@@ -10,10 +10,15 @@ export default defineConfig({
         // Required for WebTransport: allow insecure localhost certs
         launchOptions: {
             args: [
-                "--origin-to-force-quic-on=localhost:4433",
-                "--ignore-certificate-errors-spki-list=BSQJ0jkQ7wwhR7KvPZ+DSNk2XTZ/MS6xCbo9qu7+g8Y=",
+                "--origin-to-force-quic-on=127.0.0.1:4433",
+                "--ignore-certificate-errors",
             ],
         },
+    },
+    webServer: {
+        command: "cd ../../crates/reference && cargo run",
+        url: "http://127.0.0.1:4434", // Health endpoint (QUIC on 4433 doesn't respond to HTTP GET)
+        reuseExistingServer: !process.env.CI,
     },
     projects: [
         {
