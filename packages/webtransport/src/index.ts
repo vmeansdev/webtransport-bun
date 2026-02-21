@@ -266,12 +266,18 @@ class NativeServerSession implements ServerSession {
         this.#nativeHandle.close();
     }
 
-    sendDatagram(data: Uint8Array): Promise<void> {
-        throw new Error("Method not implemented.");
+    async sendDatagram(data: Uint8Array): Promise<void> {
+        // native side expects Buffer natively
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        await this.#nativeHandle.sendDatagram(buf);
     }
 
     async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-        throw new Error("Method not implemented.");
+        while (true) {
+            const datagram = await this.#nativeHandle.readDatagram();
+            if (!datagram) break; // None means closed
+            yield datagram;
+        }
     }
 
     createBidirectionalStream(): Promise<Duplex> {
