@@ -68,13 +68,15 @@ describe("webtransport package exports", () => {
         expect(DEFAULT_RATE_LIMITS.datagramsPerSec).toBe(2000);
     });
 
-    it("createServer throws when native addon not loaded", () => {
-        expect(() =>
-            createServer({
-                port: 4433,
-                tls: { certPem: "", keyPem: "" },
-                onSession: () => { },
-            }),
-        ).toThrow(); // Just expect any throw initially so it works with or without addon locally
+    it("createServer returns a server instance", () => {
+        const server = createServer({
+            port: 4433,
+            tls: { certPem: "", keyPem: "" },
+            onSession: () => { },
+        });
+        expect(server).toBeDefined();
+        expect(server.address).toBeDefined();
+        expect(server.address.port).toBe(4433);
+        expect(typeof server.close).toBe("function");
     });
 });

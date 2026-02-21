@@ -235,6 +235,66 @@ try {
     // console.error("Failed to load native addon:", e);
 }
 
+class NativeServerSession implements ServerSession {
+    #nativeHandle: any;
+
+    constructor(nativeHandle: any) {
+        this.#nativeHandle = nativeHandle;
+    }
+
+    get id(): string {
+        return this.#nativeHandle.id;
+    }
+
+    get peer(): { ip: string; port: number } {
+        return {
+            ip: this.#nativeHandle.peerIp,
+            port: this.#nativeHandle.peerPort,
+        };
+    }
+
+    // Phase 5.3 stub
+    get ready(): Promise<void> {
+        return Promise.resolve(); // Stub for now
+    }
+
+    get closed(): Promise<CloseInfo> {
+        return new Promise(() => { }); // Stub for now
+    }
+
+    close(info?: CloseInfo): void {
+        this.#nativeHandle.close();
+    }
+
+    sendDatagram(data: Uint8Array): Promise<void> {
+        throw new Error("Method not implemented.");
+    }
+
+    async *incomingDatagrams(): AsyncIterable<Uint8Array> {
+        throw new Error("Method not implemented.");
+    }
+
+    createBidirectionalStream(): Promise<Duplex> {
+        throw new Error("Method not implemented.");
+    }
+
+    async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
+        throw new Error("Method not implemented.");
+    }
+
+    createUnidirectionalStream(): Promise<Writable> {
+        throw new Error("Method not implemented.");
+    }
+
+    async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
+        throw new Error("Method not implemented.");
+    }
+
+    metricsSnapshot(): SessionMetricsSnapshot {
+        throw new Error("Method not implemented.");
+    }
+}
+
 /**
  * Create an in-process WebTransport server.
  */
@@ -249,6 +309,15 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
     const handle = new native.ServerHandle(opts.port, certPem, keyPem, (events: any[]) => {
         // TSFN callbacks for session events
+        for (const evt of events) {
+            if (evt.name === "session") {
+                // evt.handle is the native session handle passed from Rust
+                // But for now, let's say Rust just passes an object, or we explicitly create one:
+                // const nativeSession = new native.SessionHandle("test-id", "127.0.0.1", 12345);
+                // const session = new NativeServerSession(nativeSession);
+                // opts.onSession(session);
+            }
+        }
     });
 
     return {
