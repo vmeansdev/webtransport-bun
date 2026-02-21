@@ -1,0 +1,17 @@
+{
+  "name": "webtransport-bun",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json",
+    "test:interop": "cd tools/interop && bun run playwright test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
