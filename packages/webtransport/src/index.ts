@@ -133,6 +133,9 @@ export type ServerOptions = {
 
     /** Optional logging hook */
     log?: (event: LogEvent) => void;
+
+    /** Debug mode: increases log verbosity without changing semantics */
+    debug?: boolean;
 };
 
 export interface WebTransportServer {
@@ -149,7 +152,7 @@ export type ClientOptions = {
     tls?: {
         caPem?: string | Uint8Array;
         serverName?: string;
-        /** dev only */
+        /** Dev only: skips server cert verification. Requires explicit `true`. Emits warning log. Never use in production. */
         insecureSkipVerify?: boolean;
     };
     limits?: Partial<LimitsOptions>;
@@ -353,7 +356,11 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 /**
  * Connect to a WebTransport server (client mode).
  */
-export async function connect(_url: string, _opts?: ClientOptions): Promise<ClientSession> {
+export async function connect(_url: string, opts?: ClientOptions): Promise<ClientSession> {
+    if (opts?.tls?.insecureSkipVerify === true) {
+        const log = opts.log ?? ((e: LogEvent) => console.warn(`[webtransport] ${e.level}: ${e.msg}`));
+        log({ level: "warn", msg: "tls.insecureSkipVerify is enabled — dev only, never use in production" });
+    }
     // TODO: wire to native addon runtime
     throw new Error("connect is not yet implemented — native addon required");
 }

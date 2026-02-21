@@ -37,6 +37,25 @@ Operational requirements:
 - verify batching enabled
 - reduce per-message overhead (larger chunk sizes, fewer crossings)
 
+## Tuning guide
+
+- **Low latency**: reduce maxQueuedBytesPerStream, use smaller datagrams, lower backpressureTimeoutMs
+- **Throughput**: increase per-session limits, larger highWaterMark on streams
+- **queuedBytesGlobal rising**: slow consumers or too many concurrent streams; reduce limits or scale out
+
+## Known limitations and compatibility
+
+- Client `connect()` not yet implemented
+- macOS + Linux only (arm64, x64)
+- Requires Bun >= 1.3.9
+- Node-API: addon is built for Bun; Node compatibility not tested
+
+## Public internet deployment
+
+- **UDP firewalling**: Allow inbound UDP on your WebTransport port (e.g. 443). Many cloud providers require explicit security-group rules for UDP.
+- **Certificates**: Use a valid TLS cert (e.g. Let's Encrypt). SAN must include the hostname clients use. Self-signed works only for dev/testing.
+- **Browser failure modes**: CORS does not apply to WebTransport. Common issues: wrong URL scheme (must be https://), cert mismatch, UDP blocked by network.
+
 ## Deployment notes
 - Run the Bun process as a dedicated service user.
 - Use systemd on Linux; ensure Restart=on-failure.

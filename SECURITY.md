@@ -12,7 +12,7 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 ## Security principles
 1. Safe defaults
 - TLS verification enabled by default for client.
-- No insecure flags enabled unless explicitly set.
+- `insecureSkipVerify` requires explicit `tls.insecureSkipVerify: true`; emits warning log when used. Dev only — never use in production.
 2. Bounded resources
 - All buffering is bounded and accounted for.
 - There is always a cap that prevents unbounded memory growth.
