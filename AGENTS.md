@@ -95,3 +95,8 @@ Per-IP token buckets (defaults)
 - E_LIMIT_EXCEEDED
 - E_RATE_LIMITED
 - E_INTERNAL
+
+## Commit discipline
+- Each logical change must be **one scoped commit**.
+- Commit message format: **Verb + What + Why** (e.g. `Add error codes for stable programmatic handling`).
+- Do not bundle unrelated changes in a single commit.
