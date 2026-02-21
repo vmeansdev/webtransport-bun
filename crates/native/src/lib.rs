@@ -60,6 +60,20 @@ pub fn create_channels() -> (
     (cmd_tx, cmd_rx, evt_tx, evt_rx)
 }
 
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::{Env, JsFunction, Result};
+
+// ---------------------------------------------------------------------------
+// TSFN / Javascript Event mapping
+// ---------------------------------------------------------------------------
+
+#[napi(object)]
+#[derive(Clone, Debug)]
+pub struct JsEvent {
+    pub name: String,
+    pub session_id: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Smoke-test export (trivial function to verify .node loads in Bun)
 // ---------------------------------------------------------------------------
@@ -75,7 +89,48 @@ pub fn smoke_test() -> String {
 /// Returns the number of Tokio worker threads (should be 1).
 #[napi]
 pub fn runtime_worker_count() -> u32 {
-    // The runtime is lazily initialized; this call ensures it exists.
     let _ = &*RUNTIME;
     1
+}
+
+/// Initialize the runtime communication channels and wire the JS callback.
+#[napi]
+pub fn init_runtime(env: Env, callback: JsFunction) -> Result<()> {
+    let (cmd_tx, mut cmd_rx, evt_tx, mut evt_rx) = create_channels();
+
+    let tsfn: ThreadsafeFunction<Vec<JsEvent>, ErrorStrategy::Fatal> = callback
+        .create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<Vec<JsEvent>>| {
+                let mut js_array = ctx.env.create_array_with_length(ctx.value.len())?;
+                for (i, evt) in ctx.value.iter().enumerate() {
+                    let mut obj = ctx.env.create_object()?;
+                    obj.set("name", evt.name.clone())?;
+                    if let Some(id) = evt.session_id {
+                        obj.set("session_id", id)?;
+                    } else {
+                        obj.set("session_id", ctx.env.get_null()?)?;
+                    }
+                    js_array.set_element(i as u32, obj)?;
+                }
+                Ok(vec![js_array])
+            },
+        )?;
+
+    // Spawn a Tokio task to drain evt_rx and notify JS
+    RUNTIME.spawn(async move {
+        while let Some(evt) = evt_rx.recv().await {
+            let mut batch = vec![];
+            batch.push(JsEvent { name: "pong".to_string(), session_id: None });
+            
+            // Drain queue
+            while let Ok(Event::Pong) = evt_rx.try_recv() {
+                batch.push(JsEvent { name: "pong".to_string(), session_id: None });
+            }
+            
+            tsfn.call(batch, ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    });
+
+    Ok(())
 }

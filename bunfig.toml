@@ -1,3 +1,1 @@
 # Bun configuration for webtransport-bun
-[test]
-preload = []
