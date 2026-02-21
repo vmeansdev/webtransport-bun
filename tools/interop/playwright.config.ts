@@ -1,4 +1,8 @@
 import { defineConfig } from "@playwright/test";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
     testDir: "./tests",
@@ -16,9 +20,11 @@ export default defineConfig({
         },
     },
     webServer: {
-        command: "cd ../../crates/reference && cargo run",
+        command: "bun run addon-server.ts",
+        cwd: join(__dirname),
         url: "http://127.0.0.1:4434", // Health endpoint (QUIC on 4433 doesn't respond to HTTP GET)
         reuseExistingServer: !process.env.CI,
+        timeout: 15000,
     },
     projects: [
         {
