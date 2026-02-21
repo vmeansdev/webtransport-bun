@@ -425,19 +425,29 @@ class NativeClientSession implements ClientSession {
     }
 
     async createBidirectionalStream(): Promise<Duplex> {
-        throw new Error("createBidiStream not yet implemented on client");
+        const nativeStream = await this.#nativeHandle.createBidiStream();
+        return new BidiStream({ handleId: 0, nativeHandle: nativeStream });
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
-        // No-op iterator; client stream accept not yet implemented
+        while (true) {
+            const nativeStream = await this.#nativeHandle.acceptBidiStream();
+            if (!nativeStream) break;
+            yield new BidiStream({ handleId: 0, nativeHandle: nativeStream });
+        }
     }
 
     async createUnidirectionalStream(): Promise<Writable> {
-        throw new Error("createUniStream not yet implemented on client");
+        const nativeStream = await this.#nativeHandle.createUniStream();
+        return new SendStream({ handleId: 0, nativeHandle: nativeStream });
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
-        // No-op iterator; client stream accept not yet implemented
+        while (true) {
+            const nativeStream = await this.#nativeHandle.acceptUniStream();
+            if (!nativeStream) break;
+            yield new RecvStream({ handleId: 0, nativeHandle: nativeStream });
+        }
     }
 
     metricsSnapshot(): SessionMetricsSnapshot {

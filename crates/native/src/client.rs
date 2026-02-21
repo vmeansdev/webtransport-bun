@@ -7,8 +7,12 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
+use crate::client_stream::{
+    spawn_bidi_bridge, spawn_uni_recv_bridge, spawn_uni_send_bridge,
+    ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
+};
 use crate::RUNTIME;
 
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +37,12 @@ pub struct ClientSessionClosed {
 const DEFAULT_BACKPRESSURE_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
 
+/// Request to open a bidi stream. Response sent via oneshot.
+type OpenBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
+type OpenUniReq = oneshot::Sender<std::result::Result<ClientUniSendHandle, String>>;
+type AcceptBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
+type AcceptUniReq = oneshot::Sender<std::result::Result<ClientUniRecvHandle, String>>;
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -43,6 +53,10 @@ pub struct ClientSessionHandle {
     dgram_recv_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
     backpressure_timeout_ms: u64,
     max_datagram_size: usize,
+    stream_open_bi_tx: Option<mpsc::Sender<OpenBiReq>>,
+    stream_open_uni_tx: Option<mpsc::Sender<OpenUniReq>>,
+    stream_accept_bi_tx: Option<mpsc::Sender<AcceptBiReq>>,
+    stream_accept_uni_tx: Option<mpsc::Sender<AcceptUniReq>>,
 }
 
 #[napi]
@@ -109,6 +123,62 @@ impl ClientSessionHandle {
             queued_bytes: 0,
         })
     }
+
+    #[napi]
+    pub async fn create_bidi_stream(&self) -> Result<ClientBidiStreamHandle> {
+        let Some(ref tx) = self.stream_open_bi_tx else {
+            return Err(napi::Error::from_reason("session closed"));
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(resp_tx).await.map_err(|_| {
+            napi::Error::from_reason("session closed")
+        })?;
+        resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))?
+            .map_err(|e| napi::Error::from_reason(e))
+    }
+
+    #[napi]
+    pub async fn create_uni_stream(&self) -> Result<ClientUniSendHandle> {
+        let Some(ref tx) = self.stream_open_uni_tx else {
+            return Err(napi::Error::from_reason("session closed"));
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(resp_tx).await.map_err(|_| {
+            napi::Error::from_reason("session closed")
+        })?;
+        resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))?
+            .map_err(|e| napi::Error::from_reason(e))
+    }
+
+    #[napi]
+    pub async fn accept_bidi_stream(&self) -> Result<Option<ClientBidiStreamHandle>> {
+        let Some(ref tx) = self.stream_accept_bi_tx else {
+            return Err(napi::Error::from_reason("session closed"));
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(resp_tx).await.map_err(|_| {
+            napi::Error::from_reason("session closed")
+        })?;
+        match resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))? {
+            Ok(h) => Ok(Some(h)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[napi]
+    pub async fn accept_uni_stream(&self) -> Result<Option<ClientUniRecvHandle>> {
+        let Some(ref tx) = self.stream_accept_uni_tx else {
+            return Err(napi::Error::from_reason("session closed"));
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(resp_tx).await.map_err(|_| {
+            napi::Error::from_reason("session closed")
+        })?;
+        match resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))? {
+            Ok(h) => Ok(Some(h)),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 impl ClientSessionHandle {
@@ -121,6 +191,10 @@ impl ClientSessionHandle {
     ) -> Self {
         let (dgram_send_tx, mut dgram_send_rx) = mpsc::channel::<Vec<u8>>(256);
         let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (open_bi_tx, mut open_bi_rx) = mpsc::channel::<OpenBiReq>(8);
+        let (open_uni_tx, mut open_uni_rx) = mpsc::channel::<OpenUniReq>(8);
+        let (accept_bi_tx, accept_bi_rx) = mpsc::channel::<AcceptBiReq>(8);
+        let (accept_uni_tx, accept_uni_rx) = mpsc::channel::<AcceptUniReq>(8);
 
         let handle = Self {
             id: id.clone(),
@@ -130,7 +204,16 @@ impl ClientSessionHandle {
             dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
             backpressure_timeout_ms: DEFAULT_BACKPRESSURE_TIMEOUT_MS,
             max_datagram_size: DEFAULT_MAX_DATAGRAM_SIZE,
+            stream_open_bi_tx: Some(open_bi_tx),
+            stream_open_uni_tx: Some(open_uni_tx),
+            stream_accept_bi_tx: Some(accept_bi_tx),
+            stream_accept_uni_tx: Some(accept_uni_tx),
         };
+
+        let conn_bi = conn.clone();
+        let conn_uni = conn.clone();
+        let conn_accept_bi = conn.clone();
+        let conn_accept_uni = conn.clone();
 
         RUNTIME.spawn(async move {
             let conn_dgram_send = conn.clone();
@@ -152,6 +235,66 @@ impl ClientSessionHandle {
                     if dgram_recv_tx.send(dgram.as_ref().to_vec()).await.is_err() {
                         break;
                     }
+                }
+            });
+
+            tokio::spawn(async move {
+                while let Some(resp_tx) = open_bi_rx.recv().await {
+                    let r = match conn_bi.open_bi().await {
+                        Ok(opening) => match opening.await {
+                            Ok((send, recv)) => {
+                                let (read_rx, write_tx) = spawn_bidi_bridge(send, recv);
+                                Ok(ClientBidiStreamHandle::new(read_rx, write_tx))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = resp_tx.send(r);
+                }
+            });
+
+            tokio::spawn(async move {
+                while let Some(resp_tx) = open_uni_rx.recv().await {
+                    let r = match conn_uni.open_uni().await {
+                        Ok(opening) => match opening.await {
+                            Ok(send) => {
+                                let write_tx = spawn_uni_send_bridge(send);
+                                Ok(ClientUniSendHandle::new(write_tx))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = resp_tx.send(r);
+                }
+            });
+
+            let mut accept_bi_rx = accept_bi_rx;
+            tokio::spawn(async move {
+                while let Some(resp_tx) = accept_bi_rx.recv().await {
+                    let r = match conn_accept_bi.accept_bi().await {
+                        Ok((send, recv)) => {
+                            let (read_rx, write_tx) = spawn_bidi_bridge(send, recv);
+                            Ok(ClientBidiStreamHandle::new(read_rx, write_tx))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = resp_tx.send(r);
+                }
+            });
+
+            let mut accept_uni_rx_local = accept_uni_rx;
+            tokio::spawn(async move {
+                while let Some(resp_tx) = accept_uni_rx_local.recv().await {
+                    let r = match conn_accept_uni.accept_uni().await {
+                        Ok(recv) => {
+                            let read_rx = spawn_uni_recv_bridge(recv);
+                            Ok(ClientUniRecvHandle::new(read_rx))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = resp_tx.send(r);
                 }
             });
 

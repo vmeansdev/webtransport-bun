@@ -53,6 +53,13 @@ describe("webtransport client", () => {
         expect(first.done).toBe(false);
         expect(new Uint8Array(first.value!)).toEqual(new Uint8Array([1, 2, 3]));
 
+        const bidi = await client.createBidirectionalStream();
+        bidi.write(Buffer.from([4, 5, 6]));
+        bidi.end();
+        const chunks: Buffer[] = [];
+        for await (const c of bidi) chunks.push(c);
+        expect(Buffer.concat(chunks)).toEqual(Buffer.from([4, 5, 6]));
+
         await server.close();
     }, 15000);
 });

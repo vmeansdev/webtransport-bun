@@ -68,7 +68,7 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     }
 
     override _final(callback: (error?: Error | null) => void): void {
-        // TODO: signal FIN to native side
+        this.#nativeHandle?.finish?.();
         callback();
     }
 
