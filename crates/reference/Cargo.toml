@@ -1,0 +1,12 @@
+[package]
+name = "reference"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "reference-server"
+path = "src/main.rs"
+
+[dependencies]
+wtransport = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

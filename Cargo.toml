@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "crates/native",
+  "crates/reference",
+]
+resolver = "2"
