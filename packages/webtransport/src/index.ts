@@ -12,6 +12,8 @@ import type { Duplex, Readable, Writable } from "node:stream";
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 export type { Resettable, StopSendable } from "./streams.js";
 
+import { BidiStream, SendStream, RecvStream } from "./streams.js";
+
 // Re-export error codes and error class
 export {
     E_TLS,
@@ -280,20 +282,30 @@ class NativeServerSession implements ServerSession {
         }
     }
 
-    createBidirectionalStream(): Promise<Duplex> {
-        throw new Error("Method not implemented.");
+    async createBidirectionalStream(): Promise<Duplex> {
+        const nativeStream = await this.#nativeHandle.createBidiStream();
+        return new BidiStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
-        throw new Error("Method not implemented.");
+        while (true) {
+            const nativeStream = await this.#nativeHandle.acceptBidiStream();
+            if (!nativeStream) break;
+            yield new BidiStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
+        }
     }
 
-    createUnidirectionalStream(): Promise<Writable> {
-        throw new Error("Method not implemented.");
+    async createUnidirectionalStream(): Promise<Writable> {
+        const nativeStream = await this.#nativeHandle.createUniStream();
+        return new SendStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
-        throw new Error("Method not implemented.");
+        while (true) {
+            const nativeStream = await this.#nativeHandle.acceptUniStream();
+            if (!nativeStream) break;
+            yield new RecvStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
+        }
     }
 
     metricsSnapshot(): SessionMetricsSnapshot {

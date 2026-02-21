@@ -29,10 +29,12 @@ type StreamHandleId = number;
 
 export interface BidiStreamOptions extends DuplexOptions {
     handleId: StreamHandleId;
+    nativeHandle?: any;
 }
 
 export class BidiStream extends Duplex implements Resettable, StopSendable {
     private readonly _handleId: StreamHandleId;
+    readonly #nativeHandle: any;
 
     constructor(opts: BidiStreamOptions) {
         super({
@@ -42,12 +44,17 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
             writableHighWaterMark: opts.writableHighWaterMark ?? 256 * 1024,
         });
         this._handleId = opts.handleId;
+        this.#nativeHandle = opts.nativeHandle;
     }
 
     // -- Node stream overrides (to be wired to native) -----------------------
 
     override _read(_size: number): void {
         // TODO: pull from native incoming queue via stream_read_drain(handleId)
+        this.#nativeHandle?.read().then((buf: Buffer | null) => {
+            if (buf) this.push(buf);
+            else this.push(null);
+        }).catch((err: any) => this.destroy(err));
     }
 
     override _write(
@@ -57,7 +64,7 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     ): void {
         // TODO: send to native via stream_write(handleId, chunk)
         // On budget reservation failure → backpressure
-        callback();
+        this.#nativeHandle?.write(chunk).then(() => callback()).catch(callback);
     }
 
     override _final(callback: (error?: Error | null) => void): void {
@@ -73,12 +80,12 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     // -- Stream control extensions -------------------------------------------
 
     [WT_RESET](code?: number): void {
-        // TODO: call native reset(handleId, code)
+        this.#nativeHandle.reset(code ?? 0);
         this.destroy();
     }
 
     [WT_STOP_SENDING](code?: number): void {
-        // TODO: call native stopSending(handleId, code)
+        this.#nativeHandle.stopSending(code ?? 0);
     }
 }
 
@@ -88,10 +95,12 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 
 export interface SendStreamOptions extends WritableOptions {
     handleId: StreamHandleId;
+    nativeHandle?: any;
 }
 
 export class SendStream extends Writable implements Resettable {
     private readonly _handleId: StreamHandleId;
+    readonly #nativeHandle: any;
 
     constructor(opts: SendStreamOptions) {
         super({
@@ -99,6 +108,7 @@ export class SendStream extends Writable implements Resettable {
             highWaterMark: opts.highWaterMark ?? 256 * 1024,
         });
         this._handleId = opts.handleId;
+        this.#nativeHandle = opts.nativeHandle;
     }
 
     override _write(
@@ -107,7 +117,7 @@ export class SendStream extends Writable implements Resettable {
         callback: (error?: Error | null) => void,
     ): void {
         // TODO: send to native via stream_write(handleId, chunk)
-        callback();
+        this.#nativeHandle?.write(chunk).then(() => callback()).catch(callback);
     }
 
     override _final(callback: (error?: Error | null) => void): void {
@@ -121,7 +131,7 @@ export class SendStream extends Writable implements Resettable {
     }
 
     [WT_RESET](code?: number): void {
-        // TODO: call native reset(handleId, code)
+        this.#nativeHandle?.reset(code ?? 0);
         this.destroy();
     }
 }
@@ -132,10 +142,12 @@ export class SendStream extends Writable implements Resettable {
 
 export interface RecvStreamOptions extends ReadableOptions {
     handleId: StreamHandleId;
+    nativeHandle?: any;
 }
 
 export class RecvStream extends Readable implements StopSendable {
     private readonly _handleId: StreamHandleId;
+    readonly #nativeHandle: any;
 
     constructor(opts: RecvStreamOptions) {
         super({
@@ -143,10 +155,15 @@ export class RecvStream extends Readable implements StopSendable {
             highWaterMark: opts.highWaterMark ?? 256 * 1024,
         });
         this._handleId = opts.handleId;
+        this.#nativeHandle = opts.nativeHandle;
     }
 
     override _read(_size: number): void {
         // TODO: pull from native incoming queue
+        this.#nativeHandle?.read().then((buf: Buffer | null) => {
+            if (buf) this.push(buf);
+            else this.push(null);
+        }).catch((err: any) => this.destroy(err));
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
@@ -155,6 +172,6 @@ export class RecvStream extends Readable implements StopSendable {
     }
 
     [WT_STOP_SENDING](code?: number): void {
-        // TODO: call native stopSending(handleId, code)
+        this.#nativeHandle?.stopSending(code ?? 0);
     }
 }

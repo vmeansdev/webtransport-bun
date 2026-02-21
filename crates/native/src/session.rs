@@ -53,4 +53,26 @@ impl SessionHandle {
         // Return Ok(None) when closed
         Ok(None)
     }
+
+    // Streams
+
+    #[napi]
+    pub async fn create_bidi_stream(&self) -> Result<crate::stream::StreamHandle> {
+        Ok(crate::stream::StreamHandle::new(0))
+    }
+
+    #[napi]
+    pub async fn accept_bidi_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
+        Ok(None)
+    }
+
+    #[napi]
+    pub async fn create_uni_stream(&self) -> Result<crate::stream::StreamHandle> {
+        Ok(crate::stream::StreamHandle::new(0))
+    }
+
+    #[napi]
+    pub async fn accept_uni_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
+        Ok(None)
+    }
 }
