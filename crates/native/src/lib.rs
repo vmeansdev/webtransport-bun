@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 
+pub mod client;
 pub mod limits;
 pub mod metrics;
 pub mod panic_guard;

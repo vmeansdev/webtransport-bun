@@ -360,14 +360,123 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     };
 }
 
+class NativeClientSession implements ClientSession {
+    #nativeHandle: any;
+    #closedPromise: Promise<CloseInfo>;
+    #closedResolvers: Map<string, (info: CloseInfo) => void>;
+
+    constructor(
+        nativeHandle: any,
+        closedPromise: Promise<CloseInfo>,
+        closedResolvers: Map<string, (info: CloseInfo) => void>,
+    ) {
+        this.#nativeHandle = nativeHandle;
+        this.#closedPromise = closedPromise;
+        this.#closedResolvers = closedResolvers;
+    }
+
+    get id(): string {
+        return this.#nativeHandle.id;
+    }
+
+    get peer(): { ip: string; port: number } {
+        return {
+            ip: this.#nativeHandle.peerIp,
+            port: this.#nativeHandle.peerPort,
+        };
+    }
+
+    get ready(): Promise<void> {
+        return Promise.resolve();
+    }
+
+    get closed(): Promise<CloseInfo> {
+        return this.#closedPromise;
+    }
+
+    close(_info?: CloseInfo): void {
+        this.#nativeHandle.close();
+    }
+
+    async sendDatagram(data: Uint8Array): Promise<void> {
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        await this.#nativeHandle.sendDatagram(buf);
+    }
+
+    async *incomingDatagrams(): AsyncIterable<Uint8Array> {
+        while (true) {
+            const dgram = await this.#nativeHandle.readDatagram();
+            if (!dgram) break;
+            yield dgram;
+        }
+    }
+
+    async createBidirectionalStream(): Promise<Duplex> {
+        throw new Error("createBidiStream not yet implemented on client");
+    }
+
+    async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
+        // No-op iterator; client stream accept not yet implemented
+    }
+
+    async createUnidirectionalStream(): Promise<Writable> {
+        throw new Error("createUniStream not yet implemented on client");
+    }
+
+    async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
+        // No-op iterator; client stream accept not yet implemented
+    }
+
+    metricsSnapshot(): SessionMetricsSnapshot {
+        return this.#nativeHandle.metricsSnapshot();
+    }
+}
+
 /**
  * Connect to a WebTransport server (client mode).
  */
-export async function connect(_url: string, opts?: ClientOptions): Promise<ClientSession> {
+export async function connect(url: string, opts?: ClientOptions): Promise<ClientSession> {
+    if (!native) {
+        throw new Error("Native addon not loaded");
+    }
     if (opts?.tls?.insecureSkipVerify === true) {
         const log = opts.log ?? ((e: LogEvent) => console.warn(`[webtransport] ${e.level}: ${e.msg}`));
         log({ level: "warn", msg: "tls.insecureSkipVerify is enabled — dev only, never use in production" });
     }
-    // TODO: wire to native addon runtime
-    throw new Error("connect is not yet implemented — native addon required");
+
+    const optsJson = JSON.stringify({
+        limits: opts?.limits ? { ...DEFAULT_LIMITS, ...opts.limits } : undefined,
+    });
+
+    return new Promise((resolve, reject) => {
+        const closedResolvers = new Map<string, (info: CloseInfo) => void>();
+        const onClosed = (events: any[]) => {
+            for (const evt of events) {
+                if (evt.name === "session_closed" && evt.id != null) {
+                    const resolveClosed = closedResolvers.get(evt.id);
+                    closedResolvers.delete(evt.id);
+                    if (resolveClosed) resolveClosed({ code: evt.code, reason: evt.reason });
+                }
+            }
+        };
+        native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
+            if (err) {
+                reject(typeof err === "string" ? new Error(err) : err);
+                return;
+            }
+            if (handleId == null) {
+                reject(new Error("connect succeeded but no handle id"));
+                return;
+            }
+            const handle = native.takeClientSession(handleId);
+            if (!handle) {
+                reject(new Error("connect: handle not found in registry"));
+                return;
+            }
+            let closedResolve!: (info: CloseInfo) => void;
+            const closedPromise = new Promise<CloseInfo>((r) => { closedResolve = r; });
+            closedResolvers.set(handle.id, closedResolve);
+            resolve(new NativeClientSession(handle, closedPromise, closedResolvers));
+        });
+    });
 }
