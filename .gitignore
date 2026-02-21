@@ -6,6 +6,7 @@ out
 target
 dist
 *.tgz
+packages/webtransport/prebuilds
 
 # code coverage
 coverage
