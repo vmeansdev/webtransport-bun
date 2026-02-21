@@ -325,7 +325,10 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     const certPem = typeof opts.tls.certPem === "string" ? opts.tls.certPem : new TextDecoder().decode(opts.tls.certPem);
     const keyPem = typeof opts.tls.keyPem === "string" ? opts.tls.keyPem : new TextDecoder().decode(opts.tls.keyPem);
 
-    const handle = new native.ServerHandle(opts.port, certPem, keyPem, (events: any[]) => {
+    const limitsJson = JSON.stringify({ ...DEFAULT_LIMITS, ...opts.limits });
+    const rateLimitsJson = JSON.stringify({ ...DEFAULT_RATE_LIMITS, ...opts.rateLimits });
+
+    const handle = new native.ServerHandle(opts.port, certPem, keyPem, limitsJson, rateLimitsJson, (events: any[]) => {
         // TSFN callbacks for session events
         for (const evt of events) {
             if (evt.name === "session") {

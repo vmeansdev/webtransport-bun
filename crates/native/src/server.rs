@@ -12,7 +12,15 @@ pub struct ServerHandle {
 #[napi]
 impl ServerHandle {
     #[napi(constructor)]
-    pub fn new(env: Env, port: u32, cert_pem: String, key_pem: String, on_session: JsFunction) -> Result<Self> {
+    pub fn new(
+        env: Env,
+        port: u32,
+        cert_pem: String,
+        key_pem: String,
+        limits_json: String,
+        rate_limits_json: String,
+        on_session: JsFunction
+    ) -> Result<Self> {
         // Validate cert and key
         // Note: For real we would spawn a wtransport server
         // Let's just create a dummy for now to verify bindings
