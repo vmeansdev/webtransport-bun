@@ -1,0 +1,11 @@
+{
+    "name": "@webtransport-bun/interop",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "test": "playwright test"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1"
+    }
+}
