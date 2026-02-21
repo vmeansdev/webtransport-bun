@@ -197,6 +197,8 @@ export type MetricsSnapshot = {
     nowMs: number;
 
     sessionsActive: number;
+    sessionTasksActive: number;
+    streamTasksActive: number;
     handshakesInFlight: number;
     streamsActive: number;
 

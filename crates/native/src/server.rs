@@ -1,12 +1,18 @@
+//! WebTransport server via wtransport. Updates ServerMetrics for Phase 4.3.1.
+
 use napi_derive::napi;
 use napi::{Env, JsFunction, Result};
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 use crate::panic_guard;
+use crate::server_metrics::ServerMetrics;
 
 #[napi]
 pub struct ServerHandle {
-    // We will hold the background task handle here later
     port: u32,
+    metrics: Arc<ServerMetrics>,
+    shutdown_tx: Mutex<Option<watch::Sender<()>>>,
 }
 
 #[napi]
@@ -19,12 +25,20 @@ impl ServerHandle {
         _key_pem: String,
         _limits_json: String,
         _rate_limits_json: String,
-        _on_session: JsFunction
+        _on_session: JsFunction,
     ) -> Result<Self> {
         panic_guard::catch_panic(|| {
-            // Validate cert and key
-            // Note: For real we would spawn a wtransport server
-            Ok(Self { port })
+            let metrics = Arc::new(ServerMetrics::default());
+            let limits = crate::limits::Limits::from_json(&_limits_json);
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let metrics_clone = Arc::clone(&metrics);
+            let port_u16 = port.min(65535) as u16;
+            crate::spawn_wtransport_server(metrics_clone, limits, port_u16, shutdown_rx);
+            Ok(Self {
+                port,
+                metrics,
+                shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            })
         })
     }
 
@@ -35,24 +49,14 @@ impl ServerHandle {
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        panic_guard::catch_panic(|| Ok(()))
+        panic_guard::catch_panic(|| {
+            let _ = self.shutdown_tx.lock().ok().and_then(|mut g| g.take());
+            Ok(())
+        })
     }
 
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::ServerMetricsSnapshot> {
-        panic_guard::catch_panic(|| Ok(crate::metrics::ServerMetricsSnapshot {
-            now_ms: 0.0,
-            sessions_active: 0,
-            handshakes_in_flight: 0,
-            streams_active: 0,
-            datagrams_in: 0,
-            datagrams_out: 0,
-            datagrams_dropped: 0,
-            queued_bytes_global: 0,
-            backpressure_wait_count: 0,
-            backpressure_timeout_count: 0,
-            rate_limited_count: 0,
-            limit_exceeded_count: 0,
-        }))
+        panic_guard::catch_panic(|| Ok(self.metrics.snapshot()))
     }
 }

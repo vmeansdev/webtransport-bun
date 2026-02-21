@@ -8,8 +8,7 @@
 - `cargo fetch`
 
 ## Local build
-- Build native addon:
-  - `cargo build -p native`
+- Build native addon: `bun run build:native` (uses napi-rs CLI; produces `webtransport-native.${platform}-${arch}.node`)
 - Run Bun tests:
   - `bun test`
 - Run Chromium interop tests (requires Playwright browsers):

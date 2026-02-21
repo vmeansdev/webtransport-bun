@@ -6,14 +6,18 @@
 
 use napi_derive::napi;
 use once_cell::sync::Lazy;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+pub mod limits;
 pub mod metrics;
 pub mod panic_guard;
 pub mod server;
+pub mod server_metrics;
 pub mod session;
 pub mod stream;
+pub mod spawn_tracked;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
@@ -21,7 +25,7 @@ pub mod stream;
 
 /// Dedicated Tokio runtime running on its own thread.
 /// All wtransport objects are driven on this runtime.
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1) // single dedicated thread as per ARCHITECTURE.md
         .enable_all()
@@ -108,6 +112,170 @@ pub fn runtime_worker_count() -> u32 {
 #[napi]
 pub fn init_runtime(env: Env, callback: JsFunction) -> Result<()> {
     panic_guard::catch_panic(|| init_runtime_inner(env, callback))
+}
+
+/// Spawn the wtransport server loop on the dedicated runtime.
+pub(crate) fn spawn_wtransport_server(
+    metrics: Arc<server_metrics::ServerMetrics>,
+    limits: limits::Limits,
+    port: u16,
+    mut shutdown_rx: watch::Receiver<()>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use wtransport::{Endpoint, Identity, ServerConfig};
+
+    RUNTIME.spawn(async move {
+        panic_guard::spawn_quic_task(async move {
+            let identity = match Identity::self_signed(&["localhost", "127.0.0.1", "::1"]) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("webtransport-native: failed to create identity: {:?}", e);
+                    return;
+                }
+            };
+            let config = ServerConfig::builder()
+                .with_bind_default(port)
+                .with_identity(identity)
+                .build();
+            let server = match Endpoint::server(config) {
+                Ok(s) => {
+                    eprintln!("webtransport-native: endpoint created for port {}", port);
+                    s
+                }
+                Err(e) => {
+                    eprintln!("webtransport-native: failed to create endpoint: {:?}", e);
+                    return;
+                }
+            };
+
+            loop {
+                let incoming = server.accept();
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    incoming_session = incoming => {
+                        let metrics = Arc::clone(&metrics);
+                        let limits = limits.clone();
+                        spawn_tracked::spawn_tracked(
+                            metrics.clone(),
+                            spawn_tracked::TaskKind::Session,
+                            async move {
+                                metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
+                                let session_request = match incoming_session.await {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                };
+                                // 4.4.1: Shed at session accept
+                                if metrics.sessions_active.load(Ordering::Relaxed) >= limits.max_sessions {
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+                                match session_request.accept().await {
+                                    Ok(connection) => {
+                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
+                                        let conn_bidi = connection.clone();
+                                        let conn_uni = connection.clone();
+                                        let conn_dgram = connection.clone();
+                                        let m_bidi = Arc::clone(&metrics);
+                                        let m_uni = Arc::clone(&metrics);
+                                        let m_dgram = Arc::clone(&metrics);
+                                        let lim_bidi = limits.clone();
+                                        let lim_uni = limits.clone();
+                                        let lim_dgram = limits.clone();
+
+                                        // Bidi stream echo (4.4.2: shed if over max_streams_global)
+                                        spawn_tracked::spawn_tracked(
+                                            m_bidi.clone(),
+                                            spawn_tracked::TaskKind::Stream,
+                                            async move {
+                                                if let Ok((mut send, mut recv)) = conn_bidi.accept_bi().await {
+                                                    if m_bidi.streams_active.load(Ordering::Relaxed) >= lim_bidi.max_streams_global {
+                                                        m_bidi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                                        return;
+                                                    }
+                                                    m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
+                                                    let mut buf = vec![0u8; 1024];
+                                                    if let Ok(Some(n)) = recv.read(&mut buf).await {
+                                                        let sz = n as u64;
+                                                        if m_bidi.try_reserve_queued_bytes(sz, lim_bidi.max_queued_bytes_global) {
+                                                            let _ = send.write_all(&buf[..n]).await;
+                                                            m_bidi.release_queued_bytes(sz);
+                                                        }
+                                                    }
+                                                    m_bidi.streams_active.fetch_sub(1, Ordering::Relaxed);
+                                                }
+                                            },
+                                        );
+                                        // Uni stream echo (4.4.2)
+                                        spawn_tracked::spawn_tracked(
+                                            m_uni.clone(),
+                                            spawn_tracked::TaskKind::Stream,
+                                            async move {
+                                                if let Ok(mut recv) = conn_uni.accept_uni().await {
+                                                    if m_uni.streams_active.load(Ordering::Relaxed) >= lim_uni.max_streams_global {
+                                                        m_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                                        let _ = recv.stop(0u32.into());
+                                                        return;
+                                                    }
+                                                    m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                                                    let mut buf = vec![0u8; 1024];
+                                                    if let Ok(Some(n)) = recv.read(&mut buf).await {
+                                                        let sz = n as u64;
+                                                        if m_uni.try_reserve_queued_bytes(sz, lim_uni.max_queued_bytes_global) {
+                                                            if let Ok(opening) = conn_uni.open_uni().await {
+                                                                if let Ok(mut send) = opening.await {
+                                                                    let _ = send.write_all(&buf[..n]).await;
+                                                                }
+                                                            }
+                                                            m_uni.release_queued_bytes(sz);
+                                                        }
+                                                    }
+                                                    m_uni.streams_active.fetch_sub(1, Ordering::Relaxed);
+                                                }
+                                            },
+                                        );
+                                        // Datagram echo (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
+                                        spawn_tracked::spawn_tracked(
+                                            m_dgram.clone(),
+                                            spawn_tracked::TaskKind::Stream,
+                                            async move {
+                                                while let Ok(dgram) = conn_dgram.receive_datagram().await {
+                                                    m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
+                                                    if dgram.len() > lim_dgram.max_datagram_size {
+                                                        m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                        continue;
+                                                    }
+                                                    let sz = dgram.len() as u64;
+                                                    if !m_dgram.try_reserve_queued_bytes(sz, lim_dgram.max_queued_bytes_global) {
+                                                        m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                        continue;
+                                                    }
+                                                    if conn_dgram.send_datagram(dgram.as_ref()).is_ok() {
+                                                        m_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                    }
+                                                    m_dgram.release_queued_bytes(sz);
+                                                }
+                                                m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                            },
+                                        );
+                                    }
+                                    Err(_) => {
+                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    }
+                                }
+                            },
+                        );
+                    }
+                }
+            }
+        });
+    });
 }
 
 fn init_runtime_inner(env: Env, callback: JsFunction) -> Result<()> {

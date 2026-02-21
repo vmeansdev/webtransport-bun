@@ -4,11 +4,15 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "scripts": {
+    "build:native": "bunx @napi-rs/cli build --cwd crates/native --platform --release",
     "test": "bun test packages/",
     "typecheck": "tsc -p tsconfig.json",
     "test:interop": "cd tools/interop && bun run playwright test",
     "test:load": "bun tools/load/load.ts",
-    "test:soak": "bun tools/load/soak.ts"
+    "test:soak": "bun tools/load/soak.ts",
+    "test:overload": "bun tools/load/overload-session.ts",
+    "test:overload-addon": "bun tools/load/overload-addon.ts",
+    "test:load-addon": "bun tools/load/load-addon.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

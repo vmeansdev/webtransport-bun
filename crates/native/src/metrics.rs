@@ -4,6 +4,8 @@ use napi_derive::napi;
 pub struct ServerMetricsSnapshot {
     pub now_ms: f64,
     pub sessions_active: u32,
+    pub session_tasks_active: u32,
+    pub stream_tasks_active: u32,
     pub handshakes_in_flight: u32,
     pub streams_active: u32,
     pub datagrams_in: u32,
