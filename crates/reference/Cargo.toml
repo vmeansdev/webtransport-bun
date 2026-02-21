@@ -7,6 +7,10 @@ edition = "2021"
 name = "reference-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "load-client"
+path = "src/load_client.rs"
+
 [dependencies]
-wtransport = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wtransport = { version = "0.7", features = ["dangerous-configuration"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
