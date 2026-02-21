@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, watch};
 
 pub mod client;
 pub mod limits;
+pub mod rate_limit;
 pub mod metrics;
 pub mod panic_guard;
 pub mod server;
@@ -141,6 +142,7 @@ pub fn init_runtime(env: Env, callback: JsFunction) -> Result<()> {
 pub(crate) fn spawn_wtransport_server(
     metrics: Arc<server_metrics::ServerMetrics>,
     limits: limits::Limits,
+    handshakes_burst_per_ip: u64,
     port: u16,
     mut shutdown_rx: watch::Receiver<()>,
     on_session_tsfn: Option<
@@ -207,6 +209,12 @@ pub(crate) fn spawn_wtransport_server(
                                 }
                                 match session_request.accept().await {
                                     Ok(connection) => {
+                                        let peer_ip = connection.remote_address().ip().to_string();
+                                        if !rate_limit::try_acquire_per_ip_session(&peer_ip, handshakes_burst_per_ip) {
+                                            metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                            metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                            return;
+                                        }
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                         metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
 
@@ -216,13 +224,7 @@ pub(crate) fn spawn_wtransport_server(
                                             SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                         );
                                         if let Some(ref tsfn) = on_session {
-                                            let (peer_ip, peer_port) = {
-                                                let addr = connection.remote_address();
-                                                (
-                                                    addr.ip().to_string(),
-                                                    addr.port() as u32,
-                                                )
-                                            };
+                                            let peer_port = connection.remote_address().port() as u32;
                                             let accepted = SessionAccepted {
                                                 id: id.clone(),
                                                 peer_ip: peer_ip.clone(),
@@ -297,6 +299,7 @@ pub(crate) fn spawn_wtransport_server(
                                         );
                                         // Datagram echo (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
                                         let on_session_closed = on_session.clone();
+                                        let peer_ip_for_release = peer_ip.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -317,6 +320,7 @@ pub(crate) fn spawn_wtransport_server(
                                                     }
                                                     m_dgram.release_queued_bytes(sz);
                                                 }
+                                                rate_limit::release_per_ip_session(&peer_ip_for_release);
                                                 m_dgram.sessions_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                                 if let Some(ref tsfn) = on_session_closed {
                                                     tsfn.call(
