@@ -2,13 +2,13 @@
   "name": "webtransport-bun",
   "private": true,
   "type": "module",
-  "workspaces": [
-    "packages/*"
-  ],
+  "workspaces": ["packages/*"],
   "scripts": {
     "test": "bun test packages/",
     "typecheck": "tsc -p tsconfig.json",
-    "test:interop": "cd tools/interop && bun run playwright test"
+    "test:interop": "cd tools/interop && bun run playwright test",
+    "test:load": "bun tools/load/load.ts",
+    "test:soak": "bun tools/load/soak.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
