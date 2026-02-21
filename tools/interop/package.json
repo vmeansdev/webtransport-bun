@@ -1,11 +1,16 @@
 {
-    "name": "@webtransport-bun/interop",
-    "private": true,
-    "type": "module",
-    "scripts": {
-        "test": "playwright test"
-    },
-    "devDependencies": {
-        "@playwright/test": "^1"
-    }
+  "name": "@webtransport-bun/interop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "install:browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
 }

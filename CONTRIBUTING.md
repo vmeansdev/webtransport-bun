@@ -12,6 +12,9 @@
   - `cargo build -p native`
 - Run Bun tests:
   - `bun test`
+- Run Chromium interop tests (requires Playwright browsers):
+  - `cd tools/interop && bun run install:browsers` (one-time)
+  - `bun run test:interop`
 
 ## Code quality
 - TypeScript:
