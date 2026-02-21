@@ -30,6 +30,9 @@ pub struct ClientSessionClosed {
     pub reason: Option<String>,
 }
 
+const DEFAULT_BACKPRESSURE_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -38,6 +41,8 @@ pub struct ClientSessionHandle {
     peer_port: u32,
     dgram_send_tx: Option<mpsc::Sender<Vec<u8>>>,
     dgram_recv_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    backpressure_timeout_ms: u64,
+    max_datagram_size: usize,
 }
 
 #[napi]
@@ -59,10 +64,22 @@ impl ClientSessionHandle {
 
     #[napi]
     pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
-        if let Some(ref tx) = self.dgram_send_tx {
-            let bytes = data.to_vec();
-            let _ = tx.send(bytes).await;
+        let Some(ref tx) = self.dgram_send_tx else {
+            return Err(napi::Error::from_reason("session closed"));
+        };
+        let bytes = data.to_vec();
+        if bytes.len() > self.max_datagram_size {
+            return Err(napi::Error::from_reason(format!(
+                "datagram size {} exceeds max {}",
+                bytes.len(),
+                self.max_datagram_size
+            )));
         }
+        let timeout = tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
+        tokio::time::timeout(timeout, tx.send(bytes))
+            .await
+            .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?
+            .map_err(|_| napi::Error::from_reason("channel closed"))?;
         Ok(())
     }
 
@@ -111,6 +128,8 @@ impl ClientSessionHandle {
             peer_port,
             dgram_send_tx: Some(dgram_send_tx.clone()),
             dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+            backpressure_timeout_ms: DEFAULT_BACKPRESSURE_TIMEOUT_MS,
+            max_datagram_size: DEFAULT_MAX_DATAGRAM_SIZE,
         };
 
         RUNTIME.spawn(async move {
