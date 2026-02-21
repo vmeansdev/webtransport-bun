@@ -206,18 +206,17 @@ pub fn connect(
     let callback_tsfn: ThreadsafeFunction<ConnectResult, ErrorStrategy::Fatal> = callback
         .create_threadsafe_function(
             0,
-            |ctx: napi::threadsafe_function::ThreadSafeCallContext<ConnectResult>| {
-                match &ctx.value {
-                    ConnectResult::Ok(handle_id) => {
-                        let null = ctx.env.get_null()?.into_unknown();
-                        let id_val = ctx.env.create_string(handle_id)?.into_unknown();
-                        Ok(vec![null, id_val])
-                    }
-                    ConnectResult::Err(msg) => {
-                        let err_str = ctx.env.create_string(msg)?.into_unknown();
-                        let undef = ctx.env.get_undefined()?.into_unknown();
-                        Ok(vec![err_str, undef])
-                    }
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<ConnectResult>| match &ctx.value
+            {
+                ConnectResult::Ok(handle_id) => {
+                    let null = ctx.env.get_null()?.into_unknown();
+                    let id_val = ctx.env.create_string(handle_id)?.into_unknown();
+                    Ok(vec![null, id_val])
+                }
+                ConnectResult::Err(msg) => {
+                    let err_str = ctx.env.create_string(msg)?.into_unknown();
+                    let undef = ctx.env.get_undefined()?.into_unknown();
+                    Ok(vec![err_str, undef])
                 }
             },
         )?;
@@ -228,7 +227,11 @@ pub fn connect(
             .map_err(|e| e.to_string())
             .and_then(|(id, peer_ip, peer_port, conn)| {
                 let handle = ClientSessionHandle::spawn_session_task(
-                    id.clone(), peer_ip, peer_port, conn, on_closed_tsfn,
+                    id.clone(),
+                    peer_ip,
+                    peer_port,
+                    conn,
+                    on_closed_tsfn,
                 );
                 if let Ok(mut reg) = CLIENT_HANDLE_REGISTRY.lock() {
                     reg.insert(id.clone(), handle);
@@ -247,9 +250,9 @@ pub fn connect(
 /// Take the client session handle from the registry. Call after connect callback succeeds.
 #[napi]
 pub fn take_client_session(handle_id: String) -> Result<Option<ClientSessionHandle>> {
-    let mut reg = CLIENT_HANDLE_REGISTRY.lock().map_err(|_| {
-        napi::Error::from_reason("registry lock poisoned")
-    })?;
+    let mut reg = CLIENT_HANDLE_REGISTRY
+        .lock()
+        .map_err(|_| napi::Error::from_reason("registry lock poisoned"))?;
     Ok(reg.remove(&handle_id))
 }
 

@@ -63,7 +63,8 @@ impl ServerHandle {
 
             let metrics = Arc::new(ServerMetrics::default());
             let limits = crate::limits::Limits::from_json(&_limits_json);
-            let handshakes_burst_per_ip = crate::rate_limit::handshakes_burst_from_json(&_rate_limits_json);
+            let handshakes_burst_per_ip =
+                crate::rate_limit::handshakes_burst_from_json(&_rate_limits_json);
             let (shutdown_tx, shutdown_rx) = watch::channel(());
             let metrics_clone = Arc::clone(&metrics);
             let port_u16 = port.min(65535) as u16;

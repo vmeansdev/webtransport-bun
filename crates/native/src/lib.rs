@@ -13,9 +13,9 @@ use tokio::sync::{mpsc, watch};
 
 pub mod client;
 pub mod limits;
-pub mod rate_limit;
 pub mod metrics;
 pub mod panic_guard;
+pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
 pub mod session;
