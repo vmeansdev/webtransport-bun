@@ -13,6 +13,8 @@ const DEFAULT_SESSIONS: usize = 100;
 const DEFAULT_DURATION_SECS: u64 = 30;
 const DEFAULT_DATAGRAMS_PER_SEC: u64 = 1000;
 const DEFAULT_STREAMS_PER_SEC: u64 = 10;
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -100,14 +102,15 @@ async fn run(
     // Wait for duration
     tokio::time::sleep(duration).await;
 
-    // Don't call endpoint.close() — wtransport panics if connections are still alive.
-    // Sessions will stop when their run_session loops exit (duration elapsed).
-    // Give tasks a moment to finish, then wait_idle.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
+    // Shutdown: sessions exit when duration elapses, run_session calls conn.close().
+    // Join with timeout to avoid hangs (Phase 2: strict timeouts).
     for h in handles {
-        let _ = h.await;
+        if let Err(_) = tokio::time::timeout(JOIN_TIMEOUT, h).await {
+            eprintln!("load-client: warning: task join timed out");
+        }
     }
+
+    // Don't call endpoint.close() — wtransport panics if connections are still alive.
 
     let ok = counters.sessions_ok.load(Ordering::Relaxed);
     let err = counters.sessions_err.load(Ordering::Relaxed);
@@ -186,5 +189,7 @@ async fn run_session(
             }
         }
     }
+    // Shutdown state machine: stop (loop exited) → close → wait-for-closed (timeout).
     conn.close(0u32.into(), b"load test done");
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
 }
