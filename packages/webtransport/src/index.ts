@@ -221,12 +221,41 @@ export type SessionMetricsSnapshot = {
 // Public factory functions (stubs — to be wired to native addon)
 // ---------------------------------------------------------------------------
 
+import { createRequire } from "node:module";
+
+// Resolving the native module based on platform
+const _require = createRequire(import.meta.url);
+const PLATFORM = process.platform;
+const ARCH = process.arch;
+let native: any;
+try {
+    native = _require(`../../../crates/native/webtransport-native.${PLATFORM}-${ARCH}.node`);
+} catch (e) {
+    // fallback or error
+    // console.error("Failed to load native addon:", e);
+}
+
 /**
  * Create an in-process WebTransport server.
  */
-export function createServer(_opts: ServerOptions): WebTransportServer {
-    // TODO: wire to native addon runtime
-    throw new Error("createServer is not yet implemented — native addon required");
+export function createServer(opts: ServerOptions): WebTransportServer {
+    if (!native) {
+        throw new Error("Native addon not loaded");
+    }
+
+    // Convert keys to string representation if they are UInt8Arrays
+    const certPem = typeof opts.tls.certPem === "string" ? opts.tls.certPem : new TextDecoder().decode(opts.tls.certPem);
+    const keyPem = typeof opts.tls.keyPem === "string" ? opts.tls.keyPem : new TextDecoder().decode(opts.tls.keyPem);
+
+    const handle = new native.ServerHandle(opts.port, certPem, keyPem, (events: any[]) => {
+        // TSFN callbacks for session events
+    });
+
+    return {
+        address: { host: opts.host ?? "0.0.0.0", port: handle.port },
+        close: async () => await handle.close(),
+        metricsSnapshot: () => ({ /* stub */ } as any),
+    };
 }
 
 /**

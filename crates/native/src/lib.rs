@@ -9,6 +9,8 @@ use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+pub mod server;
+
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
