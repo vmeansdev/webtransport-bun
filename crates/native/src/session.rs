@@ -1,6 +1,8 @@
 use napi_derive::napi;
 use napi::Result;
 
+use crate::panic_guard;
+
 #[napi]
 pub struct SessionHandle {
     id: String,
@@ -36,53 +38,50 @@ impl SessionHandle {
 
     #[napi]
     pub fn close(&self) -> Result<()> {
-        Ok(())
+        panic_guard::catch_panic(|| Ok(()))
     }
 
     #[napi]
-    pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
-        // Phase 6.1: In a real implementation we push to mpsc channel bounded by maxQueuedBytes
-        Ok(())
+    pub async fn send_datagram(&self, _data: napi::bindgen_prelude::Buffer) -> Result<()> {
+        panic_guard::catch_panic(|| Ok(()))
     }
 
     // Usually we would return an async iterator, but napi-rs doesn't strictly have a direct AsyncIterator binding.
     // So we provide a pull-based next() pump that JS can wrap in an AsyncGenerator.
     #[napi]
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        // Phase 6.2: Read from unbounded/bounded channel linked to wtransport incoming datagrams
-        // Return Ok(None) when closed
-        Ok(None)
+        panic_guard::catch_panic(|| Ok(None))
     }
 
     // Streams
 
     #[napi]
     pub async fn create_bidi_stream(&self) -> Result<crate::stream::StreamHandle> {
-        Ok(crate::stream::StreamHandle::new(0))
+        panic_guard::catch_panic(|| Ok(crate::stream::StreamHandle::new(0)))
     }
 
     #[napi]
     pub async fn accept_bidi_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
-        Ok(None)
+        panic_guard::catch_panic(|| Ok(None))
     }
 
     #[napi]
     pub async fn create_uni_stream(&self) -> Result<crate::stream::StreamHandle> {
-        Ok(crate::stream::StreamHandle::new(0))
+        panic_guard::catch_panic(|| Ok(crate::stream::StreamHandle::new(0)))
     }
 
     #[napi]
     pub async fn accept_uni_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
-        Ok(None)
+        panic_guard::catch_panic(|| Ok(None))
     }
 
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
-        Ok(crate::metrics::SessionMetricsSnapshot {
+        panic_guard::catch_panic(|| Ok(crate::metrics::SessionMetricsSnapshot {
             datagrams_in: 0,
             datagrams_out: 0,
             streams_active: 0,
             queued_bytes: 0,
-        })
+        }))
     }
 }

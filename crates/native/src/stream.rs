@@ -1,6 +1,8 @@
 use napi_derive::napi;
 use napi::Result;
 
+use crate::panic_guard;
+
 #[napi]
 pub struct StreamHandle {
     id: u32,
@@ -20,25 +22,21 @@ impl StreamHandle {
 
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        // Pull data from stream
-        Ok(None)
+        panic_guard::catch_panic(|| Ok(None))
     }
 
     #[napi]
-    pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
-        // Send data
-        Ok(())
+    pub async fn write(&self, _chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+        panic_guard::catch_panic(|| Ok(()))
     }
 
     #[napi]
-    pub fn reset(&self, code: u32) -> Result<()> {
-        // Reset stream
-        Ok(())
+    pub fn reset(&self, _code: u32) -> Result<()> {
+        panic_guard::catch_panic(|| Ok(()))
     }
 
     #[napi]
-    pub fn stop_sending(&self, code: u32) -> Result<()> {
-        // Send STOP_SENDING
-        Ok(())
+    pub fn stop_sending(&self, _code: u32) -> Result<()> {
+        panic_guard::catch_panic(|| Ok(()))
     }
 }

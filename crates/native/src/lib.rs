@@ -9,10 +9,11 @@ use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+pub mod metrics;
+pub mod panic_guard;
 pub mod server;
 pub mod session;
 pub mod stream;
-pub mod metrics;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
@@ -86,21 +87,30 @@ pub struct JsEvent {
 /// Returns a greeting string. Use this to verify the native addon loads.
 #[napi]
 pub fn smoke_test() -> String {
-    // Verify the runtime is initialized as a side effect
-    let _ = &*RUNTIME;
-    "webtransport-native is alive!".to_string()
+    panic_guard::catch_panic(|| {
+        let _ = &*RUNTIME;
+        Ok("webtransport-native is alive!".to_string())
+    })
+    .unwrap_or_else(|_| "webtransport-native (panic recovered)".to_string())
 }
 
 /// Returns the number of Tokio worker threads (should be 1).
 #[napi]
 pub fn runtime_worker_count() -> u32 {
-    let _ = &*RUNTIME;
-    1
+    panic_guard::catch_panic(|| {
+        let _ = &*RUNTIME;
+        Ok(1u32)
+    })
+    .unwrap_or(0)
 }
 
 /// Initialize the runtime communication channels and wire the JS callback.
 #[napi]
 pub fn init_runtime(env: Env, callback: JsFunction) -> Result<()> {
+    panic_guard::catch_panic(|| init_runtime_inner(env, callback))
+}
+
+fn init_runtime_inner(env: Env, callback: JsFunction) -> Result<()> {
     let (cmd_tx, mut cmd_rx, evt_tx, mut evt_rx) = create_channels();
 
     let tsfn: ThreadsafeFunction<Vec<JsEvent>, ErrorStrategy::Fatal> = callback

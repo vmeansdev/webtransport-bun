@@ -1,7 +1,7 @@
 use napi_derive::napi;
 use napi::{Env, JsFunction, Result};
-use wtransport::ServerConfig;
-use wtransport::tls::Certificate;
+
+use crate::panic_guard;
 
 #[napi]
 pub struct ServerHandle {
@@ -13,36 +13,34 @@ pub struct ServerHandle {
 impl ServerHandle {
     #[napi(constructor)]
     pub fn new(
-        env: Env,
+        _env: Env,
         port: u32,
-        cert_pem: String,
-        key_pem: String,
-        limits_json: String,
-        rate_limits_json: String,
-        on_session: JsFunction
+        _cert_pem: String,
+        _key_pem: String,
+        _limits_json: String,
+        _rate_limits_json: String,
+        _on_session: JsFunction
     ) -> Result<Self> {
-        // Validate cert and key
-        // Note: For real we would spawn a wtransport server
-        // Let's just create a dummy for now to verify bindings
-        
-        Ok(Self {
-            port,
+        panic_guard::catch_panic(|| {
+            // Validate cert and key
+            // Note: For real we would spawn a wtransport server
+            Ok(Self { port })
         })
     }
 
     #[napi(getter)]
     pub fn port(&self) -> u32 {
-        self.port
+        panic_guard::catch_panic(|| Ok(self.port)).unwrap_or(0)
     }
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        Ok(())
+        panic_guard::catch_panic(|| Ok(()))
     }
 
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::ServerMetricsSnapshot> {
-        Ok(crate::metrics::ServerMetricsSnapshot {
+        panic_guard::catch_panic(|| Ok(crate::metrics::ServerMetricsSnapshot {
             now_ms: 0.0,
             sessions_active: 0,
             handshakes_in_flight: 0,
@@ -55,6 +53,6 @@ impl ServerHandle {
             backpressure_timeout_count: 0,
             rate_limited_count: 0,
             limit_exceeded_count: 0,
-        })
+        }))
     }
 }
