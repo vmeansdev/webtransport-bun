@@ -132,19 +132,18 @@ fn init_runtime_inner(env: Env, callback: JsFunction) -> Result<()> {
             },
         )?;
 
-    // Spawn a Tokio task to drain evt_rx and notify JS
+    // Spawn a Tokio task to drain evt_rx and notify JS (panic-safe)
     RUNTIME.spawn(async move {
-        while let Some(evt) = evt_rx.recv().await {
-            let mut batch = vec![];
-            batch.push(JsEvent { name: "pong".to_string(), session_id: None });
-            
-            // Drain queue
-            while let Ok(Event::Pong) = evt_rx.try_recv() {
+        panic_guard::spawn_quic_task(async move {
+            while let Some(_evt) = evt_rx.recv().await {
+                let mut batch = vec![];
                 batch.push(JsEvent { name: "pong".to_string(), session_id: None });
+                while let Ok(Event::Pong) = evt_rx.try_recv() {
+                    batch.push(JsEvent { name: "pong".to_string(), session_id: None });
+                }
+                tsfn.call(batch, ThreadsafeFunctionCallMode::NonBlocking);
             }
-            
-            tsfn.call(batch, ThreadsafeFunctionCallMode::NonBlocking);
-        }
+        });
     });
 
     Ok(())

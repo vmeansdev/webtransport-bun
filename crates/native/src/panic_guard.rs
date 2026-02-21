@@ -25,3 +25,21 @@ where
         }
     }
 }
+
+/// Spawn a Tokio task that touches QUIC. Panics in the task are contained:
+/// the runtime continues; a watcher logs and can trigger teardown.
+/// Use this instead of `Runtime::spawn` for any task that drives wtransport/quinn.
+pub fn spawn_quic_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::task::spawn(fut);
+    tokio::task::spawn(async move {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                eprintln!("webtransport-native: QUIC task panicked (contained): {:?}", e);
+                // TODO: trigger session/server teardown when we have a shutdown channel
+            }
+        }
+    });
+}
