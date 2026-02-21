@@ -155,7 +155,7 @@ pub(crate) fn spawn_wtransport_server(
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
-    use wtransport::{Endpoint, Identity, ServerConfig};
+    use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
     RUNTIME.spawn(async move {
         panic_guard::spawn_quic_task(async move {
@@ -184,7 +184,10 @@ pub(crate) fn spawn_wtransport_server(
             loop {
                 let incoming = server.accept();
                 tokio::select! {
-                    _ = shutdown_rx.changed() => break,
+                    _ = shutdown_rx.changed() => {
+                        server.close(VarInt::from_u32(0), b"server closing");
+                        break;
+                    }
                     incoming_session = incoming => {
                         let metrics = Arc::clone(&metrics);
                         let limits = limits.clone();
@@ -304,21 +307,30 @@ pub(crate) fn spawn_wtransport_server(
                                             m_dgram.clone(),
                                             spawn_tracked::TaskKind::Stream,
                                             async move {
-                                                while let Ok(dgram) = conn_dgram.receive_datagram().await {
-                                                    m_dgram.datagrams_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                                    if dgram.len() > lim_dgram.max_datagram_size {
-                                                        m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                                        continue;
+                                                loop {
+                                                    tokio::select! {
+                                                        res = conn_dgram.receive_datagram() => {
+                                                            let dgram = match res {
+                                                                Ok(d) => d,
+                                                                Err(_) => break,
+                                                            };
+                                                            m_dgram.datagrams_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                            if dgram.len() > lim_dgram.max_datagram_size {
+                                                                m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                                continue;
+                                                            }
+                                                            let sz = dgram.len() as u64;
+                                                            if !m_dgram.try_reserve_queued_bytes(sz, lim_dgram.max_queued_bytes_global) {
+                                                                m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                                continue;
+                                                            }
+                                                            if conn_dgram.send_datagram(dgram.as_ref()).is_ok() {
+                                                                m_dgram.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                            }
+                                                            m_dgram.release_queued_bytes(sz);
+                                                        }
+                                                        _ = conn_dgram.closed() => break,
                                                     }
-                                                    let sz = dgram.len() as u64;
-                                                    if !m_dgram.try_reserve_queued_bytes(sz, lim_dgram.max_queued_bytes_global) {
-                                                        m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                                        continue;
-                                                    }
-                                                    if conn_dgram.send_datagram(dgram.as_ref()).is_ok() {
-                                                        m_dgram.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                                    }
-                                                    m_dgram.release_queued_bytes(sz);
                                                 }
                                                 rate_limit::release_per_ip_session(&peer_ip_for_release);
                                                 m_dgram.sessions_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

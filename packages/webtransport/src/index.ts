@@ -362,7 +362,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
     return {
         address: { host: opts.host ?? "0.0.0.0", port: handle.port },
-        close: async () => await handle.close(),
+        close: async () => {
+            await handle.close();
+            for (const [id, resolve] of closedResolvers) {
+                closedResolvers.delete(id);
+                resolve({ code: 0, reason: "server closed" });
+            }
+        },
         metricsSnapshot: () => handle.metricsSnapshot(),
     };
 }
