@@ -1,34 +1,60 @@
 # Load & Soak Tests
 
 ## Purpose
-Verify that the webtransport-bun server handles sustained load without:
+Verify that the WebTransport server handles sustained load without:
 - Memory leaks (bounded buffers must hold)
 - Task leaks (all Tokio tasks join on shutdown)
 - Performance degradation over time
 
-## Planned tests
+## Tests
 
 ### Short load test (CI)
-- Duration: 30 seconds
-- Concurrent sessions: 100
-- Datagrams: 1000/s per session
-- Stream opens: 10/s per session
-- **Pass criteria**: no errors, RSS stays within 2× initial
+- Duration: 20 seconds
+- Concurrent sessions: 20 (staggered)
+- Datagrams: 50/s, streams: 2/s per session
+- **Pass criteria**: no errors, server RSS within 2× initial (when measurable)
 
 ### Soak test (nightly)
 - Duration: 30 minutes
 - Concurrent sessions: 500
-- Mixed datagram + stream workload
-- **Pass criteria**: no errors, no memory growth beyond 1.5× steady state
+- Datagrams: 500/s, streams: 5/s
+- **Pass criteria**: no errors
 
 ## Running
 
-```bash
-# Short load test
-bun run tools/load/load.ts --duration=30 --sessions=100
+From repo root:
 
-# Soak test
-bun run tools/load/soak.ts --duration=1800 --sessions=500
+```bash
+# Short load test (starts reference server, runs load-client)
+bun run test:load
+
+# Soak test (release build, 30 min)
+bun run test:soak
 ```
 
-> Scripts will be added once the server implementation is functional.
+Or directly:
+
+```bash
+bun tools/load/load.ts
+bun tools/load/soak.ts
+```
+
+## Components
+
+- **load-client** — Rust binary in `crates/reference` that connects to a WebTransport server and generates datagram + stream load. Built with `cargo build -p reference --bins`.
+- **load.ts** — Orchestrates reference server + load-client, checks RSS growth.
+- **soak.ts** — Same, with 30 min duration and 500 sessions (release build).
+
+## Production gates (10.2)
+
+The load harness enforces:
+- **No errors** — load-client must report zero session/datagram/stream errors.
+- **Bounded memory** — server RSS growth must stay within 2× initial (short load) or 1.5× (soak).
+
+Run from repo root so `CARGO_TARGET_DIR` and paths resolve correctly.
+
+## Known limitations
+
+The load-client uses wtransport; under heavy concurrent connect/close, wtransport may panic with
+"QUIC connection is still alive on close-cast". If load tests fail with this, try fewer sessions
+or lower rates. The interop tests (Chromium ↔ reference server) remain the primary validation.
