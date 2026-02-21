@@ -1,12 +1,14 @@
 //! WebTransport server via wtransport. Updates ServerMetrics for Phase 4.3.1.
 
-use napi_derive::napi;
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsFunction, Result};
+use napi_derive::napi;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use crate::panic_guard;
 use crate::server_metrics::ServerMetrics;
+use crate::SessionEvent;
 
 #[napi]
 pub struct ServerHandle {
@@ -25,15 +27,52 @@ impl ServerHandle {
         _key_pem: String,
         _limits_json: String,
         _rate_limits_json: String,
-        _on_session: JsFunction,
+        on_session: JsFunction,
     ) -> Result<Self> {
         panic_guard::catch_panic(|| {
+            let on_session_tsfn: Option<ThreadsafeFunction<SessionEvent, ErrorStrategy::Fatal>> =
+                on_session
+                    .create_threadsafe_function(
+                        0,
+                        |ctx: napi::threadsafe_function::ThreadSafeCallContext<SessionEvent>| {
+                            let mut evt = ctx.env.create_object()?;
+                            match &ctx.value {
+                                crate::SessionEvent::Accepted(v) => {
+                                    evt.set("name", "session")?;
+                                    evt.set("id", v.id.as_str())?;
+                                    evt.set("peerIp", v.peer_ip.as_str())?;
+                                    evt.set("peerPort", v.peer_port)?;
+                                }
+                                crate::SessionEvent::Closed { id, code, reason } => {
+                                    evt.set("name", "session_closed")?;
+                                    evt.set("id", id.as_str())?;
+                                    if let Some(c) = code {
+                                        evt.set("code", *c)?;
+                                    }
+                                    if let Some(r) = reason {
+                                        evt.set("reason", r.as_str())?;
+                                    }
+                                }
+                            }
+                            let mut arr = ctx.env.create_array_with_length(1)?;
+                            arr.set_element(0, evt)?;
+                            Ok(vec![arr])
+                        },
+                    )
+                    .ok();
+
             let metrics = Arc::new(ServerMetrics::default());
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let (shutdown_tx, shutdown_rx) = watch::channel(());
             let metrics_clone = Arc::clone(&metrics);
             let port_u16 = port.min(65535) as u16;
-            crate::spawn_wtransport_server(metrics_clone, limits, port_u16, shutdown_rx);
+            crate::spawn_wtransport_server(
+                metrics_clone,
+                limits,
+                port_u16,
+                shutdown_rx,
+                on_session_tsfn,
+            );
             Ok(Self {
                 port,
                 metrics,

@@ -6,6 +6,7 @@
 
 use napi_derive::napi;
 use once_cell::sync::Lazy;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
@@ -16,8 +17,8 @@ pub mod panic_guard;
 pub mod server;
 pub mod server_metrics;
 pub mod session;
-pub mod stream;
 pub mod spawn_tracked;
+pub mod stream;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
@@ -84,6 +85,27 @@ pub struct JsEvent {
     pub session_id: Option<u32>,
 }
 
+/// Data passed to on_session callback when a session is accepted (P0-A).
+#[derive(Clone, Debug)]
+pub struct SessionAccepted {
+    pub id: String,
+    pub peer_ip: String,
+    pub peer_port: u32,
+}
+
+/// Session lifecycle event: accepted or closed.
+#[derive(Clone, Debug)]
+pub enum SessionEvent {
+    Accepted(SessionAccepted),
+    Closed {
+        id: String,
+        code: Option<u32>,
+        reason: Option<String>,
+    },
+}
+
+static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Smoke-test export (trivial function to verify .node loads in Bun)
 // ---------------------------------------------------------------------------
@@ -120,6 +142,12 @@ pub(crate) fn spawn_wtransport_server(
     limits: limits::Limits,
     port: u16,
     mut shutdown_rx: watch::Receiver<()>,
+    on_session_tsfn: Option<
+        napi::threadsafe_function::ThreadsafeFunction<
+            SessionEvent,
+            napi::threadsafe_function::ErrorStrategy::Fatal,
+        >,
+    >,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -157,6 +185,7 @@ pub(crate) fn spawn_wtransport_server(
                     incoming_session = incoming => {
                         let metrics = Arc::clone(&metrics);
                         let limits = limits.clone();
+                        let on_session = on_session_tsfn.clone();
                         spawn_tracked::spawn_tracked(
                             metrics.clone(),
                             spawn_tracked::TaskKind::Session,
@@ -179,6 +208,31 @@ pub(crate) fn spawn_wtransport_server(
                                     Ok(connection) => {
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                         metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
+
+                                        // P0-A: Emit session-accepted to JS
+                                        let id = format!(
+                                            "sess-{}",
+                                            SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        );
+                                        if let Some(ref tsfn) = on_session {
+                                            let (peer_ip, peer_port) = {
+                                                let addr = connection.remote_address();
+                                                (
+                                                    addr.ip().to_string(),
+                                                    addr.port() as u32,
+                                                )
+                                            };
+                                            let accepted = SessionAccepted {
+                                                id: id.clone(),
+                                                peer_ip: peer_ip.clone(),
+                                                peer_port,
+                                            };
+                                            tsfn.call(
+                                                SessionEvent::Accepted(accepted),
+                                                napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                            );
+                                        }
+
                                         let conn_bidi = connection.clone();
                                         let conn_uni = connection.clone();
                                         let conn_dgram = connection.clone();
@@ -241,27 +295,34 @@ pub(crate) fn spawn_wtransport_server(
                                             },
                                         );
                                         // Datagram echo (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
+                                        let on_session_closed = on_session.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
                                             spawn_tracked::TaskKind::Stream,
                                             async move {
                                                 while let Ok(dgram) = conn_dgram.receive_datagram().await {
-                                                    m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
+                                                    m_dgram.datagrams_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                     if dgram.len() > lim_dgram.max_datagram_size {
-                                                        m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                        m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                         continue;
                                                     }
                                                     let sz = dgram.len() as u64;
                                                     if !m_dgram.try_reserve_queued_bytes(sz, lim_dgram.max_queued_bytes_global) {
-                                                        m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                        m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                         continue;
                                                     }
                                                     if conn_dgram.send_datagram(dgram.as_ref()).is_ok() {
-                                                        m_dgram.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                        m_dgram.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                     }
                                                     m_dgram.release_queued_bytes(sz);
                                                 }
-                                                m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                m_dgram.sessions_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                                if let Some(ref tsfn) = on_session_closed {
+                                                    tsfn.call(
+                                                        SessionEvent::Closed { id: id.clone(), code: None, reason: None },
+                                                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                                    );
+                                                }
                                             },
                                         );
                                     }
@@ -305,9 +366,15 @@ fn init_runtime_inner(env: Env, callback: JsFunction) -> Result<()> {
         panic_guard::spawn_quic_task(async move {
             while let Some(_evt) = evt_rx.recv().await {
                 let mut batch = vec![];
-                batch.push(JsEvent { name: "pong".to_string(), session_id: None });
+                batch.push(JsEvent {
+                    name: "pong".to_string(),
+                    session_id: None,
+                });
                 while let Ok(Event::Pong) = evt_rx.try_recv() {
-                    batch.push(JsEvent { name: "pong".to_string(), session_id: None });
+                    batch.push(JsEvent {
+                        name: "pong".to_string(),
+                        session_id: None,
+                    });
                 }
                 tsfn.call(batch, ThreadsafeFunctionCallMode::NonBlocking);
             }

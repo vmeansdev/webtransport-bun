@@ -246,9 +246,11 @@ try {
 
 class NativeServerSession implements ServerSession {
     #nativeHandle: any;
+    #closedPromise: Promise<CloseInfo>;
 
-    constructor(nativeHandle: any) {
+    constructor(nativeHandle: any, closedPromise: Promise<CloseInfo>) {
         this.#nativeHandle = nativeHandle;
+        this.#closedPromise = closedPromise;
     }
 
     get id(): string {
@@ -262,13 +264,12 @@ class NativeServerSession implements ServerSession {
         };
     }
 
-    // Phase 5.3 stub
     get ready(): Promise<void> {
-        return Promise.resolve(); // Stub for now
+        return Promise.resolve();
     }
 
     get closed(): Promise<CloseInfo> {
-        return new Promise(() => { }); // Stub for now
+        return this.#closedPromise;
     }
 
     close(info?: CloseInfo): void {
@@ -335,15 +336,19 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     const limitsJson = JSON.stringify({ ...DEFAULT_LIMITS, ...opts.limits });
     const rateLimitsJson = JSON.stringify({ ...DEFAULT_RATE_LIMITS, ...opts.rateLimits });
 
+    const closedResolvers = new Map<string, (info: CloseInfo) => void>();
     const handle = new native.ServerHandle(opts.port, certPem, keyPem, limitsJson, rateLimitsJson, (events: any[]) => {
-        // TSFN callbacks for session events
         for (const evt of events) {
-            if (evt.name === "session") {
-                // evt.handle is the native session handle passed from Rust
-                // But for now, let's say Rust just passes an object, or we explicitly create one:
-                // const nativeSession = new native.SessionHandle("test-id", "127.0.0.1", 12345);
-                // const session = new NativeServerSession(nativeSession);
-                // opts.onSession(session);
+            if (evt.name === "session" && evt.id != null && evt.peerIp != null && evt.peerPort != null) {
+                let closedResolve!: (info: CloseInfo) => void;
+                const closedPromise = new Promise<CloseInfo>((resolve) => { closedResolve = resolve; });
+                closedResolvers.set(evt.id, closedResolve);
+                const nativeSession = new native.SessionHandle(evt.id, evt.peerIp, evt.peerPort);
+                opts.onSession(new NativeServerSession(nativeSession, closedPromise));
+            } else if (evt.name === "session_closed" && evt.id != null) {
+                const resolve = closedResolvers.get(evt.id);
+                closedResolvers.delete(evt.id);
+                if (resolve) resolve({ code: evt.code, reason: evt.reason });
             }
         }
     });
