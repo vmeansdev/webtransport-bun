@@ -1,0 +1,33 @@
+# CI: build, test, interop (Chromium). Phase 8.1, 10.2.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - name: Build native addon
+        run: bun run build:native
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Unit tests
+        run: bun test packages/
+      - name: Build reference + load-client
+        run: cargo build -p reference --bins
+      - name: Load-addon test
+        run: bun run test:load-addon
+        timeout-minutes: 5
+      - name: Overload-addon test
+        run: bun run test:overload-addon
+        timeout-minutes: 2
+      - name: Interop (Chromium)
+        run: cd tools/interop && bun install && bun run playwright test
+        timeout-minutes: 5

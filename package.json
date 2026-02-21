@@ -12,7 +12,9 @@
     "test:soak": "bun tools/load/soak.ts",
     "test:overload": "bun tools/load/overload-session.ts",
     "test:overload-addon": "bun tools/load/overload-addon.ts",
-    "test:load-addon": "bun tools/load/load-addon.ts"
+    "test:load-addon": "bun tools/load/load-addon.ts",
+    "test:soak-addon": "bun tools/load/soak-addon.ts",
+    "bench:datagram": "bun tools/bench/datagram-throughput.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

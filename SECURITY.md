@@ -31,7 +31,7 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 - maxQueuedBytes global/per-session/per-stream
 - maxDatagramSize cap
 3. Rate limits per peer IP
-- token buckets for handshakes, stream opens, datagram ingress
+- RateLimitOptions (handshakesPerSec, streamsPerSec, datagramsPerSec) configurable via createServer; per-IP token buckets and per-subnet limits planned
 4. Panic containment
 - Rust panics must be caught at task boundaries where possible
 - convert to E_INTERNAL and close affected session/server
@@ -51,6 +51,9 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
   - scale horizontally
 
 ## Dependency policy
-- Pin wtransport + transitive QUIC/H3 dependencies to known-good versions.
-- Monthly dependency update cadence.
+- Pin wtransport + transitive QUIC/H3 dependencies (see Cargo.lock).
+- Monthly dependency update cadence; security patches applied promptly.
 - Respond to CVEs quickly; publish security advisories if needed.
+
+## Security reporting
+- Report vulnerabilities via GitHub Security Advisories or a dedicated contact (see CONTRIBUTING).

@@ -108,6 +108,16 @@ async function main() {
     await server.close();
     const finalFd = await getFdCount(process.pid);
 
+    // Leak checks: task gauges and queued bytes return to baseline
+    if (m.sessionTasksActive > 10 || m.streamTasksActive > 10) {
+        console.error("load-addon: FAIL (task gauges high:", m.sessionTasksActive, m.streamTasksActive, ")");
+        process.exit(1);
+    }
+    if (m.queuedBytesGlobal > 128 * 1024) {
+        console.error("load-addon: FAIL (queuedBytesGlobal not baseline:", m.queuedBytesGlobal, ")");
+        process.exit(1);
+    }
+
     if (exitCode !== 0) {
         console.error("load-addon: FAIL (load-client exited with", exitCode, ")");
         process.exit(1);

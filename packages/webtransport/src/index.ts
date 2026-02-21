@@ -108,12 +108,14 @@ export const DEFAULT_RATE_LIMITS: RateLimitOptions = {
 // Logging
 // ---------------------------------------------------------------------------
 
+/** Structured log event. Include sessionId, peerIp, peerPort, error code for incident diagnosis. */
 export type LogEvent = {
     level: "debug" | "info" | "warn" | "error";
     msg: string;
     sessionId?: string;
     peerIp?: string;
     peerPort?: number;
+    /** Error code (e.g. E_SESSION_CLOSED), counters context */
     data?: Record<string, unknown>;
 };
 

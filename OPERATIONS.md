@@ -15,12 +15,23 @@ Operational requirements:
 - Keep per-session queued bytes low (<= 2 MiB).
 - Prefer backpressure over drops; enable drop policy only for datagrams if you accept loss.
 
+## Enforced caps
+- Datagram size: maxDatagramSize (must respect negotiated QUIC max)
+- Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
+
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive
 - queuedBytesGlobal
 - datagramsDropped
 - backpressureTimeoutCount
 - rateLimitedCount, limitExceededCount
+
+## Idle timeout behavior
+
+- `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.
+- Activity: any data sent or received (handshake, datagrams, stream data). QUIC keepalives may extend the window.
+- When idle timeout fires: session closes with appropriate code; `closed` promise resolves.
+- Slow-reader detection (planned): streams with sustained backpressure beyond backpressureTimeoutMs are reset.
 
 ## Troubleshooting
 1) Browser cannot connect
