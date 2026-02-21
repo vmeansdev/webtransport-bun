@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 pub mod server;
 pub mod session;
 pub mod stream;
+pub mod metrics;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton

@@ -309,7 +309,7 @@ class NativeServerSession implements ServerSession {
     }
 
     metricsSnapshot(): SessionMetricsSnapshot {
-        throw new Error("Method not implemented.");
+        return this.#nativeHandle.metricsSnapshot();
     }
 }
 
@@ -341,7 +341,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     return {
         address: { host: opts.host ?? "0.0.0.0", port: handle.port },
         close: async () => await handle.close(),
-        metricsSnapshot: () => ({ /* stub */ } as any),
+        metricsSnapshot: () => handle.metricsSnapshot(),
     };
 }
 

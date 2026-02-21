@@ -31,4 +31,22 @@ impl ServerHandle {
     pub async fn close(&self) -> Result<()> {
         Ok(())
     }
+
+    #[napi]
+    pub fn metrics_snapshot(&self) -> Result<crate::metrics::ServerMetricsSnapshot> {
+        Ok(crate::metrics::ServerMetricsSnapshot {
+            now_ms: 0.0,
+            sessions_active: 0,
+            handshakes_in_flight: 0,
+            streams_active: 0,
+            datagrams_in: 0,
+            datagrams_out: 0,
+            datagrams_dropped: 0,
+            queued_bytes_global: 0,
+            backpressure_wait_count: 0,
+            backpressure_timeout_count: 0,
+            rate_limited_count: 0,
+            limit_exceeded_count: 0,
+        })
+    }
 }

@@ -75,4 +75,14 @@ impl SessionHandle {
     pub async fn accept_uni_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
         Ok(None)
     }
+
+    #[napi]
+    pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
+        Ok(crate::metrics::SessionMetricsSnapshot {
+            datagrams_in: 0,
+            datagrams_out: 0,
+            streams_active: 0,
+            queued_bytes: 0,
+        })
+    }
 }
