@@ -3,6 +3,7 @@ node_modules
 
 # output
 out
+target
 dist
 *.tgz
 
