@@ -232,16 +232,23 @@ export type SessionMetricsSnapshot = {
 
 import { createRequire } from "node:module";
 
-// Resolving the native module based on platform
+// Resolving the native module: prebuilds (published) or crates/native (dev)
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
+const BINARY = `webtransport-native.${PLATFORM}-${ARCH}.node`;
 let native: any;
-try {
-    native = _require(`../../../crates/native/webtransport-native.${PLATFORM}-${ARCH}.node`);
-} catch (e) {
-    // fallback or error
-    // console.error("Failed to load native addon:", e);
+const paths = [
+    `../../../crates/native/${BINARY}`,
+    `../prebuilds/${BINARY}`,
+];
+for (const p of paths) {
+    try {
+        native = _require(p);
+        break;
+    } catch {
+        continue;
+    }
 }
 
 class NativeServerSession implements ServerSession {

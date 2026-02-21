@@ -1,18 +1,20 @@
 {
-    "name": "@webtransport-bun/webtransport",
-    "version": "0.0.1",
-    "private": true,
-    "type": "module",
-    "main": "src/index.ts",
-    "types": "src/index.ts",
-    "exports": {
-        ".": {
-            "import": "./src/index.ts",
-            "types": "./src/index.ts"
-        }
-    },
-    "scripts": {
-        "test": "bun test",
-        "typecheck": "tsc --noEmit"
+  "name": "@webtransport-bun/webtransport",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
     }
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prebuild": "cd ../.. && bun run build:native && mkdir -p packages/webtransport/prebuilds && cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/ 2>/dev/null || true"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"]
 }
