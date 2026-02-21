@@ -10,8 +10,8 @@ Track known wtransport issues that impact correctness during termination and loa
 2. **Reset send side on session termination** — [wtransport#242](https://github.com/BiagioFesta/wtransport/issues/242)  
    Affects orderly shutdown semantics.
 
-3. **close-cast race condition** — Addressed in wtransport 0.7.x.  
-   If load-client panics with "QUIC connection is still alive on close-cast", verify pinned version and consider minimal repro for upstream.
+3. **close-cast race condition** — Addressed in wtransport 0.7.0.  
+   Pinned to `0.7`. If load-client still panics with "QUIC connection is still alive on close-cast" under concurrent connect/close, reduce to minimal repro and open upstream issue with backtrace.
 
 ## Mitigations in this repo
 
