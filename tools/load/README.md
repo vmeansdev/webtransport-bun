@@ -48,7 +48,9 @@ bun tools/load/soak.ts
 ## Production gates (10.2)
 
 The load harness enforces:
+- **No panics** — hard gate: any panic in load-client stderr fails the test.
 - **No errors** — load-client must report zero session/datagram/stream errors.
+- **No hangs** — global timeout; load-client join bounded.
 - **Bounded memory** — server RSS growth must stay within 2× initial (short load) or 1.5× (soak).
 
 Run from repo root so `CARGO_TARGET_DIR` and paths resolve correctly.
