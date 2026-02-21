@@ -10,6 +10,9 @@ dist
 coverage
 *.lcov
 
+# load test CI artifacts
+tools/load/*-stderr.log
+
 # logs
 logs
 _.log

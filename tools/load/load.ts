@@ -57,6 +57,8 @@ async function main() {
     const initialRss = await getServerRss();
     console.log("load: Running load-client...");
 
+    const stderrPath = process.env.CI ? `${ROOT}/tools/load/load-client-stderr.log` : null;
+
     const client = Bun.spawn(
         [
             CLIENT_BIN,
@@ -69,11 +71,35 @@ async function main() {
         {
             cwd: ROOT,
             stdout: "inherit",
-            stderr: "inherit",
+            stderr: stderrPath ? "pipe" : "inherit",
+            env: { ...process.env, RUST_BACKTRACE: "1" },
         }
     );
 
-    const exitCode = await client.exited;
+    const TIMEOUT_MS = (DURATION + 30) * 1000;
+    const exitOrTimeout = await Promise.race([
+        client.exited.then((code) => ({ done: true as const, code })),
+        Bun.sleep(TIMEOUT_MS).then(() => ({ done: false as const, code: -1 })),
+    ]);
+    if (!exitOrTimeout.done) {
+        client.kill();
+        console.error(`load: FAIL (load-client hung; timeout ${TIMEOUT_MS}ms)`);
+        process.exit(1);
+    }
+    const exitCode = exitOrTimeout.code;
+
+    let stderrText = "";
+    if (stderrPath && client.stderr) {
+        stderrText = await new Response(client.stderr).text();
+        await Bun.write(stderrPath, stderrText);
+    }
+
+    if (exitCode !== 0) {
+        if (stderrText && (stderrText.includes("panicked") || stderrText.includes("panic!"))) {
+            console.error("load: FAIL (load-client panicked)");
+            if (stderrPath) console.error("load: stderr saved to", stderrPath);
+        }
+    }
     const finalRss = await getServerRss();
     server.kill();
 

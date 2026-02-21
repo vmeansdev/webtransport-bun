@@ -45,6 +45,8 @@ async function main() {
 
     console.log("soak: Running load-client (30 min)...");
 
+    const stderrPath = process.env.CI ? `${ROOT}/tools/load/soak-client-stderr.log` : null;
+
     const client = Bun.spawn(
         [
             CLIENT_BIN_RELEASE,
@@ -57,11 +59,30 @@ async function main() {
         {
             cwd: ROOT,
             stdout: "inherit",
-            stderr: "inherit",
+            stderr: stderrPath ? "pipe" : "inherit",
+            env: { ...process.env, RUST_BACKTRACE: "1" },
         }
     );
 
-    const exitCode = await client.exited;
+    const TIMEOUT_MS = (DURATION + 60) * 1000;
+    const exitOrTimeout = await Promise.race([
+        client.exited.then((code) => ({ done: true as const, code })),
+        Bun.sleep(TIMEOUT_MS).then(() => ({ done: false as const, code: -1 })),
+    ]);
+    if (!exitOrTimeout.done) {
+        client.kill();
+        console.error(`soak: FAIL (load-client hung; timeout ${TIMEOUT_MS}ms)`);
+        process.exit(1);
+    }
+    const exitCode = exitOrTimeout.code;
+
+    if (stderrPath && client.stderr) {
+        const stderrText = await new Response(client.stderr).text();
+        await Bun.write(stderrPath, stderrText);
+        if (exitCode !== 0 && (stderrText.includes("panicked") || stderrText.includes("panic!"))) {
+            console.error("soak: FAIL (load-client panicked), stderr saved to", stderrPath);
+        }
+    }
     server.kill();
 
     if (exitCode !== 0) {
