@@ -80,4 +80,18 @@ describe("webtransport package exports", () => {
         expect(server.address.port).toBe(4433);
         expect(typeof server.close).toBe("function");
     });
+
+    it("createServer rejects unsupported tls.caPem with E_TLS", () => {
+        expect(() =>
+            createServer({
+                port: 4434,
+                tls: {
+                    certPem: "",
+                    keyPem: "",
+                    caPem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+                },
+                onSession: () => {},
+            })
+        ).toThrow(/E_TLS/);
+    });
 });

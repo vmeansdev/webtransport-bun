@@ -27,12 +27,18 @@ impl ServerHandle {
         host: String,
         cert_pem: String,
         key_pem: String,
+        ca_pem: String,
         _limits_json: String,
         _rate_limits_json: String,
         on_session: JsFunction,
         log_fn: JsFunction,
     ) -> Result<Self> {
         panic_guard::catch_panic(|| {
+            if !ca_pem.trim().is_empty() {
+                return Err(napi::Error::from_reason(
+                    "E_TLS: server tls.caPem is not supported yet",
+                ));
+            }
             let session_tsfn: Option<ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal>> =
                 on_session
                     .create_threadsafe_function(

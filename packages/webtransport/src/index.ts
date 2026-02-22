@@ -396,7 +396,11 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
     const certPem = typeof opts.tls.certPem === "string" ? opts.tls.certPem : new TextDecoder().decode(opts.tls.certPem);
     const keyPem = typeof opts.tls.keyPem === "string" ? opts.tls.keyPem : new TextDecoder().decode(opts.tls.keyPem);
-    // TODO(P1-6): pass caPem through to native when ServerHandle supports it
+    const caPem = typeof opts.tls.caPem === "string"
+        ? opts.tls.caPem
+        : opts.tls.caPem != null
+            ? new TextDecoder().decode(opts.tls.caPem)
+            : "";
 
     const limitsJson = JSON.stringify({ ...DEFAULT_LIMITS, ...opts.limits });
     const rateLimitsJson = JSON.stringify({ ...DEFAULT_RATE_LIMITS, ...opts.rateLimits });
@@ -419,7 +423,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
         }
     };
 
-    const handle = new native.ServerHandle(opts.port, opts.host ?? "0.0.0.0", certPem, keyPem, limitsJson, rateLimitsJson, (events: any[]) => {
+    const handle = new native.ServerHandle(opts.port, opts.host ?? "0.0.0.0", certPem, keyPem, caPem, limitsJson, rateLimitsJson, (events: any[]) => {
         for (const evt of events) {
             if (evt.name === "session" && evt.id != null && evt.peerIp != null && evt.peerPort != null) {
                 let closedResolve!: (info: CloseInfo) => void;
