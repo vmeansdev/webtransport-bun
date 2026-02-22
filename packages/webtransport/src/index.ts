@@ -302,27 +302,27 @@ class NativeServerSession implements ServerSession {
 
     async createBidirectionalStream(): Promise<Duplex> {
         const nativeStream = await this.#nativeHandle.createBidiStream();
-        return new BidiStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
+        return new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
         while (true) {
             const nativeStream = await this.#nativeHandle.acceptBidiStream();
             if (!nativeStream) break;
-            yield new BidiStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
+            yield new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
         }
     }
 
     async createUnidirectionalStream(): Promise<Writable> {
         const nativeStream = await this.#nativeHandle.createUniStream();
-        return new SendStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
+        return new SendStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
         while (true) {
             const nativeStream = await this.#nativeHandle.acceptUniStream();
             if (!nativeStream) break;
-            yield new RecvStream({ handleId: nativeStream.id, nativeHandle: nativeStream });
+            yield new RecvStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
         }
     }
 
@@ -472,6 +472,7 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
 
     const optsJson = JSON.stringify({
         limits: opts?.limits ? { ...DEFAULT_LIMITS, ...opts.limits } : undefined,
+        tls: opts?.tls ? { insecureSkipVerify: opts.tls.insecureSkipVerify ?? false } : undefined,
     });
 
     return new Promise((resolve, reject) => {

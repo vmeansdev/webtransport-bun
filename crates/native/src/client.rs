@@ -399,20 +399,47 @@ pub fn take_client_session(handle_id: String) -> Result<Option<ClientSessionHand
     Ok(reg.remove(&handle_id))
 }
 
+const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+
 async fn run_connect(
     url: &str,
-    _opts_json: String,
+    opts_json: String,
 ) -> std::result::Result<
     (String, String, u32, wtransport::Connection),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let config = wtransport::ClientConfig::builder()
-        .with_bind_default()
-        .with_no_cert_validation()
-        .build();
+    let opts = serde_json::from_str::<serde_json::Value>(&opts_json).unwrap_or_default();
+
+    let insecure_skip_verify = opts
+        .get("tls")
+        .and_then(|t| t.get("insecureSkipVerify")?.as_bool())
+        .unwrap_or(false);
+
+    let handshake_timeout_ms = opts
+        .get("limits")
+        .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+
+    let config = if insecure_skip_verify {
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_no_cert_validation()
+            .build()
+    } else {
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_native_certs()
+            .build()
+    };
 
     let endpoint = wtransport::Endpoint::client(config)?;
-    let conn = endpoint.connect(url).await?;
+    let conn = tokio::time::timeout(
+        tokio::time::Duration::from_millis(handshake_timeout_ms),
+        endpoint.connect(url),
+    )
+    .await
+    .map_err(|_| "E_HANDSHAKE_TIMEOUT")?
+    ?;
 
     let id = format!(
         "client-{}",
