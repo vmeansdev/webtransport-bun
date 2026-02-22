@@ -10,10 +10,13 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
 - tests
 
 ## Threading model
-- One dedicated Rust thread hosts a Tokio runtime.
-- All wtransport objects are owned and driven on that runtime.
-- JS calls enqueue commands to the runtime via bounded channels.
-- Runtime emits events back to JS via ThreadsafeFunction (TSFN) using batching.
+- Two dedicated Tokio runtimes, each with 1 worker thread:
+  - **RUNTIME** (`wt-server`): drives server accept loop, server-side sessions, and stream bridges.
+  - **CLIENT_RUNTIME** (`wt-client`): drives client connections and client-side stream bridges.
+- Isolation prevents same-process deadlock when client and server share a process (e.g. tests).
+- All wtransport objects are owned and driven on these runtimes.
+- JS calls enqueue commands to the runtimes via bounded channels.
+- Runtimes emit events back to JS via ThreadsafeFunction (TSFN) using batching.
 
 ## Object model and lifetimes
 - ServerHandle: owns UDP socket and accept loop.

@@ -59,7 +59,7 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 ## Implementation constraints (must follow)
 1. Node streams for stream surfaces (Readable/Writable/Duplex).
 2. Promise-based datagram sending with bounded in-flight/backpressure.
-3. Single Tokio runtime thread owned by the addon.
+3. Two dedicated Tokio runtimes (server + client), each single-threaded and owned by the addon; cross-runtime communication must stay bounded and deterministic.
 4. Bounded queues for all JS↔Rust crossings; all buffers counted against budgets.
 5. JS callback delivery must be rate-limited/batched to prevent per-packet callback storms.
 

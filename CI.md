@@ -6,6 +6,12 @@
 - Run Bun integration tests on both
 - Run Chromium interop tests at least on Linux
 
+## Supported targets (shipped prebuilds)
+| Target           | Runner         | Architecture |
+|------------------|----------------|--------------|
+| `darwin-arm64`   | `macos-latest` | aarch64      |
+| `linux-x64`     | `ubuntu-latest`| x86_64       |
+
 ## Recommended GitHub Actions jobs
 1) lint
 - bun lint/tsc
@@ -24,8 +30,9 @@
 - (interop optional on macOS if too heavy)
 
 4) prebuild
-- build release binaries for supported targets
+- build release binaries for each target in the matrix above (`darwin-arm64`, `linux-x64`)
 - attach to release or upload to artifact store
+- verify checksums for each artifact
 
 ## Release flow
 - Tag `vX.Y.Z`
