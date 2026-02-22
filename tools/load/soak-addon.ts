@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Soak test targeting addon server (createServer). Phase 9.
- * Duration via SOAK_DURATION env (default 1800 = 30 min). Use SOAK_DURATION=86400 for 24h.
+ * Env: SOAK_DURATION (default 1800), SOAK_SESSIONS (500), SOAK_DATAGRAMS_PER_SEC (500), SOAK_STREAMS_PER_SEC (5).
+ * Use SOAK_DURATION=43200 for 12h, 86400 for 24h. Trend-based leak gate when duration >= 3600.
  */
 
 import { createServer, DEFAULT_LIMITS } from "../../packages/webtransport/src/index.ts";
@@ -10,10 +11,20 @@ import { existsSync } from "node:fs";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
-const DURATION = parseInt(process.env.SOAK_DURATION ?? "1800", 10); // 30 min default
-const SESSIONS = 500;
-const DATAGRAMS_PER_SEC = 500;
-const STREAMS_PER_SEC = 5;
+const DURATION = parseInt(process.env.SOAK_DURATION ?? "1800", 10);
+const SESSIONS = parseInt(process.env.SOAK_SESSIONS ?? "500", 10);
+const DATAGRAMS_PER_SEC = parseInt(process.env.SOAK_DATAGRAMS_PER_SEC ?? "500", 10);
+const STREAMS_PER_SEC = parseInt(process.env.SOAK_STREAMS_PER_SEC ?? "5", 10);
+
+type Sample = { rss: number; fd: number; sessions: number; streams: number; queued: number };
+
+function getRssMb(): number {
+    try {
+        return (process.memoryUsage?.()?.rss ?? 0) / (1024 * 1024);
+    } catch {
+        return 0;
+    }
+}
 
 async function getFdCount(pid: number): Promise<number> {
     try {
@@ -57,6 +68,7 @@ async function main() {
 
     const maxQueuedBytesGlobal = DEFAULT_LIMITS.maxQueuedBytesGlobal;
     const pollIntervalMs = 30_000;
+    const samples: Sample[] = [];
     const poller = (async () => {
         const start = Date.now();
         while (Date.now() - start < (DURATION + 60) * 1000) {
@@ -66,6 +78,13 @@ async function main() {
                 await server.close();
                 process.exit(1);
             }
+            samples.push({
+                rss: getRssMb(),
+                fd: await getFdCount(process.pid),
+                sessions: m.sessionsActive,
+                streams: m.streamsActive,
+                queued: m.queuedBytesGlobal,
+            });
             await Bun.sleep(pollIntervalMs);
         }
     })();
@@ -129,6 +148,25 @@ async function main() {
     if (m.queuedBytesGlobal > 1024 * 1024) {
         console.error("soak-addon: FAIL (queuedBytesGlobal not baseline:", m.queuedBytesGlobal, ")");
         process.exit(1);
+    }
+
+    if (DURATION >= 3600 && samples.length >= 10) {
+        const firstThird = samples.slice(0, Math.floor(samples.length / 3));
+        const lastThird = samples.slice(-Math.floor(samples.length / 3));
+        const avg = (arr: Sample[], key: keyof Sample) =>
+            arr.reduce((s, x) => s + (typeof x[key] === "number" ? (x[key] as number) : 0), 0) / arr.length;
+        const rssFirst = avg(firstThird, "rss");
+        const rssLast = avg(lastThird, "rss");
+        const fdFirst = avg(firstThird, "fd");
+        const fdLast = avg(lastThird, "fd");
+        if (rssFirst > 0 && rssLast > rssFirst * 1.2) {
+            console.error("soak-addon: FAIL (trend: RSS", rssFirst.toFixed(1), "->", rssLast.toFixed(1), "MB, >20% growth)");
+            process.exit(1);
+        }
+        if (fdFirst > 0 && fdLast > fdFirst * 1.2) {
+            console.error("soak-addon: FAIL (trend: FD", fdFirst.toFixed(0), "->", fdLast.toFixed(0), ">20% growth)");
+            process.exit(1);
+        }
     }
 
     console.log("soak-addon: PASS");

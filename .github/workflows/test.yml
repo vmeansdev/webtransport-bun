@@ -47,6 +47,9 @@ jobs:
       - name: Load-addon test
         run: bun run test:load-addon
         timeout-minutes: 5
+      - name: Load-scale-addon (200 sessions, 30s)
+        run: LOAD_SCALE_SESSIONS=200 LOAD_SCALE_DURATION=30 bun run test:load-scale-addon
+        timeout-minutes: 3
       - name: Overload-addon test
         run: bun run test:overload-addon
         timeout-minutes: 2

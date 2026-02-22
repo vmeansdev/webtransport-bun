@@ -33,6 +33,22 @@ Operational requirements:
 - When idle timeout fires: session closes with appropriate code; `closed` promise resolves.
 - Slow-reader detection (planned): streams with sustained backpressure beyond backpressureTimeoutMs are reset.
 
+## Runbook: queued bytes climb
+When `queuedBytesGlobal` rises and stays high:
+- **Cause**: Slow consumers (clients not reading), too many concurrent streams, or bursty senders.
+- **Check**: `streamsActive`, `datagramsIn` vs `datagramsOut` (backlog), `backpressureTimeoutCount`.
+- **Actions**:
+  - Reduce `maxQueuedBytesPerStream` or `maxQueuedBytesPerSession` to shed slow readers sooner.
+  - Lower `maxStreamsPerSessionBidi`/`Uni` to limit per-session concurrency.
+  - Enable debug logging to identify high-queue sessions.
+- **Scale**: Add server instances and load-balance; reduce per-instance `maxSessions`.
+
+## Runbook: tuning limits safely
+- **Start conservative**: `maxSessions` 200–500, `maxQueuedBytesPerStream` 256 KiB.
+- **Increase gradually**: After soak/load tests, bump by ~20% and re-run tests.
+- **Monitor**: Track `limitExceededCount`, `rateLimitedCount`, `backpressureTimeoutCount` after changes.
+- **Avoid**: Setting `maxQueuedBytesGlobal` > 512 MiB without load testing; unbounded growth risks OOM.
+
 ## Troubleshooting
 1) Browser cannot connect
 - Verify UDP port open
