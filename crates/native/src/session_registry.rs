@@ -5,12 +5,30 @@
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use wtransport::Connection;
 
 use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
 use crate::server_metrics::ServerMetrics;
+
+/// Per-session metrics for `metricsSnapshot()` and per-session stream caps.
+#[derive(Default)]
+pub struct SessionMetrics {
+    pub datagrams_in: AtomicU64,
+    pub datagrams_out: AtomicU64,
+    pub streams_bidi_active: AtomicU64,
+    pub streams_uni_active: AtomicU64,
+    pub queued_bytes: AtomicU64,
+}
+
+impl SessionMetrics {
+    pub fn streams_active(&self) -> u64 {
+        self.streams_bidi_active.load(Ordering::Relaxed)
+            + self.streams_uni_active.load(Ordering::Relaxed)
+    }
+}
 
 /// Channel capacity for datagrams per session (bounded to prevent unbounded buffering).
 const DGRAM_CHANNEL_CAPACITY: usize = 2048;
@@ -29,6 +47,8 @@ pub struct SessionState {
     pub dgram_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     /// Server metrics (for datagrams_out when send_datagram succeeds).
     pub metrics: Arc<ServerMetrics>,
+    /// Per-session metrics for stream caps and metricsSnapshot.
+    pub session_metrics: Arc<SessionMetrics>,
     /// Receiver for accepted bidi streams (forwarded from accept loop).
     pub bidi_accept_rx: Arc<Mutex<mpsc::Receiver<ClientBidiStreamHandle>>>,
     /// Receiver for accepted uni streams.
@@ -42,8 +62,9 @@ pub struct SessionState {
 static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
 
 /// Insert a new session into the registry.
-/// Returns (dgram_tx, bidi_accept_tx, uni_accept_tx) for the caller to use in spawn tasks.
+/// Returns (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics).
 /// Caller must spawn: dgram forward, bidi accept forward, uni accept forward, create_bi handler, create_uni handler.
+#[allow(clippy::type_complexity)]
 pub fn insert(
     session_id: String,
     conn: Connection,
@@ -54,26 +75,30 @@ pub fn insert(
     mpsc::Sender<ClientUniRecvHandle>,
     mpsc::Receiver<CreateBiReq>,
     mpsc::Receiver<CreateUniReq>,
+    Arc<SessionMetrics>,
 ) {
     let (dgram_tx, dgram_rx) = mpsc::channel(DGRAM_CHANNEL_CAPACITY);
     let (bidi_accept_tx, bidi_accept_rx) = mpsc::channel(STREAM_ACCEPT_CAPACITY);
     let (uni_accept_tx, uni_accept_rx) = mpsc::channel(STREAM_ACCEPT_CAPACITY);
     let (create_bi_tx, create_bi_rx) = mpsc::channel(64);
     let (create_uni_tx, create_uni_rx) = mpsc::channel(64);
+    let session_metrics = Arc::new(SessionMetrics::default());
     let state = SessionState {
         conn,
         dgram_rx: Arc::new(Mutex::new(dgram_rx)),
         metrics,
+        session_metrics: Arc::clone(&session_metrics),
         bidi_accept_rx: Arc::new(Mutex::new(bidi_accept_rx)),
         uni_accept_rx: Arc::new(Mutex::new(uni_accept_rx)),
         create_bi_tx,
         create_uni_tx,
     };
     REGISTRY.insert(session_id, state);
-    (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx)
+    (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics)
 }
 
 /// Look up session state by id. Returns None if not found or session closed.
+#[allow(clippy::type_complexity)]
 pub fn get(
     session_id: &str,
 ) -> Option<(
@@ -101,6 +126,13 @@ pub fn get(
 /// Remove session from registry. Call when connection closes.
 pub fn remove(session_id: &str) {
     REGISTRY.remove(session_id);
+}
+
+/// Get per-session metrics by session id. Returns None if session not found.
+pub fn get_session_metrics(session_id: &str) -> Option<Arc<SessionMetrics>> {
+    REGISTRY
+        .get(session_id)
+        .map(|entry| Arc::clone(&entry.session_metrics))
 }
 
 /// Close a session: close the QUIC connection and remove from registry.

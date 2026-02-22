@@ -11,12 +11,11 @@ use std::time::Instant;
 static PER_IP_SESSIONS: Lazy<DashMap<String, AtomicU64>> = Lazy::new(DashMap::new);
 static PER_PREFIX_SESSIONS: Lazy<DashMap<String, AtomicU64>> = Lazy::new(DashMap::new);
 
-/// Token bucket state: (tokens, last_refill_instant).
-/// Uses parking_lot Mutex for low contention.
-static STREAM_BUCKETS: Lazy<DashMap<String, (std::sync::Mutex<(f64, Instant)>, f64, f64)>> =
-    Lazy::new(DashMap::new);
-static DGRAM_BUCKETS: Lazy<DashMap<String, (std::sync::Mutex<(f64, Instant)>, f64, f64)>> =
-    Lazy::new(DashMap::new);
+/// Token bucket entry: (mutex(tokens, last_refill), rate_per_sec, burst).
+type BucketEntry = (std::sync::Mutex<(f64, Instant)>, f64, f64);
+
+static STREAM_BUCKETS: Lazy<DashMap<String, BucketEntry>> = Lazy::new(DashMap::new);
+static DGRAM_BUCKETS: Lazy<DashMap<String, BucketEntry>> = Lazy::new(DashMap::new);
 
 const DEFAULT_HANDSHAKES_BURST_PER_IP: u64 = 40;
 const DEFAULT_HANDSHAKES_BURST_PER_PREFIX: u64 = 100;
@@ -152,7 +151,7 @@ pub fn release_per_ip_session(peer_ip: &str) {
 }
 
 fn try_acquire_token(
-    buckets: &DashMap<String, (std::sync::Mutex<(f64, Instant)>, f64, f64)>,
+    buckets: &DashMap<String, BucketEntry>,
     peer_ip: &str,
     rate_per_sec: f64,
     burst: f64,
@@ -200,4 +199,20 @@ pub fn try_acquire_datagram_ingress(peer_ip: &str) -> bool {
         DEFAULT_DATAGRAMS_PER_SEC,
         DEFAULT_DATAGRAMS_BURST,
     )
+}
+
+/// Remove stale entries from token buckets and zero-count session counters.
+/// Call periodically (e.g. every 60s) to prevent unbounded memory growth.
+pub fn cleanup_stale_entries(max_idle_secs: f64) {
+    let now = Instant::now();
+    STREAM_BUCKETS.retain(|_, v| {
+        let guard = v.0.lock().unwrap();
+        now.duration_since(guard.1).as_secs_f64() < max_idle_secs
+    });
+    DGRAM_BUCKETS.retain(|_, v| {
+        let guard = v.0.lock().unwrap();
+        now.duration_since(guard.1).as_secs_f64() < max_idle_secs
+    });
+    PER_IP_SESSIONS.retain(|_, v| v.load(Ordering::Relaxed) > 0);
+    PER_PREFIX_SESSIONS.retain(|_, v| v.load(Ordering::Relaxed) > 0);
 }

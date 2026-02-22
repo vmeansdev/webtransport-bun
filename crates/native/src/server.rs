@@ -20,9 +20,11 @@ pub struct ServerHandle {
 #[napi]
 impl ServerHandle {
     #[napi(constructor)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         _env: Env,
         port: u32,
+        host: String,
         cert_pem: String,
         key_pem: String,
         _limits_json: String,
@@ -75,6 +77,7 @@ impl ServerHandle {
                 limits,
                 handshakes_burst_per_ip,
                 handshakes_burst_per_prefix,
+                host,
                 port_u16,
                 shutdown_rx,
                 on_session_tsfn,

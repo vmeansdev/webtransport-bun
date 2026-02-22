@@ -2,8 +2,6 @@
 //! sends datagram and receives echo. Used to isolate browser-specific issues
 //! (runs in separate process, no Chromium).
 
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use wtransport::{ClientConfig, Endpoint};
 
 const DEFAULT_URL: &str = "https://127.0.0.1:4433";

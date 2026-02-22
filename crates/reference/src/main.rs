@@ -17,7 +17,7 @@ const HEALTH_PORT: u16 = 4434;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("reference-server: Starting up...");
 
-    let identity = Identity::self_signed(&["localhost", "127.0.0.1", "::1"])?;
+    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
 
     let config = ServerConfig::builder()
         .with_bind_default(4433)

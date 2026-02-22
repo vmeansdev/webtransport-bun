@@ -1,5 +1,6 @@
 use napi::Result;
 use napi_derive::napi;
+use std::sync::atomic::Ordering;
 
 use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
 use crate::panic_guard;
@@ -54,6 +55,7 @@ impl SessionHandle {
         let Some((conn, _, metrics, _, _, _, _)) = session_registry::get(&id) else {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
+        let sm = session_registry::get_session_metrics(&id);
         let sz = bytes.len();
         if sz > 1200 {
             return Err(napi::Error::from_reason("E_QUEUE_FULL"));
@@ -62,9 +64,10 @@ impl SessionHandle {
         let send_fut = RUNTIME.spawn(async move {
             conn.send_datagram(&bytes)
                 .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
-            metrics
-                .datagrams_out
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            if let Some(ref sm) = sm {
+                sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(())
         });
         tokio::time::timeout(timeout, send_fut)
@@ -103,7 +106,7 @@ impl SessionHandle {
                 resp_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(|e| napi::Error::from_reason(e))
+                    .map_err(napi::Error::from_reason)
             })
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?
@@ -135,7 +138,7 @@ impl SessionHandle {
                 resp_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(|e| napi::Error::from_reason(e))
+                    .map_err(napi::Error::from_reason)
             })
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?
@@ -154,12 +157,21 @@ impl SessionHandle {
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
         panic_guard::catch_panic(|| {
-            Ok(crate::metrics::SessionMetricsSnapshot {
-                datagrams_in: 0,
-                datagrams_out: 0,
-                streams_active: 0,
-                queued_bytes: 0,
-            })
+            if let Some(sm) = session_registry::get_session_metrics(&self.id) {
+                Ok(crate::metrics::SessionMetricsSnapshot {
+                    datagrams_in: sm.datagrams_in.load(Ordering::Relaxed) as u32,
+                    datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as u32,
+                    streams_active: sm.streams_active() as u32,
+                    queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as u32,
+                })
+            } else {
+                Ok(crate::metrics::SessionMetricsSnapshot {
+                    datagrams_in: 0,
+                    datagrams_out: 0,
+                    streams_active: 0,
+                    queued_bytes: 0,
+                })
+            }
         })
     }
 }

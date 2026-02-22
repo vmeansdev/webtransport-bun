@@ -18,7 +18,7 @@ where
             let msg = panic_any
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
-                .or_else(|| panic_any.downcast_ref::<String>().map(|s| s.clone()))
+                .or_else(|| panic_any.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "panic (no message)".to_string());
             eprintln!("webtransport-native: panic contained: {}", msg);
             Err(napi::Error::from_reason(format!(

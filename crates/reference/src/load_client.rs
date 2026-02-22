@@ -132,7 +132,7 @@ async fn run(
     // Shutdown: sessions exit when duration elapses, run_session calls conn.close().
     // Join with timeout to avoid hangs (Phase 2: strict timeouts).
     for h in handles {
-        if let Err(_) = tokio::time::timeout(JOIN_TIMEOUT, h).await {
+        if (tokio::time::timeout(JOIN_TIMEOUT, h).await).is_err() {
             eprintln!("load-client: warning: task join timed out");
         }
     }

@@ -20,6 +20,28 @@ pub enum StreamCmd {
     Reset(u32),
 }
 
+/// Holds a closure that runs on drop to decrement stream counters.
+/// Used by bridge tasks to properly track stream lifecycle.
+pub struct StreamGuard {
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl StreamGuard {
+    pub fn new(f: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            on_drop: Some(Box::new(f)),
+        }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bidi stream handle
 // ---------------------------------------------------------------------------
@@ -204,8 +226,9 @@ impl ClientUniRecvHandle {
 pub fn spawn_bidi_bridge(
     send_stream: wtransport::SendStream,
     recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
 ) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<StreamCmd>, oneshot::Sender<u32>) {
-    spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream)
+    spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard)
 }
 
 /// Spawn bridge on a specific runtime (use CLIENT_RUNTIME for client streams).
@@ -213,12 +236,14 @@ pub fn spawn_bidi_bridge_on(
     rt: &tokio::runtime::Runtime,
     mut send_stream: wtransport::SendStream,
     mut recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
 ) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<StreamCmd>, oneshot::Sender<u32>) {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
     let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
 
     rt.spawn(async move {
+        let _guard = guard;
         let mut buf = vec![0u8; 64 * 1024];
         let mut stop_rx = stop_rx;
         loop {
@@ -236,7 +261,7 @@ pub fn spawn_bidi_bridge_on(
                 }
                 code = &mut stop_rx => {
                     if let Ok(c) = code {
-                        let _ = recv_stream.stop(VarInt::from_u32(c));
+                        recv_stream.stop(VarInt::from_u32(c));
                     }
                     break;
                 }
@@ -270,17 +295,20 @@ pub fn spawn_bidi_bridge_on(
 /// Spawn bridge for an outgoing uni stream.
 pub fn spawn_uni_send_bridge(
     send_stream: wtransport::SendStream,
+    guard: Option<StreamGuard>,
 ) -> mpsc::Sender<StreamCmd> {
-    spawn_uni_send_bridge_on(&RUNTIME, send_stream)
+    spawn_uni_send_bridge_on(&RUNTIME, send_stream, guard)
 }
 
 pub fn spawn_uni_send_bridge_on(
     rt: &tokio::runtime::Runtime,
     mut send_stream: wtransport::SendStream,
+    guard: Option<StreamGuard>,
 ) -> mpsc::Sender<StreamCmd> {
     let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
 
     rt.spawn(async move {
+        let _guard = guard;
         while let Some(cmd) = write_rx.recv().await {
             match cmd {
                 StreamCmd::Data(chunk) => {
@@ -306,18 +334,21 @@ pub fn spawn_uni_send_bridge_on(
 /// Spawn bridge for an incoming uni stream.
 pub fn spawn_uni_recv_bridge(
     recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
 ) -> (mpsc::Receiver<Vec<u8>>, oneshot::Sender<u32>) {
-    spawn_uni_recv_bridge_on(&RUNTIME, recv_stream)
+    spawn_uni_recv_bridge_on(&RUNTIME, recv_stream, guard)
 }
 
 pub fn spawn_uni_recv_bridge_on(
     rt: &tokio::runtime::Runtime,
     mut recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
 ) -> (mpsc::Receiver<Vec<u8>>, oneshot::Sender<u32>) {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
 
     rt.spawn(async move {
+        let _guard = guard;
         let mut buf = vec![0u8; 64 * 1024];
         let mut stop_rx = stop_rx;
         loop {
@@ -335,7 +366,7 @@ pub fn spawn_uni_recv_bridge_on(
                 }
                 code = &mut stop_rx => {
                     if let Ok(c) = code {
-                        let _ = recv_stream.stop(VarInt::from_u32(c));
+                        recv_stream.stop(VarInt::from_u32(c));
                     }
                     break;
                 }

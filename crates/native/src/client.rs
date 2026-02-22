@@ -137,7 +137,7 @@ impl ClientSessionHandle {
             napi::Error::from_reason("session closed")
         })?;
         resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))?
-            .map_err(|e| napi::Error::from_reason(e))
+            .map_err(napi::Error::from_reason)
     }
 
     #[napi]
@@ -150,7 +150,7 @@ impl ClientSessionHandle {
             napi::Error::from_reason("session closed")
         })?;
         resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))?
-            .map_err(|e| napi::Error::from_reason(e))
+            .map_err(napi::Error::from_reason)
     }
 
     #[napi]
@@ -225,13 +225,13 @@ impl ClientSessionHandle {
             let conn_dgram_recv = conn.clone();
             let conn_closed = conn.clone();
 
-            tokio::spawn(async move {
+            crate::panic_guard::spawn_quic_task(async move {
                 while let Some(bytes) = dgram_send_rx.recv().await {
                     let _ = conn_dgram_send.send_datagram(bytes.as_slice());
                 }
             });
 
-            tokio::spawn(async move {
+            crate::panic_guard::spawn_quic_task(async move {
                 while let Ok(dgram) = conn_dgram_recv.receive_datagram().await {
                     if dgram_recv_tx.send(dgram.as_ref().to_vec()).await.is_err() {
                         break;
@@ -239,12 +239,12 @@ impl ClientSessionHandle {
                 }
             });
 
-            tokio::spawn(async move {
+            crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = open_bi_rx.recv().await {
                     let r = match conn_bi.open_bi().await {
                         Ok(opening) => match opening.await {
                             Ok((send, recv)) => {
-                                let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
+                                let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv, None);
                                 Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx, stop_tx))
                             }
                             Err(e) => Err(e.to_string()),
@@ -255,12 +255,12 @@ impl ClientSessionHandle {
                 }
             });
 
-            tokio::spawn(async move {
+            crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = open_uni_rx.recv().await {
                     let r = match conn_uni.open_uni().await {
                         Ok(opening) => match opening.await {
                             Ok(send) => {
-                                let write_tx = spawn_uni_send_bridge_on(&CLIENT_RUNTIME, send);
+                                let write_tx = spawn_uni_send_bridge_on(&CLIENT_RUNTIME, send, None);
                                 Ok(ClientUniSendHandle::new(write_tx))
                             }
                             Err(e) => Err(e.to_string()),
@@ -272,11 +272,11 @@ impl ClientSessionHandle {
             });
 
             let mut accept_bi_rx = accept_bi_rx;
-            tokio::spawn(async move {
+            crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = accept_bi_rx.recv().await {
                     let r = match conn_accept_bi.accept_bi().await {
                         Ok((send, recv)) => {
-                            let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
+                            let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv, None);
                             Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx, stop_tx))
                         }
                         Err(e) => Err(e.to_string()),
@@ -286,11 +286,11 @@ impl ClientSessionHandle {
             });
 
             let mut accept_uni_rx_local = accept_uni_rx;
-            tokio::spawn(async move {
+            crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = accept_uni_rx_local.recv().await {
                     let r = match conn_accept_uni.accept_uni().await {
                         Ok(recv) => {
-                            let (read_rx, stop_tx) = spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv);
+                            let (read_rx, stop_tx) = spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv, None);
                             Ok(ClientUniRecvHandle::new(read_rx, stop_tx))
                         }
                         Err(e) => Err(e.to_string()),
@@ -376,7 +376,7 @@ pub fn connect(
         let result = match run_connect(&url, opts_json)
             .await
             .map_err(|e| e.to_string())
-            .and_then(|(id, peer_ip, peer_port, conn)| {
+            .map(|(id, peer_ip, peer_port, conn)| {
                 let handle = ClientSessionHandle::spawn_session_task(
                     id.clone(),
                     peer_ip,
@@ -387,7 +387,7 @@ pub fn connect(
                 if let Ok(mut reg) = CLIENT_HANDLE_REGISTRY.lock() {
                     reg.insert(id.clone(), handle);
                 }
-                Ok(id)
+                id
             }) {
             std::result::Result::Ok(id) => ConnectResult::Ok(id),
             std::result::Result::Err(msg) => ConnectResult::Err(msg),
