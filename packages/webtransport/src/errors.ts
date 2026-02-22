@@ -1,6 +1,6 @@
 /**
  * Stable error codes for WebTransport operations.
- * These codes are part of the public API contract (AGENTS.md / SPEC.md).
+ * These codes are part of the public API contract (AGENTS.md / docs/SPEC.md).
  */
 
 export const E_TLS = "E_TLS";

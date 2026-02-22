@@ -20,5 +20,5 @@
 - [x] `E_BACKPRESSURE_TIMEOUT` tested — error code stability + backpressureTimeoutMs option wiring
 
 ## D) Documentation alignment
-- [x] Target matrix aligned across CI.md / COMPATIBILITY.md / release.yml
-- [x] Update TESTPLAN.md to reflect addon interop reality and current gates
+- [x] Target matrix aligned across docs/CI.md / docs/COMPATIBILITY.md / release.yml
+- [x] Update docs/TESTPLAN.md to reflect addon interop reality and current gates

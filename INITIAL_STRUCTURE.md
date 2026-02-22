@@ -1,15 +1,22 @@
 webtransport-bun/
   AGENTS.md
-  SPEC.md
-  ARCHITECTURE.md
   SECURITY.md
-  TESTPLAN.md
-  OPERATIONS.md
-  CI.md
   CONTRIBUTING.md
   package.json
   bunfig.toml
   tsconfig.json
+  docs/
+    SPEC.md
+    ARCHITECTURE.md
+    CI.md
+    TESTPLAN.md
+    OPERATIONS.md
+    COMPATIBILITY.md
+    METRICS.md
+    GETTING_STARTED.md
+    BENCHMARK_BASELINES.md
+    PROTOCOL_EDGE_CASES.md
+    WTRANSPORT_UPSTREAM.md
   crates/
     native/               # Rust napi-rs addon
       Cargo.toml

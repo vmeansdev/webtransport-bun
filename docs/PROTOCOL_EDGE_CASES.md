@@ -15,4 +15,4 @@ Expected behavior for protocol edge-case tests:
 - Codes must propagate through JS API
 
 ## Idle timeout
-- See OPERATIONS.md "Idle timeout behavior"
+- See docs/OPERATIONS.md "Idle timeout behavior"

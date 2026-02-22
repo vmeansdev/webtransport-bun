@@ -48,12 +48,12 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
    - `bun test` passes on supported targets
 
 ## Authoritative docs
-- API contract: SPEC.md
-- Implementation design: ARCHITECTURE.md
+- API contract: docs/SPEC.md
+- Implementation design: docs/ARCHITECTURE.md
 - Security defaults: SECURITY.md
-- Verification: TESTPLAN.md
-- Operations: OPERATIONS.md
-- CI/release: CI.md
+- Verification: docs/TESTPLAN.md
+- Operations: docs/OPERATIONS.md
+- CI/release: docs/CI.md
 - Contribution rules: CONTRIBUTING.md
 
 ## Implementation constraints (must follow)

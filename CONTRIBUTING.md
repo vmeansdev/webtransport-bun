@@ -24,7 +24,7 @@
   - `cargo clippy --all-targets -- -D warnings`
 
 ## Adding features
-- Update SPEC.md first (API/semantics)
+- Update docs/SPEC.md first (API/semantics)
 - Add tests in `packages/webtransport/test`
 - Implement in Rust + JS wrapper
 - Ensure limits/budgets/rate limits remain enforced

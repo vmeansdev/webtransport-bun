@@ -3,7 +3,7 @@
  *
  * Production-ready WebTransport for Bun, backed by napi-rs + wtransport (Rust).
  *
- * Public API surface — see SPEC.md for authoritative contract.
+ * Public API surface — see docs/SPEC.md for authoritative contract.
  */
 
 import type { Duplex, Readable, Writable } from "node:stream";
