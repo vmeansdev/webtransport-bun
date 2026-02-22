@@ -15,7 +15,10 @@
     "test:load-addon": "bun tools/load/load-addon.ts",
     "test:load-scale-addon": "bun tools/load/load-scale-addon.ts",
     "test:soak-addon": "bun tools/load/soak-addon.ts",
-    "bench:datagram": "bun tools/bench/datagram-throughput.ts"
+    "bench:datagram": "bun tools/bench/datagram-throughput.ts",
+    "bench:handshake": "bun tools/bench/handshake-latency.ts",
+    "bench:stream": "bun tools/bench/stream-throughput.ts",
+    "bench:baseline": "bun tools/bench/baseline.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
