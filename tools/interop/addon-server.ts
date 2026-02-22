@@ -1,22 +1,62 @@
 #!/usr/bin/env bun
 /**
  * Addon WebTransport server for Playwright interop.
- * Echoes datagrams and streams. Starts HTTP health on 4434 for readiness probing.
+ * Echoes datagrams and streams. Uses tools/interop/certs/ when present (ECDSA for Chromium).
  */
 
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { createServer as createHttpServer } from "node:http";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 const QUIC_PORT = 4433;
 const HEALTH_PORT = 4434;
 
+const certPath = join(import.meta.dir, "certs", "cert.pem");
+const keyPath = join(import.meta.dir, "certs", "key.pem");
+const certPem = existsSync(certPath) ? readFileSync(certPath, "utf-8") : "";
+const keyPem = existsSync(keyPath) ? readFileSync(keyPath, "utf-8") : "";
+if (!certPem || !keyPem) {
+    console.warn("addon-server: no ECDSA certs at", certPath, "; run 'bun run prepare:interop' for Chromium interop");
+}
+
 const wtServer = createServer({
     port: QUIC_PORT,
-    tls: { certPem: "", keyPem: "" },
+    tls: { certPem, keyPem },
     onSession: async (session) => {
-        for await (const d of session.incomingDatagrams()) {
-            await session.sendDatagram(d);
-        }
+        // Datagram echo
+        (async () => {
+            for await (const d of session.incomingDatagrams()) {
+                await session.sendDatagram(d);
+            }
+        })().catch(() => {});
+        // Bidi stream echo
+        (async () => {
+            for await (const duplex of session.incomingBidirectionalStreams()) {
+                (async () => {
+                    const chunks: Buffer[] = [];
+                    for await (const c of duplex) chunks.push(c);
+                    const buf = Buffer.concat(chunks);
+                    if (buf.length > 0) duplex.write(buf);
+                    duplex.end();
+                })().catch(() => {});
+            }
+        })().catch(() => {});
+        // Uni stream echo: read incoming, write back on new uni stream
+        (async () => {
+            for await (const readable of session.incomingUnidirectionalStreams()) {
+                (async () => {
+                    const chunks: Buffer[] = [];
+                    for await (const c of readable) chunks.push(c);
+                    const buf = Buffer.concat(chunks);
+                    if (buf.length > 0) {
+                        const writable = await session.createUnidirectionalStream();
+                        writable.write(buf);
+                        writable.end();
+                    }
+                })().catch(() => {});
+            }
+        })().catch(() => {});
     },
 });
 

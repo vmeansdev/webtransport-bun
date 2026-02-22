@@ -60,7 +60,7 @@ jobs:
         run: bun run test:overload-addon
         timeout-minutes: 2
       - name: Interop (Chromium)
-        run: cd tools/interop && bun install && bun run install:browsers && bun run playwright test
+        run: cd tools/interop && bun install && bun run install:browsers && bun run prepare:interop && bun run playwright test
         timeout-minutes: 5
       - name: Smoke test (bun add from package)
         run: |

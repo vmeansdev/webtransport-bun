@@ -1,8 +1,10 @@
 import { defineConfig } from "@playwright/test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { getCertHashBase64 } from "./cert-hash.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const certHash = getCertHashBase64();
 
 export default defineConfig({
     testDir: "./tests",
@@ -15,6 +17,9 @@ export default defineConfig({
                 "--origin-to-force-quic-on=127.0.0.1:4433",
                 "--ignore-certificate-errors",
                 "--allow-insecure-localhost",
+                ...(certHash
+                    ? [`--ignore-certificate-errors-spki-list=${certHash}`]
+                    : []),
                 "--webtransport-developer-mode",
             ],
         },

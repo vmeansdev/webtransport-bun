@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "playwright test",
-    "install:browsers": "playwright install chromium"
+    "install:browsers": "playwright install chromium",
+    "prepare:interop": "mkdir -p certs && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 10 -nodes -keyout certs/key.pem -out certs/cert.pem -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost,IP:127.0.0.1'"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
