@@ -1,5 +1,5 @@
-use napi_derive::napi;
 use napi::Result;
+use napi_derive::napi;
 
 use crate::panic_guard;
 
@@ -77,11 +77,13 @@ impl SessionHandle {
 
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
-        panic_guard::catch_panic(|| Ok(crate::metrics::SessionMetricsSnapshot {
-            datagrams_in: 0,
-            datagrams_out: 0,
-            streams_active: 0,
-            queued_bytes: 0,
-        }))
+        panic_guard::catch_panic(|| {
+            Ok(crate::metrics::SessionMetricsSnapshot {
+                datagrams_in: 0,
+                datagrams_out: 0,
+                streams_active: 0,
+                queued_bytes: 0,
+            })
+        })
     }
 }

@@ -21,7 +21,10 @@ where
                 .or_else(|| panic_any.downcast_ref::<String>().map(|s| s.clone()))
                 .unwrap_or_else(|| "panic (no message)".to_string());
             eprintln!("webtransport-native: panic contained: {}", msg);
-            Err(napi::Error::from_reason(format!("{}{}", E_INTERNAL_PREFIX, msg)))
+            Err(napi::Error::from_reason(format!(
+                "{}{}",
+                E_INTERNAL_PREFIX, msg
+            )))
         }
     }
 }
@@ -37,7 +40,10 @@ where
     tokio::task::spawn(async move {
         if let Err(e) = handle.await {
             if e.is_panic() {
-                eprintln!("webtransport-native: QUIC task panicked (contained): {:?}", e);
+                eprintln!(
+                    "webtransport-native: QUIC task panicked (contained): {:?}",
+                    e
+                );
                 // TODO: trigger session/server teardown when we have a shutdown channel
             }
         }

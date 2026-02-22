@@ -49,7 +49,8 @@ impl ServerMetrics {
             datagrams_dropped: self.datagrams_dropped.load(Ordering::Relaxed) as u32,
             queued_bytes_global: self.queued_bytes_global.load(Ordering::Relaxed) as u32,
             backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as u32,
-            backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed) as u32,
+            backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed)
+                as u32,
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as u32,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as u32,
         }

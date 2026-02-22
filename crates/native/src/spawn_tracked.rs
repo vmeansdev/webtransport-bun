@@ -27,14 +27,16 @@ where
         }
     }
     let metrics_clone = Arc::clone(&metrics);
-    let decrement = move || {
-        match kind {
-            TaskKind::Session => {
-                metrics_clone.session_tasks_active.fetch_sub(1, Ordering::Relaxed);
-            }
-            TaskKind::Stream => {
-                metrics_clone.stream_tasks_active.fetch_sub(1, Ordering::Relaxed);
-            }
+    let decrement = move || match kind {
+        TaskKind::Session => {
+            metrics_clone
+                .session_tasks_active
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        TaskKind::Stream => {
+            metrics_clone
+                .stream_tasks_active
+                .fetch_sub(1, Ordering::Relaxed);
         }
     };
     let wrapped = async move {

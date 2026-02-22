@@ -1,5 +1,5 @@
-use napi_derive::napi;
 use napi::Result;
+use napi_derive::napi;
 
 use crate::panic_guard;
 
