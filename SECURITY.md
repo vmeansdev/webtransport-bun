@@ -2,7 +2,7 @@
 
 ## Threat model
 Public internet UDP service exposed on a port (commonly 443). Likely threats:
-- Handshake floods (CPU exhaustion)
+- Handshake floods / connection churn (CPU exhaustion)
 - Session floods (memory exhaustion)
 - Stream-open floods (state explosion)
 - Slow-read / never-read (buffer bloat)
@@ -30,9 +30,12 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 - max streams per session and global
 - maxQueuedBytes global/per-session/per-stream
 - maxDatagramSize cap
-3. Rate limits per peer IP
-- RateLimitOptions (handshakesPerSec, streamsPerSec, datagramsPerSec) configurable via createServer; per-IP token buckets and per-subnet limits planned
-4. Panic containment
+3. Rate limits per peer IP and per prefix
+- RateLimitOptions: per-IP handshakesBurst, per-prefix handshakesBurstPerPrefix (/24 IPv4, /64 IPv6)
+4. Connection churn protection
+- maxHandshakesInFlight caps concurrent TLS handshakes (default 200)
+- Per-IP and per-prefix limits prevent single-source exhaustion
+5. Panic containment
 - Rust panics must be caught at task boundaries where possible
 - convert to E_INTERNAL and close affected session/server
 
