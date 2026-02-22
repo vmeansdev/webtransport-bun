@@ -12,5 +12,5 @@ name = "load-client"
 path = "src/load_client.rs"
 
 [dependencies]
-wtransport = { version = "0.7", features = ["dangerous-configuration"] }
+wtransport = { version = "=0.7.0", features = ["dangerous-configuration"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
