@@ -222,7 +222,7 @@ fn try_acquire_token(
             burst,
         )
     });
-    let mut guard = entry.0.lock().unwrap();
+    let mut guard = entry.0.lock().unwrap_or_else(|e| e.into_inner());
     let (tokens, last) = *guard;
     let now = Instant::now();
     let elapsed = now.duration_since(last).as_secs_f64();
@@ -266,7 +266,7 @@ pub fn reset_all() {
 pub fn cleanup_stale_entries(max_idle_secs: f64) {
     let now = Instant::now();
     let retain_bucket = |v: &BucketEntry| -> bool {
-        let guard = v.0.lock().unwrap();
+        let guard = v.0.lock().unwrap_or_else(|e| e.into_inner());
         now.duration_since(guard.1).as_secs_f64() < max_idle_secs
     };
     HANDSHAKE_BUCKETS.retain(|_, v| retain_bucket(v));
