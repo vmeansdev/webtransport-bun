@@ -8,6 +8,7 @@ import { createServer, connect } from "../../packages/webtransport/src/index.ts"
 
 const PORT = Number(process.env.BENCH_PORT ?? 4443);
 const N = Number(process.env.BENCH_HANDSHAKES ?? 50);
+const P95_MAX_MS = Number(process.env.BENCH_P95_MAX_MS ?? 500);
 
 function percentile(arr: number[], p: number): number {
     const sorted = [...arr].sort((a, b) => a - b);
@@ -51,8 +52,17 @@ async function main() {
     const p95 = percentile(latencies, 95);
     const p99 = percentile(latencies, 99);
     console.log(
-        `handshake-latency: n=${latencies.length} p50=${p50.toFixed(1)}ms p95=${p95.toFixed(1)}ms p99=${p99.toFixed(1)}ms`
+        `handshake-latency: n=${latencies.length} p50=${p50.toFixed(1)}ms p95=${p95.toFixed(1)}ms p99=${p99.toFixed(1)}ms (threshold p95<=${P95_MAX_MS}ms)`
     );
+
+    if (p95 > P95_MAX_MS) {
+        console.error(
+            `handshake-latency: FAIL (p95 ${p95.toFixed(1)}ms exceeds threshold ${P95_MAX_MS}ms)`
+        );
+        process.exit(1);
+    }
+
+    console.log("handshake-latency: PASS");
 }
 
 main().catch((e) => {
