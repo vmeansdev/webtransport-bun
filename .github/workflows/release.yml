@@ -1,29 +1,73 @@
-# Release: build prebuilds, generate checksums, create GitHub release.
+# Release: build prebuilds for all targets, generate checksums, create GitHub release, publish to npm.
 name: release
 on:
   push:
     tags:
       - "v*"
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: macos-latest
+            target: darwin-arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.9"
-      - name: Build native addon (Linux x64)
+      - name: Build native addon (${{ matrix.target }})
         run: bun run build:native
       - name: Prebuild + checksums
         run: |
           cd packages/webtransport && bun run prebuild
           cd prebuilds
-          shasum -a 256 *.node > SHA256SUMS 2>/dev/null || cat SHA256SUMS
+          shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true
+      - name: Upload prebuilds
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds-${{ matrix.target }}
+          path: packages/webtransport/prebuilds/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: prebuilds
+          merge-multiple: true
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: packages/webtransport/prebuilds/*
+          files: prebuilds/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages/webtransport/prebuilds
+          merge-multiple: true
+      - name: Publish to npm
+        run: |
+          cd packages/webtransport
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+          npm publish --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
