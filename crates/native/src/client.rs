@@ -20,8 +20,10 @@ pub struct ClientMetrics {
 
 use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
-    ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
+    ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
 };
+use crate::server_metrics::ServerMetrics;
+use crate::session_registry::SessionMetrics;
 use crate::CLIENT_RUNTIME;
 
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -42,9 +44,6 @@ pub struct ClientSessionClosed {
     pub code: Option<u32>,
     pub reason: Option<String>,
 }
-
-const DEFAULT_BACKPRESSURE_TIMEOUT_MS: u64 = 5000;
-const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
 
 /// Request to open a bidi stream. Response sent via oneshot.
 type OpenBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
@@ -228,6 +227,7 @@ impl ClientSessionHandle {
         conn: wtransport::Connection,
         on_closed: Option<ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
         backpressure_timeout_ms: u64,
+        limits: crate::limits::Limits,
     ) -> Self {
         let (dgram_send_tx, mut dgram_send_rx) = mpsc::channel::<Vec<u8>>(256);
         let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -239,6 +239,12 @@ impl ClientSessionHandle {
         let cm = Arc::new(ClientMetrics::default());
         let closed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let budget_metrics = Arc::new(ServerMetrics::default());
+        let session_metrics = Arc::new(SessionMetrics::default());
+        let max_global = limits.max_queued_bytes_global;
+        let max_session = limits.max_queued_bytes_per_session;
+        let max_stream = limits.max_queued_bytes_per_stream;
+
         let handle = Self {
             id: id.clone(),
             peer_ip: peer_ip.clone(),
@@ -246,7 +252,7 @@ impl ClientSessionHandle {
             dgram_send_tx: Some(dgram_send_tx.clone()),
             dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
             backpressure_timeout_ms,
-            max_datagram_size: DEFAULT_MAX_DATAGRAM_SIZE,
+            max_datagram_size: limits.max_datagram_size,
             stream_open_bi_tx: Some(open_bi_tx),
             stream_open_uni_tx: Some(open_uni_tx),
             stream_accept_bi_tx: Some(accept_bi_tx),
@@ -260,6 +266,19 @@ impl ClientSessionHandle {
         let conn_uni = conn.clone();
         let conn_accept_bi = conn.clone();
         let conn_accept_uni = conn.clone();
+
+        let make_budget = {
+            let bm = Arc::clone(&budget_metrics);
+            let sm = Arc::clone(&session_metrics);
+            move || StreamBudget {
+                server_metrics: Arc::clone(&bm),
+                session_metrics: Arc::clone(&sm),
+                stream_queued: Arc::new(AtomicU64::new(0)),
+                max_global,
+                max_session,
+                max_stream,
+            }
+        };
 
         CLIENT_RUNTIME.spawn(async move {
             let conn_dgram_send = conn.clone();
@@ -291,6 +310,7 @@ impl ClientSessionHandle {
             });
 
             let cm_bi = Arc::clone(&cm);
+            let make_budget_bi = make_budget.clone();
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = open_bi_rx.recv().await {
                     let r = match conn_bi.open_bi().await {
@@ -301,15 +321,19 @@ impl ClientSessionHandle {
                                 let guard = crate::client_stream::StreamGuard::new(move || {
                                     cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                                 });
+                                let budget = make_budget_bi();
                                 let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(
                                     &CLIENT_RUNTIME,
                                     send,
                                     recv,
                                     Some(guard),
-                                    None,
+                                    Some(budget.clone()),
                                 );
-                                Ok(ClientBidiStreamHandle::new_client_stream(
-                                    read_rx, write_tx, stop_tx,
+                                Ok(ClientBidiStreamHandle::new_with_budget(
+                                    read_rx,
+                                    write_tx,
+                                    stop_tx,
+                                    Some(budget),
                                 ))
                             }
                             Err(e) => Err(e.to_string()),
@@ -321,6 +345,7 @@ impl ClientSessionHandle {
             });
 
             let cm_uni = Arc::clone(&cm);
+            let make_budget_uni = make_budget.clone();
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = open_uni_rx.recv().await {
                     let r = match conn_uni.open_uni().await {
@@ -331,13 +356,14 @@ impl ClientSessionHandle {
                                 let guard = crate::client_stream::StreamGuard::new(move || {
                                     cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                                 });
+                                let budget = make_budget_uni();
                                 let write_tx = spawn_uni_send_bridge_on(
                                     &CLIENT_RUNTIME,
                                     send,
                                     Some(guard),
-                                    None,
+                                    Some(budget.clone()),
                                 );
-                                Ok(ClientUniSendHandle::new(write_tx))
+                                Ok(ClientUniSendHandle::new_with_budget(write_tx, Some(budget)))
                             }
                             Err(e) => Err(e.to_string()),
                         },
@@ -349,6 +375,7 @@ impl ClientSessionHandle {
 
             let mut accept_bi_rx = accept_bi_rx;
             let cm_accept_bi = Arc::clone(&cm);
+            let make_budget_accept_bi = make_budget.clone();
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = accept_bi_rx.recv().await {
                     let r = match conn_accept_bi.accept_bi().await {
@@ -358,15 +385,19 @@ impl ClientSessionHandle {
                             let guard = crate::client_stream::StreamGuard::new(move || {
                                 cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                             });
+                            let budget = make_budget_accept_bi();
                             let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(
                                 &CLIENT_RUNTIME,
                                 send,
                                 recv,
                                 Some(guard),
-                                None,
+                                Some(budget.clone()),
                             );
-                            Ok(ClientBidiStreamHandle::new_client_stream(
-                                read_rx, write_tx, stop_tx,
+                            Ok(ClientBidiStreamHandle::new_with_budget(
+                                read_rx,
+                                write_tx,
+                                stop_tx,
+                                Some(budget),
                             ))
                         }
                         Err(e) => Err(e.to_string()),
@@ -377,6 +408,7 @@ impl ClientSessionHandle {
 
             let mut accept_uni_rx_local = accept_uni_rx;
             let cm_accept_uni = Arc::clone(&cm);
+            let make_budget_accept_uni = make_budget.clone();
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = accept_uni_rx_local.recv().await {
                     let r = match conn_accept_uni.accept_uni().await {
@@ -386,9 +418,18 @@ impl ClientSessionHandle {
                             let guard = crate::client_stream::StreamGuard::new(move || {
                                 cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                             });
-                            let (read_rx, stop_tx) =
-                                spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv, Some(guard), None);
-                            Ok(ClientUniRecvHandle::new(read_rx, stop_tx))
+                            let budget = make_budget_accept_uni();
+                            let (read_rx, stop_tx) = spawn_uni_recv_bridge_on(
+                                &CLIENT_RUNTIME,
+                                recv,
+                                Some(guard),
+                                Some(budget.clone()),
+                            );
+                            Ok(ClientUniRecvHandle::new_with_budget(
+                                read_rx,
+                                stop_tx,
+                                Some(budget),
+                            ))
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -425,6 +466,15 @@ impl ClientSessionHandle {
 /// On success, use takeClientSession(handleId) to get the handle.
 #[napi]
 pub fn connect(
+    url: String,
+    opts_json: String,
+    on_closed: JsFunction,
+    callback: JsFunction,
+) -> Result<()> {
+    crate::panic_guard::catch_panic(|| connect_inner(url, opts_json, on_closed, callback))
+}
+
+fn connect_inner(
     url: String,
     opts_json: String,
     on_closed: JsFunction,
@@ -470,10 +520,15 @@ pub fn connect(
             },
         )?;
 
-    let bp_timeout_ms = serde_json::from_str::<serde_json::Value>(&opts_json)
+    let client_limits = serde_json::from_str::<serde_json::Value>(&opts_json)
         .ok()
-        .and_then(|v| v.get("limits")?.get("backpressureTimeoutMs")?.as_u64())
-        .unwrap_or(DEFAULT_BACKPRESSURE_TIMEOUT_MS);
+        .and_then(|v| {
+            let l = v.get("limits")?;
+            serde_json::to_string(l).ok()
+        })
+        .map(|s| crate::limits::Limits::from_json(&s))
+        .unwrap_or_default();
+    let bp_timeout_ms = client_limits.backpressure_timeout_ms;
 
     CLIENT_RUNTIME.spawn(async move {
         let result = match run_connect(&url, opts_json)
@@ -487,6 +542,7 @@ pub fn connect(
                     conn,
                     on_closed_tsfn,
                     bp_timeout_ms,
+                    client_limits,
                 );
                 if let Ok(mut reg) = CLIENT_HANDLE_REGISTRY.lock() {
                     reg.insert(id.clone(), handle);
@@ -505,6 +561,10 @@ pub fn connect(
 /// Take the client session handle from the registry. Call after connect callback succeeds.
 #[napi]
 pub fn take_client_session(handle_id: String) -> Result<Option<ClientSessionHandle>> {
+    crate::panic_guard::catch_panic(|| take_client_session_inner(handle_id))
+}
+
+fn take_client_session_inner(handle_id: String) -> Result<Option<ClientSessionHandle>> {
     let mut reg = CLIENT_HANDLE_REGISTRY
         .lock()
         .map_err(|_| napi::Error::from_reason("registry lock poisoned"))?;
