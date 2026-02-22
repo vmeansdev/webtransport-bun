@@ -5,6 +5,7 @@ node_modules
 out
 target
 crates/native/*.node
+crates/native/*.node.bak
 dist
 *.tgz
 packages/webtransport/prebuilds
