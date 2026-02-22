@@ -65,6 +65,7 @@ describe("webtransport package exports", () => {
     it("exports DEFAULT_RATE_LIMITS", () => {
         expect(DEFAULT_RATE_LIMITS.handshakesPerSec).toBe(20);
         expect(DEFAULT_RATE_LIMITS.handshakesBurst).toBe(40);
+        expect(DEFAULT_RATE_LIMITS.handshakesBurstPerPrefix).toBe(100);
         expect(DEFAULT_RATE_LIMITS.datagramsPerSec).toBe(2000);
     });
 

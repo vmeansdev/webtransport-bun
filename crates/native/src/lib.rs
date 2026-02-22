@@ -144,6 +144,7 @@ pub(crate) fn spawn_wtransport_server(
     metrics: Arc<server_metrics::ServerMetrics>,
     limits: limits::Limits,
     handshakes_burst_per_ip: u64,
+    handshakes_burst_per_prefix: u64,
     port: u16,
     mut shutdown_rx: watch::Receiver<()>,
     on_session_tsfn: Option<
@@ -214,7 +215,11 @@ pub(crate) fn spawn_wtransport_server(
                                 match session_request.accept().await {
                                     Ok(connection) => {
                                         let peer_ip = connection.remote_address().ip().to_string();
-                                        if !rate_limit::try_acquire_per_ip_session(&peer_ip, handshakes_burst_per_ip) {
+                                        if !rate_limit::try_acquire_per_ip_session_with_prefix(
+                                            &peer_ip,
+                                            handshakes_burst_per_ip,
+                                            handshakes_burst_per_prefix,
+                                        ) {
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                             return;

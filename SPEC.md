@@ -25,6 +25,7 @@ export type TlsOptions = {
 
 export type RateLimitOptions = {
   handshakesPerSec: number; handshakesBurst: number;
+  handshakesBurstPerPrefix?: number; // per /24 IPv4 or /64 IPv6; default 100
   streamsPerSec: number; streamsBurst: number;
   datagramsPerSec: number; datagramsBurst: number;
 };

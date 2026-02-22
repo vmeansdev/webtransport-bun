@@ -50,6 +50,8 @@ export type TlsOptions = {
 export type RateLimitOptions = {
     handshakesPerSec: number;
     handshakesBurst: number;
+    /** Per /24 (IPv4) or /64 (IPv6) prefix; defaults 100 */
+    handshakesBurstPerPrefix?: number;
     streamsPerSec: number;
     streamsBurst: number;
     datagramsPerSec: number;
@@ -98,6 +100,7 @@ export const DEFAULT_LIMITS: LimitsOptions = {
 export const DEFAULT_RATE_LIMITS: RateLimitOptions = {
     handshakesPerSec: 20,
     handshakesBurst: 40,
+    handshakesBurstPerPrefix: 100,
     streamsPerSec: 200,
     streamsBurst: 400,
     datagramsPerSec: 2000,
