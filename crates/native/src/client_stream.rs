@@ -409,7 +409,8 @@ pub fn spawn_bidi_bridge_on(
                             let sz = n as u64;
                             if let Some(ref b) = read_budget {
                                 if !b.try_reserve(sz) {
-                                    continue;
+                                    recv_stream.stop(VarInt::from_u32(0));
+                                    break;
                                 }
                             }
                             if read_tx.send(buf[..n].to_vec()).await.is_err() {
@@ -542,7 +543,8 @@ pub fn spawn_uni_recv_bridge_on(
                             let sz = n as u64;
                             if let Some(ref b) = budget {
                                 if !b.try_reserve(sz) {
-                                    continue;
+                                    recv_stream.stop(VarInt::from_u32(0));
+                                    break;
                                 }
                             }
                             if read_tx.send(buf[..n].to_vec()).await.is_err() {
