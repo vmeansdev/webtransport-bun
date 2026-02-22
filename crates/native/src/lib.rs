@@ -256,6 +256,8 @@ pub(crate) fn spawn_wtransport_server(
                                         let lim_dgram = limits.clone();
 
                                         // Bidi stream echo (4.4.2: shed if over max_streams_global)
+                                        // Slow-reader: timeout on write; reset if client doesn't drain
+                                        let timeout_ms = lim_bidi.backpressure_timeout_ms;
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -270,7 +272,12 @@ pub(crate) fn spawn_wtransport_server(
                                                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                                                         let sz = n as u64;
                                                         if m_bidi.try_reserve_queued_bytes(sz, lim_bidi.max_queued_bytes_global) {
-                                                            let _ = send.write_all(&buf[..n]).await;
+                                                            let write_fut = send.write_all(&buf[..n]);
+                                                            let timeout = tokio::time::Duration::from_millis(timeout_ms);
+                                                            if tokio::time::timeout(timeout, write_fut).await.is_err() {
+                                                                m_bidi.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
+                                                                let _ = send.reset(0u32.into());
+                                                            }
                                                             m_bidi.release_queued_bytes(sz);
                                                         }
                                                     }
@@ -279,6 +286,8 @@ pub(crate) fn spawn_wtransport_server(
                                             },
                                         );
                                         // Uni stream echo (4.4.2)
+                                        // Slow-reader: timeout on write; reset if client doesn't drain
+                                        let timeout_ms_uni = lim_uni.backpressure_timeout_ms;
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -296,7 +305,12 @@ pub(crate) fn spawn_wtransport_server(
                                                         if m_uni.try_reserve_queued_bytes(sz, lim_uni.max_queued_bytes_global) {
                                                             if let Ok(opening) = conn_uni.open_uni().await {
                                                                 if let Ok(mut send) = opening.await {
-                                                                    let _ = send.write_all(&buf[..n]).await;
+                                                                    let write_fut = send.write_all(&buf[..n]);
+                                                                    let timeout = tokio::time::Duration::from_millis(timeout_ms_uni);
+                                                                    if tokio::time::timeout(timeout, write_fut).await.is_err() {
+                                                                        m_uni.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
+                                                                        let _ = send.reset(0u32.into());
+                                                                    }
                                                                 }
                                                             }
                                                             m_uni.release_queued_bytes(sz);
