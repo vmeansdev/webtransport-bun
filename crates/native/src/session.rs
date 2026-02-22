@@ -51,27 +51,26 @@ impl SessionHandle {
     pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
         let id = self.id.clone();
         let bytes = data.as_ref().to_vec();
-        let handle = RUNTIME.spawn(async move {
-            match session_registry::get(&id) {
-                Some((conn, _, metrics, _, _, _, _)) => {
-                    let ok = conn.send_datagram(&bytes).is_ok();
-                    if ok {
-                        metrics.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if ok {
-                        Ok(())
-                    } else {
-                        Err(napi::Error::from_reason("E_SESSION_CLOSED"))
-                    }
-                }
-                None => Err(napi::Error::from_reason("E_SESSION_CLOSED")),
-            }
-        });
-        match handle.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(napi::Error::from_reason(e.to_string())),
+        let Some((conn, _, metrics, _, _, _, _)) = session_registry::get(&id) else {
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+        };
+        let sz = bytes.len();
+        if sz > 1200 {
+            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
         }
+        let timeout = tokio::time::Duration::from_millis(5000);
+        let send_fut = RUNTIME.spawn(async move {
+            conn.send_datagram(&bytes)
+                .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+            metrics
+                .datagrams_out
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        tokio::time::timeout(timeout, send_fut)
+            .await
+            .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?
+            .map_err(|e: tokio::task::JoinError| napi::Error::from_reason(e.to_string()))?
     }
 
     // Usually we would return an async iterator, but napi-rs doesn't strictly have a direct AsyncIterator binding.

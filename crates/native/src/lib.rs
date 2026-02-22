@@ -227,6 +227,10 @@ pub(crate) fn spawn_wtransport_server(
             let config = ServerConfig::builder()
                 .with_bind_default(port)
                 .with_identity(identity)
+                .max_idle_timeout(Some(
+                    std::time::Duration::from_millis(limits.idle_timeout_ms),
+                ))
+                .unwrap()
                 .build();
             let server = match Endpoint::server(config) {
                 Ok(s) => {
@@ -280,14 +284,39 @@ pub(crate) fn spawn_wtransport_server(
                                         return;
                                     }
                                 };
-                                // 4.4.1: Shed at session accept
+                                if metrics.handshakes_in_flight.load(Ordering::Relaxed)
+                                    >= limits.max_handshakes_in_flight
+                                {
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
                                 if metrics.sessions_active.load(Ordering::Relaxed) >= limits.max_sessions {
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                     return;
                                 }
                                 let authority = session_request.authority().to_string();
-                                match session_request.accept().await {
+                                let accept_timeout = tokio::time::Duration::from_millis(
+                                    limits.handshake_timeout_ms,
+                                );
+                                let accept_result = tokio::time::timeout(
+                                    accept_timeout,
+                                    session_request.accept(),
+                                )
+                                .await;
+                                let accept_result = match accept_result {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        eprintln!(
+                                            "webtransport-native: handshake timed out authority={:?}",
+                                            authority
+                                        );
+                                        return;
+                                    }
+                                };
+                                match accept_result {
                                     Ok(connection) => {
                                         let peer_ip = connection.remote_address().ip().to_string();
                                         let peer_port = connection.remote_address().port() as u32;

@@ -20,22 +20,24 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    /// Try to reserve n bytes against global budget. Returns true if successful.
+    /// Try to reserve n bytes against global budget using compare-and-swap.
     pub fn try_reserve_queued_bytes(&self, n: u64, max: u64) -> bool {
-        let prev = self.queued_bytes_global.fetch_add(n, Ordering::Relaxed);
-        if prev + n <= max {
-            true
-        } else {
-            self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
-            false
-        }
+        self.queued_bytes_global
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current + n <= max {
+                    Some(current + n)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
     }
 
     pub fn release_queued_bytes(&self, n: u64) {
         self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
     }
 
-    /// Try to reserve n bytes against both global and per-session budget. Returns true if both succeed.
+    /// Try to reserve n bytes against both global and per-session budget using CAS.
     pub fn try_reserve_queued_bytes_with_session(
         &self,
         session_queued: &std::sync::atomic::AtomicU64,
@@ -46,13 +48,19 @@ impl ServerMetrics {
         if !self.try_reserve_queued_bytes(n, global_max) {
             return false;
         }
-        let prev = session_queued.fetch_add(n, Ordering::Relaxed);
-        if prev + n > session_max {
-            session_queued.fetch_sub(n, Ordering::Relaxed);
-            self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
-            return false;
+        let ok = session_queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current + n <= session_max {
+                    Some(current + n)
+                } else {
+                    None
+                }
+            })
+            .is_ok();
+        if !ok {
+            self.release_queued_bytes(n);
         }
-        true
+        ok
     }
 
     pub fn release_session_queued_bytes(
