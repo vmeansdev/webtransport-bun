@@ -35,6 +35,35 @@ impl ServerMetrics {
         self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
     }
 
+    /// Try to reserve n bytes against both global and per-session budget. Returns true if both succeed.
+    pub fn try_reserve_queued_bytes_with_session(
+        &self,
+        session_queued: &std::sync::atomic::AtomicU64,
+        n: u64,
+        global_max: u64,
+        session_max: u64,
+    ) -> bool {
+        if !self.try_reserve_queued_bytes(n, global_max) {
+            return false;
+        }
+        let prev = session_queued.fetch_add(n, Ordering::Relaxed);
+        if prev + n > session_max {
+            session_queued.fetch_sub(n, Ordering::Relaxed);
+            self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    pub fn release_session_queued_bytes(
+        session_queued: &std::sync::atomic::AtomicU64,
+        metrics: &Self,
+        n: u64,
+    ) {
+        session_queued.fetch_sub(n, Ordering::Relaxed);
+        metrics.release_queued_bytes(n);
+    }
+
     pub fn snapshot(&self) -> super::metrics::ServerMetricsSnapshot {
         use super::metrics::ServerMetricsSnapshot;
         ServerMetricsSnapshot {
