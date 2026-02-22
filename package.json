@@ -6,6 +6,7 @@
   "scripts": {
     "build:native": "bunx @napi-rs/cli build --cwd crates/native --platform --release",
     "test": "bun test packages/",
+    "test:parity": "bun test packages/webtransport/test/parity-*.test.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test:interop": "cd tools/interop && bun run playwright test",
     "test:load": "bun tools/load/load.ts",
