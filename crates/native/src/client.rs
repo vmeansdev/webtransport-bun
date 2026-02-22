@@ -7,10 +7,10 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 
 use crate::client_stream::{
-    spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
+    spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on, StreamCmd,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
 };
 use crate::{CLIENT_RUNTIME, RUNTIME};
@@ -57,6 +57,7 @@ pub struct ClientSessionHandle {
     stream_open_uni_tx: Option<mpsc::Sender<OpenUniReq>>,
     stream_accept_bi_tx: Option<mpsc::Sender<AcceptBiReq>>,
     stream_accept_uni_tx: Option<mpsc::Sender<AcceptUniReq>>,
+    close_tx: Option<Arc<watch::Sender<(u32, String)>>>,
 }
 
 #[napi]
@@ -107,9 +108,11 @@ impl ClientSessionHandle {
     }
 
     #[napi]
-    pub fn close(&self) -> Result<()> {
-        if let Some(ref tx) = self.dgram_send_tx {
-            let _ = tx.try_send(vec![]);
+    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
+        let c = code.unwrap_or(0);
+        let r = reason.unwrap_or_default();
+        if let Some(ref tx) = self.close_tx {
+            let _ = tx.send((c, r));
         }
         Ok(())
     }
@@ -195,6 +198,7 @@ impl ClientSessionHandle {
         let (open_uni_tx, mut open_uni_rx) = mpsc::channel::<OpenUniReq>(8);
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel::<AcceptBiReq>(8);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel::<AcceptUniReq>(8);
+        let (close_tx, mut close_rx) = watch::channel((0u32, String::new()));
 
         let handle = Self {
             id: id.clone(),
@@ -208,6 +212,7 @@ impl ClientSessionHandle {
             stream_open_uni_tx: Some(open_uni_tx),
             stream_accept_bi_tx: Some(accept_bi_tx),
             stream_accept_uni_tx: Some(accept_uni_tx),
+            close_tx: Some(Arc::new(close_tx)),
         };
 
         let conn_bi = conn.clone();
@@ -222,10 +227,6 @@ impl ClientSessionHandle {
 
             tokio::spawn(async move {
                 while let Some(bytes) = dgram_send_rx.recv().await {
-                    if bytes.is_empty() {
-                        conn.close(0u32.into(), b"client close");
-                        break;
-                    }
                     let _ = conn_dgram_send.send_datagram(bytes.as_slice());
                 }
             });
@@ -243,8 +244,8 @@ impl ClientSessionHandle {
                     let r = match conn_bi.open_bi().await {
                         Ok(opening) => match opening.await {
                             Ok((send, recv)) => {
-                                let (read_rx, write_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
-                                Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx))
+                                let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
+                                Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx, stop_tx))
                             }
                             Err(e) => Err(e.to_string()),
                         },
@@ -275,8 +276,8 @@ impl ClientSessionHandle {
                 while let Some(resp_tx) = accept_bi_rx.recv().await {
                     let r = match conn_accept_bi.accept_bi().await {
                         Ok((send, recv)) => {
-                            let (read_rx, write_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
-                            Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx))
+                            let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
+                            Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx, stop_tx))
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -289,8 +290,8 @@ impl ClientSessionHandle {
                 while let Some(resp_tx) = accept_uni_rx_local.recv().await {
                     let r = match conn_accept_uni.accept_uni().await {
                         Ok(recv) => {
-                            let read_rx = spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv);
-                            Ok(ClientUniRecvHandle::new(read_rx))
+                            let (read_rx, stop_tx) = spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv);
+                            Ok(ClientUniRecvHandle::new(read_rx, stop_tx))
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -298,7 +299,14 @@ impl ClientSessionHandle {
                 }
             });
 
-            conn_closed.closed().await;
+            tokio::select! {
+                _ = conn_closed.closed() => {}
+                _ = close_rx.changed() => {
+                    let (code, reason) = close_rx.borrow().clone();
+                    conn_closed.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
+                }
+            }
+
             if let Some(ref tsfn) = on_closed {
                 tsfn.call(
                     ClientSessionClosed {

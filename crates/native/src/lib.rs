@@ -22,7 +22,7 @@ pub mod server_metrics;
 pub mod session;
 pub mod session_registry;
 pub mod spawn_tracked;
-pub mod stream;
+
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
@@ -371,8 +371,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 continue;
                                                             }
                                                             m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
-                                                            let (read_rx, write_tx) = crate::client_stream::spawn_bidi_bridge(send, recv);
-                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new(read_rx, write_tx);
+                                                            let (read_rx, write_tx, stop_tx) = crate::client_stream::spawn_bidi_bridge(send, recv);
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new(read_rx, write_tx, stop_tx);
                                                             let _ = bidi_accept_tx.send(handle).await;
                                                             m_bidi.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                         }
@@ -402,8 +402,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 continue;
                                                             }
                                                             m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                                                            let read_rx = crate::client_stream::spawn_uni_recv_bridge(recv);
-                                                            let handle = crate::client_stream::ClientUniRecvHandle::new(read_rx);
+                                                            let (read_rx, stop_tx) = crate::client_stream::spawn_uni_recv_bridge(recv);
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new(read_rx, stop_tx);
                                                             let _ = uni_accept_tx.send(handle).await;
                                                             m_uni.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                         }
@@ -423,10 +423,10 @@ pub(crate) fn spawn_wtransport_server(
                                                     let r = match conn_create_bi.open_bi().await {
                                                         Ok(opening) => match opening.await {
                                                             Ok((send, recv)) => {
-                                                                let (read_rx, write_tx) =
+                                                                let (read_rx, write_tx, stop_tx) =
                                                                     crate::client_stream::spawn_bidi_bridge(send, recv);
                                                                 Ok(crate::client_stream::ClientBidiStreamHandle::new(
-                                                                    read_rx, write_tx,
+                                                                    read_rx, write_tx, stop_tx,
                                                                 ))
                                                             }
                                                             Err(e) => Err(e.to_string()),

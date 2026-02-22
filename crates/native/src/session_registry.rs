@@ -102,3 +102,22 @@ pub fn get(
 pub fn remove(session_id: &str) {
     REGISTRY.remove(session_id);
 }
+
+/// Close a session: close the QUIC connection and remove from registry.
+/// Closing the connection causes all pending reads/writes to fail,
+/// which unblocks iterators and bridge tasks.
+pub fn close_session(session_id: &str, code: u32, reason: &[u8]) {
+    if let Some((_, state)) = REGISTRY.remove(session_id) {
+        state.conn.close(wtransport::VarInt::from_u32(code), reason);
+    }
+}
+
+/// Close all sessions. Called during server shutdown for deterministic cleanup.
+pub fn close_all(code: u32, reason: &[u8]) {
+    let keys: Vec<String> = REGISTRY.iter().map(|e| e.key().clone()).collect();
+    for key in keys {
+        if let Some((_, state)) = REGISTRY.remove(&key) {
+            state.conn.close(wtransport::VarInt::from_u32(code), reason);
+        }
+    }
+}

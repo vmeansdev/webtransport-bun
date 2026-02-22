@@ -120,17 +120,15 @@ export class SendStream extends Writable implements Resettable {
         _encoding: BufferEncoding,
         callback: (error?: Error | null) => void,
     ): void {
-        // TODO: send to native via stream_write(handleId, chunk)
         this.#nativeHandle?.write(chunk).then(() => callback()).catch(callback);
     }
 
     override _final(callback: (error?: Error | null) => void): void {
-        // TODO: signal FIN
+        this.#nativeHandle?.finish?.();
         callback();
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
-        // TODO: clean up native resources
         callback(error);
     }
 
@@ -163,7 +161,6 @@ export class RecvStream extends Readable implements StopSendable {
     }
 
     override _read(_size: number): void {
-        // TODO: pull from native incoming queue
         this.#nativeHandle?.read().then((buf: Buffer | null) => {
             if (buf) this.push(buf);
             else this.push(null);
@@ -171,7 +168,6 @@ export class RecvStream extends Readable implements StopSendable {
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
-        // TODO: clean up native resources
         callback(error);
     }
 

@@ -283,11 +283,10 @@ class NativeServerSession implements ServerSession {
     }
 
     close(info?: CloseInfo): void {
-        this.#nativeHandle.close();
+        this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
-        // native side expects Buffer natively
         const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
         await this.#nativeHandle.sendDatagram(buf);
     }
@@ -295,7 +294,7 @@ class NativeServerSession implements ServerSession {
     async *incomingDatagrams(): AsyncIterable<Uint8Array> {
         while (true) {
             const datagram = await this.#nativeHandle.readDatagram();
-            if (!datagram) break; // None means closed
+            if (!datagram) break;
             yield datagram;
         }
     }
@@ -410,8 +409,8 @@ class NativeClientSession implements ClientSession {
         return this.#closedPromise;
     }
 
-    close(_info?: CloseInfo): void {
-        this.#nativeHandle.close();
+    close(info?: CloseInfo): void {
+        this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
