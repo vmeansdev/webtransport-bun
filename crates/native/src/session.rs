@@ -1,6 +1,7 @@
 use napi::Result;
 use napi_derive::napi;
 
+use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
 use crate::panic_guard;
 use crate::session_registry;
 use crate::RUNTIME;
@@ -49,7 +50,7 @@ impl SessionHandle {
         let bytes = data.as_ref().to_vec();
         let handle = RUNTIME.spawn(async move {
             match session_registry::get(&id) {
-                Some((conn, _, metrics)) => {
+                Some((conn, _, metrics, _, _, _, _)) => {
                     let ok = conn.send_datagram(&bytes).is_ok();
                     if ok {
                         metrics.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -75,42 +76,77 @@ impl SessionHandle {
     #[napi]
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
         let id = self.id.clone();
-        let result = RUNTIME
+        let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(&id) else {
+            return Ok(None);
+        };
+        let mut rx = dgram_rx.lock().await;
+        Ok(rx.recv().await.map(|v| v.into()))
+    }
+
+    // Streams (P0-1: wired to wtransport via session registry)
+
+    #[napi]
+    pub async fn create_bidi_stream(&self) -> Result<ClientBidiStreamHandle> {
+        let id = self.id.clone();
+        RUNTIME
             .spawn(async move {
-                let Some((_, dgram_rx, _)) = session_registry::get(&id) else {
-                    return None;
+                let Some((_, _, _, _, _, create_bi_tx, _)) = session_registry::get(&id) else {
+                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
                 };
-                let mut rx = dgram_rx.lock().await;
-                rx.recv().await
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                create_bi_tx
+                    .send(resp_tx)
+                    .await
+                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+                resp_rx
+                    .await
+                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
+                    .map_err(|e| napi::Error::from_reason(e))
             })
-            .await;
-        match result {
-            Ok(Some(v)) => Ok(Some(v.into())),
-            Ok(None) => Ok(None),
-            Err(e) => Err(napi::Error::from_reason(e.to_string())),
-        }
-    }
-
-    // Streams
-
-    #[napi]
-    pub async fn create_bidi_stream(&self) -> Result<crate::stream::StreamHandle> {
-        panic_guard::catch_panic(|| Ok(crate::stream::StreamHandle::new(0)))
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?
     }
 
     #[napi]
-    pub async fn accept_bidi_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
-        panic_guard::catch_panic(|| Ok(None))
+    pub async fn accept_bidi_stream(&self) -> Result<Option<ClientBidiStreamHandle>> {
+        let id = self.id.clone();
+        let Some((_, _, _, bidi_rx, _, _, _)) = session_registry::get(&id) else {
+            return Ok(None);
+        };
+        let mut rx = bidi_rx.lock().await;
+        Ok(rx.recv().await)
     }
 
     #[napi]
-    pub async fn create_uni_stream(&self) -> Result<crate::stream::StreamHandle> {
-        panic_guard::catch_panic(|| Ok(crate::stream::StreamHandle::new(0)))
+    pub async fn create_uni_stream(&self) -> Result<ClientUniSendHandle> {
+        let id = self.id.clone();
+        RUNTIME
+            .spawn(async move {
+                let Some((_, _, _, _, _, _, create_uni_tx)) = session_registry::get(&id) else {
+                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                };
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                create_uni_tx
+                    .send(resp_tx)
+                    .await
+                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+                resp_rx
+                    .await
+                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
+                    .map_err(|e| napi::Error::from_reason(e))
+            })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?
     }
 
     #[napi]
-    pub async fn accept_uni_stream(&self) -> Result<Option<crate::stream::StreamHandle>> {
-        panic_guard::catch_panic(|| Ok(None))
+    pub async fn accept_uni_stream(&self) -> Result<Option<ClientUniRecvHandle>> {
+        let id = self.id.clone();
+        let Some((_, _, _, _, uni_rx, _, _)) = session_registry::get(&id) else {
+            return Ok(None);
+        };
+        let mut rx = uni_rx.lock().await;
+        Ok(rx.recv().await)
     }
 
     #[napi]

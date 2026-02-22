@@ -28,15 +28,25 @@ pub mod stream;
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
 
-/// Dedicated Tokio runtime running on its own thread.
-/// All wtransport objects are driven on this runtime.
+/// Server runtime: drives the WebTransport server and all server-side stream bridges.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1) // single dedicated thread as per ARCHITECTURE.md
+        .worker_threads(1)
         .enable_all()
-        .thread_name("wt-tokio")
+        .thread_name("wt-server")
         .build()
-        .expect("failed to create Tokio runtime")
+        .expect("failed to create server Tokio runtime")
+});
+
+/// Client runtime: drives client connections and client-side stream bridges.
+/// Isolated from server to avoid same-process deadlock when client+server share a process.
+pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("wt-client")
+        .build()
+        .expect("failed to create client Tokio runtime")
 });
 
 // ---------------------------------------------------------------------------
@@ -246,9 +256,27 @@ pub(crate) fn spawn_wtransport_server(
                             async move {
                                 metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
                                 let session_request = match incoming_session.await {
-                                    Ok(r) => r,
-                                    Err(_) => {
+                                    Ok(r) => {
+                                        eprintln!(
+                                            "webtransport-native: CONNECT received authority={:?}",
+                                            r.authority()
+                                        );
+                                        r
+                                    }
+                                    Err(e) => {
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        let mut chain = String::new();
+                                        let mut src: &dyn std::error::Error = &e;
+                                        chain.push_str(&src.to_string());
+                                        while let Some(s) = src.source() {
+                                            chain.push_str(" <- ");
+                                            chain.push_str(&s.to_string());
+                                            src = s;
+                                        }
+                                        eprintln!(
+                                            "webtransport-native: handshake failed (incoming_session): {}",
+                                            chain
+                                        );
                                         return;
                                     }
                                 };
@@ -258,9 +286,17 @@ pub(crate) fn spawn_wtransport_server(
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                     return;
                                 }
+                                let authority = session_request.authority().to_string();
                                 match session_request.accept().await {
                                     Ok(connection) => {
                                         let peer_ip = connection.remote_address().ip().to_string();
+                                        let peer_port = connection.remote_address().port() as u32;
+                                        eprintln!(
+                                            "webtransport-native: session accepted peer={}:{} authority={:?}",
+                                            peer_ip,
+                                            peer_port,
+                                            authority
+                                        );
                                         if !rate_limit::try_acquire_per_ip_session_with_prefix(
                                             &peer_ip,
                                             handshakes_burst_per_ip,
@@ -273,17 +309,25 @@ pub(crate) fn spawn_wtransport_server(
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                         metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
 
-                                        // P0-A: Emit session-accepted to JS
                                         let id = format!(
                                             "sess-{}",
                                             SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                         );
+
+                                        // P0-1: Register session BEFORE emitting to JS so acceptBidiStream etc. find it
+                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx) =
+                                            session_registry::insert(
+                                                id.clone(),
+                                                connection.clone(),
+                                                metrics.clone(),
+                                            );
+
+                                        // P0-A: Emit session-accepted to JS
                                         if let Some(ref tsfn) = on_session {
-                                            let peer_port = connection.remote_address().port() as u32;
                                             let accepted = SessionAccepted {
                                                 id: id.clone(),
                                                 peer_ip: peer_ip.clone(),
-                                                peer_port,
+                                                peer_port: peer_port,
                                             };
                                             tsfn.call(
                                                 SessionEvent::Accepted(accepted),
@@ -301,21 +345,12 @@ pub(crate) fn spawn_wtransport_server(
                                         let lim_uni = limits.clone();
                                         let lim_dgram = limits.clone();
 
-                                        // P0-1: Register session for JS send_datagram/read_datagram
-                                        let dgram_tx = session_registry::insert(
-                                            id.clone(),
-                                            connection.clone(),
-                                            metrics.clone(),
-                                        );
-
                                         // P1-4: Per-session queued byte budget
                                         let session_queued =
                                             Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-                                        // Bidi stream echo loop (4.4.2: shed if over max_streams_global)
+                                        // Bidi stream accept loop: forward to JS via channel (4.4.2: shed if over limits)
                                         let peer_ip_bidi = peer_ip.clone();
-                                        let session_queued_bidi = Arc::clone(&session_queued);
-                                        let timeout_ms = lim_bidi.backpressure_timeout_ms;
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -324,7 +359,7 @@ pub(crate) fn spawn_wtransport_server(
                                                     tokio::select! {
                                                         _ = conn_bidi.closed() => break,
                                                         res = conn_bidi.accept_bi() => {
-                                                            let Ok((mut send, mut recv)) = res else { break };
+                                                            let Ok((mut send, recv)) = res else { break };
                                                             if !rate_limit::try_acquire_stream_open(&peer_ip_bidi) {
                                                                 m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = send.reset(0u32.into());
@@ -336,38 +371,17 @@ pub(crate) fn spawn_wtransport_server(
                                                                 continue;
                                                             }
                                                             m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
-                                                            let mut buf = vec![0u8; 1024];
-                                                            if let Ok(Some(n)) = recv.read(&mut buf).await {
-                                                                let sz = n as u64;
-                                                                if m_bidi.try_reserve_queued_bytes_with_session(
-                                                                    &session_queued_bidi,
-                                                                    sz,
-                                                                    lim_bidi.max_queued_bytes_global,
-                                                                    lim_bidi.max_queued_bytes_per_session,
-                                                                ) {
-                                                                    let write_fut = send.write_all(&buf[..n]);
-                                                                    let timeout = tokio::time::Duration::from_millis(timeout_ms);
-                                                                    if tokio::time::timeout(timeout, write_fut).await.is_err() {
-                                                                        m_bidi.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
-                                                                        let _ = send.reset(0u32.into());
-                                                                    }
-                                                                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                                                                        &session_queued_bidi,
-                                                                        &m_bidi,
-                                                                        sz,
-                                                                    );
-                                                                }
-                                                            }
+                                                            let (read_rx, write_tx) = crate::client_stream::spawn_bidi_bridge(send, recv);
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new(read_rx, write_tx);
+                                                            let _ = bidi_accept_tx.send(handle).await;
                                                             m_bidi.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                         }
                                                     }
                                                 }
                                             },
                                         );
-                                        // Uni stream echo loop (4.4.2; P1-5: stream token bucket)
+                                        // Uni stream accept loop: forward to JS via channel (4.4.2; P1-5)
                                         let peer_ip_uni = peer_ip.clone();
-                                        let session_queued_uni = Arc::clone(&session_queued);
-                                        let timeout_ms_uni = lim_uni.backpressure_timeout_ms;
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -376,7 +390,7 @@ pub(crate) fn spawn_wtransport_server(
                                                     tokio::select! {
                                                         _ = conn_uni.closed() => break,
                                                         res = conn_uni.accept_uni() => {
-                                                            let Ok(mut recv) = res else { break };
+                                                            let Ok(recv) = res else { break };
                                                             if !rate_limit::try_acquire_stream_open(&peer_ip_uni) {
                                                                 m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = recv.stop(0u32.into());
@@ -388,33 +402,65 @@ pub(crate) fn spawn_wtransport_server(
                                                                 continue;
                                                             }
                                                             m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                                                            let mut buf = vec![0u8; 1024];
-                                                            if let Ok(Some(n)) = recv.read(&mut buf).await {
-                                                                let sz = n as u64;
-                                                                if m_uni.try_reserve_queued_bytes_with_session(
-                                                                    &session_queued_uni,
-                                                                    sz,
-                                                                    lim_uni.max_queued_bytes_global,
-                                                                    lim_uni.max_queued_bytes_per_session,
-                                                                ) {
-                                                                    if let Ok(opening) = conn_uni.open_uni().await {
-                                                                        if let Ok(mut send) = opening.await {
-                                                                            let write_fut = send.write_all(&buf[..n]);
-                                                                            let timeout = tokio::time::Duration::from_millis(timeout_ms_uni);
-                                                                            if tokio::time::timeout(timeout, write_fut).await.is_err() {
-                                                                                m_uni.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
-                                                                                let _ = send.reset(0u32.into());
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                                                                        &session_queued_uni,
-                                                                        &m_uni,
-                                                                        sz,
-                                                                    );
+                                                            let read_rx = crate::client_stream::spawn_uni_recv_bridge(recv);
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new(read_rx);
+                                                            let _ = uni_accept_tx.send(handle).await;
+                                                            m_uni.streams_active.fetch_sub(1, Ordering::Relaxed);
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        );
+                                        // Create-bidi handler: respond to SessionHandle.create_bidi_stream
+                                        let conn_create_bi = connection.clone();
+                                        let m_create_bi = Arc::clone(&metrics);
+                                        spawn_tracked::spawn_tracked(
+                                            m_create_bi,
+                                            spawn_tracked::TaskKind::Stream,
+                                            async move {
+                                                let mut rx = create_bi_rx;
+                                                while let Some(resp_tx) = rx.recv().await {
+                                                    let r = match conn_create_bi.open_bi().await {
+                                                        Ok(opening) => match opening.await {
+                                                            Ok((send, recv)) => {
+                                                                let (read_rx, write_tx) =
+                                                                    crate::client_stream::spawn_bidi_bridge(send, recv);
+                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new(
+                                                                    read_rx, write_tx,
+                                                                ))
+                                                            }
+                                                            Err(e) => Err(e.to_string()),
+                                                        },
+                                                        Err(e) => Err(e.to_string()),
+                                                    };
+                                                    let _ = resp_tx.send(r);
+                                                }
+                                            },
+                                        );
+                                        // Create-uni handler: respond to SessionHandle.create_uni_stream
+                                        let conn_create_uni = connection.clone();
+                                        let m_create_uni = Arc::clone(&metrics);
+                                        spawn_tracked::spawn_tracked(
+                                            m_create_uni,
+                                            spawn_tracked::TaskKind::Stream,
+                                            async move {
+                                                let mut rx = create_uni_rx;
+                                                while let Some(resp_tx) = rx.recv().await {
+                                                    match conn_create_uni.open_uni().await {
+                                                        Ok(opening) => {
+                                                            match opening.await {
+                                                                Ok(send) => {
+                                                                    let write_tx = crate::client_stream::spawn_uni_send_bridge(send);
+                                                                    let handle = crate::client_stream::ClientUniSendHandle::new(write_tx);
+                                                                    let _ = resp_tx.send(Ok(handle));
+                                                                }
+                                                                Err(e) => {
+                                                                    let _ = resp_tx.send(Err(e.to_string()));
                                                                 }
                                                             }
-                                                            m_uni.streams_active.fetch_sub(1, Ordering::Relaxed);
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = resp_tx.send(Err(e.to_string()));
                                                         }
                                                     }
                                                 }
@@ -481,8 +527,21 @@ pub(crate) fn spawn_wtransport_server(
                                             },
                                         );
                                     }
-                                    Err(_) => {
+                                    Err(e) => {
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        let mut chain = String::new();
+                                        let mut src: &dyn std::error::Error = &e;
+                                        chain.push_str(&src.to_string());
+                                        while let Some(s) = src.source() {
+                                            chain.push_str(" <- ");
+                                            chain.push_str(&s.to_string());
+                                            src = s;
+                                        }
+                                        eprintln!(
+                                            "webtransport-native: session accept failed authority={:?} error={}",
+                                            authority,
+                                            chain
+                                        );
                                     }
                                 }
                             },

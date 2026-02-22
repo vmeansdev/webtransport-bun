@@ -3,14 +3,20 @@
 use napi::Result;
 use napi_derive::napi;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::RUNTIME;
 
+
 /// Bridge for a bidi stream: read from RecvStream, write to SendStream.
 /// JS calls read() / write() which use channels to the bridge tasks.
+///
+/// read() awaits directly on the napi runtime (no spawn on RUNTIME/CLIENT_RUNTIME).
+/// The channel receiver works cross-runtime: the bridge sender runs on RUNTIME or
+/// CLIENT_RUNTIME, and the waker mechanism correctly notifies the napi runtime.
+/// This avoids the same-process deadlock that occurred when spawning the recv on
+/// the same runtime as the bridge tasks.
 #[napi]
 pub struct ClientBidiStreamHandle {
     read_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
@@ -27,17 +33,24 @@ impl ClientBidiStreamHandle {
             write_tx: Some(write_tx),
         }
     }
+
+    pub fn new_client_stream(
+        read_rx: mpsc::Receiver<Vec<u8>>,
+        write_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Self {
+        Self::new(read_rx, write_tx)
+    }
 }
 
 #[napi]
 impl ClientBidiStreamHandle {
+    /// Read the next chunk from the QUIC stream (via the bridge channel).
+    /// Returns None on EOF / stream close.
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        let mut rx = self.read_rx.lock().await;
-        Ok(match rx.recv().await {
-            Some(bytes) => Some(bytes.into()),
-            None => None,
-        })
+        let read_rx = Arc::clone(&self.read_rx);
+        let mut rx = read_rx.lock().await;
+        Ok(rx.recv().await.map(|bytes| bytes.into()))
     }
 
     #[napi]
@@ -123,11 +136,9 @@ impl ClientUniRecvHandle {
 impl ClientUniRecvHandle {
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        let mut rx = self.read_rx.lock().await;
-        Ok(match rx.recv().await {
-            Some(bytes) => Some(bytes.into()),
-            None => None,
-        })
+        let read_rx = Arc::clone(&self.read_rx);
+        let mut rx = read_rx.lock().await;
+        Ok(rx.recv().await.map(|bytes| bytes.into()))
     }
 
     #[napi]
@@ -141,10 +152,19 @@ pub fn spawn_bidi_bridge(
     mut send_stream: wtransport::SendStream,
     mut recv_stream: wtransport::RecvStream,
 ) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+    spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream)
+}
+
+/// Spawn bridge on a specific runtime (use CLIENT_RUNTIME for client streams).
+pub fn spawn_bidi_bridge_on(
+    rt: &tokio::runtime::Runtime,
+    mut send_stream: wtransport::SendStream,
+    mut recv_stream: wtransport::RecvStream,
+) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
 
-    RUNTIME.spawn(async move {
+    rt.spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match recv_stream.read(&mut buf).await {
@@ -153,19 +173,15 @@ pub fn spawn_bidi_bridge(
                         break;
                     }
                 }
-                Ok(None) => {
-                    let _ = read_tx.send(vec![]);
-                    break;
-                }
+                Ok(None) => break,
                 Err(_) => break,
             }
         }
     });
 
-    RUNTIME.spawn(async move {
+    rt.spawn(async move {
         while let Some(chunk) = write_rx.recv().await {
             if chunk.is_empty() {
-                let _ = send_stream.finish().await;
                 break;
             }
             if send_stream.write_all(&chunk).await.is_err() {
@@ -181,12 +197,18 @@ pub fn spawn_bidi_bridge(
 pub fn spawn_uni_send_bridge(
     mut send_stream: wtransport::SendStream,
 ) -> mpsc::Sender<Vec<u8>> {
+    spawn_uni_send_bridge_on(&RUNTIME, send_stream)
+}
+
+pub fn spawn_uni_send_bridge_on(
+    rt: &tokio::runtime::Runtime,
+    mut send_stream: wtransport::SendStream,
+) -> mpsc::Sender<Vec<u8>> {
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(256);
 
-    RUNTIME.spawn(async move {
+    rt.spawn(async move {
         while let Some(chunk) = write_rx.recv().await {
             if chunk.is_empty() {
-                let _ = send_stream.finish().await;
                 break;
             }
             if send_stream.write_all(&chunk).await.is_err() {
@@ -202,9 +224,16 @@ pub fn spawn_uni_send_bridge(
 pub fn spawn_uni_recv_bridge(
     mut recv_stream: wtransport::RecvStream,
 ) -> mpsc::Receiver<Vec<u8>> {
+    spawn_uni_recv_bridge_on(&RUNTIME, recv_stream)
+}
+
+pub fn spawn_uni_recv_bridge_on(
+    rt: &tokio::runtime::Runtime,
+    mut recv_stream: wtransport::RecvStream,
+) -> mpsc::Receiver<Vec<u8>> {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
 
-    RUNTIME.spawn(async move {
+    rt.spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match recv_stream.read(&mut buf).await {
@@ -213,10 +242,7 @@ pub fn spawn_uni_recv_bridge(
                         break;
                     }
                 }
-                Ok(None) => {
-                    let _ = read_tx.send(vec![]);
-                    break;
-                }
+                Ok(None) => break, // close channel; reader gets None = EOF
                 Err(_) => break,
             }
         }

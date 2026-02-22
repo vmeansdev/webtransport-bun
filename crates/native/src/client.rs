@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 use crate::client_stream::{
-    spawn_bidi_bridge, spawn_uni_recv_bridge, spawn_uni_send_bridge,
+    spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
 };
-use crate::RUNTIME;
+use crate::{CLIENT_RUNTIME, RUNTIME};
 
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>> =
@@ -215,7 +215,7 @@ impl ClientSessionHandle {
         let conn_accept_bi = conn.clone();
         let conn_accept_uni = conn.clone();
 
-        RUNTIME.spawn(async move {
+        CLIENT_RUNTIME.spawn(async move {
             let conn_dgram_send = conn.clone();
             let conn_dgram_recv = conn.clone();
             let conn_closed = conn.clone();
@@ -243,8 +243,8 @@ impl ClientSessionHandle {
                     let r = match conn_bi.open_bi().await {
                         Ok(opening) => match opening.await {
                             Ok((send, recv)) => {
-                                let (read_rx, write_tx) = spawn_bidi_bridge(send, recv);
-                                Ok(ClientBidiStreamHandle::new(read_rx, write_tx))
+                                let (read_rx, write_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
+                                Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx))
                             }
                             Err(e) => Err(e.to_string()),
                         },
@@ -259,7 +259,7 @@ impl ClientSessionHandle {
                     let r = match conn_uni.open_uni().await {
                         Ok(opening) => match opening.await {
                             Ok(send) => {
-                                let write_tx = spawn_uni_send_bridge(send);
+                                let write_tx = spawn_uni_send_bridge_on(&CLIENT_RUNTIME, send);
                                 Ok(ClientUniSendHandle::new(write_tx))
                             }
                             Err(e) => Err(e.to_string()),
@@ -275,8 +275,8 @@ impl ClientSessionHandle {
                 while let Some(resp_tx) = accept_bi_rx.recv().await {
                     let r = match conn_accept_bi.accept_bi().await {
                         Ok((send, recv)) => {
-                            let (read_rx, write_tx) = spawn_bidi_bridge(send, recv);
-                            Ok(ClientBidiStreamHandle::new(read_rx, write_tx))
+                            let (read_rx, write_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv);
+                            Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx))
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -289,7 +289,7 @@ impl ClientSessionHandle {
                 while let Some(resp_tx) = accept_uni_rx_local.recv().await {
                     let r = match conn_accept_uni.accept_uni().await {
                         Ok(recv) => {
-                            let read_rx = spawn_uni_recv_bridge(recv);
+                            let read_rx = spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv);
                             Ok(ClientUniRecvHandle::new(read_rx))
                         }
                         Err(e) => Err(e.to_string()),
@@ -364,7 +364,7 @@ pub fn connect(
             },
         )?;
 
-    RUNTIME.spawn(async move {
+    CLIENT_RUNTIME.spawn(async move {
         let result = match run_connect(&url, opts_json)
             .await
             .map_err(|e| e.to_string())
