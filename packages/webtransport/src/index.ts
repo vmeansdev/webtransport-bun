@@ -373,6 +373,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     const rateLimitsJson = JSON.stringify({ ...DEFAULT_RATE_LIMITS, ...opts.rateLimits });
 
     const closedResolvers = new Map<string, (info: CloseInfo) => void>();
+    const logCallback = (logEvents: any[]) => {
+        if (opts.log) {
+            for (const le of logEvents) {
+                opts.log({
+                    level: le.level ?? "info",
+                    msg: le.msg ?? "",
+                    sessionId: le.sessionId,
+                    peerIp: le.peerIp,
+                    peerPort: le.peerPort,
+                });
+            }
+        }
+    };
+
     const handle = new native.ServerHandle(opts.port, opts.host ?? "0.0.0.0", certPem, keyPem, limitsJson, rateLimitsJson, (events: any[]) => {
         for (const evt of events) {
             if (evt.name === "session" && evt.id != null && evt.peerIp != null && evt.peerPort != null) {
@@ -387,7 +401,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
                 if (resolve) resolve({ code: evt.code, reason: evt.reason });
             }
         }
-    });
+    }, logCallback);
 
     return {
         address: { host: opts.host ?? "0.0.0.0", port: handle.port },
@@ -531,13 +545,7 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
         };
         native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
             if (err) {
-                const msg = typeof err === "string" ? err : err?.message ?? String(err);
-                const match = E_CODE_RE.exec(msg);
-                if (match) {
-                    reject(new WebTransportError(match[0] as ErrorCode, msg));
-                } else {
-                    reject(new WebTransportError(E_HANDSHAKE_TIMEOUT as ErrorCode, msg));
-                }
+                reject(toWebTransportError(err));
                 return;
             }
             if (handleId == null) {
