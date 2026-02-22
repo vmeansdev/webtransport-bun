@@ -13,7 +13,7 @@ const P95_MAX_MS = Number(process.env.BENCH_P95_MAX_MS ?? 500);
 function percentile(arr: number[], p: number): number {
     const sorted = [...arr].sort((a, b) => a - b);
     const i = Math.ceil((p / 100) * sorted.length) - 1;
-    return sorted[Math.max(0, i)];
+    return sorted[Math.max(0, i)] ?? 0;
 }
 
 async function main() {
