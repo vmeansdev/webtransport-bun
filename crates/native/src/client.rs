@@ -227,6 +227,7 @@ impl ClientSessionHandle {
         peer_port: u32,
         conn: wtransport::Connection,
         on_closed: Option<ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
+        backpressure_timeout_ms: u64,
     ) -> Self {
         let (dgram_send_tx, mut dgram_send_rx) = mpsc::channel::<Vec<u8>>(256);
         let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -244,7 +245,7 @@ impl ClientSessionHandle {
             peer_port,
             dgram_send_tx: Some(dgram_send_tx.clone()),
             dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
-            backpressure_timeout_ms: DEFAULT_BACKPRESSURE_TIMEOUT_MS,
+            backpressure_timeout_ms,
             max_datagram_size: DEFAULT_MAX_DATAGRAM_SIZE,
             stream_open_bi_tx: Some(open_bi_tx),
             stream_open_uni_tx: Some(open_uni_tx),
@@ -469,6 +470,11 @@ pub fn connect(
             },
         )?;
 
+    let bp_timeout_ms = serde_json::from_str::<serde_json::Value>(&opts_json)
+        .ok()
+        .and_then(|v| v.get("limits")?.get("backpressureTimeoutMs")?.as_u64())
+        .unwrap_or(DEFAULT_BACKPRESSURE_TIMEOUT_MS);
+
     CLIENT_RUNTIME.spawn(async move {
         let result = match run_connect(&url, opts_json)
             .await
@@ -480,6 +486,7 @@ pub fn connect(
                     peer_port,
                     conn,
                     on_closed_tsfn,
+                    bp_timeout_ms,
                 );
                 if let Ok(mut reg) = CLIENT_HANDLE_REGISTRY.lock() {
                     reg.insert(id.clone(), handle);
