@@ -26,12 +26,14 @@ Operational requirements:
 - backpressureTimeoutCount
 - rateLimitedCount, limitExceededCount
 
+See docs/METRICS.md for full metrics reference and structured log format.
+
 ## Idle timeout behavior
 
 - `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.
 - Activity: any data sent or received (handshake, datagrams, stream data). QUIC keepalives may extend the window.
 - When idle timeout fires: session closes with appropriate code; `closed` promise resolves.
-- Slow-reader detection (planned): streams with sustained backpressure beyond backpressureTimeoutMs are reset.
+- Slow-reader detection: streams where the peer does not drain within backpressureTimeoutMs are reset (backpressureTimeoutCount incremented).
 
 ## Runbook: queued bytes climb
 When `queuedBytesGlobal` rises and stays high:
