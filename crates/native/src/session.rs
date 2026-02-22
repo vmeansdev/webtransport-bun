@@ -2,6 +2,8 @@ use napi::Result;
 use napi_derive::napi;
 
 use crate::panic_guard;
+use crate::session_registry;
+use crate::RUNTIME;
 
 #[napi]
 pub struct SessionHandle {
@@ -42,15 +44,51 @@ impl SessionHandle {
     }
 
     #[napi]
-    pub async fn send_datagram(&self, _data: napi::bindgen_prelude::Buffer) -> Result<()> {
-        panic_guard::catch_panic(|| Ok(()))
+    pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
+        let id = self.id.clone();
+        let bytes = data.as_ref().to_vec();
+        let handle = RUNTIME.spawn(async move {
+            match session_registry::get(&id) {
+                Some((conn, _, metrics)) => {
+                    let ok = conn.send_datagram(&bytes).is_ok();
+                    if ok {
+                        metrics.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(napi::Error::from_reason("E_SESSION_CLOSED"))
+                    }
+                }
+                None => Err(napi::Error::from_reason("E_SESSION_CLOSED")),
+            }
+        });
+        match handle.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(napi::Error::from_reason(e.to_string())),
+        }
     }
 
     // Usually we would return an async iterator, but napi-rs doesn't strictly have a direct AsyncIterator binding.
     // So we provide a pull-based next() pump that JS can wrap in an AsyncGenerator.
     #[napi]
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        panic_guard::catch_panic(|| Ok(None))
+        let id = self.id.clone();
+        let result = RUNTIME
+            .spawn(async move {
+                let Some((_, dgram_rx, _)) = session_registry::get(&id) else {
+                    return None;
+                };
+                let mut rx = dgram_rx.lock().await;
+                rx.recv().await
+            })
+            .await;
+        match result {
+            Ok(Some(v)) => Ok(Some(v.into())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(napi::Error::from_reason(e.to_string())),
+        }
     }
 
     // Streams

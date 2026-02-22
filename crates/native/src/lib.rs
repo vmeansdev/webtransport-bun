@@ -20,6 +20,7 @@ pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
 pub mod session;
+pub mod session_registry;
 pub mod spawn_tracked;
 pub mod stream;
 
@@ -300,8 +301,20 @@ pub(crate) fn spawn_wtransport_server(
                                         let lim_uni = limits.clone();
                                         let lim_dgram = limits.clone();
 
+                                        // P0-1: Register session for JS send_datagram/read_datagram
+                                        let dgram_tx = session_registry::insert(
+                                            id.clone(),
+                                            connection.clone(),
+                                            metrics.clone(),
+                                        );
+
+                                        // P1-4: Per-session queued byte budget
+                                        let session_queued =
+                                            Arc::new(std::sync::atomic::AtomicU64::new(0));
+
                                         // Bidi stream echo loop (4.4.2: shed if over max_streams_global)
-                                        // Accept streams continuously until connection closes
+                                        let peer_ip_bidi = peer_ip.clone();
+                                        let session_queued_bidi = Arc::clone(&session_queued);
                                         let timeout_ms = lim_bidi.backpressure_timeout_ms;
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
@@ -312,6 +325,11 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_bidi.closed() => break,
                                                         res = conn_bidi.accept_bi() => {
                                                             let Ok((mut send, mut recv)) = res else { break };
+                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_bidi) {
+                                                                m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                                                let _ = send.reset(0u32.into());
+                                                                continue;
+                                                            }
                                                             if m_bidi.streams_active.load(Ordering::Relaxed) >= lim_bidi.max_streams_global {
                                                                 m_bidi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = send.reset(0u32.into());
@@ -321,14 +339,23 @@ pub(crate) fn spawn_wtransport_server(
                                                             let mut buf = vec![0u8; 1024];
                                                             if let Ok(Some(n)) = recv.read(&mut buf).await {
                                                                 let sz = n as u64;
-                                                                if m_bidi.try_reserve_queued_bytes(sz, lim_bidi.max_queued_bytes_global) {
+                                                                if m_bidi.try_reserve_queued_bytes_with_session(
+                                                                    &session_queued_bidi,
+                                                                    sz,
+                                                                    lim_bidi.max_queued_bytes_global,
+                                                                    lim_bidi.max_queued_bytes_per_session,
+                                                                ) {
                                                                     let write_fut = send.write_all(&buf[..n]);
                                                                     let timeout = tokio::time::Duration::from_millis(timeout_ms);
                                                                     if tokio::time::timeout(timeout, write_fut).await.is_err() {
                                                                         m_bidi.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
                                                                         let _ = send.reset(0u32.into());
                                                                     }
-                                                                    m_bidi.release_queued_bytes(sz);
+                                                                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                                                                        &session_queued_bidi,
+                                                                        &m_bidi,
+                                                                        sz,
+                                                                    );
                                                                 }
                                                             }
                                                             m_bidi.streams_active.fetch_sub(1, Ordering::Relaxed);
@@ -337,8 +364,9 @@ pub(crate) fn spawn_wtransport_server(
                                                 }
                                             },
                                         );
-                                        // Uni stream echo loop (4.4.2)
-                                        // Accept streams continuously until connection closes
+                                        // Uni stream echo loop (4.4.2; P1-5: stream token bucket)
+                                        let peer_ip_uni = peer_ip.clone();
+                                        let session_queued_uni = Arc::clone(&session_queued);
                                         let timeout_ms_uni = lim_uni.backpressure_timeout_ms;
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
@@ -349,6 +377,11 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_uni.closed() => break,
                                                         res = conn_uni.accept_uni() => {
                                                             let Ok(mut recv) = res else { break };
+                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_uni) {
+                                                                m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                                                let _ = recv.stop(0u32.into());
+                                                                continue;
+                                                            }
                                                             if m_uni.streams_active.load(Ordering::Relaxed) >= lim_uni.max_streams_global {
                                                                 m_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = recv.stop(0u32.into());
@@ -358,7 +391,12 @@ pub(crate) fn spawn_wtransport_server(
                                                             let mut buf = vec![0u8; 1024];
                                                             if let Ok(Some(n)) = recv.read(&mut buf).await {
                                                                 let sz = n as u64;
-                                                                if m_uni.try_reserve_queued_bytes(sz, lim_uni.max_queued_bytes_global) {
+                                                                if m_uni.try_reserve_queued_bytes_with_session(
+                                                                    &session_queued_uni,
+                                                                    sz,
+                                                                    lim_uni.max_queued_bytes_global,
+                                                                    lim_uni.max_queued_bytes_per_session,
+                                                                ) {
                                                                     if let Ok(opening) = conn_uni.open_uni().await {
                                                                         if let Ok(mut send) = opening.await {
                                                                             let write_fut = send.write_all(&buf[..n]);
@@ -369,7 +407,11 @@ pub(crate) fn spawn_wtransport_server(
                                                                             }
                                                                         }
                                                                     }
-                                                                    m_uni.release_queued_bytes(sz);
+                                                                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                                                                        &session_queued_uni,
+                                                                        &m_uni,
+                                                                        sz,
+                                                                    );
                                                                 }
                                                             }
                                                             m_uni.streams_active.fetch_sub(1, Ordering::Relaxed);
@@ -378,9 +420,11 @@ pub(crate) fn spawn_wtransport_server(
                                                 }
                                             },
                                         );
-                                        // Datagram echo (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
+                                        // Datagram forward to channel (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
+                                        // JS echo via SessionHandle.send_datagram
                                         let on_session_closed = on_session.clone();
                                         let peer_ip_for_release = peer_ip.clone();
+                                        let session_queued_dgram = Arc::clone(&session_queued);
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -393,23 +437,39 @@ pub(crate) fn spawn_wtransport_server(
                                                                 Err(_) => break,
                                                             };
                                                             m_dgram.datagrams_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                            if !rate_limit::try_acquire_datagram_ingress(&peer_ip_for_release) {
+                                                                m_dgram.rate_limited_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                                m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                                continue;
+                                                            }
                                                             if dgram.len() > lim_dgram.max_datagram_size {
                                                                 m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                                 continue;
                                                             }
                                                             let sz = dgram.len() as u64;
-                                                            if !m_dgram.try_reserve_queued_bytes(sz, lim_dgram.max_queued_bytes_global) {
+                                                            if !m_dgram.try_reserve_queued_bytes_with_session(
+                                                                &session_queued_dgram,
+                                                                sz,
+                                                                lim_dgram.max_queued_bytes_global,
+                                                                lim_dgram.max_queued_bytes_per_session,
+                                                            ) {
                                                                 m_dgram.datagrams_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                                 continue;
                                                             }
-                                                            if conn_dgram.send_datagram(dgram.as_ref()).is_ok() {
-                                                                m_dgram.datagrams_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                                            }
-                                                            m_dgram.release_queued_bytes(sz);
+                                                            // Forward to channel; JS reads via SessionHandle.read_datagram
+                                                            // (datagrams_out incremented in SessionHandle.send_datagram when JS echoes)
+                                                            let payload = dgram.as_ref().to_vec();
+                                                            let _ = dgram_tx.send(payload).await;
+                                                            crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                                                                &session_queued_dgram,
+                                                                &m_dgram,
+                                                                sz,
+                                                            );
                                                         }
                                                         _ = conn_dgram.closed() => break,
                                                     }
                                                 }
+                                                session_registry::remove(&id);
                                                 rate_limit::release_per_ip_session(&peer_ip_for_release);
                                                 m_dgram.sessions_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                                 if let Some(ref tsfn) = on_session_closed {
