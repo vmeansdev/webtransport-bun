@@ -48,6 +48,8 @@ jobs:
         run: bun run typecheck
       - name: Unit tests
         run: bun test packages/
+      - name: Parity (W3C facade)
+        run: bun run test:parity
       - name: Build reference + load-client
         run: cargo build -p reference --bins
       - name: Load-addon test
