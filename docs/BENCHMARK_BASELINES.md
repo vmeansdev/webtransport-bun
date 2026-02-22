@@ -1,4 +1,4 @@
-# Benchmark baselines (Phase 2)
+# Benchmark baselines
 
 Record results here for regression tracking. Run `bun run bench:baseline` and update.
 

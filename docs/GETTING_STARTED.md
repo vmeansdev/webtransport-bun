@@ -27,6 +27,23 @@ console.log("Server listening on port", server.address.port);
 - TLS certificate and key (PEM format)
 - UDP port open (default 4433)
 
-## Client (planned)
+## Client
 
-`connect(url, opts)` is not yet implemented. Use the reference load-client or Chromium for testing.
+```ts
+import { connect } from "@webtransport-bun/webtransport";
+
+const session = await connect("https://localhost:4433", {
+  tls: { insecureSkipVerify: true }, // dev only — use valid certs in production
+});
+
+// Send a datagram
+await session.sendDatagram(new Uint8Array([1, 2, 3]));
+
+// Open a bidi stream
+const stream = await session.createBidirectionalStream();
+stream.write(Buffer.from("hello"));
+stream.on("data", (chunk: Buffer) => console.log("received:", chunk));
+
+// Clean up
+session.close();
+```

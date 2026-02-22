@@ -1,4 +1,4 @@
-# Metrics reference (Phase 5)
+# Metrics reference
 
 All metrics are exposed via `server.metricsSnapshot()` and `session.metricsSnapshot()`.
 

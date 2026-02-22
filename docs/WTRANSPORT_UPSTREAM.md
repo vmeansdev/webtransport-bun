@@ -23,4 +23,4 @@ Track known wtransport issues that impact correctness during termination and loa
 
 - Panic containment: all addon entrypoints wrapped in `catch_unwind` (see `crates/native/src/panic_guard.rs`).
 - Load client: run in separate process with `RUST_BACKTRACE=1`; stderr captured for CI artifacts.
-- Planned: session shutdown state machine with timeouts; hard-close fallbacks.
+- Deterministic shutdown: `close_all` with bounded wait and hard-close fallback (see `session_registry.rs`).

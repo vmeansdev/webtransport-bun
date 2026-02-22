@@ -6,7 +6,7 @@
 ## High-level API
 The API provides:
 - `createServer(options)` for in-process server.
-- `connect(url, options)` for client (optional initial release; server is mandatory).
+- `connect(url, options)` for client.
 - Sessions expose datagrams (Promise send + async iterable receive) and streams (Node streams).
 
 All streams must use standard Node stream backpressure semantics (write() returns false + 'drain').
@@ -157,6 +157,8 @@ export type MetricsSnapshot = {
   nowMs: number;
 
   sessionsActive: number;
+  sessionTasksActive: number;
+  streamTasksActive: number;
   handshakesInFlight: number;
   streamsActive: number;
 

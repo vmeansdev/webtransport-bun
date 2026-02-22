@@ -1,4 +1,4 @@
-# Protocol edge cases (Phase 8.2)
+# Protocol edge cases
 
 Expected behavior for protocol edge-case tests:
 
