@@ -117,9 +117,13 @@ pub fn try_acquire_per_ip_session_with_prefix(
 }
 
 fn release_per_ip_session_inner(peer_ip: &str) {
-    if let Some(entry) = PER_IP_SESSIONS.get_mut(peer_ip) {
-        let n = entry.fetch_sub(1, Ordering::SeqCst);
-        if n <= 1 {
+    if let Some(entry) = PER_IP_SESSIONS.get(peer_ip) {
+        let prev = entry
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if prev <= 1 {
             drop(entry);
             PER_IP_SESSIONS.remove(peer_ip);
         }
@@ -127,9 +131,13 @@ fn release_per_ip_session_inner(peer_ip: &str) {
 }
 
 fn release_per_prefix_session_inner(prefix: &str) {
-    if let Some(entry) = PER_PREFIX_SESSIONS.get_mut(prefix) {
-        let n = entry.fetch_sub(1, Ordering::SeqCst);
-        if n <= 1 {
+    if let Some(entry) = PER_PREFIX_SESSIONS.get(prefix) {
+        let prev = entry
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if prev <= 1 {
             drop(entry);
             PER_PREFIX_SESSIONS.remove(prefix);
         }

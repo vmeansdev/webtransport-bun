@@ -403,7 +403,6 @@ pub(crate) fn spawn_wtransport_server(
                                                             let (read_rx, write_tx, stop_tx) = crate::client_stream::spawn_bidi_bridge(send, recv);
                                                             let handle = crate::client_stream::ClientBidiStreamHandle::new(read_rx, write_tx, stop_tx);
                                                             let _ = bidi_accept_tx.send(handle).await;
-                                                            m_bidi.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                         }
                                                     }
                                                 }
@@ -434,7 +433,6 @@ pub(crate) fn spawn_wtransport_server(
                                                             let (read_rx, stop_tx) = crate::client_stream::spawn_uni_recv_bridge(recv);
                                                             let handle = crate::client_stream::ClientUniRecvHandle::new(read_rx, stop_tx);
                                                             let _ = uni_accept_tx.send(handle).await;
-                                                            m_uni.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                         }
                                                     }
                                                 }
