@@ -60,3 +60,12 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 
 ## Security reporting
 - Report vulnerabilities via GitHub Security Advisories or a dedicated contact (see CONTRIBUTING).
+
+## CI scan triage and suppressions
+- CodeQL and Trivy findings are triaged in PRs; `CRITICAL`/`HIGH` are blocking by default.
+- Any suppression must include:
+  - clear justification,
+  - scope (exact package/path/CVE),
+  - expiration/revisit date.
+- Suppressions should be minimal and temporary; broad/global ignores are not allowed.
+- When a finding is accepted temporarily, track it in an issue with owner + target fix release.
