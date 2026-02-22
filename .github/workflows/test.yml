@@ -1,6 +1,9 @@
 # CI: build, test, interop (Chromium). P0-G.
 name: test
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 jobs:
   soak:
     runs-on: ubuntu-latest
