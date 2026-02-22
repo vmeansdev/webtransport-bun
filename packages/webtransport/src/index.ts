@@ -39,6 +39,9 @@ import {
 } from "./errors.js";
 import type { ErrorCode } from "./errors.js";
 
+/** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
+type BufferSource = ArrayBuffer | ArrayBufferView;
+
 const E_CODE_RE = /^E_[A-Z_]+/;
 function toWebTransportError(err: unknown): WebTransportError {
     const msg = err instanceof Error ? err.message : String(err);
@@ -166,7 +169,31 @@ export interface WebTransportServer {
 }
 
 // ---------------------------------------------------------------------------
-// Client options
+// Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
+// ---------------------------------------------------------------------------
+
+/** Browser-style close info: closeCode/reason (spec alignment) */
+export type WebTransportCloseInfo = {
+    closeCode?: number;
+    reason?: string;
+};
+
+/** Browser-style client options for WebTransport facade */
+export type WebTransportClientOptions = {
+    serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>; // BufferSource = ArrayBuffer | ArrayBufferView
+    allowPooling?: boolean;
+    requireUnreliable?: boolean;
+    /** Bun backend extension */
+    tls?: {
+        insecureSkipVerify?: boolean;
+        caPem?: string | Uint8Array;
+        serverName?: string;
+    };
+    limits?: Partial<LimitsOptions>;
+};
+
+// ---------------------------------------------------------------------------
+// Client options (Node API)
 // ---------------------------------------------------------------------------
 
 export type ClientOptions = {
@@ -660,4 +687,311 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
     });
 
     return Promise.race([connectPromise, timeoutPromise]);
+}
+
+// ---------------------------------------------------------------------------
+// Browser-style WebTransport facade (Phase P1)
+// ---------------------------------------------------------------------------
+
+const UNSUPPORTED_CTOR_OPTIONS = ["allowPooling", "requireUnreliable"] as const;
+
+function rejectUnsupportedOption(optionName: string): never {
+    throw new WebTransportError(
+        E_INTERNAL as ErrorCode,
+        `E_INTERNAL: unsupported option '${optionName}'`
+    );
+}
+
+function validateServerCertificateHashes(
+    arr: Array<{ algorithm: string; value: BufferSource }>
+): void {
+    for (const entry of arr) {
+        if (entry.algorithm !== "sha-256") {
+            throw new WebTransportError(
+                E_INTERNAL as ErrorCode,
+                `E_INTERNAL: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`
+            );
+        }
+        if (entry.value == null || (typeof entry.value === "object" && "byteLength" in entry && entry.byteLength === 0)) {
+            throw new WebTransportError(
+                E_INTERNAL as ErrorCode,
+                "E_INTERNAL: serverCertificateHashes entry value must be non-empty BufferSource"
+            );
+        }
+    }
+}
+
+function validateClientOptions(opts?: WebTransportClientOptions): void {
+    if (!opts) return;
+    for (const k of UNSUPPORTED_CTOR_OPTIONS) {
+        if (k in opts && (opts as Record<string, unknown>)[k] !== undefined) {
+            rejectUnsupportedOption(k);
+        }
+    }
+    if (opts.serverCertificateHashes !== undefined) {
+        if (!Array.isArray(opts.serverCertificateHashes)) {
+            throw new WebTransportError(
+                E_INTERNAL as ErrorCode,
+                "E_INTERNAL: serverCertificateHashes must be an array"
+            );
+        }
+        validateServerCertificateHashes(opts.serverCertificateHashes);
+        throw new WebTransportError(
+            E_INTERNAL as ErrorCode,
+            "E_INTERNAL: serverCertificateHashes is not supported in this runtime"
+        );
+    }
+}
+
+function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
+    if (!opts) return {};
+    validateClientOptions(opts);
+    return {
+        tls: opts.tls,
+        limits: opts.limits,
+    };
+}
+
+function toCloseInfo(info: CloseInfo): WebTransportCloseInfo {
+    return {
+        closeCode: info?.code,
+        reason: info?.reason,
+    };
+}
+
+/** Internal transport state for facade method guards */
+type WebTransportState = "connecting" | "connected" | "draining" | "closed" | "failed";
+
+/**
+ * Browser-style WebTransport client. Constructor kicks off connection;
+ * use `ready` to await handshake completion.
+ */
+export class WebTransport {
+    readonly #sessionPromise: Promise<ClientSession>;
+    readonly #ready: Promise<void>;
+    readonly #closed: Promise<WebTransportCloseInfo>;
+    readonly #draining: Promise<void>;
+    #session: ClientSession | null = null;
+    #state: WebTransportState;
+    #datagramsCache: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } | null = null;
+    #incomingBidiCache: ReadableStream<{ readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> }> | null = null;
+    #incomingUniCache: ReadableStream<ReadableStream<Uint8Array>> | null = null;
+
+    constructor(urlOrSession: string | ClientSession, options?: WebTransportClientOptions) {
+        if (typeof urlOrSession === "string") {
+            const clientOpts = mapToClientOptions(options);
+            this.#sessionPromise = connect(urlOrSession, clientOpts);
+            this.#state = "connecting";
+            this.#ready = this.#sessionPromise.then(
+                (s) => {
+                    this.#session = s;
+                    if (this.#state !== "draining") this.#state = "connected";
+                },
+                (err) => {
+                    this.#state = "failed";
+                    throw err;
+                }
+            );
+            this.#closed = this.#sessionPromise.then((s) =>
+                s.closed.then((info) => {
+                    this.#state = "closed";
+                    return toCloseInfo(info);
+                })
+            );
+        } else {
+            const s = urlOrSession;
+            this.#sessionPromise = Promise.resolve(s);
+            this.#session = s;
+            this.#state = "connected";
+            this.#ready = s.ready;
+            this.#closed = s.closed.then((info) => {
+                this.#state = "closed";
+                return toCloseInfo(info);
+            });
+        }
+        // draining: spec says it resolves when session is asked to gracefully close.
+        // Native layer has no separate draining signal; we resolve when closed (documented as partial parity).
+        this.#draining = this.#closed.then(() => {});
+    }
+
+    get ready(): Promise<void> {
+        return this.#ready;
+    }
+
+    get closed(): Promise<WebTransportCloseInfo> {
+        return this.#closed;
+    }
+
+    get draining(): Promise<void> {
+        return this.#draining;
+    }
+
+    get datagrams(): {
+        readable: ReadableStream<Uint8Array>;
+        writable: WritableStream<Uint8Array>;
+    } {
+        if (!this.#datagramsCache) {
+            this.#datagramsCache = createDatagramStreams(this);
+        }
+        return this.#datagramsCache;
+    }
+
+    get incomingBidirectionalStreams(): ReadableStream<{
+        readable: ReadableStream<Uint8Array>;
+        writable: WritableStream<Uint8Array>;
+    }> {
+        if (!this.#incomingBidiCache) {
+            this.#incomingBidiCache = createIncomingBidiStreams(this);
+        }
+        return this.#incomingBidiCache;
+    }
+
+    get incomingUnidirectionalStreams(): ReadableStream<ReadableStream<Uint8Array>> {
+        if (!this.#incomingUniCache) {
+            this.#incomingUniCache = createIncomingUniStreams(this);
+        }
+        return this.#incomingUniCache;
+    }
+
+    async createBidirectionalStream(
+        options?: { sendOrder?: number; sendGroup?: number }
+    ): Promise<{
+        readable: ReadableStream<Uint8Array>;
+        writable: WritableStream<Uint8Array>;
+    }> {
+        if (options?.sendOrder !== undefined) rejectUnsupportedOption("sendOrder");
+        if (options?.sendGroup !== undefined) rejectUnsupportedOption("sendGroup");
+        if (this.#state === "draining" || this.#state === "closed" || this.#state === "failed") {
+            throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+        }
+        const s = await this.#sessionPromise;
+        const duplex = await s.createBidirectionalStream();
+        return nodeDuplexToWebBidi(duplex);
+    }
+
+    async createUnidirectionalStream(
+        options?: { sendOrder?: number; sendGroup?: number }
+    ): Promise<WritableStream<Uint8Array>> {
+        if (options?.sendOrder !== undefined) rejectUnsupportedOption("sendOrder");
+        if (options?.sendGroup !== undefined) rejectUnsupportedOption("sendGroup");
+        if (this.#state === "draining" || this.#state === "closed" || this.#state === "failed") {
+            throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+        }
+        const s = await this.#sessionPromise;
+        const writable = await s.createUnidirectionalStream();
+        return nodeWritableToWebWritable(writable);
+    }
+
+    close(info?: WebTransportCloseInfo): void {
+        if (this.#state === "connected" || this.#state === "connecting") {
+            this.#state = "draining";
+        }
+        if (this.#session) {
+            this.#session.close({
+                code: info?.closeCode,
+                reason: info?.reason,
+            });
+        }
+    }
+
+    /** Internal: session for adapters (not part of spec) */
+    async _getSession(): Promise<ClientSession> {
+        return this.#sessionPromise;
+    }
+}
+
+// Stub implementations for P2/P3 — will be replaced in datagram/stream phases
+function createDatagramStreams(
+    wt: WebTransport
+): { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } {
+    const readable = new ReadableStream<Uint8Array>({
+        async start(controller) {
+            const s = await wt._getSession();
+            for await (const d of s.incomingDatagrams()) {
+                controller.enqueue(new Uint8Array(d));
+            }
+            controller.close();
+        },
+    });
+    const writable = new WritableStream<Uint8Array>({
+        async write(chunk) {
+            const s = await wt._getSession();
+            await s.sendDatagram(chunk);
+        },
+    });
+    return { readable, writable };
+}
+
+function createIncomingBidiStreams(
+    wt: WebTransport
+): ReadableStream<{ readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> }> {
+    return new ReadableStream({
+        async start(controller) {
+            const s = await wt._getSession();
+            for await (const duplex of s.incomingBidirectionalStreams()) {
+                controller.enqueue(await nodeDuplexToWebBidi(duplex));
+            }
+            controller.close();
+        },
+    });
+}
+
+function createIncomingUniStreams(
+    wt: WebTransport
+): ReadableStream<ReadableStream<Uint8Array>> {
+    return new ReadableStream({
+        async start(controller) {
+            const s = await wt._getSession();
+            for await (const readable of s.incomingUnidirectionalStreams()) {
+                controller.enqueue(nodeReadableToWebReadable(readable));
+            }
+            controller.close();
+        },
+    });
+}
+
+function nodeDuplexToWebBidi(duplex: Duplex): Promise<{
+    readable: ReadableStream<Uint8Array>;
+    writable: WritableStream<Uint8Array>;
+}> {
+    const readable = nodeReadableToWebReadable(duplex);
+    const writable = nodeWritableToWebWritable(duplex);
+    return Promise.resolve({ readable, writable });
+}
+
+function nodeReadableToWebReadable(
+    r: Readable
+): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+        async start(controller) {
+            for await (const chunk of r) {
+                controller.enqueue(
+                    chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
+                );
+            }
+            controller.close();
+        },
+    });
+}
+
+function nodeWritableToWebWritable(w: Writable): WritableStream<Uint8Array> {
+    return new WritableStream<Uint8Array>({
+        async write(chunk) {
+            return new Promise((resolve, reject) => {
+                w.write(Buffer.from(chunk), (err: Error | null | undefined) => (err ? reject(err) : resolve()));
+            });
+        },
+        close() {
+            return new Promise((resolve, reject) => {
+                w.end((err: Error | null | undefined) => (err ? reject(err) : resolve()));
+            });
+        },
+    });
+}
+
+/**
+ * Adapter: wrap an existing ClientSession as a browser-style WebTransport.
+ */
+export function toWebTransport(session: ClientSession): WebTransport {
+    return new WebTransport(session);
 }
