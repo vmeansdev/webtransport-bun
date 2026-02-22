@@ -153,7 +153,10 @@ pub(crate) fn spawn_wtransport_server(
             napi::threadsafe_function::ErrorStrategy::Fatal,
         >,
     >,
+    cert_pem: String,
+    key_pem: String,
 ) {
+    use std::io::Write;
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
@@ -161,11 +164,53 @@ pub(crate) fn spawn_wtransport_server(
 
     RUNTIME.spawn(async move {
         panic_guard::spawn_quic_task(async move {
-            let identity = match Identity::self_signed(&["localhost", "127.0.0.1", "::1"]) {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("webtransport-native: failed to create identity: {:?}", e);
-                    return;
+            let identity = if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
+                let mut cert_file = match tempfile::Builder::new()
+                    .prefix("wt-cert-")
+                    .suffix(".pem")
+                    .tempfile()
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("webtransport-native: failed to create temp cert file: {:?}", e);
+                        return;
+                    }
+                };
+                let _ = cert_file.write_all(cert_pem.as_bytes());
+                let _ = cert_file.flush();
+                let cert_path = cert_file.path().to_path_buf();
+                let mut key_file = match tempfile::Builder::new()
+                    .prefix("wt-key-")
+                    .suffix(".pem")
+                    .tempfile()
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("webtransport-native: failed to create temp key file: {:?}", e);
+                        return;
+                    }
+                };
+                let _ = key_file.write_all(key_pem.as_bytes());
+                let _ = key_file.flush();
+                let key_path = key_file.path().to_path_buf();
+                match Identity::load_pemfiles(&cert_path, &key_path).await {
+                    Ok(i) => {
+                        drop(cert_file);
+                        drop(key_file);
+                        i
+                    }
+                    Err(e) => {
+                        eprintln!("webtransport-native: failed to load PEM identity: {:?}", e);
+                        return;
+                    }
+                }
+            } else {
+                match Identity::self_signed(&["localhost", "127.0.0.1", "::1"]) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("webtransport-native: failed to create identity: {:?}", e);
+                        return;
+                    }
                 }
             };
             let config = ServerConfig::builder()

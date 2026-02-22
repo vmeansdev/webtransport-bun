@@ -23,8 +23,8 @@ impl ServerHandle {
     pub fn new(
         _env: Env,
         port: u32,
-        _cert_pem: String,
-        _key_pem: String,
+        cert_pem: String,
+        key_pem: String,
         _limits_json: String,
         _rate_limits_json: String,
         on_session: JsFunction,
@@ -78,6 +78,8 @@ impl ServerHandle {
                 port_u16,
                 shutdown_rx,
                 on_session_tsfn,
+                cert_pem,
+                key_pem,
             );
             Ok(Self {
                 port,
