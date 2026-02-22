@@ -34,7 +34,8 @@ export interface BidiStreamOptions extends DuplexOptions {
 
 export class BidiStream extends Duplex implements Resettable, StopSendable {
     private readonly _handleId: StreamHandleId;
-    readonly #nativeHandle: any;
+    #nativeHandle: any;
+    #destroyed = false;
 
     constructor(opts: BidiStreamOptions) {
         super({
@@ -48,17 +49,17 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
         this.#nativeHandle = opts.nativeHandle;
     }
 
-    // -- Node stream overrides (to be wired to native) -----------------------
+    // -- Node stream overrides -----------------------
 
     override _read(_size: number): void {
         const h = this.#nativeHandle;
-        if (!h) {
+        if (!h || this.#destroyed) {
             this.push(null);
             return;
         }
         h.read()
             .then((buf: Buffer | null) => {
-                if (buf) this.push(buf);
+                if (buf && !this.#destroyed) this.push(buf);
                 else this.push(null);
             })
             .catch((err: any) => this.destroy(err));
@@ -69,7 +70,12 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
         _encoding: BufferEncoding,
         callback: (error?: Error | null) => void,
     ): void {
-        this.#nativeHandle?.write(chunk).then(() => callback()).catch(callback);
+        const h = this.#nativeHandle;
+        if (!h || this.#destroyed) {
+            callback(new Error("E_STREAM_RESET"));
+            return;
+        }
+        h.write(chunk).then(() => callback()).catch(callback);
     }
 
     override _final(callback: (error?: Error | null) => void): void {
@@ -78,18 +84,25 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+        if (!this.#destroyed) {
+            this.#destroyed = true;
+            try {
+                this.#nativeHandle?.reset?.(0);
+            } catch { /* already closed */ }
+            this.#nativeHandle = null;
+        }
         callback(error);
     }
 
     // -- Stream control extensions -------------------------------------------
 
     [WT_RESET](code?: number): void {
-        this.#nativeHandle.reset(code ?? 0);
+        this.#nativeHandle?.reset(code ?? 0);
         this.destroy();
     }
 
     [WT_STOP_SENDING](code?: number): void {
-        this.#nativeHandle.stopSending(code ?? 0);
+        this.#nativeHandle?.stopSending(code ?? 0);
     }
 }
 
@@ -104,11 +117,13 @@ export interface SendStreamOptions extends WritableOptions {
 
 export class SendStream extends Writable implements Resettable {
     private readonly _handleId: StreamHandleId;
-    readonly #nativeHandle: any;
+    #nativeHandle: any;
+    #destroyed = false;
 
     constructor(opts: SendStreamOptions) {
         super({
             ...opts,
+            autoDestroy: true,
             highWaterMark: opts.highWaterMark ?? 256 * 1024,
         });
         this._handleId = opts.handleId;
@@ -120,7 +135,12 @@ export class SendStream extends Writable implements Resettable {
         _encoding: BufferEncoding,
         callback: (error?: Error | null) => void,
     ): void {
-        this.#nativeHandle?.write(chunk).then(() => callback()).catch(callback);
+        const h = this.#nativeHandle;
+        if (!h || this.#destroyed) {
+            callback(new Error("E_STREAM_RESET"));
+            return;
+        }
+        h.write(chunk).then(() => callback()).catch(callback);
     }
 
     override _final(callback: (error?: Error | null) => void): void {
@@ -129,6 +149,13 @@ export class SendStream extends Writable implements Resettable {
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+        if (!this.#destroyed) {
+            this.#destroyed = true;
+            try {
+                this.#nativeHandle?.reset?.(0);
+            } catch { /* already closed */ }
+            this.#nativeHandle = null;
+        }
         callback(error);
     }
 
@@ -149,11 +176,13 @@ export interface RecvStreamOptions extends ReadableOptions {
 
 export class RecvStream extends Readable implements StopSendable {
     private readonly _handleId: StreamHandleId;
-    readonly #nativeHandle: any;
+    #nativeHandle: any;
+    #destroyed = false;
 
     constructor(opts: RecvStreamOptions) {
         super({
             ...opts,
+            autoDestroy: true,
             highWaterMark: opts.highWaterMark ?? 256 * 1024,
         });
         this._handleId = opts.handleId;
@@ -161,13 +190,25 @@ export class RecvStream extends Readable implements StopSendable {
     }
 
     override _read(_size: number): void {
-        this.#nativeHandle?.read().then((buf: Buffer | null) => {
-            if (buf) this.push(buf);
+        const h = this.#nativeHandle;
+        if (!h || this.#destroyed) {
+            this.push(null);
+            return;
+        }
+        h.read().then((buf: Buffer | null) => {
+            if (buf && !this.#destroyed) this.push(buf);
             else this.push(null);
         }).catch((err: any) => this.destroy(err));
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+        if (!this.#destroyed) {
+            this.#destroyed = true;
+            try {
+                this.#nativeHandle?.stopSending?.(0);
+            } catch { /* already closed */ }
+            this.#nativeHandle = null;
+        }
         callback(error);
     }
 
