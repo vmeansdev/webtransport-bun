@@ -9,6 +9,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 
+/// Per-client-session atomic metrics.
+#[derive(Default)]
+pub struct ClientMetrics {
+    pub datagrams_in: AtomicU64,
+    pub datagrams_out: AtomicU64,
+    pub streams_active: AtomicU64,
+    pub queued_bytes: AtomicU64,
+}
+
 use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
@@ -58,6 +67,8 @@ pub struct ClientSessionHandle {
     stream_accept_bi_tx: Option<mpsc::Sender<AcceptBiReq>>,
     stream_accept_uni_tx: Option<mpsc::Sender<AcceptUniReq>>,
     close_tx: Option<Arc<watch::Sender<(u32, String)>>>,
+    client_metrics: Arc<ClientMetrics>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[napi]
@@ -79,23 +90,37 @@ impl ClientSessionHandle {
 
     #[napi]
     pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+        }
         let Some(ref tx) = self.dgram_send_tx else {
-            return Err(napi::Error::from_reason("session closed"));
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let bytes = data.to_vec();
         if bytes.len() > self.max_datagram_size {
-            return Err(napi::Error::from_reason(format!(
-                "datagram size {} exceeds max {}",
-                bytes.len(),
-                self.max_datagram_size
-            )));
+            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
         }
+        let sz = bytes.len() as u64;
         let timeout = tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
-        tokio::time::timeout(timeout, tx.send(bytes))
-            .await
-            .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?
-            .map_err(|_| napi::Error::from_reason("channel closed"))?;
-        Ok(())
+        self.client_metrics
+            .queued_bytes
+            .fetch_add(sz, Ordering::Relaxed);
+        let result = tokio::time::timeout(timeout, tx.send(bytes)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(sz, Ordering::Relaxed);
+                Err(napi::Error::from_reason("E_SESSION_CLOSED"))
+            }
+            Err(_) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(sz, Ordering::Relaxed);
+                Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))
+            }
+        }
     }
 
     #[napi]
@@ -109,6 +134,7 @@ impl ClientSessionHandle {
 
     #[napi]
     pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
+        self.closed.store(true, Ordering::Relaxed);
         let c = code.unwrap_or(0);
         let r = reason.unwrap_or_default();
         if let Some(ref tx) = self.close_tx {
@@ -120,49 +146,56 @@ impl ClientSessionHandle {
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
         Ok(crate::metrics::SessionMetricsSnapshot {
-            datagrams_in: 0,
-            datagrams_out: 0,
-            streams_active: 0,
-            queued_bytes: 0,
+            datagrams_in: self.client_metrics.datagrams_in.load(Ordering::Relaxed) as u32,
+            datagrams_out: self.client_metrics.datagrams_out.load(Ordering::Relaxed) as u32,
+            streams_active: self.client_metrics.streams_active.load(Ordering::Relaxed) as u32,
+            queued_bytes: self.client_metrics.queued_bytes.load(Ordering::Relaxed) as u32,
         })
     }
 
     #[napi]
     pub async fn create_bidi_stream(&self) -> Result<ClientBidiStreamHandle> {
         let Some(ref tx) = self.stream_open_bi_tx else {
-            return Err(napi::Error::from_reason("session closed"));
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(resp_tx).await.map_err(|_| {
-            napi::Error::from_reason("session closed")
-        })?;
-        resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))?
+        tx.send(resp_tx)
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+        resp_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
             .map_err(napi::Error::from_reason)
     }
 
     #[napi]
     pub async fn create_uni_stream(&self) -> Result<ClientUniSendHandle> {
         let Some(ref tx) = self.stream_open_uni_tx else {
-            return Err(napi::Error::from_reason("session closed"));
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(resp_tx).await.map_err(|_| {
-            napi::Error::from_reason("session closed")
-        })?;
-        resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))?
+        tx.send(resp_tx)
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+        resp_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
             .map_err(napi::Error::from_reason)
     }
 
     #[napi]
     pub async fn accept_bidi_stream(&self) -> Result<Option<ClientBidiStreamHandle>> {
         let Some(ref tx) = self.stream_accept_bi_tx else {
-            return Err(napi::Error::from_reason("session closed"));
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(resp_tx).await.map_err(|_| {
-            napi::Error::from_reason("session closed")
-        })?;
-        match resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))? {
+        tx.send(resp_tx)
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+        match resp_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
+        {
             Ok(h) => Ok(Some(h)),
             Err(_) => Ok(None),
         }
@@ -171,13 +204,16 @@ impl ClientSessionHandle {
     #[napi]
     pub async fn accept_uni_stream(&self) -> Result<Option<ClientUniRecvHandle>> {
         let Some(ref tx) = self.stream_accept_uni_tx else {
-            return Err(napi::Error::from_reason("session closed"));
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(resp_tx).await.map_err(|_| {
-            napi::Error::from_reason("session closed")
-        })?;
-        match resp_rx.await.map_err(|_| napi::Error::from_reason("session closed"))? {
+        tx.send(resp_tx)
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+        match resp_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
+        {
             Ok(h) => Ok(Some(h)),
             Err(_) => Ok(None),
         }
@@ -199,6 +235,8 @@ impl ClientSessionHandle {
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel::<AcceptBiReq>(8);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel::<AcceptUniReq>(8);
         let (close_tx, mut close_rx) = watch::channel((0u32, String::new()));
+        let cm = Arc::new(ClientMetrics::default());
+        let closed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let handle = Self {
             id: id.clone(),
@@ -213,6 +251,8 @@ impl ClientSessionHandle {
             stream_accept_bi_tx: Some(accept_bi_tx),
             stream_accept_uni_tx: Some(accept_uni_tx),
             close_tx: Some(Arc::new(close_tx)),
+            client_metrics: Arc::clone(&cm),
+            closed: Arc::clone(&closed_flag),
         };
 
         let conn_bi = conn.clone();
@@ -225,27 +265,51 @@ impl ClientSessionHandle {
             let conn_dgram_recv = conn.clone();
             let conn_closed = conn.clone();
 
+            let cm_send = Arc::clone(&cm);
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(bytes) = dgram_send_rx.recv().await {
-                    let _ = conn_dgram_send.send_datagram(bytes.as_slice());
+                    let sz = bytes.len() as u64;
+                    cm_send.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
+                    match conn_dgram_send.send_datagram(bytes.as_slice()) {
+                        Ok(_) => {
+                            cm_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
                 }
             });
 
+            let cm_recv = Arc::clone(&cm);
             crate::panic_guard::spawn_quic_task(async move {
                 while let Ok(dgram) = conn_dgram_recv.receive_datagram().await {
+                    cm_recv.datagrams_in.fetch_add(1, Ordering::Relaxed);
                     if dgram_recv_tx.send(dgram.as_ref().to_vec()).await.is_err() {
                         break;
                     }
                 }
             });
 
+            let cm_bi = Arc::clone(&cm);
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = open_bi_rx.recv().await {
                     let r = match conn_bi.open_bi().await {
                         Ok(opening) => match opening.await {
                             Ok((send, recv)) => {
-                                let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv, None);
-                                Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx, stop_tx))
+                                cm_bi.streams_active.fetch_add(1, Ordering::Relaxed);
+                                let cm_guard = Arc::clone(&cm_bi);
+                                let guard = crate::client_stream::StreamGuard::new(move || {
+                                    cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
+                                });
+                                let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(
+                                    &CLIENT_RUNTIME,
+                                    send,
+                                    recv,
+                                    Some(guard),
+                                    None,
+                                );
+                                Ok(ClientBidiStreamHandle::new_client_stream(
+                                    read_rx, write_tx, stop_tx,
+                                ))
                             }
                             Err(e) => Err(e.to_string()),
                         },
@@ -255,12 +319,23 @@ impl ClientSessionHandle {
                 }
             });
 
+            let cm_uni = Arc::clone(&cm);
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = open_uni_rx.recv().await {
                     let r = match conn_uni.open_uni().await {
                         Ok(opening) => match opening.await {
                             Ok(send) => {
-                                let write_tx = spawn_uni_send_bridge_on(&CLIENT_RUNTIME, send, None);
+                                cm_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                                let cm_guard = Arc::clone(&cm_uni);
+                                let guard = crate::client_stream::StreamGuard::new(move || {
+                                    cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
+                                });
+                                let write_tx = spawn_uni_send_bridge_on(
+                                    &CLIENT_RUNTIME,
+                                    send,
+                                    Some(guard),
+                                    None,
+                                );
                                 Ok(ClientUniSendHandle::new(write_tx))
                             }
                             Err(e) => Err(e.to_string()),
@@ -272,12 +347,26 @@ impl ClientSessionHandle {
             });
 
             let mut accept_bi_rx = accept_bi_rx;
+            let cm_accept_bi = Arc::clone(&cm);
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = accept_bi_rx.recv().await {
                     let r = match conn_accept_bi.accept_bi().await {
                         Ok((send, recv)) => {
-                            let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(&CLIENT_RUNTIME, send, recv, None);
-                            Ok(ClientBidiStreamHandle::new_client_stream(read_rx, write_tx, stop_tx))
+                            cm_accept_bi.streams_active.fetch_add(1, Ordering::Relaxed);
+                            let cm_guard = Arc::clone(&cm_accept_bi);
+                            let guard = crate::client_stream::StreamGuard::new(move || {
+                                cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
+                            });
+                            let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(
+                                &CLIENT_RUNTIME,
+                                send,
+                                recv,
+                                Some(guard),
+                                None,
+                            );
+                            Ok(ClientBidiStreamHandle::new_client_stream(
+                                read_rx, write_tx, stop_tx,
+                            ))
                         }
                         Err(e) => Err(e.to_string()),
                     };
@@ -286,11 +375,18 @@ impl ClientSessionHandle {
             });
 
             let mut accept_uni_rx_local = accept_uni_rx;
+            let cm_accept_uni = Arc::clone(&cm);
             crate::panic_guard::spawn_quic_task(async move {
                 while let Some(resp_tx) = accept_uni_rx_local.recv().await {
                     let r = match conn_accept_uni.accept_uni().await {
                         Ok(recv) => {
-                            let (read_rx, stop_tx) = spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv, None);
+                            cm_accept_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                            let cm_guard = Arc::clone(&cm_accept_uni);
+                            let guard = crate::client_stream::StreamGuard::new(move || {
+                                cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
+                            });
+                            let (read_rx, stop_tx) =
+                                spawn_uni_recv_bridge_on(&CLIENT_RUNTIME, recv, Some(guard), None);
                             Ok(ClientUniRecvHandle::new(read_rx, stop_tx))
                         }
                         Err(e) => Err(e.to_string()),
@@ -306,6 +402,7 @@ impl ClientSessionHandle {
                     conn_closed.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
                 }
             }
+            closed_flag.store(true, Ordering::Relaxed);
 
             if let Some(ref tsfn) = on_closed {
                 tsfn.call(
@@ -446,8 +543,7 @@ async fn run_connect(
         endpoint.connect(url),
     )
     .await
-    .map_err(|_| "E_HANDSHAKE_TIMEOUT")?
-    ?;
+    .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;
 
     let id = format!(
         "client-{}",
