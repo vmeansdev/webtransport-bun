@@ -77,6 +77,29 @@ for await (const d of session.incomingDatagrams()) {
 session.close();
 ```
 
+### 4) Connect a client (W3C-like facade)
+```ts
+import { WebTransport } from "@webtransport-bun/webtransport";
+
+const wt = new WebTransport("https://127.0.0.1:4433", {
+  tls: { insecureSkipVerify: true }, // dev only
+});
+
+await wt.ready;
+
+const writer = wt.datagrams.writable.getWriter();
+await writer.write(new Uint8Array([1, 2, 3]));
+writer.releaseLock();
+
+const reader = wt.datagrams.readable.getReader();
+const { value } = await reader.read();
+console.log("echo:", value);
+reader.releaseLock();
+
+wt.close({ closeCode: 1000, reason: "done" });
+await wt.closed;
+```
+
 ## Stream Controls
 
 The stream helpers are symbol-based to avoid collisions with Node stream APIs:
