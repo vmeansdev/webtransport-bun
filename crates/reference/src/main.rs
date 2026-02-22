@@ -29,16 +29,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTP health server for Playwright webServer readiness (QUIC doesn't respond to HTTP GET)
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], HEALTH_PORT)))
-            .await
-            .expect("bind health port");
-        println!("reference-server: Health server on http://127.0.0.1:{}", HEALTH_PORT);
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], HEALTH_PORT)))
+                .await
+                .expect("bind health port");
+        println!(
+            "reference-server: Health server on http://127.0.0.1:{}",
+            HEALTH_PORT
+        );
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(x) => x,
                 Err(_) => continue,
             };
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
             let _ = stream.flush().await;
         }
     });
