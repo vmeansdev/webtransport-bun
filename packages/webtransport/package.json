@@ -13,7 +13,8 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "prebuild": "cd ../.. && bun run build:native && mkdir -p packages/webtransport/prebuilds && cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/ 2>/dev/null || true"
+    "prebuild": "cd ../.. && bun run build:native && mkdir -p packages/webtransport/prebuilds && cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/ 2>/dev/null || true",
+    "prebuild:checksums": "cd prebuilds 2>/dev/null && shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true"
   },
   "os": ["darwin", "linux"],
   "cpu": ["arm64", "x64"]

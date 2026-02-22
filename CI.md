@@ -32,3 +32,8 @@
 - CI builds prebuilds
 - Publish npm package with prebuilds
 - Publish changelog entry
+
+## Canary strategy
+- Publish `vX.Y.Z-rc.N` for release candidates
+- Run extended soak (e.g. 24h) on rc before tagging stable
+- Prefer `bun add @scope/webtransport@rc` for canary testing
