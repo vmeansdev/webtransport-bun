@@ -34,6 +34,7 @@ export type { ErrorCode } from "./errors.js";
 import {
     E_INTERNAL,
     E_HANDSHAKE_TIMEOUT,
+    E_SESSION_CLOSED,
     WebTransportError,
 } from "./errors.js";
 import type { ErrorCode } from "./errors.js";
@@ -245,12 +246,11 @@ export type SessionMetricsSnapshot = {
 };
 
 // ---------------------------------------------------------------------------
-// Public factory functions (stubs — to be wired to native addon)
+// Native addon loader
 // ---------------------------------------------------------------------------
 
 import { createRequire } from "node:module";
 
-// Resolving the native module: prebuilds (published) or crates/native (dev)
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
@@ -269,13 +269,19 @@ for (const p of paths) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Server session implementation
+// ---------------------------------------------------------------------------
+
 class NativeServerSession implements ServerSession {
     #nativeHandle: any;
     #closedPromise: Promise<CloseInfo>;
+    #closed = false;
 
     constructor(nativeHandle: any, closedPromise: Promise<CloseInfo>) {
         this.#nativeHandle = nativeHandle;
         this.#closedPromise = closedPromise;
+        this.#closedPromise.then(() => { this.#closed = true; });
     }
 
     get id(): string {
@@ -290,6 +296,7 @@ class NativeServerSession implements ServerSession {
     }
 
     get ready(): Promise<void> {
+        // Server sessions are already handshake-complete when onSession fires
         return Promise.resolve();
     }
 
@@ -298,10 +305,14 @@ class NativeServerSession implements ServerSession {
     }
 
     close(info?: CloseInfo): void {
-        this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
+        if (!this.#closed) {
+            this.#closed = true;
+            this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
+        }
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
+        if (this.#closed) throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
         try {
             const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
             await this.#nativeHandle.sendDatagram(buf);
@@ -311,14 +322,19 @@ class NativeServerSession implements ServerSession {
     }
 
     async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-        while (true) {
-            const datagram = await this.#nativeHandle.readDatagram();
-            if (!datagram) break;
-            yield datagram;
+        while (!this.#closed) {
+            try {
+                const datagram = await this.#nativeHandle.readDatagram();
+                if (!datagram) break;
+                yield datagram;
+            } catch {
+                break;
+            }
         }
     }
 
     async createBidirectionalStream(): Promise<Duplex> {
+        if (this.#closed) throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
         try {
             const nativeStream = await this.#nativeHandle.createBidiStream();
             return new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
@@ -328,14 +344,19 @@ class NativeServerSession implements ServerSession {
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
-        while (true) {
-            const nativeStream = await this.#nativeHandle.acceptBidiStream();
-            if (!nativeStream) break;
-            yield new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+        while (!this.#closed) {
+            try {
+                const nativeStream = await this.#nativeHandle.acceptBidiStream();
+                if (!nativeStream) break;
+                yield new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+            } catch {
+                break;
+            }
         }
     }
 
     async createUnidirectionalStream(): Promise<Writable> {
+        if (this.#closed) throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
         try {
             const nativeStream = await this.#nativeHandle.createUniStream();
             return new SendStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
@@ -345,10 +366,14 @@ class NativeServerSession implements ServerSession {
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
-        while (true) {
-            const nativeStream = await this.#nativeHandle.acceptUniStream();
-            if (!nativeStream) break;
-            yield new RecvStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+        while (!this.#closed) {
+            try {
+                const nativeStream = await this.#nativeHandle.acceptUniStream();
+                if (!nativeStream) break;
+                yield new RecvStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+            } catch {
+                break;
+            }
         }
     }
 
@@ -356,6 +381,10 @@ class NativeServerSession implements ServerSession {
         return this.#nativeHandle.metricsSnapshot();
     }
 }
+
+// ---------------------------------------------------------------------------
+// createServer
+// ---------------------------------------------------------------------------
 
 /**
  * Create an in-process WebTransport server.
@@ -365,14 +394,17 @@ export function createServer(opts: ServerOptions): WebTransportServer {
         throw new Error("Native addon not loaded");
     }
 
-    // Convert keys to string representation if they are UInt8Arrays
     const certPem = typeof opts.tls.certPem === "string" ? opts.tls.certPem : new TextDecoder().decode(opts.tls.certPem);
     const keyPem = typeof opts.tls.keyPem === "string" ? opts.tls.keyPem : new TextDecoder().decode(opts.tls.keyPem);
+    // TODO(P1-6): pass caPem through to native when ServerHandle supports it
 
     const limitsJson = JSON.stringify({ ...DEFAULT_LIMITS, ...opts.limits });
     const rateLimitsJson = JSON.stringify({ ...DEFAULT_RATE_LIMITS, ...opts.rateLimits });
 
     const closedResolvers = new Map<string, (info: CloseInfo) => void>();
+    let activeOnSessionCallbacks = 0;
+    let onSessionDrainResolve: (() => void) | null = null;
+
     const logCallback = (logEvents: any[]) => {
         if (opts.log) {
             for (const le of logEvents) {
@@ -394,7 +426,14 @@ export function createServer(opts: ServerOptions): WebTransportServer {
                 const closedPromise = new Promise<CloseInfo>((resolve) => { closedResolve = resolve; });
                 closedResolvers.set(evt.id, closedResolve);
                 const nativeSession = new native.SessionHandle(evt.id, evt.peerIp, evt.peerPort);
-                opts.onSession(new NativeServerSession(nativeSession, closedPromise));
+                const session = new NativeServerSession(nativeSession, closedPromise);
+                activeOnSessionCallbacks++;
+                const maybePromise = opts.onSession(session);
+                if (maybePromise && typeof maybePromise.then === "function") {
+                    maybePromise.then(onSessionCallbackDone, onSessionCallbackDone);
+                } else {
+                    onSessionCallbackDone();
+                }
             } else if (evt.name === "session_closed" && evt.id != null) {
                 const resolve = closedResolvers.get(evt.id);
                 closedResolvers.delete(evt.id);
@@ -402,6 +441,14 @@ export function createServer(opts: ServerOptions): WebTransportServer {
             }
         }
     }, logCallback);
+
+    function onSessionCallbackDone() {
+        activeOnSessionCallbacks--;
+        if (activeOnSessionCallbacks <= 0 && onSessionDrainResolve) {
+            onSessionDrainResolve();
+            onSessionDrainResolve = null;
+        }
+    }
 
     return {
         address: { host: opts.host ?? "0.0.0.0", port: handle.port },
@@ -411,24 +458,36 @@ export function createServer(opts: ServerOptions): WebTransportServer {
                 closedResolvers.delete(id);
                 resolve({ code: 0, reason: "server closed" });
             }
+            if (activeOnSessionCallbacks > 0) {
+                await Promise.race([
+                    new Promise<void>((r) => { onSessionDrainResolve = r; }),
+                    new Promise<void>((r) => setTimeout(r, 5000)),
+                ]);
+            }
         },
         metricsSnapshot: () => handle.metricsSnapshot(),
     };
 }
 
+// ---------------------------------------------------------------------------
+// Client session implementation
+// ---------------------------------------------------------------------------
+
 class NativeClientSession implements ClientSession {
     #nativeHandle: any;
+    #readyPromise: Promise<void>;
     #closedPromise: Promise<CloseInfo>;
-    #closedResolvers: Map<string, (info: CloseInfo) => void>;
+    #closed = false;
 
     constructor(
         nativeHandle: any,
+        readyPromise: Promise<void>,
         closedPromise: Promise<CloseInfo>,
-        closedResolvers: Map<string, (info: CloseInfo) => void>,
     ) {
         this.#nativeHandle = nativeHandle;
+        this.#readyPromise = readyPromise;
         this.#closedPromise = closedPromise;
-        this.#closedResolvers = closedResolvers;
+        this.#closedPromise.then(() => { this.#closed = true; });
     }
 
     get id(): string {
@@ -443,7 +502,7 @@ class NativeClientSession implements ClientSession {
     }
 
     get ready(): Promise<void> {
-        return Promise.resolve();
+        return this.#readyPromise;
     }
 
     get closed(): Promise<CloseInfo> {
@@ -451,10 +510,14 @@ class NativeClientSession implements ClientSession {
     }
 
     close(info?: CloseInfo): void {
-        this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
+        if (!this.#closed) {
+            this.#closed = true;
+            this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
+        }
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
+        if (this.#closed) throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
         try {
             const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
             await this.#nativeHandle.sendDatagram(buf);
@@ -464,44 +527,58 @@ class NativeClientSession implements ClientSession {
     }
 
     async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-        while (true) {
-            const dgram = await this.#nativeHandle.readDatagram();
-            if (!dgram) break;
-            yield dgram;
+        while (!this.#closed) {
+            try {
+                const dgram = await this.#nativeHandle.readDatagram();
+                if (!dgram) break;
+                yield dgram;
+            } catch {
+                break;
+            }
         }
     }
 
     async createBidirectionalStream(): Promise<Duplex> {
+        if (this.#closed) throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
         try {
             const nativeStream = await this.#nativeHandle.createBidiStream();
-            return new BidiStream({ handleId: 0, nativeHandle: nativeStream });
+            return new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
         } catch (err) {
             throw toWebTransportError(err);
         }
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
-        while (true) {
-            const nativeStream = await this.#nativeHandle.acceptBidiStream();
-            if (!nativeStream) break;
-            yield new BidiStream({ handleId: 0, nativeHandle: nativeStream });
+        while (!this.#closed) {
+            try {
+                const nativeStream = await this.#nativeHandle.acceptBidiStream();
+                if (!nativeStream) break;
+                yield new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+            } catch {
+                break;
+            }
         }
     }
 
     async createUnidirectionalStream(): Promise<Writable> {
+        if (this.#closed) throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
         try {
             const nativeStream = await this.#nativeHandle.createUniStream();
-            return new SendStream({ handleId: 0, nativeHandle: nativeStream });
+            return new SendStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
         } catch (err) {
             throw toWebTransportError(err);
         }
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
-        while (true) {
-            const nativeStream = await this.#nativeHandle.acceptUniStream();
-            if (!nativeStream) break;
-            yield new RecvStream({ handleId: 0, nativeHandle: nativeStream });
+        while (!this.#closed) {
+            try {
+                const nativeStream = await this.#nativeHandle.acceptUniStream();
+                if (!nativeStream) break;
+                yield new RecvStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+            } catch {
+                break;
+            }
         }
     }
 
@@ -509,6 +586,10 @@ class NativeClientSession implements ClientSession {
         return this.#nativeHandle.metricsSnapshot();
     }
 }
+
+// ---------------------------------------------------------------------------
+// connect
+// ---------------------------------------------------------------------------
 
 /**
  * Connect to a WebTransport server (client mode).
@@ -522,17 +603,20 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
         log({ level: "warn", msg: "tls.insecureSkipVerify is enabled — dev only, never use in production" });
     }
 
+    const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
     const tlsOpts = opts?.tls ? {
         insecureSkipVerify: opts.tls.insecureSkipVerify ?? false,
         caPem: opts.tls.caPem ? (typeof opts.tls.caPem === "string" ? opts.tls.caPem : new TextDecoder().decode(opts.tls.caPem)) : undefined,
         serverName: opts.tls.serverName,
     } : undefined;
     const optsJson = JSON.stringify({
-        limits: opts?.limits ? { ...DEFAULT_LIMITS, ...opts.limits } : undefined,
+        limits: mergedLimits,
         tls: tlsOpts,
     });
 
-    return new Promise((resolve, reject) => {
+    const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
+
+    const connectPromise = new Promise<ClientSession>((resolve, reject) => {
         const closedResolvers = new Map<string, (info: CloseInfo) => void>();
         const onClosed = (events: any[]) => {
             for (const evt of events) {
@@ -560,7 +644,16 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
             let closedResolve!: (info: CloseInfo) => void;
             const closedPromise = new Promise<CloseInfo>((r) => { closedResolve = r; });
             closedResolvers.set(handle.id, closedResolve);
-            resolve(new NativeClientSession(handle, closedPromise, closedResolvers));
+            const readyPromise = Promise.resolve();
+            resolve(new NativeClientSession(handle, readyPromise, closedPromise));
         });
     });
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+            reject(new WebTransportError(E_HANDSHAKE_TIMEOUT as ErrorCode, `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`));
+        }, handshakeTimeout);
+    });
+
+    return Promise.race([connectPromise, timeoutPromise]);
 }
