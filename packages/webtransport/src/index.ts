@@ -31,6 +31,21 @@ export {
 } from "./errors.js";
 export type { ErrorCode } from "./errors.js";
 
+import {
+    E_INTERNAL,
+    E_HANDSHAKE_TIMEOUT,
+    WebTransportError,
+} from "./errors.js";
+import type { ErrorCode } from "./errors.js";
+
+const E_CODE_RE = /^E_[A-Z_]+/;
+function toWebTransportError(err: unknown): WebTransportError {
+    const msg = err instanceof Error ? err.message : String(err);
+    const match = E_CODE_RE.exec(msg);
+    if (match) return new WebTransportError(match[0] as ErrorCode, msg);
+    return new WebTransportError(E_INTERNAL as ErrorCode, msg);
+}
+
 // ---------------------------------------------------------------------------
 // TLS
 // ---------------------------------------------------------------------------
@@ -287,8 +302,12 @@ class NativeServerSession implements ServerSession {
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        await this.#nativeHandle.sendDatagram(buf);
+        try {
+            const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+            await this.#nativeHandle.sendDatagram(buf);
+        } catch (err) {
+            throw toWebTransportError(err);
+        }
     }
 
     async *incomingDatagrams(): AsyncIterable<Uint8Array> {
@@ -300,8 +319,12 @@ class NativeServerSession implements ServerSession {
     }
 
     async createBidirectionalStream(): Promise<Duplex> {
-        const nativeStream = await this.#nativeHandle.createBidiStream();
-        return new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+        try {
+            const nativeStream = await this.#nativeHandle.createBidiStream();
+            return new BidiStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+        } catch (err) {
+            throw toWebTransportError(err);
+        }
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
@@ -313,8 +336,12 @@ class NativeServerSession implements ServerSession {
     }
 
     async createUnidirectionalStream(): Promise<Writable> {
-        const nativeStream = await this.#nativeHandle.createUniStream();
-        return new SendStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+        try {
+            const nativeStream = await this.#nativeHandle.createUniStream();
+            return new SendStream({ handleId: nativeStream?.id ?? 0, nativeHandle: nativeStream });
+        } catch (err) {
+            throw toWebTransportError(err);
+        }
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
@@ -346,7 +373,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     const rateLimitsJson = JSON.stringify({ ...DEFAULT_RATE_LIMITS, ...opts.rateLimits });
 
     const closedResolvers = new Map<string, (info: CloseInfo) => void>();
-    const handle = new native.ServerHandle(opts.port, certPem, keyPem, limitsJson, rateLimitsJson, (events: any[]) => {
+    const handle = new native.ServerHandle(opts.port, opts.host ?? "0.0.0.0", certPem, keyPem, limitsJson, rateLimitsJson, (events: any[]) => {
         for (const evt of events) {
             if (evt.name === "session" && evt.id != null && evt.peerIp != null && evt.peerPort != null) {
                 let closedResolve!: (info: CloseInfo) => void;
@@ -414,8 +441,12 @@ class NativeClientSession implements ClientSession {
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        await this.#nativeHandle.sendDatagram(buf);
+        try {
+            const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+            await this.#nativeHandle.sendDatagram(buf);
+        } catch (err) {
+            throw toWebTransportError(err);
+        }
     }
 
     async *incomingDatagrams(): AsyncIterable<Uint8Array> {
@@ -427,8 +458,12 @@ class NativeClientSession implements ClientSession {
     }
 
     async createBidirectionalStream(): Promise<Duplex> {
-        const nativeStream = await this.#nativeHandle.createBidiStream();
-        return new BidiStream({ handleId: 0, nativeHandle: nativeStream });
+        try {
+            const nativeStream = await this.#nativeHandle.createBidiStream();
+            return new BidiStream({ handleId: 0, nativeHandle: nativeStream });
+        } catch (err) {
+            throw toWebTransportError(err);
+        }
     }
 
     async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
@@ -440,8 +475,12 @@ class NativeClientSession implements ClientSession {
     }
 
     async createUnidirectionalStream(): Promise<Writable> {
-        const nativeStream = await this.#nativeHandle.createUniStream();
-        return new SendStream({ handleId: 0, nativeHandle: nativeStream });
+        try {
+            const nativeStream = await this.#nativeHandle.createUniStream();
+            return new SendStream({ handleId: 0, nativeHandle: nativeStream });
+        } catch (err) {
+            throw toWebTransportError(err);
+        }
     }
 
     async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
@@ -469,9 +508,14 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
         log({ level: "warn", msg: "tls.insecureSkipVerify is enabled — dev only, never use in production" });
     }
 
+    const tlsOpts = opts?.tls ? {
+        insecureSkipVerify: opts.tls.insecureSkipVerify ?? false,
+        caPem: opts.tls.caPem ? (typeof opts.tls.caPem === "string" ? opts.tls.caPem : new TextDecoder().decode(opts.tls.caPem)) : undefined,
+        serverName: opts.tls.serverName,
+    } : undefined;
     const optsJson = JSON.stringify({
         limits: opts?.limits ? { ...DEFAULT_LIMITS, ...opts.limits } : undefined,
-        tls: opts?.tls ? { insecureSkipVerify: opts.tls.insecureSkipVerify ?? false } : undefined,
+        tls: tlsOpts,
     });
 
     return new Promise((resolve, reject) => {
@@ -487,7 +531,13 @@ export async function connect(url: string, opts?: ClientOptions): Promise<Client
         };
         native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
             if (err) {
-                reject(typeof err === "string" ? new Error(err) : err);
+                const msg = typeof err === "string" ? err : err?.message ?? String(err);
+                const match = E_CODE_RE.exec(msg);
+                if (match) {
+                    reject(new WebTransportError(match[0] as ErrorCode, msg));
+                } else {
+                    reject(new WebTransportError(E_HANDSHAKE_TIMEOUT as ErrorCode, msg));
+                }
                 return;
             }
             if (handleId == null) {
