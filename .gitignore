@@ -4,6 +4,7 @@ node_modules
 # output
 out
 target
+crates/native/*.node
 dist
 *.tgz
 packages/webtransport/prebuilds
@@ -14,6 +15,8 @@ coverage
 
 # load test CI artifacts
 tools/load/*-stderr.log
+tools/interop/.cursor/
+tools/interop/test-results/
 
 # logs
 logs
