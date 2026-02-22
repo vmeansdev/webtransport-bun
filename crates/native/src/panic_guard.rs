@@ -30,7 +30,7 @@ where
 }
 
 /// Spawn a Tokio task that touches QUIC. Panics in the task are contained:
-/// the runtime continues; a watcher logs and can trigger teardown.
+/// the runtime continues; a watcher logs and triggers teardown of all sessions.
 /// Use this instead of `Runtime::spawn` for any task that drives wtransport/quinn.
 pub fn spawn_quic_task<F>(fut: F)
 where
@@ -44,7 +44,7 @@ where
                     "webtransport-native: QUIC task panicked (contained): {:?}",
                     e
                 );
-                // TODO: trigger session/server teardown when we have a shutdown channel
+                crate::session_registry::close_all(0, b"panic teardown");
             }
         }
     });
