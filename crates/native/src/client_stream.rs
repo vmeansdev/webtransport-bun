@@ -8,7 +8,6 @@
 use napi::Result;
 use napi_derive::napi;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use wtransport::VarInt;
 

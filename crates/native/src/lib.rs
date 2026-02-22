@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 pub mod client;
 pub mod client_stream;
@@ -49,57 +49,7 @@ pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .expect("failed to create client Tokio runtime")
 });
 
-// ---------------------------------------------------------------------------
-// Command / Event channel skeleton
-// ---------------------------------------------------------------------------
-
-/// Commands sent from JS → Rust runtime.
-#[derive(Debug)]
-pub enum Command {
-    /// Placeholder — will be replaced with real commands (CreateServer, SendDatagram, etc.)
-    Ping,
-}
-
-/// Events sent from Rust runtime → JS.
-#[derive(Debug)]
-pub enum Event {
-    /// Placeholder
-    Pong,
-}
-
-/// Channel capacity for command queue (bounded to prevent unbounded buffering).
-const CMD_CHANNEL_CAPACITY: usize = 4096;
-
-/// Channel capacity for event queue.
-const EVENT_CHANNEL_CAPACITY: usize = 4096;
-
-/// Create a bounded command/event channel pair.
-pub fn create_channels() -> (
-    mpsc::Sender<Command>,
-    mpsc::Receiver<Command>,
-    mpsc::Sender<Event>,
-    mpsc::Receiver<Event>,
-) {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(CMD_CHANNEL_CAPACITY);
-    let (evt_tx, evt_rx) = mpsc::channel::<Event>(EVENT_CHANNEL_CAPACITY);
-    (cmd_tx, cmd_rx, evt_tx, evt_rx)
-}
-
-use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Env, JsFunction, Result};
-
-// ---------------------------------------------------------------------------
-// TSFN / Javascript Event mapping
-// ---------------------------------------------------------------------------
-
-#[napi(object)]
-#[derive(Clone, Debug)]
-pub struct JsEvent {
-    pub name: String,
-    pub session_id: Option<u32>,
-}
-
-/// Data passed to on_session callback when a session is accepted (P0-A).
+/// Data passed to on_session callback when a session is accepted.
 #[derive(Clone, Debug)]
 pub struct SessionAccepted {
     pub id: String,
@@ -144,12 +94,6 @@ pub fn runtime_worker_count() -> u32 {
     .unwrap_or(0)
 }
 
-/// Initialize the runtime communication channels and wire the JS callback.
-#[napi]
-pub fn init_runtime(env: Env, callback: JsFunction) -> Result<()> {
-    panic_guard::catch_panic(|| init_runtime_inner(env, callback))
-}
-
 /// Spawn the wtransport server loop on the dedicated runtime.
 pub(crate) fn spawn_wtransport_server(
     metrics: Arc<server_metrics::ServerMetrics>,
@@ -169,8 +113,6 @@ pub(crate) fn spawn_wtransport_server(
 ) {
     use std::io::Write;
     use std::sync::atomic::Ordering;
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
     use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
     RUNTIME.spawn(async move {
@@ -580,47 +522,3 @@ pub(crate) fn spawn_wtransport_server(
     });
 }
 
-fn init_runtime_inner(env: Env, callback: JsFunction) -> Result<()> {
-    let (cmd_tx, mut cmd_rx, evt_tx, mut evt_rx) = create_channels();
-
-    let tsfn: ThreadsafeFunction<Vec<JsEvent>, ErrorStrategy::Fatal> = callback
-        .create_threadsafe_function(
-            0,
-            |ctx: napi::threadsafe_function::ThreadSafeCallContext<Vec<JsEvent>>| {
-                let mut js_array = ctx.env.create_array_with_length(ctx.value.len())?;
-                for (i, evt) in ctx.value.iter().enumerate() {
-                    let mut obj = ctx.env.create_object()?;
-                    obj.set("name", evt.name.clone())?;
-                    if let Some(id) = evt.session_id {
-                        obj.set("session_id", id)?;
-                    } else {
-                        obj.set("session_id", ctx.env.get_null()?)?;
-                    }
-                    js_array.set_element(i as u32, obj)?;
-                }
-                Ok(vec![js_array])
-            },
-        )?;
-
-    // Spawn a Tokio task to drain evt_rx and notify JS (panic-safe)
-    RUNTIME.spawn(async move {
-        panic_guard::spawn_quic_task(async move {
-            while let Some(_evt) = evt_rx.recv().await {
-                let mut batch = vec![];
-                batch.push(JsEvent {
-                    name: "pong".to_string(),
-                    session_id: None,
-                });
-                while let Ok(Event::Pong) = evt_rx.try_recv() {
-                    batch.push(JsEvent {
-                        name: "pong".to_string(),
-                        session_id: None,
-                    });
-                }
-                tsfn.call(batch, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-    });
-
-    Ok(())
-}

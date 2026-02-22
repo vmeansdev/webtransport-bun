@@ -1,6 +1,6 @@
 //! WebTransport server via wtransport. Updates ServerMetrics for Phase 4.3.1.
 
-use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::{Env, JsFunction, Result};
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};

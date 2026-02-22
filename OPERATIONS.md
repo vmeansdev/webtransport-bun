@@ -74,7 +74,7 @@ When `queuedBytesGlobal` rises and stays high:
 
 ## Known limitations and compatibility
 
-- Client `connect()` not yet implemented
+- Client `connect()` available with `insecureSkipVerify` and handshake timeout
 - macOS + Linux only (arm64, x64)
 - Requires Bun >= 1.3.9
 - Node-API: addon is built for Bun; Node compatibility not tested

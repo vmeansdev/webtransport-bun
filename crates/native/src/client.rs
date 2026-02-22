@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 
 use crate::client_stream::{
-    spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on, StreamCmd,
+    spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle,
 };
-use crate::{CLIENT_RUNTIME, RUNTIME};
+use crate::CLIENT_RUNTIME;
 
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>> =
