@@ -27,10 +27,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--url" => url = args.next().unwrap_or_else(|| DEFAULT_URL.to_string()),
-            "--sessions" => sessions = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SESSIONS),
-            "--duration" => duration_secs = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_DURATION_SECS),
-            "--datagrams-per-sec" => datagrams_per_sec = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_DATAGRAMS_PER_SEC),
-            "--streams-per-sec" => streams_per_sec = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_STREAMS_PER_SEC),
+            "--sessions" => {
+                sessions = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_SESSIONS)
+            }
+            "--duration" => {
+                duration_secs = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_DURATION_SECS)
+            }
+            "--datagrams-per-sec" => {
+                datagrams_per_sec = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_DATAGRAMS_PER_SEC)
+            }
+            "--streams-per-sec" => {
+                streams_per_sec = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_STREAMS_PER_SEC)
+            }
             _ => {}
         }
     }
@@ -89,7 +109,14 @@ async fn run(
             match endpoint.connect(&url).await {
                 Ok(conn) => {
                     counters.sessions_ok.fetch_add(1, Ordering::Relaxed);
-                    run_session(conn, duration, datagrams_per_sec, streams_per_sec, counters.as_ref()).await;
+                    run_session(
+                        conn,
+                        duration,
+                        datagrams_per_sec,
+                        streams_per_sec,
+                        counters.as_ref(),
+                    )
+                    .await;
                 }
                 Err(_) => {
                     counters.sessions_err.fetch_add(1, Ordering::Relaxed);
