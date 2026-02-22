@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 test('bidi stream echo via WebTransport', async ({ page }) => {
-    await page.goto('about:blank');
+    await page.goto('http://127.0.0.1:4434');
 
     const result = await page.evaluate(async () => {
         try {
@@ -29,7 +29,7 @@ test('bidi stream echo via WebTransport', async ({ page }) => {
 });
 
 test('datagram echo via WebTransport', async ({ page }) => {
-    await page.goto('about:blank');
+    await page.goto('http://127.0.0.1:4434');
 
     const result = await page.evaluate(async () => {
         try {
@@ -57,7 +57,7 @@ test('datagram echo via WebTransport', async ({ page }) => {
 });
 
 test('unidirectional stream echo via WebTransport', async ({ page }) => {
-    await page.goto('about:blank');
+    await page.goto('http://127.0.0.1:4434');
 
     const result = await page.evaluate(async () => {
         try {

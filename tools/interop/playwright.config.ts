@@ -9,13 +9,13 @@ export default defineConfig({
     timeout: 30_000,
     retries: 0,
     use: {
-        // Chromium is the only browser supporting WebTransport
         browserName: "chromium",
-        // Required for WebTransport: allow insecure localhost certs
         launchOptions: {
             args: [
                 "--origin-to-force-quic-on=127.0.0.1:4433",
                 "--ignore-certificate-errors",
+                "--allow-insecure-localhost",
+                "--webtransport-developer-mode",
             ],
         },
     },
