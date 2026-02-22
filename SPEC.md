@@ -192,3 +192,10 @@ Examples (expected to work):
 - Datagram echo server and client
 - Bidi stream echo server and client
 - Uni stream upload and download
+
+## API stability and semver
+
+- **Stable surface**: Types and functions in this spec are the public API.
+- **Semver**: Major (X.0.0) for breaking changes; minor (x.Y.0) for additive changes; patch (x.y.Z) for fixes.
+- **Error codes**: E_* codes are stable; do not remove or change meaning.
+- **Metrics fields**: ServerMetricsSnapshot and SessionMetricsSnapshot field names are stable; new fields may be added in minor releases.
