@@ -21,7 +21,7 @@ describe("backpressure (P0-C)", () => {
         });
 
         const big = new Uint8Array(1500);
-        await expect(client.sendDatagram(big)).rejects.toThrow(/exceeds max/);
+        await expect(client.sendDatagram(big)).rejects.toThrow(/E_QUEUE_FULL/);
 
         await server.close();
     }, 10000);
