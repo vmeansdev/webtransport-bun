@@ -6,9 +6,26 @@ describe("webtransport client", () => {
         expect(typeof connect).toBe("function");
     });
 
-    it.skip("connect rejects when server unreachable", async () => {
+    it("connect rejects when server unreachable", async () => {
         await expect(connect("https://127.0.0.1:19999")).rejects.toThrow();
-    });
+    }, 15000);
+
+    it("connect rejects self-signed cert when not using insecureSkipVerify (P0-3)", async () => {
+        const server = createServer({
+            port: 14452,
+            tls: { certPem: "", keyPem: "" },
+            onSession: () => {},
+        });
+        await Bun.sleep(2000);
+
+        await expect(
+            connect("https://127.0.0.1:14452", {
+                /* no tls.insecureSkipVerify - cert verification enabled */
+            }),
+        ).rejects.toThrow();
+
+        await server.close();
+    }, 15000);
 
     it("connect with insecureSkipVerify emits warning log", async () => {
         const logs: Array<{ level: string; msg: string }> = [];
@@ -32,10 +49,22 @@ describe("webtransport client", () => {
         const server = createServer({
             port: 14450,
             tls: { certPem: "", keyPem: "" },
-            onSession: async (session) => {
-                for await (const d of session.incomingDatagrams()) {
-                    await session.sendDatagram(d);
-                }
+            onSession: async (s) => {
+                void (async () => {
+                    for await (const d of s.incomingDatagrams()) {
+                        await s.sendDatagram(d);
+                    }
+                })();
+                void (async () => {
+                    for await (const duplex of s.incomingBidirectionalStreams()) {
+                        const chunks: Buffer[] = [];
+                        for await (const c of duplex) chunks.push(c);
+                        if (chunks.length > 0) {
+                            duplex.write(Buffer.concat(chunks));
+                            duplex.end();
+                        }
+                    }
+                })().catch(() => {});
             },
         });
         await Bun.sleep(2000);
@@ -53,13 +82,44 @@ describe("webtransport client", () => {
         expect(first.done).toBe(false);
         expect(new Uint8Array(first.value!)).toEqual(new Uint8Array([1, 2, 3]));
 
+        await server.close();
+    }, 20000);
+
+    it("bidi stream echo works", async () => {
+        const server = createServer({
+            port: 14451,
+            tls: { certPem: "", keyPem: "" },
+            onSession: async (s) => {
+                void (async () => {
+                    for await (const duplex of s.incomingBidirectionalStreams()) {
+                        const chunks: Buffer[] = [];
+                        for await (const c of duplex) chunks.push(c);
+                        if (chunks.length > 0) {
+                            duplex.write(Buffer.concat(chunks));
+                            duplex.end();
+                        }
+                    }
+                })().catch(() => {});
+            },
+        });
+        await Bun.sleep(2000);
+
+        const client = await connect("https://127.0.0.1:14451", {
+            tls: { insecureSkipVerify: true },
+        });
+
         const bidi = await client.createBidirectionalStream();
-        bidi.write(Buffer.from([4, 5, 6]));
-        bidi.end();
+        const payload = Buffer.from("bidi-test");
+        await new Promise<void>((resolve, reject) => {
+            bidi.write(payload, (err) => (err ? reject(err) : resolve()));
+        });
+        await new Promise<void>((resolve, reject) => {
+            bidi.end((err) => (err ? reject(err) : resolve()));
+        });
         const chunks: Buffer[] = [];
         for await (const c of bidi) chunks.push(c);
-        expect(Buffer.concat(chunks)).toEqual(Buffer.from([4, 5, 6]));
+        expect(Buffer.concat(chunks)).toEqual(payload);
 
         await server.close();
-    }, 15000);
+    }, 10000);
 });
