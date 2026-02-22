@@ -41,3 +41,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# phase instructions and task tracking (do not commit)
+INSTRUCTIONS_CURRENT_PHASE.md
+Task.md
