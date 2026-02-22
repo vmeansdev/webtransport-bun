@@ -60,6 +60,15 @@ pub struct SessionState {
 }
 
 static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
+static LIMITS: std::sync::OnceLock<crate::limits::Limits> = std::sync::OnceLock::new();
+
+pub fn set_limits(limits: crate::limits::Limits) {
+    let _ = LIMITS.set(limits);
+}
+
+pub fn get_limits() -> crate::limits::Limits {
+    LIMITS.get().cloned().unwrap_or_default()
+}
 
 /// Insert a new session into the registry.
 /// Returns (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics).
@@ -94,7 +103,14 @@ pub fn insert(
         create_uni_tx,
     };
     REGISTRY.insert(session_id, state);
-    (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics)
+    (
+        dgram_tx,
+        bidi_accept_tx,
+        uni_accept_tx,
+        create_bi_rx,
+        create_uni_rx,
+        session_metrics,
+    )
 }
 
 /// Look up session state by id. Returns None if not found or session closed.
