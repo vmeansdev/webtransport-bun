@@ -7,7 +7,7 @@ function wtConnectScript(hashBase64: string): string {
         const h = "${hashBase64}";
         if (h) {
             const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
-            opts.serverCertificateHashes = [{ algorithm: "sha-256", value: bin.buffer }];
+            opts.serverCertificateHashes = [{ algorithm: "sha-256", value: bin }];
         }
         const wt = new WebTransport("https://127.0.0.1:4433", opts);
         await wt.ready;
@@ -25,7 +25,7 @@ test.describe("Chromium WebTransport client", () => {
             if (h) {
                 const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
                 opts.serverCertificateHashes = [
-                    { algorithm: "sha-256", value: bin.buffer },
+                    { algorithm: "sha-256", value: bin },
                 ];
             }
             try {
@@ -50,7 +50,7 @@ test.describe("Chromium WebTransport client", () => {
             if (h) {
                 const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
                 opts.serverCertificateHashes = [
-                    { algorithm: "sha-256", value: bin.buffer },
+                    { algorithm: "sha-256", value: bin },
                 ];
             }
             const wt = new WebTransport("https://127.0.0.1:4433", opts);
@@ -81,7 +81,7 @@ test.describe("Chromium WebTransport client", () => {
             if (h) {
                 const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
                 opts.serverCertificateHashes = [
-                    { algorithm: "sha-256", value: bin.buffer },
+                    { algorithm: "sha-256", value: bin },
                 ];
             }
             const wt = new WebTransport("https://127.0.0.1:4433", opts);

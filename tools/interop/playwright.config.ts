@@ -1,10 +1,10 @@
 import { defineConfig } from "@playwright/test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { getCertHashBase64 } from "./cert-hash.js";
+import { getSpkiHashBase64 } from "./cert-hash.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const certHash = getCertHashBase64();
+const certHash = getSpkiHashBase64();
 
 export default defineConfig({
     testDir: "./tests",
@@ -25,10 +25,10 @@ export default defineConfig({
         },
     },
     webServer: {
-        command: "bun run addon-server.ts",
+        command: "WT_IDLE_TIMEOUT_MS=5000 bun run addon-server.ts",
         cwd: join(__dirname),
         url: "http://127.0.0.1:4434", // Health endpoint (QUIC on 4433 doesn't respond to HTTP GET)
-        reuseExistingServer: !process.env.CI,
+        reuseExistingServer: false,
         timeout: 15000,
     },
     projects: [

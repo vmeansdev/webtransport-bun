@@ -11,7 +11,7 @@ test('bidi stream echo via WebTransport', async ({ page }) => {
             if (h) {
                 const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
                 opts.serverCertificateHashes = [
-                    { algorithm: 'sha-256', value: bin.buffer },
+                    { algorithm: 'sha-256', value: bin },
                 ];
             }
             try {
@@ -50,7 +50,7 @@ test('datagram echo via WebTransport', async ({ page }) => {
             if (h) {
                 const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
                 opts.serverCertificateHashes = [
-                    { algorithm: 'sha-256', value: bin.buffer },
+                    { algorithm: 'sha-256', value: bin },
                 ];
             }
             try {
@@ -89,7 +89,7 @@ test('unidirectional stream echo via WebTransport', async ({ page }) => {
             if (h) {
                 const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
                 opts.serverCertificateHashes = [
-                    { algorithm: 'sha-256', value: bin.buffer },
+                    { algorithm: 'sha-256', value: bin },
                 ];
             }
             try {

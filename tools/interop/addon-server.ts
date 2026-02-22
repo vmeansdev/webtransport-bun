@@ -11,6 +11,8 @@ import { join } from "node:path";
 
 const QUIC_PORT = 4433;
 const HEALTH_PORT = 4434;
+const IDLE_TIMEOUT_MS = Number(process.env.WT_IDLE_TIMEOUT_MS ?? "60000");
+const CLOSE_SIGNAL = "__WT_CLOSE_4001__";
 
 const certPath = join(import.meta.dir, "certs", "cert.pem");
 const keyPath = join(import.meta.dir, "certs", "key.pem");
@@ -23,10 +25,17 @@ if (!certPem || !keyPem) {
 const wtServer = createServer({
     port: QUIC_PORT,
     tls: { certPem, keyPem },
+    limits: { idleTimeoutMs: IDLE_TIMEOUT_MS },
     onSession: async (session) => {
         // Datagram echo
         (async () => {
+            const decoder = new TextDecoder();
             for await (const d of session.incomingDatagrams()) {
+                const text = decoder.decode(d);
+                if (text === CLOSE_SIGNAL) {
+                    session.close({ code: 4001, reason: "interop-close" });
+                    continue;
+                }
                 await session.sendDatagram(d);
             }
         })().catch(() => {});
@@ -69,7 +78,7 @@ healthServer.listen(HEALTH_PORT, "127.0.0.1", () => {
     console.log(`addon-server: Health on http://127.0.0.1:${HEALTH_PORT}`);
 });
 
-console.log(`addon-server: WebTransport on https://127.0.0.1:${QUIC_PORT}`);
+console.log(`addon-server: WebTransport on https://127.0.0.1:${QUIC_PORT} (idleTimeoutMs=${IDLE_TIMEOUT_MS})`);
 
 process.on("SIGINT", async () => {
     healthServer.close();
