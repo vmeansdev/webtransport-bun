@@ -39,7 +39,8 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     constructor(opts: BidiStreamOptions) {
         super({
             ...opts,
-            // Default highWaterMark aligned with per-stream budget (256 KiB)
+            allowHalfOpen: true,
+            autoDestroy: false,
             readableHighWaterMark: opts.readableHighWaterMark ?? 256 * 1024,
             writableHighWaterMark: opts.writableHighWaterMark ?? 256 * 1024,
         });
@@ -50,11 +51,17 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     // -- Node stream overrides (to be wired to native) -----------------------
 
     override _read(_size: number): void {
-        // TODO: pull from native incoming queue via stream_read_drain(handleId)
-        this.#nativeHandle?.read().then((buf: Buffer | null) => {
-            if (buf) this.push(buf);
-            else this.push(null);
-        }).catch((err: any) => this.destroy(err));
+        const h = this.#nativeHandle;
+        if (!h) {
+            this.push(null);
+            return;
+        }
+        h.read()
+            .then((buf: Buffer | null) => {
+                if (buf) this.push(buf);
+                else this.push(null);
+            })
+            .catch((err: any) => this.destroy(err));
     }
 
     override _write(
@@ -62,8 +69,6 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
         _encoding: BufferEncoding,
         callback: (error?: Error | null) => void,
     ): void {
-        // TODO: send to native via stream_write(handleId, chunk)
-        // On budget reservation failure → backpressure
         this.#nativeHandle?.write(chunk).then(() => callback()).catch(callback);
     }
 
@@ -73,7 +78,6 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
     }
 
     override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
-        // TODO: clean up native resources
         callback(error);
     }
 
