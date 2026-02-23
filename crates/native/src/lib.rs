@@ -109,8 +109,16 @@ fn emit_log(
         let _ = tx.try_send(LogEvent {
             level: level.to_string(),
             msg: out_msg,
-            session_id: if redact { None } else { session_id.map(String::from) },
-            peer_ip: if redact { None } else { peer_ip.map(String::from) },
+            session_id: if redact {
+                None
+            } else {
+                session_id.map(String::from)
+            },
+            peer_ip: if redact {
+                None
+            } else {
+                peer_ip.map(String::from)
+            },
             peer_port: if redact { None } else { peer_port },
         });
     }
