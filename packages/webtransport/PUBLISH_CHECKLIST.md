@@ -66,3 +66,10 @@ cd packages/webtransport
 npm version patch  # or minor/major
 npm publish
 ```
+
+## Trusted publisher (no npm token) setup after first publish
+
+1. Publish once manually (command above) to create the npm package.
+2. In npm package settings, add GitHub Actions trusted publisher for this repo/workflow.
+3. In GitHub repository variables, set `NPM_TRUSTED_PUBLISHING=true`.
+4. Use Git tags (`v*`) or `workflow_dispatch` with `publish_to_npm=true` to publish via CI with provenance.
