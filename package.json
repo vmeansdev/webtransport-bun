@@ -5,6 +5,9 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "build:native": "bunx @napi-rs/cli build --cwd crates/native --platform --release",
+    "example:echo": "bun run examples/echo-playground/server.ts",
+    "example:echo:cert": "mkdir -p examples/echo-playground/certs && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 10 -nodes -keyout examples/echo-playground/certs/key.pem -out examples/echo-playground/certs/cert.pem -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost,IP:127.0.0.1'",
+    "example:echo:docker": "bash examples/echo-playground/run-docker.sh",
     "test": "bun test packages/",
     "test:parity": "bun test packages/webtransport/test/parity-*.test.ts",
     "typecheck": "tsc -p tsconfig.json",

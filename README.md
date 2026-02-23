@@ -64,6 +64,29 @@ bun add @webtransport-bun/webtransport
 bun add file:./packages/webtransport
 ```
 
+## Examples
+
+- Browser + Bun echo playground (datagrams, bidi, uni):
+  `examples/echo-playground`
+
+Quick run:
+
+```bash
+bun run build:native
+bun run example:echo:cert
+bun run example:echo
+```
+
+Then open `http://127.0.0.1:3000`.
+
+Dockerized example is available at `examples/echo-playground/Dockerfile`.
+
+Run Docker example in one command:
+
+```bash
+bun run example:echo:docker
+```
+
 ## Quickstart
 
 ### 1) Build native addon

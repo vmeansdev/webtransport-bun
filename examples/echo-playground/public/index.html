@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>webtransport-bun echo playground</title>
+    <style>
+      :root {
+        --bg: #f4f7fb;
+        --fg: #132033;
+        --muted: #5a6d86;
+        --card: #ffffff;
+        --line: #d5ddea;
+        --accent: #2e6daf;
+        --accent-2: #ff9f43;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: Menlo, Monaco, "Courier New", monospace;
+        color: var(--fg);
+        background: radial-gradient(circle at 10% 10%, #eaf2ff, var(--bg));
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        display: grid;
+        gap: 16px;
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 16px;
+        background: var(--card);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 24px;
+      }
+      p { margin: 8px 0; color: var(--muted); }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      input:not([type="radio"]) {
+        font: inherit;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        min-width: 340px;
+      }
+      button {
+        font: inherit;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 12px;
+        background: #fff;
+        cursor: pointer;
+      }
+      button.primary {
+        border-color: var(--accent);
+        color: #fff;
+        background: var(--accent);
+      }
+      button.warn {
+        border-color: var(--accent-2);
+      }
+      pre {
+        margin: 0;
+        padding: 12px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #f8fbff;
+        min-height: 260px;
+        overflow: auto;
+      }
+      code { color: #24425f; }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="card">
+        <h1>webtransport-bun echo playground</h1>
+        <p>Browser WebTransport API <code>&lt;-&gt;</code> Bun addon server echo (datagrams + bidi + uni).</p>
+        <p>
+          Tip: for self-signed local certs you may need Chrome launch flags:
+          <code>--ignore-certificate-errors --origin-to-force-quic-on=127.0.0.1:4433</code>
+        </p>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <input id="url" value="https://127.0.0.1:4433" />
+          <button id="connect" class="primary">Connect</button>
+          <button id="close" class="warn">Close</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <input id="payload" value="hello from browser" />
+          <label><input type="radio" name="channel" value="datagram" checked /> datagram</label>
+          <label><input type="radio" name="channel" value="bidi" /> bidi</label>
+          <label><input type="radio" name="channel" value="uni" /> uni</label>
+          <button id="send" class="primary">Send</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script>
+      const logEl = document.getElementById("log");
+      const urlEl = document.getElementById("url");
+      const payloadEl = document.getElementById("payload");
+      const connectBtn = document.getElementById("connect");
+      const closeBtn = document.getElementById("close");
+      const sendBtn = document.getElementById("send");
+
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+
+      let transport;
+      let datagramReader;
+      let datagramWriter;
+      let certHashBase64 = "";
+
+      function log(msg) {
+        const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logEl.textContent += `${line}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function isExpectedClose(err) {
+        return String(err).toLowerCase().includes("session is closed");
+      }
+
+      async function readDatagramsLoop() {
+        if (!transport) return;
+        datagramReader = transport.datagrams.readable.getReader();
+        try {
+          while (true) {
+            const { value, done } = await datagramReader.read();
+            if (done) break;
+            log(`datagram echo: ${decoder.decode(value)}`);
+          }
+        } catch (err) {
+          if (!isExpectedClose(err)) {
+            log(`datagram reader ended: ${String(err)}`);
+          }
+        }
+      }
+
+      async function readIncomingUniLoop() {
+        if (!transport) return;
+        const streamsReader = transport.incomingUnidirectionalStreams.getReader();
+        try {
+          while (true) {
+            const { value: readable, done } = await streamsReader.read();
+            if (done) break;
+            const reader = readable.getReader();
+            const chunks = [];
+            while (true) {
+              const part = await reader.read();
+              if (part.done) break;
+              chunks.push(part.value);
+            }
+            const totalLen = chunks.reduce((n, c) => n + c.length, 0);
+            const merged = new Uint8Array(totalLen);
+            let off = 0;
+            for (const c of chunks) {
+              merged.set(c, off);
+              off += c.length;
+            }
+            log(`uni echo: ${decoder.decode(merged)}`);
+          }
+        } catch (err) {
+          if (!isExpectedClose(err)) {
+            log(`incoming uni loop ended: ${String(err)}`);
+          }
+        }
+      }
+
+      async function connect() {
+        if (transport) {
+          log("already connected");
+          return;
+        }
+        try {
+          const url = urlEl.value.trim();
+          const opts = {};
+          if (certHashBase64) {
+            const bin = Uint8Array.from(atob(certHashBase64), (c) => c.charCodeAt(0));
+            opts.serverCertificateHashes = [{ algorithm: "sha-256", value: bin }];
+          }
+          transport = new WebTransport(url, opts);
+          await transport.ready;
+          datagramWriter = transport.datagrams.writable.getWriter();
+          void readDatagramsLoop();
+          void readIncomingUniLoop();
+          log(`connected: ${url}`);
+
+          transport.closed
+            .then((info) => log(`closed: code=${info?.closeCode ?? 0} reason=${info?.reason ?? ""}`))
+            .catch((err) => log(`closed with error: ${String(err)}`))
+            .finally(() => {
+              transport = undefined;
+              datagramWriter = undefined;
+              datagramReader = undefined;
+            });
+        } catch (err) {
+          log(`connect failed: ${String(err)}`);
+          transport = undefined;
+        }
+      }
+
+      async function sendDatagram(payload) {
+        if (!transport || !datagramWriter) {
+          log("not connected");
+          return;
+        }
+        await datagramWriter.write(encoder.encode(payload));
+        log(`datagram sent: ${payload}`);
+      }
+
+      async function sendBidi(payload) {
+        if (!transport) {
+          log("not connected");
+          return;
+        }
+        const stream = await transport.createBidirectionalStream();
+
+        const writer = stream.writable.getWriter();
+        await writer.write(encoder.encode(payload));
+        await writer.close();
+        log(`bidi sent: ${payload}`);
+
+        const reader = stream.readable.getReader();
+        const chunks = [];
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+        const totalLen = chunks.reduce((n, c) => n + c.length, 0);
+        const merged = new Uint8Array(totalLen);
+        let off = 0;
+        for (const c of chunks) {
+          merged.set(c, off);
+          off += c.length;
+        }
+
+        log(`bidi echo: ${decoder.decode(merged)}`);
+      }
+
+      async function sendUni(payload) {
+        if (!transport) {
+          log("not connected");
+          return;
+        }
+        const writable = await transport.createUnidirectionalStream();
+        const writer = writable.getWriter();
+        await writer.write(encoder.encode(payload));
+        await writer.close();
+        log(`uni sent: ${payload}`);
+      }
+
+      function selectedChannel() {
+        const el = document.querySelector('input[name="channel"]:checked');
+        return el ? el.value : "datagram";
+      }
+
+      async function sendSelected() {
+        const payload = payloadEl.value;
+        if (!payload || !payload.trim()) {
+          log("message is empty");
+          return;
+        }
+        const channel = selectedChannel();
+        if (channel === "datagram") {
+          await sendDatagram(payload);
+          return;
+        }
+        if (channel === "bidi") {
+          await sendBidi(payload);
+          return;
+        }
+        await sendUni(payload);
+      }
+
+      async function closeConnection() {
+        if (!transport) {
+          log("already closed");
+          return;
+        }
+        transport.close({ closeCode: 1000, reason: "user closed" });
+      }
+
+      connectBtn.addEventListener("click", () => void connect());
+      closeBtn.addEventListener("click", () => void closeConnection());
+      sendBtn.addEventListener("click", () => void sendSelected());
+      payloadEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") void sendSelected();
+      });
+
+      (async () => {
+        try {
+          const res = await fetch("/config");
+          if (res.ok) {
+            const cfg = await res.json();
+            if (typeof cfg.wtUrl === "string") {
+              urlEl.value = cfg.wtUrl;
+            }
+            if (typeof cfg.serverCertificateHashBase64 === "string") {
+              certHashBase64 = cfg.serverCertificateHashBase64;
+            }
+          }
+          log("ready");
+        } catch (err) {
+          log(`config fetch failed: ${String(err)}`);
+        }
+      })();
+    </script>
+  </body>
+</html>

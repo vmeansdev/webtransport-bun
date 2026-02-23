@@ -396,19 +396,26 @@ import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
-const BINARY = `webtransport-native.${PLATFORM}-${ARCH}.node`;
 let native: any;
-const paths = [
-    `../../../crates/native/${BINARY}`,
-    `../prebuilds/${BINARY}`,
+const binaryCandidates = [
+    `webtransport-native.${PLATFORM}-${ARCH}.node`,
+    `webtransport-native.${PLATFORM}-${ARCH}-gnu.node`,
+    `webtransport-native.${PLATFORM}-${ARCH}-musl.node`,
 ];
-for (const p of paths) {
-    try {
-        native = _require(p);
-        break;
-    } catch {
-        continue;
+const basePaths = [
+    "../../../crates/native",
+    "../prebuilds",
+];
+for (const base of basePaths) {
+    for (const candidate of binaryCandidates) {
+        try {
+            native = _require(`${base}/${candidate}`);
+            break;
+        } catch {
+            continue;
+        }
     }
+    if (native) break;
 }
 
 // ---------------------------------------------------------------------------
