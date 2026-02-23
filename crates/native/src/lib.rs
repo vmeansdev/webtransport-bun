@@ -82,23 +82,30 @@ static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     level: &str,
-    msg: &str,
-    session_id: Option<&str>,
-    peer_ip: Option<&str>,
-    peer_port: Option<u32>,
+    _msg: &str,
+    _session_id: Option<&str>,
+    _peer_ip: Option<&str>,
+    _peer_port: Option<u32>,
 ) {
     // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
     if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
+    let redacted_msg = match level {
+        "error" => "native error (redacted)",
+        "warn" => "native warning (redacted)",
+        "info" => "native info",
+        "debug" => "native debug",
+        _ => "native event",
+    };
     if let Some(tx) = tx {
         let _ = tx.try_send(LogEvent {
             level: level.to_string(),
-            msg: msg.to_string(),
-            session_id: session_id.map(String::from),
-            peer_ip: peer_ip.map(String::from),
-            peer_port,
+            msg: redacted_msg.to_string(),
+            session_id: None,
+            peer_ip: None,
+            peer_port: None,
         });
     }
 }
