@@ -68,6 +68,8 @@ bun add file:./packages/webtransport
 
 - Browser + Bun echo playground (datagrams, bidi, uni):
   `examples/echo-playground`
+- Compose collaboration room (1 server + 3 clients):
+  `examples/compose-collab`
 
 Quick run:
 
@@ -85,6 +87,12 @@ Run Docker example in one command:
 
 ```bash
 bun run example:echo:docker
+```
+
+Run multi-node compose collaboration example:
+
+```bash
+bun run example:compose:collab
 ```
 
 ## Quickstart

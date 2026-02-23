@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Compose Collab Dashboard</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #111b33;
+        --line: #263454;
+        --fg: #e9f0ff;
+        --muted: #9fb0d0;
+        --ok: #38bdf8;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Menlo, Monaco, "Courier New", monospace;
+        color: var(--fg);
+        background: radial-gradient(circle at 10% 10%, #1b2a4b, var(--bg));
+        padding: 20px;
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+        display: grid;
+        gap: 14px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+      .metric { font-size: 22px; color: var(--ok); }
+      .label { font-size: 12px; color: var(--muted); }
+      .mono { font-size: 12px; color: var(--muted); }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td { border-bottom: 1px solid var(--line); text-align: left; padding: 6px; vertical-align: top; }
+      th { color: var(--muted); }
+      code { white-space: pre-wrap; word-break: break-word; }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="card">
+        <h2>compose-collab dashboard</h2>
+        <div class="mono" id="status">loading...</div>
+      </section>
+
+      <section class="row">
+        <div class="card">
+          <div class="label">active sessions</div>
+          <div class="metric" id="activeSessions">0</div>
+        </div>
+        <div class="card">
+          <div class="label">ingress msgs</div>
+          <div class="metric" id="ingress">0</div>
+        </div>
+        <div class="card">
+          <div class="label">fanout msgs</div>
+          <div class="metric" id="fanout">0</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>sessions</h3>
+        <table>
+          <thead><tr><th>session id</th><th>peer</th></tr></thead>
+          <tbody id="sessions"></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h3>recent events</h3>
+        <table>
+          <thead><tr><th>at</th><th>type</th><th>detail</th></tr></thead>
+          <tbody id="events"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const activeSessionsEl = document.getElementById("activeSessions");
+      const ingressEl = document.getElementById("ingress");
+      const fanoutEl = document.getElementById("fanout");
+      const sessionsEl = document.getElementById("sessions");
+      const eventsEl = document.getElementById("events");
+
+      function renderSessions(items) {
+        sessionsEl.innerHTML = "";
+        for (const s of items) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td><code>${s.id}</code></td><td><code>${s.peer}</code></td>`;
+          sessionsEl.appendChild(tr);
+        }
+      }
+
+      function renderEvents(items) {
+        eventsEl.innerHTML = "";
+        for (const e of items.slice().reverse()) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td><code>${e.at}</code></td><td><code>${e.type}</code></td><td><code>${JSON.stringify(e.detail)}</code></td>`;
+          eventsEl.appendChild(tr);
+        }
+      }
+
+      async function refresh() {
+        try {
+          const res = await fetch("/state", { cache: "no-store" });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const state = await res.json();
+          const c = state.counters || {};
+          const ingress = (c.datagramIn || 0) + (c.bidiIn || 0) + (c.uniIn || 0);
+          const fanout = (c.fanoutDatagramOut || 0) + (c.fanoutBidiOut || 0) + (c.fanoutUniOut || 0);
+
+          statusEl.textContent = `updated: ${state.now}`;
+          activeSessionsEl.textContent = String(state.activeSessions || 0);
+          ingressEl.textContent = String(ingress);
+          fanoutEl.textContent = String(fanout);
+          renderSessions(state.sessions || []);
+          renderEvents(state.recentEvents || []);
+        } catch (err) {
+          statusEl.textContent = `dashboard error: ${String(err)}`;
+        }
+      }
+
+      void refresh();
+      setInterval(refresh, 1000);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+name: wt-collab
+
+x-collab-image: &collab_image
+  build:
+    context: ../..
+    dockerfile: examples/compose-collab/Dockerfile
+  image: wt-collab-example:latest
+  pull_policy: never
+
+services:
+  wt-server:
+    <<: *collab_image
+    command: ["bun", "run", "examples/compose-collab/server.ts"]
+    environment:
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      WT_HOST: 0.0.0.0
+      WT_PORT: 4433
+    ports:
+      - "8080:8080/tcp"
+      - "4433:4433/udp"
+
+  client-a:
+    <<: *collab_image
+    command: ["bun", "run", "examples/compose-collab/client.ts"]
+    depends_on:
+      - wt-server
+    environment:
+      CLIENT_ID: client-a
+      WT_URL: https://wt-server:4433
+
+  client-b:
+    <<: *collab_image
+    command: ["bun", "run", "examples/compose-collab/client.ts"]
+    depends_on:
+      - wt-server
+    environment:
+      CLIENT_ID: client-b
+      WT_URL: https://wt-server:4433
+
+  client-c:
+    <<: *collab_image
+    command: ["bun", "run", "examples/compose-collab/client.ts"]
+    depends_on:
+      - wt-server
+    environment:
+      CLIENT_ID: client-c
+      WT_URL: https://wt-server:4433
