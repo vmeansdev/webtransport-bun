@@ -351,7 +351,8 @@ mod tests {
     #[test]
     fn test_datagram_token_bucket() {
         let ip = unique_ip();
-        let rate = 100.0;
+        // Deterministic test: no refill during assertions.
+        let rate = 0.0;
         let burst = 10.0;
         for _ in 0..10 {
             assert!(try_acquire_datagram_ingress(&ip, rate, burst));
