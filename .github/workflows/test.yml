@@ -69,6 +69,7 @@ jobs:
         timeout-minutes: 5
       - name: Smoke test (bun add from package)
         run: |
+          bun run --cwd packages/webtransport build
           bun run --cwd packages/webtransport prebuild:native
           mkdir -p /tmp/wt-smoke && cd /tmp/wt-smoke
           bun init -y
