@@ -15,6 +15,8 @@ const DEFAULT_DATAGRAMS_PER_SEC: u64 = 1000;
 const DEFAULT_STREAMS_PER_SEC: u64 = 10;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -130,11 +132,28 @@ async fn run(
     tokio::time::sleep(duration).await;
 
     // Shutdown: sessions exit when duration elapses, run_session calls conn.close().
-    // Join with timeout to avoid hangs (Phase 2: strict timeouts).
-    for h in handles {
-        if (tokio::time::timeout(JOIN_TIMEOUT, h).await).is_err() {
-            eprintln!("load-client: warning: task join timed out");
+    // Apply a global bounded join window (not per-task) to keep teardown deterministic.
+    let join_deadline = Instant::now() + JOIN_TIMEOUT;
+    while Instant::now() < join_deadline {
+        if handles.iter().all(|h| h.is_finished()) {
+            break;
         }
+        tokio::time::sleep(JOIN_POLL_INTERVAL).await;
+    }
+
+    // If any tasks are still alive after the global timeout, abort them.
+    if handles.iter().any(|h| !h.is_finished()) {
+        eprintln!("load-client: warning: task join timed out; aborting remaining tasks");
+        for h in &handles {
+            if !h.is_finished() {
+                h.abort();
+            }
+        }
+    }
+
+    // Drain joins quickly so task resources are reclaimed before runtime shutdown.
+    for h in handles {
+        let _ = tokio::time::timeout(JOIN_ABORT_WAIT, h).await;
     }
 
     // Don't call endpoint.close() — wtransport panics if connections are still alive.
