@@ -40,9 +40,10 @@
 1. **security** — cargo audit, Trivy filesystem scan, Trivy library vulnerability scan (CRITICAL/HIGH blocking)
 2. **codeql** — CodeQL analysis (JS/TS + Rust)
 
-3. **build** — matrix: `{linux-x64, darwin-arm64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
-4. **release** — downloads artifacts, creates GitHub release with release notes
-5. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
+3. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
+4. **build** — matrix: `{linux-x64, darwin-arm64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
+5. **release** — needs [build, interop]; downloads prebuilds + interop evidence, creates GitHub release with release notes
+6. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
    - Runs on tag pushes only when repo variable `NPM_TRUSTED_PUBLISHING` is set to `true`
    - Can also be run manually from `workflow_dispatch` with `publish_to_npm=true`
 

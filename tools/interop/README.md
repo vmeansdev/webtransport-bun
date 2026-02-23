@@ -30,11 +30,16 @@ bun run playwright test
 - `bidi stream echo via WebTransport` — bidirectional stream send/recv
 - `datagram echo via WebTransport` — datagram send/recv
 - `unidirectional stream echo via WebTransport` — uni stream send, receive echo on incoming uni
+- **P3.3** (`interop-expanded.spec.ts`): reconnect storms, mixed stream/datagram concurrency, close code propagation, stream reset (writable.abort)
 
 ## Server
 
 The Playwright webServer starts the addon server (`addon-server.ts`) automatically.
 It listens on QUIC port 4433 and exposes an HTTP health endpoint on 127.0.0.1:4434 for readiness probing.
+
+## Per-release evidence
+
+Set `INTEROP_EVIDENCE=1` to emit `interop-evidence.json` (Playwright JSON reporter). CI release workflow runs this and attaches the file to the GitHub release.
 
 ## Local vs CI
 

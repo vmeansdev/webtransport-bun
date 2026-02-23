@@ -10,6 +10,13 @@ export default defineConfig({
     testDir: "./tests",
     timeout: 30_000,
     retries: 0,
+    reporter:
+        process.env.INTEROP_EVIDENCE === "1"
+            ? [
+                  ["list"],
+                  ["json", { outputFile: "interop-evidence.json" }],
+              ]
+            : "list",
     use: {
         browserName: "chromium",
         launchOptions: {

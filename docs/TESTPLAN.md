@@ -25,7 +25,7 @@
 - `bun run bench:regress` — regression gate: runs stream benchmark, fails if throughput < `STREAM_MIN_MBPS` (default 0.5)
 
 ### Interop
-- `cd tools/interop && bun run playwright test` — Chromium WebTransport client connects to addon server: session establishment with cert hash pinning, datagram round-trip, bidi stream echo
+- `cd tools/interop && bun run playwright test` — Chromium WebTransport client connects to addon server: session establishment with cert hash pinning, datagram round-trip, bidi stream echo. P3.3: reconnect storms, mixed stream/datagram concurrency, close/reset semantics; `INTEROP_EVIDENCE=1` produces `interop-evidence.json` for per-release artifacts.
 
 ### Observability invariants (unit tests)
 - `queuedBytesGlobal` drains to near-zero after all clients close
