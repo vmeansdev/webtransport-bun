@@ -4,8 +4,8 @@ Production-focused WebTransport for Bun with in-process server/client support, d
 
 ## Start here
 
-- Project overview and positioning: [`README.md`](../README.md)
-- Docs portal (role-based paths): [`README.md`](README.md)
+- Project overview and positioning: [`README`](https://github.com/vmeansdev/webtransport-bun/blob/main/README.md)
+- Docs portal (role-based paths): [`START_HERE.md`](START_HERE.md)
 - Quickstart code paths: [`GETTING_STARTED.md`](GETTING_STARTED.md)
 
 ## Key docs

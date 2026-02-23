@@ -19,7 +19,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Start Here: README.md
+  - Start Here: START_HERE.md
   - Getting Started: GETTING_STARTED.md
   - Migration From WebSocket: MIGRATION_WEBSOCKET.md
   - FAQ / Troubleshooting: FAQ.md
