@@ -5,6 +5,7 @@ use napi::{JsFunction, Result};
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
@@ -578,6 +579,149 @@ fn take_client_session_inner(handle_id: String) -> Result<Option<ClientSessionHa
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 
+/// Resolver that returns a fixed SocketAddr, used when serverName overrides an IP host
+/// so we connect to the original IP while using serverName for TLS SNI.
+#[derive(Debug)]
+struct StaticSocketResolver(std::net::SocketAddr);
+
+impl wtransport::config::DnsResolver for StaticSocketResolver {
+    fn resolve(&self, _host: &str) -> std::pin::Pin<Box<dyn wtransport::config::DnsLookupFuture>> {
+        let addr = self.0;
+        Box::pin(async move { Ok(Some(addr)) })
+    }
+}
+
+/// Build (connect_url, optional custom resolver). When serverName is provided and the
+/// original URL host is an IP, we use a custom resolver so we connect to that IP
+/// while using serverName for TLS SNI (avoids DNS resolution of serverName which can
+/// return ::1 and cause connection failures).
+fn connect_url_and_resolver(
+    url: &str,
+    server_name: Option<&str>,
+) -> std::result::Result<(String, Option<StaticSocketResolver>), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("E_TLS: invalid URL: {}", e))?;
+    let port = parsed.port().unwrap_or(443);
+    let path = parsed.path();
+    let path_query = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}{}", path, parsed.query().map(|q| format!("?{q}")).unwrap_or_default())
+    };
+
+    let (connect_url, resolver) = match (parsed.host_str(), server_name) {
+        (Some(host), Some(sni)) if !sni.is_empty() => {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                let addr = SocketAddr::new(ip, port);
+                let connect_url = format!("https://{sni}:{port}{path_query}");
+                (connect_url, Some(StaticSocketResolver(addr)))
+            } else {
+                let mut p = parsed.clone();
+                p.set_host(Some(sni)).map_err(|_| format!("E_TLS: invalid serverName for SNI: {}", sni))?;
+                (p.to_string(), None)
+            }
+        }
+        _ => (url.to_string(), None),
+    };
+
+    Ok((connect_url, resolver))
+}
+
+/// Build a RootCertStore from native certs plus optional caPem.
+fn build_root_cert_store(ca_pem: Option<&str>) -> std::result::Result<std::sync::Arc<rustls::RootCertStore>, String> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    // Add platform native certs (best-effort)
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = root_store.add(cert);
+    }
+
+    // Add custom CA(s) from caPem
+    if let Some(pem) = ca_pem {
+        let pem_bytes = pem.as_bytes();
+        let mut cursor = std::io::Cursor::new(pem_bytes);
+        let mut added = 0u32;
+        for item in rustls_pemfile::certs(&mut cursor) {
+            match item {
+                Ok(der) => {
+                    let _ = root_store.add(der);
+                    added += 1;
+                }
+                Err(e) => return Err(format!("E_TLS: invalid CA PEM: {}", e)),
+            }
+        }
+        if added == 0 {
+            return Err("E_TLS: no valid CA certificate found in caPem".to_string());
+        }
+    }
+
+    Ok(std::sync::Arc::new(root_store))
+}
+
+/// Build a rustls ClientConfig for WebTransport with the given root store.
+fn build_client_tls_config(
+    root_store: std::sync::Arc<rustls::RootCertStore>,
+    insecure_skip_verify: bool,
+) -> rustls::ClientConfig {
+    use std::sync::Arc;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 supported")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    if insecure_skip_verify {
+        config.dangerous().set_certificate_verifier(Arc::new(InsecureVerifier));
+    }
+
+    config.alpn_protocols = vec![wtransport::proto::WEBTRANSPORT_ALPN.to_vec()];
+    config
+}
+
+/// Insecure verifier for dev-only insecureSkipVerify.
+#[derive(Debug)]
+struct InsecureVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 async fn run_connect(
     url: &str,
     opts_json: String,
@@ -587,20 +731,38 @@ async fn run_connect(
 > {
     let opts = serde_json::from_str::<serde_json::Value>(&opts_json).unwrap_or_default();
 
-    let insecure_skip_verify = opts
-        .get("tls")
+    let tls_opts = opts.get("tls");
+    let insecure_skip_verify = tls_opts
         .and_then(|t| t.get("insecureSkipVerify")?.as_bool())
         .unwrap_or(false);
+
+    let ca_pem = tls_opts
+        .and_then(|t| t.get("caPem")?.as_str())
+        .filter(|s| !s.is_empty());
+
+    let server_name = tls_opts
+        .and_then(|t| t.get("serverName")?.as_str())
+        .filter(|s| !s.is_empty());
 
     let handshake_timeout_ms = opts
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
 
-    let config = if insecure_skip_verify {
+    let (connect_url, custom_resolver) = connect_url_and_resolver(url, server_name)
+        .map_err(|e| std::io::Error::other(e))?;
+
+    let mut config = if insecure_skip_verify {
         wtransport::ClientConfig::builder()
             .with_bind_default()
             .with_no_cert_validation()
+            .build()
+    } else if ca_pem.is_some() {
+        let root_store = build_root_cert_store(ca_pem).map_err(|e| std::io::Error::other(e))?;
+        let tls_config = build_client_tls_config(root_store, false);
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls(tls_config)
             .build()
     } else {
         wtransport::ClientConfig::builder()
@@ -609,10 +771,14 @@ async fn run_connect(
             .build()
     };
 
+    if let Some(resolver) = custom_resolver {
+        config.set_dns_resolver(resolver);
+    }
+
     let endpoint = wtransport::Endpoint::client(config)?;
     let conn = tokio::time::timeout(
         tokio::time::Duration::from_millis(handshake_timeout_ms),
-        endpoint.connect(url),
+        endpoint.connect(&connect_url),
     )
     .await
     .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;

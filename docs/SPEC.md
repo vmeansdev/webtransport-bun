@@ -19,8 +19,9 @@ All streams must use standard Node stream backpressure semantics (write() return
 export type TlsOptions = {
   certPem: string | Uint8Array;
   keyPem: string | Uint8Array;
+  /** Not supported for server. Passing caPem to createServer rejects with E_TLS. */
   caPem?: string | Uint8Array;
-  serverName?: string; // SNI for client mode; for server, used in logs/metrics
+  serverName?: string; // for server: used in logs/metrics only; for client: SNI override
 };
 
 export type RateLimitOptions = {
@@ -84,9 +85,12 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 ```ts
 export type ClientOptions = {
   tls?: {
+    /** PEM-encoded CA cert(s) added to trust store. Combined with platform native CAs. */
     caPem?: string | Uint8Array;
+    /** Override host for TLS SNI (e.g. connect to 127.0.0.1 with cert for "localhost"). */
     serverName?: string;
-    insecureSkipVerify?: boolean; // dev only
+    /** Skip cert verification (dev only; emits warning). */
+    insecureSkipVerify?: boolean;
   };
   limits?: Partial<LimitsOptions>;
   log?: (event: LogEvent) => void;
