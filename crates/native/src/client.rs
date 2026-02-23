@@ -323,13 +323,14 @@ impl ClientSessionHandle {
                                     cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                                 });
                                 let budget = make_budget_bi();
-                                let (read_rx, write_tx, stop_tx, write_err_slot) = spawn_bidi_bridge_on(
-                                    &CLIENT_RUNTIME,
-                                    send,
-                                    recv,
-                                    Some(guard),
-                                    Some(budget.clone()),
-                                );
+                                let (read_rx, write_tx, stop_tx, write_err_slot) =
+                                    spawn_bidi_bridge_on(
+                                        &CLIENT_RUNTIME,
+                                        send,
+                                        recv,
+                                        Some(guard),
+                                        Some(budget.clone()),
+                                    );
                                 Ok(ClientBidiStreamHandle::new_with_budget_and_slot(
                                     read_rx,
                                     write_tx,
@@ -365,7 +366,11 @@ impl ClientSessionHandle {
                                     Some(guard),
                                     Some(budget.clone()),
                                 );
-                                Ok(ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot))
+                                Ok(ClientUniSendHandle::new_with_budget_and_slot(
+                                    write_tx,
+                                    Some(budget),
+                                    write_err_slot,
+                                ))
                             }
                             Err(e) => Err(e.to_string()),
                         },
@@ -605,7 +610,11 @@ fn connect_url_and_resolver(
     let path_query = if path.is_empty() {
         "/".to_string()
     } else {
-        format!("{}{}", path, parsed.query().map(|q| format!("?{q}")).unwrap_or_default())
+        format!(
+            "{}{}",
+            path,
+            parsed.query().map(|q| format!("?{q}")).unwrap_or_default()
+        )
     };
 
     let (connect_url, resolver) = match (parsed.host_str(), server_name) {
@@ -616,7 +625,8 @@ fn connect_url_and_resolver(
                 (connect_url, Some(StaticSocketResolver(addr)))
             } else {
                 let mut p = parsed.clone();
-                p.set_host(Some(sni)).map_err(|_| format!("E_TLS: invalid serverName for SNI: {}", sni))?;
+                p.set_host(Some(sni))
+                    .map_err(|_| format!("E_TLS: invalid serverName for SNI: {}", sni))?;
                 (p.to_string(), None)
             }
         }
@@ -627,7 +637,9 @@ fn connect_url_and_resolver(
 }
 
 /// Build a RootCertStore from native certs plus optional caPem.
-fn build_root_cert_store(ca_pem: Option<&str>) -> std::result::Result<std::sync::Arc<rustls::RootCertStore>, String> {
+fn build_root_cert_store(
+    ca_pem: Option<&str>,
+) -> std::result::Result<std::sync::Arc<rustls::RootCertStore>, String> {
     let mut root_store = rustls::RootCertStore::empty();
 
     // Add platform native certs (best-effort)
@@ -674,7 +686,9 @@ fn build_client_tls_config(
         .with_no_client_auth();
 
     if insecure_skip_verify {
-        config.dangerous().set_certificate_verifier(Arc::new(InsecureVerifier));
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(InsecureVerifier));
     }
 
     config.alpn_protocols = vec![wtransport::proto::WEBTRANSPORT_ALPN.to_vec()];
@@ -703,7 +717,12 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -712,7 +731,12 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -749,8 +773,8 @@ async fn run_connect(
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
 
-    let (connect_url, custom_resolver) = connect_url_and_resolver(url, server_name)
-        .map_err(|e| std::io::Error::other(e))?;
+    let (connect_url, custom_resolver) =
+        connect_url_and_resolver(url, server_name).map_err(|e| std::io::Error::other(e))?;
 
     let mut config = if insecure_skip_verify {
         wtransport::ClientConfig::builder()

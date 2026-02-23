@@ -221,7 +221,9 @@ pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
 pub(crate) const RATE_LIMITED_CLOSE_CODE: u32 = 3991;
 
 /// Extract (code, reason) from ConnectionError for CloseInfo.
-pub(crate) fn extract_close_info(err: &wtransport::error::ConnectionError) -> (Option<u32>, Option<String>) {
+pub(crate) fn extract_close_info(
+    err: &wtransport::error::ConnectionError,
+) -> (Option<u32>, Option<String>) {
     match err {
         wtransport::error::ConnectionError::ApplicationClosed(close) => {
             let code = close.code().into_inner() as u32;

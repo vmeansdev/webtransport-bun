@@ -6,12 +6,12 @@
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
 use napi::Result;
-use std::sync::Mutex;
 use napi_derive::napi;
-use wtransport::error::StreamWriteError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use wtransport::error::StreamWriteError;
 use wtransport::VarInt;
 
 use crate::RUNTIME;
