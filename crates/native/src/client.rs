@@ -322,18 +322,19 @@ impl ClientSessionHandle {
                                     cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                                 });
                                 let budget = make_budget_bi();
-                                let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(
+                                let (read_rx, write_tx, stop_tx, write_err_slot) = spawn_bidi_bridge_on(
                                     &CLIENT_RUNTIME,
                                     send,
                                     recv,
                                     Some(guard),
                                     Some(budget.clone()),
                                 );
-                                Ok(ClientBidiStreamHandle::new_with_budget(
+                                Ok(ClientBidiStreamHandle::new_with_budget_and_slot(
                                     read_rx,
                                     write_tx,
                                     stop_tx,
                                     Some(budget),
+                                    write_err_slot,
                                 ))
                             }
                             Err(e) => Err(e.to_string()),
@@ -357,13 +358,13 @@ impl ClientSessionHandle {
                                     cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                                 });
                                 let budget = make_budget_uni();
-                                let write_tx = spawn_uni_send_bridge_on(
+                                let (write_tx, write_err_slot) = spawn_uni_send_bridge_on(
                                     &CLIENT_RUNTIME,
                                     send,
                                     Some(guard),
                                     Some(budget.clone()),
                                 );
-                                Ok(ClientUniSendHandle::new_with_budget(write_tx, Some(budget)))
+                                Ok(ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot))
                             }
                             Err(e) => Err(e.to_string()),
                         },
@@ -386,18 +387,19 @@ impl ClientSessionHandle {
                                 cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                             });
                             let budget = make_budget_accept_bi();
-                            let (read_rx, write_tx, stop_tx) = spawn_bidi_bridge_on(
+                            let (read_rx, write_tx, stop_tx, write_err_slot) = spawn_bidi_bridge_on(
                                 &CLIENT_RUNTIME,
                                 send,
                                 recv,
                                 Some(guard),
                                 Some(budget.clone()),
                             );
-                            Ok(ClientBidiStreamHandle::new_with_budget(
+                            Ok(ClientBidiStreamHandle::new_with_budget_and_slot(
                                 read_rx,
                                 write_tx,
                                 stop_tx,
                                 Some(budget),
+                                write_err_slot,
                             ))
                         }
                         Err(e) => Err(e.to_string()),
@@ -437,21 +439,24 @@ impl ClientSessionHandle {
                 }
             });
 
-            tokio::select! {
-                _ = conn_closed.closed() => {}
+            let (close_code, close_reason) = tokio::select! {
+                close_err = conn_closed.closed() => {
+                    crate::extract_close_info(&close_err)
+                }
                 _ = close_rx.changed() => {
                     let (code, reason) = close_rx.borrow().clone();
                     conn_closed.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
+                    (Some(code), Some(reason))
                 }
-            }
+            };
             closed_flag.store(true, Ordering::Relaxed);
 
             if let Some(ref tsfn) = on_closed {
                 tsfn.call(
                     ClientSessionClosed {
                         id: id.clone(),
-                        code: None,
-                        reason: None,
+                        code: close_code,
+                        reason: close_reason,
                     },
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );

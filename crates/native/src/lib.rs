@@ -215,7 +215,12 @@ pub fn set_panic_log_verbose(enabled: bool) {
     panic_guard::set_panic_log_verbose(enabled);
 }
 
-fn extract_close_info(err: &wtransport::error::ConnectionError) -> (Option<u32>, Option<String>) {
+/// Well-known close codes for stable error semantics (AGENTS.md).
+pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
+pub(crate) const RATE_LIMITED_CLOSE_CODE: u32 = 3991;
+
+/// Extract (code, reason) from ConnectionError for CloseInfo.
+pub(crate) fn extract_close_info(err: &wtransport::error::ConnectionError) -> (Option<u32>, Option<String>) {
     match err {
         wtransport::error::ConnectionError::ApplicationClosed(close) => {
             let code = close.code().into_inner() as u32;
@@ -227,7 +232,10 @@ fn extract_close_info(err: &wtransport::error::ConnectionError) -> (Option<u32>,
             };
             (Some(code), reason)
         }
-        wtransport::error::ConnectionError::TimedOut => (None, Some("idle timeout".to_string())),
+        wtransport::error::ConnectionError::TimedOut => (
+            Some(IDLE_TIMEOUT_CLOSE_CODE),
+            Some("E_SESSION_IDLE_TIMEOUT".to_string()),
+        ),
         _ => (None, None),
     }
 }
@@ -415,6 +423,7 @@ pub(crate) fn spawn_wtransport_server(
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                             emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
+                                            connection.close(VarInt::from_u32(RATE_LIMITED_CLOSE_CODE), b"E_RATE_LIMITED");
                                             return;
                                         }
                                         if !rate_limit::try_acquire_per_ip_session_with_prefix(
@@ -425,6 +434,7 @@ pub(crate) fn spawn_wtransport_server(
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                             emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
+                                            connection.close(VarInt::from_u32(RATE_LIMITED_CLOSE_CODE), b"E_RATE_LIMITED");
                                             return;
                                         }
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -508,8 +518,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_session: lim_bidi.max_queued_bytes_per_session,
                                                                 max_stream: lim_bidi.max_queued_bytes_per_stream,
                                                             };
-                                                            let (read_rx, write_tx, stop_tx) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget(read_rx, write_tx, stop_tx, Some(budget));
+                                                            let (read_rx, write_tx, stop_tx, write_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot);
                                                             let _ = bidi_accept_tx.send(handle).await;
                                                         }
                                                     }
@@ -609,10 +619,10 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
                                                                 };
-                                                                let (read_rx, write_tx, stop_tx) =
+                                                                let (read_rx, write_tx, stop_tx, write_err_slot) =
                                                                     crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new_with_budget(
-                                                                    read_rx, write_tx, stop_tx, Some(budget),
+                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(
+                                                                    read_rx, write_tx, stop_tx, Some(budget), write_err_slot,
                                                                 ))
                                                             }
                                                             Err(e) => Err(e.to_string()),
@@ -665,8 +675,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                         max_session: lim_create_uni.max_queued_bytes_per_session,
                                                                         max_stream: lim_create_uni.max_queued_bytes_per_stream,
                                                                     };
-                                                                    let write_tx = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
-                                                                    let handle = crate::client_stream::ClientUniSendHandle::new_with_budget(write_tx, Some(budget));
+                                                                    let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
+                                                                    let handle = crate::client_stream::ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot);
                                                                     let _ = resp_tx.send(Ok(handle));
                                                                 }
                                                                 Err(e) => {

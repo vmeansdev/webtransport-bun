@@ -85,12 +85,12 @@ import type { ErrorCode } from "./errors.js";
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
 
-const E_CODE_RE = /^E_[A-Z_]+/;
+const E_CODE_RE = /E_[A-Z_]+/g;
 function toWebTransportError(err: unknown): WebTransportError {
     const msg = err instanceof Error ? err.message : String(err);
-    const match = E_CODE_RE.exec(msg);
-    if (match) return new WebTransportError(match[0] as ErrorCode, msg);
-    return new WebTransportError(E_INTERNAL as ErrorCode, msg);
+    const match = msg.match(E_CODE_RE);
+    const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
+    return new WebTransportError(code, msg);
 }
 
 // ---------------------------------------------------------------------------

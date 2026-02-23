@@ -6,7 +6,9 @@
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
 use napi::Result;
+use std::sync::Mutex;
 use napi_derive::napi;
+use wtransport::error::StreamWriteError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
@@ -112,12 +114,16 @@ impl StreamBudget {
 // Bidi stream handle
 // ---------------------------------------------------------------------------
 
+/// Shared slot for write failure error code (E_STOP_SENDING, E_STREAM_RESET).
+type WriteErrorSlot = Arc<Mutex<Option<String>>>;
+
 #[napi]
 pub struct ClientBidiStreamHandle {
     read_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
     write_tx: Option<mpsc::Sender<StreamCmd>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Option<StreamBudget>,
+    write_error_slot: Option<WriteErrorSlot>,
 }
 
 impl ClientBidiStreamHandle {
@@ -131,6 +137,7 @@ impl ClientBidiStreamHandle {
             write_tx: Some(write_tx),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: None,
+            write_error_slot: None,
         }
     }
 
@@ -140,11 +147,22 @@ impl ClientBidiStreamHandle {
         stop_tx: oneshot::Sender<u32>,
         budget: Option<StreamBudget>,
     ) -> Self {
+        Self::new_with_budget_and_slot(read_rx, write_tx, stop_tx, budget, None)
+    }
+
+    pub fn new_with_budget_and_slot(
+        read_rx: mpsc::Receiver<Vec<u8>>,
+        write_tx: mpsc::Sender<StreamCmd>,
+        stop_tx: oneshot::Sender<u32>,
+        budget: Option<StreamBudget>,
+        write_error_slot: Option<WriteErrorSlot>,
+    ) -> Self {
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             write_tx: Some(write_tx),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget,
+            write_error_slot,
         }
     }
 
@@ -176,6 +194,13 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+        if let Some(ref slot) = self.write_error_slot {
+            if let Ok(guard) = slot.lock() {
+                if let Some(ref code) = *guard {
+                    return Err(napi::Error::from_reason(code.clone()));
+                }
+            }
+        }
         let Some(ref tx) = self.write_tx else {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         };
@@ -235,6 +260,7 @@ impl ClientBidiStreamHandle {
 pub struct ClientUniSendHandle {
     write_tx: Option<mpsc::Sender<StreamCmd>>,
     budget: Option<StreamBudget>,
+    write_error_slot: Option<WriteErrorSlot>,
 }
 
 impl ClientUniSendHandle {
@@ -242,6 +268,7 @@ impl ClientUniSendHandle {
         Self {
             write_tx: Some(write_tx),
             budget: None,
+            write_error_slot: None,
         }
     }
 
@@ -249,9 +276,18 @@ impl ClientUniSendHandle {
         write_tx: mpsc::Sender<StreamCmd>,
         budget: Option<StreamBudget>,
     ) -> Self {
+        Self::new_with_budget_and_slot(write_tx, budget, None)
+    }
+
+    pub fn new_with_budget_and_slot(
+        write_tx: mpsc::Sender<StreamCmd>,
+        budget: Option<StreamBudget>,
+        write_error_slot: Option<WriteErrorSlot>,
+    ) -> Self {
         Self {
             write_tx: Some(write_tx),
             budget,
+            write_error_slot,
         }
     }
 }
@@ -260,6 +296,13 @@ impl ClientUniSendHandle {
 impl ClientUniSendHandle {
     #[napi]
     pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+        if let Some(ref slot) = self.write_error_slot {
+            if let Ok(guard) = slot.lock() {
+                if let Some(ref code) = *guard {
+                    return Err(napi::Error::from_reason(code.clone()));
+                }
+            }
+        }
         let Some(ref tx) = self.write_tx else {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         };
@@ -367,6 +410,8 @@ impl ClientUniRecvHandle {
 // ---------------------------------------------------------------------------
 
 /// Spawn bridge tasks for a bidi stream on the server runtime.
+/// Returns (read_rx, write_tx, stop_tx, write_error_slot) where write_error_slot
+/// is set to E_STOP_SENDING or E_STREAM_RESET when write fails.
 pub fn spawn_bidi_bridge(
     send_stream: wtransport::SendStream,
     recv_stream: wtransport::RecvStream,
@@ -376,6 +421,7 @@ pub fn spawn_bidi_bridge(
     mpsc::Receiver<Vec<u8>>,
     mpsc::Sender<StreamCmd>,
     oneshot::Sender<u32>,
+    Option<WriteErrorSlot>,
 ) {
     spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
 }
@@ -391,10 +437,12 @@ pub fn spawn_bidi_bridge_on(
     mpsc::Receiver<Vec<u8>>,
     mpsc::Sender<StreamCmd>,
     oneshot::Sender<u32>,
+    Option<WriteErrorSlot>,
 ) {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
     let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
+    let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
 
     let read_budget = budget.clone();
     rt.spawn(async move {
@@ -435,23 +483,47 @@ pub fn spawn_bidi_bridge_on(
     });
 
     let write_budget = budget;
+    let write_error_slot_clone = Arc::clone(&write_error_slot);
     rt.spawn(async move {
         while let Some(cmd) = write_rx.recv().await {
             match cmd {
                 StreamCmd::Data(chunk) => {
                     let sz = chunk.len() as u64;
-                    if send_stream.write_all(&chunk).await.is_err() {
-                        if let Some(ref b) = write_budget {
-                            b.release(sz);
+                    match send_stream.write_all(&chunk).await {
+                        Ok(()) => {
+                            if let Some(ref b) = write_budget {
+                                b.release(sz);
+                            }
                         }
-                        break;
-                    }
-                    if let Some(ref b) = write_budget {
-                        b.release(sz);
+                        Err(e) => {
+                            if let Some(ref b) = write_budget {
+                                b.release(sz);
+                            }
+                            let code = match &e {
+                                StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                                _ => "E_STREAM_RESET",
+                            };
+                            if let Ok(mut guard) = write_error_slot_clone.lock() {
+                                if guard.is_none() {
+                                    *guard = Some(code.to_string());
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 StreamCmd::Finish => {
-                    let _ = send_stream.finish().await;
+                    if let Err(e) = send_stream.finish().await {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                    }
                     break;
                 }
                 StreamCmd::Reset(code) => {
@@ -462,15 +534,16 @@ pub fn spawn_bidi_bridge_on(
         }
     });
 
-    (read_rx, write_tx, stop_tx)
+    (read_rx, write_tx, stop_tx, Some(write_error_slot))
 }
 
 /// Spawn bridge for an outgoing uni stream.
+/// Returns (write_tx, write_error_slot) where write_error_slot is set on write failure.
 pub fn spawn_uni_send_bridge(
     send_stream: wtransport::SendStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
-) -> mpsc::Sender<StreamCmd> {
+) -> (mpsc::Sender<StreamCmd>, Option<WriteErrorSlot>) {
     spawn_uni_send_bridge_on(&RUNTIME, send_stream, guard, budget)
 }
 
@@ -479,27 +552,52 @@ pub fn spawn_uni_send_bridge_on(
     mut send_stream: wtransport::SendStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
-) -> mpsc::Sender<StreamCmd> {
+) -> (mpsc::Sender<StreamCmd>, Option<WriteErrorSlot>) {
     let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
+    let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
 
+    let write_error_slot_clone = Arc::clone(&write_error_slot);
     rt.spawn(async move {
         let _guard = guard;
         while let Some(cmd) = write_rx.recv().await {
             match cmd {
                 StreamCmd::Data(chunk) => {
                     let sz = chunk.len() as u64;
-                    if send_stream.write_all(&chunk).await.is_err() {
-                        if let Some(ref b) = budget {
-                            b.release(sz);
+                    match send_stream.write_all(&chunk).await {
+                        Ok(()) => {
+                            if let Some(ref b) = budget {
+                                b.release(sz);
+                            }
                         }
-                        break;
-                    }
-                    if let Some(ref b) = budget {
-                        b.release(sz);
+                        Err(e) => {
+                            if let Some(ref b) = budget {
+                                b.release(sz);
+                            }
+                            let code = match &e {
+                                StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                                _ => "E_STREAM_RESET",
+                            };
+                            if let Ok(mut guard) = write_error_slot_clone.lock() {
+                                if guard.is_none() {
+                                    *guard = Some(code.to_string());
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 StreamCmd::Finish => {
-                    let _ = send_stream.finish().await;
+                    if let Err(e) = send_stream.finish().await {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                    }
                     break;
                 }
                 StreamCmd::Reset(code) => {
@@ -510,7 +608,7 @@ pub fn spawn_uni_send_bridge_on(
         }
     });
 
-    write_tx
+    (write_tx, Some(write_error_slot))
 }
 
 /// Spawn bridge for an incoming uni stream.
