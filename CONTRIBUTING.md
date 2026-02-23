@@ -6,6 +6,8 @@
 3) Install dependencies:
 - `bun install`
 - `cargo fetch`
+4) Install git hooks (required for pre-commit formatting):
+- `bun run setup:hooks`
 
 ## Local build
 - Build native addon: `bun run build:native` (uses napi-rs CLI; produces `webtransport-native.${platform}-${arch}.node`)
@@ -17,7 +19,7 @@
 
 ## Code quality
 - TypeScript:
-  - `bun run lint`
+  - `bunx biome format --write .`
   - `bun run typecheck`
 - Rust:
   - `cargo fmt`

@@ -5,6 +5,7 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "scripts": {
+    "setup:hooks": "bash scripts/install-git-hooks.sh",
     "build:native": "bunx @napi-rs/cli build --cwd crates/native --platform --release",
     "example:echo": "bun run examples/echo-playground/server.ts",
     "example:echo:cert": "mkdir -p examples/echo-playground/certs && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 10 -nodes -keyout examples/echo-playground/certs/key.pem -out examples/echo-playground/certs/cert.pem -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost,IP:127.0.0.1'",
@@ -33,6 +34,7 @@
     "release:npm": "npm publish -w @webtransport-bun/webtransport --access public"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.2.4",
     "@types/bun": "latest",
     "typescript": "^5"
   }
