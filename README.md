@@ -74,11 +74,22 @@ bun run bench:baseline
 | Server snapshots / state dumps | Unidirectional stream from server |
 | Single-message envelope for all traffic | Split by semantics: datagram vs stream |
 
+Detailed migration playbook:
+- `docs/MIGRATION_WEBSOCKET.md`
+
 ## Demo
 
 - Local interactive demo: `examples/echo-playground`
 - Multi-node compose demo: `examples/compose-collab`
 - Recommended short walkthrough to record/share: run compose demo + open `http://localhost:8080/` dashboard.
+
+## Documentation
+
+- Docs portal: `docs/README.md`
+- GitHub Pages docs site: `https://vmeansdev.github.io/webtransport-bun/`
+- FAQ / troubleshooting: `docs/FAQ.md`
+- Migration guide: `docs/MIGRATION_WEBSOCKET.md`
+- AI-agent entrypoint: `llms.txt`
 
 ## Status
 - In active hardening.

@@ -1,0 +1,34 @@
+site_name: webtransport-bun
+site_description: Production-focused WebTransport for Bun
+site_url: https://vmeansdev.github.io/webtransport-bun/
+repo_url: https://github.com/vmeansdev/webtransport-bun
+repo_name: vmeansdev/webtransport-bun
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Start Here: README.md
+  - Getting Started: GETTING_STARTED.md
+  - Migration From WebSocket: MIGRATION_WEBSOCKET.md
+  - FAQ / Troubleshooting: FAQ.md
+  - API Spec: SPEC.md
+  - Architecture: ARCHITECTURE.md
+  - Operations: OPERATIONS.md
+  - Metrics: METRICS.md
+  - Test Plan: TESTPLAN.md
+  - CI / Release: CI.md
+  - Compatibility: COMPATIBILITY.md
+  - Parity Matrix: PARITY_MATRIX.md
+  - Benchmark Baselines: BENCHMARK_BASELINES.md
