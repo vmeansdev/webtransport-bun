@@ -27,7 +27,7 @@ describe("acceptance (Task gates)", () => {
                         await s.sendDatagram(d);
                         datagramsEchoed++;
                     }
-                })();
+                })().catch(() => {});
                 void (async () => {
                     for await (const _ of s.incomingBidirectionalStreams()) {
                         streamsAccepted++;
@@ -73,9 +73,11 @@ describe("acceptance (Task gates)", () => {
             port,
             tls: { certPem: "", keyPem: "" },
             onSession: async (s) => {
-                for await (const d of s.incomingDatagrams()) {
-                    await s.sendDatagram(d);
-                }
+                void (async () => {
+                    for await (const d of s.incomingDatagrams()) {
+                        await s.sendDatagram(d);
+                    }
+                })().catch(() => {});
             },
         });
         await Bun.sleep(2000);
@@ -123,7 +125,7 @@ describe("acceptance (Task gates)", () => {
                     for await (const d of s.incomingDatagrams()) {
                         await s.sendDatagram(d);
                     }
-                })();
+                })().catch(() => {});
             },
         });
         await Bun.sleep(2000);
