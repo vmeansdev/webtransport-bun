@@ -380,7 +380,7 @@ pub(crate) fn spawn_wtransport_server(
                                     }
                                 };
                                 if metrics.handshakes_in_flight.load(Ordering::Relaxed)
-                                    >= limits.max_handshakes_in_flight
+                                    > limits.max_handshakes_in_flight
                                 {
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);

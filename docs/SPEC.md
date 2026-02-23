@@ -32,10 +32,15 @@ export type RateLimitOptions = {
 };
 
 export type LimitsOptions = {
+  /** Max concurrent sessions. At limit, next handshake is rejected. */
   maxSessions: number;
+  /** Max handshakes in progress. At limit, next is rejected (inclusive: limit is allowed). */
   maxHandshakesInFlight: number;
+  /** Max bidi streams per session. At limit, createBidirectionalStream rejects with E_LIMIT_EXCEEDED. */
   maxStreamsPerSessionBidi: number;
+  /** Max uni streams per session. At limit, createUnidirectionalStream rejects with E_LIMIT_EXCEEDED. */
   maxStreamsPerSessionUni: number;
+  /** Max streams across all sessions. At limit, new streams (accept or create) are rejected. */
   maxStreamsGlobal: number;
 
   maxDatagramSize: number; // hard cap in bytes (also must respect negotiated max)
