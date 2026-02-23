@@ -87,7 +87,9 @@ fn emit_log(
     peer_ip: Option<&str>,
     peer_port: Option<u32>,
 ) {
-    eprintln!("webtransport-native: {}", msg);
+    // Avoid writing potentially sensitive runtime details to stderr by default.
+    // Full structured details still go through the optional JS log callback.
+    eprintln!("webtransport-native: [{}]", level);
     if let Some(tx) = tx {
         let _ = tx.try_send(LogEvent {
             level: level.to_string(),

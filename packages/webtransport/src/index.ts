@@ -325,6 +325,18 @@ export type SessionMetricsSnapshot = {
 /** Prometheus metric name prefix. Override via env WEBTRANSPORT_METRICS_PREFIX. */
 export const METRICS_PREFIX = process.env.WEBTRANSPORT_METRICS_PREFIX ?? "webtransport_";
 
+function escapePromLabelValue(v: unknown): string {
+    return String(v)
+        .replace(/\\/g, "\\\\")
+        .replace(/\n/g, "\\n")
+        .replace(/"/g, '\\"');
+}
+
+function sanitizePromLabelName(k: string): string {
+    const safe = k.replace(/[^a-zA-Z0-9_]/g, "_");
+    return /^[a-zA-Z_]/.test(safe) ? safe : `_${safe}`;
+}
+
 /**
  * Convert MetricsSnapshot to Prometheus exposition format (text).
  * Gauges: sessions_active, handshakes_in_flight, streams_active, session_tasks_active, stream_tasks_active, queued_bytes_global.
@@ -341,7 +353,11 @@ export function metricsToPrometheus(
     m: MetricsSnapshot,
     labels?: Record<string, string>
 ): string {
-    const l = labels ? "," + Object.entries(labels).map(([k, v]) => `${k}="${String(v).replace(/"/g, '\\"')}"`).join(",") : "";
+    const l = labels
+        ? "," + Object.entries(labels)
+            .map(([k, v]) => `${sanitizePromLabelName(k)}="${escapePromLabelValue(v)}"`)
+            .join(",")
+        : "";
     const p = METRICS_PREFIX;
     const lines: string[] = [
         `# HELP ${p}sessions_active Current open sessions`,
