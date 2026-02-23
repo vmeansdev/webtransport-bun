@@ -31,7 +31,7 @@
 10. Interop — Playwright Chromium (`bun run playwright test`)
 11. Smoke test — `bun add` from built package
 
-**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`)
+**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/24h/72h) — trigger via workflow_dispatch; writes soak-artifacts.json
 
 ### release.yml (tag push `v*`, workflow_dispatch)
 

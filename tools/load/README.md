@@ -30,6 +30,12 @@ bun run test:load
 
 # Soak test (release build, 30 min)
 bun run test:soak
+
+# Addon soak (P2.2): 2min default, or 1h/24h/72h
+SOAK_DURATION=120 bun run test:soak-addon
+bun run test:soak-addon:1h    # 1h, trend gate + artifacts
+bun run test:soak-addon:24h   # 24h (local)
+bun run test:soak-addon:72h   # 72h (local)
 ```
 
 Or directly:
@@ -37,7 +43,10 @@ Or directly:
 ```bash
 bun tools/load/load.ts
 bun tools/load/soak.ts
+SOAK_DURATION=3600 bun tools/load/soak-addon.ts
 ```
+
+**P2.2 long soak**: For 24h/72h, use GitHub Actions `soak-long` workflow (workflow_dispatch). Writes `tools/load/soak-artifacts.json` and `.csv`; trend-based leak gate when duration >= 3600s (RSS, FD, sessionTasks, streamTasks).
 
 ## Components
 

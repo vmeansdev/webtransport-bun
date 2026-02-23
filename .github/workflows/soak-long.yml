@@ -1,0 +1,48 @@
+# P2.2: Long soak jobs (1h, 24h, 72h). Trigger manually via workflow_dispatch.
+name: soak-long
+on:
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: "Soak duration in hours (1, 24, or 72)"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "24"
+          - "72"
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 44640
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - name: Build native addon
+        run: bun run build:native
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Soak (${{ github.event.inputs.duration_hours || '1' }}h)
+        id: soak
+        run: |
+          H="${{ github.event.inputs.duration_hours || '1' }}"
+          case "$H" in
+            1)  D=3600 ;;
+            24) D=86400 ;;
+            72) D=259200 ;;
+            *)  D=3600 ;;
+          esac
+          echo "SOAK_DURATION=$D"
+          SOAK_DURATION=$D SOAK_ARTIFACTS_OUT=$GITHUB_WORKSPACE/tools/load/soak-artifacts.json bun tools/load/soak-addon.ts
+        timeout-minutes: ${{ github.event.inputs.duration_hours == '72' && 44640 || (github.event.inputs.duration_hours == '24' && 1500 || 90) }}
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-artifacts-${{ github.event.inputs.duration_hours || '1' }}h
+          path: tools/load/soak-artifacts*
+          if-no-files-found: ignore

@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
 /**
- * Soak test targeting addon server (createServer). Phase 9.
+ * Soak test targeting addon server (createServer). Phase 9 / P2.2.
  * Env: SOAK_DURATION (default 1800), SOAK_SESSIONS (500), SOAK_DATAGRAMS_PER_SEC (500), SOAK_STREAMS_PER_SEC (5).
- * Use SOAK_DURATION=43200 for 12h, 86400 for 24h. Trend-based leak gate when duration >= 3600.
+ * Use SOAK_DURATION=43200 for 12h, 86400 for 24h, 259200 for 72h.
+ * Trend-based leak gate when duration >= 3600. Writes artifacts to SOAK_ARTIFACTS_OUT (default tools/load/soak-artifacts.json).
  */
 
 import { createServer, DEFAULT_LIMITS } from "../../packages/webtransport/src/index.ts";
 import { $ } from "bun";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
@@ -19,7 +21,16 @@ const MAX_SESSION_ERRORS = Math.ceil(SESSIONS * 0.5);
 const MAX_DATAGRAM_ERRORS = 5000;
 const MAX_STREAM_ERRORS = 2000;
 
-type Sample = { rss: number; fd: number; sessions: number; streams: number; queued: number };
+type Sample = {
+    ts_ms: number;
+    rss: number;
+    fd: number;
+    sessions: number;
+    streams: number;
+    sessionTasks: number;
+    streamTasks: number;
+    queued: number;
+};
 
 function getRssMb(): number {
     try {
@@ -101,10 +112,13 @@ async function main() {
                 process.exit(1);
             }
             samples.push({
+                ts_ms: Date.now(),
                 rss: getRssMb(),
                 fd: await getFdCount(process.pid),
                 sessions: m.sessionsActive,
                 streams: m.streamsActive,
+                sessionTasks: m.sessionTasksActive,
+                streamTasks: m.streamTasksActive,
                 queued: m.queuedBytesGlobal,
             });
             await Bun.sleep(pollIntervalMs);
@@ -189,6 +203,25 @@ async function main() {
         process.exit(1);
     }
 
+    const artifactsOut = process.env.SOAK_ARTIFACTS_OUT ?? join(ROOT, "tools/load/soak-artifacts.json");
+    const artifacts = {
+        duration_s: DURATION,
+        sessions: SESSIONS,
+        samples,
+        peakSessions,
+        peakStreams,
+        finalRssMb: getRssMb(),
+        finalFd: await getFdCount(process.pid),
+    };
+    writeFileSync(artifactsOut, JSON.stringify(artifacts, null, 0));
+    const csvPath = artifactsOut.replace(/\.json$/, ".csv");
+    const csvHeader = "ts_ms,rss_mb,fd,sessions,streams,session_tasks,stream_tasks,queued_bytes";
+    const csvRows = samples.map((s) =>
+        [s.ts_ms, s.rss.toFixed(2), s.fd, s.sessions, s.streams, s.sessionTasks, s.streamTasks, s.queued].join(",")
+    );
+    writeFileSync(csvPath, [csvHeader, ...csvRows].join("\n"));
+    console.log("soak-addon: artifacts written to", artifactsOut, csvPath);
+
     if (DURATION >= 3600 && samples.length >= 10) {
         const firstThird = samples.slice(0, Math.floor(samples.length / 3));
         const lastThird = samples.slice(-Math.floor(samples.length / 3));
@@ -198,12 +231,24 @@ async function main() {
         const rssLast = avg(lastThird, "rss");
         const fdFirst = avg(firstThird, "fd");
         const fdLast = avg(lastThird, "fd");
+        const sessionTasksFirst = avg(firstThird, "sessionTasks");
+        const sessionTasksLast = avg(lastThird, "sessionTasks");
+        const streamTasksFirst = avg(firstThird, "streamTasks");
+        const streamTasksLast = avg(lastThird, "streamTasks");
         if (rssFirst > 0 && rssLast > rssFirst * 1.2) {
             console.error("soak-addon: FAIL (trend: RSS", rssFirst.toFixed(1), "->", rssLast.toFixed(1), "MB, >20% growth)");
             process.exit(1);
         }
         if (fdFirst > 0 && fdLast > fdFirst * 1.2) {
             console.error("soak-addon: FAIL (trend: FD", fdFirst.toFixed(0), "->", fdLast.toFixed(0), ">20% growth)");
+            process.exit(1);
+        }
+        if (sessionTasksFirst >= 0 && sessionTasksLast > sessionTasksFirst * 1.5) {
+            console.error("soak-addon: FAIL (trend: sessionTasks", sessionTasksFirst.toFixed(0), "->", sessionTasksLast.toFixed(0), ">50% growth)");
+            process.exit(1);
+        }
+        if (streamTasksFirst >= 0 && streamTasksLast > streamTasksFirst * 1.5) {
+            console.error("soak-addon: FAIL (trend: streamTasks", streamTasksFirst.toFixed(0), "->", streamTasksLast.toFixed(0), ">50% growth)");
             process.exit(1);
         }
     }
