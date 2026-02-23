@@ -103,9 +103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(duration_secs),
         datagrams_per_sec,
         streams_per_sec,
-        max_session_errors,
-        max_datagram_errors,
-        max_stream_errors,
+        ErrorBudgets {
+            max_session_errors,
+            max_datagram_errors,
+            max_stream_errors,
+        },
     ))
 }
 
@@ -119,15 +121,20 @@ struct Counters {
     streams_err: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+struct ErrorBudgets {
+    max_session_errors: u64,
+    max_datagram_errors: u64,
+    max_stream_errors: u64,
+}
+
 async fn run(
     url: &str,
     num_sessions: usize,
     duration: Duration,
     datagrams_per_sec: u64,
     streams_per_sec: u64,
-    max_session_errors: u64,
-    max_datagram_errors: u64,
-    max_stream_errors: u64,
+    budgets: ErrorBudgets,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::builder()
         .with_bind_default()
@@ -211,9 +218,9 @@ async fn run(
     println!("load-client: streams opened={} err={}", st_open, st_err);
 
     let pass = ok > 0
-        && err <= max_session_errors
-        && dg_err <= max_datagram_errors
-        && st_err <= max_stream_errors;
+        && err <= budgets.max_session_errors
+        && dg_err <= budgets.max_datagram_errors
+        && st_err <= budgets.max_stream_errors;
     if pass {
         println!("load-client: PASS");
     } else {

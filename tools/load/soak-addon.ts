@@ -153,8 +153,14 @@ async function main() {
 
     await poller;
     await Bun.sleep(5000);
-    const m = server.metricsSnapshot();
     await server.close();
+    // Wait briefly for background task gauges to drain after shutdown.
+    let m = server.metricsSnapshot();
+    const drainDeadline = Date.now() + 30_000;
+    while ((m.sessionTasksActive > 10 || m.streamTasksActive > 10) && Date.now() < drainDeadline) {
+        await Bun.sleep(500);
+        m = server.metricsSnapshot();
+    }
     const finalFd = await getFdCount(process.pid);
 
     if (result.code !== 0) {
