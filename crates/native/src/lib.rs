@@ -87,9 +87,11 @@ fn emit_log(
     peer_ip: Option<&str>,
     peer_port: Option<u32>,
 ) {
-    // Avoid writing potentially sensitive runtime details to stderr by default.
+    // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
-    eprintln!("webtransport-native: [{}]", level);
+    if matches!(level, "warn" | "error") {
+        eprintln!("webtransport-native: [{}]", level);
+    }
     if let Some(tx) = tx {
         let _ = tx.try_send(LogEvent {
             level: level.to_string(),

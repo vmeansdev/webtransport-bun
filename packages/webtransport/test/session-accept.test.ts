@@ -3,11 +3,20 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { createServer } from "../src/index.js";
-import { $ } from "bun";
+import { connect, createServer } from "../src/index.js";
 
-const ROOT = process.cwd();
-const CLIENT_BIN = `${ROOT}/target/debug/load-client`;
+async function waitUntil(
+    condition: () => boolean,
+    timeoutMs: number,
+    intervalMs = 50,
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (condition()) return true;
+        await Bun.sleep(intervalMs);
+    }
+    return condition();
+}
 
 describe("session accept (P0-A)", () => {
     it("onSession called when client connects", async () => {
@@ -19,17 +28,14 @@ describe("session accept (P0-A)", () => {
                 sessions.push(s);
             },
         });
-        await Bun.sleep(6000);
-
-        const client = Bun.spawn(
-            [CLIENT_BIN, "--url", "https://127.0.0.1:14440", "--sessions", "1", "--duration", "2", "--datagrams-per-sec", "5", "--streams-per-sec", "1"],
-            { cwd: ROOT, stdout: "pipe", stderr: "pipe" }
-        );
-        await client.exited;
-        await Bun.sleep(1000);
+        const client = await connect("https://127.0.0.1:14440", {
+            tls: { insecureSkipVerify: true },
+        });
+        const seen = await waitUntil(() => sessions.length >= 1, 8000);
+        client.close();
         await server.close();
 
-        expect(sessions.length).toBeGreaterThanOrEqual(1);
+        expect(seen).toBe(true);
         expect(sessions[0]).toBeDefined();
         expect(sessions[0].id).toBeDefined();
         expect(typeof sessions[0].id).toBe("string");
@@ -44,17 +50,16 @@ describe("session accept (P0-A)", () => {
                 sessions.push(s);
             },
         });
-        await Bun.sleep(2000);
+        const client = await connect("https://127.0.0.1:14441", {
+            tls: { insecureSkipVerify: true },
+        });
+        const accepted = await waitUntil(() => sessions.length >= 1, 8000);
+        expect(accepted).toBe(true);
 
-        const client = Bun.spawn(
-            [CLIENT_BIN, "--url", "https://127.0.0.1:14441", "--sessions", "1", "--duration", "1", "--datagrams-per-sec", "2", "--streams-per-sec", "1"],
-            { cwd: ROOT, stdout: "pipe", stderr: "pipe" }
-        );
-        await client.exited;
-
-        expect(sessions.length).toBeGreaterThanOrEqual(1);
+        const closedPromise = sessions[0].closed.then((info: any) => ({ ok: true, info }));
+        client.close();
         const closedResult = await Promise.race([
-            sessions[0].closed.then((info: any) => ({ ok: true, info })),
+            closedPromise,
             Bun.sleep(5000).then(() => ({ ok: false })),
         ]);
         expect(closedResult.ok).toBe(true);

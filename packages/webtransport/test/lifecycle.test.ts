@@ -4,11 +4,20 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { createServer } from "../src/index.js";
-import { $ } from "bun";
+import { connect, createServer } from "../src/index.js";
 
-const ROOT = process.cwd();
-const CLIENT_BIN = `${ROOT}/target/debug/load-client`;
+async function waitUntil(
+    condition: () => boolean,
+    timeoutMs: number,
+    intervalMs = 50,
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (condition()) return true;
+        await Bun.sleep(intervalMs);
+    }
+    return condition();
+}
 
 describe("lifecycle", () => {
     it("server close => session closed promises settle", async () => {
@@ -20,14 +29,11 @@ describe("lifecycle", () => {
                 sessions.push(s);
             },
         });
-        await Bun.sleep(3000);
-
-        const client = Bun.spawn(
-            [CLIENT_BIN, "--url", "https://127.0.0.1:14435", "--sessions", "1", "--duration", "30", "--datagrams-per-sec", "2", "--streams-per-sec", "1"],
-            { cwd: ROOT, stdout: "pipe", stderr: "pipe" }
-        );
-        await Bun.sleep(2000);
-        expect(sessions.length).toBeGreaterThanOrEqual(1);
+        const client = await connect("https://127.0.0.1:14435", {
+            tls: { insecureSkipVerify: true },
+        });
+        const accepted = await waitUntil(() => sessions.length >= 1, 8000);
+        expect(accepted).toBe(true);
 
         const closedPromises = sessions.map((s) => s.closed);
         await server.close();
@@ -39,8 +45,7 @@ describe("lifecycle", () => {
         expect(results).not.toBeNull();
         expect((results as any[]).every((r) => r?.ok)).toBe(true);
 
-        client.kill();
-        await client.exited;
+        client.close();
     }, 15000);
 
     it("server close resolves without hanging", async () => {
@@ -64,5 +69,6 @@ describe("lifecycle", () => {
         expect(typeof m.streamsActive).toBe("number");
         expect(typeof m.queuedBytesGlobal).toBe("number");
         expect(typeof m.limitExceededCount).toBe("number");
+        void server.close();
     });
 });

@@ -100,13 +100,17 @@ async fn run(
     let endpoint = Arc::new(Endpoint::client(config)?);
     let counters = Arc::new(Counters::default());
 
-    // Spawn session tasks (stagger slightly to avoid connection storms)
+    // Spawn session tasks (stagger slightly to avoid connection storms).
+    // Sleep a fixed interval per spawn; do not multiply by index, otherwise
+    // startup becomes O(n^2) wall time (e.g. 500 sessions ~20+ minutes).
     let mut handles = Vec::with_capacity(num_sessions);
     for i in 0..num_sessions {
         let url = url.to_string();
         let endpoint = Arc::clone(&endpoint);
         let counters = Arc::clone(&counters);
-        tokio::time::sleep(Duration::from_millis(10 * (i as u64))).await;
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let handle = tokio::spawn(async move {
             match endpoint.connect(&url).await {
                 Ok(conn) => {
