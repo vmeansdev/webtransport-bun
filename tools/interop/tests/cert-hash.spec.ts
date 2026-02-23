@@ -36,7 +36,7 @@ test("certificate hash matches openssl DER certificate hash", () => {
     expect(jsHash).toBeTruthy();
     const opensslHash = execSync(
         `openssl x509 -in "${certPath}" -outform DER | openssl dgst -sha256 -binary | base64`,
-        { encoding: "utf-8", shell: "/bin/zsh" }
+        { encoding: "utf-8" }
     ).trim();
     expect(jsHash).toBe(opensslHash);
 });
