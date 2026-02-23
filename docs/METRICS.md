@@ -36,7 +36,7 @@ For finer-grained attribution, monitor `rateLimitedCount` and `limitExceededCoun
 
 ## Structured logs
 
-Use the `log` option with correlation fields:
+Use the `log` option for structured events:
 
 ```ts
 createServer({
@@ -46,21 +46,20 @@ createServer({
   log: (event) => {
     console.log(JSON.stringify({
       ...event,
-      sessionId: event.sessionId,
-      peerIp: event.peerIp,
-      peerPort: event.peerPort,
+      ts: Date.now(),
     }));
   },
 });
 ```
 
 Security default:
-- Native log payloads are **redacted by default** (`msg`, `sessionId`, `peerIp`, `peerPort` may be sanitized/omitted).
+- Native log payloads are **redacted by default** (`msg` may be sanitized/omitted).
+- Sensitive identifiers (`sessionId`, `peerIp`, `peerPort`) are omitted by default and in debug mode.
 
 ## Debug mode
 
-Set `debug: true` and provide a log hook that emits all levels. This opts in to detailed
-native diagnostics (including panic payload details) for local debugging:
+Set `debug: true` and provide a log hook that emits all levels. This opts in to richer
+native diagnostics for local debugging, while keeping sensitive identifiers redacted:
 
 ```ts
 createServer({

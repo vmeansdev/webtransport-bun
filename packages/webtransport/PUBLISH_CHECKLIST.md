@@ -53,6 +53,14 @@ Confirm native addon loads on your OS/arch.
 
 ## Publish command
 
+Preferred from repository root:
+
+```bash
+npm run release:npm
+```
+
+Manual alternative:
+
 ```bash
 cd packages/webtransport
 npm version patch  # or minor/major

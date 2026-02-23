@@ -1,7 +1,7 @@
 # SPEC.md
 
 ## Package name (suggested)
-`@your-scope/webtransport-bun`
+`@webtransport-bun/webtransport`
 
 ## High-level API
 The API provides:
@@ -63,10 +63,10 @@ export type ServerOptions = {
 
 export type LogEvent = {
   level: "debug" | "info" | "warn" | "error";
-  msg: string;
-  sessionId?: string;
-  peerIp?: string;
-  peerPort?: number;
+  msg: string; // may be sanitized/empty under redaction policy
+  sessionId?: string; // optional, may be redacted/omitted
+  peerIp?: string; // optional, may be redacted/omitted
+  peerPort?: number; // optional, may be redacted/omitted
   data?: Record<string, unknown>;
 };
 

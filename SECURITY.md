@@ -14,7 +14,8 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 - TLS verification enabled by default for client.
 - `insecureSkipVerify` requires explicit `tls.insecureSkipVerify: true`; emits warning log when used. Dev only — never use in production.
 - Native diagnostics are redacted by default (log payload/message/session metadata and panic details).
-  Use `createServer({ debug: true, ... })` only in trusted dev/debug environments to opt in to full details.
+  Use `createServer({ debug: true, ... })` only in trusted dev/debug environments to opt in to richer diagnostics.
+  Sensitive identifiers (session/peer metadata) remain redacted by design.
 2. Bounded resources
 - All buffering is bounded and accounted for.
 - There is always a cap that prevents unbounded memory growth.

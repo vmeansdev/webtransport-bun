@@ -111,8 +111,8 @@ When `queuedBytesGlobal` rises and stays high:
 ## Diagnostics modes
 
 - **Default (recommended for production):** native diagnostics are redacted/minimal.
-- **Debug mode:** set `createServer({ debug: true, ... })` to enable detailed native logs and panic diagnostics.
-  Do not enable in untrusted or compliance-sensitive environments.
+- **Debug mode:** set `createServer({ debug: true, ... })` to enable richer native diagnostics.
+  Sensitive identifiers remain redacted; use only in trusted environments.
 
 ## Tuning guide
 
