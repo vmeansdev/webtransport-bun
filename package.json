@@ -25,7 +25,8 @@
     "bench:handshake": "bun tools/bench/handshake-latency.ts",
     "bench:stream": "bun tools/bench/stream-throughput.ts",
     "bench:baseline": "bun tools/bench/baseline.ts",
-    "bench:regress": "bun tools/bench/bench-regress.ts"
+    "bench:regress": "bun tools/bench/bench-regress.ts",
+    "release:npm": "npm publish -w @webtransport-bun/webtransport --access public"
   },
   "devDependencies": {
     "@types/bun": "latest",
