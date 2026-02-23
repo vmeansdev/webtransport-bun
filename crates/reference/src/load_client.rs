@@ -17,6 +17,9 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
+const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
+const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -25,6 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut duration_secs = DEFAULT_DURATION_SECS;
     let mut datagrams_per_sec = DEFAULT_DATAGRAMS_PER_SEC;
     let mut streams_per_sec = DEFAULT_STREAMS_PER_SEC;
+    let mut max_session_errors = DEFAULT_MAX_SESSION_ERRORS;
+    let mut max_datagram_errors = DEFAULT_MAX_DATAGRAM_ERRORS;
+    let mut max_stream_errors = DEFAULT_MAX_STREAM_ERRORS;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -53,13 +59,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(DEFAULT_STREAMS_PER_SEC)
             }
+            "--max-session-errors" => {
+                max_session_errors = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_MAX_SESSION_ERRORS)
+            }
+            "--max-datagram-errors" => {
+                max_datagram_errors = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_MAX_DATAGRAM_ERRORS)
+            }
+            "--max-stream-errors" => {
+                max_stream_errors = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_MAX_STREAM_ERRORS)
+            }
             _ => {}
         }
     }
 
     println!(
-        "load-client: url={} sessions={} duration={}s datagrams/s={} streams/s={}",
-        url, sessions, duration_secs, datagrams_per_sec, streams_per_sec
+        "load-client: url={} sessions={} duration={}s datagrams/s={} streams/s={} budgets(session={}, datagram={}, stream={})",
+        url,
+        sessions,
+        duration_secs,
+        datagrams_per_sec,
+        streams_per_sec,
+        max_session_errors,
+        max_datagram_errors,
+        max_stream_errors
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -72,6 +103,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(duration_secs),
         datagrams_per_sec,
         streams_per_sec,
+        max_session_errors,
+        max_datagram_errors,
+        max_stream_errors,
     ))
 }
 
@@ -91,6 +125,9 @@ async fn run(
     duration: Duration,
     datagrams_per_sec: u64,
     streams_per_sec: u64,
+    max_session_errors: u64,
+    max_datagram_errors: u64,
+    max_stream_errors: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig::builder()
         .with_bind_default()
@@ -173,7 +210,10 @@ async fn run(
     println!("load-client: datagrams sent={} err={}", dg_sent, dg_err);
     println!("load-client: streams opened={} err={}", st_open, st_err);
 
-    let pass = err == 0 && dg_err == 0 && st_err == 0 && ok > 0;
+    let pass = ok > 0
+        && err <= max_session_errors
+        && dg_err <= max_datagram_errors
+        && st_err <= max_stream_errors;
     if pass {
         println!("load-client: PASS");
     } else {

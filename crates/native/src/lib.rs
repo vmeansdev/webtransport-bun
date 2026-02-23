@@ -89,7 +89,7 @@ fn emit_log(
 ) {
     // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
-    if matches!(level, "warn" | "error") {
+    if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
     if let Some(tx) = tx {
