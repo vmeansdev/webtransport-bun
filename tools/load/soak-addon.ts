@@ -58,9 +58,21 @@ async function main() {
     await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client --release`.quiet();
 
     console.log("soak-addon: Starting addon server, duration", DURATION, "s");
+    const handshakePerSec = Math.max(Math.ceil(SESSIONS / 4), 200);
+    const handshakeBurst = Math.max(SESSIONS * 2, 800);
     const server = createServer({
         port: 4433,
         tls: { certPem: "", keyPem: "" },
+        limits: { maxSessions: Math.min(SESSIONS + 500, 5000) },
+        rateLimits: {
+            handshakesPerSec: handshakePerSec,
+            handshakesBurst: handshakeBurst,
+            handshakesBurstPerPrefix: handshakeBurst,
+            streamsPerSec: Math.max(SESSIONS, 400),
+            streamsBurst: Math.max(SESSIONS * 2, 800),
+            datagramsPerSec: Math.max(SESSIONS * 10, 5000),
+            datagramsBurst: Math.max(SESSIONS * 20, 10000),
+        },
         onSession: () => {},
     });
     const initialFd = await getFdCount(process.pid);
