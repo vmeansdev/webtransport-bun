@@ -6,9 +6,19 @@
 
 import { createServer, DEFAULT_LIMITS } from "../../packages/webtransport/src/index.ts";
 import { $ } from "bun";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const ROOT = process.cwd();
+const RSS_TREND_OUT = process.env.RSS_TREND_OUT ?? join(ROOT, "tools/load/rss-trend.json");
+
+function getRssMb(): number {
+    try {
+        return (process.memoryUsage?.()?.rss ?? 0) / (1024 * 1024);
+    } catch {
+        return 0;
+    }
+}
 const CLIENT_BIN = `${ROOT}/target/debug/load-client`;
 const DURATION = 15;
 const SESSIONS = 4;
@@ -58,12 +68,19 @@ async function main() {
 
     const maxQueuedBytesGlobal = DEFAULT_LIMITS.maxQueuedBytesGlobal;
     const pollIntervalMs = 2000;
+    const rssSamples: { ts_ms: number; rss_mb: number; sessions: number; streams: number }[] = [];
     let lastMetrics = server.metricsSnapshot();
     const poller = (async () => {
         for (let i = 0; i < Math.ceil((DURATION + 10) / (pollIntervalMs / 1000)); i++) {
             await Bun.sleep(pollIntervalMs);
             const m = server.metricsSnapshot();
             lastMetrics = m;
+            rssSamples.push({
+                ts_ms: Date.now(),
+                rss_mb: getRssMb(),
+                sessions: m.sessionsActive,
+                streams: m.streamsActive,
+            });
             if (m.queuedBytesGlobal > maxQueuedBytesGlobal) {
                 console.error("load-addon: FAIL (queuedBytesGlobal", m.queuedBytesGlobal, "> max)");
                 await server.close();
@@ -128,6 +145,12 @@ async function main() {
         process.exit(1);
     }
 
+    if (rssSamples.length > 0) {
+        writeFileSync(RSS_TREND_OUT, JSON.stringify(rssSamples, null, 0));
+        const csv = ["ts_ms,rss_mb,sessions,streams", ...rssSamples.map((s) => `${s.ts_ms},${s.rss_mb.toFixed(2)},${s.sessions},${s.streams}`)].join("\n");
+        writeFileSync(RSS_TREND_OUT.replace(/\.json$/, ".csv"), csv);
+        console.log("load-addon: RSS trend written to", RSS_TREND_OUT);
+    }
     console.log("load-addon: PASS", "(metrics: sessions=", m.sessionsActive, "streams=", m.streamsActive, ")");
 }
 

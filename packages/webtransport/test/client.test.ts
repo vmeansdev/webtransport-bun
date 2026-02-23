@@ -111,10 +111,10 @@ describe("webtransport client", () => {
         const bidi = await client.createBidirectionalStream();
         const payload = Buffer.from("bidi-test");
         await new Promise<void>((resolve, reject) => {
-            bidi.write(payload, (err) => (err ? reject(err) : resolve()));
+            bidi.write(payload, (err: Error | null | undefined) => (err ? reject(err) : resolve()));
         });
         await new Promise<void>((resolve, reject) => {
-            bidi.end((err) => (err ? reject(err) : resolve()));
+            bidi.end((err: Error | null | undefined) => (err ? reject(err) : resolve()));
         });
         const chunks: Buffer[] = [];
         for await (const c of bidi) chunks.push(c);

@@ -41,11 +41,17 @@ function readExactly(stream: Duplex, n: number): Promise<Buffer> {
 }
 
 async function main() {
-    // Addon server echoes bidi streams
     const server = createServer({
         port: PORT,
         tls: { certPem: "", keyPem: "" },
-        onSession: () => {},
+        onSession: async (session) => {
+            for await (const duplex of session.incomingBidirectionalStreams()) {
+                void (async () => {
+                    for await (const chunk of duplex) duplex.write(chunk);
+                    duplex.end();
+                })().catch(() => {});
+            }
+        },
     });
     await Bun.sleep(2000);
 
@@ -70,9 +76,14 @@ async function main() {
     client.close();
     await server.close();
 
-    console.log(
-        `stream-throughput: rounds=${ROUNDS} bytes=${bytesWritten} elapsed=${elapsed.toFixed(2)}s throughput=${mbps.toFixed(2)}MB/s`
-    );
+    const result = {
+        name: "stream-throughput",
+        rounds: ROUNDS,
+        bytes: bytesWritten,
+        elapsed_s: Number(elapsed.toFixed(3)),
+        throughput_mbps: Number(mbps.toFixed(2)),
+    };
+    console.log(JSON.stringify(result));
 }
 
 main().catch((e) => {

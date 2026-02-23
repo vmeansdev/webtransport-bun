@@ -105,6 +105,7 @@ describe("robustness (Phase 4)", () => {
 
         for (let i = 0; i < 15; i++) {
             const act = actions[Math.floor(Math.random() * actions.length)];
+            if (!act) continue;
             await act().catch(() => {});
         }
 

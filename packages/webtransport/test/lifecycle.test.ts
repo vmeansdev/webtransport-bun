@@ -16,7 +16,9 @@ describe("lifecycle", () => {
         const server = createServer({
             port: 14435,
             tls: { certPem: "", keyPem: "" },
-            onSession: (s) => sessions.push(s),
+            onSession: (s) => {
+                sessions.push(s);
+            },
         });
         await Bun.sleep(3000);
 

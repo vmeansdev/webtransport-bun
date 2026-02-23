@@ -2,6 +2,10 @@
 
 All metrics are exposed via `server.metricsSnapshot()` and `session.metricsSnapshot()`.
 
+## Prometheus export
+
+Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition format. See `docs/OPERATIONS.md` for scrape setup.
+
 ## Server metrics
 
 | Field | Type | Description |

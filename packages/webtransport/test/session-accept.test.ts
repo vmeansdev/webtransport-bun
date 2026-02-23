@@ -15,7 +15,9 @@ describe("session accept (P0-A)", () => {
         const server = createServer({
             port: 14440,
             tls: { certPem: "", keyPem: "" },
-            onSession: (s) => sessions.push(s),
+            onSession: (s) => {
+                sessions.push(s);
+            },
         });
         await Bun.sleep(6000);
 
@@ -38,7 +40,9 @@ describe("session accept (P0-A)", () => {
         const server = createServer({
             port: 14441,
             tls: { certPem: "", keyPem: "" },
-            onSession: (s) => sessions.push(s),
+            onSession: (s) => {
+                sessions.push(s);
+            },
         });
         await Bun.sleep(2000);
 

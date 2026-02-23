@@ -10,6 +10,7 @@
 | OS      | Arch  | Target         | Status    |
 |---------|-------|----------------|-----------|
 | macOS   | arm64 | darwin-arm64   | supported |
+| macOS   | x64   | darwin-x64     | supported |
 | Linux   | x64   | linux-x64      | supported |
 
 ## Node-API

@@ -36,11 +36,11 @@ console.log("[client] created");
 const payload = Buffer.from("hello");
 console.log("[client] writing");
 await new Promise<void>((resolve, reject) => {
-    bidi.write(payload, (err) => (err ? reject(err) : resolve()));
+    bidi.write(payload, (err: Error | null | undefined) => (err ? reject(err) : resolve()));
 });
 console.log("[client] write done");
 await new Promise<void>((resolve, reject) => {
-    bidi.end((err) => (err ? reject(err) : resolve()));
+    bidi.end((err: Error | null | undefined) => (err ? reject(err) : resolve()));
 });
 console.log("[client] end done, reading...");
 

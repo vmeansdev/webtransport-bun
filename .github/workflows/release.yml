@@ -12,8 +12,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x64
+            rust_target: ""
           - os: macos-latest
             target: darwin-arm64
+            rust_target: ""
+          - os: macos-latest
+            target: darwin-x64
+            rust_target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +27,13 @@ jobs:
         with:
           bun-version: "1.3.9"
       - name: Build native addon (${{ matrix.target }})
-        run: bun run build:native
+        run: |
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            rustup target add ${{ matrix.rust_target }}
+            bunx @napi-rs/cli build --cwd crates/native --platform --release --target ${{ matrix.rust_target }}
+          else
+            bun run build:native
+          fi
       - name: Prebuild + checksums
         run: |
           cd packages/webtransport && bun run prebuild

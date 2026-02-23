@@ -1,9 +1,41 @@
 /**
- * @webtransport-bun/webtransport
+ * @packageDocumentation
+ * @module @webtransport-bun/webtransport
  *
  * Production-ready WebTransport for Bun, backed by napi-rs + wtransport (Rust).
+ * Supports in-process server, client (Node API and W3C-style facade), datagrams, and streams.
  *
- * Public API surface — see docs/SPEC.md for authoritative contract.
+ * @example Node client (connect)
+ * ```ts
+ * import { connect, createServer } from "@webtransport-bun/webtransport";
+ * const session = await connect("https://127.0.0.1:4433", {
+ *   tls: { insecureSkipVerify: true },
+ *   limits: { handshakeTimeoutMs: 10_000 },
+ * });
+ * await session.sendDatagram(new Uint8Array([1, 2, 3]));
+ * const stream = await session.createBidirectionalStream();
+ * stream.write(Buffer.from("hello"));
+ * stream.end();
+ * session.close();
+ * ```
+ *
+ * @example W3C-style client (new WebTransport)
+ * ```ts
+ * import { WebTransport, createServer } from "@webtransport-bun/webtransport";
+ * const wt = new WebTransport("https://127.0.0.1:4433", {
+ *   tls: { insecureSkipVerify: true },
+ * });
+ * await wt.ready;
+ * const writer = wt.datagrams.writable.getWriter();
+ * await writer.write(new Uint8Array([1, 2, 3]));
+ * writer.releaseLock();
+ * const { readable, writable } = await wt.createBidirectionalStream();
+ * // ... use Web Streams ...
+ * wt.close({ closeCode: 1000, reason: "done" });
+ * ```
+ *
+ * @see docs/SPEC.md Authoritative API contract
+ * @see docs/PARITY_MATRIX.md W3C spec alignment
  */
 
 import type { Duplex, Readable, Writable } from "node:stream";
@@ -14,7 +46,10 @@ export type { Resettable, StopSendable } from "./streams.js";
 
 import { BidiStream, SendStream, RecvStream } from "./streams.js";
 
-// Re-export error codes and error class
+/**
+ * Stable error codes. Use with {@link WebTransportError.code} for programmatic handling.
+ * @see WebTransportError
+ */
 export {
     E_TLS,
     E_HANDSHAKE_TIMEOUT,
@@ -54,11 +89,15 @@ function toWebTransportError(err: unknown): WebTransportError {
 // TLS
 // ---------------------------------------------------------------------------
 
+/** TLS configuration for server (cert/key) or client (CA, SNI). */
 export type TlsOptions = {
+    /** PEM-encoded certificate (server) or CA (client). */
     certPem: string | Uint8Array;
+    /** PEM-encoded private key (server only). */
     keyPem: string | Uint8Array;
+    /** Optional CA PEM for client verification. */
     caPem?: string | Uint8Array;
-    /** SNI for client mode; for server, used in logs/metrics */
+    /** SNI for client mode; for server, used in logs/metrics. */
     serverName?: string;
 };
 
@@ -81,20 +120,23 @@ export type RateLimitOptions = {
 // Limits
 // ---------------------------------------------------------------------------
 
+/**
+ * Resource limits. Merge with {@link DEFAULT_LIMITS} for defaults.
+ * @see DEFAULT_LIMITS Default values (e.g. handshakeTimeoutMs: 10000, maxDatagramSize: 1200).
+ */
 export type LimitsOptions = {
     maxSessions: number;
     maxHandshakesInFlight: number;
     maxStreamsPerSessionBidi: number;
     maxStreamsPerSessionUni: number;
     maxStreamsGlobal: number;
-
-    /** Hard cap in bytes (also must respect negotiated max) */
+    /** Hard cap in bytes (also must respect negotiated max). Default 1200. */
     maxDatagramSize: number;
     maxQueuedBytesGlobal: number;
     maxQueuedBytesPerSession: number;
     maxQueuedBytesPerStream: number;
-
     backpressureTimeoutMs: number;
+    /** Connect handshake timeout. Default 10000. */
     handshakeTimeoutMs: number;
     idleTimeoutMs: number;
 };
@@ -145,8 +187,9 @@ export type LogEvent = {
 // Server options & interface
 // ---------------------------------------------------------------------------
 
+/** Options for {@link createServer}. Limits/rateLimits merge with defaults. */
 export type ServerOptions = {
-    host?: string; // default: 0.0.0.0
+    host?: string; /** @default "0.0.0.0" */
     port: number;
     tls: TlsOptions;
     limits?: Partial<LimitsOptions>;
@@ -162,6 +205,7 @@ export type ServerOptions = {
     debug?: boolean;
 };
 
+/** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
     readonly address: { host: string; port: number };
     close(): Promise<void>;
@@ -172,13 +216,17 @@ export interface WebTransportServer {
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
 // ---------------------------------------------------------------------------
 
-/** Browser-style close info: closeCode/reason (spec alignment) */
+/** Browser-style close info (W3C alignment). Used by {@link WebTransport.close} and {@link WebTransport.closed}. */
 export type WebTransportCloseInfo = {
     closeCode?: number;
     reason?: string;
 };
 
-/** Browser-style client options for WebTransport facade */
+/**
+ * Options for `new WebTransport(url, options)`.
+ * Unsupported: `allowPooling`, `requireUnreliable`, `serverCertificateHashes` (validated then rejected).
+ * Stream options `sendOrder`/`sendGroup` are rejected when passed to createBidirectionalStream/createUnidirectionalStream.
+ */
 export type WebTransportClientOptions = {
     serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>; // BufferSource = ArrayBuffer | ArrayBufferView
     allowPooling?: boolean;
@@ -196,11 +244,12 @@ export type WebTransportClientOptions = {
 // Client options (Node API)
 // ---------------------------------------------------------------------------
 
+/** Options for {@link connect} (Node client API). */
 export type ClientOptions = {
     tls?: {
         caPem?: string | Uint8Array;
         serverName?: string;
-        /** Dev only: skips server cert verification. Requires explicit `true`. Emits warning log. Never use in production. */
+        /** Dev only: skips server cert verification. Requires explicit `true`. Emits warning. Never use in production. */
         insecureSkipVerify?: boolean;
     };
     limits?: Partial<LimitsOptions>;
@@ -213,6 +262,7 @@ export type ClientOptions = {
 
 export type CloseInfo = { code?: number; reason?: string };
 
+/** Base session interface (server and client). Node streams; use toWebTransport for Web Streams. */
 export interface BaseSession {
     readonly id: string;
     readonly peer: { ip: string; port: number };
@@ -271,6 +321,71 @@ export type SessionMetricsSnapshot = {
     streamsActive: number;
     queuedBytes: number;
 };
+
+/** Prometheus metric name prefix. Override via env WEBTRANSPORT_METRICS_PREFIX. */
+export const METRICS_PREFIX = process.env.WEBTRANSPORT_METRICS_PREFIX ?? "webtransport_";
+
+/**
+ * Convert MetricsSnapshot to Prometheus exposition format (text).
+ * Gauges: sessions_active, handshakes_in_flight, streams_active, session_tasks_active, stream_tasks_active, queued_bytes_global.
+ * Counters: datagrams_in, datagrams_out, datagrams_dropped, backpressure_wait_total, backpressure_timeout_total, rate_limited_total, limit_exceeded_total.
+ *
+ * @example
+ * ```ts
+ * const snapshot = server.metricsSnapshot();
+ * const text = metricsToPrometheus(snapshot, { serverId: "main" });
+ * response.end(text); // Content-Type: text/plain; version=0.0.4
+ * ```
+ */
+export function metricsToPrometheus(
+    m: MetricsSnapshot,
+    labels?: Record<string, string>
+): string {
+    const l = labels ? "," + Object.entries(labels).map(([k, v]) => `${k}="${String(v).replace(/"/g, '\\"')}"`).join(",") : "";
+    const p = METRICS_PREFIX;
+    const lines: string[] = [
+        `# HELP ${p}sessions_active Current open sessions`,
+        `# TYPE ${p}sessions_active gauge`,
+        `${p}sessions_active${l} ${m.sessionsActive}`,
+        `# HELP ${p}handshakes_in_flight Handshakes in progress`,
+        `# TYPE ${p}handshakes_in_flight gauge`,
+        `${p}handshakes_in_flight${l} ${m.handshakesInFlight}`,
+        `# HELP ${p}streams_active Active streams`,
+        `# TYPE ${p}streams_active gauge`,
+        `${p}streams_active${l} ${m.streamsActive}`,
+        `# HELP ${p}session_tasks_active Internal session tasks`,
+        `# TYPE ${p}session_tasks_active gauge`,
+        `${p}session_tasks_active${l} ${m.sessionTasksActive}`,
+        `# HELP ${p}stream_tasks_active Internal stream tasks`,
+        `# TYPE ${p}stream_tasks_active gauge`,
+        `${p}stream_tasks_active${l} ${m.streamTasksActive}`,
+        `# HELP ${p}queued_bytes_global Bytes queued globally`,
+        `# TYPE ${p}queued_bytes_global gauge`,
+        `${p}queued_bytes_global${l} ${m.queuedBytesGlobal}`,
+        `# HELP ${p}datagrams_in Datagrams received`,
+        `# TYPE ${p}datagrams_in counter`,
+        `${p}datagrams_in${l} ${m.datagramsIn}`,
+        `# HELP ${p}datagrams_out Datagrams sent`,
+        `# TYPE ${p}datagrams_out counter`,
+        `${p}datagrams_out${l} ${m.datagramsOut}`,
+        `# HELP ${p}datagrams_dropped Datagrams dropped`,
+        `# TYPE ${p}datagrams_dropped counter`,
+        `${p}datagrams_dropped${l} ${m.datagramsDropped}`,
+        `# HELP ${p}backpressure_wait_total Times senders waited on backpressure`,
+        `# TYPE ${p}backpressure_wait_total counter`,
+        `${p}backpressure_wait_total${l} ${m.backpressureWaitCount}`,
+        `# HELP ${p}backpressure_timeout_total Times backpressure timeout fired`,
+        `# TYPE ${p}backpressure_timeout_total counter`,
+        `${p}backpressure_timeout_total${l} ${m.backpressureTimeoutCount}`,
+        `# HELP ${p}rate_limited_total Sessions rejected by rate limit`,
+        `# TYPE ${p}rate_limited_total counter`,
+        `${p}rate_limited_total${l} ${m.rateLimitedCount}`,
+        `# HELP ${p}limit_exceeded_total Sessions rejected (limits)`,
+        `# TYPE ${p}limit_exceeded_total counter`,
+        `${p}limit_exceeded_total${l} ${m.limitExceededCount}`,
+    ];
+    return lines.join("\n") + "\n";
+}
 
 // ---------------------------------------------------------------------------
 // Native addon loader
@@ -415,6 +530,25 @@ class NativeServerSession implements ServerSession {
 
 /**
  * Create an in-process WebTransport server.
+ *
+ * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
+ * @returns WebTransportServer with `address`, `close()`, and `metricsSnapshot()`.
+ * @throws Error if native addon is not loaded.
+ *
+ * @example
+ * ```ts
+ * const server = createServer({
+ *   port: 4433,
+ *   tls: { certPem: "...", keyPem: "..." },
+ *   onSession: async (session) => {
+ *     for await (const d of session.incomingDatagrams()) {
+ *       await session.sendDatagram(d);
+ *     }
+ *   },
+ * });
+ * // server.address.port
+ * await server.close();
+ * ```
  */
 export function createServer(opts: ServerOptions): WebTransportServer {
     if (!native) {
@@ -623,7 +757,25 @@ class NativeClientSession implements ClientSession {
 // ---------------------------------------------------------------------------
 
 /**
- * Connect to a WebTransport server (client mode).
+ * Connect to a WebTransport server (Node API).
+ *
+ * @param url - WebTransport URL (e.g. `https://host:port/path`).
+ * @param opts - Optional TLS, limits, and logging. Limits default per {@link DEFAULT_LIMITS}.
+ *   Use `tls.insecureSkipVerify: true` only for dev; emits a warning.
+ * @returns Promise that resolves to ClientSession when handshake completes.
+ * @throws WebTransportError with code `E_HANDSHAKE_TIMEOUT` if handshake exceeds `limits.handshakeTimeoutMs` (default 10s).
+ * @throws WebTransportError with code `E_TLS` on TLS failure.
+ *
+ * @example
+ * ```ts
+ * const session = await connect("https://127.0.0.1:4433", {
+ *   tls: { insecureSkipVerify: true },
+ *   limits: { handshakeTimeoutMs: 5000 },
+ * });
+ * await session.ready;
+ * await session.sendDatagram(new Uint8Array([1, 2, 3]));
+ * session.close({ code: 1000, reason: "done" });
+ * ```
  */
 export async function connect(url: string, opts?: ClientOptions): Promise<ClientSession> {
     if (!native) {
@@ -763,8 +915,23 @@ function toCloseInfo(info: CloseInfo): WebTransportCloseInfo {
 type WebTransportState = "connecting" | "connected" | "draining" | "closed" | "failed";
 
 /**
- * Browser-style WebTransport client. Constructor kicks off connection;
- * use `ready` to await handshake completion.
+ * Browser-style WebTransport client (W3C facade).
+ *
+ * Use `new WebTransport(url, options)` to connect, or `toWebTransport(session)` to wrap an existing
+ * {@link ClientSession}. Await {@link WebTransport.ready} before using datagrams/streams.
+ *
+ * Unsupported options (`allowPooling`, `requireUnreliable`, `sendOrder`, `sendGroup`,
+ * `serverCertificateHashes`) throw {@link WebTransportError} with code `E_INTERNAL`.
+ *
+ * @example
+ * ```ts
+ * const wt = new WebTransport("https://127.0.0.1:4433", { tls: { insecureSkipVerify: true } });
+ * await wt.ready;
+ * const { readable, writable } = await wt.createBidirectionalStream();
+ * writable.getWriter().write(new Uint8Array([1, 2, 3]));
+ * wt.close({ closeCode: 1000, reason: "done" });
+ * await wt.closed;
+ * ```
  */
 export class WebTransport {
     readonly #sessionPromise: Promise<ClientSession>;
@@ -814,18 +981,22 @@ export class WebTransport {
         this.#draining = this.#closed.then(() => {});
     }
 
+    /** Resolves when handshake completes. Rejects with WebTransportError on connect failure. */
     get ready(): Promise<void> {
         return this.#ready;
     }
 
+    /** Resolves with close info when session closes. Never rejects. */
     get closed(): Promise<WebTransportCloseInfo> {
         return this.#closed;
     }
 
+    /** Resolves when session is draining. Currently resolves with closed (partial parity). */
     get draining(): Promise<void> {
         return this.#draining;
     }
 
+    /** Datagram Web Streams (readable/writable). Throws E_SESSION_CLOSED after close. */
     get datagrams(): {
         readable: ReadableStream<Uint8Array>;
         writable: WritableStream<Uint8Array>;
@@ -836,6 +1007,7 @@ export class WebTransport {
         return this.#datagramsCache;
     }
 
+    /** Incoming bidirectional streams as ReadableStream of { readable, writable }. */
     get incomingBidirectionalStreams(): ReadableStream<{
         readable: ReadableStream<Uint8Array>;
         writable: WritableStream<Uint8Array>;
@@ -846,6 +1018,7 @@ export class WebTransport {
         return this.#incomingBidiCache;
     }
 
+    /** Incoming unidirectional streams as ReadableStream of ReadableStream. */
     get incomingUnidirectionalStreams(): ReadableStream<ReadableStream<Uint8Array>> {
         if (!this.#incomingUniCache) {
             this.#incomingUniCache = createIncomingUniStreams(this);
@@ -853,6 +1026,10 @@ export class WebTransport {
         return this.#incomingUniCache;
     }
 
+    /**
+     * Create a bidirectional stream (Web Streams). Rejects sendOrder/sendGroup (unsupported).
+     * @throws WebTransportError E_SESSION_CLOSED if session is closed/draining/failed.
+     */
     async createBidirectionalStream(
         options?: { sendOrder?: number; sendGroup?: number }
     ): Promise<{
@@ -869,6 +1046,10 @@ export class WebTransport {
         return nodeDuplexToWebBidi(duplex);
     }
 
+    /**
+     * Create a unidirectional send stream (WritableStream). Rejects sendOrder/sendGroup (unsupported).
+     * @throws WebTransportError E_SESSION_CLOSED if session is closed/draining/failed.
+     */
     async createUnidirectionalStream(
         options?: { sendOrder?: number; sendGroup?: number }
     ): Promise<WritableStream<Uint8Array>> {
@@ -882,6 +1063,7 @@ export class WebTransport {
         return nodeWritableToWebWritable(writable);
     }
 
+    /** Initiate graceful close. Idempotent after first call. */
     close(info?: WebTransportCloseInfo): void {
         if (this.#state === "connected" || this.#state === "connecting") {
             this.#state = "draining";
@@ -990,7 +1172,23 @@ function nodeWritableToWebWritable(w: Writable): WritableStream<Uint8Array> {
 }
 
 /**
- * Adapter: wrap an existing ClientSession as a browser-style WebTransport.
+ * Wrap an existing {@link ClientSession} as a browser-style WebTransport.
+ *
+ * Use when you obtained a session via {@link connect} but want Web Streams and W3C-style API.
+ *
+ * @param session - Connected ClientSession from {@link connect}.
+ * @returns WebTransport with same lifecycle; `ready` resolves immediately if session is connected.
+ *
+ * @example
+ * ```ts
+ * const session = await connect("https://127.0.0.1:4433", { tls: { insecureSkipVerify: true } });
+ * const wt = toWebTransport(session);
+ * await wt.ready;
+ * const writer = wt.datagrams.writable.getWriter();
+ * await writer.write(new Uint8Array([1, 2, 3]));
+ * writer.releaseLock();
+ * session.close();
+ * ```
  */
 export function toWebTransport(session: ClientSession): WebTransport {
     return new WebTransport(session);

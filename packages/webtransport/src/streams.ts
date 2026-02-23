@@ -11,11 +11,20 @@
 import { Duplex, Readable, Writable } from "node:stream";
 import type { DuplexOptions, ReadableOptions, WritableOptions } from "node:stream";
 
-/** Symbol-based stream control — avoids name collisions with Node stream API */
+/**
+ * Symbol to call stream reset (abort receiving). Use on BidiStream, SendStream, RecvStream.
+ * @example `(stream as Resettable)[WT_RESET](code)`
+ */
 export const WT_RESET: unique symbol = Symbol("WT_RESET");
+/**
+ * Symbol to send stopSending (abort sending). Use on BidiStream, RecvStream.
+ * @example `(stream as StopSendable)[WT_STOP_SENDING](code)`
+ */
 export const WT_STOP_SENDING: unique symbol = Symbol("WT_STOP_SENDING");
 
+/** Stream that supports reset via WT_RESET. */
 export type Resettable = { [WT_RESET](code?: number): void };
+/** Stream that supports stopSending via WT_STOP_SENDING. */
 export type StopSendable = { [WT_STOP_SENDING](code?: number): void };
 
 // ---------------------------------------------------------------------------

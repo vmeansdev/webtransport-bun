@@ -13,7 +13,7 @@ Production-focused WebTransport for Bun, implemented as a Node-API addon (`napi-
 - Bun `>= 1.3.9`
 
 ### OS / Arch
-- macOS arm64 (`darwin-arm64`)
+- macOS arm64 (`darwin-arm64`), macOS x64 (`darwin-x64`)
 - Linux x64 (`linux-x64`)
 
 See `docs/COMPATIBILITY.md` for policy details.
@@ -42,6 +42,7 @@ bun run build:native
 import { createServer } from "@webtransport-bun/webtransport";
 import { readFileSync } from "node:fs";
 
+// Dev: use tools/interop/certs/ after `cd tools/interop && bun run prepare:interop`
 const certPem = readFileSync("./cert.pem", "utf-8");
 const keyPem = readFileSync("./key.pem", "utf-8");
 
@@ -140,6 +141,7 @@ bun run test:load-addon
 bun run test:overload-addon
 SOAK_DURATION=120 bun run test:soak-addon
 bun run test:interop
+bun tools/smoke-readme.ts   # README snippet smoke
 ```
 
 ## Operational Caveats

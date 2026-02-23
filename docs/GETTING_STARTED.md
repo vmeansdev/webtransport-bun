@@ -6,6 +6,7 @@
 import { createServer } from "@webtransport-bun/webtransport";
 import * as fs from "node:fs";
 
+// Dev certs: cd tools/interop && bun run prepare:interop, then use tools/interop/certs/cert.pem
 const certPem = fs.readFileSync("cert.pem", "utf-8");
 const keyPem = fs.readFileSync("key.pem", "utf-8");
 

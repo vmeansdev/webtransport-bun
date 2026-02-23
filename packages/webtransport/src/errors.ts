@@ -1,18 +1,29 @@
 /**
- * Stable error codes for WebTransport operations.
- * These codes are part of the public API contract (AGENTS.md / docs/SPEC.md).
+ * Stable error codes for WebTransport operations (AGENTS.md / docs/SPEC.md).
+ * Use with WebTransportError.code for programmatic handling.
  */
 
+/** TLS/certificate failure. */
 export const E_TLS = "E_TLS";
+/** Connection handshake timed out (limits.handshakeTimeoutMs). */
 export const E_HANDSHAKE_TIMEOUT = "E_HANDSHAKE_TIMEOUT";
+/** Session already closed or in invalid state. */
 export const E_SESSION_CLOSED = "E_SESSION_CLOSED";
+/** Session idle timeout exceeded. */
 export const E_SESSION_IDLE_TIMEOUT = "E_SESSION_IDLE_TIMEOUT";
+/** Stream was reset by peer. */
 export const E_STREAM_RESET = "E_STREAM_RESET";
+/** Peer sent stopSending. */
 export const E_STOP_SENDING = "E_STOP_SENDING";
+/** Queue/buffer full (backpressure). */
 export const E_QUEUE_FULL = "E_QUEUE_FULL";
+/** Backpressure wait exceeded timeout. */
 export const E_BACKPRESSURE_TIMEOUT = "E_BACKPRESSURE_TIMEOUT";
+/** Resource limit exceeded. */
 export const E_LIMIT_EXCEEDED = "E_LIMIT_EXCEEDED";
+/** Rate limit (token bucket) exceeded. */
 export const E_RATE_LIMITED = "E_RATE_LIMITED";
+/** Internal/unsupported option or unexpected error. */
 export const E_INTERNAL = "E_INTERNAL";
 
 export type ErrorCode =
