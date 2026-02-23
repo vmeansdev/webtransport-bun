@@ -11,7 +11,8 @@
 | Target           | Runner         | Architecture |
 |------------------|----------------|--------------|
 | `darwin-arm64`   | `macos-latest` | aarch64      |
-| `linux-x64`     | `ubuntu-latest`| x86_64       |
+| `darwin-x64`     | `macos-latest` | x86_64       |
+| `linux-x64`      | `ubuntu-latest`| x86_64       |
 
 ## Workflows
 
@@ -23,13 +24,15 @@
 2. Build native addon + install deps
 3. Typecheck (`bun run typecheck`)
 4. Unit tests (`bun test packages/`)
-5. Build reference + load-client
-6. Load-addon test (`bun run test:load-addon`)
-7. Load-scale-addon (200 sessions, 30s)
-8. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
-9. Overload-addon test (`bun run test:overload-addon`)
-10. Interop — Playwright Chromium (`bun run playwright test`)
-11. Smoke test — `bun add` from built package
+5. Parity tests (`bun run test:parity`)
+6. Build reference + load-client
+7. Load-addon test (`bun run test:load-addon`)
+8. Load-scale-addon (200 sessions, 30s)
+9. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
+10. Overload-addon test (`bun run test:overload-addon`)
+11. Load profiles (`bun run test:load-profiles-addon`)
+12. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
+13. Smoke test — `bun add` from built package
 
 **soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/24h/72h) — trigger via workflow_dispatch; writes soak-artifacts.json
 
@@ -41,7 +44,7 @@
 2. **codeql** — CodeQL analysis (JS/TS + Rust)
 
 3. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
-4. **build** — matrix: `{linux-x64, darwin-arm64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
+4. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
 5. **release** — needs [build, interop]; downloads prebuilds + interop evidence, creates GitHub release with release notes
 6. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
    - Runs on tag pushes only when repo variable `NPM_TRUSTED_PUBLISHING` is set to `true`

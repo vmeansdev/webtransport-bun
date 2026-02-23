@@ -283,8 +283,12 @@ cargo clippy --workspace -- -D clippy::all
 cargo test --workspace
 bun run typecheck
 bun test packages/
+bun run test:parity
 bun run test:load-addon
+bun run test:load-scale-addon
 bun run test:overload-addon
+bun run test:load-profiles-addon
+BENCH_P95_MAX_MS=500 bun run bench:handshake
 SOAK_DURATION=120 bun run test:soak-addon
 bun run test:interop
 bun tools/smoke-readme.ts
