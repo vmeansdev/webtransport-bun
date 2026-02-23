@@ -28,6 +28,7 @@
 ### Observability invariants (unit tests)
 - `queuedBytesGlobal` drains to near-zero after all clients close
 - `sessionTasksActive` and `streamTasksActive` drain to zero after all clients close
+- `drain.test.ts` — stream+datagram stress burst drain, abandoned iterator drain, repeated open/close stress loop (no hang), server close while clients active
 - `E_LIMIT_EXCEEDED` returned when server-created stream caps are exceeded
 - `E_QUEUE_FULL` returned on oversized datagram
 - `E_BACKPRESSURE_TIMEOUT` returned under saturation with short timeout
