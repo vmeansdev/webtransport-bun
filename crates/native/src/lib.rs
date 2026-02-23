@@ -6,7 +6,7 @@
 
 use napi_derive::napi;
 use once_cell::sync::Lazy;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
@@ -78,34 +78,46 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LOG_REDACTION_ENABLED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(true));
+
+#[napi]
+pub fn set_log_redaction_enabled(enabled: bool) {
+    LOG_REDACTION_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     level: &str,
-    _msg: &str,
-    _session_id: Option<&str>,
-    _peer_ip: Option<&str>,
-    _peer_port: Option<u32>,
+    msg: &str,
+    session_id: Option<&str>,
+    peer_ip: Option<&str>,
+    peer_port: Option<u32>,
 ) {
     // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
     if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
-    let redacted_msg = match level {
-        "error" => "native error (redacted)",
-        "warn" => "native warning (redacted)",
-        "info" => "native info",
-        "debug" => "native debug",
-        _ => "native event",
+    let redact = LOG_REDACTION_ENABLED.load(Ordering::Relaxed);
+    let out_msg = if redact {
+        match level {
+            "error" => "native error (redacted)",
+            "warn" => "native warning (redacted)",
+            "info" => "native info",
+            "debug" => "native debug",
+            _ => "native event",
+        }
+        .to_string()
+    } else {
+        msg.to_string()
     };
     if let Some(tx) = tx {
         let _ = tx.try_send(LogEvent {
             level: level.to_string(),
-            msg: redacted_msg.to_string(),
-            session_id: None,
-            peer_ip: None,
-            peer_port: None,
+            msg: out_msg,
+            session_id: if redact { None } else { session_id.map(String::from) },
+            peer_ip: if redact { None } else { peer_ip.map(String::from) },
+            peer_port: if redact { None } else { peer_port },
         });
     }
 }

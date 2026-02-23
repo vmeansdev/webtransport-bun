@@ -585,6 +585,14 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     if (!native) {
         throw new Error("Native addon not loaded");
     }
+    // Default is redacted native log payloads; debug mode explicitly opts in
+    // to full log details for local diagnosis.
+    const redactLogs = opts.debug !== true;
+    if (typeof native.set_log_redaction_enabled === "function") {
+        native.set_log_redaction_enabled(redactLogs);
+    } else if (typeof native.setLogRedactionEnabled === "function") {
+        native.setLogRedactionEnabled(redactLogs);
+    }
 
     const certPem = typeof opts.tls.certPem === "string" ? opts.tls.certPem : new TextDecoder().decode(opts.tls.certPem);
     const keyPem = typeof opts.tls.keyPem === "string" ? opts.tls.keyPem : new TextDecoder().decode(opts.tls.keyPem);
