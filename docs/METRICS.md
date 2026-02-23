@@ -54,9 +54,13 @@ createServer({
 });
 ```
 
+Security default:
+- Native log payloads are **redacted by default** (`msg`, `sessionId`, `peerIp`, `peerPort` may be sanitized/omitted).
+
 ## Debug mode
 
-Set `debug: true` and provide a log hook that emits all levels:
+Set `debug: true` and provide a log hook that emits all levels. This opts in to detailed
+native diagnostics (including panic payload details) for local debugging:
 
 ```ts
 createServer({

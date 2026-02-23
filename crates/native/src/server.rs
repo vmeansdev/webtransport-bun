@@ -25,6 +25,7 @@ impl ServerHandle {
         _env: Env,
         port: u32,
         host: String,
+        debug: bool,
         cert_pem: String,
         key_pem: String,
         ca_pem: String,
@@ -105,6 +106,7 @@ impl ServerHandle {
             let metrics = Arc::new(ServerMetrics::default());
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
+            crate::panic_guard::set_panic_log_verbose(debug);
             let (shutdown_tx, shutdown_rx) = watch::channel(());
             let metrics_clone = Arc::clone(&metrics);
             let port_u16 = port.min(65535) as u16;
@@ -119,6 +121,7 @@ impl ServerHandle {
                 log_tx,
                 cert_pem,
                 key_pem,
+                debug,
             );
             Ok(Self {
                 port,

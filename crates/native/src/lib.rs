@@ -6,7 +6,7 @@
 
 use napi_derive::napi;
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
@@ -78,15 +78,10 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-static LOG_REDACTION_ENABLED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(true));
-
-#[napi]
-pub fn set_log_redaction_enabled(enabled: bool) {
-    LOG_REDACTION_ENABLED.store(enabled, Ordering::Relaxed);
-}
 
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
+    redact: bool,
     level: &str,
     msg: &str,
     session_id: Option<&str>,
@@ -98,7 +93,6 @@ fn emit_log(
     if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
-    let redact = LOG_REDACTION_ENABLED.load(Ordering::Relaxed);
     let out_msg = if redact {
         match level {
             "error" => "native error (redacted)",
@@ -206,6 +200,13 @@ pub fn runtime_worker_count() -> u32 {
     .unwrap_or(0)
 }
 
+/// Controls whether panic diagnostics include full panic payloads.
+/// Default is false (redacted/minimal). Enable only for local debugging.
+#[napi]
+pub fn set_panic_log_verbose(enabled: bool) {
+    panic_guard::set_panic_log_verbose(enabled);
+}
+
 fn extract_close_info(err: &wtransport::error::ConnectionError) -> (Option<u32>, Option<String>) {
     match err {
         wtransport::error::ConnectionError::ApplicationClosed(close) => {
@@ -236,6 +237,7 @@ pub(crate) fn spawn_wtransport_server(
     log_tx: Option<tokio::sync::mpsc::Sender<LogEvent>>,
     cert_pem: String,
     key_pem: String,
+    debug_logs: bool,
 ) {
     use std::io::Write;
     use std::sync::atomic::Ordering;
@@ -261,7 +263,7 @@ pub(crate) fn spawn_wtransport_server(
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        emit_log(&log_tx, "error", &format!("failed to create temp cert file: {:?}", e), None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to create temp cert file: {:?}", e), None, None, None);
                         return;
                     }
                 };
@@ -275,7 +277,7 @@ pub(crate) fn spawn_wtransport_server(
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        emit_log(&log_tx, "error", &format!("failed to create temp key file: {:?}", e), None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to create temp key file: {:?}", e), None, None, None);
                         return;
                     }
                 };
@@ -289,7 +291,7 @@ pub(crate) fn spawn_wtransport_server(
                         i
                     }
                     Err(e) => {
-                        emit_log(&log_tx, "error", &format!("failed to load PEM identity: {:?}", e), None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to load PEM identity: {:?}", e), None, None, None);
                         return;
                     }
                 }
@@ -297,7 +299,7 @@ pub(crate) fn spawn_wtransport_server(
                 match Identity::self_signed(["localhost", "127.0.0.1", "::1"]) {
                     Ok(i) => i,
                     Err(e) => {
-                        emit_log(&log_tx, "error", &format!("failed to create identity: {:?}", e), None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to create identity: {:?}", e), None, None, None);
                         return;
                     }
                 }
@@ -315,11 +317,11 @@ pub(crate) fn spawn_wtransport_server(
                 .build();
             let server = match Endpoint::server(config) {
                 Ok(s) => {
-                    emit_log(&log_tx, "info", &format!("endpoint created for port {}", port), None, None, None);
+                    emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
                     s
                 }
                 Err(e) => {
-                    emit_log(&log_tx, "error", &format!("failed to create endpoint: {:?}", e), None, None, None);
+                    emit_log(&log_tx, !debug_logs, "error", &format!("failed to create endpoint: {:?}", e), None, None, None);
                     return;
                 }
             };
@@ -344,7 +346,7 @@ pub(crate) fn spawn_wtransport_server(
                                 metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
-                                        emit_log(&ltx, "debug", &format!("CONNECT received authority={:?}", r.authority()), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "debug", &format!("CONNECT received authority={:?}", r.authority()), None, None, None);
                                         r
                                     }
                                     Err(e) => {
@@ -357,7 +359,7 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, "warn", &format!("handshake failed (incoming_session): {}", chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", &format!("handshake failed (incoming_session): {}", chain), None, None, None);
                                         return;
                                     }
                                 };
@@ -366,13 +368,13 @@ pub(crate) fn spawn_wtransport_server(
                                 {
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
+                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
                                     return;
                                 }
                                 if metrics.sessions_active.load(Ordering::Relaxed) >= limits.max_sessions {
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, "warn", "limit exceeded: maxSessions", None, None, None);
+                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, None, None);
                                     return;
                                 }
                                 let authority = session_request.authority().to_string();
@@ -388,7 +390,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Ok(r) => r,
                                     Err(_) => {
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        emit_log(&ltx, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
                                     }
                                 };
@@ -396,7 +398,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Ok(connection) => {
                                         let peer_ip = connection.remote_address().ip().to_string();
                                         let peer_port = connection.remote_address().port() as u32;
-                                        emit_log(&ltx, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
+                                        emit_log(&ltx, !debug_logs, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
                                         if !rate_limit::try_acquire_handshake(
                                             &peer_ip,
                                             rate_limits.handshakes_per_sec,
@@ -404,7 +406,7 @@ pub(crate) fn spawn_wtransport_server(
                                         ) {
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                            emit_log(&ltx, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
+                                            emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
                                             return;
                                         }
                                         if !rate_limit::try_acquire_per_ip_session_with_prefix(
@@ -414,7 +416,7 @@ pub(crate) fn spawn_wtransport_server(
                                         ) {
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                            emit_log(&ltx, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
+                                            emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
                                             return;
                                         }
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -752,7 +754,7 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, "error", &format!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "error", &format!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
                                     }
                                 }
                             },

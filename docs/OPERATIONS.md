@@ -108,6 +108,12 @@ When `queuedBytesGlobal` rises and stays high:
 - verify batching enabled
 - reduce per-message overhead (larger chunk sizes, fewer crossings)
 
+## Diagnostics modes
+
+- **Default (recommended for production):** native diagnostics are redacted/minimal.
+- **Debug mode:** set `createServer({ debug: true, ... })` to enable detailed native logs and panic diagnostics.
+  Do not enable in untrusted or compliance-sensitive environments.
+
 ## Tuning guide
 
 - **Low latency**: reduce maxQueuedBytesPerStream, use smaller datagrams, lower backpressureTimeoutMs

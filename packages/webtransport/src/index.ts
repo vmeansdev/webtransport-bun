@@ -209,7 +209,7 @@ export type ServerOptions = {
     /** Optional logging hook */
     log?: (event: LogEvent) => void;
 
-    /** Debug mode: increases log verbosity without changing semantics */
+    /** Debug mode: enables detailed native diagnostics/log payloads (redaction off). */
     debug?: boolean;
 };
 
@@ -585,14 +585,6 @@ export function createServer(opts: ServerOptions): WebTransportServer {
     if (!native) {
         throw new Error("Native addon not loaded");
     }
-    // Default is redacted native log payloads; debug mode explicitly opts in
-    // to full log details for local diagnosis.
-    const redactLogs = opts.debug !== true;
-    if (typeof native.set_log_redaction_enabled === "function") {
-        native.set_log_redaction_enabled(redactLogs);
-    } else if (typeof native.setLogRedactionEnabled === "function") {
-        native.setLogRedactionEnabled(redactLogs);
-    }
 
     const certPem = typeof opts.tls.certPem === "string" ? opts.tls.certPem : new TextDecoder().decode(opts.tls.certPem);
     const keyPem = typeof opts.tls.keyPem === "string" ? opts.tls.keyPem : new TextDecoder().decode(opts.tls.keyPem);
@@ -623,7 +615,16 @@ export function createServer(opts: ServerOptions): WebTransportServer {
         }
     };
 
-    const handle = new native.ServerHandle(opts.port, opts.host ?? "0.0.0.0", certPem, keyPem, caPem, limitsJson, rateLimitsJson, (events: any[]) => {
+    const handle = new native.ServerHandle(
+        opts.port,
+        opts.host ?? "0.0.0.0",
+        opts.debug === true,
+        certPem,
+        keyPem,
+        caPem,
+        limitsJson,
+        rateLimitsJson,
+        (events: any[]) => {
         for (const evt of events) {
             if (evt.name === "session" && evt.id != null && evt.peerIp != null && evt.peerPort != null) {
                 let closedResolve!: (info: CloseInfo) => void;
@@ -644,7 +645,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
                 if (resolve) resolve({ code: evt.code, reason: evt.reason });
             }
         }
-    }, logCallback);
+        },
+        logCallback,
+    );
 
     function onSessionCallbackDone() {
         activeOnSessionCallbacks--;

@@ -3,8 +3,14 @@
 
 use napi::Result;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const E_INTERNAL_PREFIX: &str = "E_INTERNAL: ";
+static PANIC_LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_panic_log_verbose(enabled: bool) {
+    PANIC_LOG_VERBOSE.store(enabled, Ordering::Relaxed);
+}
 
 /// Run a closure, catching panics and converting to `Err(E_INTERNAL: ...)`.
 /// Logs the panic for debugging.
@@ -20,10 +26,20 @@ where
                 .map(|s| (*s).to_string())
                 .or_else(|| panic_any.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "panic (no message)".to_string());
-            eprintln!("webtransport-native: panic contained: {}", msg);
+            let verbose = PANIC_LOG_VERBOSE.load(Ordering::Relaxed);
+            if verbose {
+                eprintln!("webtransport-native: panic contained: {}", msg);
+            } else {
+                eprintln!("webtransport-native: panic contained");
+            }
+            let out_msg = if verbose {
+                msg
+            } else {
+                "panic (redacted)".to_string()
+            };
             Err(napi::Error::from_reason(format!(
                 "{}{}",
-                E_INTERNAL_PREFIX, msg
+                E_INTERNAL_PREFIX, out_msg
             )))
         }
     }
@@ -40,10 +56,14 @@ where
     tokio::task::spawn(async move {
         if let Err(e) = handle.await {
             if e.is_panic() {
-                eprintln!(
-                    "webtransport-native: QUIC task panicked (contained): {:?}",
-                    e
-                );
+                if PANIC_LOG_VERBOSE.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "webtransport-native: QUIC task panicked (contained): {:?}",
+                        e
+                    );
+                } else {
+                    eprintln!("webtransport-native: QUIC task panicked (contained)");
+                }
                 crate::session_registry::close_all(0, b"panic teardown");
             }
         }
