@@ -1,6 +1,23 @@
 {
   "name": "@webtransport-bun/webtransport",
   "version": "0.1.0",
+  "description": "Production-focused WebTransport for Bun with datagrams and streams via a Rust napi-rs addon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vmeansdev/webtransport-bun.git"
+  },
+  "homepage": "https://github.com/vmeansdev/webtransport-bun#readme",
+  "bugs": {
+    "url": "https://github.com/vmeansdev/webtransport-bun/issues"
+  },
+  "keywords": [
+    "bun",
+    "webtransport",
+    "quic",
+    "napi-rs",
+    "realtime"
+  ],
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",

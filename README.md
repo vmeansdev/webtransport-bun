@@ -2,7 +2,7 @@
   <img src="docs/brand/logo-wordmark-a-single-light.svg" alt="webtransport-bun logo" />
 </p>
 
-Production-ready WebTransport for Bun, delivered as a Node-API addon (`napi-rs`) backed by Rust `wtransport`.
+WebTransport for Bun with production guardrails: datagrams + streams, in-process server/client, and Chromium interop backed by Rust `wtransport` via `napi-rs`.
 
 <p>
   <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml/badge.svg" alt="CI" /></a>
@@ -11,35 +11,81 @@ Production-ready WebTransport for Bun, delivered as a Node-API addon (`napi-rs`)
   <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml/badge.svg" alt="Trivy" /></a>
 </p>
 
-## Why try this project?
-- Bun-first WebTransport with in-process server and client.
-- Practical API for real backends: datagrams + uni/bidi streams.
-- Rust transport core with JS ergonomics.
-- Explicit production defaults for backpressure, limits, and abuse resistance.
-- Clear docs for operations, CI, and test gates.
+## Why Try This
 
-## Why this is good
-- It is engineered around bounded memory, deterministic shutdown, and queue discipline.
-- It treats backpressure as a first-class runtime behavior, not an afterthought.
-- It supports both low-level session APIs and a W3C-like facade.
-- It includes interop testing against Chromium clients, not only local mocks.
-- It is aligned with Bun packaging and native prebuild distribution expectations.
+`webtransport-bun` is for Bun teams that need realtime transport beyond WebSockets without giving up JS/Bun ergonomics.
 
-## Alternatives
+- Mix unreliable low-latency traffic and reliable ordered traffic in one session.
+- Run WebTransport server and client in-process in Bun.
+- Keep ops predictable with queue/memory/rate limits and backpressure timeouts.
+- Use browser clients (Chromium interop tested in CI).
 
-Pick this project when you need Bun-native, in-process server + client with strong operational defaults.
+## Who This Is For
 
-| Alternative | Good at | Tradeoff vs `webtransport-bun` |
-|---|---|---|
-| Browser-native WebTransport only | Direct browser usage | No Bun server runtime for your app process |
-| Node QUIC/WebTransport ecosystem packages | Node-focused integration | Bun fit, packaging, and runtime semantics can differ |
-| Building directly on Rust QUIC stacks (`wtransport`, `quinn`) | Maximum protocol control | You build/maintain JS bindings and API surface yourself |
-| HTTP/2 + WebSocket stacks | Ubiquitous infra support | Different transport model and performance profile from WebTransport/QUIC |
+- Teams building collaboration/presence workloads with high update rates.
+- Multiplayer or telemetry-heavy backends where packet loss tolerance matters.
+- Services moving from WebSockets to QUIC/WebTransport while staying in Bun.
+- Systems needing streams for commands/state sync and datagrams for fast signals.
+
+## Who This Is Not For
+
+- Projects requiring Windows support.
+- Teams needing full browser WebTransport spec parity.
+- Cases where plain WebSockets are fully sufficient and simpler to operate.
+
+## Use Cases
+
+- Collaboration and presence: cursors/typing over datagrams, edits/events over streams.
+- Multiplayer and game telemetry: frequent state deltas + reliable control channels.
+- IoT / high-frequency ingest: lossy telemetry + reliable config/ack flows.
+- Realtime AI/control channels: low-latency control messages + reliable command streams.
+
+## Feature Matrix
+
+| Capability | `webtransport-bun` | WebSocket stacks | Raw QUIC libs (`wtransport`/`quinn`) |
+|---|---|---|---|
+| Bun in-process server | Yes | Yes | No (requires custom bindings/service) |
+| Bun in-process client | Yes | Yes | No (requires custom bindings/service) |
+| Datagram + stream model | Yes | No (single reliable channel) | Yes |
+| Browser WebTransport interop | Yes (Chromium-tested) | No | Indirect/custom |
+| Operational defaults (limits, abuse controls) | Yes | Varies by app | You build it |
+| JS-first API surface | Yes | Yes | No |
+
+## Benchmarks
+
+Benchmark baselines and methodology:
+- `docs/BENCHMARK_BASELINES.md`
+
+Reproducible commands:
+
+```bash
+bun run bench:datagram
+bun run bench:handshake
+bun run bench:stream
+bun run bench:baseline
+```
+
+## Migration From WebSocket (Quick Guide)
+
+| Existing WebSocket pattern | WebTransport channel in `webtransport-bun` |
+|---|---|
+| Presence pings / cursors / telemetry | Datagrams |
+| Chat / reliable app events | Bidirectional stream |
+| Server snapshots / state dumps | Unidirectional stream from server |
+| Single-message envelope for all traffic | Split by semantics: datagram vs stream |
+
+## Demo
+
+- Local interactive demo: `examples/echo-playground`
+- Multi-node compose demo: `examples/compose-collab`
+- Recommended short walkthrough to record/share: run compose demo + open `http://localhost:8080/` dashboard.
 
 ## Status
 - In active hardening.
+- Version: `0.1.0` (beta).
 - Primary target runtime: Bun (`>= 1.3.9`).
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
+- Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.1.x`.
 
 ## Support Matrix
 
@@ -54,12 +100,12 @@ See `docs/COMPATIBILITY.md` for policy details.
 
 ## Install
 
-### From package (when published)
+### From package
 ```bash
 bun add @webtransport-bun/webtransport
 ```
 
-### From local workspace
+### From local workspace (development)
 ```bash
 bun add file:./packages/webtransport
 ```
@@ -97,9 +143,9 @@ bun run example:compose:collab
 
 ## Quickstart
 
-### 1) Build native addon
+### 1) Install package
 ```bash
-bun run build:native
+bun add @webtransport-bun/webtransport
 ```
 
 ### 2) Start a server
@@ -166,6 +212,15 @@ wt.close({ closeCode: 1000, reason: "done" });
 await wt.closed;
 ```
 
+## From Source (Local Development)
+
+When running directly from this monorepo:
+
+```bash
+bun install
+bun run build:native
+```
+
 ## Stream Controls
 
 The stream helpers are symbol-based to avoid collisions with Node stream APIs:
@@ -221,6 +276,17 @@ See `docs/OPERATIONS.md` for runbooks.
 - CI and release flow: `docs/CI.md`
 - Operations runbooks: `docs/OPERATIONS.md`
 - Compatibility policy: `docs/COMPATIBILITY.md`
+
+## Used By
+
+Using this in production? Let me know and I will list your company/project.
+
+- Adopters list: `ADOPTERS.md`
+- Add yourself via issue: `.github/ISSUE_TEMPLATE/add-adopter.md`
+
+## License
+
+MIT. See `LICENSE`.
 
 ## Contributing
 See `CONTRIBUTING.md`.
