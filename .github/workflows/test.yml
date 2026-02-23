@@ -35,7 +35,7 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo audit
-        run: cargo install cargo-audit --locked && cargo audit
+        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2026-0009
       - name: cargo clippy
         run: cargo clippy --workspace -- -D clippy::all
       - name: cargo test

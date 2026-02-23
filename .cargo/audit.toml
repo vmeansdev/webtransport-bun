@@ -1,0 +1,8 @@
+# cargo-audit policy for CI.
+# Temporary exception for transitive advisory until upstream stack
+# (wtransport/rcgen/time) is bumped in lockfile.
+
+[advisories]
+ignore = [
+  "RUSTSEC-2026-0009",
+]
