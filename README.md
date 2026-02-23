@@ -1,10 +1,44 @@
-# webtransport-bun
+<p>
+  <img src="docs/brand/logo-wordmark-a-single-light.svg" alt="webtransport-bun logo" />
+</p>
 
-Production-focused WebTransport for Bun, implemented as a Node-API addon (`napi-rs`) backed by Rust `wtransport`.
+Production-ready WebTransport for Bun, delivered as a Node-API addon (`napi-rs`) backed by Rust `wtransport`.
+
+<p>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/release.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/release.yml/badge.svg" alt="Release" /></a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/codeql.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/codeql.yml/badge.svg" alt="CodeQL" /></a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml/badge.svg" alt="Trivy" /></a>
+</p>
+
+## Why try this project?
+- Bun-first WebTransport with in-process server and client.
+- Practical API for real backends: datagrams + uni/bidi streams.
+- Rust transport core with JS ergonomics.
+- Explicit production defaults for backpressure, limits, and abuse resistance.
+- Clear docs for operations, CI, and test gates.
+
+## Why this is good
+- It is engineered around bounded memory, deterministic shutdown, and queue discipline.
+- It treats backpressure as a first-class runtime behavior, not an afterthought.
+- It supports both low-level session APIs and a W3C-like facade.
+- It includes interop testing against Chromium clients, not only local mocks.
+- It is aligned with Bun packaging and native prebuild distribution expectations.
+
+## Alternatives
+
+Pick this project when you need Bun-native, in-process server + client with strong operational defaults.
+
+| Alternative | Good at | Tradeoff vs `webtransport-bun` |
+|---|---|---|
+| Browser-native WebTransport only | Direct browser usage | No Bun server runtime for your app process |
+| Node QUIC/WebTransport ecosystem packages | Node-focused integration | Bun fit, packaging, and runtime semantics can differ |
+| Building directly on Rust QUIC stacks (`wtransport`, `quinn`) | Maximum protocol control | You build/maintain JS bindings and API surface yourself |
+| HTTP/2 + WebSocket stacks | Ubiquitous infra support | Different transport model and performance profile from WebTransport/QUIC |
 
 ## Status
 - In active hardening.
-- Primary target runtime: Bun.
+- Primary target runtime: Bun (`>= 1.3.9`).
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
 
 ## Support Matrix
@@ -104,13 +138,11 @@ await wt.closed;
 ## Stream Controls
 
 The stream helpers are symbol-based to avoid collisions with Node stream APIs:
-
 - `WT_RESET`
 - `WT_STOP_SENDING`
 
-Example:
 ```ts
-import { WT_RESET, WT_STOP_SENDING } from "@webtransport-bun/webtransport";
+import { WT_RESET } from "@webtransport-bun/webtransport";
 
 const bidi = await session.createBidirectionalStream();
 bidi[WT_RESET](42);
@@ -141,7 +173,7 @@ bun run test:load-addon
 bun run test:overload-addon
 SOAK_DURATION=120 bun run test:soak-addon
 bun run test:interop
-bun tools/smoke-readme.ts   # README snippet smoke
+bun tools/smoke-readme.ts
 ```
 
 ## Operational Caveats
