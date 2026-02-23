@@ -35,9 +35,14 @@
 
 ### release.yml (tag push `v*`, workflow_dispatch)
 
-1. **build** — matrix: `{linux-x64, darwin-arm64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
-2. **release** — downloads artifacts, creates GitHub release with release notes
-3. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
+**P3.2**: Security gates block release. Jobs run before build:
+
+1. **security** — cargo audit, Trivy filesystem scan, Trivy library vulnerability scan (CRITICAL/HIGH blocking)
+2. **codeql** — CodeQL analysis (JS/TS + Rust)
+
+3. **build** — matrix: `{linux-x64, darwin-arm64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
+4. **release** — downloads artifacts, creates GitHub release with release notes
+5. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
    - Runs on tag pushes only when repo variable `NPM_TRUSTED_PUBLISHING` is set to `true`
    - Can also be run manually from `workflow_dispatch` with `publish_to_npm=true`
 

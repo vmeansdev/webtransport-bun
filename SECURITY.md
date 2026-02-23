@@ -66,6 +66,7 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 
 ## CI scan triage and suppressions
 - CodeQL and Trivy findings are triaged in PRs; `CRITICAL`/`HIGH` are blocking by default.
+- **P3.2**: Release workflow runs security gates (cargo audit, Trivy fs + lib, CodeQL) before build; release is blocked on any CRITICAL/HIGH finding.
 - Any suppression must include:
   - clear justification,
   - scope (exact package/path/CVE),
