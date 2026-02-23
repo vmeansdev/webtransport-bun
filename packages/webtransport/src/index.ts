@@ -4,7 +4,15 @@
  *
  * Production-ready WebTransport for Bun, backed by napi-rs + wtransport (Rust).
  * Supports in-process server, client (Node API and W3C-style facade), datagrams, and streams.
- *
+ */
+
+if (typeof globalThis.Bun === "undefined") {
+  throw new Error(
+    "@webtransport-bun/webtransport requires Bun (>=1.3.9). See https://bun.sh"
+  );
+}
+
+/**
  * @example Node client (connect)
  * ```ts
  * import { connect, createServer } from "@webtransport-bun/webtransport";

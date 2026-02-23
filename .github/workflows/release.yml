@@ -36,7 +36,7 @@ jobs:
           fi
       - name: Prebuild + checksums
         run: |
-          cd packages/webtransport && bun run prebuild
+          cd packages/webtransport && bun run prebuild:native
           cd prebuilds
           shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true
       - name: Upload prebuilds
