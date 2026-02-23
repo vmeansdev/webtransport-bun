@@ -192,11 +192,26 @@ describe("client metricsSnapshot", () => {
         const snapDuring = client.metricsSnapshot();
         expect(snapDuring.streamsActive).toBeGreaterThanOrEqual(1);
 
-        stream.write(new Uint8Array([10, 20, 30]));
-
-        const reply = await new Promise<Buffer>((resolve) => {
-            stream.once("data", resolve);
+        const replyPromise = new Promise<Buffer>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("timed out waiting for bidi echo")), 4000);
+            stream.once("data", (chunk) => {
+                clearTimeout(timer);
+                resolve(chunk);
+            });
+            stream.once("error", (err) => {
+                clearTimeout(timer);
+                reject(err);
+            });
         });
+
+        await new Promise<void>((resolve, reject) => {
+            stream.write(new Uint8Array([10, 20, 30]), (err?: Error | null) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+
+        const reply = await replyPromise;
         expect(reply).not.toBeNull();
         expect(reply.length).toBe(3);
         stream.end();
