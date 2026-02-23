@@ -28,6 +28,8 @@ if [ "${#rust_files[@]}" -gt 0 ]; then
   echo "pre-commit: formatting Rust files with cargo fmt"
   cargo fmt --all -- "${rust_files[@]}"
   git add -- "${rust_files[@]}"
+  echo "pre-commit: running clippy"
+  cargo clippy --workspace -- -D clippy::all
 fi
 
 if [ "${#tsjs_files[@]}" -gt 0 ]; then

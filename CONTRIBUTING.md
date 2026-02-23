@@ -8,6 +8,7 @@
 - `cargo fetch`
 4) Install git hooks (required for pre-commit formatting):
 - `bun run setup:hooks`
+  - Hook runs `cargo fmt` + `cargo clippy --workspace -- -D clippy::all` on staged Rust files and Biome format on staged TS/JS files.
 
 ## Local build
 - Build native addon: `bun run build:native` (uses napi-rs CLI; produces `webtransport-native.${platform}-${arch}.node`)
