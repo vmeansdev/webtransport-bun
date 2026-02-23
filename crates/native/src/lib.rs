@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 pub mod client;
 pub mod client_stream;
+pub mod histogram;
 pub mod limits;
 pub mod metrics;
 pub mod panic_guard;
@@ -399,6 +400,7 @@ pub(crate) fn spawn_wtransport_server(
                                 let accept_timeout = tokio::time::Duration::from_millis(
                                     limits.handshake_timeout_ms,
                                 );
+                                let accept_start = std::time::Instant::now();
                                 let accept_result = tokio::time::timeout(
                                     accept_timeout,
                                     session_request.accept(),
@@ -415,6 +417,7 @@ pub(crate) fn spawn_wtransport_server(
                                 };
                                 match accept_result {
                                     Ok(connection) => {
+                                        metrics.handshake_histogram.observe(accept_start.elapsed());
                                         let peer_ip = connection.remote_address().ip().to_string();
                                         let peer_port = connection.remote_address().port() as u32;
                                         emit_log(&ltx, !debug_logs, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));

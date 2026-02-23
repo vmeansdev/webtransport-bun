@@ -181,6 +181,16 @@ export type MetricsSnapshot = {
 
   rateLimitedCount: number;
   limitExceededCount: number;
+  handshakeLatency?: HistogramSnapshot | null;
+  datagramEnqueueLatency?: HistogramSnapshot | null;
+  streamOpenLatency?: HistogramSnapshot | null;
+};
+
+export type HistogramSnapshot = {
+  le: number[];
+  cumulativeCount: number[];
+  count: number;
+  sumSecs: number;
 };
 
 export type SessionMetricsSnapshot = {

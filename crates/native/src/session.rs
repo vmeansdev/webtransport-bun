@@ -76,6 +76,7 @@ impl SessionHandle {
         let sm_send = sm.clone();
         let metrics_send = metrics.clone();
         let send_fut = RUNTIME.spawn(async move {
+            let start = std::time::Instant::now();
             let result = conn
                 .send_datagram(&bytes)
                 .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
@@ -87,6 +88,7 @@ impl SessionHandle {
                 );
             }
             result?;
+            metrics_send.datagram_enqueue_histogram.observe(start.elapsed());
             metrics_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
             if let Some(ref sm) = sm_send {
                 sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -105,7 +107,7 @@ impl SessionHandle {
                 }
                 metrics.backpressure_wait_count.fetch_add(1, Ordering::Relaxed);
                 metrics.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
-                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+                Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))
             }
         }
     }
@@ -140,18 +142,23 @@ impl SessionHandle {
         let id = self.id.clone();
         RUNTIME
             .spawn(async move {
-                let Some((_, _, _, _, _, create_bi_tx, _)) = session_registry::get(&id) else {
+                let Some((_, _, metrics, _, _, create_bi_tx, _)) = session_registry::get(&id) else {
                     return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
                 };
+                let start = std::time::Instant::now();
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                 create_bi_tx
                     .send(resp_tx)
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
-                resp_rx
+                let result = resp_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(napi::Error::from_reason)
+                    .map_err(napi::Error::from_reason);
+                if result.is_ok() {
+                    metrics.stream_open_histogram.observe(start.elapsed());
+                }
+                result
             })
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?
@@ -172,18 +179,24 @@ impl SessionHandle {
         let id = self.id.clone();
         RUNTIME
             .spawn(async move {
-                let Some((_, _, _, _, _, _, create_uni_tx)) = session_registry::get(&id) else {
+                let Some((_, _, metrics, _, _, _, create_uni_tx)) =
+                    session_registry::get(&id) else {
                     return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
                 };
+                let start = std::time::Instant::now();
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                 create_uni_tx
                     .send(resp_tx)
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
-                resp_rx
+                let result = resp_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(napi::Error::from_reason)
+                    .map_err(napi::Error::from_reason);
+                if result.is_ok() {
+                    metrics.stream_open_histogram.observe(start.elapsed());
+                }
+                result
             })
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?

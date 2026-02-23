@@ -24,6 +24,18 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
 
+## Latency histograms (P3.1)
+
+Histograms are emitted as Prometheus `histogram` type (`_bucket`, `_count`, `_sum`). Buckets (seconds): 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, +Inf.
+
+| Field | Description | SLO target (in-region) |
+|-------|-------------|------------------------|
+| handshakeLatency | Accept start to completion | p99 < 300ms |
+| datagramEnqueueLatency | Server send_datagram() duration | p99 < 10ms |
+| streamOpenLatency | createBidiStream / createUniStream duration | p99 < 20ms |
+
+Use `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m]))` for p99.
+
 ## Drop reasons (datagramsDropped)
 
 The single `datagramsDropped` counter aggregates:

@@ -307,6 +307,14 @@ export interface ClientSession extends BaseSession { }
 // Metrics
 // ---------------------------------------------------------------------------
 
+/** Latency histogram snapshot (Prometheus histogram format). */
+export type HistogramSnapshot = {
+    le: number[];
+    cumulativeCount: number[];
+    count: number;
+    sumSecs: number;
+};
+
 export type MetricsSnapshot = {
     nowMs: number;
 
@@ -326,6 +334,13 @@ export type MetricsSnapshot = {
 
     rateLimitedCount: number;
     limitExceededCount: number;
+
+    /** Handshake latency (accept start to completion). P99 target &lt;300ms. */
+    handshakeLatency?: HistogramSnapshot | null;
+    /** Datagram send enqueue latency. P99 target &lt;10ms. */
+    datagramEnqueueLatency?: HistogramSnapshot | null;
+    /** Stream open latency (createBidi/createUni). P99 target &lt;20ms. */
+    streamOpenLatency?: HistogramSnapshot | null;
 };
 
 export type SessionMetricsSnapshot = {
@@ -366,53 +381,103 @@ export function metricsToPrometheus(
     m: MetricsSnapshot,
     labels?: Record<string, string>
 ): string {
-    const l = labels
-        ? "," + Object.entries(labels)
+    const baseLabels = labels
+        ? Object.entries(labels)
             .map(([k, v]) => `${sanitizePromLabelName(k)}="${escapePromLabelValue(v)}"`)
             .join(",")
         : "";
+    const metricLabels = baseLabels ? `{${baseLabels}}` : "";
     const p = METRICS_PREFIX;
     const lines: string[] = [
         `# HELP ${p}sessions_active Current open sessions`,
         `# TYPE ${p}sessions_active gauge`,
-        `${p}sessions_active${l} ${m.sessionsActive}`,
+        `${p}sessions_active${metricLabels} ${m.sessionsActive}`,
         `# HELP ${p}handshakes_in_flight Handshakes in progress`,
         `# TYPE ${p}handshakes_in_flight gauge`,
-        `${p}handshakes_in_flight${l} ${m.handshakesInFlight}`,
+        `${p}handshakes_in_flight${metricLabels} ${m.handshakesInFlight}`,
         `# HELP ${p}streams_active Active streams`,
         `# TYPE ${p}streams_active gauge`,
-        `${p}streams_active${l} ${m.streamsActive}`,
+        `${p}streams_active${metricLabels} ${m.streamsActive}`,
         `# HELP ${p}session_tasks_active Internal session tasks`,
         `# TYPE ${p}session_tasks_active gauge`,
-        `${p}session_tasks_active${l} ${m.sessionTasksActive}`,
+        `${p}session_tasks_active${metricLabels} ${m.sessionTasksActive}`,
         `# HELP ${p}stream_tasks_active Internal stream tasks`,
         `# TYPE ${p}stream_tasks_active gauge`,
-        `${p}stream_tasks_active${l} ${m.streamTasksActive}`,
+        `${p}stream_tasks_active${metricLabels} ${m.streamTasksActive}`,
         `# HELP ${p}queued_bytes_global Bytes queued globally`,
         `# TYPE ${p}queued_bytes_global gauge`,
-        `${p}queued_bytes_global${l} ${m.queuedBytesGlobal}`,
+        `${p}queued_bytes_global${metricLabels} ${m.queuedBytesGlobal}`,
         `# HELP ${p}datagrams_in Datagrams received`,
         `# TYPE ${p}datagrams_in counter`,
-        `${p}datagrams_in${l} ${m.datagramsIn}`,
+        `${p}datagrams_in${metricLabels} ${m.datagramsIn}`,
         `# HELP ${p}datagrams_out Datagrams sent`,
         `# TYPE ${p}datagrams_out counter`,
-        `${p}datagrams_out${l} ${m.datagramsOut}`,
+        `${p}datagrams_out${metricLabels} ${m.datagramsOut}`,
         `# HELP ${p}datagrams_dropped Datagrams dropped`,
         `# TYPE ${p}datagrams_dropped counter`,
-        `${p}datagrams_dropped${l} ${m.datagramsDropped}`,
+        `${p}datagrams_dropped${metricLabels} ${m.datagramsDropped}`,
         `# HELP ${p}backpressure_wait_total Times senders waited on backpressure`,
         `# TYPE ${p}backpressure_wait_total counter`,
-        `${p}backpressure_wait_total${l} ${m.backpressureWaitCount}`,
+        `${p}backpressure_wait_total${metricLabels} ${m.backpressureWaitCount}`,
         `# HELP ${p}backpressure_timeout_total Times backpressure timeout fired`,
         `# TYPE ${p}backpressure_timeout_total counter`,
-        `${p}backpressure_timeout_total${l} ${m.backpressureTimeoutCount}`,
+        `${p}backpressure_timeout_total${metricLabels} ${m.backpressureTimeoutCount}`,
         `# HELP ${p}rate_limited_total Sessions rejected by rate limit`,
         `# TYPE ${p}rate_limited_total counter`,
-        `${p}rate_limited_total${l} ${m.rateLimitedCount}`,
+        `${p}rate_limited_total${metricLabels} ${m.rateLimitedCount}`,
         `# HELP ${p}limit_exceeded_total Sessions rejected (limits)`,
         `# TYPE ${p}limit_exceeded_total counter`,
-        `${p}limit_exceeded_total${l} ${m.limitExceededCount}`,
+        `${p}limit_exceeded_total${metricLabels} ${m.limitExceededCount}`,
     ];
+
+    function emitHistogram(name: string, h: HistogramSnapshot | null | undefined): void {
+        if (!h) return;
+        const raw = h as Record<string, unknown>;
+        const le = (raw.le ?? []) as number[];
+        const cumulativeCount = (raw.cumulativeCount ?? raw.cumulative_count ?? []) as number[];
+        const count = (raw.count ?? 0) as number;
+        const sumSecs = (raw.sumSecs ?? raw.sum_secs ?? 0) as number;
+        const bn = `${p}${name}`;
+        lines.push(`# HELP ${bn}_seconds Latency histogram (seconds)`);
+        lines.push(`# TYPE ${bn}_seconds histogram`);
+        for (let i = 0; i < le.length; i++) {
+            const v = le[i];
+            const leVal = v === Infinity || v === undefined || v >= 1e308 ? "+Inf" : String(v);
+            const bucketLabels = baseLabels
+                ? `{le="${leVal}",${baseLabels}}`
+                : `{le="${leVal}"}`;
+            lines.push(`${bn}_seconds_bucket${bucketLabels} ${Math.round(cumulativeCount[i] ?? 0)}`);
+        }
+        const infBucketLabels = baseLabels
+            ? `{le="+Inf",${baseLabels}}`
+            : `{le="+Inf"}`;
+        lines.push(`${bn}_seconds_bucket${infBucketLabels} ${Math.round(count)}`);
+        lines.push(`${bn}_seconds_count${metricLabels} ${Math.round(count)}`);
+        lines.push(`${bn}_seconds_sum${metricLabels} ${sumSecs}`);
+    }
+    const mAny = m as Record<string, unknown>;
+    emitHistogram(
+        "handshake_latency",
+        (mAny.handshakeLatency ?? mAny.handshake_latency) as
+            | HistogramSnapshot
+            | null
+            | undefined,
+    );
+    emitHistogram(
+        "datagram_enqueue_latency",
+        (mAny.datagramEnqueueLatency ?? mAny.datagram_enqueue_latency) as
+            | HistogramSnapshot
+            | null
+            | undefined,
+    );
+    emitHistogram(
+        "stream_open_latency",
+        (mAny.streamOpenLatency ?? mAny.stream_open_latency) as
+            | HistogramSnapshot
+            | null
+            | undefined,
+    );
+
     return lines.join("\n") + "\n";
 }
 

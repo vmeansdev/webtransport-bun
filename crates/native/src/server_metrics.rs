@@ -2,6 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::histogram::{self, LatencyHistogram};
+use super::metrics::HistogramSnapshot;
+
 #[derive(Default)]
 pub struct ServerMetrics {
     pub sessions_active: AtomicU64,
@@ -17,6 +20,9 @@ pub struct ServerMetrics {
     pub backpressure_timeout_count: AtomicU64,
     pub rate_limited_count: AtomicU64,
     pub limit_exceeded_count: AtomicU64,
+    pub handshake_histogram: LatencyHistogram,
+    pub datagram_enqueue_histogram: LatencyHistogram,
+    pub stream_open_histogram: LatencyHistogram,
 }
 
 impl ServerMetrics {
@@ -90,7 +96,23 @@ impl ServerMetrics {
                 as u32,
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as u32,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as u32,
+            handshake_latency: Some(histogram_to_snapshot(&self.handshake_histogram)),
+            datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
+            stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),
         }
+    }
+}
+
+fn histogram_to_snapshot(h: &LatencyHistogram) -> HistogramSnapshot {
+    HistogramSnapshot {
+        le: histogram::BUCKETS.to_vec(),
+        cumulative_count: h
+            .cumulative_counts()
+            .iter()
+            .map(|&c| c as f64)
+            .collect::<Vec<_>>(),
+        count: h.count() as f64,
+        sum_secs: h.sum_secs(),
     }
 }
 

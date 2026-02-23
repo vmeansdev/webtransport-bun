@@ -150,4 +150,51 @@ describe("acceptance (Task gates)", () => {
         clients.forEach((c) => c.close());
         await server.close();
     }, 20000);
+
+    it("P3-1: latency histograms populated and metricsToPrometheus emits them", async () => {
+        const port = nextPort();
+        const server = createServer({
+            port,
+            tls: { certPem: "", keyPem: "" },
+            onSession: async (s) => {
+                void (async () => {
+                    for await (const d of s.incomingDatagrams()) {
+                        await s.sendDatagram(d);
+                    }
+                })().catch(() => {});
+                void (async () => {
+                    const stream = await s.createBidirectionalStream();
+                    stream.write(Buffer.from("hi"));
+                    stream.end();
+                })().catch(() => {});
+            },
+        });
+        await Bun.sleep(2000);
+
+        const client = await connect(`https://127.0.0.1:${port}`, {
+            tls: { insecureSkipVerify: true },
+        });
+        await client.sendDatagram(new Uint8Array([1, 2, 3]));
+        await client.incomingDatagrams()[Symbol.asyncIterator]().next();
+        const iter = client.incomingBidirectionalStreams()[Symbol.asyncIterator]();
+        await iter.next();
+        await Bun.sleep(500);
+
+        const m = server.metricsSnapshot() as Record<string, any>;
+        const handshake = m.handshakeLatency ?? m.handshake_latency;
+        const datagram = m.datagramEnqueueLatency ?? m.datagram_enqueue_latency;
+        const streamOpen = m.streamOpenLatency ?? m.stream_open_latency;
+        expect(handshake).toBeDefined();
+        expect(handshake.count).toBeGreaterThanOrEqual(1);
+        expect(datagram.count).toBeGreaterThanOrEqual(1);
+        expect(streamOpen.count).toBeGreaterThanOrEqual(1);
+
+        const { metricsToPrometheus } = await import("@webtransport-bun/webtransport");
+        const prom = metricsToPrometheus(m);
+        expect(prom).toContain("handshake_latency_seconds_bucket");
+        expect(prom).toContain("datagram_enqueue_latency_seconds_bucket");
+        expect(prom).toContain("stream_open_latency_seconds_bucket");
+
+        await server.close();
+    }, 15000);
 });

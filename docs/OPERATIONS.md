@@ -56,12 +56,64 @@ Bun.serve({
 
 **Scrape config**: Point Prometheus at `http://host:9090/metrics`. Recommended `scrape_interval`: 15s.
 
+## Dashboards (P3.1)
+
+Recommended panels for Grafana (or equivalent):
+
+| Panel | Query | Unit |
+|-------|-------|------|
+| Sessions active | `webtransport_sessions_active` | short |
+| Handshake p99 | `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m]))` | s |
+| Datagram enqueue p99 | `histogram_quantile(0.99, rate(webtransport_datagram_enqueue_latency_seconds_bucket[5m]))` | s |
+| Stream open p99 | `histogram_quantile(0.99, rate(webtransport_stream_open_latency_seconds_bucket[5m]))` | s |
+| Queued bytes | `webtransport_queued_bytes_global` | bytes |
+| Backpressure timeouts | `rate(webtransport_backpressure_timeout_total[5m])` | 1/s |
+| Rate limited | `rate(webtransport_rate_limited_total[5m])` | 1/s |
+| Limit exceeded | `rate(webtransport_limit_exceeded_total[5m])` | 1/s |
+
+## Alert rules and paging thresholds
+
+Configure Prometheus alerts. Severity: **page** for Sev-2, **ticket** for Sev-3.
+
+| Alert | Condition | Severity | Runbook |
+|-------|-----------|----------|---------|
+| WebTransportHandshakeP99High | `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m])) > 0.3` | page | Handshake latency |
+| WebTransportDatagramEnqueueP99High | `histogram_quantile(0.99, rate(webtransport_datagram_enqueue_latency_seconds_bucket[5m])) > 0.01` | page | Datagram enqueue |
+| WebTransportStreamOpenP99High | `histogram_quantile(0.99, rate(webtransport_stream_open_latency_seconds_bucket[5m])) > 0.02` | page | Stream open latency |
+| WebTransportQueuedBytesHigh | `webtransport_queued_bytes_global > 0.8 * maxQueuedBytesGlobal` | ticket | Queued bytes climb |
+| WebTransportBackpressureTimeouts | `rate(webtransport_backpressure_timeout_total[5m]) > 1` | ticket | Backpressure timeouts |
+| WebTransportRateLimited | `rate(webtransport_rate_limited_total[5m]) > 10` | ticket | Rate limited |
+| WebTransportLimitExceeded | `rate(webtransport_limit_exceeded_total[5m]) > 5` | ticket | Limit exceeded |
+
+Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400` for 400 MiB of 512 MiB).
+
 ## Idle timeout behavior
 
 - `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.
 - Activity: any data sent or received (handshake, datagrams, stream data). QUIC keepalives may extend the window.
 - When idle timeout fires: session closes with appropriate code; `closed` promise resolves.
 - Slow-reader detection: streams where the peer does not drain within backpressureTimeoutMs are reset (backpressureTimeoutCount incremented).
+
+## Runbook: handshake p99 high
+
+When `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m])) > 0.3`:
+- **Cause**: TLS/QUIC handshake slow; CPU saturation; network RTT spike; certificate validation.
+- **Check**: `handshakesInFlight`, CPU, network latency to clients.
+- **Actions**: Scale out; reduce `maxHandshakesInFlight` to shed load; verify cert chain not oversized.
+
+## Runbook: datagram enqueue p99 high
+
+When datagram enqueue p99 > 10ms:
+- **Cause**: QUIC send buffer full; backpressure from slow consumers; CPU contention.
+- **Check**: `queuedBytesGlobal`, `backpressureTimeoutCount`, `streamsActive`.
+- **Actions**: Reduce `maxQueuedBytesPerStream`; lower `backpressureTimeoutMs`; scale out.
+
+## Runbook: stream open p99 high
+
+When stream open p99 > 20ms:
+- **Cause**: QUIC flow control; rate limits; global stream cap saturation.
+- **Check**: `streamsActive`, `limitExceededCount`, `rateLimitedCount`.
+- **Actions**: Increase `maxStreamsPerSessionBidi`/`Uni` if within capacity; verify rate limits not too strict.
 
 ## Runbook: queued bytes climb
 When `queuedBytesGlobal` rises and stays high:
