@@ -1,0 +1,56 @@
+# Rollback drill: validate known-good release assets and produce restore runbook.
+# Run manually to verify rollback path or after a bad release.
+# Does NOT republish; operator follows runbook to instruct users to pin version.
+name: rollback
+on:
+  workflow_dispatch:
+    inputs:
+      rollback_target:
+        description: "Release tag to rollback to (e.g. v0.1.0)"
+        required: true
+        type: string
+jobs:
+  rollback-drill:
+    name: Rollback drill (verify + runbook)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p rollback-assets
+          gh release download "${{ inputs.rollback_target }}" --dir rollback-assets --repo "${{ github.repository }}"
+      - name: Verify artifact integrity (checksums)
+        run: |
+          cd rollback-assets
+          if [ ! -f SHA256SUMS ]; then
+            echo "::error::SHA256SUMS not found in release ${{ inputs.rollback_target }}"
+            exit 1
+          fi
+          shasum -a 256 -c SHA256SUMS
+      - name: List validated assets
+        run: |
+          echo "## Validated assets for ${{ inputs.rollback_target }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la rollback-assets/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Output runbook
+        run: |
+          VER="${{ inputs.rollback_target }}"
+          VER_NPM="${VER#v}"
+          echo "## Rollback runbook (validated)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** \`$VER\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Operator action:** Instruct users to pin to known-good version:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "bun add @webtransport-bun/webtransport@${VER_NPM}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Validation:** Artifact checksums verified OK." >> $GITHUB_STEP_SUMMARY
+          echo "ROLLBACK_TARGET=$VER" >> $GITHUB_ENV
+          echo "ROLLBACK_NPM=$VER_NPM" >> $GITHUB_ENV

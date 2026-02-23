@@ -45,10 +45,20 @@
 
 3. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
 4. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
-5. **release** — needs [build, interop]; downloads prebuilds + interop evidence, creates GitHub release with release notes
+5. **release** — needs [build, interop]; downloads prebuilds + interop evidence, regenerates combined SHA256SUMS, creates GitHub release with release notes
 6. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
    - Runs on tag pushes only when repo variable `NPM_TRUSTED_PUBLISHING` is set to `true`
    - Can also be run manually from `workflow_dispatch` with `publish_to_npm=true`
+
+### rollback.yml (workflow_dispatch)
+
+**RELEASE-OPS-A**: Rollback drill for known-good release restore.
+
+- **rollback-drill** — workflow_dispatch with input `rollback_target` (e.g. `v0.1.0`)
+  1. Downloads release assets from GitHub
+  2. Verifies SHA256 checksums against SHA256SUMS
+  3. Outputs operator runbook with pin command
+- Run via **Actions → rollback → Run workflow**. See docs/OPERATIONS.md § Runbook: Rollback to known-good release.
 
 ## Release flow
 - Tag `vX.Y.Z`

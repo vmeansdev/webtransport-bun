@@ -189,3 +189,62 @@ When `queuedBytesGlobal` rises and stays high:
 - Run the Bun process as a dedicated service user.
 - Use systemd on Linux; ensure Restart=on-failure.
 - Collect logs centrally; scrape metrics via exposed endpoint (if you add one) or poll metricsSnapshot.
+
+---
+
+## Runbook: Rollback to known-good release
+
+Use when a release introduces critical regressions (crashes, data corruption, security issues) and reverting code is not immediately feasible.
+
+### Trigger conditions
+
+- Critical bug or security issue in the current release discovered post-publish
+- Production incidents traced to the latest release
+- Decision by maintainers to revert users to a previous stable version
+
+### Prerequisites
+
+- GitHub CLI (`gh`) installed (for local drill) or access to run the `rollback` workflow
+- Identify the known-good release tag (e.g. `v0.1.0`) from release history
+
+### Option A: CI workflow (recommended)
+
+1. Open **Actions → rollback** workflow.
+2. Click **Run workflow**.
+3. Enter the rollback target tag (e.g. `v0.1.0`).
+4. Run the workflow.
+5. On success: the job summary contains the exact pin command. Proceed to **Operator action** below.
+
+### Option B: Local script
+
+```bash
+./scripts/rollback-drill.sh v0.1.0
+```
+
+Requires `gh` CLI authenticated. Verifies artifact checksums and prints the runbook.
+
+### Operator action (after validation)
+
+Instruct users to pin to the validated release:
+
+```bash
+bun add @webtransport-bun/webtransport@<VERSION>
+```
+
+Example: for rollback target `v0.1.0`, users run:
+
+```bash
+bun add @webtransport-bun/webtransport@0.1.0
+```
+
+### Expected validation signals
+
+- **Checksum verification passes**: `shasum -a 256 -c SHA256SUMS` exits 0
+- **Assets present**: `webtransport-native.*.node` for linux-x64, darwin-arm64, darwin-x64
+- **SHA256SUMS exists**: Required; releases before the combined checksum change may not have it (run a new release first if needed)
+
+### Follow-up
+
+- Open an issue to track the regression and fix
+- Consider deprecating the bad release on npm: `npm deprecate @webtransport-bun/webtransport@<bad_version> "Critical regression; use <known_good_version>"`
+- Cut a patch release once the fix is merged and tested

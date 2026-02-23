@@ -148,6 +148,10 @@ jobs:
         with:
           name: interop-evidence
           path: interop-evidence
+      - name: Regenerate combined SHA256SUMS (all targets)
+        run: |
+          cd prebuilds
+          shasum -a 256 *.node 2>/dev/null | sort -k2 > SHA256SUMS
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
