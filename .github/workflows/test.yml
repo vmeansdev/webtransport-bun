@@ -75,4 +75,4 @@ jobs:
           bun init -y
           bun add file:$GITHUB_WORKSPACE/packages/webtransport
           echo 'import { createServer } from "@webtransport-bun/webtransport"; const s = createServer({ port: 19999, tls: { certPem: "", keyPem: "" }, onSession: () => {} }); console.log("ok"); s.close().then(() => process.exit(0));' > smoke.ts
-          timeout 10 bun run smoke.ts
+          python3 -c "import subprocess; subprocess.run(['bun','run','smoke.ts'], timeout=10, check=True)"
