@@ -97,9 +97,9 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | --------------------- | --------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `WebTransport` ctor   | `new WebTransport(url, options)`                    | `implemented`  | `WebTransport` class exists in `packages/webtransport/src/index.ts`                                      | Constructor now present and wired to core connect path                  | Keep conformance checks in parity suite                               |
 | Session lifecycle     | `ready` promise semantics                           | `implemented`  | `WebTransport.ready` implemented in `packages/webtransport/src/index.ts`                                 | Core lifecycle behavior in place and covered by local parity tests      | Verify in CI parity runs                                               |
-| Session lifecycle     | `closed` promise semantics                          | `partial`      | `closed` promise wired via callbacks in `packages/webtransport/src/index.ts`                            | Some closure paths map to generic errors (`Connection lost`) in interop | Normalize close info propagation and error mapping                    |
-| Session lifecycle     | `draining` promise                                  | `partial`      | `WebTransport.draining` implemented as `closed`-derived promise in `packages/webtransport/src/index.ts` | Placeholder semantics; not native pre-close draining signal             | Keep documented as partial until native draining signal exists         |
-| Session closure       | `close({ closeCode, reason })` semantics            | `partial`      | `close(info?: {code, reason})` in `packages/webtransport/src/index.ts`                                  | Shape differs from browser object naming and semantics                  | Add browser-shape adapter for close info and validation               |
+| Session lifecycle     | `closed` promise semantics                          | `implemented`  | `closed` promise wired via callbacks; `toCloseInfo` maps native `code`/`reason` to `closeCode`/`reason` | Client-initiated close propagates closeCode/reason; interop may show generic message on network loss | Covered by parity-error-close and parity-facade-lifecycle              |
+| Session lifecycle     | `draining` promise                                  | `implemented`  | `draining` resolves when `close()` is called (closing process started)                                  | Matches spec semantics via JS-only implementation                       | —                                                                       |
+| Session closure       | `close({ closeCode, reason })` semantics            | `implemented`  | `close(info?: WebTransportCloseInfo)` accepts `closeCode`/`reason`, maps to native `code`/`reason`      | Shape and semantics match spec                                          | —                                                                       |
 | Datagrams             | `transport.datagrams.readable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and edge semantics                              |
 | Datagrams             | `transport.datagrams.writable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Writable facade exists and local parity tests pass                      | Validate CI parity run and edge semantics                              |
 | Datagrams             | datagram options (e.g. send order/group)            | `diverged`     | `sendOrder`/`sendGroup` explicitly rejected with E_INTERNAL                                              | Parity option failure behavior implemented (R1)                         | —                                                                       |
@@ -112,7 +112,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Stats                 | `getStats()` dictionaries                           | `diverged`     | No `getStats()` on WebTransport facade for v1; use `metricsSnapshot()` on Node session                   | Documented explicit divergence for current release                       | See Intentional Divergences                                            |
 | Security/auth         | `serverCertificateHashes` behavior                  | `diverged`     | Facade validates format, then rejects with "not supported in this runtime"                               | Option parsed/validated; explicit unsupported path (R5)                  | —                                                                       |
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
-| Termination semantics | iterator/stream termination on close                | `partial`      | Iterators stop on closed flags in session wrappers                                                      | Need parity across all facade streams/promises                          | Add conformance tests for all closure paths                           |
+| Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
 
 
 ## Intentional Divergences (currently)
@@ -134,13 +134,11 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 ## Remaining Work (not yet closed)
 
 1. Execution blocker: CI evidence closure (R6):
-   - local status: `bun run test:parity` passes (20/20) on current branch
+   - local status: `bun run test:parity` passes on current branch
    - confirm `test:parity` pass in CI
    - confirm interop pass in CI
    - confirm security scan jobs pass in CI
-2. Follow-up hardening (non-blocking for R1-R5 closure):
-   - `closed` and `draining` semantics refinement if required by CI/interop behavior
-   - termination semantics conformance expansion as needed
+2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A: draining resolves when `close()` called; closed propagates closeCode/reason; termination tests added for iterators.
 
 ## Required CI Gate
 
