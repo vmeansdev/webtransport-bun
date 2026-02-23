@@ -20,6 +20,7 @@
     "test:overload-addon": "bun tools/load/overload-addon.ts",
     "test:load-addon": "bun tools/load/load-addon.ts",
     "test:load-scale-addon": "bun tools/load/load-scale-addon.ts",
+    "test:load-profiles-addon": "bun tools/load/load-profiles-addon.ts",
     "test:soak-addon": "bun tools/load/soak-addon.ts",
     "bench:datagram": "bun tools/bench/datagram-throughput.ts",
     "bench:handshake": "bun tools/bench/handshake-latency.ts",

@@ -387,7 +387,9 @@ pub(crate) fn spawn_wtransport_server(
                                     emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
                                     return;
                                 }
-                                if metrics.sessions_active.load(Ordering::Relaxed) >= limits.max_sessions {
+                                let prev_sessions = metrics.sessions_active.fetch_add(1, Ordering::SeqCst);
+                                if prev_sessions >= limits.max_sessions {
+                                    metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                     emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, None, None);
@@ -405,6 +407,7 @@ pub(crate) fn spawn_wtransport_server(
                                 let accept_result = match accept_result {
                                     Ok(r) => r,
                                     Err(_) => {
+                                        metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                         emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
@@ -420,6 +423,7 @@ pub(crate) fn spawn_wtransport_server(
                                             rate_limits.handshakes_per_sec,
                                             rate_limits.handshakes_burst,
                                         ) {
+                                            metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                             emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
@@ -431,6 +435,7 @@ pub(crate) fn spawn_wtransport_server(
                                             rate_limits.handshakes_burst_per_ip,
                                             rate_limits.handshakes_burst_per_prefix,
                                         ) {
+                                            metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                             metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                             metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                             emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
@@ -438,7 +443,6 @@ pub(crate) fn spawn_wtransport_server(
                                             return;
                                         }
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
 
                                         let id = format!(
                                             "sess-{}",

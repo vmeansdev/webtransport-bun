@@ -64,6 +64,9 @@ jobs:
       - name: Overload-addon test
         run: bun run test:overload-addon
         timeout-minutes: 2
+      - name: Load profiles (P2.1)
+        run: bun run test:load-profiles-addon
+        timeout-minutes: 5
       - name: Interop (Chromium)
         run: cd tools/interop && bun install && bun run install:browsers && bun run prepare:interop && bun run playwright test
         timeout-minutes: 5

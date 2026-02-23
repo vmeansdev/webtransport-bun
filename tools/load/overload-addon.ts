@@ -10,8 +10,8 @@ import { $ } from "bun";
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/debug/load-client`;
 const MAX_SESSIONS = 5;
-const SESSIONS_ATTEMPT = 10;
-const DURATION = 5;
+const SESSIONS_ATTEMPT = 20;
+const DURATION = 8;
 
 async function main() {
     console.log("overload-addon: Building load-client...");
@@ -22,7 +22,7 @@ async function main() {
     await Bun.sleep(3000); // Allow port to be released
     await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client`.quiet();
 
-    console.log("overload-addon: Starting addon server (createServer, maxSessions=5)...");
+    console.log("overload-addon: Starting addon server (createServer, maxSessions=" + MAX_SESSIONS + ")...");
     const server = createServer({
         port: 4433,
         tls: { certPem: "", keyPem: "" },
@@ -31,7 +31,7 @@ async function main() {
     });
     await Bun.sleep(8000); // Allow addon to bind
 
-    console.log("overload-addon: Running load-client (10 sessions, 5s)...");
+    console.log("overload-addon: Running load-client (" + SESSIONS_ATTEMPT + " sessions, " + DURATION + "s)...");
     const client = Bun.spawn(
         [
             CLIENT_BIN,
@@ -40,6 +40,7 @@ async function main() {
             "--duration", String(DURATION),
             "--datagrams-per-sec", "10",
             "--streams-per-sec", "1",
+            "--max-session-errors", String(SESSIONS_ATTEMPT - MAX_SESSIONS),
         ],
         {
             cwd: ROOT,
@@ -61,7 +62,7 @@ async function main() {
         process.exit(1);
     }
 
-    await Bun.sleep(3000); // Allow sessions to drain
+    await Bun.sleep(8000); // Allow sessions and stream tasks to drain
     const m = server.metricsSnapshot();
     await server.close();
 

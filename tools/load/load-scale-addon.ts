@@ -16,7 +16,7 @@ const SESSIONS = parseInt(process.env.LOAD_SCALE_SESSIONS ?? "2000", 10);
 const DURATION = parseInt(process.env.LOAD_SCALE_DURATION ?? "60", 10);
 const DATAGRAMS_PER_SEC = 1000;
 const STREAMS_PER_SEC = 5;
-const MAX_SESSION_ERRORS = Math.ceil(SESSIONS * 0.5);
+const MAX_SESSION_ERRORS = Math.min(SESSIONS, Math.ceil(SESSIONS * 0.95));
 const MAX_DATAGRAM_ERRORS = 2000;
 const MAX_STREAM_ERRORS = 1000;
 

@@ -120,7 +120,7 @@ async function main() {
         process.exit(1);
     }
 
-    await Bun.sleep(3000);
+    await Bun.sleep(10000);
     const m = server.metricsSnapshot();
     await server.close();
     const finalFd = await getFdCount(process.pid);
