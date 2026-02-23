@@ -10,7 +10,8 @@ import { $ } from "bun";
 import { existsSync } from "node:fs";
 
 const ROOT = process.cwd();
-const CLIENT_BIN = `${ROOT}/target/release/load-client`;
+const CLIENT_BIN_RELEASE = `${ROOT}/target/release/load-client`;
+const CLIENT_BIN_DEBUG = `${ROOT}/target/debug/load-client`;
 const SESSIONS = parseInt(process.env.LOAD_SCALE_SESSIONS ?? "2000", 10);
 const DURATION = parseInt(process.env.LOAD_SCALE_DURATION ?? "60", 10);
 const DATAGRAMS_PER_SEC = 1000;
@@ -47,8 +48,17 @@ async function main() {
     } catch {}
     await Bun.sleep(3000);
 
-    console.log("load-scale-addon: Building load-client (release)...");
-    await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client --release`.quiet();
+    let clientBin = CLIENT_BIN_RELEASE;
+    if (!existsSync(clientBin) && existsSync(CLIENT_BIN_DEBUG)) {
+        clientBin = CLIENT_BIN_DEBUG;
+    }
+    if (!existsSync(clientBin)) {
+        console.log("load-scale-addon: Building load-client (debug)...");
+        await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client`.quiet();
+        clientBin = CLIENT_BIN_DEBUG;
+    } else {
+        console.log("load-scale-addon: Using existing load-client:", clientBin.replace(`${ROOT}/`, ""));
+    }
 
     console.log("load-scale-addon: Starting addon server, sessions=", SESSIONS, "duration=", DURATION);
     const handshakePerSec = Math.max(SESSIONS * 2, 400);
@@ -94,7 +104,7 @@ async function main() {
 
     const client = Bun.spawn(
         [
-            CLIENT_BIN,
+            clientBin,
             "--url", "https://127.0.0.1:4433",
             "--sessions", String(SESSIONS),
             "--duration", String(DURATION),
