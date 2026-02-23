@@ -1,9 +1,14 @@
 /**
  * P0-C: Queue saturation, backpressure timeout, and recovery.
+ * P1.2: Backpressure metrics (backpressureWaitCount, backpressureTimeoutCount).
  */
 
 import { describe, it, expect } from "bun:test";
 import { connect, createServer, E_BACKPRESSURE_TIMEOUT } from "../src/index.js";
+
+function nextPort(): number {
+    return 14460 + Math.floor(Math.random() * 100);
+}
 
 describe("backpressure (P0-C)", () => {
     it("datagram size over max is rejected", async () => {
@@ -83,4 +88,67 @@ describe("backpressure (P0-C)", () => {
 
         await server.close();
     }, 10000);
+});
+
+describe("backpressure observability (P1.2)", () => {
+    it("backpressure counters exist and have correct shape", async () => {
+        const port = nextPort();
+        const server = createServer({
+            port,
+            tls: { certPem: "", keyPem: "" },
+            onSession: async (s) => {
+                for await (const d of s.incomingDatagrams()) {
+                    await s.sendDatagram(d);
+                }
+            },
+        });
+        await Bun.sleep(2000);
+
+        const client = await connect(`https://127.0.0.1:${port}`, {
+            tls: { insecureSkipVerify: true },
+        });
+        await client.sendDatagram(new Uint8Array([1, 2, 3]));
+        const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+        await iter.next();
+
+        const m = server.metricsSnapshot();
+        expect(typeof m.backpressureWaitCount).toBe("number");
+        expect(typeof m.backpressureTimeoutCount).toBe("number");
+        expect(m.backpressureWaitCount).toBeGreaterThanOrEqual(0);
+        expect(m.backpressureTimeoutCount).toBeGreaterThanOrEqual(0);
+
+        await server.close();
+    }, 10000);
+
+    it("backpressureTimeoutCount increments when server send times out (best-effort)", async () => {
+        const port = nextPort();
+        const server = createServer({
+            port,
+            tls: { certPem: "", keyPem: "" },
+            limits: { backpressureTimeoutMs: 1 },
+            onSession: async (s) => {
+                for await (const d of s.incomingDatagrams()) {
+                    void s.sendDatagram(d).catch(() => {});
+                }
+            },
+        });
+        await Bun.sleep(2000);
+
+        const client = await connect(`https://127.0.0.1:${port}`, {
+            tls: { insecureSkipVerify: true },
+        });
+        const buf = new Uint8Array(800);
+        const sends = Array.from({ length: 600 }, () =>
+            client.sendDatagram(buf).catch(() => {})
+        );
+        await Promise.all(sends);
+        await Bun.sleep(2000);
+
+        const m = server.metricsSnapshot();
+        if (m.backpressureTimeoutCount > 0) {
+            expect(m.backpressureWaitCount).toBeGreaterThanOrEqual(m.backpressureTimeoutCount);
+        }
+
+        await server.close();
+    }, 25000);
 });

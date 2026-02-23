@@ -19,8 +19,8 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | datagramsOut | number | Datagrams sent |
 | datagramsDropped | number | Datagrams dropped (oversize, rate limit, or budget) |
 | queuedBytesGlobal | number | Bytes queued globally |
-| backpressureWaitCount | number | Times senders waited on backpressure |
-| backpressureTimeoutCount | number | Times backpressure timeout fired (E_BACKPRESSURE_TIMEOUT) |
+| backpressureWaitCount | number | Times server session send waited on backpressure (incremented on timeout) |
+| backpressureTimeoutCount | number | Times server session send_datagram timed out (E_BACKPRESSURE_TIMEOUT) |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
 

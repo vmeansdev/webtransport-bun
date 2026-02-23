@@ -93,10 +93,21 @@ impl SessionHandle {
             }
             Ok(())
         });
-        tokio::time::timeout(timeout, send_fut)
-            .await
-            .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?
-            .map_err(|e: tokio::task::JoinError| napi::Error::from_reason(e.to_string()))?
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(join_res) => join_res.map_err(|e: tokio::task::JoinError| napi::Error::from_reason(e.to_string()))?,
+            Err(_) => {
+                if let Some(ref sm) = sm {
+                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                        &sm.queued_bytes,
+                        metrics.as_ref(),
+                        sz_u64,
+                    );
+                }
+                metrics.backpressure_wait_count.fetch_add(1, Ordering::Relaxed);
+                metrics.backpressure_timeout_count.fetch_add(1, Ordering::Relaxed);
+                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+            }
+        }
     }
 
     #[napi]

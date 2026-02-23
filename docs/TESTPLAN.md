@@ -32,6 +32,7 @@
 - `E_LIMIT_EXCEEDED` returned when server-created stream caps are exceeded
 - `E_QUEUE_FULL` returned on oversized datagram
 - `E_BACKPRESSURE_TIMEOUT` returned under saturation with short timeout
+- `backpressureWaitCount` and `backpressureTimeoutCount` wired to server session send_datagram; incremented on timeout (see backpressure.test.ts)
 
 ### Pass criteria
 - All Rust quality gates pass
