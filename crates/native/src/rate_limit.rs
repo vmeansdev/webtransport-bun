@@ -377,7 +377,9 @@ mod tests {
         let limit = 5u64;
         assert!(try_acquire_per_ip_session(&ip, limit));
         release_per_ip_session(&ip);
-        cleanup_stale_entries(0.0);
+        // Keep bucket entries intact to avoid interfering with other tests that
+        // share global token-bucket state and run in parallel.
+        cleanup_stale_entries(f64::MAX);
         assert!(!PER_IP_SESSIONS.contains_key(&ip));
     }
 
