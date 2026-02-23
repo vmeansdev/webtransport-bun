@@ -5,10 +5,27 @@
 WebTransport for Bun with production guardrails: datagrams + streams, in-process server/client, and Chromium interop backed by Rust `wtransport` via `napi-rs`.
 
 <p>
-  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml/badge.svg" alt="CI" /></a>
-  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/release.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/release.yml/badge.svg" alt="Release" /></a>
-  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/codeql.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/codeql.yml/badge.svg" alt="CodeQL" /></a>
-  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml"><img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml/badge.svg" alt="Trivy" /></a>
+  <a href="https://www.npmjs.com/package/@webtransport-bun/webtransport">
+    <img src="https://img.shields.io/npm/v/%40webtransport-bun%2Fwebtransport.svg" alt="npm version" />
+  </a>
+  <a href="https://www.npmjs.com/package/@webtransport-bun/webtransport">
+    <img src="https://img.shields.io/npm/dm/%40webtransport-bun%2Fwebtransport.svg" alt="npm downloads" />
+  </a>
+  <a href="https://www.npmjs.com/package/@webtransport-bun/webtransport">
+    <img src="https://img.shields.io/bundlephobia/minzip/%40webtransport-bun%2Fwebtransport" alt="bundle size" />
+  </a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml">
+    <img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml/badge.svg" alt="CI" />
+  </a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/release.yml">
+    <img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/release.yml/badge.svg" alt="Release" />
+  </a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/codeql.yml">
+    <img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/codeql.yml/badge.svg" alt="CodeQL" />
+  </a>
+  <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml">
+    <img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/trivy.yml/badge.svg" alt="Trivy" />
+  </a>
 </p>
 
 ## Why Try This
