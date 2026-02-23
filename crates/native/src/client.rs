@@ -774,7 +774,7 @@ async fn run_connect(
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
 
     let (connect_url, custom_resolver) =
-        connect_url_and_resolver(url, server_name).map_err(|e| std::io::Error::other(e))?;
+        connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
 
     let mut config = if insecure_skip_verify {
         wtransport::ClientConfig::builder()
@@ -782,7 +782,7 @@ async fn run_connect(
             .with_no_cert_validation()
             .build()
     } else if ca_pem.is_some() {
-        let root_store = build_root_cert_store(ca_pem).map_err(|e| std::io::Error::other(e))?;
+        let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
         let tls_config = build_client_tls_config(root_store, false);
         wtransport::ClientConfig::builder()
             .with_bind_default()
