@@ -80,7 +80,7 @@ export {
 	E_INTERNAL,
 	WebTransportError,
 } from "./errors.js";
-export type { ErrorCode } from "./errors.js";
+export type { ErrorCode, WebTransportErrorOptions, WebTransportErrorSource } from "./errors.js";
 
 import {
 	E_INTERNAL,

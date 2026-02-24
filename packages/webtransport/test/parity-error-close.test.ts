@@ -9,6 +9,8 @@ import {
 	createServer,
 	WebTransportError,
 	E_HANDSHAKE_TIMEOUT,
+	E_STREAM_RESET,
+	E_STOP_SENDING,
 } from "../src/index.js";
 
 describe("parity error and close mapping (P4)", () => {
@@ -42,13 +44,22 @@ describe("parity error and close mapping (P4)", () => {
 		expect(info.reason).toBe("normal closure");
 	});
 
-	test("WebTransportError has code and message (stable shape)", () => {
+	test("WebTransportError has code, message, source (spec-like shape)", () => {
 		const err = new WebTransportError(E_HANDSHAKE_TIMEOUT, "connect timed out");
 		expect(err).toBeInstanceOf(WebTransportError);
 		expect(err).toBeInstanceOf(Error);
 		expect(err.code).toBe(E_HANDSHAKE_TIMEOUT);
 		expect(err.code).toMatch(/^E_/);
 		expect(typeof err.message).toBe("string");
+		expect(err.source).toBe("session");
+		expect(err.streamErrorCode).toBe(null);
+	});
+
+	test("WebTransportError source is stream for E_STREAM_RESET and E_STOP_SENDING", () => {
+		const resetErr = new WebTransportError(E_STREAM_RESET, "reset");
+		expect(resetErr.source).toBe("stream");
+		const stopErr = new WebTransportError(E_STOP_SENDING, "stop");
+		expect(stopErr.source).toBe("stream");
 	});
 
 	test("constructor rejects unsupported options (allowPooling, requireUnreliable)", () => {

@@ -3,6 +3,9 @@
  * Use with WebTransportError.code for programmatic handling.
  */
 
+/** W3C WebTransportErrorSource: stream or session. */
+export type WebTransportErrorSource = "stream" | "session";
+
 /** TLS/certificate failure. */
 export const E_TLS = "E_TLS";
 /** Connection handshake timed out (limits.handshakeTimeoutMs). */
@@ -39,16 +42,42 @@ export type ErrorCode =
   | typeof E_RATE_LIMITED
   | typeof E_INTERNAL;
 
+/** Options for WebTransportError (W3C-aligned). */
+export type WebTransportErrorOptions = {
+  source?: WebTransportErrorSource;
+  streamErrorCode?: number | null;
+  cause?: unknown;
+};
+
 /**
  * Custom error class for WebTransport errors.
  * Carries a stable error code for programmatic handling.
+ * W3C-aligned: source ("stream"|"session"), streamErrorCode.
  */
 export class WebTransportError extends Error {
   readonly code: ErrorCode;
+  readonly source: WebTransportErrorSource;
+  readonly streamErrorCode: number | null;
 
-  constructor(code: ErrorCode, message?: string) {
-    super(message ?? code);
+  constructor(
+    code: ErrorCode,
+    message?: string,
+    options?: WebTransportErrorOptions,
+  ) {
+    super(message ?? code, { cause: options?.cause ?? { code } });
     this.name = "WebTransportError";
     this.code = code;
+    this.source = options?.source ?? codeToSource(code);
+    this.streamErrorCode = options?.streamErrorCode ?? null;
+  }
+}
+
+function codeToSource(code: ErrorCode): WebTransportErrorSource {
+  switch (code) {
+    case E_STREAM_RESET:
+    case E_STOP_SENDING:
+      return "stream";
+    default:
+      return "session";
   }
 }
