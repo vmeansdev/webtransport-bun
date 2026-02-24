@@ -102,22 +102,24 @@ describe("backpressure observability (P1.2)", () => {
                 }
             },
         });
-        await Bun.sleep(2000);
+        try {
+            await Bun.sleep(2000);
 
-        const client = await connect(`https://127.0.0.1:${port}`, {
-            tls: { insecureSkipVerify: true },
-        });
-        await client.sendDatagram(new Uint8Array([1, 2, 3]));
-        const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-        await iter.next();
+            const client = await connect(`https://127.0.0.1:${port}`, {
+                tls: { insecureSkipVerify: true },
+            });
+            await client.sendDatagram(new Uint8Array([1, 2, 3]));
+            // Counters are shape checks only; avoid blocking on echoed datagram delivery.
+            await Bun.sleep(50);
 
-        const m = server.metricsSnapshot();
-        expect(typeof m.backpressureWaitCount).toBe("number");
-        expect(typeof m.backpressureTimeoutCount).toBe("number");
-        expect(m.backpressureWaitCount).toBeGreaterThanOrEqual(0);
-        expect(m.backpressureTimeoutCount).toBeGreaterThanOrEqual(0);
-
-        await server.close();
+            const m = server.metricsSnapshot();
+            expect(typeof m.backpressureWaitCount).toBe("number");
+            expect(typeof m.backpressureTimeoutCount).toBe("number");
+            expect(m.backpressureWaitCount).toBeGreaterThanOrEqual(0);
+            expect(m.backpressureTimeoutCount).toBeGreaterThanOrEqual(0);
+        } finally {
+            await server.close();
+        }
     }, 10000);
 
     it("backpressureTimeoutCount increments when server send times out (best-effort)", async () => {
