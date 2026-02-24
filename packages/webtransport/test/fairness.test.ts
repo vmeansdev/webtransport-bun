@@ -117,6 +117,8 @@ describe("fairness and abuse resistance (P2.3)", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			rateLimits: {
+				// Keep refill slow so this remains a true burst-boundary test.
+				handshakesPerSec: 1,
 				handshakesBurst: burst,
 				handshakesBurstPerPrefix: burst + 10,
 			},
