@@ -129,6 +129,7 @@
       let datagramReader;
       let datagramWriter;
       let certHashBase64 = "";
+      const hasWebTransport = typeof window.WebTransport === "function";
 
       function log(msg) {
         const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -187,6 +188,10 @@
       }
 
       async function connect() {
+        if (!hasWebTransport) {
+          log("connect blocked: WebTransport API is not available in this browser");
+          return;
+        }
         if (transport) {
           log("already connected");
           return;
@@ -309,6 +314,14 @@
       });
 
       (async () => {
+        if (!hasWebTransport) {
+          connectBtn.disabled = true;
+          sendBtn.disabled = true;
+          log("WebTransport API is unavailable in this browser.");
+          log("Use recent Chrome/Chromium and open: http://127.0.0.1:3000");
+          log("If needed, launch with: --origin-to-force-quic-on=127.0.0.1:4433 --ignore-certificate-errors --allow-insecure-localhost --webtransport-developer-mode");
+          return;
+        }
         try {
           const res = await fetch("/config");
           if (res.ok) {

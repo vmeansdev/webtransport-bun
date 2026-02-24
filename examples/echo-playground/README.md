@@ -20,6 +20,10 @@ bun run example:echo
 Open:
 - `http://127.0.0.1:3000` (UI)
 
+Notes:
+- `0.0.0.0` is a server bind address, not a browser URL. Always open `127.0.0.1` (or your host IP).
+- The playground requires a browser with `window.WebTransport` support (use recent Chrome/Chromium).
+
 WebTransport endpoint used by the page:
 - `https://127.0.0.1:4433`
 

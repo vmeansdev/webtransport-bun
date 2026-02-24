@@ -115,7 +115,11 @@ const httpServer = Bun.serve({
 	},
 });
 
-console.log(`HTTP UI: http://${HTTP_HOST}:${HTTP_PORT}`);
+const httpUiAccessHost = HTTP_HOST === "0.0.0.0" ? "127.0.0.1" : HTTP_HOST;
+console.log(`HTTP UI: http://${HTTP_HOST}:${HTTP_PORT} (bind)`);
+console.log(
+	`HTTP UI (open in browser): http://${httpUiAccessHost}:${HTTP_PORT}`,
+);
 console.log(`WebTransport endpoint: https://127.0.0.1:${WT_PORT}`);
 console.log("Press Ctrl+C to stop.");
 
