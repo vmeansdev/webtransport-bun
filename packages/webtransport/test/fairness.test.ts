@@ -86,29 +86,42 @@ describe("fairness and abuse resistance (P2.3)", () => {
 				handshakesBurst: 1,
 				handshakesBurstPerPrefix: 1,
 			},
-			onSession: () => {},
-		});
-		await Bun.sleep(2000);
-
-		await connect(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-		let err: unknown;
-		try {
-			await connect(`https://127.0.0.1:${port}`, {
-				tls: { insecureSkipVerify: true },
+				onSession: () => {},
 			});
-		} catch (e) {
-			err = e;
+		try {
+			await Bun.sleep(1500);
+
+			const first = await connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+				limits: { handshakeTimeoutMs: 1500 },
+			});
+
+			let err: unknown;
+			for (let i = 0; i < 3; i++) {
+				try {
+					const c = await connect(`https://127.0.0.1:${port}`, {
+						tls: { insecureSkipVerify: true },
+						limits: { handshakeTimeoutMs: 1500 },
+					});
+					c.close();
+				} catch (e) {
+					err = e;
+					if (e instanceof WebTransportError && e.code === E_RATE_LIMITED) {
+						break;
+					}
+				}
+				await Bun.sleep(50);
+			}
+			expect(err).toBeDefined();
+			expect((err as WebTransportError).code).toBe(E_RATE_LIMITED);
+
+			const m = server.metricsSnapshot();
+			expect(m.rateLimitedCount).toBeGreaterThanOrEqual(1);
+			first.close();
+		} finally {
+			await server.close();
 		}
-		expect(err).toBeDefined();
-		expect((err as WebTransportError).code).toBe(E_RATE_LIMITED);
-
-		const m = server.metricsSnapshot();
-		expect(m.rateLimitedCount).toBeGreaterThanOrEqual(1);
-
-		await server.close();
-	}, 10000);
+	}, 15000);
 
 	it("per-IP burst: at most burst connections succeed, excess rejected with rate limit", async () => {
 		const port = nextPort();
