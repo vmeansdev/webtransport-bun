@@ -135,6 +135,43 @@ test.describe("P3.3 interop expansion", () => {
         );
     });
 
+    test("getStats returns connection stats when available", async ({ page }) => {
+        await page.goto("http://127.0.0.1:4434");
+        const h = getCertHashBase64();
+
+        const result = await page.evaluate(async (hash: string) => {
+            const opts = hash
+                ? {
+                      serverCertificateHashes: [
+                          {
+                              algorithm: "sha-256" as const,
+                              value: Uint8Array.from(atob(hash), (c) => c.charCodeAt(0)),
+                          },
+                      ],
+                  }
+                : {};
+            const wt = new WebTransport("https://127.0.0.1:4433", opts);
+            await wt.ready;
+            if (typeof wt.getStats !== "function") {
+                await wt.close();
+                return { supported: false };
+            }
+            const stats = await wt.getStats();
+            await wt.close();
+            return {
+                supported: true,
+                hasDatagrams: stats != null && "datagrams" in stats,
+                datagramKeys:
+                    stats?.datagrams != null ? Object.keys(stats.datagrams) : [],
+            };
+        }, h);
+
+        if (result.supported) {
+            expect(result.hasDatagrams).toBe(true);
+            expect(Array.isArray(result.datagramKeys)).toBe(true);
+        }
+    });
+
     test("stream reset: writable.abort does not crash session", async ({ page }) => {
         await page.goto("http://127.0.0.1:4434");
         const h = getCertHashBase64();
