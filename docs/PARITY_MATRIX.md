@@ -118,23 +118,25 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Streams               | `incomingBidirectionalStreams` readable stream      | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |
 | Streams               | `createUnidirectionalStream()` writable stream      | `implemented`  | Facade writable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run and option semantics                            |
 | Streams               | `incomingUnidirectionalStreams` readable stream     | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |
-| Streams               | `sendOrder`/`sendGroup` on createBidi/createUni     | `partial`      | Options accepted, no-op (native layer does not support stream prioritization)                            | API compatible; ordering not enforced                                   | —                                                                       |
-| Stream control        | reset/stop sending semantics                        | `partial`      | Symbol methods `WT_RESET` / `WT_STOP_SENDING` in `packages/webtransport/src/streams.ts`                 | Spec API shape differs; semantics mostly present                        | Bridge to browser-style stream cancellation/abort semantics           |
+| Streams               | `sendOrder`/`sendGroup` on createBidi/createUni     | `diverged`     | Options accepted, no-op (native layer does not support stream prioritization)                            | Native scheduler required for true prioritization; JS cannot guarantee  | —                                                                       |
+| Stream control        | reset/stop sending semantics                        | `implemented`  | `writable.abort(reason)` → reset; `readable.cancel(reason)` → stopSending; symbols `WT_RESET`/`WT_STOP_SENDING` preserved | Browser-shaped API + symbol compatibility                               | —                                                                       |
 | Error model           | WebTransport error classes/codes                    | `implemented`  | WebTransportError with code, source, streamErrorCode; cause holds internal code                         | Spec-like shape; internal E_* preserved in cause                        | —                                                                       |
-| Stats                 | `getStats()` dictionaries                           | `partial`      | WebTransport.getStats() returns WebTransportConnectionStats with datagrams; bytesSent/RTT etc. absent (native does not expose) | Phase 3 implemented                                                      | —                                                                       |
+| Stats                 | `getStats()` dictionaries                           | `diverged`     | WebTransport.getStats() returns WebTransportConnectionStats with datagrams only; bytesSent/RTT/bytesReceived etc. absent (native layer does not expose) | Full stats require native metrics expansion                              | —                                                                       |
 | Security/auth         | `serverCertificateHashes` behavior                  | `diverged`     | Facade validates format, then rejects with "not supported in this runtime"                               | Option parsed/validated; explicit unsupported path (R5)                  | —                                                                       |
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
 | Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
 | Static capabilities   | `supportsReliableOnly`                             | `implemented`  | WebTransport.supportsReliableOnly = false (QUIC supports unreliable)                                   | —                                                                       | —                                                                       |
-| Options               | `congestionControl`, `datagramsReadableType`       | `partial`      | Accepted, validated; no-op (native uses default)                                                       | API compatible                                                          | —                                                                       |
+| Options               | `congestionControl`, `datagramsReadableType`       | `diverged`     | Accepted, validated; no-op (native uses default; byte-mode readable not implemented)                   | congestionControl requires native; datagramsReadableType "bytes" needs byte stream | —                                                                       |
 
 
 ## Intentional Divergences (currently)
 
 1. Primary package API is Node-first (not browser-API-first).
 2. Node client streams are Node streams; facade exposes Web Streams for browser parity.
-3. **Stats (getStats())**: `getStats()` implemented; returns minimal WebTransportConnectionStats (datagrams only). bytesSent, RTT, etc. omitted (native layer does not expose).
+3. **Stats (getStats())**: Returns minimal WebTransportConnectionStats (datagrams only). bytesSent, RTT, bytesReceived, etc. omitted (native layer does not expose).
 4. **serverCertificateHashes**: Option is parsed/validated but runtime does not support it; explicit rejection with clear error.
+5. **sendOrder/sendGroup**: Accepted on createBidirectionalStream/createUnidirectionalStream; no-op. Native layer has no stream prioritization.
+6. **congestionControl / datagramsReadableType**: Accepted, validated; no-op. congestionControl requires native; datagramsReadableType "bytes" (ReadableByteStream) not implemented.
 
 ## Priority Execution Order (completed)
 
@@ -152,7 +154,8 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
    - confirm `test:parity` pass in CI
    - confirm interop pass in CI
    - confirm security scan jobs pass in CI
-2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A: draining resolves when `close()` called; closed propagates closeCode/reason; termination tests added for iterators.
+2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A.
+3. ~~Phase 7 partial-to-implemented closure~~ — Completed: stream control abort/cancel implemented; remaining partial rows converted to diverged.
 
 ## Required CI Gate
 
