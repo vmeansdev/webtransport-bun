@@ -86,7 +86,10 @@ describe("webtransport client", () => {
 
 		await client.sendDatagram(new Uint8Array([1, 2, 3]));
 		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-		const first = await iter.next();
+		const first = (await Promise.race([
+			iter.next(),
+			Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
+		])) as IteratorResult<Uint8Array>;
 		expect(first.done).toBe(false);
 		expect(new Uint8Array(first.value!)).toEqual(new Uint8Array([1, 2, 3]));
 

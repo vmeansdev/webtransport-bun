@@ -25,6 +25,16 @@ async function waitUntil(
 	return condition();
 }
 
+async function readDatagramWithTimeout(
+	iter: AsyncIterator<Uint8Array>,
+	timeoutMs: number,
+): Promise<IteratorResult<Uint8Array>> {
+	return (await Promise.race([
+		iter.next(),
+		Bun.sleep(timeoutMs).then(() => ({ done: true as const, value: undefined })),
+	])) as IteratorResult<Uint8Array>;
+}
+
 describe("acceptance (Task gates)", () => {
 	it("P0-2: sustained multi-stream and datagram traffic", async () => {
 		const port = nextPort();
@@ -69,7 +79,7 @@ describe("acceptance (Task gates)", () => {
 		let received = 0;
 		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
 		while (received < 10) {
-			const next = await iter.next();
+			const next = await readDatagramWithTimeout(iter, 1200);
 			if (next.done) break;
 			received++;
 		}
@@ -194,11 +204,17 @@ describe("acceptance (Task gates)", () => {
 		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await client.sendDatagram(new Uint8Array([1, 2, 3]));
-		await client.incomingDatagrams()[Symbol.asyncIterator]().next();
-		const iter = client.incomingBidirectionalStreams()[Symbol.asyncIterator]();
-		await iter.next();
-		await Bun.sleep(500);
+			await client.sendDatagram(new Uint8Array([1, 2, 3]));
+			const dgIter = client.incomingDatagrams()[Symbol.asyncIterator]();
+			const dgNext = await readDatagramWithTimeout(dgIter, 1500);
+			expect(dgNext.done).toBe(false);
+			const iter = client.incomingBidirectionalStreams()[Symbol.asyncIterator]();
+			const streamNext = (await Promise.race([
+				iter.next(),
+				Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
+			])) as IteratorResult<unknown>;
+			expect(streamNext.done).toBe(false);
+			await Bun.sleep(500);
 
 		const m = server.metricsSnapshot() as Record<string, any>;
 		const handshake = m.handshakeLatency ?? m.handshake_latency;

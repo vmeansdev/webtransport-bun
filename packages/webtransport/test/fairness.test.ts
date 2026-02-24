@@ -227,15 +227,21 @@ describe("fairness and abuse resistance (P2.3)", () => {
 				const deadline = Date.now() + 8000;
 				while (Date.now() < deadline) {
 					try {
-						const c = await connect(`https://127.0.0.1:${port}`, {
-							tls: { insecureSkipVerify: true },
-						});
-						await c.sendDatagram(new Uint8Array([1, 2, 3]));
-						const iter = c.incomingDatagrams()[Symbol.asyncIterator]();
-						const r = await iter.next();
-						if (r.value) compliantConnected = true;
-						c.close();
-						return;
+							const c = await connect(`https://127.0.0.1:${port}`, {
+								tls: { insecureSkipVerify: true },
+							});
+							await c.sendDatagram(new Uint8Array([1, 2, 3]));
+							const iter = c.incomingDatagrams()[Symbol.asyncIterator]();
+							const r = (await Promise.race([
+								iter.next(),
+								Bun.sleep(1200).then(() => ({
+									done: true as const,
+									value: undefined,
+								})),
+							])) as IteratorResult<Uint8Array>;
+							if (r.value) compliantConnected = true;
+							c.close();
+							return;
 					} catch {
 						await Bun.sleep(400);
 					}

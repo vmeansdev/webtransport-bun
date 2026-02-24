@@ -66,6 +66,7 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 5. JS callback delivery must be rate-limited/batched to prevent per-packet callback storms.
 6. W3C client-facade divergences MUST be explicit in `docs/PARITY_MATRIX.md`; no silent no-op behavior for declared options.
 7. Any divergence-to-implementation work must preserve stable `E_*` diagnostics and add parity + interop tests.
+8. Test determinism rule: tests MUST NOT use unbounded waits on async iterators/streams (`await iter.next()`, open-ended `for await`) without a timeout guard. Use bounded helpers (`Promise.race` with `Bun.sleep(...)`) or polling-with-deadline so each wait has an explicit upper bound and cannot hang CI.
 
 ## Default limits (v1)
 These are default values; they must be configurable via server/client options.

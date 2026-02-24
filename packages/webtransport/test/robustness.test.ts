@@ -66,12 +66,14 @@ describe("robustness (Phase 4)", () => {
 
         await client.sendDatagram(new Uint8Array([1, 2, 3]));
         let count = 0;
-        for await (const _ of client.incomingDatagrams()) {
+        const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+        const first = (await Promise.race([
+            iter.next(),
+            Bun.sleep(1500).then(() => ({ done: true as const, value: undefined })),
+        ])) as IteratorResult<Uint8Array>;
+        if (!first.done) {
             count++;
-            if (count >= 1) {
-                client.close();
-                break;
-            }
+            client.close();
         }
         expect(count).toBeGreaterThanOrEqual(1);
         await server.close();

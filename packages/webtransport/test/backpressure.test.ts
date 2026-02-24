@@ -83,7 +83,10 @@ describe("backpressure (P0-C)", () => {
         const dgram = new Uint8Array([1, 2, 3]);
         await client.sendDatagram(dgram);
         const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-        const first = await iter.next();
+        const first = (await Promise.race([
+            iter.next(),
+            Bun.sleep(1500).then(() => ({ done: true as const, value: undefined })),
+        ])) as IteratorResult<Uint8Array>;
         expect(first.done).toBe(false);
 
         await server.close();
