@@ -47,9 +47,10 @@ describe("parity baseline (Phase 0)", () => {
 		// Streams
 		expect("incomingBidirectionalStreams" in wt).toBe(true);
 		expect("incomingUnidirectionalStreams" in wt).toBe(true);
-		expect(typeof wt.createBidirectionalStream).toBe("function");
-		expect(typeof wt.createUnidirectionalStream).toBe("function");
-		expect(typeof wt.close).toBe("function");
+			expect(typeof wt.createBidirectionalStream).toBe("function");
+			expect(typeof wt.createUnidirectionalStream).toBe("function");
+			expect(typeof wt.createSendGroup).toBe("function");
+			expect(typeof wt.close).toBe("function");
 
 		wt.close();
 	});
@@ -65,24 +66,32 @@ describe("parity baseline (Phase 0)", () => {
 		expect(stats).toBeDefined();
 		expect(stats.datagrams).toBeDefined();
 		expect(typeof stats.datagrams.droppedIncoming).toBe("number");
-		expect(typeof stats.datagrams.expiredIncoming).toBe("number");
-		expect(typeof stats.datagrams.expiredOutgoing).toBe("number");
-		expect(typeof stats.datagrams.lostOutgoing).toBe("number");
+			expect(typeof stats.datagrams.expiredIncoming).toBe("number");
+			expect(typeof stats.datagrams.expiredOutgoing).toBe("number");
+			expect(typeof stats.datagrams.lostOutgoing).toBe("number");
+			expect(typeof stats.bytesSent).toBe("number");
+			expect(typeof stats.bytesReceived).toBe("number");
+			expect(typeof stats.packetsSent).toBe("number");
+			expect(typeof stats.packetsReceived).toBe("number");
 
 		wt.close();
 	});
 
-	test("unsupported constructor options throw", () => {
-		expect(
-			() =>
-				new WebTransport(`https://127.0.0.1:${port}`, { allowPooling: true }),
-		).toThrow(/unsupported option 'allowPooling'/);
-		expect(
-			() =>
-				new WebTransport(`https://127.0.0.1:${port}`, {
-					requireUnreliable: true,
-				}),
-		).toThrow(/unsupported option 'requireUnreliable'/);
+	test("allowPooling and requireUnreliable options are accepted", () => {
+		expect(() => {
+			const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+				allowPooling: true,
+				tls: { insecureSkipVerify: true },
+			});
+			wt.close();
+		}).not.toThrow();
+		expect(() => {
+			const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+				requireUnreliable: true,
+				tls: { insecureSkipVerify: true },
+			});
+			wt.close();
+		}).not.toThrow();
 	});
 
 	test("datagrams.readable and datagrams.writable are Web Streams", async () => {

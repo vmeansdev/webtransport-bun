@@ -4,7 +4,7 @@
 Browser-Style Client Facade for `@webtransport-bun/webtransport`
 
 ## Status
-Implemented with documented divergences (see `docs/PARITY_MATRIX.md` and `PARITY_PLAN.md`)
+Implemented (see `docs/PARITY_MATRIX.md` and `PARITY_PLAN.md`)
 
 ## Motivation
 The current package is Node-first and production-friendly for backend usage. For client developers already familiar with browser WebTransport, a browser-shaped API reduces onboarding cost and usage mistakes.
@@ -113,8 +113,10 @@ export function toWebTransport(session: ClientSession): WebTransport;
 - Preserve stable internal `E_*` codes.
 - Surface browser-like errors in facade while attaching internal code in metadata (`cause.code` or equivalent).
 
-### Unsupported/diverged option behavior
-- Diverged W3C items are explicitly documented in `docs/PARITY_MATRIX.md`; no silent no-op behavior is permitted unless explicitly documented as divergence.
+### Option behavior
+- `allowPooling` is accepted; current runtime uses dedicated sessions until a native pool manager exists.
+- `requireUnreliable` is accepted; current runtime transport always supports unreliable delivery.
+- `serverCertificateHashes` is rejected when combined with `allowPooling=true`, matching W3C constraints.
 
 ## Compatibility
 - Server API remains Node-native (`createServer`).

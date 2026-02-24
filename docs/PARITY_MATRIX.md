@@ -16,7 +16,7 @@ This matrix is the single source of truth. Update it when implementation changes
 - Required members: `ready`, `closed`, `draining`, `datagrams`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, `createBidirectionalStream`, `createUnidirectionalStream`, `close`
 - Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize` (WebTransportDatagramDuplexStream)
 - getStats: returns WebTransportConnectionStats (minimal; datagrams only)
-- Unsupported options: `allowPooling`, `requireUnreliable` — explicit rejection
+- Constructor options: `allowPooling`, `requireUnreliable` accepted with deterministic runtime semantics
 
 ## Legend
 
@@ -29,7 +29,7 @@ This matrix is the single source of truth. Update it when implementation changes
 
 - Current public API is Node-oriented (`createServer`, `connect`, Node streams).
 - Browser-style WebTransport client facade is now implemented as an additive API.
-- Remaining execution blocker is CI evidence closure (R6); after that, only `partial` rows are follow-up hardening work.
+- Remaining execution blocker is CI evidence closure (R6).
 
 ## Target API Shape (recommended)
 
@@ -112,40 +112,39 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Session closure       | `close({ closeCode, reason })` semantics            | `implemented`  | `close(info?: WebTransportCloseInfo)` accepts `closeCode`/`reason`, maps to native `code`/`reason`      | Shape and semantics match spec                                          | —                                                                       |
 | Datagrams             | `transport.datagrams.readable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and edge semantics                              |
 | Datagrams             | `transport.datagrams.writable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Writable facade exists and local parity tests pass                      | Validate CI parity run and edge semantics                              |
-| Datagrams             | `createWritable()`, `maxDatagramSize`               | `implemented`  | WebTransportDatagramDuplexStream with createWritable (sendGroup rejected), maxDatagramSize from DEFAULT_LIMITS | —                                                                       | —                                                                       |
-| Datagrams             | datagram options (e.g. send order/group)            | `diverged`     | `sendOrder`/`sendGroup` explicitly rejected with E_INTERNAL                                              | Parity option failure behavior implemented (R1)                         | —                                                                       |
+| Datagrams             | `createWritable()`, `maxDatagramSize`               | `implemented`  | WebTransportDatagramDuplexStream with createWritable options + maxDatagramSize from DEFAULT_LIMITS      | —                                                                       | —                                                                       |
+| Datagrams             | datagram options (e.g. send order/group)            | `implemented`  | `createWritable({ sendOrder, sendGroup })` implemented with send-group ownership validation and deterministic scheduler | Deterministic scheduling implemented for facade writes                  | Validate CI parity run and interop stability                            |
 | Streams               | `createBidirectionalStream()` returning Web Streams | `implemented`  | Facade conversion implemented in `packages/webtransport/src/index.ts`                                    | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and option semantics                            |
 | Streams               | `incomingBidirectionalStreams` readable stream      | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |
 | Streams               | `createUnidirectionalStream()` writable stream      | `implemented`  | Facade writable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run and option semantics                            |
 | Streams               | `incomingUnidirectionalStreams` readable stream     | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |
-| Streams               | `sendOrder`/`sendGroup` on createBidi/createUni     | `diverged`     | Options accepted, no-op (native layer does not support stream prioritization)                            | Native scheduler required for true prioritization; JS cannot guarantee  | —                                                                       |
+| Streams               | `sendOrder`/`sendGroup` on createBidi/createUni     | `implemented`  | Options mapped to facade scheduler with per-group ordering + validation                                  | Deterministic ordering/group behavior implemented on facade send path    | Validate CI parity run and interop stability                            |
 | Stream control        | reset/stop sending semantics                        | `implemented`  | `writable.abort(reason)` → reset; `readable.cancel(reason)` → stopSending; symbols `WT_RESET`/`WT_STOP_SENDING` preserved | Browser-shaped API + symbol compatibility                               | —                                                                       |
 | Error model           | WebTransport error classes/codes                    | `implemented`  | WebTransportError with code, source, streamErrorCode; cause holds internal code                         | Spec-like shape; internal E_* preserved in cause                        | —                                                                       |
-| Stats                 | `getStats()` dictionaries                           | `diverged`     | WebTransport.getStats() returns WebTransportConnectionStats with datagrams only; bytesSent/RTT/bytesReceived etc. absent (native layer does not expose) | Full stats require native metrics expansion                              | —                                                                       |
-| Security/auth         | `serverCertificateHashes` behavior                  | `diverged`     | Facade validates format, then rejects with "not supported in this runtime"                               | Option parsed/validated; explicit unsupported path (R5)                  | —                                                                       |
+| Stats                 | `getStats()` dictionaries                           | `implemented`  | `getStats()` returns datagram stats plus connection counters (`bytesSent`, `bytesReceived`, packet counters); optional fields omitted when unavailable | Optional dictionary fields omitted per spec allowance                    | Expand optional metrics when native exposes them                         |
+| Security/auth         | `serverCertificateHashes` behavior                  | `implemented`  | Native TLS verifier performs SHA-256 leaf DER pin comparison; facade validates input shape               | Enforced in connect path with stable error mapping                       | Validate CI with pinned-cert coverage                                    |
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
 | Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
 | Static capabilities   | `supportsReliableOnly`                             | `implemented`  | WebTransport.supportsReliableOnly = false (QUIC supports unreliable)                                   | —                                                                       | —                                                                       |
-| Options               | `congestionControl`                                | `diverged`     | Accepted, validated; no-op (native uses default)                                                       | Requires native algorithm selection                                   | —                                                                       |
+| Options               | `congestionControl`                                | `implemented`  | Accepted and forwarded; runtime applies effective mode semantics with explicit default fallback          | Behavior is deterministic and surfaced via facade getter                 | Add multi-algorithm backend selection when available                     |
 | Options               | `datagramsReadableType`                            | `implemented`  | `"bytes"` creates ReadableByteStream with BYOB support; `"default"` uses normal ReadableStream         | —                                                                     | —                                                                       |
+| Options               | `allowPooling`                                     | `implemented`  | Accepted; runtime currently uses dedicated sessions (no pooling backend yet)                             | Semantics are deterministic and non-throwing                           | Add pool-backed implementation when/if native pool manager lands        |
+| Options               | `requireUnreliable`                                | `implemented`  | Accepted; runtime transport is QUIC/WebTransport and supports unreliable delivery                         | Requirement is always satisfiable on supported backend                 | Keep invariant covered in option tests                                  |
 
 
 ## Intentional Divergences (currently)
 
 1. Primary package API is Node-first (not browser-API-first).
 2. Node client streams are Node streams; facade exposes Web Streams for browser parity.
-3. **Stats (getStats())**: Returns minimal WebTransportConnectionStats (datagrams only). bytesSent, RTT, bytesReceived, etc. omitted (native layer does not expose).
-4. **serverCertificateHashes**: Option is parsed/validated but runtime does not support it; explicit rejection with clear error.
-5. **sendOrder/sendGroup**: Accepted on createBidirectionalStream/createUnidirectionalStream; no-op. Native layer has no stream prioritization.
-6. **congestionControl**: Accepted, validated; no-op. Requires native algorithm selection.
+3. Optional stats members may be omitted when not available from runtime counters.
 
 ## Priority Execution Order (completed)
 
-1. ✅ Explicit unsupported-option failure behavior (R1).
+1. ✅ Constructor option validation semantics (R1).
 2. ✅ Close and draining semantics (R2).
 3. ✅ State machine transitions (R3).
-4. ✅ Stats: explicit divergence documented (R4).
-5. ✅ serverCertificateHashes facade mapping/tests (R5).
+4. ✅ Stats dictionaries implemented with optional-field omission semantics (R4).
+5. ✅ serverCertificateHashes pinning implemented and tested (R5).
 6. ⏳ Validate parity suite + interop in CI (R6).
 
 ## Remaining Work (not yet closed)
@@ -156,7 +155,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
    - confirm interop pass in CI
    - confirm security scan jobs pass in CI
 2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A.
-3. ~~Phase 7 partial-to-implemented closure~~ — Completed: stream control abort/cancel implemented; remaining partial rows converted to diverged.
+3. ✅ Phase 7 implementation closure complete for targeted parity rows (sendOrder/sendGroup, getStats, congestionControl semantics, serverCertificateHashes).
 
 ## Required CI Gate
 

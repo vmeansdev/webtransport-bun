@@ -628,6 +628,7 @@ dependencies = [
 name = "native"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dashmap",
  "napi",
  "napi-build",
@@ -637,6 +638,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "url",

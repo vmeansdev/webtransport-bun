@@ -62,28 +62,33 @@ describe("parity error and close mapping (P4)", () => {
 		expect(stopErr.source).toBe("stream");
 	});
 
-	test("constructor rejects unsupported options (allowPooling, requireUnreliable)", () => {
-		expect(
-			() =>
-				new WebTransport(`https://127.0.0.1:${port}`, { allowPooling: true }),
-		).toThrow(/unsupported option 'allowPooling'/);
-		expect(
-			() =>
-				new WebTransport(`https://127.0.0.1:${port}`, {
-					requireUnreliable: true,
-				}),
-		).toThrow(/unsupported option 'requireUnreliable'/);
+	test("constructor accepts allowPooling and requireUnreliable booleans", () => {
+		expect(() => {
+			const pooled = new WebTransport(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+				allowPooling: true,
+			});
+			pooled.close();
+		}).not.toThrow();
+		expect(() => {
+			const unreliable = new WebTransport(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+				requireUnreliable: true,
+			});
+			unreliable.close();
+		}).not.toThrow();
 	});
 
-	test("serverCertificateHashes: valid format throws not-supported, invalid format throws validation error", () => {
-		expect(
-			() =>
-				new WebTransport(`https://127.0.0.1:${port}`, {
-					serverCertificateHashes: [
-						{ algorithm: "sha-256", value: new Uint8Array(32) },
-					],
-				}),
-		).toThrow(/serverCertificateHashes is not supported in this runtime/);
+	test("serverCertificateHashes: valid format accepted, invalid format throws validation error", () => {
+		expect(() => {
+			const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+				serverCertificateHashes: [
+					{ algorithm: "sha-256", value: new Uint8Array(32) },
+				],
+			});
+			wt.close();
+		}).not.toThrow();
 		expect(
 			() =>
 				new WebTransport(`https://127.0.0.1:${port}`, {
@@ -92,31 +97,50 @@ describe("parity error and close mapping (P4)", () => {
 					],
 				}),
 		).toThrow(/only supports algorithm "sha-256"/);
+		expect(
+			() =>
+				new WebTransport(`https://127.0.0.1:${port}`, {
+					allowPooling: true,
+					serverCertificateHashes: [
+						{ algorithm: "sha-256", value: new Uint8Array(32) },
+					],
+				}),
+		).toThrow(/cannot be used with allowPooling=true/);
 	});
 
-	test("createBidirectionalStream accepts sendOrder and sendGroup (no-op)", async () => {
+	test("createBidirectionalStream applies sendOrder and validates sendGroup ownership", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await wt.ready;
+		const group = wt.createSendGroup();
 		const withSendOrder = await wt.createBidirectionalStream({ sendOrder: 1 });
 		expect(withSendOrder.readable).toBeInstanceOf(ReadableStream);
 		expect(withSendOrder.writable).toBeInstanceOf(WritableStream);
-		const withSendGroup = await wt.createBidirectionalStream({ sendGroup: {} });
+		const withSendGroup = await wt.createBidirectionalStream({ sendGroup: group });
 		expect(withSendGroup.readable).toBeInstanceOf(ReadableStream);
 		expect(withSendGroup.writable).toBeInstanceOf(WritableStream);
+		await expect(
+			wt.createBidirectionalStream({ sendGroup: {} as unknown as never }),
+		).rejects.toThrow(/sendGroup belongs to another transport/);
 		wt.close();
 	});
 
-	test("createUnidirectionalStream accepts sendOrder and sendGroup (no-op)", async () => {
+	test("createUnidirectionalStream applies sendOrder and validates sendGroup ownership", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await wt.ready;
+		const group = wt.createSendGroup();
 		const withSendOrder = await wt.createUnidirectionalStream({ sendOrder: 1 });
 		expect(withSendOrder).toBeInstanceOf(WritableStream);
-		const withSendGroup = await wt.createUnidirectionalStream({ sendGroup: {} });
+		const withSendGroup = await wt.createUnidirectionalStream({
+			sendGroup: group,
+		});
 		expect(withSendGroup).toBeInstanceOf(WritableStream);
+		await expect(
+			wt.createUnidirectionalStream({ sendGroup: {} as unknown as never }),
+		).rejects.toThrow(/sendGroup belongs to another transport/);
 		wt.close();
 	});
 });

@@ -4,6 +4,7 @@ use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFun
 use napi::{JsFunction, Result};
 use napi_derive::napi;
 use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -674,6 +675,7 @@ fn build_root_cert_store(
 fn build_client_tls_config(
     root_store: std::sync::Arc<rustls::RootCertStore>,
     insecure_skip_verify: bool,
+    pinned_hashes: &[[u8; 32]],
 ) -> rustls::ClientConfig {
     use std::sync::Arc;
 
@@ -682,13 +684,23 @@ fn build_client_tls_config(
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 supported")
-        .with_root_certificates(root_store)
+        .with_root_certificates(Arc::clone(&root_store))
         .with_no_client_auth();
 
     if insecure_skip_verify {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(InsecureVerifier));
+    } else if !pinned_hashes.is_empty() {
+        let base = rustls::client::WebPkiServerVerifier::builder(Arc::clone(&root_store))
+            .build()
+            .expect("WebPkiServerVerifier should build with provided root store");
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(PinnedCertVerifier {
+                inner: base,
+                pins: pinned_hashes.to_vec(),
+            }));
     }
 
     config.alpn_protocols = vec![wtransport::proto::WEBTRANSPORT_ALPN.to_vec()];
@@ -746,6 +758,104 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     }
 }
 
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    pins: Vec<[u8; 32]>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(end_entity.as_ref());
+        let actual: [u8; 32] = hasher.finalize().into();
+        if self.pins.iter().any(|p| p == &actual) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "E_TLS: server certificate hash mismatch".to_string(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn parse_server_certificate_hashes(
+    opts: &serde_json::Value,
+) -> std::result::Result<Vec<[u8; 32]>, String> {
+    let mut out = Vec::new();
+    let Some(arr) = opts
+        .get("serverCertificateHashes")
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(out);
+    };
+    for entry in arr {
+        let algorithm = entry
+            .get("algorithm")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if algorithm != "sha-256" {
+            return Err(format!(
+                "E_INTERNAL: serverCertificateHashes only supports algorithm \"sha-256\", got \"{}\"",
+                algorithm
+            ));
+        }
+        let value_b64 = entry
+            .get("valueBase64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                "E_INTERNAL: serverCertificateHashes entry value must be base64".to_string()
+            })?;
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value_b64)
+            .map_err(|_| "E_INTERNAL: invalid base64 in serverCertificateHashes".to_string())?;
+        if decoded.len() != 32 {
+            return Err(
+                "E_INTERNAL: serverCertificateHashes value must be 32-byte SHA-256".to_string(),
+            );
+        }
+        let mut pin = [0u8; 32];
+        pin.copy_from_slice(&decoded);
+        out.push(pin);
+    }
+    Ok(out)
+}
+
 async fn run_connect(
     url: &str,
     opts_json: String,
@@ -767,6 +877,7 @@ async fn run_connect(
     let server_name = tls_opts
         .and_then(|t| t.get("serverName")?.as_str())
         .filter(|s| !s.is_empty());
+    let pinned_hashes = parse_server_certificate_hashes(&opts).map_err(std::io::Error::other)?;
 
     let handshake_timeout_ms = opts
         .get("limits")
@@ -781,9 +892,9 @@ async fn run_connect(
             .with_bind_default()
             .with_no_cert_validation()
             .build()
-    } else if ca_pem.is_some() {
+    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
         let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
-        let tls_config = build_client_tls_config(root_store, false);
+        let tls_config = build_client_tls_config(root_store, false, pinned_hashes.as_slice());
         wtransport::ClientConfig::builder()
             .with_bind_default()
             .with_custom_tls(tls_config)

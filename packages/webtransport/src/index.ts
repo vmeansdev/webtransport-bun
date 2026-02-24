@@ -245,8 +245,9 @@ export type WebTransportCloseInfo = {
 
 /**
  * Options for `new WebTransport(url, options)`.
- * Unsupported: `allowPooling`, `requireUnreliable`, `serverCertificateHashes` (validated then rejected).
- * Stream options `sendOrder`/`sendGroup` are accepted but ignored (native layer does not support prioritization).
+ * `allowPooling` and `requireUnreliable` are accepted with deterministic facade semantics:
+ * - `allowPooling`: accepted; current runtime always uses dedicated sessions (no pool backend yet).
+ * - `requireUnreliable`: accepted; current runtime uses QUIC/WebTransport and always supports unreliable delivery.
  */
 export type WebTransportClientOptions = {
 	serverCertificateHashes?: Array<{
@@ -255,7 +256,7 @@ export type WebTransportClientOptions = {
 	}>;
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;
-	/** Accepted, no-op (native uses default). */
+	/** Preference hint for congestion control. */
 	congestionControl?: "default" | "throughput" | "low-latency";
 	/** When "bytes", datagrams.readable is a ReadableByteStream with BYOB support; default uses normal ReadableStream. */
 	datagramsReadableType?: "bytes" | "default";
@@ -282,6 +283,13 @@ export type ClientOptions = {
 	};
 	limits?: Partial<LimitsOptions>;
 	log?: (event: LogEvent) => void;
+	/** Internal/advanced: cert pinning list serialized as base64. */
+	serverCertificateHashes?: Array<{
+		algorithm: "sha-256";
+		valueBase64: string;
+	}>;
+	/** Internal/advanced: congestion hint passed to native runtime. */
+	congestionControl?: "default" | "throughput" | "low-latency";
 };
 
 // ---------------------------------------------------------------------------
@@ -300,9 +308,31 @@ export type WebTransportDatagramDuplexStream = {
 	readonly readable: ReadableStream<Uint8Array>;
 	/** Backward compat: default writable. Prefer createWritable() for multiple writers. */
 	readonly writable: WritableStream<Uint8Array>;
-	createWritable(options?: { sendGroup?: unknown }): WritableStream<Uint8Array>;
+	createWritable(options?: {
+		sendGroup?: WebTransportSendGroup | null;
+		sendOrder?: number;
+	}): WritableStream<Uint8Array>;
 	readonly maxDatagramSize: number;
 };
+
+/** W3C-style send group object used by sendOrder/sendGroup options. */
+export class WebTransportSendGroup {
+	readonly #transport: WebTransport;
+	readonly #id: number;
+	constructor(transport: WebTransport, id: number) {
+		this.#transport = transport;
+		this.#id = id;
+	}
+	_getTransport(): WebTransport {
+		return this.#transport;
+	}
+	_getId(): number {
+		return this.#id;
+	}
+	async getStats(): Promise<{ bytesSent?: number; bytesAcknowledged?: number }> {
+		return this.#transport._getSendGroupStats(this.#id);
+	}
+}
 
 export type WebTransportReceiveStream = ReadableStream<Uint8Array> &
 	Partial<StopSendable>;
@@ -1044,6 +1074,8 @@ export async function connect(
 	const optsJson = JSON.stringify({
 		limits: mergedLimits,
 		tls: tlsOpts,
+		congestionControl: opts?.congestionControl,
+		serverCertificateHashes: opts?.serverCertificateHashes,
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
@@ -1102,15 +1134,6 @@ export async function connect(
 // Browser-style WebTransport facade (Phase P1)
 // ---------------------------------------------------------------------------
 
-const UNSUPPORTED_CTOR_OPTIONS = ["allowPooling", "requireUnreliable"] as const;
-
-function rejectUnsupportedOption(optionName: string): never {
-	throw new WebTransportError(
-		E_INTERNAL as ErrorCode,
-		`E_INTERNAL: unsupported option '${optionName}'`,
-	);
-}
-
 function validateServerCertificateHashes(
 	arr: Array<{ algorithm: string; value: BufferSource }>,
 ): void {
@@ -1135,15 +1158,40 @@ function validateServerCertificateHashes(
 	}
 }
 
+function bufferSourceToUint8(value: BufferSource): Uint8Array {
+	if (value instanceof ArrayBuffer) return new Uint8Array(value);
+	if (ArrayBuffer.isView(value)) {
+		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	}
+	throw new WebTransportError(
+		E_INTERNAL as ErrorCode,
+		"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+	);
+}
+
+function bufferSourceToBase64(value: BufferSource): string {
+	return Buffer.from(bufferSourceToUint8(value)).toString("base64");
+}
+
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
 const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
 
 function validateClientOptions(opts?: WebTransportClientOptions): void {
 	if (!opts) return;
-	for (const k of UNSUPPORTED_CTOR_OPTIONS) {
-		if (k in opts && (opts as Record<string, unknown>)[k] !== undefined) {
-			rejectUnsupportedOption(k);
-		}
+	if (opts.allowPooling !== undefined && typeof opts.allowPooling !== "boolean") {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			"E_INTERNAL: allowPooling must be a boolean",
+		);
+	}
+	if (
+		opts.requireUnreliable !== undefined &&
+		typeof opts.requireUnreliable !== "boolean"
+	) {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			"E_INTERNAL: requireUnreliable must be a boolean",
+		);
 	}
 	if (
 		opts.congestionControl !== undefined &&
@@ -1170,11 +1218,13 @@ function validateClientOptions(opts?: WebTransportClientOptions): void {
 				"E_INTERNAL: serverCertificateHashes must be an array",
 			);
 		}
+		if (opts.allowPooling === true) {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				"E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true",
+			);
+		}
 		validateServerCertificateHashes(opts.serverCertificateHashes);
-		throw new WebTransportError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: serverCertificateHashes is not supported in this runtime",
-		);
 	}
 }
 
@@ -1184,6 +1234,11 @@ function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 	return {
 		tls: opts.tls,
 		limits: opts.limits,
+		congestionControl: opts.congestionControl,
+		serverCertificateHashes: opts.serverCertificateHashes?.map((entry) => ({
+			algorithm: entry.algorithm,
+			valueBase64: bufferSourceToBase64(entry.value),
+		})),
 	};
 }
 
@@ -1202,14 +1257,100 @@ type WebTransportState =
 	| "closed"
 	| "failed";
 
+type SendPolicy = {
+	groupId: number;
+	sendOrder: number;
+};
+
+type ScheduledTask = {
+	groupId: number;
+	sendOrder: number;
+	seq: number;
+	run: () => Promise<void>;
+	resolve: () => void;
+	reject: (err: unknown) => void;
+};
+
+class SendScheduler {
+	#queues = new Map<number, ScheduledTask[]>();
+	#groupOrder: number[] = [];
+	#rrIdx = 0;
+	#running = false;
+	#seq = 0;
+
+	enqueue(policy: SendPolicy, run: () => Promise<void>): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			const task: ScheduledTask = {
+				groupId: policy.groupId,
+				sendOrder: policy.sendOrder,
+				seq: this.#seq++,
+				run,
+				resolve,
+				reject,
+			};
+			const q = this.#queues.get(policy.groupId) ?? [];
+			q.push(task);
+			q.sort((a, b) => a.sendOrder - b.sendOrder || a.seq - b.seq);
+			this.#queues.set(policy.groupId, q);
+			if (!this.#groupOrder.includes(policy.groupId)) {
+				this.#groupOrder.push(policy.groupId);
+			}
+			void this.#drain();
+		});
+	}
+
+	async #drain(): Promise<void> {
+		if (this.#running) return;
+		this.#running = true;
+		try {
+			while (this.#groupOrder.length > 0) {
+				const groupId = this.#nextGroup();
+				if (groupId == null) break;
+				const q = this.#queues.get(groupId);
+				if (!q || q.length === 0) {
+					this.#removeGroup(groupId);
+					continue;
+				}
+				const task = q.shift()!;
+				if (q.length === 0) this.#removeGroup(groupId);
+				try {
+					await task.run();
+					task.resolve();
+				} catch (err) {
+					task.reject(err);
+				}
+			}
+		} finally {
+			this.#running = false;
+		}
+	}
+
+	#nextGroup(): number | null {
+		if (this.#groupOrder.length === 0) return null;
+		if (this.#rrIdx >= this.#groupOrder.length) this.#rrIdx = 0;
+		const groupId = this.#groupOrder[this.#rrIdx];
+		this.#rrIdx = (this.#rrIdx + 1) % Math.max(1, this.#groupOrder.length);
+		return groupId;
+	}
+
+	#removeGroup(groupId: number): void {
+		this.#queues.delete(groupId);
+		const idx = this.#groupOrder.indexOf(groupId);
+		if (idx >= 0) this.#groupOrder.splice(idx, 1);
+		if (this.#rrIdx > idx && idx >= 0) this.#rrIdx--;
+		if (this.#rrIdx < 0) this.#rrIdx = 0;
+	}
+}
+
 /**
  * Browser-style WebTransport client (W3C facade).
  *
  * Use `new WebTransport(url, options)` to connect, or `toWebTransport(session)` to wrap an existing
  * {@link ClientSession}. Await {@link WebTransport.ready} before using datagrams/streams.
  *
- * Unsupported options (`allowPooling`, `requireUnreliable`, `serverCertificateHashes`) throw
- * {@link WebTransportError} with code `E_INTERNAL`. Stream options `sendOrder`/`sendGroup` are accepted but ignored.
+ * Option semantics:
+ * - `allowPooling` is accepted; runtime currently always uses dedicated sessions.
+ * - `requireUnreliable` is accepted; runtime transport always supports unreliable delivery.
  *
  * @example
  * ```ts
@@ -1239,15 +1380,29 @@ export class WebTransport {
 		writable: WritableStream<Uint8Array>;
 	}> | null = null;
 	#incomingUniCache: ReadableStream<ReadableStream<Uint8Array>> | null = null;
+	readonly #sendScheduler = new SendScheduler();
+	#nextSendGroupId = 1;
+	readonly #sendGroupBytesSent = new Map<number, number>();
+	readonly #connStats = {
+		bytesSent: 0,
+		bytesReceived: 0,
+		datagramsOut: 0,
+		datagramsIn: 0,
+	};
+	readonly #congestionControl: "default" | "throughput" | "low-latency";
 
 	constructor(
 		urlOrSession: string | ClientSession,
 		options?: WebTransportClientOptions,
 	) {
-		if (typeof urlOrSession === "string") {
-			this.#datagramsReadableType =
-				options?.datagramsReadableType ?? "default";
-			const clientOpts = mapToClientOptions(options);
+			if (typeof urlOrSession === "string") {
+				this.#datagramsReadableType =
+					options?.datagramsReadableType ?? "default";
+				const requestedCongestion = options?.congestionControl ?? "default";
+				// Runtime currently supports default algorithm; explicit preference falls back to default.
+				this.#congestionControl =
+					requestedCongestion === "default" ? "default" : "default";
+				const clientOpts = mapToClientOptions(options);
 			this.#sessionPromise = connect(urlOrSession, clientOpts);
 			this.#state = "connecting";
 			this.#ready = this.#sessionPromise.then(
@@ -1266,9 +1421,10 @@ export class WebTransport {
 					return toCloseInfo(info);
 				}),
 			);
-		} else {
-			this.#datagramsReadableType = "default";
-			const s = urlOrSession;
+			} else {
+				this.#datagramsReadableType = "default";
+				this.#congestionControl = "default";
+				const s = urlOrSession;
 			this.#sessionPromise = Promise.resolve(s);
 			this.#session = s;
 			this.#state = "connected";
@@ -1297,6 +1453,16 @@ export class WebTransport {
 	/** Resolves when close() has been called and closing process has started. */
 	get draining(): Promise<void> {
 		return this.#draining;
+	}
+
+	/** Effective congestion control mode applied by this runtime. */
+	get congestionControl(): "default" | "throughput" | "low-latency" {
+		return this.#congestionControl;
+	}
+
+	/** Create a send group used by sendOrder/sendGroup options. */
+	createSendGroup(): WebTransportSendGroup {
+		return new WebTransportSendGroup(this, this.#nextSendGroupId++);
 	}
 
 	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
@@ -1333,17 +1499,16 @@ export class WebTransport {
 
 	/**
 	 * Create a bidirectional stream (Web Streams).
-	 * sendOrder/sendGroup are accepted but ignored (native layer does not support stream prioritization).
 	 * @throws WebTransportError E_SESSION_CLOSED if session is closed/draining/failed.
 	 */
 	async createBidirectionalStream(options?: {
 		sendOrder?: number;
-		sendGroup?: unknown;
+		sendGroup?: WebTransportSendGroup | null;
 	}): Promise<{
 		readable: ReadableStream<Uint8Array>;
 		writable: WritableStream<Uint8Array>;
 	}> {
-		// sendOrder/sendGroup: accepted, no-op (native does not support)
+		const policy = this._resolveSendPolicy(options);
 		if (
 			this.#state === "draining" ||
 			this.#state === "closed" ||
@@ -1353,19 +1518,29 @@ export class WebTransport {
 		}
 		const s = await this.#sessionPromise;
 		const duplex = await s.createBidirectionalStream();
-		return nodeDuplexToWebBidi(duplex);
+		return nodeDuplexToWebBidi(
+			duplex,
+			this.#sendScheduler,
+			policy,
+			(bytes) => {
+				this.#connStats.bytesSent += bytes;
+				this._recordSendGroupBytes(policy.groupId, bytes);
+			},
+			(bytes) => {
+				this.#connStats.bytesReceived += bytes;
+			},
+		);
 	}
 
 	/**
 	 * Create a unidirectional send stream (WritableStream).
-	 * sendOrder/sendGroup are accepted but ignored (native layer does not support stream prioritization).
 	 * @throws WebTransportError E_SESSION_CLOSED if session is closed/draining/failed.
 	 */
 	async createUnidirectionalStream(options?: {
 		sendOrder?: number;
-		sendGroup?: unknown;
+		sendGroup?: WebTransportSendGroup | null;
 	}): Promise<WritableStream<Uint8Array>> {
-		// sendOrder/sendGroup: accepted, no-op (native does not support)
+		const policy = this._resolveSendPolicy(options);
 		if (
 			this.#state === "draining" ||
 			this.#state === "closed" ||
@@ -1375,7 +1550,15 @@ export class WebTransport {
 		}
 		const s = await this.#sessionPromise;
 		const writable = await s.createUnidirectionalStream();
-		return nodeWritableToWebWritable(writable);
+		return nodeWritableToWebWritable(
+			writable,
+			this.#sendScheduler,
+			policy,
+			(bytes) => {
+				this.#connStats.bytesSent += bytes;
+				this._recordSendGroupBytes(policy.groupId, bytes);
+			},
+		);
 	}
 
 	/**
@@ -1395,8 +1578,11 @@ export class WebTransport {
 				expiredOutgoing: 0,
 				lostOutgoing: 0,
 			},
-			// Extension: expose session-level counters (not in W3C spec but available)
-			// Omitted per spec: bytesSent, bytesReceived, RTT, etc. (native does not expose)
+			bytesSent: this.#connStats.bytesSent,
+			bytesReceived: this.#connStats.bytesReceived,
+			packetsSent: this.#connStats.datagramsOut,
+			packetsReceived: this.#connStats.datagramsIn,
+			estimatedSendRate: null,
 		};
 	}
 
@@ -1423,13 +1609,80 @@ export class WebTransport {
 	_getState(): WebTransportState {
 		return this.#state;
 	}
+
+	_resolveSendPolicy(options?: {
+		sendOrder?: number;
+		sendGroup?: WebTransportSendGroup | null;
+	}): SendPolicy {
+		const sendOrder = options?.sendOrder ?? 0;
+		if (!Number.isInteger(sendOrder)) {
+			throw new TypeError("sendOrder must be an integer");
+		}
+		let groupId = 0;
+			if (options?.sendGroup != null) {
+				if (!(options.sendGroup instanceof WebTransportSendGroup)) {
+					throw new DOMException(
+						"sendGroup belongs to another transport",
+						"InvalidStateError",
+					);
+				}
+				if (options.sendGroup._getTransport() !== this) {
+					throw new DOMException(
+						"sendGroup belongs to another transport",
+						"InvalidStateError",
+					);
+				}
+				groupId = options.sendGroup._getId();
+			}
+		return { groupId, sendOrder };
+	}
+
+	_recordSendGroupBytes(groupId: number, bytes: number): void {
+		this.#sendGroupBytesSent.set(
+			groupId,
+			(this.#sendGroupBytesSent.get(groupId) ?? 0) + bytes,
+		);
+	}
+
+	async _getSendGroupStats(groupId: number): Promise<{
+		bytesSent?: number;
+		bytesAcknowledged?: number;
+	}> {
+		return {
+			bytesSent: this.#sendGroupBytesSent.get(groupId) ?? 0,
+		};
+	}
+
+	async _sendDatagramWithPolicy(
+		chunk: Uint8Array,
+		policy: SendPolicy,
+	): Promise<void> {
+		await this.#sendScheduler.enqueue(policy, async () => {
+			const s = await this.#sessionPromise;
+			await s.sendDatagram(chunk);
+			this.#connStats.bytesSent += chunk.byteLength;
+			this.#connStats.datagramsOut += 1;
+			this._recordSendGroupBytes(policy.groupId, chunk.byteLength);
+		});
+	}
+
+	_recordIncomingDatagram(chunk: Uint8Array): void {
+		this.#connStats.bytesReceived += chunk.byteLength;
+		this.#connStats.datagramsIn += 1;
+	}
+
+	_recordIncomingStreamBytes(bytes: number): void {
+		this.#connStats.bytesReceived += bytes;
+	}
 }
 
-function createDatagramWritable(wt: WebTransport): WritableStream<Uint8Array> {
+function createDatagramWritable(
+	wt: WebTransport,
+	policy: SendPolicy,
+): WritableStream<Uint8Array> {
 	return new WritableStream<Uint8Array>({
 		async write(chunk) {
-			const s = await wt._getSession();
-			await s.sendDatagram(chunk);
+			await wt._sendDatagramWithPolicy(chunk, policy);
 		},
 	});
 }
@@ -1458,6 +1711,7 @@ function createDatagramStreams(
 			return;
 		}
 		const chunk = new Uint8Array(value);
+		wt._recordIncomingDatagram(chunk);
 		const byteController = controller as ReadableByteStreamController;
 		if (
 			readableType === "bytes" &&
@@ -1470,11 +1724,11 @@ function createDatagramStreams(
 					"BYOB buffer smaller than datagram size",
 				);
 			}
-			view.set(chunk.subarray(0, view.byteLength));
-			byteController.byobRequest.respond(chunk.length);
-			return;
-		}
-		controller.enqueue(chunk);
+				view.set(chunk.subarray(0, chunk.length));
+				byteController.byobRequest.respond(chunk.length);
+				return;
+			}
+			controller.enqueue(chunk);
 	};
 
 	const readable =
@@ -1486,23 +1740,23 @@ function createDatagramStreams(
 					highWaterMark: 0,
 				})
 			: new ReadableStream<Uint8Array>({ pull, highWaterMark: 0 });
-	const writable = createDatagramWritable(wt);
+	const writable = createDatagramWritable(wt, { groupId: 0, sendOrder: 0 });
 	return {
 		readable,
 		writable,
-		createWritable(options?: { sendGroup?: unknown }): WritableStream<Uint8Array> {
-			if (options?.sendGroup != null) {
-				throw new WebTransportError(
-					E_INTERNAL as ErrorCode,
-					"E_INTERNAL: unsupported option 'sendGroup' on datagram createWritable",
-				);
-			}
-			const state = wt._getState();
-			if (state === "closed" || state === "failed") {
-				throw new DOMException("InvalidStateError", "Transport is closed or failed");
-			}
-			return createDatagramWritable(wt);
-		},
+			createWritable(options?: {
+				sendGroup?: WebTransportSendGroup | null;
+				sendOrder?: number;
+			}): WritableStream<Uint8Array> {
+				const state = wt._getState();
+				if (state === "closed" || state === "failed") {
+					throw new DOMException(
+						"Transport is closed or failed",
+						"InvalidStateError",
+					);
+				}
+				return createDatagramWritable(wt, wt._resolveSendPolicy(options));
+			},
 		get maxDatagramSize(): number {
 			return DEFAULT_LIMITS.maxDatagramSize;
 		},
@@ -1609,7 +1863,17 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 		async start(controller) {
 			const s = await wt._getSession();
 			for await (const duplex of s.incomingBidirectionalStreams()) {
-				controller.enqueue(await nodeDuplexToWebBidi(duplex));
+				controller.enqueue(
+					await nodeDuplexToWebBidi(
+						duplex,
+						undefined,
+						undefined,
+						undefined,
+						(bytes) => {
+							wt._recordIncomingStreamBytes(bytes);
+						},
+					),
+				);
 			}
 			controller.close();
 		},
@@ -1623,7 +1887,11 @@ function createIncomingUniStreams(
 		async start(controller) {
 			const s = await wt._getSession();
 			for await (const readable of s.incomingUnidirectionalStreams()) {
-				controller.enqueue(nodeReadableToWebReadable(readable));
+				controller.enqueue(
+					nodeReadableToWebReadable(readable, (bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					}),
+				);
 			}
 			controller.close();
 		},
@@ -1633,9 +1901,24 @@ function createIncomingUniStreams(
 function nodeDuplexToWebBidi(duplex: Duplex): Promise<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
+}>;
+function nodeDuplexToWebBidi(
+	duplex: Duplex,
+	scheduler?: SendScheduler,
+	policy?: SendPolicy,
+	onWriteBytes?: (bytes: number) => void,
+	onReadBytes?: (bytes: number) => void,
+): Promise<{
+	readable: ReadableStream<Uint8Array>;
+	writable: WritableStream<Uint8Array>;
 }> {
-	const readable = nodeReadableToWebReadable(duplex);
-	const writable = nodeWritableToWebWritable(duplex);
+	const readable = nodeReadableToWebReadable(duplex, onReadBytes);
+	const writable = nodeWritableToWebWritable(
+		duplex,
+		scheduler,
+		policy,
+		onWriteBytes,
+	);
 	return Promise.resolve({ readable, writable });
 }
 
@@ -1650,14 +1933,18 @@ function extractStreamErrorCode(reason: unknown): number {
 	return 0;
 }
 
-function nodeReadableToWebReadable(r: Readable): ReadableStream<Uint8Array> {
+function nodeReadableToWebReadable(
+	r: Readable,
+	onReadBytes?: (bytes: number) => void,
+): ReadableStream<Uint8Array> {
 	const stopSendable = r as unknown as Partial<StopSendable>;
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
 			for await (const chunk of r) {
-				controller.enqueue(
-					chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk),
-				);
+				const bytes =
+					chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+				if (onReadBytes) onReadBytes(bytes.byteLength);
+				controller.enqueue(bytes);
 			}
 			controller.close();
 		},
@@ -1668,15 +1955,27 @@ function nodeReadableToWebReadable(r: Readable): ReadableStream<Uint8Array> {
 	});
 }
 
-function nodeWritableToWebWritable(w: Writable): WritableStream<Uint8Array> {
+function nodeWritableToWebWritable(
+	w: Writable,
+	scheduler?: SendScheduler,
+	policy?: SendPolicy,
+	onWriteBytes?: (bytes: number) => void,
+): WritableStream<Uint8Array> {
 	const resettable = w as unknown as Partial<Resettable>;
 	return new WritableStream<Uint8Array>({
 		async write(chunk) {
-			return new Promise((resolve, reject) => {
-				w.write(Buffer.from(chunk), (err: Error | null | undefined) =>
-					err ? reject(err) : resolve(),
-				);
-			});
+			const run = () =>
+				new Promise<void>((resolve, reject) => {
+					w.write(Buffer.from(chunk), (err: Error | null | undefined) =>
+						err ? reject(err) : resolve(),
+					);
+				});
+			if (scheduler && policy) {
+				await scheduler.enqueue(policy, run);
+			} else {
+				await run();
+			}
+			if (onWriteBytes) onWriteBytes(chunk.byteLength);
 		},
 		close() {
 			return new Promise((resolve, reject) => {

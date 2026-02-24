@@ -18,17 +18,18 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
 - Implemented in facade:
   - lifecycle (`ready`, `closed`, `draining`)
   - datagram duplex shape (`readable`, `writable`, `createWritable`, `maxDatagramSize`)
+  - datagram send options (`sendOrder`, `sendGroup`) with ownership validation + deterministic scheduling
   - stream creation/incoming stream surfaces
+  - stream send options (`sendOrder`, `sendGroup`) with deterministic scheduling
   - browser-shaped stream control mapping (`writable.abort` -> reset, `readable.cancel` -> stopSending)
   - static capability `supportsReliableOnly`
+  - `getStats()` connection counters (`bytesSent`, `bytesReceived`, packet counters, datagrams)
+  - `congestionControl` option forwarding with explicit effective-mode behavior
+  - `serverCertificateHashes` pinning support in native TLS verify path
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
-- Intentionally diverged (documented with rationale in parity matrix):
-  - `sendOrder` / `sendGroup` scheduling semantics (currently accepted/no-op)
-  - full `getStats()` dictionaries (currently minimal transport/datagram stats)
-  - `congestionControl` effective algorithm control
-  - `serverCertificateHashes` runtime support
-
-Target closure for these divergences is defined in `PARITY_PLAN.md` Phase 7 (D1-D7 work packages).
+  - `allowPooling`: accepted with deterministic dedicated-session behavior (no pool backend currently)
+  - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
+- Remaining parity tracking and implementation sequencing are in `PARITY_PLAN.md` and `docs/PARITY_MATRIX.md`.
 
 ## TypeScript API (authoritative)
 

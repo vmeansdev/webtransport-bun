@@ -6,10 +6,10 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 - In-process **client** support
 - **Datagrams** (message-based) with Promise backpressure
 - **Streams** (uni + bidi) exposed as **Node streams** (Readable/Writable/Duplex) with standard backpressure semantics
+- Browser-shaped client facade parity with the W3C WebTransport draft as a target; any remaining gaps must be explicitly documented in docs/PARITY_MATRIX.md.
 
 ## Non-goals
 - Windows support
-- Full browser WebTransport API parity (Web Streams, full spec surface)
 - Transparent reverse proxying
 - QUIC implementation from scratch (use wtransport)
 
@@ -49,6 +49,8 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 
 ## Authoritative docs
 - API contract: docs/SPEC.md
+- W3C parity status matrix: docs/PARITY_MATRIX.md
+- W3C parity execution plan: PARITY_PLAN.md
 - Implementation design: docs/ARCHITECTURE.md
 - Security defaults: SECURITY.md
 - Verification: docs/TESTPLAN.md
@@ -62,6 +64,8 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 3. Two dedicated Tokio runtimes (server + client), each single-threaded and owned by the addon; cross-runtime communication must stay bounded and deterministic.
 4. Bounded queues for all JS↔Rust crossings; all buffers counted against budgets.
 5. JS callback delivery must be rate-limited/batched to prevent per-packet callback storms.
+6. W3C client-facade divergences MUST be explicit in `docs/PARITY_MATRIX.md`; no silent no-op behavior for declared options.
+7. Any divergence-to-implementation work must preserve stable `E_*` diagnostics and add parity + interop tests.
 
 ## Default limits (v1)
 These are default values; they must be configurable via server/client options.

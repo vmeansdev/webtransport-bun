@@ -97,14 +97,18 @@ describe("parity datagrams (P2)", () => {
         wt.close();
     });
 
-    test("datagrams.createWritable rejects sendGroup option", async () => {
+    test("datagrams.createWritable accepts valid sendGroup and validates ownership", async () => {
         const wt = new WebTransport(`https://127.0.0.1:${port}`, {
             tls: { insecureSkipVerify: true },
         });
         await wt.ready;
-        expect(() => wt.datagrams.createWritable({ sendGroup: {} })).toThrow(
-            /unsupported option 'sendGroup'/,
-        );
+        const group = wt.createSendGroup();
+        expect(() =>
+            wt.datagrams.createWritable({ sendGroup: group, sendOrder: 1 }),
+        ).not.toThrow();
+        expect(() =>
+            wt.datagrams.createWritable({ sendGroup: {} as unknown as never }),
+        ).toThrow(/sendGroup belongs to another transport/);
         wt.close();
     });
 });

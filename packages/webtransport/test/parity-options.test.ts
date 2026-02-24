@@ -31,12 +31,13 @@ describe("parity options (Phase 5)", () => {
 		expect(WebTransport.supportsReliableOnly).toBe(false);
 	});
 
-	test("congestionControl option accepted (no-op)", async () => {
+	test("congestionControl option accepted with effective mode exposed", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			congestionControl: "low-latency",
 		});
 		await wt.ready;
+		expect(wt.congestionControl).toBe("default");
 		wt.close();
 	});
 
