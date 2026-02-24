@@ -12,6 +12,19 @@ function nextPort(): number {
 	return BASE_PORT + Math.floor(Math.random() * 500);
 }
 
+async function waitUntil(
+	condition: () => boolean,
+	timeoutMs: number,
+	intervalMs = 25,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (condition()) return true;
+		await Bun.sleep(intervalMs);
+	}
+	return condition();
+}
+
 describe("acceptance (Task gates)", () => {
 	it("P0-2: sustained multi-stream and datagram traffic", async () => {
 		const port = nextPort();
@@ -80,22 +93,29 @@ describe("acceptance (Task gates)", () => {
 				})().catch(() => {});
 			},
 		});
-		await Bun.sleep(2000);
+		try {
+			await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-		await client.sendDatagram(new Uint8Array([1, 2, 3]));
-		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-		await iter.next();
+			const client = await connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			await client.sendDatagram(new Uint8Array([1, 2, 3]));
 
-		const metrics = server.metricsSnapshot();
-		expect(metrics).toBeDefined();
-		expect(typeof metrics.sessionsActive).toBe("number");
-		expect(typeof metrics.datagramsIn).toBe("number");
-		expect(typeof metrics.datagramsOut).toBe("number");
+			const observed = await waitUntil(() => {
+				const m = server.metricsSnapshot();
+				return m.datagramsIn >= 1 && m.datagramsOut >= 1;
+			}, 1500);
+			expect(observed).toBe(true);
 
-		await server.close();
+			const metrics = server.metricsSnapshot();
+			expect(metrics).toBeDefined();
+			expect(typeof metrics.sessionsActive).toBe("number");
+			expect(typeof metrics.datagramsIn).toBe("number");
+			expect(typeof metrics.datagramsOut).toBe("number");
+			client.close();
+		} finally {
+			await server.close();
+		}
 	}, 10000);
 
 	it("P1-6: repeated open/close cycles do not hang", async () => {

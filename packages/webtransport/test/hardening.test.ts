@@ -15,6 +15,19 @@ import {
 	E_LIMIT_EXCEEDED,
 } from "../src/index.js";
 
+async function waitUntil(
+	condition: () => boolean,
+	timeoutMs: number,
+	intervalMs = 25,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (condition()) return true;
+		await Bun.sleep(intervalMs);
+	}
+	return condition();
+}
+
 describe("error-code mapping", () => {
 	it("client send_datagram after close returns E_SESSION_CLOSED", async () => {
 		const server = createServer({
@@ -161,14 +174,17 @@ describe("client metricsSnapshot", () => {
 		});
 
 		await client.sendDatagram(new Uint8Array([1, 2, 3]));
-		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-		const first = await iter.next();
-		expect(first.done).toBe(false);
+		const observed = await waitUntil(() => {
+			const snap = client.metricsSnapshot();
+			return snap.datagramsOut >= 1 && snap.datagramsIn >= 1;
+		}, 1500);
+		expect(observed).toBe(true);
 
 		const snap = client.metricsSnapshot();
 		expect(snap.datagramsOut).toBeGreaterThanOrEqual(1);
 		expect(snap.datagramsIn).toBeGreaterThanOrEqual(1);
 
+		client.close();
 		await server.close();
 	}, 10000);
 

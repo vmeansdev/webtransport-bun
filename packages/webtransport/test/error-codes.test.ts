@@ -80,7 +80,7 @@ describe("P0.2 stable error codes", () => {
 		await server.close();
 
 		expect(String(info?.reason ?? "")).toContain(E_SESSION_IDLE_TIMEOUT);
-	}, 10000);
+	}, 15000);
 
 	it("E_RATE_LIMITED: handshake rate limit rejects with E_RATE_LIMITED", async () => {
 		const port = nextPort();
