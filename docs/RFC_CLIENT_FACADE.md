@@ -44,7 +44,7 @@ export type WebTransportClientOptions = {
   /** When "bytes", datagrams.readable is a ReadableByteStream with BYOB support; default uses normal ReadableStream. */
   datagramsReadableType?: "bytes" | "default";
 
-  /** Accepted, no-op (native uses default). */
+  /** Accepted and forwarded; effective mode may fall back to default when backend support is limited. */
   congestionControl?: "default" | "throughput" | "low-latency";
 
   // runtime-specific extension for Bun backend apps
@@ -78,7 +78,7 @@ export class WebTransport {
 
   createBidirectionalStream(options?: {
     sendOrder?: number;
-    sendGroup?: number;
+    sendGroup?: WebTransportSendGroup | null;
   }): Promise<{
     readable: ReadableStream<Uint8Array>;
     writable: WritableStream<Uint8Array>;
@@ -86,7 +86,7 @@ export class WebTransport {
 
   createUnidirectionalStream(options?: {
     sendOrder?: number;
-    sendGroup?: number;
+    sendGroup?: WebTransportSendGroup | null;
   }): Promise<WritableStream<Uint8Array>>;
 
   close(info?: WebTransportCloseInfo): void;
@@ -128,29 +128,21 @@ export function toWebTransport(session: ClientSession): WebTransport;
 
 ## Implementation Plan
 
-### Phase A: Facade skeleton
-1. Add `WebTransport` class and constructor wiring to `connect()`.
-2. Add lifecycle promises (`ready`, `closed`, `draining` close-initiated behavior).
-3. Add parity-focused unit tests for constructor/lifecycle.
+### Completed
+1. Facade skeleton (`WebTransport` constructor/lifecycle + parity tests).
+2. Datagram facade (`readable`, `writable`, `createWritable`, max datagram size).
+3. Stream facade (bidi/uni create + incoming wrappers + reset/stop-sending mapping).
+4. Error/close normalization (`closeCode`/`reason`, facade error shape with stable internal codes).
+5. Option semantics implemented for:
+   - `congestionControl`
+   - `datagramsReadableType`
+   - `serverCertificateHashes`
+   - `allowPooling` / `requireUnreliable` acceptance semantics
+6. `sendOrder`/`sendGroup` deterministic scheduling + send-group ownership validation.
+7. `test:parity` suite and local pass evidence.
 
-### Phase B: Datagram streams facade
-1. Add `datagrams.readable` and `datagrams.writable` wrappers.
-2. Ensure backpressure and close semantics are deterministic.
-3. Add tests for read/write/close/error paths.
-
-### Phase C: Stream facade
-1. Add bidi and uni Web Streams wrappers.
-2. Add incoming stream readable wrappers.
-3. Ensure reset/stop-sending behavior is mapped consistently.
-
-### Phase D: Error + close-info normalization
-1. Normalize close info shape to `closeCode/reason` in facade.
-2. Map stable errors to facade-friendly errors with code metadata.
-3. Add conformance tests.
-
-### Phase E: CI parity gate
-1. Add `bun run test:parity` suite.
-2. Add CI job requiring parity suite pass.
+### Remaining
+1. CI evidence closure for parity + interop + security gates.
 
 ## Acceptance Criteria
 1. Browser-style client facade shipped without breaking existing APIs.
@@ -162,7 +154,4 @@ export function toWebTransport(session: ClientSession): WebTransport;
 4. `test:parity` gate integrated into CI.
 
 ## Remaining Divergence Closure Work
-1. Implement native scheduling semantics for `sendOrder`/`sendGroup`.
-2. Expand native stats and expose full facade dictionary mapping.
-3. Implement non-no-op behavior for `congestionControl` and `datagramsReadableType`.
-4. Implement `serverCertificateHashes` pinning path in native handshake.
+No targeted client-facade divergence items remain in scope. See `docs/PARITY_MATRIX.md` for current row-level status.
