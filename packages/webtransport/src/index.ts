@@ -1103,7 +1103,7 @@ export async function connect(
 	}
 	if (
 		opts?.tls?.insecureSkipVerify === true &&
-		!shouldSuppressInsecureSkipVerifyWarning()
+		(opts.log !== undefined || !shouldSuppressInsecureSkipVerifyWarning())
 	) {
 		const log =
 			opts.log ??
