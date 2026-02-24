@@ -46,10 +46,11 @@ Test log hygiene:
 1. **security** — cargo audit, Trivy filesystem scan, Trivy library vulnerability scan (CRITICAL/HIGH blocking)
 2. **codeql** — CodeQL analysis (JS/TS + Rust)
 
-3. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
-4. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
-5. **release** — needs [build, interop]; downloads prebuilds + interop evidence, regenerates combined SHA256SUMS, creates GitHub release with release notes
-6. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
+3. **parity** — W3C facade parity tests; produces `parity-evidence.json`
+4. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
+5. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
+6. **release** — needs [build, interop, parity]; verifies required evidence, downloads prebuilds + evidence, regenerates SHA256SUMS, creates GitHub release with release notes and evidence artifacts
+7. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
    - Runs on tag pushes only when repo variable `NPM_TRUSTED_PUBLISHING` is set to `true`
    - Can also be run manually from `workflow_dispatch` with `publish_to_npm=true`
 
@@ -63,11 +64,18 @@ Test log hygiene:
   3. Outputs operator runbook with pin command
 - Run via **Actions → rollback → Run workflow**. See docs/OPERATIONS.md § Runbook: Rollback to known-good release.
 
+## CI-EVIDENCE-A: Sustained evidence closure
+
+- **Release pipeline** requires parity + interop + security gates; fails on missing evidence.
+- **Evidence retention**: `parity-evidence.json` and `interop-evidence.json` attached to every release (linkable, auditable).
+- **N-consecutive green**: Release checklist (docs/RELEASE_CHECKLIST.md) documents policy; recommend 1–3 green test runs before RC, 14-day sustained green before stable.
+- See docs/RELEASE_CHECKLIST.md for full gates and soak requirements.
+
 ## Release flow
 - Tag `vX.Y.Z`
-- CI builds prebuilds for all targets
-- Publish npm package with prebuilds
-- GitHub release created with checksums
+- CI runs security, parity, interop, build; verifies required evidence
+- GitHub release created with prebuilds, checksums, parity-evidence, interop-evidence
+- Publish npm package with prebuilds (when NPM_TRUSTED_PUBLISHING enabled)
 
 ## npm publishing rollout (recommended)
 1. First release: publish manually from local machine (`npm run release:npm`) to create package on npm.

@@ -48,3 +48,9 @@
 - No panics in load-client stderr
 - Interop passes (connect, datagram echo, bidi stream echo)
 - Observability invariants asserted in automated tests
+
+### CI evidence (CI-EVIDENCE-A)
+- **Parity**: `bun run test:parity` runs in release pipeline; produces `parity-evidence.json` attached to release.
+- **Interop**: `INTEROP_EVIDENCE=1 bun run playwright test` in release pipeline; produces `interop-evidence.json` attached to release.
+- **Release gate**: Release job fails if parity-evidence or interop-evidence is missing.
+- **Auditability**: Evidence files are linkable from GitHub release Assets per release.
