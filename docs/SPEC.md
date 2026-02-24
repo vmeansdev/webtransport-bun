@@ -7,9 +7,28 @@
 The API provides:
 - `createServer(options)` for in-process server.
 - `connect(url, options)` for client.
+- `new WebTransport(url, options)` as additive browser-shaped client facade.
 - Sessions expose datagrams (Promise send + async iterable receive) and streams (Node streams).
 
 All streams must use standard Node stream backpressure semantics (write() returns false + 'drain').
+
+## W3C facade parity status (current)
+Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-2026-02-04.md`).
+
+- Implemented in facade:
+  - lifecycle (`ready`, `closed`, `draining`)
+  - datagram duplex shape (`readable`, `writable`, `createWritable`, `maxDatagramSize`)
+  - stream creation/incoming stream surfaces
+  - browser-shaped stream control mapping (`writable.abort` -> reset, `readable.cancel` -> stopSending)
+  - static capability `supportsReliableOnly`
+  - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
+- Intentionally diverged (documented with rationale in parity matrix):
+  - `sendOrder` / `sendGroup` scheduling semantics (currently accepted/no-op)
+  - full `getStats()` dictionaries (currently minimal transport/datagram stats)
+  - `congestionControl` effective algorithm control
+  - `serverCertificateHashes` runtime support
+
+Target closure for these divergences is defined in `PARITY_PLAN.md` Phase 7 (D1-D7 work packages).
 
 ## TypeScript API (authoritative)
 
@@ -176,6 +195,11 @@ export const WT_STOP_SENDING: unique symbol;
 export type Resettable = { [WT_RESET](code?: number): void };
 export type StopSendable = { [WT_STOP_SENDING](code?: number): void };
 ``` 
+
+For browser-shaped facade streams, the control mapping is:
+- Writable stream `abort(reason)` -> stream reset (native reset path)
+- Readable stream `cancel(reason)` -> stop-sending (native stop-sending path)
+- Symbol controls remain available for Node-first compatibility.
 
 ### Metrics
 

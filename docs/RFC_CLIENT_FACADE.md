@@ -4,7 +4,7 @@
 Browser-Style Client Facade for `@webtransport-bun/webtransport`
 
 ## Status
-Draft (implementation-ready)
+Implemented with documented divergences (see `docs/PARITY_MATRIX.md` and `PARITY_PLAN.md`)
 
 ## Motivation
 The current package is Node-first and production-friendly for backend usage. For client developers already familiar with browser WebTransport, a browser-shaped API reduces onboarding cost and usage mistakes.
@@ -38,6 +38,12 @@ export type WebTransportClientOptions = {
   serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>;
   allowPooling?: boolean;
   requireUnreliable?: boolean;
+
+  /** When "bytes", datagrams.readable is a ReadableByteStream with BYOB support; default uses normal ReadableStream. */
+  datagramsReadableType?: "bytes" | "default";
+
+  /** Accepted, no-op (native uses default). */
+  congestionControl?: "default" | "throughput" | "low-latency";
 
   // runtime-specific extension for Bun backend apps
   tls?: {
@@ -101,14 +107,14 @@ export function toWebTransport(session: ClientSession): WebTransport;
 ### Lifecycle
 - `ready`: resolves when underlying `connect()` succeeds.
 - `closed`: resolves with close info when session closes cleanly.
-- `draining`: resolves before `closed` when no new streams should be created (initially alias to `closed` until native signal exists, documented as partial parity).
+- `draining`: resolves when `close()` initiates graceful closure.
 
 ### Errors
 - Preserve stable internal `E_*` codes.
 - Surface browser-like errors in facade while attaching internal code in metadata (`cause.code` or equivalent).
 
-### Unsupported option behavior
-- If options such as `sendGroup` are unsupported, fail explicitly with stable error (`E_INTERNAL` or dedicated mapped error) instead of silently ignoring.
+### Unsupported/diverged option behavior
+- Diverged W3C items are explicitly documented in `docs/PARITY_MATRIX.md`; no silent no-op behavior is permitted unless explicitly documented as divergence.
 
 ## Compatibility
 - Server API remains Node-native (`createServer`).
@@ -119,7 +125,7 @@ export function toWebTransport(session: ClientSession): WebTransport;
 
 ### Phase A: Facade skeleton
 1. Add `WebTransport` class and constructor wiring to `connect()`.
-2. Add lifecycle promises (`ready`, `closed`, `draining` placeholder behavior).
+2. Add lifecycle promises (`ready`, `closed`, `draining` close-initiated behavior).
 3. Add parity-focused unit tests for constructor/lifecycle.
 
 ### Phase B: Datagram streams facade
@@ -150,7 +156,8 @@ export function toWebTransport(session: ClientSession): WebTransport;
 3. Interop suite still passes.
 4. `test:parity` gate integrated into CI.
 
-## Open Questions
-1. Should `draining` remain alias-to-closed until native support exists, or stay unimplemented initially?
-2. Which unsupported options should hard-fail vs soft-warn?
-3. Should adapter expose experimental `getStats()` mapped from `metricsSnapshot()` in v1?
+## Remaining Divergence Closure Work
+1. Implement native scheduling semantics for `sendOrder`/`sendGroup`.
+2. Expand native stats and expose full facade dictionary mapping.
+3. Implement non-no-op behavior for `congestionControl` and `datagramsReadableType`.
+4. Implement `serverCertificateHashes` pinning path in native handshake.

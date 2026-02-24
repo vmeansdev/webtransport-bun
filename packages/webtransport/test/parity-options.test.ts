@@ -40,6 +40,15 @@ describe("parity options (Phase 5)", () => {
 		wt.close();
 	});
 
+	test("datagramsReadableType 'default' uses normal ReadableStream", async () => {
+		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		await wt.ready;
+		expect(wt.datagrams.readable).toBeInstanceOf(ReadableStream);
+		wt.close();
+	});
+
 	test("datagramsReadableType 'bytes' creates ReadableByteStream and receives datagrams", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
@@ -58,6 +67,22 @@ describe("parity options (Phase 5)", () => {
 		expect(new Uint8Array(value!.buffer, value!.byteOffset, value!.byteLength)).toEqual(
 			new Uint8Array([1, 2, 3]),
 		);
+		wt.close();
+	});
+
+	test("datagramsReadableType 'bytes' BYOB buffer too small throws RangeError", async () => {
+		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+			datagramsReadableType: "bytes",
+		});
+		await wt.ready;
+		const writer = wt.datagrams.writable.getWriter();
+		await writer.write(new Uint8Array([1, 2, 3, 4, 5]));
+		writer.releaseLock();
+		const reader = wt.datagrams.readable.getReader({ mode: "byob" });
+		const tinyBuf = new Uint8Array(2);
+		await expect(reader.read(tinyBuf)).rejects.toThrow(RangeError);
+		reader.releaseLock();
 		wt.close();
 	});
 
