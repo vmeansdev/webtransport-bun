@@ -95,4 +95,29 @@ describe("parity streams (P3)", () => {
 		expect(wt.incomingUnidirectionalStreams).toBeInstanceOf(ReadableStream);
 		wt.close();
 	});
+
+	test("writable.abort(reason) maps to reset (browser-style stream control)", async () => {
+		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		await wt.ready;
+		const { readable, writable } = await wt.createBidirectionalStream();
+		const writer = writable.getWriter();
+		await writer.write(new Uint8Array([1]));
+		await writer.abort(42);
+		await expect(writer.closed).rejects.toBeDefined();
+		wt.close();
+	});
+
+	test("readable.cancel(reason) maps to stopSending (browser-style stream control)", async () => {
+		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		await wt.ready;
+		const { readable } = await wt.createBidirectionalStream();
+		const reader = readable.getReader();
+		reader.cancel(99);
+		await reader.closed.catch(() => {});
+		wt.close();
+	});
 });

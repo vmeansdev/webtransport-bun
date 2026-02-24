@@ -1590,7 +1590,19 @@ function nodeDuplexToWebBidi(duplex: Duplex): Promise<{
 	return Promise.resolve({ readable, writable });
 }
 
+/** Extract QUIC application error code from abort/cancel reason. */
+function extractStreamErrorCode(reason: unknown): number {
+	if (typeof reason === "number" && Number.isInteger(reason)) return reason;
+	const o = reason && typeof reason === "object" ? (reason as Record<string, unknown>) : null;
+	if (o) {
+		const c = (o.streamErrorCode ?? o.code) as unknown;
+		if (typeof c === "number" && Number.isInteger(c)) return c;
+	}
+	return 0;
+}
+
 function nodeReadableToWebReadable(r: Readable): ReadableStream<Uint8Array> {
+	const stopSendable = r as unknown as Partial<StopSendable>;
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
 			for await (const chunk of r) {
@@ -1600,10 +1612,15 @@ function nodeReadableToWebReadable(r: Readable): ReadableStream<Uint8Array> {
 			}
 			controller.close();
 		},
+		cancel(reason) {
+			const fn = stopSendable[WT_STOP_SENDING];
+			if (typeof fn === "function") fn.call(r, extractStreamErrorCode(reason));
+		},
 	});
 }
 
 function nodeWritableToWebWritable(w: Writable): WritableStream<Uint8Array> {
+	const resettable = w as unknown as Partial<Resettable>;
 	return new WritableStream<Uint8Array>({
 		async write(chunk) {
 			return new Promise((resolve, reject) => {
@@ -1618,6 +1635,10 @@ function nodeWritableToWebWritable(w: Writable): WritableStream<Uint8Array> {
 					err ? reject(err) : resolve(),
 				);
 			});
+		},
+		abort(reason) {
+			const fn = resettable[WT_RESET];
+			if (typeof fn === "function") fn.call(w, extractStreamErrorCode(reason));
 		},
 	});
 }
