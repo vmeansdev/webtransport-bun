@@ -31,8 +31,29 @@ async function readDatagramWithTimeout(
 ): Promise<IteratorResult<Uint8Array>> {
 	return (await Promise.race([
 		iter.next(),
-		Bun.sleep(timeoutMs).then(() => ({ done: true as const, value: undefined })),
+		Bun.sleep(timeoutMs).then(() => ({
+			done: true as const,
+			value: undefined,
+		})),
 	])) as IteratorResult<Uint8Array>;
+}
+
+async function connectWithRetry(
+	url: string,
+	opts: Parameters<typeof connect>[1],
+	timeoutMs = 6000,
+): Promise<Awaited<ReturnType<typeof connect>>> {
+	const deadline = Date.now() + timeoutMs;
+	let lastErr: unknown;
+	while (Date.now() < deadline) {
+		try {
+			return await connect(url, opts);
+		} catch (err) {
+			lastErr = err;
+			await Bun.sleep(100);
+		}
+	}
+	throw lastErr ?? new Error("connectWithRetry: timed out");
 }
 
 describe("acceptance (Task gates)", () => {
@@ -58,9 +79,7 @@ describe("acceptance (Task gates)", () => {
 				})().catch(() => {});
 			},
 		});
-		await Bun.sleep(2000);
-
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -111,11 +130,11 @@ describe("acceptance (Task gates)", () => {
 			});
 			await client.sendDatagram(new Uint8Array([1, 2, 3]));
 
-				const observed = await waitUntil(() => {
-					const m = server.metricsSnapshot();
-					return m.datagramsIn >= 1;
-				}, 3000);
-				expect(observed).toBe(true);
+			const observed = await waitUntil(() => {
+				const m = server.metricsSnapshot();
+				return m.datagramsIn >= 1;
+			}, 3000);
+			expect(observed).toBe(true);
 
 			const metrics = server.metricsSnapshot();
 			expect(metrics).toBeDefined();
@@ -126,7 +145,7 @@ describe("acceptance (Task gates)", () => {
 		} finally {
 			await server.close();
 		}
-		}, 15000);
+	}, 15000);
 
 	it("P1-6: repeated open/close cycles do not hang", async () => {
 		for (let i = 0; i < 3; i++) {
@@ -204,17 +223,17 @@ describe("acceptance (Task gates)", () => {
 		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-			await client.sendDatagram(new Uint8Array([1, 2, 3]));
-			const dgIter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const dgNext = await readDatagramWithTimeout(dgIter, 1500);
-			expect(dgNext.done).toBe(false);
-			const iter = client.incomingBidirectionalStreams()[Symbol.asyncIterator]();
-			const streamNext = (await Promise.race([
-				iter.next(),
-				Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
-			])) as IteratorResult<unknown>;
-			expect(streamNext.done).toBe(false);
-			await Bun.sleep(500);
+		await client.sendDatagram(new Uint8Array([1, 2, 3]));
+		const dgIter = client.incomingDatagrams()[Symbol.asyncIterator]();
+		const dgNext = await readDatagramWithTimeout(dgIter, 1500);
+		expect(dgNext.done).toBe(false);
+		const iter = client.incomingBidirectionalStreams()[Symbol.asyncIterator]();
+		const streamNext = (await Promise.race([
+			iter.next(),
+			Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
+		])) as IteratorResult<unknown>;
+		expect(streamNext.done).toBe(false);
+		await Bun.sleep(500);
 
 		const m = server.metricsSnapshot() as Record<string, any>;
 		const handshake = m.handshakeLatency ?? m.handshake_latency;

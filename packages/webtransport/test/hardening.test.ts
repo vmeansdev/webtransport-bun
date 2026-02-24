@@ -15,6 +15,12 @@ import {
 	E_LIMIT_EXCEEDED,
 } from "../src/index.js";
 
+const BASE_PORT = 18500;
+
+function nextPort(): number {
+	return BASE_PORT + Math.floor(Math.random() * 1000);
+}
+
 async function waitUntil(
 	condition: () => boolean,
 	timeoutMs: number,
@@ -30,8 +36,9 @@ async function waitUntil(
 
 describe("error-code mapping", () => {
 	it("client send_datagram after close returns E_SESSION_CLOSED", async () => {
+		const port = nextPort();
 		const server = createServer({
-			port: 14700,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				for await (const _ of s.incomingDatagrams()) {
@@ -40,7 +47,7 @@ describe("error-code mapping", () => {
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14700", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await client.close();
@@ -56,8 +63,9 @@ describe("error-code mapping", () => {
 	}, 10000);
 
 	it("client oversized datagram returns E_QUEUE_FULL", async () => {
+		const port = nextPort();
 		const server = createServer({
-			port: 14701,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				for await (const _ of s.incomingDatagrams()) {
@@ -66,7 +74,7 @@ describe("error-code mapping", () => {
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14701", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		try {
@@ -101,9 +109,10 @@ describe("error-code mapping", () => {
 
 describe("close-path promise settlement", () => {
 	it("server close settles all session closed promises", async () => {
+		const port = nextPort();
 		let serverSession: any = null;
 		const server = createServer({
-			port: 14702,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				serverSession = s;
@@ -113,7 +122,7 @@ describe("close-path promise settlement", () => {
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14702", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -129,8 +138,9 @@ describe("close-path promise settlement", () => {
 	}, 15000);
 
 	it("client close resolves closed promise", async () => {
+		const port = nextPort();
 		const server = createServer({
-			port: 14703,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				for await (const _ of s.incomingDatagrams()) {
@@ -139,7 +149,7 @@ describe("close-path promise settlement", () => {
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14703", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -158,8 +168,9 @@ describe("close-path promise settlement", () => {
 
 describe("client metricsSnapshot", () => {
 	it("reflects datagram activity", async () => {
+		const port = nextPort();
 		const server = createServer({
-			port: 14704,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				for await (const dgram of s.incomingDatagrams()) {
@@ -169,7 +180,7 @@ describe("client metricsSnapshot", () => {
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14704", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -189,8 +200,9 @@ describe("client metricsSnapshot", () => {
 	}, 10000);
 
 	it("tracks streamsActive and queuedBytes", async () => {
+		const port = nextPort();
 		const server = createServer({
-			port: 14705,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				for await (const bidi of s.incomingBidirectionalStreams) {
@@ -207,7 +219,7 @@ describe("client metricsSnapshot", () => {
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14705", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -252,11 +264,12 @@ describe("client metricsSnapshot", () => {
 
 describe("metrics consistency after stress burst", () => {
 	it("queuedBytesGlobal, sessionTasksActive, streamTasksActive drain after close", async () => {
+		const port = nextPort();
 		const NUM_CLIENTS = 3;
 		const DATAGRAMS_PER_CLIENT = 5;
 		let sessionsReceived = 0;
 		const server = createServer({
-			port: 14720,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				sessionsReceived++;
@@ -270,7 +283,7 @@ describe("metrics consistency after stress burst", () => {
 		const clients = [];
 		for (let i = 0; i < NUM_CLIENTS; i++) {
 			clients.push(
-				await connect("https://127.0.0.1:14720", {
+				await connect(`https://127.0.0.1:${port}`, {
 					tls: { insecureSkipVerify: true },
 				}),
 			);
@@ -311,14 +324,15 @@ describe("E_BACKPRESSURE_TIMEOUT error coding", () => {
 	});
 
 	it("client backpressureTimeoutMs option is respected", async () => {
+		const port = nextPort();
 		const server = createServer({
-			port: 14721,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async () => {},
 		});
 		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14721", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			limits: { backpressureTimeoutMs: 1 },
 		});
@@ -359,23 +373,26 @@ describe("E_BACKPRESSURE_TIMEOUT error coding", () => {
 
 describe("server-created stream cap enforcement", () => {
 	it("createBidirectionalStream fails after maxStreamsPerSessionBidi", async () => {
+		const port = nextPort();
 		const cap = 2;
 		let serverSession: any = null;
+		let resolveServerReady!: () => void;
 		const serverReady = new Promise<void>((resolve) => {
-			var server = createServer({
-				port: 14710,
-				tls: { certPem: "", keyPem: "" },
-				limits: { maxStreamsPerSessionBidi: cap, maxStreamsGlobal: 50000 },
-				onSession: async (s) => {
-					serverSession = s;
-					resolve();
-					for await (const _ of s.incomingDatagrams()) {
-					}
-				},
-			});
+			resolveServerReady = resolve;
+		});
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxStreamsPerSessionBidi: cap, maxStreamsGlobal: 50000 },
+			onSession: async (s) => {
+				serverSession = s;
+				resolveServerReady();
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
 		});
 
-		const client = await connect("https://127.0.0.1:14710", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await serverReady;
@@ -396,26 +413,30 @@ describe("server-created stream cap enforcement", () => {
 		}
 
 		await client.close();
+		await server.close();
 	}, 15000);
 
 	it("createUnidirectionalStream fails after maxStreamsPerSessionUni", async () => {
+		const port = nextPort();
 		const cap = 2;
 		let serverSession: any = null;
+		let resolveServerReady!: () => void;
 		const serverReady = new Promise<void>((resolve) => {
-			var server = createServer({
-				port: 14711,
-				tls: { certPem: "", keyPem: "" },
-				limits: { maxStreamsPerSessionUni: cap, maxStreamsGlobal: 50000 },
-				onSession: async (s) => {
-					serverSession = s;
-					resolve();
-					for await (const _ of s.incomingDatagrams()) {
-					}
-				},
-			});
+			resolveServerReady = resolve;
+		});
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxStreamsPerSessionUni: cap, maxStreamsGlobal: 50000 },
+			onSession: async (s) => {
+				serverSession = s;
+				resolveServerReady();
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
 		});
 
-		const client = await connect("https://127.0.0.1:14711", {
+		const client = await connect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await serverReady;
@@ -436,5 +457,6 @@ describe("server-created stream cap enforcement", () => {
 		}
 
 		await client.close();
+		await server.close();
 	}, 15000);
 });
