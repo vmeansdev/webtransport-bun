@@ -16,97 +16,103 @@ let keyPem = "";
 let certHashBase64 = "";
 
 try {
-  certPem = readFileSync(certPemPath, "utf8");
-  keyPem = readFileSync(keyPemPath, "utf8");
-  const cert = new X509Certificate(certPem);
-  certHashBase64 = createHash("sha256").update(cert.raw).digest("base64");
+	certPem = readFileSync(certPemPath, "utf8");
+	keyPem = readFileSync(keyPemPath, "utf8");
+	const cert = new X509Certificate(certPem);
+	certHashBase64 = createHash("sha256").update(cert.raw).digest("base64");
 } catch {
-  console.error("Missing certs for WebTransport example.");
-  console.error("Run: bun run example:echo:cert");
-  process.exit(1);
+	console.error("Missing certs for WebTransport example.");
+	console.error("Run: bun run example:echo:cert");
+	process.exit(1);
 }
 
 function toBuffer(chunks: Uint8Array[]): Buffer {
-  return Buffer.concat(chunks.map((c) => Buffer.from(c)));
+	return Buffer.concat(chunks.map((c) => Buffer.from(c)));
 }
 
 const wtServer = createServer({
-  host: WT_HOST,
-  port: WT_PORT,
-  tls: { certPem, keyPem },
-  onSession: async (session) => {
-    console.log(`[wt] session accepted id=${session.id} peer=${session.peer.ip}:${session.peer.port}`);
+	host: WT_HOST,
+	port: WT_PORT,
+	tls: { certPem, keyPem },
+	onSession: async (session) => {
+		console.log(
+			`[wt] session accepted id=${session.id} peer=${session.peer.ip}:${session.peer.port}`,
+		);
 
-    void (async () => {
-      try {
-        for await (const dgram of session.incomingDatagrams()) {
-          await session.sendDatagram(dgram);
-        }
-      } catch (err) {
-        console.warn("[wt] datagram loop ended:", err);
-      }
-    })();
+		void (async () => {
+			try {
+				for await (const dgram of session.incomingDatagrams()) {
+					await session.sendDatagram(dgram);
+				}
+			} catch (err) {
+				console.warn("[wt] datagram loop ended:", err);
+			}
+		})();
 
-    void (async () => {
-      try {
-        for await (const duplex of session.incomingBidirectionalStreams()) {
-          void (async () => {
-            const chunks: Uint8Array[] = [];
-            for await (const chunk of duplex) chunks.push(chunk);
-            if (chunks.length > 0) {
-              duplex.write(toBuffer(chunks));
-            }
-            duplex.end();
-          })().catch((err) => console.warn("[wt] bidi stream failed:", err));
-        }
-      } catch (err) {
-        console.warn("[wt] incoming bidi loop ended:", err);
-      }
-    })();
+		void (async () => {
+			try {
+				for await (const duplex of session.incomingBidirectionalStreams) {
+					void (async () => {
+						const chunks: Uint8Array[] = [];
+						for await (const chunk of duplex.readable) chunks.push(chunk);
+						const writer = duplex.writable.getWriter();
+						if (chunks.length > 0) {
+							await writer.write(toBuffer(chunks));
+						}
+						await writer.close();
+					})().catch((err) => console.warn("[wt] bidi stream failed:", err));
+				}
+			} catch (err) {
+				console.warn("[wt] incoming bidi loop ended:", err);
+			}
+		})();
 
-    void (async () => {
-      try {
-        for await (const readable of session.incomingUnidirectionalStreams()) {
-          void (async () => {
-            const chunks: Uint8Array[] = [];
-            for await (const chunk of readable) chunks.push(chunk);
-            const out = await session.createUnidirectionalStream();
-            if (chunks.length > 0) {
-              out.write(toBuffer(chunks));
-            }
-            out.end();
-          })().catch((err) => console.warn("[wt] uni stream failed:", err));
-        }
-      } catch (err) {
-        console.warn("[wt] incoming uni loop ended:", err);
-      }
-    })();
-  },
+		void (async () => {
+			try {
+				for await (const readable of session.incomingUnidirectionalStreams) {
+					void (async () => {
+						const chunks: Uint8Array[] = [];
+						for await (const chunk of readable) chunks.push(chunk);
+						const out = await session.createUnidirectionalStream();
+						if (chunks.length > 0) {
+							out.write(toBuffer(chunks));
+						}
+						out.end();
+					})().catch((err) => console.warn("[wt] uni stream failed:", err));
+				}
+			} catch (err) {
+				console.warn("[wt] incoming uni loop ended:", err);
+			}
+		})();
+	},
 });
 
 const httpServer = Bun.serve({
-  hostname: HTTP_HOST,
-  port: HTTP_PORT,
-  fetch(req) {
-    const url = new URL(req.url);
-    if (url.pathname === "/") {
-      return new Response(Bun.file(resolve(import.meta.dir, "./public/index.html")), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
-    }
+	hostname: HTTP_HOST,
+	port: HTTP_PORT,
+	fetch(req) {
+		const url = new URL(req.url);
+		if (url.pathname === "/") {
+			return new Response(
+				Bun.file(resolve(import.meta.dir, "./public/index.html")),
+				{
+					headers: { "content-type": "text/html; charset=utf-8" },
+				},
+			);
+		}
 
-    if (url.pathname === "/healthz") {
-      return Response.json({ ok: true, httpPort: HTTP_PORT, wtPort: WT_PORT });
-    }
-    if (url.pathname === "/config") {
-      return Response.json({
-        wtUrl: `https://127.0.0.1:${WT_PORT}`,
-        serverCertificateHashBase64: certHashBase64,
-      });
-    }
+		if (url.pathname === "/healthz") {
+			return Response.json({ ok: true, httpPort: HTTP_PORT, wtPort: WT_PORT });
+		}
+		if (url.pathname === "/config") {
+			return Response.json({
+				wtUrl: `https://127.0.0.1:${WT_PORT}`,
+				serverCertificateHashBase64: certHashBase64,
+			});
+		}
 
-    return new Response("Not found", { status: 404 });
-  },
+		return new Response("Not found", { status: 404 });
+	},
 });
 
 console.log(`HTTP UI: http://${HTTP_HOST}:${HTTP_PORT}`);
@@ -114,15 +120,15 @@ console.log(`WebTransport endpoint: https://127.0.0.1:${WT_PORT}`);
 console.log("Press Ctrl+C to stop.");
 
 const shutdown = async () => {
-  console.log("Shutting down...");
-  httpServer.stop(true);
-  await wtServer.close();
-  process.exit(0);
+	console.log("Shutting down...");
+	httpServer.stop(true);
+	await wtServer.close();
+	process.exit(0);
 };
 
 process.on("SIGINT", () => {
-  void shutdown();
+	void shutdown();
 });
 process.on("SIGTERM", () => {
-  void shutdown();
+	void shutdown();
 });

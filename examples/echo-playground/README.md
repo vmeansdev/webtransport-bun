@@ -40,8 +40,8 @@ If your browser still rejects local certs in your environment, use this fallback
 ## What is demonstrated
 
 - Datagram echo: browser `transport.datagrams.writable` -> server `incomingDatagrams()` -> server `sendDatagram()`
-- Bidirectional stream echo: browser `createBidirectionalStream()` -> server `incomingBidirectionalStreams()`
-- Unidirectional stream echo: browser `createUnidirectionalStream()` -> server `incomingUnidirectionalStreams()` -> server `createUnidirectionalStream()` back to client
+- Bidirectional stream echo: browser `createBidirectionalStream()` -> server `incomingBidirectionalStreams`
+- Unidirectional stream echo: browser `createUnidirectionalStream()` -> server `incomingUnidirectionalStreams` -> server `createUnidirectionalStream()` back to client
 
 ## WebTransport alongside `Bun.serve`
 

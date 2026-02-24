@@ -29,7 +29,7 @@ describe("acceptance (Task gates)", () => {
 					}
 				})().catch(() => {});
 				void (async () => {
-					for await (const _ of s.incomingBidirectionalStreams()) {
+					for await (const _ of s.incomingBidirectionalStreams) {
 						streamsAccepted++;
 					}
 				})().catch(() => {});

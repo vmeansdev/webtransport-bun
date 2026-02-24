@@ -111,7 +111,14 @@ import type { Duplex, Readable, Writable } from "node:stream";
 
 export type CloseInfo = { code?: number; reason?: string };
 
-export interface BaseSession {
+export type WebTransportBidirectionalStream = {
+  readable: ReadableStream<Uint8Array>;
+  writable: WritableStream<Uint8Array>;
+};
+
+export type WebTransportReceiveStream = ReadableStream<Uint8Array>;
+
+export interface CommonSession {
   readonly id: string;
   readonly peer: { ip: string; port: number };
 
@@ -123,7 +130,21 @@ export interface BaseSession {
   // Datagrams
   sendDatagram(data: Uint8Array): Promise<void>;
   incomingDatagrams(): AsyncIterable<Uint8Array>;
+}
 
+export interface ServerSession extends CommonSession {
+  // Streams
+  createBidirectionalStream(): Promise<Duplex>;
+  readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
+
+  createUnidirectionalStream(): Promise<Writable>;
+  readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
+
+  // Metrics (per session)
+  metricsSnapshot(): SessionMetricsSnapshot;
+}
+
+export interface ClientSession extends CommonSession {
   // Streams
   createBidirectionalStream(): Promise<Duplex>;
   incomingBidirectionalStreams(): AsyncIterable<Duplex>;
@@ -134,9 +155,6 @@ export interface BaseSession {
   // Metrics (per session)
   metricsSnapshot(): SessionMetricsSnapshot;
 }
-
-export interface ServerSession extends BaseSession {}
-export interface ClientSession extends BaseSession {}
 ```
 
 ### Stream control extensions
@@ -203,7 +221,9 @@ export type SessionMetricsSnapshot = {
 
 ### Semantics (must be implemented)
 - `sendDatagram()` Promise resolves only when accepted into a bounded internal queue (or sent). If queues are full, it must wait (backpressure). If waiting exceeds `backpressureTimeoutMs`, reject with `E_BACKPRESSURE_TIMEOUT`.
-- Incoming datagrams and streams are delivered via AsyncIterable. On session close, iterators must terminate promptly.
+- Incoming datagrams are delivered via AsyncIterable on both server/client sessions.
+- Incoming streams are delivered as ReadableStream properties on `ServerSession` and as AsyncIterable methods on `ClientSession`.
+- On session close, iterators/streams must terminate promptly.
 - Node stream backpressure:
 * writing beyond buffer returns `false`, then `'drain'` fires when writable resumes.
 - Idle timeout: a session with no activity (configurable definition) must close with `E_SESSION_IDLE_TIMEOUT` / close info.

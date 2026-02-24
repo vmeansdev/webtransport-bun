@@ -52,7 +52,15 @@ import type { Duplex, Readable, Writable } from "node:stream";
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 export type { Resettable, StopSendable } from "./streams.js";
 
-import { BidiStream, SendStream, RecvStream } from "./streams.js";
+import {
+	BidiStream,
+	RecvStream,
+	SendStream,
+	WT_RESET,
+	WT_STOP_SENDING,
+	type Resettable,
+	type StopSendable,
+} from "./streams.js";
 
 /**
  * Stable error codes. Use with {@link WebTransportError.code} for programmatic handling.
@@ -278,8 +286,15 @@ export type ClientOptions = {
 
 export type CloseInfo = { code?: number; reason?: string };
 
-/** Base session interface (server and client). Node streams; use toWebTransport for Web Streams. */
-export interface BaseSession {
+export type WebTransportBidirectionalStream = {
+	readable: ReadableStream<Uint8Array>;
+	writable: WritableStream<Uint8Array>;
+} & Partial<Resettable & StopSendable>;
+
+export type WebTransportReceiveStream = ReadableStream<Uint8Array> &
+	Partial<StopSendable>;
+
+interface CommonSession {
 	readonly id: string;
 	readonly peer: { ip: string; port: number };
 
@@ -291,7 +306,20 @@ export interface BaseSession {
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
+}
 
+/** Server session surface used by createServer(onSession). */
+export interface ServerSession extends CommonSession {
+	readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
+	readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
+
+	createBidirectionalStream(): Promise<Duplex>;
+	createUnidirectionalStream(): Promise<Writable>;
+	metricsSnapshot(): SessionMetricsSnapshot;
+}
+
+/** Node client API session surface returned by connect(). */
+export interface ClientSession extends CommonSession {
 	// Streams
 	createBidirectionalStream(): Promise<Duplex>;
 	incomingBidirectionalStreams(): AsyncIterable<Duplex>;
@@ -302,9 +330,6 @@ export interface BaseSession {
 	// Metrics (per session)
 	metricsSnapshot(): SessionMetricsSnapshot;
 }
-
-export interface ServerSession extends BaseSession {}
-export interface ClientSession extends BaseSession {}
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -532,6 +557,9 @@ class NativeServerSession implements ServerSession {
 	#nativeHandle: any;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
+	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
+		null;
+	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
 	constructor(nativeHandle: any, closedPromise: Promise<CloseInfo>) {
 		this.#nativeHandle = nativeHandle;
@@ -605,19 +633,14 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
-	async *incomingBidirectionalStreams(): AsyncIterable<Duplex> {
-		while (!this.#closed) {
-			try {
-				const nativeStream = await this.#nativeHandle.acceptBidiStream();
-				if (!nativeStream) break;
-				yield new BidiStream({
-					handleId: nativeStream?.id ?? 0,
-					nativeHandle: nativeStream,
-				});
-			} catch {
-				break;
-			}
+	get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> {
+		if (!this.#incomingBidiCache) {
+			this.#incomingBidiCache = createServerIncomingBidiStreams(
+				this.#nativeHandle,
+				() => this.#closed,
+			);
 		}
+		return this.#incomingBidiCache;
 	}
 
 	async createUnidirectionalStream(): Promise<Writable> {
@@ -634,19 +657,14 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
-	async *incomingUnidirectionalStreams(): AsyncIterable<Readable> {
-		while (!this.#closed) {
-			try {
-				const nativeStream = await this.#nativeHandle.acceptUniStream();
-				if (!nativeStream) break;
-				yield new RecvStream({
-					handleId: nativeStream?.id ?? 0,
-					nativeHandle: nativeStream,
-				});
-			} catch {
-				break;
-			}
+	get incomingUnidirectionalStreams(): ReadableStream<WebTransportReceiveStream> {
+		if (!this.#incomingUniCache) {
+			this.#incomingUniCache = createServerIncomingUniStreams(
+				this.#nativeHandle,
+				() => this.#closed,
+			);
 		}
+		return this.#incomingUniCache;
 	}
 
 	metricsSnapshot(): SessionMetricsSnapshot {
@@ -1342,9 +1360,99 @@ function createDatagramStreams(wt: WebTransport): {
 	return { readable, writable };
 }
 
-function createIncomingBidiStreams(
-	wt: WebTransport,
-): ReadableStream<{
+function attachServerBidiControls(
+	duplex: Duplex,
+	stream: {
+		readable: ReadableStream<Uint8Array>;
+		writable: WritableStream<Uint8Array>;
+	},
+): WebTransportBidirectionalStream {
+	const withControls = stream as WebTransportBidirectionalStream;
+	const reset = (duplex as unknown as Partial<Resettable>)[WT_RESET];
+	if (typeof reset === "function") {
+		withControls[WT_RESET] = (code?: number) => reset.call(duplex, code);
+	}
+	const stopSending = (duplex as unknown as Partial<StopSendable>)[
+		WT_STOP_SENDING
+	];
+	if (typeof stopSending === "function") {
+		withControls[WT_STOP_SENDING] = (code?: number) =>
+			stopSending.call(duplex, code);
+	}
+	return withControls;
+}
+
+function attachServerRecvControls(
+	readable: Readable,
+	stream: ReadableStream<Uint8Array>,
+): WebTransportReceiveStream {
+	const withControls = stream as WebTransportReceiveStream;
+	const stopSending = (readable as unknown as Partial<StopSendable>)[
+		WT_STOP_SENDING
+	];
+	if (typeof stopSending === "function") {
+		withControls[WT_STOP_SENDING] = (code?: number) =>
+			stopSending.call(readable, code);
+	}
+	return withControls;
+}
+
+function createServerIncomingBidiStreams(
+	nativeHandle: any,
+	isClosed: () => boolean,
+): ReadableStream<WebTransportBidirectionalStream> {
+	return new ReadableStream({
+		async start(controller) {
+			while (!isClosed()) {
+				try {
+					const nativeStream = await nativeHandle.acceptBidiStream();
+					if (!nativeStream) break;
+					const duplex = new BidiStream({
+						handleId: nativeStream?.id ?? 0,
+						nativeHandle: nativeStream,
+					});
+					controller.enqueue(
+						attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
+					);
+				} catch {
+					break;
+				}
+			}
+			controller.close();
+		},
+	});
+}
+
+function createServerIncomingUniStreams(
+	nativeHandle: any,
+	isClosed: () => boolean,
+): ReadableStream<WebTransportReceiveStream> {
+	return new ReadableStream({
+		async start(controller) {
+			while (!isClosed()) {
+				try {
+					const nativeStream = await nativeHandle.acceptUniStream();
+					if (!nativeStream) break;
+					const readable = new RecvStream({
+						handleId: nativeStream?.id ?? 0,
+						nativeHandle: nativeStream,
+					});
+					controller.enqueue(
+						attachServerRecvControls(
+							readable,
+							nodeReadableToWebReadable(readable),
+						),
+					);
+				} catch {
+					break;
+				}
+			}
+			controller.close();
+		},
+	});
+}
+
+function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
 }> {

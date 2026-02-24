@@ -9,148 +9,146 @@ import { connect, createServer } from "../src/index.js";
 const BASE_PORT = 14800;
 
 function nextPort(): number {
-    return BASE_PORT + Math.floor(Math.random() * 400);
+	return BASE_PORT + Math.floor(Math.random() * 400);
 }
 
 describe("adversarial transport (P3.2)", () => {
-    it("connection churn: rapid connect/disconnect does not panic, metrics drain", async () => {
-        const port = nextPort();
-        const server = createServer({
-            port,
-            tls: { certPem: "", keyPem: "" },
-            onSession: () => {},
-        });
-        await Bun.sleep(2000);
+	it("connection churn: rapid connect/disconnect does not panic, metrics drain", async () => {
+		const port = nextPort();
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		await Bun.sleep(2000);
 
-        const cycles = 20;
-        for (let i = 0; i < cycles; i++) {
-            const client = await connect(`https://127.0.0.1:${port}`, {
-                tls: { insecureSkipVerify: true },
-            });
-            client.close();
-            await Bun.sleep(30);
-        }
+		const cycles = 20;
+		for (let i = 0; i < cycles; i++) {
+			const client = await connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			client.close();
+			await Bun.sleep(30);
+		}
 
-        await Bun.sleep(2000);
-        const m = server.metricsSnapshot();
-        expect(m.sessionsActive).toBe(0);
-        expect(m.streamsActive).toBe(0);
+		await Bun.sleep(2000);
+		const m = server.metricsSnapshot();
+		expect(m.sessionsActive).toBe(0);
+		expect(m.streamsActive).toBe(0);
 
-        await server.close();
-    }, 30000);
+		await server.close();
+	}, 30000);
 
-    it("stream churn: rapid stream open/close under limit does not panic", async () => {
-        const port = nextPort();
-        const server = createServer({
-            port,
-            tls: { certPem: "", keyPem: "" },
-            limits: { maxStreamsPerSessionBidi: 10, maxStreamsPerSessionUni: 10 },
-            onSession: () => {},
-        });
-        await Bun.sleep(2000);
+	it("stream churn: rapid stream open/close under limit does not panic", async () => {
+		const port = nextPort();
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxStreamsPerSessionBidi: 10, maxStreamsPerSessionUni: 10 },
+			onSession: () => {},
+		});
+		await Bun.sleep(2000);
 
-        const client = await connect(`https://127.0.0.1:${port}`, {
-            tls: { insecureSkipVerify: true },
-        });
+		const client = await connect(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
 
-        for (let i = 0; i < 8; i++) {
-            const stream = await client.createBidirectionalStream();
-            stream.write(Buffer.from([i]));
-            stream.end();
-        }
+		for (let i = 0; i < 8; i++) {
+			const stream = await client.createBidirectionalStream();
+			stream.write(Buffer.from([i]));
+			stream.end();
+		}
 
-        await Bun.sleep(500);
-        const mDuring = server.metricsSnapshot();
-        expect(mDuring.streamsActive).toBeLessThanOrEqual(10);
+		await Bun.sleep(500);
+		const mDuring = server.metricsSnapshot();
+		expect(mDuring.streamsActive).toBeLessThanOrEqual(10);
 
-        client.close();
-        await Bun.sleep(2000);
-        const mAfter = server.metricsSnapshot();
-        expect(mAfter.streamsActive).toBe(0);
-        expect(mAfter.sessionsActive).toBe(0);
+		client.close();
+		await Bun.sleep(2000);
+		const mAfter = server.metricsSnapshot();
+		expect(mAfter.streamsActive).toBe(0);
+		expect(mAfter.sessionsActive).toBe(0);
 
-        await server.close();
-    }, 25000);
+		await server.close();
+	}, 25000);
 
-    it("mixed churn: concurrent connect/disconnect + stream + datagram stress", async () => {
-        const port = nextPort();
-        const server = createServer({
-            port,
-            tls: { certPem: "", keyPem: "" },
-            limits: { maxSessions: 8, maxStreamsPerSessionBidi: 5 },
-            onSession: async (s) => {
-                void (async () => {
-                    for await (const d of s.incomingDatagrams()) {
-                        await s.sendDatagram(d);
-                    }
-                })().catch(() => {});
-                void (async () => {
-                    for await (const _ of s.incomingBidirectionalStreams()) {
-                        /* no-op */
-                    }
-                })().catch(() => {});
-            },
-        });
-        await Bun.sleep(2000);
+	it("mixed churn: concurrent connect/disconnect + stream + datagram stress", async () => {
+		const port = nextPort();
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxSessions: 8, maxStreamsPerSessionBidi: 5 },
+			onSession: async (s) => {
+				void (async () => {
+					for await (const d of s.incomingDatagrams()) {
+						await s.sendDatagram(d);
+					}
+				})().catch(() => {});
+				void (async () => {
+					for await (const _ of s.incomingBidirectionalStreams) {
+						/* no-op */
+					}
+				})().catch(() => {});
+			},
+		});
+		await Bun.sleep(2000);
 
-        const connectDisconnect = async () => {
-            const c = await connect(`https://127.0.0.1:${port}`, {
-                tls: { insecureSkipVerify: true },
-            });
-            await c.sendDatagram(new Uint8Array(64));
-            const stream = await c.createBidirectionalStream();
-            stream.write(Buffer.alloc(100));
-            stream.end();
-            c.close();
-        };
+		const connectDisconnect = async () => {
+			const c = await connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			await c.sendDatagram(new Uint8Array(64));
+			const stream = await c.createBidirectionalStream();
+			stream.write(Buffer.alloc(100));
+			stream.end();
+			c.close();
+		};
 
-        await Promise.all([
-            ...Array.from({ length: 6 }, () =>
-                connectDisconnect().catch(() => {})
-            ),
-        ]);
+		await Promise.all([
+			...Array.from({ length: 6 }, () => connectDisconnect().catch(() => {})),
+		]);
 
-        await Bun.sleep(2000);
-        const m = server.metricsSnapshot();
-        expect(m.sessionsActive).toBe(0);
-        expect(m.streamsActive).toBe(0);
+		await Bun.sleep(2000);
+		const m = server.metricsSnapshot();
+		expect(m.sessionsActive).toBe(0);
+		expect(m.streamsActive).toBe(0);
 
-        await server.close();
-    }, 25000);
+		await server.close();
+	}, 25000);
 
-    it("edge payloads: empty datagram and max-size datagram accepted cleanly", async () => {
-        const port = nextPort();
-        const maxSize = 256;
-        const server = createServer({
-            port,
-            tls: { certPem: "", keyPem: "" },
-            limits: { maxDatagramSize: maxSize },
-            onSession: async (s) => {
-                void (async () => {
-                    for await (const d of s.incomingDatagrams()) {
-                        await s.sendDatagram(d);
-                    }
-                })().catch(() => {});
-            },
-        });
-        await Bun.sleep(2000);
+	it("edge payloads: empty datagram and max-size datagram accepted cleanly", async () => {
+		const port = nextPort();
+		const maxSize = 256;
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxDatagramSize: maxSize },
+			onSession: async (s) => {
+				void (async () => {
+					for await (const d of s.incomingDatagrams()) {
+						await s.sendDatagram(d);
+					}
+				})().catch(() => {});
+			},
+		});
+		await Bun.sleep(2000);
 
-        const client = await connect(`https://127.0.0.1:${port}`, {
-            tls: { insecureSkipVerify: true },
-        });
+		const client = await connect(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
 
-        await client.sendDatagram(new Uint8Array(0));
-        const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-        const r0 = await iter.next();
-        expect(r0.value).toBeDefined();
-        expect((r0.value as Uint8Array).length).toBe(0);
+		await client.sendDatagram(new Uint8Array(0));
+		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+		const r0 = await iter.next();
+		expect(r0.value).toBeDefined();
+		expect((r0.value as Uint8Array).length).toBe(0);
 
-        await client.sendDatagram(new Uint8Array(maxSize).fill(0x41));
-        const r1 = await iter.next();
-        expect(r1.value).toBeDefined();
-        expect((r1.value as Uint8Array).length).toBe(maxSize);
+		await client.sendDatagram(new Uint8Array(maxSize).fill(0x41));
+		const r1 = await iter.next();
+		expect(r1.value).toBeDefined();
+		expect((r1.value as Uint8Array).length).toBe(maxSize);
 
-        client.close();
-        await server.close();
-    }, 15000);
+		client.close();
+		await server.close();
+	}, 15000);
 });
