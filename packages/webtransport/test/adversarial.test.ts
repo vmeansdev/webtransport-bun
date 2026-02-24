@@ -12,6 +12,20 @@ function nextPort(): number {
 	return BASE_PORT + Math.floor(Math.random() * 400);
 }
 
+async function readDatagramWithTimeout(
+	iter: AsyncIterator<Uint8Array>,
+	timeoutMs: number,
+): Promise<Uint8Array> {
+	const next = (await Promise.race([
+		iter.next(),
+		Bun.sleep(timeoutMs).then(() => ({ done: true as const, value: undefined })),
+	])) as IteratorResult<Uint8Array>;
+	if (next.done || next.value === undefined) {
+		throw new Error("timed out waiting for echoed datagram");
+	}
+	return next.value;
+}
+
 describe("adversarial transport (P3.2)", () => {
 	it("connection churn: rapid connect/disconnect does not panic, metrics drain", async () => {
 		const port = nextPort();
@@ -131,24 +145,27 @@ describe("adversarial transport (P3.2)", () => {
 				})().catch(() => {});
 			},
 		});
-		await Bun.sleep(2000);
+		let client: Awaited<ReturnType<typeof connect>> | null = null;
+		try {
+			await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
+			client = await connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
 
-		await client.sendDatagram(new Uint8Array(0));
-		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-		const r0 = await iter.next();
-		expect(r0.value).toBeDefined();
-		expect((r0.value as Uint8Array).length).toBe(0);
+			await client.sendDatagram(new Uint8Array(0));
+			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+			const r0 = await readDatagramWithTimeout(iter, 2000);
+			expect(r0).toBeDefined();
+			expect(r0.length).toBe(0);
 
-		await client.sendDatagram(new Uint8Array(maxSize).fill(0x41));
-		const r1 = await iter.next();
-		expect(r1.value).toBeDefined();
-		expect((r1.value as Uint8Array).length).toBe(maxSize);
-
-		client.close();
-		await server.close();
+			await client.sendDatagram(new Uint8Array(maxSize).fill(0x41));
+			const r1 = await readDatagramWithTimeout(iter, 2000);
+			expect(r1).toBeDefined();
+			expect(r1.length).toBe(maxSize);
+		} finally {
+			client?.close();
+			await server.close();
+		}
 	}, 15000);
 });
