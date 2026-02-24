@@ -20,6 +20,7 @@ pub struct ClientMetrics {
     pub queued_bytes: AtomicU64,
 }
 
+use crate::client_pool::{self, PoolKey, PoolReleaseGuard};
 use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
@@ -31,6 +32,8 @@ use crate::CLIENT_RUNTIME;
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static CLIENT_POOL: Lazy<std::sync::Arc<client_pool::ClientPoolManager>> =
+    Lazy::new(|| std::sync::Arc::new(client_pool::ClientPoolManager::new()));
 
 /// Result for connect callback to avoid napi::Result type confusion.
 #[derive(Clone)]
@@ -222,11 +225,13 @@ impl ClientSessionHandle {
 }
 
 impl ClientSessionHandle {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_session_task(
         id: String,
         peer_ip: String,
         peer_port: u32,
         conn: wtransport::Connection,
+        _release_guard: Option<PoolReleaseGuard>,
         on_closed: Option<ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
         backpressure_timeout_ms: u64,
         limits: crate::limits::Limits,
@@ -283,6 +288,7 @@ impl ClientSessionHandle {
         };
 
         CLIENT_RUNTIME.spawn(async move {
+            let _guard = _release_guard;
             let conn_dgram_send = conn.clone();
             let conn_dgram_recv = conn.clone();
             let conn_closed = conn.clone();
@@ -546,12 +552,13 @@ fn connect_inner(
         let result = match run_connect(&url, opts_json)
             .await
             .map_err(|e| e.to_string())
-            .map(|(id, peer_ip, peer_port, conn)| {
+            .map(|(id, peer_ip, peer_port, conn, release_guard)| {
                 let handle = ClientSessionHandle::spawn_session_task(
                     id.clone(),
                     peer_ip,
                     peer_port,
                     conn,
+                    release_guard,
                     on_closed_tsfn,
                     bp_timeout_ms,
                     client_limits,
@@ -587,7 +594,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 
 /// Resolver that returns a fixed SocketAddr, used when serverName overrides an IP host
 /// so we connect to the original IP while using serverName for TLS SNI.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StaticSocketResolver(std::net::SocketAddr);
 
 impl wtransport::config::DnsResolver for StaticSocketResolver {
@@ -856,13 +863,19 @@ fn parse_server_certificate_hashes(
     Ok(out)
 }
 
+/// Result of run_connect: session id, peer info, connection, and optional pool release guard.
+pub type RunConnectResult = (
+    String,
+    String,
+    u32,
+    wtransport::Connection,
+    Option<PoolReleaseGuard>,
+);
+
 async fn run_connect(
     url: &str,
     opts_json: String,
-) -> std::result::Result<
-    (String, String, u32, wtransport::Connection),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> std::result::Result<RunConnectResult, Box<dyn std::error::Error + Send + Sync>> {
     let opts = serde_json::from_str::<serde_json::Value>(&opts_json).unwrap_or_default();
 
     let tls_opts = opts.get("tls");
@@ -879,6 +892,21 @@ async fn run_connect(
         .filter(|s| !s.is_empty());
     let pinned_hashes = parse_server_certificate_hashes(&opts).map_err(std::io::Error::other)?;
 
+    let allow_pooling = opts
+        .get("allowPooling")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let require_unreliable = opts
+        .get("requireUnreliable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if allow_pooling && !pinned_hashes.is_empty() {
+        return Err(
+            "E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true".into(),
+        );
+    }
+
     let handshake_timeout_ms = opts
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
@@ -886,6 +914,72 @@ async fn run_connect(
 
     let (connect_url, custom_resolver) =
         connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
+
+    let id = format!(
+        "client-{}",
+        CLIENT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+
+    if allow_pooling {
+        let parsed = url::Url::parse(url).map_err(|e| format!("E_TLS: invalid URL: {}", e))?;
+        let pool_key = PoolKey {
+            scheme: parsed.scheme().to_string(),
+            host: parsed.host_str().unwrap_or("").to_string(),
+            port: parsed.port().unwrap_or(443),
+            sni: server_name.map(String::from),
+            insecure_skip_verify,
+            has_pinned_hashes: !pinned_hashes.is_empty(),
+            has_ca_pem: ca_pem.is_some(),
+            require_unreliable,
+            congestion: opts
+                .get("congestionControl")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string(),
+        };
+        let ca_pem_owned = ca_pem.map(String::from);
+        let pinned_hashes_clone = pinned_hashes.clone();
+        let create_endpoint = move || {
+            let mut config = if insecure_skip_verify {
+                wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_no_cert_validation()
+                    .build()
+            } else if ca_pem_owned.is_some() || !pinned_hashes_clone.is_empty() {
+                let root_store = build_root_cert_store(ca_pem_owned.as_deref())
+                    .map_err(std::io::Error::other)?;
+                let tls_config =
+                    build_client_tls_config(root_store, false, pinned_hashes_clone.as_slice());
+                wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_custom_tls(tls_config)
+                    .build()
+            } else {
+                wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_native_certs()
+                    .build()
+            };
+            if let Some(resolver) = custom_resolver {
+                config.set_dns_resolver(resolver);
+            }
+            wtransport::Endpoint::client(config).map_err(|e| e.into())
+        };
+
+        let (conn, release_guard, _was_hit) = CLIENT_POOL
+            .acquire_connect(
+                pool_key,
+                &connect_url,
+                handshake_timeout_ms,
+                create_endpoint,
+            )
+            .await?;
+
+        let addr = conn.remote_address();
+        let peer_ip = addr.ip().to_string();
+        let peer_port = addr.port() as u32;
+        return Ok((id, peer_ip, peer_port, conn, Some(release_guard)));
+    }
 
     let mut config = if insecure_skip_verify {
         wtransport::ClientConfig::builder()
@@ -918,13 +1012,9 @@ async fn run_connect(
     .await
     .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;
 
-    let id = format!(
-        "client-{}",
-        CLIENT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
     let addr = conn.remote_address();
     let peer_ip = addr.ip().to_string();
     let peer_port = addr.port() as u32;
 
-    Ok((id, peer_ip, peer_port, conn))
+    Ok((id, peer_ip, peer_port, conn, None))
 }

@@ -94,11 +94,47 @@ import type { ErrorCode } from "./errors.js";
 type BufferSource = ArrayBuffer | ArrayBufferView;
 
 const E_CODE_RE = /E_[A-Z_]+/g;
-function toWebTransportError(err: unknown): WebTransportError {
+
+/**
+ * Maps known validation/connect failures to browser-style DOMException names.
+ * Returns undefined for unknown cases; E_* code is always preserved.
+ * No broad catch-all: unknown errors remain explicit.
+ */
+function normalizeToBrowserName(
+	code: ErrorCode,
+	message: string,
+): string | undefined {
+	if (message.includes("serverCertificateHashes cannot be used with allowPooling=true")) {
+		return "NotSupportedError";
+	}
+	if (message.includes("serverCertificateHashes must be an array")) {
+		return "TypeError";
+	}
+	if (message.includes("allowPooling must be a boolean") || message.includes("requireUnreliable must be a boolean")) {
+		return "TypeError";
+	}
+	if (message.includes("congestionControl must be") || message.includes("datagramsReadableType must be")) {
+		return "TypeError";
+	}
+	if (message.includes("E_HANDSHAKE_TIMEOUT")) {
+		return "TimeoutError";
+	}
+	if (message.includes("E_SESSION_CLOSED") || message.includes("E_SESSION_IDLE_TIMEOUT")) {
+		return "InvalidStateError";
+	}
+	return undefined;
+}
+
+function toWebTransportError(
+	err: unknown,
+	strictW3CErrors?: boolean,
+): WebTransportError {
 	const msg = err instanceof Error ? err.message : String(err);
 	const match = msg.match(E_CODE_RE);
 	const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
-	return new WebTransportError(code, msg);
+	const browserName =
+		strictW3CErrors === true ? normalizeToBrowserName(code, msg) : undefined;
+	return new WebTransportError(code, msg, browserName ? { browserName } : undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,10 +282,12 @@ export type WebTransportCloseInfo = {
 /**
  * Options for `new WebTransport(url, options)`.
  * `allowPooling` and `requireUnreliable` are accepted with deterministic facade semantics:
- * - `allowPooling`: accepted; current runtime always uses dedicated sessions (no pool backend yet).
+ * - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, dedicated sessions.
  * - `requireUnreliable`: accepted; current runtime uses QUIC/WebTransport and always supports unreliable delivery.
  */
 export type WebTransportClientOptions = {
+	/** When true, errors use browser-style DOMException names (NotSupportedError, etc.). Default false for backward compat. */
+	strictW3CErrors?: boolean;
 	serverCertificateHashes?: Array<{
 		algorithm: "sha-256";
 		value: BufferSource;
@@ -290,6 +328,12 @@ export type ClientOptions = {
 	}>;
 	/** Internal/advanced: congestion hint passed to native runtime. */
 	congestionControl?: "default" | "throughput" | "low-latency";
+	/** Enable connection pooling for compatible connects. */
+	allowPooling?: boolean;
+	/** Require unreliable (datagram) delivery; participates in pool compatibility. */
+	requireUnreliable?: boolean;
+	/** When true, errors use browser-style DOMException names. Default false. */
+	strictW3CErrors?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -891,15 +935,18 @@ class NativeClientSession implements ClientSession {
 	#readyPromise: Promise<void>;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
+	#strictW3CErrors: boolean;
 
 	constructor(
 		nativeHandle: any,
 		readyPromise: Promise<void>,
 		closedPromise: Promise<CloseInfo>,
+		strictW3CErrors = false,
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#readyPromise = readyPromise;
 		this.#closedPromise = closedPromise;
+		this.#strictW3CErrors = strictW3CErrors;
 		this.#closedPromise.then(() => {
 			this.#closed = true;
 		});
@@ -938,7 +985,7 @@ class NativeClientSession implements ClientSession {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
 			await this.#nativeHandle.sendDatagram(buf);
 		} catch (err) {
-			throw toWebTransportError(err);
+			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
 	}
 
@@ -964,7 +1011,7 @@ class NativeClientSession implements ClientSession {
 				nativeHandle: nativeStream,
 			});
 		} catch (err) {
-			throw toWebTransportError(err);
+			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
 	}
 
@@ -993,7 +1040,7 @@ class NativeClientSession implements ClientSession {
 				nativeHandle: nativeStream,
 			});
 		} catch (err) {
-			throw toWebTransportError(err);
+			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
 	}
 
@@ -1076,6 +1123,8 @@ export async function connect(
 		tls: tlsOpts,
 		congestionControl: opts?.congestionControl,
 		serverCertificateHashes: opts?.serverCertificateHashes,
+		allowPooling: opts?.allowPooling,
+		requireUnreliable: opts?.requireUnreliable,
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
@@ -1094,7 +1143,7 @@ export async function connect(
 		};
 		native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
 			if (err) {
-				reject(toWebTransportError(err));
+				reject(toWebTransportError(err, opts?.strictW3CErrors));
 				return;
 			}
 			if (handleId == null) {
@@ -1112,22 +1161,48 @@ export async function connect(
 			});
 			closedResolvers.set(handle.id, closedResolve);
 			const readyPromise = Promise.resolve();
-			resolve(new NativeClientSession(handle, readyPromise, closedPromise));
+			resolve(
+				new NativeClientSession(
+					handle,
+					readyPromise,
+					closedPromise,
+					opts?.strictW3CErrors,
+				),
+			);
 		});
 	});
 
 	const timeoutPromise = new Promise<never>((_, reject) => {
 		setTimeout(() => {
+			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
+			const browserName =
+				opts?.strictW3CErrors === true
+					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ?? undefined)
+					: undefined;
 			reject(
-				new WebTransportError(
-					E_HANDSHAKE_TIMEOUT as ErrorCode,
-					`E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`,
-				),
+				new WebTransportError(E_HANDSHAKE_TIMEOUT as ErrorCode, msg, browserName ? { browserName } : undefined),
 			);
 		}, handshakeTimeout);
 	});
 
 	return Promise.race([connectPromise, timeoutPromise]);
+}
+
+/** Client pool metrics (hits, misses, evictions). For tests when allowPooling is used. */
+export function clientPoolMetricsSnapshot(): {
+	hits: number;
+	misses: number;
+	evictIdle: number;
+	evictBroken: number;
+} {
+	if (!native) throw new Error("Native addon not loaded");
+	const s = native.clientPoolMetricsSnapshot();
+	return {
+		hits: s.hits,
+		misses: s.misses,
+		evictIdle: (s as any).evictIdle ?? (s as any).evict_idle ?? 0,
+		evictBroken: (s as any).evictBroken ?? (s as any).evict_broken ?? 0,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1297,7 @@ function validateClientOptions(opts?: WebTransportClientOptions): void {
 			throw new WebTransportError(
 				E_INTERNAL as ErrorCode,
 				"E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true",
+				{ browserName: "NotSupportedError" },
 			);
 		}
 		validateServerCertificateHashes(opts.serverCertificateHashes);
@@ -1235,10 +1311,13 @@ function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 		tls: opts.tls,
 		limits: opts.limits,
 		congestionControl: opts.congestionControl,
+		strictW3CErrors: opts.strictW3CErrors,
 		serverCertificateHashes: opts.serverCertificateHashes?.map((entry) => ({
 			algorithm: entry.algorithm,
 			valueBase64: bufferSourceToBase64(entry.value),
 		})),
+		allowPooling: opts.allowPooling,
+		requireUnreliable: opts.requireUnreliable,
 	};
 }
 
@@ -1349,7 +1428,7 @@ class SendScheduler {
  * {@link ClientSession}. Await {@link WebTransport.ready} before using datagrams/streams.
  *
  * Option semantics:
- * - `allowPooling` is accepted; runtime currently always uses dedicated sessions.
+ * - `allowPooling`: when true, endpoint-level pooling; when false, dedicated sessions.
  * - `requireUnreliable` is accepted; runtime transport always supports unreliable delivery.
  *
  * @example
@@ -1415,11 +1494,17 @@ export class WebTransport {
 					throw err;
 				},
 			);
-			this.#closed = this.#sessionPromise.then((s) =>
-				s.closed.then((info) => {
+			this.#closed = this.#sessionPromise.then(
+				(s) =>
+					s.closed.then((info) => {
+						this.#state = "closed";
+						return toCloseInfo(info);
+					}),
+				() => {
+					// Connect failed: closed never rejects (PARITY_MATRIX).
 					this.#state = "closed";
-					return toCloseInfo(info);
-				}),
+					return toCloseInfo({ code: 0, reason: "" });
+				},
 			);
 			} else {
 				this.#datagramsReadableType = "default";
@@ -1597,6 +1682,9 @@ export class WebTransport {
 				code: info?.closeCode,
 				reason: info?.reason,
 			});
+		} else {
+			// Still connecting: absorb eventual connect failure to prevent unhandled rejection (S4).
+			this.#ready.catch(() => {});
 		}
 	}
 

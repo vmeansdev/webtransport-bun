@@ -47,12 +47,19 @@ export type WebTransportErrorOptions = {
   source?: WebTransportErrorSource;
   streamErrorCode?: number | null;
   cause?: unknown;
+  /**
+   * Browser-style DOMException name when known (e.g. NotSupportedError, TypeError).
+   * When set, Error.name is set to this for browser/isomorphic compatibility.
+   * E_* code is always preserved for programmatic handling.
+   */
+  browserName?: string;
 };
 
 /**
  * Custom error class for WebTransport errors.
  * Carries a stable error code for programmatic handling.
  * W3C-aligned: source ("stream"|"session"), streamErrorCode.
+ * When options.browserName is set, name is set for browser-compatible semantics.
  */
 export class WebTransportError extends Error {
   readonly code: ErrorCode;
@@ -65,7 +72,7 @@ export class WebTransportError extends Error {
     options?: WebTransportErrorOptions,
   ) {
     super(message ?? code, { cause: options?.cause ?? { code } });
-    this.name = "WebTransportError";
+    this.name = options?.browserName ?? "WebTransportError";
     this.code = code;
     this.source = options?.source ?? codeToSource(code);
     this.streamErrorCode = options?.streamErrorCode ?? null;

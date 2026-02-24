@@ -27,9 +27,33 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - `congestionControl` option forwarding with explicit effective-mode behavior
   - `serverCertificateHashes` pinning support in native TLS verify path
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
-  - `allowPooling`: accepted with deterministic dedicated-session behavior (no pool backend currently)
+  - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
   - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
 - Remaining parity tracking and implementation sequencing are in `PARITY_PLAN.md` and `docs/PARITY_MATRIX.md`.
+
+## Pooling Semantics (allowPooling)
+
+When `allowPooling: true`, the runtime uses **endpoint-level pooling**:
+
+- **What is pooled:** `Endpoint` instances (UDP socket + TLS config) are reused per compatibility key.
+- **What is not pooled:** Each `connect()` still creates a new `Connection` (new QUIC handshake + WebTransport CONNECT); sessions are independent.
+- **Compatibility key dimensions:** scheme, host, port, SNI (`serverName`), TLS mode (`insecureSkipVerify`, `caPem`, `serverCertificateHashes`), `requireUnreliable`, and congestion preference. Connects with identical key reuse the pooled endpoint; differing key creates a new pool entry.
+- **Non-reuse conditions:** Different origin, TLS config, or transport options; `serverCertificateHashes` is incompatible with pooling (rejected at validation).
+- **Terminology:** Use "endpoint pooling" (reuse of `Endpoint`) — not "connection pooling" or "session pooling."
+
+See `docs/PARITY_MATRIX.md` for parity status.
+
+## requireUnreliable Invariant
+
+On supported targets (Bun ≥ 1.3.9, macOS/Linux), the transport backend is QUIC/WebTransport, which supports unreliable (datagram) delivery. Therefore `requireUnreliable: true` is satisfiable and accepted. This option participates in the pool compatibility key; connects with differing `requireUnreliable` values do not share a pooled endpoint.
+
+## Error Model and Browser-Style Names
+
+- **Stable `E_*` codes:** All errors carry `code` (e.g. `E_TLS`, `E_HANDSHAKE_TIMEOUT`) for programmatic handling. This is preserved for backward compatibility.
+- **Deterministic browser name for validation:** `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_INTERNAL`.
+- **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path and session errors use browser-style DOMException names (`TimeoutError`, `InvalidStateError`, `TypeError`) where mapped, while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
+- **Mapping rules (when strictW3CErrors):** E_HANDSHAKE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError.
+- **Unknown errors:** No broad catch-all; unmapped cases keep `name: "WebTransportError"`.
 
 ## TypeScript API (authoritative)
 

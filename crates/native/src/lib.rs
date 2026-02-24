@@ -12,6 +12,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
 pub mod client;
+pub mod client_pool;
 pub mod client_stream;
 pub mod histogram;
 pub mod limits;
@@ -197,6 +198,18 @@ pub fn smoke_test() -> String {
         Ok("webtransport-native is alive!".to_string())
     })
     .unwrap_or_else(|_| "webtransport-native (panic recovered)".to_string())
+}
+
+/// Client pool metrics snapshot (hits, misses, evictions). For tests and observability.
+#[napi]
+pub fn client_pool_metrics_snapshot() -> metrics::ClientPoolMetricsSnapshot {
+    let s = client_pool::pool_metrics_snapshot();
+    metrics::ClientPoolMetricsSnapshot {
+        hits: s.hits as u32,
+        misses: s.misses as u32,
+        evict_idle: s.evict_idle as u32,
+        evict_broken: s.evict_broken as u32,
+    }
 }
 
 /// Returns the number of Tokio worker threads (should be 1).

@@ -44,3 +44,12 @@ pub struct SessionMetricsSnapshot {
     pub streams_active: u32,
     pub queued_bytes: u32,
 }
+
+/// Client pool metrics (debug/test). Present when allowPooling is used.
+#[napi(object)]
+pub struct ClientPoolMetricsSnapshot {
+    pub hits: u32,
+    pub misses: u32,
+    pub evict_idle: u32,
+    pub evict_broken: u32,
+}

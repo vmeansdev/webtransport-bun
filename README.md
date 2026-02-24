@@ -103,6 +103,7 @@ Detailed migration playbook:
 ## Documentation
 
 - Docs portal: `docs/START_HERE.md`
+- Pooling semantics (`allowPooling`): `docs/SPEC.md` — Pooling Semantics section
 - GitHub Pages docs site: `https://vmeansdev.github.io/webtransport-bun/`
 - FAQ / troubleshooting: `docs/FAQ.md`
 - Migration guide: `docs/MIGRATION_WEBSOCKET.md`

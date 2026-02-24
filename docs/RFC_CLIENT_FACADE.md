@@ -35,6 +35,8 @@ export type WebTransportCloseInfo = {
 };
 
 export type WebTransportClientOptions = {
+  /** When true, errors use browser-style DOMException names. Default false. */
+  strictW3CErrors?: boolean;
   serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>;
   allowPooling?: boolean;
   requireUnreliable?: boolean;
@@ -111,10 +113,11 @@ export function toWebTransport(session: ClientSession): WebTransport;
 
 ### Errors
 - Preserve stable internal `E_*` codes.
-- Surface browser-like errors in facade while attaching internal code in metadata (`cause.code` or equivalent).
+- `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_INTERNAL`.
+- `strictW3CErrors: true` enables browser-style DOMException names (TimeoutError, InvalidStateError, etc.) on connect/session errors; `code` remains for programmatic handling.
 
 ### Option behavior
-- `allowPooling` is accepted; current runtime uses dedicated sessions until a native pool manager exists.
+- `allowPooling` is accepted; when true, endpoint-level pooling reuses compatible connects.
 - `requireUnreliable` is accepted; current runtime transport always supports unreliable delivery.
 - `serverCertificateHashes` is rejected when combined with `allowPooling=true`, matching W3C constraints.
 
