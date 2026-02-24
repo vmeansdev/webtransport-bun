@@ -80,7 +80,11 @@ export {
 	E_INTERNAL,
 	WebTransportError,
 } from "./errors.js";
-export type { ErrorCode, WebTransportErrorOptions, WebTransportErrorSource } from "./errors.js";
+export type {
+	ErrorCode,
+	WebTransportErrorOptions,
+	WebTransportErrorSource,
+} from "./errors.js";
 
 import {
 	E_INTERNAL,
@@ -104,22 +108,35 @@ function normalizeToBrowserName(
 	code: ErrorCode,
 	message: string,
 ): string | undefined {
-	if (message.includes("serverCertificateHashes cannot be used with allowPooling=true")) {
+	if (
+		message.includes(
+			"serverCertificateHashes cannot be used with allowPooling=true",
+		)
+	) {
 		return "NotSupportedError";
 	}
 	if (message.includes("serverCertificateHashes must be an array")) {
 		return "TypeError";
 	}
-	if (message.includes("allowPooling must be a boolean") || message.includes("requireUnreliable must be a boolean")) {
+	if (
+		message.includes("allowPooling must be a boolean") ||
+		message.includes("requireUnreliable must be a boolean")
+	) {
 		return "TypeError";
 	}
-	if (message.includes("congestionControl must be") || message.includes("datagramsReadableType must be")) {
+	if (
+		message.includes("congestionControl must be") ||
+		message.includes("datagramsReadableType must be")
+	) {
 		return "TypeError";
 	}
 	if (message.includes("E_HANDSHAKE_TIMEOUT")) {
 		return "TimeoutError";
 	}
-	if (message.includes("E_SESSION_CLOSED") || message.includes("E_SESSION_IDLE_TIMEOUT")) {
+	if (
+		message.includes("E_SESSION_CLOSED") ||
+		message.includes("E_SESSION_IDLE_TIMEOUT")
+	) {
 		return "InvalidStateError";
 	}
 	return undefined;
@@ -134,7 +151,11 @@ function toWebTransportError(
 	const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
 	const browserName =
 		strictW3CErrors === true ? normalizeToBrowserName(code, msg) : undefined;
-	return new WebTransportError(code, msg, browserName ? { browserName } : undefined);
+	return new WebTransportError(
+		code,
+		msg,
+		browserName ? { browserName } : undefined,
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +394,10 @@ export class WebTransportSendGroup {
 	_getId(): number {
 		return this.#id;
 	}
-	async getStats(): Promise<{ bytesSent?: number; bytesAcknowledged?: number }> {
+	async getStats(): Promise<{
+		bytesSent?: number;
+		bytesAcknowledged?: number;
+	}> {
 		return this.#transport._getSendGroupStats(this.#id);
 	}
 }
@@ -1185,10 +1209,15 @@ export async function connect(
 			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
 			const browserName =
 				opts?.strictW3CErrors === true
-					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ?? undefined)
+					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ??
+						undefined)
 					: undefined;
 			reject(
-				new WebTransportError(E_HANDSHAKE_TIMEOUT as ErrorCode, msg, browserName ? { browserName } : undefined),
+				new WebTransportError(
+					E_HANDSHAKE_TIMEOUT as ErrorCode,
+					msg,
+					browserName ? { browserName } : undefined,
+				),
 			);
 		}, handshakeTimeout);
 	});
@@ -1261,7 +1290,10 @@ const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
 
 function validateClientOptions(opts?: WebTransportClientOptions): void {
 	if (!opts) return;
-	if (opts.allowPooling !== undefined && typeof opts.allowPooling !== "boolean") {
+	if (
+		opts.allowPooling !== undefined &&
+		typeof opts.allowPooling !== "boolean"
+	) {
 		throw new WebTransportError(
 			E_INTERNAL as ErrorCode,
 			"E_INTERNAL: allowPooling must be a boolean",
@@ -1482,14 +1514,13 @@ export class WebTransport {
 		urlOrSession: string | ClientSession,
 		options?: WebTransportClientOptions,
 	) {
-			if (typeof urlOrSession === "string") {
-				this.#datagramsReadableType =
-					options?.datagramsReadableType ?? "default";
-				const requestedCongestion = options?.congestionControl ?? "default";
-				// Runtime currently supports default algorithm; explicit preference falls back to default.
-				this.#congestionControl =
-					requestedCongestion === "default" ? "default" : "default";
-				const clientOpts = mapToClientOptions(options);
+		if (typeof urlOrSession === "string") {
+			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
+			const requestedCongestion = options?.congestionControl ?? "default";
+			// Runtime currently supports default algorithm; explicit preference falls back to default.
+			this.#congestionControl =
+				requestedCongestion === "default" ? "default" : "default";
+			const clientOpts = mapToClientOptions(options);
 			this.#sessionPromise = connect(urlOrSession, clientOpts);
 			this.#state = "connecting";
 			this.#ready = this.#sessionPromise.then(
@@ -1514,10 +1545,10 @@ export class WebTransport {
 					return toCloseInfo({ code: 0, reason: "" });
 				},
 			);
-			} else {
-				this.#datagramsReadableType = "default";
-				this.#congestionControl = "default";
-				const s = urlOrSession;
+		} else {
+			this.#datagramsReadableType = "default";
+			this.#congestionControl = "default";
+			const s = urlOrSession;
 			this.#sessionPromise = Promise.resolve(s);
 			this.#session = s;
 			this.#state = "connected";
@@ -1715,21 +1746,21 @@ export class WebTransport {
 			throw new TypeError("sendOrder must be an integer");
 		}
 		let groupId = 0;
-			if (options?.sendGroup != null) {
-				if (!(options.sendGroup instanceof WebTransportSendGroup)) {
-					throw new DOMException(
-						"sendGroup belongs to another transport",
-						"InvalidStateError",
-					);
-				}
-				if (options.sendGroup._getTransport() !== this) {
-					throw new DOMException(
-						"sendGroup belongs to another transport",
-						"InvalidStateError",
-					);
-				}
-				groupId = options.sendGroup._getId();
+		if (options?.sendGroup != null) {
+			if (!(options.sendGroup instanceof WebTransportSendGroup)) {
+				throw new DOMException(
+					"sendGroup belongs to another transport",
+					"InvalidStateError",
+				);
 			}
+			if (options.sendGroup._getTransport() !== this) {
+				throw new DOMException(
+					"sendGroup belongs to another transport",
+					"InvalidStateError",
+				);
+			}
+			groupId = options.sendGroup._getId();
+		}
 		return { groupId, sendOrder };
 	}
 
@@ -1816,15 +1847,13 @@ function createDatagramStreams(
 		) {
 			const view = byteController.byobRequest.view as Uint8Array;
 			if (view.byteLength < chunk.length) {
-				throw new RangeError(
-					"BYOB buffer smaller than datagram size",
-				);
+				throw new RangeError("BYOB buffer smaller than datagram size");
 			}
-				view.set(chunk.subarray(0, chunk.length));
-				byteController.byobRequest.respond(chunk.length);
-				return;
-			}
-			controller.enqueue(chunk);
+			view.set(chunk.subarray(0, chunk.length));
+			byteController.byobRequest.respond(chunk.length);
+			return;
+		}
+		controller.enqueue(chunk);
 	};
 
 	const readable =
@@ -1841,19 +1870,19 @@ function createDatagramStreams(
 	return {
 		readable,
 		writable,
-			createWritable(options?: {
-				sendGroup?: WebTransportSendGroup | null;
-				sendOrder?: number;
-			}): WritableStream<Uint8Array> {
-				const state = wt._getState();
-				if (state === "closed" || state === "failed") {
-					throw new DOMException(
-						"Transport is closed or failed",
-						"InvalidStateError",
-					);
-				}
-				return createDatagramWritable(wt, wt._resolveSendPolicy(options));
-			},
+		createWritable(options?: {
+			sendGroup?: WebTransportSendGroup | null;
+			sendOrder?: number;
+		}): WritableStream<Uint8Array> {
+			const state = wt._getState();
+			if (state === "closed" || state === "failed") {
+				throw new DOMException(
+					"Transport is closed or failed",
+					"InvalidStateError",
+				);
+			}
+			return createDatagramWritable(wt, wt._resolveSendPolicy(options));
+		},
 		get maxDatagramSize(): number {
 			return DEFAULT_LIMITS.maxDatagramSize;
 		},
@@ -2018,7 +2047,10 @@ function nodeDuplexToWebBidi(
 /** Extract QUIC application error code from abort/cancel reason. */
 function extractStreamErrorCode(reason: unknown): number {
 	if (typeof reason === "number" && Number.isInteger(reason)) return reason;
-	const o = reason && typeof reason === "object" ? (reason as Record<string, unknown>) : null;
+	const o =
+		reason && typeof reason === "object"
+			? (reason as Record<string, unknown>)
+			: null;
 	if (o) {
 		const c = (o.streamErrorCode ?? o.code) as unknown;
 		if (typeof c === "number" && Number.isInteger(c)) return c;

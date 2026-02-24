@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# Ensure common tool locations are available when git invokes hooks with a minimal PATH.
+export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  exit 0
+fi
+
+if ! command -v bun >/dev/null 2>&1; then
+  echo "pre-push: bun is required" >&2
+  exit 1
+fi
+
+if ! command -v bunx >/dev/null 2>&1; then
+  echo "pre-push: bunx is required" >&2
+  exit 1
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-push: cargo is required" >&2
+  exit 1
+fi
+
+formatted_tsjs=0
+formatted_rust=0
+
+echo "pre-push: checking TS/JS formatting with biome"
+declare -a tsjs_files=()
+while IFS= read -r -d '' file; do
+  case "$file" in
+    *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs)
+      tsjs_files+=("$file")
+      ;;
+  esac
+done < <(git ls-files -z)
+
+if [ "${#tsjs_files[@]}" -gt 0 ]; then
+  if ! bunx biome format "${tsjs_files[@]}"; then
+    echo "pre-push: formatting TS/JS files with biome (--write)"
+    bunx biome format --write "${tsjs_files[@]}"
+    formatted_tsjs=1
+    echo "pre-push: re-checking TS/JS formatting"
+    bunx biome format "${tsjs_files[@]}"
+  fi
+else
+  echo "pre-push: no TS/JS files found, skipping biome check"
+fi
+
+echo "pre-push: running TypeScript typecheck"
+bun run typecheck
+
+echo "pre-push: running Rust format check"
+if ! cargo fmt --all --check; then
+  echo "pre-push: formatting Rust with cargo fmt"
+  cargo fmt --all
+  formatted_rust=1
+  echo "pre-push: re-checking Rust formatting"
+  cargo fmt --all --check
+fi
+
+echo "pre-push: running Rust workspace check"
+cargo check --workspace
+
+if [ "$formatted_tsjs" -eq 1 ] || [ "$formatted_rust" -eq 1 ]; then
+  echo "pre-push: formatters changed files. Commit formatting changes, then push again." >&2
+  git status --short -- . >&2
+  exit 1
+fi
+
+echo "pre-push: all checks passed"

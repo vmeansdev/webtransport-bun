@@ -18,7 +18,10 @@ async function readDatagramWithTimeout(
 ): Promise<Uint8Array> {
 	const next = (await Promise.race([
 		iter.next(),
-		Bun.sleep(timeoutMs).then(() => ({ done: true as const, value: undefined })),
+		Bun.sleep(timeoutMs).then(() => ({
+			done: true as const,
+			value: undefined,
+		})),
 	])) as IteratorResult<Uint8Array>;
 	if (next.done || next.value === undefined) {
 		throw new Error("timed out waiting for echoed datagram");

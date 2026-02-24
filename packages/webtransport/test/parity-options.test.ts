@@ -65,9 +65,9 @@ describe("parity options (Phase 5)", () => {
 		reader.releaseLock();
 		expect(done).toBe(false);
 		expect(value).toBeDefined();
-		expect(new Uint8Array(value!.buffer, value!.byteOffset, value!.byteLength)).toEqual(
-			new Uint8Array([1, 2, 3]),
-		);
+		expect(
+			new Uint8Array(value!.buffer, value!.byteOffset, value!.byteLength),
+		).toEqual(new Uint8Array([1, 2, 3]));
 		wt.close();
 	});
 

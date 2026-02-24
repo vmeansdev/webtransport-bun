@@ -1,8 +1,8 @@
 {
-    "name": "webtransport-native",
-    "version": "0.1.0",
-    "private": true,
-    "napi": {
-        "binaryName": "webtransport-native"
-    }
+	"name": "webtransport-native",
+	"version": "0.1.0",
+	"private": true,
+	"napi": {
+		"binaryName": "webtransport-native"
+	}
 }

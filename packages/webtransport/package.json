@@ -1,48 +1,60 @@
 {
-  "name": "@webtransport-bun/webtransport",
-  "version": "0.1.0",
-  "description": "Production-focused WebTransport for Bun with datagrams and streams via a Rust napi-rs addon",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/vmeansdev/webtransport-bun.git"
-  },
-  "homepage": "https://github.com/vmeansdev/webtransport-bun#readme",
-  "bugs": {
-    "url": "https://github.com/vmeansdev/webtransport-bun/issues"
-  },
-  "keywords": ["bun", "webtransport", "quic", "napi-rs", "realtime"],
-  "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    }
-  },
-  "files": [
-    "dist/**/*",
-    "prebuilds/**/*",
-    "README.md",
-    "LICENSE"
-  ],
-  "engines": {
-    "bun": ">=1.3.9"
-  },
-  "os": ["darwin", "linux"],
-  "cpu": ["arm64", "x64"],
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "clean": "rm -rf dist",
-    "build": "tsc -p tsconfig.build.json",
-    "prebuild:native": "cd ../.. && bun run build:native && mkdir -p packages/webtransport/prebuilds && cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/ 2>/dev/null || true",
-    "prebuild:checksums": "cd prebuilds 2>/dev/null && shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true",
-    "pack:check": "npm pack --dry-run",
-    "prepublishOnly": "npm run clean && npm run build && npm run prebuild:native && npm run prebuild:checksums && npm run pack:check",
-    "test": "bun test",
-    "typecheck": "tsc --noEmit"
-  }
+	"name": "@webtransport-bun/webtransport",
+	"version": "0.1.0",
+	"description": "Production-focused WebTransport for Bun with datagrams and streams via a Rust napi-rs addon",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/vmeansdev/webtransport-bun.git"
+	},
+	"homepage": "https://github.com/vmeansdev/webtransport-bun#readme",
+	"bugs": {
+		"url": "https://github.com/vmeansdev/webtransport-bun/issues"
+	},
+	"keywords": [
+		"bun",
+		"webtransport",
+		"quic",
+		"napi-rs",
+		"realtime"
+	],
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		}
+	},
+	"files": [
+		"dist/**/*",
+		"prebuilds/**/*",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"bun": ">=1.3.9"
+	},
+	"os": [
+		"darwin",
+		"linux"
+	],
+	"cpu": [
+		"arm64",
+		"x64"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"clean": "rm -rf dist",
+		"build": "tsc -p tsconfig.build.json",
+		"prebuild:native": "cd ../.. && bun run build:native && mkdir -p packages/webtransport/prebuilds && cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/ 2>/dev/null || true",
+		"prebuild:checksums": "cd prebuilds 2>/dev/null && shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true",
+		"pack:check": "npm pack --dry-run",
+		"prepublishOnly": "npm run clean && npm run build && npm run prebuild:native && npm run prebuild:checksums && npm run pack:check",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit"
+	}
 }

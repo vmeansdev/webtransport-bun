@@ -47,10 +47,10 @@ describe("parity baseline (Phase 0)", () => {
 		// Streams
 		expect("incomingBidirectionalStreams" in wt).toBe(true);
 		expect("incomingUnidirectionalStreams" in wt).toBe(true);
-			expect(typeof wt.createBidirectionalStream).toBe("function");
-			expect(typeof wt.createUnidirectionalStream).toBe("function");
-			expect(typeof wt.createSendGroup).toBe("function");
-			expect(typeof wt.close).toBe("function");
+		expect(typeof wt.createBidirectionalStream).toBe("function");
+		expect(typeof wt.createUnidirectionalStream).toBe("function");
+		expect(typeof wt.createSendGroup).toBe("function");
+		expect(typeof wt.close).toBe("function");
 
 		wt.close();
 	});
@@ -66,13 +66,13 @@ describe("parity baseline (Phase 0)", () => {
 		expect(stats).toBeDefined();
 		expect(stats.datagrams).toBeDefined();
 		expect(typeof stats.datagrams.droppedIncoming).toBe("number");
-			expect(typeof stats.datagrams.expiredIncoming).toBe("number");
-			expect(typeof stats.datagrams.expiredOutgoing).toBe("number");
-			expect(typeof stats.datagrams.lostOutgoing).toBe("number");
-			expect(typeof stats.bytesSent).toBe("number");
-			expect(typeof stats.bytesReceived).toBe("number");
-			expect(typeof stats.packetsSent).toBe("number");
-			expect(typeof stats.packetsReceived).toBe("number");
+		expect(typeof stats.datagrams.expiredIncoming).toBe("number");
+		expect(typeof stats.datagrams.expiredOutgoing).toBe("number");
+		expect(typeof stats.datagrams.lostOutgoing).toBe("number");
+		expect(typeof stats.bytesSent).toBe("number");
+		expect(typeof stats.bytesReceived).toBe("number");
+		expect(typeof stats.packetsSent).toBe("number");
+		expect(typeof stats.packetsReceived).toBe("number");
 
 		wt.close();
 	});

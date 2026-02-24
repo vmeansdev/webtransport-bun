@@ -32,7 +32,9 @@ describe("parity robustness (Phase 6)", () => {
 						}
 						if (chunks.length > 0) {
 							const writer = duplex.writable.getWriter();
-							await writer.write(Buffer.concat(chunks.map((c) => Buffer.from(c))));
+							await writer.write(
+								Buffer.concat(chunks.map((c) => Buffer.from(c))),
+							);
 							await writer.close();
 						}
 					})().catch(() => {});

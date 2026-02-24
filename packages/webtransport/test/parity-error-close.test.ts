@@ -117,7 +117,9 @@ describe("parity error and close mapping (P4)", () => {
 		const withSendOrder = await wt.createBidirectionalStream({ sendOrder: 1 });
 		expect(withSendOrder.readable).toBeInstanceOf(ReadableStream);
 		expect(withSendOrder.writable).toBeInstanceOf(WritableStream);
-		const withSendGroup = await wt.createBidirectionalStream({ sendGroup: group });
+		const withSendGroup = await wt.createBidirectionalStream({
+			sendGroup: group,
+		});
 		expect(withSendGroup.readable).toBeInstanceOf(ReadableStream);
 		expect(withSendGroup.writable).toBeInstanceOf(WritableStream);
 		await expect(
