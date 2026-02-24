@@ -1,10 +1,25 @@
-# CI: build, test, interop (Chromium). P0-G.
+# CI: build, test, parity, interop (Chromium). P0-G.
 name: test
 on:
   push:
   pull_request:
   workflow_dispatch:
 jobs:
+  parity:
+    name: Parity (W3C facade)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - name: Build native addon
+        run: bun run build:native
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Parity tests
+        run: bun run test:parity
   soak:
     runs-on: ubuntu-latest
     steps:
@@ -48,8 +63,6 @@ jobs:
         run: bun run typecheck
       - name: Unit tests
         run: bun test packages/
-      - name: Parity (W3C facade)
-        run: bun run test:parity
       - name: Build reference + load-client
         run: cargo build -p reference --bins
       - name: Load-addon test
