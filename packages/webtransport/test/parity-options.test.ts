@@ -14,7 +14,11 @@ describe("parity options (Phase 5)", () => {
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
-			onSession: () => {},
+			onSession: async (s) => {
+				for await (const d of s.incomingDatagrams()) {
+					await s.sendDatagram(d);
+				}
+			},
 		});
 		await Bun.sleep(2000);
 	});
@@ -36,12 +40,24 @@ describe("parity options (Phase 5)", () => {
 		wt.close();
 	});
 
-	test("datagramsReadableType option accepted (no-op)", async () => {
+	test("datagramsReadableType 'bytes' creates ReadableByteStream and receives datagrams", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			datagramsReadableType: "bytes",
 		});
 		await wt.ready;
+		const reader = wt.datagrams.readable.getReader({ mode: "byob" });
+		const writer = wt.datagrams.writable.getWriter();
+		await writer.write(new Uint8Array([1, 2, 3]));
+		writer.releaseLock();
+		const buf = new Uint8Array(128);
+		const { value, done } = await reader.read(buf);
+		reader.releaseLock();
+		expect(done).toBe(false);
+		expect(value).toBeDefined();
+		expect(new Uint8Array(value!.buffer, value!.byteOffset, value!.byteLength)).toEqual(
+			new Uint8Array([1, 2, 3]),
+		);
 		wt.close();
 	});
 

@@ -257,7 +257,7 @@ export type WebTransportClientOptions = {
 	requireUnreliable?: boolean;
 	/** Accepted, no-op (native uses default). */
 	congestionControl?: "default" | "throughput" | "low-latency";
-	/** Accepted, no-op (datagrams.readable is default stream type). */
+	/** When "bytes", datagrams.readable is a ReadableByteStream with BYOB support; default uses normal ReadableStream. */
 	datagramsReadableType?: "bytes" | "default";
 	/** Bun backend extension */
 	tls?: {
@@ -1233,6 +1233,7 @@ export class WebTransport {
 	#session: ClientSession | null = null;
 	#state: WebTransportState;
 	#datagramsCache: WebTransportDatagramDuplexStream | null = null;
+	readonly #datagramsReadableType: "bytes" | "default";
 	#incomingBidiCache: ReadableStream<{
 		readable: ReadableStream<Uint8Array>;
 		writable: WritableStream<Uint8Array>;
@@ -1244,6 +1245,8 @@ export class WebTransport {
 		options?: WebTransportClientOptions,
 	) {
 		if (typeof urlOrSession === "string") {
+			this.#datagramsReadableType =
+				options?.datagramsReadableType ?? "default";
 			const clientOpts = mapToClientOptions(options);
 			this.#sessionPromise = connect(urlOrSession, clientOpts);
 			this.#state = "connecting";
@@ -1264,6 +1267,7 @@ export class WebTransport {
 				}),
 			);
 		} else {
+			this.#datagramsReadableType = "default";
 			const s = urlOrSession;
 			this.#sessionPromise = Promise.resolve(s);
 			this.#session = s;
@@ -1298,7 +1302,10 @@ export class WebTransport {
 	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
 	get datagrams(): WebTransportDatagramDuplexStream {
 		if (!this.#datagramsCache) {
-			this.#datagramsCache = createDatagramStreams(this);
+			this.#datagramsCache = createDatagramStreams(
+				this,
+				this.#datagramsReadableType,
+			);
 		}
 		return this.#datagramsCache;
 	}
@@ -1427,16 +1434,58 @@ function createDatagramWritable(wt: WebTransport): WritableStream<Uint8Array> {
 	});
 }
 
-function createDatagramStreams(wt: WebTransport): WebTransportDatagramDuplexStream {
-	const readable = new ReadableStream<Uint8Array>({
-		async start(controller) {
+function createDatagramStreams(
+	wt: WebTransport,
+	readableType: "bytes" | "default",
+): WebTransportDatagramDuplexStream {
+	let iter: AsyncIterator<Uint8Array> | null = null;
+	const getNext = async (): Promise<IteratorResult<Uint8Array>> => {
+		if (!iter) {
 			const s = await wt._getSession();
-			for await (const d of s.incomingDatagrams()) {
-				controller.enqueue(new Uint8Array(d));
-			}
+			iter = s.incomingDatagrams()[Symbol.asyncIterator]();
+		}
+		return iter.next();
+	};
+
+	const pull = async (
+		controller:
+			| ReadableStreamController<Uint8Array>
+			| ReadableByteStreamController,
+	) => {
+		const { done, value } = await getNext();
+		if (done) {
 			controller.close();
-		},
-	});
+			return;
+		}
+		const chunk = new Uint8Array(value);
+		const byteController = controller as ReadableByteStreamController;
+		if (
+			readableType === "bytes" &&
+			byteController.byobRequest &&
+			byteController.byobRequest.view
+		) {
+			const view = byteController.byobRequest.view as Uint8Array;
+			if (view.byteLength < chunk.length) {
+				throw new RangeError(
+					"BYOB buffer smaller than datagram size",
+				);
+			}
+			view.set(chunk.subarray(0, view.byteLength));
+			byteController.byobRequest.respond(chunk.length);
+			return;
+		}
+		controller.enqueue(chunk);
+	};
+
+	const readable =
+		readableType === "bytes"
+			? new ReadableStream({
+					type: "bytes",
+					pull,
+					// @ts-expect-error highWaterMark valid for byte streams
+					highWaterMark: 0,
+				})
+			: new ReadableStream<Uint8Array>({ pull, highWaterMark: 0 });
 	const writable = createDatagramWritable(wt);
 	return {
 		readable,

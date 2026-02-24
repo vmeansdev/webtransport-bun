@@ -126,7 +126,8 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
 | Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
 | Static capabilities   | `supportsReliableOnly`                             | `implemented`  | WebTransport.supportsReliableOnly = false (QUIC supports unreliable)                                   | —                                                                       | —                                                                       |
-| Options               | `congestionControl`, `datagramsReadableType`       | `diverged`     | Accepted, validated; no-op (native uses default; byte-mode readable not implemented)                   | congestionControl requires native; datagramsReadableType "bytes" needs byte stream | —                                                                       |
+| Options               | `congestionControl`                                | `diverged`     | Accepted, validated; no-op (native uses default)                                                       | Requires native algorithm selection                                   | —                                                                       |
+| Options               | `datagramsReadableType`                            | `implemented`  | `"bytes"` creates ReadableByteStream with BYOB support; `"default"` uses normal ReadableStream         | —                                                                     | —                                                                       |
 
 
 ## Intentional Divergences (currently)
@@ -136,7 +137,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 3. **Stats (getStats())**: Returns minimal WebTransportConnectionStats (datagrams only). bytesSent, RTT, bytesReceived, etc. omitted (native layer does not expose).
 4. **serverCertificateHashes**: Option is parsed/validated but runtime does not support it; explicit rejection with clear error.
 5. **sendOrder/sendGroup**: Accepted on createBidirectionalStream/createUnidirectionalStream; no-op. Native layer has no stream prioritization.
-6. **congestionControl / datagramsReadableType**: Accepted, validated; no-op. congestionControl requires native; datagramsReadableType "bytes" (ReadableByteStream) not implemented.
+6. **congestionControl**: Accepted, validated; no-op. Requires native algorithm selection.
 
 ## Priority Execution Order (completed)
 
