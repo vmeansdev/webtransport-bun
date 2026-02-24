@@ -252,9 +252,13 @@ export type WebTransportClientOptions = {
 	serverCertificateHashes?: Array<{
 		algorithm: "sha-256";
 		value: BufferSource;
-	}>; // BufferSource = ArrayBuffer | ArrayBufferView
+	}>;
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;
+	/** Accepted, no-op (native uses default). */
+	congestionControl?: "default" | "throughput" | "low-latency";
+	/** Accepted, no-op (datagrams.readable is default stream type). */
+	datagramsReadableType?: "bytes" | "default";
 	/** Bun backend extension */
 	tls?: {
 		insecureSkipVerify?: boolean;
@@ -1131,12 +1135,33 @@ function validateServerCertificateHashes(
 	}
 }
 
+const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
+const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
+
 function validateClientOptions(opts?: WebTransportClientOptions): void {
 	if (!opts) return;
 	for (const k of UNSUPPORTED_CTOR_OPTIONS) {
 		if (k in opts && (opts as Record<string, unknown>)[k] !== undefined) {
 			rejectUnsupportedOption(k);
 		}
+	}
+	if (
+		opts.congestionControl !== undefined &&
+		!VALID_CONGESTION.has(opts.congestionControl)
+	) {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+		);
+	}
+	if (
+		opts.datagramsReadableType !== undefined &&
+		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
+	) {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			`E_INTERNAL: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
+		);
 	}
 	if (opts.serverCertificateHashes !== undefined) {
 		if (!Array.isArray(opts.serverCertificateHashes)) {
@@ -1197,6 +1222,9 @@ type WebTransportState =
  * ```
  */
 export class WebTransport {
+	/** Static: true if runtime supports sessions over exclusively reliable (TCP) connections. Ours uses QUIC (supports unreliable). */
+	static readonly supportsReliableOnly = false;
+
 	readonly #sessionPromise: Promise<ClientSession>;
 	readonly #ready: Promise<void>;
 	readonly #closed: Promise<WebTransportCloseInfo>;
