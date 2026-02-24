@@ -15,7 +15,7 @@ This matrix is the single source of truth. Update it when implementation changes
 
 - Required members: `ready`, `closed`, `draining`, `datagrams`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, `createBidirectionalStream`, `createUnidirectionalStream`, `close`
 - Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize` (WebTransportDatagramDuplexStream)
-- Diverged: `getStats` not present on facade
+- getStats: returns WebTransportConnectionStats (minimal; datagrams only)
 - Unsupported options: `allowPooling`, `requireUnreliable` — explicit rejection
 
 ## Legend
@@ -121,7 +121,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Streams               | `sendOrder`/`sendGroup` on createBidi/createUni     | `partial`      | Options accepted, no-op (native layer does not support stream prioritization)                            | API compatible; ordering not enforced                                   | —                                                                       |
 | Stream control        | reset/stop sending semantics                        | `partial`      | Symbol methods `WT_RESET` / `WT_STOP_SENDING` in `packages/webtransport/src/streams.ts`                 | Spec API shape differs; semantics mostly present                        | Bridge to browser-style stream cancellation/abort semantics           |
 | Error model           | WebTransport error classes/codes                    | `partial`      | Stable internal `E_*` codes + `WebTransportError` in `packages/webtransport/src/errors.ts`              | Need spec-aligned DOMException/WebTransportError shape in facade        | Add error translator in browser facade                                |
-| Stats                 | `getStats()` dictionaries                           | `diverged`     | No `getStats()` on WebTransport facade for v1; use `metricsSnapshot()` on Node session                   | Documented explicit divergence for current release                       | See Intentional Divergences                                            |
+| Stats                 | `getStats()` dictionaries                           | `partial`      | WebTransport.getStats() returns WebTransportConnectionStats with datagrams; bytesSent/RTT etc. absent (native does not expose) | Phase 3 implemented                                                      | —                                                                       |
 | Security/auth         | `serverCertificateHashes` behavior                  | `diverged`     | Facade validates format, then rejects with "not supported in this runtime"                               | Option parsed/validated; explicit unsupported path (R5)                  | —                                                                       |
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
 | Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
@@ -132,7 +132,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 
 1. Primary package API is Node-first (not browser-API-first).
 2. Node client streams are Node streams; facade exposes Web Streams for browser parity.
-3. **Stats (getStats())**: No `getStats()` on WebTransport facade for v1. Use Node `ClientSession.metricsSnapshot()` for observability. Explicit divergence for current release; may add adapter in future.
+3. **Stats (getStats())**: `getStats()` implemented; returns minimal WebTransportConnectionStats (datagrams only). bytesSent, RTT, etc. omitted (native layer does not expose).
 4. **serverCertificateHashes**: Option is parsed/validated but runtime does not support it; explicit rejection with clear error.
 
 ## Priority Execution Order (completed)

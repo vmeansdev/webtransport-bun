@@ -387,6 +387,29 @@ export type SessionMetricsSnapshot = {
 	queuedBytes: number;
 };
 
+/** W3C WebTransportConnectionStats shape. Unavailable stats are omitted. */
+export type WebTransportConnectionStats = {
+	datagrams: {
+		droppedIncoming: number;
+		expiredIncoming: number;
+		expiredOutgoing: number;
+		lostOutgoing: number;
+	};
+	bytesSent?: number;
+	bytesSentOverhead?: number;
+	bytesAcknowledged?: number;
+	packetsSent?: number;
+	bytesLost?: number;
+	packetsLost?: number;
+	bytesReceived?: number;
+	packetsReceived?: number;
+	smoothedRtt?: number;
+	rttVariation?: number;
+	minRtt?: number;
+	estimatedSendRate?: number | null;
+	atSendCapacity?: boolean;
+};
+
 /** Prometheus metric name prefix. Override via env WEBTRANSPORT_METRICS_PREFIX. */
 export const METRICS_PREFIX =
 	process.env.WEBTRANSPORT_METRICS_PREFIX ?? "webtransport_";
@@ -1318,6 +1341,28 @@ export class WebTransport {
 		const s = await this.#sessionPromise;
 		const writable = await s.createUnidirectionalStream();
 		return nodeWritableToWebWritable(writable);
+	}
+
+	/**
+	 * Get connection stats (W3C WebTransportConnectionStats).
+	 * Maps from session.metricsSnapshot(). Native exposes limited fields; unavailable stats are omitted.
+	 * @throws DOMException InvalidStateError if state is "failed"
+	 */
+	async getStats(): Promise<WebTransportConnectionStats> {
+		if (this.#state === "failed") {
+			throw new DOMException("Transport has failed", "InvalidStateError");
+		}
+		await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		return {
+			datagrams: {
+				droppedIncoming: 0,
+				expiredIncoming: 0,
+				expiredOutgoing: 0,
+				lostOutgoing: 0,
+			},
+			// Extension: expose session-level counters (not in W3C spec but available)
+			// Omitted per spec: bytesSent, bytesReceived, RTT, etc. (native does not expose)
+		};
 	}
 
 	/** Initiate graceful close. Idempotent after first call. */

@@ -54,14 +54,20 @@ describe("parity baseline (Phase 0)", () => {
 		wt.close();
 	});
 
-	test("WebTransport facade does NOT have getStats (diverged)", async () => {
+	test("WebTransport.getStats returns connection stats shape", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await wt.ready;
 
-		expect("getStats" in wt).toBe(false);
-		expect(typeof (wt as any).getStats).toBe("undefined");
+		expect(typeof wt.getStats).toBe("function");
+		const stats = await wt.getStats();
+		expect(stats).toBeDefined();
+		expect(stats.datagrams).toBeDefined();
+		expect(typeof stats.datagrams.droppedIncoming).toBe("number");
+		expect(typeof stats.datagrams.expiredIncoming).toBe("number");
+		expect(typeof stats.datagrams.expiredOutgoing).toBe("number");
+		expect(typeof stats.datagrams.lostOutgoing).toBe("number");
 
 		wt.close();
 	});
