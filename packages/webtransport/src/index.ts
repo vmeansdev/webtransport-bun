@@ -1330,7 +1330,7 @@ class SendScheduler {
 		if (this.#rrIdx >= this.#groupOrder.length) this.#rrIdx = 0;
 		const groupId = this.#groupOrder[this.#rrIdx];
 		this.#rrIdx = (this.#rrIdx + 1) % Math.max(1, this.#groupOrder.length);
-		return groupId;
+		return groupId ?? null;
 	}
 
 	#removeGroup(groupId: number): void {
@@ -1702,7 +1702,7 @@ function createDatagramStreams(
 
 	const pull = async (
 		controller:
-			| ReadableStreamController<Uint8Array>
+			| ReadableStreamDefaultController<Uint8Array>
 			| ReadableByteStreamController,
 	) => {
 		const { done, value } = await getNext();
@@ -1733,13 +1733,14 @@ function createDatagramStreams(
 
 	const readable =
 		readableType === "bytes"
-			? new ReadableStream({
-					type: "bytes",
-					pull,
-					// @ts-expect-error highWaterMark valid for byte streams
-					highWaterMark: 0,
-				})
-			: new ReadableStream<Uint8Array>({ pull, highWaterMark: 0 });
+			? new ReadableStream<Uint8Array>(
+					{
+						type: "bytes",
+						pull,
+					} as unknown as UnderlyingSource<Uint8Array>,
+					{ highWaterMark: 0 },
+				)
+			: new ReadableStream<Uint8Array>({ pull }, { highWaterMark: 0 });
 	const writable = createDatagramWritable(wt, { groupId: 0, sendOrder: 0 });
 	return {
 		readable,
@@ -1898,10 +1899,6 @@ function createIncomingUniStreams(
 	});
 }
 
-function nodeDuplexToWebBidi(duplex: Duplex): Promise<{
-	readable: ReadableStream<Uint8Array>;
-	writable: WritableStream<Uint8Array>;
-}>;
 function nodeDuplexToWebBidi(
 	duplex: Duplex,
 	scheduler?: SendScheduler,

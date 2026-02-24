@@ -98,7 +98,8 @@ describe("parity robustness (Phase 6)", () => {
 		const seen = new Set<number>();
 		for (let i = 0; i < 2; i++) {
 			const { value } = await reader.read();
-			if (value) seen.add(value[0]);
+			const first = value?.[0];
+			if (first !== undefined) seen.add(first);
 		}
 		reader.releaseLock();
 		expect(seen.has(0xa)).toBe(true);
