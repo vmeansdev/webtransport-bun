@@ -36,11 +36,13 @@ describe("parity baseline (Phase 0)", () => {
 		expect("closed" in wt).toBe(true);
 		expect("draining" in wt).toBe(true);
 
-		// Datagrams
+		// Datagrams (WebTransportDatagramDuplexStream)
 		expect("datagrams" in wt).toBe(true);
 		expect(wt.datagrams).toBeDefined();
 		expect("readable" in wt.datagrams).toBe(true);
 		expect("writable" in wt.datagrams).toBe(true);
+		expect(typeof wt.datagrams.createWritable).toBe("function");
+		expect(typeof wt.datagrams.maxDatagramSize).toBe("number");
 
 		// Streams
 		expect("incomingBidirectionalStreams" in wt).toBe(true);

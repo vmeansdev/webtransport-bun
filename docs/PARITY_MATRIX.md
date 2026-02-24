@@ -14,7 +14,7 @@ This matrix is the single source of truth. Update it when implementation changes
 `packages/webtransport/test/parity-baseline.test.ts` freezes the current facade surface:
 
 - Required members: `ready`, `closed`, `draining`, `datagrams`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, `createBidirectionalStream`, `createUnidirectionalStream`, `close`
-- Datagrams: `readable` and `writable` (Web Streams)
+- Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize` (WebTransportDatagramDuplexStream)
 - Diverged: `getStats` not present on facade
 - Unsupported options: `allowPooling`, `requireUnreliable` — explicit rejection
 
@@ -112,7 +112,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Session closure       | `close({ closeCode, reason })` semantics            | `implemented`  | `close(info?: WebTransportCloseInfo)` accepts `closeCode`/`reason`, maps to native `code`/`reason`      | Shape and semantics match spec                                          | —                                                                       |
 | Datagrams             | `transport.datagrams.readable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and edge semantics                              |
 | Datagrams             | `transport.datagrams.writable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Writable facade exists and local parity tests pass                      | Validate CI parity run and edge semantics                              |
-| Datagrams             | `createWritable()`, `maxDatagramSize`               | `missing`      | Not on facade; `readable`/`writable` only                                                               | Phase 1 target                                                          | Add WebTransportDatagramDuplexStream facade                            |
+| Datagrams             | `createWritable()`, `maxDatagramSize`               | `implemented`  | WebTransportDatagramDuplexStream with createWritable (sendGroup rejected), maxDatagramSize from DEFAULT_LIMITS | —                                                                       | —                                                                       |
 | Datagrams             | datagram options (e.g. send order/group)            | `diverged`     | `sendOrder`/`sendGroup` explicitly rejected with E_INTERNAL                                              | Parity option failure behavior implemented (R1)                         | —                                                                       |
 | Streams               | `createBidirectionalStream()` returning Web Streams | `implemented`  | Facade conversion implemented in `packages/webtransport/src/index.ts`                                    | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and option semantics                            |
 | Streams               | `incomingBidirectionalStreams` readable stream      | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |

@@ -291,6 +291,15 @@ export type WebTransportBidirectionalStream = {
 	writable: WritableStream<Uint8Array>;
 } & Partial<Resettable & StopSendable>;
 
+/** W3C WebTransportDatagramDuplexStream: readable, writable (compat), createWritable(), maxDatagramSize. */
+export type WebTransportDatagramDuplexStream = {
+	readonly readable: ReadableStream<Uint8Array>;
+	/** Backward compat: default writable. Prefer createWritable() for multiple writers. */
+	readonly writable: WritableStream<Uint8Array>;
+	createWritable(options?: { sendGroup?: unknown }): WritableStream<Uint8Array>;
+	readonly maxDatagramSize: number;
+};
+
 export type WebTransportReceiveStream = ReadableStream<Uint8Array> &
 	Partial<StopSendable>;
 
@@ -1172,10 +1181,7 @@ export class WebTransport {
 	#drainingResolve!: () => void;
 	#session: ClientSession | null = null;
 	#state: WebTransportState;
-	#datagramsCache: {
-		readable: ReadableStream<Uint8Array>;
-		writable: WritableStream<Uint8Array>;
-	} | null = null;
+	#datagramsCache: WebTransportDatagramDuplexStream | null = null;
 	#incomingBidiCache: ReadableStream<{
 		readable: ReadableStream<Uint8Array>;
 		writable: WritableStream<Uint8Array>;
@@ -1238,11 +1244,8 @@ export class WebTransport {
 		return this.#draining;
 	}
 
-	/** Datagram Web Streams (readable/writable). Throws E_SESSION_CLOSED after close. */
-	get datagrams(): {
-		readable: ReadableStream<Uint8Array>;
-		writable: WritableStream<Uint8Array>;
-	} {
+	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
+	get datagrams(): WebTransportDatagramDuplexStream {
 		if (!this.#datagramsCache) {
 			this.#datagramsCache = createDatagramStreams(this);
 		}
@@ -1335,13 +1338,23 @@ export class WebTransport {
 	async _getSession(): Promise<ClientSession> {
 		return this.#sessionPromise;
 	}
+
+	/** Internal: state for createWritable guard (not part of spec) */
+	_getState(): WebTransportState {
+		return this.#state;
+	}
 }
 
-// Stub implementations for P2/P3 — will be replaced in datagram/stream phases
-function createDatagramStreams(wt: WebTransport): {
-	readable: ReadableStream<Uint8Array>;
-	writable: WritableStream<Uint8Array>;
-} {
+function createDatagramWritable(wt: WebTransport): WritableStream<Uint8Array> {
+	return new WritableStream<Uint8Array>({
+		async write(chunk) {
+			const s = await wt._getSession();
+			await s.sendDatagram(chunk);
+		},
+	});
+}
+
+function createDatagramStreams(wt: WebTransport): WebTransportDatagramDuplexStream {
 	const readable = new ReadableStream<Uint8Array>({
 		async start(controller) {
 			const s = await wt._getSession();
@@ -1351,13 +1364,27 @@ function createDatagramStreams(wt: WebTransport): {
 			controller.close();
 		},
 	});
-	const writable = new WritableStream<Uint8Array>({
-		async write(chunk) {
-			const s = await wt._getSession();
-			await s.sendDatagram(chunk);
+	const writable = createDatagramWritable(wt);
+	return {
+		readable,
+		writable,
+		createWritable(options?: { sendGroup?: unknown }): WritableStream<Uint8Array> {
+			if (options?.sendGroup != null) {
+				throw new WebTransportError(
+					E_INTERNAL as ErrorCode,
+					"E_INTERNAL: unsupported option 'sendGroup' on datagram createWritable",
+				);
+			}
+			const state = wt._getState();
+			if (state === "closed" || state === "failed") {
+				throw new DOMException("InvalidStateError", "Transport is closed or failed");
+			}
+			return createDatagramWritable(wt);
 		},
-	});
-	return { readable, writable };
+		get maxDatagramSize(): number {
+			return DEFAULT_LIMITS.maxDatagramSize;
+		},
+	};
 }
 
 function attachServerBidiControls(
