@@ -1,18 +1,14 @@
-<p>
-  <img src="docs/brand/logo-wordmark-a-single-light.svg" alt="webtransport-bun logo" />
-</p>
+<div align="center">
+  <h1>webtransport-bun</h1>
+  <p><em>WebTransport for Bun with production guardrails: datagrams + streams, in-process server/client, and Chromium interop backed by Rust `wtransport` via `napi-rs`.</em></p>
+</div>
 
-WebTransport for Bun with production guardrails: datagrams + streams, in-process server/client, and Chromium interop backed by Rust `wtransport` via `napi-rs`.
-
-<p>
+<p align="center">
   <a href="https://www.npmjs.com/package/@webtransport-bun/webtransport">
     <img src="https://img.shields.io/npm/v/%40webtransport-bun%2Fwebtransport.svg" alt="npm version" />
   </a>
   <a href="https://www.npmjs.com/package/@webtransport-bun/webtransport">
     <img src="https://img.shields.io/npm/dm/%40webtransport-bun%2Fwebtransport.svg" alt="npm downloads" />
-  </a>
-  <a href="https://www.npmjs.com/package/@webtransport-bun/webtransport">
-    <img src="https://img.shields.io/bundlephobia/minzip/%40webtransport-bun%2Fwebtransport" alt="bundle size" />
   </a>
   <a href="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml">
     <img src="https://github.com/vmeansdev/webtransport-bun/actions/workflows/test.yml/badge.svg" alt="CI" />
