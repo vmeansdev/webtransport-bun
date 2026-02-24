@@ -1737,7 +1737,7 @@ function createDatagramStreams(
 					{
 						type: "bytes",
 						pull,
-					} as unknown as UnderlyingSource<Uint8Array>,
+					} as unknown as object,
 					{ highWaterMark: 0 },
 				)
 			: new ReadableStream<Uint8Array>({ pull }, { highWaterMark: 0 });
