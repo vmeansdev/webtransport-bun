@@ -492,6 +492,11 @@ export type WebTransportConnectionStats = {
 export const METRICS_PREFIX =
 	process.env.WEBTRANSPORT_METRICS_PREFIX ?? "webtransport_";
 
+function shouldSuppressInsecureSkipVerifyWarning(): boolean {
+	const v = process.env.WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN;
+	return v === "1" || v === "true" || v === "yes";
+}
+
 function escapePromLabelValue(v: unknown): string {
 	return String(v)
 		.replace(/\\/g, "\\\\")
@@ -1096,7 +1101,10 @@ export async function connect(
 	if (!native) {
 		throw new Error("Native addon not loaded");
 	}
-	if (opts?.tls?.insecureSkipVerify === true) {
+	if (
+		opts?.tls?.insecureSkipVerify === true &&
+		!shouldSuppressInsecureSkipVerifyWarning()
+	) {
 		const log =
 			opts.log ??
 			((e: LogEvent) => console.warn(`[webtransport] ${e.level}: ${e.msg}`));

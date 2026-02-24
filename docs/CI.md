@@ -31,6 +31,9 @@
 9. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
 10. Overload-addon test (`bun run test:overload-addon`)
 11. Load profiles (`bun run test:load-profiles-addon`)
+
+Test log hygiene:
+- Set `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1` in CI test jobs to suppress repeated dev-only TLS warning logs when tests intentionally use `tls.insecureSkipVerify: true`.
 12. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
 13. Smoke test — `bun add` from built package
 

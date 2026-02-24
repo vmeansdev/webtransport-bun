@@ -8,6 +8,8 @@ jobs:
   parity:
     name: Parity (W3C facade)
     runs-on: ubuntu-latest
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,6 +24,8 @@ jobs:
         run: bun run test:parity
   soak:
     runs-on: ubuntu-latest
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +39,8 @@ jobs:
         timeout-minutes: 5
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
