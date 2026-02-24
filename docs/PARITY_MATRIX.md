@@ -2,11 +2,21 @@
 
 ## Scope
 
-Track API parity against the WebTransport W3C Editor's Draft:
+Track API parity against the WebTransport W3C Editor's Draft snapshot:
 
-- [https://w3c.github.io/webtransport/](https://w3c.github.io/webtransport/)
+- Snapshot: `docs/w3c/w3c.github.io-2026-02-04.md`
+- Living: [https://w3c.github.io/webtransport/](https://w3c.github.io/webtransport/)
 
-This matrix is prefilled from the current codebase and should be updated as implementation changes land.
+This matrix is the single source of truth. Update it when implementation changes land.
+
+## Parity Baseline (Phase 0)
+
+`packages/webtransport/test/parity-baseline.test.ts` freezes the current facade surface:
+
+- Required members: `ready`, `closed`, `draining`, `datagrams`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, `createBidirectionalStream`, `createUnidirectionalStream`, `close`
+- Datagrams: `readable` and `writable` (Web Streams)
+- Diverged: `getStats` not present on facade
+- Unsupported options: `allowPooling`, `requireUnreliable` — explicit rejection
 
 ## Legend
 
@@ -102,6 +112,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Session closure       | `close({ closeCode, reason })` semantics            | `implemented`  | `close(info?: WebTransportCloseInfo)` accepts `closeCode`/`reason`, maps to native `code`/`reason`      | Shape and semantics match spec                                          | —                                                                       |
 | Datagrams             | `transport.datagrams.readable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and edge semantics                              |
 | Datagrams             | `transport.datagrams.writable`                      | `implemented`  | Implemented via facade adapters in `packages/webtransport/src/index.ts`                                 | Writable facade exists and local parity tests pass                      | Validate CI parity run and edge semantics                              |
+| Datagrams             | `createWritable()`, `maxDatagramSize`               | `missing`      | Not on facade; `readable`/`writable` only                                                               | Phase 1 target                                                          | Add WebTransportDatagramDuplexStream facade                            |
 | Datagrams             | datagram options (e.g. send order/group)            | `diverged`     | `sendOrder`/`sendGroup` explicitly rejected with E_INTERNAL                                              | Parity option failure behavior implemented (R1)                         | —                                                                       |
 | Streams               | `createBidirectionalStream()` returning Web Streams | `implemented`  | Facade conversion implemented in `packages/webtransport/src/index.ts`                                    | Web Streams facade exists and local parity tests pass                   | Validate CI parity run and option semantics                            |
 | Streams               | `incomingBidirectionalStreams` readable stream      | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |
@@ -113,6 +124,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Security/auth         | `serverCertificateHashes` behavior                  | `diverged`     | Facade validates format, then rejects with "not supported in this runtime"                               | Option parsed/validated; explicit unsupported path (R5)                  | —                                                                       |
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
 | Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
+| Static capabilities   | `supportsReliableOnly` etc.                         | `missing`      | No static capability flags on facade                                                                   | Phase 5 target                                                          | Add capability probing                                                 |
 
 
 ## Intentional Divergences (currently)
