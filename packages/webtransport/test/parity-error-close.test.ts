@@ -83,39 +83,29 @@ describe("parity error and close mapping (P4)", () => {
 		).toThrow(/only supports algorithm "sha-256"/);
 	});
 
-	test("createBidirectionalStream rejects sendOrder and sendGroup", async () => {
+	test("createBidirectionalStream accepts sendOrder and sendGroup (no-op)", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await wt.ready;
-		await expect(
-			wt.createBidirectionalStream({ sendOrder: 1 }),
-		).rejects.toMatchObject({
-			message: expect.stringMatching(/unsupported option 'sendOrder'/),
-		});
-		await expect(
-			wt.createBidirectionalStream({ sendGroup: 1 }),
-		).rejects.toMatchObject({
-			message: expect.stringMatching(/unsupported option 'sendGroup'/),
-		});
+		const withSendOrder = await wt.createBidirectionalStream({ sendOrder: 1 });
+		expect(withSendOrder.readable).toBeInstanceOf(ReadableStream);
+		expect(withSendOrder.writable).toBeInstanceOf(WritableStream);
+		const withSendGroup = await wt.createBidirectionalStream({ sendGroup: {} });
+		expect(withSendGroup.readable).toBeInstanceOf(ReadableStream);
+		expect(withSendGroup.writable).toBeInstanceOf(WritableStream);
 		wt.close();
 	});
 
-	test("createUnidirectionalStream rejects sendOrder and sendGroup", async () => {
+	test("createUnidirectionalStream accepts sendOrder and sendGroup (no-op)", async () => {
 		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await wt.ready;
-		await expect(
-			wt.createUnidirectionalStream({ sendOrder: 1 }),
-		).rejects.toMatchObject({
-			message: expect.stringMatching(/unsupported option 'sendOrder'/),
-		});
-		await expect(
-			wt.createUnidirectionalStream({ sendGroup: 1 }),
-		).rejects.toMatchObject({
-			message: expect.stringMatching(/unsupported option 'sendGroup'/),
-		});
+		const withSendOrder = await wt.createUnidirectionalStream({ sendOrder: 1 });
+		expect(withSendOrder).toBeInstanceOf(WritableStream);
+		const withSendGroup = await wt.createUnidirectionalStream({ sendGroup: {} });
+		expect(withSendGroup).toBeInstanceOf(WritableStream);
 		wt.close();
 	});
 });

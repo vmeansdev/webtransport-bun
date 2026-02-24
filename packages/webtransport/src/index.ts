@@ -246,7 +246,7 @@ export type WebTransportCloseInfo = {
 /**
  * Options for `new WebTransport(url, options)`.
  * Unsupported: `allowPooling`, `requireUnreliable`, `serverCertificateHashes` (validated then rejected).
- * Stream options `sendOrder`/`sendGroup` are rejected when passed to createBidirectionalStream/createUnidirectionalStream.
+ * Stream options `sendOrder`/`sendGroup` are accepted but ignored (native layer does not support prioritization).
  */
 export type WebTransportClientOptions = {
 	serverCertificateHashes?: Array<{
@@ -1160,8 +1160,8 @@ type WebTransportState =
  * Use `new WebTransport(url, options)` to connect, or `toWebTransport(session)` to wrap an existing
  * {@link ClientSession}. Await {@link WebTransport.ready} before using datagrams/streams.
  *
- * Unsupported options (`allowPooling`, `requireUnreliable`, `sendOrder`, `sendGroup`,
- * `serverCertificateHashes`) throw {@link WebTransportError} with code `E_INTERNAL`.
+ * Unsupported options (`allowPooling`, `requireUnreliable`, `serverCertificateHashes`) throw
+ * {@link WebTransportError} with code `E_INTERNAL`. Stream options `sendOrder`/`sendGroup` are accepted but ignored.
  *
  * @example
  * ```ts
@@ -1274,18 +1274,18 @@ export class WebTransport {
 	}
 
 	/**
-	 * Create a bidirectional stream (Web Streams). Rejects sendOrder/sendGroup (unsupported).
+	 * Create a bidirectional stream (Web Streams).
+	 * sendOrder/sendGroup are accepted but ignored (native layer does not support stream prioritization).
 	 * @throws WebTransportError E_SESSION_CLOSED if session is closed/draining/failed.
 	 */
 	async createBidirectionalStream(options?: {
 		sendOrder?: number;
-		sendGroup?: number;
+		sendGroup?: unknown;
 	}): Promise<{
 		readable: ReadableStream<Uint8Array>;
 		writable: WritableStream<Uint8Array>;
 	}> {
-		if (options?.sendOrder !== undefined) rejectUnsupportedOption("sendOrder");
-		if (options?.sendGroup !== undefined) rejectUnsupportedOption("sendGroup");
+		// sendOrder/sendGroup: accepted, no-op (native does not support)
 		if (
 			this.#state === "draining" ||
 			this.#state === "closed" ||
@@ -1299,15 +1299,15 @@ export class WebTransport {
 	}
 
 	/**
-	 * Create a unidirectional send stream (WritableStream). Rejects sendOrder/sendGroup (unsupported).
+	 * Create a unidirectional send stream (WritableStream).
+	 * sendOrder/sendGroup are accepted but ignored (native layer does not support stream prioritization).
 	 * @throws WebTransportError E_SESSION_CLOSED if session is closed/draining/failed.
 	 */
 	async createUnidirectionalStream(options?: {
 		sendOrder?: number;
-		sendGroup?: number;
+		sendGroup?: unknown;
 	}): Promise<WritableStream<Uint8Array>> {
-		if (options?.sendOrder !== undefined) rejectUnsupportedOption("sendOrder");
-		if (options?.sendGroup !== undefined) rejectUnsupportedOption("sendGroup");
+		// sendOrder/sendGroup: accepted, no-op (native does not support)
 		if (
 			this.#state === "draining" ||
 			this.#state === "closed" ||
