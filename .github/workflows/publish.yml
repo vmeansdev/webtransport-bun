@@ -49,8 +49,10 @@ jobs:
             echo "::error::Input tag (${{ inputs.tag }}) does not match package version tag (${EXPECTED_TAG})."
             exit 1
           fi
+      - name: Assert OIDC token is available
+        run: |
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" || (echo "::error::Missing ACTIONS_ID_TOKEN_REQUEST_URL (id-token permission not active)"; exit 1)
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" || (echo "::error::Missing ACTIONS_ID_TOKEN_REQUEST_TOKEN (id-token permission not active)"; exit 1)
       - name: Publish to npm (trusted publishing via OIDC)
         run: |
-          cd packages/webtransport
-          npm config delete //registry.npmjs.org/:_authToken || true
-          npm publish --access public --provenance --registry=https://registry.npmjs.org/
+          npm publish -w @webtransport-bun/webtransport --access public --provenance --registry=https://registry.npmjs.org/
