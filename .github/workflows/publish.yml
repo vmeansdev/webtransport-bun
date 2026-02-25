@@ -9,7 +9,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: ${{ vars.NPM_TRUSTED_PUBLISHING == 'true' }}
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
     steps:
@@ -19,6 +20,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: "https://registry.npmjs.org"
       - name: Download release prebuild assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -45,9 +47,28 @@ jobs:
         run: |
           cd packages/webtransport
           npm pack --dry-run --ignore-scripts
+      - name: Preflight npm auth, ownership, and version availability
+        run: |
+          set -euo pipefail
+          REG="https://registry.npmjs.org"
+          PKG="@webtransport-bun/webtransport"
+          PKG_VERSION="$(node -p "require('./packages/webtransport/package.json').version")"
+
+          WHOAMI="$(npm whoami --registry="$REG")"
+          echo "Authenticated to npm as: $WHOAMI"
+
+          npm owner ls "$PKG" --registry="$REG" > /tmp/npm_owners.txt
+          if ! grep -Eq "^${WHOAMI}( |$)" /tmp/npm_owners.txt; then
+            echo "::error::npm user '$WHOAMI' is not listed as an owner of $PKG"
+            cat /tmp/npm_owners.txt
+            exit 1
+          fi
+
+          if npm view "${PKG}@${PKG_VERSION}" version --registry="$REG" >/dev/null 2>&1; then
+            echo "::error::Version ${PKG_VERSION} is already published for ${PKG}"
+            exit 1
+          fi
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd packages/webtransport
           npm publish --ignore-scripts --access public --registry=https://registry.npmjs.org/
