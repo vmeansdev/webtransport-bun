@@ -18,6 +18,7 @@ import {
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "../src/index.js";
+import { nextPort } from "./helpers/network.js";
 
 describe("webtransport package exports", () => {
 	it("exports createServer function", () => {
@@ -93,5 +94,25 @@ describe("webtransport package exports", () => {
 				onSession: () => {},
 			}),
 		).toThrow(/E_TLS/);
+	});
+
+	it("createServer fails fast when startup cannot bind endpoint", async () => {
+		const port = nextPort(26400, 1000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			expect(() =>
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: () => {},
+				}),
+			).toThrow(/E_INTERNAL: server startup failed/);
+		} finally {
+			await server.close();
+		}
 	});
 });

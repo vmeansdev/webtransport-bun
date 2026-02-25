@@ -80,22 +80,23 @@ describe("limit boundaries (P0.4)", () => {
 		});
 
 		try {
-			const results = await Promise.all(
-				Array.from({ length: limit + 1 }, () =>
-					connectWithRetry(`https://127.0.0.1:${port}`, {
+			const accepted = [];
+			for (let i = 0; i < limit; i++) {
+				accepted.push(
+					await connectWithRetry(`https://127.0.0.1:${port}`, {
 						tls: { insecureSkipVerify: true },
-					}).then(
-						(s) => ({ ok: true as const, session: s }),
-						(e) => ({ ok: false as const, err: e }),
-					),
-				),
-			);
-
-			const succeeded = results.filter((r) => r.ok);
-			expect(succeeded.length).toBe(limit);
-			for (const s of succeeded) {
-				if (s.ok) s.session.close();
+					}),
+				);
 			}
+			expect(accepted.length).toBe(limit);
+
+			await expect(
+				connect(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+				}),
+			).rejects.toMatchObject({ code: E_LIMIT_EXCEEDED });
+
+			for (const session of accepted) session.close();
 
 			const m = server.metricsSnapshot();
 			expect(m.limitExceededCount).toBeGreaterThanOrEqual(1);

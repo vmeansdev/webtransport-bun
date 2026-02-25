@@ -1,6 +1,30 @@
 import { connect, WebTransport } from "../../src/index.js";
 
+const rangeOffsets = new Map<string, number>();
+const reservedPorts = new Set<number>();
+const seed = ((Date.now() & 0xffff) ^ ((process.pid & 0xffff) << 4)) >>> 0;
+
 export function nextPort(base: number, spread: number): number {
+	if (!Number.isInteger(base) || !Number.isInteger(spread) || spread <= 0) {
+		throw new Error(`nextPort: invalid range base=${base} spread=${spread}`);
+	}
+
+	const key = `${base}:${spread}`;
+	let start = rangeOffsets.get(key);
+	if (start === undefined) {
+		start = seed % spread;
+	}
+
+	for (let i = 0; i < spread; i++) {
+		const candidate = base + ((start + i) % spread);
+		if (!reservedPorts.has(candidate)) {
+			reservedPorts.add(candidate);
+			rangeOffsets.set(key, (start + i + 1) % spread);
+			return candidate;
+		}
+	}
+
+	// Fallback if a small range is exhausted by long-running stress loops.
 	return base + Math.floor(Math.random() * spread);
 }
 

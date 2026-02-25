@@ -4,6 +4,7 @@ use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::{Env, JsFunction, Result};
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::panic_guard;
@@ -108,6 +109,8 @@ impl ServerHandle {
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
             let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let (startup_tx, startup_rx) =
+                std::sync::mpsc::channel::<std::result::Result<(), String>>();
             let metrics_clone = Arc::clone(&metrics);
             let port_u16 = port.min(65535) as u16;
             crate::spawn_wtransport_server(
@@ -122,7 +125,27 @@ impl ServerHandle {
                 cert_pem,
                 key_pem,
                 debug,
+                startup_tx,
             );
+            match startup_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    return Err(napi::Error::from_reason(format!(
+                        "E_INTERNAL: server startup failed: {}",
+                        msg
+                    )));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(napi::Error::from_reason(
+                        "E_INTERNAL: server startup timed out".to_string(),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(napi::Error::from_reason(
+                        "E_INTERNAL: server startup channel disconnected".to_string(),
+                    ));
+                }
+            }
             Ok(Self {
                 port,
                 metrics,

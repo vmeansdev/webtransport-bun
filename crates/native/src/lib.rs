@@ -232,6 +232,7 @@ pub fn set_panic_log_verbose(enabled: bool) {
 /// Well-known close codes for stable error semantics (AGENTS.md).
 pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
 pub(crate) const RATE_LIMITED_CLOSE_CODE: u32 = 3991;
+pub(crate) const LIMIT_EXCEEDED_CLOSE_CODE: u32 = 3992;
 
 /// Extract (code, reason) from ConnectionError for CloseInfo.
 pub(crate) fn extract_close_info(
@@ -270,6 +271,7 @@ pub(crate) fn spawn_wtransport_server(
     cert_pem: String,
     key_pem: String,
     debug_logs: bool,
+    startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
 ) {
     use std::io::Write;
     use std::sync::atomic::Ordering;
@@ -287,6 +289,12 @@ pub(crate) fn spawn_wtransport_server(
 
     RUNTIME.spawn(async move {
         panic_guard::spawn_quic_task(async move {
+            let mut startup_tx = Some(startup_tx);
+            let mut report_startup = |res: std::result::Result<(), String>| {
+                if let Some(tx) = startup_tx.take() {
+                    let _ = tx.send(res);
+                }
+            };
             let identity = if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
                 let mut cert_file = match tempfile::Builder::new()
                     .prefix("wt-cert-")
@@ -295,7 +303,9 @@ pub(crate) fn spawn_wtransport_server(
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to create temp cert file: {:?}", e), None, None, None);
+                        let msg = format!("failed to create temp cert file: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        report_startup(Err(msg));
                         return;
                     }
                 };
@@ -323,7 +333,9 @@ pub(crate) fn spawn_wtransport_server(
                         i
                     }
                     Err(e) => {
-                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to load PEM identity: {:?}", e), None, None, None);
+                        let msg = format!("failed to load PEM identity: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        report_startup(Err(msg));
                         return;
                     }
                 }
@@ -331,7 +343,9 @@ pub(crate) fn spawn_wtransport_server(
                 match Identity::self_signed(["localhost", "127.0.0.1", "::1"]) {
                     Ok(i) => i,
                     Err(e) => {
-                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to create identity: {:?}", e), None, None, None);
+                        let msg = format!("failed to create identity: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        report_startup(Err(msg));
                         return;
                     }
                 }
@@ -350,10 +364,13 @@ pub(crate) fn spawn_wtransport_server(
             let server = match Endpoint::server(config) {
                 Ok(s) => {
                     emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
+                    report_startup(Ok(()));
                     s
                 }
                 Err(e) => {
-                    emit_log(&log_tx, !debug_logs, "error", &format!("failed to create endpoint: {:?}", e), None, None, None);
+                    let msg = format!("failed to create endpoint: {:?}", e);
+                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    report_startup(Err(msg));
                     return;
                 }
             };
@@ -403,15 +420,59 @@ pub(crate) fn spawn_wtransport_server(
                                     emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
                                     return;
                                 }
+                                let authority = session_request.authority().to_string();
                                 let prev_sessions = metrics.sessions_active.fetch_add(1, Ordering::SeqCst);
                                 if prev_sessions >= limits.max_sessions {
                                     metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                     emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, None, None);
+                                    let reject_timeout = tokio::time::Duration::from_millis(
+                                        limits.handshake_timeout_ms,
+                                    );
+                                    let reject_result = tokio::time::timeout(
+                                        reject_timeout,
+                                        session_request.accept(),
+                                    )
+                                    .await;
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    match reject_result {
+                                        Ok(Ok(connection)) => {
+                                            connection.close(
+                                                VarInt::from_u32(LIMIT_EXCEEDED_CLOSE_CODE),
+                                                b"E_LIMIT_EXCEEDED",
+                                            );
+                                        }
+                                        Ok(Err(e)) => {
+                                            emit_log(
+                                                &ltx,
+                                                !debug_logs,
+                                                "debug",
+                                                &format!(
+                                                    "maxSessions reject accept failed authority={:?} error={}",
+                                                    authority, e
+                                                ),
+                                                None,
+                                                None,
+                                                None,
+                                            );
+                                        }
+                                        Err(_) => {
+                                            emit_log(
+                                                &ltx,
+                                                !debug_logs,
+                                                "warn",
+                                                &format!(
+                                                    "maxSessions reject handshake timed out authority={:?}",
+                                                    authority
+                                                ),
+                                                None,
+                                                None,
+                                                None,
+                                            );
+                                        }
+                                    }
                                     return;
                                 }
-                                let authority = session_request.authority().to_string();
                                 let accept_timeout = tokio::time::Duration::from_millis(
                                     limits.handshake_timeout_ms,
                                 );
