@@ -14,7 +14,7 @@ on:
           - "72"
 jobs:
   soak:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, soak]
     timeout-minutes: 44640
     steps:
       - uses: actions/checkout@v4
