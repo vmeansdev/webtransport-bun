@@ -10,8 +10,6 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     if: ${{ vars.NPM_TRUSTED_PUBLISHING == 'true' }}
-    environment:
-      name: npm-publish
     permissions:
       contents: read
       id-token: write
