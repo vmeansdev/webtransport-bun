@@ -5,13 +5,14 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
+import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe("parity robustness (Phase 6)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15560;
+		port = nextPort(15560, 1000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
@@ -41,7 +42,10 @@ describe("parity robustness (Phase 6)", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -49,10 +53,9 @@ describe("parity robustness (Phase 6)", () => {
 	});
 
 	test("datagram and bidi streams both complete", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 
 		const w = wt.datagrams.writable.getWriter();
 		await w.write(new Uint8Array([1, 2, 3]));
@@ -82,10 +85,9 @@ describe("parity robustness (Phase 6)", () => {
 	}, 10000);
 
 	test("multiple createWritable instances send independently", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 
 		const w1 = wt.datagrams.createWritable();
 		const w2 = wt.datagrams.createWritable();

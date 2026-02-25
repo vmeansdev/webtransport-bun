@@ -5,129 +5,149 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { connect, createServer } from "../src/index.js";
+import { createServer } from "../src/index.js";
+import { withHarness } from "./helpers/harness.js";
+import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 15200;
 
-function nextPort(): number {
-	return BASE_PORT + Math.floor(Math.random() * 400);
+async function waitUntil(
+	condition: () => boolean,
+	timeoutMs: number,
+	intervalMs = 50,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (condition()) return true;
+		await Bun.sleep(intervalMs);
+	}
+	return condition();
 }
 
 describe("drain guarantees (P1.1)", () => {
 	it("stream + datagram stress burst drains to baseline after close", async () => {
-		const port = nextPort();
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: async (s) => {
-				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
-				})().catch(() => {});
-				void (async () => {
-					for await (const bidi of s.incomingBidirectionalStreams) {
-						for await (const _ of bidi.readable) {
-							/* consume */
-						}
-					}
-				})().catch(() => {});
-				void (async () => {
-					for await (const _ of s.incomingUnidirectionalStreams) {
-						/* consume */
-					}
-				})().catch(() => {});
-			},
-		});
-		await Bun.sleep(2000);
-
-		const NUM_CLIENTS = 3;
-		const clients = await Promise.all(
-			Array.from({ length: NUM_CLIENTS }, () =>
-				connect(`https://127.0.0.1:${port}`, {
-					tls: { insecureSkipVerify: true },
+		await withHarness(async (h) => {
+			const port = nextPort(BASE_PORT, 400);
+			const server = h.track(
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: async (s) => {
+						void (async () => {
+							for await (const d of s.incomingDatagrams()) {
+								await s.sendDatagram(d);
+							}
+						})().catch(() => {});
+						void (async () => {
+							for await (const bidi of s.incomingBidirectionalStreams) {
+								for await (const _ of bidi.readable) {
+									/* consume */
+								}
+							}
+						})().catch(() => {});
+						void (async () => {
+							for await (const _ of s.incomingUnidirectionalStreams) {
+								/* consume */
+							}
+						})().catch(() => {});
+					},
 				}),
-			),
-		);
-
-		// Datagrams
-		for (const c of clients) {
-			for (let i = 0; i < 5; i++) {
-				await c.sendDatagram(new Uint8Array([i, i + 1]));
-			}
-		}
-
-		// Bidi streams
-		for (const c of clients) {
-			const streams = await Promise.all(
-				Array.from({ length: 3 }, () => c.createBidirectionalStream()),
 			);
-			for (const st of streams) {
-				st.write(Buffer.alloc(100, "x"), () => {});
+			const NUM_CLIENTS = 3;
+			const clients = await Promise.all(
+				Array.from({ length: NUM_CLIENTS }, () =>
+					connectWithRetry(`https://127.0.0.1:${port}`, {
+						tls: { insecureSkipVerify: true },
+					}).then((c) => h.track(c)),
+				),
+			);
+
+			// Datagrams
+			for (const c of clients) {
+				for (let i = 0; i < 5; i++) {
+					await c.sendDatagram(new Uint8Array([i, i + 1]));
+				}
+			}
+
+			// Bidi streams
+			for (const c of clients) {
+				const streams = await Promise.all(
+					Array.from({ length: 3 }, () => c.createBidirectionalStream()),
+				);
+				for (const st of streams) {
+					st.write(Buffer.alloc(100, "x"), () => {});
+					st.end();
+				}
+			}
+
+			// Uni streams
+			for (const c of clients) {
+				const st = await c.createUnidirectionalStream();
+				st.write(Buffer.alloc(50, "y"), () => {});
 				st.end();
 			}
-		}
 
-		// Uni streams
-		for (const c of clients) {
-			const st = await c.createUnidirectionalStream();
-			st.write(Buffer.alloc(50, "y"), () => {});
-			st.end();
-		}
+			await Bun.sleep(500);
 
-		await Bun.sleep(500);
+			const mDuring = server.metricsSnapshot();
+			expect(mDuring.sessionsActive).toBe(NUM_CLIENTS);
 
-		const mDuring = server.metricsSnapshot();
-		expect(mDuring.sessionsActive).toBe(NUM_CLIENTS);
+			for (const c of clients) {
+				c.close();
+			}
 
-		for (const c of clients) {
-			c.close();
-		}
-
-		await Bun.sleep(4000);
-
-		const mAfter = server.metricsSnapshot();
-		expect(mAfter.sessionTasksActive).toBe(0);
-		expect(mAfter.streamTasksActive).toBe(0);
-		expect(mAfter.queuedBytesGlobal).toBeLessThanOrEqual(4 * 1024);
-
-		await server.close();
+			const drained = await waitUntil(() => {
+				const m = server.metricsSnapshot();
+				return (
+					m.sessionTasksActive === 0 &&
+					m.streamTasksActive === 0 &&
+					m.queuedBytesGlobal <= 4 * 1024
+				);
+			}, 7000);
+			expect(drained).toBe(true);
+		});
 	}, 25000);
 
 	it("abandoned stream iterators drain on close", async () => {
-		const port = nextPort();
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: async (s) => {
-				// Start iterators but close session before consuming all
-				const dgramIter = s.incomingDatagrams()[Symbol.asyncIterator]();
-				await dgramIter.next();
-				const bidiIter = s.incomingBidirectionalStreams[Symbol.asyncIterator]();
-				await bidiIter.next();
-				// Session closes below; iterators should terminate
-			},
+		await withHarness(async (h) => {
+			const port = nextPort(BASE_PORT, 400);
+			const server = h.track(
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: async (s) => {
+						// Start iterators but close session before consuming all
+						const dgramIter = s.incomingDatagrams()[Symbol.asyncIterator]();
+						await dgramIter.next();
+						const bidiIter =
+							s.incomingBidirectionalStreams[Symbol.asyncIterator]();
+						await bidiIter.next();
+						// Session closes below; iterators should terminate
+					},
+				}),
+			);
+			const client = h.track(
+				await connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+				}),
+			);
+			await client.sendDatagram(new Uint8Array([1, 2, 3]));
+			const stream = await client.createBidirectionalStream();
+			stream.write(Buffer.alloc(10), () => {});
+
+			await Bun.sleep(500);
+
+			client.close();
+			const drained = await waitUntil(() => {
+				const m = server.metricsSnapshot();
+				return (
+					m.sessionTasksActive === 0 &&
+					m.streamTasksActive === 0 &&
+					m.queuedBytesGlobal <= 4 * 1024
+				);
+			}, 7000);
+			expect(drained).toBe(true);
 		});
-		await Bun.sleep(2000);
-
-		const client = await connect(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-		await client.sendDatagram(new Uint8Array([1, 2, 3]));
-		const stream = await client.createBidirectionalStream();
-		stream.write(Buffer.alloc(10), () => {});
-
-		await Bun.sleep(500);
-
-		client.close();
-		await Bun.sleep(3000);
-
-		const mAfter = server.metricsSnapshot();
-		expect(mAfter.sessionTasksActive).toBe(0);
-		expect(mAfter.streamTasksActive).toBe(0);
-		expect(mAfter.queuedBytesGlobal).toBeLessThanOrEqual(4 * 1024);
-
-		await server.close();
 	}, 15000);
 
 	it("repeated open/close stress loop does not hang", async () => {
@@ -135,9 +155,7 @@ describe("drain guarantees (P1.1)", () => {
 		// repeated setup/teardown behavior.
 		const CYCLES = 6;
 		for (let i = 0; i < CYCLES; i++) {
-			// Use deterministic unique ports in-loop to avoid accidental
-			// same-run port reuse/races from random selection.
-			const port = BASE_PORT + i;
+			const port = nextPort(BASE_PORT + 1000, 1000);
 			const server = createServer({
 				port,
 				tls: { certPem: "", keyPem: "" },
@@ -150,9 +168,7 @@ describe("drain guarantees (P1.1)", () => {
 				},
 			});
 			try {
-				await Bun.sleep(250);
-
-				const client = await connect(`https://127.0.0.1:${port}`, {
+				const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 					tls: { insecureSkipVerify: true },
 				});
 				await client.sendDatagram(new Uint8Array([1, 2, 3]));
@@ -164,34 +180,36 @@ describe("drain guarantees (P1.1)", () => {
 	}, 10000);
 
 	it("server close while clients active drains tasks", async () => {
-		const port = nextPort();
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: async (s) => {
-				for await (const d of s.incomingDatagrams()) {
-					await s.sendDatagram(d);
-				}
-			},
-		});
-		await Bun.sleep(2000);
-
-		const clients = await Promise.all(
-			Array.from({ length: 2 }, () =>
-				connect(`https://127.0.0.1:${port}`, {
-					tls: { insecureSkipVerify: true },
+		await withHarness(async (h) => {
+			const port = nextPort(BASE_PORT, 400);
+			const server = h.track(
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: async (s) => {
+						for await (const d of s.incomingDatagrams()) {
+							await s.sendDatagram(d);
+						}
+					},
 				}),
-			),
-		);
-		for (const c of clients) {
-			c.sendDatagram(new Uint8Array([1])).catch(() => {});
-		}
-		await Bun.sleep(300);
+			);
+			const clients = await Promise.all(
+				Array.from({ length: 2 }, () =>
+					connectWithRetry(`https://127.0.0.1:${port}`, {
+						tls: { insecureSkipVerify: true },
+					}).then((c) => h.track(c)),
+				),
+			);
+			for (const c of clients) {
+				c.sendDatagram(new Uint8Array([1])).catch(() => {});
+			}
+			await Bun.sleep(300);
 
-		await server.close();
+			await server.close();
 
-		const mAfter = server.metricsSnapshot();
-		expect(mAfter.sessionTasksActive).toBe(0);
-		expect(mAfter.streamTasksActive).toBe(0);
+			const mAfter = server.metricsSnapshot();
+			expect(mAfter.sessionTasksActive).toBe(0);
+			expect(mAfter.streamTasksActive).toBe(0);
+		});
 	}, 15000);
 });

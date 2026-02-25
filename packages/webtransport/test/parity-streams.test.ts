@@ -6,13 +6,37 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
+import { nextPort as allocatePort } from "./helpers/network.js";
+
+const BASE_PORT = 15530;
+
+async function openWTWithRetry(
+	url: string,
+	opts: ConstructorParameters<typeof WebTransport>[1],
+	timeoutMs = 10000,
+): Promise<WebTransport> {
+	const deadline = Date.now() + timeoutMs;
+	let lastErr: unknown;
+	while (Date.now() < deadline) {
+		const wt = new WebTransport(url, opts);
+		try {
+			await wt.ready;
+			return wt;
+		} catch (err) {
+			lastErr = err;
+			wt.close();
+			await Bun.sleep(100);
+		}
+	}
+	throw lastErr ?? new Error("openWTWithRetry: timed out");
+}
 
 describe("parity streams (P3)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15530;
+		port = allocatePort(BASE_PORT, 2000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
@@ -47,7 +71,6 @@ describe("parity streams (P3)", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 	});
 
 	afterAll(async () => {
@@ -55,10 +78,9 @@ describe("parity streams (P3)", () => {
 	});
 
 	test("createBidirectionalStream returns Web Streams bidi", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const { readable, writable } = await wt.createBidirectionalStream();
 		expect(readable).toBeInstanceOf(ReadableStream);
 		expect(writable).toBeInstanceOf(WritableStream);
@@ -74,10 +96,9 @@ describe("parity streams (P3)", () => {
 	});
 
 	test("createUnidirectionalStream returns WritableStream", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const writable = await wt.createUnidirectionalStream();
 		expect(writable).toBeInstanceOf(WritableStream);
 		const writer = writable.getWriter();
@@ -87,20 +108,18 @@ describe("parity streams (P3)", () => {
 	});
 
 	test("incomingBidirectionalStreams is ReadableStream of bidi streams", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(wt.incomingBidirectionalStreams).toBeInstanceOf(ReadableStream);
 		expect(wt.incomingUnidirectionalStreams).toBeInstanceOf(ReadableStream);
 		wt.close();
 	});
 
 	test("writable.abort(reason) maps to reset (browser-style stream control)", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const { readable, writable } = await wt.createBidirectionalStream();
 		const writer = writable.getWriter();
 		await writer.write(new Uint8Array([1]));
@@ -110,10 +129,9 @@ describe("parity streams (P3)", () => {
 	});
 
 	test("readable.cancel(reason) maps to stopSending (browser-style stream control)", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const { readable } = await wt.createBidirectionalStream();
 		const reader = readable.getReader();
 		reader.cancel(99);

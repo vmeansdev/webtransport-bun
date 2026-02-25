@@ -4,25 +4,28 @@
  */
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { WebTransport, createServer, toWebTransport } from "../src/index.js";
 import {
-	WebTransport,
-	createServer,
-	connect,
-	toWebTransport,
-} from "../src/index.js";
+	nextPort,
+	openWTWithRetry,
+	connectWithRetry,
+} from "./helpers/network.js";
 
 describe("parity facade lifecycle (P1)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15500;
+		port = nextPort(15500, 1000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
-		await Bun.sleep(2000);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -30,18 +33,16 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("WebTransport constructor + ready resolves when connected", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(wt.ready).toBeDefined();
 	});
 
 	test("WebTransport closed resolves with WebTransportCloseInfo when session closes", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		wt.close({ closeCode: 0, reason: "test done" });
 		const info = await wt.closed;
 		expect(info).toBeDefined();
@@ -49,10 +50,9 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("WebTransport draining resolves when close() is called (before closed)", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const drainStart = Date.now();
 		wt.close();
 		await wt.draining;
@@ -62,10 +62,9 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("createBidirectionalStream rejects with E_SESSION_CLOSED after close()", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		wt.close();
 		await expect(wt.createBidirectionalStream()).rejects.toMatchObject({
 			code: "E_SESSION_CLOSED",
@@ -73,10 +72,9 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("lifecycle ordering: ready resolves first, draining and closed resolve after close()", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		wt.close({ closeCode: 1000, reason: "ordering test" });
 		const [drainResult, closeInfo] = await Promise.all([
 			wt.draining,
@@ -89,7 +87,7 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("toWebTransport wraps ClientSession with same lifecycle shape", async () => {
-		const session = await connect(`https://127.0.0.1:${port}`, {
+		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		const wt = toWebTransport(session);
@@ -102,10 +100,9 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("WebTransport.datagrams exists (readable + writable)", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(wt.datagrams).toBeDefined();
 		expect(wt.datagrams.readable).toBeInstanceOf(ReadableStream);
 		expect(wt.datagrams.writable).toBeInstanceOf(WritableStream);
@@ -113,17 +110,16 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("WebTransport.incomingBidirectionalStreams and incomingUnidirectionalStreams exist", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(wt.incomingBidirectionalStreams).toBeInstanceOf(ReadableStream);
 		expect(wt.incomingUnidirectionalStreams).toBeInstanceOf(ReadableStream);
 		wt.close();
 	});
 
 	test("incomingDatagrams iterator terminates when session closes", async () => {
-		const session = await connect(`https://127.0.0.1:${port}`, {
+		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		const done = (async () => {
@@ -147,7 +143,7 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("incomingBidirectionalStreams iterator terminates when session closes", async () => {
-		const session = await connect(`https://127.0.0.1:${port}`, {
+		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		const done = (async () => {
@@ -176,7 +172,7 @@ describe("parity facade lifecycle (P1)", () => {
 	});
 
 	test("incomingUnidirectionalStreams iterator terminates when session closes", async () => {
-		const session = await connect(`https://127.0.0.1:${port}`, {
+		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		const done = (async () => {

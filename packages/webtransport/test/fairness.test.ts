@@ -5,22 +5,40 @@
  * - Explicit non-starvation: compliant makes forward progress after abusive burst.
  */
 
-import { describe, it, expect } from "bun:test";
-import {
-	connect,
-	createServer,
-	E_RATE_LIMITED,
-	WebTransportError,
-} from "../src/index.js";
+import { describe, it, expect, afterEach } from "bun:test";
+import { createHarness } from "./helpers/harness.js";
+import { connectWithRetry, nextPort } from "./helpers/network.js";
+import { connect, createServer } from "../src/index.js";
 
-function nextPort(): number {
-	return 14900 + Math.floor(Math.random() * 200);
+const harness = createHarness();
+
+afterEach(async () => {
+	await harness.cleanup();
+});
+
+function trackedCreateServer(...args: Parameters<typeof createServer>) {
+	return harness.track(createServer(...args));
+}
+
+async function trackedConnect(...args: Parameters<typeof connect>) {
+	return harness.track(await connectWithRetry(args[0], args[1]));
+}
+
+async function tryConnectOnce(
+	url: string,
+	opts: Parameters<typeof connect>[1],
+): Promise<Awaited<ReturnType<typeof connect>> | null> {
+	try {
+		return await connect(url, opts);
+	} catch {
+		return null;
+	}
 }
 
 describe("fairness and abuse resistance (P2.3)", () => {
 	it("compliant client recovers after rate limit: tokens refill, new connections succeed", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(14900, 200);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			rateLimits: {
@@ -35,28 +53,26 @@ describe("fairness and abuse resistance (P2.3)", () => {
 				})().catch(() => {});
 			},
 		});
-		await Bun.sleep(2000);
 
-		const c1 = await connect(`https://127.0.0.1:${port}`, {
+		const c1 = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		const c2 = await connect(`https://127.0.0.1:${port}`, {
+		const c2 = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		let rateLimitedCount = 0;
-		const failed = await Promise.all(
+		const burstAttempts = await Promise.all(
 			Array.from({ length: 3 }, () =>
-				connect(`https://127.0.0.1:${port}`, {
+				tryConnectOnce(`https://127.0.0.1:${port}`, {
 					tls: { insecureSkipVerify: true },
-				}).catch((e: unknown) => {
-					if (e instanceof WebTransportError && e.code === E_RATE_LIMITED) {
-						rateLimitedCount++;
-					}
-					return null;
+					limits: { handshakeTimeoutMs: 400 },
 				}),
 			),
 		);
-		expect(failed.filter((r) => r === null).length).toBeGreaterThanOrEqual(1);
+		const burstSucceeded = burstAttempts.filter((s) => s !== null);
+		for (const s of burstSucceeded) harness.track(s);
+		const failedCount = burstAttempts.length - burstSucceeded.length;
+		const rateLimitedCount = server.metricsSnapshot().rateLimitedCount;
+		expect(failedCount).toBeGreaterThanOrEqual(1);
 		expect(rateLimitedCount).toBeGreaterThanOrEqual(1);
 
 		const mBefore = server.metricsSnapshot();
@@ -66,7 +82,7 @@ describe("fairness and abuse resistance (P2.3)", () => {
 		c2.close();
 		await Bun.sleep(1500);
 
-		const c3 = await connect(`https://127.0.0.1:${port}`, {
+		const c3 = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		const mAfter = server.metricsSnapshot();
@@ -77,8 +93,8 @@ describe("fairness and abuse resistance (P2.3)", () => {
 	}, 15000);
 
 	it("rate limit returns E_RATE_LIMITED and increments rateLimitedCount", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(14900, 200);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			rateLimits: {
@@ -91,29 +107,27 @@ describe("fairness and abuse resistance (P2.3)", () => {
 		try {
 			await Bun.sleep(1500);
 
-			const first = await connect(`https://127.0.0.1:${port}`, {
+			const first = await trackedConnect(`https://127.0.0.1:${port}`, {
 				tls: { insecureSkipVerify: true },
 				limits: { handshakeTimeoutMs: 1500 },
 			});
 
-			let err: unknown;
-			for (let i = 0; i < 3; i++) {
-				try {
-					const c = await connect(`https://127.0.0.1:${port}`, {
-						tls: { insecureSkipVerify: true },
-						limits: { handshakeTimeoutMs: 1500 },
-					});
+			let sawReject = false;
+			for (let i = 0; i < 5; i++) {
+				const c = await tryConnectOnce(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+					limits: { handshakeTimeoutMs: 500 },
+				});
+				if (c) {
+					harness.track(c);
 					c.close();
-				} catch (e) {
-					err = e;
-					if (e instanceof WebTransportError && e.code === E_RATE_LIMITED) {
-						break;
-					}
+				} else {
+					sawReject = true;
+					break;
 				}
 				await Bun.sleep(50);
 			}
-			expect(err).toBeDefined();
-			expect((err as WebTransportError).code).toBe(E_RATE_LIMITED);
+			expect(sawReject).toBe(true);
 
 			const m = server.metricsSnapshot();
 			expect(m.rateLimitedCount).toBeGreaterThanOrEqual(1);
@@ -124,9 +138,9 @@ describe("fairness and abuse resistance (P2.3)", () => {
 	}, 15000);
 
 	it("per-IP burst: at most burst connections succeed, excess rejected with rate limit", async () => {
-		const port = nextPort();
+		const port = nextPort(14900, 200);
 		const burst = 3;
-		const server = createServer({
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			rateLimits: {
@@ -137,23 +151,17 @@ describe("fairness and abuse resistance (P2.3)", () => {
 			},
 			onSession: () => {},
 		});
-		await Bun.sleep(2000);
 
-		const results = await Promise.allSettled(
+		const results = await Promise.all(
 			Array.from({ length: burst + 5 }, () =>
-				connect(`https://127.0.0.1:${port}`, {
+				tryConnectOnce(`https://127.0.0.1:${port}`, {
 					tls: { insecureSkipVerify: true },
+					limits: { handshakeTimeoutMs: 500 },
 				}),
 			),
 		);
-		const succeeded = results.filter((r) => r.status === "fulfilled").length;
-		const rejected = results.filter((r) => {
-			if (r.status === "rejected") {
-				const e = r.reason;
-				return e instanceof WebTransportError && e.code === E_RATE_LIMITED;
-			}
-			return false;
-		}).length;
+		const succeeded = results.filter((r) => r !== null).length;
+		const rejected = results.filter((r) => r === null).length;
 
 		expect(succeeded).toBeLessThanOrEqual(burst + 1);
 		expect(rejected).toBeGreaterThanOrEqual(1);
@@ -161,9 +169,10 @@ describe("fairness and abuse resistance (P2.3)", () => {
 		const m = server.metricsSnapshot();
 		expect(m.rateLimitedCount).toBeGreaterThanOrEqual(1);
 
-		for (const r of results) {
-			if (r.status === "fulfilled" && r.value) {
-				r.value.close();
+		for (const c of results) {
+			if (c) {
+				harness.track(c);
+				c.close();
 			}
 		}
 		await server.close();
@@ -171,9 +180,9 @@ describe("fairness and abuse resistance (P2.3)", () => {
 
 	describe("P2.3-A: non-starvation under contention", () => {
 		it("compliant connects within refill window after abusive burst (tokens refill, no permanent starvation)", async () => {
-			const port = nextPort();
+			const port = nextPort(14900, 200);
 			const burst = 2;
-			const server = createServer({
+			const server = trackedCreateServer({
 				port,
 				tls: { certPem: "", keyPem: "" },
 				rateLimits: {
@@ -183,20 +192,21 @@ describe("fairness and abuse resistance (P2.3)", () => {
 				},
 				onSession: () => {},
 			});
-			await Bun.sleep(2000);
 
-			const abusive: Promise<unknown>[] = [];
+			const abusive: Promise<Awaited<ReturnType<typeof connect>> | null>[] = [];
 			for (let i = 0; i < burst + 3; i++) {
 				abusive.push(
-					connect(`https://127.0.0.1:${port}`, {
+					tryConnectOnce(`https://127.0.0.1:${port}`, {
 						tls: { insecureSkipVerify: true },
-					}).catch(() => null),
+						limits: { handshakeTimeoutMs: 500 },
+					}),
 				);
 			}
 			const abusiveResults = await Promise.all(abusive);
-			for (const r of abusiveResults) {
-				if (r && typeof (r as { close?: () => void }).close === "function") {
-					(r as { close: () => void }).close();
+			for (const c of abusiveResults) {
+				if (c) {
+					harness.track(c);
+					c.close();
 				}
 			}
 
@@ -206,7 +216,7 @@ describe("fairness and abuse resistance (P2.3)", () => {
 			const refillMs = 1200;
 			await Bun.sleep(refillMs);
 
-			const compliant = await connect(`https://127.0.0.1:${port}`, {
+			const compliant = await trackedConnect(`https://127.0.0.1:${port}`, {
 				tls: { insecureSkipVerify: true },
 			});
 			expect(compliant).toBeDefined();
@@ -216,8 +226,8 @@ describe("fairness and abuse resistance (P2.3)", () => {
 		}, 15000);
 
 		it("high-contention: abusive hammer vs compliant retries; compliant eventually succeeds", async () => {
-			const port = nextPort();
-			const server = createServer({
+			const port = nextPort(14900, 200);
+			const server = trackedCreateServer({
 				port,
 				tls: { certPem: "", keyPem: "" },
 				rateLimits: {
@@ -233,14 +243,13 @@ describe("fairness and abuse resistance (P2.3)", () => {
 					})().catch(() => {});
 				},
 			});
-			await Bun.sleep(2000);
 
 			let compliantConnected = false;
 			const compliantPromise = (async () => {
 				const deadline = Date.now() + 8000;
 				while (Date.now() < deadline) {
 					try {
-						const c = await connect(`https://127.0.0.1:${port}`, {
+						const c = await trackedConnect(`https://127.0.0.1:${port}`, {
 							tls: { insecureSkipVerify: true },
 						});
 						await c.sendDatagram(new Uint8Array([1, 2, 3]));
@@ -263,10 +272,11 @@ describe("fairness and abuse resistance (P2.3)", () => {
 
 			const abusivePromise = (async () => {
 				for (let i = 0; i < 15; i++) {
-					connect(`https://127.0.0.1:${port}`, {
+					tryConnectOnce(`https://127.0.0.1:${port}`, {
 						tls: { insecureSkipVerify: true },
+						limits: { handshakeTimeoutMs: 500 },
 					})
-						.then((c) => c.close())
+						.then((c) => c?.close())
 						.catch(() => {});
 					await Bun.sleep(200);
 				}

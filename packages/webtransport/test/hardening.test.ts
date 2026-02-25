@@ -2,7 +2,9 @@
  * Hardening tests: byte-budget enforcement, error-code mapping, close-path settlement.
  */
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, afterEach } from "bun:test";
+import { createHarness } from "./helpers/harness.js";
+import { connectWithRetry, nextPort } from "./helpers/network.js";
 import {
 	connect,
 	createServer,
@@ -17,8 +19,18 @@ import {
 
 const BASE_PORT = 18500;
 
-function nextPort(): number {
-	return BASE_PORT + Math.floor(Math.random() * 1000);
+const harness = createHarness();
+
+afterEach(async () => {
+	await harness.cleanup();
+});
+
+function trackedCreateServer(...args: Parameters<typeof createServer>) {
+	return harness.track(createServer(...args));
+}
+
+async function trackedConnect(...args: Parameters<typeof connect>) {
+	return harness.track(await connectWithRetry(args[0], args[1]));
 }
 
 async function waitUntil(
@@ -36,8 +48,8 @@ async function waitUntil(
 
 describe("error-code mapping", () => {
 	it("client send_datagram after close returns E_SESSION_CLOSED", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(BASE_PORT, 1000);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -45,9 +57,8 @@ describe("error-code mapping", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await client.close();
@@ -63,8 +74,8 @@ describe("error-code mapping", () => {
 	}, 10000);
 
 	it("client oversized datagram returns E_QUEUE_FULL", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(BASE_PORT, 1000);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -72,9 +83,8 @@ describe("error-code mapping", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		try {
@@ -89,7 +99,7 @@ describe("error-code mapping", () => {
 
 	it("connect to unreachable host returns WebTransportError", async () => {
 		try {
-			await connect("https://127.0.0.1:19999", {
+			await trackedConnect("https://127.0.0.1:19999", {
 				limits: { handshakeTimeoutMs: 2000 },
 			});
 			expect(true).toBe(false);
@@ -109,9 +119,9 @@ describe("error-code mapping", () => {
 
 describe("close-path promise settlement", () => {
 	it("server close settles all session closed promises", async () => {
-		const port = nextPort();
+		const port = nextPort(BASE_PORT, 1000);
 		let serverSession: any = null;
-		const server = createServer({
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -120,9 +130,8 @@ describe("close-path promise settlement", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -138,8 +147,8 @@ describe("close-path promise settlement", () => {
 	}, 15000);
 
 	it("client close resolves closed promise", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(BASE_PORT, 1000);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -147,9 +156,8 @@ describe("close-path promise settlement", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -168,8 +176,8 @@ describe("close-path promise settlement", () => {
 
 describe("client metricsSnapshot", () => {
 	it("reflects datagram activity", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(BASE_PORT, 1000);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -178,9 +186,8 @@ describe("client metricsSnapshot", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
@@ -200,8 +207,8 @@ describe("client metricsSnapshot", () => {
 	}, 10000);
 
 	it("tracks streamsActive and queuedBytes", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(BASE_PORT, 1000);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -217,15 +224,17 @@ describe("client metricsSnapshot", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 
 		const stream = await client.createBidirectionalStream();
-		const snapDuring = client.metricsSnapshot();
-		expect(snapDuring.streamsActive).toBeGreaterThanOrEqual(1);
+		const observedActive = await waitUntil(() => {
+			const snap = client.metricsSnapshot();
+			return snap.streamsActive >= 1;
+		}, 1500);
+		expect(observedActive).toBe(true);
 
 		const replyPromise = new Promise<Buffer>((resolve, reject) => {
 			const timer = setTimeout(
@@ -264,11 +273,11 @@ describe("client metricsSnapshot", () => {
 
 describe("metrics consistency after stress burst", () => {
 	it("queuedBytesGlobal, sessionTasksActive, streamTasksActive drain after close", async () => {
-		const port = nextPort();
+		const port = nextPort(BASE_PORT, 1000);
 		const NUM_CLIENTS = 3;
 		const DATAGRAMS_PER_CLIENT = 5;
 		let sessionsReceived = 0;
-		const server = createServer({
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
@@ -278,12 +287,11 @@ describe("metrics consistency after stress burst", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
 
 		const clients = [];
 		for (let i = 0; i < NUM_CLIENTS; i++) {
 			clients.push(
-				await connect(`https://127.0.0.1:${port}`, {
+				await trackedConnect(`https://127.0.0.1:${port}`, {
 					tls: { insecureSkipVerify: true },
 				}),
 			);
@@ -303,12 +311,15 @@ describe("metrics consistency after stress burst", () => {
 		for (const client of clients) {
 			client.close();
 		}
-		await Bun.sleep(3000);
-
-		const mAfter = server.metricsSnapshot();
-		expect(mAfter.queuedBytesGlobal).toBeLessThanOrEqual(1024);
-		expect(mAfter.sessionTasksActive).toBe(0);
-		expect(mAfter.streamTasksActive).toBe(0);
+		const drained = await waitUntil(() => {
+			const m = server.metricsSnapshot();
+			return (
+				m.queuedBytesGlobal <= 1024 &&
+				m.sessionTasksActive === 0 &&
+				m.streamTasksActive === 0
+			);
+		}, 7000);
+		expect(drained).toBe(true);
 
 		await server.close();
 	}, 20000);
@@ -324,15 +335,14 @@ describe("E_BACKPRESSURE_TIMEOUT error coding", () => {
 	});
 
 	it("client backpressureTimeoutMs option is respected", async () => {
-		const port = nextPort();
-		const server = createServer({
+		const port = nextPort(BASE_PORT, 1000);
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async () => {},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			limits: { backpressureTimeoutMs: 1 },
 		});
@@ -373,14 +383,14 @@ describe("E_BACKPRESSURE_TIMEOUT error coding", () => {
 
 describe("server-created stream cap enforcement", () => {
 	it("createBidirectionalStream fails after maxStreamsPerSessionBidi", async () => {
-		const port = nextPort();
+		const port = nextPort(BASE_PORT, 1000);
 		const cap = 2;
 		let serverSession: any = null;
 		let resolveServerReady!: () => void;
 		const serverReady = new Promise<void>((resolve) => {
 			resolveServerReady = resolve;
 		});
-		const server = createServer({
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			limits: { maxStreamsPerSessionBidi: cap, maxStreamsGlobal: 50000 },
@@ -392,7 +402,7 @@ describe("server-created stream cap enforcement", () => {
 			},
 		});
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await serverReady;
@@ -417,14 +427,14 @@ describe("server-created stream cap enforcement", () => {
 	}, 15000);
 
 	it("createUnidirectionalStream fails after maxStreamsPerSessionUni", async () => {
-		const port = nextPort();
+		const port = nextPort(BASE_PORT, 1000);
 		const cap = 2;
 		let serverSession: any = null;
 		let resolveServerReady!: () => void;
 		const serverReady = new Promise<void>((resolve) => {
 			resolveServerReady = resolve;
 		});
-		const server = createServer({
+		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			limits: { maxStreamsPerSessionUni: cap, maxStreamsGlobal: 50000 },
@@ -436,7 +446,7 @@ describe("server-created stream cap enforcement", () => {
 			},
 		});
 
-		const client = await connect(`https://127.0.0.1:${port}`, {
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
 		await serverReady;

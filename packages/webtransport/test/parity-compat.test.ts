@@ -12,25 +12,25 @@ import {
 	E_INTERNAL,
 	E_HANDSHAKE_TIMEOUT,
 } from "../src/index.js";
+import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 const BASE_PORT = 15512;
-
-function nextPort(): number {
-	return BASE_PORT + Math.floor(Math.random() * 100);
-}
 
 describe("parity compat (behavior-level)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = nextPort();
+		port = nextPort(BASE_PORT, 100);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
-		await Bun.sleep(2500);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -75,13 +75,12 @@ describe("parity compat (behavior-level)", () => {
 	});
 
 	test("lifecycle ordering: ready resolves before closed (PARITY_MATRIX: Session lifecycle)", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(wt.closed).toBeDefined();
 		wt.close();
-		await wt.closed;
+		await wt.closed.catch(() => {});
 	});
 
 	test("strictW3CErrors: handshake timeout uses TimeoutError name when enabled", async () => {

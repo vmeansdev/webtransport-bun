@@ -18,6 +18,8 @@ coverage
 tools/load/*-stderr.log
 tools/load/soak-artifacts.json
 tools/load/soak-artifacts.csv
+tools/load/rss-trend.json
+tools/load/rss-trend.csv
 tools/interop/.cursor/
 tools/interop/test-results/
 

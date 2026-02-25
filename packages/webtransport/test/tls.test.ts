@@ -5,6 +5,7 @@ import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { nextPort } from "./helpers/network.js";
 
 const CERT_DIR = join(
 	import.meta.dir,
@@ -23,36 +24,56 @@ const KEY_PEM = existsSync(join(CERT_DIR, "key.pem"))
 	: "";
 const HAS_CERTS = CERT_PEM.length > 0 && KEY_PEM.length > 0;
 
+async function connectWithRetry(
+	url: string,
+	opts: Parameters<typeof connect>[1],
+	timeoutMs = 6000,
+): Promise<Awaited<ReturnType<typeof connect>>> {
+	const deadline = Date.now() + timeoutMs;
+	let lastErr: unknown;
+	while (Date.now() < deadline) {
+		try {
+			return await connect(url, opts);
+		} catch (err) {
+			lastErr = err;
+			await Bun.sleep(100);
+		}
+	}
+	throw lastErr ?? new Error("connectWithRetry: timed out");
+}
+
 describe("TLS contract (P0.3)", () => {
 	it("connect with serverName override uses host for SNI (connect-path smoke)", async () => {
+		const port = nextPort(24460, 2000);
 		const server = createServer({
-			port: 14460,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
-		await Bun.sleep(2000);
 
-		const client = await connect("https://127.0.0.1:14460", {
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true, serverName: "localhost" },
 		});
-		expect(client.id).toBeDefined();
-		client.close();
-
-		await server.close();
+		try {
+			expect(client.id).toBeDefined();
+		} finally {
+			client.close();
+			await server.close();
+		}
 	}, 15000);
 
 	it("connect with serverName and caPem passes strict SNI/cert verification (when certs available)", async () => {
 		if (!HAS_CERTS) return;
+		const port = nextPort(24460, 2000);
 
 		const server = createServer({
-			port: 14463,
+			port,
 			tls: { certPem: CERT_PEM, keyPem: KEY_PEM },
 			onSession: () => {},
 		});
-		await Bun.sleep(3000);
 
 		try {
-			const client = await connect("https://127.0.0.1:14463", {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 				tls: { caPem: CERT_PEM, serverName: "localhost" },
 			});
 			expect(client.id).toBeDefined();
@@ -73,42 +94,46 @@ describe("TLS contract (P0.3)", () => {
 		if (!HAS_CERTS) {
 			return;
 		}
+		const port = nextPort(24460, 2000);
 		// Server uses self-signed; passing same cert as caPem tests the code path.
 		// (Self-signed as CA can trigger CaUsedAsEndEntity; native+caPem path is covered.)
 		const server = createServer({
-			port: 14461,
+			port,
 			tls: { certPem: CERT_PEM, keyPem: KEY_PEM },
 			onSession: () => {},
 		});
-		await Bun.sleep(3000);
 		try {
-			const client = await connect("https://127.0.0.1:14461", {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 				tls: { caPem: CERT_PEM, serverName: "localhost" },
 			});
 			expect(client.id).toBeDefined();
 			client.close();
 		} catch (e) {
 			expect(String(e)).toMatch(/E_TLS|UnknownIssuer|CaUsedAsEndEntity/);
+		} finally {
+			await server.close();
 		}
-		await server.close();
 	}, 20000);
 
 	it("connect with caPem containing no valid cert rejects with E_TLS", async () => {
+		const port = nextPort(24460, 2000);
 		const server = createServer({
-			port: 14462,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
-		await Bun.sleep(2000);
 
-		await expect(
-			connect("https://127.0.0.1:14462", {
-				tls: {
-					caPem: "-----BEGIN PRIVATE KEY-----\nxxx\n-----END PRIVATE KEY-----",
-				},
-			}),
-		).rejects.toThrow(/E_TLS/);
-
-		await server.close();
+		try {
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: {
+						caPem:
+							"-----BEGIN PRIVATE KEY-----\nxxx\n-----END PRIVATE KEY-----",
+					},
+				}),
+			).rejects.toThrow(/E_TLS/);
+		} finally {
+			await server.close();
+		}
 	}, 15000);
 });

@@ -6,7 +6,7 @@
  * Supports in-process server, client (Node API and W3C-style facade), datagrams, and streams.
  */
 
-if (typeof globalThis.Bun === "undefined") {
+if (!("Bun" in globalThis)) {
 	throw new Error(
 		"@webtransport-bun/webtransport requires Bun (>=1.3.9). See https://bun.sh",
 	);
@@ -2103,7 +2103,7 @@ function nodeWritableToWebWritable(
 			if (onWriteBytes) onWriteBytes(chunk.byteLength);
 		},
 		close() {
-			return new Promise((resolve, reject) => {
+			return new Promise<void>((resolve, reject) => {
 				w.end((err: Error | null | undefined) =>
 					err ? reject(err) : resolve(),
 				);

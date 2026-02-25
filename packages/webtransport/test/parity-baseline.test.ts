@@ -6,19 +6,23 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
+import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe("parity baseline (Phase 0)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15510;
+		port = nextPort(15510, 1000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
-		await Bun.sleep(2000);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -26,10 +30,9 @@ describe("parity baseline (Phase 0)", () => {
 	});
 
 	test("WebTransport facade has required members", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 
 		// Lifecycle
 		expect("ready" in wt).toBe(true);
@@ -56,10 +59,9 @@ describe("parity baseline (Phase 0)", () => {
 	});
 
 	test("WebTransport.getStats returns connection stats shape", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 
 		expect(typeof wt.getStats).toBe("function");
 		const stats = await wt.getStats();
@@ -95,10 +97,9 @@ describe("parity baseline (Phase 0)", () => {
 	});
 
 	test("datagrams.readable and datagrams.writable are Web Streams", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 
 		expect(wt.datagrams.readable).toBeInstanceOf(ReadableStream);
 		expect(wt.datagrams.writable).toBeInstanceOf(WritableStream);

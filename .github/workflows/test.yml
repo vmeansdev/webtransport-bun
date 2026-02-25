@@ -69,6 +69,15 @@ jobs:
         run: bun run typecheck
       - name: Unit tests
         run: bun test packages/
+      - name: Flake guard (critical suites x3)
+        run: |
+          for i in 1 2 3; do
+            echo "RUN:$i acceptance P3-10"
+            bun test packages/webtransport/test/acceptance.test.ts -t "P3-10: moderate load completes without panic"
+            echo "RUN:$i backpressure P1.2"
+            bun test packages/webtransport/test/backpressure.test.ts -t "backpressure counters exist and have correct shape"
+          done
+        timeout-minutes: 4
       - name: Build reference + load-client
         run: cargo build -p reference --bins
       - name: Load-addon test

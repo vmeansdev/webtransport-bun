@@ -4,13 +4,14 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
+import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe("parity options (Phase 5)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15550;
+		port = nextPort(15550, 1000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
@@ -20,7 +21,10 @@ describe("parity options (Phase 5)", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -32,30 +36,27 @@ describe("parity options (Phase 5)", () => {
 	});
 
 	test("congestionControl option accepted with effective mode exposed", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			congestionControl: "low-latency",
 		});
-		await wt.ready;
 		expect(wt.congestionControl).toBe("default");
 		wt.close();
 	});
 
 	test("datagramsReadableType 'default' uses normal ReadableStream", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(wt.datagrams.readable).toBeInstanceOf(ReadableStream);
 		wt.close();
 	});
 
 	test("datagramsReadableType 'bytes' creates ReadableByteStream and receives datagrams", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			datagramsReadableType: "bytes",
 		});
-		await wt.ready;
 		const reader = wt.datagrams.readable.getReader({ mode: "byob" });
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(new Uint8Array([1, 2, 3]));
@@ -72,11 +73,10 @@ describe("parity options (Phase 5)", () => {
 	});
 
 	test("datagramsReadableType 'bytes' BYOB buffer too small throws RangeError", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 			datagramsReadableType: "bytes",
 		});
-		await wt.ready;
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(new Uint8Array([1, 2, 3, 4, 5]));
 		writer.releaseLock();

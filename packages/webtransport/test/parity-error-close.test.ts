@@ -12,19 +12,23 @@ import {
 	E_STREAM_RESET,
 	E_STOP_SENDING,
 } from "../src/index.js";
+import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe("parity error and close mapping (P4)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15540;
+		port = nextPort(15540, 1000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
-		await Bun.sleep(2000);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -32,10 +36,9 @@ describe("parity error and close mapping (P4)", () => {
 	});
 
 	test("closed resolves with WebTransportCloseInfo (closeCode, reason)", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		wt.close({ closeCode: 1000, reason: "normal closure" });
 		const info = await wt.closed;
 		expect(info).toBeDefined();
@@ -109,10 +112,9 @@ describe("parity error and close mapping (P4)", () => {
 	});
 
 	test("createBidirectionalStream applies sendOrder and validates sendGroup ownership", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const group = wt.createSendGroup();
 		const withSendOrder = await wt.createBidirectionalStream({ sendOrder: 1 });
 		expect(withSendOrder.readable).toBeInstanceOf(ReadableStream);
@@ -129,10 +131,9 @@ describe("parity error and close mapping (P4)", () => {
 	});
 
 	test("createUnidirectionalStream applies sendOrder and validates sendGroup ownership", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const group = wt.createSendGroup();
 		const withSendOrder = await wt.createUnidirectionalStream({ sendOrder: 1 });
 		expect(withSendOrder).toBeInstanceOf(WritableStream);

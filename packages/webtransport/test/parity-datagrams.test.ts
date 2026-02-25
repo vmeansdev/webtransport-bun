@@ -5,13 +5,14 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
+import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe("parity datagrams (P2)", () => {
 	let server: ReturnType<typeof createServer>;
 	let port: number;
 
 	beforeAll(async () => {
-		port = 15520;
+		port = nextPort(15520, 1000);
 		server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
@@ -21,7 +22,10 @@ describe("parity datagrams (P2)", () => {
 				}
 			},
 		});
-		await Bun.sleep(2000);
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		wt.close();
 	});
 
 	afterAll(async () => {
@@ -29,10 +33,9 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.writable.write sends datagram", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(new Uint8Array([1, 2, 3]));
 		writer.releaseLock();
@@ -40,10 +43,9 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.readable receives echoed datagram", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const payload = new Uint8Array([10, 20, 30]);
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(payload);
@@ -58,10 +60,9 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagram round-trip via Web Streams", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const sent = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(sent);
@@ -75,10 +76,9 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.createWritable returns WritableStream", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const writable = wt.datagrams.createWritable();
 		expect(writable).toBeInstanceOf(WritableStream);
 		const writer = writable.getWriter();
@@ -88,20 +88,18 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.maxDatagramSize is positive number", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		expect(typeof wt.datagrams.maxDatagramSize).toBe("number");
 		expect(wt.datagrams.maxDatagramSize).toBeGreaterThan(0);
 		wt.close();
 	});
 
 	test("datagrams.createWritable accepts valid sendGroup and validates ownership", async () => {
-		const wt = new WebTransport(`https://127.0.0.1:${port}`, {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		await wt.ready;
 		const group = wt.createSendGroup();
 		expect(() =>
 			wt.datagrams.createWritable({ sendGroup: group, sendOrder: 1 }),

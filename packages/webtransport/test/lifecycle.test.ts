@@ -7,6 +7,25 @@
 
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
+import { nextPort } from "./helpers/network.js";
+
+async function connectWithRetry(
+	url: string,
+	opts: Parameters<typeof connect>[1],
+	timeoutMs = 6000,
+): Promise<Awaited<ReturnType<typeof connect>>> {
+	const deadline = Date.now() + timeoutMs;
+	let lastErr: unknown;
+	while (Date.now() < deadline) {
+		try {
+			return await connect(url, opts);
+		} catch (err) {
+			lastErr = err;
+			await Bun.sleep(100);
+		}
+	}
+	throw lastErr ?? new Error("connectWithRetry: timed out");
+}
 
 async function waitUntil(
 	condition: () => boolean,
@@ -23,40 +42,45 @@ async function waitUntil(
 
 describe("lifecycle", () => {
 	it("server close => session closed promises settle", async () => {
+		const port = nextPort(21430, 2000);
 		const sessions: any[] = [];
 		const server = createServer({
-			port: 14435,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: (s) => {
 				sessions.push(s);
 			},
 		});
-		const client = await connect("https://127.0.0.1:14435", {
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		const accepted = await waitUntil(() => sessions.length >= 1, 8000);
-		expect(accepted).toBe(true);
+		try {
+			const accepted = await waitUntil(() => sessions.length >= 1, 8000);
+			expect(accepted).toBe(true);
 
-		const closedPromises = sessions.map((s) => s.closed);
-		await server.close();
+			const closedPromises = sessions.map((s) => s.closed);
+			await server.close();
 
-		const results = await Promise.race([
-			Promise.all(
-				closedPromises.map((p: Promise<any>) =>
-					p.then((v: any) => ({ ok: true, v })),
+			const results = await Promise.race([
+				Promise.all(
+					closedPromises.map((p: Promise<any>) =>
+						p.then((v: any) => ({ ok: true, v })),
+					),
 				),
-			),
-			Bun.sleep(5000).then(() => null),
-		]);
-		expect(results).not.toBeNull();
-		expect((results as any[]).every((r) => r?.ok)).toBe(true);
-
-		client.close();
+				Bun.sleep(5000).then(() => null),
+			]);
+			expect(results).not.toBeNull();
+			expect((results as any[]).every((r) => r?.ok)).toBe(true);
+		} finally {
+			client.close();
+			await server.close();
+		}
 	}, 15000);
 
 	it("server close resolves without hanging", async () => {
+		const port = nextPort(21430, 2000);
 		const server = createServer({
-			port: 14433,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
@@ -65,8 +89,9 @@ describe("lifecycle", () => {
 	});
 
 	it("metricsSnapshot after close returns consistent shape", () => {
+		const port = nextPort(21430, 2000);
 		const server = createServer({
-			port: 14434,
+			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: () => {},
 		});
@@ -75,6 +100,6 @@ describe("lifecycle", () => {
 		expect(typeof m.streamsActive).toBe("number");
 		expect(typeof m.queuedBytesGlobal).toBe("number");
 		expect(typeof m.limitExceededCount).toBe("number");
-		void server.close();
+		server.close();
 	});
 });
