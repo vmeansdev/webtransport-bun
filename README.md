@@ -107,10 +107,10 @@ Detailed migration playbook:
 
 ## Status
 - In active hardening.
-- Version: `0.1.0` (beta).
+- Version: `0.2.0` (beta).
 - Primary target runtime: Bun (`>= 1.3.9`).
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
-- Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.1.x`.
+- Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.2.x`.
 
 ## Support Matrix
 

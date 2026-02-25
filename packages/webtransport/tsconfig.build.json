@@ -8,6 +8,8 @@
 		"rootDir": "src",
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
+		"lib": ["ESNext", "DOM", "DOM.Iterable"],
+		"types": ["node", "bun"],
 		"allowImportingTsExtensions": false
 	},
 	"include": ["src/**/*.ts"],

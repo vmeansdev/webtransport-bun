@@ -36,9 +36,10 @@
 		"bench:regress": "bun tools/bench/bench-regress.ts",
 		"release:npm": "npm publish -w @webtransport-bun/webtransport --access public"
 	},
-	"devDependencies": {
-		"@biomejs/biome": "^2.2.4",
-		"@types/bun": "latest",
-		"typescript": "^5"
-	}
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.4",
+    "@types/bun": "latest",
+    "@types/node": "^22.15.3",
+    "typescript": "^5"
+  }
 }
