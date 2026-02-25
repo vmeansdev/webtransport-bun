@@ -1,0 +1,56 @@
+name: publish
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (example: v0.2.0)"
+        required: true
+        type: string
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: ${{ vars.NPM_TRUSTED_PUBLISHING == 'true' }}
+    environment:
+      name: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Download release prebuild assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p packages/webtransport/prebuilds
+          gh release download "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "webtransport-native.*.node" \
+            --pattern "SHA256SUMS" \
+            --dir packages/webtransport/prebuilds
+      - name: Verify prebuild checksums
+        run: |
+          cd packages/webtransport/prebuilds
+          shasum -a 256 -c SHA256SUMS
+      - name: Verify release tag matches package version
+        run: |
+          PKG_VERSION="$(node -p "require('./packages/webtransport/package.json').version")"
+          EXPECTED_TAG="v${PKG_VERSION}"
+          if [ "${{ inputs.tag }}" != "${EXPECTED_TAG}" ]; then
+            echo "::error::Input tag (${{ inputs.tag }}) does not match package version tag (${EXPECTED_TAG})."
+            exit 1
+          fi
+      - name: Publish to npm (trusted publishing via OIDC)
+        run: |
+          cd packages/webtransport
+          npm config delete //registry.npmjs.org/:_authToken || true
+          npm publish --access public --provenance --registry=https://registry.npmjs.org/
