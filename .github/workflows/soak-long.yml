@@ -12,6 +12,14 @@ on:
           - "1"
           - "24"
           - "72"
+      runner_type:
+        description: "Runner type for this soak run"
+        required: true
+        default: "self-hosted"
+        type: choice
+        options:
+          - "self-hosted"
+          - "github-hosted"
       runner_mode:
         description: "Runner mode (shared lowers load to preserve headroom)"
         required: true
@@ -22,7 +30,7 @@ on:
           - "dedicated"
 jobs:
   soak:
-    runs-on: [self-hosted, Linux, X64, soak]
+    runs-on: ${{ fromJson(github.event.inputs.runner_type == 'github-hosted' && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","soak"]') }}
     timeout-minutes: 44640
     concurrency:
       group: soak-long-${{ github.ref_name }}
