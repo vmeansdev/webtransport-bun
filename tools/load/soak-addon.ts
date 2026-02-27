@@ -344,6 +344,7 @@ async function main() {
 	}
 
 	console.log("soak-addon: PASS");
+	process.exit(0);
 }
 
 main().catch((e) => {

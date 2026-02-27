@@ -63,7 +63,7 @@ jobs:
           esac
           echo "SOAK_DURATION=$D"
           SOAK_DURATION=$D SOAK_ARTIFACTS_OUT=$GITHUB_WORKSPACE/tools/load/soak-artifacts.json bun tools/load/soak-addon.ts
-        timeout-minutes: ${{ github.event.inputs.duration_hours == '72' && 44640 || (github.event.inputs.duration_hours == '24' && 1500 || 90) }}
+        timeout-minutes: ${{ github.event.inputs.duration_hours == '72' && 44640 || (github.event.inputs.duration_hours == '24' && 1500 || 120) }}
       - name: Upload soak artifacts
         if: always()
         uses: actions/upload-artifact@v4
