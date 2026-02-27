@@ -78,7 +78,8 @@ jobs:
           RUNNER_MODE="${{ github.event.inputs.runner_mode || 'shared' }}"
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-          MEM_GB="$((MEM_KB / 1024 / 1024))"
+          MEM_MB="$((MEM_KB / 1024))"
+          MEM_GB_CEIL="$(((MEM_KB + 1024 * 1024 - 1) / 1024 / 1024))"
           DISK_GB="$(df -BG "$GITHUB_WORKSPACE" | awk 'NR==2 {gsub("G","",$4); print $4}' || echo 0)"
 
           PROFILE="large"
@@ -86,17 +87,17 @@ jobs:
           SOAK_DATAGRAMS_PER_SEC=500
           SOAK_STREAMS_PER_SEC=5
 
-          if [ "$CPUS" -le 1 ] || [ "$MEM_GB" -lt 2 ]; then
+          if [ "$CPUS" -le 1 ] || [ "$MEM_GB_CEIL" -lt 2 ]; then
             PROFILE="tiny"
             SOAK_SESSIONS=50
             SOAK_DATAGRAMS_PER_SEC=50
             SOAK_STREAMS_PER_SEC=1
-          elif [ "$CPUS" -le 2 ] || [ "$MEM_GB" -lt 4 ]; then
+          elif [ "$CPUS" -le 2 ] || [ "$MEM_GB_CEIL" -lt 4 ]; then
             PROFILE="small"
             SOAK_SESSIONS=150
             SOAK_DATAGRAMS_PER_SEC=150
             SOAK_STREAMS_PER_SEC=2
-          elif [ "$CPUS" -le 4 ] || [ "$MEM_GB" -lt 8 ]; then
+          elif [ "$CPUS" -le 4 ] || [ "$MEM_GB_CEIL" -lt 8 ]; then
             PROFILE="medium"
             SOAK_SESSIONS=300
             SOAK_DATAGRAMS_PER_SEC=300
@@ -115,7 +116,8 @@ jobs:
 
           echo "RUNNER_MODE=$RUNNER_MODE" >> "$GITHUB_ENV"
           echo "RUNNER_CPUS=$CPUS" >> "$GITHUB_ENV"
-          echo "RUNNER_MEM_GB=$MEM_GB" >> "$GITHUB_ENV"
+          echo "RUNNER_MEM_MB=$MEM_MB" >> "$GITHUB_ENV"
+          echo "RUNNER_MEM_GB=$MEM_GB_CEIL" >> "$GITHUB_ENV"
           echo "RUNNER_DISK_GB=$DISK_GB" >> "$GITHUB_ENV"
           echo "SOAK_PROFILE=$PROFILE" >> "$GITHUB_ENV"
           echo "SOAK_SESSIONS=$SOAK_SESSIONS" >> "$GITHUB_ENV"
@@ -123,7 +125,7 @@ jobs:
           echo "SOAK_STREAMS_PER_SEC=$SOAK_STREAMS_PER_SEC" >> "$GITHUB_ENV"
 
           echo "Runner mode: $RUNNER_MODE"
-          echo "Runner profile: cpu=$CPUS mem=${MEM_GB}GB disk_free=${DISK_GB}GB -> $PROFILE"
+          echo "Runner profile: cpu=$CPUS mem=${MEM_MB}MB (~${MEM_GB_CEIL}GB) disk_free=${DISK_GB}GB -> $PROFILE"
           echo "Soak load: sessions=$SOAK_SESSIONS datagrams/s=$SOAK_DATAGRAMS_PER_SEC streams/s=$SOAK_STREAMS_PER_SEC"
       - name: Soak (${{ github.event.inputs.duration_hours || '1' }}h)
         id: soak
@@ -135,7 +137,7 @@ jobs:
             72) D=259200 ;;
             *)  D=3600 ;;
           esac
-          echo "SOAK_DURATION=$D mode=$RUNNER_MODE profile=$SOAK_PROFILE cpu=$RUNNER_CPUS mem=${RUNNER_MEM_GB}GB"
+          echo "SOAK_DURATION=$D mode=$RUNNER_MODE profile=$SOAK_PROFILE cpu=$RUNNER_CPUS mem=${RUNNER_MEM_MB}MB (~${RUNNER_MEM_GB}GB)"
           SOAK_DURATION=$D \
           SOAK_SESSIONS=$SOAK_SESSIONS \
           SOAK_DATAGRAMS_PER_SEC=$SOAK_DATAGRAMS_PER_SEC \
