@@ -6,12 +6,6 @@
  * Supports in-process server, client (Node API and W3C-style facade), datagrams, and streams.
  */
 
-if (!("Bun" in globalThis)) {
-	throw new Error(
-		"@webtransport-bun/webtransport requires Bun (>=1.3.9). See https://bun.sh",
-	);
-}
-
 /**
  * @example Node client (connect)
  * ```ts
