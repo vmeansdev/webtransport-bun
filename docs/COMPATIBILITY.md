@@ -1,9 +1,10 @@
 # Compatibility and support policy
 
-## Bun version
+## Runtime support
 
-- **Policy**: Bun >= 1.3.9
-- Test against at least 2–3 Bun versions in CI (e.g. 1.3.9, 1.4.x, latest).
+- **Bun**: >= 1.3.9 (primary target in CI)
+- **Node**: supported (Node-API compatible runtime)
+- **Deno**: supported (npm + Node-API addon support)
 
 ## Platform matrix (shipped prebuilds)
 
@@ -15,6 +16,5 @@
 
 ## Node-API
 
-- Addon is built with napi-rs for Bun. Avoid unstable N-API features.
-- **Bun-specific**: Primary target; tested on Bun.
-- **Node**: Addon may load on Node if Node-API ABI matches; not tested or guaranteed.
+- Addon is built with napi-rs (Node-API). Avoid unstable N-API features.
+- Runtime portability is provided through Node-API loading in Bun, Node, and Deno.

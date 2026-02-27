@@ -1,6 +1,6 @@
 <div align="center">
   <h1>webtransport-bun</h1>
-  <p><em>WebTransport for Bun with production guardrails: datagrams + streams, in-process server/client, and Chromium interop backed by Rust `wtransport` via `napi-rs`.</em></p>
+  <p><em>WebTransport for Bun, Node, and Deno with production guardrails: datagrams + streams, in-process server/client, and Chromium interop backed by Rust `wtransport` via `napi-rs`.</em></p>
 </div>
 
 <p align="center">
@@ -26,10 +26,10 @@
 
 ## Why Try This
 
-`webtransport-bun` is for Bun teams that need realtime transport beyond WebSockets without giving up JS/Bun ergonomics.
+`webtransport-bun` is for teams that need realtime transport beyond WebSockets without giving up JS runtime ergonomics.
 
 - Mix unreliable low-latency traffic and reliable ordered traffic in one session.
-- Run WebTransport server and client in-process in Bun.
+- Run WebTransport server and client in-process in Bun, Node, or Deno.
 - Keep ops predictable with queue/memory/rate limits and backpressure timeouts.
 - Use browser clients (Chromium interop tested in CI).
 
@@ -37,7 +37,7 @@
 
 - Teams building collaboration/presence workloads with high update rates.
 - Multiplayer or telemetry-heavy backends where packet loss tolerance matters.
-- Services moving from WebSockets to QUIC/WebTransport while staying in Bun.
+- Services moving from WebSockets to QUIC/WebTransport while staying in JS runtimes.
 - Systems needing streams for commands/state sync and datagrams for fast signals.
 
 ## Who This Is Not For
@@ -57,8 +57,8 @@
 
 | Capability | `webtransport-bun` | WebSocket stacks | Raw QUIC libs (`wtransport`/`quinn`) |
 |---|---|---|---|
-| Bun in-process server | Yes | Yes | No (requires custom bindings/service) |
-| Bun in-process client | Yes | Yes | No (requires custom bindings/service) |
+| In-process server (Bun/Node/Deno) | Yes | Yes | No (requires custom bindings/service) |
+| In-process client (Bun/Node/Deno) | Yes | Yes | No (requires custom bindings/service) |
 | Datagram + stream model | Yes | No (single reliable channel) | Yes |
 | Browser WebTransport interop | Yes (Chromium-tested) | No | Indirect/custom |
 | Operational defaults (limits, abuse controls) | Yes | Varies by app | You build it |
@@ -108,7 +108,7 @@ Detailed migration playbook:
 ## Status
 - In active hardening.
 - Version: `0.2.0` (beta).
-- Primary target runtime: Bun (`>= 1.3.9`).
+- Runtime support: Bun (`>= 1.3.9`), Node, Deno.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
 - Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.2.x`.
 
@@ -116,6 +116,8 @@ Detailed migration playbook:
 
 ### Runtime
 - Bun `>= 1.3.9`
+- Node (Node-API compatible runtime)
+- Deno (npm + Node-API addon support)
 
 ### OS / Arch
 - macOS arm64 (`darwin-arm64`), macOS x64 (`darwin-x64`)
@@ -137,7 +139,7 @@ bun add file:./packages/webtransport
 
 ## Examples
 
-- Browser + Bun echo playground (datagrams, bidi, uni):
+- Browser + runtime echo playground (datagrams, bidi, uni):
   `examples/echo-playground`
 - Compose collaboration room (1 server + 3 clients):
   `examples/compose-collab`
