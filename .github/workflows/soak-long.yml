@@ -16,15 +16,32 @@ jobs:
   soak:
     runs-on: [self-hosted, Linux, X64, soak]
     timeout-minutes: 44640
-    env:
-      CC: clang
-      CXX: clang++
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.9"
+      - name: Select supported C/C++ compiler
+        run: |
+          if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+            echo "Selected clang/clang++"
+            exit 0
+          fi
+
+          for v in 12 11 10; do
+            if command -v "gcc-$v" >/dev/null 2>&1 && command -v "g++-$v" >/dev/null 2>&1; then
+              echo "CC=gcc-$v" >> "$GITHUB_ENV"
+              echo "CXX=g++-$v" >> "$GITHUB_ENV"
+              echo "Selected gcc-$v/g++-$v"
+              exit 0
+            fi
+          done
+
+          echo "::error::No supported compiler found. Install clang (preferred) or gcc-10+ on this self-hosted runner."
+          exit 1
       - name: Compiler diagnostics
         run: |
           echo "gcc: $(gcc --version | head -n1 || echo not-found)"
