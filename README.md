@@ -132,6 +132,13 @@ See `docs/COMPATIBILITY.md` for policy details.
 bun add @webtransport-bun/webtransport
 ```
 
+Published npm package contents:
+- `dist/` compiled JS + TypeScript declarations (`index`, `errors`, `streams`)
+- `prebuilds/` native addon binaries (`.node`) for supported targets
+- `README.md` and `LICENSE`
+
+Note: GitHub source zip/tar downloads are source snapshots and may not include generated `dist/`. Use npm install (or the release `.tgz` package asset) for a ready-to-run package.
+
 ### From local workspace (development)
 ```bash
 bun add file:./packages/webtransport
