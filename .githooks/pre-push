@@ -11,6 +11,15 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 0
 fi
 
+# Disallow any updates to main from this repo (regular and force push).
+# development remains unrestricted by this hook.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    echo "pre-push: pushes to main are blocked by project policy. Use a PR into main." >&2
+    exit 1
+  fi
+done
+
 if ! command -v bun >/dev/null 2>&1; then
   echo "pre-push: bun is required" >&2
   exit 1
