@@ -45,7 +45,7 @@ See `docs/PARITY_MATRIX.md` for parity status.
 
 ## requireUnreliable Invariant
 
-On supported targets (Bun ≥ 1.3.9, macOS/Linux), the transport backend is QUIC/WebTransport, which supports unreliable (datagram) delivery. Therefore `requireUnreliable: true` is satisfiable and accepted. This option participates in the pool compatibility key; connects with differing `requireUnreliable` values do not share a pooled endpoint.
+On supported targets (Bun/Node/Deno on macOS/Linux), the transport backend is QUIC/WebTransport, which supports unreliable (datagram) delivery. Therefore `requireUnreliable: true` is satisfiable and accepted. This option participates in the pool compatibility key; connects with differing `requireUnreliable` values do not share a pooled endpoint.
 
 ## Error Model and Browser-Style Names
 

@@ -77,6 +77,13 @@ Test log hygiene:
 - GitHub release created with prebuilds, checksums, parity-evidence, interop-evidence
 - Publish npm package with prebuilds (when NPM_TRUSTED_PUBLISHING enabled)
 
+## Branch protection policy
+- `main` must reject direct pushes and force pushes.
+- `development` currently allows both regular pushes and force pushes.
+- Repository ruleset payload is checked in at `.github/rulesets/main-no-push.json`.
+- Apply with GitHub CLI (repo admin):
+  - `gh api --method POST repos/<owner>/<repo>/rulesets --input .github/rulesets/main-no-push.json`
+
 ## npm publishing rollout (recommended)
 1. First release: publish manually from local machine (`npm run release:npm`) to create package on npm.
 2. Configure npm Trusted Publisher for this GitHub repository/workflow.

@@ -24,7 +24,7 @@ console.log("Server listening on port", server.address.port);
 
 ## Requirements
 
-- Bun >= 1.3.9
+- Bun >= 1.3.9, or Node, or Deno
 - TLS certificate and key (PEM format)
 - UDP port open (default 4433)
 

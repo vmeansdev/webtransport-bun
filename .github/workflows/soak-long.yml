@@ -12,20 +12,121 @@ on:
           - "1"
           - "24"
           - "72"
+      runner_type:
+        description: "Runner type for this soak run"
+        required: true
+        default: "self-hosted"
+        type: choice
+        options:
+          - "self-hosted"
+          - "github-hosted"
+      runner_mode:
+        description: "Runner mode (shared lowers load to preserve headroom)"
+        required: true
+        default: "shared"
+        type: choice
+        options:
+          - "shared"
+          - "dedicated"
 jobs:
   soak:
-    runs-on: [self-hosted, Linux, X64, soak]
+    runs-on: ${{ fromJson(github.event.inputs.runner_type == 'github-hosted' && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","soak"]') }}
     timeout-minutes: 44640
+    concurrency:
+      group: soak-long-${{ github.ref_name }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.9"
+      - name: Select supported C/C++ compiler
+        run: |
+          if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+            echo "Selected clang/clang++"
+            exit 0
+          fi
+
+          for v in 12 11 10; do
+            if command -v "gcc-$v" >/dev/null 2>&1 && command -v "g++-$v" >/dev/null 2>&1; then
+              echo "CC=gcc-$v" >> "$GITHUB_ENV"
+              echo "CXX=g++-$v" >> "$GITHUB_ENV"
+              echo "Selected gcc-$v/g++-$v"
+              exit 0
+            fi
+          done
+
+          echo "::error::No supported compiler found. Install clang (preferred) or gcc-10+ on this self-hosted runner."
+          exit 1
+      - name: Compiler diagnostics
+        run: |
+          echo "gcc: $(gcc --version | head -n1 || echo not-found)"
+          echo "clang: $(clang --version | head -n1 || echo not-found)"
+          echo "CC=$CC CXX=$CXX"
       - name: Build native addon
         run: bun run build:native
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Profile runner capacity
+        run: |
+          RUNNER_MODE="${{ github.event.inputs.runner_mode || 'shared' }}"
+          CPUS="$(nproc 2>/dev/null || echo 1)"
+          MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+          MEM_MB="$((MEM_KB / 1024))"
+          MEM_GB_CEIL="$(((MEM_KB + 1024 * 1024 - 1) / 1024 / 1024))"
+          DISK_GB="$(df -BG "$GITHUB_WORKSPACE" | awk 'NR==2 {gsub("G","",$4); print $4}' || echo 0)"
+
+          PROFILE="large"
+          SOAK_SESSIONS=500
+          SOAK_DATAGRAMS_PER_SEC=500
+          SOAK_STREAMS_PER_SEC=5
+
+          if [ "$CPUS" -le 1 ] || [ "$MEM_GB_CEIL" -lt 2 ]; then
+            PROFILE="tiny"
+            SOAK_SESSIONS=50
+            SOAK_DATAGRAMS_PER_SEC=50
+            SOAK_STREAMS_PER_SEC=1
+          elif [ "$CPUS" -le 2 ] || [ "$MEM_GB_CEIL" -lt 4 ]; then
+            PROFILE="small"
+            SOAK_SESSIONS=150
+            SOAK_DATAGRAMS_PER_SEC=150
+            SOAK_STREAMS_PER_SEC=2
+          elif [ "$CPUS" -le 4 ] || [ "$MEM_GB_CEIL" -lt 8 ]; then
+            PROFILE="medium"
+            SOAK_SESSIONS=300
+            SOAK_DATAGRAMS_PER_SEC=300
+            SOAK_STREAMS_PER_SEC=4
+          fi
+
+          if [ "$RUNNER_MODE" = "shared" ]; then
+            SOAK_SESSIONS=$((SOAK_SESSIONS / 2))
+            SOAK_DATAGRAMS_PER_SEC=$((SOAK_DATAGRAMS_PER_SEC / 2))
+            SOAK_STREAMS_PER_SEC=$((SOAK_STREAMS_PER_SEC / 2))
+          fi
+
+          if [ "$SOAK_SESSIONS" -lt 20 ]; then SOAK_SESSIONS=20; fi
+          if [ "$SOAK_DATAGRAMS_PER_SEC" -lt 20 ]; then SOAK_DATAGRAMS_PER_SEC=20; fi
+          if [ "$SOAK_STREAMS_PER_SEC" -lt 1 ]; then SOAK_STREAMS_PER_SEC=1; fi
+
+          echo "RUNNER_MODE=$RUNNER_MODE" >> "$GITHUB_ENV"
+          echo "RUNNER_CPUS=$CPUS" >> "$GITHUB_ENV"
+          echo "RUNNER_MEM_MB=$MEM_MB" >> "$GITHUB_ENV"
+          echo "RUNNER_MEM_GB=$MEM_GB_CEIL" >> "$GITHUB_ENV"
+          echo "RUNNER_DISK_GB=$DISK_GB" >> "$GITHUB_ENV"
+          echo "SOAK_PROFILE=$PROFILE" >> "$GITHUB_ENV"
+          echo "SOAK_SESSIONS=$SOAK_SESSIONS" >> "$GITHUB_ENV"
+          echo "SOAK_DATAGRAMS_PER_SEC=$SOAK_DATAGRAMS_PER_SEC" >> "$GITHUB_ENV"
+          echo "SOAK_STREAMS_PER_SEC=$SOAK_STREAMS_PER_SEC" >> "$GITHUB_ENV"
+
+          echo "Runner mode: $RUNNER_MODE"
+          echo "Runner profile: cpu=$CPUS mem=${MEM_MB}MB (~${MEM_GB_CEIL}GB) disk_free=${DISK_GB}GB -> $PROFILE"
+          echo "Soak load: sessions=$SOAK_SESSIONS datagrams/s=$SOAK_DATAGRAMS_PER_SEC streams/s=$SOAK_STREAMS_PER_SEC"
       - name: Soak (${{ github.event.inputs.duration_hours || '1' }}h)
         id: soak
         run: |
@@ -36,9 +137,14 @@ jobs:
             72) D=259200 ;;
             *)  D=3600 ;;
           esac
-          echo "SOAK_DURATION=$D"
-          SOAK_DURATION=$D SOAK_ARTIFACTS_OUT=$GITHUB_WORKSPACE/tools/load/soak-artifacts.json bun tools/load/soak-addon.ts
-        timeout-minutes: ${{ github.event.inputs.duration_hours == '72' && 44640 || (github.event.inputs.duration_hours == '24' && 1500 || 90) }}
+          echo "SOAK_DURATION=$D mode=$RUNNER_MODE profile=$SOAK_PROFILE cpu=$RUNNER_CPUS mem=${RUNNER_MEM_MB}MB (~${RUNNER_MEM_GB}GB)"
+          SOAK_DURATION=$D \
+          SOAK_SESSIONS=$SOAK_SESSIONS \
+          SOAK_DATAGRAMS_PER_SEC=$SOAK_DATAGRAMS_PER_SEC \
+          SOAK_STREAMS_PER_SEC=$SOAK_STREAMS_PER_SEC \
+          SOAK_ARTIFACTS_OUT=$GITHUB_WORKSPACE/tools/load/soak-artifacts.json \
+          bun tools/load/soak-addon.ts
+        timeout-minutes: ${{ github.event.inputs.duration_hours == '72' && 44640 || (github.event.inputs.duration_hours == '24' && 1500 || 120) }}
       - name: Upload soak artifacts
         if: always()
         uses: actions/upload-artifact@v4

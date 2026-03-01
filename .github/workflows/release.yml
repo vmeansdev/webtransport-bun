@@ -171,6 +171,12 @@ jobs:
         with:
           name: parity-evidence
           path: parity-evidence
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Verify required evidence (CI-EVIDENCE-A)
         run: |
           find interop-evidence -name "interop-evidence.json" -type f | grep -q . || (echo "::error::Missing interop-evidence.json"; exit 1)
@@ -179,11 +185,21 @@ jobs:
         run: |
           cd prebuilds
           shasum -a 256 *.node 2>/dev/null | sort -k2 > SHA256SUMS
+      - name: Build npm package tarball
+        run: |
+          bun install --frozen-lockfile
+          mkdir -p packages/webtransport/prebuilds
+          cp prebuilds/* packages/webtransport/prebuilds/
+          cd packages/webtransport
+          npm run clean
+          npm run build
+          npm pack --ignore-scripts
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             prebuilds/*
+            packages/webtransport/*.tgz
             interop-evidence/*
             parity-evidence/*
           generate_release_notes: true

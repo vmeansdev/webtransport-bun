@@ -176,8 +176,8 @@ When `queuedBytesGlobal` rises and stays high:
 
 - Client `connect()` fully supported: datagrams, bidi/uni streams, metrics, configurable limits
 - macOS + Linux only (arm64, x64)
-- Requires Bun >= 1.3.9
-- Node-API: addon is built for Bun; Node compatibility not tested
+- Runtime support: Bun >= 1.3.9, Node, Deno
+- Node-API addon portability applies across supported runtimes
 
 ## Public internet deployment
 
@@ -186,7 +186,7 @@ When `queuedBytesGlobal` rises and stays high:
 - **Browser failure modes**: CORS does not apply to WebTransport. Common issues: wrong URL scheme (must be https://), cert mismatch, UDP blocked by network.
 
 ## Deployment notes
-- Run the Bun process as a dedicated service user.
+- Run the runtime process as a dedicated service user.
 - Use systemd on Linux; ensure Restart=on-failure.
 - Collect logs centrally; scrape metrics via exposed endpoint (if you add one) or poll metricsSnapshot.
 

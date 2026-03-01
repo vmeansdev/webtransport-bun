@@ -1,6 +1,6 @@
 # webtransport-bun docs
 
-Production-focused WebTransport for Bun with in-process server/client support, datagrams, streams, and operational guardrails.
+Production-focused WebTransport for Bun, Node, and Deno with in-process server/client support, datagrams, streams, and operational guardrails.
 
 ## Start here
 
@@ -19,5 +19,5 @@ Production-focused WebTransport for Bun with in-process server/client support, d
 
 ## Examples
 
-- Echo playground (browser + Bun): `examples/echo-playground`
+- Echo playground (browser + runtime): `examples/echo-playground`
 - Compose collaboration room: `examples/compose-collab`

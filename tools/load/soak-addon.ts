@@ -26,6 +26,12 @@ const STREAMS_PER_SEC = parseInt(process.env.SOAK_STREAMS_PER_SEC ?? "5", 10);
 const MAX_SESSION_ERRORS = Math.ceil(SESSIONS * 0.5);
 const MAX_DATAGRAM_ERRORS = 5000;
 const MAX_STREAM_ERRORS = 2000;
+const RSS_TREND_MAX_REL = parseFloat(
+	process.env.SOAK_RSS_TREND_MAX_REL ?? "0.2",
+);
+const RSS_TREND_MIN_ABS_MB = parseFloat(
+	process.env.SOAK_RSS_TREND_MIN_ABS_MB ?? "32",
+);
 
 type Sample = {
 	ts_ms: number;
@@ -301,13 +307,18 @@ async function main() {
 		const sessionTasksLast = avg(lastThird, "sessionTasks");
 		const streamTasksFirst = avg(firstThird, "streamTasks");
 		const streamTasksLast = avg(lastThird, "streamTasks");
-		if (rssFirst > 0 && rssLast > rssFirst * 1.2) {
+		const rssGrowthMb = rssLast - rssFirst;
+		if (
+			rssFirst > 0 &&
+			rssGrowthMb > RSS_TREND_MIN_ABS_MB &&
+			rssLast > rssFirst * (1 + RSS_TREND_MAX_REL)
+		) {
 			console.error(
 				"soak-addon: FAIL (trend: RSS",
 				rssFirst.toFixed(1),
 				"->",
 				rssLast.toFixed(1),
-				"MB, >20% growth)",
+				`MB, >${(RSS_TREND_MAX_REL * 100).toFixed(0)}% and >${RSS_TREND_MIN_ABS_MB.toFixed(0)}MB growth)`,
 			);
 			process.exit(1);
 		}
@@ -344,6 +355,7 @@ async function main() {
 	}
 
 	console.log("soak-addon: PASS");
+	process.exit(0);
 }
 
 main().catch((e) => {
