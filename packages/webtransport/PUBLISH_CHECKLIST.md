@@ -34,7 +34,7 @@ cd /tmp
 rm -rf wt-pub-test && mkdir wt-pub-test && cd wt-pub-test
 bun init -y
 # From repo: bun add file:/path/to/packages/webtransport
-# Or after pack: bun add /path/to/webtransport-bun-webtransport-0.2.0.tgz
+# Or after pack: bun add /path/to/webtransport-bun-webtransport-0.2.1.tgz
 
 bun -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
 ```

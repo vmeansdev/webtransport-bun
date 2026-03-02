@@ -1,6 +1,6 @@
 {
 	"name": "@webtransport-bun/webtransport",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Production-focused WebTransport for Bun with datagrams and streams via a Rust napi-rs addon",
 	"license": "MIT",
 	"repository": {
