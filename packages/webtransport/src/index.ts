@@ -357,6 +357,16 @@ export type ClientOptions = {
 
 export type CloseInfo = { code?: number; reason?: string };
 
+function normalizeCloseInfo(
+	info: CloseInfo | undefined,
+	fallback?: CloseInfo,
+): { code: number; reason: string } {
+	return {
+		code: info?.code ?? fallback?.code ?? 0,
+		reason: info?.reason ?? fallback?.reason ?? "",
+	};
+}
+
 export type WebTransportBidirectionalStream = {
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
@@ -690,13 +700,16 @@ class NativeServerSession implements ServerSession {
 	#nativeHandle: any;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
+	#requestedCloseInfo: CloseInfo | null = null;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
 	constructor(nativeHandle: any, closedPromise: Promise<CloseInfo>) {
 		this.#nativeHandle = nativeHandle;
-		this.#closedPromise = closedPromise;
+		this.#closedPromise = closedPromise.then((info) =>
+			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
+		);
 		this.#closedPromise.then(() => {
 			this.#closed = true;
 		});
@@ -725,6 +738,7 @@ class NativeServerSession implements ServerSession {
 	close(info?: CloseInfo): void {
 		if (!this.#closed) {
 			this.#closed = true;
+			this.#requestedCloseInfo = normalizeCloseInfo(info);
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
 	}
@@ -958,6 +972,7 @@ class NativeClientSession implements ClientSession {
 	#readyPromise: Promise<void>;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
+	#requestedCloseInfo: CloseInfo | null = null;
 	#strictW3CErrors: boolean;
 
 	constructor(
@@ -968,7 +983,9 @@ class NativeClientSession implements ClientSession {
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#readyPromise = readyPromise;
-		this.#closedPromise = closedPromise;
+		this.#closedPromise = closedPromise.then((info) =>
+			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
+		);
 		this.#strictW3CErrors = strictW3CErrors;
 		this.#closedPromise.then(() => {
 			this.#closed = true;
@@ -997,6 +1014,7 @@ class NativeClientSession implements ClientSession {
 	close(info?: CloseInfo): void {
 		if (!this.#closed) {
 			this.#closed = true;
+			this.#requestedCloseInfo = normalizeCloseInfo(info);
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
 	}
@@ -1356,9 +1374,10 @@ function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 }
 
 function toCloseInfo(info: CloseInfo): WebTransportCloseInfo {
+	const normalized = normalizeCloseInfo(info);
 	return {
-		closeCode: info?.code,
-		reason: info?.reason,
+		closeCode: normalized.code,
+		reason: normalized.reason,
 	};
 }
 
