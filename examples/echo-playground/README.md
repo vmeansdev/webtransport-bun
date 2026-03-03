@@ -46,6 +46,10 @@ If your browser still rejects local certs in your environment, use this fallback
 - Datagram echo: browser `transport.datagrams.writable` -> server `incomingDatagrams()` -> server `sendDatagram()`
 - Bidirectional stream echo: browser `createBidirectionalStream()` -> server `incomingBidirectionalStreams`
 - Unidirectional stream echo: browser `createUnidirectionalStream()` -> server `incomingUnidirectionalStreams` -> server `createUnidirectionalStream()` back to client
+- Close info propagation demo:
+  - In UI, use `Close Demo (Client -> Server)` with `closeCode`/`closeReason` (defaults `4999` / `Done streaming.`).
+  - Browser log shows: `closed: code=... reason=...`.
+  - Server terminal shows: `[wt] session closed id=... code=... reason="..."`.
 
 ## WebTransport alongside `Bun.serve`
 

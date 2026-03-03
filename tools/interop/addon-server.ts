@@ -13,6 +13,14 @@ const QUIC_PORT = 4433;
 const HEALTH_PORT = 4434;
 const IDLE_TIMEOUT_MS = Number(process.env.WT_IDLE_TIMEOUT_MS ?? "60000");
 const CLOSE_SIGNAL = "__WT_CLOSE_4001__";
+const MAX_CLOSE_EVENTS = 200;
+
+type CloseEvent = {
+	timestampMs: number;
+	code: number;
+	reason: string;
+};
+const closeEvents: CloseEvent[] = [];
 
 const certPath = join(import.meta.dir, "certs", "cert.pem");
 const keyPath = join(import.meta.dir, "certs", "key.pem");
@@ -31,6 +39,17 @@ const wtServer = createServer({
 	tls: { certPem, keyPem },
 	limits: { idleTimeoutMs: IDLE_TIMEOUT_MS },
 	onSession: async (session) => {
+		void session.closed
+			.then((info) => {
+				closeEvents.push({
+					timestampMs: Date.now(),
+					code: Number(info?.code ?? 0),
+					reason: String(info?.reason ?? ""),
+				});
+				if (closeEvents.length > MAX_CLOSE_EVENTS) closeEvents.shift();
+			})
+			.catch(() => {});
+
 		// Datagram echo
 		(async () => {
 			const decoder = new TextDecoder();
@@ -42,7 +61,9 @@ const wtServer = createServer({
 				}
 				await session.sendDatagram(d);
 			}
-		})().catch(() => {});
+		})().catch((err) => {
+			console.warn("[interop-addon-server] datagram loop failed:", err);
+		});
 		// Bidi stream echo
 		(async () => {
 			for await (const duplex of session.incomingBidirectionalStreams) {
@@ -53,9 +74,13 @@ const wtServer = createServer({
 					const writer = duplex.writable.getWriter();
 					if (buf.length > 0) await writer.write(buf);
 					await writer.close();
-				})().catch(() => {});
+				})().catch((err) => {
+					console.warn("[interop-addon-server] bidi stream failed:", err);
+				});
 			}
-		})().catch(() => {});
+		})().catch((err) => {
+			console.warn("[interop-addon-server] incoming bidi loop failed:", err);
+		});
 		// Uni stream echo: read incoming, write back on new uni stream
 		(async () => {
 			for await (const readable of session.incomingUnidirectionalStreams) {
@@ -68,13 +93,28 @@ const wtServer = createServer({
 						writable.write(buf);
 						writable.end();
 					}
-				})().catch(() => {});
+				})().catch((err) => {
+					console.warn("[interop-addon-server] uni stream failed:", err);
+				});
 			}
-		})().catch(() => {});
+		})().catch((err) => {
+			console.warn("[interop-addon-server] incoming uni loop failed:", err);
+		});
 	},
 });
 
 const healthServer = createHttpServer((_req, res) => {
+	const req = _req;
+	const url = new URL(req.url ?? "/", "http://127.0.0.1");
+	if (url.pathname === "/close-events") {
+		res.writeHead(200, {
+			"Content-Type": "application/json; charset=utf-8",
+			Connection: "close",
+			"Cache-Control": "no-store",
+		});
+		res.end(JSON.stringify({ closeEvents }));
+		return;
+	}
 	res.writeHead(200, { "Content-Length": 0, Connection: "close" });
 	res.end();
 });
