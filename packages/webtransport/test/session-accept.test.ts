@@ -96,4 +96,34 @@ describe("session accept (P0-A)", () => {
 			await server.close();
 		}
 	}, 20000);
+
+	it("client-initiated close propagates code and reason to server session.closed", async () => {
+		const port = nextPort(23440, 2000);
+		const sessions: any[] = [];
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: (s) => {
+				sessions.push(s);
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const accepted = await waitUntil(() => sessions.length >= 1, 8000);
+			expect(accepted).toBe(true);
+			const closedInfoPromise = sessions[0].closed;
+			client.close({ code: 4999, reason: "Done streaming." });
+			const closeInfo = await Promise.race([
+				closedInfoPromise,
+				Bun.sleep(5000).then(() => ({ code: -1, reason: "timeout" })),
+			]);
+			expect((closeInfo as any).code).toBe(4999);
+			expect((closeInfo as any).reason).toBe("Done streaming.");
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 20000);
 });
