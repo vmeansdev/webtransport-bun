@@ -130,6 +130,9 @@ See `docs/COMPATIBILITY.md` for policy details.
 ### From package
 ```bash
 bun add @webtransport-bun/webtransport
+npm i @webtransport-bun/webtransport
+pnpm add @webtransport-bun/webtransport
+yarn add @webtransport-bun/webtransport
 ```
 
 Published npm package contents:
@@ -142,6 +145,9 @@ Note: GitHub source zip/tar downloads are source snapshots and may not include g
 ### From local workspace (development)
 ```bash
 bun add file:./packages/webtransport
+npm i file:./packages/webtransport
+pnpm add file:./packages/webtransport
+yarn add file:./packages/webtransport
 ```
 
 ## Examples
@@ -180,6 +186,9 @@ bun run example:compose:collab
 ### 1) Install package
 ```bash
 bun add @webtransport-bun/webtransport
+npm i @webtransport-bun/webtransport
+pnpm add @webtransport-bun/webtransport
+yarn add @webtransport-bun/webtransport
 ```
 
 ### 2) Start a server

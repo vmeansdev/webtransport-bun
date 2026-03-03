@@ -229,12 +229,18 @@ Instruct users to pin to the validated release:
 
 ```bash
 bun add @webtransport-bun/webtransport@<VERSION>
+npm i @webtransport-bun/webtransport@<VERSION>
+pnpm add @webtransport-bun/webtransport@<VERSION>
+yarn add @webtransport-bun/webtransport@<VERSION>
 ```
 
 Example: for rollback target `v0.1.0`, users run:
 
 ```bash
 bun add @webtransport-bun/webtransport@0.1.0
+npm i @webtransport-bun/webtransport@0.1.0
+pnpm add @webtransport-bun/webtransport@0.1.0
+yarn add @webtransport-bun/webtransport@0.1.0
 ```
 
 ### Expected validation signals

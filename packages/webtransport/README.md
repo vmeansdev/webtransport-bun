@@ -1,16 +1,19 @@
 # @webtransport-bun/webtransport
 
-Production-focused WebTransport for Bun: datagrams + streams, in-process server/client, backed by Rust `wtransport` via `napi-rs`.
+Production-focused WebTransport for Bun, Node, and Deno: datagrams + streams, in-process server/client, backed by Rust `wtransport` via `napi-rs`.
 
 ## Install
 
 ```bash
 bun add @webtransport-bun/webtransport
+npm i @webtransport-bun/webtransport
+pnpm add @webtransport-bun/webtransport
+yarn add @webtransport-bun/webtransport
 ```
 
 ## Requirements
 
-- **Runtime**: Bun >= 1.3.9 (required; this package does not run on Node.js)
+- **Runtime**: Bun >= 1.3.9, Node (Node-API compatible runtime), Deno (npm + Node-API addon support)
 - **Platforms**: macOS (arm64, x64), Linux (x64)
 
 ## Quick Start
@@ -42,12 +45,16 @@ session.close();
 Prebuilt binaries are included for darwin-arm64, darwin-x64, and linux-x64. If you see this error:
 
 - Ensure you are on a supported platform (macOS or Linux, arm64 or x64).
-- Reinstall: `rm -rf node_modules && bun install`
+- Reinstall dependencies and rebuild native artifacts (`npm i` / `pnpm i` / `yarn` / `bun install`).
 - For development from source, run `bun run build:native` from the repo root.
 
-### "requires Bun"
+### Runtime compatibility mismatch
 
-This package runs only on Bun. Use `bun add` and run your app with `bun run`.
+This package supports Bun, Node, and Deno on supported OS/arch targets. If import fails:
+
+- Confirm your runtime supports Node-API addon loading.
+- Confirm your platform matches published prebuilds (macOS arm64/x64, Linux x64).
+- If needed, build native locally from source (`bun run build:native` in this repo).
 
 ## Docs
 
