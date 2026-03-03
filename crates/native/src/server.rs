@@ -41,7 +41,7 @@ impl ServerHandle {
                     "E_TLS: server tls.caPem is not supported yet",
                 ));
             }
-            let session_tsfn: Option<ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal>> =
+            let session_tsfn: ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal> =
                 on_session
                     .create_threadsafe_function(
                         0,
@@ -74,9 +74,14 @@ impl ServerHandle {
                             Ok(vec![arr])
                         },
                     )
-                    .ok();
+                    .map_err(|e| {
+                        napi::Error::from_reason(format!(
+                            "E_INTERNAL: failed to create onSession callback bridge: {}",
+                            e
+                        ))
+                    })?;
 
-            let log_tsfn: Option<ThreadsafeFunction<Vec<LogEvent>, ErrorStrategy::Fatal>> = log_fn
+            let log_tsfn: ThreadsafeFunction<Vec<LogEvent>, ErrorStrategy::Fatal> = log_fn
                 .create_threadsafe_function(
                     0,
                     |ctx: napi::threadsafe_function::ThreadSafeCallContext<Vec<LogEvent>>| {
@@ -99,10 +104,15 @@ impl ServerHandle {
                         Ok(vec![arr])
                     },
                 )
-                .ok();
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "E_INTERNAL: failed to create log callback bridge: {}",
+                        e
+                    ))
+                })?;
 
-            let session_tx = session_tsfn.map(|tsfn| crate::spawn_event_batcher(tsfn, 64, 5));
-            let log_tx = log_tsfn.map(|tsfn| crate::spawn_event_batcher(tsfn, 128, 10));
+            let session_tx = Some(crate::spawn_event_batcher(session_tsfn, 64, 5));
+            let log_tx = Some(crate::spawn_event_batcher(log_tsfn, 128, 10));
 
             let metrics = Arc::new(ServerMetrics::default());
             let limits = crate::limits::Limits::from_json(&_limits_json);
@@ -162,7 +172,11 @@ impl ServerHandle {
     #[napi]
     pub async fn close(&self) -> Result<()> {
         panic_guard::catch_panic(|| {
-            let _ = self.shutdown_tx.lock().ok().and_then(|mut g| g.take());
+            let mut guard = self
+                .shutdown_tx
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: shutdown lock poisoned"))?;
+            guard.take();
             crate::session_registry::close_all(0, b"server closing");
             Ok(())
         })?;
@@ -185,9 +199,23 @@ impl ServerHandle {
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
-            let _ = done_tx.send(());
+            if done_tx.send(()).is_err() {
+                crate::report_channel_failure("server close completion");
+            }
         });
-        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(6));
+        match done_rx.recv_timeout(std::time::Duration::from_secs(6)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(napi::Error::from_reason(
+                    "E_INTERNAL: server close drain timeout".to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(napi::Error::from_reason(
+                    "E_INTERNAL: server close completion channel disconnected".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
