@@ -9,8 +9,10 @@ import {
 	createServer,
 	E_RATE_LIMITED,
 	E_SESSION_IDLE_TIMEOUT,
+	E_STREAM_RESET,
 	E_STOP_SENDING,
 	WebTransportError,
+	WT_RESET,
 	WT_STOP_SENDING,
 } from "../src/index.js";
 import { withHarness } from "./helpers/harness.js";
@@ -190,6 +192,50 @@ describe("P0.2 stable error codes", () => {
 			expect(err).toBeDefined();
 			expect(err).toBeInstanceOf(Error);
 			expect((err as Error).message).toContain(E_STOP_SENDING);
+		});
+	}, 15000);
+
+	it("E_STREAM_RESET: read errors when peer resets stream", async () => {
+		await withHarness(async (h) => {
+			const port = nextPort(BASE_PORT, 400);
+			h.track(
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: async (s) => {
+						for await (const duplex of s.incomingBidirectionalStreams) {
+							(duplex as any)[WT_RESET](42);
+							break;
+						}
+					},
+				}),
+			);
+			await Bun.sleep(300);
+
+			const client = h.track(
+				await connect(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+				}),
+			);
+			const stream = await client.createBidirectionalStream();
+			await new Promise<void>((resolve, reject) => {
+				stream.write(Buffer.from("trigger"), (e?: Error | null) =>
+					e ? reject(e) : resolve(),
+				);
+			});
+
+			let err: unknown = null;
+			const errPromise = new Promise<void>((resolve) => {
+				stream.once("error", (e) => {
+					err = e;
+					resolve();
+				});
+			});
+			stream.resume();
+			await Promise.race([errPromise, Bun.sleep(3000)]);
+
+			expect(err).toBeDefined();
+			expect(String((err as Error).message ?? err)).toContain(E_STREAM_RESET);
 		});
 	}, 15000);
 });

@@ -136,4 +136,51 @@ describe("TLS contract (P0.3)", () => {
 			await server.close();
 		}
 	}, 15000);
+
+	it("connect with malformed certificate PEM in caPem rejects with invalid CA PEM error", async () => {
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+
+		try {
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: {
+						caPem:
+							"-----BEGIN CERTIFICATE-----\n!!not-base64!!\n-----END CERTIFICATE-----",
+					},
+				}),
+			).rejects.toThrow(/E_TLS: invalid CA PEM/);
+		} finally {
+			await server.close();
+		}
+	}, 15000);
+
+	it("connect with parseable-but-invalid certificate in caPem rejects with no accepted certificates error", async () => {
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+
+		try {
+			// Valid PEM framing + base64 payload, but payload is not a valid X.509 cert.
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: {
+						caPem:
+							"-----BEGIN CERTIFICATE-----\nAQIDBAUGBwgJCgsMDQ4PEA==\n-----END CERTIFICATE-----",
+					},
+				}),
+			).rejects.toThrow(
+				/E_TLS: CA PEM parsed but no certificates were accepted/,
+			);
+		} finally {
+			await server.close();
+		}
+	}, 15000);
 });
