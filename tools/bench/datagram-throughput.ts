@@ -17,7 +17,9 @@ async function main() {
 			await $`kill -9 ${p.trim().split(/\s+/).filter(Boolean)}`
 				.quiet()
 				.nothrow();
-	} catch {}
+	} catch (err) {
+		console.warn("datagram-throughput: port cleanup failed:", err);
+	}
 	await Bun.sleep(2000);
 
 	await $`cd ${ROOT} && cargo build -p reference --bin load-client --release`.quiet();

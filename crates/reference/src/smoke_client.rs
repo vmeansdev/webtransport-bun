@@ -78,7 +78,10 @@ async fn run(url: &str) -> i32 {
         }
     };
     let msg = b"smoke-bidi-echo";
-    send.write_all(msg).await.ok();
+    if let Err(e) = send.write_all(msg).await {
+        eprintln!("smoke-client: bidi write failed: {}", e);
+        return 1;
+    }
     let _ = send.finish().await;
     let mut buf = vec![0u8; 256];
     let n = match recv.read(&mut buf).await {

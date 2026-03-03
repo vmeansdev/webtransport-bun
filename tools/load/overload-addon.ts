@@ -21,7 +21,9 @@ async function main() {
 			await $`kill -9 ${p4433.trim().split(/\s+/).filter(Boolean).join(" ")}`
 				.quiet()
 				.nothrow();
-	} catch {}
+	} catch (err) {
+		console.warn("overload-addon: port cleanup failed:", err);
+	}
 	await Bun.sleep(3000); // Allow port to be released
 	await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client`.quiet();
 

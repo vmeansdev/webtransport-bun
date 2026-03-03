@@ -39,7 +39,8 @@ async function getFdCount(pid: number): Promise<number> {
 		});
 		const out = await new Response(proc.stdout).text();
 		return out.trim().split("\n").length - 1;
-	} catch {
+	} catch (err) {
+		console.warn("load-scale-addon: failed to count file descriptors:", err);
 		return 0;
 	}
 }
@@ -51,7 +52,9 @@ async function main() {
 			await $`kill -9 ${p.trim().split(/\s+/).filter(Boolean)}`
 				.quiet()
 				.nothrow();
-	} catch {}
+	} catch (err) {
+		console.warn("load-scale-addon: port cleanup failed:", err);
+	}
 	await Bun.sleep(3000);
 
 	let clientBin = CLIENT_BIN_RELEASE;

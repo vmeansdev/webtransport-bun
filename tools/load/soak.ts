@@ -31,7 +31,8 @@ async function getFdCount(pid: number): Promise<number> {
 		});
 		const out = await new Response(proc.stdout).text();
 		return out.trim().split("\n").length - 1;
-	} catch {
+	} catch (err) {
+		console.warn("soak: failed to count file descriptors:", err);
 		return 0;
 	}
 }
@@ -54,7 +55,8 @@ async function getMetrics(): Promise<{
 			streamsActive: j.streamsActive ?? 0,
 			queuedBytesGlobal: j.queuedBytesGlobal ?? 0,
 		};
-	} catch {
+	} catch (err) {
+		console.warn("soak: failed to fetch metrics snapshot:", err);
 		return null;
 	}
 }
@@ -77,7 +79,8 @@ async function main() {
 		try {
 			const res = await fetch("http://127.0.0.1:4434");
 			if (res.ok) break;
-		} catch {
+		} catch (err) {
+			console.warn("soak: health check attempt failed:", err);
 			await Bun.sleep(200);
 		}
 		if (i === 29) {

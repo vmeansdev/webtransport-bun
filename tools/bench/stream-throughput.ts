@@ -51,7 +51,9 @@ async function main() {
 			for await (const duplex of session.incomingBidirectionalStreams) {
 				void (async () => {
 					await duplex.readable.pipeTo(duplex.writable);
-				})().catch(() => {});
+				})().catch((err) => {
+					console.warn("[stream-throughput] bidi echo pipe failed:", err);
+				});
 			}
 		},
 	});

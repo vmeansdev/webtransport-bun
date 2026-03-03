@@ -20,7 +20,9 @@ const server = createServer({
 					console.log("[server] echoed");
 				}
 			}
-		})().catch(() => {});
+		})().catch((err) => {
+			console.error("[server] incoming bidi loop failed", err);
+		});
 	},
 });
 await Bun.sleep(2000);

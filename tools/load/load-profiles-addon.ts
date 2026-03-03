@@ -19,7 +19,9 @@ async function killPort4433(): Promise<void> {
 			await $`kill -9 ${p.trim().split(/\s+/).filter(Boolean)}`
 				.quiet()
 				.nothrow();
-	} catch {}
+	} catch (err) {
+		console.warn("load-profiles-addon: port cleanup failed:", err);
+	}
 	await Bun.sleep(2000);
 }
 

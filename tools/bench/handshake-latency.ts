@@ -24,7 +24,11 @@ async function main() {
 		port: PORT,
 		tls: { certPem: "", keyPem: "" },
 		onSession: (s) => {
-			s.closed.then(() => {}).catch(() => {});
+			s.closed
+				.then(() => {})
+				.catch((err) => {
+					console.warn("[handshake-latency] session closed rejection:", err);
+				});
 		},
 	});
 	await Bun.sleep(2000);
@@ -38,8 +42,8 @@ async function main() {
 			const session = await connect(url, { tls: { insecureSkipVerify: true } });
 			latencies.push(performance.now() - start);
 			session.close();
-		} catch {
-			// skip failed connects
+		} catch (err) {
+			console.warn("[handshake-latency] connect failed during sample:", err);
 		}
 	}
 

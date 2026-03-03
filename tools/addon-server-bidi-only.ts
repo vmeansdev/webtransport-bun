@@ -21,7 +21,7 @@ const server = createServer({
 					console.log("[server] echoed", buf.length, "bytes");
 				})().catch((e) => console.error("[server] bidi err", e));
 			}
-		})().catch(() => {});
+		})().catch((e) => console.error("[server] incoming bidi loop err", e));
 	},
 });
 
