@@ -62,4 +62,81 @@ describe("WT stream symbols", () => {
 		stream[WT_STOP_SENDING](88);
 		expect(calls).toEqual([88]);
 	});
+
+	it("BidiStream destroy logs warning when native reset throws", () => {
+		const native = {
+			reset: (_code: number) => {
+				throw new Error("reset-fail");
+			},
+			stopSending: (_code: number) => {},
+			read: async () => null,
+			write: async (_chunk: Buffer) => {},
+			finish: () => {},
+		};
+		const stream = new BidiStream({ handleId: 5, nativeHandle: native });
+		const warn = console.warn;
+		const seen: string[] = [];
+		console.warn = (...args: unknown[]) => {
+			seen.push(args.map(String).join(" "));
+		};
+		try {
+			stream.destroy();
+		} finally {
+			console.warn = warn;
+		}
+		expect(
+			seen.some((s) => s.includes("bidi stream reset on destroy failed")),
+		).toBe(true);
+	});
+
+	it("SendStream destroy logs warning when native reset throws", () => {
+		const native = {
+			reset: (_code: number) => {
+				throw new Error("reset-fail");
+			},
+			write: async (_chunk: Buffer) => {},
+			finish: () => {},
+		};
+		const stream = new SendStream({ handleId: 6, nativeHandle: native });
+		const warn = console.warn;
+		const seen: string[] = [];
+		console.warn = (...args: unknown[]) => {
+			seen.push(args.map(String).join(" "));
+		};
+		try {
+			stream.destroy();
+		} finally {
+			console.warn = warn;
+		}
+		expect(
+			seen.some((s) =>
+				s.includes("unidirectional send stream reset on destroy failed"),
+			),
+		).toBe(true);
+	});
+
+	it("RecvStream destroy logs warning when native stopSending throws", () => {
+		const native = {
+			stopSending: (_code: number) => {
+				throw new Error("stop-fail");
+			},
+			read: async () => null,
+		};
+		const stream = new RecvStream({ handleId: 7, nativeHandle: native });
+		const warn = console.warn;
+		const seen: string[] = [];
+		console.warn = (...args: unknown[]) => {
+			seen.push(args.map(String).join(" "));
+		};
+		try {
+			stream.destroy();
+		} finally {
+			console.warn = warn;
+		}
+		expect(
+			seen.some((s) =>
+				s.includes("unidirectional recv stream stopSending on destroy failed"),
+			),
+		).toBe(true);
+	});
 });

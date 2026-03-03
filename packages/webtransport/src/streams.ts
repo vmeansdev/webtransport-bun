@@ -106,8 +106,11 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			this.#destroyed = true;
 			try {
 				this.#nativeHandle?.reset?.(0);
-			} catch {
-				/* already closed */
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(
+					`[webtransport] bidi stream reset on destroy failed: ${msg}`,
+				);
 			}
 			this.#nativeHandle = null;
 		}
@@ -178,8 +181,11 @@ export class SendStream extends Writable implements Resettable {
 			this.#destroyed = true;
 			try {
 				this.#nativeHandle?.reset?.(0);
-			} catch {
-				/* already closed */
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(
+					`[webtransport] unidirectional send stream reset on destroy failed: ${msg}`,
+				);
 			}
 			this.#nativeHandle = null;
 		}
@@ -238,8 +244,11 @@ export class RecvStream extends Readable implements StopSendable {
 			this.#destroyed = true;
 			try {
 				this.#nativeHandle?.stopSending?.(0);
-			} catch {
-				/* already closed */
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(
+					`[webtransport] unidirectional recv stream stopSending on destroy failed: ${msg}`,
+				);
 			}
 			this.#nativeHandle = null;
 		}

@@ -84,6 +84,7 @@ import {
 	E_INTERNAL,
 	E_HANDSHAKE_TIMEOUT,
 	E_SESSION_CLOSED,
+	E_SESSION_IDLE_TIMEOUT,
 	WebTransportError,
 } from "./errors.js";
 import type { ErrorCode } from "./errors.js";
@@ -149,6 +150,23 @@ function toWebTransportError(
 		code,
 		msg,
 		browserName ? { browserName } : undefined,
+	);
+}
+
+function isSessionCloseError(err: unknown): boolean {
+	const mapped = toWebTransportError(err);
+	if (
+		mapped.code === E_SESSION_CLOSED ||
+		mapped.code === E_SESSION_IDLE_TIMEOUT
+	) {
+		return true;
+	}
+	const msg = err instanceof Error ? err.message : String(err);
+	const lower = msg.toLowerCase();
+	// Native transports can report close without E_* code (e.g. "connection locally closed").
+	return (
+		lower.includes("connection locally closed") ||
+		lower.includes("connection closed by peer")
 	);
 }
 
@@ -673,23 +691,58 @@ import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
-let native: any;
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-gnu.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-musl.node`,
 ];
 const basePaths = ["../../../crates/native", "../prebuilds"];
-for (const base of basePaths) {
-	for (const candidate of binaryCandidates) {
-		try {
-			native = _require(`${base}/${candidate}`);
-			break;
-		} catch {
-			continue;
+type RequireLike = (id: string) => unknown;
+type NativeLoadFailure = { request: string; message: string };
+
+function tryLoadNativeAddon(
+	requireFn: RequireLike,
+	bases = basePaths,
+	candidates = binaryCandidates,
+): { addon: any; failures: NativeLoadFailure[] } {
+	const failures: NativeLoadFailure[] = [];
+	for (const base of bases) {
+		for (const candidate of candidates) {
+			const request = `${base}/${candidate}`;
+			try {
+				return { addon: requireFn(request), failures };
+			} catch (err) {
+				failures.push({
+					request,
+					message: err instanceof Error ? err.message : String(err),
+				});
+			}
 		}
 	}
-	if (native) break;
+	return { addon: undefined, failures };
+}
+
+function buildNativeAddonLoadErrorMessage(
+	failures: NativeLoadFailure[],
+	maxEntries = 6,
+): string {
+	if (failures.length === 0) {
+		return "Native addon not loaded; no load attempts were recorded.";
+	}
+	const shown = failures.slice(0, maxEntries);
+	const details = shown.map((f) => `- ${f.request}: ${f.message}`).join("\n");
+	const omitted = failures.length - shown.length;
+	const suffix = omitted > 0 ? `\n- ... and ${omitted} more attempt(s)` : "";
+	return `Native addon not loaded. Candidate load errors:\n${details}${suffix}`;
+}
+
+const nativeLoad = tryLoadNativeAddon(_require);
+const native = nativeLoad.addon;
+const nativeLoadFailures = nativeLoad.failures;
+
+function getNativeOrThrow(): any {
+	if (native) return native;
+	throw new Error(buildNativeAddonLoadErrorMessage(nativeLoadFailures));
 }
 
 // ---------------------------------------------------------------------------
@@ -760,8 +813,9 @@ class NativeServerSession implements ServerSession {
 				const datagram = await this.#nativeHandle.readDatagram();
 				if (!datagram) break;
 				yield datagram;
-			} catch {
-				break;
+			} catch (err) {
+				if (isSessionCloseError(err)) break;
+				throw toWebTransportError(err);
 			}
 		}
 	}
@@ -846,9 +900,7 @@ class NativeServerSession implements ServerSession {
  * ```
  */
 export function createServer(opts: ServerOptions): WebTransportServer {
-	if (!native) {
-		throw new Error("Native addon not loaded");
-	}
+	const native = getNativeOrThrow();
 
 	const certPem =
 		typeof opts.tls.certPem === "string"
@@ -875,17 +927,25 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	let activeOnSessionCallbacks = 0;
 	let onSessionDrainResolve: (() => void) | null = null;
 
+	const emitUserLog = (event: LogEvent): void => {
+		if (!opts.log) return;
+		try {
+			opts.log(event);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.warn(`[webtransport] log callback failed: ${msg}`);
+		}
+	};
+
 	const logCallback = (logEvents: any[]) => {
-		if (opts.log) {
-			for (const le of logEvents) {
-				opts.log({
-					level: le.level ?? "info",
-					msg: le.msg ?? "",
-					sessionId: le.sessionId,
-					peerIp: le.peerIp,
-					peerPort: le.peerPort,
-				});
-			}
+		for (const le of logEvents) {
+			emitUserLog({
+				level: le.level ?? "info",
+				msg: le.msg ?? "",
+				sessionId: le.sessionId,
+				peerIp: le.peerIp,
+				peerPort: le.peerPort,
+			});
 		}
 	};
 
@@ -918,9 +978,33 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					);
 					const session = new NativeServerSession(nativeSession, closedPromise);
 					activeOnSessionCallbacks++;
-					const maybePromise = opts.onSession(session);
+					let maybePromise: void | Promise<void>;
+					try {
+						maybePromise = opts.onSession(session);
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						emitUserLog({
+							level: "error",
+							msg: `E_INTERNAL: onSession callback threw: ${msg}`,
+							sessionId: evt.id,
+							peerIp: evt.peerIp,
+							peerPort: evt.peerPort,
+						});
+						onSessionCallbackDone();
+						continue;
+					}
 					if (maybePromise && typeof maybePromise.then === "function") {
-						maybePromise.then(onSessionCallbackDone, onSessionCallbackDone);
+						maybePromise.then(onSessionCallbackDone, (err) => {
+							const msg = err instanceof Error ? err.message : String(err);
+							emitUserLog({
+								level: "error",
+								msg: `E_INTERNAL: onSession callback rejected: ${msg}`,
+								sessionId: evt.id,
+								peerIp: evt.peerIp,
+								peerPort: evt.peerPort,
+							});
+							onSessionCallbackDone();
+						});
 					} else {
 						onSessionCallbackDone();
 					}
@@ -1036,8 +1120,9 @@ class NativeClientSession implements ClientSession {
 				const dgram = await this.#nativeHandle.readDatagram();
 				if (!dgram) break;
 				yield dgram;
-			} catch {
-				break;
+			} catch (err) {
+				if (isSessionCloseError(err)) break;
+				throw toWebTransportError(err, this.#strictW3CErrors);
 			}
 		}
 	}
@@ -1065,8 +1150,9 @@ class NativeClientSession implements ClientSession {
 					handleId: nativeStream?.id ?? 0,
 					nativeHandle: nativeStream,
 				});
-			} catch {
-				break;
+			} catch (err) {
+				if (isSessionCloseError(err)) break;
+				throw toWebTransportError(err, this.#strictW3CErrors);
 			}
 		}
 	}
@@ -1094,8 +1180,9 @@ class NativeClientSession implements ClientSession {
 					handleId: nativeStream?.id ?? 0,
 					nativeHandle: nativeStream,
 				});
-			} catch {
-				break;
+			} catch (err) {
+				if (isSessionCloseError(err)) break;
+				throw toWebTransportError(err, this.#strictW3CErrors);
 			}
 		}
 	}
@@ -1108,6 +1195,105 @@ class NativeClientSession implements ClientSession {
 // ---------------------------------------------------------------------------
 // connect
 // ---------------------------------------------------------------------------
+
+function connectWithNative(
+	native: any,
+	url: string,
+	optsJson: string,
+	handshakeTimeout: number,
+	strictW3CErrors?: boolean,
+	setTimer: (cb: () => void, ms: number) => any = (cb, ms) =>
+		setTimeout(cb, ms),
+	clearTimer: (handle: any) => void = (handle) => clearTimeout(handle),
+): Promise<ClientSession> {
+	return new Promise<ClientSession>((resolve, reject) => {
+		const closedResolvers = new Map<string, (info: CloseInfo) => void>();
+		let settled = false;
+		let timeoutHandle: any;
+
+		const settleResolve = (session: ClientSession): void => {
+			if (settled) return;
+			settled = true;
+			clearTimer(timeoutHandle);
+			resolve(session);
+		};
+
+		const settleReject = (err: unknown): void => {
+			if (settled) return;
+			settled = true;
+			clearTimer(timeoutHandle);
+			reject(err);
+		};
+
+		const onClosed = (events: any[]) => {
+			for (const evt of events) {
+				if (evt.name === "session_closed" && evt.id != null) {
+					const resolveClosed = closedResolvers.get(evt.id);
+					closedResolvers.delete(evt.id);
+					if (resolveClosed)
+						resolveClosed({ code: evt.code, reason: evt.reason });
+				}
+			}
+		};
+
+		timeoutHandle = setTimer(() => {
+			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
+			const browserName =
+				strictW3CErrors === true
+					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ??
+						undefined)
+					: undefined;
+			settleReject(
+				new WebTransportError(
+					E_HANDSHAKE_TIMEOUT as ErrorCode,
+					msg,
+					browserName ? { browserName } : undefined,
+				),
+			);
+		}, handshakeTimeout);
+
+		native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
+			if (err) {
+				settleReject(toWebTransportError(err, strictW3CErrors));
+				return;
+			}
+			if (handleId == null) {
+				settleReject(new Error("connect succeeded but no handle id"));
+				return;
+			}
+			const handle = native.takeClientSession(handleId);
+			if (!handle) {
+				settleReject(new Error("connect: handle not found in registry"));
+				return;
+			}
+			if (settled) {
+				try {
+					handle.close?.(0, "late connect completion after timeout");
+				} catch (closeErr) {
+					const msg =
+						closeErr instanceof Error ? closeErr.message : String(closeErr);
+					console.warn(
+						`[webtransport] late connect orphan cleanup failed: ${msg}`,
+					);
+				}
+				return;
+			}
+			let closedResolve!: (info: CloseInfo) => void;
+			const closedPromise = new Promise<CloseInfo>((r) => {
+				closedResolve = r;
+			});
+			closedResolvers.set(handle.id, closedResolve);
+			settleResolve(
+				new NativeClientSession(
+					handle,
+					Promise.resolve(),
+					closedPromise,
+					strictW3CErrors,
+				),
+			);
+		});
+	});
+}
 
 /**
  * Connect to a WebTransport server (Node API).
@@ -1134,9 +1320,7 @@ export async function connect(
 	url: string,
 	opts?: ClientOptions,
 ): Promise<ClientSession> {
-	if (!native) {
-		throw new Error("Native addon not loaded");
-	}
+	const native = getNativeOrThrow();
 	if (
 		opts?.tls?.insecureSkipVerify === true &&
 		(opts.log !== undefined || !shouldSuppressInsecureSkipVerifyWarning())
@@ -1172,69 +1356,13 @@ export async function connect(
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
-
-	const connectPromise = new Promise<ClientSession>((resolve, reject) => {
-		const closedResolvers = new Map<string, (info: CloseInfo) => void>();
-		const onClosed = (events: any[]) => {
-			for (const evt of events) {
-				if (evt.name === "session_closed" && evt.id != null) {
-					const resolveClosed = closedResolvers.get(evt.id);
-					closedResolvers.delete(evt.id);
-					if (resolveClosed)
-						resolveClosed({ code: evt.code, reason: evt.reason });
-				}
-			}
-		};
-		native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
-			if (err) {
-				reject(toWebTransportError(err, opts?.strictW3CErrors));
-				return;
-			}
-			if (handleId == null) {
-				reject(new Error("connect succeeded but no handle id"));
-				return;
-			}
-			const handle = native.takeClientSession(handleId);
-			if (!handle) {
-				reject(new Error("connect: handle not found in registry"));
-				return;
-			}
-			let closedResolve!: (info: CloseInfo) => void;
-			const closedPromise = new Promise<CloseInfo>((r) => {
-				closedResolve = r;
-			});
-			closedResolvers.set(handle.id, closedResolve);
-			const readyPromise = Promise.resolve();
-			resolve(
-				new NativeClientSession(
-					handle,
-					readyPromise,
-					closedPromise,
-					opts?.strictW3CErrors,
-				),
-			);
-		});
-	});
-
-	const timeoutPromise = new Promise<never>((_, reject) => {
-		setTimeout(() => {
-			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
-			const browserName =
-				opts?.strictW3CErrors === true
-					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ??
-						undefined)
-					: undefined;
-			reject(
-				new WebTransportError(
-					E_HANDSHAKE_TIMEOUT as ErrorCode,
-					msg,
-					browserName ? { browserName } : undefined,
-				),
-			);
-		}, handshakeTimeout);
-	});
-
-	return Promise.race([connectPromise, timeoutPromise]);
+	return connectWithNative(
+		native,
+		url,
+		optsJson,
+		handshakeTimeout,
+		opts?.strictW3CErrors,
+	);
 }
 
 /** Client pool metrics (hits, misses, evictions). For tests when allowPooling is used. */
@@ -1244,7 +1372,7 @@ export function clientPoolMetricsSnapshot(): {
 	evictIdle: number;
 	evictBroken: number;
 } {
-	if (!native) throw new Error("Native addon not loaded");
+	const native = getNativeOrThrow();
 	const s = native.clientPoolMetricsSnapshot();
 	return {
 		hits: s.hits,
@@ -1736,7 +1864,12 @@ export class WebTransport {
 			});
 		} else {
 			// Still connecting: absorb eventual connect failure to prevent unhandled rejection (S4).
-			this.#ready.catch(() => {});
+			this.#ready.catch((err) => {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(
+					`[webtransport] ready rejection observed after close() during connect: ${msg}`,
+				);
+			});
 		}
 	}
 
@@ -1956,8 +2089,10 @@ function createServerIncomingBidiStreams(
 					controller.enqueue(
 						attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
 					);
-				} catch {
-					break;
+				} catch (err) {
+					if (isClosed() || isSessionCloseError(err)) break;
+					controller.error(toWebTransportError(err));
+					return;
 				}
 			}
 			controller.close();
@@ -1985,8 +2120,10 @@ function createServerIncomingUniStreams(
 							nodeReadableToWebReadable(readable),
 						),
 					);
-				} catch {
-					break;
+				} catch (err) {
+					if (isClosed() || isSessionCloseError(err)) break;
+					controller.error(toWebTransportError(err));
+					return;
 				}
 			}
 			controller.close();
@@ -2128,6 +2265,35 @@ function nodeWritableToWebWritable(
 		},
 	});
 }
+
+function createNativeClientSessionForTests(
+	nativeHandle: any,
+	strictW3CErrors = false,
+): ClientSession {
+	return new NativeClientSession(
+		nativeHandle,
+		Promise.resolve(),
+		new Promise<CloseInfo>(() => {}),
+		strictW3CErrors,
+	);
+}
+
+function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
+	return new NativeServerSession(
+		nativeHandle,
+		new Promise<CloseInfo>(() => {}),
+	);
+}
+
+export const __TESTING__ = {
+	createNativeClientSessionForTests,
+	createNativeServerSessionForTests,
+	createServerIncomingBidiStreamsForTests: createServerIncomingBidiStreams,
+	createServerIncomingUniStreamsForTests: createServerIncomingUniStreams,
+	tryLoadNativeAddonForTests: tryLoadNativeAddon,
+	buildNativeAddonLoadErrorMessageForTests: buildNativeAddonLoadErrorMessage,
+	connectWithNativeForTests: connectWithNative,
+};
 
 /**
  * Wrap an existing {@link ClientSession} as a browser-style WebTransport.
