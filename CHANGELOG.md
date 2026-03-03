@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3](https://github.com/vmeansdev/webtransport-bun/compare/v0.2.2...v0.2.3) - 2026-03-03
+
+### Fixed
+
+- Eliminated a server-side close propagation race that could surface client-initiated closes as `code: 0, reason: ""` instead of the client-provided close info.
+- Hardened native session and stream paths to return explicit, stable `E_*` diagnostics across additional error branches.
+- Improved TypeScript-side propagation of non-close errors vs session-close EOF semantics for incoming iterators and stream wrappers.
+
+### Added
+
+- Chromium interop regression coverage that asserts browser-initiated close `code`/`reason` is observable on the server side.
+- Additional regression coverage for reset/stopSending-related error mapping and CA PEM TLS validation edge cases.
+- Internal tests for native addon loader diagnostics and connect-time race handling.
+- Echo playground close-code/reason demo controls and server-side close logging showcase.
+
+### Changed
+
+- NPM/package docs and metadata now consistently describe runtime support as Bun + Node + Deno.
+- Release/publish guidance updated with cross-runtime install/import smoke checks and updated `0.2.3` examples.
+
 ## [0.2.2](https://github.com/vmeansdev/webtransport-bun/compare/v0.2.1...v0.2.2) - 2026-03-02
 
 ### Fixed

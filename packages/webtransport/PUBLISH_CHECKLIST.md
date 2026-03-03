@@ -34,7 +34,7 @@ cd /tmp
 rm -rf wt-pub-test && mkdir wt-pub-test && cd wt-pub-test
 npm init -y
 # From repo: npm i file:/path/to/packages/webtransport
-# Or after pack: npm i /path/to/webtransport-bun-webtransport-0.2.2.tgz
+# Or after pack: npm i /path/to/webtransport-bun-webtransport-0.2.3.tgz
 
 node -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
 bun -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
