@@ -37,13 +37,13 @@ fn spawn_server_instance(
     cert_pem: &str,
     key_pem: &str,
     debug: bool,
+    max_retries: usize,
 ) -> std::result::Result<watch::Sender<()>, String> {
-    const MAX_RETRIES: usize = 30;
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
     let mut last_err: Option<String> = None;
 
-    for attempt in 0..MAX_RETRIES {
+    for attempt in 0..max_retries {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (startup_tx, startup_rx) =
             std::sync::mpsc::channel::<std::result::Result<(), String>>();
@@ -66,7 +66,7 @@ fn spawn_server_instance(
         match startup_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => return Ok(shutdown_tx),
             Ok(Err(msg)) => {
-                let should_retry = is_addr_in_use_error(&msg) && attempt + 1 < MAX_RETRIES;
+                let should_retry = is_addr_in_use_error(&msg) && attempt + 1 < max_retries;
                 if should_retry {
                     last_err = Some(msg);
                     drop(shutdown_tx);
@@ -213,6 +213,7 @@ impl ServerHandle {
                 &cert_pem,
                 &key_pem,
                 debug,
+                1,
             )
             .map_err(|msg| {
                 napi::Error::from_reason(format!("E_INTERNAL: server startup failed: {}", msg))
@@ -272,6 +273,7 @@ impl ServerHandle {
                 &cert_pem,
                 &key_pem,
                 self.debug,
+                30,
             ) {
                 Ok(new_shutdown_tx) => {
                     state.shutdown_tx = Some(new_shutdown_tx);
@@ -291,6 +293,7 @@ impl ServerHandle {
                         &old_cert,
                         &old_key,
                         self.debug,
+                        30,
                     );
                     match rollback_result {
                         Ok(rollback_shutdown_tx) => {
