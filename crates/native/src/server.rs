@@ -95,8 +95,8 @@ pub struct ServerHandle {
     metrics: Arc<ServerMetrics>,
     limits: Limits,
     rate_limits: RateLimits,
-    session_tx: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
-    log_tx: Option<tokio::sync::mpsc::Sender<LogEvent>>,
+    session_tx: Mutex<Option<tokio::sync::mpsc::Sender<SessionEvent>>>,
+    log_tx: Mutex<Option<tokio::sync::mpsc::Sender<LogEvent>>>,
     state: Mutex<ServerRuntimeState>,
 }
 
@@ -226,8 +226,8 @@ impl ServerHandle {
                 metrics,
                 limits,
                 rate_limits,
-                session_tx,
-                log_tx,
+                session_tx: Mutex::new(session_tx),
+                log_tx: Mutex::new(log_tx),
                 state: Mutex::new(ServerRuntimeState {
                     shutdown_tx: Some(shutdown_tx),
                     cert_pem,
@@ -260,6 +260,16 @@ impl ServerHandle {
             let old_key = state.key_pem.clone();
             state.shutdown_tx.take();
             crate::session_registry::close_all(0, b"server cert rotating");
+            let session_tx = self
+                .session_tx
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: session tx lock poisoned"))?
+                .clone();
+            let log_tx = self
+                .log_tx
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: log tx lock poisoned"))?
+                .clone();
 
             let port_u16 = self.port.min(65535) as u16;
             match spawn_server_instance(
@@ -268,8 +278,8 @@ impl ServerHandle {
                 &self.rate_limits,
                 &self.host,
                 port_u16,
-                &self.session_tx,
-                &self.log_tx,
+                &session_tx,
+                &log_tx,
                 &cert_pem,
                 &key_pem,
                 self.debug,
@@ -288,8 +298,8 @@ impl ServerHandle {
                         &self.rate_limits,
                         &self.host,
                         port_u16,
-                        &self.session_tx,
-                        &self.log_tx,
+                        &session_tx,
+                        &log_tx,
                         &old_cert,
                         &old_key,
                         self.debug,
@@ -326,6 +336,14 @@ impl ServerHandle {
             state.closed = true;
             state.shutdown_tx.take();
             crate::session_registry::close_all(0, b"server closing");
+            self.session_tx
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: session tx lock poisoned"))?
+                .take();
+            self.log_tx
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: log tx lock poisoned"))?
+                .take();
             Ok(())
         })?;
         let metrics = Arc::clone(&self.metrics);
