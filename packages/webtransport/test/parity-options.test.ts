@@ -59,10 +59,20 @@ describe("parity options (Phase 5)", () => {
 		});
 		const reader = wt.datagrams.readable.getReader({ mode: "byob" });
 		const writer = wt.datagrams.writable.getWriter();
-		await writer.write(new Uint8Array([1, 2, 3]));
+		await Promise.race([
+			writer.write(new Uint8Array([1, 2, 3])),
+			Bun.sleep(4000).then(() => {
+				throw new Error("timeout: datagram BYOB write");
+			}),
+		]);
 		writer.releaseLock();
 		const buf = new Uint8Array(128);
-		const { value, done } = await reader.read(buf);
+		const { value, done } = await Promise.race([
+			reader.read(buf),
+			Bun.sleep(4000).then(() => {
+				throw new Error("timeout: datagram BYOB read");
+			}),
+		]);
 		reader.releaseLock();
 		expect(done).toBe(false);
 		expect(value).toBeDefined();
@@ -70,7 +80,7 @@ describe("parity options (Phase 5)", () => {
 			new Uint8Array(value!.buffer, value!.byteOffset, value!.byteLength),
 		).toEqual(new Uint8Array([1, 2, 3]));
 		wt.close();
-	});
+	}, 15000);
 
 	test("datagramsReadableType 'bytes' BYOB buffer too small throws RangeError", async () => {
 		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
