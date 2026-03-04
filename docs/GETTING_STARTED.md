@@ -22,6 +22,15 @@ console.log("Server listening on port", server.address.port);
 // server.close() when shutting down
 ```
 
+## Runtime certificate rotation
+
+```ts
+await server.updateCert({
+  certPem: fs.readFileSync("next-cert.pem", "utf-8"),
+  keyPem: fs.readFileSync("next-key.pem", "utf-8"),
+});
+```
+
 ## Requirements
 
 - Bun >= 1.3.9, or Node, or Deno

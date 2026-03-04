@@ -122,6 +122,7 @@ export type LogEvent = {
 
 export interface WebTransportServer {
   readonly address: { host: string; port: number };
+  updateCert(tls: { certPem: string | Uint8Array; keyPem: string | Uint8Array }): Promise<void>;
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }

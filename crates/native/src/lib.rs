@@ -92,6 +92,7 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RATE_LIMIT_CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
 static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -350,12 +351,14 @@ pub(crate) fn spawn_wtransport_server(
 
     session_registry::set_limits(limits.clone());
 
-    RUNTIME.spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            rate_limit::cleanup_stale_entries(300.0);
-        }
+    RATE_LIMIT_CLEANUP_ONCE.call_once(|| {
+        RUNTIME.spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                rate_limit::cleanup_stale_entries(300.0);
+            }
+        });
     });
 
     RUNTIME.spawn(async move {

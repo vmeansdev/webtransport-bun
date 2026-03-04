@@ -79,6 +79,7 @@ describe("webtransport package exports", () => {
 		expect(server).toBeDefined();
 		expect(server.address).toBeDefined();
 		expect(server.address.port).toBe(4433);
+		expect(typeof server.updateCert).toBe("function");
 		expect(typeof server.close).toBe("function");
 	});
 

@@ -302,6 +302,11 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
+	/** Rotate server TLS certificate/key at runtime. Existing sessions are drained/closed. */
+	updateCert(tls: {
+		certPem: string | Uint8Array;
+		keyPem: string | Uint8Array;
+	}): Promise<void>;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -885,7 +890,7 @@ class NativeServerSession implements ServerSession {
  * Create an in-process WebTransport server.
  *
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
- * @returns WebTransportServer with `address`, `close()`, and `metricsSnapshot()`.
+ * @returns WebTransportServer with `address`, `updateCert()`, `close()`, and `metricsSnapshot()`.
  * @throws Error if native addon is not loaded.
  *
  * @example
@@ -1034,6 +1039,17 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
+		updateCert: async (tls) => {
+			const nextCertPem =
+				typeof tls.certPem === "string"
+					? tls.certPem
+					: new TextDecoder().decode(tls.certPem);
+			const nextKeyPem =
+				typeof tls.keyPem === "string"
+					? tls.keyPem
+					: new TextDecoder().decode(tls.keyPem);
+			await handle.updateCert(nextCertPem, nextKeyPem);
+		},
 		close: async () => {
 			await handle.close();
 			for (const [id, resolve] of closedResolvers) {

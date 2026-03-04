@@ -182,4 +182,64 @@ describe("TLS contract (P0.3)", () => {
 			await server.close();
 		}
 	}, 15000);
+
+	it("server.updateCert rotates identity and keeps server available", async () => {
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+
+		try {
+			const before = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			before.close();
+
+			await server.updateCert({
+				certPem: HAS_CERTS ? CERT_PEM : "",
+				keyPem: HAS_CERTS ? KEY_PEM : "",
+			});
+
+			const after = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			expect(after.id).toBeDefined();
+			after.close();
+		} finally {
+			await server.close();
+		}
+	}, 25000);
+
+	it("server.updateCert failure keeps server available via rollback", async () => {
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: HAS_CERTS ? CERT_PEM : "",
+				keyPem: HAS_CERTS ? KEY_PEM : "",
+			},
+			onSession: () => {},
+		});
+
+		try {
+			await expect(
+				server.updateCert({
+					certPem:
+						"-----BEGIN CERTIFICATE-----\n!!not-base64!!\n-----END CERTIFICATE-----",
+					keyPem:
+						"-----BEGIN PRIVATE KEY-----\n!!not-base64!!\n-----END PRIVATE KEY-----",
+				}),
+			).rejects.toThrow(/E_INTERNAL: certificate rotation failed/);
+
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			expect(client.id).toBeDefined();
+			client.close();
+		} finally {
+			await server.close();
+		}
+	}, 25000);
 });
