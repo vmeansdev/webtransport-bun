@@ -114,4 +114,48 @@ describe("parity options (Phase 5)", () => {
 				}),
 		).toThrow(/datagramsReadableType must be/);
 	});
+
+	test("waitUntilAvailable option waits for stream capacity on createBidirectionalStream", async () => {
+		const limitedPort = nextPort(16550, 1000);
+		const limitedServer = createServer({
+			port: limitedPort,
+			tls: { certPem: "", keyPem: "" },
+			limits: {
+				maxStreamsPerSessionBidi: 1,
+				maxStreamsGlobal: 50000,
+				backpressureTimeoutMs: 1500,
+			},
+			onSession: async (s) => {
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+		const wt = await openWTWithRetry(`https://127.0.0.1:${limitedPort}`, {
+			tls: { insecureSkipVerify: true },
+			limits: { backpressureTimeoutMs: 1500 },
+		});
+		try {
+			const first = await wt.createBidirectionalStream();
+			const secondPromise = wt.createBidirectionalStream({
+				waitUntilAvailable: true,
+			});
+			await Bun.sleep(100);
+			const writer = first.writable.getWriter();
+			await writer.close().catch(() => undefined);
+			writer.releaseLock();
+			const reader = first.readable.getReader();
+			await reader.cancel().catch(() => undefined);
+			reader.releaseLock();
+			const second = await Promise.race([
+				secondPromise,
+				Bun.sleep(2000).then(() => {
+					throw new Error("timeout waiting for waitUntilAvailable stream");
+				}),
+			]);
+			expect(second).toBeDefined();
+		} finally {
+			wt.close();
+			await limitedServer.close();
+		}
+	}, 15000);
 });

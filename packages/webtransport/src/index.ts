@@ -83,6 +83,9 @@ export type {
 import {
 	E_INTERNAL,
 	E_HANDSHAKE_TIMEOUT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_BACKPRESSURE_TIMEOUT,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
 	WebTransportError,
@@ -91,6 +94,7 @@ import type { ErrorCode } from "./errors.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
+type StreamOpenOptions = { waitUntilAvailable?: boolean };
 
 const E_CODE_RE = /E_[A-Z_]+/g;
 const SUPPRESS_LOG_CALLBACK_WARN =
@@ -172,6 +176,58 @@ function isSessionCloseError(err: unknown): boolean {
 		lower.includes("connection locally closed") ||
 		lower.includes("connection closed by peer")
 	);
+}
+
+function shouldRetryStreamOpen(err: unknown): boolean {
+	const mapped = toWebTransportError(err);
+	return (
+		mapped.code === E_LIMIT_EXCEEDED ||
+		mapped.code === E_QUEUE_FULL ||
+		mapped.code === E_BACKPRESSURE_TIMEOUT
+	);
+}
+
+function parseWaitUntilAvailable(options?: StreamOpenOptions): boolean {
+	const value = options?.waitUntilAvailable;
+	if (value === undefined) return false;
+	if (typeof value !== "boolean") {
+		throw new TypeError("waitUntilAvailable must be a boolean");
+	}
+	return value;
+}
+
+async function openStreamWithWait<T>(
+	openFn: () => Promise<T>,
+	options: StreamOpenOptions | undefined,
+	backpressureTimeoutMs: number,
+	isClosed: () => boolean,
+	strictW3CErrors?: boolean,
+): Promise<T> {
+	const waitUntilAvailable = parseWaitUntilAvailable(options);
+	if (!waitUntilAvailable) {
+		return openFn();
+	}
+	const timeoutMs = Math.max(1, backpressureTimeoutMs);
+	const deadline = Date.now() + timeoutMs;
+	while (true) {
+		if (isClosed()) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			return await openFn();
+		} catch (err) {
+			if (!shouldRetryStreamOpen(err)) {
+				throw toWebTransportError(err, strictW3CErrors);
+			}
+			if (Date.now() >= deadline) {
+				throw new WebTransportError(
+					E_BACKPRESSURE_TIMEOUT as ErrorCode,
+					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
+				);
+			}
+			await Bun.sleep(25);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -455,18 +511,18 @@ export interface ServerSession extends CommonSession {
 	readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
 	readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
 
-	createBidirectionalStream(): Promise<Duplex>;
-	createUnidirectionalStream(): Promise<Writable>;
+	createBidirectionalStream(options?: StreamOpenOptions): Promise<Duplex>;
+	createUnidirectionalStream(options?: StreamOpenOptions): Promise<Writable>;
 	metricsSnapshot(): SessionMetricsSnapshot;
 }
 
 /** Node client API session surface returned by connect(). */
 export interface ClientSession extends CommonSession {
 	// Streams
-	createBidirectionalStream(): Promise<Duplex>;
+	createBidirectionalStream(options?: StreamOpenOptions): Promise<Duplex>;
 	incomingBidirectionalStreams(): AsyncIterable<Duplex>;
 
-	createUnidirectionalStream(): Promise<Writable>;
+	createUnidirectionalStream(options?: StreamOpenOptions): Promise<Writable>;
 	incomingUnidirectionalStreams(): AsyncIterable<Readable>;
 
 	// Metrics (per session)
@@ -763,12 +819,18 @@ class NativeServerSession implements ServerSession {
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
+	#streamOpenWaitTimeoutMs: number;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
-	constructor(nativeHandle: any, closedPromise: Promise<CloseInfo>) {
+	constructor(
+		nativeHandle: any,
+		closedPromise: Promise<CloseInfo>,
+		streamOpenWaitTimeoutMs: number,
+	) {
 		this.#nativeHandle = nativeHandle;
+		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
 		this.#closedPromise = closedPromise.then((info) =>
 			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
 		);
@@ -829,11 +891,18 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
-	async createBidirectionalStream(): Promise<Duplex> {
+	async createBidirectionalStream(
+		options?: StreamOpenOptions,
+	): Promise<Duplex> {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeStream = await this.#nativeHandle.createBidiStream();
+			const nativeStream = (await openStreamWithWait(
+				() => this.#nativeHandle.createBidiStream(),
+				options,
+				this.#streamOpenWaitTimeoutMs,
+				() => this.#closed,
+			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
 				nativeHandle: nativeStream,
@@ -853,11 +922,18 @@ class NativeServerSession implements ServerSession {
 		return this.#incomingBidiCache;
 	}
 
-	async createUnidirectionalStream(): Promise<Writable> {
+	async createUnidirectionalStream(
+		options?: StreamOpenOptions,
+	): Promise<Writable> {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeStream = await this.#nativeHandle.createUniStream();
+			const nativeStream = (await openStreamWithWait(
+				() => this.#nativeHandle.createUniStream(),
+				options,
+				this.#streamOpenWaitTimeoutMs,
+				() => this.#closed,
+			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
 				nativeHandle: nativeStream,
@@ -926,7 +1002,8 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				? new TextDecoder().decode(opts.tls.caPem)
 				: "";
 
-	const limitsJson = JSON.stringify({ ...DEFAULT_LIMITS, ...opts.limits });
+	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
+	const limitsJson = JSON.stringify(mergedLimits);
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
 		...opts.rateLimits,
@@ -987,7 +1064,11 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 						evt.peerIp,
 						evt.peerPort,
 					);
-					const session = new NativeServerSession(nativeSession, closedPromise);
+					const session = new NativeServerSession(
+						nativeSession,
+						closedPromise,
+						mergedLimits.backpressureTimeoutMs,
+					);
 					activeOnSessionCallbacks++;
 					let maybePromise: void | Promise<void>;
 					try {
@@ -1080,12 +1161,14 @@ class NativeClientSession implements ClientSession {
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#strictW3CErrors: boolean;
+	#streamOpenWaitTimeoutMs: number;
 
 	constructor(
 		nativeHandle: any,
 		readyPromise: Promise<void>,
 		closedPromise: Promise<CloseInfo>,
 		strictW3CErrors = false,
+		streamOpenWaitTimeoutMs = DEFAULT_LIMITS.backpressureTimeoutMs,
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#readyPromise = readyPromise;
@@ -1093,6 +1176,7 @@ class NativeClientSession implements ClientSession {
 			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
 		);
 		this.#strictW3CErrors = strictW3CErrors;
+		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
 		this.#closedPromise.then(() => {
 			this.#closed = true;
 		});
@@ -1149,11 +1233,19 @@ class NativeClientSession implements ClientSession {
 		}
 	}
 
-	async createBidirectionalStream(): Promise<Duplex> {
+	async createBidirectionalStream(
+		options?: StreamOpenOptions,
+	): Promise<Duplex> {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeStream = await this.#nativeHandle.createBidiStream();
+			const nativeStream = (await openStreamWithWait(
+				() => this.#nativeHandle.createBidiStream(),
+				options,
+				this.#streamOpenWaitTimeoutMs,
+				() => this.#closed,
+				this.#strictW3CErrors,
+			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
 				nativeHandle: nativeStream,
@@ -1179,11 +1271,19 @@ class NativeClientSession implements ClientSession {
 		}
 	}
 
-	async createUnidirectionalStream(): Promise<Writable> {
+	async createUnidirectionalStream(
+		options?: StreamOpenOptions,
+	): Promise<Writable> {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeStream = await this.#nativeHandle.createUniStream();
+			const nativeStream = (await openStreamWithWait(
+				() => this.#nativeHandle.createUniStream(),
+				options,
+				this.#streamOpenWaitTimeoutMs,
+				() => this.#closed,
+				this.#strictW3CErrors,
+			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
 				nativeHandle: nativeStream,
@@ -1224,6 +1324,7 @@ function connectWithNative(
 	optsJson: string,
 	handshakeTimeout: number,
 	strictW3CErrors?: boolean,
+	streamOpenWaitTimeoutMs = DEFAULT_LIMITS.backpressureTimeoutMs,
 	setTimer: (cb: () => void, ms: number) => any = (cb, ms) =>
 		setTimeout(cb, ms),
 	clearTimer: (handle: any) => void = (handle) => clearTimeout(handle),
@@ -1311,6 +1412,7 @@ function connectWithNative(
 					Promise.resolve(),
 					closedPromise,
 					strictW3CErrors,
+					streamOpenWaitTimeoutMs,
 				),
 			);
 		});
@@ -1384,6 +1486,7 @@ export async function connect(
 		optsJson,
 		handshakeTimeout,
 		opts?.strictW3CErrors,
+		mergedLimits.backpressureTimeoutMs,
 	);
 }
 
@@ -1791,6 +1894,7 @@ export class WebTransport {
 	async createBidirectionalStream(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
+		waitUntilAvailable?: boolean;
 	}): Promise<{
 		readable: ReadableStream<Uint8Array>;
 		writable: WritableStream<Uint8Array>;
@@ -1804,7 +1908,7 @@ export class WebTransport {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		}
 		const s = await this.#sessionPromise;
-		const duplex = await s.createBidirectionalStream();
+		const duplex = await s.createBidirectionalStream(options);
 		return nodeDuplexToWebBidi(
 			duplex,
 			this.#sendScheduler,
@@ -1826,6 +1930,7 @@ export class WebTransport {
 	async createUnidirectionalStream(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
+		waitUntilAvailable?: boolean;
 	}): Promise<WritableStream<Uint8Array>> {
 		const policy = this._resolveSendPolicy(options);
 		if (
@@ -1836,7 +1941,7 @@ export class WebTransport {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		}
 		const s = await this.#sessionPromise;
-		const writable = await s.createUnidirectionalStream();
+		const writable = await s.createUnidirectionalStream(options);
 		return nodeWritableToWebWritable(
 			writable,
 			this.#sendScheduler,
@@ -1910,6 +2015,7 @@ export class WebTransport {
 	_resolveSendPolicy(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
+		waitUntilAvailable?: boolean;
 	}): SendPolicy {
 		const sendOrder = options?.sendOrder ?? 0;
 		if (!Number.isInteger(sendOrder)) {
@@ -2306,6 +2412,7 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 	return new NativeServerSession(
 		nativeHandle,
 		new Promise<CloseInfo>(() => {}),
+		DEFAULT_LIMITS.backpressureTimeoutMs,
 	);
 }
 

@@ -179,10 +179,10 @@ export interface CommonSession {
 
 export interface ServerSession extends CommonSession {
   // Streams
-  createBidirectionalStream(): Promise<Duplex>;
+  createBidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Duplex>;
   readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
 
-  createUnidirectionalStream(): Promise<Writable>;
+  createUnidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Writable>;
   readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
 
   // Metrics (per session)
@@ -191,10 +191,10 @@ export interface ServerSession extends CommonSession {
 
 export interface ClientSession extends CommonSession {
   // Streams
-  createBidirectionalStream(): Promise<Duplex>;
+  createBidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Duplex>;
   incomingBidirectionalStreams(): AsyncIterable<Duplex>;
 
-  createUnidirectionalStream(): Promise<Writable>;
+  createUnidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Writable>;
   incomingUnidirectionalStreams(): AsyncIterable<Readable>;
 
   // Metrics (per session)
