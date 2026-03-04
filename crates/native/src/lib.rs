@@ -636,6 +636,8 @@ pub(crate) fn spawn_wtransport_server(
                                                 connection.clone(),
                                                 metrics.clone(),
                                             );
+                                        let stream_capacity_notify =
+                                            session_registry::get_stream_capacity_notify(&id);
 
                                         if let Some(ref tx) = stx {
                                             if tx
@@ -669,6 +671,7 @@ pub(crate) fn spawn_wtransport_server(
                                         // Bidi stream accept loop: forward to JS via channel (4.4.2: shed if over limits)
                                         let peer_ip_bidi = peer_ip.clone();
                                         let rl_bidi = rate_limits.clone();
+                                        let stream_capacity_notify_bidi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -697,9 +700,13 @@ pub(crate) fn spawn_wtransport_server(
                                                             sm_bidi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
                                                             let guard_m = Arc::clone(&m_bidi);
                                                             let guard_sm = Arc::clone(&sm_bidi);
+                                                            let notify = stream_capacity_notify_bidi.clone();
                                                             let guard = crate::client_stream::StreamGuard::new(move || {
                                                                 guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                 guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
+                                                                if let Some(ref n) = notify {
+                                                                    n.notify_waiters();
+                                                                }
                                                             });
                                                             let stream_queued = Arc::new(AtomicU64::new(0));
                                                             let budget = crate::client_stream::StreamBudget {
@@ -724,6 +731,7 @@ pub(crate) fn spawn_wtransport_server(
                                         // Uni stream accept loop: forward to JS via channel (4.4.2; P1-5)
                                         let peer_ip_uni = peer_ip.clone();
                                         let rl_uni = rate_limits.clone();
+                                        let stream_capacity_notify_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -752,9 +760,13 @@ pub(crate) fn spawn_wtransport_server(
                                                             sm_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
                                                             let guard_m = Arc::clone(&m_uni);
                                                             let guard_sm = Arc::clone(&sm_uni);
+                                                            let notify = stream_capacity_notify_uni.clone();
                                                             let guard = crate::client_stream::StreamGuard::new(move || {
                                                                 guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                 guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
+                                                                if let Some(ref n) = notify {
+                                                                    n.notify_waiters();
+                                                                }
                                                             });
                                                             let stream_queued = Arc::new(AtomicU64::new(0));
                                                             let budget = crate::client_stream::StreamBudget {
@@ -781,6 +793,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let m_create_bi = Arc::clone(&metrics);
                                         let sm_create_bi = Arc::clone(&session_metrics);
                                         let lim_create_bi = limits.clone();
+                                        let stream_capacity_notify_create_bi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_bi.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -808,9 +821,13 @@ pub(crate) fn spawn_wtransport_server(
                                                                 sm_create_bi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
                                                                 let guard_m = Arc::clone(&m_create_bi);
                                                                 let guard_sm = Arc::clone(&sm_create_bi);
+                                                                let notify = stream_capacity_notify_create_bi.clone();
                                                                 let guard = crate::client_stream::StreamGuard::new(move || {
                                                                     guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                     guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
+                                                                    if let Some(ref n) = notify {
+                                                                        n.notify_waiters();
+                                                                    }
                                                                 });
                                                                 let stream_queued = Arc::new(AtomicU64::new(0));
                                                                 let budget = crate::client_stream::StreamBudget {
@@ -842,6 +859,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let m_create_uni = Arc::clone(&metrics);
                                         let sm_create_uni = Arc::clone(&session_metrics);
                                         let lim_create_uni = limits.clone();
+                                        let stream_capacity_notify_create_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -870,9 +888,13 @@ pub(crate) fn spawn_wtransport_server(
                                                                     sm_create_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
                                                                     let guard_m = Arc::clone(&m_create_uni);
                                                                     let guard_sm = Arc::clone(&sm_create_uni);
+                                                                    let notify = stream_capacity_notify_create_uni.clone();
                                                                     let guard = crate::client_stream::StreamGuard::new(move || {
                                                                         guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                         guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
+                                                                        if let Some(ref n) = notify {
+                                                                            n.notify_waiters();
+                                                                        }
                                                                     });
                                                                     let stream_queued = Arc::new(AtomicU64::new(0));
                                                                     let budget = crate::client_stream::StreamBudget {

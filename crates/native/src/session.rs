@@ -6,6 +6,7 @@ use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUn
 use crate::panic_guard;
 use crate::session_registry;
 use crate::RUNTIME;
+use tokio::time::{Duration, Instant};
 
 #[napi]
 pub struct SessionHandle {
@@ -16,6 +17,50 @@ pub struct SessionHandle {
 
 #[napi]
 impl SessionHandle {
+    async fn wait_capacity_with_timeout(
+        id: String,
+        timeout_ms: u32,
+        kind: &'static str,
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        loop {
+            let Some((_, _, metrics, _, _, _, _)) = session_registry::get(&id) else {
+                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+            };
+            let Some(sm) = session_registry::get_session_metrics(&id) else {
+                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+            };
+            let limits = session_registry::get_limits();
+            let global_ok =
+                metrics.streams_active.load(Ordering::Relaxed) < limits.max_streams_global;
+            let kind_ok = match kind {
+                "bidi" => {
+                    sm.streams_bidi_active.load(Ordering::Relaxed)
+                        < limits.max_streams_per_session_bidi
+                }
+                "uni" => {
+                    sm.streams_uni_active.load(Ordering::Relaxed)
+                        < limits.max_streams_per_session_uni
+                }
+                _ => false,
+            };
+            if global_ok && kind_ok {
+                return Ok(());
+            }
+            let Some(notify) = session_registry::get_stream_capacity_notify(&id) else {
+                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+            }
+            let remain = deadline.saturating_duration_since(now);
+            tokio::time::timeout(remain, notify.notified())
+                .await
+                .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?;
+        }
+    }
+
     #[napi(constructor)]
     pub fn new(id: String, peer_ip: String, peer_port: u32) -> Self {
         Self {
@@ -173,6 +218,15 @@ impl SessionHandle {
     }
 
     #[napi]
+    pub async fn wait_bidi_capacity(&self, timeout_ms: u32) -> Result<()> {
+        let id = self.id.clone();
+        RUNTIME
+            .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "bidi").await })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+    }
+
+    #[napi]
     pub async fn accept_bidi_stream(&self) -> Result<Option<ClientBidiStreamHandle>> {
         let id = self.id.clone();
         let Some((_, _, _, bidi_rx, _, _, _)) = session_registry::get(&id) else {
@@ -206,6 +260,15 @@ impl SessionHandle {
                 }
                 result
             })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+    }
+
+    #[napi]
+    pub async fn wait_uni_capacity(&self, timeout_ms: u32) -> Result<()> {
+        let id = self.id.clone();
+        RUNTIME
+            .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "uni").await })
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?
     }

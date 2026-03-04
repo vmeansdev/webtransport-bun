@@ -202,6 +202,7 @@ async function openStreamWithWait<T>(
 	options: StreamOpenOptions | undefined,
 	backpressureTimeoutMs: number,
 	isClosed: () => boolean,
+	waitForCapacity?: (remainingMs: number) => Promise<void>,
 	strictW3CErrors?: boolean,
 ): Promise<T> {
 	const waitUntilAvailable = parseWaitUntilAvailable(options);
@@ -228,9 +229,13 @@ async function openStreamWithWait<T>(
 				);
 			}
 			const remaining = Math.max(0, deadline - Date.now());
-			const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
-			await Bun.sleep(sleepMs);
-			backoffMs = Math.min(backoffMs * 2, 64);
+			if (waitForCapacity) {
+				await waitForCapacity(Math.max(1, remaining));
+			} else {
+				const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
+				await Bun.sleep(sleepMs);
+				backoffMs = Math.min(backoffMs * 2, 64);
+			}
 		}
 	}
 }
@@ -909,6 +914,9 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
+				typeof this.#nativeHandle.waitBidiCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
+					: undefined,
 			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
@@ -940,6 +948,9 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
+				typeof this.#nativeHandle.waitUniCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
+					: undefined,
 			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1261,6 +1272,7 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
+				undefined,
 				this.#strictW3CErrors,
 			)) as any;
 			return new BidiStream({
@@ -1299,6 +1311,7 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
+				undefined,
 				this.#strictW3CErrors,
 			)) as any;
 			return new SendStream({

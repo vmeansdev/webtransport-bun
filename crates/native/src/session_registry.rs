@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use wtransport::Connection;
 
 use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
@@ -57,6 +57,8 @@ pub struct SessionState {
     pub create_bi_tx: mpsc::Sender<CreateBiReq>,
     /// Sender for create-uni requests.
     pub create_uni_tx: mpsc::Sender<CreateUniReq>,
+    /// Notifies waiters when stream capacity may have changed.
+    pub stream_capacity_notify: Arc<Notify>,
 }
 
 static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
@@ -92,6 +94,7 @@ pub fn insert(
     let (create_bi_tx, create_bi_rx) = mpsc::channel(64);
     let (create_uni_tx, create_uni_rx) = mpsc::channel(64);
     let session_metrics = Arc::new(SessionMetrics::default());
+    let stream_capacity_notify = Arc::new(Notify::new());
     let state = SessionState {
         conn,
         dgram_rx: Arc::new(Mutex::new(dgram_rx)),
@@ -101,6 +104,7 @@ pub fn insert(
         uni_accept_rx: Arc::new(Mutex::new(uni_accept_rx)),
         create_bi_tx,
         create_uni_tx,
+        stream_capacity_notify,
     };
     REGISTRY.insert(session_id, state);
     (
@@ -111,6 +115,12 @@ pub fn insert(
         create_uni_rx,
         session_metrics,
     )
+}
+
+pub fn get_stream_capacity_notify(session_id: &str) -> Option<Arc<Notify>> {
+    REGISTRY
+        .get(session_id)
+        .map(|entry| Arc::clone(&entry.stream_capacity_notify))
 }
 
 /// Look up session state by id. Returns None if not found or session closed.
@@ -141,7 +151,9 @@ pub fn get(
 
 /// Remove session from registry. Call when connection closes.
 pub fn remove(session_id: &str) {
-    REGISTRY.remove(session_id);
+    if let Some((_, state)) = REGISTRY.remove(session_id) {
+        state.stream_capacity_notify.notify_waiters();
+    }
 }
 
 /// Get per-session metrics by session id. Returns None if session not found.
@@ -156,6 +168,7 @@ pub fn get_session_metrics(session_id: &str) -> Option<Arc<SessionMetrics>> {
 /// which unblocks iterators and bridge tasks.
 pub fn close_session(session_id: &str, code: u32, reason: &[u8]) {
     if let Some((_, state)) = REGISTRY.remove(session_id) {
+        state.stream_capacity_notify.notify_waiters();
         state.conn.close(wtransport::VarInt::from_u32(code), reason);
     }
 }
@@ -165,6 +178,7 @@ pub fn close_all(code: u32, reason: &[u8]) {
     let keys: Vec<String> = REGISTRY.iter().map(|e| e.key().clone()).collect();
     for key in keys {
         if let Some((_, state)) = REGISTRY.remove(&key) {
+            state.stream_capacity_notify.notify_waiters();
             state.conn.close(wtransport::VarInt::from_u32(code), reason);
         }
     }
