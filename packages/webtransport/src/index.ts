@@ -81,6 +81,7 @@ export type {
 } from "./errors.js";
 
 import {
+	E_TLS,
 	E_INTERNAL,
 	E_HANDSHAKE_TIMEOUT,
 	E_LIMIT_EXCEEDED,
@@ -209,6 +210,7 @@ async function openStreamWithWait<T>(
 	}
 	const timeoutMs = Math.max(1, backpressureTimeoutMs);
 	const deadline = Date.now() + timeoutMs;
+	let backoffMs = 2;
 	while (true) {
 		if (isClosed()) {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
@@ -225,7 +227,10 @@ async function openStreamWithWait<T>(
 					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
 				);
 			}
-			await Bun.sleep(25);
+			const remaining = Math.max(0, deadline - Date.now());
+			const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
+			await Bun.sleep(sleepMs);
+			backoffMs = Math.min(backoffMs * 2, 64);
 		}
 	}
 }
@@ -244,6 +249,8 @@ export type TlsOptions = {
 	caPem?: string | Uint8Array;
 	/** SNI for client mode; for server, used in logs/metrics. */
 	serverName?: string;
+	/** When true, allow empty cert/key fallback in production (dev only). */
+	allowSelfSigned?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1002,16 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		typeof opts.tls.keyPem === "string"
 			? opts.tls.keyPem
 			: new TextDecoder().decode(opts.tls.keyPem);
+	if (
+		process.env.NODE_ENV === "production" &&
+		opts.tls.allowSelfSigned !== true &&
+		(certPem.trim().length === 0 || keyPem.trim().length === 0)
+	) {
+		throw new WebTransportError(
+			E_TLS as ErrorCode,
+			"E_TLS: empty certPem/keyPem is not allowed in production (set tls.allowSelfSigned=true to override)",
+		);
+	}
 	const caPem =
 		typeof opts.tls.caPem === "string"
 			? opts.tls.caPem

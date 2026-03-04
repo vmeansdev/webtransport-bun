@@ -66,6 +66,8 @@ export type TlsOptions = {
   /** Not supported for server. Passing caPem to createServer rejects with E_TLS. */
   caPem?: string | Uint8Array;
   serverName?: string; // for server: used in logs/metrics only; for client: SNI override
+  /** Production guard override for empty cert/key fallback. */
+  allowSelfSigned?: boolean;
 };
 
 export type RateLimitOptions = {

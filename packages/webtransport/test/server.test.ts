@@ -116,4 +116,35 @@ describe("webtransport package exports", () => {
 			await server.close();
 		}
 	});
+
+	it("createServer rejects empty cert/key in production by default", () => {
+		const prev = process.env.NODE_ENV;
+		process.env.NODE_ENV = "production";
+		try {
+			expect(() =>
+				createServer({
+					port: 4435,
+					tls: { certPem: "", keyPem: "" },
+					onSession: () => {},
+				}),
+			).toThrow(/empty certPem\/keyPem is not allowed in production/);
+		} finally {
+			process.env.NODE_ENV = prev;
+		}
+	});
+
+	it("createServer allows empty cert/key in production when allowSelfSigned=true", async () => {
+		const prev = process.env.NODE_ENV;
+		process.env.NODE_ENV = "production";
+		try {
+			const server = createServer({
+				port: 4436,
+				tls: { certPem: "", keyPem: "", allowSelfSigned: true },
+				onSession: () => {},
+			});
+			await server.close();
+		} finally {
+			process.env.NODE_ENV = prev;
+		}
+	});
 });

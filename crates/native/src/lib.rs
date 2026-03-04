@@ -171,6 +171,20 @@ pub(crate) fn report_channel_failure(context: &str) {
     eprintln!("webtransport-native: {} channel delivery failed", context);
 }
 
+pub(crate) fn report_channel_closed(context: &str) {
+    #[cfg(test)]
+    {
+        CHANNEL_DELIVERY_FAILURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var("WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("webtransport-native: {} channel closed (expected)", context);
+    }
+}
+
 fn send_startup_result(
     startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
     res: std::result::Result<(), String>,
@@ -699,7 +713,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
                                                             if bidi_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_failure("bidi accept");
+                                                                report_channel_closed("bidi accept");
                                                                 break;
                                                             }
                                                         }
@@ -754,7 +768,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
                                                             if uni_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_failure("uni accept");
+                                                                report_channel_closed("uni accept");
                                                                 break;
                                                             }
                                                         }
