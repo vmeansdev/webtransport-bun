@@ -100,7 +100,10 @@ describe("acceptance (Task gates)", () => {
 				received++;
 			}
 			expect(received).toBe(10);
-
+			const streamsSeen = await waitUntil(() => streamsAccepted >= 5, 3000);
+			const datagramsSeen = await waitUntil(() => datagramsEchoed >= 10, 3000);
+			expect(streamsSeen).toBe(true);
+			expect(datagramsSeen).toBe(true);
 			expect(streamsAccepted).toBe(5);
 			expect(datagramsEchoed).toBeGreaterThanOrEqual(10);
 		} finally {
