@@ -93,6 +93,10 @@ import type { ErrorCode } from "./errors.js";
 type BufferSource = ArrayBuffer | ArrayBufferView;
 
 const E_CODE_RE = /E_[A-Z_]+/g;
+const SUPPRESS_LOG_CALLBACK_WARN =
+	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
+const SUPPRESS_READY_REJECTION_WARN =
+	process.env.WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN === "1";
 
 /**
  * Maps known validation/connect failures to browser-style DOMException names.
@@ -932,8 +936,10 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		try {
 			opts.log(event);
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.warn(`[webtransport] log callback failed: ${msg}`);
+			if (!SUPPRESS_LOG_CALLBACK_WARN) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(`[webtransport] log callback failed: ${msg}`);
+			}
 		}
 	};
 
@@ -1865,10 +1871,12 @@ export class WebTransport {
 		} else {
 			// Still connecting: absorb eventual connect failure to prevent unhandled rejection (S4).
 			this.#ready.catch((err) => {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.warn(
-					`[webtransport] ready rejection observed after close() during connect: ${msg}`,
-				);
+				if (!SUPPRESS_READY_REJECTION_WARN) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.warn(
+						`[webtransport] ready rejection observed after close() during connect: ${msg}`,
+					);
+				}
 			});
 		}
 	}

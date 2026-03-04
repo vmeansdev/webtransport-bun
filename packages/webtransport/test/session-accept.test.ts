@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { connect, createServer } from "../src/index.js";
+import { connect, createServer, WebTransport } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
 async function connectWithRetry(
@@ -35,6 +35,27 @@ async function waitUntil(
 		await Bun.sleep(intervalMs);
 	}
 	return condition();
+}
+
+async function openWTWithRetry(
+	url: string,
+	opts: ConstructorParameters<typeof WebTransport>[1],
+	timeoutMs = 10000,
+): Promise<WebTransport> {
+	const deadline = Date.now() + timeoutMs;
+	let lastErr: unknown;
+	while (Date.now() < deadline) {
+		const wt = new WebTransport(url, opts);
+		try {
+			await wt.ready;
+			return wt;
+		} catch (err) {
+			lastErr = err;
+			wt.close();
+			await Bun.sleep(100);
+		}
+	}
+	throw lastErr ?? new Error("openWTWithRetry: timed out");
 }
 
 describe("session accept (P0-A)", () => {
@@ -159,4 +180,91 @@ describe("session accept (P0-A)", () => {
 			await server.close();
 		}
 	}, 120000);
+
+	it("writer.close before read still preserves session close code/reason", async () => {
+		const port = nextPort(23440, 2000);
+		const sessions: any[] = [];
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: (s) => {
+				sessions.push(s);
+				void (async () => {
+					for await (const duplex of s.incomingBidirectionalStreams) {
+						void (async () => {
+							const reader = duplex.readable.getReader();
+							const chunks: Uint8Array[] = [];
+							while (true) {
+								const { done, value } = await Promise.race([
+									reader.read(),
+									Bun.sleep(4000).then(() => ({
+										done: true,
+										value: undefined,
+									})),
+								]);
+								if (done) break;
+								if (!value) break;
+								chunks.push(value);
+							}
+							const writer = duplex.writable.getWriter();
+							if (chunks.length > 0) {
+								await writer.write(
+									Buffer.concat(chunks.map((c) => Buffer.from(c))),
+								);
+							}
+							await writer.close();
+						})().catch(() => {});
+					}
+				})().catch(() => {});
+			},
+		});
+
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const accepted = await waitUntil(() => sessions.length >= 1, 8000);
+			expect(accepted).toBe(true);
+			const serverClosedPromise = sessions[0].closed;
+
+			const { readable, writable } = await wt.createBidirectionalStream();
+			const writer = writable.getWriter();
+			await writer.write(new Uint8Array([1, 2, 3, 4]));
+			await writer.ready;
+			await writer.close();
+
+			const reader = readable.getReader();
+			const readResult = await Promise.race([
+				reader.read(),
+				Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
+			]);
+			expect(readResult.done).toBe(false);
+			expect(
+				new Uint8Array(
+					readResult.value!.buffer,
+					readResult.value!.byteOffset,
+					readResult.value!.byteLength,
+				),
+			).toEqual(new Uint8Array([1, 2, 3, 4]));
+			reader.releaseLock();
+
+			wt.close({ closeCode: 4999, reason: "Done streaming." });
+			const clientCloseInfo = await Promise.race([
+				wt.closed,
+				Bun.sleep(5000).then(() => ({ closeCode: -1, reason: "timeout" })),
+			]);
+			expect((clientCloseInfo as any).closeCode).toBe(4999);
+			expect((clientCloseInfo as any).reason).toBe("Done streaming.");
+
+			const serverCloseInfo = await Promise.race([
+				serverClosedPromise,
+				Bun.sleep(5000).then(() => ({ code: -1, reason: "timeout" })),
+			]);
+			expect((serverCloseInfo as any).code).toBe(4999);
+			expect((serverCloseInfo as any).reason).toBe("Done streaming.");
+		} finally {
+			wt.close();
+			await server.close();
+		}
+	}, 30000);
 });

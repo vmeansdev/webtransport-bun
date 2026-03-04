@@ -35,6 +35,14 @@ export type StopSendable = { [WT_STOP_SENDING](code?: number): void };
 // Internal handle type (opaque id referencing native StreamHandle)
 // ---------------------------------------------------------------------------
 type StreamHandleId = number;
+const DEFAULT_STRICT_STREAM_ERRORS =
+	process.env.WEBTRANSPORT_STRICT_STREAM_ERRORS === "1";
+const SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS =
+	process.env.WEBTRANSPORT_SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS === "1";
+
+function normalizeError(err: unknown): Error {
+	return err instanceof Error ? err : new Error(String(err));
+}
 
 // ---------------------------------------------------------------------------
 // Bidi stream (Duplex)
@@ -43,12 +51,14 @@ type StreamHandleId = number;
 export interface BidiStreamOptions extends DuplexOptions {
 	handleId: StreamHandleId;
 	nativeHandle?: any;
+	strictStreamErrors?: boolean;
 }
 
 export class BidiStream extends Duplex implements Resettable, StopSendable {
 	private readonly _handleId: StreamHandleId;
 	#nativeHandle: any;
 	#destroyed = false;
+	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
 
 	constructor(opts: BidiStreamOptions) {
 		super({
@@ -60,6 +70,21 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		});
 		this._handleId = opts.handleId;
 		this.#nativeHandle = opts.nativeHandle;
+		this.#strictStreamErrors =
+			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		this.on("error", (err) => {
+			if (this.listenerCount("error") > 1) return;
+			const e = normalizeError(err);
+			if (!SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS) {
+				console.warn(
+					`[webtransport] unhandled bidi stream error: ${e.message}`,
+				);
+			}
+			if (this.#strictStreamErrors)
+				queueMicrotask(() => {
+					throw e;
+				});
+		});
 	}
 
 	// -- Node stream overrides -----------------------
@@ -94,8 +119,29 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	}
 
 	override _final(callback: (error?: Error | null) => void): void {
-		this.#nativeHandle?.finish?.();
-		callback();
+		const h = this.#nativeHandle;
+		if (!h || this.#destroyed) {
+			callback();
+			return;
+		}
+		try {
+			const finishFn = h.finishWait ?? h.finish;
+			if (typeof finishFn !== "function") {
+				callback();
+				return;
+			}
+			const ret = finishFn.call(h);
+			if (ret && typeof ret.then === "function") {
+				ret.then(
+					() => callback(),
+					(err: Error) => callback(err),
+				);
+				return;
+			}
+			callback();
+		} catch (err) {
+			callback(err as Error);
+		}
 	}
 
 	override _destroy(
@@ -104,13 +150,15 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	): void {
 		if (!this.#destroyed) {
 			this.#destroyed = true;
-			try {
-				this.#nativeHandle?.reset?.(0);
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.warn(
-					`[webtransport] bidi stream reset on destroy failed: ${msg}`,
-				);
+			if (error) {
+				try {
+					this.#nativeHandle?.reset?.(0);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.warn(
+						`[webtransport] bidi stream reset on destroy failed: ${msg}`,
+					);
+				}
 			}
 			this.#nativeHandle = null;
 		}
@@ -136,12 +184,14 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 export interface SendStreamOptions extends WritableOptions {
 	handleId: StreamHandleId;
 	nativeHandle?: any;
+	strictStreamErrors?: boolean;
 }
 
 export class SendStream extends Writable implements Resettable {
 	private readonly _handleId: StreamHandleId;
 	#nativeHandle: any;
 	#destroyed = false;
+	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
 
 	constructor(opts: SendStreamOptions) {
 		super({
@@ -151,6 +201,21 @@ export class SendStream extends Writable implements Resettable {
 		});
 		this._handleId = opts.handleId;
 		this.#nativeHandle = opts.nativeHandle;
+		this.#strictStreamErrors =
+			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		this.on("error", (err) => {
+			if (this.listenerCount("error") > 1) return;
+			const e = normalizeError(err);
+			if (!SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS) {
+				console.warn(
+					`[webtransport] unhandled unidirectional send stream error: ${e.message}`,
+				);
+			}
+			if (this.#strictStreamErrors)
+				queueMicrotask(() => {
+					throw e;
+				});
+		});
 	}
 
 	override _write(
@@ -169,8 +234,29 @@ export class SendStream extends Writable implements Resettable {
 	}
 
 	override _final(callback: (error?: Error | null) => void): void {
-		this.#nativeHandle?.finish?.();
-		callback();
+		const h = this.#nativeHandle;
+		if (!h || this.#destroyed) {
+			callback();
+			return;
+		}
+		try {
+			const finishFn = h.finishWait ?? h.finish;
+			if (typeof finishFn !== "function") {
+				callback();
+				return;
+			}
+			const ret = finishFn.call(h);
+			if (ret && typeof ret.then === "function") {
+				ret.then(
+					() => callback(),
+					(err: Error) => callback(err),
+				);
+				return;
+			}
+			callback();
+		} catch (err) {
+			callback(err as Error);
+		}
 	}
 
 	override _destroy(
@@ -179,13 +265,15 @@ export class SendStream extends Writable implements Resettable {
 	): void {
 		if (!this.#destroyed) {
 			this.#destroyed = true;
-			try {
-				this.#nativeHandle?.reset?.(0);
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.warn(
-					`[webtransport] unidirectional send stream reset on destroy failed: ${msg}`,
-				);
+			if (error) {
+				try {
+					this.#nativeHandle?.reset?.(0);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.warn(
+						`[webtransport] unidirectional send stream reset on destroy failed: ${msg}`,
+					);
+				}
 			}
 			this.#nativeHandle = null;
 		}
@@ -205,12 +293,14 @@ export class SendStream extends Writable implements Resettable {
 export interface RecvStreamOptions extends ReadableOptions {
 	handleId: StreamHandleId;
 	nativeHandle?: any;
+	strictStreamErrors?: boolean;
 }
 
 export class RecvStream extends Readable implements StopSendable {
 	private readonly _handleId: StreamHandleId;
 	#nativeHandle: any;
 	#destroyed = false;
+	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
 
 	constructor(opts: RecvStreamOptions) {
 		super({
@@ -220,6 +310,21 @@ export class RecvStream extends Readable implements StopSendable {
 		});
 		this._handleId = opts.handleId;
 		this.#nativeHandle = opts.nativeHandle;
+		this.#strictStreamErrors =
+			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		this.on("error", (err) => {
+			if (this.listenerCount("error") > 1) return;
+			const e = normalizeError(err);
+			if (!SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS) {
+				console.warn(
+					`[webtransport] unhandled unidirectional recv stream error: ${e.message}`,
+				);
+			}
+			if (this.#strictStreamErrors)
+				queueMicrotask(() => {
+					throw e;
+				});
+		});
 	}
 
 	override _read(_size: number): void {
@@ -242,13 +347,15 @@ export class RecvStream extends Readable implements StopSendable {
 	): void {
 		if (!this.#destroyed) {
 			this.#destroyed = true;
-			try {
-				this.#nativeHandle?.stopSending?.(0);
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.warn(
-					`[webtransport] unidirectional recv stream stopSending on destroy failed: ${msg}`,
-				);
+			if (error) {
+				try {
+					this.#nativeHandle?.stopSending?.(0);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.warn(
+						`[webtransport] unidirectional recv stream stopSending on destroy failed: ${msg}`,
+					);
+				}
 			}
 			this.#nativeHandle = null;
 		}
