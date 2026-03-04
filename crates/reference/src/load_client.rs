@@ -21,6 +21,23 @@ const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
 
+fn parse_or_default<T>(flag: &str, raw: Option<String>, default: T) -> T
+where
+    T: std::str::FromStr + Copy,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    match raw {
+        Some(v) => match v.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("load-client: invalid value for {flag} ('{v}'): {e}; using default");
+                default
+            }
+        },
+        None => default,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut url = DEFAULT_URL.to_string();
@@ -36,46 +53,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match arg.as_str() {
             "--url" => url = args.next().unwrap_or_else(|| DEFAULT_URL.to_string()),
             "--sessions" => {
-                sessions = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_SESSIONS)
+                sessions = parse_or_default("--sessions", args.next(), DEFAULT_SESSIONS)
             }
             "--duration" => {
-                duration_secs = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_DURATION_SECS)
+                duration_secs = parse_or_default("--duration", args.next(), DEFAULT_DURATION_SECS)
             }
             "--datagrams-per-sec" => {
-                datagrams_per_sec = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_DATAGRAMS_PER_SEC)
+                datagrams_per_sec = parse_or_default(
+                    "--datagrams-per-sec",
+                    args.next(),
+                    DEFAULT_DATAGRAMS_PER_SEC,
+                )
             }
             "--streams-per-sec" => {
-                streams_per_sec = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_STREAMS_PER_SEC)
+                streams_per_sec =
+                    parse_or_default("--streams-per-sec", args.next(), DEFAULT_STREAMS_PER_SEC)
             }
             "--max-session-errors" => {
-                max_session_errors = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_MAX_SESSION_ERRORS)
+                max_session_errors = parse_or_default(
+                    "--max-session-errors",
+                    args.next(),
+                    DEFAULT_MAX_SESSION_ERRORS,
+                )
             }
             "--max-datagram-errors" => {
-                max_datagram_errors = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_MAX_DATAGRAM_ERRORS)
+                max_datagram_errors = parse_or_default(
+                    "--max-datagram-errors",
+                    args.next(),
+                    DEFAULT_MAX_DATAGRAM_ERRORS,
+                )
             }
             "--max-stream-errors" => {
-                max_stream_errors = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_MAX_STREAM_ERRORS)
+                max_stream_errors = parse_or_default(
+                    "--max-stream-errors",
+                    args.next(),
+                    DEFAULT_MAX_STREAM_ERRORS,
+                )
             }
             _ => {}
         }
@@ -168,8 +181,9 @@ async fn run(
                     )
                     .await;
                 }
-                Err(_) => {
+                Err(e) => {
                     counters.sessions_err.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("load-client: session connect failed: {e}");
                 }
             }
         });
@@ -275,12 +289,14 @@ async fn run_session(
                                 counters.streams_opened.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             counters.streams_err.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("load-client: open_uni await failed: {e}");
                         }
                     },
-                    Err(_) => {
+                    Err(e) => {
                         counters.streams_err.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("load-client: open_uni failed: {e}");
                     }
                 }
             }
@@ -289,4 +305,27 @@ async fn run_session(
     // Shutdown state machine: stop (loop exited) → close → wait-for-closed (timeout).
     conn.close(0u32.into(), b"load test done");
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_or_default;
+
+    #[test]
+    fn parse_or_default_parses_valid_integer() {
+        let parsed: usize = parse_or_default("--sessions", Some("42".to_string()), 100);
+        assert_eq!(parsed, 42);
+    }
+
+    #[test]
+    fn parse_or_default_falls_back_on_invalid_integer() {
+        let parsed: usize = parse_or_default("--sessions", Some("not-a-number".to_string()), 100);
+        assert_eq!(parsed, 100);
+    }
+
+    #[test]
+    fn parse_or_default_falls_back_on_missing_value() {
+        let parsed: u64 = parse_or_default("--duration", None, 30);
+        assert_eq!(parsed, 30);
+    }
 }

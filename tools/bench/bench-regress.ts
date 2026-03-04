@@ -20,7 +20,8 @@ async function runStreamBench(): Promise<{ throughput_mbps: number } | null> {
 	if (!line) return null;
 	try {
 		return JSON.parse(line) as { throughput_mbps: number };
-	} catch {
+	} catch (err) {
+		console.warn("bench-regress: failed to parse benchmark output:", err);
 		return null;
 	}
 }

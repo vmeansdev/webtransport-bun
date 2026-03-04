@@ -29,6 +29,7 @@ async function getMetrics(): Promise<{
 			limitExceededCount: j.limitExceededCount ?? 0,
 		};
 	} catch (e) {
+		console.warn("overload-session: failed to fetch metrics snapshot:", e);
 		return null;
 	}
 }
@@ -44,7 +45,9 @@ async function main() {
 		)) {
 			if (p) await $`kill -9 ${p}`.quiet().nothrow();
 		}
-	} catch {}
+	} catch (err) {
+		console.warn("overload-session: port cleanup failed:", err);
+	}
 	await Bun.sleep(1500);
 	await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bins`.quiet();
 
@@ -62,7 +65,8 @@ async function main() {
 		try {
 			const res = await fetch("http://127.0.0.1:4434");
 			if (res.ok) break;
-		} catch {
+		} catch (err) {
+			console.warn("overload-session: health check attempt failed:", err);
 			await Bun.sleep(200);
 		}
 		if (i === 29) {

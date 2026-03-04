@@ -16,7 +16,8 @@ export function getCertHashBase64(): string {
 	try {
 		const cert = new X509Certificate(readFileSync(certPath, "utf-8"));
 		return createHash("sha256").update(cert.raw).digest("base64");
-	} catch {
+	} catch (err) {
+		console.warn("cert-hash: failed to compute certificate hash:", err);
 		return "";
 	}
 }
@@ -27,7 +28,8 @@ export function getSpkiHashBase64(): string {
 		const cert = new X509Certificate(readFileSync(certPath, "utf-8"));
 		const spki = cert.publicKey.export({ type: "spki", format: "der" });
 		return createHash("sha256").update(spki).digest("base64");
-	} catch {
+	} catch (err) {
+		console.warn("cert-hash: failed to compute SPKI hash:", err);
 		return "";
 	}
 }

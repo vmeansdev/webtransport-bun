@@ -56,6 +56,18 @@ type OpenUniReq = oneshot::Sender<std::result::Result<ClientUniSendHandle, Strin
 type AcceptBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
 type AcceptUniReq = oneshot::Sender<std::result::Result<ClientUniRecvHandle, String>>;
 
+fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Limits, String> {
+    let parsed: serde_json::Value = serde_json::from_str(opts_json)
+        .map_err(|e| format!("E_INTERNAL: invalid client options JSON: {}", e))?;
+    if let Some(limits) = parsed.get("limits") {
+        let s = serde_json::to_string(limits)
+            .map_err(|e| format!("E_INTERNAL: invalid limits payload: {}", e))?;
+        Ok(crate::limits::Limits::from_json(&s))
+    } else {
+        Ok(crate::limits::Limits::default())
+    }
+}
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -112,13 +124,14 @@ impl ClientSessionHandle {
         let result = tokio::time::timeout(timeout, tx.send(bytes)).await;
         match result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => {
+            Ok(Err(_send_err)) => {
                 self.client_metrics
                     .queued_bytes
                     .fetch_sub(sz, Ordering::Relaxed);
+                crate::report_channel_failure("client datagram enqueue");
                 Err(napi::Error::from_reason("E_SESSION_CLOSED"))
             }
-            Err(_) => {
+            Err(_elapsed) => {
                 self.client_metrics
                     .queued_bytes
                     .fetch_sub(sz, Ordering::Relaxed);
@@ -142,7 +155,9 @@ impl ClientSessionHandle {
         let c = code.unwrap_or(0);
         let r = reason.unwrap_or_default();
         if let Some(ref tx) = self.close_tx {
-            let _ = tx.send((c, r));
+            if tx.send((c, r)).is_err() {
+                crate::report_channel_failure("client close signal");
+            }
         }
         Ok(())
     }
@@ -201,7 +216,8 @@ impl ClientSessionHandle {
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
         {
             Ok(h) => Ok(Some(h)),
-            Err(_) => Ok(None),
+            Err(e) if e == "E_SESSION_CLOSED" => Ok(None),
+            Err(e) => Err(napi::Error::from_reason(e)),
         }
     }
 
@@ -219,7 +235,8 @@ impl ClientSessionHandle {
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
         {
             Ok(h) => Ok(Some(h)),
-            Err(_) => Ok(None),
+            Err(e) if e == "E_SESSION_CLOSED" => Ok(None),
+            Err(e) => Err(napi::Error::from_reason(e)),
         }
     }
 }
@@ -302,7 +319,9 @@ impl ClientSessionHandle {
                         Ok(_) => {
                             cm_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(_) => break,
+                        Err(wtransport::error::SendDatagramError::NotConnected) => break,
+                        Err(wtransport::error::SendDatagramError::UnsupportedByPeer) => break,
+                        Err(wtransport::error::SendDatagramError::TooLarge) => break,
                     }
                 }
             });
@@ -330,7 +349,7 @@ impl ClientSessionHandle {
                                     cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                                 });
                                 let budget = make_budget_bi();
-                                let (read_rx, write_tx, stop_tx, write_err_slot) =
+                                let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                     spawn_bidi_bridge_on(
                                         &CLIENT_RUNTIME,
                                         send,
@@ -344,13 +363,16 @@ impl ClientSessionHandle {
                                     stop_tx,
                                     Some(budget),
                                     write_err_slot,
+                                    read_err_slot,
                                 ))
                             }
                             Err(e) => Err(e.to_string()),
                         },
                         Err(e) => Err(e.to_string()),
                     };
-                    let _ = resp_tx.send(r);
+                    if resp_tx.send(r).is_err() {
+                        crate::report_channel_failure("client open_bidi response");
+                    }
                 }
             });
 
@@ -383,7 +405,9 @@ impl ClientSessionHandle {
                         },
                         Err(e) => Err(e.to_string()),
                     };
-                    let _ = resp_tx.send(r);
+                    if resp_tx.send(r).is_err() {
+                        crate::report_channel_failure("client open_uni response");
+                    }
                 }
             });
 
@@ -400,24 +424,28 @@ impl ClientSessionHandle {
                                 cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                             });
                             let budget = make_budget_accept_bi();
-                            let (read_rx, write_tx, stop_tx, write_err_slot) = spawn_bidi_bridge_on(
-                                &CLIENT_RUNTIME,
-                                send,
-                                recv,
-                                Some(guard),
-                                Some(budget.clone()),
-                            );
+                            let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
+                                spawn_bidi_bridge_on(
+                                    &CLIENT_RUNTIME,
+                                    send,
+                                    recv,
+                                    Some(guard),
+                                    Some(budget.clone()),
+                                );
                             Ok(ClientBidiStreamHandle::new_with_budget_and_slot(
                                 read_rx,
                                 write_tx,
                                 stop_tx,
                                 Some(budget),
                                 write_err_slot,
+                                read_err_slot,
                             ))
                         }
                         Err(e) => Err(e.to_string()),
                     };
-                    let _ = resp_tx.send(r);
+                    if resp_tx.send(r).is_err() {
+                        crate::report_channel_failure("client accept_bidi response");
+                    }
                 }
             });
 
@@ -434,21 +462,24 @@ impl ClientSessionHandle {
                                 cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
                             });
                             let budget = make_budget_accept_uni();
-                            let (read_rx, stop_tx) = spawn_uni_recv_bridge_on(
+                            let (read_rx, stop_tx, read_err_slot) = spawn_uni_recv_bridge_on(
                                 &CLIENT_RUNTIME,
                                 recv,
                                 Some(guard),
                                 Some(budget.clone()),
                             );
-                            Ok(ClientUniRecvHandle::new_with_budget(
+                            Ok(ClientUniRecvHandle::new_with_budget_and_slot(
                                 read_rx,
                                 stop_tx,
                                 Some(budget),
+                                read_err_slot,
                             ))
                         }
                         Err(e) => Err(e.to_string()),
                     };
-                    let _ = resp_tx.send(r);
+                    if resp_tx.send(r).is_err() {
+                        crate::report_channel_failure("client accept_uni response");
+                    }
                 }
             });
 
@@ -465,7 +496,7 @@ impl ClientSessionHandle {
             closed_flag.store(true, Ordering::Relaxed);
 
             if let Some(ref tsfn) = on_closed {
-                tsfn.call(
+                let status = tsfn.call(
                     ClientSessionClosed {
                         id: id.clone(),
                         code: close_code,
@@ -473,6 +504,7 @@ impl ClientSessionHandle {
                     },
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );
+                crate::report_tsfn_status("on_closed", status);
             }
         });
 
@@ -498,27 +530,31 @@ fn connect_inner(
     on_closed: JsFunction,
     callback: JsFunction,
 ) -> Result<()> {
-    let on_closed_tsfn: Option<ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>> =
-        on_closed
-            .create_threadsafe_function(
-                0,
-                |ctx: napi::threadsafe_function::ThreadSafeCallContext<ClientSessionClosed>| {
-                    let v = &ctx.value;
-                    let mut evt = ctx.env.create_object()?;
-                    evt.set("name", "session_closed")?;
-                    evt.set("id", v.id.as_str())?;
-                    if let Some(c) = v.code {
-                        evt.set("code", c)?;
-                    }
-                    if let Some(r) = &v.reason {
-                        evt.set("reason", r.as_str())?;
-                    }
-                    let mut arr = ctx.env.create_array_with_length(1)?;
-                    arr.set_element(0, evt)?;
-                    Ok(vec![arr])
-                },
-            )
-            .ok();
+    let on_closed_tsfn: ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal> = on_closed
+        .create_threadsafe_function(
+            0,
+            |ctx: napi::threadsafe_function::ThreadSafeCallContext<ClientSessionClosed>| {
+                let v = &ctx.value;
+                let mut evt = ctx.env.create_object()?;
+                evt.set("name", "session_closed")?;
+                evt.set("id", v.id.as_str())?;
+                if let Some(c) = v.code {
+                    evt.set("code", c)?;
+                }
+                if let Some(r) = &v.reason {
+                    evt.set("reason", r.as_str())?;
+                }
+                let mut arr = ctx.env.create_array_with_length(1)?;
+                arr.set_element(0, evt)?;
+                Ok(vec![arr])
+            },
+        )
+        .map_err(|e| {
+            napi::Error::from_reason(format!(
+                "E_INTERNAL: failed to create client onClosed callback bridge: {}",
+                e
+            ))
+        })?;
 
     let callback_tsfn: ThreadsafeFunction<ConnectResult, ErrorStrategy::Fatal> = callback
         .create_threadsafe_function(
@@ -538,14 +574,7 @@ fn connect_inner(
             },
         )?;
 
-    let client_limits = serde_json::from_str::<serde_json::Value>(&opts_json)
-        .ok()
-        .and_then(|v| {
-            let l = v.get("limits")?;
-            serde_json::to_string(l).ok()
-        })
-        .map(|s| crate::limits::Limits::from_json(&s))
-        .unwrap_or_default();
+    let client_limits = parse_client_limits(&opts_json).map_err(napi::Error::from_reason)?;
     let bp_timeout_ms = client_limits.backpressure_timeout_ms;
 
     CLIENT_RUNTIME.spawn(async move {
@@ -559,7 +588,7 @@ fn connect_inner(
                     peer_port,
                     conn,
                     release_guard,
-                    on_closed_tsfn,
+                    Some(on_closed_tsfn),
                     bp_timeout_ms,
                     client_limits,
                 );
@@ -571,7 +600,8 @@ fn connect_inner(
             std::result::Result::Ok(id) => ConnectResult::Ok(id),
             std::result::Result::Err(msg) => ConnectResult::Err(msg),
         };
-        callback_tsfn.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+        let status = callback_tsfn.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+        crate::report_tsfn_status("connect", status);
     });
 
     Ok(())
@@ -660,18 +690,24 @@ fn build_root_cert_store(
     if let Some(pem) = ca_pem {
         let pem_bytes = pem.as_bytes();
         let mut cursor = std::io::Cursor::new(pem_bytes);
+        let mut parsed = 0u32;
         let mut added = 0u32;
         for item in rustls_pemfile::certs(&mut cursor) {
             match item {
                 Ok(der) => {
-                    let _ = root_store.add(der);
-                    added += 1;
+                    parsed += 1;
+                    if root_store.add(der).is_ok() {
+                        added += 1;
+                    }
                 }
                 Err(e) => return Err(format!("E_TLS: invalid CA PEM: {}", e)),
             }
         }
         if added == 0 {
-            return Err("E_TLS: no valid CA certificate found in caPem".to_string());
+            if parsed == 0 {
+                return Err("E_TLS: no valid CA certificate found in caPem".to_string());
+            }
+            return Err("E_TLS: CA PEM parsed but no certificates were accepted".to_string());
         }
     }
 
@@ -683,14 +719,14 @@ fn build_client_tls_config(
     root_store: std::sync::Arc<rustls::RootCertStore>,
     insecure_skip_verify: bool,
     pinned_hashes: &[[u8; 32]],
-) -> rustls::ClientConfig {
+) -> std::result::Result<rustls::ClientConfig, String> {
     use std::sync::Arc;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 supported")
+        .map_err(|e| format!("E_TLS: failed to configure TLS versions: {}", e))?
         .with_root_certificates(Arc::clone(&root_store))
         .with_no_client_auth();
 
@@ -701,7 +737,7 @@ fn build_client_tls_config(
     } else if !pinned_hashes.is_empty() {
         let base = rustls::client::WebPkiServerVerifier::builder(Arc::clone(&root_store))
             .build()
-            .expect("WebPkiServerVerifier should build with provided root store");
+            .map_err(|e| format!("E_TLS: failed to build certificate verifier: {}", e))?;
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(PinnedCertVerifier {
@@ -711,7 +747,7 @@ fn build_client_tls_config(
     }
 
     config.alpn_protocols = vec![wtransport::proto::WEBTRANSPORT_ALPN.to_vec()];
-    config
+    Ok(config)
 }
 
 /// Insecure verifier for dev-only insecureSkipVerify.
@@ -949,7 +985,8 @@ async fn run_connect(
                 let root_store = build_root_cert_store(ca_pem_owned.as_deref())
                     .map_err(std::io::Error::other)?;
                 let tls_config =
-                    build_client_tls_config(root_store, false, pinned_hashes_clone.as_slice());
+                    build_client_tls_config(root_store, false, pinned_hashes_clone.as_slice())
+                        .map_err(std::io::Error::other)?;
                 wtransport::ClientConfig::builder()
                     .with_bind_default()
                     .with_custom_tls(tls_config)
@@ -988,7 +1025,8 @@ async fn run_connect(
             .build()
     } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
         let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
-        let tls_config = build_client_tls_config(root_store, false, pinned_hashes.as_slice());
+        let tls_config = build_client_tls_config(root_store, false, pinned_hashes.as_slice())
+            .map_err(std::io::Error::other)?;
         wtransport::ClientConfig::builder()
             .with_bind_default()
             .with_custom_tls(tls_config)
@@ -1017,4 +1055,38 @@ async fn run_connect(
     let peer_port = addr.port() as u32;
 
     Ok((id, peer_ip, peer_port, conn, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_root_cert_store, parse_client_limits};
+
+    #[test]
+    fn build_root_cert_store_rejects_parseable_but_unaccepted_cert() {
+        let pem =
+            "-----BEGIN CERTIFICATE-----\nAQIDBAUGBwgJCgsMDQ4PEA==\n-----END CERTIFICATE-----";
+        let err = build_root_cert_store(Some(pem))
+            .expect_err("expected parseable but unaccepted cert to fail");
+        assert!(err.contains("E_TLS: CA PEM parsed but no certificates were accepted"));
+    }
+
+    #[test]
+    fn build_root_cert_store_rejects_no_valid_cert_entries() {
+        let pem = "-----BEGIN NOT-A-CERT-----\nAQIDBAUGBwgJCgsMDQ4PEA==\n-----END NOT-A-CERT-----";
+        let err = build_root_cert_store(Some(pem)).expect_err("expected no valid cert entries");
+        assert!(err.contains("E_TLS: no valid CA certificate found in caPem"));
+    }
+
+    #[test]
+    fn build_root_cert_store_rejects_malformed_cert_pem() {
+        let pem = "-----BEGIN CERTIFICATE-----\n!!not-base64!!\n-----END CERTIFICATE-----";
+        let err = build_root_cert_store(Some(pem)).expect_err("expected malformed PEM failure");
+        assert!(err.contains("E_TLS: invalid CA PEM"));
+    }
+
+    #[test]
+    fn parse_client_limits_rejects_invalid_json() {
+        let err = parse_client_limits("{").expect_err("expected invalid JSON");
+        assert!(err.contains("E_INTERNAL: invalid client options JSON"));
+    }
 }

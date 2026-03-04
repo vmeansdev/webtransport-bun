@@ -107,7 +107,7 @@ Detailed migration playbook:
 
 ## Status
 - In active hardening.
-- Version: `0.2.2` (beta).
+- Version: `0.2.3` (beta).
 - Runtime support: Bun (`>= 1.3.9`), Node, Deno.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
 - Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.2.x`.
@@ -130,6 +130,9 @@ See `docs/COMPATIBILITY.md` for policy details.
 ### From package
 ```bash
 bun add @webtransport-bun/webtransport
+npm i @webtransport-bun/webtransport
+pnpm add @webtransport-bun/webtransport
+yarn add @webtransport-bun/webtransport
 ```
 
 Published npm package contents:
@@ -142,6 +145,9 @@ Note: GitHub source zip/tar downloads are source snapshots and may not include g
 ### From local workspace (development)
 ```bash
 bun add file:./packages/webtransport
+npm i file:./packages/webtransport
+pnpm add file:./packages/webtransport
+yarn add file:./packages/webtransport
 ```
 
 ## Examples
@@ -180,6 +186,9 @@ bun run example:compose:collab
 ### 1) Install package
 ```bash
 bun add @webtransport-bun/webtransport
+npm i @webtransport-bun/webtransport
+pnpm add @webtransport-bun/webtransport
+yarn add @webtransport-bun/webtransport
 ```
 
 ### 2) Start a server

@@ -100,7 +100,7 @@ impl SessionHandle {
         match tokio::time::timeout(timeout, send_fut).await {
             Ok(join_res) => join_res
                 .map_err(|e: tokio::task::JoinError| napi::Error::from_reason(e.to_string()))?,
-            Err(_) => {
+            Err(_elapsed) => {
                 if let Some(ref sm) = sm {
                     crate::server_metrics::ServerMetrics::release_session_queued_bytes(
                         &sm.queued_bytes,

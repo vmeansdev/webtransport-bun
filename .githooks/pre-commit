@@ -12,6 +12,7 @@ fi
 
 declare -a rust_files=()
 declare -a tsjs_files=()
+cargo_cmd=""
 
 while IFS= read -r -d '' file; do
   case "$file" in
@@ -25,11 +26,21 @@ while IFS= read -r -d '' file; do
 done < <(git diff --cached --name-only --diff-filter=ACMR -z)
 
 if [ "${#rust_files[@]}" -gt 0 ]; then
+  if command -v cargo >/dev/null 2>&1; then
+    cargo_cmd="$(command -v cargo)"
+  elif [ -x "${HOME}/.cargo/bin/cargo" ]; then
+    cargo_cmd="${HOME}/.cargo/bin/cargo"
+  else
+    echo "pre-commit: cargo is required for staged Rust files" >&2
+    echo "pre-commit: install Rust toolchain (https://rustup.rs) or ensure cargo is on PATH" >&2
+    exit 1
+  fi
+
   echo "pre-commit: formatting Rust files with cargo fmt"
-  cargo fmt --all -- "${rust_files[@]}"
+  "${cargo_cmd}" fmt --all -- "${rust_files[@]}"
   git add -- "${rust_files[@]}"
   echo "pre-commit: running clippy"
-  cargo clippy --workspace -- -D clippy::all
+  "${cargo_cmd}" clippy --workspace -- -D clippy::all
 fi
 
 if [ "${#tsjs_files[@]}" -gt 0 ]; then

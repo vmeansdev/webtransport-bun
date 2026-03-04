@@ -36,7 +36,13 @@ pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .enable_all()
         .thread_name("wt-server")
         .build()
-        .expect("failed to create server Tokio runtime")
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "webtransport-native: FATAL E_INTERNAL: failed to create server Tokio runtime: {}",
+                e
+            );
+            std::process::abort();
+        })
 });
 
 /// Client runtime: drives client connections and client-side stream bridges.
@@ -47,7 +53,13 @@ pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .enable_all()
         .thread_name("wt-client")
         .build()
-        .expect("failed to create client Tokio runtime")
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "webtransport-native: FATAL E_INTERNAL: failed to create client Tokio runtime: {}",
+                e
+            );
+            std::process::abort();
+        })
 });
 
 /// Data passed to on_session callback when a session is accepted.
@@ -80,6 +92,12 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static CHANNEL_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
@@ -108,22 +126,73 @@ fn emit_log(
         msg.to_string()
     };
     if let Some(tx) = tx {
-        let _ = tx.try_send(LogEvent {
-            level: level.to_string(),
-            msg: out_msg,
-            session_id: if redact {
-                None
-            } else {
-                session_id.map(String::from)
-            },
-            peer_ip: if redact {
-                None
-            } else {
-                peer_ip.map(String::from)
-            },
-            peer_port: if redact { None } else { peer_port },
-        });
+        if tx
+            .try_send(LogEvent {
+                level: level.to_string(),
+                msg: out_msg,
+                session_id: if redact {
+                    None
+                } else {
+                    session_id.map(String::from)
+                },
+                peer_ip: if redact {
+                    None
+                } else {
+                    peer_ip.map(String::from)
+                },
+                peer_port: if redact { None } else { peer_port },
+            })
+            .is_err()
+        {
+            eprintln!("webtransport-native: log event dropped (queue full or closed)");
+        }
     }
+}
+
+pub(crate) fn report_tsfn_status(context: &str, status: napi::Status) {
+    if status != napi::Status::Ok {
+        #[cfg(test)]
+        {
+            TSFN_DELIVERY_FAILURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        eprintln!(
+            "webtransport-native: {} callback delivery failed: {:?}",
+            context, status
+        );
+    }
+}
+
+pub(crate) fn report_channel_failure(context: &str) {
+    #[cfg(test)]
+    {
+        CHANNEL_DELIVERY_FAILURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    eprintln!("webtransport-native: {} channel delivery failed", context);
+}
+
+fn send_startup_result(
+    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
+    res: std::result::Result<(), String>,
+) {
+    if let Some(tx) = startup_tx.take() {
+        if tx.send(res).is_err() {
+            report_channel_failure("startup result");
+        }
+    }
+}
+
+fn write_and_flush_pem<W: std::io::Write>(
+    writer: &mut W,
+    pem: &str,
+    what: &str,
+) -> std::result::Result<(), String> {
+    writer
+        .write_all(pem.as_bytes())
+        .map_err(|e| format!("failed to write temp {} file: {:?}", what, e))?;
+    writer
+        .flush()
+        .map_err(|e| format!("failed to flush temp {} file: {:?}", what, e))?;
+    Ok(())
 }
 
 /// Spawn a background task that batches events from a channel and delivers
@@ -157,10 +226,11 @@ pub(crate) fn spawn_event_batcher<T: Send + 'static>(
                         match event {
                             Some(e) => batch.push(e),
                             None => {
-                                tsfn.call(
+                                let status = tsfn.call(
                                     std::mem::take(&mut batch),
                                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                                 );
+                                report_tsfn_status("event batch", status);
                                 return;
                             }
                         }
@@ -169,18 +239,20 @@ pub(crate) fn spawn_event_batcher<T: Send + 'static>(
                 }
             }
             if !batch.is_empty() {
-                tsfn.call(
+                let status = tsfn.call(
                     std::mem::take(&mut batch),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
+                report_tsfn_status("event batch", status);
                 batch = Vec::with_capacity(max_batch);
             }
         }
         if !batch.is_empty() {
-            tsfn.call(
+            let status = tsfn.call(
                 batch,
                 napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
             );
+            report_tsfn_status("event batch", status);
         }
     });
     tx
@@ -273,7 +345,6 @@ pub(crate) fn spawn_wtransport_server(
     debug_logs: bool,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
 ) {
-    use std::io::Write;
     use std::sync::atomic::Ordering;
     use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
@@ -291,9 +362,7 @@ pub(crate) fn spawn_wtransport_server(
         panic_guard::spawn_quic_task(async move {
             let mut startup_tx = Some(startup_tx);
             let mut report_startup = |res: std::result::Result<(), String>| {
-                if let Some(tx) = startup_tx.take() {
-                    let _ = tx.send(res);
-                }
+                send_startup_result(&mut startup_tx, res);
             };
             let identity = if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
                 let mut cert_file = match tempfile::Builder::new()
@@ -309,8 +378,11 @@ pub(crate) fn spawn_wtransport_server(
                         return;
                     }
                 };
-                let _ = cert_file.write_all(cert_pem.as_bytes());
-                let _ = cert_file.flush();
+                if let Err(msg) = write_and_flush_pem(&mut cert_file, &cert_pem, "cert") {
+                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    report_startup(Err(msg));
+                    return;
+                }
                 let cert_path = cert_file.path().to_path_buf();
                 let mut key_file = match tempfile::Builder::new()
                     .prefix("wt-key-")
@@ -319,12 +391,17 @@ pub(crate) fn spawn_wtransport_server(
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        emit_log(&log_tx, !debug_logs, "error", &format!("failed to create temp key file: {:?}", e), None, None, None);
+                        let msg = format!("failed to create temp key file: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        report_startup(Err(msg));
                         return;
                     }
                 };
-                let _ = key_file.write_all(key_pem.as_bytes());
-                let _ = key_file.flush();
+                if let Err(msg) = write_and_flush_pem(&mut key_file, &key_pem, "key") {
+                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    report_startup(Err(msg));
+                    return;
+                }
                 let key_path = key_file.path().to_path_buf();
                 match Identity::load_pemfiles(&cert_path, &key_path).await {
                     Ok(i) => {
@@ -353,14 +430,21 @@ pub(crate) fn spawn_wtransport_server(
             let bind_addr: std::net::SocketAddr = format!("{}:{}", host, port)
                 .parse()
                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
-            let config = ServerConfig::builder()
+            let config_builder = ServerConfig::builder()
                 .with_bind_address(bind_addr)
                 .with_identity(identity)
                 .max_idle_timeout(Some(
                     std::time::Duration::from_millis(limits.idle_timeout_ms),
-                ))
-                .unwrap()
-                .build();
+                ));
+            let config = match config_builder {
+                Ok(c) => c.build(),
+                Err(e) => {
+                    let msg = format!("failed to build server config: {:?}", e);
+                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    report_startup(Err(msg));
+                    return;
+                }
+            };
             let server = match Endpoint::server(config) {
                 Ok(s) => {
                     emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
@@ -456,7 +540,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 None,
                                             );
                                         }
-                                        Err(_) => {
+                                        Err(_elapsed) => {
                                             emit_log(
                                                 &ltx,
                                                 !debug_logs,
@@ -484,7 +568,7 @@ pub(crate) fn spawn_wtransport_server(
                                 .await;
                                 let accept_result = match accept_result {
                                     Ok(r) => r,
-                                    Err(_) => {
+                                    Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                         emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
@@ -537,11 +621,19 @@ pub(crate) fn spawn_wtransport_server(
                                             );
 
                                         if let Some(ref tx) = stx {
-                                            let _ = tx.try_send(SessionEvent::Accepted(SessionAccepted {
-                                                id: id.clone(),
-                                                peer_ip: peer_ip.clone(),
-                                                peer_port,
-                                            }));
+                                            if tx
+                                                .try_send(SessionEvent::Accepted(SessionAccepted {
+                                                    id: id.clone(),
+                                                    peer_ip: peer_ip.clone(),
+                                                    peer_port,
+                                                }))
+                                                .is_err()
+                                            {
+                                                eprintln!(
+                                                    "webtransport-native: session accepted event dropped for id={}",
+                                                    id
+                                                );
+                                            }
                                         }
 
                                         let conn_bidi = connection.clone();
@@ -601,9 +693,12 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_session: lim_bidi.max_queued_bytes_per_session,
                                                                 max_stream: lim_bidi.max_queued_bytes_per_stream,
                                                             };
-                                                            let (read_rx, write_tx, stop_tx, write_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot);
-                                                            let _ = bidi_accept_tx.send(handle).await;
+                                                            let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
+                                                            if bidi_accept_tx.send(handle).await.is_err() {
+                                                                report_channel_failure("bidi accept");
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -653,9 +748,12 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_session: lim_uni.max_queued_bytes_per_session,
                                                                 max_stream: lim_uni.max_queued_bytes_per_stream,
                                                             };
-                                                            let (read_rx, stop_tx) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget(read_rx, stop_tx, Some(budget));
-                                                            let _ = uni_accept_tx.send(handle).await;
+                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
+                                                            if uni_accept_tx.send(handle).await.is_err() {
+                                                                report_channel_failure("uni accept");
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -674,12 +772,16 @@ pub(crate) fn spawn_wtransport_server(
                                                 while let Some(resp_tx) = rx.recv().await {
                                                     if m_create_bi.streams_active.load(Ordering::Relaxed) >= lim_create_bi.max_streams_global {
                                                         m_create_bi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                        let _ = resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string()));
+                                                        if resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string())).is_err() {
+                                                            report_channel_failure("create_bidi response");
+                                                        }
                                                         continue;
                                                     }
                                                     if sm_create_bi.streams_bidi_active.load(Ordering::Relaxed) >= lim_create_bi.max_streams_per_session_bidi {
                                                         m_create_bi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                        let _ = resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string()));
+                                                        if resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string())).is_err() {
+                                                            report_channel_failure("create_bidi response");
+                                                        }
                                                         continue;
                                                     }
                                                     let r = match conn_create_bi.open_bi().await {
@@ -702,17 +804,19 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
                                                                 };
-                                                                let (read_rx, write_tx, stop_tx, write_err_slot) =
+                                                                let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                                                     crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
                                                                 Ok(crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(
-                                                                    read_rx, write_tx, stop_tx, Some(budget), write_err_slot,
+                                                                    read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot,
                                                                 ))
                                                             }
                                                             Err(e) => Err(e.to_string()),
                                                         },
                                                         Err(e) => Err(e.to_string()),
                                                     };
-                                                    let _ = resp_tx.send(r);
+                                                    if resp_tx.send(r).is_err() {
+                                                        report_channel_failure("create_bidi response");
+                                                    }
                                                 }
                                             },
                                         );
@@ -729,12 +833,16 @@ pub(crate) fn spawn_wtransport_server(
                                                 while let Some(resp_tx) = rx.recv().await {
                                                     if m_create_uni.streams_active.load(Ordering::Relaxed) >= lim_create_uni.max_streams_global {
                                                         m_create_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                        let _ = resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string()));
+                                                        if resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string())).is_err() {
+                                                            report_channel_failure("create_uni response");
+                                                        }
                                                         continue;
                                                     }
                                                     if sm_create_uni.streams_uni_active.load(Ordering::Relaxed) >= lim_create_uni.max_streams_per_session_uni {
                                                         m_create_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                        let _ = resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string()));
+                                                        if resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string())).is_err() {
+                                                            report_channel_failure("create_uni response");
+                                                        }
                                                         continue;
                                                     }
                                                     match conn_create_uni.open_uni().await {
@@ -760,15 +868,21 @@ pub(crate) fn spawn_wtransport_server(
                                                                     };
                                                                     let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
                                                                     let handle = crate::client_stream::ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot);
-                                                                    let _ = resp_tx.send(Ok(handle));
+                                                                    if resp_tx.send(Ok(handle)).is_err() {
+                                                                        report_channel_failure("create_uni response");
+                                                                    }
                                                                 }
                                                                 Err(e) => {
-                                                                    let _ = resp_tx.send(Err(e.to_string()));
+                                                                    if resp_tx.send(Err(e.to_string())).is_err() {
+                                                                        report_channel_failure("create_uni response");
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            let _ = resp_tx.send(Err(e.to_string()));
+                                                            if resp_tx.send(Err(e.to_string())).is_err() {
+                                                                report_channel_failure("create_uni response");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -784,10 +898,33 @@ pub(crate) fn spawn_wtransport_server(
                                             async move {
                                                 loop {
                                                     tokio::select! {
+                                                        biased;
                                                         res = conn_dgram.receive_datagram() => {
                                                             let dgram = match res {
                                                                 Ok(d) => d,
-                                                                Err(_) => break,
+                                                                Err(close_err) => {
+                                                                    let (mut close_code, mut close_reason) = extract_close_info(&close_err);
+                                                                    if close_code.is_none() && close_reason.is_none() {
+                                                                        let (code2, reason2) = extract_close_info(&conn_dgram.closed().await);
+                                                                        close_code = code2;
+                                                                        close_reason = reason2;
+                                                                    }
+                                                                    session_registry::remove(&id);
+                                                                    rate_limit::release_per_ip_session(&peer_ip_for_release);
+                                                                    m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                                    if let Some(ref tx) = closed_tx {
+                                                                        if tx
+                                                                            .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .is_err()
+                                                                        {
+                                                                            eprintln!(
+                                                                                "webtransport-native: session closed event dropped for id={}",
+                                                                                id
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                    return;
+                                                                }
                                                             };
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
@@ -821,14 +958,35 @@ pub(crate) fn spawn_wtransport_server(
                                                             }
                                                         }
                                                         close_err = conn_dgram.closed() => {
-                                                            let (close_code, close_reason) = extract_close_info(&close_err);
+                                                            let (mut close_code, mut close_reason) = extract_close_info(&close_err);
+                                                            // Prefer driver-level close details when available:
+                                                            // conn.closed() can resolve first with transport-level no-error
+                                                            // while receive_datagram() still carries ApplicationClosed(code, reason).
+                                                            if close_code.is_none() && close_reason.is_none() {
+                                                                if let Ok(Err(driver_close_err)) = tokio::time::timeout(
+                                                                    std::time::Duration::from_millis(50),
+                                                                    conn_dgram.receive_datagram(),
+                                                                )
+                                                                .await
+                                                                {
+                                                                    let (code2, reason2) = extract_close_info(&driver_close_err);
+                                                                    close_code = code2;
+                                                                    close_reason = reason2;
+                                                                }
+                                                            }
                                                             session_registry::remove(&id);
                                                             rate_limit::release_per_ip_session(&peer_ip_for_release);
                                                             m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
                                                             if let Some(ref tx) = closed_tx {
-                                                                let _ = tx.try_send(
-                                                                    SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason },
-                                                                );
+                                                                if tx
+                                                                    .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                    .is_err()
+                                                                {
+                                                                    eprintln!(
+                                                                        "webtransport-native: session closed event dropped for id={}",
+                                                                        id
+                                                                    );
+                                                                }
                                                             }
                                                             return;
                                                         }
@@ -838,9 +996,15 @@ pub(crate) fn spawn_wtransport_server(
                                                 rate_limit::release_per_ip_session(&peer_ip_for_release);
                                                 m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
                                                 if let Some(ref tx) = closed_tx {
-                                                    let _ = tx.try_send(
-                                                        SessionEvent::Closed { id: id.clone(), code: None, reason: None },
-                                                    );
+                                                    if tx
+                                                        .try_send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
+                                                        .is_err()
+                                                    {
+                                                        eprintln!(
+                                                            "webtransport-native: terminal session event dropped for id={}",
+                                                            id
+                                                        );
+                                                    }
                                                 }
                                             },
                                         );
@@ -865,4 +1029,83 @@ pub(crate) fn spawn_wtransport_server(
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{report_channel_failure, send_startup_result, CHANNEL_DELIVERY_FAILURE_COUNT};
+    use super::{report_tsfn_status, write_and_flush_pem, TSFN_DELIVERY_FAILURE_COUNT};
+    use std::sync::atomic::Ordering;
+
+    struct FailWriter;
+
+    impl std::io::Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailWriter {
+        buffer: Vec<u8>,
+    }
+
+    impl std::io::Write for FlushFailWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush-fail"))
+        }
+    }
+
+    #[test]
+    fn write_and_flush_pem_reports_write_failure() {
+        let mut writer = FailWriter;
+        let err =
+            write_and_flush_pem(&mut writer, "abc", "cert").expect_err("expected write failure");
+        assert!(err.contains("failed to write temp cert file"));
+    }
+
+    #[test]
+    fn write_and_flush_pem_reports_flush_failure() {
+        let mut writer = FlushFailWriter { buffer: Vec::new() };
+        let err =
+            write_and_flush_pem(&mut writer, "abc", "key").expect_err("expected flush failure");
+        assert!(err.contains("failed to flush temp key file"));
+    }
+
+    #[test]
+    fn report_tsfn_status_counts_failures_only() {
+        TSFN_DELIVERY_FAILURE_COUNT.store(0, Ordering::Relaxed);
+        report_tsfn_status("test", napi::Status::Ok);
+        assert_eq!(TSFN_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 0);
+        report_tsfn_status("test", napi::Status::QueueFull);
+        assert_eq!(TSFN_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 1);
+        report_tsfn_status("test", napi::Status::Closing);
+        assert_eq!(TSFN_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn report_channel_failure_counts_failures() {
+        CHANNEL_DELIVERY_FAILURE_COUNT.store(0, Ordering::Relaxed);
+        report_channel_failure("test");
+        assert_eq!(CHANNEL_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn send_startup_result_handles_disconnected_receiver() {
+        CHANNEL_DELIVERY_FAILURE_COUNT.store(0, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        drop(rx);
+        let mut opt = Some(tx);
+        send_startup_result(&mut opt, Err("boom".to_string()));
+        assert!(opt.is_none());
+        assert_eq!(CHANNEL_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 1);
+    }
 }

@@ -1,7 +1,7 @@
 {
 	"name": "@webtransport-bun/webtransport",
-	"version": "0.2.2",
-	"description": "Production-focused WebTransport for Bun with datagrams and streams via a Rust napi-rs addon",
+	"version": "0.2.3",
+	"description": "Production-focused WebTransport for Bun, Node, and Deno with datagrams and streams via a Rust napi-rs addon",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -13,6 +13,8 @@
 	},
 	"keywords": [
 		"bun",
+		"node",
+		"deno",
 		"webtransport",
 		"quic",
 		"napi-rs",
@@ -34,7 +36,8 @@
 		"LICENSE"
 	],
 	"engines": {
-		"bun": ">=1.3.9"
+		"bun": ">=1.3.9",
+		"node": ">=18"
 	},
 	"os": [
 		"darwin",

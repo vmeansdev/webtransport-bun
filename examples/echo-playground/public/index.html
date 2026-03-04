@@ -52,6 +52,12 @@
         border: 1px solid var(--line);
         min-width: 340px;
       }
+      #closeCode {
+        min-width: 120px;
+      }
+      #closeReason {
+        min-width: 320px;
+      }
       button {
         font: inherit;
         border: 1px solid var(--line);
@@ -97,6 +103,11 @@
           <button id="connect" class="primary">Connect</button>
           <button id="close" class="warn">Close</button>
         </div>
+        <div class="row" style="margin-top: 8px;">
+          <input id="closeCode" value="4999" />
+          <input id="closeReason" value="Done streaming." />
+          <button id="closeDemo">Close Demo (Client -> Server)</button>
+        </div>
       </section>
 
       <section class="card">
@@ -120,6 +131,9 @@
       const payloadEl = document.getElementById("payload");
       const connectBtn = document.getElementById("connect");
       const closeBtn = document.getElementById("close");
+      const closeDemoBtn = document.getElementById("closeDemo");
+      const closeCodeEl = document.getElementById("closeCode");
+      const closeReasonEl = document.getElementById("closeReason");
       const sendBtn = document.getElementById("send");
 
       const encoder = new TextEncoder();
@@ -306,8 +320,25 @@
         transport.close({ closeCode: 1000, reason: "user closed" });
       }
 
+      async function closeWithCustomInfo() {
+        if (!transport) {
+          log("already closed");
+          return;
+        }
+        const codeRaw = String(closeCodeEl.value ?? "").trim();
+        const reason = String(closeReasonEl.value ?? "");
+        const closeCode = Number.parseInt(codeRaw, 10);
+        if (!Number.isInteger(closeCode)) {
+          log(`invalid close code: "${codeRaw}"`);
+          return;
+        }
+        log(`closing with closeCode=${closeCode} reason="${reason}"`);
+        transport.close({ closeCode, reason });
+      }
+
       connectBtn.addEventListener("click", () => void connect());
       closeBtn.addEventListener("click", () => void closeConnection());
+      closeDemoBtn.addEventListener("click", () => void closeWithCustomInfo());
       sendBtn.addEventListener("click", () => void sendSelected());
       payloadEl.addEventListener("keydown", (e) => {
         if (e.key === "Enter") void sendSelected();

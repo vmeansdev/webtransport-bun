@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
-use wtransport::error::StreamWriteError;
+use wtransport::error::{StreamReadError, StreamWriteError};
 use wtransport::VarInt;
 
 use crate::RUNTIME;
@@ -116,6 +116,22 @@ impl StreamBudget {
 
 /// Shared slot for write failure error code (E_STOP_SENDING, E_STREAM_RESET).
 type WriteErrorSlot = Arc<Mutex<Option<String>>>;
+/// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
+type ReadErrorSlot = Arc<Mutex<Option<String>>>;
+type BidiBridgeParts = (
+    mpsc::Receiver<Vec<u8>>,
+    mpsc::Sender<StreamCmd>,
+    oneshot::Sender<u32>,
+    Option<WriteErrorSlot>,
+    Option<ReadErrorSlot>,
+);
+
+fn read_error_code(err: &StreamReadError) -> &'static str {
+    match err {
+        StreamReadError::Reset(_) => "E_STREAM_RESET",
+        StreamReadError::NotConnected | StreamReadError::QuicProto => "E_SESSION_CLOSED",
+    }
+}
 
 #[napi]
 pub struct ClientBidiStreamHandle {
@@ -124,6 +140,7 @@ pub struct ClientBidiStreamHandle {
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Option<StreamBudget>,
     write_error_slot: Option<WriteErrorSlot>,
+    read_error_slot: Option<ReadErrorSlot>,
 }
 
 impl ClientBidiStreamHandle {
@@ -138,6 +155,7 @@ impl ClientBidiStreamHandle {
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: None,
             write_error_slot: None,
+            read_error_slot: None,
         }
     }
 
@@ -147,7 +165,7 @@ impl ClientBidiStreamHandle {
         stop_tx: oneshot::Sender<u32>,
         budget: Option<StreamBudget>,
     ) -> Self {
-        Self::new_with_budget_and_slot(read_rx, write_tx, stop_tx, budget, None)
+        Self::new_with_budget_and_slot(read_rx, write_tx, stop_tx, budget, None, None)
     }
 
     pub fn new_with_budget_and_slot(
@@ -156,6 +174,7 @@ impl ClientBidiStreamHandle {
         stop_tx: oneshot::Sender<u32>,
         budget: Option<StreamBudget>,
         write_error_slot: Option<WriteErrorSlot>,
+        read_error_slot: Option<ReadErrorSlot>,
     ) -> Self {
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
@@ -163,6 +182,7 @@ impl ClientBidiStreamHandle {
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget,
             write_error_slot,
+            read_error_slot,
         }
     }
 
@@ -188,7 +208,16 @@ impl ClientBidiStreamHandle {
                 }
                 Ok(Some(bytes.into()))
             }
-            None => Ok(None),
+            None => {
+                if let Some(ref slot) = self.read_error_slot {
+                    if let Ok(guard) = slot.lock() {
+                        if let Some(ref code) = *guard {
+                            return Err(napi::Error::from_reason(code.clone()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -236,7 +265,9 @@ impl ClientBidiStreamHandle {
     pub fn stop_sending(&self, code: u32) -> Result<()> {
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
-                let _ = tx.send(code);
+                if tx.send(code).is_err() {
+                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                }
             }
         }
         Ok(())
@@ -353,6 +384,7 @@ pub struct ClientUniRecvHandle {
     read_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Option<StreamBudget>,
+    read_error_slot: Option<ReadErrorSlot>,
 }
 
 impl ClientUniRecvHandle {
@@ -361,6 +393,7 @@ impl ClientUniRecvHandle {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: None,
+            read_error_slot: None,
         }
     }
 
@@ -373,6 +406,21 @@ impl ClientUniRecvHandle {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget,
+            read_error_slot: None,
+        }
+    }
+
+    pub fn new_with_budget_and_slot(
+        read_rx: mpsc::Receiver<Vec<u8>>,
+        stop_tx: oneshot::Sender<u32>,
+        budget: Option<StreamBudget>,
+        read_error_slot: Option<ReadErrorSlot>,
+    ) -> Self {
+        Self {
+            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            stop_tx: std::sync::Mutex::new(Some(stop_tx)),
+            budget,
+            read_error_slot,
         }
     }
 }
@@ -390,7 +438,16 @@ impl ClientUniRecvHandle {
                 }
                 Ok(Some(bytes.into()))
             }
-            None => Ok(None),
+            None => {
+                if let Some(ref slot) = self.read_error_slot {
+                    if let Ok(guard) = slot.lock() {
+                        if let Some(ref code) = *guard {
+                            return Err(napi::Error::from_reason(code.clone()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -398,7 +455,9 @@ impl ClientUniRecvHandle {
     pub fn stop_sending(&self, code: u32) -> Result<()> {
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
-                let _ = tx.send(code);
+                if tx.send(code).is_err() {
+                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                }
             }
         }
         Ok(())
@@ -417,12 +476,7 @@ pub fn spawn_bidi_bridge(
     recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<Vec<u8>>,
-    mpsc::Sender<StreamCmd>,
-    oneshot::Sender<u32>,
-    Option<WriteErrorSlot>,
-) {
+) -> BidiBridgeParts {
     spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
 }
 
@@ -433,18 +487,15 @@ pub fn spawn_bidi_bridge_on(
     mut recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<Vec<u8>>,
-    mpsc::Sender<StreamCmd>,
-    oneshot::Sender<u32>,
-    Option<WriteErrorSlot>,
-) {
+) -> BidiBridgeParts {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
     let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
+    let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
 
     let read_budget = budget.clone();
+    let read_error_slot_clone = Arc::clone(&read_error_slot);
     rt.spawn(async move {
         let _guard = guard;
         let mut buf = vec![0u8; 64 * 1024];
@@ -469,7 +520,14 @@ pub fn spawn_bidi_bridge_on(
                             }
                         }
                         Ok(None) => break,
-                        Err(_) => break,
+                        Err(e) => {
+                            if let Ok(mut guard) = read_error_slot_clone.lock() {
+                                if guard.is_none() {
+                                    *guard = Some(read_error_code(&e).to_string());
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 code = &mut stop_rx => {
@@ -534,7 +592,13 @@ pub fn spawn_bidi_bridge_on(
         }
     });
 
-    (read_rx, write_tx, stop_tx, Some(write_error_slot))
+    (
+        read_rx,
+        write_tx,
+        stop_tx,
+        Some(write_error_slot),
+        Some(read_error_slot),
+    )
 }
 
 /// Spawn bridge for an outgoing uni stream.
@@ -616,7 +680,11 @@ pub fn spawn_uni_recv_bridge(
     recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
-) -> (mpsc::Receiver<Vec<u8>>, oneshot::Sender<u32>) {
+) -> (
+    mpsc::Receiver<Vec<u8>>,
+    oneshot::Sender<u32>,
+    Option<ReadErrorSlot>,
+) {
     spawn_uni_recv_bridge_on(&RUNTIME, recv_stream, guard, budget)
 }
 
@@ -625,10 +693,16 @@ pub fn spawn_uni_recv_bridge_on(
     mut recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
-) -> (mpsc::Receiver<Vec<u8>>, oneshot::Sender<u32>) {
+) -> (
+    mpsc::Receiver<Vec<u8>>,
+    oneshot::Sender<u32>,
+    Option<ReadErrorSlot>,
+) {
     let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
+    let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
 
+    let read_error_slot_clone = Arc::clone(&read_error_slot);
     rt.spawn(async move {
         let _guard = guard;
         let mut buf = vec![0u8; 64 * 1024];
@@ -653,7 +727,14 @@ pub fn spawn_uni_recv_bridge_on(
                             }
                         }
                         Ok(None) => break,
-                        Err(_) => break,
+                        Err(e) => {
+                            if let Ok(mut guard) = read_error_slot_clone.lock() {
+                                if guard.is_none() {
+                                    *guard = Some(read_error_code(&e).to_string());
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 code = &mut stop_rx => {
@@ -666,5 +747,5 @@ pub fn spawn_uni_recv_bridge_on(
         }
     });
 
-    (read_rx, stop_tx)
+    (read_rx, stop_tx, Some(read_error_slot))
 }

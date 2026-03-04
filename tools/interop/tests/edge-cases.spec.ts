@@ -1,7 +1,68 @@
 import { test, expect } from "@playwright/test";
 import { getCertHashBase64 } from "../cert-hash.js";
 
+async function waitForCloseEvent(
+	code: number,
+	reason: string,
+	timeoutMs: number,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const res = await fetch("http://127.0.0.1:4434/close-events", {
+			cache: "no-store",
+		});
+		const body = (await res.json()) as {
+			closeEvents?: Array<{ code?: number; reason?: string }>;
+		};
+		if (
+			Array.isArray(body.closeEvents) &&
+			body.closeEvents.some(
+				(evt) =>
+					Number(evt?.code ?? 0) === code &&
+					String(evt?.reason ?? "") === reason,
+			)
+		) {
+			return true;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	return false;
+}
+
 test.describe("Chromium interop edge cases", () => {
+	test("client-initiated close code and reason propagate to server", async ({
+		page,
+	}) => {
+		await page.goto("http://127.0.0.1:4434");
+		const hashBase64 = getCertHashBase64();
+		const closeCode = 1234;
+		const closeReason = "Bye bye";
+
+		const browserClosed = await page.evaluate(
+			async ({ h, closeCode, closeReason }) => {
+				const opts: WebTransportOptions = {};
+				if (h) {
+					const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
+					opts.serverCertificateHashes = [{ algorithm: "sha-256", value: bin }];
+				}
+				const wt = new WebTransport("https://127.0.0.1:4433", opts);
+				await wt.ready;
+				wt.close({ closeCode, reason: closeReason });
+				const info = await wt.closed;
+				return {
+					closeCode: (info as any)?.closeCode ?? null,
+					reason: (info as any)?.reason ?? null,
+				};
+			},
+			{ h: hashBase64, closeCode, closeReason },
+		);
+		expect(browserClosed.closeCode).toBe(closeCode);
+		expect(browserClosed.reason).toBe(closeReason);
+
+		const seenOnServer = await waitForCloseEvent(closeCode, closeReason, 6000);
+		expect(seenOnServer).toBe(true);
+	});
+
 	test("close code and reason propagate on server-triggered close", async ({
 		page,
 	}) => {

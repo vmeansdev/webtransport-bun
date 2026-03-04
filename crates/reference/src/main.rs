@@ -30,9 +30,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HTTP health server for Playwright webServer readiness (QUIC doesn't respond to HTTP GET)
     tokio::spawn(async move {
         let listener =
-            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], HEALTH_PORT)))
+            match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], HEALTH_PORT)))
                 .await
-                .expect("bind health port");
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("reference-server: failed to bind health port: {e}");
+                    return;
+                }
+            };
         println!(
             "reference-server: Health server on http://127.0.0.1:{}",
             HEALTH_PORT
@@ -40,12 +46,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(x) => x,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("reference-server: health listener accept failed: {e}");
+                    continue;
+                }
             };
-            let _ = stream
+            if let Err(e) = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await;
-            let _ = stream.flush().await;
+                .await
+            {
+                eprintln!("reference-server: health response write failed: {e}");
+                continue;
+            }
+            if let Err(e) = stream.flush().await {
+                eprintln!("reference-server: health response flush failed: {e}");
+            }
         }
     });
 
@@ -75,7 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok((mut send, mut recv)) = conn_bidi.accept_bi().await {
                                     let mut buf = vec![0; 1024];
                                     if let Ok(Some(n)) = recv.read(&mut buf).await {
-                                        let _ = send.write_all(&buf[..n]).await;
+                                        if let Err(e) = send.write_all(&buf[..n]).await {
+                                            eprintln!(
+                                                "reference-server: bidi echo write failed: {e}"
+                                            );
+                                        }
                                     }
                                 }
                             });
@@ -87,7 +106,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Ok(Some(n)) = recv.read(&mut buf).await {
                                         if let Ok(opening) = conn_uni.open_uni().await {
                                             if let Ok(mut send) = opening.await {
-                                                let _ = send.write_all(&buf[..n]).await;
+                                                if let Err(e) = send.write_all(&buf[..n]).await {
+                                                    eprintln!(
+                                                        "reference-server: uni echo write failed: {e}"
+                                                    );
+                                                }
                                             }
                                         }
                                     }

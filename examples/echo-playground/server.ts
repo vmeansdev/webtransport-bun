@@ -20,8 +20,9 @@ try {
 	keyPem = readFileSync(keyPemPath, "utf8");
 	const cert = new X509Certificate(certPem);
 	certHashBase64 = createHash("sha256").update(cert.raw).digest("base64");
-} catch {
+} catch (err) {
 	console.error("Missing certs for WebTransport example.");
+	console.error(err);
 	console.error("Run: bun run example:echo:cert");
 	process.exit(1);
 }
@@ -38,6 +39,15 @@ const wtServer = createServer({
 		console.log(
 			`[wt] session accepted id=${session.id} peer=${session.peer.ip}:${session.peer.port}`,
 		);
+		void session.closed
+			.then((info) => {
+				console.log(
+					`[wt] session closed id=${session.id} code=${info?.code ?? 0} reason="${info?.reason ?? ""}"`,
+				);
+			})
+			.catch((err) => {
+				console.warn(`[wt] session.closed rejected id=${session.id}:`, err);
+			});
 
 		void (async () => {
 			try {

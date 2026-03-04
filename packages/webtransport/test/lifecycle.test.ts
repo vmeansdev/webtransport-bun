@@ -41,6 +41,97 @@ async function waitUntil(
 }
 
 describe("lifecycle", () => {
+	it("onSession sync throw is handled and surfaced via log callback", async () => {
+		const port = nextPort(21430, 2000);
+		const logs: string[] = [];
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {
+				throw new Error("sync boom");
+			},
+			log: (e) => {
+				logs.push(`${e.level}:${e.msg}`);
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const saw = await waitUntil(
+				() =>
+					logs.some(
+						(line) =>
+							line.includes("E_INTERNAL: onSession callback threw") &&
+							line.includes("sync boom"),
+					),
+				5000,
+			);
+			expect(saw).toBe(true);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("onSession async rejection is handled and surfaced via log callback", async () => {
+		const port = nextPort(21430, 2000);
+		const logs: string[] = [];
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: async () => {
+				throw new Error("async boom");
+			},
+			log: (e) => {
+				logs.push(`${e.level}:${e.msg}`);
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const saw = await waitUntil(
+				() =>
+					logs.some(
+						(line) =>
+							line.includes("E_INTERNAL: onSession callback rejected") &&
+							line.includes("async boom"),
+					),
+				5000,
+			);
+			expect(saw).toBe(true);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("log callback throw does not break event handling", async () => {
+		const port = nextPort(21430, 2000);
+		let sessions = 0;
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {
+				sessions++;
+			},
+			log: () => {
+				throw new Error("logger failed");
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const accepted = await waitUntil(() => sessions === 1, 5000);
+			expect(accepted).toBe(true);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
 	it("server close => session closed promises settle", async () => {
 		const port = nextPort(21430, 2000);
 		const sessions: any[] = [];

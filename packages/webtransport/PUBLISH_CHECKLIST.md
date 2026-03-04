@@ -32,11 +32,13 @@ Verify output includes:
 ```bash
 cd /tmp
 rm -rf wt-pub-test && mkdir wt-pub-test && cd wt-pub-test
-bun init -y
-# From repo: bun add file:/path/to/packages/webtransport
-# Or after pack: bun add /path/to/webtransport-bun-webtransport-0.2.2.tgz
+npm init -y
+# From repo: npm i file:/path/to/packages/webtransport
+# Or after pack: npm i /path/to/webtransport-bun-webtransport-0.2.3.tgz
 
+node -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
 bun -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
+deno eval --allow-env --allow-read --allow-ffi --allow-net "import('npm:@webtransport-bun/webtransport').then((m)=>console.log('OK', Object.keys(m).length))"
 ```
 
 Confirm native addon loads on your OS/arch.
@@ -44,7 +46,7 @@ Confirm native addon loads on your OS/arch.
 ## 4. Platform constraints
 
 - Package has `"os": ["darwin","linux"]` and `"cpu": ["arm64","x64"]`
-- On unsupported platforms, `bun add` may succeed but import will throw ("requires Bun" or "Native addon not loaded")
+- On unsupported platforms, install may succeed but import should fail with a clear native-addon diagnostics message
 
 ## 5. Version and access
 
