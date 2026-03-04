@@ -127,8 +127,7 @@ describe("TLS contract (P0.3)", () => {
 			await expect(
 				connectWithRetry(`https://127.0.0.1:${port}`, {
 					tls: {
-						caPem:
-							"-----BEGIN PRIVATE KEY-----\nxxx\n-----END PRIVATE KEY-----",
+						caPem: "-----BEGIN NOT-A-CERT-----\nxxx\n-----END NOT-A-CERT-----",
 					},
 				}),
 			).rejects.toThrow(/E_TLS/);

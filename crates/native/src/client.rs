@@ -1072,8 +1072,7 @@ mod tests {
 
     #[test]
     fn build_root_cert_store_rejects_no_valid_cert_entries() {
-        let pem =
-            "-----BEGIN PRIVATE KEY-----\nAQIDBAUGBwgJCgsMDQ4PEA==\n-----END PRIVATE KEY-----";
+        let pem = "-----BEGIN NOT-A-CERT-----\nAQIDBAUGBwgJCgsMDQ4PEA==\n-----END NOT-A-CERT-----";
         let err = build_root_cert_store(Some(pem)).expect_err("expected no valid cert entries");
         assert!(err.contains("E_TLS: no valid CA certificate found in caPem"));
     }
