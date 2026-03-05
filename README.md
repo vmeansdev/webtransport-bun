@@ -107,7 +107,7 @@ Detailed migration playbook:
 
 ## Status
 - In active hardening.
-- Version: `0.2.3` (RC-quality hardening in `0.2.x`, not yet stable/GA).
+- Version: `0.2.4` (RC-quality hardening in `0.2.x`, not yet stable/GA).
 - Runtime support: Bun (`>= 1.3.9`), Node, Deno.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
 - Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.2.x`.
