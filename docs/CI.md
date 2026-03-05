@@ -24,18 +24,22 @@
 2. Build native addon + install deps
 3. Typecheck (`bun run typecheck`)
 4. Unit tests (`bun test packages/`)
-5. Parity tests (`bun run test:parity`)
-6. Build reference + load-client
-7. Load-addon test (`bun run test:load-addon`)
-8. Load-scale-addon (200 sessions, 30s)
-9. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
-10. Overload-addon test (`bun run test:overload-addon`)
-11. Load profiles (`bun run test:load-profiles-addon`)
+5. Build reference + load-client
+6. Load-addon test (`bun run test:load-addon`)
+7. Load-scale-addon (200 sessions, 30s)
+8. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
+9. Overload-addon test (`bun run test:overload-addon`)
+10. Load profiles (`bun run test:load-profiles-addon`)
 
 Test log hygiene:
 - Set `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1` in CI test jobs to suppress repeated dev-only TLS warning logs when tests intentionally use `tls.insecureSkipVerify: true`.
-12. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
-13. Smoke test — `bun add` from built package
+11. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
+12. Smoke test — `bun add` from built package
+
+**parity** job — `ubuntu-latest`
+
+1. Build native addon + install deps
+2. Run W3C facade parity suite (`bun run test:parity`)
 
 **soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/24h/72h) — trigger via workflow_dispatch; writes soak-artifacts.json
 

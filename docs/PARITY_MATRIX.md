@@ -166,4 +166,4 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 - `packages/webtransport/src/streams.ts`
 - `packages/webtransport/test/*` (new parity suites)
 - `tools/interop/tests/*`
-- `.github/workflows/test.yml` (parity job addition)
+- `.github/workflows/test.yml` (parity/interop gate maintenance)
