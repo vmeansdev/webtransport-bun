@@ -30,5 +30,5 @@ Close events can terminate loops normally. Treat expected close paths as info/no
 
 ## Is this production-ready?
 
-Project is in `0.1.x` beta hardening: usable, but API/stability still being tightened.
-Review `docs/TESTPLAN.md` and `docs/OPERATIONS.md` before production rollout.
+Project is in `0.2.x` hardening (`0.2.3` currently): RC-quality with strong CI/interop/load evidence, while API/stability continue to be tightened before stable.
+Review `docs/TESTPLAN.md`, `docs/CI.md`, and `docs/OPERATIONS.md` before production rollout.

@@ -147,15 +147,11 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 3. ✅ State machine transitions (R3).
 4. ✅ Stats dictionaries implemented with optional-field omission semantics (R4).
 5. ✅ serverCertificateHashes pinning implemented and tested (R5).
-6. ⏳ Validate parity suite + interop in CI (R6).
+6. ✅ Validate parity suite + interop in CI (R6).
 
 ## Remaining Work (not yet closed)
 
-1. Execution blocker: CI evidence closure (R6):
-   - local status: `bun run test:parity` passes on current branch
-   - confirm `test:parity` pass in CI
-   - confirm interop pass in CI
-   - confirm security scan jobs pass in CI
+1. Ongoing CI hygiene: keep parity/interop/security gates green and evidence artifacts attached in release workflow.
 2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A.
 3. ✅ Phase 7 implementation closure complete for targeted parity rows (sendOrder/sendGroup, getStats, congestionControl semantics, serverCertificateHashes).
 
