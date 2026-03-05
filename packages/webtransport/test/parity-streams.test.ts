@@ -86,7 +86,7 @@ describe("parity streams (P3)", () => {
 		expect(writable).toBeInstanceOf(WritableStream);
 		const writer = writable.getWriter();
 		await writer.write(new Uint8Array([1, 2, 3]));
-		writer.close();
+		await writer.close();
 		const reader = readable.getReader();
 		const { value } = await reader.read();
 		expect(value).toBeDefined();
@@ -103,7 +103,7 @@ describe("parity streams (P3)", () => {
 		expect(writable).toBeInstanceOf(WritableStream);
 		const writer = writable.getWriter();
 		await writer.write(new Uint8Array([4, 5, 6]));
-		writer.close();
+		await writer.close();
 		wt.close();
 	});
 

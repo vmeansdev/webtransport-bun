@@ -66,6 +66,8 @@ export type TlsOptions = {
   /** Not supported for server. Passing caPem to createServer rejects with E_TLS. */
   caPem?: string | Uint8Array;
   serverName?: string; // for server: used in logs/metrics only; for client: SNI override
+  /** Production guard override for empty cert/key fallback. */
+  allowSelfSigned?: boolean;
 };
 
 export type RateLimitOptions = {
@@ -122,6 +124,7 @@ export type LogEvent = {
 
 export interface WebTransportServer {
   readonly address: { host: string; port: number };
+  updateCert(tls: { certPem: string | Uint8Array; keyPem: string | Uint8Array }): Promise<void>;
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -178,10 +181,10 @@ export interface CommonSession {
 
 export interface ServerSession extends CommonSession {
   // Streams
-  createBidirectionalStream(): Promise<Duplex>;
+  createBidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Duplex>;
   readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
 
-  createUnidirectionalStream(): Promise<Writable>;
+  createUnidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Writable>;
   readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
 
   // Metrics (per session)
@@ -190,10 +193,10 @@ export interface ServerSession extends CommonSession {
 
 export interface ClientSession extends CommonSession {
   // Streams
-  createBidirectionalStream(): Promise<Duplex>;
+  createBidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Duplex>;
   incomingBidirectionalStreams(): AsyncIterable<Duplex>;
 
-  createUnidirectionalStream(): Promise<Writable>;
+  createUnidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Writable>;
   incomingUnidirectionalStreams(): AsyncIterable<Readable>;
 
   // Metrics (per session)

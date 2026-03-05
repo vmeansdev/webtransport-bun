@@ -192,4 +192,95 @@ describe("limit boundaries (P0.4)", () => {
 			await server.close();
 		}
 	}, 15000);
+
+	it("waitUntilAvailable: createBidirectionalStream waits for capacity and succeeds before timeout", async () => {
+		const port = nextPort(25480, 3000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: {
+				maxStreamsPerSessionBidi: 1,
+				maxStreamsGlobal: 50000,
+				backpressureTimeoutMs: 1500,
+			},
+			onSession: async (s) => {
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+			limits: { backpressureTimeoutMs: 1500 },
+		});
+		try {
+			const first = await client.createBidirectionalStream();
+			const secondPromise = client.createBidirectionalStream({
+				waitUntilAvailable: true,
+			});
+			await Bun.sleep(100);
+			first.destroy();
+			const second = await Promise.race([
+				secondPromise,
+				Bun.sleep(2000).then(() => {
+					throw new Error("timeout waiting for waitUntilAvailable stream");
+				}),
+			]);
+			expect(second).toBeDefined();
+			second.destroy();
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("server session datagram limits are isolated per server instance", async () => {
+		const portA = nextPort(25520, 3000);
+		const portB = nextPort(25820, 3000);
+		const serverA = createServer({
+			port: portA,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxDatagramSize: 8 },
+			onSession: async (s) => {
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+
+		let serverBSession: any = null;
+		let resolveServerBReady!: () => void;
+		const serverBReady = new Promise<void>((r) => {
+			resolveServerBReady = r;
+		});
+		const serverB = createServer({
+			port: portB,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxDatagramSize: 1200 },
+			onSession: async (s) => {
+				serverBSession = s;
+				resolveServerBReady();
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+
+		const clientB = await connectWithRetry(`https://127.0.0.1:${portB}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			await Promise.race([
+				serverBReady,
+				Bun.sleep(2000).then(() => {
+					throw new Error("timeout waiting for server B session");
+				}),
+			]);
+			await expect(
+				serverBSession.sendDatagram(new Uint8Array(64)),
+			).resolves.toBe(undefined);
+		} finally {
+			clientB.close();
+			await serverB.close();
+			await serverA.close();
+		}
+	}, 15000);
 });

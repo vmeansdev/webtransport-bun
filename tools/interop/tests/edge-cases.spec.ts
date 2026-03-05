@@ -30,6 +30,74 @@ async function waitForCloseEvent(
 }
 
 test.describe("Chromium interop edge cases", () => {
+	test("bidi writer.close before read still preserves close code and reason to server", async ({
+		page,
+	}) => {
+		await page.goto("http://127.0.0.1:4434");
+		const hashBase64 = getCertHashBase64();
+		const closeCode = 4999;
+		const closeReason = "Done streaming.";
+
+		const browserResult = await page.evaluate(
+			async ({ h, closeCode, closeReason }) => {
+				const opts: WebTransportOptions = {};
+				if (h) {
+					const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
+					opts.serverCertificateHashes = [{ algorithm: "sha-256", value: bin }];
+				}
+				const wt = new WebTransport("https://127.0.0.1:4433", opts);
+				await wt.ready;
+
+				const stream = await wt.createBidirectionalStream();
+				const writer = stream.writable.getWriter();
+				await writer.write(new Uint8Array([1, 2, 3, 4]));
+				await writer.ready;
+				await writer.close();
+
+				const reader = stream.readable.getReader();
+				const first = await Promise.race([
+					reader.read(),
+					new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) =>
+						setTimeout(() => resolve({ done: true, value: undefined }), 5000),
+					),
+				]);
+				reader.releaseLock();
+				if (first.done || !first.value) {
+					return { ok: false, where: "stream_read", info: null };
+				}
+				const got = Array.from(first.value);
+				if (
+					got.length !== 4 ||
+					got[0] !== 1 ||
+					got[1] !== 2 ||
+					got[2] !== 3 ||
+					got[3] !== 4
+				) {
+					return { ok: false, where: "stream_payload", info: got };
+				}
+
+				wt.close({ closeCode, reason: closeReason });
+				const closed = await wt.closed;
+				return {
+					ok: true,
+					where: "closed",
+					info: {
+						closeCode: (closed as any)?.closeCode ?? null,
+						reason: (closed as any)?.reason ?? null,
+					},
+				};
+			},
+			{ h: hashBase64, closeCode, closeReason },
+		);
+
+		expect(browserResult.ok).toBe(true);
+		expect((browserResult as any).info?.closeCode).toBe(closeCode);
+		expect((browserResult as any).info?.reason).toBe(closeReason);
+
+		const seenOnServer = await waitForCloseEvent(closeCode, closeReason, 6000);
+		expect(seenOnServer).toBe(true);
+	});
+
 	test("client-initiated close code and reason propagate to server", async ({
 		page,
 	}) => {

@@ -119,6 +119,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Streams               | `createUnidirectionalStream()` writable stream      | `implemented`  | Facade writable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run and option semantics                            |
 | Streams               | `incomingUnidirectionalStreams` readable stream     | `implemented`  | Facade readable stream adapter in `packages/webtransport/src/index.ts`                                  | Surface exists and local parity tests pass                              | Validate CI parity run                                                 |
 | Streams               | `sendOrder`/`sendGroup` on createBidi/createUni     | `implemented`  | Options mapped to facade scheduler with per-group ordering + validation                                  | Deterministic ordering/group behavior implemented on facade send path    | Validate CI parity run and interop stability                            |
+| Streams               | `waitUntilAvailable` on stream creation              | `implemented`  | Node session + facade stream creation support bounded wait/retry for capacity-unavailable opens         | Opt-in waiting semantics avoid immediate `E_LIMIT_EXCEEDED` under transient pressure | Keep timeout semantics covered in parity + boundary tests                |
 | Stream control        | reset/stop sending semantics                        | `implemented`  | `writable.abort(reason)` → reset; `readable.cancel(reason)` → stopSending; symbols `WT_RESET`/`WT_STOP_SENDING` preserved | Browser-shaped API + symbol compatibility                               | —                                                                       |
 | Error model           | WebTransport error classes/codes                    | `implemented`  | WebTransportError with code, source, streamErrorCode; cause holds internal code                         | Spec-like shape; internal E_* preserved in cause                        | —                                                                       |
 | Stats                 | `getStats()` dictionaries                           | `implemented`  | `getStats()` returns datagram stats plus connection counters (`bytesSent`, `bytesReceived`, packet counters); optional fields omitted when unavailable | Optional dictionary fields omitted per spec allowance                    | Expand optional metrics when native exposes them                         |
@@ -146,15 +147,11 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 3. ✅ State machine transitions (R3).
 4. ✅ Stats dictionaries implemented with optional-field omission semantics (R4).
 5. ✅ serverCertificateHashes pinning implemented and tested (R5).
-6. ⏳ Validate parity suite + interop in CI (R6).
+6. ✅ Validate parity suite + interop in CI (R6).
 
 ## Remaining Work (not yet closed)
 
-1. Execution blocker: CI evidence closure (R6):
-   - local status: `bun run test:parity` passes on current branch
-   - confirm `test:parity` pass in CI
-   - confirm interop pass in CI
-   - confirm security scan jobs pass in CI
+1. Ongoing CI hygiene: keep parity/interop/security gates green and evidence artifacts attached in release workflow.
 2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A.
 3. ✅ Phase 7 implementation closure complete for targeted parity rows (sendOrder/sendGroup, getStats, congestionControl semantics, serverCertificateHashes).
 
@@ -169,4 +166,4 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 - `packages/webtransport/src/streams.ts`
 - `packages/webtransport/test/*` (new parity suites)
 - `tools/interop/tests/*`
-- `.github/workflows/test.yml` (parity job addition)
+- `.github/workflows/test.yml` (parity/interop gate maintenance)

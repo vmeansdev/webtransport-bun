@@ -180,8 +180,16 @@ async function main() {
 
 	await poller;
 	await Bun.sleep(5000);
-	const m = server.metricsSnapshot();
 	await server.close();
+	let m = server.metricsSnapshot();
+	const drainDeadline = Date.now() + 30000;
+	while (
+		(m.sessionsActive > 0 || m.streamsActive > 0) &&
+		Date.now() < drainDeadline
+	) {
+		await Bun.sleep(250);
+		m = server.metricsSnapshot();
+	}
 	const finalFd = await getFdCount(process.pid);
 
 	if (result.code !== 0) {
@@ -201,6 +209,16 @@ async function main() {
 	}
 	if (initialFd > 0 && finalFd > initialFd * 2) {
 		console.error("load-scale-addon: FAIL (FD", initialFd, "->", finalFd, ")");
+		process.exit(1);
+	}
+	if (m.sessionsActive > 0 || m.streamsActive > 0) {
+		console.error(
+			"load-scale-addon: FAIL (did not drain to baseline, sessions=",
+			m.sessionsActive,
+			"streams=",
+			m.streamsActive,
+			")",
+		);
 		process.exit(1);
 	}
 

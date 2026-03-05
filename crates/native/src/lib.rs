@@ -92,6 +92,7 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RATE_LIMIT_CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
 static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -168,6 +169,20 @@ pub(crate) fn report_channel_failure(context: &str) {
         CHANNEL_DELIVERY_FAILURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     eprintln!("webtransport-native: {} channel delivery failed", context);
+}
+
+pub(crate) fn report_channel_closed(context: &str) {
+    #[cfg(test)]
+    {
+        CHANNEL_DELIVERY_FAILURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var("WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("webtransport-native: {} channel closed (expected)", context);
+    }
 }
 
 fn send_startup_result(
@@ -348,14 +363,14 @@ pub(crate) fn spawn_wtransport_server(
     use std::sync::atomic::Ordering;
     use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
-    session_registry::set_limits(limits.clone());
-
-    RUNTIME.spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            rate_limit::cleanup_stale_entries(300.0);
-        }
+    RATE_LIMIT_CLEANUP_ONCE.call_once(|| {
+        RUNTIME.spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                rate_limit::cleanup_stale_entries(300.0);
+            }
+        });
     });
 
     RUNTIME.spawn(async move {
@@ -618,7 +633,10 @@ pub(crate) fn spawn_wtransport_server(
                                                 id.clone(),
                                                 connection.clone(),
                                                 metrics.clone(),
+                                                limits.clone(),
                                             );
+                                        let stream_capacity_notify =
+                                            session_registry::get_stream_capacity_notify(&id);
 
                                         if let Some(ref tx) = stx {
                                             if tx
@@ -652,6 +670,7 @@ pub(crate) fn spawn_wtransport_server(
                                         // Bidi stream accept loop: forward to JS via channel (4.4.2: shed if over limits)
                                         let peer_ip_bidi = peer_ip.clone();
                                         let rl_bidi = rate_limits.clone();
+                                        let stream_capacity_notify_bidi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -680,9 +699,13 @@ pub(crate) fn spawn_wtransport_server(
                                                             sm_bidi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
                                                             let guard_m = Arc::clone(&m_bidi);
                                                             let guard_sm = Arc::clone(&sm_bidi);
+                                                            let notify = stream_capacity_notify_bidi.clone();
                                                             let guard = crate::client_stream::StreamGuard::new(move || {
                                                                 guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                 guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
+                                                                if let Some(ref n) = notify {
+                                                                    n.notify_waiters();
+                                                                }
                                                             });
                                                             let stream_queued = Arc::new(AtomicU64::new(0));
                                                             let budget = crate::client_stream::StreamBudget {
@@ -696,7 +719,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
                                                             if bidi_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_failure("bidi accept");
+                                                                report_channel_closed("bidi accept");
                                                                 break;
                                                             }
                                                         }
@@ -707,6 +730,7 @@ pub(crate) fn spawn_wtransport_server(
                                         // Uni stream accept loop: forward to JS via channel (4.4.2; P1-5)
                                         let peer_ip_uni = peer_ip.clone();
                                         let rl_uni = rate_limits.clone();
+                                        let stream_capacity_notify_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -735,9 +759,13 @@ pub(crate) fn spawn_wtransport_server(
                                                             sm_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
                                                             let guard_m = Arc::clone(&m_uni);
                                                             let guard_sm = Arc::clone(&sm_uni);
+                                                            let notify = stream_capacity_notify_uni.clone();
                                                             let guard = crate::client_stream::StreamGuard::new(move || {
                                                                 guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                 guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
+                                                                if let Some(ref n) = notify {
+                                                                    n.notify_waiters();
+                                                                }
                                                             });
                                                             let stream_queued = Arc::new(AtomicU64::new(0));
                                                             let budget = crate::client_stream::StreamBudget {
@@ -751,7 +779,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
                                                             if uni_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_failure("uni accept");
+                                                                report_channel_closed("uni accept");
                                                                 break;
                                                             }
                                                         }
@@ -764,6 +792,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let m_create_bi = Arc::clone(&metrics);
                                         let sm_create_bi = Arc::clone(&session_metrics);
                                         let lim_create_bi = limits.clone();
+                                        let stream_capacity_notify_create_bi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_bi.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -791,9 +820,13 @@ pub(crate) fn spawn_wtransport_server(
                                                                 sm_create_bi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
                                                                 let guard_m = Arc::clone(&m_create_bi);
                                                                 let guard_sm = Arc::clone(&sm_create_bi);
+                                                                let notify = stream_capacity_notify_create_bi.clone();
                                                                 let guard = crate::client_stream::StreamGuard::new(move || {
                                                                     guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                     guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
+                                                                    if let Some(ref n) = notify {
+                                                                        n.notify_waiters();
+                                                                    }
                                                                 });
                                                                 let stream_queued = Arc::new(AtomicU64::new(0));
                                                                 let budget = crate::client_stream::StreamBudget {
@@ -825,6 +858,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let m_create_uni = Arc::clone(&metrics);
                                         let sm_create_uni = Arc::clone(&session_metrics);
                                         let lim_create_uni = limits.clone();
+                                        let stream_capacity_notify_create_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
@@ -853,9 +887,13 @@ pub(crate) fn spawn_wtransport_server(
                                                                     sm_create_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
                                                                     let guard_m = Arc::clone(&m_create_uni);
                                                                     let guard_sm = Arc::clone(&sm_create_uni);
+                                                                    let notify = stream_capacity_notify_create_uni.clone();
                                                                     let guard = crate::client_stream::StreamGuard::new(move || {
                                                                         guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
                                                                         guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
+                                                                        if let Some(ref n) = notify {
+                                                                            n.notify_waiters();
+                                                                        }
                                                                     });
                                                                     let stream_queued = Arc::new(AtomicU64::new(0));
                                                                     let budget = crate::client_stream::StreamBudget {

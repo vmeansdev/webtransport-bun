@@ -156,7 +156,7 @@ impl ClientSessionHandle {
         let r = reason.unwrap_or_default();
         if let Some(ref tx) = self.close_tx {
             if tx.send((c, r)).is_err() {
-                crate::report_channel_failure("client close signal");
+                crate::report_channel_closed("client close signal");
             }
         }
         Ok(())

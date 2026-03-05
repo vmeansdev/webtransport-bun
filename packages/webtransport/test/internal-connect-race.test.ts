@@ -84,6 +84,7 @@ describe("internal connect race handling", () => {
 			"{}",
 			25,
 			false,
+			5000,
 			setTimer,
 			clearTimer,
 		);

@@ -20,6 +20,7 @@ use crate::RUNTIME;
 pub enum StreamCmd {
     Data(Vec<u8>),
     Finish,
+    FinishWithAck(oneshot::Sender<std::result::Result<(), String>>),
     Reset(u32),
 }
 
@@ -281,6 +282,22 @@ impl ClientBidiStreamHandle {
             .map(|tx| tx.try_send(StreamCmd::Finish));
         Ok(())
     }
+
+    #[napi]
+    pub async fn finish_wait(&self) -> Result<()> {
+        let Some(ref tx) = self.write_tx else {
+            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+        };
+        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
+        tx.send(StreamCmd::FinishWithAck(done_tx))
+            .await
+            .map_err(|_| napi::Error::from_reason("E_STREAM_RESET"))?;
+        match done_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(code)) => Err(napi::Error::from_reason(code)),
+            Err(_) => Err(napi::Error::from_reason("E_STREAM_RESET")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +389,22 @@ impl ClientUniSendHandle {
             .as_ref()
             .map(|tx| tx.try_send(StreamCmd::Finish));
         Ok(())
+    }
+
+    #[napi]
+    pub async fn finish_wait(&self) -> Result<()> {
+        let Some(ref tx) = self.write_tx else {
+            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+        };
+        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
+        tx.send(StreamCmd::FinishWithAck(done_tx))
+            .await
+            .map_err(|_| napi::Error::from_reason("E_STREAM_RESET"))?;
+        match done_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(code)) => Err(napi::Error::from_reason(code)),
+            Err(_) => Err(napi::Error::from_reason("E_STREAM_RESET")),
+        }
     }
 }
 
@@ -584,6 +617,23 @@ pub fn spawn_bidi_bridge_on(
                     }
                     break;
                 }
+                StreamCmd::FinishWithAck(done_tx) => {
+                    let mut ret: std::result::Result<(), String> = Ok(());
+                    if let Err(e) = send_stream.finish().await {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                        ret = Err(code.to_string());
+                    }
+                    let _ = done_tx.send(ret);
+                    break;
+                }
                 StreamCmd::Reset(code) => {
                     let _ = send_stream.reset(VarInt::from_u32(code));
                     break;
@@ -662,6 +712,23 @@ pub fn spawn_uni_send_bridge_on(
                             }
                         }
                     }
+                    break;
+                }
+                StreamCmd::FinishWithAck(done_tx) => {
+                    let mut ret: std::result::Result<(), String> = Ok(());
+                    if let Err(e) = send_stream.finish().await {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                        ret = Err(code.to_string());
+                    }
+                    let _ = done_tx.send(ret);
                     break;
                 }
                 StreamCmd::Reset(code) => {
