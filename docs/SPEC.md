@@ -29,7 +29,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
   - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
-- Remaining parity tracking and implementation sequencing are in `PARITY_PLAN.md` and `docs/PARITY_MATRIX.md`.
+- Remaining parity tracking and implementation sequencing are in `docs/PARITY_MATRIX.md` (see Priority Execution Order / Remaining Work).
 
 ## Pooling Semantics (allowPooling)
 
