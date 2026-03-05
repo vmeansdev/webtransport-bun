@@ -808,6 +808,8 @@ fn connect_url_and_resolver(
 fn build_root_cert_store(
     ca_pem: Option<&str>,
 ) -> std::result::Result<std::sync::Arc<rustls::RootCertStore>, String> {
+    use rustls::pki_types::pem::PemObject;
+
     let mut root_store = rustls::RootCertStore::empty();
 
     // Add platform native certs (best-effort)
@@ -818,11 +820,9 @@ fn build_root_cert_store(
 
     // Add custom CA(s) from caPem
     if let Some(pem) = ca_pem {
-        let pem_bytes = pem.as_bytes();
-        let mut cursor = std::io::Cursor::new(pem_bytes);
         let mut parsed = 0u32;
         let mut added = 0u32;
-        for item in rustls_pemfile::certs(&mut cursor) {
+        for item in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
             match item {
                 Ok(der) => {
                     parsed += 1;

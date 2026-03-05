@@ -30,7 +30,11 @@ export default defineConfig({
 		},
 	},
 	webServer: {
-		command: "WT_IDLE_TIMEOUT_MS=5000 bun run addon-server.ts",
+		command: "bun run addon-server.ts",
+		env: {
+			...process.env,
+			WT_IDLE_TIMEOUT_MS: "5000",
+		},
 		cwd: join(__dirname),
 		url: "http://127.0.0.1:4434", // Health endpoint (QUIC on 4433 doesn't respond to HTTP GET)
 		reuseExistingServer: false,

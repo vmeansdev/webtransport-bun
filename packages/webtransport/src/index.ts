@@ -770,6 +770,7 @@ const PLATFORM = process.platform;
 const ARCH = process.arch;
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
+	`webtransport-native.${PLATFORM}-${ARCH}-msvc.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-gnu.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-musl.node`,
 ];

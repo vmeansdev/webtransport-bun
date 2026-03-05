@@ -23,7 +23,7 @@ Verify output includes:
 
 - `package/dist/index.js`
 - `package/dist/index.d.ts`
-- `package/prebuilds/webtransport-native.*.node` (darwin-arm64, darwin-x64, linux-x64 as built)
+- `package/prebuilds/webtransport-native.*.node` (darwin-arm64, darwin-x64, linux-x64, win32-x64-msvc as built)
 - `package/README.md`
 - `package/LICENSE`
 
@@ -45,7 +45,7 @@ Confirm native addon loads on your OS/arch.
 
 ## 4. Platform constraints
 
-- Package has `"os": ["darwin","linux"]` and `"cpu": ["arm64","x64"]`
+- Package has `"os": ["darwin","linux","win32"]` and `"cpu": ["arm64","x64"]`
 - On unsupported platforms, install may succeed but import should fail with a clear native-addon diagnostics message
 
 ## 5. Version and access

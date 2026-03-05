@@ -14,7 +14,7 @@ yarn add @webtransport-bun/webtransport
 ## Requirements
 
 - **Runtime**: Bun >= 1.3.9, Node (Node-API compatible runtime), Deno (npm + Node-API addon support)
-- **Platforms**: macOS (arm64, x64), Linux (x64)
+- **Platforms**: macOS (arm64, x64), Linux (x64), Windows (x64)
 
 ## Quick Start
 
@@ -47,9 +47,9 @@ session.close();
 
 ### "Native addon not loaded"
 
-Prebuilt binaries are included for darwin-arm64, darwin-x64, and linux-x64. If you see this error:
+Published npm packages and GitHub release artifacts include prebuilt binaries for darwin-arm64, darwin-x64, linux-x64, and win32-x64-msvc. A source checkout may only have whatever prebuilds were generated locally. If you see this error:
 
-- Ensure you are on a supported platform (macOS or Linux, arm64 or x64).
+- Ensure you are on a supported platform (macOS/Linux/Windows on supported arch).
 - Reinstall dependencies and rebuild native artifacts (`npm i` / `pnpm i` / `yarn` / `bun install`).
 - For development from source, run `bun run build:native` from the repo root.
 
@@ -58,7 +58,7 @@ Prebuilt binaries are included for darwin-arm64, darwin-x64, and linux-x64. If y
 This package supports Bun, Node, and Deno on supported OS/arch targets. If import fails:
 
 - Confirm your runtime supports Node-API addon loading.
-- Confirm your platform matches published prebuilds (macOS arm64/x64, Linux x64).
+- Confirm your platform matches published prebuilds (macOS arm64/x64, Linux x64, Windows x64).
 - If needed, build native locally from source (`bun run build:native` in this repo).
 
 ## Docs

@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project goal
-Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **macOS + Linux**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
+Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
 - In-process **server** support (mandatory)
 - In-process **client** support
 - **Datagrams** (message-based) with Promise backpressure
@@ -9,14 +9,15 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 - Browser-shaped client facade parity with the W3C WebTransport draft as a target; any remaining gaps must be explicitly documented in docs/PARITY_MATRIX.md.
 
 ## Non-goals
-- Windows support
 - Transparent reverse proxying
 - QUIC implementation from scratch (use wtransport)
 
 ## Supported targets
-- Bun: **>= 1.3.9**
-- OS: macOS, Linux
-- Architectures: define in CI (minimum: macOS arm64, linux x64)
+- Bun: **>= 1.3.9** (primary target)
+- Node: supported (Node-API compatible runtime)
+- Deno: supported (npm + Node-API addon support)
+- OS: macOS, Linux, Windows
+- Architectures: define in CI (minimum: macOS arm64, linux x64, windows x64)
 
 ## Definition of Done (hard gates)
 ### Feature gates
@@ -50,7 +51,7 @@ Build a production-ready WebTransport implementation for Bun **v1.3.9+** on **ma
 ## Authoritative docs
 - API contract: docs/SPEC.md
 - W3C parity status matrix: docs/PARITY_MATRIX.md
-- W3C parity execution plan: PARITY_PLAN.md
+- W3C parity execution plan: docs/PARITY_MATRIX.md (Priority Execution Order / Remaining Work)
 - Implementation design: docs/ARCHITECTURE.md
 - Security defaults: SECURITY.md
 - Verification: docs/TESTPLAN.md

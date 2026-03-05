@@ -39,11 +39,14 @@ jobs:
         timeout-minutes: 5
   test:
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         bun-version: ["1.3.9", "latest"]
     steps:
       - uses: actions/checkout@v4
@@ -102,8 +105,9 @@ jobs:
         run: |
           bun run --cwd packages/webtransport build
           bun run --cwd packages/webtransport prebuild:native
-          mkdir -p /tmp/wt-smoke && cd /tmp/wt-smoke
+          TMP_DIR="$(mktemp -d)"
+          cd "$TMP_DIR"
           bun init -y
           bun add file:$GITHUB_WORKSPACE/packages/webtransport
           echo 'import { createServer } from "@webtransport-bun/webtransport"; const s = createServer({ port: 19999, tls: { certPem: "", keyPem: "" }, onSession: () => {} }); console.log("ok"); s.close().then(() => process.exit(0));' > smoke.ts
-          python3 -c "import subprocess; subprocess.run(['bun','run','smoke.ts'], timeout=10, check=True)"
+          bun run smoke.ts

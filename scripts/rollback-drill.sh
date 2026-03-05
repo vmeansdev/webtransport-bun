@@ -17,7 +17,7 @@ if command -v gh >/dev/null 2>&1; then
 else
   echo "Downloading via curl (gh not found)..."
   BASE="https://github.com/${REPO}/releases/download/${TARGET}"
-  for f in webtransport-native.darwin-arm64.node webtransport-native.darwin-x64.node webtransport-native.linux-x64.node SHA256SUMS; do
+  for f in webtransport-native.darwin-arm64.node webtransport-native.darwin-x64.node webtransport-native.linux-x64.node webtransport-native.win32-x64-msvc.node SHA256SUMS; do
     curl -fsSL -o "$f" "${BASE}/${f}" 2>/dev/null || true
   done
 fi
