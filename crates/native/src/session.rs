@@ -30,7 +30,9 @@ impl SessionHandle {
             let Some(sm) = session_registry::get_session_metrics(&id) else {
                 return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
             };
-            let limits = session_registry::get_limits();
+            let Some(limits) = session_registry::get_limits(&id) else {
+                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+            };
             let global_ok =
                 metrics.streams_active.load(Ordering::Relaxed) < limits.max_streams_global;
             let kind_ok = match kind {
@@ -101,7 +103,9 @@ impl SessionHandle {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let sm = session_registry::get_session_metrics(&id);
-        let limits = session_registry::get_limits();
+        let Some(limits) = session_registry::get_limits(&id) else {
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+        };
         let sz = bytes.len();
         if sz > limits.max_datagram_size {
             return Err(napi::Error::from_reason("E_QUEUE_FULL"));

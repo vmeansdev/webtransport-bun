@@ -233,4 +233,54 @@ describe("limit boundaries (P0.4)", () => {
 			await server.close();
 		}
 	}, 15000);
+
+	it("server session datagram limits are isolated per server instance", async () => {
+		const portA = nextPort(25520, 3000);
+		const portB = nextPort(25820, 3000);
+		const serverA = createServer({
+			port: portA,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxDatagramSize: 8 },
+			onSession: async (s) => {
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+
+		let serverBSession: any = null;
+		let resolveServerBReady!: () => void;
+		const serverBReady = new Promise<void>((r) => {
+			resolveServerBReady = r;
+		});
+		const serverB = createServer({
+			port: portB,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxDatagramSize: 1200 },
+			onSession: async (s) => {
+				serverBSession = s;
+				resolveServerBReady();
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+
+		const clientB = await connectWithRetry(`https://127.0.0.1:${portB}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			await Promise.race([
+				serverBReady,
+				Bun.sleep(2000).then(() => {
+					throw new Error("timeout waiting for server B session");
+				}),
+			]);
+			await expect(
+				serverBSession.sendDatagram(new Uint8Array(64)),
+			).resolves.toBe(undefined);
+		} finally {
+			clientB.close();
+			await serverB.close();
+			await serverA.close();
+		}
+	}, 15000);
 });

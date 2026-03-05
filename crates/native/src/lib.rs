@@ -363,8 +363,6 @@ pub(crate) fn spawn_wtransport_server(
     use std::sync::atomic::Ordering;
     use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
-    session_registry::set_limits(limits.clone());
-
     RATE_LIMIT_CLEANUP_ONCE.call_once(|| {
         RUNTIME.spawn(async {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -635,6 +633,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 id.clone(),
                                                 connection.clone(),
                                                 metrics.clone(),
+                                                limits.clone(),
                                             );
                                         let stream_capacity_notify =
                                             session_registry::get_stream_capacity_notify(&id);

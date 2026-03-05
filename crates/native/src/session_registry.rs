@@ -59,18 +59,11 @@ pub struct SessionState {
     pub create_uni_tx: mpsc::Sender<CreateUniReq>,
     /// Notifies waiters when stream capacity may have changed.
     pub stream_capacity_notify: Arc<Notify>,
+    /// Effective limits for this session (captured from owning server).
+    pub limits: crate::limits::Limits,
 }
 
 static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
-static LIMITS: std::sync::OnceLock<crate::limits::Limits> = std::sync::OnceLock::new();
-
-pub fn set_limits(limits: crate::limits::Limits) {
-    let _ = LIMITS.set(limits);
-}
-
-pub fn get_limits() -> crate::limits::Limits {
-    LIMITS.get().cloned().unwrap_or_default()
-}
 
 /// Insert a new session into the registry.
 /// Returns (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics).
@@ -80,6 +73,7 @@ pub fn insert(
     session_id: String,
     conn: Connection,
     metrics: Arc<ServerMetrics>,
+    limits: crate::limits::Limits,
 ) -> (
     mpsc::Sender<Vec<u8>>,
     mpsc::Sender<ClientBidiStreamHandle>,
@@ -105,6 +99,7 @@ pub fn insert(
         create_bi_tx,
         create_uni_tx,
         stream_capacity_notify,
+        limits,
     };
     REGISTRY.insert(session_id, state);
     (
@@ -121,6 +116,10 @@ pub fn get_stream_capacity_notify(session_id: &str) -> Option<Arc<Notify>> {
     REGISTRY
         .get(session_id)
         .map(|entry| Arc::clone(&entry.stream_capacity_notify))
+}
+
+pub fn get_limits(session_id: &str) -> Option<crate::limits::Limits> {
+    REGISTRY.get(session_id).map(|entry| entry.limits.clone())
 }
 
 /// Look up session state by id. Returns None if not found or session closed.
