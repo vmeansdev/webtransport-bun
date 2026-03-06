@@ -93,6 +93,88 @@ fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Li
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CongestionControlMode {
+    Default,
+    Throughput,
+    LowLatency,
+}
+
+fn parse_congestion_control(
+    opts: &serde_json::Value,
+) -> std::result::Result<CongestionControlMode, String> {
+    match opts
+        .get("congestionControl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+    {
+        "default" => Ok(CongestionControlMode::Default),
+        "throughput" => Ok(CongestionControlMode::Throughput),
+        "low-latency" => Ok(CongestionControlMode::LowLatency),
+        other => Err(format!(
+            "E_INTERNAL: congestionControl must be \"default\", \"throughput\", or \"low-latency\", got \"{}\"",
+            other
+        )),
+    }
+}
+
+fn build_quic_transport_config(
+    mode: CongestionControlMode,
+) -> wtransport::config::QuicTransportConfig {
+    let mut config = wtransport::config::QuicTransportConfig::default();
+    let factory: Arc<dyn wtransport::quinn::congestion::ControllerFactory + Send + Sync + 'static> =
+        match mode {
+            CongestionControlMode::Default => {
+                Arc::new(wtransport::quinn::congestion::CubicConfig::default())
+            }
+            CongestionControlMode::Throughput => {
+                Arc::new(wtransport::quinn::congestion::BbrConfig::default())
+            }
+            CongestionControlMode::LowLatency => {
+                Arc::new(wtransport::quinn::congestion::NewRenoConfig::default())
+            }
+        };
+    config.congestion_controller_factory(factory);
+    config
+}
+
+fn build_wtransport_client_config(
+    insecure_skip_verify: bool,
+    ca_pem: Option<&str>,
+    pinned_hashes: &[[u8; 32]],
+    congestion_control: CongestionControlMode,
+) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let transport_config = build_quic_transport_config(congestion_control);
+
+    let config = if insecure_skip_verify {
+        let tls_config =
+            build_client_tls_config(Arc::new(rustls::RootCertStore::empty()), true, &[])
+                .map_err(std::io::Error::other)?;
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls_config, transport_config)
+            .build()
+    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
+        let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
+        let tls_config = build_client_tls_config(root_store, false, pinned_hashes)
+            .map_err(std::io::Error::other)?;
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls_config, transport_config)
+            .build()
+    } else {
+        let root_store = build_root_cert_store(None).map_err(std::io::Error::other)?;
+        let tls_config =
+            build_client_tls_config(root_store, false, &[]).map_err(std::io::Error::other)?;
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls_config, transport_config)
+            .build()
+    };
+
+    Ok(config)
+}
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -986,6 +1068,7 @@ async fn run_connect(
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    let congestion_control = parse_congestion_control(&opts).map_err(std::io::Error::other)?;
 
     let (connect_url, custom_resolver) =
         connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
@@ -1015,27 +1098,12 @@ async fn run_connect(
         let ca_pem_owned = ca_pem.map(String::from);
         let pinned_hashes_clone = pinned_hashes.clone();
         let create_endpoint = move || {
-            let mut config = if insecure_skip_verify {
-                wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_no_cert_validation()
-                    .build()
-            } else if ca_pem_owned.is_some() || !pinned_hashes_clone.is_empty() {
-                let root_store = build_root_cert_store(ca_pem_owned.as_deref())
-                    .map_err(std::io::Error::other)?;
-                let tls_config =
-                    build_client_tls_config(root_store, false, pinned_hashes_clone.as_slice())
-                        .map_err(std::io::Error::other)?;
-                wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_custom_tls(tls_config)
-                    .build()
-            } else {
-                wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_native_certs()
-                    .build()
-            };
+            let mut config = build_wtransport_client_config(
+                insecure_skip_verify,
+                ca_pem_owned.as_deref(),
+                pinned_hashes_clone.as_slice(),
+                congestion_control,
+            )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
             }
@@ -1057,25 +1125,12 @@ async fn run_connect(
         return Ok((id, peer_ip, peer_port, conn, Some(release_guard)));
     }
 
-    let mut config = if insecure_skip_verify {
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_no_cert_validation()
-            .build()
-    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
-        let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
-        let tls_config = build_client_tls_config(root_store, false, pinned_hashes.as_slice())
-            .map_err(std::io::Error::other)?;
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_custom_tls(tls_config)
-            .build()
-    } else {
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_native_certs()
-            .build()
-    };
+    let mut config = build_wtransport_client_config(
+        insecure_skip_verify,
+        ca_pem,
+        pinned_hashes.as_slice(),
+        congestion_control,
+    )?;
 
     if let Some(resolver) = custom_resolver {
         config.set_dns_resolver(resolver);
@@ -1099,7 +1154,10 @@ async fn run_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_root_cert_store, parse_client_limits};
+    use super::{
+        build_root_cert_store, parse_client_limits, parse_congestion_control, CongestionControlMode,
+    };
+    use serde_json::json;
 
     #[test]
     fn build_root_cert_store_rejects_parseable_but_unaccepted_cert() {
@@ -1128,5 +1186,19 @@ mod tests {
     fn parse_client_limits_rejects_invalid_json() {
         let err = parse_client_limits("{").expect_err("expected invalid JSON");
         assert!(err.contains("E_INTERNAL: invalid client options JSON"));
+    }
+
+    #[test]
+    fn parse_congestion_control_maps_supported_values() {
+        let throughput = parse_congestion_control(&json!({ "congestionControl": "throughput" }))
+            .expect("throughput should parse");
+        assert_eq!(throughput, CongestionControlMode::Throughput);
+
+        let low_latency = parse_congestion_control(&json!({ "congestionControl": "low-latency" }))
+            .expect("low-latency should parse");
+        assert_eq!(low_latency, CongestionControlMode::LowLatency);
+
+        let default_mode = parse_congestion_control(&json!({})).expect("default should parse");
+        assert_eq!(default_mode, CongestionControlMode::Default);
     }
 }

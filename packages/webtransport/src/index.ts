@@ -1813,9 +1813,7 @@ export class WebTransport {
 		if (typeof urlOrSession === "string") {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			const requestedCongestion = options?.congestionControl ?? "default";
-			// Runtime currently supports default algorithm; explicit preference falls back to default.
-			this.#congestionControl =
-				requestedCongestion === "default" ? "default" : "default";
+			this.#congestionControl = requestedCongestion;
 			const clientOpts = mapToClientOptions(options);
 			this.#sessionPromise = connect(urlOrSession, clientOpts);
 			this.#state = "connecting";

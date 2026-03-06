@@ -24,7 +24,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - browser-shaped stream control mapping (`writable.abort` -> reset, `readable.cancel` -> stopSending)
   - static capability `supportsReliableOnly`
   - `getStats()` connection counters (`bytesSent`, `bytesReceived`, packet counters, datagrams)
-  - `congestionControl` option validation with explicit effective-mode fallback to `default`
+  - `congestionControl` option validation with explicit runtime mapping: `default` -> Cubic, `throughput` -> BBR, `low-latency` -> NewReno
   - `serverCertificateHashes` pinning support in native TLS verify path
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
