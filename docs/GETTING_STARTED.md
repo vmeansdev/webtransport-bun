@@ -69,6 +69,8 @@ console.log(server.tlsSnapshot());
 
 Use `replaceSniCerts()` when you want to swap the full hostname map while preserving the default certificate and current unknown-SNI policy.
 
+`tlsSnapshot()` returns canonical ASCII hostnames. If you configure Unicode SNI names, review them for homograph/confusable risk before deployment.
+
 ## Requirements
 
 - Bun >= 1.3.9, or Node, or Deno

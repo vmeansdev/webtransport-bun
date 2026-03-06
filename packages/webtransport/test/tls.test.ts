@@ -486,6 +486,34 @@ describe("TLS contract (P0.3)", () => {
 		).toThrow(/E_TLS: .*wildcard serverName/);
 	});
 
+	it("rejects duplicate SNI names after normalization with both original inputs in the error", () => {
+		if (!generatedCert) return;
+		expect(() =>
+			createServer({
+				port: nextPort(24460, 2000),
+				tls: {
+					certPem: generatedCert.certPem,
+					keyPem: generatedCert.keyPem,
+					sni: [
+						{
+							serverName: "bücher.example.test",
+							certPem: generatedCert.certPem,
+							keyPem: generatedCert.keyPem,
+						},
+						{
+							serverName: "xn--bcher-kva.example.test",
+							certPem: generatedCert.certPem,
+							keyPem: generatedCert.keyPem,
+						},
+					],
+				},
+				onSession: () => {},
+			}),
+		).toThrow(
+			/E_TLS: .*duplicate serverName entry after normalization: "xn--bcher-kva\.example\.test" conflicts with "bücher\.example\.test" as "xn--bcher-kva\.example\.test"/,
+		);
+	});
+
 	it("unknown SNI rejects by default", async () => {
 		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
 		const apiCert = generateCertForNames(["api.test"]);
@@ -710,6 +738,39 @@ describe("TLS contract (P0.3)", () => {
 		} finally {
 			await server.close();
 			apiCert.cleanup();
+		}
+	}, 20000);
+
+	it("replaceSniCerts rejects duplicate normalized names with both original inputs in the error", async () => {
+		if (!generatedCert) return;
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: generatedCert.certPem,
+				keyPem: generatedCert.keyPem,
+			},
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				server.replaceSniCerts([
+					{
+						serverName: "bücher.example.test",
+						certPem: generatedCert.certPem,
+						keyPem: generatedCert.keyPem,
+					},
+					{
+						serverName: "xn--bcher-kva.example.test",
+						certPem: generatedCert.certPem,
+						keyPem: generatedCert.keyPem,
+					},
+				]),
+			).rejects.toThrow(
+				/E_INTERNAL: tls rotation failed: duplicate serverName entry after normalization: "xn--bcher-kva\.example\.test" conflicts with "bücher\.example\.test" as "xn--bcher-kva\.example\.test"/,
+			);
+		} finally {
+			await server.close();
 		}
 	}, 20000);
 

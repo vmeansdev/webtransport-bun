@@ -409,15 +409,16 @@ impl ServerHandle {
                 napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
             })?;
             let mut certs_by_name = std::collections::HashMap::new();
+            let mut original_names_by_normalized = std::collections::HashMap::new();
             for sni_cert in sni_certs {
                 let server_name = crate::server_tls::normalize_server_name(&sni_cert.server_name)
                     .map_err(|e| {
                     napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
                 })?;
-                if certs_by_name.contains_key(&server_name) {
+                if let Some(existing_original) = original_names_by_normalized.get(&server_name) {
                     return Err(napi::Error::from_reason(format!(
-                        "E_INTERNAL: tls rotation failed: duplicate serverName entry: {}",
-                        server_name
+                        "E_INTERNAL: tls rotation failed: duplicate serverName entry after normalization: \"{}\" conflicts with \"{}\" as \"{}\"",
+                        sni_cert.server_name, existing_original, server_name
                     )));
                 }
                 let certified_key =
@@ -425,6 +426,7 @@ impl ServerHandle {
                         .map_err(|e| {
                         napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
                     })?;
+                original_names_by_normalized.insert(server_name.clone(), sni_cert.server_name);
                 certs_by_name.insert(server_name, certified_key);
             }
             state

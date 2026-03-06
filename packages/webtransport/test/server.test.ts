@@ -18,6 +18,7 @@ import {
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "../src/index.js";
+import { generateLocalhostCert } from "./helpers/certs.js";
 import { nextPort } from "./helpers/network.js";
 
 describe("webtransport package exports", () => {
@@ -151,6 +152,45 @@ describe("webtransport package exports", () => {
 			await server.close();
 		} finally {
 			process.env.NODE_ENV = prev;
+		}
+	});
+
+	it("tlsSnapshot normalizes Unicode SNI hostnames to ASCII", async () => {
+		const cert = generateLocalhostCert();
+		if (!cert) {
+			throw new Error("failed to generate localhost certificate");
+		}
+		const server = createServer({
+			port: nextPort(4437, 1000),
+			tls: {
+				certPem: cert.certPem,
+				keyPem: cert.keyPem,
+				sni: [
+					{
+						serverName: "bücher.example.test",
+						certPem: cert.certPem,
+						keyPem: cert.keyPem,
+					},
+					{
+						serverName: "*.münich.example.test",
+						certPem: cert.certPem,
+						keyPem: cert.keyPem,
+					},
+				],
+			},
+			onSession: () => {},
+		});
+		try {
+			expect(server.tlsSnapshot()).toEqual({
+				sniServerNames: [
+					"*.xn--mnich-kva.example.test",
+					"xn--bcher-kva.example.test",
+				],
+				unknownSniPolicy: "reject",
+			});
+		} finally {
+			await server.close();
+			cert.cleanup();
 		}
 	});
 });

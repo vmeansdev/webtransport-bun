@@ -177,7 +177,7 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
-- Server names are matched case-insensitively after trimming a trailing `.`.
+- Server names are IDNA-normalized to canonical ASCII after trimming a trailing `.`, so Unicode inputs are matched by their punycode form.
 - Wildcards are supported only in the left-most label, for example `*.example.com`.
 - Wildcards match exactly one label: `*.example.com` matches `api.example.com`, but not `example.com` or `a.b.example.com`.
 - Exact hostname entries take precedence over wildcard entries.
@@ -191,7 +191,8 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 - `upsertSniCert()` adds or replaces one SNI hostname mapping in place.
 - `removeSniCert()` removes one SNI hostname mapping in place.
 - `setUnknownSniPolicy()` changes only unknown-SNI behavior in place.
-- `tlsSnapshot()` returns sorted active SNI hostnames plus the current `unknownSniPolicy`.
+- `tlsSnapshot()` returns sorted active SNI hostnames in canonical ASCII form plus the current `unknownSniPolicy`.
+- Operators should review configured Unicode hostnames for homograph/confusable risk; IDNA normalization makes names protocol-correct, not human-safe.
 - `tls.sni` and `unknownSniPolicy` require a non-empty default `certPem` / `keyPem`; they do not participate in the dev self-signed fallback path.
 
 ### Client

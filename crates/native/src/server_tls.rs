@@ -3,6 +3,7 @@ use std::io::BufReader;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use idna::AsciiDenyList;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -196,7 +197,7 @@ impl ResolvesServerCert for LiveServerCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let inner = self.inner.read().ok()?;
         if let Some(server_name) = client_hello.server_name() {
-            let key = server_name.trim_end_matches('.').to_ascii_lowercase();
+            let key = normalize_server_name(server_name).ok()?;
             if let Some(cert) = inner.certs_by_name.get(&key) {
                 self.sni_cert_selections.fetch_add(1, Ordering::Relaxed);
                 return Some(Arc::clone(cert));
@@ -221,17 +222,22 @@ impl ResolvesServerCert for LiveServerCertResolver {
 }
 
 pub(crate) fn normalize_server_name(server_name: &str) -> std::result::Result<String, String> {
-    let normalized = server_name
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let normalized = server_name.trim().trim_end_matches('.');
     if normalized.is_empty() {
         return Err("serverName must be non-empty".to_string());
     }
     if normalized.contains('*') {
-        validate_wildcard_server_name(&normalized)?;
+        validate_wildcard_server_name(normalized)?;
+        let suffix = normalize_ascii_domain(&normalized[2..])?;
+        return Ok(format!("*.{}", suffix));
     }
-    Ok(normalized)
+    normalize_ascii_domain(normalized)
+}
+
+fn normalize_ascii_domain(server_name: &str) -> std::result::Result<String, String> {
+    idna::domain_to_ascii_cow(server_name.as_bytes(), AsciiDenyList::URL)
+        .map(|domain| domain.into_owned().to_ascii_lowercase())
+        .map_err(|_| format!("invalid serverName: {}", server_name))
 }
 
 fn validate_wildcard_server_name(server_name: &str) -> std::result::Result<(), String> {
@@ -333,12 +339,17 @@ pub(crate) fn parse_resolver_config(
 ) -> std::result::Result<ParsedResolverConfig, String> {
     let default_cert = parse_certified_key(&config.default_cert_pem, &config.default_key_pem)?;
     let mut certs_by_name = HashMap::new();
+    let mut original_names_by_normalized = HashMap::new();
     for sni_cert in &config.sni_certs {
         let server_name = normalize_server_name(&sni_cert.server_name)?;
-        if certs_by_name.contains_key(&server_name) {
-            return Err(format!("duplicate serverName entry: {}", server_name));
+        if let Some(existing_original) = original_names_by_normalized.get(&server_name) {
+            return Err(format!(
+                "duplicate serverName entry after normalization: \"{}\" conflicts with \"{}\" as \"{}\"",
+                sni_cert.server_name, existing_original, server_name
+            ));
         }
         let certified_key = parse_certified_key(&sni_cert.cert_pem, &sni_cert.key_pem)?;
+        original_names_by_normalized.insert(server_name.clone(), sni_cert.server_name.clone());
         certs_by_name.insert(server_name, certified_key);
     }
     Ok((default_cert, certs_by_name, config.unknown_sni_policy))
@@ -424,7 +435,10 @@ mod tests {
             unknown_sni_policy: UnknownSniPolicy::Reject,
         })
         .expect_err("expected duplicate serverName error");
-        assert!(err.contains("duplicate serverName"));
+        assert!(err.contains("duplicate serverName entry after normalization"));
+        assert!(err.contains("\"FOO.test\""));
+        assert!(err.contains("\"foo.test\""));
+        assert!(err.contains("\"foo.test\""));
     }
 
     #[test]
@@ -457,6 +471,18 @@ mod tests {
         assert_eq!(
             normalize_server_name("*.Example.COM.").expect("normalized wildcard"),
             "*.example.com"
+        );
+        assert_eq!(
+            normalize_server_name("*.bücher.example").expect("normalized wildcard idna"),
+            "*.xn--bcher-kva.example"
+        );
+    }
+
+    #[test]
+    fn normalize_server_name_applies_idna_to_unicode_hostnames() {
+        assert_eq!(
+            normalize_server_name("BÜCHER.example").expect("normalized exact idna"),
+            "xn--bcher-kva.example"
         );
     }
 

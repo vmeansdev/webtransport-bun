@@ -75,8 +75,10 @@ session.close();
 - `replaceSniCerts()` swaps the full SNI certificate map while preserving the default certificate/key and current unknown-SNI policy.
 - `upsertSniCert()` and `removeSniCert()` manage individual hostname mappings in place.
 - `setUnknownSniPolicy()` changes only unknown-SNI handling in place.
-- `tlsSnapshot()` returns sorted active SNI hostnames plus the current unknown-SNI policy.
+- `tlsSnapshot()` returns sorted active SNI hostnames in canonical ASCII form plus the current unknown-SNI policy.
 - Wildcards are supported only as left-most single-label entries such as `*.example.com`; exact hostnames win over wildcards.
+- SNI hostnames are IDNA-normalized to canonical ASCII, so Unicode names are stored and matched by their punycode form.
+- Review configured Unicode hostnames for homograph/confusable risk; IDNA normalization makes names protocol-correct, not human-safe.
 - When `tls.sni` is configured, `unknownSniPolicy` defaults to `"reject"` for unknown hostnames.
 - Clients that do not send SNI still receive the default certificate.
 - `tls.sni` and `unknownSniPolicy` require a non-empty default server certificate/key.
