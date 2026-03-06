@@ -13,7 +13,7 @@
 ## Local build
 - Build native addon: `bun run build:native` (uses napi-rs CLI; produces `webtransport-native.${platform}-${arch}.node`)
 - Run Bun tests:
-  - `bun test`
+  - `bun run test`
 - Run Chromium interop tests (requires Playwright browsers):
   - `cd tools/interop && bun run install:browsers` (one-time)
   - `bun run test:interop`

@@ -30,7 +30,7 @@ bun run playwright test
 - `bidi stream echo via WebTransport` — bidirectional stream send/recv
 - `datagram echo via WebTransport` — datagram send/recv
 - `unidirectional stream echo via WebTransport` — uni stream send, receive echo on incoming uni
-- **P3.3** (`interop-expanded.spec.ts`): reconnect storms, mixed stream/datagram concurrency, close code propagation, stream reset (writable.abort)
+- **P3.3** (`interop-expanded.pw.ts`): reconnect storms, mixed stream/datagram concurrency, close code propagation, stream reset (writable.abort)
 
 ## Server
 

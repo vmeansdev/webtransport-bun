@@ -1,28 +1,21 @@
 /**
  * TLS contract tests (P0.3): client caPem/serverName handling and invalid caPem rejection.
  */
-import { describe, it, expect } from "bun:test";
+import { afterAll, beforeAll, describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { generateLocalhostCert, type GeneratedCert } from "./helpers/certs.js";
 import { nextPort } from "./helpers/network.js";
 
-const CERT_DIR = join(
-	import.meta.dir,
-	"..",
-	"..",
-	"..",
-	"examples",
-	"echo-playground",
-	"certs",
-);
-const CERT_PEM = existsSync(join(CERT_DIR, "cert.pem"))
-	? readFileSync(join(CERT_DIR, "cert.pem"), "utf-8")
-	: "";
-const KEY_PEM = existsSync(join(CERT_DIR, "key.pem"))
-	? readFileSync(join(CERT_DIR, "key.pem"), "utf-8")
-	: "";
-const HAS_CERTS = CERT_PEM.length > 0 && KEY_PEM.length > 0;
+let generatedCert: GeneratedCert | null = null;
+
+beforeAll(() => {
+	generatedCert = generateLocalhostCert();
+});
+
+afterAll(() => {
+	generatedCert?.cleanup();
+	generatedCert = null;
+});
 
 async function connectWithRetry(
 	url: string,
@@ -63,53 +56,42 @@ describe("TLS contract (P0.3)", () => {
 	}, 15000);
 
 	it("connect with serverName and caPem passes strict SNI/cert verification (when certs available)", async () => {
-		if (!HAS_CERTS) return;
+		if (!generatedCert) return;
 		const port = nextPort(24460, 2000);
 
 		const server = createServer({
 			port,
-			tls: { certPem: CERT_PEM, keyPem: KEY_PEM },
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
 			onSession: () => {},
 		});
 
 		try {
 			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
-				tls: { caPem: CERT_PEM, serverName: "localhost" },
+				tls: { caPem: generatedCert.certPem, serverName: "localhost" },
 			});
 			expect(client.id).toBeDefined();
 			client.close();
-		} catch (e) {
-			const msg = String(e);
-			if (msg.includes("CaUsedAsEndEntity")) {
-				await server.close();
-				return; // self-signed cert with CA bit; strict SNI test needs CA-signed cert
-			}
+		} finally {
 			await server.close();
-			throw e;
 		}
-		await server.close();
 	}, 20000);
 
 	it("connect with caPem accepts option and is used for verification", async () => {
-		if (!HAS_CERTS) {
+		if (!generatedCert) {
 			return;
 		}
 		const port = nextPort(24460, 2000);
-		// Server uses self-signed; passing same cert as caPem tests the code path.
-		// (Self-signed as CA can trigger CaUsedAsEndEntity; native+caPem path is covered.)
 		const server = createServer({
 			port,
-			tls: { certPem: CERT_PEM, keyPem: KEY_PEM },
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
 			onSession: () => {},
 		});
 		try {
 			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
-				tls: { caPem: CERT_PEM, serverName: "localhost" },
+				tls: { caPem: generatedCert.certPem, serverName: "localhost" },
 			});
 			expect(client.id).toBeDefined();
 			client.close();
-		} catch (e) {
-			expect(String(e)).toMatch(/E_TLS|UnknownIssuer|CaUsedAsEndEntity/);
 		} finally {
 			await server.close();
 		}
@@ -198,8 +180,8 @@ describe("TLS contract (P0.3)", () => {
 			before.close();
 
 			await server.updateCert({
-				certPem: HAS_CERTS ? CERT_PEM : "",
-				keyPem: HAS_CERTS ? KEY_PEM : "",
+				certPem: generatedCert?.certPem ?? "",
+				keyPem: generatedCert?.keyPem ?? "",
 			});
 
 			const after = await connectWithRetry(`https://127.0.0.1:${port}`, {
@@ -217,8 +199,8 @@ describe("TLS contract (P0.3)", () => {
 		const server = createServer({
 			port,
 			tls: {
-				certPem: HAS_CERTS ? CERT_PEM : "",
-				keyPem: HAS_CERTS ? KEY_PEM : "",
+				certPem: generatedCert?.certPem ?? "",
+				keyPem: generatedCert?.keyPem ?? "",
 			},
 			onSession: () => {},
 		});
@@ -240,6 +222,55 @@ describe("TLS contract (P0.3)", () => {
 			client.close();
 		} finally {
 			await server.close();
+		}
+	}, 25000);
+
+	it("server.updateCert does not close sessions owned by another server instance", async () => {
+		const portA = nextPort(24760, 2000);
+		const portB = nextPort(25060, 2000);
+		const serverA = createServer({
+			port: portA,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+
+		let serverBSession: any = null;
+		let resolveServerBReady!: () => void;
+		const serverBReady = new Promise<void>((r) => {
+			resolveServerBReady = r;
+		});
+		const serverB = createServer({
+			port: portB,
+			tls: { certPem: "", keyPem: "" },
+			onSession: async (s) => {
+				serverBSession = s;
+				resolveServerBReady();
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
+		});
+
+		const clientB = await connectWithRetry(`https://127.0.0.1:${portB}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			await Promise.race([
+				serverBReady,
+				Bun.sleep(2000).then(() => {
+					throw new Error("timeout waiting for server B session");
+				}),
+			]);
+			await serverA.updateCert({
+				certPem: generatedCert?.certPem ?? "",
+				keyPem: generatedCert?.keyPem ?? "",
+			});
+			await expect(
+				serverBSession.sendDatagram(new Uint8Array(64)),
+			).resolves.toBe(undefined);
+		} finally {
+			clientB.close();
+			await serverB.close();
+			await serverA.close();
 		}
 	}, 25000);
 });

@@ -8,6 +8,7 @@ const certHash = getSpkiHashBase64();
 
 export default defineConfig({
 	testDir: "./tests",
+	testMatch: "**/*.pw.ts",
 	timeout: 30_000,
 	retries: 0,
 	reporter:
