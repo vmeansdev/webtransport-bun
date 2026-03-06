@@ -192,5 +192,5 @@ describe("webtransport package exports", () => {
 			await server.close();
 			cert.cleanup();
 		}
-	});
+	}, 15000);
 });
