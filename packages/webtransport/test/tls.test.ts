@@ -401,6 +401,91 @@ describe("TLS contract (P0.3)", () => {
 		}
 	}, 20000);
 
+	it("wildcard SNI matches a single subdomain label and exact hostnames take precedence", async () => {
+		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
+		const wildcardCert = generateCertForNames(["*.example.test"]);
+		const exactCert = generateCertForNames(["api.example.test"]);
+		if (!defaultCert || !wildcardCert || !exactCert) {
+			throw new Error("failed to generate wildcard certificates");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: defaultCert.certPem,
+				keyPem: defaultCert.keyPem,
+				sni: [
+					{
+						serverName: "*.example.test",
+						certPem: wildcardCert.certPem,
+						keyPem: wildcardCert.keyPem,
+					},
+					{
+						serverName: "api.example.test",
+						certPem: exactCert.certPem,
+						keyPem: exactCert.keyPem,
+					},
+				],
+			},
+			onSession: () => {},
+		});
+		try {
+			const wildcardClient = await connectWithRetry(
+				`https://127.0.0.1:${port}`,
+				{
+					tls: {
+						caPem: wildcardCert.certPem,
+						serverName: "www.example.test",
+					},
+				},
+			);
+			wildcardClient.close();
+
+			const exactClient = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: {
+					caPem: exactCert.certPem,
+					serverName: "api.example.test",
+				},
+			});
+			exactClient.close();
+
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: {
+						caPem: wildcardCert.certPem,
+						serverName: "api.dev.example.test",
+					},
+				}),
+			).rejects.toThrow(/E_TLS|certificate|peer/i);
+		} finally {
+			await server.close();
+			defaultCert.cleanup();
+			wildcardCert.cleanup();
+			exactCert.cleanup();
+		}
+	}, 25000);
+
+	it("rejects invalid wildcard server names in tls.sni", () => {
+		if (!generatedCert) return;
+		expect(() =>
+			createServer({
+				port: nextPort(24460, 2000),
+				tls: {
+					certPem: generatedCert.certPem,
+					keyPem: generatedCert.keyPem,
+					sni: [
+						{
+							serverName: "api.*.example.test",
+							certPem: generatedCert.certPem,
+							keyPem: generatedCert.keyPem,
+						},
+					],
+				},
+				onSession: () => {},
+			}),
+		).toThrow(/E_TLS: .*wildcard serverName/);
+	});
+
 	it("unknown SNI rejects by default", async () => {
 		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
 		const apiCert = generateCertForNames(["api.test"]);

@@ -178,6 +178,9 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
 - Server names are matched case-insensitively after trimming a trailing `.`.
+- Wildcards are supported only in the left-most label, for example `*.example.com`.
+- Wildcards match exactly one label: `*.example.com` matches `api.example.com`, but not `example.com` or `a.b.example.com`.
+- Exact hostname entries take precedence over wildcard entries.
 - If `tls.sni` is empty, the server always serves the default certificate.
 - If `tls.sni` is non-empty and `unknownSniPolicy` is `"reject"` (default), unknown SNI names are rejected during TLS handshake.
 - If `tls.sni` is non-empty and `unknownSniPolicy` is `"default"`, unknown SNI names fall back to the default certificate.

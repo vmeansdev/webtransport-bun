@@ -201,6 +201,12 @@ impl ResolvesServerCert for LiveServerCertResolver {
                 self.sni_cert_selections.fetch_add(1, Ordering::Relaxed);
                 return Some(Arc::clone(cert));
             }
+            if let Some(wildcard_key) = wildcard_lookup_key(&key) {
+                if let Some(cert) = inner.certs_by_name.get(&wildcard_key) {
+                    self.sni_cert_selections.fetch_add(1, Ordering::Relaxed);
+                    return Some(Arc::clone(cert));
+                }
+            }
             if !inner.certs_by_name.is_empty()
                 && inner.unknown_sni_policy == UnknownSniPolicy::Reject
             {
@@ -222,7 +228,46 @@ pub(crate) fn normalize_server_name(server_name: &str) -> std::result::Result<St
     if normalized.is_empty() {
         return Err("serverName must be non-empty".to_string());
     }
+    if normalized.contains('*') {
+        validate_wildcard_server_name(&normalized)?;
+    }
     Ok(normalized)
+}
+
+fn validate_wildcard_server_name(server_name: &str) -> std::result::Result<(), String> {
+    if server_name.matches('*').count() != 1 || !server_name.starts_with("*.") {
+        return Err(
+            "wildcard serverName must start with \"*.\" and contain no other \"*\" characters"
+                .to_string(),
+        );
+    }
+    let suffix = &server_name[2..];
+    if suffix.is_empty() || suffix.starts_with('.') || suffix.ends_with('.') {
+        return Err("wildcard serverName suffix must be non-empty".to_string());
+    }
+    if !suffix.contains('.') {
+        return Err(
+            "wildcard serverName must include at least two labels after \"*.\"".to_string(),
+        );
+    }
+    if suffix.contains('*') {
+        return Err(
+            "wildcard serverName must start with \"*.\" and contain no other \"*\" characters"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn wildcard_lookup_key(server_name: &str) -> Option<String> {
+    if server_name.starts_with("*.") {
+        return None;
+    }
+    let (_, suffix) = server_name.split_once('.')?;
+    if !suffix.contains('.') {
+        return None;
+    }
+    Some(format!("*.{}", suffix))
 }
 
 fn parse_cert_chain(cert_pem: &str) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
@@ -327,9 +372,9 @@ pub(crate) fn build_default_dev_resolver(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_default_dev_resolver, build_server_tls_config, parse_certified_key,
-        parse_resolver_config, LiveServerCertResolver, ResolverConfig, SniCertConfig,
-        UnknownSniPolicy,
+        build_default_dev_resolver, build_server_tls_config, normalize_server_name,
+        parse_certified_key, parse_resolver_config, wildcard_lookup_key, LiveServerCertResolver,
+        ResolverConfig, SniCertConfig, UnknownSniPolicy,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -405,5 +450,35 @@ mod tests {
             vec!["a.example".to_string(), "z.example".to_string()]
         );
         assert_eq!(snapshot.unknown_sni_policy, UnknownSniPolicy::Default);
+    }
+
+    #[test]
+    fn normalize_server_name_accepts_valid_wildcard() {
+        assert_eq!(
+            normalize_server_name("*.Example.COM.").expect("normalized wildcard"),
+            "*.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_server_name_rejects_invalid_wildcard_shapes() {
+        for server_name in ["*", "*example.com", "api.*.example.com", "*.com"] {
+            let err = normalize_server_name(server_name).expect_err("expected wildcard error");
+            assert!(err.contains("wildcard serverName"));
+        }
+    }
+
+    #[test]
+    fn wildcard_lookup_key_is_single_label_only() {
+        assert_eq!(
+            wildcard_lookup_key("api.example.com").as_deref(),
+            Some("*.example.com")
+        );
+        assert_eq!(
+            wildcard_lookup_key("api.dev.example.com").as_deref(),
+            Some("*.dev.example.com")
+        );
+        assert_eq!(wildcard_lookup_key("example.com"), None);
+        assert_eq!(wildcard_lookup_key("localhost"), None);
     }
 }

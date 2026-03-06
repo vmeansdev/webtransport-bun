@@ -76,6 +76,7 @@ session.close();
 - `upsertSniCert()` and `removeSniCert()` manage individual hostname mappings in place.
 - `setUnknownSniPolicy()` changes only unknown-SNI handling in place.
 - `tlsSnapshot()` returns sorted active SNI hostnames plus the current unknown-SNI policy.
+- Wildcards are supported only as left-most single-label entries such as `*.example.com`; exact hostnames win over wildcards.
 - When `tls.sni` is configured, `unknownSniPolicy` defaults to `"reject"` for unknown hostnames.
 - Clients that do not send SNI still receive the default certificate.
 - `tls.sni` and `unknownSniPolicy` require a non-empty default server certificate/key.
