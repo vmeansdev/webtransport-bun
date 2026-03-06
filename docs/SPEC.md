@@ -66,6 +66,17 @@ export type TlsOptions = {
   /** Not supported for server. Passing caPem to createServer rejects with E_TLS. */
   caPem?: string | Uint8Array;
   serverName?: string; // for server: used in logs/metrics only; for client: SNI override
+  /** Additional hostname-specific certificates for server mode. */
+  sni?: Array<{
+    serverName: string;
+    certPem: string | Uint8Array;
+    keyPem: string | Uint8Array;
+  }>;
+  /**
+   * Server-only policy for unknown SNI hostnames when `sni` entries exist.
+   * Default is "reject". No-SNI clients still receive the default cert.
+   */
+  unknownSniPolicy?: "reject" | "default";
   /** Production guard override for empty cert/key fallback. */
   allowSelfSigned?: boolean;
 };
@@ -130,12 +141,31 @@ export interface WebTransportServer {
    * Transport-config or bind-address changes still require rebuilding/restarting the server.
    */
   updateCert(tls: { certPem: string | Uint8Array; keyPem: string | Uint8Array }): Promise<void>;
+  /**
+   * Atomically replace the full server TLS configuration in place.
+   * Existing sessions stay open; only new handshakes observe the new configuration.
+   * Supports replacing the default cert/key, SNI cert map, and unknown-SNI policy.
+   * Transport-config or bind-address changes still require rebuilding/restarting the server.
+   */
+  updateTls(tls: TlsOptions): Promise<void>;
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
 
 export function createServer(opts: ServerOptions): WebTransportServer;
 ```
+
+### Server TLS / SNI semantics
+
+- `tls.certPem` / `tls.keyPem` are the default server certificate and key.
+- `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
+- Server names are matched case-insensitively after trimming a trailing `.`.
+- If `tls.sni` is empty, the server always serves the default certificate.
+- If `tls.sni` is non-empty and `unknownSniPolicy` is `"reject"` (default), unknown SNI names are rejected during TLS handshake.
+- If `tls.sni` is non-empty and `unknownSniPolicy` is `"default"`, unknown SNI names fall back to the default certificate.
+- Clients that send no SNI still receive the default certificate.
+- `updateCert()` changes only the default certificate/key.
+- `updateTls()` atomically replaces the default certificate/key, full SNI map, and `unknownSniPolicy`.
 
 ### Client
 

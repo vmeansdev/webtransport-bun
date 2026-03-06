@@ -3,7 +3,10 @@
  */
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
-import { generateLocalhostCert } from "./helpers/certs.js";
+import {
+	generateCertForNames,
+	generateLocalhostCert,
+} from "./helpers/certs.js";
 import { nextPort } from "./helpers/network.js";
 
 const generatedCert = generateLocalhostCert();
@@ -361,4 +364,163 @@ describe("TLS contract (P0.3)", () => {
 			await serverA.close();
 		}
 	}, 25000);
+
+	it("server selects hostname-specific certificates from tls.sni", async () => {
+		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
+		const apiCert = generateCertForNames(["api.test"]);
+		if (!defaultCert || !apiCert) {
+			throw new Error("failed to generate SNI certificates");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: defaultCert.certPem,
+				keyPem: defaultCert.keyPem,
+				sni: [
+					{
+						serverName: "api.test",
+						certPem: apiCert.certPem,
+						keyPem: apiCert.keyPem,
+					},
+				],
+			},
+			onSession: () => {},
+		});
+		try {
+			const apiClient = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: apiCert.certPem, serverName: "api.test" },
+			});
+			apiClient.close();
+		} finally {
+			await server.close();
+			apiCert.cleanup();
+			defaultCert.cleanup();
+		}
+	}, 20000);
+
+	it("unknown SNI rejects by default", async () => {
+		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
+		const unknownCert = generateCertForNames(["unknown.test"]);
+		if (!defaultCert || !unknownCert) {
+			throw new Error("failed to generate certificates");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: defaultCert.certPem,
+				keyPem: defaultCert.keyPem,
+			},
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { caPem: unknownCert.certPem, serverName: "unknown.test" },
+				}),
+			).rejects.toThrow(/E_TLS|certificate|peer/i);
+		} finally {
+			await server.close();
+			unknownCert.cleanup();
+			defaultCert.cleanup();
+		}
+	}, 20000);
+
+	it("unknown SNI can fall back to the default certificate", async () => {
+		const defaultCert = generateCertForNames([
+			"fallback.test",
+			"unmatched.test",
+			"127.0.0.1",
+		]);
+		if (!defaultCert) {
+			throw new Error("failed to generate fallback certificate");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: defaultCert.certPem,
+				keyPem: defaultCert.keyPem,
+				unknownSniPolicy: "default",
+			},
+			onSession: () => {},
+		});
+		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: defaultCert.certPem, serverName: "unmatched.test" },
+			});
+			client.close();
+		} finally {
+			await server.close();
+			defaultCert.cleanup();
+		}
+	}, 20000);
+
+	it("server.updateTls atomically replaces SNI certificates and unknown-SNI policy", async () => {
+		const initialDefault = generateCertForNames(["initial.test", "127.0.0.1"]);
+		const initialApi = generateCertForNames(["api.initial.test"]);
+		const nextDefault = generateCertForNames([
+			"next.test",
+			"unmatched.test",
+			"127.0.0.1",
+		]);
+		const nextApi = generateCertForNames(["api.next.test"]);
+		if (!initialDefault || !initialApi || !nextDefault || !nextApi) {
+			throw new Error("failed to generate updateTls certificates");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: initialDefault.certPem,
+				keyPem: initialDefault.keyPem,
+				sni: [
+					{
+						serverName: "api.initial.test",
+						certPem: initialApi.certPem,
+						keyPem: initialApi.keyPem,
+					},
+				],
+			},
+			onSession: () => {},
+		});
+		try {
+			const before = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: initialApi.certPem, serverName: "api.initial.test" },
+			});
+			before.close();
+			await server.updateTls({
+				certPem: nextDefault.certPem,
+				keyPem: nextDefault.keyPem,
+				unknownSniPolicy: "default",
+				sni: [
+					{
+						serverName: "api.next.test",
+						certPem: nextApi.certPem,
+						keyPem: nextApi.keyPem,
+					},
+				],
+			});
+			const after = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: nextApi.certPem, serverName: "api.next.test" },
+			});
+			after.close();
+			const fallback = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: nextDefault.certPem, serverName: "unmatched.test" },
+			});
+			fallback.close();
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { caPem: initialApi.certPem, serverName: "api.initial.test" },
+				}),
+			).rejects.toThrow(/E_TLS|certificate|peer/i);
+		} finally {
+			await server.close();
+			initialDefault.cleanup();
+			initialApi.cleanup();
+			nextDefault.cleanup();
+			nextApi.cleanup();
+		}
+	}, 30000);
 });

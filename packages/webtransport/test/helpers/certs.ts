@@ -9,7 +9,23 @@ export type GeneratedCert = {
 	cleanup: () => void;
 };
 
-export function generateLocalhostCert(): GeneratedCert | null {
+function buildSubjectAltName(names: string[]): string {
+	return names
+		.map((name) => {
+			const normalized = name.trim();
+			if (
+				/^\d{1,3}(?:\.\d{1,3}){3}$/.test(normalized) ||
+				normalized.includes(":")
+			) {
+				return `IP:${normalized}`;
+			}
+			return `DNS:${normalized}`;
+		})
+		.join(",");
+}
+
+export function generateCertForNames(names: string[]): GeneratedCert | null {
+	if (names.length === 0) return null;
 	const dir = mkdtempSync(join(tmpdir(), "webtransport-bun-cert-"));
 	const certPath = join(dir, "cert.pem");
 	const keyPath = join(dir, "key.pem");
@@ -17,6 +33,7 @@ export function generateLocalhostCert(): GeneratedCert | null {
 	const caKeyPath = join(dir, "ca-key.pem");
 	const csrPath = join(dir, "leaf.csr");
 	const extPath = join(dir, "leaf.ext");
+	const subjectName = names[0]?.trim() || "localhost";
 
 	try {
 		writeFileSync(
@@ -25,7 +42,7 @@ export function generateLocalhostCert(): GeneratedCert | null {
 				"basicConstraints=critical,CA:FALSE",
 				"keyUsage=critical,digitalSignature,keyEncipherment",
 				"extendedKeyUsage=serverAuth",
-				"subjectAltName=DNS:localhost,IP:127.0.0.1",
+				`subjectAltName=${buildSubjectAltName(names)}`,
 			].join("\n"),
 		);
 
@@ -57,7 +74,7 @@ export function generateLocalhostCert(): GeneratedCert | null {
 			"-out",
 			csrPath,
 			"-subj",
-			"/CN=localhost",
+			`/CN=${subjectName}`,
 		]);
 
 		execFileSync("openssl", [
@@ -90,4 +107,8 @@ export function generateLocalhostCert(): GeneratedCert | null {
 		rmSync(dir, { recursive: true, force: true });
 		return null;
 	}
+}
+
+export function generateLocalhostCert(): GeneratedCert | null {
+	return generateCertForNames(["localhost", "127.0.0.1"]);
 }

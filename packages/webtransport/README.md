@@ -36,6 +36,20 @@ const server = createServer({
 // Transport config and bind-address changes still require rebuilding the server.
 await server.updateCert({ certPem: "...next cert...", keyPem: "...next key..." });
 
+// Or atomically replace the full TLS configuration, including hostname-specific SNI certs.
+await server.updateTls({
+  certPem: "...default cert...",
+  keyPem: "...default key...",
+  sni: [
+    {
+      serverName: "api.example.test",
+      certPem: "...api cert...",
+      keyPem: "...api key...",
+    },
+  ],
+  unknownSniPolicy: "reject",
+});
+
 const session = await connect("https://127.0.0.1:4433", {
   tls: { insecureSkipVerify: true }, // dev only
 });
@@ -44,6 +58,14 @@ session.close();
 ```
 
 ## Troubleshooting
+
+## TLS hot-swap and SNI
+
+- `updateCert()` changes only the default server certificate/key.
+- `updateTls()` atomically replaces the default certificate/key, full SNI certificate map, and unknown-SNI policy.
+- When `tls.sni` is configured, `unknownSniPolicy` defaults to `"reject"` for unknown hostnames.
+- Clients that do not send SNI still receive the default certificate.
+- Bind-address or transport-config changes still require rebuilding/restarting the server.
 
 ### "Native addon not loaded"
 

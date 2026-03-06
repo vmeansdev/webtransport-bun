@@ -33,6 +33,25 @@ await server.updateCert({
 
 `updateCert()` hot-swaps only the TLS leaf certificate/key material. Existing sessions remain connected, and new handshakes use the new certificate immediately. Changes to bind address or transport configuration still require rebuilding or restarting the server.
 
+## Multi-host TLS with SNI
+
+```ts
+await server.updateTls({
+  certPem: fs.readFileSync("default-cert.pem", "utf-8"),
+  keyPem: fs.readFileSync("default-key.pem", "utf-8"),
+  sni: [
+    {
+      serverName: "api.example.test",
+      certPem: fs.readFileSync("api-cert.pem", "utf-8"),
+      keyPem: fs.readFileSync("api-key.pem", "utf-8"),
+    },
+  ],
+  unknownSniPolicy: "reject",
+});
+```
+
+`updateTls()` atomically replaces the default cert/key, the full SNI cert map, and the unknown-SNI policy without dropping existing sessions. By default, unknown SNI names are rejected when SNI certs are configured; clients that send no SNI still receive the default certificate. Changes to bind address or transport configuration still require rebuilding or restarting the server.
+
 ## Requirements
 
 - Bun >= 1.3.9, or Node, or Deno

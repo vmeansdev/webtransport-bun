@@ -3,6 +3,7 @@
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::{Env, JsFunction, Result};
 use napi_derive::napi;
+use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +16,64 @@ use crate::server_metrics::ServerMetrics;
 use crate::{LogEvent, SessionEvent};
 
 static SERVER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerTlsSniEntry {
+    server_name: String,
+    cert_pem: String,
+    key_pem: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerTlsConfigInput {
+    cert_pem: String,
+    key_pem: String,
+    #[serde(default)]
+    ca_pem: String,
+    #[serde(default)]
+    sni: Vec<ServerTlsSniEntry>,
+    #[serde(default)]
+    unknown_sni_policy: Option<String>,
+}
+
+fn parse_unknown_sni_policy(
+    value: Option<&str>,
+) -> std::result::Result<crate::server_tls::UnknownSniPolicy, String> {
+    match value.unwrap_or("reject") {
+        "reject" => Ok(crate::server_tls::UnknownSniPolicy::Reject),
+        "default" => Ok(crate::server_tls::UnknownSniPolicy::Default),
+        other => Err(format!(
+            "unknownSniPolicy must be \"reject\" or \"default\", got \"{}\"",
+            other
+        )),
+    }
+}
+
+fn parse_tls_resolver_config(
+    tls_config_json: &str,
+) -> std::result::Result<crate::server_tls::ResolverConfig, String> {
+    let input: ServerTlsConfigInput = serde_json::from_str(tls_config_json)
+        .map_err(|e| format!("invalid server tls JSON: {}", e))?;
+    if !input.ca_pem.trim().is_empty() {
+        return Err("server tls.caPem is not supported yet".to_string());
+    }
+    Ok(crate::server_tls::ResolverConfig {
+        default_cert_pem: input.cert_pem,
+        default_key_pem: input.key_pem,
+        sni_certs: input
+            .sni
+            .into_iter()
+            .map(|entry| crate::server_tls::SniCertConfig {
+                server_name: entry.server_name,
+                cert_pem: entry.cert_pem,
+                key_pem: entry.key_pem,
+            })
+            .collect(),
+        unknown_sni_policy: parse_unknown_sni_policy(input.unknown_sni_policy.as_deref())?,
+    })
+}
 
 struct ServerRuntimeState {
     shutdown_tx: Option<watch::Sender<()>>,
@@ -108,20 +167,13 @@ impl ServerHandle {
         port: u32,
         host: String,
         debug: bool,
-        cert_pem: String,
-        key_pem: String,
-        ca_pem: String,
+        tls_config_json: String,
         _limits_json: String,
         _rate_limits_json: String,
         on_session: JsFunction,
         log_fn: JsFunction,
     ) -> Result<Self> {
         panic_guard::catch_panic(|| {
-            if !ca_pem.trim().is_empty() {
-                return Err(napi::Error::from_reason(
-                    "E_TLS: server tls.caPem is not supported yet",
-                ));
-            }
             let session_tsfn: ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal> =
                 on_session
                     .create_threadsafe_function(
@@ -202,8 +254,12 @@ impl ServerHandle {
             let port_u16 = port.min(65535) as u16;
 
             let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tls_resolver = if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
-                crate::server_tls::build_live_resolver_from_pem(&cert_pem, &key_pem)
+            let tls_config = parse_tls_resolver_config(&tls_config_json)
+                .map_err(|msg| napi::Error::from_reason(format!("E_TLS: {}", msg)))?;
+            let tls_resolver = if !tls_config.default_cert_pem.trim().is_empty()
+                && !tls_config.default_key_pem.trim().is_empty()
+            {
+                crate::server_tls::build_live_resolver_from_config(&tls_config)
             } else {
                 crate::server_tls::build_default_dev_resolver()
             }
@@ -267,6 +323,33 @@ impl ServerHandle {
             state
                 .tls_resolver
                 .replace_default(certified_key)
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    #[napi]
+    pub async fn update_tls(&self, tls_config_json: String) -> Result<()> {
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            if state.closed {
+                return Err(napi::Error::from_reason(
+                    "E_SESSION_CLOSED: server is closed",
+                ));
+            }
+            let tls_config = parse_tls_resolver_config(&tls_config_json).map_err(|e| {
+                napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+            })?;
+            let (default_cert, certs_by_name, unknown_sni_policy) =
+                crate::server_tls::parse_resolver_config(&tls_config).map_err(|e| {
+                    napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+                })?;
+            state
+                .tls_resolver
+                .replace_all(default_cert, certs_by_name, unknown_sni_policy)
                 .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
             Ok(())
         })

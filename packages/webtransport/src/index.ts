@@ -275,6 +275,12 @@ async function openStreamWithWait<T>(
 // ---------------------------------------------------------------------------
 
 /** TLS configuration for server (cert/key) or client (CA, SNI). */
+export type ServerTlsSniEntry = {
+	serverName: string;
+	certPem: string | Uint8Array;
+	keyPem: string | Uint8Array;
+};
+
 export type TlsOptions = {
 	/** PEM-encoded certificate (server) or CA (client). */
 	certPem: string | Uint8Array;
@@ -284,6 +290,10 @@ export type TlsOptions = {
 	caPem?: string | Uint8Array;
 	/** SNI for client mode; for server, used in logs/metrics. */
 	serverName?: string;
+	/** Optional additional SNI certificates for server mode. */
+	sni?: ServerTlsSniEntry[];
+	/** Unknown SNI handling for server mode. Default "reject". No-SNI still uses default cert. */
+	unknownSniPolicy?: "reject" | "default";
 	/** When true, allow empty cert/key fallback in production (dev only). */
 	allowSelfSigned?: boolean;
 };
@@ -400,11 +410,13 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
-	/** Rotate server TLS certificate/key at runtime. Existing sessions are drained/closed. */
+	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
 	updateCert(tls: {
 		certPem: string | Uint8Array;
 		keyPem: string | Uint8Array;
 	}): Promise<void>;
+	/** Atomically replace the full server TLS configuration, including SNI certs and unknown-SNI policy. */
+	updateTls(tls: TlsOptions): Promise<void>;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1036,14 +1048,14 @@ class NativeServerSession implements ServerSession {
 export function createServer(opts: ServerOptions): WebTransportServer {
 	const native = getNativeOrThrow();
 
-	const certPem =
-		typeof opts.tls.certPem === "string"
-			? opts.tls.certPem
-			: new TextDecoder().decode(opts.tls.certPem);
-	const keyPem =
-		typeof opts.tls.keyPem === "string"
-			? opts.tls.keyPem
-			: new TextDecoder().decode(opts.tls.keyPem);
+	const decodePem = (value: string | Uint8Array | undefined): string =>
+		typeof value === "string"
+			? value
+			: value != null
+				? new TextDecoder().decode(value)
+				: "";
+	const certPem = decodePem(opts.tls.certPem);
+	const keyPem = decodePem(opts.tls.keyPem);
 	if (
 		process.env.NODE_ENV === "production" &&
 		opts.tls.allowSelfSigned !== true &&
@@ -1054,12 +1066,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			"E_TLS: empty certPem/keyPem is not allowed in production (set tls.allowSelfSigned=true to override)",
 		);
 	}
-	const caPem =
-		typeof opts.tls.caPem === "string"
-			? opts.tls.caPem
-			: opts.tls.caPem != null
-				? new TextDecoder().decode(opts.tls.caPem)
-				: "";
+	const caPem = decodePem(opts.tls.caPem);
+	const tlsConfigToJson = (tls: TlsOptions): string =>
+		JSON.stringify({
+			certPem: decodePem(tls.certPem),
+			keyPem: decodePem(tls.keyPem),
+			caPem: decodePem(tls.caPem),
+			unknownSniPolicy: tls.unknownSniPolicy ?? "reject",
+			sni:
+				tls.sni?.map((entry) => ({
+					serverName: entry.serverName,
+					certPem: decodePem(entry.certPem),
+					keyPem: decodePem(entry.keyPem),
+				})) ?? [],
+		});
 
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
@@ -1100,9 +1120,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		opts.port,
 		opts.host ?? "0.0.0.0",
 		opts.debug === true,
-		certPem,
-		keyPem,
-		caPem,
+		tlsConfigToJson(opts.tls),
 		limitsJson,
 		rateLimitsJson,
 		(events: any[]) => {
@@ -1180,15 +1198,12 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		updateCert: async (tls) => {
-			const nextCertPem =
-				typeof tls.certPem === "string"
-					? tls.certPem
-					: new TextDecoder().decode(tls.certPem);
-			const nextKeyPem =
-				typeof tls.keyPem === "string"
-					? tls.keyPem
-					: new TextDecoder().decode(tls.keyPem);
+			const nextCertPem = decodePem(tls.certPem);
+			const nextKeyPem = decodePem(tls.keyPem);
 			await handle.updateCert(nextCertPem, nextKeyPem);
+		},
+		updateTls: async (tls) => {
+			await handle.updateTls(tlsConfigToJson(tls));
 		},
 		close: async () => {
 			await handle.close();
