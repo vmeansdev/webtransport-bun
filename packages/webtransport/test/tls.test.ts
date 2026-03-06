@@ -1,20 +1,15 @@
 /**
  * TLS contract tests (P0.3): client caPem/serverName handling and invalid caPem rejection.
  */
-import { afterAll, beforeAll, describe, it, expect } from "bun:test";
+import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
-import { generateLocalhostCert, type GeneratedCert } from "./helpers/certs.js";
+import { generateLocalhostCert } from "./helpers/certs.js";
 import { nextPort } from "./helpers/network.js";
 
-let generatedCert: GeneratedCert | null = null;
+const generatedCert = generateLocalhostCert();
 
-beforeAll(() => {
-	generatedCert = generateLocalhostCert();
-});
-
-afterAll(() => {
+process.once("exit", () => {
 	generatedCert?.cleanup();
-	generatedCert = null;
 });
 
 async function connectWithRetry(
