@@ -138,6 +138,7 @@ fn build_quic_transport_config(
     config
 }
 
+#[cfg(test)]
 fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
     match mode {
         CongestionControlMode::Default => "cubic",
