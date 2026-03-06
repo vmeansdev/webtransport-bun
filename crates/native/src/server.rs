@@ -101,7 +101,17 @@ fn parse_sni_entries_json(
 struct ServerRuntimeState {
     shutdown_tx: Option<watch::Sender<()>>,
     tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
+    explicit_default_cert: bool,
     closed: bool,
+}
+
+fn ensure_explicit_default_cert(state: &ServerRuntimeState) -> Result<()> {
+    if state.explicit_default_cert {
+        return Ok(());
+    }
+    Err(napi::Error::from_reason(
+        "E_INTERNAL: tls rotation failed: SNI management requires a non-empty default certPem/keyPem",
+    ))
 }
 
 fn is_addr_in_use_error(message: &str) -> bool {
@@ -313,6 +323,8 @@ impl ServerHandle {
                 state: Mutex::new(ServerRuntimeState {
                     shutdown_tx: Some(shutdown_tx),
                     tls_resolver,
+                    explicit_default_cert: !tls_config.default_cert_pem.trim().is_empty()
+                        && !tls_config.default_key_pem.trim().is_empty(),
                     closed: false,
                 }),
             })
@@ -327,7 +339,7 @@ impl ServerHandle {
     #[napi]
     pub async fn update_cert(&self, cert_pem: String, key_pem: String) -> Result<()> {
         panic_guard::catch_panic(|| {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
@@ -347,6 +359,7 @@ impl ServerHandle {
                 .tls_resolver
                 .replace_default(certified_key)
                 .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            state.explicit_default_cert = true;
             Ok(())
         })
     }
@@ -354,7 +367,7 @@ impl ServerHandle {
     #[napi]
     pub async fn update_tls(&self, tls_config_json: String) -> Result<()> {
         panic_guard::catch_panic(|| {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
@@ -374,6 +387,7 @@ impl ServerHandle {
                 .tls_resolver
                 .replace_all(default_cert, certs_by_name, unknown_sni_policy)
                 .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            state.explicit_default_cert = true;
             Ok(())
         })
     }
@@ -390,6 +404,7 @@ impl ServerHandle {
                     "E_SESSION_CLOSED: server is closed",
                 ));
             }
+            ensure_explicit_default_cert(&state)?;
             let sni_certs = parse_sni_entries_json(&sni_json).map_err(|e| {
                 napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
             })?;
@@ -437,6 +452,7 @@ impl ServerHandle {
                     "E_SESSION_CLOSED: server is closed",
                 ));
             }
+            ensure_explicit_default_cert(&state)?;
             let certified_key = crate::server_tls::parse_certified_key(&cert_pem, &key_pem)
                 .map_err(|e| {
                     napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
@@ -461,6 +477,7 @@ impl ServerHandle {
                     "E_SESSION_CLOSED: server is closed",
                 ));
             }
+            ensure_explicit_default_cert(&state)?;
             let removed = state
                 .tls_resolver
                 .remove_sni_cert(&server_name)
@@ -487,6 +504,7 @@ impl ServerHandle {
                     "E_SESSION_CLOSED: server is closed",
                 ));
             }
+            ensure_explicit_default_cert(&state)?;
             let policy = parse_unknown_sni_policy(Some(policy.as_str())).map_err(|e| {
                 napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
             })?;

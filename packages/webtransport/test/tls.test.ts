@@ -595,6 +595,39 @@ describe("TLS contract (P0.3)", () => {
 		}
 	}, 30000);
 
+	it("incremental SNI APIs reject the dev self-signed fallback until a default cert is installed", async () => {
+		const apiCert = generateCertForNames(["api.dev.test"]);
+		if (!apiCert) {
+			throw new Error("failed to generate dev SNI certificate");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				server.upsertSniCert({
+					serverName: "api.dev.test",
+					certPem: apiCert.certPem,
+					keyPem: apiCert.keyPem,
+				}),
+			).rejects.toThrow(
+				/E_INTERNAL: tls rotation failed: SNI management requires a non-empty default certPem\/keyPem/,
+			);
+			await expect(server.setUnknownSniPolicy("default")).rejects.toThrow(
+				/E_INTERNAL: tls rotation failed: SNI management requires a non-empty default certPem\/keyPem/,
+			);
+			await expect(server.replaceSniCerts([])).rejects.toThrow(
+				/E_INTERNAL: tls rotation failed: SNI management requires a non-empty default certPem\/keyPem/,
+			);
+		} finally {
+			await server.close();
+			apiCert.cleanup();
+		}
+	}, 20000);
+
 	it("server.updateTls atomically replaces SNI certificates and unknown-SNI policy", async () => {
 		const initialDefault = generateCertForNames(["initial.test", "127.0.0.1"]);
 		const initialApi = generateCertForNames(["api.initial.test"]);
