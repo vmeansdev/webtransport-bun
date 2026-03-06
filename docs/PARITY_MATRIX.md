@@ -29,7 +29,7 @@ This matrix is the single source of truth. Update it when implementation changes
 
 - Current public API is Node-oriented (`createServer`, `connect`, Node streams).
 - Browser-style WebTransport client facade is now implemented as an additive API.
-- Remaining execution blocker is CI evidence closure (R6).
+- CI parity/interop coverage is in place; remaining work is ongoing hygiene and evidence maintenance.
 
 ## Target API Shape (recommended)
 
@@ -127,7 +127,7 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 | Transport states      | state machine transitions                           | `implemented`  | Internal state machine: connecting → connected → draining → closed / failed                              | Method guards and transition tests (R3)                                 | —                                                                       |
 | Termination semantics | iterator/stream termination on close                | `implemented`  | Iterators stop on closed flags; native read/accept returns null on close                                | parity-facade-lifecycle tests cover incomingDatagrams/bidi/uni termination on close | —                                                                       |
 | Static capabilities   | `supportsReliableOnly`                             | `implemented`  | WebTransport.supportsReliableOnly = false (QUIC supports unreliable)                                   | —                                                                       | —                                                                       |
-| Options               | `congestionControl`                                | `implemented`  | Accepted and forwarded; runtime applies effective mode semantics with explicit default fallback          | Behavior is deterministic and surfaced via facade getter                 | Add multi-algorithm backend selection when available                     |
+| Options               | `congestionControl`                                | `partial`      | Accepted and validated; current runtime falls back to `default` for all effective modes and surfaces that fallback via facade getter | Option shape is present, but backend algorithm selection is not yet implemented | Add multi-algorithm backend selection when available                     |
 | Options               | `datagramsReadableType`                            | `implemented`  | `"bytes"` creates ReadableByteStream with BYOB support; `"default"` uses normal ReadableStream         | —                                                                     | —                                                                       |
 | Options               | `allowPooling`                                     | `implemented`  | When true, endpoint-level pooling reuses compatible connects; when false, dedicated sessions             | Pool hit/miss metrics via `clientPoolMetricsSnapshot()`                 | —                                                                       |
 | Options               | `requireUnreliable`                                | `implemented`  | Accepted; runtime transport is QUIC/WebTransport and supports unreliable delivery                         | Requirement is always satisfiable on supported backend                 | Keep invariant covered in option tests                                  |

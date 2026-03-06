@@ -32,6 +32,7 @@ const server = createServer({
 });
 
 // Rotate TLS identity without process restart.
+// Current behavior: existing sessions are closed during rotation.
 await server.updateCert({ certPem: "...next cert...", keyPem: "...next key..." });
 
 const session = await connect("https://127.0.0.1:4433", {

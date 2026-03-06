@@ -42,7 +42,6 @@
 
 ## Who This Is Not For
 
-- Projects requiring Windows support.
 - Teams needing full browser WebTransport spec parity.
 - Cases where plain WebSockets are fully sufficient and simpler to operate.
 

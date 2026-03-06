@@ -24,7 +24,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - browser-shaped stream control mapping (`writable.abort` -> reset, `readable.cancel` -> stopSending)
   - static capability `supportsReliableOnly`
   - `getStats()` connection counters (`bytesSent`, `bytesReceived`, packet counters, datagrams)
-  - `congestionControl` option forwarding with explicit effective-mode behavior
+  - `congestionControl` option validation with explicit effective-mode fallback to `default`
   - `serverCertificateHashes` pinning support in native TLS verify path
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
@@ -37,7 +37,7 @@ When `allowPooling: true`, the runtime uses **endpoint-level pooling**:
 
 - **What is pooled:** `Endpoint` instances (UDP socket + TLS config) are reused per compatibility key.
 - **What is not pooled:** Each `connect()` still creates a new `Connection` (new QUIC handshake + WebTransport CONNECT); sessions are independent.
-- **Compatibility key dimensions:** scheme, host, port, SNI (`serverName`), TLS mode (`insecureSkipVerify`, `caPem`, `serverCertificateHashes`), `requireUnreliable`, and congestion preference. Connects with identical key reuse the pooled endpoint; differing key creates a new pool entry.
+- **Compatibility key dimensions:** scheme, host, port, SNI (`serverName`), TLS mode (`insecureSkipVerify`, `caPem`, `serverCertificateHashes`), `requireUnreliable`, and requested congestion preference. Connects with identical key reuse the pooled endpoint; differing key creates a new pool entry.
 - **Non-reuse conditions:** Different origin, TLS config, or transport options; `serverCertificateHashes` is incompatible with pooling (rejected at validation).
 - **Terminology:** Use "endpoint pooling" (reuse of `Endpoint`) — not "connection pooling" or "session pooling."
 
@@ -124,6 +124,7 @@ export type LogEvent = {
 
 export interface WebTransportServer {
   readonly address: { host: string; port: number };
+  /** Current behavior: rotation closes existing sessions before the new identity starts serving. */
   updateCert(tls: { certPem: string | Uint8Array; keyPem: string | Uint8Array }): Promise<void>;
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
