@@ -190,7 +190,9 @@ describe("TLS contract (P0.3)", () => {
 						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
 					]);
 					if (next.done) break;
-					await s.sendDatagram(next.value);
+					const datagram = next.value;
+					if (!datagram) break;
+					await s.sendDatagram(datagram);
 				}
 			},
 		});
@@ -266,7 +268,9 @@ describe("TLS contract (P0.3)", () => {
 						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
 					]);
 					if (next.done) break;
-					await s.sendDatagram(next.value);
+					const datagram = next.value;
+					if (!datagram) break;
+					await s.sendDatagram(datagram);
 				}
 			},
 		});
