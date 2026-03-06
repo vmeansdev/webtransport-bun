@@ -126,6 +126,44 @@ describe("parity pooling", () => {
 		});
 	});
 
+	test("different compatibility keys do not reuse (congestionControl differs)", async () => {
+		await withServer(async (url) => {
+			const before = clientPoolMetricsSnapshot();
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "throughput",
+				tls: { insecureSkipVerify: true },
+			});
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "low-latency",
+				tls: { insecureSkipVerify: true },
+			});
+			const after = clientPoolMetricsSnapshot();
+			expect(after.misses).toBeGreaterThanOrEqual(before.misses + 2);
+			expect(after.hits).toBeGreaterThanOrEqual(before.hits);
+		});
+	});
+
+	test("same non-default congestionControl reuses pooled endpoint", async () => {
+		await withServer(async (url) => {
+			const before = clientPoolMetricsSnapshot();
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "throughput",
+				tls: { insecureSkipVerify: true },
+			});
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "throughput",
+				tls: { insecureSkipVerify: true },
+			});
+			const after = clientPoolMetricsSnapshot();
+			expect(after.misses).toBeGreaterThanOrEqual(before.misses + 1);
+			expect(after.hits).toBeGreaterThanOrEqual(before.hits + 1);
+		});
+	});
+
 	test("clientPoolMetricsSnapshot returns shape", () => {
 		const s = clientPoolMetricsSnapshot();
 		expect(typeof s.hits).toBe("number");

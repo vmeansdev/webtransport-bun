@@ -138,6 +138,14 @@ fn build_quic_transport_config(
     config
 }
 
+fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
+    match mode {
+        CongestionControlMode::Default => "cubic",
+        CongestionControlMode::Throughput => "bbr",
+        CongestionControlMode::LowLatency => "new_reno",
+    }
+}
+
 fn build_wtransport_client_config(
     insecure_skip_verify: bool,
     ca_pem: Option<&str>,
@@ -1155,7 +1163,8 @@ async fn run_connect(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_root_cert_store, parse_client_limits, parse_congestion_control, CongestionControlMode,
+        build_root_cert_store, congestion_controller_label, parse_client_limits,
+        parse_congestion_control, CongestionControlMode,
     };
     use serde_json::json;
 
@@ -1193,12 +1202,15 @@ mod tests {
         let throughput = parse_congestion_control(&json!({ "congestionControl": "throughput" }))
             .expect("throughput should parse");
         assert_eq!(throughput, CongestionControlMode::Throughput);
+        assert_eq!(congestion_controller_label(throughput), "bbr");
 
         let low_latency = parse_congestion_control(&json!({ "congestionControl": "low-latency" }))
             .expect("low-latency should parse");
         assert_eq!(low_latency, CongestionControlMode::LowLatency);
+        assert_eq!(congestion_controller_label(low_latency), "new_reno");
 
         let default_mode = parse_congestion_control(&json!({})).expect("default should parse");
         assert_eq!(default_mode, CongestionControlMode::Default);
+        assert_eq!(congestion_controller_label(default_mode), "cubic");
     }
 }
