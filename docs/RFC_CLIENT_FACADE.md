@@ -114,7 +114,7 @@ export function toWebTransport(session: ClientSession): WebTransport;
 ### Errors
 - Preserve stable internal `E_*` codes.
 - `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_INTERNAL`.
-- `strictW3CErrors: true` enables browser-style DOMException names (TimeoutError, InvalidStateError, etc.) on connect/session errors; `code` remains for programmatic handling.
+- `strictW3CErrors: true` enables browser-style DOMException names (TimeoutError, InvalidStateError, AbortError, etc.) on validation, connect/session, and Web Streams facade errors; `code` remains for programmatic handling.
 
 ### Option behavior
 - `allowPooling` is accepted; when true, endpoint-level pooling reuses compatible connects.

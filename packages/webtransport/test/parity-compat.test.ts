@@ -9,8 +9,10 @@ import {
 	WebTransport,
 	createServer,
 	WebTransportError,
+	__TESTING__,
 	E_INTERNAL,
 	E_HANDSHAKE_TIMEOUT,
+	E_QUEUE_FULL,
 } from "../src/index.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
@@ -116,6 +118,44 @@ describe("parity compat (behavior-level)", () => {
 		if ((err as WebTransportError).code === E_HANDSHAKE_TIMEOUT) {
 			expect((err as WebTransportError).name).toBe("WebTransportError");
 		}
+	});
+
+	test("strictW3CErrors: validation errors use browser-style names", () => {
+		try {
+			new WebTransport(`https://127.0.0.1:${port}`, {
+				strictW3CErrors: true,
+				// @ts-expect-error invalid
+				congestionControl: "invalid",
+				tls: { insecureSkipVerify: true },
+			});
+		} catch (e) {
+			expect(e).toBeInstanceOf(WebTransportError);
+			expect((e as WebTransportError).code).toBe(E_INTERNAL);
+			expect((e as WebTransportError).name).toBe("TypeError");
+			return;
+		}
+		throw new Error("expected constructor to throw");
+	});
+
+	test("strictW3CErrors: queue pressure maps to QuotaExceededError", async () => {
+		const session = __TESTING__.createNativeClientSessionForTests(
+			{
+				id: "strict-client",
+				peerIp: "127.0.0.1",
+				peerPort: port,
+				sendDatagram: async () => {
+					throw new Error(`${E_QUEUE_FULL}: synthetic queue pressure`);
+				},
+				close: () => {},
+			},
+			true,
+		);
+		await expect(
+			session.sendDatagram(new Uint8Array([1])),
+		).rejects.toMatchObject({
+			code: E_QUEUE_FULL,
+			name: "QuotaExceededError",
+		});
 	});
 
 	test("S4 regression: close() before ready does not cause unhandled rejection (PARITY_MATRIX)", async () => {

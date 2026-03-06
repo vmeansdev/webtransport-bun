@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import { Duplex } from "node:stream";
 import {
 	__TESTING__,
 	E_INTERNAL,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
+	E_STOP_SENDING,
 	WebTransportError,
+	WebTransport,
 } from "../src/index.js";
 
 describe("internal TS error propagation", () => {
@@ -95,5 +98,41 @@ describe("internal TS error propagation", () => {
 		const reader = readable.getReader();
 		const result = await reader.read();
 		expect(result.done).toBe(true);
+	});
+
+	it("Web Streams adapters apply strictW3CErrors to stream write failures", async () => {
+		const duplex = new Duplex({
+			read() {},
+			write(_chunk, _encoding, callback) {
+				callback(new Error(`${E_STOP_SENDING}: peer stopped`));
+			},
+		});
+		const closed = new Promise<{ code?: number; reason?: string }>(() => {});
+		const session = {
+			id: "wrapped",
+			peer: { ip: "127.0.0.1", port: 4433 },
+			ready: Promise.resolve(),
+			closed,
+			close() {},
+			sendDatagram: async () => {},
+			async *incomingDatagrams() {},
+			createBidirectionalStream: async () => duplex,
+			async *incomingBidirectionalStreams() {},
+			createUnidirectionalStream: async () => duplex,
+			async *incomingUnidirectionalStreams() {},
+			metricsSnapshot: () => ({
+				datagramsIn: 0,
+				datagramsOut: 0,
+				streamsActive: 0,
+				queuedBytes: 0,
+			}),
+		};
+		const wt = new WebTransport(session, { strictW3CErrors: true });
+		const bidi = await wt.createBidirectionalStream();
+		const writer = bidi.writable.getWriter();
+		await expect(writer.write(new Uint8Array([1]))).rejects.toMatchObject({
+			code: E_STOP_SENDING,
+			name: "AbortError",
+		});
 	});
 });
