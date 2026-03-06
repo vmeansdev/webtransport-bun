@@ -4,9 +4,21 @@
 //! Each connect() creates a new Connection from the pooled Endpoint.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn map_connecting_error(
+    err: wtransport::error::ConnectingError,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match err {
+        wtransport::error::ConnectingError::SessionRejected => {
+            io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request").into()
+        }
+        other => other.into(),
+    }
+}
 
 /// Pool compatibility key.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -132,7 +144,8 @@ impl ClientPoolManager {
             entry.endpoint.connect(connect_url),
         )
         .await
-        .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;
+        .map_err(|_| "E_HANDSHAKE_TIMEOUT")?
+        .map_err(map_connecting_error)?;
 
         let release_guard = PoolReleaseGuard {
             entry: Arc::clone(&entry),

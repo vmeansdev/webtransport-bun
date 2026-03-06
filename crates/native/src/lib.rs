@@ -318,7 +318,6 @@ pub fn set_panic_log_verbose(enabled: bool) {
 
 /// Well-known close codes for stable error semantics (AGENTS.md).
 pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
-pub(crate) const RATE_LIMITED_CLOSE_CODE: u32 = 3991;
 pub(crate) const LIMIT_EXCEEDED_CLOSE_CODE: u32 = 3992;
 
 /// Extract (code, reason) from ConnectionError for CloseInfo.
@@ -347,6 +346,7 @@ pub(crate) fn extract_close_info(
 /// Spawn the wtransport server loop on the dedicated runtime.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_wtransport_server(
+    owner_server_id: u64,
     metrics: Arc<server_metrics::ServerMetrics>,
     limits: limits::Limits,
     rate_limits: rate_limit::RateLimits,
@@ -520,11 +520,36 @@ pub(crate) fn spawn_wtransport_server(
                                     return;
                                 }
                                 let authority = session_request.authority().to_string();
+                                let peer_addr = session_request.remote_address();
+                                let peer_ip = peer_addr.ip().to_string();
+                                let peer_port = peer_addr.port() as u32;
+                                if !rate_limit::try_acquire_handshake(
+                                    &peer_ip,
+                                    rate_limits.handshakes_per_sec,
+                                    rate_limits.handshakes_burst,
+                                ) {
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
+                                    session_request.too_many_requests().await;
+                                    return;
+                                }
+                                if !rate_limit::try_acquire_per_ip_session_with_prefix(
+                                    &peer_ip,
+                                    rate_limits.handshakes_burst_per_ip,
+                                    rate_limits.handshakes_burst_per_prefix,
+                                ) {
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
+                                    session_request.too_many_requests().await;
+                                    return;
+                                }
                                 let prev_sessions = metrics.sessions_active.fetch_add(1, Ordering::SeqCst);
                                 if prev_sessions >= limits.max_sessions {
                                     metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, None, None);
+                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, Some(&peer_ip), Some(peer_port));
                                     let reject_timeout = tokio::time::Duration::from_millis(
                                         limits.handshake_timeout_ms,
                                     );
@@ -534,6 +559,7 @@ pub(crate) fn spawn_wtransport_server(
                                     )
                                     .await;
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    rate_limit::release_per_ip_session(&peer_ip);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
                                             connection.close(
@@ -551,8 +577,8 @@ pub(crate) fn spawn_wtransport_server(
                                                     authority, e
                                                 ),
                                                 None,
-                                                None,
-                                                None,
+                                                Some(&peer_ip),
+                                                Some(peer_port),
                                             );
                                         }
                                         Err(_elapsed) => {
@@ -565,8 +591,8 @@ pub(crate) fn spawn_wtransport_server(
                                                     authority
                                                 ),
                                                 None,
-                                                None,
-                                                None,
+                                                Some(&peer_ip),
+                                                Some(peer_port),
                                             );
                                         }
                                     }
@@ -586,6 +612,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        rate_limit::release_per_ip_session(&peer_ip);
                                         emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
                                     }
@@ -593,33 +620,7 @@ pub(crate) fn spawn_wtransport_server(
                                 match accept_result {
                                     Ok(connection) => {
                                         metrics.handshake_histogram.observe(accept_start.elapsed());
-                                        let peer_ip = connection.remote_address().ip().to_string();
-                                        let peer_port = connection.remote_address().port() as u32;
                                         emit_log(&ltx, !debug_logs, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
-                                        if !rate_limit::try_acquire_handshake(
-                                            &peer_ip,
-                                            rate_limits.handshakes_per_sec,
-                                            rate_limits.handshakes_burst,
-                                        ) {
-                                            metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                            metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                            metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                            emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
-                                            connection.close(VarInt::from_u32(RATE_LIMITED_CLOSE_CODE), b"E_RATE_LIMITED");
-                                            return;
-                                        }
-                                        if !rate_limit::try_acquire_per_ip_session_with_prefix(
-                                            &peer_ip,
-                                            rate_limits.handshakes_burst_per_ip,
-                                            rate_limits.handshakes_burst_per_prefix,
-                                        ) {
-                                            metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                            metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                            metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                            emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
-                                            connection.close(VarInt::from_u32(RATE_LIMITED_CLOSE_CODE), b"E_RATE_LIMITED");
-                                            return;
-                                        }
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
 
                                         let id = format!(
@@ -631,6 +632,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics) =
                                             session_registry::insert(
                                                 id.clone(),
+                                                owner_server_id,
                                                 connection.clone(),
                                                 metrics.clone(),
                                                 limits.clone(),
@@ -1048,7 +1050,9 @@ pub(crate) fn spawn_wtransport_server(
                                         );
                                     }
                                     Err(e) => {
+                                        metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        rate_limit::release_per_ip_session(&peer_ip);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());

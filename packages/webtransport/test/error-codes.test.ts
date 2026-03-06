@@ -87,14 +87,19 @@ describe("P0.2 stable error codes", () => {
 	it("E_RATE_LIMITED: handshake rate limit rejects with E_RATE_LIMITED", async () => {
 		await withHarness(async (h) => {
 			const port = nextPort(BASE_PORT, 400);
+			const logs: Array<{ level: string; msg: string }> = [];
 			h.track(
 				createServer({
 					port,
 					tls: { certPem: "", keyPem: "" },
+					debug: true,
 					rateLimits: {
 						handshakesPerSec: 2,
 						handshakesBurst: 1,
 						handshakesBurstPerPrefix: 1,
+					},
+					log: (event) => {
+						logs.push({ level: event.level, msg: event.msg });
 					},
 					onSession: () => {},
 				}),
@@ -127,6 +132,10 @@ describe("P0.2 stable error codes", () => {
 
 			expect(err).toBeDefined();
 			expect((err as WebTransportError).code).toBe(E_RATE_LIMITED);
+			const acceptedLogs = logs.filter((entry) =>
+				entry.msg.includes("session accepted"),
+			);
+			expect(acceptedLogs).toHaveLength(1);
 		});
 	}, 15000);
 

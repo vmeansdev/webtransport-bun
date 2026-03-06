@@ -41,6 +41,8 @@ pub type CreateUniReq = oneshot::Sender<std::result::Result<ClientUniSendHandle,
 
 /// Live state for an open session.
 pub struct SessionState {
+    /// Owning server instance id for isolated shutdown/rotation.
+    pub owner_server_id: u64,
     /// Connection handle for sending datagrams and opening streams.
     pub conn: Connection,
     /// Receiver for datagrams forwarded from the connection.
@@ -71,6 +73,7 @@ static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
 #[allow(clippy::type_complexity)]
 pub fn insert(
     session_id: String,
+    owner_server_id: u64,
     conn: Connection,
     metrics: Arc<ServerMetrics>,
     limits: crate::limits::Limits,
@@ -90,6 +93,7 @@ pub fn insert(
     let session_metrics = Arc::new(SessionMetrics::default());
     let stream_capacity_notify = Arc::new(Notify::new());
     let state = SessionState {
+        owner_server_id,
         conn,
         dgram_rx: Arc::new(Mutex::new(dgram_rx)),
         metrics,
@@ -175,6 +179,21 @@ pub fn close_session(session_id: &str, code: u32, reason: &[u8]) {
 /// Close all sessions. Called during server shutdown for deterministic cleanup.
 pub fn close_all(code: u32, reason: &[u8]) {
     let keys: Vec<String> = REGISTRY.iter().map(|e| e.key().clone()).collect();
+    for key in keys {
+        if let Some((_, state)) = REGISTRY.remove(&key) {
+            state.stream_capacity_notify.notify_waiters();
+            state.conn.close(wtransport::VarInt::from_u32(code), reason);
+        }
+    }
+}
+
+/// Close all sessions owned by a specific server instance.
+pub fn close_all_for_owner(owner_server_id: u64, code: u32, reason: &[u8]) {
+    let keys: Vec<String> = REGISTRY
+        .iter()
+        .filter(|entry| entry.value().owner_server_id == owner_server_id)
+        .map(|entry| entry.key().clone())
+        .collect();
     for key in keys {
         if let Some((_, state)) = REGISTRY.remove(&key) {
             state.stream_capacity_notify.notify_waiters();

@@ -35,6 +35,18 @@ static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>>
 static CLIENT_POOL: Lazy<std::sync::Arc<client_pool::ClientPoolManager>> =
     Lazy::new(|| std::sync::Arc::new(client_pool::ClientPoolManager::new()));
 
+fn map_connecting_error(
+    err: wtransport::error::ConnectingError,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match err {
+        wtransport::error::ConnectingError::SessionRejected => {
+            std::io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request")
+                .into()
+        }
+        other => other.into(),
+    }
+}
+
 /// Result for connect callback to avoid napi::Result type confusion.
 #[derive(Clone)]
 enum ConnectResult {
@@ -56,6 +68,19 @@ type OpenUniReq = oneshot::Sender<std::result::Result<ClientUniSendHandle, Strin
 type AcceptBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
 type AcceptUniReq = oneshot::Sender<std::result::Result<ClientUniRecvHandle, String>>;
 
+fn try_reserve_client_queued_bytes(metrics: &ClientMetrics, budget_bytes: u64, n: u64) -> bool {
+    metrics
+        .queued_bytes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            if current + n <= budget_bytes {
+                Some(current + n)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
 fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Limits, String> {
     let parsed: serde_json::Value = serde_json::from_str(opts_json)
         .map_err(|e| format!("E_INTERNAL: invalid client options JSON: {}", e))?;
@@ -76,6 +101,7 @@ pub struct ClientSessionHandle {
     peer_port: u32,
     dgram_send_tx: Option<mpsc::Sender<Vec<u8>>>,
     dgram_recv_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    datagram_budget_bytes: u64,
     backpressure_timeout_ms: u64,
     max_datagram_size: usize,
     stream_open_bi_tx: Option<mpsc::Sender<OpenBiReq>>,
@@ -117,10 +143,10 @@ impl ClientSessionHandle {
             return Err(napi::Error::from_reason("E_QUEUE_FULL"));
         }
         let sz = bytes.len() as u64;
+        if !try_reserve_client_queued_bytes(&self.client_metrics, self.datagram_budget_bytes, sz) {
+            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+        }
         let timeout = tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
-        self.client_metrics
-            .queued_bytes
-            .fetch_add(sz, Ordering::Relaxed);
         let result = tokio::time::timeout(timeout, tx.send(bytes)).await;
         match result {
             Ok(Ok(())) => Ok(()),
@@ -144,7 +170,12 @@ impl ClientSessionHandle {
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
         let mut rx = self.dgram_recv_rx.lock().await;
         match rx.recv().await {
-            Some(bytes) => Ok(Some(bytes.into())),
+            Some(bytes) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                Ok(Some(bytes.into()))
+            }
             None => Ok(None),
         }
     }
@@ -268,6 +299,7 @@ impl ClientSessionHandle {
         let max_global = limits.max_queued_bytes_global;
         let max_session = limits.max_queued_bytes_per_session;
         let max_stream = limits.max_queued_bytes_per_stream;
+        let datagram_budget_bytes = std::cmp::min(max_global, max_session);
 
         let handle = Self {
             id: id.clone(),
@@ -275,6 +307,7 @@ impl ClientSessionHandle {
             peer_port,
             dgram_send_tx: Some(dgram_send_tx.clone()),
             dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+            datagram_budget_bytes,
             backpressure_timeout_ms,
             max_datagram_size: limits.max_datagram_size,
             stream_open_bi_tx: Some(open_bi_tx),
@@ -327,10 +360,16 @@ impl ClientSessionHandle {
             });
 
             let cm_recv = Arc::clone(&cm);
+            let recv_budget_bytes = datagram_budget_bytes;
             crate::panic_guard::spawn_quic_task(async move {
                 while let Ok(dgram) = conn_dgram_recv.receive_datagram().await {
+                    let sz = dgram.len() as u64;
+                    if !try_reserve_client_queued_bytes(&cm_recv, recv_budget_bytes, sz) {
+                        continue;
+                    }
                     cm_recv.datagrams_in.fetch_add(1, Ordering::Relaxed);
                     if dgram_recv_tx.send(dgram.as_ref().to_vec()).await.is_err() {
+                        cm_recv.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -1048,7 +1087,8 @@ async fn run_connect(
         endpoint.connect(&connect_url),
     )
     .await
-    .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;
+    .map_err(|_| "E_HANDSHAKE_TIMEOUT")?
+    .map_err(map_connecting_error)?;
 
     let addr = conn.remote_address();
     let peer_ip = addr.ip().to_string();

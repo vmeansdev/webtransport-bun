@@ -3,6 +3,7 @@
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::{Env, JsFunction, Result};
 use napi_derive::napi;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -12,6 +13,8 @@ use crate::panic_guard;
 use crate::rate_limit::RateLimits;
 use crate::server_metrics::ServerMetrics;
 use crate::{LogEvent, SessionEvent};
+
+static SERVER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct ServerRuntimeState {
     shutdown_tx: Option<watch::Sender<()>>,
@@ -27,6 +30,7 @@ fn is_addr_in_use_error(message: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_server_instance(
+    server_id: u64,
     metrics: Arc<ServerMetrics>,
     limits: &Limits,
     rate_limits: &RateLimits,
@@ -49,6 +53,7 @@ fn spawn_server_instance(
             std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
         crate::spawn_wtransport_server(
+            server_id,
             Arc::clone(&metrics),
             limits.clone(),
             rate_limits.clone(),
@@ -89,6 +94,7 @@ fn spawn_server_instance(
 
 #[napi]
 pub struct ServerHandle {
+    server_id: u64,
     port: u32,
     host: String,
     debug: bool,
@@ -202,7 +208,9 @@ impl ServerHandle {
             crate::panic_guard::set_panic_log_verbose(debug);
             let port_u16 = port.min(65535) as u16;
 
+            let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let shutdown_tx = spawn_server_instance(
+                server_id,
                 Arc::clone(&metrics),
                 &limits,
                 &rate_limits,
@@ -220,6 +228,7 @@ impl ServerHandle {
             })?;
 
             Ok(Self {
+                server_id,
                 port,
                 host,
                 debug,
@@ -259,7 +268,11 @@ impl ServerHandle {
             let old_cert = state.cert_pem.clone();
             let old_key = state.key_pem.clone();
             state.shutdown_tx.take();
-            crate::session_registry::close_all(0, b"server cert rotating");
+            crate::session_registry::close_all_for_owner(
+                self.server_id,
+                0,
+                b"server cert rotating",
+            );
             let session_tx = self
                 .session_tx
                 .lock()
@@ -273,6 +286,7 @@ impl ServerHandle {
 
             let port_u16 = self.port.min(65535) as u16;
             match spawn_server_instance(
+                self.server_id,
                 Arc::clone(&self.metrics),
                 &self.limits,
                 &self.rate_limits,
@@ -293,6 +307,7 @@ impl ServerHandle {
                 }
                 Err(update_err) => {
                     let rollback_result = spawn_server_instance(
+                        self.server_id,
                         Arc::clone(&self.metrics),
                         &self.limits,
                         &self.rate_limits,
@@ -335,7 +350,7 @@ impl ServerHandle {
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
             state.closed = true;
             state.shutdown_tx.take();
-            crate::session_registry::close_all(0, b"server closing");
+            crate::session_registry::close_all_for_owner(self.server_id, 0, b"server closing");
             self.session_tx
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: session tx lock poisoned"))?
