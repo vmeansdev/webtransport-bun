@@ -166,46 +166,121 @@ describe("TLS contract (P0.3)", () => {
 	}, 15000);
 
 	it("server.updateCert rotates identity and keeps server available", async () => {
+		if (!generatedCert) return;
 		const port = nextPort(24460, 2000);
+		const nextCert = generateLocalhostCert();
+		if (!nextCert) {
+			throw new Error("failed to generate next certificate");
+		}
+		let serverSession: any = null;
+		let resolveReady!: () => void;
+		const ready = new Promise<void>((r) => {
+			resolveReady = r;
+		});
 		const server = createServer({
 			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: () => {},
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
+			onSession: async (s) => {
+				serverSession = s;
+				resolveReady();
+				const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
+				while (true) {
+					const next = await Promise.race([
+						iter.next(),
+						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
+					]);
+					if (next.done) break;
+					await s.sendDatagram(next.value);
+				}
+			},
 		});
 
 		try {
 			const before = await connectWithRetry(`https://127.0.0.1:${port}`, {
-				tls: { insecureSkipVerify: true },
+				tls: { caPem: generatedCert.certPem, serverName: "localhost" },
 			});
-			before.close();
+			await Promise.race([
+				ready,
+				Bun.sleep(3000).then(() => {
+					throw new Error("timeout waiting for pre-rotation session");
+				}),
+			]);
 
 			await server.updateCert({
-				certPem: generatedCert?.certPem ?? "",
-				keyPem: generatedCert?.keyPem ?? "",
+				certPem: nextCert.certPem,
+				keyPem: nextCert.keyPem,
 			});
 
+			await before.sendDatagram(new Uint8Array([1, 2, 3, 4]));
+			const iter = before.incomingDatagrams()[Symbol.asyncIterator]();
+			const echoed = await Promise.race([
+				iter.next(),
+				Bun.sleep(3000).then(() => {
+					throw new Error("timeout waiting for echoed datagram after rotation");
+				}),
+			]);
+			expect(echoed.done).toBe(false);
+			expect(Array.from(echoed.value ?? [])).toEqual([1, 2, 3, 4]);
+
+			await expect(
+				connectWithRetry(
+					`https://127.0.0.1:${port}`,
+					{
+						tls: { caPem: generatedCert.certPem, serverName: "localhost" },
+					},
+					1500,
+				),
+			).rejects.toThrow(/(E_TLS|invalid peer certificate|BadSignature)/);
+
 			const after = await connectWithRetry(`https://127.0.0.1:${port}`, {
-				tls: { insecureSkipVerify: true },
+				tls: { caPem: nextCert.certPem, serverName: "localhost" },
 			});
 			expect(after.id).toBeDefined();
 			after.close();
+			before.close();
 		} finally {
+			nextCert.cleanup();
 			await server.close();
 		}
 	}, 25000);
 
-	it("server.updateCert failure keeps server available via rollback", async () => {
+	it("server.updateCert failure leaves current identity and live sessions intact", async () => {
+		if (!generatedCert) return;
 		const port = nextPort(24460, 2000);
+		let resolveReady!: () => void;
+		const ready = new Promise<void>((r) => {
+			resolveReady = r;
+		});
 		const server = createServer({
 			port,
 			tls: {
-				certPem: generatedCert?.certPem ?? "",
-				keyPem: generatedCert?.keyPem ?? "",
+				certPem: generatedCert.certPem,
+				keyPem: generatedCert.keyPem,
 			},
-			onSession: () => {},
+			onSession: async (s) => {
+				resolveReady();
+				const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
+				while (true) {
+					const next = await Promise.race([
+						iter.next(),
+						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
+					]);
+					if (next.done) break;
+					await s.sendDatagram(next.value);
+				}
+			},
 		});
 
 		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: generatedCert.certPem, serverName: "localhost" },
+			});
+			await Promise.race([
+				ready,
+				Bun.sleep(3000).then(() => {
+					throw new Error("timeout waiting for initial session");
+				}),
+			]);
 			await expect(
 				server.updateCert({
 					certPem:
@@ -215,10 +290,24 @@ describe("TLS contract (P0.3)", () => {
 				}),
 			).rejects.toThrow(/E_INTERNAL: certificate rotation failed/);
 
-			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
-				tls: { insecureSkipVerify: true },
+			await client.sendDatagram(new Uint8Array([7, 8, 9]));
+			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+			const echoed = await Promise.race([
+				iter.next(),
+				Bun.sleep(3000).then(() => {
+					throw new Error(
+						"timeout waiting for echoed datagram after failed rotation",
+					);
+				}),
+			]);
+			expect(echoed.done).toBe(false);
+			expect(Array.from(echoed.value ?? [])).toEqual([7, 8, 9]);
+
+			const after = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: generatedCert.certPem, serverName: "localhost" },
 			});
-			expect(client.id).toBeDefined();
+			expect(after.id).toBeDefined();
+			after.close();
 			client.close();
 		} finally {
 			await server.close();

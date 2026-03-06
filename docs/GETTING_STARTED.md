@@ -31,6 +31,8 @@ await server.updateCert({
 });
 ```
 
+`updateCert()` hot-swaps only the TLS leaf certificate/key material. Existing sessions remain connected, and new handshakes use the new certificate immediately. Changes to bind address or transport configuration still require rebuilding or restarting the server.
+
 ## Requirements
 
 - Bun >= 1.3.9, or Node, or Deno

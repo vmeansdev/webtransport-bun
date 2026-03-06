@@ -124,7 +124,11 @@ export type LogEvent = {
 
 export interface WebTransportServer {
   readonly address: { host: string; port: number };
-  /** Current behavior: rotation closes existing sessions before the new identity starts serving. */
+  /**
+   * Hot-swap TLS leaf cert/key material in place.
+   * Existing sessions stay open; only new handshakes observe the new certificate.
+   * Transport-config or bind-address changes still require rebuilding/restarting the server.
+   */
   updateCert(tls: { certPem: string | Uint8Array; keyPem: string | Uint8Array }): Promise<void>;
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;

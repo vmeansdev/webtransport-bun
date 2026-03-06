@@ -18,8 +18,7 @@ static SERVER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct ServerRuntimeState {
     shutdown_tx: Option<watch::Sender<()>>,
-    cert_pem: String,
-    key_pem: String,
+    tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
     closed: bool,
 }
 
@@ -38,8 +37,7 @@ fn spawn_server_instance(
     port: u16,
     session_tx: &Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     log_tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
-    cert_pem: &str,
-    key_pem: &str,
+    tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
     debug: bool,
     max_retries: usize,
 ) -> std::result::Result<watch::Sender<()>, String> {
@@ -62,8 +60,7 @@ fn spawn_server_instance(
             shutdown_rx,
             session_tx.clone(),
             log_tx.clone(),
-            cert_pem.to_string(),
-            key_pem.to_string(),
+            Arc::clone(&tls_resolver),
             debug,
             startup_tx,
         );
@@ -96,11 +93,7 @@ fn spawn_server_instance(
 pub struct ServerHandle {
     server_id: u64,
     port: u32,
-    host: String,
-    debug: bool,
     metrics: Arc<ServerMetrics>,
-    limits: Limits,
-    rate_limits: RateLimits,
     session_tx: Mutex<Option<tokio::sync::mpsc::Sender<SessionEvent>>>,
     log_tx: Mutex<Option<tokio::sync::mpsc::Sender<LogEvent>>>,
     state: Mutex<ServerRuntimeState>,
@@ -209,6 +202,12 @@ impl ServerHandle {
             let port_u16 = port.min(65535) as u16;
 
             let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tls_resolver = if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
+                crate::server_tls::build_live_resolver_from_pem(&cert_pem, &key_pem)
+            } else {
+                crate::server_tls::build_default_dev_resolver()
+            }
+            .map_err(|msg| napi::Error::from_reason(format!("E_TLS: {}", msg)))?;
             let shutdown_tx = spawn_server_instance(
                 server_id,
                 Arc::clone(&metrics),
@@ -218,8 +217,7 @@ impl ServerHandle {
                 port_u16,
                 &session_tx,
                 &log_tx,
-                &cert_pem,
-                &key_pem,
+                Arc::clone(&tls_resolver),
                 debug,
                 1,
             )
@@ -230,17 +228,12 @@ impl ServerHandle {
             Ok(Self {
                 server_id,
                 port,
-                host,
-                debug,
                 metrics,
-                limits,
-                rate_limits,
                 session_tx: Mutex::new(session_tx),
                 log_tx: Mutex::new(log_tx),
                 state: Mutex::new(ServerRuntimeState {
                     shutdown_tx: Some(shutdown_tx),
-                    cert_pem,
-                    key_pem,
+                    tls_resolver,
                     closed: false,
                 }),
             })
@@ -255,7 +248,7 @@ impl ServerHandle {
     #[napi]
     pub async fn update_cert(&self, cert_pem: String, key_pem: String) -> Result<()> {
         panic_guard::catch_panic(|| {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
@@ -264,80 +257,18 @@ impl ServerHandle {
                     "E_SESSION_CLOSED: server is closed",
                 ));
             }
-
-            let old_cert = state.cert_pem.clone();
-            let old_key = state.key_pem.clone();
-            state.shutdown_tx.take();
-            crate::session_registry::close_all_for_owner(
-                self.server_id,
-                0,
-                b"server cert rotating",
-            );
-            let session_tx = self
-                .session_tx
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: session tx lock poisoned"))?
-                .clone();
-            let log_tx = self
-                .log_tx
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: log tx lock poisoned"))?
-                .clone();
-
-            let port_u16 = self.port.min(65535) as u16;
-            match spawn_server_instance(
-                self.server_id,
-                Arc::clone(&self.metrics),
-                &self.limits,
-                &self.rate_limits,
-                &self.host,
-                port_u16,
-                &session_tx,
-                &log_tx,
-                &cert_pem,
-                &key_pem,
-                self.debug,
-                30,
-            ) {
-                Ok(new_shutdown_tx) => {
-                    state.shutdown_tx = Some(new_shutdown_tx);
-                    state.cert_pem = cert_pem;
-                    state.key_pem = key_pem;
-                    Ok(())
-                }
-                Err(update_err) => {
-                    let rollback_result = spawn_server_instance(
-                        self.server_id,
-                        Arc::clone(&self.metrics),
-                        &self.limits,
-                        &self.rate_limits,
-                        &self.host,
-                        port_u16,
-                        &session_tx,
-                        &log_tx,
-                        &old_cert,
-                        &old_key,
-                        self.debug,
-                        30,
-                    );
-                    match rollback_result {
-                        Ok(rollback_shutdown_tx) => {
-                            state.shutdown_tx = Some(rollback_shutdown_tx);
-                            Err(napi::Error::from_reason(format!(
-                                "E_INTERNAL: certificate rotation failed: {}; previous certificate restored",
-                                update_err
-                            )))
-                        }
-                        Err(rollback_err) => {
-                            state.closed = true;
-                            Err(napi::Error::from_reason(format!(
-                                "E_INTERNAL: certificate rotation failed: {}; rollback failed: {}",
-                                update_err, rollback_err
-                            )))
-                        }
-                    }
-                }
-            }
+            let certified_key = crate::server_tls::parse_certified_key(&cert_pem, &key_pem)
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "E_INTERNAL: certificate rotation failed: {}",
+                        e
+                    ))
+                })?;
+            state
+                .tls_resolver
+                .replace_default(certified_key)
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            Ok(())
         })
     }
 

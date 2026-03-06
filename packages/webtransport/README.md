@@ -31,8 +31,9 @@ const server = createServer({
   },
 });
 
-// Rotate TLS identity without process restart.
-// Current behavior: existing sessions are closed during rotation.
+// Hot-swap TLS leaf cert/key material without dropping existing sessions.
+// New handshakes immediately use the new certificate.
+// Transport config and bind-address changes still require rebuilding the server.
 await server.updateCert({ certPem: "...next cert...", keyPem: "...next key..." });
 
 const session = await connect("https://127.0.0.1:4433", {
