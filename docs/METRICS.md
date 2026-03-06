@@ -23,6 +23,9 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | backpressureTimeoutCount | number | Times server session send_datagram timed out (E_BACKPRESSURE_TIMEOUT) |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
+| sniCertSelections | number | Handshakes served by hostname-specific SNI certificates |
+| defaultCertSelections | number | Handshakes served by the default certificate |
+| unknownSniRejectedCount | number | Handshakes rejected because SNI did not match a configured hostname |
 
 ## Latency histograms (P3.1)
 

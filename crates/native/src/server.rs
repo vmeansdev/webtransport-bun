@@ -59,6 +59,14 @@ fn parse_tls_resolver_config(
     if !input.ca_pem.trim().is_empty() {
         return Err("server tls.caPem is not supported yet".to_string());
     }
+    if (input.cert_pem.trim().is_empty() || input.key_pem.trim().is_empty())
+        && (!input.sni.is_empty() || input.unknown_sni_policy.is_some())
+    {
+        return Err(
+            "server tls.sni and unknownSniPolicy require non-empty default certPem/keyPem"
+                .to_string(),
+        );
+    }
     Ok(crate::server_tls::ResolverConfig {
         default_cert_pem: input.cert_pem,
         default_key_pem: input.key_pem,
@@ -73,6 +81,21 @@ fn parse_tls_resolver_config(
             .collect(),
         unknown_sni_policy: parse_unknown_sni_policy(input.unknown_sni_policy.as_deref())?,
     })
+}
+
+fn parse_sni_entries_json(
+    sni_json: &str,
+) -> std::result::Result<Vec<crate::server_tls::SniCertConfig>, String> {
+    let entries: Vec<ServerTlsSniEntry> =
+        serde_json::from_str(sni_json).map_err(|e| format!("invalid server SNI JSON: {}", e))?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| crate::server_tls::SniCertConfig {
+            server_name: entry.server_name,
+            cert_pem: entry.cert_pem,
+            key_pem: entry.key_pem,
+        })
+        .collect())
 }
 
 struct ServerRuntimeState {
@@ -356,6 +379,147 @@ impl ServerHandle {
     }
 
     #[napi]
+    pub async fn replace_sni_certs(&self, sni_json: String) -> Result<()> {
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            if state.closed {
+                return Err(napi::Error::from_reason(
+                    "E_SESSION_CLOSED: server is closed",
+                ));
+            }
+            let sni_certs = parse_sni_entries_json(&sni_json).map_err(|e| {
+                napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+            })?;
+            let mut certs_by_name = std::collections::HashMap::new();
+            for sni_cert in sni_certs {
+                let server_name = crate::server_tls::normalize_server_name(&sni_cert.server_name)
+                    .map_err(|e| {
+                    napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+                })?;
+                if certs_by_name.contains_key(&server_name) {
+                    return Err(napi::Error::from_reason(format!(
+                        "E_INTERNAL: tls rotation failed: duplicate serverName entry: {}",
+                        server_name
+                    )));
+                }
+                let certified_key =
+                    crate::server_tls::parse_certified_key(&sni_cert.cert_pem, &sni_cert.key_pem)
+                        .map_err(|e| {
+                        napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+                    })?;
+                certs_by_name.insert(server_name, certified_key);
+            }
+            state
+                .tls_resolver
+                .replace_sni_certs(certs_by_name)
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    #[napi]
+    pub async fn upsert_sni_cert(
+        &self,
+        server_name: String,
+        cert_pem: String,
+        key_pem: String,
+    ) -> Result<()> {
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            if state.closed {
+                return Err(napi::Error::from_reason(
+                    "E_SESSION_CLOSED: server is closed",
+                ));
+            }
+            let certified_key = crate::server_tls::parse_certified_key(&cert_pem, &key_pem)
+                .map_err(|e| {
+                    napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+                })?;
+            state
+                .tls_resolver
+                .upsert_sni_cert(&server_name, certified_key)
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    #[napi]
+    pub async fn remove_sni_cert(&self, server_name: String) -> Result<()> {
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            if state.closed {
+                return Err(napi::Error::from_reason(
+                    "E_SESSION_CLOSED: server is closed",
+                ));
+            }
+            let removed = state
+                .tls_resolver
+                .remove_sni_cert(&server_name)
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            if !removed {
+                return Err(napi::Error::from_reason(format!(
+                    "E_INTERNAL: tls rotation failed: unknown serverName entry: {}",
+                    server_name
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    #[napi]
+    pub async fn set_unknown_sni_policy(&self, policy: String) -> Result<()> {
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            if state.closed {
+                return Err(napi::Error::from_reason(
+                    "E_SESSION_CLOSED: server is closed",
+                ));
+            }
+            let policy = parse_unknown_sni_policy(Some(policy.as_str())).map_err(|e| {
+                napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
+            })?;
+            state
+                .tls_resolver
+                .set_unknown_sni_policy(policy)
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    #[napi]
+    pub fn tls_snapshot(&self) -> Result<crate::metrics::ServerTlsSnapshot> {
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            let snapshot = state
+                .tls_resolver
+                .tls_snapshot()
+                .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+            Ok(crate::metrics::ServerTlsSnapshot {
+                sni_server_names: snapshot.sni_server_names,
+                unknown_sni_policy: match snapshot.unknown_sni_policy {
+                    crate::server_tls::UnknownSniPolicy::Reject => "reject".to_string(),
+                    crate::server_tls::UnknownSniPolicy::Default => "default".to_string(),
+                },
+            })
+        })
+    }
+
+    #[napi]
     pub async fn close(&self) -> Result<()> {
         panic_guard::catch_panic(|| {
             let mut state = self
@@ -416,6 +580,14 @@ impl ServerHandle {
 
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::ServerMetricsSnapshot> {
-        panic_guard::catch_panic(|| Ok(self.metrics.snapshot()))
+        panic_guard::catch_panic(|| {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
+            Ok(self
+                .metrics
+                .snapshot(Some(state.tls_resolver.metrics_snapshot())))
+        })
     }
 }

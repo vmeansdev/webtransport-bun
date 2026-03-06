@@ -148,6 +148,24 @@ export interface WebTransportServer {
    * Transport-config or bind-address changes still require rebuilding/restarting the server.
    */
   updateTls(tls: TlsOptions): Promise<void>;
+  /** Replace only the full SNI cert map, preserving the default cert/key and unknown-SNI policy. */
+  replaceSniCerts(sni: Array<{
+    serverName: string;
+    certPem: string | Uint8Array;
+    keyPem: string | Uint8Array;
+  }>): Promise<void>;
+  /** Add or replace one hostname-specific SNI certificate. */
+  upsertSniCert(sni: {
+    serverName: string;
+    certPem: string | Uint8Array;
+    keyPem: string | Uint8Array;
+  }): Promise<void>;
+  /** Remove one hostname-specific SNI certificate. */
+  removeSniCert(serverName: string): Promise<void>;
+  /** Update only the unknown-SNI policy. */
+  setUnknownSniPolicy(policy: "reject" | "default"): Promise<void>;
+  /** Inspect active SNI names and policy without exposing key material. */
+  tlsSnapshot(): { sniServerNames: string[]; unknownSniPolicy: "reject" | "default" };
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -166,6 +184,12 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 - Clients that send no SNI still receive the default certificate.
 - `updateCert()` changes only the default certificate/key.
 - `updateTls()` atomically replaces the default certificate/key, full SNI map, and `unknownSniPolicy`.
+- `replaceSniCerts()` atomically replaces only the SNI cert map, preserving the default certificate/key and `unknownSniPolicy`.
+- `upsertSniCert()` adds or replaces one SNI hostname mapping in place.
+- `removeSniCert()` removes one SNI hostname mapping in place.
+- `setUnknownSniPolicy()` changes only unknown-SNI behavior in place.
+- `tlsSnapshot()` returns sorted active SNI hostnames plus the current `unknownSniPolicy`.
+- `tls.sni` and `unknownSniPolicy` require a non-empty default `certPem` / `keyPem`; they do not participate in the dev self-signed fallback path.
 
 ### Client
 
@@ -286,6 +310,9 @@ export type MetricsSnapshot = {
 
   rateLimitedCount: number;
   limitExceededCount: number;
+  sniCertSelections: number;
+  defaultCertSelections: number;
+  unknownSniRejectedCount: number;
   handshakeLatency?: HistogramSnapshot | null;
   datagramEnqueueLatency?: HistogramSnapshot | null;
   streamOpenLatency?: HistogramSnapshot | null;

@@ -80,6 +80,12 @@ describe("webtransport package exports", () => {
 		expect(server.address).toBeDefined();
 		expect(server.address.port).toBe(4433);
 		expect(typeof server.updateCert).toBe("function");
+		expect(typeof server.updateTls).toBe("function");
+		expect(typeof server.replaceSniCerts).toBe("function");
+		expect(typeof server.upsertSniCert).toBe("function");
+		expect(typeof server.removeSniCert).toBe("function");
+		expect(typeof server.setUnknownSniPolicy).toBe("function");
+		expect(typeof server.tlsSnapshot).toBe("function");
 		expect(typeof server.close).toBe("function");
 	});
 

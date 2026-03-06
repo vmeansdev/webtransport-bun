@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::BufReader;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -33,6 +34,19 @@ type ParsedResolverConfig = (
     UnknownSniPolicy,
 );
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolverTlsSnapshot {
+    pub(crate) sni_server_names: Vec<String>,
+    pub(crate) unknown_sni_policy: UnknownSniPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolverMetricsSnapshot {
+    pub(crate) sni_cert_selections: u64,
+    pub(crate) default_cert_selections: u64,
+    pub(crate) unknown_sni_rejected_count: u64,
+}
+
 #[derive(Clone)]
 struct ResolverSnapshot {
     default_cert: Arc<CertifiedKey>,
@@ -55,6 +69,9 @@ impl std::fmt::Debug for ResolverSnapshot {
 #[derive(Debug)]
 pub(crate) struct LiveServerCertResolver {
     inner: RwLock<ResolverSnapshot>,
+    sni_cert_selections: AtomicU64,
+    default_cert_selections: AtomicU64,
+    unknown_sni_rejected_count: AtomicU64,
 }
 
 impl LiveServerCertResolver {
@@ -69,6 +86,9 @@ impl LiveServerCertResolver {
                 certs_by_name,
                 unknown_sni_policy,
             }),
+            sni_cert_selections: AtomicU64::new(0),
+            default_cert_selections: AtomicU64::new(0),
+            unknown_sni_rejected_count: AtomicU64::new(0),
         }
     }
 
@@ -100,6 +120,76 @@ impl LiveServerCertResolver {
         inner.unknown_sni_policy = unknown_sni_policy;
         Ok(())
     }
+
+    pub(crate) fn replace_sni_certs(
+        &self,
+        certs_by_name: HashMap<String, Arc<CertifiedKey>>,
+    ) -> std::result::Result<(), String> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| "server cert resolver lock poisoned".to_string())?;
+        inner.certs_by_name = certs_by_name;
+        Ok(())
+    }
+
+    pub(crate) fn upsert_sni_cert(
+        &self,
+        server_name: &str,
+        certified_key: Arc<CertifiedKey>,
+    ) -> std::result::Result<String, String> {
+        let normalized = normalize_server_name(server_name)?;
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| "server cert resolver lock poisoned".to_string())?;
+        inner
+            .certs_by_name
+            .insert(normalized.clone(), certified_key);
+        Ok(normalized)
+    }
+
+    pub(crate) fn remove_sni_cert(&self, server_name: &str) -> std::result::Result<bool, String> {
+        let normalized = normalize_server_name(server_name)?;
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| "server cert resolver lock poisoned".to_string())?;
+        Ok(inner.certs_by_name.remove(&normalized).is_some())
+    }
+
+    pub(crate) fn set_unknown_sni_policy(
+        &self,
+        unknown_sni_policy: UnknownSniPolicy,
+    ) -> std::result::Result<(), String> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| "server cert resolver lock poisoned".to_string())?;
+        inner.unknown_sni_policy = unknown_sni_policy;
+        Ok(())
+    }
+
+    pub(crate) fn tls_snapshot(&self) -> std::result::Result<ResolverTlsSnapshot, String> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| "server cert resolver lock poisoned".to_string())?;
+        let mut sni_server_names = inner.certs_by_name.keys().cloned().collect::<Vec<_>>();
+        sni_server_names.sort();
+        Ok(ResolverTlsSnapshot {
+            sni_server_names,
+            unknown_sni_policy: inner.unknown_sni_policy,
+        })
+    }
+
+    pub(crate) fn metrics_snapshot(&self) -> ResolverMetricsSnapshot {
+        ResolverMetricsSnapshot {
+            sni_cert_selections: self.sni_cert_selections.load(Ordering::Relaxed),
+            default_cert_selections: self.default_cert_selections.load(Ordering::Relaxed),
+            unknown_sni_rejected_count: self.unknown_sni_rejected_count.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl ResolvesServerCert for LiveServerCertResolver {
@@ -108,19 +198,23 @@ impl ResolvesServerCert for LiveServerCertResolver {
         if let Some(server_name) = client_hello.server_name() {
             let key = server_name.trim_end_matches('.').to_ascii_lowercase();
             if let Some(cert) = inner.certs_by_name.get(&key) {
+                self.sni_cert_selections.fetch_add(1, Ordering::Relaxed);
                 return Some(Arc::clone(cert));
             }
             if !inner.certs_by_name.is_empty()
                 && inner.unknown_sni_policy == UnknownSniPolicy::Reject
             {
+                self.unknown_sni_rejected_count
+                    .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
+        self.default_cert_selections.fetch_add(1, Ordering::Relaxed);
         Some(Arc::clone(&inner.default_cert))
     }
 }
 
-fn normalize_server_name(server_name: &str) -> std::result::Result<String, String> {
+pub(crate) fn normalize_server_name(server_name: &str) -> std::result::Result<String, String> {
     let normalized = server_name
         .trim()
         .trim_end_matches('.')
@@ -234,8 +328,11 @@ pub(crate) fn build_default_dev_resolver(
 mod tests {
     use super::{
         build_default_dev_resolver, build_server_tls_config, parse_certified_key,
-        parse_resolver_config, ResolverConfig, SniCertConfig, UnknownSniPolicy,
+        parse_resolver_config, LiveServerCertResolver, ResolverConfig, SniCertConfig,
+        UnknownSniPolicy,
     };
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn parse_certified_key_rejects_missing_certificates() {
@@ -283,5 +380,30 @@ mod tests {
         })
         .expect_err("expected duplicate serverName error");
         assert!(err.contains("duplicate serverName"));
+    }
+
+    #[test]
+    fn tls_snapshot_lists_sorted_names_and_policy() {
+        let identity = wtransport::Identity::self_signed(["localhost"]).expect("identity");
+        let cert_pem = identity
+            .certificate_chain()
+            .as_slice()
+            .iter()
+            .map(wtransport::tls::Certificate::to_pem)
+            .collect::<Vec<_>>()
+            .join("");
+        let key_pem = identity.private_key().to_secret_pem();
+        let default_cert = parse_certified_key(&cert_pem, &key_pem).expect("default cert");
+        let mut certs_by_name = HashMap::new();
+        certs_by_name.insert("z.example".to_string(), Arc::clone(&default_cert));
+        certs_by_name.insert("a.example".to_string(), Arc::clone(&default_cert));
+        let resolver =
+            LiveServerCertResolver::new(default_cert, certs_by_name, UnknownSniPolicy::Default);
+        let snapshot = resolver.tls_snapshot().expect("tls snapshot");
+        assert_eq!(
+            snapshot.sni_server_names,
+            vec!["a.example".to_string(), "z.example".to_string()]
+        );
+        assert_eq!(snapshot.unknown_sni_policy, UnknownSniPolicy::Default);
     }
 }

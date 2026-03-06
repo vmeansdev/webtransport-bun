@@ -78,8 +78,16 @@ impl ServerMetrics {
         metrics.release_queued_bytes(n);
     }
 
-    pub fn snapshot(&self) -> super::metrics::ServerMetricsSnapshot {
+    pub(crate) fn snapshot(
+        &self,
+        tls_metrics: Option<crate::server_tls::ResolverMetricsSnapshot>,
+    ) -> super::metrics::ServerMetricsSnapshot {
         use super::metrics::ServerMetricsSnapshot;
+        let tls_metrics = tls_metrics.unwrap_or(crate::server_tls::ResolverMetricsSnapshot {
+            sni_cert_selections: 0,
+            default_cert_selections: 0,
+            unknown_sni_rejected_count: 0,
+        });
         ServerMetricsSnapshot {
             now_ms: js_sys_timestamp(),
             sessions_active: self.sessions_active.load(Ordering::Relaxed) as u32,
@@ -96,6 +104,9 @@ impl ServerMetrics {
                 as u32,
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as u32,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as u32,
+            sni_cert_selections: tls_metrics.sni_cert_selections as u32,
+            default_cert_selections: tls_metrics.default_cert_selections as u32,
+            unknown_sni_rejected_count: tls_metrics.unknown_sni_rejected_count as u32,
             handshake_latency: Some(histogram_to_snapshot(&self.handshake_histogram)),
             datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
             stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),

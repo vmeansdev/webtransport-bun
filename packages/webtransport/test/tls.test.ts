@@ -392,6 +392,8 @@ describe("TLS contract (P0.3)", () => {
 				tls: { caPem: apiCert.certPem, serverName: "api.test" },
 			});
 			apiClient.close();
+			const metrics = server.metricsSnapshot();
+			expect(metrics.sniCertSelections).toBeGreaterThanOrEqual(1);
 		} finally {
 			await server.close();
 			apiCert.cleanup();
@@ -401,8 +403,9 @@ describe("TLS contract (P0.3)", () => {
 
 	it("unknown SNI rejects by default", async () => {
 		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
+		const apiCert = generateCertForNames(["api.test"]);
 		const unknownCert = generateCertForNames(["unknown.test"]);
-		if (!defaultCert || !unknownCert) {
+		if (!defaultCert || !apiCert || !unknownCert) {
 			throw new Error("failed to generate certificates");
 		}
 		const port = nextPort(24460, 2000);
@@ -411,6 +414,13 @@ describe("TLS contract (P0.3)", () => {
 			tls: {
 				certPem: defaultCert.certPem,
 				keyPem: defaultCert.keyPem,
+				sni: [
+					{
+						serverName: "api.test",
+						certPem: apiCert.certPem,
+						keyPem: apiCert.keyPem,
+					},
+				],
 			},
 			onSession: () => {},
 		});
@@ -420,8 +430,11 @@ describe("TLS contract (P0.3)", () => {
 					tls: { caPem: unknownCert.certPem, serverName: "unknown.test" },
 				}),
 			).rejects.toThrow(/E_TLS|certificate|peer/i);
+			const metrics = server.metricsSnapshot();
+			expect(metrics.unknownSniRejectedCount).toBeGreaterThanOrEqual(1);
 		} finally {
 			await server.close();
+			apiCert.cleanup();
 			unknownCert.cleanup();
 			defaultCert.cleanup();
 		}
@@ -451,11 +464,136 @@ describe("TLS contract (P0.3)", () => {
 				tls: { caPem: defaultCert.certPem, serverName: "unmatched.test" },
 			});
 			client.close();
+			const metrics = server.metricsSnapshot();
+			expect(metrics.defaultCertSelections).toBeGreaterThanOrEqual(1);
 		} finally {
 			await server.close();
 			defaultCert.cleanup();
 		}
 	}, 20000);
+
+	it("incremental SNI TLS management supports upsert, replace, remove, policy updates, and snapshots", async () => {
+		const defaultCert = generateCertForNames([
+			"default.test",
+			"unmatched.test",
+			"127.0.0.1",
+		]);
+		const apiOne = generateCertForNames(["api.one.test"]);
+		const apiOneNext = generateCertForNames(["api.one.test"]);
+		const apiTwo = generateCertForNames(["api.two.test"]);
+		if (!defaultCert || !apiOne || !apiOneNext || !apiTwo) {
+			throw new Error("failed to generate incremental SNI certificates");
+		}
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: {
+				certPem: defaultCert.certPem,
+				keyPem: defaultCert.keyPem,
+			},
+			onSession: () => {},
+		});
+		try {
+			expect(server.tlsSnapshot()).toEqual({
+				sniServerNames: [],
+				unknownSniPolicy: "reject",
+			});
+
+			await server.upsertSniCert({
+				serverName: "API.ONE.TEST",
+				certPem: apiOne.certPem,
+				keyPem: apiOne.keyPem,
+			});
+			expect(server.tlsSnapshot()).toEqual({
+				sniServerNames: ["api.one.test"],
+				unknownSniPolicy: "reject",
+			});
+
+			const first = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: apiOne.certPem, serverName: "api.one.test" },
+			});
+			first.close();
+
+			await server.upsertSniCert({
+				serverName: "api.one.test",
+				certPem: apiOneNext.certPem,
+				keyPem: apiOneNext.keyPem,
+			});
+
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { caPem: apiOne.certPem, serverName: "api.one.test" },
+				}),
+			).rejects.toThrow(/E_TLS|certificate|peer/i);
+
+			const updated = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: apiOneNext.certPem, serverName: "api.one.test" },
+			});
+			updated.close();
+
+			await server.setUnknownSniPolicy("default");
+			expect(server.tlsSnapshot()).toEqual({
+				sniServerNames: ["api.one.test"],
+				unknownSniPolicy: "default",
+			});
+
+			const fallback = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: defaultCert.certPem, serverName: "unmatched.test" },
+			});
+			fallback.close();
+
+			await server.replaceSniCerts([
+				{
+					serverName: "api.two.test",
+					certPem: apiTwo.certPem,
+					keyPem: apiTwo.keyPem,
+				},
+			]);
+			expect(server.tlsSnapshot()).toEqual({
+				sniServerNames: ["api.two.test"],
+				unknownSniPolicy: "default",
+			});
+
+			await expect(
+				connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { caPem: apiOneNext.certPem, serverName: "api.one.test" },
+				}),
+			).rejects.toThrow(/E_TLS|certificate|peer/i);
+
+			const second = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { caPem: apiTwo.certPem, serverName: "api.two.test" },
+			});
+			second.close();
+
+			await server.removeSniCert("api.two.test");
+			expect(server.tlsSnapshot()).toEqual({
+				sniServerNames: [],
+				unknownSniPolicy: "default",
+			});
+
+			await expect(server.removeSniCert("api.two.test")).rejects.toThrow(
+				/E_INTERNAL: tls rotation failed: unknown serverName entry/,
+			);
+
+			const postRemovalFallback = await connectWithRetry(
+				`https://127.0.0.1:${port}`,
+				{
+					tls: { caPem: defaultCert.certPem, serverName: "unmatched.test" },
+				},
+			);
+			postRemovalFallback.close();
+
+			const metrics = server.metricsSnapshot();
+			expect(metrics.sniCertSelections).toBeGreaterThanOrEqual(3);
+			expect(metrics.defaultCertSelections).toBeGreaterThanOrEqual(2);
+		} finally {
+			await server.close();
+			defaultCert.cleanup();
+			apiOne.cleanup();
+			apiOneNext.cleanup();
+			apiTwo.cleanup();
+		}
+	}, 30000);
 
 	it("server.updateTls atomically replaces SNI certificates and unknown-SNI policy", async () => {
 		const initialDefault = generateCertForNames(["initial.test", "127.0.0.1"]);

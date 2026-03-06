@@ -50,6 +50,15 @@ await server.updateTls({
   unknownSniPolicy: "reject",
 });
 
+// Or manage the hostname map incrementally.
+await server.upsertSniCert({
+  serverName: "admin.example.test",
+  certPem: "...admin cert...",
+  keyPem: "...admin key...",
+});
+await server.setUnknownSniPolicy("default");
+console.log(server.tlsSnapshot());
+
 const session = await connect("https://127.0.0.1:4433", {
   tls: { insecureSkipVerify: true }, // dev only
 });
@@ -63,8 +72,13 @@ session.close();
 
 - `updateCert()` changes only the default server certificate/key.
 - `updateTls()` atomically replaces the default certificate/key, full SNI certificate map, and unknown-SNI policy.
+- `replaceSniCerts()` swaps the full SNI certificate map while preserving the default certificate/key and current unknown-SNI policy.
+- `upsertSniCert()` and `removeSniCert()` manage individual hostname mappings in place.
+- `setUnknownSniPolicy()` changes only unknown-SNI handling in place.
+- `tlsSnapshot()` returns sorted active SNI hostnames plus the current unknown-SNI policy.
 - When `tls.sni` is configured, `unknownSniPolicy` defaults to `"reject"` for unknown hostnames.
 - Clients that do not send SNI still receive the default certificate.
+- `tls.sni` and `unknownSniPolicy` require a non-empty default server certificate/key.
 - Bind-address or transport-config changes still require rebuilding/restarting the server.
 
 ### "Native addon not loaded"

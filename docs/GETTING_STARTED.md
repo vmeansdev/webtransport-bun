@@ -52,6 +52,23 @@ await server.updateTls({
 
 `updateTls()` atomically replaces the default cert/key, the full SNI cert map, and the unknown-SNI policy without dropping existing sessions. By default, unknown SNI names are rejected when SNI certs are configured; clients that send no SNI still receive the default certificate. Changes to bind address or transport configuration still require rebuilding or restarting the server.
 
+## Incremental SNI management
+
+```ts
+await server.upsertSniCert({
+  serverName: "api.example.test",
+  certPem: fs.readFileSync("api-cert.pem", "utf-8"),
+  keyPem: fs.readFileSync("api-key.pem", "utf-8"),
+});
+
+await server.setUnknownSniPolicy("default");
+await server.removeSniCert("api.example.test");
+
+console.log(server.tlsSnapshot());
+```
+
+Use `replaceSniCerts()` when you want to swap the full hostname map while preserving the default certificate and current unknown-SNI policy.
+
 ## Requirements
 
 - Bun >= 1.3.9, or Node, or Deno

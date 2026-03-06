@@ -29,12 +29,21 @@ pub struct ServerMetricsSnapshot {
     pub backpressure_timeout_count: u32,
     pub rate_limited_count: u32,
     pub limit_exceeded_count: u32,
+    pub sni_cert_selections: u32,
+    pub default_cert_selections: u32,
+    pub unknown_sni_rejected_count: u32,
     /// Handshake latency (accept start to completion). Present when any observation.
     pub handshake_latency: Option<HistogramSnapshot>,
     /// Datagram send enqueue latency. Present when any observation.
     pub datagram_enqueue_latency: Option<HistogramSnapshot>,
     /// Stream open latency (create_bidi/create_uni). Present when any observation.
     pub stream_open_latency: Option<HistogramSnapshot>,
+}
+
+#[napi(object)]
+pub struct ServerTlsSnapshot {
+    pub sni_server_names: Vec<String>,
+    pub unknown_sni_policy: String,
 }
 
 #[napi(object)]

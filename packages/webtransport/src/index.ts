@@ -281,6 +281,13 @@ export type ServerTlsSniEntry = {
 	keyPem: string | Uint8Array;
 };
 
+export type UnknownSniPolicy = "reject" | "default";
+
+export type ServerTlsSnapshot = {
+	sniServerNames: string[];
+	unknownSniPolicy: UnknownSniPolicy;
+};
+
 export type TlsOptions = {
 	/** PEM-encoded certificate (server) or CA (client). */
 	certPem: string | Uint8Array;
@@ -293,7 +300,7 @@ export type TlsOptions = {
 	/** Optional additional SNI certificates for server mode. */
 	sni?: ServerTlsSniEntry[];
 	/** Unknown SNI handling for server mode. Default "reject". No-SNI still uses default cert. */
-	unknownSniPolicy?: "reject" | "default";
+	unknownSniPolicy?: UnknownSniPolicy;
 	/** When true, allow empty cert/key fallback in production (dev only). */
 	allowSelfSigned?: boolean;
 };
@@ -417,6 +424,16 @@ export interface WebTransportServer {
 	}): Promise<void>;
 	/** Atomically replace the full server TLS configuration, including SNI certs and unknown-SNI policy. */
 	updateTls(tls: TlsOptions): Promise<void>;
+	/** Replace only the full SNI cert map, preserving the default cert/key and unknown-SNI policy. */
+	replaceSniCerts(sni: ServerTlsSniEntry[]): Promise<void>;
+	/** Add or replace one hostname-specific SNI certificate. */
+	upsertSniCert(entry: ServerTlsSniEntry): Promise<void>;
+	/** Remove one hostname-specific SNI certificate. */
+	removeSniCert(serverName: string): Promise<void>;
+	/** Update only the unknown-SNI policy. */
+	setUnknownSniPolicy(policy: UnknownSniPolicy): Promise<void>;
+	/** Introspect the active server TLS SNI state without exposing key material. */
+	tlsSnapshot(): ServerTlsSnapshot;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -614,6 +631,9 @@ export type MetricsSnapshot = {
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
+	sniCertSelections: number;
+	defaultCertSelections: number;
+	unknownSniRejectedCount: number;
 
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
@@ -740,6 +760,15 @@ export function metricsToPrometheus(
 		`# HELP ${p}limit_exceeded_total Sessions rejected (limits)`,
 		`# TYPE ${p}limit_exceeded_total counter`,
 		`${p}limit_exceeded_total${metricLabels} ${m.limitExceededCount}`,
+		`# HELP ${p}tls_sni_cert_selections_total Handshakes served by hostname-specific SNI certs`,
+		`# TYPE ${p}tls_sni_cert_selections_total counter`,
+		`${p}tls_sni_cert_selections_total${metricLabels} ${m.sniCertSelections}`,
+		`# HELP ${p}tls_default_cert_selections_total Handshakes served by the default certificate`,
+		`# TYPE ${p}tls_default_cert_selections_total counter`,
+		`${p}tls_default_cert_selections_total${metricLabels} ${m.defaultCertSelections}`,
+		`# HELP ${p}tls_unknown_sni_rejected_total Handshakes rejected because SNI did not match a configured hostname`,
+		`# TYPE ${p}tls_unknown_sni_rejected_total counter`,
+		`${p}tls_unknown_sni_rejected_total${metricLabels} ${m.unknownSniRejectedCount}`,
 	];
 
 	function emitHistogram(
@@ -1027,7 +1056,7 @@ class NativeServerSession implements ServerSession {
  * Create an in-process WebTransport server.
  *
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
- * @returns WebTransportServer with `address`, `updateCert()`, `close()`, and `metricsSnapshot()`.
+ * @returns WebTransportServer with address, live TLS management methods, `close()`, and `metricsSnapshot()`.
  * @throws Error if native addon is not loaded.
  *
  * @example
@@ -1072,7 +1101,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			certPem: decodePem(tls.certPem),
 			keyPem: decodePem(tls.keyPem),
 			caPem: decodePem(tls.caPem),
-			unknownSniPolicy: tls.unknownSniPolicy ?? "reject",
+			unknownSniPolicy: tls.unknownSniPolicy,
 			sni:
 				tls.sni?.map((entry) => ({
 					serverName: entry.serverName,
@@ -1205,6 +1234,31 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		updateTls: async (tls) => {
 			await handle.updateTls(tlsConfigToJson(tls));
 		},
+		replaceSniCerts: async (sni) => {
+			await handle.replaceSniCerts(
+				JSON.stringify(
+					sni.map((entry) => ({
+						serverName: entry.serverName,
+						certPem: decodePem(entry.certPem),
+						keyPem: decodePem(entry.keyPem),
+					})),
+				),
+			);
+		},
+		upsertSniCert: async (entry) => {
+			await handle.upsertSniCert(
+				entry.serverName,
+				decodePem(entry.certPem),
+				decodePem(entry.keyPem),
+			);
+		},
+		removeSniCert: async (serverName) => {
+			await handle.removeSniCert(serverName);
+		},
+		setUnknownSniPolicy: async (policy) => {
+			await handle.setUnknownSniPolicy(policy);
+		},
+		tlsSnapshot: () => handle.tlsSnapshot(),
 		close: async () => {
 			await handle.close();
 			for (const [id, resolve] of closedResolvers) {
