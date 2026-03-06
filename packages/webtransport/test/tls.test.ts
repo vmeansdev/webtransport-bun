@@ -10,9 +10,18 @@ import {
 import { nextPort } from "./helpers/network.js";
 
 const generatedCert = generateLocalhostCert();
+const generatedWildcardDefaultCert = generateCertForNames([
+	"default.test",
+	"127.0.0.1",
+]);
+const generatedWildcardCert = generateCertForNames(["*.example.test"]);
+const generatedWildcardExactCert = generateCertForNames(["api.example.test"]);
 
 process.once("exit", () => {
 	generatedCert?.cleanup();
+	generatedWildcardDefaultCert?.cleanup();
+	generatedWildcardCert?.cleanup();
+	generatedWildcardExactCert?.cleanup();
 });
 
 async function connectWithRetry(
@@ -402,9 +411,9 @@ describe("TLS contract (P0.3)", () => {
 	}, 20000);
 
 	it("wildcard SNI matches a single subdomain label and exact hostnames take precedence", async () => {
-		const defaultCert = generateCertForNames(["default.test", "127.0.0.1"]);
-		const wildcardCert = generateCertForNames(["*.example.test"]);
-		const exactCert = generateCertForNames(["api.example.test"]);
+		const defaultCert = generatedWildcardDefaultCert;
+		const wildcardCert = generatedWildcardCert;
+		const exactCert = generatedWildcardExactCert;
 		if (!defaultCert || !wildcardCert || !exactCert) {
 			throw new Error("failed to generate wildcard certificates");
 		}
@@ -459,9 +468,6 @@ describe("TLS contract (P0.3)", () => {
 			).rejects.toThrow(/E_TLS|certificate|peer/i);
 		} finally {
 			await server.close();
-			defaultCert.cleanup();
-			wildcardCert.cleanup();
-			exactCert.cleanup();
 		}
 	}, 25000);
 
