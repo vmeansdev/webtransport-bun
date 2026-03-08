@@ -23,7 +23,7 @@ Verify output includes:
 
 - `package/dist/index.js`
 - `package/dist/index.d.ts`
-- `package/prebuilds/webtransport-native.*.node` (darwin-arm64, darwin-x64, linux-x64 as built)
+- `package/prebuilds/webtransport-native.*.node` (darwin-arm64, darwin-x64, linux-x64, win32-x64-msvc as built)
 - `package/README.md`
 - `package/LICENSE`
 
@@ -34,7 +34,7 @@ cd /tmp
 rm -rf wt-pub-test && mkdir wt-pub-test && cd wt-pub-test
 npm init -y
 # From repo: npm i file:/path/to/packages/webtransport
-# Or after pack: npm i /path/to/webtransport-bun-webtransport-0.2.3.tgz
+# Or after pack: npm i /path/to/webtransport-bun-webtransport-0.3.0.tgz
 
 node -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
 bun -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
@@ -45,7 +45,7 @@ Confirm native addon loads on your OS/arch.
 
 ## 4. Platform constraints
 
-- Package has `"os": ["darwin","linux"]` and `"cpu": ["arm64","x64"]`
+- Package has `"os": ["darwin","linux","win32"]` and `"cpu": ["arm64","x64"]`
 - On unsupported platforms, install may succeed but import should fail with a clear native-addon diagnostics message
 
 ## 5. Version and access
@@ -74,4 +74,4 @@ npm publish
 1. Publish once manually (command above) to create the npm package.
 2. In npm package settings, add GitHub Actions trusted publisher for this repo/workflow.
 3. In GitHub repository variables, set `NPM_TRUSTED_PUBLISHING=true`.
-4. Use Git tags (`v*`) or `workflow_dispatch` with `publish_to_npm=true` to publish via CI with provenance.
+4. Use Git tags (`v*`) or the manual publish workflow to publish via CI with provenance.

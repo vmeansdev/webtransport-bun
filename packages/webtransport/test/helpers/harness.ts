@@ -4,6 +4,8 @@ type Closeable = {
 	close: () => MaybePromise<void>;
 };
 
+const CLEANUP_CLOSE_TIMEOUT_MS = 1500;
+
 export type TestHarness = {
 	track<T extends Closeable>(resource: T): T;
 	cleanup: () => Promise<void>;
@@ -18,15 +20,19 @@ export function createHarness(): TestHarness {
 			return resource;
 		},
 		async cleanup(): Promise<void> {
-			while (resources.length > 0) {
-				const resource = resources.pop();
-				if (!resource) continue;
-				try {
-					await resource.close();
-				} catch {
-					// Best-effort cleanup to avoid masking test failures.
-				}
-			}
+			const pending = resources.splice(0).reverse();
+			await Promise.allSettled(
+				pending.map(async (resource) => {
+					try {
+						await Promise.race([
+							Promise.resolve(resource.close()),
+							Bun.sleep(CLEANUP_CLOSE_TIMEOUT_MS),
+						]);
+					} catch {
+						// Best-effort cleanup to avoid masking test failures.
+					}
+				}),
+			);
 		},
 	};
 }

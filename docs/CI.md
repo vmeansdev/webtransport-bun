@@ -1,10 +1,10 @@
 # CI.md
 
 ## CI goals
-- Build + test on macOS and Linux
+- Build + test on macOS, Linux, and Windows
 - Produce prebuilt binaries for napi-rs addon
-- Run Bun unit/integration tests on both
-- Run Chromium interop tests on both
+- Run Bun unit/integration tests on all supported OSes
+- Run Chromium interop tests on all supported OSes
 - Soak test for leak detection
 
 ## Supported targets (shipped prebuilds)
@@ -13,12 +13,13 @@
 | `darwin-arm64`   | `macos-latest` | aarch64      |
 | `darwin-x64`     | `macos-latest` | x86_64       |
 | `linux-x64`      | `ubuntu-latest`| x86_64       |
+| `win32-x64-msvc` | `windows-latest` | x86_64    |
 
 ## Workflows
 
 ### test.yml (push, pull_request, workflow_dispatch)
 
-**test** job — matrix: `{ubuntu-latest, macos-latest}` × `{1.3.9, latest}`
+**test** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}` × `{1.3.9, latest}`
 
 1. Rust quality gates: `cargo fmt --check`, `cargo audit`, `cargo clippy -- -D clippy::all`, `cargo test --workspace`
 2. Build native addon + install deps
@@ -52,7 +53,7 @@ Test log hygiene:
 
 3. **parity** — W3C facade parity tests; produces `parity-evidence.json`
 4. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
-5. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
+5. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
 6. **release** — needs [build, interop, parity]; verifies required evidence, downloads prebuilds + evidence, regenerates SHA256SUMS, creates GitHub release with release notes and evidence artifacts
 7. **publish** — downloads artifacts, publishes to npm via npm Trusted Publishing (OIDC, no npm token)
    - Runs on tag pushes only when repo variable `NPM_TRUSTED_PUBLISHING` is set to `true`

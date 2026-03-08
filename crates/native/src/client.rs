@@ -35,6 +35,18 @@ static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>>
 static CLIENT_POOL: Lazy<std::sync::Arc<client_pool::ClientPoolManager>> =
     Lazy::new(|| std::sync::Arc::new(client_pool::ClientPoolManager::new()));
 
+fn map_connecting_error(
+    err: wtransport::error::ConnectingError,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match err {
+        wtransport::error::ConnectingError::SessionRejected => {
+            std::io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request")
+                .into()
+        }
+        other => other.into(),
+    }
+}
+
 /// Result for connect callback to avoid napi::Result type confusion.
 #[derive(Clone)]
 enum ConnectResult {
@@ -56,6 +68,19 @@ type OpenUniReq = oneshot::Sender<std::result::Result<ClientUniSendHandle, Strin
 type AcceptBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
 type AcceptUniReq = oneshot::Sender<std::result::Result<ClientUniRecvHandle, String>>;
 
+fn try_reserve_client_queued_bytes(metrics: &ClientMetrics, budget_bytes: u64, n: u64) -> bool {
+    metrics
+        .queued_bytes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            if current + n <= budget_bytes {
+                Some(current + n)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
 fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Limits, String> {
     let parsed: serde_json::Value = serde_json::from_str(opts_json)
         .map_err(|e| format!("E_INTERNAL: invalid client options JSON: {}", e))?;
@@ -68,6 +93,97 @@ fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Li
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CongestionControlMode {
+    Default,
+    Throughput,
+    LowLatency,
+}
+
+fn parse_congestion_control(
+    opts: &serde_json::Value,
+) -> std::result::Result<CongestionControlMode, String> {
+    match opts
+        .get("congestionControl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+    {
+        "default" => Ok(CongestionControlMode::Default),
+        "throughput" => Ok(CongestionControlMode::Throughput),
+        "low-latency" => Ok(CongestionControlMode::LowLatency),
+        other => Err(format!(
+            "E_INTERNAL: congestionControl must be \"default\", \"throughput\", or \"low-latency\", got \"{}\"",
+            other
+        )),
+    }
+}
+
+fn build_quic_transport_config(
+    mode: CongestionControlMode,
+) -> wtransport::config::QuicTransportConfig {
+    let mut config = wtransport::config::QuicTransportConfig::default();
+    let factory: Arc<dyn wtransport::quinn::congestion::ControllerFactory + Send + Sync + 'static> =
+        match mode {
+            CongestionControlMode::Default => {
+                Arc::new(wtransport::quinn::congestion::CubicConfig::default())
+            }
+            CongestionControlMode::Throughput => {
+                Arc::new(wtransport::quinn::congestion::BbrConfig::default())
+            }
+            CongestionControlMode::LowLatency => {
+                Arc::new(wtransport::quinn::congestion::NewRenoConfig::default())
+            }
+        };
+    config.congestion_controller_factory(factory);
+    config
+}
+
+#[cfg(test)]
+fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
+    match mode {
+        CongestionControlMode::Default => "cubic",
+        CongestionControlMode::Throughput => "bbr",
+        CongestionControlMode::LowLatency => "new_reno",
+    }
+}
+
+fn build_wtransport_client_config(
+    insecure_skip_verify: bool,
+    ca_pem: Option<&str>,
+    pinned_hashes: &[[u8; 32]],
+    congestion_control: CongestionControlMode,
+) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let transport_config = build_quic_transport_config(congestion_control);
+
+    let config = if insecure_skip_verify {
+        let tls_config =
+            build_client_tls_config(Arc::new(rustls::RootCertStore::empty()), true, &[])
+                .map_err(std::io::Error::other)?;
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls_config, transport_config)
+            .build()
+    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
+        let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
+        let tls_config = build_client_tls_config(root_store, false, pinned_hashes)
+            .map_err(std::io::Error::other)?;
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls_config, transport_config)
+            .build()
+    } else {
+        let root_store = build_root_cert_store(None).map_err(std::io::Error::other)?;
+        let tls_config =
+            build_client_tls_config(root_store, false, &[]).map_err(std::io::Error::other)?;
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls_config, transport_config)
+            .build()
+    };
+
+    Ok(config)
+}
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -76,6 +192,7 @@ pub struct ClientSessionHandle {
     peer_port: u32,
     dgram_send_tx: Option<mpsc::Sender<Vec<u8>>>,
     dgram_recv_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    datagram_budget_bytes: u64,
     backpressure_timeout_ms: u64,
     max_datagram_size: usize,
     stream_open_bi_tx: Option<mpsc::Sender<OpenBiReq>>,
@@ -117,10 +234,10 @@ impl ClientSessionHandle {
             return Err(napi::Error::from_reason("E_QUEUE_FULL"));
         }
         let sz = bytes.len() as u64;
+        if !try_reserve_client_queued_bytes(&self.client_metrics, self.datagram_budget_bytes, sz) {
+            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+        }
         let timeout = tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
-        self.client_metrics
-            .queued_bytes
-            .fetch_add(sz, Ordering::Relaxed);
         let result = tokio::time::timeout(timeout, tx.send(bytes)).await;
         match result {
             Ok(Ok(())) => Ok(()),
@@ -144,7 +261,12 @@ impl ClientSessionHandle {
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
         let mut rx = self.dgram_recv_rx.lock().await;
         match rx.recv().await {
-            Some(bytes) => Ok(Some(bytes.into())),
+            Some(bytes) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                Ok(Some(bytes.into()))
+            }
             None => Ok(None),
         }
     }
@@ -268,6 +390,7 @@ impl ClientSessionHandle {
         let max_global = limits.max_queued_bytes_global;
         let max_session = limits.max_queued_bytes_per_session;
         let max_stream = limits.max_queued_bytes_per_stream;
+        let datagram_budget_bytes = std::cmp::min(max_global, max_session);
 
         let handle = Self {
             id: id.clone(),
@@ -275,6 +398,7 @@ impl ClientSessionHandle {
             peer_port,
             dgram_send_tx: Some(dgram_send_tx.clone()),
             dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+            datagram_budget_bytes,
             backpressure_timeout_ms,
             max_datagram_size: limits.max_datagram_size,
             stream_open_bi_tx: Some(open_bi_tx),
@@ -327,10 +451,16 @@ impl ClientSessionHandle {
             });
 
             let cm_recv = Arc::clone(&cm);
+            let recv_budget_bytes = datagram_budget_bytes;
             crate::panic_guard::spawn_quic_task(async move {
                 while let Ok(dgram) = conn_dgram_recv.receive_datagram().await {
+                    let sz = dgram.len() as u64;
+                    if !try_reserve_client_queued_bytes(&cm_recv, recv_budget_bytes, sz) {
+                        continue;
+                    }
                     cm_recv.datagrams_in.fetch_add(1, Ordering::Relaxed);
                     if dgram_recv_tx.send(dgram.as_ref().to_vec()).await.is_err() {
+                        cm_recv.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -678,6 +808,8 @@ fn connect_url_and_resolver(
 fn build_root_cert_store(
     ca_pem: Option<&str>,
 ) -> std::result::Result<std::sync::Arc<rustls::RootCertStore>, String> {
+    use rustls::pki_types::pem::PemObject;
+
     let mut root_store = rustls::RootCertStore::empty();
 
     // Add platform native certs (best-effort)
@@ -688,11 +820,9 @@ fn build_root_cert_store(
 
     // Add custom CA(s) from caPem
     if let Some(pem) = ca_pem {
-        let pem_bytes = pem.as_bytes();
-        let mut cursor = std::io::Cursor::new(pem_bytes);
         let mut parsed = 0u32;
         let mut added = 0u32;
-        for item in rustls_pemfile::certs(&mut cursor) {
+        for item in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
             match item {
                 Ok(der) => {
                     parsed += 1;
@@ -947,6 +1077,7 @@ async fn run_connect(
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    let congestion_control = parse_congestion_control(&opts).map_err(std::io::Error::other)?;
 
     let (connect_url, custom_resolver) =
         connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
@@ -976,27 +1107,12 @@ async fn run_connect(
         let ca_pem_owned = ca_pem.map(String::from);
         let pinned_hashes_clone = pinned_hashes.clone();
         let create_endpoint = move || {
-            let mut config = if insecure_skip_verify {
-                wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_no_cert_validation()
-                    .build()
-            } else if ca_pem_owned.is_some() || !pinned_hashes_clone.is_empty() {
-                let root_store = build_root_cert_store(ca_pem_owned.as_deref())
-                    .map_err(std::io::Error::other)?;
-                let tls_config =
-                    build_client_tls_config(root_store, false, pinned_hashes_clone.as_slice())
-                        .map_err(std::io::Error::other)?;
-                wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_custom_tls(tls_config)
-                    .build()
-            } else {
-                wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_native_certs()
-                    .build()
-            };
+            let mut config = build_wtransport_client_config(
+                insecure_skip_verify,
+                ca_pem_owned.as_deref(),
+                pinned_hashes_clone.as_slice(),
+                congestion_control,
+            )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
             }
@@ -1018,25 +1134,12 @@ async fn run_connect(
         return Ok((id, peer_ip, peer_port, conn, Some(release_guard)));
     }
 
-    let mut config = if insecure_skip_verify {
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_no_cert_validation()
-            .build()
-    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
-        let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
-        let tls_config = build_client_tls_config(root_store, false, pinned_hashes.as_slice())
-            .map_err(std::io::Error::other)?;
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_custom_tls(tls_config)
-            .build()
-    } else {
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_native_certs()
-            .build()
-    };
+    let mut config = build_wtransport_client_config(
+        insecure_skip_verify,
+        ca_pem,
+        pinned_hashes.as_slice(),
+        congestion_control,
+    )?;
 
     if let Some(resolver) = custom_resolver {
         config.set_dns_resolver(resolver);
@@ -1048,7 +1151,8 @@ async fn run_connect(
         endpoint.connect(&connect_url),
     )
     .await
-    .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;
+    .map_err(|_| "E_HANDSHAKE_TIMEOUT")?
+    .map_err(map_connecting_error)?;
 
     let addr = conn.remote_address();
     let peer_ip = addr.ip().to_string();
@@ -1059,7 +1163,11 @@ async fn run_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_root_cert_store, parse_client_limits};
+    use super::{
+        build_root_cert_store, congestion_controller_label, parse_client_limits,
+        parse_congestion_control, CongestionControlMode,
+    };
+    use serde_json::json;
 
     #[test]
     fn build_root_cert_store_rejects_parseable_but_unaccepted_cert() {
@@ -1088,5 +1196,22 @@ mod tests {
     fn parse_client_limits_rejects_invalid_json() {
         let err = parse_client_limits("{").expect_err("expected invalid JSON");
         assert!(err.contains("E_INTERNAL: invalid client options JSON"));
+    }
+
+    #[test]
+    fn parse_congestion_control_maps_supported_values() {
+        let throughput = parse_congestion_control(&json!({ "congestionControl": "throughput" }))
+            .expect("throughput should parse");
+        assert_eq!(throughput, CongestionControlMode::Throughput);
+        assert_eq!(congestion_controller_label(throughput), "bbr");
+
+        let low_latency = parse_congestion_control(&json!({ "congestionControl": "low-latency" }))
+            .expect("low-latency should parse");
+        assert_eq!(low_latency, CongestionControlMode::LowLatency);
+        assert_eq!(congestion_controller_label(low_latency), "new_reno");
+
+        let default_mode = parse_congestion_control(&json!({})).expect("default should parse");
+        assert_eq!(default_mode, CongestionControlMode::Default);
+        assert_eq!(congestion_controller_label(default_mode), "cubic");
     }
 }

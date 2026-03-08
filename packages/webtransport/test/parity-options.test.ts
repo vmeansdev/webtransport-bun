@@ -40,7 +40,16 @@ describe("parity options (Phase 5)", () => {
 			tls: { insecureSkipVerify: true },
 			congestionControl: "low-latency",
 		});
-		expect(wt.congestionControl).toBe("default");
+		expect(wt.congestionControl).toBe("low-latency");
+		wt.close();
+	});
+
+	test("congestionControl supports throughput mapping as a distinct effective mode", async () => {
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+			congestionControl: "throughput",
+		});
+		expect(wt.congestionControl).toBe("throughput");
 		wt.close();
 	});
 

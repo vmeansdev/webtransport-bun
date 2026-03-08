@@ -89,6 +89,9 @@ import {
 	E_BACKPRESSURE_TIMEOUT,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
+	E_STREAM_RESET,
+	E_STOP_SENDING,
+	E_RATE_LIMITED,
 	WebTransportError,
 } from "./errors.js";
 import type { ErrorCode } from "./errors.js";
@@ -123,6 +126,12 @@ function normalizeToBrowserName(
 		return "TypeError";
 	}
 	if (
+		message.includes("serverCertificateHashes entry value must be") ||
+		message.includes("invalid base64 in serverCertificateHashes")
+	) {
+		return "TypeError";
+	}
+	if (
 		message.includes("allowPooling must be a boolean") ||
 		message.includes("requireUnreliable must be a boolean")
 	) {
@@ -130,20 +139,47 @@ function normalizeToBrowserName(
 	}
 	if (
 		message.includes("congestionControl must be") ||
-		message.includes("datagramsReadableType must be")
+		message.includes("datagramsReadableType must be") ||
+		message.includes("waitUntilAvailable must be a boolean")
 	) {
 		return "TypeError";
 	}
-	if (message.includes("E_HANDSHAKE_TIMEOUT")) {
-		return "TimeoutError";
-	}
-	if (
-		message.includes("E_SESSION_CLOSED") ||
-		message.includes("E_SESSION_IDLE_TIMEOUT")
-	) {
-		return "InvalidStateError";
+	switch (code) {
+		case E_TLS:
+			return "NetworkError";
+		case E_HANDSHAKE_TIMEOUT:
+		case E_BACKPRESSURE_TIMEOUT:
+			return "TimeoutError";
+		case E_SESSION_CLOSED:
+		case E_SESSION_IDLE_TIMEOUT:
+			return "InvalidStateError";
+		case E_STREAM_RESET:
+		case E_STOP_SENDING:
+			return "AbortError";
+		case E_LIMIT_EXCEEDED:
+		case E_QUEUE_FULL:
+		case E_RATE_LIMITED:
+			return "QuotaExceededError";
+		case E_INTERNAL:
+			return "OperationError";
 	}
 	return undefined;
+}
+
+function createMappedError(
+	code: ErrorCode,
+	message: string,
+	strictW3CErrors?: boolean,
+): WebTransportError {
+	const browserName =
+		strictW3CErrors === true
+			? normalizeToBrowserName(code, message)
+			: undefined;
+	return new WebTransportError(
+		code,
+		message,
+		browserName ? { browserName } : undefined,
+	);
 }
 
 function toWebTransportError(
@@ -153,13 +189,7 @@ function toWebTransportError(
 	const msg = err instanceof Error ? err.message : String(err);
 	const match = msg.match(E_CODE_RE);
 	const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
-	const browserName =
-		strictW3CErrors === true ? normalizeToBrowserName(code, msg) : undefined;
-	return new WebTransportError(
-		code,
-		msg,
-		browserName ? { browserName } : undefined,
-	);
+	return createMappedError(code, msg, strictW3CErrors);
 }
 
 function isSessionCloseError(err: unknown): boolean {
@@ -245,6 +275,19 @@ async function openStreamWithWait<T>(
 // ---------------------------------------------------------------------------
 
 /** TLS configuration for server (cert/key) or client (CA, SNI). */
+export type ServerTlsSniEntry = {
+	serverName: string;
+	certPem: string | Uint8Array;
+	keyPem: string | Uint8Array;
+};
+
+export type UnknownSniPolicy = "reject" | "default";
+
+export type ServerTlsSnapshot = {
+	sniServerNames: string[];
+	unknownSniPolicy: UnknownSniPolicy;
+};
+
 export type TlsOptions = {
 	/** PEM-encoded certificate (server) or CA (client). */
 	certPem: string | Uint8Array;
@@ -254,6 +297,10 @@ export type TlsOptions = {
 	caPem?: string | Uint8Array;
 	/** SNI for client mode; for server, used in logs/metrics. */
 	serverName?: string;
+	/** Optional additional SNI certificates for server mode. */
+	sni?: ServerTlsSniEntry[];
+	/** Unknown SNI handling for server mode. Default "reject". No-SNI still uses default cert. */
+	unknownSniPolicy?: UnknownSniPolicy;
 	/** When true, allow empty cert/key fallback in production (dev only). */
 	allowSelfSigned?: boolean;
 };
@@ -370,11 +417,23 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
-	/** Rotate server TLS certificate/key at runtime. Existing sessions are drained/closed. */
+	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
 	updateCert(tls: {
 		certPem: string | Uint8Array;
 		keyPem: string | Uint8Array;
 	}): Promise<void>;
+	/** Atomically replace the full server TLS configuration, including SNI certs and unknown-SNI policy. */
+	updateTls(tls: TlsOptions): Promise<void>;
+	/** Replace only the full SNI cert map, preserving the default cert/key and unknown-SNI policy. */
+	replaceSniCerts(sni: ServerTlsSniEntry[]): Promise<void>;
+	/** Add or replace one hostname-specific SNI certificate. */
+	upsertSniCert(entry: ServerTlsSniEntry): Promise<void>;
+	/** Remove one hostname-specific SNI certificate. */
+	removeSniCert(serverName: string): Promise<void>;
+	/** Update only the unknown-SNI policy. */
+	setUnknownSniPolicy(policy: UnknownSniPolicy): Promise<void>;
+	/** Introspect the active server TLS SNI state without exposing key material. */
+	tlsSnapshot(): ServerTlsSnapshot;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -572,6 +631,9 @@ export type MetricsSnapshot = {
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
+	sniCertSelections: number;
+	defaultCertSelections: number;
+	unknownSniRejectedCount: number;
 
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
@@ -698,6 +760,15 @@ export function metricsToPrometheus(
 		`# HELP ${p}limit_exceeded_total Sessions rejected (limits)`,
 		`# TYPE ${p}limit_exceeded_total counter`,
 		`${p}limit_exceeded_total${metricLabels} ${m.limitExceededCount}`,
+		`# HELP ${p}tls_sni_cert_selections_total Handshakes served by hostname-specific SNI certs`,
+		`# TYPE ${p}tls_sni_cert_selections_total counter`,
+		`${p}tls_sni_cert_selections_total${metricLabels} ${m.sniCertSelections}`,
+		`# HELP ${p}tls_default_cert_selections_total Handshakes served by the default certificate`,
+		`# TYPE ${p}tls_default_cert_selections_total counter`,
+		`${p}tls_default_cert_selections_total${metricLabels} ${m.defaultCertSelections}`,
+		`# HELP ${p}tls_unknown_sni_rejected_total Handshakes rejected because SNI did not match a configured hostname`,
+		`# TYPE ${p}tls_unknown_sni_rejected_total counter`,
+		`${p}tls_unknown_sni_rejected_total${metricLabels} ${m.unknownSniRejectedCount}`,
 	];
 
 	function emitHistogram(
@@ -770,6 +841,7 @@ const PLATFORM = process.platform;
 const ARCH = process.arch;
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
+	`webtransport-native.${PLATFORM}-${ARCH}-msvc.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-gnu.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-musl.node`,
 ];
@@ -984,7 +1056,7 @@ class NativeServerSession implements ServerSession {
  * Create an in-process WebTransport server.
  *
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
- * @returns WebTransportServer with `address`, `updateCert()`, `close()`, and `metricsSnapshot()`.
+ * @returns WebTransportServer with address, live TLS management methods, `close()`, and `metricsSnapshot()`.
  * @throws Error if native addon is not loaded.
  *
  * @example
@@ -1005,14 +1077,14 @@ class NativeServerSession implements ServerSession {
 export function createServer(opts: ServerOptions): WebTransportServer {
 	const native = getNativeOrThrow();
 
-	const certPem =
-		typeof opts.tls.certPem === "string"
-			? opts.tls.certPem
-			: new TextDecoder().decode(opts.tls.certPem);
-	const keyPem =
-		typeof opts.tls.keyPem === "string"
-			? opts.tls.keyPem
-			: new TextDecoder().decode(opts.tls.keyPem);
+	const decodePem = (value: string | Uint8Array | undefined): string =>
+		typeof value === "string"
+			? value
+			: value != null
+				? new TextDecoder().decode(value)
+				: "";
+	const certPem = decodePem(opts.tls.certPem);
+	const keyPem = decodePem(opts.tls.keyPem);
 	if (
 		process.env.NODE_ENV === "production" &&
 		opts.tls.allowSelfSigned !== true &&
@@ -1023,12 +1095,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			"E_TLS: empty certPem/keyPem is not allowed in production (set tls.allowSelfSigned=true to override)",
 		);
 	}
-	const caPem =
-		typeof opts.tls.caPem === "string"
-			? opts.tls.caPem
-			: opts.tls.caPem != null
-				? new TextDecoder().decode(opts.tls.caPem)
-				: "";
+	const caPem = decodePem(opts.tls.caPem);
+	const tlsConfigToJson = (tls: TlsOptions): string =>
+		JSON.stringify({
+			certPem: decodePem(tls.certPem),
+			keyPem: decodePem(tls.keyPem),
+			caPem: decodePem(tls.caPem),
+			unknownSniPolicy: tls.unknownSniPolicy,
+			sni:
+				tls.sni?.map((entry) => ({
+					serverName: entry.serverName,
+					certPem: decodePem(entry.certPem),
+					keyPem: decodePem(entry.keyPem),
+				})) ?? [],
+		});
 
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
@@ -1069,9 +1149,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		opts.port,
 		opts.host ?? "0.0.0.0",
 		opts.debug === true,
-		certPem,
-		keyPem,
-		caPem,
+		tlsConfigToJson(opts.tls),
 		limitsJson,
 		rateLimitsJson,
 		(events: any[]) => {
@@ -1149,16 +1227,38 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		updateCert: async (tls) => {
-			const nextCertPem =
-				typeof tls.certPem === "string"
-					? tls.certPem
-					: new TextDecoder().decode(tls.certPem);
-			const nextKeyPem =
-				typeof tls.keyPem === "string"
-					? tls.keyPem
-					: new TextDecoder().decode(tls.keyPem);
+			const nextCertPem = decodePem(tls.certPem);
+			const nextKeyPem = decodePem(tls.keyPem);
 			await handle.updateCert(nextCertPem, nextKeyPem);
 		},
+		updateTls: async (tls) => {
+			await handle.updateTls(tlsConfigToJson(tls));
+		},
+		replaceSniCerts: async (sni) => {
+			await handle.replaceSniCerts(
+				JSON.stringify(
+					sni.map((entry) => ({
+						serverName: entry.serverName,
+						certPem: decodePem(entry.certPem),
+						keyPem: decodePem(entry.keyPem),
+					})),
+				),
+			);
+		},
+		upsertSniCert: async (entry) => {
+			await handle.upsertSniCert(
+				entry.serverName,
+				decodePem(entry.certPem),
+				decodePem(entry.keyPem),
+			);
+		},
+		removeSniCert: async (serverName) => {
+			await handle.removeSniCert(serverName);
+		},
+		setUnknownSniPolicy: async (policy) => {
+			await handle.setUnknownSniPolicy(policy);
+		},
+		tlsSnapshot: () => handle.tlsSnapshot(),
 		close: async () => {
 			await handle.close();
 			for (const [id, resolve] of closedResolvers) {
@@ -1543,12 +1643,24 @@ export function clientPoolMetricsSnapshot(): {
 
 function validateServerCertificateHashes(
 	arr: Array<{ algorithm: string; value: BufferSource }>,
+	strictW3CErrors?: boolean,
 ): void {
 	for (const entry of arr) {
 		if (entry.algorithm !== "sha-256") {
-			throw new WebTransportError(
+			throw createMappedError(
 				E_INTERNAL as ErrorCode,
 				`E_INTERNAL: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
+				strictW3CErrors,
+			);
+		}
+		if (
+			!(entry.value instanceof ArrayBuffer) &&
+			!ArrayBuffer.isView(entry.value)
+		) {
+			throw createMappedError(
+				E_INTERNAL as ErrorCode,
+				"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+				strictW3CErrors,
 			);
 		}
 		if (
@@ -1557,9 +1669,10 @@ function validateServerCertificateHashes(
 				"byteLength" in entry &&
 				entry.byteLength === 0)
 		) {
-			throw new WebTransportError(
+			throw createMappedError(
 				E_INTERNAL as ErrorCode,
 				"E_INTERNAL: serverCertificateHashes entry value must be non-empty BufferSource",
+				strictW3CErrors,
 			);
 		}
 	}
@@ -1583,49 +1696,57 @@ function bufferSourceToBase64(value: BufferSource): string {
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
 const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
 
-function validateClientOptions(opts?: WebTransportClientOptions): void {
+function validateClientOptions(
+	opts?: WebTransportClientOptions,
+	strictW3CErrors?: boolean,
+): void {
 	if (!opts) return;
 	if (
 		opts.allowPooling !== undefined &&
 		typeof opts.allowPooling !== "boolean"
 	) {
-		throw new WebTransportError(
+		throw createMappedError(
 			E_INTERNAL as ErrorCode,
 			"E_INTERNAL: allowPooling must be a boolean",
+			strictW3CErrors,
 		);
 	}
 	if (
 		opts.requireUnreliable !== undefined &&
 		typeof opts.requireUnreliable !== "boolean"
 	) {
-		throw new WebTransportError(
+		throw createMappedError(
 			E_INTERNAL as ErrorCode,
 			"E_INTERNAL: requireUnreliable must be a boolean",
+			strictW3CErrors,
 		);
 	}
 	if (
 		opts.congestionControl !== undefined &&
 		!VALID_CONGESTION.has(opts.congestionControl)
 	) {
-		throw new WebTransportError(
+		throw createMappedError(
 			E_INTERNAL as ErrorCode,
 			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+			strictW3CErrors,
 		);
 	}
 	if (
 		opts.datagramsReadableType !== undefined &&
 		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
 	) {
-		throw new WebTransportError(
+		throw createMappedError(
 			E_INTERNAL as ErrorCode,
 			`E_INTERNAL: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
+			strictW3CErrors,
 		);
 	}
 	if (opts.serverCertificateHashes !== undefined) {
 		if (!Array.isArray(opts.serverCertificateHashes)) {
-			throw new WebTransportError(
+			throw createMappedError(
 				E_INTERNAL as ErrorCode,
 				"E_INTERNAL: serverCertificateHashes must be an array",
+				strictW3CErrors,
 			);
 		}
 		if (opts.allowPooling === true) {
@@ -1635,13 +1756,16 @@ function validateClientOptions(opts?: WebTransportClientOptions): void {
 				{ browserName: "NotSupportedError" },
 			);
 		}
-		validateServerCertificateHashes(opts.serverCertificateHashes);
+		validateServerCertificateHashes(
+			opts.serverCertificateHashes,
+			strictW3CErrors,
+		);
 	}
 }
 
 function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 	if (!opts) return {};
-	validateClientOptions(opts);
+	validateClientOptions(opts, opts.strictW3CErrors);
 	return {
 		tls: opts.tls,
 		limits: opts.limits,
@@ -1805,6 +1929,7 @@ export class WebTransport {
 		datagramsIn: 0,
 	};
 	readonly #congestionControl: "default" | "throughput" | "low-latency";
+	#strictW3CErrors = false;
 
 	constructor(
 		urlOrSession: string | ClientSession,
@@ -1813,9 +1938,8 @@ export class WebTransport {
 		if (typeof urlOrSession === "string") {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			const requestedCongestion = options?.congestionControl ?? "default";
-			// Runtime currently supports default algorithm; explicit preference falls back to default.
-			this.#congestionControl =
-				requestedCongestion === "default" ? "default" : "default";
+			this.#congestionControl = requestedCongestion;
+			this.#strictW3CErrors = options?.strictW3CErrors ?? false;
 			const clientOpts = mapToClientOptions(options);
 			this.#sessionPromise = connect(urlOrSession, clientOpts);
 			this.#state = "connecting";
@@ -1842,8 +1966,9 @@ export class WebTransport {
 				},
 			);
 		} else {
-			this.#datagramsReadableType = "default";
-			this.#congestionControl = "default";
+			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
+			this.#congestionControl = options?.congestionControl ?? "default";
+			this.#strictW3CErrors = options?.strictW3CErrors ?? false;
 			const s = urlOrSession;
 			this.#sessionPromise = Promise.resolve(s);
 			this.#session = s;
@@ -1950,6 +2075,7 @@ export class WebTransport {
 			(bytes) => {
 				this.#connStats.bytesReceived += bytes;
 			},
+			this.#strictW3CErrors,
 		);
 	}
 
@@ -1980,6 +2106,7 @@ export class WebTransport {
 				this.#connStats.bytesSent += bytes;
 				this._recordSendGroupBytes(policy.groupId, bytes);
 			},
+			this.#strictW3CErrors,
 		);
 	}
 
@@ -2040,6 +2167,10 @@ export class WebTransport {
 	/** Internal: state for createWritable guard (not part of spec) */
 	_getState(): WebTransportState {
 		return this.#state;
+	}
+
+	_isStrictW3CErrors(): boolean {
+		return this.#strictW3CErrors;
 	}
 
 	_resolveSendPolicy(options?: {
@@ -2308,6 +2439,7 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 						(bytes) => {
 							wt._recordIncomingStreamBytes(bytes);
 						},
+						wt._isStrictW3CErrors(),
 					),
 				);
 			}
@@ -2324,9 +2456,13 @@ function createIncomingUniStreams(
 			const s = await wt._getSession();
 			for await (const readable of s.incomingUnidirectionalStreams()) {
 				controller.enqueue(
-					nodeReadableToWebReadable(readable, (bytes) => {
-						wt._recordIncomingStreamBytes(bytes);
-					}),
+					nodeReadableToWebReadable(
+						readable,
+						(bytes) => {
+							wt._recordIncomingStreamBytes(bytes);
+						},
+						wt._isStrictW3CErrors(),
+					),
 				);
 			}
 			controller.close();
@@ -2340,16 +2476,22 @@ function nodeDuplexToWebBidi(
 	policy?: SendPolicy,
 	onWriteBytes?: (bytes: number) => void,
 	onReadBytes?: (bytes: number) => void,
+	strictW3CErrors = false,
 ): Promise<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
 }> {
-	const readable = nodeReadableToWebReadable(duplex, onReadBytes);
+	const readable = nodeReadableToWebReadable(
+		duplex,
+		onReadBytes,
+		strictW3CErrors,
+	);
 	const writable = nodeWritableToWebWritable(
 		duplex,
 		scheduler,
 		policy,
 		onWriteBytes,
+		strictW3CErrors,
 	);
 	return Promise.resolve({ readable, writable });
 }
@@ -2371,17 +2513,22 @@ function extractStreamErrorCode(reason: unknown): number {
 function nodeReadableToWebReadable(
 	r: Readable,
 	onReadBytes?: (bytes: number) => void,
+	strictW3CErrors = false,
 ): ReadableStream<Uint8Array> {
 	const stopSendable = r as unknown as Partial<StopSendable>;
 	return new ReadableStream<Uint8Array>({
 		async start(controller) {
-			for await (const chunk of r) {
-				const bytes =
-					chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-				if (onReadBytes) onReadBytes(bytes.byteLength);
-				controller.enqueue(bytes);
+			try {
+				for await (const chunk of r) {
+					const bytes =
+						chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+					if (onReadBytes) onReadBytes(bytes.byteLength);
+					controller.enqueue(bytes);
+				}
+				controller.close();
+			} catch (err) {
+				controller.error(toWebTransportError(err, strictW3CErrors));
 			}
-			controller.close();
 		},
 		cancel(reason) {
 			const fn = stopSendable[WT_STOP_SENDING];
@@ -2395,6 +2542,7 @@ function nodeWritableToWebWritable(
 	scheduler?: SendScheduler,
 	policy?: SendPolicy,
 	onWriteBytes?: (bytes: number) => void,
+	strictW3CErrors = false,
 ): WritableStream<Uint8Array> {
 	const resettable = w as unknown as Partial<Resettable>;
 	return new WritableStream<Uint8Array>({
@@ -2405,18 +2553,26 @@ function nodeWritableToWebWritable(
 						err ? reject(err) : resolve(),
 					);
 				});
-			if (scheduler && policy) {
-				await scheduler.enqueue(policy, run);
-			} else {
-				await run();
+			try {
+				if (scheduler && policy) {
+					await scheduler.enqueue(policy, run);
+				} else {
+					await run();
+				}
+			} catch (err) {
+				throw toWebTransportError(err, strictW3CErrors);
 			}
 			if (onWriteBytes) onWriteBytes(chunk.byteLength);
 		},
 		close() {
 			return new Promise<void>((resolve, reject) => {
-				w.end((err: Error | null | undefined) =>
-					err ? reject(err) : resolve(),
-				);
+				w.end((err: Error | null | undefined) => {
+					if (err) {
+						reject(toWebTransportError(err, strictW3CErrors));
+						return;
+					}
+					resolve();
+				});
 			});
 		},
 		abort(reason) {

@@ -24,12 +24,12 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - browser-shaped stream control mapping (`writable.abort` -> reset, `readable.cancel` -> stopSending)
   - static capability `supportsReliableOnly`
   - `getStats()` connection counters (`bytesSent`, `bytesReceived`, packet counters, datagrams)
-  - `congestionControl` option forwarding with explicit effective-mode behavior
+  - `congestionControl` option validation with explicit runtime mapping: `default` -> Cubic, `throughput` -> BBR, `low-latency` -> NewReno
   - `serverCertificateHashes` pinning support in native TLS verify path
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
   - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
-- Remaining parity tracking and implementation sequencing are in `PARITY_PLAN.md` and `docs/PARITY_MATRIX.md`.
+- Remaining parity tracking and implementation sequencing are in `docs/PARITY_MATRIX.md` (see Priority Execution Order / Remaining Work).
 
 ## Pooling Semantics (allowPooling)
 
@@ -37,7 +37,7 @@ When `allowPooling: true`, the runtime uses **endpoint-level pooling**:
 
 - **What is pooled:** `Endpoint` instances (UDP socket + TLS config) are reused per compatibility key.
 - **What is not pooled:** Each `connect()` still creates a new `Connection` (new QUIC handshake + WebTransport CONNECT); sessions are independent.
-- **Compatibility key dimensions:** scheme, host, port, SNI (`serverName`), TLS mode (`insecureSkipVerify`, `caPem`, `serverCertificateHashes`), `requireUnreliable`, and congestion preference. Connects with identical key reuse the pooled endpoint; differing key creates a new pool entry.
+- **Compatibility key dimensions:** scheme, host, port, SNI (`serverName`), TLS mode (`insecureSkipVerify`, `caPem`, `serverCertificateHashes`), `requireUnreliable`, and requested congestion preference. Connects with identical key reuse the pooled endpoint; differing key creates a new pool entry.
 - **Non-reuse conditions:** Different origin, TLS config, or transport options; `serverCertificateHashes` is incompatible with pooling (rejected at validation).
 - **Terminology:** Use "endpoint pooling" (reuse of `Endpoint`) — not "connection pooling" or "session pooling."
 
@@ -45,14 +45,14 @@ See `docs/PARITY_MATRIX.md` for parity status.
 
 ## requireUnreliable Invariant
 
-On supported targets (Bun/Node/Deno on macOS/Linux), the transport backend is QUIC/WebTransport, which supports unreliable (datagram) delivery. Therefore `requireUnreliable: true` is satisfiable and accepted. This option participates in the pool compatibility key; connects with differing `requireUnreliable` values do not share a pooled endpoint.
+On supported targets (Bun/Node/Deno on macOS/Linux/Windows), the transport backend is QUIC/WebTransport, which supports unreliable (datagram) delivery. Therefore `requireUnreliable: true` is satisfiable and accepted. This option participates in the pool compatibility key; connects with differing `requireUnreliable` values do not share a pooled endpoint.
 
 ## Error Model and Browser-Style Names
 
 - **Stable `E_*` codes:** All errors carry `code` (e.g. `E_TLS`, `E_HANDSHAKE_TIMEOUT`) for programmatic handling. This is preserved for backward compatibility.
 - **Deterministic browser name for validation:** `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_INTERNAL`.
-- **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path and session errors use browser-style DOMException names (`TimeoutError`, `InvalidStateError`, `TypeError`) where mapped, while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
-- **Mapping rules (when strictW3CErrors):** E_HANDSHAKE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError.
+- **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path, session, and Web Streams facade errors use browser-style DOMException names while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
+- **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError; other E_INTERNAL cases → OperationError.
 - **Unknown errors:** No broad catch-all; unmapped cases keep `name: "WebTransportError"`.
 
 ## TypeScript API (authoritative)
@@ -66,6 +66,17 @@ export type TlsOptions = {
   /** Not supported for server. Passing caPem to createServer rejects with E_TLS. */
   caPem?: string | Uint8Array;
   serverName?: string; // for server: used in logs/metrics only; for client: SNI override
+  /** Additional hostname-specific certificates for server mode. */
+  sni?: Array<{
+    serverName: string;
+    certPem: string | Uint8Array;
+    keyPem: string | Uint8Array;
+  }>;
+  /**
+   * Server-only policy for unknown SNI hostnames when `sni` entries exist.
+   * Default is "reject". No-SNI clients still receive the default cert.
+   */
+  unknownSniPolicy?: "reject" | "default";
   /** Production guard override for empty cert/key fallback. */
   allowSelfSigned?: boolean;
 };
@@ -124,13 +135,65 @@ export type LogEvent = {
 
 export interface WebTransportServer {
   readonly address: { host: string; port: number };
+  /**
+   * Hot-swap TLS leaf cert/key material in place.
+   * Existing sessions stay open; only new handshakes observe the new certificate.
+   * Transport-config or bind-address changes still require rebuilding/restarting the server.
+   */
   updateCert(tls: { certPem: string | Uint8Array; keyPem: string | Uint8Array }): Promise<void>;
+  /**
+   * Atomically replace the full server TLS configuration in place.
+   * Existing sessions stay open; only new handshakes observe the new configuration.
+   * Supports replacing the default cert/key, SNI cert map, and unknown-SNI policy.
+   * Transport-config or bind-address changes still require rebuilding/restarting the server.
+   */
+  updateTls(tls: TlsOptions): Promise<void>;
+  /** Replace only the full SNI cert map, preserving the default cert/key and unknown-SNI policy. */
+  replaceSniCerts(sni: Array<{
+    serverName: string;
+    certPem: string | Uint8Array;
+    keyPem: string | Uint8Array;
+  }>): Promise<void>;
+  /** Add or replace one hostname-specific SNI certificate. */
+  upsertSniCert(sni: {
+    serverName: string;
+    certPem: string | Uint8Array;
+    keyPem: string | Uint8Array;
+  }): Promise<void>;
+  /** Remove one hostname-specific SNI certificate. */
+  removeSniCert(serverName: string): Promise<void>;
+  /** Update only the unknown-SNI policy. */
+  setUnknownSniPolicy(policy: "reject" | "default"): Promise<void>;
+  /** Inspect active SNI names and policy without exposing key material. */
+  tlsSnapshot(): { sniServerNames: string[]; unknownSniPolicy: "reject" | "default" };
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
 
 export function createServer(opts: ServerOptions): WebTransportServer;
 ```
+
+### Server TLS / SNI semantics
+
+- `tls.certPem` / `tls.keyPem` are the default server certificate and key.
+- `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
+- Server names are IDNA-normalized to canonical ASCII after trimming a trailing `.`, so Unicode inputs are matched by their punycode form.
+- Wildcards are supported only in the left-most label, for example `*.example.com`.
+- Wildcards match exactly one label: `*.example.com` matches `api.example.com`, but not `example.com` or `a.b.example.com`.
+- Exact hostname entries take precedence over wildcard entries.
+- If `tls.sni` is empty, the server always serves the default certificate.
+- If `tls.sni` is non-empty and `unknownSniPolicy` is `"reject"` (default), unknown SNI names are rejected during TLS handshake.
+- If `tls.sni` is non-empty and `unknownSniPolicy` is `"default"`, unknown SNI names fall back to the default certificate.
+- Clients that send no SNI still receive the default certificate.
+- `updateCert()` changes only the default certificate/key.
+- `updateTls()` atomically replaces the default certificate/key, full SNI map, and `unknownSniPolicy`.
+- `replaceSniCerts()` atomically replaces only the SNI cert map, preserving the default certificate/key and `unknownSniPolicy`.
+- `upsertSniCert()` adds or replaces one SNI hostname mapping in place.
+- `removeSniCert()` removes one SNI hostname mapping in place.
+- `setUnknownSniPolicy()` changes only unknown-SNI behavior in place.
+- `tlsSnapshot()` returns sorted active SNI hostnames in canonical ASCII form plus the current `unknownSniPolicy`.
+- Operators should review configured Unicode hostnames for homograph/confusable risk; IDNA normalization makes names protocol-correct, not human-safe.
+- `tls.sni` and `unknownSniPolicy` require a non-empty default `certPem` / `keyPem`; they do not participate in the dev self-signed fallback path.
 
 ### Client
 
@@ -251,6 +314,9 @@ export type MetricsSnapshot = {
 
   rateLimitedCount: number;
   limitExceededCount: number;
+  sniCertSelections: number;
+  defaultCertSelections: number;
+  unknownSniRejectedCount: number;
   handshakeLatency?: HistogramSnapshot | null;
   datagramEnqueueLatency?: HistogramSnapshot | null;
   streamOpenLatency?: HistogramSnapshot | null;

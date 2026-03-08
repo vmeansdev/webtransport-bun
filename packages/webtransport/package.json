@@ -1,6 +1,6 @@
 {
 	"name": "@webtransport-bun/webtransport",
-	"version": "0.2.4",
+	"version": "0.3.0",
 	"description": "Production-focused WebTransport for Bun, Node, and Deno with datagrams and streams via a Rust napi-rs addon",
 	"license": "MIT",
 	"repository": {
@@ -41,7 +41,8 @@
 	},
 	"os": [
 		"darwin",
-		"linux"
+		"linux",
+		"win32"
 	],
 	"cpu": [
 		"arm64",
@@ -51,12 +52,13 @@
 		"access": "public"
 	},
 	"scripts": {
-		"clean": "rm -rf dist",
+		"clean": "bun -e \"import { rm } from 'node:fs/promises'; await rm('dist', { recursive: true, force: true });\"",
 		"build": "tsc -p tsconfig.build.json",
-		"prebuild:native": "cd ../.. && bun run build:native && mkdir -p packages/webtransport/prebuilds && cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/ 2>/dev/null || true",
-		"prebuild:checksums": "cd prebuilds 2>/dev/null && shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true",
+		"prebuild:native": "cd ../.. && bun scripts/copy-prebuilds.ts",
+		"prebuild:build-and-copy": "cd ../.. && bun run build:native && bun scripts/copy-prebuilds.ts",
+		"prebuild:checksums": "cd ../.. && bun scripts/write-sha256sums.ts packages/webtransport/prebuilds",
 		"pack:check": "npm pack --dry-run",
-		"prepublishOnly": "npm run clean && npm run build && npm run prebuild:native && npm run prebuild:checksums && npm run pack:check",
+		"prepublishOnly": "npm run clean && npm run build && npm run prebuild:build-and-copy && npm run prebuild:checksums && npm run pack:check",
 		"test": "bun test",
 		"typecheck": "tsc --noEmit"
 	}

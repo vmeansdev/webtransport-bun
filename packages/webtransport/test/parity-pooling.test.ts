@@ -126,11 +126,69 @@ describe("parity pooling", () => {
 		});
 	});
 
+	test("different compatibility keys do not reuse (congestionControl differs)", async () => {
+		await withServer(async (url) => {
+			const before = clientPoolMetricsSnapshot();
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "throughput",
+				tls: { insecureSkipVerify: true },
+			});
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "low-latency",
+				tls: { insecureSkipVerify: true },
+			});
+			const after = clientPoolMetricsSnapshot();
+			expect(after.misses).toBeGreaterThanOrEqual(before.misses + 2);
+			expect(after.hits).toBeGreaterThanOrEqual(before.hits);
+		});
+	});
+
+	test("same non-default congestionControl reuses pooled endpoint", async () => {
+		await withServer(async (url) => {
+			const before = clientPoolMetricsSnapshot();
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "throughput",
+				tls: { insecureSkipVerify: true },
+			});
+			await openAndCloseWithRetry(url, {
+				allowPooling: true,
+				congestionControl: "throughput",
+				tls: { insecureSkipVerify: true },
+			});
+			const after = clientPoolMetricsSnapshot();
+			expect(after.misses).toBeGreaterThanOrEqual(before.misses + 1);
+			expect(after.hits).toBeGreaterThanOrEqual(before.hits + 1);
+		});
+	});
+
 	test("clientPoolMetricsSnapshot returns shape", () => {
 		const s = clientPoolMetricsSnapshot();
 		expect(typeof s.hits).toBe("number");
 		expect(typeof s.misses).toBe("number");
 		expect(typeof s.evictIdle).toBe("number");
 		expect(typeof s.evictBroken).toBe("number");
+	});
+
+	test("failed pooled connects evict broken entries instead of poisoning the pool", async () => {
+		const port = nextPort(16511, 1000);
+		const url = `https://127.0.0.1:${port}`;
+		const before = clientPoolMetricsSnapshot();
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const wt = new WebTransport(url, {
+				allowPooling: true,
+				tls: { insecureSkipVerify: true },
+				limits: { handshakeTimeoutMs: 50 },
+			});
+			await expect(wt.ready).rejects.toThrow(/E_HANDSHAKE_TIMEOUT/);
+			wt.close();
+			await wt.closed.catch(() => {});
+		}
+
+		const after = clientPoolMetricsSnapshot();
+		expect(after.evictBroken).toBeGreaterThanOrEqual(before.evictBroken + 1);
 	});
 });

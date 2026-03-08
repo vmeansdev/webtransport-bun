@@ -42,7 +42,6 @@
 
 ## Who This Is Not For
 
-- Projects requiring Windows support.
 - Teams needing full browser WebTransport spec parity.
 - Cases where plain WebSockets are fully sufficient and simpler to operate.
 
@@ -107,10 +106,10 @@ Detailed migration playbook:
 
 ## Status
 - In active hardening.
-- Version: `0.2.4` (RC-quality hardening in `0.2.x`, not yet stable/GA).
+- Version: `0.3.0` (release candidate, not yet stable/GA).
 - Runtime support: Bun (`>= 1.3.9`), Node, Deno.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
-- Known limits: Chromium-focused browser interop target, macOS/Linux only, API still stabilizing within `0.2.x`.
+- Known limits: Chromium-focused browser interop target, API still stabilizing through the `0.3.0` RC window.
 
 ## Support Matrix
 
@@ -122,6 +121,7 @@ Detailed migration playbook:
 ### OS / Arch
 - macOS arm64 (`darwin-arm64`), macOS x64 (`darwin-x64`)
 - Linux x64 (`linux-x64`)
+- Windows x64 (`win32-x64-msvc`)
 
 See `docs/COMPATIBILITY.md` for policy details.
 

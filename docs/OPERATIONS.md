@@ -175,7 +175,7 @@ When `queuedBytesGlobal` rises and stays high:
 ## Known limitations and compatibility
 
 - Client `connect()` fully supported: datagrams, bidi/uni streams, metrics, configurable limits
-- macOS + Linux only (arm64, x64)
+- macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
 - Runtime support: Bun >= 1.3.9, Node, Deno
 - Node-API addon portability applies across supported runtimes
 
@@ -246,7 +246,7 @@ yarn add @webtransport-bun/webtransport@0.1.0
 ### Expected validation signals
 
 - **Checksum verification passes**: `shasum -a 256 -c SHA256SUMS` exits 0
-- **Assets present**: `webtransport-native.*.node` for linux-x64, darwin-arm64, darwin-x64
+- **Assets present**: `webtransport-native.*.node` for linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc
 - **SHA256SUMS exists**: Required; releases before the combined checksum change may not have it (run a new release first if needed)
 
 ### Follow-up

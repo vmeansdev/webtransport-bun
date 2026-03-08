@@ -21,6 +21,7 @@ pub mod panic_guard;
 pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
+pub mod server_tls;
 pub mod session;
 pub mod session_registry;
 pub mod spawn_tracked;
@@ -196,20 +197,6 @@ fn send_startup_result(
     }
 }
 
-fn write_and_flush_pem<W: std::io::Write>(
-    writer: &mut W,
-    pem: &str,
-    what: &str,
-) -> std::result::Result<(), String> {
-    writer
-        .write_all(pem.as_bytes())
-        .map_err(|e| format!("failed to write temp {} file: {:?}", what, e))?;
-    writer
-        .flush()
-        .map_err(|e| format!("failed to flush temp {} file: {:?}", what, e))?;
-    Ok(())
-}
-
 /// Spawn a background task that batches events from a channel and delivers
 /// them to a ThreadsafeFunction in groups (max_batch items or every flush_ms).
 pub(crate) fn spawn_event_batcher<T: Send + 'static>(
@@ -318,7 +305,6 @@ pub fn set_panic_log_verbose(enabled: bool) {
 
 /// Well-known close codes for stable error semantics (AGENTS.md).
 pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
-pub(crate) const RATE_LIMITED_CLOSE_CODE: u32 = 3991;
 pub(crate) const LIMIT_EXCEEDED_CLOSE_CODE: u32 = 3992;
 
 /// Extract (code, reason) from ConnectionError for CloseInfo.
@@ -347,6 +333,7 @@ pub(crate) fn extract_close_info(
 /// Spawn the wtransport server loop on the dedicated runtime.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_wtransport_server(
+    owner_server_id: u64,
     metrics: Arc<server_metrics::ServerMetrics>,
     limits: limits::Limits,
     rate_limits: rate_limit::RateLimits,
@@ -355,13 +342,12 @@ pub(crate) fn spawn_wtransport_server(
     mut shutdown_rx: watch::Receiver<()>,
     session_tx: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     log_tx: Option<tokio::sync::mpsc::Sender<LogEvent>>,
-    cert_pem: String,
-    key_pem: String,
+    tls_resolver: Arc<server_tls::LiveServerCertResolver>,
     debug_logs: bool,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
 ) {
     use std::sync::atomic::Ordering;
-    use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
+    use wtransport::{Endpoint, ServerConfig, VarInt};
 
     RATE_LIMIT_CLEANUP_ONCE.call_once(|| {
         RUNTIME.spawn(async {
@@ -379,87 +365,33 @@ pub(crate) fn spawn_wtransport_server(
             let mut report_startup = |res: std::result::Result<(), String>| {
                 send_startup_result(&mut startup_tx, res);
             };
-            let identity = if !cert_pem.trim().is_empty() && !key_pem.trim().is_empty() {
-                let mut cert_file = match tempfile::Builder::new()
-                    .prefix("wt-cert-")
-                    .suffix(".pem")
-                    .tempfile()
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let msg = format!("failed to create temp cert file: {:?}", e);
+            let tls_config =
+                match server_tls::build_server_tls_config(Arc::clone(&tls_resolver)) {
+                    Ok(config) => config,
+                    Err(msg) => {
                         emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
                         report_startup(Err(msg));
                         return;
                     }
                 };
-                if let Err(msg) = write_and_flush_pem(&mut cert_file, &cert_pem, "cert") {
-                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
-                    report_startup(Err(msg));
-                    return;
-                }
-                let cert_path = cert_file.path().to_path_buf();
-                let mut key_file = match tempfile::Builder::new()
-                    .prefix("wt-key-")
-                    .suffix(".pem")
-                    .tempfile()
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let msg = format!("failed to create temp key file: {:?}", e);
-                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
-                        report_startup(Err(msg));
-                        return;
-                    }
-                };
-                if let Err(msg) = write_and_flush_pem(&mut key_file, &key_pem, "key") {
-                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
-                    report_startup(Err(msg));
-                    return;
-                }
-                let key_path = key_file.path().to_path_buf();
-                match Identity::load_pemfiles(&cert_path, &key_path).await {
-                    Ok(i) => {
-                        drop(cert_file);
-                        drop(key_file);
-                        i
-                    }
-                    Err(e) => {
-                        let msg = format!("failed to load PEM identity: {:?}", e);
-                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
-                        report_startup(Err(msg));
-                        return;
-                    }
-                }
-            } else {
-                match Identity::self_signed(["localhost", "127.0.0.1", "::1"]) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        let msg = format!("failed to create identity: {:?}", e);
-                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
-                        report_startup(Err(msg));
-                        return;
-                    }
-                }
-            };
             let bind_addr: std::net::SocketAddr = format!("{}:{}", host, port)
                 .parse()
                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
             let config_builder = ServerConfig::builder()
                 .with_bind_address(bind_addr)
-                .with_identity(identity)
-                .max_idle_timeout(Some(
-                    std::time::Duration::from_millis(limits.idle_timeout_ms),
-                ));
-            let config = match config_builder {
-                Ok(c) => c.build(),
+                .with_custom_tls(tls_config);
+            let config_builder = match config_builder.max_idle_timeout(Some(
+                std::time::Duration::from_millis(limits.idle_timeout_ms),
+            )) {
+                Ok(builder) => builder,
                 Err(e) => {
-                    let msg = format!("failed to build server config: {:?}", e);
+                    let msg = format!("failed to apply idle timeout: {:?}", e);
                     emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
                     report_startup(Err(msg));
                     return;
                 }
             };
+            let config = config_builder.build();
             let server = match Endpoint::server(config) {
                 Ok(s) => {
                     emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
@@ -520,11 +452,36 @@ pub(crate) fn spawn_wtransport_server(
                                     return;
                                 }
                                 let authority = session_request.authority().to_string();
+                                let peer_addr = session_request.remote_address();
+                                let peer_ip = peer_addr.ip().to_string();
+                                let peer_port = peer_addr.port() as u32;
+                                if !rate_limit::try_acquire_handshake(
+                                    &peer_ip,
+                                    rate_limits.handshakes_per_sec,
+                                    rate_limits.handshakes_burst,
+                                ) {
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
+                                    session_request.too_many_requests().await;
+                                    return;
+                                }
+                                if !rate_limit::try_acquire_per_ip_session_with_prefix(
+                                    &peer_ip,
+                                    rate_limits.handshakes_burst_per_ip,
+                                    rate_limits.handshakes_burst_per_prefix,
+                                ) {
+                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
+                                    session_request.too_many_requests().await;
+                                    return;
+                                }
                                 let prev_sessions = metrics.sessions_active.fetch_add(1, Ordering::SeqCst);
                                 if prev_sessions >= limits.max_sessions {
                                     metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, None, None);
+                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, Some(&peer_ip), Some(peer_port));
                                     let reject_timeout = tokio::time::Duration::from_millis(
                                         limits.handshake_timeout_ms,
                                     );
@@ -534,6 +491,7 @@ pub(crate) fn spawn_wtransport_server(
                                     )
                                     .await;
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    rate_limit::release_per_ip_session(&peer_ip);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
                                             connection.close(
@@ -551,8 +509,8 @@ pub(crate) fn spawn_wtransport_server(
                                                     authority, e
                                                 ),
                                                 None,
-                                                None,
-                                                None,
+                                                Some(&peer_ip),
+                                                Some(peer_port),
                                             );
                                         }
                                         Err(_elapsed) => {
@@ -565,8 +523,8 @@ pub(crate) fn spawn_wtransport_server(
                                                     authority
                                                 ),
                                                 None,
-                                                None,
-                                                None,
+                                                Some(&peer_ip),
+                                                Some(peer_port),
                                             );
                                         }
                                     }
@@ -586,6 +544,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        rate_limit::release_per_ip_session(&peer_ip);
                                         emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
                                     }
@@ -593,33 +552,7 @@ pub(crate) fn spawn_wtransport_server(
                                 match accept_result {
                                     Ok(connection) => {
                                         metrics.handshake_histogram.observe(accept_start.elapsed());
-                                        let peer_ip = connection.remote_address().ip().to_string();
-                                        let peer_port = connection.remote_address().port() as u32;
                                         emit_log(&ltx, !debug_logs, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
-                                        if !rate_limit::try_acquire_handshake(
-                                            &peer_ip,
-                                            rate_limits.handshakes_per_sec,
-                                            rate_limits.handshakes_burst,
-                                        ) {
-                                            metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                            metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                            metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                            emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
-                                            connection.close(VarInt::from_u32(RATE_LIMITED_CLOSE_CODE), b"E_RATE_LIMITED");
-                                            return;
-                                        }
-                                        if !rate_limit::try_acquire_per_ip_session_with_prefix(
-                                            &peer_ip,
-                                            rate_limits.handshakes_burst_per_ip,
-                                            rate_limits.handshakes_burst_per_prefix,
-                                        ) {
-                                            metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                            metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                            metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                            emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
-                                            connection.close(VarInt::from_u32(RATE_LIMITED_CLOSE_CODE), b"E_RATE_LIMITED");
-                                            return;
-                                        }
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
 
                                         let id = format!(
@@ -631,6 +564,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics) =
                                             session_registry::insert(
                                                 id.clone(),
+                                                owner_server_id,
                                                 connection.clone(),
                                                 metrics.clone(),
                                                 limits.clone(),
@@ -1048,7 +982,9 @@ pub(crate) fn spawn_wtransport_server(
                                         );
                                     }
                                     Err(e) => {
+                                        metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        rate_limit::release_per_ip_session(&peer_ip);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());
@@ -1072,51 +1008,8 @@ pub(crate) fn spawn_wtransport_server(
 #[cfg(test)]
 mod tests {
     use super::{report_channel_failure, send_startup_result, CHANNEL_DELIVERY_FAILURE_COUNT};
-    use super::{report_tsfn_status, write_and_flush_pem, TSFN_DELIVERY_FAILURE_COUNT};
+    use super::{report_tsfn_status, TSFN_DELIVERY_FAILURE_COUNT};
     use std::sync::atomic::Ordering;
-
-    struct FailWriter;
-
-    impl std::io::Write for FailWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("boom"))
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct FlushFailWriter {
-        buffer: Vec<u8>,
-    }
-
-    impl std::io::Write for FlushFailWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.buffer.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::other("flush-fail"))
-        }
-    }
-
-    #[test]
-    fn write_and_flush_pem_reports_write_failure() {
-        let mut writer = FailWriter;
-        let err =
-            write_and_flush_pem(&mut writer, "abc", "cert").expect_err("expected write failure");
-        assert!(err.contains("failed to write temp cert file"));
-    }
-
-    #[test]
-    fn write_and_flush_pem_reports_flush_failure() {
-        let mut writer = FlushFailWriter { buffer: Vec::new() };
-        let err =
-            write_and_flush_pem(&mut writer, "abc", "key").expect_err("expected flush failure");
-        assert!(err.contains("failed to flush temp key file"));
-    }
 
     #[test]
     fn report_tsfn_status_counts_failures_only() {

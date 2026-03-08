@@ -125,7 +125,13 @@ jobs:
           - os: macos-latest
             target: darwin-x64
             rust_target: x86_64-apple-darwin
+          - os: windows-latest
+            target: win32-x64-msvc
+            rust_target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -143,8 +149,8 @@ jobs:
       - name: Prebuild + checksums
         run: |
           cd packages/webtransport && bun run prebuild:native
-          cd prebuilds
-          shasum -a 256 *.node > SHA256SUMS 2>/dev/null || true
+          cd ../..
+          bun scripts/write-sha256sums.ts packages/webtransport/prebuilds
       - name: Upload prebuilds
         uses: actions/upload-artifact@v4
         with:
@@ -183,8 +189,7 @@ jobs:
           find parity-evidence -name "parity-evidence.json" -type f | grep -q . || (echo "::error::Missing parity-evidence.json"; exit 1)
       - name: Regenerate combined SHA256SUMS (all targets)
         run: |
-          cd prebuilds
-          shasum -a 256 *.node 2>/dev/null | sort -k2 > SHA256SUMS
+          bun scripts/write-sha256sums.ts prebuilds
       - name: Build npm package tarball
         run: |
           bun install --frozen-lockfile

@@ -4,9 +4,21 @@
 //! Each connect() creates a new Connection from the pooled Endpoint.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn map_connecting_error(
+    err: wtransport::error::ConnectingError,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match err {
+        wtransport::error::ConnectingError::SessionRejected => {
+            io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request").into()
+        }
+        other => other.into(),
+    }
+}
 
 /// Pool compatibility key.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -126,13 +138,23 @@ impl ClientPoolManager {
         }
 
         entry.active_refs.fetch_add(1, Ordering::Relaxed);
-
-        let conn = tokio::time::timeout(
+        let connect_result = tokio::time::timeout(
             tokio::time::Duration::from_millis(handshake_timeout_ms),
             entry.endpoint.connect(connect_url),
         )
-        .await
-        .map_err(|_| "E_HANDSHAKE_TIMEOUT")??;
+        .await;
+
+        let conn = match connect_result {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(err)) => {
+                self.release_failed_entry(&key, &entry);
+                return Err(map_connecting_error(err));
+            }
+            Err(_elapsed) => {
+                self.release_failed_entry(&key, &entry);
+                return Err("E_HANDSHAKE_TIMEOUT".into());
+            }
+        };
 
         let release_guard = PoolReleaseGuard {
             entry: Arc::clone(&entry),
@@ -141,6 +163,24 @@ impl ClientPoolManager {
         };
 
         Ok((conn, release_guard, was_hit))
+    }
+
+    fn release_failed_entry(&self, key: &PoolKey, entry: &Arc<PoolEntry>) {
+        entry.active_refs.fetch_sub(1, Ordering::Relaxed);
+        entry.last_used_ms.store(now_ms(), Ordering::Relaxed);
+
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let should_remove = guard
+            .get(key)
+            .map(|current| Arc::ptr_eq(current, entry))
+            .unwrap_or(false);
+        if should_remove {
+            guard.remove(key);
+            POOL_EVICT_BROKEN.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn evict_idle_under_lock(&self, guard: &mut HashMap<PoolKey, Arc<PoolEntry>>) {
