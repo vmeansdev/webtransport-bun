@@ -13,9 +13,14 @@ pub enum TaskKind {
 }
 
 /// Spawn a future on the runtime with tracked gauges.
-/// Decrements on completion (including panic path via spawn_quic_task).
-pub fn spawn_tracked<F>(metrics: Arc<ServerMetrics>, kind: TaskKind, fut: F)
-where
+/// Decrements on completion (including panic path via spawn_quic_task_scoped).
+/// `scope` bounds panic teardown to the owning session/server.
+pub fn spawn_tracked<F>(
+    metrics: Arc<ServerMetrics>,
+    kind: TaskKind,
+    scope: panic_guard::PanicScope,
+    fut: F,
+) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     match kind {
@@ -43,7 +48,7 @@ where
         let _guard = DropGuard::new(decrement);
         fut.await;
     };
-    panic_guard::spawn_quic_task(wrapped);
+    panic_guard::spawn_quic_task_scoped(scope, wrapped);
 }
 
 struct DropGuard<F: FnOnce()> {

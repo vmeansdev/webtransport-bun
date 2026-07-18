@@ -1442,6 +1442,31 @@ class NativeClientSession implements ClientSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	_connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
+
+	/** Current path MTU-derived max datagram payload size, or null when unknown. */
+	_pathMaxDatagramSize(): number | null {
+		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
+			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
+			: null;
+	}
+}
+
+/** Wire-level QUIC connection stats reported by the native layer. */
+export interface QuicConnectionStats {
+	rttMs: number;
+	bytesSent: number;
+	bytesReceived: number;
+	packetsSent: number;
+	packetsReceived: number;
+	packetsLost: number;
+	maxDatagramSize?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1842,6 +1867,9 @@ class SendScheduler {
 		if (this.#running) return;
 		this.#running = true;
 		try {
+			// Yield one microtask so writes enqueued in the same tick are all
+			// visible and can be dispatched in sendOrder-priority order.
+			await Promise.resolve();
 			while (this.#groupOrder.length > 0) {
 				const groupId = this.#nextGroup();
 				if (groupId == null) break;
@@ -1852,12 +1880,14 @@ class SendScheduler {
 				}
 				const task = q.shift()!;
 				if (q.length === 0) this.#removeGroup(groupId);
-				try {
-					await task.run();
-					task.resolve();
-				} catch (err) {
-					task.reject(err);
-				}
+				// Dispatch WITHOUT awaiting completion: QUIC streams are
+				// independent, and per-stream write ordering is already
+				// guaranteed by the WritableStream sink contract (the next
+				// sink write starts only after this task's promise settles).
+				// Awaiting here would head-of-line-block every other stream
+				// and all datagrams behind one backpressured peer stream.
+				// Backpressure is enforced per stream by the native layer.
+				task.run().then(task.resolve, task.reject);
 			}
 		} finally {
 			this.#running = false;
@@ -1912,6 +1942,8 @@ export class WebTransport {
 	#drainingResolve!: () => void;
 	#session: ClientSession | null = null;
 	#state: WebTransportState;
+	/** Close info captured when close() races an in-flight connect. */
+	#pendingCloseInfo: WebTransportCloseInfo | null = null;
 	#datagramsCache: WebTransportDatagramDuplexStream | null = null;
 	readonly #datagramsReadableType: "bytes" | "default";
 	#incomingBidiCache: ReadableStream<{
@@ -1946,7 +1978,18 @@ export class WebTransport {
 			this.#ready = this.#sessionPromise.then(
 				(s) => {
 					this.#session = s;
-					if (this.#state !== "draining") this.#state = "connected";
+					if (this.#state === "draining") {
+						// close() was called while connecting: the session must not
+						// outlive the transport. Close it now so `closed` settles and
+						// the QUIC connection is released instead of leaking until
+						// idle timeout.
+						s.close({
+							code: this.#pendingCloseInfo?.closeCode,
+							reason: this.#pendingCloseInfo?.reason,
+						});
+					} else {
+						this.#state = "connected";
+					}
 				},
 				(err) => {
 					this.#state = "failed";
@@ -2119,7 +2162,12 @@ export class WebTransport {
 		if (this.#state === "failed") {
 			throw new DOMException("Transport has failed", "InvalidStateError");
 		}
-		await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		const s = await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		// Prefer wire-level QUIC stats from the native layer; fall back to
+		// facade byte tallies only when the native call is unavailable.
+		const quic = (
+			s as unknown as { _connectionStats?: () => QuicConnectionStats | null }
+		)._connectionStats?.();
 		return {
 			datagrams: {
 				droppedIncoming: 0,
@@ -2127,10 +2175,12 @@ export class WebTransport {
 				expiredOutgoing: 0,
 				lostOutgoing: 0,
 			},
-			bytesSent: this.#connStats.bytesSent,
-			bytesReceived: this.#connStats.bytesReceived,
-			packetsSent: this.#connStats.datagramsOut,
-			packetsReceived: this.#connStats.datagramsIn,
+			bytesSent: quic ? quic.bytesSent : this.#connStats.bytesSent,
+			bytesReceived: quic ? quic.bytesReceived : this.#connStats.bytesReceived,
+			packetsSent: quic ? quic.packetsSent : 0,
+			packetsReceived: quic ? quic.packetsReceived : 0,
+			smoothedRtt: quic ? quic.rttMs : undefined,
+			packetsLost: quic ? quic.packetsLost : undefined,
 			estimatedSendRate: null,
 		};
 	}
@@ -2141,6 +2191,7 @@ export class WebTransport {
 		if (this.#state === "connected" || this.#state === "connecting") {
 			this.#state = "draining";
 		}
+		if (info) this.#pendingCloseInfo = info;
 		if (this.#session) {
 			this.#session.close({
 				code: info?.closeCode,
@@ -2162,6 +2213,14 @@ export class WebTransport {
 	/** Internal: session for adapters (not part of spec) */
 	async _getSession(): Promise<ClientSession> {
 		return this.#sessionPromise;
+	}
+
+	/** Internal: MTU-derived datagram size from the live session, if connected */
+	_getPathMaxDatagramSize(): number | null {
+		const s = this.#session as unknown as {
+			_pathMaxDatagramSize?: () => number | null;
+		} | null;
+		return s?._pathMaxDatagramSize?.() ?? null;
 	}
 
 	/** Internal: state for createWritable guard (not part of spec) */
@@ -2321,7 +2380,9 @@ function createDatagramStreams(
 			return createDatagramWritable(wt, wt._resolveSendPolicy(options));
 		},
 		get maxDatagramSize(): number {
-			return DEFAULT_LIMITS.maxDatagramSize;
+			// Path-MTU-derived value from QUIC when connected; configured
+			// default until the handshake completes.
+			return wt._getPathMaxDatagramSize() ?? DEFAULT_LIMITS.maxDatagramSize;
 		},
 	};
 }
@@ -2367,26 +2428,41 @@ function createServerIncomingBidiStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
 ): ReadableStream<WebTransportBidirectionalStream> {
+	// Pull-based: streams are accepted from native only as fast as the
+	// consumer reads them, so a slow/stalled consumer cannot pile up
+	// unbounded native handles in the queue.
+	let cancelled = false;
 	return new ReadableStream({
-		async start(controller) {
-			while (!isClosed()) {
-				try {
-					const nativeStream = await nativeHandle.acceptBidiStream();
-					if (!nativeStream) break;
-					const duplex = new BidiStream({
-						handleId: nativeStream?.id ?? 0,
-						nativeHandle: nativeStream,
-					});
-					controller.enqueue(
-						attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
-					);
-				} catch (err) {
-					if (isClosed() || isSessionCloseError(err)) break;
-					controller.error(toWebTransportError(err));
+		async pull(controller) {
+			if (cancelled) return;
+			if (isClosed()) {
+				controller.close();
+				return;
+			}
+			try {
+				const nativeStream = await nativeHandle.acceptBidiStream();
+				if (cancelled) return;
+				if (!nativeStream) {
+					controller.close();
 					return;
 				}
+				const duplex = new BidiStream({
+					handleId: nativeStream?.id ?? 0,
+					nativeHandle: nativeStream,
+				});
+				controller.enqueue(
+					attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
+				);
+			} catch (err) {
+				if (isClosed() || isSessionCloseError(err)) {
+					controller.close();
+					return;
+				}
+				controller.error(toWebTransportError(err));
 			}
-			controller.close();
+		},
+		cancel() {
+			cancelled = true;
 		},
 	});
 }
@@ -2395,29 +2471,42 @@ function createServerIncomingUniStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
 ): ReadableStream<WebTransportReceiveStream> {
+	// Pull-based for the same backpressure reasons as the bidi variant.
+	let cancelled = false;
 	return new ReadableStream({
-		async start(controller) {
-			while (!isClosed()) {
-				try {
-					const nativeStream = await nativeHandle.acceptUniStream();
-					if (!nativeStream) break;
-					const readable = new RecvStream({
-						handleId: nativeStream?.id ?? 0,
-						nativeHandle: nativeStream,
-					});
-					controller.enqueue(
-						attachServerRecvControls(
-							readable,
-							nodeReadableToWebReadable(readable),
-						),
-					);
-				} catch (err) {
-					if (isClosed() || isSessionCloseError(err)) break;
-					controller.error(toWebTransportError(err));
+		async pull(controller) {
+			if (cancelled) return;
+			if (isClosed()) {
+				controller.close();
+				return;
+			}
+			try {
+				const nativeStream = await nativeHandle.acceptUniStream();
+				if (cancelled) return;
+				if (!nativeStream) {
+					controller.close();
 					return;
 				}
+				const readable = new RecvStream({
+					handleId: nativeStream?.id ?? 0,
+					nativeHandle: nativeStream,
+				});
+				controller.enqueue(
+					attachServerRecvControls(
+						readable,
+						nodeReadableToWebReadable(readable),
+					),
+				);
+			} catch (err) {
+				if (isClosed() || isSessionCloseError(err)) {
+					controller.close();
+					return;
+				}
+				controller.error(toWebTransportError(err));
 			}
-			controller.close();
+		},
+		cancel() {
+			cancelled = true;
 		},
 	});
 }
@@ -2426,24 +2515,34 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
 }> {
+	// Pull-based: accept from the session only as fast as the consumer reads.
+	let iter: AsyncIterator<Duplex> | null = null;
 	return new ReadableStream({
-		async start(controller) {
-			const s = await wt._getSession();
-			for await (const duplex of s.incomingBidirectionalStreams()) {
-				controller.enqueue(
-					await nodeDuplexToWebBidi(
-						duplex,
-						undefined,
-						undefined,
-						undefined,
-						(bytes) => {
-							wt._recordIncomingStreamBytes(bytes);
-						},
-						wt._isStrictW3CErrors(),
-					),
-				);
+		async pull(controller) {
+			if (!iter) {
+				const s = await wt._getSession();
+				iter = s.incomingBidirectionalStreams()[Symbol.asyncIterator]();
 			}
-			controller.close();
+			const { value: duplex, done } = await iter.next();
+			if (done) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(
+				await nodeDuplexToWebBidi(
+					duplex,
+					undefined,
+					undefined,
+					undefined,
+					(bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					},
+					wt._isStrictW3CErrors(),
+				),
+			);
+		},
+		cancel() {
+			void iter?.return?.();
 		},
 	});
 }
@@ -2451,21 +2550,31 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 function createIncomingUniStreams(
 	wt: WebTransport,
 ): ReadableStream<ReadableStream<Uint8Array>> {
+	// Pull-based: accept from the session only as fast as the consumer reads.
+	let iter: AsyncIterator<Readable> | null = null;
 	return new ReadableStream({
-		async start(controller) {
-			const s = await wt._getSession();
-			for await (const readable of s.incomingUnidirectionalStreams()) {
-				controller.enqueue(
-					nodeReadableToWebReadable(
-						readable,
-						(bytes) => {
-							wt._recordIncomingStreamBytes(bytes);
-						},
-						wt._isStrictW3CErrors(),
-					),
-				);
+		async pull(controller) {
+			if (!iter) {
+				const s = await wt._getSession();
+				iter = s.incomingUnidirectionalStreams()[Symbol.asyncIterator]();
 			}
-			controller.close();
+			const { value: readable, done } = await iter.next();
+			if (done) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(
+				nodeReadableToWebReadable(
+					readable,
+					(bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					},
+					wt._isStrictW3CErrors(),
+				),
+			);
+		},
+		cancel() {
+			void iter?.return?.();
 		},
 	});
 }
@@ -2516,16 +2625,23 @@ function nodeReadableToWebReadable(
 	strictW3CErrors = false,
 ): ReadableStream<Uint8Array> {
 	const stopSendable = r as unknown as Partial<StopSendable>;
+	// Pull-based so the web stream's highWaterMark actually bounds buffering:
+	// a slow consumer stops pulls, which stops draining the native channel,
+	// which lets QUIC flow control push back on the peer. The previous eager
+	// start() loop buffered a fast sender unboundedly.
+	const iter = r[Symbol.asyncIterator]();
 	return new ReadableStream<Uint8Array>({
-		async start(controller) {
+		async pull(controller) {
 			try {
-				for await (const chunk of r) {
-					const bytes =
-						chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-					if (onReadBytes) onReadBytes(bytes.byteLength);
-					controller.enqueue(bytes);
+				const { value: chunk, done } = await iter.next();
+				if (done) {
+					controller.close();
+					return;
 				}
-				controller.close();
+				const bytes =
+					chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+				if (onReadBytes) onReadBytes(bytes.byteLength);
+				controller.enqueue(bytes);
 			} catch (err) {
 				controller.error(toWebTransportError(err, strictW3CErrors));
 			}
@@ -2533,6 +2649,7 @@ function nodeReadableToWebReadable(
 		cancel(reason) {
 			const fn = stopSendable[WT_STOP_SENDING];
 			if (typeof fn === "function") fn.call(r, extractStreamErrorCode(reason));
+			void iter.return?.();
 		},
 	});
 }

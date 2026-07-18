@@ -21,23 +21,51 @@ pub struct ServerMetricsSnapshot {
     pub stream_tasks_active: u32,
     pub handshakes_in_flight: u32,
     pub streams_active: u32,
-    pub datagrams_in: u32,
-    pub datagrams_out: u32,
-    pub datagrams_dropped: u32,
-    pub queued_bytes_global: u32,
-    pub backpressure_wait_count: u32,
-    pub backpressure_timeout_count: u32,
-    pub rate_limited_count: u32,
-    pub limit_exceeded_count: u32,
-    pub sni_cert_selections: u32,
-    pub default_cert_selections: u32,
-    pub unknown_sni_rejected_count: u32,
+    pub datagrams_in: f64,
+    pub datagrams_out: f64,
+    pub datagrams_dropped: f64,
+    pub queued_bytes_global: f64,
+    pub backpressure_wait_count: f64,
+    pub backpressure_timeout_count: f64,
+    pub rate_limited_count: f64,
+    pub limit_exceeded_count: f64,
+    pub sni_cert_selections: f64,
+    pub default_cert_selections: f64,
+    pub unknown_sni_rejected_count: f64,
     /// Handshake latency (accept start to completion). Present when any observation.
     pub handshake_latency: Option<HistogramSnapshot>,
     /// Datagram send enqueue latency. Present when any observation.
     pub datagram_enqueue_latency: Option<HistogramSnapshot>,
     /// Stream open latency (create_bidi/create_uni). Present when any observation.
     pub stream_open_latency: Option<HistogramSnapshot>,
+}
+
+/// Real QUIC transport stats from quinn (wire-level, not facade tallies).
+#[napi(object)]
+pub struct QuicConnectionStats {
+    pub rtt_ms: f64,
+    /// UDP payload bytes sent/received on the connection (wire bytes).
+    pub bytes_sent: f64,
+    pub bytes_received: f64,
+    /// QUIC packets sent/received/lost.
+    pub packets_sent: f64,
+    pub packets_received: f64,
+    pub packets_lost: f64,
+    /// Current max datagram payload size for this path (None until known).
+    pub max_datagram_size: Option<u32>,
+}
+
+pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStats {
+    let stats = conn.quic_connection().stats();
+    QuicConnectionStats {
+        rtt_ms: stats.path.rtt.as_secs_f64() * 1000.0,
+        bytes_sent: stats.udp_tx.bytes as f64,
+        bytes_received: stats.udp_rx.bytes as f64,
+        packets_sent: stats.path.sent_packets as f64,
+        packets_received: stats.udp_rx.datagrams as f64,
+        packets_lost: stats.path.lost_packets as f64,
+        max_datagram_size: conn.max_datagram_size().map(|n| n as u32),
+    }
 }
 
 #[napi(object)]
@@ -48,10 +76,10 @@ pub struct ServerTlsSnapshot {
 
 #[napi(object)]
 pub struct SessionMetricsSnapshot {
-    pub datagrams_in: u32,
-    pub datagrams_out: u32,
+    pub datagrams_in: f64,
+    pub datagrams_out: f64,
     pub streams_active: u32,
-    pub queued_bytes: u32,
+    pub queued_bytes: f64,
 }
 
 /// Client pool metrics (debug/test). Present when allowPooling is used.

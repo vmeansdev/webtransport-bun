@@ -22,6 +22,7 @@ url = "2"
 sha2 = "0.10"
 base64 = "0.22"
 idna = "1"
+x509-parser = "0.18.1"
 
 [build-dependencies]
 napi-build = "2"

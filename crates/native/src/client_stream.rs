@@ -16,6 +16,24 @@ use wtransport::VarInt;
 
 use crate::RUNTIME;
 
+/// Deliver a control command (Finish/Reset) without loss: try_send fast path,
+/// falling back to an async send when the write channel is momentarily full.
+/// Dropping these silently turns a graceful FIN into a data-truncating RESET.
+fn send_ctrl_lossless(tx: &Option<mpsc::Sender<StreamCmd>>, cmd: StreamCmd) {
+    let Some(tx) = tx.as_ref() else { return };
+    match tx.try_send(cmd) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(cmd)) => {
+            let tx = tx.clone();
+            RUNTIME.spawn(async move {
+                let _ = tx.send(cmd).await;
+            });
+        }
+        // Channel closed: bridge already gone, stream is finished/reset anyway.
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
 /// Commands sent from JS to the write bridge task.
 pub enum StreamCmd {
     Data(Vec<u8>),
@@ -255,10 +273,7 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn reset(&self, code: u32) -> Result<()> {
-        let _ = self
-            .write_tx
-            .as_ref()
-            .map(|tx| tx.try_send(StreamCmd::Reset(code)));
+        send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
         Ok(())
     }
 
@@ -276,10 +291,7 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn finish(&self) -> Result<()> {
-        let _ = self
-            .write_tx
-            .as_ref()
-            .map(|tx| tx.try_send(StreamCmd::Finish));
+        send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
         Ok(())
     }
 
@@ -375,19 +387,13 @@ impl ClientUniSendHandle {
 
     #[napi]
     pub fn reset(&self, code: u32) -> Result<()> {
-        let _ = self
-            .write_tx
-            .as_ref()
-            .map(|tx| tx.try_send(StreamCmd::Reset(code)));
+        send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
         Ok(())
     }
 
     #[napi]
     pub fn finish(&self) -> Result<()> {
-        let _ = self
-            .write_tx
-            .as_ref()
-            .map(|tx| tx.try_send(StreamCmd::Finish));
+        send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
         Ok(())
     }
 
