@@ -49,3 +49,16 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # phase instructions and task tracking (do not commit)
 INSTRUCTIONS_CURRENT_PHASE.md
 Task.md
+
+# Local agent/session tooling — never committed to the product repo
+.chunkhound.json
+.chunkhound/
+.codex/
+.mcp.json
+.mempalace/
+.omc/
+.zed/
+entities.json
+mempalace.yaml
+memory/
+scripts/mempal-sync-codex-convos.sh
