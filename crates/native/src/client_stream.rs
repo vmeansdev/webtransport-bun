@@ -84,6 +84,11 @@ pub struct StreamBudget {
     pub backpressure_timeout_ms: u64,
 }
 
+/// Fallback re-check interval for budget waits: bounds how long a stream can
+/// stay parked when a *sibling* stream freed shared global/session budget (whose
+/// release notifies its own per-stream notifier, not the waiter's).
+const BUDGET_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(50);
+
 impl StreamBudget {
     /// Fresh capacity notifier for a new stream budget.
     pub fn new_notify() -> Arc<tokio::sync::Notify> {
@@ -92,17 +97,17 @@ impl StreamBudget {
 
     /// Reserve `n` bytes, parking (lossless backpressure) until capacity frees
     /// or the backpressure deadline elapses. Returns true iff reserved.
+    ///
+    /// `capacity_notify` is per-stream, but the global/session tiers of the
+    /// budget are shared across sibling streams whose releases notify their own
+    /// notifier, not this one. So each wait is also capped at
+    /// `BUDGET_POLL_INTERVAL` to re-check the shared tiers even when only a
+    /// sibling freed capacity — the own-notify fast path still wakes
+    /// immediately for the common case.
     pub async fn reserve_or_wait(&self, n: u64) -> bool {
-        if self.try_reserve(n) {
-            return true;
-        }
         let deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
         loop {
-            // Register wakeup before re-checking so a release() between the
-            // failed try_reserve and the await cannot be lost.
-            let notified = self.capacity_notify.notified();
-            tokio::pin!(notified);
             if self.try_reserve(n) {
                 return true;
             }
@@ -110,12 +115,15 @@ impl StreamBudget {
             if now >= deadline {
                 return false;
             }
-            if tokio::time::timeout(deadline - now, notified)
-                .await
-                .is_err()
-            {
-                return self.try_reserve(n);
+            // Register wakeup before re-checking so a release() between the
+            // failed try_reserve and the await cannot be lost.
+            let notified = self.capacity_notify.notified();
+            tokio::pin!(notified);
+            if self.try_reserve(n) {
+                return true;
             }
+            let wait = (deadline - now).min(BUDGET_POLL_INTERVAL);
+            let _ = tokio::time::timeout(wait, notified).await;
         }
     }
 }
@@ -607,6 +615,11 @@ pub fn spawn_bidi_bridge_on(
                                     }
                                     tokio::select! {
                                         _ = &mut notified => {}
+                                        // Periodic re-check: shared session/global
+                                        // budget freed by a sibling stream notifies
+                                        // its own notifier, not ours, so poll to
+                                        // avoid an indefinite stall (stays lossless).
+                                        _ = tokio::time::sleep(BUDGET_POLL_INTERVAL) => {}
                                         code = &mut stop_rx => {
                                             abort_stop = Some(code.ok());
                                             break;
@@ -876,6 +889,11 @@ pub fn spawn_uni_recv_bridge_on(
                                     }
                                     tokio::select! {
                                         _ = &mut notified => {}
+                                        // Periodic re-check: shared session/global
+                                        // budget freed by a sibling stream notifies
+                                        // its own notifier, not ours, so poll to
+                                        // avoid an indefinite stall (stays lossless).
+                                        _ = tokio::time::sleep(BUDGET_POLL_INTERVAL) => {}
                                         code = &mut stop_rx => {
                                             abort_stop = Some(code.ok());
                                             break;

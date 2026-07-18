@@ -363,6 +363,14 @@ async function main() {
 	// Default 1024 MiB is far above steady-state for the CI workload (~500
 	// sessions); tune via SOAK_RSS_CEIL_MB.
 	const RSS_CEIL_MB = parseFloat(process.env.SOAK_RSS_CEIL_MB ?? "1024");
+	// An empty sample set means the run collected no data (e.g. the load client
+	// never started) — treat that as a failure, not a healthy 0 MB peak.
+	if (samples.length === 0) {
+		console.error(
+			"soak-addon: FAIL (no samples collected — run produced no data)",
+		);
+		process.exit(1);
+	}
 	const peakRss = samples.reduce((m, s) => Math.max(m, s.rss), 0);
 	if (peakRss > RSS_CEIL_MB) {
 		console.error(
