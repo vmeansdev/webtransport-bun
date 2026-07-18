@@ -22,6 +22,6 @@ authoritative-docs:
 
 notes-for-agents:
   - Target runtime: Bun >= 1.3.9
-  - Target OS: macOS + Linux (no Windows)
+  - Target OS: macOS + Linux + Windows
   - Respect bounded-memory and deterministic-shutdown constraints
   - Prefer examples under examples/ for runnable integration checks

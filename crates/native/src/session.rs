@@ -87,6 +87,15 @@ impl SessionHandle {
         self.peer_port
     }
 
+    /// Real QUIC transport stats (rtt, wire bytes, packet counts) for this session.
+    #[napi]
+    pub fn connection_stats(&self) -> Result<Option<crate::metrics::QuicConnectionStats>> {
+        let Some((conn, _, _, _, _, _, _)) = session_registry::get(&self.id) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::metrics::quic_stats_from_conn(&conn)))
+    }
+
     #[napi]
     pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
         let c = code.unwrap_or(0);
@@ -121,51 +130,26 @@ impl SessionHandle {
                 return Err(napi::Error::from_reason("E_QUEUE_FULL"));
             }
         }
-        let timeout = tokio::time::Duration::from_millis(limits.backpressure_timeout_ms);
-        let sm_send = sm.clone();
-        let metrics_send = metrics.clone();
-        let send_fut = RUNTIME.spawn(async move {
-            let start = std::time::Instant::now();
-            let result = conn
-                .send_datagram(&bytes)
-                .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
-            if let Some(ref sm) = sm_send {
-                crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                    &sm.queued_bytes,
-                    &metrics_send,
-                    sz_u64,
-                );
-            }
-            result?;
-            metrics_send
-                .datagram_enqueue_histogram
-                .observe(start.elapsed());
-            metrics_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            if let Some(ref sm) = sm_send {
-                sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(())
-        });
-        match tokio::time::timeout(timeout, send_fut).await {
-            Ok(join_res) => join_res
-                .map_err(|e: tokio::task::JoinError| napi::Error::from_reason(e.to_string()))?,
-            Err(_elapsed) => {
-                if let Some(ref sm) = sm {
-                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                        &sm.queued_bytes,
-                        metrics.as_ref(),
-                        sz_u64,
-                    );
-                }
-                metrics
-                    .backpressure_wait_count
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .backpressure_timeout_count
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))
-            }
+        // wtransport's send_datagram is a synchronous, non-blocking enqueue —
+        // no task spawn or timeout needed (a timeout can't fire on sync work).
+        let start = std::time::Instant::now();
+        let result = conn
+            .send_datagram(&bytes)
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
+        if let Some(ref sm) = sm {
+            crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                &sm.queued_bytes,
+                metrics.as_ref(),
+                sz_u64,
+            );
         }
+        result?;
+        metrics.datagram_enqueue_histogram.observe(start.elapsed());
+        metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref sm) = sm {
+            sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     #[napi]
@@ -292,17 +276,17 @@ impl SessionHandle {
         panic_guard::catch_panic(|| {
             if let Some(sm) = session_registry::get_session_metrics(&self.id) {
                 Ok(crate::metrics::SessionMetricsSnapshot {
-                    datagrams_in: sm.datagrams_in.load(Ordering::Relaxed) as u32,
-                    datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as u32,
+                    datagrams_in: sm.datagrams_in.load(Ordering::Relaxed) as f64,
+                    datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as f64,
                     streams_active: sm.streams_active() as u32,
-                    queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as u32,
+                    queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as f64,
                 })
             } else {
                 Ok(crate::metrics::SessionMetricsSnapshot {
-                    datagrams_in: 0,
-                    datagrams_out: 0,
+                    datagrams_in: 0.0,
+                    datagrams_out: 0.0,
                     streams_active: 0,
-                    queued_bytes: 0,
+                    queued_bytes: 0.0,
                 })
             }
         })

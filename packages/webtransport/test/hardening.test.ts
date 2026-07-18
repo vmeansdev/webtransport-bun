@@ -334,49 +334,64 @@ describe("E_BACKPRESSURE_TIMEOUT error coding", () => {
 		expect(err.message).toContain("test");
 	});
 
-	it("client backpressureTimeoutMs option is respected", async () => {
+	it("backpressureTimeoutMs deterministically yields E_BACKPRESSURE_TIMEOUT when stream capacity never frees", async () => {
 		const port = nextPort(BASE_PORT, 1000);
+		const timeoutMs = 200;
+		let serverSession: any = null;
+		let resolveServerReady!: () => void;
+		const serverReady = new Promise<void>((resolve) => {
+			resolveServerReady = resolve;
+		});
 		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
-			onSession: async () => {},
+			// One bidi stream per session, and a short capacity-wait budget: once the
+			// single slot is taken, any waitUntilAvailable open must time out.
+			limits: {
+				maxStreamsPerSessionBidi: 1,
+				maxStreamsGlobal: 50000,
+				backpressureTimeoutMs: timeoutMs,
+			},
+			onSession: async (s) => {
+				serverSession = s;
+				resolveServerReady();
+				for await (const _ of s.incomingDatagrams()) {
+				}
+			},
 		});
 
 		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
-			limits: { backpressureTimeoutMs: 1 },
 		});
+		await serverReady;
+		expect(serverSession).not.toBeNull();
 
-		const buf = new Uint8Array(100);
-		let anyBackpressureTimeout = false;
-		const SENDS = 500;
+		// Occupy the only bidi slot and hold it open for the whole test.
+		const held = await serverSession.createBidirectionalStream();
+		expect(held).toBeDefined();
 
-		const results = await Promise.allSettled(
-			Array.from({ length: SENDS }, () => client.sendDatagram(buf)),
-		);
-
-		for (const r of results) {
-			if (r.status === "rejected") {
-				const err = r.reason;
-				if (
-					err instanceof WebTransportError &&
-					err.code === E_BACKPRESSURE_TIMEOUT
-				) {
-					anyBackpressureTimeout = true;
-					break;
-				}
-			}
+		// A second open that waits for capacity can never succeed while the slot
+		// stays held, so it must reject with E_BACKPRESSURE_TIMEOUT after the
+		// configured budget elapses — no dependence on host speed.
+		const start = Date.now();
+		let caught: unknown;
+		try {
+			await serverSession.createBidirectionalStream({
+				waitUntilAvailable: true,
+			});
+			expect(true).toBe(false);
+		} catch (e) {
+			caught = e;
 		}
+		const elapsed = Date.now() - start;
 
-		// With a 1ms timeout and 500 parallel sends, backpressure timeouts
-		// may or may not occur depending on machine speed. When they do
-		// occur, they must carry the correct error code (verified above).
-		// The load test suite (backpressure.test.ts) provides additional
-		// probabilistic coverage for this path.
-		if (anyBackpressureTimeout) {
-			expect(anyBackpressureTimeout).toBe(true);
-		}
+		expect(caught).toBeInstanceOf(WebTransportError);
+		expect((caught as WebTransportError).code).toBe(E_BACKPRESSURE_TIMEOUT);
+		// The wait honored the configured budget rather than returning immediately.
+		expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 50);
 
+		held.destroy();
+		await client.close();
 		await server.close();
 	}, 15000);
 });
