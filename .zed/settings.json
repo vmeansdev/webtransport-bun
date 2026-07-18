@@ -1,0 +1,9 @@
+{
+  "context_servers": {
+    "chunkhound": {
+      "command": "chunkhound",
+      "args": ["mcp", "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun"],
+      "env": {},
+    },
+  },
+}

@@ -1,0 +1,16 @@
+{
+  "embedding": {
+    "provider": "openai",
+    "base_url": "http://localhost:11434/v1",
+    "model": "nomic-embed-text",
+    "timeout": 60,
+    "max_retries": 5,
+    "retry_backoff": 2
+  },
+  "llm": {
+    "provider": "ollama",
+    "base_url": "http://localhost:11434/v1",
+    "utility_model": "qwen3-coder-ctx:30b",
+    "synthesis_model": "qwen3-coder-ctx:30b"
+  }
+}
