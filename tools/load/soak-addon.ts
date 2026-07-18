@@ -358,7 +358,24 @@ async function main() {
 		}
 	}
 
-	console.log("soak-addon: PASS");
+	// Absolute RSS ceiling: applies to EVERY run including the short CI soak,
+	// so a gross memory regression fails fast even below the trend-gate duration.
+	// Default 1024 MiB is far above steady-state for the CI workload (~500
+	// sessions); tune via SOAK_RSS_CEIL_MB.
+	const RSS_CEIL_MB = parseFloat(process.env.SOAK_RSS_CEIL_MB ?? "1024");
+	const peakRss = samples.reduce((m, s) => Math.max(m, s.rss), 0);
+	if (peakRss > RSS_CEIL_MB) {
+		console.error(
+			"soak-addon: FAIL (peak RSS",
+			peakRss.toFixed(1),
+			`MB exceeded ceiling ${RSS_CEIL_MB.toFixed(0)}MB)`,
+		);
+		process.exit(1);
+	}
+
+	console.log(
+		`soak-addon: PASS (peak RSS ${peakRss.toFixed(1)}MB, ceiling ${RSS_CEIL_MB.toFixed(0)}MB)`,
+	);
 	process.exit(0);
 }
 

@@ -447,6 +447,8 @@ impl ClientSessionHandle {
                 max_global,
                 max_session,
                 max_stream,
+                capacity_notify: StreamBudget::new_notify(),
+                backpressure_timeout_ms,
             }
         };
 

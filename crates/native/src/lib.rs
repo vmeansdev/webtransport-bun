@@ -675,6 +675,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_global: lim_bidi.max_queued_bytes_global,
                                                                 max_session: lim_bidi.max_queued_bytes_per_session,
                                                                 max_stream: lim_bidi.max_queued_bytes_per_stream,
+                                                                capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                backpressure_timeout_ms: lim_bidi.backpressure_timeout_ms,
                                                             };
                                                             let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
@@ -736,6 +738,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_global: lim_uni.max_queued_bytes_global,
                                                                 max_session: lim_uni.max_queued_bytes_per_session,
                                                                 max_stream: lim_uni.max_queued_bytes_per_stream,
+                                                                capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                backpressure_timeout_ms: lim_uni.backpressure_timeout_ms,
                                                             };
                                                             let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
@@ -798,6 +802,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_global: lim_create_bi.max_queued_bytes_global,
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
+                                                                    capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                    backpressure_timeout_ms: lim_create_bi.backpressure_timeout_ms,
                                                                 };
                                                                 let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                                                     crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
@@ -866,6 +872,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                         max_global: lim_create_uni.max_queued_bytes_global,
                                                                         max_session: lim_create_uni.max_queued_bytes_per_session,
                                                                         max_stream: lim_create_uni.max_queued_bytes_per_stream,
+                                                                        capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                        backpressure_timeout_ms: lim_create_uni.backpressure_timeout_ms,
                                                                     };
                                                                     let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
                                                                     let handle = crate::client_stream::ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot);

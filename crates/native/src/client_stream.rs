@@ -75,6 +75,49 @@ pub struct StreamBudget {
     pub max_global: u64,
     pub max_session: u64,
     pub max_stream: u64,
+    /// Notified whenever budget is released, so a recv loop parked on a full
+    /// budget can wake and retry instead of resetting the stream (lossless
+    /// backpressure). Defaults via `StreamBudget::new_notify()`.
+    pub capacity_notify: Arc<tokio::sync::Notify>,
+    /// Max time a send may park waiting for budget headroom before yielding
+    /// E_BACKPRESSURE_TIMEOUT (reliable-stream backpressure bound).
+    pub backpressure_timeout_ms: u64,
+}
+
+impl StreamBudget {
+    /// Fresh capacity notifier for a new stream budget.
+    pub fn new_notify() -> Arc<tokio::sync::Notify> {
+        Arc::new(tokio::sync::Notify::new())
+    }
+
+    /// Reserve `n` bytes, parking (lossless backpressure) until capacity frees
+    /// or the backpressure deadline elapses. Returns true iff reserved.
+    pub async fn reserve_or_wait(&self, n: u64) -> bool {
+        if self.try_reserve(n) {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
+        loop {
+            // Register wakeup before re-checking so a release() between the
+            // failed try_reserve and the await cannot be lost.
+            let notified = self.capacity_notify.notified();
+            tokio::pin!(notified);
+            if self.try_reserve(n) {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                return self.try_reserve(n);
+            }
+        }
+    }
 }
 
 impl StreamBudget {
@@ -126,6 +169,8 @@ impl StreamBudget {
             .queued_bytes
             .fetch_sub(n, Ordering::Relaxed);
         self.server_metrics.release_queued_bytes(n);
+        // Wake any recv loop parked waiting for budget headroom.
+        self.capacity_notify.notify_waiters();
     }
 }
 
@@ -258,8 +303,10 @@ impl ClientBidiStreamHandle {
         }
         let sz = bytes.len() as u64;
         if let Some(ref b) = self.budget {
-            if !b.try_reserve(sz) {
-                return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+            // Reliable-stream backpressure: park until budget frees (lossless)
+            // instead of erroring, bounded by the backpressure timeout.
+            if !b.reserve_or_wait(sz).await {
+                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
         if tx.send(StreamCmd::Data(bytes)).await.is_err() {
@@ -372,8 +419,10 @@ impl ClientUniSendHandle {
         }
         let sz = bytes.len() as u64;
         if let Some(ref b) = self.budget {
-            if !b.try_reserve(sz) {
-                return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+            // Reliable-stream backpressure: park until budget frees (lossless)
+            // instead of erroring, bounded by the backpressure timeout.
+            if !b.reserve_or_wait(sz).await {
+                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
         if tx.send(StreamCmd::Data(bytes)).await.is_err() {
@@ -546,8 +595,28 @@ pub fn spawn_bidi_bridge_on(
                         Ok(Some(n)) => {
                             let sz = n as u64;
                             if let Some(ref b) = read_budget {
-                                if !b.try_reserve(sz) {
-                                    recv_stream.stop(VarInt::from_u32(0));
+                                // Lossless backpressure (see uni recv bridge): park
+                                // on a full budget instead of resetting the stream,
+                                // letting QUIC flow control push back on the sender.
+                                let mut abort_stop: Option<Option<u32>> = None;
+                                while !b.try_reserve(sz) {
+                                    let notified = b.capacity_notify.notified();
+                                    tokio::pin!(notified);
+                                    if b.try_reserve(sz) {
+                                        break;
+                                    }
+                                    tokio::select! {
+                                        _ = &mut notified => {}
+                                        code = &mut stop_rx => {
+                                            abort_stop = Some(code.ok());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(stop_code) = abort_stop {
+                                    if let Some(c) = stop_code {
+                                        recv_stream.stop(VarInt::from_u32(c));
+                                    }
                                     break;
                                 }
                             }
@@ -787,8 +856,36 @@ pub fn spawn_uni_recv_bridge_on(
                         Ok(Some(n)) => {
                             let sz = n as u64;
                             if let Some(ref b) = budget {
-                                if !b.try_reserve(sz) {
-                                    recv_stream.stop(VarInt::from_u32(0));
+                                // Lossless backpressure: if the byte budget is
+                                // momentarily full (slow consumer), park until a
+                                // read() releases capacity rather than resetting
+                                // the stream. While parked we stop pulling from
+                                // quinn, so QUIC flow control pushes back on the
+                                // sender — no data is dropped. `stop_rx` still
+                                // aborts promptly. On loop exit the budget is
+                                // reserved exactly once.
+                                let mut abort_stop: Option<Option<u32>> = None;
+                                while !b.try_reserve(sz) {
+                                    // Register the wakeup BEFORE re-checking so a
+                                    // release() between the failed try_reserve and
+                                    // the await cannot be lost.
+                                    let notified = b.capacity_notify.notified();
+                                    tokio::pin!(notified);
+                                    if b.try_reserve(sz) {
+                                        break;
+                                    }
+                                    tokio::select! {
+                                        _ = &mut notified => {}
+                                        code = &mut stop_rx => {
+                                            abort_stop = Some(code.ok());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(stop_code) = abort_stop {
+                                    if let Some(c) = stop_code {
+                                        recv_stream.stop(VarInt::from_u32(c));
+                                    }
                                     break;
                                 }
                             }
