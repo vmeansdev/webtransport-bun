@@ -47,7 +47,11 @@ E_QUEUE_FULL) — proven by a stall-then-resume test delivering 12.5 MiB intact.
 - [x] F8 serverCertificateHashes W3C semantics: pin-only verification (no CA
       chain requirement) when hashes are provided, per spec intent; document.
 - [x] F12 (ts-review M4) maxDatagramSize from native/session, not a constant.
-- [x] F13 (ts-review M2) Client waitUntilAvailable busy-poll → event-driven wait.
+- [~] F13 (ts-review M2) Client waitUntilAvailable busy-poll → event-driven wait.
+      DEFERRED (not a correctness bug): client stream creation awaits QUIC stream
+      credit rather than returning a retryable error, so the retry/backoff loop
+      rarely engages in practice. Documented as a minor efficiency nicety; not
+      gating production-readiness.
 
 ## Phase 3 — Test hardening
 - [x] Regression test per fix above (F1-F13), each written to fail on the old code.
