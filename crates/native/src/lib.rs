@@ -360,7 +360,7 @@ pub(crate) fn spawn_wtransport_server(
     });
 
     RUNTIME.spawn(async move {
-        panic_guard::spawn_quic_task(async move {
+        panic_guard::spawn_quic_task_scoped(panic_guard::PanicScope::Server(owner_server_id), async move {
             let mut startup_tx = Some(startup_tx);
             let mut report_startup = |res: std::result::Result<(), String>| {
                 send_startup_result(&mut startup_tx, res);
@@ -377,9 +377,30 @@ pub(crate) fn spawn_wtransport_server(
             let bind_addr: std::net::SocketAddr = format!("{}:{}", host, port)
                 .parse()
                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+            // Align QUIC transport flow control with the configured app limits so a
+            // peer cannot open QUIC-default concurrency (accept/reset churn) or
+            // buffer more than the advertised byte budgets. Headroom of 16 streams
+            // covers H3 control/QPACK/settings streams outside the app caps.
+            let mut transport = wtransport::config::QuicTransportConfig::default();
+            let clamp_varint = |n: u64| -> wtransport::quinn::VarInt {
+                wtransport::quinn::VarInt::from_u64(n.min(wtransport::quinn::VarInt::MAX.into_inner()))
+                    .unwrap_or(wtransport::quinn::VarInt::MAX)
+            };
+            transport.max_concurrent_bidi_streams(clamp_varint(
+                limits.max_streams_per_session_bidi.saturating_add(16),
+            ));
+            transport.max_concurrent_uni_streams(clamp_varint(
+                limits.max_streams_per_session_uni.saturating_add(16),
+            ));
+            transport.stream_receive_window(clamp_varint(limits.max_queued_bytes_per_stream));
+            transport.receive_window(clamp_varint(
+                limits
+                    .max_queued_bytes_per_session
+                    .saturating_add(64 * 1024),
+            ));
             let config_builder = ServerConfig::builder()
                 .with_bind_address(bind_addr)
-                .with_custom_tls(tls_config);
+                .with_custom_tls_and_transport(tls_config, transport);
             let config_builder = match config_builder.max_idle_timeout(Some(
                 std::time::Duration::from_millis(limits.idle_timeout_ms),
             )) {
@@ -422,6 +443,7 @@ pub(crate) fn spawn_wtransport_server(
                         spawn_tracked::spawn_tracked(
                             metrics.clone(),
                             spawn_tracked::TaskKind::Session,
+                            panic_guard::PanicScope::Server(owner_server_id),
                             async move {
                                 metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
                                 let session_request = match incoming_session.await {
@@ -573,16 +595,19 @@ pub(crate) fn spawn_wtransport_server(
                                             session_registry::get_stream_capacity_notify(&id);
 
                                         if let Some(ref tx) = stx {
+                                            // Lifecycle events must not be lossy: await capacity
+                                            // instead of try_send (bounded by maxSessions churn).
                                             if tx
-                                                .try_send(SessionEvent::Accepted(SessionAccepted {
+                                                .send(SessionEvent::Accepted(SessionAccepted {
                                                     id: id.clone(),
                                                     peer_ip: peer_ip.clone(),
                                                     peer_port,
                                                 }))
+                                                .await
                                                 .is_err()
                                             {
                                                 eprintln!(
-                                                    "webtransport-native: session accepted event dropped for id={}",
+                                                    "webtransport-native: session accepted event dropped for id={} (listener gone)",
                                                     id
                                                 );
                                             }
@@ -608,6 +633,7 @@ pub(crate) fn spawn_wtransport_server(
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 loop {
                                                     tokio::select! {
@@ -649,6 +675,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_global: lim_bidi.max_queued_bytes_global,
                                                                 max_session: lim_bidi.max_queued_bytes_per_session,
                                                                 max_stream: lim_bidi.max_queued_bytes_per_stream,
+                                                                capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                backpressure_timeout_ms: lim_bidi.backpressure_timeout_ms,
                                                             };
                                                             let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
@@ -668,6 +696,7 @@ pub(crate) fn spawn_wtransport_server(
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 loop {
                                                     tokio::select! {
@@ -709,6 +738,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_global: lim_uni.max_queued_bytes_global,
                                                                 max_session: lim_uni.max_queued_bytes_per_session,
                                                                 max_stream: lim_uni.max_queued_bytes_per_stream,
+                                                                capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                backpressure_timeout_ms: lim_uni.backpressure_timeout_ms,
                                                             };
                                                             let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
@@ -730,6 +761,7 @@ pub(crate) fn spawn_wtransport_server(
                                         spawn_tracked::spawn_tracked(
                                             m_create_bi.clone(),
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 let mut rx = create_bi_rx;
                                                 while let Some(resp_tx) = rx.recv().await {
@@ -770,6 +802,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_global: lim_create_bi.max_queued_bytes_global,
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
+                                                                    capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                    backpressure_timeout_ms: lim_create_bi.backpressure_timeout_ms,
                                                                 };
                                                                 let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                                                     crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
@@ -796,6 +830,7 @@ pub(crate) fn spawn_wtransport_server(
                                         spawn_tracked::spawn_tracked(
                                             m_create_uni.clone(),
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 let mut rx = create_uni_rx;
                                                 while let Some(resp_tx) = rx.recv().await {
@@ -837,6 +872,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                         max_global: lim_create_uni.max_queued_bytes_global,
                                                                         max_session: lim_create_uni.max_queued_bytes_per_session,
                                                                         max_stream: lim_create_uni.max_queued_bytes_per_stream,
+                                                                        capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                        backpressure_timeout_ms: lim_create_uni.backpressure_timeout_ms,
                                                                     };
                                                                     let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
                                                                     let handle = crate::client_stream::ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot);
@@ -867,6 +904,7 @@ pub(crate) fn spawn_wtransport_server(
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 loop {
                                                     tokio::select! {
@@ -886,11 +924,12 @@ pub(crate) fn spawn_wtransport_server(
                                                                     m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
-                                                                            .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .await
                                                                             .is_err()
                                                                         {
                                                                             eprintln!(
-                                                                                "webtransport-native: session closed event dropped for id={}",
+                                                                                "webtransport-native: session closed event dropped for id={} (listener gone)",
                                                                                 id
                                                                             );
                                                                         }
@@ -951,11 +990,12 @@ pub(crate) fn spawn_wtransport_server(
                                                             m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
-                                                                    .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                    .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                    .await
                                                                     .is_err()
                                                                 {
                                                                     eprintln!(
-                                                                        "webtransport-native: session closed event dropped for id={}",
+                                                                        "webtransport-native: session closed event dropped for id={} (listener gone)",
                                                                         id
                                                                     );
                                                                 }
@@ -969,11 +1009,12 @@ pub(crate) fn spawn_wtransport_server(
                                                 m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
-                                                        .try_send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
+                                                        .send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
+                                                        .await
                                                         .is_err()
                                                     {
                                                         eprintln!(
-                                                            "webtransport-native: terminal session event dropped for id={}",
+                                                            "webtransport-native: terminal session event dropped for id={} (listener gone)",
                                                             id
                                                         );
                                                     }

@@ -2,5 +2,6 @@
 members = [
   "crates/native",
   "crates/reference",
+  "crates/adversary",
 ]
 resolver = "2"

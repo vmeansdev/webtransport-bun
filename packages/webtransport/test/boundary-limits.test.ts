@@ -25,9 +25,9 @@ async function connectWithRetry(
 }
 
 describe("limit boundaries (P0.4)", () => {
-	it("maxHandshakesInFlight: at most limit handshakes proceed, excess rejected", async () => {
+	it("maxHandshakesInFlight: excess concurrent handshakes are rejected, capacity recovers", async () => {
 		const port = nextPort(25480, 3000);
-		const limit = 3;
+		const limit = 2;
 		const server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
@@ -35,12 +35,18 @@ describe("limit boundaries (P0.4)", () => {
 			onSession: () => {},
 		});
 
-		const attempts = 6;
 		try {
+			// A tiny in-flight cap (2) against a large concurrent burst forces the
+			// server to reject the overflow: many handshakes are simultaneously past
+			// incoming_session.await before any complete, so in-flight exceeds the cap.
+			// Single-shot connects (no retry) with a short timeout so rejected attempts
+			// — which the server silently drops — fail fast instead of retrying.
+			const attempts = 24;
 			const results = await Promise.all(
 				Array.from({ length: attempts }, () =>
-					connectWithRetry(`https://127.0.0.1:${port}`, {
+					connect(`https://127.0.0.1:${port}`, {
 						tls: { insecureSkipVerify: true },
+						limits: { handshakeTimeoutMs: 1500 },
 					}).then(
 						(s) => ({ ok: true as const, session: s }),
 						(e) => ({ ok: false as const, err: e }),
@@ -48,22 +54,25 @@ describe("limit boundaries (P0.4)", () => {
 				),
 			);
 
-			const succeeded = results.filter((r) => r.ok);
+			const succeeded = results.filter(
+				(r): r is { ok: true; session: Awaited<ReturnType<typeof connect>> } =>
+					r.ok,
+			);
 			const failed = results.filter((r) => !r.ok);
+			for (const s of succeeded) s.session.close();
 
-			expect(succeeded.length + failed.length).toBe(attempts);
-			for (const s of succeeded) {
-				if (s.ok) s.session.close();
-			}
-
+			// Rejections must occur, and the server must account for them.
+			expect(failed.length).toBeGreaterThan(0);
 			const m = server.metricsSnapshot();
-			// On fast hosts, handshakes may complete before in-flight caps are exceeded.
-			// When overflow happens, we must observe both failures and limit metrics.
-			if (failed.length > 0) {
-				expect(m.limitExceededCount).toBeGreaterThanOrEqual(1);
-			} else {
-				expect(succeeded.length).toBe(attempts);
-			}
+			expect(m.limitExceededCount).toBeGreaterThanOrEqual(1);
+
+			// Successes complete: once the burst drains and in-flight returns to zero,
+			// a fresh handshake proceeds normally, proving the cap is not permanent.
+			const late = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			expect(late).toBeDefined();
+			late.close();
 		} finally {
 			await server.close();
 		}

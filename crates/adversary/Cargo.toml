@@ -1,0 +1,18 @@
+[package]
+name = "adversary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "adversary"
+path = "src/main.rs"
+
+# Raw QUIC/H3 fuzzing client. Deliberately dependency-light: it drives quinn
+# directly (not wtransport) so it can emit malformed H3 the library client
+# would never produce. Versions are pinned to match the workspace lock so the
+# addon server and the adversary negotiate the same QUIC/TLS stack.
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["ring", "rustls", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

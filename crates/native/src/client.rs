@@ -202,6 +202,8 @@ pub struct ClientSessionHandle {
     close_tx: Option<Arc<watch::Sender<(u32, String)>>>,
     client_metrics: Arc<ClientMetrics>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Connection handle for wire-level stats (None for detached/test handles).
+    conn: Option<wtransport::Connection>,
 }
 
 #[napi]
@@ -219,6 +221,25 @@ impl ClientSessionHandle {
     #[napi(getter)]
     pub fn peer_port(&self) -> u32 {
         self.peer_port
+    }
+
+    /// Real QUIC transport stats (rtt, wire bytes, packet counts).
+    #[napi]
+    pub fn connection_stats(&self) -> Result<Option<crate::metrics::QuicConnectionStats>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(self.conn.as_ref().map(crate::metrics::quic_stats_from_conn))
+    }
+
+    /// Current max datagram payload size for the path (MTU-derived), if known.
+    #[napi]
+    pub fn path_max_datagram_size(&self) -> Result<Option<u32>> {
+        Ok(self
+            .conn
+            .as_ref()
+            .and_then(|c| c.max_datagram_size())
+            .map(|n| n as u32))
     }
 
     #[napi]
@@ -287,10 +308,10 @@ impl ClientSessionHandle {
     #[napi]
     pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
         Ok(crate::metrics::SessionMetricsSnapshot {
-            datagrams_in: self.client_metrics.datagrams_in.load(Ordering::Relaxed) as u32,
-            datagrams_out: self.client_metrics.datagrams_out.load(Ordering::Relaxed) as u32,
+            datagrams_in: self.client_metrics.datagrams_in.load(Ordering::Relaxed) as f64,
+            datagrams_out: self.client_metrics.datagrams_out.load(Ordering::Relaxed) as f64,
             streams_active: self.client_metrics.streams_active.load(Ordering::Relaxed) as u32,
-            queued_bytes: self.client_metrics.queued_bytes.load(Ordering::Relaxed) as u32,
+            queued_bytes: self.client_metrics.queued_bytes.load(Ordering::Relaxed) as f64,
         })
     }
 
@@ -408,6 +429,7 @@ impl ClientSessionHandle {
             close_tx: Some(Arc::new(close_tx)),
             client_metrics: Arc::clone(&cm),
             closed: Arc::clone(&closed_flag),
+            conn: Some(conn.clone()),
         };
 
         let conn_bi = conn.clone();
@@ -425,6 +447,8 @@ impl ClientSessionHandle {
                 max_global,
                 max_session,
                 max_stream,
+                capacity_notify: StreamBudget::new_notify(),
+                backpressure_timeout_ms,
             }
         };
 
@@ -435,7 +459,7 @@ impl ClientSessionHandle {
             let conn_closed = conn.clone();
 
             let cm_send = Arc::clone(&cm);
-            crate::panic_guard::spawn_quic_task(async move {
+            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 while let Some(bytes) = dgram_send_rx.recv().await {
                     let sz = bytes.len() as u64;
                     cm_send.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
@@ -452,7 +476,7 @@ impl ClientSessionHandle {
 
             let cm_recv = Arc::clone(&cm);
             let recv_budget_bytes = datagram_budget_bytes;
-            crate::panic_guard::spawn_quic_task(async move {
+            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 while let Ok(dgram) = conn_dgram_recv.receive_datagram().await {
                     let sz = dgram.len() as u64;
                     if !try_reserve_client_queued_bytes(&cm_recv, recv_budget_bytes, sz) {
@@ -468,7 +492,7 @@ impl ClientSessionHandle {
 
             let cm_bi = Arc::clone(&cm);
             let make_budget_bi = make_budget.clone();
-            crate::panic_guard::spawn_quic_task(async move {
+            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 while let Some(resp_tx) = open_bi_rx.recv().await {
                     let r = match conn_bi.open_bi().await {
                         Ok(opening) => match opening.await {
@@ -508,7 +532,7 @@ impl ClientSessionHandle {
 
             let cm_uni = Arc::clone(&cm);
             let make_budget_uni = make_budget.clone();
-            crate::panic_guard::spawn_quic_task(async move {
+            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 while let Some(resp_tx) = open_uni_rx.recv().await {
                     let r = match conn_uni.open_uni().await {
                         Ok(opening) => match opening.await {
@@ -544,7 +568,7 @@ impl ClientSessionHandle {
             let mut accept_bi_rx = accept_bi_rx;
             let cm_accept_bi = Arc::clone(&cm);
             let make_budget_accept_bi = make_budget.clone();
-            crate::panic_guard::spawn_quic_task(async move {
+            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 while let Some(resp_tx) = accept_bi_rx.recv().await {
                     let r = match conn_accept_bi.accept_bi().await {
                         Ok((send, recv)) => {
@@ -582,7 +606,7 @@ impl ClientSessionHandle {
             let mut accept_uni_rx_local = accept_uni_rx;
             let cm_accept_uni = Arc::clone(&cm);
             let make_budget_accept_uni = make_budget.clone();
-            crate::panic_guard::spawn_quic_task(async move {
+            crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 while let Some(resp_tx) = accept_uni_rx_local.recv().await {
                     let r = match conn_accept_uni.accept_uni().await {
                         Ok(recv) => {
@@ -931,38 +955,53 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     }
 }
 
+/// W3C serverCertificateHashes semantics: the pin REPLACES chain/hostname
+/// verification (its purpose is accepting self-signed certs). Guardrails kept
+/// from the spec's custom-verification rules: the cert must be currently valid
+/// and its total validity window must not exceed 14 days.
 #[derive(Debug)]
 struct PinnedCertVerifier {
+    /// Used only to delegate signature verification, never chain building.
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     pins: Vec<[u8; 32]>,
 }
+
+const MAX_PINNED_CERT_VALIDITY_SECS: i64 = 14 * 24 * 60 * 60;
 
 impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        )?;
         let mut hasher = Sha256::new();
         hasher.update(end_entity.as_ref());
         let actual: [u8; 32] = hasher.finalize().into();
-        if self.pins.iter().any(|p| p == &actual) {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(
+        if !self.pins.iter().any(|p| p == &actual) {
+            return Err(rustls::Error::General(
                 "E_TLS: server certificate hash mismatch".to_string(),
-            ))
+            ));
         }
+        // W3C custom-verification guardrails: currently valid, validity <= 14 days.
+        let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+            .map_err(|_| rustls::Error::General("E_TLS: pinned certificate unparsable".into()))?;
+        let now_secs = now.as_secs() as i64;
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        if now_secs < not_before || now_secs > not_after {
+            return Err(rustls::Error::General(
+                "E_TLS: pinned certificate expired or not yet valid".to_string(),
+            ));
+        }
+        if not_after - not_before > MAX_PINNED_CERT_VALIDITY_SECS {
+            return Err(rustls::Error::General(
+                "E_TLS: pinned certificate validity exceeds 14 days (W3C limit)".to_string(),
+            ));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(

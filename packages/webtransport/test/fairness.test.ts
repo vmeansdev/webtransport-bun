@@ -310,6 +310,19 @@ describe("fairness and abuse resistance (P2.3)", () => {
 			})();
 
 			const abusivePromise = (async () => {
+				// Deterministic trip: fire a concurrent burst that exceeds both the
+				// per-IP burst (2) and per-prefix burst (6) in a single refill window,
+				// so the token bucket rejects some handshakes for certain.
+				const burst = await Promise.all(
+					Array.from({ length: 12 }, () =>
+						tryConnectOnce(`https://127.0.0.1:${port}`, {
+							tls: { insecureSkipVerify: true },
+							limits: { handshakeTimeoutMs: 500 },
+						}),
+					),
+				);
+				for (const c of burst) c?.close();
+				// Keep hammering to sustain contention while the compliant client retries.
 				for (let i = 0; i < 15; i++) {
 					tryConnectOnce(`https://127.0.0.1:${port}`, {
 						tls: { insecureSkipVerify: true },
@@ -323,10 +336,12 @@ describe("fairness and abuse resistance (P2.3)", () => {
 
 			await Promise.all([compliantPromise, abusivePromise]);
 
+			// Non-starvation: the compliant client makes forward progress despite the burst.
 			expect(compliantConnected).toBe(true);
 
+			// The abusive burst deterministically exceeded the rate limit.
 			const m = server.metricsSnapshot();
-			expect(m.rateLimitedCount).toBeGreaterThanOrEqual(0);
+			expect(m.rateLimitedCount).toBeGreaterThanOrEqual(1);
 
 			await server.close();
 		}, 20000);

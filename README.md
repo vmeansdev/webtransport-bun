@@ -258,7 +258,7 @@ await wt.closed;
 W3C-facade option semantics in this runtime:
 - `allowPooling`: when `true`, endpoint-level pooling reuses compatible connects; when `false`, dedicated sessions.
 - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities.
-- `serverCertificateHashes`: supported (SHA-256 leaf pinning) and rejected when combined with `allowPooling: true`.
+- `serverCertificateHashes`: supported (SHA-256 leaf pinning, W3C semantics — the pin replaces CA/hostname validation so self-signed pinned certs are accepted, with a ≤14-day cert-validity guard) and rejected when combined with `allowPooling: true`.
 - `datagramsReadableType`: `"bytes"` uses `ReadableByteStream` with BYOB; `"default"` uses normal `ReadableStream`.
 - `congestionControl`: accepted and surfaced via effective-mode behavior.
 
