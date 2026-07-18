@@ -396,6 +396,79 @@ describe("hardening regressions", () => {
 		}
 	}, 30000);
 
+	it("7. many concurrent streams under shared byte-budget pressure all complete (no cross-stream notify starvation)", async () => {
+		const port = nextPort(24660, 500);
+		const STREAMS = 12;
+		const CHUNKS_PER = 10;
+		const CHUNK_SIZE = 32 * 1024; // 12 * 10 * 32KiB = ~3.75 MiB total, above the
+		// 2 MiB per-session byte budget, so streams contend for shared session/global
+		// budget and some park in reserve_or_wait / the recv budget loop. Kept modest
+		// so the test stays fast and stable under full-suite CPU contention while
+		// still forcing the cross-stream contention the fix addresses.
+		const server = createServer({
+			port,
+			tls: EMPTY_TLS,
+			rateLimits: NO_RATE_LIMIT,
+			onSession: (s: ServerSession) => {
+				void (async () => {
+					const chunk = new Uint8Array(CHUNK_SIZE).fill(0x5c);
+					const writers = Array.from({ length: STREAMS }, async () => {
+						const w = await s.createUnidirectionalStream();
+						w.on("error", () => {});
+						for (let i = 0; i < CHUNKS_PER; i++) {
+							await new Promise<void>((resolve, reject) => {
+								w.write(chunk, (err: Error | null | undefined) =>
+									err ? reject(err) : resolve(),
+								);
+							});
+						}
+						await new Promise<void>((resolve) => w.end(resolve));
+					});
+					await Promise.all(writers);
+				})().catch(() => {});
+			},
+		});
+
+		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, INSECURE);
+		try {
+			const reader = wt.incomingUnidirectionalStreams.getReader();
+			const drained: Promise<number>[] = [];
+			for (let s = 0; s < STREAMS; s++) {
+				const { value: recvStream, done } = await withTimeout(
+					reader.read(),
+					30000,
+					`incoming stream ${s} never arrived`,
+				);
+				if (done || !recvStream) break;
+				// Drain each stream concurrently; a starved stream would hang here.
+				drained.push(
+					(async () => {
+						const r = (recvStream as ReadableStream<Uint8Array>).getReader();
+						let got = 0;
+						while (true) {
+							const { done: d, value } = await withTimeout(
+								r.read(),
+								30000,
+								"a concurrent stream stalled (budget-notify starvation)",
+							);
+							if (d) break;
+							if (value) got += value.byteLength;
+						}
+						return got;
+					})(),
+				);
+			}
+			const totals = await Promise.all(drained);
+			expect(totals.length).toBe(STREAMS);
+			for (const got of totals) {
+				expect(got).toBe(CHUNKS_PER * CHUNK_SIZE);
+			}
+		} finally {
+			wt.close();
+			await server.close();
+		}
+	}, 60000);
+
 	it("6. receive-side backpressure is lossless: stall then resume delivers all bytes", async () => {
 		const port = nextPort(24650, 500);
 		const CHUNKS = 200;
