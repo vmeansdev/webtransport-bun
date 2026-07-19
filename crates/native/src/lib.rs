@@ -274,16 +274,20 @@ pub fn smoke_test() -> String {
     .unwrap_or_else(|_| "webtransport-native (panic recovered)".to_string())
 }
 
-/// Client pool metrics snapshot (hits, misses, evictions). For tests and observability.
+/// Client pool metrics snapshot (hits, misses, evictions), for observability.
+/// Wrapped in `catch_panic` like every other `#[napi]` export: a panic (e.g. a
+/// poisoned pool mutex) must not unwind across the FFI boundary (UB).
 #[napi]
-pub fn client_pool_metrics_snapshot() -> metrics::ClientPoolMetricsSnapshot {
-    let s = client_pool::pool_metrics_snapshot();
-    metrics::ClientPoolMetricsSnapshot {
-        hits: s.hits as u32,
-        misses: s.misses as u32,
-        evict_idle: s.evict_idle as u32,
-        evict_broken: s.evict_broken as u32,
-    }
+pub fn client_pool_metrics_snapshot() -> napi::Result<metrics::ClientPoolMetricsSnapshot> {
+    panic_guard::catch_panic(|| {
+        let s = client_pool::pool_metrics_snapshot();
+        Ok(metrics::ClientPoolMetricsSnapshot {
+            hits: s.hits as u32,
+            misses: s.misses as u32,
+            evict_idle: s.evict_idle as u32,
+            evict_broken: s.evict_broken as u32,
+        })
+    })
 }
 
 /// Returns the number of Tokio worker threads (should be 1).
@@ -327,6 +331,40 @@ pub(crate) fn extract_close_info(
             Some("E_SESSION_IDLE_TIMEOUT".to_string()),
         ),
         _ => (None, None),
+    }
+}
+
+/// Releases per-session lifecycle counters (registry entry, per-IP rate-limit
+/// slot, and the `sessions_active` gauge) exactly once — on the normal teardown
+/// path via `release()`, or on an unwind via `Drop`. Without this, a panic in
+/// the datagram-forward task (the case `panic_guard` exists for) would strand
+/// these counters: `sessions_active` inflates → false `maxSessions` rejections,
+/// and the peer IP stays permanently blocked from reconnecting.
+struct SessionCounters {
+    id: String,
+    owner_server_id: u64,
+    peer_ip: String,
+    metrics: Arc<crate::server_metrics::ServerMetrics>,
+    released: bool,
+}
+
+impl SessionCounters {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        session_registry::remove(&self.id);
+        rate_limit::release_per_ip_session(self.owner_server_id, &self.peer_ip);
+        self.metrics
+            .sessions_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for SessionCounters {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -906,6 +944,17 @@ pub(crate) fn spawn_wtransport_server(
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
+                                                // Releases session counters on any
+                                                // task exit, including a panic
+                                                // unwind (Drop). Normal paths call
+                                                // `counters.release()` explicitly.
+                                                let mut counters = SessionCounters {
+                                                    id: id.clone(),
+                                                    owner_server_id,
+                                                    peer_ip: peer_ip_for_release.clone(),
+                                                    metrics: m_dgram.clone(),
+                                                    released: false,
+                                                };
                                                 loop {
                                                     tokio::select! {
                                                         biased;
@@ -919,9 +968,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                         close_code = code2;
                                                                         close_reason = reason2;
                                                                     }
-                                                                    session_registry::remove(&id);
-                                                                    rate_limit::release_per_ip_session(owner_server_id, &peer_ip_for_release);
-                                                                    m_dgram.sessions_active.fetch_sub(1, Ordering::SeqCst);
+                                                                    counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
                                                                             .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
@@ -988,9 +1035,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     close_reason = reason2;
                                                                 }
                                                             }
-                                                            session_registry::remove(&id);
-                                                            rate_limit::release_per_ip_session(owner_server_id, &peer_ip_for_release);
-                                                            m_dgram.sessions_active.fetch_sub(1, Ordering::SeqCst);
+                                                            counters.release();
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
                                                                     .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
@@ -1007,9 +1052,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         }
                                                     }
                                                 }
-                                                session_registry::remove(&id);
-                                                rate_limit::release_per_ip_session(owner_server_id, &peer_ip_for_release);
-                                                m_dgram.sessions_active.fetch_sub(1, Ordering::SeqCst);
+                                                counters.release();
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
                                                         .send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
