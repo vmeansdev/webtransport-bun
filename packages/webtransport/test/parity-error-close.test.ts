@@ -109,6 +109,38 @@ describe("parity error and close mapping (P4)", () => {
 					],
 				}),
 		).toThrow(/cannot be used with allowPooling=true/);
+		// Empty and wrong-size hashes must be rejected (a SHA-256 digest is
+		// exactly 32 bytes). Previously an empty value passed validation.
+		expect(
+			() =>
+				new WebTransport(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+					serverCertificateHashes: [
+						{ algorithm: "sha-256", value: new Uint8Array(0) },
+					],
+				}),
+		).toThrow(/must be exactly 32 bytes/);
+		expect(
+			() =>
+				new WebTransport(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+					serverCertificateHashes: [
+						{ algorithm: "sha-256", value: new Uint8Array(16) },
+					],
+				}),
+		).toThrow(/must be exactly 32 bytes/);
+	});
+
+	test("closed rejects (not resolves) when the connection fails to establish", async () => {
+		// Port 1 is unbindable/unreachable — connect must fail. Per W3C both
+		// ready and closed reject with the same error, so a consumer can tell a
+		// failed connect from a clean close.
+		const wt = new WebTransport("https://127.0.0.1:1", {
+			tls: { insecureSkipVerify: true },
+			limits: { handshakeTimeoutMs: 1500 },
+		});
+		await expect(wt.ready).rejects.toBeInstanceOf(WebTransportError);
+		await expect(wt.closed).rejects.toBeInstanceOf(WebTransportError);
 	});
 
 	test("createBidirectionalStream applies sendOrder and validates sendGroup ownership", async () => {

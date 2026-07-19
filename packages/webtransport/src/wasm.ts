@@ -3,6 +3,12 @@
 // Lazily used only in a Chromium IWA with Direct Sockets. The wasm-bindgen glue
 // (the `.wasm` + JS) is loaded by the consumer and passed in as `WasmModule`, so
 // importing this subpath pulls no wasm bytes on its own.
+//
+// EXPERIMENTAL (0.x): the `/wasm` subpath is NOT covered by the package's 1.0.0
+// semver stability commitment. Its facade (callback-style WasmSession/WasmStream,
+// plain-Error close semantics) intentionally diverges from the native surface and
+// may change in any minor release until it converges. Depend on it only if you
+// accept breaking changes; the frozen 1.0 API is the native (root) entrypoint.
 
 export {
 	type BackendKind,
