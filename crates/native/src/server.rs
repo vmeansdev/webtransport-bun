@@ -560,9 +560,10 @@ impl ServerHandle {
             Ok(())
         })?;
         let metrics = Arc::clone(&self.metrics);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
         crate::RUNTIME.spawn(async move {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+            let mut fully_drained = false;
             loop {
                 let sessions = metrics
                     .session_tasks_active
@@ -571,6 +572,7 @@ impl ServerHandle {
                     .stream_tasks_active
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if sessions == 0 && streams == 0 {
+                    fully_drained = true;
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -578,14 +580,23 @@ impl ServerHandle {
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
-            if done_tx.send(()).is_err() {
+            if done_tx.send(fully_drained).is_err() {
                 crate::report_channel_failure("server close completion");
             }
         });
         // Await the drain instead of blocking the async worker thread with a
         // synchronous recv_timeout (which would stall a napi executor thread).
+        // close() still resolves on an incomplete drain (best-effort shutdown),
+        // but the incomplete case is surfaced to stderr rather than reported as
+        // a clean drain.
         match tokio::time::timeout(std::time::Duration::from_secs(6), done_rx).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(fully_drained)) => {
+                if !fully_drained {
+                    eprintln!(
+                        "webtransport-native: server close drain deadline reached with active tasks remaining (best-effort close)"
+                    );
+                }
+            }
             Ok(Err(_)) => {
                 return Err(napi::Error::from_reason(
                     "E_INTERNAL: server close completion channel disconnected".to_string(),
