@@ -118,8 +118,15 @@ fn parse_congestion_control(
     }
 }
 
+/// Default client idle timeout. quinn's default is `None` (never), which leaves
+/// a client on a dead path (NAT rebind, network drop, server power loss) hung
+/// forever with `closed` never resolving. A bounded default guarantees liveness.
+pub const DEFAULT_CLIENT_IDLE_TIMEOUT_MS: u64 = 30_000;
+
 fn build_quic_transport_config(
     mode: CongestionControlMode,
+    idle_timeout_ms: u64,
+    keep_alive_interval_ms: u64,
 ) -> wtransport::config::QuicTransportConfig {
     let mut config = wtransport::config::QuicTransportConfig::default();
     let factory: Arc<dyn wtransport::quinn::congestion::ControllerFactory + Send + Sync + 'static> =
@@ -135,6 +142,28 @@ fn build_quic_transport_config(
             }
         };
     config.congestion_controller_factory(factory);
+
+    // Liveness: bound how long a silent (possibly dead) connection lingers, and
+    // send keep-alive pings so a live-but-quiet connection is not idle-killed.
+    // `idle_timeout_ms == 0` opts out (unbounded), matching quinn's raw default.
+    if idle_timeout_ms > 0 {
+        match wtransport::quinn::IdleTimeout::try_from(std::time::Duration::from_millis(
+            idle_timeout_ms,
+        )) {
+            Ok(timeout) => {
+                config.max_idle_timeout(Some(timeout));
+            }
+            // Out of range: fall back to no idle timeout rather than panicking.
+            Err(_) => {
+                config.max_idle_timeout(None);
+            }
+        }
+        if keep_alive_interval_ms > 0 {
+            config.keep_alive_interval(Some(std::time::Duration::from_millis(
+                keep_alive_interval_ms,
+            )));
+        }
+    }
     config
 }
 
@@ -147,13 +176,17 @@ fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_wtransport_client_config(
     insecure_skip_verify: bool,
     ca_pem: Option<&str>,
     pinned_hashes: &[[u8; 32]],
     congestion_control: CongestionControlMode,
+    idle_timeout_ms: u64,
+    keep_alive_interval_ms: u64,
 ) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let transport_config = build_quic_transport_config(congestion_control);
+    let transport_config =
+        build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
 
     let config = if insecure_skip_verify {
         let tls_config =
@@ -1115,6 +1148,16 @@ async fn run_connect(
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    let idle_timeout_ms = opts
+        .get("limits")
+        .and_then(|l| l.get("idleTimeoutMs")?.as_u64())
+        .unwrap_or(DEFAULT_CLIENT_IDLE_TIMEOUT_MS);
+    // Keep-alive interval defaults to idle/3 so a live-but-quiet connection
+    // survives (up to two lost pings) while a dead path still times out.
+    let keep_alive_interval_ms = opts
+        .get("limits")
+        .and_then(|l| l.get("keepAliveIntervalMs")?.as_u64())
+        .unwrap_or(idle_timeout_ms / 3);
     let congestion_control = parse_congestion_control(&opts).map_err(std::io::Error::other)?;
 
     let (connect_url, custom_resolver) =
@@ -1150,6 +1193,8 @@ async fn run_connect(
                 ca_pem_owned.as_deref(),
                 pinned_hashes_clone.as_slice(),
                 congestion_control,
+                idle_timeout_ms,
+                keep_alive_interval_ms,
             )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
@@ -1177,6 +1222,8 @@ async fn run_connect(
         ca_pem,
         pinned_hashes.as_slice(),
         congestion_control,
+        idle_timeout_ms,
+        keep_alive_interval_ms,
     )?;
 
     if let Some(resolver) = custom_resolver {
@@ -1202,10 +1249,24 @@ async fn run_connect(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_root_cert_store, congestion_controller_label, parse_client_limits,
-        parse_congestion_control, CongestionControlMode,
+        build_quic_transport_config, build_root_cert_store, congestion_controller_label,
+        parse_client_limits, parse_congestion_control, CongestionControlMode,
     };
     use serde_json::json;
+
+    // Liveness config must be panic-safe across the full input range, including
+    // the out-of-range fallback (an idle timeout larger than the varint bound).
+    #[test]
+    fn build_quic_transport_config_is_panic_safe() {
+        // Normal: 30s idle, 10s keep-alive.
+        let _ = build_quic_transport_config(CongestionControlMode::Default, 30_000, 10_000);
+        // Opt-out: unbounded idle, no keep-alive.
+        let _ = build_quic_transport_config(CongestionControlMode::Throughput, 0, 0);
+        // Out-of-range idle must fall back to no timeout, not panic.
+        let _ = build_quic_transport_config(CongestionControlMode::LowLatency, u64::MAX, u64::MAX);
+        // Keep-alive with no idle bound is ignored (guarded).
+        let _ = build_quic_transport_config(CongestionControlMode::Default, 0, 5_000);
+    }
 
     #[test]
     fn build_root_cert_store_rejects_parseable_but_unaccepted_cert() {

@@ -347,7 +347,19 @@ export type LimitsOptions = {
 	backpressureTimeoutMs: number;
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
+	/**
+	 * Max idle time before a connection is considered dead and closed. Applies
+	 * to both the server and the client: on the client it guarantees `closed`
+	 * resolves on a dead path (NAT rebind, network drop, server power loss)
+	 * instead of hanging forever. Default 60000.
+	 */
 	idleTimeoutMs: number;
+	/**
+	 * Client keep-alive ping interval. Keeps a live-but-quiet connection from
+	 * being idle-closed. Must be below `idleTimeoutMs`. Defaults to
+	 * `idleTimeoutMs / 3` when omitted. Set 0 to disable keep-alive pings.
+	 */
+	keepAliveIntervalMs?: number;
 };
 
 /** Default limit values from AGENTS.md */

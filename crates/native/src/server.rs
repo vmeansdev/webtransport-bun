@@ -560,7 +560,7 @@ impl ServerHandle {
             Ok(())
         })?;
         let metrics = Arc::clone(&self.metrics);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         crate::RUNTIME.spawn(async move {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             loop {
@@ -582,16 +582,18 @@ impl ServerHandle {
                 crate::report_channel_failure("server close completion");
             }
         });
-        match done_rx.recv_timeout(std::time::Duration::from_secs(6)) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(napi::Error::from_reason(
-                    "E_INTERNAL: server close drain timeout".to_string(),
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        // Await the drain instead of blocking the async worker thread with a
+        // synchronous recv_timeout (which would stall a napi executor thread).
+        match tokio::time::timeout(std::time::Duration::from_secs(6), done_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
                 return Err(napi::Error::from_reason(
                     "E_INTERNAL: server close completion channel disconnected".to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(napi::Error::from_reason(
+                    "E_INTERNAL: server close drain timeout".to_string(),
                 ));
             }
         }
