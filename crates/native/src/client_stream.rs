@@ -372,22 +372,27 @@ impl ClientBidiStreamHandle {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
-        // Re-check after the (awaited) reservation: finish/reset issued during the
-        // park must still win, so the chunk is dropped (releasing its bytes)
-        // instead of being written after the FIN.
+        // Build the chunk NOW, immediately after reserving, so it owns the
+        // reservation: every early return below (the finish re-check, a send
+        // failure) drops it and releases the global/session/stream bytes.
+        // Building it *after* the re-check would strand the bytes reserved by
+        // reserve_or_wait when the re-check returns early — a budget leak.
+        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
+        // Re-check after the (awaited) reservation: finish/reset issued during
+        // the park must still win — `chunk` is dropped here (releasing its
+        // bytes) instead of being written after the FIN.
         //
-        // This is deterministic under the single-runtime execution model:
-        // finish()/reset() set `finished` synchronously *before* enqueuing their
-        // control command, so a write issued after them is rejected above, and a
-        // write concurrent with them (its future parked here) is rejected by this
-        // re-check. If the send below parks on a full channel, tokio wakes
-        // waiters FIFO, so this Data (registered first) is enqueued ahead of a
-        // later FIN — no reorder. (WHATWG serializes write/close through the
-        // facade anyway; this covers the raw handle.)
+        // Deterministic under the single-runtime execution model: finish()/reset()
+        // set `finished` synchronously *before* enqueuing their control command,
+        // so a write issued after them is rejected above, and a write concurrent
+        // with them (its future parked here) is rejected by this re-check. If the
+        // send below parks on a full channel, tokio wakes waiters FIFO, so this
+        // Data (registered first) is enqueued ahead of a later FIN — no reorder.
+        // (WHATWG serializes write/close through the facade; this covers the raw
+        // handle.)
         if self.finished.load(Ordering::Acquire) {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         }
-        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
         // On send failure the chunk drops here, releasing its reservation.
         if tx.send(StreamCmd::Data(chunk)).await.is_err() {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
@@ -669,6 +674,19 @@ pub fn spawn_bidi_bridge_on(
                         Ok(Some(n)) => {
                             let sz = n as u64;
                             if let Some(ref b) = read_budget {
+                                // A chunk larger than the per-stream budget can
+                                // NEVER be reserved: parking would wedge the
+                                // stream forever. Stop it so the reader unblocks
+                                // with an error instead of hanging.
+                                if sz > b.max_stream {
+                                    recv_stream.stop(VarInt::from_u32(0));
+                                    if let Ok(mut g) = read_error_slot_clone.lock() {
+                                        if g.is_none() {
+                                            *g = Some("E_STREAM_RESET".to_string());
+                                        }
+                                    }
+                                    break;
+                                }
                                 // Lossless backpressure (see uni recv bridge): park
                                 // on a full budget instead of resetting the stream,
                                 // letting QUIC flow control push back on the sender.
@@ -928,6 +946,18 @@ pub fn spawn_uni_recv_bridge_on(
                         Ok(Some(n)) => {
                             let sz = n as u64;
                             if let Some(ref b) = budget {
+                                // A chunk larger than the per-stream budget can
+                                // never be reserved: stop the stream instead of
+                                // parking forever (see bidi recv bridge).
+                                if sz > b.max_stream {
+                                    recv_stream.stop(VarInt::from_u32(0));
+                                    if let Ok(mut g) = read_error_slot_clone.lock() {
+                                        if g.is_none() {
+                                            *g = Some("E_STREAM_RESET".to_string());
+                                        }
+                                    }
+                                    break;
+                                }
                                 // Lossless backpressure: if the byte budget is
                                 // momentarily full (slow consumer), park until a
                                 // read() releases capacity rather than resetting
