@@ -62,3 +62,6 @@ entities.json
 mempalace.yaml
 memory/
 scripts/mempal-sync-codex-convos.sh
+
+# Prebuilt wasm artifacts (produced by build:wasm:dist at publish time)
+packages/webtransport/wasm-dist/

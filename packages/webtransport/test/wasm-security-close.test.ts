@@ -1,0 +1,168 @@
+// Regression tests for the deep-review fixes: cert pinning, ready rejection,
+// per-session close semantics, close-code propagation, and IPv6 addressing.
+
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, test } from "bun:test";
+import { connectWasm, serveOverUdp, type WasmSession } from "../src/backend.js";
+import { formatAddr, type WasmModule } from "../src/backend-wasm.js";
+import { BunUdpTransport } from "../src/bun-udp.js";
+
+const pkgPath = fileURLToPath(
+	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
+);
+const wasmAvailable = existsSync(pkgPath);
+const wasm = wasmAvailable
+	? ((await import(pkgPath)) as unknown as WasmModule)
+	: (null as unknown as WasmModule);
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+async function startEchoServer(port: number) {
+	const udp = await BunUdpTransport.bind("127.0.0.1", port);
+	const sessions: WasmSession[] = [];
+	const { manager, certHashBase64 } = await serveOverUdp(
+		wasm,
+		() => Promise.resolve(udp),
+		{
+			localAddress: "127.0.0.1",
+			localPort: port,
+			onSession: (session) => {
+				sessions.push(session);
+				session.onDatagram((d) => session.sendDatagram(d));
+			},
+		},
+	);
+	return { udp, manager, certHashBase64, sessions };
+}
+
+describe("formatAddr (IPv6 vs IPv4)", () => {
+	test("brackets IPv6 hosts, leaves IPv4 bare", () => {
+		expect(formatAddr({ address: "127.0.0.1", port: 443 })).toBe(
+			"127.0.0.1:443",
+		);
+		expect(formatAddr({ address: "::1", port: 443 })).toBe("[::1]:443");
+		expect(formatAddr({ address: "2001:db8::1", port: 5000 })).toBe(
+			"[2001:db8::1]:5000",
+		);
+	});
+});
+
+describe("cert pinning (serverCertificateHashes model)", () => {
+	test.skipIf(!wasmAvailable)(
+		"correct hash connects; wrong hash rejects",
+		async () => {
+			const PORT = 47850;
+			const srv = await startEchoServer(PORT);
+
+			// Correct pin: session establishes and echoes.
+			const udpOk = await BunUdpTransport.connect("127.0.0.1", PORT);
+			const ok = await connectWasm(
+				wasm,
+				udpOk,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: srv.certHashBase64 },
+			);
+			const got = new Promise<string>((res) =>
+				ok.session.onDatagram((d) => res(dec.decode(d))),
+			);
+			ok.session.sendDatagram(enc.encode("pinned-ok"));
+			expect(await got).toBe("pinned-ok");
+			ok.manager.close();
+			udpOk.close();
+
+			// Wrong pin: the TLS handshake must fail and connectWasm reject.
+			const wrongHash = btoa(String.fromCharCode(...new Uint8Array(32)));
+			const udpBad = await BunUdpTransport.connect("127.0.0.1", PORT);
+			await expect(
+				connectWasm(
+					wasm,
+					udpBad,
+					"localhost",
+					"127.0.0.1:0",
+					`127.0.0.1:${PORT}`,
+					{
+						certHashBase64: wrongHash,
+					},
+				),
+			).rejects.toThrow(/closed before session established/);
+			udpBad.close();
+
+			srv.manager.close();
+			srv.udp.close();
+		},
+		30_000,
+	);
+});
+
+describe("connection lifecycle", () => {
+	test.skipIf(!wasmAvailable)(
+		"ready rejects when the server is unreachable",
+		async () => {
+			// Nothing listens on this port; the idle timeout must reject ready.
+			const udp = await BunUdpTransport.connect("127.0.0.1", 47859);
+			const t0 = Date.now();
+			await expect(
+				connectWasm(wasm, udp, "localhost", "127.0.0.1:0", "127.0.0.1:47859"),
+			).rejects.toThrow(/closed before session established/);
+			// Bounded by the 10s idle timeout, not hanging forever.
+			expect(Date.now() - t0).toBeLessThan(20_000);
+			udp.close();
+		},
+		30_000,
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"closing one server session leaves the other client connected",
+		async () => {
+			const PORT = 47851;
+			const srv = await startEchoServer(PORT);
+
+			const udpA = await BunUdpTransport.connect("127.0.0.1", PORT);
+			const a = await connectWasm(
+				wasm,
+				udpA,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: srv.certHashBase64 },
+			);
+			const udpB = await BunUdpTransport.connect("127.0.0.1", PORT);
+			const b = await connectWasm(
+				wasm,
+				udpB,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: srv.certHashBase64 },
+			);
+			expect(srv.sessions.length).toBe(2);
+
+			// Server closes A's session with an application code; A must observe
+			// it promptly (CONNECTION_CLOSE, not a 10s idle timeout).
+			const t0 = Date.now();
+			srv.sessions[0]?.close({ code: 42, reason: "kick" });
+			const aClosed = await a.session.closed;
+			expect(aClosed.code).toBe(42);
+			expect(Date.now() - t0).toBeLessThan(5_000);
+
+			// B keeps working on the same endpoint.
+			const echoed = new Promise<string>((res) =>
+				b.session.onDatagram((d) => res(dec.decode(d))),
+			);
+			b.session.sendDatagram(enc.encode("b-alive"));
+			expect(await echoed).toBe("b-alive");
+
+			a.manager.close();
+			b.manager.close();
+			udpA.close();
+			udpB.close();
+			srv.manager.close();
+			srv.udp.close();
+		},
+		30_000,
+	);
+});

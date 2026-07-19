@@ -157,10 +157,45 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 2. ~~Follow-up hardening (closed/draining/termination)~~ — Completed in PARITY-A.
 3. ✅ Phase 7 implementation closure complete for targeted parity rows (sendOrder/sendGroup, getStats, congestionControl semantics, serverCertificateHashes).
 
+## WASM Backend (browser, Direct Sockets) — Phase Status
+
+A second backend (`crates/wasm` + `packages/webtransport/src/backend-wasm.ts`)
+runs a WebTransport server **and** client in the browser over the Direct Sockets
+`UDPSocket` API, with QUIC/TLS1.3/HTTP3/WebTransport as a sans-IO state machine
+compiled to wasm32 (quinn-proto + rustls/ring). It is intended to sit behind the
+same public API; the native addon path is unchanged. Design:
+`docs/superpowers/specs/2026-05-21-wasm-webtransport-backend-design.md`.
+
+| Capability | Status |
+|---|---|
+| wasm32 QUIC/TLS1.3 handshake (P0) | ✅ done |
+| H3 SETTINGS + Extended CONNECT session (P1) | ✅ done (wasm↔wasm loopback) |
+| WebTransport datagrams (P1) | ✅ done (`test:wasm` echo) |
+| Uni/bidi streams (P2) | ✅ done (`wasm-stream-echo` bidi echo + uni FIN) |
+| Backend selection + facade (P3) | ✅ done (`backend.ts` selector + `WasmSession`/`WasmStream` facade, `wasm-facade` test) |
+| Direct Sockets transport + cert + `./wasm` subpath + IWA (P4) | ✅ done (`DirectSocketsUdpTransport`, `wt_generate_cert` + `serverCertificateHashes`, `wasm-cert` test, reference IWA in `examples/`) |
+| Cross-stack interop (P5) | ✅ wasm client ↔ native wtransport server over real UDP (`wasm-native-interop`); wasm↔wasm over real UDP (`wasm-bun-udp`). Chrome-native-client ↔ wasm-server is browser-gated — manual harness in `tools/interop/WASM_INTEROP.md` |
+
+Notes:
+- The browser API ships under the `@webtransport-bun/webtransport/wasm` subpath
+  (lazy; pulls no wasm bytes for native installs). Unifying it under the exact
+  native `createServer`/`connect`/`WebTransport` names is a follow-up: the native
+  session interfaces (WHATWG streams, send groups, stats) are richer than the
+  current wasm facade, so converging them is an API task tracked separately.
+- Live `UDPSocket`/IWA execution requires a flagged Chromium Isolated Web App and
+  is not runnable in CI; the reference app in `examples/webtransport-wasm-iwa`
+  documents the build + flags.
+
+Intentional divergences for the wasm backend (no silent no-ops): `allowPooling`
+(single endpoint per IWA context), `congestionControl` selection (quinn-proto
+default), per-IP rate limiting (no multi-tenant threat model in a page).
+
 ## Required CI Gate
 
 - `bun run test:parity` is implemented; must remain required in CI.
 - Existing interop gate (`tools/interop` Playwright) remains required.
+- `bun run test:wasm` builds the wasm backend and runs the loopback session +
+  datagram echo gate (requires a wasm-capable LLVM; see the design spec §9).
 
 ## Files to touch first
 
