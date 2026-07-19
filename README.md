@@ -181,6 +181,70 @@ Run multi-node compose collaboration example:
 bun run example:compose:collab
 ```
 
+## WASM Backend: WebTransport Server in the Browser
+
+Beyond the native napi-rs addon, the package ships a **sans-IO wasm backend**
+(`@webtransport-bun/webtransport/wasm`) that runs the full
+QUIC/TLS1.3/HTTP3/WebTransport stack compiled to `wasm32-unknown-unknown` —
+including a **server running inside the browser** (issue #12: bring your own
+UDP socket).
+
+- **Bring your own socket**: the core never touches the network. Any transport
+  implementing `UdpTransport` (`send(data, dest)` + `onPacket(data, source)`)
+  feeds it raw UDP payloads — Direct Sockets `UDPSocket` in a Chromium
+  Isolated Web App, `Bun.udpSocket` in Bun, or an in-memory relay in tests.
+- **Server + client**: `serveOverUdp(...)` accepts sessions (multi-client,
+  routed per source address) and returns the `serverCertificateHashes` value;
+  `connectWasm(...)` / `createUnifiedClient(...)` connect as a client.
+- **Backend-agnostic contract**: `WebTransportLike` (exported from both the
+  root and `/wasm` subpaths) lets application code run unchanged against the
+  native or wasm backend.
+- **Certs**: `generateCert` produces browser-pinnable ECDSA P-256 certs
+  (validity clamped to the 14-day `serverCertificateHashes` limit).
+
+```ts
+import { loadWasmModule, serveOverUdp } from "@webtransport-bun/webtransport/wasm";
+
+const wasm = await loadWasmModule(); // prebuilt artifact shipped in the package
+const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
+  localPort: 4433,
+  onSession: (session) => session.onDatagram((d) => session.sendDatagram(d)),
+});
+```
+
+### Know before you ship
+
+- **The in-browser server is Chromium-only, and only inside an Isolated Web
+  App.** Direct Sockets `UDPSocket` does not exist on normal web pages, in
+  Firefox, or in Safari. Installing an IWA today requires `chrome://flags`
+  (`#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`) or
+  enterprise policy. *Connecting* to a wasm server needs no flags — any
+  standard WebTransport client works.
+- **Certificates expire in ≤ 14 days by design.** `serverCertificateHashes`
+  pinning (the only option without a CA-trusted cert) requires ECDSA P-256 and
+  a validity window of at most two weeks — `generateCert` clamps to this.
+  Plan for rotation: regenerate and redistribute the hash before expiry;
+  clients pin the hash, so a new cert means a new hash.
+- **You bring the I/O.** The wasm core is sans-IO: it never opens sockets,
+  reads clocks, or schedules timers. You (or one of the shipped adapters —
+  `DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) must pump packets
+  both ways and drive timeouts. There is no plug-and-play `createServer()` in
+  the browser.
+- **Client-side wasm works anywhere wasm runs** (Bun, Node, browsers) against
+  any WebTransport server — the IWA constraint applies only to hosting a
+  *server* in the browser.
+
+Typical use cases: browser-to-browser P2P on a LAN without WebRTC signaling,
+kiosk/enterprise IWAs accepting connections from local devices, offline or
+air-gapped networks, and in-page loopback for protocol testing against
+Chromium's own native client.
+
+See `examples/webtransport-wasm-iwa/` for the in-browser (IWA) reference,
+`tools/interop/WASM_INTEROP.md` for the cross-stack interop matrix, and
+`docs/PARITY_MATRIX.md` for native-vs-wasm feature parity (including the
+intentional divergences: `allowPooling` and friends are rejected, not
+silently ignored).
+
 ## Quickstart
 
 ### 1) Install package

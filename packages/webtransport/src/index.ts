@@ -2751,3 +2751,9 @@ export const __TESTING__ = {
 export function toWebTransport(session: ClientSession): WebTransport {
 	return new WebTransport(session);
 }
+
+// Backend-agnostic facade: the same contract is implemented by the wasm
+// backend (`@webtransport-bun/webtransport/wasm`), letting application code
+// run unchanged against either backend.
+export type { WebTransportLike, WtBidiStream, WtCloseInfo } from "./shared.js";
+export { nativeToWebTransportLike } from "./webtransport-like-native.js";
