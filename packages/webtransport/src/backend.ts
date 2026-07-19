@@ -15,6 +15,14 @@ import { WasmWebTransport } from "./webtransport-like-wasm.js";
 
 export { WasmWebTransport } from "./webtransport-like-wasm.js";
 
+/**
+ * Caps on the per-session buffers that hold events arriving BEFORE the app
+ * attaches a consumer. Without them, a peer flooding datagrams or opening many
+ * streams before `onDatagram`/`onStream` is called grows memory without bound.
+ */
+const MAX_PENDING_DATAGRAMS = 1024;
+const MAX_PENDING_INCOMING_STREAMS = 256;
+
 /** True when the wasm backend should be used (Direct Sockets available). */
 export function isWasmRuntime(): boolean {
 	return (
@@ -259,13 +267,32 @@ export class WasmSession {
 	}
 	/** @internal */
 	_pushDatagram(data: Uint8Array): void {
-		if (this.datagramCb) this.datagramCb(data);
-		else this.datagramQueue.push(data);
+		if (this.datagramCb) {
+			this.datagramCb(data);
+			return;
+		}
+		// Bound the pre-subscribe buffer: a peer flooding datagrams before the
+		// app attaches a consumer must not grow memory without limit. Datagrams
+		// are unreliable, so drop the oldest (ring-buffer) rather than OOM.
+		if (this.datagramQueue.length >= MAX_PENDING_DATAGRAMS) {
+			this.datagramQueue.shift();
+		}
+		this.datagramQueue.push(data);
 	}
 	/** @internal */
 	_pushIncomingStream(stream: WasmStream): void {
-		if (this.incomingCb) this.incomingCb(stream);
-		else this.incomingQueue.push(stream);
+		if (this.incomingCb) {
+			this.incomingCb(stream);
+			return;
+		}
+		// Bound un-accepted incoming streams: STOP_SENDING the excess rather than
+		// buffer unbounded when the app hasn't attached an incoming-stream
+		// handler yet.
+		if (this.incomingQueue.length >= MAX_PENDING_INCOMING_STREAMS) {
+			stream.stop(0);
+			return;
+		}
+		this.incomingQueue.push(stream);
 	}
 }
 
