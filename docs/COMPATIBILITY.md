@@ -39,7 +39,9 @@ Constraints that apply regardless of environment:
 - **Certificates**: browser clients pin via `serverCertificateHashes`, which
   requires ECDSA P-256 and validity ≤ 14 days. `generateCert` enforces both.
   Certificate rotation (and hash redistribution to clients) is the consumer's
-  responsibility.
+  responsibility. You can use the `WasmCertRotator` helper class to automatically 
+  generate new certificates ahead of expiry so your server can update its endpoints
+  without downtime.
 - **Host glue**: the consumer supplies packet I/O and timer driving; shipped
   adapters cover Direct Sockets, Bun UDP, and in-memory testing.
 - **API surface**: no `u64`/`BigInt` crosses the wasm boundary (handles are
