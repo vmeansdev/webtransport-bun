@@ -109,7 +109,10 @@ export class WasmEndpoint {
 	onError: ((err: unknown) => void) | null = null;
 	/** Resolved on the next pump() — lets backpressured writers wake on real
 	 * progress (inbound acks / timers) instead of a fixed busy-poll. */
-	private drainWaiters: Array<() => void> = [];
+	private drainWaiters: Array<{
+		fire: () => void;
+		timer: ReturnType<typeof setTimeout>;
+	}> = [];
 
 	private constructor(
 		private wasm: WasmModule,
@@ -264,14 +267,17 @@ export class WasmEndpoint {
 		if (this.closed) return Promise.resolve();
 		return new Promise((resolve) => {
 			let done = false;
-			const fire = () => {
-				if (!done) {
-					done = true;
-					resolve();
-				}
+			const waiter = {
+				fire: () => {
+					if (!done) {
+						done = true;
+						resolve();
+					}
+				},
+				timer: null as any,
 			};
-			this.drainWaiters.push(fire);
-			setTimeout(fire, maxMs);
+			waiter.timer = setTimeout(() => waiter.fire(), maxMs);
+			this.drainWaiters.push(waiter);
 		});
 	}
 
@@ -314,7 +320,10 @@ export class WasmEndpoint {
 		if (this.drainWaiters.length > 0) {
 			const waiters = this.drainWaiters;
 			this.drainWaiters = [];
-			for (const w of waiters) w();
+			for (const w of waiters) {
+				clearTimeout(w.timer);
+				w.fire();
+			}
 		}
 		this.reschedule();
 	}
@@ -412,7 +421,10 @@ export class WasmEndpoint {
 		// Release any parked writers so their promises settle (writes will fail).
 		const waiters = this.drainWaiters;
 		this.drainWaiters = [];
-		for (const w of waiters) w();
+		for (const w of waiters) {
+			clearTimeout(w.timer);
+			w.fire();
+		}
 		this.wasm.wt_close_endpoint(this.eid);
 	}
 }
