@@ -1700,15 +1700,13 @@ function validateServerCertificateHashes(
 				strictW3CErrors,
 			);
 		}
-		if (
-			entry.value == null ||
-			(typeof entry.value === "object" &&
-				"byteLength" in entry &&
-				entry.byteLength === 0)
-		) {
+		// A SHA-256 digest is exactly 32 bytes. The previous check inspected
+		// `entry` (the wrapper) for a `byteLength` it never has, so empty or
+		// malformed hashes passed straight through to the native pin path.
+		if (entry.value.byteLength !== 32) {
 			throw createMappedError(
 				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be non-empty BufferSource",
+				`E_INTERNAL: serverCertificateHashes sha-256 value must be exactly 32 bytes, got ${entry.value.byteLength}`,
 				strictW3CErrors,
 			);
 		}
@@ -2014,12 +2012,18 @@ export class WebTransport {
 						this.#state = "closed";
 						return toCloseInfo(info);
 					}),
-				() => {
-					// Connect failed: closed never rejects (PARITY_MATRIX).
+				(err) => {
+					// Connect failed: per W3C, `closed` rejects with the same
+					// error as `ready` (a resolved {closeCode:0} was
+					// indistinguishable from a clean close).
 					this.#state = "closed";
-					return toCloseInfo({ code: 0, reason: "" });
+					throw err;
 				},
 			);
+			// A consumer may await only `ready` (which also rejects on connect
+			// failure); attach a no-op handler so the spec-correct `closed`
+			// rejection does not surface as an unhandled rejection.
+			this.#closed.catch(() => {});
 		} else {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			this.#congestionControl = options?.congestionControl ?? "default";

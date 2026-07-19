@@ -214,6 +214,12 @@ const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
 
 ### Know before you ship
 
+- **`/wasm` is experimental (0.x) and exempt from the 1.0.0 semver
+  commitment.** The frozen, stability-guaranteed 1.0 API is the native (root)
+  entrypoint. The wasm facade intentionally diverges (callback-style sessions,
+  different close/error semantics) and may change in any minor release until it
+  converges with the native surface. Depend on `/wasm` only if you accept
+  breaking changes.
 - **The in-browser server is Chromium-only, and only inside an Isolated Web
   App.** Direct Sockets `UDPSocket` does not exist on normal web pages, in
   Firefox, or in Safari. Installing an IWA today requires `chrome://flags`
