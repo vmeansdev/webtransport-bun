@@ -375,6 +375,15 @@ impl ClientBidiStreamHandle {
         // Re-check after the (awaited) reservation: finish/reset issued during the
         // park must still win, so the chunk is dropped (releasing its bytes)
         // instead of being written after the FIN.
+        //
+        // This is deterministic under the single-runtime execution model:
+        // finish()/reset() set `finished` synchronously *before* enqueuing their
+        // control command, so a write issued after them is rejected above, and a
+        // write concurrent with them (its future parked here) is rejected by this
+        // re-check. If the send below parks on a full channel, tokio wakes
+        // waiters FIFO, so this Data (registered first) is enqueued ahead of a
+        // later FIN — no reorder. (WHATWG serializes write/close through the
+        // facade anyway; this covers the raw handle.)
         if self.finished.load(Ordering::Acquire) {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         }

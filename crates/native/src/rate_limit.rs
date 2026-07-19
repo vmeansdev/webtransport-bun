@@ -191,7 +191,10 @@ fn release_per_ip_session_inner(server_id: u64, peer_ip: &str) {
             .unwrap_or(0);
         if prev <= 1 {
             drop(entry);
-            PER_IP_SESSIONS.remove(&key);
+            // Only remove if still zero: a concurrent acquire may have
+            // incremented between the decrement above and here — removing then
+            // would drop a live counter (undercount = permissive limit).
+            PER_IP_SESSIONS.remove_if(&key, |_, v| v.load(Ordering::SeqCst) == 0);
         }
     }
 }
@@ -206,7 +209,7 @@ fn release_per_prefix_session_inner(server_id: u64, prefix: &str) {
             .unwrap_or(0);
         if prev <= 1 {
             drop(entry);
-            PER_PREFIX_SESSIONS.remove(&key);
+            PER_PREFIX_SESSIONS.remove_if(&key, |_, v| v.load(Ordering::SeqCst) == 0);
         }
     }
 }
