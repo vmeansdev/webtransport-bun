@@ -143,6 +143,19 @@ describe("parity error and close mapping (P4)", () => {
 		await expect(wt.closed).rejects.toBeInstanceOf(WebTransportError);
 	});
 
+	test("connect failure: observing only closed (never awaiting ready) does not leak an unhandled rejection", async () => {
+		// Both #ready and #closed reject on connect failure; awaiting only one
+		// must not leave the other as an unhandled rejection (process-aborting
+		// under --unhandled-rejections=strict).
+		const wt = new WebTransport("https://127.0.0.1:1", {
+			tls: { insecureSkipVerify: true },
+			limits: { handshakeTimeoutMs: 1500 },
+		});
+		await expect(wt.closed).rejects.toBeInstanceOf(WebTransportError);
+		// Give any unhandled-rejection microtask a tick to fire before the test ends.
+		await Bun.sleep(50);
+	});
+
 	test("createBidirectionalStream applies sendOrder and validates sendGroup ownership", async () => {
 		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
