@@ -129,6 +129,14 @@ describe("parity error and close mapping (P4)", () => {
 					],
 				}),
 		).toThrow(/must be exactly 32 bytes/);
+		// An empty array is a silent pinning downgrade — must be rejected.
+		expect(
+			() =>
+				new WebTransport(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+					serverCertificateHashes: [],
+				}),
+		).toThrow(/must be a non-empty array/);
 	});
 
 	test("closed rejects (not resolves) when the connection fails to establish", async () => {
