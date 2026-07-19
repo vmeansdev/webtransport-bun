@@ -61,6 +61,17 @@ impl Default for RateLimits {
     }
 }
 
+/// Accept a rate/burst float only if it is finite and non-negative. NaN,
+/// Infinity, and negatives from malformed config would otherwise silently
+/// hard-block all traffic (NaN comparisons) or disable the limiter (Infinity);
+/// fall back to the caller's current (default) value instead.
+fn sane_rate(v: Option<f64>, current: f64) -> f64 {
+    match v {
+        Some(n) if n.is_finite() && n >= 0.0 => n,
+        _ => current,
+    }
+}
+
 impl RateLimits {
     pub fn from_json(json: &str) -> Self {
         let mut rl = Self::default();
@@ -71,27 +82,38 @@ impl RateLimits {
             if let Some(n) = v.get("handshakesBurstPerPrefix").and_then(|x| x.as_u64()) {
                 rl.handshakes_burst_per_prefix = n;
             }
-            if let Some(n) = v.get("streamsPerSec").and_then(|x| x.as_f64()) {
-                rl.streams_per_sec = n;
-            }
-            if let Some(n) = v.get("streamsBurst").and_then(|x| x.as_f64()) {
-                rl.streams_burst = n;
-            }
-            if let Some(n) = v.get("datagramsPerSec").and_then(|x| x.as_f64()) {
-                rl.datagrams_per_sec = n;
-            }
-            if let Some(n) = v.get("datagramsBurst").and_then(|x| x.as_f64()) {
-                rl.datagrams_burst = n;
-            }
-            if let Some(n) = v.get("handshakesPerSec").and_then(|x| x.as_f64()) {
-                rl.handshakes_per_sec = n;
-            }
+            rl.streams_per_sec = sane_rate(
+                v.get("streamsPerSec").and_then(|x| x.as_f64()),
+                rl.streams_per_sec,
+            );
+            rl.streams_burst = sane_rate(
+                v.get("streamsBurst").and_then(|x| x.as_f64()),
+                rl.streams_burst,
+            );
+            rl.datagrams_per_sec = sane_rate(
+                v.get("datagramsPerSec").and_then(|x| x.as_f64()),
+                rl.datagrams_per_sec,
+            );
+            rl.datagrams_burst = sane_rate(
+                v.get("datagramsBurst").and_then(|x| x.as_f64()),
+                rl.datagrams_burst,
+            );
+            rl.handshakes_per_sec = sane_rate(
+                v.get("handshakesPerSec").and_then(|x| x.as_f64()),
+                rl.handshakes_per_sec,
+            );
             // Public API: handshakesBurst drives the token-bucket burst.
             // Compat: handshakesBurstTokens accepted as fallback.
-            if let Some(n) = v.get("handshakesBurst").and_then(|x| x.as_f64()) {
-                rl.handshakes_burst = n;
-            } else if let Some(n) = v.get("handshakesBurstTokens").and_then(|x| x.as_f64()) {
-                rl.handshakes_burst = n;
+            if v.get("handshakesBurst").is_some() {
+                rl.handshakes_burst = sane_rate(
+                    v.get("handshakesBurst").and_then(|x| x.as_f64()),
+                    rl.handshakes_burst,
+                );
+            } else if v.get("handshakesBurstTokens").is_some() {
+                rl.handshakes_burst = sane_rate(
+                    v.get("handshakesBurstTokens").and_then(|x| x.as_f64()),
+                    rl.handshakes_burst,
+                );
             }
         }
         rl
@@ -412,6 +434,21 @@ mod tests {
         assert!(try_acquire_stream_open(server_a, &ip, rate, burst));
         assert!(!try_acquire_stream_open(server_a, &ip, rate, burst));
         assert!(try_acquire_stream_open(server_b, &ip, rate, burst));
+    }
+
+    // Malformed rate/burst floats (NaN/Infinity/negative) must not slip into the
+    // limiter (NaN would hard-block all traffic, Infinity would disable it).
+    #[test]
+    fn test_rate_limit_float_sanitization() {
+        let d = RateLimits::default();
+        let nan = RateLimits::from_json(r#"{"streamsPerSec": null, "streamsBurst": -5}"#);
+        assert_eq!(nan.streams_burst, d.streams_burst); // negative rejected
+        let bad =
+            RateLimits::from_json(r#"{"datagramsPerSec": "not-a-number", "handshakesPerSec": -1}"#);
+        assert_eq!(bad.datagrams_per_sec, d.datagrams_per_sec); // non-numeric rejected
+        assert_eq!(bad.handshakes_per_sec, d.handshakes_per_sec); // negative rejected
+        let ok = RateLimits::from_json(r#"{"streamsPerSec": 123.0}"#);
+        assert_eq!(ok.streams_per_sec, 123.0); // finite non-negative accepted
     }
 
     #[test]

@@ -27,6 +27,10 @@ function buildSubjectAltName(names: string[]): string {
 export function generateCertForNames(
 	names: string[],
 	days = 30,
+	// Leaf key type. "ec" produces an ECDSA P-256 leaf, required for
+	// serverCertificateHashes pinning (W3C). Default "rsa" for the many tests
+	// that don't pin.
+	leafKeyType: "rsa" | "ec" = "rsa",
 ): GeneratedCert | null {
 	if (names.length === 0) return null;
 	const dir = mkdtempSync(join(tmpdir(), "webtransport-bun-cert-"));
@@ -66,10 +70,13 @@ export function generateCertForNames(
 			"/CN=webtransport-bun test CA",
 		]);
 
+		const leafKeyArgs =
+			leafKeyType === "ec"
+				? ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
+				: ["-newkey", "rsa:2048"];
 		execFileSync("openssl", [
 			"req",
-			"-newkey",
-			"rsa:2048",
+			...leafKeyArgs,
 			"-sha256",
 			"-nodes",
 			"-keyout",
