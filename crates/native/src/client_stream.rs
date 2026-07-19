@@ -260,6 +260,10 @@ pub struct ClientBidiStreamHandle {
     budget: Option<StreamBudget>,
     write_error_slot: Option<WriteErrorSlot>,
     read_error_slot: Option<ReadErrorSlot>,
+    /// Set once finish/reset is issued so a subsequent write is rejected
+    /// deterministically (a closed stream never accepts more data), instead of
+    /// racing into the channel behind the FIN.
+    finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ClientBidiStreamHandle {
@@ -275,6 +279,7 @@ impl ClientBidiStreamHandle {
             budget: None,
             write_error_slot: None,
             read_error_slot: None,
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -302,6 +307,7 @@ impl ClientBidiStreamHandle {
             budget,
             write_error_slot,
             read_error_slot,
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -339,6 +345,11 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+        // A finished/reset stream never accepts more data: reject deterministically
+        // rather than letting a late write race into the channel behind the FIN.
+        if self.finished.load(Ordering::Acquire) {
+            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+        }
         if let Some(ref slot) = self.write_error_slot {
             if let Ok(guard) = slot.lock() {
                 if let Some(ref code) = *guard {
@@ -361,6 +372,12 @@ impl ClientBidiStreamHandle {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
+        // Re-check after the (awaited) reservation: finish/reset issued during the
+        // park must still win, so the chunk is dropped (releasing its bytes)
+        // instead of being written after the FIN.
+        if self.finished.load(Ordering::Acquire) {
+            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+        }
         let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
         // On send failure the chunk drops here, releasing its reservation.
         if tx.send(StreamCmd::Data(chunk)).await.is_err() {
@@ -371,6 +388,7 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn reset(&self, code: u32) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
         Ok(())
     }
@@ -389,12 +407,14 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn finish(&self) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
         Ok(())
     }
 
     #[napi]
     pub async fn finish_wait(&self) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
         let Some(ref tx) = self.write_tx else {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         };
@@ -419,6 +439,8 @@ pub struct ClientUniSendHandle {
     write_tx: Option<mpsc::Sender<StreamCmd>>,
     budget: Option<StreamBudget>,
     write_error_slot: Option<WriteErrorSlot>,
+    /// See `ClientBidiStreamHandle::finished`.
+    finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ClientUniSendHandle {
@@ -427,6 +449,7 @@ impl ClientUniSendHandle {
             write_tx: Some(write_tx),
             budget: None,
             write_error_slot: None,
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -446,6 +469,7 @@ impl ClientUniSendHandle {
             write_tx: Some(write_tx),
             budget,
             write_error_slot,
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -454,6 +478,9 @@ impl ClientUniSendHandle {
 impl ClientUniSendHandle {
     #[napi]
     pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+        }
         if let Some(ref slot) = self.write_error_slot {
             if let Ok(guard) = slot.lock() {
                 if let Some(ref code) = *guard {
@@ -476,6 +503,9 @@ impl ClientUniSendHandle {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
+        if self.finished.load(Ordering::Acquire) {
+            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+        }
         let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
         // On send failure the chunk drops here, releasing its reservation.
         if tx.send(StreamCmd::Data(chunk)).await.is_err() {
@@ -486,18 +516,21 @@ impl ClientUniSendHandle {
 
     #[napi]
     pub fn reset(&self, code: u32) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
         Ok(())
     }
 
     #[napi]
     pub fn finish(&self) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
         Ok(())
     }
 
     #[napi]
     pub async fn finish_wait(&self) -> Result<()> {
+        self.finished.store(true, Ordering::Release);
         let Some(ref tx) = self.write_tx else {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         };

@@ -477,7 +477,7 @@ pub(crate) fn spawn_wtransport_server(
                                 let peer_addr = session_request.remote_address();
                                 let peer_ip = peer_addr.ip().to_string();
                                 let peer_port = peer_addr.port() as u32;
-                                if !rate_limit::try_acquire_handshake(
+                                if !rate_limit::try_acquire_handshake(owner_server_id,
                                     &peer_ip,
                                     rate_limits.handshakes_per_sec,
                                     rate_limits.handshakes_burst,
@@ -488,7 +488,7 @@ pub(crate) fn spawn_wtransport_server(
                                     session_request.too_many_requests().await;
                                     return;
                                 }
-                                if !rate_limit::try_acquire_per_ip_session_with_prefix(
+                                if !rate_limit::try_acquire_per_ip_session_with_prefix(owner_server_id,
                                     &peer_ip,
                                     rate_limits.handshakes_burst_per_ip,
                                     rate_limits.handshakes_burst_per_prefix,
@@ -513,7 +513,7 @@ pub(crate) fn spawn_wtransport_server(
                                     )
                                     .await;
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    rate_limit::release_per_ip_session(&peer_ip);
+                                    rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
                                             connection.close(
@@ -566,7 +566,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        rate_limit::release_per_ip_session(&peer_ip);
+                                        rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
                                         emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
                                     }
@@ -640,7 +640,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_bidi.closed() => break,
                                                         res = conn_bidi.accept_bi() => {
                                                             let Ok((mut send, recv)) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
                                                                 m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = send.reset(0u32.into());
                                                                 continue;
@@ -703,7 +703,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_uni.closed() => break,
                                                         res = conn_uni.accept_uni() => {
                                                             let Ok(recv) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
                                                                 m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 recv.stop(0u32.into());
                                                                 continue;
@@ -920,8 +920,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                         close_reason = reason2;
                                                                     }
                                                                     session_registry::remove(&id);
-                                                                    rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                                    m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                                    rate_limit::release_per_ip_session(owner_server_id, &peer_ip_for_release);
+                                                                    m_dgram.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
                                                                             .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
@@ -939,7 +939,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             };
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                                                            if !rate_limit::try_acquire_datagram_ingress(&peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
+                                                            if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
                                                                 m_dgram.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
                                                                 continue;
@@ -989,8 +989,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 }
                                                             }
                                                             session_registry::remove(&id);
-                                                            rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                            m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                            rate_limit::release_per_ip_session(owner_server_id, &peer_ip_for_release);
+                                                            m_dgram.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
                                                                     .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
@@ -1008,8 +1008,8 @@ pub(crate) fn spawn_wtransport_server(
                                                     }
                                                 }
                                                 session_registry::remove(&id);
-                                                rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                rate_limit::release_per_ip_session(owner_server_id, &peer_ip_for_release);
+                                                m_dgram.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
                                                         .send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
@@ -1028,7 +1028,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(e) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        rate_limit::release_per_ip_session(&peer_ip);
+                                        rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());

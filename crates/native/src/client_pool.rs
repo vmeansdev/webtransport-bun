@@ -107,8 +107,13 @@ impl ClientPoolManager {
         let (entry, was_hit) = {
             let mut guard = self.entries.lock().map_err(|_| "pool lock poisoned")?;
             self.evict_idle_under_lock(&mut guard);
-            if guard.len() >= MAX_POOL_ENTRIES {
-                self.evict_one_under_lock(&mut guard);
+            // Only a brand-new key needs headroom. If the pool is full and no
+            // idle entry can be evicted, reject rather than growing past the cap.
+            if !guard.contains_key(&key)
+                && guard.len() >= MAX_POOL_ENTRIES
+                && !self.evict_one_under_lock(&mut guard)
+            {
+                return Err("E_LIMIT_EXCEEDED: connection pool full".into());
             }
             match guard.get(&key) {
                 Some(ent) => {
@@ -200,8 +205,9 @@ impl ClientPoolManager {
         }
     }
 
-    fn evict_one_under_lock(&self, guard: &mut HashMap<PoolKey, Arc<PoolEntry>>) {
-        let _now = now_ms();
+    /// Evict the least-recently-used idle entry. Returns whether an entry was
+    /// evicted (false means every entry is busy, so the pool cannot shrink).
+    fn evict_one_under_lock(&self, guard: &mut HashMap<PoolKey, Arc<PoolEntry>>) -> bool {
         let victim = guard
             .iter()
             .filter(|(_, ent)| ent.active_refs.load(Ordering::Relaxed) == 0)
@@ -210,6 +216,9 @@ impl ClientPoolManager {
         if let Some(k) = victim {
             guard.remove(&k);
             POOL_EVICT_IDLE.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 }
