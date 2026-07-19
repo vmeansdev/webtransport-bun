@@ -122,7 +122,16 @@ function normalizeToBrowserName(
 	) {
 		return "NotSupportedError";
 	}
-	if (message.includes("serverCertificateHashes must be an array")) {
+	// Unsupported hash algorithm → NotSupportedError (W3C).
+	if (message.includes("serverCertificateHashes only supports algorithm")) {
+		return "NotSupportedError";
+	}
+	if (
+		message.includes("serverCertificateHashes must be an array") ||
+		message.includes("serverCertificateHashes must be a non-empty array") ||
+		message.includes("serverCertificateHashes sha-256 value must be exactly") ||
+		message.includes("serverCertificateHashes valueBase64 must be")
+	) {
 		return "TypeError";
 	}
 	if (
@@ -1278,12 +1287,21 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				resolve({ code: 0, reason: "server closed" });
 			}
 			if (activeOnSessionCallbacks > 0) {
-				await Promise.race([
-					new Promise<void>((r) => {
-						onSessionDrainResolve = r;
-					}),
-					new Promise<void>((r) => setTimeout(r, 5000)),
-				]);
+				// Clear the timeout timer if the drain wins the race, so it does
+				// not keep the event loop alive up to 5s after close() resolves.
+				let drainTimer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						new Promise<void>((r) => {
+							onSessionDrainResolve = r;
+						}),
+						new Promise<void>((r) => {
+							drainTimer = setTimeout(r, 5000);
+						}),
+					]);
+				} finally {
+					if (drainTimer !== undefined) clearTimeout(drainTimer);
+				}
 			}
 		},
 		metricsSnapshot: () => handle.metricsSnapshot(),
@@ -1625,6 +1643,9 @@ export async function connect(
 		});
 	}
 
+	if (opts?.serverCertificateHashes !== undefined) {
+		validateServerCertificateHashesBase64(opts.serverCertificateHashes);
+	}
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
 	const tlsOpts = opts?.tls
 		? {
@@ -1722,6 +1743,62 @@ function bufferSourceToUint8(value: BufferSource): Uint8Array {
 		E_INTERNAL as ErrorCode,
 		"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
 	);
+}
+
+/**
+ * Validate the base64 `serverCertificateHashes` shape used by the low-level
+ * `connect()` API (unlike the `WebTransport` facade, which takes BufferSource).
+ * Rejects a non-array, an empty array (silent pinning downgrade), a non-sha-256
+ * algorithm, and a `valueBase64` that does not decode to exactly 32 bytes —
+ * before the value reaches the native pin path.
+ */
+function validateServerCertificateHashesBase64(
+	hashes: Array<{ algorithm: "sha-256"; valueBase64: string }>,
+): void {
+	if (!Array.isArray(hashes)) {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			"E_INTERNAL: serverCertificateHashes must be an array",
+		);
+	}
+	if (hashes.length === 0) {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			"E_INTERNAL: serverCertificateHashes must be a non-empty array",
+		);
+	}
+	for (const entry of hashes) {
+		if (entry.algorithm !== "sha-256") {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				`E_INTERNAL: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
+			);
+		}
+		if (
+			typeof entry.valueBase64 !== "string" ||
+			entry.valueBase64.length === 0
+		) {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				"E_INTERNAL: serverCertificateHashes valueBase64 must be a non-empty base64 string",
+			);
+		}
+		let decodedLen: number;
+		try {
+			decodedLen = Buffer.from(entry.valueBase64, "base64").length;
+		} catch {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				"E_INTERNAL: invalid base64 in serverCertificateHashes",
+			);
+		}
+		if (decodedLen !== 32) {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				`E_INTERNAL: serverCertificateHashes sha-256 value must be exactly 32 bytes, got ${decodedLen}`,
+			);
+		}
+	}
 }
 
 function bufferSourceToBase64(value: BufferSource): string {
@@ -2067,6 +2144,16 @@ export class WebTransport {
 		this.#draining = new Promise<void>((r) => {
 			this.#drainingResolve = r;
 		});
+		// `draining` also resolves when the session enters its closing phase via a
+		// remote/server-initiated close (not just local close()). Without this, a
+		// consumer awaiting `draining` to detect server shutdown would hang
+		// forever. `#drainingResolve` is idempotent, so a later local close() is
+		// harmless. (Both settle paths handled so a connect-failure rejection
+		// doesn't leave draining pending or surface unhandled.)
+		this.#closed.then(
+			() => this.#drainingResolve?.(),
+			() => this.#drainingResolve?.(),
+		);
 	}
 
 	/** Resolves when handshake completes. Rejects with WebTransportError on connect failure. */
@@ -2207,7 +2294,12 @@ export class WebTransport {
 		if (this.#state === "failed") {
 			throw new DOMException("Transport has failed", "InvalidStateError");
 		}
-		const s = await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		// If getStats() is called while still connecting and the connect then
+		// fails, awaiting #sessionPromise rejects with the raw connect error;
+		// surface the consistent InvalidStateError instead.
+		const s = await this.#sessionPromise.catch(() => {
+			throw new DOMException("Transport has failed", "InvalidStateError");
+		});
 		// Prefer wire-level QUIC stats from the native layer; fall back to
 		// facade byte tallies only when the native call is unavailable.
 		const quic = (

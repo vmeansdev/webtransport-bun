@@ -64,6 +64,11 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		super({
 			...opts,
 			allowHalfOpen: true,
+			// autoDestroy stays false: it interferes with the separately-exposed
+			// Web Readable/Writable lifecycle. Instead we free the native handle
+			// explicitly once BOTH halves complete (see the end/finish listeners
+			// below) — previously the handle was stranded until GC on a bidi
+			// stream that completed cleanly.
 			autoDestroy: false,
 			readableHighWaterMark: opts.readableHighWaterMark ?? 256 * 1024,
 			writableHighWaterMark: opts.writableHighWaterMark ?? 256 * 1024,
@@ -72,6 +77,26 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		this.#nativeHandle = opts.nativeHandle;
 		this.#strictStreamErrors =
 			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		// Free the native handle when the stream completes cleanly: with
+		// autoDestroy:false, a bidi stream whose readable reaches EOF and whose
+		// writable finishes never runs _destroy() on its own, stranding the
+		// native handle until GC. Destroy once BOTH halves are done (half-open
+		// lifetimes are preserved because we wait for both events).
+		let readableEnded = false;
+		let writableFinished = false;
+		const freeWhenBothDone = () => {
+			if (readableEnded && writableFinished && !this.#destroyed) {
+				this.destroy();
+			}
+		};
+		this.once("end", () => {
+			readableEnded = true;
+			freeWhenBothDone();
+		});
+		this.once("finish", () => {
+			writableFinished = true;
+			freeWhenBothDone();
+		});
 		this.on("error", (err) => {
 			if (this.listenerCount("error") > 1) return;
 			const e = normalizeError(err);
