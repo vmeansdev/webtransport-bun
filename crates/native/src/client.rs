@@ -508,6 +508,14 @@ impl ClientSessionHandle {
                         Err(wtransport::error::SendDatagramError::TooLarge) => break,
                     }
                 }
+                // The loop can break with datagrams still buffered; release
+                // their reserved bytes so the reservation is not stranded in
+                // `queued_bytes` until the handle is dropped.
+                while let Ok(bytes) = dgram_send_rx.try_recv() {
+                    cm_send
+                        .queued_bytes
+                        .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                }
             });
 
             let cm_recv = Arc::clone(&cm);

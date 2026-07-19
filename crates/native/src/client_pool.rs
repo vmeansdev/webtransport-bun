@@ -117,8 +117,16 @@ impl ClientPoolManager {
             }
             match guard.get(&key) {
                 Some(ent) => {
-                    let refs = ent.active_refs.load(Ordering::Relaxed);
-                    if refs >= MAX_SESSIONS_PER_KEY {
+                    // Reserve a ref atomically under the pool lock: a plain
+                    // load-check then increment-after-unlock let N concurrent
+                    // acquirers each pass the cap and overshoot it by N-1.
+                    if ent
+                        .active_refs
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
+                            (r < MAX_SESSIONS_PER_KEY).then_some(r + 1)
+                        })
+                        .is_err()
+                    {
                         return Err("E_LIMIT_EXCEEDED: max sessions per pool key".into());
                     }
                     (Arc::clone(ent), true)
@@ -126,8 +134,10 @@ impl ClientPoolManager {
                 None => {
                     let endpoint = create_endpoint()?;
                     let ent = Arc::new(PoolEntry {
+                        // Starts at 1: this caller's reserved ref (no external
+                        // increment below, so the cap is never overshot).
                         endpoint,
-                        active_refs: AtomicU64::new(0),
+                        active_refs: AtomicU64::new(1),
                         last_used_ms: AtomicU64::new(now_ms()),
                     });
                     guard.insert(key.clone(), Arc::clone(&ent));
@@ -141,8 +151,6 @@ impl ClientPoolManager {
         } else {
             POOL_MISSES.fetch_add(1, Ordering::Relaxed);
         }
-
-        entry.active_refs.fetch_add(1, Ordering::Relaxed);
         let connect_result = tokio::time::timeout(
             tokio::time::Duration::from_millis(handshake_timeout_ms),
             entry.endpoint.connect(connect_url),
