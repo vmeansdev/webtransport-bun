@@ -47,3 +47,55 @@ export function serverCertificateHashes(
 ): Array<{ algorithm: "sha-256"; value: Uint8Array }> {
 	return [{ algorithm: "sha-256", value: base64ToBytes(cert.hashBase64) }];
 }
+
+/**
+ * Helper to manage the 14-day P-256 certificate rotation treadmill for wasm servers.
+ * Generates a new certificate ahead of expiry and surfaces it for distribution.
+ */
+export class WasmCertRotator {
+	public currentCert: GeneratedCert;
+	private timer: ReturnType<typeof setTimeout> | null = null;
+	private stopped = false;
+
+	constructor(
+		private wasm: WasmCertModule,
+		private commonName = "localhost",
+		private validityDays = 14,
+		/** Callback invoked when a new cert is generated (for server update and hash redistribution). */
+		private onRotate: (cert: GeneratedCert) => void,
+	) {
+		this.currentCert = generateCert(
+			this.wasm,
+			this.commonName,
+			this.validityDays,
+		);
+		this.scheduleNext();
+	}
+
+	private scheduleNext() {
+		// Rotate 2 days before the certificate expires.
+		const rotateInDays = Math.max(1, this.validityDays - 2);
+		const rotateInMs = rotateInDays * 24 * 60 * 60 * 1000;
+		this.timer = setTimeout(() => this.rotate(), rotateInMs);
+	}
+
+	private rotate() {
+		if (this.stopped) return;
+		this.currentCert = generateCert(
+			this.wasm,
+			this.commonName,
+			this.validityDays,
+		);
+		this.onRotate(this.currentCert);
+		this.scheduleNext();
+	}
+
+	/** Stop the rotation timer. */
+	stop() {
+		this.stopped = true;
+		if (this.timer) {
+			clearTimeout(this.timer);
+			this.timer = null;
+		}
+	}
+}
