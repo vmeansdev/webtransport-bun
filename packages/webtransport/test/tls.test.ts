@@ -88,6 +88,27 @@ describe("TLS contract (P0.3)", () => {
 		}
 	}, 15000);
 
+	it("connect accepts client idleTimeoutMs and keepAliveIntervalMs and still connects", async () => {
+		// Exercises the client liveness config plumbing (idle timeout + keep-alive)
+		// and confirms the defaults/overrides don't break a normal connection.
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true, serverName: "localhost" },
+				limits: { idleTimeoutMs: 20_000, keepAliveIntervalMs: 5_000 },
+			});
+			expect(client.id).toBeDefined();
+			client.close();
+		} finally {
+			await server.close();
+		}
+	}, 15000);
+
 	it("connect with serverName and caPem passes strict SNI/cert verification (when certs available)", async () => {
 		if (!generatedCert) return;
 		const port = nextPort(24460, 2000);
