@@ -26,10 +26,14 @@ fn alloc_id() -> u32 {
     })
 }
 
-/// Create a test/dev endpoint. Returns the numeric eid on success, or 0 on a
-/// bad address (0 is never a valid eid — allocation starts at 1). CLIENT
-/// endpoints created here accept ANY server cert — use `wt_new_client` in
-/// production.
+/// Create an endpoint. Returns the numeric eid on success, or 0 on a bad
+/// address (0 is never a valid eid — allocation starts at 1).
+///
+/// SECURITY: a CLIENT endpoint (`is_server == false`) created here accepts ANY
+/// server certificate. That insecure client path is compiled ONLY when the
+/// `dev-insecure` cargo feature is enabled; a default (production) build returns
+/// 0 for `is_server == false` and callers must use `wt_new_client` (hash
+/// pinning). Server endpoints are always available.
 #[wasm_bindgen]
 pub fn wt_new_endpoint(is_server: bool, addr: &str, peer_addr: &str) -> u32 {
     // Never panic across the FFI: a wasm panic aborts and poisons REGISTRY for
@@ -37,6 +41,10 @@ pub fn wt_new_endpoint(is_server: bool, addr: &str, peer_addr: &str) -> u32 {
     let (Ok(addr), Ok(peer)) = (addr.parse(), peer_addr.parse()) else {
         return 0;
     };
+    if !is_server && !cfg!(feature = "dev-insecure") {
+        // Accept-any client is not available in a production build.
+        return 0;
+    }
     let ep = WtEndpoint::new(is_server, addr, peer);
     let id = alloc_id();
     REGISTRY.with(|r| r.borrow_mut().insert(id, ep));

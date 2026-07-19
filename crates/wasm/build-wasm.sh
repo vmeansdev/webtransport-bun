@@ -38,12 +38,21 @@ if ! command -v wasm-bindgen >/dev/null 2>&1; then
   exit 1
 fi
 
-"${CARGO[@]}" build --release --target wasm32-unknown-unknown
+# The `pkg` (test) build enables the accept-any client so the wasm test suite
+# can dial without pinning. The shipped `dist`/`web` builds do NOT — the
+# accept-any code is compiled out, so a production artifact cannot skip cert
+# verification.
+MODE="${1:-pkg}"
+FEATURES=()
+if [ "$MODE" = "pkg" ]; then
+  FEATURES=(--features dev-insecure)
+fi
+"${CARGO[@]}" build --release --target wasm32-unknown-unknown "${FEATURES[@]}"
 WASM=target/wasm32-unknown-unknown/release/webtransport_wasm.wasm
 
 # Modes: pkg (default) -> crates/wasm/pkg for tests; web -> the IWA example's
 # vendor dir; dist -> the npm package's shipped wasm-dist/{node,web}.
-case "${1:-pkg}" in
+case "$MODE" in
   pkg)
     wasm-bindgen "$WASM" --out-dir pkg --target nodejs --out-name webtransport_wasm
     echo "[build-wasm] done -> pkg/"
