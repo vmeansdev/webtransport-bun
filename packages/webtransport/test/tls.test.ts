@@ -43,6 +43,32 @@ async function connectWithRetry(
 }
 
 describe("TLS contract (P0.3)", () => {
+	it("connect() validates serverCertificateHashes (base64 shape) before dialing", async () => {
+		// Empty array = silent pinning downgrade.
+		await expect(
+			connect("https://127.0.0.1:65530", { serverCertificateHashes: [] }),
+		).rejects.toThrow(/must be a non-empty array/);
+		// Wrong decoded length (2 bytes, not 32).
+		await expect(
+			connect("https://127.0.0.1:65530", {
+				serverCertificateHashes: [
+					{ algorithm: "sha-256", valueBase64: "AAA=" },
+				],
+			}),
+		).rejects.toThrow(/must be exactly 32 bytes/);
+		// Unsupported algorithm.
+		await expect(
+			connect("https://127.0.0.1:65530", {
+				serverCertificateHashes: [
+					{
+						algorithm: "sha-384" as "sha-256",
+						valueBase64: Buffer.alloc(32).toString("base64"),
+					},
+				],
+			}),
+		).rejects.toThrow(/only supports algorithm/);
+	});
+
 	it("connect with serverName override uses host for SNI (connect-path smoke)", async () => {
 		const port = nextPort(24460, 2000);
 		const server = createServer({

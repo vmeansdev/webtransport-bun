@@ -151,6 +151,27 @@ describe("parity error and close mapping (P4)", () => {
 		await expect(wt.closed).rejects.toBeInstanceOf(WebTransportError);
 	});
 
+	test("draining resolves (does not hang) when the session closes without a local close()", async () => {
+		// `draining` must resolve when the session enters its closing phase from
+		// something other than a local close() — here a failed connect settles
+		// `closed`, which resolves `draining`. Previously it only resolved via
+		// local close() and would hang forever otherwise.
+		const wt = new WebTransport("https://127.0.0.1:1", {
+			tls: { insecureSkipVerify: true },
+			limits: { handshakeTimeoutMs: 1500 },
+		});
+		wt.closed.catch(() => {});
+		wt.ready.catch(() => {});
+		await expect(
+			Promise.race([
+				wt.draining,
+				new Promise((_, reject) =>
+					setTimeout(() => reject(new Error("draining hung")), 5000),
+				),
+			]),
+		).resolves.toBeUndefined();
+	});
+
 	test("connect failure: observing only closed (never awaiting ready) does not leak an unhandled rejection", async () => {
 		// Both #ready and #closed reject on connect failure; awaiting only one
 		// must not leave the other as an unhandled rejection (process-aborting
