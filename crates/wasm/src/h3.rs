@@ -390,6 +390,65 @@ pub fn unwrap_datagram(buf: &[u8]) -> Option<(u64, &[u8])> {
 mod tests {
     use super::*;
 
+    /// Deterministic, dependency-free xorshift64* PRNG for reproducible
+    /// robustness fuzzing of the hand-rolled parsers.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+            let len = (self.next_u64() as usize) % (max_len + 1);
+            (0..len).map(|_| self.next_u64() as u8).collect()
+        }
+    }
+
+    // Robustness fuzz: feed many random + adversarial byte sequences to every
+    // hand-rolled H3/QPACK parser and assert none panics (a panic in wasm
+    // aborts and poisons the whole registry). Returning None/Some is fine — the
+    // property under test is "never panics on hostile input".
+    #[test]
+    fn parsers_never_panic_on_random_input() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..200_000 {
+            let buf = rng.bytes(64);
+            let _ = crate::varint::decode(&buf);
+            let _ = qpack_int_decode(&buf, (rng.next_u64() as u8 & 7) + 1);
+            let _ = parse_settings(&buf);
+            let _ = decode_literal_headers(&buf);
+            let _ = unwrap_datagram(&buf);
+        }
+    }
+
+    // Structured adversarial inputs: valid-looking frames with mutated /
+    // maximal varint length fields, all-continuation QPACK integers, and
+    // truncations — the paths most likely to overflow or over-allocate.
+    #[test]
+    fn parsers_never_panic_on_structured_adversarial_input() {
+        // QPACK integer with the maximum continuation run.
+        let mut overlong = vec![0xffu8];
+        overlong.extend(std::iter::repeat(0x80u8).take(64));
+        overlong.push(0x00);
+        assert!(qpack_int_decode(&overlong, 8).is_none());
+
+        // SETTINGS payload whose declared varint lengths are maximal.
+        let mut settings = Vec::new();
+        crate::varint::encode(u64::MAX, &mut settings); // id
+        crate::varint::encode(u64::MAX, &mut settings); // value
+        let _ = parse_settings(&settings);
+
+        // Truncations of a valid datagram wrapper must not panic.
+        let wrapped = wrap_datagram(8, b"payload");
+        for cut in 0..=wrapped.len() {
+            let _ = unwrap_datagram(&wrapped[..cut]);
+        }
+    }
+
     #[test]
     fn control_preamble_roundtrips_settings() {
         let buf = encode_control_preamble(16);
