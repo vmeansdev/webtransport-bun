@@ -2006,6 +2006,14 @@ export class WebTransport {
 					throw err;
 				},
 			);
+			// Symmetric to `#closed` below: a consumer may observe only `closed`
+			// (e.g. via nativeToWebTransportLike, which forwards `ready`
+			// untouched) and never await `ready`. Attach a no-op handler so a
+			// connect-failure rejection on `ready` does not surface as an
+			// unhandled rejection (which aborts under
+			// --unhandled-rejections=strict). The getter returns this same
+			// rejecting promise, so awaiters still see the error.
+			this.#ready.catch(() => {});
 			this.#closed = this.#sessionPromise.then(
 				(s) =>
 					s.closed.then((info) => {
