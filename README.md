@@ -105,11 +105,16 @@ Detailed migration playbook:
 - AI-agent entrypoint: `llms.txt`
 
 ## Status
-- In active hardening.
-- Version: `0.3.0` (release candidate, not yet stable/GA).
+- Native surface is a release candidate: `1.0.0-rc.1`.
+- Version: `1.0.0-rc.1` (RC — not yet stable/GA). The frozen surface is the
+  native (root) entrypoint; the `/wasm` subpath is experimental/0.x and exempt
+  from the 1.0 semver commitment.
 - Runtime support: Bun (`>= 1.3.9`), Node, Deno.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
-- Known limits: Chromium-focused browser interop target, API still stabilizing through the `0.3.0` RC window.
+- Known limits: Chromium-focused browser interop target. The RC has zero known
+  P0/P1/P2 defects (verified by multi-pass adversarial review); the full "10M
+  DAU"-scale production claim still awaits the evidence gates in
+  `docs/RELEASE_1.0_STATUS.md` (green remote CI, multi-day soak, scale load).
 
 ## Support Matrix
 

@@ -59,5 +59,5 @@ no BigInt interop or JSON-serialization surprises.
 
 ## Is this production-ready?
 
-Project is at `0.3.0`: a release candidate with strong CI/interop/load evidence, while API/stability continue to be tightened before stable.
+Project is at `1.0.0-rc.1`: a release candidate for the native surface with zero known P0/P1/P2 defects (multi-pass adversarial review), while the full production-scale evidence (remote CI, multi-day soak, scale load) is gathered before a stable `1.0.0` tag. See `docs/RELEASE_1.0_STATUS.md`.
 Review `docs/TESTPLAN.md`, `docs/CI.md`, and `docs/OPERATIONS.md` before production rollout.
