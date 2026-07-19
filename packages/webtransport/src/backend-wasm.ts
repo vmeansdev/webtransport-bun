@@ -375,10 +375,14 @@ export class WasmEndpoint {
 			clearTimeout(this.timer);
 			this.timer = null;
 		}
+		// close() clears the timer, but guard here and in the callback too so a
+		// timer that fires during the close race never calls wt_* on a freed eid.
+		if (this.closed) return;
 		const ms = this.wasm.wt_next_timeout_ms(this.eid);
 		if (ms >= 0) {
 			this.timer = setTimeout(
 				() => {
+					if (this.closed) return;
 					this.wasm.wt_handle_timeout(this.eid);
 					this.pump();
 				},
@@ -389,6 +393,10 @@ export class WasmEndpoint {
 
 	/** Close ONE connection (CONNECTION_CLOSE to the peer); others unaffected. */
 	closeConn(conn: number, code = 0, reason = ""): void {
+		// Guard like every other op: after close() freed the eid, calling
+		// wt_close_conn on it is a use-after-free. Reachable via
+		// WasmWebTransport.close() → session.close() → mgr.closeSession().
+		if (this.closed) return;
 		this.wasm.wt_close_conn(this.eid, conn, code, reason);
 		this.pump();
 	}
