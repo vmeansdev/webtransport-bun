@@ -187,13 +187,21 @@ export class WasmEndpoint {
 		return new WasmEndpoint(wasm, udp, eid, events);
 	}
 
+	// Every operation calls a wt_* function on this.eid. After close() has freed
+	// the wasm-side endpoint (wt_close_endpoint), that eid is invalid and may be
+	// reused by a later endpoint, so any call here would be a use-after-free (or
+	// cross-endpoint injection). Guard each with `closed` — a parked writer whose
+	// promise is released during close() can otherwise loop back into
+	// streamWrite() as a microtask after the eid is freed.
 	connect(authority: string): number {
+		if (this.closed) return 0;
 		const conn = this.wasm.wt_connect(this.eid, authority);
 		this.pump();
 		return conn;
 	}
 
 	sendDatagram(conn: number, data: Uint8Array): boolean {
+		if (this.closed) return false;
 		const ok = this.wasm.wt_send_datagram(this.eid, conn, data);
 		this.pump();
 		return ok;
@@ -201,12 +209,16 @@ export class WasmEndpoint {
 
 	/** Open a WebTransport stream; returns its handle or -1. */
 	openStream(conn: number, bidi: boolean): number {
+		if (this.closed) return -1;
 		const s = this.wasm.wt_open_stream(this.eid, conn, bidi);
 		this.pump();
 		return s;
 	}
 
 	streamWrite(stream: number, data: Uint8Array): number {
+		// -1 (not 0) so a parked writeAll loop throws "stream write failed"
+		// and terminates instead of busy-looping on zero progress.
+		if (this.closed) return -1;
 		const n = this.wasm.wt_stream_write(this.eid, stream, data);
 		this.pump();
 		return n;
@@ -214,27 +226,32 @@ export class WasmEndpoint {
 
 	/** Pause reading a stream — QUIC flow control throttles the sender. */
 	streamPause(stream: number): void {
+		if (this.closed) return;
 		this.wasm.wt_stream_pause(this.eid, stream);
 	}
 
 	/** Resume a paused stream; pump so buffered data and window updates flow. */
 	streamResume(stream: number): void {
+		if (this.closed) return;
 		this.wasm.wt_stream_resume(this.eid, stream);
 		this.pump();
 	}
 
 	streamFinish(stream: number): void {
+		if (this.closed) return;
 		this.wasm.wt_stream_finish(this.eid, stream);
 		this.pump();
 	}
 
 	streamReset(stream: number, code: number): void {
+		if (this.closed) return;
 		this.wasm.wt_stream_reset(this.eid, stream, code);
 		this.pump();
 	}
 
 	/** STOP_SENDING on the recv half (cancel an incoming readable). */
 	streamStop(stream: number, code: number): void {
+		if (this.closed) return;
 		this.wasm.wt_stream_stop(this.eid, stream, code);
 		this.pump();
 	}

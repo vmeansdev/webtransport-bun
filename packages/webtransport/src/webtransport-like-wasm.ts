@@ -13,6 +13,11 @@
 import type { WasmSession, WasmStream } from "./backend.js";
 import type { WebTransportLike, WtBidiStream, WtCloseInfo } from "./shared.js";
 
+/** Caps on the async queues bridging the wasm push-callback source to the
+ * WHATWG-style async iterables, so a flood with a slow consumer can't OOM. */
+const MAX_QUEUED_DATAGRAMS = 1024;
+const MAX_QUEUED_INCOMING_STREAMS = 256;
+
 /**
  * A tiny async queue that bridges a push-callback source to an async-iterable.
  * Items pushed before a consumer is waiting are buffered (preserving order); a
@@ -24,11 +29,31 @@ class AsyncQueue<T> {
 	private readonly waiters: Array<(r: IteratorResult<T>) => void> = [];
 	private done = false;
 
+	/**
+	 * @param maxItems Cap on buffered items when no consumer is waiting — a
+	 *   peer flooding faster than a slow/absent consumer drains cannot grow
+	 *   memory without bound.
+	 * @param onDrop Invoked for the oldest item evicted when the cap is hit
+	 *   (e.g. reset a dropped incoming stream). Omit for lossy sources
+	 *   (datagrams).
+	 */
+	constructor(
+		private readonly maxItems: number,
+		private readonly onDrop?: (item: T) => void,
+	) {}
+
 	push(item: T): void {
 		if (this.done) return;
 		const waiter = this.waiters.shift();
-		if (waiter) waiter({ value: item, done: false });
-		else this.items.push(item);
+		if (waiter) {
+			waiter({ value: item, done: false });
+			return;
+		}
+		if (this.items.length >= this.maxItems) {
+			const dropped = this.items.shift();
+			if (dropped !== undefined) this.onDrop?.(dropped);
+		}
+		this.items.push(item);
 	}
 
 	close(): void {
@@ -134,9 +159,28 @@ function toBidi(stream: WasmStream): WtBidiStream {
 export class WasmWebTransport implements WebTransportLike {
 	readonly ready: Promise<void>;
 	readonly closed: Promise<WtCloseInfo>;
-	private readonly datagrams = new AsyncQueue<Uint8Array>();
-	private readonly bidiStreams = new AsyncQueue<WtBidiStream>();
-	private readonly uniStreams = new AsyncQueue<ReadableStream<Uint8Array>>();
+	private readonly datagrams = new AsyncQueue<Uint8Array>(MAX_QUEUED_DATAGRAMS);
+	private readonly bidiStreams = new AsyncQueue<WtBidiStream>(
+		MAX_QUEUED_INCOMING_STREAMS,
+		(s) => {
+			// Drop the oldest un-consumed incoming stream by cancelling both
+			// halves so it doesn't leak.
+			try {
+				void s.readable.cancel();
+			} catch {}
+			try {
+				void s.writable.abort();
+			} catch {}
+		},
+	);
+	private readonly uniStreams = new AsyncQueue<ReadableStream<Uint8Array>>(
+		MAX_QUEUED_INCOMING_STREAMS,
+		(r) => {
+			try {
+				void r.cancel();
+			} catch {}
+		},
+	);
 	private incomingStarted = false;
 
 	constructor(private readonly session: WasmSession) {

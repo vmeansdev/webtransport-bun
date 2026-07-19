@@ -22,6 +22,8 @@ export { WasmWebTransport } from "./webtransport-like-wasm.js";
  */
 const MAX_PENDING_DATAGRAMS = 1024;
 const MAX_PENDING_INCOMING_STREAMS = 256;
+/** Per-stream cap on inbound bytes buffered before the app attaches onData. */
+const MAX_PENDING_STREAM_BYTES = 1 << 20; // 1 MiB
 
 /** True when the wasm backend should be used (Direct Sockets available). */
 export function isWasmRuntime(): boolean {
@@ -42,6 +44,7 @@ export class WasmStream {
 	private resetCb: ((code: number) => void) | null = null;
 	private stoppedCb: ((code: number) => void) | null = null;
 	private buffered: Array<{ data: Uint8Array; fin: boolean }> = [];
+	private bufferedBytes = 0;
 	/** Set when the peer STOP_SENDINGs our send half: writes will fail. */
 	private stopCode: number | null = null;
 	// Per-half completion, mirroring the Rust core. The manager releases this
@@ -127,6 +130,7 @@ export class WasmStream {
 		this.dataCb = cb;
 		for (const ev of this.buffered) cb(ev.data, ev.fin);
 		this.buffered = [];
+		this.bufferedBytes = 0;
 	}
 	onReset(cb: (code: number) => void): void {
 		this.resetCb = cb;
@@ -139,8 +143,19 @@ export class WasmStream {
 
 	/** @internal */
 	_pushData(data: Uint8Array, fin: boolean): void {
-		if (this.dataCb) this.dataCb(data, fin);
-		else this.buffered.push({ data, fin });
+		if (this.dataCb) {
+			this.dataCb(data, fin);
+		} else {
+			// Bound un-consumed inbound data: if the app hasn't attached onData
+			// and the peer floods past the cap, STOP_SENDING the recv half rather
+			// than buffer without bound (OOM). Data already buffered is preserved
+			// for a late onData; no further data will arrive after the stop.
+			this.buffered.push({ data, fin });
+			this.bufferedBytes += data.length;
+			if (this.bufferedBytes > MAX_PENDING_STREAM_BYTES && !this.recvDone) {
+				this.stop(0);
+			}
+		}
 		if (fin) {
 			this.recvDone = true;
 			this._maybeRelease();
@@ -285,11 +300,14 @@ export class WasmSession {
 			this.incomingCb(stream);
 			return;
 		}
-		// Bound un-accepted incoming streams: STOP_SENDING the excess rather than
+		// Bound un-accepted incoming streams: tear down the excess rather than
 		// buffer unbounded when the app hasn't attached an incoming-stream
-		// handler yet.
+		// handler yet. Both halves are ended (stop the recv half AND reset the
+		// send half) so the manager actually releases it from the streams map —
+		// a bidi stream that only stop()s keeps sendDone false and would orphan.
 		if (this.incomingQueue.length >= MAX_PENDING_INCOMING_STREAMS) {
 			stream.stop(0);
+			stream.reset(0);
 			return;
 		}
 		this.incomingQueue.push(stream);
