@@ -11,6 +11,13 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# Enables the accept-any TLS client path in `wt_new_endpoint` (is_server=false).
+# TEST/DEV ONLY — never enable for a shipped (wasm-dist) artifact. Production
+# clients pin by certificate hash via `wt_new_client`.
+dev-insecure = []
+
 [dependencies]
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring", "log"] }
 bytes = "1"
