@@ -33,6 +33,17 @@ impl SessionHandle {
             let Some(limits) = session_registry::get_limits(&id) else {
                 return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
             };
+            let Some(notify) = session_registry::get_stream_capacity_notify(&id) else {
+                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+            };
+            // Register the wakeup BEFORE re-checking capacity so a
+            // `notify_waiters()` fired by a StreamGuard drop between the check
+            // and the await is not lost (tokio Notify stores no permit). Without
+            // this, a stream freed in that window leaves the waiter sleeping the
+            // full timeout and yielding a spurious E_BACKPRESSURE_TIMEOUT.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+
             let global_ok =
                 metrics.streams_active.load(Ordering::Relaxed) < limits.max_streams_global;
             let kind_ok = match kind {
@@ -49,15 +60,12 @@ impl SessionHandle {
             if global_ok && kind_ok {
                 return Ok(());
             }
-            let Some(notify) = session_registry::get_stream_capacity_notify(&id) else {
-                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-            };
             let now = Instant::now();
             if now >= deadline {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
             let remain = deadline.saturating_duration_since(now);
-            tokio::time::timeout(remain, notify.notified())
+            tokio::time::timeout(remain, notified)
                 .await
                 .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?;
         }
