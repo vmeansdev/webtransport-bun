@@ -45,7 +45,10 @@ pub fn wt_new_endpoint(is_server: bool, addr: &str, peer_addr: &str) -> u32 {
         // Accept-any client is not available in a production build.
         return 0;
     }
-    let ep = WtEndpoint::new(is_server, addr, peer);
+    let ep = match WtEndpoint::new(is_server, addr, peer) {
+        Ok(ep) => ep,
+        Err(_) => return 0,
+    };
     let id = alloc_id();
     REGISTRY.with(|r| r.borrow_mut().insert(id, ep));
     id

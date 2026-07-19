@@ -122,13 +122,13 @@ enum FrameHdr {
 impl WtEndpoint {
     /// Test/dev constructor. CLIENT endpoints built this way accept ANY server
     /// certificate — production clients must use [`Self::new_client_pinned`].
-    pub fn new(is_server: bool, _addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+    pub fn new(is_server: bool, _addr: SocketAddr, peer_addr: SocketAddr) -> Result<Self, String> {
         let server_cfg = if is_server {
-            Some(spike::server_crypto().expect("server crypto").0)
+            Some(spike::server_crypto()?.0)
         } else {
             None
         };
-        Self::build(is_server, peer_addr, server_cfg, None)
+        Ok(Self::build(is_server, peer_addr, server_cfg, None))
     }
 
     /// Production client: pins the server certificate by SHA-256 of its DER
@@ -300,6 +300,13 @@ impl WtEndpoint {
         }
     }
 
+    fn push_event(events: &mut std::collections::VecDeque<WtEvent>, ev: WtEvent) {
+        if events.len() > 65536 {
+            return;
+        }
+        events.push_back(ev);
+    }
+
     fn drive(&mut self, h: ConnectionHandle, now: Instant) {
         loop {
             let ev = match self.conns.get_mut(&h) {
@@ -312,7 +319,7 @@ impl WtEndpoint {
                     let Some(&id) = self.handle_to_id.get(&h) else {
                         return;
                     };
-                    self.events.push_back(WtEvent::Connected { conn: id });
+                    Self::push_event(&mut self.events, WtEvent::Connected { conn: id });
                     self.on_connected(h);
                 }
                 QuicEvent::Stream(StreamEvent::Opened { dir }) => {
@@ -358,10 +365,13 @@ impl WtEndpoint {
                         quinn_proto::ConnectionError::LocallyClosed => {}
                         quinn_proto::ConnectionError::ApplicationClosed(app) => {
                             let code = u64::from(app.error_code).try_into().unwrap_or(u32::MAX);
-                            self.events.push_back(WtEvent::Closed { conn: id, code });
+                            Self::push_event(&mut self.events, WtEvent::Closed { conn: id, code });
                         }
                         _ => {
-                            self.events.push_back(WtEvent::Closed { conn: id, code: 0 });
+                            Self::push_event(
+                                &mut self.events,
+                                WtEvent::Closed { conn: id, code: 0 },
+                            );
                         }
                     }
                     // Flush any final frames (e.g. our own CONNECTION_CLOSE)
@@ -416,10 +426,13 @@ impl WtEndpoint {
         if let Some(c) = self.conns.get_mut(&h) {
             c.close(now, VarInt::from_u32(code), Bytes::copy_from_slice(reason));
         }
-        self.events.push_back(WtEvent::Closed {
-            conn: conn_id,
-            code,
-        });
+        Self::push_event(
+            &mut self.events,
+            WtEvent::Closed {
+                conn: conn_id,
+                code,
+            },
+        );
         // Flush the CONNECTION_CLOSE frame, then drop state immediately: a
         // sans-IO driver has no reason to sit in quinn's draining state — the
         // peer has its close frame (and the idle timeout covers its loss).
@@ -609,12 +622,15 @@ impl WtEndpoint {
             };
             let finished = outcome == ReadOutcome::Finished;
             if !data.is_empty() || finished {
-                self.events.push_back(WtEvent::StreamData {
-                    conn,
-                    stream: handle,
-                    fin: finished,
-                    data,
-                });
+                Self::push_event(
+                    &mut self.events,
+                    WtEvent::StreamData {
+                        conn,
+                        stream: handle,
+                        fin: finished,
+                        data,
+                    },
+                );
             }
             match outcome {
                 ReadOutcome::Finished => {
@@ -625,11 +641,14 @@ impl WtEndpoint {
                     self.mark_stream_half_done(handle, HALF_RECV);
                 }
                 ReadOutcome::Reset(code) => {
-                    self.events.push_back(WtEvent::StreamReset {
-                        conn,
-                        stream: handle,
-                        code: code as u32,
-                    });
+                    Self::push_event(
+                        &mut self.events,
+                        WtEvent::StreamReset {
+                            conn,
+                            stream: handle,
+                            code: code as u32,
+                        },
+                    );
                     if let Some(s) = self.sessions.get_mut(&h) {
                         s.self_bidi.remove(&id);
                     }
@@ -707,7 +726,7 @@ impl WtEndpoint {
     /// — never panics / never poisons the registry.
     fn close_conn_protocol_error(&mut self, h: ConnectionHandle, code: u32, reason: &[u8]) {
         if let Some(&id) = self.handle_to_id.get(&h) {
-            self.events.push_back(WtEvent::Closed { conn: id, code });
+            Self::push_event(&mut self.events, WtEvent::Closed { conn: id, code });
         }
         if let Some(c) = self.conns.get_mut(&h) {
             c.close(
@@ -733,7 +752,7 @@ impl WtEndpoint {
         if let Some(s) = self.sessions.get_mut(&h) {
             s.connect_closed = true;
         }
-        self.events.push_back(WtEvent::Closed { conn: id, code: 0 });
+        Self::push_event(&mut self.events, WtEvent::Closed { conn: id, code: 0 });
         // Tear down the QUIC connection too (drive() will surface
         // ConnectionLost::LocallyClosed, which is suppressed as a duplicate).
         if let Some(c) = self.conns.get_mut(&h) {
@@ -865,11 +884,14 @@ impl WtEndpoint {
                             let Some(&conn_id) = self.handle_to_id.get(&h) else {
                                 return;
                             };
-                            self.events.push_back(WtEvent::StreamOpened {
-                                conn: conn_id,
-                                stream: handle,
-                                bidi,
-                            });
+                            Self::push_event(
+                                &mut self.events,
+                                WtEvent::StreamOpened {
+                                    conn: conn_id,
+                                    stream: handle,
+                                    bidi,
+                                },
+                            );
                         }
                         // st.handle is Some here (set above or on a prior pass);
                         // fall back to Route::None rather than panicking if not.
@@ -902,12 +924,15 @@ impl WtEndpoint {
                     let Some(&conn) = self.handle_to_id.get(&h) else {
                         return;
                     };
-                    self.events.push_back(WtEvent::StreamData {
-                        conn,
-                        stream: handle,
-                        fin: finished,
-                        data: payload,
-                    });
+                    Self::push_event(
+                        &mut self.events,
+                        WtEvent::StreamData {
+                            conn,
+                            stream: handle,
+                            fin: finished,
+                            data: payload,
+                        },
+                    );
                 }
             }
             Route::Ignore | Route::None => {}
@@ -1132,10 +1157,13 @@ impl WtEndpoint {
             };
             let Some(dg) = dg else { break };
             if let Some((_qsid, payload)) = h3::unwrap_datagram(&dg) {
-                self.events.push_back(WtEvent::Datagram {
-                    conn: id,
-                    data: payload.to_vec(),
-                });
+                Self::push_event(
+                    &mut self.events,
+                    WtEvent::Datagram {
+                        conn: id,
+                        data: payload.to_vec(),
+                    },
+                );
             }
         }
     }
@@ -1274,7 +1302,7 @@ impl WtEndpoint {
     pub fn next_timeout_ms(&mut self) -> f64 {
         let now = Instant::now();
         let mut soonest: Option<Instant> = None;
-        let mut consider = |t: Instant, soonest: &mut Option<Instant>| {
+        let consider = |t: Instant, soonest: &mut Option<Instant>| {
             *soonest = Some(match *soonest {
                 Some(s) if s <= t => s,
                 _ => t,
@@ -1475,8 +1503,8 @@ mod tests {
     fn endpoints() -> (WtEndpoint, WtEndpoint, u32) {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let server = WtEndpoint::new(true, saddr, caddr);
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let server = WtEndpoint::new(true, saddr, caddr).unwrap();
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let cid = client.connect("localhost") as u32;
         (server, client, cid)
     }
@@ -1643,9 +1671,9 @@ mod tests {
         let a_addr: SocketAddr = "127.0.0.1:1001".parse().unwrap();
         let b_addr: SocketAddr = "127.0.0.1:1002".parse().unwrap();
 
-        let mut server = WtEndpoint::new(true, saddr, a_addr);
-        let mut client_a = WtEndpoint::new(false, a_addr, saddr);
-        let mut client_b = WtEndpoint::new(false, b_addr, saddr);
+        let mut server = WtEndpoint::new(true, saddr, a_addr).unwrap();
+        let mut client_a = WtEndpoint::new(false, a_addr, saddr).unwrap();
+        let mut client_b = WtEndpoint::new(false, b_addr, saddr).unwrap();
         let cid_a = client_a.connect("localhost") as u32;
         let cid_b = client_b.connect("localhost") as u32;
 
@@ -1771,8 +1799,8 @@ mod tests {
     fn finished_streams_are_pruned() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr);
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let cid = client.connect("localhost") as u32;
 
         let mut server_est = false;
@@ -1838,8 +1866,8 @@ mod tests {
     fn finished_bidi_streams_are_pruned() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr);
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let cid = client.connect("localhost") as u32;
 
         let mut server_est = false;
@@ -1919,7 +1947,7 @@ mod tests {
         use quinn_proto::{Dir, Side};
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr);
+        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
         let h = ConnectionHandle(0);
         server.handle_to_id.insert(h, 1);
         server.id_to_handle.insert(1, h);
@@ -2014,7 +2042,7 @@ mod tests {
     fn client_non_200_closes_once_and_blocks_resurrection() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let h = ConnectionHandle(0);
         client.handle_to_id.insert(h, 3);
         client.id_to_handle.insert(3, h);
@@ -2059,7 +2087,7 @@ mod tests {
     fn client_connect_deadline_fails_unanswered_handshake() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let h = ConnectionHandle(0);
         client.handle_to_id.insert(h, 4);
         client.id_to_handle.insert(4, h);
@@ -2084,7 +2112,7 @@ mod tests {
     fn client_malformed_status_closes() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let h = ConnectionHandle(0);
         client.handle_to_id.insert(h, 6);
         client.id_to_handle.insert(6, h);
@@ -2104,7 +2132,7 @@ mod tests {
     fn client_interim_1xx_then_200_establishes() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let h = ConnectionHandle(0);
         client.handle_to_id.insert(h, 5);
         client.id_to_handle.insert(5, h);
@@ -2130,7 +2158,7 @@ mod tests {
         use quinn_proto::{Dir, Side};
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr);
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
         let h = ConnectionHandle(0);
         client.handle_to_id.insert(h, 9);
         client.id_to_handle.insert(9, h);
@@ -2172,7 +2200,7 @@ mod tests {
         use quinn_proto::{Dir, Side};
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr);
+        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
         let h = ConnectionHandle(0);
         server.handle_to_id.insert(h, 7);
         server.id_to_handle.insert(7, h);
@@ -2274,9 +2302,9 @@ mod tests {
         let a_addr: SocketAddr = "127.0.0.1:1001".parse().unwrap();
         let b_addr: SocketAddr = "127.0.0.1:1002".parse().unwrap();
 
-        let mut server = WtEndpoint::new(true, saddr, a_addr);
-        let mut client_a = WtEndpoint::new(false, a_addr, saddr);
-        let mut client_b = WtEndpoint::new(false, b_addr, saddr);
+        let mut server = WtEndpoint::new(true, saddr, a_addr).unwrap();
+        let mut client_a = WtEndpoint::new(false, a_addr, saddr).unwrap();
+        let mut client_b = WtEndpoint::new(false, b_addr, saddr).unwrap();
         client_a.connect("localhost");
         let cid_b = client_b.connect("localhost") as u32;
 
