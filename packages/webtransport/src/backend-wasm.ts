@@ -118,6 +118,11 @@ export class WasmEndpoint {
 		private events: WasmSessionEvents = {},
 	) {
 		udp.onPacket((data, source) => {
+			// Ignore packets that arrive after close(): the wasm-side endpoint
+			// (this.eid) has been freed by wt_close_endpoint, so calling
+			// wt_recv_packet on it would be a use-after-free on a freed/reused
+			// eid. `closed` is set before the free, so this guard is race-safe.
+			if (this.closed) return;
 			// IPv6 sources must be bracketed or the Rust-side SocketAddr parse
 			// fails and every IPv6 client collapses onto the fallback peer_addr.
 			this.wasm.wt_recv_packet(this.eid, data, formatAddr(source));
