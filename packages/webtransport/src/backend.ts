@@ -525,6 +525,12 @@ export async function connectWasm(
 		await session.ready;
 	} catch (err) {
 		mgr.close();
+		// The connect failed and we're throwing, so the caller can't get the
+		// transport back — release it here to avoid leaking its socket/read loop.
+		// (mgr.close() only closes a transport the manager itself owns.)
+		try {
+			udp.close?.();
+		} catch {}
 		throw err;
 	}
 	return { session, manager: mgr };
