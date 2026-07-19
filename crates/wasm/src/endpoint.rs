@@ -97,6 +97,28 @@ const KEEP_ALIVE_INTERVAL_MS: u64 = 3_000;
 /// that completes QUIC but never answers CONNECT would hang the client forever.
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 
+/// Maximum size of a single buffered H3 control/CONNECT/HEADERS frame. A peer
+/// advertising a larger frame length is closed with H3_EXCESSIVE_LOAD rather
+/// than allowed to force unbounded per-connection buffering (memory-exhaustion
+/// DoS). Also keeps the `flen as usize` cast safe on wasm32 (32-bit usize): the
+/// length is checked against this cap (well below u32::MAX) before the cast.
+const MAX_H3_FRAME_SIZE: u64 = 1 << 20; // 1 MiB
+/// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
+const H3_EXCESSIVE_LOAD: u32 = 0x0107;
+
+/// Result of trying to read one H3 frame header from a buffer.
+enum FrameHdr {
+    /// Not enough bytes buffered yet — wait for more.
+    Incomplete,
+    /// Advertised length exceeds `MAX_H3_FRAME_SIZE`; the connection must close.
+    TooLarge,
+    Ready {
+        header: usize,
+        total: usize,
+        is_headers: bool,
+    },
+}
+
 impl WtEndpoint {
     /// Test/dev constructor. CLIENT endpoints built this way accept ANY server
     /// certificate — production clients must use [`Self::new_client_pinned`].
@@ -287,7 +309,9 @@ impl WtEndpoint {
             let Some(ev) = ev else { break };
             match ev {
                 QuicEvent::Connected => {
-                    let id = self.handle_to_id[&h];
+                    let Some(&id) = self.handle_to_id.get(&h) else {
+                        return;
+                    };
                     self.events.push_back(WtEvent::Connected { conn: id });
                     self.on_connected(h);
                 }
@@ -308,7 +332,9 @@ impl WtEndpoint {
                     self.drain_datagrams(h);
                 }
                 QuicEvent::ConnectionLost { reason } => {
-                    let id = self.handle_to_id[&h];
+                    let Some(&id) = self.handle_to_id.get(&h) else {
+                        return;
+                    };
                     // Surface any recv data/FIN buffered at loss time BEFORE
                     // tearing down — otherwise a final payload that arrives in
                     // the same packet as CONNECTION_CLOSE (or on a paused
@@ -578,7 +604,9 @@ impl WtEndpoint {
         if let Some(handle) = handle {
             let mut data = Vec::new();
             let outcome = read_stream(self.conns.get_mut(&h), id, &mut data);
-            let conn = self.handle_to_id[&h];
+            let Some(&conn) = self.handle_to_id.get(&h) else {
+                return;
+            };
             let finished = outcome == ReadOutcome::Finished;
             if !data.is_empty() || finished {
                 self.events.push_back(WtEvent::StreamData {
@@ -674,6 +702,22 @@ impl WtEndpoint {
     /// while the QUIC connection stays alive. Emit Closed once so awaiting
     /// `closed`/`ready` promises settle, and close the QUIC connection so the
     /// session + connection are reclaimed instead of lingering under keep-alive.
+    /// Close a connection on a protocol violation (e.g. an oversized H3 frame).
+    /// Emits `Closed` and tears down the QUIC connection. Uses graceful lookups
+    /// — never panics / never poisons the registry.
+    fn close_conn_protocol_error(&mut self, h: ConnectionHandle, code: u32, reason: &[u8]) {
+        if let Some(&id) = self.handle_to_id.get(&h) {
+            self.events.push_back(WtEvent::Closed { conn: id, code });
+        }
+        if let Some(c) = self.conns.get_mut(&h) {
+            c.close(
+                Instant::now(),
+                VarInt::from_u32(code),
+                Bytes::copy_from_slice(reason),
+            );
+        }
+    }
+
     fn close_session_on_connect_end(&mut self, h: ConnectionHandle) {
         let Some(&id) = self.handle_to_id.get(&h) else {
             return;
@@ -701,7 +745,9 @@ impl WtEndpoint {
     /// send half. The recv half keeps flowing.
     fn on_stream_stopped(&mut self, h: ConnectionHandle, id: StreamId, code: u32) {
         if let Some(stream) = self.stream_handle_for(h, id) {
-            let conn = self.handle_to_id[&h];
+            let Some(&conn) = self.handle_to_id.get(&h) else {
+                return;
+            };
             self.events
                 .push_back(WtEvent::StreamStopped { conn, stream, code });
             self.mark_stream_half_done(stream, HALF_SEND);
@@ -816,17 +862,23 @@ impl WtEndpoint {
                             self.half_done
                                 .insert(handle, if st.is_bidi { 0 } else { HALF_SEND });
                             let bidi = st.is_bidi;
-                            let conn_id = self.handle_to_id[&h];
+                            let Some(&conn_id) = self.handle_to_id.get(&h) else {
+                                return;
+                            };
                             self.events.push_back(WtEvent::StreamOpened {
                                 conn: conn_id,
                                 stream: handle,
                                 bidi,
                             });
                         }
-                        let payload = std::mem::take(&mut st.buf);
-                        Route::WtData {
-                            handle: st.handle.unwrap(),
-                            payload,
+                        // st.handle is Some here (set above or on a prior pass);
+                        // fall back to Route::None rather than panicking if not.
+                        match st.handle {
+                            Some(handle) => {
+                                let payload = std::mem::take(&mut st.buf);
+                                Route::WtData { handle, payload }
+                            }
+                            None => Route::None,
                         }
                     } else {
                         Route::None
@@ -847,7 +899,9 @@ impl WtEndpoint {
             Route::ServerConnect { id } => self.parse_server_connect(h, id),
             Route::WtData { handle, payload } => {
                 if !payload.is_empty() || finished {
-                    let conn = self.handle_to_id[&h];
+                    let Some(&conn) = self.handle_to_id.get(&h) else {
+                        return;
+                    };
                     self.events.push_back(WtEvent::StreamData {
                         conn,
                         stream: handle,
@@ -861,28 +915,38 @@ impl WtEndpoint {
     }
 
     fn parse_control(&mut self, h: ConnectionHandle) {
-        let Some(s) = self.sessions.get_mut(&h) else {
-            return;
-        };
-        loop {
-            let buf = &s.control_rx;
-            let Some((ftype, n1)) = crate::varint::decode(buf) else {
-                break;
-            };
-            let Some((flen, n2)) = crate::varint::decode(&buf[n1..]) else {
-                break;
-            };
-            let header = n1 + n2;
-            let total = header + flen as usize;
-            if buf.len() < total {
-                break;
-            }
-            if ftype == h3::frame::SETTINGS {
-                if let Some(ps) = h3::parse_settings(&buf[header..total]) {
-                    s.peer_settings = Some(ps);
+        let mut oversized = false;
+        if let Some(s) = self.sessions.get_mut(&h) {
+            loop {
+                let buf = &s.control_rx;
+                let Some((ftype, n1)) = crate::varint::decode(buf) else {
+                    break;
+                };
+                let Some((flen, n2)) = crate::varint::decode(&buf[n1..]) else {
+                    break;
+                };
+                // Bound the buffered frame: a peer advertising a huge length and
+                // dribbling bytes would otherwise grow control_rx without limit.
+                if flen > MAX_H3_FRAME_SIZE {
+                    oversized = true;
+                    break;
                 }
+                let header = n1 + n2;
+                // Safe cast: flen <= MAX_H3_FRAME_SIZE (< usize::MAX on wasm32).
+                let total = header + flen as usize;
+                if buf.len() < total {
+                    break;
+                }
+                if ftype == h3::frame::SETTINGS {
+                    if let Some(ps) = h3::parse_settings(&buf[header..total]) {
+                        s.peer_settings = Some(ps);
+                    }
+                }
+                s.control_rx.drain(..total);
             }
-            s.control_rx.drain(..total);
+        }
+        if oversized {
+            self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 control frame too large");
         }
     }
 
@@ -892,9 +956,11 @@ impl WtEndpoint {
     /// answered with 200 and establishes the session (latching the CONNECT
     /// stream to `stream_id`), and any other request is rejected with 404.
     fn parse_server_connect(&mut self, h: ConnectionHandle, stream_id: StreamId) {
-        let id = self.handle_to_id[&h];
+        let Some(&id) = self.handle_to_id.get(&h) else {
+            return;
+        };
         loop {
-            let (header, total, is_headers) = {
+            let hdr = {
                 let Some(st) = self
                     .sessions
                     .get(&h)
@@ -902,10 +968,19 @@ impl WtEndpoint {
                 else {
                     return;
                 };
-                let Some(frame) = decode_frame_header(&st.buf) else {
+                decode_frame_header(&st.buf)
+            };
+            let (header, total, is_headers) = match hdr {
+                FrameHdr::Ready {
+                    header,
+                    total,
+                    is_headers,
+                } => (header, total, is_headers),
+                FrameHdr::Incomplete => return,
+                FrameHdr::TooLarge => {
+                    self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
                     return;
-                };
-                frame
+                }
             };
             let payload_and_drain = |ep: &mut Self| -> Option<Vec<u8>> {
                 let st = ep.sessions.get_mut(&h)?.in_streams.get_mut(&stream_id)?;
@@ -964,19 +1039,33 @@ impl WtEndpoint {
     /// establishes; any other final status closes the session so `ready`
     /// rejects instead of hanging.
     fn parse_client_connect(&mut self, h: ConnectionHandle) {
-        let id = self.handle_to_id[&h];
+        let Some(&id) = self.handle_to_id.get(&h) else {
+            return;
+        };
         loop {
-            let (header, total, is_headers) = {
+            let hdr = {
                 let Some(s) = self.sessions.get(&h) else {
                     return;
                 };
-                let Some(frame) = decode_frame_header(&s.connect_rx) else {
+                decode_frame_header(&s.connect_rx)
+            };
+            let (header, total, is_headers) = match hdr {
+                FrameHdr::Ready {
+                    header,
+                    total,
+                    is_headers,
+                } => (header, total, is_headers),
+                FrameHdr::Incomplete => return,
+                FrameHdr::TooLarge => {
+                    self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
                     return;
-                };
-                frame
+                }
             };
             let payload = if is_headers {
-                self.sessions.get(&h).unwrap().connect_rx[header..total].to_vec()
+                match self.sessions.get(&h) {
+                    Some(s) => s.connect_rx[header..total].to_vec(),
+                    None => return,
+                }
             } else {
                 Vec::new()
             };
@@ -1033,7 +1122,9 @@ impl WtEndpoint {
     }
 
     fn drain_datagrams(&mut self, h: ConnectionHandle) {
-        let id = self.handle_to_id[&h];
+        let Some(&id) = self.handle_to_id.get(&h) else {
+            return;
+        };
         loop {
             let dg = match self.conns.get_mut(&h) {
                 Some(c) => c.datagrams().recv(),
@@ -1051,7 +1142,9 @@ impl WtEndpoint {
 
     fn emit_stream_reset(&mut self, h: ConnectionHandle, id: StreamId, code: u32) {
         if let Some(stream) = self.stream_handle_for(h, id) {
-            let conn = self.handle_to_id[&h];
+            let Some(&conn) = self.handle_to_id.get(&h) else {
+                return;
+            };
             self.events
                 .push_back(WtEvent::StreamReset { conn, stream, code });
         }
@@ -1261,15 +1354,27 @@ fn drain_conn_transmits(conn: &mut Connection, now: Instant, out: &mut Vec<(Vec<
 /// Decode an HTTP/3 frame header at the front of `buf`, returning
 /// `(header_len, total_len, is_headers_frame)` once the WHOLE frame is present,
 /// else None (incomplete). Does not consume `buf`.
-fn decode_frame_header(buf: &[u8]) -> Option<(usize, usize, bool)> {
-    let (ftype, n1) = crate::varint::decode(buf)?;
-    let (flen, n2) = crate::varint::decode(&buf[n1..])?;
+fn decode_frame_header(buf: &[u8]) -> FrameHdr {
+    let Some((ftype, n1)) = crate::varint::decode(buf) else {
+        return FrameHdr::Incomplete;
+    };
+    let Some((flen, n2)) = crate::varint::decode(&buf[n1..]) else {
+        return FrameHdr::Incomplete;
+    };
+    if flen > MAX_H3_FRAME_SIZE {
+        return FrameHdr::TooLarge;
+    }
     let header = n1 + n2;
+    // Safe cast: flen <= MAX_H3_FRAME_SIZE, far below usize::MAX even on wasm32.
     let total = header + flen as usize;
     if buf.len() < total {
-        return None;
+        return FrameHdr::Incomplete;
     }
-    Some((header, total, ftype == h3::frame::HEADERS))
+    FrameHdr::Ready {
+        header,
+        total,
+        is_headers: ftype == h3::frame::HEADERS,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1318,6 +1423,22 @@ mod tests {
 
     const CADDR: &str = "127.0.0.1:5544";
     const SADDR: &str = "127.0.0.1:4433";
+
+    #[test]
+    fn decode_frame_header_rejects_oversized_frame() {
+        // A frame advertising a length beyond MAX_H3_FRAME_SIZE must be flagged
+        // TooLarge so the connection is closed rather than buffered unbounded.
+        let mut buf = Vec::new();
+        crate::varint::encode(0x00, &mut buf); // ftype
+        crate::varint::encode(MAX_H3_FRAME_SIZE + 1, &mut buf); // oversized length
+        assert!(matches!(decode_frame_header(&buf), FrameHdr::TooLarge));
+
+        // A within-cap frame whose payload hasn't fully arrived is Incomplete.
+        let mut small = Vec::new();
+        crate::varint::encode(0x00, &mut small);
+        crate::varint::encode(100, &mut small);
+        assert!(matches!(decode_frame_header(&small), FrameHdr::Incomplete));
+    }
 
     /// Move all packets `from` (located at `from_addr`) emits into `to`, using
     /// `from_addr` as the datagram source so the receiver routes by it. Both

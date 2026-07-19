@@ -355,12 +355,19 @@ fn qpack_int_decode(buf: &[u8], n: u8) -> Option<(u64, usize)> {
     let mut i = 1usize;
     loop {
         let b = *buf.get(i)? as u64;
-        value += (b & 0x7f) << m;
+        // Reject an over-long / malicious varint instead of panicking on a
+        // shift >= 64 (UB in debug, wraps in release) or wrapping on add.
+        // `checked_shl` guards the shift width; `checked_add` guards the sum.
+        let shifted = (b & 0x7f).checked_shl(m)?;
+        value = value.checked_add(shifted)?;
         i += 1;
         if b & 0x80 == 0 {
             break;
         }
         m += 7;
+        if m >= 64 {
+            return None;
+        }
     }
     Some((value, i))
 }
@@ -493,5 +500,28 @@ mod tests {
         let wrapped = wrap_datagram(8, b"x"); // stream 8 -> qsid 2
         let (qsid, _) = unwrap_datagram(&wrapped).unwrap();
         assert_eq!(qsid, 2);
+    }
+
+    #[test]
+    fn qpack_int_decode_rejects_overlong_varint_without_panicking() {
+        // Prefix all-ones (needs continuation) followed by many 0x80
+        // continuation bytes: the pre-fix code shifted by m >= 64 (UB/panic in
+        // debug, wrap in release). Must return None, never panic.
+        let mut buf = vec![0xffu8]; // n=8 prefix, first == max -> continue
+        for _ in 0..20 {
+            buf.push(0x80); // continuation, value bits 0, keep going
+        }
+        buf.push(0x7f); // final byte, high bit clear
+        assert_eq!(qpack_int_decode(&buf, 8), None);
+    }
+
+    #[test]
+    fn qpack_int_decode_still_decodes_small_and_boundary_values() {
+        // Single-byte value below the prefix max.
+        assert_eq!(qpack_int_decode(&[5], 8), Some((5, 1)));
+        // max prefix (255) + one continuation byte (0) => value 255.
+        assert_eq!(qpack_int_decode(&[0xff, 0x00], 8), Some((255, 2)));
+        // 255 + (1 << 0) = 256.
+        assert_eq!(qpack_int_decode(&[0xff, 0x01], 8), Some((256, 2)));
     }
 }
