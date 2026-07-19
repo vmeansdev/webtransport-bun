@@ -620,12 +620,11 @@ impl ClientSessionHandle {
                                 &CLIENT_RUNTIME,
                                 recv,
                                 Some(guard),
-                                Some(budget.clone()),
+                                Some(budget),
                             );
-                            Ok(ClientUniRecvHandle::new_with_budget_and_slot(
+                            Ok(ClientUniRecvHandle::new_with_slot(
                                 read_rx,
                                 stop_tx,
-                                Some(budget),
                                 read_err_slot,
                             ))
                         }

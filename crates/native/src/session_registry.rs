@@ -30,6 +30,54 @@ impl SessionMetrics {
     }
 }
 
+/// A queued datagram that owns its byte-budget reservation.
+///
+/// The global (`ServerMetrics::queued_bytes_global`) and per-session
+/// (`SessionMetrics::queued_bytes`) reservation is released exactly once — when
+/// the consumer drops the slot after dequeue, or when the channel itself is
+/// dropped on session teardown (buffered slots release their own bytes). This
+/// makes the reservation impossible to leak on any teardown path.
+pub struct DatagramSlot {
+    data: Vec<u8>,
+    session_metrics: Arc<SessionMetrics>,
+    server_metrics: Arc<ServerMetrics>,
+    reserved: u64,
+}
+
+impl DatagramSlot {
+    pub fn new(
+        data: Vec<u8>,
+        session_metrics: Arc<SessionMetrics>,
+        server_metrics: Arc<ServerMetrics>,
+        reserved: u64,
+    ) -> Self {
+        Self {
+            data,
+            session_metrics,
+            server_metrics,
+            reserved,
+        }
+    }
+
+    /// Move the payload out. The reservation is still released when the slot is
+    /// dropped at the end of the caller's scope.
+    pub fn take(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.data)
+    }
+}
+
+impl Drop for DatagramSlot {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            ServerMetrics::release_session_queued_bytes(
+                &self.session_metrics.queued_bytes,
+                &self.server_metrics,
+                self.reserved,
+            );
+        }
+    }
+}
+
 /// Channel capacity for datagrams per session (bounded to prevent unbounded buffering).
 const DGRAM_CHANNEL_CAPACITY: usize = 2048;
 const STREAM_ACCEPT_CAPACITY: usize = 256;
@@ -46,7 +94,7 @@ pub struct SessionState {
     /// Connection handle for sending datagrams and opening streams.
     pub conn: Connection,
     /// Receiver for datagrams forwarded from the connection.
-    pub dgram_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    pub dgram_rx: Arc<Mutex<mpsc::Receiver<DatagramSlot>>>,
     /// Server metrics (for datagrams_out when send_datagram succeeds).
     pub metrics: Arc<ServerMetrics>,
     /// Per-session metrics for stream caps and metricsSnapshot.
@@ -78,7 +126,7 @@ pub fn insert(
     metrics: Arc<ServerMetrics>,
     limits: crate::limits::Limits,
 ) -> (
-    mpsc::Sender<Vec<u8>>,
+    mpsc::Sender<DatagramSlot>,
     mpsc::Sender<ClientBidiStreamHandle>,
     mpsc::Sender<ClientUniRecvHandle>,
     mpsc::Receiver<CreateBiReq>,
@@ -132,7 +180,7 @@ pub fn get(
     session_id: &str,
 ) -> Option<(
     Connection,
-    Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    Arc<Mutex<mpsc::Receiver<DatagramSlot>>>,
     Arc<ServerMetrics>,
     Arc<Mutex<mpsc::Receiver<ClientBidiStreamHandle>>>,
     Arc<Mutex<mpsc::Receiver<ClientUniRecvHandle>>>,
@@ -199,5 +247,67 @@ pub fn close_all_for_owner(owner_server_id: u64, code: u32, reason: &[u8]) {
             state.stream_capacity_notify.notify_waiters();
             state.conn.close(wtransport::VarInt::from_u32(code), reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GLOBAL_MAX: u64 = 1 << 20;
+    const SESSION_MAX: u64 = 1 << 18;
+
+    fn reserve(metrics: &Arc<ServerMetrics>, sm: &Arc<SessionMetrics>, n: u64) {
+        assert!(metrics.try_reserve_queued_bytes_with_session(
+            &sm.queued_bytes,
+            n,
+            GLOBAL_MAX,
+            SESSION_MAX,
+        ));
+    }
+
+    // Dropping a queued datagram without dequeuing it (session teardown path)
+    // must release its global + per-session reservation. This is the P0 leak.
+    #[test]
+    fn datagram_slot_drop_releases_reservation() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let sm = Arc::new(SessionMetrics::default());
+        reserve(&metrics, &sm, 500);
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 500);
+
+        let slot = DatagramSlot::new(vec![0u8; 500], Arc::clone(&sm), Arc::clone(&metrics), 500);
+        drop(slot);
+
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    // The normal dequeue path: take() hands the payload to JS, and the
+    // reservation is still released exactly once when the slot drops.
+    #[test]
+    fn datagram_slot_take_then_drop_releases_once() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let sm = Arc::new(SessionMetrics::default());
+        reserve(&metrics, &sm, 500);
+
+        let slot = DatagramSlot::new(vec![7u8; 500], Arc::clone(&sm), Arc::clone(&metrics), 500);
+        let data = slot.take();
+        assert_eq!(data.len(), 500);
+        assert_eq!(data[0], 7);
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+    }
+
+    // Many sessions abandoning queued datagrams must not accumulate the global
+    // budget (the attacker-accelerable exhaustion the audit flagged).
+    #[test]
+    fn churn_with_abandonment_keeps_global_bounded() {
+        let metrics = Arc::new(ServerMetrics::default());
+        for _ in 0..10_000 {
+            let sm = Arc::new(SessionMetrics::default());
+            reserve(&metrics, &sm, 1000);
+            let slot = DatagramSlot::new(vec![0u8; 1000], sm, Arc::clone(&metrics), 1000);
+            drop(slot); // session torn down with data still queued
+        }
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
     }
 }

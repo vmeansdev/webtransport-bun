@@ -36,7 +36,9 @@ fn send_ctrl_lossless(tx: &Option<mpsc::Sender<StreamCmd>>, cmd: StreamCmd) {
 
 /// Commands sent from JS to the write bridge task.
 pub enum StreamCmd {
-    Data(Vec<u8>),
+    /// Outbound stream data carrying its own byte-budget reservation, so a
+    /// buffered write released on teardown cannot leak the budget.
+    Data(StreamChunk),
     Finish,
     FinishWithAck(oneshot::Sender<std::result::Result<(), String>>),
     Reset(u32),
@@ -182,6 +184,51 @@ impl StreamBudget {
     }
 }
 
+/// A queued inbound stream chunk that owns its byte-budget reservation.
+///
+/// Mirrors `DatagramSlot`: the three-tier (global/session/stream) reservation
+/// is released exactly once — when the consumer drops the chunk after dequeue,
+/// or when the read channel is dropped on stream/session teardown (buffered
+/// chunks release their own bytes). This makes the reservation impossible to
+/// leak on any teardown path.
+pub struct StreamChunk {
+    data: Vec<u8>,
+    budget: Option<StreamBudget>,
+    reserved: u64,
+}
+
+impl StreamChunk {
+    pub fn new(data: Vec<u8>, budget: Option<StreamBudget>, reserved: u64) -> Self {
+        Self {
+            data,
+            budget,
+            reserved,
+        }
+    }
+
+    /// Move the payload out. The reservation is still released when the chunk is
+    /// dropped at the end of the caller's scope.
+    pub fn take(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.data)
+    }
+
+    /// Borrow the payload while keeping the reservation held (write bridge: the
+    /// budget stays reserved until the write completes and the chunk drops).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for StreamChunk {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            if let Some(ref b) = self.budget {
+                b.release(self.reserved);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bidi stream handle
 // ---------------------------------------------------------------------------
@@ -191,7 +238,7 @@ type WriteErrorSlot = Arc<Mutex<Option<String>>>;
 /// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
 type ReadErrorSlot = Arc<Mutex<Option<String>>>;
 type BidiBridgeParts = (
-    mpsc::Receiver<Vec<u8>>,
+    mpsc::Receiver<StreamChunk>,
     mpsc::Sender<StreamCmd>,
     oneshot::Sender<u32>,
     Option<WriteErrorSlot>,
@@ -207,7 +254,7 @@ fn read_error_code(err: &StreamReadError) -> &'static str {
 
 #[napi]
 pub struct ClientBidiStreamHandle {
-    read_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    read_rx: Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>,
     write_tx: Option<mpsc::Sender<StreamCmd>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Option<StreamBudget>,
@@ -217,7 +264,7 @@ pub struct ClientBidiStreamHandle {
 
 impl ClientBidiStreamHandle {
     pub fn new(
-        read_rx: mpsc::Receiver<Vec<u8>>,
+        read_rx: mpsc::Receiver<StreamChunk>,
         write_tx: mpsc::Sender<StreamCmd>,
         stop_tx: oneshot::Sender<u32>,
     ) -> Self {
@@ -232,7 +279,7 @@ impl ClientBidiStreamHandle {
     }
 
     pub fn new_with_budget(
-        read_rx: mpsc::Receiver<Vec<u8>>,
+        read_rx: mpsc::Receiver<StreamChunk>,
         write_tx: mpsc::Sender<StreamCmd>,
         stop_tx: oneshot::Sender<u32>,
         budget: Option<StreamBudget>,
@@ -241,7 +288,7 @@ impl ClientBidiStreamHandle {
     }
 
     pub fn new_with_budget_and_slot(
-        read_rx: mpsc::Receiver<Vec<u8>>,
+        read_rx: mpsc::Receiver<StreamChunk>,
         write_tx: mpsc::Sender<StreamCmd>,
         stop_tx: oneshot::Sender<u32>,
         budget: Option<StreamBudget>,
@@ -259,7 +306,7 @@ impl ClientBidiStreamHandle {
     }
 
     pub fn new_client_stream(
-        read_rx: mpsc::Receiver<Vec<u8>>,
+        read_rx: mpsc::Receiver<StreamChunk>,
         write_tx: mpsc::Sender<StreamCmd>,
         stop_tx: oneshot::Sender<u32>,
     ) -> Self {
@@ -274,12 +321,9 @@ impl ClientBidiStreamHandle {
         let read_rx = Arc::clone(&self.read_rx);
         let mut rx = read_rx.lock().await;
         match rx.recv().await {
-            Some(bytes) => {
-                if let Some(ref b) = self.budget {
-                    b.release(bytes.len() as u64);
-                }
-                Ok(Some(bytes.into()))
-            }
+            // `chunk.take()` moves the payload out; the reservation is released
+            // when the chunk drops at the end of this scope (see StreamChunk).
+            Some(chunk) => Ok(Some(chunk.take().into())),
             None => {
                 if let Some(ref slot) = self.read_error_slot {
                     if let Ok(guard) = slot.lock() {
@@ -317,10 +361,9 @@ impl ClientBidiStreamHandle {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
-        if tx.send(StreamCmd::Data(bytes)).await.is_err() {
-            if let Some(ref b) = self.budget {
-                b.release(sz);
-            }
+        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
+        // On send failure the chunk drops here, releasing its reservation.
+        if tx.send(StreamCmd::Data(chunk)).await.is_err() {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         }
         Ok(())
@@ -433,10 +476,9 @@ impl ClientUniSendHandle {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
-        if tx.send(StreamCmd::Data(bytes)).await.is_err() {
-            if let Some(ref b) = self.budget {
-                b.release(sz);
-            }
+        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
+        // On send failure the chunk drops here, releasing its reservation.
+        if tx.send(StreamCmd::Data(chunk)).await.is_err() {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         }
         Ok(())
@@ -477,45 +519,30 @@ impl ClientUniSendHandle {
 
 #[napi]
 pub struct ClientUniRecvHandle {
-    read_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    read_rx: Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
-    budget: Option<StreamBudget>,
     read_error_slot: Option<ReadErrorSlot>,
 }
 
 impl ClientUniRecvHandle {
-    pub fn new(read_rx: mpsc::Receiver<Vec<u8>>, stop_tx: oneshot::Sender<u32>) -> Self {
+    // Read-only handle: the recv bridge owns the budget and each buffered
+    // StreamChunk carries its own reservation, so the handle does not retain one.
+    pub fn new(read_rx: mpsc::Receiver<StreamChunk>, stop_tx: oneshot::Sender<u32>) -> Self {
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget: None,
             read_error_slot: None,
         }
     }
 
-    pub fn new_with_budget(
-        read_rx: mpsc::Receiver<Vec<u8>>,
+    pub fn new_with_slot(
+        read_rx: mpsc::Receiver<StreamChunk>,
         stop_tx: oneshot::Sender<u32>,
-        budget: Option<StreamBudget>,
-    ) -> Self {
-        Self {
-            read_rx: Arc::new(TokioMutex::new(read_rx)),
-            stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget,
-            read_error_slot: None,
-        }
-    }
-
-    pub fn new_with_budget_and_slot(
-        read_rx: mpsc::Receiver<Vec<u8>>,
-        stop_tx: oneshot::Sender<u32>,
-        budget: Option<StreamBudget>,
         read_error_slot: Option<ReadErrorSlot>,
     ) -> Self {
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget,
             read_error_slot,
         }
     }
@@ -528,12 +555,9 @@ impl ClientUniRecvHandle {
         let read_rx = Arc::clone(&self.read_rx);
         let mut rx = read_rx.lock().await;
         match rx.recv().await {
-            Some(bytes) => {
-                if let Some(ref b) = self.budget {
-                    b.release(bytes.len() as u64);
-                }
-                Ok(Some(bytes.into()))
-            }
+            // `chunk.take()` moves the payload out; the reservation is released
+            // when the chunk drops at the end of this scope (see StreamChunk).
+            Some(chunk) => Ok(Some(chunk.take().into())),
             None => {
                 if let Some(ref slot) = self.read_error_slot {
                     if let Ok(guard) = slot.lock() {
@@ -584,7 +608,7 @@ pub fn spawn_bidi_bridge_on(
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> BidiBridgeParts {
-    let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(256);
     let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
@@ -633,10 +657,11 @@ pub fn spawn_bidi_bridge_on(
                                     break;
                                 }
                             }
-                            if read_tx.send(buf[..n].to_vec()).await.is_err() {
-                                if let Some(ref b) = read_budget {
-                                    b.release(sz);
-                                }
+                            let chunk =
+                                StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
+                            // On send failure the chunk is dropped here, releasing
+                            // its reservation via Drop — no manual release needed.
+                            if read_tx.send(chunk).await.is_err() {
                                 break;
                             }
                         }
@@ -661,23 +686,19 @@ pub fn spawn_bidi_bridge_on(
         }
     });
 
-    let write_budget = budget;
+    // `budget` is dropped here: each StreamCmd::Data now carries its own
+    // reservation via StreamChunk, releasing on write completion or teardown.
+    drop(budget);
     let write_error_slot_clone = Arc::clone(&write_error_slot);
     rt.spawn(async move {
         while let Some(cmd) = write_rx.recv().await {
             match cmd {
                 StreamCmd::Data(chunk) => {
-                    let sz = chunk.len() as u64;
-                    match send_stream.write_all(&chunk).await {
-                        Ok(()) => {
-                            if let Some(ref b) = write_budget {
-                                b.release(sz);
-                            }
-                        }
+                    // The chunk holds the byte reservation until it drops at the
+                    // end of this arm (after the write completes or fails).
+                    match send_stream.write_all(chunk.as_bytes()).await {
+                        Ok(()) => {}
                         Err(e) => {
-                            if let Some(ref b) = write_budget {
-                                b.release(sz);
-                            }
                             let code = match &e {
                                 StreamWriteError::Stopped(_) => "E_STOP_SENDING",
                                 _ => "E_STREAM_RESET",
@@ -761,20 +782,16 @@ pub fn spawn_uni_send_bridge_on(
     let write_error_slot_clone = Arc::clone(&write_error_slot);
     rt.spawn(async move {
         let _guard = guard;
+        // Each StreamCmd::Data carries its own reservation via StreamChunk.
+        drop(budget);
         while let Some(cmd) = write_rx.recv().await {
             match cmd {
                 StreamCmd::Data(chunk) => {
-                    let sz = chunk.len() as u64;
-                    match send_stream.write_all(&chunk).await {
-                        Ok(()) => {
-                            if let Some(ref b) = budget {
-                                b.release(sz);
-                            }
-                        }
+                    // The chunk holds the byte reservation until it drops at the
+                    // end of this arm (after the write completes or fails).
+                    match send_stream.write_all(chunk.as_bytes()).await {
+                        Ok(()) => {}
                         Err(e) => {
-                            if let Some(ref b) = budget {
-                                b.release(sz);
-                            }
                             let code = match &e {
                                 StreamWriteError::Stopped(_) => "E_STOP_SENDING",
                                 _ => "E_STREAM_RESET",
@@ -836,7 +853,7 @@ pub fn spawn_uni_recv_bridge(
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> (
-    mpsc::Receiver<Vec<u8>>,
+    mpsc::Receiver<StreamChunk>,
     oneshot::Sender<u32>,
     Option<ReadErrorSlot>,
 ) {
@@ -849,11 +866,11 @@ pub fn spawn_uni_recv_bridge_on(
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> (
-    mpsc::Receiver<Vec<u8>>,
+    mpsc::Receiver<StreamChunk>,
     oneshot::Sender<u32>,
     Option<ReadErrorSlot>,
 ) {
-    let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
 
@@ -907,10 +924,10 @@ pub fn spawn_uni_recv_bridge_on(
                                     break;
                                 }
                             }
-                            if read_tx.send(buf[..n].to_vec()).await.is_err() {
-                                if let Some(ref b) = budget {
-                                    b.release(sz);
-                                }
+                            let chunk = StreamChunk::new(buf[..n].to_vec(), budget.clone(), sz);
+                            // On send failure the chunk is dropped here, releasing
+                            // its reservation via Drop — no manual release needed.
+                            if read_tx.send(chunk).await.is_err() {
                                 break;
                             }
                         }
@@ -936,4 +953,71 @@ pub fn spawn_uni_recv_bridge_on(
     });
 
     (read_rx, stop_tx, Some(read_error_slot))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget(stream_queued: &Arc<AtomicU64>) -> StreamBudget {
+        StreamBudget {
+            server_metrics: Arc::new(crate::server_metrics::ServerMetrics::default()),
+            session_metrics: Arc::new(crate::session_registry::SessionMetrics::default()),
+            stream_queued: Arc::clone(stream_queued),
+            max_global: 1 << 20,
+            max_session: 1 << 18,
+            max_stream: 1 << 16,
+            capacity_notify: StreamBudget::new_notify(),
+            backpressure_timeout_ms: 1000,
+        }
+    }
+
+    // A buffered inbound chunk dropped on stream/session teardown must release
+    // its three-tier reservation — the stream half of the P0 leak.
+    #[test]
+    fn stream_chunk_drop_releases_all_tiers() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(b.try_reserve(400));
+        assert_eq!(
+            b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
+            400
+        );
+        assert_eq!(b.session_metrics.queued_bytes.load(Ordering::Relaxed), 400);
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 400);
+
+        let chunk = StreamChunk::new(vec![0u8; 400], Some(b.clone()), 400);
+        drop(chunk);
+
+        assert_eq!(
+            b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(b.session_metrics.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 0);
+    }
+
+    // take() (dequeue path) yields the payload and still releases exactly once.
+    #[test]
+    fn stream_chunk_take_then_drop_releases_once() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(b.try_reserve(400));
+        let chunk = StreamChunk::new(vec![9u8; 400], Some(b.clone()), 400);
+        let data = chunk.take();
+        assert_eq!(data.len(), 400);
+        assert_eq!(data[0], 9);
+        assert_eq!(
+            b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 0);
+    }
+
+    // No budget configured → no reservation, no release, no panic.
+    #[test]
+    fn stream_chunk_without_budget_is_noop() {
+        let chunk = StreamChunk::new(vec![1u8; 10], None, 0);
+        drop(chunk);
+    }
 }

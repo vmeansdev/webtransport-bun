@@ -155,22 +155,14 @@ impl SessionHandle {
     #[napi]
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
         let id = self.id.clone();
-        let Some((_, dgram_rx, metrics, _, _, _, _)) = session_registry::get(&id) else {
+        let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(&id) else {
             return Ok(None);
         };
-        let sm = session_registry::get_session_metrics(&id);
         let mut rx = dgram_rx.lock().await;
         match rx.recv().await {
-            Some(v) => {
-                if let Some(ref sm) = sm {
-                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                        &sm.queued_bytes,
-                        &metrics,
-                        v.len() as u64,
-                    );
-                }
-                Ok(Some(v.into()))
-            }
+            // `slot.take()` moves the payload out; the reservation is released
+            // when the slot drops at the end of this scope (see DatagramSlot).
+            Some(slot) => Ok(Some(slot.take().into())),
             None => Ok(None),
         }
     }

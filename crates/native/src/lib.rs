@@ -741,8 +741,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 capacity_notify: crate::client_stream::StreamBudget::new_notify(),
                                                                 backpressure_timeout_ms: lim_uni.backpressure_timeout_ms,
                                                             };
-                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
+                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget));
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_slot(read_rx, stop_tx, read_err_slot);
                                                             if uni_accept_tx.send(handle).await.is_err() {
                                                                 report_channel_closed("uni accept");
                                                                 break;
@@ -959,12 +959,15 @@ pub(crate) fn spawn_wtransport_server(
                                                                 continue;
                                                             }
                                                             let payload = dgram.as_ref().to_vec();
-                                                            if dgram_tx.send(payload).await.is_err() {
-                                                                crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                                                                    &sm_dgram.queued_bytes,
-                                                                    &m_dgram,
-                                                                    sz,
-                                                                );
+                                                            let slot = crate::session_registry::DatagramSlot::new(
+                                                                payload,
+                                                                std::sync::Arc::clone(&sm_dgram),
+                                                                std::sync::Arc::clone(&m_dgram),
+                                                                sz,
+                                                            );
+                                                            // On send failure the slot is dropped here, releasing
+                                                            // its reservation via Drop — no manual release needed.
+                                                            if dgram_tx.send(slot).await.is_err() {
                                                                 break;
                                                             }
                                                         }
