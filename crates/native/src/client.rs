@@ -1052,6 +1052,24 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
                 "E_TLS: pinned certificate validity exceeds 14 days (W3C limit)".to_string(),
             ));
         }
+        // W3C serverCertificateHashes requires the certificate use ECDSA over
+        // NIST P-256. Enforce id-ecPublicKey (1.2.840.10045.2.1) with the
+        // secp256r1/prime256v1 curve (1.2.840.10045.3.1.7); otherwise a
+        // Chromium client would reject a cert our pin path would accept.
+        let spki = &cert.public_key().algorithm;
+        let is_ec = spki.algorithm.to_id_string() == "1.2.840.10045.2.1";
+        let is_p256 = spki
+            .parameters
+            .as_ref()
+            .and_then(|p| p.as_oid().ok())
+            .map(|oid| oid.to_id_string() == "1.2.840.10045.3.1.7")
+            .unwrap_or(false);
+        if !is_ec || !is_p256 {
+            return Err(rustls::Error::General(
+                "E_TLS: pinned certificate must use ECDSA P-256 (W3C serverCertificateHashes)"
+                    .to_string(),
+            ));
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 

@@ -854,8 +854,13 @@ describe("TLS contract (P0.3)", () => {
 	// E_HANDSHAKE_TIMEOUT. No prior test did a live pinned connect, so it was
 	// invisible. This connects with the server cert's real SHA-256 DER hash.
 	it("connect with serverCertificateHashes (pinned) succeeds against the matching cert", async () => {
-		// serverCertificateHashes requires a short-lived leaf (<=14 days, W3C).
-		const shortCert = generateCertForNames(["localhost", "127.0.0.1"], 10);
+		// serverCertificateHashes requires a short-lived (<=14 days) ECDSA P-256
+		// leaf per W3C — the native pin verifier enforces both.
+		const shortCert = generateCertForNames(
+			["localhost", "127.0.0.1"],
+			10,
+			"ec",
+		);
 		if (!shortCert) return;
 		const { X509Certificate, createHash } = await import("node:crypto");
 		// Hash the leaf (first PEM block), the cert the server actually presents.
