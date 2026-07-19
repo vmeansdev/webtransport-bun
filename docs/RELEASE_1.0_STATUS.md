@@ -62,6 +62,15 @@ P1**, and surfaced one last P2 (the `#ready` rejection asymmetry, now fixed).
 The final reviewer's verdict: *"The native + native-TS surface is honestly
 1.0.0-ready … no P0 and no true P1 blocker."*
 
+A subsequent **zero-issue gate** was then run at the user's request: a
+five-critic maximally-skeptical review (instructed to report every issue at any
+severity, defaulting to reporting when uncertain) surfaced ~36 findings —
+including a P1 that had been *reintroduced* by an earlier fix, and later a P1 a
+fix had only half-applied (bidi write but not uni write). Every P0/P1/P2 was
+fixed; P3/P4 were fixed or explicitly justified as by-design. Final two-surface
+verification (native + TS) and a native re-verification after the last fixes all
+returned **0 P0/P1/P2**. The package is versioned `1.0.0-rc.1` on that basis.
+
 ## Honest verdict
 
 The native surface has **no known P0/P1 defects** after this work: the two
