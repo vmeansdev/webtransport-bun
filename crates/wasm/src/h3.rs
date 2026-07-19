@@ -155,7 +155,9 @@ pub fn frame_wrap(frame_type: u64, payload: &[u8]) -> Vec<u8> {
 /// QPACK static table (RFC 9204 Appendix A) — the complete 99-entry table
 /// (indices 0..=98), each an (name, value) pair.
 fn qpack_static(index: u64) -> Option<(&'static str, &'static str)> {
-    QPACK_STATIC_TABLE.get(index as usize).copied()
+    QPACK_STATIC_TABLE
+        .get(usize::try_from(index).ok()?)
+        .copied()
 }
 
 /// RFC 9204 Appendix A: the QPACK static table, indices 0..=98.
@@ -310,8 +312,9 @@ pub fn decode_literal_headers(mut buf: &[u8]) -> Option<Vec<(String, String)>> {
             let huffman = first & 0x08 != 0;
             let (nlen, n1) = qpack_int_decode(buf, 3)?;
             buf = &buf[n1..];
-            let raw = buf.get(..nlen as usize)?;
-            buf = &buf[nlen as usize..];
+            let nlen_us = usize::try_from(nlen).ok()?;
+            let raw = buf.get(..nlen_us)?;
+            buf = &buf[nlen_us..];
             let name = decode_qpack_bytes(raw, huffman)?;
             let value = read_qpack_string(&mut buf)?;
             out.push((name, value));
@@ -328,8 +331,9 @@ fn read_qpack_string(buf: &mut &[u8]) -> Option<String> {
     let huffman = (*buf.first()?) & 0x80 != 0;
     let (len, n) = qpack_int_decode(buf, 7)?;
     *buf = &buf[n..];
-    let raw = buf.get(..len as usize)?;
-    *buf = &buf[len as usize..];
+    let len_us = usize::try_from(len).ok()?;
+    let raw = buf.get(..len_us)?;
+    *buf = &buf[len_us..];
     decode_qpack_bytes(raw, huffman)
 }
 
