@@ -27,14 +27,16 @@ async function* iterate<T>(stream: ReadableStream<T>): AsyncIterable<T> {
 export function nativeToWebTransportLike(wt: WebTransport): WebTransportLike {
 	let datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
 
-	// `wt.closed` rejects on connect failure (W3C); the derived promise inherits
-	// that rejection, so attach a no-op handler to it too — otherwise a consumer
-	// awaiting only `ready` would see an unhandled rejection from this adapter.
-	const closed = wt.closed.then((info) => ({
-		code: info.closeCode,
-		reason: info.reason,
-	}));
-	closed.catch(() => {});
+	// The WebTransportLike contract says `closed` NEVER rejects — connection
+	// failure is surfaced via `ready` (which rejects) instead. The underlying
+	// W3C `wt.closed` DOES reject on connect failure, so map that rejection to a
+	// resolved close info here to honor the contract. (`wt.ready`, forwarded
+	// below, already carries an internal no-op catch in the WebTransport class,
+	// so forwarding it cannot leak an unhandled rejection.)
+	const closed = wt.closed.then(
+		(info) => ({ code: info.closeCode, reason: info.reason }),
+		() => ({ code: 0, reason: "" }),
+	);
 
 	return {
 		ready: wt.ready,

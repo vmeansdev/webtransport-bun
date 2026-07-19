@@ -1784,7 +1784,20 @@ function validateClientOptions(
 				strictW3CErrors,
 			);
 		}
+		// An empty array is a silent pinning downgrade: the consumer asked for
+		// cert pinning but supplied no hashes. Reject rather than fall back to
+		// accept-any.
+		if (opts.serverCertificateHashes.length === 0) {
+			throw createMappedError(
+				E_INTERNAL as ErrorCode,
+				"E_INTERNAL: serverCertificateHashes must be a non-empty array",
+				strictW3CErrors,
+			);
+		}
 		if (opts.allowPooling === true) {
+			// W3C mandates NotSupportedError for this combination regardless of
+			// the strict flag (asserted by parity-compat) — intentionally not
+			// gated on strictW3CErrors.
 			throw new WebTransportError(
 				E_INTERNAL as ErrorCode,
 				"E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true",
