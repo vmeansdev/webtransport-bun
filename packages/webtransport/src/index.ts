@@ -2015,8 +2015,12 @@ export class WebTransport {
 				(err) => {
 					// Connect failed: per W3C, `closed` rejects with the same
 					// error as `ready` (a resolved {closeCode:0} was
-					// indistinguishable from a clean close).
-					this.#state = "closed";
+					// indistinguishable from a clean close). Keep the "failed"
+					// state that the `ready` handler set — don't mask it as a
+					// clean "closed", which callers like getStats() guard on.
+					if (this.#state !== "failed") {
+						this.#state = "closed";
+					}
 					throw err;
 				},
 			);
@@ -2049,7 +2053,11 @@ export class WebTransport {
 		return this.#ready;
 	}
 
-	/** Resolves with close info when session closes. Never rejects. */
+	/**
+	 * Resolves with close info when the session closes cleanly, and rejects
+	 * with a `WebTransportError` when the connection fails to establish (same
+	 * error as `ready`), per the W3C WebTransport spec.
+	 */
 	get closed(): Promise<WebTransportCloseInfo> {
 		return this.#closed;
 	}

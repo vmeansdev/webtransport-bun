@@ -24,7 +24,10 @@ function buildSubjectAltName(names: string[]): string {
 		.join(",");
 }
 
-export function generateCertForNames(names: string[]): GeneratedCert | null {
+export function generateCertForNames(
+	names: string[],
+	days = 30,
+): GeneratedCert | null {
 	if (names.length === 0) return null;
 	const dir = mkdtempSync(join(tmpdir(), "webtransport-bun-cert-"));
 	const certPath = join(dir, "cert.pem");
@@ -90,7 +93,7 @@ export function generateCertForNames(names: string[]): GeneratedCert | null {
 			"-out",
 			certPath,
 			"-days",
-			"30",
+			String(days),
 			"-sha256",
 			"-extfile",
 			extPath,

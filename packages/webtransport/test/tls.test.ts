@@ -846,4 +846,38 @@ describe("TLS contract (P0.3)", () => {
 			nextApi.cleanup();
 		}
 	}, 30000);
+
+	// Regression: pinned-hash (serverCertificateHashes) connect must actually
+	// work. The native verifier was built via WebPkiServerVerifier::builder(),
+	// which resolves the process-default CryptoProvider and panicked the client
+	// thread (no default installed) — masking every pinned connect as an
+	// E_HANDSHAKE_TIMEOUT. No prior test did a live pinned connect, so it was
+	// invisible. This connects with the server cert's real SHA-256 DER hash.
+	it("connect with serverCertificateHashes (pinned) succeeds against the matching cert", async () => {
+		// serverCertificateHashes requires a short-lived leaf (<=14 days, W3C).
+		const shortCert = generateCertForNames(["localhost", "127.0.0.1"], 10);
+		if (!shortCert) return;
+		const { X509Certificate, createHash } = await import("node:crypto");
+		// Hash the leaf (first PEM block), the cert the server actually presents.
+		const leafPem = `${shortCert.certPem.split("-----END CERTIFICATE-----")[0]}-----END CERTIFICATE-----\n`;
+		const der = new X509Certificate(leafPem).raw;
+		const valueBase64 = createHash("sha256").update(der).digest("base64");
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: shortCert.certPem, keyPem: shortCert.keyPem },
+			onSession: () => {},
+		});
+		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { serverName: "localhost" },
+				serverCertificateHashes: [{ algorithm: "sha-256", valueBase64 }],
+			});
+			expect(client.id).toBeDefined();
+			client.close();
+		} finally {
+			await server.close();
+			shortCert.cleanup();
+		}
+	}, 15000);
 });
