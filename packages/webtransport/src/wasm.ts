@@ -61,5 +61,6 @@ export {
 	generateCert,
 	serverCertificateHashes,
 	type WasmCertModule,
+	WasmCertRotator,
 } from "./wasm-cert.js";
 export { InMemoryRelay, type UdpTransport } from "./wasm-relay.js";

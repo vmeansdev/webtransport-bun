@@ -11,9 +11,10 @@ import {
 } from "./backend-wasm.js";
 import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
-import { WasmWebTransport } from "./webtransport-like-wasm.js";
+import { WasmWebTransport } from "./wasm-webtransport.js";
+import { wasmToWebTransportLike } from "./webtransport-like-wasm.js";
 
-export { WasmWebTransport } from "./webtransport-like-wasm.js";
+export { WasmWebTransport } from "./wasm-webtransport.js";
 
 /**
  * Caps on the per-session buffers that hold events arriving BEFORE the app
@@ -623,7 +624,10 @@ export async function connectWasmUnified(
 		peerAddr,
 		opts,
 	);
-	return { transport: new WasmWebTransport(session), manager };
+	return {
+		transport: wasmToWebTransportLike(new WasmWebTransport(session)),
+		manager,
+	};
 }
 
 /** Construction args for the wasm side of {@link createUnifiedClient}. */
