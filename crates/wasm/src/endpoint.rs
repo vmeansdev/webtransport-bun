@@ -1425,6 +1425,24 @@ mod tests {
     const SADDR: &str = "127.0.0.1:4433";
 
     #[test]
+    fn decode_frame_header_never_panics_on_random_input() {
+        // Robustness fuzz: random byte sequences must never panic the frame
+        // header decoder (varint overflow, oversized length, truncation).
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        for _ in 0..100_000 {
+            let len = (next() as usize) % 32;
+            let buf: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let _ = decode_frame_header(&buf);
+        }
+    }
+
+    #[test]
     fn decode_frame_header_rejects_oversized_frame() {
         // A frame advertising a length beyond MAX_H3_FRAME_SIZE must be flagged
         // TooLarge so the connection is closed rather than buffered unbounded.
