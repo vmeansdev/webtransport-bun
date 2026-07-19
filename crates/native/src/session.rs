@@ -41,8 +41,12 @@ impl SessionHandle {
             // and the await is not lost (tokio Notify stores no permit). Without
             // this, a stream freed in that window leaves the waiter sleeping the
             // full timeout and yielding a spurious E_BACKPRESSURE_TIMEOUT.
+            // `enable()` enrolls the future in the waiter list NOW — a pinned
+            // Notified does not register until its first poll, so without this
+            // the window the ordering is meant to close stays open.
             let notified = notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
 
             let global_ok =
                 metrics.streams_active.load(Ordering::Relaxed) < limits.max_streams_global;

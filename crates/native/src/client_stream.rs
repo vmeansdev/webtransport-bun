@@ -517,10 +517,13 @@ impl ClientUniSendHandle {
                 return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
+        // Build the chunk immediately after reserving so it owns the reservation:
+        // the finish re-check (and a send failure) below then drop it and release
+        // the bytes. Building it after the re-check would leak the reservation.
+        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
         if self.finished.load(Ordering::Acquire) {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         }
-        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
         // On send failure the chunk drops here, releasing its reservation.
         if tx.send(StreamCmd::Data(chunk)).await.is_err() {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
