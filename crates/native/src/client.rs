@@ -158,10 +158,13 @@ fn build_quic_transport_config(
                 config.max_idle_timeout(None);
             }
         }
-        if keep_alive_interval_ms > 0 {
-            config.keep_alive_interval(Some(std::time::Duration::from_millis(
-                keep_alive_interval_ms,
-            )));
+        // Keep-alive must stay strictly below the idle timeout, or a quiet but
+        // live connection gets idle-killed before a ping can refresh it. Clamp
+        // to at most idle/2 (tolerates one lost ping) regardless of the caller's
+        // value; 0 (after clamping) disables keep-alive, still bounded by idle.
+        let keep_alive_ms = keep_alive_interval_ms.min(idle_timeout_ms / 2);
+        if keep_alive_ms > 0 {
+            config.keep_alive_interval(Some(std::time::Duration::from_millis(keep_alive_ms)));
         }
     }
     config
@@ -910,7 +913,7 @@ fn build_client_tls_config(
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("E_TLS: failed to configure TLS versions: {}", e))?
         .with_root_certificates(Arc::clone(&root_store))
@@ -921,9 +924,17 @@ fn build_client_tls_config(
             .dangerous()
             .set_certificate_verifier(Arc::new(InsecureVerifier));
     } else if !pinned_hashes.is_empty() {
-        let base = rustls::client::WebPkiServerVerifier::builder(Arc::clone(&root_store))
-            .build()
-            .map_err(|e| format!("E_TLS: failed to build certificate verifier: {}", e))?;
+        // Use the explicit ring provider (same as the ClientConfig above).
+        // `builder()` alone resolves the *process-default* CryptoProvider via
+        // `get_default_or_install_from_crate_features()`, which panics on the
+        // wt-client thread when no default is installed — masking every
+        // pinned-hash connect as an E_HANDSHAKE_TIMEOUT.
+        let base = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::clone(&root_store),
+            Arc::clone(&provider),
+        )
+        .build()
+        .map_err(|e| format!("E_TLS: failed to build certificate verifier: {}", e))?;
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(PinnedCertVerifier {
@@ -1249,10 +1260,26 @@ async fn run_connect(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_quic_transport_config, build_root_cert_store, congestion_controller_label,
-        parse_client_limits, parse_congestion_control, CongestionControlMode,
+        build_client_tls_config, build_quic_transport_config, build_root_cert_store,
+        congestion_controller_label, parse_client_limits, parse_congestion_control,
+        CongestionControlMode,
     };
     use serde_json::json;
+
+    // serverCertificateHashes pinning must build its verifier with an explicit
+    // provider. `WebPkiServerVerifier::builder()` resolves the process-default
+    // CryptoProvider and panics on this thread when none is installed, masking
+    // every pinned-hash connect as an E_HANDSHAKE_TIMEOUT. This asserts the
+    // pinned-hash TLS config builds without panicking and returns a config.
+    #[test]
+    fn pinned_hash_tls_config_builds_without_default_provider() {
+        // Real pinned-hash usage carries a populated root store (default
+        // webpki roots); the verifier requires at least one trust anchor.
+        let root_store = build_root_cert_store(None).expect("default roots");
+        let cfg = build_client_tls_config(root_store, false, &[[0u8; 32]])
+            .expect("pinned-hash TLS config must build without a provider panic");
+        assert!(!cfg.alpn_protocols.is_empty());
+    }
 
     // Liveness config must be panic-safe across the full input range, including
     // the out-of-range fallback (an idle timeout larger than the varint bound).

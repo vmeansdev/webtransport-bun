@@ -159,6 +159,12 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 
 ## WASM Backend (browser, Direct Sockets) — Phase Status
 
+> **EXPERIMENTAL (0.x), exempt from the 1.0.0 semver commitment.** The `/wasm`
+> subpath and its facade are not covered by the package's 1.0 stability
+> guarantee; they intentionally diverge from the native surface and may change
+> in any minor release until converged. The frozen 1.0 API is the native (root)
+> entrypoint only.
+
 A second backend (`crates/wasm` + `packages/webtransport/src/backend-wasm.ts`)
 runs a WebTransport server **and** client in the browser over the Direct Sockets
 `UDPSocket` API, with QUIC/TLS1.3/HTTP3/WebTransport as a sans-IO state machine
