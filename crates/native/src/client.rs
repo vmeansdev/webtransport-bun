@@ -932,22 +932,11 @@ fn build_client_tls_config(
             .dangerous()
             .set_certificate_verifier(Arc::new(InsecureVerifier));
     } else if !pinned_hashes.is_empty() {
-        // Use the explicit ring provider (same as the ClientConfig above).
-        // `builder()` alone resolves the *process-default* CryptoProvider via
-        // `get_default_or_install_from_crate_features()`, which panics on the
-        // wt-client thread when no default is installed — masking every
-        // pinned-hash connect as an E_HANDSHAKE_TIMEOUT.
-        let base = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::clone(&root_store),
-            Arc::clone(&provider),
-        )
-        .build()
-        .map_err(|e| format!("E_TLS: failed to build certificate verifier: {}", e))?;
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(PinnedCertVerifier {
-                inner: base,
                 pins: pinned_hashes.to_vec(),
+                provider,
             }));
     }
 
@@ -1012,9 +1001,8 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 /// and its total validity window must not exceed 14 days.
 #[derive(Debug)]
 struct PinnedCertVerifier {
-    /// Used only to delegate signature verification, never chain building.
-    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     pins: Vec<[u8; 32]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 const MAX_PINNED_CERT_VALIDITY_SECS: i64 = 14 * 24 * 60 * 60;
@@ -1079,7 +1067,12 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -1088,11 +1081,18 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -1292,16 +1292,12 @@ mod tests {
     };
     use serde_json::json;
 
-    // serverCertificateHashes pinning must build its verifier with an explicit
-    // provider. `WebPkiServerVerifier::builder()` resolves the process-default
-    // CryptoProvider and panics on this thread when none is installed, masking
-    // every pinned-hash connect as an E_HANDSHAKE_TIMEOUT. This asserts the
-    // pinned-hash TLS config builds without panicking and returns a config.
+    // serverCertificateHashes replaces PKI chain validation, so its verifier
+    // must build even when the platform root store is empty. Handshake
+    // signatures are still verified directly by the explicit ring provider.
     #[test]
     fn pinned_hash_tls_config_builds_without_default_provider() {
-        // Real pinned-hash usage carries a populated root store (default
-        // webpki roots); the verifier requires at least one trust anchor.
-        let root_store = build_root_cert_store(None).expect("default roots");
+        let root_store = std::sync::Arc::new(rustls::RootCertStore::empty());
         let cfg = build_client_tls_config(root_store, false, &[[0u8; 32]])
             .expect("pinned-hash TLS config must build without a provider panic");
         assert!(!cfg.alpn_protocols.is_empty());
