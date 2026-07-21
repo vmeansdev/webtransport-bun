@@ -95,6 +95,7 @@ import {
 	WebTransportError,
 } from "./errors.js";
 import type { ErrorCode } from "./errors.js";
+import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
@@ -248,9 +249,10 @@ async function openStreamWithWait<T>(
 	if (!waitUntilAvailable) {
 		return openFn();
 	}
-	const timeoutMs = Math.max(1, backpressureTimeoutMs);
-	const deadline = Date.now() + timeoutMs;
-	let backoffMs = 2;
+	const waitForCapacityWithFallback =
+		waitForCapacity ?? createPollingCapacityWaiter(isClosed);
+	const deadline = createMonotonicDeadline(backpressureTimeoutMs);
+	const timeoutMs = deadline.timeoutMs;
 	while (true) {
 		if (isClosed()) {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
@@ -261,22 +263,36 @@ async function openStreamWithWait<T>(
 			if (!shouldRetryStreamOpen(err)) {
 				throw toWebTransportError(err, strictW3CErrors);
 			}
-			if (Date.now() >= deadline) {
+			if (deadline.expired()) {
 				throw new WebTransportError(
 					E_BACKPRESSURE_TIMEOUT as ErrorCode,
 					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
 				);
 			}
-			const remaining = Math.max(0, deadline - Date.now());
-			if (waitForCapacity) {
-				await waitForCapacity(Math.max(1, remaining));
-			} else {
-				const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
-				await Bun.sleep(sleepMs);
-				backoffMs = Math.min(backoffMs * 2, 64);
-			}
+			const remaining = deadline.remainingMs();
+			await withDeadline(
+				waitForCapacityWithFallback(Math.max(1, remaining)),
+				Math.max(1, remaining),
+				{
+					timeoutMessage: `E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
+				},
+			);
 		}
 	}
+}
+
+function createPollingCapacityWaiter(
+	isClosed: () => boolean,
+): (remainingMs: number) => Promise<void> {
+	let backoffMs = 2;
+	return async (remainingMs: number): Promise<void> => {
+		if (isClosed()) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		const sleepMs = Math.max(1, Math.min(backoffMs, remainingMs));
+		backoffMs = Math.min(backoffMs * 2, 64);
+		await sleep(sleepMs);
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,7 +1418,9 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				typeof this.#nativeHandle.waitBidiCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
+					: createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new BidiStream({
@@ -1441,7 +1459,9 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				typeof this.#nativeHandle.waitUniCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
+					: createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new SendStream({

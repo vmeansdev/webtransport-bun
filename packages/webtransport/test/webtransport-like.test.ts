@@ -1,16 +1,16 @@
+import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "bun:test";
 import {
 	connectWasm,
 	connectWasmUnified,
 	createWasmServer,
-	WasmWebTransport,
 } from "../src/backend.js";
 import type { WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
 import type { WebTransportLike } from "../src/shared.js";
-import { nativeToWebTransportLike } from "../src/webtransport-like-native.js";
+import type { nativeToWebTransportLike } from "../src/webtransport-like-native.js";
+import type { wasmToWebTransportLike } from "../src/webtransport-like-wasm.js";
 
 const pkgPath = fileURLToPath(
 	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
@@ -389,9 +389,10 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 describe("WebTransportLike type-level assignability", () => {
 	test("wasm impl and native adapter satisfy WebTransportLike", () => {
 		// Compile-time checks: these typecheck under `tsc --noEmit` (the real proof).
-		type WasmAssignable = WasmWebTransport extends WebTransportLike
-			? true
-			: never;
+		type WasmAssignable =
+			ReturnType<typeof wasmToWebTransportLike> extends WebTransportLike
+				? true
+				: never;
 		type NativeAssignable =
 			ReturnType<typeof nativeToWebTransportLike> extends WebTransportLike
 				? true

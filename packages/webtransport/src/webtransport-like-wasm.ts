@@ -38,7 +38,7 @@ export function wasmToWebTransportLike(wt: WasmWebTransport): WebTransportLike {
 		() => ({ code: 0, reason: "" }),
 	);
 
-	return {
+	const transport = {
 		ready: wt.ready,
 		closed,
 
@@ -72,5 +72,7 @@ export function wasmToWebTransportLike(wt: WasmWebTransport): WebTransportLike {
 		incomingUnidirectionalStreams(): AsyncIterable<ReadableStream<Uint8Array>> {
 			return iterate(wt.incomingUnidirectionalStreams);
 		},
-	};
+	} satisfies WebTransportLike;
+
+	return transport;
 }
