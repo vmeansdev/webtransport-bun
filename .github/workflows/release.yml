@@ -14,7 +14,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Cargo audit (Rust dependencies)
-        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2026-0009
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
+          cargo audit --file crates/wasm/Cargo.lock
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@0.28.0
         with:
