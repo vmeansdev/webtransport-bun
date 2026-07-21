@@ -153,7 +153,7 @@ function validateCommandRecord(value: unknown): CommandRecord {
 	const platform = validatePlatform(value.platform);
 	const toolchain = validateToolchain(value.toolchain);
 	const command = validateCommand(value.command);
-	if (!Number.isInteger(value.exitCode)) {
+	if (typeof value.exitCode !== "number" || !Number.isInteger(value.exitCode)) {
 		fail("Expected exitCode to be an integer");
 	}
 	if (!isIsoTimestamp(value.startedAt)) {
@@ -200,7 +200,11 @@ function validateSummaryRecord(value: unknown): SummaryRecord {
 	if (!isIsoTimestamp(value.generatedAt)) {
 		fail("Expected generatedAt to be an ISO-8601 timestamp");
 	}
-	if (!Number.isInteger(value.recordCount) || value.recordCount < 0) {
+	if (
+		typeof value.recordCount !== "number" ||
+		!Number.isInteger(value.recordCount) ||
+		value.recordCount < 0
+	) {
 		fail("Expected recordCount to be a non-negative integer");
 	}
 	if (!Array.isArray(value.records)) {
