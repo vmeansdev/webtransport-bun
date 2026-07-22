@@ -120,11 +120,9 @@ impl SessionHandle {
     pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
         let id = self.id.clone();
         let bytes = data.as_ref().to_vec();
-        let Some((conn, _, metrics, _, _, _, _)) = session_registry::get(&id) else {
-            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-        };
-        let sm = session_registry::get_session_metrics(&id);
-        let Some(limits) = session_registry::get_limits(&id) else {
+        let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
+            session_registry::get_datagram_send_state(&id)
+        else {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
         let sz = bytes.len();
@@ -132,35 +130,36 @@ impl SessionHandle {
             return Err(napi::Error::from_reason("E_QUEUE_FULL"));
         }
         let sz_u64 = sz as u64;
-        if let Some(ref sm) = sm {
-            if !metrics.try_reserve_queued_bytes_with_session(
-                &sm.queued_bytes,
-                sz_u64,
-                limits.max_queued_bytes_global,
-                limits.max_queued_bytes_per_session,
-            ) {
-                return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+        let deadline = Instant::now() + Duration::from_millis(limits.backpressure_timeout_ms);
+        session_registry::reserve_datagram_capacity(
+            &metrics,
+            &sm,
+            &datagram_capacity_notify,
+            &lifecycle_closed,
+            &limits,
+            sz_u64,
+            deadline,
+        )
+        .await
+        .map_err(|err| match err {
+            session_registry::DatagramCapacityError::Closed => {
+                napi::Error::from_reason("E_SESSION_CLOSED")
             }
-        }
+            session_registry::DatagramCapacityError::Timeout => {
+                napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT")
+            }
+        })?;
         // wtransport's send_datagram is a synchronous, non-blocking enqueue —
         // no task spawn or timeout needed (a timeout can't fire on sync work).
         let start = std::time::Instant::now();
         let result = conn
             .send_datagram(&bytes)
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
-        if let Some(ref sm) = sm {
-            crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                &sm.queued_bytes,
-                metrics.as_ref(),
-                sz_u64,
-            );
-        }
+        metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
         result?;
         metrics.datagram_enqueue_histogram.observe(start.elapsed());
         metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-        if let Some(ref sm) = sm {
-            sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
-        }
+        sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

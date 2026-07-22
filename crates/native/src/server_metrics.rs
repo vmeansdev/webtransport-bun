@@ -1,6 +1,8 @@
 //! Atomic server metrics for Phase 4.3.1. Updated by wtransport accept/session logic.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use super::histogram::{self, LatencyHistogram};
 use super::metrics::HistogramSnapshot;
@@ -18,6 +20,8 @@ pub struct ServerMetrics {
     pub queued_bytes_global: AtomicU64,
     pub backpressure_wait_count: AtomicU64,
     pub backpressure_timeout_count: AtomicU64,
+    /// Wakes datagram senders competing for this server instance's global byte budget.
+    pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
     pub limit_exceeded_count: AtomicU64,
     pub handshake_histogram: LatencyHistogram,
@@ -76,6 +80,19 @@ impl ServerMetrics {
     ) {
         session_queued.fetch_sub(n, Ordering::Relaxed);
         metrics.release_queued_bytes(n);
+    }
+
+    /// Release datagram queue credit and wake both the affected session and
+    /// every session competing for this server instance's global budget.
+    pub fn release_datagram_capacity(
+        &self,
+        session_queued: &std::sync::atomic::AtomicU64,
+        session_notify: &Notify,
+        n: u64,
+    ) {
+        Self::release_session_queued_bytes(session_queued, self, n);
+        session_notify.notify_waiters();
+        self.datagram_capacity_notify.notify_waiters();
     }
 
     pub(crate) fn snapshot(

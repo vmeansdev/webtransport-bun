@@ -9,6 +9,7 @@ import {
 	createServer,
 	E_BACKPRESSURE_TIMEOUT,
 	E_QUEUE_FULL,
+	E_SESSION_CLOSED,
 } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
@@ -29,6 +30,46 @@ async function connectWithRetry(
 	}
 	throw lastErr ?? new Error("connectWithRetry: timed out");
 }
+
+async function waitFor<T>(
+	read: () => T | Promise<T>,
+	predicate: (value: T) => boolean,
+	timeoutMs = 3000,
+	pollMs = 25,
+): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
+	let lastValue: T | undefined;
+	while (Date.now() < deadline) {
+		lastValue = await read();
+		if (predicate(lastValue)) {
+			return lastValue;
+		}
+		await Bun.sleep(pollMs);
+	}
+	throw new Error(
+		`waitFor timed out after ${timeoutMs}ms: ${String(lastValue)}`,
+	);
+}
+
+async function expectPending(
+	promise: Promise<unknown>,
+	waitMs = 150,
+): Promise<"pending" | "settled"> {
+	return Promise.race([
+		promise.then(
+			() => "settled" as const,
+			() => "settled" as const,
+		),
+		Bun.sleep(waitMs).then(() => "pending" as const),
+	]);
+}
+
+type ServerSessionForBackpressure = {
+	sendDatagram(data: Uint8Array): Promise<void>;
+	incomingDatagrams(): AsyncIterable<Uint8Array>;
+	metricsSnapshot(): { queuedBytes: number };
+	close(info?: { code?: number; reason?: string }): void;
+};
 
 describe("backpressure (P0-C)", () => {
 	it("datagram size over max is rejected", async () => {
@@ -196,6 +237,186 @@ describe("backpressure (P0-C)", () => {
 			]);
 			expect(queued).toBeGreaterThan(0);
 			expect(queued).toBeLessThanOrEqual(512);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("server sendDatagram waits for queued datagram capacity to be released", async () => {
+		const port = nextPort(24460, 2000);
+		const inbound = new Uint8Array(256).fill(0x61);
+		const outbound = new Uint8Array([0x62, 0x63, 0x64]);
+		let serverSession!: ServerSessionForBackpressure;
+		let resolveSession!: (session: ServerSessionForBackpressure) => void;
+		const sessionReady = new Promise<ServerSessionForBackpressure>(
+			(resolve) => {
+				resolveSession = resolve;
+			},
+		);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: {
+				maxQueuedBytesGlobal: inbound.byteLength,
+				maxQueuedBytesPerSession: inbound.byteLength,
+				backpressureTimeoutMs: 1000,
+			},
+			onSession: async (s) => {
+				serverSession = s;
+				resolveSession(s);
+			},
+		});
+
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			await sessionReady;
+			await client.sendDatagram(inbound);
+			await waitFor(
+				() => serverSession.metricsSnapshot().queuedBytes,
+				(queued) => queued === inbound.byteLength,
+			);
+
+			const serverSend = serverSession.sendDatagram(outbound);
+			expect(await expectPending(serverSend, 150)).toBe("pending");
+
+			const serverIncoming = serverSession
+				.incomingDatagrams()
+				[Symbol.asyncIterator]();
+			const received = (await Promise.race([
+				serverIncoming.next(),
+				Bun.sleep(1000).then(() => {
+					throw new Error("timeout waiting for server datagram consumption");
+				}),
+			])) as IteratorResult<Uint8Array>;
+			expect(received.done).toBe(false);
+			expect(Array.from(received.value)).toEqual(Array.from(inbound));
+
+			await expect(serverSend).resolves.toBeUndefined();
+
+			const clientIncoming = client.incomingDatagrams()[Symbol.asyncIterator]();
+			const echoed = (await Promise.race([
+				clientIncoming.next(),
+				Bun.sleep(1500).then(() => {
+					throw new Error("timeout waiting for server datagram send");
+				}),
+			])) as IteratorResult<Uint8Array>;
+			expect(echoed.done).toBe(false);
+			expect(Array.from(echoed.value)).toEqual(Array.from(outbound));
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("server sendDatagram times out under queue pressure instead of failing immediately", async () => {
+		const port = nextPort(24460, 2000);
+		const inbound = new Uint8Array(256).fill(0x41);
+		let serverSession!: ServerSessionForBackpressure;
+		let resolveSession!: (session: ServerSessionForBackpressure) => void;
+		const sessionReady = new Promise<ServerSessionForBackpressure>(
+			(resolve) => {
+				resolveSession = resolve;
+			},
+		);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: {
+				maxQueuedBytesGlobal: inbound.byteLength,
+				maxQueuedBytesPerSession: inbound.byteLength,
+				backpressureTimeoutMs: 100,
+			},
+			onSession: async (s) => {
+				serverSession = s;
+				resolveSession(s);
+			},
+		});
+
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			await sessionReady;
+			await client.sendDatagram(inbound);
+			await waitFor(
+				() => serverSession.metricsSnapshot().queuedBytes,
+				(queued) => queued === inbound.byteLength,
+			);
+
+			const before = server.metricsSnapshot();
+			const startedAt = Date.now();
+			await expect(
+				serverSession.sendDatagram(new Uint8Array([0x99])),
+			).rejects.toMatchObject({
+				code: E_BACKPRESSURE_TIMEOUT,
+			});
+			expect(Date.now() - startedAt).toBeGreaterThanOrEqual(75);
+
+			const after = server.metricsSnapshot();
+			expect(after.backpressureWaitCount).toBeGreaterThan(
+				before.backpressureWaitCount,
+			);
+			expect(after.backpressureTimeoutCount).toBeGreaterThan(
+				before.backpressureTimeoutCount,
+			);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("closing a session wakes a blocked server send and balances queued bytes", async () => {
+		const port = nextPort(24460, 2000);
+		const inbound = new Uint8Array(256).fill(0x71);
+		let serverSession!: ServerSessionForBackpressure;
+		let resolveSession!: (session: ServerSessionForBackpressure) => void;
+		const sessionReady = new Promise<ServerSessionForBackpressure>(
+			(resolve) => {
+				resolveSession = resolve;
+			},
+		);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: {
+				maxQueuedBytesGlobal: inbound.byteLength,
+				maxQueuedBytesPerSession: inbound.byteLength,
+				backpressureTimeoutMs: 1000,
+			},
+			onSession: async (session) => {
+				serverSession = session;
+				resolveSession(session);
+			},
+		});
+
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			await sessionReady;
+			await client.sendDatagram(inbound);
+			await waitFor(
+				() => server.metricsSnapshot().queuedBytesGlobal,
+				(queued) => queued === inbound.byteLength,
+			);
+
+			const blockedSend = serverSession.sendDatagram(new Uint8Array([0x72]));
+			expect(await expectPending(blockedSend, 150)).toBe("pending");
+
+			const closedAt = Date.now();
+			serverSession.close({ code: 0x100, reason: "backpressure-close" });
+			await expect(blockedSend).rejects.toMatchObject({
+				code: E_SESSION_CLOSED,
+			});
+			expect(Date.now() - closedAt).toBeLessThan(500);
+			await waitFor(
+				() => server.metricsSnapshot().queuedBytesGlobal,
+				(queued) => queued === 0,
+				1000,
+			);
 		} finally {
 			client.close();
 			await server.close();

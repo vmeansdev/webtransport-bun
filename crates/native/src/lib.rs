@@ -621,7 +621,7 @@ pub(crate) fn spawn_wtransport_server(
                                         );
 
                                         // P0-1: Register session BEFORE emitting to JS so acceptBidiStream etc. find it
-                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics) =
+                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics, datagram_capacity_notify) =
                                             session_registry::insert(
                                                 id.clone(),
                                                 owner_server_id,
@@ -1005,13 +1005,14 @@ pub(crate) fn spawn_wtransport_server(
                                                                 m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
                                                                 continue;
                                                             }
-                                                            let payload = dgram.as_ref().to_vec();
-                                                            let slot = crate::session_registry::DatagramSlot::new(
-                                                                payload,
+                                                            let reservation = crate::session_registry::DatagramReservation::new(
                                                                 std::sync::Arc::clone(&sm_dgram),
                                                                 std::sync::Arc::clone(&m_dgram),
+                                                                datagram_capacity_notify.clone(),
                                                                 sz,
                                                             );
+                                                            let payload = dgram.as_ref().to_vec();
+                                                            let slot = reservation.into_slot(payload);
                                                             // On send failure the slot is dropped here, releasing
                                                             // its reservation via Drop — no manual release needed.
                                                             if dgram_tx.send(slot).await.is_err() {
