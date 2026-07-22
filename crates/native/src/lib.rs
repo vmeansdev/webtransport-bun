@@ -93,6 +93,18 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_ID_SEED: Lazy<u64> = Lazy::new(|| {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    h.finish()
+});
 static RATE_LIMIT_CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
 static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
@@ -465,24 +477,31 @@ pub(crate) fn spawn_wtransport_server(
                 }
             };
 
-            loop {
-                let incoming = server.accept();
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        server.close(VarInt::from_u32(0), b"server closing");
-                        break;
-                    }
-                    incoming_session = incoming => {
-                        let metrics = Arc::clone(&metrics);
-                        let limits = limits.clone();
-                        let rate_limits = rate_limits.clone();
-                        let stx = session_tx.clone();
-                        let ltx = log_tx.clone();
-                        spawn_tracked::spawn_tracked(
-                            metrics.clone(),
-                            spawn_tracked::TaskKind::Session,
-                            panic_guard::PanicScope::Server(owner_server_id),
-                            async move {
+            spawn_tracked::spawn_tracked(
+                Arc::clone(&metrics),
+                owner_server_id,
+                spawn_tracked::TaskKind::Session,
+                panic_guard::PanicScope::Server(owner_server_id),
+                async move {
+                    loop {
+                        let incoming = server.accept();
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                server.close(VarInt::from_u32(0), b"server closing");
+                                break;
+                            }
+                            incoming_session = incoming => {
+                                let metrics = Arc::clone(&metrics);
+                                let limits = limits.clone();
+                                let rate_limits = rate_limits.clone();
+                                let stx = session_tx.clone();
+                                let ltx = log_tx.clone();
+                                spawn_tracked::spawn_tracked(
+                                    metrics.clone(),
+                                    owner_server_id,
+                                    spawn_tracked::TaskKind::Session,
+                                    panic_guard::PanicScope::Server(owner_server_id),
+                                    async move {
                                 metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
@@ -616,8 +635,9 @@ pub(crate) fn spawn_wtransport_server(
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
 
                                         let id = format!(
-                                            "sess-{}",
+                                            "sess-{:016x}",
                                             SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                ^ *SESSION_ID_SEED
                                         );
 
                                         // P0-1: Register session BEFORE emitting to JS so acceptBidiStream etc. find it
@@ -670,6 +690,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_bidi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -733,6 +754,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -798,6 +820,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_create_bi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_bi.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -867,6 +890,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_create_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_uni.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -941,6 +965,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let peer_ip_for_release = peer_ip.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -1084,11 +1109,13 @@ pub(crate) fn spawn_wtransport_server(
                                         emit_log(&ltx, !debug_logs, "error", &format!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
                                     }
                                 }
-                            },
-                        );
+                                    },
+                                );
+                            }
+                        }
                     }
-                }
-            }
+                },
+            );
         });
     });
 }

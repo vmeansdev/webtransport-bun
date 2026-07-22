@@ -30,10 +30,126 @@ use crate::session_registry::SessionMetrics;
 use crate::CLIENT_RUNTIME;
 
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static CLIENT_SESSION_ID_SEED: Lazy<u64> = Lazy::new(|| {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    // Mix in a client-specific discriminator so client and server seeds differ
+    "client".hash(&mut h);
+    h.finish()
+});
 static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CLIENT_POOL: Lazy<std::sync::Arc<client_pool::ClientPoolManager>> =
     Lazy::new(|| std::sync::Arc::new(client_pool::ClientPoolManager::new()));
+
+struct RegistryMutation<T> {
+    value: T,
+    poison_recovered: bool,
+}
+
+fn remove_registry_entry(
+    registry: &Mutex<HashMap<String, ClientSessionHandle>>,
+    handle_id: &str,
+) -> RegistryMutation<Option<ClientSessionHandle>> {
+    match registry.lock() {
+        Ok(mut guard) => RegistryMutation {
+            value: guard.remove(handle_id),
+            poison_recovered: false,
+        },
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            RegistryMutation {
+                value: guard.remove(handle_id),
+                poison_recovered: true,
+            }
+        }
+    }
+}
+
+fn insert_registry_entry(
+    registry: &Mutex<HashMap<String, ClientSessionHandle>>,
+    handle: ClientSessionHandle,
+) -> RegistryMutation<()> {
+    match registry.lock() {
+        Ok(mut guard) => {
+            guard.insert(handle.id.clone(), handle);
+            RegistryMutation {
+                value: (),
+                poison_recovered: false,
+            }
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.insert(handle.id.clone(), handle);
+            RegistryMutation {
+                value: (),
+                poison_recovered: true,
+            }
+        }
+    }
+}
+
+fn report_client_registry_recovery(context: &str, handle_id: &str) {
+    eprintln!(
+        "webtransport-native: {} client handle registry mutex was poisoned; recovered entry mutation for {}",
+        context, handle_id
+    );
+}
+
+fn remove_client_registry_entry(handle_id: &str) -> RegistryMutation<Option<ClientSessionHandle>> {
+    remove_registry_entry(&CLIENT_HANDLE_REGISTRY, handle_id)
+}
+
+fn finalize_client_terminal_state(
+    handle_id: &str,
+    closed_flag: &Arc<std::sync::atomic::AtomicBool>,
+    close_code: Option<u32>,
+    close_reason: Option<String>,
+    on_closed: Option<&ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
+) {
+    closed_flag.store(true, Ordering::Relaxed);
+    let removal = remove_client_registry_entry(handle_id);
+    if removal.poison_recovered {
+        report_client_registry_recovery("finalize", handle_id);
+    }
+    if let Some(tsfn) = on_closed {
+        let status = tsfn.call(
+            ClientSessionClosed {
+                id: handle_id.to_string(),
+                code: close_code,
+                reason: close_reason,
+            },
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        crate::report_tsfn_status("on_closed", status);
+    }
+}
+
+fn handle_connect_callback_status(success_id: Option<&str>, status: napi::Status) {
+    crate::report_tsfn_status("connect", status);
+    if status == napi::Status::Ok {
+        return;
+    }
+    if let Some(handle_id) = success_id {
+        let removal = remove_client_registry_entry(handle_id);
+        if removal.poison_recovered {
+            report_client_registry_recovery("connect callback cleanup", handle_id);
+        }
+        if let Some(handle) = removal.value {
+            handle.initiate_close(
+                0,
+                format!("E_INTERNAL: connect callback delivery failed: {:?}", status),
+            );
+        }
+    }
+}
 
 fn map_connecting_error(
     err: wtransport::error::ConnectingError,
@@ -330,14 +446,7 @@ impl ClientSessionHandle {
 
     #[napi]
     pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
-        self.closed.store(true, Ordering::Relaxed);
-        let c = code.unwrap_or(0);
-        let r = reason.unwrap_or_default();
-        if let Some(ref tx) = self.close_tx {
-            if tx.send((c, r)).is_err() {
-                crate::report_channel_closed("client close signal");
-            }
-        }
+        self.initiate_close(code.unwrap_or(0), reason.unwrap_or_default());
         Ok(())
     }
 
@@ -421,6 +530,18 @@ impl ClientSessionHandle {
 }
 
 impl ClientSessionHandle {
+    fn initiate_close(&self, code: u32, reason: String) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Some(ref tx) = self.close_tx {
+            if tx.send((code, reason.clone())).is_err() {
+                crate::report_channel_closed("client close signal");
+            }
+        }
+        if let Some(ref conn) = self.conn {
+            conn.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_session_task(
         id: String,
@@ -690,19 +811,13 @@ impl ClientSessionHandle {
                     (Some(code), Some(reason))
                 }
             };
-            closed_flag.store(true, Ordering::Relaxed);
-
-            if let Some(ref tsfn) = on_closed {
-                let status = tsfn.call(
-                    ClientSessionClosed {
-                        id: id.clone(),
-                        code: close_code,
-                        reason: close_reason,
-                    },
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-                crate::report_tsfn_status("on_closed", status);
-            }
+            finalize_client_terminal_state(
+                &id,
+                &closed_flag,
+                close_code,
+                close_reason,
+                on_closed.as_ref(),
+            );
         });
 
         handle
@@ -789,16 +904,21 @@ fn connect_inner(
                     bp_timeout_ms,
                     client_limits,
                 );
-                if let Ok(mut reg) = CLIENT_HANDLE_REGISTRY.lock() {
-                    reg.insert(id.clone(), handle);
+                let insertion = insert_registry_entry(&CLIENT_HANDLE_REGISTRY, handle);
+                if insertion.poison_recovered {
+                    report_client_registry_recovery("connect registry insert", &id);
                 }
                 id
             }) {
             std::result::Result::Ok(id) => ConnectResult::Ok(id),
             std::result::Result::Err(msg) => ConnectResult::Err(msg),
         };
+        let success_id = match &result {
+            ConnectResult::Ok(id) => Some(id.clone()),
+            ConnectResult::Err(_) => None,
+        };
         let status = callback_tsfn.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-        crate::report_tsfn_status("connect", status);
+        handle_connect_callback_status(success_id.as_deref(), status);
     });
 
     Ok(())
@@ -1201,8 +1321,8 @@ async fn run_connect(
         connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
 
     let id = format!(
-        "client-{}",
-        CLIENT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        "client-{:016x}",
+        CLIENT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed) ^ *CLIENT_SESSION_ID_SEED
     );
 
     if allow_pooling {
@@ -1287,10 +1407,15 @@ async fn run_connect(
 mod tests {
     use super::{
         build_client_tls_config, build_quic_transport_config, build_root_cert_store,
-        congestion_controller_label, parse_client_limits, parse_congestion_control,
-        CongestionControlMode,
+        congestion_controller_label, handle_connect_callback_status, insert_registry_entry,
+        parse_client_limits, parse_congestion_control, remove_registry_entry, ClientMetrics,
+        ClientSessionHandle, CongestionControlMode, CLIENT_HANDLE_REGISTRY,
     };
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 
     // serverCertificateHashes replaces PKI chain validation, so its verifier
     // must build even when the platform root store is empty. Handshake
@@ -1361,5 +1486,96 @@ mod tests {
         let default_mode = parse_congestion_control(&json!({})).expect("default should parse");
         assert_eq!(default_mode, CongestionControlMode::Default);
         assert_eq!(congestion_controller_label(default_mode), "cubic");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivery_failure_removes_registry_entry_and_signals_close() {
+        let handle_id = "delivery-failure-client".to_string();
+        let (dgram_send_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
+        let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(1);
+        let (close_tx, mut close_rx) = watch::channel((0u32, String::new()));
+        let closed_flag = Arc::new(AtomicBool::new(false));
+        let handle = ClientSessionHandle {
+            id: handle_id.clone(),
+            peer_ip: "127.0.0.1".to_string(),
+            peer_port: 4433,
+            dgram_send_tx: Some(dgram_send_tx),
+            dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+            datagram_budget_bytes: 1024,
+            backpressure_timeout_ms: 50,
+            max_datagram_size: 1200,
+            stream_open_bi_tx: Some(open_bi_tx),
+            stream_open_uni_tx: Some(open_uni_tx),
+            stream_accept_bi_tx: Some(accept_bi_tx),
+            stream_accept_uni_tx: Some(accept_uni_tx),
+            close_tx: Some(Arc::new(close_tx)),
+            client_metrics: Arc::new(ClientMetrics::default()),
+            closed: Arc::clone(&closed_flag),
+            conn: None,
+        };
+        let insertion = insert_registry_entry(&CLIENT_HANDLE_REGISTRY, handle);
+        assert!(!insertion.poison_recovered);
+
+        handle_connect_callback_status(Some(&handle_id), napi::Status::Closing);
+
+        assert!(closed_flag.load(Ordering::Relaxed));
+        assert!(CLIENT_HANDLE_REGISTRY
+            .lock()
+            .expect("registry lock")
+            .get(&handle_id)
+            .is_none());
+        close_rx.changed().await.expect("close signal");
+        let (code, reason) = close_rx.borrow().clone();
+        assert_eq!(code, 0);
+        assert!(reason.contains("E_INTERNAL: connect callback delivery failed"));
+        assert!(reason.contains("Closing"));
+    }
+
+    #[test]
+    fn remove_registry_entry_recovers_poison_and_removes_entry() {
+        let local_registry = Mutex::new(HashMap::<String, ClientSessionHandle>::new());
+        let handle_id = "poisoned-entry".to_string();
+        let (dgram_send_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
+        let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = watch::channel((0u32, String::new()));
+        local_registry.lock().expect("seed local registry").insert(
+            handle_id.clone(),
+            ClientSessionHandle {
+                id: handle_id.clone(),
+                peer_ip: "127.0.0.1".to_string(),
+                peer_port: 4433,
+                dgram_send_tx: Some(dgram_send_tx),
+                dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+                datagram_budget_bytes: 1024,
+                backpressure_timeout_ms: 50,
+                max_datagram_size: 1200,
+                stream_open_bi_tx: Some(open_bi_tx),
+                stream_open_uni_tx: Some(open_uni_tx),
+                stream_accept_bi_tx: Some(accept_bi_tx),
+                stream_accept_uni_tx: Some(accept_uni_tx),
+                close_tx: Some(Arc::new(close_tx)),
+                client_metrics: Arc::new(ClientMetrics::default()),
+                closed: Arc::new(AtomicBool::new(false)),
+                conn: None,
+            },
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = local_registry.lock().expect("lock local registry");
+            panic!("poison local registry");
+        });
+
+        let removal = remove_registry_entry(&local_registry, &handle_id);
+        assert!(removal.poison_recovered);
+        assert!(removal.value.is_some());
+        let remaining = local_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(remaining.get(&handle_id).is_none());
     }
 }
