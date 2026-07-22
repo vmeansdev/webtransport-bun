@@ -25,6 +25,36 @@ async function waitUntil(
 }
 
 describe("drain guarantees (P1.1)", () => {
+	it("close after a live client connect resolves with zero active tasks", async () => {
+		await withHarness(async (h) => {
+			const port = nextPort(BASE_PORT, 400);
+			const server = h.track(
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: () => {},
+				}),
+			);
+			const client = h.track(
+				await connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+				}),
+			);
+
+			const beforeClose = server.metricsSnapshot();
+			expect(beforeClose.streamTasksActive).toBeGreaterThan(0);
+
+			await server.close();
+
+			const snapshot = server.metricsSnapshot();
+			expect(snapshot.sessionsActive).toBe(0);
+			expect(snapshot.sessionTasksActive).toBe(0);
+			expect(snapshot.streamTasksActive).toBe(0);
+
+			client.close();
+		});
+	}, 15000);
+
 	it("stream + datagram stress burst drains to baseline after close", async () => {
 		await withHarness(async (h) => {
 			const port = nextPort(BASE_PORT, 400);
@@ -99,7 +129,10 @@ describe("drain guarantees (P1.1)", () => {
 			const drained = await waitUntil(() => {
 				const m = server.metricsSnapshot();
 				return (
-					m.sessionTasksActive === 0 &&
+					m.sessionsActive === 0 &&
+					// Task 5 now tracks the top-level accept loop explicitly, so a
+					// listening server retains one session task until server.close().
+					m.sessionTasksActive <= 1 &&
 					m.streamTasksActive === 0 &&
 					m.queuedBytesGlobal <= 4 * 1024
 				);
@@ -141,7 +174,10 @@ describe("drain guarantees (P1.1)", () => {
 			const drained = await waitUntil(() => {
 				const m = server.metricsSnapshot();
 				return (
-					m.sessionTasksActive === 0 &&
+					m.sessionsActive === 0 &&
+					// Task 5 now tracks the top-level accept loop explicitly, so a
+					// listening server retains one session task until server.close().
+					m.sessionTasksActive <= 1 &&
 					m.streamTasksActive === 0 &&
 					m.queuedBytesGlobal <= 4 * 1024
 				);

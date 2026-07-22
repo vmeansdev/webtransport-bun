@@ -119,6 +119,62 @@ fn is_addr_in_use_error(message: &str) -> bool {
     lower.contains("address already in use") || lower.contains("addrinuse")
 }
 
+#[derive(Clone, Copy)]
+struct CloseDrainTiming {
+    grace_period: Duration,
+    abort_period: Duration,
+    poll_interval: Duration,
+}
+
+impl CloseDrainTiming {
+    const fn production() -> Self {
+        Self {
+            grace_period: Duration::from_secs(5),
+            abort_period: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(50),
+        }
+    }
+}
+
+async fn wait_for_server_drain(
+    metrics: &ServerMetrics,
+    server_id: u64,
+    timing: CloseDrainTiming,
+) -> Option<String> {
+    let mut aborted_tasks = 0usize;
+    let mut abort_attempted = false;
+    let mut phase_deadline = tokio::time::Instant::now() + timing.grace_period;
+    loop {
+        let session_tasks = metrics.session_tasks_active.load(Ordering::Relaxed);
+        let stream_tasks = metrics.stream_tasks_active.load(Ordering::Relaxed);
+        let sessions_active = metrics.sessions_active.load(Ordering::SeqCst);
+        let tracked_tasks = crate::spawn_tracked::server_task_count(server_id);
+        if session_tasks == 0 && stream_tasks == 0 && sessions_active == 0 && tracked_tasks == 0 {
+            return None;
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= phase_deadline {
+            if !abort_attempted {
+                aborted_tasks = crate::spawn_tracked::abort_server_tasks(server_id);
+                crate::session_registry::close_all_for_owner(server_id, 0, b"server closing");
+                abort_attempted = true;
+                phase_deadline = now + timing.abort_period;
+            } else {
+                return Some(format!(
+                    "E_BACKPRESSURE_TIMEOUT: server close abort timed out sessionsActive={} sessionTasksActive={} streamTasksActive={} trackedTasksActive={} abortedTasks={}",
+                    sessions_active,
+                    session_tasks,
+                    stream_tasks,
+                    tracked_tasks,
+                    aborted_tasks,
+                ));
+            }
+        }
+        tokio::time::sleep(timing.poll_interval).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_server_instance(
     server_id: u64,
@@ -547,7 +603,10 @@ impl ServerHandle {
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
             state.closed = true;
-            state.shutdown_tx.take();
+            if let Some(tx) = state.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            crate::rate_limit::cleanup_server_entries(self.server_id);
             crate::session_registry::close_all_for_owner(self.server_id, 0, b"server closing");
             self.session_tx
                 .lock()
@@ -560,53 +619,10 @@ impl ServerHandle {
             Ok(())
         })?;
         let metrics = Arc::clone(&self.metrics);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
-        crate::RUNTIME.spawn(async move {
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-            let mut fully_drained = false;
-            loop {
-                let sessions = metrics
-                    .session_tasks_active
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let streams = metrics
-                    .stream_tasks_active
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if sessions == 0 && streams == 0 {
-                    fully_drained = true;
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-            if done_tx.send(fully_drained).is_err() {
-                crate::report_channel_failure("server close completion");
-            }
-        });
-        // Await the drain instead of blocking the async worker thread with a
-        // synchronous recv_timeout (which would stall a napi executor thread).
-        // close() still resolves on an incomplete drain (best-effort shutdown),
-        // but the incomplete case is surfaced to stderr rather than reported as
-        // a clean drain.
-        match tokio::time::timeout(std::time::Duration::from_secs(6), done_rx).await {
-            Ok(Ok(fully_drained)) => {
-                if !fully_drained {
-                    eprintln!(
-                        "webtransport-native: server close drain deadline reached with active tasks remaining (best-effort close)"
-                    );
-                }
-            }
-            Ok(Err(_)) => {
-                return Err(napi::Error::from_reason(
-                    "E_INTERNAL: server close completion channel disconnected".to_string(),
-                ));
-            }
-            Err(_) => {
-                return Err(napi::Error::from_reason(
-                    "E_INTERNAL: server close drain timeout".to_string(),
-                ));
-            }
+        let close_err =
+            wait_for_server_drain(&metrics, self.server_id, CloseDrainTiming::production()).await;
+        if let Some(msg) = close_err {
+            return Err(napi::Error::from_reason(msg));
         }
         Ok(())
     }
@@ -622,5 +638,46 @@ impl ServerHandle {
                 .metrics
                 .snapshot(Some(state.tls_resolver.metrics_snapshot())))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wait_for_server_drain, CloseDrainTiming};
+    use crate::server_metrics::ServerMetrics;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_gauges_without_tracked_tasks_time_out_after_abort_phase() {
+        let server_id = u64::MAX - 1;
+        let metrics = ServerMetrics::default();
+        metrics.session_tasks_active.store(1, Ordering::Relaxed);
+        metrics.stream_tasks_active.store(2, Ordering::Relaxed);
+        metrics.sessions_active.store(3, Ordering::Relaxed);
+        assert_eq!(crate::spawn_tracked::server_task_count(server_id), 0);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_server_drain(
+                &metrics,
+                server_id,
+                CloseDrainTiming {
+                    grace_period: Duration::ZERO,
+                    abort_period: Duration::ZERO,
+                    poll_interval: Duration::from_millis(1),
+                },
+            ),
+        )
+        .await
+        .expect("close drain must have a bounded abort phase")
+        .expect("stale gauges must return a stable timeout diagnostic");
+
+        assert!(result.starts_with("E_BACKPRESSURE_TIMEOUT:"));
+        assert!(result.contains("sessionsActive=3"));
+        assert!(result.contains("sessionTasksActive=1"));
+        assert!(result.contains("streamTasksActive=2"));
+        assert!(result.contains("trackedTasksActive=0"));
+        assert!(result.contains("abortedTasks=0"));
     }
 }

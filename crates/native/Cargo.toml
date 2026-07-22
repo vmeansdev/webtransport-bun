@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+webtransport_test_seams = []
+
 [dependencies]
 dashmap = "6"
 napi = { version = "2", features = ["async", "tokio_rt"] }
