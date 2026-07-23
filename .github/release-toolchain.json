@@ -8,7 +8,9 @@
 	"npm": ["11.18.0"],
 	"wasmBindgen": ["0.2.121"],
 	"cargoAudit": ["0.22.2"],
+	"cargoFuzz": ["0.13.1"],
 	"cargoLlvmCov": ["0.8.7"],
+	"napiRsCli": ["3.3.0"],
 	"playwright": ["1.58.2"],
 	"wbn": ["0.0.9"],
 	"wbnSign": ["0.3.1"]

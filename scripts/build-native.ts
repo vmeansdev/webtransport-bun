@@ -40,14 +40,24 @@ if (!rustupProbe.success) {
 	);
 }
 
+const napiCliDir = resolve(root, "node_modules", "@napi-rs", "cli");
+const napiCliPackage = JSON.parse(
+	readFileSync(resolve(napiCliDir, "package.json"), "utf8"),
+) as { bin?: Record<string, string> };
+const napiCliBin = napiCliPackage.bin?.napi;
+if (typeof napiCliBin !== "string") {
+	throw new Error(
+		`${napiCliDir} must provide the pinned @napi-rs/cli napi binary. Run bun install.`,
+	);
+}
+
 const child = Bun.spawn(
 	[
 		"rustup",
 		"run",
 		rustToolchain,
 		"bun",
-		"x",
-		"@napi-rs/cli",
+		resolve(napiCliDir, napiCliBin),
 		"build",
 		"--cwd",
 		"crates/native",

@@ -25,6 +25,18 @@ cargo +"$RUST_TOOLCHAIN" clippy --workspace -- -D clippy::all
 echo "[ci-local] cargo test --workspace"
 cargo +"$RUST_TOOLCHAIN" test --workspace
 
+CARGO_AUDIT_VERSION="$(
+  node -e "const fs=require('node:fs'); const policy=JSON.parse(fs.readFileSync('.github/release-toolchain.json','utf8')); if (!Array.isArray(policy.cargoAudit) || policy.cargoAudit.length === 0) throw new Error('missing cargo-audit release version'); process.stdout.write(String(policy.cargoAudit[0]));"
+)"
+if ! cargo audit --version 2>/dev/null | grep -q "cargo-audit $CARGO_AUDIT_VERSION"; then
+  echo "[ci-local] install cargo-audit $CARGO_AUDIT_VERSION"
+  cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+fi
+
+echo "[ci-local] cargo audit"
+cargo +"$RUST_TOOLCHAIN" audit
+cargo +"$RUST_TOOLCHAIN" audit --file crates/wasm/Cargo.lock
+
 echo "[ci-local] build native addon"
 rustup run "$RUST_TOOLCHAIN" bun run build:native
 

@@ -122,7 +122,9 @@ type ReleaseToolchain = {
 	npm: string[];
 	wasmBindgen: string[];
 	cargoAudit: string[];
+	cargoFuzz: string[];
 	cargoLlvmCov: string[];
+	napiRsCli: string[];
 	playwright: string[];
 	wbn: string[];
 	wbnSign: string[];
@@ -260,7 +262,7 @@ function exactVersionViolation(
 
 function commandVersionViolation(line: string): string | undefined {
 	const cargoInstall =
-		/\bcargo install (cargo-audit|wasm-bindgen-cli|cargo-llvm-cov)\b[^\n]*--version\s+(\d+\.\d+\.\d+)\b/.exec(
+		/\bcargo install (cargo-audit|wasm-bindgen-cli|cargo-llvm-cov|cargo-fuzz)\b[^\n]*--version\s+(\d+\.\d+\.\d+)\b/.exec(
 			line,
 		);
 	if (cargoInstall?.[1] && cargoInstall[2]) {
@@ -268,6 +270,7 @@ function commandVersionViolation(line: string): string | undefined {
 			"cargo-audit": TOOLCHAIN.cargoAudit,
 			"wasm-bindgen-cli": TOOLCHAIN.wasmBindgen,
 			"cargo-llvm-cov": TOOLCHAIN.cargoLlvmCov,
+			"cargo-fuzz": TOOLCHAIN.cargoFuzz,
 		}[cargoInstall[1]];
 		if (!approved) return `unsupported release tool ${cargoInstall[1]}`;
 		if (!approved.includes(cargoInstall[2])) {
@@ -284,6 +287,10 @@ function commandVersionViolation(line: string): string | undefined {
 	)?.[1];
 	if (playwright && !TOOLCHAIN.playwright.includes(playwright)) {
 		return `Playwright ${playwright} is not listed in ${TOOLCHAIN_PATH}`;
+	}
+	const napiRsCli = /@napi-rs\/cli@(\d+\.\d+\.\d+)\b/.exec(line)?.[1];
+	if (napiRsCli && !TOOLCHAIN.napiRsCli.includes(napiRsCli)) {
+		return `@napi-rs/cli ${napiRsCli} is not listed in ${TOOLCHAIN_PATH}`;
 	}
 	return undefined;
 }
@@ -837,16 +844,25 @@ function scanWorkflow(path: string): Violation[] {
 			);
 		}
 		if (
-			/\bcargo install (?:cargo-audit|wasm-bindgen-cli|cargo-llvm-cov)\b/.test(
+			/\bcargo install (?:cargo-audit|wasm-bindgen-cli|cargo-llvm-cov|cargo-fuzz)\b/.test(
 				line,
 			) &&
 			!/--version\s+\d+\.\d+\.\d+/.test(line)
 		) {
 			const tool =
-				/\bcargo install (cargo-audit|wasm-bindgen-cli|cargo-llvm-cov)\b/.exec(
+				/\bcargo install (cargo-audit|wasm-bindgen-cli|cargo-llvm-cov|cargo-fuzz)\b/.exec(
 					line,
 				)?.[1] ?? "release tooling";
 			add(index, `${tool} installs must include an exact --version`);
+		}
+		if (
+			/@napi-rs\/cli\b/.test(line) &&
+			/\b(?:bunx|npx|bun\s+(?:x|add)|npm\s+(?:i|install)|yarn\s+add|pnpm\s+add)\b/.test(
+				line,
+			) &&
+			!/@napi-rs\/cli@\d+\.\d+\.\d+\b/.test(line)
+		) {
+			add(index, "@napi-rs/cli invocations must use an exact pinned version");
 		}
 		if (
 			/\b(?:bunx|npx)\s+playwright\b/.test(line) &&
