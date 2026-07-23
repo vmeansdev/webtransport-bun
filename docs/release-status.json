@@ -1,0 +1,130 @@
+{
+	"schemaVersion": 1,
+	"candidate": {
+		"commit": null,
+		"readiness": "pending"
+	},
+	"evidence": [],
+	"claims": [
+		{
+			"id": "native-local-gates",
+			"surface": "native",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "wasm-local-gates",
+			"surface": "wasm",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "cross-platform-matrix",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "runtime-consumers",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "chromium-native-interop",
+			"surface": "native",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "chromium-wasm-interop",
+			"surface": "wasm",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "iwa-direct-sockets",
+			"surface": "wasm",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "fault-matrix",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "coverage-gates",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "fuzz-gates",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "scale-10k-multisource",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "package-artifact",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "supply-chain-provenance",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "soak-24h",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "soak-72h",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "auto-review-zero-p0-p4",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		},
+		{
+			"id": "final-no-change-confirmation",
+			"surface": "release",
+			"status": "pending",
+			"evidenceIds": []
+		}
+	],
+	"surfaces": {
+		"native": {
+			"stability": "candidate",
+			"requiredClaims": ["native-local-gates", "chromium-native-interop"]
+		},
+		"wasm": {
+			"stability": "candidate",
+			"requiredClaims": [
+				"wasm-local-gates",
+				"chromium-wasm-interop",
+				"iwa-direct-sockets"
+			]
+		}
+	},
+	"support": {
+		"claimed": [],
+		"tested": []
+	}
+}

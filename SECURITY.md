@@ -9,6 +9,8 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
 - Datagram bursts (event loop / JS callback storms)
 - Malformed / adversarial traffic triggering panics
 
+Canonical release truth: `docs/release-status.json`. This document defines the security controls that feed that manifest.
+
 ## Security principles
 1. Safe defaults
 - TLS verification enabled by default for client.
@@ -73,3 +75,13 @@ Public internet UDP service exposed on a port (commonly 443). Likely threats:
   - expiration/revisit date.
 - Suppressions should be minimal and temporary; broad/global ignores are not allowed.
 - When a finding is accepted temporarily, track it in an issue with owner + target fix release.
+
+## Environment variables affecting security diagnostics
+- `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES=1`: enables logging of expected (non-error) channel close events. Useful for debugging teardown ordering, but may produce noisy logs in production. Does not affect security enforcement.
+- `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1`: suppresses the warning log emitted when `insecureSkipVerify` is used. Should only be set in CI/test environments.
+- `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`: suppresses the one-time warning when a log callback is not provided. Does not affect security enforcement.
+These variables control diagnostic verbosity only; they do not bypass rate limits, TLS verification, or resource caps.
+
+## Known limitations
+### Private key memory zeroing
+Private key PEM strings are parsed into `PrivateKeyDer` and stored in standard Rust heap allocations which are not zeroed on deallocation. In a process crash (core dump, swap file), key material could theoretically be recoverable from process memory. This is consistent with most non-HSM TLS libraries. For deployments requiring HSM-level key protection, use external key management with TLS termination at a trusted proxy.

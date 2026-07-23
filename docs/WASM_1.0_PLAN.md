@@ -1,99 +1,81 @@
 # WASM Backend → 1.0 Plan & Status
 
-**Goal:** bring the wasm backend to production-grade with 0 known P0/P1/P2
-defects (verified by strict adversarial review), fuzzed parsers, a facade
-convergent with the native W3C surface, and documented protocol scope — so
-`/wasm` can join the package's 1.0 semver commitment instead of shipping
-experimental/0.x.
+Current release truth lives in `docs/release-status.json`. This document is the
+working plan for the `/wasm` candidate, not a GA declaration.
 
-Worktree: `feat/wasm-1.0` (off the native RC `release/1.0-hardening`).
+Package version: `1.0.0-rc.1`.
 
-## Status (2026-07-19)
+Worktree label: `feat/wasm-1.0`.
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 1 | Parser hardening (frame cap, QPACK overflow, panic-free indexers) | ✅ done — `a7c0394` |
-| 2 | Fuzzing (always-on robustness property tests) | ✅ done — `4d6d52f` |
-| 3 | TS facade defects (use-after-close, bounded queues) | ✅ done — `c9130dd`, `299b12f`, `93ec1eb` |
-| 4 | Security surface (AcceptAny gated out of shipped build) | ✅ done — `592a31a` |
-| 6a | Protocol scope docs | ✅ done — `739dbd1` (`docs/WASM_PROTOCOL_SCOPE.md`) |
-| 7 | Adversarial review loop → **0 P0/P1/P2 (Rust + TS)** | ✅ done — 3 rounds converged |
-| **5** | **Facade convergence** | ⛔ **NOT started — the 1.0-semver gate** |
-| 6b | Cert-rotation helper | ⛔ not started |
-| 6c | IWA browser-interop CI | ⛔ not started |
-| — | Accepted P3/P4 robustness | ⛔ deferred (see below) |
+## Current state
 
-**Security/DoS/panic/UAF/OOM class is CLOSED.** The remaining items are the
-convergence + ops + polish needed to actually flip `/wasm` from experimental
-0.x to a 1.0-committed surface. None is started; all are picked up from here.
+The local implementation work for Tasks 1-16 is largely landed. The review
+loop is still tightening Tasks 7/8, 13, 14, and 15, and the release gates are
+still pending:
 
----
+- immutable candidate SHA
+- cross-platform/runtime CI
+- coverage evidence
+- fuzz campaign evidence
+- >=10k diverse-source scale evidence
+- package/provenance evidence
+- 24h and 72h soak evidence
+- zero P0-P4 eight-lane review
+- final no-change confirmation
 
-## REMAINING WORK (pickup guide)
+Treat the items below as the current pickup guide for the wasm release track.
 
-### 5. Facade convergence — the gating item for `/wasm` 1.0 (largest, multi-day)
-**Why it gates 1.0:** `/wasm` is exempt from the 1.0 semver commitment *because*
-its facade diverges from the native surface. Until it converges, a consumer
-can't write backend-agnostic code, so `/wasm` must stay 0.x.
+## Task status
 
-**Current divergence** (`packages/webtransport/src/`):
-- Native (root): W3C `WebTransport` class — Promise/WHATWG streams,
-  `WebTransportError` + `E_*` codes, `{ready, closed, draining, datagrams,
-  incoming*Streams, create*Stream, close}`.
-- Wasm: `WasmSession`/`WasmStream` (`backend.ts`) — callback-style
-  (`onDatagram`/`onStream`/`onData`/`onReset`), plain `Error`s, different
-  close-info shape. `WasmWebTransport` (`webtransport-like-wasm.ts`) already
-  adapts *part* of it to the shared `WebTransportLike` contract.
+| Task group | Current status | Primary paths |
+|---|---|---|
+| 1-4 | largely landed | `scripts/generate-release-evidence.ts`; `crates/wasm/src/*`; `packages/webtransport/src/*`; `packages/webtransport/test/*` |
+| 5 | landed locally, still reviewed for facade parity details | `packages/webtransport/src/{wasm-webtransport.ts,webtransport-like-wasm.ts,backend-wasm.ts}` |
+| 6a | landed | `docs/WASM_PROTOCOL_SCOPE.md` |
+| 6b | pending | `crates/wasm/src/cert.rs`; `docs/COMPATIBILITY.md` |
+| 6c | pending release verification | `tools/interop/WASM_INTEROP.md`; `examples/webtransport-wasm-iwa/` |
+| 7 | review fixes in progress | `docs/reviews/2026-07-21-1.0-finding-ledger.md`; `docs/release-status.json` |
+| 8 | review fixes in progress | `docs/reviews/2026-07-21-1.0-finding-ledger.md`; `packages/webtransport/src/index.ts` |
+| 9-12 | largely landed | `tools/fuzz/*`; `tools/load/*`; `packages/webtransport/test/*`; `packages/webtransport/package.json` |
+| 13-15 | pending release evidence | `.github/workflows/{coverage,fuzz,iwa}.yml`; `tools/interop/*`; `tools/load/*` |
+| 16 | landed | `docs/{ARCHITECTURE.md,CI.md,COMPATIBILITY.md,OPERATIONS.md,TESTPLAN.md}` |
+| 17 | pending final closure | `docs/release-status.json`; this plan; the evidence ledger |
 
-**Approach:** extend `WasmWebTransport` (or a new adapter) to implement the full
-native `WebTransport` surface over `WasmSession`/`WasmStream` — WHATWG
-`ReadableStream`/`WritableStream` for datagrams and streams, `ready`/`closed`/
-`draining` with the same rejection semantics as the native class, W3C error
-names, and the same state machine. Reuse `shared.ts` (`WebTransportLike`) and
-mirror `webtransport-like-native.ts`. Then run the existing parity suite
-(`docs/PARITY_MATRIX.md`, `test:parity`) against the wasm backend and close the
-gaps row by row. Exit criterion: the parity matrix passes for the wasm backend
-and `/wasm` types match the native root export.
+## What is already in place
 
-### 6b. Cert-rotation helper (14-day P-256 pin treadmill)
-`serverCertificateHashes` pins require ECDSA P-256 certs ≤ 14 days
-(`crates/wasm/src/cert.rs`, `wt_generate_cert`). Add a helper that generates
-the next cert before expiry and surfaces the new hash for redistribution, plus
-docs on the rotation cadence. See `docs/COMPATIBILITY.md` cert notes.
+- The wasm backend is implemented as a candidate path, not a silent no-op.
+- Browser-shaped client behavior is covered by `packages/webtransport/src/*`
+  and the parity suites.
+- Protocol scope is documented in `docs/WASM_PROTOCOL_SCOPE.md`.
+- The interop harness and IWA proof flow exist in `tools/interop/*` and
+  `examples/webtransport-wasm-iwa/`.
 
-### 6c. IWA browser-interop CI
-The in-browser server path (Direct Sockets in a Chromium Isolated Web App) is
-covered only by a manual Playwright harness (`tools/interop/WASM_INTEROP.md`,
-`examples/webtransport-wasm-iwa/`). Make it runnable in CI (or clearly gated +
-scheduled), since it's the only browser-server coverage.
+## What still needs to close
 
-### Accepted P3/P4 (from the review rounds — deferred, not blocking)
-- **P3 — FFI-reachable constructor `.expect()`s** (`crates/wasm/src/endpoint.rs`
-  `WtEndpoint::new`/`new_client_pinned`: `server_crypto`,
-  `QuicServer/ClientConfig::try_from`). Deterministic crypto-init failure, NOT
-  attacker-controlled, but a wasm panic aborts+poisons the thread-local
-  REGISTRY — contradicts the "never panic across FFI" invariant. Fix: make the
-  constructors return `Result` and have the `wt_new_*` bridge return 0 on error.
-  Deferred only because it ripples through ~15 test call sites.
-- **P3 — `events` VecDeque unbounded if JS lags** (`endpoint.rs`): recv paths
-  drain quinn buffers into an in-process queue and extend flow-control credit;
-  mitigated by synchronous pump + the opt-in `paused` mechanism. Consider a soft
-  cap / auto-pause.
-- **P4 — `h3.rs` `nlen/len as usize` truncation on wasm32** (correctness oddity,
-  no unsafety); `next_id`/`next_stream` u32 wrap after ~4B allocations.
-- **P4 — `backend-wasm.ts` `waitForProgress` one-shot `setTimeout` not cleared
-  on close** (harmless no-op, no UAF).
+### Final release gates
 
-### Deep fuzzing (cargo-fuzz, nightly) — optional hardening
-The always-on robustness tests (`tools/fuzz/README.md`) are the regression
-guard. For coverage-guided libFuzzer runs, add a `cargo +nightly fuzz` scaffold
-under `crates/wasm` wrapping the same parser entry points, in a scheduled CI
-job.
+- Candidate immutability: bind the final release proof to one SHA and keep that
+  SHA stable.
+- CI breadth: keep the native, wasm, and browser proof matrix green across the
+  configured OS/runtime set.
+- Evidence: publish coverage, fuzz, scale, soak, and package/provenance
+  artifacts in the release ledger.
+- Review: finish the eight-lane zero-P0-P4 review and confirm no new issues were
+  introduced by the last review round.
+- Freeze: record the final no-change confirmation only after all prior gates are
+  in place.
 
----
+### Review churn that is still active
 
-## Exit criterion for `/wasm` 1.0
-Phase 5 done (parity matrix passes for the wasm backend, types converged) +
-6b/6c + the accepted P3s cleared → `/wasm` can drop its experimental/0.x marking
-and join the package's 1.0 semver commitment. The security work above is a
-prerequisite that is now complete; convergence is what remains.
+- Tasks 7 and 8 are still absorbing review feedback on wasm facade/security
+  behavior.
+- Tasks 13, 14, and 15 are still about evidence generation and release-gate
+  proof, not feature expansion.
+
+## Exit criterion
+
+`/wasm` can join the package 1.0 commitment only after the remaining release
+gates are evidenced in `docs/release-status.json` with commit-bound proof.
+
+Until then, `/wasm` remains a candidate surface and this plan remains the
+current working guide.

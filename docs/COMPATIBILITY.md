@@ -1,19 +1,24 @@
 # Compatibility and support policy
 
-## Runtime support
+The matrices below are the configured 1.0 release targets. They are not current
+support claims while `docs/release-status.json` has no passing `support.tested`
+tuples. A target becomes supported only when that manifest records its
+commit-bound passing evidence.
 
-- **Bun**: >= 1.3.9 (primary target in CI)
-- **Node**: supported (Node-API compatible runtime)
-- **Deno**: supported (npm + Node-API addon support)
+## Runtime targets
+
+- **Bun**: >= 1.3.9 (primary target in CI; evidence pending)
+- **Node**: Node-API compatible runtime (evidence pending)
+- **Deno**: npm + Node-API addon support target (evidence pending)
 
 ## Platform matrix (shipped prebuilds)
 
 | OS      | Arch  | Target         | Status    |
 |---------|-------|----------------|-----------|
-| macOS   | arm64 | darwin-arm64   | supported |
-| macOS   | x64   | darwin-x64     | supported |
-| Linux   | x64   | linux-x64      | supported |
-| Windows | x64   | win32-x64-msvc | supported |
+| macOS   | arm64 | darwin-arm64   | candidate; evidence pending |
+| macOS   | x64   | darwin-x64     | candidate; evidence pending |
+| Linux   | x64   | linux-x64      | candidate; evidence pending |
+| Windows | x64   | win32-x64-msvc | candidate; evidence pending |
 
 ## Node-API
 
@@ -27,12 +32,12 @@ has its own environment matrix, orthogonal to the prebuild table above:
 
 | Scenario | Environment | Status |
 |----------|-------------|--------|
-| Server inside the browser | Chromium Isolated Web App with `direct-sockets` permission (behind `chrome://flags/#enable-isolated-web-apps` + `#enable-isolated-web-app-dev-mode`, or enterprise policy) | supported (manual verification; not CI-runnable — see `tools/interop/WASM_INTEROP.md`) |
+| Server inside the browser | Chromium Isolated Web App with `direct-sockets` and `cross-origin-isolated` permissions | supported only when the scheduled/dispatch `iwa.yml` gate produces passing commit-bound evidence |
 | Server inside the browser | Normal web page, Firefox, Safari | **not possible** — Direct Sockets is IWA/Chromium-only |
-| Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | supported (`wasm-bun-udp` test) |
-| Client (wasm) → native server | Bun/Node host, real UDP | supported (`wasm-native-interop` test) |
-| Chrome's native `WebTransport` client → wasm server | any Chromium | supported (manual harness) |
-| Custom transport | anything implementing `UdpTransport` | supported — the core is sans-IO |
+| Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | implemented and locally tested; release evidence pending |
+| Client (wasm) → native server | Bun/Node host, real UDP | implemented and locally tested; release evidence pending |
+| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; release evidence pending |
+| Custom transport | anything implementing `UdpTransport` | implemented — the core is sans-IO; consumer-specific support is not claimed |
 
 Constraints that apply regardless of environment:
 
@@ -49,7 +54,11 @@ Constraints that apply regardless of environment:
 - **Unsupported options fail loudly**: `allowPooling` and other
   native-/browser-only options are rejected, never silently ignored
   (see `docs/PARITY_MATRIX.md`).
-- **IWA packaging**: signed web bundles, dev-mode install via
-  `chrome://web-app-internals` — see `examples/webtransport-wasm-iwa/README.md`.
-  The IWA install/signing flow is manual and Chromium-version-sensitive;
-  expect flag names and policies to move while IWAs remain behind flags.
+- **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
+  signed Web Bundle installation via Chromium's developer-mode
+  `--install-isolated-web-app-from-file` switch, unsigned source bundle, and
+  Direct Sockets execution are exercised by `.github/workflows/iwa.yml`. The
+  job fails unless the page proves the exact `browser-iwa-direct-sockets`
+  identity and writes evidence bound to the candidate commit plus both the
+  signed and unsigned bundle digests. Manual installation remains available
+  for development; see `examples/webtransport-wasm-iwa/README.md`.

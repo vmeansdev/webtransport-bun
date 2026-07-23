@@ -1,5 +1,12 @@
 # 1.0.0 Hardening Plan — native + TS API (WASM postponed)
 
+> **Historical plan (superseded).** This document records the earlier
+> native-only hardening scope and is not current release status or the active
+> definition of done. Native and WASM now ship under one evidence contract in
+> `docs/superpowers/plans/2026-07-21-faang-plus-1.0-closure.md`; the authoritative
+> current state is `docs/release-status.json` and
+> `docs/RELEASE_1.0_STATUS.md`.
+
 Branch: `release/1.0-hardening`. Goal: close every native + native-path-TS
 defect from the 2026-07-19 four-agent audit so the native surface can be
 honestly frozen at 1.0.0. WASM stays 0.x/experimental (out of scope here).

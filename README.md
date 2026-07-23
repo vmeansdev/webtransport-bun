@@ -98,6 +98,7 @@ Detailed migration playbook:
 ## Documentation
 
 - Docs portal: `docs/START_HERE.md`
+- Canonical release truth: `docs/release-status.json`
 - Pooling semantics (`allowPooling`): `docs/SPEC.md` — Pooling Semantics section
 - GitHub Pages docs site: `https://vmeansdev.github.io/webtransport-bun/`
 - FAQ / troubleshooting: `docs/FAQ.md`
@@ -106,17 +107,17 @@ Detailed migration playbook:
 
 ## Status
 - Native surface is a release candidate: `1.0.0-rc.1`.
-- Version: `1.0.0-rc.1` (RC — not yet stable/GA). The frozen surface is the
-  native (root) entrypoint; the `/wasm` subpath is experimental/0.x and exempt
-  from the 1.0 semver commitment.
-- Runtime support: Bun (`>= 1.3.9`), Node, Deno.
+- Version: `1.0.0-rc.1`. The canonical release status lives in
+  `docs/release-status.json`; the native root entrypoint and `/wasm` are
+  candidate surfaces, not stable/GA.
+- Configured release targets: Bun (`>= 1.3.9`), Node, and Deno. Candidate
+  support remains unclaimed until the matching entries in
+  `docs/release-status.json` have passing evidence.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
-- Known limits: Chromium-focused browser interop target. The RC has zero known
-  P0/P1/P2 defects (verified by multi-pass adversarial review); the full "10M
-  DAU"-scale production claim still awaits the evidence gates in
-  `docs/RELEASE_1.0_STATUS.md` (green remote CI, multi-day soak, scale load).
+- Known limits: Chromium-focused browser interop target. Readiness remains
+  pending in `docs/release-status.json` until the external evidence gates close.
 
-## Support Matrix
+## Configured Target Matrix
 
 ### Runtime
 - Bun `>= 1.3.9`
@@ -140,9 +141,9 @@ pnpm add @webtransport-bun/webtransport
 yarn add @webtransport-bun/webtransport
 ```
 
-Published npm package contents:
+The candidate 1.0 npm artifact is configured to contain:
 - `dist/` compiled JS + TypeScript declarations (`index`, `errors`, `streams`)
-- `prebuilds/` native addon binaries (`.node`) for supported targets
+- `prebuilds/` native addon binaries (`.node`) for the configured target matrix
 - `README.md` and `LICENSE`
 
 Note: GitHub source zip/tar downloads are source snapshots and may not include generated `dist/`. Use npm install (or the release `.tgz` package asset) for a ready-to-run package.
@@ -194,6 +195,9 @@ QUIC/TLS1.3/HTTP3/WebTransport stack compiled to `wasm32-unknown-unknown` —
 including a **server running inside the browser** (issue #12: bring your own
 UDP socket).
 
+The current release status is pending in `docs/release-status.json`; treat the
+`/wasm` surface as a candidate, not stable/GA.
+
 - **Bring your own socket**: the core never touches the network. Any transport
   implementing `UdpTransport` (`send(data, dest)` + `onPacket(data, source)`)
   feeds it raw UDP payloads — Direct Sockets `UDPSocket` in a Chromium
@@ -219,18 +223,19 @@ const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
 
 ### Know before you ship
 
-- **`/wasm` is experimental (0.x) and exempt from the 1.0.0 semver
-  commitment.** The frozen, stability-guaranteed 1.0 API is the native (root)
-  entrypoint. The wasm facade intentionally diverges (callback-style sessions,
-  different close/error semantics) and may change in any minor release until it
-  converges with the native surface. Depend on `/wasm` only if you accept
-  breaking changes.
+- **`/wasm` is a candidate surface, not stable/GA.** The canonical release
+  truth is `docs/release-status.json`. The wasm facade intentionally diverges
+  (callback-style sessions, different close/error semantics) until it converges
+  with the native surface. Depend on `/wasm` only if you accept change.
 - **The in-browser server is Chromium-only, and only inside an Isolated Web
   App.** Direct Sockets `UDPSocket` does not exist on normal web pages, in
   Firefox, or in Safari. Installing an IWA today requires `chrome://flags`
   (`#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`) or
-  enterprise policy. *Connecting* to a wasm server needs no flags — any
-  standard WebTransport client works.
+  enterprise policy. Chromium permission naming is compatibility-sensitive:
+  accept `direct-sockets`, the legacy `direct-sockets-private`, and Chrome 151
+  `local-network` / `loopback-network` labels where the browser exposes them.
+  *Connecting* to a wasm server needs no flags - any standard WebTransport
+  client works.
 - **Certificates expire in ≤ 14 days by design.** `serverCertificateHashes`
   pinning (the only option without a CA-trusted cert) requires ECDSA P-256 and
   a validity window of at most two weeks — `generateCert` clamps to this.
