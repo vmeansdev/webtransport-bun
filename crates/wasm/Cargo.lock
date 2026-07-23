@@ -833,6 +833,7 @@ dependencies = [
  "time",
  "wasm-bindgen",
  "web-time",
+ "x509-parser",
 ]
 
 [[package]]

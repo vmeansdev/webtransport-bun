@@ -20,15 +20,38 @@ no separate job:
   `decode_frame_header_never_panics_on_random_input` (100k inputs) plus the
   oversized-frame and QPACK-overflow regression tests.
 
-## Deep fuzzing (cargo-fuzz, nightly — follow-up)
+## Deep fuzzing (cargo-fuzz, pinned release toolchain)
 
-For coverage-guided libFuzzer runs: `cargo +nightly fuzz init` under
-`crates/wasm`, add targets wrapping the same parser entry points, seed a corpus
-from real handshakes, and run in a scheduled CI job (nightly toolchain).
-Tracked as a follow-up; the always-on robustness tests above are the immediate
-regression guard against parser panics/overflows.
+Release fuzzing now runs through `tools/fuzz/release-smoke.ts` using
+`rustup run 1.95.0 ...` as declared in `.github/release-toolchain.json`. The
+runner requires `cargo-fuzz` plus `llvm-symbolizer` from the pinned toolchain's
+`llvm-tools-preview` component so crash artifacts stay symbolized and
+actionable.
 
 ## JS boundary
 
-Lifecycle property tests (close while writing, reset storms) —
-see `packages/webtransport/test/`.
+Lifecycle property tests (close while writing, reset storms) plus the Bun-side
+`WASM event decoder property harness` live under
+`packages/webtransport/test/`.
+
+## Release smoke gate
+
+Task 14 promotes fuzzing from a README-only follow-up into an explicit release
+gate:
+
+- `bun run fuzz:release-smoke` verifies the checked-in fixed regression corpus
+  under `tools/fuzz/corpora/**` is present and retains both the corpora and the
+  crash directory under `.release-evidence/fuzz/`.
+- The cargo-fuzz targets cover H3 frames, QPACK/Huffman decoding, DER metadata
+  parsing, HandleAllocator boundaries, WtEndpoint event dispatch, event
+  encoding, and governor boundary arithmetic.
+- The stable property-test step covers the hand-rolled H3/QPACK parser tests
+  plus the Bun-side `packages/webtransport/test/wasm-limits.test.ts` decoder
+  harness.
+- When `cargo-fuzz` or `llvm-symbolizer` is missing for the pinned release
+  toolchain, the smoke runner fails with an artifacted tooling blocker instead
+  of silently claiming fuzz coverage.
+- Every spawned command has an outer watchdog; timeout state is artifacted in
+  `commandResults`.
+
+Artifacts default to `.release-evidence/fuzz/release-smoke.json`.

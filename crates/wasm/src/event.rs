@@ -42,6 +42,12 @@ impl WtEvent {
     /// Serialize as: tag(1) || conn varint || [event-specific fields]. Stream
     /// events carry conn first, then stream, then their payload.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_with_host_token(None)
+    }
+
+    /// Payload-bearing events can append a host-reservation token so JS can
+    /// release Rust-side queue ownership exactly once after delivery.
+    pub fn encode_with_host_token(&self, host_token: Option<u32>) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             WtEvent::Connected { conn } => {
@@ -57,6 +63,7 @@ impl WtEvent {
                 varint::encode(*conn as u64, &mut out);
                 varint::encode(data.len() as u64, &mut out);
                 out.extend_from_slice(data);
+                varint::encode(host_token.unwrap_or(0) as u64, &mut out);
             }
             WtEvent::Closed { conn, code } => {
                 out.push(tag::CLOSED);
@@ -81,6 +88,7 @@ impl WtEvent {
                 out.push(if *fin { 1 } else { 0 });
                 varint::encode(data.len() as u64, &mut out);
                 out.extend_from_slice(data);
+                varint::encode(host_token.unwrap_or(0) as u64, &mut out);
             }
             WtEvent::StreamReset { conn, stream, code } => {
                 out.push(tag::STREAM_RESET);

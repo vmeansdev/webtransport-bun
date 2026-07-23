@@ -33,10 +33,14 @@ pub fn generate(
     validity_days: u32,
     not_before_unix: i64,
 ) -> Result<GeneratedCert, String> {
-    let days = validity_days.min(14).max(1) as i64;
+    let days = validity_days.clamp(1, 14) as i64;
     let not_before =
         OffsetDateTime::from_unix_timestamp(not_before_unix).map_err(|e| e.to_string())?;
-    let not_after = not_before + Duration::days(days);
+    let not_after = not_before
+        .checked_add(Duration::days(days))
+        .ok_or_else(|| {
+            "certificate validity end is outside the supported time range".to_string()
+        })?;
 
     let mut params =
         CertificateParams::new(vec![common_name.to_string()]).map_err(|e| e.to_string())?;
@@ -75,5 +79,17 @@ mod tests {
         // Should not error even if asked for a year; clamp keeps browsers happy.
         let c = generate("localhost", 365, 1_700_000_000).expect("cert");
         assert!(!c.cert_der.is_empty());
+    }
+
+    #[test]
+    fn generate_near_maximum_timestamp_should_return_error_instead_of_panicking() {
+        let error = match generate("localhost", 14, 253_402_300_799) {
+            Ok(_) => panic!("validity arithmetic must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "certificate validity end is outside the supported time range"
+        );
     }
 }

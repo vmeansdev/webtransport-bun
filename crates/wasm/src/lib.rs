@@ -6,7 +6,10 @@
 pub mod cert;
 pub mod endpoint;
 pub mod event;
+pub mod governor;
 pub mod h3;
+#[cfg(any(target_arch = "wasm32", test))]
+mod handle;
 pub mod varint;
 mod verify;
 

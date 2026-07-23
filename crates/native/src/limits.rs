@@ -40,10 +40,10 @@ impl Limits {
         let mut lim = Self::default();
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
             if let Some(n) = v.get("maxSessions").and_then(|x| x.as_u64()) {
-                lim.max_sessions = n;
+                lim.max_sessions = n.max(1);
             }
             if let Some(n) = v.get("maxHandshakesInFlight").and_then(|x| x.as_u64()) {
-                lim.max_handshakes_in_flight = n;
+                lim.max_handshakes_in_flight = n.max(1);
             }
             if let Some(n) = v.get("maxStreamsPerSessionBidi").and_then(|x| x.as_u64()) {
                 lim.max_streams_per_session_bidi = n;
@@ -55,7 +55,7 @@ impl Limits {
                 lim.max_streams_global = n;
             }
             if let Some(n) = v.get("maxDatagramSize").and_then(|x| x.as_u64()) {
-                lim.max_datagram_size = n as usize;
+                lim.max_datagram_size = (n as usize).max(1);
             }
             if let Some(n) = v.get("maxQueuedBytesGlobal").and_then(|x| x.as_u64()) {
                 lim.max_queued_bytes_global = n;
@@ -67,15 +67,53 @@ impl Limits {
                 lim.max_queued_bytes_per_stream = n;
             }
             if let Some(n) = v.get("backpressureTimeoutMs").and_then(|x| x.as_u64()) {
-                lim.backpressure_timeout_ms = n;
+                lim.backpressure_timeout_ms = n.max(100);
             }
             if let Some(n) = v.get("handshakeTimeoutMs").and_then(|x| x.as_u64()) {
-                lim.handshake_timeout_ms = n;
+                lim.handshake_timeout_ms = n.max(100);
             }
             if let Some(n) = v.get("idleTimeoutMs").and_then(|x| x.as_u64()) {
-                lim.idle_timeout_ms = n;
+                lim.idle_timeout_ms = n.max(1000);
             }
         }
         lim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zero_max_datagram_size_clamped_to_one() {
+        let lim = Limits::from_json(r#"{"maxDatagramSize": 0}"#);
+        assert_eq!(lim.max_datagram_size, 1);
+    }
+
+    #[test]
+    fn test_zero_max_sessions_clamped_to_one() {
+        let lim = Limits::from_json(r#"{"maxSessions": 0}"#);
+        assert_eq!(lim.max_sessions, 1);
+    }
+
+    #[test]
+    fn test_zero_handshake_timeout_clamped() {
+        let lim = Limits::from_json(r#"{"handshakeTimeoutMs": 0}"#);
+        assert_eq!(lim.handshake_timeout_ms, 100);
+    }
+
+    #[test]
+    fn test_normal_values_pass_through() {
+        let lim = Limits::from_json(r#"{"maxSessions": 500, "maxDatagramSize": 1200}"#);
+        assert_eq!(lim.max_sessions, 500);
+        assert_eq!(lim.max_datagram_size, 1200);
+    }
+
+    #[test]
+    fn test_defaults_unchanged() {
+        let lim = Limits::from_json("{}");
+        assert_eq!(lim.max_sessions, 2000);
+        assert_eq!(lim.max_datagram_size, 1200);
+        assert_eq!(lim.handshake_timeout_ms, 10_000);
     }
 }
