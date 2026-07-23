@@ -3,6 +3,7 @@
  */
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
+import { forEachWithTimeout, nextWithTimeout } from "./helpers/harness.js";
 import {
 	generateCertForNames,
 	generateLocalhostCert,
@@ -237,17 +238,14 @@ describe("TLS contract (P0.3)", () => {
 			onSession: async (s) => {
 				serverSession = s;
 				resolveReady();
-				const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
-				while (true) {
-					const next = await Promise.race([
-						iter.next(),
-						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
-					]);
-					if (next.done) break;
-					const datagram = next.value;
-					if (!datagram) break;
-					await s.sendDatagram(datagram);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"tls rotate identity incoming datagram",
+					async (datagram) => {
+						await s.sendDatagram(datagram);
+					},
+				);
 			},
 		});
 
@@ -269,12 +267,11 @@ describe("TLS contract (P0.3)", () => {
 
 			await before.sendDatagram(new Uint8Array([1, 2, 3, 4]));
 			const iter = before.incomingDatagrams()[Symbol.asyncIterator]();
-			const echoed = await Promise.race([
-				iter.next(),
-				Bun.sleep(3000).then(() => {
-					throw new Error("timeout waiting for echoed datagram after rotation");
-				}),
-			]);
+			const echoed = await nextWithTimeout(
+				iter,
+				3000,
+				"tls rotate identity echoed datagram",
+			);
 			expect(echoed.done).toBe(false);
 			expect(Array.from(echoed.value ?? [])).toEqual([1, 2, 3, 4]);
 
@@ -315,17 +312,14 @@ describe("TLS contract (P0.3)", () => {
 			},
 			onSession: async (s) => {
 				resolveReady();
-				const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
-				while (true) {
-					const next = await Promise.race([
-						iter.next(),
-						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
-					]);
-					if (next.done) break;
-					const datagram = next.value;
-					if (!datagram) break;
-					await s.sendDatagram(datagram);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"tls failed rotation incoming datagram",
+					async (datagram) => {
+						await s.sendDatagram(datagram);
+					},
+				);
 			},
 		});
 
@@ -350,14 +344,11 @@ describe("TLS contract (P0.3)", () => {
 
 			await client.sendDatagram(new Uint8Array([7, 8, 9]));
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const echoed = await Promise.race([
-				iter.next(),
-				Bun.sleep(3000).then(() => {
-					throw new Error(
-						"timeout waiting for echoed datagram after failed rotation",
-					);
-				}),
-			]);
+			const echoed = await nextWithTimeout(
+				iter,
+				3000,
+				"tls failed rotation echoed datagram",
+			);
 			expect(echoed.done).toBe(false);
 			expect(Array.from(echoed.value ?? [])).toEqual([7, 8, 9]);
 
@@ -392,8 +383,12 @@ describe("TLS contract (P0.3)", () => {
 			onSession: async (s) => {
 				serverBSession = s;
 				resolveServerBReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"tls serverB incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 

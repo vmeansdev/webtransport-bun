@@ -16,6 +16,12 @@ import {
 	WebTransport,
 } from "../src/index.js";
 import {
+	forEachWithTimeout,
+	readWithTimeout,
+	waitFor,
+	withTimeout,
+} from "./helpers/harness.js";
+import {
 	connectWithRetry,
 	nextPort,
 	openWTWithRetry,
@@ -35,38 +41,6 @@ const NO_RATE_LIMIT = {
 	datagramsBurst: 100_000,
 };
 
-async function withTimeout<T>(
-	promise: Promise<T>,
-	ms: number,
-	label: string,
-): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(
-			() => reject(new Error(`timeout after ${ms}ms: ${label}`)),
-			ms,
-		);
-	});
-	try {
-		return await Promise.race([promise, timeout]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
-}
-
-async function waitUntil(
-	condition: () => boolean,
-	timeoutMs: number,
-	intervalMs = 25,
-): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (condition()) return true;
-		await Bun.sleep(intervalMs);
-	}
-	return condition();
-}
-
 describe("hardening regressions", () => {
 	it("1. no cross-stream head-of-line blocking (per-stream scheduling)", async () => {
 		const port = nextPort(24600, 500);
@@ -80,25 +54,38 @@ describe("hardening regressions", () => {
 			rateLimits: NO_RATE_LIMIT,
 			onSession: (s: ServerSession) => {
 				void (async () => {
-					for await (const duplex of s.incomingBidirectionalStreams) {
-						void (async () => {
-							const reader = duplex.readable.getReader();
-							const first = await reader.read();
-							const tag = first.value?.[0];
-							if (tag === DRAIN_TAG) {
-								seen.drain = true;
-								// Keep reading so this stream never backpressures.
-								while (true) {
-									const { done } = await reader.read();
-									if (done) break;
+					await forEachWithTimeout(
+						s.incomingBidirectionalStreams,
+						5000,
+						"hardening regressions scheduling incoming bidi",
+						async (duplex) => {
+							void (async () => {
+								const reader = duplex.readable.getReader();
+								const first = await readWithTimeout(
+									reader,
+									5000,
+									"stream scheduling classification read",
+								);
+								const tag = first.value?.[0];
+								if (tag === DRAIN_TAG) {
+									seen.drain = true;
+									// Keep reading so this stream never backpressures.
+									while (true) {
+										const { done } = await readWithTimeout(
+											reader,
+											5000,
+											"drain stream classification follow-up read",
+										);
+										if (done) break;
+									}
+								} else {
+									// Stall stream: identify it, then never read again so the
+									// client's writes to it park on flow control.
+									seen.stall = true;
 								}
-							} else {
-								// Stall stream: identify it, then never read again so the
-								// client's writes to it park on flow control.
-								seen.stall = true;
-							}
-						})().catch(() => {});
-					}
+							})().catch(() => {});
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -119,8 +106,13 @@ describe("hardening regressions", () => {
 			await wA.write(new Uint8Array([STALL_TAG]));
 			await wB.write(new Uint8Array([DRAIN_TAG]));
 
-			const classified = await waitUntil(() => seen.stall && seen.drain, 5000);
-			expect(classified).toBe(true);
+			await waitFor(
+				() => seen.stall && seen.drain,
+				Boolean,
+				5000,
+				25,
+				"stall/drain stream classification",
+			);
 
 			// Flood stream A. The server never reads it, so this loop parks on
 			// wA.ready and occupies the send path's head.
@@ -211,12 +203,14 @@ describe("hardening regressions", () => {
 
 			// Every session that was actually established must be torn down, not
 			// leaked until idle timeout.
-			const drained = await waitUntil(
+			await waitFor(
 				() => server.metricsSnapshot().sessionsActive === 0,
+				Boolean,
 				15000,
+				25,
+				"sessionsActive drain after close/connect race",
 			);
 			expect(server.metricsSnapshot().sessionsActive).toBe(0);
-			expect(drained).toBe(true);
 		} finally {
 			await server.close();
 		}
@@ -260,13 +254,15 @@ describe("hardening regressions", () => {
 
 			// Every accepted session must eventually emit its Closed event.
 			// Pre-fix, Closed events were silently dropped under burst.
-			const allClosed = await waitUntil(
+			await waitFor(
 				() => closedIds.size === acceptedIds.size && acceptedIds.size > 600,
+				Boolean,
 				30000,
+				25,
+				"closed event burst drain",
 			);
 			const missing = [...acceptedIds].filter((id) => !closedIds.has(id));
 			expect(missing).toEqual([]);
-			expect(allClosed).toBe(true);
 		} finally {
 			await server.close();
 		}
@@ -312,8 +308,8 @@ describe("hardening regressions", () => {
 		try {
 			// Obtain the incoming stream object but never consume it.
 			const outer = wt.incomingUnidirectionalStreams.getReader();
-			const { value: recvStream } = await withTimeout(
-				outer.read(),
+			const { value: recvStream } = await readWithTimeout(
+				outer,
 				8000,
 				"incoming unidirectional stream never arrived",
 			);
@@ -340,18 +336,27 @@ describe("hardening regressions", () => {
 			rateLimits: NO_RATE_LIMIT,
 			onSession: (s: ServerSession) => {
 				void (async () => {
-					for await (const duplex of s.incomingBidirectionalStreams) {
-						void (async () => {
-							const reader = duplex.readable.getReader();
-							const writer = duplex.writable.getWriter();
-							while (true) {
-								const { done, value } = await reader.read();
-								if (done) break;
-								if (value) await writer.write(value);
-							}
-							await writer.close();
-						})().catch(() => {});
-					}
+					await forEachWithTimeout(
+						s.incomingBidirectionalStreams,
+						5000,
+						"hardening regressions wire stats incoming bidi",
+						async (duplex) => {
+							void (async () => {
+								const reader = duplex.readable.getReader();
+								const writer = duplex.writable.getWriter();
+								while (true) {
+									const { done, value } = await readWithTimeout(
+										reader,
+										10000,
+										"stream-only stats echo read",
+									);
+									if (done) break;
+									if (value) await writer.write(value);
+								}
+								await writer.close();
+							})().catch(() => {});
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -369,7 +374,11 @@ describe("hardening regressions", () => {
 			let received = 0;
 			const readAll = (async () => {
 				while (true) {
-					const { done, value } = await reader.read();
+					const { done, value } = await readWithTimeout(
+						reader,
+						10000,
+						"stream-only stats client read",
+					);
 					if (done) break;
 					if (value) received += value.byteLength;
 				}
@@ -434,8 +443,8 @@ describe("hardening regressions", () => {
 			const reader = wt.incomingUnidirectionalStreams.getReader();
 			const drained: Promise<number>[] = [];
 			for (let s = 0; s < STREAMS; s++) {
-				const { value: recvStream, done } = await withTimeout(
-					reader.read(),
+				const { value: recvStream, done } = await readWithTimeout(
+					reader,
 					30000,
 					`incoming stream ${s} never arrived`,
 				);
@@ -446,8 +455,8 @@ describe("hardening regressions", () => {
 						const r = (recvStream as ReadableStream<Uint8Array>).getReader();
 						let got = 0;
 						while (true) {
-							const { done: d, value } = await withTimeout(
-								r.read(),
+							const { done: d, value } = await readWithTimeout(
+								r,
 								30000,
 								"a concurrent stream stalled (budget-notify starvation)",
 							);
@@ -497,8 +506,8 @@ describe("hardening regressions", () => {
 		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, INSECURE);
 		try {
 			const outer = wt.incomingUnidirectionalStreams.getReader();
-			const { value: recvStream } = await withTimeout(
-				outer.read(),
+			const { value: recvStream } = await readWithTimeout(
+				outer,
 				8000,
 				"incoming unidirectional stream never arrived",
 			);
@@ -513,8 +522,8 @@ describe("hardening regressions", () => {
 			const reader = (recvStream as ReadableStream<Uint8Array>).getReader();
 			let received = 0;
 			while (true) {
-				const { done, value } = await withTimeout(
-					reader.read(),
+				const { done, value } = await readWithTimeout(
+					reader,
 					20000,
 					"stalled receive stream did not resume delivering",
 				);

@@ -5,6 +5,7 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer, toWebTransport } from "../src/index.js";
+import { collectWithTimeout } from "./helpers/harness.js";
 import {
 	nextPort,
 	openWTWithRetry,
@@ -122,23 +123,14 @@ describe("parity facade lifecycle (P1)", () => {
 		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		const done = (async () => {
-			let count = 0;
-			for await (const _ of session.incomingDatagrams()) {
-				count++;
-			}
-			return count;
-		})();
 		session.close({ code: 1000, reason: "termination test" });
-		const count = await Promise.race([
-			done,
-			new Promise<number>((_, rej) =>
-				setTimeout(
-					() => rej(new Error("incomingDatagrams did not terminate within 5s")),
-					5000,
-				),
-			),
-		]);
+		const count = (
+			await collectWithTimeout(
+				session.incomingDatagrams(),
+				5000,
+				"parity facade lifecycle incoming datagrams termination",
+			)
+		).length;
 		expect(count).toBe(0);
 	});
 
@@ -146,28 +138,14 @@ describe("parity facade lifecycle (P1)", () => {
 		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		const done = (async () => {
-			let count = 0;
-			for await (const _ of session.incomingBidirectionalStreams()) {
-				count++;
-			}
-			return count;
-		})();
 		session.close({ code: 1000, reason: "bidi termination test" });
-		const count = await Promise.race([
-			done,
-			new Promise<number>((_, rej) =>
-				setTimeout(
-					() =>
-						rej(
-							new Error(
-								"incomingBidirectionalStreams did not terminate within 5s",
-							),
-						),
-					5000,
-				),
-			),
-		]);
+		const count = (
+			await collectWithTimeout(
+				session.incomingBidirectionalStreams(),
+				5000,
+				"parity facade lifecycle incoming bidi termination",
+			)
+		).length;
 		expect(count).toBe(0);
 	});
 
@@ -175,28 +153,14 @@ describe("parity facade lifecycle (P1)", () => {
 		const session = await connectWithRetry(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
 		});
-		const done = (async () => {
-			let count = 0;
-			for await (const _ of session.incomingUnidirectionalStreams()) {
-				count++;
-			}
-			return count;
-		})();
 		session.close({ code: 1000, reason: "uni termination test" });
-		const count = await Promise.race([
-			done,
-			new Promise<number>((_, rej) =>
-				setTimeout(
-					() =>
-						rej(
-							new Error(
-								"incomingUnidirectionalStreams did not terminate within 5s",
-							),
-						),
-					5000,
-				),
-			),
-		]);
+		const count = (
+			await collectWithTimeout(
+				session.incomingUnidirectionalStreams(),
+				5000,
+				"parity facade lifecycle incoming uni termination",
+			)
+		).length;
 		expect(count).toBe(0);
 	});
 });

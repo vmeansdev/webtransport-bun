@@ -5,10 +5,26 @@
 // `UdpTransport` (Direct Sockets in production, InMemoryRelay in tests).
 
 import {
-	type WasmModule,
 	WasmEndpoint,
+	type WasmEndpointConstructorOptions,
+	type WasmModule,
 	type WasmSessionEvents,
 } from "./backend-wasm.js";
+import {
+	E_BACKPRESSURE_TIMEOUT,
+	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
+	E_SESSION_CLOSED,
+	E_SESSION_IDLE_TIMEOUT,
+	E_STOP_SENDING,
+	E_STREAM_RESET,
+	E_TLS,
+	type ErrorCode,
+	WebTransportError,
+} from "./errors.js";
 import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import { WasmWebTransport } from "./wasm-webtransport.js";
@@ -16,15 +32,296 @@ import { wasmToWebTransportLike } from "./webtransport-like-wasm.js";
 
 export { WasmWebTransport } from "./wasm-webtransport.js";
 
+export type WasmLimitsOptions = {
+	maxSessions?: number;
+	maxHandshakesInFlight?: number;
+	maxStreamsPerSessionBidi?: number;
+	maxStreamsPerSessionUni?: number;
+	maxStreamsGlobal?: number;
+	maxDatagramSize?: number;
+	maxQueuedBytesGlobal?: number;
+	maxQueuedBytesPerSession?: number;
+	maxQueuedBytesPerStream?: number;
+	backpressureTimeoutMs?: number;
+	handshakeTimeoutMs?: number;
+	idleTimeoutMs?: number;
+};
+
+export type WasmRateLimitOptions = {
+	handshakesPerSec?: number;
+	handshakesBurst?: number;
+	streamOpensPerSec?: number;
+	streamOpensBurst?: number;
+	datagramsIngressPerSec?: number;
+	datagramsIngressBurst?: number;
+};
+
+export const DEFAULT_WASM_LIMITS = {
+	maxSessions: 2000,
+	maxHandshakesInFlight: 200,
+	maxStreamsPerSessionBidi: 200,
+	maxStreamsPerSessionUni: 200,
+	maxStreamsGlobal: 50_000,
+	maxDatagramSize: 1200,
+	maxQueuedBytesGlobal: 512 * 1024 * 1024,
+	maxQueuedBytesPerSession: 2 * 1024 * 1024,
+	maxQueuedBytesPerStream: 256 * 1024,
+	backpressureTimeoutMs: 5_000,
+	handshakeTimeoutMs: 10_000,
+	idleTimeoutMs: 60_000,
+} as const;
+
+export const DEFAULT_WASM_RATE_LIMITS = {
+	handshakesPerSec: 20,
+	handshakesBurst: 40,
+	streamOpensPerSec: 200,
+	streamOpensBurst: 400,
+	datagramsIngressPerSec: 2000,
+	datagramsIngressBurst: 5000,
+} as const;
+
+export type WasmNormalizedLimits = {
+	[K in keyof typeof DEFAULT_WASM_LIMITS]: number;
+};
+export type WasmNormalizedRateLimits = {
+	[K in keyof typeof DEFAULT_WASM_RATE_LIMITS]: number;
+};
+
+export type WasmEndpointOptions = {
+	limits?: WasmLimitsOptions;
+	rateLimits?: WasmRateLimitOptions;
+};
+
+export type WasmNormalizedEndpointOptions = {
+	limits: WasmNormalizedLimits;
+	rateLimits: WasmNormalizedRateLimits;
+};
+
+const WASM_U32_MAX = 0xffff_ffff;
+const HOST_TIMER_MAX_MS = 0x7fff_ffff;
+const WASM_STABLE_ERROR_CODES: readonly ErrorCode[] = [
+	E_TLS,
+	E_HANDSHAKE_TIMEOUT,
+	E_SESSION_CLOSED,
+	E_SESSION_IDLE_TIMEOUT,
+	E_STREAM_RESET,
+	E_STOP_SENDING,
+	E_QUEUE_FULL,
+	E_BACKPRESSURE_TIMEOUT,
+	E_LIMIT_EXCEEDED,
+	E_RATE_LIMITED,
+	E_INTERNAL,
+];
+
+function wasmOperationError(
+	detail: string,
+	fallbackCode: ErrorCode,
+	fallbackMessage: string,
+	streamErrorCode: number | null = null,
+): WebTransportError {
+	const code =
+		WASM_STABLE_ERROR_CODES.find(
+			(candidate) => detail === candidate || detail.startsWith(`${candidate}:`),
+		) ?? fallbackCode;
+	return new WebTransportError(code, detail || `${code}: ${fallbackMessage}`, {
+		streamErrorCode,
+	});
+}
+
+function normalizePositiveInteger(
+	name: string,
+	value: number,
+	maximum = WASM_U32_MAX,
+): number {
+	if (!Number.isFinite(value) || !Number.isInteger(value)) {
+		throw new TypeError(`${name} must be a finite integer`);
+	}
+	if (value <= 0) {
+		throw new RangeError(`${name} must be a positive integer`);
+	}
+	if (value > maximum) {
+		const range = maximum === HOST_TIMER_MAX_MS ? "host timer" : "WASM integer";
+		throw new RangeError(`${name} exceeds the supported ${range} range`);
+	}
+	return value;
+}
+
+export function normalizeWasmEndpointOptions(
+	options: WasmEndpointOptions = {},
+): WasmNormalizedEndpointOptions {
+	const limits = {
+		maxSessions: normalizePositiveInteger(
+			"limits.maxSessions",
+			options.limits?.maxSessions ?? DEFAULT_WASM_LIMITS.maxSessions,
+		),
+		maxHandshakesInFlight: normalizePositiveInteger(
+			"limits.maxHandshakesInFlight",
+			options.limits?.maxHandshakesInFlight ??
+				DEFAULT_WASM_LIMITS.maxHandshakesInFlight,
+		),
+		maxStreamsPerSessionBidi: normalizePositiveInteger(
+			"limits.maxStreamsPerSessionBidi",
+			options.limits?.maxStreamsPerSessionBidi ??
+				DEFAULT_WASM_LIMITS.maxStreamsPerSessionBidi,
+		),
+		maxStreamsPerSessionUni: normalizePositiveInteger(
+			"limits.maxStreamsPerSessionUni",
+			options.limits?.maxStreamsPerSessionUni ??
+				DEFAULT_WASM_LIMITS.maxStreamsPerSessionUni,
+		),
+		maxStreamsGlobal: normalizePositiveInteger(
+			"limits.maxStreamsGlobal",
+			options.limits?.maxStreamsGlobal ?? DEFAULT_WASM_LIMITS.maxStreamsGlobal,
+		),
+		maxDatagramSize: normalizePositiveInteger(
+			"limits.maxDatagramSize",
+			options.limits?.maxDatagramSize ?? DEFAULT_WASM_LIMITS.maxDatagramSize,
+		),
+		maxQueuedBytesGlobal: normalizePositiveInteger(
+			"limits.maxQueuedBytesGlobal",
+			options.limits?.maxQueuedBytesGlobal ??
+				DEFAULT_WASM_LIMITS.maxQueuedBytesGlobal,
+		),
+		maxQueuedBytesPerSession: normalizePositiveInteger(
+			"limits.maxQueuedBytesPerSession",
+			options.limits?.maxQueuedBytesPerSession ??
+				DEFAULT_WASM_LIMITS.maxQueuedBytesPerSession,
+		),
+		maxQueuedBytesPerStream: normalizePositiveInteger(
+			"limits.maxQueuedBytesPerStream",
+			options.limits?.maxQueuedBytesPerStream ??
+				DEFAULT_WASM_LIMITS.maxQueuedBytesPerStream,
+		),
+		backpressureTimeoutMs: normalizePositiveInteger(
+			"limits.backpressureTimeoutMs",
+			options.limits?.backpressureTimeoutMs ??
+				DEFAULT_WASM_LIMITS.backpressureTimeoutMs,
+			HOST_TIMER_MAX_MS,
+		),
+		handshakeTimeoutMs: normalizePositiveInteger(
+			"limits.handshakeTimeoutMs",
+			options.limits?.handshakeTimeoutMs ??
+				DEFAULT_WASM_LIMITS.handshakeTimeoutMs,
+			HOST_TIMER_MAX_MS,
+		),
+		idleTimeoutMs: normalizePositiveInteger(
+			"limits.idleTimeoutMs",
+			options.limits?.idleTimeoutMs ?? DEFAULT_WASM_LIMITS.idleTimeoutMs,
+			HOST_TIMER_MAX_MS,
+		),
+	} as const;
+
+	if (limits.maxQueuedBytesPerStream > limits.maxQueuedBytesPerSession) {
+		throw new RangeError(
+			"limits.maxQueuedBytesPerStream must be <= limits.maxQueuedBytesPerSession",
+		);
+	}
+	if (limits.maxQueuedBytesPerSession > limits.maxQueuedBytesGlobal) {
+		throw new RangeError(
+			"limits.maxQueuedBytesPerSession must be <= limits.maxQueuedBytesGlobal",
+		);
+	}
+	if (limits.maxStreamsPerSessionBidi > limits.maxStreamsGlobal) {
+		throw new RangeError(
+			"limits.maxStreamsPerSessionBidi must be <= limits.maxStreamsGlobal",
+		);
+	}
+	if (limits.maxStreamsPerSessionUni > limits.maxStreamsGlobal) {
+		throw new RangeError(
+			"limits.maxStreamsPerSessionUni must be <= limits.maxStreamsGlobal",
+		);
+	}
+	if (limits.handshakeTimeoutMs > limits.idleTimeoutMs) {
+		throw new RangeError(
+			"limits.handshakeTimeoutMs must be <= limits.idleTimeoutMs",
+		);
+	}
+
+	const rateLimits = {
+		handshakesPerSec: normalizePositiveInteger(
+			"rateLimits.handshakesPerSec",
+			options.rateLimits?.handshakesPerSec ??
+				DEFAULT_WASM_RATE_LIMITS.handshakesPerSec,
+		),
+		handshakesBurst: normalizePositiveInteger(
+			"rateLimits.handshakesBurst",
+			options.rateLimits?.handshakesBurst ??
+				DEFAULT_WASM_RATE_LIMITS.handshakesBurst,
+		),
+		streamOpensPerSec: normalizePositiveInteger(
+			"rateLimits.streamOpensPerSec",
+			options.rateLimits?.streamOpensPerSec ??
+				DEFAULT_WASM_RATE_LIMITS.streamOpensPerSec,
+		),
+		streamOpensBurst: normalizePositiveInteger(
+			"rateLimits.streamOpensBurst",
+			options.rateLimits?.streamOpensBurst ??
+				DEFAULT_WASM_RATE_LIMITS.streamOpensBurst,
+		),
+		datagramsIngressPerSec: normalizePositiveInteger(
+			"rateLimits.datagramsIngressPerSec",
+			options.rateLimits?.datagramsIngressPerSec ??
+				DEFAULT_WASM_RATE_LIMITS.datagramsIngressPerSec,
+		),
+		datagramsIngressBurst: normalizePositiveInteger(
+			"rateLimits.datagramsIngressBurst",
+			options.rateLimits?.datagramsIngressBurst ??
+				DEFAULT_WASM_RATE_LIMITS.datagramsIngressBurst,
+		),
+	} as const;
+
+	if (rateLimits.handshakesBurst < rateLimits.handshakesPerSec) {
+		throw new RangeError(
+			"rateLimits.handshakesBurst must be >= rateLimits.handshakesPerSec",
+		);
+	}
+	if (rateLimits.streamOpensBurst < rateLimits.streamOpensPerSec) {
+		throw new RangeError(
+			"rateLimits.streamOpensBurst must be >= rateLimits.streamOpensPerSec",
+		);
+	}
+	if (rateLimits.datagramsIngressBurst < rateLimits.datagramsIngressPerSec) {
+		throw new RangeError(
+			"rateLimits.datagramsIngressBurst must be >= rateLimits.datagramsIngressPerSec",
+		);
+	}
+
+	return { limits, rateLimits };
+}
+
 /**
- * Caps on the per-session buffers that hold events arriving BEFORE the app
- * attaches a consumer. Without them, a peer flooding datagrams or opening many
- * streams before `onDatagram`/`onStream` is called grows memory without bound.
+ * Opaque ownership of one payload already charged to the Rust governor.
+ * Queues move this object with the payload and release it exactly once when
+ * the library no longer retains that payload.
  */
-const MAX_PENDING_DATAGRAMS = 1024;
-const MAX_PENDING_INCOMING_STREAMS = 256;
-/** Per-stream cap on inbound bytes buffered before the app attaches onData. */
-const MAX_PENDING_STREAM_BYTES = 1 << 20; // 1 MiB
+export interface WasmPayloadReservation {
+	readonly bytes: number;
+	readonly released: boolean;
+	release(): boolean;
+}
+
+type RetainedPayload = {
+	data: Uint8Array;
+	reservation?: WasmPayloadReservation;
+};
+
+type RetainedStreamPayload = RetainedPayload & { fin: boolean };
+
+type ReservationDeliveryOptions = {
+	/** @internal The callback assumes ownership and must release on dequeue/drop. */
+	retainReservation?: boolean;
+};
+
+function accountedReservationBytes(
+	data: Uint8Array,
+	reservation?: WasmPayloadReservation,
+	fin = false,
+): number {
+	if (fin && data.length === 0) {
+		return reservation?.bytes ?? 0;
+	}
+	return Math.max(1, reservation?.bytes ?? data.length);
+}
 
 /** True when the wasm backend should be used (Direct Sockets available). */
 export function isWasmRuntime(): boolean {
@@ -41,10 +338,17 @@ export function selectBackend(): BackendKind {
 
 /** A WebTransport stream surfaced through the wasm facade. */
 export class WasmStream {
-	private dataCb: ((data: Uint8Array, fin: boolean) => void) | null = null;
+	private dataCb:
+		| ((
+				data: Uint8Array,
+				fin: boolean,
+				reservation?: WasmPayloadReservation,
+		  ) => void)
+		| null = null;
+	private dataCbRetainsReservation = false;
 	private resetCb: ((code: number) => void) | null = null;
 	private stoppedCb: ((code: number) => void) | null = null;
-	private buffered: Array<{ data: Uint8Array; fin: boolean }> = [];
+	private buffered: RetainedStreamPayload[] = [];
 	private bufferedBytes = 0;
 	/** Set when the peer STOP_SENDINGs our send half: writes will fail. */
 	private stopCode: number | null = null;
@@ -84,21 +388,39 @@ export class WasmStream {
 		// regains control across the await and may reuse its buffer.
 		let owned: Uint8Array | null = null;
 		let off = 0;
+		const deadline = Date.now() + this.mgr.options.limits.backpressureTimeoutMs;
 		while (off < data.length) {
 			if (this.stopCode !== null) {
-				throw new Error(`stream stopped by peer (code ${this.stopCode})`);
+				throw new WebTransportError(
+					E_STOP_SENDING,
+					`${E_STOP_SENDING}: stream stopped by peer (code ${this.stopCode})`,
+					{ streamErrorCode: this.stopCode },
+				);
 			}
 			const view = owned ? owned.subarray(off) : data.subarray(off);
 			const n = this.write(view);
 			if (n < 0) {
-				throw new Error("stream write failed (stream closed or reset)");
+				throw this.mgr._streamWriteError(this.conn);
 			}
 			off += n;
 			if (off < data.length) {
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					throw new WebTransportError(
+						E_BACKPRESSURE_TIMEOUT,
+						`${E_BACKPRESSURE_TIMEOUT}: stream write remained blocked past backpressureTimeoutMs`,
+					);
+				}
 				if (!owned) owned = data.slice(); // snapshot once before yielding
 				// Window closed — wait for real progress (next pump) instead of
 				// a fixed 1ms poll, capped so a stalled peer can't hang forever.
-				await this.mgr.endpoint.waitForProgress();
+				await this.mgr.endpoint.waitForProgress(Math.min(50, remainingMs));
+				if (Date.now() >= deadline) {
+					throw new WebTransportError(
+						E_BACKPRESSURE_TIMEOUT,
+						`${E_BACKPRESSURE_TIMEOUT}: stream write remained blocked past backpressureTimeoutMs`,
+					);
+				}
 			}
 		}
 	}
@@ -124,14 +446,35 @@ export class WasmStream {
 	stop(code: number): void {
 		this.mgr.endpoint.streamStop(this.handle, code);
 		this.recvDone = true;
+		this._dropRetained();
 		this._maybeRelease();
 	}
 
-	onData(cb: (data: Uint8Array, fin: boolean) => void): void {
+	onData(
+		cb: (
+			data: Uint8Array,
+			fin: boolean,
+			reservation?: WasmPayloadReservation,
+		) => void,
+		options: ReservationDeliveryOptions = {},
+	): void {
 		this.dataCb = cb;
-		for (const ev of this.buffered) cb(ev.data, ev.fin);
+		this.dataCbRetainsReservation = options.retainReservation === true;
+		const buffered = this.buffered;
 		this.buffered = [];
 		this.bufferedBytes = 0;
+		for (let index = 0; index < buffered.length; index += 1) {
+			const item = buffered[index];
+			if (!item) continue;
+			try {
+				this._deliverData(item);
+			} catch (error) {
+				for (const pending of buffered.slice(index + 1)) {
+					pending.reservation?.release();
+				}
+				throw error;
+			}
+		}
 	}
 	onReset(cb: (code: number) => void): void {
 		this.resetCb = cb;
@@ -143,19 +486,31 @@ export class WasmStream {
 	}
 
 	/** @internal */
-	_pushData(data: Uint8Array, fin: boolean): void {
+	_pushData(
+		data: Uint8Array,
+		fin: boolean,
+		reservation?: WasmPayloadReservation,
+	): void {
+		const retained = { data, fin, reservation };
 		if (this.dataCb) {
-			this.dataCb(data, fin);
+			this._deliverData(retained);
 		} else {
-			// Bound un-consumed inbound data: if the app hasn't attached onData
-			// and the peer floods past the cap, STOP_SENDING the recv half rather
-			// than buffer without bound (OOM). Data already buffered is preserved
-			// for a late onData; no further data will arrive after the stop.
-			this.buffered.push({ data, fin });
-			this.bufferedBytes += data.length;
-			if (this.bufferedBytes > MAX_PENDING_STREAM_BYTES && !this.recvDone) {
-				this.stop(0);
+			const nextBytes =
+				this.bufferedBytes + accountedReservationBytes(data, reservation, fin);
+			if (nextBytes > this.mgr.options.limits.maxQueuedBytesPerStream) {
+				reservation?.release();
+				this.mgr._reportResourceError(
+					new Error("E_QUEUE_FULL: maxQueuedBytesPerStream reached"),
+				);
+				if (!this.recvDone) {
+					this.mgr.endpoint.streamStop(this.handle, 0);
+					this.recvDone = true;
+					this._maybeRelease();
+				}
+				return;
 			}
+			this.buffered.push(retained);
+			this.bufferedBytes = nextBytes;
 		}
 		if (fin) {
 			this.recvDone = true;
@@ -164,6 +519,7 @@ export class WasmStream {
 	}
 	/** @internal */
 	_pushReset(code: number): void {
+		this._dropRetained();
 		this.resetCb?.(code);
 		// A reset ends the recv half. On connection teardown the manager also
 		// force-releases, so mark the send half done too to guarantee release.
@@ -185,6 +541,7 @@ export class WasmStream {
 	 * already settled and must not get a spurious reset), then releases.
 	 */
 	_closeFromConnection(code: number): void {
+		this._dropRetained();
 		if (!this.recvDone) {
 			this.recvDone = true;
 			this.resetCb?.(code);
@@ -197,27 +554,60 @@ export class WasmStream {
 	private _maybeRelease(): void {
 		if (this.recvDone && this.sendDone) this.mgr._releaseStream(this.handle);
 	}
+
+	/** @internal Release every payload still retained before a consumer. */
+	_dropRetained(): void {
+		for (const item of this.buffered) item.reservation?.release();
+		this.buffered = [];
+		this.bufferedBytes = 0;
+	}
+
+	private _deliverData(item: RetainedStreamPayload): void {
+		const callback = this.dataCb;
+		if (!callback) return;
+		if (this.dataCbRetainsReservation) {
+			try {
+				callback(item.data, item.fin, item.reservation);
+			} catch (error) {
+				item.reservation?.release();
+				throw error;
+			}
+			return;
+		}
+		try {
+			callback(item.data, item.fin);
+		} finally {
+			item.reservation?.release();
+		}
+	}
 }
 
 /** A WebTransport session (one QUIC connection) through the wasm facade. */
 export class WasmSession {
 	/** Resolves once established; REJECTS if the connection fails first. */
 	readonly ready: Promise<void>;
-	/** Resolves (never rejects) with close info when the session ends. */
+	/** Resolves with close info after establishment, rejects if connect fails. */
 	readonly closed: Promise<WtCloseInfo>;
 	private resolveReady!: () => void;
 	private rejectReady!: (err: Error) => void;
 	private resolveClosed!: (info: WtCloseInfo) => void;
+	private rejectClosed!: (err: Error) => void;
 	private isClosed = false;
+	private closeRequested = false;
 	private established = false;
-	private datagramCb: ((data: Uint8Array) => void) | null = null;
-	private datagramQueue: Uint8Array[] = [];
+	private datagramCb:
+		| ((data: Uint8Array, reservation?: WasmPayloadReservation) => void)
+		| null = null;
+	private datagramCbRetainsReservation = false;
+	private datagramQueue: RetainedPayload[] = [];
+	private datagramQueuedBytes = 0;
 	private incomingCb: ((stream: WasmStream) => void) | null = null;
 	private incomingQueue: WasmStream[] = [];
 
 	constructor(
 		private mgr: WasmTransportManager,
 		readonly conn: number,
+		private readonly configuredMaxDatagramSize: number,
 	) {
 		this.ready = new Promise((res, rej) => {
 			this.resolveReady = res;
@@ -226,13 +616,31 @@ export class WasmSession {
 		// A failed connect rejects `ready`; fire-and-forget consumers that only
 		// use `closed` must not die of an unhandled rejection.
 		this.ready.catch(() => {});
-		this.closed = new Promise((res) => {
+		this.closed = new Promise((res, rej) => {
 			this.resolveClosed = res;
+			this.rejectClosed = rej;
 		});
+		this.closed.catch(() => {});
 	}
 
-	sendDatagram(data: Uint8Array): boolean {
-		return this.mgr.endpoint.sendDatagram(this.conn, data);
+	get maxDatagramSize(): number {
+		return this.mgr._effectiveMaxDatagramSize(
+			this.conn,
+			this.configuredMaxDatagramSize,
+		);
+	}
+
+	async sendDatagram(data: Uint8Array): Promise<void> {
+		this.assertOpen("send a datagram");
+		if (data.byteLength > this.maxDatagramSize) {
+			throw new WebTransportError(
+				E_LIMIT_EXCEEDED,
+				`${E_LIMIT_EXCEEDED}: maxDatagramSize exceeded`,
+			);
+		}
+		if (!this.mgr.endpoint.sendDatagram(this.conn, data)) {
+			throw this.mgr._datagramSendError(this.conn);
+		}
 	}
 
 	/**
@@ -240,18 +648,39 @@ export class WasmSession {
 	 * sessions on the same endpoint are unaffected.
 	 */
 	close(info?: WtCloseInfo): void {
+		if (this.isClosed || this.closeRequested) return;
+		this.closeRequested = true;
 		this.mgr.closeSession(this, info);
 	}
-	onDatagram(cb: (data: Uint8Array) => void): void {
+	onDatagram(
+		cb: (data: Uint8Array, reservation?: WasmPayloadReservation) => void,
+		options: ReservationDeliveryOptions = {},
+	): void {
 		this.datagramCb = cb;
-		for (const d of this.datagramQueue) cb(d);
+		this.datagramCbRetainsReservation = options.retainReservation === true;
+		const datagrams = this.datagramQueue;
 		this.datagramQueue = [];
+		this.datagramQueuedBytes = 0;
+		for (let index = 0; index < datagrams.length; index += 1) {
+			const item = datagrams[index];
+			if (!item) continue;
+			try {
+				this._deliverDatagram(item);
+			} catch (error) {
+				for (const pending of datagrams.slice(index + 1)) {
+					pending.reservation?.release();
+				}
+				throw error;
+			}
+		}
 	}
 
 	createBidirectionalStream(): WasmStream {
+		this.assertOpen("create a bidirectional stream");
 		return this.mgr.openStream(this, true);
 	}
 	createUnidirectionalStream(): WasmStream {
+		this.assertOpen("create a unidirectional stream");
 		return this.mgr.openStream(this, false);
 	}
 	onIncomingStream(cb: (stream: WasmStream) => void): void {
@@ -268,32 +697,46 @@ export class WasmSession {
 		}
 	}
 	/** @internal */
-	_markClosed(info: WtCloseInfo): void {
+	_markClosed(info: WtCloseInfo, errorDetail = ""): void {
 		if (!this.isClosed) {
 			this.isClosed = true;
+			this._dropRetained();
 			if (!this.established) {
-				this.rejectReady(
-					new Error(
-						`connection closed before session established (code ${info.code ?? 0})`,
-					),
+				const error = wasmOperationError(
+					errorDetail ||
+						`${E_SESSION_CLOSED}: connection closed before session established (code ${info.code ?? 0})`,
+					E_SESSION_CLOSED,
+					"connection closed before session established",
 				);
+				this.rejectReady(error);
+				this.rejectClosed(error);
+				return;
 			}
 			this.resolveClosed(info);
 		}
 	}
 	/** @internal */
-	_pushDatagram(data: Uint8Array): void {
+	_pushDatagram(
+		data: Uint8Array,
+		reservation?: WasmPayloadReservation,
+	): boolean {
+		const retained = { data, reservation };
 		if (this.datagramCb) {
-			this.datagramCb(data);
-			return;
+			this._deliverDatagram(retained);
+			return true;
 		}
-		// Bound the pre-subscribe buffer: a peer flooding datagrams before the
-		// app attaches a consumer must not grow memory without limit. Datagrams
-		// are unreliable, so drop the oldest (ring-buffer) rather than OOM.
-		if (this.datagramQueue.length >= MAX_PENDING_DATAGRAMS) {
-			this.datagramQueue.shift();
+		const nextBytes =
+			this.datagramQueuedBytes + accountedReservationBytes(data, reservation);
+		if (nextBytes > this.mgr.options.limits.maxQueuedBytesPerSession) {
+			reservation?.release();
+			this.mgr._reportResourceError(
+				new Error("E_QUEUE_FULL: maxQueuedBytesPerSession reached"),
+			);
+			return false;
 		}
-		this.datagramQueue.push(data);
+		this.datagramQueue.push(retained);
+		this.datagramQueuedBytes = nextBytes;
+		return true;
 	}
 	/** @internal */
 	_pushIncomingStream(stream: WasmStream): void {
@@ -301,17 +744,83 @@ export class WasmSession {
 			this.incomingCb(stream);
 			return;
 		}
-		// Bound un-accepted incoming streams: tear down the excess rather than
-		// buffer unbounded when the app hasn't attached an incoming-stream
-		// handler yet. Both halves are ended (stop the recv half AND reset the
-		// send half) so the manager actually releases it from the streams map —
-		// a bidi stream that only stop()s keeps sendDone false and would orphan.
-		if (this.incomingQueue.length >= MAX_PENDING_INCOMING_STREAMS) {
+		const queuedOfKind = this.incomingQueue.filter(
+			(candidate) => candidate.bidi === stream.bidi,
+		).length;
+		const limit = stream.bidi
+			? this.mgr.options.limits.maxStreamsPerSessionBidi
+			: this.mgr.options.limits.maxStreamsPerSessionUni;
+		if (queuedOfKind >= limit) {
 			stream.stop(0);
-			stream.reset(0);
+			if (stream.bidi) stream.reset(0);
+			this.mgr._reportResourceError(
+				new Error(
+					`E_LIMIT_EXCEEDED: ${stream.bidi ? "maxStreamsPerSessionBidi" : "maxStreamsPerSessionUni"} reached`,
+				),
+			);
 			return;
 		}
 		this.incomingQueue.push(stream);
+	}
+
+	/** @internal Release payloads/streams never handed to an application. */
+	_dropRetained(): void {
+		for (const item of this.datagramQueue) item.reservation?.release();
+		this.datagramQueue = [];
+		this.datagramQueuedBytes = 0;
+		// The manager owns and tears down the underlying handles; the session must
+		// still drop its pre-subscribe references so a user-held closed session
+		// cannot retain every incoming stream object indefinitely.
+		this.incomingQueue = [];
+	}
+
+	private _deliverDatagram(item: RetainedPayload): void {
+		const callback = this.datagramCb;
+		if (!callback) return;
+		if (this.datagramCbRetainsReservation) {
+			try {
+				callback(item.data, item.reservation);
+			} catch (error) {
+				item.reservation?.release();
+				throw error;
+			}
+			return;
+		}
+		try {
+			callback(item.data);
+		} finally {
+			item.reservation?.release();
+		}
+	}
+
+	private assertOpen(operation: string): void {
+		if (!this.isClosed && !this.closeRequested) return;
+		throw new WebTransportError(
+			E_SESSION_CLOSED,
+			`${E_SESSION_CLOSED}: cannot ${operation} after session close`,
+		);
+	}
+}
+
+class ManagerHostReservation implements WasmPayloadReservation {
+	private isReleased = false;
+
+	constructor(
+		private readonly manager: WasmTransportManager,
+		readonly conn: number,
+		readonly stream: number | undefined,
+		readonly token: number,
+		readonly bytes: number,
+	) {}
+
+	get released(): boolean {
+		return this.isReleased;
+	}
+
+	release(): boolean {
+		if (this.isReleased) return false;
+		this.isReleased = true;
+		return this.manager._releaseHostReservation(this);
 	}
 }
 
@@ -327,27 +836,66 @@ export class WasmTransportManager {
 	private onSession: ((session: WasmSession) => void) | null;
 	/** Transport the manager owns and closes on {@link close}, if any. */
 	private ownedTransport: UdpTransport | null = null;
+	readonly options: WasmNormalizedEndpointOptions;
+	private hostReservations = new Set<ManagerHostReservation>();
+	private hostQueuedBytesGlobal = 0;
+	private hostQueuedBytesPerSession = new Map<number, number>();
+	private hostQueuedBytesPerStream = new Map<number, number>();
+	private hostResourceError = "";
+	private closeResourceSnapshot: ReturnType<
+		WasmTransportManager["_currentResourceSnapshot"]
+	> | null = null;
 
 	private constructor(
 		isServer: boolean,
 		onSession: ((session: WasmSession) => void) | null,
+		options: WasmNormalizedEndpointOptions,
 		makeEndpoint: (events: WasmSessionEvents) => WasmEndpoint,
 	) {
 		this.onSession = onSession;
+		this.options = options;
 		const events: WasmSessionEvents = {
 			onEstablished: (conn) => {
 				const s = this.ensureSession(conn);
 				s._markEstablished();
 				if (isServer) this.onSession?.(s);
 			},
-			onDatagram: (conn, data) => {
+			onDatagram: (conn, data, hostToken) => {
 				// Use get, not ensureSession: a datagram surfaced after the
 				// session was already closed/deleted (final drain on a graceful
 				// end) must NOT resurrect a zombie session no consumer holds.
-				this.sessions.get(conn)?._pushDatagram(data.slice());
+				if (!hostToken) {
+					this._reportResourceError(
+						new Error("E_INTERNAL: datagram payload missing host reservation"),
+					);
+					return;
+				}
+				const reservation = this._adoptHostReservation(
+					conn,
+					undefined,
+					hostToken,
+					data.length,
+				);
+				if (!reservation) {
+					this._closeSessionForInboundPressure(conn);
+					return;
+				}
+				const session = this.sessions.get(conn);
+				if (!session) {
+					reservation.release();
+					return;
+				}
+				if (!session._pushDatagram(data, reservation)) {
+					this._closeSessionForInboundPressure(conn);
+				}
 			},
 			onClosed: (conn, code) => {
-				this.ensureSession(conn)._markClosed({ code });
+				const detail = this.endpoint.takeLastError();
+				this.ensureSession(conn)._markClosed(
+					{ code, reason: detail || undefined },
+					detail,
+				);
+				this._releaseConnectionHostReservations(conn);
 				// Settle and release everything belonging to this connection.
 				// _closeFromConnection errors only readers still live (a
 				// cleanly-FINed stream stays settled), avoiding a spurious reset.
@@ -371,11 +919,27 @@ export class WasmTransportManager {
 				this.streams.set(stream, ws);
 				s._pushIncomingStream(ws);
 			},
-			onStreamData: (_conn, stream, data, fin) => {
+			onStreamData: (_conn, stream, data, fin, hostToken) => {
 				// The stream releases itself from the map once BOTH halves are
 				// done (see WasmStream._maybeRelease); deleting on fin here would
 				// drop a later STOP_SENDING for a still-open bidi send half.
-				this.streams.get(stream)?._pushData(data.slice(), fin);
+				if (!hostToken) {
+					this._reportResourceError(
+						new Error("E_INTERNAL: stream payload missing host reservation"),
+					);
+					return;
+				}
+				const reservation = this._adoptHostReservation(
+					_conn,
+					stream,
+					hostToken,
+					data.length,
+					fin,
+				);
+				if (!reservation) return;
+				const target = this.streams.get(stream);
+				if (target) target._pushData(data, fin, reservation);
+				else reservation?.release();
 			},
 			onStreamReset: (_conn, stream, code) => {
 				this.streams.get(stream)?._pushReset(code);
@@ -397,6 +961,151 @@ export class WasmTransportManager {
 	/** Optional hook for exceptions thrown by user event callbacks. */
 	onCallbackError: ((err: unknown) => void) | null = null;
 
+	/** @internal Adopt, without copying, a Rust reservation transferred to JS. */
+	_adoptHostReservation(
+		conn: number,
+		stream: number | undefined,
+		token: number,
+		bytes: number,
+		fin = false,
+	): WasmPayloadReservation | undefined {
+		const accountedBytes = fin && bytes === 0 ? 0 : Math.max(1, bytes);
+		const nextGlobal = this.hostQueuedBytesGlobal + accountedBytes;
+		const nextSession =
+			(this.hostQueuedBytesPerSession.get(conn) ?? 0) + accountedBytes;
+		const nextStream =
+			stream === undefined
+				? 0
+				: (this.hostQueuedBytesPerStream.get(stream) ?? 0) + accountedBytes;
+		let error = "";
+		if (nextGlobal > this.options.limits.maxQueuedBytesGlobal) {
+			error = "E_QUEUE_FULL: maxQueuedBytesGlobal reached";
+		} else if (nextSession > this.options.limits.maxQueuedBytesPerSession) {
+			error = "E_QUEUE_FULL: maxQueuedBytesPerSession reached";
+		} else if (
+			stream !== undefined &&
+			nextStream > this.options.limits.maxQueuedBytesPerStream
+		) {
+			error = "E_QUEUE_FULL: maxQueuedBytesPerStream reached";
+		}
+		if (error) {
+			this.endpoint.releaseHostReservation(token);
+			this._reportResourceError(new Error(error));
+			return undefined;
+		}
+
+		const reservation = new ManagerHostReservation(
+			this,
+			conn,
+			stream,
+			token,
+			accountedBytes,
+		);
+		this.hostReservations.add(reservation);
+		this.hostQueuedBytesGlobal = nextGlobal;
+		this.hostQueuedBytesPerSession.set(conn, nextSession);
+		if (stream !== undefined)
+			this.hostQueuedBytesPerStream.set(stream, nextStream);
+		return reservation;
+	}
+
+	/** @internal Release the one Rust token and all mirrored host counters. */
+	_releaseHostReservation(reservation: ManagerHostReservation): boolean {
+		if (!this.hostReservations.delete(reservation)) return false;
+		this.hostQueuedBytesGlobal = Math.max(
+			0,
+			this.hostQueuedBytesGlobal - reservation.bytes,
+		);
+		this._decrementHostBytes(
+			this.hostQueuedBytesPerSession,
+			reservation.conn,
+			reservation.bytes,
+		);
+		if (reservation.stream !== undefined) {
+			this._decrementHostBytes(
+				this.hostQueuedBytesPerStream,
+				reservation.stream,
+				reservation.bytes,
+			);
+		}
+		return this.endpoint.releaseHostReservation(reservation.token);
+	}
+
+	/** @internal Surface a stable host-side governor failure. */
+	_reportResourceError(error: unknown): void {
+		this.hostResourceError =
+			error instanceof Error ? error.message : String(error);
+		this.onCallbackError?.(error);
+	}
+
+	/** Return and clear the latest stable host-governor diagnostic. */
+	takeResourceError(): string {
+		const error = this.hostResourceError;
+		this.hostResourceError = "";
+		return error;
+	}
+
+	/** @internal Translate a failed Rust datagram send into a stable public error. */
+	_datagramSendError(conn: number): WebTransportError {
+		return wasmOperationError(
+			this.endpoint.takeDatagramSendError(),
+			this.sessions.has(conn) ? E_QUEUE_FULL : E_SESSION_CLOSED,
+			"datagram send failed because the queue or session is unavailable",
+		);
+	}
+
+	/** @internal Resolve the live negotiated/path cap without exceeding config. */
+	_effectiveMaxDatagramSize(conn: number, configured: number): number {
+		const effective = this.endpoint.maxDatagramSize(conn);
+		return Number.isSafeInteger(effective) && effective >= 0
+			? Math.min(configured, effective)
+			: configured;
+	}
+
+	/** @internal Translate a failed Rust stream write into a stable public error. */
+	_streamWriteError(conn: number): WebTransportError {
+		return wasmOperationError(
+			this.endpoint.takeStreamWriteError(),
+			this.sessions.has(conn) ? E_STREAM_RESET : E_SESSION_CLOSED,
+			"stream write failed because the stream or session is closed",
+		);
+	}
+
+	/** Current combined Rust-to-host retained-payload accounting. */
+	resourceSnapshot(): {
+		hostReservationsActive: number;
+		hostQueuedBytesGlobal: number;
+		rustQueuedBytesGlobal: number;
+		rustHostTokensActive: number;
+	} {
+		return this.closeResourceSnapshot ?? this._currentResourceSnapshot();
+	}
+
+	private _currentResourceSnapshot() {
+		let rust: { queuedBytesGlobal?: number; hostTokensActive?: number } = {};
+		try {
+			rust = JSON.parse(this.endpoint.governorSnapshot());
+		} catch {
+			// A malformed diagnostic snapshot must not break teardown.
+		}
+		return {
+			hostReservationsActive: this.hostReservations.size,
+			hostQueuedBytesGlobal: this.hostQueuedBytesGlobal,
+			rustQueuedBytesGlobal: rust.queuedBytesGlobal ?? 0,
+			rustHostTokensActive: rust.hostTokensActive ?? 0,
+		};
+	}
+
+	private _decrementHostBytes(
+		map: Map<number, number>,
+		key: number,
+		bytes: number,
+	): void {
+		const next = (map.get(key) ?? 0) - bytes;
+		if (next <= 0) map.delete(key);
+		else map.set(key, next);
+	}
+
 	static create(
 		wasm: WasmModule,
 		udp: UdpTransport,
@@ -404,9 +1113,11 @@ export class WasmTransportManager {
 		addr: string,
 		peerAddr: string,
 		onSession: ((session: WasmSession) => void) | null,
+		options: WasmNormalizedEndpointOptions,
 		certHashesBase64?: string,
 	): WasmTransportManager {
-		return new WasmTransportManager(isServer, onSession, (events) =>
+		const constructorOptions: WasmEndpointConstructorOptions = options;
+		return new WasmTransportManager(isServer, onSession, options, (events) =>
 			!isServer && certHashesBase64
 				? WasmEndpoint.createPinnedClient(
 						wasm,
@@ -414,9 +1125,18 @@ export class WasmTransportManager {
 						addr,
 						peerAddr,
 						certHashesBase64,
+						constructorOptions,
 						events,
 					)
-				: WasmEndpoint.create(wasm, udp, isServer, addr, peerAddr, events),
+				: WasmEndpoint.create(
+						wasm,
+						udp,
+						isServer,
+						addr,
+						peerAddr,
+						constructorOptions,
+						events,
+					),
 		);
 	}
 
@@ -426,8 +1146,9 @@ export class WasmTransportManager {
 		udp: UdpTransport,
 		eid: number,
 		onSession: (session: WasmSession) => void,
+		options: WasmNormalizedEndpointOptions,
 	): WasmTransportManager {
-		return new WasmTransportManager(true, onSession, (events) =>
+		return new WasmTransportManager(true, onSession, options, (events) =>
 			WasmEndpoint.adopt(wasm, udp, eid, events),
 		);
 	}
@@ -435,7 +1156,7 @@ export class WasmTransportManager {
 	private ensureSession(conn: number): WasmSession {
 		let s = this.sessions.get(conn);
 		if (!s) {
-			s = new WasmSession(this, conn);
+			s = new WasmSession(this, conn, this.options.limits.maxDatagramSize);
 			this.sessions.set(conn, s);
 		}
 		return s;
@@ -445,8 +1166,11 @@ export class WasmTransportManager {
 	openStream(session: WasmSession, bidi: boolean): WasmStream {
 		const handle = this.endpoint.openStream(session.conn, bidi);
 		if (handle < 0) {
-			throw new Error(
-				"openStream failed: session not established or connection closed",
+			const detail = this.endpoint.takeLastError();
+			throw wasmOperationError(
+				detail,
+				E_SESSION_CLOSED,
+				"openStream failed because the session is unavailable",
 			);
 		}
 		const ws = new WasmStream(this, session.conn, handle, bidi, false);
@@ -461,11 +1185,15 @@ export class WasmTransportManager {
 
 	connectClient(authority: string): WasmSession {
 		const conn = this.endpoint.connect(authority);
-		if (conn < 0) {
-			// wt_connect returns -1 for a server endpoint or rejected params; no
+		if (conn <= 0) {
+			// wt_connect returns a non-positive sentinel for a closed endpoint,
+			// server endpoint, or rejected params. No
 			// Rust connection exists, so `ready` would hang. Fail it eagerly.
-			throw new Error(
-				"wasm connect failed: server endpoint or invalid connection parameters",
+			const detail = this.endpoint.takeLastError();
+			throw wasmOperationError(
+				detail,
+				E_SESSION_CLOSED,
+				"wasm connect failed because the endpoint rejected the connection",
 			);
 		}
 		return this.ensureSession(conn);
@@ -474,6 +1202,21 @@ export class WasmTransportManager {
 	/** @internal Close one session's connection; the endpoint stays up. */
 	closeSession(session: WasmSession, info?: WtCloseInfo): void {
 		this.endpoint.closeConn(session.conn, info?.code ?? 0, info?.reason ?? "");
+	}
+
+	private _releaseConnectionHostReservations(conn: number): void {
+		for (const reservation of [...this.hostReservations]) {
+			if (reservation.conn === conn) reservation.release();
+		}
+	}
+
+	private _closeSessionForInboundPressure(conn: number): void {
+		const detail =
+			this.hostResourceError ||
+			"E_QUEUE_FULL: inbound datagram delivery budget exhausted";
+		this.sessions.get(conn)?._markClosed({ code: 0, reason: detail }, detail);
+		this._releaseConnectionHostReservations(conn);
+		this.endpoint.closeConn(conn, 0, detail);
 	}
 
 	/** Take ownership of a transport so {@link close} releases its socket. */
@@ -486,7 +1229,16 @@ export class WasmTransportManager {
 	 * and close an owned transport so its UDP socket/port is released.
 	 */
 	close(): void {
-		this.endpoint.close();
+		this.endpoint.beginClose();
+		for (const session of this.sessions.values()) {
+			session._markClosed({ code: 0, reason: "endpoint closed" });
+		}
+		for (const stream of this.streams.values()) stream._dropRetained();
+		for (const reservation of [...this.hostReservations]) reservation.release();
+		this.sessions.clear();
+		this.streams.clear();
+		this.closeResourceSnapshot = this._currentResourceSnapshot();
+		this.endpoint.finishClose();
 		this.ownedTransport?.close?.();
 		this.ownedTransport = null;
 	}
@@ -501,6 +1253,8 @@ export interface WasmConnectOptions {
 	 * the client accepts ANY server certificate.
 	 */
 	certHashBase64?: string;
+	limits?: WasmLimitsOptions;
+	rateLimits?: WasmRateLimitOptions;
 }
 
 /** Client: connect to a WebTransport server over the given UDP transport. */
@@ -512,6 +1266,7 @@ export async function connectWasm(
 	peerAddr = "127.0.0.1:443",
 	opts: WasmConnectOptions = {},
 ): Promise<{ session: WasmSession; manager: WasmTransportManager }> {
+	const normalized = normalizeWasmEndpointOptions(opts);
 	const mgr = WasmTransportManager.create(
 		wasm,
 		udp,
@@ -519,6 +1274,7 @@ export async function connectWasm(
 		addr,
 		peerAddr,
 		null,
+		normalized,
 		opts.certHashBase64,
 	);
 	const session = mgr.connectClient(authority);
@@ -544,7 +1300,9 @@ export function createWasmServer(
 	onSession: (session: WasmSession) => void,
 	addr = "0.0.0.0:443",
 	peerAddr = "127.0.0.1:0",
+	opts: WasmEndpointOptions = {},
 ): WasmTransportManager {
+	const normalized = normalizeWasmEndpointOptions(opts);
 	return WasmTransportManager.create(
 		wasm,
 		udp,
@@ -552,6 +1310,7 @@ export function createWasmServer(
 		addr,
 		peerAddr,
 		onSession,
+		normalized,
 	);
 }
 
@@ -571,16 +1330,20 @@ export async function serveOverUdp(
 		commonName?: string;
 		validityDays?: number;
 		onSession: (session: WasmSession) => void;
-	},
+	} & WasmEndpointOptions,
 ): Promise<{ manager: WasmTransportManager; certHashBase64: string }> {
+	const normalized = normalizeWasmEndpointOptions(opts);
 	const udp = await bind(opts.localAddress ?? "0.0.0.0", opts.localPort);
 	const notBefore = Math.floor(Date.now() / 1000) - 3600;
-	const json = wasm.wt_new_server(
-		`${opts.localAddress ?? "0.0.0.0"}:${opts.localPort}`,
-		"127.0.0.1:0",
-		opts.commonName ?? "localhost",
-		opts.validityDays ?? 14,
-		notBefore,
+	const json = wasm.wt_new_server_with_options(
+		JSON.stringify({
+			addr: `${opts.localAddress ?? "0.0.0.0"}:${opts.localPort}`,
+			peerAddr: "127.0.0.1:0",
+			commonName: opts.commonName ?? "localhost",
+			validityDays: opts.validityDays ?? 14,
+			notBeforeUnix: notBefore,
+			...normalized,
+		}),
 	);
 	const parsed = JSON.parse(json) as {
 		eid?: number;
@@ -597,6 +1360,7 @@ export async function serveOverUdp(
 		udp,
 		parsed.eid,
 		opts.onSession,
+		normalized,
 	);
 	// manager.close() now releases the bound UDP socket too.
 	manager.ownTransport(udp);
@@ -640,6 +1404,8 @@ export interface WasmClientArgs {
 	peerAddr?: string;
 	/** Pin the server cert by base64 SHA-256 hash(es). See {@link WasmConnectOptions}. */
 	certHashBase64?: string;
+	limits?: WasmLimitsOptions;
+	rateLimits?: WasmRateLimitOptions;
 }
 
 /** Construction args for the native side of {@link createUnifiedClient}. */
@@ -667,7 +1433,11 @@ export async function createUnifiedClient(
 			args.authority,
 			args.addr,
 			args.peerAddr,
-			{ certHashBase64: args.certHashBase64 },
+			{
+				certHashBase64: args.certHashBase64,
+				limits: args.limits,
+				rateLimits: args.rateLimits,
+			},
 		);
 		return transport;
 	}

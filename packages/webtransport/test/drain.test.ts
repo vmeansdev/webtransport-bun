@@ -4,9 +4,13 @@
  * return to baseline after close, and that repeated stress loops do not hang.
  */
 
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { createServer } from "../src/index.js";
-import { withHarness } from "./helpers/harness.js";
+import {
+	forEachWithTimeout,
+	nextWithTimeout,
+	withHarness,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 15200;
@@ -63,23 +67,33 @@ describe("drain guarantees (P1.1)", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: async (s) => {
-						void (async () => {
-							for await (const d of s.incomingDatagrams()) {
+						void forEachWithTimeout(
+							s.incomingDatagrams(),
+							5000,
+							"drain stress incoming datagram echo",
+							async (d) => {
 								await s.sendDatagram(d);
-							}
-						})().catch(() => {});
-						void (async () => {
-							for await (const bidi of s.incomingBidirectionalStreams) {
-								for await (const _ of bidi.readable) {
-									/* consume */
-								}
-							}
-						})().catch(() => {});
-						void (async () => {
-							for await (const _ of s.incomingUnidirectionalStreams) {
-								/* consume */
-							}
-						})().catch(() => {});
+							},
+						).catch(() => {});
+						void forEachWithTimeout(
+							s.incomingBidirectionalStreams,
+							5000,
+							"drain stress incoming bidi consume",
+							async (bidi) => {
+								await forEachWithTimeout(
+									bidi.readable,
+									5000,
+									"drain stress bidi readable consume",
+									async () => undefined,
+								);
+							},
+						).catch(() => {});
+						void forEachWithTimeout(
+							s.incomingUnidirectionalStreams,
+							5000,
+							"drain stress incoming uni consume",
+							async () => undefined,
+						).catch(() => {});
 					},
 				}),
 			);
@@ -151,10 +165,18 @@ describe("drain guarantees (P1.1)", () => {
 					onSession: async (s) => {
 						// Start iterators but close session before consuming all
 						const dgramIter = s.incomingDatagrams()[Symbol.asyncIterator]();
-						await dgramIter.next();
+						await nextWithTimeout(
+							dgramIter,
+							5000,
+							"drain abandoned datagram iterator bootstrap",
+						);
 						const bidiIter =
 							s.incomingBidirectionalStreams[Symbol.asyncIterator]();
-						await bidiIter.next();
+						await nextWithTimeout(
+							bidiIter,
+							5000,
+							"drain abandoned bidi iterator bootstrap",
+						);
 						// Session closes below; iterators should terminate
 					},
 				}),
@@ -196,11 +218,14 @@ describe("drain guarantees (P1.1)", () => {
 				port,
 				tls: { certPem: "", keyPem: "" },
 				onSession: async (s) => {
-					void (async () => {
-						for await (const d of s.incomingDatagrams()) {
+					void forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"drain repeated-cycle incoming datagram echo",
+						async (d) => {
 							await s.sendDatagram(d);
-						}
-					})().catch(() => {});
+						},
+					).catch(() => {});
 				},
 			});
 			try {
@@ -223,9 +248,14 @@ describe("drain guarantees (P1.1)", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: async (s) => {
-						for await (const d of s.incomingDatagrams()) {
-							await s.sendDatagram(d);
-						}
+						await forEachWithTimeout(
+							s.incomingDatagrams(),
+							5000,
+							"drain server-close incoming datagram echo",
+							async (d) => {
+								await s.sendDatagram(d);
+							},
+						);
 					},
 				}),
 			);

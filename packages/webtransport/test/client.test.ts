@@ -1,6 +1,11 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { connect, createServer } from "../src/index.js";
-import { withHarness } from "./helpers/harness.js";
+import {
+	forEachWithTimeout,
+	nextWithTimeout,
+	readWithTimeout,
+	withHarness,
+} from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
 
 async function connectWithRetry(
@@ -58,7 +63,7 @@ describe("webtransport client", () => {
 		expect(logs.length).toBeGreaterThanOrEqual(1);
 		const entry = logs.find((e) => e.msg?.includes("insecureSkipVerify"));
 		expect(entry).toBeDefined();
-		expect(entry!.msg).toContain("dev only");
+		expect(entry?.msg).toContain("dev only");
 		try {
 			await Promise.race([connectPromise, Bun.sleep(3000)]);
 		} catch {
@@ -74,19 +79,33 @@ describe("webtransport client", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: async (s) => {
-						void (async () => {
-							for await (const d of s.incomingDatagrams()) {
+						void forEachWithTimeout(
+							s.incomingDatagrams(),
+							5000,
+							"client server incoming datagram echo",
+							async (d) => {
 								await s.sendDatagram(d);
-							}
-						})();
-						void (async () => {
-							for await (const duplex of s.incomingBidirectionalStreams) {
+							},
+						).catch(() => {});
+						void forEachWithTimeout(
+							s.incomingBidirectionalStreams,
+							5000,
+							"client server incoming bidi stream",
+							async (duplex) => {
 								const reader = duplex.readable.getReader();
 								const chunks: Uint8Array[] = [];
-								while (true) {
-									const { done, value } = await reader.read();
-									if (done) break;
-									chunks.push(value);
+								try {
+									while (true) {
+										const { done, value } = await readWithTimeout(
+											reader,
+											5000,
+											"client server bidi payload read",
+										);
+										if (done || value === undefined) break;
+										chunks.push(value);
+									}
+								} finally {
+									reader.releaseLock();
 								}
 								if (chunks.length > 0) {
 									const writer = duplex.writable.getWriter();
@@ -95,8 +114,8 @@ describe("webtransport client", () => {
 									);
 									await writer.close();
 								}
-							}
-						})().catch(() => {});
+							},
+						).catch(() => {});
 					},
 				}),
 			);
@@ -112,12 +131,16 @@ describe("webtransport client", () => {
 
 			await client.sendDatagram(new Uint8Array([1, 2, 3]));
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const first = (await Promise.race([
-				iter.next(),
-				Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
-			])) as IteratorResult<Uint8Array>;
+			const first = await nextWithTimeout(
+				iter,
+				2000,
+				"client incoming datagram read",
+			);
 			expect(first.done).toBe(false);
-			expect(new Uint8Array(first.value!)).toEqual(new Uint8Array([1, 2, 3]));
+			expect(first.value).toBeDefined();
+			expect(new Uint8Array(first.value ?? [])).toEqual(
+				new Uint8Array([1, 2, 3]),
+			);
 		});
 	}, 20000);
 
@@ -129,14 +152,25 @@ describe("webtransport client", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: async (s) => {
-						void (async () => {
-							for await (const duplex of s.incomingBidirectionalStreams) {
+						void forEachWithTimeout(
+							s.incomingBidirectionalStreams,
+							5000,
+							"client bidi echo incoming stream",
+							async (duplex) => {
 								const reader = duplex.readable.getReader();
 								const chunks: Uint8Array[] = [];
-								while (true) {
-									const { done, value } = await reader.read();
-									if (done) break;
-									chunks.push(value);
+								try {
+									while (true) {
+										const { done, value } = await readWithTimeout(
+											reader,
+											5000,
+											"client bidi echo payload read",
+										);
+										if (done || value === undefined) break;
+										chunks.push(value);
+									}
+								} finally {
+									reader.releaseLock();
 								}
 								if (chunks.length > 0) {
 									const writer = duplex.writable.getWriter();
@@ -145,8 +179,8 @@ describe("webtransport client", () => {
 									);
 									await writer.close();
 								}
-							}
-						})().catch(() => {});
+							},
+						).catch(() => {});
 					},
 				}),
 			);
@@ -169,7 +203,14 @@ describe("webtransport client", () => {
 				);
 			});
 			const chunks: Buffer[] = [];
-			for await (const c of bidi) chunks.push(c);
+			await forEachWithTimeout(
+				bidi,
+				5000,
+				"client bidi echo response stream",
+				async (chunk) => {
+					chunks.push(Buffer.from(chunk));
+				},
+			);
 			expect(Buffer.concat(chunks)).toEqual(payload);
 		});
 	}, 10000);

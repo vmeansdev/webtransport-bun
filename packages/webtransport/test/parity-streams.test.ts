@@ -7,6 +7,11 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
 import { nextPort as allocatePort } from "./helpers/network.js";
+import {
+	collectWithTimeout,
+	forEachWithTimeout,
+	readWithTimeout,
+} from "./helpers/harness.js";
 
 const BASE_PORT = 15530;
 
@@ -41,34 +46,51 @@ describe("parity streams (P3)", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const duplex of s.incomingBidirectionalStreams) {
-					void (async () => {
-						const reader = duplex.readable.getReader();
-						const chunks: Uint8Array[] = [];
-						while (true) {
-							const { done, value } = await reader.read();
-							if (done) break;
-							chunks.push(value);
-						}
-						if (chunks.length > 0) {
-							const writer = duplex.writable.getWriter();
-							await writer.write(
-								Buffer.concat(chunks.map((c) => Buffer.from(c))),
+				await forEachWithTimeout(
+					s.incomingBidirectionalStreams,
+					5000,
+					"parity streams server incoming bidi",
+					async (duplex) => {
+						void (async () => {
+							const reader = duplex.readable.getReader();
+							const chunks: Uint8Array[] = [];
+							while (true) {
+								const { done, value } = await readWithTimeout(
+									reader,
+									5000,
+									"parity streams server bidi read",
+								);
+								if (done || value === undefined) break;
+								chunks.push(value);
+							}
+							if (chunks.length > 0) {
+								const writer = duplex.writable.getWriter();
+								await writer.write(
+									Buffer.concat(chunks.map((c) => Buffer.from(c))),
+								);
+								await writer.close();
+							}
+						})().catch(() => {});
+					},
+				);
+				await forEachWithTimeout(
+					s.incomingUnidirectionalStreams,
+					5000,
+					"parity streams server incoming uni",
+					async (readable) => {
+						void (async () => {
+							const chunks = await collectWithTimeout(
+								readable,
+								5000,
+								"parity streams server uni chunk read",
 							);
-							await writer.close();
-						}
-					})().catch(() => {});
-				}
-				for await (const readable of s.incomingUnidirectionalStreams) {
-					void (async () => {
-						const chunks: Uint8Array[] = [];
-						for await (const c of readable) chunks.push(c);
-						// Echo back on a new uni stream
-						const w = await s.createUnidirectionalStream();
-						w.write(Buffer.concat(chunks.map((c) => Buffer.from(c))));
-						w.end();
-					})().catch(() => {});
-				}
+							// Echo back on a new uni stream
+							const w = await s.createUnidirectionalStream();
+							w.write(Buffer.concat(chunks.map((c) => Buffer.from(c))));
+							w.end();
+						})().catch(() => {});
+					},
+				);
 			},
 		});
 	});
@@ -88,7 +110,11 @@ describe("parity streams (P3)", () => {
 		await writer.write(new Uint8Array([1, 2, 3]));
 		await writer.close();
 		const reader = readable.getReader();
-		const { value } = await reader.read();
+		const { value } = await readWithTimeout(
+			reader,
+			5000,
+			"parity streams bidi echo read",
+		);
 		expect(value).toBeDefined();
 		expect(new Uint8Array(value!)).toEqual(new Uint8Array([1, 2, 3]));
 		reader.releaseLock();

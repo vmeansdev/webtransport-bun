@@ -6,6 +6,7 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
+import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
 
 describe("parity datagrams (P2)", () => {
 	let server: ReturnType<typeof createServer>;
@@ -17,9 +18,14 @@ describe("parity datagrams (P2)", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const d of s.incomingDatagrams()) {
-					await s.sendDatagram(d);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"parity datagrams server incoming datagram",
+					async (d) => {
+						await s.sendDatagram(d);
+					},
+				);
 			},
 		});
 		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
@@ -51,7 +57,11 @@ describe("parity datagrams (P2)", () => {
 		await writer.write(payload);
 		writer.releaseLock();
 		const reader = wt.datagrams.readable.getReader();
-		const { value, done } = await reader.read();
+		const { value, done } = await readWithTimeout(
+			reader,
+			5000,
+			"parity datagram echoed read",
+		);
 		expect(done).toBe(false);
 		expect(value).toBeDefined();
 		expect(new Uint8Array(value!)).toEqual(payload);
@@ -68,7 +78,11 @@ describe("parity datagrams (P2)", () => {
 		await writer.write(sent);
 		writer.releaseLock();
 		const reader = wt.datagrams.readable.getReader();
-		const { value } = await reader.read();
+		const { value } = await readWithTimeout(
+			reader,
+			5000,
+			"parity datagram round-trip read",
+		);
 		expect(value).toBeDefined();
 		expect(new Uint8Array(value!)).toEqual(sent);
 		reader.releaseLock();

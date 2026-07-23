@@ -1,6 +1,10 @@
 # @webtransport-bun/webtransport
 
-Production-focused WebTransport for Bun, Node, and Deno: datagrams + streams, in-process server/client, backed by Rust `wtransport` via `napi-rs`.
+Production-focused candidate WebTransport for Bun, Node, and Deno: datagrams +
+streams, in-process server/client, backed by Rust `wtransport` via `napi-rs`.
+
+Canonical release truth: `../../docs/release-status.json`. This README describes
+the current candidate surface, not a stable/GA promise.
 
 ## Install
 
@@ -13,8 +17,14 @@ yarn add @webtransport-bun/webtransport
 
 ## Requirements
 
-- **Runtime**: Bun >= 1.3.9, Node (Node-API compatible runtime), Deno (npm + Node-API addon support)
-- **Platforms**: macOS (arm64, x64), Linux (x64), Windows (x64)
+- **Configured runtime targets**: Bun >= 1.3.9, Node (Node-API compatible
+  runtime), Deno (npm + Node-API addon support)
+- **Configured platform targets**: macOS (arm64, x64), Linux (x64), Windows
+  (x64)
+
+These are candidate targets, not current support claims. Support is claimed only
+after the corresponding commit-bound tuples pass in
+`../../docs/release-status.json`.
 
 ## Quick Start
 
@@ -64,6 +74,46 @@ const session = await connect("https://127.0.0.1:4433", {
 });
 await session.sendDatagram(new Uint8Array([1, 2, 3]));
 session.close();
+```
+
+## WASM / browser-direct-sockets limits
+
+The `/wasm` entrypoint accepts the same normalized resource-governor inputs on
+both client and server helpers. Validation runs before endpoint allocation or
+UDP bind, so invalid budgets fail fast.
+
+Canonical release truth: `../../docs/release-status.json`. Treat `/wasm` as a
+candidate surface until the manifest flips to ready.
+
+```ts
+import {
+  connectWasm,
+  createWasmServer,
+  DEFAULT_WASM_LIMITS,
+} from "@webtransport-bun/webtransport/wasm";
+
+const server = createWasmServer(wasm, udp, onSession, "0.0.0.0:4433", "127.0.0.1:0", {
+  limits: {
+    maxDatagramSize: 1024,
+    maxQueuedBytesPerSession: 512 * 1024,
+  },
+  rateLimits: {
+    handshakesPerSec: 10,
+    handshakesBurst: 20,
+  },
+});
+
+const { session } = await connectWasm(
+  wasm,
+  udp,
+  "localhost",
+  "127.0.0.1:0",
+  "127.0.0.1:4433",
+  {
+    certHashBase64: "<server hash>",
+    limits: { maxDatagramSize: DEFAULT_WASM_LIMITS.maxDatagramSize },
+  },
+);
 ```
 
 ## Troubleshooting

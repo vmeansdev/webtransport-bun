@@ -3,12 +3,16 @@
 // Wraps a `WasmSession` (the callback-driven wasm facade) so it satisfies
 // the native W3C WebTransport shape (ReadableStream/WritableStream).
 
-import type { WasmSession, WasmStream } from "./backend.js";
-import { WebTransportError, E_SESSION_CLOSED } from "./errors.js";
-
-/** Caps on the WHATWG streams so a flood with a slow consumer can't OOM. */
-const MAX_QUEUED_DATAGRAMS = 1024;
-const MAX_QUEUED_INCOMING_STREAMS = 256;
+import type {
+	WasmPayloadReservation,
+	WasmSession,
+	WasmStream,
+} from "./backend.js";
+import {
+	E_SESSION_CLOSED,
+	E_STREAM_RESET,
+	WebTransportError,
+} from "./errors.js";
 
 /** Browser-style close info (W3C alignment). */
 export type WebTransportCloseInfo = {
@@ -26,7 +30,7 @@ export type WebTransportDatagramDuplexStream = {
 	readonly readable: ReadableStream<Uint8Array>;
 	readonly writable: WritableStream<Uint8Array>;
 	createWritable(options?: {
-		sendGroup?: any | null;
+		sendGroup?: unknown | null;
 		sendOrder?: number;
 	}): WritableStream<Uint8Array>;
 	readonly maxDatagramSize: number;
@@ -40,44 +44,97 @@ export type WebTransportDatagramDuplexStream = {
  */
 function streamReadable(stream: WasmStream): ReadableStream<Uint8Array> {
 	let cancelled = false;
-	return new ReadableStream<Uint8Array>({
-		start(controller) {
-			stream.onData((data, fin) => {
-				if (cancelled) return; // consumer cancelled; drop, no enqueue throw
-				// `data` is already a copy from the manager's `.slice()`.
-				if (data.length > 0) {
-					try {
-						controller.enqueue(data);
-					} catch {
-						return; // controller errored/closed — stop enqueuing
-					}
-					if ((controller.desiredSize ?? 1) <= 0) stream.pause();
-				}
-				if (fin) {
-					try {
-						controller.close();
-					} catch {
-						// Already closed (e.g. duplicate fin) — ignore.
-					}
-				}
-			});
-			stream.onReset((code) => {
+	let pullPending = false;
+	let finPending = false;
+	const pending: Array<{
+		data: Uint8Array;
+		fin: boolean;
+		reservation?: WasmPayloadReservation;
+	}> = [];
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+
+	const releasePending = () => {
+		for (const item of pending) item.reservation?.release();
+		pending.length = 0;
+	};
+	const deliver = () => {
+		if (cancelled) return;
+		if (pending.length === 0) {
+			if (finPending) {
+				finPending = false;
+				pullPending = false;
 				try {
-					controller.error(new Error(`stream reset: ${code}`));
-				} catch {
-					// Already closed/errored — a settled stream stays settled.
-				}
-			});
-		},
-		pull() {
+					controller.close();
+				} catch {}
+			}
+			return;
+		}
+		if (!pullPending) return;
+		const item = pending.shift();
+		if (!item) return;
+		pullPending = false;
+		try {
+			if (item.data.length > 0) controller.enqueue(item.data);
+		} finally {
+			item.reservation?.release();
+		}
+		if (item.fin || (finPending && pending.length === 0)) {
+			finPending = false;
+			controller.close();
+		} else if (pending.length === 0) {
 			stream.resume();
+		}
+	};
+
+	return new ReadableStream<Uint8Array>(
+		{
+			start(sourceController) {
+				controller = sourceController;
+				stream.onData(
+					(data, fin, reservation) => {
+						if (cancelled) {
+							reservation?.release();
+							return;
+						}
+						if (data.length > 0) {
+							pending.push({ data, fin, reservation });
+							stream.pause();
+						} else {
+							reservation?.release();
+							if (fin) finPending = true;
+						}
+						deliver();
+					},
+					{ retainReservation: true },
+				);
+				stream.onReset((code) => {
+					releasePending();
+					try {
+						controller.error(
+							new WebTransportError(
+								E_STREAM_RESET,
+								`${E_STREAM_RESET}: stream reset by peer (code ${code})`,
+								{ streamErrorCode: code },
+							),
+						);
+					} catch {
+						// Already closed/errored — a settled stream stays settled.
+					}
+				});
+			},
+			pull() {
+				pullPending = true;
+				deliver();
+			},
+			cancel() {
+				// Consumer cancelled: STOP_SENDING so the peer stops, and release.
+				cancelled = true;
+				releasePending();
+				stream.stop(0);
+			},
 		},
-		cancel() {
-			// Consumer cancelled: STOP_SENDING so the peer stops, and release.
-			cancelled = true;
-			stream.stop(0);
-		},
-	});
+		new CountQueuingStrategy({ highWaterMark: 0 }),
+	);
 }
 
 /**
@@ -113,10 +170,13 @@ export class WasmWebTransport {
 	readonly incomingUnidirectionalStreams: ReadableStream<
 		ReadableStream<Uint8Array>
 	>;
+	private resolveDraining!: () => void;
 
 	constructor(private readonly session: WasmSession) {
 		this.ready = session.ready;
-		this.draining = new Promise(() => {}); // Draining not implemented in backend yet
+		this.draining = new Promise<undefined>((resolve) => {
+			this.resolveDraining = () => resolve(undefined);
+		});
 
 		this.closed = session.closed
 			.then((info) => ({
@@ -130,28 +190,51 @@ export class WasmWebTransport {
 
 		// Datagrams
 		let datagramsController!: ReadableStreamDefaultController<Uint8Array>;
+		let datagramPullPending = false;
+		const pendingDatagrams: Array<{
+			data: Uint8Array;
+			reservation?: WasmPayloadReservation;
+		}> = [];
+		const deliverDatagram = () => {
+			if (!datagramPullPending || pendingDatagrams.length === 0) return;
+			const item = pendingDatagrams.shift();
+			if (!item) return;
+			datagramPullPending = false;
+			try {
+				datagramsController.enqueue(item.data);
+			} finally {
+				item.reservation?.release();
+			}
+		};
 		const dReadable = new ReadableStream<Uint8Array>(
 			{
 				start(c) {
 					datagramsController = c;
 				},
+				pull() {
+					datagramPullPending = true;
+					deliverDatagram();
+				},
+				cancel() {
+					for (const item of pendingDatagrams) item.reservation?.release();
+					pendingDatagrams.length = 0;
+				},
 			},
-			new CountQueuingStrategy({ highWaterMark: MAX_QUEUED_DATAGRAMS }),
+			new CountQueuingStrategy({ highWaterMark: 0 }),
 		);
 
-		session.onDatagram((d) => {
-			if ((datagramsController.desiredSize ?? 1) > 0) {
-				try {
-					datagramsController.enqueue(d);
-				} catch {}
-			}
-		});
+		session.onDatagram(
+			(data, reservation) => {
+				pendingDatagrams.push({ data, reservation });
+				deliverDatagram();
+			},
+			{ retainReservation: true },
+		);
 
 		const dWritable = new WritableStream<Uint8Array>({
-			write: (chunk) => {
-				// Fire and forget; WasmSession.sendDatagram drops if queue is full
-				session.sendDatagram(chunk);
-			},
+			// Promise settlement is the backpressure/error boundary. A false Rust
+			// send result is translated by WasmSession into a stable rejecting error.
+			write: (chunk) => session.sendDatagram(chunk),
 		});
 
 		this.datagrams = {
@@ -160,7 +243,9 @@ export class WasmWebTransport {
 			createWritable() {
 				return dWritable;
 			},
-			maxDatagramSize: 1200,
+			get maxDatagramSize() {
+				return session.maxDatagramSize;
+			},
 		};
 
 		// Incoming streams
@@ -168,6 +253,33 @@ export class WasmWebTransport {
 		let uniController!: ReadableStreamDefaultController<
 			ReadableStream<Uint8Array>
 		>;
+		let bidiPullPending = false;
+		let uniPullPending = false;
+		const pendingBidi: WasmStream[] = [];
+		const pendingUni: WasmStream[] = [];
+		const deliverBidi = () => {
+			if (!bidiPullPending || pendingBidi.length === 0) return;
+			const stream = pendingBidi.shift();
+			if (!stream) return;
+			bidiPullPending = false;
+			try {
+				bidiController.enqueue(toBidi(stream));
+			} catch {
+				stream.stop(0);
+				stream.reset(0);
+			}
+		};
+		const deliverUni = () => {
+			if (!uniPullPending || pendingUni.length === 0) return;
+			const stream = pendingUni.shift();
+			if (!stream) return;
+			uniPullPending = false;
+			try {
+				uniController.enqueue(streamReadable(stream));
+			} catch {
+				stream.stop(0);
+			}
+		};
 
 		let incomingStarted = false;
 		const startIncoming = () => {
@@ -175,22 +287,11 @@ export class WasmWebTransport {
 			incomingStarted = true;
 			session.onIncomingStream((stream) => {
 				if (stream.bidi) {
-					if ((bidiController.desiredSize ?? 1) <= 0) {
-						stream.stop(0);
-						stream.reset(0);
-					} else {
-						try {
-							bidiController.enqueue(toBidi(stream));
-						} catch {}
-					}
+					pendingBidi.push(stream);
+					deliverBidi();
 				} else {
-					if ((uniController.desiredSize ?? 1) <= 0) {
-						stream.stop(0);
-					} else {
-						try {
-							uniController.enqueue(streamReadable(stream));
-						} catch {}
-					}
+					pendingUni.push(stream);
+					deliverUni();
 				}
 			});
 		};
@@ -201,11 +302,20 @@ export class WasmWebTransport {
 					start(c) {
 						bidiController = c;
 					},
-					pull: startIncoming,
+					pull() {
+						bidiPullPending = true;
+						startIncoming();
+						deliverBidi();
+					},
+					cancel() {
+						for (const stream of pendingBidi) {
+							stream.stop(0);
+							stream.reset(0);
+						}
+						pendingBidi.length = 0;
+					},
 				},
-				new CountQueuingStrategy({
-					highWaterMark: MAX_QUEUED_INCOMING_STREAMS,
-				}),
+				new CountQueuingStrategy({ highWaterMark: 0 }),
 			);
 
 		this.incomingUnidirectionalStreams = new ReadableStream<
@@ -215,13 +325,30 @@ export class WasmWebTransport {
 				start(c) {
 					uniController = c;
 				},
-				pull: startIncoming,
+				pull() {
+					uniPullPending = true;
+					startIncoming();
+					deliverUni();
+				},
+				cancel() {
+					for (const stream of pendingUni) stream.stop(0);
+					pendingUni.length = 0;
+				},
 			},
-			new CountQueuingStrategy({ highWaterMark: MAX_QUEUED_INCOMING_STREAMS }),
+			new CountQueuingStrategy({ highWaterMark: 0 }),
 		);
 
 		this.closed
 			.then(() => {
+				for (const item of pendingDatagrams) item.reservation?.release();
+				pendingDatagrams.length = 0;
+				for (const stream of pendingBidi) {
+					stream.stop(0);
+					stream.reset(0);
+				}
+				pendingBidi.length = 0;
+				for (const stream of pendingUni) stream.stop(0);
+				pendingUni.length = 0;
 				try {
 					datagramsController.close();
 				} catch {}
@@ -232,11 +359,11 @@ export class WasmWebTransport {
 					uniController.close();
 				} catch {}
 			})
-			.catch(() => {
-				const err = new WebTransportError(
-					E_SESSION_CLOSED,
-					"Connection failed",
-				);
+			.catch((error: unknown) => {
+				const err =
+					error instanceof WebTransportError
+						? error
+						: new WebTransportError(E_SESSION_CLOSED, "Connection failed");
 				try {
 					datagramsController.error(err);
 				} catch {}
@@ -247,9 +374,13 @@ export class WasmWebTransport {
 					uniController.error(err);
 				} catch {}
 			});
+		// Match the native facade: draining settles when closing begins locally,
+		// remotely, or because connection establishment failed.
+		this.closed.then(this.resolveDraining, this.resolveDraining);
 	}
 
 	close(info?: WebTransportCloseInfo): void {
+		this.resolveDraining();
 		this.session.close({ code: info?.closeCode, reason: info?.reason });
 	}
 

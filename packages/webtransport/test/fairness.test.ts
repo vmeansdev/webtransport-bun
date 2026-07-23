@@ -6,7 +6,11 @@
  */
 
 import { describe, it, expect, afterEach } from "bun:test";
-import { createHarness } from "./helpers/harness.js";
+import {
+	createHarness,
+	forEachWithTimeout,
+	nextWithTimeout,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 import { connect, createServer } from "../src/index.js";
 
@@ -74,8 +78,12 @@ describe("fairness and abuse resistance (P2.3)", () => {
 				},
 				onSession: (s) => {
 					void (async () => {
-						for await (const _ of s.incomingDatagrams()) {
-						}
+						await forEachWithTimeout(
+							s.incomingDatagrams(),
+							5000,
+							"fairness refill incoming datagram",
+							async () => undefined,
+						);
 					})().catch(() => {});
 				},
 			}),
@@ -275,9 +283,14 @@ describe("fairness and abuse resistance (P2.3)", () => {
 					},
 					onSession: (s) => {
 						void (async () => {
-							for await (const d of s.incomingDatagrams()) {
-								await s.sendDatagram(d);
-							}
+							await forEachWithTimeout(
+								s.incomingDatagrams(),
+								5000,
+								"fairness contention incoming datagram",
+								async (d) => {
+									await s.sendDatagram(d);
+								},
+							);
 						})().catch(() => {});
 					},
 				}),
@@ -293,13 +306,11 @@ describe("fairness and abuse resistance (P2.3)", () => {
 						});
 						await c.sendDatagram(new Uint8Array([1, 2, 3]));
 						const iter = c.incomingDatagrams()[Symbol.asyncIterator]();
-						const r = (await Promise.race([
-							iter.next(),
-							Bun.sleep(1200).then(() => ({
-								done: true as const,
-								value: undefined,
-							})),
-						])) as IteratorResult<Uint8Array>;
+						const r = await nextWithTimeout(
+							iter,
+							1200,
+							"fairness compliant datagram echo",
+						);
 						if (r.value) compliantConnected = true;
 						c.close();
 						return;
