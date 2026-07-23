@@ -83,13 +83,25 @@ const healthServer = Bun.serve({
 	port: HEALTH_PORT,
 	fetch(req) {
 		const url = new URL(req.url);
+		if (url.pathname === "/execution-identity") {
+			return Response.json(
+				{ executionIdentity: "wasm-under-bun" },
+				{ headers: { "Cache-Control": "no-store" } },
+			);
+		}
 		if (url.pathname === "/cert-hash") {
-			return new Response(JSON.stringify({ hashBase64: certHashBase64 }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Cache-Control": "no-store",
+			return new Response(
+				JSON.stringify({
+					hashBase64: certHashBase64,
+					executionIdentity: "wasm-under-bun",
+				}),
+				{
+					headers: {
+						"Content-Type": "application/json; charset=utf-8",
+						"Cache-Control": "no-store",
+					},
 				},
-			});
+			);
 		}
 		return new Response(null, { status: 200 });
 	},

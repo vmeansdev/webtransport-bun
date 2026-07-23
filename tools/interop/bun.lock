@@ -5,8 +5,8 @@
     "": {
       "name": "@webtransport-bun/interop",
       "devDependencies": {
-        "@playwright/test": "^1.58.2",
-        "@types/bun": "latest",
+        "@playwright/test": "1.58.2",
+        "@types/bun": "1.3.9",
       },
       "peerDependencies": {
         "typescript": "^5",

@@ -5,13 +5,33 @@
  */
 import { X509Certificate, createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	resolveCertDir,
+	resolvePublishedMaterialPaths,
+} from "./prepare-certs.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const certPath = join(__dirname, "certs", "cert.pem");
+const DEFAULT_CERT_DIR = join(__dirname, "certs");
+
+export function getInteropCertDir(): string {
+	if (process.env.WEBTRANSPORT_INTEROP_CERT_DIR) {
+		return resolveCertDir();
+	}
+	return DEFAULT_CERT_DIR;
+}
+
+export function getInteropCertPath(): string {
+	return resolvePublishedMaterialPaths(getInteropCertDir()).certPath;
+}
+
+export function getInteropKeyPath(): string {
+	return resolvePublishedMaterialPaths(getInteropCertDir()).keyPath;
+}
 
 export function getCertHashBase64(): string {
+	const certPath = getInteropCertPath();
 	if (!existsSync(certPath)) return "";
 	try {
 		const cert = new X509Certificate(readFileSync(certPath, "utf-8"));
@@ -23,6 +43,7 @@ export function getCertHashBase64(): string {
 }
 
 export function getSpkiHashBase64(): string {
+	const certPath = getInteropCertPath();
 	if (!existsSync(certPath)) return "";
 	try {
 		const cert = new X509Certificate(readFileSync(certPath, "utf-8"));

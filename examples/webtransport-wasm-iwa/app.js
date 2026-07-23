@@ -1,7 +1,6 @@
-// Reference IWA demo wiring. Requires a web-target wasm-bindgen build and the
-// package's wasm subpath bundled into ./vendor/ (see README.md). This file is a
-// faithful illustration of the browser API; it runs only inside a Chromium
-// Isolated Web App with the direct-sockets permission.
+// Release IWA proof harness. This module deliberately validates that it is
+// executing in an installed Isolated Web App before opening Direct Sockets;
+// loading the page or finding a UDPSocket-shaped mock is not release evidence.
 
 import initWasm, * as wasm from "./vendor/webtransport_wasm.js";
 import {
@@ -11,130 +10,414 @@ import {
 	serverCertificateHashes,
 } from "./vendor/webtransport-wasm.js";
 
+const EXECUTION_IDENTITY = "browser-iwa-direct-sockets";
+const PRIMARY_PORT = 4433;
+const ROTATED_PORT = 4434;
+const RESET_CODE = 37;
+const STOP_SENDING_CODE = 41;
+const PEER_CLOSE_CODE = 4100;
+const STEP_TIMEOUT_MS = 10_000;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const logEl = document.getElementById("log");
 const hashEl = document.getElementById("hash");
+
 function log(...args) {
 	logEl.textContent += `${args.join(" ")}\n`;
 }
 
-let serverCertHash = null;
-const SERVER_PORT = 4433;
+function monotonicNowMs() {
+	return performance.now();
+}
+
+function createMonotonicDeadline(timeoutMs, now = monotonicNowMs) {
+	const deadlineMs = now() + timeoutMs;
+	return {
+		remainingMs: () => Math.max(0, deadlineMs - now()),
+		expired: () => deadlineMs <= now(),
+	};
+}
+
+function remainingDeadlineMs(deadline) {
+	return deadline
+		? Math.max(0, deadline.remainingMs())
+		: Number.POSITIVE_INFINITY;
+}
+
+function withDeadline(
+	promise,
+	label,
+	timeoutMs = STEP_TIMEOUT_MS,
+	deadline = undefined,
+) {
+	let timer;
+	const operationDeadline = createMonotonicDeadline(timeoutMs);
+	const effectiveDelayMs = Math.min(
+		operationDeadline.remainingMs(),
+		remainingDeadlineMs(deadline),
+	);
+	return Promise.race([
+		promise,
+		new Promise((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+				effectiveDelayMs,
+			);
+		}),
+	]).finally(() => clearTimeout(timer));
+}
+
+function signal() {
+	let resolve;
+	let reject;
+	const promise = new Promise((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+function assert(condition, message) {
+	if (!condition) throw new Error(message);
+}
+
+function validateExecutionIdentity() {
+	assert(
+		location.protocol === "isolated-app:",
+		`expected isolated-app: execution, got ${location.protocol}`,
+	);
+	assert(
+		typeof globalThis.UDPSocket === "function",
+		"Direct Sockets UDPSocket is unavailable in the installed IWA",
+	);
+	assert(
+		globalThis.crossOriginIsolated === true,
+		"IWA is not cross-origin isolated",
+	);
+	return {
+		executionIdentity: EXECUTION_IDENTITY,
+		origin: location.origin,
+		protocol: location.protocol,
+		crossOriginIsolated: globalThis.crossOriginIsolated,
+		directSockets: true,
+	};
+}
+
+function installServerSession(session) {
+	session.onDatagram((data) => {
+		const text = decoder.decode(data);
+		if (text === "__IWA_PEER_CLOSE__") {
+			session.close({ code: PEER_CLOSE_CODE, reason: "iwa-peer-close" });
+			return;
+		}
+		void session.sendDatagram(data);
+	});
+
+	session.onIncomingStream((stream) => {
+		const chunks = [];
+		let controlHandled = false;
+		let queue = Promise.resolve();
+		stream.onData((data, fin) => {
+			const text = decoder.decode(data);
+			if (!controlHandled && text === "__IWA_RESET__") {
+				controlHandled = true;
+				stream.reset(RESET_CODE);
+				return;
+			}
+			if (!controlHandled && text === "__IWA_STOP_SENDING__") {
+				controlHandled = true;
+				stream.stop(STOP_SENDING_CODE);
+				return;
+			}
+			if (controlHandled) return;
+
+			if (stream.bidi) {
+				queue = queue.then(async () => {
+					if (data.length > 0) await stream.writeAll(data);
+					if (fin) stream.finish();
+				});
+				queue.catch((error) => log("server bidi error:", String(error)));
+				return;
+			}
+
+			if (data.length > 0) chunks.push(data.slice());
+			if (!fin) return;
+			const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+			const payload = new Uint8Array(total);
+			let offset = 0;
+			for (const chunk of chunks) {
+				payload.set(chunk, offset);
+				offset += chunk.length;
+			}
+			const output = session.createUnidirectionalStream();
+			void output
+				.writeAll(payload)
+				.then(() => output.finish())
+				.catch((error) => log("server uni error:", String(error)));
+		});
+	});
+}
+
+const servers = new Map();
+
+async function startServer(port) {
+	const existing = servers.get(port);
+	if (existing) return existing;
+	const server = await withDeadline(
+		serveOverUdp(wasm, DirectSocketsUdpTransport.bind, {
+			localAddress: "127.0.0.1",
+			localPort: port,
+			commonName: "localhost",
+			validityDays: 14,
+			onSession: installServerSession,
+		}),
+		`start IWA server on UDP ${port}`,
+	);
+	servers.set(port, server);
+	return server;
+}
+
+async function openClient(port, certHashBase64) {
+	const udp = await withDeadline(
+		DirectSocketsUdpTransport.connect("127.0.0.1", port),
+		`open Direct Sockets client for ${port}`,
+	);
+	try {
+		const connected = await withDeadline(
+			connectWasm(wasm, udp, "localhost", "127.0.0.1:0", `127.0.0.1:${port}`, {
+				certHashBase64,
+			}),
+			`connect WASM WebTransport client to ${port}`,
+		);
+		return {
+			...connected,
+			udp,
+			async close() {
+				connected.manager.close();
+				await udp.close();
+			},
+		};
+	} catch (error) {
+		await udp.close();
+		throw error;
+	}
+}
+
+async function datagramRoundTrip(session, payload) {
+	const received = signal();
+	session.onDatagram((data) => received.resolve(decoder.decode(data)));
+	await session.sendDatagram(encoder.encode(payload));
+	const echoed = await withDeadline(received.promise, "IWA datagram echo");
+	assert(echoed === payload, `datagram mismatch: ${echoed}`);
+	return echoed;
+}
+
+async function bidiRoundTrip(session, payload) {
+	const received = signal();
+	const chunks = [];
+	const stream = session.createBidirectionalStream();
+	stream.onData((data, fin) => {
+		if (data.length > 0) chunks.push(data.slice());
+		if (fin) {
+			received.resolve(
+				decoder.decode(Uint8Array.from(chunks.flatMap((c) => [...c]))),
+			);
+		}
+	});
+	await stream.writeAll(encoder.encode(payload));
+	stream.finish();
+	const echoed = await withDeadline(received.promise, "IWA bidi echo");
+	assert(echoed === payload, `bidi mismatch: ${echoed}`);
+	return echoed;
+}
+
+async function uniRoundTrip(session, payload) {
+	const incoming = signal();
+	session.onIncomingStream((stream) => {
+		if (!stream.bidi) incoming.resolve(stream);
+	});
+	const output = session.createUnidirectionalStream();
+	await output.writeAll(encoder.encode(payload));
+	output.finish();
+	const input = await withDeadline(incoming.promise, "IWA incoming uni stream");
+	const received = signal();
+	const chunks = [];
+	input.onData((data, fin) => {
+		if (data.length > 0) chunks.push(data.slice());
+		if (fin) {
+			received.resolve(
+				decoder.decode(Uint8Array.from(chunks.flatMap((c) => [...c]))),
+			);
+		}
+	});
+	const echoed = await withDeadline(received.promise, "IWA uni echo");
+	assert(echoed === payload, `uni mismatch: ${echoed}`);
+	return echoed;
+}
+
+async function resetRoundTrip(session) {
+	const reset = signal();
+	const stream = session.createBidirectionalStream();
+	stream.onReset((code) => reset.resolve(code));
+	await stream.writeAll(encoder.encode("__IWA_RESET__"));
+	const code = await withDeadline(
+		reset.promise,
+		"IWA RESET_STREAM propagation",
+	);
+	assert(code === RESET_CODE, `reset code mismatch: ${code}`);
+	return code;
+}
+
+async function stopSendingRoundTrip(session) {
+	const stopped = signal();
+	const stream = session.createBidirectionalStream();
+	stream.onStopped((code) => stopped.resolve(code));
+	await stream.writeAll(encoder.encode("__IWA_STOP_SENDING__"));
+	const code = await withDeadline(
+		stopped.promise,
+		"IWA STOP_SENDING propagation",
+	);
+	assert(code === STOP_SENDING_CODE, `STOP_SENDING code mismatch: ${code}`);
+	return code;
+}
+
+async function peerCloseRoundTrip(session) {
+	await session.sendDatagram(encoder.encode("__IWA_PEER_CLOSE__"));
+	const info = await withDeadline(session.closed, "IWA peer connection close");
+	assert(
+		info.code === PEER_CLOSE_CODE,
+		`peer close code mismatch: ${info.code}`,
+	);
+	return { code: info.code, reason: info.reason };
+}
+
+async function runIwaInteropProof() {
+	const startedAt = new Date().toISOString();
+	const identity = validateExecutionIdentity();
+	const primary = await startServer(PRIMARY_PORT);
+	hashEl.textContent = primary.certHashBase64;
+	log("execution identity:", identity.executionIdentity);
+	log("server: listening on udp", PRIMARY_PORT);
+
+	const functionalClient = await openClient(
+		PRIMARY_PORT,
+		primary.certHashBase64,
+	);
+	let functional;
+	try {
+		functional = {
+			datagram: await datagramRoundTrip(
+				functionalClient.session,
+				"iwa-datagram",
+			),
+			bidi: await bidiRoundTrip(functionalClient.session, "iwa-bidi"),
+			uni: await uniRoundTrip(functionalClient.session, "iwa-uni"),
+			resetCode: await resetRoundTrip(functionalClient.session),
+			stopSendingCode: await stopSendingRoundTrip(functionalClient.session),
+			peerClose: await peerCloseRoundTrip(functionalClient.session),
+		};
+	} finally {
+		await functionalClient.close();
+	}
+
+	const reconnects = [];
+	for (let attempt = 1; attempt <= 8; attempt += 1) {
+		const client = await openClient(PRIMARY_PORT, primary.certHashBase64);
+		try {
+			const payload = `iwa-reconnect-${attempt}`;
+			reconnects.push({
+				attempt,
+				payload: await datagramRoundTrip(client.session, payload),
+			});
+			client.session.close({ code: 4200 + attempt, reason: "iwa-reconnect" });
+			await withDeadline(
+				client.session.closed,
+				`IWA reconnect close ${attempt}`,
+			);
+		} finally {
+			await client.close();
+		}
+	}
+
+	const rotated = await startServer(ROTATED_PORT);
+	assert(
+		rotated.certHashBase64 !== primary.certHashBase64,
+		"certificate rotation produced the same certificate hash",
+	);
+	let oldPinRejected = false;
+	try {
+		const stale = await openClient(ROTATED_PORT, primary.certHashBase64);
+		await stale.close();
+	} catch {
+		oldPinRejected = true;
+	}
+	assert(oldPinRejected, "rotated server accepted the stale certificate pin");
+	const rotatedClient = await openClient(ROTATED_PORT, rotated.certHashBase64);
+	let rotatedPayload;
+	try {
+		rotatedPayload = await datagramRoundTrip(
+			rotatedClient.session,
+			"iwa-rotated-cert",
+		);
+	} finally {
+		await rotatedClient.close();
+	}
+
+	const evidence = {
+		schemaVersion: 1,
+		status: "passed",
+		startedAt,
+		finishedAt: new Date().toISOString(),
+		...identity,
+		functional,
+		reconnects,
+		certificateRotation: {
+			oldPinRejected,
+			oldHash: primary.certHashBase64,
+			newHash: rotated.certHashBase64,
+			payload: rotatedPayload,
+		},
+		browser: navigator.userAgent,
+	};
+	globalThis.__WT_IWA_EVIDENCE__ = evidence;
+	log("IWA RELEASE PROOF PASSED", JSON.stringify(evidence));
+	return evidence;
+}
+
+globalThis.runIwaInteropProof = runIwaInteropProof;
+globalThis.__WT_IWA_READY__ = false;
 
 await initWasm();
+globalThis.__WT_IWA_READY__ = true;
 log("wasm initialised");
 
 document.getElementById("start-server").addEventListener("click", async () => {
 	try {
-		const { certHashBase64 } = await serveOverUdp(
-			wasm,
-			DirectSocketsUdpTransport.bind,
-			{
-				localAddress: "127.0.0.1",
-				localPort: SERVER_PORT,
-				commonName: "localhost",
-				validityDays: 14,
-				onSession: (session) => {
-					log("server: session established");
-					session.onDatagram((d) => {
-						log(`server: echo datagram (${d.length}b)`);
-						session.sendDatagram(d);
-					});
-					session.onIncomingStream((stream) => {
-						if (stream.bidi) {
-							// Bidi: echo received bytes back on the same stream.
-							// writeAll resolves only when every byte is accepted;
-							// serialize chunks and FIN when the peer FINs.
-							let queue = Promise.resolve();
-							stream.onData((data, fin) => {
-								queue = queue
-									.then(async () => {
-										if (data.length > 0) await stream.writeAll(data);
-										if (fin) stream.finish();
-									})
-									.catch((e) => log("server: bidi echo error", String(e)));
-							});
-						} else {
-							// Uni is RECV-ONLY — cannot write back on it. Echo onto
-							// a fresh uni stream once the input completes.
-							const chunks = [];
-							stream.onData((data, fin) => {
-								if (data.length > 0) chunks.push(data.slice());
-								if (fin) {
-									const total = chunks.reduce((n, c) => n + c.length, 0);
-									const buf = new Uint8Array(total);
-									let off = 0;
-									for (const c of chunks) {
-										buf.set(c, off);
-										off += c.length;
-									}
-									const out = session.createUnidirectionalStream();
-									(total > 0 ? out.writeAll(buf) : Promise.resolve())
-										.then(() => out.finish())
-										.catch((e) => log("server: uni echo error", String(e)));
-								}
-							});
-						}
-					});
-				},
-			},
-		);
-		serverCertHash = certHashBase64;
-		hashEl.textContent = certHashBase64;
-		log("server: listening on udp", SERVER_PORT);
-	} catch (e) {
-		log("server error:", String(e));
+		validateExecutionIdentity();
+		const server = await startServer(PRIMARY_PORT);
+		hashEl.textContent = server.certHashBase64;
+		log("server: listening on udp", PRIMARY_PORT);
+	} catch (error) {
+		log("server error:", String(error));
 	}
 });
 
 document
 	.getElementById("connect-client")
 	.addEventListener("click", async () => {
-		if (!serverCertHash) {
-			log("start the server first");
-			return;
-		}
 		try {
-			const udp = await DirectSocketsUdpTransport.connect(
-				"127.0.0.1",
-				SERVER_PORT,
-			);
-			// Pin the server's cert hash — the client fails against any other cert.
-			// peerAddr MUST match where the server listens (SERVER_PORT), or the
-			// wasm client targets :443 while packets arrive from :SERVER_PORT.
-			const { session } = await connectWasm(
-				wasm,
-				udp,
-				"localhost",
-				"127.0.0.1:0",
-				`127.0.0.1:${SERVER_PORT}`,
-				{ certHashBase64: serverCertHash },
-			);
-			log("client: session established (cert pinned)");
-
-			// Datagram round-trip.
-			session.onDatagram((d) =>
-				log("client: got datagram", new TextDecoder().decode(d)),
-			);
-			session.sendDatagram(new TextEncoder().encode("hello-datagram"));
-
-			// Bidi stream round-trip.
-			const stream = session.createBidirectionalStream();
-			stream.onData((data) =>
-				log("client: stream echo", new TextDecoder().decode(data)),
-			);
-			stream.write(new TextEncoder().encode("hello-stream"));
-
-			// `serverCertificateHashes` a native browser client would use to connect:
-			log(
-				"serverCertificateHashes:",
-				JSON.stringify(
-					serverCertificateHashes({ hashBase64: serverCertHash }).map((h) => ({
-						algorithm: h.algorithm,
-						value: `<${h.value.length} bytes>`,
-					})),
-				),
-			);
-		} catch (e) {
-			log("client error:", String(e));
+			await runIwaInteropProof();
+		} catch (error) {
+			globalThis.__WT_IWA_EVIDENCE__ = {
+				schemaVersion: 1,
+				status: "failed",
+				error: String(error),
+				finishedAt: new Date().toISOString(),
+			};
+			log("IWA RELEASE PROOF FAILED", String(error));
 		}
 	});
+
+// Used by the release runner to validate the exact browser-facing pin shape.
+globalThis.__WT_IWA_CERT_HASHES__ = (hashBase64) =>
+	serverCertificateHashes({ hashBase64 });

@@ -1,71 +1,159 @@
 #!/usr/bin/env bun
 /**
- * Datagram throughput benchmark. Phase 10.
- * Connects to addon server, sends datagrams, measures throughput and latency.
+ * Datagram throughput benchmark with in-process client/server metrics.
+ * Reports throughput, loss ratio, event-loop delay, CPU user time, and peak RSS.
  */
 
-import { createServer } from "../../packages/webtransport/src/index.ts";
-import { $ } from "bun";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
-const ROOT = process.cwd();
-const CLIENT_BIN = `${ROOT}/target/release/load-client`;
+import {
+	connect,
+	createServer,
+} from "../../packages/webtransport/src/index.ts";
+import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
+
+const PORT = Number(process.env.BENCH_PORT ?? 4433);
+const SESSION_COUNT = Number(process.env.BENCH_SESSIONS ?? 4);
+const DATAGRAMS_PER_SESSION = Number(
+	process.env.BENCH_DATAGRAMS_PER_SESSION ?? 2_500,
+);
+const PAYLOAD_SIZE = Number(process.env.BENCH_DATAGRAM_SIZE ?? 512);
+const SETTLE_TIMEOUT_MS = Number(process.env.BENCH_SETTLE_TIMEOUT_MS ?? 5_000);
+const SETTLE_QUIET_MS = Number(process.env.BENCH_SETTLE_QUIET_MS ?? 250);
+const SAMPLE_INTERVAL_MS = Number(process.env.BENCH_SAMPLE_INTERVAL_MS ?? 25);
+
+async function waitForSettle(
+	readCount: () => number,
+	targetCount: number,
+	timeoutMs: number,
+	quietMs: number,
+) {
+	const startedAt = performance.now();
+	let lastCount = readCount();
+	let lastChangedAt = startedAt;
+	while (performance.now() - startedAt < timeoutMs) {
+		await Bun.sleep(25);
+		const current = readCount();
+		if (current !== lastCount) {
+			lastCount = current;
+			lastChangedAt = performance.now();
+		}
+		if (current >= targetCount) {
+			return current;
+		}
+		if (performance.now() - lastChangedAt >= quietMs) {
+			return current;
+		}
+	}
+	return readCount();
+}
 
 async function main() {
-	try {
-		const p = await $`lsof -ti :4433`.quiet().nothrow().text();
-		if (p.trim())
-			await $`kill -9 ${p.trim().split(/\s+/).filter(Boolean)}`
-				.quiet()
-				.nothrow();
-	} catch (err) {
-		console.warn("datagram-throughput: port cleanup failed:", err);
+	const cert = generateLocalhostCert();
+	if (!cert) {
+		throw new Error(
+			"datagram-throughput: failed to generate localhost TLS cert",
+		);
 	}
-	await Bun.sleep(2000);
 
-	await $`cd ${ROOT} && cargo build -p reference --bin load-client --release`.quiet();
+	const payload = new Uint8Array(PAYLOAD_SIZE).fill(0x61);
+	let receivedDatagrams = 0;
+	let peakRssMiB = process.memoryUsage().rss / (1024 * 1024);
+	const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+	const rssSampler = setInterval(() => {
+		peakRssMiB = Math.max(
+			peakRssMiB,
+			process.memoryUsage().rss / (1024 * 1024),
+		);
+	}, SAMPLE_INTERVAL_MS);
+	eventLoopDelay.enable();
 
 	const server = createServer({
-		port: 4433,
-		tls: { certPem: "", keyPem: "" },
-		onSession: () => {},
+		port: PORT,
+		tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+		onSession: (session) => {
+			void (async () => {
+				for await (const _datagram of session.incomingDatagrams()) {
+					receivedDatagrams += 1;
+				}
+			})().catch((error) => {
+				console.warn(
+					"datagram-throughput: incoming datagram drain failed:",
+					error,
+				);
+			});
+		},
 	});
-	await Bun.sleep(6000);
 
-	const start = performance.now();
-	const client = Bun.spawn(
-		[
-			CLIENT_BIN,
-			"--url",
-			"https://127.0.0.1:4433",
-			"--sessions",
-			"4",
-			"--duration",
-			"10",
-			"--datagrams-per-sec",
-			"1000",
-			"--streams-per-sec",
-			"0",
-		],
-		{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
-	);
-	const out = await new Response(client.stdout).text();
-	await client.exited;
-	const elapsed = (performance.now() - start) / 1000;
-	await server.close();
+	const clients = [];
+	const cpuStartedAt = process.cpuUsage();
+	const benchmarkStartedAt = performance.now();
 
-	const match = out.match(/datagrams sent=(\d+)/);
-	const sent = match?.[1] ? parseInt(match[1], 10) : 0;
-	const throughput = sent / elapsed;
-	console.log(
-		"datagram-throughput: sent=",
-		sent,
-		"elapsed=",
-		elapsed.toFixed(2),
-		"s",
-		"throughput=",
-		throughput.toFixed(0),
-		"dgram/s",
-	);
+	try {
+		await Bun.sleep(1_000);
+		const url = `https://127.0.0.1:${PORT}`;
+		for (let i = 0; i < SESSION_COUNT; i++) {
+			clients.push(
+				await connect(url, {
+					tls: { caPem: cert.certPem, serverName: "localhost" },
+				}),
+			);
+		}
+
+		await Promise.all(
+			clients.map(async (client) => {
+				for (let i = 0; i < DATAGRAMS_PER_SESSION; i++) {
+					await client.sendDatagram(payload);
+				}
+			}),
+		);
+
+		const totalSent = SESSION_COUNT * DATAGRAMS_PER_SESSION;
+		const observedAfterSettle = await waitForSettle(
+			() => receivedDatagrams,
+			totalSent,
+			SETTLE_TIMEOUT_MS,
+			SETTLE_QUIET_MS,
+		);
+		const elapsedSecs = (performance.now() - benchmarkStartedAt) / 1000;
+		const throughput = totalSent / elapsedSecs;
+		const delivered = Math.min(totalSent, observedAfterSettle);
+		const lossRatio = totalSent === 0 ? 0 : (totalSent - delivered) / totalSent;
+		const cpuUsage = process.cpuUsage(cpuStartedAt);
+
+		console.log(
+			[
+				"datagram-throughput:",
+				`sent=${totalSent}`,
+				`received=${delivered}`,
+				`elapsed=${elapsedSecs.toFixed(3)}s`,
+				`throughput=${throughput.toFixed(1)} dgram/s`,
+				`loss=${lossRatio.toFixed(6)}`,
+			].join(" "),
+		);
+		console.log(
+			JSON.stringify({
+				name: "datagram-throughput",
+				sent: totalSent,
+				received: delivered,
+				throughput_dgrams_per_sec: Number(throughput.toFixed(3)),
+				loss_ratio: Number(lossRatio.toFixed(6)),
+				event_loop_delay_p99_ms: Number(
+					(eventLoopDelay.percentile(99) / 1_000_000).toFixed(3),
+				),
+				cpu_user_ms: Number((cpuUsage.user / 1000).toFixed(3)),
+				peak_rss_mib: Number(peakRssMiB.toFixed(3)),
+			}),
+		);
+	} finally {
+		clearInterval(rssSampler);
+		eventLoopDelay.disable();
+		for (const client of clients) {
+			client.close();
+		}
+		await server.close();
+		cert.cleanup();
+	}
 }
 
 main().catch((e) => {
