@@ -25,6 +25,7 @@ import {
 	type ErrorCode,
 	WebTransportError,
 } from "./errors.js";
+import { createMonotonicDeadline } from "./deadline.js";
 import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import { WasmWebTransport } from "./wasm-webtransport.js";
@@ -388,7 +389,14 @@ export class WasmStream {
 		// regains control across the await and may reuse its buffer.
 		let owned: Uint8Array | null = null;
 		let off = 0;
-		const deadline = Date.now() + this.mgr.options.limits.backpressureTimeoutMs;
+		// Monotonic STALL deadline, re-armed on every accepted byte: the timeout
+		// bounds time without progress, not total transfer time — a large chunk
+		// draining slowly through a narrow flow-control window must not fail
+		// while the peer keeps consuming. (Wall-clock Date.now() here made an
+		// NTP step forward look like a stall.)
+		let deadline = createMonotonicDeadline(
+			this.mgr.options.limits.backpressureTimeoutMs,
+		);
 		while (off < data.length) {
 			if (this.stopCode !== null) {
 				throw new WebTransportError(
@@ -402,9 +410,14 @@ export class WasmStream {
 			if (n < 0) {
 				throw this.mgr._streamWriteError(this.conn);
 			}
-			off += n;
+			if (n > 0) {
+				off += n;
+				deadline = createMonotonicDeadline(
+					this.mgr.options.limits.backpressureTimeoutMs,
+				);
+			}
 			if (off < data.length) {
-				const remainingMs = deadline - Date.now();
+				const remainingMs = deadline.remainingMs();
 				if (remainingMs <= 0) {
 					throw new WebTransportError(
 						E_BACKPRESSURE_TIMEOUT,
@@ -414,13 +427,9 @@ export class WasmStream {
 				if (!owned) owned = data.slice(); // snapshot once before yielding
 				// Window closed — wait for real progress (next pump) instead of
 				// a fixed 1ms poll, capped so a stalled peer can't hang forever.
+				// The loop re-attempts the write before the deadline check, so a
+				// window that opened during the wait is never thrown away.
 				await this.mgr.endpoint.waitForProgress(Math.min(50, remainingMs));
-				if (Date.now() >= deadline) {
-					throw new WebTransportError(
-						E_BACKPRESSURE_TIMEOUT,
-						`${E_BACKPRESSURE_TIMEOUT}: stream write remained blocked past backpressureTimeoutMs`,
-					);
-				}
 			}
 		}
 	}
@@ -1277,9 +1286,13 @@ export async function connectWasm(
 		normalized,
 		opts.certHashBase64,
 	);
-	const session = mgr.connectClient(authority);
+	// connectClient can throw SYNCHRONOUSLY (rejected authority, wt_connect
+	// failure) — it must sit inside the try so the endpoint, the transport's
+	// onPacket subscription, and any armed timer are torn down on that path too.
 	try {
+		const session = mgr.connectClient(authority);
 		await session.ready;
+		return { session, manager: mgr };
 	} catch (err) {
 		mgr.close();
 		// The connect failed and we're throwing, so the caller can't get the
@@ -1290,7 +1303,6 @@ export async function connectWasm(
 		} catch {}
 		throw err;
 	}
-	return { session, manager: mgr };
 }
 
 /** Server: accept WebTransport sessions over the given UDP transport. */
