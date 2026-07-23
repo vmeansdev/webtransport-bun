@@ -1114,7 +1114,11 @@ export async function readProcessTextBounded(
 	timeoutMs: number = LOAD_IO_TIMEOUT_MS,
 ): Promise<string> {
 	const exitGraceMs = Math.min(CHILD_EXIT_GRACE_MS, Math.max(25, timeoutMs));
-	const { promise, cancel } = captureOutput(proc.stdout);
+	// Bun.Subprocess types stdout as number | ReadableStream | undefined; only a
+	// piped stream is capturable.
+	const { promise, cancel } = captureOutput(
+		proc.stdout instanceof ReadableStream ? proc.stdout : undefined,
+	);
 	try {
 		return await Promise.race([
 			promise,
