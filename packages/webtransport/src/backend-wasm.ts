@@ -120,6 +120,15 @@ export type DecodedWasmEvent =
 	| { type: "stream-stopped"; conn: number; stream: number; code: number }
 	| { type: "unknown"; tag: number };
 
+// Host-token recovery on failure: a malformed (null) or unknown-tag event
+// cannot have its embedded host token released here. The token is the TRAILING
+// varint of DATAGRAM/STREAM_DATA events, so its position is only known after a
+// full successful parse — every failure path below fails before/at the token
+// bytes (truncation) or on an unknown layout, and guessing a token from the
+// tail risks releasing a DIFFERENT live reservation (worse than the leak). The
+// in-tree Rust encoder only ever emits well-formed events, so this arm is pure
+// defense-in-depth; a leak here implies encoder corruption/version skew and is
+// reclaimed at endpoint close (release_all_host_tokens).
 export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 	const tag = ev[0];
 	if (tag == null) return null;
@@ -221,6 +230,14 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 	}
 }
 
+// INVARIANT (double-release safety): the catch blocks below release the raw
+// hostToken after a throwing callback that may itself have already released the
+// same token (via a manager reservation, e.g. WasmStream._deliverData). That
+// second release is a safe no-op ONLY because both releases run synchronously
+// within this one dispatch: Rust reuses freed token ids, and only wt_poll_event
+// processing allocates new ones, so nothing can interleave and rebind the id to
+// a different live reservation between the two calls. Any change that defers
+// either release (queueMicrotask, await, re-entrant pump) breaks this.
 export function dispatchDecodedWasmEvent(
 	decoded: DecodedWasmEvent | null,
 	events: WasmSessionEvents,
