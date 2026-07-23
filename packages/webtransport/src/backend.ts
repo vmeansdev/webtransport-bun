@@ -1290,22 +1290,45 @@ export class WasmTransportManager {
 	/**
 	 * Shut down the endpoint: CONNECTION_CLOSE every session, drop wasm state,
 	 * and close an owned transport so its UDP socket/port is released.
+	 *
+	 * INFALLIBLE by contract: teardown must never throw. A step that throws
+	 * would mask the caller's original error (e.g. the connect failure that
+	 * triggered this close) and skip the steps after it — every phase is
+	 * isolated and reported instead of propagated.
 	 */
 	close(): void {
-		this.endpoint.beginClose();
+		const guard = (step: () => void) => {
+			try {
+				step();
+			} catch (error) {
+				try {
+					this._reportResourceError(error);
+				} catch {
+					// onCallbackError hook threw while reporting — nothing left
+					// to report to; teardown continues regardless.
+				}
+			}
+		};
+		guard(() => this.endpoint.beginClose());
 		for (const session of this.sessions.values()) {
-			session._markClosed({ code: 0, reason: "endpoint closed" });
+			guard(() => session._markClosed({ code: 0, reason: "endpoint closed" }));
 		}
-		for (const stream of this.streams.values()) stream._dropRetained();
-		for (const reservation of [...this.hostReservations]) reservation.release();
+		for (const stream of this.streams.values()) {
+			guard(() => stream._dropRetained());
+		}
+		for (const reservation of [...this.hostReservations]) {
+			guard(() => reservation.release());
+		}
 		this.sessions.clear();
 		this.streams.clear();
 		// First close wins: a second close() runs after finishClose() freed the
 		// endpoint, so governorSnapshot() would report zeros and clobber the
 		// diagnostic captured at real teardown time.
-		this.closeResourceSnapshot ??= this._currentResourceSnapshot();
-		this.endpoint.finishClose();
-		this.ownedTransport?.close?.();
+		guard(() => {
+			this.closeResourceSnapshot ??= this._currentResourceSnapshot();
+		});
+		guard(() => this.endpoint.finishClose());
+		guard(() => this.ownedTransport?.close?.());
 		this.ownedTransport = null;
 	}
 }
@@ -1351,7 +1374,12 @@ export async function connectWasm(
 		await session.ready;
 		return { session, manager: mgr };
 	} catch (err) {
-		mgr.close();
+		// close() is infallible by contract, but the original connect error must
+		// win even if that contract regresses — never let teardown mask it or
+		// skip the transport release below.
+		try {
+			mgr.close();
+		} catch {}
 		// The connect failed and we're throwing, so the caller can't get the
 		// transport back — release it here to avoid leaking its socket/read loop.
 		// (mgr.close() only closes a transport the manager itself owns.)
