@@ -1316,6 +1316,40 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		expect(manager.resourceSnapshot()).toEqual(first);
 	});
 
+	test("close() is infallible: a throwing teardown step is reported and later steps still run", () => {
+		const tokens = new Set([7]);
+		const manager = WasmTransportManager.create(
+			fakeModuleWithHostTokens(tokens),
+			new InMemoryRelay().a,
+			false,
+			"127.0.0.1:5544",
+			"127.0.0.1:4433",
+			null,
+			normalizeWasmEndpointOptions(),
+		);
+		const reported: unknown[] = [];
+		manager.onCallbackError = (error) => reported.push(error);
+		manager.connectClient("localhost");
+		let transportClosed = false;
+		manager.ownTransport({
+			send() {},
+			onPacket() {},
+			close() {
+				transportClosed = true;
+				throw new Error("transport close failed");
+			},
+		} as unknown as UdpTransport);
+
+		// The owned transport's close throws — close() must neither propagate
+		// nor skip: the error is reported and teardown completes.
+		expect(() => manager.close()).not.toThrow();
+		expect(transportClosed).toBe(true);
+		expect(reported.length).toBe(1);
+		expect(String(reported[0])).toContain("transport close failed");
+		// And a second close stays a safe no-op.
+		expect(() => manager.close()).not.toThrow();
+	});
+
 	test("throwing retained callbacks release mirrored host and Rust reservations", () => {
 		const options = normalizeWasmEndpointOptions({
 			limits: {
