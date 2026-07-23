@@ -67,6 +67,11 @@ function requireValue<T>(value: T | undefined, label: string): T {
 	return value;
 }
 
+function trackedStreamCount(manager: WasmTransportManager): number {
+	return (manager as unknown as { streams: Map<number, WasmStream> }).streams
+		.size;
+}
+
 function incomingQueueLength(session: WasmSession): number {
 	return (
 		session as unknown as {
@@ -889,6 +894,39 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		expect(exact.released).toBe(true);
 	});
 
+	test("per-stream overflow surfaces a reset to a late consumer instead of hanging it", () => {
+		const { manager, errors } = fakeManager({
+			maxQueuedBytesGlobal: 4,
+			maxQueuedBytesPerSession: 4,
+			maxQueuedBytesPerStream: 4,
+		});
+		const stream = new WasmStream(manager, 1, 9, false, true);
+		stream._pushData(new Uint8Array(4), false, testReservation(4));
+		stream._pushData(new Uint8Array(1), false, testReservation(1));
+		expect(String(errors[0])).toContain("E_QUEUE_FULL");
+
+		// Buffered bytes are still delivered first, then the parked reset fires
+		// for the late subscriber (previously it hung until peer reset/idle).
+		const order: string[] = [];
+		stream.onData((data) => order.push(`data:${data.length}`));
+		stream.onReset((code) => order.push(`reset:${code}`));
+		expect(order).toEqual(["data:4", "reset:0"]);
+	});
+
+	test("per-stream overflow resets an already-subscribed reset consumer synchronously", () => {
+		const { manager } = fakeManager({
+			maxQueuedBytesGlobal: 4,
+			maxQueuedBytesPerSession: 4,
+			maxQueuedBytesPerStream: 4,
+		});
+		const stream = new WasmStream(manager, 1, 9, false, true);
+		const resets: number[] = [];
+		stream.onReset((code) => resets.push(code));
+		stream._pushData(new Uint8Array(4), false, testReservation(4));
+		stream._pushData(new Uint8Array(1), false, testReservation(1));
+		expect(resets).toEqual([0]);
+	});
+
 	test("WHATWG datagram and stream pulls hold then release the original reservation", async () => {
 		const { manager } = fakeManager({
 			maxQueuedBytesGlobal: 8,
@@ -1153,6 +1191,109 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		expect(streamTokens.has(2)).toBe(false);
 		streamFiller.release();
 		streamManager.close();
+	});
+
+	test("failed stream host adoption fails the stream closed and releases the token exactly once", () => {
+		const tokens = new Set([1, 2]);
+		const releases: number[] = [];
+		const originalDelete = tokens.delete.bind(tokens);
+		tokens.delete = (token: number) => {
+			releases.push(token);
+			return originalDelete(token);
+		};
+		const events: Uint8Array[] = [];
+		const manager = WasmTransportManager.create(
+			fakeModuleWithHostTokens(tokens, events),
+			new InMemoryRelay().a,
+			false,
+			"127.0.0.1:5544",
+			"127.0.0.1:4433",
+			null,
+			normalizeWasmEndpointOptions({
+				limits: {
+					maxQueuedBytesGlobal: 4,
+					maxQueuedBytesPerSession: 4,
+					maxQueuedBytesPerStream: 4,
+				},
+			}),
+		);
+		const session = manager.connectClient("localhost");
+		const stream = session.createBidirectionalStream();
+		const filler = requireValue(
+			manager._adoptHostReservation(1, undefined, 1, 4),
+			"filler reservation",
+		);
+		const resets: number[] = [];
+		stream.onReset((code) => resets.push(code));
+		// stream-data for handle 0 carrying token 2; adoption fails against the
+		// exhausted budget. The recv half must fail CLOSED (stop + reset) rather
+		// than silently dropping the bytes and leaving the stream readable.
+		events.push(new Uint8Array([6, 1, 0, 0, 1, 9, 2]));
+		manager.endpoint.pump();
+		expect(resets).toEqual([0]);
+		expect(releases.filter((token) => token === 2)).toEqual([2]);
+		filler.release();
+		manager.close();
+	});
+
+	test("throwing consumer on a fin payload still releases the stream handle", () => {
+		const tokens = new Set([1]);
+		const events: Uint8Array[] = [];
+		const manager = WasmTransportManager.create(
+			fakeModuleWithHostTokens(tokens, events),
+			new InMemoryRelay().a,
+			false,
+			"127.0.0.1:5544",
+			"127.0.0.1:4433",
+			null,
+			normalizeWasmEndpointOptions({
+				limits: {
+					maxQueuedBytesGlobal: 4,
+					maxQueuedBytesPerSession: 4,
+					maxQueuedBytesPerStream: 4,
+				},
+			}),
+		);
+		manager.onCallbackError = () => {};
+		const session = manager.connectClient("localhost");
+		let sawFin = false;
+		session.onIncomingStream((stream) => {
+			stream.onData((_data, fin) => {
+				sawFin = fin;
+				throw new Error("consumer failed");
+			});
+		});
+		// Uni incoming stream 9, then its fin'd payload carrying token 1. The
+		// throwing callback must not skip the fin bookkeeping that releases the
+		// handle from the manager's stream map.
+		events.push(
+			new Uint8Array([5, 1, 9, 0]),
+			new Uint8Array([6, 1, 9, 1, 1, 8, 1]),
+		);
+		manager.endpoint.pump();
+		expect(sawFin).toBe(true);
+		expect(tokens.size).toBe(0);
+		expect(trackedStreamCount(manager)).toBe(0);
+		manager.close();
+	});
+
+	test("a second close() keeps the first close's resource snapshot", () => {
+		const tokens = new Set([7]);
+		const manager = WasmTransportManager.create(
+			fakeModuleWithHostTokens(tokens),
+			new InMemoryRelay().a,
+			false,
+			"127.0.0.1:5544",
+			"127.0.0.1:4433",
+			null,
+			normalizeWasmEndpointOptions(),
+		);
+		manager.connectClient("localhost");
+		manager.close();
+		const first = manager.resourceSnapshot();
+		expect(first.rustHostTokensActive).toBe(1);
+		manager.close();
+		expect(manager.resourceSnapshot()).toEqual(first);
 	});
 
 	test("throwing retained callbacks release mirrored host and Rust reservations", () => {

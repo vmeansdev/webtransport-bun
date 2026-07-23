@@ -10,6 +10,7 @@ import {
 	type WasmModule,
 	type WasmSessionEvents,
 } from "./backend-wasm.js";
+import { createMonotonicDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
@@ -25,7 +26,6 @@ import {
 	type ErrorCode,
 	WebTransportError,
 } from "./errors.js";
-import { createMonotonicDeadline } from "./deadline.js";
 import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import { WasmWebTransport } from "./wasm-webtransport.js";
@@ -348,6 +348,8 @@ export class WasmStream {
 		| null = null;
 	private dataCbRetainsReservation = false;
 	private resetCb: ((code: number) => void) | null = null;
+	/** Reset surfaced before a consumer subscribed; replayed by onReset. */
+	private pendingResetCode: number | null = null;
 	private stoppedCb: ((code: number) => void) | null = null;
 	private buffered: RetainedStreamPayload[] = [];
 	private bufferedBytes = 0;
@@ -487,6 +489,13 @@ export class WasmStream {
 	}
 	onReset(cb: (code: number) => void): void {
 		this.resetCb = cb;
+		// A reset surfaced before subscription (e.g. a recv-budget overflow on a
+		// stream nobody was reading yet) must not strand a later consumer.
+		if (this.pendingResetCode !== null) {
+			const code = this.pendingResetCode;
+			this.pendingResetCode = null;
+			cb(code);
+		}
 	}
 	/** Peer STOP_SENDING on our send half; reads continue, writes will fail. */
 	onStopped(cb: (code: number) => void): void {
@@ -502,29 +511,55 @@ export class WasmStream {
 	): void {
 		const retained = { data, fin, reservation };
 		if (this.dataCb) {
-			this._deliverData(retained);
-		} else {
-			const nextBytes =
-				this.bufferedBytes + accountedReservationBytes(data, reservation, fin);
-			if (nextBytes > this.mgr.options.limits.maxQueuedBytesPerStream) {
-				reservation?.release();
-				this.mgr._reportResourceError(
-					new Error("E_QUEUE_FULL: maxQueuedBytesPerStream reached"),
-				);
-				if (!this.recvDone) {
-					this.mgr.endpoint.streamStop(this.handle, 0);
+			// A throwing consumer must not skip the fin bookkeeping: without it
+			// the handle stays in mgr.streams until connection teardown.
+			// (_deliverData already releases the reservation on the throw path.)
+			try {
+				this._deliverData(retained);
+			} finally {
+				if (fin) {
 					this.recvDone = true;
 					this._maybeRelease();
 				}
-				return;
 			}
-			this.buffered.push(retained);
-			this.bufferedBytes = nextBytes;
+			return;
 		}
+		const nextBytes =
+			this.bufferedBytes + accountedReservationBytes(data, reservation, fin);
+		if (nextBytes > this.mgr.options.limits.maxQueuedBytesPerStream) {
+			reservation?.release();
+			this.mgr._reportResourceError(
+				new Error("E_QUEUE_FULL: maxQueuedBytesPerStream reached"),
+			);
+			this._failInboundPressure();
+			return;
+		}
+		this.buffered.push(retained);
+		this.bufferedBytes = nextBytes;
 		if (fin) {
 			this.recvDone = true;
 			this._maybeRelease();
 		}
+	}
+	/**
+	 * @internal Recv-budget failure (queue overflow or a failed host-reservation
+	 * adoption): fail the recv half CLOSED instead of silently dropping payload
+	 * bytes — if JS/Rust accounting ever drift, a live stream missing bytes is
+	 * silent data corruption. STOP_SENDING tells the peer; the reset surfaced
+	 * here (buffered chunks are still delivered first on a late onData
+	 * subscribe) errors the consumer instead of hanging it until idle timeout.
+	 */
+	_failInboundPressure(): void {
+		if (this.recvDone) return;
+		this.mgr.endpoint.streamStop(this.handle, 0);
+		this.recvDone = true;
+		this._surfaceReset(0);
+		this._maybeRelease();
+	}
+	/** Deliver a reset now, or park it for the eventual onReset subscriber. */
+	private _surfaceReset(code: number): void {
+		if (this.resetCb) this.resetCb(code);
+		else this.pendingResetCode = code;
 	}
 	/** @internal */
 	_pushReset(code: number): void {
@@ -571,6 +606,13 @@ export class WasmStream {
 		this.bufferedBytes = 0;
 	}
 
+	// INVARIANT (double-release safety): when a callback throws, the release
+	// here runs first and the rethrow then reaches dispatchDecodedWasmEvent's
+	// catch, which releases the same RAW token id again. That second release is
+	// a safe no-op ONLY because both happen synchronously in the same dispatch
+	// — no wt_poll_event (and thus no Rust-side token allocation) can interleave,
+	// so the id cannot yet have been reused for a different live reservation.
+	// (Rust reuses freed token ids; see backend-wasm.ts dispatchDecodedWasmEvent.)
 	private _deliverData(item: RetainedStreamPayload): void {
 		const callback = this.dataCb;
 		if (!callback) return;
@@ -945,7 +987,15 @@ export class WasmTransportManager {
 					data.length,
 					fin,
 				);
-				if (!reservation) return;
+				if (!reservation) {
+					// Adoption failed (budget exhausted; _adoptHostReservation already
+					// released the host token, exactly once). Fail closed like the
+					// datagram path: dropping these bytes while leaving the stream
+					// readable would be silent data corruption if JS/Rust accounting
+					// ever drift.
+					this.streams.get(stream)?._failInboundPressure();
+					return;
+				}
 				const target = this.streams.get(stream);
 				if (target) target._pushData(data, fin, reservation);
 				else reservation?.release();
@@ -1246,7 +1296,10 @@ export class WasmTransportManager {
 		for (const reservation of [...this.hostReservations]) reservation.release();
 		this.sessions.clear();
 		this.streams.clear();
-		this.closeResourceSnapshot = this._currentResourceSnapshot();
+		// First close wins: a second close() runs after finishClose() freed the
+		// endpoint, so governorSnapshot() would report zeros and clobber the
+		// diagnostic captured at real teardown time.
+		this.closeResourceSnapshot ??= this._currentResourceSnapshot();
 		this.endpoint.finishClose();
 		this.ownedTransport?.close?.();
 		this.ownedTransport = null;
