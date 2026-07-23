@@ -308,8 +308,18 @@ pub fn cleanup_stale_entries(max_idle_secs: f64) {
     HANDSHAKE_BUCKETS.retain(|_, v| retain_bucket(v));
     STREAM_BUCKETS.retain(|_, v| retain_bucket(v));
     DGRAM_BUCKETS.retain(|_, v| retain_bucket(v));
-    PER_IP_SESSIONS.retain(|_, v| v.load(Ordering::Relaxed) > 0);
-    PER_PREFIX_SESSIONS.retain(|_, v| v.load(Ordering::Relaxed) > 0);
+    PER_IP_SESSIONS.retain(|_, v| v.load(Ordering::SeqCst) > 0);
+    PER_PREFIX_SESSIONS.retain(|_, v| v.load(Ordering::SeqCst) > 0);
+}
+
+/// Remove **all** rate-limiter entries owned by `server_id`.
+/// Call when a server is closed so no stale entries linger in global maps.
+pub fn cleanup_server_entries(server_id: u64) {
+    PER_IP_SESSIONS.retain(|k, _| k.0 != server_id);
+    PER_PREFIX_SESSIONS.retain(|k, _| k.0 != server_id);
+    HANDSHAKE_BUCKETS.retain(|k, _| k.0 != server_id);
+    STREAM_BUCKETS.retain(|k, _| k.0 != server_id);
+    DGRAM_BUCKETS.retain(|k, _| k.0 != server_id);
 }
 
 #[cfg(test)]
@@ -527,5 +537,35 @@ mod tests {
         let json = r#"{"handshakesBurst":60,"handshakesBurstTokens":999}"#;
         let rl = RateLimits::from_json(json);
         assert!((rl.handshakes_burst - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cleanup_server_entries_removes_all() {
+        let ip = unique_ip();
+        let sid_a: u64 = 9000;
+        let sid_b: u64 = 9001;
+
+        // Populate all 5 maps for server 9000.
+        assert!(try_acquire_per_ip_session(sid_a, &ip, 100));
+        assert!(try_acquire_handshake(sid_a, &ip, 10.0, 10.0));
+        assert!(try_acquire_stream_open(sid_a, &ip, 10.0, 10.0));
+        assert!(try_acquire_datagram_ingress(sid_a, &ip, 10.0, 10.0));
+
+        // Populate server 9001 to prove isolation.
+        assert!(try_acquire_per_ip_session(sid_b, &ip, 100));
+
+        // Cleanup server 9000.
+        cleanup_server_entries(sid_a);
+
+        // All 9000 entries must be gone.
+        assert!(!PER_IP_SESSIONS.contains_key(&(sid_a, ip.clone())));
+        let prefix = ip_to_prefix(&ip);
+        assert!(!PER_PREFIX_SESSIONS.contains_key(&(sid_a, prefix.clone())));
+        assert!(!HANDSHAKE_BUCKETS.contains_key(&(sid_a, ip.clone())));
+        assert!(!STREAM_BUCKETS.contains_key(&(sid_a, ip.clone())));
+        assert!(!DGRAM_BUCKETS.contains_key(&(sid_a, ip.clone())));
+
+        // 9001 entry must still be present.
+        assert!(PER_IP_SESSIONS.contains_key(&(sid_b, ip.clone())));
     }
 }

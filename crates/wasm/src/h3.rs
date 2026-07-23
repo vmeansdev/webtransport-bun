@@ -436,7 +436,7 @@ mod tests {
     fn parsers_never_panic_on_structured_adversarial_input() {
         // QPACK integer with the maximum continuation run.
         let mut overlong = vec![0xffu8];
-        overlong.extend(std::iter::repeat(0x80u8).take(64));
+        overlong.extend(std::iter::repeat_n(0x80u8, 64));
         overlong.push(0x00);
         assert!(qpack_int_decode(&overlong, 8).is_none());
 
@@ -571,9 +571,7 @@ mod tests {
         // continuation bytes: the pre-fix code shifted by m >= 64 (UB/panic in
         // debug, wrap in release). Must return None, never panic.
         let mut buf = vec![0xffu8]; // n=8 prefix, first == max -> continue
-        for _ in 0..20 {
-            buf.push(0x80); // continuation, value bits 0, keep going
-        }
+        buf.extend(std::iter::repeat_n(0x80, 20)); // continuation bytes
         buf.push(0x7f); // final byte, high bit clear
         assert_eq!(qpack_int_decode(&buf, 8), None);
     }

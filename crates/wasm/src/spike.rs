@@ -5,15 +5,21 @@
 //! Kept as a regression test of the QUIC core; the crypto helpers are reused by
 //! the real endpoint state machine.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig,
 };
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use web_time::Instant;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const SERVER_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4433));
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const CLIENT_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5544));
 
 /// Build a rustls server config from DER cert + PKCS8 key, with the `h3` ALPN.
@@ -100,6 +106,7 @@ pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
 }
 
 /// Route every transmit a connection wants to send into a flat list of payloads.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn drain_transmits(conn: &mut quinn_proto::Connection, now: Instant, out: &mut Vec<Vec<u8>>) {
     let max = conn.current_mtu() as usize;
     loop {
@@ -112,6 +119,7 @@ fn drain_transmits(conn: &mut quinn_proto::Connection, now: Instant, out: &mut V
 }
 
 /// Run a full in-memory client<->server QUIC handshake. Returns a status string.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn run_handshake() -> Result<String, String> {
     let (server_cfg, _cert_der) = server_crypto()?;
     let server_crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(server_cfg)
@@ -145,7 +153,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
     for step in 0..200 {
         let now = Instant::now();
 
-        let inbound: Vec<Vec<u8>> = to_server.drain(..).collect();
+        let inbound = std::mem::take(&mut to_server);
         for dgram in inbound {
             let mut resp_buf = Vec::new();
             let data = bytes::BytesMut::from(&dgram[..]);
@@ -177,7 +185,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
             }
         }
 
-        let inbound: Vec<Vec<u8>> = to_client.drain(..).collect();
+        let inbound = std::mem::take(&mut to_client);
         for dgram in inbound {
             let mut resp_buf = Vec::new();
             let data = bytes::BytesMut::from(&dgram[..]);
@@ -194,7 +202,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
             }
         }
 
-        for (_ch, conn) in server_conns.iter_mut() {
+        for conn in server_conns.values_mut() {
             while let Some(ev) = conn.poll() {
                 if matches!(ev, Event::Connected) {
                     server_connected = true;
@@ -220,7 +228,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
 
         if to_server.is_empty() && to_client.is_empty() {
             let mut progressed = false;
-            for (_ch, conn) in server_conns.iter_mut() {
+            for conn in server_conns.values_mut() {
                 if conn.poll_timeout().is_some() {
                     conn.handle_timeout(Instant::now());
                     drain_transmits(conn, Instant::now(), &mut to_client);

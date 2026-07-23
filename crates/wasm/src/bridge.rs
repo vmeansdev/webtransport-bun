@@ -11,18 +11,134 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use crate::endpoint::WtEndpoint;
+use crate::governor::{WasmLimits, WasmRateLimits};
+use crate::handle::HandleAllocator;
 
 thread_local! {
     static REGISTRY: RefCell<HashMap<u32, WtEndpoint>> = RefCell::new(HashMap::new());
-    static NEXT: RefCell<u32> = const { RefCell::new(1) };
+    static NEXT: RefCell<HandleAllocator> = const { RefCell::new(HandleAllocator::new()) };
 }
 
-fn alloc_id() -> u32 {
-    NEXT.with(|n| {
-        let mut n = n.borrow_mut();
-        let id = *n;
-        *n += 1;
-        id
+const REGISTRY_UNAVAILABLE: &str = "E_INTERNAL: endpoint registry unavailable";
+const INVALID_OPTIONS_TIMESTAMP: &str = "E_INTERNAL: notBeforeUnix must be a finite integer";
+
+fn register_endpoint(endpoint: WtEndpoint) -> Result<u32, String> {
+    REGISTRY
+        .try_with(|registry| {
+            let mut registry = registry
+                .try_borrow_mut()
+                .map_err(|_| REGISTRY_UNAVAILABLE.to_string())?;
+            let id = NEXT
+                .try_with(|next| {
+                    let mut next = next
+                        .try_borrow_mut()
+                        .map_err(|_| REGISTRY_UNAVAILABLE.to_string())?;
+                    next.allocate().map_err(str::to_string)
+                })
+                .map_err(|_| REGISTRY_UNAVAILABLE.to_string())??;
+            if registry.contains_key(&id) {
+                return Err("E_INTERNAL: endpoint handle collision".to_string());
+            }
+            registry.insert(id, endpoint);
+            Ok(id)
+        })
+        .map_err(|_| REGISTRY_UNAVAILABLE.to_string())?
+}
+
+fn with_endpoint_mut<R>(
+    eid: u32,
+    operation: impl FnOnce(&mut WtEndpoint) -> R,
+) -> Result<Option<R>, &'static str> {
+    REGISTRY
+        .try_with(|registry| {
+            let mut registry = registry
+                .try_borrow_mut()
+                .map_err(|_| REGISTRY_UNAVAILABLE)?;
+            Ok(registry.get_mut(&eid).map(operation))
+        })
+        .map_err(|_| REGISTRY_UNAVAILABLE)?
+}
+
+fn with_endpoint<R>(
+    eid: u32,
+    operation: impl FnOnce(&WtEndpoint) -> R,
+) -> Result<Option<R>, &'static str> {
+    REGISTRY
+        .try_with(|registry| {
+            let registry = registry.try_borrow().map_err(|_| REGISTRY_UNAVAILABLE)?;
+            Ok(registry.get(&eid).map(operation))
+        })
+        .map_err(|_| REGISTRY_UNAVAILABLE)?
+}
+
+fn parse_unix_seconds(value: f64) -> Result<i64, String> {
+    if !value.is_finite() {
+        return Err("E_INTERNAL: notBeforeUnix must be finite".to_string());
+    }
+    if value.fract() != 0.0 || value < i64::MIN as f64 || value >= i64::MAX as f64 {
+        return Err("E_INTERNAL: notBeforeUnix must be an integer".to_string());
+    }
+    Ok(value as i64)
+}
+
+fn parse_options_unix_seconds(value: Option<&serde_json::Value>) -> Result<i64, String> {
+    let value = value
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| INVALID_OPTIONS_TIMESTAMP.to_string())?;
+    parse_unix_seconds(value).map_err(|_| INVALID_OPTIONS_TIMESTAMP.to_string())
+}
+
+fn parse_limits(value: &serde_json::Value) -> Result<WasmLimits, String> {
+    let limits = value
+        .get("limits")
+        .ok_or_else(|| "limits missing".to_string())?;
+    let as_usize = |key: &str| -> Result<usize, String> {
+        limits
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| format!("invalid limits.{key}"))
+    };
+    let as_u64 = |key: &str| -> Result<u64, String> {
+        limits
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("invalid limits.{key}"))
+    };
+    Ok(WasmLimits {
+        max_sessions: as_usize("maxSessions")?,
+        max_handshakes_in_flight: as_usize("maxHandshakesInFlight")?,
+        max_streams_per_session_bidi: as_usize("maxStreamsPerSessionBidi")?,
+        max_streams_per_session_uni: as_usize("maxStreamsPerSessionUni")?,
+        max_streams_global: as_usize("maxStreamsGlobal")?,
+        max_datagram_size: as_usize("maxDatagramSize")?,
+        max_queued_bytes_global: as_usize("maxQueuedBytesGlobal")?,
+        max_queued_bytes_per_session: as_usize("maxQueuedBytesPerSession")?,
+        max_queued_bytes_per_stream: as_usize("maxQueuedBytesPerStream")?,
+        backpressure_timeout_ms: as_u64("backpressureTimeoutMs")?,
+        handshake_timeout_ms: as_u64("handshakeTimeoutMs")?,
+        idle_timeout_ms: as_u64("idleTimeoutMs")?,
+    })
+}
+
+fn parse_rate_limits(value: &serde_json::Value) -> Result<WasmRateLimits, String> {
+    let limits = value
+        .get("rateLimits")
+        .ok_or_else(|| "rateLimits missing".to_string())?;
+    let as_u32 = |key: &str| -> Result<u32, String> {
+        limits
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| format!("invalid rateLimits.{key}"))
+    };
+    Ok(WasmRateLimits {
+        handshakes_per_sec: as_u32("handshakesPerSec")?,
+        handshakes_burst: as_u32("handshakesBurst")?,
+        stream_opens_per_sec: as_u32("streamOpensPerSec")?,
+        stream_opens_burst: as_u32("streamOpensBurst")?,
+        datagrams_ingress_per_sec: as_u32("datagramsIngressPerSec")?,
+        datagrams_ingress_burst: as_u32("datagramsIngressBurst")?,
     })
 }
 
@@ -45,13 +161,63 @@ pub fn wt_new_endpoint(is_server: bool, addr: &str, peer_addr: &str) -> u32 {
         // Accept-any client is not available in a production build.
         return 0;
     }
-    let ep = match WtEndpoint::new(is_server, addr, peer) {
+    let ep = match WtEndpoint::new_with_limits(is_server, addr, peer, WasmLimits::default()) {
         Ok(ep) => ep,
         Err(_) => return 0,
     };
-    let id = alloc_id();
-    REGISTRY.with(|r| r.borrow_mut().insert(id, ep));
-    id
+    register_endpoint(ep).unwrap_or(0)
+}
+
+/// Create an endpoint from one normalized JSON config object:
+/// `{ isServer, addr, peerAddr, limits }`.
+#[wasm_bindgen]
+pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({ "error": format!("config json: {err}") }).to_string()
+        }
+    };
+    let is_server = parsed
+        .get("isServer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let addr = match parsed.get("addr").and_then(|v| v.as_str()) {
+        Some(addr) => addr,
+        None => return serde_json::json!({ "error": "addr missing" }).to_string(),
+    };
+    let peer_addr = match parsed.get("peerAddr").and_then(|v| v.as_str()) {
+        Some(peer_addr) => peer_addr,
+        None => return serde_json::json!({ "error": "peerAddr missing" }).to_string(),
+    };
+    let (Ok(addr), Ok(peer)) = (addr.parse(), peer_addr.parse()) else {
+        return serde_json::json!({ "error": "invalid addr or peerAddr" }).to_string();
+    };
+    let limits = match parse_limits(&parsed) {
+        Ok(limits) => limits,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    let rate_limits = match parse_rate_limits(&parsed) {
+        Ok(rate_limits) => rate_limits,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    if !is_server && !cfg!(feature = "dev-insecure") {
+        return serde_json::json!({ "error": "dev-insecure client path unavailable" }).to_string();
+    }
+    let ep = match WtEndpoint::new_with_limits_and_rate_limits(
+        is_server,
+        addr,
+        peer,
+        limits,
+        rate_limits,
+    ) {
+        Ok(ep) => ep,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    match register_endpoint(ep) {
+        Ok(id) => serde_json::json!({ "eid": id }).to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    }
 }
 
 /// Generate a self-signed P-256 cert. Returns JSON:
@@ -59,7 +225,11 @@ pub fn wt_new_endpoint(is_server: bool, addr: &str, peer_addr: &str) -> u32 {
 /// where `hashBase64` is the `serverCertificateHashes` value (SHA-256 of DER).
 #[wasm_bindgen]
 pub fn wt_generate_cert(common_name: &str, validity_days: u32, not_before_unix: f64) -> String {
-    match crate::cert::generate(common_name, validity_days, not_before_unix as i64) {
+    let not_before_unix = match parse_unix_seconds(not_before_unix) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({ "error": error }).to_string(),
+    };
+    match crate::cert::generate(common_name, validity_days, not_before_unix) {
         Ok(g) => {
             use base64::Engine as _;
             let der_b64 = base64::engine::general_purpose::STANDARD.encode(&g.cert_der);
@@ -91,18 +261,77 @@ pub fn wt_new_server(
         Ok(p) => p,
         Err(e) => return serde_json::json!({ "error": format!("peer_addr: {e}") }).to_string(),
     };
-    match WtEndpoint::new_with_generated_cert(
+    let not_before_unix = match parse_unix_seconds(not_before_unix) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({ "error": error }).to_string(),
+    };
+    match WtEndpoint::new_with_generated_cert_with_limits(
         peer,
         common_name,
         validity_days,
-        not_before_unix as i64,
+        not_before_unix,
+        WasmLimits::default(),
     ) {
-        Ok((ep, hash)) => {
-            let id = alloc_id();
-            REGISTRY.with(|r| r.borrow_mut().insert(id, ep));
-            serde_json::json!({ "eid": id, "hashBase64": hash }).to_string()
-        }
+        Ok((ep, hash)) => match register_endpoint(ep) {
+            Ok(id) => serde_json::json!({ "eid": id, "hashBase64": hash }).to_string(),
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        },
         Err(e) => serde_json::json!({ "error": e }).to_string(),
+    }
+}
+
+/// Create a server endpoint from one normalized JSON config object:
+/// `{ addr, peerAddr, commonName, validityDays, notBeforeUnix, limits }`.
+#[wasm_bindgen]
+pub fn wt_new_server_with_options(config_json: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({ "error": format!("config json: {err}") }).to_string()
+        }
+    };
+    let peer_addr = match parsed.get("peerAddr").and_then(|v| v.as_str()) {
+        Some(peer_addr) => peer_addr,
+        None => return serde_json::json!({ "error": "peerAddr missing" }).to_string(),
+    };
+    let common_name = parsed
+        .get("commonName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("localhost");
+    let validity_days = parsed
+        .get("validityDays")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(14);
+    let not_before_unix = match parse_options_unix_seconds(parsed.get("notBeforeUnix")) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({ "error": error }).to_string(),
+    };
+    let peer = match peer_addr.parse() {
+        Ok(peer) => peer,
+        Err(err) => return serde_json::json!({ "error": format!("peer_addr: {err}") }).to_string(),
+    };
+    let limits = match parse_limits(&parsed) {
+        Ok(limits) => limits,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    let rate_limits = match parse_rate_limits(&parsed) {
+        Ok(rate_limits) => rate_limits,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    match WtEndpoint::new_with_generated_cert_with_limits_and_rate_limits(
+        peer,
+        common_name,
+        validity_days,
+        not_before_unix,
+        limits,
+        rate_limits,
+    ) {
+        Ok((ep, hash)) => match register_endpoint(ep) {
+            Ok(id) => serde_json::json!({ "eid": id, "hashBase64": hash }).to_string(),
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        },
+        Err(err) => serde_json::json!({ "error": err }).to_string(),
     }
 }
 
@@ -122,13 +351,60 @@ pub fn wt_new_client(addr: &str, peer_addr: &str, cert_hashes_base64: &str) -> S
         Ok(h) => h,
         Err(e) => return serde_json::json!({ "error": e }).to_string(),
     };
-    match WtEndpoint::new_client_pinned(peer, hashes) {
-        Ok(ep) => {
-            let id = alloc_id();
-            REGISTRY.with(|r| r.borrow_mut().insert(id, ep));
-            serde_json::json!({ "eid": id }).to_string()
-        }
+    match WtEndpoint::new_client_pinned_with_limits(peer, hashes, WasmLimits::default()) {
+        Ok(ep) => match register_endpoint(ep) {
+            Ok(id) => serde_json::json!({ "eid": id }).to_string(),
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        },
         Err(e) => serde_json::json!({ "error": e }).to_string(),
+    }
+}
+
+/// Create a pinned client endpoint from one normalized JSON config object:
+/// `{ addr, peerAddr, certHashesBase64, limits }`.
+#[wasm_bindgen]
+pub fn wt_new_client_with_options(config_json: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({ "error": format!("config json: {err}") }).to_string()
+        }
+    };
+    let peer_addr = match parsed.get("peerAddr").and_then(|v| v.as_str()) {
+        Some(peer_addr) => peer_addr,
+        None => return serde_json::json!({ "error": "peerAddr missing" }).to_string(),
+    };
+    let cert_hashes_base64 = match parsed.get("certHashesBase64").and_then(|v| v.as_str()) {
+        Some(cert_hashes_base64) => cert_hashes_base64,
+        None => return serde_json::json!({ "error": "certHashesBase64 missing" }).to_string(),
+    };
+    let peer = match peer_addr.parse() {
+        Ok(peer) => peer,
+        Err(err) => return serde_json::json!({ "error": format!("peer_addr: {err}") }).to_string(),
+    };
+    let hashes = match crate::verify::PinnedCertVerifier::parse_hashes(cert_hashes_base64) {
+        Ok(hashes) => hashes,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    let limits = match parse_limits(&parsed) {
+        Ok(limits) => limits,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    let rate_limits = match parse_rate_limits(&parsed) {
+        Ok(rate_limits) => rate_limits,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    match WtEndpoint::new_client_pinned_with_limits_and_rate_limits(
+        peer,
+        hashes,
+        limits,
+        rate_limits,
+    ) {
+        Ok(ep) => match register_endpoint(ep) {
+            Ok(id) => serde_json::json!({ "eid": id }).to_string(),
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        },
+        Err(err) => serde_json::json!({ "error": err }).to_string(),
     }
 }
 
@@ -137,10 +413,8 @@ pub fn wt_new_client(addr: &str, peer_addr: &str, cert_hashes_base64: &str) -> S
 /// endpoint are unaffected.
 #[wasm_bindgen]
 pub fn wt_close_conn(eid: u32, conn: u32, code: u32, reason: &str) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.close_conn(conn, code, reason.as_bytes(), Instant::now());
-        }
+    let _ = with_endpoint_mut(eid, |endpoint| {
+        endpoint.close_conn(conn, code, reason.as_bytes(), Instant::now());
     });
 }
 
@@ -148,10 +422,8 @@ pub fn wt_close_conn(eid: u32, conn: u32, code: u32, reason: &str) {
 /// afterwards, then call `wt_close_endpoint` to drop the state.
 #[wasm_bindgen]
 pub fn wt_close_all(eid: u32, code: u32, reason: &str) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.close_all(code, reason.as_bytes(), Instant::now());
-        }
+    let _ = with_endpoint_mut(eid, |endpoint| {
+        endpoint.close_all(code, reason.as_bytes(), Instant::now());
     });
 }
 
@@ -159,21 +431,23 @@ pub fn wt_close_all(eid: u32, code: u32, reason: &str) {
 /// (server endpoint, bad params, or unknown eid) — never panics.
 #[wasm_bindgen]
 pub fn wt_connect(eid: u32, authority: &str) -> f64 {
-    REGISTRY.with(|r| match r.borrow_mut().get_mut(&eid) {
-        Some(ep) => ep.connect(authority) as f64,
-        None => -1.0,
-    })
+    with_endpoint_mut(eid, |endpoint| endpoint.connect(authority) as f64)
+        .ok()
+        .flatten()
+        .unwrap_or(-1.0)
 }
 
-/// Feed an inbound UDP datagram. `source` is the remote "ip:port"; if it fails
-/// to parse, the endpoint's configured peer address is used as a fallback.
+/// Feed an inbound UDP datagram. `source` must be the real remote "ip:port";
+/// malformed source metadata is rejected rather than collapsed onto a trusted
+/// fallback address.
 #[wasm_bindgen]
 pub fn wt_recv_packet(eid: u32, data: &[u8], source: &str) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            let src = source.parse().unwrap_or_else(|_| ep.peer_addr());
-            ep.recv(Instant::now(), src, data);
-        }
+    let _ = with_endpoint_mut(eid, |endpoint| {
+        let Ok(src) = source.parse() else {
+            endpoint.set_last_error("E_INTERNAL: invalid source address");
+            return;
+        };
+        endpoint.recv(Instant::now(), src, data);
     });
 }
 
@@ -181,127 +455,219 @@ pub fn wt_recv_packet(eid: u32, data: &[u8], source: &str) {
 /// `[dest_len:u8 | dest:utf8 "ip:port" | pkt_len:u32-le | pkt:bytes]`.
 #[wasm_bindgen]
 pub fn wt_poll_transmits(eid: u32) -> Vec<u8> {
-    REGISTRY.with(|r| {
+    with_endpoint_mut(eid, |endpoint| {
         let mut out = Vec::new();
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            let mut pkts = Vec::new();
-            ep.poll_transmits(Instant::now(), &mut pkts);
-            for (p, dest) in pkts {
-                let dest = dest.to_string();
-                let dest_bytes = dest.as_bytes();
-                out.push(dest_bytes.len() as u8);
-                out.extend_from_slice(dest_bytes);
-                out.extend_from_slice(&(p.len() as u32).to_le_bytes());
-                out.extend_from_slice(&p);
-            }
+        let mut packets = Vec::new();
+        endpoint.poll_transmits(Instant::now(), &mut packets);
+        for (packet, destination) in packets {
+            let destination = destination.to_string();
+            let destination_bytes = destination.as_bytes();
+            out.push(destination_bytes.len() as u8);
+            out.extend_from_slice(destination_bytes);
+            out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            out.extend_from_slice(&packet);
         }
         out
     })
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 #[wasm_bindgen]
 pub fn wt_next_timeout_ms(eid: u32) -> f64 {
-    REGISTRY.with(|r| match r.borrow_mut().get_mut(&eid) {
-        Some(ep) => ep.next_timeout_ms(),
-        None => -1.0,
-    })
+    with_endpoint_mut(eid, WtEndpoint::next_timeout_ms)
+        .ok()
+        .flatten()
+        .unwrap_or(-1.0)
 }
 
 #[wasm_bindgen]
 pub fn wt_handle_timeout(eid: u32) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.handle_timeout(Instant::now());
-        }
-    });
+    let _ = with_endpoint_mut(eid, |endpoint| endpoint.handle_timeout(Instant::now()));
 }
 
 #[wasm_bindgen]
 pub fn wt_poll_event(eid: u32) -> Option<Vec<u8>> {
-    REGISTRY.with(|r| {
-        r.borrow_mut()
-            .get_mut(&eid)
-            .and_then(|ep| ep.poll_event().map(|e| e.encode()))
-    })
+    with_endpoint_mut(eid, WtEndpoint::poll_event_encoded)
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+#[wasm_bindgen]
+pub fn wt_release_host_reservation(eid: u32, token: u32) -> bool {
+    with_endpoint_mut(eid, |endpoint| endpoint.release_host_token(token))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
+pub fn wt_take_last_error(eid: u32) -> String {
+    match with_endpoint_mut(eid, WtEndpoint::take_last_error) {
+        Ok(Some(error)) => error.unwrap_or_default(),
+        Ok(None) => String::new(),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn wt_governor_snapshot(eid: u32) -> String {
+    match with_endpoint(eid, WtEndpoint::governor_snapshot_json) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => "{}".to_string(),
+        Err(error) => serde_json::json!({ "error": error }).to_string(),
+    }
 }
 
 #[wasm_bindgen]
 pub fn wt_send_datagram(eid: u32, conn: u32, data: &[u8]) -> bool {
-    REGISTRY.with(|r| match r.borrow_mut().get_mut(&eid) {
-        Some(ep) => ep.send_datagram(conn, data),
-        None => false,
-    })
+    with_endpoint_mut(eid, |endpoint| endpoint.send_datagram(conn, data))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
+pub fn wt_max_datagram_size(eid: u32, conn: u32) -> f64 {
+    with_endpoint_mut(eid, |endpoint| endpoint.max_datagram_size(conn))
+        .ok()
+        .flatten()
+        .flatten()
+        .map_or(-1.0, |size| size as f64)
 }
 
 #[wasm_bindgen]
 pub fn wt_open_stream(eid: u32, conn: u32, bidi: bool) -> i32 {
-    REGISTRY.with(|r| match r.borrow_mut().get_mut(&eid) {
-        Some(ep) => ep.open_stream(conn, bidi),
-        None => -1,
-    })
+    with_endpoint_mut(eid, |endpoint| endpoint.open_stream(conn, bidi))
+        .ok()
+        .flatten()
+        .unwrap_or(-1)
 }
 
 #[wasm_bindgen]
 pub fn wt_stream_write(eid: u32, stream: u32, data: &[u8]) -> f64 {
-    REGISTRY.with(|r| match r.borrow_mut().get_mut(&eid) {
-        Some(ep) => ep.stream_write(stream, data) as f64,
-        None => -1.0,
-    })
+    with_endpoint_mut(eid, |endpoint| endpoint.stream_write(stream, data) as f64)
+        .ok()
+        .flatten()
+        .unwrap_or(-1.0)
 }
 
 /// Pause reading a WT stream: data stays in quinn's recv buffer so QUIC flow
 /// control throttles the sender. Call `wt_stream_resume` to drain.
 #[wasm_bindgen]
 pub fn wt_stream_pause(eid: u32, stream: u32) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.stream_pause(stream);
-        }
-    });
+    let _ = with_endpoint_mut(eid, |endpoint| endpoint.stream_pause(stream));
 }
 
 /// Resume a paused WT stream. The caller should pump afterwards: buffered data
 /// is surfaced as events and window updates as transmits.
 #[wasm_bindgen]
 pub fn wt_stream_resume(eid: u32, stream: u32) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.stream_resume(stream);
-        }
-    });
+    let _ = with_endpoint_mut(eid, |endpoint| endpoint.stream_resume(stream));
 }
 
 #[wasm_bindgen]
 pub fn wt_stream_finish(eid: u32, stream: u32) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.stream_finish(stream);
-        }
-    });
+    let _ = with_endpoint_mut(eid, |endpoint| endpoint.stream_finish(stream));
 }
 
 #[wasm_bindgen]
 pub fn wt_stream_reset(eid: u32, stream: u32, code: u32) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.stream_reset(stream, code);
-        }
-    });
+    let _ = with_endpoint_mut(eid, |endpoint| endpoint.stream_reset(stream, code));
 }
 
 /// STOP_SENDING on a stream's recv half (cancel an incoming ReadableStream).
 #[wasm_bindgen]
 pub fn wt_stream_stop(eid: u32, stream: u32, code: u32) {
-    REGISTRY.with(|r| {
-        if let Some(ep) = r.borrow_mut().get_mut(&eid) {
-            ep.stream_stop(stream, code);
-        }
-    });
+    let _ = with_endpoint_mut(eid, |endpoint| endpoint.stream_stop(stream, code));
 }
 
 #[wasm_bindgen]
 pub fn wt_close_endpoint(eid: u32) {
-    REGISTRY.with(|r| {
-        r.borrow_mut().remove(&eid);
+    let _ = REGISTRY.try_with(|registry| {
+        if let Ok(mut registry) = registry.try_borrow_mut() {
+            registry.remove(&eid);
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        wt_close_endpoint, wt_new_endpoint_with_options, wt_recv_packet, wt_take_last_error,
+        REGISTRY,
+    };
+
+    #[test]
+    fn recv_packet_rejects_invalid_source_without_peer_fallback() {
+        let config = serde_json::json!({
+            "isServer": true,
+            "addr": "127.0.0.1:4433",
+            "peerAddr": "127.0.0.1:5544",
+            "limits": {
+                "maxSessions": 2000,
+                "maxHandshakesInFlight": 200,
+                "maxStreamsPerSessionBidi": 200,
+                "maxStreamsPerSessionUni": 200,
+                "maxStreamsGlobal": 50000,
+                "maxDatagramSize": 1200,
+                "maxQueuedBytesGlobal": 512 * 1024 * 1024,
+                "maxQueuedBytesPerSession": 2 * 1024 * 1024,
+                "maxQueuedBytesPerStream": 256 * 1024,
+                "backpressureTimeoutMs": 5000,
+                "handshakeTimeoutMs": 10000,
+                "idleTimeoutMs": 60000
+            },
+            "rateLimits": {
+                "handshakesPerSec": 20,
+                "handshakesBurst": 40,
+                "streamOpensPerSec": 200,
+                "streamOpensBurst": 400,
+                "datagramsIngressPerSec": 2000,
+                "datagramsIngressBurst": 5000
+            }
+        })
+        .to_string();
+        let created: serde_json::Value =
+            serde_json::from_str(&wt_new_endpoint_with_options(&config)).expect("endpoint json");
+        let eid = created
+            .get("eid")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("endpoint id");
+
+        wt_recv_packet(eid, b"ignored", "not-a-socket-address");
+
+        let error = wt_take_last_error(eid);
+        assert_eq!(error, "E_INTERNAL: invalid source address");
+        assert!(!error.contains("127.0.0.1"));
+        assert!(!error.contains("5544"));
+
+        REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            let endpoint = registry.get(&eid).expect("endpoint still registered");
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&endpoint.governor_snapshot_json()).expect("snapshot json");
+            assert_eq!(
+                snapshot,
+                serde_json::json!({
+                    "sessionsActive": 0,
+                    "handshakesInFlight": 0,
+                    "streamsActiveGlobal": 0,
+                    "queuedBytesGlobal": 0,
+                    "hostTokensActive": 0,
+                    "rateLimitBucketCount": 0,
+                    "rateLimitedHandshakeCount": 0,
+                    "rateLimitedStreamOpenCount": 0,
+                    "rateLimitedDatagramIngressCount": 0,
+                    "handshakeTimeoutMs": 10000,
+                    "idleTimeoutMs": 60000,
+                })
+            );
+        });
+
+        wt_close_endpoint(eid);
+    }
 }
