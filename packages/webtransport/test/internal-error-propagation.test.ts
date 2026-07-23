@@ -6,9 +6,10 @@ import {
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
 	E_STOP_SENDING,
-	WebTransportError,
 	WebTransport,
+	WebTransportError,
 } from "../src/index.js";
+import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
 
 describe("internal TS error propagation", () => {
 	it("NativeClientSession.incomingDatagrams propagates non-close errors", async () => {
@@ -21,7 +22,7 @@ describe("internal TS error propagation", () => {
 		const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
 		let err: unknown;
 		try {
-			await iter.next();
+			await nextWithTimeout(iter, 2000, "datagram error propagation read");
 		} catch (e) {
 			err = e;
 		}
@@ -37,7 +38,11 @@ describe("internal TS error propagation", () => {
 			close: () => {},
 		});
 		const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
-		const first = await iter.next();
+		const first = await nextWithTimeout(
+			iter,
+			2000,
+			"session-close datagram EOF read",
+		);
 		expect(first.done).toBe(true);
 	});
 
@@ -51,7 +56,7 @@ describe("internal TS error propagation", () => {
 		const iter = session.incomingBidirectionalStreams()[Symbol.asyncIterator]();
 		let err: unknown;
 		try {
-			await iter.next();
+			await nextWithTimeout(iter, 2000, "bidi accept error propagation read");
 		} catch (e) {
 			err = e;
 		}
@@ -69,7 +74,11 @@ describe("internal TS error propagation", () => {
 		const iter = session
 			.incomingUnidirectionalStreams()
 			[Symbol.asyncIterator]();
-		const first = await iter.next();
+		const first = await nextWithTimeout(
+			iter,
+			2000,
+			"idle-timeout uni EOF read",
+		);
 		expect(first.done).toBe(true);
 	});
 
@@ -83,7 +92,13 @@ describe("internal TS error propagation", () => {
 			() => false,
 		);
 		const reader = readable.getReader();
-		await expect(reader.read()).rejects.toMatchObject({ code: E_INTERNAL });
+		await expect(
+			readWithTimeout(
+				reader,
+				2000,
+				"server incoming bidi error propagation read",
+			),
+		).rejects.toMatchObject({ code: E_INTERNAL });
 	});
 
 	it("server incoming uni stream wrapper closes on session-closed failure", async () => {
@@ -96,7 +111,11 @@ describe("internal TS error propagation", () => {
 			() => false,
 		);
 		const reader = readable.getReader();
-		const result = await reader.read();
+		const result = await readWithTimeout(
+			reader,
+			2000,
+			"server incoming uni EOF read",
+		);
 		expect(result.done).toBe(true);
 	});
 

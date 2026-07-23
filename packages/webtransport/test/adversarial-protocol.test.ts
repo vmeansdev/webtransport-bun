@@ -20,7 +20,13 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { connect, createServer } from "../src/index.js";
-import { withHarness } from "./helpers/harness.js";
+import {
+	collectWithTimeout,
+	forEachWithTimeout,
+	nextWithTimeout,
+	readWithTimeout,
+	withHarness,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 19100;
@@ -56,17 +62,21 @@ async function legitimateEcho(port: number): Promise<void> {
 		await new Promise<void>((res, rej) => {
 			bidi.end((err: Error | null | undefined) => (err ? rej(err) : res()));
 		});
-		const chunks: Buffer[] = [];
-		for await (const c of bidi) chunks.push(c);
+		const chunks = await collectWithTimeout(
+			bidi,
+			5000,
+			"adversarial protocol legitimate echo bidi read",
+		);
 		expect(Buffer.concat(chunks)).toEqual(payload);
 
 		// Datagram echo round-trip.
 		await client.sendDatagram(new Uint8Array([9, 8, 7]));
 		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-		const got = (await Promise.race([
-			iter.next(),
-			Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
-		])) as IteratorResult<Uint8Array>;
+		const got = await nextWithTimeout(
+			iter,
+			2000,
+			"adversarial protocol legitimate echo datagram read",
+		);
 		expect(got.done).toBe(false);
 	} finally {
 		client.close();
@@ -107,29 +117,43 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 					rateLimits: { handshakesBurst: 8, handshakesPerSec: 8 },
 					onSession: async (s) => {
 						void (async () => {
-							for await (const d of s.incomingDatagrams()) {
-								await s.sendDatagram(d);
-							}
+							await forEachWithTimeout(
+								s.incomingDatagrams(),
+								5000,
+								"adversarial protocol server incoming datagram",
+								async (d) => {
+									await s.sendDatagram(d);
+								},
+							);
 						})().catch(() => {});
 						void (async () => {
-							for await (const duplex of s.incomingBidirectionalStreams) {
-								void (async () => {
-									const reader = duplex.readable.getReader();
-									const chunks: Uint8Array[] = [];
-									while (true) {
-										const { done, value } = await reader.read();
-										if (done) break;
-										chunks.push(value);
-									}
-									if (chunks.length > 0) {
-										const writer = duplex.writable.getWriter();
-										await writer.write(
-											Buffer.concat(chunks.map((c) => Buffer.from(c))),
-										);
-										await writer.close();
-									}
-								})().catch(() => {});
-							}
+							await forEachWithTimeout(
+								s.incomingBidirectionalStreams,
+								5000,
+								"adversarial protocol server incoming bidi",
+								async (duplex) => {
+									void (async () => {
+										const reader = duplex.readable.getReader();
+										const chunks: Uint8Array[] = [];
+										while (true) {
+											const { done, value } = await readWithTimeout(
+												reader,
+												5000,
+												"adversarial protocol server bidi read",
+											);
+											if (done || value === undefined) break;
+											chunks.push(value);
+										}
+										if (chunks.length > 0) {
+											const writer = duplex.writable.getWriter();
+											await writer.write(
+												Buffer.concat(chunks.map((c) => Buffer.from(c))),
+											);
+											await writer.close();
+										}
+									})().catch(() => {});
+								},
+							);
 						})().catch(() => {});
 					},
 				}),

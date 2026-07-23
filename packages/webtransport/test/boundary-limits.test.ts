@@ -4,6 +4,7 @@
  */
 import { describe, it, expect } from "bun:test";
 import { connect, createServer, E_LIMIT_EXCEEDED } from "../src/index.js";
+import { forEachWithTimeout } from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
 
 async function connectWithRetry(
@@ -129,8 +130,12 @@ describe("limit boundaries (P0.4)", () => {
 			onSession: async (s) => {
 				serverSession = s;
 				resolveServerReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits server bidi incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -173,8 +178,12 @@ describe("limit boundaries (P0.4)", () => {
 			onSession: async (s) => {
 				serverSession = s;
 				resolveServerReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits server uni incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -213,8 +222,12 @@ describe("limit boundaries (P0.4)", () => {
 				backpressureTimeoutMs: 1500,
 			},
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits waitUntilAvailable incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -251,8 +264,12 @@ describe("limit boundaries (P0.4)", () => {
 			tls: { certPem: "", keyPem: "" },
 			limits: { maxDatagramSize: 8 },
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits serverA incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -268,8 +285,12 @@ describe("limit boundaries (P0.4)", () => {
 			onSession: async (s) => {
 				serverBSession = s;
 				resolveServerBReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits serverB incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -300,8 +321,12 @@ describe("limit boundaries (P0.4)", () => {
 			port: portA,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits server close A incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -316,8 +341,12 @@ describe("limit boundaries (P0.4)", () => {
 			onSession: async (s) => {
 				serverBSession = s;
 				resolveServerBReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"boundary limits server close B incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 

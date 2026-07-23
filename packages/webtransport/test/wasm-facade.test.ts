@@ -1,6 +1,6 @@
+import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "bun:test";
 import {
 	connectWasm,
 	createWasmServer,
@@ -30,20 +30,30 @@ describe("wasm backend facade (P3)", () => {
 		"facade: session + datagram + bidi echo end-to-end",
 		async () => {
 			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4433 };
+			const clientAddr = { address: "127.0.0.1", port: 5544 };
 
-			const server = createWasmServer(wasm, relay.a, (session) => {
-				session.onDatagram((d) => session.sendDatagram(d)); // echo datagrams
-				session.onIncomingStream((stream: WasmStream) => {
-					stream.onData((data, _fin) => {
-						if (data.length > 0) stream.write(data); // echo stream data
+			const server = createWasmServer(
+				wasm,
+				relay.endpoint(serverAddr),
+				(session) => {
+					session.onDatagram((d) => session.sendDatagram(d)); // echo datagrams
+					session.onIncomingStream((stream: WasmStream) => {
+						stream.onData((data, _fin) => {
+							if (data.length > 0) stream.write(data); // echo stream data
+						});
 					});
-				});
-			});
+				},
+				"127.0.0.1:4433",
+				"127.0.0.1:5544",
+			);
 
 			const { session: client, manager: clientMgr } = await connectWasm(
 				wasm,
-				relay.b,
+				relay.endpoint(clientAddr),
 				"localhost",
+				"127.0.0.1:5544",
+				"127.0.0.1:4433",
 			);
 
 			// Datagram round-trip via the facade.

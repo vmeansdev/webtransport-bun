@@ -6,6 +6,7 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { WebTransport, createServer } from "../src/index.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
+import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
 
 describe("parity robustness (Phase 6)", () => {
 	let server: ReturnType<typeof createServer>;
@@ -18,28 +19,42 @@ describe("parity robustness (Phase 6)", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"parity robustness server incoming datagram",
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					);
 				})().catch(() => {});
-				for await (const duplex of s.incomingBidirectionalStreams) {
-					void (async () => {
-						const reader = duplex.readable.getReader();
-						const chunks: Uint8Array[] = [];
-						while (true) {
-							const { done, value } = await reader.read();
-							if (done) break;
-							chunks.push(value);
-						}
-						if (chunks.length > 0) {
-							const writer = duplex.writable.getWriter();
-							await writer.write(
-								Buffer.concat(chunks.map((c) => Buffer.from(c))),
-							);
-							await writer.close();
-						}
-					})().catch(() => {});
-				}
+				await forEachWithTimeout(
+					s.incomingBidirectionalStreams,
+					5000,
+					"parity robustness server incoming bidi",
+					async (duplex) => {
+						void (async () => {
+							const reader = duplex.readable.getReader();
+							const chunks: Uint8Array[] = [];
+							while (true) {
+								const { done, value } = await readWithTimeout(
+									reader,
+									5000,
+									"parity robustness server bidi read",
+								);
+								if (done || value === undefined) break;
+								chunks.push(value);
+							}
+							if (chunks.length > 0) {
+								const writer = duplex.writable.getWriter();
+								await writer.write(
+									Buffer.concat(chunks.map((c) => Buffer.from(c))),
+								);
+								await writer.close();
+							}
+						})().catch(() => {});
+					},
+				);
 			},
 		});
 		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
@@ -61,7 +76,11 @@ describe("parity robustness (Phase 6)", () => {
 		await w.write(new Uint8Array([1, 2, 3]));
 		w.releaseLock();
 		const dr = wt.datagrams.readable.getReader();
-		const { value: dgramVal } = await dr.read();
+		const { value: dgramVal } = await readWithTimeout(
+			dr,
+			5000,
+			"parity robustness datagram echo read",
+		);
 		dr.releaseLock();
 		expect(dgramVal).toBeDefined();
 		expect(new Uint8Array(dgramVal!).toString()).toBe("1,2,3");
@@ -73,7 +92,11 @@ describe("parity robustness (Phase 6)", () => {
 		const br = readable.getReader();
 		const chunks: Uint8Array[] = [];
 		while (true) {
-			const { done, value } = await br.read();
+			const { done, value } = await readWithTimeout(
+				br,
+				5000,
+				"parity robustness bidi echo read",
+			);
 			if (done) break;
 			if (value) chunks.push(value);
 		}
@@ -101,7 +124,11 @@ describe("parity robustness (Phase 6)", () => {
 		const reader = wt.datagrams.readable.getReader();
 		const seen = new Set<number>();
 		for (let i = 0; i < 2; i++) {
-			const { value } = await reader.read();
+			const { value } = await readWithTimeout(
+				reader,
+				5000,
+				"parity robustness multi-writer datagram read",
+			);
 			const first = value?.[0];
 			if (first !== undefined) seen.add(first);
 		}

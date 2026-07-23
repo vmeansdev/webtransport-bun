@@ -2,8 +2,9 @@
  * Parity tests: Option surface and capability flags (Phase 5).
  */
 
-import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { WebTransport, createServer } from "../src/index.js";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createServer, WebTransport } from "../src/index.js";
+import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe("parity options (Phase 5)", () => {
@@ -16,9 +17,14 @@ describe("parity options (Phase 5)", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const d of s.incomingDatagrams()) {
-					await s.sendDatagram(d);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"parity options incoming datagram",
+					async (d) => {
+						await s.sendDatagram(d);
+					},
+				);
 			},
 		});
 		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
@@ -76,17 +82,20 @@ describe("parity options (Phase 5)", () => {
 		]);
 		writer.releaseLock();
 		const buf = new Uint8Array(128);
-		const { value, done } = await Promise.race([
-			reader.read(buf),
-			Bun.sleep(4000).then(() => {
-				throw new Error("timeout: datagram BYOB read");
-			}),
-		]);
+		const { value, done } = await readWithTimeout(
+			reader,
+			4000,
+			"parity options BYOB datagram read",
+			buf,
+		);
 		reader.releaseLock();
 		expect(done).toBe(false);
 		expect(value).toBeDefined();
+		if (!value) {
+			throw new Error("parity options BYOB read returned no value");
+		}
 		expect(
-			new Uint8Array(value!.buffer, value!.byteOffset, value!.byteLength),
+			new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
 		).toEqual(new Uint8Array([1, 2, 3]));
 		wt.close();
 	}, 15000);
@@ -101,7 +110,9 @@ describe("parity options (Phase 5)", () => {
 		writer.releaseLock();
 		const reader = wt.datagrams.readable.getReader({ mode: "byob" });
 		const tinyBuf = new Uint8Array(2);
-		await expect(reader.read(tinyBuf)).rejects.toThrow(RangeError);
+		await expect(
+			readWithTimeout(reader, 4000, "parity options tiny BYOB read", tinyBuf),
+		).rejects.toThrow(RangeError);
 		reader.releaseLock();
 		wt.close();
 	});
@@ -135,8 +146,12 @@ describe("parity options (Phase 5)", () => {
 				backpressureTimeoutMs: 1500,
 			},
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"parity options waitUntilAvailable incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 		const wt = await openWTWithRetry(`https://127.0.0.1:${limitedPort}`, {

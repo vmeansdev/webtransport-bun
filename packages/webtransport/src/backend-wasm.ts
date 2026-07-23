@@ -30,13 +30,18 @@ function parseDest(dest: string): UdpAddr {
 // Typed structurally so the package does not hard-depend on generated artifacts.
 export interface WasmModule {
 	wt_new_endpoint(isServer: boolean, addr: string, peerAddr: string): number;
+	wt_new_endpoint_with_options(configJson: string): string;
 	wt_connect(eid: number, authority: string): number;
 	wt_recv_packet(eid: number, data: Uint8Array, source: string): void;
 	wt_poll_transmits(eid: number): Uint8Array;
 	wt_next_timeout_ms(eid: number): number;
 	wt_handle_timeout(eid: number): void;
 	wt_poll_event(eid: number): Uint8Array | undefined;
+	wt_release_host_reservation(eid: number, token: number): boolean;
+	wt_take_last_error(eid: number): string;
+	wt_governor_snapshot(eid: number): string;
 	wt_send_datagram(eid: number, conn: number, data: Uint8Array): boolean;
+	wt_max_datagram_size(eid: number, conn: number): number;
 	wt_open_stream(eid: number, conn: number, bidi: boolean): number;
 	wt_stream_write(eid: number, stream: number, data: Uint8Array): number;
 	wt_stream_pause(eid: number, stream: number): void;
@@ -49,6 +54,7 @@ export interface WasmModule {
 		peerAddr: string,
 		certHashesBase64: string,
 	): string;
+	wt_new_client_with_options(configJson: string): string;
 	wt_close_conn(eid: number, conn: number, code: number, reason: string): void;
 	wt_close_all(eid: number, code: number, reason: string): void;
 	wt_close_endpoint(eid: number): void;
@@ -64,6 +70,7 @@ export interface WasmModule {
 		validityDays: number,
 		notBeforeUnix: number,
 	): string;
+	wt_new_server_with_options(configJson: string): string;
 }
 
 const EVENT = {
@@ -77,18 +84,211 @@ const EVENT = {
 	STREAM_STOPPED: 8,
 } as const;
 
-function decodeVarint(buf: Uint8Array, off: number): [number, number] {
+function decodeVarintSafe(
+	buf: Uint8Array,
+	off: number,
+): [number, number] | null {
+	if (off >= buf.length) return null;
 	const first = buf[off] ?? 0;
 	const len = 1 << (first >> 6);
+	if (off + len > buf.length) return null;
 	let v = first & 0x3f;
 	for (let i = 1; i < len; i++) v = v * 256 + (buf[off + i] ?? 0);
 	return [v, off + len];
 }
 
+export type DecodedWasmEvent =
+	| { type: "connected"; conn: number }
+	| { type: "session-established"; conn: number }
+	| {
+			type: "datagram";
+			conn: number;
+			payload: Uint8Array;
+			hostToken?: number;
+	  }
+	| { type: "closed"; conn: number; code: number }
+	| { type: "stream-opened"; conn: number; stream: number; bidi: boolean }
+	| {
+			type: "stream-data";
+			conn: number;
+			stream: number;
+			payload: Uint8Array;
+			fin: boolean;
+			hostToken?: number;
+	  }
+	| { type: "stream-reset"; conn: number; stream: number; code: number }
+	| { type: "stream-stopped"; conn: number; stream: number; code: number }
+	| { type: "unknown"; tag: number };
+
+export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
+	const tag = ev[0];
+	if (tag == null) return null;
+	let off = 1;
+	const connResult = decodeVarintSafe(ev, off);
+	if (!connResult) return null;
+	const [conn, nextOff] = connResult;
+	off = nextOff;
+	switch (tag) {
+		case EVENT.CONNECTED:
+			return { type: "connected", conn };
+		case EVENT.SESSION_ESTABLISHED:
+			return { type: "session-established", conn };
+		case EVENT.DATAGRAM: {
+			const lenResult = decodeVarintSafe(ev, off);
+			if (!lenResult) return null;
+			let len: number;
+			[len, off] = lenResult;
+			if (off + len > ev.length) return null;
+			const payload = ev.subarray(off, off + len);
+			off += len;
+			const hostTokenResult =
+				off < ev.length ? decodeVarintSafe(ev, off) : null;
+			if (off < ev.length && !hostTokenResult) return null;
+			const hostToken = hostTokenResult?.[0];
+			return {
+				type: "datagram",
+				conn,
+				payload,
+				hostToken: hostToken && hostToken > 0 ? hostToken : undefined,
+			};
+		}
+		case EVENT.CLOSED: {
+			const codeResult = decodeVarintSafe(ev, off);
+			if (!codeResult) return null;
+			return { type: "closed", conn, code: codeResult[0] };
+		}
+		case EVENT.STREAM_OPENED: {
+			const streamResult = decodeVarintSafe(ev, off);
+			if (!streamResult) return null;
+			let stream: number;
+			[stream, off] = streamResult;
+			if (off >= ev.length) return null;
+			return {
+				type: "stream-opened",
+				conn,
+				stream,
+				bidi: (ev[off] ?? 0) === 1,
+			};
+		}
+		case EVENT.STREAM_DATA: {
+			const streamResult = decodeVarintSafe(ev, off);
+			if (!streamResult) return null;
+			let stream: number;
+			[stream, off] = streamResult;
+			if (off >= ev.length) return null;
+			const fin = (ev[off] ?? 0) === 1;
+			off += 1;
+			const lenResult = decodeVarintSafe(ev, off);
+			if (!lenResult) return null;
+			let len: number;
+			[len, off] = lenResult;
+			if (off + len > ev.length) return null;
+			const payload = ev.subarray(off, off + len);
+			off += len;
+			const hostTokenResult =
+				off < ev.length ? decodeVarintSafe(ev, off) : null;
+			if (off < ev.length && !hostTokenResult) return null;
+			const hostToken = hostTokenResult?.[0];
+			return {
+				type: "stream-data",
+				conn,
+				stream,
+				payload,
+				fin,
+				hostToken: hostToken && hostToken > 0 ? hostToken : undefined,
+			};
+		}
+		case EVENT.STREAM_RESET: {
+			const streamResult = decodeVarintSafe(ev, off);
+			if (!streamResult) return null;
+			let stream: number;
+			[stream, off] = streamResult;
+			const codeResult = decodeVarintSafe(ev, off);
+			if (!codeResult) return null;
+			return { type: "stream-reset", conn, stream, code: codeResult[0] };
+		}
+		case EVENT.STREAM_STOPPED: {
+			const streamResult = decodeVarintSafe(ev, off);
+			if (!streamResult) return null;
+			let stream: number;
+			[stream, off] = streamResult;
+			const codeResult = decodeVarintSafe(ev, off);
+			if (!codeResult) return null;
+			return { type: "stream-stopped", conn, stream, code: codeResult[0] };
+		}
+		default:
+			return { type: "unknown", tag };
+	}
+}
+
+export function dispatchDecodedWasmEvent(
+	decoded: DecodedWasmEvent | null,
+	events: WasmSessionEvents,
+	releaseHostReservation: (token: number) => boolean = () => false,
+): void {
+	if (!decoded) return;
+	switch (decoded.type) {
+		case "connected":
+			events.onConnected?.(decoded.conn);
+			return;
+		case "session-established":
+			events.onEstablished?.(decoded.conn);
+			return;
+		case "datagram": {
+			const callback = events.onDatagram;
+			if (callback) {
+				try {
+					callback(decoded.conn, decoded.payload, decoded.hostToken);
+				} catch (error) {
+					if (decoded.hostToken) releaseHostReservation(decoded.hostToken);
+					throw error;
+				}
+			} else if (decoded.hostToken) {
+				releaseHostReservation(decoded.hostToken);
+			}
+			return;
+		}
+		case "closed":
+			events.onClosed?.(decoded.conn, decoded.code);
+			return;
+		case "stream-opened":
+			events.onStreamOpened?.(decoded.conn, decoded.stream, decoded.bidi);
+			return;
+		case "stream-data": {
+			const callback = events.onStreamData;
+			if (callback) {
+				try {
+					callback(
+						decoded.conn,
+						decoded.stream,
+						decoded.payload,
+						decoded.fin,
+						decoded.hostToken,
+					);
+				} catch (error) {
+					if (decoded.hostToken) releaseHostReservation(decoded.hostToken);
+					throw error;
+				}
+			} else if (decoded.hostToken) {
+				releaseHostReservation(decoded.hostToken);
+			}
+			return;
+		}
+		case "stream-reset":
+			events.onStreamReset?.(decoded.conn, decoded.stream, decoded.code);
+			return;
+		case "stream-stopped":
+			events.onStreamStopped?.(decoded.conn, decoded.stream, decoded.code);
+			return;
+		case "unknown":
+			return;
+	}
+}
+
 export interface WasmSessionEvents {
 	onConnected?: (conn: number) => void;
 	onEstablished?: (conn: number) => void;
-	onDatagram?: (conn: number, data: Uint8Array) => void;
+	onDatagram?: (conn: number, data: Uint8Array, hostToken?: number) => void;
 	onClosed?: (conn: number, code: number) => void;
 	onStreamOpened?: (conn: number, stream: number, bidi: boolean) => void;
 	onStreamData?: (
@@ -96,22 +296,59 @@ export interface WasmSessionEvents {
 		stream: number,
 		data: Uint8Array,
 		fin: boolean,
+		hostToken?: number,
 	) => void;
 	onStreamReset?: (conn: number, stream: number, code: number) => void;
 	/** Peer STOP_SENDING on our send half; the recv half is unaffected. */
 	onStreamStopped?: (conn: number, stream: number, code: number) => void;
 }
 
+export interface WasmEndpointConstructorOptions {
+	limits: {
+		maxSessions: number;
+		maxHandshakesInFlight: number;
+		maxStreamsPerSessionBidi: number;
+		maxStreamsPerSessionUni: number;
+		maxStreamsGlobal: number;
+		maxDatagramSize: number;
+		maxQueuedBytesGlobal: number;
+		maxQueuedBytesPerSession: number;
+		maxQueuedBytesPerStream: number;
+		backpressureTimeoutMs: number;
+		handshakeTimeoutMs: number;
+		idleTimeoutMs: number;
+	};
+	rateLimits: {
+		handshakesPerSec: number;
+		handshakesBurst: number;
+		streamOpensPerSec: number;
+		streamOpensBurst: number;
+		datagramsIngressPerSec: number;
+		datagramsIngressBurst: number;
+	};
+}
+
+function isConstructorOptions(
+	value: WasmEndpointConstructorOptions | WasmSessionEvents,
+): value is WasmEndpointConstructorOptions {
+	return "limits" in value && "rateLimits" in value;
+}
+
 export class WasmEndpoint {
 	private timer: ReturnType<typeof setTimeout> | null = null;
 	private closed = false;
+	private closing = false;
+	private datagramSendError = "";
+	private streamWriteError = "";
+	private pumping = false;
+	private pumpAgain = false;
 	/** Reports an exception thrown by a user event callback during dispatch. */
 	onError: ((err: unknown) => void) | null = null;
 	/** Resolved on the next pump() — lets backpressured writers wake on real
 	 * progress (inbound acks / timers) instead of a fixed busy-poll. */
 	private drainWaiters: Array<{
 		fire: () => void;
-		timer: ReturnType<typeof setTimeout>;
+		timer?: ReturnType<typeof setTimeout>;
 	}> = [];
 
 	private constructor(
@@ -127,7 +364,7 @@ export class WasmEndpoint {
 			// eid. `closed` is set before the free, so this guard is race-safe.
 			if (this.closed) return;
 			// IPv6 sources must be bracketed or the Rust-side SocketAddr parse
-			// fails and every IPv6 client collapses onto the fallback peer_addr.
+			// fails closed as malformed source metadata.
 			this.wasm.wt_recv_packet(this.eid, data, formatAddr(source));
 			this.pump();
 		});
@@ -145,17 +382,49 @@ export class WasmEndpoint {
 		isServer: boolean,
 		addr: string,
 		peerAddr: string,
+		optionsOrEvents: WasmEndpointConstructorOptions | WasmSessionEvents = {},
 		events: WasmSessionEvents = {},
 	): WasmEndpoint {
-		const eid = wasm.wt_new_endpoint(isServer, addr, peerAddr);
-		if (eid === 0) {
-			// 0 is the bad-address sentinel (valid eids start at 1). Surface it
-			// here so the real cause isn't misattributed to a later connect error.
+		const options = isConstructorOptions(optionsOrEvents)
+			? optionsOrEvents
+			: {
+					limits: {
+						maxSessions: 2000,
+						maxHandshakesInFlight: 200,
+						maxStreamsPerSessionBidi: 200,
+						maxStreamsPerSessionUni: 200,
+						maxStreamsGlobal: 50_000,
+						maxDatagramSize: 1200,
+						maxQueuedBytesGlobal: 512 * 1024 * 1024,
+						maxQueuedBytesPerSession: 2 * 1024 * 1024,
+						maxQueuedBytesPerStream: 256 * 1024,
+						backpressureTimeoutMs: 5_000,
+						handshakeTimeoutMs: 10_000,
+						idleTimeoutMs: 60_000,
+					},
+					rateLimits: {
+						handshakesPerSec: 20,
+						handshakesBurst: 40,
+						streamOpensPerSec: 200,
+						streamOpensBurst: 400,
+						datagramsIngressPerSec: 2000,
+						datagramsIngressBurst: 5000,
+					},
+				};
+		const sessionEvents = isConstructorOptions(optionsOrEvents)
+			? events
+			: optionsOrEvents;
+		const parsed = JSON.parse(
+			wasm.wt_new_endpoint_with_options(
+				JSON.stringify({ isServer, addr, peerAddr, ...options }),
+			),
+		) as { eid?: number; error?: string };
+		if (parsed.error || parsed.eid == null) {
 			throw new Error(
-				`wt_new_endpoint failed: invalid address ${JSON.stringify(addr)} or peerAddr ${JSON.stringify(peerAddr)}`,
+				`wt_new_endpoint failed: ${parsed.error ?? "unknown error"}`,
 			);
 		}
-		return new WasmEndpoint(wasm, udp, eid, events);
+		return new WasmEndpoint(wasm, udp, parsed.eid, sessionEvents);
 	}
 
 	/**
@@ -169,15 +438,52 @@ export class WasmEndpoint {
 		addr: string,
 		peerAddr: string,
 		certHashesBase64: string,
+		optionsOrEvents: WasmEndpointConstructorOptions | WasmSessionEvents = {},
 		events: WasmSessionEvents = {},
 	): WasmEndpoint {
+		const options = isConstructorOptions(optionsOrEvents)
+			? optionsOrEvents
+			: {
+					limits: {
+						maxSessions: 2000,
+						maxHandshakesInFlight: 200,
+						maxStreamsPerSessionBidi: 200,
+						maxStreamsPerSessionUni: 200,
+						maxStreamsGlobal: 50_000,
+						maxDatagramSize: 1200,
+						maxQueuedBytesGlobal: 512 * 1024 * 1024,
+						maxQueuedBytesPerSession: 2 * 1024 * 1024,
+						maxQueuedBytesPerStream: 256 * 1024,
+						backpressureTimeoutMs: 5_000,
+						handshakeTimeoutMs: 10_000,
+						idleTimeoutMs: 60_000,
+					},
+					rateLimits: {
+						handshakesPerSec: 20,
+						handshakesBurst: 40,
+						streamOpensPerSec: 200,
+						streamOpensBurst: 400,
+						datagramsIngressPerSec: 2000,
+						datagramsIngressBurst: 5000,
+					},
+				};
+		const sessionEvents = isConstructorOptions(optionsOrEvents)
+			? events
+			: optionsOrEvents;
 		const parsed = JSON.parse(
-			wasm.wt_new_client(addr, peerAddr, certHashesBase64),
+			wasm.wt_new_client_with_options(
+				JSON.stringify({
+					addr,
+					peerAddr,
+					certHashesBase64,
+					...options,
+				}),
+			),
 		) as { eid?: number; error?: string };
 		if (parsed.error || parsed.eid == null) {
 			throw new Error(`wt_new_client failed: ${parsed.error ?? "unknown"}`);
 		}
-		return new WasmEndpoint(wasm, udp, parsed.eid, events);
+		return new WasmEndpoint(wasm, udp, parsed.eid, sessionEvents);
 	}
 
 	/** Wrap an endpoint already created wasm-side (e.g. via wt_new_server). */
@@ -204,10 +510,28 @@ export class WasmEndpoint {
 	}
 
 	sendDatagram(conn: number, data: Uint8Array): boolean {
-		if (this.closed) return false;
+		this.datagramSendError = "";
+		if (this.closed) {
+			this.datagramSendError = "E_SESSION_CLOSED: endpoint is closed";
+			return false;
+		}
 		const ok = this.wasm.wt_send_datagram(this.eid, conn, data);
+		// Capture the operation-scoped diagnostic before pump() dispatches any
+		// unrelated close callback that might consume the endpoint's last error.
+		if (!ok) this.datagramSendError = this.wasm.wt_take_last_error(this.eid);
 		this.pump();
 		return ok;
+	}
+
+	maxDatagramSize(conn: number): number {
+		if (this.closed) return -1;
+		return this.wasm.wt_max_datagram_size(this.eid, conn);
+	}
+
+	takeDatagramSendError(): string {
+		const error = this.datagramSendError;
+		this.datagramSendError = "";
+		return error;
 	}
 
 	/** Open a WebTransport stream; returns its handle or -1. */
@@ -221,10 +545,21 @@ export class WasmEndpoint {
 	streamWrite(stream: number, data: Uint8Array): number {
 		// -1 (not 0) so a parked writeAll loop throws "stream write failed"
 		// and terminates instead of busy-looping on zero progress.
-		if (this.closed) return -1;
+		this.streamWriteError = "";
+		if (this.closed) {
+			this.streamWriteError = "E_SESSION_CLOSED: endpoint is closed";
+			return -1;
+		}
 		const n = this.wasm.wt_stream_write(this.eid, stream, data);
+		if (n < 0) this.streamWriteError = this.wasm.wt_take_last_error(this.eid);
 		this.pump();
 		return n;
+	}
+
+	takeStreamWriteError(): string {
+		const error = this.streamWriteError;
+		this.streamWriteError = "";
+		return error;
 	}
 
 	/** Pause reading a stream — QUIC flow control throttles the sender. */
@@ -259,6 +594,23 @@ export class WasmEndpoint {
 		this.pump();
 	}
 
+	releaseHostReservation(token: number): boolean {
+		if (this.closed || token <= 0) return false;
+		const released = this.wasm.wt_release_host_reservation(this.eid, token);
+		if (released) this.pump();
+		return released;
+	}
+
+	takeLastError(): string {
+		if (this.closed) return "";
+		return this.wasm.wt_take_last_error(this.eid);
+	}
+
+	governorSnapshot(): string {
+		if (this.closed) return "{}";
+		return this.wasm.wt_governor_snapshot(this.eid);
+	}
+
 	/**
 	 * Resolve on the next pump (real progress) or after `maxMs` as a safety net.
 	 * Used by backpressured writers instead of a fixed-interval poll.
@@ -267,14 +619,17 @@ export class WasmEndpoint {
 		if (this.closed) return Promise.resolve();
 		return new Promise((resolve) => {
 			let done = false;
-			const waiter = {
+			const waiter: {
+				fire: () => void;
+				timer?: ReturnType<typeof setTimeout>;
+			} = {
 				fire: () => {
 					if (!done) {
 						done = true;
 						resolve();
 					}
 				},
-				timer: null as any,
+				timer: undefined,
 			};
 			waiter.timer = setTimeout(() => waiter.fire(), maxMs);
 			this.drainWaiters.push(waiter);
@@ -283,6 +638,23 @@ export class WasmEndpoint {
 
 	/** Drain transmits to the wire, dispatch events, reschedule the timer. */
 	pump(): void {
+		if (this.closed) return;
+		if (this.pumping) {
+			this.pumpAgain = true;
+			return;
+		}
+		this.pumping = true;
+		try {
+			do {
+				this.pumpAgain = false;
+				this.pumpOnce();
+			} while (this.pumpAgain && !this.closed);
+		} finally {
+			this.pumping = false;
+		}
+	}
+
+	private pumpOnce(): void {
 		if (this.closed) return;
 		const out = this.wasm.wt_poll_transmits(this.eid);
 		let off = 0;
@@ -321,7 +693,7 @@ export class WasmEndpoint {
 			const waiters = this.drainWaiters;
 			this.drainWaiters = [];
 			for (const w of waiters) {
-				clearTimeout(w.timer);
+				if (w.timer !== undefined) clearTimeout(w.timer);
 				w.fire();
 			}
 		}
@@ -329,54 +701,9 @@ export class WasmEndpoint {
 	}
 
 	private dispatch(ev: Uint8Array): void {
-		const tag = ev[0];
-		let off = 1;
-		let conn: number;
-		[conn, off] = decodeVarint(ev, off);
-		if (tag === EVENT.CONNECTED) {
-			this.events.onConnected?.(conn);
-		} else if (tag === EVENT.SESSION_ESTABLISHED) {
-			this.events.onEstablished?.(conn);
-		} else if (tag === EVENT.DATAGRAM) {
-			let len: number;
-			[len, off] = decodeVarint(ev, off);
-			this.events.onDatagram?.(conn, ev.subarray(off, off + len));
-		} else if (tag === EVENT.CLOSED) {
-			const [code] = decodeVarint(ev, off);
-			this.events.onClosed?.(conn, code);
-		} else if (tag === EVENT.STREAM_OPENED) {
-			// conn already decoded; next: stream varint, then bidi byte.
-			let stream: number;
-			[stream, off] = decodeVarint(ev, off);
-			const bidi = (ev[off] ?? 0) === 1;
-			this.events.onStreamOpened?.(conn, stream, bidi);
-		} else if (tag === EVENT.STREAM_DATA) {
-			// conn already decoded; next: stream varint, fin byte, len + data.
-			let stream: number;
-			[stream, off] = decodeVarint(ev, off);
-			const fin = (ev[off] ?? 0) === 1;
-			off += 1;
-			let len: number;
-			[len, off] = decodeVarint(ev, off);
-			this.events.onStreamData?.(
-				conn,
-				stream,
-				ev.subarray(off, off + len),
-				fin,
-			);
-		} else if (tag === EVENT.STREAM_RESET) {
-			// conn already decoded; next: stream varint, then code varint.
-			let stream: number;
-			[stream, off] = decodeVarint(ev, off);
-			const [code] = decodeVarint(ev, off);
-			this.events.onStreamReset?.(conn, stream, code);
-		} else if (tag === EVENT.STREAM_STOPPED) {
-			// conn already decoded; next: stream varint, then code varint.
-			let stream: number;
-			[stream, off] = decodeVarint(ev, off);
-			const [code] = decodeVarint(ev, off);
-			this.events.onStreamStopped?.(conn, stream, code);
-		}
+		dispatchDecodedWasmEvent(decodeWasmEvent(ev), this.events, (token) =>
+			this.releaseHostReservation(token),
+		);
 	}
 
 	private reschedule(): void {
@@ -410,21 +737,34 @@ export class WasmEndpoint {
 		this.pump();
 	}
 
-	close(): void {
-		if (this.closed) return;
+	/** Begin deterministic teardown while reservation-release calls remain valid. */
+	beginClose(): void {
+		if (this.closed || this.closing) return;
+		this.closing = true;
 		// Gracefully CONNECTION_CLOSE every live connection and flush those
 		// frames to the wire before dropping the wasm-side state.
 		this.wasm.wt_close_all(this.eid, 0, "endpoint closed");
 		this.pump();
+	}
+
+	/** Finish teardown after the manager has released every retained payload. */
+	finishClose(): void {
+		if (this.closed) return;
+		if (!this.closing) this.beginClose();
 		this.closed = true;
 		if (this.timer) clearTimeout(this.timer);
 		// Release any parked writers so their promises settle (writes will fail).
 		const waiters = this.drainWaiters;
 		this.drainWaiters = [];
 		for (const w of waiters) {
-			clearTimeout(w.timer);
+			if (w.timer !== undefined) clearTimeout(w.timer);
 			w.fire();
 		}
 		this.wasm.wt_close_endpoint(this.eid);
+	}
+
+	close(): void {
+		this.beginClose();
+		this.finishClose();
 	}
 }

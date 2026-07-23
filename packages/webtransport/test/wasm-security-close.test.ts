@@ -1,9 +1,9 @@
 // Regression tests for the deep-review fixes: cert pinning, ready rejection,
 // per-session close semantics, close-code propagation, and IPv6 addressing.
 
+import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "bun:test";
 import { connectWasm, serveOverUdp, type WasmSession } from "../src/backend.js";
 import { formatAddr, type WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
@@ -106,10 +106,12 @@ describe("connection lifecycle", () => {
 			const udp = await BunUdpTransport.connect("127.0.0.1", 47859);
 			const t0 = Date.now();
 			await expect(
-				connectWasm(wasm, udp, "localhost", "127.0.0.1:0", "127.0.0.1:47859"),
-			).rejects.toThrow(/closed before session established/);
-			// Bounded by the 10s idle timeout, not hanging forever.
-			expect(Date.now() - t0).toBeLessThan(20_000);
+				connectWasm(wasm, udp, "localhost", "127.0.0.1:0", "127.0.0.1:47859", {
+					limits: { handshakeTimeoutMs: 50, idleTimeoutMs: 100 },
+				}),
+			).rejects.toThrow(/E_HANDSHAKE_TIMEOUT/);
+			// The configured handshake deadline bounds an unreachable peer.
+			expect(Date.now() - t0).toBeLessThan(1_000);
 			udp.close();
 		},
 		30_000,

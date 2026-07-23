@@ -876,6 +876,7 @@ import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
+const NATIVE_ADDON_OVERRIDE_ENV = "WEBTRANSPORT_NATIVE_ADDON_PATH";
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-msvc.node`,
@@ -890,8 +891,22 @@ function tryLoadNativeAddon(
 	requireFn: RequireLike,
 	bases = basePaths,
 	candidates = binaryCandidates,
+	explicitRequests: string[] = [],
 ): { addon: any; failures: NativeLoadFailure[] } {
 	const failures: NativeLoadFailure[] = [];
+	for (const request of explicitRequests) {
+		try {
+			return { addon: requireFn(request), failures };
+		} catch (err) {
+			failures.push({
+				request,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (explicitRequests.length > 0) {
+		return { addon: undefined, failures };
+	}
 	for (const base of bases) {
 		for (const candidate of candidates) {
 			const request = `${base}/${candidate}`;
@@ -908,6 +923,13 @@ function tryLoadNativeAddon(
 	return { addon: undefined, failures };
 }
 
+function nativeAddonOverrideRequestsFromEnv(
+	envValue = process.env[NATIVE_ADDON_OVERRIDE_ENV],
+): string[] {
+	const trimmed = envValue?.trim();
+	return trimmed ? [trimmed] : [];
+}
+
 function buildNativeAddonLoadErrorMessage(
 	failures: NativeLoadFailure[],
 	maxEntries = 6,
@@ -922,7 +944,12 @@ function buildNativeAddonLoadErrorMessage(
 	return `Native addon not loaded. Candidate load errors:\n${details}${suffix}`;
 }
 
-const nativeLoad = tryLoadNativeAddon(_require);
+const nativeLoad = tryLoadNativeAddon(
+	_require,
+	basePaths,
+	binaryCandidates,
+	nativeAddonOverrideRequestsFromEnv(),
+);
 const native = nativeLoad.addon;
 const nativeLoadFailures = nativeLoad.failures;
 
@@ -2883,6 +2910,8 @@ export const __TESTING__ = {
 	createServerIncomingUniStreamsForTests: createServerIncomingUniStreams,
 	tryLoadNativeAddonForTests: tryLoadNativeAddon,
 	buildNativeAddonLoadErrorMessageForTests: buildNativeAddonLoadErrorMessage,
+	nativeAddonOverrideRequestsFromEnvForTests:
+		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
 };
 

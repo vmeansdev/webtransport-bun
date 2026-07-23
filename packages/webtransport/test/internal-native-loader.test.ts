@@ -29,4 +29,41 @@ describe("internal native addon loader", () => {
 		expect(msg).toContain("/x/two.node");
 		expect(msg).toContain("wrong architecture");
 	});
+
+	it("parses an explicit addon override path from env", () => {
+		expect(
+			__TESTING__.nativeAddonOverrideRequestsFromEnvForTests(
+				" /tmp/webtransport-seam.node ",
+			),
+		).toEqual(["/tmp/webtransport-seam.node"]);
+		expect(
+			__TESTING__.nativeAddonOverrideRequestsFromEnvForTests("   "),
+		).toEqual([]);
+	});
+
+	it("does not fall back when an explicit addon override fails", () => {
+		const attempts: string[] = [];
+		const fallbackAddon = { source: "default-candidate" };
+		const result = __TESTING__.tryLoadNativeAddonForTests(
+			(request: string) => {
+				attempts.push(request);
+				if (request === "/tmp/missing-override.node") {
+					throw new Error("explicit override missing");
+				}
+				return fallbackAddon;
+			},
+			["/base"],
+			["fallback.node"],
+			["/tmp/missing-override.node"],
+		);
+
+		expect(result.addon).toBeUndefined();
+		expect(attempts).toEqual(["/tmp/missing-override.node"]);
+		expect(result.failures).toEqual([
+			{
+				request: "/tmp/missing-override.node",
+				message: "explicit override missing",
+			},
+		]);
+	});
 });

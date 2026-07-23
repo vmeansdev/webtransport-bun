@@ -5,6 +5,7 @@ import { connectWasm } from "../src/backend.js";
 import type { WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
 import { generateCert, type WasmCertModule } from "../src/wasm-cert.js";
+import { forEachWithTimeout } from "./helpers/harness.js";
 
 // Cross-stack interop: our wasm WebTransport CLIENT against the native Rust
 // (wtransport) SERVER over real localhost UDP. Exercises whether our hand-rolled
@@ -50,9 +51,14 @@ describe("wasm client <-> native server interop (P5)", () => {
 				port: PORT,
 				tls: { certPem: cert.certPem, keyPem: cert.keyPem },
 				onSession: async (session) => {
-					for await (const d of session.incomingDatagrams()) {
-						await session.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						session.incomingDatagrams(),
+						5000,
+						"wasm native interop server incoming datagram",
+						async (d) => {
+							await session.sendDatagram(d);
+						},
+					);
 				},
 			});
 
