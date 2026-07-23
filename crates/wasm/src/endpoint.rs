@@ -120,6 +120,11 @@ const MAX_READ_BATCHES_PER_PUMP: usize = 64;
 const MAX_WAITERS_WOKEN_PER_CAPACITY_CHANGE: usize = 64;
 /// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
 const H3_EXCESSIVE_LOAD: u32 = 0x0107;
+
+/// H3_INTERNAL_ERROR (RFC 9114 §8.1): used when the endpoint itself can no
+/// longer service a connection (e.g. host reservation token space exhausted)
+/// and fails closed instead of silently dropping payloads.
+const H3_INTERNAL_ERROR: u32 = 0x0102;
 const MAX_PENDING_EVENTS: usize = 65_536;
 
 #[derive(Default)]
@@ -1953,19 +1958,43 @@ impl WtEndpoint {
     }
 
     pub fn poll_event_encoded(&mut self) -> Option<Vec<u8>> {
-        let event = self.events.pop_front()?;
-        let token = match self.event_reservations.pop_front().flatten() {
-            Some(reservation) => match self.governor.transfer_to_host(reservation) {
-                Ok(token) => Some(token),
-                Err(error) => {
-                    self.set_last_error(error);
-                    return None;
-                }
-            },
-            None => None,
-        };
-        self.resume_waiting_after_capacity_change();
-        Some(event.encode_with_host_token(token))
+        loop {
+            let event = self.events.pop_front()?;
+            let token = match self.event_reservations.pop_front().flatten() {
+                Some(reservation) => match self.governor.transfer_to_host(reservation) {
+                    Ok(token) => Some(token),
+                    Err(error) => {
+                        // The payload can no longer reach the host (host-token
+                        // space exhausted), so silently dropping it would
+                        // desync the stream/datagram flow. Fail closed: tear
+                        // down the affected connection so the loss surfaces as
+                        // a Closed event instead of quiet data corruption.
+                        self.set_last_error(error);
+                        let conn = event.conn();
+                        if self.id_to_handle.contains_key(&conn) {
+                            self.close_conn(
+                                conn,
+                                H3_INTERNAL_ERROR,
+                                b"host reservation token space exhausted",
+                                Instant::now(),
+                            );
+                        } else {
+                            // Connection state is already gone; still surface
+                            // the dropped payload rather than staying silent.
+                            self.push_event(WtEvent::Closed {
+                                conn,
+                                code: H3_INTERNAL_ERROR,
+                            });
+                        }
+                        self.resume_waiting_after_capacity_change();
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            self.resume_waiting_after_capacity_change();
+            return Some(event.encode_with_host_token(token));
+        }
     }
 }
 
@@ -2165,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_transfer_failure_drops_payload_instead_of_encoding_token_zero() {
+    fn bridge_transfer_failure_fails_closed_instead_of_encoding_token_zero() {
         let caddr: SocketAddr = CADDR.parse().unwrap();
         let saddr: SocketAddr = SADDR.parse().unwrap();
         let limits = WasmLimits {
@@ -2189,13 +2218,26 @@ mod tests {
             endpoint.poll_event_encoded().is_some(),
             "first token transfers"
         );
-        assert!(
-            endpoint.poll_event_encoded().is_none(),
-            "failed transfer must drop, never deliver an unaccounted token-0 payload"
+        // The second transfer fails: the payload must never be delivered with
+        // an unaccounted token-0, and the failure must be observable — the
+        // affected connection fails closed with a Closed event instead of the
+        // payload silently vanishing.
+        let closed = endpoint
+            .poll_event_encoded()
+            .expect("failed transfer surfaces a Closed event");
+        assert_eq!(closed[0], crate::event::tag::CLOSED);
+        assert_eq!(
+            crate::varint::decode(&closed[1..]).map(|(conn, _)| conn),
+            Some(1),
+            "Closed event targets the connection whose payload was dropped"
         );
         assert_eq!(
             endpoint.take_last_error().as_deref(),
             Some("E_LIMIT_EXCEEDED: host reservation token space exhausted")
+        );
+        assert!(
+            endpoint.poll_event_encoded().is_none(),
+            "queue is drained after the fail-closed teardown"
         );
         let snapshot = endpoint.governor.snapshot(1, None);
         assert_eq!(snapshot.host_tokens_active, 1);

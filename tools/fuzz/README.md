@@ -43,8 +43,10 @@ gate:
   under `tools/fuzz/corpora/**` is present and retains both the corpora and the
   crash directory under `.release-evidence/fuzz/`.
 - The cargo-fuzz targets cover H3 frames, QPACK/Huffman decoding, DER metadata
-  parsing, HandleAllocator boundaries, WtEndpoint event dispatch, event
-  encoding, and governor boundary arithmetic.
+  parsing, the client certificate pin policy (14-day validity window and
+  P-256/ECDSA-SHA256 gating, with the verification time fuzzed alongside the
+  DER), HandleAllocator boundaries, WtEndpoint event dispatch, event encoding,
+  and governor boundary arithmetic.
 - The stable property-test step covers the hand-rolled H3/QPACK parser tests
   plus the Bun-side `packages/webtransport/test/wasm-limits.test.ts` decoder
   harness.
