@@ -1,10 +1,20 @@
-import { defineConfig } from "@playwright/test";
-import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "@playwright/test";
+import {
+	resolveInteropHealthPort,
+	resolveInteropHealthUrl,
+	resolveInteropHost,
+	resolveInteropQuicPort,
+} from "./browser-helpers.js";
 import { getSpkiHashBase64 } from "./cert-hash.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const certHash = getSpkiHashBase64();
+const interopHost = resolveInteropHost();
+const interopQuicPort = resolveInteropQuicPort();
+const interopHealthPort = resolveInteropHealthPort();
+const interopHealthUrl = resolveInteropHealthUrl();
 
 export default defineConfig({
 	testDir: "./tests",
@@ -19,7 +29,7 @@ export default defineConfig({
 		browserName: "chromium",
 		launchOptions: {
 			args: [
-				"--origin-to-force-quic-on=127.0.0.1:4433",
+				`--origin-to-force-quic-on=${interopHost}:${interopQuicPort}`,
 				"--ignore-certificate-errors",
 				"--allow-insecure-localhost",
 				...(certHash
@@ -30,15 +40,22 @@ export default defineConfig({
 		},
 	},
 	webServer: {
-		command: "bun run addon-server.ts",
+		command: "bun run prepare-certs.ts && bun run addon-server.ts",
+		name: "interop-webserver",
+		stdout: "pipe",
+		wait: {
+			stdout: new RegExp(
+				`addon-server: Health on http://${interopHost.replaceAll(".", "\\.")}:${interopHealthPort}`,
+			),
+		},
 		env: {
 			...process.env,
 			WT_IDLE_TIMEOUT_MS: "5000",
 		},
 		cwd: join(__dirname),
-		url: "http://127.0.0.1:4434", // Health endpoint (QUIC on 4433 doesn't respond to HTTP GET)
+		url: interopHealthUrl, // Health endpoint (QUIC port doesn't respond to HTTP GET)
 		reuseExistingServer: false,
-		timeout: 15000,
+		timeout: 60000,
 	},
 	projects: [
 		{

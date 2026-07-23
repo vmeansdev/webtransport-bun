@@ -4,15 +4,15 @@
  * - SPKI hash used for Chromium --ignore-certificate-errors-spki-list
  */
 import { test, expect } from "@playwright/test";
-import { getCertHashBase64, getSpkiHashBase64 } from "../cert-hash.js";
+import {
+	getCertHashBase64,
+	getInteropCertPath,
+	getSpkiHashBase64,
+} from "../cert-hash.js";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const certPath = join(__dirname, "..", "certs", "cert.pem");
+const certPath = getInteropCertPath();
 
 function openssl(args: string[], input?: Buffer): Buffer {
 	return execFileSync("openssl", args, {
