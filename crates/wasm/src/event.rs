@@ -39,6 +39,20 @@ pub mod tag {
 }
 
 impl WtEvent {
+    /// Connection id this event belongs to.
+    pub fn conn(&self) -> u32 {
+        match self {
+            WtEvent::Connected { conn }
+            | WtEvent::SessionEstablished { conn }
+            | WtEvent::Datagram { conn, .. }
+            | WtEvent::Closed { conn, .. }
+            | WtEvent::StreamOpened { conn, .. }
+            | WtEvent::StreamData { conn, .. }
+            | WtEvent::StreamReset { conn, .. }
+            | WtEvent::StreamStopped { conn, .. } => *conn,
+        }
+    }
+
     /// Serialize as: tag(1) || conn varint || [event-specific fields]. Stream
     /// events carry conn first, then stream, then their payload.
     pub fn encode(&self) -> Vec<u8> {

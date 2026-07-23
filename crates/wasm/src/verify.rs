@@ -62,6 +62,19 @@ fn certificate_satisfies_pin_policy(der: &[u8], now: rustls::pki_types::UnixTime
         && tbs_signature == outer_signature
 }
 
+/// Fuzzing entry point for the pin-policy check (the `cert_pin_policy` target
+/// in `tools/fuzz`): same code path as `verify_server_cert`, with the
+/// verification time taken as raw Unix seconds so the fuzz crate does not need
+/// a rustls dependency. Not used by production callers.
+pub fn certificate_satisfies_pin_policy_at(der: &[u8], now_unix_secs: u64) -> bool {
+    certificate_satisfies_pin_policy(
+        der,
+        rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            now_unix_secs,
+        )),
+    )
+}
+
 /// Pin the server certificate by SHA-256(DER). Connection fails with a
 /// certificate error unless the presented end-entity cert matches one of the
 /// expected hashes.

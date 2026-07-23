@@ -14,6 +14,7 @@ describe("Task 14 fuzz release smoke", () => {
 			"h3_frames",
 			"qpack_huffman",
 			"der_metadata",
+			"cert_pin_policy",
 			"handle_allocator",
 			"endpoint_event_dispatch",
 			"event_encode",
@@ -99,8 +100,10 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(manifest).toContain('name = "handle_allocator"');
 		expect(manifest).toContain('name = "endpoint_event_dispatch"');
 		expect(manifest).toContain('name = "event_encode"');
+		expect(manifest).toContain('name = "cert_pin_policy"');
 		expect(manifest).not.toContain('name = "event_decode"');
 		expect(readme).toContain("DER metadata parsing");
+		expect(readme).toContain("certificate pin policy");
 		expect(readme).toContain("HandleAllocator");
 		expect(readme).toContain("WtEndpoint event dispatch");
 		expect(readme).toContain("event encoding");

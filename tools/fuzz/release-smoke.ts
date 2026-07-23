@@ -27,6 +27,7 @@ export const cargoFuzzTargets = [
 	{ name: "h3_frames", corpus: "h3" },
 	{ name: "qpack_huffman", corpus: "qpack" },
 	{ name: "der_metadata", corpus: "der" },
+	{ name: "cert_pin_policy", corpus: "pin" },
 	{ name: "handle_allocator", corpus: "handle" },
 	{ name: "endpoint_event_dispatch", corpus: "event" },
 	{ name: "event_encode", corpus: "bridge" },
