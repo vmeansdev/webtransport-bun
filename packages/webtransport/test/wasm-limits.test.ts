@@ -913,6 +913,26 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		expect(order).toEqual(["data:4", "reset:0"]);
 	});
 
+	test("a peer reset before onReset subscription is parked, not dropped", () => {
+		const { manager } = fakeManager({});
+		const stream = new WasmStream(manager, 1, 9, false, true);
+		stream._pushReset(7);
+
+		const resets: number[] = [];
+		stream.onReset((code) => resets.push(code));
+		expect(resets).toEqual([7]);
+	});
+
+	test("a connection close before onReset subscription is parked, not dropped", () => {
+		const { manager } = fakeManager({});
+		const stream = new WasmStream(manager, 1, 9, false, true);
+		stream._closeFromConnection(3);
+
+		const resets: number[] = [];
+		stream.onReset((code) => resets.push(code));
+		expect(resets).toEqual([3]);
+	});
+
 	test("per-stream overflow resets an already-subscribed reset consumer synchronously", () => {
 		const { manager } = fakeManager({
 			maxQueuedBytesGlobal: 4,

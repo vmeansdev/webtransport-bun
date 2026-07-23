@@ -564,7 +564,9 @@ export class WasmStream {
 	/** @internal */
 	_pushReset(code: number): void {
 		this._dropRetained();
-		this.resetCb?.(code);
+		// Park for a late subscriber like every other reset path — a peer reset
+		// arriving before onReset must error the eventual consumer, not vanish.
+		this._surfaceReset(code);
 		// A reset ends the recv half. On connection teardown the manager also
 		// force-releases, so mark the send half done too to guarantee release.
 		this.recvDone = true;
@@ -588,7 +590,9 @@ export class WasmStream {
 		this._dropRetained();
 		if (!this.recvDone) {
 			this.recvDone = true;
-			this.resetCb?.(code);
+			// Same parking rule as _pushReset: a consumer subscribing after the
+			// connection died must still observe the failure.
+			this._surfaceReset(code);
 		}
 		this.sendDone = true;
 		this.mgr._releaseStream(this.handle);
