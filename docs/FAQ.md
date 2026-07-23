@@ -59,5 +59,13 @@ no BigInt interop or JSON-serialization surprises.
 
 ## Is this production-ready?
 
-Project is at `1.0.0-rc.1`: a release candidate for the native surface with zero known P0/P1/P2 defects (multi-pass adversarial review), while the full production-scale evidence (remote CI, multi-day soak, scale load) is gathered before a stable `1.0.0` tag. See `docs/RELEASE_1.0_STATUS.md`.
-Review `docs/TESTPLAN.md`, `docs/CI.md`, and `docs/OPERATIONS.md` before production rollout.
+Not yet. The package remains `1.0.0-rc.1`, and both the native and WASM
+surfaces remain release candidates. Local implementation gates have useful
+coverage, but the immutable multi-platform/runtime matrix, release coverage and
+fuzz evidence, >=10k diverse-source scale proof, 24-hour and 72-hour soaks, and
+the zero-P0-P4 independent-review/no-change confirmation are still required.
+`docs/release-status.json` is the machine-readable authority; see
+`docs/RELEASE_1.0_STATUS.md` for the human summary.
+
+Review `docs/TESTPLAN.md`, `docs/CI.md`, and `docs/OPERATIONS.md` before any
+production rollout.

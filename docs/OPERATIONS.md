@@ -10,6 +10,8 @@ Operational requirements:
 - UDP port must be reachable from the internet (firewall rules).
 - Certificates must be valid for the hostname used by clients/browsers.
 
+Canonical release truth: `docs/release-status.json`. This page describes operational guidance for the current candidate surfaces.
+
 ## Recommended defaults
 - Keep maxSessions conservative initially (e.g., 200–500) until tested.
 - Keep per-session queued bytes low (<= 2 MiB).
@@ -174,10 +176,10 @@ When `queuedBytesGlobal` rises and stays high:
 
 ## Known limitations and compatibility
 
-- Client `connect()` fully supported: datagrams, bidi/uni streams, metrics, configurable limits
-- macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
-- Runtime support: Bun >= 1.3.9, Node, Deno
-- Node-API addon portability applies across supported runtimes
+- Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
+- Configured target matrix: macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
+- Configured runtime matrix: Bun >= 1.3.9, Node, Deno
+- Node-API addon portability applies across the configured runtime matrix
 
 ## Public internet deployment
 
