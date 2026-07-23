@@ -1184,6 +1184,27 @@ impl WtEndpoint {
                 Bytes::copy_from_slice(reason),
             );
         }
+        self.release_connection_budget(h);
+    }
+
+    /// Release this connection's governor byte-budget NOW, without touching
+    /// its state machine: quinn owns the connection until it surfaces
+    /// `ConnectionLost`, but a burst of error-closes must not pin budget that
+    /// admission decisions are made against across that window. Reservations
+    /// release exactly once on drop, so the eventual `cleanup_connection` is a
+    /// budget no-op. Rate-limiter connection counts are deliberately NOT
+    /// released here — the connection still exists until quinn retires it, and
+    /// freeing its per-host slot early would over-admit.
+    fn release_connection_budget(&mut self, h: ConnectionHandle) {
+        self.handshake_reservations.remove(&h);
+        self.session_reservations.remove(&h);
+        let stream_index = &self.stream_index;
+        let stream_reservations = &mut self.stream_reservations;
+        for (handle, &(sh, _)) in stream_index.iter() {
+            if sh == h {
+                stream_reservations.remove(handle);
+            }
+        }
     }
 
     fn close_session_on_connect_end(&mut self, h: ConnectionHandle) {
@@ -1207,6 +1228,7 @@ impl WtEndpoint {
         if let Some(c) = self.conns.get_mut(&h) {
             c.close(Instant::now(), VarInt::from_u32(0), Bytes::new());
         }
+        self.release_connection_budget(h);
     }
 
     /// Peer STOP_SENDING on our send half: surface the code and retire the
@@ -2486,6 +2508,47 @@ mod tests {
             client.take_last_error().as_deref(),
             Some("E_LIMIT_EXCEEDED: maxStreamsGlobal reached")
         );
+    }
+
+    #[test]
+    fn error_close_releases_governor_budget_before_connection_lost() {
+        let caddr: SocketAddr = CADDR.parse().unwrap();
+        let saddr: SocketAddr = SADDR.parse().unwrap();
+        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
+        let conn = client.connect("localhost") as u32;
+        let mut established = false;
+        for _ in 0..400 {
+            relay_client_to_server(&mut client, &mut server);
+            relay_server_to_client(&mut server, &mut client);
+            while let Some(event) = client.poll_event() {
+                if matches!(event, WtEvent::SessionEstablished { .. }) {
+                    established = true;
+                }
+            }
+            while server.poll_event().is_some() {}
+            if established {
+                break;
+            }
+        }
+        assert!(established, "session establishes before budget assertions");
+        assert!(client.open_stream(conn, true) > 0);
+        let h = *client.id_to_handle.get(&conn).unwrap();
+        assert!(
+            client.session_reservations.contains_key(&h),
+            "established session carries a session reservation"
+        );
+        assert_eq!(client.stream_reservations.len(), 1);
+
+        // The budget must free at the close site itself — BEFORE any further
+        // drive/pump surfaces ConnectionLost and runs cleanup_connection.
+        client.close_conn_protocol_error(h, 0x0102, b"test");
+        assert!(!client.handshake_reservations.contains_key(&h));
+        assert!(!client.session_reservations.contains_key(&h));
+        assert!(client.stream_reservations.is_empty());
+        // Connection state stays with quinn's lifecycle (not torn down here);
+        // the eventual cleanup_connection is a budget no-op.
+        assert!(client.conns.contains_key(&h));
     }
 
     #[test]
