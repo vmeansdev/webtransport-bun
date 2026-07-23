@@ -513,9 +513,15 @@ export async function runCommandWithBoundedOutput(
 			exitPromise,
 			terminateGraceMs,
 		);
+		// Bounded exit contract: awaitWithTimeout("child.exited", ...) — a child
+		// that survives SIGKILL must not hang the campaign; report it as killed.
 		exit = {
 			kind: "exit",
-			value: await exitPromise,
+			value: await awaitWithTimeout(
+				"child.exited",
+				exitPromise,
+				Math.max(terminateGraceMs, 1),
+			).catch(() => ({ code: -1, signal: "SIGKILL" })),
 		};
 	}
 
@@ -531,11 +537,20 @@ export async function runCommandWithBoundedOutput(
 		timedOut = true;
 		forceKilled =
 			(await reapPipeHolders(child.pid ?? 0, terminateGraceMs)) || forceKilled;
+		// Re-drain whatever the reaped holders released, but PRESERVE the
+		// drain-timeout flag — the settled controller resolves instantly with
+		// timedOut:false on the second await, which must not mask the first.
 		stdoutResult = stdoutResult.timedOut
-			? await awaitCaptureWithinTimeout(stdoutCapture, 0)
+			? {
+					...(await awaitCaptureWithinTimeout(stdoutCapture, 0)),
+					timedOut: true,
+				}
 			: stdoutResult;
 		stderrResult = stderrResult.timedOut
-			? await awaitCaptureWithinTimeout(stderrCapture, 0)
+			? {
+					...(await awaitCaptureWithinTimeout(stderrCapture, 0)),
+					timedOut: true,
+				}
 			: stderrResult;
 	}
 
