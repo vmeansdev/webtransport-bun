@@ -101,6 +101,16 @@ jobs:
           echo "hole test OK (suite failed without pkg)"
         env:
           WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Hole test — delete wasm-dist and expect dist behavioral red
+        run: |
+          rm -rf packages/webtransport/wasm-dist
+          if bun run test:wasm:dist-hole; then
+            echo "expected dist behavioral suite to fail without wasm-dist" >&2
+            exit 1
+          fi
+          echo "dist hole test OK"
+        env:
+          WEBTRANSPORT_REQUIRE_WASM_DIST: "1"
       - name: Rebuild wasm after hole test
         run: bun run build:wasm && bun run build:wasm:dist
       - name: Interop (Chromium native client -> wasm server)
