@@ -910,7 +910,7 @@ fn connect_inner(
                 id
             }) {
             std::result::Result::Ok(id) => ConnectResult::Ok(id),
-            std::result::Result::Err(msg) => ConnectResult::Err(msg),
+            std::result::Result::Err(msg) => ConnectResult::Err(msg.to_string()),
         };
         let success_id = match &result {
             ConnectResult::Ok(id) => Some(id.clone()),

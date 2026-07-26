@@ -40,27 +40,26 @@ impl WtCode {
 
     fn parse(message: &str) -> Option<Self> {
         const CODES: [WtCode; 13] = [
-            Self::E_INVALID_ARGUMENT,
-            Self::E_UNSUPPORTED_ARGUMENT,
-            Self::E_TLS,
-            Self::E_HANDSHAKE_TIMEOUT,
-            Self::E_SESSION_CLOSED,
-            Self::E_SESSION_IDLE_TIMEOUT,
-            Self::E_STREAM_RESET,
-            Self::E_STOP_SENDING,
-            Self::E_QUEUE_FULL,
-            Self::E_BACKPRESSURE_TIMEOUT,
-            Self::E_LIMIT_EXCEEDED,
-            Self::E_RATE_LIMITED,
-            Self::E_INTERNAL,
+            WtCode::E_INVALID_ARGUMENT,
+            WtCode::E_UNSUPPORTED_ARGUMENT,
+            WtCode::E_TLS,
+            WtCode::E_HANDSHAKE_TIMEOUT,
+            WtCode::E_SESSION_CLOSED,
+            WtCode::E_SESSION_IDLE_TIMEOUT,
+            WtCode::E_STREAM_RESET,
+            WtCode::E_STOP_SENDING,
+            WtCode::E_QUEUE_FULL,
+            WtCode::E_BACKPRESSURE_TIMEOUT,
+            WtCode::E_LIMIT_EXCEEDED,
+            WtCode::E_RATE_LIMITED,
+            WtCode::E_INTERNAL,
         ];
         for code in CODES {
             let marker = code.as_str();
             if message == marker {
                 return Some(code);
             }
-            if message.starts_with(marker) {
-                let suffix = &message[marker.len()..];
+            if let Some(suffix) = message.strip_prefix(marker) {
                 if suffix.starts_with(':') {
                     return Some(code);
                 }
@@ -113,24 +112,26 @@ impl fmt::Display for WtError {
     }
 }
 
-pub type WtResult<T> = std::result::Result<T, napi::Error<String>>;
+pub type WtResult<T> = std::result::Result<T, napi::Error>;
 
-impl From<WtError> for napi::Error<String> {
+impl From<WtError> for napi::Error {
     fn from(err: WtError) -> Self {
-        napi::Error::new(err.code.as_str().to_string(), err.detail)
+        // Sync napi entrypoints require `Error` (Status), not `Error<String>`.
+        // Preserve `E_CODE: detail` so JS classification stays message-stable.
+        napi::Error::from_reason(err.to_string())
     }
 }
 
-pub fn from_reason(detail: impl Into<String>) -> napi::Error<String> {
-    WtError::from_detail(detail.into()).into()
+pub fn from_reason(detail: impl std::fmt::Display) -> napi::Error {
+    WtError::from_detail(detail.to_string()).into()
 }
 
-pub fn from_code(code: WtCode, detail: impl Into<String>) -> napi::Error<String> {
-    WtError::with_code(code, detail.into()).into()
+pub fn from_code(code: WtCode, detail: impl std::fmt::Display) -> napi::Error {
+    WtError::with_code(code, detail.to_string()).into()
 }
 
-pub fn from_upstream_error(detail: impl Into<String>) -> napi::Error<String> {
-    let detail = detail.into();
+pub fn from_upstream_error(detail: impl std::fmt::Display) -> napi::Error {
+    let detail = detail.to_string();
     let lower = detail.to_ascii_lowercase();
     if lower.contains("connection locally closed") || lower.contains("connection closed by peer") {
         return from_code(WtCode::E_SESSION_CLOSED, detail);
