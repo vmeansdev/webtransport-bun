@@ -275,6 +275,30 @@ function parseWaitUntilAvailable(
 	return value;
 }
 
+function boundNativeCapacityWait(
+	handle: {
+		waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+		waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	},
+	kind: "bidi" | "uni",
+): ((remainingMs: number) => Promise<void>) | undefined {
+	let fn: ((remainingMs: number) => Promise<void>) | undefined;
+	switch (kind) {
+		case "bidi":
+			fn = handle.waitBidiCapacity;
+			break;
+		case "uni":
+			fn = handle.waitUniCapacity;
+			break;
+		default: {
+			const _exhaustive: never = kind;
+			return _exhaustive;
+		}
+	}
+	if (typeof fn !== "function") return undefined;
+	return (remainingMs) => fn.call(handle, remainingMs);
+}
+
 async function openStreamWithWait<T>(
 	openFn: () => Promise<T>,
 	options: StreamOpenOptions | undefined,
@@ -1221,9 +1245,7 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitBidiCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi"),
 			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1255,9 +1277,7 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitUniCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni"),
 			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1631,9 +1651,8 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitBidiCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
-					: createPollingCapacityWaiter(() => this.#closed),
+				boundNativeCapacityWait(this.#nativeHandle, "bidi") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new BidiStream({
@@ -1672,9 +1691,8 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitUniCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
-					: createPollingCapacityWaiter(() => this.#closed),
+				boundNativeCapacityWait(this.#nativeHandle, "uni") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new SendStream({
