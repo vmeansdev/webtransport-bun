@@ -508,53 +508,79 @@ mod tests {
         assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
     }
 
-    async fn wait_for_datagram_backpressure_capacity(
+    fn limits() -> crate::limits::Limits {
+        crate::limits::Limits {
+            max_queued_bytes_global: GLOBAL_MAX,
+            max_queued_bytes_per_session: SESSION_MAX,
+            backpressure_timeout_ms: 500,
+            ..crate::limits::Limits::default()
+        }
+    }
+
+    async fn wait_for_datagram_backpressure_slot(
         metrics: Arc<ServerMetrics>,
         sm: Arc<SessionMetrics>,
         session_notify: Arc<Notify>,
         reserved: u64,
         deadline: Instant,
-        mut before_recheck: Option<Box<dyn FnOnce() + Send>>,
+        lifecycle_closed: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::result::Result<(), &'static str> {
-        loop {
-            let session_notified = session_notify.notified();
-            tokio::pin!(session_notified);
-            session_notified.as_mut().enable();
-            let global_notified = metrics.datagram_capacity_notify.notified();
-            tokio::pin!(global_notified);
-            global_notified.as_mut().enable();
+        reserve_datagram_capacity(
+            &metrics,
+            &sm,
+            &session_notify,
+            &lifecycle_closed,
+            &limits(),
+            reserved,
+            deadline,
+        )
+        .await
+        .map_err(|err| match err {
+            DatagramCapacityError::Closed => "closed",
+            DatagramCapacityError::Timeout => "timeout",
+        })
+    }
 
-            if let Some(hook) = before_recheck.take() {
-                hook();
+    async fn await_backpressure_waiter(
+        metrics: Arc<ServerMetrics>,
+        target_count: u64,
+    ) -> std::result::Result<(), &'static str> {
+        timeout(Duration::from_millis(200), async {
+            while metrics.backpressure_wait_count.load(Ordering::Relaxed) < target_count {
+                tokio::task::yield_now().await;
             }
+        })
+        .await
+        .map_err(|_| "timeout")
+    }
 
-            if metrics.try_reserve_queued_bytes_with_session(
-                &sm.queued_bytes,
-                reserved,
-                GLOBAL_MAX,
-                SESSION_MAX,
-            ) {
-                return Ok(());
-            }
-
-            metrics
-                .backpressure_wait_count
-                .fetch_add(1, Ordering::Relaxed);
-
-            let now = Instant::now();
-            if now >= deadline {
-                return Err("timeout");
-            }
-
-            timeout(deadline.saturating_duration_since(now), async {
-                tokio::select! {
-                    _ = &mut session_notified => {},
-                    _ = &mut global_notified => {},
-                }
+    #[test]
+    fn datagram_backpressure_tests_do_not_reimplement_reserve_datagram_capacity() {
+        let source = include_str!("session_registry.rs");
+        let fn_source = source
+            .split("pub async fn reserve_datagram_capacity(")
+            .nth(1)
+            .and_then(|body| {
+                body.split("/// Owns a datagram byte-budget reservation")
+                    .next()
             })
-            .await
-            .map_err(|_| "timeout")?;
-        }
+            .expect(
+                "reserve_datagram_capacity definition must include following doc-commented section",
+            );
+        assert_eq!(
+            fn_source
+                .matches("let session_notified = session_notify.notified();")
+                .count(),
+            1,
+            "test-local copies of waiter registration must not be reintroduced"
+        );
+        assert_eq!(
+            fn_source
+                .matches("let owner_notified = metrics.datagram_capacity_notify.notified();")
+                .count(),
+            1,
+            "production-path tests must call reserve_datagram_capacity directly"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -572,13 +598,13 @@ mod tests {
         );
 
         let waiter = |metrics: Arc<ServerMetrics>, sm: Arc<SessionMetrics>, notify: Arc<Notify>| async move {
-            wait_for_datagram_backpressure_capacity(
+            wait_for_datagram_backpressure_slot(
                 Arc::clone(&metrics),
                 Arc::clone(&sm),
                 Arc::clone(&notify),
                 100,
                 Instant::now() + Duration::from_millis(500),
-                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .await
             .expect("waiter should acquire released capacity");
@@ -607,23 +633,29 @@ mod tests {
         let notify = Arc::new(Notify::new());
         reserve(&metrics, &sm, 100);
 
-        wait_for_datagram_backpressure_capacity(
+        let waiter = tokio::spawn(wait_for_datagram_backpressure_slot(
             Arc::clone(&metrics),
             Arc::clone(&sm),
             Arc::clone(&notify),
             100,
             Instant::now() + Duration::from_millis(250),
-            Some(Box::new({
-                let metrics = Arc::clone(&metrics);
-                let sm = Arc::clone(&sm);
-                let notify = Arc::clone(&notify);
-                move || {
-                    metrics.release_datagram_capacity(&sm.queued_bytes, &notify, 100);
-                }
-            })),
-        )
-        .await
-        .expect("release between register and re-check must not time out");
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        let releaser = tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            let sm = Arc::clone(&sm);
+            let notify = Arc::clone(&notify);
+            async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                metrics.release_datagram_capacity(&sm.queued_bytes, &notify, 100);
+            }
+        });
+
+        let _ = timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter should consume a single release without timeout")
+            .expect("waiter should reserve capacity");
+        releaser.await.expect("releaser task should run");
 
         assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 100);
         assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 100);
@@ -651,13 +683,13 @@ mod tests {
         let waiter_sm = Arc::new(SessionMetrics::default());
         let waiter_notify = Arc::new(Notify::new());
 
-        let waiter = wait_for_datagram_backpressure_capacity(
+        let waiter = wait_for_datagram_backpressure_slot(
             Arc::clone(&metrics),
             Arc::clone(&waiter_sm),
             Arc::clone(&waiter_notify),
             100,
             Instant::now() + Duration::from_millis(500),
-            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         drop(blocker_slot);
@@ -680,27 +712,23 @@ mod tests {
         let sm = Arc::new(SessionMetrics::default());
         let session_notify = Arc::new(Notify::new());
         reserve(&metrics, &sm, SESSION_MAX);
-        let (parked_tx, parked_rx) = oneshot::channel();
 
-        let second_send = tokio::spawn(wait_for_datagram_backpressure_capacity(
+        let second_send = tokio::spawn(wait_for_datagram_backpressure_slot(
             Arc::clone(&metrics),
             Arc::clone(&sm),
             Arc::clone(&session_notify),
             1,
             Instant::now() + Duration::from_millis(500),
-            Some(Box::new(move || {
-                let _ = parked_tx.send(());
-            })),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
-        timeout(Duration::from_millis(100), parked_rx)
+        await_backpressure_waiter(Arc::clone(&metrics), 1)
             .await
-            .expect("second send must reach the registered capacity wait")
-            .expect("second send must report that it is parked");
+            .expect("second send should register as parked");
         tokio::task::yield_now().await;
 
         metrics.release_datagram_capacity(&sm.queued_bytes, &session_notify, SESSION_MAX);
 
-        timeout(Duration::from_millis(100), second_send)
+        let _ = timeout(Duration::from_millis(100), second_send)
             .await
             .expect("the first outbound send's direct release must wake the second")
             .expect("second send task must not panic")
@@ -764,22 +792,18 @@ mod tests {
         let owner_a_sm = Arc::new(SessionMetrics::default());
         let owner_a_notify = Arc::new(Notify::new());
         reserve(&owner_a, &owner_a_sm, SESSION_MAX);
-        let (parked_tx, parked_rx) = oneshot::channel();
 
-        let owner_a_waiter = tokio::spawn(wait_for_datagram_backpressure_capacity(
+        let owner_a_waiter = tokio::spawn(wait_for_datagram_backpressure_slot(
             Arc::clone(&owner_a),
             Arc::clone(&owner_a_sm),
             Arc::clone(&owner_a_notify),
             1,
             Instant::now() + Duration::from_millis(500),
-            Some(Box::new(move || {
-                let _ = parked_tx.send(());
-            })),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
-        timeout(Duration::from_millis(100), parked_rx)
+        await_backpressure_waiter(Arc::clone(&owner_a), 1)
             .await
-            .expect("owner A waiter must register before the unrelated release")
-            .expect("owner A waiter must report that it is parked");
+            .expect("owner A waiter must reach the parked state");
         tokio::task::yield_now().await;
         assert_eq!(owner_a.backpressure_wait_count.load(Ordering::Relaxed), 1);
 
