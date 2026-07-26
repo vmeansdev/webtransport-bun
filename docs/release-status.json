@@ -46,6 +46,20 @@
 			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: Playwright chromium-webtransport 19/19 on darwin/arm64."
+		},
+		{
+			"id": "local-chromium-wasm-interop-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/chromium-wasm-interop.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"status": "passed",
+			"notes": "Playwright chromium-webtransport-wasm 5/5 darwin/arm64."
+		},
+		{
+			"id": "local-fault-matrix-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/fault-matrix.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"status": "passed",
+			"notes": "Playwright seeded UDP fault-matrix 1/1 darwin/arm64."
 		}
 	],
 	"claims": [
@@ -53,13 +67,17 @@
 			"id": "native-local-gates",
 			"surface": "native",
 			"status": "passed",
-			"evidenceIds": ["local-native-gates-19acc30"]
+			"evidenceIds": [
+				"local-native-gates-19acc30"
+			]
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
-			"evidenceIds": ["local-wasm-gates-19acc30"]
+			"evidenceIds": [
+				"local-wasm-gates-19acc30"
+			]
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -71,19 +89,25 @@
 			"id": "runtime-consumers",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-runtime-consumers-19acc30"]
+			"evidenceIds": [
+				"local-runtime-consumers-19acc30"
+			]
 		},
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
 			"status": "passed",
-			"evidenceIds": ["local-chromium-native-interop-19acc30"]
+			"evidenceIds": [
+				"local-chromium-native-interop-19acc30"
+			]
 		},
 		{
 			"id": "chromium-wasm-interop",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": [
+				"local-chromium-wasm-interop-19acc30"
+			]
 		},
 		{
 			"id": "iwa-direct-sockets",
@@ -94,8 +118,10 @@
 		{
 			"id": "fault-matrix",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": [
+				"local-fault-matrix-19acc30"
+			]
 		},
 		{
 			"id": "coverage-gates",
@@ -122,13 +148,17 @@
 			"id": "package-artifact",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-package-artifact-19acc30"]
+			"evidenceIds": [
+				"local-package-artifact-19acc30"
+			]
 		},
 		{
 			"id": "supply-chain-provenance",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-supply-chain-19acc30"]
+			"evidenceIds": [
+				"local-supply-chain-19acc30"
+			]
 		},
 		{
 			"id": "soak-24h",
@@ -158,7 +188,10 @@
 	"surfaces": {
 		"native": {
 			"stability": "candidate",
-			"requiredClaims": ["native-local-gates", "chromium-native-interop"]
+			"requiredClaims": [
+				"native-local-gates",
+				"chromium-native-interop"
+			]
 		},
 		"wasm": {
 			"stability": "candidate",
@@ -176,7 +209,9 @@
 			{
 				"id": "wasm-bun-suite-ubuntu-only",
 				"surface": "wasm",
-				"claimIds": ["wasm-local-gates"],
+				"claimIds": [
+					"wasm-local-gates"
+				],
 				"summary": "Hosted wasm Bun suite evidence is produced on the ubuntu wasm CI job; local darwin evidence is additionally bound under docs/release-evidence/ while Actions are unavailable, and does not expand the claimed support matrix."
 			}
 		]
