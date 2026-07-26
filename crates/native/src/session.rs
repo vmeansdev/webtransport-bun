@@ -1,8 +1,8 @@
-use napi::Result;
+use napi::bindgen_prelude::Buffer;
+use napi::{Env, JsObject, Result};
 use napi_derive::napi;
 use std::sync::atomic::Ordering;
 
-use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
 use crate::error::{
     from_reason as wt_from_reason, from_upstream_error as wt_from_upstream_error, WtResult,
 };
@@ -119,162 +119,207 @@ impl SessionHandle {
         Ok(())
     }
 
-    #[napi]
-    pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
+    /// Spawn on the addon runtime without holding an exclusive napi borrow of
+    /// `self` across `.await` (Bun rejects concurrent `async fn &self` calls).
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn send_datagram(&self, env: Env, data: Buffer) -> Result<JsObject> {
         let id = self.id.clone();
         let bytes = data.as_ref().to_vec();
-        let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
-            session_registry::get_datagram_send_state(&id)
-        else {
-            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-        };
-        let sz = bytes.len();
-        if sz > limits.max_datagram_size {
-            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
-        }
-        let sz_u64 = sz as u64;
-        let deadline = Instant::now() + Duration::from_millis(limits.backpressure_timeout_ms);
-        session_registry::reserve_datagram_capacity(
-            &metrics,
-            &sm,
-            &datagram_capacity_notify,
-            &lifecycle_closed,
-            &limits,
-            sz_u64,
-            deadline,
-        )
-        .await
-        .map_err(|err| match err {
-            session_registry::DatagramCapacityError::Closed => {
-                napi::Error::from_reason("E_SESSION_CLOSED")
-            }
-            session_registry::DatagramCapacityError::Timeout => {
-                napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT")
-            }
-        })?;
-        // wtransport's send_datagram is a synchronous, non-blocking enqueue —
-        // no task spawn or timeout needed (a timeout can't fire on sync work).
-        let start = std::time::Instant::now();
-        let result = conn
-            .send_datagram(&bytes)
-            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
-        metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
-        result?;
-        metrics.datagram_enqueue_histogram.observe(start.elapsed());
-        metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-        sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    #[napi]
-    pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        let id = self.id.clone();
-        let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(&id) else {
-            return Ok(None);
-        };
-        let mut rx = dgram_rx.lock().await;
-        match rx.recv().await {
-            // `slot.take()` moves the payload out; the reservation is released
-            // when the slot drops at the end of this scope (see DatagramSlot).
-            Some(slot) => Ok(Some(slot.take().into())),
-            None => Ok(None),
-        }
-    }
-
-    // Streams (P0-1: wired to wtransport via session registry)
-
-    #[napi]
-    pub async fn create_bidi_stream(&self) -> Result<ClientBidiStreamHandle> {
-        let id = self.id.clone();
-        RUNTIME
-            .spawn(async move {
-                let Some((_, _, metrics, _, _, create_bi_tx, _)) = session_registry::get(&id)
-                else {
-                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-                };
-                let start = std::time::Instant::now();
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                create_bi_tx
-                    .send(resp_tx)
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let Some((
+                        conn,
+                        metrics,
+                        sm,
+                        limits,
+                        datagram_capacity_notify,
+                        lifecycle_closed,
+                    )) = session_registry::get_datagram_send_state(&id)
+                    else {
+                        return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                    };
+                    let sz = bytes.len();
+                    if sz > limits.max_datagram_size {
+                        return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+                    }
+                    let sz_u64 = sz as u64;
+                    let deadline =
+                        Instant::now() + Duration::from_millis(limits.backpressure_timeout_ms);
+                    session_registry::reserve_datagram_capacity(
+                        &metrics,
+                        &sm,
+                        &datagram_capacity_notify,
+                        &lifecycle_closed,
+                        &limits,
+                        sz_u64,
+                        deadline,
+                    )
                     .await
-                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
-                let result = resp_rx
-                    .await
-                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(wt_from_upstream_error);
-                if result.is_ok() {
-                    metrics.stream_open_histogram.observe(start.elapsed());
-                }
-                result
-            })
-            .await
-            .map_err(wt_from_upstream_error)?
+                    .map_err(|err| match err {
+                        session_registry::DatagramCapacityError::Closed => {
+                            napi::Error::from_reason("E_SESSION_CLOSED")
+                        }
+                        session_registry::DatagramCapacityError::Timeout => {
+                            napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT")
+                        }
+                    })?;
+                    let start = std::time::Instant::now();
+                    let result = conn
+                        .send_datagram(&bytes)
+                        .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
+                    metrics.release_datagram_capacity(
+                        &sm.queued_bytes,
+                        &datagram_capacity_notify,
+                        sz_u64,
+                    );
+                    result?;
+                    metrics.datagram_enqueue_histogram.observe(start.elapsed());
+                    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                    sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
-    #[napi]
-    pub async fn wait_bidi_capacity(&self, timeout_ms: u32) -> Result<()> {
+    #[napi(ts_return_type = "Promise<Buffer | null>")]
+    pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        RUNTIME
-            .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "bidi").await })
-            .await
-            .map_err(wt_from_upstream_error)?
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(&id) else {
+                        return Ok(None);
+                    };
+                    let mut rx = dgram_rx.lock().await;
+                    match rx.recv().await {
+                        Some(slot) => Ok(Some(Buffer::from(slot.take()))),
+                        None => Ok(None),
+                    }
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
-    #[napi]
-    pub async fn accept_bidi_stream(&self) -> Result<Option<ClientBidiStreamHandle>> {
+    #[napi(ts_return_type = "Promise<ClientBidiStreamHandle>")]
+    pub fn create_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        let Some((_, _, _, bidi_rx, _, _, _)) = session_registry::get(&id) else {
-            return Ok(None);
-        };
-        let mut rx = bidi_rx.lock().await;
-        Ok(rx.recv().await)
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let Some((_, _, metrics, _, _, create_bi_tx, _)) = session_registry::get(&id)
+                    else {
+                        return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                    };
+                    let start = std::time::Instant::now();
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    create_bi_tx
+                        .send(resp_tx)
+                        .await
+                        .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+                    let result = resp_rx
+                        .await
+                        .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
+                        .map_err(wt_from_upstream_error);
+                    if result.is_ok() {
+                        metrics.stream_open_histogram.observe(start.elapsed());
+                    }
+                    result
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
-    #[napi]
-    pub async fn create_uni_stream(&self) -> Result<ClientUniSendHandle> {
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn wait_bidi_capacity(&self, env: Env, timeout_ms: u32) -> Result<JsObject> {
         let id = self.id.clone();
-        RUNTIME
-            .spawn(async move {
-                let Some((_, _, metrics, _, _, _, create_uni_tx)) = session_registry::get(&id)
-                else {
-                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-                };
-                let start = std::time::Instant::now();
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                create_uni_tx
-                    .send(resp_tx)
-                    .await
-                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
-                let result = resp_rx
-                    .await
-                    .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(wt_from_upstream_error);
-                if result.is_ok() {
-                    metrics.stream_open_histogram.observe(start.elapsed());
-                }
-                result
-            })
-            .await
-            .map_err(wt_from_upstream_error)?
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(
+                    async move { Self::wait_capacity_with_timeout(id, timeout_ms, "bidi").await },
+                )
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
-    #[napi]
-    pub async fn wait_uni_capacity(&self, timeout_ms: u32) -> Result<()> {
+    #[napi(ts_return_type = "Promise<ClientBidiStreamHandle | null>")]
+    pub fn accept_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        RUNTIME
-            .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "uni").await })
-            .await
-            .map_err(wt_from_upstream_error)?
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let Some((_, _, _, bidi_rx, _, _, _)) = session_registry::get(&id) else {
+                        return Ok(None);
+                    };
+                    let mut rx = bidi_rx.lock().await;
+                    Ok(rx.recv().await)
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
-    #[napi]
-    pub async fn accept_uni_stream(&self) -> Result<Option<ClientUniRecvHandle>> {
+    #[napi(ts_return_type = "Promise<ClientUniSendHandle>")]
+    pub fn create_uni_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        let Some((_, _, _, _, uni_rx, _, _)) = session_registry::get(&id) else {
-            return Ok(None);
-        };
-        let mut rx = uni_rx.lock().await;
-        Ok(rx.recv().await)
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let Some((_, _, metrics, _, _, _, create_uni_tx)) = session_registry::get(&id)
+                    else {
+                        return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                    };
+                    let start = std::time::Instant::now();
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    create_uni_tx
+                        .send(resp_tx)
+                        .await
+                        .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?;
+                    let result = resp_rx
+                        .await
+                        .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
+                        .map_err(wt_from_upstream_error);
+                    if result.is_ok() {
+                        metrics.stream_open_histogram.observe(start.elapsed());
+                    }
+                    result
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn wait_uni_capacity(&self, env: Env, timeout_ms: u32) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "uni").await })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    #[napi(ts_return_type = "Promise<ClientUniRecvHandle | null>")]
+    pub fn accept_uni_stream(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let Some((_, _, _, _, uni_rx, _, _)) = session_registry::get(&id) else {
+                        return Ok(None);
+                    };
+                    let mut rx = uni_rx.lock().await;
+                    Ok(rx.recv().await)
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
     #[napi]
