@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "kind": "command",
+  "name": "native-local-gates",
+  "commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+  "platform": {
+    "os": "darwin",
+    "arch": "arm64",
+    "runtime": "bun"
+  },
+  "toolchain": {
+    "name": "bun",
+    "version": "1.3.14"
+  },
+  "command": [
+    "env",
+    "WEBTRANSPORT_COLD_LOOP_COUNT=1",
+    "bun",
+    "run",
+    "test:packages:cold-loop"
+  ],
+  "exitCode": 0,
+  "startedAt": "2026-07-26T19:48:14.099Z",
+  "finishedAt": "2026-07-26T19:50:46.452Z",
+  "artifactSha256": "8ac89491d89b00b797c32f9dd3cbb1dd40731b1755627183dc769974c256aa62"
+}
