@@ -1,0 +1,107 @@
+{
+	"schemaVersion": 1,
+	"status": "failed",
+	"failures": [
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/limits.rs: line coverage 79.57% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/limits.rs: function coverage 52.63% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/limits.rs: branch coverage 61.54% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/server.rs: line coverage 11.00% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/server.rs: function coverage 5.00% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/server.rs: branch coverage 33.33% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/session.rs: line coverage 0.00% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/session.rs: function coverage 0.00% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/session.rs: branch coverage 0.00% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/spawn_tracked.rs: line coverage 69.63% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/spawn_tracked.rs: function coverage 84.00% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/native/src/spawn_tracked.rs: branch coverage 45.83% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/governor.rs: branch coverage 79.55% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/endpoint.rs: line coverage 86.52% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/endpoint.rs: function coverage 86.42% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/endpoint.rs: branch coverage 70.99% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/cert.rs: function coverage 60.00% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/cert.rs: branch coverage 0.00% < required 80.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/verify.rs: line coverage 89.22% < required 90.00%",
+		"/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/crates/wasm/src/verify.rs: function coverage 88.00% < required 90.00%",
+		"packages/webtransport/src/wasm-webtransport.ts: line coverage 84.39% < required 90.00%",
+		"packages/webtransport/src/wasm-webtransport.ts: function coverage 78.57% < required 90.00%"
+	],
+	"observed": {
+		"native": {
+			"crates/native/src/limits.rs": {
+				"line_pct": 79.56989247311827,
+				"function_pct": 52.63157894736842,
+				"branch_pct": 61.53846153846154
+			},
+			"crates/native/src/server.rs": {
+				"line_pct": 10.996563573883162,
+				"function_pct": 5.0,
+				"branch_pct": 33.33333333333333
+			},
+			"crates/native/src/session.rs": {
+				"line_pct": 0.0,
+				"function_pct": 0.0,
+				"branch_pct": 0.0
+			},
+			"crates/native/src/spawn_tracked.rs": {
+				"line_pct": 69.63350785340315,
+				"function_pct": 84.0,
+				"branch_pct": 45.83333333333333
+			}
+		},
+		"wasm": {
+			"crates/wasm/src/governor.rs": {
+				"line_pct": 96.00307455803228,
+				"function_pct": 95.77464788732394,
+				"branch_pct": 79.54545454545455
+			},
+			"crates/wasm/src/h3.rs": {
+				"line_pct": 99.06832298136646,
+				"function_pct": 100.0,
+				"branch_pct": 88.23529411764706
+			},
+			"crates/wasm/src/endpoint.rs": {
+				"line_pct": 86.52309829802014,
+				"function_pct": 86.41975308641975,
+				"branch_pct": 70.99447513812154
+			},
+			"crates/wasm/src/cert.rs": {
+				"line_pct": 91.07142857142857,
+				"function_pct": 60.0,
+				"branch_pct": 0.0
+			},
+			"crates/wasm/src/verify.rs": {
+				"line_pct": 89.22413793103449,
+				"function_pct": 88.0,
+				"branch_pct": 83.33333333333334
+			}
+		},
+		"bun": {
+			"packages/webtransport/src/backend.ts": {
+				"line_pct": 97.79693486590038,
+				"function_pct": 95.95959595959596
+			},
+			"packages/webtransport/src/backend-wasm.ts": {
+				"line_pct": 100.0,
+				"function_pct": 95.1219512195122
+			},
+			"packages/webtransport/src/wasm-webtransport.ts": {
+				"line_pct": 84.38538205980066,
+				"function_pct": 78.57142857142857
+			}
+		}
+	},
+	"toolchain": {
+		"rustCoverage": "nightly (required for --branch)",
+		"cargoLlvmCov": "0.8.7",
+		"bun": "1.3.14"
+	},
+	"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+	"sourceCommit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+	"command": [
+		"cargo +nightly llvm-cov --workspace --branch --json --output-path coverage/native-coverage.json",
+		"cargo +nightly llvm-cov --manifest-path crates/wasm/Cargo.toml --branch --json --output-path coverage/wasm-coverage.json",
+		"bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage/bun packages/",
+		"python3 enforce-floors (from coverage.yml)"
+	],
+	"notes": "Local coverage attempt on darwin/arm64. Stable 1.95.0 cannot use --branch (needs -Z); used nightly for branch instrumentation. Floors failed; claim stays pending."
+}
