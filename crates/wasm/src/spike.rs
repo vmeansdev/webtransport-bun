@@ -55,10 +55,13 @@ pub(crate) fn server_crypto() -> Result<(rustls::ServerConfig, Vec<u8>), String>
     Ok((cfg, cert_der))
 }
 
-/// Dangerous verifier: accept any cert. Spike only — the real backend pins by hash.
+/// Dangerous verifier: accept any cert. Compiled only for `dev-insecure` builds
+/// and native unit tests — production/dist wasm omits this type entirely.
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
 #[derive(Debug)]
 pub(crate) struct AcceptAny;
 
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
 impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     fn verify_server_cert(
         &self,
@@ -93,6 +96,8 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     }
 }
 
+/// Accept-any client crypto for tests / `dev-insecure` only.
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
 pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -103,6 +108,12 @@ pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h3".to_vec()];
     Ok(cfg)
+}
+
+/// Production/dist builds: accept-any client crypto is unavailable.
+#[cfg(not(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32")))))]
+pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
+    Err("E_INTERNAL: accept-any client crypto unavailable; use hash-pinned wt_new_client".into())
 }
 
 /// Route every transmit a connection wants to send into a flat list of payloads.

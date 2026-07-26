@@ -67,8 +67,10 @@ MODE="${1:-pkg}"
 if [ "$MODE" = "pkg" ]; then
   "${CARGO[@]}" build --release --target wasm32-unknown-unknown --features dev-insecure
 else
-  # macOS ships Bash 3.2, where expanding an empty array under `set -u`
-  # terminates the script. Keep the production build argument-free instead.
+  # Production/dist: never enable dev-insecure. Set wt_ship_production so a
+  # mistaken --features dev-insecure becomes a compile_error (inert under
+  # cargo test --all-features, which does not set this cfg).
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg wt_ship_production"
   "${CARGO[@]}" build --release --target wasm32-unknown-unknown
 fi
 WASM=target/wasm32-unknown-unknown/release/webtransport_wasm.wasm
