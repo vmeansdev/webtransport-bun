@@ -1238,21 +1238,28 @@ fn parse_server_certificate_hashes(
                 algorithm
             ));
         }
-        let value_b64 = entry
-            .get("valueBase64")
-            .and_then(|v| v.as_str())
+        let value = entry
+            .get("value")
+            .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                "E_INTERNAL: serverCertificateHashes entry value must be base64".to_string()
+                "E_INTERNAL: serverCertificateHashes entry value must be a byte-array".to_string()
             })?;
-        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value_b64)
-            .map_err(|_| "E_INTERNAL: invalid base64 in serverCertificateHashes".to_string())?;
-        if decoded.len() != 32 {
+        if value.len() != 32 {
             return Err(
                 "E_INTERNAL: serverCertificateHashes value must be 32-byte SHA-256".to_string(),
             );
         }
         let mut pin = [0u8; 32];
-        pin.copy_from_slice(&decoded);
+        for (i, entry) in value.iter().enumerate() {
+            let byte = entry
+                .as_u64()
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or_else(|| {
+                    "E_INTERNAL: serverCertificateHashes entry value must be a byte-array"
+                        .to_string()
+                })?;
+            pin[i] = byte;
+        }
         out.push(pin);
     }
     Ok(out)
