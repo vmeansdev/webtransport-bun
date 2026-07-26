@@ -24,6 +24,8 @@ commit-bound passing evidence.
 
 - Addon is built with napi-rs (Node-API). Avoid unstable N-API features.
 - Runtime portability is provided through Node-API loading in Bun, Node, and Deno.
+- **Native engine:** `wtransport =0.7.0` (pinned). Pre-1.0, single-maintainer —
+  see `SUPPORT.md`.
 
 ## WASM backend (`@webtransport-bun/webtransport/wasm`)
 
