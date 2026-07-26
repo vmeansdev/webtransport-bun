@@ -243,7 +243,7 @@ describe("hardening regressions", () => {
 						const c = await connectWithRetry(
 							`https://127.0.0.1:${port}`,
 							INSECURE,
-							8000,
+							4000,
 						);
 						c.close();
 					}),
