@@ -1,0 +1,258 @@
+{
+	"config": {
+		"configFile": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/playwright.wasm.config.ts",
+		"rootDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/tests-wasm",
+		"forbidOnly": false,
+		"fullyParallel": false,
+		"globalSetup": null,
+		"globalTeardown": null,
+		"globalTimeout": 0,
+		"grep": {},
+		"grepInvert": null,
+		"maxFailures": 0,
+		"metadata": {
+			"actualWorkers": 1
+		},
+		"preserveOutput": "always",
+		"projects": [
+			{
+				"outputDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/test-results",
+				"repeatEach": 1,
+				"retries": 0,
+				"metadata": {
+					"actualWorkers": 1
+				},
+				"id": "chromium-webtransport-wasm",
+				"name": "chromium-webtransport-wasm",
+				"testDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/tests-wasm",
+				"testIgnore": [],
+				"testMatch": [
+					"**/*.@(spec|test).?(c|m)[jt]s?(x)"
+				],
+				"timeout": 30000
+			}
+		],
+		"quiet": false,
+		"reporter": [
+			[
+				"list",
+				null
+			],
+			[
+				"json",
+				{
+					"outputFile": "interop-evidence-wasm.json"
+				}
+			]
+		],
+		"reportSlowTests": {
+			"max": 5,
+			"threshold": 300000
+		},
+		"runAgents": "none",
+		"shard": null,
+		"tags": [],
+		"updateSnapshots": "missing",
+		"updateSourceMethod": "patch",
+		"version": "1.58.2",
+		"workers": 5,
+		"webServer": {
+			"command": "WT_IDLE_TIMEOUT_MS=60000 bun run wasm-server.ts",
+			"cwd": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop",
+			"url": "http://127.0.0.1:4436",
+			"reuseExistingServer": false,
+			"timeout": 30000
+		}
+	},
+	"suites": [
+		{
+			"title": "wasm-server.spec.ts",
+			"file": "wasm-server.spec.ts",
+			"column": 0,
+			"line": 0,
+			"specs": [
+				{
+					"title": "execution identity is WASM under Bun",
+					"ok": true,
+					"tags": [],
+					"tests": [
+						{
+							"timeout": 30000,
+							"annotations": [],
+							"expectedStatus": "passed",
+							"projectId": "chromium-webtransport-wasm",
+							"projectName": "chromium-webtransport-wasm",
+							"results": [
+								{
+									"workerIndex": 0,
+									"parallelIndex": 0,
+									"status": "passed",
+									"duration": 69,
+									"errors": [],
+									"stdout": [],
+									"stderr": [],
+									"retry": 0,
+									"startTime": "2026-07-26T20:14:10.279Z",
+									"annotations": [],
+									"attachments": []
+								}
+							],
+							"status": "expected"
+						}
+					],
+					"id": "ebf16ecba1e6da880b33-c000edcb249389ea51c6",
+					"file": "wasm-server.spec.ts",
+					"line": 41,
+					"column": 1
+				},
+				{
+					"title": "datagram echo via native WebTransport -> wasm server",
+					"ok": true,
+					"tags": [],
+					"tests": [
+						{
+							"timeout": 30000,
+							"annotations": [],
+							"expectedStatus": "passed",
+							"projectId": "chromium-webtransport-wasm",
+							"projectName": "chromium-webtransport-wasm",
+							"results": [
+								{
+									"workerIndex": 0,
+									"parallelIndex": 0,
+									"status": "passed",
+									"duration": 72,
+									"errors": [],
+									"stdout": [],
+									"stderr": [],
+									"retry": 0,
+									"startTime": "2026-07-26T20:14:11.071Z",
+									"annotations": [],
+									"attachments": []
+								}
+							],
+							"status": "expected"
+						}
+					],
+					"id": "ebf16ecba1e6da880b33-8a2cc84dd41223dd007f",
+					"file": "wasm-server.spec.ts",
+					"line": 65,
+					"column": 1
+				},
+				{
+					"title": "bidi stream echo via native WebTransport -> wasm server",
+					"ok": true,
+					"tags": [],
+					"tests": [
+						{
+							"timeout": 30000,
+							"annotations": [],
+							"expectedStatus": "passed",
+							"projectId": "chromium-webtransport-wasm",
+							"projectName": "chromium-webtransport-wasm",
+							"results": [
+								{
+									"workerIndex": 0,
+									"parallelIndex": 0,
+									"status": "passed",
+									"duration": 66,
+									"errors": [],
+									"stdout": [],
+									"stderr": [],
+									"retry": 0,
+									"startTime": "2026-07-26T20:14:11.151Z",
+									"annotations": [],
+									"attachments": []
+								}
+							],
+							"status": "expected"
+						}
+					],
+					"id": "ebf16ecba1e6da880b33-7aac44ee8318ff786663",
+					"file": "wasm-server.spec.ts",
+					"line": 120,
+					"column": 1
+				},
+				{
+					"title": "unidirectional stream echo via native WebTransport -> wasm server",
+					"ok": true,
+					"tags": [],
+					"tests": [
+						{
+							"timeout": 30000,
+							"annotations": [],
+							"expectedStatus": "passed",
+							"projectId": "chromium-webtransport-wasm",
+							"projectName": "chromium-webtransport-wasm",
+							"results": [
+								{
+									"workerIndex": 0,
+									"parallelIndex": 0,
+									"status": "passed",
+									"duration": 64,
+									"errors": [],
+									"stdout": [],
+									"stderr": [],
+									"retry": 0,
+									"startTime": "2026-07-26T20:14:11.224Z",
+									"annotations": [],
+									"attachments": []
+								}
+							],
+							"status": "expected"
+						}
+					],
+					"id": "ebf16ecba1e6da880b33-fd2dd68a7eea964af923",
+					"file": "wasm-server.spec.ts",
+					"line": 177,
+					"column": 1
+				},
+				{
+					"title": "eight consecutive Chromium reconnects complete against the WASM server",
+					"ok": true,
+					"tags": [],
+					"tests": [
+						{
+							"timeout": 30000,
+							"annotations": [],
+							"expectedStatus": "passed",
+							"projectId": "chromium-webtransport-wasm",
+							"projectName": "chromium-webtransport-wasm",
+							"results": [
+								{
+									"workerIndex": 0,
+									"parallelIndex": 0,
+									"status": "passed",
+									"duration": 156,
+									"errors": [],
+									"stdout": [],
+									"stderr": [],
+									"retry": 0,
+									"startTime": "2026-07-26T20:14:11.295Z",
+									"annotations": [],
+									"attachments": []
+								}
+							],
+							"status": "expected"
+						}
+					],
+					"id": "ebf16ecba1e6da880b33-9cb79070be9518fb3c65",
+					"file": "wasm-server.spec.ts",
+					"line": 241,
+					"column": 1
+				}
+			]
+		}
+	],
+	"errors": [],
+	"stats": {
+		"startTime": "2026-07-26T20:14:09.176Z",
+		"duration": 2317.8070000000002,
+		"expected": 5,
+		"skipped": 0,
+		"unexpected": 0,
+		"flaky": 0
+	},
+	"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+	"sourceCommit": "19acc308ab01a789a831a49aa9cf98afc50eefd4"
+}
