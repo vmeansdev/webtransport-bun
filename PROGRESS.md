@@ -24,7 +24,7 @@ not `release/1.0-hardening`).
 | D3 | partial | scale-10k retained pending with note (not falsely passed) |
 | D4 | complete | `scripts/promote-release-status.ts` refuses without evidence |
 | E | partial | SUPPORT.md + wtransport disclosure; SPEC generator (E2) not built |
-| Evidence bind | **partial (local, no Actions)** | 8/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
+| Evidence bind | **partial (local, no Actions)** | 9/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
 
 ## Local verification (this worktree)
 
@@ -46,11 +46,12 @@ not `release/1.0-hardening`).
 - `supply-chain-provenance`
 - `chromium-native-interop` (Playwright 19/19 darwin)
 - `fault-matrix`
+- `iwa-direct-sockets` (system Chrome 150 IWA proof)
 - `chromium-wasm-interop` (Playwright wasm 5/5 darwin)
 
 ## What still blocks readiness=ready
 
-1. Remaining commit-bound claims: interop, IWA, coverage, fuzz campaign (Linux),
+1. Remaining commit-bound claims: coverage, fuzz campaign (Linux),
    cross-platform matrix, soaks, review, final no-change.
 2. Soak 24h/72h (honest-release marked soak out of scope as evidence; still in release-status).
 3. Eight-lane zero P0–P4 review + final no-change confirmation.
@@ -61,7 +62,7 @@ not `release/1.0-hardening`).
 Native Playwright suite is **19/19** on darwin after the interop addon emits
 application idle close `3990`/`E_SESSION_IDLE_TIMEOUT` (Chromium may still
 surface `Connection lost` client-side; server close-events are asserted).
-IWA, coverage, fuzz (Linux), matrix, soaks, review remain pending.
+Coverage, fuzz (Linux), cross-platform matrix, soaks, review remain pending.
 
 GitHub Actions are unavailable for now; continue generating local/Linux evidence
 and binding under `docs/release-evidence/<commit>/` rather than waiting on CI
