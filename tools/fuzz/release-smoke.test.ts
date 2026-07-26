@@ -32,6 +32,9 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(source).toContain("cargoFuzzTargets");
 		expect(source).toContain("-max_total_time=");
 		expect(source).toContain("-artifact_prefix=");
+		expect(source).toContain("--fuzz-dir");
+		expect(source).toContain("--sanitizer");
+		expect(source).toContain("none");
 		expect(source).toContain(".release-evidence");
 		expect(source).toContain("corpora");
 		expect(source).toContain("rustup run");
