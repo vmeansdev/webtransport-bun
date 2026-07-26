@@ -3,15 +3,54 @@ import { Duplex } from "node:stream";
 import {
 	__TESTING__,
 	E_INTERNAL,
+	E_BACKPRESSURE_TIMEOUT,
+	E_HANDSHAKE_TIMEOUT,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_RATE_LIMITED,
+	E_QUEUE_FULL,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
 	E_STOP_SENDING,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransport,
 	WebTransportError,
 } from "../src/index.js";
 import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
 
 describe("internal TS error propagation", () => {
+	it("native error parser only recognizes enumerated stable codes", async () => {
+		expect(__TESTING__.nativeErrorCodes).toEqual([
+			E_TLS,
+			E_HANDSHAKE_TIMEOUT,
+			E_SESSION_CLOSED,
+			E_SESSION_IDLE_TIMEOUT,
+			E_STREAM_RESET,
+			E_STOP_SENDING,
+			E_QUEUE_FULL,
+			E_BACKPRESSURE_TIMEOUT,
+			E_LIMIT_EXCEEDED,
+			E_RATE_LIMITED,
+			E_INVALID_ARGUMENT,
+			E_UNSUPPORTED_ARGUMENT,
+			E_INTERNAL,
+		]);
+
+		const session = __TESTING__.createNativeClientSessionForTests({
+			sendDatagram: async () => {
+				throw new Error("E_HANDSHAKE_TIMEOUTX: not a real code");
+			},
+			close: () => {},
+		});
+		await expect(
+			session.sendDatagram(new Uint8Array([1])),
+		).rejects.toMatchObject({
+			code: E_INTERNAL,
+		});
+	});
+
 	it("NativeClientSession.incomingDatagrams propagates non-close errors", async () => {
 		const session = __TESTING__.createNativeClientSessionForTests({
 			readDatagram: async () => {

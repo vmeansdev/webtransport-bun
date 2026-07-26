@@ -11,6 +11,11 @@ import {
 	type WasmSessionEvents,
 } from "./backend-wasm.js";
 import { createMonotonicDeadline } from "./deadline.js";
+import type {
+	ErrorCode,
+	WasmNormalizedRateLimits,
+	WasmRateLimitOptions,
+} from "./types.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
@@ -23,9 +28,9 @@ import {
 	E_STOP_SENDING,
 	E_STREAM_RESET,
 	E_TLS,
-	type ErrorCode,
 	WebTransportError,
 } from "./errors.js";
+export type { WasmRateLimitOptions } from "./types.js";
 import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import { WasmWebTransport } from "./wasm-webtransport.js";
@@ -46,15 +51,6 @@ export type WasmLimitsOptions = {
 	backpressureTimeoutMs?: number;
 	handshakeTimeoutMs?: number;
 	idleTimeoutMs?: number;
-};
-
-export type WasmRateLimitOptions = {
-	handshakesPerSec?: number;
-	handshakesBurst?: number;
-	streamOpensPerSec?: number;
-	streamOpensBurst?: number;
-	datagramsIngressPerSec?: number;
-	datagramsIngressBurst?: number;
 };
 
 export const DEFAULT_WASM_LIMITS = {
@@ -84,9 +80,7 @@ export const DEFAULT_WASM_RATE_LIMITS = {
 export type WasmNormalizedLimits = {
 	[K in keyof typeof DEFAULT_WASM_LIMITS]: number;
 };
-export type WasmNormalizedRateLimits = {
-	[K in keyof typeof DEFAULT_WASM_RATE_LIMITS]: number;
-};
+export type { WasmNormalizedRateLimits } from "./types.js";
 
 export type WasmEndpointOptions = {
 	limits?: WasmLimitsOptions;

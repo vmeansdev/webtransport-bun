@@ -44,16 +44,16 @@ async function connectWithRetry(
 }
 
 describe("TLS contract (P0.3)", () => {
-	it("connect() validates serverCertificateHashes (base64 shape) before dialing", async () => {
+	it("connect() validates serverCertificateHashes (BufferSource shape) before dialing", async () => {
 		// Empty array = silent pinning downgrade.
 		await expect(
 			connect("https://127.0.0.1:65530", { serverCertificateHashes: [] }),
 		).rejects.toThrow(/must be a non-empty array/);
-		// Wrong decoded length (2 bytes, not 32).
+		// Wrong byte length (2 bytes, not 32).
 		await expect(
 			connect("https://127.0.0.1:65530", {
 				serverCertificateHashes: [
-					{ algorithm: "sha-256", valueBase64: "AAA=" },
+					{ algorithm: "sha-256", value: new Uint8Array(2) },
 				],
 			}),
 		).rejects.toThrow(/must be exactly 32 bytes/);
@@ -63,7 +63,7 @@ describe("TLS contract (P0.3)", () => {
 				serverCertificateHashes: [
 					{
 						algorithm: "sha-384" as "sha-256",
-						valueBase64: Buffer.alloc(32).toString("base64"),
+						value: new Uint8Array(32),
 					},
 				],
 			}),
@@ -908,7 +908,7 @@ describe("TLS contract (P0.3)", () => {
 		// Hash the leaf (first PEM block), the cert the server actually presents.
 		const leafPem = `${shortCert.certPem.split("-----END CERTIFICATE-----")[0]}-----END CERTIFICATE-----\n`;
 		const der = new X509Certificate(leafPem).raw;
-		const valueBase64 = createHash("sha256").update(der).digest("base64");
+		const value = new Uint8Array(createHash("sha256").update(der).digest());
 		const port = nextPort(24460, 2000);
 		const server = createServer({
 			port,
@@ -918,7 +918,7 @@ describe("TLS contract (P0.3)", () => {
 		try {
 			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
 				tls: { serverName: "localhost" },
-				serverCertificateHashes: [{ algorithm: "sha-256", valueBase64 }],
+				serverCertificateHashes: [{ algorithm: "sha-256", value }],
 			});
 			expect(client.id).toBeDefined();
 			client.close();
