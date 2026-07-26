@@ -70,7 +70,8 @@
 			"id": "scale-10k-multisource",
 			"surface": "release",
 			"status": "pending",
-			"evidenceIds": []
+			"evidenceIds": [],
+			"notes": "Honest-release D3: claim retained as pending instrumentation target; not a 1.0 GA blocker while tools/load/distributed-scale.ts exists. Retire or rename only after promote-release-status policy update."
 		},
 		{
 			"id": "package-artifact",
