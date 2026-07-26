@@ -70,6 +70,24 @@ describe("internal TS error propagation", () => {
 		});
 	});
 
+	it("native error parser strips Bun GenericFailure prefix and prefers causal codes", () => {
+		expect(
+			__TESTING__.extractMessageErrorCodeForTests(
+				"GenericFailure, E_RATE_LIMITED: E_RATE_LIMITED: server rejected",
+			),
+		).toBe(E_RATE_LIMITED);
+		expect(
+			__TESTING__.extractMessageErrorCodeForTests(
+				"GenericFailure, E_SESSION_CLOSED: connection closed by peer: E_LIMIT_EXCEEDED (code 3992)",
+			),
+		).toBe(E_LIMIT_EXCEEDED);
+		expect(
+			__TESTING__.extractMessageErrorCodeForTests(
+				"E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out",
+			),
+		).toBe(E_BACKPRESSURE_TIMEOUT);
+	});
+
 	it("NativeClientSession.incomingDatagrams propagates non-close errors", async () => {
 		const session = __TESTING__.createNativeClientSessionForTests({
 			readDatagram: async () => {

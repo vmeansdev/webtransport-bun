@@ -111,6 +111,10 @@ type BufferSource = ArrayBuffer | ArrayBufferView;
 type StreamOpenOptions = { waitUntilAvailable?: boolean };
 
 const E_CODE_RE = /^(E_[A-Z_]+)(?::|$)/;
+/** Bun/Node often stringify napi errors as `GenericFailure, E_CODE: …`. */
+const NAPI_STATUS_PREFIX_RE =
+	/^(?:GenericFailure|Cancelled|InvalidArg|ObjectExpected|StringExpected|FunctionExpected|NumberExpected|BooleanExpected|ArrayExpected|Unknown|PendingException|EscapeCalledTwice|HandleScopeMismatch|CallbackScopeMismatch|QueueFull|Closing|BigintExpected|DateExpected|ArrayBufferExpected|DetachableArraybufferExpected|WouldDeadlock),\s*/u;
+const E_CODE_TOKEN_RE = /\b(E_[A-Z_]+)\b/gu;
 const KNOWN_ERROR_CODES = [
 	E_TLS,
 	E_HANDSHAKE_TIMEOUT,
@@ -127,6 +131,8 @@ const KNOWN_ERROR_CODES = [
 	E_INTERNAL,
 ] as const satisfies readonly ErrorCode[];
 const KNOWN_ERROR_CODE_SET = new Set<ErrorCode>(KNOWN_ERROR_CODES);
+/** Wrapper codes that may nest a more specific causal E_* in the same message. */
+const WRAPPER_ERROR_CODES = new Set<ErrorCode>([E_SESSION_CLOSED, E_INTERNAL]);
 const SUPPRESS_LOG_CALLBACK_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
 const SUPPRESS_READY_REJECTION_WARN =
@@ -178,6 +184,31 @@ function createMappedError(
 	);
 }
 
+function knownCodeOrUndefined(
+	value: string | undefined,
+): ErrorCode | undefined {
+	return value && KNOWN_ERROR_CODE_SET.has(value as ErrorCode)
+		? (value as ErrorCode)
+		: undefined;
+}
+
+/**
+ * Extract a stable E_* from native/Bun error text. Prefers a causal code when a
+ * wrapper like E_SESSION_CLOSED nests `connection closed by peer: E_LIMIT_EXCEEDED`.
+ */
+function extractMessageErrorCode(msg: string): ErrorCode | undefined {
+	const withoutStatus = msg.replace(NAPI_STATUS_PREFIX_RE, "");
+	const startCode = knownCodeOrUndefined(withoutStatus.match(E_CODE_RE)?.[1]);
+	const tokens = [...withoutStatus.matchAll(E_CODE_TOKEN_RE)]
+		.map((m) => knownCodeOrUndefined(m[1]))
+		.filter((c): c is ErrorCode => c != null);
+	const causal = [...tokens].reverse().find((c) => !WRAPPER_ERROR_CODES.has(c));
+	if (startCode && WRAPPER_ERROR_CODES.has(startCode) && causal) {
+		return causal;
+	}
+	return startCode ?? causal ?? tokens[0];
+}
+
 function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
@@ -195,14 +226,8 @@ function toWebTransportError(
 	if (knownExplicitCode) {
 		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
 	}
-	const messageCodeMatch = msg.match(E_CODE_RE);
-	const messageCode =
-		messageCodeMatch &&
-		KNOWN_ERROR_CODE_SET.has(messageCodeMatch[1] as ErrorCode)
-			? (messageCodeMatch[1] as ErrorCode)
-			: undefined;
 	return createMappedError(
-		messageCode ?? (E_INTERNAL as ErrorCode),
+		extractMessageErrorCode(msg) ?? (E_INTERNAL as ErrorCode),
 		msg,
 		strictW3CErrors,
 	);
@@ -1191,14 +1216,13 @@ class NativeServerSession implements ServerSession {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeWaitBidiCapacity = this.#nativeHandle.waitBidiCapacity;
 			const nativeStream = (await openStreamWithWait(
 				() => this.#nativeHandle.createBidiStream(),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof nativeWaitBidiCapacity === "function"
-					? (remainingMs) => nativeWaitBidiCapacity(remainingMs)
+				typeof this.#nativeHandle.waitBidiCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
 					: undefined,
 			)) as any;
 			return new BidiStream({
@@ -1226,14 +1250,13 @@ class NativeServerSession implements ServerSession {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeWaitUniCapacity = this.#nativeHandle.waitUniCapacity;
 			const nativeStream = (await openStreamWithWait(
 				() => this.#nativeHandle.createUniStream(),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof nativeWaitUniCapacity === "function"
-					? (remainingMs) => nativeWaitUniCapacity(remainingMs)
+				typeof this.#nativeHandle.waitUniCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
 					: undefined,
 			)) as any;
 			return new SendStream({
@@ -1603,14 +1626,13 @@ class NativeClientSession implements ClientSession {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeWaitBidiCapacity = this.#nativeHandle.waitBidiCapacity;
 			const nativeStream = (await openStreamWithWait(
 				() => this.#nativeHandle.createBidiStream(),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof nativeWaitBidiCapacity === "function"
-					? (remainingMs) => nativeWaitBidiCapacity(remainingMs)
+				typeof this.#nativeHandle.waitBidiCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
 					: createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
@@ -1645,14 +1667,13 @@ class NativeClientSession implements ClientSession {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
-			const nativeWaitUniCapacity = this.#nativeHandle.waitUniCapacity;
 			const nativeStream = (await openStreamWithWait(
 				() => this.#nativeHandle.createUniStream(),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof nativeWaitUniCapacity === "function"
-					? (remainingMs) => nativeWaitUniCapacity(remainingMs)
+				typeof this.#nativeHandle.waitUniCapacity === "function"
+					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
 					: createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
@@ -3093,6 +3114,7 @@ export const __TESTING__ = {
 		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
 	nativeErrorCodes: KNOWN_ERROR_CODES,
+	extractMessageErrorCodeForTests: extractMessageErrorCode,
 };
 
 /**
