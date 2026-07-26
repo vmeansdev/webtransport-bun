@@ -24,9 +24,11 @@ no separate job:
 
 Release fuzzing now runs through `tools/fuzz/release-smoke.ts` using
 `rustup run 1.95.0 ...` as declared in `.github/release-toolchain.json`. The
-runner requires `cargo-fuzz` plus `llvm-symbolizer` from the pinned toolchain's
-`llvm-tools-preview` component so crash artifacts stay symbolized and
-actionable.
+runner requires `cargo-fuzz` plus `llvm-symbolizer` (pinned toolchain
+`llvm-tools-preview` when present, otherwise PATH / Homebrew LLVM) so crash
+artifacts stay symbolized and actionable. Invocations use `--fuzz-dir .` and
+`--sanitizer none` because this directory *is* the fuzz package and the pinned
+stable toolchain cannot build with AddressSanitizer.
 
 ## JS boundary
 

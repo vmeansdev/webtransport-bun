@@ -109,16 +109,32 @@ function resolveLlvmSymbolizer(toolchain: string): string | null {
 		toolchainCommand(toolchain, "rustc", "--print", "sysroot"),
 	);
 	const host = rustHostTriple(toolchain);
-	if (!sysroot.ok || !host) return null;
-	const path = resolve(
-		sysroot.stdout.trim(),
-		"lib",
-		"rustlib",
-		host,
-		"bin",
-		"llvm-symbolizer",
-	);
-	return existsSync(path) ? path : null;
+	if (sysroot.ok && host) {
+		const toolchainPath = resolve(
+			sysroot.stdout.trim(),
+			"lib",
+			"rustlib",
+			host,
+			"bin",
+			"llvm-symbolizer",
+		);
+		if (existsSync(toolchainPath)) return toolchainPath;
+	}
+	// rustup's llvm-tools-preview on some hosts (notably current darwin) omits
+	// llvm-symbolizer; accept a PATH / Homebrew binary so crash artifacts still
+	// symbolize instead of failing the smoke as a false tooling blocker.
+	const fromPath = probe(["sh", "-c", "command -v llvm-symbolizer"]);
+	if (fromPath.ok) {
+		const resolved = fromPath.stdout.trim().split("\n")[0]?.trim();
+		if (resolved && existsSync(resolved)) return resolved;
+	}
+	for (const candidate of [
+		"/opt/homebrew/opt/llvm/bin/llvm-symbolizer",
+		"/usr/local/opt/llvm/bin/llvm-symbolizer",
+	]) {
+		if (existsSync(candidate)) return candidate;
+	}
+	return null;
 }
 
 type CollectedOutput = {
@@ -316,12 +332,19 @@ async function main() {
 		}
 		const crashDirectory = resolve(EVIDENCE_ROOT, "crashes", target.name);
 		mkdirSync(crashDirectory, { recursive: true });
+		// Match CI compile-check: this crate IS the fuzz package (`tools/fuzz`),
+		// so cargo-fuzz needs `--fuzz-dir .`. Stable 1.95.0 cannot build with
+		// AddressSanitizer (`-Zsanitizer`), so release smoke uses `--sanitizer none`.
 		const command = toolchainCommand(
 			toolchain,
 			"cargo",
 			"fuzz",
 			"run",
 			target.name,
+			"--fuzz-dir",
+			".",
+			"--sanitizer",
+			"none",
 			corpusDirectory,
 			"--",
 			`-max_total_time=${FIXED_DURATION_SECS}`,
