@@ -145,11 +145,13 @@ fn parse_rate_limits(value: &serde_json::Value) -> Result<WasmRateLimits, String
 /// Create an endpoint. Returns the numeric eid on success, or 0 on a bad
 /// address (0 is never a valid eid — allocation starts at 1).
 ///
-/// SECURITY: a CLIENT endpoint (`is_server == false`) created here accepts ANY
-/// server certificate. That insecure client path is compiled ONLY when the
-/// `dev-insecure` cargo feature is enabled; a default (production) build returns
-/// 0 for `is_server == false` and callers must use `wt_new_client` (hash
-/// pinning). Server endpoints are always available.
+/// SECURITY: a CLIENT endpoint (`is_server == false`) created here uses the
+/// accept-any TLS verifier. That path is compiled ONLY when the `dev-insecure`
+/// cargo feature is enabled (pkg/test builds). A production/dist build returns
+/// 0 for `is_server == false`; callers must use `wt_new_client` (hash pinning).
+/// Dist builds also set `RUSTFLAGS=--cfg wt_ship_production`, which
+/// `compile_error!`s if combined with `--features dev-insecure`.
+/// Server endpoints are always available.
 #[wasm_bindgen]
 pub fn wt_new_endpoint(is_server: bool, addr: &str, peer_addr: &str) -> u32 {
     // Never panic across the FFI: a wasm panic aborts and poisons REGISTRY for
@@ -202,7 +204,7 @@ pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
     if !is_server && !cfg!(feature = "dev-insecure") {
-        return serde_json::json!({ "error": "dev-insecure client path unavailable" }).to_string();
+        return serde_json::json!({ "error": "accept-any client path unavailable" }).to_string();
     }
     let ep = match WtEndpoint::new_with_limits_and_rate_limits(
         is_server,

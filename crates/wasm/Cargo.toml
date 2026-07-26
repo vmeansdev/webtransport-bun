@@ -18,6 +18,10 @@ default = []
 # clients pin by certificate hash via `wt_new_client`.
 dev-insecure = []
 
+# Dist builds set `RUSTFLAGS=--cfg wt_ship_production` (not a Cargo feature) so
+# `dev-insecure` + ship cfg is a compile error, while `cargo test --all-features`
+# stays inert (it does not set that cfg).
+
 [dependencies]
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring", "log"] }
 bytes = "1"
@@ -37,3 +41,6 @@ wasm-bindgen = "0.2"
 
 [profile.release]
 opt-level = "s"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(wt_ship_production)'] }
