@@ -34,7 +34,7 @@ because that manifest is still `pending` and has no `evidenceIds`.
 |---|---|---|---|
 | `wasm-local-gates` | `crates/wasm/src/{bridge.rs,cert.rs,endpoint.rs,event.rs,h3.rs,lib.rs,verify.rs}`; `packages/webtransport/src/{backend.ts,backend-wasm.ts,wasm-webtransport.ts,webtransport-like-wasm.ts}` | `packages/webtransport/test/{wasm-*.test.ts,parity-*.test.ts}`; `bun run test:wasm`; `bun run build:wasm` | `docs/release-status.json` → `pending`, no `evidenceIds` |
 | `chromium-wasm-interop` | `tools/interop/{tests-wasm/wasm-server.spec.ts,playwright.wasm.config.ts}` | `tools/interop/interop-evidence-wasm.json` | `docs/release-status.json` → `pending`, no commit-bound release claim yet |
-| `iwa-direct-sockets` | `examples/webtransport-wasm-iwa/{README.md,app.js,.well-known/manifest.webmanifest}`; `tools/interop/{run-iwa.mjs,tests/iwa-contract.test.ts}` | `.release-evidence/iwa/{evidence.json,evidence-chrome-beta.json,origin.txt,webtransport-wasm-iwa.wbn,webtransport-wasm-iwa.swbn}` when the workflow runs | `docs/release-status.json` → `pending`, no commit-bound release claim yet |
+| `iwa-direct-sockets` | `examples/webtransport-wasm-iwa/{README.md,app.js,.well-known/manifest.webmanifest}`; `tools/interop/run-iwa.mjs` | `.release-evidence/iwa/{evidence.json,evidence-chrome-beta.json,origin.txt,webtransport-wasm-iwa.wbn,webtransport-wasm-iwa.swbn}` when the workflow runs | `docs/release-status.json` → `pending`, no commit-bound release claim yet |
 
 ### Release-only gates
 
