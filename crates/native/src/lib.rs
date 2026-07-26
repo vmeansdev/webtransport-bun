@@ -4,6 +4,7 @@
 //! It owns a dedicated Tokio runtime thread and communicates
 //! with JS via bounded channels + ThreadsafeFunction.
 
+use crate::error::from_upstream_error as wt_from_upstream_error;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicU64;
@@ -873,9 +874,13 @@ pub(crate) fn spawn_wtransport_server(
                                                                     read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot,
                                                                 ))
                                                             }
-                                                            Err(e) => Err(e.to_string()),
+                                                            Err(e) => {
+                                                                Err(wt_from_upstream_error(e.to_string()).to_string())
+                                                            }
                                                         },
-                                                        Err(e) => Err(e.to_string()),
+                                                        Err(e) => {
+                                                            Err(wt_from_upstream_error(e.to_string()).to_string())
+                                                        }
                                                     };
                                                     if resp_tx.send(r).is_err() {
                                                         report_channel_failure("create_bidi response");
@@ -945,14 +950,22 @@ pub(crate) fn spawn_wtransport_server(
                                                                     }
                                                                 }
                                                                 Err(e) => {
-                                                                    if resp_tx.send(Err(e.to_string())).is_err() {
+                                                                    if resp_tx
+                                                                        .send(Err(
+                                                                            wt_from_upstream_error(e.to_string()).to_string(),
+                                                                        ))
+                                                                        .is_err()
+                                                                    {
                                                                         report_channel_failure("create_uni response");
                                                                     }
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            if resp_tx.send(Err(e.to_string())).is_err() {
+                                                            if resp_tx
+                                                                .send(Err(wt_from_upstream_error(e.to_string()).to_string()))
+                                                                .is_err()
+                                                            {
                                                                 report_channel_failure("create_uni response");
                                                             }
                                                         }
