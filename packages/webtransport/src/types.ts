@@ -26,6 +26,20 @@ export interface WtCloseInfo {
 	readonly reason?: string;
 }
 
+/** Optional connection stats (W3C-shaped subset). */
+export type WebTransportLikeStats = {
+	bytesSent: number;
+	bytesReceived: number;
+	packetsSent: number;
+	packetsReceived: number;
+};
+
+/**
+ * Declared members that a backend may omit. Runtime must match this set —
+ * see `WEBTRANSPORT_LIKE_OPTIONAL` test.
+ */
+export const WEBTRANSPORT_LIKE_OPTIONAL = ["getStats"] as const;
+
 /** The common WebTransport surface satisfied by both backends. */
 export interface WebTransportLike {
 	readonly ready: Promise<void>;
@@ -37,6 +51,8 @@ export interface WebTransportLike {
 	createUnidirectionalStream(): Promise<WritableStream<Uint8Array>>;
 	incomingBidirectionalStreams(): AsyncIterable<WtBidiStream>;
 	incomingUnidirectionalStreams(): AsyncIterable<ReadableStream<Uint8Array>>;
+	/** Optional: present on native and wasm facades; check with `if (t.getStats)`. */
+	getStats?(): Promise<WebTransportLikeStats>;
 }
 
 /**
