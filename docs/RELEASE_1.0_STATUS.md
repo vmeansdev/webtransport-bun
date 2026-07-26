@@ -18,8 +18,9 @@ eight-lane review, and final no-change confirmation.
 
 Each row separates implementation evidence from release verification. The
 implementation paths point at the code or tests that currently carry the claim.
-The release-verification column always defers to `docs/release-status.json`
-because that manifest is still `pending` and has no `evidenceIds`.
+The release-verification column always defers to `docs/release-status.json`.
+Readiness is still `pending`; three local claims now carry commit-bound
+`evidenceIds` under `docs/release-evidence/` while Actions are unavailable.
 
 ### Native surface
 

@@ -3,7 +3,8 @@
 **Goal:** Close remaining gaps from `docs/WASM_1.0_PLAN.md` and
 `docs/superpowers/plans/2026-07-24-1.0-honest-release.md`.
 
-**Branch tip:** see `git log -1 --oneline`
+**Branch tip:** see `git log -1 --oneline` (work continues on `feat/wasm-1.0`,
+not `release/1.0-hardening`).
 
 ## Phase ledger
 
@@ -19,22 +20,35 @@
 | C3 | complete | waitUntilAvailable accepted on wasm stream opens |
 | C4 | largely complete | A1/A2 error-code surface already landed |
 | C5–C6 | largely complete | 9 `parity-*.test.ts` suites present; further option polish is incremental |
-| D1 | partial | fuzz compile-check green locally; full release-duration campaign still pending |
+| D1 | partial | fuzz compile-check green locally; release-smoke fixed for `--fuzz-dir`/`--sanitizer none`; darwin sancov link still blocks full smoke |
 | D3 | partial | scale-10k retained pending with note (not falsely passed) |
 | D4 | complete | `scripts/promote-release-status.ts` refuses without evidence |
 | E | partial | SUPPORT.md + wtransport disclosure; SPEC generator (E2) not built |
-| Evidence bind | **blocked on CI artifacts** | 17/17 claims still `pending`; promote dry-run refuses |
+| Evidence bind | **partial (local, no Actions)** | 3/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
 
 ## Local verification (this worktree)
 
 - `bun run typecheck` + `check-doc-truth` pass
 - `bun run test:wasm` → 67/67 pass (`WEBTRANSPORT_REQUIRE_WASM=1`)
-- Non-wasm package suite → 307/307 pass after native error-parse / SessionHandle fixes
+- Packages cold-loop → 369/369 pass
+- `bun scripts/test-package-artifact.ts build` → tarball produced
 - `tools/fuzz` `cargo check --all-targets` pass (Rust 1.95.0)
+- `tools/fuzz/release-smoke.test.ts` → 9/9 pass
+
+## Bound claims (commit `36fef17…`)
+
+- `wasm-local-gates`
+- `native-local-gates` (cold-loop subset; full `test:ci-local` still open)
+- `package-artifact`
 
 ## What still blocks readiness=ready
 
-1. Commit-bound evidence artifacts for each claim (local gates, interop, IWA, coverage, fuzz campaign, package, provenance).
+1. Remaining commit-bound claims: interop, IWA, coverage, fuzz campaign (Linux),
+   provenance, cross-platform matrix, soaks, review, final no-change.
 2. Soak 24h/72h (honest-release marked soak out of scope as evidence; still in release-status).
 3. Eight-lane zero P0–P4 review + final no-change confirmation.
 4. Optional: E2 `scripts/gen-spec.ts` freshness generator.
+
+GitHub Actions are unavailable for now; continue generating local/Linux evidence
+and binding under `docs/release-evidence/<commit>/` rather than waiting on CI
+artifacts.
