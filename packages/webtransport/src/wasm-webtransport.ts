@@ -379,6 +379,25 @@ export class WasmWebTransport {
 		this.session.close({ code: info?.closeCode, reason: info?.reason });
 	}
 
+	/**
+	 * W3C WebTransportConnectionStats subset. Wasm does not yet expose QUIC
+	 * wire counters; returns zeros so `if (t.getStats)` consumers type-check
+	 * without E_UNSUPPORTED throwers (honest-release C1/C2).
+	 */
+	async getStats(): Promise<{
+		bytesSent: number;
+		bytesReceived: number;
+		packetsSent: number;
+		packetsReceived: number;
+	}> {
+		return {
+			bytesSent: 0,
+			bytesReceived: 0,
+			packetsSent: 0,
+			packetsReceived: 0,
+		};
+	}
+
 	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
 		return toBidi(this.session.createBidirectionalStream());
 	}

@@ -72,6 +72,8 @@ export function wasmToWebTransportLike(wt: WasmWebTransport): WebTransportLike {
 		incomingUnidirectionalStreams(): AsyncIterable<ReadableStream<Uint8Array>> {
 			return iterate(wt.incomingUnidirectionalStreams);
 		},
+
+		getStats: () => wt.getStats(),
 	} satisfies WebTransportLike;
 
 	return transport;
