@@ -17,8 +17,8 @@ import {
 	runChild,
 } from "../../../scripts/run-cold-loop.ts";
 import {
-	__TESTING__,
 	ensureInteropCerts,
+	__TESTING__ as INTEROP_TESTING,
 	resolvePublishedMaterialPaths,
 } from "../../../tools/interop/prepare-certs.ts";
 
@@ -108,7 +108,7 @@ describe("interop cert preparation", () => {
 			"    DNS:localhost, IP Address:127.0.0.1",
 		].join("\n");
 
-		expect(__TESTING__.isLocalhostCertificateSummary(summary)).toBe(true);
+		expect(INTEROP_TESTING.isLocalhostCertificateSummary(summary)).toBe(true);
 	});
 
 	it("accepts fallback text-mode summary output", () => {
@@ -119,7 +119,7 @@ describe("interop cert preparation", () => {
 			"        DNS:localhost, IP Address:127.0.0.1",
 		].join("\n");
 
-		expect(__TESTING__.isLocalhostCertificateSummary(summary)).toBe(true);
+		expect(INTEROP_TESTING.isLocalhostCertificateSummary(summary)).toBe(true);
 	});
 
 	it("rejects summaries missing loopback SAN entries", () => {
@@ -129,7 +129,7 @@ describe("interop cert preparation", () => {
 			"    DNS:localhost",
 		].join("\n");
 
-		expect(__TESTING__.isLocalhostCertificateSummary(summary)).toBe(false);
+		expect(INTEROP_TESTING.isLocalhostCertificateSummary(summary)).toBe(false);
 	});
 
 	it("does not clear a young ownerless prep lock", () => {
@@ -137,7 +137,7 @@ describe("interop cert preparation", () => {
 		const lockDir = join(dirname(certDir), `.${basename(certDir)}.lock`);
 		mkdirSync(lockDir, { recursive: true });
 
-		expect(__TESTING__.clearStaleLock(lockDir)).toBe(false);
+		expect(INTEROP_TESTING.clearStaleLock(lockDir)).toBe(false);
 		expect(existsSync(lockDir)).toBe(true);
 	});
 
@@ -147,11 +147,11 @@ describe("interop cert preparation", () => {
 		writeFileSync(join(stagedDir, "cert.pem"), "fake cert\n", "utf8");
 		writeFileSync(join(stagedDir, "key.pem"), "fake key\n", "utf8");
 
-		__TESTING__.publishAtomically(certDir, stagedDir);
+		INTEROP_TESTING.publishAtomically(certDir, stagedDir);
 
-		const currentPath = __TESTING__.getCurrentGenerationPath(certDir);
+		const currentPath = INTEROP_TESTING.getCurrentGenerationPath(certDir);
 		const generation = readFileSync(currentPath, "utf8").trim();
-		const material = __TESTING__.resolvePublishedMaterialPaths(certDir);
+		const material = INTEROP_TESTING.resolvePublishedMaterialPaths(certDir);
 
 		expect(generation).toContain("generation-");
 		expect(material.certPath).toContain(generation);
@@ -168,7 +168,7 @@ describe("interop cert preparation", () => {
 
 		await ensureInteropCerts();
 
-		const currentPath = __TESTING__.getCurrentGenerationPath(certDir);
+		const currentPath = INTEROP_TESTING.getCurrentGenerationPath(certDir);
 		const generation = readFileSync(currentPath, "utf8").trim();
 		const material = resolvePublishedMaterialPaths(certDir);
 		const keySummary = execFileSync(
@@ -180,7 +180,7 @@ describe("interop cert preparation", () => {
 		expect(generation).toContain("generation-");
 		expect(material.certPath).toContain(generation);
 		expect(keySummary).toMatch(/ASN1 OID: prime256v1|NIST CURVE: P-256/);
-		expect(__TESTING__.hasValidMaterial(certDir)).toBe(true);
+		expect(INTEROP_TESTING.hasValidMaterial(certDir)).toBe(true);
 	});
 
 	it("defaults release loops to ten iterations and gives interop runs fresh state", () => {

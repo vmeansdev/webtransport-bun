@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { __TESTING__ } from "../src/index.js";
+import { __TESTING__ } from "../src/internal.js";
 
 describe("internal native addon loader", () => {
 	it("records candidate-specific root causes when load fails", () => {

@@ -4,6 +4,7 @@
 		"noEmit": false,
 		"declaration": true,
 		"declarationMap": true,
+		"stripInternal": true,
 		"outDir": "dist",
 		"rootDir": "src",
 		"module": "NodeNext",
@@ -13,5 +14,5 @@
 		"allowImportingTsExtensions": false
 	},
 	"include": ["src/**/*.ts"],
-	"exclude": ["test/**", "**/*.test.ts"]
+	"exclude": ["test/**", "**/*.test.ts", "src/internal.ts"]
 }

@@ -110,7 +110,7 @@ import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 type BufferSource = ArrayBuffer | ArrayBufferView;
 type StreamOpenOptions = { waitUntilAvailable?: boolean };
 
-const E_CODE_RE = /E_[A-Z_]+/g;
+const E_CODE_RE = /^(E_[A-Z_]+)(?::|$)/;
 const KNOWN_ERROR_CODES = [
 	E_TLS,
 	E_HANDSHAKE_TIMEOUT,
@@ -126,6 +126,7 @@ const KNOWN_ERROR_CODES = [
 	E_UNSUPPORTED_ARGUMENT,
 	E_INTERNAL,
 ] as const satisfies readonly ErrorCode[];
+const KNOWN_ERROR_CODE_SET = new Set<ErrorCode>(KNOWN_ERROR_CODES);
 const SUPPRESS_LOG_CALLBACK_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
 const SUPPRESS_READY_REJECTION_WARN =
@@ -181,12 +182,30 @@ function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
 ): WebTransportError {
+	const explicitCode =
+		err && typeof err === "object"
+			? (err as { code?: unknown }).code
+			: undefined;
+	const knownExplicitCode =
+		typeof explicitCode === "string" &&
+		KNOWN_ERROR_CODE_SET.has(explicitCode as ErrorCode)
+			? (explicitCode as ErrorCode)
+			: undefined;
 	const msg = err instanceof Error ? err.message : String(err);
-	const code =
-		KNOWN_ERROR_CODES.find(
-			(candidate) => msg === candidate || msg.startsWith(`${candidate}:`),
-		) ?? (E_INTERNAL as ErrorCode);
-	return createMappedError(code, msg, strictW3CErrors);
+	if (knownExplicitCode) {
+		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
+	}
+	const messageCodeMatch = msg.match(E_CODE_RE);
+	const messageCode =
+		messageCodeMatch &&
+		KNOWN_ERROR_CODE_SET.has(messageCodeMatch[1] as ErrorCode)
+			? (messageCodeMatch[1] as ErrorCode)
+			: undefined;
+	return createMappedError(
+		messageCode ?? (E_INTERNAL as ErrorCode),
+		msg,
+		strictW3CErrors,
+	);
 }
 
 function isSessionCloseError(err: unknown): boolean {
@@ -565,9 +584,11 @@ export class WebTransportSendGroup {
 		this.#transport = transport;
 		this.#id = id;
 	}
+	/** @internal */
 	_getTransport(): WebTransport {
 		return this.#transport;
 	}
+	/** @internal */
 	_getId(): number {
 		return this.#id;
 	}
@@ -1651,6 +1672,7 @@ class NativeClientSession implements ClientSession {
 	}
 
 	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
 	_connectionStats(): QuicConnectionStats | null {
 		return typeof this.#nativeHandle.connectionStats === "function"
 			? (this.#nativeHandle.connectionStats() ?? null)
@@ -1658,6 +1680,7 @@ class NativeClientSession implements ClientSession {
 	}
 
 	/** Current path MTU-derived max datagram payload size, or null when unknown. */
+	/** @internal */
 	_pathMaxDatagramSize(): number | null {
 		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
 			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
@@ -2530,12 +2553,13 @@ export class WebTransport {
 		}
 	}
 
-	/** Internal: session for adapters (not part of spec) */
+	/** @internal */
 	async _getSession(): Promise<ClientSession> {
 		return this.#sessionPromise;
 	}
 
 	/** Internal: MTU-derived datagram size from the live session, if connected */
+	/** @internal */
 	_getPathMaxDatagramSize(): number | null {
 		const s = this.#session as unknown as {
 			_pathMaxDatagramSize?: () => number | null;
@@ -2544,14 +2568,17 @@ export class WebTransport {
 	}
 
 	/** Internal: state for createWritable guard (not part of spec) */
+	/** @internal */
 	_getState(): WebTransportState {
 		return this.#state;
 	}
 
+	/** @internal */
 	_isStrictW3CErrors(): boolean {
 		return this.#strictW3CErrors;
 	}
 
+	/** @internal */
 	_resolveSendPolicy(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
@@ -2580,6 +2607,7 @@ export class WebTransport {
 		return { groupId, sendOrder };
 	}
 
+	/** @internal */
 	_recordSendGroupBytes(groupId: number, bytes: number): void {
 		this.#sendGroupBytesSent.set(
 			groupId,
@@ -2587,6 +2615,7 @@ export class WebTransport {
 		);
 	}
 
+	/** @internal */
 	async _getSendGroupStats(groupId: number): Promise<{
 		bytesSent?: number;
 		bytesAcknowledged?: number;
@@ -2596,6 +2625,7 @@ export class WebTransport {
 		};
 	}
 
+	/** @internal */
 	async _sendDatagramWithPolicy(
 		chunk: Uint8Array,
 		policy: SendPolicy,
@@ -2609,11 +2639,13 @@ export class WebTransport {
 		});
 	}
 
+	/** @internal */
 	_recordIncomingDatagram(chunk: Uint8Array): void {
 		this.#connStats.bytesReceived += chunk.byteLength;
 		this.#connStats.datagramsIn += 1;
 	}
 
+	/** @internal */
 	_recordIncomingStreamBytes(bytes: number): void {
 		this.#connStats.bytesReceived += bytes;
 	}
@@ -3039,6 +3071,7 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 	);
 }
 
+/** @internal */
 export const __TESTING__ = {
 	createNativeClientSessionForTests,
 	createNativeServerSessionForTests,

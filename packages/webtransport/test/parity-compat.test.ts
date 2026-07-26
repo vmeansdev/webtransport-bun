@@ -9,12 +9,12 @@ import {
 	WebTransport,
 	createServer,
 	WebTransportError,
-	__TESTING__,
 	E_INVALID_ARGUMENT,
 	E_UNSUPPORTED_ARGUMENT,
 	E_HANDSHAKE_TIMEOUT,
 	E_QUEUE_FULL,
 } from "../src/index.js";
+import { __TESTING__ } from "../src/internal.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 const BASE_PORT = 15512;
