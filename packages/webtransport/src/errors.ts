@@ -64,7 +64,7 @@ export class WebTransportError extends Error {
 		message?: string,
 		options?: WebTransportErrorOptions,
 	) {
-		super(message ?? code, { cause: options?.cause ?? { code } });
+		super(message ?? code, { cause: options?.cause });
 		this.name = options?.browserName ?? "WebTransportError";
 		this.code = code;
 		this.source = options?.source ?? codeToSource(code);
