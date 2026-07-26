@@ -128,3 +128,12 @@ pub fn from_reason(detail: impl Into<String>) -> napi::Error<String> {
 pub fn from_code(code: WtCode, detail: impl Into<String>) -> napi::Error<String> {
     WtError::with_code(code, detail.into()).into()
 }
+
+pub fn from_upstream_error(detail: impl Into<String>) -> napi::Error<String> {
+    let detail = detail.into();
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("connection locally closed") || lower.contains("connection closed by peer") {
+        return from_code(WtCode::E_SESSION_CLOSED, detail);
+    }
+    from_reason(detail)
+}
