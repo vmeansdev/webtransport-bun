@@ -60,6 +60,13 @@
 			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
 			"notes": "Playwright seeded UDP fault-matrix 1/1 darwin/arm64."
+		},
+		{
+			"id": "local-iwa-direct-sockets-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/iwa-direct-sockets.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"status": "passed",
+			"notes": "Local system Chrome 150 IWA proof via tools/interop/run-iwa.mjs (direct-sockets)."
 		}
 	],
 	"claims": [
@@ -112,8 +119,10 @@
 		{
 			"id": "iwa-direct-sockets",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": [
+				"local-iwa-direct-sockets-19acc30"
+			]
 		},
 		{
 			"id": "fault-matrix",
