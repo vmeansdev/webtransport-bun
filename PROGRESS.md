@@ -48,10 +48,19 @@ not `release/1.0-hardening`).
 ## What still blocks readiness=ready
 
 1. Remaining commit-bound claims: interop, IWA, coverage, fuzz campaign (Linux),
-   provenance, cross-platform matrix, soaks, review, final no-change.
+   cross-platform matrix, soaks, review, final no-change.
 2. Soak 24h/72h (honest-release marked soak out of scope as evidence; still in release-status).
 3. Eight-lane zero P0–P4 review + final no-change confirmation.
 4. Optional: E2 `scripts/gen-spec.ts` freshness generator.
+
+### Interop note (local Chromium)
+
+Native Playwright suite is **18/19** on darwin. The failing case is
+`idle timeout closes inactive session`: Chromium surfaces
+`WebTransportError: Connection lost.` instead of resolving `wt.closed` with
+`{ closeCode: 3990, reason: "E_SESSION_IDLE_TIMEOUT" }`. Bun↔Bun idle close
+already maps `TimedOut` correctly; Chromium needs an application
+`CLOSE_WEBTRANSPORT_SESSION` before the QUIC idle drop. Claim stays pending.
 
 GitHub Actions are unavailable for now; continue generating local/Linux evidence
 and binding under `docs/release-evidence/<commit>/` rather than waiting on CI
