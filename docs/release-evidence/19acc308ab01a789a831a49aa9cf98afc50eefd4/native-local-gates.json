@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "command",
   "name": "native-local-gates",
-  "commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+  "commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
   "platform": {
     "os": "darwin",
     "arch": "arm64",
@@ -20,7 +20,7 @@
     "test:packages:cold-loop"
   ],
   "exitCode": 0,
-  "startedAt": "2026-07-26T20:04:32.907Z",
-  "finishedAt": "2026-07-26T20:04:33.907Z",
-  "artifactSha256": "caa6ee8f1852d7683fd5ae887a57a2d9c442140b2a057d4f3d89a924f0fbe35f"
+  "startedAt": "2026-07-26T20:13:19.301Z",
+  "finishedAt": "2026-07-26T20:13:20.301Z",
+  "artifactSha256": "9ea921faf967f9151c32be549e0e0bd6c9e7861f15297d0138ba9b09e54ebe7b"
 }

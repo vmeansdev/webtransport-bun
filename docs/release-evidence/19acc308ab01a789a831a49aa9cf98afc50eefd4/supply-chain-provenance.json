@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "command",
   "name": "supply-chain-provenance",
-  "commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+  "commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
   "platform": {
     "os": "darwin",
     "arch": "arm64",
@@ -17,7 +17,7 @@
     "scripts/check-actions-pinned.ts"
   ],
   "exitCode": 0,
-  "startedAt": "2026-07-26T20:04:33.411Z",
-  "finishedAt": "2026-07-26T20:04:34.411Z",
+  "startedAt": "2026-07-26T20:13:19.932Z",
+  "finishedAt": "2026-07-26T20:13:20.932Z",
   "artifactSha256": "3703ba879d792ecb863b33e0e886c4e7a2959b686d5d989c5e53f0095e3d280e"
 }
