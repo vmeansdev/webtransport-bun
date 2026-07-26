@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "command",
   "name": "wasm-local-gates",
-  "commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+  "commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
   "platform": {
     "os": "darwin",
     "arch": "arm64",
@@ -18,7 +18,7 @@
     "test:wasm"
   ],
   "exitCode": 0,
-  "startedAt": "2026-07-26T20:02:00.661Z",
-  "finishedAt": "2026-07-26T20:02:01.661Z",
-  "artifactSha256": "5a16b77662b3e5c275a420cfd092f6299e59ac7445337d07ebb91a407a262efd"
+  "startedAt": "2026-07-26T20:10:47.358Z",
+  "finishedAt": "2026-07-26T20:10:48.358Z",
+  "artifactSha256": "0a5d68ca810541f79bb0628180e07590c92f2ad04fb1cf607b6ae28c7aa3ac2d"
 }

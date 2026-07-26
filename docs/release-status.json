@@ -1,44 +1,51 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+		"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-wasm-gates-4c29189",
-			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/wasm-local-gates.json",
-			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"id": "local-wasm-gates-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/wasm-local-gates.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: bun run test:wasm on darwin/arm64."
 		},
 		{
-			"id": "local-native-gates-4c29189",
-			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/native-local-gates.json",
-			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"id": "local-native-gates-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/native-local-gates.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: packages cold-loop (count=1) on darwin/arm64. Full test:ci-local matrix still pending."
+			"notes": "Local Actions-independent bind: packages cold-loop (count=1) on darwin/arm64."
 		},
 		{
-			"id": "local-package-artifact-4c29189",
-			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/package-artifact.json",
-			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"id": "local-package-artifact-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/package-artifact.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: bun scripts/test-package-artifact.ts build."
 		},
 		{
-			"id": "local-runtime-consumers-4c29189",
-			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/runtime-consumers.json",
-			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"id": "local-runtime-consumers-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/runtime-consumers.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: internal-package-artifact.test.ts."
 		},
 		{
-			"id": "local-supply-chain-4c29189",
-			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/supply-chain-provenance.json",
-			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"id": "local-supply-chain-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/supply-chain-provenance.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: bun scripts/check-actions-pinned.ts across workflows."
+			"notes": "Local Actions-independent bind: bun scripts/check-actions-pinned.ts."
+		},
+		{
+			"id": "local-chromium-native-interop-19acc30",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/chromium-native-interop.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"status": "passed",
+			"notes": "Local Actions-independent bind: Playwright chromium-webtransport 19/19 on darwin/arm64."
 		}
 	],
 	"claims": [
@@ -46,13 +53,13 @@
 			"id": "native-local-gates",
 			"surface": "native",
 			"status": "passed",
-			"evidenceIds": ["local-native-gates-4c29189"]
+			"evidenceIds": ["local-native-gates-19acc30"]
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
-			"evidenceIds": ["local-wasm-gates-4c29189"]
+			"evidenceIds": ["local-wasm-gates-19acc30"]
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -64,13 +71,13 @@
 			"id": "runtime-consumers",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-runtime-consumers-4c29189"]
+			"evidenceIds": ["local-runtime-consumers-19acc30"]
 		},
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": ["local-chromium-native-interop-19acc30"]
 		},
 		{
 			"id": "chromium-wasm-interop",
@@ -115,13 +122,13 @@
 			"id": "package-artifact",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-package-artifact-4c29189"]
+			"evidenceIds": ["local-package-artifact-19acc30"]
 		},
 		{
 			"id": "supply-chain-provenance",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-supply-chain-4c29189"]
+			"evidenceIds": ["local-supply-chain-19acc30"]
 		},
 		{
 			"id": "soak-24h",

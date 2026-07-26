@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "command",
   "name": "package-artifact",
-  "commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+  "commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
   "platform": {
     "os": "darwin",
     "arch": "arm64",
@@ -18,7 +18,7 @@
     "build"
   ],
   "exitCode": 0,
-  "startedAt": "2026-07-26T20:02:04.733Z",
-  "finishedAt": "2026-07-26T20:02:05.733Z",
+  "startedAt": "2026-07-26T20:10:51.297Z",
+  "finishedAt": "2026-07-26T20:10:52.297Z",
   "artifactSha256": "7ae0c5c1a3c2d992c9c367c67dd12ea2b562172cbb151580273c3d7bca5dba63"
 }
