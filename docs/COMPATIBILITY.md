@@ -28,7 +28,12 @@ commit-bound passing evidence.
 ## WASM backend (`@webtransport-bun/webtransport/wasm`)
 
 The wasm backend (quinn-proto + rustls compiled to `wasm32-unknown-unknown`)
-has its own environment matrix, orthogonal to the prebuild table above:
+has its own environment matrix, orthogonal to the prebuild table above.
+
+**CI scope:** the wasm Bun suite (`wasm-*.test.ts`, `webtransport-like.test.ts`)
+is exercised on the ubuntu `wasm` workflow job only. The multi-OS/bun matrix
+excludes those files by design so missing `crates/wasm/pkg` cannot skip-green.
+See `docs/release-status.json` → `support.scopeLimits`.
 
 | Scenario | Environment | Status |
 |----------|-------------|--------|

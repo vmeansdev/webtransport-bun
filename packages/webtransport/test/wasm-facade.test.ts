@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
 	connectWasm,
 	createWasmServer,
@@ -10,14 +8,13 @@ import {
 } from "../src/backend.js";
 import type { WasmModule } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 describe("wasm backend facade (P3)", () => {
 	test("backend selection defaults to native without UDPSocket", () => {
