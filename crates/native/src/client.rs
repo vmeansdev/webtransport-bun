@@ -189,11 +189,9 @@ fn try_reserve_client_queued_bytes(metrics: &ClientMetrics, budget_bytes: u64, n
     metrics
         .queued_bytes
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            if current + n <= budget_bytes {
-                Some(current + n)
-            } else {
-                None
-            }
+            current
+                .checked_add(n)
+                .and_then(|next| (next <= budget_bytes).then_some(next))
         })
         .is_ok()
 }

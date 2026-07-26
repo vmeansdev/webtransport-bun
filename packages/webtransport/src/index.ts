@@ -1107,6 +1107,7 @@ class NativeServerSession implements ServerSession {
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
@@ -1165,17 +1166,23 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const datagram = await this.#nativeHandle.readDatagram();
-				if (!datagram) break;
-				yield datagram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err);
-			}
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			const session = this;
+			this.#incomingDatagramsCache = (async function* () {
+				while (!session.#closed) {
+					try {
+						const datagram = await session.#nativeHandle.readDatagram();
+						if (!datagram) break;
+						yield datagram;
+					} catch (err) {
+						if (isSessionCloseError(err)) break;
+						throw toWebTransportError(err);
+					}
+				}
+			})();
 		}
+		return this.#incomingDatagramsCache;
 	}
 
 	async createBidirectionalStream(
@@ -1512,6 +1519,7 @@ class NativeClientSession implements ClientSession {
 	#requestedCloseInfo: CloseInfo | null = null;
 	#strictW3CErrors: boolean;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
 
 	constructor(
 		nativeHandle: NativeSessionHandle,
@@ -1570,17 +1578,23 @@ class NativeClientSession implements ClientSession {
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const dgram = await this.#nativeHandle.readDatagram();
-				if (!dgram) break;
-				yield dgram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err, this.#strictW3CErrors);
-			}
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			const session = this;
+			this.#incomingDatagramsCache = (async function* () {
+				while (!session.#closed) {
+					try {
+						const dgram = await session.#nativeHandle.readDatagram();
+						if (!dgram) break;
+						yield dgram;
+					} catch (err) {
+						if (isSessionCloseError(err)) break;
+						throw toWebTransportError(err, session.#strictW3CErrors);
+					}
+				}
+			})();
 		}
+		return this.#incomingDatagramsCache;
 	}
 
 	async createBidirectionalStream(
@@ -2387,7 +2401,7 @@ export class WebTransport {
 		return new WebTransportSendGroup(this, this.#nextSendGroupId++);
 	}
 
-	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
+	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Lazily initialized and cached. */
 	get datagrams(): WebTransportDatagramDuplexStream {
 		if (!this.#datagramsCache) {
 			this.#datagramsCache = createDatagramStreams(
