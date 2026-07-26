@@ -252,6 +252,10 @@ fn read_error_code(err: &StreamReadError) -> &'static str {
     }
 }
 
+fn should_reset_on_oversized_chunk(sz: u64, budget: &Option<StreamBudget>) -> bool {
+    budget.as_ref().is_some_and(|b| sz > b.max_stream)
+}
+
 #[napi]
 pub struct ClientBidiStreamHandle {
     read_rx: Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>,
@@ -681,7 +685,7 @@ pub fn spawn_bidi_bridge_on(
                                 // NEVER be reserved: parking would wedge the
                                 // stream forever. Stop it so the reader unblocks
                                 // with an error instead of hanging.
-                                if sz > b.max_stream {
+                                if should_reset_on_oversized_chunk(sz, &read_budget) {
                                     recv_stream.stop(VarInt::from_u32(0));
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
@@ -952,7 +956,7 @@ pub fn spawn_uni_recv_bridge_on(
                                 // A chunk larger than the per-stream budget can
                                 // never be reserved: stop the stream instead of
                                 // parking forever (see bidi recv bridge).
-                                if sz > b.max_stream {
+                                if should_reset_on_oversized_chunk(sz, &budget) {
                                     recv_stream.stop(VarInt::from_u32(0));
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
@@ -1094,5 +1098,23 @@ mod tests {
     fn stream_chunk_without_budget_is_noop() {
         let chunk = StreamChunk::new(vec![1u8; 10], None, 0);
         drop(chunk);
+    }
+
+    #[test]
+    fn recv_bridge_oversized_chunk_guard_matches_budget_limit() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(
+            should_reset_on_oversized_chunk(b.max_stream + 1, &Some(b.clone())),
+            "chunks above max_stream must request stream reset"
+        );
+        assert!(
+            !should_reset_on_oversized_chunk(b.max_stream, &Some(b.clone())),
+            "chunks at max_stream must be buffered"
+        );
+        assert!(
+            !should_reset_on_oversized_chunk(b.max_stream + 1, &None),
+            "chunks without a budget must not trigger the oversized guard"
+        );
     }
 }
