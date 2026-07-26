@@ -1,11 +1,10 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { connectWasm } from "../src/backend.js";
 import type { WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
 import { generateCert, type WasmCertModule } from "../src/wasm-cert.js";
 import { forEachWithTimeout } from "./helpers/harness.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
 // Cross-stack interop: our wasm WebTransport CLIENT against the native Rust
 // (wtransport) SERVER over real localhost UDP. Exercises whether our hand-rolled
@@ -15,17 +14,14 @@ import { forEachWithTimeout } from "./helpers/harness.js";
 // (run `bun run build:native` first). Live browser interop (wasm server <->
 // Chrome native client) is documented in tools/interop/WASM_INTEROP.md.
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent. WEBTRANSPORT_REQUIRE_WASM=1 fails at import via helper.
 
 let wasm: WasmModule & WasmCertModule;
 let createServer: typeof import("../src/index.js").createServer | null = null;
 
 beforeAll(async () => {
 	if (!wasmAvailable) return;
-	wasm = (await import(pkgPath)) as unknown as WasmModule & WasmCertModule;
+	wasm = (await loadWasmModule()) as WasmModule & WasmCertModule;
 	try {
 		const native = await import("../src/index.js");
 		// Probe that the native addon actually loads in this environment.

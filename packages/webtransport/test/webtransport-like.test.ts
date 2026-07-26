@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
 	connectWasm,
 	connectWasmUnified,
@@ -12,14 +10,13 @@ import type { WebTransportLike } from "../src/shared.js";
 import type { nativeToWebTransportLike } from "../src/webtransport-like-native.js";
 import type { wasmToWebTransportLike } from "../src/webtransport-like-wasm.js";
 import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
