@@ -67,6 +67,13 @@
 			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
 			"status": "passed",
 			"notes": "Local system Chrome 150 IWA proof via tools/interop/run-iwa.mjs (direct-sockets)."
+		},
+		{
+			"id": "local-coverage-floors-19acc30-failed",
+			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/coverage-gates-floor-results.json",
+			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"status": "failed",
+			"notes": "Local coverage floors failed (native/wasm/bun risk modules below thresholds)."
 		}
 	],
 	"claims": [
@@ -136,8 +143,10 @@
 			"id": "coverage-gates",
 			"surface": "release",
 			"status": "pending",
-			"evidenceIds": [],
-			"notes": "typecheck alone is insufficient; needs coverage workflow / threshold evidence."
+			"evidenceIds": [
+				"local-coverage-floors-19acc30-failed"
+			],
+			"notes": "Local llvm-cov+Bun LCOV ran; risk-module floors failed (22 violations). See coverage-gates-floor-results.json. Stable --branch needs nightly; do not mark passed until floors clear."
 		},
 		{
 			"id": "fuzz-gates",
