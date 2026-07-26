@@ -52,8 +52,10 @@ describe("internal TS error propagation", () => {
 	});
 
 	it("native error parser prefers explicit err.code when present", async () => {
-		const wrapped = new Error("not a real code message");
-		(wrapped as { code: string }).code = "E_HANDSHAKE_TIMEOUT";
+		const wrapped = new Error("not a real code message") as Error & {
+			code: string;
+		};
+		wrapped.code = "E_HANDSHAKE_TIMEOUT";
 		const session = __TESTING__.createNativeClientSessionForTests({
 			sendDatagram: async () => {
 				throw wrapped;
