@@ -24,22 +24,26 @@ not `release/1.0-hardening`).
 | D3 | partial | scale-10k retained pending with note (not falsely passed) |
 | D4 | complete | `scripts/promote-release-status.ts` refuses without evidence |
 | E | partial | SUPPORT.md + wtransport disclosure; SPEC generator (E2) not built |
-| Evidence bind | **partial (local, no Actions)** | 3/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
+| Evidence bind | **partial (local, no Actions)** | 5/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
 
 ## Local verification (this worktree)
 
 - `bun run typecheck` + `check-doc-truth` pass
 - `bun run test:wasm` → 67/67 pass (`WEBTRANSPORT_REQUIRE_WASM=1`)
 - Packages cold-loop → 369/369 pass
+- `bun run test:parity` → 63/63 pass
 - `bun scripts/test-package-artifact.ts build` → tarball produced
+- `bun scripts/check-actions-pinned.ts` → pass (11 workflows)
 - `tools/fuzz` `cargo check --all-targets` pass (Rust 1.95.0)
 - `tools/fuzz/release-smoke.test.ts` → 9/9 pass
 
-## Bound claims (commit `36fef17…`)
+## Bound claims (candidate `4c29189…`)
 
 - `wasm-local-gates`
 - `native-local-gates` (cold-loop subset; full `test:ci-local` still open)
 - `package-artifact`
+- `runtime-consumers`
+- `supply-chain-provenance`
 
 ## What still blocks readiness=ready
 
