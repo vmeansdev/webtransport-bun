@@ -1,19 +1,13 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
-import { type WasmModule, WasmEndpoint } from "../src/backend-wasm.js";
+import { WasmEndpoint } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-// Loads the nodejs-target wasm-bindgen glue built by crates/wasm/build-wasm.sh.
-// If the wasm hasn't been built, skip rather than fail the default `bun test`
-// run — `bun run test:wasm` builds first and is the authoritative gate.
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 describe("wasm WebTransport backend (P1)", () => {
 	test.skipIf(!wasmAvailable)(

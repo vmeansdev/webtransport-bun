@@ -125,6 +125,14 @@
 	},
 	"support": {
 		"claimed": [],
-		"tested": []
+		"tested": [],
+		"scopeLimits": [
+			{
+				"id": "wasm-bun-suite-ubuntu-only",
+				"surface": "wasm",
+				"claimIds": ["wasm-local-gates"],
+				"summary": "Wasm Bun suite (wasm-*.test.ts + webtransport-like) evidence is produced on the ubuntu wasm CI job only; the OS/bun matrix excludes those files by design."
+			}
+		]
 	}
 }
