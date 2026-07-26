@@ -24,7 +24,7 @@ not `release/1.0-hardening`).
 | D3 | partial | scale-10k retained pending with note (not falsely passed) |
 | D4 | complete | `scripts/promote-release-status.ts` refuses without evidence |
 | E | partial | SUPPORT.md + wtransport disclosure; SPEC generator (E2) not built |
-| Evidence bind | **partial (local, no Actions)** | 6/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
+| Evidence bind | **partial (local, no Actions)** | 8/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
 
 ## Local verification (this worktree)
 
@@ -45,6 +45,8 @@ not `release/1.0-hardening`).
 - `runtime-consumers`
 - `supply-chain-provenance`
 - `chromium-native-interop` (Playwright 19/19 darwin)
+- `fault-matrix`
+- `chromium-wasm-interop` (Playwright wasm 5/5 darwin)
 
 ## What still blocks readiness=ready
 
@@ -59,7 +61,7 @@ not `release/1.0-hardening`).
 Native Playwright suite is **19/19** on darwin after the interop addon emits
 application idle close `3990`/`E_SESSION_IDLE_TIMEOUT` (Chromium may still
 surface `Connection lost` client-side; server close-events are asserted).
-Wasm Chromium interop + IWA remain pending.
+IWA, coverage, fuzz (Linux), matrix, soaks, review remain pending.
 
 GitHub Actions are unavailable for now; continue generating local/Linux evidence
 and binding under `docs/release-evidence/<commit>/` rather than waiting on CI
