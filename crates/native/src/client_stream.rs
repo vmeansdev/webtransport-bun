@@ -143,11 +143,8 @@ impl StreamBudget {
             .session_metrics
             .queued_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                if c + n <= self.max_session {
-                    Some(c + n)
-                } else {
-                    None
-                }
+                c.checked_add(n)
+                    .and_then(|next| (next <= self.max_session).then_some(next))
             })
             .is_ok();
         if !session_ok {
@@ -157,11 +154,8 @@ impl StreamBudget {
         let stream_ok = self
             .stream_queued
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                if c + n <= self.max_stream {
-                    Some(c + n)
-                } else {
-                    None
-                }
+                c.checked_add(n)
+                    .and_then(|next| (next <= self.max_stream).then_some(next))
             })
             .is_ok();
         if !stream_ok {

@@ -96,6 +96,10 @@ pub struct WtEndpoint {
     last_error: Option<String>,
 }
 
+fn clamp_varint_to_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 // This endpoint models exactly ONE WebTransport session per QUIC connection
 // (a second CONNECT is rejected with 404), so advertise that honestly.
 const WT_MAX_SESSIONS: u64 = 1;
@@ -708,7 +712,7 @@ impl WtEndpoint {
                     // Peer STOP_SENDING on OUR send half: writes will fail from
                     // now on. The recv half (if any) is untouched — this is NOT
                     // an inbound reset.
-                    self.on_stream_stopped(h, id, error_code.into_inner() as u32);
+                    self.on_stream_stopped(h, id, clamp_varint_to_u32(error_code.into_inner()));
                 }
                 QuicEvent::DatagramReceived => {
                     self.drain_datagrams(h, now);
@@ -1002,7 +1006,7 @@ impl WtEndpoint {
             match final_outcome {
                 ReadOutcome::Finished => self.retire_in_stream(h, id),
                 ReadOutcome::Reset(code) => {
-                    self.emit_stream_reset(h, id, code as u32);
+                    self.emit_stream_reset(h, id, clamp_varint_to_u32(code));
                     self.retire_in_stream(h, id);
                 }
                 ReadOutcome::Open => {}
@@ -1066,7 +1070,7 @@ impl WtEndpoint {
                     self.push_event(WtEvent::StreamReset {
                         conn,
                         stream: handle,
-                        code: code as u32,
+                        code: clamp_varint_to_u32(code),
                     });
                     if let Some(s) = self.sessions.get_mut(&h) {
                         s.self_bidi.remove(&id);

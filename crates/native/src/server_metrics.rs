@@ -34,11 +34,9 @@ impl ServerMetrics {
     pub fn try_reserve_queued_bytes(&self, n: u64, max: u64) -> bool {
         self.queued_bytes_global
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current + n <= max {
-                    Some(current + n)
-                } else {
-                    None
-                }
+                current
+                    .checked_add(n)
+                    .and_then(|next| (next <= max).then_some(next))
             })
             .is_ok()
     }
@@ -60,11 +58,9 @@ impl ServerMetrics {
         }
         let ok = session_queued
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current + n <= session_max {
-                    Some(current + n)
-                } else {
-                    None
-                }
+                current
+                    .checked_add(n)
+                    .and_then(|next| (next <= session_max).then_some(next))
             })
             .is_ok();
         if !ok {
