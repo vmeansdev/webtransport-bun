@@ -14,6 +14,7 @@ use tokio::sync::watch;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
+pub mod error;
 pub mod histogram;
 pub mod limits;
 pub mod metrics;

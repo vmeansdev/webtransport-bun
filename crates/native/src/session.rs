@@ -3,6 +3,7 @@ use napi_derive::napi;
 use std::sync::atomic::Ordering;
 
 use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
+use crate::error::{from_reason as wt_from_reason, WtResult};
 use crate::panic_guard;
 use crate::session_registry;
 use crate::RUNTIME;
@@ -101,7 +102,7 @@ impl SessionHandle {
 
     /// Real QUIC transport stats (rtt, wire bytes, packet counts) for this session.
     #[napi]
-    pub fn connection_stats(&self) -> Result<Option<crate::metrics::QuicConnectionStats>> {
+    pub fn connection_stats(&self) -> WtResult<Option<crate::metrics::QuicConnectionStats>> {
         let Some((conn, _, _, _, _, _, _)) = session_registry::get(&self.id) else {
             return Ok(None);
         };
@@ -109,7 +110,7 @@ impl SessionHandle {
     }
 
     #[napi]
-    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
+    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
         let c = code.unwrap_or(0);
         let r = reason.unwrap_or_default();
         session_registry::close_session(&self.id, c, r.as_bytes());
@@ -275,7 +276,7 @@ impl SessionHandle {
     }
 
     #[napi]
-    pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
+    pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::SessionMetricsSnapshot> {
         panic_guard::catch_panic(|| {
             if let Some(sm) = session_registry::get_session_metrics(&self.id) {
                 Ok(crate::metrics::SessionMetricsSnapshot {
@@ -293,5 +294,6 @@ impl SessionHandle {
                 })
             }
         })
+        .map_err(wt_from_reason)
     }
 }
