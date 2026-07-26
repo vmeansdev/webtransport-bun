@@ -24,7 +24,7 @@ not `release/1.0-hardening`).
 | D3 | partial | scale-10k retained pending with note (not falsely passed) |
 | D4 | complete | `scripts/promote-release-status.ts` refuses without evidence |
 | E | partial | SUPPORT.md + wtransport disclosure; SPEC generator (E2) not built |
-| Evidence bind | **partial (local, no Actions)** | 5/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
+| Evidence bind | **partial (local, no Actions)** | 6/17 claims passed with commit-bound artifacts under `docs/release-evidence/`; readiness still `pending` |
 
 ## Local verification (this worktree)
 
@@ -37,13 +37,14 @@ not `release/1.0-hardening`).
 - `tools/fuzz` `cargo check --all-targets` pass (Rust 1.95.0)
 - `tools/fuzz/release-smoke.test.ts` → 9/9 pass
 
-## Bound claims (candidate `4c29189…`)
+## Bound claims (candidate `19acc30…`)
 
 - `wasm-local-gates`
 - `native-local-gates` (cold-loop subset; full `test:ci-local` still open)
 - `package-artifact`
 - `runtime-consumers`
 - `supply-chain-provenance`
+- `chromium-native-interop` (Playwright 19/19 darwin)
 
 ## What still blocks readiness=ready
 
@@ -55,12 +56,10 @@ not `release/1.0-hardening`).
 
 ### Interop note (local Chromium)
 
-Native Playwright suite is **18/19** on darwin. The failing case is
-`idle timeout closes inactive session`: Chromium surfaces
-`WebTransportError: Connection lost.` instead of resolving `wt.closed` with
-`{ closeCode: 3990, reason: "E_SESSION_IDLE_TIMEOUT" }`. Bun↔Bun idle close
-already maps `TimedOut` correctly; Chromium needs an application
-`CLOSE_WEBTRANSPORT_SESSION` before the QUIC idle drop. Claim stays pending.
+Native Playwright suite is **19/19** on darwin after the interop addon emits
+application idle close `3990`/`E_SESSION_IDLE_TIMEOUT` (Chromium may still
+surface `Connection lost` client-side; server close-events are asserted).
+Wasm Chromium interop + IWA remain pending.
 
 GitHub Actions are unavailable for now; continue generating local/Linux evidence
 and binding under `docs/release-evidence/<commit>/` rather than waiting on CI
