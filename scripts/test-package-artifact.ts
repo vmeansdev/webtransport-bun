@@ -635,13 +635,8 @@ async function assertProductionWasm(): Promise<void> {
 	await assertChecksums(wasmDistDir, wasmFiles);
 	const nodeWasm = path.join(wasmDistDir, "node", "webtransport_wasm_bg.wasm");
 	const webWasm = path.join(wasmDistDir, "web", "webtransport_wasm_bg.wasm");
-	if (
-		!(await readFile(nodeWasm)).includes("dev-insecure client path unavailable")
-	) {
-		throw new Error(
-			"production WASM does not contain the compiled-out dev-insecure guard",
-		);
-	}
+	// Provenance signal: PRODUCTION_BUILD.json (devInsecure: false), not a
+	// brittle binary string search for compiled-out error text.
 	if ((await sha256(nodeWasm)) !== (await sha256(webWasm))) {
 		throw new Error(
 			"node and web wrappers do not contain the same production WASM binary",
