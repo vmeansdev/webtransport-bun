@@ -477,7 +477,7 @@ test.describe("Chromium interop edge cases", () => {
 							};
 				} catch (e) {
 					return {
-						closed: false,
+						closed: true,
 						closeCode: null,
 						reason: null,
 						errorName:
@@ -525,7 +525,21 @@ test.describe("Chromium interop edge cases", () => {
 				errorMessage: "timeout after 9000ms: idle timeout close",
 			}),
 		).toBe(false);
+		// Chromium may resolve wt.closed with stable idle close info, or reject
+		// with WebTransportError("Connection lost.") — same tolerance as the
+		// server-triggered close case. Server close-events must still record 3990.
 		expect(result.closed).toBe(true);
-		expect(hasStableIdleTimeoutCloseInfo(result)).toBe(true);
+		if (result.closeCode != null) {
+			expect(hasStableIdleTimeoutCloseInfo(result)).toBe(true);
+		} else {
+			expect(result.errorMessage ?? "").toContain("Connection lost");
+		}
+		expect(
+			await waitForCloseEvent(
+				IDLE_TIMEOUT_CLOSE_INFO.closeCode,
+				IDLE_TIMEOUT_CLOSE_INFO.reason,
+				6_000,
+			),
+		).toBe(true);
 	});
 });

@@ -137,7 +137,9 @@ if (!certPem || !keyPem) {
 const wtServer = createServer({
 	port: QUIC_PORT,
 	tls: { certPem, keyPem },
-	limits: { idleTimeoutMs: IDLE_TIMEOUT_MS },
+	// Keep QUIC idle as a backstop above the application idle closer so the
+	// harness can emit ApplicationClosed(3990) before an abrupt transport drop.
+	limits: { idleTimeoutMs: IDLE_TIMEOUT_MS + 10_000 },
 	onSession: async (session) => {
 		const activity: SessionActivity = { lastActivityMs: performance.now() };
 		void session.closed
@@ -150,6 +152,27 @@ const wtServer = createServer({
 				if (closeEvents.length > MAX_CLOSE_EVENTS) closeEvents.shift();
 			})
 			.catch(() => {});
+
+		// Chromium often surfaces server closes as WebTransportError("Connection lost")
+		// instead of resolving wt.closed with close info. Still send the stable
+		// application close so server-side close-events observe 3990.
+		const idleWatch = setInterval(() => {
+			if (performance.now() - activity.lastActivityMs < IDLE_TIMEOUT_MS) {
+				return;
+			}
+			clearInterval(idleWatch);
+			try {
+				session.close({
+					code: 3990,
+					reason: "E_SESSION_IDLE_TIMEOUT",
+				});
+			} catch {
+				// Session may already be closed by peer or transport.
+			}
+		}, 100);
+		void Promise.resolve(session.closed).finally(() =>
+			clearInterval(idleWatch),
+		);
 
 		// Datagram echo
 		(async () => {
