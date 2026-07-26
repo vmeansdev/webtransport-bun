@@ -2002,16 +2002,12 @@ function bufferSourceToUint8(value: BufferSource): Uint8Array {
 
 function mapServerCertificateHashes(
 	hashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>,
-): Array<{ algorithm: "sha-256"; valueBase64: string }> | undefined {
+): Array<{ algorithm: "sha-256"; value: number[] }> | undefined {
 	if (hashes === undefined) return;
 	return hashes.map((entry) => ({
 		algorithm: entry.algorithm,
-		valueBase64: bufferSourceToBase64(entry.value),
+		value: Array.from(bufferSourceToUint8(entry.value)),
 	}));
-}
-
-function bufferSourceToBase64(value: BufferSource): string {
-	return Buffer.from(bufferSourceToUint8(value)).toString("base64");
 }
 
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
