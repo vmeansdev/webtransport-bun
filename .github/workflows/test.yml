@@ -81,8 +81,28 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.121 --locked
       - name: Install deps
         run: bun install --frozen-lockfile
-      - name: Build wasm + wasm Bun suite
+      - name: Build native (for wasm-native-interop)
+        run: bun run build:native
+      - name: Build wasm + wasm-dist + full wasm Bun suite
         run: bun run test:wasm
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Wasm native interop (requires pkg + native)
+        run: bun run test:wasm:interop
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Hole test — delete pkg and expect wasm suite red
+        run: |
+          rm -rf crates/wasm/pkg
+          if bun run test:wasm:hole; then
+            echo "expected wasm suite to fail without pkg" >&2
+            exit 1
+          fi
+          echo "hole test OK (suite failed without pkg)"
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Rebuild wasm after hole test
+        run: bun run build:wasm && bun run build:wasm:dist
       - name: Interop (Chromium native client -> wasm server)
         run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run playwright test -c playwright.wasm.config.ts
         timeout-minutes: 6
@@ -128,7 +148,12 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
       - name: Unit tests
-        run: bun test packages/
+        # Wasm Bun suites are ubuntu-only (wasm job). Exclude them here so
+        # existsSync(pkg) skipIf cannot false-green the OS/bun matrix.
+        run: >
+          bun test packages/
+          --path-ignore-patterns='**/wasm-*.test.ts'
+          --path-ignore-patterns='**/webtransport-like.test.ts'
       - name: Flake guard (critical suite P3-10 x3)
         run: |
           for i in 1 2 3; do
