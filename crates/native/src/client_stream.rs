@@ -5,6 +5,7 @@
 //! - Read bridge: sends Vec<u8> to a bounded mpsc channel; selects on a stop_sending oneshot.
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
+use crate::error::{from_reason as wt_from_reason, WtResult};
 use napi::Result;
 use napi_derive::napi;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -338,7 +339,7 @@ impl ClientBidiStreamHandle {
                 if let Some(ref slot) = self.read_error_slot {
                     if let Ok(guard) = slot.lock() {
                         if let Some(ref code) = *guard {
-                            return Err(napi::Error::from_reason(code.clone()));
+                            return Err(wt_from_reason(code.clone()));
                         }
                     }
                 }
@@ -352,17 +353,17 @@ impl ClientBidiStreamHandle {
         // A finished/reset stream never accepts more data: reject deterministically
         // rather than letting a late write race into the channel behind the FIN.
         if self.finished.load(Ordering::Acquire) {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            return Err(wt_from_reason("E_STREAM_RESET"));
         }
         if let Some(ref slot) = self.write_error_slot {
             if let Ok(guard) = slot.lock() {
                 if let Some(ref code) = *guard {
-                    return Err(napi::Error::from_reason(code.clone()));
+                    return Err(wt_from_reason(code.clone()));
                 }
             }
         }
         let Some(ref tx) = self.write_tx else {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            return Err(wt_from_reason("E_STREAM_RESET"));
         };
         let bytes = chunk.to_vec();
         if bytes.is_empty() {
@@ -373,7 +374,7 @@ impl ClientBidiStreamHandle {
             // Reliable-stream backpressure: park until budget frees (lossless)
             // instead of erroring, bounded by the backpressure timeout.
             if !b.reserve_or_wait(sz).await {
-                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+                return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
         // Build the chunk NOW, immediately after reserving, so it owns the
@@ -395,28 +396,28 @@ impl ClientBidiStreamHandle {
         // (WHATWG serializes write/close through the facade; this covers the raw
         // handle.)
         if self.finished.load(Ordering::Acquire) {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            return Err(wt_from_reason("E_STREAM_RESET"));
         }
         // On send failure the chunk drops here, releasing its reservation.
         if tx.send(StreamCmd::Data(chunk)).await.is_err() {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            return Err(wt_from_reason("E_STREAM_RESET"));
         }
         Ok(())
     }
 
     #[napi]
-    pub fn reset(&self, code: u32) -> Result<()> {
+    pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
         Ok(())
     }
 
     #[napi]
-    pub fn stop_sending(&self, code: u32) -> Result<()> {
+    pub fn stop_sending(&self, code: u32) -> WtResult<()> {
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
                 if tx.send(code).is_err() {
-                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                    return Err(wt_from_reason("E_SESSION_CLOSED"));
                 }
             }
         }
@@ -424,7 +425,7 @@ impl ClientBidiStreamHandle {
     }
 
     #[napi]
-    pub fn finish(&self) -> Result<()> {
+    pub fn finish(&self) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
         Ok(())
@@ -536,14 +537,14 @@ impl ClientUniSendHandle {
     }
 
     #[napi]
-    pub fn reset(&self, code: u32) -> Result<()> {
+    pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
         Ok(())
     }
 
     #[napi]
-    pub fn finish(&self) -> Result<()> {
+    pub fn finish(&self) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
         send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
         Ok(())
@@ -626,11 +627,11 @@ impl ClientUniRecvHandle {
     }
 
     #[napi]
-    pub fn stop_sending(&self, code: u32) -> Result<()> {
+    pub fn stop_sending(&self, code: u32) -> WtResult<()> {
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
                 if tx.send(code).is_err() {
-                    return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+                    return Err(wt_from_reason("E_SESSION_CLOSED"));
                 }
             }
         }

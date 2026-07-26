@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::error::{from_reason as wt_from_reason, WtResult};
 use crate::limits::Limits;
 use crate::panic_guard;
 use crate::rate_limit::RateLimits;
@@ -261,7 +262,7 @@ impl ServerHandle {
         _rate_limits_json: String,
         on_session: JsFunction,
         log_fn: JsFunction,
-    ) -> Result<Self> {
+    ) -> WtResult<Self> {
         panic_guard::catch_panic(|| {
             let session_tsfn: ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal> =
                 on_session
@@ -385,6 +386,7 @@ impl ServerHandle {
                 }),
             })
         })
+        .map_err(wt_from_reason)
     }
 
     #[napi(getter)]
@@ -575,7 +577,7 @@ impl ServerHandle {
     }
 
     #[napi]
-    pub fn tls_snapshot(&self) -> Result<crate::metrics::ServerTlsSnapshot> {
+    pub fn tls_snapshot(&self) -> WtResult<crate::metrics::ServerTlsSnapshot> {
         panic_guard::catch_panic(|| {
             let state = self
                 .state
@@ -593,6 +595,7 @@ impl ServerHandle {
                 },
             })
         })
+        .map_err(wt_from_reason)
     }
 
     #[napi]
@@ -628,7 +631,7 @@ impl ServerHandle {
     }
 
     #[napi]
-    pub fn metrics_snapshot(&self) -> Result<crate::metrics::ServerMetricsSnapshot> {
+    pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::ServerMetricsSnapshot> {
         panic_guard::catch_panic(|| {
             let state = self
                 .state
@@ -638,6 +641,7 @@ impl ServerHandle {
                 .metrics
                 .snapshot(Some(state.tls_resolver.metrics_snapshot())))
         })
+        .map_err(wt_from_reason)
     }
 }
 

@@ -25,6 +25,7 @@ use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
 };
+use crate::error::WtResult;
 use crate::server_metrics::ServerMetrics;
 use crate::session_registry::SessionMetrics;
 use crate::CLIENT_RUNTIME;
@@ -377,7 +378,7 @@ impl ClientSessionHandle {
 
     /// Real QUIC transport stats (rtt, wire bytes, packet counts).
     #[napi]
-    pub fn connection_stats(&self) -> Result<Option<crate::metrics::QuicConnectionStats>> {
+    pub fn connection_stats(&self) -> WtResult<Option<crate::metrics::QuicConnectionStats>> {
         if self.closed.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -386,7 +387,7 @@ impl ClientSessionHandle {
 
     /// Current max datagram payload size for the path (MTU-derived), if known.
     #[napi]
-    pub fn path_max_datagram_size(&self) -> Result<Option<u32>> {
+    pub fn path_max_datagram_size(&self) -> WtResult<Option<u32>> {
         Ok(self
             .conn
             .as_ref()
@@ -445,13 +446,13 @@ impl ClientSessionHandle {
     }
 
     #[napi]
-    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
+    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
         self.initiate_close(code.unwrap_or(0), reason.unwrap_or_default());
         Ok(())
     }
 
     #[napi]
-    pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
+    pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::SessionMetricsSnapshot> {
         Ok(crate::metrics::SessionMetricsSnapshot {
             datagrams_in: self.client_metrics.datagrams_in.load(Ordering::Relaxed) as f64,
             datagrams_out: self.client_metrics.datagrams_out.load(Ordering::Relaxed) as f64,
