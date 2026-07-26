@@ -17,8 +17,8 @@ import {
 	writeArtifact,
 } from "./bench-lib.ts";
 
-const WARMUPS = Number(process.env.BENCH_WARMUPS ?? "1");
-const ROUNDS = Number(process.env.BENCH_ROUNDS ?? "5");
+const WARMUPS = Number(process.env.BENCH_WARMUPS ?? "3");
+const ROUNDS = Number(process.env.BENCH_ROUNDS ?? "15");
 const BASELINE_PATH = process.env.BENCH_BASELINE_PATH ?? DEFAULT_BASELINE_PATH;
 const ARTIFACT_PATH = process.env.BENCH_ARTIFACT_OUT ?? DEFAULT_ARTIFACT_PATH;
 
