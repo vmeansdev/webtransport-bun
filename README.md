@@ -110,12 +110,10 @@ Detailed migration playbook:
 - Version: `1.0.0-rc.1`. The canonical release status lives in
   `docs/release-status.json`; the native root entrypoint and `/wasm` are
   candidate surfaces, not stable/GA.
-- Configured release targets: Bun (`>= 1.3.9`), Node, and Deno. Candidate
-  support remains unclaimed until the matching entries in
+- Configured release targets: Bun (`>= 1.3.9`), Node, and Deno. Candidate support remains unclaimed until the matching entries in
   `docs/release-status.json` have passing evidence.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
-- Known limits: Chromium-focused browser interop target. Readiness remains
-  pending in `docs/release-status.json` until the external evidence gates close.
+- Known limits: Chromium-focused browser interop target. Readiness remains pending in `docs/release-status.json` until the external evidence gates close.
 
 ## Configured Target Matrix
 

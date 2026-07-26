@@ -22,8 +22,7 @@ yarn add @webtransport-bun/webtransport
 - **Configured platform targets**: macOS (arm64, x64), Linux (x64), Windows
   (x64)
 
-These are candidate targets, not current support claims. Support is claimed only
-after the corresponding commit-bound tuples pass in
+These are candidate targets, not current support claims. Support is claimed only after the corresponding commit-bound tuples pass in
 `../../docs/release-status.json`.
 
 ## Quick Start
