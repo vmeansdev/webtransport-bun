@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -48,14 +49,48 @@ export type BenchmarkMetricThreshold = {
 	unit: string;
 };
 
+/**
+ * Gate design: detect a ≥10% relative non-overlapping CI95 regression at 95%
+ * confidence. Derived defaults: warmups=3, rounds=15 (open-loop capture).
+ * Pass condition is non-overlapping CI vs approved baseline — not absolute
+ * latency ceilings.
+ */
+export const BENCH_MINIMUM_DETECTABLE_EFFECT = {
+	relative: 0.1,
+	confidence: 0.95,
+} as const;
+export const BENCH_DESIGN_WARMUPS = 3;
+export const BENCH_DESIGN_ROUNDS = 15;
+/** Max first-parent distance when candidateRelationship is "ancestry". */
+export const BENCH_DEFAULT_MAX_ANCESTRY_DISTANCE = 32;
+
 export type ApprovedBaselines = {
 	status: "approved" | "blocked";
 	approvedAt: string | null;
+	/** Reviewable human who approved the baseline (required when approved). */
+	approver: string | null;
 	commit: string | null;
-	candidateRelationship: "exact" | null;
+	candidateRelationship: "exact" | "ancestry" | null;
+	/** Max first-parent distance when relationship is ancestry. */
+	maxAncestryDistance: number | null;
 	machine: string | null;
 	bunVersion: string | null;
 	rustcVersion: string | null;
+	/** sha256(`${bunVersion}\\n${rustcVersion}`) — must match candidate. */
+	toolchainHash: string | null;
+	/**
+	 * SHA-256 of the capture artifact that produced this baseline. Gate verifies
+	 * that artifact's `commit` equals `baseline.commit` and its digest matches.
+	 */
+	artifactSha256: string | null;
+	/** Path (repo-relative or absolute) of the capture artifact. */
+	artifactPath: string | null;
+	minimumDetectableEffect: {
+		relative: number;
+		confidence: number;
+	} | null;
+	designWarmups: number | null;
+	designRounds: number | null;
 	notes: string[];
 	thresholds: Record<string, BenchmarkMetricThreshold>;
 	lastAttempt?: {
@@ -446,6 +481,47 @@ export function gitWorkingTreeDirty(): boolean {
 export function rustcVersion(): string | null {
 	const result = spawnSync("rustc", ["-V"], { cwd: ROOT, encoding: "utf8" });
 	return result.status === 0 ? result.stdout.trim() : null;
+}
+
+export function toolchainHash(
+	bunVersion: string | null,
+	rustcVersionValue: string | null,
+): string | null {
+	if (!bunVersion || !rustcVersionValue) return null;
+	return createHash("sha256")
+		.update(`${bunVersion}\n${rustcVersionValue}`)
+		.digest("hex");
+}
+
+export function sha256File(path: string): string {
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+/**
+ * First-parent distance from `ancestor` to `descendant` (0 if equal).
+ * Returns null if ancestor is not reachable on the first-parent chain.
+ */
+export function gitFirstParentDistance(
+	ancestor: string,
+	descendant: string,
+): number | null {
+	if (ancestor.toLowerCase() === descendant.toLowerCase()) return 0;
+	const result = spawnSync(
+		"git",
+		["rev-list", "--first-parent", "--count", `${ancestor}..${descendant}`],
+		{ cwd: ROOT, encoding: "utf8" },
+	);
+	if (result.status !== 0) return null;
+	const count = Number(result.stdout.trim());
+	if (!Number.isFinite(count)) return null;
+	// Confirm ancestor is actually an ancestor on first-parent.
+	const isAncestor = spawnSync(
+		"git",
+		["merge-base", "--is-ancestor", ancestor, descendant],
+		{ cwd: ROOT, encoding: "utf8" },
+	);
+	if (isAncestor.status !== 0) return null;
+	return count;
 }
 
 export function machineIdentity(): string {
@@ -980,20 +1056,48 @@ export function validateApprovedBaselineContext(
 	) {
 		failures.push("approved baseline timestamp is missing or invalid");
 	}
+	if (!baseline.approver || baseline.approver.trim().length === 0) {
+		failures.push("approved baseline requires an explicit approver");
+	}
 	if (!baseline.commit || !/^[0-9a-f]{40}$/i.test(baseline.commit)) {
 		failures.push("approved baseline commit is not a full Git SHA");
 	}
 	if (!current.commit || !/^[0-9a-f]{40}$/i.test(current.commit)) {
 		failures.push("candidate commit is not a full Git SHA");
 	}
-	if (baseline.candidateRelationship !== "exact") {
+	if (
+		baseline.candidateRelationship !== "exact" &&
+		baseline.candidateRelationship !== "ancestry"
+	) {
 		failures.push(
-			"approved baseline must declare an exact candidate relationship",
+			"approved baseline must declare exact or ancestry candidate relationship",
 		);
-	} else if (baseline.commit !== current.commit) {
+	} else if (
+		baseline.candidateRelationship === "exact" &&
+		baseline.commit &&
+		current.commit &&
+		baseline.commit !== current.commit
+	) {
 		failures.push(
 			"approved baseline commit does not exactly match candidate commit",
 		);
+	} else if (
+		baseline.candidateRelationship === "ancestry" &&
+		baseline.commit &&
+		current.commit
+	) {
+		const maxDistance =
+			baseline.maxAncestryDistance ?? BENCH_DEFAULT_MAX_ANCESTRY_DISTANCE;
+		const distance = gitFirstParentDistance(baseline.commit, current.commit);
+		if (distance === null) {
+			failures.push(
+				"approved baseline commit is not a first-parent ancestor of the candidate",
+			);
+		} else if (distance > maxDistance) {
+			failures.push(
+				`approved baseline ancestry distance ${distance} exceeds max ${maxDistance}`,
+			);
+		}
 	}
 	if (!baseline.machine || baseline.machine !== current.machine) {
 		failures.push("approved baseline machine does not match candidate machine");
@@ -1010,6 +1114,72 @@ export function validateApprovedBaselineContext(
 		failures.push(
 			"approved baseline Rust runtime does not match candidate runtime",
 		);
+	}
+	const expectedToolchain = toolchainHash(
+		current.bunVersion,
+		current.rustcVersion,
+	);
+	if (!baseline.toolchainHash || baseline.toolchainHash !== expectedToolchain) {
+		failures.push(
+			"approved baseline toolchain hash does not match candidate toolchain",
+		);
+	}
+	if (
+		!baseline.minimumDetectableEffect ||
+		baseline.minimumDetectableEffect.relative !==
+			BENCH_MINIMUM_DETECTABLE_EFFECT.relative ||
+		baseline.minimumDetectableEffect.confidence !==
+			BENCH_MINIMUM_DETECTABLE_EFFECT.confidence
+	) {
+		failures.push(
+			"approved baseline must declare the 10%/95% minimum detectable effect",
+		);
+	}
+	if (
+		baseline.designWarmups !== BENCH_DESIGN_WARMUPS ||
+		baseline.designRounds !== BENCH_DESIGN_ROUNDS
+	) {
+		failures.push(
+			`approved baseline design warmups/rounds must be ${BENCH_DESIGN_WARMUPS}/${BENCH_DESIGN_ROUNDS}`,
+		);
+	}
+	if (
+		!baseline.artifactSha256 ||
+		!/^[0-9a-f]{64}$/i.test(baseline.artifactSha256)
+	) {
+		failures.push("approved baseline requires artifactSha256");
+	}
+	if (!baseline.artifactPath) {
+		failures.push("approved baseline requires artifactPath");
+	} else {
+		const artifactFull = resolve(ROOT, baseline.artifactPath);
+		if (!existsSync(artifactFull)) {
+			failures.push(
+				`approved baseline capture artifact missing at ${baseline.artifactPath}`,
+			);
+		} else {
+			const digest = sha256File(artifactFull);
+			if (
+				baseline.artifactSha256 &&
+				digest.toLowerCase() !== baseline.artifactSha256.toLowerCase()
+			) {
+				failures.push(
+					"approved baseline artifactSha256 does not match capture artifact bytes",
+				);
+			}
+			try {
+				const parsed = JSON.parse(readFileSync(artifactFull, "utf8")) as {
+					commit?: string;
+				};
+				if (!parsed.commit || parsed.commit !== baseline.commit) {
+					failures.push(
+						"capture artifact commit does not equal baseline.commit",
+					);
+				}
+			} catch {
+				failures.push("capture artifact is not valid JSON");
+			}
+		}
 	}
 	return failures;
 }

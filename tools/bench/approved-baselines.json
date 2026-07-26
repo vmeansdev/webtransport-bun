@@ -1,14 +1,27 @@
 {
   "status": "blocked",
   "approvedAt": null,
+  "approver": null,
   "commit": null,
   "candidateRelationship": null,
+  "maxAncestryDistance": 32,
   "machine": null,
   "bunVersion": null,
   "rustcVersion": null,
+  "toolchainHash": null,
+  "artifactSha256": null,
+  "artifactPath": null,
+  "minimumDetectableEffect": {
+    "relative": 0.1,
+    "confidence": 0.95
+  },
+  "designWarmups": 3,
+  "designRounds": 15,
   "notes": [
     "Populate this file only from a successful release-candidate benchmark capture.",
-    "Do not guess thresholds. bench-regress compares confidence intervals against the approved measured baseline in this file."
+    "Do not guess thresholds. bench-regress compares confidence intervals against the approved measured baseline in this file.",
+    "Gate design: detect a ≥10% relative non-overlapping CI95 regression at 95% confidence (warmups=3, rounds=15).",
+    "Approved baselines require: approver, artifactSha256+artifactPath (artifact.commit === baseline.commit), machine, toolchainHash."
   ],
   "thresholds": {},
   "lastAttempt": {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -10,6 +11,7 @@ import {
 	runCommand,
 	sampleSummary,
 	studentTCritical95,
+	toolchainHash,
 	validateApprovedBaselineContext,
 	validateBenchmarkRuns,
 } from "./bench-lib.ts";
@@ -135,9 +137,21 @@ describe("Task 14 benchmark evidence", () => {
 		).toBeNull();
 	});
 
-	test("requires an exact candidate, machine, and runtime baseline relationship", () => {
+	test("requires an exact candidate, machine, toolchain, approver, and capture artifact", () => {
 		const commit = "a".repeat(40);
-		const baseline = approvedBaseline({ commit });
+		const tempRoot = mkdtempSync(resolve(tmpdir(), "wt-bench-base-"));
+		TEMP_ROOTS.push(tempRoot);
+		const artifactPath = resolve(tempRoot, "capture.json");
+		const artifactBody = JSON.stringify({ commit, runs: [] });
+		writeFileSync(artifactPath, artifactBody);
+		const artifactSha256 = createHash("sha256")
+			.update(artifactBody)
+			.digest("hex");
+		const baseline = approvedBaseline({
+			commit,
+			artifactPath,
+			artifactSha256,
+		});
 		const current = {
 			commit,
 			machine: "darwin/arm64/local/runner-a",
@@ -145,6 +159,9 @@ describe("Task 14 benchmark evidence", () => {
 			rustcVersion: "rustc 1.95.0",
 		};
 		expect(validateApprovedBaselineContext(baseline, current)).toEqual([]);
+		expect(toolchainHash(current.bunVersion, current.rustcVersion)).toBe(
+			baseline.toolchainHash,
+		);
 
 		expect(
 			validateApprovedBaselineContext(baseline, {
@@ -156,10 +173,25 @@ describe("Task 14 benchmark evidence", () => {
 		);
 		expect(
 			validateApprovedBaselineContext(
-				approvedBaseline({ commit: "deadbeef" }),
+				approvedBaseline({
+					commit: "deadbeef",
+					artifactPath,
+					artifactSha256,
+				}),
 				current,
 			),
 		).toContain("approved baseline commit is not a full Git SHA");
+		expect(
+			validateApprovedBaselineContext(
+				approvedBaseline({
+					commit,
+					artifactPath,
+					artifactSha256,
+					approver: "",
+				}),
+				current,
+			),
+		).toContain("approved baseline requires an explicit approver");
 		expect(
 			validateApprovedBaselineContext(baseline, {
 				...current,
@@ -367,14 +399,29 @@ function requiredRuns(): BenchmarkRun[] {
 function approvedBaseline(
 	overrides: Partial<ApprovedBaselines> = {},
 ): ApprovedBaselines {
+	const bunVersion = overrides.bunVersion ?? "1.3.14";
+	const rustcVersion = overrides.rustcVersion ?? "rustc 1.95.0";
+	const commit = overrides.commit ?? "a".repeat(40);
+	const artifactPath =
+		overrides.artifactPath ?? ".release-evidence/bench/capture.json";
 	return {
 		status: "approved",
 		approvedAt: "2026-07-22T00:00:00.000Z",
-		commit: "a".repeat(40),
+		approver: "test-approver",
+		commit,
 		candidateRelationship: "exact",
+		maxAncestryDistance: 32,
 		machine: "darwin/arm64/local/runner-a",
-		bunVersion: "1.3.14",
-		rustcVersion: "rustc 1.95.0",
+		bunVersion,
+		rustcVersion,
+		toolchainHash: createHash("sha256")
+			.update(`${bunVersion}\n${rustcVersion}`)
+			.digest("hex"),
+		artifactSha256: "c".repeat(64),
+		artifactPath,
+		minimumDetectableEffect: { relative: 0.1, confidence: 0.95 },
+		designWarmups: 3,
+		designRounds: 15,
 		notes: [],
 		thresholds: {},
 		...overrides,
