@@ -398,11 +398,35 @@ export class WasmWebTransport {
 		};
 	}
 
-	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
+	async createBidirectionalStream(options?: {
+		waitUntilAvailable?: boolean;
+	}): Promise<WebTransportBidirectionalStream> {
+		if (
+			options?.waitUntilAvailable !== undefined &&
+			typeof options.waitUntilAvailable !== "boolean"
+		) {
+			throw new WebTransportError(
+				"E_INVALID_ARGUMENT",
+				"waitUntilAvailable must be a boolean",
+			);
+		}
+		// Wasm stream opens already observe governor/backpressure in WasmSession;
+		// waitUntilAvailable=true is accepted for API parity (C3).
 		return toBidi(this.session.createBidirectionalStream());
 	}
 
-	async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
+	async createUnidirectionalStream(options?: {
+		waitUntilAvailable?: boolean;
+	}): Promise<WritableStream<Uint8Array>> {
+		if (
+			options?.waitUntilAvailable !== undefined &&
+			typeof options.waitUntilAvailable !== "boolean"
+		) {
+			throw new WebTransportError(
+				"E_INVALID_ARGUMENT",
+				"waitUntilAvailable must be a boolean",
+			);
+		}
 		return streamWritable(this.session.createUnidirectionalStream());
 	}
 }

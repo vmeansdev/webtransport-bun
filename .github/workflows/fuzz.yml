@@ -29,6 +29,10 @@ jobs:
         run: rustup run 1.95.0 cargo install cargo-fuzz --locked --version 0.13.1
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Compile-check fuzz targets (PR-time safety net)
+        run: |
+          rustup run 1.95.0 cargo fuzz build --fuzz-dir tools/fuzz --sanitizer none || \
+          (cd tools/fuzz && rustup run 1.95.0 cargo check --all-targets)
       - name: Scheduled fuzz smoke
         run: bun run fuzz:release-smoke
       - name: Upload fuzz evidence
