@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
 	generateCert,
 	serverCertificateHashes,
 	type WasmCertModule,
 } from "../src/wasm-cert.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
 interface WasmCertFfiModule extends WasmCertModule {
 	wt_new_server(
@@ -24,12 +23,10 @@ interface WasmCertFfiModule extends WasmCertModule {
 	wt_close_endpoint(eid: number): void;
 }
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmCertFfiModule)
+	? ((await loadWasmModule()) as unknown as WasmCertFfiModule)
 	: (null as unknown as WasmCertFfiModule);
 
 function serverOptions(
