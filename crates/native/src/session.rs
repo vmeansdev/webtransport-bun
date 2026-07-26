@@ -201,7 +201,7 @@ impl SessionHandle {
                 let result = resp_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(napi::Error::from_reason);
+                    .map_err(wt_from_upstream_error);
                 if result.is_ok() {
                     metrics.stream_open_histogram.observe(start.elapsed());
                 }
@@ -248,7 +248,7 @@ impl SessionHandle {
                 let result = resp_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-                    .map_err(napi::Error::from_reason);
+                    .map_err(wt_from_upstream_error);
                 if result.is_ok() {
                     metrics.stream_open_histogram.observe(start.elapsed());
                 }

@@ -473,7 +473,7 @@ impl ClientSessionHandle {
         resp_rx
             .await
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-            .map_err(napi::Error::from_reason)
+            .map_err(wt_from_upstream_error)
     }
 
     #[napi]
@@ -488,7 +488,7 @@ impl ClientSessionHandle {
         resp_rx
             .await
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-            .map_err(napi::Error::from_reason)
+            .map_err(wt_from_upstream_error)
     }
 
     #[napi]
@@ -506,7 +506,7 @@ impl ClientSessionHandle {
         {
             Ok(h) => Ok(Some(h)),
             Err(e) if e == "E_SESSION_CLOSED" => Ok(None),
-            Err(e) => Err(napi::Error::from_reason(e)),
+            Err(e) => Err(wt_from_upstream_error(e)),
         }
     }
 
@@ -525,7 +525,7 @@ impl ClientSessionHandle {
         {
             Ok(h) => Ok(Some(h)),
             Err(e) if e == "E_SESSION_CLOSED" => Ok(None),
-            Err(e) => Err(napi::Error::from_reason(e)),
+            Err(e) => Err(wt_from_upstream_error(e)),
         }
     }
 }
@@ -686,9 +686,9 @@ impl ClientSessionHandle {
                                     read_err_slot,
                                 ))
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                         },
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client open_bidi response");
@@ -721,9 +721,9 @@ impl ClientSessionHandle {
                                     write_err_slot,
                                 ))
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                         },
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client open_uni response");
@@ -761,7 +761,7 @@ impl ClientSessionHandle {
                                 read_err_slot,
                             ))
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client accept_bidi response");
@@ -794,7 +794,7 @@ impl ClientSessionHandle {
                                 read_err_slot,
                             ))
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client accept_uni response");
