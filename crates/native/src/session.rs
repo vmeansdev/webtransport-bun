@@ -3,7 +3,9 @@ use napi_derive::napi;
 use std::sync::atomic::Ordering;
 
 use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
-use crate::error::{from_reason as wt_from_reason, WtResult};
+use crate::error::{
+    from_reason as wt_from_reason, from_upstream_error as wt_from_upstream_error, WtResult,
+};
 use crate::panic_guard;
 use crate::session_registry;
 use crate::RUNTIME;
@@ -206,7 +208,7 @@ impl SessionHandle {
                 result
             })
             .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+            .map_err(wt_from_upstream_error)?
     }
 
     #[napi]
@@ -215,7 +217,7 @@ impl SessionHandle {
         RUNTIME
             .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "bidi").await })
             .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+            .map_err(wt_from_upstream_error)?
     }
 
     #[napi]
@@ -253,7 +255,7 @@ impl SessionHandle {
                 result
             })
             .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+            .map_err(wt_from_upstream_error)?
     }
 
     #[napi]
@@ -262,7 +264,7 @@ impl SessionHandle {
         RUNTIME
             .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "uni").await })
             .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+            .map_err(wt_from_upstream_error)?
     }
 
     #[napi]
