@@ -1,22 +1,44 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": null,
+		"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
 		"readiness": "pending"
 	},
-	"evidence": [],
+	"evidence": [
+		{
+			"id": "local-wasm-gates-36fef17",
+			"path": "docs/release-evidence/36fef17ef3dd6929ed4d2aff76afb3ab1c03950a/wasm-local-gates.json",
+			"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+			"status": "passed",
+			"notes": "Local Actions-independent bind: bun run test:wasm on darwin/arm64."
+		},
+		{
+			"id": "local-native-gates-36fef17",
+			"path": "docs/release-evidence/36fef17ef3dd6929ed4d2aff76afb3ab1c03950a/native-local-gates.json",
+			"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+			"status": "passed",
+			"notes": "Local Actions-independent bind: packages cold-loop (count=1) on darwin/arm64. Full test:ci-local matrix still pending."
+		},
+		{
+			"id": "local-package-artifact-36fef17",
+			"path": "docs/release-evidence/36fef17ef3dd6929ed4d2aff76afb3ab1c03950a/package-artifact.json",
+			"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+			"status": "passed",
+			"notes": "Local Actions-independent bind: bun scripts/test-package-artifact.ts build."
+		}
+	],
 	"claims": [
 		{
 			"id": "native-local-gates",
 			"surface": "native",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": ["local-native-gates-36fef17"]
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": ["local-wasm-gates-36fef17"]
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -64,7 +86,8 @@
 			"id": "fuzz-gates",
 			"surface": "release",
 			"status": "pending",
-			"evidenceIds": []
+			"evidenceIds": [],
+			"notes": "release-smoke now passes --fuzz-dir/--sanitizer none; darwin cargo-fuzz still fails linking sancov without ASan runtime. Linux/CI campaign still required for pass."
 		},
 		{
 			"id": "scale-10k-multisource",
@@ -76,8 +99,8 @@
 		{
 			"id": "package-artifact",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": ["local-package-artifact-36fef17"]
 		},
 		{
 			"id": "supply-chain-provenance",
@@ -132,7 +155,7 @@
 				"id": "wasm-bun-suite-ubuntu-only",
 				"surface": "wasm",
 				"claimIds": ["wasm-local-gates"],
-				"summary": "Wasm Bun suite (wasm-*.test.ts + webtransport-like) evidence is produced on the ubuntu wasm CI job only; the OS/bun matrix excludes those files by design."
+				"summary": "Hosted wasm Bun suite evidence is produced on the ubuntu wasm CI job; local darwin evidence is additionally bound under docs/release-evidence/ while Actions are unavailable, and does not expand the claimed support matrix."
 			}
 		]
 	}
