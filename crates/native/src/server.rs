@@ -262,7 +262,7 @@ impl ServerHandle {
         _rate_limits_json: String,
         on_session: JsFunction,
         log_fn: JsFunction,
-    ) -> WtResult<Self> {
+    ) -> Result<Self> {
         panic_guard::catch_panic(|| {
             let session_tsfn: ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal> =
                 on_session
@@ -386,7 +386,6 @@ impl ServerHandle {
                 }),
             })
         })
-        .map_err(wt_from_reason)
     }
 
     #[napi(getter)]
