@@ -1,30 +1,44 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+		"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-wasm-gates-36fef17",
-			"path": "docs/release-evidence/36fef17ef3dd6929ed4d2aff76afb3ab1c03950a/wasm-local-gates.json",
-			"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+			"id": "local-wasm-gates-4c29189",
+			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/wasm-local-gates.json",
+			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: bun run test:wasm on darwin/arm64."
 		},
 		{
-			"id": "local-native-gates-36fef17",
-			"path": "docs/release-evidence/36fef17ef3dd6929ed4d2aff76afb3ab1c03950a/native-local-gates.json",
-			"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+			"id": "local-native-gates-4c29189",
+			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/native-local-gates.json",
+			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: packages cold-loop (count=1) on darwin/arm64. Full test:ci-local matrix still pending."
 		},
 		{
-			"id": "local-package-artifact-36fef17",
-			"path": "docs/release-evidence/36fef17ef3dd6929ed4d2aff76afb3ab1c03950a/package-artifact.json",
-			"commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+			"id": "local-package-artifact-4c29189",
+			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/package-artifact.json",
+			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
 			"status": "passed",
 			"notes": "Local Actions-independent bind: bun scripts/test-package-artifact.ts build."
+		},
+		{
+			"id": "local-runtime-consumers-4c29189",
+			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/runtime-consumers.json",
+			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"status": "passed",
+			"notes": "Local Actions-independent bind: internal-package-artifact.test.ts."
+		},
+		{
+			"id": "local-supply-chain-4c29189",
+			"path": "docs/release-evidence/4c29189ccb406b75c1abc7aebe604754b5dbe07e/supply-chain-provenance.json",
+			"commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
+			"status": "passed",
+			"notes": "Local Actions-independent bind: bun scripts/check-actions-pinned.ts across workflows."
 		}
 	],
 	"claims": [
@@ -32,13 +46,13 @@
 			"id": "native-local-gates",
 			"surface": "native",
 			"status": "passed",
-			"evidenceIds": ["local-native-gates-36fef17"]
+			"evidenceIds": ["local-native-gates-4c29189"]
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
-			"evidenceIds": ["local-wasm-gates-36fef17"]
+			"evidenceIds": ["local-wasm-gates-4c29189"]
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -49,8 +63,8 @@
 		{
 			"id": "runtime-consumers",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": ["local-runtime-consumers-4c29189"]
 		},
 		{
 			"id": "chromium-native-interop",
@@ -80,7 +94,8 @@
 			"id": "coverage-gates",
 			"surface": "release",
 			"status": "pending",
-			"evidenceIds": []
+			"evidenceIds": [],
+			"notes": "typecheck alone is insufficient; needs coverage workflow / threshold evidence."
 		},
 		{
 			"id": "fuzz-gates",
@@ -100,13 +115,13 @@
 			"id": "package-artifact",
 			"surface": "release",
 			"status": "passed",
-			"evidenceIds": ["local-package-artifact-36fef17"]
+			"evidenceIds": ["local-package-artifact-4c29189"]
 		},
 		{
 			"id": "supply-chain-provenance",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": []
+			"status": "passed",
+			"evidenceIds": ["local-supply-chain-4c29189"]
 		},
 		{
 			"id": "soak-24h",

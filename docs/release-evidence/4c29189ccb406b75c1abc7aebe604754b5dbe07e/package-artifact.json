@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "kind": "command",
   "name": "package-artifact",
-  "commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+  "commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
   "platform": {
     "os": "darwin",
     "arch": "arm64",
-    "runtime": "bun"
+    "runtime": "bun/1.3.14"
   },
   "toolchain": {
     "name": "bun",
@@ -18,7 +18,7 @@
     "build"
   ],
   "exitCode": 0,
-  "startedAt": "2026-07-26T19:48:09.638Z",
-  "finishedAt": "2026-07-26T19:48:13.949Z",
+  "startedAt": "2026-07-26T20:02:04.733Z",
+  "finishedAt": "2026-07-26T20:02:05.733Z",
   "artifactSha256": "7ae0c5c1a3c2d992c9c367c67dd12ea2b562172cbb151580273c3d7bca5dba63"
 }
