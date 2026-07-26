@@ -25,7 +25,7 @@ use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
 };
-use crate::error::WtResult;
+use crate::error::{from_upstream_error as wt_from_upstream_error, WtResult};
 use crate::server_metrics::ServerMetrics;
 use crate::session_registry::SessionMetrics;
 use crate::CLIENT_RUNTIME;
@@ -893,7 +893,7 @@ fn connect_inner(
     CLIENT_RUNTIME.spawn(async move {
         let result = match run_connect(&url, opts_json)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| wt_from_upstream_error(e.to_string()))
             .map(|(id, peer_ip, peer_port, conn, release_guard)| {
                 let handle = ClientSessionHandle::spawn_session_task(
                     id.clone(),
