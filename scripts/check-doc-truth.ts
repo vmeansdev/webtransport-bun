@@ -510,6 +510,34 @@ if (status) {
 				);
 			}
 		}
+		const iwa = claims.get("iwa-direct-sockets");
+		if (!iwa) {
+			report(
+				"release-status.candidate.readiness",
+				"ready release requires the iwa-direct-sockets claim",
+			);
+		} else if (iwa.status !== "passed" || iwa.evidenceIds.length === 0) {
+			report(
+				"release-status.candidate.readiness",
+				"ready release requires iwa-direct-sockets to be passed with commit-bound evidence (run-iwa.mjs / iwa.yml artifacts)",
+			);
+		} else {
+			const bound = iwa.evidenceIds.some((id) => {
+				const entry = evidence.get(id);
+				return (
+					entry?.status === "passed" &&
+					entry.commit === status.candidate.commit &&
+					typeof entry.path === "string" &&
+					entry.path.length > 0
+				);
+			});
+			if (!bound) {
+				report(
+					"release-status.candidate.readiness",
+					"ready release requires iwa-direct-sockets evidence bound to the release commit",
+				);
+			}
+		}
 	}
 }
 checkRuntimeContract();
