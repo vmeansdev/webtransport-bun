@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "kind": "command",
   "name": "wasm-local-gates",
-  "commit": "36fef17ef3dd6929ed4d2aff76afb3ab1c03950a",
+  "commit": "4c29189ccb406b75c1abc7aebe604754b5dbe07e",
   "platform": {
     "os": "darwin",
     "arch": "arm64",
-    "runtime": "bun"
+    "runtime": "bun/1.3.14"
   },
   "toolchain": {
     "name": "bun",
@@ -18,7 +18,7 @@
     "test:wasm"
   ],
   "exitCode": 0,
-  "startedAt": "2026-07-26T19:48:03.239Z",
-  "finishedAt": "2026-07-26T19:48:09.475Z",
-  "artifactSha256": "f62318a52e7e9bce146f6225d50b14a54c076ec3c29fa1f2590f3b8291473435"
+  "startedAt": "2026-07-26T20:02:00.661Z",
+  "finishedAt": "2026-07-26T20:02:01.661Z",
+  "artifactSha256": "5a16b77662b3e5c275a420cfd092f6299e59ac7445337d07ebb91a407a262efd"
 }
