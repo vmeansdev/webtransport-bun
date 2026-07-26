@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Duplex } from "node:stream";
 import {
-	__TESTING__,
 	E_INTERNAL,
 	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
@@ -18,6 +17,7 @@ import {
 	WebTransport,
 	WebTransportError,
 } from "../src/index.js";
+import { __TESTING__ } from "../src/internal.js";
 import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
 
 describe("internal TS error propagation", () => {
@@ -48,6 +48,23 @@ describe("internal TS error propagation", () => {
 			session.sendDatagram(new Uint8Array([1])),
 		).rejects.toMatchObject({
 			code: E_INTERNAL,
+		});
+	});
+
+	it("native error parser prefers explicit err.code when present", async () => {
+		const wrapped = new Error("not a real code message");
+		(wrapped as { code: string }).code = "E_HANDSHAKE_TIMEOUT";
+		const session = __TESTING__.createNativeClientSessionForTests({
+			sendDatagram: async () => {
+				throw wrapped;
+			},
+			close: () => {},
+		});
+		await expect(
+			session.sendDatagram(new Uint8Array([1])),
+		).rejects.toMatchObject({
+			code: E_HANDSHAKE_TIMEOUT,
+			message: "not a real code message",
 		});
 	});
 

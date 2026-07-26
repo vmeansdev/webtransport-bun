@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { __TESTING__ } from "../src/index.js";
+import { __TESTING__ } from "../src/internal.js";
 
 describe("internal waitUntilAvailable native signaling", () => {
 	it("NativeServerSession.createBidirectionalStream uses native waitBidiCapacity when available", async () => {
