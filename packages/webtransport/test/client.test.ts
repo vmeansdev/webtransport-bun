@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { connect, createServer } from "../src/index.js";
+import {
+	connect,
+	createServer,
+	E_INVALID_ARGUMENT,
+	E_UNSUPPORTED_ARGUMENT,
+} from "../src/index.js";
 import {
 	forEachWithTimeout,
 	nextWithTimeout,
@@ -33,6 +38,21 @@ describe("webtransport client", () => {
 
 	it("connect rejects when server unreachable", async () => {
 		await expect(connect("https://127.0.0.1:19999")).rejects.toThrow();
+	}, 15000);
+
+	it("connect rejects malformed URL with E_INVALID_ARGUMENT", async () => {
+		await expect(connect("https://")).rejects.toMatchObject({
+			code: E_INVALID_ARGUMENT,
+		});
+		await expect(connect("not-a-url")).rejects.toMatchObject({
+			code: E_INVALID_ARGUMENT,
+		});
+	}, 15000);
+
+	it("connect rejects non-https URL with E_UNSUPPORTED_ARGUMENT", async () => {
+		await expect(connect("http://127.0.0.1:19999")).rejects.toMatchObject({
+			code: E_UNSUPPORTED_ARGUMENT,
+		});
 	}, 15000);
 
 	it("connect rejects self-signed cert when not using insecureSkipVerify (P0-3)", async () => {

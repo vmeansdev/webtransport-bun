@@ -10,7 +10,8 @@ import {
 	createServer,
 	WebTransportError,
 	__TESTING__,
-	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_UNSUPPORTED_ARGUMENT,
 	E_HANDSHAKE_TIMEOUT,
 	E_QUEUE_FULL,
 } from "../src/index.js";
@@ -50,7 +51,7 @@ describe("parity compat (behavior-level)", () => {
 			});
 		} catch (e) {
 			expect(e).toBeInstanceOf(WebTransportError);
-			expect((e as WebTransportError).code).toBe(E_INTERNAL);
+			expect((e as WebTransportError).code).toBe(E_UNSUPPORTED_ARGUMENT);
 			expect((e as WebTransportError).name).toBe("NotSupportedError");
 			return;
 		}
@@ -72,7 +73,7 @@ describe("parity compat (behavior-level)", () => {
 				tls: { insecureSkipVerify: true },
 			});
 		} catch (e) {
-			expect((e as WebTransportError).code).toBe(E_INTERNAL);
+			expect((e as WebTransportError).code).toBe(E_INVALID_ARGUMENT);
 		}
 	});
 
@@ -130,7 +131,7 @@ describe("parity compat (behavior-level)", () => {
 			});
 		} catch (e) {
 			expect(e).toBeInstanceOf(WebTransportError);
-			expect((e as WebTransportError).code).toBe(E_INTERNAL);
+			expect((e as WebTransportError).code).toBe(E_INVALID_ARGUMENT);
 			expect((e as WebTransportError).name).toBe("TypeError");
 			return;
 		}

@@ -13,12 +13,7 @@ import {
 	E_STREAM_RESET,
 	WebTransportError,
 } from "./errors.js";
-
-/** Browser-style close info (W3C alignment). */
-export type WebTransportCloseInfo = {
-	closeCode?: number;
-	reason?: string;
-};
+import type { WebTransportCloseInfo } from "./types.js";
 
 /** A bidirectional stream as a pair of WHATWG streams. */
 export interface WebTransportBidirectionalStream {
