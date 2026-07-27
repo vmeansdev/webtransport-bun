@@ -14,8 +14,8 @@
 		"check"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "package artifact check after wasm-dist rebuild (eventWireVersion 2)",
-	"artifactSha256": "c5c1a58c99dd204170da1e2f25a12a3f58d1a457ba8e1ba32eb1b6f7dbe39634"
+	"startedAt": "2026-07-27T14:00:15+00:00",
+	"finishedAt": "2026-07-27T14:00:23+00:00",
+	"notes": "package artifact check after wasm-dist rebuild (eventWireVersion 2) (wall window ~8s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "ba67884529f8028d82ceb28c99867f52195fed9baa6f3ad54b259ba8f93ca993"
 }

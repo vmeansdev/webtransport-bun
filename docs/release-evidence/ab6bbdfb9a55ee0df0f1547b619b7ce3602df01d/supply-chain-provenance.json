@@ -13,8 +13,8 @@
 		"scripts/check-actions-pinned.ts"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "actions pin policy",
-	"artifactSha256": "5f9b67e757fb330c747a31202c533c40dd471beed1109cdc9eb98ced22011be7"
+	"startedAt": "2026-07-27T14:00:03+00:00",
+	"finishedAt": "2026-07-27T14:00:04+00:00",
+	"notes": "actions pin policy (wall window ~1s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "6afb9745ae0946e43f24f38ee31875b8945c1bc745f22db54f0ed8b281956337"
 }

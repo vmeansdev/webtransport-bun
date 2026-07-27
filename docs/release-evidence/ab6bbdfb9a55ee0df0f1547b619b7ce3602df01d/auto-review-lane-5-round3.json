@@ -1,0 +1,68 @@
+{
+	"lane": 5,
+	"round": 3,
+	"agent": "ef373e64-0528-4cb5-a74c-11eaab9e2ca1",
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L5-P2-0rtt-soft-assert",
+			"severity": "P2",
+			"summary": "has0Rtt===true hard assert on shared-store reconnect",
+			"status": "fixed"
+		},
+		{
+			"id": "L5-P2-qpack-product-tests",
+			"severity": "P2",
+			"summary": "Rust ICI\u2192KRC + indexed CONNECT; bun enableDynamicQpack session",
+			"status": "fixed"
+		},
+		{
+			"id": "L5-P2-event-fuzz-stale",
+			"severity": "P2",
+			"summary": "event_encode fuzz covers session_id wire v2",
+			"status": "fixed"
+		},
+		{
+			"id": "L5-P2-chromium-evidence",
+			"severity": "P2",
+			"summary": "chromium wasm/native rebound at ab6bbdf",
+			"status": "fixed"
+		},
+		{
+			"id": "L5-P2-coverage-unrebound",
+			"severity": "P2",
+			"summary": "coverage-gates demoted pending (honest)",
+			"status": "invalidated"
+		},
+		{
+			"id": "L5-P3-multisession-edges",
+			"severity": "P3",
+			"summary": "product tests cover isolation/SessionClosed/limit",
+			"status": "fixed"
+		},
+		{
+			"id": "L5-P3-unbounded-awaits",
+			"severity": "P3",
+			"summary": "handshake-bounded awaits",
+			"status": "fixed"
+		},
+		{
+			"id": "L5-P3-fault-soak",
+			"severity": "P3",
+			"summary": "fault rebound; soak pending OK",
+			"status": "invalidated"
+		},
+		{
+			"id": "L5-P3-fuzz-gates-pending",
+			"severity": "P3",
+			"summary": "fuzz updated; fuzz-gates pending OK",
+			"status": "invalidated"
+		},
+		{
+			"id": "L5-P4-flaky-markers",
+			"severity": "P4",
+			"summary": "no flake signals",
+			"status": "invalidated"
+		}
+	]
+}

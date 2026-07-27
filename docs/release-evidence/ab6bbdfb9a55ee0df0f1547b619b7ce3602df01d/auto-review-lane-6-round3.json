@@ -1,0 +1,69 @@
+{
+	"lane": 6,
+	"round": 3,
+	"agent": "61a73489-6210-472d-bf48-841d6bf9ca12",
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L6-P0-test-wasm-allowlist",
+			"severity": "P0",
+			"status": "fixed",
+			"summary": "allowlist"
+		},
+		{
+			"id": "L6-P1-ticketstore-exports",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "exports"
+		},
+		{
+			"id": "L6-P1-compat-bigint",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "bigint docs"
+		},
+		{
+			"id": "L6-P1-evidence-stamp-clone",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "cloned zero-duration timestamps on ab6bbdf command evidence",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L6-P2-wire-provenance",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "eventWireVersion 2"
+		},
+		{
+			"id": "L6-P2-claim-drift",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "rebind"
+		},
+		{
+			"id": "L6-P2-compat-chromium-evidence",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "COMPATIBILITY Chrome\u2192wasm evidence pending wording",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L6-P3-allowlist-floor",
+			"severity": "P3",
+			"status": "invalidated",
+			"summary": "floor equals disk count including non-allowlisted (deferred / non-blocking)"
+		},
+		{
+			"id": "L6-P3-open-session-f64",
+			"severity": "P3",
+			"status": "invalidated"
+		},
+		{
+			"id": "L6-P4-testplan",
+			"severity": "P4",
+			"status": "invalidated"
+		}
+	],
+	"note": "evidence stamps + COMPATIBILITY chromium wording fixed"
+}

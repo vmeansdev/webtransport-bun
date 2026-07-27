@@ -1,0 +1,80 @@
+{
+	"lane": 1,
+	"round": 3,
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "SEC-01",
+			"severity": "P1",
+			"summary": "Client CONNECT deadline + pending/unlatched count toward wt_max_sessions",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs:992"
+		},
+		{
+			"id": "SEC-02",
+			"severity": "P2",
+			"summary": "Default per-endpoint ticket store; shareProcess0RttTicketStore opt-in + shared ClientConfig",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs:41"
+		},
+		{
+			"id": "SEC-03",
+			"severity": "P2",
+			"summary": "TicketStoreHost not on TLS path",
+			"status": "invalidated"
+		},
+		{
+			"id": "SEC-04",
+			"severity": "P2",
+			"summary": "CONNECT admission occupied=unlatched+active_wt; early RESET; cap-only (no Handshake/StreamOpen charge) intentional and fail-closed vs storms",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs:2108"
+		},
+		{
+			"id": "SEC-05",
+			"severity": "P3",
+			"summary": "requireSafeSessionId soft-fails to null (no throw)",
+			"status": "fixed",
+			"file": "packages/webtransport/src/backend-wasm.ts:171"
+		},
+		{
+			"id": "SEC-06",
+			"severity": "P3",
+			"summary": "unknown SESSION_CLOSED silently ignored",
+			"status": "invalidated"
+		},
+		{
+			"id": "SEC-CLOSE",
+			"severity": "P1",
+			"summary": "primary close_wt_session propagates application code/reason via close_conn",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs:3166"
+		},
+		{
+			"id": "SEC-07",
+			"severity": "P1",
+			"summary": "Server never applies handshakeTimeoutMs after QUIC accept: keep-alives defeat idle, so CONNECT-less peers pin handshake_reservations+session_reservations until maxHandshakesInFlight exhaustion",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs:1210",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "SEC-08",
+			"severity": "P3",
+			"summary": "qpackMaxTableCapacity from JS is unclamped (operator can advertise/allocate unbounded dynamic-table capacity)",
+			"status": "fixed",
+			"file": "crates/wasm/src/bridge.rs:180",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "SEC-09",
+			"severity": "P3",
+			"summary": "wt_open_session still returns f64; JS BigInt(sid) can lose precision above MAX_SAFE_INTEGER",
+			"status": "invalidated",
+			"file": "crates/wasm/src/bridge.rs:632",
+			"fixedIn": "round3-follow-up"
+		}
+	],
+	"agent": "798e27a1-3907-4db8-9310-38b8b5dad880",
+	"note": "SEC-07 server post-accept deadline; SEC-08 QPACK hard caps; SEC-09 f64 deferred"
+}
