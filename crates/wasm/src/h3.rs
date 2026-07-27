@@ -235,11 +235,9 @@ impl DynamicTable {
     ) -> Result<(), QpackError> {
         let sz = Self::entry_size(&name, &value);
         if sz > self.capacity {
-            // Entry larger than current capacity: drop acknowledged entries
-            // (and empty only what the ack floor allows) — not a hard error
-            // when the table can be cleared.
-            self.evict_to_fit(usize::MAX, ack_floor)?;
-            return Ok(());
+            // Oversized relative to current capacity: RFC 9204 treats this as an
+            // encoder-stream error — do not pretend success after a no-op clear.
+            return Err(QpackError::Invalid);
         }
         self.evict_to_fit(sz, ack_floor)?;
         self.entries.push_back(DynEntry { name, value });
@@ -525,37 +523,46 @@ pub fn encode_connect_request_with(
             ric: 0,
         });
     }
+    // Encode against a clone so a mid-flight Err cannot leave unreplicated
+    // inserts in the live encoder (literal fallback would desync the peer).
+    let mut scratch = encoder.clone();
     let mut encoder_stream = Vec::new();
-    if encoder.table.insert_count() == 0 {
-        encoder_stream.extend(encoder.set_capacity_instruction(encoder.table.max_capacity())?);
+    if scratch.table.insert_count() == 0 {
+        encoder_stream.extend(scratch.set_capacity_instruction(scratch.table.max_capacity())?);
     }
-    let method = ensure_dynamic_entry(encoder, ":method", "CONNECT", &mut encoder_stream)?;
-    let protocol = ensure_dynamic_entry(encoder, ":protocol", "webtransport", &mut encoder_stream)?;
-    let scheme = ensure_dynamic_entry(encoder, ":scheme", "https", &mut encoder_stream)?;
-    let auth = ensure_dynamic_entry(encoder, ":authority", authority, &mut encoder_stream)?;
-    let path_abs = ensure_dynamic_entry(encoder, ":path", path, &mut encoder_stream)?;
+    let method = ensure_dynamic_entry(&mut scratch, ":method", "CONNECT", &mut encoder_stream)?;
+    let protocol = ensure_dynamic_entry(
+        &mut scratch,
+        ":protocol",
+        "webtransport",
+        &mut encoder_stream,
+    )?;
+    let scheme = ensure_dynamic_entry(&mut scratch, ":scheme", "https", &mut encoder_stream)?;
+    let auth = ensure_dynamic_entry(&mut scratch, ":authority", authority, &mut encoder_stream)?;
+    let path_abs = ensure_dynamic_entry(&mut scratch, ":path", path, &mut encoder_stream)?;
 
-    let insert_count = encoder.table.insert_count();
+    let insert_count = scratch.table.insert_count();
     let ric = insert_count;
     let base = insert_count + 1;
     let mut fields = Vec::new();
-    encode_field_section_prefix(ric, base, encoder.table.max_capacity(), &mut fields)
+    encode_field_section_prefix(ric, base, scratch.table.max_capacity(), &mut fields)
         .ok_or(QpackError::Invalid)?;
-    encoder
+    scratch
         .encode_dynamic_indexed(method, base, &mut fields)
         .ok_or(QpackError::Invalid)?;
-    encoder
+    scratch
         .encode_dynamic_indexed(protocol, base, &mut fields)
         .ok_or(QpackError::Invalid)?;
-    encoder
+    scratch
         .encode_dynamic_indexed(scheme, base, &mut fields)
         .ok_or(QpackError::Invalid)?;
-    encoder
+    scratch
         .encode_dynamic_indexed(auth, base, &mut fields)
         .ok_or(QpackError::Invalid)?;
-    encoder
+    scratch
         .encode_dynamic_indexed(path_abs, base, &mut fields)
         .ok_or(QpackError::Invalid)?;
+    *encoder = scratch;
     Ok(EncodedHeaders {
         headers_frame: frame_wrap(frame::HEADERS, &fields),
         encoder_stream,
@@ -575,20 +582,22 @@ pub fn encode_status_response_with(
             ric: 0,
         });
     }
+    let mut scratch = encoder.clone();
     let mut encoder_stream = Vec::new();
-    if encoder.table.insert_count() == 0 {
-        encoder_stream.extend(encoder.set_capacity_instruction(encoder.table.max_capacity())?);
+    if scratch.table.insert_count() == 0 {
+        encoder_stream.extend(scratch.set_capacity_instruction(scratch.table.max_capacity())?);
     }
-    let status_abs = ensure_dynamic_entry(encoder, ":status", status, &mut encoder_stream)?;
-    let insert_count = encoder.table.insert_count();
+    let status_abs = ensure_dynamic_entry(&mut scratch, ":status", status, &mut encoder_stream)?;
+    let insert_count = scratch.table.insert_count();
     let ric = insert_count;
     let base = insert_count + 1;
     let mut fields = Vec::new();
-    encode_field_section_prefix(ric, base, encoder.table.max_capacity(), &mut fields)
+    encode_field_section_prefix(ric, base, scratch.table.max_capacity(), &mut fields)
         .ok_or(QpackError::Invalid)?;
-    encoder
+    scratch
         .encode_dynamic_indexed(status_abs, base, &mut fields)
         .ok_or(QpackError::Invalid)?;
+    *encoder = scratch;
     Ok(EncodedHeaders {
         headers_frame: frame_wrap(frame::HEADERS, &fields),
         encoder_stream,
@@ -1644,12 +1653,12 @@ mod tests {
             table.insert_with_ack_floor("too".into(), "big-for-cap".into(), Some(0)),
             Err(QpackError::Invalid)
         );
-        // Empty + oversized clears via usize::MAX path when floor allows.
+        // Empty + oversized is an encoder error (not Ok-after-clear).
         let mut empty = DynamicTable::new(10);
         empty.set_capacity(10).unwrap();
         assert_eq!(
             empty.insert_with_ack_floor("abcdefghij".into(), "klmnopqrst".into(), None),
-            Ok(())
+            Err(QpackError::Invalid)
         );
         assert!(empty.is_empty());
     }

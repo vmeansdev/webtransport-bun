@@ -33,9 +33,44 @@ fn shared_0rtt_ticket_store() -> Arc<InMemoryTicketStore> {
         .clone()
 }
 
+/// TLS SNI / ticket-store key from a WebTransport authority.
+///
+/// Strips a trailing `:port` (including bracketed IPv6). Quinn `connect` and
+/// ticket hydrate/dump must use the same host so 0-RTT tickets key correctly
+/// for non-localhost authorities.
+pub(crate) fn tls_server_name_from_authority(authority: &str) -> Option<String> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => authority,
+        }
+    } else if let Some((h, port)) = authority.rsplit_once(':') {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    } else {
+        authority
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn shared_0rtt_client_ticket_count(server_name: &str) -> usize {
-    shared_0rtt_ticket_store().client_ticket_count(server_name)
+    let Some(host) = tls_server_name_from_authority(server_name) else {
+        return 0;
+    };
+    shared_0rtt_ticket_store().client_ticket_count(&host)
 }
 
 fn ticket_store_for_0rtt(share_process: bool) -> Arc<InMemoryTicketStore> {
@@ -131,6 +166,9 @@ struct Session {
     qpack_decoder: h3::QpackDecoder,
     /// Encoder-side dynamic QPACK table for outbound HEADERS when capacity > 0.
     qpack_encoder: h3::QpackEncoder,
+    /// Header streams currently waiting on QPACK inserts (Blocked). Counted
+    /// against SETTINGS_QPACK_BLOCKED_STREAMS.
+    qpack_blocked_streams: HashSet<StreamId>,
     /// Stream id → Required Insert Count for sections we emitted (section-ack → KRC).
     pending_section_ric: HashMap<u64, u64>,
     /// Peer-accepted streams (uni + bidi) being classified/read.
@@ -368,10 +406,44 @@ fn should_reset_send_on_wt_reject(bidi: bool) -> bool {
 
 /// SETTINGS_QPACK_BLOCKED_STREAMS = 0 forbids waiting on encoder inserts.
 fn qpack_blocking_forbidden(max_blocked_streams: u64) -> bool {
-    if max_blocked_streams == 0 {
-        true
-    } else {
-        false
+    max_blocked_streams == 0
+}
+
+/// Record a Blocked header stream, or close the connection when over the
+/// advertised SETTINGS_QPACK_BLOCKED_STREAMS cap (including max=0).
+/// When `stream_id` is `None` (primary CONNECT not yet indexed), only the
+/// max=0 fail-closed check applies.
+fn note_qpack_header_blocked(
+    sessions: &mut HashMap<ConnectionHandle, Session>,
+    h: ConnectionHandle,
+    stream_id: Option<StreamId>,
+) -> Result<(), &'static [u8]> {
+    let Some(s) = sessions.get_mut(&h) else {
+        return Ok(());
+    };
+    let max_blocked = s.qpack_decoder.max_blocked_streams();
+    if qpack_blocking_forbidden(max_blocked) {
+        return Err(b"QPACK blocked streams not permitted");
+    }
+    let Some(stream_id) = stream_id else {
+        return Ok(());
+    };
+    let max = usize::try_from(max_blocked).unwrap_or(usize::MAX);
+    let already = s.qpack_blocked_streams.contains(&stream_id);
+    if !already && s.qpack_blocked_streams.len() >= max {
+        return Err(b"QPACK blocked stream limit exceeded");
+    }
+    s.qpack_blocked_streams.insert(stream_id);
+    Ok(())
+}
+
+fn clear_qpack_header_blocked(
+    sessions: &mut HashMap<ConnectionHandle, Session>,
+    h: ConnectionHandle,
+    stream_id: StreamId,
+) {
+    if let Some(s) = sessions.get_mut(&h) {
+        s.qpack_blocked_streams.remove(&stream_id);
     }
 }
 
@@ -981,7 +1053,11 @@ impl WtEndpoint {
                 return -1;
             }
         };
-        let (handle, conn) = match self.inner.connect(now, cfg, self.peer_addr, "localhost") {
+        let Some(server_name) = tls_server_name_from_authority(authority) else {
+            self.set_last_error("E_INVALID_ARGUMENT: empty authority host");
+            return -1;
+        };
+        let (handle, conn) = match self.inner.connect(now, cfg, self.peer_addr, &server_name) {
             Ok(pair) => pair,
             Err(_) => {
                 self.set_last_error("E_INTERNAL: quic connect rejected");
@@ -1047,16 +1123,20 @@ impl WtEndpoint {
 
     /// Drain client TLS tickets for `server_name` into an opaque vault blob.
     pub fn dump_client_ticket(&self, server_name: &str) -> Option<Vec<u8>> {
+        let host = tls_server_name_from_authority(server_name)?;
         self.ticket_store
             .as_ref()
-            .and_then(|store| store.export_client_tickets(server_name))
+            .and_then(|store| store.export_client_tickets(&host))
     }
 
     /// Hydrate client TLS tickets from an opaque vault blob before connect.
     pub fn import_client_ticket(&self, server_name: &str, blob: &[u8]) -> bool {
+        let Some(host) = tls_server_name_from_authority(server_name) else {
+            return false;
+        };
         self.ticket_store
             .as_ref()
-            .is_some_and(|store| store.import_client_tickets(server_name, blob))
+            .is_some_and(|store| store.import_client_tickets(&host, blob))
     }
 
     /// Local QPACK SETTINGS (advertised and used to bound the decoder).
@@ -2616,19 +2696,10 @@ impl WtEndpoint {
             };
             match decode_result {
                 Err(h3::QpackError::Blocked) => {
-                    // Wait for encoder-stream inserts unless we advertised
-                    // SETTINGS_QPACK_BLOCKED_STREAMS = 0 (no blocking allowed).
-                    let max_blocked = self
-                        .sessions
-                        .get(&h)
-                        .map(|s| s.qpack_decoder.max_blocked_streams())
-                        .unwrap_or(0);
-                    if qpack_blocking_forbidden(max_blocked) {
-                        self.close_conn_protocol_error(
-                            h,
-                            QPACK_DECOMPRESSION_FAILED,
-                            b"QPACK blocked streams not permitted",
-                        );
+                    if let Err(reason) =
+                        note_qpack_header_blocked(&mut self.sessions, h, Some(stream_id))
+                    {
+                        self.close_conn_protocol_error(h, QPACK_DECOMPRESSION_FAILED, reason);
                     }
                     return;
                 }
@@ -2641,6 +2712,7 @@ impl WtEndpoint {
                     return;
                 }
                 Ok((headers, ric)) => {
+                    clear_qpack_header_blocked(&mut self.sessions, h, stream_id);
                     if let Some(s) = self.sessions.get_mut(&h) {
                         if let Some(st) = s.in_streams.get_mut(&stream_id) {
                             st.buf.drain(..total);
@@ -2757,17 +2829,9 @@ impl WtEndpoint {
             };
             let headers = match decode_result {
                 Err(h3::QpackError::Blocked) => {
-                    let max_blocked = self
-                        .sessions
-                        .get(&h)
-                        .map(|s| s.qpack_decoder.max_blocked_streams())
-                        .unwrap_or(0);
-                    if qpack_blocking_forbidden(max_blocked) {
-                        self.close_conn_protocol_error(
-                            h,
-                            QPACK_DECOMPRESSION_FAILED,
-                            b"QPACK blocked streams not permitted",
-                        );
+                    let sid = self.sessions.get(&h).and_then(|s| s.connect_stream);
+                    if let Err(reason) = note_qpack_header_blocked(&mut self.sessions, h, sid) {
+                        self.close_conn_protocol_error(h, QPACK_DECOMPRESSION_FAILED, reason);
                     }
                     return;
                 }
@@ -2780,6 +2844,9 @@ impl WtEndpoint {
                     return;
                 }
                 Ok((headers, ric)) => {
+                    if let Some(sid) = self.sessions.get(&h).and_then(|s| s.connect_stream) {
+                        clear_qpack_header_blocked(&mut self.sessions, h, sid);
+                    }
                     if let Some(s) = self.sessions.get_mut(&h) {
                         s.connect_rx.drain(..total);
                     }
@@ -2881,17 +2948,10 @@ impl WtEndpoint {
             };
             let headers = match decode_result {
                 Err(h3::QpackError::Blocked) => {
-                    let max_blocked = self
-                        .sessions
-                        .get(&h)
-                        .map(|s| s.qpack_decoder.max_blocked_streams())
-                        .unwrap_or(0);
-                    if qpack_blocking_forbidden(max_blocked) {
-                        self.close_conn_protocol_error(
-                            h,
-                            QPACK_DECOMPRESSION_FAILED,
-                            b"QPACK blocked streams not permitted",
-                        );
+                    if let Err(reason) =
+                        note_qpack_header_blocked(&mut self.sessions, h, Some(stream_id))
+                    {
+                        self.close_conn_protocol_error(h, QPACK_DECOMPRESSION_FAILED, reason);
                     }
                     return;
                 }
@@ -2904,6 +2964,7 @@ impl WtEndpoint {
                     return;
                 }
                 Ok((headers, ric)) => {
+                    clear_qpack_header_blocked(&mut self.sessions, h, stream_id);
                     if let Some(pending) = self
                         .sessions
                         .get_mut(&h)
