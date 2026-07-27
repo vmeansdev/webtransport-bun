@@ -96,7 +96,7 @@ export type WasmEndpointOptions = {
 
 export type WasmNormalizedEndpointOptions = {
 	limits: Required<WasmLimitsOptions>;
-	rateLimits: Required<WasmRateLimitsOptions>;
+	rateLimits: Required<WasmRateLimitOptions>;
 	/** Present only when the caller set {@link WasmEndpointOptions.wtMaxSessions}. */
 	wtMaxSessions?: number;
 	/** Present only when the caller set {@link WasmEndpointOptions.enable0Rtt}. */

@@ -237,7 +237,9 @@ function createDatagramReadable(
 				byteController.byobRequest.respond(item.data.length);
 				return;
 			}
-			datagramsController.enqueue(item.data);
+			datagramsController.enqueue(
+				item.data as Uint8Array<ArrayBuffer> & ArrayBufferView<ArrayBuffer>,
+			);
 		} finally {
 			item.reservation?.release();
 		}
