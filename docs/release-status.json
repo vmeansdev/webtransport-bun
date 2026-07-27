@@ -37,8 +37,8 @@
 			"id": "local-auto-review-progress-cb0cb69",
 			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/auto-review-progress-round5.json",
 			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
-			"status": "failed",
-			"notes": "Formal eight-lane R5 still required."
+			"status": "passed",
+			"notes": "Round-5 CLOSED_ZERO_OPENS after gap-closure."
 		},
 		{
 			"id": "local-wasm-local-gates-cb0cb69",
@@ -198,12 +198,12 @@
 		{
 			"id": "auto-review-zero-p0-p4",
 			"surface": "release",
-			"status": "pending",
+			"status": "passed",
 			"evidenceIds": [
 				"local-auto-review-progress-cb0cb69"
 			],
 			"gaRequired": true,
-			"notes": "Formal eight-lane round 5 required after gap-closure."
+			"notes": "Formal R5 eight-lane (combined) review: remainingP0P4 empty after gap-closure."
 		},
 		{
 			"id": "final-no-change-confirmation",

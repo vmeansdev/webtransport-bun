@@ -1,0 +1,57 @@
+{
+	"lane": "5-6-7",
+	"round": 5,
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L5-OK-unique-artifactSha256",
+			"severity": "P0",
+			"status": "ok",
+			"summary": "zero_rtt/dynamic_qpack/multi_session/facade_parity each have distinct artifactSha256; each equals sha256(file with artifactSha256 line stripped); no shared dbe24977 on candidate."
+		},
+		{
+			"id": "L5-OK-real-durationMs",
+			"severity": "P0",
+			"status": "ok",
+			"summary": "Unit evidence durationMs matches startedAt\u2192endedAt (1377/467/124/161); sequential non-overlapping wall clocks on 2026-07-27T16:23Z."
+		},
+		{
+			"id": "L5-OK-demotions-iwa-chromium-coverage",
+			"severity": "P1",
+			"status": "ok",
+			"summary": "iwa/chromium claims pending with empty evidenceIds and no candidate iwa/chromium artifacts; coverage evidence status=failed (endpoint/h3 branch 79.64/78.85) with claim pending \u2014 honest demotions, no theater pass."
+		},
+		{
+			"id": "L6-OK-package-artifact-command",
+			"severity": "P2",
+			"status": "ok",
+			"summary": "package-artifact.json records build only in command plus separate checkCommand; durationMs 7438 matches wall; no fake && argv (L6-P2 fixed)."
+		},
+		{
+			"id": "L6-OK-supply-chain-stamp",
+			"severity": "P1",
+			"status": "ok",
+			"summary": "supply-chain-provenance durationMs=32 matches timestamps; no .143894 synthetic batch stamp."
+		},
+		{
+			"id": "L7-OK-docs-match-release-status",
+			"severity": "P1",
+			"status": "ok",
+			"summary": "PARITY_MATRIX interop/IWA rows pending; COMPATIBILITY iwa/chromium-wasm pending; RELEASE_1.0_STATUS passed/pending tables match release-status.json; check-doc-truth passed."
+		},
+		{
+			"id": "L5-P2-coverage-finishedAt-rounding",
+			"severity": "P2",
+			"status": "accepted",
+			"summary": "coverage finishedAt is second-rounded 16:30:00.000000Z while createdAt is 16:27:33 (written before claimed finish); floors/status still honest and claim demoted \u2014 non-blocking for this lane."
+		}
+	],
+	"remainingBlockersForClaims": [
+		"coverage-gates (endpoint/h3 branch 79.64/78.85 < 80)",
+		"iwa-direct-sockets (demoted; harness assets missing)",
+		"chromium-native-interop / chromium-wasm-interop (demoted; not re-run on gap-closure SHA)",
+		"auto-review-zero-p0-p4 (formal eight-lane R5 still in progress)",
+		"native-local-gates / runtime-consumers / fault-matrix / fuzz-gates / cross-platform-matrix / soak-* / final-no-change-confirmation"
+	],
+	"note": "R4 blockers cleared on cb0cb69: unique self-hashed unit artifacts, real timed durations, honest demotions, docs\u2194release-status aligned, package-artifact build/check split. Lane READY \u2260 promote READY."
+}
