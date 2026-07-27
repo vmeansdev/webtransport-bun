@@ -26,14 +26,15 @@ describe("wasm WebTransport backend (P1)", () => {
 					onEstablished: () => {
 						serverEstablished = true;
 					},
-					onDatagram: (conn, data) => {
-						server.sendDatagram(conn, data); // echo
+					onDatagram: (conn, sessionId, data) => {
+						server.sendDatagram(conn, sessionId, data); // echo
 					},
 				},
 			);
 
 			let received: Uint8Array | null = null;
 			let clientEstablished = false;
+			let clientSessionId = 0n;
 			const client = WasmEndpoint.create(
 				wasm,
 				relay.b,
@@ -41,10 +42,11 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:5544",
 				"127.0.0.1:4433",
 				{
-					onEstablished: () => {
+					onEstablished: (_conn, sessionId) => {
 						clientEstablished = true;
+						clientSessionId = sessionId;
 					},
-					onDatagram: (_conn, data) => {
+					onDatagram: (_conn, _sessionId, data) => {
 						received = data.slice();
 					},
 				},
@@ -62,7 +64,11 @@ describe("wasm WebTransport backend (P1)", () => {
 			expect(serverEstablished).toBe(true);
 			expect(clientEstablished).toBe(true);
 
-			client.sendDatagram(conn, new TextEncoder().encode("ping"));
+			client.sendDatagram(
+				conn,
+				clientSessionId,
+				new TextEncoder().encode("ping"),
+			);
 
 			const echoDeadline = Date.now() + 3000;
 			while (received === null && Date.now() < echoDeadline) {
@@ -93,8 +99,8 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:443",
 				"127.0.0.1:1001",
 				{
-					onDatagram: (conn, data) => {
-						server.sendDatagram(conn, data); // echo back to origin conn
+					onDatagram: (conn, sessionId, data) => {
+						server.sendDatagram(conn, sessionId, data); // echo back to origin conn
 					},
 				},
 			);
@@ -103,6 +109,8 @@ describe("wasm WebTransport backend (P1)", () => {
 			let bEcho: Uint8Array | null = null;
 			let aEst = false;
 			let bEst = false;
+			let aSessionId = 0n;
+			let bSessionId = 0n;
 			const clientA = WasmEndpoint.create(
 				wasm,
 				relay.endpoint(aAddr),
@@ -110,10 +118,11 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:1001",
 				"127.0.0.1:443",
 				{
-					onEstablished: () => {
+					onEstablished: (_c, sessionId) => {
 						aEst = true;
+						aSessionId = sessionId;
 					},
-					onDatagram: (_c, d) => {
+					onDatagram: (_c, _sid, d) => {
 						aEcho = d.slice();
 					},
 				},
@@ -125,10 +134,11 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:1002",
 				"127.0.0.1:443",
 				{
-					onEstablished: () => {
+					onEstablished: (_c, sessionId) => {
 						bEst = true;
+						bSessionId = sessionId;
 					},
-					onDatagram: (_c, d) => {
+					onDatagram: (_c, _sid, d) => {
 						bEcho = d.slice();
 					},
 				},
@@ -142,8 +152,16 @@ describe("wasm WebTransport backend (P1)", () => {
 			expect(aEst).toBe(true);
 			expect(bEst).toBe(true);
 
-			clientA.sendDatagram(connA, new TextEncoder().encode("alpha-payload"));
-			clientB.sendDatagram(connB, new TextEncoder().encode("bravo-payload"));
+			clientA.sendDatagram(
+				connA,
+				aSessionId,
+				new TextEncoder().encode("alpha-payload"),
+			);
+			clientB.sendDatagram(
+				connB,
+				bSessionId,
+				new TextEncoder().encode("bravo-payload"),
+			);
 
 			dl = Date.now() + 3000;
 			while ((aEcho === null || bEcho === null) && Date.now() < dl)

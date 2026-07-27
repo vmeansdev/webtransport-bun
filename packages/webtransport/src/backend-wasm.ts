@@ -40,9 +40,31 @@ export interface WasmModule {
 	wt_release_host_reservation(eid: number, token: number): boolean;
 	wt_take_last_error(eid: number): string;
 	wt_governor_snapshot(eid: number): string;
-	wt_send_datagram(eid: number, conn: number, data: Uint8Array): boolean;
-	wt_max_datagram_size(eid: number, conn: number): number;
-	wt_open_stream(eid: number, conn: number, bidi: boolean): number;
+	wt_send_datagram(
+		eid: number,
+		conn: number,
+		sessionId: bigint | number,
+		data: Uint8Array,
+	): boolean;
+	wt_max_datagram_size(
+		eid: number,
+		conn: number,
+		sessionId: bigint | number,
+	): number;
+	wt_open_stream(
+		eid: number,
+		conn: number,
+		sessionId: bigint | number,
+		bidi: boolean,
+	): number;
+	wt_open_session(eid: number, conn: number): number;
+	wt_close_session(
+		eid: number,
+		conn: number,
+		sessionId: bigint | number,
+		code: number,
+		reason: string,
+	): boolean;
 	wt_stream_write(eid: number, stream: number, data: Uint8Array): number;
 	wt_stream_pause(eid: number, stream: number): void;
 	wt_stream_resume(eid: number, stream: number): void;
@@ -82,6 +104,7 @@ const EVENT = {
 	STREAM_DATA: 6,
 	STREAM_RESET: 7,
 	STREAM_STOPPED: 8,
+	SESSION_CLOSED: 9,
 } as const;
 
 function decodeVarintSafe(
@@ -97,17 +120,50 @@ function decodeVarintSafe(
 	return [v, off + len];
 }
 
+function decodeVarintBig(
+	buf: Uint8Array,
+	off: number,
+): [bigint, number] | null {
+	if (off >= buf.length) return null;
+	const first = buf[off] ?? 0;
+	const len = 1 << (first >> 6);
+	if (off + len > buf.length) return null;
+	let v = BigInt(first & 0x3f);
+	for (let i = 1; i < len; i++) v = v * 256n + BigInt(buf[off + i] ?? 0);
+	return [v, off + len];
+}
+
+function requireSafeSessionId(sessionId: bigint): bigint {
+	if (sessionId < 0n || sessionId > BigInt(Number.MAX_SAFE_INTEGER)) {
+		throw new RangeError("sessionId exceeds JavaScript safe integer range");
+	}
+	return sessionId;
+}
+
 export type DecodedWasmEvent =
 	| { type: "connected"; conn: number }
-	| { type: "session-established"; conn: number }
+	| { type: "session-established"; conn: number; sessionId: bigint }
 	| {
 			type: "datagram";
 			conn: number;
+			sessionId: bigint;
 			payload: Uint8Array;
 			hostToken?: number;
 	  }
 	| { type: "closed"; conn: number; code: number }
-	| { type: "stream-opened"; conn: number; stream: number; bidi: boolean }
+	| {
+			type: "session-closed";
+			conn: number;
+			sessionId: bigint;
+			code: number;
+	  }
+	| {
+			type: "stream-opened";
+			conn: number;
+			sessionId: bigint;
+			stream: number;
+			bidi: boolean;
+	  }
 	| {
 			type: "stream-data";
 			conn: number;
@@ -140,9 +196,19 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 	switch (tag) {
 		case EVENT.CONNECTED:
 			return { type: "connected", conn };
-		case EVENT.SESSION_ESTABLISHED:
-			return { type: "session-established", conn };
+		case EVENT.SESSION_ESTABLISHED: {
+			const sid = decodeVarintBig(ev, off);
+			if (!sid) return null;
+			return {
+				type: "session-established",
+				conn,
+				sessionId: requireSafeSessionId(sid[0]),
+			};
+		}
 		case EVENT.DATAGRAM: {
+			const sid = decodeVarintBig(ev, off);
+			if (!sid) return null;
+			off = sid[1];
 			const lenResult = decodeVarintSafe(ev, off);
 			if (!lenResult) return null;
 			let len: number;
@@ -157,6 +223,7 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			return {
 				type: "datagram",
 				conn,
+				sessionId: requireSafeSessionId(sid[0]),
 				payload,
 				hostToken: hostToken && hostToken > 0 ? hostToken : undefined,
 			};
@@ -166,7 +233,23 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			if (!codeResult) return null;
 			return { type: "closed", conn, code: codeResult[0] };
 		}
+		case EVENT.SESSION_CLOSED: {
+			const sid = decodeVarintBig(ev, off);
+			if (!sid) return null;
+			off = sid[1];
+			const codeResult = decodeVarintSafe(ev, off);
+			if (!codeResult) return null;
+			return {
+				type: "session-closed",
+				conn,
+				sessionId: requireSafeSessionId(sid[0]),
+				code: codeResult[0],
+			};
+		}
 		case EVENT.STREAM_OPENED: {
+			const sid = decodeVarintBig(ev, off);
+			if (!sid) return null;
+			off = sid[1];
 			const streamResult = decodeVarintSafe(ev, off);
 			if (!streamResult) return null;
 			let stream: number;
@@ -175,6 +258,7 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			return {
 				type: "stream-opened",
 				conn,
+				sessionId: requireSafeSessionId(sid[0]),
 				stream,
 				bidi: (ev[off] ?? 0) === 1,
 			};
@@ -223,7 +307,12 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			[stream, off] = streamResult;
 			const codeResult = decodeVarintSafe(ev, off);
 			if (!codeResult) return null;
-			return { type: "stream-stopped", conn, stream, code: codeResult[0] };
+			return {
+				type: "stream-stopped",
+				conn,
+				stream,
+				code: codeResult[0],
+			};
 		}
 		default:
 			return { type: "unknown", tag };
@@ -249,13 +338,18 @@ export function dispatchDecodedWasmEvent(
 			events.onConnected?.(decoded.conn);
 			return;
 		case "session-established":
-			events.onEstablished?.(decoded.conn);
+			events.onEstablished?.(decoded.conn, decoded.sessionId);
 			return;
 		case "datagram": {
 			const callback = events.onDatagram;
 			if (callback) {
 				try {
-					callback(decoded.conn, decoded.payload, decoded.hostToken);
+					callback(
+						decoded.conn,
+						decoded.sessionId,
+						decoded.payload,
+						decoded.hostToken,
+					);
 				} catch (error) {
 					if (decoded.hostToken) releaseHostReservation(decoded.hostToken);
 					throw error;
@@ -268,8 +362,16 @@ export function dispatchDecodedWasmEvent(
 		case "closed":
 			events.onClosed?.(decoded.conn, decoded.code);
 			return;
+		case "session-closed":
+			events.onSessionClosed?.(decoded.conn, decoded.sessionId, decoded.code);
+			return;
 		case "stream-opened":
-			events.onStreamOpened?.(decoded.conn, decoded.stream, decoded.bidi);
+			events.onStreamOpened?.(
+				decoded.conn,
+				decoded.sessionId,
+				decoded.stream,
+				decoded.bidi,
+			);
 			return;
 		case "stream-data": {
 			const callback = events.onStreamData;
@@ -304,10 +406,21 @@ export function dispatchDecodedWasmEvent(
 
 export interface WasmSessionEvents {
 	onConnected?: (conn: number) => void;
-	onEstablished?: (conn: number) => void;
-	onDatagram?: (conn: number, data: Uint8Array, hostToken?: number) => void;
+	onEstablished?: (conn: number, sessionId: bigint) => void;
+	onDatagram?: (
+		conn: number,
+		sessionId: bigint,
+		data: Uint8Array,
+		hostToken?: number,
+	) => void;
 	onClosed?: (conn: number, code: number) => void;
-	onStreamOpened?: (conn: number, stream: number, bidi: boolean) => void;
+	onSessionClosed?: (conn: number, sessionId: bigint, code: number) => void;
+	onStreamOpened?: (
+		conn: number,
+		sessionId: bigint,
+		stream: number,
+		bidi: boolean,
+	) => void;
 	onStreamData?: (
 		conn: number,
 		stream: number,
@@ -530,13 +643,13 @@ export class WasmEndpoint {
 		return conn;
 	}
 
-	sendDatagram(conn: number, data: Uint8Array): boolean {
+	sendDatagram(conn: number, sessionId: bigint, data: Uint8Array): boolean {
 		this.datagramSendError = "";
 		if (this.closed) {
 			this.datagramSendError = "E_SESSION_CLOSED: endpoint is closed";
 			return false;
 		}
-		const ok = this.wasm.wt_send_datagram(this.eid, conn, data);
+		const ok = this.wasm.wt_send_datagram(this.eid, conn, sessionId, data);
 		// Capture the operation-scoped diagnostic before pump() dispatches any
 		// unrelated close callback that might consume the endpoint's last error.
 		if (!ok) this.datagramSendError = this.wasm.wt_take_last_error(this.eid);
@@ -544,9 +657,9 @@ export class WasmEndpoint {
 		return ok;
 	}
 
-	maxDatagramSize(conn: number): number {
+	maxDatagramSize(conn: number, sessionId: bigint): number {
 		if (this.closed) return -1;
-		return this.wasm.wt_max_datagram_size(this.eid, conn);
+		return this.wasm.wt_max_datagram_size(this.eid, conn, sessionId);
 	}
 
 	takeDatagramSendError(): string {
@@ -556,11 +669,37 @@ export class WasmEndpoint {
 	}
 
 	/** Open a WebTransport stream; returns its handle or -1. */
-	openStream(conn: number, bidi: boolean): number {
+	openStream(conn: number, sessionId: bigint, bidi: boolean): number {
 		if (this.closed) return -1;
-		const s = this.wasm.wt_open_stream(this.eid, conn, bidi);
+		const s = this.wasm.wt_open_stream(this.eid, conn, sessionId, bidi);
 		this.pump();
 		return s;
+	}
+
+	openSession(conn: number): bigint | null {
+		if (this.closed) return null;
+		const sid = this.wasm.wt_open_session(this.eid, conn);
+		this.pump();
+		if (sid < 0) return null;
+		return BigInt(sid);
+	}
+
+	closeSession(
+		conn: number,
+		sessionId: bigint,
+		code: number,
+		reason: string,
+	): boolean {
+		if (this.closed) return false;
+		const ok = this.wasm.wt_close_session(
+			this.eid,
+			conn,
+			sessionId,
+			code,
+			reason,
+		);
+		this.pump();
+		return ok;
 	}
 
 	streamWrite(stream: number, data: Uint8Array): number {

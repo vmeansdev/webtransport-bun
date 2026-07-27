@@ -373,7 +373,9 @@ describe("wasm resource governor (Task 6 RED)", () => {
 
 	test("WASM event decoder property harness preserves host-token release on dropped malformed events", () => {
 		let released = 0;
-		const decoded = decodeWasmEvent(Uint8Array.of(3, 0x01, 0x01, 0xaa, 0x01));
+		const decoded = decodeWasmEvent(
+			Uint8Array.of(3, 0x01, 0x00, 0x01, 0xaa, 0x01),
+		);
 		expect(decoded?.type).toBe("datagram");
 		dispatchDecodedWasmEvent(decoded ?? null, {}, () => {
 			released += 1;
@@ -1459,7 +1461,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 				normalized,
 				{
 					onDatagram: (conn, data, token) => {
-						server.sendDatagram(conn, data);
+						server.sendDatagram(conn, sessionId, data);
 						if (token) {
 							expect(server.releaseHostReservation(token)).toBe(true);
 						}
@@ -1499,7 +1501,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			}
 			expect(established).toBe(true);
 
-			client.sendDatagram(conn, encoder.encode("ping"));
+			client.sendDatagram(conn, sessionId, encoder.encode("ping"));
 			const firstDeadline = Date.now() + 3_000;
 			while (received.length < 1 && Date.now() < firstDeadline) {
 				await Bun.sleep(5);
@@ -1511,7 +1513,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 				hostTokensActive: 1,
 			});
 
-			client.sendDatagram(conn, encoder.encode("pong"));
+			client.sendDatagram(conn, sessionId, encoder.encode("pong"));
 			await Bun.sleep(100);
 			expect(received).toEqual(["ping"]);
 			expect(JSON.parse(client.governorSnapshot())).toMatchObject({
@@ -1527,7 +1529,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 				hostTokensActive: 0,
 			});
 
-			client.sendDatagram(conn, encoder.encode("pong"));
+			client.sendDatagram(conn, sessionId, encoder.encode("pong"));
 			const secondDeadline = Date.now() + 3_000;
 			while (received.length < 2 && Date.now() < secondDeadline) {
 				await Bun.sleep(5);

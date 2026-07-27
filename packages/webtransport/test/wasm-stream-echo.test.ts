@@ -63,7 +63,7 @@ describe("wasm WebTransport streams (P2)", () => {
 		);
 		serverRef = server;
 
-		const stream = client.openStream(conn, true);
+		const stream = client.openStream(conn, 0n, true);
 		expect(stream).toBeGreaterThanOrEqual(0);
 		client.streamWrite(stream, new TextEncoder().encode("hello-bidi"));
 
@@ -90,7 +90,7 @@ describe("wasm WebTransport streams (P2)", () => {
 			{},
 		);
 
-		const stream = client.openStream(conn, false);
+		const stream = client.openStream(conn, 0n, false);
 		expect(stream).toBeGreaterThanOrEqual(0);
 		client.streamWrite(stream, new TextEncoder().encode("uni-msg"));
 		client.streamFinish(stream);

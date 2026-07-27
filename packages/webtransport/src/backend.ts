@@ -686,6 +686,7 @@ export class WasmSession {
 	constructor(
 		private mgr: WasmTransportManager,
 		readonly conn: number,
+		private _sessionId: bigint,
 		private readonly configuredMaxDatagramSize: number,
 	) {
 		this.ready = new Promise((res, rej) => {
@@ -702,9 +703,19 @@ export class WasmSession {
 		this.closed.catch(() => {});
 	}
 
+	get sessionId(): bigint {
+		return this._sessionId;
+	}
+
+	/** @internal Bind the real CONNECT stream id once SessionEstablished arrives. */
+	_bindSessionId(sessionId: bigint): void {
+		this._sessionId = sessionId;
+	}
+
 	get maxDatagramSize(): number {
 		return this.mgr._effectiveMaxDatagramSize(
 			this.conn,
+			this.sessionId,
 			this.configuredMaxDatagramSize,
 		);
 	}
@@ -717,14 +728,14 @@ export class WasmSession {
 				`${E_LIMIT_EXCEEDED}: maxDatagramSize exceeded`,
 			);
 		}
-		if (!this.mgr.endpoint.sendDatagram(this.conn, data)) {
-			throw this.mgr._datagramSendError(this.conn);
+		if (!this.mgr.endpoint.sendDatagram(this.conn, this.sessionId, data)) {
+			throw this.mgr._datagramSendError(this.conn, this.sessionId);
 		}
 	}
 
 	/**
-	 * Close THIS session's connection (CONNECTION_CLOSE to the peer). Other
-	 * sessions on the same endpoint are unaffected.
+	 * Close this WebTransport session. Primary session close tears down the
+	 * QUIC connection; extra sessions only FIN that CONNECT.
 	 */
 	close(info?: WtCloseInfo): void {
 		if (this.isClosed || this.closeRequested) return;
@@ -908,9 +919,18 @@ class ManagerHostReservation implements WasmPayloadReservation {
  * per-handle streams. Used for both the client (single session) and server
  * (one session per accepted connection) facades.
  */
+function sessionKey(conn: number, sessionId: bigint): string {
+	return `${conn}:${sessionId}`;
+}
+
+/** Placeholder session id for a client connect before SessionEstablished. */
+const PENDING_SESSION_ID = -1n;
+
 export class WasmTransportManager {
 	readonly endpoint: WasmEndpoint;
-	private sessions = new Map<number, WasmSession>();
+	private sessions = new Map<string, WasmSession>();
+	/** stream handle → sessionId for demux of stream-data/reset/stopped. */
+	private streamSessionIds = new Map<number, bigint>();
 	private streams = new Map<number, WasmStream>();
 	private onSession: ((session: WasmSession) => void) | null;
 	/** Transport the manager owns and closes on {@link close}, if any. */
@@ -934,12 +954,21 @@ export class WasmTransportManager {
 		this.onSession = onSession;
 		this.options = options;
 		const events: WasmSessionEvents = {
-			onEstablished: (conn) => {
-				const s = this.ensureSession(conn);
+			onEstablished: (conn, sessionId) => {
+				const pendingKey = sessionKey(conn, PENDING_SESSION_ID);
+				const pending = this.sessions.get(pendingKey);
+				if (pending) {
+					this.sessions.delete(pendingKey);
+					pending._bindSessionId(sessionId);
+					this.sessions.set(sessionKey(conn, sessionId), pending);
+					pending._markEstablished();
+					return;
+				}
+				const s = this.ensureSession(conn, sessionId);
 				s._markEstablished();
-				if (isServer) this.onSession?.(s);
+				this.onSession?.(s);
 			},
-			onDatagram: (conn, data, hostToken) => {
+			onDatagram: (conn, sessionId, data, hostToken) => {
 				// Use get, not ensureSession: a datagram surfaced after the
 				// session was already closed/deleted (final drain on a graceful
 				// end) must NOT resurrect a zombie session no consumer holds.
@@ -956,30 +985,28 @@ export class WasmTransportManager {
 					data.length,
 				);
 				if (!reservation) {
-					this._closeSessionForInboundPressure(conn);
+					this._closeSessionForInboundPressure(conn, sessionId);
 					return;
 				}
-				const session = this.sessions.get(conn);
+				const session = this.sessions.get(sessionKey(conn, sessionId));
 				if (!session) {
 					reservation.release();
 					return;
 				}
 				if (!session._pushDatagram(data, reservation)) {
-					this._closeSessionForInboundPressure(conn);
+					this._closeSessionForInboundPressure(conn, sessionId);
 				}
 			},
 			onClosed: (conn, code) => {
 				const detail = this.endpoint.takeLastError();
-				this.ensureSession(conn)._markClosed(
-					{ code, reason: detail || undefined },
-					detail,
+				const matching = [...this.sessions.values()].filter(
+					(s) => s.conn === conn,
 				);
+				for (const s of matching) {
+					s._markClosed({ code, reason: detail || undefined }, detail);
+					this.sessions.delete(sessionKey(s.conn, s.sessionId));
+				}
 				this._releaseConnectionHostReservations(conn);
-				// Settle and release everything belonging to this connection.
-				// _closeFromConnection errors only readers still live (a
-				// cleanly-FINed stream stays settled), avoiding a spurious reset.
-				// A throwing user onReset callback must not abort cleanup of the
-				// remaining streams, so isolate each one.
 				for (const [handle, ws] of this.streams) {
 					if (ws.conn === conn) {
 						try {
@@ -988,14 +1015,38 @@ export class WasmTransportManager {
 							this.onCallbackError?.(err);
 						}
 						this.streams.delete(handle);
+						this.streamSessionIds.delete(handle);
 					}
 				}
-				this.sessions.delete(conn);
 			},
-			onStreamOpened: (conn, stream, bidi) => {
-				const s = this.ensureSession(conn);
+			onSessionClosed: (conn, sessionId, code) => {
+				const detail = this.endpoint.takeLastError();
+				const key = sessionKey(conn, sessionId);
+				const s = this.sessions.get(key);
+				if (s) {
+					s._markClosed({ code, reason: detail || undefined }, detail);
+					this.sessions.delete(key);
+				}
+				for (const [handle, sid] of [...this.streamSessionIds]) {
+					if (sid === sessionId) {
+						const ws = this.streams.get(handle);
+						if (ws && ws.conn === conn) {
+							try {
+								ws._closeFromConnection(code);
+							} catch (err) {
+								this.onCallbackError?.(err);
+							}
+							this.streams.delete(handle);
+						}
+						this.streamSessionIds.delete(handle);
+					}
+				}
+			},
+			onStreamOpened: (conn, sessionId, stream, bidi) => {
+				const s = this.ensureSession(conn, sessionId);
 				const ws = new WasmStream(this, conn, stream, bidi, true);
 				this.streams.set(stream, ws);
+				this.streamSessionIds.set(stream, sessionId);
 				s._pushIncomingStream(ws);
 			},
 			onStreamData: (_conn, stream, data, fin, hostToken) => {
@@ -1133,27 +1184,37 @@ export class WasmTransportManager {
 	}
 
 	/** @internal Translate a failed Rust datagram send into a stable public error. */
-	_datagramSendError(conn: number): WebTransportError {
+	_datagramSendError(conn: number, sessionId: bigint): WebTransportError {
 		return wasmOperationError(
 			this.endpoint.takeDatagramSendError(),
-			this.sessions.has(conn) ? E_QUEUE_FULL : E_SESSION_CLOSED,
+			this.sessions.has(sessionKey(conn, sessionId))
+				? E_QUEUE_FULL
+				: E_SESSION_CLOSED,
 			"datagram send failed because the queue or session is unavailable",
 		);
 	}
 
 	/** @internal Resolve the live negotiated/path cap without exceeding config. */
-	_effectiveMaxDatagramSize(conn: number, configured: number): number {
-		const effective = this.endpoint.maxDatagramSize(conn);
+	_effectiveMaxDatagramSize(
+		conn: number,
+		sessionId: bigint,
+		configured: number,
+	): number {
+		const effective = this.endpoint.maxDatagramSize(conn, sessionId);
 		return Number.isSafeInteger(effective) && effective >= 0
 			? Math.min(configured, effective)
 			: configured;
 	}
 
 	/** @internal Translate a failed Rust stream write into a stable public error. */
-	_streamWriteError(conn: number): WebTransportError {
+	_streamWriteError(conn: number, sessionId?: bigint): WebTransportError {
+		const open =
+			sessionId === undefined
+				? [...this.sessions.values()].some((s) => s.conn === conn)
+				: this.sessions.has(sessionKey(conn, sessionId));
 		return wasmOperationError(
 			this.endpoint.takeStreamWriteError(),
-			this.sessions.has(conn) ? E_STREAM_RESET : E_SESSION_CLOSED,
+			open ? E_STREAM_RESET : E_SESSION_CLOSED,
 			"stream write failed because the stream or session is closed",
 		);
 	}
@@ -1240,18 +1301,56 @@ export class WasmTransportManager {
 		);
 	}
 
-	private ensureSession(conn: number): WasmSession {
-		let s = this.sessions.get(conn);
+	private ensureSession(conn: number, sessionId: bigint): WasmSession {
+		const key = sessionKey(conn, sessionId);
+		let s = this.sessions.get(key);
 		if (!s) {
-			s = new WasmSession(this, conn, this.options.limits.maxDatagramSize);
-			this.sessions.set(conn, s);
+			s = new WasmSession(
+				this,
+				conn,
+				sessionId,
+				this.options.limits.maxDatagramSize,
+			);
+			this.sessions.set(key, s);
 		}
 		return s;
 	}
 
+	/** Open an additional WT session on an existing QUIC connection (client). */
+	async openSession(conn: number): Promise<WasmSession> {
+		const sid = this.endpoint.openSession(conn);
+		if (sid == null) {
+			throw wasmOperationError(
+				this.endpoint.takeLastError(),
+				E_LIMIT_EXCEEDED,
+				"openSession failed",
+			);
+		}
+		// Wait until SessionEstablished demux creates/marks the session.
+		const key = sessionKey(conn, sid);
+		const deadline = Date.now() + this.options.limits.handshakeTimeoutMs;
+		while (Date.now() < deadline) {
+			this.endpoint.pump();
+			const s = this.sessions.get(key);
+			if (s?.ready) {
+				await s.ready;
+				return s;
+			}
+			await new Promise((r) => setTimeout(r, 1));
+		}
+		throw new WebTransportError(
+			E_HANDSHAKE_TIMEOUT,
+			"openSession timed out waiting for CONNECT 200",
+		);
+	}
+
 	/** @internal */
 	openStream(session: WasmSession, bidi: boolean): WasmStream {
-		const handle = this.endpoint.openStream(session.conn, bidi);
+		const handle = this.endpoint.openStream(
+			session.conn,
+			session.sessionId,
+			bidi,
+		);
 		if (handle < 0) {
 			const detail = this.endpoint.takeLastError();
 			throw wasmOperationError(
@@ -1262,12 +1361,14 @@ export class WasmTransportManager {
 		}
 		const ws = new WasmStream(this, session.conn, handle, bidi, false);
 		this.streams.set(handle, ws);
+		this.streamSessionIds.set(handle, session.sessionId);
 		return ws;
 	}
 
 	/** @internal Remove a stream whose both halves are complete. */
 	_releaseStream(handle: number): void {
 		this.streams.delete(handle);
+		this.streamSessionIds.delete(handle);
 	}
 
 	connectClient(authority: string): WasmSession {
@@ -1283,12 +1384,25 @@ export class WasmTransportManager {
 				"wasm connect failed because the endpoint rejected the connection",
 			);
 		}
-		return this.ensureSession(conn);
+		return this.ensureSession(conn, PENDING_SESSION_ID);
 	}
 
-	/** @internal Close one session's connection; the endpoint stays up. */
+	/** @internal Close one session; primary tears down QUIC, extras do not. */
 	closeSession(session: WasmSession, info?: WtCloseInfo): void {
-		this.endpoint.closeConn(session.conn, info?.code ?? 0, info?.reason ?? "");
+		if (session.sessionId === PENDING_SESSION_ID) {
+			this.endpoint.closeConn(
+				session.conn,
+				info?.code ?? 0,
+				info?.reason ?? "",
+			);
+			return;
+		}
+		this.endpoint.closeSession(
+			session.conn,
+			session.sessionId,
+			info?.code ?? 0,
+			info?.reason ?? "",
+		);
 	}
 
 	private _releaseConnectionHostReservations(conn: number): void {
@@ -1297,11 +1411,16 @@ export class WasmTransportManager {
 		}
 	}
 
-	private _closeSessionForInboundPressure(conn: number): void {
+	private _closeSessionForInboundPressure(
+		conn: number,
+		sessionId: bigint,
+	): void {
 		const detail =
 			this.hostResourceError ||
 			"E_QUEUE_FULL: inbound datagram delivery budget exhausted";
-		this.sessions.get(conn)?._markClosed({ code: 0, reason: detail }, detail);
+		const key = sessionKey(conn, sessionId);
+		this.sessions.get(key)?._markClosed({ code: 0, reason: detail }, detail);
+		this.sessions.delete(key);
 		this._releaseConnectionHostReservations(conn);
 		this.endpoint.closeConn(conn, 0, detail);
 	}
