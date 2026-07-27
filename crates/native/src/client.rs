@@ -294,7 +294,6 @@ fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_wtransport_client_config(
     insecure_skip_verify: bool,
     ca_pem: Option<&str>,
@@ -333,6 +332,20 @@ fn build_wtransport_client_config(
     };
 
     Ok(config)
+}
+
+/// Insecure client config for Rust loopback coverage tests only.
+#[cfg(test)]
+pub(crate) fn insecure_loopback_client_config(
+) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    build_wtransport_client_config(
+        true,
+        None,
+        &[],
+        CongestionControlMode::Default,
+        60_000,
+        10_000,
+    )
 }
 
 #[napi]
