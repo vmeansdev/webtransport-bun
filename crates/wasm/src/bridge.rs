@@ -142,6 +142,22 @@ fn parse_rate_limits(value: &serde_json::Value) -> Result<WasmRateLimits, String
     })
 }
 
+/// Optional `wtMaxSessions` (SETTINGS_WT_MAX_SESSIONS per QUIC connection).
+/// When omitted, the Rust default (`WT_MAX_SESSIONS_DEFAULT`, currently 2) applies.
+fn apply_optional_wt_max_sessions(ep: &mut WtEndpoint, parsed: &serde_json::Value) {
+    if let Some(n) = parsed.get("wtMaxSessions").and_then(|v| v.as_u64()) {
+        ep.set_wt_max_sessions(n);
+    }
+}
+
+/// Optional `enable0Rtt` (QUIC TLS 1.3 early data). Default false.
+fn parse_enable_0rtt(parsed: &serde_json::Value) -> bool {
+    parsed
+        .get("enable0Rtt")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Create an endpoint. Returns the numeric eid on success, or 0 on a bad
 /// address (0 is never a valid eid — allocation starts at 1).
 ///
@@ -206,16 +222,19 @@ pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
     if !is_server && !cfg!(feature = "dev-insecure") {
         return serde_json::json!({ "error": "accept-any client path unavailable" }).to_string();
     }
-    let ep = match WtEndpoint::new_with_limits_and_rate_limits(
+    let enable_0rtt = parse_enable_0rtt(&parsed);
+    let mut ep = match WtEndpoint::new_with_limits_rate_limits_and_0rtt(
         is_server,
         addr,
         peer,
         limits,
         rate_limits,
+        enable_0rtt,
     ) {
         Ok(ep) => ep,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
+    apply_optional_wt_max_sessions(&mut ep, &parsed);
     match register_endpoint(ep) {
         Ok(id) => serde_json::json!({ "eid": id }).to_string(),
         Err(error) => serde_json::json!({ "error": error }).to_string(),
@@ -321,18 +340,23 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
         Ok(rate_limits) => rate_limits,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
-    match WtEndpoint::new_with_generated_cert_with_limits_and_rate_limits(
+    let enable_0rtt = parse_enable_0rtt(&parsed);
+    match WtEndpoint::new_with_generated_cert_with_limits_rate_limits_and_0rtt(
         peer,
         common_name,
         validity_days,
         not_before_unix,
         limits,
         rate_limits,
+        enable_0rtt,
     ) {
-        Ok((ep, hash)) => match register_endpoint(ep) {
-            Ok(id) => serde_json::json!({ "eid": id, "hashBase64": hash }).to_string(),
-            Err(error) => serde_json::json!({ "error": error }).to_string(),
-        },
+        Ok((mut ep, hash)) => {
+            apply_optional_wt_max_sessions(&mut ep, &parsed);
+            match register_endpoint(ep) {
+                Ok(id) => serde_json::json!({ "eid": id, "hashBase64": hash }).to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            }
+        }
         Err(err) => serde_json::json!({ "error": err }).to_string(),
     }
 }
@@ -396,16 +420,21 @@ pub fn wt_new_client_with_options(config_json: &str) -> String {
         Ok(rate_limits) => rate_limits,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
-    match WtEndpoint::new_client_pinned_with_limits_and_rate_limits(
+    let enable_0rtt = parse_enable_0rtt(&parsed);
+    match WtEndpoint::new_client_pinned_with_limits_rate_limits_and_0rtt(
         peer,
         hashes,
         limits,
         rate_limits,
+        enable_0rtt,
     ) {
-        Ok(ep) => match register_endpoint(ep) {
-            Ok(id) => serde_json::json!({ "eid": id }).to_string(),
-            Err(error) => serde_json::json!({ "error": error }).to_string(),
-        },
+        Ok(mut ep) => {
+            apply_optional_wt_max_sessions(&mut ep, &parsed);
+            match register_endpoint(ep) {
+                Ok(id) => serde_json::json!({ "eid": id }).to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            }
+        }
         Err(err) => serde_json::json!({ "error": err }).to_string(),
     }
 }

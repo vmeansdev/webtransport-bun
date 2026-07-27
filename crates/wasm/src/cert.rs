@@ -26,6 +26,20 @@ pub fn sha256_base64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+/// Map an underlying crypto/time error into a stable string for the JS host.
+fn format_cert_error(err: impl std::fmt::Display) -> String {
+    err.to_string()
+}
+
+fn validity_end_out_of_range() -> String {
+    "certificate validity end is outside the supported time range".to_string()
+}
+
+/// Clamp requested validity into the browser-accepted `1..=14` day window.
+pub(crate) fn clamp_validity_days(validity_days: u32) -> i64 {
+    i64::from(validity_days.clamp(1, 14))
+}
+
 /// Generate a self-signed P-256 cert valid for `validity_days` (clamped to 14),
 /// starting at `not_before_unix` seconds. Returns an error string on failure.
 pub fn generate(
@@ -33,25 +47,23 @@ pub fn generate(
     validity_days: u32,
     not_before_unix: i64,
 ) -> Result<GeneratedCert, String> {
-    let days = validity_days.clamp(1, 14) as i64;
+    let days = clamp_validity_days(validity_days);
     let not_before =
-        OffsetDateTime::from_unix_timestamp(not_before_unix).map_err(|e| e.to_string())?;
+        OffsetDateTime::from_unix_timestamp(not_before_unix).map_err(format_cert_error)?;
     let not_after = not_before
         .checked_add(Duration::days(days))
-        .ok_or_else(|| {
-            "certificate validity end is outside the supported time range".to_string()
-        })?;
+        .ok_or_else(validity_end_out_of_range)?;
 
     let mut params =
-        CertificateParams::new(vec![common_name.to_string()]).map_err(|e| e.to_string())?;
+        CertificateParams::new(vec![common_name.to_string()]).map_err(format_cert_error)?;
     let mut dn = DistinguishedName::new();
     dn.push(rcgen::DnType::CommonName, common_name);
     params.distinguished_name = dn;
     params.not_before = not_before;
     params.not_after = not_after;
 
-    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| e.to_string())?;
-    let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(format_cert_error)?;
+    let cert = params.self_signed(&key).map_err(format_cert_error)?;
 
     Ok(GeneratedCert {
         cert_pem: cert.pem(),
@@ -72,11 +84,16 @@ mod tests {
         assert!(c.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(c.key_pem.contains("BEGIN PRIVATE KEY"));
         assert!(!c.cert_der.is_empty());
+        assert!(!c.key_der.is_empty());
+        assert_eq!(sha256_base64(&c.cert_der).len(), 44);
     }
 
     #[test]
     fn clamps_validity_to_14_days() {
         // Should not error even if asked for a year; clamp keeps browsers happy.
+        assert_eq!(clamp_validity_days(0), 1);
+        assert_eq!(clamp_validity_days(14), 14);
+        assert_eq!(clamp_validity_days(365), 14);
         let c = generate("localhost", 365, 1_700_000_000).expect("cert");
         assert!(!c.cert_der.is_empty());
     }
@@ -87,9 +104,16 @@ mod tests {
             Ok(_) => panic!("validity arithmetic must fail closed"),
             Err(error) => error,
         };
-        assert_eq!(
-            error,
-            "certificate validity end is outside the supported time range"
-        );
+        assert_eq!(error, validity_end_out_of_range());
+    }
+
+    #[test]
+    fn generate_rejects_out_of_range_unix_timestamp() {
+        let error = match generate("localhost", 1, i64::MIN) {
+            Ok(_) => panic!("invalid unix time must fail"),
+            Err(error) => error,
+        };
+        assert!(!error.is_empty());
+        assert_eq!(format_cert_error("boom"), "boom");
     }
 }

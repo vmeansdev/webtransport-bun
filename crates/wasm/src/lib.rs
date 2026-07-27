@@ -21,6 +21,7 @@ pub mod governor;
 pub mod h3;
 #[cfg(any(target_arch = "wasm32", test))]
 mod handle;
+pub mod ticket_store;
 pub mod varint;
 pub mod verify;
 

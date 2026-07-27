@@ -1,7 +1,14 @@
-//! Minimal HTTP/3 + WebTransport framing (no dynamic QPACK table).
+//! Minimal HTTP/3 + WebTransport framing with bounded dynamic QPACK.
 //!
 //! Wire constants per RFC 9114 (HTTP/3), RFC 9204 (QPACK), RFC 9297 (datagrams),
 //! and draft-ietf-webtrans-http3.
+//!
+//! Dynamic QPACK support is foundational (Phase 2): a capped dynamic table,
+//! encoder-stream inserts, and indexed dynamic field-line decode. Full claim
+//! pass still needs broader encoder strategies, decoder-stream acks, and interop
+//! evidence — see remaining gaps in module tests / `docs/WASM_PROTOCOL_SCOPE.md`.
+
+use std::collections::VecDeque;
 
 use crate::varint;
 
@@ -26,13 +33,51 @@ pub mod setting {
     pub const WEBTRANSPORT_MAX_SESSIONS: u64 = 0x2b60_3743;
 }
 
+/// Production-safe default dynamic-table capacity (bytes), advertised in SETTINGS.
+pub const DEFAULT_QPACK_MAX_TABLE_CAPACITY: u64 = 4096;
+/// Conservative default for SETTINGS_QPACK_BLOCKED_STREAMS.
+pub const DEFAULT_QPACK_BLOCKED_STREAMS: u64 = 16;
+
+/// Local QPACK SETTINGS we advertise (and bound decoder state against).
+/// Set either field to `0` for literal-only / no-blocking compat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QpackLocalSettings {
+    pub max_table_capacity: u64,
+    pub max_blocked_streams: u64,
+}
+
+impl Default for QpackLocalSettings {
+    fn default() -> Self {
+        Self {
+            max_table_capacity: DEFAULT_QPACK_MAX_TABLE_CAPACITY,
+            max_blocked_streams: DEFAULT_QPACK_BLOCKED_STREAMS,
+        }
+    }
+}
+
+impl QpackLocalSettings {
+    /// Compat mode: advertise zero capacity / blocked streams (literal-only).
+    pub const fn disabled() -> Self {
+        Self {
+            max_table_capacity: 0,
+            max_blocked_streams: 0,
+        }
+    }
+}
+
 /// Encode the control-stream preamble: stream type byte + a SETTINGS frame
-/// advertising WebTransport + H3 datagrams.
+/// advertising WebTransport + H3 datagrams + QPACK limits (defaults).
 pub fn encode_control_preamble(max_sessions: u64) -> Vec<u8> {
+    encode_control_preamble_with(max_sessions, &QpackLocalSettings::default())
+}
+
+/// Encode control preamble with explicit QPACK SETTINGS (use
+/// [`QpackLocalSettings::disabled`] for zero-capacity compat).
+pub fn encode_control_preamble_with(max_sessions: u64, qpack: &QpackLocalSettings) -> Vec<u8> {
     let mut payload = Vec::new();
     let pairs = [
-        (setting::QPACK_MAX_TABLE_CAPACITY, 0),
-        (setting::QPACK_BLOCKED_STREAMS, 0),
+        (setting::QPACK_MAX_TABLE_CAPACITY, qpack.max_table_capacity),
+        (setting::QPACK_BLOCKED_STREAMS, qpack.max_blocked_streams),
         (setting::ENABLE_CONNECT_PROTOCOL, 1),
         (setting::H3_DATAGRAM, 1),
         (setting::ENABLE_WEBTRANSPORT, 1),
@@ -56,6 +101,10 @@ pub struct PeerSettings {
     pub h3_datagram: bool,
     pub connect_protocol: bool,
     pub max_sessions: u64,
+    /// Peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY (0 if absent).
+    pub qpack_max_table_capacity: u64,
+    /// Peer's SETTINGS_QPACK_BLOCKED_STREAMS (0 if absent).
+    pub qpack_blocked_streams: u64,
 }
 
 /// Parse a SETTINGS frame payload (after type+length already stripped).
@@ -71,10 +120,413 @@ pub fn parse_settings(mut payload: &[u8]) -> Option<PeerSettings> {
             setting::H3_DATAGRAM => s.h3_datagram = val == 1,
             setting::ENABLE_CONNECT_PROTOCOL => s.connect_protocol = val == 1,
             setting::WEBTRANSPORT_MAX_SESSIONS => s.max_sessions = val,
+            setting::QPACK_MAX_TABLE_CAPACITY => s.qpack_max_table_capacity = val,
+            setting::QPACK_BLOCKED_STREAMS => s.qpack_blocked_streams = val,
             _ => {}
         }
     }
     Some(s)
+}
+
+/// QPACK decode / encoder-stream errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QpackError {
+    /// Field section references inserts not yet received (may unblock later).
+    Blocked,
+    /// Malformed encoding, OOB index, capacity abuse, or hard protocol violation.
+    Invalid,
+}
+
+#[derive(Debug, Clone)]
+struct DynEntry {
+    name: String,
+    value: String,
+}
+
+/// Bounded QPACK dynamic table (RFC 9204 §3.2).
+#[derive(Debug, Clone)]
+pub struct DynamicTable {
+    /// Oldest at front, newest at back.
+    entries: VecDeque<DynEntry>,
+    /// Current capacity (bytes); starts at 0 until Set Capacity.
+    capacity: usize,
+    /// SETTINGS / local hard cap.
+    max_capacity: usize,
+    /// Sum of entry sizes currently in the table.
+    size: usize,
+    /// Total inserts ever (absolute index of newest entry when non-empty).
+    insert_count: u64,
+}
+
+impl DynamicTable {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            capacity: 0,
+            max_capacity,
+            size: 0,
+            insert_count: 0,
+        }
+    }
+
+    pub fn insert_count(&self) -> u64 {
+        self.insert_count
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn max_capacity(&self) -> usize {
+        self.max_capacity
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn entry_size(name: &str, value: &str) -> usize {
+        name.len().saturating_add(value.len()).saturating_add(32)
+    }
+
+    /// RFC 9204 §4.3.1 — capacity must not exceed the SETTINGS max.
+    pub fn set_capacity(&mut self, capacity: usize) -> Result<(), QpackError> {
+        if capacity > self.max_capacity {
+            return Err(QpackError::Invalid);
+        }
+        self.capacity = capacity;
+        self.evict_to_fit(0);
+        Ok(())
+    }
+
+    /// Insert a name/value pair, evicting oldest entries as needed.
+    pub fn insert(&mut self, name: String, value: String) -> Result<(), QpackError> {
+        let sz = Self::entry_size(&name, &value);
+        if sz > self.capacity {
+            // Entry larger than current capacity: drop it (and empty the table)
+            // per RFC 9204 §3.2.2 — not a hard error.
+            self.evict_to_fit(usize::MAX);
+            return Ok(());
+        }
+        self.evict_to_fit(sz);
+        self.entries.push_back(DynEntry { name, value });
+        self.size = self.size.saturating_add(sz);
+        self.insert_count = self.insert_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn evict_to_fit(&mut self, additional: usize) {
+        while !self.entries.is_empty()
+            && (additional == usize::MAX || self.size.saturating_add(additional) > self.capacity)
+        {
+            if let Some(e) = self.entries.pop_front() {
+                self.size = self
+                    .size
+                    .saturating_sub(Self::entry_size(&e.name, &e.value));
+            }
+            if additional == usize::MAX && self.entries.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn oldest_absolute(&self) -> Option<u64> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.insert_count - self.entries.len() as u64 + 1)
+        }
+    }
+
+    /// Look up by absolute index (1-based). `None` if missing / evicted / OOB.
+    pub fn get_absolute(&self, abs: u64) -> Option<(&str, &str)> {
+        if abs == 0 {
+            return None;
+        }
+        let oldest = self.oldest_absolute()?;
+        if abs < oldest || abs > self.insert_count {
+            return None;
+        }
+        let idx = (abs - oldest) as usize;
+        let e = self.entries.get(idx)?;
+        Some((e.name.as_str(), e.value.as_str()))
+    }
+
+    /// Relative index w.r.t. Base (RFC 9204 §3.2.5): abs = Base - rel - 1.
+    pub fn get_relative(&self, relative: u64, base: u64) -> Option<(&str, &str)> {
+        let abs = base.checked_sub(relative)?.checked_sub(1)?;
+        self.get_absolute(abs)
+    }
+
+    /// Post-base index (RFC 9204 §4.5.3): abs = Base + post + 1.
+    pub fn get_post_base(&self, post: u64, base: u64) -> Option<(&str, &str)> {
+        let abs = base.checked_add(post)?.checked_add(1)?;
+        self.get_absolute(abs)
+    }
+}
+
+/// Decoder-side QPACK state: dynamic table + blocked-stream limit.
+#[derive(Debug, Clone)]
+pub struct QpackDecoder {
+    table: DynamicTable,
+    max_blocked_streams: u64,
+}
+
+impl QpackDecoder {
+    pub fn new(settings: &QpackLocalSettings) -> Self {
+        let max_cap = usize::try_from(settings.max_table_capacity).unwrap_or(usize::MAX);
+        Self {
+            table: DynamicTable::new(max_cap),
+            max_blocked_streams: settings.max_blocked_streams,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(&QpackLocalSettings::disabled())
+    }
+
+    pub fn table(&self) -> &DynamicTable {
+        &self.table
+    }
+
+    pub fn table_mut(&mut self) -> &mut DynamicTable {
+        &mut self.table
+    }
+
+    pub fn max_blocked_streams(&self) -> u64 {
+        self.max_blocked_streams
+    }
+}
+
+impl Default for QpackDecoder {
+    fn default() -> Self {
+        Self::new(&QpackLocalSettings::default())
+    }
+}
+
+/// Encoder-side dynamic table + helpers to emit encoder-stream inserts.
+/// Outbound HEADERS continue to use literals by default (Chromium-safe).
+#[derive(Debug, Clone)]
+pub struct QpackEncoder {
+    table: DynamicTable,
+}
+
+impl QpackEncoder {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            table: DynamicTable::new(max_capacity),
+        }
+    }
+
+    pub fn table(&self) -> &DynamicTable {
+        &self.table
+    }
+
+    /// Emit a Set Dynamic Table Capacity instruction and apply it locally.
+    pub fn set_capacity_instruction(&mut self, capacity: usize) -> Result<Vec<u8>, QpackError> {
+        self.table.set_capacity(capacity)?;
+        let mut out = Vec::new();
+        // 001 capacity (5+)
+        qpack_int(0x20, 5, capacity as u64, &mut out);
+        Ok(out)
+    }
+
+    /// Insert With Literal Name (QPACK analogue of HPACK "literal with
+    /// incremental indexing") and return the encoder-stream bytes.
+    pub fn insert_literal_instruction(
+        &mut self,
+        name: &str,
+        value: &str,
+    ) -> Result<Vec<u8>, QpackError> {
+        let mut out = Vec::new();
+        // 01 H(=0) name-len (5+)
+        qpack_int(0x40, 5, name.len() as u64, &mut out);
+        out.extend_from_slice(name.as_bytes());
+        qpack_int(0x00, 7, value.len() as u64, &mut out);
+        out.extend_from_slice(value.as_bytes());
+        self.table.insert(name.to_string(), value.to_string())?;
+        Ok(out)
+    }
+
+    /// Build a field section that references the newest dynamic entry (relative
+    /// index 0) with Base = insert_count + 1. Used by unit tests / optional
+    /// encoder paths when capacity > 0.
+    pub fn encode_indexed_newest_section(&self) -> Option<Vec<u8>> {
+        let insert_count = self.table.insert_count();
+        if insert_count == 0 {
+            return None;
+        }
+        let ric = insert_count;
+        let base = insert_count + 1;
+        let mut out = Vec::new();
+        encode_field_section_prefix(ric, base, self.table.max_capacity(), &mut out)?;
+        // Indexed Field Line, dynamic (T=0), relative index 0.
+        qpack_int(0x80, 6, 0, &mut out);
+        Some(out)
+    }
+}
+
+fn encode_field_section_prefix(
+    ric: u64,
+    base: u64,
+    max_capacity: usize,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let encoded_ric = encode_required_insert_count(ric, max_capacity)?;
+    qpack_int(0x00, 8, encoded_ric, out);
+    if base >= ric {
+        let delta = base - ric;
+        qpack_int(0x00, 7, delta, out); // S=0
+    } else {
+        let delta = ric - base - 1;
+        qpack_int(0x80, 7, delta, out); // S=1
+    }
+    Some(())
+}
+
+fn encode_required_insert_count(ric: u64, max_capacity: usize) -> Option<u64> {
+    if ric == 0 {
+        return Some(0);
+    }
+    let max_entries = (max_capacity / 32) as u64;
+    if max_entries == 0 {
+        return None;
+    }
+    Some((ric % (2 * max_entries)) + 1)
+}
+
+fn decode_required_insert_count(
+    encoded: u64,
+    max_capacity: usize,
+    total_inserts: u64,
+) -> Result<u64, QpackError> {
+    if encoded == 0 {
+        return Ok(0);
+    }
+    let max_entries = (max_capacity / 32) as u64;
+    if max_entries == 0 {
+        return Err(QpackError::Invalid);
+    }
+    let full_range = 2u64.checked_mul(max_entries).ok_or(QpackError::Invalid)?;
+    let max_value = total_inserts
+        .checked_add(max_entries)
+        .ok_or(QpackError::Invalid)?;
+    let max_wrapped = (max_value / full_range).saturating_mul(full_range);
+    let mut ric = max_wrapped
+        .checked_add(encoded)
+        .ok_or(QpackError::Invalid)?
+        .checked_sub(1)
+        .ok_or(QpackError::Invalid)?;
+    if ric > max_value {
+        if ric <= max_value.saturating_add(max_entries) {
+            ric = ric.checked_sub(full_range).ok_or(QpackError::Invalid)?;
+        } else {
+            return Err(QpackError::Invalid);
+        }
+    }
+    if ric == 0 {
+        return Err(QpackError::Invalid);
+    }
+    Ok(ric)
+}
+
+/// Apply complete encoder-stream instructions (RFC 9204 §4.3). Returns the
+/// number of bytes consumed; trailing partial instructions are left unconsumed.
+pub fn feed_encoder_stream(decoder: &mut QpackDecoder, data: &[u8]) -> Result<usize, QpackError> {
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let buf = &data[offset..];
+        let first = buf[0];
+        let consumed = if first & 0x80 != 0 {
+            // Insert With Name Reference: 1 T index(6+) + value.
+            let static_table = first & 0x40 != 0;
+            let Some((idx, n)) = qpack_int_decode(buf, 6) else {
+                break;
+            };
+            let mut rest = match buf.get(n..) {
+                Some(r) => r,
+                None => break,
+            };
+            let name = if static_table {
+                qpack_static(idx).ok_or(QpackError::Invalid)?.0.to_string()
+            } else {
+                let abs = decoder
+                    .table
+                    .insert_count()
+                    .checked_sub(idx)
+                    .ok_or(QpackError::Invalid)?;
+                decoder
+                    .table
+                    .get_absolute(abs)
+                    .ok_or(QpackError::Invalid)?
+                    .0
+                    .to_string()
+            };
+            let Some(value) = read_qpack_string(&mut rest) else {
+                break;
+            };
+            decoder.table.insert(name, value)?;
+            let value_len = buf.len() - n - rest.len();
+            n.checked_add(value_len).ok_or(QpackError::Invalid)?
+        } else if first & 0x40 != 0 {
+            // Insert With Literal Name: 01 H nameLen(5+) name value.
+            let huffman = first & 0x20 != 0;
+            let Some((nlen, n1)) = qpack_int_decode(buf, 5) else {
+                break;
+            };
+            let nlen_us = usize::try_from(nlen).map_err(|_| QpackError::Invalid)?;
+            if buf.len() < n1 + nlen_us {
+                break;
+            }
+            let raw = &buf[n1..n1 + nlen_us];
+            let mut rest = &buf[n1 + nlen_us..];
+            let name = decode_qpack_bytes(raw, huffman).ok_or(QpackError::Invalid)?;
+            let Some(value) = read_qpack_string(&mut rest) else {
+                break;
+            };
+            decoder.table.insert(name, value)?;
+            let after_name = n1 + nlen_us;
+            let value_len = buf.len() - after_name - rest.len();
+            after_name
+                .checked_add(value_len)
+                .ok_or(QpackError::Invalid)?
+        } else if first & 0x20 != 0 {
+            // Set Dynamic Table Capacity: 001 capacity(5+).
+            let Some((cap, n)) = qpack_int_decode(buf, 5) else {
+                break;
+            };
+            let cap_us = usize::try_from(cap).map_err(|_| QpackError::Invalid)?;
+            decoder.table.set_capacity(cap_us)?;
+            n
+        } else {
+            // Duplicate: 000 index(5+).
+            let Some((idx, n)) = qpack_int_decode(buf, 5) else {
+                break;
+            };
+            let abs = decoder
+                .table
+                .insert_count()
+                .checked_sub(idx)
+                .ok_or(QpackError::Invalid)?;
+            let (name, value) = decoder
+                .table
+                .get_absolute(abs)
+                .ok_or(QpackError::Invalid)
+                .map(|(n, v)| (n.to_string(), v.to_string()))?;
+            decoder.table.insert(name, value)?;
+            n
+        };
+        offset += consumed;
+    }
+    Ok(offset)
 }
 
 /// QPACK integer with an N-bit prefix (RFC 9204 §4.1.1 / RFC 7541 §5.1).
@@ -272,57 +724,125 @@ const QPACK_STATIC_TABLE: [(&str, &str); 99] = [
     ("x-frame-options", "sameorigin"),
 ];
 
-/// Decode a QPACK field section into (name, value) pairs. Supports the encodings
-/// a peer realistically uses without a dynamic table: indexed field lines and
-/// literal field lines (literal name, or static name reference). Huffman-coded
-/// strings are not decoded (returns None if encountered).
-pub fn decode_literal_headers(mut buf: &[u8]) -> Option<Vec<(String, String)>> {
+/// Decode a QPACK field section into (name, value) pairs without a dynamic
+/// table (RIC must be 0; dynamic refs fail). Prefer [`decode_field_section`]
+/// when a [`QpackDecoder`] is available.
+pub fn decode_literal_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
+    let decoder = QpackDecoder::disabled();
+    decode_field_section(buf, &decoder).ok()
+}
+
+/// Decode a QPACK field section against decoder dynamic-table state.
+///
+/// Supports static/dynamic Indexed Field Lines, Literal With Name Reference
+/// (static or dynamic), Literal With Literal Name, and Post-Base forms.
+/// Returns [`QpackError::Blocked`] when Required Insert Count exceeds known
+/// inserts (caller may wait for encoder-stream data), or [`QpackError::Invalid`]
+/// for OOB / malformed / abuse.
+pub fn decode_field_section(
+    mut buf: &[u8],
+    decoder: &QpackDecoder,
+) -> Result<Vec<(String, String)>, QpackError> {
     if buf.len() < 2 {
-        return None;
+        return Err(QpackError::Invalid);
     }
-    buf = &buf[2..]; // skip the 2-byte field section prefix (RIC=0, base=0)
+    let (encoded_ric, n_ric) = qpack_int_decode(buf, 8).ok_or(QpackError::Invalid)?;
+    buf = buf.get(n_ric..).ok_or(QpackError::Invalid)?;
+    let ric = decode_required_insert_count(
+        encoded_ric,
+        decoder.table.max_capacity(),
+        decoder.table.insert_count(),
+    )?;
+    if ric > decoder.table.insert_count() {
+        return Err(QpackError::Blocked);
+    }
+    if buf.is_empty() {
+        return Err(QpackError::Invalid);
+    }
+    let s_bit = buf[0] & 0x80 != 0;
+    let (delta_base, n_base) = qpack_int_decode(buf, 7).ok_or(QpackError::Invalid)?;
+    buf = buf.get(n_base..).ok_or(QpackError::Invalid)?;
+    let base = if !s_bit {
+        ric.checked_add(delta_base).ok_or(QpackError::Invalid)?
+    } else {
+        ric.checked_sub(delta_base)
+            .ok_or(QpackError::Invalid)?
+            .checked_sub(1)
+            .ok_or(QpackError::Invalid)?
+    };
+
     let mut out = Vec::new();
     while !buf.is_empty() {
-        let first = *buf.first()?;
+        let first = *buf.first().ok_or(QpackError::Invalid)?;
         if first & 0x80 != 0 {
-            // Indexed Field Line: 1 T index(6). T=1 -> static table.
+            // Indexed Field Line: 1 T index(6).
             let static_table = first & 0x40 != 0;
-            let (idx, n) = qpack_int_decode(buf, 6)?;
-            buf = &buf[n..];
-            if static_table {
-                let (name, value) = qpack_static(idx)?;
-                out.push((name.to_string(), value.to_string()));
+            let (idx, n) = qpack_int_decode(buf, 6).ok_or(QpackError::Invalid)?;
+            buf = buf.get(n..).ok_or(QpackError::Invalid)?;
+            let (name, value) = if static_table {
+                let (n, v) = qpack_static(idx).ok_or(QpackError::Invalid)?;
+                (n.to_string(), v.to_string())
             } else {
-                return None; // dynamic table unsupported
-            }
-        } else if first & 0x40 != 0 {
-            // Literal Field Line With Name Reference: 0 1 N T index(4).
-            let static_table = first & 0x10 != 0;
-            let (idx, n) = qpack_int_decode(buf, 4)?;
-            buf = &buf[n..];
-            let name = if static_table {
-                qpack_static(idx)?.0.to_string()
-            } else {
-                return None;
+                let (n, v) = decoder
+                    .table
+                    .get_relative(idx, base)
+                    .ok_or(QpackError::Invalid)?;
+                (n.to_string(), v.to_string())
             };
-            let value = read_qpack_string(&mut buf)?;
+            out.push((name, value));
+        } else if first & 0x40 != 0 {
+            // Literal Field Line With Name Reference: 01 N T index(4).
+            let static_table = first & 0x10 != 0;
+            let (idx, n) = qpack_int_decode(buf, 4).ok_or(QpackError::Invalid)?;
+            buf = buf.get(n..).ok_or(QpackError::Invalid)?;
+            let name = if static_table {
+                qpack_static(idx).ok_or(QpackError::Invalid)?.0.to_string()
+            } else {
+                decoder
+                    .table
+                    .get_relative(idx, base)
+                    .ok_or(QpackError::Invalid)?
+                    .0
+                    .to_string()
+            };
+            let value = read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?;
             out.push((name, value));
         } else if first & 0x20 != 0 {
-            // Literal Field Line With Literal Name: 0 0 1 N H nameLen(3).
+            // Literal Field Line With Literal Name: 001 N H nameLen(3).
             let huffman = first & 0x08 != 0;
-            let (nlen, n1) = qpack_int_decode(buf, 3)?;
-            buf = &buf[n1..];
-            let nlen_us = usize::try_from(nlen).ok()?;
-            let raw = buf.get(..nlen_us)?;
-            buf = &buf[nlen_us..];
-            let name = decode_qpack_bytes(raw, huffman)?;
-            let value = read_qpack_string(&mut buf)?;
+            let (nlen, n1) = qpack_int_decode(buf, 3).ok_or(QpackError::Invalid)?;
+            buf = buf.get(n1..).ok_or(QpackError::Invalid)?;
+            let nlen_us = usize::try_from(nlen).map_err(|_| QpackError::Invalid)?;
+            let raw = buf.get(..nlen_us).ok_or(QpackError::Invalid)?;
+            buf = buf.get(nlen_us..).ok_or(QpackError::Invalid)?;
+            let name = decode_qpack_bytes(raw, huffman).ok_or(QpackError::Invalid)?;
+            let value = read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?;
+            out.push((name, value));
+        } else if first & 0x10 != 0 {
+            // Indexed Field Line With Post-Base Index: 0001 index(4).
+            let (idx, n) = qpack_int_decode(buf, 4).ok_or(QpackError::Invalid)?;
+            buf = buf.get(n..).ok_or(QpackError::Invalid)?;
+            let (name, value) = decoder
+                .table
+                .get_post_base(idx, base)
+                .ok_or(QpackError::Invalid)
+                .map(|(n, v)| (n.to_string(), v.to_string()))?;
             out.push((name, value));
         } else {
-            return None; // post-base / dynamic encodings unsupported
+            // Literal Field Line With Post-Base Name Reference: 0000 N index(3).
+            let (idx, n) = qpack_int_decode(buf, 3).ok_or(QpackError::Invalid)?;
+            buf = buf.get(n..).ok_or(QpackError::Invalid)?;
+            let name = decoder
+                .table
+                .get_post_base(idx, base)
+                .ok_or(QpackError::Invalid)?
+                .0
+                .to_string();
+            let value = read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?;
+            out.push((name, value));
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Read a QPACK string literal: 1-bit Huffman flag + 7-bit length prefix + bytes.
@@ -425,6 +945,9 @@ mod tests {
             let _ = qpack_int_decode(&buf, (rng.next_u64() as u8 & 7) + 1);
             let _ = parse_settings(&buf);
             let _ = decode_literal_headers(&buf);
+            let mut dec = QpackDecoder::default();
+            let _ = feed_encoder_stream(&mut dec, &buf);
+            let _ = decode_field_section(&buf, &dec);
             let _ = unwrap_datagram(&buf);
         }
     }
@@ -467,6 +990,115 @@ mod tests {
         let s = parse_settings(payload).unwrap();
         assert!(s.webtransport && s.h3_datagram && s.connect_protocol);
         assert_eq!(s.max_sessions, 16);
+        assert_eq!(s.qpack_max_table_capacity, DEFAULT_QPACK_MAX_TABLE_CAPACITY);
+        assert_eq!(s.qpack_blocked_streams, DEFAULT_QPACK_BLOCKED_STREAMS);
+    }
+
+    #[test]
+    fn control_preamble_can_advertise_zero_qpack_for_compat() {
+        let buf = encode_control_preamble_with(1, &QpackLocalSettings::disabled());
+        let (st, n0) = varint::decode(&buf).unwrap();
+        assert_eq!(st, stream_type::CONTROL);
+        let rest = &buf[n0..];
+        let (ft, n1) = varint::decode(rest).unwrap();
+        assert_eq!(ft, frame::SETTINGS);
+        let rest = &rest[n1..];
+        let (len, n2) = varint::decode(rest).unwrap();
+        let payload = &rest[n2..n2 + len as usize];
+        let s = parse_settings(payload).unwrap();
+        assert_eq!(s.qpack_max_table_capacity, 0);
+        assert_eq!(s.qpack_blocked_streams, 0);
+    }
+
+    #[test]
+    fn dynamic_qpack_insert_index_roundtrip() {
+        let mut enc = QpackEncoder::new(4096);
+        let mut dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 16,
+        });
+
+        let mut enc_stream = enc.set_capacity_instruction(4096).unwrap();
+        enc_stream.extend(
+            enc.insert_literal_instruction(":protocol", "webtransport")
+                .unwrap(),
+        );
+        let consumed = feed_encoder_stream(&mut dec, &enc_stream).unwrap();
+        assert_eq!(consumed, enc_stream.len());
+        assert_eq!(dec.table().insert_count(), 1);
+        assert_eq!(
+            dec.table().get_absolute(1),
+            Some((":protocol", "webtransport"))
+        );
+
+        let section = enc.encode_indexed_newest_section().unwrap();
+        let hdrs = decode_field_section(&section, &dec).unwrap();
+        assert_eq!(hdrs, vec![(":protocol".into(), "webtransport".into())]);
+    }
+
+    #[test]
+    fn dynamic_qpack_capacity_eviction() {
+        // Capacity fits exactly one small entry (name+value+32).
+        // "a"/"b" => 1+1+32 = 34 bytes.
+        let mut table = DynamicTable::new(34);
+        table.set_capacity(34).unwrap();
+        table.insert("a".into(), "b".into()).unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get_absolute(1), Some(("a", "b")));
+
+        // Second insert of same size evicts the first.
+        table.insert("c".into(), "d".into()).unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get_absolute(1), None); // evicted
+        assert_eq!(table.get_absolute(2), Some(("c", "d")));
+        assert_eq!(table.insert_count(), 2);
+
+        // Shrinking capacity to 0 empties the table.
+        table.set_capacity(0).unwrap();
+        assert!(table.is_empty());
+        assert_eq!(table.size(), 0);
+        assert_eq!(table.insert_count(), 2); // insert count is never decremented
+    }
+
+    #[test]
+    fn dynamic_qpack_rejects_oob_and_empty_dynamic_index() {
+        let dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 16,
+        });
+        // RIC=0, Base=0, Indexed dynamic relative 0 → OOB on empty table.
+        let section = [0x00u8, 0x00, 0x80];
+        assert_eq!(
+            decode_field_section(&section, &dec),
+            Err(QpackError::Invalid)
+        );
+
+        // Direct table lookup OOB / empty.
+        assert!(dec.table().is_empty());
+        assert_eq!(dec.table().get_absolute(1), None);
+        assert_eq!(dec.table().get_relative(0, 1), None);
+
+        // Capacity larger than SETTINGS max is abuse.
+        let mut table = DynamicTable::new(100);
+        assert_eq!(table.set_capacity(101), Err(QpackError::Invalid));
+    }
+
+    #[test]
+    fn dynamic_qpack_blocked_when_ric_exceeds_inserts() {
+        let mut enc = QpackEncoder::new(4096);
+        enc.set_capacity_instruction(4096).unwrap();
+        enc.insert_literal_instruction("x", "y").unwrap();
+        let section = enc.encode_indexed_newest_section().unwrap();
+
+        // Decoder has not seen the insert yet → Blocked.
+        let dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 16,
+        });
+        assert_eq!(
+            decode_field_section(&section, &dec),
+            Err(QpackError::Blocked)
+        );
     }
 
     #[test]

@@ -82,6 +82,39 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 - `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`: suppresses the one-time warning when a log callback is not provided. Does not affect security enforcement.
 These variables control diagnostic verbosity only; they do not bypass rate limits, TLS verification, or resource caps.
 
+## WASM 0-RTT / early data (anti-replay)
+
+Opt-in via endpoint option `enable0Rtt` (default **false**). When enabled, the
+wasm stack configures rustls/quinn-proto for TLS 1.3 early data:
+
+- **Server:** `max_early_data_size = u32::MAX` (QUIC requirement) with a
+  **stateful** session store (`InMemoryTicketStore`). Stateless ticketing is
+  intentionally not used; rustls only accepts early data on the stateful path.
+- **Client:** `enable_early_data = true` with the same style of ticket store so
+  a later connect can offer 0-RTT when a ticket is present.
+
+### What is protected
+- **Ticket single-use (server):** presenting a stateful session ticket consumes
+  it (`StoresServerSessions::take`). A naive replay of the same ticket against
+  this process should fail resumption / early-data acceptance once the ticket
+  is spent.
+- **Transport-parameter / ALPN consistency:** quinn/rustls reject 0-RTT when
+  resumed parameters are incompatible (covered by unit tests); the handshake
+  falls back to 1-RTT.
+
+### What is not protected
+- **Application-data replay:** 0-RTT stream/datagram payloads can still be
+  replayed by an on-path attacker to the original server within the ticket
+  lifetime. Treat early application data as **at-most-once / replay-tolerant**
+  only (same rule as HTTP early data). Do not put non-idempotent WT session
+  setup or mutating RPCs solely in 0-RTT.
+- **Cross-process / multi-instance anti-replay:** the in-memory store is
+  per-endpoint process. Shared anti-replay across horizontally scaled wasm
+  hosts (or durable JS-backed stores) is **not** implemented yet; a future JS
+  ticket-store bridge must supply coordinated single-use semantics if required.
+- **Disabled by default:** with `enable0Rtt: false`, early data is not offered
+  or accepted even if residual tickets exist in a shared store.
+
 ## Known limitations
 ### Private key memory zeroing
 Private key PEM strings are parsed into `PrivateKeyDer` and stored in standard Rust heap allocations which are not zeroed on deallocation. In a process crash (core dump, swap file), key material could theoretically be recoverable from process memory. This is consistent with most non-HSM TLS libraries. For deployments requiring HSM-level key protection, use external key management with TLS termination at a trusted proxy.
