@@ -43,6 +43,19 @@ pub(crate) fn server_config_from_der(
 
 /// Generate a self-signed P-256 cert and build the rustls server config.
 pub(crate) fn server_crypto() -> Result<(rustls::ServerConfig, Vec<u8>), String> {
+    let (cfg, cert_der, _resolver) = server_crypto_with_resolver()?;
+    Ok((cfg, cert_der))
+}
+
+/// Same as [`server_crypto`] but returns the live TLS resolver for `update_tls`.
+pub(crate) fn server_crypto_with_resolver() -> Result<
+    (
+        rustls::ServerConfig,
+        Vec<u8>,
+        crate::server_tls::LiveServerCertResolver,
+    ),
+    String,
+> {
     let mut params =
         rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(|e| e.to_string())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
@@ -51,8 +64,9 @@ pub(crate) fn server_crypto() -> Result<(rustls::ServerConfig, Vec<u8>), String>
     let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
     let cert_der = cert.der().to_vec();
     let key_der = key.serialize_der();
-    let cfg = server_config_from_der(cert_der.clone(), key_der)?;
-    Ok((cfg, cert_der))
+    let (cfg, resolver) =
+        crate::server_tls::server_config_with_live_resolver(cert_der.clone(), key_der)?;
+    Ok((cfg, cert_der, resolver))
 }
 
 /// Dangerous verifier: accept any cert. Compiled only for `dev-insecure` builds

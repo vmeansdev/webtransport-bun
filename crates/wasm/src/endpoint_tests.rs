@@ -15,6 +15,7 @@ fn build_missing_server_crypto_should_return_stable_error_instead_of_panicking()
         WasmRateLimits::default(),
         false,
         false,
+        CongestionControlMode::Default,
     ) {
         Ok(_) => panic!("missing server crypto must fail closed"),
         Err(error) => error,
@@ -2097,6 +2098,116 @@ fn endpoint_surface_helpers_and_constructor_variants() {
     assert_eq!(server_mut.wt_max_sessions(), 1);
     server_mut.set_wt_max_sessions(10_000);
     assert_eq!(server_mut.wt_max_sessions(), WT_MAX_SESSIONS_HARD_CAP);
+}
+
+#[test]
+fn tls_snapshot_and_update_tls_rotate_default_cert_and_sni_map() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+    let (server, original_hash) = WtEndpoint::new_with_generated_cert_with_limits(
+        caddr,
+        "localhost",
+        14,
+        now_unix,
+        WasmLimits::default(),
+    )
+    .expect("generated cert server");
+
+    // A generated-cert server always carries a live resolver; snapshot must
+    // reflect the initial default cert with no SNI entries configured.
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&server.tls_snapshot_json()).expect("initial snapshot json");
+    assert_eq!(snapshot["defaultCertPresent"], true);
+    assert_eq!(snapshot["unknownSniPolicy"], "reject");
+    assert_eq!(snapshot["sniNames"], serde_json::json!([]));
+    assert_eq!(
+        snapshot["defaultCertHashBase64"].as_str(),
+        Some(original_hash.as_str())
+    );
+
+    // A malformed rotation payload fails closed with a stable E_TLS error and
+    // leaves the previous resolver state untouched.
+    let bad = server.update_tls_json("{not-json");
+    let bad_result: serde_json::Value = serde_json::from_str(&bad).expect("bad result json");
+    assert!(bad_result["error"]
+        .as_str()
+        .expect("error string")
+        .contains("E_TLS"));
+
+    // Rotating the default cert returns the new pin hash, and it must differ
+    // from the original so pin clients can detect the change.
+    let rotated_common_name = "rotated.test";
+    let rotated = crate::cert::generate(rotated_common_name, 14, now_unix).expect("rotated cert");
+    let rotated_hash = crate::cert::sha256_base64(&rotated.cert_der);
+    assert_ne!(rotated_hash, original_hash);
+    let update_json = serde_json::json!({
+        "certPem": rotated.cert_pem,
+        "keyPem": rotated.key_pem,
+        "sni": [
+            {
+                "serverName": "sni.example",
+                "certPem": rotated.cert_pem,
+                "keyPem": rotated.key_pem,
+            }
+        ],
+        "unknownSniPolicy": "default",
+    })
+    .to_string();
+    let result: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&update_json)).expect("update result json");
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["defaultCertHashBase64"].as_str(),
+        Some(rotated_hash.as_str())
+    );
+
+    let snapshot_after: serde_json::Value =
+        serde_json::from_str(&server.tls_snapshot_json()).expect("post-rotate snapshot json");
+    assert_eq!(snapshot_after["unknownSniPolicy"], "default");
+    assert_eq!(
+        snapshot_after["sniNames"],
+        serde_json::json!(["sni.example"])
+    );
+    assert_eq!(
+        snapshot_after["defaultCertHashBase64"].as_str(),
+        Some(rotated_hash.as_str())
+    );
+
+    // A rotation payload with an invalid PEM fails closed instead of silently
+    // leaving the resolver half-updated.
+    let invalid = serde_json::json!({ "certPem": "not-a-cert", "keyPem": "not-a-key" }).to_string();
+    let invalid_result: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&invalid)).expect("invalid result json");
+    assert!(invalid_result["error"]
+        .as_str()
+        .expect("error string")
+        .contains("E_TLS"));
+    // Resolver state from the successful rotation above must be unaffected.
+    let snapshot_unchanged: serde_json::Value =
+        serde_json::from_str(&server.tls_snapshot_json()).expect("unchanged snapshot json");
+    assert_eq!(
+        snapshot_unchanged["defaultCertHashBase64"].as_str(),
+        Some(rotated_hash.as_str())
+    );
+}
+
+#[test]
+fn tls_snapshot_json_on_client_endpoint_has_no_live_resolver() {
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let hashes = vec![[0u8; 32]];
+    let client = WtEndpoint::new_client_pinned_with_limits(saddr, hashes, WasmLimits::default())
+        .expect("pinned client");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&client.tls_snapshot_json()).expect("client snapshot json");
+    assert_eq!(snapshot["defaultCertPresent"], false);
+    assert_eq!(snapshot["sniNames"], serde_json::json!([]));
+
+    let update_result: serde_json::Value =
+        serde_json::from_str(&client.update_tls_json("{}")).expect("client update result json");
+    assert!(update_result["error"]
+        .as_str()
+        .expect("error string")
+        .contains("E_TLS"));
 }
 
 #[test]

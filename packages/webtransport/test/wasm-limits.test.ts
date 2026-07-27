@@ -103,6 +103,10 @@ function fakeManager(limits: WasmLimitsOptions = {}) {
 			_reportResourceError(error: unknown) {
 				errors.push(error);
 			},
+			emitLog() {},
+			_recordDatagramOut() {},
+			_recordDatagramIn() {},
+			_recordDatagramDropped() {},
 		} as unknown as WasmTransportManager,
 		errors,
 	};
@@ -692,7 +696,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 
 	test("pre-establishment failure rejects ready and closed with the same typed error", async () => {
 		const { manager } = fakeManager();
-		const session = new WasmSession(manager, 1, 1200);
+		const session = new WasmSession(manager, 1, 1n, 1200);
 		const transport = new WasmWebTransport(session);
 
 		const readyFailure = transport.ready.catch((error) => error);
@@ -715,7 +719,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 
 	test("transport-level pre-establishment close still rejects ready and closed with one typed fallback error", async () => {
 		const { manager } = fakeManager();
-		const session = new WasmSession(manager, 1, 1200);
+		const session = new WasmSession(manager, 1, 1n, 1200);
 		const transport = new WasmWebTransport(session);
 
 		const readyFailure = transport.ready.catch((error) => error);
@@ -803,7 +807,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 
 	test("WASM readable reset rejects with a stable stream error and peer code", async () => {
 		const { manager } = fakeManager();
-		const session = new WasmSession(manager, 1, 1200);
+		const session = new WasmSession(manager, 1, 1n, 1200);
 		const facade = new WasmWebTransport(session);
 		const incoming = new WasmStream(manager, 1, 24, false, true);
 		const outerReader = facade.incomingUnidirectionalStreams.getReader();
@@ -838,7 +842,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			maxQueuedBytesPerSession: 4,
 			maxQueuedBytesPerStream: 4,
 		});
-		const session = new WasmSession(manager, 1, 4);
+		const session = new WasmSession(manager, 1, 1n, 4);
 		const exact = testReservation(4);
 		const excess = testReservation(1);
 
@@ -862,7 +866,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			maxStreamsPerSessionUni: 1,
 			maxStreamsGlobal: 2,
 		});
-		const session = new WasmSession(manager, 1, 1200);
+		const session = new WasmSession(manager, 1, 1n, 1200);
 		const calls: string[] = [];
 		const stream = (bidi: boolean, id: number) =>
 			({
@@ -966,7 +970,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			maxQueuedBytesPerSession: 8,
 			maxQueuedBytesPerStream: 4,
 		});
-		const session = new WasmSession(manager, 1, 4);
+		const session = new WasmSession(manager, 1, 1n, 4);
 		const facade = new WasmWebTransport(session);
 
 		const datagramReservation = testReservation(4);
@@ -1008,7 +1012,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 
 	test("WHATWG stream resolves a pending read when a zero-byte FIN arrives", async () => {
 		const { manager } = fakeManager();
-		const session = new WasmSession(manager, 1, 1200);
+		const session = new WasmSession(manager, 1, 1n, 1200);
 		const facade = new WasmWebTransport(session);
 		const incoming = new WasmStream(manager, 1, 23, false, true);
 		const incomingReader = facade.incomingUnidirectionalStreams.getReader();
@@ -1046,7 +1050,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			maxQueuedBytesPerSession: 1,
 			maxQueuedBytesPerStream: 1,
 		});
-		const session = new WasmSession(manager, 1, 1200);
+		const session = new WasmSession(manager, 1, 1n, 1200);
 		const firstDatagram = testReservation(0);
 		const secondDatagram = testReservation(0);
 

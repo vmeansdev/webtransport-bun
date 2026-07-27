@@ -255,9 +255,9 @@ Chromium's own native client.
 
 See `examples/webtransport-wasm-iwa/` for the in-browser (IWA) reference,
 `tools/interop/WASM_INTEROP.md` for the cross-stack interop matrix, and
-`docs/PARITY_MATRIX.md` for native-vs-wasm feature parity (including the
-intentional divergences: `allowPooling` and friends are rejected, not
-silently ignored).
+`docs/PARITY_MATRIX.md` for native-vs-wasm feature parity (pooling, stats, CC,
+sendOrder, durable tickets, live TLS, metrics — still no plug-and-play browser
+`createServer()`; hosts supply `UdpTransport`).
 
 ## Quickstart
 

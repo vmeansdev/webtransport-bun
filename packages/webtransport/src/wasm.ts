@@ -20,6 +20,8 @@ export {
 	DEFAULT_WASM_RATE_LIMITS,
 	isWasmRuntime,
 	MemoryTicketStoreHost,
+	FileTicketStoreHost,
+	IndexedDBTicketStoreHost,
 	type NativeClientArgs,
 	normalizeWasmEndpointOptions,
 	selectBackend,
@@ -37,6 +39,9 @@ export {
 	type WasmStream,
 	WasmTransportManager,
 	WasmWebTransport,
+	wasmClientPoolMetricsSnapshot,
+	toWasmServerSession,
+	WasmServerSession,
 } from "./backend.js";
 export {
 	validateWasmWebTransportOptions,

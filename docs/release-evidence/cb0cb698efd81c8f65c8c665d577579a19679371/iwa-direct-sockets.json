@@ -1,0 +1,74 @@
+{
+	"schemaVersion": 1,
+	"status": "passed",
+	"startedAt": "2026-07-27T17:06:48.207Z",
+	"finishedAt": "2026-07-27T17:06:48.295Z",
+	"executionIdentity": "browser-iwa-direct-sockets",
+	"origin": "isolated-app://4kjnvtnyjsacmiuildaxxufpkwr5krazsyczrt3y7ggsfrynjm7aaaic",
+	"protocol": "isolated-app:",
+	"crossOriginIsolated": true,
+	"directSockets": true,
+	"functional": {
+		"datagram": "iwa-datagram",
+		"bidi": "iwa-bidi",
+		"uni": "iwa-uni",
+		"resetCode": 37,
+		"stopSendingCode": 41,
+		"peerClose": {
+			"code": 4100
+		}
+	},
+	"reconnects": [
+		{
+			"attempt": 1,
+			"payload": "iwa-reconnect-1"
+		},
+		{
+			"attempt": 2,
+			"payload": "iwa-reconnect-2"
+		},
+		{
+			"attempt": 3,
+			"payload": "iwa-reconnect-3"
+		},
+		{
+			"attempt": 4,
+			"payload": "iwa-reconnect-4"
+		},
+		{
+			"attempt": 5,
+			"payload": "iwa-reconnect-5"
+		},
+		{
+			"attempt": 6,
+			"payload": "iwa-reconnect-6"
+		},
+		{
+			"attempt": 7,
+			"payload": "iwa-reconnect-7"
+		},
+		{
+			"attempt": 8,
+			"payload": "iwa-reconnect-8"
+		}
+	],
+	"certificateRotation": {
+		"oldPinRejected": true,
+		"oldHash": "5aXKDgH37tpY925y4gn3dJB9PFvAMVd7JmcIu9CMUiQ=",
+		"newHash": "obJ2t8ycif+DqRPJSJxDD4jZvvZlrA0uZLVaWOaY3yc=",
+		"payload": "iwa-rotated-cert"
+	},
+	"browser": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+	"sourceCommit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"signedBundlePath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/.release-evidence/iwa/webtransport-wasm-iwa.swbn",
+	"signedBundleSha256": "4c91ddb0ef8af766d608db06f916d3e65f858c25375ff5b8cbda38b01a236980",
+	"unsignedBundlePath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/.release-evidence/iwa/webtransport-wasm-iwa.wbn",
+	"unsignedBundleSha256": "4190225b9fd8f09512e08af24704ae78900b9fcf6adf437d1f41393541033768",
+	"browserVersion": "150.0.7871.182",
+	"browserChannel": "playwright-chromium",
+	"browserExecutable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+	"localNetworkPermission": "pregranted-for-automated-proof",
+	"playwrightVersion": "1.58.2",
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"artifactSha256": "bc0800e523015b4f0cda241306c79e97d6605e2c877988fd28ce526916ece2a7"
+}

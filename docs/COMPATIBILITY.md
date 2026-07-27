@@ -39,7 +39,7 @@ See `docs/release-status.json` → `support.scopeLimits`.
 
 | Scenario | Environment | Status |
 |----------|-------------|--------|
-| Server inside the browser | Chromium Isolated Web App with `direct-sockets` and `cross-origin-isolated` permissions | `iwa-direct-sockets` currently **pending** in `docs/release-status.json` (re-run required; no theater evidence) |
+| Server inside the browser | Chromium Isolated Web App with `direct-sockets` and `cross-origin-isolated` permissions | `iwa-direct-sockets` **passed** on gap-closure candidate (local Chrome Direct Sockets) |
 | Server inside the browser | Normal web page, Firefox, Safari | **not possible** — Direct Sockets is IWA/Chromium-only |
 | Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | implemented and locally tested; release evidence pending |
 | Client (wasm) → native server | Bun/Node host, real UDP | implemented and locally tested; release evidence pending |
@@ -68,7 +68,10 @@ Constraints that apply regardless of environment:
   requirements (`wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`) and
   are **claim-passed** on the current candidate in `docs/release-status.json`
   (defaults remain Chromium-safe: QPACK capacity 0, `enable0Rtt` false).
-  `wasm-facade-parity` is claim-passed on the current candidate (smoke bar).
+  `wasm-facade-parity` is claim-passed on the current candidate (pooling,
+  waitUntilAvailable, quinn getStats, CC factories, sendOrder scheduler,
+  durable ticket hosts, metrics, live TLS/SNI, log/debug, WasmServerSession).
+  Plug-and-play browser `createServer()` remains out of scope (sans-IO hosts).
 - **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
   signed Web Bundle installation via Chromium's developer-mode
   `--install-isolated-web-app-from-file` switch, unsigned source bundle, and

@@ -14,12 +14,23 @@ import {
 } from "./backend-wasm.js";
 export type { TicketStoreHost };
 export { MemoryTicketStoreHost };
+export {
+	FileTicketStoreHost,
+	IndexedDBTicketStoreHost,
+} from "./ticket-store-hosts.js";
+export {
+	toWasmServerSession,
+	WasmServerSession,
+} from "./wasm-server-session.js";
 import { createMonotonicDeadline } from "./deadline.js";
 import type {
 	ErrorCode,
+	MetricsSnapshot,
+	SessionMetricsSnapshot,
 	WasmNormalizedRateLimits,
 	WasmRateLimitOptions,
 } from "./types.js";
+export type { MetricsSnapshot, SessionMetricsSnapshot } from "./types.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
@@ -32,6 +43,7 @@ import {
 	E_STOP_SENDING,
 	E_STREAM_RESET,
 	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
 export type { WasmRateLimitOptions } from "./types.js";
@@ -39,8 +51,16 @@ import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import { WasmWebTransport } from "./wasm-webtransport.js";
 import { wasmToWebTransportLike } from "./webtransport-like-wasm.js";
+import {
+	__resetWasmClientPoolForTests,
+	wasmClientPoolMetricsSnapshot,
+	wasmPoolKey,
+	wasmPoolPut,
+	wasmPoolTake,
+} from "./wasm-endpoint-pool.js";
 
 export { WasmWebTransport } from "./wasm-webtransport.js";
+export { __resetWasmClientPoolForTests, wasmClientPoolMetricsSnapshot };
 
 export type WasmLimitsOptions = {
 	maxSessions?: number;
@@ -116,6 +136,12 @@ export type WasmEndpointOptions = {
 	 * Process-local opaque vault blobs only; durable IndexedDB is out of scope.
 	 */
 	ticketStore?: TicketStoreHost;
+	/** Quinn congestion preference wired into TransportConfig. */
+	congestionControl?: "default" | "throughput" | "low-latency";
+	/** Optional structured ops logger. */
+	log?: (event: { type: string; [k: string]: unknown }) => void;
+	/** When true, log events may include sensitive PEM/key fields. */
+	debug?: boolean;
 };
 
 export type WasmNormalizedEndpointOptions = {
@@ -129,6 +155,7 @@ export type WasmNormalizedEndpointOptions = {
 	qpackMaxTableCapacity?: number;
 	qpackBlockedStreams?: number;
 	enableDynamicQpack?: boolean;
+	congestionControl?: "default" | "throughput" | "low-latency";
 };
 
 const WASM_U32_MAX = 0xffff_ffff;
@@ -401,6 +428,9 @@ export function normalizeWasmEndpointOptions(
 		...(qpackMaxTableCapacity === undefined ? {} : { qpackMaxTableCapacity }),
 		...(qpackBlockedStreams === undefined ? {} : { qpackBlockedStreams }),
 		...(enableDynamicQpack === undefined ? {} : { enableDynamicQpack }),
+		...(options.congestionControl === undefined
+			? {}
+			: { congestionControl: options.congestionControl }),
 	};
 }
 
@@ -772,6 +802,8 @@ export class WasmSession {
 	private datagramQueuedBytes = 0;
 	private incomingCb: ((stream: WasmStream) => void) | null = null;
 	private incomingQueue: WasmStream[] = [];
+	private datagramsInCount = 0;
+	private datagramsOutCount = 0;
 
 	constructor(
 		private mgr: WasmTransportManager,
@@ -795,6 +827,53 @@ export class WasmSession {
 
 	get sessionId(): bigint {
 		return this._sessionId;
+	}
+
+	/** Endpoint backpressure timeout used by waitUntilAvailable stream opens. */
+	get backpressureTimeoutMs(): number {
+		return this.mgr.options.limits.backpressureTimeoutMs;
+	}
+
+	/** True once close was requested or the session is fully closed. */
+	get isClosingOrClosed(): boolean {
+		return this.isClosed || this.closeRequested;
+	}
+
+	/** Quinn connection stats for W3C getStats(). */
+	connectionStats(): {
+		bytesSent: number;
+		bytesReceived: number;
+		packetsSent: number;
+		packetsReceived: number;
+		datagrams: {
+			droppedIncoming: number;
+			expiredIncoming: number;
+			expiredOutgoing: number;
+			lostOutgoing: number;
+		};
+	} {
+		const stats = this.mgr.endpoint.connStats(this.conn);
+		if (!stats || stats.error) {
+			return {
+				bytesSent: 0,
+				bytesReceived: 0,
+				packetsSent: 0,
+				packetsReceived: 0,
+				datagrams: {
+					droppedIncoming: 0,
+					expiredIncoming: 0,
+					expiredOutgoing: 0,
+					lostOutgoing: 0,
+				},
+			};
+		}
+		return {
+			bytesSent: stats.bytesSent,
+			bytesReceived: stats.bytesReceived,
+			packetsSent: stats.packetsSent,
+			packetsReceived: stats.packetsReceived,
+			datagrams: stats.datagrams,
+		};
 	}
 
 	/** @internal Bind the real CONNECT stream id once SessionEstablished arrives. */
@@ -823,6 +902,10 @@ export class WasmSession {
 	async sendDatagram(data: Uint8Array): Promise<void> {
 		this.assertOpen("send a datagram");
 		if (data.byteLength > this.maxDatagramSize) {
+			this.mgr.emitLog("limit_exceeded", {
+				context: "sendDatagram",
+				detail: "maxDatagramSize exceeded",
+			});
 			throw new WebTransportError(
 				E_LIMIT_EXCEEDED,
 				`${E_LIMIT_EXCEEDED}: maxDatagramSize exceeded`,
@@ -831,6 +914,8 @@ export class WasmSession {
 		if (!this.mgr.endpoint.sendDatagram(this.conn, this.sessionId, data)) {
 			throw this.mgr._datagramSendError(this.conn, this.sessionId);
 		}
+		this.datagramsOutCount += 1;
+		this.mgr._recordDatagramOut();
 	}
 
 	/**
@@ -863,6 +948,16 @@ export class WasmSession {
 				throw error;
 			}
 		}
+	}
+
+	metricsSnapshot(): SessionMetricsSnapshot {
+		const stats = this.connectionStats();
+		return {
+			datagramsIn: this.datagramsInCount,
+			datagramsOut: this.datagramsOutCount,
+			streamsActive: this.mgr._activeStreamCount(this.conn, this.sessionId),
+			queuedBytes: stats.bytesSent + stats.bytesReceived,
+		};
 	}
 
 	createBidirectionalStream(): WasmStream {
@@ -910,6 +1005,8 @@ export class WasmSession {
 		data: Uint8Array,
 		reservation?: WasmPayloadReservation,
 	): boolean {
+		this.datagramsInCount += 1;
+		this.mgr._recordDatagramIn();
 		const retained = { data, reservation };
 		if (this.datagramCb) {
 			this._deliverDatagram(retained);
@@ -919,9 +1016,14 @@ export class WasmSession {
 			this.datagramQueuedBytes + accountedReservationBytes(data, reservation);
 		if (nextBytes > this.mgr.options.limits.maxQueuedBytesPerSession) {
 			reservation?.release();
+			this.mgr.emitLog("limit_exceeded", {
+				context: "pushDatagram",
+				detail: "maxQueuedBytesPerSession reached",
+			});
 			this.mgr._reportResourceError(
 				new Error("E_QUEUE_FULL: maxQueuedBytesPerSession reached"),
 			);
+			this.mgr._recordDatagramDropped();
 			return false;
 		}
 		this.datagramQueue.push(retained);
@@ -943,10 +1045,15 @@ export class WasmSession {
 		if (queuedOfKind >= limit) {
 			stream.stop(0);
 			if (stream.bidi) stream.reset(0);
+			const limitName = stream.bidi
+				? "maxStreamsPerSessionBidi"
+				: "maxStreamsPerSessionUni";
+			this.mgr.emitLog("limit_exceeded", {
+				context: "pushIncomingStream",
+				detail: `${limitName} reached`,
+			});
 			this.mgr._reportResourceError(
-				new Error(
-					`E_LIMIT_EXCEEDED: ${stream.bidi ? "maxStreamsPerSessionBidi" : "maxStreamsPerSessionUni"} reached`,
-				),
+				new Error(`E_LIMIT_EXCEEDED: ${limitName} reached`),
 			);
 			return;
 		}
@@ -1039,11 +1146,21 @@ export class WasmTransportManager {
 	private ownedTransport: UdpTransport | null = null;
 	readonly options: WasmNormalizedEndpointOptions;
 	readonly ticketStore: TicketStoreHost | null;
+	private lastAuthority: string | null = null;
 	private hostReservations = new Set<ManagerHostReservation>();
 	private hostQueuedBytesGlobal = 0;
 	private hostQueuedBytesPerSession = new Map<number, number>();
 	private hostQueuedBytesPerStream = new Map<number, number>();
 	private hostResourceError = "";
+	private datagramsIn = 0;
+	private datagramsOut = 0;
+	private datagramsDropped = 0;
+	private backpressureWaitCount = 0;
+	private backpressureTimeoutCount = 0;
+	private logFn:
+		| ((event: { type: string; [k: string]: unknown }) => void)
+		| null = null;
+	private debugLog = false;
 	private closeResourceSnapshot: ReturnType<
 		WasmTransportManager["_currentResourceSnapshot"]
 	> | null = null;
@@ -1067,10 +1184,18 @@ export class WasmTransportManager {
 					pending._bindSessionId(sessionId);
 					this.sessions.set(sessionKey(conn, sessionId), pending);
 					pending._markEstablished();
+					this.emitLog("session_established", {
+						conn,
+						sessionId: sessionId.toString(),
+					});
 					return;
 				}
 				const s = this.ensureSession(conn, sessionId);
 				s._markEstablished();
+				this.emitLog("session_established", {
+					conn,
+					sessionId: sessionId.toString(),
+				});
 				this.onSession?.(s);
 			},
 			onDatagram: (conn, sessionId, data, hostToken) => {
@@ -1107,6 +1232,12 @@ export class WasmTransportManager {
 				const matching = [...this.sessions.values()].filter(
 					(s) => s.conn === conn,
 				);
+				this.emitLog("session_closed", {
+					conn,
+					code,
+					sessionCount: matching.length,
+					detail: detail || undefined,
+				});
 				for (const s of matching) {
 					s._markClosed({ code, reason: detail || undefined }, detail);
 					this.sessions.delete(sessionKey(s.conn, s.sessionId));
@@ -1128,6 +1259,12 @@ export class WasmTransportManager {
 				const detail = this.endpoint.takeLastError();
 				const key = sessionKey(conn, sessionId);
 				const s = this.sessions.get(key);
+				this.emitLog("session_closed", {
+					conn,
+					sessionId: sessionId.toString(),
+					code,
+					detail: detail || undefined,
+				});
 				if (s) {
 					s._markClosed({ code, reason: detail || undefined }, detail);
 					this.sessions.delete(key);
@@ -1291,15 +1428,29 @@ export class WasmTransportManager {
 		return error;
 	}
 
+	/** @internal Emit a `limit`/`rate_limit` log event for E_LIMIT_EXCEEDED/E_RATE_LIMITED errors. */
+	private _logIfLimitOrRateLimited(
+		context: string,
+		error: WebTransportError,
+	): void {
+		if (error.code === E_RATE_LIMITED) {
+			this.emitLog("rate_limited", { context, detail: error.message });
+		} else if (error.code === E_LIMIT_EXCEEDED) {
+			this.emitLog("limit_exceeded", { context, detail: error.message });
+		}
+	}
+
 	/** @internal Translate a failed Rust datagram send into a stable public error. */
 	_datagramSendError(conn: number, sessionId: bigint): WebTransportError {
-		return wasmOperationError(
+		const error = wasmOperationError(
 			this.endpoint.takeDatagramSendError(),
 			this.sessions.has(sessionKey(conn, sessionId))
 				? E_QUEUE_FULL
 				: E_SESSION_CLOSED,
 			"datagram send failed because the queue or session is unavailable",
 		);
+		this._logIfLimitOrRateLimited("sendDatagram", error);
+		return error;
 	}
 
 	/** @internal Resolve the live negotiated/path cap without exceeding config. */
@@ -1320,11 +1471,13 @@ export class WasmTransportManager {
 			sessionId === undefined
 				? [...this.sessions.values()].some((s) => s.conn === conn)
 				: this.sessions.has(sessionKey(conn, sessionId));
-		return wasmOperationError(
+		const error = wasmOperationError(
 			this.endpoint.takeStreamWriteError(),
 			open ? E_STREAM_RESET : E_SESSION_CLOSED,
 			"stream write failed because the stream or session is closed",
 		);
+		this._logIfLimitOrRateLimited("streamWrite", error);
+		return error;
 	}
 
 	/** Current combined Rust-to-host retained-payload accounting. */
@@ -1434,11 +1587,9 @@ export class WasmTransportManager {
 	async openSession(conn: number): Promise<WasmSession> {
 		const sid = this.endpoint.openSession(conn);
 		if (sid == null) {
-			throw wasmOperationError(
-				this.endpoint.takeLastError(),
-				E_LIMIT_EXCEEDED,
-				"openSession failed",
-			);
+			const detail = this.endpoint.takeLastError();
+			this.emitLog("handshake_failed", { conn, stage: "openSession", detail });
+			throw wasmOperationError(detail, E_LIMIT_EXCEEDED, "openSession failed");
 		}
 		// Wait until SessionEstablished demux creates/marks the session.
 		const key = sessionKey(conn, sid);
@@ -1449,6 +1600,11 @@ export class WasmTransportManager {
 			if (this.failedPendingOpens.has(key)) {
 				this.failedPendingOpens.delete(key);
 				const detail = this.endpoint.takeLastError();
+				this.emitLog("handshake_failed", {
+					conn,
+					stage: "openSessionConnect",
+					detail,
+				});
 				throw wasmOperationError(
 					detail,
 					E_SESSION_CLOSED,
@@ -1469,6 +1625,10 @@ export class WasmTransportManager {
 			/* best-effort */
 		}
 		this.failedPendingOpens.delete(key);
+		this.emitLog("handshake_failed", {
+			conn,
+			stage: "openSessionTimeout",
+		});
 		throw new WebTransportError(
 			E_HANDSHAKE_TIMEOUT,
 			"openSession timed out waiting for CONNECT 200",
@@ -1502,6 +1662,30 @@ export class WasmTransportManager {
 		this.streamSessionIds.delete(handle);
 	}
 
+	/** @internal Aggregate one session's outbound datagram send for {@link metricsSnapshot}. */
+	_recordDatagramOut(): void {
+		this.datagramsOut += 1;
+	}
+	/** @internal Aggregate one session's inbound datagram delivery for {@link metricsSnapshot}. */
+	_recordDatagramIn(): void {
+		this.datagramsIn += 1;
+	}
+	/** @internal Aggregate one session's dropped inbound datagram for {@link metricsSnapshot}. */
+	_recordDatagramDropped(): void {
+		this.datagramsDropped += 1;
+	}
+
+	/** @internal Count live (not yet released) streams belonging to one session. */
+	_activeStreamCount(conn: number, sessionId: bigint): number {
+		let count = 0;
+		for (const [handle, sid] of this.streamSessionIds) {
+			if (sid !== sessionId) continue;
+			const stream = this.streams.get(handle);
+			if (stream?.conn === conn) count += 1;
+		}
+		return count;
+	}
+
 	connectClient(authority: string): WasmSession {
 		const conn = this.endpoint.connect(authority);
 		if (conn <= 0) {
@@ -1509,6 +1693,7 @@ export class WasmTransportManager {
 			// server endpoint, or rejected params. No
 			// Rust connection exists, so `ready` would hang. Fail it eagerly.
 			const detail = this.endpoint.takeLastError();
+			this.emitLog("handshake_failed", { stage: "connectClient", detail });
 			throw wasmOperationError(
 				detail,
 				E_SESSION_CLOSED,
@@ -1523,15 +1708,22 @@ export class WasmTransportManager {
 	 * No-op when no host is configured or the key is empty.
 	 */
 	async hydrateTicketsFromHost(authority: string): Promise<boolean> {
+		this.lastAuthority = authority;
 		if (!this.ticketStore || !this.options.enable0Rtt) return false;
 		const blob = await this.ticketStore.take(authority);
 		if (!blob || blob.length === 0) return false;
 		return this.endpoint.importClientTicket(authority, blob);
 	}
 
+	/** Remember authority for auto ticket dump on close. */
+	rememberAuthority(authority: string): void {
+		this.lastAuthority = authority;
+	}
+
 	/**
 	 * Dump client tickets minted on this endpoint into {@link ticketStore}.
-	 * Call after NST flush (and before close) so a fresh endpoint can hydrate.
+	 * Called automatically on {@link close} when a store is configured; also
+	 * available for explicit dump after NST.
 	 */
 	async dumpTicketsToHost(authority: string): Promise<boolean> {
 		if (!this.ticketStore || !this.options.enable0Rtt) return false;
@@ -1539,6 +1731,68 @@ export class WasmTransportManager {
 		if (!blob || blob.length === 0) return false;
 		await this.ticketStore.put(authority, blob);
 		return true;
+	}
+
+	/** Native-shaped metrics snapshot (governor + JS counters). TLS counters are 0 until Phase 6. */
+	metricsSnapshot(): MetricsSnapshot {
+		let rust: Record<string, number> = {};
+		try {
+			rust = JSON.parse(this.endpoint.governorSnapshot()) as Record<
+				string,
+				number
+			>;
+		} catch {
+			rust = {};
+		}
+		return {
+			nowMs: Date.now(),
+			sessionsActive: this.sessions.size,
+			sessionTasksActive: this.sessions.size,
+			streamTasksActive: this.streams.size,
+			handshakesInFlight: rust.handshakesInFlight ?? 0,
+			streamsActive: this.streams.size,
+			datagramsIn: this.datagramsIn,
+			datagramsOut: this.datagramsOut,
+			datagramsDropped: this.datagramsDropped,
+			queuedBytesGlobal: this.hostQueuedBytesGlobal,
+			backpressureWaitCount: this.backpressureWaitCount,
+			backpressureTimeoutCount: this.backpressureTimeoutCount,
+			rateLimitedCount: rust.rateLimitedCount ?? 0,
+			limitExceededCount: rust.limitExceededCount ?? 0,
+			sniCertSelections: rust.sniCertSelections ?? 0,
+			defaultCertSelections: rust.defaultCertSelections ?? 0,
+			unknownSniRejectedCount: rust.unknownSniRejectedCount ?? 0,
+		};
+	}
+
+	/** Optional ops logging (Phase 7). */
+	setLog(
+		log: ((event: { type: string; [k: string]: unknown }) => void) | null,
+		debug = false,
+	): void {
+		this.logFn = log;
+		this.debugLog = debug;
+	}
+
+	/** @internal Structured ops logging (Phase 7); also called from {@link WasmSession}. */
+	emitLog(type: string, fields: Record<string, unknown> = {}): void {
+		if (!this.logFn) return;
+		// Only raw PEM material is sensitive here — derived hashes like
+		// `defaultCertHashBase64` are already handed to clients for pinning,
+		// so a naive "cert"/"key" substring match would over-redact them.
+		const event = this.debugLog
+			? { type, ...fields }
+			: {
+					type,
+					...Object.fromEntries(
+						Object.entries(fields).filter(([k]) => !/pem$/i.test(k)),
+					),
+				};
+		try {
+			this.logFn(event);
+		} catch {
+			/* ignore logger failures */
+		}
 	}
 
 	/** @internal Close one session; primary tears down QUIC, extras do not. */
@@ -1594,6 +1848,11 @@ export class WasmTransportManager {
 	 * isolated and reported instead of propagated.
 	 */
 	close(): void {
+		const authority = this.lastAuthority;
+		if (authority && this.ticketStore && this.options.enable0Rtt) {
+			void this.dumpTicketsToHost(authority).catch(() => {});
+		}
+		this.emitLog("endpoint_close", { authority });
 		const guard = (step: () => void) => {
 			try {
 				step();
@@ -1627,6 +1886,78 @@ export class WasmTransportManager {
 		guard(() => this.endpoint.finishClose());
 		guard(() => this.ownedTransport?.close?.());
 		this.ownedTransport = null;
+	}
+
+	/**
+	 * Live TLS update (Phase 6). Requires wasm bridge `wt_update_tls`.
+	 * Accepts JSON matching native rotate_tls_config shape when supported.
+	 */
+	async updateTls(tls: {
+		certPem?: string;
+		keyPem?: string;
+		sni?: Array<{ serverName: string; certPem: string; keyPem: string }>;
+		unknownSniPolicy?: "reject" | "default";
+	}): Promise<void> {
+		const fn = (
+			this.endpoint as unknown as {
+				updateTls?: (json: string) => string;
+			}
+		).updateTls;
+		if (typeof fn !== "function") {
+			throw new WebTransportError(
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				"E_UNSUPPORTED_ARGUMENT: wt_update_tls not available in this wasm build",
+			);
+		}
+		const result = JSON.parse(fn.call(this.endpoint, JSON.stringify(tls))) as {
+			error?: string;
+			defaultCertHashBase64?: string;
+		};
+		if (result.error) {
+			this.emitLog("tls_update_failed", { error: result.error });
+			throw new WebTransportError(E_TLS as ErrorCode, result.error);
+		}
+		// A rotated default cert changes the hash pin clients trust; surface it
+		// via the structured log so operators can redistribute it out-of-band.
+		this.emitLog("tls_update", {
+			sniCount: tls.sni?.length ?? 0,
+			unknownSniPolicy: tls.unknownSniPolicy ?? "reject",
+			defaultCertHashBase64: result.defaultCertHashBase64,
+		});
+	}
+
+	tlsSnapshot(): {
+		unknownSniPolicy: "reject" | "default";
+		defaultCertPresent: boolean;
+		sniNames: string[];
+		defaultCertHashBase64?: string;
+	} {
+		const fn = (
+			this.endpoint as unknown as {
+				tlsSnapshot?: () => string;
+			}
+		).tlsSnapshot;
+		if (typeof fn !== "function") {
+			return {
+				unknownSniPolicy: "reject",
+				defaultCertPresent: true,
+				sniNames: [],
+			};
+		}
+		try {
+			return JSON.parse(fn.call(this.endpoint)) as {
+				unknownSniPolicy: "reject" | "default";
+				defaultCertPresent: boolean;
+				sniNames: string[];
+				defaultCertHashBase64?: string;
+			};
+		} catch {
+			return {
+				unknownSniPolicy: "reject",
+				defaultCertPresent: true,
+				sniNames: [],
+			};
+		}
 	}
 }
 
@@ -1682,38 +2013,88 @@ export async function connectWasm(
 	opts: WasmConnectOptions = {},
 ): Promise<{ session: WasmSession; manager: WasmTransportManager }> {
 	const normalized = normalizeWasmEndpointOptions(opts);
-	const mgr = WasmTransportManager.create(
-		wasm,
-		udp,
-		false,
-		addr,
-		peerAddr,
-		null,
-		normalized,
-		opts.certHashBase64,
-		opts.ticketStore ?? null,
-	);
-	// connectClient can throw SYNCHRONOUSLY (rejected authority, wt_connect
-	// failure) — it must sit inside the try so the endpoint, the transport's
-	// onPacket subscription, and any armed timer are torn down on that path too.
+	const allowPooling = opts.allowPooling === true;
+	if (allowPooling && opts.certHashBase64) {
+		throw new WebTransportError(
+			E_UNSUPPORTED_ARGUMENT as ErrorCode,
+			"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
+		);
+	}
+
+	let mgr: WasmTransportManager | null = null;
+	let pooled = false;
+	if (allowPooling) {
+		const url = (() => {
+			try {
+				return new URL(
+					authority.includes("://") ? authority : `https://${authority}`,
+				);
+			} catch {
+				return null;
+			}
+		})();
+		const host = url?.hostname ?? authority;
+		const port = url?.port
+			? Number(url.port)
+			: peerAddr.includes(":")
+				? Number(peerAddr.slice(peerAddr.lastIndexOf(":") + 1))
+				: 443;
+		const key = wasmPoolKey({
+			scheme: url?.protocol?.replace(":", "") || "https",
+			host,
+			port,
+			serverName: host,
+			requireUnreliable: opts.requireUnreliable,
+			congestionControl: opts.congestionControl,
+			tlsFingerprint: opts.certHashBase64 ?? "accept-any",
+		});
+		mgr = wasmPoolTake(key) ?? null;
+		if (mgr) {
+			pooled = true;
+		} else {
+			mgr = WasmTransportManager.create(
+				wasm,
+				udp,
+				false,
+				addr,
+				peerAddr,
+				null,
+				normalized,
+				opts.certHashBase64,
+				opts.ticketStore ?? null,
+			);
+			wasmPoolPut(key, mgr);
+			pooled = true;
+		}
+	} else {
+		mgr = WasmTransportManager.create(
+			wasm,
+			udp,
+			false,
+			addr,
+			peerAddr,
+			null,
+			normalized,
+			opts.certHashBase64,
+			opts.ticketStore ?? null,
+		);
+	}
+
 	try {
+		mgr.rememberAuthority(authority);
 		await mgr.hydrateTicketsFromHost(authority);
 		const session = mgr.connectClient(authority);
 		await session.ready;
 		return { session, manager: mgr };
 	} catch (err) {
-		// close() is infallible by contract, but the original connect error must
-		// win even if that contract regresses — never let teardown mask it or
-		// skip the transport release below.
-		try {
-			mgr.close();
-		} catch {}
-		// The connect failed and we're throwing, so the caller can't get the
-		// transport back — release it here to avoid leaking its socket/read loop.
-		// (mgr.close() only closes a transport the manager itself owns.)
-		try {
-			udp.close?.();
-		} catch {}
+		if (!pooled) {
+			try {
+				mgr.close();
+			} catch {}
+			try {
+				udp.close?.();
+			} catch {}
+		}
 		throw err;
 	}
 }
@@ -1728,7 +2109,7 @@ export function createWasmServer(
 	opts: WasmEndpointOptions = {},
 ): WasmTransportManager {
 	const normalized = normalizeWasmEndpointOptions(opts);
-	return WasmTransportManager.create(
+	const mgr = WasmTransportManager.create(
 		wasm,
 		udp,
 		true,
@@ -1737,6 +2118,8 @@ export function createWasmServer(
 		onSession,
 		normalized,
 	);
+	if (opts.log) mgr.setLog(opts.log, opts.debug === true);
+	return mgr;
 }
 
 /**
@@ -1789,6 +2172,7 @@ export async function serveOverUdp(
 	);
 	// manager.close() now releases the bound UDP socket too.
 	manager.ownTransport(udp);
+	if (opts.log) manager.setLog(opts.log, opts.debug === true);
 	return { manager, certHashBase64: parsed.hashBase64 };
 }
 
@@ -1851,9 +2235,8 @@ export interface WasmClientArgs {
 	qpackBlockedStreams?: number;
 	enableDynamicQpack?: boolean;
 	/**
-	 * Optional JS host for 0-RTT ticket hydrate/dump. Pass through to
-	 * {@link connectWasmUnified}; call `manager.dumpTicketsToHost(authority)`
-	 * explicitly after NST (not automatic on close).
+	 * Optional JS host for 0-RTT ticket hydrate/dump. Auto-dumps on manager
+	 * close; `dumpTicketsToHost` remains available for explicit dump after NST.
 	 */
 	ticketStore?: TicketStoreHost;
 	allowPooling?: boolean;

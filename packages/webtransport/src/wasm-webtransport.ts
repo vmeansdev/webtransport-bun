@@ -9,11 +9,15 @@ import type {
 	WasmStream,
 } from "./backend.js";
 import {
+	E_BACKPRESSURE_TIMEOUT,
 	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
 	E_SESSION_CLOSED,
 	E_STREAM_RESET,
 	WebTransportError,
 } from "./errors.js";
+import { SendScheduler, type SendPolicy } from "./send-scheduler.js";
 import type { WebTransportCloseInfo } from "./types.js";
 import {
 	createW3CMappedError,
@@ -43,6 +47,12 @@ export type WebTransportDatagramDuplexStream = {
 /** Options for {@link WasmWebTransport} — W3C-shaped, validated loudly. */
 export type WasmWebTransportOptions = W3CClientOptionSurface;
 
+type StreamOpenOptions = {
+	waitUntilAvailable?: boolean;
+	sendOrder?: number;
+	sendGroup?: WasmWebTransportSendGroup | null;
+};
+
 /** Minimal send-group handle for API parity with the native facade. */
 export class WasmWebTransportSendGroup {
 	constructor(
@@ -50,11 +60,82 @@ export class WasmWebTransportSendGroup {
 		private readonly id: number,
 	) {}
 
+	/** @internal */
+	_getId(): number {
+		return this.id;
+	}
+
+	/** @internal */
+	_getTransport(): WasmWebTransport {
+		return this.transport;
+	}
+
 	async getStats(): Promise<{
 		bytesSent?: number;
 		bytesAcknowledged?: number;
 	}> {
 		return this.transport._getSendGroupStats(this.id);
+	}
+}
+
+function shouldRetryStreamOpen(err: unknown): boolean {
+	if (!(err instanceof WebTransportError)) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return (
+			msg.includes(E_LIMIT_EXCEEDED) ||
+			msg.includes(E_QUEUE_FULL) ||
+			msg.includes(E_BACKPRESSURE_TIMEOUT)
+		);
+	}
+	return (
+		err.code === E_LIMIT_EXCEEDED ||
+		err.code === E_QUEUE_FULL ||
+		err.code === E_BACKPRESSURE_TIMEOUT
+	);
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function openStreamWithWait<T>(
+	openFn: () => T,
+	options: StreamOpenOptions | undefined,
+	backpressureTimeoutMs: number,
+	isClosed: () => boolean,
+	strictW3CErrors: boolean,
+): Promise<T> {
+	const wait = options?.waitUntilAvailable;
+	if (wait !== undefined && typeof wait !== "boolean") {
+		throw createW3CMappedError(
+			E_INVALID_ARGUMENT,
+			"waitUntilAvailable must be a boolean",
+			strictW3CErrors,
+		);
+	}
+	if (!wait) return openFn();
+
+	const started = Date.now();
+	let backoffMs = 2;
+	while (true) {
+		if (isClosed()) {
+			throw new WebTransportError(E_SESSION_CLOSED);
+		}
+		try {
+			return openFn();
+		} catch (err) {
+			if (!shouldRetryStreamOpen(err)) throw err;
+			const elapsed = Date.now() - started;
+			if (elapsed >= backpressureTimeoutMs) {
+				throw new WebTransportError(
+					E_BACKPRESSURE_TIMEOUT,
+					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${backpressureTimeoutMs}ms`,
+				);
+			}
+			const remaining = Math.max(1, backpressureTimeoutMs - elapsed);
+			await sleep(Math.min(backoffMs, remaining));
+			backoffMs = Math.min(backoffMs * 2, 50);
+		}
 	}
 }
 
@@ -153,7 +234,6 @@ function streamReadable(
 				deliver();
 			},
 			cancel() {
-				// Consumer cancelled: STOP_SENDING so the peer stops, and release.
 				cancelled = true;
 				releasePending();
 				stream.stop(0);
@@ -167,10 +247,22 @@ function streamReadable(
  * Wrap a `WasmStream` as a WHATWG `WritableStream`. `write` resolves only once
  * EVERY byte is accepted by the QUIC send buffer.
  */
-function streamWritable(stream: WasmStream): WritableStream<Uint8Array> {
+function streamWritable(
+	stream: WasmStream,
+	scheduler?: SendScheduler,
+	policy?: SendPolicy,
+	onBytesSent?: (bytes: number) => void,
+): WritableStream<Uint8Array> {
 	return new WritableStream<Uint8Array>({
 		write(chunk) {
-			return stream.writeAll(chunk);
+			const run = async () => {
+				await stream.writeAll(chunk);
+				onBytesSent?.(chunk.byteLength);
+			};
+			if (scheduler && policy) {
+				return scheduler.enqueue(policy, run);
+			}
+			return run();
 		},
 		close() {
 			stream.finish();
@@ -185,10 +277,13 @@ function streamWritable(stream: WasmStream): WritableStream<Uint8Array> {
 function toBidi(
 	stream: WasmStream,
 	strictW3CErrors: boolean,
+	scheduler?: SendScheduler,
+	policy?: SendPolicy,
+	onBytesSent?: (bytes: number) => void,
 ): WebTransportBidirectionalStream {
 	return {
 		readable: streamReadable(stream, strictW3CErrors),
-		writable: streamWritable(stream),
+		writable: streamWritable(stream, scheduler, policy, onBytesSent),
 	};
 }
 
@@ -273,14 +368,15 @@ function createDatagramReadable(
 		releasePending();
 	};
 
+	// Bun's `UnderlyingSource` type doesn't model `type: "bytes"` sources (its
+	// docs say the mode "is not currently supported"), and this package's
+	// tsconfig omits the DOM lib that defines `UnderlyingByteSource`. Bun's
+	// runtime does support it, so bypass the constructor's overloads here.
 	const readable =
 		readableType === "bytes"
 			? new ReadableStream<Uint8Array>(
 					{
 						type: "bytes",
-						start(c: ReadableByteStreamController) {
-							datagramsController = c;
-						},
 						pull,
 						cancel,
 					} as unknown as object,
@@ -331,6 +427,7 @@ export class WasmWebTransport {
 	readonly #congestionControl: W3CCongestionControl;
 	readonly #strictW3CErrors: boolean;
 	readonly #sendGroupBytes = new Map<number, number>();
+	readonly #sendScheduler = new SendScheduler();
 	#nextSendGroupId = 1;
 
 	constructor(
@@ -354,29 +451,29 @@ export class WasmWebTransport {
 				reason: info.reason,
 			}))
 			.catch((err) => {
-				// W3C specifies closed rejects on connect failure.
 				throw this.#mapError(err);
 			});
 
 		const datagrams = createDatagramReadable(session, datagramsReadableType);
-		const dWritable = new WritableStream<Uint8Array>({
-			// Promise settlement is the backpressure/error boundary. A false Rust
-			// send result is translated by WasmSession into a stable rejecting error.
-			write: (chunk) => session.sendDatagram(chunk),
-		});
+		const self = this;
+		const defaultPolicy: SendPolicy = { groupId: 0, sendOrder: 0 };
+		const dWritable = createDatagramWritable(this, defaultPolicy);
 
 		this.datagrams = {
 			readable: datagrams.readable,
 			writable: dWritable,
-			createWritable() {
-				return dWritable;
+			createWritable(options?: {
+				sendGroup?: unknown | null;
+				sendOrder?: number;
+			}) {
+				const policy = self._resolveSendPolicy(options);
+				return createDatagramWritable(self, policy);
 			},
 			get maxDatagramSize() {
 				return session.maxDatagramSize;
 			},
 		};
 
-		// Incoming streams
 		let bidiController!: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
 		let uniController!: ReadableStreamDefaultController<
 			ReadableStream<Uint8Array>
@@ -493,18 +590,52 @@ export class WasmWebTransport {
 					uniController.error(err);
 				} catch {}
 			});
-		// Match the native facade: draining settles when closing begins locally,
-		// remotely, or because connection establishment failed.
 		this.closed.then(this.resolveDraining, this.resolveDraining);
 	}
 
-	/** Effective congestion control mode (preference; accepted for API parity). */
+	/** Effective congestion control mode (preference; wired in Phase 2 to quinn). */
 	get congestionControl(): W3CCongestionControl {
 		return this.#congestionControl;
 	}
 
 	createSendGroup(): WasmWebTransportSendGroup {
 		return new WasmWebTransportSendGroup(this, this.#nextSendGroupId++);
+	}
+
+	/** @internal */
+	_resolveSendPolicy(options?: {
+		sendOrder?: number;
+		sendGroup?: unknown | null;
+	}): SendPolicy {
+		const sendOrder = options?.sendOrder ?? 0;
+		if (!Number.isInteger(sendOrder)) {
+			throw new TypeError("sendOrder must be an integer");
+		}
+		let groupId = 0;
+		if (options?.sendGroup != null) {
+			if (!(options.sendGroup instanceof WasmWebTransportSendGroup)) {
+				throw new DOMException(
+					"sendGroup belongs to another transport",
+					"InvalidStateError",
+				);
+			}
+			if (options.sendGroup._getTransport() !== this) {
+				throw new DOMException(
+					"sendGroup belongs to another transport",
+					"InvalidStateError",
+				);
+			}
+			groupId = options.sendGroup._getId();
+		}
+		return { groupId, sendOrder };
+	}
+
+	/** @internal */
+	_recordSendGroupBytes(groupId: number, bytes: number): void {
+		this.#sendGroupBytes.set(
+			groupId,
+			(this.#sendGroupBytes.get(groupId) ?? 0) + bytes,
+		);
 	}
 
 	/** @internal */
@@ -515,16 +646,24 @@ export class WasmWebTransport {
 		return { bytesSent: this.#sendGroupBytes.get(id) ?? 0 };
 	}
 
+	/** @internal */
+	async _sendDatagramWithPolicy(
+		chunk: Uint8Array,
+		policy: SendPolicy,
+	): Promise<void> {
+		await this.#sendScheduler.enqueue(policy, async () => {
+			await this.session.sendDatagram(chunk);
+			this._recordSendGroupBytes(policy.groupId, chunk.byteLength);
+		});
+	}
+
 	close(info?: WebTransportCloseInfo): void {
 		this.resolveDraining();
 		this.session.close({ code: info?.closeCode, reason: info?.reason });
 	}
 
 	/**
-	 * W3C WebTransportConnectionStats subset. Wasm does not yet expose QUIC
-	 * wire counters; returns zeros so `if (t.getStats)` consumers type-check
-	 * without E_UNSUPPORTED throwers (honest-release C1/C2). Datagram sub-stats
-	 * are included for parity-baseline shape compatibility.
+	 * W3C WebTransportConnectionStats subset backed by quinn Connection::stats.
 	 */
 	async getStats(): Promise<{
 		bytesSent: number;
@@ -538,55 +677,43 @@ export class WasmWebTransport {
 			lostOutgoing: number;
 		};
 	}> {
-		return {
-			bytesSent: 0,
-			bytesReceived: 0,
-			packetsSent: 0,
-			packetsReceived: 0,
-			datagrams: {
-				droppedIncoming: 0,
-				expiredIncoming: 0,
-				expiredOutgoing: 0,
-				lostOutgoing: 0,
-			},
-		};
+		return this.session.connectionStats();
 	}
 
-	async createBidirectionalStream(options?: {
-		waitUntilAvailable?: boolean;
-	}): Promise<WebTransportBidirectionalStream> {
-		if (
-			options?.waitUntilAvailable !== undefined &&
-			typeof options.waitUntilAvailable !== "boolean"
-		) {
-			throw createW3CMappedError(
-				E_INVALID_ARGUMENT,
-				"waitUntilAvailable must be a boolean",
-				this.#strictW3CErrors,
-			);
-		}
-		// Wasm stream opens already observe governor/backpressure in WasmSession;
-		// waitUntilAvailable=true is accepted for API parity (C3).
-		return toBidi(
-			this.session.createBidirectionalStream(),
+	async createBidirectionalStream(
+		options?: StreamOpenOptions,
+	): Promise<WebTransportBidirectionalStream> {
+		const policy = this._resolveSendPolicy(options);
+		const stream = await openStreamWithWait(
+			() => this.session.createBidirectionalStream(),
+			options,
+			this.session.backpressureTimeoutMs,
+			() => this.session.isClosingOrClosed,
 			this.#strictW3CErrors,
+		);
+		return toBidi(
+			stream,
+			this.#strictW3CErrors,
+			this.#sendScheduler,
+			policy,
+			(bytes) => this._recordSendGroupBytes(policy.groupId, bytes),
 		);
 	}
 
-	async createUnidirectionalStream(options?: {
-		waitUntilAvailable?: boolean;
-	}): Promise<WritableStream<Uint8Array>> {
-		if (
-			options?.waitUntilAvailable !== undefined &&
-			typeof options.waitUntilAvailable !== "boolean"
-		) {
-			throw createW3CMappedError(
-				E_INVALID_ARGUMENT,
-				"waitUntilAvailable must be a boolean",
-				this.#strictW3CErrors,
-			);
-		}
-		return streamWritable(this.session.createUnidirectionalStream());
+	async createUnidirectionalStream(
+		options?: StreamOpenOptions,
+	): Promise<WritableStream<Uint8Array>> {
+		const policy = this._resolveSendPolicy(options);
+		const stream = await openStreamWithWait(
+			() => this.session.createUnidirectionalStream(),
+			options,
+			this.session.backpressureTimeoutMs,
+			() => this.session.isClosingOrClosed,
+			this.#strictW3CErrors,
+		);
+		return streamWritable(stream, this.#sendScheduler, policy, (bytes) =>
+			this._recordSendGroupBytes(policy.groupId, bytes),
+		);
 	}
 
 	#mapError(error: unknown): WebTransportError {
@@ -597,21 +724,30 @@ export class WasmWebTransport {
 			return new WebTransportError(error.code, error.message, {
 				browserName,
 				source: error.source,
-				streamErrorCode: error.streamErrorCode,
-				cause: error,
 			});
 		}
 		return createW3CMappedError(
 			E_SESSION_CLOSED,
-			error instanceof Error ? error.message : "Connection failed",
+			error instanceof Error ? error.message : String(error),
 			this.#strictW3CErrors,
 		);
 	}
 }
 
+function createDatagramWritable(
+	wt: WasmWebTransport,
+	policy: SendPolicy,
+): WritableStream<Uint8Array> {
+	return new WritableStream<Uint8Array>({
+		async write(chunk) {
+			await wt._sendDatagramWithPolicy(chunk, policy);
+		},
+	});
+}
+
 /** Validate W3C options without constructing a session (parity selector tests). */
 export function validateWasmWebTransportOptions(
-	options?: WasmWebTransportOptions,
+	options: WasmWebTransportOptions = {},
 ): void {
-	validateW3CClientOptions(options, options?.strictW3CErrors);
+	validateW3CClientOptions(options, options.strictW3CErrors);
 }

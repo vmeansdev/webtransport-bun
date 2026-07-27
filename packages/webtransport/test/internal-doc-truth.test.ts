@@ -253,7 +253,7 @@ describe("documentation truth policy", () => {
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"ready release still has non-passing claim wasm-browser",
+			"ready release still has non-passing gaRequired claim wasm-browser",
 		);
 	});
 

@@ -13,6 +13,7 @@ use quinn_proto::{
 };
 use web_time::Instant;
 
+use crate::congestion::CongestionControlMode;
 use crate::event::WtEvent;
 use crate::governor::{
     Governor, PeerRateLimiter, RateLimitDimension, RateLimitSnapshot, Reservation, StreamKind,
@@ -102,6 +103,7 @@ fn shared_0rtt_accept_any_client_config() -> Result<ClientConfig, String> {
     tc.keep_alive_interval(Some(std::time::Duration::from_millis(
         KEEP_ALIVE_INTERVAL_MS,
     )));
+    CongestionControlMode::Default.apply(&mut tc);
     client_config.transport_config(Arc::new(tc));
     let _ = CFG.set(client_config.clone());
     Ok(client_config)
@@ -274,6 +276,8 @@ pub struct WtEndpoint {
     /// Local QPACK SETTINGS (advertised + decoder bound). Default disabled (0).
     qpack_settings: h3::QpackLocalSettings,
     last_error: Option<String>,
+    /// Live TLS resolver when the server was built with rotatable certs.
+    tls_resolver: Option<crate::server_tls::LiveServerCertResolver>,
 }
 
 fn clamp_varint_to_u32(value: u64) -> u32 {
@@ -729,21 +733,56 @@ impl WtEndpoint {
         enable_0rtt: bool,
         share_process_0rtt_ticket_store: bool,
     ) -> Result<Self, String> {
-        let server_cfg = if is_server {
-            Some(spike::server_crypto()?.0)
-        } else {
-            None
-        };
-        Self::build(
+        Self::new_with_limits_rate_limits_0rtt_ticket_share_and_cc(
             is_server,
+            _addr,
             peer_addr,
-            server_cfg,
-            None,
             limits,
             rate_limits,
             enable_0rtt,
             share_process_0rtt_ticket_store,
+            CongestionControlMode::Default,
         )
+    }
+
+    pub fn new_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+        is_server: bool,
+        _addr: SocketAddr,
+        peer_addr: SocketAddr,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+        congestion_control: CongestionControlMode,
+    ) -> Result<Self, String> {
+        if is_server {
+            let (cfg, _cert_der, resolver) = spike::server_crypto_with_resolver()?;
+            let mut ep = Self::build(
+                true,
+                peer_addr,
+                Some(cfg),
+                None,
+                limits,
+                rate_limits,
+                enable_0rtt,
+                share_process_0rtt_ticket_store,
+                congestion_control,
+            )?;
+            ep.tls_resolver = Some(resolver);
+            Ok(ep)
+        } else {
+            Self::build(
+                false,
+                peer_addr,
+                None,
+                None,
+                limits,
+                rate_limits,
+                enable_0rtt,
+                share_process_0rtt_ticket_store,
+                congestion_control,
+            )
+        }
     }
 
     /// Production client: pins the server certificate by SHA-256 of its DER
@@ -812,6 +851,26 @@ impl WtEndpoint {
         enable_0rtt: bool,
         share_process_0rtt_ticket_store: bool,
     ) -> Result<Self, String> {
+        Self::new_client_pinned_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+            peer_addr,
+            hashes,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            share_process_0rtt_ticket_store,
+            CongestionControlMode::Default,
+        )
+    }
+
+    pub fn new_client_pinned_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+        peer_addr: SocketAddr,
+        hashes: Vec<[u8; 32]>,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+        congestion_control: CongestionControlMode,
+    ) -> Result<Self, String> {
         let crypto = crate::verify::client_crypto_pinned(hashes)?;
         Self::build(
             false,
@@ -822,6 +881,7 @@ impl WtEndpoint {
             rate_limits,
             enable_0rtt,
             share_process_0rtt_ticket_store,
+            congestion_control,
         )
     }
 
@@ -910,22 +970,47 @@ impl WtEndpoint {
         enable_0rtt: bool,
         share_process_0rtt_ticket_store: bool,
     ) -> Result<(Self, String), String> {
+        Self::new_with_generated_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+            peer_addr,
+            common_name,
+            validity_days,
+            not_before_unix,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            share_process_0rtt_ticket_store,
+            CongestionControlMode::Default,
+        )
+    }
+
+    pub fn new_with_generated_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+        peer_addr: SocketAddr,
+        common_name: &str,
+        validity_days: u32,
+        not_before_unix: i64,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+        congestion_control: CongestionControlMode,
+    ) -> Result<(Self, String), String> {
         let gen = crate::cert::generate(common_name, validity_days, not_before_unix)?;
         let hash = crate::cert::sha256_base64(&gen.cert_der);
-        let cfg = spike::server_config_from_der(gen.cert_der, gen.key_der)?;
-        Ok((
-            Self::build(
-                true,
-                peer_addr,
-                Some(cfg),
-                None,
-                limits,
-                rate_limits,
-                enable_0rtt,
-                share_process_0rtt_ticket_store,
-            )?,
-            hash,
-        ))
+        let (cfg, resolver) =
+            crate::server_tls::server_config_with_live_resolver(gen.cert_der, gen.key_der)?;
+        let mut ep = Self::build(
+            true,
+            peer_addr,
+            Some(cfg),
+            None,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            share_process_0rtt_ticket_store,
+            congestion_control,
+        )?;
+        ep.tls_resolver = Some(resolver);
+        Ok((ep, hash))
     }
 
     fn build(
@@ -937,6 +1022,7 @@ impl WtEndpoint {
         rate_limits: WasmRateLimits,
         enable_0rtt: bool,
         share_process_0rtt_ticket_store: bool,
+        congestion_control: CongestionControlMode,
     ) -> Result<Self, String> {
         limits.validate()?;
         rate_limits.validate()?;
@@ -956,6 +1042,7 @@ impl WtEndpoint {
         tc.keep_alive_interval(Some(std::time::Duration::from_millis(
             KEEP_ALIVE_INTERVAL_MS.min((idle_timeout_ms / 3).max(1)),
         )));
+        congestion_control.apply(&mut tc);
         let transport = Arc::new(tc);
         let ticket_store = if enable_0rtt {
             Some(ticket_store_for_0rtt(share_process_0rtt_ticket_store))
@@ -1034,6 +1121,7 @@ impl WtEndpoint {
             session_closed_count: 0,
             qpack_settings: h3::QpackLocalSettings::disabled(),
             last_error: None,
+            tls_resolver: None,
         })
     }
 
@@ -1119,6 +1207,125 @@ impl WtEndpoint {
     /// Whether this endpoint was built with `enable0Rtt` / early data enabled.
     pub fn enable_0rtt(&self) -> bool {
         self.enable_0rtt
+    }
+
+    /// Quinn connection counters for W3C `getStats()` (JSON).
+    pub fn connection_stats_json(&self, conn_id: u32) -> String {
+        let Some(handle) = self.id_to_handle.get(&conn_id) else {
+            return serde_json::json!({ "error": "E_SESSION_CLOSED: unknown connection" })
+                .to_string();
+        };
+        let Some(conn) = self.conns.get(handle) else {
+            return serde_json::json!({ "error": "E_SESSION_CLOSED: connection gone" }).to_string();
+        };
+        let stats = conn.stats();
+        serde_json::json!({
+            "bytesSent": stats.udp_tx.bytes,
+            "bytesReceived": stats.udp_rx.bytes,
+            "packetsSent": stats.udp_tx.datagrams,
+            "packetsReceived": stats.udp_rx.datagrams,
+            "smoothedRttMs": stats.path.rtt.as_secs_f64() * 1000.0,
+            "datagrams": {
+                "droppedIncoming": 0,
+                "expiredIncoming": 0,
+                "expiredOutgoing": 0,
+                "lostOutgoing": 0
+            }
+        })
+        .to_string()
+    }
+
+    pub fn tls_snapshot_json(&self) -> String {
+        match &self.tls_resolver {
+            Some(r) => r.snapshot_json(),
+            None => serde_json::json!({
+                "unknownSniPolicy": "reject",
+                "defaultCertPresent": self.is_server,
+                "sniNames": [],
+                "sniCertSelections": 0,
+                "defaultCertSelections": 0,
+                "unknownSniRejectedCount": 0,
+            })
+            .to_string(),
+        }
+    }
+
+    pub fn update_tls_json(&self, config_json: &str) -> String {
+        let Some(resolver) = &self.tls_resolver else {
+            return serde_json::json!({
+                "error": "E_TLS: live TLS resolver unavailable on this endpoint"
+            })
+            .to_string();
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(config_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({ "error": format!("E_TLS: config json: {e}") })
+                    .to_string()
+            }
+        };
+        let mut default_cert_rotated = false;
+        if let (Some(cert), Some(key)) = (
+            parsed.get("certPem").and_then(|v| v.as_str()),
+            parsed.get("keyPem").and_then(|v| v.as_str()),
+        ) {
+            match crate::server_tls::certified_key_from_pem(cert, key) {
+                Ok(ck) => {
+                    resolver.replace_default(ck);
+                    default_cert_rotated = true;
+                }
+                Err(e) => return serde_json::json!({ "error": e }).to_string(),
+            }
+        }
+        if let Some(policy) = parsed.get("unknownSniPolicy").and_then(|v| v.as_str()) {
+            match crate::server_tls::UnknownSniPolicy::parse(Some(policy)) {
+                Ok(p) => resolver.set_unknown_policy(p),
+                Err(e) => return serde_json::json!({ "error": e }).to_string(),
+            }
+        }
+        if let Some(entries) = parsed.get("sni").and_then(|v| v.as_array()) {
+            let mut mapped = Vec::new();
+            for entry in entries {
+                let name = match entry.get("serverName").and_then(|v| v.as_str()) {
+                    Some(n) => n.to_string(),
+                    None => {
+                        return serde_json::json!({ "error": "E_TLS: sni.serverName missing" })
+                            .to_string()
+                    }
+                };
+                let cert = match entry.get("certPem").and_then(|v| v.as_str()) {
+                    Some(c) => c,
+                    None => {
+                        return serde_json::json!({ "error": "E_TLS: sni.certPem missing" })
+                            .to_string()
+                    }
+                };
+                let key = match entry.get("keyPem").and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => {
+                        return serde_json::json!({ "error": "E_TLS: sni.keyPem missing" })
+                            .to_string()
+                    }
+                };
+                match crate::server_tls::certified_key_from_pem(cert, key) {
+                    Ok(ck) => mapped.push((name, ck)),
+                    Err(e) => return serde_json::json!({ "error": e }).to_string(),
+                }
+            }
+            resolver.set_sni(mapped);
+        }
+        // Pin clients trust a specific cert hash; when the default cert just
+        // changed, hand back the new hash so the caller can redistribute it
+        // out-of-band instead of silently breaking existing pinned clients.
+        if default_cert_rotated {
+            serde_json::json!({
+                "ok": true,
+                "defaultCertHashBase64": resolver.default_cert_hash_base64(),
+            })
+            .to_string()
+        } else {
+            serde_json::json!({ "ok": true }).to_string()
+        }
     }
 
     /// Drain client TLS tickets for `server_name` into an opaque vault blob.

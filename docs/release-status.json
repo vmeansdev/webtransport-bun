@@ -67,6 +67,13 @@
 			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
 			"notes": "Honest timed facade tests."
+		},
+		{
+			"id": "local-iwa-direct-sockets-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/iwa-direct-sockets.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+			"status": "passed",
+			"notes": "Local Chrome 150 IWA Direct Sockets; 8 reconnects + cert rotation; in-page ~88ms loopback (process ~2s incl. launch); sourceCommit=cb0cb69."
 		}
 	],
 	"claims": [
@@ -122,10 +129,12 @@
 		{
 			"id": "iwa-direct-sockets",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-iwa-direct-sockets-cb0cb69"
+			],
 			"gaRequired": true,
-			"notes": "IWA harness missing origin.txt/bundle on this host; demoted (no theater stamp)."
+			"notes": "Local Chrome IWA Direct Sockets on gap-closure candidate (rebuilt+signed bundle; Chrome 150)."
 		},
 		{
 			"id": "fault-matrix",
