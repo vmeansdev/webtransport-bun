@@ -187,7 +187,7 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 				"both peers establish",
 			);
 
-			const aStream1 = clientA.openStream(connA, true);
+			const aStream1 = clientA.openStream(connA, 0n, true);
 			expect(aStream1).toBeGreaterThan(0);
 			clientA.streamWrite(aStream1, Uint8Array.of(0x41));
 			await waitFor(
@@ -197,7 +197,7 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 				5,
 				"first peer-opened stream",
 			);
-			const aStream2 = clientA.openStream(connA, true);
+			const aStream2 = clientA.openStream(connA, 0n, true);
 			expect(aStream2).toBeGreaterThan(0);
 			clientA.streamWrite(aStream2, Uint8Array.of(0x42));
 			const streamLimitError = await waitFor(
@@ -209,7 +209,7 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 			);
 			expect(streamLimitError).not.toContain("127.0.0.");
 			expect(streamLimitError).not.toContain("5544");
-			const bStream = clientB.openStream(connB, true);
+			const bStream = clientB.openStream(connB, 0n, true);
 			expect(bStream).toBeGreaterThan(0);
 			clientB.streamWrite(bStream, Uint8Array.of(0x43));
 			await waitFor(
@@ -261,7 +261,7 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 			options,
 			{
 				onEstablished: (conn) => serverEstablished.push(conn),
-				onDatagram: (conn, data) =>
+				onDatagram: (conn, sessionId, data) =>
 					serverDatagrams.push({ conn, payload: data.slice() }),
 			},
 		);
@@ -297,7 +297,9 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 				"both peers establish for datagram abuse",
 			);
 
-			expect(clientA.sendDatagram(connA, Uint8Array.of(0x01))).toBe(true);
+			expect(clientA.sendDatagram(connA, sessionId, Uint8Array.of(0x01))).toBe(
+				true,
+			);
 			await waitFor(
 				() => serverDatagrams.length,
 				(count) => count === 1,
@@ -305,7 +307,9 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 				5,
 				"first abusive-peer datagram arrives",
 			);
-			expect(clientA.sendDatagram(connA, Uint8Array.of(0x02))).toBe(true);
+			expect(clientA.sendDatagram(connA, sessionId, Uint8Array.of(0x02))).toBe(
+				true,
+			);
 			const datagramLimitError = await waitFor(
 				() => server.takeLastError(),
 				(error) => error.includes(E_RATE_LIMITED),
@@ -316,7 +320,9 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 			expect(datagramLimitError).not.toContain("127.0.0.");
 			expect(datagramLimitError).not.toContain("5544");
 
-			expect(clientB.sendDatagram(connB, Uint8Array.of(0x03))).toBe(true);
+			expect(clientB.sendDatagram(connB, sessionId, Uint8Array.of(0x03))).toBe(
+				true,
+			);
 			await waitFor(
 				() => ({
 					datagrams: serverDatagrams.length,
