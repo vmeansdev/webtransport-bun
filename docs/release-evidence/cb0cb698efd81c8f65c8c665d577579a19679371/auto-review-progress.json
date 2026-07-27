@@ -1,0 +1,12 @@
+{
+	"round": 5,
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"status": "IN_PROGRESS_PENDING_FORMAL_LANES",
+	"seeAlso": "auto-review-progress-round5.json",
+	"claimPass": {
+		"auto-review-zero-p0-p4": "REJECT"
+	},
+	"remainingP0P4": [
+		"FORMAL_R5_LANES_REQUIRED"
+	]
+}

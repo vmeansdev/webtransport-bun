@@ -1,0 +1,19 @@
+{
+	"round": 5,
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"headAtReview": "cb0cb69",
+	"reviewRange": "a57df57..cb0cb698efd81c8f65c8c665d577579a19679371",
+	"status": "IN_PROGRESS",
+	"note": "Formal R5 after gap-closure. Product fixes + honest evidence rebound; demoted unreproducible claims.",
+	"lanes": {
+		"1": { "verdict": "pending", "opens": [], "agent": "41a3a4be-f30b-4d7e-8611-5c2aaa726170" },
+		"2": { "verdict": "N/A", "opens": [], "agent": "parent", "note": "native untouched in gap-closure range" },
+		"3": { "verdict": "pending", "opens": [], "agent": "248d3da2-72d4-4224-ad90-9af949402753" },
+		"4": { "verdict": "pending", "opens": [], "agent": "248d3da2-72d4-4224-ad90-9af949402753" },
+		"5": { "verdict": "pending", "opens": [], "agent": "3d7ee8b2-1570-491e-8f83-98c60ed50f8d" },
+		"6": { "verdict": "pending", "opens": [], "agent": "3d7ee8b2-1570-491e-8f83-98c60ed50f8d" },
+		"7": { "verdict": "pending", "opens": [], "agent": "3d7ee8b2-1570-491e-8f83-98c60ed50f8d" },
+		"8": { "verdict": "pending", "opens": [], "agent": "248d3da2-72d4-4224-ad90-9af949402753" }
+	},
+	"remainingP0P4": []
+}

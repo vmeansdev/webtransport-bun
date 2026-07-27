@@ -9,22 +9,22 @@ Package version: `1.0.0-rc.1`.
 `bun scripts/promote-release-status.ts` succeeds. `scale-10k-multisource` is
 `gaRequired: false`.
 
-## Local progress on candidate `b97e622…`
+## Local progress on candidate `cb0cb69…`
 
 ### Passed (commit-bound on candidate)
 
-- `native-local-gates`, `wasm-local-gates`, `runtime-consumers`
-- `chromium-native-interop`, `chromium-wasm-interop`
-- `fault-matrix`, `package-artifact`, `supply-chain-provenance`
-- `coverage-gates` (endpoint/h3 floors recovered)
-- `iwa-direct-sockets` (local Chrome Direct Sockets proof)
+- `wasm-local-gates`, `package-artifact`, `supply-chain-provenance`
 - `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity`
+  (honest timed unit evidence after R4 gap-closure)
 
 ### Still pending (block promote)
 
 | Claim | Blocker |
 |---|---|
-| `auto-review-zero-p0-p4` | Round-4 COMPLETE_NOT_READY; gap closure + round 5 required |
+| `auto-review-zero-p0-p4` | Formal eight-lane round 5 required after gap-closure |
+| `coverage-gates` | endpoint/h3 branch 79.64/78.85 < 80 after gap-closure |
+| `iwa-direct-sockets` | IWA harness assets missing on this host; demoted (no theater) |
+| `native-local-gates`, `runtime-consumers`, `chromium-*`, `fault-matrix` | Not re-run on gap-closure SHA; demoted pending re-verify |
 | `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
 | `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |
 | `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
@@ -33,8 +33,9 @@ Package version: `1.0.0-rc.1`.
 ## What is safe to say today
 
 - Package remains `1.0.0-rc.1`; readiness remains `pending`.
-- Protocol + facade + IWA + coverage gates are claim-passed on candidate
-  `b97e622` with local commit-bound evidence. Soft facade divergences
-  (`allowPooling` / `waitUntilAvailable` / zero `getStats`) remain documented.
-- TicketStoreHost hydrate/dump is on the 0-RTT path; durable IndexedDB is not.
+- R4 product gaps closed on candidate: random ticket vault, SNI=authority,
+  QPACK encode scratch + blocked-stream cap, `ticketStore` on unified client.
+- Soft facade divergences (`allowPooling` / `waitUntilAvailable` / zero
+  `getStats`) remain documented. Ticket dump is explicit (`dumpTicketsToHost`),
+  not automatic on close.
 - Promote still refuses until the pending table above clears.

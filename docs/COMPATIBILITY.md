@@ -39,11 +39,11 @@ See `docs/release-status.json` → `support.scopeLimits`.
 
 | Scenario | Environment | Status |
 |----------|-------------|--------|
-| Server inside the browser | Chromium Isolated Web App with `direct-sockets` and `cross-origin-isolated` permissions | supported only when the scheduled/dispatch `iwa.yml` gate produces passing commit-bound evidence |
+| Server inside the browser | Chromium Isolated Web App with `direct-sockets` and `cross-origin-isolated` permissions | `iwa-direct-sockets` currently **pending** in `docs/release-status.json` (re-run required; no theater evidence) |
 | Server inside the browser | Normal web page, Firefox, Safari | **not possible** — Direct Sockets is IWA/Chromium-only |
 | Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | implemented and locally tested; release evidence pending |
 | Client (wasm) → native server | Bun/Node host, real UDP | implemented and locally tested; release evidence pending |
-| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; `chromium-wasm-interop` claim-passed on current candidate |
+| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; `chromium-wasm-interop` currently **pending** re-verify on gap-closure candidate |
 | Custom transport | anything implementing `UdpTransport` | implemented — the core is sans-IO; consumer-specific support is not claimed |
 
 Constraints that apply regardless of environment:

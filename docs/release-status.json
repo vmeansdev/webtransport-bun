@@ -1,133 +1,89 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+		"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-coverage-floors-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/coverage-gates-floor-results.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "endpoint/h3 floors \u226590/90/80 on candidate."
-		},
-		{
-			"id": "local-dynamic_qpack-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/dynamic_qpack-unit-evidence.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "QPACK options + KRC on candidate."
-		},
-		{
-			"id": "local-multi_session-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/multi_session-unit-evidence.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "Multi-session product surface on candidate."
-		},
-		{
-			"id": "local-zero_rtt-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/zero_rtt-unit-evidence.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "Shared-store + TicketStoreHost hydrate has0Rtt on candidate."
-		},
-		{
-			"id": "local-auto-review-progress-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/auto-review-progress-round4.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-coverage-floors-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/coverage-gates-floor-results.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "failed",
-			"notes": "Round-4 COMPLETE_NOT_READY; remainingP0P4 non-empty. Supersedes stale auto-review-progress.json claimPass."
+			"notes": "endpoint/h3 branch 79.64/78.85 < 80 after gap-closure."
 		},
 		{
-			"id": "local-wasm-local-gates-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/wasm-local-gates.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-dynamic_qpack-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/dynamic_qpack-unit-evidence.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "bun run test:wasm 85 pass"
+			"notes": "Honest timed bun test wasm-qpack-options."
 		},
 		{
-			"id": "local-native-local-gates-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/native-local-gates.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-multi_session-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/multi_session-unit-evidence.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "cargo test -p native --lib 110 pass"
+			"notes": "Honest timed bun test wasm-multi-session."
 		},
 		{
-			"id": "local-supply-chain-provenance-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/supply-chain-provenance.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-zero_rtt-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/zero_rtt-unit-evidence.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "actions pin policy rebound"
+			"notes": "Honest timed bun test wasm-0rtt; warm OnceLock soft first assert intentional."
 		},
 		{
-			"id": "local-package-artifact-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/package-artifact.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "package artifact build+check"
+			"id": "local-auto-review-progress-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/auto-review-progress-round5.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+			"status": "failed",
+			"notes": "Formal eight-lane R5 still required."
 		},
 		{
-			"id": "local-runtime-consumers-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/runtime-consumers.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-wasm-local-gates-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/wasm-local-gates.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "internal package artifact tests rebound"
+			"notes": "bun run test:wasm 85 pass."
 		},
 		{
-			"id": "local-chromium-wasm-interop-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/chromium-wasm-interop.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-supply-chain-provenance-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/supply-chain-provenance.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "chromium wasm interop rebound"
+			"notes": "Honest timed check-actions-pinned."
 		},
 		{
-			"id": "local-chromium-native-interop-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/chromium-native-interop.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-package-artifact-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/package-artifact.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "chromium native interop rebound"
+			"notes": "Honest sequential build then check."
 		},
 		{
-			"id": "local-fault-matrix-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/fault-matrix.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"id": "local-facade_parity-cb0cb69",
+			"path": "docs/release-evidence/cb0cb698efd81c8f65c8c665d577579a19679371/facade_parity-unit-evidence.json",
+			"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
 			"status": "passed",
-			"notes": "fault matrix rebound"
-		},
-		{
-			"id": "local-facade_parity-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/facade_parity-unit-evidence.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "Facade session-map smoke + wasm parity"
-		},
-		{
-			"id": "local-iwa-direct-sockets-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/iwa-direct-sockets.json",
-			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "Local Chrome IWA Direct Sockets proof"
+			"notes": "Honest timed facade tests."
 		}
 	],
 	"claims": [
 		{
 			"id": "native-local-gates",
 			"surface": "native",
-			"status": "passed",
-			"evidenceIds": [
-				"local-native-local-gates-b97e622"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Native lib gates on candidate."
+			"notes": "Not re-run on gap-closure candidate; demoted pending re-verify."
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-local-gates-b97e622"
+				"local-wasm-local-gates-cb0cb69"
 			],
 			"gaRequired": true,
 			"notes": "Wasm product suite on candidate."
@@ -142,62 +98,52 @@
 		{
 			"id": "runtime-consumers",
 			"surface": "release",
-			"status": "passed",
-			"evidenceIds": [
-				"local-runtime-consumers-b97e622"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Rebound."
+			"notes": "Not re-run on gap-closure candidate; demoted pending re-verify."
 		},
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
-			"status": "passed",
-			"evidenceIds": [
-				"local-chromium-native-interop-b97e622"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Rebound."
+			"notes": "Not re-run on gap-closure candidate; demoted pending re-verify."
 		},
 		{
 			"id": "chromium-wasm-interop",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-chromium-wasm-interop-b97e622"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Rebound."
+			"notes": "Not re-run on gap-closure candidate; demoted pending re-verify."
 		},
 		{
 			"id": "iwa-direct-sockets",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-iwa-direct-sockets-b97e622"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Local Chrome IWA Direct Sockets on candidate."
+			"notes": "IWA harness missing origin.txt/bundle on this host; demoted (no theater stamp)."
 		},
 		{
 			"id": "fault-matrix",
 			"surface": "release",
-			"status": "passed",
-			"evidenceIds": [
-				"local-fault-matrix-b97e622"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Rebound."
+			"notes": "Not re-run on gap-closure candidate; demoted pending re-verify."
 		},
 		{
 			"id": "coverage-gates",
 			"surface": "release",
-			"status": "passed",
+			"status": "pending",
 			"evidenceIds": [
-				"local-coverage-floors-b97e622"
+				"local-coverage-floors-cb0cb69"
 			],
 			"gaRequired": true,
-			"notes": "endpoint/h3 floors recovered on candidate."
+			"notes": "Branch floors 79.64/78.85 < 80 after gap-closure product changes."
 		},
 		{
 			"id": "fuzz-gates",
@@ -220,7 +166,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-b97e622"
+				"local-package-artifact-cb0cb69"
 			],
 			"gaRequired": true,
 			"notes": "Build+check on candidate."
@@ -230,7 +176,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-provenance-b97e622"
+				"local-supply-chain-provenance-cb0cb69"
 			],
 			"gaRequired": true,
 			"notes": "Rebound."
@@ -254,10 +200,10 @@
 			"surface": "release",
 			"status": "pending",
 			"evidenceIds": [
-				"local-auto-review-progress-b97e622"
+				"local-auto-review-progress-cb0cb69"
 			],
 			"gaRequired": true,
-			"notes": "R4 COMPLETE_NOT_READY; round 5 required after gap closure."
+			"notes": "Formal eight-lane round 5 required after gap-closure."
 		},
 		{
 			"id": "final-no-change-confirmation",
@@ -271,7 +217,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-dynamic_qpack-b97e622"
+				"local-dynamic_qpack-cb0cb69"
 			],
 			"gaRequired": true,
 			"notes": "Opt-in dynamic QPACK on candidate."
@@ -281,7 +227,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-multi_session-b97e622"
+				"local-multi_session-cb0cb69"
 			],
 			"gaRequired": true,
 			"notes": "Multi-session on candidate."
@@ -291,20 +237,20 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-zero_rtt-b97e622"
+				"local-zero_rtt-cb0cb69"
 			],
 			"gaRequired": true,
-			"notes": "Shared-store + TicketStoreHost hydrate/dump has0Rtt; IndexedDB still out of scope."
+			"notes": "Shared-store + TicketStoreHost hydrate/dump; warm OnceLock soft first assert intentional; SNI=authority host."
 		},
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-facade_parity-b97e622"
+				"local-facade_parity-cb0cb69"
 			],
 			"gaRequired": true,
-			"notes": "Smoke bar: session-map + wasm parity; pooling/waitUntilAvailable/getStats soft divergences."
+			"notes": "Session-map smoke + unified client ticketStore/manager return."
 		}
 	],
 	"surfaces": {
