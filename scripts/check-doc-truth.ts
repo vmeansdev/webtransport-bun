@@ -18,6 +18,8 @@ type Claim = {
 	surface: "native" | "wasm" | "release";
 	status: ClaimStatus;
 	evidenceIds: string[];
+	/** When false, claim is tracked but does not block readiness=ready. Default true. */
+	gaRequired?: boolean;
 };
 
 type Surface = {
@@ -215,6 +217,12 @@ function checkClaims(
 		}
 		if (!(["passed", "pending", "failed"] as const).includes(claim.status)) {
 			report(location, "status must be passed, pending, or failed");
+		}
+		if (
+			claim.gaRequired !== undefined &&
+			typeof claim.gaRequired !== "boolean"
+		) {
+			report(location, "gaRequired must be a boolean when present");
 		}
 		const evidenceIds = asArray<string>(
 			claim.evidenceIds,
@@ -503,10 +511,11 @@ if (status) {
 			);
 		}
 		for (const claim of claims.values()) {
-			if (claim.status !== "passed") {
+			const blocksGa = claim.gaRequired !== false;
+			if (blocksGa && claim.status !== "passed") {
 				report(
 					"release-status.candidate.readiness",
-					`ready release still has non-passing claim ${claim.id}`,
+					`ready release still has non-passing gaRequired claim ${claim.id}`,
 				);
 			}
 		}

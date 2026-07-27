@@ -54,7 +54,7 @@ verification. Code can be present while the release claim is still pending.
 | Surface | Implementation source | Implementation evidence | Release verification |
 |---|---|---|---|
 | Native addon path | `crates/native/src/{client.rs,lib.rs,limits.rs,rate_limit.rs,server.rs}` | `packages/webtransport/test/{acceptance,adversarial,backpressure,drain,fairness,hardening*,parity-*,tls}.test.ts`; `docs/reviews/2026-07-21-1.0-finding-ledger.md` | `docs/release-status.json` still `pending` |
-| WASM candidate path | `crates/wasm/src/{bridge.rs,cert.rs,endpoint.rs,event.rs,h3.rs,lib.rs,verify.rs}`; `packages/webtransport/src/{backend.ts,backend-wasm.ts,wasm-webtransport.ts,webtransport-like-wasm.ts}` | `packages/webtransport/test/{wasm-*.test.ts,parity-*.test.ts}`; `tools/interop/interop-evidence-wasm.json` | `docs/release-status.json` still `pending` |
+| WASM candidate path (coupled 1.0 target) | `crates/wasm/src/{bridge.rs,cert.rs,endpoint.rs,event.rs,h3.rs,lib.rs,verify.rs}`; `packages/webtransport/src/{backend.ts,backend-wasm.ts,wasm-webtransport.ts,webtransport-like-wasm.ts}` | `packages/webtransport/test/{wasm-*.test.ts,parity-*.test.ts}`; `tools/interop/interop-evidence-wasm.json` | Protocol/facade claims `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity` still `pending` in `docs/release-status.json` |
 
 ## Interop and IWA evidence
 
@@ -67,9 +67,11 @@ verification. Code can be present while the release claim is still pending.
 ## Candidate notes
 
 - The browser-shaped client facade is implemented as an additive surface.
-- The wasm backend is a candidate implementation, not a GA declaration.
-- The former “intentional divergence” notes are retired. Treat remaining
-  differences as implementation details or release-verification status, not as
-  silent no-ops.
-- Release verification still waits on commit-bound evidence in
+- The wasm backend is a **candidate** toward coupled package 1.0.0 — not GA
+  until `gaRequired` claims (including protocol bar + facade parity) pass.
+- Protocol targets (dynamic QPACK, multi-session, 0-RTT) are required for
+  coupled GA; see `docs/WASM_PROTOCOL_SCOPE.md`.
+- Treat remaining differences as implementation progress or release-verification
+  status, not as silent no-ops.
+- Release verification always defers to commit-bound evidence in
   `docs/release-status.json`.
