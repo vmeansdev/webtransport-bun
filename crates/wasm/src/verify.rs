@@ -20,6 +20,17 @@ fn application_verification_failure() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
 }
 
+fn format_verify_error(err: impl std::fmt::Display) -> String {
+    err.to_string()
+}
+
+fn ensure_p256_signature_scheme(scheme: rustls::SignatureScheme) -> Result<(), rustls::Error> {
+    if scheme != rustls::SignatureScheme::ECDSA_NISTP256_SHA256 {
+        return Err(application_verification_failure());
+    }
+    Ok(())
+}
+
 fn certificate_satisfies_pin_policy(der: &[u8], now: rustls::pki_types::UnixTime) -> bool {
     let Ok((remaining, cert)) = x509_parser::parse_x509_certificate(der) else {
         return false;
@@ -139,9 +150,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if dss.scheme != rustls::SignatureScheme::ECDSA_NISTP256_SHA256 {
-            return Err(application_verification_failure());
-        }
+        ensure_p256_signature_scheme(dss.scheme)?;
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -156,9 +165,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if dss.scheme != rustls::SignatureScheme::ECDSA_NISTP256_SHA256 {
-            return Err(application_verification_failure());
-        }
+        ensure_p256_signature_scheme(dss.scheme)?;
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -177,7 +184,7 @@ pub(crate) fn client_crypto_pinned(hashes: Vec<[u8; 32]>) -> Result<rustls::Clie
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| e.to_string())?
+        .map_err(format_verify_error)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier::new(hashes)))
         .with_no_client_auth();
@@ -340,5 +347,53 @@ mod tests {
             }
             assert_application_verification_failure(verify_with_matching_pin(&der, 0));
         }
+    }
+
+    #[test]
+    fn certificate_satisfies_pin_policy_at_mirrors_unix_time_helper() {
+        let der = fixture(VALID_P256);
+        let (not_before, not_after) = validity(&der);
+        let mid = not_before + (not_after - not_before) / 2;
+        assert!(super::certificate_satisfies_pin_policy_at(&der, mid));
+        assert!(!super::certificate_satisfies_pin_policy_at(
+            &der,
+            not_before.saturating_sub(1)
+        ));
+        // Seconds that cannot fit in i64 must fail closed (fuzz/host clock safety).
+        assert!(!super::certificate_satisfies_pin_policy_at(&der, u64::MAX));
+    }
+
+    #[test]
+    fn parse_hashes_accepts_csv_and_client_crypto_builds() {
+        let der = fixture(VALID_P256);
+        let digest: [u8; 32] = Sha256::digest(&der).into();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+        let hashes = PinnedCertVerifier::parse_hashes(&format!(" ,{encoded}, "))
+            .expect("trimmed valid hash");
+        assert_eq!(hashes, vec![digest]);
+
+        let cfg = super::client_crypto_pinned(hashes).expect("pinned client crypto");
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+
+        let verifier = PinnedCertVerifier::new(vec![digest]);
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
+        );
+    }
+
+    #[test]
+    fn verify_tls_signatures_reject_non_p256_schemes() {
+        assert!(matches!(
+            super::ensure_p256_signature_scheme(rustls::SignatureScheme::RSA_PKCS1_SHA256),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure
+            ))
+        ));
+        assert!(super::ensure_p256_signature_scheme(
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256
+        )
+        .is_ok());
+        assert_eq!(super::format_verify_error("x"), "x");
     }
 }

@@ -904,6 +904,16 @@ impl Reservation {
             kind: Some(kind),
         }
     }
+
+    #[cfg(test)]
+    fn clear_kind_for_test(&mut self) {
+        self.kind = None;
+    }
+
+    #[cfg(test)]
+    fn clear_inner_for_test(&mut self) {
+        self.inner = None;
+    }
 }
 
 impl Drop for Reservation {
@@ -1750,6 +1760,255 @@ mod tests {
         assert!(governor.release_host_token(first));
         assert_eq!(
             governor.snapshot(1, None),
+            super::GovernorSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn limits_validation_rejects_zeros_and_inconsistent_relationships() {
+        assert!(WasmLimits {
+            max_sessions: 0,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("maxSessions"));
+
+        assert!(WasmLimits {
+            backpressure_timeout_ms: 0,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("backpressureTimeoutMs"));
+
+        assert!(WasmLimits {
+            max_queued_bytes_per_stream: 8,
+            max_queued_bytes_per_session: 4,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("maxQueuedBytesPerStream"));
+
+        assert!(WasmLimits {
+            max_queued_bytes_per_session: 8,
+            max_queued_bytes_global: 4,
+            max_queued_bytes_per_stream: 2,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("maxQueuedBytesPerSession"));
+
+        assert!(WasmLimits {
+            max_streams_per_session_bidi: 8,
+            max_streams_per_session_uni: 1,
+            max_streams_global: 4,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("maxStreamsPerSessionBidi"));
+
+        assert!(WasmLimits {
+            max_streams_per_session_bidi: 1,
+            max_streams_per_session_uni: 8,
+            max_streams_global: 4,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("maxStreamsPerSessionUni"));
+
+        assert!(WasmLimits {
+            handshake_timeout_ms: 20,
+            idle_timeout_ms: 10,
+            ..WasmLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("handshakeTimeoutMs"));
+    }
+
+    #[test]
+    fn rate_limit_validation_rejects_handshake_and_datagram_burst_below_rate() {
+        assert!(WasmRateLimits {
+            handshakes_burst: 1,
+            handshakes_per_sec: 2,
+            ..WasmRateLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("handshakesBurst"));
+
+        assert!(WasmRateLimits {
+            datagrams_ingress_burst: 1,
+            datagrams_ingress_per_sec: 2,
+            ..WasmRateLimits::default()
+        }
+        .validate()
+        .unwrap_err()
+        .contains("datagramsIngressBurst"));
+    }
+
+    #[test]
+    fn rate_limit_pure_ipv6_peer_isolation_and_bucket_capacity() {
+        use std::net::Ipv6Addr;
+
+        let now = Instant::now();
+        let mut limiter = PeerRateLimiter::new(
+            WasmRateLimits {
+                handshakes_per_sec: 1,
+                handshakes_burst: 1,
+                stream_opens_per_sec: 1,
+                stream_opens_burst: 1,
+                datagrams_ingress_per_sec: 1,
+                datagrams_ingress_burst: 1,
+            },
+            &WasmLimits {
+                max_sessions: 1,
+                max_handshakes_in_flight: 1,
+                handshake_timeout_ms: 10,
+                idle_timeout_ms: 1_000,
+                ..WasmLimits::default()
+            },
+        )
+        .expect("rate limiter");
+
+        let v6_a = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 4000);
+        let v6_b = SocketAddr::new(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()), 4000);
+        assert!(limiter
+            .check(now, v6_a, RateLimitDimension::Handshake)
+            .is_ok());
+        assert!(limiter
+            .check(now, v6_b, RateLimitDimension::Handshake)
+            .is_ok());
+
+        // max_buckets = max(1*2, 1*2, 64) = 64; fill remaining capacity then trip.
+        for i in 0..62u16 {
+            let peer = SocketAddr::from((Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8), 4000));
+            assert!(
+                limiter
+                    .check(now, peer, RateLimitDimension::Handshake)
+                    .is_ok(),
+                "peer {i} should fit under bucket cap"
+            );
+        }
+        let overflow = SocketAddr::from((Ipv4Addr::new(10, 1, 0, 1), 4000));
+        assert_eq!(
+            limiter
+                .check(now, overflow, RateLimitDimension::DatagramIngress)
+                .err()
+                .as_deref(),
+            Some("E_RATE_LIMITED: peer rate limit bucket capacity reached")
+        );
+        assert!(limiter.snapshot().rate_limited_datagram_ingress_count > 0);
+    }
+
+    #[test]
+    fn rate_limit_reattach_replaces_owner_and_connection_checks_all_dimensions() {
+        let now = Instant::now();
+        let mut limiter = PeerRateLimiter::new(
+            WasmRateLimits {
+                handshakes_per_sec: 8,
+                handshakes_burst: 8,
+                stream_opens_per_sec: 8,
+                stream_opens_burst: 8,
+                datagrams_ingress_per_sec: 8,
+                datagrams_ingress_burst: 8,
+            },
+            &WasmLimits {
+                max_sessions: 4,
+                max_handshakes_in_flight: 4,
+                handshake_timeout_ms: 10,
+                idle_timeout_ms: 50,
+                ..WasmLimits::default()
+            },
+        )
+        .expect("rate limiter");
+        let peer_a = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 4000));
+        let peer_b = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), 4000));
+
+        limiter.attach_connection(1, peer_a, now).expect("attach A");
+        limiter
+            .attach_connection(1, peer_b, now)
+            .expect("reattach same conn id to B");
+        assert!(limiter
+            .check_connection(now, 1, RateLimitDimension::Handshake)
+            .is_ok());
+        assert!(limiter
+            .check_connection(now, 1, RateLimitDimension::StreamOpen)
+            .is_ok());
+        assert!(limiter
+            .check_connection(now, 1, RateLimitDimension::DatagramIngress)
+            .is_ok());
+    }
+
+    #[test]
+    fn transfer_to_host_rejects_non_queued_and_already_consumed_reservations() {
+        let governor = Governor::new(WasmLimits {
+            max_queued_bytes_global: 8,
+            max_queued_bytes_per_session: 8,
+            max_queued_bytes_per_stream: 8,
+            ..WasmLimits::default()
+        })
+        .expect("governor");
+
+        let handshake = governor.reserve_handshake().expect("handshake");
+        assert_eq!(
+            governor.transfer_to_host(handshake).err().as_deref(),
+            Some("E_INTERNAL: only queued-byte reservations can transfer to host")
+        );
+
+        let mut consumed = governor.reserve_event_bytes(1, Some(1), 1).expect("queued");
+        consumed.clear_kind_for_test();
+        assert_eq!(
+            governor.transfer_to_host(consumed).err().as_deref(),
+            Some("E_INTERNAL: reservation already consumed")
+        );
+
+        let mut missing_inner = governor.reserve_event_bytes(1, Some(2), 1).expect("queued");
+        missing_inner.clear_inner_for_test();
+        assert_eq!(
+            governor.transfer_to_host(missing_inner).err().as_deref(),
+            Some("E_INTERNAL: reservation missing governor")
+        );
+    }
+
+    #[test]
+    fn available_event_bytes_and_partial_stream_release_cover_remaining_branches() {
+        let governor = Governor::new(WasmLimits {
+            max_queued_bytes_global: 10,
+            max_queued_bytes_per_session: 8,
+            max_queued_bytes_per_stream: 4,
+            max_streams_per_session_bidi: 3,
+            max_streams_per_session_uni: 3,
+            max_streams_global: 8,
+            ..WasmLimits::default()
+        })
+        .expect("governor");
+
+        assert_eq!(governor.available_event_bytes(1, Some(1)), 4);
+        let keep = governor
+            .reserve_event_bytes(1, Some(1), 2)
+            .expect("partial stream fill");
+        assert_eq!(governor.available_event_bytes(1, Some(1)), 2);
+        assert_eq!(governor.available_event_bytes(1, None), 6);
+
+        let s1 = governor
+            .reserve_stream(1, 1, StreamKind::Bidi)
+            .expect("stream 1");
+        let s2 = governor
+            .reserve_stream(1, 2, StreamKind::Bidi)
+            .expect("stream 2");
+        drop(s1);
+        // Dropping one of two streams exercises the >1 decrement path.
+        assert_eq!(governor.snapshot(1, None).streams_active_global, 1);
+        drop(s2);
+        drop(keep);
+        assert_eq!(
+            governor.snapshot(1, Some(1)),
             super::GovernorSnapshot::default()
         );
     }

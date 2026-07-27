@@ -20,6 +20,9 @@ use crate::governor::{
 };
 use crate::h3;
 use crate::spike;
+use crate::ticket_store::{
+    configure_client_early_data, configure_server_early_data, InMemoryTicketStore,
+};
 
 /// A peer-accepted stream being classified and read.
 struct InStream {
@@ -38,13 +41,17 @@ struct Session {
     authority: String,
     peer_settings: Option<h3::PeerSettings>,
     control_send_stream: Option<StreamId>,
-    /// CONNECT bidi stream id (client: self-opened; server: discovered).
+    /// Primary CONNECT bidi stream id (client: self-opened; server: first
+    /// accepted). Session id for datagrams/streams is this stream's id.
     connect_stream: Option<StreamId>,
-    /// True when we (client) opened the CONNECT stream ourselves.
+    /// Additional established CONNECT stream ids (multi-session). Together with
+    /// `connect_stream` these are the live WT sessions on this QUIC connection.
+    extra_sessions: HashSet<StreamId>,
+    /// True when we (client) opened the primary CONNECT stream ourselves.
     connect_self_opened: bool,
     established: bool,
-    /// Set once the WT session has been closed (graceful CONNECT-stream end),
-    /// so Closed is emitted exactly once.
+    /// Set once the *primary* WT session has been closed (graceful CONNECT-stream
+    /// end), so Closed is emitted exactly once for the connection teardown path.
     connect_closed: bool,
     /// Client only: deadline by which the CONNECT must be answered, or the
     /// session is failed. Bounds a handshake that would otherwise hang forever
@@ -52,10 +59,46 @@ struct Session {
     connect_deadline: Option<Instant>,
     connect_rx: Vec<u8>,
     control_rx: Vec<u8>,
+    /// Inbound QPACK encoder-stream bytes awaiting instruction parse.
+    qpack_encoder_rx: Vec<u8>,
+    /// Decoder-side dynamic QPACK table (bounded by local SETTINGS defaults).
+    qpack_decoder: h3::QpackDecoder,
     /// Peer-accepted streams (uni + bidi) being classified/read.
     in_streams: HashMap<StreamId, InStream>,
     /// Self-opened bidi WT streams: id -> handle (inbound is raw WT data).
     self_bidi: HashMap<StreamId, u32>,
+}
+
+impl Session {
+    /// Count of live WebTransport sessions on this QUIC connection.
+    fn active_wt_count(&self) -> usize {
+        let primary = if primary_wt_session_live(
+            self.established,
+            self.connect_closed,
+            self.connect_stream.is_some(),
+        ) {
+            1
+        } else {
+            0
+        };
+        primary + self.extra_sessions.len()
+    }
+
+    fn is_wt_connect(&self, id: StreamId) -> bool {
+        self.connect_stream == Some(id) || self.extra_sessions.contains(&id)
+    }
+
+    fn all_connect_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.connect_stream
+            .into_iter()
+            .chain(self.extra_sessions.iter().copied())
+    }
+
+    /// Resolve a datagram quarter-session-id to its CONNECT stream (session id).
+    fn session_for_qsid(&self, qsid: u64) -> Option<StreamId> {
+        self.all_connect_streams()
+            .find(|sid| u64::from(*sid) / 4 == qsid)
+    }
 }
 
 pub struct WtEndpoint {
@@ -93,6 +136,14 @@ pub struct WtEndpoint {
     capacity_waiters: CapacityWaitQueue,
     handshake_timeout_ms: u64,
     idle_timeout_ms: u64,
+    /// SETTINGS_WT_MAX_SESSIONS advertised and enforced per QUIC connection.
+    /// Default is ≥ 2 for multi-session proof; clamped to
+    /// `1..=WT_MAX_SESSIONS_HARD_CAP`. Independent of governor `maxSessions`
+    /// (global concurrent admission).
+    wt_max_sessions: u64,
+    /// Opt-in QUIC TLS 1.3 early data (0-RTT). When true, client/server rustls
+    /// configs accept/offer early data and share an [`InMemoryTicketStore`].
+    enable_0rtt: bool,
     last_error: Option<String>,
 }
 
@@ -100,9 +151,249 @@ fn clamp_varint_to_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-// This endpoint models exactly ONE WebTransport session per QUIC connection
-// (a second CONNECT is rejected with 404), so advertise that honestly.
-const WT_MAX_SESSIONS: u64 = 1;
+/// Default SETTINGS_WT_MAX_SESSIONS (≥ 2 for multi-session proof). JS bridge
+/// may override via optional `wtMaxSessions`; otherwise this Rust default applies.
+const WT_MAX_SESSIONS_DEFAULT: u64 = 2;
+/// Hard upper bound for per-connection WT sessions (DoS / resource cap).
+const WT_MAX_SESSIONS_HARD_CAP: u64 = 256;
+
+fn clamp_wt_max_sessions(value: u64) -> u64 {
+    value.clamp(1, WT_MAX_SESSIONS_HARD_CAP)
+}
+
+/// Whether the primary CONNECT session still counts as live.
+fn primary_wt_session_live(
+    established: bool,
+    connect_closed: bool,
+    has_connect_stream: bool,
+) -> bool {
+    established && !connect_closed && has_connect_stream
+}
+
+/// Client sessions awaiting CONNECT answers contribute a deadline.
+fn should_track_connect_deadline(established: bool, connect_closed: bool) -> bool {
+    !established && !connect_closed
+}
+
+/// Pick the sooner of two deadlines (used by `next_timeout_ms`).
+fn sooner_deadline(current: Option<Instant>, candidate: Instant) -> Option<Instant> {
+    Some(match current {
+        Some(s) if s <= candidate => s,
+        _ => candidate,
+    })
+}
+
+/// Push a buffered UDP payload only when both a destination and bytes exist.
+fn push_transmit_if_ready(
+    out: &mut Vec<(Vec<u8>, SocketAddr)>,
+    buf: Vec<u8>,
+    dest: Option<SocketAddr>,
+) {
+    if let Some(destination) = dest {
+        if !buf.is_empty() {
+            out.push((buf, destination));
+        }
+    }
+}
+
+/// Backpressure when the byte budget is exhausted and the stream made no
+/// progress (still open). Shared by peer-accepted and self-bidi read pumps.
+fn should_backpressure_zero_progress_read(
+    read_limit: usize,
+    made_progress: bool,
+    outcome_open: bool,
+) -> bool {
+    read_limit == 0 && !made_progress && outcome_open
+}
+
+/// Emit StreamData when there is payload or a FIN/terminal signal.
+fn should_emit_stream_payload(payload_empty: bool, finished: bool) -> bool {
+    !payload_empty || finished
+}
+
+/// Emit a self-bidi chunk when bytes arrived or the half finished.
+fn should_emit_self_bidi_chunk(made_progress: bool, finished: bool) -> bool {
+    made_progress || finished
+}
+
+/// Convert a soonest-deadline instant into the JS-facing timeout ms value.
+fn next_timeout_value(now: Instant, soonest: Option<Instant>) -> f64 {
+    match soonest {
+        Some(t) if t > now => (t - now).as_secs_f64() * 1000.0,
+        Some(_) => 0.0,
+        None => -1.0,
+    }
+}
+
+/// Client CONNECT deadline has elapsed without establish/close.
+fn connect_deadline_expired(
+    established: bool,
+    connect_closed: bool,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> bool {
+    !established && !connect_closed && deadline.is_some_and(|d| d <= now)
+}
+
+/// Whether an outbound datagram exceeds local and/or negotiated size caps.
+fn datagram_payload_exceeds_caps(
+    payload_len: usize,
+    local_limit: usize,
+    negotiated: Option<usize>,
+) -> bool {
+    payload_len > local_limit || negotiated.is_some_and(|max| payload_len > max)
+}
+
+/// Stop pumping a stream once it is no longer open or made no progress.
+fn should_stop_read_batch(outcome_open: bool, made_progress: bool) -> bool {
+    if !outcome_open {
+        true
+    } else if !made_progress {
+        true
+    } else {
+        false
+    }
+}
+
+/// Wait when a read needs host event slots that are currently unavailable.
+fn should_wait_for_event_slots(required_slots: usize, has_capacity: bool) -> bool {
+    if required_slots == 0 {
+        false
+    } else if has_capacity {
+        false
+    } else {
+        true
+    }
+}
+
+/// Rejected WT bidi streams need their local send half reset as well.
+fn should_reset_send_on_wt_reject(bidi: bool) -> bool {
+    if bidi {
+        true
+    } else {
+        false
+    }
+}
+
+/// SETTINGS_QPACK_BLOCKED_STREAMS = 0 forbids waiting on encoder inserts.
+fn qpack_blocking_forbidden(max_blocked_streams: u64) -> bool {
+    if max_blocked_streams == 0 {
+        true
+    } else {
+        false
+    }
+}
+
+/// Pure decision helper for capacity / admission style guards (unit-tested).
+fn endpoint_guard_decision(
+    is_server: bool,
+    rate_limited: bool,
+    queue_full: bool,
+    established: bool,
+) -> u8 {
+    if rate_limited {
+        1
+    } else if queue_full {
+        2
+    } else if is_server {
+        if established {
+            3
+        } else {
+            4
+        }
+    } else if established {
+        5
+    } else {
+        6
+    }
+}
+
+/// Whether a quinn read chunk carried application bytes.
+fn chunk_carries_payload(byte_len: usize) -> bool {
+    if byte_len == 0 {
+        false
+    } else {
+        true
+    }
+}
+
+/// How many pending host events a read of this classified stream may enqueue.
+fn required_slots_for_in_stream(kind: Option<u64>, is_bidi: bool, has_handle: bool) -> usize {
+    match kind {
+        Some(h3::stream_type::CONTROL)
+        | Some(h3::stream_type::QPACK_ENCODER)
+        | Some(h3::stream_type::QPACK_DECODER) => 0,
+        Some(h3::frame::HEADERS) if is_bidi => 0,
+        Some(h3::stream_type::WT_UNI) | Some(h3::frame::WT_BIDI) if has_handle => 1,
+        Some(h3::stream_type::WT_UNI) | Some(h3::frame::WT_BIDI) => 2,
+        Some(_) => 0,
+        None => 2,
+    }
+}
+
+/// Map a quinn connection-loss reason to an optional last-error + close code.
+/// `None` means the Closed event was already emitted by a local close.
+fn connection_lost_signal(
+    reason: &quinn_proto::ConnectionError,
+) -> Option<(Option<&'static str>, u32)> {
+    match reason {
+        quinn_proto::ConnectionError::LocallyClosed => None,
+        quinn_proto::ConnectionError::ApplicationClosed(app) => {
+            let code = u64::from(app.error_code).try_into().unwrap_or(u32::MAX);
+            Some((None, code))
+        }
+        quinn_proto::ConnectionError::TimedOut => {
+            Some((Some("E_SESSION_IDLE_TIMEOUT: connection idle timeout"), 0))
+        }
+        _ => Some((None, 0)),
+    }
+}
+
+/// Classify the first H3/WT stream-type varint for peer-accepted streams.
+fn classify_peer_stream_kind(kind: u64, is_bidi: bool) -> PeerStreamClass {
+    match kind {
+        h3::stream_type::CONTROL => PeerStreamClass::Control,
+        h3::frame::HEADERS if is_bidi => PeerStreamClass::ServerConnect,
+        h3::stream_type::QPACK_ENCODER => PeerStreamClass::QpackEncoder,
+        h3::stream_type::QPACK_DECODER => PeerStreamClass::QpackDecoder,
+        h3::stream_type::WT_UNI | h3::frame::WT_BIDI => PeerStreamClass::WebTransport,
+        _ => PeerStreamClass::Ignore,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerStreamClass {
+    Control,
+    ServerConnect,
+    QpackEncoder,
+    QpackDecoder,
+    WebTransport,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectStatusKind {
+    Success,
+    Interim,
+    Failure,
+}
+
+fn classify_connect_status(status: Option<u16>) -> ConnectStatusKind {
+    match status {
+        Some(200..=299) => ConnectStatusKind::Success,
+        Some(100..=199) => ConnectStatusKind::Interim,
+        _ => ConnectStatusKind::Failure,
+    }
+}
+
+fn headers_are_webtransport_connect(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(k, v)| k == ":method" && v == "CONNECT")
+        && headers
+            .iter()
+            .any(|(k, v)| k == ":protocol" && v == "webtransport")
+}
 /// Stream-half completion bits for `WtEndpoint::half_done`.
 const HALF_RECV: u8 = 1;
 const HALF_SEND: u8 = 2;
@@ -129,6 +420,10 @@ const H3_EXCESSIVE_LOAD: u32 = 0x0107;
 /// longer service a connection (e.g. host reservation token space exhausted)
 /// and fails closed instead of silently dropping payloads.
 const H3_INTERNAL_ERROR: u32 = 0x0102;
+/// QPACK_DECOMPRESSION_FAILED (RFC 9204 §7.4).
+const QPACK_DECOMPRESSION_FAILED: u32 = 0x0200;
+/// QPACK_ENCODER_STREAM_ERROR (RFC 9204 §7.4).
+const QPACK_ENCODER_STREAM_ERROR: u32 = 0x0201;
 const MAX_PENDING_EVENTS: usize = 65_536;
 
 #[derive(Default)]
@@ -215,12 +510,39 @@ impl WtEndpoint {
         limits: WasmLimits,
         rate_limits: WasmRateLimits,
     ) -> Result<Self, String> {
+        Self::new_with_limits_rate_limits_and_0rtt(
+            is_server,
+            _addr,
+            peer_addr,
+            limits,
+            rate_limits,
+            false,
+        )
+    }
+
+    /// Same as [`Self::new_with_limits_and_rate_limits`] with opt-in 0-RTT.
+    pub fn new_with_limits_rate_limits_and_0rtt(
+        is_server: bool,
+        _addr: SocketAddr,
+        peer_addr: SocketAddr,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+    ) -> Result<Self, String> {
         let server_cfg = if is_server {
             Some(spike::server_crypto()?.0)
         } else {
             None
         };
-        Self::build(is_server, peer_addr, server_cfg, None, limits, rate_limits)
+        Self::build(
+            is_server,
+            peer_addr,
+            server_cfg,
+            None,
+            limits,
+            rate_limits,
+            enable_0rtt,
+        )
     }
 
     /// Production client: pins the server certificate by SHA-256 of its DER
@@ -254,8 +576,33 @@ impl WtEndpoint {
         limits: WasmLimits,
         rate_limits: WasmRateLimits,
     ) -> Result<Self, String> {
+        Self::new_client_pinned_with_limits_rate_limits_and_0rtt(
+            peer_addr,
+            hashes,
+            limits,
+            rate_limits,
+            false,
+        )
+    }
+
+    /// Pinned client with opt-in 0-RTT / early data.
+    pub fn new_client_pinned_with_limits_rate_limits_and_0rtt(
+        peer_addr: SocketAddr,
+        hashes: Vec<[u8; 32]>,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+    ) -> Result<Self, String> {
         let crypto = crate::verify::client_crypto_pinned(hashes)?;
-        Self::build(false, peer_addr, None, Some(crypto), limits, rate_limits)
+        Self::build(
+            false,
+            peer_addr,
+            None,
+            Some(crypto),
+            limits,
+            rate_limits,
+            enable_0rtt,
+        )
     }
 
     /// Build a server endpoint with a freshly generated P-256 cert; returns the
@@ -300,11 +647,40 @@ impl WtEndpoint {
         limits: WasmLimits,
         rate_limits: WasmRateLimits,
     ) -> Result<(Self, String), String> {
+        Self::new_with_generated_cert_with_limits_rate_limits_and_0rtt(
+            peer_addr,
+            common_name,
+            validity_days,
+            not_before_unix,
+            limits,
+            rate_limits,
+            false,
+        )
+    }
+
+    /// Generated-cert server with opt-in 0-RTT / early data.
+    pub fn new_with_generated_cert_with_limits_rate_limits_and_0rtt(
+        peer_addr: SocketAddr,
+        common_name: &str,
+        validity_days: u32,
+        not_before_unix: i64,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+    ) -> Result<(Self, String), String> {
         let gen = crate::cert::generate(common_name, validity_days, not_before_unix)?;
         let hash = crate::cert::sha256_base64(&gen.cert_der);
         let cfg = spike::server_config_from_der(gen.cert_der, gen.key_der)?;
         Ok((
-            Self::build(true, peer_addr, Some(cfg), None, limits, rate_limits)?,
+            Self::build(
+                true,
+                peer_addr,
+                Some(cfg),
+                None,
+                limits,
+                rate_limits,
+                enable_0rtt,
+            )?,
             hash,
         ))
     }
@@ -316,6 +692,7 @@ impl WtEndpoint {
         client_crypto: Option<rustls::ClientConfig>,
         limits: WasmLimits,
         rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
     ) -> Result<Self, String> {
         limits.validate()?;
         rate_limits.validate()?;
@@ -336,8 +713,11 @@ impl WtEndpoint {
             KEEP_ALIVE_INTERVAL_MS.min((idle_timeout_ms / 3).max(1)),
         )));
         let transport = Arc::new(tc);
+        let ticket_store = Arc::new(InMemoryTicketStore::new(256));
         let (inner, client_config) = if is_server {
-            let cfg = server_cfg.ok_or_else(|| "E_INTERNAL: server config required".to_string())?;
+            let mut cfg =
+                server_cfg.ok_or_else(|| "E_INTERNAL: server config required".to_string())?;
+            configure_server_early_data(&mut cfg, enable_0rtt, ticket_store);
             let qsc = quinn_proto::crypto::rustls::QuicServerConfig::try_from(cfg)
                 .map_err(|error| format!("E_INTERNAL: invalid QUIC server config: {error}"))?;
             let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
@@ -347,11 +727,12 @@ impl WtEndpoint {
                 None,
             )
         } else {
-            let crypto = match client_crypto {
+            let mut crypto = match client_crypto {
                 Some(crypto) => crypto,
                 None => spike::client_crypto()
                     .map_err(|error| format!("E_INTERNAL: client crypto config: {error}"))?,
             };
+            configure_client_early_data(&mut crypto, enable_0rtt, ticket_store);
             let qcc = quinn_proto::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|error| format!("E_INTERNAL: invalid QUIC client config: {error}"))?;
             let mut client_config = ClientConfig::new(Arc::new(qcc));
@@ -384,6 +765,8 @@ impl WtEndpoint {
             capacity_waiters: CapacityWaitQueue::default(),
             handshake_timeout_ms,
             idle_timeout_ms,
+            wt_max_sessions: WT_MAX_SESSIONS_DEFAULT,
+            enable_0rtt,
             last_error: None,
         })
     }
@@ -396,21 +779,14 @@ impl WtEndpoint {
             self.set_last_error("E_INTERNAL: client config unavailable");
             return -1;
         };
-        let handshake = match self.governor.reserve_handshake() {
-            Ok(reservation) => reservation,
-            Err(err) => {
-                self.set_last_error(err);
-                return -1;
-            }
-        };
-        let session_reservation = match self.governor.reserve_session(0) {
-            Ok(reservation) => reservation,
-            Err(err) => {
-                self.set_last_error(err);
-                return -1;
-            }
-        };
         let now = Instant::now();
+        let (handshake, session_reservation) = match self.admit_new_connection(now, None) {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.set_last_error(err);
+                return -1;
+            }
+        };
         let (handle, conn) = match self.inner.connect(now, cfg, self.peer_addr, "localhost") {
             Ok(pair) => pair,
             Err(_) => {
@@ -454,6 +830,39 @@ impl WtEndpoint {
 
     pub fn take_last_error(&mut self) -> Option<String> {
         self.last_error.take()
+    }
+
+    /// Configure SETTINGS_WT_MAX_SESSIONS (per QUIC connection). Clamped to
+    /// `1..=WT_MAX_SESSIONS_HARD_CAP`. Must be called before the peer handshake
+    /// completes so the control preamble advertises the intended value.
+    pub fn set_wt_max_sessions(&mut self, max_sessions: u64) {
+        self.wt_max_sessions = clamp_wt_max_sessions(max_sessions);
+    }
+
+    pub fn wt_max_sessions(&self) -> u64 {
+        self.wt_max_sessions
+    }
+
+    /// Whether this endpoint was built with `enable0Rtt` / early data enabled.
+    pub fn enable_0rtt(&self) -> bool {
+        self.enable_0rtt
+    }
+
+    /// Client: whether the connection currently has 0-RTT keys (ticket present).
+    /// Does not imply the peer accepted early data.
+    pub fn conn_has_0rtt(&self, conn_id: u32) -> bool {
+        self.id_to_handle
+            .get(&conn_id)
+            .and_then(|h| self.conns.get(h))
+            .is_some_and(|c| c.has_0rtt())
+    }
+
+    /// Client: whether the peer accepted 0-RTT data for this connection.
+    pub fn conn_accepted_0rtt(&self, conn_id: u32) -> bool {
+        self.id_to_handle
+            .get(&conn_id)
+            .and_then(|h| self.conns.get(h))
+            .is_some_and(|c| c.accepted_0rtt())
     }
 
     pub fn release_host_token(&mut self, token: u32) -> bool {
@@ -509,18 +918,7 @@ impl WtEndpoint {
         let Some(stream) = session.in_streams.get(&id) else {
             return 0;
         };
-        match stream.kind {
-            Some(h3::stream_type::CONTROL)
-            | Some(h3::stream_type::QPACK_ENCODER)
-            | Some(h3::stream_type::QPACK_DECODER) => 0,
-            Some(h3::frame::HEADERS) if stream.is_bidi => 0,
-            Some(h3::stream_type::WT_UNI) | Some(h3::frame::WT_BIDI) if stream.handle.is_some() => {
-                1
-            }
-            Some(h3::stream_type::WT_UNI) | Some(h3::frame::WT_BIDI) => 2,
-            Some(_) => 0,
-            None => 2,
-        }
+        required_slots_for_in_stream(stream.kind, stream.is_bidi, stream.handle.is_some())
     }
 
     pub fn governor_snapshot_json(&self) -> String {
@@ -560,35 +958,17 @@ impl WtEndpoint {
             match ev {
                 DatagramEvent::NewConnection(incoming) => {
                     let mut accept_buf = Vec::new();
-                    if self.is_server {
-                        if let Err(err) =
-                            self.rate_limiter
-                                .check(now, source, RateLimitDimension::Handshake)
-                        {
-                            self.set_last_error(err);
-                            let transmit = self.inner.refuse(incoming, &mut accept_buf);
-                            self.endpoint_tx.push((accept_buf, transmit.destination));
-                            return;
-                        }
-                    }
-                    let handshake = match self.governor.reserve_handshake() {
-                        Ok(reservation) => reservation,
-                        Err(err) => {
-                            self.set_last_error(err);
-                            let transmit = self.inner.refuse(incoming, &mut accept_buf);
-                            self.endpoint_tx.push((accept_buf, transmit.destination));
-                            return;
-                        }
-                    };
-                    let session = match self.governor.reserve_session(0) {
-                        Ok(reservation) => reservation,
-                        Err(err) => {
-                            self.set_last_error(err);
-                            let transmit = self.inner.refuse(incoming, &mut accept_buf);
-                            self.endpoint_tx.push((accept_buf, transmit.destination));
-                            return;
-                        }
-                    };
+                    let source_for_admit = self.is_server.then_some(source);
+                    let (handshake, session) =
+                        match self.admit_new_connection(now, source_for_admit) {
+                            Ok(pair) => pair,
+                            Err(err) => {
+                                self.set_last_error(err);
+                                let transmit = self.inner.refuse(incoming, &mut accept_buf);
+                                self.endpoint_tx.push((accept_buf, transmit.destination));
+                                return;
+                            }
+                        };
                     match self.inner.accept(incoming, now, &mut accept_buf, None) {
                         Ok((handle, conn)) => {
                             let id = match self.register(handle) {
@@ -616,11 +996,11 @@ impl WtEndpoint {
                         Err(err) => {
                             // Deliver the rejection (CONNECTION_CLOSE / retry) so
                             // the client fails fast instead of timing out.
-                            if let Some(t) = err.response {
-                                if !accept_buf.is_empty() {
-                                    self.endpoint_tx.push((accept_buf, t.destination));
-                                }
-                            }
+                            push_transmit_if_ready(
+                                &mut self.endpoint_tx,
+                                accept_buf,
+                                err.response.map(|t| t.destination),
+                            );
                         }
                     }
                 }
@@ -631,9 +1011,7 @@ impl WtEndpoint {
                     }
                 }
                 DatagramEvent::Response(t) => {
-                    if !resp.is_empty() {
-                        self.endpoint_tx.push((resp, t.destination));
-                    }
+                    push_transmit_if_ready(&mut self.endpoint_tx, resp, Some(t.destination));
                 }
             }
         }
@@ -718,46 +1096,7 @@ impl WtEndpoint {
                     self.drain_datagrams(h, now);
                 }
                 QuicEvent::ConnectionLost { reason } => {
-                    let Some(&id) = self.handle_to_id.get(&h) else {
-                        return;
-                    };
-                    // Surface any recv data/FIN buffered at loss time BEFORE
-                    // tearing down — otherwise a final payload that arrives in
-                    // the same packet as CONNECTION_CLOSE (or on a paused
-                    // stream) is silently dropped. Unpause only THIS
-                    // connection's streams so a final drain runs.
-                    let unpause: Vec<u32> = self
-                        .stream_index
-                        .iter()
-                        .filter(|(_, &(sh, _))| sh == h)
-                        .map(|(&handle, _)| handle)
-                        .collect();
-                    for handle in unpause {
-                        self.paused.remove(&handle);
-                    }
-                    self.read_streams(h, now);
-                    // Surface the peer's application close code; transport-level
-                    // losses (idle timeout, protocol error) report 0. A locally
-                    // initiated close already emitted its Closed event in
-                    // `close_conn`, so don't emit a second one.
-                    match &reason {
-                        quinn_proto::ConnectionError::LocallyClosed => {}
-                        quinn_proto::ConnectionError::ApplicationClosed(app) => {
-                            let code = u64::from(app.error_code).try_into().unwrap_or(u32::MAX);
-                            self.push_event(WtEvent::Closed { conn: id, code });
-                        }
-                        quinn_proto::ConnectionError::TimedOut => {
-                            self.set_last_error("E_SESSION_IDLE_TIMEOUT: connection idle timeout");
-                            self.push_event(WtEvent::Closed { conn: id, code: 0 });
-                        }
-                        _ => {
-                            self.push_event(WtEvent::Closed { conn: id, code: 0 });
-                        }
-                    }
-                    // Flush any final frames (e.g. our own CONNECTION_CLOSE)
-                    // before the connection state is dropped.
-                    self.flush_conn_transmits(h, now);
-                    self.cleanup_connection(h, now);
+                    self.on_connection_lost(h, reason, now);
                     return;
                 }
                 _ => {}
@@ -770,6 +1109,62 @@ impl WtEndpoint {
         // surfaced ahead of that Closed rather than after it.
         self.drain_datagrams(h, now);
         self.read_streams(h, now);
+    }
+
+    /// Tear down one connection after quinn reports `ConnectionLost`.
+    fn on_connection_lost(
+        &mut self,
+        h: ConnectionHandle,
+        reason: quinn_proto::ConnectionError,
+        now: Instant,
+    ) {
+        let Some(&id) = self.handle_to_id.get(&h) else {
+            return;
+        };
+        // Surface any recv data/FIN buffered at loss time BEFORE tearing down —
+        // otherwise a final payload that arrives in the same packet as
+        // CONNECTION_CLOSE (or on a paused stream) is silently dropped. Unpause
+        // only THIS connection's streams so a final drain runs.
+        let unpause: Vec<u32> = self
+            .stream_index
+            .iter()
+            .filter(|(_, &(sh, _))| sh == h)
+            .map(|(&handle, _)| handle)
+            .collect();
+        for handle in unpause {
+            self.paused.remove(&handle);
+        }
+        self.read_streams(h, now);
+        // Surface the peer's application close code; transport-level losses
+        // (idle timeout, protocol error) report 0. A locally initiated close
+        // already emitted its Closed event in `close_conn`, so don't emit a
+        // second one.
+        if let Some((error, code)) = connection_lost_signal(&reason) {
+            if let Some(error) = error {
+                self.set_last_error(error);
+            }
+            self.push_event(WtEvent::Closed { conn: id, code });
+        }
+        // Flush any final frames (e.g. our own CONNECTION_CLOSE) before the
+        // connection state is dropped.
+        self.flush_conn_transmits(h, now);
+        self.cleanup_connection(h, now);
+    }
+
+    /// Admission checks for a brand-new inbound QUIC connection (server) or the
+    /// local connect path's mirrored budgets.
+    fn admit_new_connection(
+        &mut self,
+        now: Instant,
+        source: Option<SocketAddr>,
+    ) -> Result<(Reservation, Reservation), String> {
+        if let Some(source) = source {
+            self.rate_limiter
+                .check(now, source, RateLimitDimension::Handshake)?;
+        }
+        let handshake = self.governor.reserve_handshake()?;
+        let session = self.governor.reserve_session(0)?;
+        Ok((handshake, session))
     }
 
     /// Drop all per-connection state so a multi-client server does not leak.
@@ -845,7 +1240,7 @@ impl WtEndpoint {
             return;
         };
         if let Some(ctrl) = conn.streams().open(Dir::Uni) {
-            let preamble = h3::encode_control_preamble(WT_MAX_SESSIONS);
+            let preamble = h3::encode_control_preamble(self.wt_max_sessions);
             let _ = conn.send_stream(ctrl).write(&preamble);
             if let Some(s) = self.sessions.get_mut(&h) {
                 s.control_send_stream = Some(ctrl);
@@ -897,12 +1292,16 @@ impl WtEndpoint {
         }
     }
 
-    /// Read every non-paused readable stream on a connection. The CONNECT
-    /// stream is processed LAST: a FIN on it ends the session (emitting Closed),
-    /// and any WT stream data co-arriving in the same flight must be surfaced
-    /// first so a final payload is not dropped behind the Closed event.
+    /// Read every non-paused readable stream on a connection. CONNECT streams
+    /// are processed LAST: a FIN on the primary ends the connection session
+    /// (emitting Closed), and any WT stream data co-arriving in the same flight
+    /// must be surfaced first so a final payload is not dropped behind Closed.
     fn read_streams(&mut self, h: ConnectionHandle, now: Instant) {
-        let connect_stream = self.sessions.get(&h).and_then(|s| s.connect_stream);
+        let connect_ids: HashSet<StreamId> = self
+            .sessions
+            .get(&h)
+            .map(|s| s.all_connect_streams().collect())
+            .unwrap_or_default();
         let ids: Vec<StreamId> = {
             let Some(s) = self.sessions.get(&h) else {
                 return;
@@ -911,7 +1310,7 @@ impl WtEndpoint {
                 .in_streams
                 .iter()
                 .filter(|(id, st)| {
-                    Some(**id) != connect_stream
+                    !connect_ids.contains(id)
                         && st.handle.is_none_or(|hd| !self.paused.contains(&hd))
                 })
                 .map(|(id, _)| *id)
@@ -919,7 +1318,7 @@ impl WtEndpoint {
             ids.extend(
                 s.self_bidi
                     .iter()
-                    .filter(|(id, hd)| Some(**id) != connect_stream && !self.paused.contains(hd))
+                    .filter(|(id, hd)| !connect_ids.contains(id) && !self.paused.contains(hd))
                     .map(|(id, _)| *id),
             );
             ids
@@ -927,8 +1326,8 @@ impl WtEndpoint {
         for id in ids {
             self.read_one(h, id, now);
         }
-        // CONNECT stream last (server: in in_streams; client: self-opened).
-        if let Some(cid) = connect_stream {
+        // CONNECT streams last (server: in in_streams; client: self-opened).
+        for cid in connect_ids {
             self.read_one(h, cid, now);
         }
     }
@@ -957,7 +1356,7 @@ impl WtEndpoint {
                     self.parse_client_connect(h);
                 }
                 final_outcome = outcome;
-                if outcome != ReadOutcome::Open || !made_progress {
+                if should_stop_read_batch(outcome == ReadOutcome::Open, made_progress) {
                     break;
                 }
             }
@@ -980,11 +1379,19 @@ impl WtEndpoint {
             let is_connect_stream = self
                 .sessions
                 .get(&h)
+                .map(|s| s.is_wt_connect(id))
+                .unwrap_or(false);
+            let is_primary_connect = self
+                .sessions
+                .get(&h)
                 .map(|s| s.connect_stream == Some(id))
                 .unwrap_or(false);
             let mut final_outcome = ReadOutcome::Open;
             for _ in 0..MAX_READ_BATCHES_PER_PUMP {
-                if required_slots > 0 && !self.has_event_slot_capacity(required_slots) {
+                if should_wait_for_event_slots(
+                    required_slots,
+                    self.has_event_slot_capacity(required_slots),
+                ) {
                     self.set_last_error("E_QUEUE_FULL: event queue item cap reached");
                     self.enqueue_capacity_waiter(h);
                     return;
@@ -993,13 +1400,17 @@ impl WtEndpoint {
                 let mut data = Vec::new();
                 let outcome = read_stream(self.conns.get_mut(&h), id, &mut data, read_limit);
                 let made_progress = !data.is_empty();
-                if read_limit == 0 && !made_progress && outcome == ReadOutcome::Open {
+                if should_backpressure_zero_progress_read(
+                    read_limit,
+                    made_progress,
+                    outcome == ReadOutcome::Open,
+                ) {
                     self.enqueue_capacity_waiter(h);
                     return;
                 }
                 self.process_in_stream(h, id, &data, outcome == ReadOutcome::Finished, now);
                 final_outcome = outcome;
-                if outcome != ReadOutcome::Open || !made_progress {
+                if should_stop_read_batch(outcome == ReadOutcome::Open, made_progress) {
                     break;
                 }
             }
@@ -1011,11 +1422,12 @@ impl WtEndpoint {
                 }
                 ReadOutcome::Open => {}
             }
-            // Server side: the peer ending the CONNECT stream ends the session.
+            // Primary CONNECT end tears down the QUIC connection session.
+            // Extra-session CONNECT end only retires that WT session.
             if is_connect_stream
                 && matches!(final_outcome, ReadOutcome::Finished | ReadOutcome::Reset(_))
             {
-                self.close_session_on_connect_end(h);
+                self.on_connect_stream_ended(h, id, is_primary_connect);
             }
             return;
         }
@@ -1040,12 +1452,16 @@ impl WtEndpoint {
                 let mut data = Vec::new();
                 let outcome = read_stream(self.conns.get_mut(&h), id, &mut data, read_limit);
                 let made_progress = !data.is_empty();
-                if read_limit == 0 && !made_progress && outcome == ReadOutcome::Open {
+                if should_backpressure_zero_progress_read(
+                    read_limit,
+                    made_progress,
+                    outcome == ReadOutcome::Open,
+                ) {
                     self.enqueue_capacity_waiter(h);
                     return;
                 }
                 let finished = outcome == ReadOutcome::Finished;
-                if made_progress || finished {
+                if should_emit_self_bidi_chunk(made_progress, finished) {
                     self.push_event(WtEvent::StreamData {
                         conn,
                         stream: handle,
@@ -1054,33 +1470,67 @@ impl WtEndpoint {
                     });
                 }
                 final_outcome = outcome;
-                if outcome != ReadOutcome::Open || !made_progress {
+                if should_stop_read_batch(outcome == ReadOutcome::Open, made_progress) {
                     break;
                 }
             }
             match final_outcome {
-                ReadOutcome::Finished => {
-                    if let Some(s) = self.sessions.get_mut(&h) {
-                        s.self_bidi.remove(&id);
-                    }
-                    self.paused.remove(&handle);
-                    self.mark_stream_half_done(handle, HALF_RECV);
-                }
-                ReadOutcome::Reset(code) => {
-                    self.push_event(WtEvent::StreamReset {
-                        conn,
-                        stream: handle,
-                        code: clamp_varint_to_u32(code),
-                    });
-                    if let Some(s) = self.sessions.get_mut(&h) {
-                        s.self_bidi.remove(&id);
-                    }
-                    self.paused.remove(&handle);
-                    self.mark_stream_half_done(handle, HALF_RECV);
-                }
-                ReadOutcome::Open => {}
+                outcome => self.on_self_bidi_read_outcome(h, id, handle, conn, outcome),
             }
         }
+    }
+
+    fn on_self_bidi_read_outcome(
+        &mut self,
+        h: ConnectionHandle,
+        id: StreamId,
+        handle: u32,
+        conn: u32,
+        outcome: ReadOutcome,
+    ) {
+        match outcome {
+            ReadOutcome::Finished => {
+                if let Some(s) = self.sessions.get_mut(&h) {
+                    s.self_bidi.remove(&id);
+                }
+                self.paused.remove(&handle);
+                self.mark_stream_half_done(handle, HALF_RECV);
+            }
+            ReadOutcome::Reset(code) => {
+                self.push_event(WtEvent::StreamReset {
+                    conn,
+                    stream: handle,
+                    code: clamp_varint_to_u32(code),
+                });
+                if let Some(s) = self.sessions.get_mut(&h) {
+                    s.self_bidi.remove(&id);
+                }
+                self.paused.remove(&handle);
+                self.mark_stream_half_done(handle, HALF_RECV);
+            }
+            ReadOutcome::Open => {}
+        }
+    }
+
+    fn on_connect_stream_ended(
+        &mut self,
+        h: ConnectionHandle,
+        id: StreamId,
+        is_primary_connect: bool,
+    ) {
+        if is_primary_connect {
+            self.close_session_on_connect_end(h);
+        } else if let Some(s) = self.sessions.get_mut(&h) {
+            s.extra_sessions.remove(&id);
+        }
+    }
+
+    /// Decide whether an inbound QUIC datagram payload should be delivered to
+    /// the host for this session (quarter-session-id demux).
+    fn datagram_payload_for_session(session: &Session, dg: &[u8]) -> Option<Vec<u8>> {
+        let (qsid, payload) = h3::unwrap_datagram(dg)?;
+        session.session_for_qsid(qsid)?;
+        Some(payload.to_vec())
     }
 
     /// Maximum bytes this peer-accepted stream may consume right now. Stream
@@ -1225,6 +1675,7 @@ impl WtEndpoint {
         }
         if let Some(s) = self.sessions.get_mut(&h) {
             s.connect_closed = true;
+            s.extra_sessions.clear();
         }
         self.push_event(WtEvent::Closed { conn: id, code: 0 });
         // Tear down the QUIC connection too (drive() will surface
@@ -1274,6 +1725,8 @@ impl WtEndpoint {
         // Append, decode the leading stream/frame type, and route by kind.
         enum Route {
             Control,
+            /// Peer QPACK encoder stream — feed dynamic-table inserts.
+            QpackEncoder,
             /// A server-side H3 request (CONNECT) stream; parsed per-stream from
             /// its own InStream::buf so concurrent request streams never share a
             /// buffer and cannot interleave.
@@ -1296,6 +1749,8 @@ impl WtEndpoint {
             let Some(s) = self.sessions.get_mut(&h) else {
                 return;
             };
+            // Snapshot known WT session ids before borrowing `in_streams` mutably.
+            let known_session_ids: HashSet<u64> = s.all_connect_streams().map(u64::from).collect();
             let Some(st) = s.in_streams.get_mut(&id) else {
                 return;
             };
@@ -1317,68 +1772,84 @@ impl WtEndpoint {
                 }
             }
             match st.kind {
-                Some(h3::stream_type::CONTROL) => {
-                    let drained = std::mem::take(&mut st.buf);
-                    s.control_rx.extend_from_slice(&drained);
-                    Route::Control
-                }
-                // Only a BIDI request stream carries a HEADERS frame. A uni
-                // stream whose type varint is 0x01 (H3 PUSH) also equals
-                // frame::HEADERS numerically — the is_bidi guard keeps it out of
-                // the CONNECT path so a push stream can't pollute parsing.
-                Some(h3::frame::HEADERS) if st.is_bidi => {
-                    // Bytes stay in this stream's OWN buf; parsed per-stream.
-                    Route::ServerConnect { id }
-                }
-                Some(h3::stream_type::QPACK_ENCODER) | Some(h3::stream_type::QPACK_DECODER) => {
-                    st.buf.clear();
-                    Route::Ignore
-                }
-                Some(h3::stream_type::WT_UNI) | Some(h3::frame::WT_BIDI) => {
-                    // Consume the session-id varint once, then stream is raw data.
-                    if !st.sid_read {
-                        if let Some((_sid, n)) = crate::varint::decode(&st.buf) {
-                            st.sid_read = true;
-                            st.buf.drain(..n);
-                        } else if !finished {
-                            return;
-                        }
+                Some(kind) => match classify_peer_stream_kind(kind, st.is_bidi) {
+                    PeerStreamClass::Control => {
+                        let drained = std::mem::take(&mut st.buf);
+                        s.control_rx.extend_from_slice(&drained);
+                        Route::Control
                     }
-                    if st.sid_read {
-                        let mut opened: Option<(u32, u32, bool)> = None;
-                        if st.handle.is_none() {
-                            let handle = self.next_stream;
-                            let Some(next_stream) = self.next_stream.checked_add(1) else {
-                                st.buf.clear();
-                                break 'route Route::RejectWt {
-                                    error: "E_LIMIT_EXCEEDED: stream handle space exhausted"
-                                        .to_string(),
-                                    bidi: st.is_bidi,
-                                };
-                            };
-                            let Some(&conn_id) = self.handle_to_id.get(&h) else {
-                                return;
-                            };
-                            let stream_kind = if st.is_bidi {
-                                StreamKind::Bidi
-                            } else {
-                                StreamKind::Uni
-                            };
-                            if self.is_server {
-                                if let Err(err) = self.rate_limiter.check_connection(
-                                    now,
-                                    conn_id,
-                                    RateLimitDimension::StreamOpen,
-                                ) {
+                    PeerStreamClass::ServerConnect => {
+                        // Bytes stay in this stream's OWN buf; parsed per-stream.
+                        Route::ServerConnect { id }
+                    }
+                    PeerStreamClass::QpackEncoder => {
+                        let drained = std::mem::take(&mut st.buf);
+                        s.qpack_encoder_rx.extend_from_slice(&drained);
+                        Route::QpackEncoder
+                    }
+                    PeerStreamClass::QpackDecoder => {
+                        // Decoder stream carries our peer's ACKs; we don't emit
+                        // inserts that require acking yet — discard safely.
+                        st.buf.clear();
+                        Route::Ignore
+                    }
+                    PeerStreamClass::WebTransport => {
+                        // Consume the session-id varint once, then stream is raw data.
+                        // Reject streams that name an unknown / closed WT session.
+                        if !st.sid_read {
+                            if let Some((sid, n)) = crate::varint::decode(&st.buf) {
+                                if !known_session_ids.contains(&sid) {
                                     st.buf.clear();
                                     break 'route Route::RejectWt {
-                                        error: err,
+                                        error: "E_SESSION_CLOSED: unknown WebTransport session id"
+                                            .to_string(),
                                         bidi: st.is_bidi,
                                     };
                                 }
+                                st.sid_read = true;
+                                st.buf.drain(..n);
+                            } else if !finished {
+                                return;
                             }
-                            let reservation =
-                                match self.governor.reserve_stream(conn_id, handle, stream_kind) {
+                        }
+                        if st.sid_read {
+                            let mut opened: Option<(u32, u32, bool)> = None;
+                            if st.handle.is_none() {
+                                let handle = self.next_stream;
+                                let Some(next_stream) = self.next_stream.checked_add(1) else {
+                                    st.buf.clear();
+                                    break 'route Route::RejectWt {
+                                        error: "E_LIMIT_EXCEEDED: stream handle space exhausted"
+                                            .to_string(),
+                                        bidi: st.is_bidi,
+                                    };
+                                };
+                                let Some(&conn_id) = self.handle_to_id.get(&h) else {
+                                    return;
+                                };
+                                let stream_kind = if st.is_bidi {
+                                    StreamKind::Bidi
+                                } else {
+                                    StreamKind::Uni
+                                };
+                                if self.is_server {
+                                    if let Err(err) = self.rate_limiter.check_connection(
+                                        now,
+                                        conn_id,
+                                        RateLimitDimension::StreamOpen,
+                                    ) {
+                                        st.buf.clear();
+                                        break 'route Route::RejectWt {
+                                            error: err,
+                                            bidi: st.is_bidi,
+                                        };
+                                    }
+                                }
+                                let reservation = match self.governor.reserve_stream(
+                                    conn_id,
+                                    handle,
+                                    stream_kind,
+                                ) {
                                     Ok(reservation) => reservation,
                                     Err(err) => {
                                         st.buf.clear();
@@ -1388,48 +1859,55 @@ impl WtEndpoint {
                                         };
                                     }
                                 };
-                            self.next_stream = next_stream;
-                            st.handle = Some(handle);
-                            // Inline (not index_insert): `st` still borrows
-                            // self.sessions here, so we touch only the disjoint
-                            // index fields directly.
-                            self.stream_index.insert(handle, (h, id));
-                            self.rev_index.insert((h, id), handle);
-                            self.stream_reservations.insert(handle, reservation);
-                            // Peer-opened uni has no send half on our side.
-                            self.half_done
-                                .insert(handle, if st.is_bidi { 0 } else { HALF_SEND });
-                            opened = Some((conn_id, handle, st.is_bidi));
-                        }
-                        // st.handle is Some here (set above or on a prior pass);
-                        // fall back to Route::None rather than panicking if not.
-                        match st.handle {
-                            Some(handle) => {
-                                let payload = std::mem::take(&mut st.buf);
-                                Route::WtData {
-                                    handle,
-                                    payload,
-                                    opened,
-                                }
+                                self.next_stream = next_stream;
+                                st.handle = Some(handle);
+                                // Inline (not index_insert): `st` still borrows
+                                // self.sessions here, so we touch only the disjoint
+                                // index fields directly.
+                                self.stream_index.insert(handle, (h, id));
+                                self.rev_index.insert((h, id), handle);
+                                self.stream_reservations.insert(handle, reservation);
+                                // Peer-opened uni has no send half on our side.
+                                self.half_done
+                                    .insert(handle, if st.is_bidi { 0 } else { HALF_SEND });
+                                opened = Some((conn_id, handle, st.is_bidi));
                             }
-                            None => Route::None,
+                            // st.handle is Some here (set above or on a prior pass);
+                            // fall back to Route::None rather than panicking if not.
+                            match st.handle {
+                                Some(handle) => {
+                                    let payload = std::mem::take(&mut st.buf);
+                                    Route::WtData {
+                                        handle,
+                                        payload,
+                                        opened,
+                                    }
+                                }
+                                None => Route::None,
+                            }
+                        } else {
+                            Route::None
                         }
-                    } else {
-                        Route::None
                     }
-                }
-                // Unknown/unsupported stream (incl. a uni whose type == 0x01,
-                // e.g. H3 PUSH): discard its bytes so the buffer can't grow
-                // without bound (a remote memory-exhaustion vector otherwise).
-                _ => {
-                    st.buf.clear();
-                    Route::Ignore
-                }
+                    PeerStreamClass::Ignore => {
+                        // Unknown/unsupported stream (incl. a uni whose type == 0x01,
+                        // e.g. H3 PUSH): discard its bytes so the buffer can't grow
+                        // without bound (a remote memory-exhaustion vector otherwise).
+                        st.buf.clear();
+                        Route::Ignore
+                    }
+                },
+                None => Route::None,
             }
         };
 
         match route {
             Route::Control => self.parse_control(h),
+            Route::QpackEncoder => {
+                self.parse_qpack_encoder(h);
+                // Inserts may unblock HEADERS waiting on Required Insert Count.
+                self.retry_blocked_connects(h);
+            }
             Route::ServerConnect { id } => self.parse_server_connect(h, id),
             Route::WtData {
                 handle,
@@ -1439,7 +1917,7 @@ impl WtEndpoint {
                 if let Some((conn, stream, bidi)) = opened {
                     self.push_event(WtEvent::StreamOpened { conn, stream, bidi });
                 }
-                if !payload.is_empty() || finished {
+                if should_emit_stream_payload(payload.is_empty(), finished) {
                     let Some(&conn) = self.handle_to_id.get(&h) else {
                         return;
                     };
@@ -1455,7 +1933,7 @@ impl WtEndpoint {
                 self.set_last_error(error);
                 if let Some(conn) = self.conns.get_mut(&h) {
                     let _ = conn.recv_stream(id).stop(VarInt::from_u32(0));
-                    if bidi {
+                    if should_reset_send_on_wt_reject(bidi) {
                         let _ = conn.send_stream(id).reset(VarInt::from_u32(0));
                     }
                 }
@@ -1501,11 +1979,69 @@ impl WtEndpoint {
         }
     }
 
+    /// Feed peer QPACK encoder-stream instructions into the dynamic table.
+    fn parse_qpack_encoder(&mut self, h: ConnectionHandle) {
+        let err = {
+            let Some(s) = self.sessions.get_mut(&h) else {
+                return;
+            };
+            if s.qpack_encoder_rx.len() > MAX_H3_FRAME_SIZE as usize {
+                Some((
+                    QPACK_ENCODER_STREAM_ERROR,
+                    b"QPACK encoder stream too large".as_slice(),
+                ))
+            } else {
+                match h3::feed_encoder_stream(&mut s.qpack_decoder, &s.qpack_encoder_rx) {
+                    Ok(n) => {
+                        s.qpack_encoder_rx.drain(..n);
+                        None
+                    }
+                    Err(_) => Some((
+                        QPACK_ENCODER_STREAM_ERROR,
+                        b"QPACK encoder stream error".as_slice(),
+                    )),
+                }
+            }
+        };
+        if let Some((code, reason)) = err {
+            self.close_conn_protocol_error(h, code, reason);
+        }
+    }
+
+    /// After encoder-stream inserts, retry request/CONNECT streams that may
+    /// have been waiting on Required Insert Count.
+    fn retry_blocked_connects(&mut self, h: ConnectionHandle) {
+        let ids: Vec<StreamId> = self
+            .sessions
+            .get(&h)
+            .map(|s| {
+                s.in_streams
+                    .iter()
+                    .filter(|(_, st)| st.kind == Some(h3::frame::HEADERS) && st.is_bidi)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            self.parse_server_connect(h, id);
+        }
+        if self
+            .sessions
+            .get(&h)
+            .map(|s| s.connect_self_opened && !s.connect_rx.is_empty())
+            .unwrap_or(false)
+        {
+            self.parse_client_connect(h);
+        }
+    }
+
     /// Server: parse HEADERS frames from a request stream's OWN buffer
     /// (`in_streams[stream_id].buf`). Every complete frame is drained (a
     /// non-CONNECT request can never wedge), a real WebTransport CONNECT is
-    /// answered with 200 and establishes the session (latching the CONNECT
-    /// stream to `stream_id`), and any other request is rejected with 404.
+    /// answered with 200 and establishes a session (latching the CONNECT
+    /// stream to `stream_id`) up to `wt_max_sessions`, and any other request
+    /// is rejected with 404. Over-cap CONNECT is rejected with 429 +
+    /// `E_LIMIT_EXCEEDED` (stable, no panic).
     fn parse_server_connect(&mut self, h: ConnectionHandle, stream_id: StreamId) {
         let Some(&id) = self.handle_to_id.get(&h) else {
             return;
@@ -1533,53 +2069,109 @@ impl WtEndpoint {
                     return;
                 }
             };
-            let payload_and_drain = |ep: &mut Self| -> Option<Vec<u8>> {
-                let st = ep.sessions.get_mut(&h)?.in_streams.get_mut(&stream_id)?;
-                let payload = if is_headers {
-                    st.buf[header..total].to_vec()
-                } else {
-                    Vec::new()
-                };
-                st.buf.drain(..total);
-                Some(payload)
-            };
-            let Some(payload) = payload_and_drain(self) else {
-                return;
-            };
+
             if !is_headers {
-                continue; // skip non-HEADERS frame
+                if let Some(st) = self
+                    .sessions
+                    .get_mut(&h)
+                    .and_then(|s| s.in_streams.get_mut(&stream_id))
+                {
+                    st.buf.drain(..total);
+                }
+                continue;
             }
 
-            let headers = h3::decode_literal_headers(&payload);
-            let is_connect = headers
-                .as_ref()
-                .map(|hs| {
-                    hs.iter().any(|(k, v)| k == ":method" && v == "CONNECT")
-                        && hs
-                            .iter()
-                            .any(|(k, v)| k == ":protocol" && v == "webtransport")
-                })
-                .unwrap_or(false);
-            // Only the FIRST CONNECT establishes: this endpoint models one WT
-            // session per QUIC connection, so a second CONNECT is rejected.
-            let already = self.sessions.get(&h).map(|s| s.established).unwrap_or(true);
-            if is_connect && !already {
-                if let Some(conn) = self.conns.get_mut(&h) {
-                    let resp = h3::encode_connect_response_ok();
-                    let _ = conn.send_stream(stream_id).write(&resp);
+            let decode_result = {
+                let Some(s) = self.sessions.get(&h) else {
+                    return;
+                };
+                let Some(st) = s.in_streams.get(&stream_id) else {
+                    return;
+                };
+                h3::decode_field_section(&st.buf[header..total], &s.qpack_decoder)
+            };
+            match decode_result {
+                Err(h3::QpackError::Blocked) => {
+                    // Wait for encoder-stream inserts unless we advertised
+                    // SETTINGS_QPACK_BLOCKED_STREAMS = 0 (no blocking allowed).
+                    let max_blocked = self
+                        .sessions
+                        .get(&h)
+                        .map(|s| s.qpack_decoder.max_blocked_streams())
+                        .unwrap_or(0);
+                    if qpack_blocking_forbidden(max_blocked) {
+                        self.close_conn_protocol_error(
+                            h,
+                            QPACK_DECOMPRESSION_FAILED,
+                            b"QPACK blocked streams not permitted",
+                        );
+                    }
+                    return;
                 }
-                if let Some(s) = self.sessions.get_mut(&h) {
-                    s.connect_stream = Some(stream_id);
-                    s.established = true;
+                Err(h3::QpackError::Invalid) => {
+                    self.close_conn_protocol_error(
+                        h,
+                        QPACK_DECOMPRESSION_FAILED,
+                        b"QPACK decompression failed",
+                    );
+                    return;
                 }
-                self.handshake_reservations.remove(&h);
-                self.push_event(WtEvent::SessionEstablished { conn: id });
-            } else {
-                // Reject (404 + FIN) so the peer fails fast rather than hanging.
-                if let Some(conn) = self.conns.get_mut(&h) {
-                    let resp = h3::encode_status_response("404");
-                    let _ = conn.send_stream(stream_id).write(&resp);
-                    let _ = conn.send_stream(stream_id).finish();
+                Ok(headers) => {
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        if let Some(st) = s.in_streams.get_mut(&stream_id) {
+                            st.buf.drain(..total);
+                        }
+                    }
+
+                    let is_connect = headers_are_webtransport_connect(&headers);
+                    if !is_connect {
+                        if let Some(conn) = self.conns.get_mut(&h) {
+                            let resp = h3::encode_status_response("404");
+                            let _ = conn.send_stream(stream_id).write(&resp);
+                            let _ = conn.send_stream(stream_id).finish();
+                        }
+                        continue;
+                    }
+
+                    let already_this = self
+                        .sessions
+                        .get(&h)
+                        .map(|s| s.is_wt_connect(stream_id))
+                        .unwrap_or(false);
+                    if already_this {
+                        continue;
+                    }
+
+                    let active = self
+                        .sessions
+                        .get(&h)
+                        .map(|s| s.active_wt_count())
+                        .unwrap_or(0);
+                    if active >= self.wt_max_sessions as usize {
+                        self.set_last_error("E_LIMIT_EXCEEDED: SETTINGS_WT_MAX_SESSIONS exceeded");
+                        if let Some(conn) = self.conns.get_mut(&h) {
+                            let resp = h3::encode_status_response("429");
+                            let _ = conn.send_stream(stream_id).write(&resp);
+                            let _ = conn.send_stream(stream_id).finish();
+                        }
+                        continue;
+                    }
+
+                    if let Some(conn) = self.conns.get_mut(&h) {
+                        let resp = h3::encode_connect_response_ok();
+                        let _ = conn.send_stream(stream_id).write(&resp);
+                    }
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        if !s.established || s.connect_stream.is_none() {
+                            s.connect_stream = Some(stream_id);
+                            s.established = true;
+                            s.connect_closed = false;
+                        } else {
+                            s.extra_sessions.insert(stream_id);
+                        }
+                    }
+                    self.handshake_reservations.remove(&h);
+                    self.push_event(WtEvent::SessionEstablished { conn: id });
                 }
             }
         }
@@ -1612,18 +2204,10 @@ impl WtEndpoint {
                     return;
                 }
             };
-            let payload = if is_headers {
-                match self.sessions.get(&h) {
-                    Some(s) => s.connect_rx[header..total].to_vec(),
-                    None => return,
-                }
-            } else {
-                Vec::new()
-            };
-            if let Some(s) = self.sessions.get_mut(&h) {
-                s.connect_rx.drain(..total);
-            }
             if !is_headers {
+                if let Some(s) = self.sessions.get_mut(&h) {
+                    s.connect_rx.drain(..total);
+                }
                 continue;
             }
             let (established, closed) = self
@@ -1634,19 +2218,57 @@ impl WtEndpoint {
             if closed {
                 // Session already failed/closed; ignore further CONNECT frames
                 // (a late 200 must not resurrect a discarded session).
+                if let Some(s) = self.sessions.get_mut(&h) {
+                    s.connect_rx.drain(..total);
+                }
                 continue;
             }
-            let headers = h3::decode_literal_headers(&payload);
+            let decode_result = {
+                let Some(s) = self.sessions.get(&h) else {
+                    return;
+                };
+                h3::decode_field_section(&s.connect_rx[header..total], &s.qpack_decoder)
+            };
+            let headers = match decode_result {
+                Err(h3::QpackError::Blocked) => {
+                    let max_blocked = self
+                        .sessions
+                        .get(&h)
+                        .map(|s| s.qpack_decoder.max_blocked_streams())
+                        .unwrap_or(0);
+                    if qpack_blocking_forbidden(max_blocked) {
+                        self.close_conn_protocol_error(
+                            h,
+                            QPACK_DECOMPRESSION_FAILED,
+                            b"QPACK blocked streams not permitted",
+                        );
+                    }
+                    return;
+                }
+                Err(h3::QpackError::Invalid) => {
+                    self.close_conn_protocol_error(
+                        h,
+                        QPACK_DECOMPRESSION_FAILED,
+                        b"QPACK decompression failed",
+                    );
+                    return;
+                }
+                Ok(headers) => {
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        s.connect_rx.drain(..total);
+                    }
+                    headers
+                }
+            };
             // Strictly parse the numeric :status (a malformed value is a bad
             // response, not an interim one).
-            let status: Option<u16> = headers.as_ref().and_then(|hs| {
-                hs.iter()
-                    .find(|(k, _)| k == ":status")
-                    .and_then(|(_, v)| v.parse().ok())
-            });
-            match status {
+            let status: Option<u16> = headers
+                .iter()
+                .find(|(k, _)| k == ":status")
+                .and_then(|(_, v)| v.parse().ok());
+            match classify_connect_status(status) {
                 // 2xx establishes the WebTransport session.
-                Some(200..=299) => {
+                ConnectStatusKind::Success => {
                     if !established {
                         if let Some(s) = self.sessions.get_mut(&h) {
                             s.established = true;
@@ -1658,11 +2280,11 @@ impl WtEndpoint {
                 }
                 // 1xx interim informational — wait for the final response (the
                 // connect deadline still bounds an interim-only / silent server).
-                Some(100..=199) => {}
+                ConnectStatusKind::Interim => {}
                 // Any other final status, or an unparseable/missing one: the
                 // session will never establish. Route through the graceful-close
                 // helper (exactly one Closed, QUIC torn down, FIN then a no-op).
-                _ => {
+                ConnectStatusKind::Failure => {
                     if !established {
                         self.close_session_on_connect_end(h);
                         return;
@@ -1690,26 +2312,31 @@ impl WtEndpoint {
                 None => return,
             };
             let Some(dg) = dg else { break };
-            if let Some((_qsid, payload)) = h3::unwrap_datagram(&dg) {
-                if self.is_server {
-                    if let Err(err) = self.rate_limiter.check_connection(
-                        now,
-                        id,
-                        RateLimitDimension::DatagramIngress,
-                    ) {
-                        self.set_last_error(err);
-                        self.close_conn(id, 0, b"rate limited", now);
-                        break;
-                    }
-                }
-                if let Err(err) = self.try_push_event(WtEvent::Datagram {
-                    conn: id,
-                    data: payload.to_vec(),
-                }) {
+            // Demux by quarter-session-id: only deliver datagrams that map to a
+            // live WT session on this connection (isolation between sessions).
+            let Some(session) = self.sessions.get(&h) else {
+                continue;
+            };
+            let Some(payload) = Self::datagram_payload_for_session(session, &dg) else {
+                continue;
+            };
+            if self.is_server {
+                if let Err(err) =
+                    self.rate_limiter
+                        .check_connection(now, id, RateLimitDimension::DatagramIngress)
+                {
                     self.set_last_error(err);
-                    self.close_conn(id, 0, b"inbound datagram budget exhausted", now);
+                    self.close_conn(id, 0, b"rate limited", now);
                     break;
                 }
+            }
+            if let Err(err) = self.try_push_event(WtEvent::Datagram {
+                conn: id,
+                data: payload,
+            }) {
+                self.set_last_error(err);
+                self.close_conn(id, 0, b"inbound datagram budget exhausted", now);
+                break;
             }
         }
     }
@@ -1725,11 +2352,11 @@ impl WtEndpoint {
 
     /// Send a WebTransport datagram on the session's CONNECT context.
     pub fn send_datagram(&mut self, conn_id: u32, payload: &[u8]) -> bool {
-        if payload.len() > self.governor.limits().max_datagram_size
-            || self
-                .max_datagram_size(conn_id)
-                .is_some_and(|max| payload.len() > max)
-        {
+        if datagram_payload_exceeds_caps(
+            payload.len(),
+            self.governor.limits().max_datagram_size,
+            self.max_datagram_size(conn_id),
+        ) {
             self.set_last_error("E_LIMIT_EXCEEDED: maxDatagramSize exceeded");
             return false;
         }
@@ -1918,30 +2545,20 @@ impl WtEndpoint {
     pub fn next_timeout_ms(&mut self) -> f64 {
         let now = Instant::now();
         let mut soonest: Option<Instant> = None;
-        let consider = |t: Instant, soonest: &mut Option<Instant>| {
-            *soonest = Some(match *soonest {
-                Some(s) if s <= t => s,
-                _ => t,
-            });
-        };
         for conn in self.conns.values_mut() {
             if let Some(t) = conn.poll_timeout() {
-                consider(t, &mut soonest);
+                soonest = sooner_deadline(soonest, t);
             }
         }
         // Pending CONNECT deadlines (unestablished client sessions).
         for s in self.sessions.values() {
-            if !s.established && !s.connect_closed {
+            if should_track_connect_deadline(s.established, s.connect_closed) {
                 if let Some(t) = s.connect_deadline {
-                    consider(t, &mut soonest);
+                    soonest = sooner_deadline(soonest, t);
                 }
             }
         }
-        match soonest {
-            Some(t) if t > now => (t - now).as_secs_f64() * 1000.0,
-            Some(_) => 0.0,
-            None => -1.0,
-        }
+        next_timeout_value(now, soonest)
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {
@@ -1964,7 +2581,7 @@ impl WtEndpoint {
             .sessions
             .iter()
             .filter(|(_, s)| {
-                !s.established && !s.connect_closed && s.connect_deadline.is_some_and(|d| d <= now)
+                connect_deadline_expired(s.established, s.connect_closed, s.connect_deadline, now)
             })
             .map(|(h, _)| *h)
             .collect();
@@ -2066,7 +2683,7 @@ fn decode_frame_header(buf: &[u8]) -> FrameHdr {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadOutcome {
     /// Stream still open; more data may follow.
     Open,
@@ -2110,7 +2727,7 @@ fn read_stream(
         let remaining = max_bytes - out.len();
         match chunks.next(remaining) {
             Ok(Some(chunk)) => {
-                if chunk.bytes.is_empty() {
+                if !chunk_carries_payload(chunk.bytes.len()) {
                     break;
                 }
                 out.extend_from_slice(&chunk.bytes);
@@ -2130,1807 +2747,6 @@ fn read_stream(
     outcome
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-
-    const CADDR: &str = "127.0.0.1:5544";
-    const SADDR: &str = "127.0.0.1:4433";
-
-    #[test]
-    fn build_missing_server_crypto_should_return_stable_error_instead_of_panicking() {
-        let peer_addr: SocketAddr = CADDR.parse().expect("fixed peer address");
-        let error = match WtEndpoint::build(
-            true,
-            peer_addr,
-            None,
-            None,
-            WasmLimits::default(),
-            WasmRateLimits::default(),
-        ) {
-            Ok(_) => panic!("missing server crypto must fail closed"),
-            Err(error) => error,
-        };
-        assert_eq!(error, "E_INTERNAL: server config required");
-    }
-
-    #[test]
-    fn configured_handshake_and_idle_deadlines_drive_the_endpoint() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let limits = WasmLimits {
-            handshake_timeout_ms: 17,
-            idle_timeout_ms: 29,
-            ..WasmLimits::default()
-        };
-        let mut client = WtEndpoint::new_with_limits(false, caddr, saddr, limits).unwrap();
-        assert_eq!(client.idle_timeout_ms, 29);
-
-        let before = Instant::now();
-        let conn = client.connect("localhost") as u32;
-        let after = Instant::now();
-        let handle = client.id_to_handle[&conn];
-        let deadline = client.sessions[&handle]
-            .connect_deadline
-            .expect("connect deadline");
-        assert!(deadline >= before + std::time::Duration::from_millis(17));
-        assert!(deadline <= after + std::time::Duration::from_millis(17));
-        assert!(client.next_timeout_ms() <= 17.0);
-    }
-
-    #[test]
-    fn rust_event_bytes_stay_reserved_through_bridge_transfer_and_teardown() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let limits = WasmLimits {
-            max_datagram_size: 4,
-            max_queued_bytes_global: 4,
-            max_queued_bytes_per_session: 4,
-            max_queued_bytes_per_stream: 4,
-            ..WasmLimits::default()
-        };
-        let mut endpoint = WtEndpoint::new_with_limits(true, saddr, caddr, limits).unwrap();
-
-        endpoint.push_event(WtEvent::Datagram {
-            conn: 7,
-            data: vec![1; 4],
-        });
-        assert_eq!(endpoint.governor.snapshot(7, None).queued_bytes_global, 4);
-        endpoint.push_event(WtEvent::Datagram {
-            conn: 7,
-            data: vec![2],
-        });
-        assert_eq!(
-            endpoint.take_last_error().as_deref(),
-            Some("E_QUEUE_FULL: maxQueuedBytesGlobal reached")
-        );
-        assert_eq!(endpoint.events.len(), 1, "limit+1 event is not retained");
-
-        let encoded = endpoint.poll_event_encoded().expect("encoded event");
-        assert!(!encoded.is_empty());
-        let transferred = endpoint.governor.snapshot(7, None);
-        assert_eq!(transferred.queued_bytes_global, 4);
-        assert_eq!(transferred.host_tokens_active, 1);
-
-        assert_eq!(endpoint.governor.release_all_host_tokens(), 1);
-        assert_eq!(
-            endpoint.governor.snapshot(7, None),
-            crate::governor::GovernorSnapshot::default()
-        );
-    }
-
-    #[test]
-    fn bridge_transfer_failure_fails_closed_instead_of_encoding_token_zero() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let limits = WasmLimits {
-            max_queued_bytes_global: 2,
-            max_queued_bytes_per_session: 2,
-            max_queued_bytes_per_stream: 2,
-            ..WasmLimits::default()
-        };
-        let mut endpoint = WtEndpoint::new_with_limits(true, saddr, caddr, limits).unwrap();
-        endpoint.governor.set_host_token_ceiling_for_test(1);
-        endpoint.push_event(WtEvent::Datagram {
-            conn: 1,
-            data: vec![1],
-        });
-        endpoint.push_event(WtEvent::Datagram {
-            conn: 1,
-            data: vec![2],
-        });
-
-        assert!(
-            endpoint.poll_event_encoded().is_some(),
-            "first token transfers"
-        );
-        // The second transfer fails: the payload must never be delivered with
-        // an unaccounted token-0, and the failure must be observable — the
-        // affected connection fails closed with a Closed event instead of the
-        // payload silently vanishing.
-        let closed = endpoint
-            .poll_event_encoded()
-            .expect("failed transfer surfaces a Closed event");
-        assert_eq!(closed[0], crate::event::tag::CLOSED);
-        assert_eq!(
-            crate::varint::decode(&closed[1..]).map(|(conn, _)| conn),
-            Some(1),
-            "Closed event targets the connection whose payload was dropped"
-        );
-        assert_eq!(
-            endpoint.take_last_error().as_deref(),
-            Some("E_LIMIT_EXCEEDED: host reservation token space exhausted")
-        );
-        assert!(
-            endpoint.poll_event_encoded().is_none(),
-            "queue is drained after the fail-closed teardown"
-        );
-        let snapshot = endpoint.governor.snapshot(1, None);
-        assert_eq!(snapshot.host_tokens_active, 1);
-        assert_eq!(snapshot.queued_bytes_global, 1);
-        assert_eq!(endpoint.governor.release_all_host_tokens(), 1);
-        assert_eq!(
-            endpoint.governor.snapshot(1, None),
-            crate::governor::GovernorSnapshot::default()
-        );
-    }
-
-    #[test]
-    fn event_item_cap_accepts_exact_boundary_and_rejects_limit_plus_one() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut endpoint = WtEndpoint::new(true, saddr, caddr).unwrap();
-        endpoint.events = std::iter::repeat_n(WtEvent::Connected { conn: 1 }, 65_536).collect();
-        endpoint.event_reservations = std::iter::repeat_with(|| None).take(65_536).collect();
-
-        endpoint.push_event(WtEvent::Connected { conn: 2 });
-        assert_eq!(endpoint.events.len(), 65_536);
-        assert_eq!(endpoint.event_reservations.len(), 65_536);
-        assert_eq!(
-            endpoint.take_last_error().as_deref(),
-            Some("E_QUEUE_FULL: event queue item cap reached")
-        );
-    }
-
-    #[test]
-    fn decode_frame_header_never_panics_on_random_input() {
-        // Robustness fuzz: random byte sequences must never panic the frame
-        // header decoder (varint overflow, oversized length, truncation).
-        let mut state = 0x1234_5678_9abc_def0u64;
-        let mut next = || {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
-        };
-        for _ in 0..100_000 {
-            let len = (next() as usize) % 32;
-            let buf: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            let _ = decode_frame_header(&buf);
-        }
-    }
-
-    #[test]
-    fn decode_frame_header_rejects_oversized_frame() {
-        // A frame advertising a length beyond MAX_H3_FRAME_SIZE must be flagged
-        // TooLarge so the connection is closed rather than buffered unbounded.
-        let mut buf = Vec::new();
-        crate::varint::encode(0x00, &mut buf); // ftype
-        crate::varint::encode(MAX_H3_FRAME_SIZE + 1, &mut buf); // oversized length
-        assert!(matches!(decode_frame_header(&buf), FrameHdr::TooLarge));
-
-        // A within-cap frame whose payload hasn't fully arrived is Incomplete.
-        let mut small = Vec::new();
-        crate::varint::encode(0x00, &mut small);
-        crate::varint::encode(100, &mut small);
-        assert!(matches!(decode_frame_header(&small), FrameHdr::Incomplete));
-    }
-
-    /// Move all packets `from` (located at `from_addr`) emits into `to`, using
-    /// `from_addr` as the datagram source so the receiver routes by it. Both
-    /// endpoints are a fixed pair, so every emitted destination is `to`.
-    fn relay_step_addr(from: &mut WtEndpoint, to: &mut WtEndpoint, from_addr: SocketAddr) -> bool {
-        let now = Instant::now();
-        let mut pkts = Vec::new();
-        from.poll_transmits(now, &mut pkts);
-        let moved = !pkts.is_empty();
-        for (p, _dest) in pkts {
-            to.recv(Instant::now(), from_addr, &p);
-        }
-        moved
-    }
-
-    fn endpoints() -> (WtEndpoint, WtEndpoint, u32) {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let server = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let cid = client.connect("localhost") as u32;
-        (server, client, cid)
-    }
-
-    fn relay_client_to_server(client: &mut WtEndpoint, server: &mut WtEndpoint) -> bool {
-        relay_step_addr(client, server, CADDR.parse().unwrap())
-    }
-
-    fn relay_server_to_client(server: &mut WtEndpoint, client: &mut WtEndpoint) -> bool {
-        relay_step_addr(server, client, SADDR.parse().unwrap())
-    }
-
-    fn decode_stream_data_event(encoded: &[u8]) -> Option<(u32, u32, bool, Vec<u8>, u32)> {
-        if encoded.first().copied() != Some(crate::event::tag::STREAM_DATA) {
-            return None;
-        }
-        let (conn, mut offset) = crate::varint::decode(&encoded[1..])?;
-        offset += 1;
-        let (stream, next) = crate::varint::decode(&encoded[offset..])?;
-        offset += next;
-        let fin = *encoded.get(offset)? != 0;
-        offset += 1;
-        let (len, next) = crate::varint::decode(&encoded[offset..])?;
-        offset += next;
-        let len: usize = len.try_into().ok()?;
-        let data = encoded.get(offset..offset + len)?.to_vec();
-        offset += len;
-        let (token, _next) = crate::varint::decode(&encoded[offset..])?;
-        Some((conn as u32, stream as u32, fin, data, token as u32))
-    }
-
-    #[test]
-    fn datagram_size_accepts_exact_limit_and_rejects_limit_plus_one_stably() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let server_limits = WasmLimits {
-            max_datagram_size: 4,
-            ..WasmLimits::default()
-        };
-        let client_limits = server_limits.clone();
-        let mut server = WtEndpoint::new_with_limits(true, saddr, caddr, server_limits).unwrap();
-        let mut client = WtEndpoint::new_with_limits(false, caddr, saddr, client_limits).unwrap();
-        let conn = client.connect("localhost") as u32;
-        let mut established = false;
-
-        for _ in 0..400 {
-            let moved = relay_client_to_server(&mut client, &mut server)
-                | relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = client.poll_event() {
-                if matches!(event, WtEvent::SessionEstablished { .. }) {
-                    established = true;
-                }
-            }
-            while server.poll_event().is_some() {}
-            if established {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-
-        assert!(
-            established,
-            "session establishes before boundary assertions"
-        );
-        assert!(client.send_datagram(conn, b"1234"), "exact limit succeeds");
-        assert!(!client.send_datagram(conn, b"12345"), "limit+1 fails");
-        assert_eq!(
-            client.take_last_error().as_deref(),
-            Some("E_LIMIT_EXCEEDED: maxDatagramSize exceeded")
-        );
-    }
-
-    #[test]
-    fn datagram_size_respects_negotiated_transport_capacity_stably() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let limits = WasmLimits {
-            max_datagram_size: 100_000,
-            ..WasmLimits::default()
-        };
-        let mut server = WtEndpoint::new_with_limits(true, saddr, caddr, limits.clone()).unwrap();
-        let mut client = WtEndpoint::new_with_limits(false, caddr, saddr, limits).unwrap();
-        let conn = client.connect("localhost") as u32;
-        let mut established = false;
-
-        for _ in 0..400 {
-            let moved = relay_client_to_server(&mut client, &mut server)
-                | relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = client.poll_event() {
-                if matches!(event, WtEvent::SessionEstablished { .. }) {
-                    established = true;
-                }
-            }
-            while server.poll_event().is_some() {}
-            if established {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-
-        assert!(established, "session establishes before size assertions");
-        let effective = client
-            .max_datagram_size(conn)
-            .expect("established connection supports datagrams");
-        assert!(effective > 0);
-        assert!(effective < 64 * 1024);
-        assert!(!client.send_datagram(conn, &vec![0; 64 * 1024]));
-        assert_eq!(
-            client.take_last_error().as_deref(),
-            Some("E_LIMIT_EXCEEDED: maxDatagramSize exceeded")
-        );
-    }
-
-    #[test]
-    fn outgoing_stream_limit_rejects_before_allocating_a_quic_stream_or_handle() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let server_limits = WasmLimits::default();
-        let client_limits = WasmLimits {
-            max_streams_per_session_bidi: 1,
-            max_streams_per_session_uni: 1,
-            max_streams_global: 1,
-            ..WasmLimits::default()
-        };
-        let mut server = WtEndpoint::new_with_limits(true, saddr, caddr, server_limits).unwrap();
-        let mut client = WtEndpoint::new_with_limits(false, caddr, saddr, client_limits).unwrap();
-        let conn = client.connect("localhost") as u32;
-        let mut established = false;
-        for _ in 0..400 {
-            relay_client_to_server(&mut client, &mut server);
-            relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = client.poll_event() {
-                if matches!(event, WtEvent::SessionEstablished { .. }) {
-                    established = true;
-                }
-            }
-            while server.poll_event().is_some() {}
-            if established {
-                break;
-            }
-        }
-        assert!(
-            established,
-            "session establishes before stream limit assertions"
-        );
-
-        assert!(client.open_stream(conn, true) > 0, "exact limit succeeds");
-        let next_handle = client.next_stream;
-        assert_eq!(client.open_stream(conn, true), -1, "limit+1 fails");
-        assert_eq!(
-            client.next_stream, next_handle,
-            "rejected open must not consume or expose a stream handle"
-        );
-        assert_eq!(client.stream_index.len(), 1);
-        assert_eq!(client.stream_reservations.len(), 1);
-        assert_eq!(
-            client.take_last_error().as_deref(),
-            Some("E_LIMIT_EXCEEDED: maxStreamsGlobal reached")
-        );
-    }
-
-    #[test]
-    fn error_close_releases_governor_budget_before_connection_lost() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let conn = client.connect("localhost") as u32;
-        let mut established = false;
-        for _ in 0..400 {
-            relay_client_to_server(&mut client, &mut server);
-            relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = client.poll_event() {
-                if matches!(event, WtEvent::SessionEstablished { .. }) {
-                    established = true;
-                }
-            }
-            while server.poll_event().is_some() {}
-            if established {
-                break;
-            }
-        }
-        assert!(established, "session establishes before budget assertions");
-        assert!(client.open_stream(conn, true) > 0);
-        let h = *client.id_to_handle.get(&conn).unwrap();
-        assert!(
-            client.session_reservations.contains_key(&h),
-            "established session carries a session reservation"
-        );
-        assert_eq!(client.stream_reservations.len(), 1);
-
-        // The budget must free at the close site itself — BEFORE any further
-        // drive/pump surfaces ConnectionLost and runs cleanup_connection.
-        client.close_conn_protocol_error(h, 0x0102, b"test");
-        assert!(!client.handshake_reservations.contains_key(&h));
-        assert!(!client.session_reservations.contains_key(&h));
-        assert!(client.stream_reservations.is_empty());
-        // Connection state stays with quinn's lifecycle (not torn down here);
-        // the eventual cleanup_connection is a budget no-op.
-        assert!(client.conns.contains_key(&h));
-    }
-
-    #[test]
-    fn incoming_stream_limit_drops_parser_state_instead_of_buffering_untracked_bytes() {
-        use quinn_proto::{Dir, Side};
-
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let limits = WasmLimits {
-            max_streams_per_session_bidi: 1,
-            max_streams_per_session_uni: 1,
-            max_streams_global: 1,
-            ..WasmLimits::default()
-        };
-        let mut endpoint = WtEndpoint::new_with_limits(true, saddr, caddr, limits).unwrap();
-        let h = ConnectionHandle(0);
-        let stream_id = StreamId::new(Side::Client, Dir::Bi, 0);
-        endpoint.handle_to_id.insert(h, 1);
-        endpoint.id_to_handle.insert(1, h);
-        let mut session = Session::default();
-        session.in_streams.insert(
-            stream_id,
-            InStream {
-                kind: None,
-                is_bidi: true,
-                sid_read: false,
-                handle: None,
-                buf: Vec::new(),
-            },
-        );
-        endpoint.sessions.insert(h, session);
-        let _ = endpoint
-            .rate_limiter
-            .attach_connection(1, caddr, Instant::now());
-        let held = endpoint
-            .governor
-            .reserve_stream(1, 99, StreamKind::Bidi)
-            .expect("fill exact stream limit");
-        endpoint.stream_reservations.insert(99, held);
-
-        let mut encoded = Vec::new();
-        crate::varint::encode(h3::frame::WT_BIDI, &mut encoded);
-        crate::varint::encode(0, &mut encoded);
-        encoded.extend_from_slice(&[7; 64]);
-        endpoint.process_in_stream(h, stream_id, &encoded, false, Instant::now());
-
-        assert!(
-            !endpoint.sessions[&h].in_streams.contains_key(&stream_id),
-            "rejected stream parser state and payload must be dropped"
-        );
-        assert_eq!(
-            endpoint.next_stream, 1,
-            "rejection must not consume a handle"
-        );
-        assert_eq!(
-            endpoint.take_last_error().as_deref(),
-            Some("E_LIMIT_EXCEEDED: maxStreamsGlobal reached")
-        );
-    }
-
-    #[test]
-    fn incoming_stream_without_owner_mapping_fails_closed_without_allocating_state() {
-        use quinn_proto::{Dir, Side};
-
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut endpoint = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let h = ConnectionHandle(0);
-        let stream_id = StreamId::new(Side::Client, Dir::Bi, 0);
-        endpoint.handle_to_id.insert(h, 1);
-        endpoint.id_to_handle.insert(1, h);
-        let mut session = Session::default();
-        session.in_streams.insert(
-            stream_id,
-            InStream {
-                kind: None,
-                is_bidi: true,
-                sid_read: false,
-                handle: None,
-                buf: Vec::new(),
-            },
-        );
-        endpoint.sessions.insert(h, session);
-
-        let mut encoded = Vec::new();
-        crate::varint::encode(h3::frame::WT_BIDI, &mut encoded);
-        crate::varint::encode(0, &mut encoded);
-        encoded.extend_from_slice(&[7; 8]);
-        endpoint.process_in_stream(h, stream_id, &encoded, false, Instant::now());
-
-        assert!(
-            !endpoint.sessions[&h].in_streams.contains_key(&stream_id),
-            "missing owner mapping must reject and retire the parser state"
-        );
-        assert_eq!(
-            endpoint.next_stream, 1,
-            "missing owner mapping must not consume a stream handle"
-        );
-        assert_eq!(endpoint.stream_reservations.len(), 0);
-        assert!(
-            endpoint.events.is_empty(),
-            "rejected stream must not emit WT events"
-        );
-        assert_eq!(
-            endpoint.take_last_error().as_deref(),
-            Some("E_INTERNAL: missing peer ownership for streamOpens rate limiting")
-        );
-    }
-
-    #[test]
-    fn wt_session_and_datagram_echo() {
-        let (mut server, mut client, cid) = endpoints();
-        let mut server_est = false;
-        let mut client_est = false;
-        let mut echoed = false;
-
-        for _ in 0..400 {
-            let a = relay_client_to_server(&mut client, &mut server);
-            let b = relay_server_to_client(&mut server, &mut client);
-            while let Some(ev) = server.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => server_est = true,
-                    WtEvent::Datagram { conn, data } => {
-                        server.send_datagram(conn, &data);
-                    }
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => client_est = true,
-                    WtEvent::Datagram { data, .. } => {
-                        assert_eq!(data, b"ping");
-                        echoed = true;
-                    }
-                    _ => {}
-                }
-            }
-            if server_est && client_est && !echoed {
-                client.send_datagram(cid, b"ping");
-            }
-            if echoed {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert!(server_est && client_est && echoed);
-    }
-
-    #[test]
-    fn wt_bidi_stream_echo() {
-        let (mut server, mut client, cid) = endpoints();
-        let mut server_est = false;
-        let mut client_est = false;
-        let mut client_stream: Option<u32> = None;
-        let mut sent = false;
-        let mut echo: Option<Vec<u8>> = None;
-        // server side: map of accepted bidi stream -> echo it
-        for _ in 0..600 {
-            let a = relay_client_to_server(&mut client, &mut server);
-            let b = relay_server_to_client(&mut server, &mut client);
-            while let Some(ev) = server.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => server_est = true,
-                    WtEvent::StreamData { stream, data, .. } if !data.is_empty() => {
-                        server.stream_write(stream, &data);
-                    }
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => client_est = true,
-                    WtEvent::StreamData { data, .. } if !data.is_empty() => {
-                        echo = Some(data);
-                    }
-                    _ => {}
-                }
-            }
-            if server_est && client_est && client_stream.is_none() {
-                let s = client.open_stream(cid, true);
-                assert!(s >= 0);
-                client_stream = Some(s as u32);
-            }
-            if let Some(s) = client_stream {
-                if !sent {
-                    client.stream_write(s, b"hello-bidi");
-                    sent = true;
-                }
-            }
-            if echo.is_some() {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert_eq!(echo.as_deref(), Some(&b"hello-bidi"[..]));
-    }
-
-    #[test]
-    fn reliable_stream_data_larger_than_event_budget_is_backpressured_not_dropped() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let limits = WasmLimits {
-            max_queued_bytes_global: 16 * 1024,
-            max_queued_bytes_per_session: 8 * 1024,
-            max_queued_bytes_per_stream: 4 * 1024,
-            ..WasmLimits::default()
-        };
-        let mut server = WtEndpoint::new_with_limits(true, saddr, caddr, limits.clone()).unwrap();
-        let mut client = WtEndpoint::new_with_limits(false, caddr, saddr, limits).unwrap();
-        let conn = client.connect("localhost") as u32;
-        let mut server_established = false;
-        let mut client_established = false;
-
-        for _ in 0..600 {
-            let moved = relay_client_to_server(&mut client, &mut server)
-                | relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = server.poll_event() {
-                if matches!(event, WtEvent::SessionEstablished { .. }) {
-                    server_established = true;
-                }
-            }
-            while let Some(event) = client.poll_event() {
-                if matches!(event, WtEvent::SessionEstablished { .. }) {
-                    client_established = true;
-                }
-            }
-            if server_established && client_established {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert!(server_established && client_established);
-
-        let stream = client.open_stream(conn, true);
-        assert!(stream >= 0);
-        let stream = stream as u32;
-        let payload: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
-        let mut sent = 0usize;
-        let mut received = Vec::with_capacity(payload.len());
-
-        for _ in 0..10_000 {
-            if sent < payload.len() {
-                let accepted = client.stream_write(stream, &payload[sent..]);
-                assert!(accepted >= 0, "stream write should not fail");
-                sent += accepted as usize;
-            }
-            let moved = relay_client_to_server(&mut client, &mut server)
-                | relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = server.poll_event() {
-                if let WtEvent::StreamData { data, .. } = event {
-                    received.extend_from_slice(&data);
-                }
-            }
-            while client.poll_event().is_some() {}
-            if sent == payload.len() && received.len() == payload.len() {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-
-        assert_eq!(sent, payload.len(), "the sender accepted the full payload");
-        assert_eq!(
-            received, payload,
-            "reliable stream bytes must never be dropped"
-        );
-        assert_ne!(
-            server.take_last_error().as_deref(),
-            Some("E_QUEUE_FULL: maxQueuedBytesPerStream reached"),
-        );
-    }
-
-    #[test]
-    fn full_event_queue_backpressures_reliable_stream_reads_without_losing_bytes() {
-        let (mut server, mut client, _cid) = endpoints();
-        let mut server_conn = None;
-        let mut client_established = false;
-        let mut client_stream = None;
-
-        for _ in 0..2_000 {
-            let moved = relay_client_to_server(&mut client, &mut server)
-                | relay_server_to_client(&mut server, &mut client);
-            while let Some(event) = server.poll_event() {
-                if let WtEvent::SessionEstablished { conn } = event {
-                    server_conn = Some(conn);
-                }
-            }
-            while let Some(event) = client.poll_event() {
-                match event {
-                    WtEvent::SessionEstablished { .. } => client_established = true,
-                    WtEvent::StreamOpened { stream, .. } => client_stream = Some(stream),
-                    _ => {}
-                }
-            }
-            if client_established && client_stream.is_none() {
-                let stream = server.open_stream(server_conn.expect("server conn"), true);
-                assert!(stream >= 0);
-            }
-            if client_established && client_stream.is_some() {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-
-        let client_stream = client_stream.expect("client observed opened stream");
-        server.events =
-            std::iter::repeat_n(WtEvent::Connected { conn: 9 }, MAX_PENDING_EVENTS).collect();
-        server.event_reservations = std::iter::repeat_with(|| None)
-            .take(MAX_PENDING_EVENTS)
-            .collect();
-
-        client.stream_write(client_stream, b"queued-data");
-
-        for _ in 0..10 {
-            let moved = relay_client_to_server(&mut client, &mut server)
-                | relay_server_to_client(&mut server, &mut client);
-            while client.poll_event().is_some() {}
-            if !moved {
-                break;
-            }
-        }
-
-        assert_eq!(server.events.len(), MAX_PENDING_EVENTS);
-        assert_eq!(
-            server.take_last_error().as_deref(),
-            Some("E_QUEUE_FULL: event queue item cap reached")
-        );
-
-        assert!(server.poll_event().is_some(), "free one queue slot");
-        assert!(matches!(
-            server.events.back(),
-            Some(WtEvent::StreamData { data, .. }) if data == b"queued-data"
-        ));
-    }
-
-    #[test]
-    fn releasing_one_host_token_resumes_other_connections_blocked_by_global_capacity() {
-        let limits = WasmLimits {
-            max_queued_bytes_global: 4,
-            max_queued_bytes_per_session: 4,
-            max_queued_bytes_per_stream: 4,
-            ..WasmLimits::default()
-        };
-        let saddr: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let a_addr: SocketAddr = "127.0.0.1:1001".parse().unwrap();
-        let b_addr: SocketAddr = "127.0.0.1:1002".parse().unwrap();
-
-        let mut server = WtEndpoint::new_with_limits(true, saddr, a_addr, limits.clone()).unwrap();
-        let mut client_a =
-            WtEndpoint::new_with_limits(false, a_addr, saddr, limits.clone()).unwrap();
-        let mut client_b = WtEndpoint::new_with_limits(false, b_addr, saddr, limits).unwrap();
-        client_a.connect("localhost");
-        client_b.connect("localhost");
-
-        fn drain2(from: &mut WtEndpoint) -> Vec<(SocketAddr, Vec<u8>)> {
-            let mut pkts = Vec::new();
-            from.poll_transmits(Instant::now(), &mut pkts);
-            pkts.into_iter().map(|(p, dest)| (dest, p)).collect()
-        }
-
-        let mut conn_a = None;
-        let mut conn_b = None;
-        let mut client_a_established = false;
-        let mut client_b_established = false;
-        let mut stream_a = None;
-        let mut stream_b = None;
-        let mut opened = false;
-
-        for _ in 0..3_000 {
-            let mut wire: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
-            for (dest, p) in drain2(&mut client_a) {
-                wire.push((a_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut client_b) {
-                wire.push((b_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut server) {
-                wire.push((saddr, dest, p));
-            }
-            let moved = !wire.is_empty();
-            for (src, dest, p) in wire {
-                let now = Instant::now();
-                if dest == saddr {
-                    server.recv(now, src, &p);
-                } else if dest == a_addr {
-                    client_a.recv(now, src, &p);
-                } else if dest == b_addr {
-                    client_b.recv(now, src, &p);
-                }
-            }
-            while let Some(event) = server.poll_event() {
-                if let WtEvent::SessionEstablished { conn } = event {
-                    if conn_a.is_none() {
-                        conn_a = Some(conn);
-                    } else if Some(conn) != conn_a {
-                        conn_b = Some(conn);
-                    }
-                }
-            }
-            while let Some(event) = client_a.poll_event() {
-                match event {
-                    WtEvent::SessionEstablished { .. } => client_a_established = true,
-                    WtEvent::StreamOpened { stream, .. } => stream_a = Some(stream),
-                    _ => {}
-                }
-            }
-            while let Some(event) = client_b.poll_event() {
-                match event {
-                    WtEvent::SessionEstablished { .. } => client_b_established = true,
-                    WtEvent::StreamOpened { stream, .. } => stream_b = Some(stream),
-                    _ => {}
-                }
-            }
-            if conn_a.is_some()
-                && conn_b.is_some()
-                && client_a_established
-                && client_b_established
-                && !opened
-            {
-                if let (Some(conn_a), Some(conn_b)) = (conn_a, conn_b) {
-                    assert!(server.open_stream(conn_a, true) >= 0);
-                    assert!(server.open_stream(conn_b, true) >= 0);
-                    opened = true;
-                }
-            }
-            if stream_a.is_some() && stream_b.is_some() {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client_a.handle_timeout(now);
-                client_b.handle_timeout(now);
-            }
-        }
-
-        let stream_a = stream_a.expect("client a stream");
-        let stream_b = stream_b.expect("client b stream");
-        client_a.stream_write(stream_a, b"aaaa");
-
-        let (first_conn, token_a) = 'token_a: loop {
-            let mut wire: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
-            for (dest, p) in drain2(&mut client_a) {
-                wire.push((a_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut client_b) {
-                wire.push((b_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut server) {
-                wire.push((saddr, dest, p));
-            }
-            let moved = !wire.is_empty();
-            for (src, dest, p) in wire {
-                let now = Instant::now();
-                if dest == saddr {
-                    server.recv(now, src, &p);
-                } else if dest == a_addr {
-                    client_a.recv(now, src, &p);
-                } else if dest == b_addr {
-                    client_b.recv(now, src, &p);
-                }
-            }
-            if let Some(encoded) = server.poll_event_encoded() {
-                if let Some((conn, _stream, _fin, data, token)) = decode_stream_data_event(&encoded)
-                {
-                    assert_eq!(data, b"aaaa");
-                    break 'token_a (conn, token);
-                }
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client_a.handle_timeout(now);
-            }
-        };
-        assert!(token_a > 0, "first payload must retain a host token");
-
-        client_b.stream_write(stream_b, b"bbbb");
-        for _ in 0..20 {
-            let mut wire: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
-            for (dest, p) in drain2(&mut client_a) {
-                wire.push((a_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut client_b) {
-                wire.push((b_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut server) {
-                wire.push((saddr, dest, p));
-            }
-            let moved = !wire.is_empty();
-            for (src, dest, p) in wire {
-                let now = Instant::now();
-                if dest == saddr {
-                    server.recv(now, src, &p);
-                } else if dest == a_addr {
-                    client_a.recv(now, src, &p);
-                } else if dest == b_addr {
-                    client_b.recv(now, src, &p);
-                }
-            }
-            assert!(
-                server.poll_event_encoded().is_none(),
-                "global capacity should block the second connection until release"
-            );
-            if !moved {
-                break;
-            }
-        }
-
-        assert!(server.release_host_token(token_a));
-        let encoded = server
-            .poll_event_encoded()
-            .expect("releasing one token should immediately resume the other connection");
-        let (conn, _stream, _fin, data, token_b) =
-            decode_stream_data_event(&encoded).expect("stream data event");
-        assert_ne!(conn, first_conn);
-        assert_eq!(data, b"bbbb");
-        assert!(token_b > 0);
-    }
-
-    #[test]
-    fn wt_uni_stream_oneway() {
-        let (mut server, mut client, cid) = endpoints();
-        let mut server_est = false;
-        let mut client_est = false;
-        let mut opened = false;
-        let mut got: Vec<u8> = Vec::new();
-        let mut got_fin = false;
-        for _ in 0..600 {
-            let a = relay_client_to_server(&mut client, &mut server);
-            let b = relay_server_to_client(&mut server, &mut client);
-            while let Some(ev) = server.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => server_est = true,
-                    WtEvent::StreamData { data, fin, .. } => {
-                        got.extend_from_slice(&data);
-                        if fin {
-                            got_fin = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client.poll_event() {
-                if let WtEvent::SessionEstablished { .. } = ev {
-                    client_est = true;
-                }
-            }
-            if server_est && client_est && !opened {
-                let s = client.open_stream(cid, false);
-                assert!(s >= 0);
-                client.stream_write(s as u32, b"uni-msg");
-                client.stream_finish(s as u32);
-                opened = true;
-            }
-            if got_fin {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert_eq!(got, b"uni-msg");
-        assert!(got_fin, "uni stream should signal FIN");
-    }
-
-    /// Two clients at distinct source addresses share one server endpoint. Each
-    /// must complete its own handshake + WT session, get ITS OWN datagram echoed
-    /// back, and never observe the other client's payload (routing isolation).
-    #[test]
-    fn multi_client_datagram_isolation() {
-        let saddr: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let a_addr: SocketAddr = "127.0.0.1:1001".parse().unwrap();
-        let b_addr: SocketAddr = "127.0.0.1:1002".parse().unwrap();
-
-        let mut server = WtEndpoint::new(true, saddr, a_addr).unwrap();
-        let mut client_a = WtEndpoint::new(false, a_addr, saddr).unwrap();
-        let mut client_b = WtEndpoint::new(false, b_addr, saddr).unwrap();
-        let cid_a = client_a.connect("localhost") as u32;
-        let cid_b = client_b.connect("localhost") as u32;
-
-        // Drain one endpoint (located at `from_addr`) into `(from_addr, dest, pkt)`
-        // records so the switch below can route by destination without overlapping
-        // mutable borrows of the endpoints.
-        fn drain(from: &mut WtEndpoint, _from_addr: SocketAddr) -> Vec<(SocketAddr, Vec<u8>)> {
-            let mut pkts = Vec::new();
-            from.poll_transmits(Instant::now(), &mut pkts);
-            pkts.into_iter().map(|(p, dest)| (dest, p)).collect()
-        }
-
-        let mut a_est = false;
-        let mut b_est = false;
-        let mut a_got: Vec<Vec<u8>> = Vec::new();
-        let mut b_got: Vec<Vec<u8>> = Vec::new();
-        let mut a_sent = false;
-        let mut b_sent = false;
-        // Keep pumping a while after both echoes arrive to catch LATE cross-talk.
-        let mut linger = 0u32;
-
-        for _ in 0..1200 {
-            // Collect everything emitted this tick, then deliver by destination.
-            let mut wire: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
-            for (dest, p) in drain(&mut client_a, a_addr) {
-                wire.push((a_addr, dest, p));
-            }
-            for (dest, p) in drain(&mut client_b, b_addr) {
-                wire.push((b_addr, dest, p));
-            }
-            for (dest, p) in drain(&mut server, saddr) {
-                wire.push((saddr, dest, p));
-            }
-            let moved = !wire.is_empty();
-            for (src, dest, p) in wire {
-                let now = Instant::now();
-                if dest == saddr {
-                    server.recv(now, src, &p);
-                } else if dest == a_addr {
-                    client_a.recv(now, src, &p);
-                } else if dest == b_addr {
-                    client_b.recv(now, src, &p);
-                }
-            }
-
-            // Server echoes each datagram back to the connection it arrived on.
-            while let Some(ev) = server.poll_event() {
-                if let WtEvent::Datagram { conn, data } = ev {
-                    server.send_datagram(conn, &data);
-                }
-            }
-            while let Some(ev) = client_a.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => a_est = true,
-                    WtEvent::Datagram { data, .. } => {
-                        // Isolation must hold on EVERY delivery, not just the last.
-                        assert_ne!(
-                            data.as_slice(),
-                            &b"bravo-payload"[..],
-                            "client A must never see client B's payload"
-                        );
-                        a_got.push(data);
-                    }
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client_b.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => b_est = true,
-                    WtEvent::Datagram { data, .. } => {
-                        assert_ne!(
-                            data.as_slice(),
-                            &b"alpha-payload"[..],
-                            "client B must never see client A's payload"
-                        );
-                        b_got.push(data);
-                    }
-                    _ => {}
-                }
-            }
-
-            if a_est && !a_sent {
-                client_a.send_datagram(cid_a, b"alpha-payload");
-                a_sent = true;
-            }
-            if b_est && !b_sent {
-                client_b.send_datagram(cid_b, b"bravo-payload");
-                b_sent = true;
-            }
-
-            if !a_got.is_empty() && !b_got.is_empty() {
-                linger += 1;
-                if linger > 40 {
-                    break;
-                }
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client_a.handle_timeout(now);
-                client_b.handle_timeout(now);
-            }
-        }
-
-        assert!(a_est, "client A session should establish");
-        assert!(b_est, "client B session should establish");
-        // Each client got exactly its own payload echoed — nothing else, ever.
-        assert_eq!(
-            a_got,
-            vec![b"alpha-payload".to_vec()],
-            "client A gets exactly its own payload echoed"
-        );
-        assert_eq!(
-            b_got,
-            vec![b"bravo-payload".to_vec()],
-            "client B gets exactly its own payload echoed"
-        );
-    }
-
-    /// Per-stream recv state must be dropped once a stream finishes — a
-    /// long-lived connection cycling many streams must not grow endpoint maps.
-    #[test]
-    fn finished_streams_are_pruned() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let cid = client.connect("localhost") as u32;
-
-        let mut server_est = false;
-        let mut client_est = false;
-        let mut fins = 0usize;
-        let mut opened = 0usize;
-        const ROUNDS: usize = 5;
-
-        for _ in 0..4000 {
-            let a = relay_step_addr(&mut client, &mut server, caddr);
-            let b = relay_step_addr(&mut server, &mut client, saddr);
-            while let Some(ev) = server.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => server_est = true,
-                    WtEvent::StreamData { fin: true, .. } => fins += 1,
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client.poll_event() {
-                if let WtEvent::SessionEstablished { .. } = ev {
-                    client_est = true;
-                }
-            }
-            if server_est && client_est && opened < ROUNDS && fins == opened {
-                let s = client.open_stream(cid, false);
-                assert!(s >= 0);
-                client.stream_write(s as u32, b"cycle");
-                client.stream_finish(s as u32);
-                opened += 1;
-            }
-            if fins == ROUNDS {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert_eq!(fins, ROUNDS, "all {ROUNDS} uni streams should FIN");
-
-        // Server side: every finished uni stream's recv state and index entry
-        // must be gone (control/qpack/CONNECT streams legitimately remain).
-        let s_session = server.sessions.values().next().expect("server session");
-        assert!(
-            s_session.in_streams.values().all(|st| st.handle.is_none()),
-            "no finished WT stream should retain recv state"
-        );
-        assert!(
-            server.stream_index.is_empty(),
-            "server stream_index should be empty after all streams finished"
-        );
-        // Client side: finishing a self-opened uni stream releases its index.
-        assert!(
-            client.stream_index.is_empty(),
-            "client stream_index should be empty after finishing its streams"
-        );
-    }
-
-    /// Bidi streams must release their index once BOTH halves finish — the
-    /// uni-only pruning regression left completed bidi streams resident.
-    #[test]
-    fn finished_bidi_streams_are_pruned() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let cid = client.connect("localhost") as u32;
-
-        let mut server_est = false;
-        let mut client_est = false;
-        let mut echoes = 0usize;
-        let mut opened = 0usize;
-        let mut open_handle: Option<u32> = None;
-        const ROUNDS: usize = 3;
-
-        for _ in 0..6000 {
-            let a = relay_step_addr(&mut client, &mut server, caddr);
-            let b = relay_step_addr(&mut server, &mut client, saddr);
-            while let Some(ev) = server.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => server_est = true,
-                    WtEvent::StreamData {
-                        stream,
-                        fin: true,
-                        data,
-                        ..
-                    } => {
-                        // Echo the full request back and finish our half.
-                        server.stream_write(stream, &data);
-                        server.stream_finish(stream);
-                    }
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => client_est = true,
-                    WtEvent::StreamData { fin: true, .. } => {
-                        echoes += 1;
-                        open_handle = None;
-                    }
-                    _ => {}
-                }
-            }
-            if server_est
-                && client_est
-                && opened < ROUNDS
-                && open_handle.is_none()
-                && echoes == opened
-            {
-                let s = client.open_stream(cid, true);
-                assert!(s >= 0);
-                let s = s as u32;
-                client.stream_write(s, b"bidi-cycle");
-                client.stream_finish(s);
-                open_handle = Some(s);
-                opened += 1;
-            }
-            if echoes == ROUNDS {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert_eq!(echoes, ROUNDS, "all {ROUNDS} bidi echoes should complete");
-        assert!(
-            client.stream_index.is_empty(),
-            "client bidi stream_index should be empty after both halves finish"
-        );
-        assert!(
-            server.stream_index.is_empty(),
-            "server bidi stream_index should be empty after both halves finish"
-        );
-        assert!(client.half_done.is_empty() && server.half_done.is_empty());
-    }
-
-    /// Fabricate a server session with one peer-accepted bidi request stream
-    /// carrying `frame` in its OWN buffer, ready for parse_server_connect.
-    fn server_with_request(frame: Vec<u8>) -> (WtEndpoint, ConnectionHandle, StreamId) {
-        use quinn_proto::{Dir, Side};
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let h = ConnectionHandle(0);
-        server.handle_to_id.insert(h, 1);
-        server.id_to_handle.insert(1, h);
-        let stream_id = StreamId::new(Side::Client, Dir::Bi, 0);
-        let mut sess = Session::default();
-        sess.in_streams.insert(
-            stream_id,
-            InStream {
-                kind: Some(h3::frame::HEADERS),
-                is_bidi: true,
-                sid_read: false,
-                handle: None,
-                buf: frame,
-            },
-        );
-        server.sessions.insert(h, sess);
-        (server, h, stream_id)
-    }
-
-    /// A non-CONNECT HEADERS frame on a request stream must be DRAINED (not
-    /// re-parsed forever) and must not establish a session.
-    #[test]
-    fn non_connect_request_is_drained_not_wedged() {
-        let (mut server, h, stream_id) =
-            server_with_request(h3::encode_get_request("localhost", "/nope"));
-        server.parse_server_connect(h, stream_id);
-        let s = server.sessions.get(&h).unwrap();
-        assert!(
-            s.in_streams.get(&stream_id).unwrap().buf.is_empty(),
-            "non-CONNECT frame must be drained, not left to re-parse"
-        );
-        assert!(!s.established, "a GET must not establish a WT session");
-    }
-
-    /// Two request streams parsed independently must not corrupt each other:
-    /// a partial frame on one and a full CONNECT on the other still establishes.
-    #[test]
-    fn concurrent_request_streams_do_not_interleave() {
-        use quinn_proto::{Dir, Side};
-        let (mut server, h, connect_sid) =
-            server_with_request(h3::encode_connect_request("localhost", "/"));
-        // A second request stream holding only a PARTIAL frame (1 byte).
-        let other_sid = StreamId::new(Side::Client, Dir::Bi, 4);
-        server.sessions.get_mut(&h).unwrap().in_streams.insert(
-            other_sid,
-            InStream {
-                kind: Some(h3::frame::HEADERS),
-                is_bidi: true,
-                sid_read: false,
-                handle: None,
-                buf: vec![0x01], // incomplete HEADERS frame
-            },
-        );
-        // Parsing the partial stream must be a no-op (not wedge, not consume).
-        server.parse_server_connect(h, other_sid);
-        // Parsing the CONNECT stream establishes cleanly regardless.
-        server.parse_server_connect(h, connect_sid);
-        let s = server.sessions.get(&h).unwrap();
-        assert!(
-            s.established,
-            "CONNECT establishes despite a concurrent stream"
-        );
-        assert_eq!(s.connect_stream, Some(connect_sid));
-        assert_eq!(
-            s.in_streams.get(&other_sid).unwrap().buf,
-            vec![0x01],
-            "the other stream's partial frame is untouched"
-        );
-    }
-
-    /// A real CONNECT frame establishes and latches the CONNECT stream to the
-    /// stream it arrived on.
-    #[test]
-    fn connect_request_latches_stream_and_establishes() {
-        let (mut server, h, stream_id) =
-            server_with_request(h3::encode_connect_request("localhost", "/"));
-        server.parse_server_connect(h, stream_id);
-        let s = server.sessions.get(&h).unwrap();
-        assert!(s.in_streams.get(&stream_id).unwrap().buf.is_empty());
-        assert!(s.established, "a valid CONNECT must establish the session");
-        assert_eq!(s.connect_stream, Some(stream_id), "CONNECT stream latched");
-        assert!(matches!(
-            server.events.back(),
-            Some(WtEvent::SessionEstablished { conn: 1 })
-        ));
-    }
-
-    /// A client non-200 CONNECT response emits exactly one Closed, marks the
-    /// session closed, and a later 200 on the same connection must NOT
-    /// resurrect it (no SessionEstablished).
-    #[test]
-    fn client_non_200_closes_once_and_blocks_resurrection() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let h = ConnectionHandle(0);
-        client.handle_to_id.insert(h, 3);
-        client.id_to_handle.insert(3, h);
-        // A 404 rejection followed (later) by a stray 200.
-        let sess = Session {
-            connect_self_opened: true,
-            connect_rx: h3::encode_status_response("404"),
-            ..Session::default()
-        };
-        client.sessions.insert(h, sess);
-
-        client.parse_client_connect(h);
-        let closes = client
-            .events
-            .iter()
-            .filter(|e| matches!(e, WtEvent::Closed { conn: 3, .. }))
-            .count();
-        assert_eq!(closes, 1, "non-200 emits exactly one Closed");
-        assert!(client.sessions.get(&h).unwrap().connect_closed);
-        assert!(!client.sessions.get(&h).unwrap().established);
-
-        // A stray 200 arriving afterwards must be ignored (no resurrection).
-        client
-            .sessions
-            .get_mut(&h)
-            .unwrap()
-            .connect_rx
-            .extend_from_slice(&h3::encode_status_response("200"));
-        client.parse_client_connect(h);
-        assert!(!client.sessions.get(&h).unwrap().established);
-        assert!(
-            !client
-                .events
-                .iter()
-                .any(|e| matches!(e, WtEvent::SessionEstablished { .. })),
-            "a late 200 must not establish a discarded session"
-        );
-    }
-
-    /// A client whose CONNECT is never answered (e.g. interim-only or silent
-    /// server, where keep-alives defeat the idle timeout) fails at the connect
-    /// deadline instead of hanging forever.
-    #[test]
-    fn client_connect_deadline_fails_unanswered_handshake() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let h = ConnectionHandle(0);
-        client.handle_to_id.insert(h, 4);
-        client.id_to_handle.insert(4, h);
-        let t0 = Instant::now();
-        let sess = Session {
-            connect_self_opened: true,
-            connect_deadline: Some(t0),
-            ..Session::default()
-        };
-        client.sessions.insert(h, sess);
-
-        // A tick past the deadline must fail the session.
-        client.handle_timeout(t0 + std::time::Duration::from_millis(1));
-        assert!(client.sessions.get(&h).unwrap().connect_closed);
-        assert!(client
-            .events
-            .iter()
-            .any(|e| matches!(e, WtEvent::Closed { conn: 4, .. })));
-    }
-
-    /// A malformed :status (non-numeric, e.g. "1") is a bad response, not an
-    /// interim one: the session is closed rather than waited on.
-    #[test]
-    fn client_malformed_status_closes() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let h = ConnectionHandle(0);
-        client.handle_to_id.insert(h, 6);
-        client.id_to_handle.insert(6, h);
-        let sess = Session {
-            connect_self_opened: true,
-            connect_rx: h3::encode_status_response("1"), // not a valid 1xx
-            ..Session::default()
-        };
-        client.sessions.insert(h, sess);
-
-        client.parse_client_connect(h);
-        assert!(client.sessions.get(&h).unwrap().connect_closed);
-        assert!(!client.sessions.get(&h).unwrap().established);
-    }
-
-    /// An interim 1xx CONNECT response is not fatal: a following 200 still
-    /// establishes.
-    #[test]
-    fn client_interim_1xx_then_200_establishes() {
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let h = ConnectionHandle(0);
-        client.handle_to_id.insert(h, 5);
-        client.id_to_handle.insert(5, h);
-        let mut sess = Session {
-            connect_self_opened: true,
-            connect_rx: h3::encode_status_response("103"),
-            ..Session::default()
-        };
-        sess.connect_rx
-            .extend_from_slice(&h3::encode_status_response("200"));
-        client.sessions.insert(h, sess);
-
-        client.parse_client_connect(h);
-        assert!(
-            client.sessions.get(&h).unwrap().established,
-            "1xx is interim; the following 200 must establish"
-        );
-        assert!(!client.sessions.get(&h).unwrap().connect_closed);
-    }
-
-    /// A peer-accepted uni stream whose first varint is 0x01 (H3 PUSH) must not
-    /// accumulate its bytes without bound.
-    #[test]
-    fn uni_push_stream_bytes_do_not_accumulate() {
-        use quinn_proto::{Dir, Side};
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
-        let h = ConnectionHandle(0);
-        client.handle_to_id.insert(h, 9);
-        client.id_to_handle.insert(9, h);
-        let sid = StreamId::new(Side::Server, Dir::Uni, 0);
-        let mut sess = Session::default();
-        sess.in_streams.insert(
-            sid,
-            InStream {
-                kind: None,
-                is_bidi: false,
-                sid_read: false,
-                handle: None,
-                buf: Vec::new(),
-            },
-        );
-        client.sessions.insert(h, sess);
-
-        // Stream type 0x01 (PUSH) then a lot of payload, across several reads.
-        client.process_in_stream(h, sid, &[0x01], false, Instant::now());
-        for _ in 0..100 {
-            client.process_in_stream(h, sid, &[0xAB; 64], false, Instant::now());
-        }
-        let buf_len = client
-            .sessions
-            .get(&h)
-            .unwrap()
-            .in_streams
-            .get(&sid)
-            .unwrap()
-            .buf
-            .len();
-        assert_eq!(buf_len, 0, "PUSH/unknown uni bytes must be discarded");
-    }
-
-    /// A graceful WT session end (CONNECT-stream FIN) emits exactly one Closed
-    /// event, even though the QUIC connection was still alive.
-    #[test]
-    fn connect_stream_end_emits_closed_once() {
-        use quinn_proto::{Dir, Side};
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
-        let h = ConnectionHandle(0);
-        server.handle_to_id.insert(h, 7);
-        server.id_to_handle.insert(7, h);
-        let sid = StreamId::new(Side::Client, Dir::Bi, 0);
-        let sess = Session {
-            established: true,
-            connect_stream: Some(sid),
-            ..Session::default()
-        };
-        server.sessions.insert(h, sess);
-
-        // No live quinn conn, so the conn.close() is a no-op; the event path is
-        // what we assert.
-        server.close_session_on_connect_end(h);
-        server.close_session_on_connect_end(h); // idempotent
-
-        let closes = server
-            .events
-            .iter()
-            .filter(|e| matches!(e, WtEvent::Closed { conn: 7, .. }))
-            .count();
-        assert_eq!(closes, 1, "exactly one Closed for a graceful session end");
-        assert!(server.sessions.get(&h).unwrap().connect_closed);
-    }
-
-    /// A pinned client connects when the server's cert matches the hash, and
-    /// fails the handshake (Closed, never Connected) against a wrong hash.
-    #[test]
-    fn pinned_cert_client_accepts_matching_and_rejects_wrong_hash() {
-        use base64::Engine as _;
-        let caddr: SocketAddr = CADDR.parse().unwrap();
-        let saddr: SocketAddr = SADDR.parse().unwrap();
-        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
-
-        // Matching hash: session must establish.
-        let (mut server, hash) =
-            WtEndpoint::new_with_generated_cert(caddr, "localhost", 14, now_unix).unwrap();
-        let pinned = crate::verify::PinnedCertVerifier::parse_hashes(&hash).unwrap();
-        let mut client = WtEndpoint::new_client_pinned(saddr, pinned).unwrap();
-        client.connect("localhost");
-        let mut established = false;
-        for _ in 0..2000 {
-            let a = relay_step_addr(&mut client, &mut server, caddr);
-            let b = relay_step_addr(&mut server, &mut client, saddr);
-            while server.poll_event().is_some() {}
-            while let Some(ev) = client.poll_event() {
-                if let WtEvent::SessionEstablished { .. } = ev {
-                    established = true;
-                }
-            }
-            if established {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client.handle_timeout(now);
-            }
-        }
-        assert!(established, "pinned client with matching hash must connect");
-
-        // Wrong hash: handshake must fail with a Closed event, never Connected.
-        let (mut server2, _hash2) =
-            WtEndpoint::new_with_generated_cert(caddr, "localhost", 14, now_unix).unwrap();
-        let wrong = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        let pinned = crate::verify::PinnedCertVerifier::parse_hashes(&wrong).unwrap();
-        let mut client2 = WtEndpoint::new_client_pinned(saddr, pinned).unwrap();
-        client2.connect("localhost");
-        let mut connected = false;
-        let mut closed = false;
-        for _ in 0..2000 {
-            let a = relay_step_addr(&mut client2, &mut server2, caddr);
-            let b = relay_step_addr(&mut server2, &mut client2, saddr);
-            while server2.poll_event().is_some() {}
-            while let Some(ev) = client2.poll_event() {
-                match ev {
-                    WtEvent::Connected { .. } => connected = true,
-                    WtEvent::Closed { .. } => closed = true,
-                    _ => {}
-                }
-            }
-            if closed {
-                break;
-            }
-            if !a && !b {
-                let now = Instant::now();
-                server2.handle_timeout(now);
-                client2.handle_timeout(now);
-            }
-        }
-        assert!(!connected, "wrong pin must never complete the handshake");
-        assert!(closed, "wrong pin must surface a Closed event");
-    }
-
-    /// close_conn tears down exactly one connection: the closed peer sees the
-    /// application code, the other client keeps working, and the closer's own
-    /// state for that connection is pruned.
-    #[test]
-    fn close_conn_is_per_connection_and_carries_code() {
-        let saddr: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let a_addr: SocketAddr = "127.0.0.1:1001".parse().unwrap();
-        let b_addr: SocketAddr = "127.0.0.1:1002".parse().unwrap();
-
-        let mut server = WtEndpoint::new(true, saddr, a_addr).unwrap();
-        let mut client_a = WtEndpoint::new(false, a_addr, saddr).unwrap();
-        let mut client_b = WtEndpoint::new(false, b_addr, saddr).unwrap();
-        client_a.connect("localhost");
-        let cid_b = client_b.connect("localhost") as u32;
-
-        fn drain2(from: &mut WtEndpoint) -> Vec<(SocketAddr, Vec<u8>)> {
-            let mut pkts = Vec::new();
-            from.poll_transmits(Instant::now(), &mut pkts);
-            pkts.into_iter().map(|(p, dest)| (dest, p)).collect()
-        }
-
-        let mut a_est = false;
-        let mut b_est = false;
-        let mut server_conn_a: Option<u32> = None;
-        let mut a_closed_code: Option<u32> = None;
-        let mut b_echo = false;
-        let mut closed_sent = false;
-        let mut b_probed = false;
-
-        for _ in 0..3000 {
-            let mut wire: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
-            for (dest, p) in drain2(&mut client_a) {
-                wire.push((a_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut client_b) {
-                wire.push((b_addr, dest, p));
-            }
-            for (dest, p) in drain2(&mut server) {
-                wire.push((saddr, dest, p));
-            }
-            let moved = !wire.is_empty();
-            for (src, dest, p) in wire {
-                let now = Instant::now();
-                if dest == saddr {
-                    server.recv(now, src, &p);
-                } else if dest == a_addr {
-                    client_a.recv(now, src, &p);
-                } else if dest == b_addr {
-                    client_b.recv(now, src, &p);
-                }
-            }
-
-            while let Some(ev) = server.poll_event() {
-                match ev {
-                    // First establishment is client A (it connected first).
-                    WtEvent::SessionEstablished { conn } if server_conn_a.is_none() => {
-                        server_conn_a = Some(conn);
-                    }
-                    WtEvent::SessionEstablished { .. } => {}
-                    WtEvent::Datagram { conn, data } => {
-                        server.send_datagram(conn, &data);
-                    }
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client_a.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => a_est = true,
-                    WtEvent::Closed { code, .. } => a_closed_code = Some(code),
-                    _ => {}
-                }
-            }
-            while let Some(ev) = client_b.poll_event() {
-                match ev {
-                    WtEvent::SessionEstablished { .. } => b_est = true,
-                    WtEvent::Datagram { .. } => b_echo = true,
-                    _ => {}
-                }
-            }
-
-            if a_est && b_est && !closed_sent {
-                let conn_a = server_conn_a.expect("server saw A's session");
-                server.close_conn(conn_a, 42, b"kick", Instant::now());
-                closed_sent = true;
-            }
-            if a_closed_code.is_some() && !b_probed {
-                // After A is gone, B must still round-trip on the same endpoint.
-                client_b.send_datagram(cid_b, b"still-alive");
-                b_probed = true;
-            }
-            if b_echo {
-                break;
-            }
-            if !moved {
-                let now = Instant::now();
-                server.handle_timeout(now);
-                client_a.handle_timeout(now);
-                client_b.handle_timeout(now);
-            }
-        }
-
-        assert_eq!(
-            a_closed_code,
-            Some(42),
-            "closed client must observe the application close code"
-        );
-        assert!(
-            b_echo,
-            "the other client must keep working after close_conn"
-        );
-        assert_eq!(
-            server.conns.len(),
-            1,
-            "server must prune exactly the closed connection"
-        );
-        let conn_a = server_conn_a.expect("server saw A's session");
-        assert!(
-            matches!(
-                server.rate_limiter.check_connection(
-                    Instant::now(),
-                    conn_a,
-                    RateLimitDimension::DatagramIngress
-                ),
-                Err(ref err)
-                    if err
-                        == "E_INTERNAL: missing peer ownership for datagramsIngress rate limiting"
-            ),
-            "closed connection must fail closed after limiter ownership cleanup"
-        );
-        assert_eq!(
-            server.governor.snapshot(0, None).sessions_active,
-            1,
-            "close_conn must release the closed session reservation"
-        );
-    }
-
-    #[test]
-    fn capacity_wait_queue_deduplicates_and_round_robins_50k_waiters() {
-        let mut queue = CapacityWaitQueue::default();
-        for conn in 1..=50_000 {
-            queue.enqueue(conn);
-            queue.enqueue(conn);
-        }
-
-        assert_eq!(queue.len(), 50_000, "duplicates must collapse");
-        assert_eq!(queue.pop_front(), Some(1));
-        queue.enqueue(1);
-        assert_eq!(queue.pop_front(), Some(2));
-        assert_eq!(queue.pop_front(), Some(3));
-        assert_eq!(queue.len(), 49_998);
-    }
-}
+#[cfg(test)]
+#[path = "endpoint_tests.rs"]
+mod tests;
