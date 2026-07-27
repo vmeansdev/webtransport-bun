@@ -89,8 +89,10 @@ pub(crate) fn spawn_server_instance(
 }
 
 /// Sends shutdown when dropped so panic/early-return paths still stop the accept loop.
+#[cfg(test)]
 pub(crate) struct ShutdownOnDrop(pub Option<watch::Sender<()>>);
 
+#[cfg(test)]
 impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
         if let Some(tx) = self.0.take() {
