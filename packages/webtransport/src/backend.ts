@@ -361,15 +361,21 @@ export function normalizeWasmEndpointOptions(
 		qpackBlockedStreams = 16;
 	} else {
 		if (options.qpackMaxTableCapacity !== undefined) {
-			qpackMaxTableCapacity = normalizeNonNegativeInteger(
-				"qpackMaxTableCapacity",
-				options.qpackMaxTableCapacity,
+			qpackMaxTableCapacity = Math.min(
+				65536,
+				normalizeNonNegativeInteger(
+					"qpackMaxTableCapacity",
+					options.qpackMaxTableCapacity,
+				),
 			);
 		}
 		if (options.qpackBlockedStreams !== undefined) {
-			qpackBlockedStreams = normalizeNonNegativeInteger(
-				"qpackBlockedStreams",
-				options.qpackBlockedStreams,
+			qpackBlockedStreams = Math.min(
+				128,
+				normalizeNonNegativeInteger(
+					"qpackBlockedStreams",
+					options.qpackBlockedStreams,
+				),
 			);
 		} else if (
 			qpackMaxTableCapacity !== undefined &&
@@ -1601,6 +1607,12 @@ export interface WasmConnectOptions {
 	wtMaxSessions?: number;
 	/** Opt-in QUIC TLS 1.3 early data (default false). */
 	enable0Rtt?: boolean;
+	/**
+	 * Share the process-local 0-RTT ticket store across Wasm endpoints in this
+	 * process (default false / per-endpoint). Same semantics as
+	 * {@link WasmEndpointOptions.shareProcess0RttTicketStore}.
+	 */
+	shareProcess0RttTicketStore?: boolean;
 	/**
 	 * Opt-in dynamic QPACK table capacity (bytes). Default 0 (literal-only).
 	 * Prefer {@link enableDynamicQpack} for the 4096/16 preset.
