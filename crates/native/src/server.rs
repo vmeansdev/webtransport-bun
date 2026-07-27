@@ -312,7 +312,7 @@ async fn wait_for_server_drain(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_server_instance(
+pub(crate) fn spawn_server_instance(
     server_id: u64,
     metrics: Arc<ServerMetrics>,
     limits: &Limits,
@@ -385,6 +385,24 @@ pub struct ServerHandle {
 
 #[napi]
 impl ServerHandle {
+    /// Test-only constructor that skips NAPI Env / JS callbacks.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        server_id: u64,
+        port: u32,
+        metrics: Arc<ServerMetrics>,
+        state: ServerRuntimeState,
+    ) -> Self {
+        Self {
+            server_id,
+            port,
+            metrics,
+            session_tx: Mutex::new(None),
+            log_tx: Mutex::new(None),
+            state: Mutex::new(state),
+        }
+    }
+
     #[napi(constructor)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -665,7 +683,8 @@ mod tests {
         parse_tls_resolver_config, parse_unknown_sni_policy, remove_sni_cert_state,
         replace_sni_certs_state, rotate_default_cert, rotate_tls_config,
         set_unknown_sni_policy_state, spawn_server_instance, tls_snapshot_from_state,
-        upsert_sni_cert_state, wait_for_server_drain, CloseDrainTiming, ServerRuntimeState,
+        upsert_sni_cert_state, wait_for_server_drain, CloseDrainTiming, ServerHandle,
+        ServerRuntimeState,
     };
     use crate::limits::Limits;
     use crate::rate_limit::RateLimits;
@@ -917,6 +936,62 @@ mod tests {
             is_addr_in_use_error(&err) || err.contains("failed to create endpoint"),
             "unexpected bind error: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_handle_for_test_covers_tls_close_and_snapshots() {
+        let (cert_pem, key_pem) = self_signed_pem();
+        let server_id = u64::MAX - 31;
+        let metrics = Arc::new(ServerMetrics::default());
+        let (shutdown_tx, _shutdown_rx) = watch::channel(());
+        let handle = ServerHandle::for_test(
+            server_id,
+            9,
+            Arc::clone(&metrics),
+            ServerRuntimeState {
+                shutdown_tx: Some(shutdown_tx),
+                tls_resolver: build_default_dev_resolver().expect("resolver"),
+                explicit_default_cert: true,
+                closed: false,
+            },
+        );
+        assert_eq!(handle.port(), 9);
+        handle
+            .update_cert(cert_pem.clone(), key_pem.clone())
+            .await
+            .expect("update_cert");
+        let tls_json = format!(
+            r#"{{"certPem":{},"keyPem":{},"sni":[],"unknownSniPolicy":"reject"}}"#,
+            serde_json::to_string(&cert_pem).unwrap(),
+            serde_json::to_string(&key_pem).unwrap()
+        );
+        handle.update_tls(tls_json).await.expect("update_tls");
+        let sni_json = format!(
+            r#"[{{"serverName":"x.example","certPem":{},"keyPem":{}}}]"#,
+            serde_json::to_string(&cert_pem).unwrap(),
+            serde_json::to_string(&key_pem).unwrap()
+        );
+        handle
+            .replace_sni_certs(sni_json)
+            .await
+            .expect("replace_sni");
+        handle
+            .upsert_sni_cert("y.example".into(), cert_pem.clone(), key_pem.clone())
+            .await
+            .expect("upsert");
+        handle
+            .set_unknown_sni_policy("default".into())
+            .await
+            .expect("policy");
+        let snap = handle.tls_snapshot().expect("tls snap");
+        assert!(snap.sni_server_names.contains(&"x.example".to_string()));
+        assert_eq!(snap.unknown_sni_policy, "default");
+        handle
+            .remove_sni_cert("x.example".into())
+            .await
+            .expect("remove");
+        let _ = handle.metrics_snapshot().expect("metrics");
+        handle.close().await.expect("close");
     }
 
     #[test]
