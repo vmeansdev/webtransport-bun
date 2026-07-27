@@ -16,12 +16,12 @@ Package version: `1.0.0-rc.1`.
 - `wasm-local-gates`, `package-artifact`, `supply-chain-provenance`
 - `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity`
   (honest timed unit evidence after R4 gap-closure)
+- `auto-review-zero-p0-p4` (round-5 remainingP0P4 empty)
 
 ### Still pending (block promote)
 
 | Claim | Blocker |
 |---|---|
-| `auto-review-zero-p0-p4` | Formal eight-lane round 5 required after gap-closure |
 | `coverage-gates` | endpoint/h3 branch 79.64/78.85 < 80 after gap-closure |
 | `iwa-direct-sockets` | IWA harness assets missing on this host; demoted (no theater) |
 | `native-local-gates`, `runtime-consumers`, `chromium-*`, `fault-matrix` | Not re-run on gap-closure SHA; demoted pending re-verify |
