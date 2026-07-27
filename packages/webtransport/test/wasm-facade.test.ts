@@ -157,8 +157,9 @@ describe("wasm backend facade (P3)", () => {
 				"facade.ready",
 			);
 			const stats = await primary.getStats();
-			expect(stats.bytesSent).toBe(0);
-			expect(stats.bytesReceived).toBe(0);
+			expect(stats.bytesSent).toBeGreaterThan(0);
+			expect(stats.packetsSent).toBeGreaterThan(0);
+			expect(stats.bytesReceived).toBeGreaterThanOrEqual(0);
 
 			await expect(clientMgr.openSession(primarySession.conn)).rejects.toThrow(
 				/E_LIMIT_EXCEEDED/,

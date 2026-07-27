@@ -14,7 +14,7 @@ requires, in addition to evidence gates:
 | Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | **passed** on candidate: opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); peer decoder ICI/section-ack applied to encoder KRC; indexed outbound CONNECT/status when capacity > 0 |
 | Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | **passed** on candidate: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
 | 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | **passed** on candidate for process-local Rust ticket store + `has0Rtt`/`accepted0Rtt` when `enable0Rtt: true` (default false); JS `TicketStoreHost` hydrate/dump bridges opaque process-local vault blobs (pinned-client resume without `shareProcess0RttTicketStore`); durable IndexedDB serialization remains out of scope |
-| Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | **passed** smoke bar on candidate (`WasmClientArgs` 0-RTT/QPACK, session-map, wasm parity). Soft divergences: `allowPooling`/`waitUntilAvailable` accepted-not-implemented; `getStats` zeros |
+| Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | **passed** smoke bar on candidate. Implemented: `allowPooling` endpoint pool, `waitUntilAvailable` with timeout, quinn-backed `getStats`, congestion factories (Cubic/BBR/NewReno), sendGroup/sendOrder scheduler, auto ticket dump + Memory/File/IndexedDB hosts, metricsSnapshot, live TLS/SNI resolver, log/debug hooks, `WasmServerSession` |
 
 These are **1.0 requirements**, not permanent product omissions. Treat
 `docs/release-status.json` as canonical for claim pass/fail.
@@ -45,7 +45,9 @@ These are **1.0 requirements**, not permanent product omissions. Treat
   (0-RTT) is wired here under `enable0Rtt` (`ticket_store.rs`);
   `wasm-0rtt` is claim-passed for the Rust process-local store path and the
   JS `TicketStoreHost` hydrate/dump bridge (opaque in-process vault blobs).
-  Durable IndexedDB / cross-reload ticket serialization remains unfinished.
+  Durable IndexedDB / cross-reload ticket serialization is available via
+  `IndexedDBTicketStoreHost`; Bun/Node file durability via `FileTicketStoreHost`.
+  Tickets auto-dump on manager close when a store is configured.
 
 ## Still out of 1.0 scope (non-goals)
 

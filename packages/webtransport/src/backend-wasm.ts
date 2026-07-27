@@ -105,6 +105,9 @@ export interface WasmModule {
 	wt_stream_stop(eid: number, stream: number, code: number): void;
 	wt_conn_has_0rtt(eid: number, conn: number): boolean;
 	wt_conn_accepted_0rtt(eid: number, conn: number): boolean;
+	wt_conn_stats(eid: number, conn: number): string;
+	wt_tls_snapshot?(eid: number): string;
+	wt_update_tls?(eid: number, configJson: string): string;
 	wt_enable_0rtt(eid: number): boolean;
 	wt_dump_client_ticket(eid: number, serverName: string): Uint8Array;
 	wt_import_client_ticket(
@@ -759,6 +762,74 @@ export class WasmEndpoint {
 	has0Rtt(conn: number): boolean {
 		if (this.closed) return false;
 		return this.wasm.wt_conn_has_0rtt(this.eid, conn);
+	}
+
+	connStats(conn: number): {
+		bytesSent: number;
+		bytesReceived: number;
+		packetsSent: number;
+		packetsReceived: number;
+		datagrams: {
+			droppedIncoming: number;
+			expiredIncoming: number;
+			expiredOutgoing: number;
+			lostOutgoing: number;
+		};
+		smoothedRttMs?: number;
+		error?: string;
+	} | null {
+		if (this.closed) return null;
+		if (typeof this.wasm.wt_conn_stats !== "function") return null;
+		try {
+			return JSON.parse(this.wasm.wt_conn_stats(this.eid, conn)) as {
+				bytesSent: number;
+				bytesReceived: number;
+				packetsSent: number;
+				packetsReceived: number;
+				datagrams: {
+					droppedIncoming: number;
+					expiredIncoming: number;
+					expiredOutgoing: number;
+					lostOutgoing: number;
+				};
+				smoothedRttMs?: number;
+				error?: string;
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	updateTls(configJson: string): string {
+		if (this.closed) {
+			return JSON.stringify({ error: "E_SESSION_CLOSED: endpoint is closed" });
+		}
+		const fn = this.wasm.wt_update_tls;
+		if (typeof fn !== "function") {
+			return JSON.stringify({
+				error: "E_TLS: live TLS resolver unavailable on this endpoint",
+			});
+		}
+		return fn.call(this.wasm, this.eid, configJson);
+	}
+
+	tlsSnapshot(): string {
+		if (this.closed) {
+			return JSON.stringify({
+				unknownSniPolicy: "reject",
+				defaultCertPresent: false,
+				sniNames: [],
+			});
+		}
+		const fn = this.wasm.wt_tls_snapshot;
+		if (typeof fn !== "function") {
+			return JSON.stringify({
+				unknownSniPolicy: "reject",
+				defaultCertPresent: true,
+				sniNames: [],
+			});
+		}
+		return fn.call(this.wasm, this.eid);
 	}
 
 	accepted0Rtt(conn: number): boolean {

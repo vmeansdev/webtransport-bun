@@ -27,9 +27,10 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 - **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless
   you set `shareProcess0RttTicketStore: true` (loopback / same-process resume
   only). Optional `ticketStore` (JS `TicketStoreHost`) hydrates opaque client
-  tickets into the Rust store before connect; callers must invoke
-  `dumpTicketsToHost(authority)` explicitly after NST (close does **not**
-  auto-dump). Durable IndexedDB serialization is still out of scope.
+  tickets into the Rust store before connect. Manager `close()` auto-dumps when
+  a store is configured; `dumpTicketsToHost(authority)` remains available for
+  explicit dump after NST. Hosts: `MemoryTicketStoreHost`, `FileTicketStoreHost`
+  (Bun/Node), `IndexedDBTicketStoreHost` (IWA/browser).
 - **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
   decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
   index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.

@@ -105,3 +105,56 @@ export type WasmNormalizedRateLimits = {
 	datagramsIngressPerSec: number;
 	datagramsIngressBurst: number;
 };
+
+/**
+ * Latency histogram snapshot (Prometheus histogram format). Duplicated here
+ * (rather than imported from index.ts) so the wasm backend never pulls in
+ * index.ts's eager native-addon load; keep in sync with index.ts's copy.
+ */
+export type HistogramSnapshot = {
+	le: number[];
+	cumulativeCount: number[];
+	count: number;
+	sumSecs: number;
+};
+
+/**
+ * Aggregate metrics snapshot shape shared by the native and wasm backends.
+ * See the note on {@link HistogramSnapshot} for why this is duplicated
+ * rather than imported from index.ts.
+ */
+export type MetricsSnapshot = {
+	nowMs: number;
+
+	sessionsActive: number;
+	sessionTasksActive: number;
+	streamTasksActive: number;
+	handshakesInFlight: number;
+	streamsActive: number;
+
+	datagramsIn: number;
+	datagramsOut: number;
+	datagramsDropped: number;
+
+	queuedBytesGlobal: number;
+	backpressureWaitCount: number;
+	backpressureTimeoutCount: number;
+
+	rateLimitedCount: number;
+	limitExceededCount: number;
+	sniCertSelections: number;
+	defaultCertSelections: number;
+	unknownSniRejectedCount: number;
+
+	handshakeLatency?: HistogramSnapshot | null;
+	datagramEnqueueLatency?: HistogramSnapshot | null;
+	streamOpenLatency?: HistogramSnapshot | null;
+};
+
+/** Per-session metrics snapshot shape shared by the native and wasm backends. */
+export type SessionMetricsSnapshot = {
+	datagramsIn: number;
+	datagramsOut: number;
+	streamsActive: number;
+	queuedBytes: number;
+};

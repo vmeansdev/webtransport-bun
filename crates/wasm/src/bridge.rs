@@ -159,6 +159,14 @@ fn parse_enable_0rtt(parsed: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_congestion_control(
+    parsed: &serde_json::Value,
+) -> Result<crate::congestion::CongestionControlMode, String> {
+    crate::congestion::CongestionControlMode::parse(
+        parsed.get("congestionControl").and_then(|v| v.as_str()),
+    )
+}
+
 /// Opt-in process-shared 0-RTT ticket store (loopback). Default false = per-endpoint.
 fn parse_share_process_0rtt_ticket_store(parsed: &serde_json::Value) -> bool {
     parsed
@@ -271,7 +279,11 @@ pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
     }
     let enable_0rtt = parse_enable_0rtt(&parsed);
     let share_tickets = parse_share_process_0rtt_ticket_store(&parsed);
-    let mut ep = match WtEndpoint::new_with_limits_rate_limits_0rtt_and_ticket_share(
+    let congestion = match parse_congestion_control(&parsed) {
+        Ok(v) => v,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    let mut ep = match WtEndpoint::new_with_limits_rate_limits_0rtt_ticket_share_and_cc(
         is_server,
         addr,
         peer,
@@ -279,6 +291,7 @@ pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
         rate_limits,
         enable_0rtt,
         share_tickets,
+        congestion,
     ) {
         Ok(ep) => ep,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
@@ -392,7 +405,11 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
     };
     let enable_0rtt = parse_enable_0rtt(&parsed);
     let share_tickets = parse_share_process_0rtt_ticket_store(&parsed);
-    match WtEndpoint::new_with_generated_cert_with_limits_rate_limits_0rtt_and_ticket_share(
+    let congestion = match parse_congestion_control(&parsed) {
+        Ok(v) => v,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    match WtEndpoint::new_with_generated_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
         peer,
         common_name,
         validity_days,
@@ -401,6 +418,7 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
         rate_limits,
         enable_0rtt,
         share_tickets,
+        congestion,
     ) {
         Ok((mut ep, hash)) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);
@@ -475,13 +493,18 @@ pub fn wt_new_client_with_options(config_json: &str) -> String {
     };
     let enable_0rtt = parse_enable_0rtt(&parsed);
     let share_tickets = parse_share_process_0rtt_ticket_store(&parsed);
-    match WtEndpoint::new_client_pinned_with_limits_rate_limits_0rtt_and_ticket_share(
+    let congestion = match parse_congestion_control(&parsed) {
+        Ok(v) => v,
+        Err(err) => return serde_json::json!({ "error": err }).to_string(),
+    };
+    match WtEndpoint::new_client_pinned_with_limits_rate_limits_0rtt_ticket_share_and_cc(
         peer,
         hashes,
         limits,
         rate_limits,
         enable_0rtt,
         share_tickets,
+        congestion,
     ) {
         Ok(mut ep) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);
@@ -705,6 +728,40 @@ pub fn wt_conn_accepted_0rtt(eid: u32, conn: u32) -> bool {
         .ok()
         .flatten()
         .unwrap_or(false)
+}
+
+/// Quinn connection stats JSON for W3C getStats().
+#[wasm_bindgen]
+pub fn wt_conn_stats(eid: u32, conn: u32) -> String {
+    match with_endpoint(eid, |endpoint| endpoint.connection_stats_json(conn)) {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            serde_json::json!({ "error": "E_SESSION_CLOSED: unknown endpoint" }).to_string()
+        }
+        Err(_) => serde_json::json!({ "error": REGISTRY_UNAVAILABLE }).to_string(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn wt_tls_snapshot(eid: u32) -> String {
+    match with_endpoint(eid, |endpoint| endpoint.tls_snapshot_json()) {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            serde_json::json!({ "error": "E_SESSION_CLOSED: unknown endpoint" }).to_string()
+        }
+        Err(_) => serde_json::json!({ "error": REGISTRY_UNAVAILABLE }).to_string(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn wt_update_tls(eid: u32, config_json: &str) -> String {
+    match with_endpoint(eid, |endpoint| endpoint.update_tls_json(config_json)) {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            serde_json::json!({ "error": "E_SESSION_CLOSED: unknown endpoint" }).to_string()
+        }
+        Err(_) => serde_json::json!({ "error": REGISTRY_UNAVAILABLE }).to_string(),
+    }
 }
 
 #[wasm_bindgen]
