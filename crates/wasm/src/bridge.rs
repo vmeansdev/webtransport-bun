@@ -169,6 +169,10 @@ fn parse_share_process_0rtt_ticket_store(parsed: &serde_json::Value) -> bool {
 
 /// Opt-in dynamic QPACK SETTINGS. Default disabled (0/0).
 /// `enableDynamicQpack: true` aliases `{4096, 16}`.
+/// Capacity/blocked streams are hard-capped to bound allocator abuse.
+const QPACK_MAX_TABLE_CAPACITY_HARD_CAP: u64 = 65_536;
+const QPACK_MAX_BLOCKED_STREAMS_HARD_CAP: u64 = 128;
+
 fn parse_qpack_settings(parsed: &serde_json::Value) -> h3::QpackLocalSettings {
     if parsed
         .get("enableDynamicQpack")
@@ -180,17 +184,20 @@ fn parse_qpack_settings(parsed: &serde_json::Value) -> h3::QpackLocalSettings {
     let capacity = parsed
         .get("qpackMaxTableCapacity")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(QPACK_MAX_TABLE_CAPACITY_HARD_CAP);
     let blocked = if capacity > 0 {
         parsed
             .get("qpackBlockedStreams")
             .and_then(|v| v.as_u64())
             .unwrap_or(16)
+            .min(QPACK_MAX_BLOCKED_STREAMS_HARD_CAP)
     } else {
         parsed
             .get("qpackBlockedStreams")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
+            .min(QPACK_MAX_BLOCKED_STREAMS_HARD_CAP)
     };
     h3::QpackLocalSettings {
         max_table_capacity: capacity,
