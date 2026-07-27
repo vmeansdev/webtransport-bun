@@ -14,7 +14,7 @@ requires, in addition to evidence gates:
 | Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | **passed** on candidate: opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); peer decoder ICI/section-ack applied to encoder KRC; indexed outbound CONNECT/status when capacity > 0 |
 | Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | **passed** on candidate: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
 | 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | **passed** on candidate for process-local Rust ticket store + `has0Rtt`/`accepted0Rtt` when `enable0Rtt: true` (default false); JS `TicketStoreHost` is **not** bridged to rustls yet (export-only / future durable host) |
-| Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | still **pending**: foundation/options only; product-complete parity smoke incomplete |
+| Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | **passed** smoke bar: `WasmClientArgs` 0-RTT/QPACK passthrough, facade/`WasmWebTransport` multi-session datagram isolation + over-cap, wasm parity baseline/options/compat. Soft divergences: `allowPooling`/`waitUntilAvailable` accepted not implemented; `getStats` zeros |
 
 These are **1.0 requirements**, not permanent product omissions. Treat
 `docs/release-status.json` as canonical for claim pass/fail.

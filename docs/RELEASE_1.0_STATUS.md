@@ -25,7 +25,7 @@ Package version: `1.0.0-rc.1`.
 | Claim | Blocker |
 |---|---|
 | `coverage-gates` | Demoted: wasm `endpoint.rs` / `h3.rs` llvm-cov floors below 90/90/80 after QPACK/CONNECT work |
-| `wasm-facade-parity` | Foundation/options only; product parity smoke incomplete |
+| `wasm-facade-parity` | Smoke bar passed: session-map + wasm parity baseline/options/compat; pooling/waitUntilAvailable/`getStats` soft divergences documented |
 | `iwa-direct-sockets` | Needs IWA origin/bundle + Chrome Direct Sockets run |
 | `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
 | `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |

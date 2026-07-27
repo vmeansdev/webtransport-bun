@@ -1796,6 +1796,16 @@ export interface WasmClientArgs {
 	limits?: WasmLimitsOptions;
 	rateLimits?: WasmRateLimitOptions;
 	wtMaxSessions?: number;
+	/** Opt-in QUIC TLS 1.3 early data (default false). */
+	enable0Rtt?: boolean;
+	/**
+	 * Share the process-local 0-RTT ticket store across Wasm endpoints in this
+	 * process. Same semantics as {@link WasmConnectOptions.shareProcess0RttTicketStore}.
+	 */
+	shareProcess0RttTicketStore?: boolean;
+	qpackMaxTableCapacity?: number;
+	qpackBlockedStreams?: number;
+	enableDynamicQpack?: boolean;
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;
 	congestionControl?: "default" | "throughput" | "low-latency";
@@ -1833,6 +1843,11 @@ export async function createUnifiedClient(
 				limits: args.limits,
 				rateLimits: args.rateLimits,
 				wtMaxSessions: args.wtMaxSessions,
+				enable0Rtt: args.enable0Rtt,
+				shareProcess0RttTicketStore: args.shareProcess0RttTicketStore,
+				qpackMaxTableCapacity: args.qpackMaxTableCapacity,
+				qpackBlockedStreams: args.qpackBlockedStreams,
+				enableDynamicQpack: args.enableDynamicQpack,
 				allowPooling: args.allowPooling,
 				requireUnreliable: args.requireUnreliable,
 				congestionControl: args.congestionControl,
