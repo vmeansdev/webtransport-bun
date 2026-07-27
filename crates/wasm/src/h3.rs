@@ -602,7 +602,8 @@ pub fn encode_connect_response_ok_with(
     encode_status_response_with(encoder, "200")
 }
 
-fn encode_field_section_prefix(
+/// Encode Required Insert Count + Base prefix for a field section (RFC 9204 §4.5.1).
+pub(crate) fn encode_field_section_prefix(
     ric: u64,
     base: u64,
     max_capacity: usize,
@@ -1626,5 +1627,74 @@ mod tests {
         assert_eq!(qpack_int_decode(&[0xff, 0x00], 8), Some((255, 2)));
         // 255 + (1 << 0) = 256.
         assert_eq!(qpack_int_decode(&[0xff, 0x01], 8), Some((256, 2)));
+    }
+
+    #[test]
+    fn insert_with_ack_floor_refuses_oversized_and_overflow() {
+        let mut table = DynamicTable::new(68);
+        table.set_capacity(34).unwrap();
+        table.insert("a".into(), "b".into()).unwrap();
+        // Second same-size insert would evict abs=1; floor 0 refuses.
+        assert_eq!(
+            table.insert_with_ack_floor("c".into(), "d".into(), Some(0)),
+            Err(QpackError::Invalid)
+        );
+        // Entry larger than capacity with floor blocking eviction.
+        assert_eq!(
+            table.insert_with_ack_floor("too".into(), "big-for-cap".into(), Some(0)),
+            Err(QpackError::Invalid)
+        );
+        // Empty + oversized clears via usize::MAX path when floor allows.
+        let mut empty = DynamicTable::new(10);
+        empty.set_capacity(10).unwrap();
+        assert_eq!(
+            empty.insert_with_ack_floor("abcdefghij".into(), "klmnopqrst".into(), None),
+            Ok(())
+        );
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn decode_field_section_post_base_and_s_bit_prefix() {
+        let mut enc = QpackEncoder::new(4096);
+        let mut dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 16,
+        });
+        let mut stream = enc.set_capacity_instruction(4096).unwrap();
+        stream.extend(enc.insert_literal_instruction("n1", "v1").unwrap());
+        stream.extend(enc.insert_literal_instruction("n2", "v2").unwrap());
+        feed_encoder_stream(&mut dec, &stream).unwrap();
+        assert_eq!(dec.table().insert_count(), 2);
+
+        // RIC=2, Base=1 (S=1, delta = ric-base-1 = 0), then post-base indexed 0 → abs 2.
+        let mut section = Vec::new();
+        encode_field_section_prefix(2, 1, 4096, &mut section).unwrap();
+        qpack_int(0x10, 4, 0, &mut section); // post-base indexed
+        let (hdrs, ric) = decode_field_section(&section, &dec).unwrap();
+        assert_eq!(ric, 2);
+        assert_eq!(hdrs, vec![("n2".into(), "v2".into())]);
+
+        // Post-base literal name reference + value.
+        let mut section2 = Vec::new();
+        encode_field_section_prefix(2, 1, 4096, &mut section2).unwrap();
+        qpack_int(0x00, 3, 0, &mut section2); // post-base name ref → n2
+        qpack_int(0x00, 7, 2, &mut section2); // value len 2, no huffman
+        section2.extend_from_slice(b"zz");
+        let (hdrs2, _) = decode_field_section(&section2, &dec).unwrap();
+        assert_eq!(hdrs2, vec![("n2".into(), "zz".into())]);
+
+        // Literal name-ref dynamic: base=2, relative 0 → abs 1 → n1.
+        let mut section3 = Vec::new();
+        encode_field_section_prefix(2, 2, 4096, &mut section3).unwrap();
+        qpack_int(0x40, 4, 0, &mut section3);
+        qpack_int(0x00, 7, 1, &mut section3);
+        section3.push(b'x');
+        let (hdrs3, _) = decode_field_section(&section3, &dec).unwrap();
+        assert_eq!(hdrs3, vec![("n1".into(), "x".into())]);
+
+        assert_eq!(encode_required_insert_count(0, 0), Some(0));
+        assert_eq!(encode_required_insert_count(1, 0), None);
+        assert_eq!(encode_required_insert_count(1, 31), None);
     }
 }
