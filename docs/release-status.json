@@ -88,6 +88,20 @@
 			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
 			"notes": "Playwright chromium-webtransport-wasm 5/5"
+		},
+		{
+			"id": "local-chromium-native-interop-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/chromium-native-interop.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"status": "passed",
+			"notes": "Playwright chromium-webtransport 19/19 darwin/arm64"
+		},
+		{
+			"id": "local-fault-matrix-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/fault-matrix.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"status": "passed",
+			"notes": "fault matrix 1/1"
 		}
 	],
 	"claims": [
@@ -131,8 +145,10 @@
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-chromium-native-interop-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
@@ -157,8 +173,10 @@
 		{
 			"id": "fault-matrix",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-fault-matrix-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
