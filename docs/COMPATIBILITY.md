@@ -56,8 +56,9 @@ Constraints that apply regardless of environment:
   without downtime.
 - **Host glue**: the consumer supplies packet I/O and timer driving; shipped
   adapters cover Direct Sockets, Bun UDP, and in-memory testing.
-- **API surface**: no `u64`/`BigInt` crosses the wasm boundary (handles are
-  `u32`, sizes are `f64`), so no BigInt polyfill or serialization caveats.
+- **API surface**: connection/stream handles stay `u32` and sizes stay `f64`.
+  Session demux uses `u64`/`bigint` (`session_id` on WtEvent and session-scoped
+  APIs); consumers must accept BigInt for those fields.
 - **Unsupported options fail loudly**: options that are not yet supported on
   wasm fail with stable errors (never silently ignored). Coupled 1.0 requires
   facade parity (`wasm-facade-parity`) so W3C-shaped options converge with the

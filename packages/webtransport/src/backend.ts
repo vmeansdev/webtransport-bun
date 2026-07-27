@@ -97,6 +97,12 @@ export type WasmEndpointOptions = {
 	/** Enable QUIC 0-RTT / early data when the wasm module supports it. */
 	enable0Rtt?: boolean;
 	/**
+	 * When `enable0Rtt` is true, share one process-local ticket store across
+	 * endpoints (loopback / same-process resume). Default false = isolated
+	 * per-endpoint stores (safer for multi-tenant hosts).
+	 */
+	shareProcess0RttTicketStore?: boolean;
+	/**
 	 * Opt-in dynamic QPACK table capacity (bytes). Default 0 (literal-only).
 	 * Prefer {@link enableDynamicQpack} for the 4096/16 preset.
 	 */
@@ -114,6 +120,7 @@ export type WasmNormalizedEndpointOptions = {
 	wtMaxSessions?: number;
 	/** Present only when the caller set {@link WasmEndpointOptions.enable0Rtt}. */
 	enable0Rtt?: boolean;
+	shareProcess0RttTicketStore?: boolean;
 	qpackMaxTableCapacity?: number;
 	qpackBlockedStreams?: number;
 	enableDynamicQpack?: boolean;
@@ -338,6 +345,10 @@ export function normalizeWasmEndpointOptions(
 	if (options.enable0Rtt !== undefined) {
 		enable0Rtt = Boolean(options.enable0Rtt);
 	}
+	let shareProcess0RttTicketStore: boolean | undefined;
+	if (options.shareProcess0RttTicketStore !== undefined) {
+		shareProcess0RttTicketStore = Boolean(options.shareProcess0RttTicketStore);
+	}
 
 	const enableDynamicQpack =
 		options.enableDynamicQpack === undefined
@@ -373,6 +384,9 @@ export function normalizeWasmEndpointOptions(
 		rateLimits,
 		...(wtMaxSessions === undefined ? {} : { wtMaxSessions }),
 		...(enable0Rtt === undefined ? {} : { enable0Rtt }),
+		...(shareProcess0RttTicketStore === undefined
+			? {}
+			: { shareProcess0RttTicketStore }),
 		...(qpackMaxTableCapacity === undefined ? {} : { qpackMaxTableCapacity }),
 		...(qpackBlockedStreams === undefined ? {} : { qpackBlockedStreams }),
 		...(enableDynamicQpack === undefined ? {} : { enableDynamicQpack }),
@@ -1004,6 +1018,8 @@ const PENDING_SESSION_ID = -1n;
 export class WasmTransportManager {
 	readonly endpoint: WasmEndpoint;
 	private sessions = new Map<string, WasmSession>();
+	/** Keys for secondary opens that failed before SessionEstablished. */
+	private failedPendingOpens = new Set<string>();
 	/** stream handle → sessionId for demux of stream-data/reset/stopped. */
 	private streamSessionIds = new Map<number, bigint>();
 	private streams = new Map<number, WasmStream>();
@@ -1101,6 +1117,9 @@ export class WasmTransportManager {
 				if (s) {
 					s._markClosed({ code, reason: detail || undefined }, detail);
 					this.sessions.delete(key);
+				} else {
+					// Secondary CONNECT failed/timed out before establish.
+					this.failedPendingOpens.add(key);
 				}
 				for (const [handle, sid] of [...this.streamSessionIds]) {
 					if (sid === sessionId) {
@@ -1403,9 +1422,19 @@ export class WasmTransportManager {
 		}
 		// Wait until SessionEstablished demux creates/marks the session.
 		const key = sessionKey(conn, sid);
+		this.failedPendingOpens.delete(key);
 		const deadline = Date.now() + this.options.limits.handshakeTimeoutMs;
 		while (Date.now() < deadline) {
 			this.endpoint.pump();
+			if (this.failedPendingOpens.has(key)) {
+				this.failedPendingOpens.delete(key);
+				const detail = this.endpoint.takeLastError();
+				throw wasmOperationError(
+					detail,
+					E_SESSION_CLOSED,
+					"openSession CONNECT failed",
+				);
+			}
 			const s = this.sessions.get(key);
 			if (s?.ready) {
 				await s.ready;
@@ -1413,6 +1442,13 @@ export class WasmTransportManager {
 			}
 			await new Promise((r) => setTimeout(r, 1));
 		}
+		// Abort stranded Rust pending CONNECT so buffers/streams do not leak.
+		try {
+			this.endpoint.closeSession(conn, sid, 0, "openSession timeout");
+		} catch {
+			/* best-effort */
+		}
+		this.failedPendingOpens.delete(key);
 		throw new WebTransportError(
 			E_HANDSHAKE_TIMEOUT,
 			"openSession timed out waiting for CONNECT 200",

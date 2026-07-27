@@ -92,6 +92,19 @@ case "$MODE" in
       --target nodejs --out-name webtransport_wasm
     wasm-bindgen "$WASM" --out-dir ../../packages/webtransport/wasm-dist/web \
       --target web --out-name webtransport_wasm
+    # Scope nodejs glue as CommonJS under the package's root `"type": "module"`.
+    printf '%s\n' '{"private":true,"type":"commonjs"}' \
+      > ../../packages/webtransport/wasm-dist/node/package.json
+    # Provenance marker (eventWireVersion 2 = session_id + SessionClosed tag 9).
+    cat > ../../packages/webtransport/wasm-dist/PRODUCTION_BUILD.json <<'EOF'
+{
+  "schemaVersion": 1,
+  "profile": "release",
+  "devInsecure": false,
+  "targets": ["nodejs", "web"],
+  "eventWireVersion": 2
+}
+EOF
     echo "[build-wasm] done -> packages/webtransport/wasm-dist/{node,web}"
     ;;
   *)

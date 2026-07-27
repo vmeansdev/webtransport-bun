@@ -168,9 +168,9 @@ function decodeVarintBig(
 	return [v, off + len];
 }
 
-function requireSafeSessionId(sessionId: bigint): bigint {
+function requireSafeSessionId(sessionId: bigint): bigint | null {
 	if (sessionId < 0n || sessionId > BigInt(Number.MAX_SAFE_INTEGER)) {
-		throw new RangeError("sessionId exceeds JavaScript safe integer range");
+		return null;
 	}
 	return sessionId;
 }
@@ -234,10 +234,12 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 		case EVENT.SESSION_ESTABLISHED: {
 			const sid = decodeVarintBig(ev, off);
 			if (!sid) return null;
+			const sessionId = requireSafeSessionId(sid[0]);
+			if (sessionId == null) return null;
 			return {
 				type: "session-established",
 				conn,
-				sessionId: requireSafeSessionId(sid[0]),
+				sessionId,
 			};
 		}
 		case EVENT.DATAGRAM: {
@@ -255,10 +257,12 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 				off < ev.length ? decodeVarintSafe(ev, off) : null;
 			if (off < ev.length && !hostTokenResult) return null;
 			const hostToken = hostTokenResult?.[0];
+			const sessionId = requireSafeSessionId(sid[0]);
+			if (sessionId == null) return null;
 			return {
 				type: "datagram",
 				conn,
-				sessionId: requireSafeSessionId(sid[0]),
+				sessionId,
 				payload,
 				hostToken: hostToken && hostToken > 0 ? hostToken : undefined,
 			};
@@ -274,10 +278,12 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			off = sid[1];
 			const codeResult = decodeVarintSafe(ev, off);
 			if (!codeResult) return null;
+			const sessionId = requireSafeSessionId(sid[0]);
+			if (sessionId == null) return null;
 			return {
 				type: "session-closed",
 				conn,
-				sessionId: requireSafeSessionId(sid[0]),
+				sessionId,
 				code: codeResult[0],
 			};
 		}
@@ -290,10 +296,12 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			let stream: number;
 			[stream, off] = streamResult;
 			if (off >= ev.length) return null;
+			const sessionId = requireSafeSessionId(sid[0]);
+			if (sessionId == null) return null;
 			return {
 				type: "stream-opened",
 				conn,
-				sessionId: requireSafeSessionId(sid[0]),
+				sessionId,
 				stream,
 				bidi: (ev[off] ?? 0) === 1,
 			};
@@ -493,6 +501,8 @@ export interface WasmEndpointConstructorOptions {
 	};
 	/** Opt-in QUIC TLS 1.3 early data (0-RTT). Default false. */
 	enable0Rtt?: boolean;
+	/** Opt-in process-shared 0-RTT ticket store. Default false. */
+	shareProcess0RttTicketStore?: boolean;
 	/** Optional SETTINGS_WT_MAX_SESSIONS (forwarded to the Rust bridge). */
 	wtMaxSessions?: number;
 	qpackMaxTableCapacity?: number;

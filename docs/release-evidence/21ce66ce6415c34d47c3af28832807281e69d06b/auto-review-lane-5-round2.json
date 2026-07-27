@@ -1,0 +1,15 @@
+{
+  "lane": 5,
+  "round": 2,
+  "verdict": "READY",
+  "findings": [
+    {"id": "L5-P2-0rtt-soft-assert", "severity": "P2", "status": "fixed", "summary": "has0Rtt===true hard assert"},
+    {"id": "L5-P2-qpack-product-tests", "severity": "P2", "status": "fixed", "summary": "wasm↔wasm + Rust ICI/KRC tests"},
+    {"id": "L5-P2-event-fuzz-stale", "severity": "P2", "status": "invalidated", "summary": "fixed earlier on branch"},
+    {"id": "L5-P2-chromium-evidence", "severity": "P2", "status": "invalidated", "summary": "claim rebind follow-on"},
+    {"id": "L5-P2-coverage-unrebound", "severity": "P2", "status": "invalidated", "summary": "claim rebind follow-on"},
+    {"id": "L5-P3-multisession-edges", "severity": "P3", "status": "invalidated", "summary": "covered by product tests"},
+    {"id": "L5-P3-unbounded-awaits", "severity": "P3", "status": "fixed", "summary": "redundant ready await removed"},
+    {"id": "L5-P3-fault-soak", "severity": "P3", "status": "invalidated", "summary": "claim rebind follow-on"}
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "lane": 6,
+  "round": 2,
+  "verdict": "READY",
+  "findings": [
+    {"id": "L6-P2-wire-provenance", "severity": "P2", "status": "fixed", "summary": "eventWireVersion:2"},
+    {"id": "L6-P2-claim-drift", "severity": "P2", "status": "fixed", "summary": "release-status/OPERATIONS QPACK notes updated"},
+    {"id": "L6-P3-open-session-f64", "severity": "P3", "status": "invalidated", "summary": "deferred follow-on"},
+    {"id": "L6-P4-testplan", "severity": "P4", "status": "invalidated", "summary": "deferred follow-on"}
+  ]
+}

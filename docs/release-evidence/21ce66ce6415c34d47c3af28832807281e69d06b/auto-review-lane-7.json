@@ -1,0 +1,13 @@
+{
+  "lane": 7,
+  "agent": "2c1fd9e1-ed84-4ed0-9cbb-91ae59ee7b65",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "L7-P1-stale-claim-notes", "severity": "P1", "summary": "release-status notes lag landed ACK/TicketStoreHost exports"},
+    {"id": "L7-P1-ticketstore-unwired", "severity": "P1", "summary": "TicketStoreHost advertised but not bridged to rustls"},
+    {"id": "L7-P1-ops-docs-gap", "severity": "P1", "summary": "OPERATIONS/METRICS omit new footguns"},
+    {"id": "L7-P1-shared-ticket-store", "severity": "P1", "summary": "process-global 0-RTT store undocumented cliff"},
+    {"id": "L7-P1-primary-close-quic", "severity": "P1", "summary": "primary close / pressure tears down whole QUIC"},
+    {"id": "L7-P1-no-session-metrics", "severity": "P1", "summary": "no SessionClosed/0-RTT counters in snapshot"}
+  ]
+}

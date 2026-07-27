@@ -1,0 +1,11 @@
+{
+  "lane": 7,
+  "round": 2,
+  "verdict": "READY",
+  "findings": [
+    {"id": "L7-P1-no-session-metrics", "severity": "P1", "status": "fixed", "summary": "wtSessionsActive/sessionClosedCount"},
+    {"id": "L7-P1-stale-claim-notes", "severity": "P1", "status": "fixed", "summary": "QPACK notes match product surface"},
+    {"id": "L7-P2-ops-qpack-literal", "severity": "P2", "status": "fixed", "summary": "OPERATIONS Dynamic QPACK footgun updated"},
+    {"id": "L7-P2-passed-claim-rebind-notes", "severity": "P2", "status": "invalidated", "summary": "separate candidate rebind gate"}
+  ]
+}

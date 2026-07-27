@@ -1,0 +1,21 @@
+{
+  "lane": 8,
+  "agent": "d67ab546-9b1b-4bdb-8713-2ecd2355698a",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "L8-P0-fuzz-stale", "severity": "P0", "summary": "event_encode fuzz pre-session_id wire"},
+    {"id": "L8-P0-ticketstore-theater", "severity": "P0", "summary": "TicketStoreHost security fiction"},
+    {"id": "L8-P0-pending-bypass", "severity": "P0", "summary": "pending max-sessions bypass", "status": "fixed-in-l3-batch"},
+    {"id": "L8-P1-open-before-200", "severity": "P1", "summary": "open_wt_session returns pre-200"},
+    {"id": "L8-P1-deadline-dead", "severity": "P1", "summary": "pending deadline unused", "status": "fixed-in-l3-batch"},
+    {"id": "L8-P1-qpack-half", "severity": "P1", "summary": "peer decoder ICI discarded; outbound literal"},
+    {"id": "L8-P1-secondary-streams", "severity": "P1", "summary": "close_wt_session does not reset session WT streams"},
+    {"id": "L8-P1-shared-store", "severity": "P1", "summary": "process-global ticket store"}
+  ],
+  "claimPass": {
+    "wasm-multi-session": "REJECT",
+    "wasm-0rtt": "REJECT",
+    "wasm-dynamic-qpack": "REJECT",
+    "auto-review-zero-p0-p4": "REJECT"
+  }
+}

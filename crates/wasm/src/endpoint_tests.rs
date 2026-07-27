@@ -14,6 +14,7 @@ fn build_missing_server_crypto_should_return_stable_error_instead_of_panicking()
         WasmLimits::default(),
         WasmRateLimits::default(),
         false,
+        false,
     ) {
         Ok(_) => panic!("missing server crypto must fail closed"),
         Err(error) => error,
@@ -463,6 +464,7 @@ fn incoming_stream_limit_drops_parser_state_instead_of_buffering_untracked_bytes
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -516,6 +518,7 @@ fn incoming_stream_without_owner_mapping_fails_closed_without_allocating_state()
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -1318,6 +1321,7 @@ fn server_with_request(frame: Vec<u8>) -> (WtEndpoint, ConnectionHandle, StreamI
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: frame,
         },
     );
@@ -1357,6 +1361,7 @@ fn concurrent_request_streams_do_not_interleave() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: vec![0x01], // incomplete HEADERS frame
         },
     );
@@ -1412,6 +1417,7 @@ fn two_connect_sessions_succeed_when_max_is_two() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: h3::encode_connect_request("localhost", "/b"),
         },
     );
@@ -1452,6 +1458,7 @@ fn third_connect_rejected_when_max_sessions_is_two() {
                 sid_read: false,
                 wt_session_id: None,
                 handle: None,
+                connect_admitted: false,
                 buf: h3::encode_connect_request("localhost", "/b"),
             },
         );
@@ -1463,6 +1470,7 @@ fn third_connect_rejected_when_max_sessions_is_two() {
                 sid_read: false,
                 wt_session_id: None,
                 handle: None,
+                connect_admitted: false,
                 buf: h3::encode_connect_request("localhost", "/c"),
             },
         );
@@ -1503,6 +1511,7 @@ fn datagram_session_id_demux_isolates_sessions() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: h3::encode_connect_request("localhost", "/b"),
         },
     );
@@ -1695,6 +1704,7 @@ fn uni_push_stream_bytes_do_not_accumulate() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2061,6 +2071,8 @@ fn endpoint_surface_helpers_and_constructor_variants() {
     let snap = server.governor_snapshot_json();
     assert!(snap.contains("sessionsActive"));
     assert!(snap.contains("handshakeTimeoutMs"));
+    assert!(snap.contains("wtSessionsActive"));
+    assert!(snap.contains("sessionClosedCount"));
 
     let hashes = crate::verify::PinnedCertVerifier::parse_hashes(&hash).unwrap();
     let client =
@@ -2201,7 +2213,7 @@ fn emit_stream_reset_and_stopped_helpers_push_events() {
     endpoint.handle_to_id.insert(h, 3);
     endpoint.id_to_handle.insert(3, h);
     let sid = StreamId::new(Side::Client, Dir::Bi, 0);
-    endpoint.index_insert(42, h, sid);
+    endpoint.index_insert(42, h, sid, 0);
 
     endpoint.emit_stream_reset(h, sid, 7);
     endpoint.on_stream_stopped(h, sid, 9);
@@ -2403,6 +2415,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2415,6 +2428,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2427,6 +2441,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2439,6 +2454,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2520,6 +2536,7 @@ fn required_event_slots_for_read_covers_self_bidi_and_missing() {
             sid_read: true,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2531,6 +2548,7 @@ fn required_event_slots_for_read_covers_self_bidi_and_missing() {
             sid_read: true,
             wt_session_id: None,
             handle: Some(3),
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2882,6 +2900,7 @@ fn process_in_stream_rejects_when_handle_space_exhausted() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -2966,6 +2985,7 @@ fn read_stream_none_conn_and_retry_blocked_connects() {
                         sid_read: false,
                         wt_session_id: None,
                         handle: None,
+                        connect_admitted: false,
                         buf: h3::encode_connect_request("localhost", "/"),
                     },
                 );
@@ -3105,7 +3125,7 @@ fn open_stream_and_write_fail_when_quic_conn_missing() {
         Some("E_SESSION_CLOSED: connection missing")
     );
 
-    endpoint.index_insert(7, h, sid);
+    endpoint.index_insert(7, h, sid, 0);
     assert_eq!(endpoint.stream_write(7, b"x"), -1);
     endpoint.stream_finish(7);
     endpoint.stream_reset(7, 1);
@@ -3278,7 +3298,7 @@ fn on_connection_lost_emits_closed_for_timeout_and_skips_local() {
     endpoint.handle_to_id.insert(h, 3);
     endpoint.id_to_handle.insert(3, h);
     let sid = StreamId::new(Side::Client, Dir::Bi, 0);
-    endpoint.index_insert(8, h, sid);
+    endpoint.index_insert(8, h, sid, 0);
     endpoint.paused.insert(8);
     endpoint.sessions.insert(h, Session::default());
 
@@ -3350,7 +3370,7 @@ fn self_bidi_read_outcome_finished_reset_and_open() {
     let mut sess = Session::default();
     sess.self_bidi.insert(sid, 9);
     endpoint.sessions.insert(h, sess);
-    endpoint.index_insert(9, h, sid);
+    endpoint.index_insert(9, h, sid, 0);
     endpoint.paused.insert(9);
 
     endpoint.on_self_bidi_read_outcome(h, sid, 9, 1, ReadOutcome::Open);
@@ -3376,7 +3396,7 @@ fn self_bidi_read_outcome_finished_reset_and_open() {
         .unwrap()
         .self_bidi
         .insert(sid2, 10);
-    endpoint.index_insert(10, h, sid2);
+    endpoint.index_insert(10, h, sid2, 0);
     endpoint.on_self_bidi_read_outcome(h, sid2, 10, 1, ReadOutcome::Finished);
     assert!(!endpoint.sessions[&h].self_bidi.contains_key(&sid2));
 }
@@ -3426,6 +3446,7 @@ fn process_in_stream_rate_limits_server_stream_opens() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -3514,6 +3535,7 @@ fn in_stream_read_limit_covers_classification_branches() {
             sid_read: false,
             wt_session_id: None,
             handle: None,
+            connect_admitted: false,
             buf: Vec::new(),
         },
     );
@@ -3743,4 +3765,228 @@ fn endpoint_branch_helpers_cover_remaining_edges() {
     assert!(!chunk_carries_payload(0));
     assert!(chunk_carries_payload(1));
     assert!(chunk_carries_payload(64));
+}
+
+#[test]
+fn dynamic_qpack_wasm_to_wasm_session_and_peer_ici_krc() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let settings = h3::QpackLocalSettings::default();
+    let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+    let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
+    server.set_qpack_settings(settings);
+    client.set_qpack_settings(settings);
+    let _cid = client.connect("localhost") as u32;
+
+    let mut server_est = false;
+    let mut client_est = false;
+    for _ in 0..400 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = server.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                server_est = true;
+            }
+        }
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                client_est = true;
+            }
+        }
+        if server_est && client_est {
+            break;
+        }
+    }
+    assert!(
+        server_est && client_est,
+        "dynamic QPACK session must establish"
+    );
+
+    // Flush decoder-stream ICI / section-acks so KRC can advance.
+    for _ in 0..64 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+    }
+
+    let client_h = *client.id_to_handle.values().next().expect("client handle");
+    let server_h = *server.id_to_handle.values().next().expect("server handle");
+    let client_enc = &client.sessions[&client_h].qpack_encoder;
+    let server_enc = &server.sessions[&server_h].qpack_encoder;
+    assert!(
+        client_enc.table().insert_count() > 0,
+        "client must emit dynamic inserts for CONNECT"
+    );
+    assert!(
+        server_enc.table().insert_count() > 0,
+        "server must emit dynamic inserts for 200"
+    );
+    assert!(
+        client_enc.known_received_count() > 0,
+        "peer ICI must advance client encoder KRC"
+    );
+    assert!(
+        server_enc.known_received_count() > 0,
+        "section-ack / ICI must advance server encoder KRC"
+    );
+}
+
+#[test]
+fn shared_0rtt_ticket_store_second_connect_has_0rtt() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let limits = WasmLimits::default();
+    let rates = WasmRateLimits::default();
+    let mut server = WtEndpoint::new_with_limits_rate_limits_0rtt_and_ticket_share(
+        true,
+        saddr,
+        caddr,
+        limits.clone(),
+        rates.clone(),
+        true,
+        true,
+    )
+    .unwrap();
+    let mut client = WtEndpoint::new_with_limits_rate_limits_0rtt_and_ticket_share(
+        false, caddr, saddr, limits, rates, true, true,
+    )
+    .unwrap();
+    let cid1 = client.connect("localhost") as u32;
+    assert!(
+        !client.conn_has_0rtt(cid1),
+        "first connect has no ticket yet"
+    );
+
+    let mut server_est = false;
+    let mut client_est = false;
+    for _ in 0..400 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = server.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                server_est = true;
+            }
+        }
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                client_est = true;
+            }
+        }
+        if server_est && client_est {
+            break;
+        }
+    }
+    assert!(server_est && client_est);
+
+    // Flush NewSessionTicket into the shared store via poll_transmits NST rounds.
+    for _ in 0..80 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+    }
+
+    assert!(
+        crate::endpoint::shared_0rtt_client_ticket_count("localhost") > 0,
+        "NST flush must mint a client ticket into the shared store (got {})",
+        crate::endpoint::shared_0rtt_client_ticket_count("localhost")
+    );
+
+    client.close_conn(cid1, 0, b"", Instant::now());
+    for _ in 0..32 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+    }
+    drop(client);
+
+    // Fresh endpoint + shared ClientConfig must still offer 0-RTT.
+    let mut client2 = WtEndpoint::new_with_limits_rate_limits_0rtt_and_ticket_share(
+        false,
+        caddr,
+        saddr,
+        WasmLimits::default(),
+        WasmRateLimits::default(),
+        true,
+        true,
+    )
+    .unwrap();
+    let cid2 = client2.connect("localhost");
+    assert!(cid2 > 0, "second connect must succeed, got {cid2}");
+    let cid2 = cid2 as u32;
+    assert!(
+        client2.conn_has_0rtt(cid2),
+        "shared-store reconnect must offer 0-RTT (tickets={})",
+        crate::endpoint::shared_0rtt_client_ticket_count("localhost")
+    );
+}
+
+#[test]
+fn unlatched_connect_storm_resets_without_unbounded_buffers() {
+    use quinn_proto::{Dir, Side};
+
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+    server.set_wt_max_sessions(2);
+    let h = ConnectionHandle(0);
+    server.handle_to_id.insert(h, 1);
+    server.id_to_handle.insert(1, h);
+    server.sessions.insert(h, Session::default());
+    let _ = server
+        .rate_limiter
+        .attach_connection(1, caddr, Instant::now());
+
+    // Incomplete HEADERS prefixes — never latch as WT sessions, only buffer.
+    let mut incomplete = Vec::new();
+    crate::varint::encode(h3::frame::HEADERS, &mut incomplete);
+    // Declare a large frame length but only send a prefix (tempt unbounded buffer).
+    crate::varint::encode(512 * 1024, &mut incomplete);
+    incomplete.extend(std::iter::repeat_n(0x61u8, 1024));
+
+    for i in 0..6u64 {
+        let sid = StreamId::new(Side::Client, Dir::Bi, i);
+        server.sessions.get_mut(&h).unwrap().in_streams.insert(
+            sid,
+            InStream {
+                kind: None,
+                is_bidi: true,
+                sid_read: false,
+                wt_session_id: None,
+                handle: None,
+                connect_admitted: false,
+                buf: Vec::new(),
+            },
+        );
+        server.process_in_stream(h, sid, &incomplete, false, Instant::now());
+    }
+
+    let sess = &server.sessions[&h];
+    let admitted = sess
+        .in_streams
+        .values()
+        .filter(|st| st.connect_admitted)
+        .count();
+    assert!(
+        admitted <= 2,
+        "unlatched CONNECT admission must stay within wt_max_sessions (got {admitted})"
+    );
+    let max_buf = sess
+        .in_streams
+        .values()
+        .map(|st| st.buf.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_buf <= MAX_H3_FRAME_SIZE as usize,
+        "CONNECT storm must not grow unbounded buffers (max={max_buf})"
+    );
+    // Over-cap streams are retired (RESET path), so in_streams stays bounded.
+    assert!(
+        sess.in_streams.len() <= 2,
+        "rejected CONNECTs must leave in_streams (got {})",
+        sess.in_streams.len()
+    );
 }

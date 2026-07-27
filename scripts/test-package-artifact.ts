@@ -594,6 +594,8 @@ async function finalizeProductionWasm(): Promise<void> {
 		profile: "release",
 		devInsecure: false,
 		targets: ["nodejs", "web"],
+		// WtEvent wire v2: session_id on session-scoped events + SessionClosed tag 9.
+		eventWireVersion: 2,
 	};
 	await writeFile(
 		path.join(wasmDistDir, "PRODUCTION_BUILD.json"),
@@ -622,6 +624,11 @@ async function assertProductionWasm(): Promise<void> {
 	) as Record<string, unknown>;
 	if (marker.profile !== "release" || marker.devInsecure !== false) {
 		throw new Error("WASM production provenance marker is invalid");
+	}
+	if (marker.eventWireVersion !== 2) {
+		throw new Error(
+			`WASM eventWireVersion mismatch: expected 2, got ${String(marker.eventWireVersion)}`,
+		);
 	}
 	const nodePackage = JSON.parse(
 		await readFile(path.join(wasmDistDir, "node", "package.json"), "utf8"),

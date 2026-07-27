@@ -332,21 +332,47 @@ impl Default for QpackDecoder {
 }
 
 /// Encoder-side dynamic table + helpers to emit encoder-stream inserts.
-/// Outbound HEADERS continue to use literals by default (Chromium-safe).
+/// Outbound HEADERS use literals when capacity is 0 (Chromium-safe default).
 #[derive(Debug, Clone)]
 pub struct QpackEncoder {
     table: DynamicTable,
+    /// Inserts the peer has acknowledged via decoder-stream ICI / section acks.
+    known_received_count: u64,
 }
 
 impl QpackEncoder {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             table: DynamicTable::new(max_capacity),
+            known_received_count: 0,
         }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(0)
     }
 
     pub fn table(&self) -> &DynamicTable {
         &self.table
+    }
+
+    pub fn known_received_count(&self) -> u64 {
+        self.known_received_count
+    }
+
+    /// Peer Insert Count Increment (RFC 9204 §4.4.3).
+    pub fn note_peer_ici(&mut self, delta: u64) {
+        self.known_received_count = self.known_received_count.saturating_add(delta);
+        if self.known_received_count > self.table.insert_count() {
+            self.known_received_count = self.table.insert_count();
+        }
+    }
+
+    /// Peer Section Acknowledgement: raise KRC to at least `ric`.
+    pub fn note_section_ack(&mut self, ric: u64) {
+        if ric > self.known_received_count {
+            self.known_received_count = ric.min(self.table.insert_count());
+        }
     }
 
     /// Emit a Set Dynamic Table Capacity instruction and apply it locally.
@@ -375,6 +401,19 @@ impl QpackEncoder {
         Ok(out)
     }
 
+    /// Absolute insert index of a dynamic entry matching name+value, if any.
+    pub fn find_absolute(&self, name: &str, value: &str) -> Option<u64> {
+        let count = self.table.insert_count();
+        for abs in 1..=count {
+            if let Some((n, v)) = self.table.get_absolute(abs) {
+                if n == name && v == value {
+                    return Some(abs);
+                }
+            }
+        }
+        None
+    }
+
     /// Build a field section that references the newest dynamic entry (relative
     /// index 0) with Base = insert_count + 1. Used by unit tests / optional
     /// encoder paths when capacity > 0.
@@ -391,6 +430,134 @@ impl QpackEncoder {
         qpack_int(0x80, 6, 0, &mut out);
         Some(out)
     }
+
+    /// Encode one Indexed Field Line for a dynamic absolute index (Base = insert_count+1).
+    fn encode_dynamic_indexed(&self, abs: u64, base: u64, out: &mut Vec<u8>) -> Option<()> {
+        if abs >= base {
+            return None;
+        }
+        let rel = base - 1 - abs;
+        qpack_int(0x80, 6, rel, out);
+        Some(())
+    }
+}
+
+impl Default for QpackEncoder {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// Result of building an outbound HEADERS frame that may include encoder-stream inserts.
+pub struct EncodedHeaders {
+    pub headers_frame: Vec<u8>,
+    pub encoder_stream: Vec<u8>,
+    /// Required Insert Count for this section (0 when literal-only).
+    pub ric: u64,
+}
+
+/// Ensure capacity + insert `name`/`value` if missing; append encoder-stream bytes.
+fn ensure_dynamic_entry(
+    encoder: &mut QpackEncoder,
+    name: &str,
+    value: &str,
+    encoder_stream: &mut Vec<u8>,
+) -> Result<u64, QpackError> {
+    if let Some(abs) = encoder.find_absolute(name, value) {
+        return Ok(abs);
+    }
+    encoder_stream.extend(encoder.insert_literal_instruction(name, value)?);
+    Ok(encoder.table.insert_count())
+}
+
+/// Build CONNECT request HEADERS, using the dynamic table when capacity > 0.
+pub fn encode_connect_request_with(
+    encoder: &mut QpackEncoder,
+    authority: &str,
+    path: &str,
+) -> Result<EncodedHeaders, QpackError> {
+    if encoder.table.max_capacity() == 0 {
+        return Ok(EncodedHeaders {
+            headers_frame: encode_connect_request(authority, path),
+            encoder_stream: Vec::new(),
+            ric: 0,
+        });
+    }
+    let mut encoder_stream = Vec::new();
+    if encoder.table.insert_count() == 0 {
+        encoder_stream.extend(encoder.set_capacity_instruction(encoder.table.max_capacity())?);
+    }
+    let method = ensure_dynamic_entry(encoder, ":method", "CONNECT", &mut encoder_stream)?;
+    let protocol = ensure_dynamic_entry(encoder, ":protocol", "webtransport", &mut encoder_stream)?;
+    let scheme = ensure_dynamic_entry(encoder, ":scheme", "https", &mut encoder_stream)?;
+    let auth = ensure_dynamic_entry(encoder, ":authority", authority, &mut encoder_stream)?;
+    let path_abs = ensure_dynamic_entry(encoder, ":path", path, &mut encoder_stream)?;
+
+    let insert_count = encoder.table.insert_count();
+    let ric = insert_count;
+    let base = insert_count + 1;
+    let mut fields = Vec::new();
+    encode_field_section_prefix(ric, base, encoder.table.max_capacity(), &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    encoder
+        .encode_dynamic_indexed(method, base, &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    encoder
+        .encode_dynamic_indexed(protocol, base, &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    encoder
+        .encode_dynamic_indexed(scheme, base, &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    encoder
+        .encode_dynamic_indexed(auth, base, &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    encoder
+        .encode_dynamic_indexed(path_abs, base, &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    Ok(EncodedHeaders {
+        headers_frame: frame_wrap(frame::HEADERS, &fields),
+        encoder_stream,
+        ric,
+    })
+}
+
+/// Build a `:status` response, using the dynamic table when capacity > 0.
+pub fn encode_status_response_with(
+    encoder: &mut QpackEncoder,
+    status: &str,
+) -> Result<EncodedHeaders, QpackError> {
+    if encoder.table.max_capacity() == 0 {
+        return Ok(EncodedHeaders {
+            headers_frame: encode_status_response(status),
+            encoder_stream: Vec::new(),
+            ric: 0,
+        });
+    }
+    let mut encoder_stream = Vec::new();
+    if encoder.table.insert_count() == 0 {
+        encoder_stream.extend(encoder.set_capacity_instruction(encoder.table.max_capacity())?);
+    }
+    let status_abs = ensure_dynamic_entry(encoder, ":status", status, &mut encoder_stream)?;
+    let insert_count = encoder.table.insert_count();
+    let ric = insert_count;
+    let base = insert_count + 1;
+    let mut fields = Vec::new();
+    encode_field_section_prefix(ric, base, encoder.table.max_capacity(), &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    encoder
+        .encode_dynamic_indexed(status_abs, base, &mut fields)
+        .ok_or(QpackError::Invalid)?;
+    Ok(EncodedHeaders {
+        headers_frame: frame_wrap(frame::HEADERS, &fields),
+        encoder_stream,
+        ric,
+    })
+}
+
+pub fn encode_connect_response_ok_with(
+    encoder: &mut QpackEncoder,
+) -> Result<EncodedHeaders, QpackError> {
+    encode_status_response_with(encoder, "200")
 }
 
 fn encode_field_section_prefix(
@@ -564,18 +731,29 @@ pub fn encode_insert_count_increment(delta: u64) -> Vec<u8> {
 }
 
 /// Parse peer decoder-stream instructions (acks / cancellations / ICI).
-/// Returns bytes consumed. Trailing partial instructions are left unconsumed.
-pub fn feed_decoder_stream(data: &[u8]) -> Result<(usize, u64 /* ici delta sum */), QpackError> {
+/// Returns bytes consumed, ICI delta sum, and section-ack stream ids.
+pub fn feed_decoder_stream(
+    data: &[u8],
+) -> Result<
+    (
+        usize,
+        u64,      /* ici delta */
+        Vec<u64>, /* section ack sids */
+    ),
+    QpackError,
+> {
     let mut offset = 0usize;
     let mut ici_total = 0u64;
+    let mut section_acks = Vec::new();
     while offset < data.len() {
         let buf = &data[offset..];
         let first = buf[0];
         let consumed = if first & 0x80 != 0 {
             // Section Acknowledgement: 1 stream_id(7+)
-            let Some((_sid, n)) = qpack_int_decode(buf, 7) else {
+            let Some((sid, n)) = qpack_int_decode(buf, 7) else {
                 break;
             };
+            section_acks.push(sid);
             n
         } else if first & 0x40 != 0 {
             // Stream Cancellation: 01 stream_id(6+)
@@ -593,7 +771,7 @@ pub fn feed_decoder_stream(data: &[u8]) -> Result<(usize, u64 /* ici delta sum *
         };
         offset += consumed;
     }
-    Ok((offset, ici_total))
+    Ok((offset, ici_total, section_acks))
 }
 
 /// QPACK integer with an N-bit prefix (RFC 9204 §4.1.1 / RFC 7541 §5.1).
@@ -1149,9 +1327,64 @@ mod tests {
         let ack = encode_section_acknowledgement(0);
         assert!(!ack.is_empty());
         let ici = encode_insert_count_increment(1);
-        let (n, delta) = feed_decoder_stream(&ici).unwrap();
+        let (n, delta, _acks) = feed_decoder_stream(&ici).unwrap();
         assert_eq!(n, ici.len());
         assert_eq!(delta, 1);
+    }
+
+    #[test]
+    fn peer_ici_advances_encoder_known_received_count() {
+        let mut enc = QpackEncoder::new(4096);
+        enc.set_capacity_instruction(4096).unwrap();
+        enc.insert_literal_instruction(":method", "CONNECT")
+            .unwrap();
+        assert_eq!(enc.known_received_count(), 0);
+        enc.note_peer_ici(1);
+        assert_eq!(enc.known_received_count(), 1);
+        // Cap at insert_count.
+        enc.note_peer_ici(99);
+        assert_eq!(enc.known_received_count(), enc.table.insert_count());
+        enc.note_section_ack(enc.table.insert_count());
+        assert_eq!(enc.known_received_count(), enc.table.insert_count());
+    }
+
+    #[test]
+    fn encode_connect_request_with_indexes_when_capacity_nonzero() {
+        let mut enc = QpackEncoder::new(4096);
+        let encoded = encode_connect_request_with(&mut enc, "localhost", "/").unwrap();
+        assert!(encoded.ric > 0);
+        assert!(!encoded.encoder_stream.is_empty());
+
+        let mut dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 16,
+        });
+        let n = feed_encoder_stream(&mut dec, &encoded.encoder_stream).unwrap();
+        assert_eq!(n, encoded.encoder_stream.len());
+        // Strip H3 HEADERS frame wrapper to get field section.
+        let (ft, n0) = varint::decode(&encoded.headers_frame).unwrap();
+        assert_eq!(ft, frame::HEADERS);
+        let rest = &encoded.headers_frame[n0..];
+        let (len, n2) = varint::decode(rest).unwrap();
+        let section = &rest[n2..n2 + len as usize];
+        let (hdrs, ric) = decode_field_section(section, &dec).unwrap();
+        assert_eq!(ric, encoded.ric);
+        assert!(hdrs.iter().any(|(n, v)| n == ":method" && v == "CONNECT"));
+        assert!(hdrs
+            .iter()
+            .any(|(n, v)| n == ":protocol" && v == "webtransport"));
+    }
+
+    #[test]
+    fn encode_connect_request_with_stays_literal_when_capacity_zero() {
+        let mut enc = QpackEncoder::disabled();
+        let encoded = encode_connect_request_with(&mut enc, "localhost", "/").unwrap();
+        assert_eq!(encoded.ric, 0);
+        assert!(encoded.encoder_stream.is_empty());
+        assert_eq!(
+            encoded.headers_frame,
+            encode_connect_request("localhost", "/")
+        );
     }
 
     #[test]
