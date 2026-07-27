@@ -4934,3 +4934,56 @@ fn parse_qpack_decoder_oversized_buffer_fails_closed() {
         }
     )));
 }
+
+#[test]
+fn tls_server_name_from_authority_strips_port_and_brackets() {
+    assert_eq!(
+        tls_server_name_from_authority("localhost:443").as_deref(),
+        Some("localhost")
+    );
+    assert_eq!(
+        tls_server_name_from_authority("example.com").as_deref(),
+        Some("example.com")
+    );
+    assert_eq!(
+        tls_server_name_from_authority("[::1]:4433").as_deref(),
+        Some("::1")
+    );
+    assert_eq!(tls_server_name_from_authority("").as_deref(), None);
+    assert_eq!(tls_server_name_from_authority("   ").as_deref(), None);
+    assert_eq!(
+        tls_server_name_from_authority("not-a-port:abc").as_deref(),
+        Some("not-a-port:abc")
+    );
+}
+
+#[test]
+fn qpack_blocked_stream_cap_refuses_additional_streams() {
+    let mut sessions = HashMap::new();
+    let h = ConnectionHandle(0);
+    let mut sess = Session::default();
+    sess.qpack_decoder = h3::QpackDecoder::new(&h3::QpackLocalSettings {
+        max_table_capacity: 4096,
+        max_blocked_streams: 1,
+    });
+    sessions.insert(h, sess);
+    let s0 = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+    let s1 = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+    assert!(note_qpack_header_blocked(&mut sessions, h, Some(s0)).is_ok());
+    // Same stream may wait again.
+    assert!(note_qpack_header_blocked(&mut sessions, h, Some(s0)).is_ok());
+    let err = note_qpack_header_blocked(&mut sessions, h, Some(s1)).unwrap_err();
+    assert!(std::str::from_utf8(err).unwrap().contains("limit exceeded"));
+    clear_qpack_header_blocked(&mut sessions, h, s0);
+    assert!(note_qpack_header_blocked(&mut sessions, h, Some(s1)).is_ok());
+}
+
+#[test]
+fn endpoint_guard_decision_covers_all_arms() {
+    assert_eq!(endpoint_guard_decision(false, true, false, false), 1);
+    assert_eq!(endpoint_guard_decision(false, false, true, false), 2);
+    assert_eq!(endpoint_guard_decision(true, false, false, true), 3);
+    assert_eq!(endpoint_guard_decision(true, false, false, false), 4);
+    assert_eq!(endpoint_guard_decision(false, false, false, true), 5);
+    assert_eq!(endpoint_guard_decision(false, false, false, false), 6);
+}

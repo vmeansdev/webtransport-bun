@@ -1706,4 +1706,25 @@ mod tests {
         assert_eq!(encode_required_insert_count(1, 0), None);
         assert_eq!(encode_required_insert_count(1, 31), None);
     }
+
+    #[test]
+    fn encode_with_scratch_leaves_encoder_unchanged_on_err() {
+        // Capacity too small for ":status" + long value under KRC floor 0.
+        let mut enc = QpackEncoder::new(20);
+        let _ = enc.set_capacity_instruction(20);
+        // Force known_received_count=0 so eviction of any insert is refused.
+        let before_ic = enc.table.insert_count();
+        let before_cap = enc.table.max_capacity();
+        let result = encode_connect_request_with(
+            &mut enc,
+            "this-authority-is-definitely-too-long-for-twenty-byte-table",
+            "/also-a-long-path-that-cannot-fit",
+        );
+        assert!(
+            result.is_err(),
+            "expected encode failure under tiny capacity"
+        );
+        assert_eq!(enc.table.insert_count(), before_ic);
+        assert_eq!(enc.table.max_capacity(), before_cap);
+    }
 }
