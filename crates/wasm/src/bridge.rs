@@ -553,16 +553,18 @@ pub fn wt_governor_snapshot(eid: u32) -> String {
 }
 
 #[wasm_bindgen]
-pub fn wt_send_datagram(eid: u32, conn: u32, data: &[u8]) -> bool {
-    with_endpoint_mut(eid, |endpoint| endpoint.send_datagram(conn, data))
-        .ok()
-        .flatten()
-        .unwrap_or(false)
+pub fn wt_send_datagram(eid: u32, conn: u32, session_id: u64, data: &[u8]) -> bool {
+    with_endpoint_mut(eid, |endpoint| {
+        endpoint.send_datagram(conn, session_id, data)
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
 #[wasm_bindgen]
-pub fn wt_max_datagram_size(eid: u32, conn: u32) -> f64 {
-    with_endpoint_mut(eid, |endpoint| endpoint.max_datagram_size(conn))
+pub fn wt_max_datagram_size(eid: u32, conn: u32, session_id: u64) -> f64 {
+    with_endpoint_mut(eid, |endpoint| endpoint.max_datagram_size(conn, session_id))
         .ok()
         .flatten()
         .flatten()
@@ -570,11 +572,29 @@ pub fn wt_max_datagram_size(eid: u32, conn: u32) -> f64 {
 }
 
 #[wasm_bindgen]
-pub fn wt_open_stream(eid: u32, conn: u32, bidi: bool) -> i32 {
-    with_endpoint_mut(eid, |endpoint| endpoint.open_stream(conn, bidi))
+pub fn wt_open_stream(eid: u32, conn: u32, session_id: u64, bidi: bool) -> i32 {
+    with_endpoint_mut(eid, |endpoint| endpoint.open_stream(conn, session_id, bidi))
         .ok()
         .flatten()
         .unwrap_or(-1)
+}
+
+#[wasm_bindgen]
+pub fn wt_open_session(eid: u32, conn: u32) -> f64 {
+    with_endpoint_mut(eid, |endpoint| endpoint.open_wt_session(conn) as f64)
+        .ok()
+        .flatten()
+        .unwrap_or(-1.0)
+}
+
+#[wasm_bindgen]
+pub fn wt_close_session(eid: u32, conn: u32, session_id: u64, code: u32, reason: &str) -> bool {
+    with_endpoint_mut(eid, |endpoint| {
+        endpoint.close_wt_session(conn, session_id, code, reason.as_bytes())
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
 #[wasm_bindgen]

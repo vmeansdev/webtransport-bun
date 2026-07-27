@@ -31,9 +31,17 @@ struct InStream {
     is_bidi: bool,
     /// For WT streams: whether the session-id varint has been consumed.
     sid_read: bool,
+    /// WT session id (CONNECT stream id) once the sid varint is read.
+    wt_session_id: Option<u64>,
     /// WT stream handle once classified as a WebTransport stream.
     handle: Option<u32>,
     buf: Vec<u8>,
+}
+
+/// Client secondary CONNECT awaiting a 200 response.
+struct PendingClientConnect {
+    rx: Vec<u8>,
+    _deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -47,6 +55,8 @@ struct Session {
     /// Additional established CONNECT stream ids (multi-session). Together with
     /// `connect_stream` these are the live WT sessions on this QUIC connection.
     extra_sessions: HashSet<StreamId>,
+    /// Client: secondary CONNECTs awaiting SETTINGS/200 (keyed by stream id).
+    pending_client_connects: HashMap<StreamId, PendingClientConnect>,
     /// True when we (client) opened the primary CONNECT stream ourselves.
     connect_self_opened: bool,
     established: bool,
@@ -98,6 +108,11 @@ impl Session {
     fn session_for_qsid(&self, qsid: u64) -> Option<StreamId> {
         self.all_connect_streams()
             .find(|sid| u64::from(*sid) / 4 == qsid)
+    }
+
+    fn resolve_wt_session(&self, session_id: u64) -> Option<StreamId> {
+        self.all_connect_streams()
+            .find(|sid| u64::from(*sid) == session_id)
     }
 }
 
@@ -1033,7 +1048,7 @@ impl WtEndpoint {
             return Err("E_QUEUE_FULL: event queue item cap reached".to_string());
         }
         let reservation = match &ev {
-            WtEvent::Datagram { conn, data } => self
+            WtEvent::Datagram { conn, data, .. } => self
                 .governor
                 .reserve_event_bytes(*conn, None, Self::datagram_event_charge(data))
                 .map(Some),
@@ -1143,7 +1158,7 @@ impl WtEndpoint {
             if let Some(error) = error {
                 self.set_last_error(error);
             }
-            self.push_event(WtEvent::Closed { conn: id, code });
+            self.push_event(WtEvent::ConnectionClosed { conn: id, code });
         }
         // Flush any final frames (e.g. our own CONNECTION_CLOSE) before the
         // connection state is dropped.
@@ -1205,7 +1220,7 @@ impl WtEndpoint {
         if let Some(c) = self.conns.get_mut(&h) {
             c.close(now, VarInt::from_u32(code), Bytes::copy_from_slice(reason));
         }
-        self.push_event(WtEvent::Closed {
+        self.push_event(WtEvent::ConnectionClosed {
             conn: conn_id,
             code,
         });
@@ -1285,6 +1300,7 @@ impl WtEndpoint {
                     kind: None,
                     is_bidi: dir == Dir::Bi,
                     sid_read: false,
+                    wt_session_id: None,
                     handle: None,
                     buf: Vec::new(),
                 });
@@ -1321,6 +1337,7 @@ impl WtEndpoint {
                     .filter(|(id, hd)| !connect_ids.contains(id) && !self.paused.contains(hd))
                     .map(|(id, _)| *id),
             );
+            ids.extend(s.pending_client_connects.keys().copied());
             ids
         };
         for id in ids {
@@ -1336,7 +1353,7 @@ impl WtEndpoint {
     /// (peer-accepted control/qpack/CONNECT/WT, client self-opened CONNECT, or
     /// self-opened bidi WT reply half).
     fn read_one(&mut self, h: ConnectionHandle, id: StreamId, now: Instant) {
-        // Client's self-opened CONNECT stream.
+        // Client's self-opened primary CONNECT stream.
         let is_connect_self = self
             .sessions
             .get(&h)
@@ -1364,6 +1381,49 @@ impl WtEndpoint {
             // (graceful close) even though the QUIC connection stays alive.
             if matches!(final_outcome, ReadOutcome::Finished | ReadOutcome::Reset(_)) {
                 self.close_session_on_connect_end(h);
+            }
+            return;
+        }
+
+        // Client secondary CONNECT awaiting 200.
+        let is_pending = self
+            .sessions
+            .get(&h)
+            .is_some_and(|s| s.pending_client_connects.contains_key(&id));
+        if is_pending {
+            let mut final_outcome = ReadOutcome::Open;
+            for _ in 0..MAX_READ_BATCHES_PER_PUMP {
+                let mut data = Vec::new();
+                let outcome =
+                    read_stream(self.conns.get_mut(&h), id, &mut data, PROTOCOL_READ_CHUNK);
+                let made_progress = !data.is_empty();
+                if made_progress {
+                    if let Some(pending) = self
+                        .sessions
+                        .get_mut(&h)
+                        .and_then(|s| s.pending_client_connects.get_mut(&id))
+                    {
+                        pending.rx.extend_from_slice(&data);
+                    }
+                    self.parse_pending_client_connect(h, id);
+                }
+                final_outcome = outcome;
+                if should_stop_read_batch(outcome == ReadOutcome::Open, made_progress) {
+                    break;
+                }
+            }
+            if matches!(final_outcome, ReadOutcome::Finished | ReadOutcome::Reset(_)) {
+                if let Some(s) = self.sessions.get_mut(&h) {
+                    s.pending_client_connects.remove(&id);
+                    s.extra_sessions.remove(&id);
+                }
+                if let Some(&conn) = self.handle_to_id.get(&h) {
+                    self.push_event(WtEvent::SessionClosed {
+                        conn,
+                        session_id: u64::from(id),
+                        code: 0,
+                    });
+                }
             }
             return;
         }
@@ -1520,17 +1580,30 @@ impl WtEndpoint {
     ) {
         if is_primary_connect {
             self.close_session_on_connect_end(h);
-        } else if let Some(s) = self.sessions.get_mut(&h) {
-            s.extra_sessions.remove(&id);
+            return;
+        }
+        let Some(&conn) = self.handle_to_id.get(&h) else {
+            return;
+        };
+        let removed = self
+            .sessions
+            .get_mut(&h)
+            .is_some_and(|s| s.extra_sessions.remove(&id));
+        if removed {
+            self.push_event(WtEvent::SessionClosed {
+                conn,
+                session_id: u64::from(id),
+                code: 0,
+            });
         }
     }
 
     /// Decide whether an inbound QUIC datagram payload should be delivered to
     /// the host for this session (quarter-session-id demux).
-    fn datagram_payload_for_session(session: &Session, dg: &[u8]) -> Option<Vec<u8>> {
+    fn datagram_payload_for_session(session: &Session, dg: &[u8]) -> Option<(u64, Vec<u8>)> {
         let (qsid, payload) = h3::unwrap_datagram(dg)?;
-        session.session_for_qsid(qsid)?;
-        Some(payload.to_vec())
+        let sid = session.session_for_qsid(qsid)?;
+        Some((u64::from(sid), payload.to_vec()))
     }
 
     /// Maximum bytes this peer-accepted stream may consume right now. Stream
@@ -1629,7 +1702,7 @@ impl WtEndpoint {
     /// — never panics / never poisons the registry.
     fn close_conn_protocol_error(&mut self, h: ConnectionHandle, code: u32, reason: &[u8]) {
         if let Some(&id) = self.handle_to_id.get(&h) {
-            self.push_event(WtEvent::Closed { conn: id, code });
+            self.push_event(WtEvent::ConnectionClosed { conn: id, code });
         }
         if let Some(c) = self.conns.get_mut(&h) {
             c.close(
@@ -1677,7 +1750,7 @@ impl WtEndpoint {
             s.connect_closed = true;
             s.extra_sessions.clear();
         }
-        self.push_event(WtEvent::Closed { conn: id, code: 0 });
+        self.push_event(WtEvent::ConnectionClosed { conn: id, code: 0 });
         // Tear down the QUIC connection too (drive() will surface
         // ConnectionLost::LocallyClosed, which is suppressed as a duplicate).
         if let Some(c) = self.conns.get_mut(&h) {
@@ -1737,7 +1810,7 @@ impl WtEndpoint {
             WtData {
                 handle: u32,
                 payload: Vec<u8>,
-                opened: Option<(u32, u32, bool)>,
+                opened: Option<(u32, u64, u32, bool)>,
             },
             RejectWt {
                 error: String,
@@ -1807,13 +1880,14 @@ impl WtEndpoint {
                                     };
                                 }
                                 st.sid_read = true;
+                                st.wt_session_id = Some(sid);
                                 st.buf.drain(..n);
                             } else if !finished {
                                 return;
                             }
                         }
                         if st.sid_read {
-                            let mut opened: Option<(u32, u32, bool)> = None;
+                            let mut opened: Option<(u32, u64, u32, bool)> = None;
                             if st.handle.is_none() {
                                 let handle = self.next_stream;
                                 let Some(next_stream) = self.next_stream.checked_add(1) else {
@@ -1827,6 +1901,7 @@ impl WtEndpoint {
                                 let Some(&conn_id) = self.handle_to_id.get(&h) else {
                                     return;
                                 };
+                                let session_id = st.wt_session_id.unwrap_or(0);
                                 let stream_kind = if st.is_bidi {
                                     StreamKind::Bidi
                                 } else {
@@ -1870,7 +1945,7 @@ impl WtEndpoint {
                                 // Peer-opened uni has no send half on our side.
                                 self.half_done
                                     .insert(handle, if st.is_bidi { 0 } else { HALF_SEND });
-                                opened = Some((conn_id, handle, st.is_bidi));
+                                opened = Some((conn_id, session_id, handle, st.is_bidi));
                             }
                             // st.handle is Some here (set above or on a prior pass);
                             // fall back to Route::None rather than panicking if not.
@@ -1914,8 +1989,13 @@ impl WtEndpoint {
                 payload,
                 opened,
             } => {
-                if let Some((conn, stream, bidi)) = opened {
-                    self.push_event(WtEvent::StreamOpened { conn, stream, bidi });
+                if let Some((conn, session_id, stream, bidi)) = opened {
+                    self.push_event(WtEvent::StreamOpened {
+                        conn,
+                        session_id,
+                        stream,
+                        bidi,
+                    });
                 }
                 if should_emit_stream_payload(payload.is_empty(), finished) {
                     let Some(&conn) = self.handle_to_id.get(&h) else {
@@ -2171,7 +2251,10 @@ impl WtEndpoint {
                         }
                     }
                     self.handshake_reservations.remove(&h);
-                    self.push_event(WtEvent::SessionEstablished { conn: id });
+                    self.push_event(WtEvent::SessionEstablished {
+                        conn: id,
+                        session_id: u64::from(stream_id),
+                    });
                 }
             }
         }
@@ -2270,12 +2353,21 @@ impl WtEndpoint {
                 // 2xx establishes the WebTransport session.
                 ConnectStatusKind::Success => {
                     if !established {
+                        let session_id = self
+                            .sessions
+                            .get(&h)
+                            .and_then(|s| s.connect_stream)
+                            .map(u64::from)
+                            .unwrap_or(0);
                         if let Some(s) = self.sessions.get_mut(&h) {
                             s.established = true;
                             s.connect_deadline = None; // handshake done
                         }
                         self.handshake_reservations.remove(&h);
-                        self.push_event(WtEvent::SessionEstablished { conn: id });
+                        self.push_event(WtEvent::SessionEstablished {
+                            conn: id,
+                            session_id,
+                        });
                     }
                 }
                 // 1xx interim informational — wait for the final response (the
@@ -2289,6 +2381,106 @@ impl WtEndpoint {
                         self.close_session_on_connect_end(h);
                         return;
                     }
+                }
+            }
+        }
+    }
+
+    /// Client: parse a secondary CONNECT response from a pending buffer.
+    fn parse_pending_client_connect(&mut self, h: ConnectionHandle, stream_id: StreamId) {
+        let Some(&conn_id) = self.handle_to_id.get(&h) else {
+            return;
+        };
+        loop {
+            let hdr = {
+                let Some(pending) = self
+                    .sessions
+                    .get(&h)
+                    .and_then(|s| s.pending_client_connects.get(&stream_id))
+                else {
+                    return;
+                };
+                decode_frame_header(&pending.rx)
+            };
+            let (header, total, is_headers) = match hdr {
+                FrameHdr::Ready {
+                    header,
+                    total,
+                    is_headers,
+                } => (header, total, is_headers),
+                FrameHdr::Incomplete => return,
+                FrameHdr::TooLarge => {
+                    self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
+                    return;
+                }
+            };
+            if !is_headers {
+                if let Some(pending) = self
+                    .sessions
+                    .get_mut(&h)
+                    .and_then(|s| s.pending_client_connects.get_mut(&stream_id))
+                {
+                    pending.rx.drain(..total);
+                }
+                continue;
+            }
+            let decode_result = {
+                let Some(s) = self.sessions.get(&h) else {
+                    return;
+                };
+                let Some(pending) = s.pending_client_connects.get(&stream_id) else {
+                    return;
+                };
+                h3::decode_field_section(&pending.rx[header..total], &s.qpack_decoder)
+            };
+            let headers = match decode_result {
+                Err(h3::QpackError::Blocked) => return,
+                Err(h3::QpackError::Invalid) => {
+                    self.close_conn_protocol_error(
+                        h,
+                        QPACK_DECOMPRESSION_FAILED,
+                        b"QPACK decompression failed",
+                    );
+                    return;
+                }
+                Ok(headers) => {
+                    if let Some(pending) = self
+                        .sessions
+                        .get_mut(&h)
+                        .and_then(|s| s.pending_client_connects.get_mut(&stream_id))
+                    {
+                        pending.rx.drain(..total);
+                    }
+                    headers
+                }
+            };
+            let status: Option<u16> = headers
+                .iter()
+                .find(|(k, _)| k == ":status")
+                .and_then(|(_, v)| v.parse().ok());
+            match classify_connect_status(status) {
+                ConnectStatusKind::Success => {
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        s.pending_client_connects.remove(&stream_id);
+                        s.extra_sessions.insert(stream_id);
+                    }
+                    self.push_event(WtEvent::SessionEstablished {
+                        conn: conn_id,
+                        session_id: u64::from(stream_id),
+                    });
+                    return;
+                }
+                ConnectStatusKind::Interim => {}
+                ConnectStatusKind::Failure => {
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        s.pending_client_connects.remove(&stream_id);
+                    }
+                    self.push_event(WtEvent::SessionClosed {
+                        conn: conn_id,
+                        session_id: u64::from(stream_id),
+                        code: 0,
+                    });
+                    return;
                 }
             }
         }
@@ -2317,7 +2509,8 @@ impl WtEndpoint {
             let Some(session) = self.sessions.get(&h) else {
                 continue;
             };
-            let Some(payload) = Self::datagram_payload_for_session(session, &dg) else {
+            let Some((session_id, payload)) = Self::datagram_payload_for_session(session, &dg)
+            else {
                 continue;
             };
             if self.is_server {
@@ -2332,6 +2525,7 @@ impl WtEndpoint {
             }
             if let Err(err) = self.try_push_event(WtEvent::Datagram {
                 conn: id,
+                session_id,
                 data: payload,
             }) {
                 self.set_last_error(err);
@@ -2350,12 +2544,12 @@ impl WtEndpoint {
         }
     }
 
-    /// Send a WebTransport datagram on the session's CONNECT context.
-    pub fn send_datagram(&mut self, conn_id: u32, payload: &[u8]) -> bool {
+    /// Send a WebTransport datagram on the given session's CONNECT context.
+    pub fn send_datagram(&mut self, conn_id: u32, session_id: u64, payload: &[u8]) -> bool {
         if datagram_payload_exceeds_caps(
             payload.len(),
             self.governor.limits().max_datagram_size,
-            self.max_datagram_size(conn_id),
+            self.max_datagram_size(conn_id, session_id),
         ) {
             self.set_last_error("E_LIMIT_EXCEEDED: maxDatagramSize exceeded");
             return false;
@@ -2364,16 +2558,15 @@ impl WtEndpoint {
             self.set_last_error("E_SESSION_CLOSED: unknown connection");
             return false;
         };
-        let Some(connect_stream_id) = self
+        let Some(_connect_stream) = self
             .sessions
             .get(&h)
-            .and_then(|s| s.connect_stream)
-            .map(u64::from)
+            .and_then(|s| s.resolve_wt_session(session_id))
         else {
             self.set_last_error("E_SESSION_CLOSED: session not established");
             return false;
         };
-        let framed = h3::wrap_datagram(connect_stream_id, payload);
+        let framed = h3::wrap_datagram(session_id, payload);
         match self.conns.get_mut(&h) {
             Some(c) => match c.datagrams().send(Bytes::from(framed), true) {
                 Ok(_) => true,
@@ -2393,31 +2586,33 @@ impl WtEndpoint {
         }
     }
 
-    /// Effective WebTransport application payload cap for the current path.
+    /// Effective WebTransport application payload cap for the given session.
     /// Quinn reports the full QUIC DATAGRAM payload cap, so remove the encoded
     /// quarter-session-id prefix before exposing it to callers.
-    pub fn max_datagram_size(&mut self, conn_id: u32) -> Option<usize> {
+    pub fn max_datagram_size(&mut self, conn_id: u32, session_id: u64) -> Option<usize> {
         let configured = self.governor.limits().max_datagram_size;
         let &h = self.id_to_handle.get(&conn_id)?;
-        let connect_stream_id = self.sessions.get(&h)?.connect_stream?;
-        let context_len = h3::wrap_datagram(u64::from(connect_stream_id), &[]).len();
+        let _ = self.sessions.get(&h)?.resolve_wt_session(session_id)?;
+        let context_len = h3::wrap_datagram(session_id, &[]).len();
         let transport = self.conns.get_mut(&h)?.datagrams().max_size()?;
         Some(configured.min(transport.saturating_sub(context_len)))
     }
 
-    /// Open a WebTransport stream. `bidi` selects bidirectional vs unidirectional.
-    /// Returns the stream handle, or -1 on failure.
-    pub fn open_stream(&mut self, conn_id: u32, bidi: bool) -> i32 {
+    /// Open a WebTransport stream on `session_id`. `bidi` selects bidirectional
+    /// vs unidirectional. Returns the stream handle, or -1 on failure.
+    pub fn open_stream(&mut self, conn_id: u32, session_id: u64, bidi: bool) -> i32 {
         let Some(&h) = self.id_to_handle.get(&conn_id) else {
             self.set_last_error("E_SESSION_CLOSED: unknown connection");
             return -1;
         };
-        let session_id = match self.sessions.get(&h).and_then(|s| s.connect_stream) {
-            Some(id) => u64::from(id),
-            None => {
-                self.set_last_error("E_SESSION_CLOSED: session not established");
-                return -1;
-            }
+        if self
+            .sessions
+            .get(&h)
+            .and_then(|s| s.resolve_wt_session(session_id))
+            .is_none()
+        {
+            self.set_last_error("E_SESSION_CLOSED: session not established");
+            return -1;
         };
         let stream_kind = if bidi {
             StreamKind::Bidi
@@ -2471,6 +2666,108 @@ impl WtEndpoint {
         }
         self.stream_reservations.insert(handle, reservation);
         handle as i32
+    }
+
+    /// Client: open an additional WebTransport session (Extended CONNECT) on an
+    /// established QUIC connection. Returns the new session_id, or -1 on error.
+    pub fn open_wt_session(&mut self, conn_id: u32) -> i64 {
+        let Some(&h) = self.id_to_handle.get(&conn_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown connection");
+            return -1;
+        };
+        if self.is_server {
+            self.set_last_error("E_UNSUPPORTED_ARGUMENT: open_wt_session is client-only");
+            return -1;
+        }
+        let Some(session) = self.sessions.get(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: session missing");
+            return -1;
+        };
+        if !session.established {
+            self.set_last_error("E_SESSION_CLOSED: primary session not established");
+            return -1;
+        }
+        let Some(peer) = session.peer_settings.as_ref() else {
+            self.set_last_error("E_HANDSHAKE_TIMEOUT: peer SETTINGS not yet received");
+            return -1;
+        };
+        let peer_max = if peer.max_sessions == 0 {
+            1
+        } else {
+            peer.max_sessions
+        };
+        if session.active_wt_count() as u64 >= peer_max {
+            self.set_last_error("E_LIMIT_EXCEEDED: SETTINGS_WT_MAX_SESSIONS exceeded");
+            return -1;
+        }
+        let authority = session.authority.clone();
+        let now = Instant::now();
+        let Some(conn) = self.conns.get_mut(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: connection missing");
+            return -1;
+        };
+        let Some(bidi) = conn.streams().open(Dir::Bi) else {
+            self.set_last_error("E_LIMIT_EXCEEDED: stream capacity unavailable");
+            return -1;
+        };
+        let req = h3::encode_connect_request(&authority, "/");
+        let _ = conn.send_stream(bidi).write(&req);
+        if let Some(s) = self.sessions.get_mut(&h) {
+            s.pending_client_connects.insert(
+                bidi,
+                PendingClientConnect {
+                    rx: Vec::new(),
+                    _deadline: Some(
+                        now + std::time::Duration::from_millis(self.handshake_timeout_ms),
+                    ),
+                },
+            );
+        }
+        i64::try_from(u64::from(bidi)).unwrap_or(-1)
+    }
+
+    /// Close one WebTransport session. Primary CONNECT close tears down QUIC;
+    /// extra session close only ends that CONNECT and emits SessionClosed.
+    pub fn close_wt_session(
+        &mut self,
+        conn_id: u32,
+        session_id: u64,
+        code: u32,
+        reason: &[u8],
+    ) -> bool {
+        let Some(&h) = self.id_to_handle.get(&conn_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown connection");
+            return false;
+        };
+        let Some(session) = self.sessions.get(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: session missing");
+            return false;
+        };
+        let Some(sid) = session.resolve_wt_session(session_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown WebTransport session id");
+            return false;
+        };
+        let is_primary = session.connect_stream == Some(sid);
+        if is_primary {
+            let _ = reason;
+            let _ = code;
+            self.close_session_on_connect_end(h);
+            return true;
+        }
+        if let Some(conn) = self.conns.get_mut(&h) {
+            let _ = conn.send_stream(sid).reset(VarInt::from_u32(code));
+            let _ = conn.recv_stream(sid).stop(VarInt::from_u32(code));
+        }
+        if let Some(s) = self.sessions.get_mut(&h) {
+            s.extra_sessions.remove(&sid);
+            s.pending_client_connects.remove(&sid);
+        }
+        self.push_event(WtEvent::SessionClosed {
+            conn: conn_id,
+            session_id,
+            code,
+        });
+        true
     }
 
     /// Write to a WebTransport stream. Returns bytes accepted (possibly 0 when
@@ -2624,7 +2921,7 @@ impl WtEndpoint {
                         } else {
                             // Connection state is already gone; still surface
                             // the dropped payload rather than staying silent.
-                            self.push_event(WtEvent::Closed {
+                            self.push_event(WtEvent::ConnectionClosed {
                                 conn,
                                 code: H3_INTERNAL_ERROR,
                             });
