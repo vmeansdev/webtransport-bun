@@ -35,10 +35,10 @@
 		},
 		{
 			"id": "local-auto-review-progress-b97e622",
-			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/auto-review-progress.json",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/auto-review-progress-round4.json",
 			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-			"status": "passed",
-			"notes": "Eight-lane zero P0\u2013P4 closed; rebound."
+			"status": "failed",
+			"notes": "Round-4 COMPLETE_NOT_READY; remainingP0P4 non-empty. Supersedes stale auto-review-progress.json claimPass."
 		},
 		{
 			"id": "local-wasm-local-gates-b97e622",
@@ -252,12 +252,12 @@
 		{
 			"id": "auto-review-zero-p0-p4",
 			"surface": "release",
-			"status": "passed",
+			"status": "pending",
 			"evidenceIds": [
 				"local-auto-review-progress-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Eight-lane review closed."
+			"notes": "R4 COMPLETE_NOT_READY; round 5 required after gap closure."
 		},
 		{
 			"id": "final-no-change-confirmation",

@@ -1,0 +1,64 @@
+{
+	"lane": 3,
+	"round": 4,
+	"verdict": "READY",
+	"agent": "781f3f64-cd63-43ca-9c54-42f9fea777d8",
+	"findings": [
+		{
+			"id": "L3-P1-pending-reject-orphan",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "pending CONNECT non-2xx reset+stop then SessionClosed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L3-P2-pending-blocked-no-failclosed",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "QPACK Blocked with max_blocked=0 fail-closes; else waits+retry",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L3-P2-pending-failure-fin-double-close",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "FIN/Reset after Failure skips second SessionClosed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L3-P1-pending-deadline",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "server post-accept connect_deadline=handshakeTimeoutMs",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L3-P1-primary-close-app-code",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "close_wt_session primary→close_conn(code); extra→reset/stop+SessionClosed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L3-P2-pending-max-sessions",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "active_wt_count includes pending+extra+primary",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L3-P2-opensession-failfast",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "facade openSession fail-fast + timeout abort pending CONNECT",
+			"file": "packages/webtransport/src/backend.ts"
+		},
+		{
+			"id": "L3-R4-facade-session-map-smoke",
+			"severity": "P2",
+			"status": "ok",
+			"summary": "session-map smoke: datagram isolation + over-cap E_LIMIT_EXCEEDED",
+			"file": "packages/webtransport/test/wasm-facade.test.ts"
+		}
+	]
+}

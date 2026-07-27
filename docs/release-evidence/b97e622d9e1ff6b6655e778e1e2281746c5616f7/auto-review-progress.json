@@ -1,38 +1,21 @@
 {
-	"round": 2,
-	"headAtReview": "ab6bbdf",
-	"productCommit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
-	"note": "Product fixes committed; candidate rebound with commit-bound evidence.",
-	"status": "CLOSED_FINDINGS",
-	"verification": {
-		"cargoTestWasm": "145 passed",
-		"testWasm": "82 pass",
-		"focusedBunTests": "wasm-0rtt + wasm-qpack-options + wasm-multi-session + wasm-limits + abuse + security-close green",
-		"chromiumWasmInterop": "5/5 passed",
-		"chromiumNativeInterop": "19/19 passed",
-		"faultMatrix": "1/1 passed",
-		"docTruth": "passed (narrative docs synced in round-3 L7 follow-up; pending commit)",
-		"packageArtifactCheck": "passed (eventWireVersion 2)",
-		"coverageFloors": "failed"
-	},
-	"lanes": {
-		"1": "READY after SEC-04 occupied=unlatched+active fix",
-		"2": "READY (native N/A)",
-		"3": "READY after extra-CONNECT FIN path + admission occupied fix",
-		"4": "READY",
-		"5": "READY",
-		"6": "READY",
-		"7": "READY",
-		"8": "READY"
-	},
-	"remainingP0P4": [],
-	"claimPass": {
-		"wasm-multi-session": "PASS",
-		"wasm-0rtt": "PASS",
-		"wasm-dynamic-qpack": "PASS",
-		"auto-review-zero-p0-p4": "PASS"
-	},
+	"round": 4,
 	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
-	"round3Note": "L7 open doc-lag findings fixed in working tree; awaiting remaining lanes.",
-	"notes": "Rebound to candidate b97e622 after local gate re-verify."
+	"headAtReview": "a57df57",
+	"productCommit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"status": "SUPERSEDED_BY_ROUND4",
+	"note": "Canonical round-4 ledger is auto-review-progress-round4.json (COMPLETE_NOT_READY). This file no longer claims zero P0–P4 or claimPass PASS.",
+	"seeAlso": "auto-review-progress-round4.json",
+	"claimPass": {
+		"wasm-multi-session": "PENDING_RERUN",
+		"wasm-0rtt": "PENDING_RERUN",
+		"wasm-dynamic-qpack": "PENDING_RERUN",
+		"auto-review-zero-p0-p4": "REJECT"
+	},
+	"remainingP0P4": [
+		"see auto-review-progress-round4.json"
+	],
+	"verification": {
+		"coverageFloors": "see coverage-gates-floor-results.json (passed on candidate; prior round-2 note obsolete)"
+	}
 }
