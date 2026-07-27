@@ -43,7 +43,7 @@ See `docs/release-status.json` → `support.scopeLimits`.
 | Server inside the browser | Normal web page, Firefox, Safari | **not possible** — Direct Sockets is IWA/Chromium-only |
 | Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | implemented and locally tested; release evidence pending |
 | Client (wasm) → native server | Bun/Node host, real UDP | implemented and locally tested; release evidence pending |
-| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; release evidence pending |
+| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; `chromium-wasm-interop` claim-passed on current candidate |
 | Custom transport | anything implementing `UdpTransport` | implemented — the core is sans-IO; consumer-specific support is not claimed |
 
 Constraints that apply regardless of environment:
@@ -64,9 +64,11 @@ Constraints that apply regardless of environment:
   facade parity (`wasm-facade-parity`) so W3C-shaped options converge with the
   native surface where feasible — see `docs/PARITY_MATRIX.md` and
   `docs/WASM_PROTOCOL_SCOPE.md`.
-- **Protocol bar (not yet GA):** dynamic QPACK, multi-session, and 0-RTT are
-  coupled 1.0 requirements tracked as `wasm-dynamic-qpack`,
-  `wasm-multi-session`, and `wasm-0rtt` in `docs/release-status.json`.
+- **Protocol bar:** dynamic QPACK, multi-session, and 0-RTT are coupled 1.0
+  requirements (`wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`) and
+  are **claim-passed** on the current candidate in `docs/release-status.json`
+  (defaults remain Chromium-safe: QPACK capacity 0, `enable0Rtt` false).
+  `wasm-facade-parity` remains pending.
 - **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
   signed Web Bundle installation via Chromium's developer-mode
   `--install-isolated-web-app-from-file` switch, unsigned source bundle, and

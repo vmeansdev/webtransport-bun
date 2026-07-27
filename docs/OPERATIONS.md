@@ -30,12 +30,20 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 - **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
   decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
   index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.
+- **CONNECT admission (wasm)**: concurrent unlatched + active WT sessions are
+  capped by `wtMaxSessions` / peer `SETTINGS_WT_MAX_SESSIONS`; over-cap
+  CONNECTs get early RESET (no MiB HEADERS buffering). Handshake /
+  stream-open **rate-limit buckets are not charged** at CONNECT classify —
+  those buckets still gate UDP handshakes and WT stream opens only. Size
+  `wtMaxSessions` for CONNECT storm resistance; do not assume handshake
+  rate limits alone throttle Extended CONNECT floods.
 
 ## Enforced caps
 - Datagram size: maxDatagramSize (must respect negotiated QUIC max)
 - Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
 - WT sessions per QUIC connection: `wtMaxSessions` / `SETTINGS_WT_MAX_SESSIONS`
-  (pending client CONNECTs count toward the cap)
+  (pending client CONNECTs and server unlatched admitted CONNECTs count toward
+  the admission occupied set; see OPERATIONS CONNECT admission note)
 
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive

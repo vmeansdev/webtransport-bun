@@ -33,7 +33,7 @@ In addition to the shared governor fields (`sessionsActive`, queued bytes, rate-
 
 | Field | Type | Description |
 |-------|------|-------------|
-| wtSessionsActive | number | Live + pending WebTransport sessions across connections |
+| wtSessionsActive | number | Live primary/extra WT sessions + client pending CONNECTs (excludes server unlatched admitted CONNECTs that still count toward admission occupied) |
 | sessionClosedCount | number | Cumulative `SessionClosed` events (extra-session / timed-out CONNECT) |
 
 Per-connection `has0Rtt` / `accepted0Rtt` remain on connection getters (not rolled into this snapshot).
