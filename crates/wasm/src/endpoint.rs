@@ -1197,6 +1197,13 @@ impl WtEndpoint {
                             let enc_cap = usize::try_from(self.qpack_settings.max_table_capacity)
                                 .unwrap_or(0);
                             wt_session.qpack_encoder = h3::QpackEncoder::new(enc_cap);
+                            // Bound QUIC-accept → first WT CONNECT: keep-alives
+                            // defeat idle timeout, so without this deadline a
+                            // CONNECT-less peer can pin handshake/session
+                            // reservations until maxHandshakesInFlight exhausts.
+                            wt_session.connect_deadline = Some(
+                                now + std::time::Duration::from_millis(self.handshake_timeout_ms),
+                            );
                             self.sessions.insert(handle, wt_session);
                             if self.is_server {
                                 if let Err(err) =
@@ -1644,12 +1651,17 @@ impl WtEndpoint {
                 }
             }
             if matches!(final_outcome, ReadOutcome::Finished | ReadOutcome::Reset(_)) {
-                if let Some(s) = self.sessions.get_mut(&h) {
-                    s.pending_client_connects.remove(&id);
-                    s.extra_sessions.remove(&id);
-                }
-                if let Some(&conn) = self.handle_to_id.get(&h) {
-                    self.push_session_closed(conn, u64::from(id), 0);
+                // Only emit SessionClosed if this CONNECT was still pending
+                // (Failure path already closed + reset/stop'd).
+                let closed_pending = self
+                    .sessions
+                    .get_mut(&h)
+                    .and_then(|s| s.pending_client_connects.remove(&id))
+                    .is_some();
+                if closed_pending {
+                    if let Some(&conn) = self.handle_to_id.get(&h) {
+                        self.push_session_closed(conn, u64::from(id), 0);
+                    }
                 }
             }
             return;
@@ -2842,7 +2854,21 @@ impl WtEndpoint {
                 h3::decode_field_section(&pending.rx[header..total], &s.qpack_decoder)
             };
             let headers = match decode_result {
-                Err(h3::QpackError::Blocked) => return,
+                Err(h3::QpackError::Blocked) => {
+                    let max_blocked = self
+                        .sessions
+                        .get(&h)
+                        .map(|s| s.qpack_decoder.max_blocked_streams())
+                        .unwrap_or(0);
+                    if qpack_blocking_forbidden(max_blocked) {
+                        self.close_conn_protocol_error(
+                            h,
+                            QPACK_DECOMPRESSION_FAILED,
+                            b"QPACK blocked streams not permitted",
+                        );
+                    }
+                    return;
+                }
                 Err(h3::QpackError::Invalid) => {
                     self.close_conn_protocol_error(
                         h,
@@ -2883,6 +2909,10 @@ impl WtEndpoint {
                 ConnectStatusKind::Failure => {
                     if let Some(s) = self.sessions.get_mut(&h) {
                         s.pending_client_connects.remove(&stream_id);
+                    }
+                    if let Some(conn) = self.conns.get_mut(&h) {
+                        let _ = conn.send_stream(stream_id).reset(VarInt::from_u32(0));
+                        let _ = conn.recv_stream(stream_id).stop(VarInt::from_u32(0));
                     }
                     self.push_session_closed(conn_id, u64::from(stream_id), 0);
                     return;
@@ -3305,7 +3335,7 @@ impl WtEndpoint {
                 soonest = sooner_deadline(soonest, t);
             }
         }
-        // Pending CONNECT deadlines (unestablished client sessions).
+        // Pending CONNECT / post-accept handshake deadlines (unestablished).
         for s in self.sessions.values() {
             if should_track_connect_deadline(s.established, s.connect_closed) {
                 if let Some(t) = s.connect_deadline {
@@ -3336,7 +3366,8 @@ impl WtEndpoint {
                 }
             }
         }
-        // Fail any client session whose CONNECT deadline has passed unanswered.
+        // Fail any session whose post-accept / client CONNECT deadline passed
+        // unanswered (releases handshake+session reservations).
         let expired: Vec<ConnectionHandle> = self
             .sessions
             .iter()
