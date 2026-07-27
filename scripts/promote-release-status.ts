@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Promote docs/release-status.json readiness only when every claim is passed
- * with commit-bound evidence that check-doc-truth would accept.
+ * Promote docs/release-status.json readiness only when every gaRequired claim
+ * is passed with commit-bound evidence that check-doc-truth would accept.
+ * Claims with `gaRequired: false` (e.g. scale-10k-multisource) are tracked but
+ * do not block GA.
  *
  * Usage:
  *   bun scripts/promote-release-status.ts --commit <40-hex>
@@ -18,6 +20,7 @@ type Claim = {
 	id: string;
 	status: string;
 	evidenceIds: string[];
+	gaRequired?: boolean;
 };
 
 type Evidence = {
@@ -68,6 +71,8 @@ function main() {
 	const failures: string[] = [];
 
 	for (const claim of status.claims) {
+		const blocksGa = claim.gaRequired !== false;
+		if (!blocksGa) continue;
 		if (claim.status !== "passed") {
 			failures.push(`claim ${claim.id} status=${claim.status}`);
 			continue;

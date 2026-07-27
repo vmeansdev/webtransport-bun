@@ -4,11 +4,11 @@
 // (the `.wasm` + JS) is loaded by the consumer and passed in as `WasmModule`, so
 // importing this subpath pulls no wasm bytes on its own.
 //
-// EXPERIMENTAL (0.x): the `/wasm` subpath is NOT covered by the package's 1.0.0
-// semver stability commitment. Its facade (callback-style WasmSession/WasmStream,
-// plain-Error close semantics) intentionally diverges from the native surface and
-// may change in any minor release until it converges. Depend on it only if you
-// accept breaking changes; the frozen 1.0 API is the native (root) entrypoint.
+// CANDIDATE (coupled 1.0): `/wasm` is not yet under the package's stable 1.0.0
+// semver commitment. It joins GA only when docs/release-status.json marks
+// readiness=ready after wasm protocol bar (dynamic QPACK, multi-session, 0-RTT)
+// and wasm-facade-parity claims pass. Until then the facade may still change;
+// the frozen root entrypoint remains the native API. See docs/WASM_1.0_PLAN.md.
 
 export {
 	type BackendKind,
@@ -36,6 +36,19 @@ export {
 	WasmTransportManager,
 	WasmWebTransport,
 } from "./backend.js";
+export {
+	validateWasmWebTransportOptions,
+	type WasmWebTransportOptions,
+	WasmWebTransportSendGroup,
+} from "./wasm-webtransport.js";
+export {
+	createW3CMappedError,
+	normalizeW3CBrowserName,
+	validateW3CClientOptions,
+	type W3CClientOptionSurface,
+	type W3CCongestionControl,
+	type W3CDatagramsReadableType,
+} from "./w3c-client-options.js";
 export type { WasmModule, WasmSessionEvents } from "./backend-wasm.js";
 export type {
 	WebTransportLike,

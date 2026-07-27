@@ -58,9 +58,14 @@ Constraints that apply regardless of environment:
   adapters cover Direct Sockets, Bun UDP, and in-memory testing.
 - **API surface**: no `u64`/`BigInt` crosses the wasm boundary (handles are
   `u32`, sizes are `f64`), so no BigInt polyfill or serialization caveats.
-- **Unsupported options fail loudly**: `allowPooling` and other
-  native-/browser-only options are rejected, never silently ignored
-  (see `docs/PARITY_MATRIX.md`).
+- **Unsupported options fail loudly**: options that are not yet supported on
+  wasm fail with stable errors (never silently ignored). Coupled 1.0 requires
+  facade parity (`wasm-facade-parity`) so W3C-shaped options converge with the
+  native surface where feasible — see `docs/PARITY_MATRIX.md` and
+  `docs/WASM_PROTOCOL_SCOPE.md`.
+- **Protocol bar (not yet GA):** dynamic QPACK, multi-session, and 0-RTT are
+  coupled 1.0 requirements tracked as `wasm-dynamic-qpack`,
+  `wasm-multi-session`, and `wasm-0rtt` in `docs/release-status.json`.
 - **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
   signed Web Bundle installation via Chromium's developer-mode
   `--install-isolated-web-app-from-file` switch, unsigned source bundle, and
