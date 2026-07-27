@@ -81,6 +81,10 @@ struct Session {
     control_rx: Vec<u8>,
     /// Inbound QPACK encoder-stream bytes awaiting instruction parse.
     qpack_encoder_rx: Vec<u8>,
+    /// Inbound QPACK decoder-stream bytes (peer ACKs / ICI).
+    qpack_decoder_rx: Vec<u8>,
+    /// Our outbound QPACK decoder stream (for section acks / ICI).
+    qpack_decoder_send: Option<StreamId>,
     /// Decoder-side dynamic QPACK table (matches advertised SETTINGS; default 0).
     qpack_decoder: h3::QpackDecoder,
     /// Peer-accepted streams (uni + bidi) being classified/read.
@@ -169,6 +173,8 @@ pub struct WtEndpoint {
     /// Opt-in QUIC TLS 1.3 early data (0-RTT). When true, client/server rustls
     /// configs accept/offer early data and share an [`InMemoryTicketStore`].
     enable_0rtt: bool,
+    /// Local QPACK SETTINGS (advertised + decoder bound). Default disabled (0).
+    qpack_settings: h3::QpackLocalSettings,
     last_error: Option<String>,
 }
 
@@ -449,6 +455,8 @@ const H3_INTERNAL_ERROR: u32 = 0x0102;
 const QPACK_DECOMPRESSION_FAILED: u32 = 0x0200;
 /// QPACK_ENCODER_STREAM_ERROR (RFC 9204 §7.4).
 const QPACK_ENCODER_STREAM_ERROR: u32 = 0x0201;
+/// QPACK_DECODER_STREAM_ERROR (RFC 9204 §7.4).
+const QPACK_DECODER_STREAM_ERROR: u32 = 0x0202;
 const MAX_PENDING_EVENTS: usize = 65_536;
 
 #[derive(Default)]
@@ -796,6 +804,7 @@ impl WtEndpoint {
             idle_timeout_ms,
             wt_max_sessions: WT_MAX_SESSIONS_DEFAULT,
             enable_0rtt,
+            qpack_settings: h3::QpackLocalSettings::disabled(),
             last_error: None,
         })
     }
@@ -832,6 +841,7 @@ impl WtEndpoint {
         };
         self.conns.insert(handle, conn);
         let mut session = Session::default();
+        session.qpack_decoder = h3::QpackDecoder::new(&self.qpack_settings);
         authority.clone_into(&mut session.authority);
         session.connect_deadline =
             Some(now + std::time::Duration::from_millis(self.handshake_timeout_ms));
@@ -875,6 +885,18 @@ impl WtEndpoint {
     /// Whether this endpoint was built with `enable0Rtt` / early data enabled.
     pub fn enable_0rtt(&self) -> bool {
         self.enable_0rtt
+    }
+
+    /// Local QPACK SETTINGS (advertised and used to bound the decoder).
+    pub fn qpack_settings(&self) -> h3::QpackLocalSettings {
+        self.qpack_settings
+    }
+
+    /// Configure local QPACK SETTINGS before the peer handshake completes.
+    /// Non-zero capacity is only safe once decoder-stream ACK emit is wired
+    /// (always true on this build).
+    pub fn set_qpack_settings(&mut self, settings: h3::QpackLocalSettings) {
+        self.qpack_settings = settings;
     }
 
     /// Client: whether the connection currently has 0-RTT keys (ticket present).
@@ -1008,7 +1030,9 @@ impl WtEndpoint {
                                 }
                             };
                             self.conns.insert(handle, conn);
-                            self.sessions.insert(handle, Session::default());
+                            let mut wt_session = Session::default();
+                            wt_session.qpack_decoder = h3::QpackDecoder::new(&self.qpack_settings);
+                            self.sessions.insert(handle, wt_session);
                             if self.is_server {
                                 if let Err(err) =
                                     self.rate_limiter.attach_connection(id, source, now)
@@ -1269,7 +1293,8 @@ impl WtEndpoint {
             return;
         };
         if let Some(ctrl) = conn.streams().open(Dir::Uni) {
-            let preamble = h3::encode_control_preamble(self.wt_max_sessions);
+            let preamble =
+                h3::encode_control_preamble_with(self.wt_max_sessions, &self.qpack_settings);
             let _ = conn.send_stream(ctrl).write(&preamble);
             if let Some(s) = self.sessions.get_mut(&h) {
                 s.control_send_stream = Some(ctrl);
@@ -1283,6 +1308,11 @@ impl WtEndpoint {
                 let mut b = Vec::new();
                 crate::varint::encode(st, &mut b);
                 let _ = conn.send_stream(id).write(&b);
+                if st == h3::stream_type::QPACK_DECODER {
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        s.qpack_decoder_send = Some(id);
+                    }
+                }
             }
         }
         if !self.is_server {
@@ -1814,6 +1844,8 @@ impl WtEndpoint {
             Control,
             /// Peer QPACK encoder stream — feed dynamic-table inserts.
             QpackEncoder,
+            /// Peer QPACK decoder stream — section acks / ICI.
+            QpackDecoder,
             /// A server-side H3 request (CONNECT) stream; parsed per-stream from
             /// its own InStream::buf so concurrent request streams never share a
             /// buffer and cannot interleave.
@@ -1875,10 +1907,9 @@ impl WtEndpoint {
                         Route::QpackEncoder
                     }
                     PeerStreamClass::QpackDecoder => {
-                        // Decoder stream carries our peer's ACKs; we don't emit
-                        // inserts that require acking yet — discard safely.
-                        st.buf.clear();
-                        Route::Ignore
+                        let drained = std::mem::take(&mut st.buf);
+                        s.qpack_decoder_rx.extend_from_slice(&drained);
+                        Route::QpackDecoder
                     }
                     PeerStreamClass::WebTransport => {
                         // Consume the session-id varint once, then stream is raw data.
@@ -1997,6 +2028,9 @@ impl WtEndpoint {
                 // Inserts may unblock HEADERS waiting on Required Insert Count.
                 self.retry_blocked_connects(h);
             }
+            Route::QpackDecoder => {
+                self.parse_qpack_decoder(h);
+            }
             Route::ServerConnect { id } => self.parse_server_connect(h, id),
             Route::WtData {
                 handle,
@@ -2075,6 +2109,7 @@ impl WtEndpoint {
 
     /// Feed peer QPACK encoder-stream instructions into the dynamic table.
     fn parse_qpack_encoder(&mut self, h: ConnectionHandle) {
+        let mut ici: Option<(StreamId, Vec<u8>)> = None;
         let err = {
             let Some(s) = self.sessions.get_mut(&h) else {
                 return;
@@ -2085,9 +2120,19 @@ impl WtEndpoint {
                     b"QPACK encoder stream too large".as_slice(),
                 ))
             } else {
+                let before = s.qpack_decoder.table().insert_count();
                 match h3::feed_encoder_stream(&mut s.qpack_decoder, &s.qpack_encoder_rx) {
                     Ok(n) => {
                         s.qpack_encoder_rx.drain(..n);
+                        let after = s.qpack_decoder.table().insert_count();
+                        if after > before {
+                            let delta = after - before;
+                            s.qpack_decoder.note_insert_count_increment(delta);
+                            if let Some(decoder_send) = s.qpack_decoder_send {
+                                ici =
+                                    Some((decoder_send, h3::encode_insert_count_increment(delta)));
+                            }
+                        }
                         None
                     }
                     Err(_) => Some((
@@ -2099,6 +2144,54 @@ impl WtEndpoint {
         };
         if let Some((code, reason)) = err {
             self.close_conn_protocol_error(h, code, reason);
+            return;
+        }
+        if let Some((sid, bytes)) = ici {
+            if let Some(conn) = self.conns.get_mut(&h) {
+                let _ = conn.send_stream(sid).write(&bytes);
+            }
+        }
+    }
+
+    /// Consume peer decoder-stream ACKs / ICI (outbound inserts stay literal today).
+    fn parse_qpack_decoder(&mut self, h: ConnectionHandle) {
+        let err = {
+            let Some(s) = self.sessions.get_mut(&h) else {
+                return;
+            };
+            if s.qpack_decoder_rx.len() > MAX_H3_FRAME_SIZE as usize {
+                Some((
+                    QPACK_DECODER_STREAM_ERROR,
+                    b"QPACK decoder stream too large".as_slice(),
+                ))
+            } else {
+                match h3::feed_decoder_stream(&s.qpack_decoder_rx) {
+                    Ok((n, _)) => {
+                        s.qpack_decoder_rx.drain(..n);
+                        None
+                    }
+                    Err(_) => Some((
+                        QPACK_DECODER_STREAM_ERROR,
+                        b"QPACK decoder stream error".as_slice(),
+                    )),
+                }
+            }
+        };
+        if let Some((code, reason)) = err {
+            self.close_conn_protocol_error(h, code, reason);
+        }
+    }
+
+    fn emit_qpack_section_ack(&mut self, h: ConnectionHandle, stream_id: StreamId, ric: u64) {
+        if ric == 0 {
+            return;
+        }
+        let Some(decoder_send) = self.sessions.get(&h).and_then(|s| s.qpack_decoder_send) else {
+            return;
+        };
+        let bytes = h3::encode_section_acknowledgement(u64::from(stream_id));
+        if let Some(conn) = self.conns.get_mut(&h) {
+            let _ = conn.send_stream(decoder_send).write(&bytes);
         }
     }
 
@@ -2210,12 +2303,13 @@ impl WtEndpoint {
                     );
                     return;
                 }
-                Ok(headers) => {
+                Ok((headers, ric)) => {
                     if let Some(s) = self.sessions.get_mut(&h) {
                         if let Some(st) = s.in_streams.get_mut(&stream_id) {
                             st.buf.drain(..total);
                         }
                     }
+                    self.emit_qpack_section_ack(h, stream_id, ric);
 
                     let is_connect = headers_are_webtransport_connect(&headers);
                     if !is_connect {
@@ -2350,9 +2444,12 @@ impl WtEndpoint {
                     );
                     return;
                 }
-                Ok(headers) => {
+                Ok((headers, ric)) => {
                     if let Some(s) = self.sessions.get_mut(&h) {
                         s.connect_rx.drain(..total);
+                    }
+                    if let Some(sid) = self.sessions.get(&h).and_then(|s| s.connect_stream) {
+                        self.emit_qpack_section_ack(h, sid, ric);
                     }
                     headers
                 }
@@ -2457,7 +2554,7 @@ impl WtEndpoint {
                     );
                     return;
                 }
-                Ok(headers) => {
+                Ok((headers, ric)) => {
                     if let Some(pending) = self
                         .sessions
                         .get_mut(&h)
@@ -2465,6 +2562,7 @@ impl WtEndpoint {
                     {
                         pending.rx.drain(..total);
                     }
+                    self.emit_qpack_section_ack(h, stream_id, ric);
                     headers
                 }
             };

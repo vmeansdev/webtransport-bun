@@ -281,6 +281,8 @@ impl DynamicTable {
 pub struct QpackDecoder {
     table: DynamicTable,
     max_blocked_streams: u64,
+    /// Inserts we have acknowledged to the peer via decoder-stream ICI.
+    known_received_count: u64,
 }
 
 impl QpackDecoder {
@@ -289,6 +291,7 @@ impl QpackDecoder {
         Self {
             table: DynamicTable::new(max_cap),
             max_blocked_streams: settings.max_blocked_streams,
+            known_received_count: 0,
         }
     }
 
@@ -310,6 +313,14 @@ impl QpackDecoder {
 
     pub fn max_table_capacity(&self) -> u64 {
         self.table.max_capacity() as u64
+    }
+
+    pub fn known_received_count(&self) -> u64 {
+        self.known_received_count
+    }
+
+    pub fn note_insert_count_increment(&mut self, delta: u64) {
+        self.known_received_count = self.known_received_count.saturating_add(delta);
     }
 }
 
@@ -537,6 +548,54 @@ pub fn feed_encoder_stream(decoder: &mut QpackDecoder, data: &[u8]) -> Result<us
     Ok(offset)
 }
 
+/// Encode a Section Acknowledgement decoder instruction (RFC 9204 §4.4.1).
+/// `stream_id` is the request stream id whose field section was fully processed.
+pub fn encode_section_acknowledgement(stream_id: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    qpack_int(0x80, 7, stream_id, &mut out);
+    out
+}
+
+/// Encode an Insert Count Increment decoder instruction (RFC 9204 §4.4.3).
+pub fn encode_insert_count_increment(delta: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    qpack_int(0x00, 6, delta, &mut out);
+    out
+}
+
+/// Parse peer decoder-stream instructions (acks / cancellations / ICI).
+/// Returns bytes consumed. Trailing partial instructions are left unconsumed.
+pub fn feed_decoder_stream(data: &[u8]) -> Result<(usize, u64 /* ici delta sum */), QpackError> {
+    let mut offset = 0usize;
+    let mut ici_total = 0u64;
+    while offset < data.len() {
+        let buf = &data[offset..];
+        let first = buf[0];
+        let consumed = if first & 0x80 != 0 {
+            // Section Acknowledgement: 1 stream_id(7+)
+            let Some((_sid, n)) = qpack_int_decode(buf, 7) else {
+                break;
+            };
+            n
+        } else if first & 0x40 != 0 {
+            // Stream Cancellation: 01 stream_id(6+)
+            let Some((_sid, n)) = qpack_int_decode(buf, 6) else {
+                break;
+            };
+            n
+        } else {
+            // Insert Count Increment: 00 delta(6+)
+            let Some((delta, n)) = qpack_int_decode(buf, 6) else {
+                break;
+            };
+            ici_total = ici_total.saturating_add(delta);
+            n
+        };
+        offset += consumed;
+    }
+    Ok((offset, ici_total))
+}
+
 /// QPACK integer with an N-bit prefix (RFC 9204 §4.1.1 / RFC 7541 §5.1).
 fn qpack_int(prefix: u8, n: u8, value: u64, out: &mut Vec<u8>) {
     let max = (1u64 << n) - 1;
@@ -737,7 +796,9 @@ const QPACK_STATIC_TABLE: [(&str, &str); 99] = [
 /// when a [`QpackDecoder`] is available.
 pub fn decode_literal_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
     let decoder = QpackDecoder::disabled();
-    decode_field_section(buf, &decoder).ok()
+    decode_field_section(buf, &decoder)
+        .ok()
+        .map(|(headers, _)| headers)
 }
 
 /// Decode a QPACK field section against decoder dynamic-table state.
@@ -746,11 +807,11 @@ pub fn decode_literal_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
 /// (static or dynamic), Literal With Literal Name, and Post-Base forms.
 /// Returns [`QpackError::Blocked`] when Required Insert Count exceeds known
 /// inserts (caller may wait for encoder-stream data), or [`QpackError::Invalid`]
-/// for OOB / malformed / abuse.
+/// for OOB / malformed / abuse. On success returns `(headers, required_insert_count)`.
 pub fn decode_field_section(
     mut buf: &[u8],
     decoder: &QpackDecoder,
-) -> Result<Vec<(String, String)>, QpackError> {
+) -> Result<(Vec<(String, String)>, u64), QpackError> {
     if buf.len() < 2 {
         return Err(QpackError::Invalid);
     }
@@ -850,7 +911,7 @@ pub fn decode_field_section(
             out.push((name, value));
         }
     }
-    Ok(out)
+    Ok((out, ric))
 }
 
 /// Read a QPACK string literal: 1-bit Huffman flag + 7-bit length prefix + bytes.
@@ -1082,8 +1143,15 @@ mod tests {
         );
 
         let section = enc.encode_indexed_newest_section().unwrap();
-        let hdrs = decode_field_section(&section, &dec).unwrap();
+        let (hdrs, ric) = decode_field_section(&section, &dec).unwrap();
+        assert_eq!(ric, 1);
         assert_eq!(hdrs, vec![(":protocol".into(), "webtransport".into())]);
+        let ack = encode_section_acknowledgement(0);
+        assert!(!ack.is_empty());
+        let ici = encode_insert_count_increment(1);
+        let (n, delta) = feed_decoder_stream(&ici).unwrap();
+        assert_eq!(n, ici.len());
+        assert_eq!(delta, 1);
     }
 
     #[test]

@@ -96,6 +96,15 @@ export type WasmEndpointOptions = {
 	wtMaxSessions?: number;
 	/** Enable QUIC 0-RTT / early data when the wasm module supports it. */
 	enable0Rtt?: boolean;
+	/**
+	 * Opt-in dynamic QPACK table capacity (bytes). Default 0 (literal-only).
+	 * Prefer {@link enableDynamicQpack} for the 4096/16 preset.
+	 */
+	qpackMaxTableCapacity?: number;
+	/** SETTINGS_QPACK_BLOCKED_STREAMS; default 0, or 16 when capacity > 0 and omitted. */
+	qpackBlockedStreams?: number;
+	/** Alias for `{ qpackMaxTableCapacity: 4096, qpackBlockedStreams: 16 }`. */
+	enableDynamicQpack?: boolean;
 };
 
 export type WasmNormalizedEndpointOptions = {
@@ -105,6 +114,9 @@ export type WasmNormalizedEndpointOptions = {
 	wtMaxSessions?: number;
 	/** Present only when the caller set {@link WasmEndpointOptions.enable0Rtt}. */
 	enable0Rtt?: boolean;
+	qpackMaxTableCapacity?: number;
+	qpackBlockedStreams?: number;
+	enableDynamicQpack?: boolean;
 };
 
 const WASM_U32_MAX = 0xffff_ffff;
@@ -152,6 +164,23 @@ function normalizePositiveInteger(
 	if (value > maximum) {
 		const range = maximum === HOST_TIMER_MAX_MS ? "host timer" : "WASM integer";
 		throw new RangeError(`${name} exceeds the supported ${range} range`);
+	}
+	return value;
+}
+
+function normalizeNonNegativeInteger(
+	name: string,
+	value: number,
+	maximum = WASM_U32_MAX,
+): number {
+	if (!Number.isFinite(value) || !Number.isInteger(value)) {
+		throw new TypeError(`${name} must be a finite integer`);
+	}
+	if (value < 0) {
+		throw new RangeError(`${name} must be a non-negative integer`);
+	}
+	if (value > maximum) {
+		throw new RangeError(`${name} exceeds the supported WASM integer range`);
 	}
 	return value;
 }
@@ -310,11 +339,43 @@ export function normalizeWasmEndpointOptions(
 		enable0Rtt = Boolean(options.enable0Rtt);
 	}
 
+	const enableDynamicQpack =
+		options.enableDynamicQpack === undefined
+			? undefined
+			: Boolean(options.enableDynamicQpack);
+	let qpackMaxTableCapacity: number | undefined;
+	let qpackBlockedStreams: number | undefined;
+	if (enableDynamicQpack) {
+		qpackMaxTableCapacity = 4096;
+		qpackBlockedStreams = 16;
+	} else {
+		if (options.qpackMaxTableCapacity !== undefined) {
+			qpackMaxTableCapacity = normalizeNonNegativeInteger(
+				"qpackMaxTableCapacity",
+				options.qpackMaxTableCapacity,
+			);
+		}
+		if (options.qpackBlockedStreams !== undefined) {
+			qpackBlockedStreams = normalizeNonNegativeInteger(
+				"qpackBlockedStreams",
+				options.qpackBlockedStreams,
+			);
+		} else if (
+			qpackMaxTableCapacity !== undefined &&
+			qpackMaxTableCapacity > 0
+		) {
+			qpackBlockedStreams = 16;
+		}
+	}
+
 	return {
 		limits,
 		rateLimits,
 		...(wtMaxSessions === undefined ? {} : { wtMaxSessions }),
 		...(enable0Rtt === undefined ? {} : { enable0Rtt }),
+		...(qpackMaxTableCapacity === undefined ? {} : { qpackMaxTableCapacity }),
+		...(qpackBlockedStreams === undefined ? {} : { qpackBlockedStreams }),
+		...(enableDynamicQpack === undefined ? {} : { enableDynamicQpack }),
 	};
 }
 
@@ -1504,6 +1565,15 @@ export interface WasmConnectOptions {
 	wtMaxSessions?: number;
 	/** Opt-in QUIC TLS 1.3 early data (default false). */
 	enable0Rtt?: boolean;
+	/**
+	 * Opt-in dynamic QPACK table capacity (bytes). Default 0 (literal-only).
+	 * Prefer {@link enableDynamicQpack} for the 4096/16 preset.
+	 */
+	qpackMaxTableCapacity?: number;
+	/** SETTINGS_QPACK_BLOCKED_STREAMS; default 0, or 16 when capacity > 0 and omitted. */
+	qpackBlockedStreams?: number;
+	/** Alias for `{ qpackMaxTableCapacity: 4096, qpackBlockedStreams: 16 }`. */
+	enableDynamicQpack?: boolean;
 	/** W3C facade options applied when wrapping the session as WasmWebTransport. */
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;

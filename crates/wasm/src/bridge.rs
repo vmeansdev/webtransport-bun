@@ -12,6 +12,7 @@ use web_time::Instant;
 
 use crate::endpoint::WtEndpoint;
 use crate::governor::{WasmLimits, WasmRateLimits};
+use crate::h3;
 use crate::handle::HandleAllocator;
 
 thread_local! {
@@ -158,6 +159,37 @@ fn parse_enable_0rtt(parsed: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Opt-in dynamic QPACK SETTINGS. Default disabled (0/0).
+/// `enableDynamicQpack: true` aliases `{4096, 16}`.
+fn parse_qpack_settings(parsed: &serde_json::Value) -> h3::QpackLocalSettings {
+    if parsed
+        .get("enableDynamicQpack")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return h3::QpackLocalSettings::default();
+    }
+    let capacity = parsed
+        .get("qpackMaxTableCapacity")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let blocked = if capacity > 0 {
+        parsed
+            .get("qpackBlockedStreams")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(16)
+    } else {
+        parsed
+            .get("qpackBlockedStreams")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    h3::QpackLocalSettings {
+        max_table_capacity: capacity,
+        max_blocked_streams: blocked,
+    }
+}
+
 /// Create an endpoint. Returns the numeric eid on success, or 0 on a bad
 /// address (0 is never a valid eid — allocation starts at 1).
 ///
@@ -235,6 +267,7 @@ pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
     apply_optional_wt_max_sessions(&mut ep, &parsed);
+    ep.set_qpack_settings(parse_qpack_settings(&parsed));
     match register_endpoint(ep) {
         Ok(id) => serde_json::json!({ "eid": id }).to_string(),
         Err(error) => serde_json::json!({ "error": error }).to_string(),
@@ -352,6 +385,7 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
     ) {
         Ok((mut ep, hash)) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);
+            ep.set_qpack_settings(parse_qpack_settings(&parsed));
             match register_endpoint(ep) {
                 Ok(id) => serde_json::json!({ "eid": id, "hashBase64": hash }).to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),
@@ -430,6 +464,7 @@ pub fn wt_new_client_with_options(config_json: &str) -> String {
     ) {
         Ok(mut ep) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);
+            ep.set_qpack_settings(parse_qpack_settings(&parsed));
             match register_endpoint(ep) {
                 Ok(id) => serde_json::json!({ "eid": id }).to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),

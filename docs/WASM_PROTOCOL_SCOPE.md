@@ -11,7 +11,7 @@ requires, in addition to evidence gates:
 
 | Capability | 1.0 requirement | Claim id | Status |
 |---|---|---|---|
-| Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | foundation only — wire default SETTINGS capacity 0; product opt-in + decoder ACKs pending |
+| Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | product surface: decoder-stream ICI/section-ack emit before non-zero SETTINGS; opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); outbound CONNECT stays literal |
 | Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | product surface landed: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
 | 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | product surface: `TicketStoreHost`/`MemoryTicketStoreHost` take-once, `has0Rtt`/`accepted0Rtt` exports, process-local shared store when `enable0Rtt: true` (default false); CONNECT/app policy waits for 1-RTT |
 | Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | foundation/options work started; product-complete evidence pending |
