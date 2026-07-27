@@ -9,7 +9,11 @@ import {
 	type WasmEndpointConstructorOptions,
 	type WasmModule,
 	type WasmSessionEvents,
+	MemoryTicketStoreHost,
+	type TicketStoreHost,
 } from "./backend-wasm.js";
+export type { TicketStoreHost };
+export { MemoryTicketStoreHost };
 import { createMonotonicDeadline } from "./deadline.js";
 import type {
 	ErrorCode,
@@ -718,6 +722,16 @@ export class WasmSession {
 			this.sessionId,
 			this.configuredMaxDatagramSize,
 		);
+	}
+
+	/** Whether this connection has 0-RTT keys (ticket present). Default-off endpoints stay false. */
+	get has0Rtt(): boolean {
+		return this.mgr.endpoint.has0Rtt(this.conn);
+	}
+
+	/** Whether the peer accepted 0-RTT for this connection. */
+	get accepted0Rtt(): boolean {
+		return this.mgr.endpoint.accepted0Rtt(this.conn);
 	}
 
 	async sendDatagram(data: Uint8Array): Promise<void> {
@@ -1488,6 +1502,8 @@ export interface WasmConnectOptions {
 	limits?: WasmLimitsOptions;
 	rateLimits?: WasmRateLimitOptions;
 	wtMaxSessions?: number;
+	/** Opt-in QUIC TLS 1.3 early data (default false). */
+	enable0Rtt?: boolean;
 	/** W3C facade options applied when wrapping the session as WasmWebTransport. */
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;

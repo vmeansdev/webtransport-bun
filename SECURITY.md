@@ -114,6 +114,11 @@ wasm stack configures rustls/quinn-proto for TLS 1.3 early data:
   ticket-store bridge must supply coordinated single-use semantics if required.
 - **Disabled by default:** with `enable0Rtt: false`, early data is not offered
   or accepted even if residual tickets exist in a shared store.
+- **CONNECT / app policy:** wait for 1-RTT (post-handshake) before non-idempotent
+  WebTransport CONNECT or application RPCs unless an explicit, documented
+  exception allows early data. Export `has0Rtt` / `accepted0Rtt` so hosts can
+  gate sends. `TicketStoreHost.take` is single-use (anti-replay); do not reuse
+  a taken ticket.
 
 ## Known limitations
 ### Private key memory zeroing
