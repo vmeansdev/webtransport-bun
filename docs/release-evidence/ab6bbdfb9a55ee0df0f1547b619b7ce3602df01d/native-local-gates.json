@@ -16,8 +16,8 @@
 		"--lib"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "cargo test -p native --lib 110 pass",
-	"artifactSha256": "2f58a3cb23831bbba00786413b6fb09b89365e4d56da6c9897d02680cc70bb23"
+	"startedAt": "2026-07-27T14:00:00+00:00",
+	"finishedAt": "2026-07-27T14:00:02+00:00",
+	"notes": "cargo test -p native --lib 110 pass (wall window ~2s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "2e0966d3f43429ea10d9613e3ffe9880095555ab770e44633285815b88fb4f83"
 }

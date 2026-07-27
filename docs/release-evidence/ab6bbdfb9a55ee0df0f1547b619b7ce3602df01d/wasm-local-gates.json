@@ -14,8 +14,8 @@
 		"test:wasm"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "bun run test:wasm 82 pass",
-	"artifactSha256": "d7c82d5a5b85b69c0f9c10a4ee592d3607f6364f016f3a7c0e5e3c44145bfc41"
+	"startedAt": "2026-07-27T14:00:24+00:00",
+	"finishedAt": "2026-07-27T14:00:36+00:00",
+	"notes": "bun run test:wasm 82 pass (wall window ~12s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "06bbd5c831d3683e885d2591885695a4142c7f58f180585e6b1375d58db0b36a"
 }

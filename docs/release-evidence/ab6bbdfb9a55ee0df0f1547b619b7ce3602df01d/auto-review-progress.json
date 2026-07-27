@@ -11,7 +11,7 @@
 		"chromiumWasmInterop": "5/5 passed",
 		"chromiumNativeInterop": "19/19 passed",
 		"faultMatrix": "1/1 passed",
-		"docTruth": "pending-bind",
+		"docTruth": "passed (narrative docs synced in round-3 L7 follow-up; pending commit)",
 		"packageArtifactCheck": "passed (eventWireVersion 2)",
 		"coverageFloors": "failed"
 	},
@@ -32,5 +32,6 @@
 		"wasm-dynamic-qpack": "PASS",
 		"auto-review-zero-p0-p4": "PASS"
 	},
-	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d"
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"round3Note": "L7 open doc-lag findings fixed in working tree; awaiting remaining lanes."
 }

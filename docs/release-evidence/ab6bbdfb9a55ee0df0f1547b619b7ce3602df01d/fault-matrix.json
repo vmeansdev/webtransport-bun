@@ -16,8 +16,8 @@
 		"playwright.fault.config.ts"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "fault matrix 1/1",
-	"artifactSha256": "ff2bdb5ba7e59beb19ae8bea333f3aa1f82c303cbc6b962ea63a260d90876b6d"
+	"startedAt": "2026-07-27T14:02:19+00:00",
+	"finishedAt": "2026-07-27T14:02:44+00:00",
+	"notes": "fault matrix 1/1 (wall window ~25s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "cbc0ee5f459b0012b4afb1c2eb2a16a781469e7e3bc0b1094a830753624d7076"
 }

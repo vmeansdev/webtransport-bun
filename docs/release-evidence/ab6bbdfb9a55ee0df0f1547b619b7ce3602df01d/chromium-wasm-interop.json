@@ -16,8 +16,8 @@
 		"playwright.wasm.config.ts"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "Playwright chromium-webtransport-wasm 5/5",
-	"artifactSha256": "ca010401e36dded4fbe1dcbd870e6f64b4b20a73f6d9e3cdc78106d69f7e14e6"
+	"startedAt": "2026-07-27T14:00:37+00:00",
+	"finishedAt": "2026-07-27T14:01:22+00:00",
+	"notes": "Playwright chromium-webtransport-wasm 5/5 (wall window ~45s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "2800bac5029ac7d38a0202c93af265215db842c77d7199c9b94d1c5bf953058f"
 }

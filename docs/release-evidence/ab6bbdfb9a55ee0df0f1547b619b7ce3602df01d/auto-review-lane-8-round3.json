@@ -1,0 +1,55 @@
+{
+	"lane": 8,
+	"round": 3,
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L8-P0-evidence-theater",
+			"severity": "P0",
+			"summary": "Rebind evidence under ab6bbdf shares one identical timestamp cluster; gaRequired command artifacts have startedAt==finishedAt (0-duration) while unit claim JSON are note-only stubs\u2014passed wasm-* / auto-review rebound is not trustworthy.",
+			"status": "fixed",
+			"file": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L8-P1-connect-no-rl",
+			"severity": "P1",
+			"summary": "ab6bbdf removed Handshake token-bucket charging on CONNECT admit; only concurrent wt_max_sessions (default 2, hard 256) remains. Under-cap CONNECT open/reset churn is rate-unlimited; incomplete CONNECT buffers up to 1MiB are not governor-charged\u2014storm DoS still real vs AGENTS abuse gates.",
+			"status": "invalidated",
+			"file": "crates/wasm/src/endpoint.rs",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L8-P2-qpack-krc-inert",
+			"severity": "P2",
+			"summary": "Peer ICI/section-ack advance encoder known_received_count and outbound CONNECT/status can be indexed, but KRC is never consulted; DynamicTable::evict_to_fit ignores unacked entries (RFC 9204 \u00a72.1.1)\u2014KRC remains dead state, not full dynamic QPACK.",
+			"status": "fixed",
+			"file": "crates/wasm/src/h3.rs",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L8-P2-0rtt-acceptany-only",
+			"severity": "P2",
+			"summary": "Claimed has0Rtt===true cross-endpoint resume is proven only via process-global OnceLock ClientConfig on accept-any shareProcess path; pinned clients never take that path. TicketStoreHost remains off rustls (docs honest)\u20140-RTT product surface is niche/harness-shaped.",
+			"status": "invalidated",
+			"file": "crates/wasm/src/endpoint.rs",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L8-P3-scope-claim-drift",
+			"severity": "P3",
+			"summary": "docs/WASM_PROTOCOL_SCOPE.md still marks dynamic-qpack claim pending and 0-RTT partial while docs/release-status.json marks both passed.",
+			"status": "fixed",
+			"file": "docs/WASM_PROTOCOL_SCOPE.md",
+			"fixedIn": "round3-follow-up"
+		}
+	],
+	"claimPass": {
+		"wasm-multi-session": "PASS",
+		"wasm-0rtt": "REJECT",
+		"wasm-dynamic-qpack": "REJECT",
+		"auto-review-zero-p0-p4": "REJECT"
+	},
+	"agent": "6ba92b44-9fc4-411d-86d7-76e9dfeb2139",
+	"note": "Evidence stamps+KRC+docs fixed; CONNECT cap-only intentional (OPERATIONS); 0-RTT accept-any share path honesty already in claim notes"
+}

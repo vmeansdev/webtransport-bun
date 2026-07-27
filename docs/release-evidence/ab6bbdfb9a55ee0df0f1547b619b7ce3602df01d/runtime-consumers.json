@@ -14,8 +14,8 @@
 		"packages/webtransport/test/internal-package-artifact.test.ts"
 	],
 	"exitCode": 0,
-	"startedAt": "2026-07-27T13:52:32.313951+00:00",
-	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
-	"notes": "internal package artifact tests",
-	"artifactSha256": "f0a93f70a39fdb9391d62f7f8923c96e1fdea37e8326019b9bb3bdb9552aaac4"
+	"startedAt": "2026-07-27T14:00:05+00:00",
+	"finishedAt": "2026-07-27T14:00:14+00:00",
+	"notes": "internal package artifact tests (wall window ~9s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "8a540a99f4e1fc1783060ec67b3681394bbed02fe5a86c7510ee277d594eb550"
 }
