@@ -3,6 +3,7 @@ import {
 	connectWasm,
 	createWasmServer,
 	normalizeWasmEndpointOptions,
+	serveOverUdp,
 } from "../src/backend.js";
 import { MemoryTicketStoreHost } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
@@ -131,6 +132,74 @@ describe("wasm 0-RTT product surface", () => {
 				shared,
 			);
 			await withDeadline(second.session.ready, 5_000, "second.ready");
+			expect(second.manager.endpoint.enable0Rtt()).toBe(true);
+			expect(second.session.has0Rtt).toBe(true);
+			second.manager.close();
+			server.close();
+		},
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"pinned client + MemoryTicketStoreHost hydrate yields has0Rtt without shareProcess",
+		async () => {
+			const relay = new InMemoryRelay();
+			const ticketStore = new MemoryTicketStoreHost();
+			const { manager: server, certHashBase64 } = await serveOverUdp(
+				wasm,
+				(localAddress, localPort) =>
+					Promise.resolve(
+						relay.endpoint({ address: localAddress, port: localPort }),
+					),
+				{
+					localAddress: "127.0.0.1",
+					localPort: 4433,
+					enable0Rtt: true,
+					onSession: (s) => {
+						s.onDatagram((d) => {
+							void s.sendDatagram(d);
+						});
+					},
+				},
+			);
+			expect(server.endpoint.enable0Rtt()).toBe(true);
+
+			const first = await connectWasm(
+				wasm,
+				relay.endpoint({ address: "127.0.0.1", port: 5544 }),
+				"localhost",
+				"127.0.0.1:5544",
+				"127.0.0.1:4433",
+				{
+					enable0Rtt: true,
+					certHashBase64,
+					ticketStore,
+				},
+			);
+			await withDeadline(first.session.ready, 5_000, "pinned.first.ready");
+			expect(first.session.has0Rtt).toBe(false);
+			for (let i = 0; i < 100; i++) {
+				server.endpoint.pump();
+				first.manager.endpoint.pump();
+				await Bun.sleep(5);
+			}
+			const dumped = await first.manager.dumpTicketsToHost("localhost");
+			expect(dumped).toBe(true);
+			first.session.close();
+			first.manager.close();
+
+			const second = await connectWasm(
+				wasm,
+				relay.endpoint({ address: "127.0.0.1", port: 5545 }),
+				"localhost",
+				"127.0.0.1:5545",
+				"127.0.0.1:4433",
+				{
+					enable0Rtt: true,
+					certHashBase64,
+					ticketStore,
+				},
+			);
+			await withDeadline(second.session.ready, 5_000, "pinned.second.ready");
 			expect(second.manager.endpoint.enable0Rtt()).toBe(true);
 			expect(second.session.has0Rtt).toBe(true);
 			second.manager.close();

@@ -715,6 +715,28 @@ pub fn wt_enable_0rtt(eid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Dump client TLS tickets for `server_name` into an opaque process-local blob.
+/// Empty vector when no tickets / no 0-RTT store.
+#[wasm_bindgen]
+pub fn wt_dump_client_ticket(eid: u32, server_name: &str) -> Vec<u8> {
+    with_endpoint_mut(eid, |endpoint| endpoint.dump_client_ticket(server_name))
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Hydrate opaque client-ticket blob into the endpoint store before connect.
+#[wasm_bindgen]
+pub fn wt_import_client_ticket(eid: u32, server_name: &str, blob: &[u8]) -> bool {
+    with_endpoint_mut(eid, |endpoint| {
+        endpoint.import_client_ticket(server_name, blob)
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 #[wasm_bindgen]
 pub fn wt_close_endpoint(eid: u32) {
     let _ = REGISTRY.try_with(|registry| {

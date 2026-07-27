@@ -118,8 +118,10 @@ wasm stack configures rustls/quinn-proto for TLS 1.3 early data:
   WebTransport CONNECT or application RPCs unless an explicit, documented
   exception allows early data. Export `has0Rtt` / `accepted0Rtt` so hosts can
   gate sends. In-process anti-replay uses the Rust `InMemoryTicketStore::take`
-  path (not the JS `TicketStoreHost` export, which is not yet wired into rustls).
-  Do not reuse a taken ticket.
+  path. JS `TicketStoreHost` participates on the **hydrate/dump** path around
+  connect/close (opaque process-local vault blobs keyed by server name); it is
+  not on the rustls hot path. Durable IndexedDB / cross-process ticket
+  serialization remains out of scope. Do not reuse a taken ticket.
 
 ## Known limitations
 ### Private key memory zeroing
