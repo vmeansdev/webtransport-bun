@@ -262,7 +262,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Foundation only (unit/fuzz paths). Product incomplete until decoder ACKs + opt-in SETTINGS>0 + wasm↔wasm evidence."
+			"notes": "Foundation only (unit/fuzz paths). Product incomplete until decoder ACKs + opt-in SETTINGS>0 + wasm\u2194wasm evidence."
 		},
 		{
 			"id": "wasm-multi-session",
@@ -270,7 +270,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Foundation only (Rust multi-CONNECT). Product incomplete until WtEvent session_id demux + JS (conn,sessionId) facade + evidence."
+			"notes": "Product surface landed (WtEvent session_id + JS (conn,sessionId) + openSession). Evidence JSON on disk; rebind when candidate commit advances."
 		},
 		{
 			"id": "wasm-0rtt",
