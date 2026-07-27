@@ -61,7 +61,7 @@ struct Session {
     control_rx: Vec<u8>,
     /// Inbound QPACK encoder-stream bytes awaiting instruction parse.
     qpack_encoder_rx: Vec<u8>,
-    /// Decoder-side dynamic QPACK table (bounded by local SETTINGS defaults).
+    /// Decoder-side dynamic QPACK table (matches advertised SETTINGS; default 0).
     qpack_decoder: h3::QpackDecoder,
     /// Peer-accepted streams (uni + bidi) being classified/read.
     in_streams: HashMap<StreamId, InStream>,
