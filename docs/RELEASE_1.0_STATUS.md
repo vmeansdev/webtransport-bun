@@ -18,14 +18,11 @@ Package version: `1.0.0-rc.1`.
 - `fault-matrix` (1/1)
 - `coverage-gates` (native+wasm llvm-cov floors ≥90/90/80)
 - `package-artifact`, `supply-chain-provenance`
-- Protocol/facade bar: `wasm-dynamic-qpack`, `wasm-multi-session`,
-  `wasm-0rtt`, `wasm-facade-parity` (unit/parity evidence; Chromium-facing
-  QPACK SETTINGS remain zero by default until decoder-stream ACKs land)
-
 ### Still pending (block promote)
 
 | Claim | Blocker |
 |---|---|
+| `wasm-dynamic-qpack` / `wasm-multi-session` / `wasm-0rtt` / `wasm-facade-parity` | Demoted to pending: foundation unit evidence only; product surfaces incomplete |
 | `iwa-direct-sockets` | Needs IWA origin/bundle + Chrome Direct Sockets run (`origin.txt` missing locally) |
 | `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
 | `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |
