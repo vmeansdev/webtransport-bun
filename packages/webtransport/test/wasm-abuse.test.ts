@@ -152,7 +152,8 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 			options,
 			{
 				onEstablished: (conn) => serverEstablished.push(conn),
-				onStreamOpened: (conn, stream) => serverOpened.push({ conn, stream }),
+				onStreamOpened: (conn, _sessionId, stream) =>
+					serverOpened.push({ conn, stream }),
 			},
 		);
 		const clientA = WasmEndpoint.create(
@@ -297,6 +298,7 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 				"both peers establish for datagram abuse",
 			);
 
+			const sessionId = 0n;
 			expect(clientA.sendDatagram(connA, sessionId, Uint8Array.of(0x01))).toBe(
 				true,
 			);
