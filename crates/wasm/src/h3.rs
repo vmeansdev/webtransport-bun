@@ -202,34 +202,67 @@ impl DynamicTable {
 
     /// RFC 9204 §4.3.1 — capacity must not exceed the SETTINGS max.
     pub fn set_capacity(&mut self, capacity: usize) -> Result<(), QpackError> {
+        self.set_capacity_with_ack_floor(capacity, None)
+    }
+
+    /// Like [`Self::set_capacity`], but encoder tables must not evict entries
+    /// newer than `ack_floor` (Known Received Count).
+    pub fn set_capacity_with_ack_floor(
+        &mut self,
+        capacity: usize,
+        ack_floor: Option<u64>,
+    ) -> Result<(), QpackError> {
         if capacity > self.max_capacity {
             return Err(QpackError::Invalid);
         }
         self.capacity = capacity;
-        self.evict_to_fit(0);
-        Ok(())
+        self.evict_to_fit(0, ack_floor)
     }
 
     /// Insert a name/value pair, evicting oldest entries as needed.
     pub fn insert(&mut self, name: String, value: String) -> Result<(), QpackError> {
+        self.insert_with_ack_floor(name, value, None)
+    }
+
+    /// Encoder insert: never evict dynamic entries with absolute index
+    /// `> ack_floor` (unacknowledged). Returns [`QpackError::Invalid`] when the
+    /// insert cannot fit without dropping unacked entries (RFC 9204 §3.2.2).
+    pub fn insert_with_ack_floor(
+        &mut self,
+        name: String,
+        value: String,
+        ack_floor: Option<u64>,
+    ) -> Result<(), QpackError> {
         let sz = Self::entry_size(&name, &value);
         if sz > self.capacity {
-            // Entry larger than current capacity: drop it (and empty the table)
-            // per RFC 9204 §3.2.2 — not a hard error.
-            self.evict_to_fit(usize::MAX);
+            // Entry larger than current capacity: drop acknowledged entries
+            // (and empty only what the ack floor allows) — not a hard error
+            // when the table can be cleared.
+            self.evict_to_fit(usize::MAX, ack_floor)?;
             return Ok(());
         }
-        self.evict_to_fit(sz);
+        self.evict_to_fit(sz, ack_floor)?;
         self.entries.push_back(DynEntry { name, value });
         self.size = self.size.saturating_add(sz);
         self.insert_count = self.insert_count.saturating_add(1);
         Ok(())
     }
 
-    fn evict_to_fit(&mut self, additional: usize) {
+    fn evict_to_fit(
+        &mut self,
+        additional: usize,
+        ack_floor: Option<u64>,
+    ) -> Result<(), QpackError> {
         while !self.entries.is_empty()
             && (additional == usize::MAX || self.size.saturating_add(additional) > self.capacity)
         {
+            if let Some(oldest) = self.oldest_absolute() {
+                if let Some(floor) = ack_floor {
+                    if oldest > floor {
+                        return Err(QpackError::Invalid);
+                    }
+                }
+            }
             if let Some(e) = self.entries.pop_front() {
                 self.size = self
                     .size
@@ -239,6 +272,10 @@ impl DynamicTable {
                 break;
             }
         }
+        if additional != usize::MAX && self.size.saturating_add(additional) > self.capacity {
+            return Err(QpackError::Invalid);
+        }
+        Ok(())
     }
 
     fn oldest_absolute(&self) -> Option<u64> {
@@ -377,7 +414,8 @@ impl QpackEncoder {
 
     /// Emit a Set Dynamic Table Capacity instruction and apply it locally.
     pub fn set_capacity_instruction(&mut self, capacity: usize) -> Result<Vec<u8>, QpackError> {
-        self.table.set_capacity(capacity)?;
+        self.table
+            .set_capacity_with_ack_floor(capacity, Some(self.known_received_count))?;
         let mut out = Vec::new();
         // 001 capacity (5+)
         qpack_int(0x20, 5, capacity as u64, &mut out);
@@ -397,7 +435,11 @@ impl QpackEncoder {
         out.extend_from_slice(name.as_bytes());
         qpack_int(0x00, 7, value.len() as u64, &mut out);
         out.extend_from_slice(value.as_bytes());
-        self.table.insert(name.to_string(), value.to_string())?;
+        self.table.insert_with_ack_floor(
+            name.to_string(),
+            value.to_string(),
+            Some(self.known_received_count),
+        )?;
         Ok(out)
     }
 
@@ -1409,6 +1451,23 @@ mod tests {
         assert!(table.is_empty());
         assert_eq!(table.size(), 0);
         assert_eq!(table.insert_count(), 2); // insert count is never decremented
+    }
+
+    #[test]
+    fn encoder_refuses_to_evict_unacked_dynamic_entries() {
+        let mut enc = QpackEncoder::new(34);
+        enc.set_capacity_instruction(34).unwrap();
+        enc.insert_literal_instruction("a", "b").unwrap();
+        assert_eq!(enc.known_received_count(), 0);
+        // Second insert would need to evict abs=1 before the peer ACKs it.
+        assert_eq!(
+            enc.insert_literal_instruction("c", "d"),
+            Err(QpackError::Invalid)
+        );
+        enc.note_peer_ici(1);
+        enc.insert_literal_instruction("c", "d").unwrap();
+        assert_eq!(enc.table().get_absolute(1), None);
+        assert_eq!(enc.table().get_absolute(2), Some(("c", "d")));
     }
 
     #[test]
