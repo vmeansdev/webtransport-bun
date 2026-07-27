@@ -2106,9 +2106,10 @@ impl WtEndpoint {
                         Route::Control
                     }
                     PeerStreamClass::ServerConnect => {
-                        // Admit once: cap unlatched CONNECTs + StreamOpen rate limit.
-                        // Reject early with RESET so storms cannot buffer up to
-                        // MAX_H3_FRAME_SIZE per stream.
+                        // Admit once: cap unlatched CONNECTs + handshake bucket.
+                        // Use Handshake (not StreamOpen) so CONNECT storms do not
+                        // steal the WT stream-open budget. Reject early with RESET
+                        // so storms cannot buffer up to MAX_H3_FRAME_SIZE per stream.
                         if !st.connect_admitted {
                             let occupied = unlatched_connects + active_wt;
                             if occupied >= connect_cap {
@@ -2124,7 +2125,7 @@ impl WtEndpoint {
                                     if let Err(err) = self.rate_limiter.check_connection(
                                         now,
                                         conn_id,
-                                        RateLimitDimension::StreamOpen,
+                                        RateLimitDimension::Handshake,
                                     ) {
                                         st.buf.clear();
                                         break 'route Route::RejectWt {
@@ -3178,9 +3179,9 @@ impl WtEndpoint {
         };
         let is_primary = session.connect_stream == Some(sid);
         if is_primary {
-            let _ = reason;
-            let _ = code;
-            self.close_session_on_connect_end(h);
+            // Primary close tears down QUIC with the application code/reason so
+            // the peer observes ConnectionClosed with the intended close code.
+            self.close_conn(conn_id, code, reason, Instant::now());
             return true;
         }
         if let Some(conn) = self.conns.get_mut(&h) {
