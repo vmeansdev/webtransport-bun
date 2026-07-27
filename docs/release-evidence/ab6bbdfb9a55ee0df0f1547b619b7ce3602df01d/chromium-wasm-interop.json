@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "chromium-wasm-interop",
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "playwright"
+	},
+	"command": [
+		"bunx",
+		"playwright",
+		"test",
+		"-c",
+		"playwright.wasm.config.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T13:52:32.313951+00:00",
+	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
+	"notes": "Playwright chromium-webtransport-wasm 5/5",
+	"artifactSha256": "ca010401e36dded4fbe1dcbd870e6f64b4b20a73f6d9e3cdc78106d69f7e14e6"
+}

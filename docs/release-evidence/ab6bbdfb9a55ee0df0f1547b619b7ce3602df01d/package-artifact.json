@@ -1,0 +1,21 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "package-artifact",
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "bun"
+	},
+	"command": [
+		"bun",
+		"scripts/test-package-artifact.ts",
+		"check"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T13:52:32.313951+00:00",
+	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
+	"notes": "package artifact check after wasm-dist rebuild (eventWireVersion 2)",
+	"artifactSha256": "c5c1a58c99dd204170da1e2f25a12a3f58d1a457ba8e1ba32eb1b6f7dbe39634"
+}

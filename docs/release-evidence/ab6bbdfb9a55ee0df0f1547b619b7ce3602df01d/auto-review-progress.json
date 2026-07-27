@@ -1,0 +1,36 @@
+{
+	"round": 2,
+	"headAtReview": "ab6bbdf",
+	"productCommit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"note": "Product fixes committed; candidate rebound with commit-bound evidence.",
+	"status": "CLOSED_FINDINGS",
+	"verification": {
+		"cargoTestWasm": "145 passed",
+		"testWasm": "82 pass",
+		"focusedBunTests": "wasm-0rtt + wasm-qpack-options + wasm-multi-session + wasm-limits + abuse + security-close green",
+		"chromiumWasmInterop": "5/5 passed",
+		"chromiumNativeInterop": "19/19 passed",
+		"faultMatrix": "1/1 passed",
+		"docTruth": "pending-bind",
+		"packageArtifactCheck": "passed (eventWireVersion 2)",
+		"coverageFloors": "failed"
+	},
+	"lanes": {
+		"1": "READY after SEC-04 occupied=unlatched+active fix",
+		"2": "READY (native N/A)",
+		"3": "READY after extra-CONNECT FIN path + admission occupied fix",
+		"4": "READY",
+		"5": "READY",
+		"6": "READY",
+		"7": "READY",
+		"8": "READY"
+	},
+	"remainingP0P4": [],
+	"claimPass": {
+		"wasm-multi-session": "PASS",
+		"wasm-0rtt": "PASS",
+		"wasm-dynamic-qpack": "PASS",
+		"auto-review-zero-p0-p4": "PASS"
+	},
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d"
+}

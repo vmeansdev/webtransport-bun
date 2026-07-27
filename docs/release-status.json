@@ -1,105 +1,105 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+		"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-coverage-floors-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/coverage-gates-floor-results.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
-			"status": "passed",
-			"notes": "Local llvm-cov --branch floors for native+wasm risk modules."
+			"id": "local-coverage-floors-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/coverage-gates-floor-results.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"status": "failed",
+			"notes": "Local nightly llvm-cov --branch: wasm endpoint.rs/h3.rs below 90/90/80 after QPACK/CONNECT work; claim demoted pending coverage recovery."
 		},
 		{
-			"id": "local-dynamic_qpack-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/dynamic_qpack-unit-evidence.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-dynamic_qpack-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/dynamic_qpack-unit-evidence.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "Local evidence for wasm-dynamic-qpack."
 		},
 		{
-			"id": "local-multi_session-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/multi_session-unit-evidence.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-multi_session-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/multi_session-unit-evidence.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "Local evidence for wasm-multi-session."
 		},
 		{
-			"id": "local-zero_rtt-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/zero_rtt-unit-evidence.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-zero_rtt-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/zero_rtt-unit-evidence.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "Local evidence for wasm-0rtt."
 		},
 		{
-			"id": "local-facade_parity-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/facade_parity-unit-evidence.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
-			"status": "passed",
-			"notes": "Local evidence for wasm-facade-parity."
-		},
-		{
-			"id": "local-auto-review-progress-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/auto-review-progress.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-facade_parity-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/facade_parity-unit-evidence.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "failed",
-			"notes": "Progress only; eight-lane zero-P0-P4 not closed."
+			"notes": "Parity incomplete."
 		},
 		{
-			"id": "local-wasm-local-gates-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/wasm-local-gates.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-auto-review-progress-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/auto-review-progress.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
-			"notes": "bun run test:wasm 68 pass"
+			"notes": "Eight-lane zero P0\u2013P4 closed; product committed and rebound."
 		},
 		{
-			"id": "local-native-local-gates-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/native-local-gates.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-wasm-local-gates-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/wasm-local-gates.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"status": "passed",
+			"notes": "bun run test:wasm 82 pass"
+		},
+		{
+			"id": "local-native-local-gates-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/native-local-gates.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "cargo test -p native --lib 110 pass"
 		},
 		{
-			"id": "local-supply-chain-provenance-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/supply-chain-provenance.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-supply-chain-provenance-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/supply-chain-provenance.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "actions pin policy"
 		},
 		{
-			"id": "local-package-artifact-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/package-artifact.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-package-artifact-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/package-artifact.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
-			"notes": "package tarball build"
+			"notes": "package artifact check"
 		},
 		{
-			"id": "local-runtime-consumers-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/runtime-consumers.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-runtime-consumers-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/runtime-consumers.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "internal package artifact tests"
 		},
 		{
-			"id": "local-chromium-wasm-interop-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/chromium-wasm-interop.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-chromium-wasm-interop-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/chromium-wasm-interop.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "Playwright chromium-webtransport-wasm 5/5"
 		},
 		{
-			"id": "local-chromium-native-interop-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/chromium-native-interop.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-chromium-native-interop-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/chromium-native-interop.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "Playwright chromium-webtransport 19/19 darwin/arm64"
 		},
 		{
-			"id": "local-fault-matrix-2cc0732",
-			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/fault-matrix.json",
-			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"id": "local-fault-matrix-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/fault-matrix.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "fault matrix 1/1"
 		}
@@ -110,20 +110,20 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-native-local-gates-2cc0732"
+				"local-native-local-gates-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on current candidate."
+			"notes": "Rebound locally on candidate."
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-local-gates-2cc0732"
+				"local-wasm-local-gates-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on current candidate."
+			"notes": "Rebound locally on candidate."
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -137,7 +137,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-runtime-consumers-2cc0732"
+				"local-runtime-consumers-ab6bbdf"
 			],
 			"gaRequired": true,
 			"notes": "Rebound locally on current candidate."
@@ -147,7 +147,7 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-native-interop-2cc0732"
+				"local-chromium-native-interop-ab6bbdf"
 			],
 			"gaRequired": true,
 			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
@@ -157,7 +157,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-wasm-interop-2cc0732"
+				"local-chromium-wasm-interop-ab6bbdf"
 			],
 			"gaRequired": true,
 			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
@@ -175,7 +175,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-fault-matrix-2cc0732"
+				"local-fault-matrix-ab6bbdf"
 			],
 			"gaRequired": true,
 			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
@@ -183,11 +183,11 @@
 		{
 			"id": "coverage-gates",
 			"surface": "release",
-			"status": "passed",
+			"status": "pending",
 			"evidenceIds": [
-				"local-coverage-floors-2cc0732"
+				"local-coverage-floors-ab6bbdf"
 			],
-			"notes": "Rust floors clear locally; Bun LCOV CI-deferred.",
+			"notes": "Demoted: wasm endpoint/h3 branch/line floors below gate after QPACK/CONNECT product work; needs coverage recovery before re-pass.",
 			"gaRequired": true
 		},
 		{
@@ -211,7 +211,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-2cc0732"
+				"local-package-artifact-ab6bbdf"
 			],
 			"gaRequired": true,
 			"notes": "Rebound locally on current candidate."
@@ -221,7 +221,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-provenance-2cc0732"
+				"local-supply-chain-provenance-ab6bbdf"
 			],
 			"gaRequired": true,
 			"notes": "Rebound locally on current candidate."
@@ -243,11 +243,12 @@
 		{
 			"id": "auto-review-zero-p0-p4",
 			"surface": "release",
-			"status": "pending",
+			"status": "passed",
 			"evidenceIds": [
-				"local-auto-review-progress-2cc0732"
+				"local-auto-review-progress-ab6bbdf"
 			],
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Eight-lane review closed with remainingP0P4=[]; product + regression fixes at candidate."
 		},
 		{
 			"id": "final-no-change-confirmation",
@@ -259,34 +260,42 @@
 		{
 			"id": "wasm-dynamic-qpack",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-dynamic_qpack-ab6bbdf"
+			],
 			"gaRequired": true,
-			"notes": "Product surface: opt-in dynamic table applies peer ICI/section-acks to encoder KRC and indexes outbound CONNECT/status when capacity>0 (default capacity 0). Claim stays pending until commit-bound product evidence + candidate rebind."
+			"notes": "Opt-in dynamic QPACK: peer ICI\u2192encoder KRC + indexed CONNECT/status when capacity>0; default capacity 0."
 		},
 		{
 			"id": "wasm-multi-session",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-multi_session-ab6bbdf"
+			],
 			"gaRequired": true,
-			"notes": "Product surface landed (WtEvent session_id + JS (conn,sessionId) + openSession). Evidence JSON on disk; rebind when candidate commit advances."
+			"notes": "Multi-session product surface with datagram isolation + SessionClosed secondary path."
 		},
 		{
 			"id": "wasm-0rtt",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-zero_rtt-ab6bbdf"
+			],
 			"gaRequired": true,
-			"notes": "has0Rtt/accepted0Rtt + per-endpoint InMemoryTicketStore (opt-in shareProcess0RttTicketStore + shared ClientConfig). Product test asserts has0Rtt===true on shared-store reconnect. JS TicketStoreHost not bridged to rustls. Claim pending until candidate rebind."
+			"notes": "Shared-store reconnect reports has0Rtt===true after NST flush; JS TicketStoreHost still not bridged to rustls."
 		},
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
 			"status": "pending",
-			"evidenceIds": [],
+			"evidenceIds": [
+				"local-facade_parity-ab6bbdf"
+			],
 			"gaRequired": true,
-			"notes": "Foundation/options only. Product incomplete until parity smoke with session map + commit-bound evidence."
+			"notes": "Foundation/options only. Product incomplete until parity smoke with session map + commit-bound passing evidence."
 		}
 	],
 	"surfaces": {

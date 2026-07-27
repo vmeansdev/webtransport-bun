@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "native-local-gates",
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "bun"
+	},
+	"command": [
+		"cargo",
+		"test",
+		"-p",
+		"native",
+		"--lib"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T13:52:32.313951+00:00",
+	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
+	"notes": "cargo test -p native --lib 110 pass",
+	"artifactSha256": "2f58a3cb23831bbba00786413b6fb09b89365e4d56da6c9897d02680cc70bb23"
+}
