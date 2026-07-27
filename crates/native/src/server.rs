@@ -1,22 +1,14 @@
-//! WebTransport server via wtransport. Updates ServerMetrics for Phase 4.3.1.
+//! Server TLS rotation, drain, and spawn helpers (NAPI-free).
+//! NAPI bindings live in `server_napi.rs`. Coverage floors target this module.
 
-use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
-use napi::{Env, JsFunction, Result};
-use napi_derive::napi;
+use napi::Result;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::error::{from_reason as wt_from_reason, WtResult};
-use crate::limits::Limits;
-use crate::panic_guard;
-use crate::rate_limit::RateLimits;
 use crate::server_metrics::ServerMetrics;
-use crate::{LogEvent, SessionEvent};
-
-static SERVER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,7 +31,7 @@ struct ServerTlsConfigInput {
     unknown_sni_policy: Option<String>,
 }
 
-fn parse_unknown_sni_policy(
+pub(crate) fn parse_unknown_sni_policy(
     value: Option<&str>,
 ) -> std::result::Result<crate::server_tls::UnknownSniPolicy, String> {
     match value.unwrap_or("reject") {
@@ -52,7 +44,7 @@ fn parse_unknown_sni_policy(
     }
 }
 
-fn parse_tls_resolver_config(
+pub(crate) fn parse_tls_resolver_config(
     tls_config_json: &str,
 ) -> std::result::Result<crate::server_tls::ResolverConfig, String> {
     let input: ServerTlsConfigInput = serde_json::from_str(tls_config_json)
@@ -84,7 +76,7 @@ fn parse_tls_resolver_config(
     })
 }
 
-fn parse_sni_entries_json(
+pub(crate) fn parse_sni_entries_json(
     sni_json: &str,
 ) -> std::result::Result<Vec<crate::server_tls::SniCertConfig>, String> {
     let entries: Vec<ServerTlsSniEntry> =
@@ -99,14 +91,14 @@ fn parse_sni_entries_json(
         .collect())
 }
 
-struct ServerRuntimeState {
-    shutdown_tx: Option<watch::Sender<()>>,
-    tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
-    explicit_default_cert: bool,
-    closed: bool,
+pub(crate) struct ServerRuntimeState {
+    pub(crate) shutdown_tx: Option<watch::Sender<()>>,
+    pub(crate) tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
+    pub(crate) explicit_default_cert: bool,
+    pub(crate) closed: bool,
 }
 
-fn ensure_explicit_default_cert(state: &ServerRuntimeState) -> Result<()> {
+pub(crate) fn ensure_explicit_default_cert(state: &ServerRuntimeState) -> Result<()> {
     if state.explicit_default_cert {
         return Ok(());
     }
@@ -115,7 +107,7 @@ fn ensure_explicit_default_cert(state: &ServerRuntimeState) -> Result<()> {
     ))
 }
 
-fn ensure_server_open(state: &ServerRuntimeState) -> Result<()> {
+pub(crate) fn ensure_server_open(state: &ServerRuntimeState) -> Result<()> {
     if state.closed {
         return Err(napi::Error::from_reason(
             "E_SESSION_CLOSED: server is closed",
@@ -124,51 +116,62 @@ fn ensure_server_open(state: &ServerRuntimeState) -> Result<()> {
     Ok(())
 }
 
-fn rotate_default_cert(
+pub(crate) fn map_internal_error(detail: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(format!("E_INTERNAL: {}", detail))
+}
+
+pub(crate) fn map_tls_rotation_error(detail: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", detail))
+}
+
+pub(crate) fn map_certificate_rotation_error(detail: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(format!(
+        "E_INTERNAL: certificate rotation failed: {}",
+        detail
+    ))
+}
+
+pub(crate) fn rotate_default_cert(
     state: &mut ServerRuntimeState,
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<()> {
     ensure_server_open(state)?;
-    let certified_key = crate::server_tls::parse_certified_key(cert_pem, key_pem).map_err(|e| {
-        napi::Error::from_reason(format!("E_INTERNAL: certificate rotation failed: {}", e))
-    })?;
+    let certified_key = crate::server_tls::parse_certified_key(cert_pem, key_pem)
+        .map_err(map_certificate_rotation_error)?;
     state
         .tls_resolver
         .replace_default(certified_key)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     state.explicit_default_cert = true;
     Ok(())
 }
 
-fn rotate_tls_config(state: &mut ServerRuntimeState, tls_config_json: &str) -> Result<()> {
+pub(crate) fn rotate_tls_config(
+    state: &mut ServerRuntimeState,
+    tls_config_json: &str,
+) -> Result<()> {
     ensure_server_open(state)?;
-    let tls_config = parse_tls_resolver_config(tls_config_json)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e)))?;
+    let tls_config = parse_tls_resolver_config(tls_config_json).map_err(map_tls_rotation_error)?;
     let (default_cert, certs_by_name, unknown_sni_policy) =
-        crate::server_tls::parse_resolver_config(&tls_config).map_err(|e| {
-            napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
-        })?;
+        crate::server_tls::parse_resolver_config(&tls_config).map_err(map_tls_rotation_error)?;
     state
         .tls_resolver
         .replace_all(default_cert, certs_by_name, unknown_sni_policy)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     state.explicit_default_cert = true;
     Ok(())
 }
 
-fn replace_sni_certs_state(state: &ServerRuntimeState, sni_json: &str) -> Result<()> {
+pub(crate) fn replace_sni_certs_state(state: &ServerRuntimeState, sni_json: &str) -> Result<()> {
     ensure_server_open(state)?;
     ensure_explicit_default_cert(state)?;
-    let sni_certs = parse_sni_entries_json(sni_json)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e)))?;
+    let sni_certs = parse_sni_entries_json(sni_json).map_err(map_tls_rotation_error)?;
     let mut certs_by_name = std::collections::HashMap::new();
     let mut original_names_by_normalized = std::collections::HashMap::new();
     for sni_cert in sni_certs {
-        let server_name =
-            crate::server_tls::normalize_server_name(&sni_cert.server_name).map_err(|e| {
-                napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e))
-            })?;
+        let server_name = crate::server_tls::normalize_server_name(&sni_cert.server_name)
+            .map_err(map_tls_rotation_error)?;
         if let Some(existing_original) = original_names_by_normalized.get(&server_name) {
             return Err(napi::Error::from_reason(format!(
                 "E_INTERNAL: tls rotation failed: duplicate serverName entry after normalization: \"{}\" conflicts with \"{}\" as \"{}\"",
@@ -176,20 +179,19 @@ fn replace_sni_certs_state(state: &ServerRuntimeState, sni_json: &str) -> Result
             )));
         }
         let certified_key =
-            crate::server_tls::parse_certified_key(&sni_cert.cert_pem, &sni_cert.key_pem).map_err(
-                |e| napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e)),
-            )?;
+            crate::server_tls::parse_certified_key(&sni_cert.cert_pem, &sni_cert.key_pem)
+                .map_err(map_tls_rotation_error)?;
         original_names_by_normalized.insert(server_name.clone(), sni_cert.server_name);
         certs_by_name.insert(server_name, certified_key);
     }
     state
         .tls_resolver
         .replace_sni_certs(certs_by_name)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     Ok(())
 }
 
-fn upsert_sni_cert_state(
+pub(crate) fn upsert_sni_cert_state(
     state: &ServerRuntimeState,
     server_name: &str,
     cert_pem: &str,
@@ -198,21 +200,21 @@ fn upsert_sni_cert_state(
     ensure_server_open(state)?;
     ensure_explicit_default_cert(state)?;
     let certified_key = crate::server_tls::parse_certified_key(cert_pem, key_pem)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e)))?;
+        .map_err(map_tls_rotation_error)?;
     state
         .tls_resolver
         .upsert_sni_cert(server_name, certified_key)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     Ok(())
 }
 
-fn remove_sni_cert_state(state: &ServerRuntimeState, server_name: &str) -> Result<()> {
+pub(crate) fn remove_sni_cert_state(state: &ServerRuntimeState, server_name: &str) -> Result<()> {
     ensure_server_open(state)?;
     ensure_explicit_default_cert(state)?;
     let removed = state
         .tls_resolver
         .remove_sni_cert(server_name)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     if !removed {
         return Err(napi::Error::from_reason(format!(
             "E_INTERNAL: tls rotation failed: unknown serverName entry: {}",
@@ -222,25 +224,24 @@ fn remove_sni_cert_state(state: &ServerRuntimeState, server_name: &str) -> Resul
     Ok(())
 }
 
-fn set_unknown_sni_policy_state(state: &ServerRuntimeState, policy: &str) -> Result<()> {
+pub(crate) fn set_unknown_sni_policy_state(state: &ServerRuntimeState, policy: &str) -> Result<()> {
     ensure_server_open(state)?;
     ensure_explicit_default_cert(state)?;
-    let policy = parse_unknown_sni_policy(Some(policy))
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: tls rotation failed: {}", e)))?;
+    let policy = parse_unknown_sni_policy(Some(policy)).map_err(map_tls_rotation_error)?;
     state
         .tls_resolver
         .set_unknown_sni_policy(policy)
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     Ok(())
 }
 
-fn tls_snapshot_from_state(
+pub(crate) fn tls_snapshot_from_state(
     state: &ServerRuntimeState,
 ) -> Result<crate::metrics::ServerTlsSnapshot> {
     let snapshot = state
         .tls_resolver
         .tls_snapshot()
-        .map_err(|e| napi::Error::from_reason(format!("E_INTERNAL: {}", e)))?;
+        .map_err(map_internal_error)?;
     Ok(crate::metrics::ServerTlsSnapshot {
         sni_server_names: snapshot.sni_server_names,
         unknown_sni_policy: match snapshot.unknown_sni_policy {
@@ -250,20 +251,15 @@ fn tls_snapshot_from_state(
     })
 }
 
-fn is_addr_in_use_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("address already in use") || lower.contains("addrinuse")
-}
-
 #[derive(Clone, Copy)]
-struct CloseDrainTiming {
-    grace_period: Duration,
-    abort_period: Duration,
-    poll_interval: Duration,
+pub(crate) struct CloseDrainTiming {
+    pub(crate) grace_period: Duration,
+    pub(crate) abort_period: Duration,
+    pub(crate) poll_interval: Duration,
 }
 
 impl CloseDrainTiming {
-    const fn production() -> Self {
+    pub(crate) const fn production() -> Self {
         Self {
             grace_period: Duration::from_secs(5),
             abort_period: Duration::from_secs(5),
@@ -272,7 +268,16 @@ impl CloseDrainTiming {
     }
 }
 
-async fn wait_for_server_drain(
+pub(crate) fn server_runtime_is_idle(
+    session_tasks: u64,
+    stream_tasks: u64,
+    sessions_active: u64,
+    tracked_tasks: usize,
+) -> bool {
+    session_tasks == 0 && stream_tasks == 0 && sessions_active == 0 && tracked_tasks == 0
+}
+
+pub(crate) async fn wait_for_server_drain(
     metrics: &ServerMetrics,
     server_id: u64,
     timing: CloseDrainTiming,
@@ -285,7 +290,7 @@ async fn wait_for_server_drain(
         let stream_tasks = metrics.stream_tasks_active.load(Ordering::Relaxed);
         let sessions_active = metrics.sessions_active.load(Ordering::SeqCst);
         let tracked_tasks = crate::spawn_tracked::server_task_count(server_id);
-        if session_tasks == 0 && stream_tasks == 0 && sessions_active == 0 && tracked_tasks == 0 {
+        if server_runtime_is_idle(session_tasks, stream_tasks, sessions_active, tracked_tasks) {
             return None;
         }
 
@@ -311,383 +316,16 @@ async fn wait_for_server_drain(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_server_instance(
-    server_id: u64,
-    metrics: Arc<ServerMetrics>,
-    limits: &Limits,
-    rate_limits: &RateLimits,
-    host: &str,
-    port: u16,
-    session_tx: &Option<tokio::sync::mpsc::Sender<SessionEvent>>,
-    log_tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
-    tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
-    debug: bool,
-    max_retries: usize,
-) -> std::result::Result<watch::Sender<()>, String> {
-    const RETRY_DELAY: Duration = Duration::from_millis(100);
-
-    let mut last_err: Option<String> = None;
-
-    for attempt in 0..max_retries {
-        let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let (startup_tx, startup_rx) =
-            std::sync::mpsc::channel::<std::result::Result<(), String>>();
-
-        crate::spawn_wtransport_server(
-            server_id,
-            Arc::clone(&metrics),
-            limits.clone(),
-            rate_limits.clone(),
-            host.to_string(),
-            port,
-            shutdown_rx,
-            session_tx.clone(),
-            log_tx.clone(),
-            Arc::clone(&tls_resolver),
-            debug,
-            startup_tx,
-        );
-
-        match startup_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => return Ok(shutdown_tx),
-            Ok(Err(msg)) => {
-                let should_retry = is_addr_in_use_error(&msg) && attempt + 1 < max_retries;
-                if should_retry {
-                    last_err = Some(msg);
-                    drop(shutdown_tx);
-                    std::thread::sleep(RETRY_DELAY);
-                    continue;
-                }
-                return Err(msg);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err("server startup timed out".to_string());
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("server startup channel disconnected".to_string());
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| "server startup failed".to_string()))
-}
-
-#[napi]
-pub struct ServerHandle {
-    server_id: u64,
-    port: u32,
-    metrics: Arc<ServerMetrics>,
-    session_tx: Mutex<Option<tokio::sync::mpsc::Sender<SessionEvent>>>,
-    log_tx: Mutex<Option<tokio::sync::mpsc::Sender<LogEvent>>>,
-    state: Mutex<ServerRuntimeState>,
-}
-
-#[napi]
-impl ServerHandle {
-    /// Test-only constructor that skips NAPI Env / JS callbacks.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        server_id: u64,
-        port: u32,
-        metrics: Arc<ServerMetrics>,
-        state: ServerRuntimeState,
-    ) -> Self {
-        Self {
-            server_id,
-            port,
-            metrics,
-            session_tx: Mutex::new(None),
-            log_tx: Mutex::new(None),
-            state: Mutex::new(state),
-        }
-    }
-
-    #[napi(constructor)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        _env: Env,
-        port: u32,
-        host: String,
-        debug: bool,
-        tls_config_json: String,
-        _limits_json: String,
-        _rate_limits_json: String,
-        on_session: JsFunction,
-        log_fn: JsFunction,
-    ) -> Result<Self> {
-        panic_guard::catch_panic(|| {
-            let session_tsfn: ThreadsafeFunction<Vec<SessionEvent>, ErrorStrategy::Fatal> =
-                on_session
-                    .create_threadsafe_function(
-                        0,
-                        |ctx: napi::threadsafe_function::ThreadSafeCallContext<
-                            Vec<SessionEvent>,
-                        >| {
-                            let mut arr = ctx.env.create_array_with_length(ctx.value.len())?;
-                            for (i, event) in ctx.value.iter().enumerate() {
-                                let mut evt = ctx.env.create_object()?;
-                                match event {
-                                    crate::SessionEvent::Accepted(v) => {
-                                        evt.set("name", "session")?;
-                                        evt.set("id", v.id.as_str())?;
-                                        evt.set("peerIp", v.peer_ip.as_str())?;
-                                        evt.set("peerPort", v.peer_port)?;
-                                    }
-                                    crate::SessionEvent::Closed { id, code, reason } => {
-                                        evt.set("name", "session_closed")?;
-                                        evt.set("id", id.as_str())?;
-                                        if let Some(c) = code {
-                                            evt.set("code", *c)?;
-                                        }
-                                        if let Some(r) = reason {
-                                            evt.set("reason", r.as_str())?;
-                                        }
-                                    }
-                                }
-                                arr.set_element(i as u32, evt)?;
-                            }
-                            Ok(vec![arr])
-                        },
-                    )
-                    .map_err(|e| {
-                        napi::Error::from_reason(format!(
-                            "E_INTERNAL: failed to create onSession callback bridge: {}",
-                            e
-                        ))
-                    })?;
-
-            let log_tsfn: ThreadsafeFunction<Vec<LogEvent>, ErrorStrategy::Fatal> = log_fn
-                .create_threadsafe_function(
-                    0,
-                    |ctx: napi::threadsafe_function::ThreadSafeCallContext<Vec<LogEvent>>| {
-                        let mut arr = ctx.env.create_array_with_length(ctx.value.len())?;
-                        for (i, le) in ctx.value.iter().enumerate() {
-                            let mut evt = ctx.env.create_object()?;
-                            evt.set("level", le.level.as_str())?;
-                            evt.set("msg", le.msg.as_str())?;
-                            if let Some(ref sid) = le.session_id {
-                                evt.set("sessionId", sid.as_str())?;
-                            }
-                            if let Some(ref ip) = le.peer_ip {
-                                evt.set("peerIp", ip.as_str())?;
-                            }
-                            if let Some(p) = le.peer_port {
-                                evt.set("peerPort", p)?;
-                            }
-                            arr.set_element(i as u32, evt)?;
-                        }
-                        Ok(vec![arr])
-                    },
-                )
-                .map_err(|e| {
-                    napi::Error::from_reason(format!(
-                        "E_INTERNAL: failed to create log callback bridge: {}",
-                        e
-                    ))
-                })?;
-
-            let session_tx = Some(crate::spawn_event_batcher(session_tsfn, 64, 5));
-            let log_tx = Some(crate::spawn_event_batcher(log_tsfn, 128, 10));
-
-            let metrics = Arc::new(ServerMetrics::default());
-            let limits = crate::limits::Limits::from_json(&_limits_json);
-            let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
-            crate::panic_guard::set_panic_log_verbose(debug);
-            let port_u16 = port.min(65535) as u16;
-
-            let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tls_config = parse_tls_resolver_config(&tls_config_json)
-                .map_err(|msg| napi::Error::from_reason(format!("E_TLS: {}", msg)))?;
-            let tls_resolver = if !tls_config.default_cert_pem.trim().is_empty()
-                && !tls_config.default_key_pem.trim().is_empty()
-            {
-                crate::server_tls::build_live_resolver_from_config(&tls_config)
-            } else {
-                crate::server_tls::build_default_dev_resolver()
-            }
-            .map_err(|msg| napi::Error::from_reason(format!("E_TLS: {}", msg)))?;
-            let shutdown_tx = spawn_server_instance(
-                server_id,
-                Arc::clone(&metrics),
-                &limits,
-                &rate_limits,
-                &host,
-                port_u16,
-                &session_tx,
-                &log_tx,
-                Arc::clone(&tls_resolver),
-                debug,
-                1,
-            )
-            .map_err(|msg| {
-                napi::Error::from_reason(format!("E_INTERNAL: server startup failed: {}", msg))
-            })?;
-
-            Ok(Self {
-                server_id,
-                port,
-                metrics,
-                session_tx: Mutex::new(session_tx),
-                log_tx: Mutex::new(log_tx),
-                state: Mutex::new(ServerRuntimeState {
-                    shutdown_tx: Some(shutdown_tx),
-                    tls_resolver,
-                    explicit_default_cert: !tls_config.default_cert_pem.trim().is_empty()
-                        && !tls_config.default_key_pem.trim().is_empty(),
-                    closed: false,
-                }),
-            })
-        })
-    }
-
-    #[napi(getter)]
-    pub fn port(&self) -> u32 {
-        panic_guard::catch_panic(|| Ok(self.port)).unwrap_or(0)
-    }
-
-    #[napi]
-    pub async fn update_cert(&self, cert_pem: String, key_pem: String) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            rotate_default_cert(&mut state, &cert_pem, &key_pem)
-        })
-    }
-
-    #[napi]
-    pub async fn update_tls(&self, tls_config_json: String) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            rotate_tls_config(&mut state, &tls_config_json)
-        })
-    }
-
-    #[napi]
-    pub async fn replace_sni_certs(&self, sni_json: String) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            replace_sni_certs_state(&state, &sni_json)
-        })
-    }
-
-    #[napi]
-    pub async fn upsert_sni_cert(
-        &self,
-        server_name: String,
-        cert_pem: String,
-        key_pem: String,
-    ) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            upsert_sni_cert_state(&state, &server_name, &cert_pem, &key_pem)
-        })
-    }
-
-    #[napi]
-    pub async fn remove_sni_cert(&self, server_name: String) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            remove_sni_cert_state(&state, &server_name)
-        })
-    }
-
-    #[napi]
-    pub async fn set_unknown_sni_policy(&self, policy: String) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            set_unknown_sni_policy_state(&state, &policy)
-        })
-    }
-
-    #[napi]
-    pub fn tls_snapshot(&self) -> WtResult<crate::metrics::ServerTlsSnapshot> {
-        panic_guard::catch_panic(|| {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            tls_snapshot_from_state(&state)
-        })
-        .map_err(wt_from_reason)
-    }
-
-    #[napi]
-    pub async fn close(&self) -> Result<()> {
-        panic_guard::catch_panic(|| {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            state.closed = true;
-            if let Some(tx) = state.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            crate::rate_limit::cleanup_server_entries(self.server_id);
-            crate::session_registry::close_all_for_owner(self.server_id, 0, b"server closing");
-            self.session_tx
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: session tx lock poisoned"))?
-                .take();
-            self.log_tx
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: log tx lock poisoned"))?
-                .take();
-            Ok(())
-        })?;
-        let metrics = Arc::clone(&self.metrics);
-        let close_err =
-            wait_for_server_drain(&metrics, self.server_id, CloseDrainTiming::production()).await;
-        if let Some(msg) = close_err {
-            return Err(napi::Error::from_reason(msg));
-        }
-        Ok(())
-    }
-
-    #[napi]
-    pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::ServerMetricsSnapshot> {
-        panic_guard::catch_panic(|| {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            Ok(self
-                .metrics
-                .snapshot(Some(state.tls_resolver.metrics_snapshot())))
-        })
-        .map_err(wt_from_reason)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_explicit_default_cert, is_addr_in_use_error, parse_sni_entries_json,
-        parse_tls_resolver_config, parse_unknown_sni_policy, remove_sni_cert_state,
-        replace_sni_certs_state, rotate_default_cert, rotate_tls_config,
-        set_unknown_sni_policy_state, spawn_server_instance, tls_snapshot_from_state,
-        upsert_sni_cert_state, wait_for_server_drain, CloseDrainTiming, ServerHandle,
-        ServerRuntimeState,
+        ensure_explicit_default_cert, map_certificate_rotation_error, map_internal_error,
+        map_tls_rotation_error, parse_sni_entries_json, parse_tls_resolver_config,
+        parse_unknown_sni_policy, remove_sni_cert_state, replace_sni_certs_state,
+        rotate_default_cert, rotate_tls_config, server_runtime_is_idle,
+        set_unknown_sni_policy_state, tls_snapshot_from_state, upsert_sni_cert_state,
+        wait_for_server_drain, CloseDrainTiming, ServerRuntimeState,
     };
-    use crate::limits::Limits;
-    use crate::rate_limit::RateLimits;
     use crate::server_metrics::ServerMetrics;
     use crate::server_tls::{build_default_dev_resolver, UnknownSniPolicy};
     use std::sync::atomic::Ordering;
@@ -715,6 +353,29 @@ mod tests {
             explicit_default_cert,
             closed: false,
         }
+    }
+
+    #[test]
+    fn server_runtime_is_idle_requires_all_gauges_clear() {
+        assert!(server_runtime_is_idle(0, 0, 0, 0));
+        assert!(!server_runtime_is_idle(1, 0, 0, 0));
+        assert!(!server_runtime_is_idle(0, 1, 0, 0));
+        assert!(!server_runtime_is_idle(0, 0, 1, 0));
+        assert!(!server_runtime_is_idle(0, 0, 0, 1));
+        assert!(!server_runtime_is_idle(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn tls_error_mappers_preserve_stable_prefixes() {
+        assert!(map_internal_error("lock poisoned")
+            .reason
+            .starts_with("E_INTERNAL:"));
+        assert!(map_tls_rotation_error("bad json")
+            .reason
+            .contains("tls rotation failed"));
+        assert!(map_certificate_rotation_error("bad pem")
+            .reason
+            .contains("certificate rotation failed"));
     }
 
     #[test]
@@ -771,6 +432,18 @@ mod tests {
 
         let bad_json = parse_tls_resolver_config("{not-json").unwrap_err();
         assert!(bad_json.contains("invalid server tls JSON"));
+
+        let empty_with_policy = parse_tls_resolver_config(
+            r#"{"certPem":"","keyPem":"","sni":[],"unknownSniPolicy":"reject"}"#,
+        )
+        .unwrap_err();
+        assert!(empty_with_policy.contains("require non-empty default certPem/keyPem"));
+
+        let empty_key_with_sni = parse_tls_resolver_config(
+            r#"{"certPem":"CERT","keyPem":"","sni":[{"serverName":"a.example","certPem":"C2","keyPem":"K2"}]}"#,
+        )
+        .unwrap_err();
+        assert!(empty_key_with_sni.contains("require non-empty default certPem/keyPem"));
     }
 
     #[test]
@@ -785,13 +458,6 @@ mod tests {
 
         let err = parse_sni_entries_json("null").unwrap_err();
         assert!(err.contains("invalid server SNI JSON"));
-    }
-
-    #[test]
-    fn is_addr_in_use_error_matches_common_os_phrasing() {
-        assert!(is_addr_in_use_error("Address already in use (os error 48)"));
-        assert!(is_addr_in_use_error("bind: AddrInUse"));
-        assert!(!is_addr_in_use_error("connection refused"));
     }
 
     #[test]
@@ -869,129 +535,124 @@ mod tests {
     }
 
     #[test]
-    fn spawn_server_instance_binds_ephemeral_port_and_shuts_down() {
-        let server_id = u64::MAX - 20;
-        let metrics = Arc::new(ServerMetrics::default());
-        let limits = Limits::default();
-        let rate_limits = RateLimits::default();
-        let resolver = build_default_dev_resolver().expect("dev resolver");
-        // Bind an ephemeral UDP port first so we don't collide with CI siblings.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-        let port = probe.local_addr().expect("local addr").port();
-        drop(probe);
+    fn tls_helper_error_paths_surface_stable_codes() {
+        let (cert_pem, key_pem) = self_signed_pem();
+        let mut state = open_state(true);
 
-        let shutdown_tx = spawn_server_instance(
-            server_id,
-            Arc::clone(&metrics),
-            &limits,
-            &rate_limits,
-            "127.0.0.1",
-            port,
-            &None,
-            &None,
-            resolver,
-            false,
-            3,
-        )
-        .expect("server should start");
-        let _ = shutdown_tx.send(());
-        // Drain must observe idle after shutdown signal (no sessions accepted).
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        let drain = rt.block_on(wait_for_server_drain(
-            &metrics,
-            server_id,
-            CloseDrainTiming {
-                grace_period: Duration::from_millis(500),
-                abort_period: Duration::from_millis(200),
-                poll_interval: Duration::from_millis(10),
-            },
-        ));
-        assert!(drain.is_none(), "unexpected drain diagnostic: {drain:?}");
+        let bad_cert = rotate_default_cert(&mut state, "not-a-cert", "not-a-key").unwrap_err();
+        assert!(bad_cert.reason.contains("certificate rotation failed"));
+
+        let bad_tls = rotate_tls_config(&mut state, "{not-json").unwrap_err();
+        assert!(bad_tls.reason.contains("tls rotation failed"));
+
+        let bad_sni_json = replace_sni_certs_state(&state, "null").unwrap_err();
+        assert!(bad_sni_json.reason.contains("tls rotation failed"));
+
+        let bad_wildcard = format!(
+            r#"[{{"serverName":"*","certPem":{},"keyPem":{}}}]"#,
+            serde_json::to_string(&cert_pem).unwrap(),
+            serde_json::to_string(&key_pem).unwrap()
+        );
+        let wildcard_err = replace_sni_certs_state(&state, &bad_wildcard).unwrap_err();
+        assert!(wildcard_err.reason.contains("tls rotation failed"));
+
+        let dup = format!(
+            r#"[{{"serverName":"A.example","certPem":{},"keyPem":{}}},{{"serverName":"a.example","certPem":{},"keyPem":{}}}]"#,
+            serde_json::to_string(&cert_pem).unwrap(),
+            serde_json::to_string(&key_pem).unwrap(),
+            serde_json::to_string(&cert_pem).unwrap(),
+            serde_json::to_string(&key_pem).unwrap()
+        );
+        let dup_err = replace_sni_certs_state(&state, &dup).unwrap_err();
+        assert!(dup_err.reason.contains("duplicate serverName"));
+
+        let bad_upsert =
+            upsert_sni_cert_state(&state, "z.example", "not-a-cert", "not-a-key").unwrap_err();
+        assert!(bad_upsert.reason.contains("tls rotation failed"));
+
+        let bad_policy = set_unknown_sni_policy_state(&state, "allow").unwrap_err();
+        assert!(bad_policy.reason.contains("tls rotation failed"));
     }
 
     #[test]
-    fn spawn_server_instance_reports_addr_in_use() {
-        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold port");
-        let port = held.local_addr().expect("addr").port();
-        let server_id = u64::MAX - 21;
-        let metrics = Arc::new(ServerMetrics::default());
-        let err = spawn_server_instance(
-            server_id,
-            metrics,
-            &Limits::default(),
-            &RateLimits::default(),
-            "127.0.0.1",
-            port,
-            &None,
-            &None,
-            build_default_dev_resolver().expect("dev resolver"),
-            false,
-            1,
+    fn replace_sni_rejects_invalid_pem_for_valid_names() {
+        let state = open_state(true);
+        let err = replace_sni_certs_state(
+            &state,
+            r#"[{"serverName":"ok.example","certPem":"nope","keyPem":"nope"}]"#,
         )
-        .expect_err("port held by UDP socket should fail QUIC bind");
+        .unwrap_err();
+        assert!(err.reason.contains("tls rotation failed"));
+    }
+
+    #[test]
+    fn rotate_tls_config_rejects_invalid_pem_after_json_parse() {
+        let mut state = open_state(false);
+        let err = rotate_tls_config(
+            &mut state,
+            r#"{"certPem":"nope","keyPem":"nope","sni":[],"unknownSniPolicy":"reject"}"#,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("tls rotation failed"));
+    }
+
+    #[test]
+    fn sni_helpers_reject_closed_server() {
+        let (cert_pem, key_pem) = self_signed_pem();
+        let mut state = open_state(true);
+        state.closed = true;
+        assert!(replace_sni_certs_state(&state, "[]")
+            .unwrap_err()
+            .reason
+            .contains("E_SESSION_CLOSED"));
         assert!(
-            is_addr_in_use_error(&err) || err.contains("failed to create endpoint"),
-            "unexpected bind error: {err}"
+            upsert_sni_cert_state(&state, "a.example", &cert_pem, &key_pem)
+                .unwrap_err()
+                .reason
+                .contains("E_SESSION_CLOSED")
         );
+        assert!(remove_sni_cert_state(&state, "a.example")
+            .unwrap_err()
+            .reason
+            .contains("E_SESSION_CLOSED"));
+        assert!(set_unknown_sni_policy_state(&state, "reject")
+            .unwrap_err()
+            .reason
+            .contains("E_SESSION_CLOSED"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn server_handle_for_test_covers_tls_close_and_snapshots() {
-        let (cert_pem, key_pem) = self_signed_pem();
-        let server_id = u64::MAX - 31;
+    async fn wait_for_server_drain_aborts_tracked_tasks() {
+        use crate::spawn_tracked::{spawn_tracked, TaskKind};
+        let server_id = u64::MAX - 24;
         let metrics = Arc::new(ServerMetrics::default());
-        let (shutdown_tx, _shutdown_rx) = watch::channel(());
-        let handle = ServerHandle::for_test(
-            server_id,
-            9,
+        spawn_tracked(
             Arc::clone(&metrics),
-            ServerRuntimeState {
-                shutdown_tx: Some(shutdown_tx),
-                tls_resolver: build_default_dev_resolver().expect("resolver"),
-                explicit_default_cert: true,
-                closed: false,
+            server_id,
+            TaskKind::Session,
+            crate::panic_guard::PanicScope::Server(server_id),
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
             },
         );
-        assert_eq!(handle.port(), 9);
-        handle
-            .update_cert(cert_pem.clone(), key_pem.clone())
-            .await
-            .expect("update_cert");
-        let tls_json = format!(
-            r#"{{"certPem":{},"keyPem":{},"sni":[],"unknownSniPolicy":"reject"}}"#,
-            serde_json::to_string(&cert_pem).unwrap(),
-            serde_json::to_string(&key_pem).unwrap()
-        );
-        handle.update_tls(tls_json).await.expect("update_tls");
-        let sni_json = format!(
-            r#"[{{"serverName":"x.example","certPem":{},"keyPem":{}}}]"#,
-            serde_json::to_string(&cert_pem).unwrap(),
-            serde_json::to_string(&key_pem).unwrap()
-        );
-        handle
-            .replace_sni_certs(sni_json)
-            .await
-            .expect("replace_sni");
-        handle
-            .upsert_sni_cert("y.example".into(), cert_pem.clone(), key_pem.clone())
-            .await
-            .expect("upsert");
-        handle
-            .set_unknown_sni_policy("default".into())
-            .await
-            .expect("policy");
-        let snap = handle.tls_snapshot().expect("tls snap");
-        assert!(snap.sni_server_names.contains(&"x.example".to_string()));
-        assert_eq!(snap.unknown_sni_policy, "default");
-        handle
-            .remove_sni_cert("x.example".into())
-            .await
-            .expect("remove");
-        let _ = handle.metrics_snapshot().expect("metrics");
-        handle.close().await.expect("close");
+        // Give the tracked task a moment to register.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(crate::spawn_tracked::server_task_count(server_id) >= 1);
+        // Keep a stale sessions gauge so abort alone cannot clear idle.
+        metrics.sessions_active.store(1, Ordering::SeqCst);
+        let result = wait_for_server_drain(
+            &metrics,
+            server_id,
+            CloseDrainTiming {
+                grace_period: Duration::ZERO,
+                abort_period: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .expect("stale gauge after abort must time out");
+        assert!(result.contains("abortedTasks="));
+        assert!(result.contains("sessionsActive=1"));
     }
 
     #[test]

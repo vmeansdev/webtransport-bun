@@ -23,8 +23,11 @@ pub mod panic_guard;
 pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
+pub mod server_napi;
+pub mod server_spawn;
 pub mod server_tls;
 pub mod session;
+pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
 

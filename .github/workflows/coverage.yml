@@ -64,6 +64,7 @@ jobs:
 
           native_floors = {
               "crates/native/src/limits.rs": (90.0, 90.0, 80.0),
+              # Logic modules only — NAPI/bindings in *_napi.rs; bind/spawn in server_spawn.rs
               "crates/native/src/server.rs": (90.0, 90.0, 80.0),
               "crates/native/src/session.rs": (90.0, 90.0, 80.0),
               "crates/native/src/spawn_tracked.rs": (90.0, 90.0, 80.0),
