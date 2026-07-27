@@ -11,14 +11,13 @@ requires, in addition to evidence gates:
 
 | Capability | 1.0 requirement | Claim id | Status |
 |---|---|---|---|
-| Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | product surface: opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); peer decoder ICI/section-ack applied to encoder KRC; indexed outbound CONNECT/status when capacity > 0; claim remains pending until commit-bound evidence |
-| Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | product surface landed: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
-| 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | partial: `has0Rtt`/`accepted0Rtt` exports + process-local Rust `InMemoryTicketStore` when `enable0Rtt: true` (default false); JS `TicketStoreHost` is **not** bridged to rustls yet (export-only / future durable host) |
-| Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | foundation/options work started; product-complete evidence pending |
+| Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | **passed** on candidate: opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); peer decoder ICI/section-ack applied to encoder KRC; indexed outbound CONNECT/status when capacity > 0 |
+| Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | **passed** on candidate: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
+| 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | **passed** on candidate for process-local Rust ticket store + `has0Rtt`/`accepted0Rtt` when `enable0Rtt: true` (default false); JS `TicketStoreHost` is **not** bridged to rustls yet (export-only / future durable host) |
+| Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | still **pending**: foundation/options only; product-complete parity smoke incomplete |
 
-These are **1.0 requirements**, not permanent product omissions. Until each
-claim is `passed` with commit-bound **product-surface** evidence, the
-capability is incomplete (do not treat unit-only foundations as GA).
+These are **1.0 requirements**, not permanent product omissions. Treat
+`docs/release-status.json` as canonical for claim pass/fail.
 
 ## Implemented today (hand-rolled)
 
@@ -26,8 +25,8 @@ capability is incomplete (do not treat unit-only foundations as GA).
   Chromium-facing default advertises QPACK capacity **0** / blocked streams
   **0** (literal-only). Opt-in dynamic table emits decoder-stream ICI /
   section-acks, applies peer ICI/section-acks to encoder Known Received Count,
-  and indexes outbound CONNECT/status when capacity > 0 — claim remains pending
-  until commit-bound product evidence.
+  and indexes outbound CONNECT/status when capacity > 0 (`wasm-dynamic-qpack`
+  passed on candidate with commit-bound evidence).
 - WebTransport session establishment (Extended CONNECT → 200), datagrams
   (quarter-session-id framing), and uni/bidi streams.
 - Frame-size bound: a single buffered H3 control/CONNECT/HEADERS frame is
@@ -43,8 +42,9 @@ capability is incomplete (do not treat unit-only foundations as GA).
 - Connection migration, key update, loss recovery, congestion control, ACKs,
   flow control, retry / stateless reset, and the QUIC idle timeout. These are
   handled by quinn-proto and inherit its correctness and defaults. Early data
-  (0-RTT) foundation is wired here under `enable0Rtt` (`ticket_store.rs`);
-  durable JS ticket persistence and claim evidence remain for `wasm-0rtt`.
+  (0-RTT) is wired here under `enable0Rtt` (`ticket_store.rs`);
+  `wasm-0rtt` is claim-passed for the Rust process-local store path — durable
+  JS `TicketStoreHost`→rustls bridging remains unfinished.
 
 ## Still out of 1.0 scope (non-goals)
 

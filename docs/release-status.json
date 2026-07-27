@@ -113,7 +113,7 @@
 				"local-native-local-gates-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on candidate."
+			"notes": "Rebound locally on candidate ab6bbdf."
 		},
 		{
 			"id": "wasm-local-gates",
@@ -123,7 +123,7 @@
 				"local-wasm-local-gates-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on candidate."
+			"notes": "Rebound locally on candidate ab6bbdf."
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -150,7 +150,7 @@
 				"local-chromium-native-interop-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
+			"notes": "Rebound to candidate ab6bbdf with local commit-bound evidence."
 		},
 		{
 			"id": "chromium-wasm-interop",
@@ -160,7 +160,7 @@
 				"local-chromium-wasm-interop-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
+			"notes": "Rebound to candidate ab6bbdf with local commit-bound evidence."
 		},
 		{
 			"id": "iwa-direct-sockets",
@@ -178,7 +178,7 @@
 				"local-fault-matrix-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
+			"notes": "Rebound to candidate ab6bbdf with local commit-bound evidence."
 		},
 		{
 			"id": "coverage-gates",
