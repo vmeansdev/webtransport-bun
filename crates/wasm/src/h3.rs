@@ -307,11 +307,16 @@ impl QpackDecoder {
     pub fn max_blocked_streams(&self) -> u64 {
         self.max_blocked_streams
     }
+
+    pub fn max_table_capacity(&self) -> u64 {
+        self.table.max_capacity() as u64
+    }
 }
 
 impl Default for QpackDecoder {
+    /// Matches [`encode_control_preamble`]: zero capacity until opt-in dynamic QPACK.
     fn default() -> Self {
-        Self::new(&QpackLocalSettings::default())
+        Self::disabled()
     }
 }
 
@@ -1025,6 +1030,34 @@ mod tests {
         let s = parse_settings(payload).unwrap();
         assert_eq!(s.qpack_max_table_capacity, 0);
         assert_eq!(s.qpack_blocked_streams, 0);
+    }
+
+    #[test]
+    fn advertised_settings_capacity_matches_decoder_default() {
+        let buf = encode_control_preamble(2);
+        let rest = &buf[varint::decode(&buf).unwrap().1..];
+        let (ft, n1) = varint::decode(rest).unwrap();
+        assert_eq!(ft, frame::SETTINGS);
+        let rest = &rest[n1..];
+        let (len, n2) = varint::decode(rest).unwrap();
+        let s = parse_settings(&rest[n2..n2 + len as usize]).unwrap();
+        let dec = QpackDecoder::default();
+        assert_eq!(s.qpack_max_table_capacity, dec.max_table_capacity());
+        assert_eq!(s.qpack_blocked_streams, dec.max_blocked_streams());
+        assert_eq!(s.qpack_max_table_capacity, 0);
+        assert_eq!(s.qpack_blocked_streams, 0);
+
+        let settings = QpackLocalSettings::default();
+        let buf_dyn = encode_control_preamble_with(2, &settings);
+        let rest = &buf_dyn[varint::decode(&buf_dyn).unwrap().1..];
+        let (ft, n1) = varint::decode(rest).unwrap();
+        assert_eq!(ft, frame::SETTINGS);
+        let rest = &rest[n1..];
+        let (len, n2) = varint::decode(rest).unwrap();
+        let s_dyn = parse_settings(&rest[n2..n2 + len as usize]).unwrap();
+        let dec_dyn = QpackDecoder::new(&settings);
+        assert_eq!(s_dyn.qpack_max_table_capacity, dec_dyn.max_table_capacity());
+        assert_eq!(s_dyn.qpack_blocked_streams, dec_dyn.max_blocked_streams());
     }
 
     #[test]
