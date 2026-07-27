@@ -45,7 +45,7 @@ pub(crate) fn spawn_server_instance(
     tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
     debug: bool,
     max_retries: usize,
-) -> std::result::Result<watch::Sender<()>, String> {
+) -> std::result::Result<(watch::Sender<()>, u16), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
     let mut last_err: Option<String> = None;
@@ -53,7 +53,7 @@ pub(crate) fn spawn_server_instance(
     for attempt in 0..max_retries {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (startup_tx, startup_rx) =
-            std::sync::mpsc::channel::<std::result::Result<(), String>>();
+            std::sync::mpsc::channel::<std::result::Result<u16, String>>();
 
         crate::spawn_wtransport_server(
             server_id,
@@ -71,7 +71,7 @@ pub(crate) fn spawn_server_instance(
         );
 
         match startup_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => return Ok(shutdown_tx),
+            Ok(Ok(bound_port)) => return Ok((shutdown_tx, bound_port)),
             Ok(Err(msg)) => {
                 if should_retry_startup_error(&msg, attempt, max_retries) {
                     last_err = Some(msg);
@@ -88,11 +88,22 @@ pub(crate) fn spawn_server_instance(
     Err(last_err.unwrap_or_else(|| "server startup failed".to_string()))
 }
 
+/// Sends shutdown when dropped so panic/early-return paths still stop the accept loop.
+pub(crate) struct ShutdownOnDrop(pub Option<watch::Sender<()>>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         is_addr_in_use_error, map_startup_recv_timeout_error, should_retry_startup_error,
-        spawn_server_instance,
+        spawn_server_instance, ShutdownOnDrop,
     };
     use crate::limits::Limits;
     use crate::rate_limit::RateLimits;
@@ -132,18 +143,14 @@ mod tests {
         let limits = Limits::default();
         let rate_limits = RateLimits::default();
         let resolver = build_default_dev_resolver().expect("dev resolver");
-        // Bind an ephemeral UDP port first so we don't collide with CI siblings.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-        let port = probe.local_addr().expect("local addr").port();
-        drop(probe);
-
-        let shutdown_tx = spawn_server_instance(
+        // Bind port 0 and use the OS-reported port (no probe/drop TOCTOU).
+        let (shutdown_tx, bound_port) = spawn_server_instance(
             server_id,
             Arc::clone(&metrics),
             &limits,
             &rate_limits,
             "127.0.0.1",
-            port,
+            0,
             &None,
             &None,
             resolver,
@@ -151,12 +158,14 @@ mod tests {
             3,
         )
         .expect("server should start");
-        let _ = shutdown_tx.send(());
+        assert_ne!(bound_port, 0, "OS must assign a non-zero ephemeral port");
+        let _shutdown = ShutdownOnDrop(Some(shutdown_tx));
         // Drain must observe idle after shutdown signal (no sessions accepted).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("rt");
+        drop(_shutdown);
         let drain = rt.block_on(wait_for_server_drain(
             &metrics,
             server_id,

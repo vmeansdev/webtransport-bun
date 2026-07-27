@@ -64,7 +64,10 @@ jobs:
 
           native_floors = {
               "crates/native/src/limits.rs": (90.0, 90.0, 80.0),
-              # Logic modules only — NAPI/bindings in *_napi.rs; bind/spawn in server_spawn.rs
+              # Logic modules only — TLS rotation + close-drain in server.rs;
+              # session capacity/datagram/stream helpers in session.rs.
+              # Bind/retry spawn lives in server_spawn.rs (unit-tested, not floored).
+              # NAPI/bindings live in *_napi.rs (not floored).
               "crates/native/src/server.rs": (90.0, 90.0, 80.0),
               "crates/native/src/session.rs": (90.0, 90.0, 80.0),
               "crates/native/src/spawn_tracked.rs": (90.0, 90.0, 80.0),
@@ -101,7 +104,14 @@ jobs:
                   branches = summary.get("branches", {})
                   line_pct = float(lines.get("percent", 0.0))
                   function_pct = float(functions.get("percent", 0.0))
-                  branch_pct = float(branches.get("percent", 0.0))
+                  # llvm-cov reports 0% when a file has zero branch sites; treat
+                  # that as full coverage for floor evaluation (vacuous truth).
+                  branch_count = int(branches.get("count", 0) or 0)
+                  branch_pct = (
+                      100.0
+                      if branch_count == 0
+                      else float(branches.get("percent", 0.0))
+                  )
                   if line_pct < line_floor:
                       failures.append(
                           f"{candidate}: line coverage {line_pct:.2f}% < required {line_floor:.2f}%"
