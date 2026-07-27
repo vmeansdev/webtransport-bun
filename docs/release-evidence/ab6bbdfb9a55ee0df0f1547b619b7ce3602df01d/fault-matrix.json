@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "fault-matrix",
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "playwright"
+	},
+	"command": [
+		"bunx",
+		"playwright",
+		"test",
+		"-c",
+		"playwright.fault.config.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T13:52:32.313951+00:00",
+	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
+	"notes": "fault matrix 1/1",
+	"artifactSha256": "ff2bdb5ba7e59beb19ae8bea333f3aa1f82c303cbc6b962ea63a260d90876b6d"
+}

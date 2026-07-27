@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "chromium-native-interop",
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "playwright"
+	},
+	"command": [
+		"bunx",
+		"playwright",
+		"test",
+		"-c",
+		"playwright.config.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T13:52:32.313951+00:00",
+	"finishedAt": "2026-07-27T13:52:32.313951+00:00",
+	"notes": "Playwright chromium-webtransport 19/19 darwin/arm64",
+	"artifactSha256": "9ea533d2294863f98fcb1b8c2099b76b69d59b2d58fb06c8dc27a30e024275a3"
+}

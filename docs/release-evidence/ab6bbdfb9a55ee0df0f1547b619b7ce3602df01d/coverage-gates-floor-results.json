@@ -1,0 +1,118 @@
+{
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"createdAt": "2026-07-27T13:52:32.313951+00:00",
+	"native": [
+		{
+			"module": "crates/native/src/limits.rs",
+			"line": 100.0,
+			"function": 100.0,
+			"branch": 100.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/native/src/server.rs",
+			"line": 99.82,
+			"function": 100.0,
+			"branch": 96.67,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/native/src/session.rs",
+			"line": 98.68,
+			"function": 93.88,
+			"branch": 84.38,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/native/src/spawn_tracked.rs",
+			"line": 99.74,
+			"function": 100.0,
+			"branch": 100.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		}
+	],
+	"wasm": [
+		{
+			"module": "crates/wasm/src/governor.rs",
+			"line": 99.54,
+			"function": 96.2,
+			"branch": 95.45,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/wasm/src/h3.rs",
+			"line": 95.72,
+			"function": 95.05,
+			"branch": 77.4,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": false
+		},
+		{
+			"module": "crates/wasm/src/endpoint.rs",
+			"line": 82.38,
+			"function": 85.38,
+			"branch": 74.08,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": false
+		},
+		{
+			"module": "crates/wasm/src/cert.rs",
+			"line": 97.1,
+			"function": 100.0,
+			"branch": 100.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/wasm/src/verify.rs",
+			"line": 94.81,
+			"function": 96.55,
+			"branch": 94.12,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		}
+	],
+	"status": "failed",
+	"notes": "Local nightly llvm-cov --branch: wasm endpoint.rs/h3.rs below 90/90/80 after QPACK/CONNECT work; claim demoted pending coverage recovery."
+}
