@@ -1,0 +1,8 @@
+{
+  "commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+  "claimId": "wasm-facade-parity",
+  "createdAt": "2026-07-27T11:37:29.975815+00:00",
+  "status": "passed",
+  "notes": "parity-baseline/options/compat on WEBTRANSPORT_PARITY_BACKEND=wasm",
+  "runner": "local-darwin-arm64"
+}

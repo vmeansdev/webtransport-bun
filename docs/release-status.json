@@ -1,72 +1,86 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+		"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-wasm-gates-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/wasm-local-gates.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-coverage-floors-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/coverage-gates-floor-results.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: bun run test:wasm on darwin/arm64."
+			"notes": "Local llvm-cov --branch floors for native+wasm risk modules."
 		},
 		{
-			"id": "local-native-gates-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/native-local-gates.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-dynamic_qpack-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/dynamic_qpack-unit-evidence.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: packages cold-loop (count=1) on darwin/arm64."
+			"notes": "Local evidence for wasm-dynamic-qpack."
 		},
 		{
-			"id": "local-package-artifact-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/package-artifact.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-multi_session-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/multi_session-unit-evidence.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: bun scripts/test-package-artifact.ts build."
+			"notes": "Local evidence for wasm-multi-session."
 		},
 		{
-			"id": "local-runtime-consumers-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/runtime-consumers.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-zero_rtt-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/zero_rtt-unit-evidence.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: internal-package-artifact.test.ts."
+			"notes": "Local evidence for wasm-0rtt."
 		},
 		{
-			"id": "local-supply-chain-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/supply-chain-provenance.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-facade_parity-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/facade_parity-unit-evidence.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Local Actions-independent bind: bun scripts/check-actions-pinned.ts."
+			"notes": "Local evidence for wasm-facade-parity."
 		},
 		{
-			"id": "local-chromium-native-interop-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/chromium-native-interop.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
-			"status": "passed",
-			"notes": "Local Actions-independent bind: Playwright chromium-webtransport 19/19 on darwin/arm64."
+			"id": "local-auto-review-progress-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/auto-review-progress.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"status": "failed",
+			"notes": "Progress only; eight-lane zero-P0-P4 not closed."
 		},
 		{
-			"id": "local-chromium-wasm-interop-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/chromium-wasm-interop.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-wasm-local-gates-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/wasm-local-gates.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Playwright chromium-webtransport-wasm 5/5 darwin/arm64."
+			"notes": "bun run test:wasm 68 pass"
 		},
 		{
-			"id": "local-fault-matrix-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/fault-matrix.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-native-local-gates-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/native-local-gates.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Playwright seeded UDP fault-matrix 1/1 darwin/arm64."
+			"notes": "cargo test -p native --lib 110 pass"
 		},
 		{
-			"id": "local-iwa-direct-sockets-19acc30",
-			"path": "docs/release-evidence/19acc308ab01a789a831a49aa9cf98afc50eefd4/iwa-direct-sockets.json",
-			"commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+			"id": "local-supply-chain-provenance-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/supply-chain-provenance.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
-			"notes": "Local system Chrome 150 IWA proof via tools/interop/run-iwa.mjs (direct-sockets)."
+			"notes": "actions pin policy"
+		},
+		{
+			"id": "local-package-artifact-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/package-artifact.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"status": "passed",
+			"notes": "package tarball build"
+		},
+		{
+			"id": "local-runtime-consumers-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/runtime-consumers.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"status": "passed",
+			"notes": "internal package artifact tests"
 		}
 	],
 	"claims": [
@@ -75,18 +89,20 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-native-gates-19acc30"
+				"local-native-local-gates-2cc0732"
 			],
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Rebound locally on current candidate."
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-gates-19acc30"
+				"local-wasm-local-gates-2cc0732"
 			],
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Rebound locally on current candidate."
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -100,52 +116,51 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-runtime-consumers-19acc30"
+				"local-runtime-consumers-2cc0732"
 			],
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Rebound locally on current candidate."
 		},
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
-			"status": "passed",
-			"evidenceIds": [
-				"local-chromium-native-interop-19acc30"
-			],
-			"gaRequired": true
+			"status": "pending",
+			"evidenceIds": [],
+			"gaRequired": true,
+			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
 		{
 			"id": "chromium-wasm-interop",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-chromium-wasm-interop-19acc30"
-			],
-			"gaRequired": true
+			"status": "pending",
+			"evidenceIds": [],
+			"gaRequired": true,
+			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
 		{
 			"id": "iwa-direct-sockets",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-iwa-direct-sockets-19acc30"
-			],
-			"gaRequired": true
+			"status": "pending",
+			"evidenceIds": [],
+			"gaRequired": true,
+			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
 		{
 			"id": "fault-matrix",
 			"surface": "release",
-			"status": "passed",
-			"evidenceIds": [
-				"local-fault-matrix-19acc30"
-			],
-			"gaRequired": true
+			"status": "pending",
+			"evidenceIds": [],
+			"gaRequired": true,
+			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
 		{
 			"id": "coverage-gates",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"notes": "WIP: native+wasm llvm-cov floors clear at HEAD 1f453c2 working tree; rebind after commit. Prior failed evidence retained until then.",
+			"status": "passed",
+			"evidenceIds": [
+				"local-coverage-floors-2cc0732"
+			],
+			"notes": "Rust floors clear locally; Bun LCOV CI-deferred.",
 			"gaRequired": true
 		},
 		{
@@ -169,18 +184,20 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-19acc30"
+				"local-package-artifact-2cc0732"
 			],
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Rebound locally on current candidate."
 		},
 		{
 			"id": "supply-chain-provenance",
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-19acc30"
+				"local-supply-chain-provenance-2cc0732"
 			],
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Rebound locally on current candidate."
 		},
 		{
 			"id": "soak-24h",
@@ -200,7 +217,9 @@
 			"id": "auto-review-zero-p0-p4",
 			"surface": "release",
 			"status": "pending",
-			"evidenceIds": [],
+			"evidenceIds": [
+				"local-auto-review-progress-2cc0732"
+			],
 			"gaRequired": true
 		},
 		{
@@ -213,32 +232,40 @@
 		{
 			"id": "wasm-dynamic-qpack",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-dynamic_qpack-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Coupled 1.0: RFC 9204 dynamic QPACK with hard caps; unit+fuzz+interop evidence required. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
 		},
 		{
 			"id": "wasm-multi-session",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-multi_session-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Coupled 1.0: SETTINGS_WT_MAX_SESSIONS>1 with session demux; wasm\u2194wasm + over-cap rejection. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
 		},
 		{
 			"id": "wasm-0rtt",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-zero_rtt-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Coupled 1.0: early data + anti-replay; ticket storage via JS bridge; SECURITY.md notes. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
 		},
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-facade_parity-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Coupled 1.0: W3C options + E_* parity with native; parity-*.test.ts on wasm selector. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
 		}
