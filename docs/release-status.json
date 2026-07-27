@@ -187,7 +187,7 @@
 			"evidenceIds": [
 				"local-coverage-floors-ab6bbdf"
 			],
-			"notes": "Demoted: wasm endpoint/h3 branch/line floors below gate after QPACK/CONNECT product work; needs coverage recovery before re-pass.",
+			"notes": "Floors green on 991fa88; claim flip awaits candidate rebind. Artifact docs/release-evidence/991fa88fe6a6b808b0bc160340f6cf9adf076e0a/coverage-gates-floor-results.json.",
 			"gaRequired": true
 		},
 		{

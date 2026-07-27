@@ -3990,3 +3990,947 @@ fn unlatched_connect_storm_resets_without_unbounded_buffers() {
         sess.in_streams.len()
     );
 }
+
+fn client_with_established_peer(max_sessions: u64) -> (WtEndpoint, ConnectionHandle, u32) {
+    use quinn_proto::{Dir, Side};
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
+    let h = ConnectionHandle(0);
+    let conn_id = 7u32;
+    client.handle_to_id.insert(h, conn_id);
+    client.id_to_handle.insert(conn_id, h);
+    let primary = StreamId::new(Side::Client, Dir::Bi, 0);
+    let sess = Session {
+        established: true,
+        connect_stream: Some(primary),
+        authority: "localhost".into(),
+        peer_settings: Some(h3::PeerSettings {
+            max_sessions,
+            ..h3::PeerSettings::default()
+        }),
+        ..Session::default()
+    };
+    client.sessions.insert(h, sess);
+    (client, h, conn_id)
+}
+
+#[test]
+fn open_wt_session_error_arms_without_quic() {
+    let (mut client, _h, _conn_id) = client_with_established_peer(2);
+    assert_eq!(client.open_wt_session(999), -1);
+    assert!(client
+        .take_last_error()
+        .unwrap()
+        .contains("E_SESSION_CLOSED"));
+
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+    server.handle_to_id.insert(ConnectionHandle(0), 1);
+    server.id_to_handle.insert(1, ConnectionHandle(0));
+    server
+        .sessions
+        .insert(ConnectionHandle(0), Session::default());
+    assert_eq!(server.open_wt_session(1), -1);
+    assert!(server
+        .take_last_error()
+        .unwrap()
+        .contains("E_UNSUPPORTED_ARGUMENT"));
+
+    let (mut client, h, conn_id) = client_with_established_peer(2);
+    client.sessions.get_mut(&h).unwrap().established = false;
+    assert_eq!(client.open_wt_session(conn_id), -1);
+    assert!(client
+        .take_last_error()
+        .unwrap()
+        .contains("primary session not established"));
+
+    let (mut client, h, conn_id) = client_with_established_peer(2);
+    client.sessions.get_mut(&h).unwrap().peer_settings = None;
+    assert_eq!(client.open_wt_session(conn_id), -1);
+    assert!(client
+        .take_last_error()
+        .unwrap()
+        .contains("E_HANDSHAKE_TIMEOUT"));
+
+    let (mut client, _h, conn_id) = client_with_established_peer(1);
+    assert_eq!(client.open_wt_session(conn_id), -1);
+    assert!(client
+        .take_last_error()
+        .unwrap()
+        .contains("E_LIMIT_EXCEEDED"));
+}
+
+#[test]
+fn parse_pending_client_connect_non_200_and_200() {
+    use quinn_proto::{Dir, Side};
+    let (mut client, h, conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 4);
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: h3::encode_status_response("404"),
+                deadline: None,
+            },
+        );
+    client.parse_pending_client_connect(h, pending_sid);
+    assert!(!client
+        .sessions
+        .get(&h)
+        .unwrap()
+        .pending_client_connects
+        .contains_key(&pending_sid));
+    assert!(client.events.iter().any(|e| matches!(
+        e,
+        WtEvent::SessionClosed {
+            conn,
+            session_id,
+            ..
+        } if *conn == conn_id && *session_id == u64::from(pending_sid)
+    )));
+
+    let (mut client, h, conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 8);
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: h3::encode_status_response("200"),
+                deadline: None,
+            },
+        );
+    client.parse_pending_client_connect(h, pending_sid);
+    let s = client.sessions.get(&h).unwrap();
+    assert!(s.extra_sessions.contains(&pending_sid));
+    assert!(!s.pending_client_connects.contains_key(&pending_sid));
+    assert!(client.events.iter().any(|e| matches!(
+        e,
+        WtEvent::SessionEstablished {
+            conn,
+            session_id,
+            ..
+        } if *conn == conn_id && *session_id == u64::from(pending_sid)
+    )));
+}
+
+#[test]
+fn pending_client_connect_deadline_expires_in_handle_timeout() {
+    use quinn_proto::{Dir, Side};
+    let (mut client, h, conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 4);
+    let t0 = Instant::now();
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: Vec::new(),
+                deadline: Some(t0),
+            },
+        );
+    client.handle_timeout(t0 + std::time::Duration::from_millis(1));
+    assert!(!client
+        .sessions
+        .get(&h)
+        .unwrap()
+        .pending_client_connects
+        .contains_key(&pending_sid));
+    assert!(client.events.iter().any(|e| matches!(
+        e,
+        WtEvent::SessionClosed {
+            conn,
+            session_id,
+            ..
+        } if *conn == conn_id && *session_id == u64::from(pending_sid)
+    )));
+}
+
+#[test]
+fn server_post_accept_connect_deadline_fires() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+    let h = ConnectionHandle(0);
+    server.handle_to_id.insert(h, 9);
+    server.id_to_handle.insert(9, h);
+    let t0 = Instant::now();
+    server.sessions.insert(
+        h,
+        Session {
+            connect_deadline: Some(t0),
+            ..Session::default()
+        },
+    );
+    server.handle_timeout(t0 + std::time::Duration::from_millis(1));
+    assert!(server.sessions.get(&h).unwrap().connect_closed);
+    assert!(server
+        .events
+        .iter()
+        .any(|e| matches!(e, WtEvent::ConnectionClosed { conn: 9, .. })));
+}
+
+#[test]
+fn open_and_close_wt_session_live_multi_session() {
+    let (mut server, mut client, cid) = endpoints();
+    server.set_wt_max_sessions(2);
+    client.set_wt_max_sessions(2);
+    let mut server_est = 0usize;
+    let mut client_est = 0usize;
+    let mut secondary: Option<i64> = None;
+    let mut secondary_closed = false;
+
+    for _ in 0..800 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = server.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                server_est += 1;
+            }
+        }
+        while let Some(ev) = client.poll_event() {
+            match ev {
+                WtEvent::SessionEstablished { .. } => client_est += 1,
+                WtEvent::SessionClosed { session_id, .. } => {
+                    if secondary == Some(session_id as i64) {
+                        secondary_closed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if client_est >= 1 && secondary.is_none() {
+            let sid = client.open_wt_session(cid);
+            assert!(
+                sid >= 0,
+                "open_wt_session must succeed: {:?}",
+                client.take_last_error()
+            );
+            secondary = Some(sid);
+        }
+        if client_est >= 2 {
+            if let Some(sid) = secondary {
+                let stream = client.open_stream(cid, sid as u64, true);
+                if stream >= 0 {
+                    let _ = client.stream_write(stream as u32, b"x");
+                }
+                assert!(client.close_wt_session(cid, sid as u64, 17, b"extra-done"));
+                break;
+            }
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(
+        client_est >= 2 && server_est >= 2,
+        "expected dual CONNECT (client={client_est} server={server_est})"
+    );
+    // Drain close notification.
+    for _ in 0..200 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if let WtEvent::SessionClosed { session_id, .. } = ev {
+                if secondary == Some(session_id as i64) {
+                    secondary_closed = true;
+                }
+            }
+        }
+        if secondary_closed {
+            break;
+        }
+    }
+    assert!(secondary_closed || secondary.is_some());
+    // Primary close tears down QUIC.
+    assert!(client.close_wt_session(cid, 0, 0, b"primary"));
+}
+
+#[test]
+fn close_wt_session_unknown_ids_fail_closed() {
+    let (mut client, _h, conn_id) = client_with_established_peer(2);
+    assert!(!client.close_wt_session(999, 0, 0, b"x"));
+    assert!(client
+        .take_last_error()
+        .unwrap()
+        .contains("E_SESSION_CLOSED"));
+    assert!(!client.close_wt_session(conn_id, 99, 0, b"x"));
+    assert!(client
+        .take_last_error()
+        .unwrap()
+        .contains("unknown WebTransport session id"));
+}
+
+#[test]
+fn parse_pending_client_connect_qpack_blocked_invalid_and_data_skip() {
+    use quinn_proto::{Dir, Side};
+    // Blocked RIC against empty decoder with capacity>0 and max_blocked=0 → protocol close.
+    let (mut client, h, _conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 4);
+    {
+        let s = client.sessions.get_mut(&h).unwrap();
+        s.qpack_decoder = h3::QpackDecoder::new(&h3::QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 0,
+        });
+    }
+    let mut section = Vec::new();
+    h3::encode_field_section_prefix(1, 0, 4096, &mut section).unwrap();
+    let blocked = h3::frame_wrap(h3::frame::HEADERS, &section);
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: blocked,
+                deadline: None,
+            },
+        );
+    client.parse_pending_client_connect(h, pending_sid);
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|e| matches!(e, WtEvent::ConnectionClosed { .. })),
+        "blocked QPACK with max_blocked=0 must fail closed"
+    );
+
+    // Invalid dynamic index → protocol close.
+    let (mut client, h, _conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 8);
+    let invalid = h3::frame_wrap(h3::frame::HEADERS, &[0x00, 0x00, 0x80]);
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: invalid,
+                deadline: None,
+            },
+        );
+    client.parse_pending_client_connect(h, pending_sid);
+    assert!(client
+        .events
+        .iter()
+        .any(|e| matches!(e, WtEvent::ConnectionClosed { .. })));
+
+    // Non-HEADERS DATA drained, then 200 establishes.
+    let (mut client, h, conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 12);
+    let mut rx = h3::frame_wrap(h3::frame::DATA, b"xx");
+    rx.extend_from_slice(&h3::encode_status_response("200"));
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(pending_sid, PendingClientConnect { rx, deadline: None });
+    client.parse_pending_client_connect(h, pending_sid);
+    assert!(client
+        .sessions
+        .get(&h)
+        .unwrap()
+        .extra_sessions
+        .contains(&pending_sid));
+    assert!(client.events.iter().any(|e| matches!(
+        e,
+        WtEvent::SessionEstablished { conn, session_id, .. }
+        if *conn == conn_id && *session_id == u64::from(pending_sid)
+    )));
+}
+
+#[test]
+fn parse_client_connect_blocked_fail_closed() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
+    let h = ConnectionHandle(0);
+    client.handle_to_id.insert(h, 11);
+    client.id_to_handle.insert(11, h);
+    let mut section = Vec::new();
+    h3::encode_field_section_prefix(1, 0, 4096, &mut section).unwrap();
+    let sess = Session {
+        connect_self_opened: true,
+        connect_rx: h3::frame_wrap(h3::frame::HEADERS, &section),
+        qpack_decoder: h3::QpackDecoder::new(&h3::QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 0,
+        }),
+        ..Session::default()
+    };
+    client.sessions.insert(h, sess);
+    client.parse_client_connect(h);
+    assert!(client
+        .events
+        .iter()
+        .any(|e| matches!(e, WtEvent::ConnectionClosed { .. })));
+}
+
+fn establish_pair(max_sessions: u64) -> (WtEndpoint, WtEndpoint, u32) {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+    let mut client = WtEndpoint::new(false, caddr, saddr).unwrap();
+    server.set_wt_max_sessions(max_sessions);
+    client.set_wt_max_sessions(max_sessions);
+    let cid = client.connect("localhost") as u32;
+    let mut ok = false;
+    for _ in 0..600 {
+        let moved = relay_client_to_server(&mut client, &mut server)
+            | relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                ok = true;
+            }
+        }
+        while server.poll_event().is_some() {}
+        if ok {
+            break;
+        }
+        if !moved {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(ok, "primary session must establish");
+    (server, client, cid)
+}
+
+#[test]
+fn next_timeout_tracks_pending_client_connect_deadline() {
+    use quinn_proto::{Dir, Side};
+    let (mut client, h, _conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 4);
+    let deadline = Instant::now() + std::time::Duration::from_millis(40);
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: Vec::new(),
+                deadline: Some(deadline),
+            },
+        );
+    let ms = client.next_timeout_ms();
+    assert!(
+        ms >= 0.0 && ms <= 40.0,
+        "pending CONNECT deadline must contribute to next_timeout_ms (got {ms})"
+    );
+}
+
+#[test]
+fn encode_status_and_connect_ok_fall_back_when_dynamic_qpack_insert_fails() {
+    // Tiny dynamic table cannot hold ":status"/code → encode_*_with Err → static fallback.
+    let (mut server, h, sid) = server_with_request(h3::encode_get_request("localhost", "/x"));
+    server.sessions.get_mut(&h).unwrap().qpack_encoder = h3::QpackEncoder::new(8);
+    server.parse_server_connect(h, sid);
+    assert!(
+        server
+            .sessions
+            .get(&h)
+            .unwrap()
+            .in_streams
+            .get(&sid)
+            .unwrap()
+            .buf
+            .is_empty(),
+        "404 fallback must still drain the non-CONNECT request"
+    );
+
+    let (mut server2, h2, sid2) = server_with_request(h3::encode_connect_request("localhost", "/"));
+    server2.sessions.get_mut(&h2).unwrap().qpack_encoder = h3::QpackEncoder::new(8);
+    server2.parse_server_connect(h2, sid2);
+    assert!(
+        server2.sessions.get(&h2).unwrap().established,
+        "CONNECT ok fallback must still establish"
+    );
+}
+
+#[test]
+fn send_datagram_connection_missing_arm() {
+    let (mut client, _h, conn_id) = client_with_established_peer(1);
+    assert!(!client.send_datagram(conn_id, 0, b"x"));
+    assert_eq!(
+        client.take_last_error().as_deref(),
+        Some("E_SESSION_CLOSED: connection missing")
+    );
+}
+
+#[test]
+fn send_datagram_toolarge_arm() {
+    let (_server, mut client, cid) = establish_pair(2);
+    let h = *client.id_to_handle.get(&cid).unwrap();
+    let transport = client
+        .conns
+        .get_mut(&h)
+        .unwrap()
+        .datagrams()
+        .max_size()
+        .expect("transport datagram size");
+    // Skip pre-check so framed size can exceed quinn's DATAGRAM cap.
+    assert!(!client.send_datagram_unchecked_size(cid, 0, &vec![0u8; transport]));
+    assert_eq!(
+        client.take_last_error().as_deref(),
+        Some("E_LIMIT_EXCEEDED: maxDatagramSize exceeded")
+    );
+}
+
+#[test]
+fn stream_write_blocked_and_reset_error_arms() {
+    let (mut server, mut client, cid) = establish_pair(2);
+    let stream = client.open_stream(cid, 0, true);
+    assert!(stream >= 0);
+    let stream = stream as u32;
+    // Deliver STREAM frames so the stream exists, then stop pumping so the
+    // send window cannot grow — subsequent large writes block.
+    for _ in 0..40 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+    }
+    let chunk = vec![0u8; 64 * 1024];
+    let mut saw_blocked = false;
+    for _ in 0..4_000 {
+        let n = client.stream_write(stream, &chunk);
+        if n == 0 {
+            assert!(
+                client
+                    .take_last_error()
+                    .unwrap_or_default()
+                    .contains("E_BACKPRESSURE_TIMEOUT"),
+                "Blocked write must set backpressure diagnostic"
+            );
+            saw_blocked = true;
+            break;
+        }
+        assert!(n > 0, "unexpected write failure before block");
+    }
+    assert!(saw_blocked, "unpumped large writes must eventually Block");
+
+    let stream2 = client.open_stream(cid, 0, true);
+    assert!(stream2 >= 0);
+    let stream2 = stream2 as u32;
+    for _ in 0..40 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+    }
+    client.stream_reset(stream2, 7);
+    assert_eq!(client.stream_write(stream2, b"after-reset"), -1);
+    assert!(client
+        .take_last_error()
+        .unwrap_or_default()
+        .contains("E_STREAM_RESET"));
+}
+
+#[test]
+fn pending_connect_peer_fin_before_200_emits_session_closed() {
+    let (mut server, mut client, cid) = establish_pair(2);
+    let secondary = client.open_wt_session(cid);
+    assert!(
+        secondary >= 0,
+        "open secondary: {:?}",
+        client.take_last_error()
+    );
+    let secondary = secondary as u64;
+
+    // Deliver the client's CONNECT bidi to the server, then FIN the server
+    // send half with no HEADERS so the client sees Finished while still pending.
+    let mut finished_peer = false;
+    for _ in 0..400 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+
+        if !finished_peer {
+            for (&h, sess) in server.sessions.iter() {
+                let primary = sess.connect_stream;
+                let targets: Vec<_> = sess
+                    .in_streams
+                    .iter()
+                    .filter(|(sid, st)| st.is_bidi && Some(**sid) != primary)
+                    .map(|(sid, _)| *sid)
+                    .collect();
+                if let Some(conn) = server.conns.get_mut(&h) {
+                    for sid in targets {
+                        let _ = conn.send_stream(sid).finish();
+                        finished_peer = true;
+                    }
+                }
+            }
+        }
+        if finished_peer {
+            break;
+        }
+    }
+    assert!(
+        finished_peer,
+        "server must observe and FIN the secondary CONNECT"
+    );
+
+    let mut closed = false;
+    for _ in 0..400 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if let WtEvent::SessionClosed { session_id, .. } = ev {
+                if session_id == secondary {
+                    closed = true;
+                }
+            }
+        }
+        while server.poll_event().is_some() {}
+        if closed {
+            break;
+        }
+        let now = Instant::now();
+        server.handle_timeout(now);
+        client.handle_timeout(now);
+    }
+    assert!(
+        closed,
+        "Finished pending CONNECT must emit SessionClosed (read_one 1656 path)"
+    );
+}
+
+#[test]
+fn parse_pending_failure_resets_live_quic_stream() {
+    let (_server, mut client, cid) = establish_pair(2);
+    let secondary = client.open_wt_session(cid);
+    assert!(secondary >= 0, "{:?}", client.take_last_error());
+    // Do not relay — keep the CONNECT pending and inject a final non-200.
+    let h = *client.id_to_handle.get(&cid).expect("client handle");
+    let pending_sid = *client
+        .sessions
+        .get(&h)
+        .unwrap()
+        .pending_client_connects
+        .keys()
+        .next()
+        .expect("secondary still pending");
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .get_mut(&pending_sid)
+        .unwrap()
+        .rx = h3::encode_status_response("404");
+    client.parse_pending_client_connect(h, pending_sid);
+    assert!(client.events.iter().any(|e| matches!(
+        e,
+        WtEvent::SessionClosed { session_id, .. } if *session_id == u64::from(pending_sid)
+    )));
+    assert!(!client
+        .sessions
+        .get(&h)
+        .unwrap()
+        .pending_client_connects
+        .contains_key(&pending_sid));
+}
+
+#[test]
+fn parse_pending_qpack_blocked_waits_when_max_blocked_nonzero() {
+    use quinn_proto::{Dir, Side};
+    let (mut client, h, _conn_id) = client_with_established_peer(2);
+    let pending_sid = StreamId::new(Side::Client, Dir::Bi, 4);
+    {
+        let s = client.sessions.get_mut(&h).unwrap();
+        s.qpack_decoder = h3::QpackDecoder::new(&h3::QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 8,
+        });
+    }
+    let mut section = Vec::new();
+    h3::encode_field_section_prefix(1, 0, 4096, &mut section).unwrap();
+    let blocked = h3::frame_wrap(h3::frame::HEADERS, &section);
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .insert(
+            pending_sid,
+            PendingClientConnect {
+                rx: blocked,
+                deadline: None,
+            },
+        );
+    client.parse_pending_client_connect(h, pending_sid);
+    assert!(
+        client
+            .sessions
+            .get(&h)
+            .unwrap()
+            .pending_client_connects
+            .contains_key(&pending_sid),
+        "Blocked with max_blocked>0 must wait (not fail closed)"
+    );
+    assert!(
+        !client
+            .events
+            .iter()
+            .any(|e| matches!(e, WtEvent::ConnectionClosed { .. })),
+        "must not protocol-close when blocking is permitted"
+    );
+}
+
+#[test]
+fn server_datagram_ingress_rate_limit_and_event_budget_close() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let limits = WasmLimits {
+        max_queued_bytes_global: 8,
+        max_queued_bytes_per_session: 8,
+        max_queued_bytes_per_stream: 8,
+        max_datagram_size: 64,
+        ..WasmLimits::default()
+    };
+    let rate = WasmRateLimits {
+        datagrams_ingress_per_sec: 1,
+        datagrams_ingress_burst: 1,
+        ..WasmRateLimits::default()
+    };
+    let mut server =
+        WtEndpoint::new_with_limits_and_rate_limits(true, saddr, caddr, limits.clone(), rate)
+            .unwrap();
+    let mut client = WtEndpoint::new_with_limits(false, caddr, saddr, limits).unwrap();
+    let cid = client.connect("localhost") as u32;
+    let mut established = false;
+    for _ in 0..600 {
+        let moved = relay_client_to_server(&mut client, &mut server)
+            | relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while server.poll_event().is_some() {}
+        if established {
+            break;
+        }
+        if !moved {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(established);
+    let now = Instant::now();
+    let server_conn = *server.id_to_handle.keys().next().expect("server conn");
+    let _ =
+        server
+            .rate_limiter
+            .check_connection(now, server_conn, RateLimitDimension::DatagramIngress);
+    assert!(client.send_datagram(cid, 0, b"rate-me"));
+    for _ in 0..80 {
+        let _ = relay_client_to_server(&mut client, &mut server);
+        let _ = relay_server_to_client(&mut server, &mut client);
+        while server.poll_event().is_some() {}
+        while client.poll_event().is_some() {}
+    }
+    let err = server.take_last_error().unwrap_or_default();
+    assert!(
+        err.contains("E_RATE_LIMITED") || err.contains("budget") || err.contains("E_QUEUE_FULL"),
+        "ingress datagram must hit rate-limit or budget arm, got {err}"
+    );
+}
+
+#[test]
+fn reject_wt_unknown_session_resets_live_connection_stream() {
+    use quinn_proto::{Dir, Side};
+    let (mut server, _client, _cid) = establish_pair(2);
+    let h = *server.id_to_handle.values().next().expect("server handle");
+    let wt = StreamId::new(Side::Client, Dir::Uni, 9);
+    server.sessions.get_mut(&h).unwrap().in_streams.insert(
+        wt,
+        InStream {
+            kind: None,
+            is_bidi: false,
+            sid_read: false,
+            wt_session_id: None,
+            handle: None,
+            connect_admitted: false,
+            buf: Vec::new(),
+        },
+    );
+    let mut bytes = Vec::new();
+    crate::varint::encode(h3::stream_type::WT_UNI, &mut bytes);
+    crate::varint::encode(999, &mut bytes); // unknown session id
+    bytes.extend_from_slice(b"x");
+    server.process_in_stream(h, wt, &bytes, false, Instant::now());
+    assert!(server
+        .take_last_error()
+        .unwrap_or_default()
+        .contains("unknown WebTransport session id"));
+    assert!(!server
+        .sessions
+        .get(&h)
+        .unwrap()
+        .in_streams
+        .contains_key(&wt));
+}
+
+#[test]
+fn handle_timeout_fires_quic_timer_and_pending_with_conn() {
+    let (mut server, mut client, cid) = establish_pair(2);
+    let secondary = client.open_wt_session(cid);
+    assert!(secondary >= 0, "{:?}", client.take_last_error());
+    let h = *client.id_to_handle.get(&cid).unwrap();
+    let pending_sid = *client
+        .sessions
+        .get(&h)
+        .unwrap()
+        .pending_client_connects
+        .keys()
+        .next()
+        .expect("pending secondary");
+    let t0 = Instant::now();
+    client
+        .sessions
+        .get_mut(&h)
+        .unwrap()
+        .pending_client_connects
+        .get_mut(&pending_sid)
+        .unwrap()
+        .deadline = Some(t0);
+    // Far-future `now` forces poll_timeout() <= now; same tick also expires pending.
+    let later = t0 + std::time::Duration::from_secs(3_600);
+    client.handle_timeout(later);
+    server.handle_timeout(later);
+    assert!(client.events.iter().any(|e| matches!(
+        e,
+        WtEvent::SessionClosed { session_id, .. } if *session_id == u64::from(pending_sid)
+    )));
+}
+
+#[test]
+fn poll_event_encoded_closes_registered_connection_on_token_exhaustion() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut endpoint = WtEndpoint::new_with_limits(
+        true,
+        saddr,
+        caddr,
+        WasmLimits {
+            max_queued_bytes_global: 4,
+            max_queued_bytes_per_session: 4,
+            max_queued_bytes_per_stream: 4,
+            ..WasmLimits::default()
+        },
+    )
+    .unwrap();
+    let h = ConnectionHandle(0);
+    endpoint.handle_to_id.insert(h, 7);
+    endpoint.id_to_handle.insert(7, h);
+    endpoint.sessions.insert(h, Session::default());
+    endpoint.governor.set_host_token_ceiling_for_test(1);
+    endpoint.push_event(WtEvent::Datagram {
+        conn: 7,
+        session_id: 0,
+        data: vec![1],
+    });
+    endpoint.push_event(WtEvent::Datagram {
+        conn: 7,
+        session_id: 0,
+        data: vec![2],
+    });
+    assert!(endpoint.poll_event_encoded().is_some());
+    let encoded = endpoint
+        .poll_event_encoded()
+        .expect("closed via close_conn");
+    assert_eq!(encoded[0], crate::event::tag::CLOSED);
+    assert!(
+        !endpoint.id_to_handle.contains_key(&7),
+        "registered conn must be torn down via close_conn path"
+    );
+}
+
+#[test]
+fn open_wt_session_stream_capacity_unavailable_arm() {
+    let (_server, mut client, cid) = establish_pair(8);
+    // Exhaust client-initiated bidi stream credit, then open_wt_session must
+    // fail on streams().open(Dir::Bi) == None.
+    let mut opened = 0usize;
+    for _ in 0..10_000 {
+        let s = client.open_stream(cid, 0, true);
+        if s < 0 {
+            break;
+        }
+        opened += 1;
+    }
+    assert!(opened > 0, "should open at least one WT data stream");
+    let sid = client.open_wt_session(cid);
+    assert_eq!(sid, -1);
+    assert!(
+        client
+            .take_last_error()
+            .unwrap_or_default()
+            .contains("stream capacity unavailable"),
+        "expected stream capacity arm"
+    );
+}
+
+#[test]
+fn parse_qpack_decoder_oversized_buffer_fails_closed() {
+    use quinn_proto::{Dir, Side};
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut server = WtEndpoint::new(true, saddr, caddr).unwrap();
+    let h = ConnectionHandle(0);
+    server.handle_to_id.insert(h, 3);
+    server.id_to_handle.insert(3, h);
+    let qdec = StreamId::new(Side::Client, Dir::Uni, 2);
+    let mut sess = Session::default();
+    sess.in_streams.insert(
+        qdec,
+        InStream {
+            kind: None,
+            is_bidi: false,
+            sid_read: false,
+            wt_session_id: None,
+            handle: None,
+            connect_admitted: false,
+            buf: Vec::new(),
+        },
+    );
+    server.sessions.insert(h, sess);
+    let mut bytes = Vec::new();
+    crate::varint::encode(h3::stream_type::QPACK_DECODER, &mut bytes);
+    bytes.extend(std::iter::repeat_n(0xABu8, MAX_H3_FRAME_SIZE as usize + 8));
+    server.process_in_stream(h, qdec, &bytes, false, Instant::now());
+    assert!(server.events.iter().any(|e| matches!(
+        e,
+        WtEvent::ConnectionClosed {
+            code: QPACK_DECODER_STREAM_ERROR,
+            ..
+        }
+    )));
+}
