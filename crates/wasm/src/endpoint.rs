@@ -2106,10 +2106,10 @@ impl WtEndpoint {
                         Route::Control
                     }
                     PeerStreamClass::ServerConnect => {
-                        // Admit once: cap unlatched CONNECTs + handshake bucket.
-                        // Use Handshake (not StreamOpen) so CONNECT storms do not
-                        // steal the WT stream-open budget. Reject early with RESET
-                        // so storms cannot buffer up to MAX_H3_FRAME_SIZE per stream.
+                        // Admit once against concurrent unlatched+active WT sessions.
+                        // Do not charge Handshake/StreamOpen here — those buckets
+                        // gate UDP handshakes and WT stream opens respectively;
+                        // CONNECT storms fail closed via the admission cap + RESET.
                         if !st.connect_admitted {
                             let occupied = unlatched_connects + active_wt;
                             if occupied >= connect_cap {
@@ -2119,21 +2119,6 @@ impl WtEndpoint {
                                         .to_string(),
                                     bidi: true,
                                 };
-                            }
-                            if self.is_server {
-                                if let Some(&conn_id) = self.handle_to_id.get(&h) {
-                                    if let Err(err) = self.rate_limiter.check_connection(
-                                        now,
-                                        conn_id,
-                                        RateLimitDimension::Handshake,
-                                    ) {
-                                        st.buf.clear();
-                                        break 'route Route::RejectWt {
-                                            error: err,
-                                            bidi: true,
-                                        };
-                                    }
-                                }
                             }
                             st.connect_admitted = true;
                         }
