@@ -2989,6 +2989,23 @@ impl WtEndpoint {
             self.set_last_error("E_LIMIT_EXCEEDED: maxDatagramSize exceeded");
             return false;
         }
+        self.send_datagram_framed(conn_id, session_id, payload)
+    }
+
+    /// Frame + quinn send without the application-size pre-check (test-only).
+    /// Used to exercise `SendDatagramError::TooLarge` / queue-full arms that the
+    /// production pre-check otherwise makes unreachable.
+    #[cfg(test)]
+    pub(crate) fn send_datagram_unchecked_size(
+        &mut self,
+        conn_id: u32,
+        session_id: u64,
+        payload: &[u8],
+    ) -> bool {
+        self.send_datagram_framed(conn_id, session_id, payload)
+    }
+
+    fn send_datagram_framed(&mut self, conn_id: u32, session_id: u64, payload: &[u8]) -> bool {
         let Some(&h) = self.id_to_handle.get(&conn_id) else {
             self.set_last_error("E_SESSION_CLOSED: unknown connection");
             return false;
