@@ -259,42 +259,34 @@
 		{
 			"id": "wasm-dynamic-qpack",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-dynamic_qpack-2cc0732"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Coupled 1.0: RFC 9204 dynamic QPACK with hard caps; unit+fuzz+interop evidence required. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
+			"notes": "Foundation only (unit/fuzz paths). Product incomplete until decoder ACKs + opt-in SETTINGS>0 + wasm↔wasm evidence."
 		},
 		{
 			"id": "wasm-multi-session",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-multi_session-2cc0732"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Coupled 1.0: SETTINGS_WT_MAX_SESSIONS>1 with session demux; wasm\u2194wasm + over-cap rejection. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
+			"notes": "Foundation only (Rust multi-CONNECT). Product incomplete until WtEvent session_id demux + JS (conn,sessionId) facade + evidence."
 		},
 		{
 			"id": "wasm-0rtt",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-zero_rtt-2cc0732"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Coupled 1.0: early data + anti-replay; ticket storage via JS bridge; SECURITY.md notes. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
+			"notes": "Foundation only (ticket_store + loopback). Product incomplete until TicketStoreHost take-once + JS has0Rtt/accepted0Rtt + evidence."
 		},
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
-			"status": "passed",
-			"evidenceIds": [
-				"local-facade_parity-2cc0732"
-			],
+			"status": "pending",
+			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Coupled 1.0: W3C options + E_* parity with native; parity-*.test.ts on wasm selector. WIP unit/parity proofs under docs/release-evidence/1f453c2\u2026; bind after commit."
+			"notes": "Foundation/options only. Product incomplete until parity smoke with session map + commit-bound evidence."
 		}
 	],
 	"surfaces": {
