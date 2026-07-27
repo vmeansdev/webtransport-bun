@@ -81,6 +81,13 @@
 			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
 			"status": "passed",
 			"notes": "internal package artifact tests"
+		},
+		{
+			"id": "local-chromium-wasm-interop-2cc0732",
+			"path": "docs/release-evidence/2cc07325e9ad905417418a4132e7c14dad0d0f97/chromium-wasm-interop.json",
+			"commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+			"status": "passed",
+			"notes": "Playwright chromium-webtransport-wasm 5/5"
 		}
 	],
 	"claims": [
@@ -132,8 +139,10 @@
 		{
 			"id": "chromium-wasm-interop",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-chromium-wasm-interop-2cc0732"
+			],
 			"gaRequired": true,
 			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
 		},
