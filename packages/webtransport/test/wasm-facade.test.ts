@@ -11,6 +11,7 @@ import {
 import type { WasmModule } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
+import { withTimeout } from "./helpers/harness.js";
 
 // Soft-skip when pkg is absent (local `bun test packages/`). With
 // WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
@@ -116,10 +117,10 @@ describe("wasm backend facade (P3)", () => {
 				"127.0.0.1:5544",
 				"127.0.0.1:4433",
 			);
-			await primarySession.ready;
+			await withTimeout(primarySession.ready, 5000, "primarySession.ready");
 
 			const secondarySession = await clientMgr.openSession(primarySession.conn);
-			await secondarySession.ready;
+			await withTimeout(secondarySession.ready, 5000, "secondarySession.ready");
 			expect(primarySession.sessionId).not.toBe(secondarySession.sessionId);
 
 			let primaryEcho: Uint8Array | null = null;
@@ -150,7 +151,11 @@ describe("wasm backend facade (P3)", () => {
 
 			const primary = new WasmWebTransport(primarySession);
 			const secondary = new WasmWebTransport(secondarySession);
-			await Promise.all([primary.ready, secondary.ready]);
+			await withTimeout(
+				Promise.all([primary.ready, secondary.ready]),
+				5000,
+				"facade.ready",
+			);
 			const stats = await primary.getStats();
 			expect(stats.bytesSent).toBe(0);
 			expect(stats.bytesReceived).toBe(0);
@@ -178,7 +183,7 @@ describe("wasm backend facade (P3)", () => {
 				"127.0.0.1:5544",
 				{ enable0Rtt: true, enableDynamicQpack: true },
 			);
-			const transport = await createUnifiedClient({
+			const { transport } = await createUnifiedClient({
 				kind: "wasm",
 				wasm,
 				udp: relay.endpoint({ address: "127.0.0.1", port: 5544 }),
@@ -189,7 +194,7 @@ describe("wasm backend facade (P3)", () => {
 				shareProcess0RttTicketStore: true,
 				enableDynamicQpack: true,
 			});
-			await transport.ready;
+			await withTimeout(transport.ready, 5000, "unified.ready");
 			transport.close();
 			server.close();
 		},

@@ -1850,6 +1850,12 @@ export interface WasmClientArgs {
 	qpackMaxTableCapacity?: number;
 	qpackBlockedStreams?: number;
 	enableDynamicQpack?: boolean;
+	/**
+	 * Optional JS host for 0-RTT ticket hydrate/dump. Pass through to
+	 * {@link connectWasmUnified}; call `manager.dumpTicketsToHost(authority)`
+	 * explicitly after NST (not automatic on close).
+	 */
+	ticketStore?: TicketStoreHost;
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;
 	congestionControl?: "default" | "throughput" | "low-latency";
@@ -1869,14 +1875,24 @@ export interface NativeClientArgs {
  * current runtime. The wasm and native sides take different construction args
  * (module/udp vs a native-instance factory) — both yield the same contract.
  *
- * Pass `args` whose `kind` matches the runtime; mismatches throw. Use
- * {@link selectBackend} to pick which args to build.
+ * Wasm returns `{ transport, manager }` so callers can
+ * `manager.dumpTicketsToHost(authority)` when a {@link TicketStoreHost} is set.
+ * Native returns the transport alone.
  */
 export async function createUnifiedClient(
+	args: WasmClientArgs,
+): Promise<{ transport: WebTransportLike; manager: WasmTransportManager }>;
+export async function createUnifiedClient(
+	args: NativeClientArgs,
+): Promise<WebTransportLike>;
+export async function createUnifiedClient(
 	args: WasmClientArgs | NativeClientArgs,
-): Promise<WebTransportLike> {
+): Promise<
+	| WebTransportLike
+	| { transport: WebTransportLike; manager: WasmTransportManager }
+> {
 	if (args.kind === "wasm") {
-		const { transport } = await connectWasmUnified(
+		return connectWasmUnified(
 			args.wasm,
 			args.udp,
 			args.authority,
@@ -1892,6 +1908,7 @@ export async function createUnifiedClient(
 				qpackMaxTableCapacity: args.qpackMaxTableCapacity,
 				qpackBlockedStreams: args.qpackBlockedStreams,
 				enableDynamicQpack: args.enableDynamicQpack,
+				ticketStore: args.ticketStore,
 				allowPooling: args.allowPooling,
 				requireUnreliable: args.requireUnreliable,
 				congestionControl: args.congestionControl,
@@ -1899,7 +1916,6 @@ export async function createUnifiedClient(
 				datagramsReadableType: args.datagramsReadableType,
 			},
 		);
-		return transport;
 	}
 	return args.create();
 }
