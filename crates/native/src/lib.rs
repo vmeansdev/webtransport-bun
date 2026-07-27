@@ -204,8 +204,8 @@ pub(crate) fn report_channel_closed(context: &str) {
 }
 
 fn send_startup_result(
-    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
-    res: std::result::Result<(), String>,
+    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<u16, String>>>,
+    res: std::result::Result<u16, String>,
 ) {
     if let Some(tx) = startup_tx.take() {
         if tx.send(res).is_err() {
@@ -399,7 +399,7 @@ pub(crate) fn spawn_wtransport_server(
     log_tx: Option<tokio::sync::mpsc::Sender<LogEvent>>,
     tls_resolver: Arc<server_tls::LiveServerCertResolver>,
     debug_logs: bool,
-    startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
     use wtransport::{Endpoint, ServerConfig, VarInt};
@@ -417,7 +417,7 @@ pub(crate) fn spawn_wtransport_server(
     RUNTIME.spawn(async move {
         panic_guard::spawn_quic_task_scoped(panic_guard::PanicScope::Server(owner_server_id), async move {
             let mut startup_tx = Some(startup_tx);
-            let mut report_startup = |res: std::result::Result<(), String>| {
+            let mut report_startup = |res: std::result::Result<u16, String>| {
                 send_startup_result(&mut startup_tx, res);
             };
             let tls_config =
@@ -469,11 +469,28 @@ pub(crate) fn spawn_wtransport_server(
             };
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
-                Ok(s) => {
-                    emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
-                    report_startup(Ok(()));
-                    s
-                }
+                Ok(s) => match s.local_addr() {
+                    Ok(addr) => {
+                        let bound_port = addr.port();
+                        emit_log(
+                            &log_tx,
+                            !debug_logs,
+                            "info",
+                            &format!("endpoint created for port {}", bound_port),
+                            None,
+                            None,
+                            None,
+                        );
+                        report_startup(Ok(bound_port));
+                        s
+                    }
+                    Err(e) => {
+                        let msg = format!("failed to read bound address: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        report_startup(Err(msg));
+                        return;
+                    }
+                },
                 Err(e) => {
                     let msg = format!("failed to create endpoint: {:?}", e);
                     emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
@@ -1164,7 +1181,7 @@ mod tests {
     #[test]
     fn send_startup_result_handles_disconnected_receiver() {
         CHANNEL_DELIVERY_FAILURE_COUNT.store(0, Ordering::Relaxed);
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<u16, String>>();
         drop(rx);
         let mut opt = Some(tx);
         send_startup_result(&mut opt, Err("boom".to_string()));

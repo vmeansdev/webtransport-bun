@@ -427,7 +427,7 @@ mod tests {
         use crate::limits::Limits;
         use crate::rate_limit::RateLimits;
         use crate::server_metrics::ServerMetrics;
-        use crate::server_spawn::spawn_server_instance;
+        use crate::server_spawn::{spawn_server_instance, ShutdownOnDrop};
         use crate::server_tls::build_default_dev_resolver;
         use crate::session_registry;
         use crate::SessionEvent;
@@ -435,17 +435,14 @@ mod tests {
         let server_id = u64::MAX - 30;
         let metrics = Arc::new(ServerMetrics::default());
         let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(8);
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
 
-        let shutdown_tx = spawn_server_instance(
+        let (shutdown_tx, port) = spawn_server_instance(
             server_id,
             Arc::clone(&metrics),
             &Limits::default(),
             &RateLimits::default(),
             "127.0.0.1",
-            port,
+            0,
             &Some(session_tx),
             &None,
             build_default_dev_resolver().expect("resolver"),
@@ -453,6 +450,8 @@ mod tests {
             3,
         )
         .expect("server start");
+        assert_ne!(port, 0, "OS must assign a non-zero ephemeral port");
+        let _shutdown = ShutdownOnDrop(Some(shutdown_tx));
 
         let client_cfg = insecure_loopback_client_config().expect("client cfg");
         let endpoint = wtransport::Endpoint::client(client_cfg).expect("client endpoint");
@@ -632,7 +631,7 @@ mod tests {
             .is_none());
 
         handle.close(Some(0), Some("done".into())).unwrap();
-        let _ = shutdown_tx.send(());
+        drop(_shutdown);
         drop(client_conn);
         session_registry::remove(&client_id);
     }

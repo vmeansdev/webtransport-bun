@@ -1,4 +1,5 @@
-//! Server TLS rotation, drain, and spawn helpers (NAPI-free).
+//! Server TLS rotation and close-drain helpers (NAPI-free).
+//! Bind/retry live in `server_spawn.rs` (outside coverage floors).
 //! NAPI bindings live in `server_napi.rs`. Coverage floors target this module.
 
 use napi::Result;

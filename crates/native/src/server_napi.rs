@@ -152,7 +152,7 @@ impl ServerHandle {
                 crate::server_tls::build_default_dev_resolver()
             }
             .map_err(|msg| napi::Error::from_reason(format!("E_TLS: {}", msg)))?;
-            let shutdown_tx = spawn_server_instance(
+            let (shutdown_tx, bound_port) = spawn_server_instance(
                 server_id,
                 Arc::clone(&metrics),
                 &limits,
@@ -171,7 +171,8 @@ impl ServerHandle {
 
             Ok(Self {
                 server_id,
-                port,
+                // Prefer OS-reported bind port so port:0 surfaces a real listen port to JS.
+                port: u32::from(bound_port),
                 metrics,
                 session_tx: Mutex::new(session_tx),
                 log_tx: Mutex::new(log_tx),
