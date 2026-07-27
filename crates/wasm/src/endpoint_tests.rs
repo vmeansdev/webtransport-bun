@@ -60,11 +60,13 @@ fn rust_event_bytes_stay_reserved_through_bridge_transfer_and_teardown() {
 
     endpoint.push_event(WtEvent::Datagram {
         conn: 7,
+        session_id: 0,
         data: vec![1; 4],
     });
     assert_eq!(endpoint.governor.snapshot(7, None).queued_bytes_global, 4);
     endpoint.push_event(WtEvent::Datagram {
         conn: 7,
+        session_id: 0,
         data: vec![2],
     });
     assert_eq!(
@@ -100,10 +102,12 @@ fn bridge_transfer_failure_fails_closed_instead_of_encoding_token_zero() {
     endpoint.governor.set_host_token_ceiling_for_test(1);
     endpoint.push_event(WtEvent::Datagram {
         conn: 1,
+        session_id: 0,
         data: vec![1],
     });
     endpoint.push_event(WtEvent::Datagram {
         conn: 1,
+        session_id: 0,
         data: vec![2],
     });
 
@@ -280,8 +284,11 @@ fn datagram_size_accepts_exact_limit_and_rejects_limit_plus_one_stably() {
         established,
         "session establishes before boundary assertions"
     );
-    assert!(client.send_datagram(conn, b"1234"), "exact limit succeeds");
-    assert!(!client.send_datagram(conn, b"12345"), "limit+1 fails");
+    assert!(
+        client.send_datagram(conn, 0, b"1234"),
+        "exact limit succeeds"
+    );
+    assert!(!client.send_datagram(conn, 0, b"12345"), "limit+1 fails");
     assert_eq!(
         client.take_last_error().as_deref(),
         Some("E_LIMIT_EXCEEDED: maxDatagramSize exceeded")
@@ -322,11 +329,11 @@ fn datagram_size_respects_negotiated_transport_capacity_stably() {
 
     assert!(established, "session establishes before size assertions");
     let effective = client
-        .max_datagram_size(conn)
+        .max_datagram_size(conn, 0)
         .expect("established connection supports datagrams");
     assert!(effective > 0);
     assert!(effective < 64 * 1024);
-    assert!(!client.send_datagram(conn, &vec![0; 64 * 1024]));
+    assert!(!client.send_datagram(conn, 0, &vec![0; 64 * 1024]));
     assert_eq!(
         client.take_last_error().as_deref(),
         Some("E_LIMIT_EXCEEDED: maxDatagramSize exceeded")
@@ -366,9 +373,12 @@ fn outgoing_stream_limit_rejects_before_allocating_a_quic_stream_or_handle() {
         "session establishes before stream limit assertions"
     );
 
-    assert!(client.open_stream(conn, true) > 0, "exact limit succeeds");
+    assert!(
+        client.open_stream(conn, 0, true) > 0,
+        "exact limit succeeds"
+    );
     let next_handle = client.next_stream;
-    assert_eq!(client.open_stream(conn, true), -1, "limit+1 fails");
+    assert_eq!(client.open_stream(conn, 0, true), -1, "limit+1 fails");
     assert_eq!(
         client.next_stream, next_handle,
         "rejected open must not consume or expose a stream handle"
@@ -403,7 +413,7 @@ fn error_close_releases_governor_budget_before_connection_lost() {
         }
     }
     assert!(established, "session establishes before budget assertions");
-    assert!(client.open_stream(conn, true) > 0);
+    assert!(client.open_stream(conn, 0, true) > 0);
     let h = *client.id_to_handle.get(&conn).unwrap();
     assert!(
         client.session_reservations.contains_key(&h),
@@ -451,6 +461,7 @@ fn incoming_stream_limit_drops_parser_state_instead_of_buffering_untracked_bytes
             kind: None,
             is_bidi: true,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -503,6 +514,7 @@ fn incoming_stream_without_owner_mapping_fails_closed_without_allocating_state()
             kind: None,
             is_bidi: true,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -547,8 +559,8 @@ fn wt_session_and_datagram_echo() {
         while let Some(ev) = server.poll_event() {
             match ev {
                 WtEvent::SessionEstablished { .. } => server_est = true,
-                WtEvent::Datagram { conn, data } => {
-                    server.send_datagram(conn, &data);
+                WtEvent::Datagram { conn, data, .. } => {
+                    server.send_datagram(conn, 0, &data);
                 }
                 _ => {}
             }
@@ -564,7 +576,7 @@ fn wt_session_and_datagram_echo() {
             }
         }
         if server_est && client_est && !echoed {
-            client.send_datagram(cid, b"ping");
+            client.send_datagram(cid, 0, b"ping");
         }
         if echoed {
             break;
@@ -609,7 +621,7 @@ fn wt_bidi_stream_echo() {
             }
         }
         if server_est && client_est && client_stream.is_none() {
-            let s = client.open_stream(cid, true);
+            let s = client.open_stream(cid, 0, true);
             assert!(s >= 0);
             client_stream = Some(s as u32);
         }
@@ -671,7 +683,7 @@ fn reliable_stream_data_larger_than_event_budget_is_backpressured_not_dropped() 
     }
     assert!(server_established && client_established);
 
-    let stream = client.open_stream(conn, true);
+    let stream = client.open_stream(conn, 0, true);
     assert!(stream >= 0);
     let stream = stream as u32;
     let payload: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
@@ -724,7 +736,7 @@ fn full_event_queue_backpressures_reliable_stream_reads_without_losing_bytes() {
         let moved = relay_client_to_server(&mut client, &mut server)
             | relay_server_to_client(&mut server, &mut client);
         while let Some(event) = server.poll_event() {
-            if let WtEvent::SessionEstablished { conn } = event {
+            if let WtEvent::SessionEstablished { conn, .. } = event {
                 server_conn = Some(conn);
             }
         }
@@ -736,7 +748,7 @@ fn full_event_queue_backpressures_reliable_stream_reads_without_losing_bytes() {
             }
         }
         if client_established && client_stream.is_none() {
-            let stream = server.open_stream(server_conn.expect("server conn"), true);
+            let stream = server.open_stream(server_conn.expect("server conn"), 0, true);
             assert!(stream >= 0);
         }
         if client_established && client_stream.is_some() {
@@ -835,7 +847,7 @@ fn releasing_one_host_token_resumes_other_connections_blocked_by_global_capacity
             }
         }
         while let Some(event) = server.poll_event() {
-            if let WtEvent::SessionEstablished { conn } = event {
+            if let WtEvent::SessionEstablished { conn, .. } = event {
                 if conn_a.is_none() {
                     conn_a = Some(conn);
                 } else if Some(conn) != conn_a {
@@ -864,8 +876,8 @@ fn releasing_one_host_token_resumes_other_connections_blocked_by_global_capacity
             && !opened
         {
             if let (Some(conn_a), Some(conn_b)) = (conn_a, conn_b) {
-                assert!(server.open_stream(conn_a, true) >= 0);
-                assert!(server.open_stream(conn_b, true) >= 0);
+                assert!(server.open_stream(conn_a, 0, true) >= 0);
+                assert!(server.open_stream(conn_b, 0, true) >= 0);
                 opened = true;
             }
         }
@@ -992,7 +1004,7 @@ fn wt_uni_stream_oneway() {
             }
         }
         if server_est && client_est && !opened {
-            let s = client.open_stream(cid, false);
+            let s = client.open_stream(cid, 0, false);
             assert!(s >= 0);
             client.stream_write(s as u32, b"uni-msg");
             client.stream_finish(s as u32);
@@ -1070,8 +1082,8 @@ fn multi_client_datagram_isolation() {
 
         // Server echoes each datagram back to the connection it arrived on.
         while let Some(ev) = server.poll_event() {
-            if let WtEvent::Datagram { conn, data } = ev {
-                server.send_datagram(conn, &data);
+            if let WtEvent::Datagram { conn, data, .. } = ev {
+                server.send_datagram(conn, 0, &data);
             }
         }
         while let Some(ev) = client_a.poll_event() {
@@ -1105,11 +1117,11 @@ fn multi_client_datagram_isolation() {
         }
 
         if a_est && !a_sent {
-            client_a.send_datagram(cid_a, b"alpha-payload");
+            client_a.send_datagram(cid_a, 0, b"alpha-payload");
             a_sent = true;
         }
         if b_est && !b_sent {
-            client_b.send_datagram(cid_b, b"bravo-payload");
+            client_b.send_datagram(cid_b, 0, b"bravo-payload");
             b_sent = true;
         }
 
@@ -1174,7 +1186,7 @@ fn finished_streams_are_pruned() {
             }
         }
         if server_est && client_est && opened < ROUNDS && fins == opened {
-            let s = client.open_stream(cid, false);
+            let s = client.open_stream(cid, 0, false);
             assert!(s >= 0);
             client.stream_write(s as u32, b"cycle");
             client.stream_finish(s as u32);
@@ -1257,7 +1269,7 @@ fn finished_bidi_streams_are_pruned() {
         }
         if server_est && client_est && opened < ROUNDS && open_handle.is_none() && echoes == opened
         {
-            let s = client.open_stream(cid, true);
+            let s = client.open_stream(cid, 0, true);
             assert!(s >= 0);
             let s = s as u32;
             client.stream_write(s, b"bidi-cycle");
@@ -1304,6 +1316,7 @@ fn server_with_request(frame: Vec<u8>) -> (WtEndpoint, ConnectionHandle, StreamI
             kind: Some(h3::frame::HEADERS),
             is_bidi: true,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: frame,
         },
@@ -1342,6 +1355,7 @@ fn concurrent_request_streams_do_not_interleave() {
             kind: Some(h3::frame::HEADERS),
             is_bidi: true,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: vec![0x01], // incomplete HEADERS frame
         },
@@ -1376,7 +1390,7 @@ fn connect_request_latches_stream_and_establishes() {
     assert_eq!(s.connect_stream, Some(stream_id), "CONNECT stream latched");
     assert!(matches!(
         server.events.back(),
-        Some(WtEvent::SessionEstablished { conn: 1 })
+        Some(WtEvent::SessionEstablished { conn: 1, .. })
     ));
 }
 
@@ -1396,6 +1410,7 @@ fn two_connect_sessions_succeed_when_max_is_two() {
             kind: Some(h3::frame::HEADERS),
             is_bidi: true,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: h3::encode_connect_request("localhost", "/b"),
         },
@@ -1411,7 +1426,7 @@ fn two_connect_sessions_succeed_when_max_is_two() {
     let established = server
         .events
         .iter()
-        .filter(|e| matches!(e, WtEvent::SessionEstablished { conn: 1 }))
+        .filter(|e| matches!(e, WtEvent::SessionEstablished { conn: 1, .. }))
         .count();
     assert_eq!(established, 2);
     assert!(server.take_last_error().is_none());
@@ -1435,6 +1450,7 @@ fn third_connect_rejected_when_max_sessions_is_two() {
                 kind: Some(h3::frame::HEADERS),
                 is_bidi: true,
                 sid_read: false,
+                wt_session_id: None,
                 handle: None,
                 buf: h3::encode_connect_request("localhost", "/b"),
             },
@@ -1445,6 +1461,7 @@ fn third_connect_rejected_when_max_sessions_is_two() {
                 kind: Some(h3::frame::HEADERS),
                 is_bidi: true,
                 sid_read: false,
+                wt_session_id: None,
                 handle: None,
                 buf: h3::encode_connect_request("localhost", "/c"),
             },
@@ -1484,6 +1501,7 @@ fn datagram_session_id_demux_isolates_sessions() {
             kind: Some(h3::frame::HEADERS),
             is_bidi: true,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: h3::encode_connect_request("localhost", "/b"),
         },
@@ -1555,7 +1573,7 @@ fn client_non_200_closes_once_and_blocks_resurrection() {
     let closes = client
         .events
         .iter()
-        .filter(|e| matches!(e, WtEvent::Closed { conn: 3, .. }))
+        .filter(|e| matches!(e, WtEvent::ConnectionClosed { conn: 3, .. }))
         .count();
     assert_eq!(closes, 1, "non-200 emits exactly one Closed");
     assert!(client.sessions.get(&h).unwrap().connect_closed);
@@ -1604,7 +1622,7 @@ fn client_connect_deadline_fails_unanswered_handshake() {
     assert!(client
         .events
         .iter()
-        .any(|e| matches!(e, WtEvent::Closed { conn: 4, .. })));
+        .any(|e| matches!(e, WtEvent::ConnectionClosed { conn: 4, .. })));
 }
 
 /// A malformed :status (non-numeric, e.g. "1") is a bad response, not an
@@ -1675,6 +1693,7 @@ fn uni_push_stream_bytes_do_not_accumulate() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -1725,7 +1744,7 @@ fn connect_stream_end_emits_closed_once() {
     let closes = server
         .events
         .iter()
-        .filter(|e| matches!(e, WtEvent::Closed { conn: 7, .. }))
+        .filter(|e| matches!(e, WtEvent::ConnectionClosed { conn: 7, .. }))
         .count();
     assert_eq!(closes, 1, "exactly one Closed for a graceful session end");
     assert!(server.sessions.get(&h).unwrap().connect_closed);
@@ -1783,7 +1802,7 @@ fn pinned_cert_client_accepts_matching_and_rejects_wrong_hash() {
         while let Some(ev) = client2.poll_event() {
             match ev {
                 WtEvent::Connected { .. } => connected = true,
-                WtEvent::Closed { .. } => closed = true,
+                WtEvent::ConnectionClosed { .. } => closed = true,
                 _ => {}
             }
         }
@@ -1855,12 +1874,12 @@ fn close_conn_is_per_connection_and_carries_code() {
         while let Some(ev) = server.poll_event() {
             match ev {
                 // First establishment is client A (it connected first).
-                WtEvent::SessionEstablished { conn } if server_conn_a.is_none() => {
+                WtEvent::SessionEstablished { conn, .. } if server_conn_a.is_none() => {
                     server_conn_a = Some(conn);
                 }
                 WtEvent::SessionEstablished { .. } => {}
-                WtEvent::Datagram { conn, data } => {
-                    server.send_datagram(conn, &data);
+                WtEvent::Datagram { conn, data, .. } => {
+                    server.send_datagram(conn, 0, &data);
                 }
                 _ => {}
             }
@@ -1868,7 +1887,7 @@ fn close_conn_is_per_connection_and_carries_code() {
         while let Some(ev) = client_a.poll_event() {
             match ev {
                 WtEvent::SessionEstablished { .. } => a_est = true,
-                WtEvent::Closed { code, .. } => a_closed_code = Some(code),
+                WtEvent::ConnectionClosed { code, .. } => a_closed_code = Some(code),
                 _ => {}
             }
         }
@@ -1887,7 +1906,7 @@ fn close_conn_is_per_connection_and_carries_code() {
         }
         if a_closed_code.is_some() && !b_probed {
             // After A is gone, B must still round-trip on the same endpoint.
-            client_b.send_datagram(cid_b, b"still-alive");
+            client_b.send_datagram(cid_b, 0, b"still-alive");
             b_probed = true;
         }
         if b_echo {
@@ -2100,7 +2119,7 @@ fn stream_pause_resume_reset_stop_and_close_all_on_live_session() {
             }
         }
         if server_est && client_est && !opened {
-            let s = client.open_stream(cid, true);
+            let s = client.open_stream(cid, 0, true);
             assert!(s >= 0);
             stream = s as u32;
             client.stream_write(stream, b"pause-me");
@@ -2114,7 +2133,7 @@ fn stream_pause_resume_reset_stop_and_close_all_on_live_session() {
             server.stream_resume(9_999);
             client.stream_reset(stream, 0x11);
             // Open a second stream so stop/reset both have a live handle.
-            let s2 = client.open_stream(cid, true);
+            let s2 = client.open_stream(cid, 0, true);
             if s2 >= 0 {
                 let stream2 = s2 as u32;
                 client.stream_write(stream2, b"stop-me");
@@ -2224,12 +2243,12 @@ fn send_datagram_error_paths_are_stable() {
         },
     )
     .unwrap();
-    assert!(!endpoint.send_datagram(1, &[0; 8]));
+    assert!(!endpoint.send_datagram(1, 0, &[0; 8]));
     assert_eq!(
         endpoint.take_last_error().as_deref(),
         Some("E_LIMIT_EXCEEDED: maxDatagramSize exceeded")
     );
-    assert!(!endpoint.send_datagram(99, b"hi"));
+    assert!(!endpoint.send_datagram(99, 0, b"hi"));
     assert_eq!(
         endpoint.take_last_error().as_deref(),
         Some("E_SESSION_CLOSED: unknown connection")
@@ -2239,7 +2258,7 @@ fn send_datagram_error_paths_are_stable() {
     endpoint.handle_to_id.insert(h, 5);
     endpoint.id_to_handle.insert(5, h);
     endpoint.sessions.insert(h, Session::default());
-    assert!(!endpoint.send_datagram(5, b"hi"));
+    assert!(!endpoint.send_datagram(5, 0, b"hi"));
     assert_eq!(
         endpoint.take_last_error().as_deref(),
         Some("E_SESSION_CLOSED: session not established")
@@ -2252,12 +2271,12 @@ fn release_unknown_host_token_is_false_and_open_stream_unknown_fails() {
     let saddr: SocketAddr = SADDR.parse().unwrap();
     let mut endpoint = WtEndpoint::new(true, saddr, caddr).unwrap();
     assert!(!endpoint.release_host_token(123));
-    assert_eq!(endpoint.open_stream(7, true), -1);
+    assert_eq!(endpoint.open_stream(7, 0, true), -1);
     assert_eq!(
         endpoint.take_last_error().as_deref(),
         Some("E_SESSION_CLOSED: unknown connection")
     );
-    assert!(endpoint.max_datagram_size(7).is_none());
+    assert!(endpoint.max_datagram_size(7, 0).is_none());
 }
 
 #[test]
@@ -2382,6 +2401,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -2393,6 +2413,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -2404,6 +2425,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -2415,6 +2437,7 @@ fn process_in_stream_routes_control_qpack_and_rejects_unknown_wt_session() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -2495,6 +2518,7 @@ fn required_event_slots_for_read_covers_self_bidi_and_missing() {
             kind: Some(h3::stream_type::WT_UNI),
             is_bidi: false,
             sid_read: true,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -2505,6 +2529,7 @@ fn required_event_slots_for_read_covers_self_bidi_and_missing() {
             kind: Some(h3::stream_type::WT_UNI),
             is_bidi: false,
             sid_read: true,
+            wt_session_id: None,
             handle: Some(3),
             buf: Vec::new(),
         },
@@ -2546,7 +2571,7 @@ fn stream_write_finish_on_unknown_and_next_timeout_without_conns() {
             ..Session::default()
         },
     );
-    assert_eq!(endpoint.open_stream(1, true), -1);
+    assert_eq!(endpoint.open_stream(1, 0, true), -1);
     assert_eq!(
         endpoint.take_last_error().as_deref(),
         Some("E_SESSION_CLOSED: session not established")
@@ -2605,7 +2630,7 @@ fn parse_server_connect_rejects_oversized_and_drains_non_headers() {
     assert!(
         server.events.iter().any(|e| matches!(
             e,
-            WtEvent::Closed {
+            WtEvent::ConnectionClosed {
                 code: H3_EXCESSIVE_LOAD,
                 ..
             }
@@ -2664,7 +2689,7 @@ fn parse_server_connect_invalid_qpack_closes_and_already_latched_is_noop() {
     server.parse_server_connect(h, stream_id);
     assert!(server.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: QPACK_DECOMPRESSION_FAILED,
             ..
         }
@@ -2708,7 +2733,7 @@ fn parse_client_connect_oversized_and_status_edges() {
     client.parse_client_connect(h);
     assert!(client.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: H3_EXCESSIVE_LOAD,
             ..
         }
@@ -2781,7 +2806,7 @@ fn parse_control_and_qpack_encoder_error_paths() {
     server.parse_control(h);
     assert!(server.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: H3_EXCESSIVE_LOAD,
             ..
         }
@@ -2801,7 +2826,7 @@ fn parse_control_and_qpack_encoder_error_paths() {
     server2.parse_qpack_encoder(h);
     assert!(server2.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: QPACK_ENCODER_STREAM_ERROR,
             ..
         }
@@ -2821,7 +2846,7 @@ fn parse_control_and_qpack_encoder_error_paths() {
     server3.parse_qpack_encoder(h);
     assert!(server3.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: QPACK_ENCODER_STREAM_ERROR,
             ..
         }
@@ -2855,6 +2880,7 @@ fn process_in_stream_rejects_when_handle_space_exhausted() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -2938,6 +2964,7 @@ fn read_stream_none_conn_and_retry_blocked_connects() {
                         kind: Some(h3::frame::HEADERS),
                         is_bidi: true,
                         sid_read: false,
+                        wt_session_id: None,
                         handle: None,
                         buf: h3::encode_connect_request("localhost", "/"),
                     },
@@ -2968,7 +2995,7 @@ fn close_conn_protocol_error_and_release_budget_are_safe() {
     endpoint.close_conn_protocol_error(h, H3_INTERNAL_ERROR, b"boom");
     assert!(endpoint.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             conn: 9,
             code: H3_INTERNAL_ERROR
         }
@@ -3072,7 +3099,7 @@ fn open_stream_and_write_fail_when_quic_conn_missing() {
             ..Session::default()
         },
     );
-    assert_eq!(endpoint.open_stream(1, true), -1);
+    assert_eq!(endpoint.open_stream(1, 0, true), -1);
     assert_eq!(
         endpoint.take_last_error().as_deref(),
         Some("E_SESSION_CLOSED: connection missing")
@@ -3104,10 +3131,12 @@ fn poll_event_encoded_surfaces_closed_when_conn_already_gone() {
     endpoint.governor.set_host_token_ceiling_for_test(1);
     endpoint.push_event(WtEvent::Datagram {
         conn: 42,
+        session_id: 0,
         data: vec![1],
     });
     endpoint.push_event(WtEvent::Datagram {
         conn: 42,
+        session_id: 0,
         data: vec![2],
     });
     assert!(endpoint.poll_event_encoded().is_some());
@@ -3261,7 +3290,7 @@ fn on_connection_lost_emits_closed_for_timeout_and_skips_local() {
     assert!(endpoint
         .events
         .iter()
-        .any(|e| matches!(e, WtEvent::Closed { conn: 3, code: 0 })));
+        .any(|e| matches!(e, WtEvent::ConnectionClosed { conn: 3, code: 0 })));
     assert!(endpoint.handle_to_id.is_empty());
 
     // LocallyClosed must not emit a second Closed.
@@ -3301,7 +3330,7 @@ fn on_connection_lost_emits_closed_for_timeout_and_skips_local() {
     );
     assert!(endpoint4.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             conn: 5,
             code: 0x11
         }
@@ -3395,6 +3424,7 @@ fn process_in_stream_rate_limits_server_stream_opens() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -3429,7 +3459,7 @@ fn parse_connect_qpack_blocked_with_zero_max_closes() {
     server.parse_server_connect(h, sid);
     assert!(server.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: QPACK_DECOMPRESSION_FAILED,
             ..
         }
@@ -3454,7 +3484,7 @@ fn parse_connect_qpack_blocked_with_zero_max_closes() {
     client.parse_client_connect(h2);
     assert!(client.events.iter().any(|e| matches!(
         e,
-        WtEvent::Closed {
+        WtEvent::ConnectionClosed {
             code: QPACK_DECOMPRESSION_FAILED,
             ..
         }
@@ -3482,6 +3512,7 @@ fn in_stream_read_limit_covers_classification_branches() {
             kind: None,
             is_bidi: false,
             sid_read: false,
+            wt_session_id: None,
             handle: None,
             buf: Vec::new(),
         },
@@ -3566,8 +3597,8 @@ fn connect_stream_end_extra_session_and_datagram_demux_helpers() {
     };
     let good = h3::wrap_datagram(u64::from(primary), b"hi");
     assert_eq!(
-        WtEndpoint::datagram_payload_for_session(&session, &good).as_deref(),
-        Some(b"hi".as_slice())
+        WtEndpoint::datagram_payload_for_session(&session, &good).map(|(_, p)| p),
+        Some(b"hi".to_vec())
     );
     assert!(WtEndpoint::datagram_payload_for_session(&session, b"bad").is_none());
     let other = h3::wrap_datagram(999_999, b"x");
