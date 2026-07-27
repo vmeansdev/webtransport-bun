@@ -1,5 +1,37 @@
 import type { UdpAddr, UdpTransport } from "./wasm-relay.js";
 
+/**
+ * Host-facing ticket persistence for wasm 0-RTT (Bun-first; IndexedDB IWA
+ * adapter can implement the same contract later). `take` is single-use.
+ */
+export interface TicketStoreHost {
+	get(key: string): Promise<Uint8Array | null>;
+	put(key: string, ticket: Uint8Array): Promise<void>;
+	/** Consume and remove a ticket (anti-replay). */
+	take(key: string): Promise<Uint8Array | null>;
+}
+
+/** Process-local TicketStoreHost with take-once semantics. */
+export class MemoryTicketStoreHost implements TicketStoreHost {
+	private readonly map = new Map<string, Uint8Array>();
+
+	async get(key: string): Promise<Uint8Array | null> {
+		const value = this.map.get(key);
+		return value ? value.slice() : null;
+	}
+
+	async put(key: string, ticket: Uint8Array): Promise<void> {
+		this.map.set(key, ticket.slice());
+	}
+
+	async take(key: string): Promise<Uint8Array | null> {
+		const value = this.map.get(key);
+		if (!value) return null;
+		this.map.delete(key);
+		return value.slice();
+	}
+}
+
 const TEXT_DECODER = new TextDecoder();
 
 /**
@@ -71,6 +103,9 @@ export interface WasmModule {
 	wt_stream_finish(eid: number, stream: number): void;
 	wt_stream_reset(eid: number, stream: number, code: number): void;
 	wt_stream_stop(eid: number, stream: number, code: number): void;
+	wt_conn_has_0rtt(eid: number, conn: number): boolean;
+	wt_conn_accepted_0rtt(eid: number, conn: number): boolean;
+	wt_enable_0rtt(eid: number): boolean;
 	wt_new_client(
 		addr: string,
 		peerAddr: string,
@@ -700,6 +735,21 @@ export class WasmEndpoint {
 		);
 		this.pump();
 		return ok;
+	}
+
+	has0Rtt(conn: number): boolean {
+		if (this.closed) return false;
+		return this.wasm.wt_conn_has_0rtt(this.eid, conn);
+	}
+
+	accepted0Rtt(conn: number): boolean {
+		if (this.closed) return false;
+		return this.wasm.wt_conn_accepted_0rtt(this.eid, conn);
+	}
+
+	enable0Rtt(): boolean {
+		if (this.closed) return false;
+		return this.wasm.wt_enable_0rtt(this.eid);
 	}
 
 	streamWrite(stream: number, data: Uint8Array): number {

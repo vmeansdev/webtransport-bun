@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
@@ -23,6 +23,16 @@ use crate::spike;
 use crate::ticket_store::{
     configure_client_early_data, configure_server_early_data, InMemoryTicketStore,
 };
+
+/// Process-local shared ticket store so Bun loopback client+server with
+/// `enable0Rtt: true` can resume. IndexedDB host adapters can replace this
+/// later via a TicketStoreHost bridge without changing the JS surface.
+fn shared_0rtt_ticket_store() -> Arc<InMemoryTicketStore> {
+    static STORE: OnceLock<Arc<InMemoryTicketStore>> = OnceLock::new();
+    STORE
+        .get_or_init(|| Arc::new(InMemoryTicketStore::new(256)))
+        .clone()
+}
 
 /// A peer-accepted stream being classified and read.
 struct InStream {
@@ -728,7 +738,11 @@ impl WtEndpoint {
             KEEP_ALIVE_INTERVAL_MS.min((idle_timeout_ms / 3).max(1)),
         )));
         let transport = Arc::new(tc);
-        let ticket_store = Arc::new(InMemoryTicketStore::new(256));
+        let ticket_store = if enable_0rtt {
+            shared_0rtt_ticket_store()
+        } else {
+            Arc::new(InMemoryTicketStore::new(1))
+        };
         let (inner, client_config) = if is_server {
             let mut cfg =
                 server_cfg.ok_or_else(|| "E_INTERNAL: server config required".to_string())?;

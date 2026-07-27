@@ -636,6 +636,30 @@ pub fn wt_stream_stop(eid: u32, stream: u32, code: u32) {
 }
 
 #[wasm_bindgen]
+pub fn wt_conn_has_0rtt(eid: u32, conn: u32) -> bool {
+    with_endpoint_mut(eid, |endpoint| endpoint.conn_has_0rtt(conn))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
+pub fn wt_conn_accepted_0rtt(eid: u32, conn: u32) -> bool {
+    with_endpoint_mut(eid, |endpoint| endpoint.conn_accepted_0rtt(conn))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
+pub fn wt_enable_0rtt(eid: u32) -> bool {
+    with_endpoint_mut(eid, |endpoint| endpoint.enable_0rtt())
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
 pub fn wt_close_endpoint(eid: u32) {
     let _ = REGISTRY.try_with(|registry| {
         if let Ok(mut registry) = registry.try_borrow_mut() {
