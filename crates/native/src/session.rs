@@ -1,22 +1,17 @@
-use napi::bindgen_prelude::Buffer;
-use napi::{Env, JsObject, Result};
-use napi_derive::napi;
+//! Session capacity, datagram, and stream helpers (NAPI-free).
+//! NAPI bindings live in `session_napi.rs`. Coverage floors target this module.
+
+use napi::Result;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Notify;
-
-use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
-use crate::error::{
-    from_reason as wt_from_reason, from_upstream_error as wt_from_upstream_error, WtResult,
-};
-use crate::panic_guard;
-use crate::session_registry;
-use crate::session_registry::SessionMetrics;
-use crate::RUNTIME;
 use tokio::time::{Duration, Instant};
 
-/// Snapshot used by stream-open waiters. Decoupled from the registry so unit
-/// tests can drive the wait loop without a live QUIC `Connection`.
+use crate::client_stream::{ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle};
+use crate::error::from_upstream_error as wt_from_upstream_error;
+use crate::session_registry;
+use crate::session_registry::SessionMetrics;
+
 pub(crate) struct StreamCapacityView {
     pub global_active: u64,
     pub max_global: u64,
@@ -246,186 +241,33 @@ pub(crate) async fn accept_uni_stream_for_session(id: &str) -> Result<Option<Cli
     Ok(rx.recv().await)
 }
 
-#[napi]
-pub struct SessionHandle {
+pub(crate) async fn wait_session_stream_capacity(
     id: String,
-    peer_ip: String,
-    peer_port: u32,
-}
-
-#[napi]
-impl SessionHandle {
-    async fn wait_capacity_with_timeout(
-        id: String,
-        timeout_ms: u32,
-        kind: &'static str,
-    ) -> Result<()> {
-        wait_stream_kind_capacity_with_timeout(timeout_ms, kind, || {
-            let (_, _, metrics, _, _, _, _) = session_registry::get(&id)?;
-            let sm = session_registry::get_session_metrics(&id)?;
-            let limits = session_registry::get_limits(&id)?;
-            let notify = session_registry::get_stream_capacity_notify(&id)?;
-            Some(StreamCapacityView {
-                global_active: metrics.streams_active.load(Ordering::Relaxed),
-                max_global: limits.max_streams_global,
-                bidi_active: sm.streams_bidi_active.load(Ordering::Relaxed),
-                uni_active: sm.streams_uni_active.load(Ordering::Relaxed),
-                max_bidi: limits.max_streams_per_session_bidi,
-                max_uni: limits.max_streams_per_session_uni,
-                notify,
-            })
+    timeout_ms: u32,
+    kind: &'static str,
+) -> Result<()> {
+    wait_stream_kind_capacity_with_timeout(timeout_ms, kind, || {
+        let (_, _, metrics, _, _, _, _) = session_registry::get(&id)?;
+        let sm = session_registry::get_session_metrics(&id)?;
+        let limits = session_registry::get_limits(&id)?;
+        let notify = session_registry::get_stream_capacity_notify(&id)?;
+        Some(StreamCapacityView {
+            global_active: metrics.streams_active.load(Ordering::Relaxed),
+            max_global: limits.max_streams_global,
+            bidi_active: sm.streams_bidi_active.load(Ordering::Relaxed),
+            uni_active: sm.streams_uni_active.load(Ordering::Relaxed),
+            max_bidi: limits.max_streams_per_session_bidi,
+            max_uni: limits.max_streams_per_session_uni,
+            notify,
         })
-        .await
-    }
-
-    #[napi(constructor)]
-    pub fn new(id: String, peer_ip: String, peer_port: u32) -> Self {
-        Self {
-            id,
-            peer_ip,
-            peer_port,
-        }
-    }
-
-    #[napi(getter)]
-    pub fn id(&self) -> String {
-        self.id.clone()
-    }
-
-    #[napi(getter)]
-    pub fn peer_ip(&self) -> String {
-        self.peer_ip.clone()
-    }
-
-    #[napi(getter)]
-    pub fn peer_port(&self) -> u32 {
-        self.peer_port
-    }
-
-    /// Real QUIC transport stats (rtt, wire bytes, packet counts) for this session.
-    #[napi]
-    pub fn connection_stats(&self) -> WtResult<Option<crate::metrics::QuicConnectionStats>> {
-        let Some((conn, _, _, _, _, _, _)) = session_registry::get(&self.id) else {
-            return Ok(None);
-        };
-        Ok(Some(crate::metrics::quic_stats_from_conn(&conn)))
-    }
-
-    #[napi]
-    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
-        let c = code.unwrap_or(0);
-        let r = reason.unwrap_or_default();
-        session_registry::close_session(&self.id, c, r.as_bytes());
-        Ok(())
-    }
-
-    /// Spawn on the addon runtime without holding an exclusive napi borrow of
-    /// `self` across `.await` (Bun rejects concurrent `async fn &self` calls).
-    #[napi(ts_return_type = "Promise<void>")]
-    pub fn send_datagram(&self, env: Env, data: Buffer) -> Result<JsObject> {
-        let id = self.id.clone();
-        let bytes = data.as_ref().to_vec();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { send_datagram_for_session(&id, &bytes).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<Buffer | null>")]
-    pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { Ok(read_datagram_for_session(&id).await?.map(Buffer::from)) })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<ClientBidiStreamHandle>")]
-    pub fn create_bidi_stream(&self, env: Env) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { create_bidi_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<void>")]
-    pub fn wait_bidi_capacity(&self, env: Env, timeout_ms: u32) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(
-                    async move { Self::wait_capacity_with_timeout(id, timeout_ms, "bidi").await },
-                )
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<ClientBidiStreamHandle | null>")]
-    pub fn accept_bidi_stream(&self, env: Env) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { accept_bidi_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<ClientUniSendHandle>")]
-    pub fn create_uni_stream(&self, env: Env) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { create_uni_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<void>")]
-    pub fn wait_uni_capacity(&self, env: Env, timeout_ms: u32) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { Self::wait_capacity_with_timeout(id, timeout_ms, "uni").await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi(ts_return_type = "Promise<ClientUniRecvHandle | null>")]
-    pub fn accept_uni_stream(&self, env: Env) -> Result<JsObject> {
-        let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { accept_uni_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
-    }
-
-    #[napi]
-    pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::SessionMetricsSnapshot> {
-        panic_guard::catch_panic(|| {
-            Ok(session_metrics_snapshot_from(
-                session_registry::get_session_metrics(&self.id).as_deref(),
-            ))
-        })
-        .map_err(wt_from_reason)
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_napi::SessionHandle;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -495,7 +337,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wait_capacity_with_timeout_unknown_session_is_closed() {
-        let err = SessionHandle::wait_capacity_with_timeout("no-such-session".into(), 30, "bidi")
+        let err = wait_session_stream_capacity("no-such-session".into(), 30, "bidi")
             .await
             .unwrap_err();
         assert!(err.reason.contains("E_SESSION_CLOSED"));
@@ -584,9 +426,10 @@ mod tests {
         use crate::client::insecure_loopback_client_config;
         use crate::limits::Limits;
         use crate::rate_limit::RateLimits;
-        use crate::server::spawn_server_instance;
         use crate::server_metrics::ServerMetrics;
+        use crate::server_spawn::spawn_server_instance;
         use crate::server_tls::build_default_dev_resolver;
+        use crate::session_registry;
         use crate::SessionEvent;
 
         let server_id = u64::MAX - 30;
@@ -639,10 +482,10 @@ mod tests {
             .unwrap_err();
         assert!(queue_err.reason.contains("E_QUEUE_FULL"));
 
-        SessionHandle::wait_capacity_with_timeout(id.clone(), 200, "bidi")
+        wait_session_stream_capacity(id.clone(), 200, "bidi")
             .await
             .expect("bidi capacity");
-        SessionHandle::wait_capacity_with_timeout(id.clone(), 200, "uni")
+        wait_session_stream_capacity(id.clone(), 200, "uni")
             .await
             .expect("uni capacity");
 
@@ -671,8 +514,126 @@ mod tests {
             .unwrap_err();
         assert!(closed.reason.contains("E_SESSION_CLOSED"));
 
+        // Client-side registry insert exercises read/create error + datagram dequeue.
+        let client_id = format!("{id}-client");
+        let mut tight = Limits::default();
+        tight.max_queued_bytes_global = 1;
+        tight.max_queued_bytes_per_session = 1;
+        tight.backpressure_timeout_ms = 1;
+        let (
+            dgram_tx,
+            _bidi_accept_tx,
+            _uni_accept_tx,
+            create_bi_rx,
+            create_uni_rx,
+            sm,
+            dgram_notify,
+        ) = session_registry::insert(
+            client_id.clone(),
+            server_id,
+            client_conn.clone(),
+            Arc::clone(&metrics),
+            tight,
+        );
+        drop(create_bi_rx);
+        drop(create_uni_rx);
+        assert!(
+            create_bidi_stream_for_session(&client_id).await.is_err(),
+            "create_bidi without handler must fail"
+        );
+        assert!(
+            create_uni_stream_for_session(&client_id).await.is_err(),
+            "create_uni without handler must fail"
+        );
+        assert!(
+            create_bidi_stream_for_session("missing-create")
+                .await
+                .is_err(),
+            "missing session create_bidi must fail"
+        );
+        assert!(
+            create_uni_stream_for_session("missing-create")
+                .await
+                .is_err(),
+            "missing session create_uni must fail"
+        );
+
+        // Zero timeout while over capacity hits the deadline branch before sleep.
+        let notify = Arc::new(Notify::new());
+        let deadline_err = wait_stream_kind_capacity_with_timeout(0, "bidi", || {
+            Some(StreamCapacityView {
+                global_active: 0,
+                max_global: 10,
+                bidi_active: 2,
+                uni_active: 0,
+                max_bidi: 2,
+                max_uni: 2,
+                notify: Arc::clone(&notify),
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(deadline_err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
+
+        let timeout_err = send_datagram_for_session(&client_id, b"ab")
+            .await
+            .unwrap_err();
+        assert!(timeout_err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
+
+        let slot = session_registry::DatagramSlot::new(
+            b"queued".to_vec(),
+            Arc::clone(&sm),
+            Arc::clone(&metrics),
+            Arc::clone(&dgram_notify),
+            0,
+        );
+        dgram_tx.send(slot).await.expect("enqueue datagram");
+        let got = read_datagram_for_session(&client_id)
+            .await
+            .expect("read")
+            .expect("payload");
+        assert_eq!(got, b"queued");
+
+        // Closed-session path for reserve: mark closed then attempt send.
+        session_registry::close_session(&client_id, 0, b"closed");
+        // Re-insert for read/accept closed-channel paths.
+        let loose = Limits::default();
+        let (
+            dgram_tx,
+            bidi_accept_tx,
+            uni_accept_tx,
+            create_bi_rx,
+            create_uni_rx,
+            _sm2,
+            _dgram_notify2,
+        ) = session_registry::insert(
+            client_id.clone(),
+            server_id,
+            client_conn.clone(),
+            Arc::clone(&metrics),
+            loose,
+        );
+        drop(create_bi_rx);
+        drop(create_uni_rx);
+        drop(bidi_accept_tx);
+        drop(uni_accept_tx);
+        assert!(accept_bidi_stream_for_session(&client_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(accept_uni_stream_for_session(&client_id)
+            .await
+            .unwrap()
+            .is_none());
+        drop(dgram_tx);
+        assert!(read_datagram_for_session(&client_id)
+            .await
+            .unwrap()
+            .is_none());
+
         handle.close(Some(0), Some("done".into())).unwrap();
         let _ = shutdown_tx.send(());
         drop(client_conn);
+        session_registry::remove(&client_id);
     }
 }
