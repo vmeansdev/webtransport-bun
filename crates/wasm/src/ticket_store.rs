@@ -20,6 +20,11 @@ use rustls::{client as rustls_client, NamedGroup};
 
 /// Opaque blob magic for process-local client-ticket vault entries (`WT0T`).
 const CLIENT_TICKET_BLOB_MAGIC: &[u8; 4] = b"WT0T";
+/// Cryptographically random vault token length (unguessable; not sequential).
+const CLIENT_TICKET_TOKEN_LEN: usize = 32;
+const CLIENT_TICKET_BLOB_LEN: usize = 4 + CLIENT_TICKET_TOKEN_LEN;
+/// Max in-process vault entries; oldest dropped on overflow (SEC-11).
+const MAX_CLIENT_TICKET_VAULT_ENTRIES: usize = 64;
 
 /// Bound TLS 1.3 tickets retained per server name (matches rustls handy cache).
 const MAX_TLS13_TICKETS_PER_SERVER: usize = 8;
@@ -118,15 +123,15 @@ impl InMemoryTicketStore {
         let Ok(expected) = ServerName::try_from(server_name.to_string()) else {
             return false;
         };
-        let Some(id) = parse_client_ticket_blob_id(blob) else {
+        let Some(token) = parse_client_ticket_blob_token(blob) else {
             return false;
         };
-        let Some(exported) = client_ticket_vault_take(id) else {
+        let Some(exported) = client_ticket_vault_take(&token) else {
             return false;
         };
         if exported.server_name != expected {
-            // Put back under the same id so the caller's blob stays valid.
-            client_ticket_vault_restore(id, exported);
+            // Put back under the same token so the caller's blob stays valid.
+            client_ticket_vault_restore(token, exported);
             return false;
         }
         if let Some(group) = exported.kx_hint {
@@ -153,56 +158,118 @@ struct ExportedClientTickets {
 }
 
 struct ClientTicketVault {
-    next_id: u64,
-    entries: HashMap<u64, ExportedClientTickets>,
+    entries: HashMap<[u8; CLIENT_TICKET_TOKEN_LEN], ExportedClientTickets>,
+    /// Insertion order for LRU eviction when at capacity.
+    order: VecDeque<[u8; CLIENT_TICKET_TOKEN_LEN]>,
 }
 
 fn client_ticket_vault() -> &'static Mutex<ClientTicketVault> {
     static VAULT: OnceLock<Mutex<ClientTicketVault>> = OnceLock::new();
     VAULT.get_or_init(|| {
         Mutex::new(ClientTicketVault {
-            next_id: 1,
             entries: HashMap::new(),
+            order: VecDeque::new(),
         })
     })
 }
 
-fn encode_client_ticket_blob_id(id: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12);
+fn encode_client_ticket_blob(token: &[u8; CLIENT_TICKET_TOKEN_LEN]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CLIENT_TICKET_BLOB_LEN);
     out.extend_from_slice(CLIENT_TICKET_BLOB_MAGIC);
-    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(token);
     out
 }
 
-fn parse_client_ticket_blob_id(blob: &[u8]) -> Option<u64> {
-    if blob.len() != 12 || &blob[..4] != CLIENT_TICKET_BLOB_MAGIC {
+fn parse_client_ticket_blob_token(blob: &[u8]) -> Option<[u8; CLIENT_TICKET_TOKEN_LEN]> {
+    if blob.len() != CLIENT_TICKET_BLOB_LEN || &blob[..4] != CLIENT_TICKET_BLOB_MAGIC {
         return None;
     }
-    Some(u64::from_le_bytes(blob[4..12].try_into().ok()?))
+    let mut token = [0u8; CLIENT_TICKET_TOKEN_LEN];
+    token.copy_from_slice(&blob[4..]);
+    Some(token)
+}
+
+fn random_vault_token() -> [u8; CLIENT_TICKET_TOKEN_LEN] {
+    let mut token = [0u8; CLIENT_TICKET_TOKEN_LEN];
+    getrandom::getrandom(&mut token).expect("getrandom for ticket vault token");
+    token
 }
 
 fn client_ticket_vault_put(exported: ExportedClientTickets) -> Vec<u8> {
     let mut vault = client_ticket_vault()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let id = vault.next_id;
-    vault.next_id = vault.next_id.saturating_add(1).max(1);
-    vault.entries.insert(id, exported);
-    encode_client_ticket_blob_id(id)
+    while vault.entries.len() >= MAX_CLIENT_TICKET_VAULT_ENTRIES {
+        if let Some(old) = vault.order.pop_front() {
+            vault.entries.remove(&old);
+        } else {
+            break;
+        }
+    }
+    let mut token = random_vault_token();
+    // Extremely unlikely collision; regenerate rather than overwrite.
+    while vault.entries.contains_key(&token) {
+        token = random_vault_token();
+    }
+    vault.order.push_back(token);
+    vault.entries.insert(token, exported);
+    encode_client_ticket_blob(&token)
 }
 
-fn client_ticket_vault_restore(id: u64, exported: ExportedClientTickets) {
+fn client_ticket_vault_restore(
+    token: [u8; CLIENT_TICKET_TOKEN_LEN],
+    exported: ExportedClientTickets,
+) {
     let mut vault = client_ticket_vault()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    vault.entries.insert(id, exported);
+    if !vault.entries.contains_key(&token) {
+        vault.order.push_back(token);
+    }
+    vault.entries.insert(token, exported);
+    while vault.entries.len() > MAX_CLIENT_TICKET_VAULT_ENTRIES {
+        if let Some(old) = vault.order.pop_front() {
+            if old != token {
+                vault.entries.remove(&old);
+            } else {
+                vault.order.push_back(old);
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 }
 
-fn client_ticket_vault_take(id: u64) -> Option<ExportedClientTickets> {
+fn client_ticket_vault_take(
+    token: &[u8; CLIENT_TICKET_TOKEN_LEN],
+) -> Option<ExportedClientTickets> {
     let mut vault = client_ticket_vault()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    vault.entries.remove(&id)
+    let exported = vault.entries.remove(token)?;
+    if let Some(idx) = vault.order.iter().position(|t| t == token) {
+        vault.order.remove(idx);
+    }
+    Some(exported)
+}
+
+#[cfg(test)]
+fn client_ticket_vault_clear_for_test() {
+    let mut vault = client_ticket_vault()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    vault.entries.clear();
+    vault.order.clear();
+}
+
+#[cfg(test)]
+fn client_ticket_vault_len_for_test() -> usize {
+    client_ticket_vault()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .len()
 }
 
 impl ClientSessionStore for InMemoryTicketStore {
@@ -757,5 +824,71 @@ mod tests {
         assert!(hydrated.import_client_tickets("localhost", &blob));
         assert!(hydrated.client_ticket_count("localhost") > 0);
         assert!(!hydrated.import_client_tickets("localhost", &blob));
+    }
+
+    #[test]
+    fn vault_blob_rejects_sequential_u64_forge() {
+        super::client_ticket_vault_clear_for_test();
+        let client_store = Arc::new(InMemoryTicketStore::new(64));
+        let server_store = Arc::new(InMemoryTicketStore::new(64));
+        let (server_cfg, client_cfg) =
+            configs_with_early_data(true, &[b"h3"], client_store.clone(), server_store)
+                .expect("crypto");
+        let mut pair = Pair::new(server_cfg, client_cfg).expect("pair");
+        let ch1 = pair.begin_connect().expect("connect1");
+        pair.drive_until_connected(ch1).expect("handshake1");
+        pair.close_client(ch1);
+
+        let blob = client_store
+            .export_client_tickets("localhost")
+            .expect("export");
+        assert_eq!(blob.len(), super::CLIENT_TICKET_BLOB_LEN);
+        assert_eq!(&blob[..4], super::CLIENT_TICKET_BLOB_MAGIC);
+
+        // Legacy sequential forge: WT0T + u64 LE id — wrong length / not in vault.
+        let mut forged = Vec::from(*super::CLIENT_TICKET_BLOB_MAGIC);
+        forged.extend_from_slice(&1u64.to_le_bytes());
+        let hydrated = Arc::new(InMemoryTicketStore::new(64));
+        assert!(!hydrated.import_client_tickets("localhost", &forged));
+
+        // Random token of wrong length rejected.
+        assert!(!hydrated.import_client_tickets("localhost", &[0u8; 12]));
+        // Correct-length garbage token rejected.
+        let mut garbage = Vec::from(*super::CLIENT_TICKET_BLOB_MAGIC);
+        garbage.extend_from_slice(&[0xAAu8; super::CLIENT_TICKET_TOKEN_LEN]);
+        assert!(!hydrated.import_client_tickets("localhost", &garbage));
+
+        // Real blob still works once.
+        assert!(hydrated.import_client_tickets("localhost", &blob));
+    }
+
+    #[test]
+    fn vault_evicts_oldest_when_at_capacity() {
+        super::client_ticket_vault_clear_for_test();
+        let mut blobs = Vec::new();
+        for i in 0..(super::MAX_CLIENT_TICKET_VAULT_ENTRIES + 2) {
+            let name = format!("host{i}.example");
+            let blob = super::client_ticket_vault_put(super::ExportedClientTickets {
+                server_name: rustls::pki_types::ServerName::try_from(name).expect("name"),
+                kx_hint: None,
+                tls13: vec![],
+            });
+            blobs.push(blob);
+        }
+        assert_eq!(
+            super::client_ticket_vault_len_for_test(),
+            super::MAX_CLIENT_TICKET_VAULT_ENTRIES
+        );
+        let probe = Arc::new(InMemoryTicketStore::new(8));
+        assert!(
+            !probe.import_client_tickets("host0.example", &blobs[0]),
+            "oldest vault entry must be gone after overflow"
+        );
+        assert!(
+            !probe.import_client_tickets("host1.example", &blobs[1]),
+            "second-oldest must also be gone"
+        );
+        let newest_name = format!("host{}.example", super::MAX_CLIENT_TICKET_VAULT_ENTRIES + 1);
+        assert!(probe.import_client_tickets(&newest_name, blobs.last().unwrap()));
     }
 }
