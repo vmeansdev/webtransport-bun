@@ -1,0 +1,19 @@
+{
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"claimId": "wasm-facade-parity",
+	"createdAt": "2026-07-27T16:23:54.609111Z",
+	"status": "passed",
+	"notes": "wasm-facade session-map + facade-options; soft divergences documented.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"bun",
+		"test",
+		"packages/webtransport/test/wasm-facade.test.ts",
+		"packages/webtransport/test/wasm-facade-options.test.ts"
+	],
+	"startedAt": "2026-07-27T16:23:54.447939Z",
+	"endedAt": "2026-07-27T16:23:54.609111Z",
+	"durationMs": 161,
+	"exitCode": 0,
+	"artifactSha256": "6d70937608999c70841318b02b41f04096e73a4cf263f09d51c635567c3a17b4"
+}
