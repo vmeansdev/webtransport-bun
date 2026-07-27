@@ -34,13 +34,6 @@
 			"notes": "Local evidence for wasm-0rtt."
 		},
 		{
-			"id": "local-facade_parity-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/facade_parity-unit-evidence.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
-			"status": "failed",
-			"notes": "Parity incomplete."
-		},
-		{
 			"id": "local-auto-review-progress-ab6bbdf",
 			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/auto-review-progress.json",
 			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
@@ -102,6 +95,13 @@
 			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
 			"status": "passed",
 			"notes": "fault matrix 1/1"
+		},
+		{
+			"id": "local-facade_parity-ab6bbdf",
+			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/facade_parity-unit-evidence.json",
+			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"status": "failed",
+			"notes": "Superseded by smoke on e08a059; claim flip deferred to candidate rebind (Phase 5)."
 		}
 	],
 	"claims": [
@@ -295,7 +295,7 @@
 				"local-facade_parity-ab6bbdf"
 			],
 			"gaRequired": true,
-			"notes": "Foundation/options only. Product incomplete until parity smoke with session map + commit-bound passing evidence."
+			"notes": "Smoke green on e08a059 (session-map + wasm parity); claim flip awaits candidate rebind so evidence commit matches candidate."
 		}
 	],
 	"surfaces": {
