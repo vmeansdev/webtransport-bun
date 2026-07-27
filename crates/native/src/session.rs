@@ -2,14 +2,137 @@ use napi::bindgen_prelude::Buffer;
 use napi::{Env, JsObject, Result};
 use napi_derive::napi;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use crate::error::{
     from_reason as wt_from_reason, from_upstream_error as wt_from_upstream_error, WtResult,
 };
 use crate::panic_guard;
 use crate::session_registry;
+use crate::session_registry::SessionMetrics;
 use crate::RUNTIME;
 use tokio::time::{Duration, Instant};
+
+/// Snapshot used by stream-open waiters. Decoupled from the registry so unit
+/// tests can drive the wait loop without a live QUIC `Connection`.
+pub(crate) struct StreamCapacityView {
+    pub global_active: u64,
+    pub max_global: u64,
+    pub bidi_active: u64,
+    pub uni_active: u64,
+    pub max_bidi: u64,
+    pub max_uni: u64,
+    pub notify: Arc<Notify>,
+}
+
+/// Pure capacity predicate used by stream-open waiters.
+#[cfg(test)]
+pub(crate) fn stream_kind_has_capacity(
+    kind: &str,
+    global_active: u64,
+    max_global: u64,
+    session_metrics: &SessionMetrics,
+    max_bidi: u64,
+    max_uni: u64,
+) -> bool {
+    stream_kind_view_has_capacity(
+        kind,
+        global_active,
+        max_global,
+        session_metrics.streams_bidi_active.load(Ordering::Relaxed),
+        session_metrics.streams_uni_active.load(Ordering::Relaxed),
+        max_bidi,
+        max_uni,
+    )
+}
+
+pub(crate) fn stream_kind_view_has_capacity(
+    kind: &str,
+    global_active: u64,
+    max_global: u64,
+    bidi_active: u64,
+    uni_active: u64,
+    max_bidi: u64,
+    max_uni: u64,
+) -> bool {
+    let global_ok = global_active < max_global;
+    let kind_ok = match kind {
+        "bidi" => bidi_active < max_bidi,
+        "uni" => uni_active < max_uni,
+        _ => false,
+    };
+    global_ok && kind_ok
+}
+
+/// Async wait loop shared by `wait_bidi_capacity` / `wait_uni_capacity`.
+/// `load` returns `None` when the session is gone (`E_SESSION_CLOSED`).
+pub(crate) async fn wait_stream_kind_capacity_with_timeout<F>(
+    timeout_ms: u32,
+    kind: &'static str,
+    mut load: F,
+) -> Result<()>
+where
+    F: FnMut() -> Option<StreamCapacityView>,
+{
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let Some(view) = load() else {
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+        };
+        // Register the wakeup BEFORE re-checking capacity so a
+        // `notify_waiters()` fired by a StreamGuard drop between the check
+        // and the await is not lost (tokio Notify stores no permit). Without
+        // this, a stream freed in that window leaves the waiter sleeping the
+        // full timeout and yielding a spurious E_BACKPRESSURE_TIMEOUT.
+        // `enable()` enrolls the future in the waiter list NOW — a pinned
+        // Notified does not register until its first poll, so without this
+        // the window the ordering is meant to close stays open.
+        let notified = view.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if stream_kind_view_has_capacity(
+            kind,
+            view.global_active,
+            view.max_global,
+            view.bidi_active,
+            view.uni_active,
+            view.max_bidi,
+            view.max_uni,
+        ) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+        }
+        let remain = deadline.saturating_duration_since(now);
+        tokio::time::timeout(remain, notified)
+            .await
+            .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?;
+    }
+}
+
+pub(crate) fn session_metrics_snapshot_from(
+    sm: Option<&SessionMetrics>,
+) -> crate::metrics::SessionMetricsSnapshot {
+    if let Some(sm) = sm {
+        crate::metrics::SessionMetricsSnapshot {
+            datagrams_in: sm.datagrams_in.load(Ordering::Relaxed) as f64,
+            datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as f64,
+            streams_active: sm.streams_active() as u32,
+            queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as f64,
+        }
+    } else {
+        crate::metrics::SessionMetricsSnapshot {
+            datagrams_in: 0.0,
+            datagrams_out: 0.0,
+            streams_active: 0,
+            queued_bytes: 0.0,
+        }
+    }
+}
 
 #[napi]
 pub struct SessionHandle {
@@ -25,57 +148,22 @@ impl SessionHandle {
         timeout_ms: u32,
         kind: &'static str,
     ) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        loop {
-            let Some((_, _, metrics, _, _, _, _)) = session_registry::get(&id) else {
-                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-            };
-            let Some(sm) = session_registry::get_session_metrics(&id) else {
-                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-            };
-            let Some(limits) = session_registry::get_limits(&id) else {
-                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-            };
-            let Some(notify) = session_registry::get_stream_capacity_notify(&id) else {
-                return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-            };
-            // Register the wakeup BEFORE re-checking capacity so a
-            // `notify_waiters()` fired by a StreamGuard drop between the check
-            // and the await is not lost (tokio Notify stores no permit). Without
-            // this, a stream freed in that window leaves the waiter sleeping the
-            // full timeout and yielding a spurious E_BACKPRESSURE_TIMEOUT.
-            // `enable()` enrolls the future in the waiter list NOW — a pinned
-            // Notified does not register until its first poll, so without this
-            // the window the ordering is meant to close stays open.
-            let notified = notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            let global_ok =
-                metrics.streams_active.load(Ordering::Relaxed) < limits.max_streams_global;
-            let kind_ok = match kind {
-                "bidi" => {
-                    sm.streams_bidi_active.load(Ordering::Relaxed)
-                        < limits.max_streams_per_session_bidi
-                }
-                "uni" => {
-                    sm.streams_uni_active.load(Ordering::Relaxed)
-                        < limits.max_streams_per_session_uni
-                }
-                _ => false,
-            };
-            if global_ok && kind_ok {
-                return Ok(());
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
-            }
-            let remain = deadline.saturating_duration_since(now);
-            tokio::time::timeout(remain, notified)
-                .await
-                .map_err(|_| napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))?;
-        }
+        wait_stream_kind_capacity_with_timeout(timeout_ms, kind, || {
+            let (_, _, metrics, _, _, _, _) = session_registry::get(&id)?;
+            let sm = session_registry::get_session_metrics(&id)?;
+            let limits = session_registry::get_limits(&id)?;
+            let notify = session_registry::get_stream_capacity_notify(&id)?;
+            Some(StreamCapacityView {
+                global_active: metrics.streams_active.load(Ordering::Relaxed),
+                max_global: limits.max_streams_global,
+                bidi_active: sm.streams_bidi_active.load(Ordering::Relaxed),
+                uni_active: sm.streams_uni_active.load(Ordering::Relaxed),
+                max_bidi: limits.max_streams_per_session_bidi,
+                max_uni: limits.max_streams_per_session_uni,
+                notify,
+            })
+        })
+        .await
     }
 
     #[napi(constructor)]
@@ -325,22 +413,167 @@ impl SessionHandle {
     #[napi]
     pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::SessionMetricsSnapshot> {
         panic_guard::catch_panic(|| {
-            if let Some(sm) = session_registry::get_session_metrics(&self.id) {
-                Ok(crate::metrics::SessionMetricsSnapshot {
-                    datagrams_in: sm.datagrams_in.load(Ordering::Relaxed) as f64,
-                    datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as f64,
-                    streams_active: sm.streams_active() as u32,
-                    queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as f64,
-                })
-            } else {
-                Ok(crate::metrics::SessionMetricsSnapshot {
-                    datagrams_in: 0.0,
-                    datagrams_out: 0.0,
-                    streams_active: 0,
-                    queued_bytes: 0.0,
-                })
-            }
+            Ok(session_metrics_snapshot_from(
+                session_registry::get_session_metrics(&self.id).as_deref(),
+            ))
         })
         .map_err(wt_from_reason)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    #[test]
+    fn session_handle_exposes_constructor_identity() {
+        let handle = SessionHandle::new("sess-1".into(), "127.0.0.1".into(), 4433);
+        assert_eq!(handle.id(), "sess-1");
+        assert_eq!(handle.peer_ip(), "127.0.0.1");
+        assert_eq!(handle.peer_port(), 4433);
+    }
+
+    #[test]
+    fn connection_stats_and_close_are_safe_for_unknown_session() {
+        let handle = SessionHandle::new("missing-session".into(), "10.0.0.1".into(), 9);
+        assert!(handle.connection_stats().unwrap().is_none());
+        assert!(handle.close(Some(3990), Some("gone".into())).is_ok());
+    }
+
+    #[test]
+    fn metrics_snapshot_returns_zeros_for_unknown_session() {
+        let handle = SessionHandle::new("missing-metrics".into(), "::1".into(), 1);
+        let snap = handle.metrics_snapshot().unwrap();
+        assert_eq!(snap.datagrams_in, 0.0);
+        assert_eq!(snap.datagrams_out, 0.0);
+        assert_eq!(snap.streams_active, 0);
+        assert_eq!(snap.queued_bytes, 0.0);
+    }
+
+    #[test]
+    fn session_metrics_snapshot_from_reads_atomics() {
+        let sm = SessionMetrics::default();
+        sm.datagrams_in.store(3, Ordering::Relaxed);
+        sm.datagrams_out.store(5, Ordering::Relaxed);
+        sm.streams_bidi_active.store(2, Ordering::Relaxed);
+        sm.streams_uni_active.store(1, Ordering::Relaxed);
+        sm.queued_bytes.store(99, Ordering::Relaxed);
+        let snap = session_metrics_snapshot_from(Some(&sm));
+        assert_eq!(snap.datagrams_in, 3.0);
+        assert_eq!(snap.datagrams_out, 5.0);
+        assert_eq!(snap.streams_active, 3);
+        assert_eq!(snap.queued_bytes, 99.0);
+        let empty = session_metrics_snapshot_from(None);
+        assert_eq!(empty.streams_active, 0);
+    }
+
+    #[test]
+    fn stream_kind_has_capacity_respects_global_and_per_kind_caps() {
+        let sm = SessionMetrics::default();
+        assert!(stream_kind_has_capacity("bidi", 0, 10, &sm, 2, 2));
+        assert!(stream_kind_has_capacity("uni", 0, 10, &sm, 2, 2));
+        assert!(!stream_kind_has_capacity("other", 0, 10, &sm, 2, 2));
+
+        sm.streams_bidi_active.store(2, Ordering::Relaxed);
+        assert!(!stream_kind_has_capacity("bidi", 0, 10, &sm, 2, 2));
+        assert!(stream_kind_has_capacity("uni", 0, 10, &sm, 2, 2));
+
+        sm.streams_uni_active.store(2, Ordering::Relaxed);
+        assert!(!stream_kind_has_capacity("uni", 0, 10, &sm, 2, 2));
+
+        // Global cap blocks even when per-kind still has room.
+        sm.streams_bidi_active.store(0, Ordering::Relaxed);
+        sm.streams_uni_active.store(0, Ordering::Relaxed);
+        assert!(!stream_kind_has_capacity("bidi", 10, 10, &sm, 2, 2));
+        assert!(stream_kind_has_capacity("bidi", 9, 10, &sm, 2, 2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_capacity_with_timeout_unknown_session_is_closed() {
+        let err = SessionHandle::wait_capacity_with_timeout("no-such-session".into(), 30, "bidi")
+            .await
+            .unwrap_err();
+        assert!(err.reason.contains("E_SESSION_CLOSED"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_capacity_returns_closed_when_snapshot_missing() {
+        let err = wait_stream_kind_capacity_with_timeout(50, "bidi", || None)
+            .await
+            .unwrap_err();
+        assert!(err.reason.contains("E_SESSION_CLOSED"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_capacity_succeeds_when_already_under_cap() {
+        let notify = Arc::new(Notify::new());
+        wait_stream_kind_capacity_with_timeout(50, "bidi", || {
+            Some(StreamCapacityView {
+                global_active: 0,
+                max_global: 10,
+                bidi_active: 0,
+                uni_active: 0,
+                max_bidi: 2,
+                max_uni: 2,
+                notify: Arc::clone(&notify),
+            })
+        })
+        .await
+        .expect("under cap must succeed immediately");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_capacity_times_out_when_cap_never_frees() {
+        let notify = Arc::new(Notify::new());
+        let err = wait_stream_kind_capacity_with_timeout(20, "uni", || {
+            Some(StreamCapacityView {
+                global_active: 0,
+                max_global: 10,
+                bidi_active: 0,
+                uni_active: 2,
+                max_bidi: 2,
+                max_uni: 2,
+                notify: Arc::clone(&notify),
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_capacity_wakes_when_notify_fires() {
+        let notify = Arc::new(Notify::new());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_c = Arc::clone(&polls);
+        let notify_c = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            wait_stream_kind_capacity_with_timeout(500, "bidi", || {
+                let n = polls_c.fetch_add(1, Ordering::Relaxed);
+                Some(StreamCapacityView {
+                    global_active: 0,
+                    max_global: 10,
+                    // first poll blocked, later polls free
+                    bidi_active: if n == 0 { 2 } else { 0 },
+                    uni_active: 0,
+                    max_bidi: 2,
+                    max_uni: 2,
+                    notify: Arc::clone(&notify_c),
+                })
+            })
+            .await
+        });
+        // Let waiter enroll on Notify before waking.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        notify.notify_waiters();
+        waiter
+            .await
+            .expect("join")
+            .expect("notify must unblock capacity wait");
+        assert!(polls.load(Ordering::Relaxed) >= 2);
     }
 }
