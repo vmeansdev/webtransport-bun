@@ -85,11 +85,22 @@ export type { WasmNormalizedRateLimits } from "./types.js";
 export type WasmEndpointOptions = {
 	limits?: WasmLimitsOptions;
 	rateLimits?: WasmRateLimitOptions;
+	/**
+	 * SETTINGS_WT_MAX_SESSIONS advertised/enforced per QUIC connection
+	 * (1..=256). When omitted, the Rust default applies (currently 2).
+	 */
+	wtMaxSessions?: number;
+	/** Enable QUIC 0-RTT / early data when the wasm module supports it. */
+	enable0Rtt?: boolean;
 };
 
 export type WasmNormalizedEndpointOptions = {
-	limits: WasmNormalizedLimits;
-	rateLimits: WasmNormalizedRateLimits;
+	limits: Required<WasmLimitsOptions>;
+	rateLimits: Required<WasmRateLimitsOptions>;
+	/** Present only when the caller set {@link WasmEndpointOptions.wtMaxSessions}. */
+	wtMaxSessions?: number;
+	/** Present only when the caller set {@link WasmEndpointOptions.enable0Rtt}. */
+	enable0Rtt?: boolean;
 };
 
 const WASM_U32_MAX = 0xffff_ffff;
@@ -281,7 +292,26 @@ export function normalizeWasmEndpointOptions(
 		);
 	}
 
-	return { limits, rateLimits };
+	let wtMaxSessions: number | undefined;
+	if (options.wtMaxSessions !== undefined) {
+		wtMaxSessions = normalizePositiveInteger(
+			"wtMaxSessions",
+			options.wtMaxSessions,
+			256,
+		);
+	}
+
+	let enable0Rtt: boolean | undefined;
+	if (options.enable0Rtt !== undefined) {
+		enable0Rtt = Boolean(options.enable0Rtt);
+	}
+
+	return {
+		limits,
+		rateLimits,
+		...(wtMaxSessions === undefined ? {} : { wtMaxSessions }),
+		...(enable0Rtt === undefined ? {} : { enable0Rtt }),
+	};
 }
 
 /**
@@ -1338,6 +1368,13 @@ export interface WasmConnectOptions {
 	certHashBase64?: string;
 	limits?: WasmLimitsOptions;
 	rateLimits?: WasmRateLimitOptions;
+	wtMaxSessions?: number;
+	/** W3C facade options applied when wrapping the session as WasmWebTransport. */
+	allowPooling?: boolean;
+	requireUnreliable?: boolean;
+	congestionControl?: "default" | "throughput" | "low-latency";
+	strictW3CErrors?: boolean;
+	datagramsReadableType?: "bytes" | "default";
 }
 
 /** Client: connect to a WebTransport server over the given UDP transport. */
@@ -1480,7 +1517,15 @@ export async function connectWasmUnified(
 		opts,
 	);
 	return {
-		transport: wasmToWebTransportLike(new WasmWebTransport(session)),
+		transport: wasmToWebTransportLike(
+			new WasmWebTransport(session, {
+				allowPooling: opts.allowPooling,
+				requireUnreliable: opts.requireUnreliable,
+				congestionControl: opts.congestionControl,
+				strictW3CErrors: opts.strictW3CErrors,
+				datagramsReadableType: opts.datagramsReadableType,
+			}),
+		),
 		manager,
 	};
 }
@@ -1497,6 +1542,12 @@ export interface WasmClientArgs {
 	certHashBase64?: string;
 	limits?: WasmLimitsOptions;
 	rateLimits?: WasmRateLimitOptions;
+	wtMaxSessions?: number;
+	allowPooling?: boolean;
+	requireUnreliable?: boolean;
+	congestionControl?: "default" | "throughput" | "low-latency";
+	strictW3CErrors?: boolean;
+	datagramsReadableType?: "bytes" | "default";
 }
 
 /** Construction args for the native side of {@link createUnifiedClient}. */
@@ -1528,6 +1579,12 @@ export async function createUnifiedClient(
 				certHashBase64: args.certHashBase64,
 				limits: args.limits,
 				rateLimits: args.rateLimits,
+				wtMaxSessions: args.wtMaxSessions,
+				allowPooling: args.allowPooling,
+				requireUnreliable: args.requireUnreliable,
+				congestionControl: args.congestionControl,
+				strictW3CErrors: args.strictW3CErrors,
+				datagramsReadableType: args.datagramsReadableType,
 			},
 		);
 		return transport;

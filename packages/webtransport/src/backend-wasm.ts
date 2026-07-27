@@ -343,6 +343,10 @@ export interface WasmEndpointConstructorOptions {
 		datagramsIngressPerSec: number;
 		datagramsIngressBurst: number;
 	};
+	/** Opt-in QUIC TLS 1.3 early data (0-RTT). Default false. */
+	enable0Rtt?: boolean;
+	/** Optional SETTINGS_WT_MAX_SESSIONS (forwarded to the Rust bridge). */
+	wtMaxSessions?: number;
 }
 
 function isConstructorOptions(
