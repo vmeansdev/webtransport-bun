@@ -460,6 +460,19 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		expect(bindCalls).toBe(0);
 	});
 
+	test("normalization accepts optional wtMaxSessions and rejects out-of-range", () => {
+		expect(
+			normalizeWasmEndpointOptions({ wtMaxSessions: 4 }).wtMaxSessions,
+		).toBe(4);
+		expect(normalizeWasmEndpointOptions({}).wtMaxSessions).toBeUndefined();
+		expect(() => normalizeWasmEndpointOptions({ wtMaxSessions: 0 })).toThrow(
+			/wtMaxSessions must be a positive integer/,
+		);
+		expect(() => normalizeWasmEndpointOptions({ wtMaxSessions: 257 })).toThrow(
+			/wtMaxSessions exceeds/,
+		);
+	});
+
 	test("normalization rejects timer values outside the host timer range", () => {
 		const maxTimerMs = 0x7fff_ffff;
 		expect(

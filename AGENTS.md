@@ -106,3 +106,23 @@ Per-IP token buckets (defaults)
 - Each logical change must be **one scoped commit**.
 - Commit message format: **Verb + What + Why** (e.g. `Add error codes for stable programmatic handling`).
 - Do not bundle unrelated changes in a single commit.
+
+## Learned User Preferences
+- Prefer `bunx` over `npx` for running package binaries.
+- Keep one scoped logical change per commit; do not commit planning/instruction files (`INSTRUCTIONS_CURRENT_PHASE.md`, `Task.md`, `PRODUCTION_PLAN.md`) unless explicitly asked.
+- When told to continue until all phases or subphases are done, keep going without pausing for per-step confirmation; partial completion is not enough.
+- Prefer project markdown docs under `docs/` rather than the repo root.
+- Prefer local Chrome on this machine for browser/IWA verification when available rather than assuming Chromium/Playwright is missing.
+- Rust native code must have its own unit-test coverage, separate from TypeScript tests, during development.
+- After scoped native/coverage refactors, run an auto-review pass and report before continuing related work.
+- Target production-grade 1.0 for both native and WASM; WASM 1.0 requires protocol expansion (multi-session, 0-RTT, dynamic QPACK) plus facade/API parity with native, not evidence-hardening alone.
+
+## Learned Workspace Facts
+- Active 1.0 production work is on branch `feat/wasm-1.0` in the worktree at `/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0` (not `release/1.0-hardening`).
+- Phase execution is driven by `INSTRUCTIONS_CURRENT_PHASE.md` → infer/update `Task.md`, then execute until all phases are done.
+- Published package entrypoints target compiled JS and `.d.ts` under `dist/` with native addon binaries under `prebuilds/`.
+- Invalid client `caPem` must map to stable `E_TLS` (not `E_INTERNAL`).
+- When GitHub Actions are unavailable due to limits, continue local 1.0 hardening without waiting on CI.
+- Keep floored Rust logic modules (`session.rs`, `server.rs`) free of NAPI Env wrappers; put bindings in `*_napi.rs` / `server_spawn.rs` so llvm-cov floors stay honest.
+- Native llvm-cov floors (90% line / 90% function / 80% branch) apply to floored logic modules only; NAPI binding modules and `server_spawn` are intentionally outside those floors.
+- WASM (`crates/wasm/`) is a separate engine from native: sans-IO `quinn-proto` + hand-rolled H3/WT with JS-owned UDP I/O; native is napi + `wtransport` + Tokio.
