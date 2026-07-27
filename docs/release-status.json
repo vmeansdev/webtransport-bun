@@ -1,107 +1,114 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+		"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-coverage-floors-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/coverage-gates-floor-results.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
-			"status": "failed",
-			"notes": "Local nightly llvm-cov --branch: wasm endpoint.rs/h3.rs below 90/90/80 after QPACK/CONNECT work; claim demoted pending coverage recovery."
-		},
-		{
-			"id": "local-dynamic_qpack-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/dynamic_qpack-unit-evidence.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-coverage-floors-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/coverage-gates-floor-results.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "Local evidence for wasm-dynamic-qpack."
+			"notes": "endpoint/h3 floors \u226590/90/80 on candidate."
 		},
 		{
-			"id": "local-multi_session-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/multi_session-unit-evidence.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-dynamic_qpack-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/dynamic_qpack-unit-evidence.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "Local evidence for wasm-multi-session."
+			"notes": "QPACK options + KRC on candidate."
 		},
 		{
-			"id": "local-zero_rtt-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/zero_rtt-unit-evidence.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-multi_session-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/multi_session-unit-evidence.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "Local evidence for wasm-0rtt."
+			"notes": "Multi-session product surface on candidate."
 		},
 		{
-			"id": "local-auto-review-progress-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/auto-review-progress.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-zero_rtt-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/zero_rtt-unit-evidence.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "Eight-lane zero P0\u2013P4 closed; product committed and rebound."
+			"notes": "Shared-store + TicketStoreHost hydrate has0Rtt on candidate."
 		},
 		{
-			"id": "local-wasm-local-gates-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/wasm-local-gates.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-auto-review-progress-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/auto-review-progress.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "bun run test:wasm 82 pass"
+			"notes": "Eight-lane zero P0\u2013P4 closed; rebound."
 		},
 		{
-			"id": "local-native-local-gates-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/native-local-gates.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-wasm-local-gates-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/wasm-local-gates.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"status": "passed",
+			"notes": "bun run test:wasm 85 pass"
+		},
+		{
+			"id": "local-native-local-gates-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/native-local-gates.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
 			"notes": "cargo test -p native --lib 110 pass"
 		},
 		{
-			"id": "local-supply-chain-provenance-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/supply-chain-provenance.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-supply-chain-provenance-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/supply-chain-provenance.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "actions pin policy"
+			"notes": "actions pin policy rebound"
 		},
 		{
-			"id": "local-package-artifact-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/package-artifact.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-package-artifact-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/package-artifact.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "package artifact check"
+			"notes": "package artifact build+check"
 		},
 		{
-			"id": "local-runtime-consumers-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/runtime-consumers.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-runtime-consumers-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/runtime-consumers.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "internal package artifact tests"
+			"notes": "internal package artifact tests rebound"
 		},
 		{
-			"id": "local-chromium-wasm-interop-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/chromium-wasm-interop.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-chromium-wasm-interop-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/chromium-wasm-interop.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "Playwright chromium-webtransport-wasm 5/5"
+			"notes": "chromium wasm interop rebound"
 		},
 		{
-			"id": "local-chromium-native-interop-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/chromium-native-interop.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-chromium-native-interop-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/chromium-native-interop.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "Playwright chromium-webtransport 19/19 darwin/arm64"
+			"notes": "chromium native interop rebound"
 		},
 		{
-			"id": "local-fault-matrix-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/fault-matrix.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+			"id": "local-fault-matrix-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/fault-matrix.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
 			"status": "passed",
-			"notes": "fault matrix 1/1"
+			"notes": "fault matrix rebound"
 		},
 		{
-			"id": "local-facade_parity-ab6bbdf",
-			"path": "docs/release-evidence/ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d/facade_parity-unit-evidence.json",
-			"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
-			"status": "failed",
-			"notes": "Superseded by smoke on e08a059; claim flip deferred to candidate rebind (Phase 5)."
+			"id": "local-facade_parity-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/facade_parity-unit-evidence.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"status": "passed",
+			"notes": "Facade session-map smoke + wasm parity"
+		},
+		{
+			"id": "local-iwa-direct-sockets-b97e622",
+			"path": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/iwa-direct-sockets.json",
+			"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+			"status": "passed",
+			"notes": "Local Chrome IWA Direct Sockets proof"
 		}
 	],
 	"claims": [
@@ -110,20 +117,20 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-native-local-gates-ab6bbdf"
+				"local-native-local-gates-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on candidate ab6bbdf."
+			"notes": "Native lib gates on candidate."
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-local-gates-ab6bbdf"
+				"local-wasm-local-gates-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on candidate ab6bbdf."
+			"notes": "Wasm product suite on candidate."
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -137,94 +144,96 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-runtime-consumers-ab6bbdf"
+				"local-runtime-consumers-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on current candidate."
+			"notes": "Rebound."
 		},
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-native-interop-ab6bbdf"
+				"local-chromium-native-interop-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound to candidate ab6bbdf with local commit-bound evidence."
+			"notes": "Rebound."
 		},
 		{
 			"id": "chromium-wasm-interop",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-wasm-interop-ab6bbdf"
+				"local-chromium-wasm-interop-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound to candidate ab6bbdf with local commit-bound evidence."
+			"notes": "Rebound."
 		},
 		{
 			"id": "iwa-direct-sockets",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
+			"status": "passed",
+			"evidenceIds": [
+				"local-iwa-direct-sockets-b97e622"
+			],
 			"gaRequired": true,
-			"notes": "Local Chrome IWA proof green on 89b2cc2; claim flip awaits candidate rebind (artifact docs/release-evidence/89b2cc23549ea2dab50ed1474f247db5b6653606/iwa-direct-sockets.json)."
+			"notes": "Local Chrome IWA Direct Sockets on candidate."
 		},
 		{
 			"id": "fault-matrix",
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-fault-matrix-ab6bbdf"
+				"local-fault-matrix-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound to candidate ab6bbdf with local commit-bound evidence."
+			"notes": "Rebound."
 		},
 		{
 			"id": "coverage-gates",
 			"surface": "release",
-			"status": "pending",
+			"status": "passed",
 			"evidenceIds": [
-				"local-coverage-floors-ab6bbdf"
+				"local-coverage-floors-b97e622"
 			],
-			"notes": "Floors green on 991fa88; claim flip awaits candidate rebind. Artifact docs/release-evidence/991fa88fe6a6b808b0bc160340f6cf9adf076e0a/coverage-gates-floor-results.json.",
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "endpoint/h3 floors recovered on candidate."
 		},
 		{
 			"id": "fuzz-gates",
 			"surface": "release",
 			"status": "pending",
 			"evidenceIds": [],
-			"notes": "Darwin cargo-fuzz sancov link blocked; Linux/CI campaign still required. release-smoke property steps pass.",
-			"gaRequired": true
+			"gaRequired": true,
+			"notes": "Darwin cargo-fuzz sancov link blocked; Linux/CI campaign still required."
 		},
 		{
 			"id": "scale-10k-multisource",
 			"surface": "release",
 			"status": "pending",
 			"evidenceIds": [],
-			"notes": "Instrumentation target; gaRequired=false so it does not block promote. tools/load/distributed-scale.ts remains available.",
-			"gaRequired": false
+			"gaRequired": false,
+			"notes": "Instrumentation target; gaRequired=false."
 		},
 		{
 			"id": "package-artifact",
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-ab6bbdf"
+				"local-package-artifact-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on current candidate."
+			"notes": "Build+check on candidate."
 		},
 		{
 			"id": "supply-chain-provenance",
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-provenance-ab6bbdf"
+				"local-supply-chain-provenance-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Rebound locally on current candidate."
+			"notes": "Rebound."
 		},
 		{
 			"id": "soak-24h",
@@ -245,10 +254,10 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-auto-review-progress-ab6bbdf"
+				"local-auto-review-progress-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Eight-lane review closed with remainingP0P4=[]; product + regression fixes at candidate."
+			"notes": "Eight-lane review closed."
 		},
 		{
 			"id": "final-no-change-confirmation",
@@ -262,40 +271,40 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-dynamic_qpack-ab6bbdf"
+				"local-dynamic_qpack-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Opt-in dynamic QPACK: peer ICI\u2192encoder KRC + indexed CONNECT/status when capacity>0; default capacity 0."
+			"notes": "Opt-in dynamic QPACK on candidate."
 		},
 		{
 			"id": "wasm-multi-session",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-multi_session-ab6bbdf"
+				"local-multi_session-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Multi-session product surface with datagram isolation + SessionClosed secondary path."
+			"notes": "Multi-session on candidate."
 		},
 		{
 			"id": "wasm-0rtt",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-zero_rtt-ab6bbdf"
+				"local-zero_rtt-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Shared-store reconnect reports has0Rtt===true after NST flush; JS TicketStoreHost still not bridged to rustls."
+			"notes": "Shared-store + TicketStoreHost hydrate/dump has0Rtt; IndexedDB still out of scope."
 		},
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
-			"status": "pending",
+			"status": "passed",
 			"evidenceIds": [
-				"local-facade_parity-ab6bbdf"
+				"local-facade_parity-b97e622"
 			],
 			"gaRequired": true,
-			"notes": "Smoke green on e08a059 (session-map + wasm parity); claim flip awaits candidate rebind so evidence commit matches candidate."
+			"notes": "Smoke bar: session-map + wasm parity; pooling/waitUntilAvailable/getStats soft divergences."
 		}
 	],
 	"surfaces": {

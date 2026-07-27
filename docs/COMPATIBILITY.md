@@ -68,7 +68,7 @@ Constraints that apply regardless of environment:
   requirements (`wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`) and
   are **claim-passed** on the current candidate in `docs/release-status.json`
   (defaults remain Chromium-safe: QPACK capacity 0, `enable0Rtt` false).
-  `wasm-facade-parity` smoke is green; claim remains pending until candidate rebind.
+  `wasm-facade-parity` is claim-passed on the current candidate (smoke bar).
 - **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
   signed Web Bundle installation via Chromium's developer-mode
   `--install-isolated-web-app-from-file` switch, unsigned source bundle, and
