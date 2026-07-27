@@ -68,7 +68,10 @@ impl QpackLocalSettings {
 /// Encode the control-stream preamble: stream type byte + a SETTINGS frame
 /// advertising WebTransport + H3 datagrams + QPACK limits (defaults).
 pub fn encode_control_preamble(max_sessions: u64) -> Vec<u8> {
-    encode_control_preamble_with(max_sessions, &QpackLocalSettings::default())
+    // Production/Chromium-facing default: advertise zero QPACK table capacity
+    // until decoder-stream ACKs are complete. Opt into dynamic QPACK via
+    // `encode_control_preamble_with` + non-zero `QpackLocalSettings`.
+    encode_control_preamble_with(max_sessions, &QpackLocalSettings::disabled())
 }
 
 /// Encode control preamble with explicit QPACK SETTINGS (use
@@ -990,8 +993,22 @@ mod tests {
         let s = parse_settings(payload).unwrap();
         assert!(s.webtransport && s.h3_datagram && s.connect_protocol);
         assert_eq!(s.max_sessions, 16);
-        assert_eq!(s.qpack_max_table_capacity, DEFAULT_QPACK_MAX_TABLE_CAPACITY);
-        assert_eq!(s.qpack_blocked_streams, DEFAULT_QPACK_BLOCKED_STREAMS);
+        // Default preamble stays Chromium-safe (zero dynamic table).
+        assert_eq!(s.qpack_max_table_capacity, 0);
+        assert_eq!(s.qpack_blocked_streams, 0);
+
+        let buf_dyn = encode_control_preamble_with(16, &QpackLocalSettings::default());
+        let rest = &buf_dyn[varint::decode(&buf_dyn).unwrap().1..];
+        let (ft, n1) = varint::decode(rest).unwrap();
+        assert_eq!(ft, frame::SETTINGS);
+        let rest = &rest[n1..];
+        let (len, n2) = varint::decode(rest).unwrap();
+        let s_dyn = parse_settings(&rest[n2..n2 + len as usize]).unwrap();
+        assert_eq!(
+            s_dyn.qpack_max_table_capacity,
+            DEFAULT_QPACK_MAX_TABLE_CAPACITY
+        );
+        assert_eq!(s_dyn.qpack_blocked_streams, DEFAULT_QPACK_BLOCKED_STREAMS);
     }
 
     #[test]
