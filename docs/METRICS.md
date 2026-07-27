@@ -27,6 +27,17 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | defaultCertSelections | number | Handshakes served by the default certificate |
 | unknownSniRejectedCount | number | Handshakes rejected because SNI did not match a configured hostname |
 
+## WASM governor snapshot (`governor_snapshot_json`)
+
+In addition to the shared governor fields (`sessionsActive`, queued bytes, rate-limit counters), the wasm endpoint snapshot includes:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| wtSessionsActive | number | Live + pending WebTransport sessions across connections |
+| sessionClosedCount | number | Cumulative `SessionClosed` events (extra-session / timed-out CONNECT) |
+
+Per-connection `has0Rtt` / `accepted0Rtt` remain on connection getters (not rolled into this snapshot).
+
 ## Latency histograms (P3.1)
 
 Histograms are emitted as Prometheus `histogram` type (`_bucket`, `_count`, `_sum`). Buckets (seconds): 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, +Inf.

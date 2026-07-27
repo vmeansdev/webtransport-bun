@@ -24,14 +24,52 @@ use crate::ticket_store::{
     configure_client_early_data, configure_server_early_data, InMemoryTicketStore,
 };
 
-/// Process-local shared ticket store so Bun loopback client+server with
-/// `enable0Rtt: true` can resume. IndexedDB host adapters can replace this
-/// later via a TicketStoreHost bridge without changing the JS surface.
+/// Opt-in process-local shared ticket store for Bun loopback client+server
+/// (`shareProcess0RttTicketStore: true`). Default is per-endpoint isolation.
 fn shared_0rtt_ticket_store() -> Arc<InMemoryTicketStore> {
     static STORE: OnceLock<Arc<InMemoryTicketStore>> = OnceLock::new();
     STORE
         .get_or_init(|| Arc::new(InMemoryTicketStore::new(256)))
         .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn shared_0rtt_client_ticket_count(server_name: &str) -> usize {
+    shared_0rtt_ticket_store().client_ticket_count(server_name)
+}
+
+fn ticket_store_for_0rtt(share_process: bool) -> Arc<InMemoryTicketStore> {
+    if share_process {
+        shared_0rtt_ticket_store()
+    } else {
+        Arc::new(InMemoryTicketStore::new(256))
+    }
+}
+
+/// Process-shared quinn [`ClientConfig`] for `shareProcess0RttTicketStore`.
+/// Reusing the same config (not only the ticket store) is required for a fresh
+/// endpoint to offer 0-RTT from tickets minted by a prior endpoint.
+fn shared_0rtt_accept_any_client_config() -> Result<ClientConfig, String> {
+    static CFG: OnceLock<ClientConfig> = OnceLock::new();
+    if let Some(cfg) = CFG.get() {
+        return Ok(cfg.clone());
+    }
+    let mut crypto = spike::client_crypto()
+        .map_err(|error| format!("E_INTERNAL: client crypto config: {error}"))?;
+    configure_client_early_data(&mut crypto, true, shared_0rtt_ticket_store());
+    let qcc = quinn_proto::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .map_err(|error| format!("E_INTERNAL: invalid QUIC client config: {error}"))?;
+    let mut client_config = ClientConfig::new(Arc::new(qcc));
+    let mut tc = quinn_proto::TransportConfig::default();
+    let idle = IdleTimeout::try_from(std::time::Duration::from_millis(30_000))
+        .map_err(|_| "E_INTERNAL: shared 0-RTT idle timeout".to_string())?;
+    tc.max_idle_timeout(Some(idle));
+    tc.keep_alive_interval(Some(std::time::Duration::from_millis(
+        KEEP_ALIVE_INTERVAL_MS,
+    )));
+    client_config.transport_config(Arc::new(tc));
+    let _ = CFG.set(client_config.clone());
+    Ok(client_config)
 }
 
 /// A peer-accepted stream being classified and read.
@@ -45,13 +83,15 @@ struct InStream {
     wt_session_id: Option<u64>,
     /// WT stream handle once classified as a WebTransport stream.
     handle: Option<u32>,
+    /// Server request/CONNECT stream passed admission (cap + rate limit).
+    connect_admitted: bool,
     buf: Vec<u8>,
 }
 
 /// Client secondary CONNECT awaiting a 200 response.
 struct PendingClientConnect {
     rx: Vec<u8>,
-    _deadline: Option<Instant>,
+    deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -85,8 +125,14 @@ struct Session {
     qpack_decoder_rx: Vec<u8>,
     /// Our outbound QPACK decoder stream (for section acks / ICI).
     qpack_decoder_send: Option<StreamId>,
+    /// Our outbound QPACK encoder stream (capacity / inserts).
+    qpack_encoder_send: Option<StreamId>,
     /// Decoder-side dynamic QPACK table (matches advertised SETTINGS; default 0).
     qpack_decoder: h3::QpackDecoder,
+    /// Encoder-side dynamic QPACK table for outbound HEADERS when capacity > 0.
+    qpack_encoder: h3::QpackEncoder,
+    /// Stream id → Required Insert Count for sections we emitted (section-ack → KRC).
+    pending_section_ric: HashMap<u64, u64>,
     /// Peer-accepted streams (uni + bidi) being classified/read.
     in_streams: HashMap<StreamId, InStream>,
     /// Self-opened bidi WT streams: id -> handle (inbound is raw WT data).
@@ -94,7 +140,9 @@ struct Session {
 }
 
 impl Session {
-    /// Count of live WebTransport sessions on this QUIC connection.
+    /// Count of live + pending WebTransport sessions on this QUIC connection.
+    /// Pending client CONNECTs count toward `SETTINGS_WT_MAX_SESSIONS` so
+    /// callers cannot open unbounded secondary streams while waiting on 200.
     fn active_wt_count(&self) -> usize {
         let primary = if primary_wt_session_live(
             self.established,
@@ -105,7 +153,7 @@ impl Session {
         } else {
             0
         };
-        primary + self.extra_sessions.len()
+        primary + self.extra_sessions.len() + self.pending_client_connects.len()
     }
 
     fn is_wt_connect(&self, id: StreamId) -> bool {
@@ -118,15 +166,17 @@ impl Session {
             .chain(self.extra_sessions.iter().copied())
     }
 
+    /// Established or pending client CONNECT stream ids (for close/abort).
+    fn resolve_wt_session(&self, session_id: u64) -> Option<StreamId> {
+        self.all_connect_streams()
+            .chain(self.pending_client_connects.keys().copied())
+            .find(|sid| u64::from(*sid) == session_id)
+    }
+
     /// Resolve a datagram quarter-session-id to its CONNECT stream (session id).
     fn session_for_qsid(&self, qsid: u64) -> Option<StreamId> {
         self.all_connect_streams()
             .find(|sid| u64::from(*sid) / 4 == qsid)
-    }
-
-    fn resolve_wt_session(&self, session_id: u64) -> Option<StreamId> {
-        self.all_connect_streams()
-            .find(|sid| u64::from(*sid) == session_id)
     }
 }
 
@@ -145,6 +195,8 @@ pub struct WtEndpoint {
     /// resolving a StreamId to its WT handle is O(1) (kept in sync via
     /// `index_insert`/`index_remove`).
     rev_index: HashMap<(ConnectionHandle, StreamId), u32>,
+    /// WT stream handle -> session_id (for session-scoped teardown).
+    stream_sessions: HashMap<u32, u64>,
     /// WT stream handles the consumer paused: their recv data stays in quinn's
     /// buffer (exerting QUIC flow control on the sender) until resumed.
     paused: HashSet<u32>,
@@ -171,8 +223,13 @@ pub struct WtEndpoint {
     /// (global concurrent admission).
     wt_max_sessions: u64,
     /// Opt-in QUIC TLS 1.3 early data (0-RTT). When true, client/server rustls
-    /// configs accept/offer early data and share an [`InMemoryTicketStore`].
+    /// configs accept/offer early data with an [`InMemoryTicketStore`].
     enable_0rtt: bool,
+    /// Remaining local drive rounds after Connected so NewSessionTicket can
+    /// be emitted/consumed (mirrors the unit-harness 64-iteration flush).
+    nst_flush_remaining: HashMap<ConnectionHandle, u8>,
+    /// Cumulative SessionClosed events (extra-session or timed-out CONNECT).
+    session_closed_count: u64,
     /// Local QPACK SETTINGS (advertised + decoder bound). Default disabled (0).
     qpack_settings: h3::QpackLocalSettings,
     last_error: Option<String>,
@@ -392,6 +449,20 @@ fn classify_peer_stream_kind(kind: u64, is_bidi: bool) -> PeerStreamClass {
     }
 }
 
+/// Count server request streams that are admitted but not yet latched as WT sessions.
+fn count_unlatched_connect_streams(session: &Session) -> usize {
+    session
+        .in_streams
+        .iter()
+        .filter(|(id, st)| {
+            st.connect_admitted
+                && st.is_bidi
+                && st.kind == Some(h3::frame::HEADERS)
+                && !session.is_wt_connect(**id)
+        })
+        .count()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PeerStreamClass {
     Control,
@@ -562,6 +633,27 @@ impl WtEndpoint {
         rate_limits: WasmRateLimits,
         enable_0rtt: bool,
     ) -> Result<Self, String> {
+        Self::new_with_limits_rate_limits_0rtt_and_ticket_share(
+            is_server,
+            _addr,
+            peer_addr,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            false,
+        )
+    }
+
+    /// Opt-in 0-RTT with optional process-shared ticket store (loopback only).
+    pub fn new_with_limits_rate_limits_0rtt_and_ticket_share(
+        is_server: bool,
+        _addr: SocketAddr,
+        peer_addr: SocketAddr,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+    ) -> Result<Self, String> {
         let server_cfg = if is_server {
             Some(spike::server_crypto()?.0)
         } else {
@@ -575,6 +667,7 @@ impl WtEndpoint {
             limits,
             rate_limits,
             enable_0rtt,
+            share_process_0rtt_ticket_store,
         )
     }
 
@@ -626,6 +719,24 @@ impl WtEndpoint {
         rate_limits: WasmRateLimits,
         enable_0rtt: bool,
     ) -> Result<Self, String> {
+        Self::new_client_pinned_with_limits_rate_limits_0rtt_and_ticket_share(
+            peer_addr,
+            hashes,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            false,
+        )
+    }
+
+    pub fn new_client_pinned_with_limits_rate_limits_0rtt_and_ticket_share(
+        peer_addr: SocketAddr,
+        hashes: Vec<[u8; 32]>,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+    ) -> Result<Self, String> {
         let crypto = crate::verify::client_crypto_pinned(hashes)?;
         Self::build(
             false,
@@ -635,6 +746,7 @@ impl WtEndpoint {
             limits,
             rate_limits,
             enable_0rtt,
+            share_process_0rtt_ticket_store,
         )
     }
 
@@ -701,6 +813,28 @@ impl WtEndpoint {
         rate_limits: WasmRateLimits,
         enable_0rtt: bool,
     ) -> Result<(Self, String), String> {
+        Self::new_with_generated_cert_with_limits_rate_limits_0rtt_and_ticket_share(
+            peer_addr,
+            common_name,
+            validity_days,
+            not_before_unix,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            false,
+        )
+    }
+
+    pub fn new_with_generated_cert_with_limits_rate_limits_0rtt_and_ticket_share(
+        peer_addr: SocketAddr,
+        common_name: &str,
+        validity_days: u32,
+        not_before_unix: i64,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+    ) -> Result<(Self, String), String> {
         let gen = crate::cert::generate(common_name, validity_days, not_before_unix)?;
         let hash = crate::cert::sha256_base64(&gen.cert_der);
         let cfg = spike::server_config_from_der(gen.cert_der, gen.key_der)?;
@@ -713,6 +847,7 @@ impl WtEndpoint {
                 limits,
                 rate_limits,
                 enable_0rtt,
+                share_process_0rtt_ticket_store,
             )?,
             hash,
         ))
@@ -726,6 +861,7 @@ impl WtEndpoint {
         limits: WasmLimits,
         rate_limits: WasmRateLimits,
         enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
     ) -> Result<Self, String> {
         limits.validate()?;
         rate_limits.validate()?;
@@ -747,7 +883,7 @@ impl WtEndpoint {
         )));
         let transport = Arc::new(tc);
         let ticket_store = if enable_0rtt {
-            shared_0rtt_ticket_store()
+            ticket_store_for_0rtt(share_process_0rtt_ticket_store)
         } else {
             Arc::new(InMemoryTicketStore::new(1))
         };
@@ -763,6 +899,11 @@ impl WtEndpoint {
                 Endpoint::new(ep_cfg, Some(Arc::new(server_config)), true, None),
                 None,
             )
+        } else if enable_0rtt && share_process_0rtt_ticket_store && client_crypto.is_none() {
+            // Accept-any loopback clients share one ClientConfig so reconnect
+            // across manager instances can offer has_0rtt from prior NST.
+            let client_config = shared_0rtt_accept_any_client_config()?;
+            (Endpoint::new(ep_cfg, None, true, None), Some(client_config))
         } else {
             let mut crypto = match client_crypto {
                 Some(crypto) => crypto,
@@ -787,6 +928,7 @@ impl WtEndpoint {
             next_id: 1,
             stream_index: HashMap::new(),
             rev_index: HashMap::new(),
+            stream_sessions: HashMap::new(),
             paused: HashSet::new(),
             half_done: HashMap::new(),
             next_stream: 1,
@@ -804,6 +946,8 @@ impl WtEndpoint {
             idle_timeout_ms,
             wt_max_sessions: WT_MAX_SESSIONS_DEFAULT,
             enable_0rtt,
+            nst_flush_remaining: HashMap::new(),
+            session_closed_count: 0,
             qpack_settings: h3::QpackLocalSettings::disabled(),
             last_error: None,
         })
@@ -842,6 +986,8 @@ impl WtEndpoint {
         self.conns.insert(handle, conn);
         let mut session = Session::default();
         session.qpack_decoder = h3::QpackDecoder::new(&self.qpack_settings);
+        let enc_cap = usize::try_from(self.qpack_settings.max_table_capacity).unwrap_or(0);
+        session.qpack_encoder = h3::QpackEncoder::new(enc_cap);
         authority.clone_into(&mut session.authority);
         session.connect_deadline =
             Some(now + std::time::Duration::from_millis(self.handshake_timeout_ms));
@@ -975,6 +1121,11 @@ impl WtEndpoint {
     pub fn governor_snapshot_json(&self) -> String {
         let snapshot = self.governor.snapshot(0, None);
         let rate_limit_snapshot: RateLimitSnapshot = self.rate_limiter.snapshot();
+        let wt_sessions_active: u64 = self
+            .sessions
+            .values()
+            .map(|s| s.active_wt_count() as u64)
+            .sum();
         serde_json::json!({
             "sessionsActive": snapshot.sessions_active,
             "handshakesInFlight": snapshot.handshakes_in_flight,
@@ -987,8 +1138,19 @@ impl WtEndpoint {
             "rateLimitedDatagramIngressCount": rate_limit_snapshot.rate_limited_datagram_ingress_count,
             "handshakeTimeoutMs": self.handshake_timeout_ms,
             "idleTimeoutMs": self.idle_timeout_ms,
+            "wtSessionsActive": wt_sessions_active,
+            "sessionClosedCount": self.session_closed_count,
         })
         .to_string()
+    }
+
+    fn push_session_closed(&mut self, conn: u32, session_id: u64, code: u32) {
+        self.session_closed_count = self.session_closed_count.saturating_add(1);
+        self.push_event(WtEvent::SessionClosed {
+            conn,
+            session_id,
+            code,
+        });
     }
 
     /// The configured peer address (single-server target for clients, or the
@@ -1032,6 +1194,9 @@ impl WtEndpoint {
                             self.conns.insert(handle, conn);
                             let mut wt_session = Session::default();
                             wt_session.qpack_decoder = h3::QpackDecoder::new(&self.qpack_settings);
+                            let enc_cap = usize::try_from(self.qpack_settings.max_table_capacity)
+                                .unwrap_or(0);
+                            wt_session.qpack_encoder = h3::QpackEncoder::new(enc_cap);
                             self.sessions.insert(handle, wt_session);
                             if self.is_server {
                                 if let Err(err) =
@@ -1131,6 +1296,11 @@ impl WtEndpoint {
                     };
                     self.push_event(WtEvent::Connected { conn: id });
                     self.on_connected(h);
+                    if self.enable_0rtt {
+                        // Match ticket_store unit harness: keep polling after
+                        // Connected so NewSessionTicket can land in the store.
+                        self.nst_flush_remaining.insert(h, 64);
+                    }
                 }
                 QuicEvent::Stream(StreamEvent::Opened { dir }) => {
                     self.accept_streams(h, dir);
@@ -1308,22 +1478,38 @@ impl WtEndpoint {
                 let mut b = Vec::new();
                 crate::varint::encode(st, &mut b);
                 let _ = conn.send_stream(id).write(&b);
-                if st == h3::stream_type::QPACK_DECODER {
-                    if let Some(s) = self.sessions.get_mut(&h) {
+                if let Some(s) = self.sessions.get_mut(&h) {
+                    if st == h3::stream_type::QPACK_DECODER {
                         s.qpack_decoder_send = Some(id);
+                    } else if st == h3::stream_type::QPACK_ENCODER {
+                        s.qpack_encoder_send = Some(id);
                     }
                 }
             }
         }
         if !self.is_server {
-            if let Some(bidi) = conn.streams().open(Dir::Bi) {
+            if let Some(bidi) = self
+                .conns
+                .get_mut(&h)
+                .and_then(|c| c.streams().open(Dir::Bi))
+            {
                 let authority = self
                     .sessions
                     .get(&h)
                     .map(|s| s.authority.clone())
                     .unwrap_or_default();
-                let req = h3::encode_connect_request(&authority, "/");
-                let _ = conn.send_stream(bidi).write(&req);
+                let encoded = self
+                    .sessions
+                    .get_mut(&h)
+                    .and_then(|s| {
+                        h3::encode_connect_request_with(&mut s.qpack_encoder, &authority, "/").ok()
+                    })
+                    .unwrap_or_else(|| h3::EncodedHeaders {
+                        headers_frame: h3::encode_connect_request(&authority, "/"),
+                        encoder_stream: Vec::new(),
+                        ric: 0,
+                    });
+                self.write_encoded_headers(h, bidi, encoded);
                 if let Some(s) = self.sessions.get_mut(&h) {
                     s.connect_stream = Some(bidi);
                     s.connect_self_opened = true;
@@ -1346,6 +1532,7 @@ impl WtEndpoint {
                     sid_read: false,
                     wt_session_id: None,
                     handle: None,
+                    connect_admitted: false,
                     buf: Vec::new(),
                 });
             }
@@ -1462,12 +1649,32 @@ impl WtEndpoint {
                     s.extra_sessions.remove(&id);
                 }
                 if let Some(&conn) = self.handle_to_id.get(&h) {
-                    self.push_event(WtEvent::SessionClosed {
-                        conn,
-                        session_id: u64::from(id),
-                        code: 0,
-                    });
+                    self.push_session_closed(conn, u64::from(id), 0);
                 }
+            }
+            return;
+        }
+
+        // Client secondary CONNECT already latched into extra_sessions.
+        let is_extra_self = self
+            .sessions
+            .get(&h)
+            .is_some_and(|s| s.connect_self_opened && s.extra_sessions.contains(&id));
+        if is_extra_self {
+            let mut final_outcome = ReadOutcome::Open;
+            for _ in 0..MAX_READ_BATCHES_PER_PUMP {
+                let mut data = Vec::new();
+                let outcome =
+                    read_stream(self.conns.get_mut(&h), id, &mut data, PROTOCOL_READ_CHUNK);
+                let made_progress = !data.is_empty();
+                // Post-200 CONNECT bytes are ignored; we only care about FIN/reset.
+                final_outcome = outcome;
+                if should_stop_read_batch(outcome == ReadOutcome::Open, made_progress) {
+                    break;
+                }
+            }
+            if matches!(final_outcome, ReadOutcome::Finished | ReadOutcome::Reset(_)) {
+                self.on_connect_stream_ended(h, id, false);
             }
             return;
         }
@@ -1634,11 +1841,7 @@ impl WtEndpoint {
             .get_mut(&h)
             .is_some_and(|s| s.extra_sessions.remove(&id));
         if removed {
-            self.push_event(WtEvent::SessionClosed {
-                conn,
-                session_id: u64::from(id),
-                code: 0,
-            });
+            self.push_session_closed(conn, u64::from(id), 0);
         }
     }
 
@@ -1710,10 +1913,11 @@ impl WtEndpoint {
     }
 
     /// Insert a WT stream handle <-> (connection, quinn stream id) mapping into
-    /// both the forward and reverse indexes.
-    fn index_insert(&mut self, handle: u32, h: ConnectionHandle, sid: StreamId) {
+    /// both the forward and reverse indexes, and record its session id.
+    fn index_insert(&mut self, handle: u32, h: ConnectionHandle, sid: StreamId, session_id: u64) {
         self.stream_index.insert(handle, (h, sid));
         self.rev_index.insert((h, sid), handle);
+        self.stream_sessions.insert(handle, session_id);
     }
 
     /// Remove a WT stream handle from both indexes.
@@ -1721,6 +1925,7 @@ impl WtEndpoint {
         if let Some((h, sid)) = self.stream_index.remove(&handle) {
             self.rev_index.remove(&(h, sid));
         }
+        self.stream_sessions.remove(&handle);
     }
 
     /// Resolve a quinn StreamId to the WT stream handle it is surfaced as (O(1)).
@@ -1870,6 +2075,9 @@ impl WtEndpoint {
             };
             // Snapshot known WT session ids before borrowing `in_streams` mutably.
             let known_session_ids: HashSet<u64> = s.all_connect_streams().map(u64::from).collect();
+            let unlatched_connects = count_unlatched_connect_streams(s);
+            let active_wt = s.active_wt_count();
+            let connect_cap = self.wt_max_sessions.max(1) as usize;
             let Some(st) = s.in_streams.get_mut(&id) else {
                 return;
             };
@@ -1898,7 +2106,44 @@ impl WtEndpoint {
                         Route::Control
                     }
                     PeerStreamClass::ServerConnect => {
-                        // Bytes stay in this stream's OWN buf; parsed per-stream.
+                        // Admit once: cap unlatched CONNECTs + StreamOpen rate limit.
+                        // Reject early with RESET so storms cannot buffer up to
+                        // MAX_H3_FRAME_SIZE per stream.
+                        if !st.connect_admitted {
+                            let occupied = unlatched_connects + active_wt;
+                            if occupied >= connect_cap {
+                                st.buf.clear();
+                                break 'route Route::RejectWt {
+                                    error: "E_LIMIT_EXCEEDED: unlatched CONNECT admission cap"
+                                        .to_string(),
+                                    bidi: true,
+                                };
+                            }
+                            if self.is_server {
+                                if let Some(&conn_id) = self.handle_to_id.get(&h) {
+                                    if let Err(err) = self.rate_limiter.check_connection(
+                                        now,
+                                        conn_id,
+                                        RateLimitDimension::StreamOpen,
+                                    ) {
+                                        st.buf.clear();
+                                        break 'route Route::RejectWt {
+                                            error: err,
+                                            bidi: true,
+                                        };
+                                    }
+                                }
+                            }
+                            st.connect_admitted = true;
+                        }
+                        if st.buf.len() > MAX_H3_FRAME_SIZE as usize {
+                            st.buf.clear();
+                            break 'route Route::RejectWt {
+                                error: "E_LIMIT_EXCEEDED: CONNECT request buffer exceeded"
+                                    .to_string(),
+                                bidi: true,
+                            };
+                        }
                         Route::ServerConnect { id }
                     }
                     PeerStreamClass::QpackEncoder => {
@@ -1986,6 +2231,7 @@ impl WtEndpoint {
                                 // index fields directly.
                                 self.stream_index.insert(handle, (h, id));
                                 self.rev_index.insert((h, id), handle);
+                                self.stream_sessions.insert(handle, session_id);
                                 self.stream_reservations.insert(handle, reservation);
                                 // Peer-opened uni has no send half on our side.
                                 self.half_done
@@ -2153,7 +2399,7 @@ impl WtEndpoint {
         }
     }
 
-    /// Consume peer decoder-stream ACKs / ICI (outbound inserts stay literal today).
+    /// Consume peer decoder-stream ACKs / ICI and advance encoder Known Received Count.
     fn parse_qpack_decoder(&mut self, h: ConnectionHandle) {
         let err = {
             let Some(s) = self.sessions.get_mut(&h) else {
@@ -2166,8 +2412,16 @@ impl WtEndpoint {
                 ))
             } else {
                 match h3::feed_decoder_stream(&s.qpack_decoder_rx) {
-                    Ok((n, _)) => {
+                    Ok((n, ici_delta, section_acks)) => {
                         s.qpack_decoder_rx.drain(..n);
+                        if ici_delta > 0 {
+                            s.qpack_encoder.note_peer_ici(ici_delta);
+                        }
+                        for sid in section_acks {
+                            if let Some(ric) = s.pending_section_ric.remove(&sid) {
+                                s.qpack_encoder.note_section_ack(ric);
+                            }
+                        }
                         None
                     }
                     Err(_) => Some((
@@ -2180,6 +2434,57 @@ impl WtEndpoint {
         if let Some((code, reason)) = err {
             self.close_conn_protocol_error(h, code, reason);
         }
+    }
+
+    /// Write optional encoder-stream inserts then HEADERS; track RIC for section-ack → KRC.
+    fn write_encoded_headers(
+        &mut self,
+        h: ConnectionHandle,
+        stream_id: StreamId,
+        encoded: h3::EncodedHeaders,
+    ) {
+        if !encoded.encoder_stream.is_empty() {
+            if let Some(enc_sid) = self.sessions.get(&h).and_then(|s| s.qpack_encoder_send) {
+                if let Some(conn) = self.conns.get_mut(&h) {
+                    let _ = conn.send_stream(enc_sid).write(&encoded.encoder_stream);
+                }
+            }
+        }
+        if let Some(conn) = self.conns.get_mut(&h) {
+            let _ = conn.send_stream(stream_id).write(&encoded.headers_frame);
+        }
+        if encoded.ric > 0 {
+            if let Some(s) = self.sessions.get_mut(&h) {
+                s.pending_section_ric
+                    .insert(u64::from(stream_id), encoded.ric);
+            }
+        }
+    }
+
+    fn encode_status_for_session(
+        &mut self,
+        h: ConnectionHandle,
+        status: &str,
+    ) -> h3::EncodedHeaders {
+        self.sessions
+            .get_mut(&h)
+            .and_then(|s| h3::encode_status_response_with(&mut s.qpack_encoder, status).ok())
+            .unwrap_or_else(|| h3::EncodedHeaders {
+                headers_frame: h3::encode_status_response(status),
+                encoder_stream: Vec::new(),
+                ric: 0,
+            })
+    }
+
+    fn encode_connect_ok_for_session(&mut self, h: ConnectionHandle) -> h3::EncodedHeaders {
+        self.sessions
+            .get_mut(&h)
+            .and_then(|s| h3::encode_connect_response_ok_with(&mut s.qpack_encoder).ok())
+            .unwrap_or_else(|| h3::EncodedHeaders {
+                headers_frame: h3::encode_connect_response_ok(),
+                encoder_stream: Vec::new(),
+                ric: 0,
+            })
     }
 
     fn emit_qpack_section_ack(&mut self, h: ConnectionHandle, stream_id: StreamId, ric: u64) {
@@ -2219,6 +2524,14 @@ impl WtEndpoint {
             .unwrap_or(false)
         {
             self.parse_client_connect(h);
+        }
+        let pending_ids: Vec<StreamId> = self
+            .sessions
+            .get(&h)
+            .map(|s| s.pending_client_connects.keys().copied().collect())
+            .unwrap_or_default();
+        for id in pending_ids {
+            self.parse_pending_client_connect(h, id);
         }
     }
 
@@ -2313,9 +2626,9 @@ impl WtEndpoint {
 
                     let is_connect = headers_are_webtransport_connect(&headers);
                     if !is_connect {
+                        let resp = self.encode_status_for_session(h, "404");
+                        self.write_encoded_headers(h, stream_id, resp);
                         if let Some(conn) = self.conns.get_mut(&h) {
-                            let resp = h3::encode_status_response("404");
-                            let _ = conn.send_stream(stream_id).write(&resp);
                             let _ = conn.send_stream(stream_id).finish();
                         }
                         continue;
@@ -2337,18 +2650,16 @@ impl WtEndpoint {
                         .unwrap_or(0);
                     if active >= self.wt_max_sessions as usize {
                         self.set_last_error("E_LIMIT_EXCEEDED: SETTINGS_WT_MAX_SESSIONS exceeded");
+                        let resp = self.encode_status_for_session(h, "429");
+                        self.write_encoded_headers(h, stream_id, resp);
                         if let Some(conn) = self.conns.get_mut(&h) {
-                            let resp = h3::encode_status_response("429");
-                            let _ = conn.send_stream(stream_id).write(&resp);
                             let _ = conn.send_stream(stream_id).finish();
                         }
                         continue;
                     }
 
-                    if let Some(conn) = self.conns.get_mut(&h) {
-                        let resp = h3::encode_connect_response_ok();
-                        let _ = conn.send_stream(stream_id).write(&resp);
-                    }
+                    let resp = self.encode_connect_ok_for_session(h);
+                    self.write_encoded_headers(h, stream_id, resp);
                     if let Some(s) = self.sessions.get_mut(&h) {
                         if !s.established || s.connect_stream.is_none() {
                             s.connect_stream = Some(stream_id);
@@ -2587,11 +2898,7 @@ impl WtEndpoint {
                     if let Some(s) = self.sessions.get_mut(&h) {
                         s.pending_client_connects.remove(&stream_id);
                     }
-                    self.push_event(WtEvent::SessionClosed {
-                        conn: conn_id,
-                        session_id: u64::from(stream_id),
-                        code: 0,
-                    });
+                    self.push_session_closed(conn_id, u64::from(stream_id), 0);
                     return;
                 }
             }
@@ -2767,7 +3074,7 @@ impl WtEndpoint {
         let _ = conn.send_stream(sid).write(&header);
 
         self.next_stream = next_stream;
-        self.index_insert(handle, h, sid);
+        self.index_insert(handle, h, sid, session_id);
         // Self-opened uni has no recv half on our side.
         self.half_done
             .insert(handle, if bidi { 0 } else { HALF_RECV });
@@ -2822,14 +3129,24 @@ impl WtEndpoint {
             self.set_last_error("E_LIMIT_EXCEEDED: stream capacity unavailable");
             return -1;
         };
-        let req = h3::encode_connect_request(&authority, "/");
-        let _ = conn.send_stream(bidi).write(&req);
+        let encoded = self
+            .sessions
+            .get_mut(&h)
+            .and_then(|s| {
+                h3::encode_connect_request_with(&mut s.qpack_encoder, &authority, "/").ok()
+            })
+            .unwrap_or_else(|| h3::EncodedHeaders {
+                headers_frame: h3::encode_connect_request(&authority, "/"),
+                encoder_stream: Vec::new(),
+                ric: 0,
+            });
+        self.write_encoded_headers(h, bidi, encoded);
         if let Some(s) = self.sessions.get_mut(&h) {
             s.pending_client_connects.insert(
                 bidi,
                 PendingClientConnect {
                     rx: Vec::new(),
-                    _deadline: Some(
+                    deadline: Some(
                         now + std::time::Duration::from_millis(self.handshake_timeout_ms),
                     ),
                 },
@@ -2870,15 +3187,39 @@ impl WtEndpoint {
             let _ = conn.send_stream(sid).reset(VarInt::from_u32(code));
             let _ = conn.recv_stream(sid).stop(VarInt::from_u32(code));
         }
+        // Reset/stop every WT stream demuxed to this session.
+        let session_streams: Vec<(u32, StreamId)> = self
+            .stream_index
+            .iter()
+            .filter(|(handle, &(sh, _))| {
+                sh == h && self.stream_sessions.get(handle) == Some(&session_id)
+            })
+            .map(|(handle, &(_, quic_sid))| (*handle, quic_sid))
+            .collect();
+        for (handle, quic_sid) in session_streams {
+            if let Some(conn) = self.conns.get_mut(&h) {
+                let _ = conn.send_stream(quic_sid).reset(VarInt::from_u32(code));
+                let _ = conn.recv_stream(quic_sid).stop(VarInt::from_u32(code));
+            }
+            if let Some(s) = self.sessions.get_mut(&h) {
+                s.self_bidi.remove(&quic_sid);
+                s.in_streams.remove(&quic_sid);
+            }
+            self.paused.remove(&handle);
+            self.half_done.remove(&handle);
+            self.stream_reservations.remove(&handle);
+            self.index_remove(handle);
+            self.push_event(WtEvent::StreamReset {
+                conn: conn_id,
+                stream: handle,
+                code,
+            });
+        }
         if let Some(s) = self.sessions.get_mut(&h) {
             s.extra_sessions.remove(&sid);
             s.pending_client_connects.remove(&sid);
         }
-        self.push_event(WtEvent::SessionClosed {
-            conn: conn_id,
-            session_id,
-            code,
-        });
+        self.push_session_closed(conn_id, session_id, code);
         true
     }
 
@@ -2941,6 +3282,25 @@ impl WtEndpoint {
     /// Drain outbound QUIC datagrams for all connections into `out`, each paired
     /// with the destination address quinn-proto chose for the packet.
     pub fn poll_transmits(&mut self, now: Instant, out: &mut Vec<(Vec<u8>, SocketAddr)>) {
+        // While NST flush is pending, drive connections so crypto tickets are
+        // emitted even when the UDP loop is quiet after SessionEstablished.
+        if self.enable_0rtt && !self.nst_flush_remaining.is_empty() {
+            let flush_handles: Vec<ConnectionHandle> =
+                self.nst_flush_remaining.keys().copied().collect();
+            for h in flush_handles {
+                if !self.conns.contains_key(&h) {
+                    self.nst_flush_remaining.remove(&h);
+                    continue;
+                }
+                self.drive(h, now);
+                if let Some(left) = self.nst_flush_remaining.get_mut(&h) {
+                    *left = left.saturating_sub(1);
+                    if *left == 0 {
+                        self.nst_flush_remaining.remove(&h);
+                    }
+                }
+            }
+        }
         out.append(&mut self.endpoint_tx);
         let handles: Vec<ConnectionHandle> = self.conns.keys().copied().collect();
         for h in handles {
@@ -2963,6 +3323,11 @@ impl WtEndpoint {
         for s in self.sessions.values() {
             if should_track_connect_deadline(s.established, s.connect_closed) {
                 if let Some(t) = s.connect_deadline {
+                    soonest = sooner_deadline(soonest, t);
+                }
+            }
+            for pending in s.pending_client_connects.values() {
+                if let Some(t) = pending.deadline {
                     soonest = sooner_deadline(soonest, t);
                 }
             }
@@ -2997,6 +3362,37 @@ impl WtEndpoint {
         for h in expired {
             self.set_last_error("E_HANDSHAKE_TIMEOUT: WebTransport CONNECT timed out");
             self.close_session_on_connect_end(h);
+        }
+        // Fail secondary client CONNECTs whose deadlines elapsed (session-only).
+        let mut expired_pending: Vec<(ConnectionHandle, u32, u64)> = Vec::new();
+        for (&h, s) in &self.sessions {
+            let Some(&conn_id) = self.handle_to_id.get(&h) else {
+                continue;
+            };
+            for (sid, pending) in &s.pending_client_connects {
+                if pending.deadline.is_some_and(|d| d <= now) {
+                    expired_pending.push((h, conn_id, u64::from(*sid)));
+                }
+            }
+        }
+        for (h, conn_id, session_id) in expired_pending {
+            self.set_last_error("E_HANDSHAKE_TIMEOUT: WebTransport CONNECT timed out");
+            let Some(sid) = self
+                .sessions
+                .get(&h)
+                .and_then(|s| s.resolve_wt_session(session_id))
+            else {
+                continue;
+            };
+            if let Some(conn) = self.conns.get_mut(&h) {
+                let _ = conn.send_stream(sid).reset(VarInt::from_u32(0));
+                let _ = conn.recv_stream(sid).stop(VarInt::from_u32(0));
+            }
+            if let Some(s) = self.sessions.get_mut(&h) {
+                s.pending_client_connects.remove(&sid);
+                s.extra_sessions.remove(&sid);
+            }
+            self.push_session_closed(conn_id, session_id, 0);
         }
         self.drive_all(now);
     }

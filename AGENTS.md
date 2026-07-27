@@ -109,13 +109,14 @@ Per-IP token buckets (defaults)
 
 ## Learned User Preferences
 - Prefer `bunx` over `npx` for running package binaries.
-- Keep one scoped logical change per commit; do not commit planning/instruction files (`INSTRUCTIONS_CURRENT_PHASE.md`, `Task.md`, `PRODUCTION_PLAN.md`) unless explicitly asked.
+- Keep one scoped logical change per commit; do not commit planning/instruction files (`INSTRUCTIONS_CURRENT_PHASE.md`, `Task.md`, `PRODUCTION_PLAN.md`, `PARITY_PLAN.md`, `POOLING_PLAN.md`, and similar plan markdown) unless explicitly asked.
 - When told to continue until all phases or subphases are done, keep going without pausing for per-step confirmation; partial completion is not enough.
 - Prefer project markdown docs under `docs/` rather than the repo root.
 - Prefer local Chrome on this machine for browser/IWA verification when available rather than assuming Chromium/Playwright is missing.
 - Rust native code must have its own unit-test coverage, separate from TypeScript tests, during development.
 - After scoped native/coverage refactors, run an auto-review pass and report before continuing related work.
 - Target production-grade 1.0 for both native and WASM; WASM 1.0 requires protocol expansion (multi-session, 0-RTT, dynamic QPACK) plus facade/API parity with native, not evidence-hardening alone.
+- When implementing an attached plan, do not edit the plan file itself; execute the plan as specified.
 
 ## Learned Workspace Facts
 - Active 1.0 production work is on branch `feat/wasm-1.0` in the worktree at `/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0` (not `release/1.0-hardening`).
@@ -126,3 +127,4 @@ Per-IP token buckets (defaults)
 - Keep floored Rust logic modules (`session.rs`, `server.rs`) free of NAPI Env wrappers; put bindings in `*_napi.rs` / `server_spawn.rs` so llvm-cov floors stay honest.
 - Native llvm-cov floors (90% line / 90% function / 80% branch) apply to floored logic modules only; NAPI binding modules and `server_spawn` are intentionally outside those floors.
 - WASM (`crates/wasm/`) is a separate engine from native: sans-IO `quinn-proto` + hand-rolled H3/WT with JS-owned UDP I/O; native is napi + `wtransport` + Tokio.
+- Browser WASM networking for 1.0 is constrained to Chromium IWA + Direct Sockets; general browser-server outside that path is out of scope.

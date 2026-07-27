@@ -339,6 +339,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			onEstablished() {},
 			onDatagram() {},
 			onClosed() {},
+			onSessionClosed() {},
 			onStreamOpened() {},
 			onStreamData() {},
 			onStreamReset() {},
@@ -1087,7 +1088,9 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			}),
 		);
 		const session = manager.connectClient("localhost");
-		session._markEstablished();
+		// Remap pending → sessionId 0 so demuxed datagrams hit this session.
+		events.push(Uint8Array.of(2, 1, 0));
+		manager.endpoint.pump();
 		let retained: TestReservation | undefined;
 		session.onDatagram(
 			(_data, reservation) => {
@@ -1095,7 +1098,11 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			},
 			{ retainReservation: true },
 		);
-		events.push(new Uint8Array([3, 1, 0, 1]), new Uint8Array([3, 1, 0, 2]));
+		// tag DATAGRAM | conn=1 | sessionId=0 | len=0 | hostToken
+		events.push(
+			new Uint8Array([3, 1, 0, 0, 1]),
+			new Uint8Array([3, 1, 0, 0, 2]),
+		);
 
 		manager.endpoint.pump();
 		const closeInfo = await settlesPromptly(session.closed);
@@ -1189,7 +1196,11 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		datagramSession.onDatagram(() => {
 			datagramsDelivered += 1;
 		});
-		datagramEvents.push(new Uint8Array([3, 1, 1, 7, 2]));
+		// Establish then DATAGRAM: tag|conn|sid|len|payload|token
+		datagramEvents.push(
+			Uint8Array.of(2, 1, 0),
+			new Uint8Array([3, 1, 0, 1, 7, 2]),
+		);
 		datagramManager.endpoint.pump();
 		expect(datagramsDelivered).toBe(0);
 		expect(datagramTokens.has(2)).toBe(false);
@@ -1217,7 +1228,10 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		stream.onData((data) => {
 			streamBytesDelivered += data.length;
 		});
-		streamEvents.push(new Uint8Array([6, 1, 0, 0, 1, 9, 2]));
+		streamEvents.push(
+			Uint8Array.of(2, 1, 0),
+			new Uint8Array([6, 1, 0, 0, 1, 9, 2]),
+		);
 		streamManager.endpoint.pump();
 		expect(streamBytesDelivered).toBe(0);
 		expect(streamTokens.has(2)).toBe(false);
@@ -1295,11 +1309,13 @@ describe("wasm resource governor (Task 6 RED)", () => {
 				throw new Error("consumer failed");
 			});
 		});
-		// Uni incoming stream 9, then its fin'd payload carrying token 1. The
+		// Establish, then uni stream 9 + fin'd payload carrying token 1. The
 		// throwing callback must not skip the fin bookkeeping that releases the
 		// handle from the manager's stream map.
+		// STREAM_OPENED: tag|conn|sessionId|stream|bidi
 		events.push(
-			new Uint8Array([5, 1, 9, 0]),
+			Uint8Array.of(2, 1, 0),
+			new Uint8Array([5, 1, 0, 9, 0]),
 			new Uint8Array([6, 1, 9, 1, 1, 8, 1]),
 		);
 		manager.endpoint.pump();
@@ -1390,7 +1406,10 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			},
 			{ retainReservation: true },
 		);
-		datagramEvents.push(new Uint8Array([3, 1, 1, 7, 1]));
+		datagramEvents.push(
+			Uint8Array.of(2, 1, 0),
+			new Uint8Array([3, 1, 0, 1, 7, 1]),
+		);
 		datagramManager.endpoint.pump();
 		expect(datagramTokens.size).toBe(0);
 		expect(datagramManager.resourceSnapshot()).toMatchObject({
@@ -1422,7 +1441,8 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			);
 		});
 		streamEvents.push(
-			new Uint8Array([5, 1, 9, 1]),
+			Uint8Array.of(2, 1, 0),
+			new Uint8Array([5, 1, 0, 9, 1]),
 			new Uint8Array([6, 1, 9, 0, 1, 8, 1]),
 		);
 		streamManager.endpoint.pump();
@@ -1451,6 +1471,7 @@ describe("wasm resource governor (Task 6 RED)", () => {
 			const decoder = new TextDecoder();
 			let firstToken: number | undefined;
 			const received: string[] = [];
+			let sessionId = 0n;
 
 			const server = WasmEndpoint.create(
 				wasm,
@@ -1460,8 +1481,11 @@ describe("wasm resource governor (Task 6 RED)", () => {
 				"127.0.0.1:5544",
 				normalized,
 				{
-					onDatagram: (conn, data, token) => {
-						server.sendDatagram(conn, sessionId, data);
+					onEstablished: (_conn, sid) => {
+						sessionId = sid;
+					},
+					onDatagram: (conn, sid, data, token) => {
+						server.sendDatagram(conn, sid, data);
 						if (token) {
 							expect(server.releaseHostReservation(token)).toBe(true);
 						}
@@ -1478,10 +1502,11 @@ describe("wasm resource governor (Task 6 RED)", () => {
 				"127.0.0.1:4433",
 				normalized,
 				{
-					onEstablished: () => {
+					onEstablished: (_conn, sid) => {
 						established = true;
+						sessionId = sid;
 					},
-					onDatagram: (_conn, data, token) => {
+					onDatagram: (_conn, _sid, data, token) => {
 						received.push(decoder.decode(data));
 						if (firstToken === undefined && token) {
 							firstToken = token;

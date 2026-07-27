@@ -1,0 +1,16 @@
+{
+  "lane": 3,
+  "round": 2,
+  "verdict": "READY",
+  "note": "Late [Lane 3](84f75dda-8ba0-479d-afe9-a111c54eeefc) opens were pre-fix; is_extra_self FIN path + occupied admission are in tree.",
+  "findings": [
+    {"id": "L3-P1-pending-deadline", "severity": "P1", "status": "fixed"},
+    {"id": "L3-P1-qpack-pending-retry", "severity": "P1", "status": "fixed"},
+    {"id": "L3-P2-pending-max-sessions", "severity": "P2", "status": "fixed"},
+    {"id": "L3-P2-opensession-failfast", "severity": "P2", "status": "fixed"},
+    {"id": "L3-P1-client-extra-connect-fin", "severity": "P1", "status": "fixed", "summary": "is_extra_self branch emits SessionClosed on FIN/reset"},
+    {"id": "L3-P2-unlatched-ignores-latched", "severity": "P2", "status": "fixed", "summary": "occupied = unlatched + active_wt"},
+    {"id": "L3-P3-open-session-f64", "severity": "P3", "status": "invalidated"},
+    {"id": "L3-P3-sessionclosed-metrics", "severity": "P3", "status": "fixed"}
+  ]
+}

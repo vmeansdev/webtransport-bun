@@ -262,7 +262,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Foundation only (unit/fuzz paths). Product incomplete until decoder ACKs + opt-in SETTINGS>0 + wasm\u2194wasm evidence."
+			"notes": "Product surface: opt-in dynamic table applies peer ICI/section-acks to encoder KRC and indexes outbound CONNECT/status when capacity>0 (default capacity 0). Claim stays pending until commit-bound product evidence + candidate rebind."
 		},
 		{
 			"id": "wasm-multi-session",
@@ -278,7 +278,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Foundation only (ticket_store + loopback). Product incomplete until TicketStoreHost take-once + JS has0Rtt/accepted0Rtt + evidence."
+			"notes": "has0Rtt/accepted0Rtt + per-endpoint InMemoryTicketStore (opt-in shareProcess0RttTicketStore + shared ClientConfig). Product test asserts has0Rtt===true on shared-store reconnect. JS TicketStoreHost not bridged to rustls. Claim pending until candidate rebind."
 		},
 		{
 			"id": "wasm-facade-parity",

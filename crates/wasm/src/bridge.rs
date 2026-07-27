@@ -159,6 +159,14 @@ fn parse_enable_0rtt(parsed: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Opt-in process-shared 0-RTT ticket store (loopback). Default false = per-endpoint.
+fn parse_share_process_0rtt_ticket_store(parsed: &serde_json::Value) -> bool {
+    parsed
+        .get("shareProcess0RttTicketStore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Opt-in dynamic QPACK SETTINGS. Default disabled (0/0).
 /// `enableDynamicQpack: true` aliases `{4096, 16}`.
 fn parse_qpack_settings(parsed: &serde_json::Value) -> h3::QpackLocalSettings {
@@ -255,13 +263,15 @@ pub fn wt_new_endpoint_with_options(config_json: &str) -> String {
         return serde_json::json!({ "error": "accept-any client path unavailable" }).to_string();
     }
     let enable_0rtt = parse_enable_0rtt(&parsed);
-    let mut ep = match WtEndpoint::new_with_limits_rate_limits_and_0rtt(
+    let share_tickets = parse_share_process_0rtt_ticket_store(&parsed);
+    let mut ep = match WtEndpoint::new_with_limits_rate_limits_0rtt_and_ticket_share(
         is_server,
         addr,
         peer,
         limits,
         rate_limits,
         enable_0rtt,
+        share_tickets,
     ) {
         Ok(ep) => ep,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
@@ -374,7 +384,8 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
     let enable_0rtt = parse_enable_0rtt(&parsed);
-    match WtEndpoint::new_with_generated_cert_with_limits_rate_limits_and_0rtt(
+    let share_tickets = parse_share_process_0rtt_ticket_store(&parsed);
+    match WtEndpoint::new_with_generated_cert_with_limits_rate_limits_0rtt_and_ticket_share(
         peer,
         common_name,
         validity_days,
@@ -382,6 +393,7 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
         limits,
         rate_limits,
         enable_0rtt,
+        share_tickets,
     ) {
         Ok((mut ep, hash)) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);
@@ -455,12 +467,14 @@ pub fn wt_new_client_with_options(config_json: &str) -> String {
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
     let enable_0rtt = parse_enable_0rtt(&parsed);
-    match WtEndpoint::new_client_pinned_with_limits_rate_limits_and_0rtt(
+    let share_tickets = parse_share_process_0rtt_ticket_store(&parsed);
+    match WtEndpoint::new_client_pinned_with_limits_rate_limits_0rtt_and_ticket_share(
         peer,
         hashes,
         limits,
         rate_limits,
         enable_0rtt,
+        share_tickets,
     ) {
         Ok(mut ep) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);

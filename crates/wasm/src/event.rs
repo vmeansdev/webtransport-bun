@@ -1,4 +1,8 @@
 //! Events surfaced from the bridge to JS, plus a compact wire form for poll_event.
+//!
+//! Wire version 2 (see `PRODUCTION_BUILD.json` `eventWireVersion`): session_id on
+//! session-scoped events and `SessionClosed` tag 9. Hosts should treat a mismatch
+//! as a build/packaging error (no runtime negotiation this round).
 use crate::varint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

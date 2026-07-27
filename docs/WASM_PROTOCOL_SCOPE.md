@@ -11,9 +11,9 @@ requires, in addition to evidence gates:
 
 | Capability | 1.0 requirement | Claim id | Status |
 |---|---|---|---|
-| Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | product surface: decoder-stream ICI/section-ack emit before non-zero SETTINGS; opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); outbound CONNECT stays literal |
+| Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | product surface: opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); peer decoder ICI/section-ack applied to encoder KRC; indexed outbound CONNECT/status when capacity > 0; claim remains pending until commit-bound evidence |
 | Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | product surface landed: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
-| 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | product surface: `TicketStoreHost`/`MemoryTicketStoreHost` take-once, `has0Rtt`/`accepted0Rtt` exports, process-local shared store when `enable0Rtt: true` (default false); CONNECT/app policy waits for 1-RTT |
+| 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | partial: `has0Rtt`/`accepted0Rtt` exports + process-local Rust `InMemoryTicketStore` when `enable0Rtt: true` (default false); JS `TicketStoreHost` is **not** bridged to rustls yet (export-only / future durable host) |
 | Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | foundation/options work started; product-complete evidence pending |
 
 These are **1.0 requirements**, not permanent product omissions. Until each
@@ -24,9 +24,10 @@ capability is incomplete (do not treat unit-only foundations as GA).
 
 - HTTP/3 framing: control stream, SETTINGS, Extended CONNECT, HEADERS.
   Chromium-facing default advertises QPACK capacity **0** / blocked streams
-  **0** (literal-only). Opt-in dynamic table (capacity 4096 / blocked 16)
-  exists in code paths but is not product-complete until decoder-stream ACKs
-  and claim evidence land.
+  **0** (literal-only). Opt-in dynamic table emits decoder-stream ICI /
+  section-acks, applies peer ICI/section-acks to encoder Known Received Count,
+  and indexes outbound CONNECT/status when capacity > 0 — claim remains pending
+  until commit-bound product evidence.
 - WebTransport session establishment (Extended CONNECT → 200), datagrams
   (quarter-session-id framing), and uni/bidi streams.
 - Frame-size bound: a single buffered H3 control/CONNECT/HEADERS frame is

@@ -1,0 +1,13 @@
+{
+  "lane": 1,
+  "agent": "69a676d0-ff3d-40b8-b718-ef0e8beebb0a",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "SEC-01", "severity": "P1", "summary": "pending CONNECT bypasses WT_MAX_SESSIONS + unused deadline", "status": "fixed-in-l3-batch"},
+    {"id": "SEC-02", "severity": "P2", "summary": "process-global shared 0-RTT ticket store"},
+    {"id": "SEC-03", "severity": "P2", "summary": "TicketStoreHost not on TLS path"},
+    {"id": "SEC-04", "severity": "P2", "summary": "extra CONNECT not rate-limited before reject"},
+    {"id": "SEC-05", "severity": "P3", "summary": "f64 open_session + throwing requireSafeSessionId"},
+    {"id": "SEC-06", "severity": "P3", "summary": "unknown SESSION_CLOSED silently ignored"}
+  ]
+}

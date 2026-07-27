@@ -17,12 +17,29 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 - Keep per-session queued bytes low (<= 2 MiB).
 - Prefer backpressure over drops; enable drop policy only for datagrams if you accept loss.
 
+## WASM footguns (multi-session / 0-RTT / QPACK)
+
+- **Primary CONNECT close tears down the whole QUIC connection** (and every
+  extra WT session on it). Close only non-primary sessions when you want
+  siblings to survive (`SessionClosed`).
+- **Inbound host-queue pressure** can also close the entire QUIC connection
+  (budget is keyed by `conn`, not per WT `sessionId`).
+- **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless
+  you set `shareProcess0RttTicketStore: true` (loopback / same-process resume
+  only). JS `TicketStoreHost` is not yet wired into rustls.
+- **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
+  decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
+  index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.
+
 ## Enforced caps
 - Datagram size: maxDatagramSize (must respect negotiated QUIC max)
 - Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
+- WT sessions per QUIC connection: `wtMaxSessions` / `SETTINGS_WT_MAX_SESSIONS`
+  (pending client CONNECTs count toward the cap)
 
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive
+- wasm: wtSessionsActive, sessionClosedCount (governor snapshot)
 - queuedBytesGlobal
 - datagramsDropped
 - backpressureTimeoutCount

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { connectWasm, createWasmServer } from "../src/backend.js";
+import {
+	connectWasm,
+	createWasmServer,
+	normalizeWasmEndpointOptions,
+} from "../src/backend.js";
 import { MemoryTicketStoreHost } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
@@ -7,6 +11,27 @@ import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 const wasm = wasmAvailable
 	? await loadWasmModule()
 	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
+
+async function withDeadline<T>(
+	promise: Promise<T>,
+	ms: number,
+	label: string,
+): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<T>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`${label} timed out after ${ms}ms`)),
+					ms,
+				);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
 
 describe("wasm 0-RTT product surface", () => {
 	test("MemoryTicketStoreHost take-once rejects replay", async () => {
@@ -16,6 +41,14 @@ describe("wasm 0-RTT product surface", () => {
 		expect(first).toEqual(new Uint8Array([1, 2, 3]));
 		expect(await store.take("k")).toBeNull();
 		expect(await store.get("k")).toBeNull();
+	});
+
+	test("Chromium-safe defaults omit enable0Rtt and QPACK fields", () => {
+		const n = normalizeWasmEndpointOptions({});
+		expect(n.enable0Rtt).toBeUndefined();
+		expect(n.shareProcess0RttTicketStore).toBeUndefined();
+		expect(n.qpackMaxTableCapacity).toBeUndefined();
+		expect(n.enableDynamicQpack).toBeUndefined();
 	});
 
 	test.skipIf(!wasmAvailable)(
@@ -38,7 +71,7 @@ describe("wasm 0-RTT product surface", () => {
 				"127.0.0.1:4433",
 				{ enable0Rtt: false },
 			);
-			await session.ready;
+			await withDeadline(session.ready, 5_000, "session.ready");
 			expect(manager.endpoint.enable0Rtt()).toBe(false);
 			expect(session.has0Rtt).toBe(false);
 			expect(session.accepted0Rtt).toBe(false);
@@ -48,9 +81,13 @@ describe("wasm 0-RTT product surface", () => {
 	);
 
 	test.skipIf(!wasmAvailable)(
-		"enable0Rtt true + shared process store can resume",
+		"enable0Rtt + shareProcess0RttTicketStore yields has0Rtt on reconnect",
 		async () => {
 			const relay = new InMemoryRelay();
+			const shared = {
+				enable0Rtt: true,
+				shareProcess0RttTicketStore: true,
+			} as const;
 			const server = createWasmServer(
 				wasm,
 				relay.endpoint({ address: "127.0.0.1", port: 4433 }),
@@ -61,7 +98,7 @@ describe("wasm 0-RTT product surface", () => {
 				},
 				"127.0.0.1:4433",
 				"127.0.0.1:5544",
-				{ enable0Rtt: true },
+				shared,
 			);
 			expect(server.endpoint.enable0Rtt()).toBe(true);
 
@@ -71,9 +108,17 @@ describe("wasm 0-RTT product surface", () => {
 				"localhost",
 				"127.0.0.1:5544",
 				"127.0.0.1:4433",
-				{ enable0Rtt: true },
+				shared,
 			);
-			await first.session.ready;
+			await withDeadline(first.session.ready, 5_000, "first.ready");
+			expect(first.manager.endpoint.enable0Rtt()).toBe(true);
+			expect(first.session.has0Rtt).toBe(false);
+			// Flush NewSessionTicket into the shared store (Rust poll_transmits NST rounds).
+			for (let i = 0; i < 100; i++) {
+				server.endpoint.pump();
+				first.manager.endpoint.pump();
+				await Bun.sleep(5);
+			}
 			first.session.close();
 			first.manager.close();
 
@@ -83,13 +128,11 @@ describe("wasm 0-RTT product surface", () => {
 				"localhost",
 				"127.0.0.1:5545",
 				"127.0.0.1:4433",
-				{ enable0Rtt: true },
+				shared,
 			);
-			await second.session.ready;
-			// After a prior handshake into the shared store, a later connect may
-			// offer 0-RTT (has0Rtt). Acceptance is best-effort depending on timing.
-			expect(typeof second.session.has0Rtt).toBe("boolean");
-			expect(typeof second.session.accepted0Rtt).toBe("boolean");
+			await withDeadline(second.session.ready, 5_000, "second.ready");
+			expect(second.manager.endpoint.enable0Rtt()).toBe(true);
+			expect(second.session.has0Rtt).toBe(true);
 			second.manager.close();
 			server.close();
 		},
