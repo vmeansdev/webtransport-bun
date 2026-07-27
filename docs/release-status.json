@@ -168,7 +168,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Candidate advanced; prior 19acc30 evidence needs rebind on this commit."
+			"notes": "Local Chrome IWA proof green on 89b2cc2; claim flip awaits candidate rebind (artifact docs/release-evidence/89b2cc23549ea2dab50ed1474f247db5b6653606/iwa-direct-sockets.json)."
 		},
 		{
 			"id": "fault-matrix",
