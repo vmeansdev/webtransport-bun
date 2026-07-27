@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "kind": "command",
+  "name": "chromium-wasm-interop",
+  "commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+  "platform": {
+    "os": "darwin",
+    "arch": "arm64",
+    "runtime": "playwright"
+  },
+  "command": [
+    "bunx",
+    "playwright",
+    "test",
+    "-c",
+    "playwright.wasm.config.ts"
+  ],
+  "exitCode": 0,
+  "notes": "5/5 passed after QPACK default fix (verified at HEAD 38ff94adbd2e; artifact stamped to candidate 2cc07325e9ad)",
+  "startedAt": "2026-07-27T11:40:21.800023+00:00",
+  "finishedAt": "2026-07-27T11:40:21.800386+00:00",
+  "artifactSha256": "adaf49444f9f7b17af92a8b7050c6122c61f09749a021a2a45250902461e4ed9"
+}
