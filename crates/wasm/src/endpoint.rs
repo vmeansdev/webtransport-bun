@@ -225,6 +225,9 @@ pub struct WtEndpoint {
     /// Opt-in QUIC TLS 1.3 early data (0-RTT). When true, client/server rustls
     /// configs accept/offer early data with an [`InMemoryTicketStore`].
     enable_0rtt: bool,
+    /// Hot-path ticket store when `enable_0rtt` (shared or per-endpoint).
+    /// Retained so JS can dump/hydrate opaque client tickets across endpoints.
+    ticket_store: Option<Arc<InMemoryTicketStore>>,
     /// Remaining local drive rounds after Connected so NewSessionTicket can
     /// be emitted/consumed (mirrors the unit-harness 64-iteration flush).
     nst_flush_remaining: HashMap<ConnectionHandle, u8>,
@@ -883,14 +886,17 @@ impl WtEndpoint {
         )));
         let transport = Arc::new(tc);
         let ticket_store = if enable_0rtt {
-            ticket_store_for_0rtt(share_process_0rtt_ticket_store)
+            Some(ticket_store_for_0rtt(share_process_0rtt_ticket_store))
         } else {
-            Arc::new(InMemoryTicketStore::new(1))
+            None
         };
         let (inner, client_config) = if is_server {
             let mut cfg =
                 server_cfg.ok_or_else(|| "E_INTERNAL: server config required".to_string())?;
-            configure_server_early_data(&mut cfg, enable_0rtt, ticket_store);
+            let store = ticket_store
+                .clone()
+                .unwrap_or_else(|| Arc::new(InMemoryTicketStore::new(1)));
+            configure_server_early_data(&mut cfg, enable_0rtt, store);
             let qsc = quinn_proto::crypto::rustls::QuicServerConfig::try_from(cfg)
                 .map_err(|error| format!("E_INTERNAL: invalid QUIC server config: {error}"))?;
             let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
@@ -905,12 +911,17 @@ impl WtEndpoint {
             let client_config = shared_0rtt_accept_any_client_config()?;
             (Endpoint::new(ep_cfg, None, true, None), Some(client_config))
         } else {
+            // Clone pinned/accept-any crypto so verifier Arcs stay shared across
+            // endpoints (required for rustls compatible_config after hydrate).
             let mut crypto = match client_crypto {
                 Some(crypto) => crypto,
                 None => spike::client_crypto()
                     .map_err(|error| format!("E_INTERNAL: client crypto config: {error}"))?,
             };
-            configure_client_early_data(&mut crypto, enable_0rtt, ticket_store);
+            let store = ticket_store
+                .clone()
+                .unwrap_or_else(|| Arc::new(InMemoryTicketStore::new(1)));
+            configure_client_early_data(&mut crypto, enable_0rtt, store);
             let qcc = quinn_proto::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|error| format!("E_INTERNAL: invalid QUIC client config: {error}"))?;
             let mut client_config = ClientConfig::new(Arc::new(qcc));
@@ -946,6 +957,7 @@ impl WtEndpoint {
             idle_timeout_ms,
             wt_max_sessions: WT_MAX_SESSIONS_DEFAULT,
             enable_0rtt,
+            ticket_store,
             nst_flush_remaining: HashMap::new(),
             session_closed_count: 0,
             qpack_settings: h3::QpackLocalSettings::disabled(),
@@ -1031,6 +1043,20 @@ impl WtEndpoint {
     /// Whether this endpoint was built with `enable0Rtt` / early data enabled.
     pub fn enable_0rtt(&self) -> bool {
         self.enable_0rtt
+    }
+
+    /// Drain client TLS tickets for `server_name` into an opaque vault blob.
+    pub fn dump_client_ticket(&self, server_name: &str) -> Option<Vec<u8>> {
+        self.ticket_store
+            .as_ref()
+            .and_then(|store| store.export_client_tickets(server_name))
+    }
+
+    /// Hydrate client TLS tickets from an opaque vault blob before connect.
+    pub fn import_client_ticket(&self, server_name: &str, blob: &[u8]) -> bool {
+        self.ticket_store
+            .as_ref()
+            .is_some_and(|store| store.import_client_tickets(server_name, blob))
     }
 
     /// Local QPACK SETTINGS (advertised and used to bound the decoder).

@@ -13,7 +13,7 @@ requires, in addition to evidence gates:
 |---|---|---|---|
 | Dynamic QPACK | RFC 9204 dynamic table with hard caps | `wasm-dynamic-qpack` | **passed** on candidate: opt-in `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0); peer decoder ICI/section-ack applied to encoder KRC; indexed outbound CONNECT/status when capacity > 0 |
 | Multi-session | `SETTINGS_WT_MAX_SESSIONS > 1`, demux by session id | `wasm-multi-session` | **passed** on candidate: WtEvent `session_id` demux, session-scoped APIs, JS `(conn,sessionId)` map, `openSession`, SessionClosed vs ConnectionClosed; primary CONNECT close tears down QUIC |
-| 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | **passed** on candidate for process-local Rust ticket store + `has0Rtt`/`accepted0Rtt` when `enable0Rtt: true` (default false); JS `TicketStoreHost` is **not** bridged to rustls yet (export-only / future durable host) |
+| 0-RTT / early data | Session tickets + anti-replay | `wasm-0rtt` | **passed** on candidate for process-local Rust ticket store + `has0Rtt`/`accepted0Rtt` when `enable0Rtt: true` (default false); JS `TicketStoreHost` hydrate/dump bridges opaque process-local vault blobs (pinned-client resume without `shareProcess0RttTicketStore`); durable IndexedDB serialization remains out of scope |
 | Facade / API parity | W3C-shaped options + `E_*` parity with native | `wasm-facade-parity` | smoke **green** on product HEAD (`WasmClientArgs` 0-RTT/QPACK, session-map, wasm parity); claim flip at candidate rebind. Soft divergences: `allowPooling`/`waitUntilAvailable` accepted-not-implemented; `getStats` zeros |
 
 These are **1.0 requirements**, not permanent product omissions. Treat
@@ -43,8 +43,9 @@ These are **1.0 requirements**, not permanent product omissions. Treat
   flow control, retry / stateless reset, and the QUIC idle timeout. These are
   handled by quinn-proto and inherit its correctness and defaults. Early data
   (0-RTT) is wired here under `enable0Rtt` (`ticket_store.rs`);
-  `wasm-0rtt` is claim-passed for the Rust process-local store path — durable
-  JS `TicketStoreHost`→rustls bridging remains unfinished.
+  `wasm-0rtt` is claim-passed for the Rust process-local store path and the
+  JS `TicketStoreHost` hydrate/dump bridge (opaque in-process vault blobs).
+  Durable IndexedDB / cross-reload ticket serialization remains unfinished.
 
 ## Still out of 1.0 scope (non-goals)
 

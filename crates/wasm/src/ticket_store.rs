@@ -3,19 +3,23 @@
 //! Quinn-proto + rustls need a [`ClientSessionStore`] (client tickets) and a
 //! [`StoresServerSessions`] (server stateful tickets). This module owns both
 //! roles behind one in-memory type so Rust loopback tests can resume with
-//! early data today, while a future JS bridge can swap the maps for host-driven
-//! persistence (IndexedDB / OPFS) without pulling I/O into the protocol core.
+//! early data today. JS hosts hydrate/dump via opaque vault blobs
+//! ([`export_client_tickets`] / [`import_client_tickets`]) — durable IndexedDB
+//! serialization of rustls session values remains out of scope.
 //!
 //! Anti-replay (stateful path): server tickets are single-use via
 //! [`StoresServerSessions::take`]. See SECURITY.md § "WASM 0-RTT / early data".
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use rustls::client::ClientSessionStore;
 use rustls::pki_types::ServerName;
 use rustls::server::StoresServerSessions;
 use rustls::{client as rustls_client, NamedGroup};
+
+/// Opaque blob magic for process-local client-ticket vault entries (`WT0T`).
+const CLIENT_TICKET_BLOB_MAGIC: &[u8; 4] = b"WT0T";
 
 /// Bound TLS 1.3 tickets retained per server name (matches rustls handy cache).
 const MAX_TLS13_TICKETS_PER_SERVER: usize = 8;
@@ -86,12 +90,119 @@ impl InMemoryTicketStore {
         self.server.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// Drain all TLS 1.3 client tickets (+ kx hint) for `server_name` into an
+    /// opaque process-local vault blob for JS [`TicketStoreHost`] persistence.
+    ///
+    /// Full `Tls13ClientSessionValue` serialization is not public in rustls;
+    /// the blob is an in-process vault key (not durable across wasm reloads).
+    pub fn export_client_tickets(&self, server_name: &str) -> Option<Vec<u8>> {
+        let name = ServerName::try_from(server_name.to_string()).ok()?;
+        let mut map = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        let data = map.remove(&name)?;
+        let mut order = self.client_order.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(idx) = order.iter().position(|n| n == &name) {
+            order.remove(idx);
+        }
+        if data.tls13.is_empty() && data.kx_hint.is_none() {
+            return None;
+        }
+        Some(client_ticket_vault_put(ExportedClientTickets {
+            server_name: name,
+            kx_hint: data.kx_hint,
+            tls13: data.tls13.into_iter().collect(),
+        }))
+    }
+
+    /// Import opaque vault blob tickets into this store (hydrate before connect).
+    pub fn import_client_tickets(&self, server_name: &str, blob: &[u8]) -> bool {
+        let Ok(expected) = ServerName::try_from(server_name.to_string()) else {
+            return false;
+        };
+        let Some(id) = parse_client_ticket_blob_id(blob) else {
+            return false;
+        };
+        let Some(exported) = client_ticket_vault_take(id) else {
+            return false;
+        };
+        if exported.server_name != expected {
+            // Put back under the same id so the caller's blob stays valid.
+            client_ticket_vault_restore(id, exported);
+            return false;
+        }
+        if let Some(group) = exported.kx_hint {
+            self.set_kx_hint(exported.server_name.clone(), group);
+        }
+        for ticket in exported.tls13 {
+            self.insert_tls13_ticket(exported.server_name.clone(), ticket);
+        }
+        true
+    }
+
     fn touch_client_name(order: &mut VecDeque<ServerName<'static>>, name: &ServerName<'static>) {
         if let Some(idx) = order.iter().position(|n| n == name) {
             order.remove(idx);
         }
         order.push_back(name.clone());
     }
+}
+
+struct ExportedClientTickets {
+    server_name: ServerName<'static>,
+    kx_hint: Option<NamedGroup>,
+    tls13: Vec<rustls_client::Tls13ClientSessionValue>,
+}
+
+struct ClientTicketVault {
+    next_id: u64,
+    entries: HashMap<u64, ExportedClientTickets>,
+}
+
+fn client_ticket_vault() -> &'static Mutex<ClientTicketVault> {
+    static VAULT: OnceLock<Mutex<ClientTicketVault>> = OnceLock::new();
+    VAULT.get_or_init(|| {
+        Mutex::new(ClientTicketVault {
+            next_id: 1,
+            entries: HashMap::new(),
+        })
+    })
+}
+
+fn encode_client_ticket_blob_id(id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(CLIENT_TICKET_BLOB_MAGIC);
+    out.extend_from_slice(&id.to_le_bytes());
+    out
+}
+
+fn parse_client_ticket_blob_id(blob: &[u8]) -> Option<u64> {
+    if blob.len() != 12 || &blob[..4] != CLIENT_TICKET_BLOB_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(blob[4..12].try_into().ok()?))
+}
+
+fn client_ticket_vault_put(exported: ExportedClientTickets) -> Vec<u8> {
+    let mut vault = client_ticket_vault()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let id = vault.next_id;
+    vault.next_id = vault.next_id.saturating_add(1).max(1);
+    vault.entries.insert(id, exported);
+    encode_client_ticket_blob_id(id)
+}
+
+fn client_ticket_vault_restore(id: u64, exported: ExportedClientTickets) {
+    let mut vault = client_ticket_vault()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    vault.entries.insert(id, exported);
+}
+
+fn client_ticket_vault_take(id: u64) -> Option<ExportedClientTickets> {
+    let mut vault = client_ticket_vault()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    vault.entries.remove(&id)
 }
 
 impl ClientSessionStore for InMemoryTicketStore {
@@ -620,5 +731,31 @@ mod tests {
         );
         pair2.drive_until_connected(ch2).expect("hs2");
         assert!(!pair2.client_conns[&ch2].accepted_0rtt());
+    }
+
+    #[test]
+    fn export_import_client_tickets_round_trips_across_stores() {
+        let client_store = Arc::new(InMemoryTicketStore::new(64));
+        let server_store = Arc::new(InMemoryTicketStore::new(64));
+        let (server_cfg, client_cfg) =
+            configs_with_early_data(true, &[b"h3"], client_store.clone(), server_store.clone())
+                .expect("crypto");
+        let mut pair = Pair::new(server_cfg, client_cfg).expect("pair");
+        let ch1 = pair.begin_connect().expect("connect1");
+        pair.drive_until_connected(ch1).expect("handshake1");
+        assert!(client_store.client_ticket_count("localhost") > 0);
+        pair.close_client(ch1);
+
+        let blob = client_store
+            .export_client_tickets("localhost")
+            .expect("export");
+        assert_eq!(client_store.client_ticket_count("localhost"), 0);
+
+        // Fresh store + ClientConfig sharing the same crypto base would be
+        // required for quinn has_0rtt; here we only assert vault hydrate.
+        let hydrated = Arc::new(InMemoryTicketStore::new(64));
+        assert!(hydrated.import_client_tickets("localhost", &blob));
+        assert!(hydrated.client_ticket_count("localhost") > 0);
+        assert!(!hydrated.import_client_tickets("localhost", &blob));
     }
 }

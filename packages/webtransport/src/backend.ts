@@ -111,6 +111,11 @@ export type WasmEndpointOptions = {
 	qpackBlockedStreams?: number;
 	/** Alias for `{ qpackMaxTableCapacity: 4096, qpackBlockedStreams: 16 }`. */
 	enableDynamicQpack?: boolean;
+	/**
+	 * Optional JS host for 0-RTT ticket hydrate/dump across fresh endpoints.
+	 * Process-local opaque vault blobs only; durable IndexedDB is out of scope.
+	 */
+	ticketStore?: TicketStoreHost;
 };
 
 export type WasmNormalizedEndpointOptions = {
@@ -1033,6 +1038,7 @@ export class WasmTransportManager {
 	/** Transport the manager owns and closes on {@link close}, if any. */
 	private ownedTransport: UdpTransport | null = null;
 	readonly options: WasmNormalizedEndpointOptions;
+	readonly ticketStore: TicketStoreHost | null;
 	private hostReservations = new Set<ManagerHostReservation>();
 	private hostQueuedBytesGlobal = 0;
 	private hostQueuedBytesPerSession = new Map<number, number>();
@@ -1047,9 +1053,11 @@ export class WasmTransportManager {
 		onSession: ((session: WasmSession) => void) | null,
 		options: WasmNormalizedEndpointOptions,
 		makeEndpoint: (events: WasmSessionEvents) => WasmEndpoint,
+		ticketStore: TicketStoreHost | null = null,
 	) {
 		this.onSession = onSession;
 		this.options = options;
+		this.ticketStore = ticketStore;
 		const events: WasmSessionEvents = {
 			onEstablished: (conn, sessionId) => {
 				const pendingKey = sessionKey(conn, PENDING_SESSION_ID);
@@ -1363,28 +1371,34 @@ export class WasmTransportManager {
 		onSession: ((session: WasmSession) => void) | null,
 		options: WasmNormalizedEndpointOptions,
 		certHashesBase64?: string,
+		ticketStore: TicketStoreHost | null = null,
 	): WasmTransportManager {
 		const constructorOptions: WasmEndpointConstructorOptions = options;
-		return new WasmTransportManager(isServer, onSession, options, (events) =>
-			!isServer && certHashesBase64
-				? WasmEndpoint.createPinnedClient(
-						wasm,
-						udp,
-						addr,
-						peerAddr,
-						certHashesBase64,
-						constructorOptions,
-						events,
-					)
-				: WasmEndpoint.create(
-						wasm,
-						udp,
-						isServer,
-						addr,
-						peerAddr,
-						constructorOptions,
-						events,
-					),
+		return new WasmTransportManager(
+			isServer,
+			onSession,
+			options,
+			(events) =>
+				!isServer && certHashesBase64
+					? WasmEndpoint.createPinnedClient(
+							wasm,
+							udp,
+							addr,
+							peerAddr,
+							certHashesBase64,
+							constructorOptions,
+							events,
+						)
+					: WasmEndpoint.create(
+							wasm,
+							udp,
+							isServer,
+							addr,
+							peerAddr,
+							constructorOptions,
+							events,
+						),
+			ticketStore,
 		);
 	}
 
@@ -1502,6 +1516,29 @@ export class WasmTransportManager {
 			);
 		}
 		return this.ensureSession(conn, PENDING_SESSION_ID);
+	}
+
+	/**
+	 * Hydrate opaque client tickets from {@link ticketStore} before connect.
+	 * No-op when no host is configured or the key is empty.
+	 */
+	async hydrateTicketsFromHost(authority: string): Promise<boolean> {
+		if (!this.ticketStore || !this.options.enable0Rtt) return false;
+		const blob = await this.ticketStore.take(authority);
+		if (!blob || blob.length === 0) return false;
+		return this.endpoint.importClientTicket(authority, blob);
+	}
+
+	/**
+	 * Dump client tickets minted on this endpoint into {@link ticketStore}.
+	 * Call after NST flush (and before close) so a fresh endpoint can hydrate.
+	 */
+	async dumpTicketsToHost(authority: string): Promise<boolean> {
+		if (!this.ticketStore || !this.options.enable0Rtt) return false;
+		const blob = this.endpoint.dumpClientTicket(authority);
+		if (!blob || blob.length === 0) return false;
+		await this.ticketStore.put(authority, blob);
+		return true;
 	}
 
 	/** @internal Close one session; primary tears down QUIC, extras do not. */
@@ -1622,6 +1659,11 @@ export interface WasmConnectOptions {
 	qpackBlockedStreams?: number;
 	/** Alias for `{ qpackMaxTableCapacity: 4096, qpackBlockedStreams: 16 }`. */
 	enableDynamicQpack?: boolean;
+	/**
+	 * Optional JS host for 0-RTT ticket hydrate/dump across fresh endpoints.
+	 * Process-local opaque vault blobs only; durable IndexedDB is out of scope.
+	 */
+	ticketStore?: TicketStoreHost;
 	/** W3C facade options applied when wrapping the session as WasmWebTransport. */
 	allowPooling?: boolean;
 	requireUnreliable?: boolean;
@@ -1649,11 +1691,13 @@ export async function connectWasm(
 		null,
 		normalized,
 		opts.certHashBase64,
+		opts.ticketStore ?? null,
 	);
 	// connectClient can throw SYNCHRONOUSLY (rejected authority, wt_connect
 	// failure) — it must sit inside the try so the endpoint, the transport's
 	// onPacket subscription, and any armed timer are torn down on that path too.
 	try {
+		await mgr.hydrateTicketsFromHost(authority);
 		const session = mgr.connectClient(authority);
 		await session.ready;
 		return { session, manager: mgr };

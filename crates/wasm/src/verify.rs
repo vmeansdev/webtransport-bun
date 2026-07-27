@@ -6,6 +6,7 @@
 //! handshake signature are still verified, so this is NOT an accept-anything
 //! path.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use x509_parser::oid_registry::{
@@ -180,16 +181,33 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
 }
 
 /// Build a TLS 1.3 / h3 client config that pins the server cert by hash.
+///
+/// Configs for the same pin set share `verifier` / client-auth resolver Arcs
+/// (via a process-local cache) so rustls resumption `compatible_config` stays
+/// true when tickets are hydrated into a fresh endpoint's ticket store.
 pub(crate) fn client_crypto_pinned(hashes: Vec<[u8; 32]>) -> Result<rustls::ClientConfig, String> {
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<Vec<[u8; 32]>, rustls::ClientConfig>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut key = hashes;
+    key.sort();
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cfg) = guard.get(&key) {
+            return Ok(cfg.clone());
+        }
+    }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(format_verify_error)?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier::new(hashes)))
+        .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier::new(key.clone())))
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h3".to_vec()];
-    Ok(cfg)
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(guard.entry(key).or_insert(cfg).clone())
 }
 
 #[cfg(test)]

@@ -106,6 +106,12 @@ export interface WasmModule {
 	wt_conn_has_0rtt(eid: number, conn: number): boolean;
 	wt_conn_accepted_0rtt(eid: number, conn: number): boolean;
 	wt_enable_0rtt(eid: number): boolean;
+	wt_dump_client_ticket(eid: number, serverName: string): Uint8Array;
+	wt_import_client_ticket(
+		eid: number,
+		serverName: string,
+		blob: Uint8Array,
+	): boolean;
 	wt_new_client(
 		addr: string,
 		peerAddr: string,
@@ -763,6 +769,19 @@ export class WasmEndpoint {
 	enable0Rtt(): boolean {
 		if (this.closed) return false;
 		return this.wasm.wt_enable_0rtt(this.eid);
+	}
+
+	/** Drain client tickets for `serverName` into an opaque vault blob. */
+	dumpClientTicket(serverName: string): Uint8Array | null {
+		if (this.closed) return null;
+		const blob = this.wasm.wt_dump_client_ticket(this.eid, serverName);
+		return blob.length > 0 ? blob : null;
+	}
+
+	/** Hydrate opaque client-ticket blob before connect. */
+	importClientTicket(serverName: string, blob: Uint8Array): boolean {
+		if (this.closed) return false;
+		return this.wasm.wt_import_client_ticket(this.eid, serverName, blob);
 	}
 
 	streamWrite(stream: number, data: Uint8Array): number {

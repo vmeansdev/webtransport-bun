@@ -26,7 +26,9 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
   (budget is keyed by `conn`, not per WT `sessionId`).
 - **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless
   you set `shareProcess0RttTicketStore: true` (loopback / same-process resume
-  only). JS `TicketStoreHost` is not yet wired into rustls.
+  only). Optional `ticketStore` (JS `TicketStoreHost`) hydrates opaque client
+  tickets into the Rust store before connect and dumps after NST flush/close;
+  durable IndexedDB serialization is still out of scope.
 - **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
   decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
   index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.
