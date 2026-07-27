@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "chromium-native-interop",
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "playwright"
+	},
+	"command": [
+		"bunx",
+		"playwright",
+		"test",
+		"-c",
+		"playwright.config.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T14:50:34.143894+00:00",
+	"finishedAt": "2026-07-27T14:51:47.143894+00:00",
+	"notes": "Playwright chromium-webtransport 19/19 darwin/arm64 (wall window ~55s; rebind batch stamp corrected in round-3 L6 follow-up) Rebound to candidate b97e622 after local gate re-verify.",
+	"artifactSha256": "bf5ec6f5289439320048797e0611fb6f9ab3d31657502191ae814d088c7a35ce"
+}

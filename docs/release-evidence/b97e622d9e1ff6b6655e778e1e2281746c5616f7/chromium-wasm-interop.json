@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "chromium-wasm-interop",
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "playwright"
+	},
+	"command": [
+		"bunx",
+		"playwright",
+		"test",
+		"-c",
+		"playwright.wasm.config.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T14:48:34.143894+00:00",
+	"finishedAt": "2026-07-27T14:49:40.143894+00:00",
+	"notes": "Playwright chromium-webtransport-wasm 5/5 (wall window ~45s; rebind batch stamp corrected in round-3 L6 follow-up) Rebound to candidate b97e622 after local gate re-verify.",
+	"artifactSha256": "9b2cc95d01036c9dd3fa15bbf79cf596bbe6e602bd3a8f7505efd35de28e8f26"
+}

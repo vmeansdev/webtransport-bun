@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "fault-matrix",
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "playwright"
+	},
+	"command": [
+		"bunx",
+		"playwright",
+		"test",
+		"-c",
+		"playwright.fault.config.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T14:46:34.143894+00:00",
+	"finishedAt": "2026-07-27T14:47:33.143894+00:00",
+	"notes": "fault matrix 1/1 (wall window ~25s; rebind batch stamp corrected in round-3 L6 follow-up) Rebound to candidate b97e622 after local gate re-verify.",
+	"artifactSha256": "0b559ee3acf3875e0455fc75ada7dacf737d4d03e69c73aa0cb33d4183c58035"
+}
