@@ -19,12 +19,12 @@ Package version: `1.0.0-rc.1`.
 - `coverage-gates` (endpoint/h3 floors recovered)
 - `iwa-direct-sockets` (local Chrome Direct Sockets proof)
 - `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity`
-- `auto-review-zero-p0-p4`
 
 ### Still pending (block promote)
 
 | Claim | Blocker |
 |---|---|
+| `auto-review-zero-p0-p4` | Round-4 COMPLETE_NOT_READY; gap closure + round 5 required |
 | `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
 | `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |
 | `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
