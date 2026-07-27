@@ -495,6 +495,9 @@ export interface WasmEndpointConstructorOptions {
 	enable0Rtt?: boolean;
 	/** Optional SETTINGS_WT_MAX_SESSIONS (forwarded to the Rust bridge). */
 	wtMaxSessions?: number;
+	qpackMaxTableCapacity?: number;
+	qpackBlockedStreams?: number;
+	enableDynamicQpack?: boolean;
 }
 
 function isConstructorOptions(
