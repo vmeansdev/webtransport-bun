@@ -147,11 +147,21 @@ fn drain_transmits(conn: &mut quinn_proto::Connection, now: Instant, out: &mut V
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn run_handshake() -> Result<String, String> {
     let (server_cfg, _cert_der) = server_crypto()?;
+    run_handshake_with(server_cfg, client_crypto()?)
+}
+
+/// Drive a full in-memory client<->server QUIC handshake with caller-supplied
+/// TLS configs, so trust models other than accept-any can be exercised.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn run_handshake_with(
+    server_cfg: rustls::ServerConfig,
+    client_cfg: rustls::ClientConfig,
+) -> Result<String, String> {
     let server_crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(server_cfg)
         .map_err(|e| format!("server quic cfg: {e}"))?;
     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
 
-    let client_crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(client_crypto()?)
+    let client_crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(client_cfg)
         .map_err(|e| format!("client quic cfg: {e}"))?;
     let client_config = ClientConfig::new(Arc::new(client_crypto));
 
@@ -236,8 +246,14 @@ pub(crate) fn run_handshake() -> Result<String, String> {
             drain_transmits(conn, now, &mut to_client);
         }
         while let Some(ev) = client_conn.poll() {
-            if matches!(ev, Event::Connected) {
-                client_connected = true;
+            match ev {
+                Event::Connected => client_connected = true,
+                // Surface the TLS alert instead of letting a rejected
+                // certificate look like a generic stall.
+                Event::ConnectionLost { reason } => {
+                    return Err(format!("client connection lost: {reason}"))
+                }
+                _ => {}
             }
         }
         drain_transmits(&mut client_conn, now, &mut to_server);

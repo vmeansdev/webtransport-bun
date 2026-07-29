@@ -38,15 +38,14 @@ These are **1.0 requirements**, not permanent product omissions. Treat
   ≤ 14-day validity — enforced in `verify.rs`). This is the default and the
   only path with end-to-end proof.
 - Client CA-root trust via `caPem` (user-supplied roots) is **implemented and
-  construction-verified, not end-to-end proven**. `wasm-ca-trust.test.ts`
-  asserts that a CA-verified endpoint builds and that malformed roots map to
-  `E_TLS`; no test completes a handshake against a CA-verified server. Proving
-  it is blocked on test infrastructure: `wt_generate_cert` emits self-signed
-  leaves only, and a self-signed leaf cannot act as its own webpki trust
-  anchor, so no valid chain can be built in-test. **Open follow-up:** add
-  test-only CA + leaf chain generation (rcgen can issue a leaf from a CA) and
-  an end-to-end handshake test. Until then treat `caPem` as
-  implemented-unproven, not parity-closed.
+  end-to-end verified**. `wasm-ca-trust.test.ts` runs a server holding a
+  CA-issued leaf against a client trusting only that CA over the in-memory
+  relay: the handshake completes and stream data echoes. A client handed a
+  different CA's PEM is refused with `E_TLS: handshake failed with TLS alert
+  48` (unknown_ca). The same chain is proven at the QUIC layer natively in
+  `spike_tests::loopback_handshake_over_ca_root_trust`. Test chains come from
+  `cert::generate_ca_signed`, gated behind `dev-insecure` exactly like the
+  accept-any client verifier, so no shipped artifact can mint a CA.
 
 ## Delegated to quinn-proto (transport layer)
 
