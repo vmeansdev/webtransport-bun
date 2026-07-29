@@ -251,3 +251,79 @@ describe("server congestionControl (parity backport B1)", () => {
 		}, 20000);
 	}
 });
+
+describe("server keepalive (parity backport B2)", () => {
+	it("session with limits.keepAliveIntervalMs survives past the idle timeout without traffic", async () => {
+		const port = nextPort(27900, 500);
+		let serverSession: any = null;
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { idleTimeoutMs: 1200, keepAliveIntervalMs: 300 },
+			onSession: async (s) => {
+				serverSession = s;
+				for await (const d of s.incomingDatagrams()) {
+					await s.sendDatagram(d);
+				}
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const deadline = Date.now() + 5000;
+			while (serverSession == null && Date.now() < deadline) {
+				await Bun.sleep(50);
+			}
+			expect(serverSession).not.toBeNull();
+
+			let sessionClosed = false;
+			serverSession.closed.then(() => {
+				sessionClosed = true;
+			});
+
+			// 3x the idle timeout with zero application traffic.
+			await Bun.sleep(3600);
+			expect(sessionClosed).toBe(false);
+
+			// Session must still be fully functional after the quiet period.
+			await client.sendDatagram(new Uint8Array([42]));
+			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+			const echoed = await iter.next();
+			expect(echoed.done).toBe(false);
+			expect(Array.from(echoed.value as Uint8Array)).toEqual([42]);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 20000);
+
+	it("control: without keepalive the same quiet session hits E_SESSION_IDLE_TIMEOUT", async () => {
+		const port = nextPort(27900, 500);
+		let serverSession: any = null;
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { idleTimeoutMs: 1200 },
+			onSession: (s) => {
+				serverSession = s;
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const deadline = Date.now() + 5000;
+			while (serverSession == null && Date.now() < deadline) {
+				await Bun.sleep(50);
+			}
+			expect(serverSession).not.toBeNull();
+
+			const info = await serverSession.closed;
+			expect(String(info?.reason ?? "")).toContain("E_SESSION_IDLE_TIMEOUT");
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 20000);
+});
