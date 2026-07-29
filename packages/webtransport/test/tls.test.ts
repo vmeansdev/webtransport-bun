@@ -3,6 +3,7 @@
  */
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
+import { forEachWithTimeout, nextWithTimeout } from "./helpers/harness.js";
 import {
 	generateCertForNames,
 	generateLocalhostCert,
@@ -43,6 +44,32 @@ async function connectWithRetry(
 }
 
 describe("TLS contract (P0.3)", () => {
+	it("connect() validates serverCertificateHashes (BufferSource shape) before dialing", async () => {
+		// Empty array = silent pinning downgrade.
+		await expect(
+			connect("https://127.0.0.1:65530", { serverCertificateHashes: [] }),
+		).rejects.toThrow(/must be a non-empty array/);
+		// Wrong byte length (2 bytes, not 32).
+		await expect(
+			connect("https://127.0.0.1:65530", {
+				serverCertificateHashes: [
+					{ algorithm: "sha-256", value: new Uint8Array(2) },
+				],
+			}),
+		).rejects.toThrow(/must be exactly 32 bytes/);
+		// Unsupported algorithm.
+		await expect(
+			connect("https://127.0.0.1:65530", {
+				serverCertificateHashes: [
+					{
+						algorithm: "sha-384" as "sha-256",
+						value: new Uint8Array(32),
+					},
+				],
+			}),
+		).rejects.toThrow(/only supports algorithm/);
+	});
+
 	it("connect with serverName override uses host for SNI (connect-path smoke)", async () => {
 		const port = nextPort(24460, 2000);
 		const server = createServer({
@@ -58,6 +85,27 @@ describe("TLS contract (P0.3)", () => {
 			expect(client.id).toBeDefined();
 		} finally {
 			client.close();
+			await server.close();
+		}
+	}, 15000);
+
+	it("connect accepts client idleTimeoutMs and keepAliveIntervalMs and still connects", async () => {
+		// Exercises the client liveness config plumbing (idle timeout + keep-alive)
+		// and confirms the defaults/overrides don't break a normal connection.
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true, serverName: "localhost" },
+				limits: { idleTimeoutMs: 20_000, keepAliveIntervalMs: 5_000 },
+			});
+			expect(client.id).toBeDefined();
+			client.close();
+		} finally {
 			await server.close();
 		}
 	}, 15000);
@@ -190,17 +238,14 @@ describe("TLS contract (P0.3)", () => {
 			onSession: async (s) => {
 				serverSession = s;
 				resolveReady();
-				const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
-				while (true) {
-					const next = await Promise.race([
-						iter.next(),
-						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
-					]);
-					if (next.done) break;
-					const datagram = next.value;
-					if (!datagram) break;
-					await s.sendDatagram(datagram);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"tls rotate identity incoming datagram",
+					async (datagram) => {
+						await s.sendDatagram(datagram);
+					},
+				);
 			},
 		});
 
@@ -222,12 +267,11 @@ describe("TLS contract (P0.3)", () => {
 
 			await before.sendDatagram(new Uint8Array([1, 2, 3, 4]));
 			const iter = before.incomingDatagrams()[Symbol.asyncIterator]();
-			const echoed = await Promise.race([
-				iter.next(),
-				Bun.sleep(3000).then(() => {
-					throw new Error("timeout waiting for echoed datagram after rotation");
-				}),
-			]);
+			const echoed = await nextWithTimeout(
+				iter,
+				3000,
+				"tls rotate identity echoed datagram",
+			);
 			expect(echoed.done).toBe(false);
 			expect(Array.from(echoed.value ?? [])).toEqual([1, 2, 3, 4]);
 
@@ -268,17 +312,14 @@ describe("TLS contract (P0.3)", () => {
 			},
 			onSession: async (s) => {
 				resolveReady();
-				const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
-				while (true) {
-					const next = await Promise.race([
-						iter.next(),
-						Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
-					]);
-					if (next.done) break;
-					const datagram = next.value;
-					if (!datagram) break;
-					await s.sendDatagram(datagram);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"tls failed rotation incoming datagram",
+					async (datagram) => {
+						await s.sendDatagram(datagram);
+					},
+				);
 			},
 		});
 
@@ -303,14 +344,11 @@ describe("TLS contract (P0.3)", () => {
 
 			await client.sendDatagram(new Uint8Array([7, 8, 9]));
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const echoed = await Promise.race([
-				iter.next(),
-				Bun.sleep(3000).then(() => {
-					throw new Error(
-						"timeout waiting for echoed datagram after failed rotation",
-					);
-				}),
-			]);
+			const echoed = await nextWithTimeout(
+				iter,
+				3000,
+				"tls failed rotation echoed datagram",
+			);
 			expect(echoed.done).toBe(false);
 			expect(Array.from(echoed.value ?? [])).toEqual([7, 8, 9]);
 
@@ -345,8 +383,12 @@ describe("TLS contract (P0.3)", () => {
 			onSession: async (s) => {
 				serverBSession = s;
 				resolveServerBReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"tls serverB incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -846,4 +888,43 @@ describe("TLS contract (P0.3)", () => {
 			nextApi.cleanup();
 		}
 	}, 30000);
+
+	// Regression: pinned-hash (serverCertificateHashes) connect must actually
+	// work. The native verifier was built via WebPkiServerVerifier::builder(),
+	// which resolves the process-default CryptoProvider and panicked the client
+	// thread (no default installed) — masking every pinned connect as an
+	// E_HANDSHAKE_TIMEOUT. No prior test did a live pinned connect, so it was
+	// invisible. This connects with the server cert's real SHA-256 DER hash.
+	it("connect with serverCertificateHashes (pinned) succeeds against the matching cert", async () => {
+		// serverCertificateHashes requires a short-lived (<=14 days) ECDSA P-256
+		// leaf per W3C — the native pin verifier enforces both.
+		const shortCert = generateCertForNames(
+			["localhost", "127.0.0.1"],
+			10,
+			"ec",
+		);
+		if (!shortCert) return;
+		const { X509Certificate, createHash } = await import("node:crypto");
+		// Hash the leaf (first PEM block), the cert the server actually presents.
+		const leafPem = `${shortCert.certPem.split("-----END CERTIFICATE-----")[0]}-----END CERTIFICATE-----\n`;
+		const der = new X509Certificate(leafPem).raw;
+		const value = new Uint8Array(createHash("sha256").update(der).digest());
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: shortCert.certPem, keyPem: shortCert.keyPem },
+			onSession: () => {},
+		});
+		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { serverName: "localhost" },
+				serverCertificateHashes: [{ algorithm: "sha-256", value }],
+			});
+			expect(client.id).toBeDefined();
+			client.close();
+		} finally {
+			await server.close();
+			shortCert.cleanup();
+		}
+	}, 15000);
 });

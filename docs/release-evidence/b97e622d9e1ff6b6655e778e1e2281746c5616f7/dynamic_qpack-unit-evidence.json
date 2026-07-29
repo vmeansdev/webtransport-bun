@@ -1,0 +1,11 @@
+{
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"claimId": "wasm-dynamic-qpack",
+	"createdAt": "2026-07-27T15:10:12+00:00",
+	"status": "passed",
+	"notes": "QPACK options + encoder KRC floors covered on HEAD.",
+	"runner": "local-darwin-arm64",
+	"startedAt": "2026-07-27T15:10:11+00:00",
+	"endedAt": "2026-07-27T15:10:12+00:00",
+	"artifactSha256": "dbe24977da579ad38efd421d996b37c0ebd4613b3b829f8c18ed4f1e08710c75"
+}

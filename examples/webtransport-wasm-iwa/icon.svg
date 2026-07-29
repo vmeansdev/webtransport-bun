@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="WebTransport WASM">
+  <rect width="512" height="512" rx="96" fill="#10151d"/>
+  <path d="M80 142h64l51 228h-64L80 142Zm144 0h64l-51 228h-64l51-228Zm96 0h64l48 228h-64l-48-228Z" fill="#61dafb"/>
+</svg>

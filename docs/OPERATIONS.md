@@ -10,17 +10,48 @@ Operational requirements:
 - UDP port must be reachable from the internet (firewall rules).
 - Certificates must be valid for the hostname used by clients/browsers.
 
+Canonical release truth: `docs/release-status.json`. This page describes operational guidance for the current candidate surfaces.
+
 ## Recommended defaults
 - Keep maxSessions conservative initially (e.g., 200–500) until tested.
 - Keep per-session queued bytes low (<= 2 MiB).
 - Prefer backpressure over drops; enable drop policy only for datagrams if you accept loss.
 
+## WASM footguns (multi-session / 0-RTT / QPACK)
+
+- **Primary CONNECT close tears down the whole QUIC connection** (and every
+  extra WT session on it). Close only non-primary sessions when you want
+  siblings to survive (`SessionClosed`).
+- **Inbound host-queue pressure** can also close the entire QUIC connection
+  (budget is keyed by `conn`, not per WT `sessionId`).
+- **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless
+  you set `shareProcess0RttTicketStore: true` (loopback / same-process resume
+  only). Optional `ticketStore` (JS `TicketStoreHost`) hydrates opaque client
+  tickets into the Rust store before connect. Manager `close()` auto-dumps when
+  a store is configured; `dumpTicketsToHost(authority)` remains available for
+  explicit dump after NST. Hosts: `MemoryTicketStoreHost`, `FileTicketStoreHost`
+  (Bun/Node), `IndexedDBTicketStoreHost` (IWA/browser).
+- **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
+  decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
+  index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.
+- **CONNECT admission (wasm)**: concurrent unlatched + active WT sessions are
+  capped by `wtMaxSessions` / peer `SETTINGS_WT_MAX_SESSIONS`; over-cap
+  CONNECTs get early RESET (no MiB HEADERS buffering). Handshake /
+  stream-open **rate-limit buckets are not charged** at CONNECT classify —
+  those buckets still gate UDP handshakes and WT stream opens only. Size
+  `wtMaxSessions` for CONNECT storm resistance; do not assume handshake
+  rate limits alone throttle Extended CONNECT floods.
+
 ## Enforced caps
 - Datagram size: maxDatagramSize (must respect negotiated QUIC max)
 - Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
+- WT sessions per QUIC connection: `wtMaxSessions` / `SETTINGS_WT_MAX_SESSIONS`
+  (pending client CONNECTs and server unlatched admitted CONNECTs count toward
+  the admission occupied set; see OPERATIONS CONNECT admission note)
 
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive
+- wasm: wtSessionsActive, sessionClosedCount (governor snapshot)
 - queuedBytesGlobal
 - datagramsDropped
 - backpressureTimeoutCount
@@ -174,10 +205,10 @@ When `queuedBytesGlobal` rises and stays high:
 
 ## Known limitations and compatibility
 
-- Client `connect()` fully supported: datagrams, bidi/uni streams, metrics, configurable limits
-- macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
-- Runtime support: Bun >= 1.3.9, Node, Deno
-- Node-API addon portability applies across supported runtimes
+- Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
+- Configured target matrix: macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
+- Configured runtime matrix: Bun >= 1.3.9, Node, Deno
+- Node-API addon portability applies across the configured runtime matrix
 
 ## Public internet deployment
 

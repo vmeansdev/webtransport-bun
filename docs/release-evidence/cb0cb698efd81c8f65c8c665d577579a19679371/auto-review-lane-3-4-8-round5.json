@@ -1,0 +1,57 @@
+{
+	"lane": "3-4-8",
+	"round": 5,
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L3-multi-session-connect",
+			"severity": "P1",
+			"status": "ok",
+			"summary": "open_wt_session + pending CONNECT deadlines/caps intact; secondary CONNECT uses encode_connect_request_with; facade session-map smoke still covers isolation/over-cap",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L4-P3-unified-ticketstore",
+			"severity": "P3",
+			"status": "fixed",
+			"summary": "WasmClientArgs.ticketStore wired; createUnifiedClient wasm overload returns {transport,manager}",
+			"file": "packages/webtransport/src/backend.ts"
+		},
+		{
+			"id": "L4-P2-ops-dump-overclaim",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "OPERATIONS.md now says callers must invoke dumpTicketsToHost; close does not auto-dump",
+			"file": "docs/OPERATIONS.md"
+		},
+		{
+			"id": "L8-P2-0rtt-sni-authority-skew",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "Quinn connect/import/dump use tls_server_name_from_authority (no hardcoded localhost SNI)",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L8-P2-qpack-partial-insert-fallback",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "encode_*_with clones scratch and commits only on Ok; Err leaves live encoder unchanged for literal fallback",
+			"file": "crates/wasm/src/h3.rs"
+		},
+		{
+			"id": "L8-P3-qpack-oversized-ok",
+			"severity": "P3",
+			"status": "fixed",
+			"summary": "insert_with_ack_floor sz>capacity returns Err(Invalid); unit covers scratch rollback",
+			"file": "crates/wasm/src/h3.rs"
+		},
+		{
+			"id": "L3-R5-facade-ready-timeouts",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "wasm-facade.test.ts wraps primary/secondary/unified ready with withTimeout; openSession retains handshakeTimeoutMs deadline",
+			"file": "packages/webtransport/test/wasm-facade.test.ts"
+		}
+	],
+	"note": "Candidate cb0cb69 closes R4 L4/L8 opens for ticketStore+manager, OPERATIONS dump honesty, SNI=authority, QPACK scratch/oversized, and facade ready timeouts; L3 multi-session CONNECT remains sound."
+}

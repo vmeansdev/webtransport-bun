@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "kind": "command",
+  "name": "runtime-consumers",
+  "commit": "19acc308ab01a789a831a49aa9cf98afc50eefd4",
+  "platform": {
+    "os": "darwin",
+    "arch": "arm64",
+    "runtime": "bun/1.3.14"
+  },
+  "toolchain": {
+    "name": "bun",
+    "version": "1.3.14"
+  },
+  "command": [
+    "bun",
+    "test",
+    "packages/webtransport/test/internal-package-artifact.test.ts"
+  ],
+  "exitCode": 0,
+  "startedAt": "2026-07-26T20:13:28.444Z",
+  "finishedAt": "2026-07-26T20:13:29.444Z",
+  "artifactSha256": "ad1da998f7f629a8b5349197bef59dee34c22410fd6e255f97dc38edcd27a005"
+}

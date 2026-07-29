@@ -1,3 +1,4 @@
 *.pem
 !.gitignore
 !README.md
+current-generation.txt

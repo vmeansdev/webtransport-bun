@@ -9,6 +9,11 @@ export interface UdpAddr {
 }
 
 export interface UdpTransport {
+	/**
+	 * Port the socket actually bound to. Set by bound-mode (server) adapters and
+	 * is the OS-assigned port when the caller asked for the ephemeral port 0.
+	 */
+	readonly localPort?: number;
 	/** Send `data` toward `dest`. A connected client socket may ignore `dest`. */
 	send(data: Uint8Array, dest: UdpAddr): void;
 	/** Register the inbound-packet callback; `source` is the sender's address. */
@@ -53,9 +58,7 @@ export class InMemoryRelay {
 	/**
 	 * Convenience for the legacy 2-endpoint tests: a fixed point-to-point pair.
 	 * `.a`'s sends go to `.b` and vice versa, ignoring the passed destination.
-	 * The reported source is intentionally unparseable so each endpoint falls
-	 * back to its own configured peer address — preserving the original
-	 * single-peer behavior independent of which addresses the test uses.
+	 * Packets carry the fixed loopback source addresses used by those fixtures.
 	 */
 	readonly a: UdpTransport;
 	readonly b: UdpTransport;
@@ -63,14 +66,13 @@ export class InMemoryRelay {
 	constructor() {
 		let aCb: ((d: Uint8Array, s: UdpAddr) => void) | null = null;
 		let bCb: ((d: Uint8Array, s: UdpAddr) => void) | null = null;
-		// address "" / port NaN => "ip:port" parse fails on the Rust side, so the
-		// endpoint uses its configured peer_addr (matches legacy point-to-point).
-		const unknown: UdpAddr = { address: "", port: Number.NaN };
+		const aSource: UdpAddr = { address: "127.0.0.1", port: 4433 };
+		const bSource: UdpAddr = { address: "127.0.0.1", port: 5544 };
 		this.a = {
 			send: (data) => {
 				if (bCb) {
 					const copy = data.slice();
-					queueMicrotask(() => bCb?.(copy, unknown));
+					queueMicrotask(() => bCb?.(copy, { ...aSource }));
 				}
 			},
 			onPacket: (cb) => {
@@ -81,7 +83,7 @@ export class InMemoryRelay {
 			send: (data) => {
 				if (aCb) {
 					const copy = data.slice();
-					queueMicrotask(() => aCb?.(copy, unknown));
+					queueMicrotask(() => aCb?.(copy, { ...bSource }));
 				}
 			},
 			onPacket: (cb) => {

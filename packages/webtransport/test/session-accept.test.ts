@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from "bun:test";
 import { connect, createServer, WebTransport } from "../src/index.js";
+import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
 
 async function connectWithRetry(
@@ -190,31 +191,34 @@ describe("session accept (P0-A)", () => {
 			onSession: (s) => {
 				sessions.push(s);
 				void (async () => {
-					for await (const duplex of s.incomingBidirectionalStreams) {
-						void (async () => {
-							const reader = duplex.readable.getReader();
-							const chunks: Uint8Array[] = [];
-							while (true) {
-								const { done, value } = await Promise.race([
-									reader.read(),
-									Bun.sleep(4000).then(() => ({
-										done: true,
-										value: undefined,
-									})),
-								]);
-								if (done) break;
-								if (!value) break;
-								chunks.push(value);
-							}
-							const writer = duplex.writable.getWriter();
-							if (chunks.length > 0) {
-								await writer.write(
-									Buffer.concat(chunks.map((c) => Buffer.from(c))),
-								);
-							}
-							await writer.close();
-						})().catch(() => {});
-					}
+					await forEachWithTimeout(
+						s.incomingBidirectionalStreams,
+						5000,
+						"session accept incoming bidi",
+						async (duplex) => {
+							void (async () => {
+								const reader = duplex.readable.getReader();
+								const chunks: Uint8Array[] = [];
+								while (true) {
+									const { done, value } = await readWithTimeout(
+										reader,
+										4000,
+										"session accept server bidi read",
+									);
+									if (done) break;
+									if (!value) break;
+									chunks.push(value);
+								}
+								const writer = duplex.writable.getWriter();
+								if (chunks.length > 0) {
+									await writer.write(
+										Buffer.concat(chunks.map((c) => Buffer.from(c))),
+									);
+								}
+								await writer.close();
+							})().catch(() => {});
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -234,10 +238,11 @@ describe("session accept (P0-A)", () => {
 			await writer.close();
 
 			const reader = readable.getReader();
-			const readResult = await Promise.race([
-				reader.read(),
-				Bun.sleep(5000).then(() => ({ done: true, value: undefined })),
-			]);
+			const readResult = await readWithTimeout(
+				reader,
+				5000,
+				"session accept client bidi echo read",
+			);
 			expect(readResult.done).toBe(false);
 			expect(
 				new Uint8Array(

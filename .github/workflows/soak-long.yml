@@ -28,36 +28,109 @@ on:
         options:
           - "shared"
           - "dedicated"
+      candidate_commit:
+        description: "Exact immutable release candidate commit SHA to verify"
+        required: true
+        type: string
+      candidate_ref:
+        description: "Human-readable candidate ref/tag for evidence"
+        required: false
+        default: ""
+        type: string
+      segment_index:
+        description: "1-based segment index within the selected runner campaign"
+        required: true
+        default: "1"
+        type: string
+      segment_count:
+        description: "1 for 1h and self-hosted 24h/72h; GitHub-hosted: 5 for 24h or 15 for 72h"
+        required: true
+        default: "1"
+        type: string
+      campaign_seed:
+        description: "Stable seed reused across every segment of one campaign"
+        required: true
+        type: string
+      continuity_token:
+        description: "Stable continuity token reused across every segment of one campaign"
+        required: true
+        type: string
 jobs:
   soak:
+    permissions:
+      actions: read
+      contents: read
     runs-on: ${{ fromJson(github.event.inputs.runner_type == 'github-hosted' && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","soak"]') }}
-    timeout-minutes: 44640
+    timeout-minutes: ${{ github.event.inputs.runner_type == 'github-hosted' && 330 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4380 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1500 || 390) }}
     concurrency:
-      group: soak-long-${{ github.ref_name }}
+      group: soak-long-${{ github.event.inputs.candidate_commit }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: "20"
-      - uses: oven-sh/setup-bun@v2
+          ref: ${{ github.event.inputs.candidate_commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.3.9"
+      - name: Validate campaign inputs
+        env:
+          CANDIDATE_COMMIT: ${{ github.event.inputs.candidate_commit }}
+          CAMPAIGN_SEED: ${{ github.event.inputs.campaign_seed }}
+          CONTINUITY_TOKEN: ${{ github.event.inputs.continuity_token }}
+          DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
+          SEGMENT_INDEX: ${{ github.event.inputs.segment_index }}
+          SEGMENT_COUNT: ${{ github.event.inputs.segment_count }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::candidate_commit must be an exact lowercase 40-character commit SHA"
+            exit 1
+          fi
+          if [[ ! "$SEGMENT_INDEX" =~ ^[0-9]+$ ]] || [[ ! "$SEGMENT_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "::error::segment_index and segment_count must be positive integers"
+            exit 1
+          fi
+          if [ -z "$CAMPAIGN_SEED" ] || [ -z "$CONTINUITY_TOKEN" ]; then
+            echo "::error::campaign_seed and continuity_token must be non-empty"
+            exit 1
+          fi
+          case "${RUNNER_TYPE}:${DURATION_HOURS}:${SEGMENT_COUNT}" in
+            "github-hosted:1:1"|"self-hosted:1:1"|\
+            "github-hosted:24:5"|"github-hosted:72:15"|\
+            "self-hosted:24:1"|"self-hosted:72:1") ;;
+            *)
+              echo "::error::Expected 1 segment for 1h and self-hosted 24h/72h, or GitHub-hosted 5/15 segments for 24h/72h"
+              exit 1
+              ;;
+          esac
+          if [ "$SEGMENT_INDEX" -lt 1 ] || [ "$SEGMENT_INDEX" -gt "$SEGMENT_COUNT" ]; then
+            echo "::error::segment_index must be between 1 and segment_count"
+            exit 1
+          fi
+      - name: Install deps
+        run: bun install --frozen-lockfile
       - name: Select supported C/C++ compiler
         run: |
           if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
-            echo "CC=clang" >> "$GITHUB_ENV"
-            echo "CXX=clang++" >> "$GITHUB_ENV"
-            echo "Selected clang/clang++"
+            echo "CC=$(realpath "$(command -v clang)")" >> "$GITHUB_ENV"
+            echo "CXX=$(realpath "$(command -v clang++)")" >> "$GITHUB_ENV"
+            echo "Selected resolved clang/clang++ paths"
             exit 0
           fi
 
           for v in 12 11 10; do
             if command -v "gcc-$v" >/dev/null 2>&1 && command -v "g++-$v" >/dev/null 2>&1; then
-              echo "CC=gcc-$v" >> "$GITHUB_ENV"
-              echo "CXX=g++-$v" >> "$GITHUB_ENV"
-              echo "Selected gcc-$v/g++-$v"
+              echo "CC=$(realpath "$(command -v "gcc-$v")")" >> "$GITHUB_ENV"
+              echo "CXX=$(realpath "$(command -v "g++-$v")")" >> "$GITHUB_ENV"
+              echo "Selected resolved gcc-$v/g++-$v paths"
               exit 0
             fi
           done
@@ -66,13 +139,12 @@ jobs:
           exit 1
       - name: Compiler diagnostics
         run: |
-          echo "gcc: $(gcc --version | head -n1 || echo not-found)"
-          echo "clang: $(clang --version | head -n1 || echo not-found)"
-          echo "CC=$CC CXX=$CXX"
+          echo "CC=$CC"
+          "$CC" --version
+          echo "CXX=$CXX"
+          "$CXX" --version
       - name: Build native addon
         run: bun run build:native
-      - name: Install deps
-        run: bun install --frozen-lockfile
       - name: Profile runner capacity
         run: |
           RUNNER_MODE="${{ github.event.inputs.runner_mode || 'shared' }}"
@@ -127,28 +199,222 @@ jobs:
           echo "Runner mode: $RUNNER_MODE"
           echo "Runner profile: cpu=$CPUS mem=${MEM_MB}MB (~${MEM_GB_CEIL}GB) disk_free=${DISK_GB}GB -> $PROFILE"
           echo "Soak load: sessions=$SOAK_SESSIONS datagrams/s=$SOAK_DATAGRAMS_PER_SEC streams/s=$SOAK_STREAMS_PER_SEC"
+      - name: Define segment artifact identity
+        id: segment-metadata
+        env:
+          CANDIDATE_COMMIT: ${{ github.event.inputs.candidate_commit }}
+          DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          SEGMENT_INDEX: ${{ github.event.inputs.segment_index }}
+          SEGMENT_COUNT: ${{ github.event.inputs.segment_count }}
+        run: |
+          echo "artifact_name=soak-segment-${DURATION_HOURS}h-${CANDIDATE_COMMIT}-seg$(printf '%02d' "$SEGMENT_INDEX")of$(printf '%02d' "$SEGMENT_COUNT")" >> "$GITHUB_OUTPUT"
+      - name: Resolve previous segment artifact automatically
+        if: github.event.inputs.segment_index != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ github.event.inputs.candidate_commit }}
+          CAMPAIGN_SEED: ${{ github.event.inputs.campaign_seed }}
+          CONTINUITY_TOKEN: ${{ github.event.inputs.continuity_token }}
+          DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          SEGMENT_INDEX: ${{ github.event.inputs.segment_index }}
+          SEGMENT_COUNT: ${{ github.event.inputs.segment_count }}
+        run: |
+          set -euo pipefail
+          PREVIOUS_INDEX="$((10#$SEGMENT_INDEX - 1))"
+          ARTIFACT_NAME="soak-segment-${DURATION_HOURS}h-${CANDIDATE_COMMIT}-seg$(printf '%02d' "$PREVIOUS_INDEX")of$(printf '%02d' "$SEGMENT_COUNT")"
+          ARTIFACT_ID="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" |
+              jq -rs --arg name "$ARTIFACT_NAME" \
+                '[.[] | .artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | reverse | .[0].id // empty'
+          )"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "::error::Missing passing predecessor artifact $ARTIFACT_NAME"
+            exit 1
+          fi
+          PREVIOUS_DIR="$RUNNER_TEMP/soak-predecessor"
+          mkdir -p "$PREVIOUS_DIR"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" > "$PREVIOUS_DIR/artifact.zip"
+          unzip -q "$PREVIOUS_DIR/artifact.zip" -d "$PREVIOUS_DIR"
+          PREVIOUS_JSON="$(find "$PREVIOUS_DIR" -type f -name 'soak-artifacts-seg-*.json' -print -quit)"
+          if [ -z "$PREVIOUS_JSON" ]; then
+            echo "::error::Artifact $ARTIFACT_NAME did not contain a segment JSON"
+            exit 1
+          fi
+          TOKEN_DIGEST="$(printf '%s' "$CONTINUITY_TOKEN" | sha256sum | cut -d' ' -f1)"
+          jq -e \
+            --arg commit "$CANDIDATE_COMMIT" \
+            --arg seed "$CAMPAIGN_SEED" \
+            --arg token "$TOKEN_DIGEST" \
+            --argjson index "$PREVIOUS_INDEX" \
+            --argjson count "$SEGMENT_COUNT" \
+            '.status == "pass" and .candidateCommit == $commit and .actualCommit == $commit and .seed == $seed and .continuityTokenDigest == $token and .segmentIndex == $index and .segmentCount == $count' \
+            "$PREVIOUS_JSON" >/dev/null
+          PREVIOUS_FINAL_HASH="$(jq -er '.finalStateHash' "$PREVIOUS_JSON")"
+          echo "PREVIOUS_FINAL_HASH=$PREVIOUS_FINAL_HASH" >> "$GITHUB_ENV"
       - name: Soak (${{ github.event.inputs.duration_hours || '1' }}h)
         id: soak
         run: |
           H="${{ github.event.inputs.duration_hours || '1' }}"
-          case "$H" in
-            1)  D=3600 ;;
-            24) D=86400 ;;
-            72) D=259200 ;;
-            *)  D=3600 ;;
+          RUNNER_TYPE="${{ github.event.inputs.runner_type }}"
+          case "${RUNNER_TYPE}:${H}" in
+            "github-hosted:1"|"self-hosted:1") TOTAL_SECONDS=3600; DEFAULT_SEGMENTS=1 ;;
+            "github-hosted:24") TOTAL_SECONDS=86400; DEFAULT_SEGMENTS=5 ;;
+            "github-hosted:72") TOTAL_SECONDS=259200; DEFAULT_SEGMENTS=15 ;;
+            "self-hosted:24") TOTAL_SECONDS=86400; DEFAULT_SEGMENTS=1 ;;
+            "self-hosted:72") TOTAL_SECONDS=259200; DEFAULT_SEGMENTS=1 ;;
+            *)  TOTAL_SECONDS=3600; DEFAULT_SEGMENTS=1 ;;
           esac
-          echo "SOAK_DURATION=$D mode=$RUNNER_MODE profile=$SOAK_PROFILE cpu=$RUNNER_CPUS mem=${RUNNER_MEM_MB}MB (~${RUNNER_MEM_GB}GB)"
-          SOAK_DURATION=$D \
+          SEGMENT_COUNT="${{ github.event.inputs.segment_count || '1' }}"
+          SEGMENT_INDEX="${{ github.event.inputs.segment_index || '1' }}"
+          if [ "$SEGMENT_COUNT" = "1" ]; then
+            if [ "$RUNNER_TYPE" = "github-hosted" ] && [ "$H" != "1" ]; then
+              echo "::error::24h/72h github-hosted campaigns must use bounded multi-job segments"
+              exit 1
+            fi
+            SEGMENT_SECONDS="$TOTAL_SECONDS"
+          else
+            if [ "$SEGMENT_COUNT" = "" ] || [ "$SEGMENT_COUNT" = "0" ]; then
+              SEGMENT_COUNT="$DEFAULT_SEGMENTS"
+            fi
+            if [ "$SEGMENT_COUNT" -ne "$DEFAULT_SEGMENTS" ]; then
+              echo "::error::${H}h campaigns must use ${DEFAULT_SEGMENTS} contiguous segments"
+              exit 1
+            fi
+            if [ "$SEGMENT_INDEX" -lt 1 ] || [ "$SEGMENT_INDEX" -gt "$SEGMENT_COUNT" ]; then
+              echo "::error::segment_index must be between 1 and $SEGMENT_COUNT"
+              exit 1
+            fi
+            SEGMENT_SECONDS="$((TOTAL_SECONDS / SEGMENT_COUNT))"
+            if [ "$SEGMENT_SECONDS" -gt 21600 ]; then
+              echo "::error::segment duration ${SEGMENT_SECONDS}s exceeds the 6h cap"
+              exit 1
+            fi
+          fi
+          if [ -z "${PREVIOUS_FINAL_HASH:-}" ] && [ "$SEGMENT_INDEX" -ne 1 ]; then
+            echo "::error::automatic predecessor resolution did not provide previousFinalHash"
+            exit 1
+          fi
+          if [ -n "${PREVIOUS_FINAL_HASH:-}" ] && [ "$SEGMENT_INDEX" -eq 1 ]; then
+            echo "::error::segment 1 cannot have a predecessor hash"
+            exit 1
+          fi
+          if [ "${{ github.event.inputs.candidate_commit }}" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::Checked-out HEAD does not match candidate_commit"
+            git rev-parse HEAD
+            exit 1
+          fi
+          ARTIFACT_PATH="$GITHUB_WORKSPACE/tools/load/soak-artifacts-seg-$(printf '%02d' "$SEGMENT_INDEX")-of-$(printf '%02d' "$SEGMENT_COUNT").json"
+          echo "SOAK_DURATION=$SEGMENT_SECONDS mode=$RUNNER_MODE profile=$SOAK_PROFILE cpu=$RUNNER_CPUS mem=${RUNNER_MEM_MB}MB (~${RUNNER_MEM_GB}GB) segment=${SEGMENT_INDEX}/${SEGMENT_COUNT} candidate=${{ github.event.inputs.candidate_commit }}"
+          SOAK_DURATION=$SEGMENT_SECONDS \
           SOAK_SESSIONS=$SOAK_SESSIONS \
           SOAK_DATAGRAMS_PER_SEC=$SOAK_DATAGRAMS_PER_SEC \
           SOAK_STREAMS_PER_SEC=$SOAK_STREAMS_PER_SEC \
-          SOAK_ARTIFACTS_OUT=$GITHUB_WORKSPACE/tools/load/soak-artifacts.json \
+          SOAK_ARTIFACTS_OUT="$ARTIFACT_PATH" \
+          SOAK_CANDIDATE_COMMIT="${{ github.event.inputs.candidate_commit }}" \
+          SOAK_CANDIDATE_REF="${{ github.event.inputs.candidate_ref }}" \
+          SOAK_RUNNER_TYPE="${{ github.event.inputs.runner_type }}" \
+          SOAK_SEGMENT_INDEX="$SEGMENT_INDEX" \
+          SOAK_SEGMENT_COUNT="$SEGMENT_COUNT" \
+          SOAK_SEED="${{ github.event.inputs.campaign_seed }}" \
+          SOAK_CONTINUITY_TOKEN="${{ github.event.inputs.continuity_token }}" \
+          SOAK_PREVIOUS_FINAL_HASH="${PREVIOUS_FINAL_HASH:-}" \
           bun tools/load/soak-addon.ts
-        timeout-minutes: ${{ github.event.inputs.duration_hours == '72' && 44640 || (github.event.inputs.duration_hours == '24' && 1500 || 120) }}
-      - name: Upload soak artifacts
+        timeout-minutes: ${{ github.event.inputs.runner_type == 'github-hosted' && 300 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4350 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1470 || 365) }}
+      - name: Validate segment evidence contract
+        run: |
+          set -euo pipefail
+          SEGMENT_JSON="$(find "$GITHUB_WORKSPACE/tools/load" -maxdepth 1 -type f -name 'soak-artifacts-seg-*.json' -print -quit)"
+          if [ -z "$SEGMENT_JSON" ]; then
+            echo "::error::Soak run did not emit a segment JSON artifact"
+            exit 1
+          fi
+          jq -e '
+            .requiredOperationClasses |
+            type == "array" and
+            index("datagram-echo") != null and
+            index("uni-echo") != null and
+            index("bidi-echo") != null and
+            index("stream-reset") != null and
+            index("stop-sending") != null and
+            index("idle-peers") != null and
+            index("overload") != null and
+            index("reconnect-churn") != null and
+            index("cert-rotation") != null
+          ' "$SEGMENT_JSON" >/dev/null
+          jq -e '
+            .observedOperationCounts."datagram-echo" > 0 and
+            .observedOperationCounts."uni-echo" > 0 and
+            .observedOperationCounts."bidi-echo" > 0 and
+            .observedOperationCounts."stream-reset" > 0 and
+            .observedOperationCounts."stop-sending" > 0 and
+            .baselineMetrics.heapUsedMb >= 0 and
+            .baselineMetrics.sockets >= 0 and
+            .finalMetrics.heapUsedMb >= 0 and
+            .finalMetrics.sockets >= 0
+          ' "$SEGMENT_JSON" >/dev/null
+      - name: Upload current segment artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
         with:
-          name: soak-artifacts-${{ github.event.inputs.duration_hours || '1' }}h
-          path: tools/load/soak-artifacts*
-          if-no-files-found: ignore
+          name: ${{ steps.segment-metadata.outputs.artifact_name }}
+          path: tools/load/soak-artifacts-seg-*
+          if-no-files-found: error
+          retention-days: 90
+      - name: Download prior campaign segment artifacts
+        if: github.event.inputs.segment_index == github.event.inputs.segment_count && github.event.inputs.segment_index != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ github.event.inputs.candidate_commit }}
+          DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          SEGMENT_COUNT: ${{ github.event.inputs.segment_count }}
+        run: |
+          set -euo pipefail
+          AGGREGATE_INPUT_DIR="$GITHUB_WORKSPACE/tools/load/aggregate-input"
+          mkdir -p "$AGGREGATE_INPUT_DIR"
+          for INDEX in $(seq 1 "$((10#$SEGMENT_COUNT - 1))"); do
+            ARTIFACT_NAME="soak-segment-${DURATION_HOURS}h-${CANDIDATE_COMMIT}-seg$(printf '%02d' "$INDEX")of$(printf '%02d' "$SEGMENT_COUNT")"
+            ARTIFACT_ID="$(
+              gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" |
+                jq -rs --arg name "$ARTIFACT_NAME" \
+                  '[.[] | .artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | reverse | .[0].id // empty'
+            )"
+            if [ -z "$ARTIFACT_ID" ]; then
+              echo "::error::Missing campaign artifact $ARTIFACT_NAME"
+              exit 1
+            fi
+            DESTINATION="$RUNNER_TEMP/campaign-segment-$(printf '%02d' "$INDEX")"
+            mkdir -p "$DESTINATION"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" > "$DESTINATION/artifact.zip"
+            unzip -q "$DESTINATION/artifact.zip" -d "$DESTINATION"
+            SEGMENT_JSON="$(find "$DESTINATION" -type f -name 'soak-artifacts-seg-*.json' -print -quit)"
+            if [ -z "$SEGMENT_JSON" ]; then
+              echo "::error::Artifact $ARTIFACT_NAME did not contain a segment JSON"
+              exit 1
+            fi
+            cp "$SEGMENT_JSON" "$AGGREGATE_INPUT_DIR/soak-segment-$(printf '%02d' "$INDEX").json"
+          done
+          cp tools/load/soak-artifacts-seg-*.json "$AGGREGATE_INPUT_DIR/soak-segment-$(printf '%02d' "$SEGMENT_COUNT").json"
+          FOUND_COUNT="$(find "$AGGREGATE_INPUT_DIR" -type f -name 'soak-segment-*.json' | wc -l | tr -d ' ')"
+          if [ "$FOUND_COUNT" -ne "$SEGMENT_COUNT" ]; then
+            echo "::error::Expected $SEGMENT_COUNT campaign JSON files, found $FOUND_COUNT"
+            exit 1
+          fi
+      - name: Prepare single-segment aggregate input
+        if: github.event.inputs.segment_index == '1' && github.event.inputs.segment_count == '1'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tools/load/aggregate-input"
+          cp tools/load/soak-artifacts-seg-*.json "$GITHUB_WORKSPACE/tools/load/aggregate-input/soak-segment-01.json"
+      - name: Aggregate the complete campaign
+        if: github.event.inputs.segment_index == github.event.inputs.segment_count
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.release-evidence"
+          SOAK_AGGREGATE_OUT="$GITHUB_WORKSPACE/.release-evidence/soak-aggregate-${{ github.event.inputs.duration_hours }}h.json" \
+          bun tools/load/soak-addon.ts aggregate "$GITHUB_WORKSPACE/tools/load/aggregate-input"
+      - name: Upload aggregate evidence
+        if: github.event.inputs.segment_index == github.event.inputs.segment_count
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: soak-aggregate-${{ github.event.inputs.duration_hours }}h-${{ github.event.inputs.candidate_commit }}
+          path: .release-evidence/soak-aggregate-*.json
+          if-no-files-found: error
+          retention-days: 90

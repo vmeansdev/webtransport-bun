@@ -1,18 +1,21 @@
 #!/usr/bin/env bun
+
 /**
  * Stream throughput benchmark: MB/s using addon server (bidi echo) + client.
  * Opens bidi streams, writes payloads, reads echo, measures total bytes / elapsed time.
  */
 
-import {
-	createServer,
-	connect,
-} from "../../packages/webtransport/src/index.ts";
 import type { Duplex } from "node:stream";
+import {
+	connect,
+	createServer,
+} from "../../packages/webtransport/src/index.ts";
+import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 
 const PORT = Number(process.env.BENCH_PORT ?? 4445);
 const ROUNDS = Number(process.env.BENCH_ROUNDS ?? 50);
 const PAYLOAD_SIZE = 1024; // 1 KiB per write (server reads 1024 max)
+const CLOSE_TIMEOUT_MS = Number(process.env.BENCH_CLOSE_TIMEOUT_MS ?? 5_000);
 
 function writeAsync(stream: Duplex, chunk: Buffer): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -43,10 +46,29 @@ function readExactly(stream: Duplex, n: number): Promise<Buffer> {
 	});
 }
 
+async function finishStream(stream: Duplex): Promise<void> {
+	const ended = new Promise<void>((resolve, reject) => {
+		stream.once("end", resolve);
+		stream.once("error", reject);
+		stream.end();
+		stream.resume();
+	});
+	await Promise.race([
+		ended,
+		Bun.sleep(CLOSE_TIMEOUT_MS).then(() => {
+			throw new Error("stream-throughput: timed out waiting for clean FIN");
+		}),
+	]);
+}
+
 async function main() {
+	const cert = generateLocalhostCert();
+	if (!cert) {
+		throw new Error("stream-throughput: failed to generate localhost TLS cert");
+	}
 	const server = createServer({
 		port: PORT,
-		tls: { certPem: "", keyPem: "" },
+		tls: { certPem: cert.certPem, keyPem: cert.keyPem },
 		onSession: async (session) => {
 			for await (const duplex of session.incomingBidirectionalStreams) {
 				void (async () => {
@@ -60,7 +82,9 @@ async function main() {
 	await Bun.sleep(2000);
 
 	const url = `https://127.0.0.1:${PORT}`;
-	const client = await connect(url, { tls: { insecureSkipVerify: true } });
+	const client = await connect(url, {
+		tls: { caPem: cert.certPem, serverName: "localhost" },
+	});
 
 	const payload = Buffer.alloc(PAYLOAD_SIZE, "x");
 	const stream = await client.createBidirectionalStream();
@@ -73,12 +97,13 @@ async function main() {
 		await readExactly(stream, payload.length);
 		bytesWritten += payload.length;
 	}
-
 	const elapsed = (performance.now() - start) / 1000;
 	const mbps = bytesWritten / (1024 * 1024) / elapsed;
+	await finishStream(stream);
 
 	client.close();
 	await server.close();
+	cert.cleanup();
 
 	const result = {
 		name: "stream-throughput",

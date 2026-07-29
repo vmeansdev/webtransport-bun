@@ -5,15 +5,21 @@
 //! Kept as a regression test of the QUIC core; the crypto helpers are reused by
 //! the real endpoint state machine.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, ServerConfig,
 };
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use web_time::Instant;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const SERVER_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4433));
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const CLIENT_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5544));
 
 /// Build a rustls server config from DER cert + PKCS8 key, with the `h3` ALPN.
@@ -37,6 +43,19 @@ pub(crate) fn server_config_from_der(
 
 /// Generate a self-signed P-256 cert and build the rustls server config.
 pub(crate) fn server_crypto() -> Result<(rustls::ServerConfig, Vec<u8>), String> {
+    let (cfg, cert_der, _resolver) = server_crypto_with_resolver()?;
+    Ok((cfg, cert_der))
+}
+
+/// Same as [`server_crypto`] but returns the live TLS resolver for `update_tls`.
+pub(crate) fn server_crypto_with_resolver() -> Result<
+    (
+        rustls::ServerConfig,
+        Vec<u8>,
+        crate::server_tls::LiveServerCertResolver,
+    ),
+    String,
+> {
     let mut params =
         rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(|e| e.to_string())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
@@ -45,14 +64,18 @@ pub(crate) fn server_crypto() -> Result<(rustls::ServerConfig, Vec<u8>), String>
     let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
     let cert_der = cert.der().to_vec();
     let key_der = key.serialize_der();
-    let cfg = server_config_from_der(cert_der.clone(), key_der)?;
-    Ok((cfg, cert_der))
+    let (cfg, resolver) =
+        crate::server_tls::server_config_with_live_resolver(cert_der.clone(), key_der)?;
+    Ok((cfg, cert_der, resolver))
 }
 
-/// Dangerous verifier: accept any cert. Spike only — the real backend pins by hash.
+/// Dangerous verifier: accept any cert. Compiled only for `dev-insecure` builds
+/// and native unit tests — production/dist wasm omits this type entirely.
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
 #[derive(Debug)]
 pub(crate) struct AcceptAny;
 
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
 impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     fn verify_server_cert(
         &self,
@@ -87,6 +110,8 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
     }
 }
 
+/// Accept-any client crypto for tests / `dev-insecure` only.
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
 pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -99,7 +124,14 @@ pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
     Ok(cfg)
 }
 
+/// Production/dist builds: accept-any client crypto is unavailable.
+#[cfg(not(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32")))))]
+pub(crate) fn client_crypto() -> Result<rustls::ClientConfig, String> {
+    Err("E_INTERNAL: accept-any client crypto unavailable; use hash-pinned wt_new_client".into())
+}
+
 /// Route every transmit a connection wants to send into a flat list of payloads.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn drain_transmits(conn: &mut quinn_proto::Connection, now: Instant, out: &mut Vec<Vec<u8>>) {
     let max = conn.current_mtu() as usize;
     loop {
@@ -112,13 +144,24 @@ fn drain_transmits(conn: &mut quinn_proto::Connection, now: Instant, out: &mut V
 }
 
 /// Run a full in-memory client<->server QUIC handshake. Returns a status string.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn run_handshake() -> Result<String, String> {
     let (server_cfg, _cert_der) = server_crypto()?;
+    run_handshake_with(server_cfg, client_crypto()?)
+}
+
+/// Drive a full in-memory client<->server QUIC handshake with caller-supplied
+/// TLS configs, so trust models other than accept-any can be exercised.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn run_handshake_with(
+    server_cfg: rustls::ServerConfig,
+    client_cfg: rustls::ClientConfig,
+) -> Result<String, String> {
     let server_crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(server_cfg)
         .map_err(|e| format!("server quic cfg: {e}"))?;
     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
 
-    let client_crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(client_crypto()?)
+    let client_crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(client_cfg)
         .map_err(|e| format!("client quic cfg: {e}"))?;
     let client_config = ClientConfig::new(Arc::new(client_crypto));
 
@@ -145,7 +188,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
     for step in 0..200 {
         let now = Instant::now();
 
-        let inbound: Vec<Vec<u8>> = to_server.drain(..).collect();
+        let inbound = std::mem::take(&mut to_server);
         for dgram in inbound {
             let mut resp_buf = Vec::new();
             let data = bytes::BytesMut::from(&dgram[..]);
@@ -177,7 +220,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
             }
         }
 
-        let inbound: Vec<Vec<u8>> = to_client.drain(..).collect();
+        let inbound = std::mem::take(&mut to_client);
         for dgram in inbound {
             let mut resp_buf = Vec::new();
             let data = bytes::BytesMut::from(&dgram[..]);
@@ -194,7 +237,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
             }
         }
 
-        for (_ch, conn) in server_conns.iter_mut() {
+        for conn in server_conns.values_mut() {
             while let Some(ev) = conn.poll() {
                 if matches!(ev, Event::Connected) {
                     server_connected = true;
@@ -203,8 +246,14 @@ pub(crate) fn run_handshake() -> Result<String, String> {
             drain_transmits(conn, now, &mut to_client);
         }
         while let Some(ev) = client_conn.poll() {
-            if matches!(ev, Event::Connected) {
-                client_connected = true;
+            match ev {
+                Event::Connected => client_connected = true,
+                // Surface the TLS alert instead of letting a rejected
+                // certificate look like a generic stall.
+                Event::ConnectionLost { reason } => {
+                    return Err(format!("client connection lost: {reason}"))
+                }
+                _ => {}
             }
         }
         drain_transmits(&mut client_conn, now, &mut to_server);
@@ -220,7 +269,7 @@ pub(crate) fn run_handshake() -> Result<String, String> {
 
         if to_server.is_empty() && to_client.is_empty() {
             let mut progressed = false;
-            for (_ch, conn) in server_conns.iter_mut() {
+            for conn in server_conns.values_mut() {
                 if conn.poll_timeout().is_some() {
                     conn.handle_timeout(Instant::now());
                     drain_transmits(conn, Instant::now(), &mut to_client);

@@ -50,6 +50,12 @@ export class DirectSocketsUdpTransport implements UdpTransport {
 	private serverAddress?: string;
 	private serverPort?: number;
 	private closed = false;
+	private boundPort?: number;
+
+	/** Bound port reported by the socket; unset in client (connected) mode. */
+	get localPort(): number | undefined {
+		return this.boundPort;
+	}
 
 	private constructor(
 		private socket: UDPSocketLike,
@@ -79,13 +85,21 @@ export class DirectSocketsUdpTransport implements UdpTransport {
 		return t;
 	}
 
-	/** Server: bound-mode socket listening on a local address/port. */
+	/**
+	 * Server: bound-mode socket listening on a local address/port.
+	 *
+	 * Port 0 means "let the OS pick". The WICG spec rejects an explicit
+	 * `localPort: 0` with a TypeError, so the field is omitted instead; the real
+	 * port comes back on `openInfo.localPort` and is surfaced as `localPort`.
+	 */
 	static async bind(
 		localAddress: string,
 		localPort: number,
 	): Promise<DirectSocketsUdpTransport> {
 		const Ctor = getUDPSocket();
-		const socket = new Ctor({ localAddress, localPort });
+		const socket = new Ctor(
+			localPort === 0 ? { localAddress } : { localAddress, localPort },
+		);
 		const t = new DirectSocketsUdpTransport(socket, false);
 		await t.start();
 		return t;
@@ -93,6 +107,7 @@ export class DirectSocketsUdpTransport implements UdpTransport {
 
 	private async start(): Promise<void> {
 		const info = await this.socket.opened;
+		if (!this.connected) this.boundPort = info.localPort;
 		this.writer = info.writable.getWriter();
 		void this.readLoop(info.readable);
 	}

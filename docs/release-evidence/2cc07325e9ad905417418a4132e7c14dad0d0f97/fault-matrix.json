@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "kind": "command",
+  "name": "fault-matrix",
+  "commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+  "platform": {
+    "os": "darwin",
+    "arch": "arm64",
+    "runtime": "playwright"
+  },
+  "command": [
+    "bunx",
+    "playwright",
+    "test",
+    "-c",
+    "playwright.fault.config.ts"
+  ],
+  "exitCode": 0,
+  "notes": "seeded UDP fault matrix 1/1",
+  "startedAt": "2026-07-27T11:41:10.049025+00:00",
+  "finishedAt": "2026-07-27T11:41:10.049204+00:00",
+  "artifactSha256": "025000b6416957bc963457f9ab3d0a89f757a3cc98f357142edb1c3c7d819ad2"
+}

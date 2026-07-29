@@ -1,0 +1,21 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "runtime-consumers",
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "bun"
+	},
+	"command": [
+		"bun",
+		"test",
+		"packages/webtransport/test/internal-package-artifact.test.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T14:00:05+00:00",
+	"finishedAt": "2026-07-27T14:00:14+00:00",
+	"notes": "internal package artifact tests (wall window ~9s; rebind batch stamp corrected in round-3 L6 follow-up)",
+	"artifactSha256": "8a540a99f4e1fc1783060ec67b3681394bbed02fe5a86c7510ee277d594eb550"
+}

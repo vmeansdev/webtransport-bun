@@ -1,0 +1,12 @@
+{
+	"commit": "e08a05938ff221726b1dd4ce12063d16df5eceae",
+	"claimId": "wasm-facade-parity",
+	"createdAt": "2026-07-27T14:34:23.698945+00:00",
+	"status": "passed",
+	"notes": "Smoke bar: WasmClientArgs 0-RTT/QPACK passthrough; facade session-map datagram isolation + over-cap; WEBTRANSPORT_PARITY_BACKEND=wasm baseline/options/compat green. Soft divergences: allowPooling/waitUntilAvailable accepted-not-implemented; getStats zeros.",
+	"runner": "local-darwin-arm64",
+	"command": "WEBTRANSPORT_REQUIRE_WASM=1 bun test packages/webtransport/test/wasm-facade.test.ts && WEBTRANSPORT_PARITY_BACKEND=wasm bun test packages/webtransport/test/parity-baseline.test.ts packages/webtransport/test/parity-options.test.ts packages/webtransport/test/parity-compat.test.ts",
+	"startedAt": "2026-07-27T14:34:11.698945+00:00",
+	"endedAt": "2026-07-27T14:34:23.698945+00:00",
+	"durationMs": 12000
+}

@@ -69,3 +69,9 @@ scripts/mempal-sync-codex-convos.sh
 
 # Prebuilt wasm artifacts (produced by build:wasm:dist at publish time)
 packages/webtransport/wasm-dist/
+
+# Generated release evidence artifacts
+.release-evidence/
+
+# Local planning/tracker scratch files — never committed
+/.scratch/

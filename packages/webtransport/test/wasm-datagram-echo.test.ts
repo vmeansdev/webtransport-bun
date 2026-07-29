@@ -1,19 +1,13 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
-import { type WasmModule, WasmEndpoint } from "../src/backend-wasm.js";
+import { WasmEndpoint } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-// Loads the nodejs-target wasm-bindgen glue built by crates/wasm/build-wasm.sh.
-// If the wasm hasn't been built, skip rather than fail the default `bun test`
-// run — `bun run test:wasm` builds first and is the authoritative gate.
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 describe("wasm WebTransport backend (P1)", () => {
 	test.skipIf(!wasmAvailable)(
@@ -32,14 +26,15 @@ describe("wasm WebTransport backend (P1)", () => {
 					onEstablished: () => {
 						serverEstablished = true;
 					},
-					onDatagram: (conn, data) => {
-						server.sendDatagram(conn, data); // echo
+					onDatagram: (conn, sessionId, data) => {
+						server.sendDatagram(conn, sessionId, data); // echo
 					},
 				},
 			);
 
 			let received: Uint8Array | null = null;
 			let clientEstablished = false;
+			let clientSessionId = 0n;
 			const client = WasmEndpoint.create(
 				wasm,
 				relay.b,
@@ -47,10 +42,11 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:5544",
 				"127.0.0.1:4433",
 				{
-					onEstablished: () => {
+					onEstablished: (_conn, sessionId) => {
 						clientEstablished = true;
+						clientSessionId = sessionId;
 					},
-					onDatagram: (_conn, data) => {
+					onDatagram: (_conn, _sessionId, data) => {
 						received = data.slice();
 					},
 				},
@@ -68,7 +64,11 @@ describe("wasm WebTransport backend (P1)", () => {
 			expect(serverEstablished).toBe(true);
 			expect(clientEstablished).toBe(true);
 
-			client.sendDatagram(conn, new TextEncoder().encode("ping"));
+			client.sendDatagram(
+				conn,
+				clientSessionId,
+				new TextEncoder().encode("ping"),
+			);
 
 			const echoDeadline = Date.now() + 3000;
 			while (received === null && Date.now() < echoDeadline) {
@@ -99,8 +99,8 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:443",
 				"127.0.0.1:1001",
 				{
-					onDatagram: (conn, data) => {
-						server.sendDatagram(conn, data); // echo back to origin conn
+					onDatagram: (conn, sessionId, data) => {
+						server.sendDatagram(conn, sessionId, data); // echo back to origin conn
 					},
 				},
 			);
@@ -109,6 +109,8 @@ describe("wasm WebTransport backend (P1)", () => {
 			let bEcho: Uint8Array | null = null;
 			let aEst = false;
 			let bEst = false;
+			let aSessionId = 0n;
+			let bSessionId = 0n;
 			const clientA = WasmEndpoint.create(
 				wasm,
 				relay.endpoint(aAddr),
@@ -116,10 +118,11 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:1001",
 				"127.0.0.1:443",
 				{
-					onEstablished: () => {
+					onEstablished: (_c, sessionId) => {
 						aEst = true;
+						aSessionId = sessionId;
 					},
-					onDatagram: (_c, d) => {
+					onDatagram: (_c, _sid, d) => {
 						aEcho = d.slice();
 					},
 				},
@@ -131,10 +134,11 @@ describe("wasm WebTransport backend (P1)", () => {
 				"127.0.0.1:1002",
 				"127.0.0.1:443",
 				{
-					onEstablished: () => {
+					onEstablished: (_c, sessionId) => {
 						bEst = true;
+						bSessionId = sessionId;
 					},
-					onDatagram: (_c, d) => {
+					onDatagram: (_c, _sid, d) => {
 						bEcho = d.slice();
 					},
 				},
@@ -148,8 +152,16 @@ describe("wasm WebTransport backend (P1)", () => {
 			expect(aEst).toBe(true);
 			expect(bEst).toBe(true);
 
-			clientA.sendDatagram(connA, new TextEncoder().encode("alpha-payload"));
-			clientB.sendDatagram(connB, new TextEncoder().encode("bravo-payload"));
+			clientA.sendDatagram(
+				connA,
+				aSessionId,
+				new TextEncoder().encode("alpha-payload"),
+			);
+			clientB.sendDatagram(
+				connB,
+				bSessionId,
+				new TextEncoder().encode("bravo-payload"),
+			);
 
 			dl = Date.now() + 3000;
 			while ((aEcho === null || bEcho === null) && Date.now() < dl)

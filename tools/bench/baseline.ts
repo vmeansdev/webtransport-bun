@@ -4,37 +4,26 @@
  * Use for CI regression checks and baseline recording.
  */
 
-const ROOT = process.cwd();
-
-async function run(cmd: string[]): Promise<string> {
-	const p = Bun.spawn(cmd, { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
-	const out = await new Response(p.stdout).text();
-	const err = await new Response(p.stderr).text();
-	const exit = await p.exited;
-	if (exit !== 0) {
-		throw new Error(`Bench failed: ${cmd.join(" ")}\n${err}`);
-	}
-	return out + err;
-}
+import { runCommand } from "./bench-lib.ts";
 
 async function main() {
 	const results: Record<string, string> = {};
 	try {
-		const out = await run(["bun", "tools/bench/handshake-latency.ts"]);
+		const out = await runCommand(["bun", "tools/bench/handshake-latency.ts"]);
 		console.log(out.trim());
 		results.handshake = "ok";
 	} catch (e) {
 		results.handshake = "fail";
 	}
 	try {
-		const out = await run(["bun", "tools/bench/stream-throughput.ts"]);
+		const out = await runCommand(["bun", "tools/bench/stream-throughput.ts"]);
 		console.log(out.trim());
 		results.stream = "ok";
 	} catch (e) {
 		results.stream = "skip"; // stream bench can be flaky; non-fatal
 	}
 	try {
-		const out = await run(["bun", "run", "bench:datagram"]);
+		const out = await runCommand(["bun", "run", "bench:datagram"]);
 		console.log(out.trim());
 		results.datagram = "ok";
 	} catch (e) {

@@ -1,26 +1,70 @@
 // Browser / Isolated Web App entrypoint: `@webtransport-bun/webtransport/wasm`.
 //
-// Lazily used only in a Chromium IWA with Direct Sockets. The wasm-bindgen glue
-// (the `.wasm` + JS) is loaded by the consumer and passed in as `WasmModule`, so
-// importing this subpath pulls no wasm bytes on its own.
+// Plug-and-play: `await createServer({ port, tls, onSession })` auto-loads
+// `wasm-dist/web`, binds Direct Sockets, and returns a WasmWebTransportServer.
+// Lower-level APIs still accept an injected {@link WasmModule} for tests/custom hosts.
+//
+// CANDIDATE (coupled 1.0): `/wasm` is not yet under the package's stable 1.0.0
+// semver commitment. It joins GA only when docs/release-status.json marks
+// readiness=ready after wasm protocol bar (dynamic QPACK, multi-session, 0-RTT)
+// and wasm-facade-parity claims pass. Until then the facade may still change;
+// the frozen root entrypoint remains the native API. See docs/WASM_1.0_PLAN.md.
 
 export {
 	type BackendKind,
-	type NativeClientArgs,
-	type WasmClientArgs,
-	type WasmConnectOptions,
-	type WasmSession,
-	type WasmStream,
-	WasmTransportManager,
-	WasmWebTransport,
 	connectWasm,
 	connectWasmUnified,
 	createUnifiedClient,
 	createWasmServer,
+	DEFAULT_WASM_LIMITS,
+	DEFAULT_WASM_RATE_LIMITS,
 	isWasmRuntime,
+	MemoryTicketStoreHost,
+	FileTicketStoreHost,
+	IndexedDBTicketStoreHost,
+	type NativeClientArgs,
+	normalizeWasmEndpointOptions,
 	selectBackend,
 	serveOverUdp,
+	type TicketStoreHost,
+	type WasmClientArgs,
+	type WasmConnectOptions,
+	type WasmEndpointOptions,
+	type WasmLimitsOptions,
+	type WasmNormalizedEndpointOptions,
+	type WasmNormalizedLimits,
+	type WasmNormalizedRateLimits,
+	type WasmRateLimitOptions,
+	type WasmSession,
+	type WasmStream,
+	WasmTransportManager,
+	WasmWebTransport,
+	wasmClientPoolMetricsSnapshot,
+	toWasmServerSession,
+	WasmServerSession,
 } from "./backend.js";
+export {
+	createServer,
+	createIwaServer,
+	loadWasmWebModule,
+	type WasmCreateServerOptions,
+	type WasmCreateServerTls,
+	type WasmSniEntry,
+	type WasmWebTransportServer,
+} from "./wasm-create-server.js";
+export {
+	validateWasmWebTransportOptions,
+	type WasmWebTransportOptions,
+	WasmWebTransportSendGroup,
+} from "./wasm-webtransport.js";
+export {
+	createW3CMappedError,
+	normalizeW3CBrowserName,
+	validateW3CClientOptions,
+	type W3CClientOptionSurface,
+	type W3CCongestionControl,
+	type W3CDatagramsReadableType,
+} from "./w3c-client-options.js";
 export type { WasmModule, WasmSessionEvents } from "./backend-wasm.js";
 export type {
 	WebTransportLike,
@@ -33,8 +77,8 @@ import type { WasmModule } from "./backend-wasm.js";
 /**
  * Load the prebuilt Node/Bun wasm-bindgen module shipped with the npm package
  * (`wasm-dist/node`). In a source checkout, produce it first with
- * `bun run build:wasm:dist`. Browser/IWA consumers should instead load the
- * `web`-target glue (`wasm-dist/web`) and pass it in as {@link WasmModule}.
+ * `bun run build:wasm:dist`. Browser/IWA consumers should prefer
+ * {@link createServer} / {@link loadWasmWebModule} (`wasm-dist/web`).
  */
 export async function loadWasmModule(): Promise<WasmModule> {
 	// Computed specifier: the artifact is created at build/publish time, so the
@@ -55,5 +99,6 @@ export {
 	generateCert,
 	serverCertificateHashes,
 	type WasmCertModule,
+	WasmCertRotator,
 } from "./wasm-cert.js";
 export { InMemoryRelay, type UdpTransport } from "./wasm-relay.js";

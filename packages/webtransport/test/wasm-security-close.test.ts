@@ -1,20 +1,18 @@
 // Regression tests for the deep-review fixes: cert pinning, ready rejection,
 // per-session close semantics, close-code propagation, and IPv6 addressing.
 
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import { connectWasm, serveOverUdp, type WasmSession } from "../src/backend.js";
 import { formatAddr, type WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
+import { E_TLS } from "../src/errors.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -74,21 +72,26 @@ describe("cert pinning (serverCertificateHashes model)", () => {
 			ok.manager.close();
 			udpOk.close();
 
-			// Wrong pin: the TLS handshake must fail and connectWasm reject.
+			// Wrong pin: the TLS handshake must fail and connectWasm reject with
+			// the TLS reason (alert 49, access_denied) rather than an opaque
+			// pre-establishment close.
 			const wrongHash = btoa(String.fromCharCode(...new Uint8Array(32)));
 			const udpBad = await BunUdpTransport.connect("127.0.0.1", PORT);
-			await expect(
-				connectWasm(
-					wasm,
-					udpBad,
-					"localhost",
-					"127.0.0.1:0",
-					`127.0.0.1:${PORT}`,
-					{
-						certHashBase64: wrongHash,
-					},
-				),
-			).rejects.toThrow(/closed before session established/);
+			const rejected = await connectWasm(
+				wasm,
+				udpBad,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: wrongHash },
+			).then(
+				() => null,
+				(error: unknown) => error,
+			);
+			expect((rejected as { code?: string }).code).toBe(E_TLS);
+			expect(String(rejected)).toContain(
+				"E_TLS: handshake failed with TLS alert",
+			);
 			udpBad.close();
 
 			srv.manager.close();
@@ -106,10 +109,12 @@ describe("connection lifecycle", () => {
 			const udp = await BunUdpTransport.connect("127.0.0.1", 47859);
 			const t0 = Date.now();
 			await expect(
-				connectWasm(wasm, udp, "localhost", "127.0.0.1:0", "127.0.0.1:47859"),
-			).rejects.toThrow(/closed before session established/);
-			// Bounded by the 10s idle timeout, not hanging forever.
-			expect(Date.now() - t0).toBeLessThan(20_000);
+				connectWasm(wasm, udp, "localhost", "127.0.0.1:0", "127.0.0.1:47859", {
+					limits: { handshakeTimeoutMs: 50, idleTimeoutMs: 100 },
+				}),
+			).rejects.toThrow(/E_HANDSHAKE_TIMEOUT/);
+			// The configured handshake deadline bounds an unreachable peer.
+			expect(Date.now() - t0).toBeLessThan(1_000);
 			udp.close();
 		},
 		30_000,

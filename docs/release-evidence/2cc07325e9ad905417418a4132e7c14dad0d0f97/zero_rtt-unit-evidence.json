@@ -1,0 +1,8 @@
+{
+  "commit": "2cc07325e9ad905417418a4132e7c14dad0d0f97",
+  "claimId": "wasm-0rtt",
+  "createdAt": "2026-07-27T11:37:29.975696+00:00",
+  "status": "passed",
+  "notes": "crates/wasm ticket_store 0-RTT resume/reject tests + SECURITY.md anti-replay",
+  "runner": "local-darwin-arm64"
+}

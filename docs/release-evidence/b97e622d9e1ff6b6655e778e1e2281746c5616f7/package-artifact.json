@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "package-artifact",
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "bun"
+	},
+	"command": [
+		"bun",
+		"scripts/test-package-artifact.ts",
+		"build",
+		"&&",
+		"check"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T15:11:56+00:00",
+	"finishedAt": "2026-07-27T15:12:02+00:00",
+	"notes": "package artifact build+check",
+	"artifactSha256": "d212b65a87e4c26e160d5b2700d4659b891b357de75eff90325ce27a9dd88bba"
+}

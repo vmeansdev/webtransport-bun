@@ -1,0 +1,52 @@
+{
+	"lane": 4,
+	"round": 4,
+	"agent": "d1f9f9bf-1769-47b0-b6fd-cc9d0c2590c3",
+	"agentSelfVerdict": "READY",
+	"verdict": "NOT READY",
+	"note": "Agent self-scored READY but left open P2/P3; ledger treats any open P0–P4 as NOT READY.",
+	"findings": [
+		{
+			"id": "L4-P3-unified-client-opts",
+			"severity": "P3",
+			"status": "fixed",
+			"summary": "WasmClientArgs + createUnifiedClient now pass enable0Rtt, shareProcess0RttTicketStore, and QPACK options into connectWasmUnified",
+			"file": "packages/webtransport/src/backend.ts"
+		},
+		{
+			"id": "L4-P1-ticketstore-wiring",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "ticketStore take-before-connect via hydrateTicketsFromHost in connectWasm; dumpTicketsToHost + MemoryTicketStoreHost dump/import bindings present; pinned-client 0-RTT test covers path",
+			"file": "packages/webtransport/src/backend.ts"
+		},
+		{
+			"id": "L4-P2-soft-divergences",
+			"severity": "P2",
+			"status": "ok",
+			"summary": "allowPooling/waitUntilAvailable accepted-not-implemented and getStats zeros are explicit in wasm-webtransport JSDoc + PARITY_MATRIX/WASM_PROTOCOL_SCOPE/RELEASE notes (not silent lies)",
+			"file": "packages/webtransport/src/wasm-webtransport.ts"
+		},
+		{
+			"id": "L4-P2-opensession-bigint",
+			"severity": "P2",
+			"status": "ok",
+			"summary": "openSession returns BigInt(sid); over-cap rejects E_LIMIT_EXCEEDED; CONNECT fail/timeout map to E_SESSION_CLOSED/E_HANDSHAKE_TIMEOUT; facade session-map test asserts isolation + over-cap",
+			"file": "packages/webtransport/src/backend.ts"
+		},
+		{
+			"id": "L4-P2-ops-dump-overclaim",
+			"severity": "P2",
+			"status": "open",
+			"summary": "docs/OPERATIONS.md says ticketStore dumps after NST flush/close, but close() never auto-dumps; callers must invoke dumpTicketsToHost (code JSDoc is honest)",
+			"file": "docs/OPERATIONS.md"
+		},
+		{
+			"id": "L4-P3-unified-ticketstore",
+			"severity": "P3",
+			"status": "open",
+			"summary": "WasmClientArgs omits ticketStore (WasmConnectOptions has it); createUnifiedClient also discards manager so dumpTicketsToHost is unreachable on that entrypoint",
+			"file": "packages/webtransport/src/backend.ts"
+		}
+	]
+}

@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "status": "passed",
+  "startedAt": "2026-07-27T15:10:41.477Z",
+  "finishedAt": "2026-07-27T15:10:41.564Z",
+  "executionIdentity": "browser-iwa-direct-sockets",
+  "origin": "isolated-app://44g3uxb4r22pcyo52aid6u2a5fat3lkah6fvqv3fs5osduiz5z5qaaic",
+  "protocol": "isolated-app:",
+  "crossOriginIsolated": true,
+  "directSockets": true,
+  "functional": {
+    "datagram": "iwa-datagram",
+    "bidi": "iwa-bidi",
+    "uni": "iwa-uni",
+    "resetCode": 37,
+    "stopSendingCode": 41,
+    "peerClose": {
+      "code": 4100
+    }
+  },
+  "reconnects": [
+    {
+      "attempt": 1,
+      "payload": "iwa-reconnect-1"
+    },
+    {
+      "attempt": 2,
+      "payload": "iwa-reconnect-2"
+    },
+    {
+      "attempt": 3,
+      "payload": "iwa-reconnect-3"
+    },
+    {
+      "attempt": 4,
+      "payload": "iwa-reconnect-4"
+    },
+    {
+      "attempt": 5,
+      "payload": "iwa-reconnect-5"
+    },
+    {
+      "attempt": 6,
+      "payload": "iwa-reconnect-6"
+    },
+    {
+      "attempt": 7,
+      "payload": "iwa-reconnect-7"
+    },
+    {
+      "attempt": 8,
+      "payload": "iwa-reconnect-8"
+    }
+  ],
+  "certificateRotation": {
+    "oldPinRejected": true,
+    "oldHash": "Nouu5fkWf7Vl9XzZUxWX4mEtTg1S4060B5hyWo9QuRU=",
+    "newHash": "MvGmXzbZhMybwhK2S1mDZ/TwwnxSsEeIDs0p2j8ZHTo=",
+    "payload": "iwa-rotated-cert"
+  },
+  "browser": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "sourceCommit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+  "signedBundlePath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/.release-evidence/iwa/webtransport-wasm-iwa.swbn",
+  "signedBundleSha256": "fc2588b1ac02de57c06a677cf5c4caf36a4a68cb4e22f2613bb38a265cb3f929",
+  "unsignedBundlePath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/.release-evidence/iwa/webtransport-wasm-iwa.wbn",
+  "unsignedBundleSha256": "8b02154e5f310c38f8021649c4ffaf9cb0bd41bd4afd9e6e9e25ff93f44661e8",
+  "browserVersion": "150.0.7871.182",
+  "browserChannel": "playwright-chromium",
+  "browserExecutable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "localNetworkPermission": "pregranted-for-automated-proof",
+  "playwrightVersion": "1.58.2",
+  "claimId": "iwa-direct-sockets",
+  "commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7"
+}
