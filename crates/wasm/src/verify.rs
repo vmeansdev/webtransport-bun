@@ -230,6 +230,22 @@ pub fn client_crypto(trust: ClientTrust) -> Result<rustls::ClientConfig, String>
 /// resolves through `rustls-pki-types`' `web` feature to `web-time`, i.e. the
 /// browser's `Date.now()` — no custom `TimeProvider` is required.
 pub fn client_crypto_ca_roots(ca_pem: &str) -> Result<rustls::ClientConfig, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = ca_roots_verifier(ca_pem, provider.clone())?;
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(format_verify_error)?
+        .with_webpki_verifier(verifier)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(cfg)
+}
+
+/// Build the webpki chain verifier for a PEM bundle of trust anchors.
+fn ca_roots_verifier(
+    ca_pem: &str,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<rustls::client::WebPkiServerVerifier>, String> {
     let anchors = rustls_pemfile::certs(&mut ca_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("E_TLS: caPem: {e}"))?;
@@ -243,20 +259,9 @@ pub fn client_crypto_ca_roots(ca_pem: &str) -> Result<rustls::ClientConfig, Stri
             .map_err(|e| format!("E_TLS: caPem: {e}"))?;
     }
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider.clone(),
-    )
-    .build()
-    .map_err(|e| format!("E_TLS: caPem: {e}"))?;
-    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(format_verify_error)?
-        .with_webpki_verifier(verifier)
-        .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"h3".to_vec()];
-    Ok(cfg)
+    rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|e| format!("E_TLS: caPem: {e}"))
 }
 
 /// Build a TLS 1.3 / h3 client config that pins the server cert by hash.
@@ -496,6 +501,46 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(fixture(VALID_P256)).into();
         super::client_crypto(super::ClientTrust::Pinned(vec![digest]))
             .expect("dispatched pinned crypto");
+    }
+
+    #[test]
+    fn ca_roots_verifier_accepts_a_leaf_issued_by_the_trusted_anchor_only() {
+        let now_unix = 1_700_000_000;
+        let chain = crate::cert::generate_ca_signed("localhost", 14, now_unix).expect("chain");
+        let other =
+            crate::cert::generate_ca_signed("other.example", 14, now_unix).expect("other chain");
+
+        let verify_against = |ca_pem: &str| {
+            let verifier = super::ca_roots_verifier(
+                ca_pem,
+                std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .expect("ca verifier");
+            let leaf = rustls::pki_types::CertificateDer::from(chain.leaf.cert_der.clone());
+            let server_name =
+                rustls::pki_types::ServerName::try_from("localhost").expect("static server name");
+            verifier
+                .verify_server_cert(
+                    &leaf,
+                    &[],
+                    &server_name,
+                    &[],
+                    rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(
+                        now_unix as u64 + 3600,
+                    )),
+                )
+                .map(|_| ())
+        };
+
+        verify_against(&chain.ca_pem).expect("leaf must verify against its own CA");
+        let rejected = verify_against(&other.ca_pem).expect_err("foreign CA must not verify");
+        assert!(
+            matches!(
+                rejected,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+            ),
+            "unexpected rejection: {rejected}"
+        );
     }
 
     #[test]
