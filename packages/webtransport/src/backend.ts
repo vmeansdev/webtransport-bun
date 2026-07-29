@@ -1525,6 +1525,7 @@ export class WasmTransportManager {
 		options: WasmNormalizedEndpointOptions,
 		certHashesBase64?: string,
 		ticketStore: TicketStoreHost | null = null,
+		caPem?: string,
 	): WasmTransportManager {
 		const constructorOptions: WasmEndpointConstructorOptions = options;
 		return new WasmTransportManager(
@@ -1532,25 +1533,35 @@ export class WasmTransportManager {
 			onSession,
 			options,
 			(events) =>
-				!isServer && certHashesBase64
-					? WasmEndpoint.createPinnedClient(
+				!isServer && caPem
+					? WasmEndpoint.createCaVerifiedClient(
 							wasm,
 							udp,
 							addr,
 							peerAddr,
-							certHashesBase64,
+							caPem,
 							constructorOptions,
 							events,
 						)
-					: WasmEndpoint.create(
-							wasm,
-							udp,
-							isServer,
-							addr,
-							peerAddr,
-							constructorOptions,
-							events,
-						),
+					: !isServer && certHashesBase64
+						? WasmEndpoint.createPinnedClient(
+								wasm,
+								udp,
+								addr,
+								peerAddr,
+								certHashesBase64,
+								constructorOptions,
+								events,
+							)
+						: WasmEndpoint.create(
+								wasm,
+								udp,
+								isServer,
+								addr,
+								peerAddr,
+								constructorOptions,
+								events,
+							),
 			ticketStore,
 		);
 	}
@@ -1981,6 +1992,12 @@ export interface WasmConnectOptions {
 	 * the client accepts ANY server certificate.
 	 */
 	certHashBase64?: string;
+	/**
+	 * PEM bundle of CA roots to verify the server's chain against, as an
+	 * alternative to `certHashBase64` pinning. Mutually exclusive with it, and
+	 * the only roots trusted — wasm has no system trust store.
+	 */
+	caPem?: string;
 	limits?: WasmLimitsOptions;
 	rateLimits?: WasmRateLimitOptions;
 	wtMaxSessions?: number;
@@ -2031,6 +2048,12 @@ export async function connectWasm(
 			"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
 		);
 	}
+	if (opts.certHashBase64 && opts.caPem) {
+		throw new WebTransportError(
+			E_TLS as ErrorCode,
+			"E_TLS: certHashBase64 and caPem are mutually exclusive",
+		);
+	}
 
 	let mgr: WasmTransportManager | null = null;
 	let pooled = false;
@@ -2073,6 +2096,7 @@ export async function connectWasm(
 				normalized,
 				opts.certHashBase64,
 				opts.ticketStore ?? null,
+				opts.caPem,
 			);
 			wasmPoolPut(key, mgr);
 			pooled = true;
@@ -2088,6 +2112,7 @@ export async function connectWasm(
 			normalized,
 			opts.certHashBase64,
 			opts.ticketStore ?? null,
+			opts.caPem,
 		);
 	}
 

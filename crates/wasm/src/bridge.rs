@@ -498,16 +498,12 @@ pub fn wt_new_client_with_options(config_json: &str) -> String {
         Some(peer_addr) => peer_addr,
         None => return serde_json::json!({ "error": "peerAddr missing" }).to_string(),
     };
-    let cert_hashes_base64 = match parsed.get("certHashesBase64").and_then(|v| v.as_str()) {
-        Some(cert_hashes_base64) => cert_hashes_base64,
-        None => return serde_json::json!({ "error": "certHashesBase64 missing" }).to_string(),
-    };
     let peer = match peer_addr.parse() {
         Ok(peer) => peer,
         Err(err) => return serde_json::json!({ "error": format!("peer_addr: {err}") }).to_string(),
     };
-    let hashes = match crate::verify::PinnedCertVerifier::parse_hashes(cert_hashes_base64) {
-        Ok(hashes) => hashes,
+    let trust = match crate::verify::ClientTrust::from_config(&parsed) {
+        Ok(trust) => trust,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
     let limits = match parse_limits(&parsed) {
@@ -524,9 +520,9 @@ pub fn wt_new_client_with_options(config_json: &str) -> String {
         Ok(v) => v,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
-    match WtEndpoint::new_client_pinned_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+    match WtEndpoint::new_client_with_trust(
         peer,
-        hashes,
+        trust,
         limits,
         rate_limits,
         enable_0rtt,

@@ -1,4 +1,32 @@
+import {
+	E_INTERNAL,
+	E_TLS,
+	type ErrorCode,
+	WebTransportError,
+} from "./errors.js";
 import type { UdpAddr, UdpTransport } from "./wasm-relay.js";
+
+/**
+ * How a wasm client decides to trust the server: pin by SHA-256(DER), or
+ * verify the chain against caller-supplied CA roots. Exactly one applies.
+ */
+export type WasmClientTrust =
+	| { certHashesBase64: string; caPem?: never }
+	| { caPem: string; certHashesBase64?: never };
+
+/**
+ * Map a wasm client-construction failure onto the same error codes native
+ * reports, so a bad `caPem` surfaces as E_TLS on both backends rather than as
+ * an opaque internal error.
+ */
+function clientConstructionError(error: string | undefined): WebTransportError {
+	const message = error ?? "unknown error";
+	const code = message.startsWith("E_TLS") ? E_TLS : E_INTERNAL;
+	return new WebTransportError(
+		code as ErrorCode,
+		message.startsWith("E_") ? message : `${code}: ${message}`,
+	);
+}
 
 /**
  * Host-facing ticket persistence for wasm 0-RTT (Bun-first; IndexedDB IWA
@@ -632,6 +660,52 @@ export class WasmEndpoint {
 		optionsOrEvents: WasmEndpointConstructorOptions | WasmSessionEvents = {},
 		events: WasmSessionEvents = {},
 	): WasmEndpoint {
+		return WasmEndpoint.createClient(
+			wasm,
+			udp,
+			addr,
+			peerAddr,
+			{ certHashesBase64 },
+			optionsOrEvents,
+			events,
+		);
+	}
+
+	/**
+	 * Create a CLIENT endpoint that verifies the server's chain against the CA
+	 * roots in `caPem`. Nothing outside those roots is trusted — there is no
+	 * bundled or system trust store on wasm.
+	 */
+	static createCaVerifiedClient(
+		wasm: WasmModule,
+		udp: UdpTransport,
+		addr: string,
+		peerAddr: string,
+		caPem: string,
+		optionsOrEvents: WasmEndpointConstructorOptions | WasmSessionEvents = {},
+		events: WasmSessionEvents = {},
+	): WasmEndpoint {
+		return WasmEndpoint.createClient(
+			wasm,
+			udp,
+			addr,
+			peerAddr,
+			{ caPem },
+			optionsOrEvents,
+			events,
+		);
+	}
+
+	/** Shared client construction; `trust` selects pinning or CA roots. */
+	private static createClient(
+		wasm: WasmModule,
+		udp: UdpTransport,
+		addr: string,
+		peerAddr: string,
+		trust: WasmClientTrust,
+		optionsOrEvents: WasmEndpointConstructorOptions | WasmSessionEvents = {},
+		events: WasmSessionEvents = {},
+	): WasmEndpoint {
 		const options = isConstructorOptions(optionsOrEvents)
 			? optionsOrEvents
 			: {
@@ -666,13 +740,13 @@ export class WasmEndpoint {
 				JSON.stringify({
 					addr,
 					peerAddr,
-					certHashesBase64,
+					...trust,
 					...options,
 				}),
 			),
 		) as { eid?: number; error?: string };
 		if (parsed.error || parsed.eid == null) {
-			throw new Error(`wt_new_client failed: ${parsed.error ?? "unknown"}`);
+			throw clientConstructionError(parsed.error);
 		}
 		return new WasmEndpoint(wasm, udp, parsed.eid, sessionEvents);
 	}

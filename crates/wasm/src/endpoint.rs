@@ -871,7 +871,29 @@ impl WtEndpoint {
         share_process_0rtt_ticket_store: bool,
         congestion_control: CongestionControlMode,
     ) -> Result<Self, String> {
-        let crypto = crate::verify::client_crypto_pinned(hashes)?;
+        Self::new_client_with_trust(
+            peer_addr,
+            crate::verify::ClientTrust::Pinned(hashes),
+            limits,
+            rate_limits,
+            enable_0rtt,
+            share_process_0rtt_ticket_store,
+            congestion_control,
+        )
+    }
+
+    /// Client endpoint under an explicit trust model: hash pinning (the
+    /// default) or verification against caller-supplied CA roots.
+    pub fn new_client_with_trust(
+        peer_addr: SocketAddr,
+        trust: crate::verify::ClientTrust,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+        congestion_control: CongestionControlMode,
+    ) -> Result<Self, String> {
+        let crypto = crate::verify::client_crypto(trust)?;
         Self::build(
             false,
             peer_addr,
