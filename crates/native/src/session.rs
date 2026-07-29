@@ -448,6 +448,7 @@ mod tests {
             build_default_dev_resolver().expect("resolver"),
             crate::client::CongestionControlMode::Default,
             false,
+            false,
             3,
         )
         .expect("server start");
@@ -534,6 +535,7 @@ mod tests {
             client_conn.clone(),
             Arc::clone(&metrics),
             tight,
+            false,
         );
         drop(create_bi_rx);
         drop(create_uni_rx);
@@ -612,6 +614,7 @@ mod tests {
             client_conn.clone(),
             Arc::clone(&metrics),
             loose,
+            false,
         );
         drop(create_bi_rx);
         drop(create_uni_rx);

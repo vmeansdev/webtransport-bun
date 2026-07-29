@@ -301,6 +301,25 @@ pub(crate) fn congestion_controller_label(mode: CongestionControlMode) -> &'stat
     }
 }
 
+/// Build a fresh rustls client TLS config from trust inputs. For 0-RTT
+/// connects, do NOT call this per connect — resumption requires one shared
+/// config per identity (see `zero_rtt::shared_tls_for_identity`).
+pub(crate) fn build_client_tls_parts(
+    insecure_skip_verify: bool,
+    ca_pem: Option<&str>,
+    pinned_hashes: &[[u8; 32]],
+) -> std::result::Result<rustls::ClientConfig, String> {
+    if insecure_skip_verify {
+        build_client_tls_config(Arc::new(rustls::RootCertStore::empty()), true, &[])
+    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
+        let root_store = build_root_cert_store(ca_pem)?;
+        build_client_tls_config(root_store, false, pinned_hashes)
+    } else {
+        let root_store = build_root_cert_store(None)?;
+        build_client_tls_config(root_store, false, &[])
+    }
+}
+
 fn build_wtransport_client_config(
     insecure_skip_verify: bool,
     ca_pem: Option<&str>,
@@ -312,33 +331,12 @@ fn build_wtransport_client_config(
     let transport_config =
         build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
 
-    let config = if insecure_skip_verify {
-        let tls_config =
-            build_client_tls_config(Arc::new(rustls::RootCertStore::empty()), true, &[])
-                .map_err(std::io::Error::other)?;
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_custom_tls_and_transport(tls_config, transport_config)
-            .build()
-    } else if ca_pem.is_some() || !pinned_hashes.is_empty() {
-        let root_store = build_root_cert_store(ca_pem).map_err(std::io::Error::other)?;
-        let tls_config = build_client_tls_config(root_store, false, pinned_hashes)
-            .map_err(std::io::Error::other)?;
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_custom_tls_and_transport(tls_config, transport_config)
-            .build()
-    } else {
-        let root_store = build_root_cert_store(None).map_err(std::io::Error::other)?;
-        let tls_config =
-            build_client_tls_config(root_store, false, &[]).map_err(std::io::Error::other)?;
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_custom_tls_and_transport(tls_config, transport_config)
-            .build()
-    };
-
-    Ok(config)
+    let tls_config = build_client_tls_parts(insecure_skip_verify, ca_pem, pinned_hashes)
+        .map_err(std::io::Error::other)?;
+    Ok(wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_custom_tls_and_transport(tls_config, transport_config)
+        .build())
 }
 
 /// Insecure client config for Rust loopback coverage tests only.
@@ -375,6 +373,8 @@ pub struct ClientSessionHandle {
     closed: Arc<std::sync::atomic::AtomicBool>,
     /// Connection handle for wire-level stats (None for detached/test handles).
     conn: Option<wtransport::Connection>,
+    /// 0-RTT status for this connect (None when enable0Rtt was off).
+    zero_rtt: Option<crate::zero_rtt::ZeroRttHandleState>,
 }
 
 #[napi]
@@ -392,6 +392,35 @@ impl ClientSessionHandle {
     #[napi(getter)]
     pub fn peer_port(&self) -> u32 {
         self.peer_port
+    }
+
+    /// Whether this connect offered early data (a 0-RTT-capable resumption
+    /// ticket was consumed for it). False when enable0Rtt was off or there
+    /// was nothing to resume.
+    #[napi(getter, js_name = "has0Rtt")]
+    pub fn has_0rtt(&self) -> bool {
+        self.zero_rtt.as_ref().is_some_and(|z| z.has_0rtt)
+    }
+
+    /// Whether the server accepted this connect's early data. False until the
+    /// handshake completes; stays false when early data was refused (the
+    /// session then completed over a normal 1-RTT recovery).
+    #[napi(getter, js_name = "accepted0Rtt")]
+    pub fn accepted_0rtt(&self) -> bool {
+        self.zero_rtt
+            .as_ref()
+            .is_some_and(|z| z.has_0rtt && z.accepted.get().copied() == Some(true))
+    }
+
+    /// Whether the TLS handshake has completed. Always true for non-0-RTT
+    /// connects (connect resolves post-handshake); for 0-RTT connects this
+    /// flips once full cryptographic guarantees are in place.
+    #[napi(getter, js_name = "handshakeConfirmed")]
+    pub fn handshake_confirmed(&self) -> bool {
+        match self.zero_rtt.as_ref() {
+            Some(z) => z.accepted.get().is_some(),
+            None => true,
+        }
     }
 
     /// Real QUIC transport stats (rtt, wire bytes, packet counts).
@@ -571,6 +600,7 @@ impl ClientSessionHandle {
         on_closed: Option<ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
         backpressure_timeout_ms: u64,
         limits: crate::limits::Limits,
+        zero_rtt: Option<crate::zero_rtt::ZeroRttHandleState>,
     ) -> Self {
         let (dgram_send_tx, mut dgram_send_rx) = mpsc::channel::<Vec<u8>>(256);
         let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -606,6 +636,7 @@ impl ClientSessionHandle {
             client_metrics: Arc::clone(&cm),
             closed: Arc::clone(&closed_flag),
             conn: Some(conn.clone()),
+            zero_rtt,
         };
 
         let conn_bi = conn.clone();
@@ -912,7 +943,7 @@ fn connect_inner(
         let result = match run_connect(&url, opts_json)
             .await
             .map_err(|e| wt_from_upstream_error(e.to_string()))
-            .map(|(id, peer_ip, peer_port, conn, release_guard)| {
+            .map(|(id, peer_ip, peer_port, conn, release_guard, zero_rtt)| {
                 let handle = ClientSessionHandle::spawn_session_task(
                     id.clone(),
                     peer_ip,
@@ -922,6 +953,7 @@ fn connect_inner(
                     Some(on_closed_tsfn),
                     bp_timeout_ms,
                     client_limits,
+                    zero_rtt,
                 );
                 let insertion = insert_registry_entry(&CLIENT_HANDLE_REGISTRY, handle);
                 if insertion.poison_recovered {
@@ -1235,7 +1267,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-fn parse_server_certificate_hashes(
+pub(crate) fn parse_server_certificate_hashes(
     opts: &serde_json::Value,
 ) -> std::result::Result<Vec<[u8; 32]>, String> {
     let mut out = Vec::new();
@@ -1283,13 +1315,15 @@ fn parse_server_certificate_hashes(
     Ok(out)
 }
 
-/// Result of run_connect: session id, peer info, connection, and optional pool release guard.
+/// Result of run_connect: session id, peer info, connection, optional pool
+/// release guard, and 0-RTT status (None when enable0Rtt was off).
 pub type RunConnectResult = (
     String,
     String,
     u32,
     wtransport::Connection,
     Option<PoolReleaseGuard>,
+    Option<crate::zero_rtt::ZeroRttHandleState>,
 );
 
 async fn run_connect(
@@ -1325,6 +1359,17 @@ async fn run_connect(
         return Err(
             "E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true".into(),
         );
+    }
+
+    let enable_0rtt = opts
+        .get("enable0Rtt")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Pooling reuses live connections; 0-RTT is about new-connection latency
+    // and its has0Rtt/accepted0Rtt reporting is per-handshake. Combining the
+    // two would silently report nothing, so reject loudly instead.
+    if enable_0rtt && allow_pooling {
+        return Err("E_INTERNAL: enable0Rtt cannot be used with allowPooling=true".into());
     }
 
     let handshake_timeout_ms = opts
@@ -1397,7 +1442,24 @@ async fn run_connect(
         let addr = conn.remote_address();
         let peer_ip = addr.ip().to_string();
         let peer_port = addr.port() as u32;
-        return Ok((id, peer_ip, peer_port, conn, Some(release_guard)));
+        return Ok((id, peer_ip, peer_port, conn, Some(release_guard), None));
+    }
+
+    if enable_0rtt {
+        return run_connect_0rtt(
+            id,
+            &connect_url,
+            custom_resolver,
+            insecure_skip_verify,
+            ca_pem,
+            pinned_hashes.as_slice(),
+            server_name,
+            congestion_control,
+            idle_timeout_ms,
+            keep_alive_interval_ms,
+            handshake_timeout_ms,
+        )
+        .await;
     }
 
     let mut config = build_wtransport_client_config(
@@ -1426,7 +1488,98 @@ async fn run_connect(
     let peer_ip = addr.ip().to_string();
     let peer_port = addr.port() as u32;
 
-    Ok((id, peer_ip, peer_port, conn, None))
+    Ok((id, peer_ip, peer_port, conn, None, None))
+}
+
+/// 0-RTT connect path. Differs from the plain path in exactly two ways bound
+/// by the fork's contract: the TLS config comes from the per-identity shared
+/// cache (rustls resumes only under the SAME verifier Arc — a fresh config
+/// per connect would silently never resume), and `connect_0rtt` is used so a
+/// resumed session request rides in the first flight.
+///
+/// Timeout audit (0-RTT changes what "connected" means): `handshakeTimeoutMs`
+/// still bounds `connect_0rtt`, which resolves when the session request is
+/// answered — possibly BEFORE the TLS handshake completes. The remaining
+/// confirmation is tracked by a watcher task whose future resolves at
+/// handshake completion or connection loss, both bounded by the idle timeout,
+/// so no timer waits on a weaker event than it did before.
+#[allow(clippy::too_many_arguments)]
+async fn run_connect_0rtt(
+    id: String,
+    connect_url: &str,
+    custom_resolver: Option<StaticSocketResolver>,
+    insecure_skip_verify: bool,
+    ca_pem: Option<&str>,
+    pinned_hashes: &[[u8; 32]],
+    server_name: Option<&str>,
+    congestion_control: CongestionControlMode,
+    idle_timeout_ms: u64,
+    keep_alive_interval_ms: u64,
+    handshake_timeout_ms: u64,
+) -> std::result::Result<RunConnectResult, Box<dyn std::error::Error + Send + Sync>> {
+    let key = crate::zero_rtt::TlsIdentityKey::new(insecure_skip_verify, ca_pem, pinned_hashes);
+    let (tls_config, store) = crate::zero_rtt::shared_tls_for_identity(&key, ca_pem, pinned_hashes)
+        .map_err(std::io::Error::other)?;
+
+    let transport_config =
+        build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
+    let mut config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_custom_tls_and_transport(tls_config, transport_config)
+        .enable_0rtt(true)
+        .build();
+    if let Some(resolver) = custom_resolver {
+        config.set_dns_resolver(resolver);
+    }
+
+    // The name rustls sees is the SNI host: an explicit serverName override,
+    // else the URL host of the (possibly rewritten) connect URL.
+    let sni_host = match server_name {
+        Some(sni) if !sni.is_empty() => sni.to_string(),
+        _ => url::Url::parse(connect_url)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+            .unwrap_or_default(),
+    };
+    let sni_name = rustls::pki_types::ServerName::try_from(sni_host.clone()).ok();
+
+    let endpoint = wtransport::Endpoint::client(config)?;
+    let early_takes_before = sni_name
+        .as_ref()
+        .map(|n| store.early_take_count(n))
+        .unwrap_or(0);
+    let conn = tokio::time::timeout(
+        tokio::time::Duration::from_millis(handshake_timeout_ms),
+        endpoint.connect_0rtt(connect_url),
+    )
+    .await
+    .map_err(|_| "E_HANDSHAKE_TIMEOUT")?
+    .map_err(map_connecting_error)?;
+    let has_0rtt = sni_name
+        .as_ref()
+        .map(|n| store.early_take_count(n) > early_takes_before)
+        .unwrap_or(false);
+
+    let accepted: Arc<std::sync::OnceLock<bool>> = Arc::new(std::sync::OnceLock::new());
+    let accepted_writer = Arc::clone(&accepted);
+    let conn_watch = conn.clone();
+    CLIENT_RUNTIME.spawn(async move {
+        let result = conn_watch.handshake_confirmed().await;
+        let _ = accepted_writer.set(result);
+    });
+
+    let addr = conn.remote_address();
+    let peer_ip = addr.ip().to_string();
+    let peer_port = addr.port() as u32;
+
+    Ok((
+        id,
+        peer_ip,
+        peer_port,
+        conn,
+        None,
+        Some(crate::zero_rtt::ZeroRttHandleState { has_0rtt, accepted }),
+    ))
 }
 
 #[cfg(test)]
@@ -1541,6 +1694,7 @@ mod tests {
             client_metrics: Arc::new(ClientMetrics::default()),
             closed: Arc::clone(&closed_flag),
             conn: None,
+            zero_rtt: None,
         };
         let insertion = insert_registry_entry(&CLIENT_HANDLE_REGISTRY, handle);
         assert!(!insertion.poison_recovered);
@@ -1589,6 +1743,7 @@ mod tests {
                 client_metrics: Arc::new(ClientMetrics::default()),
                 closed: Arc::new(AtomicBool::new(false)),
                 conn: None,
+                zero_rtt: None,
             },
         );
         let _ = std::panic::catch_unwind(|| {

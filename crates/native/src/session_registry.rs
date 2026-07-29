@@ -224,6 +224,12 @@ pub struct SessionState {
     pub datagram_lifecycle_closed: Arc<AtomicBool>,
     /// Effective limits for this session (captured from owning server).
     pub limits: crate::limits::Limits,
+    /// Whether the session request arrived as 0-RTT early data (replayable).
+    pub is_0rtt: bool,
+    /// Whether the TLS handshake has completed. Initialized true for non-0-RTT
+    /// sessions (accept resolves post-handshake); for 0-RTT sessions the
+    /// accept-loop watcher flips it at handshake completion.
+    pub handshake_confirmed: Arc<AtomicBool>,
 }
 
 static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
@@ -239,6 +245,7 @@ pub fn insert(
     conn: Connection,
     metrics: Arc<ServerMetrics>,
     limits: crate::limits::Limits,
+    is_0rtt: bool,
 ) -> (
     mpsc::Sender<DatagramSlot>,
     mpsc::Sender<ClientBidiStreamHandle>,
@@ -271,6 +278,8 @@ pub fn insert(
         datagram_capacity_notify: Arc::clone(&datagram_capacity_notify),
         datagram_lifecycle_closed,
         limits,
+        is_0rtt,
+        handshake_confirmed: Arc::new(AtomicBool::new(!is_0rtt)),
     };
     REGISTRY.insert(session_id, state);
     (
@@ -282,6 +291,13 @@ pub fn insert(
         session_metrics,
         datagram_capacity_notify,
     )
+}
+
+/// 0-RTT status of a session: (is_0rtt, handshake_confirmed flag).
+pub fn zero_rtt_state(session_id: &str) -> Option<(bool, Arc<AtomicBool>)> {
+    REGISTRY
+        .get(session_id)
+        .map(|entry| (entry.is_0rtt, Arc::clone(&entry.handshake_confirmed)))
 }
 
 pub fn get_stream_capacity_notify(session_id: &str) -> Option<Arc<Notify>> {

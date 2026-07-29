@@ -48,6 +48,32 @@ impl SessionHandle {
         self.peer_port
     }
 
+    /// Whether this session's CONNECT arrived as replayable 0-RTT early data.
+    /// False for closed/unknown sessions and whenever the server did not
+    /// enable 0-RTT.
+    #[napi(getter, js_name = "has0Rtt")]
+    pub fn has_0rtt(&self) -> bool {
+        session_registry::zero_rtt_state(&self.id).is_some_and(|(is_0rtt, _)| is_0rtt)
+    }
+
+    /// Whether this process accepted the client's early data. On the server
+    /// this equals has0Rtt: a request that was readable from early data was
+    /// by definition accepted; a refused flight is retried by the client as
+    /// 1-RTT and arrives with has0Rtt=false.
+    #[napi(getter, js_name = "accepted0Rtt")]
+    pub fn accepted_0rtt(&self) -> bool {
+        self.has_0rtt()
+    }
+
+    /// Whether the TLS handshake has completed for this session. Always true
+    /// for non-0-RTT sessions; for 0-RTT sessions it flips once the client is
+    /// authenticated and the session request is no longer replayable.
+    #[napi(getter, js_name = "handshakeConfirmed")]
+    pub fn handshake_confirmed(&self) -> bool {
+        session_registry::zero_rtt_state(&self.id)
+            .is_some_and(|(_, confirmed)| confirmed.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Real QUIC transport stats (rtt, wire bytes, packet counts) for this session.
     #[napi]
     pub fn connection_stats(&self) -> WtResult<Option<crate::metrics::QuicConnectionStats>> {
