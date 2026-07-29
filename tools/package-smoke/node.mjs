@@ -204,6 +204,11 @@ export async function main(runtime = "node") {
 		0,
 		"production WASM must compile out the unpinned dev-insecure client",
 	);
+	assert.equal(
+		typeof wasmModule.wt_generate_ca_signed_cert_for_test,
+		"undefined",
+		"production WASM must not export the test-only CA chain generator",
+	);
 
 	let client;
 	const serverErrors = [];

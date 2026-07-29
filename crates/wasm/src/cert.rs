@@ -73,6 +73,73 @@ pub fn generate(
     })
 }
 
+/// A CA cert plus a leaf issued by it — the shape `caPem` client trust needs,
+/// which `generate` cannot produce (a self-signed leaf is not a trust anchor).
+///
+/// TEST/DEV ONLY, gated exactly like the accept-any client verifier: a shipped
+/// (`wasm-dist`) build compiles this out entirely. Production servers get their
+/// chain from a real CA; the wasm backend never mints one.
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
+pub struct GeneratedChain {
+    pub ca_pem: String,
+    pub leaf: GeneratedCert,
+}
+
+/// Issue a P-256 leaf for `common_name` under a freshly minted P-256 CA. The
+/// leaf honours the same `1..=14` day clamp as [`generate`]; the CA shares the
+/// leaf's window so the whole chain is valid over exactly that period.
+#[cfg(any(feature = "dev-insecure", all(test, not(target_arch = "wasm32"))))]
+pub fn generate_ca_signed(
+    common_name: &str,
+    validity_days: u32,
+    not_before_unix: i64,
+) -> Result<GeneratedChain, String> {
+    use rcgen::{BasicConstraints, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyUsagePurpose};
+
+    let days = clamp_validity_days(validity_days);
+    let not_before =
+        OffsetDateTime::from_unix_timestamp(not_before_unix).map_err(format_cert_error)?;
+    let not_after = not_before
+        .checked_add(Duration::days(days))
+        .ok_or_else(validity_end_out_of_range)?;
+
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).map_err(format_cert_error)?;
+    let mut ca_dn = DistinguishedName::new();
+    ca_dn.push(rcgen::DnType::CommonName, format!("{common_name} test ca"));
+    ca_params.distinguished_name = ca_dn;
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(format_cert_error)?;
+    let ca_cert = ca_params.self_signed(&ca_key).map_err(format_cert_error)?;
+
+    let mut leaf_params =
+        CertificateParams::new(vec![common_name.to_string()]).map_err(format_cert_error)?;
+    let mut leaf_dn = DistinguishedName::new();
+    leaf_dn.push(rcgen::DnType::CommonName, common_name);
+    leaf_params.distinguished_name = leaf_dn;
+    leaf_params.not_before = not_before;
+    leaf_params.not_after = not_after;
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(format_cert_error)?;
+    let issuer = Issuer::from_params(&ca_params, &ca_key);
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .map_err(format_cert_error)?;
+
+    Ok(GeneratedChain {
+        ca_pem: ca_cert.pem(),
+        leaf: GeneratedCert {
+            cert_pem: leaf.pem(),
+            key_pem: leaf_key.serialize_pem(),
+            cert_der: leaf.der().to_vec(),
+            key_der: leaf_key.serialize_der(),
+        },
+    })
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -96,6 +163,53 @@ mod tests {
         assert_eq!(clamp_validity_days(365), 14);
         let c = generate("localhost", 365, 1_700_000_000).expect("cert");
         assert!(!c.cert_der.is_empty());
+    }
+
+    #[test]
+    fn ca_signed_chain_has_a_real_anchor_and_a_clamped_leaf() {
+        let now = 1_700_000_000;
+        let chain = generate_ca_signed("localhost", 365, now).expect("chain");
+        assert!(chain.ca_pem.contains("BEGIN CERTIFICATE"));
+        assert!(chain.leaf.cert_pem.contains("BEGIN CERTIFICATE"));
+
+        let ca_der = pem_to_der(&chain.ca_pem);
+        let (_, ca) = x509_parser::parse_x509_certificate(&ca_der).expect("ca der");
+        assert!(
+            ca.basic_constraints()
+                .expect("bc")
+                .expect("present")
+                .value
+                .ca
+        );
+
+        let (_, leaf) =
+            x509_parser::parse_x509_certificate(&chain.leaf.cert_der).expect("leaf der");
+        assert!(leaf
+            .basic_constraints()
+            .expect("bc")
+            .is_none_or(|bc| !bc.value.ca));
+        assert_eq!(leaf.issuer(), ca.subject(), "leaf must chain to the CA");
+        assert_ne!(
+            leaf.issuer(),
+            leaf.subject(),
+            "leaf must not be self-issued"
+        );
+
+        let validity = leaf.validity();
+        assert_eq!(validity.not_before.timestamp(), now);
+        assert_eq!(
+            validity.not_after.timestamp() - validity.not_before.timestamp(),
+            14 * 24 * 60 * 60,
+            "leaf validity must stay inside the 14-day browser window"
+        );
+    }
+
+    fn pem_to_der(pem: &str) -> Vec<u8> {
+        rustls_pemfile::certs(&mut pem.as_bytes())
+            .next()
+            .expect("one certificate")
+            .expect("valid pem")
+            .to_vec()
     }
 
     #[test]

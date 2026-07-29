@@ -330,6 +330,35 @@ pub fn wt_generate_cert(common_name: &str, validity_days: u32, not_before_unix: 
     }
 }
 
+/// TEST/DEV ONLY: generate a P-256 leaf issued by a throwaway CA, so the
+/// `caPem` client trust path can be exercised against a real chain. Returns
+/// JSON `{ "caPem": ..., "certPem": ..., "keyPem": ..., "hashBase64": ... }`.
+///
+/// Compiled only under `dev-insecure`, exactly like the accept-any client: a
+/// shipped (`wasm-dist`) artifact does not export this at all.
+#[cfg(feature = "dev-insecure")]
+#[wasm_bindgen]
+pub fn wt_generate_ca_signed_cert_for_test(
+    common_name: &str,
+    validity_days: u32,
+    not_before_unix: f64,
+) -> String {
+    let not_before_unix = match parse_unix_seconds(not_before_unix) {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({ "error": error }).to_string(),
+    };
+    match crate::cert::generate_ca_signed(common_name, validity_days, not_before_unix) {
+        Ok(chain) => serde_json::json!({
+            "caPem": chain.ca_pem,
+            "certPem": chain.leaf.cert_pem,
+            "keyPem": chain.leaf.key_pem,
+            "hashBase64": crate::cert::sha256_base64(&chain.leaf.cert_der),
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({ "error": e }).to_string(),
+    }
+}
+
 /// Create a server endpoint with a freshly generated P-256 cert. Returns JSON:
 /// `{ "eid": <number>, "hashBase64": ... }` for the client's serverCertificateHashes.
 #[wasm_bindgen]
