@@ -1,8 +1,9 @@
 import type { WasmSession } from "./backend.js";
 
 /**
- * Thin server-session facade over {@link WasmSession} for closer native
- * ServerSession ergonomics without inventing plug-and-play createServer().
+ * Thin server-session facade over {@link WasmSession} for wasm/IWA
+ * `createServer` `onSession` callbacks. This is intentionally not the native
+ * `ServerSession` type — stream ReadableStreams / Node duplexes are not mirrored.
  */
 export class WasmServerSession {
 	constructor(private readonly session: WasmSession) {}

@@ -61,6 +61,10 @@ These are **1.0 requirements**, not permanent product omissions. Treat
 ## Server-in-browser constraint
 
 The in-browser server path requires Direct Sockets in a Chromium Isolated Web
-App; see `README.md` and `docs/COMPATIBILITY.md`. `/wasm` remains a
-**candidate** surface until coupled promote succeeds — tracked in
+App; see `README.md` and `docs/COMPATIBILITY.md`. On that path,
+`await createServer(...)` / `createIwaServer` from
+`@webtransport-bun/webtransport/wasm` is the plug-and-play entry (auto-loads
+`wasm-dist/web`, binds UDP, returns `WasmWebTransportServer` with live
+`certHashBase64`). It is not the root native sync `createServer`. `/wasm`
+remains a **candidate** surface until coupled promote succeeds — tracked in
 `docs/WASM_1.0_PLAN.md` and `docs/release-status.json`.

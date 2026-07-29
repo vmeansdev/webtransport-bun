@@ -35,8 +35,12 @@ with the `direct-sockets` permission — not on normal pages, not in Firefox or
 Safari. Enable `chrome://flags/#enable-isolated-web-apps` and
 `#enable-isolated-web-app-dev-mode`, then install the bundle via
 `chrome://web-app-internals`. Full walkthrough:
-`examples/webtransport-wasm-iwa/README.md`. Note this gates only *hosting* a
-server; connecting to one works from any standard WebTransport client.
+`examples/webtransport-wasm-iwa/README.md`. Inside an IWA you can use
+`await createServer({ port, tls, onSession })` from
+`@webtransport-bun/webtransport/wasm` (also exported as `createIwaServer`).
+That is not the root package's native sync `createServer`. Note this gates
+only *hosting* a server; connecting to one works from any standard
+WebTransport client.
 
 ## Clients suddenly fail to connect to my wasm server after ~2 weeks
 
