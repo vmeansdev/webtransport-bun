@@ -254,12 +254,12 @@
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
-			"status": "passed",
+			"status": "pending",
 			"evidenceIds": [
 				"local-facade_parity-cb0cb69"
 			],
 			"gaRequired": true,
-			"notes": "Session-map smoke + unified client ticketStore/manager return."
+			"notes": "DEMOTED 2026-07-29: the cb0cb69 evidence is a session-map smoke plus unified-client return-shape check, which no longer supports a facade-parity claim now that the wasm server session converges on the native ServerSession surface. Superseding run at 11abb39: all 9 parity suites on both backends (native 67/0, wasm 64 pass/3 skip/0 fail) in docs/release-evidence/11abb39cf65613a0772fc43b73a4a567595a694b/facade_parity-dual-backend-evidence.json. Held at pending because passed evidence must name candidate.commit, still cb0cb69; rebinding the candidate is a maintainer decision."
 		}
 	],
 	"surfaces": {
