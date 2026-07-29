@@ -348,6 +348,14 @@ export type LimitsOptions = {
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
 	idleTimeoutMs: number;
+	/**
+	 * Keep-alive ping interval in ms. On the server, sessions emit QUIC
+	 * keep-alive packets so idle-but-healthy connections survive
+	 * `idleTimeoutMs`; the effective interval is clamped to
+	 * `min(keepAliveIntervalMs, idleTimeoutMs / 3)`. `0` or omitted disables
+	 * keep-alive (the default).
+	 */
+	keepAliveIntervalMs?: number;
 };
 
 /** Default limit values from AGENTS.md */

@@ -414,6 +414,11 @@ pub(crate) fn spawn_wtransport_server(
                     return;
                 }
             };
+            let config_builder = config_builder.keep_alive_interval(
+                limits
+                    .effective_keep_alive_interval_ms()
+                    .map(std::time::Duration::from_millis),
+            );
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
                 Ok(s) => {
