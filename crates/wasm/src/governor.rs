@@ -9,6 +9,20 @@ const HOST_TIMER_MAX_MS: u64 = i32::MAX as u64;
 const RATE_LIMIT_FP_SCALE: u128 = 1_000_000;
 const MIN_RATE_LIMIT_BUCKET_CAP: usize = 64;
 
+/// Per-IP buckets alone are trivially defeated: a single /24 gives an attacker
+/// 256 addresses and a /64 gives more than any bucket map could hold. Requests
+/// therefore also draw from a bucket shared by everyone in the same aggregate,
+/// /24 for IPv4 and /64 for IPv6 — the smallest blocks routinely allocated to
+/// one customer, so aggregating them rarely groups unrelated tenants.
+const IPV4_AGGREGATE_PREFIX_BITS: u32 = 24;
+const IPV6_AGGREGATE_PREFIX_BITS: u32 = 64;
+
+/// How much more traffic an aggregate may draw than a single address. Set so a
+/// legitimately busy prefix (a NAT gateway, a mobile carrier block) is not
+/// throttled to one host's budget, while a spray across the block still hits a
+/// ceiling far below `hosts × per-IP rate`.
+const AGGREGATE_RATE_MULTIPLIER: u32 = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WasmLimits {
     pub max_sessions: usize,
@@ -209,14 +223,31 @@ impl RateLimitDimension {
             },
         }
     }
+
+    /// Budget for the shared /24 or /64 bucket: the per-IP budget scaled up so
+    /// a busy prefix is not held to one address's rate.
+    fn aggregate_bucket_config(self, limits: &WasmRateLimits) -> TokenBucketConfig {
+        let config = self.bucket_config(limits);
+        TokenBucketConfig {
+            rate_per_sec: config
+                .rate_per_sec
+                .saturating_mul(AGGREGATE_RATE_MULTIPLIER),
+            burst: config.burst.saturating_mul(AGGREGATE_RATE_MULTIPLIER),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RateLimitSnapshot {
     pub bucket_count: usize,
+    /// Live /24 and /64 aggregate buckets.
+    pub prefix_bucket_count: usize,
     pub rate_limited_handshake_count: u64,
     pub rate_limited_stream_open_count: u64,
     pub rate_limited_datagram_ingress_count: u64,
+    /// Subset of the above that the aggregate bucket rejected rather than the
+    /// per-IP one — tells an operator a spray across a block is in progress.
+    pub rate_limited_by_prefix_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -232,7 +263,26 @@ impl PeerKey {
             },
         }
     }
+
+    /// Network address of the aggregate this peer belongs to.
+    fn aggregate(self) -> PrefixKey {
+        match self.0 {
+            IpAddr::V4(ip) => {
+                let mask = (!0u32) << (32 - IPV4_AGGREGATE_PREFIX_BITS);
+                PrefixKey(IpAddr::V4((u32::from(ip) & mask).into()))
+            }
+            IpAddr::V6(ip) => {
+                let mask = (!0u128) << (128 - IPV6_AGGREGATE_PREFIX_BITS);
+                PrefixKey(IpAddr::V6((u128::from(ip) & mask).into()))
+            }
+        }
+    }
 }
+
+/// The /24 or /64 an address falls in. Distinct from [`PeerKey`] so the two
+/// bucket maps can never be confused for one another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PrefixKey(IpAddr);
 
 #[derive(Clone, Copy, Debug)]
 struct TokenBucketConfig {
@@ -254,13 +304,17 @@ impl TokenBucketState {
         }
     }
 
-    fn try_consume(&mut self, now: Instant, config: TokenBucketConfig) -> bool {
+    /// Refill, then report whether a token is available without taking it.
+    /// Split from [`Self::spend`] so a request that must satisfy several
+    /// buckets can check them all before charging any.
+    fn peek(&mut self, now: Instant, config: TokenBucketConfig) -> bool {
         self.refill(now, config);
-        if self.tokens_fp < RATE_LIMIT_FP_SCALE {
-            return false;
-        }
-        self.tokens_fp -= RATE_LIMIT_FP_SCALE;
-        true
+        self.tokens_fp >= RATE_LIMIT_FP_SCALE
+    }
+
+    /// Take the token a preceding [`Self::peek`] found.
+    fn spend(&mut self) {
+        self.tokens_fp = self.tokens_fp.saturating_sub(RATE_LIMIT_FP_SCALE);
     }
 
     fn refill(&mut self, now: Instant, config: TokenBucketConfig) {
@@ -295,18 +349,36 @@ struct PeerBucket {
 
 impl PeerBucket {
     fn new(now: Instant, rate_limits: &WasmRateLimits) -> Self {
+        Self::with_config(now, rate_limits, RateLimitDimension::bucket_config)
+    }
+
+    /// A fresh aggregate bucket, starting at the (larger) aggregate burst so a
+    /// prefix's first requests are not charged against a single host's budget.
+    fn new_aggregate(now: Instant, rate_limits: &WasmRateLimits) -> Self {
+        Self::with_config(
+            now,
+            rate_limits,
+            RateLimitDimension::aggregate_bucket_config,
+        )
+    }
+
+    fn with_config(
+        now: Instant,
+        rate_limits: &WasmRateLimits,
+        config: fn(RateLimitDimension, &WasmRateLimits) -> TokenBucketConfig,
+    ) -> Self {
         Self {
             handshakes: TokenBucketState::new(
                 now,
-                RateLimitDimension::Handshake.bucket_config(rate_limits),
+                config(RateLimitDimension::Handshake, rate_limits),
             ),
             stream_opens: TokenBucketState::new(
                 now,
-                RateLimitDimension::StreamOpen.bucket_config(rate_limits),
+                config(RateLimitDimension::StreamOpen, rate_limits),
             ),
             datagrams_ingress: TokenBucketState::new(
                 now,
-                RateLimitDimension::DatagramIngress.bucket_config(rate_limits),
+                config(RateLimitDimension::DatagramIngress, rate_limits),
             ),
             owner_count: 0,
             last_touched: now,
@@ -328,10 +400,12 @@ pub struct PeerRateLimiter {
     idle_ttl: Duration,
     max_buckets: usize,
     buckets: HashMap<PeerKey, PeerBucket>,
+    prefix_buckets: HashMap<PrefixKey, PeerBucket>,
     connection_owners: HashMap<u32, PeerKey>,
     rate_limited_handshake_count: u64,
     rate_limited_stream_open_count: u64,
     rate_limited_datagram_ingress_count: u64,
+    rate_limited_by_prefix_count: u64,
 }
 
 impl PeerRateLimiter {
@@ -343,10 +417,12 @@ impl PeerRateLimiter {
             idle_ttl: Duration::from_millis(limits.idle_timeout_ms),
             max_buckets: Self::bucket_cap(limits),
             buckets: HashMap::new(),
+            prefix_buckets: HashMap::new(),
             connection_owners: HashMap::new(),
             rate_limited_handshake_count: 0,
             rate_limited_stream_open_count: 0,
             rate_limited_datagram_ingress_count: 0,
+            rate_limited_by_prefix_count: 0,
         })
     }
 
@@ -387,6 +463,13 @@ impl PeerRateLimiter {
         let bucket = self.ensure_bucket(now, peer, RateLimitDimension::Handshake)?;
         bucket.owner_count = bucket.owner_count.saturating_add(1);
         bucket.last_touched = now;
+        // The aggregate bucket is pinned by live connections too, so an active
+        // prefix cannot idle out and hand an attacker a fresh full bucket.
+        self.ensure_prefix_bucket(now, peer.aggregate(), RateLimitDimension::Handshake)?;
+        if let Some(bucket) = self.prefix_buckets.get_mut(&peer.aggregate()) {
+            bucket.owner_count = bucket.owner_count.saturating_add(1);
+            bucket.last_touched = now;
+        }
         self.connection_owners.insert(conn, peer);
         Ok(())
     }
@@ -400,14 +483,17 @@ impl PeerRateLimiter {
     pub fn snapshot(&self) -> RateLimitSnapshot {
         RateLimitSnapshot {
             bucket_count: self.buckets.len(),
+            prefix_bucket_count: self.prefix_buckets.len(),
             rate_limited_handshake_count: self.rate_limited_handshake_count,
             rate_limited_stream_open_count: self.rate_limited_stream_open_count,
             rate_limited_datagram_ingress_count: self.rate_limited_datagram_ingress_count,
+            rate_limited_by_prefix_count: self.rate_limited_by_prefix_count,
         }
     }
 
     pub fn clear(&mut self) {
         self.buckets.clear();
+        self.prefix_buckets.clear();
         self.connection_owners.clear();
     }
 
@@ -425,13 +511,51 @@ impl PeerRateLimiter {
         peer: PeerKey,
         dimension: RateLimitDimension,
     ) -> Result<(), String> {
-        let config = dimension.bucket_config(&self.rate_limits);
-        let bucket = self.ensure_bucket(now, peer, dimension)?;
-        bucket.last_touched = now;
-        if bucket.bucket_mut(dimension).try_consume(now, config) {
+        let peer_config = dimension.bucket_config(&self.rate_limits);
+        let prefix_config = dimension.aggregate_bucket_config(&self.rate_limits);
+
+        // Both the per-IP bucket and the aggregate it belongs to must have a
+        // token. They are refilled and peeked before either is charged, so a
+        // rejected request never leaves the other bucket short.
+        self.ensure_bucket(now, peer, dimension)?;
+        self.ensure_prefix_bucket(now, peer.aggregate(), dimension)?;
+
+        let peer_ready = {
+            let bucket = self.buckets.get_mut(&peer).expect("bucket just ensured");
+            bucket.last_touched = now;
+            bucket.bucket_mut(dimension).peek(now, peer_config)
+        };
+        let prefix_ready = {
+            let bucket = self
+                .prefix_buckets
+                .get_mut(&peer.aggregate())
+                .expect("prefix bucket just ensured");
+            bucket.last_touched = now;
+            bucket.bucket_mut(dimension).peek(now, prefix_config)
+        };
+
+        if peer_ready && prefix_ready {
+            self.buckets
+                .get_mut(&peer)
+                .expect("bucket just ensured")
+                .bucket_mut(dimension)
+                .spend();
+            self.prefix_buckets
+                .get_mut(&peer.aggregate())
+                .expect("prefix bucket just ensured")
+                .bucket_mut(dimension)
+                .spend();
             return Ok(());
         }
+
         self.bump_counter(dimension);
+        if !prefix_ready {
+            self.rate_limited_by_prefix_count = self.rate_limited_by_prefix_count.saturating_add(1);
+            return Err(format!(
+                "E_RATE_LIMITED: {} rate limit reached for the peer's network prefix",
+                dimension.error_label()
+            ));
+        }
         Err(format!(
             "E_RATE_LIMITED: {} rate limit reached",
             dimension.error_label()
@@ -455,8 +579,36 @@ impl PeerRateLimiter {
             .or_insert_with(|| PeerBucket::new(now, &self.rate_limits)))
     }
 
+    /// Same admission rule as [`Self::ensure_bucket`], against the aggregate
+    /// map. Capped separately so the two maps together stay within twice the
+    /// per-IP bound rather than growing without limit.
+    fn ensure_prefix_bucket(
+        &mut self,
+        now: Instant,
+        prefix: PrefixKey,
+        dimension: RateLimitDimension,
+    ) -> Result<(), String> {
+        if !self.prefix_buckets.contains_key(&prefix)
+            && self.prefix_buckets.len() >= self.max_buckets
+        {
+            self.bump_counter(dimension);
+            self.rate_limited_by_prefix_count = self.rate_limited_by_prefix_count.saturating_add(1);
+            return Err(
+                "E_RATE_LIMITED: peer prefix rate limit bucket capacity reached".to_string(),
+            );
+        }
+        self.prefix_buckets
+            .entry(prefix)
+            .or_insert_with(|| PeerBucket::new_aggregate(now, &self.rate_limits));
+        Ok(())
+    }
+
     fn decrement_owner(&mut self, peer: PeerKey, now: Instant) {
         if let Some(bucket) = self.buckets.get_mut(&peer) {
+            bucket.owner_count = bucket.owner_count.saturating_sub(1);
+            bucket.last_touched = now;
+        }
+        if let Some(bucket) = self.prefix_buckets.get_mut(&peer.aggregate()) {
             bucket.owner_count = bucket.owner_count.saturating_sub(1);
             bucket.last_touched = now;
         }
@@ -465,13 +617,15 @@ impl PeerRateLimiter {
 
     fn evict_idle_zero_owner(&mut self, now: Instant) {
         let idle_ttl = self.idle_ttl;
-        self.buckets.retain(|_, bucket| {
+        let live = |bucket: &PeerBucket| {
             bucket.owner_count > 0
                 || now
                     .checked_duration_since(bucket.last_touched)
                     .unwrap_or_default()
                     < idle_ttl
-        });
+        };
+        self.buckets.retain(|_, bucket| live(bucket));
+        self.prefix_buckets.retain(|_, bucket| live(bucket));
     }
 
     fn bump_counter(&mut self, dimension: RateLimitDimension) {
@@ -936,7 +1090,8 @@ mod tests {
     use web_time::Instant;
 
     use super::{
-        Governor, PeerRateLimiter, RateLimitDimension, StreamKind, WasmLimits, WasmRateLimits,
+        Governor, PeerKey, PeerRateLimiter, RateLimitDimension, StreamKind, WasmLimits,
+        WasmRateLimits, AGGREGATE_RATE_MULTIPLIER,
     };
 
     #[test]
@@ -1886,8 +2041,10 @@ mod tests {
             .is_ok());
 
         // max_buckets = max(1*2, 1*2, 64) = 64; fill remaining capacity then trip.
-        for i in 0..62u16 {
-            let peer = SocketAddr::from((Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8), 4000));
+        // One address per /24 so this exercises the per-IP bucket cap rather
+        // than the aggregate bucket the whole block would otherwise share.
+        for i in 0..62u8 {
+            let peer = SocketAddr::from((Ipv4Addr::new(10, 0, i, 1), 4000));
             assert!(
                 limiter
                     .check(now, peer, RateLimitDimension::Handshake)
@@ -1904,6 +2061,116 @@ mod tests {
             Some("E_RATE_LIMITED: peer rate limit bucket capacity reached")
         );
         assert!(limiter.snapshot().rate_limited_datagram_ingress_count > 0);
+    }
+
+    #[test]
+    fn peer_key_aggregates_to_slash24_and_slash64() {
+        let key = |s: &str| PeerKey::from_socket_addr(SocketAddr::new(s.parse().unwrap(), 443));
+        let agg = |s: &str| key(s).aggregate().0.to_string();
+
+        assert_eq!(agg("203.0.113.7"), "203.0.113.0");
+        assert_eq!(agg("203.0.113.255"), "203.0.113.0");
+        assert_ne!(agg("203.0.113.7"), agg("203.0.114.7"));
+
+        assert_eq!(agg("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::");
+        assert_eq!(agg("2001:db8:1:2::ffff"), "2001:db8:1:2::");
+        assert_ne!(agg("2001:db8:1:2::1"), agg("2001:db8:1:3::1"));
+
+        // v4-mapped v6 addresses fold onto the v4 aggregate, matching PeerKey.
+        assert_eq!(agg("::ffff:203.0.113.7"), "203.0.113.0");
+    }
+
+    #[test]
+    fn rate_limit_aggregates_a_flood_spread_across_one_prefix() {
+        let now = Instant::now();
+        let limits = WasmRateLimits {
+            handshakes_per_sec: 2,
+            handshakes_burst: 2,
+            stream_opens_per_sec: 2,
+            stream_opens_burst: 2,
+            datagrams_ingress_per_sec: 2,
+            datagrams_ingress_burst: 2,
+        };
+        let mut limiter =
+            PeerRateLimiter::new(limits.clone(), &WasmLimits::default()).expect("rate limiter");
+
+        // Per-IP burst is 2, so 200 fresh addresses would buy 400 handshakes
+        // without aggregation. The shared /24 caps the block at burst * 8.
+        let allowed = (0..200u8)
+            .filter(|i| {
+                let peer = SocketAddr::from((Ipv4Addr::new(198, 51, 100, *i), 443));
+                limiter
+                    .check(now, peer, RateLimitDimension::Handshake)
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(
+            allowed,
+            (limits.handshakes_burst * AGGREGATE_RATE_MULTIPLIER) as usize
+        );
+
+        let snapshot = limiter.snapshot();
+        assert!(snapshot.rate_limited_by_prefix_count > 0);
+        assert_eq!(snapshot.rate_limited_handshake_count, 200 - allowed as u64);
+        // One aggregate bucket covered every one of those addresses.
+        assert_eq!(snapshot.prefix_bucket_count, 1);
+
+        // A neighbouring /24 is unaffected: aggregation must not become a
+        // global limit.
+        let neighbour = SocketAddr::from((Ipv4Addr::new(198, 51, 101, 1), 443));
+        assert!(limiter
+            .check(now, neighbour, RateLimitDimension::Handshake)
+            .is_ok());
+        assert_eq!(limiter.snapshot().prefix_bucket_count, 2);
+
+        // The rejection names the prefix so operators can tell the two apart.
+        let same_block = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 250), 443));
+        let err = limiter
+            .check(now, same_block, RateLimitDimension::Handshake)
+            .expect_err("prefix exhausted");
+        assert!(err.contains("E_RATE_LIMITED"));
+        assert!(err.contains("network prefix"));
+    }
+
+    #[test]
+    fn rate_limit_aggregate_refills_and_does_not_charge_rejected_requests() {
+        let now = Instant::now();
+        let limits = WasmRateLimits {
+            handshakes_per_sec: 1,
+            handshakes_burst: 1,
+            stream_opens_per_sec: 1,
+            stream_opens_burst: 1,
+            datagrams_ingress_per_sec: 1,
+            datagrams_ingress_burst: 1,
+        };
+        let mut limiter =
+            PeerRateLimiter::new(limits, &WasmLimits::default()).expect("rate limiter");
+
+        // Drain the /24 aggregate (burst 1 * 8) using eight distinct addresses.
+        for i in 0..8u8 {
+            let peer = SocketAddr::from((Ipv4Addr::new(192, 0, 2, i), 443));
+            assert!(limiter
+                .check(now, peer, RateLimitDimension::Handshake)
+                .is_ok());
+        }
+        let blocked = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 100), 443));
+        assert!(limiter
+            .check(now, blocked, RateLimitDimension::Handshake)
+            .is_err());
+
+        // The rejected request must not have spent the fresh per-IP token: once
+        // the aggregate refills, that address gets its full per-IP burst.
+        let later = now + Duration::from_secs(10);
+        assert!(limiter
+            .check(later, blocked, RateLimitDimension::Handshake)
+            .is_ok());
+
+        // Aggregation is per dimension: draining handshakes leaves datagram
+        // ingress for the same block untouched.
+        let peer = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 443));
+        assert!(limiter
+            .check(now, peer, RateLimitDimension::DatagramIngress)
+            .is_ok());
     }
 
     #[test]
