@@ -94,13 +94,13 @@ fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Li
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CongestionControlMode {
+pub(crate) enum CongestionControlMode {
     Default,
     Throughput,
     LowLatency,
 }
 
-fn parse_congestion_control(
+pub(crate) fn parse_congestion_control(
     opts: &serde_json::Value,
 ) -> std::result::Result<CongestionControlMode, String> {
     match opts
@@ -118,10 +118,10 @@ fn parse_congestion_control(
     }
 }
 
-fn build_quic_transport_config(
+pub(crate) fn apply_congestion_controller(
+    config: &mut wtransport::config::QuicTransportConfig,
     mode: CongestionControlMode,
-) -> wtransport::config::QuicTransportConfig {
-    let mut config = wtransport::config::QuicTransportConfig::default();
+) {
     let factory: Arc<dyn wtransport::quinn::congestion::ControllerFactory + Send + Sync + 'static> =
         match mode {
             CongestionControlMode::Default => {
@@ -135,11 +135,18 @@ fn build_quic_transport_config(
             }
         };
     config.congestion_controller_factory(factory);
+}
+
+fn build_quic_transport_config(
+    mode: CongestionControlMode,
+) -> wtransport::config::QuicTransportConfig {
+    let mut config = wtransport::config::QuicTransportConfig::default();
+    apply_congestion_controller(&mut config, mode);
     config
 }
 
 #[cfg(test)]
-fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
+pub(crate) fn congestion_controller_label(mode: CongestionControlMode) -> &'static str {
     match mode {
         CongestionControlMode::Default => "cubic",
         CongestionControlMode::Throughput => "bbr",
