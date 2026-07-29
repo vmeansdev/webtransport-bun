@@ -2142,11 +2142,23 @@ export async function serveOverUdp(
 		keyPem?: string;
 		onSession: (session: WasmSession) => void;
 	} & WasmEndpointOptions,
-): Promise<{ manager: WasmTransportManager; certHashBase64: string }> {
+): Promise<{
+	manager: WasmTransportManager;
+	certHashBase64: string;
+	localPort: number;
+}> {
 	const normalized = normalizeWasmEndpointOptions(opts);
 	const udp = await bind(opts.localAddress ?? "0.0.0.0", opts.localPort);
+	// With the ephemeral port 0 the OS picks; the endpoint must be told the real
+	// port or it advertises :0 as its own address.
+	const localPort = udp.localPort ?? opts.localPort;
 	let adopted = false;
 	try {
+		if (opts.localPort === 0 && localPort === 0) {
+			throw new Error(
+				"bind() requested ephemeral port 0 but the transport did not report a bound localPort",
+			);
+		}
 		const notBefore = Math.floor(Date.now() / 1000) - 3600;
 		const pemFields =
 			opts.certPem != null && opts.keyPem != null
@@ -2154,7 +2166,7 @@ export async function serveOverUdp(
 				: {};
 		const json = wasm.wt_new_server_with_options(
 			JSON.stringify({
-				addr: `${opts.localAddress ?? "0.0.0.0"}:${opts.localPort}`,
+				addr: `${opts.localAddress ?? "0.0.0.0"}:${localPort}`,
 				peerAddr: "127.0.0.1:0",
 				commonName: opts.commonName ?? "localhost",
 				validityDays: opts.validityDays ?? 14,
@@ -2187,7 +2199,7 @@ export async function serveOverUdp(
 		manager.ownTransport(udp);
 		adopted = true;
 		if (opts.log) manager.setLog(opts.log, opts.debug === true);
-		return { manager, certHashBase64: parsed.hashBase64 };
+		return { manager, certHashBase64: parsed.hashBase64, localPort };
 	} catch (err) {
 		if (!adopted) {
 			try {

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { connectWasm } from "../src/backend.js";
+import { BunUdpTransport } from "../src/bun-udp.js";
+import { DirectSocketsUdpTransport } from "../src/direct-sockets.js";
 import { createServer, createIwaServer } from "../src/wasm-create-server.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
@@ -21,17 +23,33 @@ describe("wasm createServer plug-and-play", () => {
 		).rejects.toThrow(/UDPSocket unavailable|E_UNSUPPORTED_ARGUMENT/);
 	});
 
-	test("rejects port 0", async () => {
+	test("rejects out-of-range ports", async () => {
+		const relay = new InMemoryRelay();
+		for (const port of [-1, 65536, 1.5]) {
+			await expect(
+				createServer({
+					port,
+					tls: { allowSelfSigned: true },
+					wasm: wasmAvailable ? wasm : ({} as never),
+					bind: async () => relay.a,
+					onSession: () => {},
+				}),
+			).rejects.toThrow(/port must be an integer|E_INVALID_ARGUMENT/);
+		}
+	});
+
+	test("port 0 without a transport-reported localPort fails loudly", async () => {
 		const relay = new InMemoryRelay();
 		await expect(
 			createServer({
 				port: 0,
 				tls: { allowSelfSigned: true },
 				wasm: wasmAvailable ? wasm : ({} as never),
+				// InMemoryRelay endpoints do not report a bound port.
 				bind: async () => relay.a,
 				onSession: () => {},
 			}),
-		).rejects.toThrow(/port must be an integer|E_INVALID_ARGUMENT/);
+		).rejects.toThrow(/did not report a bound localPort/);
 	});
 
 	test("rejects empty PEM without allowSelfSigned", async () => {
@@ -49,6 +67,107 @@ describe("wasm createServer plug-and-play", () => {
 
 	test("createIwaServer is an alias of createServer", () => {
 		expect(createIwaServer).toBe(createServer);
+	});
+
+	test.skipIf(!wasmAvailable)(
+		"port 0 over Bun UDP: address.port is the real bound port and serves traffic",
+		async () => {
+			const server = await createServer({
+				host: "127.0.0.1",
+				port: 0,
+				tls: { allowSelfSigned: true, commonName: "localhost" },
+				wasm,
+				bind: (host, port) => BunUdpTransport.bind(host, port),
+				onSession: (session) => {
+					session.onDatagram((d) => {
+						void session.sendDatagram(d);
+					});
+				},
+			});
+
+			expect(server.address.port).toBeGreaterThan(0);
+			expect(server.address.port).toBeLessThanOrEqual(65535);
+
+			const clientUdp = await BunUdpTransport.connect(
+				"127.0.0.1",
+				server.address.port,
+			);
+			const { session: client, manager: clientMgr } = await connectWasm(
+				wasm,
+				clientUdp,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${server.address.port}`,
+				{ certHashBase64: server.certHashBase64 },
+			);
+
+			let dgram: Uint8Array | null = null;
+			client.onDatagram((d) => {
+				dgram = d.slice();
+			});
+			await client.sendDatagram(new TextEncoder().encode("ephemeral"));
+
+			await withTimeout(
+				(async () => {
+					while (dgram === null) await Bun.sleep(5);
+				})(),
+				5000,
+				"ephemeral-port datagram echo",
+			);
+			expect(new TextDecoder().decode(dgram as unknown as Uint8Array)).toBe(
+				"ephemeral",
+			);
+
+			clientMgr.close();
+			clientUdp.close();
+			await server.close();
+		},
+	);
+
+	test("Direct Sockets bind(0) omits localPort and surfaces openInfo.localPort", async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		const prior = (globalThis as { UDPSocket?: unknown }).UDPSocket;
+		// Mirrors WICG semantics: an explicit localPort of 0 is a TypeError, and
+		// omitting it lets the OS pick a port reported on `opened`.
+		(globalThis as { UDPSocket?: unknown }).UDPSocket = class {
+			opened: Promise<{
+				readable: ReadableStream<never>;
+				writable: WritableStream<never>;
+				localAddress?: string;
+				localPort?: number;
+			}>;
+			constructor(options: Record<string, unknown>) {
+				seen.push(options);
+				if (options.localPort === 0) {
+					throw new TypeError("localPort must be greater than zero");
+				}
+				this.opened = Promise.resolve({
+					readable: new ReadableStream<never>(),
+					writable: new WritableStream<never>(),
+					localAddress: "127.0.0.1",
+					localPort: options.localPort === undefined ? 51234 : 4433,
+				});
+			}
+			async close(): Promise<void> {}
+		};
+		try {
+			const ephemeral = await DirectSocketsUdpTransport.bind("127.0.0.1", 0);
+			expect(seen.at(-1)).toEqual({ localAddress: "127.0.0.1" });
+			expect(ephemeral.localPort).toBe(51234);
+			await ephemeral.close();
+
+			const fixed = await DirectSocketsUdpTransport.bind("127.0.0.1", 4433);
+			expect(seen.at(-1)).toEqual({
+				localAddress: "127.0.0.1",
+				localPort: 4433,
+			});
+			expect(fixed.localPort).toBe(4433);
+			await fixed.close();
+		} finally {
+			if (prior === undefined)
+				(globalThis as { UDPSocket?: unknown }).UDPSocket = undefined;
+			else (globalThis as { UDPSocket?: unknown }).UDPSocket = prior;
+		}
 	});
 
 	test.skipIf(!wasmAvailable)(

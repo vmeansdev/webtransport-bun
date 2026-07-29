@@ -7,6 +7,7 @@ import type { UdpAddr, UdpTransport } from "./wasm-relay.js";
 interface BunUdpSocket {
 	send(data: Uint8Array, port?: number, address?: string): number | boolean;
 	close(): void;
+	readonly port?: number;
 }
 interface BunUdpGlobal {
 	udpSocket(opts: {
@@ -36,10 +37,15 @@ export class BunUdpTransport implements UdpTransport {
 	private cb: ((data: Uint8Array, source: UdpAddr) => void) | null = null;
 	private closed = false;
 
+	/** Bound port (OS-assigned when the caller passed 0); unset in client mode. */
+	readonly localPort?: number;
+
 	private constructor(
 		private socket: BunUdpSocket,
 		private connected: boolean,
-	) {}
+	) {
+		if (!connected) this.localPort = socket.port;
+	}
 
 	/** Client: connected socket toward a fixed server. */
 	static async connect(host: string, port: number): Promise<BunUdpTransport> {

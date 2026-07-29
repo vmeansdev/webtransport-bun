@@ -9,6 +9,11 @@ export interface UdpAddr {
 }
 
 export interface UdpTransport {
+	/**
+	 * Port the socket actually bound to. Set by bound-mode (server) adapters and
+	 * is the OS-assigned port when the caller asked for the ephemeral port 0.
+	 */
+	readonly localPort?: number;
 	/** Send `data` toward `dest`. A connected client socket may ignore `dest`. */
 	send(data: Uint8Array, dest: UdpAddr): void;
 	/** Register the inbound-packet callback; `source` is the sender's address. */
