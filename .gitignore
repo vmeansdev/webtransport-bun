@@ -54,6 +54,7 @@ Task.md
 .chunkhound.json
 .chunkhound/
 .codex/
+.cursor/
 .mcp.json
 .mempalace/
 .omc/
@@ -62,6 +63,9 @@ entities.json
 mempalace.yaml
 memory/
 scripts/mempal-sync-codex-convos.sh
+
+# Nested git worktrees checked out inside the repo directory
+/feat-wasm-1.0/
 
 # Prebuilt wasm artifacts (produced by build:wasm:dist at publish time)
 packages/webtransport/wasm-dist/
