@@ -402,6 +402,7 @@ pub(crate) fn spawn_wtransport_server(
     congestion_control: client::CongestionControlMode,
     debug_logs: bool,
     enable_0rtt: bool,
+    allow_early_session: bool,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -689,27 +690,50 @@ pub(crate) fn spawn_wtransport_server(
                                                 limits.clone(),
                                                 is_0rtt,
                                             );
-                                        // Flip handshake_confirmed once full TLS
-                                        // guarantees exist. Resolves at handshake
-                                        // completion or connection loss (bounded
-                                        // by the idle timeout), so it cannot hang.
+                                        // Replay-safety gate. The session request is
+                                        // the replayable unit of 0-RTT, so by default
+                                        // the onSession lifecycle event is deferred
+                                        // until the handshake is confirmed (the request
+                                        // is then no longer replayable). allowEarlySession
+                                        // opts out, surfacing the session immediately
+                                        // with is_0rtt observable for apps that only do
+                                        // idempotent work pre-confirmation.
+                                        //
+                                        // Either way the handshake_confirmed flag must
+                                        // flip so the session getter reflects reality;
+                                        // handshake_confirmed() resolves at completion or
+                                        // connection loss (bounded by the idle timeout),
+                                        // so neither path can hang forever.
                                         if is_0rtt {
-                                            if let Some((_, confirmed_flag)) =
-                                                session_registry::zero_rtt_state(&id)
-                                            {
-                                                let conn_confirm = connection.clone();
-                                                panic_guard::spawn_quic_task_scoped(
-                                                    panic_guard::PanicScope::Server(owner_server_id),
-                                                    async move {
-                                                        let _ = conn_confirm
-                                                            .handshake_confirmed()
-                                                            .await;
-                                                        confirmed_flag.store(
-                                                            true,
-                                                            std::sync::atomic::Ordering::Release,
-                                                        );
-                                                    },
-                                                );
+                                            let confirmed_flag = session_registry::zero_rtt_state(&id)
+                                                .map(|(_, flag)| flag);
+                                            if allow_early_session {
+                                                if let Some(flag) = confirmed_flag {
+                                                    let conn_confirm = connection.clone();
+                                                    panic_guard::spawn_quic_task_scoped(
+                                                        panic_guard::PanicScope::Server(owner_server_id),
+                                                        async move {
+                                                            let _ = conn_confirm
+                                                                .handshake_confirmed()
+                                                                .await;
+                                                            flag.store(
+                                                                true,
+                                                                std::sync::atomic::Ordering::Release,
+                                                            );
+                                                        },
+                                                    );
+                                                }
+                                            } else {
+                                                // Deferred default: block this session's
+                                                // setup until confirmation, then flip the
+                                                // flag before the onSession event fires.
+                                                let _ = connection.handshake_confirmed().await;
+                                                if let Some(flag) = confirmed_flag {
+                                                    flag.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
+                                                }
                                             }
                                         }
                                         let stream_capacity_notify =

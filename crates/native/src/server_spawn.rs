@@ -46,6 +46,7 @@ pub(crate) fn spawn_server_instance(
     congestion_control: crate::client::CongestionControlMode,
     debug: bool,
     enable_0rtt: bool,
+    allow_early_session: bool,
     max_retries: usize,
 ) -> std::result::Result<(watch::Sender<()>, u16), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -71,6 +72,7 @@ pub(crate) fn spawn_server_instance(
             congestion_control,
             debug,
             enable_0rtt,
+            allow_early_session,
             startup_tx,
         );
 
@@ -163,6 +165,7 @@ mod tests {
             crate::client::CongestionControlMode::Default,
             false,
             false,
+            false,
             3,
         )
         .expect("server should start");
@@ -205,6 +208,7 @@ mod tests {
             crate::client::CongestionControlMode::Default,
             false,
             false,
+            false,
             1,
         )
         .expect_err("port held by UDP socket should fail QUIC bind");
@@ -232,6 +236,7 @@ mod tests {
             crate::client::CongestionControlMode::Default,
             false,
             false,
+            false,
             2,
         )
         .expect_err("held port must fail after retry");
@@ -254,6 +259,7 @@ mod tests {
             &None,
             build_default_dev_resolver().expect("dev resolver"),
             crate::client::CongestionControlMode::Default,
+            false,
             false,
             false,
             0,

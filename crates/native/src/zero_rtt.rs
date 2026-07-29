@@ -488,7 +488,8 @@ mod tests {
             crate::server_tls::build_default_dev_resolver().expect("dev resolver"),
             crate::client::CongestionControlMode::Default,
             false,
-            true, // enable_0rtt
+            true,  // enable_0rtt
+            false, // allow_early_session
             3,
         )
         .expect("0-RTT server start");
