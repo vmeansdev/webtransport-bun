@@ -508,6 +508,16 @@ export type ServerOptions = {
 	 */
 	enable0Rtt?: boolean;
 
+	/**
+	 * Deliver 0-RTT sessions to `onSession` before the handshake is confirmed.
+	 * Off by default: session establishment is the replayable unit of 0-RTT,
+	 * so by default `onSession` is deferred until the request is no longer
+	 * replayable. Opt in only when the callback's pre-confirmation work is
+	 * strictly idempotent; it can still gate side effects on
+	 * `session.handshakeConfirmed`. No effect unless `enable0Rtt` is set.
+	 */
+	allowEarlySession?: boolean;
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -1447,6 +1457,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	const serverOptsJson = JSON.stringify({
 		congestionControl: opts.congestionControl ?? "default",
 		enable0Rtt: opts.enable0Rtt === true,
+		allowEarlySession: opts.allowEarlySession === true,
 	});
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
