@@ -2734,7 +2734,10 @@ fn connection_lost_signal_covers_local_app_timeout_and_other() {
 
     assert_eq!(
         connection_lost_signal(&quinn_proto::ConnectionError::TimedOut),
-        Some((Some("E_SESSION_IDLE_TIMEOUT: connection idle timeout"), 0))
+        Some((
+            Some("E_SESSION_IDLE_TIMEOUT: connection idle timeout".to_string()),
+            0
+        ))
     );
     assert_eq!(
         connection_lost_signal(&quinn_proto::ConnectionError::Reset),
@@ -3570,6 +3573,22 @@ fn connection_lost_signal_covers_transport_error_variants() {
     assert_eq!(
         connection_lost_signal(&quinn_proto::ConnectionError::CidsExhausted),
         Some((None, 0))
+    );
+
+    // A CRYPTO_ERROR (0x100 + TLS alert) must name itself: alert 42 is
+    // bad_certificate, what a rejected caPem / pin set produces.
+    assert_eq!(
+        connection_lost_signal(&quinn_proto::ConnectionError::TransportError(
+            quinn_proto::TransportError {
+                code: quinn_proto::TransportErrorCode::crypto(42),
+                frame: None,
+                reason: "".into(),
+            }
+        )),
+        Some((
+            Some("E_TLS: handshake failed with TLS alert 42".to_string()),
+            0
+        ))
     );
 }
 

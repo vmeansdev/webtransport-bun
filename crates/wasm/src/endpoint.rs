@@ -500,20 +500,40 @@ fn required_slots_for_in_stream(kind: Option<u64>, is_bidi: bool, has_handle: bo
 
 /// Map a quinn connection-loss reason to an optional last-error + close code.
 /// `None` means the Closed event was already emitted by a local close.
-fn connection_lost_signal(
-    reason: &quinn_proto::ConnectionError,
-) -> Option<(Option<&'static str>, u32)> {
+fn connection_lost_signal(reason: &quinn_proto::ConnectionError) -> Option<(Option<String>, u32)> {
     match reason {
         quinn_proto::ConnectionError::LocallyClosed => None,
         quinn_proto::ConnectionError::ApplicationClosed(app) => {
             let code = u64::from(app.error_code).try_into().unwrap_or(u32::MAX);
             Some((None, code))
         }
-        quinn_proto::ConnectionError::TimedOut => {
-            Some((Some("E_SESSION_IDLE_TIMEOUT: connection idle timeout"), 0))
-        }
-        _ => Some((None, 0)),
+        quinn_proto::ConnectionError::TimedOut => Some((
+            Some("E_SESSION_IDLE_TIMEOUT: connection idle timeout".to_string()),
+            0,
+        )),
+        // A rejected certificate arrives as a QUIC CRYPTO_ERROR carrying the
+        // TLS alert. Without this it is indistinguishable from any other
+        // transport loss: close code 0 and no diagnostic, which is exactly how
+        // a bad `caPem`/pin set fails.
+        _ => Some((tls_alert_error(reason), 0)),
     }
+}
+
+/// QUIC wraps a TLS alert as CRYPTO_ERROR, i.e. `0x100 + alert` (RFC 9001 §4.8).
+fn tls_alert_error(reason: &quinn_proto::ConnectionError) -> Option<String> {
+    const CRYPTO_ERROR: std::ops::Range<u64> = 0x100..0x200;
+    let code = match reason {
+        quinn_proto::ConnectionError::TransportError(error) => u64::from(error.code),
+        quinn_proto::ConnectionError::ConnectionClosed(close) => u64::from(close.error_code),
+        _ => return None,
+    };
+    if !CRYPTO_ERROR.contains(&code) {
+        return None;
+    }
+    Some(format!(
+        "E_TLS: handshake failed with TLS alert {}",
+        code - CRYPTO_ERROR.start
+    ))
 }
 
 /// Classify the first H3/WT stream-type varint for peer-accepted streams.
