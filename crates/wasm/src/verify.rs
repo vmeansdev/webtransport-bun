@@ -180,6 +180,85 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
+/// How a client decides whether to trust the server's certificate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientTrust {
+    /// Pin by SHA-256(DER) — the browser's `serverCertificateHashes` model and
+    /// the default, since a wasm client has no system trust store to fall back on.
+    Pinned(Vec<[u8; 32]>),
+    /// Verify a normal certificate chain against caller-supplied CA roots.
+    /// Nothing is trusted beyond these roots: there is no bundled root store.
+    CaRoots(String),
+}
+
+impl ClientTrust {
+    /// Read the trust model out of a client config object.
+    ///
+    /// Hash pinning stays the default; `caPem` opts into normal chain
+    /// verification. Supplying both is an error rather than a silent
+    /// preference, since that combination always means a misconfiguration.
+    pub fn from_config(parsed: &serde_json::Value) -> Result<Self, String> {
+        let field = |name: &str| {
+            parsed
+                .get(name)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+        };
+        match (field("certHashesBase64"), field("caPem")) {
+            (Some(_), Some(_)) => {
+                Err("E_TLS: certHashesBase64 and caPem are mutually exclusive".to_string())
+            }
+            (None, None) => Err("certHashesBase64 missing".to_string()),
+            (Some(csv), None) => Ok(Self::Pinned(PinnedCertVerifier::parse_hashes(csv)?)),
+            (None, Some(pem)) => Ok(Self::CaRoots(pem.to_string())),
+        }
+    }
+}
+
+/// Build a TLS 1.3 / h3 client config for the given trust model.
+pub fn client_crypto(trust: ClientTrust) -> Result<rustls::ClientConfig, String> {
+    match trust {
+        ClientTrust::Pinned(hashes) => client_crypto_pinned(hashes),
+        ClientTrust::CaRoots(pem) => client_crypto_ca_roots(&pem),
+    }
+}
+
+/// Build a TLS 1.3 / h3 client config that verifies the server chain against
+/// `ca_pem`, a PEM bundle of trust anchors supplied by the caller.
+///
+/// Certificate lifetimes are checked against `UnixTime::now()`. On wasm32 that
+/// resolves through `rustls-pki-types`' `web` feature to `web-time`, i.e. the
+/// browser's `Date.now()` — no custom `TimeProvider` is required.
+pub fn client_crypto_ca_roots(ca_pem: &str) -> Result<rustls::ClientConfig, String> {
+    let anchors = rustls_pemfile::certs(&mut ca_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("E_TLS: caPem: {e}"))?;
+    if anchors.is_empty() {
+        return Err("E_TLS: no certificates in caPem".to_string());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for anchor in anchors {
+        roots
+            .add(anchor)
+            .map_err(|e| format!("E_TLS: caPem: {e}"))?;
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| format!("E_TLS: caPem: {e}"))?;
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(format_verify_error)?
+        .with_webpki_verifier(verifier)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(cfg)
+}
+
 /// Build a TLS 1.3 / h3 client config that pins the server cert by hash.
 ///
 /// Configs for the same pin set share `verifier` / client-auth resolver Arcs
@@ -398,6 +477,93 @@ mod tests {
             verifier.supported_verify_schemes(),
             vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
         );
+    }
+
+    #[test]
+    fn ca_roots_client_crypto_builds_from_a_pem_bundle() {
+        let ca = crate::cert::generate("ca.example", 14, 1_700_000_000).expect("ca cert");
+        let cfg = super::client_crypto_ca_roots(&ca.cert_pem).expect("ca client crypto");
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+
+        // Multiple anchors in one bundle are all installed.
+        let second = crate::cert::generate("ca2.example", 14, 1_700_000_000).expect("ca2 cert");
+        let bundle = format!("{}\n{}", ca.cert_pem, second.cert_pem);
+        super::client_crypto_ca_roots(&bundle).expect("multi-anchor bundle");
+
+        // The trust dispatcher routes to the same builders.
+        super::client_crypto(super::ClientTrust::CaRoots(ca.cert_pem.clone()))
+            .expect("dispatched ca crypto");
+        let digest: [u8; 32] = Sha256::digest(fixture(VALID_P256)).into();
+        super::client_crypto(super::ClientTrust::Pinned(vec![digest]))
+            .expect("dispatched pinned crypto");
+    }
+
+    #[test]
+    fn client_trust_from_config_picks_pinning_or_ca_roots() {
+        use super::ClientTrust;
+
+        let digest: [u8; 32] = Sha256::digest(fixture(VALID_P256)).into();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+
+        assert_eq!(
+            ClientTrust::from_config(&serde_json::json!({ "certHashesBase64": encoded }))
+                .expect("pinned trust"),
+            ClientTrust::Pinned(vec![digest])
+        );
+        assert_eq!(
+            ClientTrust::from_config(&serde_json::json!({ "caPem": "roots" })).expect("ca trust"),
+            ClientTrust::CaRoots("roots".to_string())
+        );
+
+        // Blank strings count as absent, so an unset option is not mistaken
+        // for an empty trust set.
+        assert_eq!(
+            ClientTrust::from_config(
+                &serde_json::json!({ "certHashesBase64": encoded, "caPem": "  " })
+            )
+            .expect("blank caPem ignored"),
+            ClientTrust::Pinned(vec![digest])
+        );
+
+        let err = ClientTrust::from_config(
+            &serde_json::json!({ "certHashesBase64": encoded, "caPem": "roots" }),
+        )
+        .expect_err("both trust models supplied");
+        assert!(err.starts_with("E_TLS"), "unexpected error: {err}");
+        assert!(err.contains("mutually exclusive"));
+
+        let err =
+            ClientTrust::from_config(&serde_json::json!({})).expect_err("no trust model supplied");
+        assert!(err.contains("certHashesBase64 missing"));
+
+        // A malformed pin still maps to the pin-specific E_TLS error.
+        let err = ClientTrust::from_config(&serde_json::json!({ "certHashesBase64": "!!" }))
+            .expect_err("malformed pin");
+        assert!(err.starts_with("E_TLS"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn ca_roots_reject_malformed_bundles_with_stable_tls_errors() {
+        // Every rejection must map to E_TLS, matching how native reports a bad
+        // caPem — never a generic internal error.
+        for bad in [
+            "",
+            "   ",
+            "not a pem at all",
+            "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----",
+        ] {
+            let err =
+                super::client_crypto_ca_roots(bad).expect_err("malformed caPem must be rejected");
+            assert!(
+                err.starts_with("E_TLS"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+
+        // A PEM carrying a private key rather than a certificate is not a root.
+        let gen = crate::cert::generate("key.example", 14, 1_700_000_000).expect("cert");
+        let err = super::client_crypto_ca_roots(&gen.key_pem).expect_err("key pem is not a root");
+        assert!(err.starts_with("E_TLS"), "unexpected error: {err}");
     }
 
     #[test]
