@@ -17,11 +17,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Chromium Isolated Web App; the native adapter is behind a dynamic import.
 - `WasmSession.peer` / `WasmServerSession.peer`, backed by a new `wt_conn_peer`
   wasm bridge export over quinn-proto's `Connection::remote_address()`.
+- **Native 0-RTT session resumption.** `createServer` accepts `enable0Rtt` (and
+  `allowEarlySession`); `connect` and the `WebTransport` client accept
+  `enable0Rtt`. Sessions expose `has0Rtt`, `accepted0Rtt`, and
+  `handshakeConfirmed`. Opaque, process-local ticket movement is available via
+  `exportTicketVault`/`importTicketVault`. 0-RTT is off by default; the session
+  request is replayable early data, so by default the server `onSession`
+  callback is deferred until the handshake is confirmed (`allowEarlySession`
+  opts out for idempotent pre-confirmation work). Resumption state and
+  anti-replay are per-process (a restart or a different load-balanced instance
+  falls back to a full 1-RTT handshake); durable ticket persistence is out of
+  scope. This required forking `wtransport` — see below and
+  `docs/FORK_MAINTENANCE.md`.
 
 ### Changed
 
-- Upgraded `wtransport` from `=0.7.0` to `=0.7.1` in both the native addon and the reference server (the reference crate now enables the `quinn` feature for compile parity).
-- `docs/PARITY_MATRIX.md` now documents 0-RTT resumption and dynamic QPACK as upstream-gated on the native backend (not exposed by wtransport 0.7.1); the wasm backend implements both in its own stack.
+- Upgraded `wtransport` from `=0.7.0` to `=0.7.1`, then switched both the native
+  addon and the reference server from the crates.io release to a Git dependency
+  on the `vmeansdev/wtransport` fork (branch `feat/0rtt`, pinned by rev
+  `aa45f37`, version `0.7.1-zerortt.1`) via `[workspace.dependencies]`. The fork
+  adds the 0-RTT APIs upstream 0.7.1 lacked; the swap is otherwise behavior-
+  neutral. The reference crate keeps the `quinn` feature for compile parity.
+- `docs/PARITY_MATRIX.md` now lists native 0-RTT as **implemented (on the fork)**
+  rather than upstream-gated; dynamic QPACK remains upstream-gated on native and
+  wasm-only. `docs/WASM_PROTOCOL_SCOPE.md` notes the native/wasm 0-RTT parity.
 - `WasmServerSession` now mirrors the native `ServerSession` surface (`id`, `peer`,
   `incomingDatagrams()`, incoming stream `ReadableStream`s, `getStats()`), delegating
   to a `WasmWebTransport` over the same session. `createBidirectionalStream` and
