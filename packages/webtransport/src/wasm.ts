@@ -47,9 +47,9 @@ export {
 	createServer,
 	createIwaServer,
 	loadWasmWebModule,
-	resetWasmWebModuleLoaderForTests,
 	type WasmCreateServerOptions,
 	type WasmCreateServerTls,
+	type WasmSniEntry,
 	type WasmWebTransportServer,
 } from "./wasm-create-server.js";
 export {

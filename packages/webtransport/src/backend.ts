@@ -2189,6 +2189,7 @@ export async function serveOverUdp(
 	// port or it advertises :0 as its own address.
 	const localPort = udp.localPort ?? opts.localPort;
 	let adopted = false;
+	let eid: number | null = null;
 	try {
 		if (opts.localPort === 0 && localPort === 0) {
 			throw new Error(
@@ -2224,6 +2225,9 @@ export async function serveOverUdp(
 		if (parsed.error || parsed.eid == null || parsed.hashBase64 == null) {
 			throw new Error(`wt_new_server failed: ${parsed.error ?? "unknown"}`);
 		}
+		// From here the wasm side owns an endpoint. Until `adopted`, nothing
+		// else will ever free it, so the catch below has to.
+		eid = parsed.eid;
 		const manager = WasmTransportManager.adopt(
 			wasm,
 			udp,
@@ -2238,6 +2242,14 @@ export async function serveOverUdp(
 		return { manager, certHashBase64: parsed.hashBase64, localPort };
 	} catch (err) {
 		if (!adopted) {
+			// Once adopted, manager.close() owns both of these.
+			if (eid != null) {
+				try {
+					wasm.wt_close_endpoint(eid);
+				} catch {
+					/* ignore close failures during cleanup */
+				}
+			}
 			try {
 				udp.close?.();
 			} catch {

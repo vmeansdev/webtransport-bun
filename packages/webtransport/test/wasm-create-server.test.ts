@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { connectWasm } from "../src/backend.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
 import { DirectSocketsUdpTransport } from "../src/direct-sockets.js";
-import { createServer, createIwaServer } from "../src/wasm-create-server.js";
+import {
+	createIwaServer,
+	createServer,
+	loadWasmWebModule,
+	memoizeSuccessfulLoad,
+	resetWasmWebModuleLoaderForTests,
+} from "../src/wasm-create-server.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 import { withTimeout } from "./helpers/harness.js";
@@ -477,6 +483,97 @@ describe("wasm createServer plug-and-play", () => {
 			// The batch was rejected wholesale — the removal did not land either.
 			expect(server.tlsSnapshot().sniNames).toEqual(["keep.example"]);
 
+			await server.close();
+		},
+	);
+	test("the module memo keeps successes and drops failures", async () => {
+		// Exercises the loader's memo directly: wasm-dist/web is present in a
+		// built checkout, so driving loadWasmWebModule() itself could never
+		// reach the failure path.
+		let attempts = 0;
+		let fail = true;
+		const load = memoizeSuccessfulLoad(async () => {
+			attempts += 1;
+			if (fail) throw new Error("transient");
+			return "loaded";
+		});
+
+		await expect(load()).rejects.toThrow("transient");
+		await expect(load()).rejects.toThrow("transient");
+		// A failure must not be cached: each call retries.
+		expect(attempts).toBe(2);
+
+		fail = false;
+		expect(await load()).toBe("loaded");
+		expect(attempts).toBe(3);
+
+		// A success IS cached: no further factory calls.
+		expect(await load()).toBe("loaded");
+		expect(attempts).toBe(3);
+
+		// Concurrent callers share one in-flight attempt.
+		fail = true;
+		const retry = memoizeSuccessfulLoad(async () => {
+			attempts += 1;
+			throw new Error("transient");
+		});
+		const both = await Promise.allSettled([retry(), retry()]);
+		expect(both.every((r) => r.status === "rejected")).toBe(true);
+		expect(attempts).toBe(4);
+	});
+
+	test("resetWasmWebModuleLoaderForTests restores a fresh loader", async () => {
+		resetWasmWebModuleLoaderForTests();
+		const first = await loadWasmWebModule().catch(() => null);
+		resetWasmWebModuleLoaderForTests();
+		const second = await loadWasmWebModule().catch(() => null);
+		// Whether or not wasm-dist/web is present, the reset must not throw and
+		// must keep returning a consistent result.
+		expect(first === null).toBe(second === null);
+	});
+
+	test.skipIf(!wasmAvailable)(
+		"a rejected async onSession is reported, not left unhandled",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4439 };
+			const clientAddr = { address: "127.0.0.1", port: 5549 };
+
+			const server = await createServer({
+				host: "127.0.0.1",
+				port: 4439,
+				tls: { allowSelfSigned: true, commonName: "localhost" },
+				wasm,
+				bind: async () => relay.endpoint(serverAddr),
+				onSession: async () => {
+					throw new Error("handler blew up");
+				},
+			});
+
+			const reported: unknown[] = [];
+			server.unwrap().onCallbackError = (err) => {
+				reported.push(err);
+			};
+
+			const { manager: clientMgr } = await connectWasm(
+				wasm,
+				relay.endpoint(clientAddr),
+				"localhost",
+				"127.0.0.1:5549",
+				"127.0.0.1:4439",
+				{ certHashBase64: server.certHashBase64 },
+			);
+
+			await withTimeout(
+				(async () => {
+					while (reported.length === 0) await Bun.sleep(5);
+				})(),
+				5000,
+				"async onSession rejection reported",
+			);
+			expect(String(reported[0])).toContain("handler blew up");
+
+			clientMgr.close();
 			await server.close();
 		},
 	);
