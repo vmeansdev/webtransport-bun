@@ -125,38 +125,90 @@ function decodeSniEntry(entry: WasmSniEntry): {
 	};
 }
 
-let webWasmLoad: Promise<WasmModule> | null = null;
+/**
+ * Surface a failure thrown or rejected by the user's `onSession` callback on
+ * the manager's callback channel, matching how the pump reports a synchronous
+ * throw. Falls back to the console when no hook is installed, or before the
+ * manager exists.
+ */
+function reportSessionCallbackError(
+	manager: WasmTransportManager | null,
+	err: unknown,
+): void {
+	const hook = manager?.onCallbackError;
+	if (hook) {
+		try {
+			hook.call(manager, err);
+			return;
+		} catch {
+			// The hook itself threw — fall through to the console so the
+			// original failure is not swallowed.
+		}
+	}
+	console.error("wasm createServer: onSession callback failed:", err);
+}
+
+/**
+ * Memoize an async factory, keeping only successful results. A failed attempt
+ * is dropped so a transient error does not poison every later call, while
+ * concurrent callers still share one in-flight attempt.
+ *
+ * @internal Exported for tests; the retry-after-failure behaviour is otherwise
+ * only reachable when the wasm asset genuinely fails to load.
+ */
+export function memoizeSuccessfulLoad<T>(
+	factory: () => Promise<T>,
+): () => Promise<T> {
+	let inFlight: Promise<T> | null = null;
+	return () => {
+		if (!inFlight) {
+			const attempt = factory();
+			inFlight = attempt;
+			attempt.catch(() => {
+				if (inFlight === attempt) inFlight = null;
+			});
+		}
+		return inFlight;
+	};
+}
+
+let loadWebWasm = makeWebWasmLoader();
+
+function makeWebWasmLoader(): () => Promise<WasmModule> {
+	return memoizeSuccessfulLoad(async () => {
+		const spec = "../wasm-dist/web/webtransport_wasm.js";
+		try {
+			const mod = (await import(spec)) as {
+				default?: (input?: unknown) => Promise<unknown>;
+			} & WasmModule;
+			if (typeof mod.default === "function") {
+				await mod.default();
+			}
+			return mod as WasmModule;
+		} catch (cause) {
+			throw new Error(
+				"prebuilt web wasm module not found: run `bun run build:wasm:dist` in a source checkout, or reinstall the published package (wasm-dist/web)",
+				{ cause },
+			);
+		}
+	});
+}
 
 /**
  * Load and initialize the browser/IWA wasm-bindgen glue from `wasm-dist/web`.
- * Memoized. Injected modules must already be initialized.
+ * Only a successful load is memoized. Injected modules must already be
+ * initialized.
  */
 export async function loadWasmWebModule(): Promise<WasmModule> {
-	if (!webWasmLoad) {
-		webWasmLoad = (async () => {
-			const spec = "../wasm-dist/web/webtransport_wasm.js";
-			try {
-				const mod = (await import(spec)) as {
-					default?: (input?: unknown) => Promise<unknown>;
-				} & WasmModule;
-				if (typeof mod.default === "function") {
-					await mod.default();
-				}
-				return mod as WasmModule;
-			} catch (cause) {
-				throw new Error(
-					"prebuilt web wasm module not found: run `bun run build:wasm:dist` in a source checkout, or reinstall the published package (wasm-dist/web)",
-					{ cause },
-				);
-			}
-		})();
-	}
-	return webWasmLoad;
+	return loadWebWasm();
 }
 
-/** @internal Reset memoized loader (tests). */
+/**
+ * @internal Reset the memoized loader. Test-only, and deliberately NOT
+ * re-exported from the public `/wasm` entrypoint — import it from this module.
+ */
 export function resetWasmWebModuleLoaderForTests(): void {
-	webWasmLoad = null;
+	loadWebWasm = makeWebWasmLoader();
 }
 
 class WasmWebTransportServerImpl implements WasmWebTransportServer {
@@ -339,7 +391,20 @@ export async function createServer(
 			validityDays: tls.validityDays ?? 14,
 			...(hasPem ? { certPem, keyPem } : {}),
 			onSession: (session: WasmSession) => {
-				void onSession(toWasmServerSession(session));
+				// A synchronous throw is contained by the pump and surfaced on
+				// the manager's callback channel. An async rejection is not, so
+				// route it to the same place instead of letting it escape as an
+				// unhandled rejection.
+				try {
+					const result = onSession(toWasmServerSession(session));
+					if (result) {
+						void Promise.resolve(result).catch((err) => {
+							reportSessionCallbackError(manager, err);
+						});
+					}
+				} catch (err) {
+					reportSessionCallbackError(manager, err);
+				}
 			},
 			log,
 			debug,
