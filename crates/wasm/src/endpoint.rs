@@ -1291,6 +1291,23 @@ impl WtEndpoint {
         .to_string()
     }
 
+    /// Remote address of a live connection for the session `peer` accessor (JSON).
+    pub fn connection_peer_json(&self, conn_id: u32) -> String {
+        let Some(handle) = self.id_to_handle.get(&conn_id) else {
+            return serde_json::json!({ "error": "E_SESSION_CLOSED: unknown connection" })
+                .to_string();
+        };
+        let Some(conn) = self.conns.get(handle) else {
+            return serde_json::json!({ "error": "E_SESSION_CLOSED: connection gone" }).to_string();
+        };
+        let addr = conn.remote_address();
+        serde_json::json!({
+            "ip": addr.ip().to_string(),
+            "port": addr.port(),
+        })
+        .to_string()
+    }
+
     pub fn tls_snapshot_json(&self) -> String {
         match &self.tls_resolver {
             Some(r) => r.snapshot_json(),

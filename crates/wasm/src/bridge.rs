@@ -765,6 +765,18 @@ pub fn wt_conn_stats(eid: u32, conn: u32) -> String {
     }
 }
 
+/// Remote address of a connection, for the session `peer` accessor.
+#[wasm_bindgen]
+pub fn wt_conn_peer(eid: u32, conn: u32) -> String {
+    match with_endpoint(eid, |endpoint| endpoint.connection_peer_json(conn)) {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            serde_json::json!({ "error": "E_SESSION_CLOSED: unknown endpoint" }).to_string()
+        }
+        Err(_) => serde_json::json!({ "error": REGISTRY_UNAVAILABLE }).to_string(),
+    }
+}
+
 #[wasm_bindgen]
 pub fn wt_tls_snapshot(eid: u32) -> String {
     match with_endpoint(eid, |endpoint| endpoint.tls_snapshot_json()) {

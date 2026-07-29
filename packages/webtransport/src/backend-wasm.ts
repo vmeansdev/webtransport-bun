@@ -134,6 +134,8 @@ export interface WasmModule {
 	wt_conn_has_0rtt(eid: number, conn: number): boolean;
 	wt_conn_accepted_0rtt(eid: number, conn: number): boolean;
 	wt_conn_stats(eid: number, conn: number): string;
+	/** Optional: absent on wasm packages built before the `peer` accessor landed. */
+	wt_conn_peer?(eid: number, conn: number): string;
 	wt_tls_snapshot?(eid: number): string;
 	wt_update_tls?(eid: number, configJson: string): string;
 	wt_enable_0rtt(eid: number): boolean;
@@ -836,6 +838,24 @@ export class WasmEndpoint {
 	has0Rtt(conn: number): boolean {
 		if (this.closed) return false;
 		return this.wasm.wt_conn_has_0rtt(this.eid, conn);
+	}
+
+	connPeer(conn: number): { ip: string; port: number } | null {
+		if (this.closed) return null;
+		if (typeof this.wasm.wt_conn_peer !== "function") return null;
+		try {
+			const parsed = JSON.parse(this.wasm.wt_conn_peer(this.eid, conn)) as {
+				ip?: string;
+				port?: number;
+				error?: string;
+			};
+			if (typeof parsed.ip !== "string" || typeof parsed.port !== "number") {
+				return null;
+			}
+			return { ip: parsed.ip, port: parsed.port };
+		} catch {
+			return null;
+		}
 	}
 
 	connStats(conn: number): {

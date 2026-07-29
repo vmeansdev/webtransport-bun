@@ -595,6 +595,62 @@ fn wt_session_and_datagram_echo() {
 }
 
 #[test]
+fn connection_peer_json_reports_each_side_remote_address() {
+    let (mut server, mut client, cid) = endpoints();
+    let mut server_conn: Option<u32> = None;
+    let mut client_est = false;
+
+    for _ in 0..400 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = server.poll_event() {
+            if let WtEvent::SessionEstablished { conn, .. } = ev {
+                server_conn = Some(conn);
+            }
+        }
+        while let Some(ev) = client.poll_event() {
+            if let WtEvent::SessionEstablished { .. } = ev {
+                client_est = true;
+            }
+        }
+        if server_conn.is_some() && client_est {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+
+    let server_conn = server_conn.expect("server session established");
+    assert!(client_est);
+
+    // Each side reports the *other* side's address, matching native `peer`.
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+
+    let seen_by_server: serde_json::Value =
+        serde_json::from_str(&server.connection_peer_json(server_conn)).unwrap();
+    assert_eq!(seen_by_server["ip"], caddr.ip().to_string());
+    assert_eq!(seen_by_server["port"], caddr.port());
+
+    let seen_by_client: serde_json::Value =
+        serde_json::from_str(&client.connection_peer_json(cid)).unwrap();
+    assert_eq!(seen_by_client["ip"], saddr.ip().to_string());
+    assert_eq!(seen_by_client["port"], saddr.port());
+}
+
+#[test]
+fn connection_peer_json_fails_closed_for_an_unknown_connection() {
+    let (server, _client, _cid) = endpoints();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&server.connection_peer_json(9999)).unwrap();
+    assert_eq!(parsed["error"], "E_SESSION_CLOSED: unknown connection");
+    assert!(parsed.get("ip").is_none());
+}
+
+#[test]
 fn wt_bidi_stream_echo() {
     let (mut server, mut client, cid) = endpoints();
     let mut server_est = false;
