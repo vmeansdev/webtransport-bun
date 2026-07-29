@@ -163,10 +163,16 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 
 		test("S4 regression: close() before ready does not cause unhandled rejection (PARITY_MATRIX)", async () => {
 			if (isWasmParityBackend()) {
-				// Wasm construct path validates options without starting a connect;
-				// close() is a no-op on the validation stub — still covers acceptance.
+				// The native trigger is a connect to a dead port, which the
+				// in-memory relay cannot address. Closing a real WasmWebTransport
+				// before it is ready still covers the regression: close() must
+				// absorb the settled state without surfacing an unhandled
+				// rejection. `closed` is awaited so any rejection is observed here
+				// rather than escaping to the process handler.
 				const wt = harness.construct({ allowPooling: true });
 				wt.close();
+				await wt.closed.catch(() => undefined);
+				await Bun.sleep(100);
 				return;
 			}
 			// Simulates parity-baseline "allowPooling options accepted": new WebTransport + close() without awaiting ready.
