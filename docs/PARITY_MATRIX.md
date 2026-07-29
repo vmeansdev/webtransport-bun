@@ -142,6 +142,24 @@ export function toWebTransport(session: ClientSession): WebTransportLike;
 2. Node client streams are Node streams; facade exposes Web Streams for browser parity.
 3. Optional stats members may be omitted when not available from runtime counters.
 
+## Upstream-Gated Capabilities (native backend)
+
+These are `missing` on the native backend because the underlying `wtransport`
+crate (pinned `=0.7.1`) does not expose the required APIs. They are tracked as
+upstream feature requests, not local work items (drafts:
+`.scratch/parity-closure/upstream-issues.md`; file against
+[BiagioFesta/wtransport](https://github.com/BiagioFesta/wtransport)).
+
+| Capability | Status | Why it is upstream-gated (verified against wtransport 0.7.1 source) |
+| --- | --- | --- |
+| 0-RTT session resumption / early data | `missing` (upstream-gated) | No early-data or session-ticket API anywhere in 0.7.1; the server accept path never calls quinn's `Connecting::into_0rtt`, and neither config builder exposes a ticketer hook that would enable 0-RTT accepts. A rustls ticketer via `with_custom_tls` would only yield 1-RTT resumption (explicitly out of scope). |
+| Dynamic QPACK table | `missing` (upstream-gated, hard) | `wtransport-proto` QPACK decoder is static-table-only — any dynamic-table instruction returns `DecodingError::DynamicNotSupported` (`qpack.rs`); local SETTINGS hardcode `qpack_max_table_capacity(0)` and `qpack_blocked_streams(0)` (`driver/streams/settings.rs:25-26`). Native must never advertise nonzero QPACK SETTINGS until upstream implements the dynamic table. |
+
+Server-side capabilities that became available in wtransport 0.7.1 —
+congestion control (`ServerOptions.congestionControl`) and keep-alive
+(`limits.keepAliveIntervalMs`, clamped to `min(interval, idleTimeout/3)`) —
+are implemented on native and no longer upstream-gated.
+
 ## Priority Execution Order (completed)
 
 1. ✅ Constructor option validation semantics (R1).
