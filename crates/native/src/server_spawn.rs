@@ -45,6 +45,7 @@ pub(crate) fn spawn_server_instance(
     tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
     congestion_control: crate::client::CongestionControlMode,
     debug: bool,
+    enable_0rtt: bool,
     max_retries: usize,
 ) -> std::result::Result<(watch::Sender<()>, u16), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -69,6 +70,7 @@ pub(crate) fn spawn_server_instance(
             Arc::clone(&tls_resolver),
             congestion_control,
             debug,
+            enable_0rtt,
             startup_tx,
         );
 
@@ -160,6 +162,7 @@ mod tests {
             resolver,
             crate::client::CongestionControlMode::Default,
             false,
+            false,
             3,
         )
         .expect("server should start");
@@ -201,6 +204,7 @@ mod tests {
             build_default_dev_resolver().expect("dev resolver"),
             crate::client::CongestionControlMode::Default,
             false,
+            false,
             1,
         )
         .expect_err("port held by UDP socket should fail QUIC bind");
@@ -227,6 +231,7 @@ mod tests {
             build_default_dev_resolver().expect("dev resolver"),
             crate::client::CongestionControlMode::Default,
             false,
+            false,
             2,
         )
         .expect_err("held port must fail after retry");
@@ -249,6 +254,7 @@ mod tests {
             &None,
             build_default_dev_resolver().expect("dev resolver"),
             crate::client::CongestionControlMode::Default,
+            false,
             false,
             0,
         )

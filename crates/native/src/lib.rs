@@ -30,6 +30,7 @@ pub mod session;
 pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
+pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
@@ -400,6 +401,7 @@ pub(crate) fn spawn_wtransport_server(
     tls_resolver: Arc<server_tls::LiveServerCertResolver>,
     congestion_control: client::CongestionControlMode,
     debug_logs: bool,
+    enable_0rtt: bool,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -474,6 +476,11 @@ pub(crate) fn spawn_wtransport_server(
                     .effective_keep_alive_interval_ms()
                     .map(std::time::Duration::from_millis),
             );
+            // 0-RTT (fork feature): switches rustls to a stateful per-process
+            // session store with take-once semantics (single-process
+            // anti-replay) and allows the CONNECT request to arrive as
+            // replayable early data; sessions report is_0rtt.
+            let config_builder = config_builder.enable_0rtt(enable_0rtt);
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
                 Ok(s) => match s.local_addr() {
@@ -559,6 +566,9 @@ pub(crate) fn spawn_wtransport_server(
                                     emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
                                     return;
                                 }
+                                // Sampled when the request was read: true means the
+                                // CONNECT arrived as replayable 0-RTT early data.
+                                let is_0rtt = session_request.is_0rtt();
                                 let authority = session_request.authority().to_string();
                                 let peer_addr = session_request.remote_address();
                                 let peer_ip = peer_addr.ip().to_string();
@@ -677,7 +687,31 @@ pub(crate) fn spawn_wtransport_server(
                                                 connection.clone(),
                                                 metrics.clone(),
                                                 limits.clone(),
+                                                is_0rtt,
                                             );
+                                        // Flip handshake_confirmed once full TLS
+                                        // guarantees exist. Resolves at handshake
+                                        // completion or connection loss (bounded
+                                        // by the idle timeout), so it cannot hang.
+                                        if is_0rtt {
+                                            if let Some((_, confirmed_flag)) =
+                                                session_registry::zero_rtt_state(&id)
+                                            {
+                                                let conn_confirm = connection.clone();
+                                                panic_guard::spawn_quic_task_scoped(
+                                                    panic_guard::PanicScope::Server(owner_server_id),
+                                                    async move {
+                                                        let _ = conn_confirm
+                                                            .handshake_confirmed()
+                                                            .await;
+                                                        confirmed_flag.store(
+                                                            true,
+                                                            std::sync::atomic::Ordering::Release,
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        }
                                         let stream_capacity_notify =
                                             session_registry::get_stream_capacity_notify(&id);
 

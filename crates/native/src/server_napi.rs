@@ -141,6 +141,10 @@ impl ServerHandle {
                 serde_json::from_str(&server_opts_json).unwrap_or(serde_json::Value::Null);
             let congestion_control = crate::client::parse_congestion_control(&server_opts)
                 .map_err(napi::Error::from_reason)?;
+            let enable_0rtt = server_opts
+                .get("enable0Rtt")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -169,6 +173,7 @@ impl ServerHandle {
                 Arc::clone(&tls_resolver),
                 congestion_control,
                 debug,
+                enable_0rtt,
                 1,
             )
             .map_err(|msg| {
