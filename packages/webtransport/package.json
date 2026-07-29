@@ -31,6 +31,10 @@
 		"./wasm": {
 			"import": "./dist/wasm.js",
 			"types": "./dist/wasm.d.ts"
+		},
+		"./portable": {
+			"import": "./dist/portable.js",
+			"types": "./dist/portable.d.ts"
 		}
 	},
 	"files": [
