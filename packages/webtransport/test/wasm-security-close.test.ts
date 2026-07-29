@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { connectWasm, serveOverUdp, type WasmSession } from "../src/backend.js";
 import { formatAddr, type WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
+import { E_TLS } from "../src/errors.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
 // Soft-skip when pkg is absent (local `bun test packages/`). With
@@ -71,21 +72,26 @@ describe("cert pinning (serverCertificateHashes model)", () => {
 			ok.manager.close();
 			udpOk.close();
 
-			// Wrong pin: the TLS handshake must fail and connectWasm reject.
+			// Wrong pin: the TLS handshake must fail and connectWasm reject with
+			// the TLS reason (alert 49, access_denied) rather than an opaque
+			// pre-establishment close.
 			const wrongHash = btoa(String.fromCharCode(...new Uint8Array(32)));
 			const udpBad = await BunUdpTransport.connect("127.0.0.1", PORT);
-			await expect(
-				connectWasm(
-					wasm,
-					udpBad,
-					"localhost",
-					"127.0.0.1:0",
-					`127.0.0.1:${PORT}`,
-					{
-						certHashBase64: wrongHash,
-					},
-				),
-			).rejects.toThrow(/closed before session established/);
+			const rejected = await connectWasm(
+				wasm,
+				udpBad,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: wrongHash },
+			).then(
+				() => null,
+				(error: unknown) => error,
+			);
+			expect((rejected as { code?: string }).code).toBe(E_TLS);
+			expect(String(rejected)).toContain(
+				"E_TLS: handshake failed with TLS alert",
+			);
 			udpBad.close();
 
 			srv.manager.close();
