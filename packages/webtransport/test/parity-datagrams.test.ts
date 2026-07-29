@@ -4,19 +4,18 @@
  */
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { WebTransport, createServer } from "../src/index.js";
-import { nextPort, openWTWithRetry } from "./helpers/network.js";
 import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
+import {
+	createParityHarness,
+	type ParityHarness,
+	skipWasmParityIfUnavailable,
+} from "./helpers/parity-backend.js";
 
-describe("parity datagrams (P2)", () => {
-	let server: ReturnType<typeof createServer>;
-	let port: number;
+describe.skipIf(skipWasmParityIfUnavailable)("parity datagrams (P2)", () => {
+	let harness: ParityHarness;
 
 	beforeAll(async () => {
-		port = nextPort(15520, 1000);
-		server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
+		harness = await createParityHarness({
 			onSession: async (s) => {
 				await forEachWithTimeout(
 					s.incomingDatagrams(),
@@ -28,20 +27,14 @@ describe("parity datagrams (P2)", () => {
 				);
 			},
 		});
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-		wt.close();
 	});
 
 	afterAll(async () => {
-		await server.close();
+		await harness.close();
 	});
 
 	test("datagrams.writable.write sends datagram", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
+		const wt = await harness.open();
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(new Uint8Array([1, 2, 3]));
 		writer.releaseLock();
@@ -49,9 +42,7 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.readable receives echoed datagram", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
+		const wt = await harness.open();
 		const payload = new Uint8Array([10, 20, 30]);
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(payload);
@@ -70,9 +61,7 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagram round-trip via Web Streams", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
+		const wt = await harness.open();
 		const sent = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
 		const writer = wt.datagrams.writable.getWriter();
 		await writer.write(sent);
@@ -90,9 +79,7 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.createWritable returns WritableStream", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
+		const wt = await harness.open();
 		const writable = wt.datagrams.createWritable();
 		expect(writable).toBeInstanceOf(WritableStream);
 		const writer = writable.getWriter();
@@ -102,19 +89,17 @@ describe("parity datagrams (P2)", () => {
 	});
 
 	test("datagrams.maxDatagramSize is positive number", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
+		const wt = await harness.open();
 		expect(typeof wt.datagrams.maxDatagramSize).toBe("number");
 		expect(wt.datagrams.maxDatagramSize).toBeGreaterThan(0);
 		wt.close();
 	});
 
 	test("datagrams.createWritable accepts valid sendGroup and validates ownership", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-		const group = wt.createSendGroup();
+		const wt = await harness.open();
+		// Both backends have a nominally-private send-group class, so the union
+		// needs a cast even though each half is self-consistent.
+		const group = wt.createSendGroup() as never;
 		expect(() =>
 			wt.datagrams.createWritable({ sendGroup: group, sendOrder: 1 }),
 		).not.toThrow();

@@ -6,7 +6,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createServer, WebTransport } from "../src/index.js";
+import { WebTransport } from "../src/index.js";
 import { WasmWebTransport } from "../src/wasm-webtransport.js";
 import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
 import {
@@ -16,9 +16,7 @@ import {
 	skipWasmParityIfUnavailable,
 	type ParityHarness,
 	type ParityTransport,
-	wasmParityReady,
 } from "./helpers/parity-backend.js";
-import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
 describe.skipIf(skipWasmParityIfUnavailable)(
 	`parity options (Phase 5) [${PARITY_BACKEND}]`,
@@ -161,19 +159,10 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 		});
 
 		test("waitUntilAvailable option waits for stream capacity on createBidirectionalStream", async () => {
-			// Native enforces maxStreamsPerSessionBidi via the addon; wasm governor
-			// path differs for waitUntilAvailable blocking — keep native coverage
-			// here and soft-skip the capacity-wait race on wasm until stream-cap
-			// wait semantics land.
-			if (isWasmParityBackend()) {
-				expect(wasmParityReady()).toBe(true);
-				return;
-			}
-			const limitedPort = nextPort(16550, 1000);
-			const limitedServer = createServer({
-				port: limitedPort,
-				tls: { certPem: "", keyPem: "" },
-				limits: {
+			// Both backends enforce maxStreamsPerSessionBidi, so this runs
+			// behaviorally on either one through a limit-configured harness.
+			const limitedServer = await createParityHarness({
+				serverLimits: {
 					maxStreamsPerSessionBidi: 1,
 					maxStreamsGlobal: 50000,
 					backpressureTimeoutMs: 1500,
@@ -187,13 +176,9 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 					);
 				},
 			});
-			const wt: ParityTransport = await openWTWithRetry(
-				`https://127.0.0.1:${limitedPort}`,
-				{
-					tls: { insecureSkipVerify: true },
-					limits: { backpressureTimeoutMs: 1500 },
-				},
-			);
+			const wt: ParityTransport = await limitedServer.open({
+				limits: { backpressureTimeoutMs: 1500 },
+			});
 			try {
 				const first = await wt.createBidirectionalStream();
 				const secondPromise = wt.createBidirectionalStream({

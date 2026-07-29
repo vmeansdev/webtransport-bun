@@ -4,137 +4,131 @@
  */
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { WebTransport, createServer } from "../src/index.js";
-import { nextPort, openWTWithRetry } from "./helpers/network.js";
 import { forEachWithTimeout, readWithTimeout } from "./helpers/harness.js";
+import {
+	createParityHarness,
+	type ParityHarness,
+	skipWasmParityIfUnavailable,
+} from "./helpers/parity-backend.js";
 
-describe("parity robustness (Phase 6)", () => {
-	let server: ReturnType<typeof createServer>;
-	let port: number;
+describe.skipIf(skipWasmParityIfUnavailable)(
+	"parity robustness (Phase 6)",
+	() => {
+		let harness: ParityHarness;
 
-	beforeAll(async () => {
-		port = nextPort(15560, 1000);
-		server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: async (s) => {
-				void (async () => {
+		beforeAll(async () => {
+			harness = await createParityHarness({
+				onSession: async (s) => {
+					void (async () => {
+						await forEachWithTimeout(
+							s.incomingDatagrams(),
+							5000,
+							"parity robustness server incoming datagram",
+							async (d) => {
+								await s.sendDatagram(d);
+							},
+						);
+					})().catch(() => {});
 					await forEachWithTimeout(
-						s.incomingDatagrams(),
+						s.incomingBidirectionalStreams,
 						5000,
-						"parity robustness server incoming datagram",
-						async (d) => {
-							await s.sendDatagram(d);
+						"parity robustness server incoming bidi",
+						async (duplex) => {
+							void (async () => {
+								const reader = duplex.readable.getReader();
+								const chunks: Uint8Array[] = [];
+								while (true) {
+									const { done, value } = await readWithTimeout(
+										reader,
+										5000,
+										"parity robustness server bidi read",
+									);
+									if (done || value === undefined) break;
+									chunks.push(value);
+								}
+								if (chunks.length > 0) {
+									const writer = duplex.writable.getWriter();
+									await writer.write(
+										Buffer.concat(chunks.map((c) => Buffer.from(c))),
+									);
+									await writer.close();
+								}
+							})().catch(() => {});
 						},
 					);
-				})().catch(() => {});
-				await forEachWithTimeout(
-					s.incomingBidirectionalStreams,
+				},
+			});
+		});
+
+		afterAll(async () => {
+			await harness.close();
+		});
+
+		test("datagram and bidi streams both complete", async () => {
+			const wt = await harness.open();
+
+			const w = wt.datagrams.writable.getWriter();
+			await w.write(new Uint8Array([1, 2, 3]));
+			w.releaseLock();
+			const dr = wt.datagrams.readable.getReader();
+			const { value: dgramVal } = await readWithTimeout(
+				dr,
+				5000,
+				"parity robustness datagram echo read",
+			);
+			dr.releaseLock();
+			expect(dgramVal).toBeDefined();
+			expect(new Uint8Array(dgramVal!).toString()).toBe("1,2,3");
+
+			const { readable, writable } = await wt.createBidirectionalStream();
+			const bw = writable.getWriter();
+			await bw.write(new Uint8Array([4, 5, 6]));
+			await bw.close();
+			const br = readable.getReader();
+			const chunks: Uint8Array[] = [];
+			while (true) {
+				const { done, value } = await readWithTimeout(
+					br,
 					5000,
-					"parity robustness server incoming bidi",
-					async (duplex) => {
-						void (async () => {
-							const reader = duplex.readable.getReader();
-							const chunks: Uint8Array[] = [];
-							while (true) {
-								const { done, value } = await readWithTimeout(
-									reader,
-									5000,
-									"parity robustness server bidi read",
-								);
-								if (done || value === undefined) break;
-								chunks.push(value);
-							}
-							if (chunks.length > 0) {
-								const writer = duplex.writable.getWriter();
-								await writer.write(
-									Buffer.concat(chunks.map((c) => Buffer.from(c))),
-								);
-								await writer.close();
-							}
-						})().catch(() => {});
-					},
+					"parity robustness bidi echo read",
 				);
-			},
+				if (done) break;
+				if (value) chunks.push(value);
+			}
+			br.releaseLock();
+			expect(chunks.length).toBeGreaterThan(0);
+			const echoed = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+			expect(new Uint8Array(echoed)).toEqual(new Uint8Array([4, 5, 6]));
+			wt.close();
+		}, 10000);
+
+		test("multiple createWritable instances send independently", async () => {
+			const wt = await harness.open();
+
+			const w1 = wt.datagrams.createWritable();
+			const w2 = wt.datagrams.createWritable();
+			const writer1 = w1.getWriter();
+			const writer2 = w2.getWriter();
+			await writer1.write(new Uint8Array([0xa]));
+			await writer2.write(new Uint8Array([0xb]));
+			writer1.releaseLock();
+			writer2.releaseLock();
+
+			const reader = wt.datagrams.readable.getReader();
+			const seen = new Set<number>();
+			for (let i = 0; i < 2; i++) {
+				const { value } = await readWithTimeout(
+					reader,
+					5000,
+					"parity robustness multi-writer datagram read",
+				);
+				const first = value?.[0];
+				if (first !== undefined) seen.add(first);
+			}
+			reader.releaseLock();
+			expect(seen.has(0xa)).toBe(true);
+			expect(seen.has(0xb)).toBe(true);
+			wt.close();
 		});
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-		wt.close();
-	});
-
-	afterAll(async () => {
-		await server.close();
-	});
-
-	test("datagram and bidi streams both complete", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-
-		const w = wt.datagrams.writable.getWriter();
-		await w.write(new Uint8Array([1, 2, 3]));
-		w.releaseLock();
-		const dr = wt.datagrams.readable.getReader();
-		const { value: dgramVal } = await readWithTimeout(
-			dr,
-			5000,
-			"parity robustness datagram echo read",
-		);
-		dr.releaseLock();
-		expect(dgramVal).toBeDefined();
-		expect(new Uint8Array(dgramVal!).toString()).toBe("1,2,3");
-
-		const { readable, writable } = await wt.createBidirectionalStream();
-		const bw = writable.getWriter();
-		await bw.write(new Uint8Array([4, 5, 6]));
-		await bw.close();
-		const br = readable.getReader();
-		const chunks: Uint8Array[] = [];
-		while (true) {
-			const { done, value } = await readWithTimeout(
-				br,
-				5000,
-				"parity robustness bidi echo read",
-			);
-			if (done) break;
-			if (value) chunks.push(value);
-		}
-		br.releaseLock();
-		expect(chunks.length).toBeGreaterThan(0);
-		const echoed = Buffer.concat(chunks.map((c) => Buffer.from(c)));
-		expect(new Uint8Array(echoed)).toEqual(new Uint8Array([4, 5, 6]));
-		wt.close();
-	}, 10000);
-
-	test("multiple createWritable instances send independently", async () => {
-		const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
-			tls: { insecureSkipVerify: true },
-		});
-
-		const w1 = wt.datagrams.createWritable();
-		const w2 = wt.datagrams.createWritable();
-		const writer1 = w1.getWriter();
-		const writer2 = w2.getWriter();
-		await writer1.write(new Uint8Array([0xa]));
-		await writer2.write(new Uint8Array([0xb]));
-		writer1.releaseLock();
-		writer2.releaseLock();
-
-		const reader = wt.datagrams.readable.getReader();
-		const seen = new Set<number>();
-		for (let i = 0; i < 2; i++) {
-			const { value } = await readWithTimeout(
-				reader,
-				5000,
-				"parity robustness multi-writer datagram read",
-			);
-			const first = value?.[0];
-			if (first !== undefined) seen.add(first);
-		}
-		reader.releaseLock();
-		expect(seen.has(0xa)).toBe(true);
-		expect(seen.has(0xb)).toBe(true);
-		wt.close();
-	});
-});
+	},
+);
