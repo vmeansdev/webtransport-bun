@@ -23,9 +23,11 @@ function addr(address: string, port: number): UdpAddr {
 function parseSnapshot(endpoint: WasmEndpoint) {
 	return JSON.parse(endpoint.governorSnapshot()) as {
 		rateLimitBucketCount?: number;
+		rateLimitPrefixBucketCount?: number;
 		rateLimitedHandshakeCount?: number;
 		rateLimitedStreamOpenCount?: number;
 		rateLimitedDatagramIngressCount?: number;
+		rateLimitedByPrefixCount?: number;
 	};
 }
 
@@ -120,6 +122,73 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 			clientA.close();
 			clientA2.close();
 			clientB.close();
+			server.close();
+		}
+	});
+
+	test("a handshake flood spread across one /24 is capped by the prefix bucket", async () => {
+		const relay = new InMemoryRelay();
+		const options = normalizeWasmEndpointOptions({
+			rateLimits: {
+				handshakesPerSec: 1,
+				handshakesBurst: 1,
+				streamOpensPerSec: 8,
+				streamOpensBurst: 8,
+				datagramsIngressPerSec: 8,
+				datagramsIngressBurst: 8,
+			},
+		});
+		const serverAddr = addr("203.0.113.1", 4433);
+		const serverEstablished: number[] = [];
+		const server = WasmEndpoint.create(
+			wasm,
+			relay.endpoint(serverAddr),
+			true,
+			"203.0.113.1:4433",
+			"203.0.113.10:5544",
+			options,
+			{ onEstablished: (conn) => serverEstablished.push(conn) },
+		);
+
+		// Every attacker address is distinct, so the per-IP bucket (burst 1)
+		// would admit all 24. They share a /24, whose aggregate bucket is
+		// burst * 8, so only 8 handshakes may land.
+		const ATTACKERS = 24;
+		const clients = Array.from({ length: ATTACKERS }, (_, i) =>
+			WasmEndpoint.create(
+				wasm,
+				relay.endpoint(addr(`203.0.113.${100 + i}`, 5544)),
+				false,
+				`203.0.113.${100 + i}:5544`,
+				"203.0.113.1:4433",
+				options,
+			),
+		);
+
+		try {
+			for (const client of clients) client.connect("localhost");
+
+			await waitFor(
+				() => parseSnapshot(server).rateLimitedByPrefixCount ?? 0,
+				(rejected) => rejected > 0,
+				5_000,
+				5,
+				"prefix bucket rejects part of the flood",
+			);
+
+			const snapshot = parseSnapshot(server);
+			expect(serverEstablished.length).toBeLessThanOrEqual(8);
+			expect(snapshot.rateLimitedByPrefixCount ?? 0).toBeGreaterThan(0);
+			// All 24 addresses collapse onto a single aggregate bucket.
+			expect(snapshot.rateLimitPrefixBucketCount).toBe(1);
+			expect(snapshot.rateLimitedHandshakeCount ?? 0).toBeGreaterThan(0);
+
+			// The error names the prefix, not the peer's address.
+			const serverError = server.takeLastError();
+			expect(serverError).toContain(E_RATE_LIMITED);
+			expect(serverError).not.toContain("203.0.113.");
+		} finally {
+			for (const client of clients) client.close();
 			server.close();
 		}
 	});
