@@ -2192,6 +2192,195 @@ fn tls_snapshot_and_update_tls_rotate_default_cert_and_sni_map() {
 }
 
 #[test]
+fn update_tls_upserts_and_removes_sni_entries_without_replacing_the_map() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+    let (server, original_hash) = WtEndpoint::new_with_generated_cert_with_limits(
+        caddr,
+        "localhost",
+        14,
+        now_unix,
+        WasmLimits::default(),
+    )
+    .expect("generated cert server");
+
+    let a = crate::cert::generate("a.example", 14, now_unix).expect("a cert");
+    let b = crate::cert::generate("b.example", 14, now_unix).expect("b cert");
+    let a2 = crate::cert::generate("a.example", 14, now_unix - 1).expect("a2 cert");
+
+    let sni_names = |ep: &WtEndpoint| -> Vec<String> {
+        let snap: serde_json::Value =
+            serde_json::from_str(&ep.tls_snapshot_json()).expect("snapshot json");
+        snap["sniNames"]
+            .as_array()
+            .expect("sniNames array")
+            .iter()
+            .map(|v| v.as_str().expect("name").to_string())
+            .collect()
+    };
+
+    // Two independent upserts accumulate; neither wipes the other.
+    for (name, gen) in [("a.example", &a), ("b.example", &b)] {
+        let payload = serde_json::json!({
+            "sniUpsert": [{
+                "serverName": name,
+                "certPem": gen.cert_pem,
+                "keyPem": gen.key_pem,
+            }]
+        })
+        .to_string();
+        let res: serde_json::Value =
+            serde_json::from_str(&server.update_tls_json(&payload)).expect("upsert result");
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["sniUpserted"], 1);
+    }
+    assert_eq!(sni_names(&server), vec!["a.example", "b.example"]);
+    // The default cert is untouched by SNI-only edits.
+    let snap: serde_json::Value =
+        serde_json::from_str(&server.tls_snapshot_json()).expect("snapshot json");
+    assert_eq!(
+        snap["defaultCertHashBase64"].as_str(),
+        Some(original_hash.as_str())
+    );
+
+    // Re-upserting an existing name replaces in place: same order, no duplicate.
+    let payload = serde_json::json!({
+        "sniUpsert": [{
+            "serverName": "A.Example",
+            "certPem": a2.cert_pem,
+            "keyPem": a2.key_pem,
+        }]
+    })
+    .to_string();
+    let res: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&payload)).expect("replace result");
+    assert_eq!(res["ok"], true);
+    assert_eq!(sni_names(&server), vec!["a.example", "b.example"]);
+
+    // Removal is case-insensitive and reports how many entries actually went.
+    let payload = serde_json::json!({ "sniRemove": ["A.EXAMPLE", "absent.example"] }).to_string();
+    let res: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&payload)).expect("remove result");
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["sniRemoved"], 1);
+    assert_eq!(sni_names(&server), vec!["b.example"]);
+
+    // A bad PEM in the batch leaves the live map untouched (validate-then-apply).
+    let payload = serde_json::json!({
+        "sniRemove": ["b.example"],
+        "sniUpsert": [{
+            "serverName": "c.example",
+            "certPem": "not-a-cert",
+            "keyPem": "not-a-key",
+        }]
+    })
+    .to_string();
+    let res: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&payload)).expect("invalid batch result");
+    assert!(res["error"].as_str().expect("error").contains("E_TLS"));
+    assert_eq!(sni_names(&server), vec!["b.example"]);
+
+    // Malformed removal payloads are rejected rather than silently ignored.
+    for bad in [
+        serde_json::json!({ "sniRemove": "b.example" }),
+        serde_json::json!({ "sniRemove": [1] }),
+        serde_json::json!({ "sniUpsert": [{ "serverName": "", "certPem": a.cert_pem, "keyPem": a.key_pem }] }),
+    ] {
+        let res: serde_json::Value =
+            serde_json::from_str(&server.update_tls_json(&bad.to_string())).expect("bad result");
+        assert!(res["error"].as_str().expect("error").contains("E_TLS"));
+    }
+    assert_eq!(sni_names(&server), vec!["b.example"]);
+}
+
+#[test]
+fn update_tls_rejects_sni_batches_that_would_exceed_the_entry_cap() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+    let (server, _) = WtEndpoint::new_with_generated_cert_with_limits(
+        caddr,
+        "localhost",
+        14,
+        now_unix,
+        WasmLimits::default(),
+    )
+    .expect("generated cert server");
+
+    let gen = crate::cert::generate("cap.example", 14, now_unix).expect("cap cert");
+    // Seed the map to exactly the cap via whole-map replacement.
+    let full: Vec<serde_json::Value> = (0..crate::server_tls::MAX_SNI_ENTRIES)
+        .map(|i| {
+            serde_json::json!({
+                "serverName": format!("host{i}.example"),
+                "certPem": gen.cert_pem,
+                "keyPem": gen.key_pem,
+            })
+        })
+        .collect();
+    let res: serde_json::Value = serde_json::from_str(
+        &server.update_tls_json(&serde_json::json!({ "sni": full }).to_string()),
+    )
+    .expect("seed result");
+    assert_eq!(res["ok"], true);
+
+    // One more distinct name would overflow the cap.
+    let payload = serde_json::json!({
+        "sniUpsert": [{
+            "serverName": "overflow.example",
+            "certPem": gen.cert_pem,
+            "keyPem": gen.key_pem,
+        }]
+    })
+    .to_string();
+    let res: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&payload)).expect("overflow result");
+    assert!(res["error"].as_str().expect("error").contains("E_TLS"));
+
+    // Replacing an existing name stays at the cap and is allowed.
+    let payload = serde_json::json!({
+        "sniUpsert": [{
+            "serverName": "host0.example",
+            "certPem": gen.cert_pem,
+            "keyPem": gen.key_pem,
+        }]
+    })
+    .to_string();
+    let res: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&payload)).expect("in-place result");
+    assert_eq!(res["ok"], true);
+
+    // Removing one first makes room for a new name in the same batch.
+    let payload = serde_json::json!({
+        "sniRemove": ["host1.example"],
+        "sniUpsert": [{
+            "serverName": "overflow.example",
+            "certPem": gen.cert_pem,
+            "keyPem": gen.key_pem,
+        }]
+    })
+    .to_string();
+    let res: serde_json::Value =
+        serde_json::from_str(&server.update_tls_json(&payload)).expect("swap result");
+    assert_eq!(res["ok"], true);
+
+    // A whole-map replacement over the cap is rejected too.
+    let over: Vec<serde_json::Value> = (0..crate::server_tls::MAX_SNI_ENTRIES + 1)
+        .map(|i| {
+            serde_json::json!({
+                "serverName": format!("big{i}.example"),
+                "certPem": gen.cert_pem,
+                "keyPem": gen.key_pem,
+            })
+        })
+        .collect();
+    let res: serde_json::Value = serde_json::from_str(
+        &server.update_tls_json(&serde_json::json!({ "sni": over }).to_string()),
+    )
+    .expect("over result");
+    assert!(res["error"].as_str().expect("error").contains("E_TLS"));
+}
+
+#[test]
 fn tls_snapshot_json_on_client_endpoint_has_no_live_resolver() {
     let saddr: SocketAddr = SADDR.parse().unwrap();
     let hashes = vec![[0u8; 32]];

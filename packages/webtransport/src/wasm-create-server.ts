@@ -22,6 +22,13 @@ import {
 	toWasmServerSession,
 } from "./wasm-server-session.js";
 
+/** One SNI mapping: a server name and the PEM pair to serve for it. */
+export type WasmSniEntry = {
+	serverName: string;
+	certPem: string | Uint8Array;
+	keyPem: string | Uint8Array;
+};
+
 export type WasmCreateServerTls = {
 	/** PEM certificate. Required unless `allowSelfSigned` is true. */
 	certPem?: string | Uint8Array;
@@ -33,11 +40,7 @@ export type WasmCreateServerTls = {
 	commonName?: string;
 	/** Validity days for generated certs (default 14, clamped by wasm). */
 	validityDays?: number;
-	sni?: Array<{
-		serverName: string;
-		certPem: string | Uint8Array;
-		keyPem: string | Uint8Array;
-	}>;
+	sni?: WasmSniEntry[];
 	unknownSniPolicy?: "reject" | "default";
 };
 
@@ -78,25 +81,19 @@ export interface WasmWebTransportServer {
 	updateTls(tls: {
 		certPem?: string | Uint8Array;
 		keyPem?: string | Uint8Array;
-		sni?: Array<{
-			serverName: string;
-			certPem: string | Uint8Array;
-			keyPem: string | Uint8Array;
-		}>;
+		/** Whole-map replacement. Applied before `sniRemove`/`sniUpsert`. */
+		sni?: WasmSniEntry[];
+		/** Insert-or-replace individual entries, leaving the rest of the map. */
+		sniUpsert?: WasmSniEntry[];
+		/** Remove individual entries by name (case-insensitive). */
+		sniRemove?: string[];
 		unknownSniPolicy?: "reject" | "default";
 	}): Promise<void>;
-	replaceSniCerts(
-		sni: Array<{
-			serverName: string;
-			certPem: string | Uint8Array;
-			keyPem: string | Uint8Array;
-		}>,
-	): Promise<void>;
-	upsertSniCert(entry: {
-		serverName: string;
-		certPem: string | Uint8Array;
-		keyPem: string | Uint8Array;
-	}): Promise<void>;
+	/** Replace the whole SNI map. Prefer the incremental ops for rotation. */
+	replaceSniCerts(sni: WasmSniEntry[]): Promise<void>;
+	/** Insert or replace one SNI entry without disturbing the others. */
+	upsertSniCert(entry: WasmSniEntry): Promise<void>;
+	/** Drop one SNI entry. Removing an absent name is a no-op. */
 	removeSniCert(serverName: string): Promise<void>;
 	setUnknownSniPolicy(policy: "reject" | "default"): Promise<void>;
 	tlsSnapshot(): {
@@ -114,6 +111,18 @@ export interface WasmWebTransportServer {
 function decodePem(value: string | Uint8Array | undefined): string {
 	if (value == null) return "";
 	return typeof value === "string" ? value : new TextDecoder().decode(value);
+}
+
+function decodeSniEntry(entry: WasmSniEntry): {
+	serverName: string;
+	certPem: string;
+	keyPem: string;
+} {
+	return {
+		serverName: entry.serverName,
+		certPem: decodePem(entry.certPem),
+		keyPem: decodePem(entry.keyPem),
+	};
 }
 
 let webWasmLoad: Promise<WasmModule> | null = null;
@@ -191,32 +200,22 @@ class WasmWebTransportServerImpl implements WasmWebTransportServer {
 	async updateTls(tls: {
 		certPem?: string | Uint8Array;
 		keyPem?: string | Uint8Array;
-		sni?: Array<{
-			serverName: string;
-			certPem: string | Uint8Array;
-			keyPem: string | Uint8Array;
-		}>;
+		sni?: WasmSniEntry[];
+		sniUpsert?: WasmSniEntry[];
+		sniRemove?: string[];
 		unknownSniPolicy?: "reject" | "default";
 	}): Promise<void> {
 		await this.#manager.updateTls({
 			certPem: tls.certPem != null ? decodePem(tls.certPem) : undefined,
 			keyPem: tls.keyPem != null ? decodePem(tls.keyPem) : undefined,
-			sni: tls.sni?.map((e) => ({
-				serverName: e.serverName,
-				certPem: decodePem(e.certPem),
-				keyPem: decodePem(e.keyPem),
-			})),
+			sni: tls.sni?.map(decodeSniEntry),
+			sniUpsert: tls.sniUpsert?.map(decodeSniEntry),
+			sniRemove: tls.sniRemove,
 			unknownSniPolicy: tls.unknownSniPolicy,
 		});
 	}
 
-	async replaceSniCerts(
-		sni: Array<{
-			serverName: string;
-			certPem: string | Uint8Array;
-			keyPem: string | Uint8Array;
-		}>,
-	): Promise<void> {
+	async replaceSniCerts(sni: WasmSniEntry[]): Promise<void> {
 		const snap = this.tlsSnapshot();
 		await this.updateTls({
 			sni,
@@ -224,22 +223,12 @@ class WasmWebTransportServerImpl implements WasmWebTransportServer {
 		});
 	}
 
-	async upsertSniCert(_entry: {
-		serverName: string;
-		certPem: string | Uint8Array;
-		keyPem: string | Uint8Array;
-	}): Promise<void> {
-		throw new WebTransportError(
-			E_UNSUPPORTED_ARGUMENT as ErrorCode,
-			"E_UNSUPPORTED_ARGUMENT: upsertSniCert requires replaceSniCerts with the full PEM map on wasm",
-		);
+	async upsertSniCert(entry: WasmSniEntry): Promise<void> {
+		await this.#manager.updateTls({ sniUpsert: [decodeSniEntry(entry)] });
 	}
 
-	async removeSniCert(_serverName: string): Promise<void> {
-		throw new WebTransportError(
-			E_UNSUPPORTED_ARGUMENT as ErrorCode,
-			"E_UNSUPPORTED_ARGUMENT: removeSniCert requires replaceSniCerts with remaining PEM entries on wasm",
-		);
+	async removeSniCert(serverName: string): Promise<void> {
+		await this.#manager.updateTls({ sniRemove: [serverName] });
 	}
 
 	async setUnknownSniPolicy(policy: "reject" | "default"): Promise<void> {

@@ -1325,39 +1325,78 @@ impl WtEndpoint {
             } else {
                 None
             };
-        let next_sni = if let Some(entries) = parsed.get("sni").and_then(|v| v.as_array()) {
-            let mut mapped = Vec::new();
-            for entry in entries {
-                let name = match entry.get("serverName").and_then(|v| v.as_str()) {
-                    Some(n) => n.to_string(),
-                    None => {
-                        return serde_json::json!({ "error": "E_TLS: sni.serverName missing" })
-                            .to_string()
-                    }
-                };
-                let cert = match entry.get("certPem").and_then(|v| v.as_str()) {
-                    Some(c) => c,
-                    None => {
-                        return serde_json::json!({ "error": "E_TLS: sni.certPem missing" })
-                            .to_string()
-                    }
-                };
-                let key = match entry.get("keyPem").and_then(|v| v.as_str()) {
-                    Some(k) => k,
-                    None => {
-                        return serde_json::json!({ "error": "E_TLS: sni.keyPem missing" })
-                            .to_string()
-                    }
-                };
-                match crate::server_tls::certified_key_from_pem(cert, key) {
-                    Ok(ck) => mapped.push((name, ck)),
-                    Err(e) => return serde_json::json!({ "error": e }).to_string(),
-                }
+        let next_sni = if parsed.get("sni").and_then(|v| v.as_array()).is_some() {
+            let mapped = match parse_sni_entries(parsed.get("sni")) {
+                Ok(v) => v,
+                Err(e) => return serde_json::json!({ "error": e }).to_string(),
+            };
+            if mapped.len() > crate::server_tls::MAX_SNI_ENTRIES {
+                return serde_json::json!({
+                    "error": format!(
+                        "E_TLS: sni map exceeds the {} entry cap",
+                        crate::server_tls::MAX_SNI_ENTRIES
+                    )
+                })
+                .to_string();
             }
             Some(mapped)
         } else {
             None
         };
+
+        // Incremental map edits. Validated here so a bad PEM or an over-cap
+        // insert leaves the live resolver untouched.
+        let next_upserts = match parse_sni_entries(parsed.get("sniUpsert")) {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({ "error": e }).to_string(),
+        };
+        let next_removals = match parsed.get("sniRemove") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(names)) => {
+                let mut out = Vec::with_capacity(names.len());
+                for name in names {
+                    match name.as_str() {
+                        Some(n) => out.push(n.to_string()),
+                        None => {
+                            return serde_json::json!({
+                                "error": "E_TLS: sniRemove entries must be strings"
+                            })
+                            .to_string()
+                        }
+                    }
+                }
+                out
+            }
+            Some(_) => {
+                return serde_json::json!({ "error": "E_TLS: sniRemove must be an array" })
+                    .to_string()
+            }
+        };
+
+        // Simulate the resulting name set before touching anything, so an
+        // over-cap batch is rejected wholesale rather than half-applied. Order
+        // matches application order: replace, then remove, then upsert.
+        if !next_upserts.is_empty() {
+            let mut names: Vec<String> = match &next_sni {
+                Some(mapped) => mapped.iter().map(|(n, _)| n.clone()).collect(),
+                None => resolver.sni_names(),
+            };
+            names.retain(|n| !next_removals.iter().any(|r| r.eq_ignore_ascii_case(n)));
+            for (name, _) in &next_upserts {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    names.push(name.clone());
+                }
+            }
+            if names.len() > crate::server_tls::MAX_SNI_ENTRIES {
+                return serde_json::json!({
+                    "error": format!(
+                        "E_TLS: sni map would exceed the {} entry cap",
+                        crate::server_tls::MAX_SNI_ENTRIES
+                    )
+                })
+                .to_string();
+            }
+        }
 
         let mut default_cert_rotated = false;
         if let Some(ck) = default_ck {
@@ -1370,18 +1409,31 @@ impl WtEndpoint {
         if let Some(mapped) = next_sni {
             resolver.set_sni(mapped);
         }
+        let mut sni_removed = 0u64;
+        for name in &next_removals {
+            if resolver.remove_sni(name) {
+                sni_removed += 1;
+            }
+        }
+        let sni_upserted = next_upserts.len() as u64;
+        for (name, ck) in next_upserts {
+            resolver.upsert_sni(&name, ck);
+        }
         // Pin clients trust a specific cert hash; when the default cert just
         // changed, hand back the new hash so the caller can redistribute it
         // out-of-band instead of silently breaking existing pinned clients.
+        let mut result = serde_json::json!({ "ok": true });
         if default_cert_rotated {
-            serde_json::json!({
-                "ok": true,
-                "defaultCertHashBase64": resolver.default_cert_hash_base64(),
-            })
-            .to_string()
-        } else {
-            serde_json::json!({ "ok": true }).to_string()
+            result["defaultCertHashBase64"] =
+                serde_json::json!(resolver.default_cert_hash_base64());
         }
+        if sni_upserted > 0 {
+            result["sniUpserted"] = serde_json::json!(sni_upserted);
+        }
+        if !next_removals.is_empty() {
+            result["sniRemoved"] = serde_json::json!(sni_removed);
+        }
+        result.to_string()
     }
 
     /// Drain client TLS tickets for `server_name` into an opaque vault blob.
@@ -3828,6 +3880,40 @@ impl WtEndpoint {
             return Some(event.encode_with_host_token(token));
         }
     }
+}
+
+/// Parse a JSON array of `{serverName, certPem, keyPem}` into certified keys.
+/// A missing field is `Ok(vec![])`; a malformed one is an `E_TLS` string so the
+/// caller can bail before mutating the live resolver.
+fn parse_sni_entries(
+    value: Option<&serde_json::Value>,
+) -> Result<Vec<(String, std::sync::Arc<rustls::sign::CertifiedKey>)>, String> {
+    let entries = match value {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(entries)) => entries,
+        Some(_) => return Err("E_TLS: sni entries must be an array".into()),
+    };
+    let mut mapped = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry
+            .get("serverName")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "E_TLS: sni.serverName missing".to_string())?;
+        if name.is_empty() {
+            return Err("E_TLS: sni.serverName must not be empty".into());
+        }
+        let cert = entry
+            .get("certPem")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "E_TLS: sni.certPem missing".to_string())?;
+        let key = entry
+            .get("keyPem")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "E_TLS: sni.keyPem missing".to_string())?;
+        let ck = crate::server_tls::certified_key_from_pem(cert, key)?;
+        mapped.push((name.to_string(), ck));
+    }
+    Ok(mapped)
 }
 
 /// Read all currently-available ordered bytes from a recv stream into `out`.

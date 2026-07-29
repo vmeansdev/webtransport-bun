@@ -283,4 +283,201 @@ describe("wasm createServer plug-and-play", () => {
 			await server.close();
 		},
 	);
+
+	test.skipIf(!wasmAvailable)(
+		"SNI upsert/remove edit the map incrementally while traffic flows",
+		async () => {
+			const gen = (cn: string) =>
+				JSON.parse(
+					wasm.wt_generate_cert(cn, 14, Math.floor(Date.now() / 1000) - 3600),
+				) as { certPem: string; keyPem: string; hashBase64: string };
+
+			const server = await createServer({
+				host: "127.0.0.1",
+				port: 0,
+				tls: {
+					allowSelfSigned: true,
+					commonName: "localhost",
+					sni: (() => {
+						const seed = gen("seed.example");
+						return [
+							{
+								serverName: "seed.example",
+								certPem: seed.certPem,
+								keyPem: seed.keyPem,
+							},
+						];
+					})(),
+					unknownSniPolicy: "default",
+				},
+				wasm,
+				bind: (host, port) => BunUdpTransport.bind(host, port),
+				onSession: (session) => {
+					session.onDatagram((d) => {
+						void session.sendDatagram(d);
+					});
+				},
+			});
+			const pinnedHash = server.certHashBase64;
+
+			const clientUdp = await BunUdpTransport.connect(
+				"127.0.0.1",
+				server.address.port,
+			);
+			const { session: client, manager: clientMgr } = await connectWasm(
+				wasm,
+				clientUdp,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${server.address.port}`,
+				{ certHashBase64: pinnedHash },
+			);
+
+			let echoes = 0;
+			client.onDatagram(() => {
+				echoes += 1;
+			});
+
+			const SENDS = 40;
+			const traffic = (async () => {
+				for (let n = 0; n < SENDS; n++) {
+					await client.sendDatagram(new TextEncoder().encode(`load-${n}`));
+					await Bun.sleep(2);
+				}
+			})();
+
+			// Rotate the SNI map incrementally while the echo loop is mid-flight;
+			// the sleeps keep the edits genuinely interleaved with the traffic
+			// rather than collapsing into one microtask drain.
+			const rotation = (async () => {
+				for (const name of ["a.example", "b.example", "c.example"]) {
+					const cert = gen(name);
+					await server.upsertSniCert({
+						serverName: name,
+						certPem: cert.certPem,
+						keyPem: cert.keyPem,
+					});
+					await Bun.sleep(10);
+				}
+			})();
+
+			await Promise.all([traffic, rotation]);
+			expect(server.tlsSnapshot().sniNames).toEqual([
+				"seed.example",
+				"a.example",
+				"b.example",
+				"c.example",
+			]);
+
+			// Re-upserting replaces in place rather than appending a duplicate.
+			const replacement = gen("b.example");
+			await server.upsertSniCert({
+				serverName: "B.Example",
+				certPem: replacement.certPem,
+				keyPem: replacement.keyPem,
+			});
+			expect(server.tlsSnapshot().sniNames).toEqual([
+				"seed.example",
+				"a.example",
+				"b.example",
+				"c.example",
+			]);
+
+			await server.removeSniCert("a.example");
+			await server.removeSniCert("never-added.example"); // no-op
+			expect(server.tlsSnapshot().sniNames).toEqual([
+				"seed.example",
+				"b.example",
+				"c.example",
+			]);
+
+			// None of the SNI edits disturbed the default cert clients pinned.
+			expect(server.certHashBase64).toBe(pinnedHash);
+
+			// The session kept echoing throughout the rotation.
+			await withTimeout(
+				(async () => {
+					while (echoes < SENDS) await Bun.sleep(5);
+				})(),
+				5000,
+				"echo traffic across SNI rotation",
+			);
+
+			// ...and still echoes once the rotation has settled.
+			const before = echoes;
+			await client.sendDatagram(new TextEncoder().encode("post-rotation"));
+			await withTimeout(
+				(async () => {
+					while (echoes <= before) await Bun.sleep(5);
+				})(),
+				5000,
+				"post-rotation echo",
+			);
+
+			clientMgr.close();
+			clientUdp.close();
+			await server.close();
+		},
+		// Generates four P-256 certs in wasm on top of a live handshake.
+		20_000,
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"invalid SNI edits fail closed and leave the live map untouched",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4437 };
+			const seed = JSON.parse(
+				wasm.wt_generate_cert(
+					"keep.example",
+					14,
+					Math.floor(Date.now() / 1000) - 3600,
+				),
+			) as { certPem: string; keyPem: string };
+
+			const server = await createServer({
+				host: "127.0.0.1",
+				port: 4437,
+				tls: {
+					allowSelfSigned: true,
+					sni: [
+						{
+							serverName: "keep.example",
+							certPem: seed.certPem,
+							keyPem: seed.keyPem,
+						},
+					],
+				},
+				wasm,
+				bind: async () => relay.endpoint(serverAddr),
+				onSession: () => {},
+			});
+
+			await expect(
+				server.upsertSniCert({
+					serverName: "bad.example",
+					certPem: "not-a-cert",
+					keyPem: "not-a-key",
+				}),
+			).rejects.toThrow(/E_TLS/);
+			expect(server.tlsSnapshot().sniNames).toEqual(["keep.example"]);
+
+			await expect(
+				server.updateTls({
+					sniRemove: ["keep.example"],
+					sniUpsert: [
+						{
+							serverName: "also-bad.example",
+							certPem: "nope",
+							keyPem: "nope",
+						},
+					],
+				}),
+			).rejects.toThrow(/E_TLS/);
+			// The batch was rejected wholesale — the removal did not land either.
+			expect(server.tlsSnapshot().sniNames).toEqual(["keep.example"]);
+
+			await server.close();
+		},
+	);
 });

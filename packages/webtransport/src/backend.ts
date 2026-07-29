@@ -1895,7 +1895,16 @@ export class WasmTransportManager {
 	async updateTls(tls: {
 		certPem?: string;
 		keyPem?: string;
+		/** Whole-map replacement. Applied before `sniRemove`/`sniUpsert`. */
 		sni?: Array<{ serverName: string; certPem: string; keyPem: string }>;
+		/** Incremental insert-or-replace; leaves other entries alone. */
+		sniUpsert?: Array<{
+			serverName: string;
+			certPem: string;
+			keyPem: string;
+		}>;
+		/** Incremental removal by server name (case-insensitive). */
+		sniRemove?: string[];
 		unknownSniPolicy?: "reject" | "default";
 	}): Promise<void> {
 		const fn = (
@@ -1921,6 +1930,8 @@ export class WasmTransportManager {
 		// via the structured log so operators can redistribute it out-of-band.
 		this.emitLog("tls_update", {
 			sniCount: tls.sni?.length ?? 0,
+			sniUpserted: tls.sniUpsert?.length ?? 0,
+			sniRemoved: tls.sniRemove?.length ?? 0,
 			unknownSniPolicy: tls.unknownSniPolicy ?? "reject",
 			defaultCertHashBase64: result.defaultCertHashBase64,
 		});

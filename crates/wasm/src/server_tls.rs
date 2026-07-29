@@ -7,6 +7,11 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
 
+/// Upper bound on live SNI entries. Each entry pins a parsed certificate chain
+/// and signing key in wasm linear memory, and incremental upserts otherwise let
+/// a control path grow the map without bound.
+pub const MAX_SNI_ENTRIES: usize = 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnknownSniPolicy {
     Reject,
@@ -97,6 +102,42 @@ impl LiveServerCertResolver {
     pub fn set_sni(&self, entries: Vec<(String, Arc<CertifiedKey>)>) {
         let mut guard = self.inner.lock().expect("resolver lock");
         guard.sni = entries;
+    }
+
+    /// Insert or replace one SNI entry, leaving the rest of the map alone.
+    /// Names match case-insensitively, matching `resolve`.
+    pub fn upsert_sni(&self, server_name: &str, key: Arc<CertifiedKey>) {
+        let mut guard = self.inner.lock().expect("resolver lock");
+        match guard
+            .sni
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(server_name))
+        {
+            Some(slot) => slot.1 = key,
+            None => guard.sni.push((server_name.to_string(), key)),
+        }
+    }
+
+    /// Drop one SNI entry. Returns whether a matching entry was present.
+    pub fn remove_sni(&self, server_name: &str) -> bool {
+        let mut guard = self.inner.lock().expect("resolver lock");
+        let before = guard.sni.len();
+        guard
+            .sni
+            .retain(|(n, _)| !n.eq_ignore_ascii_case(server_name));
+        guard.sni.len() != before
+    }
+
+    /// Configured SNI names, in map order — lets a caller simulate the result
+    /// of a batch of edits before applying it.
+    pub fn sni_names(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("resolver lock")
+            .sni
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     pub fn set_unknown_policy(&self, policy: UnknownSniPolicy) {
@@ -272,6 +313,32 @@ mod tests {
         resolver.set_unknown_policy(UnknownSniPolicy::Default);
         let snapshot: serde_json::Value = serde_json::from_str(&resolver.snapshot_json()).unwrap();
         assert_eq!(snapshot["unknownSniPolicy"], "default");
+    }
+
+    #[test]
+    fn upsert_and_remove_edit_the_sni_map_in_place() {
+        let resolver = LiveServerCertResolver::new(
+            Some(generated_certified_key("default.test")),
+            UnknownSniPolicy::Reject,
+        );
+        let first = generated_certified_key("one.test");
+        let second = generated_certified_key("two.test");
+        resolver.upsert_sni("one.test", Arc::clone(&first));
+        resolver.upsert_sni("two.test", second);
+        assert_eq!(resolver.sni_names(), vec!["one.test", "two.test"]);
+
+        // Replacing an existing name keeps position and does not duplicate.
+        let replacement = generated_certified_key("one.test");
+        resolver.upsert_sni("ONE.TEST", Arc::clone(&replacement));
+        assert_eq!(resolver.sni_names(), vec!["one.test", "two.test"]);
+
+        assert!(resolver.remove_sni("One.Test"));
+        assert!(!resolver.remove_sni("One.Test"));
+        assert_eq!(resolver.sni_names(), vec!["two.test"]);
+
+        // Whole-map replacement still works alongside the incremental ops.
+        resolver.set_sni(vec![("three.test".to_string(), first)]);
+        assert_eq!(resolver.sni_names(), vec!["three.test"]);
     }
 
     #[test]
