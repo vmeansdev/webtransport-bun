@@ -41,7 +41,7 @@ parity, and shared evidence binding.
 | 6b | landed (impl) | `crates/wasm/src/cert.rs`; `WasmCertRotator`; COMPATIBILITY |
 | 6c | harness landed; evidence pending deepen | `tools/interop/*`; IWA |
 | Protocol bar | in progress | `h3.rs`, `endpoint.rs`, TLS early-data |
-| Facade parity | pending | `parity-*.test.ts` on wasm selector |
+| Facade parity | suites run on both backends; claim pending commit rebind | all 9 `parity-*.test.ts` via `webtransport-bun/portable` (native 67/0; wasm 64 pass/3 skip/0 fail) — evidence at `docs/release-evidence/11abb39.../facade_parity-dual-backend-evidence.json` |
 | 13-15 | tooling landed; **evidence pending** | coverage/fuzz/soak workflows |
 | 17 | pending final closure | `release-status.json`; promote tool |
 

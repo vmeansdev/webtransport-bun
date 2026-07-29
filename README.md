@@ -206,6 +206,9 @@ The current release status is pending in `docs/release-status.json`; treat the
 - **Backend-agnostic contract**: `WebTransportLike` (exported from both the
   root and `/wasm` subpaths) lets application code run unchanged against the
   native or wasm backend.
+- **One server, either backend**: `webtransport-bun/portable` exports an async
+  `createServer` that dispatches on the runtime, handing your `onSession` the
+  same session shape on both. See below.
 - **Certs**: `generateCert` produces browser-pinnable ECDSA P-256 certs
   (validity clamped to the 14-day `serverCertificateHashes` limit).
 
@@ -219,12 +222,35 @@ const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
 });
 ```
 
+The same echo server, written once and run on whichever backend the runtime
+provides:
+
+```ts
+import { createServer } from "@webtransport-bun/webtransport/portable";
+
+const server = await createServer({
+  port: 4433,
+  tls: { allowSelfSigned: true }, // wasm-only; pass certPem/keyPem on native
+  onSession: async (session) => {
+    for await (const d of session.incomingDatagrams()) {
+      await session.sendDatagram(d);
+    }
+  },
+});
+// wasm clients pin server.certHashBase64
+await server.close();
+```
+
 ### Know before you ship
 
 - **`/wasm` is a candidate surface, not stable/GA.** The canonical release
-  truth is `docs/release-status.json`. The wasm facade intentionally diverges
-  (callback-style sessions, different close/error semantics) until it converges
-  with the native surface. Depend on `/wasm` only if you accept change.
+  truth is `docs/release-status.json`. The wasm server session now mirrors the
+  native `ServerSession` shape — `incomingDatagrams()`, the incoming stream
+  `ReadableStream`s, `id`/`peer`, and `getStats()` — so one server codebase runs
+  on either backend through `webtransport-bun/portable`. What remains divergent
+  is the original callback-style API (`onDatagram`/`onIncomingStream`), kept for
+  back-compat but deprecated; it cannot be combined with the W3C surface on the
+  same session. Depend on `/wasm` only if you accept change.
 - **The in-browser server is Chromium-only, and only inside an Isolated Web
   App.** Direct Sockets `UDPSocket` does not exist on normal web pages, in
   Firefox, or in Safari. Installing an IWA today requires `chrome://flags`

@@ -1,0 +1,62 @@
+{
+  "id": "local-facade_parity_dual_backend-11abb39",
+  "commit": "11abb39cf65613a0772fc43b73a4a567595a694b",
+  "generatedAt": "2026-07-29",
+  "harness": "bun test packages/webtransport/test/parity-*.test.ts",
+  "what": "All nine parity-*.test.ts suites executed against both backends through the portable createServer. Supersedes the session-map smoke that backed local-facade_parity-cb0cb69.",
+  "runs": [
+    {
+      "selector": "native",
+      "command": "bun test packages/webtransport/test/parity-*.test.ts",
+      "files": 9,
+      "tests": 67,
+      "pass": 67,
+      "fail": 0,
+      "skip": 0,
+      "expectCalls": 155
+    },
+    {
+      "selector": "wasm",
+      "command": "WEBTRANSPORT_PARITY_BACKEND=wasm WEBTRANSPORT_REQUIRE_WASM=1 bun test packages/webtransport/test/parity-*.test.ts",
+      "files": 9,
+      "tests": 67,
+      "pass": 64,
+      "fail": 0,
+      "skip": 3,
+      "expectCalls": 139,
+      "stableAcrossRuns": 3
+    }
+  ],
+  "antiGaming": {
+    "requireWasmEnvSet": true,
+    "executedWasmTestCount": 64,
+    "stubTransportRemoved": "wasm construct() returns a real WasmWebTransport over a reserved live session; the previous { close(){} } cast is gone",
+    "getStatsBackedByTraffic": "bytesSent and bytesReceived asserted > 0 after echo (wasm-server-session-parity.test.ts)",
+    "streamCapsBehavioralOnWasm": "waitUntilAvailable stream-capacity test runs on both backends via a limit-configured harness; no soft-skip"
+  },
+  "wasmExclusions": [
+    {
+      "count": 3,
+      "kind": "test.skipIf",
+      "suite": "parity-compat",
+      "reason": "pre-existing native-only compat checks"
+    },
+    {
+      "kind": "in-test guard",
+      "reason": "connect-failure tests need a real unreachable UDP socket; the in-memory relay cannot address a dead peer"
+    },
+    {
+      "kind": "in-test guard",
+      "reason": "toWebTransport / connectWithRetry wrap a native ClientSession with no wasm equivalent"
+    },
+    {
+      "kind": "in-test guard",
+      "reason": "serverCertificateHashes algorithm/digest validation: wasm pins by live hash and never consumes those entries"
+    },
+    {
+      "kind": "in-test guard",
+      "reason": "pooled connects cannot verify this self-signed loopback server (pooling forbids hash pinning; wasm has no insecureSkipVerify). Wasm pooled reuse is covered behaviorally in wasm-parity-helpers.test.ts"
+    }
+  ],
+  "notes": "Not stamped passed in release-status.json: check-doc-truth requires passed evidence to name candidate.commit, which is still cb0cb698efd81c8f65c8c665d577579a19679371. Rebinding the candidate would invalidate every other passed entry, so this artifact is recorded and the claim is held at pending until the maintainer rebinds."
+}
