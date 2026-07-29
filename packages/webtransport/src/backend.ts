@@ -793,6 +793,7 @@ export class WasmSession {
 	private rejectClosed!: (err: Error) => void;
 	private isClosed = false;
 	private closeRequested = false;
+	private localCloseInfo: WtCloseInfo | null = null;
 	private established = false;
 	private datagramCb:
 		| ((data: Uint8Array, reservation?: WasmPayloadReservation) => void)
@@ -934,6 +935,11 @@ export class WasmSession {
 	close(info?: WtCloseInfo): void {
 		if (this.isClosed || this.closeRequested) return;
 		this.closeRequested = true;
+		// The reason travels to the peer, but the close event that resolves
+		// `closed` carries only a wasm-side error detail — empty for a clean
+		// local close. Keep the caller's info so our own `closed` reports what
+		// was asked for, matching native.
+		this.localCloseInfo = info ?? {};
 		this.mgr.closeSession(this, info);
 	}
 	onDatagram(
@@ -1006,7 +1012,15 @@ export class WasmSession {
 				this.rejectClosed(error);
 				return;
 			}
-			this.resolveClosed(info);
+			const local = this.localCloseInfo;
+			this.resolveClosed(
+				local
+					? {
+							code: local.code ?? info.code,
+							reason: local.reason ?? info.reason,
+						}
+					: info,
+			);
 		}
 	}
 	/** @internal */
