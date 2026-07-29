@@ -14,7 +14,7 @@ Package version: `1.0.0-rc.1`.
 ### Passed (commit-bound on candidate)
 
 - `wasm-local-gates`, `package-artifact`, `supply-chain-provenance`
-- `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity`
+- `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`
   (honest timed unit evidence after R4 gap-closure)
 - `auto-review-zero-p0-p4` (round-5 remainingP0P4 empty)
 - `iwa-direct-sockets` (local Chrome 150 Direct Sockets; rebuilt+signed bundle)
@@ -28,7 +28,17 @@ Package version: `1.0.0-rc.1`.
 | `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
 | `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |
 | `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
+| `wasm-facade-parity` | **Demoted 2026-07-29.** Its `cb0cb69` evidence was a session-map smoke that never supported the claim's wording. Superseded by all 9 `parity-*.test.ts` on both backends (native 67/0; wasm 64 pass/3 skip/0 fail) — see `docs/release-evidence/11abb39…/facade_parity-dual-backend-evidence.json`. Stamping it `passed` needs evidence bound to `candidate.commit`, still `cb0cb69` |
 | `final-no-change-confirmation` | Requires immutable freeze after all other gates |
+
+### Not GA-blocking
+
+| Claim | Harness | Evidence artifact |
+|---|---|---|
+| `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; `.release-evidence/load/distributed-scale-artifact.json` |
+
+`distributed-scale.ts` is the authoritative multisource harness; the earlier
+single-source scale scripts it replaced are not release evidence.
 
 ## What is safe to say today
 

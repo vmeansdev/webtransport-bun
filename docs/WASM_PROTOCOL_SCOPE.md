@@ -35,7 +35,18 @@ These are **1.0 requirements**, not permanent product omissions. Treat
 - CONNECT handshake timeout (`connect_deadline`, 10 s) so an unanswered
   handshake fails `ready` instead of hanging.
 - Client certificate pinning via `serverCertificateHashes` (ECDSA P-256,
-  ≤ 14-day validity — enforced in `verify.rs`).
+  ≤ 14-day validity — enforced in `verify.rs`). This is the default and the
+  only path with end-to-end proof.
+- Client CA-root trust via `caPem` (user-supplied roots) is **implemented and
+  construction-verified, not end-to-end proven**. `wasm-ca-trust.test.ts`
+  asserts that a CA-verified endpoint builds and that malformed roots map to
+  `E_TLS`; no test completes a handshake against a CA-verified server. Proving
+  it is blocked on test infrastructure: `wt_generate_cert` emits self-signed
+  leaves only, and a self-signed leaf cannot act as its own webpki trust
+  anchor, so no valid chain can be built in-test. **Open follow-up:** add
+  test-only CA + leaf chain generation (rcgen can issue a leaf from a CA) and
+  an end-to-end handshake test. Until then treat `caPem` as
+  implemented-unproven, not parity-closed.
 
 ## Delegated to quinn-proto (transport layer)
 
