@@ -133,3 +133,13 @@ Per-IP token buckets (defaults)
 - IWA Direct Sockets proofs need generated/signed web-bundle assets (`origin.txt`, `.wbn`/`.swbn`; typically gitignored) before `tools/interop/run-iwa.mjs`; packaged artifacts often live under `.release-evidence/iwa/`.
 - WASM soft facade gaps (pooling, `waitUntilAvailable`, real `getStats`/CC, sendOrder/sendGroup, live TLS/SNI, metrics/log, `WasmServerSession`) are largely closed on the candidate; ticket hosts use IndexedDB in IWA and memory/file on Bun; remaining non-parity is product/API (async `/wasm` vs native sync root, session shape, IWA-only browser host, Bun still prefers native).
 - WASM IWA plug-and-play server is async `createServer` / `createIwaServer` from the `/wasm` entrypoint over Direct Sockets; distinct from the root native sync `createServer`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as local markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
