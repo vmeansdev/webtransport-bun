@@ -304,7 +304,7 @@ describe.skipIf(!wasmAvailable)("WasmServerSession facade (Phase 8)", () => {
 			);
 			expect(clientFacade.metricsSnapshot().datagramsOut).toBe(1);
 
-			clientFacade.createBidirectionalStream();
+			await clientFacade.createBidirectionalStream();
 			expect(clientFacade.metricsSnapshot().streamsActive).toBe(1);
 		} finally {
 			serverSession.close();
