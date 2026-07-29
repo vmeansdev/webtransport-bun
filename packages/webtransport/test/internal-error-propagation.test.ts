@@ -206,6 +206,9 @@ describe("internal TS error propagation", () => {
 		const session = {
 			id: "wrapped",
 			peer: { ip: "127.0.0.1", port: 4433 },
+			has0Rtt: false,
+			accepted0Rtt: false,
+			handshakeConfirmed: true,
 			ready: Promise.resolve(),
 			closed,
 			close() {},
