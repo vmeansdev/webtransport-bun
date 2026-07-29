@@ -2137,43 +2137,67 @@ export async function serveOverUdp(
 		localPort: number;
 		commonName?: string;
 		validityDays?: number;
+		/** Optional PEM pair — when both set, the endpoint is built atomically (no generate-then-rotate). */
+		certPem?: string;
+		keyPem?: string;
 		onSession: (session: WasmSession) => void;
 	} & WasmEndpointOptions,
 ): Promise<{ manager: WasmTransportManager; certHashBase64: string }> {
 	const normalized = normalizeWasmEndpointOptions(opts);
 	const udp = await bind(opts.localAddress ?? "0.0.0.0", opts.localPort);
-	const notBefore = Math.floor(Date.now() / 1000) - 3600;
-	const json = wasm.wt_new_server_with_options(
-		JSON.stringify({
-			addr: `${opts.localAddress ?? "0.0.0.0"}:${opts.localPort}`,
-			peerAddr: "127.0.0.1:0",
-			commonName: opts.commonName ?? "localhost",
-			validityDays: opts.validityDays ?? 14,
-			notBeforeUnix: notBefore,
-			...normalized,
-		}),
-	);
-	const parsed = JSON.parse(json) as {
-		eid?: number;
-		hashBase64?: string;
-		error?: string;
-	};
-	if (parsed.error || parsed.eid == null || parsed.hashBase64 == null) {
-		// Release the socket we just bound before failing, or the port leaks.
-		udp.close?.();
-		throw new Error(`wt_new_server failed: ${parsed.error ?? "unknown"}`);
+	let adopted = false;
+	try {
+		const notBefore = Math.floor(Date.now() / 1000) - 3600;
+		const pemFields =
+			opts.certPem != null && opts.keyPem != null
+				? { certPem: opts.certPem, keyPem: opts.keyPem }
+				: {};
+		const json = wasm.wt_new_server_with_options(
+			JSON.stringify({
+				addr: `${opts.localAddress ?? "0.0.0.0"}:${opts.localPort}`,
+				peerAddr: "127.0.0.1:0",
+				commonName: opts.commonName ?? "localhost",
+				validityDays: opts.validityDays ?? 14,
+				notBeforeUnix: notBefore,
+				...pemFields,
+				...normalized,
+			}),
+		);
+		let parsed: { eid?: number; hashBase64?: string; error?: string };
+		try {
+			parsed = JSON.parse(json) as {
+				eid?: number;
+				hashBase64?: string;
+				error?: string;
+			};
+		} catch (cause) {
+			throw new Error("wt_new_server returned invalid JSON", { cause });
+		}
+		if (parsed.error || parsed.eid == null || parsed.hashBase64 == null) {
+			throw new Error(`wt_new_server failed: ${parsed.error ?? "unknown"}`);
+		}
+		const manager = WasmTransportManager.adopt(
+			wasm,
+			udp,
+			parsed.eid,
+			opts.onSession,
+			normalized,
+		);
+		// manager.close() now releases the bound UDP socket too.
+		manager.ownTransport(udp);
+		adopted = true;
+		if (opts.log) manager.setLog(opts.log, opts.debug === true);
+		return { manager, certHashBase64: parsed.hashBase64 };
+	} catch (err) {
+		if (!adopted) {
+			try {
+				udp.close?.();
+			} catch {
+				/* ignore close failures during cleanup */
+			}
+		}
+		throw err;
 	}
-	const manager = WasmTransportManager.adopt(
-		wasm,
-		udp,
-		parsed.eid,
-		opts.onSession,
-		normalized,
-	);
-	// manager.close() now releases the bound UDP socket too.
-	manager.ownTransport(udp);
-	if (opts.log) manager.setLog(opts.log, opts.debug === true);
-	return { manager, certHashBase64: parsed.hashBase64 };
 }
 
 /**

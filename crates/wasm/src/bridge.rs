@@ -365,7 +365,9 @@ pub fn wt_new_server(
 }
 
 /// Create a server endpoint from one normalized JSON config object:
-/// `{ addr, peerAddr, commonName, validityDays, notBeforeUnix, limits }`.
+/// `{ addr, peerAddr, commonName, validityDays, notBeforeUnix, limits,
+///    certPem?, keyPem? }`. When both PEMs are present the endpoint is built
+/// atomically from them; otherwise a fresh P-256 cert is generated.
 #[wasm_bindgen]
 pub fn wt_new_server_with_options(config_json: &str) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(config_json) {
@@ -409,17 +411,42 @@ pub fn wt_new_server_with_options(config_json: &str) -> String {
         Ok(v) => v,
         Err(err) => return serde_json::json!({ "error": err }).to_string(),
     };
-    match WtEndpoint::new_with_generated_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
-        peer,
-        common_name,
-        validity_days,
-        not_before_unix,
-        limits,
-        rate_limits,
-        enable_0rtt,
-        share_tickets,
-        congestion,
-    ) {
+    let cert_pem = parsed.get("certPem").and_then(|v| v.as_str());
+    let key_pem = parsed.get("keyPem").and_then(|v| v.as_str());
+    let created = match (cert_pem, key_pem) {
+        (Some(cert), Some(key)) => {
+            WtEndpoint::new_with_pem_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+                peer,
+                cert,
+                key,
+                limits,
+                rate_limits,
+                enable_0rtt,
+                share_tickets,
+                congestion,
+            )
+        }
+        (None, None) => {
+            WtEndpoint::new_with_generated_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+                peer,
+                common_name,
+                validity_days,
+                not_before_unix,
+                limits,
+                rate_limits,
+                enable_0rtt,
+                share_tickets,
+                congestion,
+            )
+        }
+        _ => {
+            return serde_json::json!({
+                "error": "E_TLS: certPem and keyPem must both be set or both omitted"
+            })
+            .to_string()
+        }
+    };
+    match created {
         Ok((mut ep, hash)) => {
             apply_optional_wt_max_sessions(&mut ep, &parsed);
             ep.set_qpack_settings(parse_qpack_settings(&parsed));

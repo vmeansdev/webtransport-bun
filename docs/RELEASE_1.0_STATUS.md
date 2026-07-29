@@ -39,5 +39,7 @@ Package version: `1.0.0-rc.1`.
   sendOrder were closed on the parity epic path; ticket dump auto-fires on
   close when a `TicketStoreHost` is set (`Memory` / `File` / `IndexedDB`).
   Live TLS/SNI rotate, metricsSnapshot, log/debug, and `WasmServerSession`
-  are available on wasm managers (still no plug-and-play browser `createServer`).
+  are available on wasm managers. Async IWA plug-and-play `createServer` exists
+  on `@webtransport-bun/webtransport/wasm` (candidate; not GA; not the root
+  native sync API).
 - Promote still refuses until the pending table above clears.

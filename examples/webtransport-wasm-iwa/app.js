@@ -5,8 +5,8 @@
 import initWasm, * as wasm from "./vendor/webtransport_wasm.js";
 import {
 	connectWasm,
+	createServer,
 	DirectSocketsUdpTransport,
-	serveOverUdp,
 	serverCertificateHashes,
 } from "./vendor/webtransport-wasm.js";
 
@@ -164,11 +164,15 @@ async function startServer(port) {
 	const existing = servers.get(port);
 	if (existing) return existing;
 	const server = await withDeadline(
-		serveOverUdp(wasm, DirectSocketsUdpTransport.bind, {
-			localAddress: "127.0.0.1",
-			localPort: port,
-			commonName: "localhost",
-			validityDays: 14,
+		createServer({
+			host: "127.0.0.1",
+			port,
+			tls: {
+				allowSelfSigned: true,
+				commonName: "localhost",
+				validityDays: 14,
+			},
+			wasm,
 			onSession: installServerSession,
 		}),
 		`start IWA server on UDP ${port}`,

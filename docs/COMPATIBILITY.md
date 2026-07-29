@@ -71,7 +71,10 @@ Constraints that apply regardless of environment:
   `wasm-facade-parity` is claim-passed on the current candidate (pooling,
   waitUntilAvailable, quinn getStats, CC factories, sendOrder scheduler,
   durable ticket hosts, metrics, live TLS/SNI, log/debug, WasmServerSession).
-  Plug-and-play browser `createServer()` remains out of scope (sans-IO hosts).
+  Async plug-and-play `createServer` / `createIwaServer` on
+  `@webtransport-bun/webtransport/wasm` is available for Chromium IWA + Direct
+  Sockets (candidate; not interchangeable with root native sync `createServer`).
+  Normal webpages / Firefox / Safari remain impossible.
 - **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
   signed Web Bundle installation via Chromium's developer-mode
   `--install-isolated-web-app-from-file` switch, unsigned source bundle, and

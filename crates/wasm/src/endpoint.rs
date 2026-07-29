@@ -1013,6 +1013,40 @@ impl WtEndpoint {
         Ok((ep, hash))
     }
 
+    /// Server endpoint with caller-supplied PEM cert/key (atomic; no generate-then-rotate).
+    pub fn new_with_pem_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+        peer_addr: SocketAddr,
+        cert_pem: &str,
+        key_pem: &str,
+        limits: WasmLimits,
+        rate_limits: WasmRateLimits,
+        enable_0rtt: bool,
+        share_process_0rtt_ticket_store: bool,
+        congestion_control: CongestionControlMode,
+    ) -> Result<(Self, String), String> {
+        let key = crate::server_tls::certified_key_from_pem(cert_pem, key_pem)?;
+        let hash = crate::server_tls::LiveServerCertResolver::new(
+            Some(Arc::clone(&key)),
+            crate::server_tls::UnknownSniPolicy::Reject,
+        )
+        .default_cert_hash_base64()
+        .ok_or_else(|| "E_TLS: default cert hash missing after PEM parse".to_string())?;
+        let (cfg, resolver) = crate::server_tls::server_config_with_live_resolver_key(key)?;
+        let mut ep = Self::build(
+            true,
+            peer_addr,
+            Some(cfg),
+            None,
+            limits,
+            rate_limits,
+            enable_0rtt,
+            share_process_0rtt_ticket_store,
+            congestion_control,
+        )?;
+        ep.tls_resolver = Some(resolver);
+        Ok((ep, hash))
+    }
+
     fn build(
         is_server: bool,
         peer_addr: SocketAddr,
@@ -1264,26 +1298,34 @@ impl WtEndpoint {
                     .to_string()
             }
         };
-        let mut default_cert_rotated = false;
-        if let (Some(cert), Some(key)) = (
+
+        // Validate every field before mutating the live resolver (fail-closed).
+        let default_ck = match (
             parsed.get("certPem").and_then(|v| v.as_str()),
             parsed.get("keyPem").and_then(|v| v.as_str()),
         ) {
-            match crate::server_tls::certified_key_from_pem(cert, key) {
-                Ok(ck) => {
-                    resolver.replace_default(ck);
-                    default_cert_rotated = true;
+            (Some(cert), Some(key)) => match crate::server_tls::certified_key_from_pem(cert, key) {
+                Ok(ck) => Some(ck),
+                Err(e) => return serde_json::json!({ "error": e }).to_string(),
+            },
+            (None, None) => None,
+            _ => {
+                return serde_json::json!({
+                    "error": "E_TLS: certPem and keyPem must both be set or both omitted"
+                })
+                .to_string()
+            }
+        };
+        let next_policy =
+            if let Some(policy) = parsed.get("unknownSniPolicy").and_then(|v| v.as_str()) {
+                match crate::server_tls::UnknownSniPolicy::parse(Some(policy)) {
+                    Ok(p) => Some(p),
+                    Err(e) => return serde_json::json!({ "error": e }).to_string(),
                 }
-                Err(e) => return serde_json::json!({ "error": e }).to_string(),
-            }
-        }
-        if let Some(policy) = parsed.get("unknownSniPolicy").and_then(|v| v.as_str()) {
-            match crate::server_tls::UnknownSniPolicy::parse(Some(policy)) {
-                Ok(p) => resolver.set_unknown_policy(p),
-                Err(e) => return serde_json::json!({ "error": e }).to_string(),
-            }
-        }
-        if let Some(entries) = parsed.get("sni").and_then(|v| v.as_array()) {
+            } else {
+                None
+            };
+        let next_sni = if let Some(entries) = parsed.get("sni").and_then(|v| v.as_array()) {
             let mut mapped = Vec::new();
             for entry in entries {
                 let name = match entry.get("serverName").and_then(|v| v.as_str()) {
@@ -1312,6 +1354,20 @@ impl WtEndpoint {
                     Err(e) => return serde_json::json!({ "error": e }).to_string(),
                 }
             }
+            Some(mapped)
+        } else {
+            None
+        };
+
+        let mut default_cert_rotated = false;
+        if let Some(ck) = default_ck {
+            resolver.replace_default(ck);
+            default_cert_rotated = true;
+        }
+        if let Some(p) = next_policy {
+            resolver.set_unknown_policy(p);
+        }
+        if let Some(mapped) = next_sni {
             resolver.set_sni(mapped);
         }
         // Pin clients trust a specific cert hash; when the default cert just

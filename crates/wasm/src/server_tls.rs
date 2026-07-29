@@ -157,7 +157,11 @@ pub fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<Arc<Certi
         .key_provider
         .load_private_key(key)
         .map_err(|e| format!("E_TLS: load key: {e}"))?;
-    Ok(Arc::new(CertifiedKey::new(certs, signing)))
+    let certified = CertifiedKey::new(certs, signing);
+    certified
+        .keys_match()
+        .map_err(|e| format!("E_TLS: private key does not match certificate: {e}"))?;
+    Ok(Arc::new(certified))
 }
 
 pub fn certified_key_from_der(
@@ -171,7 +175,11 @@ pub fn certified_key_from_der(
         .key_provider
         .load_private_key(key)
         .map_err(|e| format!("E_TLS: load key: {e}"))?;
-    Ok(Arc::new(CertifiedKey::new(vec![cert], signing)))
+    let certified = CertifiedKey::new(vec![cert], signing);
+    certified
+        .keys_match()
+        .map_err(|e| format!("E_TLS: private key does not match certificate: {e}"))?;
+    Ok(Arc::new(certified))
 }
 
 pub fn server_config_with_live_resolver(
@@ -179,6 +187,14 @@ pub fn server_config_with_live_resolver(
     key_der: Vec<u8>,
 ) -> Result<(ServerConfig, LiveServerCertResolver), String> {
     let key = certified_key_from_der(cert_der, key_der)?;
+    server_config_with_live_resolver_key(key)
+}
+
+/// Build a server config + live resolver from an already-parsed {@link CertifiedKey}
+/// (PEM construction path for atomic `wt_new_server_with_options`).
+pub fn server_config_with_live_resolver_key(
+    key: Arc<CertifiedKey>,
+) -> Result<(ServerConfig, LiveServerCertResolver), String> {
     let resolver = LiveServerCertResolver::new(Some(key), UnknownSniPolicy::Reject);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = ServerConfig::builder_with_provider(provider)

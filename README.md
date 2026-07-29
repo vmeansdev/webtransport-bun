@@ -239,11 +239,13 @@ const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
   a validity window of at most two weeks — `generateCert` clamps to this.
   Plan for rotation: regenerate and redistribute the hash before expiry;
   clients pin the hash, so a new cert means a new hash.
-- **You bring the I/O.** The wasm core is sans-IO: it never opens sockets,
-  reads clocks, or schedules timers. You (or one of the shipped adapters —
-  `DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) must pump packets
-  both ways and drive timeouts. There is no plug-and-play `createServer()` in
-  the browser.
+- **You bring the I/O — unless you use IWA plug-and-play.** The wasm core is
+  sans-IO: it never opens sockets, reads clocks, or schedules timers by itself.
+  Shipped adapters (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) pump
+  packets and drive timeouts. Inside a Chromium IWA with Direct Sockets,
+  `await createServer(...)` from `@webtransport-bun/webtransport/wasm` (alias
+  `createIwaServer`) owns bind + pumps for you. That is not the root package's
+  native sync `createServer`, and it still cannot run on a normal webpage.
 - **Client-side wasm works anywhere wasm runs** (Bun, Node, browsers) against
   any WebTransport server — the IWA constraint applies only to hosting a
   *server* in the browser.
@@ -256,8 +258,9 @@ Chromium's own native client.
 See `examples/webtransport-wasm-iwa/` for the in-browser (IWA) reference,
 `tools/interop/WASM_INTEROP.md` for the cross-stack interop matrix, and
 `docs/PARITY_MATRIX.md` for native-vs-wasm feature parity (pooling, stats, CC,
-sendOrder, durable tickets, live TLS, metrics — still no plug-and-play browser
-`createServer()`; hosts supply `UdpTransport`).
+sendOrder, durable tickets, live TLS, metrics — IWA async `createServer` on
+`/wasm` is available as a candidate; lower-level hosts may still supply
+`UdpTransport`).
 
 ## Quickstart
 

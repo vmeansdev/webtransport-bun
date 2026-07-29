@@ -17,9 +17,9 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
 
 ## What it shows
 
-- `serveOverUdp(...)` — a WebTransport server bound to UDP, exercising
-  datagrams, uni/bidi streams, RESET_STREAM, STOP_SENDING, peer close, and
-  eight reconnects.
+- `createServer(...)` (wasm/IWA plug-and-play) — a WebTransport server bound to
+  UDP via Direct Sockets, exercising datagrams, uni/bidi streams, RESET_STREAM,
+  STOP_SENDING, peer close, and eight reconnects.
 - `connectWasm(...)` — a WebTransport client over a connected `UDPSocket`.
 - Certificate rotation — a stale pin must fail and the new P-256 certificate
   must complete a payload exchange.
