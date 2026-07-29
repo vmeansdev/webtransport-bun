@@ -348,6 +348,14 @@ export type LimitsOptions = {
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
 	idleTimeoutMs: number;
+	/**
+	 * Keep-alive ping interval in ms. On the server, sessions emit QUIC
+	 * keep-alive packets so idle-but-healthy connections survive
+	 * `idleTimeoutMs`; the effective interval is clamped to
+	 * `min(keepAliveIntervalMs, idleTimeoutMs / 3)`. `0` or omitted disables
+	 * keep-alive (the default).
+	 */
+	keepAliveIntervalMs?: number;
 };
 
 /** Default limit values from AGENTS.md */
@@ -404,6 +412,9 @@ export type ServerOptions = {
 	limits?: Partial<LimitsOptions>;
 	rateLimits?: Partial<RateLimitOptions>;
 
+	/** Congestion controller for all server connections: cubic (default), BBR (throughput), or NewReno (low-latency). */
+	congestionControl?: "default" | "throughput" | "low-latency";
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -417,6 +428,8 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
+	/** Effective congestion-control mode applied to all server connections. */
+	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
 	updateCert(tls: {
 		certPem: string | Uint8Array;
@@ -1110,8 +1123,21 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				})) ?? [],
 		});
 
+	if (
+		opts.congestionControl !== undefined &&
+		!VALID_CONGESTION.has(opts.congestionControl)
+	) {
+		throw new WebTransportError(
+			E_INTERNAL as ErrorCode,
+			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+		);
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
+	const serverOptsJson = JSON.stringify({
+		congestionControl: opts.congestionControl ?? "default",
+	});
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
 		...opts.rateLimits,
@@ -1152,6 +1178,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		tlsConfigToJson(opts.tls),
 		limitsJson,
 		rateLimitsJson,
+		serverOptsJson,
 		(events: any[]) => {
 			for (const evt of events) {
 				if (
@@ -1226,6 +1253,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
+		congestionControl: opts.congestionControl ?? "default",
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);

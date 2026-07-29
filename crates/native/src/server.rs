@@ -130,6 +130,7 @@ fn spawn_server_instance(
     session_tx: &Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     log_tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     tls_resolver: Arc<crate::server_tls::LiveServerCertResolver>,
+    congestion_control: crate::client::CongestionControlMode,
     debug: bool,
     max_retries: usize,
 ) -> std::result::Result<watch::Sender<()>, String> {
@@ -153,6 +154,7 @@ fn spawn_server_instance(
             session_tx.clone(),
             log_tx.clone(),
             Arc::clone(&tls_resolver),
+            congestion_control,
             debug,
             startup_tx,
         );
@@ -203,6 +205,7 @@ impl ServerHandle {
         tls_config_json: String,
         _limits_json: String,
         _rate_limits_json: String,
+        server_opts_json: String,
         on_session: JsFunction,
         log_fn: JsFunction,
     ) -> Result<Self> {
@@ -281,6 +284,10 @@ impl ServerHandle {
             let log_tx = Some(crate::spawn_event_batcher(log_tsfn, 128, 10));
 
             let metrics = Arc::new(ServerMetrics::default());
+            let server_opts: serde_json::Value =
+                serde_json::from_str(&server_opts_json).unwrap_or(serde_json::Value::Null);
+            let congestion_control = crate::client::parse_congestion_control(&server_opts)
+                .map_err(napi::Error::from_reason)?;
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -307,6 +314,7 @@ impl ServerHandle {
                 &session_tx,
                 &log_tx,
                 Arc::clone(&tls_resolver),
+                congestion_control,
                 debug,
                 1,
             )
@@ -609,5 +617,47 @@ impl ServerHandle {
                 .metrics
                 .snapshot(Some(state.tls_resolver.metrics_snapshot())))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::{
+        congestion_controller_label, parse_congestion_control, CongestionControlMode,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn server_opts_congestion_control_maps_to_expected_controllers() {
+        let cases = [
+            (json!({}), CongestionControlMode::Default, "cubic"),
+            (
+                json!({ "congestionControl": "default" }),
+                CongestionControlMode::Default,
+                "cubic",
+            ),
+            (
+                json!({ "congestionControl": "throughput" }),
+                CongestionControlMode::Throughput,
+                "bbr",
+            ),
+            (
+                json!({ "congestionControl": "low-latency" }),
+                CongestionControlMode::LowLatency,
+                "new_reno",
+            ),
+        ];
+        for (opts, expected_mode, expected_label) in cases {
+            let mode = parse_congestion_control(&opts).expect("server opts should parse");
+            assert_eq!(mode, expected_mode);
+            assert_eq!(congestion_controller_label(mode), expected_label);
+        }
+    }
+
+    #[test]
+    fn server_opts_congestion_control_rejects_unknown_value() {
+        let err = parse_congestion_control(&json!({ "congestionControl": "warp-speed" }))
+            .expect_err("unknown mode must be rejected");
+        assert!(err.contains("E_INTERNAL"), "error must carry code: {err}");
     }
 }

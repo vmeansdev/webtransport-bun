@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Server-side `congestionControl` on `ServerOptions` (`"default"` → Cubic, `"throughput"` → BBR, `"low-latency"` → NewReno), matching the existing client option; the effective mode is exposed as `WebTransportServer.congestionControl`.
+- Server keep-alive: `limits.keepAliveIntervalMs` now emits QUIC keep-alive packets on server sessions so idle-but-healthy connections survive `idleTimeoutMs`; the interval is clamped to `min(keepAliveIntervalMs, idleTimeoutMs / 3)`, and `0`/omitted keeps keep-alive disabled.
+
+### Changed
+
+- Upgraded `wtransport` from `=0.7.0` to `=0.7.1` in both the native addon and the reference server (the reference crate now enables the `quinn` feature for compile parity).
+- `docs/PARITY_MATRIX.md` now documents 0-RTT resumption and dynamic QPACK as upstream-gated on the native backend (not exposed by wtransport 0.7.1).
+
 ## [0.3.0](https://github.com/vmeansdev/webtransport-bun/compare/v0.2.4...v0.3.0) - 2026-03-08
 
 ### Changed

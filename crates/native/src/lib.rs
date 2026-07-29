@@ -343,6 +343,7 @@ pub(crate) fn spawn_wtransport_server(
     session_tx: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     log_tx: Option<tokio::sync::mpsc::Sender<LogEvent>>,
     tls_resolver: Arc<server_tls::LiveServerCertResolver>,
+    congestion_control: client::CongestionControlMode,
     debug_logs: bool,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
 ) {
@@ -398,9 +399,10 @@ pub(crate) fn spawn_wtransport_server(
                     .max_queued_bytes_per_session
                     .saturating_add(64 * 1024),
             ));
+            client::apply_congestion_controller(&mut transport, congestion_control);
             let config_builder = ServerConfig::builder()
-                .with_bind_address(bind_addr)
-                .with_custom_tls_and_transport(tls_config, transport);
+            .with_bind_address(bind_addr)
+            .with_custom_tls_and_transport(tls_config, transport);
             let config_builder = match config_builder.max_idle_timeout(Some(
                 std::time::Duration::from_millis(limits.idle_timeout_ms),
             )) {
@@ -412,6 +414,11 @@ pub(crate) fn spawn_wtransport_server(
                     return;
                 }
             };
+            let config_builder = config_builder.keep_alive_interval(
+                limits
+                    .effective_keep_alive_interval_ms()
+                    .map(std::time::Duration::from_millis),
+            );
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
                 Ok(s) => {
