@@ -684,7 +684,7 @@ dependencies = [
  "tokio",
  "url",
  "wtransport",
- "x509-parser 0.18.1",
+ "x509-parser",
 ]
 
 [[package]]

@@ -19,7 +19,7 @@ import {
 	WT_STOP_SENDING,
 } from "../src/index.js";
 import { generateLocalhostCert } from "./helpers/certs.js";
-import { nextPort } from "./helpers/network.js";
+import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 describe("webtransport package exports", () => {
 	it("exports createServer function", () => {
@@ -193,4 +193,61 @@ describe("webtransport package exports", () => {
 			cert.cleanup();
 		}
 	}, 15000);
+});
+
+describe("server congestionControl (parity backport B1)", () => {
+	it("rejects invalid congestionControl with E_INTERNAL", () => {
+		expect(() =>
+			createServer({
+				port: nextPort(27400, 500),
+				tls: { certPem: "", keyPem: "" },
+				// @ts-expect-error invalid mode on purpose
+				congestionControl: "warp-speed",
+				onSession: () => {},
+			}),
+		).toThrow(/E_INTERNAL: congestionControl must be/);
+	});
+
+	it("defaults to cubic and exposes the effective mode", async () => {
+		const server = createServer({
+			port: nextPort(27400, 500),
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			expect(server.congestionControl).toBe("default");
+		} finally {
+			await server.close();
+		}
+	});
+
+	for (const mode of ["throughput", "low-latency"] as const) {
+		it(`accepts sessions and echoes traffic with congestionControl=${mode}`, async () => {
+			const port = nextPort(27400, 500);
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				congestionControl: mode,
+				onSession: async (s) => {
+					for await (const d of s.incomingDatagrams()) {
+						await s.sendDatagram(d);
+					}
+				},
+			});
+			expect(server.congestionControl).toBe(mode);
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			try {
+				await client.sendDatagram(new Uint8Array([7, 8, 9]));
+				const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+				const echoed = await iter.next();
+				expect(echoed.done).toBe(false);
+				expect(Array.from(echoed.value as Uint8Array)).toEqual([7, 8, 9]);
+			} finally {
+				client.close();
+				await server.close();
+			}
+		}, 20000);
+	}
 });
