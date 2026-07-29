@@ -839,6 +839,15 @@ export class WasmSession {
 		return this.isClosed || this.closeRequested;
 	}
 
+	/**
+	 * Remote address of this session's connection, matching the native
+	 * `ServerSession.peer` shape. Falls back to `0.0.0.0:0` once the connection
+	 * is gone, or on a wasm package predating the `wt_conn_peer` export.
+	 */
+	get peer(): { ip: string; port: number } {
+		return this.mgr.endpoint.connPeer(this.conn) ?? { ip: "0.0.0.0", port: 0 };
+	}
+
 	/** Quinn connection stats for W3C getStats(). */
 	connectionStats(): {
 		bytesSent: number;
