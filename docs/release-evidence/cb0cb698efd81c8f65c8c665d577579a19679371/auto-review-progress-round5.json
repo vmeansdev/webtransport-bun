@@ -1,0 +1,58 @@
+{
+	"round": 5,
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"headAtReview": "2b264aa",
+	"reviewRange": "a57df57..2b264aa",
+	"status": "CLOSED_ZERO_OPENS",
+	"note": "Formal R5 after gap-closure. L1 READY; L2 N/A; L3-4-8 READY; L5-6-7 READY.",
+	"lanes": {
+		"1": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "41a3a4be-f30b-4d7e-8611-5c2aaa726170"
+		},
+		"2": {
+			"verdict": "N/A",
+			"opens": [],
+			"agent": "parent"
+		},
+		"3": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "248d3da2-72d4-4224-ad90-9af949402753"
+		},
+		"4": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "248d3da2-72d4-4224-ad90-9af949402753"
+		},
+		"5": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "3d7ee8b2-1570-491e-8f83-98c60ed50f8d"
+		},
+		"6": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "3d7ee8b2-1570-491e-8f83-98c60ed50f8d"
+		},
+		"7": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "3d7ee8b2-1570-491e-8f83-98c60ed50f8d"
+		},
+		"8": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "248d3da2-72d4-4224-ad90-9af949402753"
+		}
+	},
+	"remainingP0P4": [],
+	"claimPass": {
+		"wasm-0rtt": "PASS",
+		"wasm-dynamic-qpack": "PASS",
+		"wasm-multi-session": "PASS",
+		"wasm-facade-parity": "PASS",
+		"auto-review-zero-p0-p4": "PASS"
+	}
+}

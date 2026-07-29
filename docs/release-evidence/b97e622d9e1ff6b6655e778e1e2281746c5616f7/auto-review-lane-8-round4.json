@@ -1,0 +1,64 @@
+{
+	"lane": 8,
+	"round": 4,
+	"verdict": "NOT READY",
+	"agent": "46346713-4dda-42e3-8ea9-a5366d9199df",
+	"note": "KRC refuse + hard caps OK; TicketStoreHost hydrate works for localhost/process-local vault; evidence honesty + premature auto-review pass block READY.",
+	"claimPass": {
+		"wasm-multi-session": "PASS",
+		"wasm-0rtt": "REJECT",
+		"wasm-dynamic-qpack": "REJECT",
+		"auto-review-zero-p0-p4": "REJECT"
+	},
+	"findings": [
+		{
+			"id": "L8-P0-evidence-theater",
+			"severity": "P0",
+			"summary": "b97e622 zero_rtt / dynamic_qpack / multi_session unit evidence are 1s note stubs sharing identical artifactSha256 dbe24977…; no command output / wall-clock proof. Claim flip to passed is not honest.",
+			"status": "open",
+			"file": "docs/release-evidence/b97e622d9e1ff6b6655e778e1e2281746c5616f7/{zero_rtt,dynamic_qpack,multi_session}-unit-evidence.json"
+		},
+		{
+			"id": "L8-P0-autoreview-premature-pass",
+			"severity": "P0",
+			"summary": "release-status auto-review-zero-p0-p4=passed and b97e622 auto-review-progress.json marks L8 READY / claimPass PASS while round4 progress is IN_PROGRESS and this lane still open.",
+			"status": "open",
+			"file": "docs/release-status.json"
+		},
+		{
+			"id": "L8-P2-qpack-partial-insert-fallback",
+			"severity": "P2",
+			"summary": "insert_with_ack_floor/KRC refuse itself is correct, but encode_connect/status_with can mutate the encoder table then Err; endpoint .ok() falls back to literals with empty encoder_stream, leaving unreplicated inserts → peer table desync under constrained capacity.",
+			"status": "open",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L8-P2-0rtt-sni-authority-skew",
+			"severity": "P2",
+			"summary": "TicketStoreHost opaque vault can hydrate has0Rtt on a fresh endpoint without shareProcess (pinned test path), but quinn connect SNI is hardcoded \"localhost\" while hydrate/dump keys on WT authority—non-localhost authorities dump/hydrate the wrong rustls ticket key.",
+			"status": "open",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L8-P3-qpack-oversized-ok",
+			"severity": "P3",
+			"summary": "insert_with_ack_floor sz>capacity with floor=None returns Ok(()) after clearing and does not insert; RFC 9204 treats oversized encoder inserts as QPACK_ENCODER_STREAM_ERROR.",
+			"status": "open",
+			"file": "crates/wasm/src/h3.rs"
+		},
+		{
+			"id": "L8-OK-krc-evict-refuse",
+			"severity": "info",
+			"summary": "Encoder insert_with_ack_floor / set_capacity_with_ack_floor refuse eviction when oldest_absolute > known_received_count; unit-covered.",
+			"status": "ok",
+			"file": "crates/wasm/src/h3.rs"
+		},
+		{
+			"id": "L8-OK-qpack-hard-caps",
+			"severity": "info",
+			"summary": "QPACK hard caps 65536 capacity / 128 blocked streams enforced in bridge.rs and backend.ts normalize.",
+			"status": "ok",
+			"file": "crates/wasm/src/bridge.rs"
+		}
+	]
+}

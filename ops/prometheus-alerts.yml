@@ -1,0 +1,100 @@
+groups:
+  - name: webtransport-project
+    interval: 30s
+    rules:
+      - alert: WebTransportQueuePressureHigh
+        expr: max by (server_id) (webtransport_queued_bytes_global) > 429496730
+        for: 10m
+        labels:
+          severity: ticket
+          metric_owner: webtransport
+        annotations:
+          summary: WebTransport queue use exceeds 80 percent of the default 512 MiB global budget
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#queue-pressure
+      - alert: WebTransportBackpressureTimeoutRateHigh
+        expr: sum by (server_id) (rate(webtransport_backpressure_timeout_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: webtransport
+        annotations:
+          summary: Backpressure timeouts exceed 0.1 per second
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#backpressure-timeouts
+      - alert: WebTransportRateLimitingHigh
+        expr: sum by (server_id) (rate(webtransport_rate_limited_total[5m])) > 10
+        for: 10m
+        labels:
+          severity: ticket
+          metric_owner: webtransport
+        annotations:
+          summary: Rate limiting exceeds 10 rejections per second
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#rate-limiting
+      - alert: WebTransportHandshakeLatencyP99High
+        expr: histogram_quantile(0.99, sum by (le, server_id) (rate(webtransport_handshake_latency_seconds_bucket[5m]))) > 0.3
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: webtransport
+        annotations:
+          summary: WebTransport handshake p99 exceeds 300 milliseconds
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#handshake-health
+      - alert: WebTransportTaskLeakSuspected
+        expr: (sum by (server_id) (webtransport_session_tasks_active + webtransport_stream_tasks_active) > 0) and on (server_id) (max by (server_id) (webtransport_sessions_active) == 0)
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: webtransport
+        annotations:
+          summary: Internal tasks remain after all sessions have drained
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#task-leakage
+  - name: webtransport-service-integration
+    interval: 30s
+    rules:
+      - alert: WebTransportHandshakeFailureRatioHigh
+        expr: sum by (service) (rate(webtransport_service_handshake_failures_total[5m])) / clamp_min(sum by (service) (rate(webtransport_service_handshake_attempts_total[5m])), 1) > 0.05
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: application
+        annotations:
+          summary: Application-observed handshake failures exceed 5 percent
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#handshake-health
+      - alert: WebTransportCloseLatencyP99High
+        expr: histogram_quantile(0.99, sum by (le, service) (rate(webtransport_service_close_latency_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: application
+        annotations:
+          summary: Application-observed close latency p99 exceeds 2 seconds
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#close-latency
+      - alert: WebTransportSocketLeakSuspected
+        expr: max by (service) (webtransport_service_udp_sockets_open - webtransport_service_servers_expected) > 0
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: application
+        annotations:
+          summary: UDP socket count remains above the configured server count
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#socket-leakage
+  - name: webtransport-host-runtime
+    interval: 30s
+    rules:
+      - alert: WebTransportRssGrowthSustained
+        expr: deriv(process_resident_memory_bytes{service=~"webtransport.*"}[30m]) > 87381
+        for: 30m
+        labels:
+          severity: ticket
+          metric_owner: host
+        annotations:
+          summary: Process RSS is growing by more than 150 MiB per 30 minutes
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#rss-trend
+      - alert: WebTransportEventLoopLagHigh
+        expr: max by (service) (webtransport_host_event_loop_lag_seconds) > 0.1
+        for: 10m
+        labels:
+          severity: page
+          metric_owner: host
+        annotations:
+          summary: Host-exported event-loop lag exceeds 100 milliseconds
+          runbook_url: https://github.com/vmeansdev/webtransport-bun/blob/main/ops/README.md#event-loop-lag

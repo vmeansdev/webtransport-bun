@@ -1,0 +1,50 @@
+{
+	"round": 3,
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"headAtReview": "1d8bd6d",
+	"status": "CLOSED_FINDINGS_PENDING_COMMIT",
+	"note": "Round-3 eight-lane review; open P0\u2013P4 fixed or invalidated in working tree (docs+product). Awaiting commit of follow-ups.",
+	"lanes": {
+		"1": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "798e27a1-3907-4db8-9310-38b8b5dad880"
+		},
+		"2": {
+			"verdict": "N/A",
+			"opens": [],
+			"agent": "c6dea7a7-f117-4fe2-8b62-95ba32e05686"
+		},
+		"3": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "5259f7b3-ea5c-4ae0-aea4-581f7929702c"
+		},
+		"4": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "b7b85585-d343-4582-a25f-b3012435f27b"
+		},
+		"5": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "ef373e64-0528-4cb5-a74c-11eaab9e2ca1"
+		},
+		"6": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "61a73489-6210-472d-bf48-841d6bf9ca12"
+		},
+		"7": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "44140645-2bec-4d46-8c47-82651a48e586"
+		},
+		"8": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "6ba92b44-9fc4-411d-86d7-76e9dfeb2139"
+		}
+	},
+	"remainingP0P4": []
+}

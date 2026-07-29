@@ -1,0 +1,28 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "package-artifact",
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "bun"
+	},
+	"command": [
+		"bun",
+		"scripts/test-package-artifact.ts",
+		"build"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T16:25:41.063730+00:00",
+	"finishedAt": "2026-07-27T16:25:48.502457+00:00",
+	"durationMs": 7438,
+	"notes": "Honest sequential build then check invocations (not a fake && argv).",
+	"checkCommand": [
+		"bun",
+		"scripts/test-package-artifact.ts",
+		"check"
+	],
+	"checkExitCode": 0,
+	"artifactSha256": "44950b49a7131949f7e2263635661d972a1dc71e7ff09a11b2796bb0721efa7d"
+}

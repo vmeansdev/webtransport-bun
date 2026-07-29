@@ -1,0 +1,85 @@
+{
+	"lane": 7,
+	"round": 3,
+	"agent": "44140645-2bec-4d46-8c47-82651a48e586",
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L7-P1-stale-release-status-md",
+			"severity": "P1",
+			"summary": "RELEASE_1.0_STATUS.md still on candidate 2cc0732: lists coverage-gates as passed and protocol/auto-review claims as pending/not-closed, contradicting release-status.json (coverage failed/pending; wasm-dynamic-qpack/multi-session/0rtt + auto-review-zero-p0-p4 passed on ab6bbdf)",
+			"status": "fixed",
+			"file": "docs/RELEASE_1.0_STATUS.md",
+			"fixedIn": "round3-doc-sync"
+		},
+		{
+			"id": "L7-P1-protocol-scope-claim-lag",
+			"severity": "P1",
+			"summary": "WASM_PROTOCOL_SCOPE still says dynamic QPACK claim remains pending and 0-RTT claim evidence remains, while release-status.json marks wasm-dynamic-qpack/wasm-0rtt passed with ab6bbdf evidence; auto-review-progress also notes docTruth:pending-bind",
+			"status": "fixed",
+			"file": "docs/WASM_PROTOCOL_SCOPE.md",
+			"fixedIn": "round3-doc-sync"
+		},
+		{
+			"id": "L7-P2-parity-compat-claim-lag",
+			"severity": "P2",
+			"summary": "PARITY_MATRIX and COMPATIBILITY still say wasm-dynamic-qpack/multi-session/0rtt (and facade) are pending/not-yet-GA despite three protocol claims now passed in release-status.json",
+			"status": "fixed",
+			"file": "docs/PARITY_MATRIX.md",
+			"fixedIn": "round3-doc-sync"
+		},
+		{
+			"id": "L7-P2-connect-admission-ops-gap",
+			"severity": "P2",
+			"summary": "ab6bbdf stopped charging Handshake rate-limit at CONNECT classify; storms fail closed only via unlatched+active wtMaxSessions cap + RESET \u2014 OPERATIONS/SECURITY still imply handshake rate limits cover CONNECT admission",
+			"status": "fixed",
+			"file": "docs/OPERATIONS.md",
+			"fixedIn": "round3-doc-sync"
+		},
+		{
+			"id": "L7-P2-wtsessions-undercount-unlatched",
+			"severity": "P2",
+			"summary": "wtSessionsActive sums active_wt_count (live primary/extra + client pending) but omits server unlatched admitted CONNECTs that count toward admission occupied; METRICS Live + pending overstates completeness",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs",
+			"fixedIn": "round3-doc-sync"
+		},
+		{
+			"id": "L7-P3-stale-claim-rebind-notes",
+			"severity": "P3",
+			"summary": "chromium-*/fault-matrix claim notes still say prior 19acc30 evidence needs rebind though ab6bbdf evidence artifacts are attached and passed",
+			"status": "fixed",
+			"file": "docs/release-status.json",
+			"fixedIn": "round3-doc-sync"
+		},
+		{
+			"id": "L7-P1-no-session-metrics",
+			"severity": "P1",
+			"summary": "wtSessionsActive/sessionClosedCount present in governor_snapshot_json + METRICS/OPERATIONS",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "L7-P1-shared-ticket-store",
+			"severity": "P1",
+			"summary": "shareProcess0RttTicketStore / process-local store footgun documented in OPERATIONS + SECURITY",
+			"status": "fixed",
+			"file": "docs/OPERATIONS.md"
+		},
+		{
+			"id": "L7-P2-ops-qpack-literal",
+			"severity": "P2",
+			"summary": "OPERATIONS Dynamic QPACK ICI/section-ack traffic footgun updated",
+			"status": "fixed",
+			"file": "docs/OPERATIONS.md"
+		},
+		{
+			"id": "L7-passed-claims-ab6bbdf-evidence",
+			"severity": "P2",
+			"summary": "wasm-dynamic-qpack/multi-session/0rtt + auto-review-zero-p0-p4 have commit-bound ab6bbdf evidence; coverage-gates and wasm-facade-parity correctly remain pending",
+			"status": "fixed",
+			"file": "docs/release-status.json"
+		}
+	],
+	"note": "Open doc/ops honesty findings fixed in working tree after lane report."
+}

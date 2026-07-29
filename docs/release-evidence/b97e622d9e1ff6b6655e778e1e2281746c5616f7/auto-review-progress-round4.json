@@ -1,0 +1,103 @@
+{
+	"round": 4,
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"headAtReview": "a57df57",
+	"reviewRange": "1d8bd6d..a57df57068c23669b14ce4b6ab8ff12711a20f29",
+	"status": "COMPLETE_NOT_READY",
+	"completedAt": "2026-07-27T15:47:00Z",
+	"note": "Round-4 complete. READY: L2 N/A, L3. NOT READY: L1/L4/L5/L6/L7/L8. Blockers: evidence theater (P0), premature auto-review-zero-p0-p4 pass (P0), TicketStoreHost vault forgeability (P2), doc claim lag, stamp honesty.",
+	"lanes": {
+		"1": {
+			"verdict": "NOT READY",
+			"opens": ["SEC-10", "SEC-11", "SEC-12"],
+			"agent": "910e6a78-df09-4bb8-bce3-7df0f624b2f2"
+		},
+		"2": {
+			"verdict": "N/A",
+			"opens": [],
+			"agent": "0667ffd5-57cd-4457-bc7a-9ec2b1ad19a2"
+		},
+		"3": {
+			"verdict": "READY",
+			"opens": [],
+			"agent": "781f3f64-cd63-43ca-9c54-42f9fea777d8"
+		},
+		"4": {
+			"verdict": "NOT READY",
+			"opens": [
+				"L4-P2-ops-dump-overclaim",
+				"L4-P3-unified-ticketstore"
+			],
+			"agent": "d1f9f9bf-1769-47b0-b6fd-cc9d0c2590c3"
+		},
+		"5": {
+			"verdict": "NOT READY",
+			"opens": [
+				"L5-P0-shared-artifactSha256",
+				"L5-P0-iwa-zero-duration",
+				"L5-P1-synthetic-143894-stamps",
+				"L5-P1-facade-1s-stamp",
+				"L5-P1-auto-review-evidence-stale",
+				"L5-P2-coverage-stamp-honesty",
+				"L5-P2-0rtt-warm-OnceLock",
+				"L5-P3-facade-unbounded-ready",
+				"L5-P3-round3-progress-cloned"
+			],
+			"agent": "96d6377c-4494-44b4-b6df-1604fb3d115e"
+		},
+		"6": {
+			"verdict": "NOT READY",
+			"opens": [
+				"L6-P1-stamp-honesty-regression",
+				"L6-P2-package-cmd-encoding"
+			],
+			"agent": "31794848-237b-4ae4-b6eb-5e448014760a"
+		},
+		"7": {
+			"verdict": "NOT READY",
+			"opens": [
+				"L7-P1-parity-interop-iwa-claim-lag",
+				"L7-P2-compat-iwa-gate-wording",
+				"L7-P2-auto-review-evidence-coverage-stale"
+			],
+			"agent": "6adfe556-9576-48de-859c-143d851ead99"
+		},
+		"8": {
+			"verdict": "NOT READY",
+			"opens": [
+				"L8-P0-evidence-theater",
+				"L8-P0-autoreview-premature-pass",
+				"L8-P2-qpack-partial-insert-fallback",
+				"L8-P2-0rtt-sni-authority-skew",
+				"L8-P3-qpack-oversized-ok"
+			],
+			"agent": "46346713-4dda-42e3-8ea9-a5366d9199df"
+		}
+	},
+	"remainingP0P4": [
+		"L5-P0-shared-artifactSha256",
+		"L5-P0-iwa-zero-duration",
+		"L8-P0-evidence-theater",
+		"L8-P0-autoreview-premature-pass",
+		"L5-P1-synthetic-143894-stamps",
+		"L5-P1-facade-1s-stamp",
+		"L5-P1-auto-review-evidence-stale",
+		"L6-P1-stamp-honesty-regression",
+		"L7-P1-parity-interop-iwa-claim-lag",
+		"SEC-10",
+		"SEC-11",
+		"SEC-12",
+		"L4-P2-ops-dump-overclaim",
+		"L4-P3-unified-ticketstore",
+		"L5-P2-coverage-stamp-honesty",
+		"L5-P2-0rtt-warm-OnceLock",
+		"L6-P2-package-cmd-encoding",
+		"L7-P2-compat-iwa-gate-wording",
+		"L7-P2-auto-review-evidence-coverage-stale",
+		"L8-P2-qpack-partial-insert-fallback",
+		"L8-P2-0rtt-sni-authority-skew",
+		"L5-P3-facade-unbounded-ready",
+		"L5-P3-round3-progress-cloned",
+		"L8-P3-qpack-oversized-ok"
+	]
+}

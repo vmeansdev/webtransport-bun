@@ -1,9 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import {
-	__TESTING__,
-	E_HANDSHAKE_TIMEOUT,
-	WebTransportError,
-} from "../src/index.js";
+import { E_HANDSHAKE_TIMEOUT, WebTransportError } from "../src/index.js";
+import { __TESTING__ as INTERNAL_TESTING } from "../src/internal.js";
 
 describe("internal connect race handling", () => {
 	it("times out and closes late session handle from native callback", async () => {
@@ -27,7 +24,7 @@ describe("internal connect race handling", () => {
 
 		let err: unknown;
 		try {
-			await __TESTING__.connectWithNativeForTests(
+			await INTERNAL_TESTING.connectWithNativeForTests(
 				fakeNative,
 				"https://127.0.0.1:1",
 				"{}",
@@ -78,7 +75,7 @@ describe("internal connect race handling", () => {
 			cleared = true;
 		};
 
-		const session = await __TESTING__.connectWithNativeForTests(
+		const session = await INTERNAL_TESTING.connectWithNativeForTests(
 			fakeNative,
 			"https://127.0.0.1:1",
 			"{}",
@@ -120,7 +117,7 @@ describe("internal connect race handling", () => {
 			};
 
 			await expect(
-				__TESTING__.connectWithNativeForTests(
+				INTERNAL_TESTING.connectWithNativeForTests(
 					fakeNative,
 					"https://127.0.0.1:1",
 					"{}",

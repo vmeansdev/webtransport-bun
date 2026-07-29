@@ -1,17 +1,14 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import { connectWasm, createWasmServer } from "../src/backend.js";
 import type { WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 describe("wasm backend over real Bun UDP (P5)", () => {
 	test.skipIf(!wasmAvailable)(

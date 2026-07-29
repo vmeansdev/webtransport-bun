@@ -8,9 +8,19 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
 - tests
 
 ## Threading model
-- Two dedicated Tokio runtimes, each with 1 worker thread:
+- Two dedicated Tokio runtimes use the exact constructor contract
+  `Builder::new_multi_thread().worker_threads(1)`:
   - **RUNTIME** (`wt-server`): drives server accept loop, server-side sessions, and stream bridges.
   - **CLIENT_RUNTIME** (`wt-client`): drives client connections and client-side stream bridges.
+- `new_multi_thread` with exactly one worker is intentional. Synchronous N-API
+  entry points call `Runtime::spawn` without a permanently driven `block_on`;
+  replacing these runtimes with `Builder::new_current_thread()` would leave
+  spawned work without a continuously driven executor. The one-worker builders
+  therefore provide separate, independently driven server and client executors
+  while preserving single-worker execution within each runtime.
+- `scripts/check-doc-truth.ts` source-policies both runtime declarations,
+  worker counts, and dedicated thread names so the documented constructor and
+  implementation cannot drift silently.
 - Isolation prevents same-process deadlock when client and server share a process (e.g. tests).
 - All wtransport objects are owned and driven on these runtimes.
 - JS calls enqueue commands to the runtimes via bounded channels.

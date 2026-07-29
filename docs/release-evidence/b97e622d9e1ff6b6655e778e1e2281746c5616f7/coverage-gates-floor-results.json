@@ -1,0 +1,119 @@
+{
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"createdAt": "2026-07-27T15:12:34.143894+00:00",
+	"native": [
+		{
+			"module": "crates/native/src/limits.rs",
+			"line": 100.0,
+			"function": 100.0,
+			"branch": 100.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/native/src/server.rs",
+			"line": 99.82,
+			"function": 100.0,
+			"branch": 96.67,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/native/src/session.rs",
+			"line": 98.68,
+			"function": 93.88,
+			"branch": 84.38,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/native/src/spawn_tracked.rs",
+			"line": 99.74,
+			"function": 100.0,
+			"branch": 100.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		}
+	],
+	"wasm": [
+		{
+			"module": "crates/wasm/src/governor.rs",
+			"line": 99.54,
+			"function": 96.2,
+			"branch": 95.45,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/wasm/src/h3.rs",
+			"line": 96.89,
+			"function": 96.23,
+			"branch": 80.13,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/wasm/src/endpoint.rs",
+			"line": 93.33,
+			"function": 90.99,
+			"branch": 80.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/wasm/src/cert.rs",
+			"line": 97.1,
+			"function": 100.0,
+			"branch": 100.0,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		},
+		{
+			"module": "crates/wasm/src/verify.rs",
+			"line": 94.31,
+			"function": 90.62,
+			"branch": 94.44,
+			"floors": [
+				90.0,
+				90.0,
+				80.0
+			],
+			"pass": true
+		}
+	],
+	"status": "passed",
+	"notes": "Nightly llvm-cov --branch on candidate HEAD after Phase 3 recovery + TicketStoreHost.",
+	"runner": "local-darwin-arm64"
+}

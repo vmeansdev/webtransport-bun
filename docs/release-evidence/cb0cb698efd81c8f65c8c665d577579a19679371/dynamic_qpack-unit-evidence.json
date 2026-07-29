@@ -1,0 +1,18 @@
+{
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"claimId": "wasm-dynamic-qpack",
+	"createdAt": "2026-07-27T16:23:54.323155Z",
+	"status": "passed",
+	"notes": "QPACK options + KRC refuse on candidate.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"bun",
+		"test",
+		"packages/webtransport/test/wasm-qpack-options.test.ts"
+	],
+	"startedAt": "2026-07-27T16:23:53.856142Z",
+	"endedAt": "2026-07-27T16:23:54.323155Z",
+	"durationMs": 467,
+	"exitCode": 0,
+	"artifactSha256": "b0797d665f6cb14779d0aff23447089c5312aa8f8dfafd21d4be9494710298bb"
+}

@@ -2,10 +2,10 @@
  * Stable error codes for WebTransport operations (AGENTS.md / docs/SPEC.md).
  * Use with WebTransportError.code for programmatic handling.
  */
+import type { ErrorCode } from "./types.js";
 
 /** W3C WebTransportErrorSource: stream or session. */
 export type WebTransportErrorSource = "stream" | "session";
-
 /** TLS/certificate failure. */
 export const E_TLS = "E_TLS";
 /** Connection handshake timed out (limits.handshakeTimeoutMs). */
@@ -26,21 +26,14 @@ export const E_BACKPRESSURE_TIMEOUT = "E_BACKPRESSURE_TIMEOUT";
 export const E_LIMIT_EXCEEDED = "E_LIMIT_EXCEEDED";
 /** Rate limit (token bucket) exceeded. */
 export const E_RATE_LIMITED = "E_RATE_LIMITED";
+/** Invalid argument values. */
+export const E_INVALID_ARGUMENT = "E_INVALID_ARGUMENT";
+/** Unsupported argument combinations / feature requests. */
+export const E_UNSUPPORTED_ARGUMENT = "E_UNSUPPORTED_ARGUMENT";
 /** Internal/unsupported option or unexpected error. */
 export const E_INTERNAL = "E_INTERNAL";
 
-export type ErrorCode =
-	| typeof E_TLS
-	| typeof E_HANDSHAKE_TIMEOUT
-	| typeof E_SESSION_CLOSED
-	| typeof E_SESSION_IDLE_TIMEOUT
-	| typeof E_STREAM_RESET
-	| typeof E_STOP_SENDING
-	| typeof E_QUEUE_FULL
-	| typeof E_BACKPRESSURE_TIMEOUT
-	| typeof E_LIMIT_EXCEEDED
-	| typeof E_RATE_LIMITED
-	| typeof E_INTERNAL;
+export type { ErrorCode };
 
 /** Options for WebTransportError (W3C-aligned). */
 export type WebTransportErrorOptions = {

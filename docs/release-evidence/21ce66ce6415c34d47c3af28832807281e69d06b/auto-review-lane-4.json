@@ -1,0 +1,12 @@
+{
+  "lane": 4,
+  "agent": "e575bd8b-d7a5-4265-870f-53773a7ce5d1",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "L4-P0-limits-sessionId", "severity": "P0", "summary": "wasm-limits incomplete sessionId/wire migration"},
+    {"id": "L4-P1-ticketstore-unwired", "severity": "P1", "summary": "TicketStoreHost unwired"},
+    {"id": "L4-P1-exports", "severity": "P1", "summary": "TicketStore not on ./wasm", "status": "fixed-in-l6-batch"},
+    {"id": "L4-P1-requireSafe-throw", "severity": "P1", "summary": "requireSafeSessionId throws on decode"},
+    {"id": "L4-P1-callback-arity", "severity": "P1", "summary": "breaking WasmSessionEvents arity"}
+  ]
+}

@@ -11,11 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Server-side `congestionControl` on `ServerOptions` (`"default"` → Cubic, `"throughput"` → BBR, `"low-latency"` → NewReno), matching the existing client option; the effective mode is exposed as `WebTransportServer.congestionControl`.
 - Server keep-alive: `limits.keepAliveIntervalMs` now emits QUIC keep-alive packets on server sessions so idle-but-healthy connections survive `idleTimeoutMs`; the interval is clamped to `min(keepAliveIntervalMs, idleTimeoutMs / 3)`, and `0`/omitted keeps keep-alive disabled.
+- New `webtransport-bun/portable` entrypoint: an async `createServer` that runs one
+  server codebase against the native addon and the wasm backend, dispatching on the
+  runtime. The module stays free of static `node:` imports so it loads inside a
+  Chromium Isolated Web App; the native adapter is behind a dynamic import.
+- `WasmSession.peer` / `WasmServerSession.peer`, backed by a new `wt_conn_peer`
+  wasm bridge export over quinn-proto's `Connection::remote_address()`.
 
 ### Changed
 
 - Upgraded `wtransport` from `=0.7.0` to `=0.7.1` in both the native addon and the reference server (the reference crate now enables the `quinn` feature for compile parity).
-- `docs/PARITY_MATRIX.md` now documents 0-RTT resumption and dynamic QPACK as upstream-gated on the native backend (not exposed by wtransport 0.7.1).
+- `docs/PARITY_MATRIX.md` now documents 0-RTT resumption and dynamic QPACK as upstream-gated on the native backend (not exposed by wtransport 0.7.1); the wasm backend implements both in its own stack.
+- `WasmServerSession` now mirrors the native `ServerSession` surface (`id`, `peer`,
+  `incomingDatagrams()`, incoming stream `ReadableStream`s, `getStats()`), delegating
+  to a `WasmWebTransport` over the same session. `createBidirectionalStream` and
+  `createUnidirectionalStream` are now async and resolve to W3C `{ readable, writable }`
+  pairs; the synchronous raw-stream form remains reachable through `unwrap()`.
+  The callback API (`onDatagram`/`onIncomingStream`) is deprecated but retained, and
+  now throws if combined with the W3C surface on the same session rather than
+  silently dropping datagrams. `/wasm` remains a candidate surface.
+- All nine `parity-*.test.ts` suites now run against both backends.
+
+### Fixed
+
+- A wasm session that closed itself reported `reason: undefined` from `closed`; the
+  caller's close reason is now retained locally, matching native.
 
 ## [0.3.0](https://github.com/vmeansdev/webtransport-bun/compare/v0.2.4...v0.3.0) - 2026-03-08
 

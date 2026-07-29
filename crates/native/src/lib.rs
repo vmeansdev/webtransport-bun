@@ -4,6 +4,7 @@
 //! It owns a dedicated Tokio runtime thread and communicates
 //! with JS via bounded channels + ThreadsafeFunction.
 
+use crate::error::from_upstream_error as wt_from_upstream_error;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicU64;
@@ -14,6 +15,7 @@ use tokio::sync::watch;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
+pub mod error;
 pub mod histogram;
 pub mod limits;
 pub mod metrics;
@@ -21,8 +23,11 @@ pub mod panic_guard;
 pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
+pub mod server_napi;
+pub mod server_spawn;
 pub mod server_tls;
 pub mod session;
+pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
 
@@ -93,6 +98,18 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_ID_SEED: Lazy<u64> = Lazy::new(|| {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    h.finish()
+});
 static RATE_LIMIT_CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
 static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
@@ -187,8 +204,8 @@ pub(crate) fn report_channel_closed(context: &str) {
 }
 
 fn send_startup_result(
-    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
-    res: std::result::Result<(), String>,
+    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<u16, String>>>,
+    res: std::result::Result<u16, String>,
 ) {
     if let Some(tx) = startup_tx.take() {
         if tx.send(res).is_err() {
@@ -274,16 +291,20 @@ pub fn smoke_test() -> String {
     .unwrap_or_else(|_| "webtransport-native (panic recovered)".to_string())
 }
 
-/// Client pool metrics snapshot (hits, misses, evictions). For tests and observability.
+/// Client pool metrics snapshot (hits, misses, evictions), for observability.
+/// Wrapped in `catch_panic` like every other `#[napi]` export: a panic (e.g. a
+/// poisoned pool mutex) must not unwind across the FFI boundary (UB).
 #[napi]
-pub fn client_pool_metrics_snapshot() -> metrics::ClientPoolMetricsSnapshot {
-    let s = client_pool::pool_metrics_snapshot();
-    metrics::ClientPoolMetricsSnapshot {
-        hits: s.hits as u32,
-        misses: s.misses as u32,
-        evict_idle: s.evict_idle as u32,
-        evict_broken: s.evict_broken as u32,
-    }
+pub fn client_pool_metrics_snapshot() -> napi::Result<metrics::ClientPoolMetricsSnapshot> {
+    panic_guard::catch_panic(|| {
+        let s = client_pool::pool_metrics_snapshot();
+        Ok(metrics::ClientPoolMetricsSnapshot {
+            hits: s.hits as u32,
+            misses: s.misses as u32,
+            evict_idle: s.evict_idle as u32,
+            evict_broken: s.evict_broken as u32,
+        })
+    })
 }
 
 /// Returns the number of Tokio worker threads (should be 1).
@@ -330,6 +351,40 @@ pub(crate) fn extract_close_info(
     }
 }
 
+/// Releases per-session lifecycle counters (registry entry, per-IP rate-limit
+/// slot, and the `sessions_active` gauge) exactly once — on the normal teardown
+/// path via `release()`, or on an unwind via `Drop`. Without this, a panic in
+/// the datagram-forward task (the case `panic_guard` exists for) would strand
+/// these counters: `sessions_active` inflates → false `maxSessions` rejections,
+/// and the peer IP stays permanently blocked from reconnecting.
+struct SessionCounters {
+    id: String,
+    owner_server_id: u64,
+    peer_ip: String,
+    metrics: Arc<crate::server_metrics::ServerMetrics>,
+    released: bool,
+}
+
+impl SessionCounters {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        session_registry::remove(&self.id);
+        rate_limit::release_per_ip_session(self.owner_server_id, &self.peer_ip);
+        self.metrics
+            .sessions_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for SessionCounters {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Spawn the wtransport server loop on the dedicated runtime.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_wtransport_server(
@@ -345,7 +400,7 @@ pub(crate) fn spawn_wtransport_server(
     tls_resolver: Arc<server_tls::LiveServerCertResolver>,
     congestion_control: client::CongestionControlMode,
     debug_logs: bool,
-    startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
     use wtransport::{Endpoint, ServerConfig, VarInt};
@@ -363,7 +418,7 @@ pub(crate) fn spawn_wtransport_server(
     RUNTIME.spawn(async move {
         panic_guard::spawn_quic_task_scoped(panic_guard::PanicScope::Server(owner_server_id), async move {
             let mut startup_tx = Some(startup_tx);
-            let mut report_startup = |res: std::result::Result<(), String>| {
+            let mut report_startup = |res: std::result::Result<u16, String>| {
                 send_startup_result(&mut startup_tx, res);
             };
             let tls_config =
@@ -421,11 +476,28 @@ pub(crate) fn spawn_wtransport_server(
             );
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
-                Ok(s) => {
-                    emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
-                    report_startup(Ok(()));
-                    s
-                }
+                Ok(s) => match s.local_addr() {
+                    Ok(addr) => {
+                        let bound_port = addr.port();
+                        emit_log(
+                            &log_tx,
+                            !debug_logs,
+                            "info",
+                            &format!("endpoint created for port {}", bound_port),
+                            None,
+                            None,
+                            None,
+                        );
+                        report_startup(Ok(bound_port));
+                        s
+                    }
+                    Err(e) => {
+                        let msg = format!("failed to read bound address: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        report_startup(Err(msg));
+                        return;
+                    }
+                },
                 Err(e) => {
                     let msg = format!("failed to create endpoint: {:?}", e);
                     emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
@@ -434,24 +506,31 @@ pub(crate) fn spawn_wtransport_server(
                 }
             };
 
-            loop {
-                let incoming = server.accept();
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        server.close(VarInt::from_u32(0), b"server closing");
-                        break;
-                    }
-                    incoming_session = incoming => {
-                        let metrics = Arc::clone(&metrics);
-                        let limits = limits.clone();
-                        let rate_limits = rate_limits.clone();
-                        let stx = session_tx.clone();
-                        let ltx = log_tx.clone();
-                        spawn_tracked::spawn_tracked(
-                            metrics.clone(),
-                            spawn_tracked::TaskKind::Session,
-                            panic_guard::PanicScope::Server(owner_server_id),
-                            async move {
+            spawn_tracked::spawn_tracked(
+                Arc::clone(&metrics),
+                owner_server_id,
+                spawn_tracked::TaskKind::Session,
+                panic_guard::PanicScope::Server(owner_server_id),
+                async move {
+                    loop {
+                        let incoming = server.accept();
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                server.close(VarInt::from_u32(0), b"server closing");
+                                break;
+                            }
+                            incoming_session = incoming => {
+                                let metrics = Arc::clone(&metrics);
+                                let limits = limits.clone();
+                                let rate_limits = rate_limits.clone();
+                                let stx = session_tx.clone();
+                                let ltx = log_tx.clone();
+                                spawn_tracked::spawn_tracked(
+                                    metrics.clone(),
+                                    owner_server_id,
+                                    spawn_tracked::TaskKind::Session,
+                                    panic_guard::PanicScope::Server(owner_server_id),
+                                    async move {
                                 metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
@@ -484,7 +563,7 @@ pub(crate) fn spawn_wtransport_server(
                                 let peer_addr = session_request.remote_address();
                                 let peer_ip = peer_addr.ip().to_string();
                                 let peer_port = peer_addr.port() as u32;
-                                if !rate_limit::try_acquire_handshake(
+                                if !rate_limit::try_acquire_handshake(owner_server_id,
                                     &peer_ip,
                                     rate_limits.handshakes_per_sec,
                                     rate_limits.handshakes_burst,
@@ -495,7 +574,7 @@ pub(crate) fn spawn_wtransport_server(
                                     session_request.too_many_requests().await;
                                     return;
                                 }
-                                if !rate_limit::try_acquire_per_ip_session_with_prefix(
+                                if !rate_limit::try_acquire_per_ip_session_with_prefix(owner_server_id,
                                     &peer_ip,
                                     rate_limits.handshakes_burst_per_ip,
                                     rate_limits.handshakes_burst_per_prefix,
@@ -520,7 +599,7 @@ pub(crate) fn spawn_wtransport_server(
                                     )
                                     .await;
                                     metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    rate_limit::release_per_ip_session(&peer_ip);
+                                    rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
                                             connection.close(
@@ -573,7 +652,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        rate_limit::release_per_ip_session(&peer_ip);
+                                        rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
                                         emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
                                     }
@@ -585,12 +664,13 @@ pub(crate) fn spawn_wtransport_server(
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
 
                                         let id = format!(
-                                            "sess-{}",
+                                            "sess-{:016x}",
                                             SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                ^ *SESSION_ID_SEED
                                         );
 
                                         // P0-1: Register session BEFORE emitting to JS so acceptBidiStream etc. find it
-                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics) =
+                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics, datagram_capacity_notify) =
                                             session_registry::insert(
                                                 id.clone(),
                                                 owner_server_id,
@@ -639,6 +719,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_bidi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -647,7 +728,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_bidi.closed() => break,
                                                         res = conn_bidi.accept_bi() => {
                                                             let Ok((mut send, recv)) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
                                                                 m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = send.reset(0u32.into());
                                                                 continue;
@@ -702,6 +783,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -710,7 +792,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_uni.closed() => break,
                                                         res = conn_uni.accept_uni() => {
                                                             let Ok(recv) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
                                                                 m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 recv.stop(0u32.into());
                                                                 continue;
@@ -748,8 +830,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 capacity_notify: crate::client_stream::StreamBudget::new_notify(),
                                                                 backpressure_timeout_ms: lim_uni.backpressure_timeout_ms,
                                                             };
-                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
+                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget));
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_slot(read_rx, stop_tx, read_err_slot);
                                                             if uni_accept_tx.send(handle).await.is_err() {
                                                                 report_channel_closed("uni accept");
                                                                 break;
@@ -767,6 +849,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_create_bi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_bi.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -818,9 +901,13 @@ pub(crate) fn spawn_wtransport_server(
                                                                     read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot,
                                                                 ))
                                                             }
-                                                            Err(e) => Err(e.to_string()),
+                                                            Err(e) => {
+                                                                Err(wt_from_upstream_error(e.to_string()).to_string())
+                                                            }
                                                         },
-                                                        Err(e) => Err(e.to_string()),
+                                                        Err(e) => {
+                                                            Err(wt_from_upstream_error(e.to_string()).to_string())
+                                                        }
                                                     };
                                                     if resp_tx.send(r).is_err() {
                                                         report_channel_failure("create_bidi response");
@@ -836,6 +923,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_create_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_uni.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
@@ -889,14 +977,22 @@ pub(crate) fn spawn_wtransport_server(
                                                                     }
                                                                 }
                                                                 Err(e) => {
-                                                                    if resp_tx.send(Err(e.to_string())).is_err() {
+                                                                    if resp_tx
+                                                                        .send(Err(
+                                                                            wt_from_upstream_error(e.to_string()).to_string(),
+                                                                        ))
+                                                                        .is_err()
+                                                                    {
                                                                         report_channel_failure("create_uni response");
                                                                     }
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            if resp_tx.send(Err(e.to_string())).is_err() {
+                                                            if resp_tx
+                                                                .send(Err(wt_from_upstream_error(e.to_string()).to_string()))
+                                                                .is_err()
+                                                            {
                                                                 report_channel_failure("create_uni response");
                                                             }
                                                         }
@@ -910,9 +1006,21 @@ pub(crate) fn spawn_wtransport_server(
                                         let peer_ip_for_release = peer_ip.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
                                             panic_guard::PanicScope::Session(id.clone()),
                                             async move {
+                                                // Releases session counters on any
+                                                // task exit, including a panic
+                                                // unwind (Drop). Normal paths call
+                                                // `counters.release()` explicitly.
+                                                let mut counters = SessionCounters {
+                                                    id: id.clone(),
+                                                    owner_server_id,
+                                                    peer_ip: peer_ip_for_release.clone(),
+                                                    metrics: m_dgram.clone(),
+                                                    released: false,
+                                                };
                                                 loop {
                                                     tokio::select! {
                                                         biased;
@@ -926,9 +1034,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                         close_code = code2;
                                                                         close_reason = reason2;
                                                                     }
-                                                                    session_registry::remove(&id);
-                                                                    rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                                    m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                                    counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
                                                                             .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
@@ -946,7 +1052,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             };
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                                                            if !rate_limit::try_acquire_datagram_ingress(&peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
+                                                            if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
                                                                 m_dgram.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
                                                                 continue;
@@ -965,13 +1071,17 @@ pub(crate) fn spawn_wtransport_server(
                                                                 m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
                                                                 continue;
                                                             }
+                                                            let reservation = crate::session_registry::DatagramReservation::new(
+                                                                std::sync::Arc::clone(&sm_dgram),
+                                                                std::sync::Arc::clone(&m_dgram),
+                                                                datagram_capacity_notify.clone(),
+                                                                sz,
+                                                            );
                                                             let payload = dgram.as_ref().to_vec();
-                                                            if dgram_tx.send(payload).await.is_err() {
-                                                                crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                                                                    &sm_dgram.queued_bytes,
-                                                                    &m_dgram,
-                                                                    sz,
-                                                                );
+                                                            let slot = reservation.into_slot(payload);
+                                                            // On send failure the slot is dropped here, releasing
+                                                            // its reservation via Drop — no manual release needed.
+                                                            if dgram_tx.send(slot).await.is_err() {
                                                                 break;
                                                             }
                                                         }
@@ -992,9 +1102,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     close_reason = reason2;
                                                                 }
                                                             }
-                                                            session_registry::remove(&id);
-                                                            rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                            m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                            counters.release();
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
                                                                     .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
@@ -1011,9 +1119,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         }
                                                     }
                                                 }
-                                                session_registry::remove(&id);
-                                                rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                counters.release();
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
                                                         .send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
@@ -1032,7 +1138,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(e) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        rate_limit::release_per_ip_session(&peer_ip);
+                                        rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());
@@ -1044,11 +1150,13 @@ pub(crate) fn spawn_wtransport_server(
                                         emit_log(&ltx, !debug_logs, "error", &format!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
                                     }
                                 }
-                            },
-                        );
+                                    },
+                                );
+                            }
+                        }
                     }
-                }
-            }
+                },
+            );
         });
     });
 }
@@ -1080,7 +1188,7 @@ mod tests {
     #[test]
     fn send_startup_result_handles_disconnected_receiver() {
         CHANNEL_DELIVERY_FAILURE_COUNT.store(0, Ordering::Relaxed);
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<u16, String>>();
         drop(rx);
         let mut opt = Some(tx);
         send_startup_result(&mut opt, Err("boom".to_string()));

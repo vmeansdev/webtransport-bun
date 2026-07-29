@@ -1,0 +1,105 @@
+{
+	"lane": 1,
+	"round": 4,
+	"verdict": "NOT READY",
+	"agent": "910e6a78-df09-4bb8-bce3-7df0f624b2f2",
+	"note": "Gap-closure CONNECT/QPACK/caps verified fixed. New TicketStoreHost vault (79f9b01) reintroduces process-global ticket side-channel via guessable opaque blobs; not READY until SEC-10/11/12 closed or explicitly accepted.",
+	"findings": [
+		{
+			"id": "SEC-01",
+			"severity": "P1",
+			"summary": "Client CONNECT deadline + pending/unlatched count toward wt_max_sessions",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "SEC-02",
+			"severity": "P2",
+			"summary": "Default per-endpoint ticket store; shareProcess0RttTicketStore opt-in",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "SEC-03",
+			"severity": "P2",
+			"summary": "TicketStoreHost not on TLS path",
+			"status": "invalidated"
+		},
+		{
+			"id": "SEC-04",
+			"severity": "P2",
+			"summary": "CONNECT admission occupied=unlatched+active_wt; early RESET; cap fail-closed",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "SEC-05",
+			"severity": "P3",
+			"summary": "requireSafeSessionId soft-fails to null (no throw)",
+			"status": "fixed",
+			"file": "packages/webtransport/src/backend-wasm.ts"
+		},
+		{
+			"id": "SEC-06",
+			"severity": "P3",
+			"summary": "unknown SESSION_CLOSED silently ignored",
+			"status": "invalidated"
+		},
+		{
+			"id": "SEC-CLOSE",
+			"severity": "P1",
+			"summary": "primary close_wt_session propagates application code/reason via close_conn",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "SEC-07",
+			"severity": "P1",
+			"summary": "Server post-accept handshakeTimeoutMs CONNECT deadline releases reservations",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "SEC-08",
+			"severity": "P3",
+			"summary": "QPACK capacity/blocked SETTINGS hard-capped (65536/128) in bridge+normalize",
+			"status": "fixed",
+			"file": "crates/wasm/src/bridge.rs"
+		},
+		{
+			"id": "SEC-09",
+			"severity": "P3",
+			"summary": "wt_open_session still returns f64; BigInt precision above MAX_SAFE_INTEGER",
+			"status": "invalidated",
+			"file": "crates/wasm/src/bridge.rs"
+		},
+		{
+			"id": "SEC-10",
+			"severity": "P2",
+			"summary": "TicketStoreHost vault blobs are forgeable sequential WT0T+u64 IDs in a process-global map: any caller of wt_import_client_ticket can steal/consume dumped tickets without the host blob, defeating take-once and per-endpoint isolation (shareProcess=false) on the hydrate/dump path",
+			"status": "open",
+			"file": "crates/wasm/src/ticket_store.rs"
+		},
+		{
+			"id": "SEC-11",
+			"severity": "P3",
+			"summary": "Process-global client_ticket_vault has no max entries/TTL; dump without hydrate (or put failure after export) orphans TLS session values unbounded",
+			"status": "open",
+			"file": "crates/wasm/src/ticket_store.rs"
+		},
+		{
+			"id": "SEC-12",
+			"severity": "P3",
+			"summary": "SETTINGS_QPACK_BLOCKED_STREAMS is capped/advertised but only 0→fail-closed is enforced; concurrent Blocked streams are not counted against the setting",
+			"status": "open",
+			"file": "crates/wasm/src/endpoint.rs"
+		},
+		{
+			"id": "SEC-13",
+			"severity": "P2",
+			"summary": "Pending CONNECT non-2xx reset/stop; QPACK Blocked fail-closed when forbidden; KRC eviction refuse on encoder insert/shrink",
+			"status": "fixed",
+			"file": "crates/wasm/src/endpoint.rs"
+		}
+	]
+}

@@ -1,0 +1,8 @@
+{
+	"commit": "ab6bbdfb9a55ee0df0f1547b619b7ce3602df01d",
+	"claimId": "wasm-0rtt",
+	"createdAt": "2026-07-27T13:52:32.313951+00:00",
+	"status": "passed",
+	"notes": "wasm-0rtt hard has0Rtt===true shared-store reconnect",
+	"runner": "local-darwin-arm64"
+}

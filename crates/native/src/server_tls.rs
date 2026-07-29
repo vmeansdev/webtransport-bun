@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use idna::AsciiDenyList;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -277,8 +277,7 @@ fn wildcard_lookup_key(server_name: &str) -> Option<String> {
 }
 
 fn parse_cert_chain(cert_pem: &str) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
-    let mut reader = BufReader::new(cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to parse certificate PEM: {}", e))?;
     if certs.is_empty() {
@@ -288,13 +287,12 @@ fn parse_cert_chain(cert_pem: &str) -> std::result::Result<Vec<CertificateDer<'s
 }
 
 fn parse_private_key(key_pem: &str) -> std::result::Result<PrivateKeyDer<'static>, String> {
-    let mut reader = BufReader::new(key_pem.as_bytes());
-    match rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("failed to parse private key PEM: {}", e))?
-    {
-        Some(key) => Ok(key),
-        None => Err("private key PEM contained no private key".to_string()),
-    }
+    PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).map_err(|error| match error {
+        rustls::pki_types::pem::Error::NoItemsFound => {
+            "private key PEM contained no private key".to_string()
+        }
+        _ => format!("failed to parse private key PEM: {}", error),
+    })
 }
 
 pub(crate) fn parse_certified_key(
@@ -384,8 +382,8 @@ pub(crate) fn build_default_dev_resolver(
 mod tests {
     use super::{
         build_default_dev_resolver, build_server_tls_config, normalize_server_name,
-        parse_certified_key, parse_resolver_config, wildcard_lookup_key, LiveServerCertResolver,
-        ResolverConfig, SniCertConfig, UnknownSniPolicy,
+        parse_certified_key, parse_private_key, parse_resolver_config, wildcard_lookup_key,
+        LiveServerCertResolver, ResolverConfig, SniCertConfig, UnknownSniPolicy,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -394,6 +392,12 @@ mod tests {
     fn parse_certified_key_rejects_missing_certificates() {
         let err = parse_certified_key("", "").expect_err("expected parse error");
         assert!(err.contains("certificate PEM contained no certificates"));
+    }
+
+    #[test]
+    fn parse_private_key_rejects_missing_key_material() {
+        let err = parse_private_key("").expect_err("expected missing private key");
+        assert_eq!(err, "private key PEM contained no private key");
     }
 
     #[test]

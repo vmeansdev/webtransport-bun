@@ -1,0 +1,8 @@
+{
+	"lane": 2,
+	"round": 4,
+	"verdict": "N/A",
+	"findings": [],
+	"agent": "0667ffd5-57cd-4457-bc7a-9ec2b1ad19a2",
+	"note": "crates/native/ untouched in 1d8bd6d..a57df57 (0 files). Diff is WASM Rust/JS + docs/evidence only. Latent skew (not regressions): native String session handles vs WASM (conn,bigint) demux; handle-bound native close vs closeSession(conn,sid,...); shareProcess0RttTicketStore/enable0Rtt/wtMaxSessions/QPACK/ticketStore Host hydrate-dump remain WASM-only options."
+}

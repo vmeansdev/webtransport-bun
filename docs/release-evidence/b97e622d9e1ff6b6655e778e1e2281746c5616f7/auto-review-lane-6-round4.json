@@ -1,0 +1,85 @@
+{
+	"lane": 6,
+	"round": 4,
+	"verdict": "NOT READY",
+	"agent": "31794848-237b-4ae4-b6eb-5e448014760a",
+	"note": "package-artifact + eventWireVersion + ticket dump/import surface OK on candidate; NOT READY on supply-chain stamp honesty",
+	"findings": [
+		{
+			"id": "L6-P1-stamp-honesty-regression",
+			"severity": "P1",
+			"status": "open",
+			"summary": "Candidate-bound supply-chain-provenance.json (and packaging-adjacent runtime-consumers.json) still use synthetic .143894 batch stamps whose startedAt/finishedAt deltas (52s/45s) contradict notes claiming wall ~1s/~9s; rebind regresses round-3 L6-P1 evidence-stamp honesty."
+		},
+		{
+			"id": "L6-P2-package-cmd-encoding",
+			"severity": "P2",
+			"status": "open",
+			"summary": "package-artifact.json command encodes [build, &&, check] as one argv vector; script only honors argv[2]=build (check not a separate invocation). buildArtifact already covers production asserts, but the recorded command is not an honest shell pipeline."
+		},
+		{
+			"id": "L6-P0-test-wasm-allowlist",
+			"severity": "P0",
+			"status": "fixed",
+			"summary": "prior allowlist"
+		},
+		{
+			"id": "L6-P1-ticketstore-exports",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "wt_dump_client_ticket/wt_import_client_ticket on bridge + wasm-dist node/web d.ts; TicketStoreHost/MemoryTicketStoreHost re-exported from wasm.ts; hydrate/dump wired in backend.ts"
+		},
+		{
+			"id": "L6-P1-compat-bigint",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "bigint docs"
+		},
+		{
+			"id": "L6-P1-evidence-stamp-clone",
+			"severity": "P1",
+			"status": "regressed",
+			"summary": "ab6 stamp fix did not hold on b97e622 supply-chain/runtime-consumers rebind; see L6-P1-stamp-honesty-regression"
+		},
+		{
+			"id": "L6-P2-wire-provenance",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "PRODUCTION_BUILD.json eventWireVersion:2 written by build-wasm.sh dist + finalizeProductionWasm; assertProductionWasm enforces ===2; package-artifact evidence on candidate b97e622 (6s build+check) aligns with wasm-dist mtime"
+		},
+		{
+			"id": "L6-P2-claim-drift",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "release-status package-artifact + supply-chain-provenance claims bound to local-*-b97e622 evidence ids"
+		},
+		{
+			"id": "L6-P2-compat-chromium-evidence",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "COMPATIBILITY wording"
+		},
+		{
+			"id": "L6-P3-production-build-checksum-omit",
+			"severity": "P3",
+			"status": "accepted",
+			"summary": "PRODUCTION_BUILD.json intentionally omitted from wasm-dist SHA256SUMS; content still asserted by assertProductionWasm; binary checksums match disk"
+		},
+		{
+			"id": "L6-P3-allowlist-floor",
+			"severity": "P3",
+			"status": "invalidated",
+			"summary": "deferred / non-blocking"
+		},
+		{
+			"id": "L6-P3-open-session-f64",
+			"severity": "P3",
+			"status": "invalidated"
+		},
+		{
+			"id": "L6-P4-testplan",
+			"severity": "P4",
+			"status": "invalidated"
+		}
+	]
+}

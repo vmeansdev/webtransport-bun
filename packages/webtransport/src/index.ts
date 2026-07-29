@@ -71,20 +71,23 @@ export {
 	E_BACKPRESSURE_TIMEOUT,
 	E_LIMIT_EXCEEDED,
 	E_RATE_LIMITED,
+	E_INVALID_ARGUMENT,
+	E_UNSUPPORTED_ARGUMENT,
 	E_INTERNAL,
 	WebTransportError,
 } from "./errors.js";
 export type {
-	ErrorCode,
 	WebTransportErrorOptions,
 	WebTransportErrorSource,
 } from "./errors.js";
+export type { ErrorCode } from "./types.js";
 
 import {
 	E_TLS,
 	E_INTERNAL,
 	E_HANDSHAKE_TIMEOUT,
 	E_LIMIT_EXCEEDED,
+	E_INVALID_ARGUMENT,
 	E_QUEUE_FULL,
 	E_BACKPRESSURE_TIMEOUT,
 	E_SESSION_CLOSED,
@@ -92,15 +95,44 @@ import {
 	E_STREAM_RESET,
 	E_STOP_SENDING,
 	E_RATE_LIMITED,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
-import type { ErrorCode } from "./errors.js";
+import type {
+	CloseInfo,
+	ErrorCode,
+	RateLimitOptions,
+	WebTransportCloseInfo,
+} from "./types.js";
+import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
 type StreamOpenOptions = { waitUntilAvailable?: boolean };
 
-const E_CODE_RE = /E_[A-Z_]+/g;
+const E_CODE_RE = /^(E_[A-Z_]+)(?::|$)/;
+/** Bun/Node often stringify napi errors as `GenericFailure, E_CODE: …`. */
+const NAPI_STATUS_PREFIX_RE =
+	/^(?:GenericFailure|Cancelled|InvalidArg|ObjectExpected|StringExpected|FunctionExpected|NumberExpected|BooleanExpected|ArrayExpected|Unknown|PendingException|EscapeCalledTwice|HandleScopeMismatch|CallbackScopeMismatch|QueueFull|Closing|BigintExpected|DateExpected|ArrayBufferExpected|DetachableArraybufferExpected|WouldDeadlock),\s*/u;
+const E_CODE_TOKEN_RE = /\b(E_[A-Z_]+)\b/gu;
+const KNOWN_ERROR_CODES = [
+	E_TLS,
+	E_HANDSHAKE_TIMEOUT,
+	E_SESSION_CLOSED,
+	E_SESSION_IDLE_TIMEOUT,
+	E_STREAM_RESET,
+	E_STOP_SENDING,
+	E_QUEUE_FULL,
+	E_BACKPRESSURE_TIMEOUT,
+	E_LIMIT_EXCEEDED,
+	E_RATE_LIMITED,
+	E_INVALID_ARGUMENT,
+	E_UNSUPPORTED_ARGUMENT,
+	E_INTERNAL,
+] as const satisfies readonly ErrorCode[];
+const KNOWN_ERROR_CODE_SET = new Set<ErrorCode>(KNOWN_ERROR_CODES);
+/** Wrapper codes that may nest a more specific causal E_* in the same message. */
+const WRAPPER_ERROR_CODES = new Set<ErrorCode>([E_SESSION_CLOSED, E_INTERNAL]);
 const SUPPRESS_LOG_CALLBACK_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
 const SUPPRESS_READY_REJECTION_WARN =
@@ -111,40 +143,12 @@ const SUPPRESS_READY_REJECTION_WARN =
  * Returns undefined for unknown cases; E_* code is always preserved.
  * No broad catch-all: unknown errors remain explicit.
  */
-function normalizeToBrowserName(
-	code: ErrorCode,
-	message: string,
-): string | undefined {
-	if (
-		message.includes(
-			"serverCertificateHashes cannot be used with allowPooling=true",
-		)
-	) {
-		return "NotSupportedError";
-	}
-	if (message.includes("serverCertificateHashes must be an array")) {
-		return "TypeError";
-	}
-	if (
-		message.includes("serverCertificateHashes entry value must be") ||
-		message.includes("invalid base64 in serverCertificateHashes")
-	) {
-		return "TypeError";
-	}
-	if (
-		message.includes("allowPooling must be a boolean") ||
-		message.includes("requireUnreliable must be a boolean")
-	) {
-		return "TypeError";
-	}
-	if (
-		message.includes("congestionControl must be") ||
-		message.includes("datagramsReadableType must be") ||
-		message.includes("waitUntilAvailable must be a boolean")
-	) {
-		return "TypeError";
-	}
+function normalizeToBrowserName(code: ErrorCode): string | undefined {
 	switch (code) {
+		case E_INVALID_ARGUMENT:
+			return "TypeError";
+		case E_UNSUPPORTED_ARGUMENT:
+			return "NotSupportedError";
 		case E_TLS:
 			return "NetworkError";
 		case E_HANDSHAKE_TIMEOUT:
@@ -172,9 +176,7 @@ function createMappedError(
 	strictW3CErrors?: boolean,
 ): WebTransportError {
 	const browserName =
-		strictW3CErrors === true
-			? normalizeToBrowserName(code, message)
-			: undefined;
+		strictW3CErrors === true ? normalizeToBrowserName(code) : undefined;
 	return new WebTransportError(
 		code,
 		message,
@@ -182,14 +184,53 @@ function createMappedError(
 	);
 }
 
+function knownCodeOrUndefined(
+	value: string | undefined,
+): ErrorCode | undefined {
+	return value && KNOWN_ERROR_CODE_SET.has(value as ErrorCode)
+		? (value as ErrorCode)
+		: undefined;
+}
+
+/**
+ * Extract a stable E_* from native/Bun error text. Prefers a causal code when a
+ * wrapper like E_SESSION_CLOSED nests `connection closed by peer: E_LIMIT_EXCEEDED`.
+ */
+function extractMessageErrorCode(msg: string): ErrorCode | undefined {
+	const withoutStatus = msg.replace(NAPI_STATUS_PREFIX_RE, "");
+	const startCode = knownCodeOrUndefined(withoutStatus.match(E_CODE_RE)?.[1]);
+	const tokens = [...withoutStatus.matchAll(E_CODE_TOKEN_RE)]
+		.map((m) => knownCodeOrUndefined(m[1]))
+		.filter((c): c is ErrorCode => c != null);
+	const causal = [...tokens].reverse().find((c) => !WRAPPER_ERROR_CODES.has(c));
+	if (startCode && WRAPPER_ERROR_CODES.has(startCode) && causal) {
+		return causal;
+	}
+	return startCode ?? causal ?? tokens[0];
+}
+
 function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
 ): WebTransportError {
+	const explicitCode =
+		err && typeof err === "object"
+			? (err as { code?: unknown }).code
+			: undefined;
+	const knownExplicitCode =
+		typeof explicitCode === "string" &&
+		KNOWN_ERROR_CODE_SET.has(explicitCode as ErrorCode)
+			? (explicitCode as ErrorCode)
+			: undefined;
 	const msg = err instanceof Error ? err.message : String(err);
-	const match = msg.match(E_CODE_RE);
-	const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
-	return createMappedError(code, msg, strictW3CErrors);
+	if (knownExplicitCode) {
+		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
+	}
+	return createMappedError(
+		extractMessageErrorCode(msg) ?? (E_INTERNAL as ErrorCode),
+		msg,
+		strictW3CErrors,
+	);
 }
 
 function isSessionCloseError(err: unknown): boolean {
@@ -218,13 +259,44 @@ function shouldRetryStreamOpen(err: unknown): boolean {
 	);
 }
 
-function parseWaitUntilAvailable(options?: StreamOpenOptions): boolean {
+function parseWaitUntilAvailable(
+	options?: StreamOpenOptions,
+	strictW3CErrors?: boolean,
+): boolean {
 	const value = options?.waitUntilAvailable;
 	if (value === undefined) return false;
 	if (typeof value !== "boolean") {
-		throw new TypeError("waitUntilAvailable must be a boolean");
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: waitUntilAvailable must be a boolean",
+			strictW3CErrors,
+		);
 	}
 	return value;
+}
+
+function boundNativeCapacityWait(
+	handle: {
+		waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+		waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	},
+	kind: "bidi" | "uni",
+): ((remainingMs: number) => Promise<void>) | undefined {
+	let fn: ((remainingMs: number) => Promise<void>) | undefined;
+	switch (kind) {
+		case "bidi":
+			fn = handle.waitBidiCapacity;
+			break;
+		case "uni":
+			fn = handle.waitUniCapacity;
+			break;
+		default: {
+			const _exhaustive: never = kind;
+			return _exhaustive;
+		}
+	}
+	if (typeof fn !== "function") return undefined;
+	return (remainingMs) => fn.call(handle, remainingMs);
 }
 
 async function openStreamWithWait<T>(
@@ -235,13 +307,14 @@ async function openStreamWithWait<T>(
 	waitForCapacity?: (remainingMs: number) => Promise<void>,
 	strictW3CErrors?: boolean,
 ): Promise<T> {
-	const waitUntilAvailable = parseWaitUntilAvailable(options);
+	const waitUntilAvailable = parseWaitUntilAvailable(options, strictW3CErrors);
 	if (!waitUntilAvailable) {
 		return openFn();
 	}
-	const timeoutMs = Math.max(1, backpressureTimeoutMs);
-	const deadline = Date.now() + timeoutMs;
-	let backoffMs = 2;
+	const waitForCapacityWithFallback =
+		waitForCapacity ?? createPollingCapacityWaiter(isClosed);
+	const deadline = createMonotonicDeadline(backpressureTimeoutMs);
+	const timeoutMs = deadline.timeoutMs;
 	while (true) {
 		if (isClosed()) {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
@@ -252,22 +325,36 @@ async function openStreamWithWait<T>(
 			if (!shouldRetryStreamOpen(err)) {
 				throw toWebTransportError(err, strictW3CErrors);
 			}
-			if (Date.now() >= deadline) {
+			if (deadline.expired()) {
 				throw new WebTransportError(
 					E_BACKPRESSURE_TIMEOUT as ErrorCode,
 					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
 				);
 			}
-			const remaining = Math.max(0, deadline - Date.now());
-			if (waitForCapacity) {
-				await waitForCapacity(Math.max(1, remaining));
-			} else {
-				const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
-				await Bun.sleep(sleepMs);
-				backoffMs = Math.min(backoffMs * 2, 64);
-			}
+			const remaining = deadline.remainingMs();
+			await withDeadline(
+				waitForCapacityWithFallback(Math.max(1, remaining)),
+				Math.max(1, remaining),
+				{
+					timeoutMessage: `E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
+				},
+			);
 		}
 	}
+}
+
+function createPollingCapacityWaiter(
+	isClosed: () => boolean,
+): (remainingMs: number) => Promise<void> {
+	let backoffMs = 2;
+	return async (remainingMs: number): Promise<void> => {
+		if (isClosed()) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		const sleepMs = Math.max(1, Math.min(backoffMs, remainingMs));
+		backoffMs = Math.min(backoffMs * 2, 64);
+		await sleep(sleepMs);
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -309,16 +396,7 @@ export type TlsOptions = {
 // Rate-limit options
 // ---------------------------------------------------------------------------
 
-export type RateLimitOptions = {
-	handshakesPerSec: number;
-	handshakesBurst: number;
-	/** Per /24 (IPv4) or /64 (IPv6) prefix; defaults 100 */
-	handshakesBurstPerPrefix?: number;
-	streamsPerSec: number;
-	streamsBurst: number;
-	datagramsPerSec: number;
-	datagramsBurst: number;
-};
+export type { RateLimitOptions } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -347,13 +425,20 @@ export type LimitsOptions = {
 	backpressureTimeoutMs: number;
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
+	/**
+	 * Max idle time before a connection is considered dead and closed. Applies
+	 * to both the server and the client: on the client it guarantees `closed`
+	 * resolves on a dead path (NAT rebind, network drop, server power loss)
+	 * instead of hanging forever. Default 60000.
+	 */
 	idleTimeoutMs: number;
 	/**
-	 * Keep-alive ping interval in ms. On the server, sessions emit QUIC
-	 * keep-alive packets so idle-but-healthy connections survive
-	 * `idleTimeoutMs`; the effective interval is clamped to
-	 * `min(keepAliveIntervalMs, idleTimeoutMs / 3)`. `0` or omitted disables
-	 * keep-alive (the default).
+	 * Keep-alive ping interval in ms. Keeps a live-but-quiet connection from
+	 * being idle-closed, and is always clamped to stay safely below
+	 * `idleTimeoutMs`. On the client it defaults to `idleTimeoutMs / 3` when
+	 * omitted; on the server keep-alive is off unless set, and the effective
+	 * interval is `min(keepAliveIntervalMs, idleTimeoutMs / 3)`. Set 0 to
+	 * disable.
 	 */
 	keepAliveIntervalMs?: number;
 };
@@ -456,10 +541,7 @@ export interface WebTransportServer {
 // ---------------------------------------------------------------------------
 
 /** Browser-style close info (W3C alignment). Used by {@link WebTransport.close} and {@link WebTransport.closed}. */
-export type WebTransportCloseInfo = {
-	closeCode?: number;
-	reason?: string;
-};
+export type { WebTransportCloseInfo } from "./types.js";
 
 /**
  * Options for `new WebTransport(url, options)`.
@@ -503,10 +585,10 @@ export type ClientOptions = {
 	};
 	limits?: Partial<LimitsOptions>;
 	log?: (event: LogEvent) => void;
-	/** Internal/advanced: cert pinning list serialized as base64. */
+	/** Cert pinning list; values are raw SHA-256 digests (BufferSource). */
 	serverCertificateHashes?: Array<{
 		algorithm: "sha-256";
-		valueBase64: string;
+		value: BufferSource;
 	}>;
 	/** Internal/advanced: congestion hint passed to native runtime. */
 	congestionControl?: "default" | "throughput" | "low-latency";
@@ -522,7 +604,7 @@ export type ClientOptions = {
 // Session types
 // ---------------------------------------------------------------------------
 
-export type CloseInfo = { code?: number; reason?: string };
+export type { CloseInfo } from "./types.js";
 
 function normalizeCloseInfo(
 	info: CloseInfo | undefined,
@@ -559,9 +641,11 @@ export class WebTransportSendGroup {
 		this.#transport = transport;
 		this.#id = id;
 	}
+	/** @internal */
 	_getTransport(): WebTransport {
 		return this.#transport;
 	}
+	/** @internal */
 	_getId(): number {
 		return this.#id;
 	}
@@ -852,6 +936,7 @@ import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
+const NATIVE_ADDON_OVERRIDE_ENV = "WEBTRANSPORT_NATIVE_ADDON_PATH";
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-msvc.node`,
@@ -861,18 +946,169 @@ const binaryCandidates = [
 const basePaths = ["../../../crates/native", "../prebuilds"];
 type RequireLike = (id: string) => unknown;
 type NativeLoadFailure = { request: string; message: string };
+type NativeLoadResult = {
+	addon: NativeAddon | undefined;
+	failures: NativeLoadFailure[];
+};
+type NativeLogEvent = {
+	level?: "debug" | "info" | "warn" | "error";
+	msg?: string;
+	sessionId?: string;
+	peerIp?: string;
+	peerPort?: number;
+};
+type NativeServerSessionEvent =
+	| {
+			name: "session";
+			id: string;
+			peerIp: string;
+			peerPort: number;
+	  }
+	| {
+			name: "session_closed";
+			id: string;
+			code: number;
+			reason: string;
+	  };
+type NativeClientSessionEvent = {
+	name: "session_closed";
+	id: string;
+	code: number;
+	reason: string;
+};
+type NativeBidiStreamHandle = {
+	readonly id: number;
+	read(): Promise<Buffer | null>;
+	write(chunk: Buffer | Uint8Array): Promise<void>;
+	finish(): Promise<void> | void;
+	finishWait?: () => Promise<void> | void;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+};
+type NativeSendStreamHandle = {
+	readonly id: number;
+	write(chunk: Buffer | Uint8Array): Promise<void>;
+	finish?: () => Promise<void> | void;
+	finishWait?: () => Promise<void> | void;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+};
+type NativeRecvStreamHandle = {
+	readonly id: number;
+	read(): Promise<Buffer | null>;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+};
+interface NativeSessionHandle {
+	id: string;
+	peerIp: string;
+	peerPort: number;
+	close(code: number | null, reason: string | null): void;
+	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
+	readDatagram(): Promise<Buffer | null>;
+	createBidiStream(): Promise<NativeBidiStreamHandle>;
+	createUniStream(): Promise<NativeSendStreamHandle>;
+	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+	waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	acceptBidiStream(): Promise<NativeBidiStreamHandle | null>;
+	acceptUniStream(): Promise<NativeRecvStreamHandle | null>;
+	metricsSnapshot(): SessionMetricsSnapshot;
+	connectionStats?(): QuicConnectionStats | null;
+	pathMaxDatagramSize?: () => number | null;
+}
+type NativeConnectSessionHandle = {
+	id: string;
+	close(code: number | null, reason: string | null): void;
+	peerIp?: string;
+	peerPort?: number;
+} & Partial<NativeSessionHandle>;
+interface NativeServerHandle {
+	port: number;
+	close(): Promise<void>;
+	updateCert(certPem: string, keyPem: string): Promise<void>;
+	updateTls(configJson: string): Promise<void>;
+	replaceSniCerts(json: string): Promise<void>;
+	upsertSniCert(
+		serverName: string,
+		certPem: string,
+		keyPem: string,
+	): Promise<void>;
+	removeSniCert(serverName: string): Promise<void>;
+	setUnknownSniPolicy(policy: string): Promise<void>;
+	tlsSnapshot(): ServerTlsSnapshot;
+	metricsSnapshot(): MetricsSnapshot;
+}
+interface NativeAddon {
+	ServerHandle: new (
+		port: number,
+		host: string,
+		debug: boolean,
+		tlsConfigJson: string,
+		limitsJson: string,
+		rateLimitsJson: string,
+		serverOptsJson: string,
+		onSessionEvents: (events: NativeServerSessionEvent[]) => void,
+		onLog?: (events: NativeLogEvent[]) => void,
+	) => NativeServerHandle;
+	SessionHandle: new (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	) => NativeSessionHandle;
+	ClientSessionHandle: new (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	) => NativeSessionHandle;
+	connect(
+		url: string,
+		optsJson: string,
+		onClosed: (events: NativeClientSessionEvent[]) => void,
+		cb: (err: unknown, handleId?: string) => void,
+	): void;
+	takeClientSession(handleId: string): NativeSessionHandle | undefined;
+	clientPoolMetricsSnapshot(): {
+		hits: number;
+		misses: number;
+		evictIdle?: number;
+		evictBroken?: number;
+	};
+}
+interface NativeConnectOnlyAddon {
+	connect(
+		url: string,
+		optsJson: string,
+		onClosed: (events: NativeClientSessionEvent[]) => void,
+		cb: (err: unknown, handleId?: string) => void,
+	): void;
+	takeClientSession(handleId: string): NativeConnectSessionHandle | undefined;
+}
 
 function tryLoadNativeAddon(
 	requireFn: RequireLike,
 	bases = basePaths,
 	candidates = binaryCandidates,
-): { addon: any; failures: NativeLoadFailure[] } {
+	explicitRequests: string[] = [],
+): NativeLoadResult {
 	const failures: NativeLoadFailure[] = [];
+	for (const request of explicitRequests) {
+		try {
+			return { addon: requireFn(request) as NativeAddon, failures };
+		} catch (err) {
+			failures.push({
+				request,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (explicitRequests.length > 0) {
+		return { addon: undefined, failures };
+	}
 	for (const base of bases) {
 		for (const candidate of candidates) {
 			const request = `${base}/${candidate}`;
 			try {
-				return { addon: requireFn(request), failures };
+				return { addon: requireFn(request) as NativeAddon, failures };
 			} catch (err) {
 				failures.push({
 					request,
@@ -882,6 +1118,13 @@ function tryLoadNativeAddon(
 		}
 	}
 	return { addon: undefined, failures };
+}
+
+function nativeAddonOverrideRequestsFromEnv(
+	envValue = process.env[NATIVE_ADDON_OVERRIDE_ENV],
+): string[] {
+	const trimmed = envValue?.trim();
+	return trimmed ? [trimmed] : [];
 }
 
 function buildNativeAddonLoadErrorMessage(
@@ -898,11 +1141,16 @@ function buildNativeAddonLoadErrorMessage(
 	return `Native addon not loaded. Candidate load errors:\n${details}${suffix}`;
 }
 
-const nativeLoad = tryLoadNativeAddon(_require);
-const native = nativeLoad.addon;
+const nativeLoad = tryLoadNativeAddon(
+	_require,
+	basePaths,
+	binaryCandidates,
+	nativeAddonOverrideRequestsFromEnv(),
+);
+const native = nativeLoad.addon as NativeAddon | undefined;
 const nativeLoadFailures = nativeLoad.failures;
 
-function getNativeOrThrow(): any {
+function getNativeOrThrow(): NativeAddon {
 	if (native) return native;
 	throw new Error(buildNativeAddonLoadErrorMessage(nativeLoadFailures));
 }
@@ -912,17 +1160,18 @@ function getNativeOrThrow(): any {
 // ---------------------------------------------------------------------------
 
 class NativeServerSession implements ServerSession {
-	#nativeHandle: any;
+	#nativeHandle: NativeSessionHandle;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
 	constructor(
-		nativeHandle: any,
+		nativeHandle: NativeSessionHandle,
 		closedPromise: Promise<CloseInfo>,
 		streamOpenWaitTimeoutMs: number,
 	) {
@@ -975,17 +1224,23 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const datagram = await this.#nativeHandle.readDatagram();
-				if (!datagram) break;
-				yield datagram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err);
-			}
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			const session = this;
+			this.#incomingDatagramsCache = (async function* () {
+				while (!session.#closed) {
+					try {
+						const datagram = await session.#nativeHandle.readDatagram();
+						if (!datagram) break;
+						yield datagram;
+					} catch (err) {
+						if (isSessionCloseError(err)) break;
+						throw toWebTransportError(err);
+					}
+				}
+			})();
 		}
+		return this.#incomingDatagramsCache;
 	}
 
 	async createBidirectionalStream(
@@ -999,9 +1254,7 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitBidiCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi"),
 			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1033,9 +1286,7 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitUniCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni"),
 			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1159,7 +1410,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
-	const logCallback = (logEvents: any[]) => {
+	const logCallback = (logEvents: NativeLogEvent[]) => {
 		for (const le of logEvents) {
 			emitUserLog({
 				level: le.level ?? "info",
@@ -1179,7 +1430,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		limitsJson,
 		rateLimitsJson,
 		serverOptsJson,
-		(events: any[]) => {
+		(events: NativeServerSessionEvent[]) => {
 			for (const evt of events) {
 				if (
 					evt.name === "session" &&
@@ -1208,9 +1459,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 						maybePromise = opts.onSession(session);
 					} catch (err) {
 						const msg = err instanceof Error ? err.message : String(err);
+						session.close({
+							code: 0,
+							reason: `onSession callback threw: ${msg}`,
+						});
 						emitUserLog({
 							level: "error",
-							msg: `E_INTERNAL: onSession callback threw: ${msg}`,
+							msg: `E_INVALID_ARGUMENT: onSession callback threw: ${msg}`,
 							sessionId: evt.id,
 							peerIp: evt.peerIp,
 							peerPort: evt.peerPort,
@@ -1221,9 +1476,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					if (maybePromise && typeof maybePromise.then === "function") {
 						maybePromise.then(onSessionCallbackDone, (err) => {
 							const msg = err instanceof Error ? err.message : String(err);
+							session.close({
+								code: 0,
+								reason: `onSession callback rejected: ${msg}`,
+							});
 							emitUserLog({
 								level: "error",
-								msg: `E_INTERNAL: onSession callback rejected: ${msg}`,
+								msg: `E_INVALID_ARGUMENT: onSession callback rejected: ${msg}`,
 								sessionId: evt.id,
 								peerIp: evt.peerIp,
 								peerPort: evt.peerPort,
@@ -1294,12 +1553,21 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				resolve({ code: 0, reason: "server closed" });
 			}
 			if (activeOnSessionCallbacks > 0) {
-				await Promise.race([
-					new Promise<void>((r) => {
-						onSessionDrainResolve = r;
-					}),
-					new Promise<void>((r) => setTimeout(r, 5000)),
-				]);
+				// Clear the timeout timer if the drain wins the race, so it does
+				// not keep the event loop alive up to 5s after close() resolves.
+				let drainTimer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						new Promise<void>((r) => {
+							onSessionDrainResolve = r;
+						}),
+						new Promise<void>((r) => {
+							drainTimer = setTimeout(r, 5000);
+						}),
+					]);
+				} finally {
+					if (drainTimer !== undefined) clearTimeout(drainTimer);
+				}
 			}
 		},
 		metricsSnapshot: () => handle.metricsSnapshot(),
@@ -1311,16 +1579,17 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 // ---------------------------------------------------------------------------
 
 class NativeClientSession implements ClientSession {
-	#nativeHandle: any;
+	#nativeHandle: NativeSessionHandle;
 	#readyPromise: Promise<void>;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#strictW3CErrors: boolean;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
 
 	constructor(
-		nativeHandle: any,
+		nativeHandle: NativeSessionHandle,
 		readyPromise: Promise<void>,
 		closedPromise: Promise<CloseInfo>,
 		strictW3CErrors = false,
@@ -1376,17 +1645,23 @@ class NativeClientSession implements ClientSession {
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const dgram = await this.#nativeHandle.readDatagram();
-				if (!dgram) break;
-				yield dgram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err, this.#strictW3CErrors);
-			}
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			const session = this;
+			this.#incomingDatagramsCache = (async function* () {
+				while (!session.#closed) {
+					try {
+						const dgram = await session.#nativeHandle.readDatagram();
+						if (!dgram) break;
+						yield dgram;
+					} catch (err) {
+						if (isSessionCloseError(err)) break;
+						throw toWebTransportError(err, session.#strictW3CErrors);
+					}
+				}
+			})();
 		}
+		return this.#incomingDatagramsCache;
 	}
 
 	async createBidirectionalStream(
@@ -1400,7 +1675,8 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new BidiStream({
@@ -1439,7 +1715,8 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new SendStream({
@@ -1472,6 +1749,7 @@ class NativeClientSession implements ClientSession {
 	}
 
 	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
 	_connectionStats(): QuicConnectionStats | null {
 		return typeof this.#nativeHandle.connectionStats === "function"
 			? (this.#nativeHandle.connectionStats() ?? null)
@@ -1479,6 +1757,7 @@ class NativeClientSession implements ClientSession {
 	}
 
 	/** Current path MTU-derived max datagram payload size, or null when unknown. */
+	/** @internal */
 	_pathMaxDatagramSize(): number | null {
 		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
 			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
@@ -1501,8 +1780,37 @@ export interface QuicConnectionStats {
 // connect
 // ---------------------------------------------------------------------------
 
+function validateConnectUrl(url: string, strictW3CErrors?: boolean): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch (err) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: connect URL is invalid: ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+			strictW3CErrors,
+		);
+	}
+	if (parsed.protocol !== "https:") {
+		throw createMappedError(
+			E_UNSUPPORTED_ARGUMENT as ErrorCode,
+			`E_UNSUPPORTED_ARGUMENT: connect only supports https URLs, got ${parsed.protocol}`,
+			strictW3CErrors,
+		);
+	}
+	if (!parsed.hostname) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: connect URL must include a host",
+			strictW3CErrors,
+		);
+	}
+}
+
 function connectWithNative(
-	native: any,
+	native: NativeConnectOnlyAddon,
 	url: string,
 	optsJson: string,
 	handshakeTimeout: number,
@@ -1531,7 +1839,7 @@ function connectWithNative(
 			reject(err);
 		};
 
-		const onClosed = (events: any[]) => {
+		const onClosed = (events: NativeClientSessionEvent[]) => {
 			for (const evt of events) {
 				if (evt.name === "session_closed" && evt.id != null) {
 					const resolveClosed = closedResolvers.get(evt.id);
@@ -1546,7 +1854,7 @@ function connectWithNative(
 			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
 			const browserName =
 				strictW3CErrors === true
-					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ??
+					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode) ??
 						undefined)
 					: undefined;
 			settleReject(
@@ -1558,47 +1866,52 @@ function connectWithNative(
 			);
 		}, handshakeTimeout);
 
-		native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
-			if (err) {
-				settleReject(toWebTransportError(err, strictW3CErrors));
-				return;
-			}
-			if (handleId == null) {
-				settleReject(new Error("connect succeeded but no handle id"));
-				return;
-			}
-			const handle = native.takeClientSession(handleId);
-			if (!handle) {
-				settleReject(new Error("connect: handle not found in registry"));
-				return;
-			}
-			if (settled) {
-				try {
-					handle.close?.(0, "late connect completion after timeout");
-				} catch (closeErr) {
-					const msg =
-						closeErr instanceof Error ? closeErr.message : String(closeErr);
-					console.warn(
-						`[webtransport] late connect orphan cleanup failed: ${msg}`,
-					);
+		native.connect(
+			url,
+			optsJson,
+			onClosed,
+			(err: unknown, handleId?: string) => {
+				if (err) {
+					settleReject(toWebTransportError(err, strictW3CErrors));
+					return;
 				}
-				return;
-			}
-			let closedResolve!: (info: CloseInfo) => void;
-			const closedPromise = new Promise<CloseInfo>((r) => {
-				closedResolve = r;
-			});
-			closedResolvers.set(handle.id, closedResolve);
-			settleResolve(
-				new NativeClientSession(
-					handle,
-					Promise.resolve(),
-					closedPromise,
-					strictW3CErrors,
-					streamOpenWaitTimeoutMs,
-				),
-			);
-		});
+				if (handleId == null) {
+					settleReject(new Error("connect succeeded but no handle id"));
+					return;
+				}
+				const handle = native.takeClientSession(handleId);
+				if (!handle) {
+					settleReject(new Error("connect: handle not found in registry"));
+					return;
+				}
+				if (settled) {
+					try {
+						handle.close?.(0, "late connect completion after timeout");
+					} catch (closeErr) {
+						const msg =
+							closeErr instanceof Error ? closeErr.message : String(closeErr);
+						console.warn(
+							`[webtransport] late connect orphan cleanup failed: ${msg}`,
+						);
+					}
+					return;
+				}
+				let closedResolve!: (info: CloseInfo) => void;
+				const closedPromise = new Promise<CloseInfo>((r) => {
+					closedResolve = r;
+				});
+				closedResolvers.set(handle.id, closedResolve);
+				settleResolve(
+					new NativeClientSession(
+						handle as NativeSessionHandle,
+						Promise.resolve(),
+						closedPromise,
+						strictW3CErrors,
+						streamOpenWaitTimeoutMs,
+					),
+				);
+			},
+		);
 	});
 }
 
@@ -1628,6 +1941,10 @@ export async function connect(
 	opts?: ClientOptions,
 ): Promise<ClientSession> {
 	const native = getNativeOrThrow();
+	validateConnectUrl(url, opts?.strictW3CErrors);
+	const serverCertificateHashes = mapServerCertificateHashes(
+		opts?.serverCertificateHashes,
+	);
 	if (
 		opts?.tls?.insecureSkipVerify === true &&
 		(opts.log !== undefined || !shouldSuppressInsecureSkipVerifyWarning())
@@ -1641,6 +1958,12 @@ export async function connect(
 		});
 	}
 
+	if (opts?.serverCertificateHashes !== undefined) {
+		validateServerCertificateHashes(
+			opts.serverCertificateHashes,
+			opts?.strictW3CErrors,
+		);
+	}
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
 	const tlsOpts = opts?.tls
 		? {
@@ -1657,7 +1980,7 @@ export async function connect(
 		limits: mergedLimits,
 		tls: tlsOpts,
 		congestionControl: opts?.congestionControl,
-		serverCertificateHashes: opts?.serverCertificateHashes,
+		serverCertificateHashes: serverCertificateHashes,
 		allowPooling: opts?.allowPooling,
 		requireUnreliable: opts?.requireUnreliable,
 	});
@@ -1695,14 +2018,28 @@ export function clientPoolMetricsSnapshot(): {
 // ---------------------------------------------------------------------------
 
 function validateServerCertificateHashes(
-	arr: Array<{ algorithm: string; value: BufferSource }>,
+	arr: unknown,
 	strictW3CErrors?: boolean,
 ): void {
+	if (!Array.isArray(arr)) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
+			strictW3CErrors,
+		);
+	}
+	if (arr.length === 0) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
+			strictW3CErrors,
+		);
+	}
 	for (const entry of arr) {
 		if (entry.algorithm !== "sha-256") {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				`E_INTERNAL: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				`E_UNSUPPORTED_ARGUMENT: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
 				strictW3CErrors,
 			);
 		}
@@ -1711,20 +2048,18 @@ function validateServerCertificateHashes(
 			!ArrayBuffer.isView(entry.value)
 		) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes entry value must be BufferSource",
 				strictW3CErrors,
 			);
 		}
-		if (
-			entry.value == null ||
-			(typeof entry.value === "object" &&
-				"byteLength" in entry &&
-				entry.byteLength === 0)
-		) {
+		// A SHA-256 digest is exactly 32 bytes. The previous check inspected
+		// `entry` (the wrapper) for a `byteLength` it never has, so empty or
+		// malformed hashes passed straight through to the native pin path.
+		if (entry.value.byteLength !== 32) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be non-empty BufferSource",
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: serverCertificateHashes sha-256 value must be exactly 32 bytes, got ${entry.value.byteLength}`,
 				strictW3CErrors,
 			);
 		}
@@ -1737,13 +2072,19 @@ function bufferSourceToUint8(value: BufferSource): Uint8Array {
 		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 	}
 	throw new WebTransportError(
-		E_INTERNAL as ErrorCode,
-		"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+		E_INVALID_ARGUMENT as ErrorCode,
+		"E_INVALID_ARGUMENT: serverCertificateHashes entry value must be BufferSource",
 	);
 }
 
-function bufferSourceToBase64(value: BufferSource): string {
-	return Buffer.from(bufferSourceToUint8(value)).toString("base64");
+function mapServerCertificateHashes(
+	hashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>,
+): Array<{ algorithm: "sha-256"; value: number[] }> | undefined {
+	if (hashes === undefined) return;
+	return hashes.map((entry) => ({
+		algorithm: entry.algorithm,
+		value: Array.from(bufferSourceToUint8(entry.value)),
+	}));
 }
 
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
@@ -1759,8 +2100,8 @@ function validateClientOptions(
 		typeof opts.allowPooling !== "boolean"
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: allowPooling must be a boolean",
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: allowPooling must be a boolean",
 			strictW3CErrors,
 		);
 	}
@@ -1769,8 +2110,8 @@ function validateClientOptions(
 		typeof opts.requireUnreliable !== "boolean"
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: requireUnreliable must be a boolean",
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: requireUnreliable must be a boolean",
 			strictW3CErrors,
 		);
 	}
@@ -1779,8 +2120,8 @@ function validateClientOptions(
 		!VALID_CONGESTION.has(opts.congestionControl)
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
 			strictW3CErrors,
 		);
 	}
@@ -1789,24 +2130,37 @@ function validateClientOptions(
 		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
 			strictW3CErrors,
 		);
 	}
 	if (opts.serverCertificateHashes !== undefined) {
 		if (!Array.isArray(opts.serverCertificateHashes)) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes must be an array",
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
+				strictW3CErrors,
+			);
+		}
+		// An empty array is a silent pinning downgrade: the consumer asked for
+		// cert pinning but supplied no hashes. Reject rather than fall back to
+		// accept-any.
+		if (opts.serverCertificateHashes.length === 0) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
 				strictW3CErrors,
 			);
 		}
 		if (opts.allowPooling === true) {
-			throw new WebTransportError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true",
-				{ browserName: "NotSupportedError" },
+			// W3C mandates NotSupportedError for this combination regardless of
+			// the strict flag (asserted by parity-compat) — intentionally not
+			// gated on strictW3CErrors.
+			throw createMappedError(
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
+				true,
 			);
 		}
 		validateServerCertificateHashes(
@@ -1824,10 +2178,7 @@ function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 		limits: opts.limits,
 		congestionControl: opts.congestionControl,
 		strictW3CErrors: opts.strictW3CErrors,
-		serverCertificateHashes: opts.serverCertificateHashes?.map((entry) => ({
-			algorithm: entry.algorithm,
-			valueBase64: bufferSourceToBase64(entry.value),
-		})),
+		serverCertificateHashes: opts.serverCertificateHashes,
 		allowPooling: opts.allowPooling,
 		requireUnreliable: opts.requireUnreliable,
 	};
@@ -2024,18 +2375,36 @@ export class WebTransport {
 					throw err;
 				},
 			);
+			// Symmetric to `#closed` below: a consumer may observe only `closed`
+			// (e.g. via nativeToWebTransportLike, which forwards `ready`
+			// untouched) and never await `ready`. Attach a no-op handler so a
+			// connect-failure rejection on `ready` does not surface as an
+			// unhandled rejection (which aborts under
+			// --unhandled-rejections=strict). The getter returns this same
+			// rejecting promise, so awaiters still see the error.
+			this.#ready.catch(() => {});
 			this.#closed = this.#sessionPromise.then(
 				(s) =>
 					s.closed.then((info) => {
 						this.#state = "closed";
 						return toCloseInfo(info);
 					}),
-				() => {
-					// Connect failed: closed never rejects (PARITY_MATRIX).
-					this.#state = "closed";
-					return toCloseInfo({ code: 0, reason: "" });
+				(err) => {
+					// Connect failed: per W3C, `closed` rejects with the same
+					// error as `ready` (a resolved {closeCode:0} was
+					// indistinguishable from a clean close). Keep the "failed"
+					// state that the `ready` handler set — don't mask it as a
+					// clean "closed", which callers like getStats() guard on.
+					if (this.#state !== "failed") {
+						this.#state = "closed";
+					}
+					throw err;
 				},
 			);
+			// A consumer may await only `ready` (which also rejects on connect
+			// failure); attach a no-op handler so the spec-correct `closed`
+			// rejection does not surface as an unhandled rejection.
+			this.#closed.catch(() => {});
 		} else {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			this.#congestionControl = options?.congestionControl ?? "default";
@@ -2054,6 +2423,16 @@ export class WebTransport {
 		this.#draining = new Promise<void>((r) => {
 			this.#drainingResolve = r;
 		});
+		// `draining` also resolves when the session enters its closing phase via a
+		// remote/server-initiated close (not just local close()). Without this, a
+		// consumer awaiting `draining` to detect server shutdown would hang
+		// forever. `#drainingResolve` is idempotent, so a later local close() is
+		// harmless. (Both settle paths handled so a connect-failure rejection
+		// doesn't leave draining pending or surface unhandled.)
+		this.#closed.then(
+			() => this.#drainingResolve?.(),
+			() => this.#drainingResolve?.(),
+		);
 	}
 
 	/** Resolves when handshake completes. Rejects with WebTransportError on connect failure. */
@@ -2061,7 +2440,11 @@ export class WebTransport {
 		return this.#ready;
 	}
 
-	/** Resolves with close info when session closes. Never rejects. */
+	/**
+	 * Resolves with close info when the session closes cleanly, and rejects
+	 * with a `WebTransportError` when the connection fails to establish (same
+	 * error as `ready`), per the W3C WebTransport spec.
+	 */
 	get closed(): Promise<WebTransportCloseInfo> {
 		return this.#closed;
 	}
@@ -2081,7 +2464,7 @@ export class WebTransport {
 		return new WebTransportSendGroup(this, this.#nextSendGroupId++);
 	}
 
-	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
+	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Lazily initialized and cached. */
 	get datagrams(): WebTransportDatagramDuplexStream {
 		if (!this.#datagramsCache) {
 			this.#datagramsCache = createDatagramStreams(
@@ -2190,7 +2573,12 @@ export class WebTransport {
 		if (this.#state === "failed") {
 			throw new DOMException("Transport has failed", "InvalidStateError");
 		}
-		const s = await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		// If getStats() is called while still connecting and the connect then
+		// fails, awaiting #sessionPromise rejects with the raw connect error;
+		// surface the consistent InvalidStateError instead.
+		const s = await this.#sessionPromise.catch(() => {
+			throw new DOMException("Transport has failed", "InvalidStateError");
+		});
 		// Prefer wire-level QUIC stats from the native layer; fall back to
 		// facade byte tallies only when the native call is unavailable.
 		const quic = (
@@ -2238,12 +2626,13 @@ export class WebTransport {
 		}
 	}
 
-	/** Internal: session for adapters (not part of spec) */
+	/** @internal */
 	async _getSession(): Promise<ClientSession> {
 		return this.#sessionPromise;
 	}
 
 	/** Internal: MTU-derived datagram size from the live session, if connected */
+	/** @internal */
 	_getPathMaxDatagramSize(): number | null {
 		const s = this.#session as unknown as {
 			_pathMaxDatagramSize?: () => number | null;
@@ -2252,14 +2641,17 @@ export class WebTransport {
 	}
 
 	/** Internal: state for createWritable guard (not part of spec) */
+	/** @internal */
 	_getState(): WebTransportState {
 		return this.#state;
 	}
 
+	/** @internal */
 	_isStrictW3CErrors(): boolean {
 		return this.#strictW3CErrors;
 	}
 
+	/** @internal */
 	_resolveSendPolicy(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
@@ -2288,6 +2680,7 @@ export class WebTransport {
 		return { groupId, sendOrder };
 	}
 
+	/** @internal */
 	_recordSendGroupBytes(groupId: number, bytes: number): void {
 		this.#sendGroupBytesSent.set(
 			groupId,
@@ -2295,6 +2688,7 @@ export class WebTransport {
 		);
 	}
 
+	/** @internal */
 	async _getSendGroupStats(groupId: number): Promise<{
 		bytesSent?: number;
 		bytesAcknowledged?: number;
@@ -2304,6 +2698,7 @@ export class WebTransport {
 		};
 	}
 
+	/** @internal */
 	async _sendDatagramWithPolicy(
 		chunk: Uint8Array,
 		policy: SendPolicy,
@@ -2317,11 +2712,13 @@ export class WebTransport {
 		});
 	}
 
+	/** @internal */
 	_recordIncomingDatagram(chunk: Uint8Array): void {
 		this.#connStats.bytesReceived += chunk.byteLength;
 		this.#connStats.datagramsIn += 1;
 	}
 
+	/** @internal */
 	_recordIncomingStreamBytes(bytes: number): void {
 		this.#connStats.bytesReceived += bytes;
 	}
@@ -2747,6 +3144,7 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 	);
 }
 
+/** @internal */
 export const __TESTING__ = {
 	createNativeClientSessionForTests,
 	createNativeServerSessionForTests,
@@ -2754,7 +3152,11 @@ export const __TESTING__ = {
 	createServerIncomingUniStreamsForTests: createServerIncomingUniStreams,
 	tryLoadNativeAddonForTests: tryLoadNativeAddon,
 	buildNativeAddonLoadErrorMessageForTests: buildNativeAddonLoadErrorMessage,
+	nativeAddonOverrideRequestsFromEnvForTests:
+		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
+	nativeErrorCodes: KNOWN_ERROR_CODES,
+	extractMessageErrorCodeForTests: extractMessageErrorCode,
 };
 
 /**

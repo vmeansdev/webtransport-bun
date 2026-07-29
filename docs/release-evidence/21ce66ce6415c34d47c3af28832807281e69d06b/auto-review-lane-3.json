@@ -1,0 +1,12 @@
+{
+  "lane": 3,
+  "agent": "0c24459e-9fdf-43dd-a226-a24f2bf3335b",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "L3-P1-pending-deadline", "severity": "P1", "summary": "secondary CONNECT _deadline unused; JS timeout strands Rust pending"},
+    {"id": "L3-P1-qpack-pending-retry", "severity": "P1", "summary": "Blocked pending client CONNECTs never retried after inserts"},
+    {"id": "L3-P2-pending-max-sessions", "severity": "P2", "summary": "pending CONNECTs not counted toward WT_MAX_SESSIONS"},
+    {"id": "L3-P2-opensession-failfast", "severity": "P2", "summary": "openSession ignores SessionClosed/non-200 until handshake timeout"},
+    {"id": "L3-P3-open-session-f64", "severity": "P3", "summary": "wt_open_session returns f64"}
+  ]
+}

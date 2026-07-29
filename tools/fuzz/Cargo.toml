@@ -1,0 +1,73 @@
+[package]
+name = "webtransport-release-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+webtransport-wasm = { path = "../../crates/wasm" }
+web-time = "1.1.0"
+x509-parser = "0.18.1"
+
+[[bin]]
+name = "h3_frames"
+path = "fuzz_targets/h3_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack_huffman"
+path = "fuzz_targets/qpack_huffman.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_pin_policy"
+path = "fuzz_targets/cert_pin_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "der_metadata"
+path = "fuzz_targets/der_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_encode"
+path = "fuzz_targets/event_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handle_allocator"
+path = "fuzz_targets/handle_allocator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint_event_dispatch"
+path = "fuzz_targets/endpoint_event_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "limit_arithmetic"
+path = "fuzz_targets/limit_arithmetic.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

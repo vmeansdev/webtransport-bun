@@ -1,53 +1,85 @@
 # Compatibility and support policy
 
-## Runtime support
+The matrices below are the configured 1.0 release targets. They are not current
+support claims while `docs/release-status.json` has no passing `support.tested`
+tuples. A target becomes supported only when that manifest records its
+commit-bound passing evidence.
 
-- **Bun**: >= 1.3.9 (primary target in CI)
-- **Node**: supported (Node-API compatible runtime)
-- **Deno**: supported (npm + Node-API addon support)
+## Runtime targets
+
+- **Bun**: >= 1.3.9 (primary target in CI; evidence pending)
+- **Node**: Node-API compatible runtime (evidence pending)
+- **Deno**: npm + Node-API addon support target (evidence pending)
 
 ## Platform matrix (shipped prebuilds)
 
 | OS      | Arch  | Target         | Status    |
 |---------|-------|----------------|-----------|
-| macOS   | arm64 | darwin-arm64   | supported |
-| macOS   | x64   | darwin-x64     | supported |
-| Linux   | x64   | linux-x64      | supported |
-| Windows | x64   | win32-x64-msvc | supported |
+| macOS   | arm64 | darwin-arm64   | candidate; evidence pending |
+| macOS   | x64   | darwin-x64     | candidate; evidence pending |
+| Linux   | x64   | linux-x64      | candidate; evidence pending |
+| Windows | x64   | win32-x64-msvc | candidate; evidence pending |
 
 ## Node-API
 
 - Addon is built with napi-rs (Node-API). Avoid unstable N-API features.
 - Runtime portability is provided through Node-API loading in Bun, Node, and Deno.
+- **Native engine:** `wtransport =0.7.0` (pinned). Pre-1.0, single-maintainer —
+  see `SUPPORT.md`.
 
 ## WASM backend (`@webtransport-bun/webtransport/wasm`)
 
 The wasm backend (quinn-proto + rustls compiled to `wasm32-unknown-unknown`)
-has its own environment matrix, orthogonal to the prebuild table above:
+has its own environment matrix, orthogonal to the prebuild table above.
+
+**CI scope:** the wasm Bun suite (`wasm-*.test.ts`, `webtransport-like.test.ts`)
+is exercised on the ubuntu `wasm` workflow job only. The multi-OS/bun matrix
+excludes those files by design so missing `crates/wasm/pkg` cannot skip-green.
+See `docs/release-status.json` → `support.scopeLimits`.
 
 | Scenario | Environment | Status |
 |----------|-------------|--------|
-| Server inside the browser | Chromium Isolated Web App with `direct-sockets` permission (behind `chrome://flags/#enable-isolated-web-apps` + `#enable-isolated-web-app-dev-mode`, or enterprise policy) | supported (manual verification; not CI-runnable — see `tools/interop/WASM_INTEROP.md`) |
+| Server inside the browser | Chromium Isolated Web App with `direct-sockets` and `cross-origin-isolated` permissions | `iwa-direct-sockets` **passed** on gap-closure candidate (local Chrome Direct Sockets) |
 | Server inside the browser | Normal web page, Firefox, Safari | **not possible** — Direct Sockets is IWA/Chromium-only |
-| Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | supported (`wasm-bun-udp` test) |
-| Client (wasm) → native server | Bun/Node host, real UDP | supported (`wasm-native-interop` test) |
-| Chrome's native `WebTransport` client → wasm server | any Chromium | supported (manual harness) |
-| Custom transport | anything implementing `UdpTransport` | supported — the core is sans-IO |
+| Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | implemented and locally tested; release evidence pending |
+| Client (wasm) → native server | Bun/Node host, real UDP | implemented and locally tested; release evidence pending |
+| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; `chromium-wasm-interop` currently **pending** re-verify on gap-closure candidate |
+| Custom transport | anything implementing `UdpTransport` | implemented — the core is sans-IO; consumer-specific support is not claimed |
 
 Constraints that apply regardless of environment:
 
 - **Certificates**: browser clients pin via `serverCertificateHashes`, which
   requires ECDSA P-256 and validity ≤ 14 days. `generateCert` enforces both.
   Certificate rotation (and hash redistribution to clients) is the consumer's
-  responsibility.
+  responsibility. You can use the `WasmCertRotator` helper class to automatically 
+  generate new certificates ahead of expiry so your server can update its endpoints
+  without downtime.
 - **Host glue**: the consumer supplies packet I/O and timer driving; shipped
   adapters cover Direct Sockets, Bun UDP, and in-memory testing.
-- **API surface**: no `u64`/`BigInt` crosses the wasm boundary (handles are
-  `u32`, sizes are `f64`), so no BigInt polyfill or serialization caveats.
-- **Unsupported options fail loudly**: `allowPooling` and other
-  native-/browser-only options are rejected, never silently ignored
-  (see `docs/PARITY_MATRIX.md`).
-- **IWA packaging**: signed web bundles, dev-mode install via
-  `chrome://web-app-internals` — see `examples/webtransport-wasm-iwa/README.md`.
-  The IWA install/signing flow is manual and Chromium-version-sensitive;
-  expect flag names and policies to move while IWAs remain behind flags.
+- **API surface**: connection/stream handles stay `u32` and sizes stay `f64`.
+  Session demux uses `u64`/`bigint` (`session_id` on WtEvent and session-scoped
+  APIs); consumers must accept BigInt for those fields.
+- **Unsupported options fail loudly**: options that are not yet supported on
+  wasm fail with stable errors (never silently ignored). Coupled 1.0 requires
+  facade parity (`wasm-facade-parity`) so W3C-shaped options converge with the
+  native surface where feasible — see `docs/PARITY_MATRIX.md` and
+  `docs/WASM_PROTOCOL_SCOPE.md`.
+- **Protocol bar:** dynamic QPACK, multi-session, and 0-RTT are coupled 1.0
+  requirements (`wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`) and
+  are **claim-passed** on the current candidate in `docs/release-status.json`
+  (defaults remain Chromium-safe: QPACK capacity 0, `enable0Rtt` false).
+  `wasm-facade-parity` is claim-passed on the current candidate (pooling,
+  waitUntilAvailable, quinn getStats, CC factories, sendOrder scheduler,
+  durable ticket hosts, metrics, live TLS/SNI, log/debug, WasmServerSession).
+  Async plug-and-play `createServer` / `createIwaServer` on
+  `@webtransport-bun/webtransport/wasm` is available for Chromium IWA + Direct
+  Sockets (candidate; not interchangeable with root native sync `createServer`).
+  Normal webpages / Firefox / Safari remain impossible.
+- **IWA packaging**: the canonical `/.well-known/manifest.webmanifest`,
+  signed Web Bundle installation via Chromium's developer-mode
+  `--install-isolated-web-app-from-file` switch, unsigned source bundle, and
+  Direct Sockets execution are exercised by `.github/workflows/iwa.yml`. The
+  job fails unless the page proves the exact `browser-iwa-direct-sockets`
+  identity and writes evidence bound to the candidate commit plus both the
+  signed and unsigned bundle digests. Manual installation remains available
+  for development; see `examples/webtransport-wasm-iwa/README.md`.

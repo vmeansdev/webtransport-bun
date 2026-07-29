@@ -25,15 +25,132 @@ use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
 };
+use crate::error::{from_upstream_error as wt_from_upstream_error, WtResult};
 use crate::server_metrics::ServerMetrics;
 use crate::session_registry::SessionMetrics;
 use crate::CLIENT_RUNTIME;
 
 static CLIENT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static CLIENT_SESSION_ID_SEED: Lazy<u64> = Lazy::new(|| {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    // Mix in a client-specific discriminator so client and server seeds differ
+    "client".hash(&mut h);
+    h.finish()
+});
 static CLIENT_HANDLE_REGISTRY: Lazy<Mutex<HashMap<String, ClientSessionHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CLIENT_POOL: Lazy<std::sync::Arc<client_pool::ClientPoolManager>> =
     Lazy::new(|| std::sync::Arc::new(client_pool::ClientPoolManager::new()));
+
+struct RegistryMutation<T> {
+    value: T,
+    poison_recovered: bool,
+}
+
+fn remove_registry_entry(
+    registry: &Mutex<HashMap<String, ClientSessionHandle>>,
+    handle_id: &str,
+) -> RegistryMutation<Option<ClientSessionHandle>> {
+    match registry.lock() {
+        Ok(mut guard) => RegistryMutation {
+            value: guard.remove(handle_id),
+            poison_recovered: false,
+        },
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            RegistryMutation {
+                value: guard.remove(handle_id),
+                poison_recovered: true,
+            }
+        }
+    }
+}
+
+fn insert_registry_entry(
+    registry: &Mutex<HashMap<String, ClientSessionHandle>>,
+    handle: ClientSessionHandle,
+) -> RegistryMutation<()> {
+    match registry.lock() {
+        Ok(mut guard) => {
+            guard.insert(handle.id.clone(), handle);
+            RegistryMutation {
+                value: (),
+                poison_recovered: false,
+            }
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.insert(handle.id.clone(), handle);
+            RegistryMutation {
+                value: (),
+                poison_recovered: true,
+            }
+        }
+    }
+}
+
+fn report_client_registry_recovery(context: &str, handle_id: &str) {
+    eprintln!(
+        "webtransport-native: {} client handle registry mutex was poisoned; recovered entry mutation for {}",
+        context, handle_id
+    );
+}
+
+fn remove_client_registry_entry(handle_id: &str) -> RegistryMutation<Option<ClientSessionHandle>> {
+    remove_registry_entry(&CLIENT_HANDLE_REGISTRY, handle_id)
+}
+
+fn finalize_client_terminal_state(
+    handle_id: &str,
+    closed_flag: &Arc<std::sync::atomic::AtomicBool>,
+    close_code: Option<u32>,
+    close_reason: Option<String>,
+    on_closed: Option<&ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
+) {
+    closed_flag.store(true, Ordering::Relaxed);
+    let removal = remove_client_registry_entry(handle_id);
+    if removal.poison_recovered {
+        report_client_registry_recovery("finalize", handle_id);
+    }
+    if let Some(tsfn) = on_closed {
+        let status = tsfn.call(
+            ClientSessionClosed {
+                id: handle_id.to_string(),
+                code: close_code,
+                reason: close_reason,
+            },
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        crate::report_tsfn_status("on_closed", status);
+    }
+}
+
+fn handle_connect_callback_status(success_id: Option<&str>, status: napi::Status) {
+    crate::report_tsfn_status("connect", status);
+    if status == napi::Status::Ok {
+        return;
+    }
+    if let Some(handle_id) = success_id {
+        let removal = remove_client_registry_entry(handle_id);
+        if removal.poison_recovered {
+            report_client_registry_recovery("connect callback cleanup", handle_id);
+        }
+        if let Some(handle) = removal.value {
+            handle.initiate_close(
+                0,
+                format!("E_INTERNAL: connect callback delivery failed: {:?}", status),
+            );
+        }
+    }
+}
 
 fn map_connecting_error(
     err: wtransport::error::ConnectingError,
@@ -72,11 +189,9 @@ fn try_reserve_client_queued_bytes(metrics: &ClientMetrics, budget_bytes: u64, n
     metrics
         .queued_bytes
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            if current + n <= budget_bytes {
-                Some(current + n)
-            } else {
-                None
-            }
+            current
+                .checked_add(n)
+                .and_then(|next| (next <= budget_bytes).then_some(next))
         })
         .is_ok()
 }
@@ -118,6 +233,11 @@ pub(crate) fn parse_congestion_control(
     }
 }
 
+/// Default client idle timeout. quinn's default is `None` (never), which leaves
+/// a client on a dead path (NAT rebind, network drop, server power loss) hung
+/// forever with `closed` never resolving. A bounded default guarantees liveness.
+pub const DEFAULT_CLIENT_IDLE_TIMEOUT_MS: u64 = 30_000;
+
 pub(crate) fn apply_congestion_controller(
     config: &mut wtransport::config::QuicTransportConfig,
     mode: CongestionControlMode,
@@ -139,9 +259,36 @@ pub(crate) fn apply_congestion_controller(
 
 fn build_quic_transport_config(
     mode: CongestionControlMode,
+    idle_timeout_ms: u64,
+    keep_alive_interval_ms: u64,
 ) -> wtransport::config::QuicTransportConfig {
     let mut config = wtransport::config::QuicTransportConfig::default();
     apply_congestion_controller(&mut config, mode);
+
+    // Liveness: bound how long a silent (possibly dead) connection lingers, and
+    // send keep-alive pings so a live-but-quiet connection is not idle-killed.
+    // `idle_timeout_ms == 0` opts out (unbounded), matching quinn's raw default.
+    if idle_timeout_ms > 0 {
+        match wtransport::quinn::IdleTimeout::try_from(std::time::Duration::from_millis(
+            idle_timeout_ms,
+        )) {
+            Ok(timeout) => {
+                config.max_idle_timeout(Some(timeout));
+            }
+            // Out of range: fall back to no idle timeout rather than panicking.
+            Err(_) => {
+                config.max_idle_timeout(None);
+            }
+        }
+        // Keep-alive must stay strictly below the idle timeout, or a quiet but
+        // live connection gets idle-killed before a ping can refresh it. Clamp
+        // to at most idle/2 (tolerates one lost ping) regardless of the caller's
+        // value; 0 (after clamping) disables keep-alive, still bounded by idle.
+        let keep_alive_ms = keep_alive_interval_ms.min(idle_timeout_ms / 2);
+        if keep_alive_ms > 0 {
+            config.keep_alive_interval(Some(std::time::Duration::from_millis(keep_alive_ms)));
+        }
+    }
     config
 }
 
@@ -159,8 +306,11 @@ fn build_wtransport_client_config(
     ca_pem: Option<&str>,
     pinned_hashes: &[[u8; 32]],
     congestion_control: CongestionControlMode,
+    idle_timeout_ms: u64,
+    keep_alive_interval_ms: u64,
 ) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let transport_config = build_quic_transport_config(congestion_control);
+    let transport_config =
+        build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
 
     let config = if insecure_skip_verify {
         let tls_config =
@@ -189,6 +339,20 @@ fn build_wtransport_client_config(
     };
 
     Ok(config)
+}
+
+/// Insecure client config for Rust loopback coverage tests only.
+#[cfg(test)]
+pub(crate) fn insecure_loopback_client_config(
+) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    build_wtransport_client_config(
+        true,
+        None,
+        &[],
+        CongestionControlMode::Default,
+        60_000,
+        10_000,
+    )
 }
 
 #[napi]
@@ -232,7 +396,7 @@ impl ClientSessionHandle {
 
     /// Real QUIC transport stats (rtt, wire bytes, packet counts).
     #[napi]
-    pub fn connection_stats(&self) -> Result<Option<crate::metrics::QuicConnectionStats>> {
+    pub fn connection_stats(&self) -> WtResult<Option<crate::metrics::QuicConnectionStats>> {
         if self.closed.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -241,7 +405,7 @@ impl ClientSessionHandle {
 
     /// Current max datagram payload size for the path (MTU-derived), if known.
     #[napi]
-    pub fn path_max_datagram_size(&self) -> Result<Option<u32>> {
+    pub fn path_max_datagram_size(&self) -> WtResult<Option<u32>> {
         Ok(self
             .conn
             .as_ref()
@@ -300,20 +464,13 @@ impl ClientSessionHandle {
     }
 
     #[napi]
-    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> Result<()> {
-        self.closed.store(true, Ordering::Relaxed);
-        let c = code.unwrap_or(0);
-        let r = reason.unwrap_or_default();
-        if let Some(ref tx) = self.close_tx {
-            if tx.send((c, r)).is_err() {
-                crate::report_channel_closed("client close signal");
-            }
-        }
+    pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
+        self.initiate_close(code.unwrap_or(0), reason.unwrap_or_default());
         Ok(())
     }
 
     #[napi]
-    pub fn metrics_snapshot(&self) -> Result<crate::metrics::SessionMetricsSnapshot> {
+    pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::SessionMetricsSnapshot> {
         Ok(crate::metrics::SessionMetricsSnapshot {
             datagrams_in: self.client_metrics.datagrams_in.load(Ordering::Relaxed) as f64,
             datagrams_out: self.client_metrics.datagrams_out.load(Ordering::Relaxed) as f64,
@@ -334,7 +491,7 @@ impl ClientSessionHandle {
         resp_rx
             .await
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-            .map_err(napi::Error::from_reason)
+            .map_err(wt_from_upstream_error)
     }
 
     #[napi]
@@ -349,7 +506,7 @@ impl ClientSessionHandle {
         resp_rx
             .await
             .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"))?
-            .map_err(napi::Error::from_reason)
+            .map_err(wt_from_upstream_error)
     }
 
     #[napi]
@@ -367,7 +524,7 @@ impl ClientSessionHandle {
         {
             Ok(h) => Ok(Some(h)),
             Err(e) if e == "E_SESSION_CLOSED" => Ok(None),
-            Err(e) => Err(napi::Error::from_reason(e)),
+            Err(e) => Err(wt_from_upstream_error(e)),
         }
     }
 
@@ -386,12 +543,24 @@ impl ClientSessionHandle {
         {
             Ok(h) => Ok(Some(h)),
             Err(e) if e == "E_SESSION_CLOSED" => Ok(None),
-            Err(e) => Err(napi::Error::from_reason(e)),
+            Err(e) => Err(wt_from_upstream_error(e)),
         }
     }
 }
 
 impl ClientSessionHandle {
+    fn initiate_close(&self, code: u32, reason: String) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Some(ref tx) = self.close_tx {
+            if tx.send((code, reason.clone())).is_err() {
+                crate::report_channel_closed("client close signal");
+            }
+        }
+        if let Some(ref conn) = self.conn {
+            conn.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_session_task(
         id: String,
@@ -479,6 +648,14 @@ impl ClientSessionHandle {
                         Err(wtransport::error::SendDatagramError::TooLarge) => break,
                     }
                 }
+                // The loop can break with datagrams still buffered; release
+                // their reserved bytes so the reservation is not stranded in
+                // `queued_bytes` until the handle is dropped.
+                while let Ok(bytes) = dgram_send_rx.try_recv() {
+                    cm_send
+                        .queued_bytes
+                        .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                }
             });
 
             let cm_recv = Arc::clone(&cm);
@@ -527,9 +704,9 @@ impl ClientSessionHandle {
                                     read_err_slot,
                                 ))
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                         },
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client open_bidi response");
@@ -562,9 +739,9 @@ impl ClientSessionHandle {
                                     write_err_slot,
                                 ))
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                         },
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client open_uni response");
@@ -602,7 +779,7 @@ impl ClientSessionHandle {
                                 read_err_slot,
                             ))
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client accept_bidi response");
@@ -627,16 +804,15 @@ impl ClientSessionHandle {
                                 &CLIENT_RUNTIME,
                                 recv,
                                 Some(guard),
-                                Some(budget.clone()),
+                                Some(budget),
                             );
-                            Ok(ClientUniRecvHandle::new_with_budget_and_slot(
+                            Ok(ClientUniRecvHandle::new_with_slot(
                                 read_rx,
                                 stop_tx,
-                                Some(budget),
                                 read_err_slot,
                             ))
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(wt_from_upstream_error(e.to_string()).to_string()),
                     };
                     if resp_tx.send(r).is_err() {
                         crate::report_channel_failure("client accept_uni response");
@@ -654,19 +830,13 @@ impl ClientSessionHandle {
                     (Some(code), Some(reason))
                 }
             };
-            closed_flag.store(true, Ordering::Relaxed);
-
-            if let Some(ref tsfn) = on_closed {
-                let status = tsfn.call(
-                    ClientSessionClosed {
-                        id: id.clone(),
-                        code: close_code,
-                        reason: close_reason,
-                    },
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-                crate::report_tsfn_status("on_closed", status);
-            }
+            finalize_client_terminal_state(
+                &id,
+                &closed_flag,
+                close_code,
+                close_reason,
+                on_closed.as_ref(),
+            );
         });
 
         handle
@@ -741,7 +911,7 @@ fn connect_inner(
     CLIENT_RUNTIME.spawn(async move {
         let result = match run_connect(&url, opts_json)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| wt_from_upstream_error(e.to_string()))
             .map(|(id, peer_ip, peer_port, conn, release_guard)| {
                 let handle = ClientSessionHandle::spawn_session_task(
                     id.clone(),
@@ -753,16 +923,21 @@ fn connect_inner(
                     bp_timeout_ms,
                     client_limits,
                 );
-                if let Ok(mut reg) = CLIENT_HANDLE_REGISTRY.lock() {
-                    reg.insert(id.clone(), handle);
+                let insertion = insert_registry_entry(&CLIENT_HANDLE_REGISTRY, handle);
+                if insertion.poison_recovered {
+                    report_client_registry_recovery("connect registry insert", &id);
                 }
                 id
             }) {
             std::result::Result::Ok(id) => ConnectResult::Ok(id),
-            std::result::Result::Err(msg) => ConnectResult::Err(msg),
+            std::result::Result::Err(msg) => ConnectResult::Err(msg.to_string()),
+        };
+        let success_id = match &result {
+            ConnectResult::Ok(id) => Some(id.clone()),
+            ConnectResult::Err(_) => None,
         };
         let status = callback_tsfn.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-        crate::report_tsfn_status("connect", status);
+        handle_connect_callback_status(success_id.as_deref(), status);
     });
 
     Ok(())
@@ -885,7 +1060,7 @@ fn build_client_tls_config(
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("E_TLS: failed to configure TLS versions: {}", e))?
         .with_root_certificates(Arc::clone(&root_store))
@@ -896,14 +1071,11 @@ fn build_client_tls_config(
             .dangerous()
             .set_certificate_verifier(Arc::new(InsecureVerifier));
     } else if !pinned_hashes.is_empty() {
-        let base = rustls::client::WebPkiServerVerifier::builder(Arc::clone(&root_store))
-            .build()
-            .map_err(|e| format!("E_TLS: failed to build certificate verifier: {}", e))?;
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(PinnedCertVerifier {
-                inner: base,
                 pins: pinned_hashes.to_vec(),
+                provider,
             }));
     }
 
@@ -968,9 +1140,8 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 /// and its total validity window must not exceed 14 days.
 #[derive(Debug)]
 struct PinnedCertVerifier {
-    /// Used only to delegate signature verification, never chain building.
-    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     pins: Vec<[u8; 32]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 const MAX_PINNED_CERT_VALIDITY_SECS: i64 = 14 * 24 * 60 * 60;
@@ -1008,6 +1179,24 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
                 "E_TLS: pinned certificate validity exceeds 14 days (W3C limit)".to_string(),
             ));
         }
+        // W3C serverCertificateHashes requires the certificate use ECDSA over
+        // NIST P-256. Enforce id-ecPublicKey (1.2.840.10045.2.1) with the
+        // secp256r1/prime256v1 curve (1.2.840.10045.3.1.7); otherwise a
+        // Chromium client would reject a cert our pin path would accept.
+        let spki = &cert.public_key().algorithm;
+        let is_ec = spki.algorithm.to_id_string() == "1.2.840.10045.2.1";
+        let is_p256 = spki
+            .parameters
+            .as_ref()
+            .and_then(|p| p.as_oid().ok())
+            .map(|oid| oid.to_id_string() == "1.2.840.10045.3.1.7")
+            .unwrap_or(false);
+        if !is_ec || !is_p256 {
+            return Err(rustls::Error::General(
+                "E_TLS: pinned certificate must use ECDSA P-256 (W3C serverCertificateHashes)"
+                    .to_string(),
+            ));
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -1017,7 +1206,12 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -1026,11 +1220,18 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -1055,21 +1256,28 @@ fn parse_server_certificate_hashes(
                 algorithm
             ));
         }
-        let value_b64 = entry
-            .get("valueBase64")
-            .and_then(|v| v.as_str())
+        let value = entry
+            .get("value")
+            .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                "E_INTERNAL: serverCertificateHashes entry value must be base64".to_string()
+                "E_INTERNAL: serverCertificateHashes entry value must be a byte-array".to_string()
             })?;
-        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value_b64)
-            .map_err(|_| "E_INTERNAL: invalid base64 in serverCertificateHashes".to_string())?;
-        if decoded.len() != 32 {
+        if value.len() != 32 {
             return Err(
                 "E_INTERNAL: serverCertificateHashes value must be 32-byte SHA-256".to_string(),
             );
         }
         let mut pin = [0u8; 32];
-        pin.copy_from_slice(&decoded);
+        for (i, entry) in value.iter().enumerate() {
+            let byte = entry
+                .as_u64()
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or_else(|| {
+                    "E_INTERNAL: serverCertificateHashes entry value must be a byte-array"
+                        .to_string()
+                })?;
+            pin[i] = byte;
+        }
         out.push(pin);
     }
     Ok(out)
@@ -1123,14 +1331,24 @@ async fn run_connect(
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    let idle_timeout_ms = opts
+        .get("limits")
+        .and_then(|l| l.get("idleTimeoutMs")?.as_u64())
+        .unwrap_or(DEFAULT_CLIENT_IDLE_TIMEOUT_MS);
+    // Keep-alive interval defaults to idle/3 so a live-but-quiet connection
+    // survives (up to two lost pings) while a dead path still times out.
+    let keep_alive_interval_ms = opts
+        .get("limits")
+        .and_then(|l| l.get("keepAliveIntervalMs")?.as_u64())
+        .unwrap_or(idle_timeout_ms / 3);
     let congestion_control = parse_congestion_control(&opts).map_err(std::io::Error::other)?;
 
     let (connect_url, custom_resolver) =
         connect_url_and_resolver(url, server_name).map_err(std::io::Error::other)?;
 
     let id = format!(
-        "client-{}",
-        CLIENT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        "client-{:016x}",
+        CLIENT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed) ^ *CLIENT_SESSION_ID_SEED
     );
 
     if allow_pooling {
@@ -1158,6 +1376,8 @@ async fn run_connect(
                 ca_pem_owned.as_deref(),
                 pinned_hashes_clone.as_slice(),
                 congestion_control,
+                idle_timeout_ms,
+                keep_alive_interval_ms,
             )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
@@ -1185,6 +1405,8 @@ async fn run_connect(
         ca_pem,
         pinned_hashes.as_slice(),
         congestion_control,
+        idle_timeout_ms,
+        keep_alive_interval_ms,
     )?;
 
     if let Some(resolver) = custom_resolver {
@@ -1210,10 +1432,41 @@ async fn run_connect(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_root_cert_store, congestion_controller_label, parse_client_limits,
-        parse_congestion_control, CongestionControlMode,
+        build_client_tls_config, build_quic_transport_config, build_root_cert_store,
+        congestion_controller_label, handle_connect_callback_status, insert_registry_entry,
+        parse_client_limits, parse_congestion_control, remove_registry_entry, ClientMetrics,
+        ClientSessionHandle, CongestionControlMode, CLIENT_HANDLE_REGISTRY,
     };
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
+
+    // serverCertificateHashes replaces PKI chain validation, so its verifier
+    // must build even when the platform root store is empty. Handshake
+    // signatures are still verified directly by the explicit ring provider.
+    #[test]
+    fn pinned_hash_tls_config_builds_without_default_provider() {
+        let root_store = std::sync::Arc::new(rustls::RootCertStore::empty());
+        let cfg = build_client_tls_config(root_store, false, &[[0u8; 32]])
+            .expect("pinned-hash TLS config must build without a provider panic");
+        assert!(!cfg.alpn_protocols.is_empty());
+    }
+
+    // Liveness config must be panic-safe across the full input range, including
+    // the out-of-range fallback (an idle timeout larger than the varint bound).
+    #[test]
+    fn build_quic_transport_config_is_panic_safe() {
+        // Normal: 30s idle, 10s keep-alive.
+        let _ = build_quic_transport_config(CongestionControlMode::Default, 30_000, 10_000);
+        // Opt-out: unbounded idle, no keep-alive.
+        let _ = build_quic_transport_config(CongestionControlMode::Throughput, 0, 0);
+        // Out-of-range idle must fall back to no timeout, not panic.
+        let _ = build_quic_transport_config(CongestionControlMode::LowLatency, u64::MAX, u64::MAX);
+        // Keep-alive with no idle bound is ignored (guarded).
+        let _ = build_quic_transport_config(CongestionControlMode::Default, 0, 5_000);
+    }
 
     #[test]
     fn build_root_cert_store_rejects_parseable_but_unaccepted_cert() {
@@ -1259,5 +1512,96 @@ mod tests {
         let default_mode = parse_congestion_control(&json!({})).expect("default should parse");
         assert_eq!(default_mode, CongestionControlMode::Default);
         assert_eq!(congestion_controller_label(default_mode), "cubic");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivery_failure_removes_registry_entry_and_signals_close() {
+        let handle_id = "delivery-failure-client".to_string();
+        let (dgram_send_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
+        let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(1);
+        let (close_tx, mut close_rx) = watch::channel((0u32, String::new()));
+        let closed_flag = Arc::new(AtomicBool::new(false));
+        let handle = ClientSessionHandle {
+            id: handle_id.clone(),
+            peer_ip: "127.0.0.1".to_string(),
+            peer_port: 4433,
+            dgram_send_tx: Some(dgram_send_tx),
+            dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+            datagram_budget_bytes: 1024,
+            backpressure_timeout_ms: 50,
+            max_datagram_size: 1200,
+            stream_open_bi_tx: Some(open_bi_tx),
+            stream_open_uni_tx: Some(open_uni_tx),
+            stream_accept_bi_tx: Some(accept_bi_tx),
+            stream_accept_uni_tx: Some(accept_uni_tx),
+            close_tx: Some(Arc::new(close_tx)),
+            client_metrics: Arc::new(ClientMetrics::default()),
+            closed: Arc::clone(&closed_flag),
+            conn: None,
+        };
+        let insertion = insert_registry_entry(&CLIENT_HANDLE_REGISTRY, handle);
+        assert!(!insertion.poison_recovered);
+
+        handle_connect_callback_status(Some(&handle_id), napi::Status::Closing);
+
+        assert!(closed_flag.load(Ordering::Relaxed));
+        assert!(CLIENT_HANDLE_REGISTRY
+            .lock()
+            .expect("registry lock")
+            .get(&handle_id)
+            .is_none());
+        close_rx.changed().await.expect("close signal");
+        let (code, reason) = close_rx.borrow().clone();
+        assert_eq!(code, 0);
+        assert!(reason.contains("E_INTERNAL: connect callback delivery failed"));
+        assert!(reason.contains("Closing"));
+    }
+
+    #[test]
+    fn remove_registry_entry_recovers_poison_and_removes_entry() {
+        let local_registry = Mutex::new(HashMap::<String, ClientSessionHandle>::new());
+        let handle_id = "poisoned-entry".to_string();
+        let (dgram_send_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
+        let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
+        let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
+        let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = watch::channel((0u32, String::new()));
+        local_registry.lock().expect("seed local registry").insert(
+            handle_id.clone(),
+            ClientSessionHandle {
+                id: handle_id.clone(),
+                peer_ip: "127.0.0.1".to_string(),
+                peer_port: 4433,
+                dgram_send_tx: Some(dgram_send_tx),
+                dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+                datagram_budget_bytes: 1024,
+                backpressure_timeout_ms: 50,
+                max_datagram_size: 1200,
+                stream_open_bi_tx: Some(open_bi_tx),
+                stream_open_uni_tx: Some(open_uni_tx),
+                stream_accept_bi_tx: Some(accept_bi_tx),
+                stream_accept_uni_tx: Some(accept_uni_tx),
+                close_tx: Some(Arc::new(close_tx)),
+                client_metrics: Arc::new(ClientMetrics::default()),
+                closed: Arc::new(AtomicBool::new(false)),
+                conn: None,
+            },
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = local_registry.lock().expect("lock local registry");
+            panic!("poison local registry");
+        });
+
+        let removal = remove_registry_entry(&local_registry, &handle_id);
+        assert!(removal.poison_recovered);
+        assert!(removal.value.is_some());
+        let remaining = local_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(remaining.get(&handle_id).is_none());
     }
 }

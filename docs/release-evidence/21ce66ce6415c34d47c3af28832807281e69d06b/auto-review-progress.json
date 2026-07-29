@@ -1,0 +1,46 @@
+{
+  "round": 2,
+  "headAtReview": "21ce66c",
+  "note": "Product fixes landed on dirty tree atop 21ce66c; candidate rebind / claim pass still separate.",
+  "status": "CLOSED_FINDINGS",
+  "verification": {
+    "cargoTestWasm": "145 passed",
+    "focusedBunTests": "wasm-0rtt + wasm-qpack-options + wasm-multi-session + wasm-limits green",
+    "chromiumWasmInterop": "5/5 passed",
+    "docTruth": "passed",
+    "packageArtifactCheck": "passed (eventWireVersion 2)"
+  },
+  "lanes": {
+    "1": "READY after SEC-04 occupied=unlatched+active fix",
+    "2": "READY (native N/A)",
+    "3": "READY after extra-CONNECT FIN path + admission occupied fix",
+    "4": "READY",
+    "5": "READY — remaining open items invalidated (stale/out-of-scope/rebind)",
+    "6": "READY — claim-drift fixed in release-status/OPERATIONS; f64/TESTPLAN follow-ons invalidated",
+    "7": "READY — stale QPACK notes fixed; chromium rebind notes are claim-pass follow-on",
+    "8": "READY"
+  },
+  "fixedThisRound": [
+    "L5/L8: NST flush + shared ClientConfig → has0Rtt===true shared-store reconnect",
+    "L8: peer QPACK ICI→encoder KRC + indexed outbound CONNECT/status when capacity>0",
+    "L1 SEC-04: CONNECT admission (unlatched+active) + StreamOpen + early RESET",
+    "L3-P1: client established secondary CONNECT FIN/reset → SessionClosed",
+    "L6 P2: eventWireVersion:2 in PRODUCTION_BUILD (finalize + build-wasm.sh dist)",
+    "L7: wtSessionsActive + sessionClosedCount + honest QPACK/0-RTT claim notes"
+  ],
+  "invalidatedOrDeferred": [
+    "L5-P2-event-fuzz-stale: already updated earlier in branch",
+    "L5-P2-chromium-evidence / coverage-unrebound / fault-soak: candidate rebind follow-on (claims stay pending)",
+    "L5-P3-multisession-edges: covered by multi-session product test; further edges follow-on",
+    "L5-P3-unbounded-awaits: connectWasm already awaits ready",
+    "L6-P3-open-session-f64 / L6-P4-testplan: non-blocking packaging follow-ons",
+    "L7-P2-passed-claim-rebind-notes: separate evidence rebind gate, not a product defect in this fix range"
+  ],
+  "remainingP0P4": [],
+  "claimPass": {
+    "wasm-multi-session": "REJECT (rebind owed)",
+    "wasm-0rtt": "REJECT (rebind owed)",
+    "wasm-dynamic-qpack": "REJECT (rebind owed)",
+    "auto-review-zero-p0-p4": "CLOSABLE_FROM_FINDINGS"
+  }
+}

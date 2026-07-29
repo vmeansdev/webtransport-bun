@@ -5,35 +5,14 @@
 
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
+import {
+	forEachWithTimeout,
+	nextWithTimeout,
+	waitFor,
+} from "./helpers/harness.js";
 import { nextPort as allocatePort } from "./helpers/network.js";
 
 const BASE_PORT = 14600;
-
-async function waitUntil(
-	condition: () => boolean,
-	timeoutMs: number,
-	intervalMs = 25,
-): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (condition()) return true;
-		await Bun.sleep(intervalMs);
-	}
-	return condition();
-}
-
-async function readDatagramWithTimeout(
-	iter: AsyncIterator<Uint8Array>,
-	timeoutMs: number,
-): Promise<IteratorResult<Uint8Array>> {
-	return (await Promise.race([
-		iter.next(),
-		Bun.sleep(timeoutMs).then(() => ({
-			done: true as const,
-			value: undefined,
-		})),
-	])) as IteratorResult<Uint8Array>;
-}
 
 async function connectWithRetry(
 	url: string,
@@ -64,15 +43,25 @@ describe("acceptance (Task gates)", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-						datagramsEchoed++;
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"acceptance sustained traffic incoming datagram",
+						async (d) => {
+							await s.sendDatagram(d);
+							datagramsEchoed++;
+						},
+					);
 				})().catch(() => {});
 				void (async () => {
-					for await (const _ of s.incomingBidirectionalStreams) {
-						streamsAccepted++;
-					}
+					await forEachWithTimeout(
+						s.incomingBidirectionalStreams,
+						5000,
+						"acceptance sustained traffic incoming bidi",
+						async () => {
+							streamsAccepted++;
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -95,15 +84,29 @@ describe("acceptance (Task gates)", () => {
 			let received = 0;
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
 			while (received < 10) {
-				const next = await readDatagramWithTimeout(iter, 1200);
+				const next = await nextWithTimeout(
+					iter,
+					1200,
+					"acceptance sustained traffic echoed datagram",
+				);
 				if (next.done) break;
 				received++;
 			}
 			expect(received).toBe(10);
-			const streamsSeen = await waitUntil(() => streamsAccepted >= 5, 3000);
-			const datagramsSeen = await waitUntil(() => datagramsEchoed >= 10, 3000);
-			expect(streamsSeen).toBe(true);
-			expect(datagramsSeen).toBe(true);
+			await waitFor(
+				() => streamsAccepted,
+				(count) => count >= 5,
+				3000,
+				25,
+				"acceptance sustained traffic streams accepted",
+			);
+			await waitFor(
+				() => datagramsEchoed,
+				(count) => count >= 10,
+				3000,
+				25,
+				"acceptance sustained traffic datagrams echoed",
+			);
 			expect(streamsAccepted).toBe(5);
 			expect(datagramsEchoed).toBeGreaterThanOrEqual(10);
 		} finally {
@@ -119,9 +122,14 @@ describe("acceptance (Task gates)", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"acceptance metrics incoming datagram",
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -132,11 +140,13 @@ describe("acceptance (Task gates)", () => {
 			});
 			await client.sendDatagram(new Uint8Array([1, 2, 3]));
 
-			const observed = await waitUntil(() => {
-				const m = server.metricsSnapshot();
-				return m.datagramsIn >= 1;
-			}, 3000);
-			expect(observed).toBe(true);
+			await waitFor(
+				() => server.metricsSnapshot().datagramsIn,
+				(count) => count >= 1,
+				3000,
+				25,
+				"acceptance metrics datagrams in",
+			);
 
 			const metrics = server.metricsSnapshot();
 			expect(metrics).toBeDefined();
@@ -176,9 +186,14 @@ describe("acceptance (Task gates)", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"acceptance moderate load incoming datagram",
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -193,11 +208,13 @@ describe("acceptance (Task gates)", () => {
 					),
 				);
 			}
-			const allSessionsVisible = await waitUntil(() => {
-				const metrics = server.metricsSnapshot();
-				return metrics.sessionsActive >= 4;
-			}, 8000);
-			expect(allSessionsVisible).toBe(true);
+			await waitFor(
+				() => server.metricsSnapshot().sessionsActive,
+				(count) => count >= 4,
+				8000,
+				25,
+				"acceptance moderate load sessions visible",
+			);
 
 			await Promise.all(
 				clients.flatMap((c) =>
@@ -219,9 +236,14 @@ describe("acceptance (Task gates)", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"acceptance histogram incoming datagram",
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					);
 				})().catch(() => {});
 				void (async () => {
 					const stream = await s.createBidirectionalStream();
@@ -237,15 +259,20 @@ describe("acceptance (Task gates)", () => {
 			});
 			await client.sendDatagram(new Uint8Array([1, 2, 3]));
 			const dgIter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const dgNext = await readDatagramWithTimeout(dgIter, 1500);
+			const dgNext = await nextWithTimeout(
+				dgIter,
+				1500,
+				"acceptance histogram echoed datagram",
+			);
 			expect(dgNext.done).toBe(false);
 			const iter = client
 				.incomingBidirectionalStreams()
 				[Symbol.asyncIterator]();
-			const streamNext = (await Promise.race([
-				iter.next(),
-				Bun.sleep(2000).then(() => ({ done: true as const, value: undefined })),
-			])) as IteratorResult<unknown>;
+			const streamNext = await nextWithTimeout(
+				iter,
+				2000,
+				"acceptance histogram incoming bidi",
+			);
 			expect(streamNext.done).toBe(false);
 			await Bun.sleep(500);
 

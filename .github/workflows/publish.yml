@@ -1,86 +1,212 @@
 name: publish
 on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to publish (example: v0.3.0)"
+      release_run_id:
+        description: "Exact successful release workflow run ID to retry"
         required: true
         type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-release-run-${{ github.event.workflow_run.id || inputs.release_run_id }}
+  cancel-in-progress: false
+
 jobs:
   publish:
+    name: Publish immutable release-run artifact to npm
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    timeout-minutes: 25
+    environment: npm-publish
     permissions:
+      actions: read
       contents: read
+      id-token: write
+    env:
+      RELEASE_RUN_ID: ${{ github.event.workflow_run.id || inputs.release_run_id }}
+      EXPECTED_REPOSITORY: vmeansdev/webtransport-bun
+      EXPECTED_PUBLISH_WORKFLOW: .github/workflows/publish.yml
+      EXPECTED_RELEASE_WORKFLOW: .github/workflows/release.yml
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: refs/tags/${{ inputs.tag }}
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.9"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: "https://registry.npmjs.org"
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      - name: Download release prebuild assets
+      - name: Verify publish workflow and release-run identity
+        id: release-run
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p packages/webtransport/prebuilds
-          gh release download "${{ inputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "webtransport-native.*.node" \
-            --pattern "SHA256SUMS" \
-            --dir packages/webtransport/prebuilds
-      - name: Verify prebuild checksums
-        run: |
-          cd packages/webtransport/prebuilds
-          shasum -a 256 -c SHA256SUMS
-      - name: Verify release tag matches package version
-        run: |
-          PKG_VERSION="$(node -p "require('./packages/webtransport/package.json').version")"
-          EXPECTED_TAG="v${PKG_VERSION}"
-          if [ "${{ inputs.tag }}" != "${EXPECTED_TAG}" ]; then
-            echo "::error::Input tag (${{ inputs.tag }}) does not match package version tag (${EXPECTED_TAG})."
-            exit 1
-          fi
-      - name: Build package dist
-        run: |
-          cd packages/webtransport
-          npm run clean
-          npm run build
-          test -f dist/index.js
-          test -f dist/index.d.ts
-      - name: Verify package tarball (no scripts)
-        run: |
-          cd packages/webtransport
-          npm pack --dry-run --ignore-scripts
-      - name: Preflight npm auth, ownership, and version availability
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          REG="https://registry.npmjs.org"
-          PKG="@webtransport-bun/webtransport"
-          PKG_VERSION="$(node -p "require('./packages/webtransport/package.json').version")"
-
-          WHOAMI="$(npm whoami --registry="$REG")"
-          echo "Authenticated to npm as: $WHOAMI"
-
-          npm owner ls "$PKG" --registry="$REG" > /tmp/npm_owners.txt
-          if ! grep -Eq "^${WHOAMI}( |$)" /tmp/npm_owners.txt; then
-            echo "::error::npm user '$WHOAMI' is not listed as an owner of $PKG"
-            cat /tmp/npm_owners.txt
+          if [ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]; then
+            echo "::error::Refusing to publish from unexpected repository $GITHUB_REPOSITORY"
             exit 1
           fi
-
+          case "$GITHUB_WORKFLOW_REF" in
+            "$EXPECTED_REPOSITORY/$EXPECTED_PUBLISH_WORKFLOW"@*) ;;
+            *)
+              echo "::error::Unexpected publish workflow identity $GITHUB_WORKFLOW_REF"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::release_run_id must be numeric"
+            exit 1
+          fi
+          RUN_JSON="$RUNNER_TEMP/release-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" > "$RUN_JSON"
+          jq -e \
+            --argjson runId "$RELEASE_RUN_ID" \
+            --arg repository "$EXPECTED_REPOSITORY" \
+            --arg workflow "$EXPECTED_RELEASE_WORKFLOW" \
+            '.id == $runId and .event == "push" and .status == "completed" and .conclusion == "success" and .head_repository.full_name == $repository and ((.path == $workflow) or (.path | startswith($workflow + "@"))) and (.head_branch | test("^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.-]+)?$")) and (.head_sha | test("^[0-9a-f]{40}$")) and (.run_attempt >= 1)' \
+            "$RUN_JSON" >/dev/null || exit 1
+          echo "candidate_commit=$(jq -er '.head_sha' "$RUN_JSON")" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$(jq -er '.head_branch' "$RUN_JSON")" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$(jq -er '.run_attempt' "$RUN_JSON")" >> "$GITHUB_OUTPUT"
+      - name: Download exact release-run publish input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-publish-input-${{ steps.release-run.outputs.run_attempt }}
+          path: ${{ runner.temp }}/npm-publish-input
+          run-id: ${{ env.RELEASE_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Verify candidate identity and tarball digest
+        id: candidate
+        env:
+          EXPECTED_COMMIT: ${{ steps.release-run.outputs.candidate_commit }}
+          EXPECTED_TAG: ${{ steps.release-run.outputs.release_tag }}
+          EXPECTED_ATTEMPT: ${{ steps.release-run.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          INPUT_DIR="$RUNNER_TEMP/npm-publish-input"
+          IDENTITY="$INPUT_DIR/candidate-identity.json"
+          test -f "$IDENTITY"
+          mapfile -t TARBALLS < <(find "$INPUT_DIR" -maxdepth 1 -name '*.tgz' -type f -print)
+          if [ "${#TARBALLS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one downloaded tarball, found ${#TARBALLS[@]}"
+            exit 1
+          fi
+          TARBALL="${TARBALLS[0]}"
+          TARBALL_NAME="$(basename "$TARBALL")"
+          FILE_COUNT="$(find "$INPUT_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [ "$FILE_COUNT" -ne 2 ]; then
+            echo "::error::npm-publish-input must contain only candidate identity and one tarball"
+            exit 1
+          fi
+          jq -e \
+            --arg repository "$EXPECTED_REPOSITORY" \
+            --arg workflow "$EXPECTED_RELEASE_WORKFLOW" \
+            --argjson runId "$RELEASE_RUN_ID" \
+            --argjson attempt "$EXPECTED_ATTEMPT" \
+            --arg commit "$EXPECTED_COMMIT" \
+            --arg tag "$EXPECTED_TAG" \
+            --arg tarball "$TARBALL_NAME" \
+            '.schemaVersion == 1 and .repository == $repository and .workflowPath == $workflow and .releaseRunId == $runId and .releaseRunAttempt == $attempt and .candidateCommit == $commit and .tag == $tag and .tarball == $tarball and (.tarballSha256 | test("^[0-9a-f]{64}$"))' \
+            "$IDENTITY" >/dev/null || exit 1
+          EXPECTED_DIGEST="$(jq -er '.tarballSha256' "$IDENTITY")"
+          ACTUAL_DIGEST="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
+          if [ "$ACTUAL_DIGEST" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::Downloaded tarball digest does not match candidate identity"
+            exit 1
+          fi
+          echo "commit=$EXPECTED_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "tag=$EXPECTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "digest=$EXPECTED_DIGEST" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.candidate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.9"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
+        with:
+          deno-version: "2.9.3"
+      - name: Install exact npm CLI
+        run: npm install --global npm@11.18.0
+      - name: Verify checked-out tag and package identity
+        env:
+          CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
+          RELEASE_TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$CANDIDATE_COMMIT"
+          node - <<'NODE'
+          const pkg = require("./packages/webtransport/package.json");
+          if (pkg.name !== "@webtransport-bun/webtransport") {
+            throw new Error(`unexpected package identity: ${pkg.name}`);
+          }
+          if (pkg.repository?.url !== "git+https://github.com/vmeansdev/webtransport-bun.git") {
+            throw new Error(`unexpected package repository: ${pkg.repository?.url}`);
+          }
+          if (`v${pkg.version}` !== process.env.RELEASE_TAG) {
+            throw new Error(`package version ${pkg.version} does not match ${process.env.RELEASE_TAG}`);
+          }
+          NODE
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Smoke the exact release-run tarball
+        env:
+          TARBALL: ${{ steps.candidate.outputs.tarball }}
+        run: |
+          bun scripts/test-package-artifact.ts smoke "$TARBALL" \
+            --runtime bun \
+            --runtime node \
+            --runtime deno
+      - name: Verify registry identity and unpublished version
+        run: |
+          set -euo pipefail
+          REG="https://registry.npmjs.org/"
+          PKG="@webtransport-bun/webtransport"
+          PKG_VERSION="$(node -p "require('./packages/webtransport/package.json').version")"
+          npm config set registry "$REG"
+          if [ "$(npm config get registry)" != "$REG" ]; then
+            echo "::error::npm registry identity does not match $REG"
+            exit 1
+          fi
           if npm view "${PKG}@${PKG_VERSION}" version --registry="$REG" >/dev/null 2>&1; then
             echo "::error::Version ${PKG_VERSION} is already published for ${PKG}"
             exit 1
           fi
-      - name: Publish to npm
+      - name: Dry-run the exact tarball
+        env:
+          TARBALL: ${{ steps.candidate.outputs.tarball }}
+          BOUND_DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
-          cd packages/webtransport
-          npm publish --ignore-scripts --access public --registry=https://registry.npmjs.org/
+          set -euo pipefail
+          IDENTITY="$RUNNER_TEMP/npm-publish-input/candidate-identity.json"
+          EXPECTED_DIGEST="$(jq -er '.tarballSha256' "$IDENTITY")"
+          ACTUAL_DIGEST="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
+          if [ "$EXPECTED_DIGEST" != "$BOUND_DIGEST" ] || [ "$ACTUAL_DIGEST" != "$BOUND_DIGEST" ]; then
+            echo "::error::Tarball changed before npm dry-run"
+            exit 1
+          fi
+          npm publish "$TARBALL" --dry-run --ignore-scripts --access public --registry=https://registry.npmjs.org/
+      - name: Publish to npm with trusted publishing and provenance
+        env:
+          TARBALL: ${{ steps.candidate.outputs.tarball }}
+          BOUND_DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$RUNNER_TEMP/npm-publish-input/candidate-identity.json"
+          EXPECTED_DIGEST="$(jq -er '.tarballSha256' "$IDENTITY")"
+          ACTUAL_DIGEST="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
+          if [ "$EXPECTED_DIGEST" != "$BOUND_DIGEST" ] || [ "$ACTUAL_DIGEST" != "$BOUND_DIGEST" ]; then
+            echo "::error::Tarball changed before registry upload"
+            exit 1
+          fi
+          npm publish "$TARBALL" --ignore-scripts --access public --provenance --registry=https://registry.npmjs.org/

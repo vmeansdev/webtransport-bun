@@ -1,0 +1,18 @@
+{
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"claimId": "wasm-0rtt",
+	"createdAt": "2026-07-27T16:23:53.856077Z",
+	"status": "passed",
+	"notes": "Shared-store + TicketStoreHost hydrate/dump has0Rtt; warm OnceLock first assert soft.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"bun",
+		"test",
+		"packages/webtransport/test/wasm-0rtt.test.ts"
+	],
+	"startedAt": "2026-07-27T16:23:52.478913Z",
+	"endedAt": "2026-07-27T16:23:53.856077Z",
+	"durationMs": 1377,
+	"exitCode": 0,
+	"artifactSha256": "a80d0b0f42e92f629fbace1f68a610d81fb880fa00a99e38b4c7611e0d32e365"
+}

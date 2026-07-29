@@ -5,27 +5,14 @@
 
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
-import { withHarness } from "./helpers/harness.js";
+import {
+	forEachWithTimeout,
+	nextWithTimeout,
+	withHarness,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 14800;
-
-async function readDatagramWithTimeout(
-	iter: AsyncIterator<Uint8Array>,
-	timeoutMs: number,
-): Promise<Uint8Array> {
-	const next = (await Promise.race([
-		iter.next(),
-		Bun.sleep(timeoutMs).then(() => ({
-			done: true as const,
-			value: undefined,
-		})),
-	])) as IteratorResult<Uint8Array>;
-	if (next.done || next.value === undefined) {
-		throw new Error("timed out waiting for echoed datagram");
-	}
-	return next.value;
-}
 
 describe("adversarial transport (P3.2)", () => {
 	it("connection churn: rapid connect/disconnect does not panic, metrics drain", async () => {
@@ -101,14 +88,22 @@ describe("adversarial transport (P3.2)", () => {
 					limits: { maxSessions: 8, maxStreamsPerSessionBidi: 5 },
 					onSession: async (s) => {
 						void (async () => {
-							for await (const d of s.incomingDatagrams()) {
-								await s.sendDatagram(d);
-							}
+							await forEachWithTimeout(
+								s.incomingDatagrams(),
+								5000,
+								"adversarial mixed churn incoming datagram",
+								async (d) => {
+									await s.sendDatagram(d);
+								},
+							);
 						})().catch(() => {});
 						void (async () => {
-							for await (const _ of s.incomingBidirectionalStreams) {
-								/* no-op */
-							}
+							await forEachWithTimeout(
+								s.incomingBidirectionalStreams,
+								5000,
+								"adversarial mixed churn incoming bidi",
+								async () => undefined,
+							);
 						})().catch(() => {});
 					},
 				}),
@@ -146,9 +141,14 @@ describe("adversarial transport (P3.2)", () => {
 			limits: { maxDatagramSize: maxSize },
 			onSession: async (s) => {
 				void (async () => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"adversarial edge payload incoming datagram",
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					);
 				})().catch(() => {});
 			},
 		});
@@ -160,14 +160,28 @@ describe("adversarial transport (P3.2)", () => {
 
 			await client.sendDatagram(new Uint8Array(0));
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const r0 = await readDatagramWithTimeout(iter, 2000);
+			const r0 = await nextWithTimeout(
+				iter,
+				2000,
+				"adversarial edge payload empty datagram echo",
+			);
+			if (r0.done || r0.value === undefined) {
+				throw new Error("timed out waiting for echoed datagram");
+			}
 			expect(r0).toBeDefined();
-			expect(r0.length).toBe(0);
+			expect(r0.value.length).toBe(0);
 
 			await client.sendDatagram(new Uint8Array(maxSize).fill(0x41));
-			const r1 = await readDatagramWithTimeout(iter, 2000);
+			const r1 = await nextWithTimeout(
+				iter,
+				2000,
+				"adversarial edge payload max datagram echo",
+			);
+			if (r1.done || r1.value === undefined) {
+				throw new Error("timed out waiting for echoed datagram");
+			}
 			expect(r1).toBeDefined();
-			expect(r1.length).toBe(maxSize);
+			expect(r1.value.length).toBe(maxSize);
 		} finally {
 			client?.close();
 			await server.close();

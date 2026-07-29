@@ -6,16 +6,23 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
 `wasm32-unknown-unknown`.
 
 > **Cannot run outside Chromium.** Direct Sockets requires a Chromium
-> **Isolated Web App (IWA)** with the `direct-sockets` permission, behind a flag.
-> This demo is therefore not exercised by CI; it is a faithful reference.
+> **Isolated Web App (IWA)** with both the `direct-sockets` and
+> `cross-origin-isolated` permissions. The compatibility manifest retains
+> `direct-sockets-private` for Chromium through 150 and also declares Chrome
+> 151's replacement `local-network` and `loopback-network` policies. The
+> scheduled/dispatch `iwa.yml` job proves the same signed bundle with both the
+> pinned Playwright Chromium and the current Chrome Beta channel.
+> packages and installs this exact app; a normal page load is not accepted as
+> release evidence.
 
 ## What it shows
 
-- `serveOverUdp(...)` — a WebTransport server bound to a UDP port, echoing
-  datagrams and bidi streams, returning the `serverCertificateHashes` value.
+- `createServer(...)` (wasm/IWA plug-and-play) — a WebTransport server bound to
+  UDP via Direct Sockets, exercising datagrams, uni/bidi streams, RESET_STREAM,
+  STOP_SENDING, peer close, and eight reconnects.
 - `connectWasm(...)` — a WebTransport client over a connected `UDPSocket`.
-- `generateCert` / `serverCertificateHashes` — short-lived P-256 cert + the hash
-  a native browser client would pin.
+- Certificate rotation — a stale pin must fail and the new P-256 certificate
+  must complete a payload exchange.
 
 ## Build
 
@@ -36,27 +43,30 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
      --target browser --format esm
    ```
 
-3. Package the directory as a Signed Web Bundle (`.swbn`) for an IWA, using
+3. Package the directory as an unsigned developer Web Bundle (`.wbn`) and a
+   Signed Web Bundle (`.swbn`) release artifact, using
    Chromium's `wbn` + `wbn-sign` npm tooling:
 
    ```bash
-   # One-time: generate an Ed25519 signing key (KEEP IT PRIVATE — it defines
-   # the app's identity/origin).
-   openssl genpkey -algorithm Ed25519 -out iwa-signing.key.pem
+   # Generate the Ed25519 signing key OUTSIDE the app directory. It defines
+   # the app's identity/origin and must never be included in the web bundle.
+   mkdir -p ../../.release-evidence/iwa
+   openssl genpkey -algorithm Ed25519 -out /tmp/wt-iwa-signing.key.pem
 
-   # Bundle + sign this directory into an installable .swbn.
-   npm i -D wbn wbn-sign
-   npx wbn --dir . --output webtransport-wasm-iwa.wbn --formatVersion b2
+   # Bundle this directory, then sign the identical bytes for Chromium's
+   # automated developer-mode install and the auditable release artifact.
+   npm i --no-save --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1
+   npx wbn@0.0.9 --dir . --output /tmp/webtransport-wasm-iwa.wbn --formatVersion b2
    node -e '
      const { NodeCryptoSigningStrategy, IntegrityBlockSigner, WebBundleId } = require("wbn-sign");
      const crypto = require("node:crypto"), fs = require("node:fs");
-     const key = crypto.createPrivateKey(fs.readFileSync("iwa-signing.key.pem"));
+     const key = crypto.createPrivateKey(fs.readFileSync("/tmp/wt-iwa-signing.key.pem"));
      console.log("origin:", new WebBundleId(key).serializeWithIsolatedWebAppOrigin());
-     new IntegrityBlockSigner(fs.readFileSync("webtransport-wasm-iwa.wbn"),
+     new IntegrityBlockSigner(fs.readFileSync("/tmp/webtransport-wasm-iwa.wbn"),
        new WebBundleId(key).serialize(),
        [new NodeCryptoSigningStrategy(key)]
      ).sign().then(({ signedWebBundle }) =>
-       fs.writeFileSync("webtransport-wasm-iwa.swbn", signedWebBundle));
+       fs.writeFileSync("../../.release-evidence/iwa/webtransport-wasm-iwa.swbn", signedWebBundle));
    '
    ```
 
@@ -70,11 +80,14 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
    - `#enable-isolated-web-app-dev-mode`
    - `#restricted-api-origins` may be needed for Direct Sockets.
 2. Install the dev IWA: `chrome://web-app-internals` → "Install from bundle".
-3. Launch the app, click **Start server**, then **Connect client + echo**.
+3. Launch the app, click **Start server**, then **Run release proof**. The proof
+   is successful only after all functional operations, reconnects, and
+   certificate rotation pass.
 
 ## Files
 
-- `manifest.webmanifest` — IWA manifest declaring the `direct-sockets` permission.
+- `.well-known/manifest.webmanifest` — canonical IWA manifest granting Direct
+  Sockets only to its cross-origin-isolated self.
 - `index.html` — demo UI.
 - `app.js` — wiring against the wasm browser API.
 - `vendor/` — generated wasm glue + bundled package (created by the Build steps;
@@ -87,5 +100,7 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
   `crates/wasm` tests and `tools/interop/tests-wasm`).
 - Cross-origin browser clients connecting to this server with
   `serverCertificateHashes` is validated separately (see `tools/interop`).
-- The IWA install/signing flow itself is manual (Chromium flags + dev-mode
-  install) and not exercised by CI.
+- CI uses a fresh ephemeral signing key, installs the signed `.swbn` through
+  Chromium's developer-mode file switch, and binds the proof to both that
+  signed artifact and its unsigned source bundle. Both bundles, the origin,
+  and proof JSON are uploaded; the signing key is never bundled or uploaded.

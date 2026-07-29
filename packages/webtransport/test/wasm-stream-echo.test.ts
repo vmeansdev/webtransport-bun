@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import {
 	type WasmModule,
@@ -7,14 +5,13 @@ import {
 	type WasmSessionEvents,
 } from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 async function pair(
 	serverEvents: WasmSessionEvents,
@@ -66,7 +63,7 @@ describe("wasm WebTransport streams (P2)", () => {
 		);
 		serverRef = server;
 
-		const stream = client.openStream(conn, true);
+		const stream = client.openStream(conn, 0n, true);
 		expect(stream).toBeGreaterThanOrEqual(0);
 		client.streamWrite(stream, new TextEncoder().encode("hello-bidi"));
 
@@ -93,7 +90,7 @@ describe("wasm WebTransport streams (P2)", () => {
 			{},
 		);
 
-		const stream = client.openStream(conn, false);
+		const stream = client.openStream(conn, 0n, false);
 		expect(stream).toBeGreaterThanOrEqual(0);
 		client.streamWrite(stream, new TextEncoder().encode("uni-msg"));
 		client.streamFinish(stream);

@@ -1,24 +1,22 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import {
 	connectWasm,
 	connectWasmUnified,
 	createWasmServer,
-	WasmWebTransport,
 } from "../src/backend.js";
 import type { WasmModule } from "../src/backend-wasm.js";
 import { BunUdpTransport } from "../src/bun-udp.js";
 import type { WebTransportLike } from "../src/shared.js";
-import { nativeToWebTransportLike } from "../src/webtransport-like-native.js";
+import type { nativeToWebTransportLike } from "../src/webtransport-like-native.js";
+import type { wasmToWebTransportLike } from "../src/webtransport-like-wasm.js";
+import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
+import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
-const pkgPath = fileURLToPath(
-	new URL("../../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
-);
-const wasmAvailable = existsSync(pkgPath);
+// Soft-skip when pkg is absent (local `bun test packages/`). With
+// WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
 const wasm = wasmAvailable
-	? ((await import(pkgPath)) as unknown as WasmModule)
-	: (null as unknown as WasmModule);
+	? await loadWasmModule()
+	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -29,10 +27,15 @@ async function readFirst(
 	timeoutMs = 5000,
 ): Promise<Uint8Array | null> {
 	const reader = readable.getReader();
-	const deadline = Date.now() + timeoutMs;
 	try {
+		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
-			const { value, done } = await reader.read();
+			const remainingMs = Math.max(1, deadline - Date.now());
+			const { value, done } = await readWithTimeout(
+				reader,
+				remainingMs,
+				"first readable chunk",
+			);
 			if (done) return null;
 			if (value && value.length > 0) return value;
 		}
@@ -79,7 +82,11 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 			// Datagram echo.
 			const dgrams = client.incomingDatagrams()[Symbol.asyncIterator]();
 			await client.sendDatagram(enc.encode("udp-dg"));
-			const dgResult = await dgrams.next();
+			const dgResult = await nextWithTimeout(
+				dgrams,
+				5000,
+				"wasm datagram echo next",
+			);
 			expect(dgResult.done).toBe(false);
 			expect(dec.decode(dgResult.value)).toBe("udp-dg");
 
@@ -155,7 +162,11 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 			const reader = bidi.readable.getReader();
 			const deadline = Date.now() + 30_000;
 			while (total < SIZE && Date.now() < deadline) {
-				const { value, done } = await reader.read();
+				const { value, done } = await readWithTimeout(
+					reader,
+					Math.max(1, deadline - Date.now()),
+					"large wasm bidi payload read",
+				);
 				if (done) break;
 				if (value) {
 					received.push(value);
@@ -230,7 +241,11 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 			let closed = false;
 			const deadline = Date.now() + 15_000;
 			while (Date.now() < deadline) {
-				const { value, done } = await reader.read();
+				const { value, done } = await readWithTimeout(
+					reader,
+					Math.max(1, deadline - Date.now()),
+					"echo FIN close read",
+				);
 				if (done) {
 					closed = true;
 					break;
@@ -358,7 +373,11 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 			await writer.write(enc.encode("hello?"));
 
 			const reader = bidi.readable.getReader();
-			const pendingRead = reader.read().then(
+			const pendingRead = readWithTimeout(
+				reader,
+				20_000,
+				"wasm stream reader settles on connection close",
+			).then(
 				(r) => ({ settled: true as const, done: r.done, errored: false }),
 				() => ({ settled: true as const, done: true, errored: true }),
 			);
@@ -389,9 +408,10 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 describe("WebTransportLike type-level assignability", () => {
 	test("wasm impl and native adapter satisfy WebTransportLike", () => {
 		// Compile-time checks: these typecheck under `tsc --noEmit` (the real proof).
-		type WasmAssignable = WasmWebTransport extends WebTransportLike
-			? true
-			: never;
+		type WasmAssignable =
+			ReturnType<typeof wasmToWebTransportLike> extends WebTransportLike
+				? true
+				: never;
 		type NativeAssignable =
 			ReturnType<typeof nativeToWebTransportLike> extends WebTransportLike
 				? true
