@@ -45,8 +45,8 @@ export type WasmCreateServerOptions = {
 	/** Bind host. Default "127.0.0.1" (IWA loopback-friendly). */
 	host?: string;
 	/**
-	 * UDP port. Must be a concrete port (> 0). Ephemeral port 0 is rejected
-	 * because Direct Sockets bound localPort is not yet re-exported.
+	 * UDP port. Pass 0 for an OS-assigned ephemeral port; the real port is on
+	 * the returned server's `address.port`.
 	 */
 	port: number;
 	tls: WasmCreateServerTls;
@@ -288,10 +288,10 @@ class WasmWebTransportServerImpl implements WasmWebTransportServer {
 export async function createServer(
 	opts: WasmCreateServerOptions,
 ): Promise<WasmWebTransportServer> {
-	if (!Number.isInteger(opts.port) || opts.port <= 0 || opts.port > 65535) {
+	if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535) {
 		throw new WebTransportError(
 			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: port must be an integer in 1..65535 (ephemeral port 0 is unsupported on wasm Direct Sockets)",
+			"E_INVALID_ARGUMENT: port must be an integer in 0..65535 (0 selects an ephemeral port)",
 		);
 	}
 
@@ -378,7 +378,7 @@ export async function createServer(
 			);
 		}
 
-		return new WasmWebTransportServerImpl(manager, host, opts.port);
+		return new WasmWebTransportServerImpl(manager, host, started.localPort);
 	} catch (err) {
 		manager?.close();
 		throw err;
