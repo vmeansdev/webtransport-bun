@@ -1,0 +1,72 @@
+{
+	"id": "local-facade_parity_dual_backend-c7a1e78",
+	"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+	"claimId": "wasm-facade-parity",
+	"generatedAt": "2026-07-29",
+	"status": "passed",
+	"runner": "local-darwin-arm64",
+	"harness": "bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+	"what": "Fresh dual-backend run of all nine parity-*.test.ts suites at the rebound candidate. Supersedes local-facade_parity_dual_backend-11abb39, which recorded the same result at a pre-message-alignment commit that no longer exists after the history rewrite.",
+	"runs": [
+		{
+			"selector": "native",
+			"command": "bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+			"files": 9,
+			"tests": 67,
+			"pass": 67,
+			"fail": 0,
+			"skip": 0,
+			"expectCalls": 155,
+			"startedAt": "2026-07-29T17:15:21.485Z",
+			"endedAt": "2026-07-29T17:15:28.214Z",
+			"durationMs": 6728,
+			"exitCode": 0
+		},
+		{
+			"selector": "wasm",
+			"command": "WEBTRANSPORT_PARITY_BACKEND=wasm WEBTRANSPORT_REQUIRE_WASM=1 bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+			"files": 9,
+			"tests": 67,
+			"pass": 64,
+			"fail": 0,
+			"skip": 3,
+			"expectCalls": 139,
+			"startedAt": "2026-07-29T17:15:28.215Z",
+			"endedAt": "2026-07-29T17:15:29.203Z",
+			"durationMs": 987,
+			"exitCode": 0
+		}
+	],
+	"antiGaming": {
+		"requireWasmEnvSet": true,
+		"executedWasmTestCount": 64,
+		"stubTransportRemoved": "wasm construct() returns a real WasmWebTransport over a reserved live session; the previous { close(){} } cast is gone",
+		"getStatsBackedByTraffic": "bytesSent and bytesReceived asserted > 0 after echo (wasm-server-session-parity.test.ts)",
+		"streamCapsBehavioralOnWasm": "waitUntilAvailable stream-capacity test runs on both backends via a limit-configured harness; no soft-skip"
+	},
+	"wasmExclusions": [
+		{
+			"count": 3,
+			"kind": "test.skipIf",
+			"suite": "parity-compat",
+			"reason": "pre-existing native-only compat checks"
+		},
+		{
+			"kind": "in-test guard",
+			"reason": "connect-failure tests need a real unreachable UDP socket; the in-memory relay cannot address a dead peer"
+		},
+		{
+			"kind": "in-test guard",
+			"reason": "toWebTransport / connectWithRetry wrap a native ClientSession with no wasm equivalent"
+		},
+		{
+			"kind": "in-test guard",
+			"reason": "serverCertificateHashes algorithm/digest validation: wasm pins by live hash and never consumes those entries"
+		},
+		{
+			"kind": "in-test guard",
+			"reason": "pooled connects cannot verify this self-signed loopback server (pooling forbids hash pinning; wasm has no insecureSkipVerify). Wasm pooled reuse is covered behaviorally in wasm-parity-helpers.test.ts"
+		}
+	],
+	"notes": "caPem CA-root trust is end-to-end verified in the same tree: wasm-ca-trust.test.ts completes a handshake and echoes stream data between a server holding a CA-issued leaf and a client trusting only that CA, and a foreign CA is refused with E_TLS alert 48 (unknown_ca); the same chain is proven at the QUIC layer natively in spike_tests::loopback_handshake_over_ca_root_trust."
+}

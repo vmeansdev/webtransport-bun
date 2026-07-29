@@ -1,0 +1,18 @@
+{
+	"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+	"claimId": "wasm-multi-session",
+	"createdAt": "2026-07-29T17:15:45.934Z",
+	"status": "passed",
+	"notes": "Timed bun test wasm-multi-session against the wasm dist at the rebound candidate.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"bash",
+		"-c",
+		"WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-multi-session.test.ts"
+	],
+	"startedAt": "2026-07-29T17:15:45.792Z",
+	"endedAt": "2026-07-29T17:15:45.934Z",
+	"durationMs": 142,
+	"exitCode": 0,
+	"artifactSha256": "c214e37c2c3305969fb201fe4539109f286cddf2644bb22e9f63a19953b4dd77"
+}
