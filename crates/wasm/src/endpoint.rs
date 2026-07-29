@@ -524,6 +524,9 @@ fn tls_alert_error(reason: &quinn_proto::ConnectionError) -> Option<String> {
     const CRYPTO_ERROR: std::ops::Range<u64> = 0x100..0x200;
     let code = match reason {
         quinn_proto::ConnectionError::TransportError(error) => u64::from(error.code),
+        // Covered end-to-end only (the peer rejecting our cert): quinn's
+        // `frame::ConnectionClose` is not publicly constructible, so this arm
+        // cannot be reached from a unit test.
         quinn_proto::ConnectionError::ConnectionClosed(close) => u64::from(close.error_code),
         _ => return None,
     };
