@@ -490,6 +490,7 @@ mod tests {
             false,
             true,  // enable_0rtt
             false, // allow_early_session
+            0,     // qpack_max_table_capacity (static-only)
             3,
         )
         .expect("0-RTT server start");

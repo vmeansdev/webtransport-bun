@@ -47,6 +47,7 @@ pub(crate) fn spawn_server_instance(
     debug: bool,
     enable_0rtt: bool,
     allow_early_session: bool,
+    qpack_max_table_capacity: u64,
     max_retries: usize,
 ) -> std::result::Result<(watch::Sender<()>, u16), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -73,6 +74,7 @@ pub(crate) fn spawn_server_instance(
             debug,
             enable_0rtt,
             allow_early_session,
+            qpack_max_table_capacity,
             startup_tx,
         );
 
@@ -166,6 +168,7 @@ mod tests {
             false,
             false,
             false,
+            0,
             3,
         )
         .expect("server should start");
@@ -209,6 +212,7 @@ mod tests {
             false,
             false,
             false,
+            0,
             1,
         )
         .expect_err("port held by UDP socket should fail QUIC bind");
@@ -237,6 +241,7 @@ mod tests {
             false,
             false,
             false,
+            0,
             2,
         )
         .expect_err("held port must fail after retry");
@@ -262,6 +267,7 @@ mod tests {
             false,
             false,
             false,
+            0,
             0,
         )
         .expect_err("zero retries must fail without attempting bind");
