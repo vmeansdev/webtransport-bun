@@ -5,12 +5,13 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { toWebTransport } from "../src/index.js";
-import { collectWithTimeout } from "./helpers/harness.js";
+import { collectWithTimeout, withTimeout } from "./helpers/harness.js";
 import { connectWithRetry } from "./helpers/network.js";
 import {
 	createParityHarness,
 	isWasmParityBackend,
 	type ParityHarness,
+	type ParityServerSession,
 	skipWasmParityIfUnavailable,
 	wasmParityReady,
 } from "./helpers/parity-backend.js";
@@ -19,9 +20,12 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 	"parity facade lifecycle (P1)",
 	() => {
 		let harness: ParityHarness;
+		let onServerSession: (session: ParityServerSession) => void = () => {};
 
 		beforeAll(async () => {
-			harness = await createParityHarness({ onSession: () => {} });
+			harness = await createParityHarness({
+				onSession: (session) => onServerSession(session),
+			});
 		});
 
 		afterAll(async () => {
@@ -50,6 +54,67 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			const drainElapsed = Date.now() - drainStart;
 			expect(drainElapsed).toBeLessThan(500); // draining should resolve promptly when close() is called
 			await wt.closed;
+		});
+
+		test("draining resolves on a peer drain, and the session stays usable", async () => {
+			// The local-close test above cannot tell a wire-driven `draining` from
+			// one the facade resolved itself. Here nothing closes: the server sends
+			// a WT_DRAIN_SESSION capsule and the session must keep working, which
+			// only the real signal can produce.
+			// `open()` retries, so more than one server session can exist; a
+			// token round-trip identifies the one actually backing this client.
+			const token = `drain-${Math.random().toString(36).slice(2)}`;
+			let server: ParityServerSession | undefined;
+			onServerSession = (session) => {
+				void (async () => {
+					const decoder = new TextDecoder();
+					for await (const d of session.incomingDatagrams()) {
+						if (decoder.decode(d) === token) {
+							server = session;
+							return;
+						}
+					}
+				})().catch(() => {});
+			};
+			try {
+				const wt = await harness.open();
+				await wt.ready;
+				const writer = wt.datagrams.writable.getWriter();
+				const deadline = Date.now() + 5000;
+				// Datagrams are unreliable; resend until the server has one.
+				while (!server && Date.now() < deadline) {
+					await writer.write(new TextEncoder().encode(token));
+					await new Promise((r) => setTimeout(r, 25));
+				}
+				writer.releaseLock();
+				expect(server).toBeDefined();
+
+				let closedEarly = false;
+				void wt.closed.then(
+					() => {
+						closedEarly = true;
+					},
+					() => {
+						closedEarly = true;
+					},
+				);
+
+				server?.drain();
+				await withTimeout(wt.draining, 5000, "parity peer drain");
+
+				// A drain is a warning, not an ending: the session must still be
+				// open and still able to carry a new stream.
+				expect(closedEarly).toBe(false);
+				const stream = await wt.createBidirectionalStream();
+				const streamWriter = stream.writable.getWriter();
+				await streamWriter.write(new Uint8Array([1, 2, 3]));
+				streamWriter.releaseLock();
+
+				wt.close();
+				await wt.closed;
+			} finally {
+				onServerSession = () => {};
+			}
 		});
 
 		test("createBidirectionalStream rejects with E_SESSION_CLOSED after close()", async () => {

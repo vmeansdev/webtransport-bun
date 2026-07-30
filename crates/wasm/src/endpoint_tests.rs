@@ -1784,10 +1784,10 @@ fn uni_push_stream_bytes_do_not_accumulate() {
     assert_eq!(buf_len, 0, "PUSH/unknown uni bytes must be discarded");
 }
 
-/// A graceful WT session end (CONNECT-stream FIN) emits exactly one Closed
-/// event, even though the QUIC connection was still alive.
+/// A graceful WT session end (CONNECT-stream FIN) on an established session
+/// emits exactly one SessionClosed and leaves the QUIC connection alive.
 #[test]
-fn connect_stream_end_emits_closed_once() {
+fn connect_stream_end_emits_session_closed_once() {
     use quinn_proto::{Dir, Side};
     let caddr: SocketAddr = CADDR.parse().unwrap();
     let saddr: SocketAddr = SADDR.parse().unwrap();
@@ -1803,17 +1803,27 @@ fn connect_stream_end_emits_closed_once() {
     };
     server.sessions.insert(h, sess);
 
-    // No live quinn conn, so the conn.close() is a no-op; the event path is
+    // No live quinn conn, so the stream teardown is a no-op; the event path is
     // what we assert.
-    server.close_session_on_connect_end(h);
-    server.close_session_on_connect_end(h); // idempotent
+    server.on_connect_stream_ended(h, sid, true);
+    server.on_connect_stream_ended(h, sid, true); // idempotent
 
     let closes = server
         .events
         .iter()
-        .filter(|e| matches!(e, WtEvent::ConnectionClosed { conn: 7, .. }))
+        .filter(|e| matches!(e, WtEvent::SessionClosed { conn: 7, .. }))
         .count();
-    assert_eq!(closes, 1, "exactly one Closed for a graceful session end");
+    assert_eq!(
+        closes, 1,
+        "exactly one SessionClosed for a graceful session end"
+    );
+    assert!(
+        !server
+            .events
+            .iter()
+            .any(|e| matches!(e, WtEvent::ConnectionClosed { .. })),
+        "a session close must not tear down the QUIC connection"
+    );
     assert!(server.sessions.get(&h).unwrap().connect_closed);
 }
 
@@ -2099,7 +2109,7 @@ fn decode_frame_header_ready_path_and_incomplete_splits() {
     assert!(matches!(
         decode_frame_header(&buf),
         FrameHdr::Ready {
-            is_headers: true,
+            ftype: h3::frame::HEADERS,
             total: _,
             header: _
         }
@@ -4631,8 +4641,133 @@ fn open_and_close_wt_session_live_multi_session() {
         }
     }
     assert!(secondary_closed || secondary.is_some());
-    // Primary close tears down QUIC.
+    // The primary session closes over its own CONNECT stream; the QUIC
+    // connection carrying it stays up.
     assert!(client.close_wt_session(cid, 0, 0, b"primary"));
+    assert!(client.sessions.values().all(|s| s.connect_closed));
+}
+
+/// Closing the primary session writes a WT_CLOSE_SESSION capsule on the CONNECT
+/// stream: the peer learns the application code and reason, and the QUIC
+/// connection is never closed out from under sibling sessions.
+#[test]
+fn primary_session_close_conveys_code_and_reason_over_capsule() {
+    let (mut server, mut client, cid) = endpoints();
+    let mut established = false;
+    let mut closed: Option<(u32, String)> = None;
+    let mut server_conn_closed = false;
+
+    for _ in 0..800 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while let Some(ev) = server.poll_event() {
+            match ev {
+                WtEvent::SessionClosed { code, reason, .. } => closed = Some((code, reason)),
+                WtEvent::ConnectionClosed { .. } => server_conn_closed = true,
+                _ => {}
+            }
+        }
+        if established && closed.is_none() {
+            assert!(client.close_wt_session(cid, 0, 4001, b"bye now"));
+            established = false; // fire once
+        }
+        if closed.is_some() {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+
+    assert_eq!(
+        closed,
+        Some((4001, "bye now".to_string())),
+        "peer must observe the capsule's code and reason"
+    );
+    assert!(
+        !server_conn_closed,
+        "a session close must not close the QUIC connection"
+    );
+}
+
+/// WT_DRAIN_SESSION reaches the peer as SessionDraining and leaves the session
+/// usable: draining is advisory, not a close.
+#[test]
+fn drain_capsule_notifies_the_peer_without_closing_the_session() {
+    let (mut server, mut client, cid) = endpoints();
+    let mut established = false;
+    let mut drained = false;
+    let mut closed = false;
+
+    for _ in 0..800 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while let Some(ev) = server.poll_event() {
+            match ev {
+                WtEvent::SessionDraining { .. } => drained = true,
+                WtEvent::SessionClosed { .. } | WtEvent::ConnectionClosed { .. } => closed = true,
+                _ => {}
+            }
+        }
+        if established && !drained {
+            assert!(client.drain_wt_session(cid, 0));
+            established = false; // fire once
+        }
+        if drained {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+
+    assert!(drained, "peer must observe WT_DRAIN_SESSION");
+    assert!(!closed, "a drain must not close the session");
+    // Draining an unestablished session is refused rather than writing a
+    // capsule before the 2xx (§3.2).
+    assert!(!client.drain_wt_session(cid, 99));
+}
+
+/// A closed primary session stops being a demux target while its connection
+/// (and any sibling sessions) keep running, so late inbound streams naming it
+/// are rejected instead of routed onto a dead session.
+#[test]
+fn live_connect_streams_drops_a_closed_primary_but_keeps_extras() {
+    use quinn_proto::{Dir, Side};
+    let primary = StreamId::new(Side::Client, Dir::Bi, 0);
+    let extra = StreamId::new(Side::Client, Dir::Bi, 1);
+    let mut session = Session {
+        established: true,
+        connect_stream: Some(primary),
+        ..Session::default()
+    };
+    session.extra_sessions.insert(extra);
+    assert_eq!(
+        session.live_connect_streams().collect::<Vec<_>>(),
+        vec![primary, extra]
+    );
+
+    session.connect_closed = true;
+    assert_eq!(
+        session.live_connect_streams().collect::<Vec<_>>(),
+        vec![extra]
+    );
+    // The full set still names the primary: replies on that stream stay routable.
+    assert!(session.all_connect_streams().any(|s| s == primary));
 }
 
 #[test]
@@ -5173,6 +5308,54 @@ fn reject_wt_unknown_session_resets_live_connection_stream() {
         .contains_key(&wt));
 }
 
+/// §4.6: a WebTransport stream the receiver cannot associate with a session is
+/// rejected with WT_BUFFERED_STREAM_REJECTED, the same codepoint the native
+/// fork sends, so a sender sees one code from both backends.
+#[test]
+fn unassociated_wt_stream_is_rejected_with_buffered_stream_rejected() {
+    use quinn_proto::{Dir, Side, WriteError};
+    let (mut server, mut client, cid) = establish_pair(2);
+    let ch = *client.id_to_handle.get(&cid).expect("client handle");
+
+    // Open a raw uni stream naming a session the server has never seen.
+    let sid = {
+        let conn = client.conns.get_mut(&ch).expect("client conn");
+        let sid = conn.streams().open(Dir::Uni).expect("uni stream");
+        let mut header = Vec::new();
+        crate::varint::encode(h3::stream_type::WT_UNI, &mut header);
+        crate::varint::encode(999, &mut header);
+        conn.send_stream(sid).write(&header).expect("write header");
+        sid
+    };
+    assert_eq!(sid.dir(), Dir::Uni);
+    assert_eq!(sid.initiator(), Side::Client);
+
+    let mut stop_code = None;
+    for _ in 0..200 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+        if let Some(conn) = client.conns.get_mut(&ch) {
+            if let Err(WriteError::Stopped(code)) = conn.send_stream(sid).write(b"payload") {
+                stop_code = Some(code.into_inner());
+                break;
+            }
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+
+    assert_eq!(
+        stop_code,
+        Some(u64::from(crate::wt_error::WT_BUFFERED_STREAM_REJECTED)),
+        "sender must see WT_BUFFERED_STREAM_REJECTED"
+    );
+}
+
 #[test]
 fn handle_timeout_fires_quic_timer_and_pending_with_conn() {
     let (mut server, mut client, cid) = establish_pair(2);
@@ -5361,4 +5544,52 @@ fn endpoint_guard_decision_covers_all_arms() {
     assert_eq!(endpoint_guard_decision(true, false, false, false), 4);
     assert_eq!(endpoint_guard_decision(false, false, false, true), 5);
     assert_eq!(endpoint_guard_decision(false, false, false, false), 6);
+}
+
+/// §6 teardown must not reach for a stream half that does not exist. A
+/// unidirectional stream has only one, owned by whichever side opened it, and
+/// quinn-proto asserts on the other — which in wasm is an unreachable trap, not
+/// a catchable error. Closing a session that owns a self-opened uni stream
+/// (and one the peer opened) has to survive.
+#[test]
+fn closing_a_session_with_unidirectional_streams_does_not_trap() {
+    let (mut server, mut client, cid) = endpoints();
+    let mut established = false;
+
+    for _ in 0..800 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while server.poll_event().is_some() {}
+        if established {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(established, "session must establish");
+
+    // Send-only half locally, and let the peer's uni stream arrive so the
+    // recv-only case is covered on the client too.
+    assert!(client.open_stream(cid, 0, false) >= 0);
+    assert!(server.open_stream(cid, 0, false) >= 0);
+    for _ in 0..200 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+        if !a && !b {
+            break;
+        }
+    }
+
+    assert!(client.close_wt_session(cid, 0, 7, b"bye"));
+    assert!(server.close_wt_session(cid, 0, 7, b"bye"));
 }

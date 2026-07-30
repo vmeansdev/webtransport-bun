@@ -12,6 +12,20 @@ The API provides:
 
 All streams must use standard Node stream backpressure semantics (write() returns false + 'drain').
 
+## Protocol posture
+
+Both backends speak the draft-02/07 wire format, because that is what Chromium
+interoperates with and interop is the bar. Elements of draft-16 are adopted
+**additively, where they are free** — a session close now travels as a
+`WT_CLOSE_SESSION` capsule, drains as `WT_DRAIN_SESSION`, and stream error
+codes go through the §4.4 `WT_APPLICATION_ERROR` mapping. None of that changes
+the wire format Chromium sees, and all of it is verified against a real browser
+(`tools/interop/`).
+
+This is **not** a claim of draft-16 conformance. Full conformance is blocked
+upstream on `RESET_STREAM_AT`, which quinn does not implement; see
+`docs/PARITY_MATRIX.md` for what is and is not present on each backend.
+
 ## W3C facade parity status (current)
 Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-2026-02-04.md`).
 

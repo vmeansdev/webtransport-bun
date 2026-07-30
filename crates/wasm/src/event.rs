@@ -1,8 +1,9 @@
 //! Events surfaced from the bridge to JS, plus a compact wire form for poll_event.
 //!
-//! Wire version 2 (see `PRODUCTION_BUILD.json` `eventWireVersion`): session_id on
-//! session-scoped events and `SessionClosed` tag 9. Hosts should treat a mismatch
-//! as a build/packaging error (no runtime negotiation this round).
+//! Wire version 3 (see `PRODUCTION_BUILD.json` `eventWireVersion`): session_id on
+//! session-scoped events, `SessionClosed` tag 9 carrying the peer's close reason,
+//! and `SessionDraining` tag 10. Hosts should treat a mismatch as a
+//! build/packaging error (no runtime negotiation this round).
 use crate::varint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,12 +39,19 @@ pub enum WtEvent {
     /// The peer sent STOP_SENDING for our send half of a stream: further
     /// writes will fail. The recv half (if any) is unaffected.
     StreamStopped { conn: u32, stream: u32, code: u32 },
-    /// An extra (non-primary) WebTransport session closed; QUIC stays up.
+    /// A WebTransport session closed; the QUIC connection stays up. `reason` is
+    /// the peer's `WT_CLOSE_SESSION` reason (empty when it sent none, or when
+    /// the session ended without a capsule).
     SessionClosed {
         conn: u32,
         session_id: u64,
         code: u32,
+        reason: String,
     },
+    /// The peer sent `WT_DRAIN_SESSION`: it intends to close this session soon,
+    /// so no new streams or datagrams should be started. Existing transfers
+    /// continue until the session actually closes.
+    SessionDraining { conn: u32, session_id: u64 },
 }
 
 pub mod tag {
@@ -57,6 +65,7 @@ pub mod tag {
     pub const STREAM_RESET: u8 = 7;
     pub const STREAM_STOPPED: u8 = 8;
     pub const SESSION_CLOSED: u8 = 9;
+    pub const SESSION_DRAINING: u8 = 10;
 }
 
 impl WtEvent {
@@ -71,7 +80,8 @@ impl WtEvent {
             | WtEvent::StreamData { conn, .. }
             | WtEvent::StreamReset { conn, .. }
             | WtEvent::StreamStopped { conn, .. }
-            | WtEvent::SessionClosed { conn, .. } => *conn,
+            | WtEvent::SessionClosed { conn, .. }
+            | WtEvent::SessionDraining { conn, .. } => *conn,
         }
     }
 
@@ -153,11 +163,19 @@ impl WtEvent {
                 conn,
                 session_id,
                 code,
+                reason,
             } => {
                 out.push(tag::SESSION_CLOSED);
                 varint::encode(*conn as u64, &mut out);
                 varint::encode(*session_id, &mut out);
                 varint::encode(*code as u64, &mut out);
+                varint::encode(reason.len() as u64, &mut out);
+                out.extend_from_slice(reason.as_bytes());
+            }
+            WtEvent::SessionDraining { conn, session_id } => {
+                out.push(tag::SESSION_DRAINING);
+                varint::encode(*conn as u64, &mut out);
+                varint::encode(*session_id, &mut out);
             }
         }
         out
@@ -183,6 +201,7 @@ mod tests {
                 WtEvent::StreamReset { .. } => tag::STREAM_RESET,
                 WtEvent::StreamStopped { .. } => tag::STREAM_STOPPED,
                 WtEvent::SessionClosed { .. } => tag::SESSION_CLOSED,
+                WtEvent::SessionDraining { .. } => tag::SESSION_DRAINING,
             }
         );
         // Decode enough fields to prove layout (manual spot-check via re-encode equality).
@@ -253,6 +272,23 @@ mod tests {
                 conn: 9,
                 session_id: 16,
                 code: 0,
+                reason: String::new(),
+            },
+            None,
+        );
+        roundtrip(
+            WtEvent::SessionClosed {
+                conn: 9,
+                session_id: 16,
+                code: 42,
+                reason: "bye".to_string(),
+            },
+            None,
+        );
+        roundtrip(
+            WtEvent::SessionDraining {
+                conn: 10,
+                session_id: 4,
             },
             None,
         );

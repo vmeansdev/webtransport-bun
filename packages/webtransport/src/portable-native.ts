@@ -47,6 +47,7 @@ function toPortableSession(session: ServerSession): PortableServerSession {
 			>;
 		},
 		close: (info) => session.close(info),
+		drain: () => session.drain(),
 		sendDatagram: (data) => session.sendDatagram(data),
 		incomingDatagrams: () => session.incomingDatagrams(),
 		metricsSnapshot: () => session.metricsSnapshot(),

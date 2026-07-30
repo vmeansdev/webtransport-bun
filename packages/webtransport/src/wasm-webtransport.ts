@@ -590,6 +590,10 @@ export class WasmWebTransport {
 					uniController.error(err);
 				} catch {}
 			});
+		// The peer's WT_DRAIN_SESSION is the real wire signal. The close-based
+		// resolution stays as a fallback so a peer that never drains cannot
+		// leave a consumer awaiting `draining` forever.
+		session.draining.then(this.resolveDraining, this.resolveDraining);
 		this.closed.then(this.resolveDraining, this.resolveDraining);
 	}
 

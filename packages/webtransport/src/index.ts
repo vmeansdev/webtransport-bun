@@ -702,7 +702,21 @@ interface CommonSession {
 	readonly ready: Promise<void>;
 	readonly closed: Promise<CloseInfo>;
 
+	/**
+	 * Resolves when the peer says this session is going away — a received
+	 * `WT_DRAIN_SESSION` capsule or `GOAWAY`. The session stays usable: streams
+	 * already open keep working and new ones can still be opened. This is a
+	 * warning, not an ending; await `closed` for the ending.
+	 */
+	readonly draining: Promise<void>;
+
 	close(info?: CloseInfo): void;
+
+	/**
+	 * Tell the peer this session is going away soon, without ending it. Sends a
+	 * `WT_DRAIN_SESSION` capsule and returns immediately.
+	 */
+	drain(): void;
 
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
@@ -1054,6 +1068,9 @@ interface NativeSessionHandle {
 	has0Rtt?: boolean;
 	accepted0Rtt?: boolean;
 	handshakeConfirmed?: boolean;
+	/** Session drain (absent on older prebuilt addons). */
+	drain?: () => void;
+	waitDraining?: () => Promise<void>;
 }
 type NativeConnectSessionHandle = {
 	id: string;
@@ -1211,6 +1228,7 @@ class NativeServerSession implements ServerSession {
 	#requestedCloseInfo: CloseInfo | null = null;
 	#streamOpenWaitTimeoutMs: number;
 	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
+	#drainingPromise: Promise<void> | null = null;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
@@ -1273,12 +1291,32 @@ class NativeServerSession implements ServerSession {
 		return this.#closedPromise;
 	}
 
+	get draining(): Promise<void> {
+		// Raced against `closed` so a session that ends without the peer ever
+		// draining does not leave this pending forever. An older prebuilt addon
+		// has no waitDraining, in which case close is the only signal available.
+		this.#drainingPromise ??= Promise.race(
+			[
+				this.#nativeHandle.waitDraining?.(),
+				this.#closedPromise.then(
+					() => undefined,
+					() => undefined,
+				),
+			].filter((p): p is Promise<void> => p !== undefined),
+		);
+		return this.#drainingPromise;
+	}
+
 	close(info?: CloseInfo): void {
 		if (!this.#closed) {
 			this.#closed = true;
 			this.#requestedCloseInfo = normalizeCloseInfo(info);
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
+	}
+
+	drain(): void {
+		if (!this.#closed) this.#nativeHandle.drain?.();
 	}
 
 	async sendDatagram(data: Uint8Array): Promise<void> {
@@ -1657,6 +1695,7 @@ class NativeClientSession implements ClientSession {
 	#strictW3CErrors: boolean;
 	#streamOpenWaitTimeoutMs: number;
 	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
+	#drainingPromise: Promise<void> | null = null;
 
 	constructor(
 		nativeHandle: NativeSessionHandle,
@@ -1708,12 +1747,32 @@ class NativeClientSession implements ClientSession {
 		return this.#closedPromise;
 	}
 
+	get draining(): Promise<void> {
+		// Raced against `closed` so a session that ends without the peer ever
+		// draining does not leave this pending forever. An older prebuilt addon
+		// has no waitDraining, in which case close is the only signal available.
+		this.#drainingPromise ??= Promise.race(
+			[
+				this.#nativeHandle.waitDraining?.(),
+				this.#closedPromise.then(
+					() => undefined,
+					() => undefined,
+				),
+			].filter((p): p is Promise<void> => p !== undefined),
+		);
+		return this.#drainingPromise;
+	}
+
 	close(info?: CloseInfo): void {
 		if (!this.#closed) {
 			this.#closed = true;
 			this.#requestedCloseInfo = normalizeCloseInfo(info);
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
+	}
+
+	drain(): void {
+		if (!this.#closed) this.#nativeHandle.drain?.();
 	}
 
 	async sendDatagram(data: Uint8Array): Promise<void> {
@@ -2567,6 +2626,19 @@ export class WebTransport {
 		this.#closed.then(
 			() => this.#drainingResolve?.(),
 			() => this.#drainingResolve?.(),
+		);
+		// And it resolves on the real wire signal: a peer that sends
+		// WT_DRAIN_SESSION is saying the session is going away while leaving it
+		// usable, which is the case the two paths above cannot see. The close
+		// fallbacks stay — a peer that never drains must not hang consumers.
+		this.#sessionPromise.then(
+			(s) => {
+				s.draining.then(
+					() => this.#drainingResolve?.(),
+					() => this.#drainingResolve?.(),
+				);
+			},
+			() => {},
 		);
 	}
 

@@ -14,6 +14,7 @@ compile_error!(
      dist builds must omit --features dev-insecure"
 );
 
+pub mod capsule;
 pub mod cert;
 pub mod congestion;
 pub mod endpoint;
@@ -26,6 +27,7 @@ pub mod server_tls;
 pub mod ticket_store;
 pub mod varint;
 pub mod verify;
+pub mod wt_error;
 
 #[cfg(target_arch = "wasm32")]
 mod bridge;

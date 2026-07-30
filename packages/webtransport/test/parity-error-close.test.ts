@@ -15,6 +15,7 @@ import {
 	createParityHarness,
 	isWasmParityBackend,
 	type ParityHarness,
+	type ParityServerSession,
 	skipWasmParityIfUnavailable,
 	wasmParityReady,
 } from "./helpers/parity-backend.js";
@@ -23,9 +24,12 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 	"parity error and close mapping (P4)",
 	() => {
 		let harness: ParityHarness;
+		let onServerSession: (session: ParityServerSession) => void = () => {};
 
 		beforeAll(async () => {
-			harness = await createParityHarness({ onSession: () => {} });
+			harness = await createParityHarness({
+				onSession: (session) => onServerSession(session),
+			});
 		});
 
 		afterAll(async () => {
@@ -40,6 +44,47 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			expect(typeof info).toBe("object");
 			expect(info.closeCode).toBe(1000);
 			expect(info.reason).toBe("normal closure");
+		});
+
+		test("close code and reason cross the wire from the peer", async () => {
+			// The local-close test above proves only that the facade echoes what it
+			// was handed. This one proves the CLOSE_WEBTRANSPORT_SESSION capsule
+			// carries both fields: nothing on the client ever sees 4242 or the
+			// reason string, so they can only have arrived from the server.
+			// `open()` retries, so more than one server session can exist; a
+			// token round-trip identifies the one actually backing this client.
+			const token = `close-${Math.random().toString(36).slice(2)}`;
+			let server: ParityServerSession | undefined;
+			onServerSession = (session) => {
+				void (async () => {
+					const decoder = new TextDecoder();
+					for await (const d of session.incomingDatagrams()) {
+						if (decoder.decode(d) === token) {
+							server = session;
+							return;
+						}
+					}
+				})().catch(() => {});
+			};
+			try {
+				const wt = await harness.open();
+				await wt.ready;
+				const writer = wt.datagrams.writable.getWriter();
+				const deadline = Date.now() + 5000;
+				// Datagrams are unreliable; resend until the server has one.
+				while (!server && Date.now() < deadline) {
+					await writer.write(new TextEncoder().encode(token));
+					await new Promise((r) => setTimeout(r, 25));
+				}
+				writer.releaseLock();
+				expect(server).toBeDefined();
+				server?.close({ code: 4242, reason: "peer said so" });
+				const info = await wt.closed;
+				expect(info.closeCode).toBe(4242);
+				expect(info.reason).toBe("peer said so");
+			} finally {
+				onServerSession = () => {};
+			}
 		});
 
 		test("WebTransportError has code, message, source (spec-like shape)", () => {
