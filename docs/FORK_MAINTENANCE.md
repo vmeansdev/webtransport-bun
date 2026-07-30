@@ -91,6 +91,23 @@ Cadence: at minimum whenever upstream ships a correctness or security fix that
 touches the transport/H3/TLS paths, and opportunistically otherwise so the
 delta stays small and MR-able.
 
+## Known fork limitations (accepted, not yet fixed)
+
+- **Session-command channel can silently drop a terminal command under a
+  synchronous flood.** The driver's `session_commands` channel is a bounded
+  `mpsc::channel(4)`, and every producer (session close, drain, GOAWAY) enqueues
+  with `let _ = try_send(...)`. A JS caller issuing 4+ `drain()`/`goAway()` calls
+  in a tight synchronous loop can fill the channel faster than the driver task
+  drains it, after which a following `close(code, reason)` is dropped: the peer
+  never receives the `CLOSE_WEBTRANSPORT_SESSION` capsule and the connection
+  lingers to idle timeout, yet the local session state is already marked closed,
+  so JS reports a clean close. This predates the GOAWAY work (drain had the same
+  property); GOAWAY only added a second way to fill the queue. Not fixed because
+  the honest fixes are design changes (an unbounded channel, or priority delivery
+  for terminal commands) that do not belong in a bugfix commit. Reach it only
+  with an abnormal synchronous command flood; normal one-shot close/drain/goAway
+  is unaffected.
+
 ## MR-later intent
 
 The fork's feature commits are written to be proposable to upstream as they

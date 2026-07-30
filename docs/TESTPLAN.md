@@ -62,3 +62,19 @@ Canonical release truth: `docs/release-status.json`. The suites below are the ev
 - **Release gate**: Release job fails if parity-evidence or interop-evidence is missing.
 - **Auditability**: Evidence files are linkable from GitHub release Assets per release.
 - **Readiness**: `docs/release-status.json` is the canonical release-status manifest for native and wasm candidate surfaces.
+
+## Known load-sensitive flakes
+
+These pass in isolation and fail only intermittently under a loaded machine
+(e.g. concurrent cargo builds during a full-suite run). Re-run in isolation to
+confirm before treating a failure as a regression; none is a correctness defect
+in the code under test.
+
+- **`runtime-portability` › `withDeadline` timeout/clear** — global timer-spy
+  counts get polluted by concurrently-running test files.
+- **`tools/load` › descendant-held pipes / timeout+drain metadata** — passes
+  30/30 in isolation; full-suite-only.
+- **`hardening-regressions` › "Closed events survive a churn burst (>512
+  sessions)"** — opens >512 sessions and asserts closed-event delivery within a
+  handshake-timeout window; misses the window under CPU contention. No GOAWAY or
+  capsule path is involved. Observed intermittently 2026-07-30.
