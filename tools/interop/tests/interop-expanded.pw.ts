@@ -354,4 +354,84 @@ test.describe("P3.3 interop expansion", () => {
 
 		expect(result.ok).toBe(true);
 	});
+
+	test("stream reset code round-trips through the WT_APPLICATION_ERROR remap", async ({
+		page,
+	}) => {
+		await page.goto(resolveInteropHealthUrl());
+		const h = getCertHashBase64();
+		const interopOrigin = resolveInteropOrigin();
+
+		// A WebTransport application error code does not travel as itself: draft
+		// §4.4 maps it onto a reserved QUIC range on the way out and back on the
+		// way in. Chromium does that mapping independently of us, so a code that
+		// survives a server reset intact is proof both ends agree. 0x1e is the
+		// mapping's period, so a code just past a multiple of it lands right after
+		// one of the skipped reserved values — the arithmetic most likely to be
+		// wrong. 0x1e * 7 + 1 = 211.
+		const RESET_CODE = 211;
+
+		const result = await page.evaluate(
+			async ({ hash, url, code }) => {
+				const withTimeout = (
+					globalThis as typeof globalThis & {
+						__wtWithTimeout?: <T>(
+							promise: PromiseLike<T>,
+							timeoutMs: number,
+							label: string,
+						) => Promise<T>;
+					}
+				).__wtWithTimeout;
+				if (!withTimeout)
+					throw new Error("missing __wtWithTimeout init script");
+				const opts = hash
+					? {
+							serverCertificateHashes: [
+								{
+									algorithm: "sha-256" as const,
+									value: Uint8Array.from(atob(hash), (c) => c.charCodeAt(0)),
+								},
+							],
+						}
+					: {};
+				const wt = new WebTransport(url, opts);
+				await withTimeout(wt.ready, 5_000, "reset code ready");
+
+				const incoming = wt.incomingUnidirectionalStreams.getReader();
+				const w = wt.datagrams.writable.getWriter();
+				await w.write(new TextEncoder().encode(`__WT_RESET_${code}__`));
+				w.releaseLock();
+
+				const { value: stream } = await withTimeout(
+					incoming.read(),
+					5_000,
+					"reset code incoming uni",
+				);
+				if (!stream) return { errorName: null, streamErrorCode: null };
+
+				const reader = (stream as ReadableStream<Uint8Array>).getReader();
+				try {
+					// Drain until the reset surfaces as a read rejection.
+					for (;;) {
+						const { done } = await withTimeout(
+							reader.read(),
+							5_000,
+							"reset code read",
+						);
+						if (done) return { errorName: "closed", streamErrorCode: null };
+					}
+				} catch (e) {
+					const err = e as { name?: string; streamErrorCode?: number };
+					return {
+						errorName: err?.name ?? null,
+						streamErrorCode: err?.streamErrorCode ?? null,
+					};
+				}
+			},
+			{ hash: h, url: interopOrigin, code: RESET_CODE },
+		);
+
+		expect(result?.errorName).toBe("WebTransportError");
+		expect(result?.streamErrorCode).toBe(RESET_CODE);
+	});
 });
