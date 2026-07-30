@@ -302,13 +302,19 @@ impl DynamicTable {
         Some((e.name.as_str(), e.value.as_str()))
     }
 
-    /// Relative index w.r.t. Base (RFC 9204 §3.2.5): abs = Base - rel - 1.
+    /// Relative index w.r.t. Base (RFC 9204 §3.2.5).
+    ///
+    /// Relative index 0 is the entry inserted just before Base. The RFC numbers
+    /// absolute indexes from 0 and so writes this as `Base - rel - 1`; this table
+    /// numbers them from 1, which cancels the offset, leaving `abs = Base - rel`.
+    /// Post-base (`abs = Base + post + 1`) then covers exactly the entries with
+    /// `abs > Base`, so relative and post-base indexing agree with no gap.
     pub fn get_relative(&self, relative: u64, base: u64) -> Option<(&str, &str)> {
-        let abs = base.checked_sub(relative)?.checked_sub(1)?;
+        let abs = base.checked_sub(relative)?;
         self.get_absolute(abs)
     }
 
-    /// Post-base index (RFC 9204 §4.5.3): abs = Base + post + 1.
+    /// Post-base index (RFC 9204 §3.2.6): abs = Base + post + 1.
     pub fn get_post_base(&self, post: u64, base: u64) -> Option<(&str, &str)> {
         let abs = base.checked_add(post)?.checked_add(1)?;
         self.get_absolute(abs)
@@ -459,28 +465,28 @@ impl QpackEncoder {
     }
 
     /// Build a field section that references the newest dynamic entry (relative
-    /// index 0) with Base = insert_count + 1. Used by unit tests / optional
-    /// encoder paths when capacity > 0.
+    /// index 0) with Base = insert_count (RFC 9204 §4.5.1). Used by unit tests /
+    /// optional encoder paths when capacity > 0.
     pub fn encode_indexed_newest_section(&self) -> Option<Vec<u8>> {
         let insert_count = self.table.insert_count();
         if insert_count == 0 {
             return None;
         }
         let ric = insert_count;
-        let base = insert_count + 1;
+        let base = insert_count;
         let mut out = Vec::new();
         encode_field_section_prefix(ric, base, self.table.max_capacity(), &mut out)?;
-        // Indexed Field Line, dynamic (T=0), relative index 0.
+        // Indexed Field Line, dynamic (T=0), relative index 0 → abs = Base.
         qpack_int(0x80, 6, 0, &mut out);
         Some(out)
     }
 
-    /// Encode one Indexed Field Line for a dynamic absolute index (Base = insert_count+1).
+    /// Encode one Indexed Field Line for a dynamic absolute index (Base = insert_count).
     fn encode_dynamic_indexed(&self, abs: u64, base: u64, out: &mut Vec<u8>) -> Option<()> {
-        if abs >= base {
-            return None;
-        }
-        let rel = base - 1 - abs;
+        // The decoder resolves abs = Base - rel (1-based table), so rel = Base - abs.
+        // `checked_sub` rejects an entry newer than Base (which relative indexing
+        // cannot name — that is what post-base indexing is for).
+        let rel = base.checked_sub(abs)?;
         qpack_int(0x80, 6, rel, out);
         Some(())
     }
@@ -547,7 +553,7 @@ pub fn encode_connect_request_with(
 
     let insert_count = scratch.table.insert_count();
     let ric = insert_count;
-    let base = insert_count + 1;
+    let base = insert_count;
     let mut fields = Vec::new();
     encode_field_section_prefix(ric, base, scratch.table.max_capacity(), &mut fields)
         .ok_or(QpackError::Invalid)?;
@@ -594,7 +600,7 @@ pub fn encode_status_response_with(
     let status_abs = ensure_dynamic_entry(&mut scratch, ":status", status, &mut encoder_stream)?;
     let insert_count = scratch.table.insert_count();
     let ric = insert_count;
-    let base = insert_count + 1;
+    let base = insert_count;
     let mut fields = Vec::new();
     encode_field_section_prefix(ric, base, scratch.table.max_capacity(), &mut fields)
         .ok_or(QpackError::Invalid)?;
@@ -1714,10 +1720,11 @@ mod tests {
         let (hdrs2, _) = decode_field_section(&section2, &dec).unwrap();
         assert_eq!(hdrs2, vec![("n2".into(), "zz".into())]);
 
-        // Literal name-ref dynamic: base=2, relative 0 → abs 1 → n1.
+        // Literal name-ref dynamic: base=2, relative 1 → abs = 2-1 = 1 → n1.
+        // (Under the RFC-correct `abs = Base - rel`; relative 0 would name n2.)
         let mut section3 = Vec::new();
         encode_field_section_prefix(2, 2, 4096, &mut section3).unwrap();
-        qpack_int(0x40, 4, 0, &mut section3);
+        qpack_int(0x40, 4, 1, &mut section3);
         qpack_int(0x00, 7, 1, &mut section3);
         section3.push(b'x');
         let (hdrs3, _) = decode_field_section(&section3, &dec).unwrap();
@@ -1747,5 +1754,164 @@ mod tests {
         );
         assert_eq!(enc.table.insert_count(), before_ic);
         assert_eq!(enc.table.max_capacity(), before_cap);
+    }
+
+    /// RFC 9204 Appendix B — the normative encode/decode examples, driven byte
+    /// for byte through the real encoder-stream and field-section decoders.
+    ///
+    /// These vectors come from a *real RFC encoder*: the absolute indexes on the
+    /// wire assume the RFC's from-0 numbering, and the field sections mix
+    /// relative, post-base, and static references. They only decode to the RFC's
+    /// annotated header values if relative indexing resolves `abs = Base - rel`
+    /// (this table is 1-based, so the RFC's `Base - rel - 1` loses its `- 1`).
+    /// Under the previous off-by-one (`Base - rel - 1`) the B.4 §Stream 8 lines
+    /// resolve one entry too old — its `:authority` line decodes as
+    /// `custom-key=custom-value` — so this is a genuine discriminator, not a
+    /// symmetric round-trip. Advertised capacity is 220, per the examples.
+    #[test]
+    fn rfc9204_appendix_b_vectors() {
+        // B.1 — Literal Field Line with Name Reference (static only, no table).
+        // 0000 | RIC=0, Base=0 ; 51 0b "/index.html" | static idx 1 (:path).
+        let mut b1 = vec![0x00, 0x00, 0x51, 0x0b];
+        b1.extend_from_slice(b"/index.html");
+        assert_eq!(
+            decode_literal_headers(&b1).unwrap(),
+            vec![(":path".to_string(), "/index.html".to_string())]
+        );
+
+        // Decoder with the advertised 220-byte capacity from the examples.
+        let mut dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 220,
+            max_blocked_streams: 16,
+        });
+
+        // B.2 — Encoder stream: Set Capacity=220, then two Insert With Name
+        // Reference (static idx 0 :authority, idx 1 :path).
+        let mut enc_stream = vec![0x3f, 0xbd, 0x01, 0xc0, 0x0f];
+        enc_stream.extend_from_slice(b"www.example.com");
+        enc_stream.extend_from_slice(&[0xc1, 0x0c]);
+        enc_stream.extend_from_slice(b"/sample/path");
+        assert_eq!(
+            feed_encoder_stream(&mut dec, &enc_stream).unwrap(),
+            enc_stream.len()
+        );
+        assert_eq!(dec.table().insert_count(), 2);
+        // RFC abs 0/1 → this table's 1-based abs 1/2.
+        assert_eq!(
+            dec.table().get_absolute(1),
+            Some((":authority", "www.example.com"))
+        );
+        assert_eq!(dec.table().get_absolute(2), Some((":path", "/sample/path")));
+        assert_eq!(dec.table().size(), 106);
+
+        // B.2 — Stream 4 field section: RIC=2, Base=0, two post-base indexed
+        // lines (post 0 → abs 1, post 1 → abs 2). Exercises post-base indexing.
+        let b2_section = [0x03, 0x81, 0x10, 0x11];
+        let (b2_hdrs, b2_ric) = decode_field_section(&b2_section, &dec).unwrap();
+        assert_eq!(b2_ric, 2);
+        assert_eq!(
+            b2_hdrs,
+            vec![
+                (":authority".to_string(), "www.example.com".to_string()),
+                (":path".to_string(), "/sample/path".to_string()),
+            ]
+        );
+
+        // B.3 — Encoder stream: Insert With Literal Name (custom-key=custom-value).
+        let mut b3_stream = vec![0x4a];
+        b3_stream.extend_from_slice(b"custom-key");
+        b3_stream.push(0x0c);
+        b3_stream.extend_from_slice(b"custom-value");
+        assert_eq!(
+            feed_encoder_stream(&mut dec, &b3_stream).unwrap(),
+            b3_stream.len()
+        );
+        assert_eq!(dec.table().insert_count(), 3);
+        assert_eq!(
+            dec.table().get_absolute(3),
+            Some(("custom-key", "custom-value"))
+        );
+        assert_eq!(dec.table().size(), 160);
+
+        // B.4 — Encoder stream: Duplicate (relative index 2 → abs 0 → :authority).
+        assert_eq!(feed_encoder_stream(&mut dec, &[0x02]).unwrap(), 1);
+        assert_eq!(dec.table().insert_count(), 4);
+        assert_eq!(
+            dec.table().get_absolute(4),
+            Some((":authority", "www.example.com"))
+        );
+        assert_eq!(dec.table().size(), 217);
+
+        // B.4 — Stream 8 field section: RIC=4, Base=4. Dynamic relative 0 → abs 4
+        // (:authority), static idx 1 (:path=/), dynamic relative 1 → abs 3
+        // (custom-key). THE discriminator: the off-by-one decodes line 1 as
+        // custom-key=custom-value and line 3 as :path=/sample/path.
+        let b4_section = [0x05, 0x00, 0x80, 0xc1, 0x81];
+        let (b4_hdrs, b4_ric) = decode_field_section(&b4_section, &dec).unwrap();
+        assert_eq!(b4_ric, 4);
+        assert_eq!(
+            b4_hdrs,
+            vec![
+                (":authority".to_string(), "www.example.com".to_string()),
+                (":path".to_string(), "/".to_string()),
+                ("custom-key".to_string(), "custom-value".to_string()),
+            ]
+        );
+
+        // B.5 — Encoder stream: Insert With Name Reference (dynamic relative 1 →
+        // abs 2 custom-key), value custom-value2. Overflows 220 → evicts abs 1.
+        let mut b5_stream = vec![0x81, 0x0d];
+        b5_stream.extend_from_slice(b"custom-value2");
+        assert_eq!(
+            feed_encoder_stream(&mut dec, &b5_stream).unwrap(),
+            b5_stream.len()
+        );
+        assert_eq!(dec.table().insert_count(), 5);
+        assert_eq!(dec.table().get_absolute(1), None); // oldest evicted
+        assert_eq!(dec.table().get_absolute(2), Some((":path", "/sample/path")));
+        assert_eq!(
+            dec.table().get_absolute(5),
+            Some(("custom-key", "custom-value2"))
+        );
+        assert_eq!(dec.table().size(), 215);
+    }
+
+    /// wasm encode → wasm decode still round-trips after moving the emitted Base
+    /// to the RFC value (insert_count, not insert_count + 1). Also asserts the
+    /// field-section prefix now carries Delta Base = 0 (Base == RIC), the base a
+    /// conforming RFC peer emits when every reference is a relative index.
+    #[test]
+    fn wasm_dynamic_qpack_roundtrip_after_rfc_base() {
+        let mut enc = QpackEncoder::new(4096);
+        let mut dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 16,
+        });
+
+        let encoded = encode_connect_request_with(&mut enc, "example.com", "/chat").unwrap();
+        let n = feed_encoder_stream(&mut dec, &encoded.encoder_stream).unwrap();
+        assert_eq!(n, encoded.encoder_stream.len());
+
+        // Strip the H3 HEADERS frame wrapper.
+        let (ft, n0) = varint::decode(&encoded.headers_frame).unwrap();
+        assert_eq!(ft, frame::HEADERS);
+        let rest = &encoded.headers_frame[n0..];
+        let (len, n1) = varint::decode(rest).unwrap();
+        let section = &rest[n1..n1 + len as usize];
+
+        // Prefix: encoded RIC then Delta Base. S=0 and Delta Base=0 ⇔ Base=RIC.
+        let (_enc_ric, nr) = qpack_int_decode(section, 8).unwrap();
+        let (delta_base, _nb) = qpack_int_decode(&section[nr..], 7).unwrap();
+        assert_eq!(section[nr] & 0x80, 0, "S bit must be 0 (Base >= RIC)");
+        assert_eq!(delta_base, 0, "Base must equal RIC (insert_count)");
+
+        let (hdrs, ric) = decode_field_section(section, &dec).unwrap();
+        assert_eq!(ric, encoded.ric);
+        assert_eq!(ric, dec.table().insert_count());
+        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get(":method"), Some("CONNECT"));
+        assert_eq!(get(":protocol"), Some("webtransport"));
+        assert_eq!(get(":authority"), Some("example.com"));
+        assert_eq!(get(":path"), Some("/chat"));
     }
 }
