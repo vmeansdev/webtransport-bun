@@ -76,15 +76,15 @@ don't merge**:
 ```sh
 git remote add upstream https://github.com/BiagioFesta/wtransport   # once
 git fetch upstream
-git rebase upstream/master           # rebase feat/track1-conformance onto master
+git rebase upstream/master           # rebase feat/qpack-dynamic onto master
 ```
 
 Rebasing keeps the feature commits proposable upstream and keeps the branch a
 clean series. Before rebasing away the current tip, tag it so the pinned rev
 stays reachable (see above). After a rebase, run the fork's own test suite
-locally (`cargo test` in the fork, including `wtransport/tests/zero_rtt.rs` and
-`wtransport/tests/session_close.rs`) — webtransport-bun CI does **not** run the
-fork's suite.
+locally (`cargo test` in the fork, including `wtransport/tests/zero_rtt.rs`,
+`wtransport/tests/session_close.rs`, and `wtransport/tests/qpack_dynamic.rs`) —
+webtransport-bun CI does **not** run the fork's suite.
 
 Cadence: at minimum whenever upstream ships a correctness or security fix that
 touches the transport/H3/TLS paths, and opportunistically otherwise so the
