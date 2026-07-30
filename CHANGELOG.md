@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgraded `wtransport` from `=0.7.0` to `=0.7.1`, then switched both the native
   addon and the reference server from the crates.io release to a Git dependency
   on the `vmeansdev/wtransport` fork (branch `feat/qpack-dynamic`, which stacks
-  on `feat/track1-conformance`, pinned by rev `d3ff84d`, version
+  on `feat/track1-conformance`, pinned by rev `ac515b1`, version
   `0.7.1-zerortt-qpack.1`) via `[workspace.dependencies]`. The fork adds the
   0-RTT APIs upstream 0.7.1 lacked, the session lifecycle work above, and the
   dynamic QPACK decode + encoder machinery; the swap is behavior-neutral while
