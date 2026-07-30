@@ -30,6 +30,7 @@ pub mod session;
 pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
+pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
@@ -400,6 +401,8 @@ pub(crate) fn spawn_wtransport_server(
     tls_resolver: Arc<server_tls::LiveServerCertResolver>,
     congestion_control: client::CongestionControlMode,
     debug_logs: bool,
+    enable_0rtt: bool,
+    allow_early_session: bool,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -474,6 +477,11 @@ pub(crate) fn spawn_wtransport_server(
                     .effective_keep_alive_interval_ms()
                     .map(std::time::Duration::from_millis),
             );
+            // 0-RTT (fork feature): switches rustls to a stateful per-process
+            // session store with take-once semantics (single-process
+            // anti-replay) and allows the CONNECT request to arrive as
+            // replayable early data; sessions report is_0rtt.
+            let config_builder = config_builder.enable_0rtt(enable_0rtt);
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
                 Ok(s) => match s.local_addr() {
@@ -559,6 +567,9 @@ pub(crate) fn spawn_wtransport_server(
                                     emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
                                     return;
                                 }
+                                // Sampled when the request was read: true means the
+                                // CONNECT arrived as replayable 0-RTT early data.
+                                let is_0rtt = session_request.is_0rtt();
                                 let authority = session_request.authority().to_string();
                                 let peer_addr = session_request.remote_address();
                                 let peer_ip = peer_addr.ip().to_string();
@@ -677,7 +688,54 @@ pub(crate) fn spawn_wtransport_server(
                                                 connection.clone(),
                                                 metrics.clone(),
                                                 limits.clone(),
+                                                is_0rtt,
                                             );
+                                        // Replay-safety gate. The session request is
+                                        // the replayable unit of 0-RTT, so by default
+                                        // the onSession lifecycle event is deferred
+                                        // until the handshake is confirmed (the request
+                                        // is then no longer replayable). allowEarlySession
+                                        // opts out, surfacing the session immediately
+                                        // with is_0rtt observable for apps that only do
+                                        // idempotent work pre-confirmation.
+                                        //
+                                        // Either way the handshake_confirmed flag must
+                                        // flip so the session getter reflects reality;
+                                        // handshake_confirmed() resolves at completion or
+                                        // connection loss (bounded by the idle timeout),
+                                        // so neither path can hang forever.
+                                        if is_0rtt {
+                                            let confirmed_flag = session_registry::zero_rtt_state(&id)
+                                                .map(|(_, flag)| flag);
+                                            if allow_early_session {
+                                                if let Some(flag) = confirmed_flag {
+                                                    let conn_confirm = connection.clone();
+                                                    panic_guard::spawn_quic_task_scoped(
+                                                        panic_guard::PanicScope::Server(owner_server_id),
+                                                        async move {
+                                                            let _ = conn_confirm
+                                                                .handshake_confirmed()
+                                                                .await;
+                                                            flag.store(
+                                                                true,
+                                                                std::sync::atomic::Ordering::Release,
+                                                            );
+                                                        },
+                                                    );
+                                                }
+                                            } else {
+                                                // Deferred default: block this session's
+                                                // setup until confirmation, then flip the
+                                                // flag before the onSession event fires.
+                                                let _ = connection.handshake_confirmed().await;
+                                                if let Some(flag) = confirmed_flag {
+                                                    flag.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let stream_capacity_notify =
                                             session_registry::get_stream_capacity_notify(&id);
 

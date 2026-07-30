@@ -500,6 +500,24 @@ export type ServerOptions = {
 	/** Congestion controller for all server connections: cubic (default), BBR (throughput), or NewReno (low-latency). */
 	congestionControl?: "default" | "throughput" | "low-latency";
 
+	/**
+	 * Accept QUIC 0-RTT session establishment from resuming clients.
+	 * Off by default. When enabled, a returning client's CONNECT can arrive
+	 * as replayable early data; such sessions report `has0Rtt` and resumption
+	 * state is per-process (restarts/load balancing fall back to 1-RTT).
+	 */
+	enable0Rtt?: boolean;
+
+	/**
+	 * Deliver 0-RTT sessions to `onSession` before the handshake is confirmed.
+	 * Off by default: session establishment is the replayable unit of 0-RTT,
+	 * so by default `onSession` is deferred until the request is no longer
+	 * replayable. Opt in only when the callback's pre-confirmation work is
+	 * strictly idempotent; it can still gate side effects on
+	 * `session.handshakeConfirmed`. No effect unless `enable0Rtt` is set.
+	 */
+	allowEarlySession?: boolean;
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -598,6 +616,12 @@ export type ClientOptions = {
 	requireUnreliable?: boolean;
 	/** When true, errors use browser-style DOMException names. Default false. */
 	strictW3CErrors?: boolean;
+	/**
+	 * Offer QUIC 0-RTT on reconnects to servers seen before by this process.
+	 * Off by default. Requires the server to enable 0-RTT too; incompatible
+	 * with `allowPooling`. Sessions report `has0Rtt`/`accepted0Rtt`.
+	 */
+	enable0Rtt?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -663,6 +687,17 @@ export type WebTransportReceiveStream = ReadableStream<Uint8Array> &
 interface CommonSession {
 	readonly id: string;
 	readonly peer: { ip: string; port: number };
+
+	/**
+	 * Whether this session involved 0-RTT early data. Client side: this
+	 * connect offered early data; server side: the CONNECT arrived as
+	 * replayable early data. Always false unless 0-RTT was enabled.
+	 */
+	readonly has0Rtt: boolean;
+	/** Whether the peer accepted the early data (false until known / when refused). */
+	readonly accepted0Rtt: boolean;
+	/** Whether the TLS handshake has completed (always true for non-0-RTT sessions). */
+	readonly handshakeConfirmed: boolean;
 
 	readonly ready: Promise<void>;
 	readonly closed: Promise<CloseInfo>;
@@ -1015,6 +1050,10 @@ interface NativeSessionHandle {
 	metricsSnapshot(): SessionMetricsSnapshot;
 	connectionStats?(): QuicConnectionStats | null;
 	pathMaxDatagramSize?: () => number | null;
+	/** 0-RTT getters (absent on older prebuilt addons). */
+	has0Rtt?: boolean;
+	accepted0Rtt?: boolean;
+	handshakeConfirmed?: boolean;
 }
 type NativeConnectSessionHandle = {
 	id: string;
@@ -1073,6 +1112,12 @@ interface NativeAddon {
 		evictIdle?: number;
 		evictBroken?: number;
 	};
+	/** 0-RTT vault (absent on older prebuilt addons). */
+	exportZeroRttVault?(
+		optsJson: string,
+		serverName?: string | null,
+	): string | null;
+	importZeroRttVault?(optsJson: string, token: string): boolean;
 }
 interface NativeConnectOnlyAddon {
 	connect(
@@ -1170,6 +1215,9 @@ class NativeServerSession implements ServerSession {
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
+	#has0Rtt: boolean;
+	#handshakeConfirmedLatch = false;
+
 	constructor(
 		nativeHandle: NativeSessionHandle,
 		closedPromise: Promise<CloseInfo>,
@@ -1177,6 +1225,9 @@ class NativeServerSession implements ServerSession {
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
+		// Snapshot: fixed for the session's lifetime, and must survive the
+		// native registry entry being removed at close.
+		this.#has0Rtt = nativeHandle.has0Rtt ?? false;
 		this.#closedPromise = closedPromise.then((info) =>
 			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
 		);
@@ -1194,6 +1245,23 @@ class NativeServerSession implements ServerSession {
 			ip: this.#nativeHandle.peerIp,
 			port: this.#nativeHandle.peerPort,
 		};
+	}
+
+	get has0Rtt(): boolean {
+		return this.#has0Rtt;
+	}
+
+	get accepted0Rtt(): boolean {
+		// Server side: a request readable from early data was accepted.
+		return this.#has0Rtt;
+	}
+
+	get handshakeConfirmed(): boolean {
+		if (!this.#handshakeConfirmedLatch) {
+			this.#handshakeConfirmedLatch =
+				this.#nativeHandle.handshakeConfirmed ?? true;
+		}
+		return this.#handshakeConfirmedLatch;
 	}
 
 	get ready(): Promise<void> {
@@ -1388,6 +1456,8 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
 		congestionControl: opts.congestionControl ?? "default",
+		enable0Rtt: opts.enable0Rtt === true,
+		allowEarlySession: opts.allowEarlySession === true,
 	});
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
@@ -1616,6 +1686,18 @@ class NativeClientSession implements ClientSession {
 			ip: this.#nativeHandle.peerIp,
 			port: this.#nativeHandle.peerPort,
 		};
+	}
+
+	get has0Rtt(): boolean {
+		return this.#nativeHandle.has0Rtt ?? false;
+	}
+
+	get accepted0Rtt(): boolean {
+		return this.#nativeHandle.accepted0Rtt ?? false;
+	}
+
+	get handshakeConfirmed(): boolean {
+		return this.#nativeHandle.handshakeConfirmed ?? true;
 	}
 
 	get ready(): Promise<void> {
@@ -1936,6 +2018,68 @@ function connectWithNative(
  * session.close({ code: 1000, reason: "done" });
  * ```
  */
+function mapClientTlsOptions(tls: ClientOptions["tls"]):
+	| {
+			insecureSkipVerify: boolean;
+			caPem: string | undefined;
+			serverName: string | undefined;
+	  }
+	| undefined {
+	if (!tls) return undefined;
+	return {
+		insecureSkipVerify: tls.insecureSkipVerify ?? false,
+		caPem: tls.caPem
+			? typeof tls.caPem === "string"
+				? tls.caPem
+				: new TextDecoder().decode(tls.caPem)
+			: undefined,
+		serverName: tls.serverName,
+	};
+}
+
+/** JSON identity payload the native 0-RTT vault keys client state by. */
+function clientIdentityOptsJson(opts?: ClientOptions): string {
+	return JSON.stringify({
+		tls: mapClientTlsOptions(opts?.tls),
+		serverCertificateHashes: mapServerCertificateHashes(
+			opts?.serverCertificateHashes,
+		),
+	});
+}
+
+/**
+ * Drain this process's in-memory 0-RTT tickets for a client identity
+ * (optionally scoped to one server name) into an opaque vault. Returns a
+ * token to pass to {@link importTicketVault}, or null when there is nothing
+ * to export. Tokens reference live in-process state only — they are NOT
+ * durable and mean nothing after a process restart.
+ */
+export function exportTicketVault(
+	opts?: ClientOptions,
+	serverName?: string,
+): string | null {
+	const native = getNativeOrThrow();
+	if (typeof native.exportZeroRttVault !== "function") return null;
+	return native.exportZeroRttVault(
+		clientIdentityOptsJson(opts),
+		serverName ?? null,
+	);
+}
+
+/**
+ * Import a vault previously produced by {@link exportTicketVault} into a
+ * client identity's ticket store. Consumes the token; returns false when the
+ * token is unknown or already used.
+ */
+export function importTicketVault(
+	token: string,
+	opts?: ClientOptions,
+): boolean {
+	const native = getNativeOrThrow();
+	if (typeof native.importZeroRttVault !== "function") return false;
+	return native.importZeroRttVault(clientIdentityOptsJson(opts), token);
+}
+
 export async function connect(
 	url: string,
 	opts?: ClientOptions,
@@ -1965,17 +2109,7 @@ export async function connect(
 		);
 	}
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
-	const tlsOpts = opts?.tls
-		? {
-				insecureSkipVerify: opts.tls.insecureSkipVerify ?? false,
-				caPem: opts.tls.caPem
-					? typeof opts.tls.caPem === "string"
-						? opts.tls.caPem
-						: new TextDecoder().decode(opts.tls.caPem)
-					: undefined,
-				serverName: opts.tls.serverName,
-			}
-		: undefined;
+	const tlsOpts = mapClientTlsOptions(opts?.tls);
 	const optsJson = JSON.stringify({
 		limits: mergedLimits,
 		tls: tlsOpts,
@@ -1983,6 +2117,7 @@ export async function connect(
 		serverCertificateHashes: serverCertificateHashes,
 		allowPooling: opts?.allowPooling,
 		requireUnreliable: opts?.requireUnreliable,
+		enable0Rtt: opts?.enable0Rtt,
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;

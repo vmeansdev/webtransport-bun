@@ -16,5 +16,5 @@ name = "smoke-client"
 path = "src/smoke_client.rs"
 
 [dependencies]
-wtransport = { version = "=0.7.1", features = ["dangerous-configuration", "quinn"] }
+wtransport = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
