@@ -586,7 +586,7 @@ impl ClientSessionHandle {
             }
         }
         if let Some(ref conn) = self.conn {
-            conn.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
+            conn.close_session(code, &reason);
         }
     }
 
@@ -853,11 +853,11 @@ impl ClientSessionHandle {
 
             let (close_code, close_reason) = tokio::select! {
                 close_err = conn_closed.closed() => {
-                    crate::extract_close_info(&close_err)
+                    crate::resolve_close_info(&conn_closed, &close_err).await
                 }
                 _ = close_rx.changed() => {
                     let (code, reason) = close_rx.borrow().clone();
-                    conn_closed.close(wtransport::VarInt::from_u32(code), reason.as_bytes());
+                    conn_closed.close_session(code, &reason);
                     (Some(code), Some(reason))
                 }
             };

@@ -374,10 +374,27 @@ pub fn get_session_metrics(session_id: &str) -> Option<Arc<SessionMetrics>> {
         .map(|entry| Arc::clone(&entry.session_metrics))
 }
 
-/// Close a session: close the QUIC connection and remove from registry.
-/// Closing the connection causes all pending reads/writes to fail,
-/// which unblocks iterators and bridge tasks.
-pub fn close_session(session_id: &str, code: u32, reason: &[u8]) {
+/// End a WebTransport session, telling the peer why.
+///
+/// The code and reason reach the peer as a `CLOSE_WEBTRANSPORT_SESSION` capsule
+/// on the CONNECT stream — a QUIC `CONNECTION_CLOSE` carries neither. Delivery
+/// is best-effort and off the caller's critical path; the connection is torn
+/// down once the capsule is out. Local state is marked closed first, so pending
+/// reads/writes fail immediately either way and iterators and bridge tasks
+/// unblock without waiting on the wire.
+pub fn close_session(session_id: &str, code: u32, reason: &str) {
+    mark_closed_and_notify_capacity_waiters(session_id);
+    if let Some((_, state)) = REGISTRY.remove(session_id) {
+        mark_state_closed_and_notify(&state);
+        state.conn.close_session(code, reason);
+    }
+}
+
+/// Tear a session down at the QUIC level without a close capsule.
+///
+/// For teardowns that are not an application close — a contained panic, an
+/// internal invariant failure — where the peer only needs the connection gone.
+pub fn abort_session(session_id: &str, code: u32, reason: &[u8]) {
     mark_closed_and_notify_capacity_waiters(session_id);
     if let Some((_, state)) = REGISTRY.remove(session_id) {
         mark_state_closed_and_notify(&state);
