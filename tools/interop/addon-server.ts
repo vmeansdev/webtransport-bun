@@ -153,9 +153,10 @@ const wtServer = createServer({
 			})
 			.catch(() => {});
 
-		// Chromium often surfaces server closes as WebTransportError("Connection lost")
-		// instead of resolving wt.closed with close info. Still send the stable
-		// application close so server-side close-events observe 3990.
+		// A stable application close, so server-side close events observe 3990.
+		// (Chromium used to surface every server close as a bare "Connection lost"
+		// because the close reached it as a QUIC CONNECTION_CLOSE; it now arrives
+		// as a CLOSE_WEBTRANSPORT_SESSION capsule and carries the code and reason.)
 		const idleWatch = setInterval(() => {
 			if (performance.now() - activity.lastActivityMs < IDLE_TIMEOUT_MS) {
 				return;
