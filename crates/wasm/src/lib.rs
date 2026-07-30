@@ -14,6 +14,7 @@ compile_error!(
      dist builds must omit --features dev-insecure"
 );
 
+pub mod capsule;
 pub mod cert;
 pub mod congestion;
 pub mod endpoint;
