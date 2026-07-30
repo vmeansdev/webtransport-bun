@@ -3962,8 +3962,18 @@ impl WtEndpoint {
         let gone = VarInt::from_u32(crate::wt_error::WT_SESSION_GONE);
         for (handle, quic_sid) in session_streams {
             if let Some(conn) = self.conns.get_mut(&h) {
-                let _ = conn.send_stream(quic_sid).reset(gone);
-                let _ = conn.recv_stream(quic_sid).stop(gone);
+                // A unidirectional stream has one half, owned by whichever side
+                // opened it. Reaching for the half that does not exist is an
+                // assertion failure inside quinn-proto, not a recoverable error,
+                // so ask only for the halves this stream actually has.
+                let opened_locally = quic_sid.initiator() == conn.side();
+                let bidi = quic_sid.dir() == Dir::Bi;
+                if bidi || opened_locally {
+                    let _ = conn.send_stream(quic_sid).reset(gone);
+                }
+                if bidi || !opened_locally {
+                    let _ = conn.recv_stream(quic_sid).stop(gone);
+                }
             }
             if let Some(s) = self.sessions.get_mut(&h) {
                 s.self_bidi.remove(&quic_sid);
