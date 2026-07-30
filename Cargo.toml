@@ -12,4 +12,4 @@ resolver = "2"
 # on feat/track1-conformance), pinned by rev. See docs/FORK_MAINTENANCE.md for
 # the maintenance obligations this git dependency creates (advisory watch,
 # Dependabot blindness, rev reachability).
-wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "d3ff84d9977240685a77002bfd1d63996d87be1b", features = ["dangerous-configuration", "quinn"] }
+wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "ac515b1559b75ae83059b4c14c9289bf5cf447a5", features = ["dangerous-configuration", "quinn"] }

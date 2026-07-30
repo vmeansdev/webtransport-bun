@@ -386,35 +386,32 @@ export function normalizeWasmEndpointOptions(
 		options.enableDynamicQpack === undefined
 			? undefined
 			: Boolean(options.enableDynamicQpack);
+	// An explicit capacity wins over the boolean, an explicit `0` included:
+	// naming a capacity is the more specific request, and naming zero asks for
+	// static-only. The native backend resolves the pair the same way.
 	let qpackMaxTableCapacity: number | undefined;
 	let qpackBlockedStreams: number | undefined;
-	if (enableDynamicQpack) {
+	if (options.qpackMaxTableCapacity !== undefined) {
+		qpackMaxTableCapacity = Math.min(
+			65536,
+			normalizeNonNegativeInteger(
+				"qpackMaxTableCapacity",
+				options.qpackMaxTableCapacity,
+			),
+		);
+	} else if (enableDynamicQpack) {
 		qpackMaxTableCapacity = 4096;
+	}
+	if (options.qpackBlockedStreams !== undefined) {
+		qpackBlockedStreams = Math.min(
+			128,
+			normalizeNonNegativeInteger(
+				"qpackBlockedStreams",
+				options.qpackBlockedStreams,
+			),
+		);
+	} else if (qpackMaxTableCapacity !== undefined && qpackMaxTableCapacity > 0) {
 		qpackBlockedStreams = 16;
-	} else {
-		if (options.qpackMaxTableCapacity !== undefined) {
-			qpackMaxTableCapacity = Math.min(
-				65536,
-				normalizeNonNegativeInteger(
-					"qpackMaxTableCapacity",
-					options.qpackMaxTableCapacity,
-				),
-			);
-		}
-		if (options.qpackBlockedStreams !== undefined) {
-			qpackBlockedStreams = Math.min(
-				128,
-				normalizeNonNegativeInteger(
-					"qpackBlockedStreams",
-					options.qpackBlockedStreams,
-				),
-			);
-		} else if (
-			qpackMaxTableCapacity !== undefined &&
-			qpackMaxTableCapacity > 0
-		) {
-			qpackBlockedStreams = 16;
-		}
 	}
 
 	return {

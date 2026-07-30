@@ -27,6 +27,28 @@ describe("wasm dynamic QPACK options", () => {
 		expect(n.qpackBlockedStreams).toBe(16);
 	});
 
+	// The two options together were the untested combination, and wasm used to
+	// answer it differently from native: the boolean won and the number was
+	// dropped. Identical options must resolve to the same advertised capacity on
+	// both backends.
+	test("explicit capacity wins over enableDynamicQpack", () => {
+		const n = normalizeWasmEndpointOptions({
+			enableDynamicQpack: true,
+			qpackMaxTableCapacity: 8192,
+		});
+		expect(n.qpackMaxTableCapacity).toBe(8192);
+		expect(n.qpackBlockedStreams).toBe(16);
+	});
+
+	test("an explicit capacity of 0 beats enableDynamicQpack", () => {
+		const n = normalizeWasmEndpointOptions({
+			enableDynamicQpack: true,
+			qpackMaxTableCapacity: 0,
+		});
+		expect(n.qpackMaxTableCapacity).toBe(0);
+		expect(n.qpackBlockedStreams).toBeUndefined();
+	});
+
 	test("explicit capacity>0 defaults blocked streams to 16", () => {
 		const n = normalizeWasmEndpointOptions({ qpackMaxTableCapacity: 2048 });
 		expect(n.qpackMaxTableCapacity).toBe(2048);

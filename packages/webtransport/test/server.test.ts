@@ -1,21 +1,21 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import {
 	createServer,
 	DEFAULT_LIMITS,
 	DEFAULT_RATE_LIMITS,
-	E_TLS,
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
-	E_LIMIT_EXCEEDED,
-	E_RATE_LIMITED,
-	E_INVALID_ARGUMENT,
+	E_STREAM_RESET,
+	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
-	E_INTERNAL,
 	WebTransportError,
 	WT_RESET,
 	WT_STOP_SENDING,
@@ -200,7 +200,7 @@ describe("webtransport package exports", () => {
 });
 
 describe("server congestionControl (parity backport B1)", () => {
-	it("rejects invalid congestionControl with E_INTERNAL", () => {
+	it("rejects invalid congestionControl as a bad argument", () => {
 		expect(() =>
 			createServer({
 				port: nextPort(27400, 500),
@@ -209,7 +209,7 @@ describe("server congestionControl (parity backport B1)", () => {
 				congestionControl: "warp-speed",
 				onSession: () => {},
 			}),
-		).toThrow(/E_INTERNAL: congestionControl must be/);
+		).toThrow(/E_INVALID_ARGUMENT: congestionControl must be/);
 	});
 
 	it("defaults to cubic and exposes the effective mode", async () => {

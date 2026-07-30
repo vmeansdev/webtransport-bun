@@ -251,18 +251,35 @@ pub(crate) const QPACK_DYNAMIC_PRESET_CAPACITY: u64 = 4096;
 /// unchanged wire behavior). The value is clamped to
 /// [`MAX_QPACK_TABLE_CAPACITY`]. `qpackBlockedStreams` is intentionally not a
 /// settable option: the fork always advertises zero.
-pub(crate) fn parse_qpack_max_table_capacity(opts: &serde_json::Value) -> u64 {
-    if let Some(n) = opts.get("qpackMaxTableCapacity").and_then(|v| v.as_u64()) {
-        return n.min(MAX_QPACK_TABLE_CAPACITY);
+///
+/// A `qpackMaxTableCapacity` that is present but not a non-negative integer is
+/// an error rather than an absent value. The facade already rejects one, so
+/// reaching here means an internal caller bypassed it, and falling through to
+/// the preset would answer a malformed request with a dynamic table nobody
+/// asked for.
+pub(crate) fn parse_qpack_max_table_capacity(
+    opts: &serde_json::Value,
+) -> std::result::Result<u64, String> {
+    match opts.get("qpackMaxTableCapacity") {
+        Some(serde_json::Value::Null) | None => {}
+        Some(value) => {
+            let n = value.as_u64().ok_or_else(|| {
+                "E_INVALID_ARGUMENT: qpackMaxTableCapacity must be a non-negative integer"
+                    .to_string()
+            })?;
+            return Ok(n.min(MAX_QPACK_TABLE_CAPACITY));
+        }
     }
+
     if opts
         .get("enableDynamicQpack")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        return QPACK_DYNAMIC_PRESET_CAPACITY;
+        return Ok(QPACK_DYNAMIC_PRESET_CAPACITY);
     }
-    0
+
+    Ok(0)
 }
 
 /// Default client idle timeout. quinn's default is `None` (never), which leaves
@@ -1439,7 +1456,8 @@ async fn run_connect(
     }
 
     // QPACK dynamic-table capacity to advertise (0 = static-only, the default).
-    let qpack_max_table_capacity = parse_qpack_max_table_capacity(&opts);
+    let qpack_max_table_capacity =
+        parse_qpack_max_table_capacity(&opts).map_err(napi::Error::from_reason)?;
 
     let handshake_timeout_ms = opts
         .get("limits")
@@ -1742,19 +1760,20 @@ mod tests {
         assert_eq!(congestion_controller_label(default_mode), "cubic");
     }
 
+    fn qpack_capacity(opts: serde_json::Value) -> u64 {
+        parse_qpack_max_table_capacity(&opts).expect("options should be accepted")
+    }
+
     #[test]
     fn parse_qpack_capacity_defaults_to_static_only() {
-        assert_eq!(parse_qpack_max_table_capacity(&json!({})), 0);
-        assert_eq!(
-            parse_qpack_max_table_capacity(&json!({ "enableDynamicQpack": false })),
-            0
-        );
+        assert_eq!(qpack_capacity(json!({})), 0);
+        assert_eq!(qpack_capacity(json!({ "enableDynamicQpack": false })), 0);
     }
 
     #[test]
     fn parse_qpack_capacity_preset_expands_to_4096() {
         assert_eq!(
-            parse_qpack_max_table_capacity(&json!({ "enableDynamicQpack": true })),
+            qpack_capacity(json!({ "enableDynamicQpack": true })),
             QPACK_DYNAMIC_PRESET_CAPACITY
         );
     }
@@ -1763,15 +1782,11 @@ mod tests {
     fn parse_qpack_capacity_explicit_wins_over_preset() {
         // Explicit capacity beats the boolean preset in both directions.
         assert_eq!(
-            parse_qpack_max_table_capacity(
-                &json!({ "qpackMaxTableCapacity": 1024, "enableDynamicQpack": true })
-            ),
+            qpack_capacity(json!({ "qpackMaxTableCapacity": 1024, "enableDynamicQpack": true })),
             1024
         );
         assert_eq!(
-            parse_qpack_max_table_capacity(
-                &json!({ "qpackMaxTableCapacity": 0, "enableDynamicQpack": true })
-            ),
+            qpack_capacity(json!({ "qpackMaxTableCapacity": 0, "enableDynamicQpack": true })),
             0
         );
     }
@@ -1779,8 +1794,31 @@ mod tests {
     #[test]
     fn parse_qpack_capacity_clamps_to_max() {
         assert_eq!(
-            parse_qpack_max_table_capacity(&json!({ "qpackMaxTableCapacity": 1_000_000 })),
+            qpack_capacity(json!({ "qpackMaxTableCapacity": 1_000_000 })),
             MAX_QPACK_TABLE_CAPACITY
+        );
+    }
+
+    /// A capacity that is present but unusable is rejected, rather than falling
+    /// through to a preset the caller never asked for.
+    #[test]
+    fn parse_qpack_capacity_rejects_a_value_that_is_not_a_count() {
+        for value in [json!(-1), json!(1.5), json!("4096"), json!(true), json!([])] {
+            let error = parse_qpack_max_table_capacity(
+                &json!({ "qpackMaxTableCapacity": value, "enableDynamicQpack": true }),
+            )
+            .expect_err("a non-integer capacity should be rejected");
+
+            assert!(
+                error.starts_with("E_INVALID_ARGUMENT: qpackMaxTableCapacity"),
+                "unexpected error: {error}"
+            );
+        }
+
+        // An explicit null is absence, not a malformed value.
+        assert_eq!(
+            qpack_capacity(json!({ "qpackMaxTableCapacity": null, "enableDynamicQpack": true })),
+            QPACK_DYNAMIC_PRESET_CAPACITY
         );
     }
 
