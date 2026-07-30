@@ -196,18 +196,27 @@ function controlledFacadeSession() {
 			rejectClosed = reject;
 		},
 	);
+	// Mirrors the real session: `draining` is pending until the peer sends
+	// WT_DRAIN_SESSION or this side starts closing.
+	let resolveDraining!: () => void;
+	const draining = new Promise<void>((resolve) => {
+		resolveDraining = resolve;
+	});
 	const session = {
 		ready: Promise.resolve(),
 		closed,
+		draining,
 		maxDatagramSize: 1200,
 		onDatagram() {},
 		onIncomingStream() {},
 		sendDatagram: async () => {},
+		drain: () => true,
 		close() {
+			resolveDraining();
 			resolveClosed({ code: 0, reason: "local close" });
 		},
 	} as unknown as WasmSession;
-	return { session, resolveClosed, rejectClosed };
+	return { session, resolveClosed, rejectClosed, resolveDraining };
 }
 
 async function settlesPromptly<T>(promise: Promise<T>): Promise<T> {
@@ -543,6 +552,15 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		failed.rejectClosed(new Error("connect failed"));
 		await expect(
 			settlesPromptly(failedFacade.draining),
+		).resolves.toBeUndefined();
+
+		// The peer's WT_DRAIN_SESSION settles `draining` on its own, with the
+		// session still open.
+		const drained = controlledFacadeSession();
+		const drainedFacade = new WasmWebTransport(drained.session);
+		drained.resolveDraining();
+		await expect(
+			settlesPromptly(drainedFacade.draining),
 		).resolves.toBeUndefined();
 	});
 

@@ -95,14 +95,15 @@ case "$MODE" in
     # Scope nodejs glue as CommonJS under the package's root `"type": "module"`.
     printf '%s\n' '{"private":true,"type":"commonjs"}' \
       > ../../packages/webtransport/wasm-dist/node/package.json
-    # Provenance marker (eventWireVersion 2 = session_id + SessionClosed tag 9).
+    # Provenance marker (eventWireVersion 3 = session_id, SessionClosed tag 9
+    # with the peer's close reason, SessionDraining tag 10).
     cat > ../../packages/webtransport/wasm-dist/PRODUCTION_BUILD.json <<'EOF'
 {
   "schemaVersion": 1,
   "profile": "release",
   "devInsecure": false,
   "targets": ["nodejs", "web"],
-  "eventWireVersion": 2
+  "eventWireVersion": 3
 }
 EOF
     echo "[build-wasm] done -> packages/webtransport/wasm-dist/{node,web}"

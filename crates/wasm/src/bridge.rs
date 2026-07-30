@@ -729,6 +729,14 @@ pub fn wt_close_session(eid: u32, conn: u32, session_id: u64, code: u32, reason:
 }
 
 #[wasm_bindgen]
+pub fn wt_drain_session(eid: u32, conn: u32, session_id: u64) -> bool {
+    with_endpoint_mut(eid, |endpoint| endpoint.drain_wt_session(conn, session_id))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
 pub fn wt_stream_write(eid: u32, stream: u32, data: &[u8]) -> f64 {
     with_endpoint_mut(eid, |endpoint| endpoint.stream_write(stream, data) as f64)
         .ok()

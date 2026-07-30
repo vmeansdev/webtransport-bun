@@ -4697,6 +4697,51 @@ fn primary_session_close_conveys_code_and_reason_over_capsule() {
     );
 }
 
+/// WT_DRAIN_SESSION reaches the peer as SessionDraining and leaves the session
+/// usable: draining is advisory, not a close.
+#[test]
+fn drain_capsule_notifies_the_peer_without_closing_the_session() {
+    let (mut server, mut client, cid) = endpoints();
+    let mut established = false;
+    let mut drained = false;
+    let mut closed = false;
+
+    for _ in 0..800 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while let Some(ev) = server.poll_event() {
+            match ev {
+                WtEvent::SessionDraining { .. } => drained = true,
+                WtEvent::SessionClosed { .. } | WtEvent::ConnectionClosed { .. } => closed = true,
+                _ => {}
+            }
+        }
+        if established && !drained {
+            assert!(client.drain_wt_session(cid, 0));
+            established = false; // fire once
+        }
+        if drained {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+
+    assert!(drained, "peer must observe WT_DRAIN_SESSION");
+    assert!(!closed, "a drain must not close the session");
+    // Draining an unestablished session is refused rather than writing a
+    // capsule before the 2xx (§3.2).
+    assert!(!client.drain_wt_session(cid, 99));
+}
+
 /// A closed primary session stops being a demux target while its connection
 /// (and any sibling sessions) keep running, so late inbound streams naming it
 /// are rejected instead of routed onto a dead session.
@@ -5261,6 +5306,54 @@ fn reject_wt_unknown_session_resets_live_connection_stream() {
         .unwrap()
         .in_streams
         .contains_key(&wt));
+}
+
+/// §4.6: a WebTransport stream the receiver cannot associate with a session is
+/// rejected with WT_BUFFERED_STREAM_REJECTED, the same codepoint the native
+/// fork sends, so a sender sees one code from both backends.
+#[test]
+fn unassociated_wt_stream_is_rejected_with_buffered_stream_rejected() {
+    use quinn_proto::{Dir, Side, WriteError};
+    let (mut server, mut client, cid) = establish_pair(2);
+    let ch = *client.id_to_handle.get(&cid).expect("client handle");
+
+    // Open a raw uni stream naming a session the server has never seen.
+    let sid = {
+        let conn = client.conns.get_mut(&ch).expect("client conn");
+        let sid = conn.streams().open(Dir::Uni).expect("uni stream");
+        let mut header = Vec::new();
+        crate::varint::encode(h3::stream_type::WT_UNI, &mut header);
+        crate::varint::encode(999, &mut header);
+        conn.send_stream(sid).write(&header).expect("write header");
+        sid
+    };
+    assert_eq!(sid.dir(), Dir::Uni);
+    assert_eq!(sid.initiator(), Side::Client);
+
+    let mut stop_code = None;
+    for _ in 0..200 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+        if let Some(conn) = client.conns.get_mut(&ch) {
+            if let Err(WriteError::Stopped(code)) = conn.send_stream(sid).write(b"payload") {
+                stop_code = Some(code.into_inner());
+                break;
+            }
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+
+    assert_eq!(
+        stop_code,
+        Some(u64::from(crate::wt_error::WT_BUFFERED_STREAM_REJECTED)),
+        "sender must see WT_BUFFERED_STREAM_REJECTED"
+    );
 }
 
 #[test]
