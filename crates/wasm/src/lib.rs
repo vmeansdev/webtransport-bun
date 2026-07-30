@@ -26,6 +26,7 @@ pub mod server_tls;
 pub mod ticket_store;
 pub mod varint;
 pub mod verify;
+pub mod wt_error;
 
 #[cfg(target_arch = "wasm32")]
 mod bridge;

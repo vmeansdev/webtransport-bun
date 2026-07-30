@@ -284,6 +284,20 @@ fn clamp_varint_to_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// Remap an outbound WebTransport application error code onto its QUIC
+/// stream-error code per draft §4.4. The image is always < 2^62, so the VarInt
+/// conversion never fails; `VarInt::MAX` is an unreachable safety fallback.
+fn remap_wt_app_error(code: u32) -> VarInt {
+    VarInt::from_u64(crate::wt_error::remap_application_error(code)).unwrap_or(VarInt::MAX)
+}
+
+/// Recover the 32-bit application error code from an inbound WT-stream QUIC
+/// error code (§4.4 inverse). Codes outside the WT application range — e.g. H3
+/// control/CONNECT protocol codes — are passed through clamped to u32.
+fn unmap_wt_app_error(value: u64) -> u32 {
+    crate::wt_error::unmap_application_error(value).unwrap_or_else(|| clamp_varint_to_u32(value))
+}
+
 /// Default SETTINGS_WT_MAX_SESSIONS (≥ 2 for multi-session proof). JS bridge
 /// may override via optional `wtMaxSessions`; otherwise this Rust default applies.
 const WT_MAX_SESSIONS_DEFAULT: u64 = 2;
@@ -1805,7 +1819,7 @@ impl WtEndpoint {
                     // Peer STOP_SENDING on OUR send half: writes will fail from
                     // now on. The recv half (if any) is untouched — this is NOT
                     // an inbound reset.
-                    self.on_stream_stopped(h, id, clamp_varint_to_u32(error_code.into_inner()));
+                    self.on_stream_stopped(h, id, unmap_wt_app_error(error_code.into_inner()));
                 }
                 QuicEvent::DatagramReceived => {
                     self.drain_datagrams(h, now);
@@ -2225,7 +2239,7 @@ impl WtEndpoint {
             match final_outcome {
                 ReadOutcome::Finished => self.retire_in_stream(h, id),
                 ReadOutcome::Reset(code) => {
-                    self.emit_stream_reset(h, id, clamp_varint_to_u32(code));
+                    self.emit_stream_reset(h, id, unmap_wt_app_error(code));
                     self.retire_in_stream(h, id);
                 }
                 ReadOutcome::Open => {}
@@ -2308,7 +2322,7 @@ impl WtEndpoint {
                 self.push_event(WtEvent::StreamReset {
                     conn,
                     stream: handle,
-                    code: clamp_varint_to_u32(code),
+                    code: unmap_wt_app_error(code),
                 });
                 if let Some(s) = self.sessions.get_mut(&h) {
                     s.self_bidi.remove(&id);
@@ -3760,7 +3774,7 @@ impl WtEndpoint {
     pub fn stream_reset(&mut self, stream: u32, code: u32) {
         if let Some(&(h, sid)) = self.stream_index.get(&stream) {
             if let Some(c) = self.conns.get_mut(&h) {
-                let _ = c.send_stream(sid).reset(VarInt::from_u32(code));
+                let _ = c.send_stream(sid).reset(remap_wt_app_error(code));
             }
             self.mark_stream_half_done(stream, HALF_SEND);
         }
@@ -3771,7 +3785,7 @@ impl WtEndpoint {
     pub fn stream_stop(&mut self, stream: u32, code: u32) {
         if let Some(&(h, sid)) = self.stream_index.get(&stream) {
             if let Some(c) = self.conns.get_mut(&h) {
-                let _ = c.recv_stream(sid).stop(VarInt::from_u32(code));
+                let _ = c.recv_stream(sid).stop(remap_wt_app_error(code));
             }
             self.paused.remove(&stream);
             self.mark_stream_half_done(stream, HALF_RECV);
