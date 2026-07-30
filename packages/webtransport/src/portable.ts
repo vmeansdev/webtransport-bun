@@ -41,6 +41,13 @@ export interface PortableServerSession {
 
 	close(info?: { code?: number; reason?: string }): void;
 
+	/**
+	 * Tell the peer this session is going away soon, without ending it. Sends a
+	 * `WT_DRAIN_SESSION` capsule; streams already open keep working and new ones
+	 * can still be opened.
+	 */
+	drain(): void;
+
 	sendDatagram(data: Uint8Array): Promise<void>;
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
 

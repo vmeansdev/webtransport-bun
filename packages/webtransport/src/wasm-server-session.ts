@@ -172,6 +172,10 @@ export class WasmServerSession {
 	close(info?: { code?: number; reason?: string }): void {
 		this.#session.close(info);
 	}
+
+	drain(): void {
+		this.#session.drain();
+	}
 }
 
 /** Wrap an accepted wasm session as a ServerSession-like facade. */

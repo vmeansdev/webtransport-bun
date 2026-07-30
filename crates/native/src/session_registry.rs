@@ -390,6 +390,16 @@ pub fn close_session(session_id: &str, code: u32, reason: &str) {
     }
 }
 
+/// Tell the peer the session is going away soon, leaving it usable.
+///
+/// Sends a `WT_DRAIN_SESSION` capsule. The session stays in the registry: a
+/// drain is a warning, not an ending.
+pub fn drain_session(session_id: &str) {
+    if let Some(entry) = REGISTRY.get(session_id) {
+        entry.conn.drain_session();
+    }
+}
+
 /// Tear a session down at the QUIC level without a close capsule.
 ///
 /// For teardowns that are not an application close — a contained panic, an

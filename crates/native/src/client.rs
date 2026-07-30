@@ -1,7 +1,7 @@
 //! WebTransport client. Connects to a server and exposes session API.
 
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{JsFunction, Result};
+use napi::{Env, JsFunction, JsObject, Result};
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
@@ -496,6 +496,37 @@ impl ClientSessionHandle {
     pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
         self.initiate_close(code.unwrap_or(0), reason.unwrap_or_default());
         Ok(())
+    }
+
+    /// Tell the peer this session is going away soon, without ending it.
+    ///
+    /// Sends a `WT_DRAIN_SESSION` capsule; the session stays fully usable.
+    #[napi]
+    pub fn drain(&self) -> WtResult<()> {
+        if let Some(ref conn) = self.conn {
+            conn.drain_session();
+        }
+        Ok(())
+    }
+
+    /// Resolves once the peer says this session is going away.
+    ///
+    /// Settles on a received `WT_DRAIN_SESSION` or `GOAWAY`, and immediately if
+    /// one already arrived. The session stays usable: this is a warning, not an
+    /// ending. Spawned rather than written as `async fn(&self)` so a wait that
+    /// may never settle does not hold an exclusive napi borrow of the handle and
+    /// block every other call on it.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn wait_draining(&self, env: Env) -> Result<JsObject> {
+        let conn = self.conn.clone();
+        env.spawn_future(async move {
+            let Some(conn) = conn else { return Ok(()) };
+            CLIENT_RUNTIME
+                .spawn(async move { conn.draining().await })
+                .await
+                .map_err(wt_from_upstream_error)?;
+            Ok(())
+        })
     }
 
     #[napi]
