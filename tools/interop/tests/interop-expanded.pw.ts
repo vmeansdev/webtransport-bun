@@ -247,11 +247,11 @@ test.describe("P3.3 interop expansion", () => {
 			{ hash: h, url: interopOrigin },
 		);
 
-		expect(
-			result.code === 4001 ||
-				result.reason?.includes("interop") ||
-				result.reason?.includes("Connection"),
-		).toBe(true);
+		// Previously satisfied by the reason merely containing "Connection", which
+		// a bare connection teardown also produces. The close capsule carries the
+		// real code and reason, so assert them exactly.
+		expect(result.code).toBe(4001);
+		expect(result.reason).toBe("interop-close");
 	});
 
 	test("getStats returns connection stats when available", async ({ page }) => {
