@@ -7,8 +7,9 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-# Fork of BiagioFesta/wtransport carrying 0-RTT support (branch feat/0rtt),
+# Fork of BiagioFesta/wtransport carrying 0-RTT support plus the WebTransport
+# conformance work (branch feat/track1-conformance, a superset of feat/0rtt),
 # pinned by rev. See docs/FORK_MAINTENANCE.md for the maintenance obligations
 # this git dependency creates (advisory watch, Dependabot blindness, rev
 # reachability).
-wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "aa45f3719bfb5e443d274c2f3c7784797ac81f52", features = ["dangerous-configuration", "quinn"] }
+wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "b0b9f5c9716e068ef9206a96abe3fcfc9edba5da", features = ["dangerous-configuration", "quinn"] }

@@ -788,17 +788,17 @@ pub(crate) fn spawn_wtransport_server(
                                                             let Ok((mut send, recv)) = res else { break };
                                                             if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
                                                                 m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                let _ = send.reset(0u32.into());
+                                                                let _ = send.reset(0);
                                                                 continue;
                                                             }
                                                             if m_bidi.streams_active.load(Ordering::Relaxed) >= lim_bidi.max_streams_global {
                                                                 m_bidi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                let _ = send.reset(0u32.into());
+                                                                let _ = send.reset(0);
                                                                 continue;
                                                             }
                                                             if sm_bidi.streams_bidi_active.load(Ordering::Relaxed) >= lim_bidi.max_streams_per_session_bidi {
                                                                 m_bidi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                let _ = send.reset(0u32.into());
+                                                                let _ = send.reset(0);
                                                                 continue;
                                                             }
                                                             m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
@@ -852,17 +852,17 @@ pub(crate) fn spawn_wtransport_server(
                                                             let Ok(recv) = res else { break };
                                                             if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
                                                                 m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                recv.stop(0u32.into());
+                                                                recv.stop(0);
                                                                 continue;
                                                             }
                                                             if m_uni.streams_active.load(Ordering::Relaxed) >= lim_uni.max_streams_global {
                                                                 m_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                recv.stop(0u32.into());
+                                                                recv.stop(0);
                                                                 continue;
                                                             }
                                                             if sm_uni.streams_uni_active.load(Ordering::Relaxed) >= lim_uni.max_streams_per_session_uni {
                                                                 m_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                recv.stop(0u32.into());
+                                                                recv.stop(0);
                                                                 continue;
                                                             }
                                                             m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
