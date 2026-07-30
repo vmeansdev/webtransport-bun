@@ -29,6 +29,26 @@ These are **1.0 requirements**, not permanent product omissions. Treat
   passed on candidate with commit-bound evidence).
 - WebTransport session establishment (Extended CONNECT → 200), datagrams
   (quarter-session-id framing), and uni/bidi streams.
+- **Session capsules on the CONNECT stream** (`capsule.rs`), encode and decode,
+  with the bounded partial-frame accumulation the rest of the H3 parser uses so
+  a capsule split across DATA frames still parses:
+  - `WT_CLOSE_SESSION` — a session close now reaches the peer as a capsule
+    carrying the application code and reason, instead of a QUIC
+    `CONNECTION_CLOSE` that told a browser only that the connection vanished.
+    The QUIC connection is left up for sibling sessions
+    (`endpoint_tests.rs::primary_session_close_conveys_code_and_reason_over_capsule`).
+    A capsule write is gated on the session being established, so nothing is
+    written before the 2xx (§3.2).
+  - `WT_DRAIN_SESSION` — received drains resolve `draining` without ending the
+    session (`endpoint_tests.rs::drain_capsule_notifies_the_peer_without_closing_the_session`).
+  - `WT_BUFFERED_STREAM_REJECTED` for streams that never associate with a
+    session (`endpoint_tests.rs::unassociated_wt_stream_is_rejected_with_buffered_stream_rejected`).
+- WebTransport application error codes are mapped onto the reserved QUIC range
+  and back per draft §4.4 (`wt_error.rs`), for QUIC **stream** codes only — the
+  close capsule carries the raw 32-bit code. Proven against real Chromium in
+  `tools/interop/tests-wasm/wasm-server.spec.ts`.
+- **`GOAWAY` is not implemented.** The wasm backend signals a session drain
+  only; there is no connection-level GOAWAY send path.
 - Frame-size bound: a single buffered H3 control/CONNECT/HEADERS frame is
   capped at `MAX_H3_FRAME_SIZE` (1 MiB); a peer advertising more is closed with
   H3_EXCESSIVE_LOAD (see `endpoint.rs`).
