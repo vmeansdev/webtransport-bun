@@ -30,7 +30,11 @@ pub mod setting {
     pub const ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
     pub const H3_DATAGRAM: u64 = 0x33;
     pub const ENABLE_WEBTRANSPORT: u64 = 0x2b60_3742;
-    pub const WEBTRANSPORT_MAX_SESSIONS: u64 = 0x2b60_3743;
+    // draft-07 / Chromium SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07. The previous
+    // 0x2b60_3743 was a fabricated increment of ENABLE_WEBTRANSPORT that matched
+    // no draft and no implementation, so our advertised session cap was silently
+    // ignored by native and Chromium alike.
+    pub const WEBTRANSPORT_MAX_SESSIONS: u64 = 0xc671_706a;
 }
 
 /// Production-safe default dynamic-table capacity (bytes), advertised in SETTINGS.
@@ -1305,6 +1309,23 @@ mod tests {
             DEFAULT_QPACK_MAX_TABLE_CAPACITY
         );
         assert_eq!(s_dyn.qpack_blocked_streams, DEFAULT_QPACK_BLOCKED_STREAMS);
+    }
+
+    #[test]
+    fn max_sessions_uses_chromium_draft07_codepoint() {
+        // Regression: the setting id must be the real draft-07/Chromium
+        // SETTINGS_WEBTRANS_MAX_SESSIONS_DRAFT07 (0xc671706a). A self-consistent
+        // round-trip through our own parser can't catch a fabricated id, so
+        // assert the exact varint bytes appear on the wire.
+        assert_eq!(setting::WEBTRANSPORT_MAX_SESSIONS, 0xc671_706a);
+        let mut id_bytes = Vec::new();
+        varint::encode(setting::WEBTRANSPORT_MAX_SESSIONS, &mut id_bytes);
+        let buf = encode_control_preamble(42);
+        assert!(
+            buf.windows(id_bytes.len())
+                .any(|w| w == id_bytes.as_slice()),
+            "max-sessions codepoint 0xc671706a must appear in the SETTINGS frame"
+        );
     }
 
     #[test]
