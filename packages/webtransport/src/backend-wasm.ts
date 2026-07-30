@@ -230,6 +230,8 @@ export type DecodedWasmEvent =
 			conn: number;
 			sessionId: bigint;
 			code: number;
+			/** Peer's WT_CLOSE_SESSION reason; empty when it sent none. */
+			reason: string;
 	  }
 	| {
 			type: "stream-opened";
@@ -317,13 +319,21 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			off = sid[1];
 			const codeResult = decodeVarintSafe(ev, off);
 			if (!codeResult) return null;
+			let code: number;
+			[code, off] = codeResult;
+			const lenResult = decodeVarintSafe(ev, off);
+			if (!lenResult) return null;
+			let len: number;
+			[len, off] = lenResult;
+			if (off + len > ev.length) return null;
 			const sessionId = requireSafeSessionId(sid[0]);
 			if (sessionId == null) return null;
 			return {
 				type: "session-closed",
 				conn,
 				sessionId,
-				code: codeResult[0],
+				code,
+				reason: TEXT_DECODER.decode(ev.subarray(off, off + len)),
 			};
 		}
 		case EVENT.STREAM_OPENED: {
@@ -445,7 +455,12 @@ export function dispatchDecodedWasmEvent(
 			events.onClosed?.(decoded.conn, decoded.code);
 			return;
 		case "session-closed":
-			events.onSessionClosed?.(decoded.conn, decoded.sessionId, decoded.code);
+			events.onSessionClosed?.(
+				decoded.conn,
+				decoded.sessionId,
+				decoded.code,
+				decoded.reason,
+			);
 			return;
 		case "stream-opened":
 			events.onStreamOpened?.(
@@ -496,7 +511,12 @@ export interface WasmSessionEvents {
 		hostToken?: number,
 	) => void;
 	onClosed?: (conn: number, code: number) => void;
-	onSessionClosed?: (conn: number, sessionId: bigint, code: number) => void;
+	onSessionClosed?: (
+		conn: number,
+		sessionId: bigint,
+		code: number,
+		reason: string,
+	) => void;
 	onStreamOpened?: (
 		conn: number,
 		sessionId: bigint,

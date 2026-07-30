@@ -146,12 +146,14 @@ describe("connection lifecycle", () => {
 			);
 			expect(srv.sessions.length).toBe(2);
 
-			// Server closes A's session with an application code; A must observe
-			// it promptly (CONNECTION_CLOSE, not a 10s idle timeout).
+			// Server closes A's session with an application code; the
+			// WT_CLOSE_SESSION capsule carries both code and reason to A
+			// promptly (not after a 10s idle timeout).
 			const t0 = Date.now();
 			srv.sessions[0]?.close({ code: 42, reason: "kick" });
 			const aClosed = await a.session.closed;
 			expect(aClosed.code).toBe(42);
+			expect(aClosed.reason).toBe("kick");
 			expect(Date.now() - t0).toBeLessThan(5_000);
 
 			// B keeps working on the same endpoint.

@@ -38,11 +38,14 @@ pub enum WtEvent {
     /// The peer sent STOP_SENDING for our send half of a stream: further
     /// writes will fail. The recv half (if any) is unaffected.
     StreamStopped { conn: u32, stream: u32, code: u32 },
-    /// An extra (non-primary) WebTransport session closed; QUIC stays up.
+    /// A WebTransport session closed; the QUIC connection stays up. `reason` is
+    /// the peer's `WT_CLOSE_SESSION` reason (empty when it sent none, or when
+    /// the session ended without a capsule).
     SessionClosed {
         conn: u32,
         session_id: u64,
         code: u32,
+        reason: String,
     },
 }
 
@@ -153,11 +156,14 @@ impl WtEvent {
                 conn,
                 session_id,
                 code,
+                reason,
             } => {
                 out.push(tag::SESSION_CLOSED);
                 varint::encode(*conn as u64, &mut out);
                 varint::encode(*session_id, &mut out);
                 varint::encode(*code as u64, &mut out);
+                varint::encode(reason.len() as u64, &mut out);
+                out.extend_from_slice(reason.as_bytes());
             }
         }
         out
@@ -253,6 +259,16 @@ mod tests {
                 conn: 9,
                 session_id: 16,
                 code: 0,
+                reason: String::new(),
+            },
+            None,
+        );
+        roundtrip(
+            WtEvent::SessionClosed {
+                conn: 9,
+                session_id: 16,
+                code: 42,
+                reason: "bye".to_string(),
             },
             None,
         );

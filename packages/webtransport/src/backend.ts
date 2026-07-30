@@ -1278,7 +1278,7 @@ export class WasmTransportManager {
 					}
 				}
 			},
-			onSessionClosed: (conn, sessionId, code) => {
+			onSessionClosed: (conn, sessionId, code, reason) => {
 				const detail = this.endpoint.takeLastError();
 				const key = sessionKey(conn, sessionId);
 				const s = this.sessions.get(key);
@@ -1286,15 +1286,20 @@ export class WasmTransportManager {
 					conn,
 					sessionId: sessionId.toString(),
 					code,
+					reason: reason || undefined,
 					detail: detail || undefined,
 				});
 				if (s) {
-					s._markClosed({ code, reason: detail || undefined }, detail);
+					s._markClosed(
+						{ code, reason: reason || detail || undefined },
+						detail,
+					);
 					this.sessions.delete(key);
 				} else {
 					// Secondary CONNECT failed/timed out before establish.
 					this.failedPendingOpens.add(key);
 				}
+				this._releaseSessionHostReservations(conn, sessionId);
 				for (const [handle, sid] of [...this.streamSessionIds]) {
 					if (sid === sessionId) {
 						const ws = this.streams.get(handle);
@@ -1850,6 +1855,32 @@ export class WasmTransportManager {
 	private _releaseConnectionHostReservations(conn: number): void {
 		for (const reservation of [...this.hostReservations]) {
 			if (reservation.conn === conn) reservation.release();
+		}
+	}
+
+	/**
+	 * Release the retained inbound bytes owned by one closing session. Stream
+	 * reservations follow their stream's session; datagram reservations are only
+	 * connection-scoped, so they drop once the last session on that connection
+	 * is gone. Call after the session has left {@link sessions} but before its
+	 * stream ids are unmapped.
+	 */
+	private _releaseSessionHostReservations(
+		conn: number,
+		sessionId: bigint,
+	): void {
+		const connHasLiveSession = [...this.sessions.values()].some(
+			(s) => s.conn === conn,
+		);
+		for (const reservation of [...this.hostReservations]) {
+			if (reservation.conn !== conn) continue;
+			const owner =
+				reservation.stream === undefined
+					? undefined
+					: this.streamSessionIds.get(reservation.stream);
+			const owned =
+				owner === undefined ? !connHasLiveSession : owner === sessionId;
+			if (owned) reservation.release();
 		}
 	}
 
