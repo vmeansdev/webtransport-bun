@@ -6,6 +6,7 @@
 		"test": "bun run test:once",
 		"test:once": "WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test",
 		"test:wasm-server": "bunx playwright test -c playwright.wasm.config.ts",
+		"test:qpack": "WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.qpack.config.ts",
 		"install:browsers": "playwright install chromium",
 		"prepare:interop": "bun run prepare-certs.ts"
 	},

@@ -9,8 +9,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import {
 	createServer,
-	WT_RESET,
 	type Resettable,
+	WT_RESET,
 } from "../../packages/webtransport/src/index.ts";
 import {
 	nextWithTimeout,
@@ -140,9 +140,24 @@ if (!certPem || !keyPem) {
 	);
 }
 
+// Optional dynamic-QPACK advertisement for the QPACK interop project. Off
+// unless WT_QPACK_MAX_TABLE_CAPACITY is set, so the default interop run keeps
+// static-only wire behavior.
+const qpackMaxTableCapacityEnv = process.env.WT_QPACK_MAX_TABLE_CAPACITY;
+const qpackMaxTableCapacity =
+	qpackMaxTableCapacityEnv === undefined
+		? undefined
+		: Number(qpackMaxTableCapacityEnv);
+if (qpackMaxTableCapacity !== undefined) {
+	console.log(
+		`addon-server: advertising qpackMaxTableCapacity=${qpackMaxTableCapacity}`,
+	);
+}
+
 const wtServer = createServer({
 	port: QUIC_PORT,
 	tls: { certPem, keyPem },
+	...(qpackMaxTableCapacity === undefined ? {} : { qpackMaxTableCapacity }),
 	// Keep QUIC idle as a backstop above the application idle closer so the
 	// harness can emit ApplicationClosed(3990) before an abrupt transport drop.
 	limits: { idleTimeoutMs: IDLE_TIMEOUT_MS + 10_000 },
