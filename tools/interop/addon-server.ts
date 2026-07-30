@@ -7,7 +7,11 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
-import { createServer } from "../../packages/webtransport/src/index.ts";
+import {
+	createServer,
+	WT_RESET,
+	type Resettable,
+} from "../../packages/webtransport/src/index.ts";
 import {
 	nextWithTimeout,
 	readWithTimeout,
@@ -24,6 +28,8 @@ const HEALTH_PORT = resolveInteropHealthPort();
 const IDLE_TIMEOUT_MS = Number(process.env.WT_IDLE_TIMEOUT_MS ?? "60000");
 const WAIT_IDLE_TIMEOUT_MS = IDLE_TIMEOUT_MS + 5_000;
 const CLOSE_SIGNAL = "__WT_CLOSE_4001__";
+/** `__WT_RESET_<code>__` — open a uni stream to the client and reset it with `code`. */
+const RESET_SIGNAL = /^__WT_RESET_(\d+)__$/;
 const MAX_CLOSE_EVENTS = 200;
 
 type CloseEvent = {
@@ -186,6 +192,14 @@ const wtServer = createServer({
 					const text = decoder.decode(d);
 					if (text === CLOSE_SIGNAL) {
 						session.close({ code: 4001, reason: "interop-close" });
+						return;
+					}
+					const reset = RESET_SIGNAL.exec(text);
+					if (reset) {
+						const code = Number(reset[1]);
+						const uni = await session.createUnidirectionalStream();
+						uni.write(new Uint8Array([0x01]));
+						(uni as unknown as Resettable)[WT_RESET](code);
 						return;
 					}
 					await session.sendDatagram(d);
