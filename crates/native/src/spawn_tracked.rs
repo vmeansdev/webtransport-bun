@@ -91,7 +91,7 @@ fn spawn_tracked_watcher(
                 }
                 match scope {
                     panic_guard::PanicScope::Session(id) => {
-                        crate::session_registry::close_session(&id, 0, b"panic teardown");
+                        crate::session_registry::abort_session(&id, 0, b"panic teardown");
                     }
                     panic_guard::PanicScope::Server(owner) => {
                         crate::session_registry::close_all_for_owner(owner, 0, b"panic teardown");

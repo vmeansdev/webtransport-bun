@@ -87,7 +87,7 @@ impl SessionHandle {
     pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
         let c = code.unwrap_or(0);
         let r = reason.unwrap_or_default();
-        session_registry::close_session(&self.id, c, r.as_bytes());
+        session_registry::close_session(&self.id, c, &r);
         Ok(())
     }
 

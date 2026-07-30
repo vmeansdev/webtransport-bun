@@ -352,6 +352,35 @@ pub(crate) fn extract_close_info(
     }
 }
 
+/// Close details for a session whose peer ended it, which `closed()` cannot give.
+///
+/// A peer that ends a session sends a `CLOSE_WEBTRANSPORT_SESSION` capsule and
+/// only then closes the QUIC connection, with `H3_NO_ERROR` — a code about the
+/// transport that says nothing about the session. The capsule's code and reason
+/// reach us on the session operations instead, so ask one of those and fall back
+/// to the transport error for every other way a connection can end.
+///
+/// Bounded: on an already-closed connection the operation returns its error
+/// immediately, and the deadline only caps the case where datagrams the peer
+/// sent before closing are still queued ahead of it.
+pub(crate) async fn resolve_close_info(
+    conn: &wtransport::Connection,
+    transport_err: &wtransport::error::ConnectionError,
+) -> (Option<u32>, Option<String>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    while let Ok(res) = tokio::time::timeout_at(deadline, conn.receive_datagram()).await {
+        match res {
+            // A datagram left over on a session that is already gone.
+            Ok(_) => continue,
+            Err(op_err @ wtransport::error::ConnectionError::ApplicationClosed(_)) => {
+                return extract_close_info(&op_err);
+            }
+            Err(_) => break,
+        }
+    }
+    extract_close_info(transport_err)
+}
+
 /// Releases per-session lifecycle counters (registry entry, per-IP rate-limit
 /// slot, and the `sessions_active` gauge) exactly once — on the normal teardown
 /// path via `release()`, or on an unwind via `Drop`. Without this, a panic in
@@ -1144,22 +1173,8 @@ pub(crate) fn spawn_wtransport_server(
                                                             }
                                                         }
                                                         close_err = conn_dgram.closed() => {
-                                                            let (mut close_code, mut close_reason) = extract_close_info(&close_err);
-                                                            // Prefer driver-level close details when available:
-                                                            // conn.closed() can resolve first with transport-level no-error
-                                                            // while receive_datagram() still carries ApplicationClosed(code, reason).
-                                                            if close_code.is_none() && close_reason.is_none() {
-                                                                if let Ok(Err(driver_close_err)) = tokio::time::timeout(
-                                                                    std::time::Duration::from_millis(50),
-                                                                    conn_dgram.receive_datagram(),
-                                                                )
-                                                                .await
-                                                                {
-                                                                    let (code2, reason2) = extract_close_info(&driver_close_err);
-                                                                    close_code = code2;
-                                                                    close_reason = reason2;
-                                                                }
-                                                            }
+                                                            let (close_code, close_reason) =
+                                                                resolve_close_info(&conn_dgram, &close_err).await;
                                                             counters.release();
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
