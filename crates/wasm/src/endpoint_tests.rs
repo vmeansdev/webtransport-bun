@@ -5545,3 +5545,51 @@ fn endpoint_guard_decision_covers_all_arms() {
     assert_eq!(endpoint_guard_decision(false, false, false, true), 5);
     assert_eq!(endpoint_guard_decision(false, false, false, false), 6);
 }
+
+/// §6 teardown must not reach for a stream half that does not exist. A
+/// unidirectional stream has only one, owned by whichever side opened it, and
+/// quinn-proto asserts on the other — which in wasm is an unreachable trap, not
+/// a catchable error. Closing a session that owns a self-opened uni stream
+/// (and one the peer opened) has to survive.
+#[test]
+fn closing_a_session_with_unidirectional_streams_does_not_trap() {
+    let (mut server, mut client, cid) = endpoints();
+    let mut established = false;
+
+    for _ in 0..800 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while server.poll_event().is_some() {}
+        if established {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(established, "session must establish");
+
+    // Send-only half locally, and let the peer's uni stream arrive so the
+    // recv-only case is covered on the client too.
+    assert!(client.open_stream(cid, 0, false) >= 0);
+    assert!(server.open_stream(cid, 0, false) >= 0);
+    for _ in 0..200 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while client.poll_event().is_some() {}
+        while server.poll_event().is_some() {}
+        if !a && !b {
+            break;
+        }
+    }
+
+    assert!(client.close_wt_session(cid, 0, 7, b"bye"));
+    assert!(server.close_wt_session(cid, 0, 7, b"bye"));
+}
