@@ -91,6 +91,20 @@ function verifyGeneratedMaterial(certPath: string, keyPath: string): void {
 	if (!isLocalhostCertificateSummary(certSummary)) {
 		throw new Error("generated certificate is missing localhost SAN entries");
 	}
+
+	// The key/SAN checks above accept a certificate regardless of its validity
+	// window, so an expired cert on disk would be silently reused. These certs
+	// are minted with only 10 days of validity, and Chrome enforces the
+	// notBefore..notAfter window for `serverCertificateHashes`, so an expired
+	// cert produces an immediate connection failure in the interop suite.
+	// `openssl x509 -checkend` exits non-zero — and runOpenSSL therefore throws
+	// — when the cert has expired or will expire within the margin, forcing
+	// regeneration. The margin comfortably clears any single interop run.
+	try {
+		runOpenSSL(["x509", "-in", certPath, "-checkend", "3600", "-noout"]);
+	} catch {
+		throw new Error("certificate is expired or expiring within the hour");
+	}
 }
 
 type InteropMaterialPaths = {
