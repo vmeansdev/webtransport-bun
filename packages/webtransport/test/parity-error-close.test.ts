@@ -51,17 +51,32 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			// was handed. This one proves the CLOSE_WEBTRANSPORT_SESSION capsule
 			// carries both fields: nothing on the client ever sees 4242 or the
 			// reason string, so they can only have arrived from the server.
+			// `open()` retries, so more than one server session can exist; a
+			// token round-trip identifies the one actually backing this client.
+			const token = `close-${Math.random().toString(36).slice(2)}`;
 			let server: ParityServerSession | undefined;
 			onServerSession = (session) => {
-				server = session;
+				void (async () => {
+					const decoder = new TextDecoder();
+					for await (const d of session.incomingDatagrams()) {
+						if (decoder.decode(d) === token) {
+							server = session;
+							return;
+						}
+					}
+				})().catch(() => {});
 			};
 			try {
 				const wt = await harness.open();
 				await wt.ready;
+				const writer = wt.datagrams.writable.getWriter();
 				const deadline = Date.now() + 5000;
+				// Datagrams are unreliable; resend until the server has one.
 				while (!server && Date.now() < deadline) {
-					await new Promise((r) => setTimeout(r, 10));
+					await writer.write(new TextEncoder().encode(token));
+					await new Promise((r) => setTimeout(r, 25));
 				}
+				writer.releaseLock();
 				expect(server).toBeDefined();
 				server?.close({ code: 4242, reason: "peer said so" });
 				const info = await wt.closed;
