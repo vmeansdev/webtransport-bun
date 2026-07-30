@@ -400,6 +400,20 @@ pub fn drain_session(session_id: &str) {
     }
 }
 
+/// Tell the peer not to open any further session on this connection (H3 `GOAWAY`).
+///
+/// `GOAWAY` is connection-scoped, not session-scoped, so this is a
+/// server-initiated graceful-shutdown signal: "I'm going away, don't start new
+/// sessions." The session stays in the registry and fully usable — like a drain,
+/// this is a warning, not an ending. Native is single-session-per-connection, so
+/// the "refuse a second session" enforcement is not exercisable through the
+/// public API; the observable effect is the peer's `draining` settling.
+pub fn send_goaway(session_id: &str) {
+    if let Some(entry) = REGISTRY.get(session_id) {
+        entry.conn.send_goaway();
+    }
+}
+
 /// Tear a session down at the QUIC level without a close capsule.
 ///
 /// For teardowns that are not an application close — a contained panic, an

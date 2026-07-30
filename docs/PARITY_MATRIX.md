@@ -64,7 +64,7 @@ live.
 |---|---|---|---|---|
 | `WT_CLOSE_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_registry.rs,client.rs,lib.rs}` (via the fork's `Connection::close_session`); `crates/wasm/src/{capsule.rs,endpoint.rs}` | Real Chromium reads back both fields on both backends: `tools/interop/tests/edge-cases.pw.ts`, `tools/interop/tests/interop-expanded.pw.ts`, `tools/interop/tests-wasm/wasm-server.spec.ts`. Backend-to-backend: `packages/webtransport/test/parity-error-close.test.ts` ("close code and reason cross the wire from the peer"). WASM unit: `crates/wasm/src/endpoint_tests.rs::primary_session_close_conveys_code_and_reason_over_capsule` |
 | `WT_DRAIN_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_napi.rs,session_registry.rs,client.rs}` over the fork's `drain_session`/`draining`; `packages/webtransport/src/{index.ts,portable.ts,portable-native.ts}`; `crates/wasm/src/{capsule.rs,endpoint.rs}` | `packages/webtransport/test/parity-facade-lifecycle.test.ts` ("draining resolves on a peer drain, and the session stays usable") runs on **both** backends. WASM unit: `crates/wasm/src/endpoint_tests.rs::drain_capsule_notifies_the_peer_without_closing_the_session` |
-| `GOAWAY` | fork-side only — `Connection::send_goaway` exists, **not exposed** through the native binding | **not implemented** — wasm signals session drain only | fork `wtransport/src/connection.rs` | No repo-side send path on either backend, so nothing here is claimed. A received `GOAWAY` does settle native `draining`, since the fork folds it into the same signal |
+| `GOAWAY` (send + receive) | `implemented` — server-side `goAway()` sends the connection-scoped H3 `GOAWAY`; a received `GOAWAY` already settled `draining` | **deliberate non-goal** — the wasm h3 module has no control-stream `GOAWAY` handling; wasm signals session drain only | `crates/native/src/{session_napi.rs,session_registry.rs}` over the fork's `Connection::send_goaway`; `packages/webtransport/src/index.ts` (`ServerSession.goAway()`) | `packages/webtransport/test/native-goaway.test.ts`: a native server calls `goAway()` and the native client peer observes it — its `draining` settles while the session stays usable (a fresh stream still opens). Negative control: without the send, `draining` stays pending on the wire. **Scope caveat:** native is single-session-per-connection, so `GOAWAY`'s real use is a server-initiated graceful-shutdown signal ("don't start new sessions"); the "refuse a second session" enforcement is not reachable through the public API, since native cannot open a 2nd CONNECT on one connection |
 | `WT_APPLICATION_ERROR` remap (§4.4, QUIC stream codes only) | `implemented` | `implemented` | fork `wtransport/src/stream.rs` (`reset`/`stop` take a `u32` and map it); `crates/wasm/src/wt_error.rs` | Chromium round-trips the code on both backends: `tools/interop/tests/interop-expanded.pw.ts` and `tools/interop/tests-wasm/wasm-server.spec.ts` ("stream reset code round-trips … through the remap"). Both were verified to fail when the server shifts the code by one |
 | Buffered-stream reject (`WT_BUFFERED_STREAM_REJECTED`) | n/a — native is single-session, so there is no unassociated-stream buffer | `implemented` | `crates/wasm/src/endpoint.rs` | `crates/wasm/src/endpoint_tests.rs::unassociated_wt_stream_is_rejected_with_buffered_stream_rejected` |
 
@@ -74,9 +74,15 @@ received `GOAWAY` — the fork folds both into one signal), and *also* on the
 local `close()` path and on `closed`. Those fallbacks are deliberate: a peer
 that never drains must not leave consumers waiting forever.
 
-`send_goaway()` remains unexposed, so neither backend can *send* a `GOAWAY`.
-That asymmetry is intentional — wasm has no GOAWAY at all — and is the one
-remaining gap in this section.
+The native backend now *sends* `GOAWAY` through `ServerSession.goAway()`, which
+surfaces the fork's `Connection::send_goaway`. Because native is
+single-session-per-connection, the practical effect is limited to a
+server-initiated graceful-shutdown signal — the peer observes it as its
+`draining` settling, the session stays usable, and the "refuse a second session"
+enforcement `GOAWAY` implies is not exercisable through the public API. Wasm
+sends no `GOAWAY` and that stays a deliberate non-goal: the wasm h3 module has no
+control-stream `GOAWAY` handling. That asymmetry is intentional, not a pending
+gap.
 
 **The native backend consumes the fork at rev `d3ff84d`** (branch
 `feat/qpack-dynamic`, which stacks on `feat/track1-conformance`, itself a
