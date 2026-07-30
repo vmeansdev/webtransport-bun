@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without ending the session. The wasm backend gained a capsule encoder and
   decoder; the native backend routes `session.close({code, reason})` through
   the fork's `Connection::close_session`.
+- Sessions expose `drain()` and a wire-driven `draining` promise on both
+  backends and on `webtransport-bun/portable`. `drain()` sends a
+  `WT_DRAIN_SESSION` capsule — the session stays fully usable — and `draining`
+  resolves when the peer sends one. The existing local-`close()` fallback is
+  unchanged, so a peer that never drains still cannot hang a consumer.
 - WebTransport application error codes are mapped onto the reserved QUIC range
   and back per draft §4.4, for QUIC **stream** codes only — the close capsule
   carries the raw 32-bit code.

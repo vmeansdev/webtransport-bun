@@ -63,19 +63,20 @@ live.
 | Behavior | Native | WASM | Implementation source | Implementation evidence |
 |---|---|---|---|---|
 | `WT_CLOSE_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_registry.rs,client.rs,lib.rs}` (via the fork's `Connection::close_session`); `crates/wasm/src/{capsule.rs,endpoint.rs}` | Real Chromium reads back both fields on both backends: `tools/interop/tests/edge-cases.pw.ts`, `tools/interop/tests/interop-expanded.pw.ts`, `tools/interop/tests-wasm/wasm-server.spec.ts`. Backend-to-backend: `packages/webtransport/test/parity-error-close.test.ts` ("close code and reason cross the wire from the peer"). WASM unit: `crates/wasm/src/endpoint_tests.rs::primary_session_close_conveys_code_and_reason_over_capsule` |
-| `WT_DRAIN_SESSION` capsule | fork-side only — `Connection::drain_session`/`draining` exist but **no napi binding exposes them** (see below) | `implemented` | fork `wtransport/src/connection.rs`; `crates/wasm/src/{capsule.rs,endpoint.rs}` | `crates/wasm/src/endpoint_tests.rs::drain_capsule_notifies_the_peer_without_closing_the_session`. The facade's local-close `draining` fallback (`packages/webtransport/src/index.ts`) is preserved on both backends |
-| `GOAWAY` | fork-side only — `Connection::send_goaway` exists, **not exposed** through the native binding | **not implemented** — wasm signals session drain only | fork `wtransport/src/connection.rs` | No repo-side send path on either backend, so nothing here is claimed |
+| `WT_DRAIN_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_napi.rs,session_registry.rs,client.rs}` over the fork's `drain_session`/`draining`; `packages/webtransport/src/{index.ts,portable.ts,portable-native.ts}`; `crates/wasm/src/{capsule.rs,endpoint.rs}` | `packages/webtransport/test/parity-facade-lifecycle.test.ts` ("draining resolves on a peer drain, and the session stays usable") runs on **both** backends. WASM unit: `crates/wasm/src/endpoint_tests.rs::drain_capsule_notifies_the_peer_without_closing_the_session` |
+| `GOAWAY` | fork-side only — `Connection::send_goaway` exists, **not exposed** through the native binding | **not implemented** — wasm signals session drain only | fork `wtransport/src/connection.rs` | No repo-side send path on either backend, so nothing here is claimed. A received `GOAWAY` does settle native `draining`, since the fork folds it into the same signal |
 | `WT_APPLICATION_ERROR` remap (§4.4, QUIC stream codes only) | `implemented` | `implemented` | fork `wtransport/src/stream.rs` (`reset`/`stop` take a `u32` and map it); `crates/wasm/src/wt_error.rs` | Chromium round-trips the code on both backends: `tools/interop/tests/interop-expanded.pw.ts` and `tools/interop/tests-wasm/wasm-server.spec.ts` ("stream reset code round-trips … through the remap"). Both were verified to fail when the server shifts the code by one |
 | Buffered-stream reject (`WT_BUFFERED_STREAM_REJECTED`) | n/a — native is single-session, so there is no unassociated-stream buffer | `implemented` | `crates/wasm/src/endpoint.rs` | `crates/wasm/src/endpoint_tests.rs::unassociated_wt_stream_is_rejected_with_buffered_stream_rejected` |
 
-**Native `draining` is local-close-driven only.** The fork exposes
-`drain_session()`, `send_goaway()` and `draining()`, but no napi binding
-surfaces them, so on native the facade's `draining` still resolves from the
-local `close()` path (`packages/webtransport/src/index.ts`) and never from a
-received `WT_DRAIN_SESSION` or `GOAWAY`. That fallback is deliberate — it stops
-a peer that never drains from hanging consumers forever — and is preserved on
-both backends. Exposing the wire-driven path on native is remaining work, not a
-claim.
+**`draining` is wire-driven on both backends, with the local-close fallback
+kept.** It resolves on a received `WT_DRAIN_SESSION` (and, on native, a
+received `GOAWAY` — the fork folds both into one signal), and *also* on the
+local `close()` path and on `closed`. Those fallbacks are deliberate: a peer
+that never drains must not leave consumers waiting forever.
+
+`send_goaway()` remains unexposed, so neither backend can *send* a `GOAWAY`.
+That asymmetry is intentional — wasm has no GOAWAY at all — and is the one
+remaining gap in this section.
 
 **The native backend consumes the fork at rev `b0b9f5c`** (branch
 `feat/track1-conformance`, a superset of `feat/0rtt`), which is where
