@@ -432,6 +432,7 @@ pub(crate) fn spawn_wtransport_server(
     debug_logs: bool,
     enable_0rtt: bool,
     allow_early_session: bool,
+    qpack_max_table_capacity: u64,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -511,6 +512,12 @@ pub(crate) fn spawn_wtransport_server(
             // anti-replay) and allows the CONNECT request to arrive as
             // replayable early data; sessions report is_0rtt.
             let config_builder = config_builder.enable_0rtt(enable_0rtt);
+            // Dynamic QPACK (fork feature): advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY.
+            // Zero (the default) keeps static-only, unchanged wire behavior. The
+            // fork always advertises SETTINGS_QPACK_BLOCKED_STREAMS = 0, so there
+            // is no blocked-streams option to thread.
+            let config_builder =
+                config_builder.qpack_max_table_capacity(qpack_max_table_capacity);
             let config = config_builder.build();
             let server = match Endpoint::server(config) {
                 Ok(s) => match s.local_addr() {

@@ -233,6 +233,38 @@ pub(crate) fn parse_congestion_control(
     }
 }
 
+/// Hard cap on the advertised QPACK dynamic-table capacity, mirroring the
+/// fork's `MAX_QPACK_TABLE_CAPACITY` (64 KiB). We clamp here too so a bogus
+/// option never reaches the builder.
+pub(crate) const MAX_QPACK_TABLE_CAPACITY: u64 = 65_536;
+
+/// Capacity the `enableDynamicQpack` boolean preset expands to. Deliberately
+/// diverges from the wasm backend's blocked-streams default: native never
+/// advertises blocked_streams > 0 (the fork hardcodes it to 0), so the preset
+/// is capacity-only.
+pub(crate) const QPACK_DYNAMIC_PRESET_CAPACITY: u64 = 4096;
+
+/// Resolve the QPACK dynamic-table capacity to advertise from server/client
+/// options. `qpackMaxTableCapacity` (a number) wins when present — including an
+/// explicit `0` to force static-only — otherwise the `enableDynamicQpack`
+/// boolean expands to the preset. Absent both, the result is `0` (static-only,
+/// unchanged wire behavior). The value is clamped to
+/// [`MAX_QPACK_TABLE_CAPACITY`]. `qpackBlockedStreams` is intentionally not a
+/// settable option: the fork always advertises zero.
+pub(crate) fn parse_qpack_max_table_capacity(opts: &serde_json::Value) -> u64 {
+    if let Some(n) = opts.get("qpackMaxTableCapacity").and_then(|v| v.as_u64()) {
+        return n.min(MAX_QPACK_TABLE_CAPACITY);
+    }
+    if opts
+        .get("enableDynamicQpack")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return QPACK_DYNAMIC_PRESET_CAPACITY;
+    }
+    0
+}
+
 /// Default client idle timeout. quinn's default is `None` (never), which leaves
 /// a client on a dead path (NAT rebind, network drop, server power loss) hung
 /// forever with `closed` never resolving. A bounded default guarantees liveness.
@@ -327,6 +359,7 @@ fn build_wtransport_client_config(
     congestion_control: CongestionControlMode,
     idle_timeout_ms: u64,
     keep_alive_interval_ms: u64,
+    qpack_max_table_capacity: u64,
 ) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let transport_config =
         build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
@@ -336,6 +369,7 @@ fn build_wtransport_client_config(
     Ok(wtransport::ClientConfig::builder()
         .with_bind_default()
         .with_custom_tls_and_transport(tls_config, transport_config)
+        .qpack_max_table_capacity(qpack_max_table_capacity)
         .build())
 }
 
@@ -350,6 +384,7 @@ pub(crate) fn insecure_loopback_client_config(
         CongestionControlMode::Default,
         60_000,
         10_000,
+        0,
     )
 }
 
@@ -1403,6 +1438,9 @@ async fn run_connect(
         return Err("E_INTERNAL: enable0Rtt cannot be used with allowPooling=true".into());
     }
 
+    // QPACK dynamic-table capacity to advertise (0 = static-only, the default).
+    let qpack_max_table_capacity = parse_qpack_max_table_capacity(&opts);
+
     let handshake_timeout_ms = opts
         .get("limits")
         .and_then(|l| l.get("handshakeTimeoutMs")?.as_u64())
@@ -1454,6 +1492,7 @@ async fn run_connect(
                 congestion_control,
                 idle_timeout_ms,
                 keep_alive_interval_ms,
+                qpack_max_table_capacity,
             )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
@@ -1489,6 +1528,7 @@ async fn run_connect(
             idle_timeout_ms,
             keep_alive_interval_ms,
             handshake_timeout_ms,
+            qpack_max_table_capacity,
         )
         .await;
     }
@@ -1500,6 +1540,7 @@ async fn run_connect(
         congestion_control,
         idle_timeout_ms,
         keep_alive_interval_ms,
+        qpack_max_table_capacity,
     )?;
 
     if let Some(resolver) = custom_resolver {
@@ -1547,6 +1588,7 @@ async fn run_connect_0rtt(
     idle_timeout_ms: u64,
     keep_alive_interval_ms: u64,
     handshake_timeout_ms: u64,
+    qpack_max_table_capacity: u64,
 ) -> std::result::Result<RunConnectResult, Box<dyn std::error::Error + Send + Sync>> {
     let key = crate::zero_rtt::TlsIdentityKey::new(insecure_skip_verify, ca_pem, pinned_hashes);
     let (tls_config, store) = crate::zero_rtt::shared_tls_for_identity(&key, ca_pem, pinned_hashes)
@@ -1558,6 +1600,7 @@ async fn run_connect_0rtt(
         .with_bind_default()
         .with_custom_tls_and_transport(tls_config, transport_config)
         .enable_0rtt(true)
+        .qpack_max_table_capacity(qpack_max_table_capacity)
         .build();
     if let Some(resolver) = custom_resolver {
         config.set_dns_resolver(resolver);
@@ -1618,8 +1661,9 @@ mod tests {
     use super::{
         build_client_tls_config, build_quic_transport_config, build_root_cert_store,
         congestion_controller_label, handle_connect_callback_status, insert_registry_entry,
-        parse_client_limits, parse_congestion_control, remove_registry_entry, ClientMetrics,
-        ClientSessionHandle, CongestionControlMode, CLIENT_HANDLE_REGISTRY,
+        parse_client_limits, parse_congestion_control, parse_qpack_max_table_capacity,
+        remove_registry_entry, ClientMetrics, ClientSessionHandle, CongestionControlMode,
+        CLIENT_HANDLE_REGISTRY, MAX_QPACK_TABLE_CAPACITY, QPACK_DYNAMIC_PRESET_CAPACITY,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1696,6 +1740,48 @@ mod tests {
         let default_mode = parse_congestion_control(&json!({})).expect("default should parse");
         assert_eq!(default_mode, CongestionControlMode::Default);
         assert_eq!(congestion_controller_label(default_mode), "cubic");
+    }
+
+    #[test]
+    fn parse_qpack_capacity_defaults_to_static_only() {
+        assert_eq!(parse_qpack_max_table_capacity(&json!({})), 0);
+        assert_eq!(
+            parse_qpack_max_table_capacity(&json!({ "enableDynamicQpack": false })),
+            0
+        );
+    }
+
+    #[test]
+    fn parse_qpack_capacity_preset_expands_to_4096() {
+        assert_eq!(
+            parse_qpack_max_table_capacity(&json!({ "enableDynamicQpack": true })),
+            QPACK_DYNAMIC_PRESET_CAPACITY
+        );
+    }
+
+    #[test]
+    fn parse_qpack_capacity_explicit_wins_over_preset() {
+        // Explicit capacity beats the boolean preset in both directions.
+        assert_eq!(
+            parse_qpack_max_table_capacity(
+                &json!({ "qpackMaxTableCapacity": 1024, "enableDynamicQpack": true })
+            ),
+            1024
+        );
+        assert_eq!(
+            parse_qpack_max_table_capacity(
+                &json!({ "qpackMaxTableCapacity": 0, "enableDynamicQpack": true })
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn parse_qpack_capacity_clamps_to_max() {
+        assert_eq!(
+            parse_qpack_max_table_capacity(&json!({ "qpackMaxTableCapacity": 1_000_000 })),
+            MAX_QPACK_TABLE_CAPACITY
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

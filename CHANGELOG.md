@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope. This required forking `wtransport` — see below and
   `docs/FORK_MAINTENANCE.md`.
 
+- **Native dynamic QPACK (opt-in).** `createServer` and the client (`connect` /
+  `WebTransport`) accept `qpackMaxTableCapacity` (bytes, clamped to 64 KiB) and
+  the `enableDynamicQpack` boolean preset (capacity 4096). Off by default
+  (capacity 0 = static-only, unchanged wire behavior). When set, native
+  advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY`, decodes the peer's dynamic
+  table, and drives its decoder stream (Section-Ack / Insert-Count-Increment /
+  Stream-Cancellation). `SETTINGS_QPACK_BLOCKED_STREAMS` is always advertised as
+  0 and is not configurable — the decision that keeps header decoding
+  synchronous. A consequence worth stating: because a WebTransport session
+  carries a single CONNECT header exchange and at blocked-streams 0 an encoder
+  may not reference an unacknowledged entry, native never emits a dynamic-table
+  *reference* on the wire; it populates and acknowledges the table but encodes
+  the CONNECT literally. This is an interop/completeness feature, not a
+  throughput one. Backed by the fork (see below); decode correctness is covered
+  by the fork's RFC 9204 Appendix B vectors, and a Chromium interop test proves
+  native no longer rejects a peer that advertises a table.
+
 - **WebTransport session capsules on both backends.** A session close now
   reaches the peer as a `WT_CLOSE_SESSION` capsule carrying the application
   code and reason, and a received `WT_DRAIN_SESSION` resolves `draining`
@@ -51,16 +68,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Upgraded `wtransport` from `=0.7.0` to `=0.7.1`, then switched both the native
   addon and the reference server from the crates.io release to a Git dependency
-  on the `vmeansdev/wtransport` fork (branch `feat/track1-conformance`, pinned
-  by rev `b0b9f5c`, version `0.7.1-zerortt.1`) via `[workspace.dependencies]`.
-  The fork adds the 0-RTT APIs upstream 0.7.1 lacked, plus the session
-  lifecycle work above; the swap is otherwise behavior-neutral. The reference
-  crate keeps the `quinn` feature for compile parity.
+  on the `vmeansdev/wtransport` fork (branch `feat/qpack-dynamic`, which stacks
+  on `feat/track1-conformance`, pinned by rev `d3ff84d`, version
+  `0.7.1-zerortt-qpack.1`) via `[workspace.dependencies]`. The fork adds the
+  0-RTT APIs upstream 0.7.1 lacked, the session lifecycle work above, and the
+  dynamic QPACK decode + encoder machinery; the swap is behavior-neutral while
+  the QPACK capacity default stays 0. The reference crate keeps the `quinn`
+  feature for compile parity.
 - The wasm `SETTINGS_WT_MAX_SESSIONS` codepoint was corrected to Chromium's
   `0xc671706a`; the previous value was fabricated.
-- `docs/PARITY_MATRIX.md` now lists native 0-RTT as **implemented (on the fork)**
-  rather than upstream-gated; dynamic QPACK remains upstream-gated on native and
-  wasm-only. `docs/WASM_PROTOCOL_SCOPE.md` notes the native/wasm 0-RTT parity.
+- `docs/PARITY_MATRIX.md` now lists native 0-RTT **and** native dynamic QPACK as
+  **implemented (on the fork)** rather than upstream-gated; the upstream-gated
+  table is now empty. `docs/WASM_PROTOCOL_SCOPE.md` notes the native/wasm 0-RTT
+  and dynamic-QPACK parity, including the deliberate blocked-streams divergence
+  (native always 0, wasm defaults 16).
 - `WasmServerSession` now mirrors the native `ServerSession` surface (`id`, `peer`,
   `incomingDatagrams()`, incoming stream `ReadableStream`s, `getStats()`), delegating
   to a `WasmWebTransport` over the same session. `createBidirectionalStream` and

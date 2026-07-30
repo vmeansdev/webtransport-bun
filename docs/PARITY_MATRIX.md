@@ -78,10 +78,11 @@ that never drains must not leave consumers waiting forever.
 That asymmetry is intentional — wasm has no GOAWAY at all — and is the one
 remaining gap in this section.
 
-**The native backend consumes the fork at rev `b0b9f5c`** (branch
-`feat/track1-conformance`, a superset of `feat/0rtt`), which is where
-`close_session`, the drain/GOAWAY methods, and the §4.4 remap live. See
-`docs/FORK_MAINTENANCE.md`.
+**The native backend consumes the fork at rev `d3ff84d`** (branch
+`feat/qpack-dynamic`, which stacks on `feat/track1-conformance`, itself a
+superset of `feat/0rtt`), which is where `close_session`, the drain/GOAWAY
+methods, the §4.4 remap, and the dynamic QPACK decode + encoder machinery live.
+See `docs/FORK_MAINTENANCE.md`.
 
 ## Native and wasm implementation surfaces
 
@@ -100,29 +101,29 @@ remaining gap in this section.
 
 ## Upstream-Gated Capabilities (native backend)
 
-These are `missing` on the native backend because the underlying `wtransport`
-crate does not expose the required APIs. They are tracked as upstream feature
-requests, not local work items (file against
-[BiagioFesta/wtransport](https://github.com/BiagioFesta/wtransport)).
+No native capabilities are `missing` for want of an upstream API any longer.
+The two that were — 0-RTT and the dynamic QPACK table — are now implemented on
+the `vmeansdev/wtransport` fork (see below); the table is kept for history.
 
-| Capability | Status | Why it is upstream-gated (verified against wtransport 0.7.1 source) |
+| Capability | Status | Notes |
 | --- | --- | --- |
-| Dynamic QPACK table | `missing` (upstream-gated, hard) | `wtransport-proto` QPACK decoder is static-table-only — any dynamic-table instruction returns `DecodingError::DynamicNotSupported` (`qpack.rs`); local SETTINGS hardcode `qpack_max_table_capacity(0)` and `qpack_blocked_streams(0)` (`driver/streams/settings.rs:25-26`). Native must never advertise nonzero QPACK SETTINGS until upstream implements the dynamic table. |
+| Dynamic QPACK table | **implemented (on the fork)** | Was `missing` on stock wtransport 0.7.1 (the QPACK decoder was static-table-only, returning `DecodingError::DynamicNotSupported`, and local SETTINGS hardcoded capacity 0). The fork adds RFC 9204 dynamic-table decode, the local decoder stream (Section-Ack / Insert-Count-Increment / Stream-Cancellation), and the peer-sized encoder machinery. Native exposes it opt-in via `qpackMaxTableCapacity` / `enableDynamicQpack` (default 0 = static-only). `SETTINGS_QPACK_BLOCKED_STREAMS` is always 0, so native decodes + acknowledges the peer's table but never emits a dynamic-table *reference* on the single CONNECT exchange (an encoder may not reference an unacknowledged entry at blocked-streams 0). Interop/completeness, not throughput. Decode is covered by the fork's RFC 9204 Appendix B vectors; a Chromium interop test (`tools/interop/tests-qpack/`) proves native no longer rejects an advertised table. |
 
 Server-side capabilities that became available in wtransport 0.7.1 —
 congestion control (`ServerOptions.congestionControl`) and keep-alive
 (`limits.keepAliveIntervalMs`, clamped to `min(interval, idleTimeout/3)`) —
 are implemented on native and no longer upstream-gated.
 
-**0-RTT is no longer upstream-gated.** The native backend now depends on a
-fork of wtransport (`vmeansdev/wtransport`, branch `feat/track1-conformance`,
-pinned by rev `b0b9f5c`) that adds `enable_0rtt`,
+**0-RTT and dynamic QPACK are no longer upstream-gated.** The native backend
+now depends on a fork of wtransport (`vmeansdev/wtransport`, branch
+`feat/qpack-dynamic`, pinned by rev `d3ff84d`) that adds `enable_0rtt`,
 `connect_0rtt`, `SessionRequest::is_0rtt`/`handshake_confirmed`, and
-0-RTT-rejection recovery — the exact APIs 0.7.1 lacked. The consuming plumbing
-lives in `crates/native/src/zero_rtt.rs` and is surfaced through the facade;
-see the implemented row above and `docs/FORK_MAINTENANCE.md` for the
-obligations the git dependency creates. Dynamic QPACK remains native-only in
-the wasm stack.
+0-RTT-rejection recovery — the exact APIs 0.7.1 lacked — plus the
+`qpack_max_table_capacity` config method and the dynamic QPACK decode + encoder
+machinery. The 0-RTT plumbing lives in `crates/native/src/zero_rtt.rs`; the
+QPACK options thread through `crates/native/src/{client,server_napi,lib}.rs`.
+Both are surfaced through the facade; see the implemented rows above and
+`docs/FORK_MAINTENANCE.md` for the obligations the git dependency creates.
 
 ## Candidate notes
 
