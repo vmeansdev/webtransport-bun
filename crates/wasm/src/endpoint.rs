@@ -2545,9 +2545,15 @@ impl WtEndpoint {
                     self.end_wt_session(h, sid, code, reason);
                     return;
                 }
-                // WT_DRAIN_SESSION is wired up in W-T3; ignoring it here is
-                // spec-legal (a drain is advisory) and keeps parsing bounded.
-                Ok(Some(crate::capsule::Capsule::Drain)) => continue,
+                Ok(Some(crate::capsule::Capsule::Drain)) => {
+                    if let Some(&conn) = self.handle_to_id.get(&h) {
+                        self.push_event(WtEvent::SessionDraining {
+                            conn,
+                            session_id: u64::from(sid),
+                        });
+                    }
+                    continue;
+                }
                 Ok(None) => return,
                 Err(_) => {
                     if let Some(conn) = self.conns.get_mut(&h) {
@@ -2682,6 +2688,9 @@ impl WtEndpoint {
             RejectWt {
                 error: String,
                 bidi: bool,
+                /// QUIC code for the RESET_STREAM / STOP_SENDING (§4.6 uses
+                /// WT_BUFFERED_STREAM_REJECTED for a WT stream we cannot take).
+                code: u32,
             },
             None,
         }
@@ -2734,6 +2743,7 @@ impl WtEndpoint {
                                     error: "E_LIMIT_EXCEEDED: unlatched CONNECT admission cap"
                                         .to_string(),
                                     bidi: true,
+                                    code: 0,
                                 };
                             }
                             st.connect_admitted = true;
@@ -2744,6 +2754,7 @@ impl WtEndpoint {
                                 error: "E_LIMIT_EXCEEDED: CONNECT request buffer exceeded"
                                     .to_string(),
                                 bidi: true,
+                                code: 0,
                             };
                         }
                         Route::ServerConnect { id }
@@ -2769,6 +2780,7 @@ impl WtEndpoint {
                                         error: "E_SESSION_CLOSED: unknown WebTransport session id"
                                             .to_string(),
                                         bidi: st.is_bidi,
+                                        code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                     };
                                 }
                                 st.sid_read = true;
@@ -2788,6 +2800,7 @@ impl WtEndpoint {
                                         error: "E_LIMIT_EXCEEDED: stream handle space exhausted"
                                             .to_string(),
                                         bidi: st.is_bidi,
+                                        code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                     };
                                 };
                                 let Some(&conn_id) = self.handle_to_id.get(&h) else {
@@ -2809,6 +2822,7 @@ impl WtEndpoint {
                                         break 'route Route::RejectWt {
                                             error: err,
                                             bidi: st.is_bidi,
+                                            code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                         };
                                     }
                                 }
@@ -2823,6 +2837,7 @@ impl WtEndpoint {
                                         break 'route Route::RejectWt {
                                             error: err,
                                             bidi: st.is_bidi,
+                                            code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                         };
                                     }
                                 };
@@ -2905,12 +2920,12 @@ impl WtEndpoint {
                     });
                 }
             }
-            Route::RejectWt { error, bidi } => {
+            Route::RejectWt { error, bidi, code } => {
                 self.set_last_error(error);
                 if let Some(conn) = self.conns.get_mut(&h) {
-                    let _ = conn.recv_stream(id).stop(VarInt::from_u32(0));
+                    let _ = conn.recv_stream(id).stop(VarInt::from_u32(code));
                     if should_reset_send_on_wt_reject(bidi) {
-                        let _ = conn.send_stream(id).reset(VarInt::from_u32(0));
+                        let _ = conn.send_stream(id).reset(VarInt::from_u32(code));
                     }
                 }
                 self.retire_in_stream(h, id);
@@ -3894,6 +3909,41 @@ impl WtEndpoint {
         }
         self.reset_session_streams(h, conn_id, session_id);
         self.push_session_closed(conn_id, session_id, code, String::new());
+        true
+    }
+
+    /// Tell the peer this session is draining (§6): it should stop starting new
+    /// streams and datagrams, but everything in flight keeps running and the
+    /// session stays open until it is actually closed. Only meaningful on an
+    /// established session (§3.2).
+    pub fn drain_wt_session(&mut self, conn_id: u32, session_id: u64) -> bool {
+        let Some(&h) = self.id_to_handle.get(&conn_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown connection");
+            return false;
+        };
+        let Some(session) = self.sessions.get(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: session missing");
+            return false;
+        };
+        let Some(sid) = session.resolve_wt_session(session_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown WebTransport session id");
+            return false;
+        };
+        let established = if session.connect_stream == Some(sid) {
+            session.established && !session.connect_closed
+        } else {
+            session.extra_sessions.contains(&sid)
+        };
+        if !established {
+            self.set_last_error("E_SESSION_CLOSED: session not established");
+            return false;
+        }
+        let Some(conn) = self.conns.get_mut(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: connection missing");
+            return false;
+        };
+        let frame = crate::capsule::drain_data_frame();
+        let _ = conn.send_stream(sid).write(&frame);
         true
     }
 
