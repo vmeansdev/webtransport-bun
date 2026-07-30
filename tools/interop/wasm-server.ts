@@ -14,6 +14,12 @@ import { BunUdpTransport } from "../../packages/webtransport/src/bun-udp.ts";
 const QUIC_PORT = 4435;
 const HEALTH_PORT = 4436;
 
+// Command channel, mirroring addon-server.ts so both backends get the same
+// Chromium close/reset coverage. Datagrams that are not commands are echoed.
+const CLOSE_SIGNAL = "__WT_CLOSE_4001__";
+/** `__WT_RESET_<code>__` — open a uni stream to the client and reset it with `code`. */
+const RESET_SIGNAL = /^__WT_RESET_(\d+)__$/;
+
 const pkgPath = fileURLToPath(
 	new URL("../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
 );
@@ -34,8 +40,25 @@ const { manager, certHashBase64 } = await serveOverUdp(
 		commonName: "localhost",
 		validityDays: 14,
 		onSession: (session) => {
-			// Datagram echo
-			session.onDatagram((d) => session.sendDatagram(d));
+			const decoder = new TextDecoder();
+			// Datagram echo, minus the command channel.
+			session.onDatagram((d) => {
+				const text = decoder.decode(d);
+				if (text === CLOSE_SIGNAL) {
+					session.close({ code: 4001, reason: "interop-close" });
+					return;
+				}
+				const reset = RESET_SIGNAL.exec(text);
+				if (reset) {
+					const out = session.createUnidirectionalStream();
+					out
+						.writeAll(new Uint8Array([0x01]))
+						.then(() => out.reset(Number(reset[1])))
+						.catch(() => {});
+					return;
+				}
+				session.sendDatagram(d);
+			});
 			// Stream echo
 			session.onIncomingStream((stream) => {
 				if (stream.bidi) {

@@ -289,3 +289,118 @@ test("eight consecutive Chromium reconnects complete against the WASM server", a
 		})),
 	);
 });
+
+test("server close code and reason reach Chromium from the wasm server", async ({
+	page,
+}) => {
+	await page.goto(HEALTH_URL);
+	const hashBase64 = await fetchCertHash();
+
+	const result = await page.evaluate(
+		async ({ url, h }) => {
+			const withTimeout = (
+				globalThis as typeof globalThis & {
+					__wtWithTimeout?: <T>(
+						promise: PromiseLike<T>,
+						timeoutMs: number,
+						label: string,
+					) => Promise<T>;
+				}
+			).__wtWithTimeout;
+			if (!withTimeout) throw new Error("bounded browser helpers missing");
+			const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
+			const wt = new WebTransport(url, {
+				serverCertificateHashes: [{ algorithm: "sha-256", value: bin }],
+			});
+			await withTimeout(wt.ready, 5_000, "wasm close ready");
+			const w = wt.datagrams.writable.getWriter();
+			await w.write(new TextEncoder().encode("__WT_CLOSE_4001__"));
+			w.releaseLock();
+			try {
+				const info = await withTimeout(wt.closed, 5_000, "wasm close settled");
+				return {
+					closeCode: (info as { closeCode?: number })?.closeCode ?? null,
+					reason: (info as { reason?: string })?.reason ?? null,
+					error: null,
+				};
+			} catch (e) {
+				return {
+					closeCode: null,
+					reason: null,
+					error: (e as Error).message,
+				};
+			}
+		},
+		{ url: QUIC_URL, h: hashBase64 },
+	);
+
+	// The wasm backend's own WT_CLOSE_SESSION capsule, read by a real browser.
+	expect(result.error).toBeNull();
+	expect(result.closeCode).toBe(4001);
+	expect(result.reason).toBe("interop-close");
+});
+
+test("stream reset code round-trips from the wasm server through the remap", async ({
+	page,
+}) => {
+	await page.goto(HEALTH_URL);
+	const hashBase64 = await fetchCertHash();
+
+	// Same code as the native spec, and for the same reason: 211 sits just past
+	// a multiple of the §4.4 mapping's 0x1e period.
+	const RESET_CODE = 211;
+
+	const result = await page.evaluate(
+		async ({ url, h, code }) => {
+			const withTimeout = (
+				globalThis as typeof globalThis & {
+					__wtWithTimeout?: <T>(
+						promise: PromiseLike<T>,
+						timeoutMs: number,
+						label: string,
+					) => Promise<T>;
+				}
+			).__wtWithTimeout;
+			if (!withTimeout) throw new Error("bounded browser helpers missing");
+			const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
+			const wt = new WebTransport(url, {
+				serverCertificateHashes: [{ algorithm: "sha-256", value: bin }],
+			});
+			await withTimeout(wt.ready, 5_000, "wasm reset ready");
+
+			const incoming = wt.incomingUnidirectionalStreams.getReader();
+			const w = wt.datagrams.writable.getWriter();
+			await w.write(new TextEncoder().encode(`__WT_RESET_${code}__`));
+			w.releaseLock();
+
+			const { value: stream } = await withTimeout(
+				incoming.read(),
+				5_000,
+				"wasm reset incoming uni",
+			);
+			if (!stream) return { errorName: null, streamErrorCode: null };
+
+			const reader = (stream as ReadableStream<Uint8Array>).getReader();
+			try {
+				for (;;) {
+					const { done } = await withTimeout(
+						reader.read(),
+						5_000,
+						"wasm reset read",
+					);
+					if (done) return { errorName: "closed", streamErrorCode: null };
+				}
+			} catch (e) {
+				const err = e as { name?: string; streamErrorCode?: number };
+				return {
+					errorName: err?.name ?? null,
+					streamErrorCode: err?.streamErrorCode ?? null,
+				};
+			}
+		},
+		{ url: QUIC_URL, h: hashBase64, code: RESET_CODE },
+	);
+
+	expect(result?.errorName).toBe("WebTransportError");
+	expect(result?.streamErrorCode).toBe(RESET_CODE);
+});
