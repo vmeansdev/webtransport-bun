@@ -42,59 +42,60 @@
 
 import type { Duplex, Readable, Writable } from "node:stream";
 
+export type { Resettable, StopSendable } from "./streams.js";
 // Re-export stream symbols and helpers
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
-export type { Resettable, StopSendable } from "./streams.js";
 
 import {
 	BidiStream,
 	RecvStream,
+	type Resettable,
 	SendStream,
+	type StopSendable,
 	WT_RESET,
 	WT_STOP_SENDING,
-	type Resettable,
-	type StopSendable,
 } from "./streams.js";
 
+export type {
+	WebTransportErrorOptions,
+	WebTransportErrorSource,
+} from "./errors.js";
 /**
  * Stable error codes. Use with {@link WebTransportError.code} for programmatic handling.
  * @see WebTransportError
  */
 export {
-	E_TLS,
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
-	E_LIMIT_EXCEEDED,
-	E_RATE_LIMITED,
-	E_INVALID_ARGUMENT,
+	E_STREAM_RESET,
+	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
-	E_INTERNAL,
 	WebTransportError,
-} from "./errors.js";
-export type {
-	WebTransportErrorOptions,
-	WebTransportErrorSource,
 } from "./errors.js";
 export type { ErrorCode } from "./types.js";
 
+import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
-	E_TLS,
-	E_INTERNAL,
-	E_HANDSHAKE_TIMEOUT,
-	E_LIMIT_EXCEEDED,
-	E_INVALID_ARGUMENT,
-	E_QUEUE_FULL,
 	E_BACKPRESSURE_TIMEOUT,
+	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_RATE_LIMITED,
+	E_STREAM_RESET,
+	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
@@ -104,7 +105,6 @@ import type {
 	RateLimitOptions,
 	WebTransportCloseInfo,
 } from "./types.js";
-import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
@@ -518,6 +518,25 @@ export type ServerOptions = {
 	 */
 	allowEarlySession?: boolean;
 
+	/**
+	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+	 * to peers, in bytes. `0` (the default) advertises no table and keeps header
+	 * compression to the static table alone — unchanged wire behavior. A non-zero
+	 * value both offers a table to the peer and bounds the table this endpoint will
+	 * mirror; it is clamped to 65536 (64 KiB). This is an interop/completeness
+	 * setting, not a throughput one: WebTransport carries headers only on the
+	 * CONNECT exchange. `SETTINGS_QPACK_BLOCKED_STREAMS` is always advertised as 0
+	 * and is not configurable. Prefer {@link enableDynamicQpack} for the preset.
+	 */
+	qpackMaxTableCapacity?: number;
+
+	/**
+	 * Convenience preset for {@link qpackMaxTableCapacity}: `true` advertises a
+	 * 4096-byte dynamic table (blocked-streams still 0). Off by default. An
+	 * explicit `qpackMaxTableCapacity` takes precedence over this flag.
+	 */
+	enableDynamicQpack?: boolean;
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -622,6 +641,21 @@ export type ClientOptions = {
 	 * with `allowPooling`. Sessions report `has0Rtt`/`accepted0Rtt`.
 	 */
 	enable0Rtt?: boolean;
+	/**
+	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+	 * to the server, in bytes. `0` (the default) keeps header compression to the
+	 * static table alone. Clamped to 65536. `SETTINGS_QPACK_BLOCKED_STREAMS` is
+	 * always 0 and not configurable. Interop/completeness, not throughput —
+	 * WebTransport carries headers only on the CONNECT exchange. Prefer
+	 * {@link enableDynamicQpack} for the preset.
+	 */
+	qpackMaxTableCapacity?: number;
+	/**
+	 * Convenience preset for {@link qpackMaxTableCapacity}: `true` advertises a
+	 * 4096-byte dynamic table (blocked-streams still 0). Off by default. An
+	 * explicit `qpackMaxTableCapacity` takes precedence.
+	 */
+	enableDynamicQpack?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -1490,12 +1524,28 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		);
 	}
 
+	if (opts.qpackMaxTableCapacity !== undefined) {
+		const cap = opts.qpackMaxTableCapacity;
+		if (!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY) {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				`E_INTERNAL: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
+			);
+		}
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
 		congestionControl: opts.congestionControl ?? "default",
 		enable0Rtt: opts.enable0Rtt === true,
 		allowEarlySession: opts.allowEarlySession === true,
+		...(opts.qpackMaxTableCapacity === undefined
+			? {}
+			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
+		...(opts.enableDynamicQpack === undefined
+			? {}
+			: { enableDynamicQpack: opts.enableDynamicQpack }),
 	});
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
@@ -2167,6 +2217,15 @@ export async function connect(
 			opts?.strictW3CErrors,
 		);
 	}
+	if (opts?.qpackMaxTableCapacity !== undefined) {
+		const cap = opts.qpackMaxTableCapacity;
+		if (!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY) {
+			throw new WebTransportError(
+				E_INTERNAL as ErrorCode,
+				`E_INTERNAL: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
+			);
+		}
+	}
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
 	const tlsOpts = mapClientTlsOptions(opts?.tls);
 	const optsJson = JSON.stringify({
@@ -2177,6 +2236,8 @@ export async function connect(
 		allowPooling: opts?.allowPooling,
 		requireUnreliable: opts?.requireUnreliable,
 		enable0Rtt: opts?.enable0Rtt,
+		qpackMaxTableCapacity: opts?.qpackMaxTableCapacity,
+		enableDynamicQpack: opts?.enableDynamicQpack,
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
@@ -2282,6 +2343,8 @@ function mapServerCertificateHashes(
 }
 
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
+/** Hard cap on advertised QPACK dynamic-table capacity (mirrors the native `MAX_QPACK_TABLE_CAPACITY`, 64 KiB). */
+const MAX_QPACK_TABLE_CAPACITY = 65536;
 const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
 
 function validateClientOptions(

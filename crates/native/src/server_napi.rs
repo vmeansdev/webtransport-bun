@@ -152,6 +152,9 @@ impl ServerHandle {
                 .get("allowEarlySession")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // QPACK dynamic-table capacity to advertise (0 = static-only default).
+            let qpack_max_table_capacity =
+                crate::client::parse_qpack_max_table_capacity(&server_opts);
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -182,6 +185,7 @@ impl ServerHandle {
                 debug,
                 enable_0rtt,
                 allow_early_session,
+                qpack_max_table_capacity,
                 1,
             )
             .map_err(|msg| {
