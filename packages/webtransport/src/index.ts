@@ -765,6 +765,19 @@ export interface ServerSession extends CommonSession {
 	createBidirectionalStream(options?: StreamOpenOptions): Promise<Duplex>;
 	createUnidirectionalStream(options?: StreamOpenOptions): Promise<Writable>;
 	metricsSnapshot(): SessionMetricsSnapshot;
+
+	/**
+	 * Tell the peer not to open any further session on this connection. Sends an
+	 * H3 `GOAWAY` and returns immediately.
+	 *
+	 * `GOAWAY` is connection-scoped, so this is a server-initiated
+	 * graceful-shutdown signal ("I'm going away, don't start new sessions"). The
+	 * peer observes it as its `draining` settling, and the current session stays
+	 * usable. Native is single-session-per-connection, so the "refuse a second
+	 * session" enforcement is not reachable through this API — the observable
+	 * effect is the drain signal on the peer.
+	 */
+	goAway(): void;
 }
 
 /** Node client API session surface returned by connect(). */
@@ -1105,6 +1118,8 @@ interface NativeSessionHandle {
 	/** Session drain (absent on older prebuilt addons). */
 	drain?: () => void;
 	waitDraining?: () => Promise<void>;
+	/** Connection-scoped H3 GOAWAY send (absent on older prebuilt addons). */
+	goAway?: () => void;
 }
 type NativeConnectSessionHandle = {
 	id: string;
@@ -1351,6 +1366,10 @@ class NativeServerSession implements ServerSession {
 
 	drain(): void {
 		if (!this.#closed) this.#nativeHandle.drain?.();
+	}
+
+	goAway(): void {
+		if (!this.#closed) this.#nativeHandle.goAway?.();
 	}
 
 	async sendDatagram(data: Uint8Array): Promise<void> {
