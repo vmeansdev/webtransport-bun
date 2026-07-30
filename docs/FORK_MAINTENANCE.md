@@ -1,22 +1,23 @@
 # Maintaining the wtransport fork dependency
 
 The native backend depends on a **fork** of `wtransport`, not the crates.io
-release, because upstream 0.7.1 has neither 0-RTT support nor the WebTransport
-session-lifecycle conformance work, and we need both:
+release, because upstream 0.7.1 has neither 0-RTT support, the WebTransport
+session-lifecycle conformance work, nor dynamic QPACK, and we need all three:
 
 - Fork: [`vmeansdev/wtransport`](https://github.com/vmeansdev/wtransport),
-  branch `feat/track1-conformance` (a superset of `feat/0rtt`), branched from
-  `BiagioFesta/wtransport` `master` at `a11e6a8`.
+  branch `feat/qpack-dynamic` (which stacks on `feat/track1-conformance`, itself
+  a superset of `feat/0rtt`), branched from `BiagioFesta/wtransport` `master` at
+  `a11e6a8`.
 - Consumed as a **Git dependency pinned by revision** through
   `[workspace.dependencies]` in the root `Cargo.toml`:
 
   ```toml
-  wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "b0b9f5c9716e068ef9206a96abe3fcfc9edba5da", features = ["dangerous-configuration", "quinn"] }
+  wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "d3ff84d9977240685a77002bfd1d63996d87be1b", features = ["dangerous-configuration", "quinn"] }
   ```
 
   `crates/native` and `crates/reference` both reference it with
   `wtransport = { workspace = true }`. The committed `Cargo.lock` records the
-  exact rev (`0.7.1-zerortt.1`).
+  exact rev (`0.7.1-zerortt-qpack.1`).
 
 This document is the standing obligation list that pinning to a Git fork
 creates. Read it before touching the dependency, cutting a release, or
@@ -33,13 +34,13 @@ from source.
 Therefore, for `vmeansdev/wtransport`:
 
 - The repository must stay **public**.
-- The commit `b0b9f5c` (and any rev this project has ever pinned, including the
-  earlier `aa45f37`) must remain reachable: **no force-push that orphans it, no
-  history rewrite, no garbage collection** of that object. Keep a branch or tag
-  pointing at each pinned rev so it is never a dangling commit.
-  `feat/track1-conformance` currently serves that role for `b0b9f5c` and
-  `feat/0rtt` for `aa45f37`; if either branch is rebased forward, tag the old
-  tip first (e.g. `pinned/b0b9f5c`).
+- The commit `d3ff84d` (and any rev this project has ever pinned, including the
+  earlier `b0b9f5c` and `aa45f37`) must remain reachable: **no force-push that
+  orphans it, no history rewrite, no garbage collection** of that object. Keep a
+  branch or tag pointing at each pinned rev so it is never a dangling commit.
+  `feat/qpack-dynamic` currently serves that role for `d3ff84d`,
+  `feat/track1-conformance` for `b0b9f5c`, and `feat/0rtt` for `aa45f37`; if any
+  branch is rebased forward, tag the old tip first (e.g. `pinned/d3ff84d`).
 - Bumping the pin is a deliberate change: update `rev` in the workspace
   `Cargo.toml`, regenerate `Cargo.lock`, and keep the old rev reachable anyway
   (older release tags of this project still point at it).
@@ -75,15 +76,15 @@ don't merge**:
 ```sh
 git remote add upstream https://github.com/BiagioFesta/wtransport   # once
 git fetch upstream
-git rebase upstream/master           # rebase feat/track1-conformance onto master
+git rebase upstream/master           # rebase feat/qpack-dynamic onto master
 ```
 
 Rebasing keeps the feature commits proposable upstream and keeps the branch a
 clean series. Before rebasing away the current tip, tag it so the pinned rev
 stays reachable (see above). After a rebase, run the fork's own test suite
-locally (`cargo test` in the fork, including `wtransport/tests/zero_rtt.rs` and
-`wtransport/tests/session_close.rs`) — webtransport-bun CI does **not** run the
-fork's suite.
+locally (`cargo test` in the fork, including `wtransport/tests/zero_rtt.rs`,
+`wtransport/tests/session_close.rs`, and `wtransport/tests/qpack_dynamic.rs`) —
+webtransport-bun CI does **not** run the fork's suite.
 
 Cadence: at minimum whenever upstream ships a correctness or security fix that
 touches the transport/H3/TLS paths, and opportunistically otherwise so the
@@ -100,7 +101,7 @@ then, the obligations above hold.
 
 ## Checklist for bumping the pin
 
-1. Rebase `feat/track1-conformance` on the fork; tag the old tip so its rev
+1. Rebase `feat/qpack-dynamic` on the fork; tag the old tip so its rev
    stays reachable.
 2. Push the fork (a maintainer action; agents do not push).
 3. Update `rev` in the root `Cargo.toml` `[workspace.dependencies]`.
