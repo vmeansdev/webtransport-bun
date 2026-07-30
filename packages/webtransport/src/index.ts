@@ -523,7 +523,7 @@ export type ServerOptions = {
 	 * to peers, in bytes. `0` (the default) advertises no table and keeps header
 	 * compression to the static table alone — unchanged wire behavior. A non-zero
 	 * value both offers a table to the peer and bounds the table this endpoint will
-	 * mirror; it is clamped to 65536 (64 KiB). This is an interop/completeness
+	 * mirror; values above 65536 (64 KiB) are rejected. This is an interop/completeness
 	 * setting, not a throughput one: WebTransport carries headers only on the
 	 * CONNECT exchange. `SETTINGS_QPACK_BLOCKED_STREAMS` is always advertised as 0
 	 * and is not configurable. Prefer {@link enableDynamicQpack} for the preset.
@@ -644,7 +644,8 @@ export type ClientOptions = {
 	/**
 	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
 	 * to the server, in bytes. `0` (the default) keeps header compression to the
-	 * static table alone. Clamped to 65536. `SETTINGS_QPACK_BLOCKED_STREAMS` is
+	 * static table alone. Values above 65536 are rejected.
+	 * `SETTINGS_QPACK_BLOCKED_STREAMS` is
 	 * always 0 and not configurable. Interop/completeness, not throughput —
 	 * WebTransport carries headers only on the CONNECT exchange. Prefer
 	 * {@link enableDynamicQpack} for the preset.
@@ -1537,21 +1538,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		opts.congestionControl !== undefined &&
 		!VALID_CONGESTION.has(opts.congestionControl)
 	) {
-		throw new WebTransportError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
 		);
 	}
 
-	if (opts.qpackMaxTableCapacity !== undefined) {
-		const cap = opts.qpackMaxTableCapacity;
-		if (!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY) {
-			throw new WebTransportError(
-				E_INTERNAL as ErrorCode,
-				`E_INTERNAL: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
-			);
-		}
-	}
+	validateQpackOptions(opts);
 
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
@@ -2236,14 +2229,8 @@ export async function connect(
 			opts?.strictW3CErrors,
 		);
 	}
-	if (opts?.qpackMaxTableCapacity !== undefined) {
-		const cap = opts.qpackMaxTableCapacity;
-		if (!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY) {
-			throw new WebTransportError(
-				E_INTERNAL as ErrorCode,
-				`E_INTERNAL: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
-			);
-		}
+	if (opts !== undefined) {
+		validateQpackOptions(opts, opts.strictW3CErrors);
 	}
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
 	const tlsOpts = mapClientTlsOptions(opts?.tls);
@@ -2365,6 +2352,42 @@ const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
 /** Hard cap on advertised QPACK dynamic-table capacity (mirrors the native `MAX_QPACK_TABLE_CAPACITY`, 64 KiB). */
 const MAX_QPACK_TABLE_CAPACITY = 65536;
 const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
+
+/**
+ * Both QPACK options, validated the same way on the server and the client.
+ * A capacity above the cap is rejected rather than clamped: silently
+ * advertising something other than what was asked for would be a worse answer
+ * than saying no.
+ */
+function validateQpackOptions(
+	opts: {
+		qpackMaxTableCapacity?: number;
+		enableDynamicQpack?: boolean;
+	},
+	strictW3CErrors?: boolean,
+): void {
+	if (
+		opts.enableDynamicQpack !== undefined &&
+		typeof opts.enableDynamicQpack !== "boolean"
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: enableDynamicQpack must be a boolean",
+			strictW3CErrors,
+		);
+	}
+	const cap = opts.qpackMaxTableCapacity;
+	if (
+		cap !== undefined &&
+		(!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY)
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
+			strictW3CErrors,
+		);
+	}
+}
 
 function validateClientOptions(
 	opts?: WebTransportClientOptions,

@@ -154,7 +154,8 @@ impl ServerHandle {
                 .unwrap_or(false);
             // QPACK dynamic-table capacity to advertise (0 = static-only default).
             let qpack_max_table_capacity =
-                crate::client::parse_qpack_max_table_capacity(&server_opts);
+                crate::client::parse_qpack_max_table_capacity(&server_opts)
+                    .map_err(napi::Error::from_reason)?;
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
