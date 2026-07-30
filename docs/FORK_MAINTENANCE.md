@@ -12,7 +12,7 @@ session-lifecycle conformance work, nor dynamic QPACK, and we need all three:
   `[workspace.dependencies]` in the root `Cargo.toml`:
 
   ```toml
-  wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "d3ff84d9977240685a77002bfd1d63996d87be1b", features = ["dangerous-configuration", "quinn"] }
+  wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "ac515b1559b75ae83059b4c14c9289bf5cf447a5", features = ["dangerous-configuration", "quinn"] }
   ```
 
   `crates/native` and `crates/reference` both reference it with
@@ -34,13 +34,14 @@ from source.
 Therefore, for `vmeansdev/wtransport`:
 
 - The repository must stay **public**.
-- The commit `d3ff84d` (and any rev this project has ever pinned, including the
-  earlier `b0b9f5c` and `aa45f37`) must remain reachable: **no force-push that
-  orphans it, no history rewrite, no garbage collection** of that object. Keep a
-  branch or tag pointing at each pinned rev so it is never a dangling commit.
-  `feat/qpack-dynamic` currently serves that role for `d3ff84d`,
-  `feat/track1-conformance` for `b0b9f5c`, and `feat/0rtt` for `aa45f37`; if any
-  branch is rebased forward, tag the old tip first (e.g. `pinned/d3ff84d`).
+- The commit `ac515b1` (and any rev this project has ever pinned, including the
+  earlier `d3ff84d`, `b0b9f5c` and `aa45f37`) must remain reachable: **no
+  force-push that orphans it, no history rewrite, no garbage collection** of that
+  object. Keep a branch or tag pointing at each pinned rev so it is never a
+  dangling commit. `feat/qpack-dynamic` currently serves that role for both
+  `ac515b1` and its ancestor `d3ff84d`, `feat/track1-conformance` for `b0b9f5c`,
+  and `feat/0rtt` for `aa45f37`; if any branch is rebased forward, tag the old
+  tips first (e.g. `pinned/ac515b1`, `pinned/d3ff84d`).
 - Bumping the pin is a deliberate change: update `rev` in the workspace
   `Cargo.toml`, regenerate `Cargo.lock`, and keep the old rev reachable anyway
   (older release tags of this project still point at it).

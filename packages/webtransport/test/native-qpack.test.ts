@@ -1,18 +1,31 @@
 /**
  * Native dynamic-QPACK option tests (fork feat/qpack-dynamic).
  *
- * Scope: these prove the napi option threads through — that advertising a
- * non-zero SETTINGS_QPACK_MAX_TABLE_CAPACITY on one or both peers still
- * establishes a session (the CONNECT header section round-trips) and the data
- * plane works, with no QPACK_DECOMPRESSION_FAILED / QPACK_ENCODER_STREAM_ERROR.
+ * Scope, stated honestly: the round-trip tests are a NO-REGRESSION guard, not a
+ * proof that the option reaches the wire. They establish a session and echo a
+ * datagram with a non-zero SETTINGS_QPACK_MAX_TABLE_CAPACITY asked for on one
+ * or both peers, and would catch a QPACK_DECOMPRESSION_FAILED /
+ * QPACK_ENCODER_STREAM_ERROR teardown introduced by advertising a table. They
+ * would NOT catch the option being dropped somewhere between here and the
+ * builder: nothing observable from this process differs between a session that
+ * advertised 4096 and one that advertised nothing.
  *
- * They do NOT prove the dynamic-reference decode path against a native peer:
+ * What covers the rest:
+ *  - the resolver's own behaviour (number-over-boolean precedence, explicit 0,
+ *    clamping, malformed values) — the Rust unit tests around
+ *    `parse_qpack_max_table_capacity` in crates/native/src/client.rs;
+ *  - the option actually reaching the wire — the Chromium interop gate in
+ *    tools/interop, which waits on the server's advertised-capacity line and
+ *    drives a real browser QPACK encoder against it;
+ *  - the decode machinery — RFC 9204 Appendix B vectors and the fork's suite.
+ *
+ * The validation tests at the bottom are the ones that fail if the option stops
+ * being read here at all.
+ *
+ * A native<->native handshake also cannot exercise a dynamic table REFERENCE:
  * at blocked_streams=0 (always, per the fork's tractability decision) neither
- * native peer ever emits a dynamic table reference on the single CONNECT
- * exchange, so a native<->native handshake exercises the option plumbing and
- * the encoder-stream insert/ack path, not a dynamic REFERENCE. The RFC 9204
- * Appendix B vectors and the fork's own unit suite carry the decode-machinery
- * proof; Chromium interop (see tools/interop) carries the cross-impl proof.
+ * peer may reference an entry on the single CONNECT exchange, so what runs is
+ * the insert/ack path, not a reference.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -177,5 +190,63 @@ describe("native dynamic QPACK options", () => {
 				onSession: () => {},
 			}),
 		).toThrow(/qpackMaxTableCapacity/);
+	});
+
+	// A bad option is the caller's mistake, not an internal failure, and the two
+	// codes are handled differently by anyone catching them.
+	it("reports a bad capacity as an argument error, not an internal one", async () => {
+		const port = nextPort(24650, 2000);
+		expect(() =>
+			createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				qpackMaxTableCapacity: 70000,
+				onSession: () => {},
+			}),
+		).toThrow(/E_INVALID_ARGUMENT: qpackMaxTableCapacity/);
+
+		await expect(
+			connect("https://127.0.0.1:1", {
+				tls: { insecureSkipVerify: true },
+				qpackMaxTableCapacity: -1,
+			}),
+		).rejects.toThrow(/E_INVALID_ARGUMENT: qpackMaxTableCapacity/);
+	});
+
+	// Silently ignoring it would leave the caller believing they had a dynamic
+	// table: the Rust side reads this with `as_bool()` and drops anything else.
+	it("rejects a non-boolean enableDynamicQpack on both surfaces", async () => {
+		const port = nextPort(24660, 2000);
+		expect(() =>
+			createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				// @ts-expect-error non-boolean on purpose
+				enableDynamicQpack: "yes",
+				onSession: () => {},
+			}),
+		).toThrow(/E_INVALID_ARGUMENT: enableDynamicQpack must be a boolean/);
+
+		await expect(
+			connect("https://127.0.0.1:1", {
+				tls: { insecureSkipVerify: true },
+				// @ts-expect-error non-boolean on purpose
+				enableDynamicQpack: 1,
+			}),
+		).rejects.toThrow(
+			/E_INVALID_ARGUMENT: enableDynamicQpack must be a boolean/,
+		);
+	});
+
+	// Strict mode turns facade errors into DOMExceptions; a bad QPACK value was
+	// the one that stayed a plain WebTransportError.
+	it("maps a bad capacity to a DOMException under strictW3CErrors", async () => {
+		await expect(
+			connect("https://127.0.0.1:1", {
+				tls: { insecureSkipVerify: true },
+				strictW3CErrors: true,
+				qpackMaxTableCapacity: 70000,
+			}),
+		).rejects.toMatchObject({ name: "TypeError" });
 	});
 });

@@ -181,35 +181,41 @@ fn parse_share_process_0rtt_ticket_store(parsed: &serde_json::Value) -> bool {
 const QPACK_MAX_TABLE_CAPACITY_HARD_CAP: u64 = 65_536;
 const QPACK_MAX_BLOCKED_STREAMS_HARD_CAP: u64 = 128;
 
+/// `qpackMaxTableCapacity` wins over `enableDynamicQpack` when both are given,
+/// an explicit `0` included: naming a capacity is the more specific request, and
+/// a caller who names zero is asking for static-only. The native backend
+/// resolves the two options the same way.
+///
+/// Blocked streams are where the backends legitimately differ: the fork
+/// hardcodes `SETTINGS_QPACK_BLOCKED_STREAMS` to zero, so native has no such
+/// option, while this decoder can park a blocked section and advertises a
+/// non-zero default alongside a non-zero capacity.
 fn parse_qpack_settings(parsed: &serde_json::Value) -> h3::QpackLocalSettings {
-    if parsed
-        .get("enableDynamicQpack")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return h3::QpackLocalSettings::default();
-    }
-    let capacity = parsed
-        .get("qpackMaxTableCapacity")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(QPACK_MAX_TABLE_CAPACITY_HARD_CAP);
-    let blocked = if capacity > 0 {
-        parsed
-            .get("qpackBlockedStreams")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(16)
-            .min(QPACK_MAX_BLOCKED_STREAMS_HARD_CAP)
-    } else {
-        parsed
-            .get("qpackBlockedStreams")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            .min(QPACK_MAX_BLOCKED_STREAMS_HARD_CAP)
+    let capacity = match parsed.get("qpackMaxTableCapacity").and_then(|v| v.as_u64()) {
+        Some(explicit) => explicit.min(QPACK_MAX_TABLE_CAPACITY_HARD_CAP),
+        None if parsed
+            .get("enableDynamicQpack")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false) =>
+        {
+            h3::DEFAULT_QPACK_MAX_TABLE_CAPACITY
+        }
+        None => 0,
     };
+
+    let blocked_default = if capacity > 0 {
+        h3::DEFAULT_QPACK_BLOCKED_STREAMS
+    } else {
+        0
+    };
+
     h3::QpackLocalSettings {
         max_table_capacity: capacity,
-        max_blocked_streams: blocked,
+        max_blocked_streams: parsed
+            .get("qpackBlockedStreams")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(blocked_default)
+            .min(QPACK_MAX_BLOCKED_STREAMS_HARD_CAP),
     }
 }
 
@@ -878,9 +884,63 @@ pub fn wt_close_endpoint(eid: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        wt_close_endpoint, wt_new_endpoint_with_options, wt_recv_packet, wt_take_last_error,
-        REGISTRY,
+        parse_qpack_settings, wt_close_endpoint, wt_new_endpoint_with_options, wt_recv_packet,
+        wt_take_last_error, REGISTRY,
     };
+    use crate::h3;
+
+    /// The explicit capacity is the more specific request, so it wins over the
+    /// boolean in both directions. Native resolves the same pair the same way;
+    /// a divergence here would give one backend a dynamic table the other
+    /// refuses on identical options.
+    #[test]
+    fn an_explicit_qpack_capacity_wins_over_the_boolean() {
+        assert_eq!(
+            parse_qpack_settings(&serde_json::json!({
+                "enableDynamicQpack": true,
+                "qpackMaxTableCapacity": 8192,
+            })),
+            h3::QpackLocalSettings {
+                max_table_capacity: 8192,
+                max_blocked_streams: h3::DEFAULT_QPACK_BLOCKED_STREAMS,
+            }
+        );
+
+        // Zero is a request, not an absent value: it asks for static-only even
+        // though the boolean asks for a table.
+        assert_eq!(
+            parse_qpack_settings(&serde_json::json!({
+                "enableDynamicQpack": true,
+                "qpackMaxTableCapacity": 0,
+            })),
+            h3::QpackLocalSettings::disabled()
+        );
+
+        assert_eq!(
+            parse_qpack_settings(&serde_json::json!({ "enableDynamicQpack": true })),
+            h3::QpackLocalSettings::default()
+        );
+
+        assert_eq!(
+            parse_qpack_settings(&serde_json::json!({})),
+            h3::QpackLocalSettings::disabled()
+        );
+    }
+
+    /// Both bounds hold whichever option asked for the capacity.
+    #[test]
+    fn qpack_settings_stay_within_the_hard_caps() {
+        assert_eq!(
+            parse_qpack_settings(&serde_json::json!({
+                "qpackMaxTableCapacity": u64::MAX,
+                "qpackBlockedStreams": u64::MAX,
+            })),
+            h3::QpackLocalSettings {
+                max_table_capacity: super::QPACK_MAX_TABLE_CAPACITY_HARD_CAP,
+                max_blocked_streams: super::QPACK_MAX_BLOCKED_STREAMS_HARD_CAP,
+            }
+        );
+    }
 
     #[test]
     fn recv_packet_rejects_invalid_source_without_peer_fallback() {
