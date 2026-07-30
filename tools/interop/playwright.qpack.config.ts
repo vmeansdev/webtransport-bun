@@ -26,6 +26,10 @@ const interopQuicPort = resolveInteropQuicPort();
 const interopHealthPort = resolveInteropHealthPort();
 const interopHealthUrl = resolveInteropHealthUrl();
 
+/** The capacity under test. The server echoes it back, and the readiness gate
+ * below refuses to start the browser until it has. */
+const qpackMaxTableCapacity = "4096";
+
 export default defineConfig({
 	testDir: "./tests-qpack",
 	testMatch: "**/*.pw.ts",
@@ -51,15 +55,19 @@ export default defineConfig({
 		name: "interop-qpack-webserver",
 		stdout: "pipe",
 		wait: {
+			// Both lines, in the order the server prints them. Waiting on the health
+			// line alone made this gate pass whether or not the setting under test
+			// ever reached the server: a dropped option would have been reported as
+			// a clean interop run.
 			stdout: new RegExp(
-				`addon-server: Health on http://${interopHost.replaceAll(".", "\\.")}:${interopHealthPort}`,
+				`addon-server: advertising qpackMaxTableCapacity=${qpackMaxTableCapacity}\\b[\\s\\S]*addon-server: Health on http://${interopHost.replaceAll(".", "\\.")}:${interopHealthPort}`,
 			),
 		},
 		env: {
 			...process.env,
 			WT_IDLE_TIMEOUT_MS: "5000",
-			// The setting under test: advertise a 4096-byte dynamic QPACK table.
-			WT_QPACK_MAX_TABLE_CAPACITY: "4096",
+			// The setting under test: advertise a dynamic QPACK table.
+			WT_QPACK_MAX_TABLE_CAPACITY: qpackMaxTableCapacity,
 		},
 		cwd: join(__dirname),
 		url: interopHealthUrl,
