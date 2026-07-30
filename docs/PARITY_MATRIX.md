@@ -49,6 +49,7 @@ verification. Code can be present while the release claim is still pending.
 | Security / auth (CA roots) | wasm client `caPem` trust over user-supplied roots | `crates/wasm/src/verify.rs`; `packages/webtransport/src/backend.ts` | `packages/webtransport/test/wasm-ca-trust.test.ts` | **Implemented and end-to-end verified.** A server holding a CA-issued leaf completes the handshake against a client trusting only that CA, and stream data echoes over it; a client given a different CA's PEM is refused with `E_TLS: handshake failed with TLS alert 48` (unknown_ca). Also proven at the QUIC layer natively (`spike_tests::loopback_handshake_over_ca_root_trust`). Test chains come from `cert::generate_ca_signed`, gated behind `dev-insecure` like the accept-any verifier, so shipped artifacts cannot mint a CA |
 | Transport states | `connecting → connected → draining → closed / failed` | `packages/webtransport/src/index.ts`; `packages/webtransport/src/backend.ts` | `packages/webtransport/test/parity-facade-lifecycle.test.ts`; `packages/webtransport/test/parity-robustness.test.ts` | `docs/release-status.json` still `pending` |
 | Static capabilities and option mapping | `supportsReliableOnly`, `congestionControl`, `datagramsReadableType`, `allowPooling`, `requireUnreliable`, `strictW3CErrors` | `packages/webtransport/src/index.ts`; `packages/webtransport/src/backend.ts` | `packages/webtransport/test/parity-options.test.ts`; `packages/webtransport/test/parity-pooling.test.ts`; `packages/webtransport/test/parity-compat.test.ts` | `docs/release-status.json` still `pending` |
+| 0-RTT session resumption / early data | `enable0Rtt` (server + client), `allowEarlySession`, session-object `has0Rtt`/`accepted0Rtt`/`handshakeConfirmed`, `exportTicketVault`/`importTicketVault` | `crates/native/src/{zero_rtt.rs,client.rs,lib.rs,server_napi.rs,session_napi.rs,session_registry.rs}`; `packages/webtransport/src/index.ts` | `packages/webtransport/test/native-0rtt.test.ts` (7 pass); `crates/native` `zero_rtt` unit + loopback resumption tests (`shared_config_resumes_with_early_data`, `fresh_config_per_connect_never_resumes`) | `docs/release-status.json` still `pending` |
 
 ## Native and wasm implementation surfaces
 
@@ -68,20 +69,28 @@ verification. Code can be present while the release claim is still pending.
 ## Upstream-Gated Capabilities (native backend)
 
 These are `missing` on the native backend because the underlying `wtransport`
-crate (pinned `=0.7.1`) does not expose the required APIs. They are tracked as
-upstream feature requests, not local work items (file against
+crate does not expose the required APIs. They are tracked as upstream feature
+requests, not local work items (file against
 [BiagioFesta/wtransport](https://github.com/BiagioFesta/wtransport)).
 
 | Capability | Status | Why it is upstream-gated (verified against wtransport 0.7.1 source) |
 | --- | --- | --- |
-| 0-RTT session resumption / early data | `missing` (upstream-gated) | No early-data or session-ticket API anywhere in 0.7.1; the server accept path never calls quinn's `Connecting::into_0rtt`, and neither config builder exposes a ticketer hook that would enable 0-RTT accepts. A rustls ticketer via `with_custom_tls` would only yield 1-RTT resumption (explicitly out of scope). |
 | Dynamic QPACK table | `missing` (upstream-gated, hard) | `wtransport-proto` QPACK decoder is static-table-only — any dynamic-table instruction returns `DecodingError::DynamicNotSupported` (`qpack.rs`); local SETTINGS hardcode `qpack_max_table_capacity(0)` and `qpack_blocked_streams(0)` (`driver/streams/settings.rs:25-26`). Native must never advertise nonzero QPACK SETTINGS until upstream implements the dynamic table. |
 
 Server-side capabilities that became available in wtransport 0.7.1 —
 congestion control (`ServerOptions.congestionControl`) and keep-alive
 (`limits.keepAliveIntervalMs`, clamped to `min(interval, idleTimeout/3)`) —
-are implemented on native and no longer upstream-gated. The wasm backend
-implements dynamic QPACK and 0-RTT in its own stack, so those rows are native-only.
+are implemented on native and no longer upstream-gated.
+
+**0-RTT is no longer upstream-gated.** The native backend now depends on a
+fork of wtransport (`vmeansdev/wtransport`, branch `feat/0rtt`, pinned by rev
+`aa45f37`) that adds `enable_0rtt`,
+`connect_0rtt`, `SessionRequest::is_0rtt`/`handshake_confirmed`, and
+0-RTT-rejection recovery — the exact APIs 0.7.1 lacked. The consuming plumbing
+lives in `crates/native/src/zero_rtt.rs` and is surfaced through the facade;
+see the implemented row above and `docs/FORK_MAINTENANCE.md` for the
+obligations the git dependency creates. Dynamic QPACK remains native-only in
+the wasm stack.
 
 ## Candidate notes
 
