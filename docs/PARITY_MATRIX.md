@@ -84,7 +84,7 @@ sends no `GOAWAY` and that stays a deliberate non-goal: the wasm h3 module has n
 control-stream `GOAWAY` handling. That asymmetry is intentional, not a pending
 gap.
 
-**The native backend consumes the fork at rev `d3ff84d`** (branch
+**The native backend consumes the fork at rev `ac515b1`** (branch
 `feat/qpack-dynamic`, which stacks on `feat/track1-conformance`, itself a
 superset of `feat/0rtt`), which is where `close_session`, the drain/GOAWAY
 methods, the §4.4 remap, and the dynamic QPACK decode + encoder machinery live.
@@ -122,7 +122,7 @@ are implemented on native and no longer upstream-gated.
 
 **0-RTT and dynamic QPACK are no longer upstream-gated.** The native backend
 now depends on a fork of wtransport (`vmeansdev/wtransport`, branch
-`feat/qpack-dynamic`, pinned by rev `d3ff84d`) that adds `enable_0rtt`,
+`feat/qpack-dynamic`, pinned by rev `ac515b1`) that adds `enable_0rtt`,
 `connect_0rtt`, `SessionRequest::is_0rtt`/`handshake_confirmed`, and
 0-RTT-rejection recovery — the exact APIs 0.7.1 lacked — plus the
 `qpack_max_table_capacity` config method and the dynamic QPACK decode + encoder
