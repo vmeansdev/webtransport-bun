@@ -51,6 +51,38 @@ verification. Code can be present while the release claim is still pending.
 | Static capabilities and option mapping | `supportsReliableOnly`, `congestionControl`, `datagramsReadableType`, `allowPooling`, `requireUnreliable`, `strictW3CErrors` | `packages/webtransport/src/index.ts`; `packages/webtransport/src/backend.ts` | `packages/webtransport/test/parity-options.test.ts`; `packages/webtransport/test/parity-pooling.test.ts`; `packages/webtransport/test/parity-compat.test.ts` | `docs/release-status.json` still `pending` |
 | 0-RTT session resumption / early data | `enable0Rtt` (server + client), `allowEarlySession`, session-object `has0Rtt`/`accepted0Rtt`/`handshakeConfirmed`, `exportTicketVault`/`importTicketVault` | `crates/native/src/{zero_rtt.rs,client.rs,lib.rs,server_napi.rs,session_napi.rs,session_registry.rs}`; `packages/webtransport/src/index.ts` | `packages/webtransport/test/native-0rtt.test.ts` (7 pass); `crates/native` `zero_rtt` unit + loopback resumption tests (`shared_config_resumes_with_early_data`, `fresh_config_per_connect_never_resumes`) | `docs/release-status.json` still `pending` |
 
+## Session lifecycle on the wire
+
+These rows cover how a session close, a drain, and a stream error actually
+reach the peer. All four are `implemented` on **both** backends. The evidence
+that matters here is Chromium, not native-to-native: a QUIC `CONNECTION_CLOSE`
+looks like a valid close to another copy of ourselves while telling a browser
+nothing, which is exactly how the old interop gates passed while the defect was
+live.
+
+| Behavior | Native | WASM | Implementation source | Implementation evidence |
+|---|---|---|---|---|
+| `WT_CLOSE_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_registry.rs,client.rs,lib.rs}` (via the fork's `Connection::close_session`); `crates/wasm/src/{capsule.rs,endpoint.rs}` | Real Chromium reads back both fields on both backends: `tools/interop/tests/edge-cases.pw.ts`, `tools/interop/tests/interop-expanded.pw.ts`, `tools/interop/tests-wasm/wasm-server.spec.ts`. Backend-to-backend: `packages/webtransport/test/parity-error-close.test.ts` ("close code and reason cross the wire from the peer"). WASM unit: `crates/wasm/src/endpoint_tests.rs::primary_session_close_conveys_code_and_reason_over_capsule` |
+| `WT_DRAIN_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_napi.rs,session_registry.rs,client.rs}` over the fork's `drain_session`/`draining`; `packages/webtransport/src/{index.ts,portable.ts,portable-native.ts}`; `crates/wasm/src/{capsule.rs,endpoint.rs}` | `packages/webtransport/test/parity-facade-lifecycle.test.ts` ("draining resolves on a peer drain, and the session stays usable") runs on **both** backends. WASM unit: `crates/wasm/src/endpoint_tests.rs::drain_capsule_notifies_the_peer_without_closing_the_session` |
+| `GOAWAY` | fork-side only — `Connection::send_goaway` exists, **not exposed** through the native binding | **not implemented** — wasm signals session drain only | fork `wtransport/src/connection.rs` | No repo-side send path on either backend, so nothing here is claimed. A received `GOAWAY` does settle native `draining`, since the fork folds it into the same signal |
+| `WT_APPLICATION_ERROR` remap (§4.4, QUIC stream codes only) | `implemented` | `implemented` | fork `wtransport/src/stream.rs` (`reset`/`stop` take a `u32` and map it); `crates/wasm/src/wt_error.rs` | Chromium round-trips the code on both backends: `tools/interop/tests/interop-expanded.pw.ts` and `tools/interop/tests-wasm/wasm-server.spec.ts` ("stream reset code round-trips … through the remap"). Both were verified to fail when the server shifts the code by one |
+| Buffered-stream reject (`WT_BUFFERED_STREAM_REJECTED`) | n/a — native is single-session, so there is no unassociated-stream buffer | `implemented` | `crates/wasm/src/endpoint.rs` | `crates/wasm/src/endpoint_tests.rs::unassociated_wt_stream_is_rejected_with_buffered_stream_rejected` |
+
+**`draining` is wire-driven on both backends, with the local-close fallback
+kept.** It resolves on a received `WT_DRAIN_SESSION` (and, on native, a
+received `GOAWAY` — the fork folds both into one signal), and *also* on the
+local `close()` path and on `closed`. Those fallbacks are deliberate: a peer
+that never drains must not leave consumers waiting forever.
+
+`send_goaway()` remains unexposed, so neither backend can *send* a `GOAWAY`.
+That asymmetry is intentional — wasm has no GOAWAY at all — and is the one
+remaining gap in this section.
+
+**The native backend consumes the fork at rev `b0b9f5c`** (branch
+`feat/track1-conformance`, a superset of `feat/0rtt`), which is where
+`close_session`, the drain/GOAWAY methods, and the §4.4 remap live. See
+`docs/FORK_MAINTENANCE.md`.
+
 ## Native and wasm implementation surfaces
 
 | Surface | Implementation source | Implementation evidence | Release verification |
@@ -83,8 +115,8 @@ congestion control (`ServerOptions.congestionControl`) and keep-alive
 are implemented on native and no longer upstream-gated.
 
 **0-RTT is no longer upstream-gated.** The native backend now depends on a
-fork of wtransport (`vmeansdev/wtransport`, branch `feat/0rtt`, pinned by rev
-`aa45f37`) that adds `enable_0rtt`,
+fork of wtransport (`vmeansdev/wtransport`, branch `feat/track1-conformance`,
+pinned by rev `b0b9f5c`) that adds `enable_0rtt`,
 `connect_0rtt`, `SessionRequest::is_0rtt`/`handshake_confirmed`, and
 0-RTT-rejection recovery — the exact APIs 0.7.1 lacked. The consuming plumbing
 lives in `crates/native/src/zero_rtt.rs` and is surfaced through the facade;

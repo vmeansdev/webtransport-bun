@@ -146,12 +146,14 @@ describe("connection lifecycle", () => {
 			);
 			expect(srv.sessions.length).toBe(2);
 
-			// Server closes A's session with an application code; A must observe
-			// it promptly (CONNECTION_CLOSE, not a 10s idle timeout).
+			// Server closes A's session with an application code; the
+			// WT_CLOSE_SESSION capsule carries both code and reason to A
+			// promptly (not after a 10s idle timeout).
 			const t0 = Date.now();
 			srv.sessions[0]?.close({ code: 42, reason: "kick" });
 			const aClosed = await a.session.closed;
 			expect(aClosed.code).toBe(42);
+			expect(aClosed.reason).toBe("kick");
 			expect(Date.now() - t0).toBeLessThan(5_000);
 
 			// B keeps working on the same endpoint.
@@ -165,6 +167,65 @@ describe("connection lifecycle", () => {
 			b.manager.close();
 			udpA.close();
 			udpB.close();
+			srv.manager.close();
+			srv.udp.close();
+		},
+		30_000,
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"a server drain resolves the client's draining without closing it",
+		async () => {
+			const PORT = 47852;
+			const srv = await startEchoServer(PORT);
+			const udp = await BunUdpTransport.connect("127.0.0.1", PORT);
+			const c = await connectWasm(
+				wasm,
+				udp,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: srv.certHashBase64 },
+			);
+
+			expect(srv.sessions[0]?.drain()).toBe(true);
+			await c.session.draining;
+
+			// Draining is advisory: the session still works afterwards.
+			const echoed = new Promise<string>((res) =>
+				c.session.onDatagram((d) => res(dec.decode(d))),
+			);
+			c.session.sendDatagram(enc.encode("still-here"));
+			expect(await echoed).toBe("still-here");
+
+			c.manager.close();
+			udp.close();
+			srv.manager.close();
+			srv.udp.close();
+		},
+		30_000,
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"draining still resolves on a local close when the peer never drains",
+		async () => {
+			const PORT = 47853;
+			const srv = await startEchoServer(PORT);
+			const udp = await BunUdpTransport.connect("127.0.0.1", PORT);
+			const c = await connectWasm(
+				wasm,
+				udp,
+				"localhost",
+				"127.0.0.1:0",
+				`127.0.0.1:${PORT}`,
+				{ certHashBase64: srv.certHashBase64 },
+			);
+
+			c.session.close({ code: 7, reason: "local" });
+			await c.session.draining;
+
+			c.manager.close();
+			udp.close();
 			srv.manager.close();
 			srv.udp.close();
 		},

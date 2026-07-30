@@ -30,14 +30,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scope. This required forking `wtransport` — see below and
   `docs/FORK_MAINTENANCE.md`.
 
+- **WebTransport session capsules on both backends.** A session close now
+  reaches the peer as a `WT_CLOSE_SESSION` capsule carrying the application
+  code and reason, and a received `WT_DRAIN_SESSION` resolves `draining`
+  without ending the session. The wasm backend gained a capsule encoder and
+  decoder; the native backend routes `session.close({code, reason})` through
+  the fork's `Connection::close_session`.
+- Sessions expose `drain()` and a wire-driven `draining` promise on both
+  backends and on `webtransport-bun/portable`. `drain()` sends a
+  `WT_DRAIN_SESSION` capsule — the session stays fully usable — and `draining`
+  resolves when the peer sends one. The existing local-`close()` fallback is
+  unchanged, so a peer that never drains still cannot hang a consumer.
+- WebTransport application error codes are mapped onto the reserved QUIC range
+  and back per draft §4.4, for QUIC **stream** codes only — the close capsule
+  carries the raw 32-bit code.
+- The wasm backend rejects streams that never associate with a session using
+  `WT_BUFFERED_STREAM_REJECTED`.
+
 ### Changed
 
 - Upgraded `wtransport` from `=0.7.0` to `=0.7.1`, then switched both the native
   addon and the reference server from the crates.io release to a Git dependency
-  on the `vmeansdev/wtransport` fork (branch `feat/0rtt`, pinned by rev
-  `aa45f37`, version `0.7.1-zerortt.1`) via `[workspace.dependencies]`. The fork
-  adds the 0-RTT APIs upstream 0.7.1 lacked; the swap is otherwise behavior-
-  neutral. The reference crate keeps the `quinn` feature for compile parity.
+  on the `vmeansdev/wtransport` fork (branch `feat/track1-conformance`, pinned
+  by rev `b0b9f5c`, version `0.7.1-zerortt.1`) via `[workspace.dependencies]`.
+  The fork adds the 0-RTT APIs upstream 0.7.1 lacked, plus the session
+  lifecycle work above; the swap is otherwise behavior-neutral. The reference
+  crate keeps the `quinn` feature for compile parity.
+- The wasm `SETTINGS_WT_MAX_SESSIONS` codepoint was corrected to Chromium's
+  `0xc671706a`; the previous value was fabricated.
 - `docs/PARITY_MATRIX.md` now lists native 0-RTT as **implemented (on the fork)**
   rather than upstream-gated; dynamic QPACK remains upstream-gated on native and
   wasm-only. `docs/WASM_PROTOCOL_SCOPE.md` notes the native/wasm 0-RTT parity.
@@ -55,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A wasm session that closed itself reported `reason: undefined` from `closed`; the
   caller's close reason is now retained locally, matching native.
+- A server-initiated close reached a browser as a bare QUIC `CONNECTION_CLOSE`,
+  so Chromium reported only "Connection lost" with no code or reason. Both
+  backends now send the close capsule, and the Chromium interop specs assert the
+  real code and reason instead of tolerating the loss.
+- Reading a peer's close took the code from `closed()`, which reports the QUIC
+  connection's fate — `H3_NO_ERROR` once a close capsule has been handled — and
+  so lost the session's real close code. The code and reason are now taken from
+  the session operation that carries them.
 
 ## [0.3.0](https://github.com/vmeansdev/webtransport-bun/compare/v0.2.4...v0.3.0) - 2026-03-08
 

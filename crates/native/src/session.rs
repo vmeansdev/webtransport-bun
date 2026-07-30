@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(got, b"queued");
 
         // Closed-session path for reserve: mark closed then attempt send.
-        session_registry::close_session(&client_id, 0, b"closed");
+        session_registry::abort_session(&client_id, 0, b"closed");
         // Re-insert for read/accept closed-channel paths.
         let loose = Limits::default();
         let (

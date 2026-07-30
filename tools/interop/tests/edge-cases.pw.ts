@@ -346,12 +346,14 @@ test.describe("Chromium interop edge cases", () => {
 			},
 		);
 
+		// A QUIC CONNECTION_CLOSE told Chromium only that the connection was gone,
+		// so this used to accept a bare "Connection lost". The server now sends a
+		// CLOSE_WEBTRANSPORT_SESSION capsule, which is the only way Chromium can
+		// report the code and reason — so demand both.
+		expect(result.error).toBeNull();
 		expect(result.closed).toBe(true);
-		if (result.closeCode != null) {
-			expect(result.closeCode).toBe(4001);
-		} else {
-			expect(result.error).toContain("Connection lost");
-		}
+		expect(result.closeCode).toBe(4001);
+		expect(result.reason).toBe("interop-close");
 	});
 
 	test("large bidi payload round-trips", async ({ page }) => {

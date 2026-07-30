@@ -175,6 +175,12 @@ struct Session {
     pending_section_ric: HashMap<u64, u64>,
     /// Peer-accepted streams (uni + bidi) being classified/read.
     in_streams: HashMap<StreamId, InStream>,
+    /// Session capsules (§6) arriving on an established CONNECT stream, keyed by
+    /// that stream id. Handles capsules fragmented across DATA frames.
+    capsules: HashMap<StreamId, crate::capsule::CapsuleAssembler>,
+    /// Client secondary CONNECT streams after their 200: undecoded H3 frame
+    /// bytes. Unlike the primary/server paths these have no other rx buffer.
+    extra_rx: HashMap<StreamId, Vec<u8>>,
     /// Self-opened bidi WT streams: id -> handle (inbound is raw WT data).
     self_bidi: HashMap<StreamId, u32>,
 }
@@ -202,6 +208,17 @@ impl Session {
 
     fn all_connect_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
         self.connect_stream
+            .into_iter()
+            .chain(self.extra_sessions.iter().copied())
+    }
+
+    /// CONNECT streams whose WT session is still live. A closed primary drops
+    /// out while its extra sessions (and the QUIC connection) keep running, so
+    /// inbound streams naming the dead session are rejected rather than
+    /// demuxed onto it.
+    fn live_connect_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.connect_stream
+            .filter(|_| !self.connect_closed)
             .into_iter()
             .chain(self.extra_sessions.iter().copied())
     }
@@ -282,6 +299,20 @@ pub struct WtEndpoint {
 
 fn clamp_varint_to_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+/// Remap an outbound WebTransport application error code onto its QUIC
+/// stream-error code per draft §4.4. The image is always < 2^62, so the VarInt
+/// conversion never fails; `VarInt::MAX` is an unreachable safety fallback.
+fn remap_wt_app_error(code: u32) -> VarInt {
+    VarInt::from_u64(crate::wt_error::remap_application_error(code)).unwrap_or(VarInt::MAX)
+}
+
+/// Recover the 32-bit application error code from an inbound WT-stream QUIC
+/// error code (§4.4 inverse). Codes outside the WT application range — e.g. H3
+/// control/CONNECT protocol codes — are passed through clamped to u32.
+fn unmap_wt_app_error(value: u64) -> u32 {
+    crate::wt_error::unmap_application_error(value).unwrap_or_else(|| clamp_varint_to_u32(value))
 }
 
 /// Default SETTINGS_WT_MAX_SESSIONS (≥ 2 for multi-session proof). JS bridge
@@ -624,6 +655,8 @@ const H3_EXCESSIVE_LOAD: u32 = 0x0107;
 /// longer service a connection (e.g. host reservation token space exhausted)
 /// and fails closed instead of silently dropping payloads.
 const H3_INTERNAL_ERROR: u32 = 0x0102;
+/// H3_MESSAGE_ERROR (RFC 9114 §8.1): a malformed capsule on a CONNECT stream.
+const H3_MESSAGE_ERROR: u32 = 0x010e;
 /// QPACK_DECOMPRESSION_FAILED (RFC 9204 §7.4).
 const QPACK_DECOMPRESSION_FAILED: u32 = 0x0200;
 /// QPACK_ENCODER_STREAM_ERROR (RFC 9204 §7.4).
@@ -665,7 +698,7 @@ enum FrameHdr {
     Ready {
         header: usize,
         total: usize,
-        is_headers: bool,
+        ftype: u64,
     },
 }
 
@@ -1629,12 +1662,13 @@ impl WtEndpoint {
         .to_string()
     }
 
-    fn push_session_closed(&mut self, conn: u32, session_id: u64, code: u32) {
+    fn push_session_closed(&mut self, conn: u32, session_id: u64, code: u32, reason: String) {
         self.session_closed_count = self.session_closed_count.saturating_add(1);
         self.push_event(WtEvent::SessionClosed {
             conn,
             session_id,
             code,
+            reason,
         });
     }
 
@@ -1805,7 +1839,7 @@ impl WtEndpoint {
                     // Peer STOP_SENDING on OUR send half: writes will fail from
                     // now on. The recv half (if any) is untouched — this is NOT
                     // an inbound reset.
-                    self.on_stream_stopped(h, id, clamp_varint_to_u32(error_code.into_inner()));
+                    self.on_stream_stopped(h, id, unmap_wt_app_error(error_code.into_inner()));
                 }
                 QuicEvent::DatagramReceived => {
                     self.drain_datagrams(h, now);
@@ -2103,7 +2137,7 @@ impl WtEndpoint {
             // The peer FINning/resetting the CONNECT stream ends the WT session
             // (graceful close) even though the QUIC connection stays alive.
             if matches!(final_outcome, ReadOutcome::Finished | ReadOutcome::Reset(_)) {
-                self.close_session_on_connect_end(h);
+                self.on_connect_stream_ended(h, id, true);
             }
             return;
         }
@@ -2145,7 +2179,7 @@ impl WtEndpoint {
                     .is_some();
                 if closed_pending {
                     if let Some(&conn) = self.handle_to_id.get(&h) {
-                        self.push_session_closed(conn, u64::from(id), 0);
+                        self.push_session_closed(conn, u64::from(id), 0, String::new());
                     }
                 }
             }
@@ -2164,7 +2198,12 @@ impl WtEndpoint {
                 let outcome =
                     read_stream(self.conns.get_mut(&h), id, &mut data, PROTOCOL_READ_CHUNK);
                 let made_progress = !data.is_empty();
-                // Post-200 CONNECT bytes are ignored; we only care about FIN/reset.
+                if made_progress {
+                    if let Some(s) = self.sessions.get_mut(&h) {
+                        s.extra_rx.entry(id).or_default().extend_from_slice(&data);
+                    }
+                    self.parse_extra_connect_capsules(h, id);
+                }
                 final_outcome = outcome;
                 if should_stop_read_batch(outcome == ReadOutcome::Open, made_progress) {
                     break;
@@ -2225,7 +2264,7 @@ impl WtEndpoint {
             match final_outcome {
                 ReadOutcome::Finished => self.retire_in_stream(h, id),
                 ReadOutcome::Reset(code) => {
-                    self.emit_stream_reset(h, id, clamp_varint_to_u32(code));
+                    self.emit_stream_reset(h, id, unmap_wt_app_error(code));
                     self.retire_in_stream(h, id);
                 }
                 ReadOutcome::Open => {}
@@ -2308,7 +2347,7 @@ impl WtEndpoint {
                 self.push_event(WtEvent::StreamReset {
                     conn,
                     stream: handle,
-                    code: clamp_varint_to_u32(code),
+                    code: unmap_wt_app_error(code),
                 });
                 if let Some(s) = self.sessions.get_mut(&h) {
                     s.self_bidi.remove(&id);
@@ -2320,26 +2359,27 @@ impl WtEndpoint {
         }
     }
 
+    /// A CONNECT stream ended (FIN or reset). On an established session that is
+    /// a peer-initiated close that carried no `WT_CLOSE_SESSION` capsule, so the
+    /// session ends with code 0 and the QUIC connection survives. A primary
+    /// CONNECT that ends *before* it was answered is a handshake failure and
+    /// still fails the whole connection, so `ready` rejects.
     fn on_connect_stream_ended(
         &mut self,
         h: ConnectionHandle,
         id: StreamId,
         is_primary_connect: bool,
     ) {
-        if is_primary_connect {
-            self.close_session_on_connect_end(h);
-            return;
-        }
-        let Some(&conn) = self.handle_to_id.get(&h) else {
-            return;
-        };
-        let removed = self
+        let established = self
             .sessions
-            .get_mut(&h)
-            .is_some_and(|s| s.extra_sessions.remove(&id));
-        if removed {
-            self.push_session_closed(conn, u64::from(id), 0);
+            .get(&h)
+            .map(|s| s.established)
+            .unwrap_or(false);
+        if is_primary_connect && !established {
+            self.fail_session_before_establish(h);
+            return;
         }
+        self.end_wt_session(h, id, 0, String::new());
     }
 
     /// Decide whether an inbound QUIC datagram payload should be delivered to
@@ -2480,7 +2520,92 @@ impl WtEndpoint {
         }
     }
 
-    fn close_session_on_connect_end(&mut self, h: ConnectionHandle) {
+    /// Feed `WT_CLOSE_SESSION`/`WT_DRAIN_SESSION` capsule bytes (the payload of a
+    /// DATA frame on an established CONNECT stream) into that session's
+    /// assembler and act on every complete capsule. A malformed capsule is a
+    /// protocol error: reset the CONNECT stream per §6.
+    fn feed_session_capsules(&mut self, h: ConnectionHandle, sid: StreamId, payload: &[u8]) {
+        {
+            let Some(s) = self.sessions.get_mut(&h) else {
+                return;
+            };
+            s.capsules.entry(sid).or_default().push(payload);
+        }
+        loop {
+            let popped = match self
+                .sessions
+                .get_mut(&h)
+                .and_then(|s| s.capsules.get_mut(&sid))
+            {
+                Some(asm) => asm.next(),
+                None => return,
+            };
+            match popped {
+                Ok(Some(crate::capsule::Capsule::Close { code, reason })) => {
+                    self.end_wt_session(h, sid, code, reason);
+                    return;
+                }
+                Ok(Some(crate::capsule::Capsule::Drain)) => {
+                    if let Some(&conn) = self.handle_to_id.get(&h) {
+                        self.push_event(WtEvent::SessionDraining {
+                            conn,
+                            session_id: u64::from(sid),
+                        });
+                    }
+                    continue;
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    if let Some(conn) = self.conns.get_mut(&h) {
+                        let _ = conn
+                            .send_stream(sid)
+                            .reset(VarInt::from_u32(H3_MESSAGE_ERROR));
+                        let _ = conn
+                            .recv_stream(sid)
+                            .stop(VarInt::from_u32(H3_MESSAGE_ERROR));
+                    }
+                    self.set_last_error("E_PROTOCOL: malformed WebTransport capsule");
+                    self.end_wt_session(h, sid, H3_MESSAGE_ERROR, String::new());
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Retire one established WebTransport session while the QUIC connection
+    /// stays up: drop it from the session registry, reset its streams with
+    /// `WT_SESSION_GONE`, and emit `SessionClosed` exactly once.
+    fn end_wt_session(&mut self, h: ConnectionHandle, sid: StreamId, code: u32, reason: String) {
+        let Some(&conn) = self.handle_to_id.get(&h) else {
+            return;
+        };
+        let live = match self.sessions.get_mut(&h) {
+            Some(s) => {
+                let removed = if s.connect_stream == Some(sid) {
+                    let was_live = s.established && !s.connect_closed;
+                    s.connect_closed = true;
+                    was_live
+                } else {
+                    s.extra_sessions.remove(&sid)
+                };
+                s.capsules.remove(&sid);
+                s.extra_rx.remove(&sid);
+                removed
+            }
+            None => return,
+        };
+        if !live {
+            return;
+        }
+        self.reset_session_streams(h, conn, u64::from(sid));
+        self.push_session_closed(conn, u64::from(sid), code, reason);
+    }
+
+    /// The primary CONNECT will never be answered — a non-2xx response, a peer
+    /// FIN before any response, or an expired handshake deadline. The session
+    /// never existed, so this fails the whole QUIC connection (emitting
+    /// `ConnectionClosed`) rather than reporting a session close.
+    fn fail_session_before_establish(&mut self, h: ConnectionHandle) {
         let Some(&id) = self.handle_to_id.get(&h) else {
             return;
         };
@@ -2563,6 +2688,9 @@ impl WtEndpoint {
             RejectWt {
                 error: String,
                 bidi: bool,
+                /// QUIC code for the RESET_STREAM / STOP_SENDING (§4.6 uses
+                /// WT_BUFFERED_STREAM_REJECTED for a WT stream we cannot take).
+                code: u32,
             },
             None,
         }
@@ -2571,7 +2699,7 @@ impl WtEndpoint {
                 return;
             };
             // Snapshot known WT session ids before borrowing `in_streams` mutably.
-            let known_session_ids: HashSet<u64> = s.all_connect_streams().map(u64::from).collect();
+            let known_session_ids: HashSet<u64> = s.live_connect_streams().map(u64::from).collect();
             let unlatched_connects = count_unlatched_connect_streams(s);
             let active_wt = s.active_wt_count();
             let connect_cap = self.wt_max_sessions.max(1) as usize;
@@ -2615,6 +2743,7 @@ impl WtEndpoint {
                                     error: "E_LIMIT_EXCEEDED: unlatched CONNECT admission cap"
                                         .to_string(),
                                     bidi: true,
+                                    code: 0,
                                 };
                             }
                             st.connect_admitted = true;
@@ -2625,6 +2754,7 @@ impl WtEndpoint {
                                 error: "E_LIMIT_EXCEEDED: CONNECT request buffer exceeded"
                                     .to_string(),
                                 bidi: true,
+                                code: 0,
                             };
                         }
                         Route::ServerConnect { id }
@@ -2650,6 +2780,7 @@ impl WtEndpoint {
                                         error: "E_SESSION_CLOSED: unknown WebTransport session id"
                                             .to_string(),
                                         bidi: st.is_bidi,
+                                        code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                     };
                                 }
                                 st.sid_read = true;
@@ -2669,6 +2800,7 @@ impl WtEndpoint {
                                         error: "E_LIMIT_EXCEEDED: stream handle space exhausted"
                                             .to_string(),
                                         bidi: st.is_bidi,
+                                        code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                     };
                                 };
                                 let Some(&conn_id) = self.handle_to_id.get(&h) else {
@@ -2690,6 +2822,7 @@ impl WtEndpoint {
                                         break 'route Route::RejectWt {
                                             error: err,
                                             bidi: st.is_bidi,
+                                            code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                         };
                                     }
                                 }
@@ -2704,6 +2837,7 @@ impl WtEndpoint {
                                         break 'route Route::RejectWt {
                                             error: err,
                                             bidi: st.is_bidi,
+                                            code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                         };
                                     }
                                 };
@@ -2786,12 +2920,12 @@ impl WtEndpoint {
                     });
                 }
             }
-            Route::RejectWt { error, bidi } => {
+            Route::RejectWt { error, bidi, code } => {
                 self.set_last_error(error);
                 if let Some(conn) = self.conns.get_mut(&h) {
-                    let _ = conn.recv_stream(id).stop(VarInt::from_u32(0));
+                    let _ = conn.recv_stream(id).stop(VarInt::from_u32(code));
                     if should_reset_send_on_wt_reject(bidi) {
-                        let _ = conn.send_stream(id).reset(VarInt::from_u32(0));
+                        let _ = conn.send_stream(id).reset(VarInt::from_u32(code));
                     }
                 }
                 self.retire_in_stream(h, id);
@@ -3040,12 +3174,12 @@ impl WtEndpoint {
                 };
                 decode_frame_header(&st.buf)
             };
-            let (header, total, is_headers) = match hdr {
+            let (header, total, ftype) = match hdr {
                 FrameHdr::Ready {
                     header,
                     total,
-                    is_headers,
-                } => (header, total, is_headers),
+                    ftype,
+                } => (header, total, ftype),
                 FrameHdr::Incomplete => return,
                 FrameHdr::TooLarge => {
                     self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
@@ -3053,13 +3187,24 @@ impl WtEndpoint {
                 }
             };
 
-            if !is_headers {
+            if ftype != h3::frame::HEADERS {
+                // Once the CONNECT is established its DATA frames carry session
+                // capsules (§6); before that a request body is not our business.
+                let capsule_payload = self
+                    .sessions
+                    .get(&h)
+                    .filter(|s| ftype == h3::frame::DATA && s.is_wt_connect(stream_id))
+                    .and_then(|s| s.in_streams.get(&stream_id))
+                    .map(|st| st.buf[header..total].to_vec());
                 if let Some(st) = self
                     .sessions
                     .get_mut(&h)
                     .and_then(|s| s.in_streams.get_mut(&stream_id))
                 {
                     st.buf.drain(..total);
+                }
+                if let Some(payload) = capsule_payload {
+                    self.feed_session_capsules(h, stream_id, &payload);
                 }
                 continue;
             }
@@ -3169,21 +3314,31 @@ impl WtEndpoint {
                 };
                 decode_frame_header(&s.connect_rx)
             };
-            let (header, total, is_headers) = match hdr {
+            let (header, total, ftype) = match hdr {
                 FrameHdr::Ready {
                     header,
                     total,
-                    is_headers,
-                } => (header, total, is_headers),
+                    ftype,
+                } => (header, total, ftype),
                 FrameHdr::Incomplete => return,
                 FrameHdr::TooLarge => {
                     self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
                     return;
                 }
             };
-            if !is_headers {
+            if ftype != h3::frame::HEADERS {
+                // Post-200 DATA frames on the CONNECT stream carry session
+                // capsules (§6).
+                let capsule = self
+                    .sessions
+                    .get(&h)
+                    .filter(|s| ftype == h3::frame::DATA && s.established && !s.connect_closed)
+                    .and_then(|s| Some((s.connect_stream?, s.connect_rx[header..total].to_vec())));
                 if let Some(s) = self.sessions.get_mut(&h) {
                     s.connect_rx.drain(..total);
+                }
+                if let Some((sid, payload)) = capsule {
+                    self.feed_session_capsules(h, sid, &payload);
                 }
                 continue;
             }
@@ -3270,10 +3425,55 @@ impl WtEndpoint {
                 // helper (exactly one Closed, QUIC torn down, FIN then a no-op).
                 ConnectStatusKind::Failure => {
                     if !established {
-                        self.close_session_on_connect_end(h);
+                        self.fail_session_before_establish(h);
                         return;
                     }
                 }
+            }
+        }
+    }
+
+    /// Client: a secondary CONNECT stream past its 200 carries only session
+    /// capsules (§6). Unlike the primary and server paths this buffer exists
+    /// solely for them, so every non-DATA frame is discarded.
+    fn parse_extra_connect_capsules(&mut self, h: ConnectionHandle, stream_id: StreamId) {
+        loop {
+            let hdr = {
+                let Some(buf) = self
+                    .sessions
+                    .get(&h)
+                    .and_then(|s| s.extra_rx.get(&stream_id))
+                else {
+                    return;
+                };
+                decode_frame_header(buf)
+            };
+            let (header, total, ftype) = match hdr {
+                FrameHdr::Ready {
+                    header,
+                    total,
+                    ftype,
+                } => (header, total, ftype),
+                FrameHdr::Incomplete => return,
+                FrameHdr::TooLarge => {
+                    self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
+                    return;
+                }
+            };
+            let payload = match self
+                .sessions
+                .get_mut(&h)
+                .and_then(|s| s.extra_rx.get_mut(&stream_id))
+            {
+                Some(buf) => {
+                    let payload = (ftype == h3::frame::DATA).then(|| buf[header..total].to_vec());
+                    buf.drain(..total);
+                    payload
+                }
+                None => return,
+            };
+            if let Some(payload) = payload {
+                self.feed_session_capsules(h, stream_id, &payload);
             }
         }
     }
@@ -3294,19 +3494,19 @@ impl WtEndpoint {
                 };
                 decode_frame_header(&pending.rx)
             };
-            let (header, total, is_headers) = match hdr {
+            let (header, total, ftype) = match hdr {
                 FrameHdr::Ready {
                     header,
                     total,
-                    is_headers,
-                } => (header, total, is_headers),
+                    ftype,
+                } => (header, total, ftype),
                 FrameHdr::Incomplete => return,
                 FrameHdr::TooLarge => {
                     self.close_conn_protocol_error(h, H3_EXCESSIVE_LOAD, b"H3 frame too large");
                     return;
                 }
             };
-            if !is_headers {
+            if ftype != h3::frame::HEADERS {
                 if let Some(pending) = self
                     .sessions
                     .get_mut(&h)
@@ -3380,7 +3580,7 @@ impl WtEndpoint {
                         let _ = conn.send_stream(stream_id).reset(VarInt::from_u32(0));
                         let _ = conn.recv_stream(stream_id).stop(VarInt::from_u32(0));
                     }
-                    self.push_session_closed(conn_id, u64::from(stream_id), 0);
+                    self.push_session_closed(conn_id, u64::from(stream_id), 0, String::new());
                     return;
                 }
             }
@@ -3654,8 +3854,12 @@ impl WtEndpoint {
         i64::try_from(u64::from(bidi)).unwrap_or(-1)
     }
 
-    /// Close one WebTransport session. Primary CONNECT close tears down QUIC;
-    /// extra session close only ends that CONNECT and emits SessionClosed.
+    /// Close one WebTransport session (§6). An established session is closed by
+    /// writing a `WT_CLOSE_SESSION` capsule and FINning the CONNECT stream — the
+    /// QUIC connection stays up, so sibling sessions on it keep running. The
+    /// capsule is buffered before the FIN and we never issue a CONNECTION_CLOSE
+    /// here, so nothing can preempt it on the wire. `closed` settles locally off
+    /// the `SessionClosed` event; delivery of the capsule is never awaited.
     pub fn close_wt_session(
         &mut self,
         conn_id: u32,
@@ -3676,17 +3880,77 @@ impl WtEndpoint {
             return false;
         };
         let is_primary = session.connect_stream == Some(sid);
-        if is_primary {
-            // Primary close tears down QUIC with the application code/reason so
-            // the peer observes ConnectionClosed with the intended close code.
-            self.close_conn(conn_id, code, reason, Instant::now());
-            return true;
-        }
+        // §3.2: capsules may only be written once the session is established.
+        // A CONNECT still awaiting its 2xx is aborted with RESET_STREAM instead.
+        let established = if is_primary {
+            session.established && !session.connect_closed
+        } else {
+            session.extra_sessions.contains(&sid)
+        };
         if let Some(conn) = self.conns.get_mut(&h) {
-            let _ = conn.send_stream(sid).reset(VarInt::from_u32(code));
-            let _ = conn.recv_stream(sid).stop(VarInt::from_u32(code));
+            if established {
+                let frame = crate::capsule::close_data_frame(code, reason);
+                let _ = conn.send_stream(sid).write(&frame);
+                let _ = conn.send_stream(sid).finish();
+            } else {
+                let _ = conn.send_stream(sid).reset(VarInt::from_u32(code));
+                let _ = conn.recv_stream(sid).stop(VarInt::from_u32(code));
+            }
         }
-        // Reset/stop every WT stream demuxed to this session.
+        if let Some(s) = self.sessions.get_mut(&h) {
+            if is_primary {
+                s.connect_closed = true;
+            } else {
+                s.extra_sessions.remove(&sid);
+            }
+            s.pending_client_connects.remove(&sid);
+            s.capsules.remove(&sid);
+            s.extra_rx.remove(&sid);
+        }
+        self.reset_session_streams(h, conn_id, session_id);
+        self.push_session_closed(conn_id, session_id, code, String::new());
+        true
+    }
+
+    /// Tell the peer this session is draining (§6): it should stop starting new
+    /// streams and datagrams, but everything in flight keeps running and the
+    /// session stays open until it is actually closed. Only meaningful on an
+    /// established session (§3.2).
+    pub fn drain_wt_session(&mut self, conn_id: u32, session_id: u64) -> bool {
+        let Some(&h) = self.id_to_handle.get(&conn_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown connection");
+            return false;
+        };
+        let Some(session) = self.sessions.get(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: session missing");
+            return false;
+        };
+        let Some(sid) = session.resolve_wt_session(session_id) else {
+            self.set_last_error("E_SESSION_CLOSED: unknown WebTransport session id");
+            return false;
+        };
+        let established = if session.connect_stream == Some(sid) {
+            session.established && !session.connect_closed
+        } else {
+            session.extra_sessions.contains(&sid)
+        };
+        if !established {
+            self.set_last_error("E_SESSION_CLOSED: session not established");
+            return false;
+        }
+        let Some(conn) = self.conns.get_mut(&h) else {
+            self.set_last_error("E_SESSION_CLOSED: connection missing");
+            return false;
+        };
+        let frame = crate::capsule::drain_data_frame();
+        let _ = conn.send_stream(sid).write(&frame);
+        true
+    }
+
+    /// Reset every WT stream demuxed to a terminated session with
+    /// `WT_SESSION_GONE` (§6). The code is written raw: §4.4's application-code
+    /// remap covers application-chosen codes, not this fixed protocol one.
+    fn reset_session_streams(&mut self, h: ConnectionHandle, conn_id: u32, session_id: u64) {
         let session_streams: Vec<(u32, StreamId)> = self
             .stream_index
             .iter()
@@ -3695,10 +3959,21 @@ impl WtEndpoint {
             })
             .map(|(handle, &(_, quic_sid))| (*handle, quic_sid))
             .collect();
+        let gone = VarInt::from_u32(crate::wt_error::WT_SESSION_GONE);
         for (handle, quic_sid) in session_streams {
             if let Some(conn) = self.conns.get_mut(&h) {
-                let _ = conn.send_stream(quic_sid).reset(VarInt::from_u32(code));
-                let _ = conn.recv_stream(quic_sid).stop(VarInt::from_u32(code));
+                // A unidirectional stream has one half, owned by whichever side
+                // opened it. Reaching for the half that does not exist is an
+                // assertion failure inside quinn-proto, not a recoverable error,
+                // so ask only for the halves this stream actually has.
+                let opened_locally = quic_sid.initiator() == conn.side();
+                let bidi = quic_sid.dir() == Dir::Bi;
+                if bidi || opened_locally {
+                    let _ = conn.send_stream(quic_sid).reset(gone);
+                }
+                if bidi || !opened_locally {
+                    let _ = conn.recv_stream(quic_sid).stop(gone);
+                }
             }
             if let Some(s) = self.sessions.get_mut(&h) {
                 s.self_bidi.remove(&quic_sid);
@@ -3711,15 +3986,9 @@ impl WtEndpoint {
             self.push_event(WtEvent::StreamReset {
                 conn: conn_id,
                 stream: handle,
-                code,
+                code: crate::wt_error::WT_SESSION_GONE,
             });
         }
-        if let Some(s) = self.sessions.get_mut(&h) {
-            s.extra_sessions.remove(&sid);
-            s.pending_client_connects.remove(&sid);
-        }
-        self.push_session_closed(conn_id, session_id, code);
-        true
     }
 
     /// Write to a WebTransport stream. Returns bytes accepted (possibly 0 when
@@ -3760,7 +4029,7 @@ impl WtEndpoint {
     pub fn stream_reset(&mut self, stream: u32, code: u32) {
         if let Some(&(h, sid)) = self.stream_index.get(&stream) {
             if let Some(c) = self.conns.get_mut(&h) {
-                let _ = c.send_stream(sid).reset(VarInt::from_u32(code));
+                let _ = c.send_stream(sid).reset(remap_wt_app_error(code));
             }
             self.mark_stream_half_done(stream, HALF_SEND);
         }
@@ -3771,7 +4040,7 @@ impl WtEndpoint {
     pub fn stream_stop(&mut self, stream: u32, code: u32) {
         if let Some(&(h, sid)) = self.stream_index.get(&stream) {
             if let Some(c) = self.conns.get_mut(&h) {
-                let _ = c.recv_stream(sid).stop(VarInt::from_u32(code));
+                let _ = c.recv_stream(sid).stop(remap_wt_app_error(code));
             }
             self.paused.remove(&stream);
             self.mark_stream_half_done(stream, HALF_RECV);
@@ -3861,7 +4130,7 @@ impl WtEndpoint {
             .collect();
         for h in expired {
             self.set_last_error("E_HANDSHAKE_TIMEOUT: WebTransport CONNECT timed out");
-            self.close_session_on_connect_end(h);
+            self.fail_session_before_establish(h);
         }
         // Fail secondary client CONNECTs whose deadlines elapsed (session-only).
         let mut expired_pending: Vec<(ConnectionHandle, u32, u64)> = Vec::new();
@@ -3892,7 +4161,7 @@ impl WtEndpoint {
                 s.pending_client_connects.remove(&sid);
                 s.extra_sessions.remove(&sid);
             }
-            self.push_session_closed(conn_id, session_id, 0);
+            self.push_session_closed(conn_id, session_id, 0, String::new());
         }
         self.drive_all(now);
     }
@@ -3997,7 +4266,7 @@ fn drain_conn_transmits(conn: &mut Connection, now: Instant, out: &mut Vec<(Vec<
 }
 
 /// Decode an HTTP/3 frame header at the front of `buf`, returning
-/// `(header_len, total_len, is_headers_frame)` once the WHOLE frame is present,
+/// `(header_len, total_len, frame_type)` once the WHOLE frame is present,
 /// else None (incomplete). Does not consume `buf`.
 fn decode_frame_header(buf: &[u8]) -> FrameHdr {
     let Some((ftype, n1)) = crate::varint::decode(buf) else {
@@ -4018,7 +4287,7 @@ fn decode_frame_header(buf: &[u8]) -> FrameHdr {
     FrameHdr::Ready {
         header,
         total,
-        is_headers: ftype == h3::frame::HEADERS,
+        ftype,
     }
 }
 

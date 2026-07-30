@@ -87,8 +87,40 @@ impl SessionHandle {
     pub fn close(&self, code: Option<u32>, reason: Option<String>) -> WtResult<()> {
         let c = code.unwrap_or(0);
         let r = reason.unwrap_or_default();
-        session_registry::close_session(&self.id, c, r.as_bytes());
+        session_registry::close_session(&self.id, c, &r);
         Ok(())
+    }
+
+    /// Tell the peer this session is going away soon, without ending it.
+    ///
+    /// Sends a `WT_DRAIN_SESSION` capsule. Streams already open keep working and
+    /// new ones can still be opened; this only asks the peer to start winding
+    /// down. Returns immediately — the capsule goes out in the background.
+    #[napi]
+    pub fn drain(&self) -> WtResult<()> {
+        session_registry::drain_session(&self.id);
+        Ok(())
+    }
+
+    /// Resolves once the peer says this session is going away.
+    ///
+    /// Settles on a received `WT_DRAIN_SESSION` or `GOAWAY`, and immediately if
+    /// one already arrived. The session stays usable: this is a warning, not an
+    /// ending. A session that is gone resolves too, so no caller is left waiting
+    /// on a peer that can no longer speak.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn wait_draining(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            let Some((conn, ..)) = session_registry::get(&id) else {
+                return Ok(());
+            };
+            RUNTIME
+                .spawn(async move { conn.draining().await })
+                .await
+                .map_err(wt_from_upstream_error)?;
+            Ok(())
+        })
     }
 
     /// Spawn on the addon runtime without holding an exclusive napi borrow of

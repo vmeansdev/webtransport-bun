@@ -787,9 +787,15 @@ export class WasmSession {
 	readonly ready: Promise<void>;
 	/** Resolves with close info after establishment, rejects if connect fails. */
 	readonly closed: Promise<WtCloseInfo>;
+	/**
+	 * Resolves when the peer sends WT_DRAIN_SESSION, or when this side starts
+	 * closing. Draining is advisory: the session keeps working until it closes.
+	 */
+	readonly draining: Promise<void>;
 	private resolveReady!: () => void;
 	private rejectReady!: (err: Error) => void;
 	private resolveClosed!: (info: WtCloseInfo) => void;
+	private resolveDraining!: () => void;
 	private rejectClosed!: (err: Error) => void;
 	private isClosed = false;
 	private closeRequested = false;
@@ -824,6 +830,9 @@ export class WasmSession {
 			this.rejectClosed = rej;
 		});
 		this.closed.catch(() => {});
+		this.draining = new Promise((res) => {
+			this.resolveDraining = res;
+		});
 	}
 
 	get sessionId(): bigint {
@@ -929,12 +938,26 @@ export class WasmSession {
 	}
 
 	/**
-	 * Close this WebTransport session. Primary session close tears down the
-	 * QUIC connection; extra sessions only FIN that CONNECT.
+	 * Ask the peer to stop starting new streams and datagrams on this session
+	 * (WT_DRAIN_SESSION): a graceful-shutdown signal that leaves in-flight work
+	 * running. Returns false when the session is not established.
+	 */
+	drain(): boolean {
+		if (this.isClosingOrClosed) return false;
+		return this.mgr.drainSession(this);
+	}
+
+	/**
+	 * Close this WebTransport session. The peer is told over a WT_CLOSE_SESSION
+	 * capsule on the CONNECT stream; the QUIC connection stays up for any other
+	 * sessions on it.
 	 */
 	close(info?: WtCloseInfo): void {
 		if (this.isClosed || this.closeRequested) return;
 		this.closeRequested = true;
+		// A local close starts the closing phase, which is what `draining`
+		// reports; a peer that never drains must not leave it pending.
+		this.resolveDraining();
 		// The reason travels to the peer, but the close event that resolves
 		// `closed` carries only a wasm-side error detail — empty for a clean
 		// local close. Keep the caller's info so our own `closed` reports what
@@ -996,10 +1019,17 @@ export class WasmSession {
 			this.resolveReady();
 		}
 	}
+	/** @internal The peer sent WT_DRAIN_SESSION. */
+	_markDraining(): void {
+		this.resolveDraining();
+	}
 	/** @internal */
 	_markClosed(info: WtCloseInfo, errorDetail = ""): void {
 		if (!this.isClosed) {
 			this.isClosed = true;
+			// A session that closed without ever draining still leaves the
+			// closing phase behind it; never leave `draining` pending.
+			this.resolveDraining();
 			this._dropRetained();
 			if (!this.established) {
 				const error = wasmOperationError(
@@ -1278,7 +1308,14 @@ export class WasmTransportManager {
 					}
 				}
 			},
-			onSessionClosed: (conn, sessionId, code) => {
+			onSessionDraining: (conn, sessionId) => {
+				this.emitLog("session_draining", {
+					conn,
+					sessionId: sessionId.toString(),
+				});
+				this.sessions.get(sessionKey(conn, sessionId))?._markDraining();
+			},
+			onSessionClosed: (conn, sessionId, code, reason) => {
 				const detail = this.endpoint.takeLastError();
 				const key = sessionKey(conn, sessionId);
 				const s = this.sessions.get(key);
@@ -1286,15 +1323,20 @@ export class WasmTransportManager {
 					conn,
 					sessionId: sessionId.toString(),
 					code,
+					reason: reason || undefined,
 					detail: detail || undefined,
 				});
 				if (s) {
-					s._markClosed({ code, reason: detail || undefined }, detail);
+					s._markClosed(
+						{ code, reason: reason || detail || undefined },
+						detail,
+					);
 					this.sessions.delete(key);
 				} else {
 					// Secondary CONNECT failed/timed out before establish.
 					this.failedPendingOpens.add(key);
 				}
+				this._releaseSessionHostReservations(conn, sessionId);
 				for (const [handle, sid] of [...this.streamSessionIds]) {
 					if (sid === sessionId) {
 						const ws = this.streams.get(handle);
@@ -1829,7 +1871,16 @@ export class WasmTransportManager {
 		}
 	}
 
-	/** @internal Close one session; primary tears down QUIC, extras do not. */
+	/** @internal Signal WT_DRAIN_SESSION for one established session. */
+	drainSession(session: WasmSession): boolean {
+		if (session.sessionId === PENDING_SESSION_ID) return false;
+		return this.endpoint.drainSession(session.conn, session.sessionId);
+	}
+
+	/**
+	 * @internal Close one session over its CONNECT stream; the QUIC connection
+	 * survives for any sibling sessions.
+	 */
 	closeSession(session: WasmSession, info?: WtCloseInfo): void {
 		if (session.sessionId === PENDING_SESSION_ID) {
 			this.endpoint.closeConn(
@@ -1850,6 +1901,32 @@ export class WasmTransportManager {
 	private _releaseConnectionHostReservations(conn: number): void {
 		for (const reservation of [...this.hostReservations]) {
 			if (reservation.conn === conn) reservation.release();
+		}
+	}
+
+	/**
+	 * Release the retained inbound bytes owned by one closing session. Stream
+	 * reservations follow their stream's session; datagram reservations are only
+	 * connection-scoped, so they drop once the last session on that connection
+	 * is gone. Call after the session has left {@link sessions} but before its
+	 * stream ids are unmapped.
+	 */
+	private _releaseSessionHostReservations(
+		conn: number,
+		sessionId: bigint,
+	): void {
+		const connHasLiveSession = [...this.sessions.values()].some(
+			(s) => s.conn === conn,
+		);
+		for (const reservation of [...this.hostReservations]) {
+			if (reservation.conn !== conn) continue;
+			const owner =
+				reservation.stream === undefined
+					? undefined
+					: this.streamSessionIds.get(reservation.stream);
+			const owned =
+				owner === undefined ? !connHasLiveSession : owner === sessionId;
+			if (owned) reservation.release();
 		}
 	}
 

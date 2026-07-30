@@ -125,6 +125,11 @@ export interface WasmModule {
 		code: number,
 		reason: string,
 	): boolean;
+	wt_drain_session(
+		eid: number,
+		conn: number,
+		sessionId: bigint | number,
+	): boolean;
 	wt_stream_write(eid: number, stream: number, data: Uint8Array): number;
 	wt_stream_pause(eid: number, stream: number): void;
 	wt_stream_resume(eid: number, stream: number): void;
@@ -179,6 +184,7 @@ const EVENT = {
 	STREAM_RESET: 7,
 	STREAM_STOPPED: 8,
 	SESSION_CLOSED: 9,
+	SESSION_DRAINING: 10,
 } as const;
 
 function decodeVarintSafe(
@@ -230,7 +236,10 @@ export type DecodedWasmEvent =
 			conn: number;
 			sessionId: bigint;
 			code: number;
+			/** Peer's WT_CLOSE_SESSION reason; empty when it sent none. */
+			reason: string;
 	  }
+	| { type: "session-draining"; conn: number; sessionId: bigint }
 	| {
 			type: "stream-opened";
 			conn: number;
@@ -317,14 +326,29 @@ export function decodeWasmEvent(ev: Uint8Array): DecodedWasmEvent | null {
 			off = sid[1];
 			const codeResult = decodeVarintSafe(ev, off);
 			if (!codeResult) return null;
+			let code: number;
+			[code, off] = codeResult;
+			const lenResult = decodeVarintSafe(ev, off);
+			if (!lenResult) return null;
+			let len: number;
+			[len, off] = lenResult;
+			if (off + len > ev.length) return null;
 			const sessionId = requireSafeSessionId(sid[0]);
 			if (sessionId == null) return null;
 			return {
 				type: "session-closed",
 				conn,
 				sessionId,
-				code: codeResult[0],
+				code,
+				reason: TEXT_DECODER.decode(ev.subarray(off, off + len)),
 			};
+		}
+		case EVENT.SESSION_DRAINING: {
+			const sid = decodeVarintBig(ev, off);
+			if (!sid) return null;
+			const sessionId = requireSafeSessionId(sid[0]);
+			if (sessionId == null) return null;
+			return { type: "session-draining", conn, sessionId };
 		}
 		case EVENT.STREAM_OPENED: {
 			const sid = decodeVarintBig(ev, off);
@@ -445,7 +469,15 @@ export function dispatchDecodedWasmEvent(
 			events.onClosed?.(decoded.conn, decoded.code);
 			return;
 		case "session-closed":
-			events.onSessionClosed?.(decoded.conn, decoded.sessionId, decoded.code);
+			events.onSessionClosed?.(
+				decoded.conn,
+				decoded.sessionId,
+				decoded.code,
+				decoded.reason,
+			);
+			return;
+		case "session-draining":
+			events.onSessionDraining?.(decoded.conn, decoded.sessionId);
 			return;
 		case "stream-opened":
 			events.onStreamOpened?.(
@@ -496,7 +528,13 @@ export interface WasmSessionEvents {
 		hostToken?: number,
 	) => void;
 	onClosed?: (conn: number, code: number) => void;
-	onSessionClosed?: (conn: number, sessionId: bigint, code: number) => void;
+	onSessionDraining?: (conn: number, sessionId: bigint) => void;
+	onSessionClosed?: (
+		conn: number,
+		sessionId: bigint,
+		code: number,
+		reason: string,
+	) => void;
 	onStreamOpened?: (
 		conn: number,
 		sessionId: bigint,
@@ -831,6 +869,16 @@ export class WasmEndpoint {
 			code,
 			reason,
 		);
+		this.pump();
+		return ok;
+	}
+
+	drainSession(conn: number, sessionId: bigint): boolean {
+		if (this.closed) return false;
+		// Older wasm builds predate the drain capsule; treating it as a no-op
+		// keeps a mismatched module from throwing on a purely advisory signal.
+		if (typeof this.wasm.wt_drain_session !== "function") return false;
+		const ok = this.wasm.wt_drain_session(this.eid, conn, sessionId);
 		this.pump();
 		return ok;
 	}

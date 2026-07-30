@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use wtransport::error::{StreamReadError, StreamWriteError};
-use wtransport::VarInt;
 
 use crate::RUNTIME;
 
@@ -681,7 +680,7 @@ pub fn spawn_bidi_bridge_on(
                                 // stream forever. Stop it so the reader unblocks
                                 // with an error instead of hanging.
                                 if should_reset_on_oversized_chunk(sz, &read_budget) {
-                                    recv_stream.stop(VarInt::from_u32(0));
+                                    recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
                                             *g = Some("E_STREAM_RESET".to_string());
@@ -714,7 +713,7 @@ pub fn spawn_bidi_bridge_on(
                                 }
                                 if let Some(stop_code) = abort_stop {
                                     if let Some(c) = stop_code {
-                                        recv_stream.stop(VarInt::from_u32(c));
+                                        recv_stream.stop(c);
                                     }
                                     break;
                                 }
@@ -740,7 +739,7 @@ pub fn spawn_bidi_bridge_on(
                 }
                 code = &mut stop_rx => {
                     if let Ok(c) = code {
-                        recv_stream.stop(VarInt::from_u32(c));
+                        recv_stream.stop(c);
                     }
                     break;
                 }
@@ -806,7 +805,7 @@ pub fn spawn_bidi_bridge_on(
                     break;
                 }
                 StreamCmd::Reset(code) => {
-                    let _ = send_stream.reset(VarInt::from_u32(code));
+                    let _ = send_stream.reset(code);
                     break;
                 }
             }
@@ -899,7 +898,7 @@ pub fn spawn_uni_send_bridge_on(
                     break;
                 }
                 StreamCmd::Reset(code) => {
-                    let _ = send_stream.reset(VarInt::from_u32(code));
+                    let _ = send_stream.reset(code);
                     break;
                 }
             }
@@ -952,7 +951,7 @@ pub fn spawn_uni_recv_bridge_on(
                                 // never be reserved: stop the stream instead of
                                 // parking forever (see bidi recv bridge).
                                 if should_reset_on_oversized_chunk(sz, &budget) {
-                                    recv_stream.stop(VarInt::from_u32(0));
+                                    recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
                                             *g = Some("E_STREAM_RESET".to_string());
@@ -993,7 +992,7 @@ pub fn spawn_uni_recv_bridge_on(
                                 }
                                 if let Some(stop_code) = abort_stop {
                                     if let Some(c) = stop_code {
-                                        recv_stream.stop(VarInt::from_u32(c));
+                                        recv_stream.stop(c);
                                     }
                                     break;
                                 }
@@ -1018,7 +1017,7 @@ pub fn spawn_uni_recv_bridge_on(
                 }
                 code = &mut stop_rx => {
                     if let Ok(c) = code {
-                        recv_stream.stop(VarInt::from_u32(c));
+                        recv_stream.stop(c);
                     }
                     break;
                 }
