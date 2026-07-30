@@ -47,8 +47,10 @@ These are **1.0 requirements**, not permanent product omissions. Treat
   and back per draft §4.4 (`wt_error.rs`), for QUIC **stream** codes only — the
   close capsule carries the raw 32-bit code. Proven against real Chromium in
   `tools/interop/tests-wasm/wasm-server.spec.ts`.
-- **`GOAWAY` is not implemented.** The wasm backend signals a session drain
-  only; there is no connection-level GOAWAY send path.
+- **`GOAWAY` is a deliberate non-goal on wasm.** The wasm backend signals a
+  session drain only; the wasm h3 module has no control-stream `GOAWAY` handling,
+  so there is no connection-level GOAWAY send path. (Native does send it, via
+  `ServerSession.goAway()` — see `docs/PARITY_MATRIX.md`; that stays native-only.)
 - Frame-size bound: a single buffered H3 control/CONNECT/HEADERS frame is
   capped at `MAX_H3_FRAME_SIZE` (1 MiB); a peer advertising more is closed with
   H3_EXCESSIVE_LOAD (see `endpoint.rs`).

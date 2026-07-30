@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native GOAWAY send.** `ServerSession.goAway()` sends the connection-scoped
+  H3 `GOAWAY`, surfacing the fork's `Connection::send_goaway`. The peer observes
+  it as its `draining` settling (the fork folds a received `GOAWAY` into the same
+  signal as `WT_DRAIN_SESSION`), and the session stays usable. Scope caveat:
+  native is single-session-per-connection, so `GOAWAY`'s practical use is a
+  server-initiated graceful-shutdown signal — the "refuse a second session"
+  enforcement it implies is not reachable through the public API. Wasm sends no
+  `GOAWAY` and that remains a deliberate non-goal (no control-stream handling in
+  the wasm h3 module).
 - Server-side `congestionControl` on `ServerOptions` (`"default"` → Cubic, `"throughput"` → BBR, `"low-latency"` → NewReno), matching the existing client option; the effective mode is exposed as `WebTransportServer.congestionControl`.
 - Server keep-alive: `limits.keepAliveIntervalMs` now emits QUIC keep-alive packets on server sessions so idle-but-healthy connections survive `idleTimeoutMs`; the interval is clamped to `min(keepAliveIntervalMs, idleTimeoutMs / 3)`, and `0`/omitted keeps keep-alive disabled.
 - New `webtransport-bun/portable` entrypoint: an async `createServer` that runs one

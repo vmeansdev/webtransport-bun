@@ -102,6 +102,20 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Tell the peer not to open any further session on this connection.
+    ///
+    /// Sends an H3 `GOAWAY`. `GOAWAY` is connection-scoped: it asks the peer to
+    /// stop starting new WebTransport sessions on this connection, a
+    /// server-initiated graceful-shutdown signal. The current session keeps
+    /// working — new refusals are not exercisable here because native is
+    /// single-session-per-connection. Returns immediately; the frame goes out in
+    /// the background. The peer observes it as its `draining` settling.
+    #[napi(js_name = "goAway")]
+    pub fn go_away(&self) -> WtResult<()> {
+        session_registry::send_goaway(&self.id);
+        Ok(())
+    }
+
     /// Resolves once the peer says this session is going away.
     ///
     /// Settles on a received `WT_DRAIN_SESSION` or `GOAWAY`, and immediately if
