@@ -19,15 +19,34 @@ export function buildInteropWebServerEnv(
 	return env;
 }
 
+export function resolveBunExecutable(): string {
+	if (basename(process.execPath).toLowerCase() === "bun") return process.execPath;
+	const lookup = process.platform === "win32" ? "where.exe" : "which";
+	try {
+		const resolved = execFileSync(lookup, ["bun"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		})
+			.split(/\r?\n/)[0]
+			?.trim();
+		if (resolved) return resolved;
+	} catch {
+		// Fall through to a clear error instead of serializing PATH into evidence.
+	}
+	throw new Error("Bun executable could not be resolved for interop startup");
+}
+
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 export function buildInteropWebServerCommand(): string {
-	const bun = shellQuote(process.execPath);
+	const bun = shellQuote(resolveBunExecutable());
 	return `${bun} run prepare-certs.ts && ${bun} run addon-server.ts`;
 }
 
 export function documentedServerEnvironmentKeys(): readonly string[] {
 	return SERVER_ENV_KEYS;
 }
+import { execFileSync } from "node:child_process";
+import { basename } from "node:path";
