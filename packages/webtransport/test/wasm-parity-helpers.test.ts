@@ -1,5 +1,11 @@
 import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+	chmodSync,
+	mkdtempSync,
+	lstatSync,
+	rmSync,
+	symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,10 +20,7 @@ import {
 } from "../src/backend.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
-import {
-	wasmCaFingerprint,
-	wasmPoolKey,
-} from "../src/wasm-endpoint-pool.js";
+import { wasmCaFingerprint, wasmPoolKey } from "../src/wasm-endpoint-pool.js";
 
 // Soft-skip when pkg is absent (local `bun test packages/`). With
 // WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
@@ -48,6 +51,45 @@ describe("wasm parity epic helpers", () => {
 			expect(await store.get("auth")).toBeNull();
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("FileTicketStoreHost protects POSIX permissions and rejects symlinks", async () => {
+		if (process.platform === "win32") return;
+		const parent = mkdtempSync(join(tmpdir(), "wt-tickets-parent-"));
+		const dir = join(parent, "private");
+		const previousUmask = process.umask(0);
+		try {
+			const store = new FileTicketStoreHost(dir);
+			expect(lstatSync(dir).mode & 0o777).toBe(0o700);
+			await store.put("secure", new Uint8Array([1, 2, 3]));
+			const ticketPath = join(dir, "c2VjdXJl.ticket");
+			expect(lstatSync(ticketPath).mode & 0o777).toBe(0o600);
+
+			chmodSync(ticketPath, 0o644);
+			await expect(store.get("secure")).resolves.toEqual(
+				new Uint8Array([1, 2, 3]),
+			);
+			expect(lstatSync(ticketPath).mode & 0o777).toBe(0o600);
+
+			const target = join(dir, "target");
+			await Bun.write(target, new Uint8Array([9]));
+			const symlinkKey = "symlink";
+			try {
+				symlinkSync(
+					target,
+					join(
+						dir,
+						`${Buffer.from(symlinkKey, "utf8").toString("base64url")}.ticket`,
+					),
+				);
+			} catch {
+				return;
+			}
+			await expect(store.get(symlinkKey)).rejects.toThrow(/symlink/i);
+		} finally {
+			process.umask(previousUmask);
+			rmSync(parent, { recursive: true, force: true });
 		}
 	});
 

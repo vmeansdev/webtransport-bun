@@ -1,5 +1,12 @@
 import {
+	chmodSync,
+	closeSync,
+	constants,
+	fchmodSync,
+	fstatSync,
+	lstatSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
 	unlinkSync,
@@ -7,6 +14,63 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { TicketStoreHost } from "./backend-wasm.js";
+
+const POSIX_TICKET_DIRECTORY_MODE = 0o700;
+const POSIX_TICKET_FILE_MODE = 0o600;
+
+function isErrno(error: unknown, code: string): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error as { code?: unknown }).code === code
+	);
+}
+
+function rejectUnsafeTicketPath(path: string): void {
+	const stat = lstatSync(path);
+	if (stat.isSymbolicLink()) {
+		throw new Error(`Refusing symlink ticket path: ${path}`);
+	}
+	if (!stat.isFile()) {
+		throw new Error(`Refusing non-regular ticket path: ${path}`);
+	}
+}
+
+function readTicket(path: string): Uint8Array | null {
+	try {
+		rejectUnsafeTicketPath(path);
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return null;
+		throw error;
+	}
+
+	if (process.platform === "win32") {
+		return new Uint8Array(readFileSync(path));
+	}
+
+	let fd: number | undefined;
+	try {
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const stat = fstatSync(fd);
+		if (!stat.isFile()) {
+			throw new Error(`Refusing non-regular ticket path: ${path}`);
+		}
+		const ticket = new Uint8Array(readFileSync(fd));
+		fchmodSync(fd, POSIX_TICKET_FILE_MODE);
+		return ticket;
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return null;
+		if (isErrno(error, "ELOOP")) {
+			throw new Error(`Refusing symlink ticket path: ${path}`, {
+				cause: error,
+			});
+		}
+		throw error;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
 
 function keyToFile(dir: string, key: string): string {
 	const safe = Buffer.from(key, "utf8").toString("base64url");
@@ -16,33 +80,68 @@ function keyToFile(dir: string, key: string): string {
 /** Bun/Node durable TicketStoreHost using one file per authority key. */
 export class FileTicketStoreHost implements TicketStoreHost {
 	constructor(private readonly directory: string) {
-		mkdirSync(directory, { recursive: true });
+		mkdirSync(directory, {
+			recursive: true,
+			mode: POSIX_TICKET_DIRECTORY_MODE,
+		});
+		const stat = lstatSync(directory);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) {
+			throw new Error(`Refusing unsafe ticket directory: ${directory}`);
+		}
+		if (process.platform !== "win32") {
+			chmodSync(directory, POSIX_TICKET_DIRECTORY_MODE);
+		}
 	}
 
 	async get(key: string): Promise<Uint8Array | null> {
-		try {
-			return new Uint8Array(readFileSync(keyToFile(this.directory, key)));
-		} catch {
-			return null;
-		}
+		return readTicket(keyToFile(this.directory, key));
 	}
 
 	async put(key: string, ticket: Uint8Array): Promise<void> {
 		const path = keyToFile(this.directory, key);
-		const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-		writeFileSync(tmp, ticket);
-		renameSync(tmp, path);
+		try {
+			rejectUnsafeTicketPath(path);
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+
+		const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random()
+			.toString(36)
+			.slice(2)}.tmp`;
+		let fd: number | undefined;
+		let renamed = false;
+		try {
+			fd = openSync(
+				tmp,
+				constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+				POSIX_TICKET_FILE_MODE,
+			);
+			writeFileSync(fd, ticket);
+			if (process.platform !== "win32") {
+				fchmodSync(fd, POSIX_TICKET_FILE_MODE);
+			}
+			closeSync(fd);
+			fd = undefined;
+			renameSync(tmp, path);
+			renamed = true;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+			if (!renamed) {
+				try {
+					unlinkSync(tmp);
+				} catch (error) {
+					if (!isErrno(error, "ENOENT")) throw error;
+				}
+			}
+		}
 	}
 
 	async take(key: string): Promise<Uint8Array | null> {
 		const path = keyToFile(this.directory, key);
-		try {
-			const value = new Uint8Array(readFileSync(path));
-			unlinkSync(path);
-			return value;
-		} catch {
-			return null;
-		}
+		const value = readTicket(path);
+		if (value === null) return null;
+		unlinkSync(path);
+		return value;
 	}
 }
 
