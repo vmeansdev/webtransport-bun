@@ -372,10 +372,14 @@ async function terminateCommandProcessTree(
 		child,
 		"SIGKILL",
 	);
+	const postKillProofDeadline = Math.min(
+		proofDeadline,
+		Date.now() + killGraceMs,
+	);
 	return {
 		cleanupError: usedDirectChildFallbackAfterKill
 			? new Error("descendant exit unproven after direct-child fallback")
-			: !(await waitForProcessGroupExitUntil(child.pid, proofDeadline))
+			: !(await waitForProcessGroupExitUntil(child.pid, postKillProofDeadline))
 				? new Error(
 						"descendant exit unproven after bounded process-group proof",
 					)
