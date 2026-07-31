@@ -4,8 +4,12 @@ import {
 	createWasmServer,
 	normalizeWasmEndpointOptions,
 	serveOverUdp,
+	WasmTransportManager,
 } from "../src/backend.js";
-import { MemoryTicketStoreHost } from "../src/backend-wasm.js";
+import {
+	MemoryTicketStoreHost,
+	type TicketStoreHost,
+} from "../src/backend-wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
@@ -34,6 +38,39 @@ async function withDeadline<T>(
 	}
 }
 
+function fakeTicketDumpModule(blob = new Uint8Array([4, 5, 6])) {
+	const base = {
+		wt_new_endpoint_with_options: () => JSON.stringify({ eid: 1 }),
+		wt_poll_transmits: () => new Uint8Array(),
+		wt_poll_event: () => undefined,
+		wt_next_timeout_ms: () => -1,
+		wt_governor_snapshot: () => "{}",
+		wt_take_last_error: () => "",
+		wt_dump_client_ticket: () => blob.slice(),
+		wt_close_all() {},
+		wt_close_endpoint() {},
+	};
+	return new Proxy(base, {
+		get(target, key) {
+			return Reflect.get(target, key) ?? (() => 0);
+		},
+	}) as unknown as Parameters<typeof WasmTransportManager.create>[0];
+}
+
+function ticketDumpManager(ticketStore: TicketStoreHost): WasmTransportManager {
+	return WasmTransportManager.create(
+		fakeTicketDumpModule(),
+		new InMemoryRelay().a,
+		false,
+		"127.0.0.1:5544",
+		"127.0.0.1:4433",
+		null,
+		normalizeWasmEndpointOptions({ enable0Rtt: true }),
+		undefined,
+		ticketStore,
+	);
+}
+
 describe("wasm 0-RTT product surface", () => {
 	test("MemoryTicketStoreHost take-once rejects replay", async () => {
 		const store = new MemoryTicketStoreHost();
@@ -50,6 +87,75 @@ describe("wasm 0-RTT product surface", () => {
 		expect(n.shareProcess0RttTicketStore).toBeUndefined();
 		expect(n.qpackMaxTableCapacity).toBeUndefined();
 		expect(n.enableDynamicQpack).toBeUndefined();
+	});
+
+	test("manager close stays sync while shutdown waits for ticket persistence", async () => {
+		let resolvePut!: () => void;
+		let transportClosed = 0;
+		const stored: Uint8Array[] = [];
+		const ticketStore: TicketStoreHost = {
+			async get() {
+				return null;
+			},
+			async put(_key, ticket) {
+				stored.push(ticket.slice());
+				await new Promise<void>((resolve) => {
+					resolvePut = resolve;
+				});
+			},
+			async take() {
+				return null;
+			},
+		};
+		const manager = ticketDumpManager(ticketStore);
+		manager.ownTransport({
+			send() {},
+			onPacket() {},
+			close() {
+				transportClosed += 1;
+			},
+		});
+		manager.rememberAuthority("localhost");
+
+		expect(manager.close()).toBeUndefined();
+		const shutdown = manager.waitForShutdown();
+		let settled = false;
+		void shutdown.finally(() => {
+			settled = true;
+		});
+		await Bun.sleep(0);
+		expect(stored).toEqual([new Uint8Array([4, 5, 6])]);
+		expect(settled).toBe(false);
+		expect(transportClosed).toBe(1);
+
+		resolvePut();
+		await expect(shutdown).resolves.toBeUndefined();
+		manager.close();
+		expect(transportClosed).toBe(1);
+	});
+
+	test("manager close surfaces ticket persistence failures via waitForShutdown", async () => {
+		const reported: unknown[] = [];
+		const manager = ticketDumpManager({
+			async get() {
+				return null;
+			},
+			async put() {
+				throw new Error("persist failed");
+			},
+			async take() {
+				return null;
+			},
+		});
+		manager.onCallbackError = (error) => {
+			reported.push(error);
+		};
+		manager.rememberAuthority("localhost");
+
+		manager.close();
+		await expect(manager.waitForShutdown()).rejects.toThrow("persist failed");
+		expect(reported).toHaveLength(1);
+		expect(String(reported[0])).toContain("persist failed");
 	});
 
 	test.skipIf(!wasmAvailable)(

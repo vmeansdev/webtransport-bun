@@ -237,15 +237,22 @@ export class IndexedDBTicketStoreHost implements TicketStoreHost {
 	}
 
 	async take(key: string): Promise<Uint8Array | null> {
-		const existing = await this.get(key);
-		if (!existing) return null;
 		const db = await this.db();
-		await new Promise<void>((resolve, reject) => {
+		return new Promise<Uint8Array | null>((resolve, reject) => {
 			const tx = db.transaction(this.storeName, "readwrite");
-			tx.objectStore(this.storeName).delete(key);
-			tx.oncomplete = () => resolve();
+			const store = tx.objectStore(this.storeName);
+			const req = store.get(key);
+			let existing: Uint8Array | null = null;
+			req.onsuccess = () => {
+				const value = req.result;
+				if (value instanceof Uint8Array) {
+					existing = value.slice();
+					store.delete(key);
+				}
+			};
+			req.onerror = () => reject(req.error);
+			tx.oncomplete = () => resolve(existing);
 			tx.onerror = () => reject(tx.error);
 		});
-		return existing;
 	}
 }

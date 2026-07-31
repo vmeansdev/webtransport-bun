@@ -13,6 +13,7 @@ import {
 	connectWasm,
 	createWasmServer,
 	FileTicketStoreHost,
+	IndexedDBTicketStoreHost,
 	MemoryTicketStoreHost,
 	normalizeWasmEndpointOptions,
 	toWasmServerSession,
@@ -27,6 +28,107 @@ import { wasmCaFingerprint, wasmPoolKey } from "../src/wasm-endpoint-pool.js";
 const wasm = wasmAvailable
 	? await loadWasmModule()
 	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
+
+type FakeRequest<T> = {
+	result: T;
+	error: Error | null;
+	onsuccess: (() => void) | null;
+	onerror: (() => void) | null;
+};
+
+function makeFakeRequest<T>(initial: T): FakeRequest<T> {
+	return {
+		result: initial,
+		error: null,
+		onsuccess: null,
+		onerror: null,
+	};
+}
+
+function createFakeIndexedDbFactory() {
+	class FakeDatabase {
+		private readonly stores = new Map<string, Map<string, Uint8Array>>();
+		private writeChain = Promise.resolve();
+
+		readonly objectStoreNames = {
+			contains: (name: string) => this.stores.has(name),
+		};
+
+		createObjectStore(name: string): void {
+			if (!this.stores.has(name)) this.stores.set(name, new Map());
+		}
+
+		transaction(storeName: string, mode: "readonly" | "readwrite") {
+			const store = this.stores.get(storeName);
+			if (!store) throw new Error(`missing object store ${storeName}`);
+			const steps: Array<() => void> = [];
+			const tx = {
+				error: null as Error | null,
+				oncomplete: null as (() => void) | null,
+				onerror: null as (() => void) | null,
+				objectStore: (_name: string) => ({
+					get: (key: string) => {
+						const req = makeFakeRequest<Uint8Array | undefined>(undefined);
+						steps.push(() => {
+							req.result = store.get(key)?.slice();
+							req.onsuccess?.();
+						});
+						return req;
+					},
+					put: (value: Uint8Array, key: string) => {
+						steps.push(() => {
+							store.set(key, value.slice());
+						});
+					},
+					delete: (key: string) => {
+						steps.push(() => {
+							store.delete(key);
+						});
+					},
+				}),
+			};
+			const run = async () => {
+				await Promise.resolve();
+				try {
+					for (let i = 0; i < steps.length; i++) steps[i]?.();
+					tx.oncomplete?.();
+				} catch (error) {
+					tx.error = error as Error;
+					tx.onerror?.();
+				}
+			};
+			if (mode === "readwrite") {
+				this.writeChain = this.writeChain.then(run, run);
+			} else {
+				void run();
+			}
+			return tx;
+		}
+	}
+
+	const dbs = new Map<string, FakeDatabase>();
+	return {
+		open(name: string) {
+			const req = {
+				...makeFakeRequest<FakeDatabase>(undefined as never),
+				onupgradeneeded: null as (() => void) | null,
+			};
+			queueMicrotask(() => {
+				let db = dbs.get(name);
+				if (!db) {
+					db = new FakeDatabase();
+					dbs.set(name, db);
+					req.result = db;
+					req.onupgradeneeded?.();
+				} else {
+					req.result = db;
+				}
+				req.onsuccess?.();
+			});
+			return req;
+		},
+	};
+}
 
 describe("wasm parity epic helpers", () => {
 	beforeEach(() => {
@@ -90,6 +192,28 @@ describe("wasm parity epic helpers", () => {
 		} finally {
 			process.umask(previousUmask);
 			rmSync(parent, { recursive: true, force: true });
+		}
+	});
+
+	test("IndexedDBTicketStoreHost take is atomic across concurrent calls", async () => {
+		const previous = (globalThis as { indexedDB?: unknown }).indexedDB;
+		(globalThis as { indexedDB?: unknown }).indexedDB =
+			createFakeIndexedDbFactory();
+		try {
+			const store = new IndexedDBTicketStoreHost("wt-test-db", "tickets");
+			await store.put("auth", new Uint8Array([7, 8, 9]));
+			const [first, second] = await Promise.all([
+				store.take("auth"),
+				store.take("auth"),
+			]);
+			const results = [first, second];
+			expect(results.filter((value) => value !== null)).toHaveLength(1);
+			expect(results).toContainEqual(new Uint8Array([7, 8, 9]));
+			expect(await store.get("auth")).toBeNull();
+		} finally {
+			if (previous === undefined)
+				delete (globalThis as { indexedDB?: unknown }).indexedDB;
+			else (globalThis as { indexedDB?: unknown }).indexedDB = previous;
 		}
 	});
 

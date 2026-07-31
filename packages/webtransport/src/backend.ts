@@ -1215,6 +1215,8 @@ export class WasmTransportManager {
 	private closeResourceSnapshot: ReturnType<
 		WasmTransportManager["_currentResourceSnapshot"]
 	> | null = null;
+	private shutdownPromise: Promise<void> | null = null;
+	private closeStarted = false;
 
 	private constructor(
 		isServer: boolean,
@@ -1264,6 +1266,7 @@ export class WasmTransportManager {
 					undefined,
 					hostToken,
 					data.length,
+					false,
 				);
 				if (!reservation) {
 					this._closeSessionForInboundPressure(conn, sessionId);
@@ -1807,6 +1810,23 @@ export class WasmTransportManager {
 		return true;
 	}
 
+	private _persistCloseTickets(authority: string | null): Promise<void> {
+		if (!authority || !this.ticketStore || !this.options.enable0Rtt) {
+			return Promise.resolve();
+		}
+		const blob = this.endpoint.dumpClientTicket(authority);
+		if (!blob || blob.length === 0) return Promise.resolve();
+		const persist = Promise.resolve(this.ticketStore.put(authority, blob));
+		const observable = persist.catch((error) => {
+			this._reportResourceError(error);
+			throw error;
+		});
+		// close() remains sync; keep detached persistence failures observable via
+		// waitForShutdown() and onCallbackError without triggering unhandled-reject noise.
+		void observable.catch(() => {});
+		return observable;
+	}
+
 	/** Native-shaped metrics snapshot (governor + JS counters). TLS counters are 0 until Phase 6. */
 	metricsSnapshot(): MetricsSnapshot {
 		let rust: Record<string, number> = {};
@@ -1957,10 +1977,10 @@ export class WasmTransportManager {
 	 * isolated and reported instead of propagated.
 	 */
 	close(): void {
+		if (this.closeStarted) return;
+		this.closeStarted = true;
 		const authority = this.lastAuthority;
-		if (authority && this.ticketStore && this.options.enable0Rtt) {
-			void this.dumpTicketsToHost(authority).catch(() => {});
-		}
+		this.shutdownPromise = this._persistCloseTickets(authority);
 		this.emitLog("endpoint_close", { authority });
 		const guard = (step: () => void) => {
 			try {
@@ -1995,6 +2015,10 @@ export class WasmTransportManager {
 		guard(() => this.endpoint.finishClose());
 		guard(() => this.ownedTransport?.close?.());
 		this.ownedTransport = null;
+	}
+
+	waitForShutdown(): Promise<void> {
+		return this.shutdownPromise ?? Promise.resolve();
 	}
 
 	/**
