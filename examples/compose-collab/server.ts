@@ -8,7 +8,7 @@ import { resolve } from "node:path";
 
 const WT_HOST = process.env.WT_HOST ?? "0.0.0.0";
 const WT_PORT = Number(process.env.WT_PORT ?? 4433);
-const HTTP_HOST = process.env.HTTP_HOST ?? "0.0.0.0";
+const HTTP_HOST = process.env.HTTP_HOST ?? "127.0.0.1";
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 8080);
 
 const certPemPath = resolve(import.meta.dir, "./certs/cert.pem");

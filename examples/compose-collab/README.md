@@ -19,6 +19,13 @@ bun run example:compose:collab
 
 This command builds the image and starts all nodes via Docker Compose.
 
+The dashboard is local-only by default. Direct runs bind HTTP to loopback, and
+Compose publishes the container dashboard on `127.0.0.1:8080`; the WebTransport
+UDP port remains available on the configured host mapping for local clients.
+Change the HTTP bind or port mapping only for an intentional, protected network
+demo. The dashboard is an unauthenticated diagnostics surface and must not be
+used as a production control plane.
+
 ## What you should see
 
 - Server logs showing sessions joining/leaving
