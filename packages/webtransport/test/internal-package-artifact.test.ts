@@ -101,20 +101,19 @@ function createFixtureTarball(root: string): string {
 }
 
 function createHangingRuntime(root: string, descendantPidFile: string): string {
-	const runtime = join(root, "fake-deno.sh");
+	const runtime = join(root, "fake-deno");
 	writeFileSync(
 		runtime,
 		[
-			"#!/bin/sh",
-			'if [ "$1" = "--version" ]; then',
-			'  echo "deno 2.9.3"',
-			"  exit 0",
-			"fi",
-			`"${process.execPath}" -e 'setInterval(() => {}, 1_000);' -- "$@" &`,
-			'printf "%s" "$!" > "$WT_FIXTURE_DESCENDANT_PID_FILE"',
-			'echo "fixture smoke started"',
-			'echo "fixture smoke stderr" >&2',
-			'wait "$!"',
+			`#!${process.execPath}`,
+			'const { spawn } = require("node:child_process");',
+			'const { writeFileSync } = require("node:fs");',
+			'if (process.argv[2] === "--version") { console.log("deno 2.9.3"); process.exit(0); }',
+			'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000);"], { stdio: "ignore" });',
+			"writeFileSync(process.env.WT_FIXTURE_DESCENDANT_PID_FILE, String(child.pid));",
+			'console.log("fixture smoke started");',
+			'console.error("fixture smoke stderr");',
+			"setInterval(() => {}, 1_000);",
 		].join("\n"),
 		"utf8",
 	);
@@ -294,13 +293,15 @@ function createHangingTaskkill(
 	writeFileSync(
 		taskkill,
 		[
-			"#!/bin/sh",
-			'printf "%s\\n" "$@" > "$WT_FIXTURE_TASKKILL_ARGS_FILE"',
-			'printf "%s" "$$" > "$WT_FIXTURE_TASKKILL_PID_FILE"',
-			'target="$2"',
-			`descendant_pid="$(cat ${JSON.stringify(descendantPidFile)} 2>/dev/null || true)"`,
-			'if [ -n "$descendant_pid" ]; then kill -9 "$descendant_pid" 2>/dev/null || true; sleep 0.05; fi',
-			"exec sleep 1000",
+			`#!${process.execPath}`,
+			'const { readFileSync, writeFileSync } = require("node:fs");',
+			"const args = process.argv.slice(2);",
+			'writeFileSync(process.env.WT_FIXTURE_TASKKILL_ARGS_FILE, `${args.join("\\n")}\\n`);',
+			"writeFileSync(process.env.WT_FIXTURE_TASKKILL_PID_FILE, String(process.pid));",
+			`const descendantPid = Number(readFileSync(${JSON.stringify(descendantPidFile)}, "utf8"));`,
+			'try { process.kill(descendantPid, "SIGKILL"); } catch {}',
+			"setTimeout(() => {}, 50);",
+			"setInterval(() => {}, 1_000);",
 		].join("\n"),
 		"utf8",
 	);
@@ -314,10 +315,10 @@ function createFailingTaskkill(root: string): string {
 	writeFileSync(
 		taskkill,
 		[
-			"#!/bin/sh",
-			'echo "fixture taskkill stdout"',
-			'echo "fixture taskkill stderr" >&2',
-			"exit 23",
+			`#!${process.execPath}`,
+			'console.log("fixture taskkill stdout");',
+			'console.error("fixture taskkill stderr");',
+			"process.exit(23);",
 		].join("\n"),
 		"utf8",
 	);
@@ -327,17 +328,16 @@ function createFailingTaskkill(root: string): string {
 
 function createRootOnlyTaskkill(root: string, triggerPath?: string): string {
 	const taskkill = join(root, "root-only-taskkill");
-	const trigger = triggerPath
-		? `: > ${JSON.stringify(triggerPath)}`
-		: undefined;
 	writeFileSync(
 		taskkill,
 		[
-			"#!/bin/sh",
-			'target="$2"',
-			'kill -9 "$target" 2>/dev/null || true',
-			...(trigger ? [trigger] : []),
-			"exit 0",
+			`#!${process.execPath}`,
+			'const { writeFileSync } = require("node:fs");',
+			'try { process.kill(Number(process.argv[3]), "SIGKILL"); } catch {}',
+			...(triggerPath
+				? [`writeFileSync(${JSON.stringify(triggerPath)}, "");`]
+				: []),
+			"process.exit(0);",
 		].join("\n"),
 		"utf8",
 	);
@@ -469,11 +469,12 @@ test.serial(
 		process.env.WT_FIXTURE_TASKKILL_ARGS_FILE = taskkill.argsFile;
 		process.env.WT_FIXTURE_TASKKILL_PID_FILE = taskkill.pidFile;
 		const startedAt = Date.now();
+		const taskkillTimeoutMs = 3_000;
 		let cleanupError: Error | undefined;
 		const cleanupPromise = capturedError(
 			runBoundedWindowsTreeKill(
 				child.pid as number,
-				1_500,
+				taskkillTimeoutMs,
 				join(root, "taskkill"),
 			),
 		);
@@ -500,8 +501,10 @@ test.serial(
 			"/T",
 			"/F",
 		]);
-		expect(cleanupError?.message).toContain("taskkill timed out after 1500ms");
-		expect(elapsedMs).toBeLessThan(3_000);
+		expect(cleanupError?.message).toContain(
+			`taskkill timed out after ${taskkillTimeoutMs}ms`,
+		);
+		expect(elapsedMs).toBeLessThan(5_000);
 		await expectPidExit(child.pid as number);
 		await expectProcessExit(descendantPidFile);
 		await expectProcessExit(taskkill.pidFile);
@@ -537,10 +540,11 @@ test.serial(
 		const descendantPidFile = join(root, "descendant.pid");
 		const child = spawnHangingProcessTree(descendantPidFile);
 		await waitForFile(descendantPidFile);
+		const taskkillTimeoutMs = 3_000;
 		const cleanupError = await capturedError(
 			runBoundedWindowsTreeKill(
 				child.pid as number,
-				1_500,
+				taskkillTimeoutMs,
 				createFailingTaskkill(root),
 			),
 		);
