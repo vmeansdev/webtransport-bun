@@ -110,6 +110,8 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					limits: {
+						maxHandshakesInFlight: 2,
+						handshakeTimeoutMs: 1500,
 						maxStreamsPerSessionBidi: 8,
 						maxStreamsPerSessionUni: 8,
 						maxDatagramSize: 512,
@@ -167,14 +169,35 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 				[ADVERSARY_BIN, `127.0.0.1:${port}`, "localhost"],
 				{ stdout: "pipe", stderr: "pipe" },
 			);
-			const exitCode = await Promise.race([
-				proc.exited,
-				Bun.sleep(30000).then(() => "timeout" as const),
-			]);
+			let peakHandshakesInFlight = 0;
+			let peakSessionTasksActive = 0;
+			const sampler = setInterval(() => {
+				const sample = server.metricsSnapshot();
+				peakHandshakesInFlight = Math.max(
+					peakHandshakesInFlight,
+					sample.handshakesInFlight,
+				);
+				peakSessionTasksActive = Math.max(
+					peakSessionTasksActive,
+					sample.sessionTasksActive,
+				);
+			}, 5);
+			let exitCode: number | "timeout";
+			try {
+				exitCode = await Promise.race([
+					proc.exited,
+					Bun.sleep(30000).then(() => "timeout" as const),
+				]);
+			} finally {
+				clearInterval(sampler);
+			}
 			if (exitCode === "timeout") {
 				proc.kill();
 				throw new Error("adversary binary did not exit within 30s");
 			}
+			expect(peakHandshakesInFlight).toBeLessThanOrEqual(2);
+			// The accept loop itself is one tracked session task.
+			expect(peakSessionTasksActive).toBeLessThanOrEqual(3);
 			// Attacker should complete cleanly; the server is the SUT, so a
 			// nonzero exit is surfaced but does not by itself fail the run.
 			if (exitCode !== 0) {
