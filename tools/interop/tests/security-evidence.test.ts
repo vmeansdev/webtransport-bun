@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	buildInteropWebServerEnv,
 	buildInteropWebServerCommand,
+	resolveBunExecutable,
 } from "../web-server-env.ts";
 import { verifyEvidenceDocument } from "../verify-evidence.ts";
 
@@ -31,7 +32,7 @@ describe("interop evidence security boundary", () => {
 
 	it("uses the current Bun executable instead of PATH lookup", () => {
 		const command = buildInteropWebServerCommand();
-		expect(command).toContain(process.execPath);
+		expect(command).toContain(resolveBunExecutable());
 		expect(command).not.toContain("bun run");
 	});
 
