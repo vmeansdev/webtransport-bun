@@ -108,11 +108,8 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 			'  echo "deno 2.9.3"',
 			"  exit 0",
 			"fi",
-			`"${process.execPath}" -e '`,
-			'const { writeFileSync } = require("node:fs");',
-			"writeFileSync(process.env.WT_FIXTURE_DESCENDANT_PID_FILE, String(process.pid));",
-			"setInterval(() => {}, 1_000);",
-			`' -- "$@" &`,
+			`"${process.execPath}" -e 'setInterval(() => {}, 1_000);' -- "$@" &`,
+			'printf "%s" "$!" > "$WT_FIXTURE_DESCENDANT_PID_FILE"',
 			'echo "fixture smoke started"',
 			'echo "fixture smoke stderr" >&2',
 			'wait "$!"',
@@ -128,11 +125,14 @@ function processIsAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		if (process.platform !== "win32") {
-			const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+			const psResult = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
 				encoding: "utf8",
 			});
-			const state = (status.stdout ?? "").trim();
-			if (state.startsWith("Z")) return false;
+			if (!psResult.error) {
+				const state = (psResult.stdout ?? "").trim();
+				if (state.length === 0) return false;
+				if (state.startsWith("Z")) return false;
+			}
 		}
 		return true;
 	} catch {
@@ -148,7 +148,8 @@ async function expectProcessExit(pidFile: string): Promise<void> {
 
 async function expectPidExit(pid: number): Promise<void> {
 	const deadline = Date.now() + 1_000;
-	while (processIsAlive(pid) && Date.now() < deadline) {
+	while (Date.now() < deadline) {
+		if (!processIsAlive(pid)) return;
 		await Bun.sleep(25);
 	}
 	expect(processIsAlive(pid)).toBe(false);
@@ -179,15 +180,15 @@ function hangingProcessTreeSource(
 	const descendantSource = "setInterval(() => {}, 1_000);";
 	return [
 		'const { spawn } = require("node:child_process");',
-		'const { writeFileSync } = require("node:fs");',
-		`const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });`,
-		`writeFileSync(${JSON.stringify(descendantPidFile)}, String(child.pid));`,
+		'const { writeFileSync, writeSync } = require("node:fs");',
 		...(emitDiagnostics
 			? [
-					'console.log("fixture command stdout");',
-					'console.error("fixture command stderr");',
+					'writeSync(1, "fixture command stdout\\n");',
+					'writeSync(2, "fixture command stderr\\n");',
 				]
 			: []),
+		`const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });`,
+		`writeFileSync(${JSON.stringify(descendantPidFile)}, String(child.pid));`,
 		"setInterval(() => {}, 1_000);",
 	].join("\n");
 }
@@ -267,8 +268,7 @@ function createHangingTaskkill(
 			'printf "%s" "$$" > "$WT_FIXTURE_TASKKILL_PID_FILE"',
 			'target="$2"',
 			`descendant_pid="$(cat ${JSON.stringify(descendantPidFile)} 2>/dev/null || true)"`,
-			'if [ -n "$descendant_pid" ]; then kill -9 "$descendant_pid" 2>/dev/null || true; fi',
-			'kill -9 "$target" 2>/dev/null || true',
+			'if [ -n "$descendant_pid" ]; then kill -9 "$descendant_pid" 2>/dev/null || true; sleep 0.05; fi',
 			"exec sleep 1000",
 		].join("\n"),
 		"utf8",
@@ -397,6 +397,7 @@ test.serial(
 		expect(result.stderr).toContain("fixture smoke started");
 		expect(result.stderr).toContain("fixture smoke stderr");
 		expect(elapsedMs).toBeLessThan(5_000);
+		await waitForFile(descendantPidFile);
 		await expectProcessExit(descendantPidFile);
 	},
 );

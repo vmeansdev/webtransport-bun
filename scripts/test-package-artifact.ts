@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, mkdtempSync, openSync, rmSync } from "node:fs";
 import {
@@ -159,6 +159,31 @@ function signalPosixProcessTree(
 	return false;
 }
 
+function bestEffortPosixDirectChildReap(rootPid: number): void {
+	const probe = spawnSync("pgrep", ["-P", String(rootPid)], {
+		encoding: "utf8",
+		env: sharedEnv(),
+		windowsHide: true,
+	});
+	if (probe.error) return;
+	const childPids = (probe.stdout ?? "")
+		.split(/\s+/)
+		.map((value) => Number.parseInt(value, 10))
+		.filter((value) => Number.isFinite(value));
+	for (const childPid of childPids) {
+		try {
+			process.kill(childPid, "SIGKILL");
+		} catch {
+			// Best-effort timeout cleanup for simulated-Windows tests on POSIX hosts.
+		}
+	}
+	try {
+		process.kill(rootPid, "SIGKILL");
+	} catch {
+		// The root may already have exited while the timeout handler was running.
+	}
+}
+
 export async function runBoundedWindowsTreeKill(
 	pid: number,
 	timeoutMs: number,
@@ -215,6 +240,9 @@ export async function runBoundedWindowsTreeKill(
 			finish();
 		});
 		timeoutHandle = setTimeout(() => {
+			if (process.platform !== "win32") {
+				bestEffortPosixDirectChildReap(pid);
+			}
 			try {
 				killer.kill("SIGKILL");
 			} catch {
