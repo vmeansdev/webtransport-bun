@@ -987,12 +987,11 @@ export class WasmSession {
 	}
 
 	metricsSnapshot(): SessionMetricsSnapshot {
-		const stats = this.connectionStats();
 		return {
 			datagramsIn: this.datagramsInCount,
 			datagramsOut: this.datagramsOutCount,
 			streamsActive: this.mgr._activeStreamCount(this.conn, this.sessionId),
-			queuedBytes: stats.bytesSent + stats.bytesReceived,
+			queuedBytes: this.mgr._queuedBytesForSession(this.conn),
 		};
 	}
 
@@ -1761,6 +1760,11 @@ export class WasmTransportManager {
 			if (stream?.conn === conn) count += 1;
 		}
 		return count;
+	}
+
+	/** @internal Return retained host payload bytes for one session connection. */
+	_queuedBytesForSession(conn: number): number {
+		return this.hostQueuedBytesPerSession.get(conn) ?? 0;
 	}
 
 	connectClient(authority: string): WasmSession {

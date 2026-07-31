@@ -1593,6 +1593,49 @@ describe("wasm resource governor (Task 6 RED)", () => {
 	);
 
 	test.skipIf(!wasmAvailable)(
+		"session queuedBytes reports retained payloads and drains independently of cumulative stats",
+		async () => {
+			const pair = await realManagedPair({
+				maxDatagramSize: 4,
+				maxQueuedBytesGlobal: 4,
+				maxQueuedBytesPerSession: 4,
+				maxQueuedBytesPerStream: 4,
+			});
+			try {
+				expect(pair.clientSession.metricsSnapshot().queuedBytes).toBe(0);
+
+				await pair.serverSession.sendDatagram(new Uint8Array([1, 2, 3, 4]));
+				await waitForSnapshot(
+					pair.clientManager,
+					(snapshot) => snapshot.hostQueuedBytesGlobal === 4,
+					"session datagram was not retained",
+				);
+				expect(pair.clientSession.metricsSnapshot().queuedBytes).toBe(4);
+
+				let received = 0;
+				pair.clientSession.onDatagram(() => {
+					received += 1;
+				});
+				const deadline = Date.now() + 3_000;
+				while (received < 1 && Date.now() < deadline) await Bun.sleep(5);
+				expect(received).toBe(1);
+				await waitForSnapshot(
+					pair.clientManager,
+					(snapshot) => snapshot.hostQueuedBytesGlobal === 0,
+					"session datagram reservation did not release",
+				);
+				expect(pair.clientSession.metricsSnapshot().queuedBytes).toBe(0);
+				const stats = pair.clientSession.connectionStats();
+				expect(stats.bytesSent + stats.bytesReceived).toBeGreaterThan(0);
+			} finally {
+				pair.clientManager.close();
+				pair.serverManager.close();
+			}
+		},
+		10_000,
+	);
+
+	test.skipIf(!wasmAvailable)(
 		"real manager keeps paused datagram reservation through WHATWG pull and resumes after capacity frees",
 		async () => {
 			const pair = await realManagedPair({
