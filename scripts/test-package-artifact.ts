@@ -474,7 +474,7 @@ export async function runPackageCommand(
 					[beforeCleanupStdout, beforeCleanupStderr] =
 						await timeoutCapturePromise;
 				}
-				if (timedOut && cleanupError !== undefined) {
+				if (timedOut) {
 					const stabilizationMs =
 						platform === "win32"
 							? WINDOWS_CAPTURE_STABILIZATION_MS
