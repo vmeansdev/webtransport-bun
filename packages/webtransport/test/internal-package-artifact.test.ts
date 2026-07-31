@@ -109,6 +109,7 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 			'const { spawn } = require("node:child_process");',
 			'const { writeFileSync } = require("node:fs");',
 			'if (process.argv[2] === "--version") { console.log("deno 2.9.3"); process.exit(0); }',
+			'if (process.env.WT_FIXTURE_STARTED_FILE) writeFileSync(process.env.WT_FIXTURE_STARTED_FILE, "started");',
 			'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000);"], { stdio: "ignore" });',
 			"writeFileSync(process.env.WT_FIXTURE_DESCENDANT_PID_FILE, String(child.pid));",
 			'console.log("fixture smoke started");',
@@ -223,6 +224,7 @@ function delayedDescendantOutputSource(
 async function runGuarded(
 	args: string[],
 	env: NodeJS.ProcessEnv,
+	guardTimeoutMs = 5_000,
 ): Promise<{
 	error?: Error;
 	status: number | null;
@@ -260,13 +262,13 @@ async function runGuarded(
 					}
 				}
 				child.kill("SIGKILL");
-			}, 5_000);
+			}, guardTimeoutMs);
 		});
 		child.once("close", (status) => {
 			if (guard !== undefined) clearTimeout(guard);
 			resolve({
 				error: guardExpired
-					? new Error("test process exceeded its 5000ms guard")
+					? new Error(`test process exceeded its ${guardTimeoutMs}ms guard`)
 					: undefined,
 				status,
 				stdout,
@@ -407,9 +409,9 @@ test.serial(
 		tempRoots.push(root);
 		const tarball = createFixtureTarball(root);
 		const descendantPidFile = join(root, "descendant.pid");
+		const smokeStartedFile = join(root, "smoke.started");
 		const runtime = createHangingRuntime(root, descendantPidFile);
-		const startedAt = Date.now();
-		const result = await runGuarded(
+		const guardedResult = runGuarded(
 			[
 				"scripts/test-package-artifact.ts",
 				"smoke",
@@ -424,8 +426,13 @@ test.serial(
 				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
 				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
 				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
+				WT_FIXTURE_STARTED_FILE: smokeStartedFile,
 			},
+			8_000,
 		);
+		await waitForFile(smokeStartedFile);
+		const startedAt = Date.now();
+		const result = await guardedResult;
 		const elapsedMs = Date.now() - startedAt;
 
 		expect(result.error).toBeUndefined();
