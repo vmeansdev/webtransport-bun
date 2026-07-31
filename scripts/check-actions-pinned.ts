@@ -887,6 +887,19 @@ function scanWorkflow(path: string): Violation[] {
 	for (const job of jobs) {
 		const block = lines.slice(job.start, job.end + 1);
 		const text = block.join("\n");
+		for (const step of stepBlocks(lines, job)) {
+			const command = stepRun(step);
+			if (!/\$\{\{\s*github\.event\.inputs\.[A-Za-z0-9_-]+/.test(command)) {
+				continue;
+			}
+			const relativeLine = step.lines.findIndex((line) =>
+				/\$\{\{\s*github\.event\.inputs\.[A-Za-z0-9_-]+/.test(line),
+			);
+			add(
+				step.start + Math.max(relativeLine, 0),
+				"workflow_dispatch inputs must pass through step env, not shell run source",
+			);
+		}
 		if (
 			/uses:\s*['"]?actions\/checkout@/.test(text) &&
 			!hasPermission(block, "contents", "read") &&

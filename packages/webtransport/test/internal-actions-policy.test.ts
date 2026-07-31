@@ -23,6 +23,10 @@ const TEST_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "test.yml"),
 	"utf8",
 );
+const SOAK_WORKFLOW = readFileSync(
+	join(PROJECT_ROOT, ".github", "workflows", "soak-long.yml"),
+	"utf8",
+);
 const LOCAL_CI_SCRIPT = readFileSync(
 	join(PROJECT_ROOT, "scripts", "test_ci_local.sh"),
 	"utf8",
@@ -121,6 +125,26 @@ function mutatePublishWorkflowOccurrence(
 		);
 	}
 	return `${PUBLISH_WORKFLOW.slice(0, index)}${replacement}${PUBLISH_WORKFLOW.slice(index + search.length)}`;
+}
+
+function runSoakInputValidation(overrides: Record<string, string> = {}) {
+	return spawnSync("bash", ["scripts/validate-soak-inputs.sh"], {
+		cwd: PROJECT_ROOT,
+		env: {
+			...process.env,
+			CANDIDATE_COMMIT: "0123456789abcdef0123456789abcdef01234567",
+			CANDIDATE_REF: "refs/tags/v1.0.0",
+			CAMPAIGN_SEED: "seed-01",
+			CONTINUITY_TOKEN: "continuity-01",
+			DURATION_HOURS: "1",
+			RUNNER_TYPE: "github-hosted",
+			RUNNER_MODE: "shared",
+			SEGMENT_INDEX: "1",
+			SEGMENT_COUNT: "1",
+			...overrides,
+		},
+		encoding: "utf8",
+	});
 }
 
 function parseWorkflow(document: string): {
@@ -991,5 +1015,53 @@ jobs:
 `);
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("policy passed");
+	});
+
+	it("rejects workflow inputs interpolated into shell run source", () => {
+		const campaignSeedExpression =
+			"$" + "{{ github.event.inputs.campaign_seed }}";
+		const result = runPolicy(`
+jobs:
+  soak:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "${campaignSeedExpression}"
+`);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("must pass through step env");
+
+		const accepted = runPolicy(`
+jobs:
+  soak:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CAMPAIGN_SEED: ${campaignSeedExpression}
+        run: |
+          echo "$CAMPAIGN_SEED"
+`);
+		expect(accepted.status).toBe(0);
+	});
+
+	it("validates soak inputs against shell metacharacters and bounded lengths", () => {
+		expect(runSoakInputValidation().status).toBe(0);
+		for (const [key, value] of [
+			["CANDIDATE_REF", "refs/tags/v1;touch /tmp/pwned"],
+			["CAMPAIGN_SEED", "seed$(id)"],
+			["CONTINUITY_TOKEN", "token && echo pwned"],
+		] as const) {
+			const result = runSoakInputValidation({ [key]: value });
+			expect(result.status, key).toBe(1);
+		}
+		expect(SOAK_WORKFLOW).toContain("validate-soak-inputs.sh");
+		expect(SOAK_WORKFLOW).toContain(
+			"INPUT_CANDIDATE_COMMIT: " +
+				"${{ github.event.inputs.candidate_commit }}",
+		);
 	});
 });
