@@ -240,6 +240,7 @@ async function runGuarded(
 		let stdout = "";
 		let stderr = "";
 		let guardExpired = false;
+		let guard: ReturnType<typeof setTimeout> | undefined;
 		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", (chunk: string) => {
 			stdout += chunk;
@@ -248,20 +249,22 @@ async function runGuarded(
 		child.stderr.on("data", (chunk: string) => {
 			stderr += chunk;
 		});
-		const guard = setTimeout(() => {
-			guardExpired = true;
-			if (child.pid !== undefined && process.platform !== "win32") {
-				try {
-					process.kill(-child.pid, "SIGKILL");
-					return;
-				} catch {
-					// Fall through to the direct child handle.
+		child.once("spawn", () => {
+			guard = setTimeout(() => {
+				guardExpired = true;
+				if (child.pid !== undefined && process.platform !== "win32") {
+					try {
+						process.kill(-child.pid, "SIGKILL");
+						return;
+					} catch {
+						// Fall through to the direct child handle.
+					}
 				}
-			}
-			child.kill("SIGKILL");
-		}, 5_000);
+				child.kill("SIGKILL");
+			}, 5_000);
+		});
 		child.once("close", (status) => {
-			clearTimeout(guard);
+			if (guard !== undefined) clearTimeout(guard);
 			resolve({
 				error: guardExpired
 					? new Error("test process exceeded its 5000ms guard")
@@ -272,7 +275,7 @@ async function runGuarded(
 			});
 		});
 		child.once("error", (error) => {
-			clearTimeout(guard);
+			if (guard !== undefined) clearTimeout(guard);
 			resolve({ error, status: null, stdout, stderr });
 		});
 	});
@@ -467,14 +470,20 @@ test.serial(
 		process.env.WT_FIXTURE_TASKKILL_PID_FILE = taskkill.pidFile;
 		const startedAt = Date.now();
 		let cleanupError: Error | undefined;
+		const cleanupPromise = capturedError(
+			runBoundedWindowsTreeKill(
+				child.pid as number,
+				1_500,
+				join(root, "taskkill"),
+			),
+		);
 		try {
-			cleanupError = await capturedError(
-				runBoundedWindowsTreeKill(
-					child.pid as number,
-					1_500,
-					join(root, "taskkill"),
-				),
-			);
+			// The mocked command writes its invocation evidence before sleeping.
+			// Wait for that bounded proof while the fixture environment is still
+			// installed; otherwise a loaded host can time out before /bin/sh has
+			// flushed the files, making the assertion race the test cleanup.
+			await waitForFile(taskkill.argsFile);
+			cleanupError = await cleanupPromise;
 		} finally {
 			if (previousArgsFile === undefined)
 				delete process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;

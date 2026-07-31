@@ -254,20 +254,22 @@ export async function runBoundedWindowsTreeKill(
 			}
 			finish();
 		});
-		timeoutHandle = setTimeout(() => {
-			if (process.platform !== "win32") {
-				bestEffortPosixDirectChildReap(pid);
-			}
-			try {
-				killer.kill("SIGKILL");
-			} catch {
-				// The killer may already have exited between the timer and this call.
-			}
-			killer.stdout?.destroy();
-			killer.stderr?.destroy();
-			killer.unref();
-			fail(`taskkill timed out after ${timeoutMs}ms`);
-		}, timeoutMs);
+		killer.once("spawn", () => {
+			timeoutHandle = setTimeout(() => {
+				if (process.platform !== "win32") {
+					bestEffortPosixDirectChildReap(pid);
+				}
+				try {
+					killer.kill("SIGKILL");
+				} catch {
+					// The killer may already have exited between the timer and this call.
+				}
+				killer.stdout?.destroy();
+				killer.stderr?.destroy();
+				killer.unref();
+				fail(`taskkill timed out after ${timeoutMs}ms`);
+			}, timeoutMs);
+		});
 	});
 }
 
