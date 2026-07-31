@@ -30,6 +30,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { connect, createServer, type ServerSession } from "../src/index.js";
+import { forEachWithTimeout, nextWithTimeout } from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
 
 async function connectWithRetry(
@@ -74,11 +75,14 @@ function echoServer(port: number, qpack: Record<string, unknown>) {
 		...qpack,
 		onSession: (session) => {
 			sessions.push(session);
-			void (async () => {
-				for await (const dgram of session.incomingDatagrams()) {
+			void forEachWithTimeout(
+				session.incomingDatagrams(),
+				5000,
+				"native qpack server echo datagram",
+				async (dgram) => {
 					await session.sendDatagram(dgram);
-				}
-			})().catch(() => {});
+				},
+			).catch(() => {});
 		},
 	});
 	return { server, sessions };
@@ -92,9 +96,18 @@ async function roundTrip(url: string, clientOpts: Record<string, unknown>) {
 	const payload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 	let echoed: Uint8Array | undefined;
 	void (async () => {
-		for await (const dgram of client.incomingDatagrams()) {
-			echoed = dgram;
-			break;
+		const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+		try {
+			const next = await nextWithTimeout(
+				iter,
+				5000,
+				"native qpack client echo datagram",
+			);
+			if (!next.done && next.value !== undefined) {
+				echoed = next.value;
+			}
+		} finally {
+			await iter.return?.();
 		}
 	})().catch(() => {});
 	// Datagrams are unreliable; retransmit until the echo lands (or timeout).

@@ -7,7 +7,7 @@ import {
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { toWasmServerSession } from "../src/wasm-server-session.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
-import { withTimeout } from "./helpers/harness.js";
+import { nextWithTimeout, withTimeout } from "./helpers/harness.js";
 
 const wasm = wasmAvailable
 	? await loadWasmModule()
@@ -79,9 +79,21 @@ describe("WasmServerSession native-shaped surface", () => {
 				const facade = toWasmServerSession(serverSession);
 				const received: Uint8Array[] = [];
 				const pump = (async () => {
-					for await (const d of facade.incomingDatagrams()) {
-						received.push(d.slice());
-						if (received.length === 2) return;
+					const iter = facade.incomingDatagrams()[Symbol.asyncIterator]();
+					try {
+						while (received.length < 2) {
+							const next = await nextWithTimeout(
+								iter,
+								5000,
+								"wasm server session incoming datagram",
+							);
+							if (next.done || next.value === undefined) {
+								return;
+							}
+							received.push(next.value.slice());
+						}
+					} finally {
+						await iter.return?.();
 					}
 				})();
 

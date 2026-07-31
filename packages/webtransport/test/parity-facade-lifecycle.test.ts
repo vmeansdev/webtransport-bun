@@ -5,7 +5,11 @@
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { toWebTransport } from "../src/index.js";
-import { collectWithTimeout, withTimeout } from "./helpers/harness.js";
+import {
+	collectWithTimeout,
+	nextWithTimeout,
+	withTimeout,
+} from "./helpers/harness.js";
 import { connectWithRetry } from "./helpers/network.js";
 import {
 	createParityHarness,
@@ -68,11 +72,24 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			onServerSession = (session) => {
 				void (async () => {
 					const decoder = new TextDecoder();
-					for await (const d of session.incomingDatagrams()) {
-						if (decoder.decode(d) === token) {
-							server = session;
-							return;
+					const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
+					try {
+						while (true) {
+							const next = await nextWithTimeout(
+								iter,
+								5000,
+								"parity lifecycle peer-drain token datagram",
+							);
+							if (next.done || next.value === undefined) {
+								return;
+							}
+							if (decoder.decode(next.value) === token) {
+								server = session;
+								return;
+							}
 						}
+					} finally {
+						await iter.return?.();
 					}
 				})().catch(() => {});
 			};

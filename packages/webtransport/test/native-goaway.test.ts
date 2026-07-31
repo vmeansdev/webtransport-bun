@@ -16,7 +16,11 @@
 
 import { describe, expect, it } from "bun:test";
 import { createServer, type ServerSession } from "../src/index.js";
-import { withHarness, withTimeout } from "./helpers/harness.js";
+import {
+	nextWithTimeout,
+	withHarness,
+	withTimeout,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 15600;
@@ -52,11 +56,24 @@ describe("native GOAWAY send path", () => {
 					onSession: (s) => {
 						void (async () => {
 							const decoder = new TextDecoder();
-							for await (const d of s.incomingDatagrams()) {
-								if (decoder.decode(d) === token) {
-									serverSession = s;
-									return;
+							const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
+							try {
+								while (true) {
+									const next = await nextWithTimeout(
+										iter,
+										5000,
+										"native goaway positive token datagram",
+									);
+									if (next.done || next.value === undefined) {
+										return;
+									}
+									if (decoder.decode(next.value) === token) {
+										serverSession = s;
+										return;
+									}
 								}
+							} finally {
+								await iter.return?.();
 							}
 						})().catch(() => {});
 					},
@@ -116,11 +133,24 @@ describe("native GOAWAY send path", () => {
 					onSession: (s) => {
 						void (async () => {
 							const decoder = new TextDecoder();
-							for await (const d of s.incomingDatagrams()) {
-								if (decoder.decode(d) === token) {
-									serverSession = s;
-									return;
+							const iter = s.incomingDatagrams()[Symbol.asyncIterator]();
+							try {
+								while (true) {
+									const next = await nextWithTimeout(
+										iter,
+										5000,
+										"native goaway negative token datagram",
+									);
+									if (next.done || next.value === undefined) {
+										return;
+									}
+									if (decoder.decode(next.value) === token) {
+										serverSession = s;
+										return;
+									}
 								}
+							} finally {
+								await iter.return?.();
 							}
 						})().catch(() => {});
 					},

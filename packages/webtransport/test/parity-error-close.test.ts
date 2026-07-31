@@ -19,6 +19,7 @@ import {
 	skipWasmParityIfUnavailable,
 	wasmParityReady,
 } from "./helpers/parity-backend.js";
+import { nextWithTimeout } from "./helpers/harness.js";
 
 describe.skipIf(skipWasmParityIfUnavailable)(
 	"parity error and close mapping (P4)",
@@ -58,11 +59,24 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			onServerSession = (session) => {
 				void (async () => {
 					const decoder = new TextDecoder();
-					for await (const d of session.incomingDatagrams()) {
-						if (decoder.decode(d) === token) {
-							server = session;
-							return;
+					const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
+					try {
+						while (true) {
+							const next = await nextWithTimeout(
+								iter,
+								5000,
+								"parity error close token datagram",
+							);
+							if (next.done || next.value === undefined) {
+								return;
+							}
+							if (decoder.decode(next.value) === token) {
+								server = session;
+								return;
+							}
 						}
+					} finally {
+						await iter.return?.();
 					}
 				})().catch(() => {});
 			};

@@ -21,6 +21,7 @@ import {
 	WT_STOP_SENDING,
 } from "../src/index.js";
 import { generateLocalhostCert } from "./helpers/certs.js";
+import { forEachWithTimeout, nextWithTimeout } from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 describe("webtransport package exports", () => {
@@ -233,9 +234,14 @@ describe("server congestionControl (parity backport B1)", () => {
 				tls: { certPem: "", keyPem: "" },
 				congestionControl: mode,
 				onSession: async (s) => {
-					for await (const d of s.incomingDatagrams()) {
-						await s.sendDatagram(d);
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						`server congestionControl ${mode} echo datagram`,
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					);
 				},
 			});
 			expect(server.congestionControl).toBe(mode);
@@ -245,9 +251,17 @@ describe("server congestionControl (parity backport B1)", () => {
 			try {
 				await client.sendDatagram(new Uint8Array([7, 8, 9]));
 				const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-				const echoed = await iter.next();
-				expect(echoed.done).toBe(false);
-				expect(Array.from(echoed.value as Uint8Array)).toEqual([7, 8, 9]);
+				try {
+					const echoed = await nextWithTimeout(
+						iter,
+						5000,
+						`server congestionControl ${mode} echoed datagram`,
+					);
+					expect(echoed.done).toBe(false);
+					expect(Array.from(echoed.value as Uint8Array)).toEqual([7, 8, 9]);
+				} finally {
+					await iter.return?.();
+				}
 			} finally {
 				client.close();
 				await server.close();
@@ -266,9 +280,14 @@ describe("server keepalive (parity backport B2)", () => {
 			limits: { idleTimeoutMs: 1200, keepAliveIntervalMs: 300 },
 			onSession: async (s) => {
 				serverSession = s;
-				for await (const d of s.incomingDatagrams()) {
-					await s.sendDatagram(d);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"server keepalive echo datagram",
+					async (d) => {
+						await s.sendDatagram(d);
+					},
+				);
 			},
 		});
 		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
@@ -293,9 +312,17 @@ describe("server keepalive (parity backport B2)", () => {
 			// Session must still be fully functional after the quiet period.
 			await client.sendDatagram(new Uint8Array([42]));
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const echoed = await iter.next();
-			expect(echoed.done).toBe(false);
-			expect(Array.from(echoed.value as Uint8Array)).toEqual([42]);
+			try {
+				const echoed = await nextWithTimeout(
+					iter,
+					5000,
+					"server keepalive echoed datagram",
+				);
+				expect(echoed.done).toBe(false);
+				expect(Array.from(echoed.value as Uint8Array)).toEqual([42]);
+			} finally {
+				await iter.return?.();
+			}
 		} finally {
 			client.close();
 			await server.close();
