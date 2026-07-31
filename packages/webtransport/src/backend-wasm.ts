@@ -627,6 +627,9 @@ export class WasmEndpoint {
 			this.wasm.wt_recv_packet(this.eid, data, formatAddr(source));
 			this.pump();
 		});
+		udp.onWritable?.(() => {
+			if (!this.closed) this.pump();
+		});
 	}
 
 	/**

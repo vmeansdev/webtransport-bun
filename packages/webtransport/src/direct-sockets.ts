@@ -27,6 +27,15 @@ interface UDPSocketLike {
 }
 type UDPSocketCtor = new (options: Record<string, unknown>) => UDPSocketLike;
 
+/** Hard overload boundaries for the Direct Sockets writable FIFO. */
+export const DIRECT_SOCKETS_MAX_PENDING_WRITES = 256;
+export const DIRECT_SOCKETS_MAX_PENDING_WRITE_BYTES = 4 * 1024 * 1024;
+
+type PendingWrite = {
+	message: UDPMessage;
+	bytes: number;
+};
+
 function getUDPSocket(): UDPSocketCtor {
 	const ctor = (globalThis as { UDPSocket?: UDPSocketCtor }).UDPSocket;
 	if (!ctor) {
@@ -40,6 +49,11 @@ function getUDPSocket(): UDPSocketCtor {
 export class DirectSocketsUdpTransport implements UdpTransport {
 	private cb: ((data: Uint8Array, source: UdpAddr) => void) | null = null;
 	private writer: WritableStreamDefaultWriter<UDPMessage> | null = null;
+	private writableCb: (() => void) | null = null;
+	private readonly pendingWrites: PendingWrite[] = [];
+	private pendingBytes = 0;
+	private droppedWrites = 0;
+	private draining = false;
 	// Structural type: avoids DOM-vs-node ReadableStreamDefaultReader lib clashes.
 	private reader: {
 		read(): Promise<{ value?: UDPMessage; done: boolean }>;
@@ -55,6 +69,21 @@ export class DirectSocketsUdpTransport implements UdpTransport {
 	/** Bound port reported by the socket; unset in client (connected) mode. */
 	get localPort(): number | undefined {
 		return this.boundPort;
+	}
+
+	/** Number of datagrams queued or currently awaiting writable settlement. */
+	get pendingWriteCount(): number {
+		return this.pendingWrites.length;
+	}
+
+	/** Bytes queued or currently awaiting writable settlement. */
+	get pendingWriteBytes(): number {
+		return this.pendingBytes;
+	}
+
+	/** Datagrams rejected at the declared hard queue boundary or by the writer. */
+	get droppedWriteCount(): number {
+		return this.droppedWrites;
 	}
 
 	private constructor(
@@ -150,21 +179,79 @@ export class DirectSocketsUdpTransport implements UdpTransport {
 		// Connected sockets target the fixed server; bound sockets route to the
 		// destination the wasm endpoint chose for the packet.
 		const msg: UDPMessage = this.connected
-			? { data }
-			: { data, remoteAddress: dest.address, remotePort: dest.port };
-		// Fire-and-forget; backpressure handled by the wasm send budget. A
-		// rejection (socket torn down mid-pump) is UDP loss, not an error to
-		// surface — swallow it so it never becomes an unhandled rejection.
-		this.writer.write(msg).catch(() => {});
+			? { data: data.slice() }
+			: {
+					data: data.slice(),
+					remoteAddress: dest.address,
+					remotePort: dest.port,
+				};
+		if (
+			this.pendingWrites.length >= DIRECT_SOCKETS_MAX_PENDING_WRITES ||
+			this.pendingBytes + msg.data.byteLength >
+				DIRECT_SOCKETS_MAX_PENDING_WRITE_BYTES
+		) {
+			this.droppedWrites += 1;
+			return;
+		}
+		this.pendingWrites.push({ message: msg, bytes: msg.data.byteLength });
+		this.pendingBytes += msg.data.byteLength;
+		this.startDrain();
 	}
 
 	onPacket(cb: (data: Uint8Array, source: UdpAddr) => void): void {
 		this.cb = cb;
 	}
 
+	onWritable(cb: () => void): void {
+		this.writableCb = cb;
+	}
+
+	private startDrain(): void {
+		if (this.draining || this.closed) return;
+		this.draining = true;
+		void this.drainWrites().catch(() => {
+			// All expected writer failures are handled per packet in drainWrites.
+			// Keep a defensive catch here so a browser-specific writer cannot
+			// create an unhandled rejection in the Direct Sockets adapter.
+		});
+	}
+
+	private async drainWrites(): Promise<void> {
+		try {
+			while (!this.closed && this.writer && this.pendingWrites.length > 0) {
+				const pending = this.pendingWrites[0];
+				if (!pending) break;
+				const writer = this.writer;
+				try {
+					if (writer.desiredSize !== null && writer.desiredSize <= 0) {
+						await writer.ready;
+					}
+					await writer.write(pending.message);
+				} catch {
+					this.droppedWrites += 1;
+				} finally {
+					if (this.pendingWrites[0] === pending) {
+						this.pendingWrites.shift();
+						this.pendingBytes -= pending.bytes;
+					}
+					this.writableCb?.();
+				}
+			}
+		} finally {
+			this.draining = false;
+			this.writableCb?.();
+			if (!this.closed && this.pendingWrites.length > 0) {
+				this.startDrain();
+			}
+		}
+	}
+
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		this.droppedWrites += this.pendingWrites.length;
+		this.pendingWrites.length = 0;
+		this.pendingBytes = 0;
 		// UDPSocket.close() REJECTS while readable/writable are locked, so the
 		// stream locks must be released first: cancel() the parked reader (this
 		// also unblocks readLoop's pending read()) and release the writer.
@@ -174,9 +261,15 @@ export class DirectSocketsUdpTransport implements UdpTransport {
 			// reader already gone
 		}
 		try {
-			this.writer?.releaseLock();
+			await this.writer?.abort(new Error("Direct Sockets transport closed"));
 		} catch {
-			// writer already released
+			// writer already aborted or released
+		} finally {
+			try {
+				this.writer?.releaseLock();
+			} catch {
+				// writer already released
+			}
 		}
 		try {
 			await this.socket.close();
