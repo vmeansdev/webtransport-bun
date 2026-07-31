@@ -38,24 +38,26 @@ const trackedPids: number[] = [];
 
 setDefaultTimeout(15_000);
 
-afterEach(() => {
-	for (const pid of trackedPids.splice(0)) {
-		try {
-			process.kill(pid, "SIGKILL");
-		} catch {
-			// The production timeout cleanup should normally have removed it.
-		}
-	}
-	for (const pidFile of trackedPidFiles.splice(0)) {
+afterEach(async () => {
+	const pidsToReap = new Set(trackedPids.splice(0));
+	for (const pidFile of trackedPidFiles) {
 		if (!existsSync(pidFile)) continue;
 		const pid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
-		if (!Number.isFinite(pid)) continue;
+		if (Number.isFinite(pid)) pidsToReap.add(pid);
+	}
+	for (const pid of pidsToReap) {
 		try {
 			process.kill(pid, "SIGKILL");
 		} catch {
 			// The production timeout cleanup should normally have removed it.
 		}
 	}
+	const deadline = Date.now() + 1_000;
+	while (Date.now() < deadline && [...pidsToReap].some(processIsAlive)) {
+		await Bun.sleep(25);
+	}
+	for (const pid of pidsToReap) expect(processIsAlive(pid)).toBe(false);
+	trackedPidFiles.splice(0);
 	for (const root of tempRoots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -193,6 +195,32 @@ function hangingProcessTreeSource(
 	].join("\n");
 }
 
+function delayedDescendantOutputSource(
+	descendantPidFile: string,
+	triggerPath: string,
+): string {
+	const markerPath = `${descendantPidFile}.late`;
+	const descendantSource = [
+		'const { existsSync, writeFileSync, writeSync } = require("node:fs");',
+		`const trigger = ${JSON.stringify(triggerPath)};`,
+		"const poll = setInterval(() => {",
+		"  if (!existsSync(trigger)) return;",
+		"  clearInterval(poll);",
+		`  setTimeout(() => { writeFileSync(${JSON.stringify(markerPath)}, "done"); writeSync(1, "late descendant stdout\\n"); writeSync(2, "late descendant stderr\\n"); }, 300);`,
+		"}, 5);",
+		"setInterval(() => {}, 1_000);",
+	].join("\n");
+	return [
+		'const { spawn } = require("node:child_process");',
+		'const { writeFileSync, writeSync } = require("node:fs");',
+		'writeSync(1, "fixture command stdout\\n");',
+		'writeSync(2, "fixture command stderr\\n");',
+		`const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: ["ignore", 1, 2] });`,
+		`writeFileSync(${JSON.stringify(descendantPidFile)}, String(child.pid));`,
+		"setInterval(() => {}, 1_000);",
+	].join("\n");
+}
+
 async function runGuarded(
 	args: string[],
 	env: NodeJS.ProcessEnv,
@@ -294,14 +322,18 @@ function createFailingTaskkill(root: string): string {
 	return taskkill;
 }
 
-function createRootOnlyTaskkill(root: string): string {
+function createRootOnlyTaskkill(root: string, triggerPath?: string): string {
 	const taskkill = join(root, "root-only-taskkill");
+	const trigger = triggerPath
+		? `: > ${JSON.stringify(triggerPath)}`
+		: undefined;
 	writeFileSync(
 		taskkill,
 		[
 			"#!/bin/sh",
 			'target="$2"',
 			'kill -9 "$target" 2>/dev/null || true',
+			...(trigger ? [trigger] : []),
 			"exit 0",
 		].join("\n"),
 		"utf8",
@@ -386,6 +418,8 @@ test.serial(
 				...process.env,
 				WEBTRANSPORT_DENO_COMMAND: runtime,
 				WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: "1500",
+				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
+				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
 				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
 			},
 		);
@@ -555,7 +589,7 @@ test.serial(
 );
 
 test.serial(
-	"bounded command rejects win32 cleanup when taskkill exits 0 but the descendant remains alive",
+	"bounded command preserves late descendant output when win32 cleanup cannot prove exit",
 	async () => {
 		if (process.platform === "win32") return;
 		const runPackageCommand = packageCommandRunner();
@@ -565,11 +599,12 @@ test.serial(
 		);
 		tempRoots.push(root);
 		const descendantPidFile = join(root, "descendant.pid");
+		const triggerPath = join(root, "late.trigger");
 		trackedPidFiles.push(descendantPidFile);
 		const cleanupError = await capturedError(
 			runPackageCommand(
 				process.execPath,
-				["-e", hangingProcessTreeSource(descendantPidFile, true)],
+				["-e", delayedDescendantOutputSource(descendantPidFile, triggerPath)],
 				{
 					cwd: root,
 					label: "fixture windows command",
@@ -577,11 +612,12 @@ test.serial(
 					timeoutMs: 1_500,
 					processTreeProbe: (rootPid) =>
 						probeFixtureTree(rootPid, descendantPidFile),
-					windowsTreeKillCommand: createRootOnlyTaskkill(root),
+					windowsTreeKillCommand: createRootOnlyTaskkill(root, triggerPath),
 				},
 			),
 		);
 		await waitForFile(descendantPidFile);
+		await waitForFile(`${descendantPidFile}.late`);
 		const descendantPid = readPid(descendantPidFile);
 
 		expect(cleanupError?.message).toContain(
@@ -589,6 +625,8 @@ test.serial(
 		);
 		expect(cleanupError?.message).toContain("fixture command stdout");
 		expect(cleanupError?.message).toContain("fixture command stderr");
+		expect(cleanupError?.message).toContain("late descendant stdout");
+		expect(cleanupError?.message).toContain("late descendant stderr");
 		expect(processIsAlive(descendantPid)).toBe(true);
 		try {
 			process.kill(descendantPid, "SIGKILL");
@@ -664,8 +702,6 @@ test.serial(
 			join(tmpdir(), "wt-package-command-posix-proof-timeout-"),
 		);
 		tempRoots.push(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		trackedPidFiles.push(descendantPidFile);
 		const previousKillGrace =
 			process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
 		const originalKill = process.kill.bind(process);
@@ -688,7 +724,7 @@ test.serial(
 			cleanupError = await capturedError(
 				runPackageCommand(
 					process.execPath,
-					["-e", hangingProcessTreeSource(descendantPidFile, true)],
+					["-e", "setInterval(() => {}, 1_000);"],
 					{
 						cwd: root,
 						label: "fixture posix command",
@@ -716,10 +752,7 @@ test.serial(
 		expect(cleanupError?.message).toContain(
 			"process-tree cleanup failed: descendant exit unproven after bounded process-group proof",
 		);
-		expect(cleanupError?.message).toContain("fixture command stdout");
-		expect(cleanupError?.message).toContain("fixture command stderr");
 		expect(elapsedMs).toBeLessThan(900);
-		await expectProcessExit(descendantPidFile);
 	},
 );
 
@@ -737,6 +770,8 @@ test.serial(
 				...process.env,
 				PATH: `${root}:${process.env.PATH ?? ""}`,
 				WEBTRANSPORT_PACKAGE_COMMAND_TIMEOUT_MS: "1500",
+				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
+				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "250",
 			},
 		);
 

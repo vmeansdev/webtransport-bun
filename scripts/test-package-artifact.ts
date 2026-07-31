@@ -39,6 +39,10 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_SMOKE_TIMEOUT_MS = 60_000;
 const DEFAULT_SMOKE_KILL_GRACE_MS = 250;
 const DEFAULT_SMOKE_TREE_KILL_TIMEOUT_MS = 5_000;
+// Descendants may retain inherited capture descriptors after the root/helper exits.
+// Keep the stabilization bounded and platform-specific without extending command deadlines.
+const POSIX_CAPTURE_STABILIZATION_MS = 150;
+const WINDOWS_CAPTURE_STABILIZATION_MS = 500;
 process.on("exit", () => rmSync(npmCacheDir, { recursive: true, force: true }));
 
 function sharedEnv(): NodeJS.ProcessEnv {
@@ -92,6 +96,17 @@ async function readCapturedText(file: string): Promise<string> {
 		if (code === "ENOENT") return "";
 		throw error;
 	}
+}
+
+function mergeCapturedText(
+	beforeCleanup: string,
+	afterCleanup: string,
+): string {
+	if (beforeCleanup.length === 0) return afterCleanup;
+	if (afterCleanup.length === 0) return beforeCleanup;
+	if (afterCleanup.startsWith(beforeCleanup)) return afterCleanup;
+	if (beforeCleanup.startsWith(afterCleanup)) return beforeCleanup;
+	return `${beforeCleanup}${afterCleanup}`;
 }
 
 function processIsAlive(pid: number): boolean {
@@ -432,6 +447,7 @@ export async function runPackageCommand(
 		let timedOut = false;
 		let cleanupError: Error | undefined;
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+		let timeoutCapturePromise: Promise<[string, string]> | undefined;
 
 		const cleanup = () => {
 			if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
@@ -448,10 +464,25 @@ export async function runPackageCommand(
 			let stdout = "";
 			let stderr = "";
 			try {
-				[stdout, stderr] = await Promise.all([
+				let beforeCleanupStdout = "";
+				let beforeCleanupStderr = "";
+				if (timeoutCapturePromise !== undefined) {
+					[beforeCleanupStdout, beforeCleanupStderr] =
+						await timeoutCapturePromise;
+				}
+				if (timedOut && cleanupError !== undefined) {
+					const stabilizationMs =
+						platform === "win32"
+							? WINDOWS_CAPTURE_STABILIZATION_MS
+							: POSIX_CAPTURE_STABILIZATION_MS;
+					await wait(stabilizationMs);
+				}
+				const [afterCleanupStdout, afterCleanupStderr] = await Promise.all([
 					readCapturedText(stdoutPath),
 					readCapturedText(stderrPath),
 				]);
+				stdout = mergeCapturedText(beforeCleanupStdout, afterCleanupStdout);
+				stderr = mergeCapturedText(beforeCleanupStderr, afterCleanupStderr);
 			} catch (captureError) {
 				const detail =
 					captureError instanceof Error
@@ -512,6 +543,10 @@ export async function runPackageCommand(
 
 		timeoutHandle = setTimeout(() => {
 			timedOut = true;
+			timeoutCapturePromise = Promise.all([
+				readCapturedText(stdoutPath),
+				readCapturedText(stderrPath),
+			]);
 			void terminateCommandProcessTree(
 				child,
 				killGraceMs,
