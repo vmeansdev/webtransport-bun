@@ -86,7 +86,9 @@ describe("runtime-portable deadline helpers", () => {
 		installTimerSpies();
 
 		await expect(
-			withDeadline(new Promise<never>(() => {}), 1, {
+			// Leave enough room for a loaded event loop while still proving the
+			// timeout path with a bounded, short deadline.
+			withDeadline(new Promise<never>(() => {}), 25, {
 				timeoutMessage: "timed out",
 			}),
 		).rejects.toThrow("timed out");
