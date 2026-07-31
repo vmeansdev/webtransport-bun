@@ -8,6 +8,10 @@ import {
 	resolveInteropQuicPort,
 } from "./browser-helpers.js";
 import { getSpkiHashBase64 } from "./cert-hash.js";
+import {
+	buildInteropWebServerCommand,
+	buildInteropWebServerEnv,
+} from "./web-server-env.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const certHash = getSpkiHashBase64();
@@ -40,7 +44,7 @@ export default defineConfig({
 		},
 	},
 	webServer: {
-		command: "bun run prepare-certs.ts && bun run addon-server.ts",
+		command: buildInteropWebServerCommand(),
 		name: "interop-webserver",
 		stdout: "pipe",
 		wait: {
@@ -48,10 +52,7 @@ export default defineConfig({
 				`addon-server: Health on http://${interopHost.replaceAll(".", "\\.")}:${interopHealthPort}`,
 			),
 		},
-		env: {
-			...process.env,
-			WT_IDLE_TIMEOUT_MS: "5000",
-		},
+		env: { ...buildInteropWebServerEnv(), WT_IDLE_TIMEOUT_MS: "5000" },
 		cwd: join(__dirname),
 		url: interopHealthUrl, // Health endpoint (QUIC port doesn't respond to HTTP GET)
 		reuseExistingServer: false,
