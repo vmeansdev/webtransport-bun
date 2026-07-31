@@ -5,6 +5,10 @@ import {
 import { X509Certificate, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+	EXAMPLE_MAX_STREAM_BODY_BYTES,
+	readLimitedChunks,
+} from "../stream-limit.js";
 
 const WT_HOST = process.env.WT_HOST ?? "0.0.0.0";
 const WT_PORT = Number(process.env.WT_PORT ?? 4433);
@@ -154,8 +158,10 @@ const wtServer = createServer({
 			try {
 				for await (const duplex of session.incomingBidirectionalStreams) {
 					void (async () => {
-						const chunks: Uint8Array[] = [];
-						for await (const chunk of duplex.readable) chunks.push(chunk);
+						const chunks = await readLimitedChunks(
+							duplex.readable,
+							EXAMPLE_MAX_STREAM_BODY_BYTES,
+						);
 						counters.bidiIn++;
 						const body = decodeChunks(chunks);
 						pushEvent("bidi.in", { fromSessionId: session.id, body });
@@ -177,8 +183,10 @@ const wtServer = createServer({
 			try {
 				for await (const readable of session.incomingUnidirectionalStreams) {
 					void (async () => {
-						const chunks: Uint8Array[] = [];
-						for await (const chunk of readable) chunks.push(chunk);
+						const chunks = await readLimitedChunks(
+							readable,
+							EXAMPLE_MAX_STREAM_BODY_BYTES,
+						);
 						counters.uniIn++;
 						const body = decodeChunks(chunks);
 						pushEvent("uni.in", { fromSessionId: session.id, body });

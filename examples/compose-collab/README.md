@@ -26,6 +26,9 @@ Change the HTTP bind or port mapping only for an intentional, protected network
 demo. The dashboard is an unauthenticated diagnostics surface and must not be
 used as a production control plane.
 
+Complete bidi and uni bodies are capped at 256 KiB. Inputs over that limit are
+cancelled before the example retains or broadcasts the body.
+
 ## What you should see
 
 - Server logs showing sessions joining/leaving

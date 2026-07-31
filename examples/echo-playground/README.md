@@ -27,6 +27,9 @@ Notes:
 WebTransport endpoint used by the page:
 - `https://127.0.0.1:4433`
 
+The example retains at most 256 KiB from any complete bidi or uni stream. An
+over-limit stream is cancelled instead of being buffered until EOF.
+
 ## Chrome notes for local self-signed cert
 
 The playground fetches `serverCertificateHashes` from `/config` and uses certificate pinning for WebTransport.
