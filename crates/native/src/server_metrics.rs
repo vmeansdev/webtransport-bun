@@ -143,6 +143,33 @@ impl ServerMetrics {
     }
 }
 
+fn histogram_to_snapshot(h: &LatencyHistogram) -> HistogramSnapshot {
+    HistogramSnapshot {
+        le: histogram::BUCKETS.to_vec(),
+        cumulative_count: h
+            .cumulative_counts()
+            .iter()
+            .map(|&c| c as f64)
+            .collect::<Vec<_>>(),
+        count: h.count() as f64,
+        sum_secs: h.sum_secs(),
+    }
+}
+
+fn js_sys_timestamp() -> f64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServerMetrics;
@@ -182,32 +209,5 @@ mod tests {
 
         assert_eq!(admitted, 4);
         assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 4);
-    }
-}
-
-fn histogram_to_snapshot(h: &LatencyHistogram) -> HistogramSnapshot {
-    HistogramSnapshot {
-        le: histogram::BUCKETS.to_vec(),
-        cumulative_count: h
-            .cumulative_counts()
-            .iter()
-            .map(|&c| c as f64)
-            .collect::<Vec<_>>(),
-        count: h.count() as f64,
-        sum_secs: h.sum_secs(),
-    }
-}
-
-fn js_sys_timestamp() -> f64 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .unwrap_or(0.0)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        0.0
     }
 }
