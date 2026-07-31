@@ -54,6 +54,7 @@ import { wasmToWebTransportLike } from "./webtransport-like-wasm.js";
 import {
 	__resetWasmClientPoolForTests,
 	wasmClientPoolMetricsSnapshot,
+	wasmCaFingerprint,
 	wasmPoolKey,
 	wasmPoolPut,
 	wasmPoolTake,
@@ -2170,6 +2171,9 @@ export async function connectWasm(
 			: peerAddr.includes(":")
 				? Number(peerAddr.slice(peerAddr.lastIndexOf(":") + 1))
 				: 443;
+		const caFingerprint = opts.caPem
+			? await wasmCaFingerprint(opts.caPem)
+			: undefined;
 		const key = wasmPoolKey({
 			scheme: url?.protocol?.replace(":", "") || "https",
 			host,
@@ -2177,7 +2181,11 @@ export async function connectWasm(
 			serverName: host,
 			requireUnreliable: opts.requireUnreliable,
 			congestionControl: opts.congestionControl,
-			tlsFingerprint: opts.certHashBase64 ?? "accept-any",
+			tlsFingerprint: opts.certHashBase64
+				? `cert:${opts.certHashBase64}`
+				: caFingerprint
+					? `ca:${caFingerprint}`
+					: "accept-any",
 		});
 		mgr = wasmPoolTake(key) ?? null;
 		if (mgr) {

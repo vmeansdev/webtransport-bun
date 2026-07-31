@@ -14,6 +14,10 @@ import {
 } from "../src/backend.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
+import {
+	wasmCaFingerprint,
+	wasmPoolKey,
+} from "../src/wasm-endpoint-pool.js";
 
 // Soft-skip when pkg is absent (local `bun test packages/`). With
 // WEBTRANSPORT_REQUIRE_WASM=1 the helper throws at import time instead.
@@ -51,6 +55,29 @@ describe("wasm parity epic helpers", () => {
 		const snap = wasmClientPoolMetricsSnapshot();
 		expect(snap.size).toBe(0);
 		expect(snap.hits + snap.misses).toBe(0);
+	});
+
+	test("wasm pool identities include exact TLS trust material", async () => {
+		const base = {
+			scheme: "https",
+			host: "example.test",
+			port: 443,
+			serverName: "example.test",
+		};
+		const caA = await wasmCaFingerprint("ca-a");
+		const caB = await wasmCaFingerprint("ca-b");
+		expect(wasmPoolKey({ ...base, tlsFingerprint: `ca:${caA}` })).toBe(
+			wasmPoolKey({ ...base, tlsFingerprint: `ca:${caA}` }),
+		);
+		expect(wasmPoolKey({ ...base, tlsFingerprint: `ca:${caA}` })).not.toBe(
+			wasmPoolKey({ ...base, tlsFingerprint: `ca:${caB}` }),
+		);
+		expect(wasmPoolKey({ ...base, tlsFingerprint: "accept-any" })).not.toBe(
+			wasmPoolKey({ ...base, tlsFingerprint: "cert:hash" }),
+		);
+		expect(wasmPoolKey({ ...base, tlsFingerprint: "accept-any" })).not.toBe(
+			wasmPoolKey({ ...base, tlsFingerprint: `ca:${caA}` }),
+		);
 	});
 
 	test("toWasmServerSession wraps session shape", () => {

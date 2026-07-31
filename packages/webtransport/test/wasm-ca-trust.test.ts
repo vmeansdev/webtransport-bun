@@ -3,6 +3,7 @@ import { connectWasm, normalizeWasmEndpointOptions } from "../src/backend.js";
 import { WasmEndpoint, type WasmSessionEvents } from "../src/backend-wasm.js";
 import { E_TLS } from "../src/errors.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { wasmCaFingerprint, wasmPoolKey } from "../src/wasm-endpoint-pool.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
 
 const wasm = wasmAvailable
@@ -147,6 +148,26 @@ describe.skipIf(!wasmAvailable)("wasm client CA-root trust", () => {
 		);
 		expect(endpoint).toBeDefined();
 		endpoint.close();
+	});
+
+	test("distinct CA fixtures produce distinct pooled trust identities", async () => {
+		const first = generatedChain("localhost");
+		const second = generatedChain("other.example");
+		const firstKey = wasmPoolKey({
+			scheme: "https",
+			host: "localhost",
+			port: 443,
+			serverName: "localhost",
+			tlsFingerprint: `ca:${await wasmCaFingerprint(first.caPem)}`,
+		});
+		const secondKey = wasmPoolKey({
+			scheme: "https",
+			host: "localhost",
+			port: 443,
+			serverName: "localhost",
+			tlsFingerprint: `ca:${await wasmCaFingerprint(second.caPem)}`,
+		});
+		expect(firstKey).not.toBe(secondKey);
 	});
 
 	test("rejects malformed roots with E_TLS, matching native", () => {

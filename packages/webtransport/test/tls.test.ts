@@ -152,6 +152,36 @@ describe("TLS contract (P0.3)", () => {
 		}
 	}, 20000);
 
+	it("allowPooling does not reuse an endpoint across distinct CA bundles", async () => {
+		if (!generatedCert) return;
+		const foreign = generateLocalhostCert();
+		if (!foreign) throw new Error("failed to generate foreign certificate");
+		const port = nextPort(24460, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
+			onSession: () => {},
+		});
+
+		try {
+			const trusted = await connect(`https://127.0.0.1:${port}`, {
+				allowPooling: true,
+				tls: { caPem: generatedCert.certPem, serverName: "localhost" },
+			});
+			trusted.close();
+
+			await expect(
+				connect(`https://127.0.0.1:${port}`, {
+					allowPooling: true,
+					tls: { caPem: foreign.certPem, serverName: "localhost" },
+				}),
+			).rejects.toThrow(/invalid peer certificate|E_TLS/);
+		} finally {
+			foreign.cleanup();
+			await server.close();
+		}
+	}, 20000);
+
 	it("connect with caPem containing no valid cert rejects with E_TLS", async () => {
 		const port = nextPort(24460, 2000);
 		const server = createServer({
