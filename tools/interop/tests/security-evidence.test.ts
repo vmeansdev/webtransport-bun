@@ -4,7 +4,10 @@ import {
 	buildInteropWebServerCommand,
 	resolveBunExecutable,
 } from "../web-server-env.ts";
-import { verifyEvidenceDocument } from "../verify-evidence.ts";
+import {
+	verifyEvidenceDocument,
+	verifyInteropEvidenceDocument,
+} from "../verify-evidence.ts";
 
 describe("interop evidence security boundary", () => {
 	it("forwards only documented non-sensitive server settings", () => {
@@ -49,7 +52,7 @@ describe("interop evidence security boundary", () => {
 					},
 				},
 			}),
-		).toThrow(/environment/i);
+		).toThrow(/environment|host path/i);
 	});
 
 	it("accepts evidence containing only the documented runtime environment", () => {
@@ -67,5 +70,64 @@ describe("interop evidence security boundary", () => {
 				},
 			}),
 		).not.toThrow();
+	});
+
+	it("rejects nested secrets and host paths without echoing values", () => {
+		const cases = [
+			{
+				marker: "sk-test-secret-value",
+				document: {
+					metadata: { nested: { authorization: "sk-test-secret-value" } },
+				},
+			},
+			{
+				marker: "/Users/private-user/project",
+				document: {
+					results: [{ details: { sourcePath: "/Users/private-user/project" } }],
+				},
+			},
+			{
+				marker: "C:\\Users\\private-user\\project",
+				document: {
+					results: [
+						{ details: { sourcePath: "C:\\Users\\private-user\\project" } },
+					],
+				},
+			},
+			{
+				marker: "\\\\private-server\\share\\evidence.json",
+				document: {
+					results: [
+						{
+							details: {
+								sourcePath: "\\\\private-server\\share\\evidence.json",
+							},
+						},
+					],
+				},
+			},
+		];
+
+		for (const { marker, document } of cases) {
+			let thrown: unknown;
+			try {
+				verifyEvidenceDocument(document);
+			} catch (error) {
+				thrown = error;
+			}
+			expect(thrown).toBeDefined();
+			const message = String(thrown);
+			expect(message).toContain("unsafe interop evidence");
+			expect(message).not.toContain(marker);
+		}
+	});
+
+	it("keeps interop schema checks separate from the generic privacy walk", () => {
+		expect(() =>
+			verifyEvidenceDocument({ readiness: { status: "passed" } }),
+		).not.toThrow();
+		expect(() =>
+			verifyInteropEvidenceDocument({ readiness: { status: "passed" } }),
+		).toThrow(/config|webServer/i);
 	});
 });
