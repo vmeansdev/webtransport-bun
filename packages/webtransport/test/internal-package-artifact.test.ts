@@ -111,10 +111,10 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 			`"${process.execPath}" -e '`,
 			'const { writeFileSync } = require("node:fs");',
 			"writeFileSync(process.env.WT_FIXTURE_DESCENDANT_PID_FILE, String(process.pid));",
-			'console.log("fixture smoke started");',
-			'console.error("fixture smoke stderr");',
 			"setInterval(() => {}, 1_000);",
 			`' -- "$@" &`,
+			'echo "fixture smoke started"',
+			'echo "fixture smoke stderr" >&2',
 			'wait "$!"',
 		].join("\n"),
 		"utf8",
@@ -147,7 +147,7 @@ async function expectProcessExit(pidFile: string): Promise<void> {
 }
 
 async function expectPidExit(pid: number): Promise<void> {
-	const deadline = Date.now() + 2_000;
+	const deadline = Date.now() + 1_000;
 	while (processIsAlive(pid) && Date.now() < deadline) {
 		await Bun.sleep(25);
 	}
@@ -249,7 +249,10 @@ async function runGuarded(
 	});
 }
 
-function createHangingTaskkill(root: string): {
+function createHangingTaskkill(
+	root: string,
+	descendantPidFile: string,
+): {
 	argsFile: string;
 	pidFile: string;
 } {
@@ -263,7 +266,8 @@ function createHangingTaskkill(root: string): {
 			'printf "%s\\n" "$@" > "$WT_FIXTURE_TASKKILL_ARGS_FILE"',
 			'printf "%s" "$$" > "$WT_FIXTURE_TASKKILL_PID_FILE"',
 			'target="$2"',
-			'for child in $(pgrep -P "$target"); do kill -9 "$child" 2>/dev/null || true; done',
+			`descendant_pid="$(cat ${JSON.stringify(descendantPidFile)} 2>/dev/null || true)"`,
+			'if [ -n "$descendant_pid" ]; then kill -9 "$descendant_pid" 2>/dev/null || true; fi',
 			'kill -9 "$target" 2>/dev/null || true',
 			"exec sleep 1000",
 		].join("\n"),
@@ -420,7 +424,7 @@ test.serial(
 		tempRoots.push(root);
 		const descendantPidFile = join(root, "descendant.pid");
 		const child = spawnHangingProcessTree(descendantPidFile);
-		const taskkill = createHangingTaskkill(root);
+		const taskkill = createHangingTaskkill(root, descendantPidFile);
 		await waitForFile(descendantPidFile);
 		const previousArgsFile = process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;
 		const previousPidFile = process.env.WT_FIXTURE_TASKKILL_PID_FILE;
@@ -661,10 +665,13 @@ test.serial(
 		tempRoots.push(root);
 		const descendantPidFile = join(root, "descendant.pid");
 		trackedPidFiles.push(descendantPidFile);
+		const previousKillGrace =
+			process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
 		const originalKill = process.kill.bind(process);
 		const previousTreeKillTimeout =
 			process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
-		process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS = "200";
+		process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS = "350";
+		process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS = "100";
 		process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
 			if (
 				pid < 0 &&
@@ -675,6 +682,7 @@ test.serial(
 			return originalKill(pid, signal);
 		}) as typeof process.kill;
 		let cleanupError: Error | undefined;
+		const startedAt = Date.now();
 		try {
 			cleanupError = await capturedError(
 				runPackageCommand(
@@ -683,12 +691,18 @@ test.serial(
 					{
 						cwd: root,
 						label: "fixture posix command",
-						timeoutMs: 1_500,
+						timeoutMs: 600,
 					},
 				),
 			);
 		} finally {
 			process.kill = originalKill;
+			if (previousKillGrace === undefined) {
+				delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
+			} else {
+				process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS =
+					previousKillGrace;
+			}
 			if (previousTreeKillTimeout === undefined) {
 				delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
 			} else {
@@ -696,12 +710,14 @@ test.serial(
 					previousTreeKillTimeout;
 			}
 		}
+		const elapsedMs = Date.now() - startedAt;
 
 		expect(cleanupError?.message).toContain(
 			"process-tree cleanup failed: descendant exit unproven after bounded process-group proof",
 		);
 		expect(cleanupError?.message).toContain("fixture command stdout");
 		expect(cleanupError?.message).toContain("fixture command stderr");
+		expect(elapsedMs).toBeLessThan(900);
 		await expectProcessExit(descendantPidFile);
 	},
 );

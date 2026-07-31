@@ -127,7 +127,13 @@ async function waitForProcessGroupExit(
 	rootPid: number,
 	timeoutMs: number,
 ): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
+	return waitForProcessGroupExitUntil(rootPid, Date.now() + timeoutMs);
+}
+
+async function waitForProcessGroupExitUntil(
+	rootPid: number,
+	deadline: number,
+): Promise<boolean> {
 	while (processGroupExists(rootPid) && Date.now() < deadline) {
 		await wait(25);
 	}
@@ -279,13 +285,14 @@ async function terminateCommandProcessTree(
 		};
 	}
 
+	const proofDeadline = Date.now() + treeKillTimeoutMs;
 	const usedDirectChildFallback = !signalPosixProcessTree(
 		child.pid,
 		child,
 		"SIGTERM",
 	);
 	if (usedDirectChildFallback) {
-		await wait(killGraceMs);
+		await wait(Math.min(killGraceMs, Math.max(0, proofDeadline - Date.now())));
 		signalPosixProcessTree(child.pid, child, "SIGKILL");
 		return {
 			cleanupError: new Error(
@@ -295,9 +302,24 @@ async function terminateCommandProcessTree(
 		};
 	}
 
-	if (await waitForProcessGroupExit(child.pid, killGraceMs)) {
+	if (
+		await waitForProcessGroupExitUntil(
+			child.pid,
+			Math.min(proofDeadline, Date.now() + killGraceMs),
+		)
+	) {
 		return {
 			cleanupError: undefined,
+			usedDirectChildFallback: false,
+		};
+	}
+
+	if (Date.now() >= proofDeadline) {
+		signalPosixProcessTree(child.pid, child, "SIGKILL");
+		return {
+			cleanupError: new Error(
+				"descendant exit unproven after bounded process-group proof",
+			),
 			usedDirectChildFallback: false,
 		};
 	}
@@ -310,7 +332,7 @@ async function terminateCommandProcessTree(
 	return {
 		cleanupError: usedDirectChildFallbackAfterKill
 			? new Error("descendant exit unproven after direct-child fallback")
-			: !(await waitForProcessGroupExit(child.pid, treeKillTimeoutMs))
+			: !(await waitForProcessGroupExitUntil(child.pid, proofDeadline))
 				? new Error(
 						"descendant exit unproven after bounded process-group proof",
 					)
