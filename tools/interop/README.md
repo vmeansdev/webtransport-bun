@@ -41,6 +41,14 @@ It listens on QUIC port 4433 and exposes an HTTP health endpoint on 127.0.0.1:44
 
 Set `INTEROP_EVIDENCE=1` to emit `interop-evidence.json` (Playwright JSON reporter). CI release workflow runs this and attaches the file to the GitHub release.
 
+Interop web-server processes receive an explicit allowlist of non-sensitive
+runtime settings only: idle timeout, QPACK capacity, and localhost host/port
+overrides. The harness invokes the current Bun executable directly and resolves
+OpenSSL from deterministic locations, so `PATH` and the developer shell
+environment are never serialized into release evidence. Release evidence is
+validated before upload; validation rejects inherited environment keys,
+credential-shaped values, and absolute host paths in the web-server environment.
+
 ## Local vs CI
 
 Interop tests may fail locally with "Opening handshake failed" in some environments (e.g. Cursor

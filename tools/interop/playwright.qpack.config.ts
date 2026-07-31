@@ -8,6 +8,10 @@ import {
 	resolveInteropQuicPort,
 } from "./browser-helpers.js";
 import { getSpkiHashBase64 } from "./cert-hash.js";
+import {
+	buildInteropWebServerCommand,
+	buildInteropWebServerEnv,
+} from "./web-server-env.ts";
 
 /**
  * Dynamic-QPACK interop: the native addon server advertises a non-zero
@@ -51,7 +55,7 @@ export default defineConfig({
 		},
 	},
 	webServer: {
-		command: "bun run prepare-certs.ts && bun run addon-server.ts",
+		command: buildInteropWebServerCommand(),
 		name: "interop-qpack-webserver",
 		stdout: "pipe",
 		wait: {
@@ -64,7 +68,7 @@ export default defineConfig({
 			),
 		},
 		env: {
-			...process.env,
+			...buildInteropWebServerEnv(),
 			WT_IDLE_TIMEOUT_MS: "5000",
 			// The setting under test: advertise a dynamic QPACK table.
 			WT_QPACK_MAX_TABLE_CAPACITY: qpackMaxTableCapacity,

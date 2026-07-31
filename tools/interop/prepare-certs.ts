@@ -30,8 +30,29 @@ export function resolveCertDir(): string {
 	return requested ? resolve(requested) : DEFAULT_CERT_DIR;
 }
 
+export function resolveOpenSSLExecutable(): string {
+	const configured = process.env.WEBTRANSPORT_INTEROP_OPENSSL_PATH;
+	const candidates = [
+		configured,
+		"/usr/bin/openssl",
+		"/opt/homebrew/bin/openssl",
+		"/opt/homebrew/opt/openssl@3/bin/openssl",
+	].filter((candidate): candidate is string => Boolean(candidate));
+	for (const candidate of candidates) {
+		try {
+			execFileSync(candidate, ["version"], { stdio: "ignore" });
+			return candidate;
+		} catch {
+			// Try the next deterministic location.
+		}
+	}
+	throw new Error(
+		"OpenSSL is required; set WEBTRANSPORT_INTEROP_OPENSSL_PATH to an executable path",
+	);
+}
+
 function runOpenSSL(args: string[]): Buffer {
-	return execFileSync("openssl", args, {
+	return execFileSync(resolveOpenSSLExecutable(), args, {
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 }

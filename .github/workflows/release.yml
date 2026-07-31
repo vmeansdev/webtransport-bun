@@ -132,6 +132,7 @@ jobs:
           bun run install:browsers
           bun run prepare:interop
           INTEROP_EVIDENCE=1 bun run playwright test
+          bun run verify-evidence.ts interop-evidence.json
         timeout-minutes: 5
       - name: Upload interop evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
