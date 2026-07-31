@@ -19,6 +19,15 @@ type PackFile = { path: string };
 type PackResult = { filename?: string; files?: PackFile[] };
 type Runtime = "bun" | "node" | "deno";
 type Fingerprint = { files: string[]; sha256: Record<string, string> };
+type ProcessTreeProbeResult = {
+	rootAlive: boolean;
+	descendantAlive: boolean;
+};
+type ProcessTreeProbe = (rootPid: number) => Promise<ProcessTreeProbeResult>;
+type ProcessTreeCleanupResult = {
+	cleanupError?: Error;
+	usedDirectChildFallback: boolean;
+};
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageDir = path.join(root, "packages", "webtransport");
@@ -85,14 +94,34 @@ async function readCapturedText(file: string): Promise<string> {
 	}
 }
 
+function processIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForPidExit(
+	pid: number,
+	timeoutMs: number,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (processIsAlive(pid) && Date.now() < deadline) {
+		await wait(25);
+	}
+	return !processIsAlive(pid);
+}
+
 function signalPosixProcessTree(
 	pid: number,
 	child: ReturnType<typeof spawn>,
 	signal: NodeJS.Signals,
-): void {
+): boolean {
 	try {
 		process.kill(-pid, signal);
-		return;
+		return true;
 	} catch {
 		// Fall back to the direct child when process-group signaling is unavailable.
 	}
@@ -101,6 +130,7 @@ function signalPosixProcessTree(
 	} catch {
 		// Best-effort cleanup after a smoke timeout.
 	}
+	return false;
 }
 
 export async function runBoundedWindowsTreeKill(
@@ -177,32 +207,77 @@ async function terminateCommandProcessTree(
 	killGraceMs: number,
 	treeKillTimeoutMs: number,
 	platform: NodeJS.Platform,
+	processTreeProbe?: ProcessTreeProbe,
 	windowsTreeKillCommand?: string,
-): Promise<Error | undefined> {
-	if (child.pid === undefined) return undefined;
+): Promise<ProcessTreeCleanupResult> {
+	if (child.pid === undefined) {
+		return { cleanupError: undefined, usedDirectChildFallback: false };
+	}
 	if (platform === "win32") {
 		let cleanupError: Error | undefined;
+		let taskkillSucceeded = false;
 		try {
 			await runBoundedWindowsTreeKill(
 				child.pid,
 				treeKillTimeoutMs,
 				windowsTreeKillCommand,
 			);
+			taskkillSucceeded = true;
 		} catch (error) {
 			cleanupError = error instanceof Error ? error : new Error(String(error));
 		}
-		try {
-			child.kill("SIGKILL");
-		} catch {
-			// taskkill owns whole-tree cleanup; this is a direct-child fallback only.
+
+		if (taskkillSucceeded && cleanupError === undefined) {
+			if (!(await waitForPidExit(child.pid, killGraceMs))) {
+				cleanupError = new Error(
+					"root child still alive after taskkill exit 0",
+				);
+			} else if (processTreeProbe) {
+				const probe = await processTreeProbe(child.pid);
+				if (probe.rootAlive) {
+					cleanupError = new Error(
+						"root child still alive after taskkill exit 0",
+					);
+				} else if (probe.descendantAlive) {
+					cleanupError = new Error(
+						"descendant exit unproven after taskkill exit 0",
+					);
+				}
+			}
 		}
-		return cleanupError;
+
+		if (cleanupError !== undefined) {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// taskkill owns whole-tree cleanup; this is a direct-child fallback only.
+			}
+		}
+		return {
+			cleanupError,
+			usedDirectChildFallback: cleanupError !== undefined,
+		};
 	}
 
-	signalPosixProcessTree(child.pid, child, "SIGTERM");
+	const usedDirectChildFallback = !signalPosixProcessTree(
+		child.pid,
+		child,
+		"SIGTERM",
+	);
 	await wait(killGraceMs);
-	signalPosixProcessTree(child.pid, child, "SIGKILL");
-	return undefined;
+	const usedDirectChildFallbackAfterKill = !signalPosixProcessTree(
+		child.pid,
+		child,
+		"SIGKILL",
+	);
+	return {
+		cleanupError:
+			usedDirectChildFallback || usedDirectChildFallbackAfterKill
+				? new Error("descendant exit unproven after direct-child fallback")
+				: undefined,
+		usedDirectChildFallback:
+			usedDirectChildFallback || usedDirectChildFallbackAfterKill,
+	};
 }
 
 export async function runPackageCommand(
@@ -213,6 +288,7 @@ export async function runPackageCommand(
 		echoOutput?: boolean;
 		label?: string;
 		platform?: NodeJS.Platform;
+		processTreeProbe?: ProcessTreeProbe;
 		timeoutMs?: number;
 		windowsTreeKillCommand?: string;
 	},
@@ -352,10 +428,11 @@ export async function runPackageCommand(
 				killGraceMs,
 				treeKillTimeoutMs,
 				platform,
+				options.processTreeProbe,
 				options.windowsTreeKillCommand,
 			)
-				.then((error) => {
-					cleanupError = error;
+				.then((result) => {
+					cleanupError = result.cleanupError;
 				})
 				.catch((error) => {
 					cleanupError =

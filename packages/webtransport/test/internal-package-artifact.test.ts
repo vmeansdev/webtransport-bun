@@ -23,6 +23,10 @@ type PackageCommandRunner = (
 		label: string;
 		platform?: NodeJS.Platform;
 		timeoutMs: number;
+		processTreeProbe?: (rootPid: number) => Promise<{
+			rootAlive: boolean;
+			descendantAlive: boolean;
+		}>;
 		windowsTreeKillCommand?: string;
 	},
 ) => Promise<string>;
@@ -123,6 +127,13 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 function processIsAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
+		if (process.platform !== "win32") {
+			const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+				encoding: "utf8",
+			});
+			const state = (status.stdout ?? "").trim();
+			if (state.startsWith("Z")) return false;
+		}
 		return true;
 	} catch {
 		return false;
@@ -279,6 +290,22 @@ function createFailingTaskkill(root: string): string {
 	return taskkill;
 }
 
+function createRootOnlyTaskkill(root: string): string {
+	const taskkill = join(root, "root-only-taskkill");
+	writeFileSync(
+		taskkill,
+		[
+			"#!/bin/sh",
+			'target="$2"',
+			'kill -9 "$target" 2>/dev/null || true',
+			"exit 0",
+		].join("\n"),
+		"utf8",
+	);
+	chmodSync(taskkill, 0o755);
+	return taskkill;
+}
+
 function createHangingNpm(root: string): string {
 	const npm = join(root, "npm");
 	writeFileSync(
@@ -304,6 +331,24 @@ async function capturedError(
 	} catch (error) {
 		return error instanceof Error ? error : new Error(String(error));
 	}
+}
+
+function readPid(pidFile: string): number {
+	return Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+}
+
+async function probeFixtureTree(
+	rootPid: number,
+	descendantPidFile: string,
+): Promise<{
+	rootAlive: boolean;
+	descendantAlive: boolean;
+}> {
+	await waitForFile(descendantPidFile);
+	return {
+		rootAlive: processIsAlive(rootPid),
+		descendantAlive: processIsAlive(readPid(descendantPidFile)),
+	};
 }
 
 function packageCommandRunner(): PackageCommandRunner | undefined {
@@ -501,6 +546,106 @@ test.serial(
 		expect(cleanupError?.message).toContain("fixture command stdout");
 		expect(cleanupError?.message).toContain("fixture command stderr");
 		expect(processIsAlive(descendantPid)).toBe(true);
+	},
+);
+
+test.serial(
+	"bounded command rejects win32 cleanup when taskkill exits 0 but the descendant remains alive",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(
+			join(tmpdir(), "wt-package-command-win32-descendant-proof-"),
+		);
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const cleanupError = await capturedError(
+			runPackageCommand(
+				process.execPath,
+				["-e", hangingProcessTreeSource(descendantPidFile, true)],
+				{
+					cwd: root,
+					label: "fixture windows command",
+					platform: "win32",
+					timeoutMs: 1_500,
+					processTreeProbe: (rootPid) =>
+						probeFixtureTree(rootPid, descendantPidFile),
+					windowsTreeKillCommand: createRootOnlyTaskkill(root),
+				},
+			),
+		);
+		await waitForFile(descendantPidFile);
+		const descendantPid = readPid(descendantPidFile);
+
+		expect(cleanupError?.message).toContain(
+			"process-tree cleanup failed: descendant exit unproven after taskkill exit 0",
+		);
+		expect(cleanupError?.message).toContain("fixture command stdout");
+		expect(cleanupError?.message).toContain("fixture command stderr");
+		expect(processIsAlive(descendantPid)).toBe(true);
+		try {
+			process.kill(descendantPid, "SIGKILL");
+		} catch {
+			// The negative control explicitly reaps its live descendant before returning.
+		}
+		await expectPidExit(descendantPid);
+	},
+);
+
+test.serial(
+	"bounded command labels POSIX direct-child fallback as descendant exit unproven",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(
+			join(tmpdir(), "wt-package-command-posix-direct-child-fallback-"),
+		);
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const originalKill = process.kill.bind(process);
+		process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
+			if (pid < 0) {
+				throw new Error("fixture process-group kill unavailable");
+			}
+			return originalKill(pid, signal);
+		}) as typeof process.kill;
+		let cleanupError: Error | undefined;
+		try {
+			cleanupError = await capturedError(
+				runPackageCommand(
+					process.execPath,
+					["-e", hangingProcessTreeSource(descendantPidFile, true)],
+					{
+						cwd: root,
+						label: "fixture posix command",
+						timeoutMs: 1_500,
+						processTreeProbe: (rootPid) =>
+							probeFixtureTree(rootPid, descendantPidFile),
+					},
+				),
+			);
+		} finally {
+			process.kill = originalKill;
+		}
+		await waitForFile(descendantPidFile);
+		const descendantPid = readPid(descendantPidFile);
+
+		expect(cleanupError?.message).toContain(
+			"process-tree cleanup failed: descendant exit unproven after direct-child fallback",
+		);
+		expect(cleanupError?.message).toContain("fixture command stdout");
+		expect(cleanupError?.message).toContain("fixture command stderr");
+		expect(processIsAlive(descendantPid)).toBe(true);
+		try {
+			originalKill(descendantPid, "SIGKILL");
+		} catch {
+			// The negative control explicitly reaps its live descendant before returning.
+		}
+		await expectPidExit(descendantPid);
 	},
 );
 
