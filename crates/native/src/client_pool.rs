@@ -3,6 +3,7 @@
 //! Path B (endpoint-level pooling): Pool Endpoints per compatibility key.
 //! Each connect() creates a new Connection from the pooled Endpoint.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,9 +30,13 @@ pub struct PoolKey {
     pub sni: Option<String>,
     pub insecure_skip_verify: bool,
     pub has_pinned_hashes: bool,
-    pub has_ca_pem: bool,
+    pub ca_pem_fingerprint: Option<[u8; 32]>,
     pub require_unreliable: bool,
     pub congestion: String,
+}
+
+pub fn ca_pem_fingerprint(ca_pem: Option<&str>) -> Option<[u8; 32]> {
+    ca_pem.map(|pem| Sha256::digest(pem.as_bytes()).into())
 }
 
 /// Shared state for a pooled endpoint.
@@ -252,5 +257,39 @@ pub fn pool_metrics_snapshot() -> PoolMetricsSnapshot {
         misses: POOL_MISSES.load(Ordering::Relaxed),
         evict_idle: POOL_EVICT_IDLE.load(Ordering::Relaxed),
         evict_broken: POOL_EVICT_BROKEN.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ca_pem_fingerprint, PoolKey};
+
+    fn key(ca_pem: Option<&str>, pinned: bool, insecure: bool) -> PoolKey {
+        PoolKey {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+            sni: Some("example.test".to_string()),
+            insecure_skip_verify: insecure,
+            has_pinned_hashes: pinned,
+            ca_pem_fingerprint: ca_pem_fingerprint(ca_pem),
+            require_unreliable: false,
+            congestion: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn pool_key_keeps_trust_domains_separate() {
+        assert_eq!(
+            key(Some("ca-a"), false, false),
+            key(Some("ca-a"), false, false)
+        );
+        assert_ne!(
+            key(Some("ca-a"), false, false),
+            key(Some("ca-b"), false, false)
+        );
+        assert_ne!(key(None, false, false), key(Some("ca-a"), false, false));
+        assert_ne!(key(None, false, false), key(None, true, false));
+        assert_ne!(key(None, false, false), key(None, false, true));
     }
 }

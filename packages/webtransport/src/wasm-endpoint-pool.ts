@@ -18,6 +18,17 @@ export type WasmPoolKeyInput = {
 	tlsFingerprint: string;
 };
 
+/** SHA-256 identity for a custom CA bundle, used as a pool trust-domain key. */
+export async function wasmCaFingerprint(caPem: string): Promise<string> {
+	const digest = await globalThis.crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(caPem),
+	);
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
+}
+
 /** Stable string key for {@link WasmPoolKeyInput}, safe as a Map key. */
 export function wasmPoolKey(input: WasmPoolKeyInput): string {
 	return [

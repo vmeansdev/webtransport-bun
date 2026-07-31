@@ -1492,7 +1492,7 @@ async fn run_connect(
             sni: server_name.map(String::from),
             insecure_skip_verify,
             has_pinned_hashes: !pinned_hashes.is_empty(),
-            has_ca_pem: ca_pem.is_some(),
+            ca_pem_fingerprint: client_pool::ca_pem_fingerprint(ca_pem),
             require_unreliable,
             congestion: opts
                 .get("congestionControl")
