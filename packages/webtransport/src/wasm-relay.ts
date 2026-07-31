@@ -18,6 +18,8 @@ export interface UdpTransport {
 	send(data: Uint8Array, dest: UdpAddr): void;
 	/** Register the inbound-packet callback; `source` is the sender's address. */
 	onPacket(cb: (data: Uint8Array, source: UdpAddr) => void): void;
+	/** Wake an endpoint when a transport-local send queue makes progress. */
+	onWritable?(cb: () => void): void;
 	/** Release the underlying socket, if any. Idempotent. */
 	close?(): void;
 }
