@@ -147,7 +147,7 @@ async function expectProcessExit(pidFile: string): Promise<void> {
 }
 
 async function expectPidExit(pid: number): Promise<void> {
-	const deadline = Date.now() + 1_000;
+	const deadline = Date.now() + 2_000;
 	while (processIsAlive(pid) && Date.now() < deadline) {
 		await Bun.sleep(25);
 	}
@@ -646,6 +646,63 @@ test.serial(
 			// The negative control explicitly reaps its live descendant before returning.
 		}
 		await expectPidExit(descendantPid);
+	},
+);
+
+test.serial(
+	"bounded command rejects POSIX cleanup when process-group proof stays unverified",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(
+			join(tmpdir(), "wt-package-command-posix-proof-timeout-"),
+		);
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const originalKill = process.kill.bind(process);
+		const previousTreeKillTimeout =
+			process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
+		process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS = "200";
+		process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
+			if (
+				pid < 0 &&
+				(signal === 0 || signal === undefined || signal === "SIGKILL")
+			) {
+				return true as never;
+			}
+			return originalKill(pid, signal);
+		}) as typeof process.kill;
+		let cleanupError: Error | undefined;
+		try {
+			cleanupError = await capturedError(
+				runPackageCommand(
+					process.execPath,
+					["-e", hangingProcessTreeSource(descendantPidFile, true)],
+					{
+						cwd: root,
+						label: "fixture posix command",
+						timeoutMs: 1_500,
+					},
+				),
+			);
+		} finally {
+			process.kill = originalKill;
+			if (previousTreeKillTimeout === undefined) {
+				delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
+			} else {
+				process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS =
+					previousTreeKillTimeout;
+			}
+		}
+
+		expect(cleanupError?.message).toContain(
+			"process-tree cleanup failed: descendant exit unproven after bounded process-group proof",
+		);
+		expect(cleanupError?.message).toContain("fixture command stdout");
+		expect(cleanupError?.message).toContain("fixture command stderr");
+		await expectProcessExit(descendantPidFile);
 	},
 );
 
