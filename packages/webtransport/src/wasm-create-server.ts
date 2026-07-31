@@ -2,10 +2,10 @@
 // Distinct from the root native `createServer` (sync, napi addon).
 
 import {
+	serveOverUdp,
 	type WasmEndpointOptions,
 	type WasmSession,
 	type WasmTransportManager,
-	serveOverUdp,
 } from "./backend.js";
 import type { WasmModule } from "./backend-wasm.js";
 import { DirectSocketsUdpTransport } from "./direct-sockets.js";
@@ -18,9 +18,10 @@ import {
 } from "./errors.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import {
-	type WasmServerSession,
 	toWasmServerSession,
+	type WasmServerSession,
 } from "./wasm-server-session.js";
+import type { WasmWebTransportOptions } from "./wasm-webtransport.js";
 
 /** One SNI mapping: a server name and the PEM pair to serve for it. */
 export type WasmSniEntry = {
@@ -59,6 +60,8 @@ export type WasmCreateServerOptions = {
 	debug?: boolean;
 	/** Pre-initialized wasm module. When omitted, loads `wasm-dist/web`. */
 	wasm?: WasmModule;
+	/** W3C facade options applied to each accepted server session. */
+	sessionOptions?: WasmWebTransportOptions;
 	/**
 	 * Injectable UDP bind (tests). Default: DirectSocketsUdpTransport.bind.
 	 * When omitted and UDPSocket is unavailable, fails closed.
@@ -396,7 +399,9 @@ export async function createServer(
 				// route it to the same place instead of letting it escape as an
 				// unhandled rejection.
 				try {
-					const result = onSession(toWasmServerSession(session));
+					const result = onSession(
+						toWasmServerSession(session, opts.sessionOptions),
+					);
 					if (result) {
 						void Promise.resolve(result).catch((err) => {
 							reportSessionCallbackError(manager, err);

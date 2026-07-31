@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { connectWasm } from "../src/backend.js";
-import { createServer } from "../src/portable.js";
 import type { PortableServerSession } from "../src/portable.js";
+import { createServer } from "../src/portable.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import {
 	forEachWithTimeout,
@@ -121,6 +121,7 @@ describe("portable createServer", () => {
 			const relay = new InMemoryRelay();
 			const serverAddr = { address: "127.0.0.1", port: 4711 };
 			const clientAddr = { address: "127.0.0.1", port: 5711 };
+			const accepted = Promise.withResolvers<PortableServerSession>();
 
 			// Byte-for-byte the handler used against native above.
 			const echo = async (session: PortableServerSession) => {
@@ -141,7 +142,11 @@ describe("portable createServer", () => {
 				tls: { allowSelfSigned: true },
 				wasmModule: wasm,
 				wasmBind: async () => relay.endpoint(serverAddr),
-				onSession: echo,
+				wasmOptions: { strictW3CErrors: true },
+				onSession: async (session) => {
+					accepted.resolve(session);
+					await echo(session);
+				},
 			});
 
 			try {
@@ -161,6 +166,16 @@ describe("portable createServer", () => {
 				const echoed = Promise.withResolvers<Uint8Array>();
 				session.onDatagram((d) => echoed.resolve(d.slice()));
 				await session.sendDatagram(Uint8Array.of(7, 7, 7));
+				const serverSession = await withTimeout(
+					accepted.promise,
+					5000,
+					"portable wasm server session acceptance",
+				);
+				await expect(
+					serverSession.createBidirectionalStream({
+						waitUntilAvailable: "invalid" as never,
+					}),
+				).rejects.toMatchObject({ name: "TypeError" });
 
 				await expect(
 					withTimeout(echoed.promise, 5000, "wasm portable datagram echo"),
@@ -172,6 +187,18 @@ describe("portable createServer", () => {
 			}
 		},
 	);
+
+	test("forwards wasm facade options into the wasm session adapter", () => {
+		const portableSource = readFileSync(`${srcDir}portable.ts`, "utf8");
+		const wasmServerSource = readFileSync(
+			`${srcDir}wasm-create-server.ts`,
+			"utf8",
+		);
+		expect(portableSource).toContain("sessionOptions: opts.wasmOptions");
+		expect(wasmServerSource).toContain(
+			"toWasmServerSession(session, opts.sessionOptions)",
+		);
+	});
 
 	test("rejects wasm-only allowSelfSigned on the native backend", async () => {
 		await expect(

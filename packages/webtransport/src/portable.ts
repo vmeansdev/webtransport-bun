@@ -7,7 +7,7 @@
 // statically import `node:*`. The native branch — and only the native branch —
 // pulls in `./portable-native.js` through a dynamic import.
 
-import { selectBackend, type BackendKind } from "./backend.js";
+import { type BackendKind, selectBackend } from "./backend.js";
 import type { WasmModule } from "./backend-wasm.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import type {
@@ -173,6 +173,7 @@ async function createWasmPortableServer(
 		limits: opts.limits,
 		log: opts.log,
 		debug: opts.debug,
+		...(opts.wasmOptions ? { sessionOptions: opts.wasmOptions } : {}),
 		...(opts.wasmModule ? { wasm: opts.wasmModule } : {}),
 		...(opts.wasmBind ? { bind: opts.wasmBind } : {}),
 		// WasmServerSession already implements the portable surface.
