@@ -443,6 +443,10 @@ export class WasmWebTransport {
 		this.ready = session.ready.catch((error: unknown) => {
 			throw this.#mapError(error);
 		});
+		// Preserve the rejection for callers that observe `ready`, while also
+		// preventing a fire-and-forget facade from becoming an unhandled rejection
+		// when its session fails before the caller subscribes.
+		this.ready.catch(() => {});
 		this.draining = new Promise<undefined>((resolve) => {
 			this.resolveDraining = () => resolve(undefined);
 		});
@@ -455,6 +459,9 @@ export class WasmWebTransport {
 			.catch((err) => {
 				throw this.#mapError(err);
 			});
+		// `closed` is intentionally rejectable for pre-establishment failures;
+		// mark the derived promise handled without changing its public outcome.
+		this.closed.catch(() => {});
 
 		const datagrams = createDatagramReadable(session, datagramsReadableType);
 		const self = this;
