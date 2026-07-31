@@ -30,6 +30,22 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
+    pub fn try_acquire_handshake(&self, max: u64) -> bool {
+        self.handshakes_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < max).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    pub fn release_handshake(&self) {
+        self.handshakes_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+
     /// Try to reserve n bytes against global budget using compare-and-swap.
     pub fn try_reserve_queued_bytes(&self, n: u64, max: u64) -> bool {
         self.queued_bytes_global
@@ -124,6 +140,48 @@ impl ServerMetrics {
             datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
             stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerMetrics;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn handshake_admission_allows_exact_limit_and_release_reopens_capacity() {
+        let metrics = ServerMetrics::default();
+
+        assert!(metrics.try_acquire_handshake(2));
+        assert!(metrics.try_acquire_handshake(2));
+        assert!(!metrics.try_acquire_handshake(2));
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 2);
+
+        metrics.release_handshake();
+        assert!(metrics.try_acquire_handshake(2));
+        metrics.release_handshake();
+        metrics.release_handshake();
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_handshake_admission_never_exceeds_cap() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let mut threads = Vec::new();
+        for _ in 0..32 {
+            let metrics = Arc::clone(&metrics);
+            threads.push(thread::spawn(move || metrics.try_acquire_handshake(4)));
+        }
+        let admitted = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().ok())
+            .filter(|admitted| *admitted)
+            .count();
+
+        assert_eq!(admitted, 4);
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 4);
     }
 }
 
