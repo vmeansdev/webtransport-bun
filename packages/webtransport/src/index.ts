@@ -99,6 +99,10 @@ import {
 	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
+import {
+	createW3CMappedError,
+	normalizeW3CBrowserName,
+} from "./w3c-client-options.js";
 import type {
 	CloseInfo,
 	ErrorCode,
@@ -143,45 +147,12 @@ const SUPPRESS_READY_REJECTION_WARN =
  * Returns undefined for unknown cases; E_* code is always preserved.
  * No broad catch-all: unknown errors remain explicit.
  */
-function normalizeToBrowserName(code: ErrorCode): string | undefined {
-	switch (code) {
-		case E_INVALID_ARGUMENT:
-			return "TypeError";
-		case E_UNSUPPORTED_ARGUMENT:
-			return "NotSupportedError";
-		case E_TLS:
-			return "NetworkError";
-		case E_HANDSHAKE_TIMEOUT:
-		case E_BACKPRESSURE_TIMEOUT:
-			return "TimeoutError";
-		case E_SESSION_CLOSED:
-		case E_SESSION_IDLE_TIMEOUT:
-			return "InvalidStateError";
-		case E_STREAM_RESET:
-		case E_STOP_SENDING:
-			return "AbortError";
-		case E_LIMIT_EXCEEDED:
-		case E_QUEUE_FULL:
-		case E_RATE_LIMITED:
-			return "QuotaExceededError";
-		case E_INTERNAL:
-			return "OperationError";
-	}
-	return undefined;
-}
-
 function createMappedError(
 	code: ErrorCode,
 	message: string,
 	strictW3CErrors?: boolean,
 ): WebTransportError {
-	const browserName =
-		strictW3CErrors === true ? normalizeToBrowserName(code) : undefined;
-	return new WebTransportError(
-		code,
-		message,
-		browserName ? { browserName } : undefined,
-	);
+	return createW3CMappedError(code, message, strictW3CErrors);
 }
 
 function knownCodeOrUndefined(
@@ -2057,7 +2028,7 @@ function connectWithNative(
 			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
 			const browserName =
 				strictW3CErrors === true
-					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode) ??
+					? (normalizeW3CBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode) ??
 						undefined)
 					: undefined;
 			settleReject(

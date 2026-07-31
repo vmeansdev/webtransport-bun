@@ -30,6 +30,7 @@ import {
 import type { WebTransportCloseInfo } from "../../src/types.js";
 import { InMemoryRelay } from "../../src/wasm-relay.js";
 import type { WasmWebTransportOptions } from "../../src/wasm-webtransport.js";
+import { WebTransportError } from "../../src/errors.js";
 import { nextPort, openWTWithRetry } from "./network.js";
 import { loadWasmModule, wasmAvailable } from "./wasm-availability.js";
 
@@ -99,6 +100,54 @@ type ParityHarness = {
 };
 
 export type { ParityHarness };
+
+/**
+ * Build a public WASM facade around a deterministic session-shaped stimulus.
+ * This keeps parity tests independent of host-specific UDP timeout behavior
+ * while still exercising the exported WasmWebTransport error surface.
+ */
+export function createWasmErrorProbe(
+	options: {
+		strictW3CErrors?: boolean;
+		readyError?: WebTransportError;
+		sendDatagramError?: WebTransportError;
+	} = {},
+): WasmWebTransport {
+	const never = new Promise<never>(() => {});
+	const session = {
+		ready: options.readyError
+			? Promise.reject(options.readyError)
+			: Promise.resolve(),
+		closed: never,
+		draining: never,
+		onDatagram() {},
+		onIncomingStream() {},
+		maxDatagramSize: 1200,
+		backpressureTimeoutMs: 10,
+		isClosingOrClosed: false,
+		connectionStats() {
+			return {
+				bytesSent: 0,
+				bytesReceived: 0,
+				packetsSent: 0,
+				packetsReceived: 0,
+				datagrams: {
+					droppedIncoming: 0,
+					expiredIncoming: 0,
+					expiredOutgoing: 0,
+					lostOutgoing: 0,
+				},
+			};
+		},
+		sendDatagram: async () => {
+			if (options.sendDatagramError) throw options.sendDatagramError;
+		},
+		close() {},
+	};
+	return new WasmWebTransport(session as unknown as WasmSession, {
+		strictW3CErrors: options.strictW3CErrors,
+	});
+}
 
 let wasmModulePromise: Promise<
 	Awaited<ReturnType<typeof loadWasmModule>>

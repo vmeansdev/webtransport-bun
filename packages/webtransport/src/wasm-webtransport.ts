@@ -440,7 +440,9 @@ export class WasmWebTransport {
 		const datagramsReadableType: W3CDatagramsReadableType =
 			options.datagramsReadableType ?? "default";
 
-		this.ready = session.ready;
+		this.ready = session.ready.catch((error: unknown) => {
+			throw this.#mapError(error);
+		});
 		this.draining = new Promise<undefined>((resolve) => {
 			this.resolveDraining = () => resolve(undefined);
 		});
@@ -656,7 +658,11 @@ export class WasmWebTransport {
 		policy: SendPolicy,
 	): Promise<void> {
 		await this.#sendScheduler.enqueue(policy, async () => {
-			await this.session.sendDatagram(chunk);
+			try {
+				await this.session.sendDatagram(chunk);
+			} catch (error) {
+				throw this.#mapError(error);
+			}
 			this._recordSendGroupBytes(policy.groupId, chunk.byteLength);
 		});
 	}
@@ -728,6 +734,7 @@ export class WasmWebTransport {
 			return new WebTransportError(error.code, error.message, {
 				browserName,
 				source: error.source,
+				streamErrorCode: error.streamErrorCode,
 			});
 		}
 		return createW3CMappedError(

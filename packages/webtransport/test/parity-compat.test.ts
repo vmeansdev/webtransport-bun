@@ -20,6 +20,7 @@ import {
 import { __TESTING__ } from "../src/internal.js";
 import {
 	createParityHarness,
+	createWasmErrorProbe,
 	isWasmParityBackend,
 	PARITY_BACKEND,
 	skipWasmParityIfUnavailable,
@@ -80,46 +81,62 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			await wt.closed.catch(() => {});
 		});
 
-		test.skipIf(isWasmParityBackend())(
-			"strictW3CErrors: handshake timeout uses TimeoutError name when enabled",
-			async () => {
-				// 192.0.2.1 (TEST-NET) is often unreachable; our timeout can win. On restricted envs native may fail first (E_INTERNAL).
-				const wt = new WebTransport("https://192.0.2.1:443", {
-					tls: { insecureSkipVerify: true },
-					limits: { handshakeTimeoutMs: 150 },
-					strictW3CErrors: true,
-				});
-				const err = await wt.ready.then(
-					() => undefined as unknown,
-					(e: unknown) => e,
-				);
-				if (err === undefined) throw new Error("expected ready to reject");
-				expect(err).toBeInstanceOf(WebTransportError);
-				if ((err as WebTransportError).code === E_HANDSHAKE_TIMEOUT) {
-					expect((err as WebTransportError).name).toBe("TimeoutError");
-				}
-				// If E_INTERNAL: native won race (e.g. connection refused, operation not permitted); skip name assertion
-			},
-		);
+		test("strictW3CErrors: handshake timeout uses TimeoutError name when enabled", async () => {
+			// Native uses the live TEST-NET stimulus. WASM uses a deterministic
+			// public-facade rejection because its in-memory relay has no dead-port
+			// route and host UDP policy can win the timeout race.
+			const wt = isWasmParityBackend()
+				? createWasmErrorProbe({
+						strictW3CErrors: true,
+						readyError: new WebTransportError(
+							E_HANDSHAKE_TIMEOUT,
+							"E_HANDSHAKE_TIMEOUT: synthetic parity timeout",
+						),
+					})
+				: new WebTransport("https://192.0.2.1:443", {
+						tls: { insecureSkipVerify: true },
+						limits: { handshakeTimeoutMs: 150 },
+						strictW3CErrors: true,
+					});
+			const err = await wt.ready.then(
+				() => undefined as unknown,
+				(e: unknown) => e,
+			);
+			if (err === undefined) throw new Error("expected ready to reject");
+			expect(err).toBeInstanceOf(WebTransportError);
+			if (
+				isWasmParityBackend() ||
+				(err as WebTransportError).code === E_HANDSHAKE_TIMEOUT
+			) {
+				expect((err as WebTransportError).name).toBe("TimeoutError");
+			}
+		});
 
-		test.skipIf(isWasmParityBackend())(
-			"strictW3CErrors: default preserves WebTransportError name",
-			async () => {
-				const wt = new WebTransport("https://192.0.2.1:443", {
-					tls: { insecureSkipVerify: true },
-					limits: { handshakeTimeoutMs: 150 },
-				});
-				const err = await wt.ready.then(
-					() => undefined as unknown,
-					(e: unknown) => e,
-				);
-				if (err === undefined) throw new Error("expected ready to reject");
-				expect(err).toBeInstanceOf(WebTransportError);
-				if ((err as WebTransportError).code === E_HANDSHAKE_TIMEOUT) {
-					expect((err as WebTransportError).name).toBe("WebTransportError");
-				}
-			},
-		);
+		test("strictW3CErrors: default preserves WebTransportError name", async () => {
+			const wt = isWasmParityBackend()
+				? createWasmErrorProbe({
+						readyError: new WebTransportError(
+							E_HANDSHAKE_TIMEOUT,
+							"E_HANDSHAKE_TIMEOUT: synthetic parity timeout",
+						),
+					})
+				: new WebTransport("https://192.0.2.1:443", {
+						tls: { insecureSkipVerify: true },
+						limits: { handshakeTimeoutMs: 150 },
+					});
+			const err = await wt.ready.then(
+				() => undefined as unknown,
+				(e: unknown) => e,
+			);
+			if (err === undefined) throw new Error("expected ready to reject");
+			expect(err).toBeInstanceOf(WebTransportError);
+			if (
+				isWasmParityBackend() ||
+				(err as WebTransportError).code === E_HANDSHAKE_TIMEOUT
+			) {
+				expect((err as WebTransportError).name).toBe("WebTransportError");
+			}
+		});
 
 		test("strictW3CErrors: validation errors use browser-style names", () => {
 			try {
@@ -137,29 +154,41 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			throw new Error("expected constructor to throw");
 		});
 
-		test.skipIf(isWasmParityBackend())(
-			"strictW3CErrors: queue pressure maps to QuotaExceededError",
-			async () => {
-				const session = __TESTING__.createNativeClientSessionForTests(
-					{
-						id: "strict-client",
-						peerIp: "127.0.0.1",
-						peerPort: 1,
-						sendDatagram: async () => {
-							throw new Error(`${E_QUEUE_FULL}: synthetic queue pressure`);
-						},
-						close: () => {},
-					},
-					true,
-				);
-				await expect(
-					session.sendDatagram(new Uint8Array([1])),
-				).rejects.toMatchObject({
+		test("strictW3CErrors: queue pressure maps to QuotaExceededError", async () => {
+			if (isWasmParityBackend()) {
+				const wt = createWasmErrorProbe({
+					strictW3CErrors: true,
+					sendDatagramError: new WebTransportError(
+						E_QUEUE_FULL,
+						"E_QUEUE_FULL: synthetic queue pressure",
+					),
+				});
+				const writer = wt.datagrams.writable.getWriter();
+				await expect(writer.write(new Uint8Array([1]))).rejects.toMatchObject({
 					code: E_QUEUE_FULL,
 					name: "QuotaExceededError",
 				});
-			},
-		);
+				return;
+			}
+			const session = __TESTING__.createNativeClientSessionForTests(
+				{
+					id: "strict-client",
+					peerIp: "127.0.0.1",
+					peerPort: 1,
+					sendDatagram: async () => {
+						throw new Error(`${E_QUEUE_FULL}: synthetic queue pressure`);
+					},
+					close: () => {},
+				},
+				true,
+			);
+			await expect(
+				session.sendDatagram(new Uint8Array([1])),
+			).rejects.toMatchObject({
+				code: E_QUEUE_FULL,
+				name: "QuotaExceededError",
+			});
+		});
 
 		test("S4 regression: close() before ready does not cause unhandled rejection (PARITY_MATRIX)", async () => {
 			if (isWasmParityBackend()) {
