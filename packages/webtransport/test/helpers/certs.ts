@@ -70,22 +70,45 @@ export function generateCertForNames(
 			"/CN=webtransport-bun test CA",
 		]);
 
-		const leafKeyArgs =
-			leafKeyType === "ec"
-				? ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
-				: ["-newkey", "rsa:2048"];
-		execFileSync("openssl", [
-			"req",
-			...leafKeyArgs,
-			"-sha256",
-			"-nodes",
-			"-keyout",
-			keyPath,
-			"-out",
-			csrPath,
-			"-subj",
-			`/CN=${subjectName}`,
-		]);
+		if (leafKeyType === "ec") {
+			// OpenSSL 3's `req -newkey ec` emits a PKCS#8 variant that
+			// rustls/ring rejects, while ecparam produces the standard SEC1
+			// P-256 encoding accepted by the native TLS parser.
+			execFileSync("openssl", [
+				"ecparam",
+				"-name",
+				"prime256v1",
+				"-genkey",
+				"-noout",
+				"-out",
+				keyPath,
+			]);
+			execFileSync("openssl", [
+				"req",
+				"-new",
+				"-sha256",
+				"-key",
+				keyPath,
+				"-out",
+				csrPath,
+				"-subj",
+				`/CN=${subjectName}`,
+			]);
+		} else {
+			execFileSync("openssl", [
+				"req",
+				"-newkey",
+				"rsa:2048",
+				"-sha256",
+				"-nodes",
+				"-keyout",
+				keyPath,
+				"-out",
+				csrPath,
+				"-subj",
+				`/CN=${subjectName}`,
+			]);
+		}
 
 		execFileSync("openssl", [
 			"x509",
