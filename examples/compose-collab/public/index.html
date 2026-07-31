@@ -94,7 +94,13 @@
         sessionsEl.innerHTML = "";
         for (const s of items) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td><code>${s.id}</code></td><td><code>${s.peer}</code></td>`;
+          for (const value of [s.id, s.peer]) {
+            const td = document.createElement("td");
+            const code = document.createElement("code");
+            code.textContent = String(value ?? "");
+            td.appendChild(code);
+            tr.appendChild(td);
+          }
           sessionsEl.appendChild(tr);
         }
       }
@@ -103,7 +109,13 @@
         eventsEl.innerHTML = "";
         for (const e of items.slice().reverse()) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td><code>${e.at}</code></td><td><code>${e.type}</code></td><td><code>${JSON.stringify(e.detail)}</code></td>`;
+          for (const value of [e.at, e.type, JSON.stringify(e.detail)]) {
+            const td = document.createElement("td");
+            const code = document.createElement("code");
+            code.textContent = String(value ?? "");
+            td.appendChild(code);
+            tr.appendChild(td);
+          }
           eventsEl.appendChild(tr);
         }
       }
