@@ -157,12 +157,19 @@ async function expectPidExit(pid: number): Promise<void> {
 	expect(processIsAlive(pid)).toBe(false);
 }
 
-async function waitForFile(file: string): Promise<void> {
-	const deadline = Date.now() + 3_000;
+async function fileAppearsWithin(
+	file: string,
+	timeoutMs: number,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
 	while (!existsSync(file) && Date.now() < deadline) {
 		await Bun.sleep(25);
 	}
-	expect(existsSync(file)).toBe(true);
+	return existsSync(file);
+}
+
+async function waitForFile(file: string, timeoutMs = 3_000): Promise<void> {
+	expect(await fileAppearsWithin(file, timeoutMs)).toBe(true);
 }
 
 function spawnHangingProcessTree(descendantPidFile: string) {
@@ -429,13 +436,18 @@ test.serial(
 				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
 				WT_FIXTURE_STARTED_FILE: smokeStartedFile,
 			},
-			8_000,
+			15_000,
 		);
-		await waitForFile(smokeStartedFile);
+		// Under the full cold package suite, starting the nested runtime can be
+		// scheduler-delayed beyond the normal file-observation window. Keep the
+		// outer guard bounded, but always await it so a missed marker cannot leak
+		// the fixture process tree into later tests.
+		const smokeStarted = await fileAppearsWithin(smokeStartedFile, 8_000);
 		const startedAt = Date.now();
 		const result = await guardedResult;
 		const elapsedMs = Date.now() - startedAt;
 
+		expect(smokeStarted).toBe(true);
 		expect(result.error).toBeUndefined();
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("deno smoke timed out after 1500ms");
