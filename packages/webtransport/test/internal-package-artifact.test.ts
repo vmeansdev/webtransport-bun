@@ -490,6 +490,18 @@ describe.serial("package artifact cleanup", () => {
 			const result = await guardedResult;
 			const elapsedMs = Date.now() - startedAt;
 
+			if (!smokeStarted) {
+				const tail = (value: string) => value.slice(-4_000);
+				throw new Error(
+					[
+						"exact-package smoke fixture did not start",
+						`guard status: ${result.status ?? "none"}`,
+						`guard error: ${result.error?.message ?? "none"}`,
+						`guard stdout tail:\n${tail(result.stdout)}`,
+						`guard stderr tail:\n${tail(result.stderr)}`,
+					].join("\n"),
+				);
+			}
 			expect(smokeStarted).toBe(true);
 			expect(result.error).toBeUndefined();
 			expect(result.status).toBe(1);

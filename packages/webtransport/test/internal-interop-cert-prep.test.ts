@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -48,6 +48,14 @@ function makeTempCertDir(): string {
 function processIsAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
+		if (process.platform !== "win32") {
+			const psResult = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+				encoding: "utf8",
+			});
+			if (!psResult.error && (psResult.stdout ?? "").trim().startsWith("Z")) {
+				return false;
+			}
+		}
 		return true;
 	} catch {
 		return false;
