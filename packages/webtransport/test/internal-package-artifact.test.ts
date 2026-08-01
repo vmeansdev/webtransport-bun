@@ -572,7 +572,6 @@ describe.serial("package artifact cleanup", () => {
 			const previousPidFile = process.env.WT_FIXTURE_TASKKILL_PID_FILE;
 			process.env.WT_FIXTURE_TASKKILL_ARGS_FILE = taskkill.argsFile;
 			process.env.WT_FIXTURE_TASKKILL_PID_FILE = taskkill.pidFile;
-			const startedAt = Date.now();
 			const taskkillTimeoutMs = 3_000;
 			let cleanupError: Error | undefined;
 			const cleanupPromise = capturedError(
@@ -587,8 +586,14 @@ describe.serial("package artifact cleanup", () => {
 				// Wait for that bounded proof while the fixture environment is still
 				// installed; otherwise a loaded host can time out before /bin/sh has
 				// flushed the files, making the assertion race the test cleanup.
-				await waitForFile(taskkill.argsFile);
+				await waitForFile(taskkill.argsFile, 30_000);
+				// Exclude pre-marker scheduler latency from the cleanup stopwatch. The
+				// command timeout remains bounded from its actual child spawn, while this
+				// assertion measures only the cleanup proof after invocation is visible.
+				const cleanupStartedAt = Date.now();
 				cleanupError = await cleanupPromise;
+				const elapsedMs = Date.now() - cleanupStartedAt;
+				expect(elapsedMs).toBeLessThan(5_000);
 			} finally {
 				if (previousArgsFile === undefined)
 					delete process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;
@@ -597,15 +602,12 @@ describe.serial("package artifact cleanup", () => {
 					delete process.env.WT_FIXTURE_TASKKILL_PID_FILE;
 				else process.env.WT_FIXTURE_TASKKILL_PID_FILE = previousPidFile;
 			}
-			const elapsedMs = Date.now() - startedAt;
-
 			expect(
 				readFileSync(taskkill.argsFile, "utf8").trim().split("\n"),
 			).toEqual(["/PID", String(child.pid), "/T", "/F"]);
 			expect(cleanupError?.message).toContain(
 				`taskkill timed out after ${taskkillTimeoutMs}ms`,
 			);
-			expect(elapsedMs).toBeLessThan(5_000);
 			await expectPidExit(child.pid as number);
 			await expectProcessExit(descendantPidFile);
 			await expectProcessExit(taskkill.pidFile);
