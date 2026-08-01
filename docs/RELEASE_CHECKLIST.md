@@ -69,7 +69,9 @@ Workflow artifact naming contract:
 
 What the long-run harness now proves per segment:
 
-- steady-state leak/trend guard, not just an RSS ceiling
+- steady-state leak/trend guard, not just an RSS ceiling; the short-load gate
+  treats in-process RSS residency as diagnostic and uses repeated fresh child
+  cycles plus clean process exit as the authoritative cleanup proof
 - forced overload burst with explicit session/datagram/stream SLO checks
 - idle-peer hold period
 - reconnect churn burst

@@ -29,7 +29,7 @@ Canonical release truth: `docs/release-status.json`. CI evidence feeds that mani
 4. Unit tests (`bun test packages/`)
 5. Build reference + load-client
 6. Load-addon test (`bun run test:load-addon`)
-7. Load-scale-addon (200 sessions, 30s)
+7. Load-scale-addon authoritative child-process repeated-cycle gate (two 200-session, 30s cycles)
 8. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
 9. Overload-addon test (`bun run test:overload-addon`)
 10. Load profiles (`bun run test:load-profiles-addon`)

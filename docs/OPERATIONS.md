@@ -168,8 +168,19 @@ When `queuedBytesGlobal` rises and stays high:
 
 **Acceptable growth heuristics** (short load, ~15–30s):
 - RSS should plateau or decline after load ends; sustained growth suggests a leak.
-- Typical baseline: 50–150 MiB depending on platform. Post-load should return within ~2× baseline.
-- If final RSS > 3× initial, triage: run with longer duration, check `sessionTasksActive`/`streamTasksActive` drain.
+- The warmed-idle-to-final RSS comparison is an in-process diagnostic. Native
+  allocators and Tokio/runtime pools can retain pages after logical cleanup, so
+  a raw `>1.25×` result is recorded in `diagnosticFailures` and is not, by
+  itself, a release verdict.
+- The authoritative short-load verdict is the two-cycle child-process gate from
+  `bun run test:load-scale-addon`: each fresh child must drain all gauges and
+  pass its workload/resource assertions, then exit without timeout, forced kill,
+  or pipe-drain residue. RSS values from separate processes are not compared as
+  a same-allocator plateau; process exit is the residency boundary and the OS
+  reclaims the child address space after the evidence is written.
+- A peak RSS cap remains authoritative. If final RSS is >3× warmed idle, triage
+  with longer duration and the `sessionTasksActive`/`streamTasksActive` drain
+  gauges; the per-cycle raw RSS result remains in the artifact for diagnosis.
 
 **Triage steps**:
 1. Compare first vs last sample: `rss_mb` delta. If >100 MiB growth over 15s with 4 sessions, investigate.
