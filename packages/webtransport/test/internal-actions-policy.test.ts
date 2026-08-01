@@ -161,7 +161,7 @@ function parseWorkflow(document: string): {
 }
 
 describe("GitHub Actions release policy", () => {
-	it("makes coverage, benchmark regression, and >=10k distributed scale release-blocking with downloaded evidence", () => {
+	it("keeps coverage and benchmark regression blocking while making distributed scale optional", () => {
 		const workflow = parseWorkflow(RELEASE_WORKFLOW);
 		const releaseJob = workflow.jobs?.release;
 		expect(releaseJob).toBeDefined();
@@ -179,24 +179,16 @@ describe("GitHub Actions release policy", () => {
 				"parity",
 				"coverage",
 				"bench-regress",
-				"distributed-scale",
 				"fuzz",
 				"package-consumers",
 			]),
 		);
+		expect(releaseNeeds).not.toContain("distributed-scale");
 
 		expect(RELEASE_WORKFLOW).toContain("name: coverage-artifacts");
 		expect(RELEASE_WORKFLOW).toContain("path: coverage-artifacts");
 		expect(RELEASE_WORKFLOW).toContain("name: bench-regress-evidence");
 		expect(RELEASE_WORKFLOW).toContain("path: bench-regress-evidence");
-		expect(RELEASE_WORKFLOW).toContain("name: distributed-scale-evidence");
-		expect(RELEASE_WORKFLOW).toContain("path: distributed-scale-evidence");
-		expect(RELEASE_WORKFLOW).toContain(
-			"bun run tools/interop/sanitize-evidence.ts .release-evidence/load/distributed-scale-artifact.json",
-		);
-		expect(RELEASE_WORKFLOW).toContain(
-			"bun run tools/interop/verify-evidence.ts .release-evidence/load/distributed-scale-artifact.json",
-		);
 		expect(RELEASE_WORKFLOW).toContain(
 			'find coverage-artifacts -name "native-coverage.json" -type f | grep -q .',
 		);
@@ -204,8 +196,15 @@ describe("GitHub Actions release policy", () => {
 			'find bench-regress-evidence -name "bench-regress-artifact.json" -type f | grep -q .',
 		);
 		expect(RELEASE_WORKFLOW).toContain(
-			'find distributed-scale-evidence -name "distributed-scale-artifact.json" -type f | grep -q .',
+			"name: Optional post-1.0 distributed scale diagnostic",
 		);
+		expect(RELEASE_WORKFLOW).toContain("run_optional_distributed_scale");
+		expect(RELEASE_WORKFLOW).toContain("continue-on-error: true");
+		const releaseBlock = RELEASE_WORKFLOW.slice(
+			RELEASE_WORKFLOW.indexOf("\n  release:\n"),
+		);
+		expect(releaseBlock).not.toContain("distributed-scale-evidence");
+		expect(releaseBlock).not.toContain("distributed-scale-artifact.json");
 	});
 
 	it("makes exact package consumers release-blocking for the release workflow across all supported operating systems", () => {
