@@ -1324,10 +1324,10 @@ async function runOneCampaign(
 		}
 
 		const preCloseSnapshots = servers.map((server) => server.metricsSnapshot());
-		// Native connection/session allocations are lazy, so the process-start
-		// RSS sample is not a meaningful recovery baseline for a live campaign.
 		// Capture the steady, fully-loaded sample immediately before deterministic
-		// close; peak RSS remains the independent cap against unbounded growth.
+		// close for diagnostics. The pass/fail recovery comparator remains the
+		// warmed idle baseline captured after server startup; peak RSS remains
+		// the independent cap against unbounded growth.
 		const recoveryBaselineRssMb = getRssMb();
 		const p99HandshakeMs = preCloseSnapshots
 			.map((snapshot) =>
@@ -1424,9 +1424,9 @@ async function runOneCampaign(
 				`final gauges did not recover to baseline: ${JSON.stringify(finalGauges)}`,
 			);
 		}
-		if (finalRssMb > recoveryBaselineRssMb * config.maxRecoveryRssRatio) {
+		if (finalRssMb > initialRssMb * config.maxRecoveryRssRatio) {
 			failures.push(
-				`RSS did not recover near steady workload baseline: baseline=${recoveryBaselineRssMb.toFixed(2)}MB final=${finalRssMb.toFixed(2)}MB ratio=${(finalRssMb / recoveryBaselineRssMb).toFixed(3)}`,
+				`RSS did not recover near baseline: initial=${initialRssMb.toFixed(2)}MB final=${finalRssMb.toFixed(2)}MB loaded=${recoveryBaselineRssMb.toFixed(2)}MB ratio=${(finalRssMb / initialRssMb).toFixed(3)}`,
 			);
 		}
 
