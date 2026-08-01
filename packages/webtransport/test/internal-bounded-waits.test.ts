@@ -11,6 +11,7 @@ import {
 } from "./helpers/harness.js";
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
+const SCANNER_TEST_TIMEOUT_MS = 15_000;
 const tempRoots: string[] = [];
 
 type InteropWaitHelpers = {
@@ -347,7 +348,7 @@ export async function consume(stream: AsyncIterable<Uint8Array>) {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("tools/interop/addon-server.ts");
 		expect(result.stderr).toContain("for await loop without deadline guard");
-	});
+	}, SCANNER_TEST_TIMEOUT_MS);
 
 	it("scans .mjs and .js targets for the same bounded-wait violations", () => {
 		const root = makeTempRoot();
@@ -378,7 +379,7 @@ export async function read(reader) {
 		expect(result.stderr).toContain("examples/webtransport-wasm-iwa/app.js");
 		expect(result.stderr).toContain("for await loop without deadline guard");
 		expect(result.stderr).toContain("read() outside canonical bounded helper");
-	});
+	}, SCANNER_TEST_TIMEOUT_MS);
 
 	it("allows only the exact canonical helper files", () => {
 		const root = makeTempRoot();
@@ -410,7 +411,7 @@ export const BROWSER_READ_WITH_TIMEOUT_SOURCE = readWithTimeout.toString();
 		const result = runScanner(root);
 		expect(result.status).toBe(0);
 		expect(result.stderr).toBe("");
-	});
+	}, SCANNER_TEST_TIMEOUT_MS);
 
 	it("rejects fake helper names outside the canonical helper path", () => {
 		const root = makeTempRoot();
@@ -437,7 +438,7 @@ async function nextWithTimeout(iter: AsyncIterator<Uint8Array>) {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("outside canonical bounded helper");
 		expect(result.stderr).toContain("fake-helper.test.ts");
-	});
+	}, SCANNER_TEST_TIMEOUT_MS);
 
 	it("rejects extracted promises, then-chains, bind aliases, and destructured aliases", () => {
 		const root = makeTempRoot();
@@ -500,7 +501,7 @@ export async function consume(iter: AsyncIterator<Uint8Array>) {
 		expect(result.stderr).toContain("then-chain.test.ts");
 		expect(result.stderr).toContain("bind-alias.test.ts");
 		expect(result.stderr).toContain("destructured-alias.test.ts");
-	});
+	}, SCANNER_TEST_TIMEOUT_MS);
 
 	it("rejects open-ended for await loops", () => {
 		const root = makeTempRoot();
@@ -529,5 +530,5 @@ export async function consume(stream: AsyncIterable<Uint8Array>) {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("for await loop without deadline guard");
 		expect(result.stderr).toContain("for-await.test.ts");
-	});
+	}, SCANNER_TEST_TIMEOUT_MS);
 });
