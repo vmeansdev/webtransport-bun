@@ -547,29 +547,34 @@ export async function runPackageCommand(
 			if (!timedOut) void finish(undefined, code, signal);
 		});
 
-		timeoutHandle = setTimeout(() => {
-			timedOut = true;
-			timeoutCapturePromise = Promise.all([
-				readCapturedText(stdoutPath),
-				readCapturedText(stderrPath),
-			]);
-			void terminateCommandProcessTree(
-				child,
-				killGraceMs,
-				treeKillTimeoutMs,
-				platform,
-				options.processTreeProbe,
-				options.windowsTreeKillCommand,
-			)
-				.then((result) => {
-					cleanupError = result.cleanupError;
-				})
-				.catch((error) => {
-					cleanupError =
-						error instanceof Error ? error : new Error(String(error));
-				})
-				.finally(() => void finish());
-		}, timeoutMs);
+		// Start the command deadline after the child has actually spawned. A
+		// loaded host can delay process startup after spawn() returns; counting
+		// that scheduler latency as command runtime loses bounded diagnostics.
+		child.once("spawn", () => {
+			timeoutHandle = setTimeout(() => {
+				timedOut = true;
+				timeoutCapturePromise = Promise.all([
+					readCapturedText(stdoutPath),
+					readCapturedText(stderrPath),
+				]);
+				void terminateCommandProcessTree(
+					child,
+					killGraceMs,
+					treeKillTimeoutMs,
+					platform,
+					options.processTreeProbe,
+					options.windowsTreeKillCommand,
+				)
+					.then((result) => {
+						cleanupError = result.cleanupError;
+					})
+					.catch((error) => {
+						cleanupError =
+							error instanceof Error ? error : new Error(String(error));
+					})
+					.finally(() => void finish());
+			}, timeoutMs);
+		});
 	});
 }
 
