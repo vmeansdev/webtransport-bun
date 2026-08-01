@@ -12,6 +12,8 @@ Canonical release truth: `docs/release-status.json`. The suites below are the ev
 ### Unit tests
 - `bun test packages/` — must pass
 - Packages: webtransport (server, client, lifecycle, session-accept, backpressure, hardening, robustness, abuse, acceptance)
+- `bun scripts/check-bounded-waits.ts` — must pass before release verification; every
+  awaited iterator/read in test code needs an explicit timeout guard.
 
 ### Load / harness
 - `bun run test:load-addon` — addon server + Rust load-client, no panics, FD stable, task gauges + queuedBytesGlobal return to baseline; writes `tools/load/rss-trend.json` and `rss-trend.csv` (RSS samples at 2s intervals)
@@ -78,3 +80,23 @@ in the code under test.
   sessions)"** — opens >512 sessions and asserts closed-event delivery within a
   handshake-timeout window; misses the window under CPU contention. No GOAWAY or
   capsule path is involved. Observed intermittently 2026-07-30.
+
+## Known local verification blockers
+
+These are environment or harness failures, not passing evidence. A functional
+candidate must rerun them successfully (or record an explicit external gate)
+before any release-status claim is rebound.
+
+- **Canonical package cold loop** — the exact-package cleanup suite previously
+  passed in three fresh focused processes (`10 pass / 0 fail` each), and one
+  loaded full package iteration was green (`487 pass / 0 fail`). Later fresh
+  runs reproduced host-load-only startup loss: the fake runtime sometimes did
+  not begin before the bounded 1.5 s smoke deadline, and the fake npm helper
+  sometimes emitted no diagnostic lines before its same deadline. The required
+  canonical loop therefore remains unproven; keep clean-verifier evidence
+  deferred until the fixture behavior is deterministic without weakening those
+  deadlines or assertions.
+- **Release evidence** — `docs/release-status.json` remains `pending` until the
+  canonical loop and the remaining local release gates are green on one clean
+  source SHA. No hosted, long-running, or cross-platform claim is inferred from
+  the local results above.

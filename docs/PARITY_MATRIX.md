@@ -35,6 +35,30 @@ surface:
 The implementation rows below intentionally separate code coverage from release
 verification. Code can be present while the release claim is still pending.
 
+## Portable server contract (functional candidate)
+
+`@webtransport-bun/webtransport/portable` is the common server contract for
+the native addon and WASM transports. Its `createServer` factory is async and
+selects `backend: "native"` or `backend: "wasm"`; it is intentionally distinct
+from the synchronous root native `createServer` and the async, browser/IWA-
+oriented `/wasm` entrypoint.
+
+| Common surface | Contract | Evidence | Release verification |
+|---|---|---|---|
+| Server handle | `backend`, `address`, optional wasm `certHashBase64`, async `close()` | `packages/webtransport/test/portable-server.test.ts` | `docs/release-status.json` still `pending` |
+| Accepted session | `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, bounded `incomingDatagrams()` | `packages/webtransport/test/portable-server.test.ts`; `packages/webtransport/test/wasm-server-session-parity.test.ts` | `docs/release-status.json` still `pending` |
+| Streams | `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, and Web Streams `{ readable, writable }` from both stream constructors | `packages/webtransport/test/portable-server.test.ts`; `packages/webtransport/test/wasm-server-session-parity.test.ts` | `docs/release-status.json` still `pending` |
+| Metrics and limits | `metricsSnapshot()` plus shared `maxStreamsPerSessionBidi`, `maxStreamsGlobal`, and `backpressureTimeoutMs` limits | `packages/webtransport/test/portable-server.test.ts`; `packages/webtransport/test/wasm-limits.test.ts` | `docs/release-status.json` still `pending` |
+
+The portable contract deliberately does not erase backend-specific controls:
+`wasmOptions`, `wasmModule`, and `wasmBind` are forwarded only on the WASM
+branch, while `tls.allowSelfSigned` is WASM-only and is rejected by the native
+adapter rather than silently ignored. WASM-only `sendOrder`/`sendGroup`, IWA
+Direct Sockets, live TLS/SNI rotation, and ticket hosts remain documented on
+the `/wasm` surface instead of being promised by `/portable`. The focused
+current-source parity observations (69 pass/0 fail on each backend lane) are
+pre-verification results, not commit-bound release evidence.
+
 ## Browser-shaped client surface
 
 | Area | Members / behavior | Implementation source | Implementation evidence | Release verification |
