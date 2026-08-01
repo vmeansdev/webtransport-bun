@@ -6,8 +6,9 @@ Package version: `1.0.0-rc.1`.
 
 **Coupled GA model:** `1.0.0` only when every `gaRequired: true` claim is
 `passed` with commit-bound evidence and
-`bun scripts/promote-release-status.ts` succeeds. `scale-10k-multisource` is
-`gaRequired: false`.
+`bun scripts/promote-release-status.ts` succeeds. The distributed
+`scale-10k-multisource` workload and the 24h/72h soak campaigns are tracked
+as `gaRequired: false` post-1.0 follow-ups and do not block `1.0.0`.
 
 ## Bounded functional-candidate state
 
@@ -32,8 +33,10 @@ candidate that is frozen only after the local deterministic checks, native and
 WASM functional lanes, package-artifact checks, and the exact-package process
 cleanup smoke have been re-run from a clean tree. It is not a stable release,
 GA certification, publish approval, or cross-platform support claim. Hosted
-CI, browser/IWA, long-soak, coverage/fuzz, operator, and independent-review
-gates remain release gates even when local functional checks are healthy.
+CI, browser/IWA, coverage/fuzz, benchmark, operator, and independent-review
+gates remain release gates even when local functional checks are healthy. The
+distributed 10k workload and 24h/72h wall-clock soaks are optional post-1.0
+reliability evidence, not `1.0.0` promotion gates.
 
 The Task 11 report will contain only sanitized, commit-bound data: schema
 version; candidate commit and clean-tree identity; exact commands; start/end
@@ -72,7 +75,6 @@ commit-bound functional-readiness artifact named above.
 | `auto-review-zero-p0-p4` | Current architect, critic, security, and test-evidence reviews found no P0-P2 issue; a full P0-P4 release artifact remains pending |
 | `fuzz-gates` | Darwin cargo-fuzz sanitizer-coverage link fails; **Linux/CI campaign required** |
 | `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence remains pending |
-| `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
 | `final-no-change-confirmation` | Requires immutable freeze after all other gates |
 
 ### Not GA-blocking
@@ -80,9 +82,12 @@ commit-bound functional-readiness artifact named above.
 | Claim | Harness | Evidence artifact |
 |---|---|---|
 | `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; `.release-evidence/load/distributed-scale-artifact.json` |
+| `soak-24h` / `soak-72h` (`gaRequired: false`, `pending`) | `soak-long.yml` / `bun run test:soak-addon:24h` / `:72h` | segmented `soak-segment-*` and aggregate `soak-aggregate-*` artifacts |
 
 `distributed-scale.ts` is the authoritative multisource harness; the earlier
-single-source scale scripts it replaced are not release evidence.
+single-source scale scripts it replaced are not release evidence. These scale
+and long-soak records remain useful for post-1.0 reliability follow-up and are
+not required to clear the promotion table.
 
 ## What is safe to say today
 

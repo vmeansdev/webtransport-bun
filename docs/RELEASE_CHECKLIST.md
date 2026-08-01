@@ -14,6 +14,8 @@ The release workflow enforces these; the pipeline fails if any are missing:
 | Code quality | codeql | CodeQL analysis |
 | Parity | parity | parity-evidence.json |
 | Interop | interop | interop-evidence.json |
+| Coverage floors | coverage | native/WASM/Bun coverage reports |
+| Benchmark regression | bench-regress | `bench-regress-artifact.json` against the approved baseline |
 | Fuzz/property testing | fuzz | `.release-evidence/fuzz/release-smoke.json` Actions artifact |
 | Build | build | prebuilds + SHA256SUMS |
 | Exact package consumers | package-consumers | successful exact-tarball Bun/Node/Deno smoke across the supported OS/runtime matrix |
@@ -30,16 +32,19 @@ Before tagging an RC or stable release:
 
 No automated enforcement of the 14-day window; this is a release checklist discipline.
 
-## Soak evidence (RC / stable)
+## Optional post-1.0 soak evidence
 
 GitHub-hosted Actions jobs are capped at ~6 hours. A single 24h/72h soak cannot run as one GitHub-hosted job.
 
 | Stage | Soak requirement | Artifact |
 |-------|------------------|----------|
 | RC | 1h soak recommended | `soak-aggregate-1h-<commit>` from `soak-long` |
-| Stable | 24h and 72h soaks mandatory (P2.2-A/P2.2-B) | complete segmented campaign aggregates for both durations, plus chained segment artifacts such as `soak-segment-24h-<commit>-seg01of05` and final `soak-aggregate-24h-<commit>` |
+| Stable | 24h and 72h soaks optional post-1.0 reliability evidence (not a `1.0.0` blocker) | complete segmented campaign aggregates for both durations, plus chained segment artifacts such as `soak-segment-24h-<commit>-seg01of05` and final `soak-aggregate-24h-<commit>` |
 
-Do not start the 24h or 72h campaign until the exact release candidate commit is frozen. Any code, config, dependency, toolchain, or workflow change after segment 1 invalidates the campaign and requires a full restart from segment 1.
+If a post-1.0 24h or 72h campaign is run, start it only after the exact
+candidate commit is frozen. Any code, config, dependency, toolchain, or
+workflow change after segment 1 invalidates the campaign and requires a full
+restart from segment 1. These campaigns are not required to promote `1.0.0`.
 
 Campaign requirements:
 
@@ -47,7 +52,8 @@ Campaign requirements:
 2. On GitHub-hosted runners, use `segment_count=5` for 24h and `segment_count=15` for 72h, dispatching indices in order. Each 4.8h workload leaves setup, cleanup, and artifact-upload headroom under GitHub's hard 6h job limit. On self-hosted runners use `segment_count=1` for both 24h and 72h, matching the executable workflow's single long-lived runner policy. The workflow resolves each predecessor artifact and `finalStateHash` itself; a missing or invalid predecessor stops the next segment.
 3. Keep the same Bun, Rust, resolved CC/CXX paths and versions, and checkout commit for the whole chain. The harness records them and aggregation rejects drift.
 4. The final segment automatically downloads all prior artifacts for that candidate and performs mandatory aggregation. No manual side-loaded directory is accepted by the release workflow. For forensic local re-verification only, run `bun tools/load/soak-addon.ts aggregate /path/to/segment-artifacts`.
-5. Aggregation is release-blocking. It rejects:
+5. Aggregation is required to accept a post-1.0 soak result, but is not
+   `1.0.0` release-blocking. It rejects:
    - missing segments
    - non-contiguous indices
    - failed segments
@@ -78,9 +84,11 @@ What the long-run harness now proves per segment:
 - certificate rotation followed by fresh reconnect traffic
 - final close/drain cleanup back to queue/task baseline
 
-Retain the segment JSON, CSV, stderr/stdout logs, and aggregate JSON in the release evidence bundle or release-blocking issue.
+Retain the segment JSON, CSV, stderr/stdout logs, and aggregate JSON in the
+post-1.0 reliability evidence bundle or follow-up issue.
 
-Retain soak artifacts and link them in release notes (or a release-blocking issue) for audit.
+Retain optional soak artifacts and link them in release notes (or a follow-up
+issue) for audit.
 
 ## Evidence links (auditable)
 

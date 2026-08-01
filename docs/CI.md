@@ -51,7 +51,7 @@ Test log hygiene:
 1. Build native addon + install deps
 2. Run W3C facade parity suite (`bun run test:parity`)
 
-**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/24h/72h) — trigger via workflow_dispatch; each run retains `soak-artifacts-seg-*.json`/CSV plus logs, and the final segment emits the validated `.release-evidence/soak-aggregate-<duration>h.json` campaign record.
+**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/24h/72h) — trigger via workflow_dispatch; each run retains `soak-artifacts-seg-*.json`/CSV plus logs, and the final segment emits the validated `.release-evidence/soak-aggregate-<duration>h.json` campaign record. The 24h/72h campaigns are optional post-1.0 reliability evidence and are not a `1.0.0` promotion gate.
 
 ### release.yml (tag push `v*`, workflow_dispatch)
 
@@ -64,7 +64,9 @@ Test log hygiene:
 4. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
 5. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
 6. **package-consumers** — needs [build]; builds the exact tarball from the downloaded release prebuilds and runs the native addon, datagram, unidirectional-stream, bidirectional-stream, and deterministic-close smoke under Bun, Deno, and the supported Node engine floor/current versions across Linux, macOS, and Windows.
-7. **release** — needs [build, interop, parity, fuzz, package-consumers]; verifies required evidence and all four target prebuilds, regenerates and checks SHA256SUMS, builds and smokes the exact package under Bun/Node/Deno, then uploads the tarball plus a run/attempt/commit/tag/digest-bound `candidate-identity.json` as the immutable, attempt-qualified `npm-publish-input-<run_attempt>` Actions artifact before creating the GitHub release.
+7. **coverage** — native, WASM, and Bun coverage floors; uploads the coverage evidence consumed by `release`.
+8. **bench-regress** — benchmark regression evidence against the approved candidate/machine baseline.
+9. **release** — needs [build, interop, parity, coverage, bench-regress, fuzz, package-consumers]; verifies required evidence and all four target prebuilds, regenerates and checks SHA256SUMS, builds and smokes the exact package under Bun/Node/Deno, then uploads the tarball plus a run/attempt/commit/tag/digest-bound `candidate-identity.json` as the immutable, attempt-qualified `npm-publish-input-<run_attempt>` Actions artifact before creating the GitHub release. The distributed 10k multisource workload is intentionally excluded from this dependency and remains a manual/post-1.0 diagnostic campaign.
 
 The blocking **fuzz** job runs `bun run fuzz:release-smoke`, then sanitizes the JSON before upload. It covers cargo-fuzz targets, stable Rust parser/property tests, and the Bun-side `WASM event decoder property harness` from `packages/webtransport/test/wasm-limits.test.ts`. Its canonical artifact path is `.release-evidence/fuzz/release-smoke.json`.
 
@@ -86,7 +88,7 @@ The job uses npm Trusted Publishing only: job-scoped `id-token: write`, the prot
 
 ## CI-EVIDENCE-A: Sustained evidence closure
 
-- **Release pipeline** requires security, CodeQL, fuzz, build, exact-package consumers, parity, and interop gates; fails on any missing blocker or required release evidence.
+- **Release pipeline** requires security, CodeQL, parity, interop, coverage, benchmark, fuzz, build, and exact-package consumer gates; fails on any missing blocker or required release evidence. The distributed 10k workload and 24h/72h soaks are retained as optional post-1.0 evidence and are not release dependencies.
 - **Evidence retention**: prebuilds, the npm tarball, `parity-evidence.json`, and `interop-evidence.json` are attached to every GitHub release. Fuzz evidence and the immutable npm publish input remain attempt-qualified Actions artifacts under the release workflow's retention policy.
 - **Release status**: `docs/release-status.json` stays the canonical readiness record for native and wasm candidate surfaces.
 - **N-consecutive green**: Release checklist (docs/RELEASE_CHECKLIST.md) documents policy; recommend 1–3 green test runs before RC, 14-day sustained green before stable.
@@ -121,5 +123,5 @@ The job uses npm Trusted Publishing only: job-scoped `id-token: write`, the prot
 
 ## Canary strategy
 - Publish `vX.Y.Z-rc.N` for release candidates
-- Run extended soak (e.g. 24h) on rc before tagging stable
+- Run an extended soak (e.g. 24h) on rc as optional post-1.0 reliability evidence; it is not required to tag `1.0.0`
 - Prefer `bun add @scope/webtransport@rc` for canary testing

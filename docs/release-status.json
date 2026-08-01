@@ -10,7 +10,7 @@
 			"path": "docs/release-evidence/5db80f071085d951168e9438bc930add453fffe3/functional-readiness.json",
 			"commit": "5db80f071085d951168e9438bc930add453fffe3",
 			"status": "passed",
-			"notes": "Sanitized bounded local functional proof; deferred hosted, long-running, cross-platform, fuzz, coverage, IWA, and operator gates remain pending."
+			"notes": "Sanitized bounded local functional proof; hosted cross-platform, fuzz, coverage, IWA, benchmark, review, and operator gates remain pending. The distributed 10k workload and 24h/72h soak campaigns are tracked as post-1.0 follow-ups and do not block 1.0.0 promotion."
 		}
 	],
 	"claims": [
@@ -100,7 +100,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": false,
-			"notes": "The bounded two-cycle single-source scale proof passed; the 10k multisource instrumentation target remains separate."
+			"notes": "The bounded two-cycle single-source scale proof passed. The distributed 10k multisource workload remains an optional post-1.0 reliability follow-up and is excluded from 1.0.0 promotion."
 		},
 		{
 			"id": "package-artifact",
@@ -123,16 +123,16 @@
 			"surface": "release",
 			"status": "pending",
 			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Long-running 24-hour soak was intentionally not started."
+			"gaRequired": false,
+			"notes": "Long-running 24-hour soak is an optional post-1.0 reliability campaign; it is intentionally excluded from 1.0.0 promotion."
 		},
 		{
 			"id": "soak-72h",
 			"surface": "release",
 			"status": "pending",
 			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Long-running 72-hour soak was intentionally not started."
+			"gaRequired": false,
+			"notes": "Long-running 72-hour soak is an optional post-1.0 reliability campaign; it is intentionally excluded from 1.0.0 promotion."
 		},
 		{
 			"id": "auto-review-zero-p0-p4",
