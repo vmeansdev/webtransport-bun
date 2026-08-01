@@ -37,6 +37,10 @@ const smokeSourceDir = path.join(root, "tools", "package-smoke");
 const npmCacheDir = mkdtempSync(path.join(tmpdir(), "webtransport-npm-cache-"));
 const DEFAULT_COMMAND_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_SMOKE_TIMEOUT_MS = 60_000;
+// Runtime discovery is setup, not the bounded smoke execution under test. Keep
+// its own finite budget so host scheduler latency cannot consume a deliberately
+// short smoke deadline (the cleanup fixture uses 1500ms for that path).
+const DEFAULT_RUNTIME_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_SMOKE_KILL_GRACE_MS = 250;
 const DEFAULT_SMOKE_TREE_KILL_TIMEOUT_MS = 5_000;
 // Descendants may retain inherited capture descriptors after the root/helper exits.
@@ -961,6 +965,10 @@ async function smokeTarball(
 					cwd: consumerDir,
 					label: `${runtime} --version probe`,
 					echoOnSuccess: false,
+					timeoutMs: envInteger(
+						"WEBTRANSPORT_PACKAGE_RUNTIME_PROBE_TIMEOUT_MS",
+						DEFAULT_RUNTIME_PROBE_TIMEOUT_MS,
+					),
 				});
 			} catch (error) {
 				const detail = error instanceof Error ? error.message : String(error);
