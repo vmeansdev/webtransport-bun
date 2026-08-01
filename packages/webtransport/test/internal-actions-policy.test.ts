@@ -40,6 +40,7 @@ const RELEASE_TOOLCHAIN = JSON.parse(
 ) as {
 	node: string[];
 	rust: string[];
+	rustNightly: string[];
 	wasmBindgen: string[];
 	cargoAudit: string[];
 	cargoFuzz: string[];
@@ -80,6 +81,7 @@ function runPolicy(workflow: string, filename = "test.yml") {
 			schemaVersion: 1,
 			bun: ["1.3.9", "1.3.14"],
 			rust: ["1.95.0"],
+			rustNightly: ["nightly-2026-07-31"],
 			node: ["18.20.4", "20.19.0", "22.23.1"],
 			deno: ["2.9.3"],
 			python: ["3.12.10"],
@@ -191,6 +193,15 @@ describe("GitHub Actions release policy", () => {
 		expect(RELEASE_WORKFLOW).toContain("path: bench-regress-evidence");
 		expect(RELEASE_WORKFLOW).toContain(
 			'find coverage-artifacts -name "native-coverage.json" -type f | grep -q .',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find coverage-artifacts -name "wasm-coverage.json" -type f | grep -q .',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find coverage-artifacts -path "*/coverage/bun/lcov.info" -type f | grep -q .',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find coverage-artifacts -path "*/coverage/bun/path-proof.txt" -type f | grep -q .',
 		);
 		expect(RELEASE_WORKFLOW).toContain(
 			'find bench-regress-evidence -name "bench-regress-artifact.json" -type f | grep -q .',
@@ -427,6 +438,42 @@ jobs:
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
 			"cargo-llvm-cov installs must include an exact --version",
+		);
+	});
+
+	it("accepts an allowlisted pinned nightly coverage toolchain", () => {
+		const result = runPolicy(`
+jobs:
+  coverage:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@${PIN}
+      - uses: dtolnay/rust-toolchain@${PIN}
+        with:
+          toolchain: nightly-2026-07-31
+`);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("policy passed");
+	});
+
+	it("rejects an unapproved nightly coverage toolchain", () => {
+		const result = runPolicy(`
+jobs:
+  coverage:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@${PIN}
+      - uses: dtolnay/rust-toolchain@${PIN}
+        with:
+          toolchain: nightly-2026-08-01
+`);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"toolchain nightly-2026-08-01 is not listed",
 		);
 	});
 

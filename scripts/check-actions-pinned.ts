@@ -11,6 +11,7 @@ const TOOLCHAIN_PATH = resolve(ROOT, ".github", "release-toolchain.json");
 const SHA40 = /^[0-9a-f]{40}$/i;
 const SHA256 = /^sha256:[0-9a-f]{64}$/i;
 const EXACT_SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const EXACT_NIGHTLY = /^nightly-\d{4}-\d{2}-\d{2}$/;
 const RELEASE_ATTEMPT_ARTIFACT =
 	"npm-publish-input-$" + "{{ steps.release-run.outputs.run_attempt }}";
 const RELEASE_RUN_ID_EXPRESSION = "$" + "{{ env.RELEASE_RUN_ID }}";
@@ -116,6 +117,7 @@ type ReleaseToolchain = {
 	schemaVersion: 1;
 	bun: string[];
 	rust: string[];
+	rustNightly: string[];
 	node: string[];
 	deno: string[];
 	python: string[];
@@ -144,12 +146,20 @@ function loadToolchain(): ReleaseToolchain {
 	}
 	for (const [tool, versions] of Object.entries(parsed)) {
 		if (tool === "schemaVersion") continue;
+		const versionPattern =
+			tool === "rustNightly" ? EXACT_NIGHTLY : EXACT_SEMVER;
 		if (
 			!Array.isArray(versions) ||
 			versions.length === 0 ||
-			!versions.every((version) => EXACT_SEMVER.test(String(version)))
+			!versions.every((version) => versionPattern.test(String(version)))
 		) {
-			throw new Error(`${tool} must list one or more exact semantic versions`);
+			throw new Error(
+				`${tool} must list one or more exact ${
+					tool === "rustNightly"
+						? "nightly toolchain dates"
+						: "semantic versions"
+				}`,
+			);
 		}
 	}
 	return parsed;
@@ -157,7 +167,7 @@ function loadToolchain(): ReleaseToolchain {
 
 const TOOLCHAIN = loadToolchain();
 
-function approvedVersions(key: string): string[] {
+function approvedVersions(key: string, value?: string): string[] {
 	const mapping: Record<string, keyof ReleaseToolchain> = {
 		"bun-version": "bun",
 		"node-version": "node",
@@ -165,8 +175,18 @@ function approvedVersions(key: string): string[] {
 		"python-version": "python",
 		toolchain: "rust",
 	};
+	if (key === "toolchain" && value && EXACT_NIGHTLY.test(value)) {
+		return TOOLCHAIN.rustNightly;
+	}
 	const tool = mapping[key];
 	return tool ? (TOOLCHAIN[tool] as string[]) : [];
+}
+
+function isExactVersion(key: string, value: string): boolean {
+	return (
+		EXACT_SEMVER.test(value) ||
+		(key === "toolchain" && EXACT_NIGHTLY.test(value))
+	);
 }
 
 function scalar(value: string): string {
@@ -220,12 +240,12 @@ function exactVersionViolation(
 			.find(Boolean);
 		if (matrixValues) {
 			const values = matrixValues.split(",").map(scalar);
-			const approved = approvedVersions(key);
 			if (
 				values.length > 0 &&
 				values.every(
 					(candidate) =>
-						EXACT_SEMVER.test(candidate) && approved.includes(candidate),
+						isExactVersion(key, candidate) &&
+						approvedVersions(key, candidate).includes(candidate),
 				)
 			) {
 				return undefined;
@@ -239,21 +259,22 @@ function exactVersionViolation(
 			.map((candidate) => (candidate ? scalar(candidate) : undefined))
 			.filter(
 				(candidate): candidate is string =>
-					typeof candidate === "string" && EXACT_SEMVER.test(candidate),
+					typeof candidate === "string" && isExactVersion(key, candidate),
 			);
-		const approved = approvedVersions(key);
 		if (
 			includeValues.length > 0 &&
-			includeValues.every((candidate) => approved.includes(candidate))
+			includeValues.every((candidate) =>
+				approvedVersions(key, candidate).includes(candidate),
+			)
 		) {
 			return undefined;
 		}
 		return `${key} matrix ${matrixReference} must contain only exact three-part versions`;
 	}
-	if (!EXACT_SEMVER.test(normalized)) {
+	if (!isExactVersion(key, normalized)) {
 		return `${key} must be an exact three-part version, not ${JSON.stringify(normalized)}`;
 	}
-	const approved = approvedVersions(key);
+	const approved = approvedVersions(key, normalized);
 	if (!approved.includes(normalized)) {
 		return `${key} ${normalized} is not listed in ${TOOLCHAIN_PATH}`;
 	}

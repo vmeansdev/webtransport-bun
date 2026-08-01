@@ -69,7 +69,7 @@ commit-bound functional-readiness artifact named above.
 
 | Claim | Blocker |
 |---|---|
-| `coverage-gates` | `cargo llvm-cov --branch` needs a nightly toolchain (`-Z coverage-options=branch`); Bun coverage passed, native/WASM branch floors remain pending |
+| `coverage-gates` | Candidate workflows now use the allowlisted `nightly-2026-07-31` toolchain for `cargo llvm-cov --branch`; hosted native/WASM/Bun floor evidence remains pending |
 | `fault-matrix` | Dedicated release fault-matrix artifact was not regenerated for this candidate |
 | `iwa-direct-sockets` | Current signed IWA assets and signing authority are unavailable for a reproducible non-interactive proof |
 | `auto-review-zero-p0-p4` | Current architect, critic, security, and test-evidence reviews found no P0-P2 issue; a full P0-P4 release artifact remains pending |

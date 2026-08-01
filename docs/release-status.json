@@ -84,7 +84,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Pinned stable Rust rejects nightly-only branch coverage flags; Bun coverage passed, native/WASM branch floors remain pending."
+			"notes": "Candidate workflows now use allowlisted nightly-2026-07-31 for branch coverage; hosted native/WASM/Bun floor evidence remains pending."
 		},
 		{
 			"id": "fuzz-gates",

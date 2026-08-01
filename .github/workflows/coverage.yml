@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
         with:
-          toolchain: 1.95.0
+          toolchain: nightly-2026-07-31
           components: llvm-tools-preview
           targets: wasm32-unknown-unknown
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -38,9 +38,9 @@ jobs:
       - name: Prepare coverage artifact directory
         run: mkdir -p coverage/bun
       - name: Native coverage
-        run: cargo llvm-cov --workspace --branch --json --output-path coverage/native-coverage.json
+        run: cargo +nightly-2026-07-31 llvm-cov --workspace --branch --json --output-path coverage/native-coverage.json
       - name: WASM coverage
-        run: cargo llvm-cov --manifest-path crates/wasm/Cargo.toml --branch --json --output-path coverage/wasm-coverage.json
+        run: cargo +nightly-2026-07-31 llvm-cov --manifest-path crates/wasm/Cargo.toml --branch --json --output-path coverage/wasm-coverage.json
       - name: Bun coverage
         run: |
           bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage/bun packages/
