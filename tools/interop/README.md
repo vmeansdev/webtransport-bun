@@ -39,15 +39,17 @@ It listens on QUIC port 4433 and exposes an HTTP health endpoint on 127.0.0.1:44
 
 ## Per-release evidence
 
-Set `INTEROP_EVIDENCE=1` to emit `interop-evidence.json` (Playwright JSON reporter). CI release workflow runs this and attaches the file to the GitHub release.
+Set `INTEROP_EVIDENCE=1` to emit `interop-evidence.json` (Playwright JSON reporter), then run `bun run sanitize-evidence.ts interop-evidence.json` before validation or upload. The sanitizer removes Playwright's host-specific config paths and executable paths at the generation boundary. CI release workflow runs both steps and attaches the sanitized file to the GitHub release.
 
 Interop web-server processes receive an explicit allowlist of non-sensitive
 runtime settings only: idle timeout, QPACK capacity, and localhost host/port
 overrides. The harness invokes the current Bun executable directly and resolves
 OpenSSL from deterministic locations, so `PATH` and the developer shell
-environment are never serialized into release evidence. Release evidence is
-validated before upload; validation rejects inherited environment keys,
-credential-shaped values, and absolute host paths in the web-server environment.
+environment are never serialized into release evidence. The generation-boundary
+sanitizer also removes Playwright config paths and executable paths before the
+whole-document validator runs. Release evidence is validated before upload;
+validation rejects inherited environment keys, credential-shaped values, and
+absolute host paths anywhere in the document.
 
 ## Local vs CI
 
