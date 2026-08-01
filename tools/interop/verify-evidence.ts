@@ -10,7 +10,7 @@ const ALLOWED_ENV_KEYS = new Set([
 	"WEBTRANSPORT_INTEROP_HEALTH_PORT",
 ]);
 const SECRET_KEY_PATTERN =
-	/(token|api[_-]?key|secret|password|passwd|credential|authorization|auth(?:entication|orization)?|private[_-]?key|access[_-]?key|cookie|session[_-]?token)/i;
+	/(token|api[_-]?key|secret|password|passwd|credential|authorization|auth(?:entication|orization)|private[_-]?key|access[_-]?key|cookie|session[_-]?token)/i;
 const ENV_KEY_PATTERN =
 	/(token|api[_-]?key|secret|password|passwd|credential|auth|ssh|home|path|shell|user|codex|vscode|brew|java|gopath|goroot|tmpdir|pwd|oldpwd|socket)/i;
 const SECRET_VALUE_PATTERN =
@@ -88,16 +88,29 @@ export function verifyInteropEvidenceDocument(document: unknown): void {
 	inspectEnvironment((webServer as { env?: unknown }).env);
 }
 
+export function isInteropEvidenceDocument(document: unknown): boolean {
+	if (
+		document === null ||
+		typeof document !== "object" ||
+		Array.isArray(document)
+	) {
+		return false;
+	}
+	const config = (document as { config?: unknown }).config;
+	return (
+		config !== null &&
+		typeof config === "object" &&
+		!Array.isArray(config) &&
+		"webServer" in config
+	);
+}
+
 export function verifyEvidenceFile(path: string): void {
 	if (!existsSync(path)) fail(`missing file ${JSON.stringify(path)}`);
 	try {
 		const document = JSON.parse(readFileSync(path, "utf8"));
 		verifyEvidenceDocument(document);
-		if (
-			document !== null &&
-			typeof document === "object" &&
-			"config" in document
-		) {
+		if (isInteropEvidenceDocument(document)) {
 			verifyInteropEvidenceDocument(document);
 		}
 	} catch (error) {

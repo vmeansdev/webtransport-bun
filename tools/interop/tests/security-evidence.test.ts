@@ -72,6 +72,28 @@ describe("interop evidence security boundary", () => {
 		).not.toThrow();
 	});
 
+	it("accepts benign authoritative telemetry keys", () => {
+		expect(() =>
+			verifyEvidenceDocument({
+				memoryTelemetry: {
+					inProcessRssRecovery: { authoritative: false },
+				},
+			}),
+		).not.toThrow();
+	});
+
+	it("keeps generic config artifacts outside the interop schema", () => {
+		expect(() =>
+			verifyEvidenceDocument({
+				config: {
+					label: "distributed-scale",
+					artifactPath:
+						".release-evidence/load/distributed-scale-artifact.json",
+				},
+			}),
+		).not.toThrow();
+	});
+
 	it("rejects nested secrets and host paths without echoing values", () => {
 		const cases = [
 			{

@@ -192,6 +192,12 @@ describe("GitHub Actions release policy", () => {
 		expect(RELEASE_WORKFLOW).toContain("name: distributed-scale-evidence");
 		expect(RELEASE_WORKFLOW).toContain("path: distributed-scale-evidence");
 		expect(RELEASE_WORKFLOW).toContain(
+			"bun run tools/interop/sanitize-evidence.ts .release-evidence/load/distributed-scale-artifact.json",
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			"bun run tools/interop/verify-evidence.ts .release-evidence/load/distributed-scale-artifact.json",
+		);
+		expect(RELEASE_WORKFLOW).toContain(
 			'find coverage-artifacts -name "native-coverage.json" -type f | grep -q .',
 		);
 		expect(RELEASE_WORKFLOW).toContain(

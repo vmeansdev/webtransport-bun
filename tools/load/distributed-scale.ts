@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 import {
 	createServer,
 	DEFAULT_LIMITS,
@@ -15,10 +15,8 @@ import { createLoadSessionHandler } from "./soak-addon.ts";
 const ROOT = process.cwd();
 const CLIENT_BIN_RELEASE = `${ROOT}/target/release/load-client`;
 const CLIENT_BIN_DEBUG = `${ROOT}/target/debug/load-client`;
-const DEFAULT_ARTIFACT_PATH = resolve(
-	ROOT,
-	".release-evidence/load/distributed-scale-artifact.json",
-);
+const DEFAULT_ARTIFACT_PATH =
+	".release-evidence/load/distributed-scale-artifact.json";
 const DEFAULT_CLIENT_TARGET_HOST = "127.0.0.1";
 const CHILD_EXIT_TIMEOUT_MS = 30_000;
 const LOAD_CLIENT_COMPLETION_GRACE_MS = 15_000;
@@ -574,7 +572,7 @@ export async function runCommandWithBoundedOutput(
 	try {
 		exit = await Promise.race([
 			exitPromise.then((value) => ({ kind: "exit" as const, value })),
-		timeoutPromise.then(() => ({ kind: "timeout" as const })),
+			timeoutPromise.then(() => ({ kind: "timeout" as const })),
 		]);
 	} finally {
 		commandSettled = true;

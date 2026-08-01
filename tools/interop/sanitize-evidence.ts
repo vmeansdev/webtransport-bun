@@ -3,6 +3,7 @@
 import { basename } from "node:path";
 import { readFileSync, writeFileSync } from "node:fs";
 import {
+	isInteropEvidenceDocument,
 	verifyEvidenceDocument,
 	verifyInteropEvidenceDocument,
 } from "./verify-evidence.ts";
@@ -54,12 +55,7 @@ export function sanitizeEvidenceDocument(document: unknown): unknown {
 
 function validateDocument(document: unknown): void {
 	verifyEvidenceDocument(document);
-	if (
-		document !== null &&
-		typeof document === "object" &&
-		!Array.isArray(document) &&
-		"config" in document
-	) {
+	if (isInteropEvidenceDocument(document)) {
 		verifyInteropEvidenceDocument(document);
 	}
 }

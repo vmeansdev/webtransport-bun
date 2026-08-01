@@ -264,6 +264,10 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Distributed scale campaign (>=10k sessions)
         run: bun tools/load/distributed-scale.ts
+      - name: Sanitize distributed scale evidence
+        run: |
+          bun run tools/interop/sanitize-evidence.ts .release-evidence/load/distributed-scale-artifact.json
+          bun run tools/interop/verify-evidence.ts .release-evidence/load/distributed-scale-artifact.json
       - name: Upload distributed scale evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
         with:

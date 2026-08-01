@@ -1,7 +1,5 @@
 #!/usr/bin/env bun
 
-import { resolve } from "node:path";
-
 import {
 	runScaleCampaign,
 	type ScaleCampaignConfig,
@@ -43,7 +41,7 @@ export function loadScaleConfigFromEnv(): ScaleCampaignConfig {
 		),
 		artifactPath:
 			process.env.LOAD_SCALE_ARTIFACT_OUT ??
-			resolve(process.cwd(), ".release-evidence/load/load-scale-artifact.json"),
+			".release-evidence/load/load-scale-artifact.json",
 	};
 }
 
