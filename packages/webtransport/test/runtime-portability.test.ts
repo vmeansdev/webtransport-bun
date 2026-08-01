@@ -15,6 +15,18 @@ describe("runtime-portable deadline helpers", () => {
 	const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 	const clearedTimers = new Set<ReturnType<typeof setTimeout>>();
 
+	function captureNewTimer(
+		before: ReadonlySet<ReturnType<typeof setTimeout>>,
+	): ReturnType<typeof setTimeout> {
+		const timer = [...pendingTimers].find(
+			(candidate) => !before.has(candidate),
+		);
+		if (timer === undefined) {
+			throw new Error("deadline helper did not schedule a timer");
+		}
+		return timer;
+	}
+
 	function listSourceFiles(dir: string): string[] {
 		return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
 			const path = `${dir}${entry.name}`;
@@ -61,55 +73,61 @@ describe("runtime-portable deadline helpers", () => {
 	it("sleep resolves early when aborted and clears its timer", async () => {
 		installTimerSpies();
 		const controller = new AbortController();
+		const before = new Set(pendingTimers);
 		const sleepPromise = sleep(1_000, controller.signal);
+		const timer = captureNewTimer(before);
 
 		controller.abort(new Error("stop"));
 
 		await expect(sleepPromise).rejects.toThrow("stop");
-		expect(clearedTimers.size).toBe(1);
-		expect(pendingTimers.size).toBe(0);
+		expect(clearedTimers.has(timer)).toBe(true);
+		expect(pendingTimers.has(timer)).toBe(false);
 	});
 
 	it("withDeadline returns early results and clears its timeout", async () => {
 		installTimerSpies();
+		const before = new Set(pendingTimers);
 
-		const result = await withDeadline(Promise.resolve("ready"), 1_000, {
+		const resultPromise = withDeadline(Promise.resolve("ready"), 1_000, {
 			timeoutMessage: "timed out",
 		});
+		const timer = captureNewTimer(before);
+		const result = await resultPromise;
 
 		expect(result).toBe("ready");
-		expect(clearedTimers.size).toBe(1);
-		expect(pendingTimers.size).toBe(0);
+		expect(clearedTimers.has(timer)).toBe(true);
+		expect(pendingTimers.has(timer)).toBe(false);
 	});
 
 	it("withDeadline rejects on timeout and clears its timeout", async () => {
 		installTimerSpies();
+		const before = new Set(pendingTimers);
+		const deadline = withDeadline(new Promise<never>(() => {}), 25, {
+			timeoutMessage: "timed out",
+		});
+		const timer = captureNewTimer(before);
 
-		await expect(
-			// Leave enough room for a loaded event loop while still proving the
-			// timeout path with a bounded, short deadline.
-			withDeadline(new Promise<never>(() => {}), 25, {
-				timeoutMessage: "timed out",
-			}),
-		).rejects.toThrow("timed out");
-		expect(clearedTimers.size).toBe(1);
-		expect(pendingTimers.size).toBe(0);
+		await expect(deadline).rejects.toThrow("timed out");
+		expect(clearedTimers.has(timer)).toBe(true);
+		expect(pendingTimers.has(timer)).toBe(false);
 	});
 
 	it("withDeadline rejects on abort and clears its timeout", async () => {
 		installTimerSpies();
 		const controller = new AbortController();
 		const pending = new Promise<never>(() => {});
+		const before = new Set(pendingTimers);
 		const deadlinePromise = withDeadline(pending, 1_000, {
 			signal: controller.signal,
 			timeoutMessage: "timed out",
 		});
+		const timer = captureNewTimer(before);
 
 		controller.abort(new Error("abort requested"));
 
 		await expect(deadlinePromise).rejects.toThrow("abort requested");
-		expect(clearedTimers.size).toBe(1);
-		expect(pendingTimers.size).toBe(0);
+		expect(clearedTimers.has(timer)).toBe(true);
+		expect(pendingTimers.has(timer)).toBe(false);
 	});
 
 	it("monotonic deadlines ignore wall-clock jumps", () => {

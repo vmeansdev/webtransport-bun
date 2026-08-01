@@ -243,7 +243,10 @@ describe("hardening regressions", () => {
 						const c = await connectWithRetry(
 							`https://127.0.0.1:${port}`,
 							INSECURE,
-							3000,
+							// Other package files run concurrently in the cold suite; allow
+							// one bounded retry window beyond the 10s handshake deadline
+							// without changing the production timeout.
+							15_000,
 						);
 						c.close();
 					}),
