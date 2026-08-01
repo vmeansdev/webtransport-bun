@@ -43,7 +43,7 @@ See `docs/release-status.json` → `scopeLimits`.
 | Server inside the browser | Normal web page, Firefox, Safari | **not possible** — Direct Sockets is IWA/Chromium-only |
 | Server in Bun (wasm instead of native addon) | `Bun.udpSocket` transport | implemented and locally tested; release evidence pending |
 | Client (wasm) → native server | Bun/Node host, real UDP | implemented and locally tested; release evidence pending |
-| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; `chromium-wasm-interop` **passed** on the current bounded candidate |
+| Chrome's native `WebTransport` client → wasm server | configured Chromium lanes | automated locally and in `iwa.yml` / `playwright.wasm.config.ts`; `chromium-wasm-interop` **passed** on the canonical bounded candidate (`5db80f0`) |
 | Custom transport | anything implementing `UdpTransport` | implemented — the core is sans-IO; consumer-specific support is not claimed |
 
 Constraints that apply regardless of environment:
@@ -68,7 +68,8 @@ Constraints that apply regardless of environment:
   requirements (`wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`) and
   are **claim-passed** on the current candidate in `docs/release-status.json`
   (defaults remain Chromium-safe: QPACK capacity 0, `enable0Rtt` false).
-  `wasm-facade-parity` is claim-passed on the current candidate (pooling,
+  `wasm-facade-parity` is claim-passed on the canonical bounded candidate
+  (`5db80f0`) (pooling,
   waitUntilAvailable, quinn getStats, CC factories, sendOrder scheduler,
   durable ticket hosts, metrics, live TLS/SNI, log/debug, WasmServerSession).
   Async plug-and-play `createServer` / `createIwaServer` on
