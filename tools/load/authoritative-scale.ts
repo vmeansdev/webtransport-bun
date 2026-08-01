@@ -224,9 +224,9 @@ async function runChildCycle(): Promise<void> {
 		label: `${baseConfig.label}-cycle-${cycleIndex}`,
 		artifactPath: childArtifactPath,
 	});
-	// The child is the residency boundary. Exit explicitly after writing the
-	// artifact so imported native runtime handles cannot extend the process.
-	process.exit(0);
+	// The child is the residency boundary. Return naturally after writing the
+	// artifact; the parent watchdog treats a lingering runtime handle as a
+	// failed authoritative cleanup result instead of masking it with exit(0).
 }
 
 function processIsolationFailureArtifact(
