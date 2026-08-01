@@ -32,16 +32,20 @@ describe("abuse resistance (P0-D)", () => {
 			await Bun.sleep(300);
 
 			const attempts = 15;
-			const connects = Array.from({ length: attempts }, () =>
-				connect(`https://127.0.0.1:${port}`, {
-					tls: { insecureSkipVerify: true },
-				})
-					.then((c) => h.track(c))
-					.catch(() => null),
+			// Observe every rejection explicitly. Under a loaded package suite,
+			// rejected handshakes can reach the 10s timeout boundary instead of
+			// being refused immediately by the rate limiter.
+			const results = await Promise.allSettled(
+				Array.from({ length: attempts }, () =>
+					connect(`https://127.0.0.1:${port}`, {
+						tls: { insecureSkipVerify: true },
+					}).then((c) => h.track(c)),
+				),
 			);
-			const results = await Promise.all(connects);
-			const succeeded = results.filter((r) => r != null);
-			const failed = results.filter((r) => r == null);
+			const succeeded = results.filter(
+				(result) => result.status === "fulfilled",
+			);
+			const failed = results.filter((result) => result.status === "rejected");
 
 			expect(succeeded.length).toBeLessThanOrEqual(burst);
 			expect(failed.length).toBeGreaterThan(0);
