@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Barrier;
 use tokio::time::interval;
 use wtransport::error::StreamWriteError;
 use wtransport::ClientConfig;
@@ -27,10 +28,28 @@ const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
 const PROBE_UNI_ECHO_PREFIX: &str = "probe:uni-echo:";
 const PROBE_UNI_STOP_PREFIX: &str = "probe:uni-stop:";
+const SERVER_PROBE_PREFIX: &str = "server-probe:";
 const PROBE_BIDI_ECHO_PREFIX: &str = "probe:bidi-echo:";
 const PROBE_BIDI_RESET_PREFIX: &str = "probe:bidi-reset:";
 const LOAD_UNI_PREFIX: &str = "load:uni:";
 const LOAD_BIDI_PREFIX: &str = "load:bidi:";
+
+#[derive(Debug, Eq, PartialEq)]
+enum UniProbeDisposition {
+    Expected,
+    ServerOwned,
+    Unexpected,
+}
+
+fn classify_uni_probe_payload(payload: &[u8], expected: &[u8]) -> UniProbeDisposition {
+    if payload == expected {
+        UniProbeDisposition::Expected
+    } else if payload.starts_with(SERVER_PROBE_PREFIX.as_bytes()) {
+        UniProbeDisposition::ServerOwned
+    } else {
+        UniProbeDisposition::Unexpected
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ClientMode {
@@ -253,6 +272,24 @@ async fn read_stream_to_end(
     }
 }
 
+async fn read_stream_to_end_before(
+    recv: &mut wtransport::RecvStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut buf = [0u8; 1024];
+    let mut out = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("uni echo timed out while reading a candidate stream".into());
+        }
+        match tokio::time::timeout(remaining, recv.read(&mut buf)).await?? {
+            Some(n) => out.extend_from_slice(&buf[..n]),
+            None => return Ok(out),
+        }
+    }
+}
+
 async fn run_datagram_echo_probe(
     conn: &wtransport::Connection,
     counters: &Counters,
@@ -277,10 +314,24 @@ async fn run_uni_echo_probe(
     counters.streams_opened.fetch_add(1, Ordering::Relaxed);
     send.write_all(&payload).await?;
     send.finish().await?;
-    let mut recv = tokio::time::timeout(PROBE_TIMEOUT, conn.accept_uni()).await??;
-    let echoed = read_stream_to_end(&mut recv).await?;
-    if echoed != payload {
-        return Err("uni echo mismatch".into());
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("uni echo timed out waiting for the client echo".into());
+        }
+        let mut recv = tokio::time::timeout(remaining, conn.accept_uni()).await??;
+        let echoed = read_stream_to_end_before(&mut recv, deadline).await?;
+        match classify_uni_probe_payload(&echoed, &payload) {
+            UniProbeDisposition::Expected => break,
+            // The addon scale harness also exercises a server-created uni stream
+            // on this session. Drain that known stream before accepting the
+            // client-owned echo so stream ordering cannot make the probe flaky.
+            UniProbeDisposition::ServerOwned => continue,
+            UniProbeDisposition::Unexpected => {
+                return Err("uni echo mismatch".into());
+            }
+        }
     }
     counters.uni_echo_ok.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -381,10 +432,12 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     match mode {
         ClientMode::Load => {
             let mut handles = Vec::with_capacity(num_sessions);
+            let probe_barrier = Arc::new(Barrier::new(num_sessions.max(1)));
             for i in 0..num_sessions {
                 let url = url.to_string();
                 let endpoint = Arc::clone(&endpoint);
                 let counters = Arc::clone(&counters);
+                let probe_barrier = Arc::clone(&probe_barrier);
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -393,6 +446,10 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                         Ok(conn) => {
                             counters.sessions_ok.fetch_add(1, Ordering::Relaxed);
                             run_probe_suite(&conn, counters.as_ref()).await;
+                            // Keep high-rate workload traffic behind a barrier so
+                            // late session probes are not competing with an
+                            // already-saturated earlier session.
+                            probe_barrier.wait().await;
                             run_session(
                                 conn,
                                 duration,
@@ -405,6 +462,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                         Err(e) => {
                             counters.sessions_err.fetch_add(1, Ordering::Relaxed);
                             eprintln!("load-client: session connect failed: {e}");
+                            probe_barrier.wait().await;
                         }
                     }
                 });
@@ -614,7 +672,10 @@ async fn run_reconnect_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_summary_json, parse_client_mode, parse_or_default, ClientMode, Counters};
+    use super::{
+        classify_uni_probe_payload, load_summary_json, parse_client_mode, parse_or_default,
+        ClientMode, Counters, UniProbeDisposition,
+    };
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -651,5 +712,23 @@ mod tests {
         counters.reconnects_ok.store(3, Ordering::Relaxed);
         let summary = load_summary_json(ClientMode::Reconnect, &counters);
         assert!(summary.contains("\"observedReconnects\":3"));
+    }
+
+    #[test]
+    fn classifies_the_client_echo_before_server_owned_probe_streams() {
+        let expected = b"probe:uni-echo:42";
+
+        assert_eq!(
+            classify_uni_probe_payload(expected, expected),
+            UniProbeDisposition::Expected
+        );
+        assert_eq!(
+            classify_uni_probe_payload(b"server-probe:4433", expected),
+            UniProbeDisposition::ServerOwned
+        );
+        assert_eq!(
+            classify_uni_probe_payload(b"unexpected:payload", expected),
+            UniProbeDisposition::Unexpected
+        );
     }
 }
