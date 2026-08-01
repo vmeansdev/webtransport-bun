@@ -217,6 +217,51 @@ fn send_startup_result(
 
 /// Spawn a background task that batches events from a channel and delivers
 /// them to a ThreadsafeFunction in groups (max_batch items or every flush_ms).
+async fn run_event_batcher<T, F>(
+    mut rx: tokio::sync::mpsc::Receiver<T>,
+    max_batch: usize,
+    flush_ms: u64,
+    mut deliver_batch: F,
+) where
+    T: Send + 'static,
+    F: FnMut(Vec<T>),
+{
+    let mut batch = Vec::with_capacity(max_batch);
+    loop {
+        if batch.is_empty() {
+            match rx.recv().await {
+                Some(e) => batch.push(e),
+                None => break,
+            }
+        }
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(flush_ms);
+        loop {
+            if batch.len() >= max_batch {
+                break;
+            }
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(e) => batch.push(e),
+                        None => {
+                            deliver_batch(std::mem::take(&mut batch));
+                            return;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        if !batch.is_empty() {
+            deliver_batch(std::mem::take(&mut batch));
+            batch = Vec::with_capacity(max_batch);
+        }
+    }
+    if !batch.is_empty() {
+        deliver_batch(batch);
+    }
+}
+
 pub(crate) fn spawn_event_batcher<T: Send + 'static>(
     tsfn: napi::threadsafe_function::ThreadsafeFunction<
         Vec<T>,
@@ -225,55 +270,16 @@ pub(crate) fn spawn_event_batcher<T: Send + 'static>(
     max_batch: usize,
     flush_ms: u64,
 ) -> tokio::sync::mpsc::Sender<T> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<T>(512);
+    let (tx, rx) = tokio::sync::mpsc::channel::<T>(512);
     RUNTIME.spawn(async move {
-        let mut batch = Vec::with_capacity(max_batch);
-        loop {
-            if batch.is_empty() {
-                match rx.recv().await {
-                    Some(e) => batch.push(e),
-                    None => break,
-                }
-            }
-            let deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_millis(flush_ms);
-            loop {
-                if batch.len() >= max_batch {
-                    break;
-                }
-                tokio::select! {
-                    event = rx.recv() => {
-                        match event {
-                            Some(e) => batch.push(e),
-                            None => {
-                                let status = tsfn.call(
-                                    std::mem::take(&mut batch),
-                                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                                );
-                                report_tsfn_status("event batch", status);
-                                return;
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep_until(deadline) => break,
-                }
-            }
-            if !batch.is_empty() {
-                let status = tsfn.call(
-                    std::mem::take(&mut batch),
-                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                );
-                report_tsfn_status("event batch", status);
-                batch = Vec::with_capacity(max_batch);
-            }
-        }
-        if !batch.is_empty() {
+        run_event_batcher(rx, max_batch, flush_ms, |batch| {
             let status = tsfn.call(
                 batch,
                 napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
             );
             report_tsfn_status("event batch", status);
-        }
+        })
+        .await;
     });
     tx
 }
@@ -1252,9 +1258,11 @@ pub(crate) fn spawn_wtransport_server(
 
 #[cfg(test)]
 mod tests {
+    use super::run_event_batcher;
     use super::{report_channel_failure, send_startup_result, CHANNEL_DELIVERY_FAILURE_COUNT};
     use super::{report_tsfn_status, TSFN_DELIVERY_FAILURE_COUNT};
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn report_tsfn_status_counts_failures_only() {
@@ -1283,5 +1291,29 @@ mod tests {
         send_startup_result(&mut opt, Err("boom".to_string()));
         assert!(opt.is_none());
         assert_eq!(CHANNEL_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_event_batcher_flushes_pending_batch_when_sender_drops() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(8);
+        let delivered: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let delivered_clone = Arc::clone(&delivered);
+        let worker = tokio::spawn(async move {
+            run_event_batcher(rx, 8, 50, move |batch| {
+                delivered_clone.lock().expect("lock").push(batch);
+            })
+            .await;
+        });
+
+        tx.send(7).await.expect("send first");
+        tx.send(9).await.expect("send second");
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), worker)
+            .await
+            .expect("batcher should exit after sender drop")
+            .expect("worker join");
+
+        assert_eq!(delivered.lock().expect("lock").as_slice(), &[vec![7, 9]]);
     }
 }
