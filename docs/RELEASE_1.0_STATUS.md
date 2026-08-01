@@ -9,23 +9,21 @@ Package version: `1.0.0-rc.1`.
 `bun scripts/promote-release-status.ts` succeeds. `scale-10k-multisource` is
 `gaRequired: false`.
 
-## Candidate state before functional verification
+## Bounded functional-candidate state
 
-The manifest is still bound to candidate `c7a1e78…` and remains `pending`.
-Those commit-bound artifacts are historical evidence; they do not certify the
-current `codex/functional-1.0-readiness` source tree. This source-candidate
-documentation pass deliberately does not rebind `docs/release-status.json` or
-write new passed evidence. Task 11 must re-run the local lane from a clean
-checkout and create the sanitized functional-readiness record first.
+The manifest is bound to source candidate
+`5db80f071085d951168e9438bc930add453fffe3` and remains `pending`. The
+sanitized proof is recorded in
+`docs/release-evidence/5db80f071085d951168e9438bc930add453fffe3/functional-readiness.json`.
+The evidence-child handoff still has to preserve this source SHA as its parent;
+the source candidate, not the evidence child, remains the code/package identity.
 
-### Existing manifest evidence (bound to `c7a1e78…`, not this source candidate)
-
-- `native-local-gates` (canonical bun package suite, 441/441)
-- `wasm-local-gates` (`bun run test:wasm`, 86/86)
-- `wasm-facade-parity` — all 9 `parity-*.test.ts` on both backends
-  (native 67 pass/0 fail; wasm 64 pass/3 skip/0 fail)
-- `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt` (timed unit evidence)
-- `package-artifact`, `supply-chain-provenance`
+The current commit-bound local claims are `native-local-gates`,
+`wasm-local-gates`, `runtime-consumers`, native and WASM Chromium interop,
+`package-artifact`, `supply-chain-provenance`, and the WASM QPACK,
+multi-session, 0-RTT, and facade-parity checks. Historical evidence directories
+remain retained for audit context but are not referenced by the current
+manifest.
 
 ### Functional-candidate truth boundary
 
@@ -43,36 +41,37 @@ timestamps; exit codes and pass/fail/skip counts; toolchain versions; current
 OS/architecture; artifact digests where applicable; explicit deferred/external
 gates; and no secrets or absolute host paths.
 
-### Pre-verification observations (2026-07-31; not release evidence)
+### Verified bounded local result (2026-08-01)
 
-- `bun scripts/check-bounded-waits.ts` passed on the current source tree.
-- The focused native and WASM parity lanes each completed with 69 passes and
-  0 failures; the Task 5 ticket-lifecycle and Task 6 queued-byte proofs also
-  pass in their focused runs.
-- The exact-package process-artifact smoke remains a local blocker: the
-  current host has no Deno runtime, and the process-tree cleanup run is
-  host-sensitive (fake-Deno diagnostic capture and mocked nonzero-taskkill
-  timeout behavior). The latest full-package observation had 2 failures, so
-  it is not a release pass.
-- The adversarial protocol build is also toolchain-blocked on this host:
-  rustc 1.85.0 is below dependency floors required by the pinned wtransport
-  and time/rcgen graph. That is an external toolchain blocker, not a passing
-  local gate.
+- The canonical pinned lane completed with ten package cold-loop iterations;
+  each iteration reported 488 pass and 0 fail across 65 files, and the exact-
+  package cleanup proof remained green.
+- Rust 1.95.0 and Deno 2.9.3 are callable. The same reproducible tarball passed
+  Bun, Node, and Deno import, datagram, uni-stream, bidi-stream, and
+  deterministic-close smokes.
+- The authoritative two-cycle scale verdict passed with natural process exits
+  and no forced kills. In-process RSS residency remains diagnostic telemetry
+  under the adopted policy; it is not an authoritative leak failure.
+- Fresh sanitized Chromium reports passed 21 native tests and 7 WASM-server
+  tests. Bounded waits, docs truth, internal docs truth, parity, load profiles,
+  and the canonical release policy checks also passed.
+- The release-smoke fuzz command remains deferred: eight Darwin arm64
+  cargo-fuzz targets hit the sanitizer-coverage linker limitation, while the
+  parser/decoder harnesses passed. Linux/CI fuzz evidence is still required.
 
-No local command in this documentation commit is being promoted to
-commit-bound release evidence. A local failure, stale artifact, or privacy
-failure returns execution to the relevant implementation task.
+The full sanitized command, count, digest, and deferral record is the
+commit-bound functional-readiness artifact named above.
 
 ### Still pending (block promote)
 
 | Claim | Blocker |
 |---|---|
-| `coverage-gates` | `cargo llvm-cov --branch` needs a nightly toolchain (`-Z coverage-options=branch`); not re-measured on the rebound candidate. Last measurement, on the pre-alignment gap-closure commit, was already under floor at endpoint/h3 branch 79.64/78.85 < 80 |
-| `runtime-consumers`, `chromium-*`, `fault-matrix` | Not re-run on the rebound candidate; demoted pending re-verify |
-| `iwa-direct-sockets` | **Demoted 2026-07-29 on rebind.** The Chrome 150 Direct Sockets proof was a manually rebuilt and signed IWA bundle; the run was real but is bound to the pre-alignment commit and cannot be reproduced non-interactively |
-| `auto-review-zero-p0-p4` | **Demoted 2026-07-29 on rebind.** Round 5 closed with no open P0-P4, but against the gap-closure commit; the candidate has since advanced by the portable-`createServer`, `ServerSession`-convergence, caPem and `E_TLS` commits |
-| `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
-| `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |
+| `coverage-gates` | `cargo llvm-cov --branch` needs a nightly toolchain (`-Z coverage-options=branch`); Bun coverage passed, native/WASM branch floors remain pending |
+| `fault-matrix` | Dedicated release fault-matrix artifact was not regenerated for this candidate |
+| `iwa-direct-sockets` | Current signed IWA assets and signing authority are unavailable for a reproducible non-interactive proof |
+| `auto-review-zero-p0-p4` | Current architect, critic, security, and test-evidence reviews found no P0-P2 issue; a full P0-P4 release artifact remains pending |
+| `fuzz-gates` | Darwin cargo-fuzz sanitizer-coverage link fails; **Linux/CI campaign required** |
+| `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence remains pending |
 | `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
 | `final-no-change-confirmation` | Requires immutable freeze after all other gates |
 
@@ -90,13 +89,12 @@ single-source scale scripts it replaced are not release evidence.
 - Package remains `1.0.0-rc.1`; readiness remains `pending`.
 - The current source contains the portable server contract, strict native/WASM
   error semantics, deterministic ticket handling, retained-byte accounting,
-  and complete interop-evidence privacy validation. Focused parity and
-  lifecycle tests currently pass, but their results are not yet bound to a
-  source-candidate evidence record.
+  and complete interop-evidence privacy validation. The bounded local results
+  are now bound to the source candidate by the functional-readiness artifact.
 - The portable `/portable` server is a common functional contract. The root
   native `createServer` remains synchronous and addon-backed; the `/wasm`
   entrypoint remains asynchronous and browser/IWA-oriented. These are
   intentional entrypoint differences, not a claim that every runtime is
   distribution-ready.
-- Promote still refuses until the pending table above clears and Task 11 binds
-  only freshly verified evidence to the frozen source candidate.
+- Promote still refuses until the pending table above clears; the current
+  bounded result is not a stable, GA, publish, or all-platform certification.

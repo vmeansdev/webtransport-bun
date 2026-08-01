@@ -1,0 +1,275 @@
+{
+  "schemaVersion": 1,
+  "kind": "functional-readiness",
+  "commit": "5db80f071085d951168e9438bc930add453fffe3",
+  "sourceCommit": "5db80f071085d951168e9438bc930add453fffe3",
+  "candidateRelationship": "exact",
+  "createdAt": "2026-08-01T19:06:48Z",
+  "runner": {
+    "os": "darwin",
+    "arch": "arm64",
+    "runtime": "bun",
+    "runtimeVersion": "1.3.14",
+    "nodeVersion": "23.9.0"
+  },
+  "toolchain": {
+    "rust": "1.95.0",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "deno": "2.9.3",
+    "cargoFuzz": "0.13.2 (deferred; policy requires 0.13.1)"
+  },
+  "cleanTree": {
+    "trackedFilesClean": true,
+    "detachedVerifierCheckout": true,
+    "verifierCommit": "5db80f071085d951168e9438bc930add453fffe3",
+    "protectedUntrackedPlanRetained": "docs/superpowers/plans/2026-07-31-functional-1.0-task2-toolchain-resolution.md"
+  },
+  "commands": [
+    {
+      "name": "canonical-local-lane",
+      "command": [
+        "mise",
+        "x",
+        "deno@2.9.3",
+        "--",
+        "env",
+        "RUSTUP_TOOLCHAIN=1.95.0",
+        "bash",
+        "scripts/test_ci_local.sh"
+      ],
+      "exitCode": 0,
+      "counts": {
+        "packageColdLoopIterations": 10,
+        "packageTestsPerIteration": 488,
+        "packageFailuresPerIteration": 0,
+        "packageSkippedPerIteration": 0,
+        "packageFilesPerIteration": 65,
+        "packageExpectCallsPerIteration": 2153,
+        "interopColdLoopIterations": 10,
+        "interopTestsPerIteration": 21,
+        "interopFailuresPerIteration": 0,
+        "loadProfilesPassed": 4
+      },
+      "notes": "Canonical verifier completed format, Rust, native build, typecheck, audits, package cold loop, parity, bounded load, and Chromium interop without an authoritative failure."
+    },
+    {
+      "name": "bounded-waits-and-doc-truth",
+      "command": [
+        "bun",
+        "scripts/check-bounded-waits.ts"
+      ],
+      "additionalCommands": [
+        ["bun", "scripts/check-doc-truth.ts"],
+        [
+          "bun",
+          "test",
+          "packages/webtransport/test/internal-doc-truth.test.ts"
+        ]
+      ],
+      "exitCode": 0,
+      "counts": {
+        "boundedWaitTestFiles": 87,
+        "boundedWaitCanonicalHelpers": 2,
+        "internalDocTruthPassed": 15,
+        "internalDocTruthFailed": 0
+      }
+    },
+    {
+      "name": "explicit-wasm-lanes",
+      "command": [
+        "bun",
+        "run",
+        "test:wasm"
+      ],
+      "additionalCommands": [
+        ["bun", "run", "test:wasm:interop"],
+        ["bun", "test", "packages/webtransport/test/parity-*.test.ts"]
+      ],
+      "exitCode": 0,
+      "counts": {
+        "wasmSuitePassed": 93,
+        "wasmSuiteFailed": 0,
+        "wasmInteropPassed": 1,
+        "wasmInteropFailed": 0,
+        "wasmParityPassed": 69,
+        "wasmParityFailed": 0
+      }
+    },
+    {
+      "name": "package-artifact-consumers",
+      "command": [
+        "bun",
+        "scripts/test-package-artifact.ts",
+        "build",
+        "--verify-reproducible",
+        "--runtime",
+        "bun",
+        "--runtime",
+        "node",
+        "--runtime",
+        "deno"
+      ],
+      "exitCode": 0,
+      "counts": {
+        "runtimesPassed": 3,
+        "runtimesFailed": 0,
+        "operationsPerRuntime": [
+          "import",
+          "datagram",
+          "uni",
+          "bidi",
+          "deterministic-close"
+        ]
+      }
+    },
+    {
+      "name": "authoritative-scale-and-load",
+      "command": [
+        "bun",
+        "tools/load/authoritative-scale.ts"
+      ],
+      "additionalCommands": [
+        ["bun", "tools/load/load-addon.ts"],
+        ["bun", "tools/load/load-profiles-addon.ts"]
+      ],
+      "exitCode": 0,
+      "counts": {
+        "scaleCycles": 2,
+        "scaleVerdictFailures": 0,
+        "processIsolatedNaturalExits": 2,
+        "processIsolatedForcedKills": 0,
+        "loadAddonSessions": 4,
+        "loadAddonDatagrams": 1806,
+        "loadAddonStreams": 138,
+        "loadProfilesPassed": 4
+      },
+      "rssPolicy": {
+        "inProcessResidency": "diagnostic-only",
+        "repeatedCycleComparison": "process-isolated",
+        "repeatedCycleVerdict": "pass",
+        "processIsolationVerdict": "pass",
+        "diagnosticFailures": 2
+      },
+      "artifact": {
+        "path": ".release-evidence/load/load-scale-artifact.json",
+        "sha256": "04a9810e507a3db49b085bf72449a8618cbb0a2707eb30ba9c849e7119a0a262"
+      }
+    },
+    {
+      "name": "native-chromium-interop",
+      "command": [
+        "bun",
+        "run",
+        "test:once",
+        "INTEROP_EVIDENCE=1"
+      ],
+      "exitCode": 0,
+      "startedAt": "2026-08-01T19:02:28.384Z",
+      "finishedAt": "2026-08-01T19:02:45.696Z",
+      "counts": {
+        "passed": 21,
+        "failed": 0,
+        "skipped": 0,
+        "flaky": 0
+      },
+      "artifact": {
+        "path": "tools/interop/interop-evidence.json",
+        "sha256": "f8401d45e3f4fe7e39226918fa77ea8bf65af482860d9b56d8a8e114625b2d6e"
+      }
+    },
+    {
+      "name": "wasm-chromium-interop",
+      "command": [
+        "bun",
+        "run",
+        "test:interop:wasm-server",
+        "INTEROP_EVIDENCE=1"
+      ],
+      "exitCode": 0,
+      "startedAt": "2026-08-01T19:03:08.922Z",
+      "finishedAt": "2026-08-01T19:03:17.998Z",
+      "counts": {
+        "passed": 7,
+        "failed": 0,
+        "skipped": 0,
+        "flaky": 0
+      },
+      "artifact": {
+        "path": "tools/interop/interop-evidence-wasm.json",
+        "sha256": "fa14184757bc2c984ee45247e630166862a01bc38af5fd5d6ee5e813665f62f4"
+      }
+    }
+  ],
+  "artifacts": {
+    "packageTarball": {
+      "path": "packages/webtransport/webtransport-bun-webtransport-1.0.0-rc.1.tgz",
+      "sha256": "13ef52732312e88e2b500e652613290e343dc73daa66744bd302aa6d8809ae8e",
+      "runtimes": [
+        "bun",
+        "node",
+        "deno"
+      ],
+      "status": "passed"
+    },
+    "fuzzReleaseSmoke": {
+      "path": ".release-evidence/fuzz/release-smoke.json",
+      "sha256": "c21f9c7b0b7dc9394ad5f79a9c7dd73783360948c446d094376f43a506783c83",
+      "status": "deferred",
+      "exitCode": 1,
+      "cargoFuzzTargets": 8,
+      "darwinLinkFailures": 8,
+      "parserAndDecoderHarnesses": "passed",
+      "reason": "Darwin arm64 sanitizer-coverage link fails; Linux/CI campaign remains required. The installed cargo-fuzz is 0.13.2 while the release policy pins 0.13.1."
+    }
+  },
+  "privacy": {
+    "status": "passed",
+    "validatedFiles": [
+      "tools/interop/interop-evidence.json",
+      "tools/interop/interop-evidence-wasm.json",
+      "docs/release-evidence/5db80f071085d951168e9438bc930add453fffe3/functional-readiness.json"
+    ],
+    "absolutePaths": false,
+    "sensitiveValuesPresent": false
+  },
+  "deferredGates": [
+    {
+      "id": "cross-platform-matrix",
+      "reason": "Hosted macOS, Linux, and Windows matrix is not available in this local run."
+    },
+    {
+      "id": "iwa-direct-sockets",
+      "reason": "Current signed IWA assets and signing authority are not available for a reproducible non-interactive proof."
+    },
+    {
+      "id": "coverage-gates",
+      "reason": "Pinned stable Rust rejects the nightly-only branch coverage flag; Bun coverage passed, native/WASM branch floors remain pending."
+    },
+    {
+      "id": "fuzz-gates",
+      "reason": "Darwin cargo-fuzz sanitizer-coverage linking is toolchain/host blocked; Linux/CI fuzz campaign remains required."
+    },
+    {
+      "id": "fault-matrix",
+      "reason": "The dedicated release fault-matrix artifact was not regenerated for this candidate."
+    },
+    {
+      "id": "soak-24h-72h",
+      "reason": "Long-running soak campaigns were intentionally not started."
+    },
+    {
+      "id": "auto-review-zero-p0-p4",
+      "reason": "Independent current reviews found no P0-P2 issue; a full P0-P4 release review artifact is still pending."
+    },
+    {
+      "id": "final-no-change-confirmation",
+      "reason": "Final freeze confirmation belongs to the evidence child handoff."
+    },
+    {
+      "id": "operator-release-work",
+      "reason": "Publishing, external credential rotation, and hosted release operations remain outside this local proof."
+    }
+  ],
+  "verdict": "Functional 1.0 candidate ready for the bounded local scope; GA/stable/distribution certification remains pending the explicitly deferred hosted, long-running, cross-platform, and operator-owned gates."
+}
