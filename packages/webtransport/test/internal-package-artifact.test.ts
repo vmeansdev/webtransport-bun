@@ -352,10 +352,11 @@ function createHangingNpm(root: string): string {
 	writeFileSync(
 		npm,
 		[
-			"#!/bin/sh",
-			'echo "fixture package helper stdout"',
-			'echo "fixture package helper stderr" >&2',
-			`exec "${process.execPath}" -e 'setInterval(() => {}, 1_000);'`,
+			`#!${process.execPath}`,
+			'const { writeSync } = require("node:fs");',
+			'writeSync(1, "fixture package helper stdout\\n");',
+			'writeSync(2, "fixture package helper stderr\\n");',
+			"setInterval(() => {}, 1_000);",
 		].join("\n"),
 		"utf8",
 	);
