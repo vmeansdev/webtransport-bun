@@ -44,7 +44,7 @@ Do not start the 24h or 72h campaign until the exact release candidate commit is
 Campaign requirements:
 
 1. Use `workflow_dispatch` on `soak-long` with the exact `candidate_commit`, `campaign_seed`, and `continuity_token` for every segment.
-2. On GitHub-hosted runners, use `segment_count=5` for 24h and `segment_count=15` for 72h, dispatching indices in order. Each 4.8h workload leaves setup, cleanup, and artifact-upload headroom under GitHub's hard 6h job limit. On self-hosted runners use `segment_count=4` or `12` respectively. The workflow resolves each predecessor artifact and `finalStateHash` itself; a missing or invalid predecessor stops the next segment.
+2. On GitHub-hosted runners, use `segment_count=5` for 24h and `segment_count=15` for 72h, dispatching indices in order. Each 4.8h workload leaves setup, cleanup, and artifact-upload headroom under GitHub's hard 6h job limit. On self-hosted runners use `segment_count=1` for both 24h and 72h, matching the executable workflow's single long-lived runner policy. The workflow resolves each predecessor artifact and `finalStateHash` itself; a missing or invalid predecessor stops the next segment.
 3. Keep the same Bun, Rust, resolved CC/CXX paths and versions, and checkout commit for the whole chain. The harness records them and aggregation rejects drift.
 4. The final segment automatically downloads all prior artifacts for that candidate and performs mandatory aggregation. No manual side-loaded directory is accepted by the release workflow. For forensic local re-verification only, run `bun tools/load/soak-addon.ts aggregate /path/to/segment-artifacts`.
 5. Aggregation is release-blocking. It rejects:
@@ -60,7 +60,7 @@ Campaign requirements:
 Self-hosted runner requirements:
 
 1. Linux x64 runner tagged `soak` with stable `clang` or `gcc-10+`, exact release-policy Bun and Rust versions, `openssl`, GitHub CLI (`gh`), `jq`, and `unzip`, plus enough headroom for the configured session/datagram/stream profile.
-2. The workflow uses bounded 4x6h or 12x6h segments on self-hosted runners. Each segment must produce the same tamper-evident hash-chained JSON/CSV artifact set, and the final aggregate is mandatory.
+2. The workflow uses one 24h or 72h segment (`segment_count=1`) on self-hosted runners. That segment must produce the same tamper-evident hash-chained JSON/CSV artifact set, and the final aggregate is mandatory.
 
 Workflow artifact naming contract:
 
