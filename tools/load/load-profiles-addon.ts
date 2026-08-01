@@ -8,6 +8,7 @@
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { $ } from "bun";
 import { existsSync } from "node:fs";
+import { createLoadSessionHandler } from "./soak-addon.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/debug/load-client`;
@@ -32,6 +33,7 @@ async function runProfile(
 	datagramsPerSec: number,
 	streamsPerSec: number,
 	maxSessionErrors: number,
+	maxStreamErrors: number,
 	rateLimits?: { handshakesBurst?: number; handshakesPerSec?: number },
 ): Promise<{ pass: boolean; msg: string }> {
 	await killPort4433();
@@ -41,7 +43,7 @@ async function runProfile(
 		tls: { certPem: "", keyPem: "" },
 		limits: { maxSessions: Math.min(sessions + 50, 5000) },
 		rateLimits: rateLimits ?? undefined,
-		onSession: () => {},
+		onSession: createLoadSessionHandler(`load-profiles-addon:${name}`),
 	});
 	await Bun.sleep(5000);
 
@@ -60,6 +62,8 @@ async function runProfile(
 			String(streamsPerSec),
 			"--max-session-errors",
 			String(maxSessionErrors),
+			"--max-stream-errors",
+			String(maxStreamErrors),
 		],
 		{
 			cwd: ROOT,
@@ -70,6 +74,7 @@ async function runProfile(
 	);
 
 	const exitCode = await client.exited;
+	const stdout = client.stdout ? await new Response(client.stdout).text() : "";
 	const stderr = client.stderr ? await new Response(client.stderr).text() : "";
 	await server.close();
 	await Bun.sleep(3000);
@@ -78,7 +83,16 @@ async function runProfile(
 		return { pass: false, msg: "load-client panicked" };
 	}
 	if (exitCode !== 0) {
-		return { pass: false, msg: `load-client exited ${exitCode}` };
+		const diagnostic = [stdout, stderr]
+			.join("\n")
+			.trim()
+			.split("\n")
+			.slice(-12)
+			.join("\\n");
+		return {
+			pass: false,
+			msg: `load-client exited ${exitCode}${diagnostic ? `: ${diagnostic}` : ""}`,
+		};
 	}
 	return { pass: true, msg: "PASS" };
 }
@@ -96,6 +110,7 @@ async function main() {
 		dg: number;
 		st: number;
 		maxErr: number;
+		maxStreamErr: number;
 		rateLimits?: { handshakesBurst?: number; handshakesPerSec?: number };
 	}> = [
 		{
@@ -105,6 +120,7 @@ async function main() {
 			dg: 1,
 			st: 1,
 			maxErr: 5,
+			maxStreamErr: 0,
 		},
 		{
 			name: "stream-open flood",
@@ -113,6 +129,9 @@ async function main() {
 			dg: 5,
 			st: 50,
 			maxErr: 0,
+			// This profile intentionally drives stream-cap/backpressure shedding;
+			// keep the rejection budget bounded while requiring all probes to pass.
+			maxStreamErr: 1000,
 		},
 		{
 			name: "datagram flood",
@@ -121,6 +140,7 @@ async function main() {
 			dg: 500,
 			st: 2,
 			maxErr: 0,
+			maxStreamErr: 0,
 		},
 		{
 			name: "mixed realistic",
@@ -129,6 +149,7 @@ async function main() {
 			dg: 80,
 			st: 8,
 			maxErr: 0,
+			maxStreamErr: 0,
 		},
 		{
 			name: "contention (P2.3-A)",
@@ -137,6 +158,7 @@ async function main() {
 			dg: 60,
 			st: 15,
 			maxErr: 8,
+			maxStreamErr: 0,
 			rateLimits: { handshakesBurst: 4, handshakesPerSec: 10 },
 		},
 	];
@@ -151,6 +173,7 @@ async function main() {
 			p.dg,
 			p.st,
 			p.maxErr,
+			p.maxStreamErr,
 			p.rateLimits,
 		);
 		if (r.pass) {
