@@ -109,6 +109,7 @@ function createFixtureTarball(root: string): string {
 function createHangingRuntime(root: string, descendantPidFile: string): string {
 	const source = join(root, "fake-deno.c");
 	const runtime = join(root, "fake-deno");
+	const launcher = join(root, "fake-deno-launcher.sh");
 	writeFileSync(
 		source,
 		[
@@ -130,7 +131,6 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 			'    puts("deno 2.9.3");',
 			"    return 0;",
 			"  }",
-			'  write_text(getenv("WT_FIXTURE_STARTED_FILE"), "started");',
 			"  pid_t child = fork();",
 			"  if (child < 0) return 1;",
 			"  if (child == 0) {",
@@ -159,8 +159,21 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 			`fixture C runtime compilation failed (${compiled.status ?? compiled.signal ?? "unknown"})\n${compiled.stdout ?? ""}${compiled.stderr ?? ""}`,
 		);
 	}
+	writeFileSync(
+		launcher,
+		[
+			"#!/bin/sh",
+			'if [ "${1:-}" != "--version" ] && [ -n "${WT_FIXTURE_STARTED_FILE:-}" ]; then',
+			'  printf "started" > "$WT_FIXTURE_STARTED_FILE"',
+			"fi",
+			`exec '${runtime.replaceAll("'", "'\\''")}' "$@"`,
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	chmodSync(launcher, 0o755);
 	trackedPidFiles.push(descendantPidFile);
-	return runtime;
+	return launcher;
 }
 
 function processIsAlive(pid: number): boolean {
