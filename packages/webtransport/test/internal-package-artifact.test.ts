@@ -106,7 +106,11 @@ function createFixtureTarball(root: string): string {
 	return join(pkgDir, filename);
 }
 
-function createHangingRuntime(root: string, descendantPidFile: string): string {
+function createHangingRuntime(
+	root: string,
+	descendantPidFile: string,
+	startedFile: string,
+): string {
 	const source = join(root, "fake-deno.c");
 	const runtime = join(root, "fake-deno");
 	const launcher = join(root, "fake-deno-launcher.sh");
@@ -163,9 +167,11 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 		launcher,
 		[
 			"#!/bin/sh",
-			'if [ "${1:-}" != "--version" ] && [ -n "${WT_FIXTURE_STARTED_FILE:-}" ]; then',
-			'  printf "started" > "$WT_FIXTURE_STARTED_FILE"',
+			'if [ "${1:-}" = "--version" ]; then',
+			'  printf "deno 2.9.3\\n"',
+			"  exit 0",
 			"fi",
+			`  printf "started" > '${startedFile.replaceAll("'", "'\\''")}'`,
 			`exec '${runtime.replaceAll("'", "'\\''")}' "$@"`,
 			"",
 		].join("\n"),
@@ -474,7 +480,11 @@ describe.serial("package artifact cleanup", () => {
 			const tarball = createFixtureTarball(root);
 			const descendantPidFile = join(root, "descendant.pid");
 			const smokeStartedFile = join(root, "smoke.started");
-			const runtime = createHangingRuntime(root, descendantPidFile);
+			const runtime = createHangingRuntime(
+				root,
+				descendantPidFile,
+				smokeStartedFile,
+			);
 			const fixtureEnv = {
 				...process.env,
 				WEBTRANSPORT_DENO_COMMAND: runtime,
@@ -483,17 +493,7 @@ describe.serial("package artifact cleanup", () => {
 				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
 				NPM_CONFIG_OFFLINE: "true",
 				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
-				WT_FIXTURE_STARTED_FILE: smokeStartedFile,
 			};
-			const probe = spawnSync(runtime, ["--version"], {
-				env: fixtureEnv,
-				encoding: "utf8",
-				stdio: "ignore",
-				timeout: 5_000,
-				killSignal: "SIGKILL",
-			});
-			expect(probe.error).toBeUndefined();
-			expect(probe.status).toBe(0);
 			const guardedResult = runGuarded(
 				[
 					"scripts/test-package-artifact.ts",
