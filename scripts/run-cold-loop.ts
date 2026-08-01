@@ -187,10 +187,16 @@ export async function runChild(
 
 	let timedOut = false;
 	let cleanup: Promise<void> | undefined;
-	const timer = globalThis.setTimeout(() => {
-		timedOut = true;
-		cleanup = killProcessTree(child.pid);
-	}, timeoutMs);
+	let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+	// A loaded host can delay exec after spawn() returns. Start the bounded
+	// command deadline once the child has actually spawned, matching the
+	// package-artifact command runner's startup contract.
+	child.once("spawn", () => {
+		timer = globalThis.setTimeout(() => {
+			timedOut = true;
+			cleanup = killProcessTree(child.pid);
+		}, timeoutMs);
+	});
 
 	let result: { code: number | null; signal: NodeJS.Signals | null };
 	try {
@@ -202,12 +208,12 @@ export async function runChild(
 			child.once("exit", (code, signal) => resolvePromise({ code, signal }));
 		});
 	} catch (error) {
-		globalThis.clearTimeout(timer);
+		if (timer !== undefined) globalThis.clearTimeout(timer);
 		await (cleanup ?? killProcessTree(child.pid));
 		throw error;
 	}
 
-	globalThis.clearTimeout(timer);
+	if (timer !== undefined) globalThis.clearTimeout(timer);
 	if (timedOut) {
 		await (cleanup ?? killProcessTree(child.pid));
 		throw new Error(`${label} timed out after ${timeoutMs}ms`);
