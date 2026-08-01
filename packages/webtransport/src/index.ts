@@ -2,7 +2,7 @@
  * @packageDocumentation
  * @module @webtransport-bun/webtransport
  *
- * Production-ready WebTransport for Bun, backed by napi-rs + wtransport (Rust).
+ * Release-candidate WebTransport for Bun, backed by napi-rs + wtransport (Rust).
  * Supports in-process server, client (Node API and W3C-style facade), datagrams, and streams.
  */
 
