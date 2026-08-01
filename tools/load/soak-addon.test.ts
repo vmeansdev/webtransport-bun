@@ -22,6 +22,7 @@ import {
 const ROOT = join(import.meta.dir, "..", "..");
 const HARNESS = join(import.meta.dir, "soak-addon.ts");
 const WORKFLOW = join(ROOT, ".github", "workflows", "soak-long.yml");
+const SOAK_INPUT_VALIDATOR = join(ROOT, "scripts", "validate-soak-inputs.sh");
 const tempRoots: string[] = [];
 
 type SegmentArtifact = Parameters<typeof aggregateSegments>[0][number];
@@ -562,25 +563,36 @@ describe("hosted soak orchestration policy", () => {
 
 	test("caps each job and soak step near one hosted segment", () => {
 		const workflow = readFileSync(WORKFLOW, "utf8");
+		const validator = readFileSync(SOAK_INPUT_VALIDATOR, "utf8");
 		expect(workflow).toContain(
 			"github.event.inputs.runner_type == 'github-hosted' && 330 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4380 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1500 || 390)",
 		);
 		expect(workflow).toContain(
 			"github.event.inputs.runner_type == 'github-hosted' && 300 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4350 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1470 || 365)",
 		);
-		expect(workflow).toContain('"github-hosted:24:5"');
-		expect(workflow).toContain('"github-hosted:72:15"');
-		expect(workflow).toContain('"self-hosted:24:1"');
-		expect(workflow).toContain('"self-hosted:72:1"');
+		expect(workflow).toContain("bash scripts/validate-soak-inputs.sh");
+		expect(validator).toContain('"github-hosted:shared:24:5"');
+		expect(validator).toContain('"github-hosted:dedicated:24:5"');
+		expect(validator).toContain('"github-hosted:shared:72:15"');
+		expect(validator).toContain('"github-hosted:dedicated:72:15"');
+		expect(validator).toContain('"self-hosted:shared:24:1"');
+		expect(validator).toContain('"self-hosted:dedicated:24:1"');
+		expect(validator).toContain('"self-hosted:shared:72:1"');
+		expect(validator).toContain('"self-hosted:dedicated:72:1"');
 		expect(workflow).not.toContain("44640");
 	});
 
 	test("permits one-run self-hosted long soaks while retaining hosted segmentation", () => {
 		const workflow = readFileSync(WORKFLOW, "utf8");
-		expect(workflow).toContain('"self-hosted:24:1"');
-		expect(workflow).toContain('"self-hosted:72:1"');
-		expect(workflow).toContain('"github-hosted:24:5"');
-		expect(workflow).toContain('"github-hosted:72:15"');
+		const validator = readFileSync(SOAK_INPUT_VALIDATOR, "utf8");
+		expect(validator).toContain('"self-hosted:shared:24:1"');
+		expect(validator).toContain('"self-hosted:dedicated:24:1"');
+		expect(validator).toContain('"self-hosted:shared:72:1"');
+		expect(validator).toContain('"self-hosted:dedicated:72:1"');
+		expect(validator).toContain('"github-hosted:shared:24:5"');
+		expect(validator).toContain('"github-hosted:dedicated:24:5"');
+		expect(validator).toContain('"github-hosted:shared:72:15"');
+		expect(validator).toContain('"github-hosted:dedicated:72:15"');
 		expect(workflow).toContain(
 			"24h/72h github-hosted campaigns must use bounded multi-job segments",
 		);
