@@ -474,12 +474,15 @@ describe.serial("package artifact cleanup", () => {
 				},
 				45_000,
 			);
+			// Wait for the fixture's durable startup marker before starting the
+			// cleanup stopwatch. The smoke deadline still starts in the production
+			// command after its child has spawned; this assertion measures only the
+			// bounded cleanup path and cannot turn delayed fixture startup into a
+			// cleanup failure.
+			const smokeStarted = await fileAppearsWithin(smokeStartedFile, 30_000);
 			const startedAt = Date.now();
 			const result = await guardedResult;
 			const elapsedMs = Date.now() - startedAt;
-			// The guarded command has settled before this bounded marker check, so a
-			// delayed filesystem observation cannot race process-tree cleanup.
-			const smokeStarted = await fileAppearsWithin(smokeStartedFile, 1_000);
 
 			expect(smokeStarted).toBe(true);
 			expect(result.error).toBeUndefined();
