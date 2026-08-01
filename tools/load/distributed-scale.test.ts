@@ -38,6 +38,21 @@ const ZERO_GAUGES: FinalGauges = {
 };
 
 describe("Task 14 distributed scale evidence", () => {
+	test("starts the child watchdog after the process spawn event", () => {
+		const source = readFileSync(
+			new URL("./distributed-scale.ts", import.meta.url),
+			"utf8",
+		);
+		const helperStart = source.indexOf(
+			"export async function runCommandWithBoundedOutput",
+		);
+		const helper = source.slice(helperStart);
+
+		expect(helper).toContain('child.once("spawn"');
+		expect(helper).toContain("setTimeout");
+		expect(helper).toContain("outerTimeoutMs");
+	});
+
 	test("the live harness uses server observations and an explicit overload phase", () => {
 		const source = readFileSync(
 			new URL("./distributed-scale.ts", import.meta.url),

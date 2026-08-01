@@ -552,10 +552,35 @@ export async function runCommandWithBoundedOutput(
 	const drainTimeoutMs = options.drainTimeoutMs ?? CHILD_DRAIN_TIMEOUT_MS;
 	let timedOut = false;
 	let forceKilled = false;
-	let exit = await Promise.race([
-		exitPromise.then((value) => ({ kind: "exit" as const, value })),
-		Bun.sleep(outerTimeoutMs).then(() => ({ kind: "timeout" as const })),
-	]);
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	let timeoutResolve!: () => void;
+	const timeoutPromise = new Promise<void>((resolve) => {
+		timeoutResolve = resolve;
+	});
+	let watchdogStarted = false;
+	let commandSettled = false;
+	const startWatchdog = () => {
+		if (watchdogStarted || commandSettled) return;
+		watchdogStarted = true;
+		timeoutHandle = setTimeout(timeoutResolve, outerTimeoutMs);
+	};
+	// Start the command deadline after the child has actually spawned. A loaded
+	// host can delay process startup after spawn() returns; counting that
+	// scheduler latency as command runtime can create a false timeout verdict.
+	child.once("spawn", startWatchdog);
+	let exit:
+		| { kind: "exit"; value: { code: number | null; signal: string | null } }
+		| { kind: "timeout" };
+	try {
+		exit = await Promise.race([
+			exitPromise.then((value) => ({ kind: "exit" as const, value })),
+		timeoutPromise.then(() => ({ kind: "timeout" as const })),
+		]);
+	} finally {
+		commandSettled = true;
+		if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+		child.removeListener("spawn", startWatchdog);
+	}
 	if (exit.kind === "timeout") {
 		timedOut = true;
 		forceKilled = await terminateProcessTree(
