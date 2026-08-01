@@ -485,10 +485,13 @@ describe.serial("package artifact cleanup", () => {
 				descendantPidFile,
 				smokeStartedFile,
 			);
+			// Keep the smoke deadline finite while giving a cold native fixture
+			// enough scheduler headroom to emit the diagnostics this test verifies.
+			const smokeTimeoutMs = 3_000;
 			const fixtureEnv = {
 				...process.env,
 				WEBTRANSPORT_DENO_COMMAND: runtime,
-				WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: "1500",
+				WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: String(smokeTimeoutMs),
 				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
 				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
 				NPM_CONFIG_OFFLINE: "true",
@@ -530,7 +533,9 @@ describe.serial("package artifact cleanup", () => {
 			expect(smokeStarted).toBe(true);
 			expect(result.error).toBeUndefined();
 			expect(result.status).toBe(1);
-			expect(result.stderr).toContain("deno smoke timed out after 1500ms");
+			expect(result.stderr).toContain(
+				`deno smoke timed out after ${smokeTimeoutMs}ms`,
+			);
 			expect(result.stderr).toContain("fixture smoke started");
 			expect(result.stderr).toContain("fixture smoke stderr");
 			expect(elapsedMs).toBeLessThan(5_000);
@@ -647,7 +652,10 @@ describe.serial("package artifact cleanup", () => {
 			const descendantPidFile = join(root, "descendant.pid");
 			const child = spawnHangingProcessTree(descendantPidFile);
 			await waitForFile(descendantPidFile);
-			const taskkillTimeoutMs = 3_000;
+			// Keep the fixture deadline finite, but give a cold Node helper enough
+			// scheduler headroom to start and emit its intended nonzero exit under
+			// the repeated package verifier.
+			const taskkillTimeoutMs = 10_000;
 			const cleanupError = await capturedError(
 				runBoundedWindowsTreeKill(
 					child.pid as number,
