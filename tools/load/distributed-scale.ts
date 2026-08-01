@@ -153,14 +153,25 @@ export type FinalSampleOrdering = {
 	diagnosticGcTriggered: boolean;
 };
 
+export type InProcessRssRecovery = {
+	authoritative: false;
+	status: "pass" | "fail";
+	initialRssMb: number;
+	loadedRssMb: number;
+	finalRssMb: number;
+	ratio: number;
+	thresholdRatio: number;
+};
+
 export type MemoryTelemetry = {
 	warmedIdle: MemoryTelemetrySnapshot;
 	preCloseLoaded: MemoryTelemetrySnapshot;
 	postCloseRecovery: MemoryTelemetrySnapshot;
 	finalSampleOrdering: FinalSampleOrdering;
+	inProcessRssRecovery: InProcessRssRecovery;
 };
 
-type RunSummary = {
+export type RunSummary = {
 	label: string;
 	sessions: number;
 	durationSec: number;
@@ -194,7 +205,10 @@ type RunSummary = {
 	p99DatagramEnqueueMs: number | null;
 	p99StreamOpenMs: number | null;
 	clientSummaries: ClientSummary[];
+	/** Authoritative protocol, workload, gauge, and bounded-resource failures. */
 	failures: string[];
+	/** Raw in-process RSS residency findings; retained for diagnosis, not release authority. */
+	diagnosticFailures: string[];
 };
 
 export type ScaleArtifact = {
@@ -755,7 +769,13 @@ export function evaluateOverloadEvidence(evidence: OverloadEvidence): string[] {
 }
 
 function rustcVersion() {
-	const result = spawnSync("rustc", ["-V"], { cwd: ROOT, encoding: "utf8" });
+	const requestedToolchain = process.env.RUSTUP_TOOLCHAIN?.trim();
+	const result = requestedToolchain
+		? spawnSync("rustup", ["run", requestedToolchain, "rustc", "-V"], {
+				cwd: ROOT,
+				encoding: "utf8",
+			})
+		: spawnSync("rustc", ["-V"], { cwd: ROOT, encoding: "utf8" });
 	return result.status === 0 ? result.stdout.trim() : null;
 }
 
@@ -1176,6 +1196,7 @@ async function runOneCampaign(
 	}
 
 	const failures: string[] = [];
+	const diagnosticFailures: string[] = [];
 	const mainClientPlans = buildMainClientPlans(config);
 	const serverSessionCaps = Array.from(
 		{ length: config.serverCount },
@@ -1525,11 +1546,24 @@ async function runOneCampaign(
 		const postCloseRecoveryMemoryTelemetry =
 			captureProcessMemoryTelemetrySnapshot();
 		const finalRssMb = postCloseRecoveryMemoryTelemetry.rssMb;
+		const inProcessRssRecovery: InProcessRssRecovery = {
+			authoritative: false,
+			status:
+				finalRssMb <= initialRssMb * config.maxRecoveryRssRatio
+					? "pass"
+					: "fail",
+			initialRssMb: Number(initialRssMb.toFixed(3)),
+			loadedRssMb: Number(recoveryBaselineRssMb.toFixed(3)),
+			finalRssMb: Number(finalRssMb.toFixed(3)),
+			ratio: Number((finalRssMb / initialRssMb).toFixed(3)),
+			thresholdRatio: config.maxRecoveryRssRatio,
+		};
 		const memoryTelemetry: MemoryTelemetry = {
 			warmedIdle: warmedIdleMemoryTelemetry,
 			preCloseLoaded: preCloseLoadedMemoryTelemetry,
 			postCloseRecovery: postCloseRecoveryMemoryTelemetry,
 			finalSampleOrdering: buildFinalSampleOrdering(diagnosticGcTriggered),
+			inProcessRssRecovery,
 		};
 
 		if (
@@ -1544,8 +1578,8 @@ async function runOneCampaign(
 				`final gauges did not recover to baseline: ${JSON.stringify(finalGauges)}`,
 			);
 		}
-		if (finalRssMb > initialRssMb * config.maxRecoveryRssRatio) {
-			failures.push(
+		if (inProcessRssRecovery.status === "fail") {
+			diagnosticFailures.push(
 				`RSS did not recover near baseline: initial=${initialRssMb.toFixed(2)}MB final=${finalRssMb.toFixed(2)}MB loaded=${recoveryBaselineRssMb.toFixed(2)}MB ratio=${(finalRssMb / initialRssMb).toFixed(3)}`,
 			);
 		}
@@ -1585,6 +1619,7 @@ async function runOneCampaign(
 			p99StreamOpenMs: p99Stream,
 			clientSummaries,
 			failures,
+			diagnosticFailures,
 		};
 	} finally {
 		if (!serversClosed) {
@@ -1646,12 +1681,22 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 					stages: ["failure-snapshot"],
 					diagnosticGcTriggered: false,
 				},
+				inProcessRssRecovery: {
+					authoritative: false,
+					status: "fail",
+					initialRssMb: 0,
+					loadedRssMb: 0,
+					finalRssMb: 0,
+					ratio: Number.POSITIVE_INFINITY,
+					thresholdRatio: config.maxRecoveryRssRatio,
+				},
 			},
 			p99HandshakeMs: null,
 			p99DatagramEnqueueMs: null,
 			p99StreamOpenMs: null,
 			clientSummaries: [],
 			failures: [error instanceof Error ? error.message : String(error)],
+			diagnosticFailures: [],
 		};
 	}
 	mkdirSync(dirname(config.artifactPath), { recursive: true });

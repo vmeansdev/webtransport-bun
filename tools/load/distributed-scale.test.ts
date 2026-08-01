@@ -288,6 +288,15 @@ describe("Task 14 distributed scale evidence", () => {
 				arrayBuffers: 3 * 1024 * 1024,
 			}),
 			finalSampleOrdering: buildFinalSampleOrdering(true),
+			inProcessRssRecovery: {
+				authoritative: false as const,
+				status: "fail" as const,
+				initialRssMb: 48,
+				loadedRssMb: 450,
+				finalRssMb: 451,
+				ratio: 9.396,
+				thresholdRatio: 1.25,
+			},
 		};
 		const artifact = buildScaleArtifact(
 			validConfig(),

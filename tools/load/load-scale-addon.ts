@@ -2,10 +2,13 @@
 
 import { resolve } from "node:path";
 
-import { runScaleCampaign } from "./distributed-scale.ts";
+import {
+	runScaleCampaign,
+	type ScaleCampaignConfig,
+} from "./distributed-scale.ts";
 
-async function main() {
-	const summary = await runScaleCampaign({
+export function loadScaleConfigFromEnv(): ScaleCampaignConfig {
+	return {
 		label: process.env.LOAD_SCALE_LABEL ?? "load-scale-addon",
 		sessions: Number(process.env.LOAD_SCALE_SESSIONS ?? "200"),
 		durationSec: Number(process.env.LOAD_SCALE_DURATION ?? "30"),
@@ -41,7 +44,17 @@ async function main() {
 		artifactPath:
 			process.env.LOAD_SCALE_ARTIFACT_OUT ??
 			resolve(process.cwd(), ".release-evidence/load/load-scale-artifact.json"),
-	});
+	};
+}
+
+export async function runLoadScaleAddon(): Promise<
+	Awaited<ReturnType<typeof runScaleCampaign>>
+> {
+	return runScaleCampaign(loadScaleConfigFromEnv());
+}
+
+async function main() {
+	const summary = await runLoadScaleAddon();
 
 	console.log(JSON.stringify(summary, null, 2));
 	if (summary.failures.length > 0) {
@@ -49,7 +62,9 @@ async function main() {
 	}
 }
 
-main().catch((error) => {
-	console.error(error);
-	process.exit(1);
-});
+if (import.meta.main) {
+	main().catch((error) => {
+		console.error(error);
+		process.exit(1);
+	});
+}
