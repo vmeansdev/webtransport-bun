@@ -112,6 +112,7 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 	writeFileSync(
 		source,
 		[
+			"#include <fcntl.h>",
 			"#include <stdio.h>",
 			"#include <stdlib.h>",
 			"#include <string.h>",
@@ -119,10 +120,10 @@ function createHangingRuntime(root: string, descendantPidFile: string): string {
 			"#include <unistd.h>",
 			"static void write_text(const char *path, const char *text) {",
 			"  if (path == NULL) return;",
-			'  FILE *file = fopen(path, "w");',
-			"  if (file == NULL) return;",
-			"  fputs(text, file);",
-			"  fclose(file);",
+			"  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);",
+			"  if (fd < 0) return;",
+			"  (void)write(fd, text, strlen(text));",
+			"  close(fd);",
 			"}",
 			"int main(int argc, char **argv) {",
 			'  if (argc > 1 && strcmp(argv[1], "--version") == 0) {',
@@ -461,6 +462,25 @@ describe.serial("package artifact cleanup", () => {
 			const descendantPidFile = join(root, "descendant.pid");
 			const smokeStartedFile = join(root, "smoke.started");
 			const runtime = createHangingRuntime(root, descendantPidFile);
+			const fixtureEnv = {
+				...process.env,
+				WEBTRANSPORT_DENO_COMMAND: runtime,
+				WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: "1500",
+				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
+				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
+				NPM_CONFIG_OFFLINE: "true",
+				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
+				WT_FIXTURE_STARTED_FILE: smokeStartedFile,
+			};
+			const probe = spawnSync(runtime, ["--version"], {
+				env: fixtureEnv,
+				encoding: "utf8",
+				stdio: "ignore",
+				timeout: 5_000,
+				killSignal: "SIGKILL",
+			});
+			expect(probe.error).toBeUndefined();
+			expect(probe.status).toBe(0);
 			const guardedResult = runGuarded(
 				[
 					"scripts/test-package-artifact.ts",
@@ -469,15 +489,7 @@ describe.serial("package artifact cleanup", () => {
 					"--runtime",
 					"deno",
 				],
-				{
-					...process.env,
-					WEBTRANSPORT_DENO_COMMAND: runtime,
-					WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: "1500",
-					WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
-					WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
-					WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
-					WT_FIXTURE_STARTED_FILE: smokeStartedFile,
-				},
+				fixtureEnv,
 				45_000,
 			);
 			// Wait for the fixture's durable startup marker before starting the
