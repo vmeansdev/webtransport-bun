@@ -59,7 +59,9 @@ afterEach(() => {
 
 function createFixtureTarball(root: string): string {
 	const pkgDir = join(root, "fixture-package");
+	const npmCacheDir = join(root, ".npm-cache");
 	mkdirSync(pkgDir, { recursive: true });
+	mkdirSync(npmCacheDir, { recursive: true });
 	writeFileSync(
 		join(pkgDir, "package.json"),
 		JSON.stringify({
@@ -76,6 +78,10 @@ function createFixtureTarball(root: string): string {
 	);
 	const packed = spawnSync("npm", ["pack", "--quiet"], {
 		cwd: pkgDir,
+		env: {
+			...process.env,
+			NPM_CONFIG_CACHE: npmCacheDir,
+		},
 		encoding: "utf8",
 	});
 	if (packed.status !== 0) {
@@ -95,23 +101,33 @@ function createFixtureTarball(root: string): string {
 }
 
 function createHangingRuntime(root: string, descendantPidFile: string): string {
-	const runtime = join(root, "fake-deno.sh");
+	const runtime = join(root, "fake-deno.js");
+	const descendant = join(root, "fake-deno-descendant.js");
 	writeFileSync(
-		runtime,
+		descendant,
 		[
-			"#!/bin/sh",
-			'if [ "$1" = "--version" ]; then',
-			'  echo "deno 2.9.3"',
-			"  exit 0",
-			"fi",
-			`"${process.execPath}" -e '`,
 			'const { writeFileSync } = require("node:fs");',
 			"writeFileSync(process.env.WT_FIXTURE_DESCENDANT_PID_FILE, String(process.pid));",
 			'console.log("fixture smoke started");',
 			'console.error("fixture smoke stderr");',
 			"setInterval(() => {}, 1_000);",
-			`' -- "$@" &`,
-			'wait "$!"',
+		].join("\n"),
+		"utf8",
+	);
+	writeFileSync(
+		runtime,
+		[
+			"#!/usr/bin/env node",
+			'const { spawn } = require("node:child_process");',
+			'if (process.argv[2] === "--version") {',
+			'  console.log("deno 2.9.3");',
+			"  process.exit(0);",
+			"}",
+			`const child = spawn(process.execPath, [${JSON.stringify(descendant)}], {`,
+			'  stdio: "inherit",',
+			"});",
+			"if (child.pid === undefined) process.exit(1);",
+			"setInterval(() => {}, 1_000);",
 		].join("\n"),
 		"utf8",
 	);
