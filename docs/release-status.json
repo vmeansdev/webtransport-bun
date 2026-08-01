@@ -92,7 +92,7 @@
 			"status": "pending",
 			"evidenceIds": [],
 			"gaRequired": true,
-			"notes": "Darwin arm64 cargo-fuzz sanitizer-coverage link is blocked; Linux/CI campaign remains required."
+			"notes": "Darwin arm64 cargo-fuzz sanitizer-coverage link is blocked; observed cargo-fuzz 0.13.2 also differs from pinned 0.13.1; Linux/CI campaign remains required."
 		},
 		{
 			"id": "scale-10k-multisource",
