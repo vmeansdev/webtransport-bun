@@ -72,6 +72,9 @@ LOAD_SCALE_SESSIONS=200 LOAD_SCALE_DURATION=30 bun run test:load-scale-addon
 echo "[ci-local] load-profiles-addon"
 bun run test:load-profiles-addon
 
+echo "[ci-local] install interop deps and Chromium"
+(cd tools/interop && bun install --frozen-lockfile && bun run install:browsers)
+
 echo "[ci-local] interop (fresh process x${WEBTRANSPORT_COLD_LOOP_COUNT:-10})"
 bun run test:interop
 
