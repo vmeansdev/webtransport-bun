@@ -37,7 +37,7 @@ GitHub-hosted Actions jobs are capped at ~6 hours. A single 24h/72h soak cannot 
 | Stage | Soak requirement | Artifact |
 |-------|------------------|----------|
 | RC | 1h soak recommended | `soak-aggregate-1h-<commit>` from `soak-long` |
-| Stable | 24h soak mandatory (P2.2-A); 72h recommended | complete segmented campaign aggregate, plus chained segment artifacts such as `soak-segment-24h-<commit>-seg01of05` and final `soak-aggregate-24h-<commit>` |
+| Stable | 24h and 72h soaks mandatory (P2.2-A/P2.2-B) | complete segmented campaign aggregates for both durations, plus chained segment artifacts such as `soak-segment-24h-<commit>-seg01of05` and final `soak-aggregate-24h-<commit>` |
 
 Do not start the 24h or 72h campaign until the exact release candidate commit is frozen. Any code, config, dependency, toolchain, or workflow change after segment 1 invalidates the campaign and requires a full restart from segment 1.
 
