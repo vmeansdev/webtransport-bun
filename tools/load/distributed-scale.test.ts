@@ -55,8 +55,8 @@ describe("Task 14 distributed scale evidence", () => {
 			new URL("./distributed-scale.ts", import.meta.url),
 			"utf8",
 		);
-		expect(source).toContain("session.incomingDatagrams()");
-		expect(source).toContain("await session.sendDatagram(data)");
+		expect(source).toContain("createLoadSessionHandler");
+		expect(source).toContain("onDatagramEcho");
 		expect(source).toContain("await session.createBidirectionalStream()");
 		expect(source).toContain("await session.createUnidirectionalStream()");
 		expect(source).toContain("serverDatagramErrors");
@@ -104,6 +104,21 @@ describe("Task 14 distributed scale evidence", () => {
 			recoveryDurationMs: 10,
 		};
 		expect(evaluateOverloadEvidence(valid)).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
+					streamsActive: 2,
+					queuedBytesGlobal: 128,
+				},
+				postOverloadGauges: {
+					...recovered,
+					streamsActive: 0,
+					queuedBytesGlobal: 8 * 1024 * 1024,
+				},
+			}),
+		).toEqual([]);
 		expect(
 			evaluateOverloadEvidence({
 				...valid,

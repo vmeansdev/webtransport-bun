@@ -162,6 +162,53 @@ const PROBE_BIDI_RESET_PREFIX = `${PROBE_PREFIX}bidi-reset:`;
 const LOAD_UNI_PREFIX = `${LOAD_PREFIX}uni:`;
 const LOAD_BIDI_PREFIX = `${LOAD_PREFIX}bidi:`;
 
+const UTF8_ENCODER = new TextEncoder();
+const PROBE_DATAGRAM_PREFIX_BYTES = UTF8_ENCODER.encode(PROBE_DATAGRAM_PREFIX);
+const PROBE_UNI_ECHO_PREFIX_BYTES = UTF8_ENCODER.encode(PROBE_UNI_ECHO_PREFIX);
+const PROBE_UNI_STOP_PREFIX_BYTES = UTF8_ENCODER.encode(PROBE_UNI_STOP_PREFIX);
+const PROBE_BIDI_ECHO_PREFIX_BYTES = UTF8_ENCODER.encode(
+	PROBE_BIDI_ECHO_PREFIX,
+);
+const PROBE_BIDI_RESET_PREFIX_BYTES = UTF8_ENCODER.encode(
+	PROBE_BIDI_RESET_PREFIX,
+);
+const LOAD_UNI_PREFIX_BYTES = UTF8_ENCODER.encode(LOAD_UNI_PREFIX);
+const LOAD_BIDI_PREFIX_BYTES = UTF8_ENCODER.encode(LOAD_BIDI_PREFIX);
+
+function startsWithBytes(value: Uint8Array, prefix: Uint8Array): boolean {
+	if (value.byteLength < prefix.byteLength) return false;
+	for (let index = 0; index < prefix.byteLength; index += 1) {
+		if (value[index] !== prefix[index]) return false;
+	}
+	return true;
+}
+
+function isExpectedLoadTeardownError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null || !("code" in error)) {
+		return false;
+	}
+	const code = String((error as { code?: unknown }).code);
+	return (
+		code === "E_SESSION_CLOSED" ||
+		code === "E_STREAM_RESET" ||
+		code === "E_STOP_SENDING"
+	);
+}
+
+function reportLoadHandlerError(
+	logPrefix: string,
+	label: string,
+	error: unknown,
+): void {
+	if (
+		process.env.WEBTRANSPORT_SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS === "1" &&
+		isExpectedLoadTeardownError(error)
+	) {
+		return;
+	}
+	console.warn(`${logPrefix}: ${label}:`, error);
+}
+
 export type Sample = {
 	ts_ms: number;
 	phase: string;
@@ -1270,7 +1317,7 @@ async function readUniWithPeek(
 		const firstBuffer = Buffer.from(firstChunk);
 		// The stop-sending probe intentionally waits for the peer signal before
 		// finishing its send stream, so do not wait for FIN before handling it.
-		if (firstBuffer.toString("utf8").startsWith(PROBE_UNI_STOP_PREFIX)) {
+		if (startsWithBytes(firstBuffer, PROBE_UNI_STOP_PREFIX_BYTES)) {
 			return { first: firstBuffer, rest: Buffer.alloc(0) };
 		}
 		const restChunks: Buffer[] = [];
@@ -1310,20 +1357,25 @@ async function writeWebWritable(
 	}
 }
 
+export type LoadSessionHandlerOptions = {
+	onDatagramEcho?: () => void;
+};
+
 export function createLoadSessionHandler(
 	logPrefix = "soak-addon",
+	options: LoadSessionHandlerOptions = {},
 ): (session: ServerSession) => void {
 	return (session) => {
 		void (async () => {
 			try {
 				for await (const datagram of session.incomingDatagrams()) {
-					const text = Buffer.from(datagram).toString("utf8");
-					if (text.startsWith(PROBE_DATAGRAM_PREFIX)) {
+					if (startsWithBytes(datagram, PROBE_DATAGRAM_PREFIX_BYTES)) {
 						await session.sendDatagram(datagram);
+						options.onDatagramEcho?.();
 					}
 				}
 			} catch (error) {
-				console.warn(`${logPrefix}: datagram loop failed:`, error);
+				reportLoadHandlerError(logPrefix, "datagram loop failed", error);
 			}
 		})();
 		void (async () => {
@@ -1343,16 +1395,15 @@ export function createLoadSessionHandler(
 								duplex.readable,
 								"bidi payload",
 							);
-							const text = body.toString("utf8");
-							if (text.startsWith(PROBE_BIDI_RESET_PREFIX)) {
+							if (startsWithBytes(body, PROBE_BIDI_RESET_PREFIX_BYTES)) {
 								duplex[WT_RESET]?.(42);
 								return;
 							}
-							if (text.startsWith(PROBE_BIDI_ECHO_PREFIX)) {
+							if (startsWithBytes(body, PROBE_BIDI_ECHO_PREFIX_BYTES)) {
 								await writeWebWritable(duplex.writable, body);
 								return;
 							}
-							if (text.startsWith(LOAD_BIDI_PREFIX)) {
+							if (startsWithBytes(body, LOAD_BIDI_PREFIX_BYTES)) {
 								const writer = duplex.writable.getWriter();
 								try {
 									await writer.close();
@@ -1361,12 +1412,12 @@ export function createLoadSessionHandler(
 								}
 							}
 						} catch (error) {
-							console.warn(`${logPrefix}: bidi handler failed:`, error);
+							reportLoadHandlerError(logPrefix, "bidi handler failed", error);
 						}
 					})(duplex as WebIncomingBidi);
 				}
 			} catch (error) {
-				console.warn(`${logPrefix}: bidi loop failed:`, error);
+				reportLoadHandlerError(logPrefix, "bidi loop failed", error);
 			} finally {
 				try {
 					reader.releaseLock();
@@ -1393,13 +1444,12 @@ export function createLoadSessionHandler(
 								"uni payload",
 							);
 							if (!first) return;
-							const body = Buffer.concat([first, rest]);
-							const text = body.toString("utf8");
-							if (text.startsWith(PROBE_UNI_STOP_PREFIX)) {
+							if (startsWithBytes(first, PROBE_UNI_STOP_PREFIX_BYTES)) {
 								incoming[WT_STOP_SENDING]?.(0);
 								return;
 							}
-							if (text.startsWith(PROBE_UNI_ECHO_PREFIX)) {
+							const body = Buffer.concat([first, rest]);
+							if (startsWithBytes(body, PROBE_UNI_ECHO_PREFIX_BYTES)) {
 								const writable = await session.createUnidirectionalStream();
 								await new Promise<void>((resolve, reject) => {
 									writable.write(body, (error) =>
@@ -1413,14 +1463,14 @@ export function createLoadSessionHandler(
 								});
 								return;
 							}
-							if (text.startsWith(LOAD_UNI_PREFIX)) return;
+							if (startsWithBytes(body, LOAD_UNI_PREFIX_BYTES)) return;
 						} catch (error) {
-							console.warn(`${logPrefix}: uni handler failed:`, error);
+							reportLoadHandlerError(logPrefix, "uni handler failed", error);
 						}
 					})(incoming);
 				}
 			} catch (error) {
-				console.warn(`${logPrefix}: uni loop failed:`, error);
+				reportLoadHandlerError(logPrefix, "uni loop failed", error);
 			} finally {
 				try {
 					reader.releaseLock();
