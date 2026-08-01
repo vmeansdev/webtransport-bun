@@ -56,6 +56,7 @@ gate:
   toolchain, the smoke runner fails with an artifacted tooling blocker instead
   of silently claiming fuzz coverage.
 - Every spawned command has an outer watchdog; timeout state is artifacted in
-  `commandResults`.
+  `commandResults`. CI sanitizes the JSON artifact before validation/upload so
+  command, stdout, and stderr paths never disclose the runner workspace.
 
 Artifacts default to `.release-evidence/fuzz/release-smoke.json`.

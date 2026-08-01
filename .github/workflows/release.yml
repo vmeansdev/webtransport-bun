@@ -165,6 +165,8 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Release fuzz smoke
         run: bun run fuzz:release-smoke
+      - name: Sanitize fuzz evidence
+        run: bun run tools/interop/sanitize-evidence.ts .release-evidence/fuzz/release-smoke.json
       - name: Upload fuzz evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
         with:

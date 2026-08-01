@@ -8,6 +8,8 @@ import {
 } from "./verify-evidence.ts";
 
 const ABSOLUTE_PATH_PATTERN = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
+const EMBEDDED_ABSOLUTE_PATH_PATTERN =
+	/(^|[\s"'=(:,])((?:\/(?!\/)[^\s"'`,;\)\]]+|[A-Za-z]:[\\/][^\s"'`,;\)\]]+|\\\\[^\s"'`,;\)\]]+))/g;
 
 type EvidenceObject = Record<string, unknown>;
 
@@ -17,7 +19,11 @@ function normalizeCommand(value: string): string {
 			/(['"])(\/(?:[^'"\\]|\\.)+|[A-Za-z]:[\\/](?:[^'"\\]|\\.)*)\1/g,
 			"bun",
 		)
-		.replace(/(^|\s)(\/(?:\S+)|[A-Za-z]:[\\/](?:\S+))/g, "$1<redacted>");
+		.replace(EMBEDDED_ABSOLUTE_PATH_PATTERN, "$1<redacted>");
+}
+
+function redactEmbeddedPaths(value: string): string {
+	return value.replace(EMBEDDED_ABSOLUTE_PATH_PATTERN, "$1<redacted>");
 }
 
 function normalizeString(value: string, key: string): string {
@@ -26,12 +32,14 @@ function normalizeString(value: string, key: string): string {
 	if (key === "outputDir") return "test-results";
 	if (key === "cwd") return ".";
 	if (key === "command") return normalizeCommand(value);
-	return ABSOLUTE_PATH_PATTERN.test(value) ? "<redacted>" : value;
+	if (ABSOLUTE_PATH_PATTERN.test(value)) return "<redacted>";
+	return redactEmbeddedPaths(value);
 }
 
 function sanitizeValue(value: unknown, key = ""): unknown {
 	if (typeof value === "string") return normalizeString(value, key);
-	if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry));
+	if (Array.isArray(value))
+		return value.map((entry) => sanitizeValue(entry, key));
 	if (value === null || typeof value !== "object") return value;
 	const sanitized: EvidenceObject = {};
 	for (const [childKey, childValue] of Object.entries(value)) {

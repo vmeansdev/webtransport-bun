@@ -66,7 +66,7 @@ Test log hygiene:
 6. **package-consumers** — needs [build]; builds the exact tarball from the downloaded release prebuilds and runs the native addon, datagram, unidirectional-stream, bidirectional-stream, and deterministic-close smoke under Bun, Deno, and the supported Node engine floor/current versions across Linux, macOS, and Windows.
 7. **release** — needs [build, interop, parity, fuzz, package-consumers]; verifies required evidence and all four target prebuilds, regenerates and checks SHA256SUMS, builds and smokes the exact package under Bun/Node/Deno, then uploads the tarball plus a run/attempt/commit/tag/digest-bound `candidate-identity.json` as the immutable, attempt-qualified `npm-publish-input-<run_attempt>` Actions artifact before creating the GitHub release.
 
-The blocking **fuzz** job runs `bun run fuzz:release-smoke`, which now covers cargo-fuzz targets, stable Rust parser/property tests, and the Bun-side `WASM event decoder property harness` from `packages/webtransport/test/wasm-limits.test.ts`. Its canonical artifact path is `.release-evidence/fuzz/release-smoke.json`.
+The blocking **fuzz** job runs `bun run fuzz:release-smoke`, then sanitizes the JSON before upload. It covers cargo-fuzz targets, stable Rust parser/property tests, and the Bun-side `WASM event decoder property harness` from `packages/webtransport/test/wasm-limits.test.ts`. Its canonical artifact path is `.release-evidence/fuzz/release-smoke.json`.
 
 ### publish.yml (successful release workflow_run, workflow_dispatch)
 

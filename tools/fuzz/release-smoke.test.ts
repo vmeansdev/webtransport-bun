@@ -140,10 +140,16 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(releaseWorkflow).toContain("fuzz:");
 		expect(releaseWorkflow).toContain("needs: [security, codeql, fuzz]");
 		expect(releaseWorkflow).toContain("bun run fuzz:release-smoke");
+		expect(releaseWorkflow).toContain(
+			"bun run tools/interop/sanitize-evidence.ts .release-evidence/fuzz/release-smoke.json",
+		);
 		expect(releaseWorkflow).toContain("fuzz-evidence");
 		expect(fuzzWorkflow).toContain("schedule:");
 		expect(fuzzWorkflow).toContain("workflow_dispatch:");
 		expect(fuzzWorkflow).toContain("bun run fuzz:release-smoke");
+		expect(fuzzWorkflow).toContain(
+			"bun run tools/interop/sanitize-evidence.ts .release-evidence/fuzz/release-smoke.json",
+		);
 		expect(fuzzWorkflow).toContain("retention-days: 90");
 		expect(packageJson).toContain('"fuzz:release-smoke"');
 	});

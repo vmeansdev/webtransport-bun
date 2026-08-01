@@ -39,4 +39,28 @@ describe("interop evidence generation boundary", () => {
 		verifyEvidenceDocument(sanitized);
 		verifyInteropEvidenceDocument(sanitized);
 	});
+
+	it("redacts embedded paths in command arrays and diagnostics", () => {
+		const hostRoot = "/Users/private-user/webtransport-bun/tools/fuzz";
+		const document = {
+			command: [
+				"rustup",
+				"run",
+				"1.95.0",
+				`${hostRoot}/corpora/h3`,
+				`-artifact_prefix=/private/var/folders/private-user/crashes/`,
+			],
+			stdout: `cargo-fuzz wrote diagnostics under ${hostRoot}/target`,
+			stderr: `linker failed in /opt/homebrew/opt/llvm/bin/clang`,
+		};
+
+		const sanitized = sanitizeEvidenceDocument(document);
+		const serialized = JSON.stringify(sanitized);
+		expect(serialized).not.toContain(hostRoot);
+		expect(serialized).not.toContain("/private/var/folders");
+		expect(serialized).not.toContain("/opt/homebrew/opt/llvm");
+		expect(sanitized.command[3]).toBe("<redacted>");
+		expect(sanitized.command[4]).toBe("-artifact_prefix=<redacted>");
+		verifyEvidenceDocument(sanitized);
+	});
 });
