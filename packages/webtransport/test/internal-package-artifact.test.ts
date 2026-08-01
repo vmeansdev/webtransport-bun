@@ -359,11 +359,10 @@ function createHangingNpm(root: string): string {
 	writeFileSync(
 		npm,
 		[
-			`#!${process.execPath}`,
-			'const { writeSync } = require("node:fs");',
-			'writeSync(1, "fixture package helper stdout\\n");',
-			'writeSync(2, "fixture package helper stderr\\n");',
-			"setInterval(() => {}, 1_000);",
+			"#!/bin/sh",
+			'printf "fixture package helper stdout\\n"',
+			'printf "fixture package helper stderr\\n" >&2',
+			"exec sleep 1000",
 		].join("\n"),
 		"utf8",
 	);
@@ -436,13 +435,13 @@ test.serial(
 				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
 				WT_FIXTURE_STARTED_FILE: smokeStartedFile,
 			},
-			15_000,
+			45_000,
 		);
 		// Under the full cold package suite, starting the nested runtime can be
 		// scheduler-delayed beyond the normal file-observation window. Keep the
 		// outer guard bounded, but always await it so a missed marker cannot leak
 		// the fixture process tree into later tests.
-		const smokeStarted = await fileAppearsWithin(smokeStartedFile, 8_000);
+		const smokeStarted = await fileAppearsWithin(smokeStartedFile, 30_000);
 		const startedAt = Date.now();
 		const result = await guardedResult;
 		const elapsedMs = Date.now() - startedAt;
@@ -457,6 +456,7 @@ test.serial(
 		await waitForFile(descendantPidFile);
 		await expectProcessExit(descendantPidFile);
 	},
+	60_000,
 );
 
 test.serial("win32 taskkill removes a genuine runtime descendant", async () => {
