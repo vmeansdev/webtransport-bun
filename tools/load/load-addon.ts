@@ -8,6 +8,7 @@ import {
 	createServer,
 	DEFAULT_LIMITS,
 } from "../../packages/webtransport/src/index.ts";
+import { createLoadSessionHandler } from "./soak-addon.ts";
 import { $ } from "bun";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -72,7 +73,7 @@ async function main() {
 	const server = createServer({
 		port: 4433,
 		tls: { certPem: "", keyPem: "" },
-		onSession: () => {},
+		onSession: createLoadSessionHandler("load-addon"),
 	});
 	const initialFd = await getFdCount(process.pid);
 	await Bun.sleep(8000); // Allow addon server to bind (Tokio + wtransport startup)

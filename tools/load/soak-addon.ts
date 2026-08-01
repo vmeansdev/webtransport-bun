@@ -30,6 +30,7 @@ import { $ } from "bun";
 import {
 	createServer,
 	DEFAULT_LIMITS,
+	type ServerSession,
 	type WebTransportServer,
 	WT_RESET,
 	WT_STOP_SENDING,
@@ -1265,6 +1266,13 @@ async function readUniWithPeek(
 	try {
 		const first = await readWithTimeout(reader, LOAD_IO_TIMEOUT_MS, label);
 		if (first.done) return { first: null, rest: Buffer.alloc(0) };
+		const firstChunk = requireReadValue(first.value, label);
+		const firstBuffer = Buffer.from(firstChunk);
+		// The stop-sending probe intentionally waits for the peer signal before
+		// finishing its send stream, so do not wait for FIN before handling it.
+		if (firstBuffer.toString("utf8").startsWith(PROBE_UNI_STOP_PREFIX)) {
+			return { first: firstBuffer, rest: Buffer.alloc(0) };
+		}
 		const restChunks: Buffer[] = [];
 		while (true) {
 			const next = await readWithTimeout(
@@ -1276,9 +1284,8 @@ async function readUniWithPeek(
 			const chunk = requireReadValue(next.value, `${label} follow-up`);
 			restChunks.push(Buffer.from(chunk));
 		}
-		const firstChunk = requireReadValue(first.value, label);
 		return {
-			first: Buffer.from(firstChunk),
+			first: firstBuffer,
 			rest: Buffer.concat(restChunks),
 		};
 	} finally {
@@ -1301,6 +1308,128 @@ async function writeWebWritable(
 	} finally {
 		writer.releaseLock();
 	}
+}
+
+export function createLoadSessionHandler(
+	logPrefix = "soak-addon",
+): (session: ServerSession) => void {
+	return (session) => {
+		void (async () => {
+			try {
+				for await (const datagram of session.incomingDatagrams()) {
+					const text = Buffer.from(datagram).toString("utf8");
+					if (text.startsWith(PROBE_DATAGRAM_PREFIX)) {
+						await session.sendDatagram(datagram);
+					}
+				}
+			} catch (error) {
+				console.warn(`${logPrefix}: datagram loop failed:`, error);
+			}
+		})();
+		void (async () => {
+			const reader = session.incomingBidirectionalStreams.getReader();
+			try {
+				while (true) {
+					const next = await readWithTimeout(
+						reader,
+						LOAD_IO_TIMEOUT_MS,
+						"incoming bidi stream",
+					);
+					if (next.done) return;
+					const duplex = next.value;
+					void (async (duplex: WebIncomingBidi) => {
+						try {
+							const body = await collectReadable(
+								duplex.readable,
+								"bidi payload",
+							);
+							const text = body.toString("utf8");
+							if (text.startsWith(PROBE_BIDI_RESET_PREFIX)) {
+								duplex[WT_RESET]?.(42);
+								return;
+							}
+							if (text.startsWith(PROBE_BIDI_ECHO_PREFIX)) {
+								await writeWebWritable(duplex.writable, body);
+								return;
+							}
+							if (text.startsWith(LOAD_BIDI_PREFIX)) {
+								const writer = duplex.writable.getWriter();
+								try {
+									await writer.close();
+								} finally {
+									writer.releaseLock();
+								}
+							}
+						} catch (error) {
+							console.warn(`${logPrefix}: bidi handler failed:`, error);
+						}
+					})(duplex as WebIncomingBidi);
+				}
+			} catch (error) {
+				console.warn(`${logPrefix}: bidi loop failed:`, error);
+			} finally {
+				try {
+					reader.releaseLock();
+				} catch {
+					// Teardown can race lock release.
+				}
+			}
+		})();
+		void (async () => {
+			const reader = session.incomingUnidirectionalStreams.getReader();
+			try {
+				while (true) {
+					const next = await readWithTimeout(
+						reader,
+						LOAD_IO_TIMEOUT_MS,
+						"incoming uni stream",
+					);
+					if (next.done) return;
+					const incoming = requireReadValue(next.value, "incoming uni stream");
+					void (async (incoming: WebIncomingUni) => {
+						try {
+							const { first, rest } = await readUniWithPeek(
+								incoming,
+								"uni payload",
+							);
+							if (!first) return;
+							const body = Buffer.concat([first, rest]);
+							const text = body.toString("utf8");
+							if (text.startsWith(PROBE_UNI_STOP_PREFIX)) {
+								incoming[WT_STOP_SENDING]?.(0);
+								return;
+							}
+							if (text.startsWith(PROBE_UNI_ECHO_PREFIX)) {
+								const writable = await session.createUnidirectionalStream();
+								await new Promise<void>((resolve, reject) => {
+									writable.write(body, (error) =>
+										error ? reject(error) : resolve(),
+									);
+								});
+								await new Promise<void>((resolve, reject) => {
+									writable.end((error?: Error | null) =>
+										error ? reject(error) : resolve(),
+									);
+								});
+								return;
+							}
+							if (text.startsWith(LOAD_UNI_PREFIX)) return;
+						} catch (error) {
+							console.warn(`${logPrefix}: uni handler failed:`, error);
+						}
+					})(incoming);
+				}
+			} catch (error) {
+				console.warn(`${logPrefix}: uni loop failed:`, error);
+			} finally {
+				try {
+					reader.releaseLock();
+				} catch {
+					// Teardown can race lock release.
+				}
+			}
+		})();
+	};
 }
 
 function continuityDigest(token: string): string {
@@ -1601,128 +1730,7 @@ async function runSegment(): Promise<void> {
 			datagramsPerSec: Math.max(SESSIONS * 20, 10000),
 			datagramsBurst: Math.max(SESSIONS * 40, 20000),
 		},
-		onSession: async (session) => {
-			void (async () => {
-				try {
-					for await (const datagram of session.incomingDatagrams()) {
-						const text = Buffer.from(datagram).toString("utf8");
-						if (text.startsWith(PROBE_DATAGRAM_PREFIX)) {
-							await session.sendDatagram(datagram);
-						}
-					}
-				} catch (error) {
-					console.warn("soak-addon: datagram loop failed:", error);
-				}
-			})();
-			void (async () => {
-				const reader = session.incomingBidirectionalStreams.getReader();
-				try {
-					while (true) {
-						const next = await readWithTimeout(
-							reader,
-							LOAD_IO_TIMEOUT_MS,
-							"incoming bidi stream",
-						);
-						if (next.done) return;
-						const duplex = next.value;
-						void (async (duplex: WebIncomingBidi) => {
-							try {
-								const body = await collectReadable(
-									duplex.readable,
-									"bidi payload",
-								);
-								const text = body.toString("utf8");
-								if (text.startsWith(PROBE_BIDI_RESET_PREFIX)) {
-									duplex[WT_RESET]?.(42);
-									return;
-								}
-								if (text.startsWith(PROBE_BIDI_ECHO_PREFIX)) {
-									await writeWebWritable(duplex.writable, body);
-									return;
-								}
-								if (text.startsWith(LOAD_BIDI_PREFIX)) {
-									const writer = duplex.writable.getWriter();
-									try {
-										await writer.close();
-									} finally {
-										writer.releaseLock();
-									}
-								}
-							} catch (error) {
-								console.warn("soak-addon: bidi handler failed:", error);
-							}
-						})(duplex as WebIncomingBidi);
-					}
-				} catch (error) {
-					console.warn("soak-addon: bidi loop failed:", error);
-				} finally {
-					try {
-						reader.releaseLock();
-					} catch {
-						// Teardown can race lock release.
-					}
-				}
-			})();
-			void (async () => {
-				const reader = session.incomingUnidirectionalStreams.getReader();
-				try {
-					while (true) {
-						const next = await readWithTimeout(
-							reader,
-							LOAD_IO_TIMEOUT_MS,
-							"incoming uni stream",
-						);
-						if (next.done) return;
-						const incoming = requireReadValue(
-							next.value,
-							"incoming uni stream",
-						);
-						void (async (incoming: WebIncomingUni) => {
-							try {
-								const { first, rest } = await readUniWithPeek(
-									incoming,
-									"uni payload",
-								);
-								if (!first) return;
-								const body = Buffer.concat([first, rest]);
-								const text = body.toString("utf8");
-								if (text.startsWith(PROBE_UNI_STOP_PREFIX)) {
-									incoming[WT_STOP_SENDING]?.(0);
-									return;
-								}
-								if (text.startsWith(PROBE_UNI_ECHO_PREFIX)) {
-									const writable = await session.createUnidirectionalStream();
-									await new Promise<void>((resolve, reject) => {
-										writable.write(body, (error) =>
-											error ? reject(error) : resolve(),
-										);
-									});
-									await new Promise<void>((resolve, reject) => {
-										writable.end((error?: Error | null) =>
-											error ? reject(error) : resolve(),
-										);
-									});
-									return;
-								}
-								if (text.startsWith(LOAD_UNI_PREFIX)) {
-									return;
-								}
-							} catch (error) {
-								console.warn("soak-addon: uni handler failed:", error);
-							}
-						})(incoming);
-					}
-				} catch (error) {
-					console.warn("soak-addon: uni loop failed:", error);
-				} finally {
-					try {
-						reader.releaseLock();
-					} catch {
-						// Teardown can race lock release.
-					}
-				}
-			})();
-		},
+		onSession: createLoadSessionHandler(),
 	});
 
 	const startedAtMs = Date.now();
