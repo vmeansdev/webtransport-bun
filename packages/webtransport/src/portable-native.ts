@@ -73,7 +73,7 @@ function duplexToWeb(duplex: Duplex): WebTransportBidirectionalStream {
 export async function createNativePortableServer(
 	opts: PortableCreateServerOptions,
 ): Promise<PortableServer> {
-	if (opts.tls.allowSelfSigned && !opts.tls.certPem) {
+	if (opts.tls.allowSelfSigned) {
 		throw new Error(
 			"portable createServer: tls.allowSelfSigned is wasm-only — supply tls.certPem/keyPem on the native backend",
 		);

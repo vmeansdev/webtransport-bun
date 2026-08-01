@@ -298,6 +298,7 @@ class WasmWebTransportServerImpl implements WasmWebTransportServer {
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#manager.close();
+		await this.#manager.waitForShutdown();
 	}
 
 	metricsSnapshot() {

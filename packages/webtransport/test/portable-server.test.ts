@@ -209,5 +209,17 @@ describe("portable createServer", () => {
 				onSession: () => {},
 			}),
 		).rejects.toThrow(/wasm-only/);
+		await expect(
+			createServer({
+				backend: "native",
+				port: nextPort(16600, 200),
+				tls: {
+					allowSelfSigned: true,
+					certPem: "explicit-cert",
+					keyPem: "explicit-key",
+				},
+				onSession: () => {},
+			}),
+		).rejects.toThrow(/wasm-only/);
 	});
 });
