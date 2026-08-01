@@ -113,6 +113,7 @@ jobs:
           WT_PLAYWRIGHT_VERSION: "1.58.2"
         run: |
           xvfb-run node tools/interop/run-iwa.mjs
+          bun run tools/interop/verify-evidence.ts .release-evidence/iwa/evidence.json
 
       - name: Run IWA Playwright Test on Chrome Beta
         env:
@@ -125,6 +126,7 @@ jobs:
           WT_PLAYWRIGHT_VERSION: "1.58.2"
         run: |
           xvfb-run node tools/interop/run-iwa.mjs
+          bun run tools/interop/verify-evidence.ts .release-evidence/iwa/evidence-chrome-beta.json
 
       - name: Upload immutable IWA evidence
         if: always()

@@ -222,15 +222,16 @@ try {
 		...pageEvidence,
 		sourceCommit:
 			process.env.GITHUB_SHA ?? process.env.WT_CANDIDATE_SHA ?? null,
-		signedBundlePath: bundlePath,
+		signedBundleArtifact: "webtransport-wasm-iwa.swbn",
 		signedBundleSha256: createHash("sha256").update(bundle).digest("hex"),
-		unsignedBundlePath,
+		unsignedBundleArtifact: "webtransport-wasm-iwa.wbn",
 		unsignedBundleSha256: createHash("sha256")
 			.update(unsignedBundle)
 			.digest("hex"),
 		browserVersion,
-		browserChannel: browserChannel ?? "playwright-chromium",
-		browserExecutable: browserExecutable ?? null,
+		browserChannel: browserChannel
+			? "configured-channel"
+			: "playwright-chromium",
 		localNetworkPermission: "pregranted-for-automated-proof",
 		playwrightVersion: process.env.WT_PLAYWRIGHT_VERSION ?? "1.58.2",
 	};
@@ -248,10 +249,9 @@ try {
 		executionIdentity: null,
 		sourceCommit:
 			process.env.GITHUB_SHA ?? process.env.WT_CANDIDATE_SHA ?? null,
-		signedBundlePath: bundlePath,
-		unsignedBundlePath,
-		error:
-			error instanceof Error ? (error.stack ?? error.message) : String(error),
+		signedBundleArtifact: "webtransport-wasm-iwa.swbn",
+		unsignedBundleArtifact: "webtransport-wasm-iwa.wbn",
+		errorName: error instanceof Error ? error.name : "UnknownError",
 		finishedAt: new Date().toISOString(),
 	};
 	await writeFile(evidencePath, `${JSON.stringify(failed, null, 2)}\n`);
