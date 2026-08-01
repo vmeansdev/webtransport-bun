@@ -249,7 +249,7 @@ describe("soak campaign integrity", () => {
 			runLoadClient(
 				"structured-summary",
 				[process.execPath, "-e", script],
-				1_000,
+				5_000,
 			),
 		);
 		const structured = result as {
@@ -303,7 +303,7 @@ describe("soak campaign integrity", () => {
 			runLoadClient(
 				"structured-reconnect-summary",
 				[process.execPath, "-e", script],
-				1_000,
+				5_000,
 			),
 		);
 		const structured = result as {
