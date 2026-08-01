@@ -786,7 +786,10 @@ describe.serial("package artifact cleanup", () => {
 						{
 							cwd: root,
 							label: "fixture posix command",
-							timeoutMs: 1_500,
+							// Keep the fixture deadline finite while leaving a loaded host
+							// enough time to flush its initial diagnostics before the
+							// direct-child fallback is exercised.
+							timeoutMs: 3_000,
 						},
 					),
 				);
