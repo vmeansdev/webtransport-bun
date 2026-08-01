@@ -5,7 +5,10 @@ import { join } from "node:path";
 
 import {
 	awaitWithTimeout,
+	buildFinalSampleOrdering,
+	buildScaleArtifact,
 	buildSourceIdentityProof,
+	captureMemoryTelemetrySnapshot,
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
 	evaluateWorkloadEvidence,
@@ -217,6 +220,132 @@ describe("Task 14 distributed scale evidence", () => {
 		);
 		expect(source).toContain('awaitWithTimeout("child.exited"');
 		expect(source).toContain('awaitWithTimeout("server.close"');
+	});
+
+	test("captures memory telemetry fields in MB for warmed, loaded, and recovery snapshots", () => {
+		expect(
+			captureMemoryTelemetrySnapshot({
+				rss: 96 * 1024 * 1024,
+				heapTotal: 40 * 1024 * 1024,
+				heapUsed: 24 * 1024 * 1024,
+				external: 12 * 1024 * 1024,
+				arrayBuffers: 8 * 1024 * 1024,
+			}),
+		).toEqual({
+			rssMb: 96,
+			heapTotalMb: 40,
+			heapUsedMb: 24,
+			externalMb: 12,
+			arrayBuffersMb: 8,
+		});
+	});
+
+	test("records final sample ordering around reference release and diagnostic GC", () => {
+		expect(buildFinalSampleOrdering(false)).toEqual({
+			stages: [
+				"warmed-idle",
+				"pre-close-loaded",
+				"post-close-gauges",
+				"references-released",
+				"post-close-recovery",
+			],
+			diagnosticGcTriggered: false,
+		});
+		expect(buildFinalSampleOrdering(true)).toEqual({
+			stages: [
+				"warmed-idle",
+				"pre-close-loaded",
+				"post-close-gauges",
+				"references-released",
+				"diagnostic-gc",
+				"post-close-recovery",
+			],
+			diagnosticGcTriggered: true,
+		});
+	});
+
+	test("builds a scale artifact with telemetry embedded in the summary", () => {
+		const telemetry = {
+			warmedIdle: captureMemoryTelemetrySnapshot({
+				rss: 48 * 1024 * 1024,
+				heapTotal: 20 * 1024 * 1024,
+				heapUsed: 12 * 1024 * 1024,
+				external: 6 * 1024 * 1024,
+				arrayBuffers: 3 * 1024 * 1024,
+			}),
+			preCloseLoaded: captureMemoryTelemetrySnapshot({
+				rss: 450 * 1024 * 1024,
+				heapTotal: 50 * 1024 * 1024,
+				heapUsed: 25 * 1024 * 1024,
+				external: 7 * 1024 * 1024,
+				arrayBuffers: 4 * 1024 * 1024,
+			}),
+			postCloseRecovery: captureMemoryTelemetrySnapshot({
+				rss: 451 * 1024 * 1024,
+				heapTotal: 49 * 1024 * 1024,
+				heapUsed: 24 * 1024 * 1024,
+				external: 6 * 1024 * 1024,
+				arrayBuffers: 3 * 1024 * 1024,
+			}),
+			finalSampleOrdering: buildFinalSampleOrdering(true),
+		};
+		const artifact = buildScaleArtifact(
+			validConfig(),
+			{
+				label: "scale",
+				sessions: 4,
+				durationSec: 2,
+				serverCount: 1,
+				clientCount: 1,
+				totalRequestedSessions: 4,
+				totalOkSessions: 4,
+				globalSuccessRate: 1,
+				fairnessGap: 0,
+				peakLiveSessions: 4,
+				peakStreams: 2,
+				peakQueuedBytesGlobal: 0,
+				peakRssMb: 450,
+				finalRssMb: 451,
+				serverDatagramSends: 4,
+				serverBidiStreamsOpened: 1,
+				serverUniStreamsOpened: 1,
+				serverDatagramErrors: 0,
+				serverStreamErrors: 0,
+				sourceIdentityCount: 1,
+				sourcePrefixCount: 1,
+				sourceIdentityProof: buildSourceIdentityProof(["127.0.0.1"]),
+				liveSetHeldMs: 1000,
+				admissionShedCount: 1,
+				overloadEvidence: {
+					attemptedSessions: 1,
+					acceptedSessions: 0,
+					rejectedSessions: 1,
+					limitExceededDelta: 1,
+					rateLimitedDelta: 0,
+					admissionShedCount: 1,
+					steadyStateBeforeOverload: ZERO_GAUGES,
+					postOverloadGauges: ZERO_GAUGES,
+					recoveryDurationMs: 1,
+				},
+				overloadClientSummaries: [],
+				closeDurationMs: 1,
+				finalGauges: ZERO_GAUGES,
+				memoryTelemetry: telemetry,
+				p99HandshakeMs: 1,
+				p99DatagramEnqueueMs: 1,
+				p99StreamOpenMs: 1,
+				clientSummaries: [],
+				failures: [],
+			} as any,
+			"2026-08-01T00:00:00.000Z",
+			"1.3.14",
+			"rustc 1.90.0",
+		);
+
+		expect(artifact.summary.memoryTelemetry).toEqual(telemetry);
+		expect(artifact.createdAt).toBe("2026-08-01T00:00:00.000Z");
+		expect(artifact.bunVersion).toBe("1.3.14");
+		expect(artifact.rustcVersion).toBe("rustc 1.90.0");
 	});
 
 	test("terminates descendant-held pipes and records timeout and drain metadata", async () => {

@@ -140,6 +140,26 @@ export type OverloadEvidence = {
 	recoveryDurationMs: number;
 };
 
+export type MemoryTelemetrySnapshot = {
+	rssMb: number;
+	heapTotalMb: number;
+	heapUsedMb: number;
+	externalMb: number;
+	arrayBuffersMb: number;
+};
+
+export type FinalSampleOrdering = {
+	stages: string[];
+	diagnosticGcTriggered: boolean;
+};
+
+export type MemoryTelemetry = {
+	warmedIdle: MemoryTelemetrySnapshot;
+	preCloseLoaded: MemoryTelemetrySnapshot;
+	postCloseRecovery: MemoryTelemetrySnapshot;
+	finalSampleOrdering: FinalSampleOrdering;
+};
+
 type RunSummary = {
 	label: string;
 	sessions: number;
@@ -169,11 +189,20 @@ type RunSummary = {
 	overloadClientSummaries: ClientSummary[];
 	closeDurationMs: number;
 	finalGauges: FinalGauges;
+	memoryTelemetry: MemoryTelemetry;
 	p99HandshakeMs: number | null;
 	p99DatagramEnqueueMs: number | null;
 	p99StreamOpenMs: number | null;
 	clientSummaries: ClientSummary[];
 	failures: string[];
+};
+
+export type ScaleArtifact = {
+	createdAt: string;
+	bunVersion: string;
+	rustcVersion: string | null;
+	config: ScaleCampaignConfig;
+	summary: RunSummary;
 };
 
 type BoundedCommandOptions = {
@@ -734,6 +763,76 @@ function getRssMb() {
 	return process.memoryUsage().rss / (1024 * 1024);
 }
 
+export function captureMemoryTelemetrySnapshot(
+	usage: Pick<
+		NodeJS.MemoryUsage,
+		"rss" | "heapTotal" | "heapUsed" | "external" | "arrayBuffers"
+	>,
+): MemoryTelemetrySnapshot {
+	const toMb = (value: number) => Number((value / (1024 * 1024)).toFixed(3));
+	return {
+		rssMb: toMb(usage.rss),
+		heapTotalMb: toMb(usage.heapTotal),
+		heapUsedMb: toMb(usage.heapUsed),
+		externalMb: toMb(usage.external),
+		arrayBuffersMb: toMb(usage.arrayBuffers),
+	};
+}
+
+function captureProcessMemoryTelemetrySnapshot(): MemoryTelemetrySnapshot {
+	return captureMemoryTelemetrySnapshot(process.memoryUsage());
+}
+
+function maybeRunDiagnosticGc(): boolean {
+	if (typeof Bun.gc !== "function") return false;
+	try {
+		Bun.gc(true);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export function buildFinalSampleOrdering(
+	diagnosticGcTriggered: boolean,
+): FinalSampleOrdering {
+	return {
+		stages: diagnosticGcTriggered
+			? [
+					"warmed-idle",
+					"pre-close-loaded",
+					"post-close-gauges",
+					"references-released",
+					"diagnostic-gc",
+					"post-close-recovery",
+				]
+			: [
+					"warmed-idle",
+					"pre-close-loaded",
+					"post-close-gauges",
+					"references-released",
+					"post-close-recovery",
+				],
+		diagnosticGcTriggered,
+	};
+}
+
+export function buildScaleArtifact(
+	config: ScaleCampaignConfig,
+	summary: RunSummary,
+	createdAt: string = new Date().toISOString(),
+	bunVersion: string = Bun.version,
+	rustVersion: string | null = rustcVersion(),
+): ScaleArtifact {
+	return {
+		createdAt,
+		bunVersion,
+		rustcVersion: rustVersion,
+		config,
+		summary,
+	};
+}
+
 function percentileFromHistogram(
 	snapshot: MetricsSnapshot[keyof Pick<
 		MetricsSnapshot,
@@ -1089,6 +1188,7 @@ async function runOneCampaign(
 	const serverObservedPeerIps = new Set<string>();
 	let initialRssMb = getRssMb();
 	let peakRssMb = initialRssMb;
+	let warmedIdleMemoryTelemetry = captureProcessMemoryTelemetrySnapshot();
 	let peakLiveSessions = 0;
 	let peakStreams = 0;
 	let peakQueuedBytesGlobal = 0;
@@ -1172,7 +1272,8 @@ async function runOneCampaign(
 		// Establish the recovery baseline after the addon runtimes and sockets
 		// are warm. Measuring before server startup would count permanent runtime
 		// initialization as workload-retained RSS.
-		initialRssMb = getRssMb();
+		warmedIdleMemoryTelemetry = captureProcessMemoryTelemetrySnapshot();
+		initialRssMb = warmedIdleMemoryTelemetry.rssMb;
 		peakRssMb = Math.max(peakRssMb, initialRssMb);
 
 		let polling = true;
@@ -1328,7 +1429,9 @@ async function runOneCampaign(
 		// close for diagnostics. The pass/fail recovery comparator remains the
 		// warmed idle baseline captured after server startup; peak RSS remains
 		// the independent cap against unbounded growth.
-		const recoveryBaselineRssMb = getRssMb();
+		const preCloseLoadedMemoryTelemetry =
+			captureProcessMemoryTelemetrySnapshot();
+		const recoveryBaselineRssMb = preCloseLoadedMemoryTelemetry.rssMb;
 		const p99HandshakeMs = preCloseSnapshots
 			.map((snapshot) =>
 				percentileFromHistogram(snapshot.handshakeLatency, 0.99),
@@ -1410,7 +1513,24 @@ async function runOneCampaign(
 			server.metricsSnapshot(),
 		);
 		finalGauges = aggregateGauges(postCloseSnapshots);
-		const finalRssMb = getRssMb();
+		// Release server/runtime references before the final RSS sample so the
+		// measurement distinguishes runtime residency from still-retained handles.
+		preCloseSnapshots.length = 0;
+		postCloseSnapshots.length = 0;
+		servers.length = 0;
+		const diagnosticGcTriggered = maybeRunDiagnosticGc();
+		if (diagnosticGcTriggered) {
+			await Bun.sleep(50);
+		}
+		const postCloseRecoveryMemoryTelemetry =
+			captureProcessMemoryTelemetrySnapshot();
+		const finalRssMb = postCloseRecoveryMemoryTelemetry.rssMb;
+		const memoryTelemetry: MemoryTelemetry = {
+			warmedIdle: warmedIdleMemoryTelemetry,
+			preCloseLoaded: preCloseLoadedMemoryTelemetry,
+			postCloseRecovery: postCloseRecoveryMemoryTelemetry,
+			finalSampleOrdering: buildFinalSampleOrdering(diagnosticGcTriggered),
+		};
 
 		if (
 			finalGauges.sessionsActive !== 0 ||
@@ -1459,6 +1579,7 @@ async function runOneCampaign(
 			overloadClientSummaries: overloadResult.clientSummaries,
 			closeDurationMs,
 			finalGauges,
+			memoryTelemetry,
 			p99HandshakeMs: p99Handshake,
 			p99DatagramEnqueueMs: p99Datagram,
 			p99StreamOpenMs: p99Stream,
@@ -1517,6 +1638,15 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 			overloadClientSummaries: [],
 			closeDurationMs: 0,
 			finalGauges: emptyGauges,
+			memoryTelemetry: {
+				warmedIdle: captureProcessMemoryTelemetrySnapshot(),
+				preCloseLoaded: captureProcessMemoryTelemetrySnapshot(),
+				postCloseRecovery: captureProcessMemoryTelemetrySnapshot(),
+				finalSampleOrdering: {
+					stages: ["failure-snapshot"],
+					diagnosticGcTriggered: false,
+				},
+			},
 			p99HandshakeMs: null,
 			p99DatagramEnqueueMs: null,
 			p99StreamOpenMs: null,
@@ -1527,17 +1657,7 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 	mkdirSync(dirname(config.artifactPath), { recursive: true });
 	writeFileSync(
 		config.artifactPath,
-		JSON.stringify(
-			{
-				createdAt: new Date().toISOString(),
-				bunVersion: Bun.version,
-				rustcVersion: rustcVersion(),
-				config,
-				summary,
-			},
-			null,
-			2,
-		),
+		JSON.stringify(buildScaleArtifact(config, summary), null, 2),
 	);
 	return summary;
 }
