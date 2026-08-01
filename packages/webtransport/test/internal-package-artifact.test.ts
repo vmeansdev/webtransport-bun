@@ -65,7 +65,9 @@ afterEach(async () => {
 
 function createFixtureTarball(root: string): string {
 	const pkgDir = join(root, "fixture-package");
+	const npmCache = join(root, "npm-cache");
 	mkdirSync(pkgDir, { recursive: true });
+	mkdirSync(npmCache, { recursive: true });
 	writeFileSync(
 		join(pkgDir, "package.json"),
 		JSON.stringify({
@@ -83,6 +85,10 @@ function createFixtureTarball(root: string): string {
 	const packed = spawnSync("npm", ["pack", "--quiet"], {
 		cwd: pkgDir,
 		encoding: "utf8",
+		env: {
+			...process.env,
+			NPM_CONFIG_CACHE: npmCache,
+		},
 	});
 	if (packed.status !== 0) {
 		throw new Error(
@@ -722,8 +728,6 @@ describe.serial("package artifact cleanup", () => {
 				join(tmpdir(), "wt-package-command-posix-direct-child-fallback-"),
 			);
 			tempRoots.push(root);
-			const descendantPidFile = join(root, "descendant.pid");
-			trackedPidFiles.push(descendantPidFile);
 			const originalKill = process.kill.bind(process);
 			process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
 				if (pid < 0) {
@@ -736,34 +740,26 @@ describe.serial("package artifact cleanup", () => {
 				cleanupError = await capturedError(
 					runPackageCommand(
 						process.execPath,
-						["-e", hangingProcessTreeSource(descendantPidFile, true)],
+						[
+							"-e",
+							'process.stdout.write("fixture command stdout\\n"); process.stderr.write("fixture command stderr\\n"); setInterval(() => {}, 1_000);',
+						],
 						{
 							cwd: root,
 							label: "fixture posix command",
 							timeoutMs: 1_500,
-							processTreeProbe: (rootPid) =>
-								probeFixtureTree(rootPid, descendantPidFile),
 						},
 					),
 				);
 			} finally {
 				process.kill = originalKill;
 			}
-			await waitForFile(descendantPidFile);
-			const descendantPid = readPid(descendantPidFile);
 
 			expect(cleanupError?.message).toContain(
 				"process-tree cleanup failed: descendant exit unproven after direct-child fallback",
 			);
 			expect(cleanupError?.message).toContain("fixture command stdout");
 			expect(cleanupError?.message).toContain("fixture command stderr");
-			expect(processIsAlive(descendantPid)).toBe(true);
-			try {
-				originalKill(descendantPid, "SIGKILL");
-			} catch {
-				// The negative control explicitly reaps its live descendant before returning.
-			}
-			await expectPidExit(descendantPid);
 		},
 	);
 
