@@ -1,4 +1,4 @@
-import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import {
 	chmodSync,
@@ -101,24 +101,57 @@ function createFixtureTarball(root: string): string {
 }
 
 function createHangingRuntime(root: string, descendantPidFile: string): string {
+	const source = join(root, "fake-deno.c");
 	const runtime = join(root, "fake-deno");
 	writeFileSync(
-		runtime,
+		source,
 		[
-			`#!${process.execPath}`,
-			'const { spawn } = require("node:child_process");',
-			'const { writeFileSync } = require("node:fs");',
-			'if (process.argv[2] === "--version") { console.log("deno 2.9.3"); process.exit(0); }',
-			'if (process.env.WT_FIXTURE_STARTED_FILE) writeFileSync(process.env.WT_FIXTURE_STARTED_FILE, "started");',
-			'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000);"], { stdio: "ignore" });',
-			"writeFileSync(process.env.WT_FIXTURE_DESCENDANT_PID_FILE, String(child.pid));",
-			'console.log("fixture smoke started");',
-			'console.error("fixture smoke stderr");',
-			"setInterval(() => {}, 1_000);",
+			"#include <stdio.h>",
+			"#include <stdlib.h>",
+			"#include <string.h>",
+			"#include <sys/types.h>",
+			"#include <unistd.h>",
+			"static void write_text(const char *path, const char *text) {",
+			"  if (path == NULL) return;",
+			'  FILE *file = fopen(path, "w");',
+			"  if (file == NULL) return;",
+			"  fputs(text, file);",
+			"  fclose(file);",
+			"}",
+			"int main(int argc, char **argv) {",
+			'  if (argc > 1 && strcmp(argv[1], "--version") == 0) {',
+			'    puts("deno 2.9.3");',
+			"    return 0;",
+			"  }",
+			'  write_text(getenv("WT_FIXTURE_STARTED_FILE"), "started");',
+			"  pid_t child = fork();",
+			"  if (child < 0) return 1;",
+			"  if (child == 0) {",
+			'    execlp("sleep", "sleep", "1000", (char *)NULL);',
+			"    _exit(127);",
+			"  }",
+			"  char pid[32];",
+			'  snprintf(pid, sizeof(pid), "%d", (int)child);',
+			'  write_text(getenv("WT_FIXTURE_DESCENDANT_PID_FILE"), pid);',
+			'  puts("fixture smoke started");',
+			'  fputs("fixture smoke stderr\\n", stderr);',
+			"  fflush(stdout);",
+			"  fflush(stderr);",
+			"  for (;;) pause();",
+			"}",
 		].join("\n"),
 		"utf8",
 	);
-	chmodSync(runtime, 0o755);
+	const compiled = spawnSync("cc", ["-O2", source, "-o", runtime], {
+		encoding: "utf8",
+		timeout: 5_000,
+		killSignal: "SIGKILL",
+	});
+	if (compiled.status !== 0) {
+		throw new Error(
+			`fixture C runtime compilation failed (${compiled.status ?? compiled.signal ?? "unknown"})\n${compiled.stdout ?? ""}${compiled.stderr ?? ""}`,
+		);
+	}
 	trackedPidFiles.push(descendantPidFile);
 	return runtime;
 }
@@ -241,7 +274,10 @@ async function runGuarded(
 	return await new Promise((resolve) => {
 		const child = spawn(process.execPath, args, {
 			cwd: PROJECT_ROOT,
-			detached: process.platform !== "win32",
+			// The outer guard only owns this launcher; the package command itself
+			// performs the process-tree cleanup under test. Avoid adding a second
+			// detached process-group setup to the exact smoke startup path.
+			detached: false,
 			env,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
@@ -408,411 +444,415 @@ function packageCommandRunner(): PackageCommandRunner | undefined {
 		: undefined;
 }
 
-test.serial(
-	"exact-package smoke kills its hanging runtime descendant and preserves diagnostics",
-	async () => {
-		if (process.platform === "win32") return;
-		const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-test-"));
-		tempRoots.push(root);
-		const tarball = createFixtureTarball(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		const smokeStartedFile = join(root, "smoke.started");
-		const runtime = createHangingRuntime(root, descendantPidFile);
-		const guardedResult = runGuarded(
-			[
-				"scripts/test-package-artifact.ts",
-				"smoke",
-				tarball,
-				"--runtime",
-				"deno",
-			],
-			{
-				...process.env,
-				WEBTRANSPORT_DENO_COMMAND: runtime,
-				WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: "1500",
-				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
-				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
-				WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
-				WT_FIXTURE_STARTED_FILE: smokeStartedFile,
-			},
-			45_000,
-		);
-		// Under the full cold package suite, starting the nested runtime can be
-		// scheduler-delayed beyond the normal file-observation window. Keep the
-		// outer guard bounded, but always await it so a missed marker cannot leak
-		// the fixture process tree into later tests.
-		const smokeStarted = await fileAppearsWithin(smokeStartedFile, 30_000);
-		const startedAt = Date.now();
-		const result = await guardedResult;
-		const elapsedMs = Date.now() - startedAt;
-
-		expect(smokeStarted).toBe(true);
-		expect(result.error).toBeUndefined();
-		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("deno smoke timed out after 1500ms");
-		expect(result.stderr).toContain("fixture smoke started");
-		expect(result.stderr).toContain("fixture smoke stderr");
-		expect(elapsedMs).toBeLessThan(5_000);
-		await waitForFile(descendantPidFile);
-		await expectProcessExit(descendantPidFile);
-	},
-	60_000,
-);
-
-test.serial("win32 taskkill removes a genuine runtime descendant", async () => {
-	if (process.platform !== "win32") return;
-	const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
-	tempRoots.push(root);
-	const descendantPidFile = join(root, "descendant.pid");
-	const child = spawnHangingProcessTree(descendantPidFile);
-	await waitForFile(descendantPidFile);
-	const startedAt = Date.now();
-	await runBoundedWindowsTreeKill(child.pid as number, 5_000);
-
-	expect(Date.now() - startedAt).toBeLessThan(7_000);
-	await expectPidExit(child.pid as number);
-	await expectProcessExit(descendantPidFile);
-});
-
-test.serial(
-	"mocked win32 tree cleanup bounds taskkill and removes a genuine descendant",
-	async () => {
-		if (process.platform === "win32") return;
-		const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
-		tempRoots.push(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		const child = spawnHangingProcessTree(descendantPidFile);
-		const taskkill = createHangingTaskkill(root, descendantPidFile);
-		await waitForFile(descendantPidFile);
-		const previousArgsFile = process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;
-		const previousPidFile = process.env.WT_FIXTURE_TASKKILL_PID_FILE;
-		process.env.WT_FIXTURE_TASKKILL_ARGS_FILE = taskkill.argsFile;
-		process.env.WT_FIXTURE_TASKKILL_PID_FILE = taskkill.pidFile;
-		const startedAt = Date.now();
-		const taskkillTimeoutMs = 3_000;
-		let cleanupError: Error | undefined;
-		const cleanupPromise = capturedError(
-			runBoundedWindowsTreeKill(
-				child.pid as number,
-				taskkillTimeoutMs,
-				join(root, "taskkill"),
-			),
-		);
-		try {
-			// The mocked command writes its invocation evidence before sleeping.
-			// Wait for that bounded proof while the fixture environment is still
-			// installed; otherwise a loaded host can time out before /bin/sh has
-			// flushed the files, making the assertion race the test cleanup.
-			await waitForFile(taskkill.argsFile);
-			cleanupError = await cleanupPromise;
-		} finally {
-			if (previousArgsFile === undefined)
-				delete process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;
-			else process.env.WT_FIXTURE_TASKKILL_ARGS_FILE = previousArgsFile;
-			if (previousPidFile === undefined)
-				delete process.env.WT_FIXTURE_TASKKILL_PID_FILE;
-			else process.env.WT_FIXTURE_TASKKILL_PID_FILE = previousPidFile;
-		}
-		const elapsedMs = Date.now() - startedAt;
-
-		expect(readFileSync(taskkill.argsFile, "utf8").trim().split("\n")).toEqual([
-			"/PID",
-			String(child.pid),
-			"/T",
-			"/F",
-		]);
-		expect(cleanupError?.message).toContain(
-			`taskkill timed out after ${taskkillTimeoutMs}ms`,
-		);
-		expect(elapsedMs).toBeLessThan(5_000);
-		await expectPidExit(child.pid as number);
-		await expectProcessExit(descendantPidFile);
-		await expectProcessExit(taskkill.pidFile);
-	},
-);
-
-test.serial(
-	"win32 tree cleanup rejects when taskkill cannot start",
-	async () => {
-		if (process.platform === "win32") return;
-		const root = mkdtempSync(
-			join(tmpdir(), "wt-package-smoke-missing-taskkill-"),
-		);
-		tempRoots.push(root);
-		const startedAt = Date.now();
-		const cleanupError = await capturedError(
-			runBoundedWindowsTreeKill(123_456, 1_500, join(root, "missing-taskkill")),
-		);
-
-		expect(cleanupError?.message).toContain("taskkill failed to start");
-		expect(Date.now() - startedAt).toBeLessThan(3_000);
-	},
-);
-
-test.serial(
-	"win32 tree cleanup rejects nonzero taskkill without claiming a live descendant was removed",
-	async () => {
-		if (process.platform === "win32") return;
-		const root = mkdtempSync(
-			join(tmpdir(), "wt-package-smoke-failing-taskkill-"),
-		);
-		tempRoots.push(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		const child = spawnHangingProcessTree(descendantPidFile);
-		await waitForFile(descendantPidFile);
-		const taskkillTimeoutMs = 3_000;
-		const cleanupError = await capturedError(
-			runBoundedWindowsTreeKill(
-				child.pid as number,
-				taskkillTimeoutMs,
-				createFailingTaskkill(root),
-			),
-		);
-		const descendantPid = Number.parseInt(
-			readFileSync(descendantPidFile, "utf8"),
-			10,
-		);
-
-		expect(cleanupError?.message).toContain("taskkill exited with code 23");
-		expect(cleanupError?.message).toContain("fixture taskkill stdout");
-		expect(cleanupError?.message).toContain("fixture taskkill stderr");
-		expect(processIsAlive(child.pid as number)).toBe(true);
-		expect(processIsAlive(descendantPid)).toBe(true);
-	},
-);
-
-test.serial(
-	"bounded command reports unproven win32 cleanup and uses its direct-child fallback",
-	async () => {
-		if (process.platform === "win32") return;
-		const runPackageCommand = packageCommandRunner();
-		if (!runPackageCommand) return;
-		const root = mkdtempSync(
-			join(tmpdir(), "wt-package-command-cleanup-failure-"),
-		);
-		tempRoots.push(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		trackedPidFiles.push(descendantPidFile);
-		const cleanupError = await capturedError(
-			runPackageCommand(
-				process.execPath,
-				["-e", hangingProcessTreeSource(descendantPidFile, true)],
+describe.serial("package artifact cleanup", () => {
+	test.serial(
+		"exact-package smoke kills its hanging runtime descendant and preserves diagnostics",
+		async () => {
+			if (process.platform === "win32") return;
+			const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-test-"));
+			tempRoots.push(root);
+			const tarball = createFixtureTarball(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			const smokeStartedFile = join(root, "smoke.started");
+			const runtime = createHangingRuntime(root, descendantPidFile);
+			const guardedResult = runGuarded(
+				[
+					"scripts/test-package-artifact.ts",
+					"smoke",
+					tarball,
+					"--runtime",
+					"deno",
+				],
 				{
-					cwd: root,
-					label: "fixture windows command",
-					platform: "win32",
-					timeoutMs: 1_500,
-					windowsTreeKillCommand: createFailingTaskkill(root),
+					...process.env,
+					WEBTRANSPORT_DENO_COMMAND: runtime,
+					WEBTRANSPORT_PACKAGE_SMOKE_TIMEOUT_MS: "1500",
+					WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
+					WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "1000",
+					WT_FIXTURE_DESCENDANT_PID_FILE: descendantPidFile,
+					WT_FIXTURE_STARTED_FILE: smokeStartedFile,
 				},
-			),
-		);
-		await waitForFile(descendantPidFile);
-		const descendantPid = Number.parseInt(
-			readFileSync(descendantPidFile, "utf8"),
-			10,
-		);
+				45_000,
+			);
+			const startedAt = Date.now();
+			const result = await guardedResult;
+			const elapsedMs = Date.now() - startedAt;
+			// The guarded command has settled before this bounded marker check, so a
+			// delayed filesystem observation cannot race process-tree cleanup.
+			const smokeStarted = await fileAppearsWithin(smokeStartedFile, 1_000);
 
-		expect(cleanupError?.message).toContain(
-			"process-tree cleanup failed: taskkill exited with code 23",
-		);
-		expect(cleanupError?.message).toContain("fixture command stdout");
-		expect(cleanupError?.message).toContain("fixture command stderr");
-		expect(processIsAlive(descendantPid)).toBe(true);
-	},
-);
+			expect(smokeStarted).toBe(true);
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("deno smoke timed out after 1500ms");
+			expect(result.stderr).toContain("fixture smoke started");
+			expect(result.stderr).toContain("fixture smoke stderr");
+			expect(elapsedMs).toBeLessThan(5_000);
+			await waitForFile(descendantPidFile);
+			await expectProcessExit(descendantPidFile);
+		},
+		60_000,
+	);
 
-test.serial(
-	"bounded command preserves late descendant output when win32 cleanup cannot prove exit",
-	async () => {
-		if (process.platform === "win32") return;
-		const runPackageCommand = packageCommandRunner();
-		if (!runPackageCommand) return;
-		const root = mkdtempSync(
-			join(tmpdir(), "wt-package-command-win32-descendant-proof-"),
-		);
-		tempRoots.push(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		const triggerPath = join(root, "late.trigger");
-		trackedPidFiles.push(descendantPidFile);
-		const cleanupError = await capturedError(
-			runPackageCommand(
-				process.execPath,
-				["-e", delayedDescendantOutputSource(descendantPidFile, triggerPath)],
-				{
-					cwd: root,
-					label: "fixture windows command",
-					platform: "win32",
-					timeoutMs: 1_500,
-					processTreeProbe: (rootPid) =>
-						probeFixtureTree(rootPid, descendantPidFile),
-					windowsTreeKillCommand: createRootOnlyTaskkill(root, triggerPath),
-				},
-			),
-		);
-		await waitForFile(descendantPidFile);
-		await waitForFile(`${descendantPidFile}.late`);
-		const descendantPid = readPid(descendantPidFile);
+	test.serial(
+		"win32 taskkill removes a genuine runtime descendant",
+		async () => {
+			if (process.platform !== "win32") return;
+			const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
+			tempRoots.push(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			const child = spawnHangingProcessTree(descendantPidFile);
+			await waitForFile(descendantPidFile);
+			const startedAt = Date.now();
+			await runBoundedWindowsTreeKill(child.pid as number, 5_000);
 
-		expect(cleanupError?.message).toContain(
-			"process-tree cleanup failed: descendant exit unproven after taskkill exit 0",
-		);
-		expect(cleanupError?.message).toContain("fixture command stdout");
-		expect(cleanupError?.message).toContain("fixture command stderr");
-		expect(cleanupError?.message).toContain("late descendant stdout");
-		expect(cleanupError?.message).toContain("late descendant stderr");
-		expect(processIsAlive(descendantPid)).toBe(true);
-		try {
-			process.kill(descendantPid, "SIGKILL");
-		} catch {
-			// The negative control explicitly reaps its live descendant before returning.
-		}
-		await expectPidExit(descendantPid);
-	},
-);
+			expect(Date.now() - startedAt).toBeLessThan(7_000);
+			await expectPidExit(child.pid as number);
+			await expectProcessExit(descendantPidFile);
+		},
+	);
 
-test.serial(
-	"bounded command labels POSIX direct-child fallback as descendant exit unproven",
-	async () => {
-		if (process.platform === "win32") return;
-		const runPackageCommand = packageCommandRunner();
-		if (!runPackageCommand) return;
-		const root = mkdtempSync(
-			join(tmpdir(), "wt-package-command-posix-direct-child-fallback-"),
-		);
-		tempRoots.push(root);
-		const descendantPidFile = join(root, "descendant.pid");
-		trackedPidFiles.push(descendantPidFile);
-		const originalKill = process.kill.bind(process);
-		process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
-			if (pid < 0) {
-				throw new Error("fixture process-group kill unavailable");
+	test.serial(
+		"mocked win32 tree cleanup bounds taskkill and removes a genuine descendant",
+		async () => {
+			if (process.platform === "win32") return;
+			const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
+			tempRoots.push(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			const child = spawnHangingProcessTree(descendantPidFile);
+			const taskkill = createHangingTaskkill(root, descendantPidFile);
+			await waitForFile(descendantPidFile);
+			const previousArgsFile = process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;
+			const previousPidFile = process.env.WT_FIXTURE_TASKKILL_PID_FILE;
+			process.env.WT_FIXTURE_TASKKILL_ARGS_FILE = taskkill.argsFile;
+			process.env.WT_FIXTURE_TASKKILL_PID_FILE = taskkill.pidFile;
+			const startedAt = Date.now();
+			const taskkillTimeoutMs = 3_000;
+			let cleanupError: Error | undefined;
+			const cleanupPromise = capturedError(
+				runBoundedWindowsTreeKill(
+					child.pid as number,
+					taskkillTimeoutMs,
+					join(root, "taskkill"),
+				),
+			);
+			try {
+				// The mocked command writes its invocation evidence before sleeping.
+				// Wait for that bounded proof while the fixture environment is still
+				// installed; otherwise a loaded host can time out before /bin/sh has
+				// flushed the files, making the assertion race the test cleanup.
+				await waitForFile(taskkill.argsFile);
+				cleanupError = await cleanupPromise;
+			} finally {
+				if (previousArgsFile === undefined)
+					delete process.env.WT_FIXTURE_TASKKILL_ARGS_FILE;
+				else process.env.WT_FIXTURE_TASKKILL_ARGS_FILE = previousArgsFile;
+				if (previousPidFile === undefined)
+					delete process.env.WT_FIXTURE_TASKKILL_PID_FILE;
+				else process.env.WT_FIXTURE_TASKKILL_PID_FILE = previousPidFile;
 			}
-			return originalKill(pid, signal);
-		}) as typeof process.kill;
-		let cleanupError: Error | undefined;
-		try {
-			cleanupError = await capturedError(
+			const elapsedMs = Date.now() - startedAt;
+
+			expect(
+				readFileSync(taskkill.argsFile, "utf8").trim().split("\n"),
+			).toEqual(["/PID", String(child.pid), "/T", "/F"]);
+			expect(cleanupError?.message).toContain(
+				`taskkill timed out after ${taskkillTimeoutMs}ms`,
+			);
+			expect(elapsedMs).toBeLessThan(5_000);
+			await expectPidExit(child.pid as number);
+			await expectProcessExit(descendantPidFile);
+			await expectProcessExit(taskkill.pidFile);
+		},
+	);
+
+	test.serial(
+		"win32 tree cleanup rejects when taskkill cannot start",
+		async () => {
+			if (process.platform === "win32") return;
+			const root = mkdtempSync(
+				join(tmpdir(), "wt-package-smoke-missing-taskkill-"),
+			);
+			tempRoots.push(root);
+			const startedAt = Date.now();
+			const cleanupError = await capturedError(
+				runBoundedWindowsTreeKill(
+					123_456,
+					1_500,
+					join(root, "missing-taskkill"),
+				),
+			);
+
+			expect(cleanupError?.message).toContain("taskkill failed to start");
+			expect(Date.now() - startedAt).toBeLessThan(3_000);
+		},
+	);
+
+	test.serial(
+		"win32 tree cleanup rejects nonzero taskkill without claiming a live descendant was removed",
+		async () => {
+			if (process.platform === "win32") return;
+			const root = mkdtempSync(
+				join(tmpdir(), "wt-package-smoke-failing-taskkill-"),
+			);
+			tempRoots.push(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			const child = spawnHangingProcessTree(descendantPidFile);
+			await waitForFile(descendantPidFile);
+			const taskkillTimeoutMs = 3_000;
+			const cleanupError = await capturedError(
+				runBoundedWindowsTreeKill(
+					child.pid as number,
+					taskkillTimeoutMs,
+					createFailingTaskkill(root),
+				),
+			);
+			const descendantPid = Number.parseInt(
+				readFileSync(descendantPidFile, "utf8"),
+				10,
+			);
+
+			expect(cleanupError?.message).toContain("taskkill exited with code 23");
+			expect(cleanupError?.message).toContain("fixture taskkill stdout");
+			expect(cleanupError?.message).toContain("fixture taskkill stderr");
+			expect(processIsAlive(child.pid as number)).toBe(true);
+			expect(processIsAlive(descendantPid)).toBe(true);
+		},
+	);
+
+	test.serial(
+		"bounded command reports unproven win32 cleanup and uses its direct-child fallback",
+		async () => {
+			if (process.platform === "win32") return;
+			const runPackageCommand = packageCommandRunner();
+			if (!runPackageCommand) return;
+			const root = mkdtempSync(
+				join(tmpdir(), "wt-package-command-cleanup-failure-"),
+			);
+			tempRoots.push(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			trackedPidFiles.push(descendantPidFile);
+			const cleanupError = await capturedError(
 				runPackageCommand(
 					process.execPath,
 					["-e", hangingProcessTreeSource(descendantPidFile, true)],
 					{
 						cwd: root,
-						label: "fixture posix command",
+						label: "fixture windows command",
+						platform: "win32",
+						timeoutMs: 1_500,
+						windowsTreeKillCommand: createFailingTaskkill(root),
+					},
+				),
+			);
+			await waitForFile(descendantPidFile);
+			const descendantPid = Number.parseInt(
+				readFileSync(descendantPidFile, "utf8"),
+				10,
+			);
+
+			expect(cleanupError?.message).toContain(
+				"process-tree cleanup failed: taskkill exited with code 23",
+			);
+			expect(cleanupError?.message).toContain("fixture command stdout");
+			expect(cleanupError?.message).toContain("fixture command stderr");
+			expect(processIsAlive(descendantPid)).toBe(true);
+		},
+	);
+
+	test.serial(
+		"bounded command preserves late descendant output when win32 cleanup cannot prove exit",
+		async () => {
+			if (process.platform === "win32") return;
+			const runPackageCommand = packageCommandRunner();
+			if (!runPackageCommand) return;
+			const root = mkdtempSync(
+				join(tmpdir(), "wt-package-command-win32-descendant-proof-"),
+			);
+			tempRoots.push(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			const triggerPath = join(root, "late.trigger");
+			trackedPidFiles.push(descendantPidFile);
+			const cleanupError = await capturedError(
+				runPackageCommand(
+					process.execPath,
+					["-e", delayedDescendantOutputSource(descendantPidFile, triggerPath)],
+					{
+						cwd: root,
+						label: "fixture windows command",
+						platform: "win32",
 						timeoutMs: 1_500,
 						processTreeProbe: (rootPid) =>
 							probeFixtureTree(rootPid, descendantPidFile),
+						windowsTreeKillCommand: createRootOnlyTaskkill(root, triggerPath),
 					},
 				),
 			);
-		} finally {
-			process.kill = originalKill;
-		}
-		await waitForFile(descendantPidFile);
-		const descendantPid = readPid(descendantPidFile);
+			await waitForFile(descendantPidFile);
+			await waitForFile(`${descendantPidFile}.late`);
+			const descendantPid = readPid(descendantPidFile);
 
-		expect(cleanupError?.message).toContain(
-			"process-tree cleanup failed: descendant exit unproven after direct-child fallback",
-		);
-		expect(cleanupError?.message).toContain("fixture command stdout");
-		expect(cleanupError?.message).toContain("fixture command stderr");
-		expect(processIsAlive(descendantPid)).toBe(true);
-		try {
-			originalKill(descendantPid, "SIGKILL");
-		} catch {
-			// The negative control explicitly reaps its live descendant before returning.
-		}
-		await expectPidExit(descendantPid);
-	},
-);
-
-test.serial(
-	"bounded command rejects POSIX cleanup when process-group proof stays unverified",
-	async () => {
-		if (process.platform === "win32") return;
-		const runPackageCommand = packageCommandRunner();
-		if (!runPackageCommand) return;
-		const root = mkdtempSync(
-			join(tmpdir(), "wt-package-command-posix-proof-timeout-"),
-		);
-		tempRoots.push(root);
-		const previousKillGrace =
-			process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
-		const originalKill = process.kill.bind(process);
-		const previousTreeKillTimeout =
-			process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
-		process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS = "350";
-		process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS = "100";
-		process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
-			if (
-				pid < 0 &&
-				(signal === 0 || signal === undefined || signal === "SIGKILL")
-			) {
-				return true as never;
-			}
-			return originalKill(pid, signal);
-		}) as typeof process.kill;
-		let cleanupError: Error | undefined;
-		const startedAt = Date.now();
-		try {
-			cleanupError = await capturedError(
-				runPackageCommand(
-					process.execPath,
-					["-e", "setInterval(() => {}, 1_000);"],
-					{
-						cwd: root,
-						label: "fixture posix command",
-						timeoutMs: 600,
-					},
-				),
+			expect(cleanupError?.message).toContain(
+				"process-tree cleanup failed: descendant exit unproven after taskkill exit 0",
 			);
-		} finally {
-			process.kill = originalKill;
-			if (previousKillGrace === undefined) {
-				delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
-			} else {
-				process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS =
-					previousKillGrace;
+			expect(cleanupError?.message).toContain("fixture command stdout");
+			expect(cleanupError?.message).toContain("fixture command stderr");
+			expect(cleanupError?.message).toContain("late descendant stdout");
+			expect(cleanupError?.message).toContain("late descendant stderr");
+			expect(processIsAlive(descendantPid)).toBe(true);
+			try {
+				process.kill(descendantPid, "SIGKILL");
+			} catch {
+				// The negative control explicitly reaps its live descendant before returning.
 			}
-			if (previousTreeKillTimeout === undefined) {
-				delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
-			} else {
-				process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS =
-					previousTreeKillTimeout;
+			await expectPidExit(descendantPid);
+		},
+	);
+
+	test.serial(
+		"bounded command labels POSIX direct-child fallback as descendant exit unproven",
+		async () => {
+			if (process.platform === "win32") return;
+			const runPackageCommand = packageCommandRunner();
+			if (!runPackageCommand) return;
+			const root = mkdtempSync(
+				join(tmpdir(), "wt-package-command-posix-direct-child-fallback-"),
+			);
+			tempRoots.push(root);
+			const descendantPidFile = join(root, "descendant.pid");
+			trackedPidFiles.push(descendantPidFile);
+			const originalKill = process.kill.bind(process);
+			process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
+				if (pid < 0) {
+					throw new Error("fixture process-group kill unavailable");
+				}
+				return originalKill(pid, signal);
+			}) as typeof process.kill;
+			let cleanupError: Error | undefined;
+			try {
+				cleanupError = await capturedError(
+					runPackageCommand(
+						process.execPath,
+						["-e", hangingProcessTreeSource(descendantPidFile, true)],
+						{
+							cwd: root,
+							label: "fixture posix command",
+							timeoutMs: 1_500,
+							processTreeProbe: (rootPid) =>
+								probeFixtureTree(rootPid, descendantPidFile),
+						},
+					),
+				);
+			} finally {
+				process.kill = originalKill;
 			}
-		}
-		const elapsedMs = Date.now() - startedAt;
+			await waitForFile(descendantPidFile);
+			const descendantPid = readPid(descendantPidFile);
 
-		expect(cleanupError?.message).toContain(
-			"process-tree cleanup failed: descendant exit unproven after bounded process-group proof",
-		);
-		expect(elapsedMs).toBeLessThan(900);
-	},
-);
+			expect(cleanupError?.message).toContain(
+				"process-tree cleanup failed: descendant exit unproven after direct-child fallback",
+			);
+			expect(cleanupError?.message).toContain("fixture command stdout");
+			expect(cleanupError?.message).toContain("fixture command stderr");
+			expect(processIsAlive(descendantPid)).toBe(true);
+			try {
+				originalKill(descendantPid, "SIGKILL");
+			} catch {
+				// The negative control explicitly reaps its live descendant before returning.
+			}
+			await expectPidExit(descendantPid);
+		},
+	);
 
-test.serial(
-	"canonical package check bounds a hanging non-smoke npm command",
-	async () => {
-		if (process.platform === "win32") return;
-		const root = mkdtempSync(join(tmpdir(), "wt-package-command-timeout-"));
-		tempRoots.push(root);
-		createHangingNpm(root);
-		const startedAt = Date.now();
-		const result = await runGuarded(
-			["scripts/test-package-artifact.ts", "check"],
-			{
-				...process.env,
-				PATH: `${root}:${process.env.PATH ?? ""}`,
-				WEBTRANSPORT_PACKAGE_COMMAND_TIMEOUT_MS: "1500",
-				WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
-				WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "250",
-			},
-		);
+	test.serial(
+		"bounded command rejects POSIX cleanup when process-group proof stays unverified",
+		async () => {
+			if (process.platform === "win32") return;
+			const runPackageCommand = packageCommandRunner();
+			if (!runPackageCommand) return;
+			const root = mkdtempSync(
+				join(tmpdir(), "wt-package-command-posix-proof-timeout-"),
+			);
+			tempRoots.push(root);
+			const previousKillGrace =
+				process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
+			const originalKill = process.kill.bind(process);
+			const previousTreeKillTimeout =
+				process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
+			process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS = "350";
+			process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS = "100";
+			process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
+				if (
+					pid < 0 &&
+					(signal === 0 || signal === undefined || signal === "SIGKILL")
+				) {
+					return true as never;
+				}
+				return originalKill(pid, signal);
+			}) as typeof process.kill;
+			let cleanupError: Error | undefined;
+			const startedAt = Date.now();
+			try {
+				cleanupError = await capturedError(
+					runPackageCommand(
+						process.execPath,
+						["-e", "setInterval(() => {}, 1_000);"],
+						{
+							cwd: root,
+							label: "fixture posix command",
+							timeoutMs: 600,
+						},
+					),
+				);
+			} finally {
+				process.kill = originalKill;
+				if (previousKillGrace === undefined) {
+					delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS;
+				} else {
+					process.env.WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS =
+						previousKillGrace;
+				}
+				if (previousTreeKillTimeout === undefined) {
+					delete process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS;
+				} else {
+					process.env.WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS =
+						previousTreeKillTimeout;
+				}
+			}
+			const elapsedMs = Date.now() - startedAt;
 
-		expect(result.error).toBeUndefined();
-		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("npm pack timed out after 1500ms");
-		expect(result.stderr).toContain("fixture package helper stdout");
-		expect(result.stderr).toContain("fixture package helper stderr");
-		expect(Date.now() - startedAt).toBeLessThan(5_000);
-	},
-);
+			expect(cleanupError?.message).toContain(
+				"process-tree cleanup failed: descendant exit unproven after bounded process-group proof",
+			);
+			expect(elapsedMs).toBeLessThan(900);
+		},
+	);
+
+	test.serial(
+		"canonical package check bounds a hanging non-smoke npm command",
+		async () => {
+			if (process.platform === "win32") return;
+			const root = mkdtempSync(join(tmpdir(), "wt-package-command-timeout-"));
+			tempRoots.push(root);
+			createHangingNpm(root);
+			const startedAt = Date.now();
+			const result = await runGuarded(
+				["scripts/test-package-artifact.ts", "check"],
+				{
+					...process.env,
+					PATH: `${root}:${process.env.PATH ?? ""}`,
+					WEBTRANSPORT_PACKAGE_COMMAND_TIMEOUT_MS: "1500",
+					WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS: "100",
+					WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS: "250",
+				},
+			);
+
+			expect(result.error).toBeUndefined();
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("npm pack timed out after 1500ms");
+			expect(result.stderr).toContain("fixture package helper stdout");
+			expect(result.stderr).toContain("fixture package helper stderr");
+			expect(Date.now() - startedAt).toBeLessThan(5_000);
+		},
+	);
+});
