@@ -1364,121 +1364,153 @@ export type LoadSessionHandlerOptions = {
 export function createLoadSessionHandler(
 	logPrefix = "soak-addon",
 	options: LoadSessionHandlerOptions = {},
-): (session: ServerSession) => void {
-	return (session) => {
-		void (async () => {
-			try {
-				for await (const datagram of session.incomingDatagrams()) {
-					if (startsWithBytes(datagram, PROBE_DATAGRAM_PREFIX_BYTES)) {
-						await session.sendDatagram(datagram);
-						options.onDatagramEcho?.();
+): (session: ServerSession) => Promise<void> {
+	return async (session) => {
+		const tasks = new Set<Promise<void>>();
+		const trackTask = (task: Promise<void>): Promise<void> => {
+			tasks.add(task);
+			void task.finally(() => {
+				tasks.delete(task);
+			});
+			return task;
+		};
+		trackTask(
+			(async () => {
+				try {
+					for await (const datagram of session.incomingDatagrams()) {
+						if (startsWithBytes(datagram, PROBE_DATAGRAM_PREFIX_BYTES)) {
+							await session.sendDatagram(datagram);
+							options.onDatagramEcho?.();
+						}
+					}
+				} catch (error) {
+					reportLoadHandlerError(logPrefix, "datagram loop failed", error);
+				}
+			})(),
+		);
+		trackTask(
+			(async () => {
+				const reader = session.incomingBidirectionalStreams.getReader();
+				try {
+					while (true) {
+						const next = await readWithTimeout(
+							reader,
+							LOAD_IO_TIMEOUT_MS,
+							"incoming bidi stream",
+						);
+						if (next.done) return;
+						const duplex = next.value;
+						trackTask(
+							(async (duplex: WebIncomingBidi) => {
+								try {
+									const body = await collectReadable(
+										duplex.readable,
+										"bidi payload",
+									);
+									if (startsWithBytes(body, PROBE_BIDI_RESET_PREFIX_BYTES)) {
+										duplex[WT_RESET]?.(42);
+										return;
+									}
+									if (startsWithBytes(body, PROBE_BIDI_ECHO_PREFIX_BYTES)) {
+										await writeWebWritable(duplex.writable, body);
+										return;
+									}
+									if (startsWithBytes(body, LOAD_BIDI_PREFIX_BYTES)) {
+										const writer = duplex.writable.getWriter();
+										try {
+											await writer.close();
+										} finally {
+											writer.releaseLock();
+										}
+									}
+								} catch (error) {
+									reportLoadHandlerError(
+										logPrefix,
+										"bidi handler failed",
+										error,
+									);
+								}
+							})(duplex as WebIncomingBidi),
+						);
+					}
+				} catch (error) {
+					reportLoadHandlerError(logPrefix, "bidi loop failed", error);
+				} finally {
+					try {
+						reader.releaseLock();
+					} catch {
+						// Teardown can race lock release.
 					}
 				}
-			} catch (error) {
-				reportLoadHandlerError(logPrefix, "datagram loop failed", error);
-			}
-		})();
-		void (async () => {
-			const reader = session.incomingBidirectionalStreams.getReader();
-			try {
-				while (true) {
-					const next = await readWithTimeout(
-						reader,
-						LOAD_IO_TIMEOUT_MS,
-						"incoming bidi stream",
-					);
-					if (next.done) return;
-					const duplex = next.value;
-					void (async (duplex: WebIncomingBidi) => {
-						try {
-							const body = await collectReadable(
-								duplex.readable,
-								"bidi payload",
-							);
-							if (startsWithBytes(body, PROBE_BIDI_RESET_PREFIX_BYTES)) {
-								duplex[WT_RESET]?.(42);
-								return;
-							}
-							if (startsWithBytes(body, PROBE_BIDI_ECHO_PREFIX_BYTES)) {
-								await writeWebWritable(duplex.writable, body);
-								return;
-							}
-							if (startsWithBytes(body, LOAD_BIDI_PREFIX_BYTES)) {
-								const writer = duplex.writable.getWriter();
+			})(),
+		);
+		trackTask(
+			(async () => {
+				const reader = session.incomingUnidirectionalStreams.getReader();
+				try {
+					while (true) {
+						const next = await readWithTimeout(
+							reader,
+							LOAD_IO_TIMEOUT_MS,
+							"incoming uni stream",
+						);
+						if (next.done) return;
+						const incoming = requireReadValue(
+							next.value,
+							"incoming uni stream",
+						);
+						trackTask(
+							(async (incoming: WebIncomingUni) => {
 								try {
-									await writer.close();
-								} finally {
-									writer.releaseLock();
+									const { first, rest } = await readUniWithPeek(
+										incoming,
+										"uni payload",
+									);
+									if (!first) return;
+									if (startsWithBytes(first, PROBE_UNI_STOP_PREFIX_BYTES)) {
+										incoming[WT_STOP_SENDING]?.(0);
+										return;
+									}
+									const body = Buffer.concat([first, rest]);
+									if (startsWithBytes(body, PROBE_UNI_ECHO_PREFIX_BYTES)) {
+										const writable = await session.createUnidirectionalStream();
+										await new Promise<void>((resolve, reject) => {
+											writable.write(body, (error) =>
+												error ? reject(error) : resolve(),
+											);
+										});
+										await new Promise<void>((resolve, reject) => {
+											writable.end((error?: Error | null) =>
+												error ? reject(error) : resolve(),
+											);
+										});
+										return;
+									}
+									if (startsWithBytes(body, LOAD_UNI_PREFIX_BYTES)) return;
+								} catch (error) {
+									reportLoadHandlerError(
+										logPrefix,
+										"uni handler failed",
+										error,
+									);
 								}
-							}
-						} catch (error) {
-							reportLoadHandlerError(logPrefix, "bidi handler failed", error);
-						}
-					})(duplex as WebIncomingBidi);
+							})(incoming),
+						);
+					}
+				} catch (error) {
+					reportLoadHandlerError(logPrefix, "uni loop failed", error);
+				} finally {
+					try {
+						reader.releaseLock();
+					} catch {
+						// Teardown can race lock release.
+					}
 				}
-			} catch (error) {
-				reportLoadHandlerError(logPrefix, "bidi loop failed", error);
-			} finally {
-				try {
-					reader.releaseLock();
-				} catch {
-					// Teardown can race lock release.
-				}
-			}
-		})();
-		void (async () => {
-			const reader = session.incomingUnidirectionalStreams.getReader();
-			try {
-				while (true) {
-					const next = await readWithTimeout(
-						reader,
-						LOAD_IO_TIMEOUT_MS,
-						"incoming uni stream",
-					);
-					if (next.done) return;
-					const incoming = requireReadValue(next.value, "incoming uni stream");
-					void (async (incoming: WebIncomingUni) => {
-						try {
-							const { first, rest } = await readUniWithPeek(
-								incoming,
-								"uni payload",
-							);
-							if (!first) return;
-							if (startsWithBytes(first, PROBE_UNI_STOP_PREFIX_BYTES)) {
-								incoming[WT_STOP_SENDING]?.(0);
-								return;
-							}
-							const body = Buffer.concat([first, rest]);
-							if (startsWithBytes(body, PROBE_UNI_ECHO_PREFIX_BYTES)) {
-								const writable = await session.createUnidirectionalStream();
-								await new Promise<void>((resolve, reject) => {
-									writable.write(body, (error) =>
-										error ? reject(error) : resolve(),
-									);
-								});
-								await new Promise<void>((resolve, reject) => {
-									writable.end((error?: Error | null) =>
-										error ? reject(error) : resolve(),
-									);
-								});
-								return;
-							}
-							if (startsWithBytes(body, LOAD_UNI_PREFIX_BYTES)) return;
-						} catch (error) {
-							reportLoadHandlerError(logPrefix, "uni handler failed", error);
-						}
-					})(incoming);
-				}
-			} catch (error) {
-				reportLoadHandlerError(logPrefix, "uni loop failed", error);
-			} finally {
-				try {
-					reader.releaseLock();
-				} catch {
-					// Teardown can race lock release.
-				}
-			}
-		})();
+			})(),
+		);
+		while (tasks.size > 0) {
+			await Promise.allSettled([...tasks]);
+		}
 	};
 }
 

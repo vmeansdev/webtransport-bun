@@ -31,6 +31,14 @@ afterEach(async () => {
 	await harness.cleanup();
 });
 
+function deferred<T = void>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((res) => {
+		resolve = res;
+	});
+	return { promise, resolve };
+}
+
 function trackedCreateServer(...args: Parameters<typeof createServer>) {
 	return harness.track(createServer(...args));
 }
@@ -180,6 +188,48 @@ describe("close-path promise settlement", () => {
 
 		expect(info).not.toBe("timeout");
 		await server.close();
+	}, 15000);
+
+	it("server close waits for an in-flight onSession promise to drain", async () => {
+		const port = nextPort(BASE_PORT, 1000);
+		const sessionAccepted = deferred<void>();
+		const releaseHandler = deferred<void>();
+		const server = trackedCreateServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: async () => {
+				sessionAccepted.resolve();
+				await releaseHandler.promise;
+			},
+		});
+
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		await withTimeout(
+			sessionAccepted.promise,
+			5_000,
+			"hardening wait for session acceptance",
+		);
+
+		const closePromise = server.close();
+		const closeState = await Promise.race([
+			closePromise.then(() => "resolved"),
+			Bun.sleep(100).then(() => "pending"),
+		]);
+		expect(closeState).toBe("pending");
+
+		releaseHandler.resolve();
+		await expect(
+			withTimeout(
+				closePromise,
+				5_000,
+				"hardening wait for server close handler drain",
+			),
+		).resolves.toBeUndefined();
+		await expect(
+			withTimeout(client.closed, 5_000, "hardening wait for client.closed"),
+		).resolves.toBeTruthy();
 	}, 15000);
 });
 

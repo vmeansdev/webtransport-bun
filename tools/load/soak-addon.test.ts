@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import {
 	aggregateSegments,
+	createLoadSessionHandler,
 	computeSegmentObservedOperationCounts,
 	evaluateTrendAndRecovery,
 	type Sample,
@@ -204,6 +205,17 @@ function runAggregate(input: string, output: string) {
 		encoding: "utf8",
 		env: { ...process.env, SOAK_AGGREGATE_OUT: output },
 	});
+}
+
+function deferred<T = void>(): {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+} {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((res) => {
+		resolve = res;
+	});
+	return { promise, resolve };
 }
 
 describe("soak campaign integrity", () => {
@@ -585,6 +597,58 @@ describe("hosted soak orchestration policy", () => {
 		expect(workflow).toContain("baselineMetrics");
 		expect(workflow).toContain("heapUsedMb");
 		expect(workflow).toContain("sockets");
+	});
+});
+
+describe("createLoadSessionHandler", () => {
+	test("returns a drain promise that waits for spawned bidi work", async () => {
+		const releaseBody = deferred<void>();
+		const chunk = new TextEncoder().encode("load-bidi:test");
+		const bidiBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(chunk);
+				void releaseBody.promise.then(() => controller.close());
+			},
+		});
+		const incomingBidi = new ReadableStream({
+			start(controller) {
+				controller.enqueue({
+					readable: bidiBody,
+					writable: new WritableStream<Uint8Array>(),
+				});
+				controller.close();
+			},
+		});
+		const session = {
+			incomingDatagrams(): AsyncIterable<Uint8Array> {
+				return {
+					async *[Symbol.asyncIterator]() {},
+				};
+			},
+			incomingBidirectionalStreams: incomingBidi,
+			incomingUnidirectionalStreams: new ReadableStream({
+				start(controller) {
+					controller.close();
+				},
+			}),
+			createUnidirectionalStream: async () => {
+				throw new Error("unexpected createUnidirectionalStream");
+			},
+			sendDatagram: async () => undefined,
+		} as any;
+
+		const drain = createLoadSessionHandler("test")(session);
+		expect(drain).toBeInstanceOf(Promise);
+		if (!(drain instanceof Promise)) return;
+
+		const beforeRelease = await Promise.race([
+			drain.then(() => "resolved"),
+			Bun.sleep(25).then(() => "pending"),
+		]);
+		expect(beforeRelease).toBe("pending");
+
+		releaseBody.resolve();
+		await expect(drain).resolves.toBeUndefined();
 	});
 });
 
