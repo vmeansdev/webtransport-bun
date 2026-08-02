@@ -30,6 +30,7 @@ pub mod session;
 pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
+pub mod transport_memory;
 pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
@@ -487,9 +488,12 @@ pub(crate) fn spawn_wtransport_server(
             // buffer more than the advertised byte budgets. Headroom of 16 streams
             // covers H3 control/QPACK/settings streams outside the app caps.
             let mut transport = wtransport::config::QuicTransportConfig::default();
+            let memory_policy = transport_memory::TransportMemoryPolicy::from_limits(&limits);
             let clamp_varint = |n: u64| -> wtransport::quinn::VarInt {
-                wtransport::quinn::VarInt::from_u64(n.min(wtransport::quinn::VarInt::MAX.into_inner()))
-                    .unwrap_or(wtransport::quinn::VarInt::MAX)
+                wtransport::quinn::VarInt::from_u64(
+                    n.min(wtransport::quinn::VarInt::MAX.into_inner()),
+                )
+                .unwrap_or(wtransport::quinn::VarInt::MAX)
             };
             transport.max_concurrent_bidi_streams(clamp_varint(
                 limits.max_streams_per_session_bidi.saturating_add(16),
@@ -497,12 +501,7 @@ pub(crate) fn spawn_wtransport_server(
             transport.max_concurrent_uni_streams(clamp_varint(
                 limits.max_streams_per_session_uni.saturating_add(16),
             ));
-            transport.stream_receive_window(clamp_varint(limits.max_queued_bytes_per_stream));
-            transport.receive_window(clamp_varint(
-                limits
-                    .max_queued_bytes_per_session
-                    .saturating_add(64 * 1024),
-            ));
+            memory_policy.apply_flow_control(&mut transport);
             client::apply_congestion_controller(&mut transport, congestion_control);
             let config_builder = ServerConfig::builder()
             .with_bind_address(bind_addr)
