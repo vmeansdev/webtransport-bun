@@ -9,6 +9,7 @@ use crate::limits::Limits;
 
 pub(crate) const QUIC_VARINT_MAX: u64 = (1u64 << 62) - 1;
 pub(crate) const DATAGRAM_CHANNEL_CAPACITY_CEILING: usize = 2048;
+pub(crate) const H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TransportMemoryPolicy {
@@ -58,6 +59,40 @@ impl TransportMemoryPolicy {
         }
     }
 
+    pub(crate) fn with_datagram_buffers(
+        self,
+        limits: &Limits,
+        receive_buffer_size: usize,
+        send_buffer_size: usize,
+    ) -> Self {
+        let payload_floor = limits.max_datagram_size.max(1);
+        Self {
+            datagram_receive_buffer_size: Some(receive_buffer_size.max(payload_floor)),
+            datagram_send_buffer_size: Some(send_buffer_size.max(payload_floor)),
+            ..self
+        }
+    }
+
+    pub(crate) fn with_h1b_datagram_buffers(self, limits: &Limits) -> Self {
+        self.with_datagram_buffers(
+            limits,
+            H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES,
+            H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES,
+        )
+    }
+
+    pub(crate) fn apply_datagram_buffers(
+        &self,
+        config: &mut wtransport::config::QuicTransportConfig,
+    ) {
+        if let Some(receive) = self.datagram_receive_buffer_size {
+            config.datagram_receive_buffer_size(Some(receive));
+        }
+        if let Some(send) = self.datagram_send_buffer_size {
+            config.datagram_send_buffer_size(send);
+        }
+    }
+
     pub(crate) fn apply_flow_control(&self, config: &mut wtransport::config::QuicTransportConfig) {
         let stream =
             wtransport::quinn::VarInt::from_u64(clamp_quic_window(self.stream_receive_window))
@@ -83,7 +118,7 @@ fn ceil_div(numerator: u64, denominator: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::TransportMemoryPolicy;
+    use super::{TransportMemoryPolicy, H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES};
     use crate::limits::Limits;
 
     #[test]
@@ -147,5 +182,33 @@ mod tests {
         let mut config = wtransport::config::QuicTransportConfig::default();
 
         policy.apply_flow_control(&mut config);
+    }
+
+    #[test]
+    fn clamps_datagram_buffers_to_the_configured_payload_floor() {
+        let mut limits = Limits::default();
+        limits.max_datagram_size = 1200;
+        let policy =
+            TransportMemoryPolicy::from_limits(&limits).with_datagram_buffers(&limits, 64, 32);
+
+        assert_eq!(policy.datagram_receive_buffer_size, Some(1200));
+        assert_eq!(policy.datagram_send_buffer_size, Some(1200));
+    }
+
+    #[test]
+    fn applies_h1b_datagram_snapshot_to_real_quic_transport_config() {
+        let limits = Limits::default();
+        let policy = TransportMemoryPolicy::from_limits(&limits).with_h1b_datagram_buffers(&limits);
+        assert_eq!(
+            policy.datagram_receive_buffer_size,
+            Some(H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES)
+        );
+        assert_eq!(
+            policy.datagram_send_buffer_size,
+            Some(H1B_DATAGRAM_BUFFER_CANDIDATE_BYTES)
+        );
+        let mut config = wtransport::config::QuicTransportConfig::default();
+
+        policy.apply_datagram_buffers(&mut config);
     }
 }

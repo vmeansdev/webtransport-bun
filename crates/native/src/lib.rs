@@ -488,7 +488,8 @@ pub(crate) fn spawn_wtransport_server(
             // buffer more than the advertised byte budgets. Headroom of 16 streams
             // covers H3 control/QPACK/settings streams outside the app caps.
             let mut transport = wtransport::config::QuicTransportConfig::default();
-            let memory_policy = transport_memory::TransportMemoryPolicy::from_limits(&limits);
+            let memory_policy = transport_memory::TransportMemoryPolicy::from_limits(&limits)
+                .with_h1b_datagram_buffers(&limits);
             let clamp_varint = |n: u64| -> wtransport::quinn::VarInt {
                 wtransport::quinn::VarInt::from_u64(
                     n.min(wtransport::quinn::VarInt::MAX.into_inner()),
@@ -502,6 +503,7 @@ pub(crate) fn spawn_wtransport_server(
                 limits.max_streams_per_session_uni.saturating_add(16),
             ));
             memory_policy.apply_flow_control(&mut transport);
+            memory_policy.apply_datagram_buffers(&mut transport);
             client::apply_congestion_controller(&mut transport, congestion_control);
             let config_builder = ServerConfig::builder()
             .with_bind_address(bind_addr)
