@@ -40,6 +40,7 @@ fuzz_target!(|data: &[u8]| {
             conn,
             session_id,
             code,
+            reason: String::new(),
         },
         WtEvent::StreamOpened {
             conn,

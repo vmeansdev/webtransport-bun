@@ -152,10 +152,10 @@ fuzz_target!(|data: &[u8]| {
 
         match data.get(offset).copied().unwrap_or(0) % 5 {
             0 => {
-                let _ = client.send_datagram(client_conn, payload(data, offset + 1));
+                let _ = client.send_datagram(client_conn, 0, payload(data, offset + 1));
             }
             1 => {
-                let stream = client.open_stream(client_conn, true);
+                let stream = client.open_stream(client_conn, 0, true);
                 if stream >= 0 {
                     let stream = stream as u32;
                     let _ = client.stream_write(stream, payload(data, offset + 1));
@@ -164,12 +164,12 @@ fuzz_target!(|data: &[u8]| {
             }
             2 => {
                 if let Some(conn) = server_conn {
-                    let _ = server.send_datagram(conn, payload(data, offset + 1));
+                    let _ = server.send_datagram(conn, 0, payload(data, offset + 1));
                 }
             }
             3 => {
                 if let Some(conn) = server_conn {
-                    let stream = server.open_stream(conn, true);
+                    let stream = server.open_stream(conn, 0, true);
                     if stream >= 0 {
                         let stream = stream as u32;
                         let _ = server.stream_write(stream, payload(data, offset + 1));
