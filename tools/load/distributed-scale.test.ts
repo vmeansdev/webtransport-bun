@@ -9,6 +9,7 @@ import {
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
 	evaluateWorkloadEvidence,
+	nativeTransportPolicySnapshot,
 	type FinalGauges,
 	runCommandWithBoundedOutput,
 	type ScaleCampaignConfig,
@@ -48,6 +49,18 @@ describe("Task 14 distributed scale evidence", () => {
 		expect(source).not.toMatch(
 			/clientSummaries\.filter\([\s\S]*?sourceIdentityCount/,
 		);
+	});
+
+	test("records the selected native transport policy for memory evidence", () => {
+		const policy = nativeTransportPolicySnapshot();
+
+		expect(policy.streamReceiveWindowBytes).toBe(262_144);
+		expect(policy.receiveWindowBytes).toBe(2 * 1024 * 1024);
+		expect(policy.sendWindowBytes).toBe(2 * 1024 * 1024);
+		expect(policy.datagramReceiveBufferBytes).toBe(64 * 1024);
+		expect(policy.datagramSendBufferBytes).toBe(64 * 1024);
+		expect(policy.datagramChannelCapacity).toBe(2048);
+		expect(policy.datagramChannelPolicy).toBe("fixed-h2-candidate-disproved");
 	});
 
 	test("actively exercises server datagram and bidi/uni stream opens so server histograms are real", () => {
