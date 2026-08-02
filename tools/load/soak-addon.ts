@@ -1578,6 +1578,23 @@ export function phasePlan(durationSeconds: number): {
 	];
 }
 
+/**
+ * Return the sampling deadline needed to observe the final phase's bounded
+ * recovery window. The legacy duration+90s floor is retained for long runs,
+ * but short schedules can place their final phase after that floor.
+ */
+export function phaseSamplingHorizonMs(durationSeconds: number): number {
+	const minimumHorizonMs = (durationSeconds + 90) * 1000;
+	const lastPhase = phasePlan(durationSeconds).at(-1);
+	if (!lastPhase) return minimumHorizonMs;
+	const lastPhaseEndMs = lastPhase.startOffsetMs + lastPhase.durationMs;
+	const recoveryWindowMs = Math.max(
+		60_000,
+		Math.floor(lastPhase.durationMs / 2),
+	);
+	return Math.max(minimumHorizonMs, lastPhaseEndMs + recoveryWindowMs);
+}
+
 export function soakStreamRateLimitPerSec(
 	sessions: number,
 	streamsPerSec: number,
@@ -1936,7 +1953,7 @@ async function runSegment(): Promise<void> {
 	let peakStreams = 0;
 
 	const poller = (async () => {
-		while (Date.now() - startedAtMs < (DURATION + 90) * 1000) {
+		while (Date.now() - startedAtMs < phaseSamplingHorizonMs(DURATION)) {
 			const metrics = server.metricsSnapshot();
 			peakSessions = Math.max(peakSessions, metrics.sessionsActive);
 			peakStreams = Math.max(peakStreams, metrics.streamsActive);

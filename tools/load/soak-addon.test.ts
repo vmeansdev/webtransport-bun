@@ -18,6 +18,7 @@ import {
 	evaluateTrendAndRecovery,
 	phaseLoadDurationSeconds,
 	phasePlan,
+	phaseSamplingHorizonMs,
 	sampleIntervalMs,
 	soakDatagramRateLimitPerSec,
 	soakPhaseSessionCount,
@@ -42,6 +43,18 @@ test("scales short smoke phase slots to fit the bounded CI window", () => {
 	expect(
 		(phases.at(-1)?.startOffsetMs ?? 0) + (phases.at(-1)?.durationMs ?? 0),
 	).toBe(180_000);
+});
+
+test("samples through the final short-soak recovery window", () => {
+	const durationSeconds = 120;
+	const lastPhase = phasePlan(durationSeconds).at(-1);
+	const lastPhaseEndMs =
+		(lastPhase?.startOffsetMs ?? 0) + (lastPhase?.durationMs ?? 0);
+
+	expect(phaseSamplingHorizonMs(durationSeconds)).toBe(240_000);
+	expect(phaseSamplingHorizonMs(durationSeconds)).toBeGreaterThanOrEqual(
+		lastPhaseEndMs + 60_000,
+	);
 });
 
 test("keeps short phase clients inside their scheduled slots", () => {
