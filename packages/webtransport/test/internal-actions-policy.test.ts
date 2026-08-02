@@ -11,33 +11,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
-const PUBLISH_WORKFLOW = readFileSync(
+function readText(path: string): string {
+	return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
+const PUBLISH_WORKFLOW = readText(
 	join(PROJECT_ROOT, ".github", "workflows", "publish.yml"),
-	"utf8",
 );
-const RELEASE_WORKFLOW = readFileSync(
+const RELEASE_WORKFLOW = readText(
 	join(PROJECT_ROOT, ".github", "workflows", "release.yml"),
-	"utf8",
 );
-const COVERAGE_WORKFLOW = readFileSync(
+const COVERAGE_WORKFLOW = readText(
 	join(PROJECT_ROOT, ".github", "workflows", "coverage.yml"),
-	"utf8",
 );
-const TEST_WORKFLOW = readFileSync(
+const TEST_WORKFLOW = readText(
 	join(PROJECT_ROOT, ".github", "workflows", "test.yml"),
-	"utf8",
 );
-const SOAK_WORKFLOW = readFileSync(
+const SOAK_WORKFLOW = readText(
 	join(PROJECT_ROOT, ".github", "workflows", "soak-long.yml"),
-	"utf8",
 );
-const LOCAL_CI_SCRIPT = readFileSync(
+const LOCAL_CI_SCRIPT = readText(
 	join(PROJECT_ROOT, "scripts", "test_ci_local.sh"),
-	"utf8",
 );
-const NATIVE_BUILD_SCRIPT = readFileSync(
+const NATIVE_BUILD_SCRIPT = readText(
 	join(PROJECT_ROOT, "scripts", "build-native.ts"),
-	"utf8",
 );
 const RELEASE_TOOLCHAIN = JSON.parse(
 	readFileSync(join(PROJECT_ROOT, ".github", "release-toolchain.json"), "utf8"),

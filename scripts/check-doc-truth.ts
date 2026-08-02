@@ -71,16 +71,17 @@ const EXACT_CONSTRUCTOR = "Builder::new_multi_thread().worker_threads(1)";
 type Violation = { location: string; message: string };
 const violations: Violation[] = [];
 
+function repoRelative(path: string): string {
+	return relative(ROOT, path).replaceAll("\\", "/");
+}
+
 function report(location: string, message: string): void {
 	violations.push({ location, message });
 }
 
 function readText(path: string): string | undefined {
 	if (!existsSync(path)) {
-		report(
-			relative(ROOT, path),
-			"required documentation-truth input is missing",
-		);
+		report(repoRelative(path), "required documentation-truth input is missing");
 		return undefined;
 	}
 	return readFileSync(path, "utf8");
@@ -93,7 +94,7 @@ function readStatus(): ReleaseStatus | undefined {
 		return JSON.parse(text) as ReleaseStatus;
 	} catch (error) {
 		report(
-			relative(ROOT, STATUS_PATH),
+			repoRelative(STATUS_PATH),
 			`must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`,
 		);
 		return undefined;
@@ -349,7 +350,7 @@ function checkRuntimeContract(): void {
 	if (architecture === undefined || source === undefined) return;
 	if (!architecture.includes(EXACT_CONSTRUCTOR)) {
 		report(
-			relative(ROOT, ARCHITECTURE_PATH),
+			repoRelative(ARCHITECTURE_PATH),
 			`must state the exact runtime constructor ${EXACT_CONSTRUCTOR}`,
 		);
 	}
@@ -359,7 +360,7 @@ function checkRuntimeContract(): void {
 	] as const) {
 		const block = runtimeBlock(source, name);
 		if (!block) {
-			report(relative(ROOT, RUNTIME_SOURCE_PATH), `missing ${name} runtime`);
+			report(repoRelative(RUNTIME_SOURCE_PATH), `missing ${name} runtime`);
 			continue;
 		}
 		if (
@@ -367,13 +368,13 @@ function checkRuntimeContract(): void {
 			block.includes("new_current_thread")
 		) {
 			report(
-				relative(ROOT, RUNTIME_SOURCE_PATH),
+				repoRelative(RUNTIME_SOURCE_PATH),
 				`${name} contradicts ${EXACT_CONSTRUCTOR}`,
 			);
 		}
 		if (!block.includes(`.thread_name("${threadName}")`)) {
 			report(
-				relative(ROOT, RUNTIME_SOURCE_PATH),
+				repoRelative(RUNTIME_SOURCE_PATH),
 				`${name} must retain dedicated thread name ${threadName}`,
 			);
 		}
@@ -385,13 +386,13 @@ function checkNarrativeStatusTruth(): void {
 	if (faq !== undefined) {
 		if (/zero known P[0-4]/i.test(faq)) {
 			report(
-				relative(ROOT, FAQ_PATH),
+				repoRelative(FAQ_PATH),
 				"must not claim zero known P-level findings outside the commit-bound review manifest",
 			);
 		}
 		if (!faq.includes("docs/release-status.json")) {
 			report(
-				relative(ROOT, FAQ_PATH),
+				repoRelative(FAQ_PATH),
 				"production-readiness answer must defer to docs/release-status.json",
 			);
 		}
@@ -401,13 +402,13 @@ function checkNarrativeStatusTruth(): void {
 	if (historicalPlan !== undefined) {
 		if (!historicalPlan.includes("Historical plan (superseded)")) {
 			report(
-				relative(ROOT, HISTORICAL_HARDENING_PLAN_PATH),
+				repoRelative(HISTORICAL_HARDENING_PLAN_PATH),
 				"superseded native-only plan must carry an explicit historical banner",
 			);
 		}
 		if (!historicalPlan.includes("docs/release-status.json")) {
 			report(
-				relative(ROOT, HISTORICAL_HARDENING_PLAN_PATH),
+				repoRelative(HISTORICAL_HARDENING_PLAN_PATH),
 				"superseded plan must point to the canonical current status",
 			);
 		}
@@ -417,13 +418,13 @@ function checkNarrativeStatusTruth(): void {
 	if (compatibility !== undefined) {
 		if (!compatibility.includes("configured 1.0 release targets")) {
 			report(
-				relative(ROOT, COMPATIBILITY_PATH),
+				repoRelative(COMPATIBILITY_PATH),
 				"compatibility matrices must identify themselves as configured release targets",
 			);
 		}
 		if (!compatibility.includes("docs/release-status.json")) {
 			report(
-				relative(ROOT, COMPATIBILITY_PATH),
+				repoRelative(COMPATIBILITY_PATH),
 				"compatibility policy must defer support claims to docs/release-status.json",
 			);
 		}
@@ -435,7 +436,7 @@ function checkNarrativeStatusTruth(): void {
 		for (const requiredGate of ["fuzz", "package-consumers"]) {
 			if (!releaseDocs.includes(requiredGate)) {
 				report(
-					relative(ROOT, path),
+					repoRelative(path),
 					`must name the release-blocking ${requiredGate} gate`,
 				);
 			}
@@ -464,7 +465,7 @@ function checkNarrativeStatusTruth(): void {
 	] as const) {
 		const readme = readText(path);
 		if (readme === undefined) continue;
-		const location = relative(ROOT, path);
+		const location = repoRelative(path);
 		if (!readme.includes(statusRef)) {
 			report(
 				location,
