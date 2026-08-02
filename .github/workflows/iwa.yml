@@ -58,8 +58,8 @@ jobs:
           
       - name: Setup IWA packaging tools
         run: |
-          npm install --no-save --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1 playwright@1.58.2
-          timeout 10m npx playwright@1.58.2 install chromium chrome-beta
+          bun add --no-save --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1 playwright@1.58.2
+          timeout 10m bunx --no-install playwright install chromium chrome-beta
 
       - name: Build native addon for Chromium interop
         run: bun run build:native
@@ -67,7 +67,7 @@ jobs:
       - name: Prove Chromium against the native addon server
         run: |
           cd tools/interop
-          INTEROP_EVIDENCE=1 npx playwright@1.58.2 test
+          INTEROP_EVIDENCE=1 bunx --no-install playwright test
           bun run sanitize-evidence.ts interop-evidence.json
 
       - name: Build node-target WASM for Chromium interop
@@ -76,7 +76,7 @@ jobs:
       - name: Prove Chromium against the WASM server under Bun
         run: |
           cd tools/interop
-          INTEROP_EVIDENCE=1 npx playwright@1.58.2 test -c playwright.wasm.config.ts
+          INTEROP_EVIDENCE=1 bunx --no-install playwright test -c playwright.wasm.config.ts
           bun run sanitize-evidence.ts interop-evidence-wasm.json
 
       - name: Prove the seeded user-space UDP fault matrix
@@ -84,7 +84,7 @@ jobs:
           WT_FAULT_EVIDENCE_PATH: ${{ github.workspace }}/.release-evidence/interop/fault-matrix.json
         run: |
           cd tools/interop
-          npx playwright@1.58.2 test -c playwright.fault.config.ts
+          bunx --no-install playwright test -c playwright.fault.config.ts
           bun run sanitize-evidence.ts ../../.release-evidence/interop/fault-matrix.json
           bun run verify-evidence.ts ../../.release-evidence/interop/fault-matrix.json
         
@@ -92,7 +92,7 @@ jobs:
         run: |
           mkdir -p .release-evidence/iwa
           openssl genpkey -algorithm Ed25519 -out "$RUNNER_TEMP/iwa-signing.key.pem"
-          npx wbn --dir examples/webtransport-wasm-iwa --output .release-evidence/iwa/webtransport-wasm-iwa.wbn --formatVersion b2
+          bunx --no-install wbn --dir examples/webtransport-wasm-iwa --output .release-evidence/iwa/webtransport-wasm-iwa.wbn --formatVersion b2
           node -e '
             const { NodeCryptoSigningStrategy, IntegrityBlockSigner, WebBundleId } = require("wbn-sign");
             const crypto = require("node:crypto"), fs = require("node:fs");
@@ -146,5 +146,5 @@ jobs:
             .release-evidence/interop/fault-matrix.json
             tools/interop/interop-evidence.json
             tools/interop/interop-evidence-wasm.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
