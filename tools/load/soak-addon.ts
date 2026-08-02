@@ -1537,6 +1537,11 @@ export function phasePlan(durationSeconds: number): {
 	];
 }
 
+export function phaseLoadDurationSeconds(durationMs: number): number {
+	const minimumDurationSeconds = durationMs >= 45_000 ? 45 : 5;
+	return Math.max(minimumDurationSeconds, Math.floor(durationMs / 1000));
+}
+
 type CapturedOutput = {
 	promise: Promise<string>;
 	cancel: () => Promise<void>;
@@ -1881,7 +1886,7 @@ async function runSegment(): Promise<void> {
 								"--sessions",
 								String(Math.max(50, Math.floor(SESSIONS * 0.6))),
 								"--duration",
-								String(Math.max(45, Math.floor(phase.durationMs / 1000))),
+								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--datagrams-per-sec",
 								String(Math.max(DATAGRAMS_PER_SEC * 2, 1000)),
 								"--streams-per-sec",
@@ -1909,7 +1914,7 @@ async function runSegment(): Promise<void> {
 								"--sessions",
 								String(Math.max(20, Math.floor(SESSIONS * 0.2))),
 								"--duration",
-								String(Math.max(45, Math.floor(phase.durationMs / 1000))),
+								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--datagrams-per-sec",
 								"0",
 								"--streams-per-sec",
@@ -1937,7 +1942,7 @@ async function runSegment(): Promise<void> {
 								"--sessions",
 								String(Math.max(40, Math.floor(SESSIONS * 0.35))),
 								"--duration",
-								String(Math.max(45, Math.floor(phase.durationMs / 1000))),
+								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--hold-ms",
 								"1000",
 								"--max-session-errors",
@@ -1964,7 +1969,7 @@ async function runSegment(): Promise<void> {
 								"--sessions",
 								String(Math.max(30, Math.floor(SESSIONS * 0.25))),
 								"--duration",
-								String(Math.max(45, Math.floor(phase.durationMs / 1000))),
+								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--datagrams-per-sec",
 								String(Math.max(50, Math.floor(DATAGRAMS_PER_SEC * 0.4))),
 								"--streams-per-sec",

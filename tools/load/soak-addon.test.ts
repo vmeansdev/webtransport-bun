@@ -16,6 +16,7 @@ import {
 	createLoadSessionHandler,
 	computeSegmentObservedOperationCounts,
 	evaluateTrendAndRecovery,
+	phaseLoadDurationSeconds,
 	phasePlan,
 	type Sample,
 } from "./soak-addon.ts";
@@ -37,6 +38,11 @@ test("scales short smoke phase slots to fit the bounded CI window", () => {
 	expect(
 		(phases.at(-1)?.startOffsetMs ?? 0) + (phases.at(-1)?.durationMs ?? 0),
 	).toBe(100_000);
+});
+
+test("keeps short phase clients inside their scheduled slots", () => {
+	expect(phaseLoadDurationSeconds(10_000)).toBe(10);
+	expect(phaseLoadDurationSeconds(45_000)).toBe(45);
 });
 
 afterEach(() => {
