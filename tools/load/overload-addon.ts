@@ -71,7 +71,11 @@ async function main() {
 		},
 	);
 
-	const TIMEOUT_MS = (DURATION + 20) * 1000;
+	// The load client runs five bounded protocol probes before its workload and
+	// retains a bounded close/join grace period. Keep the harness deadline
+	// beyond that complete lifecycle so a slow, intentionally shed session does
+	// not look like a hung child.
+	const TIMEOUT_MS = (DURATION + 40) * 1000;
 	const exitOrTimeout = await Promise.race([
 		client.exited.then((code) => ({ done: true as const, code })),
 		Bun.sleep(TIMEOUT_MS).then(() => ({ done: false as const, code: -1 })),
