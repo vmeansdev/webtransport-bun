@@ -259,6 +259,21 @@ async function readFirstChunkBeforeDeadline(
 	}
 }
 
+async function settleProbeReadable(
+	readable: ReadableStream<Uint8Array>,
+): Promise<void> {
+	const reader = readable.getReader();
+	try {
+		await reader.cancel().catch(() => undefined);
+	} finally {
+		try {
+			reader.releaseLock();
+		} catch {
+			// Teardown can race lock release.
+		}
+	}
+}
+
 async function writeProbePayload(
 	writable: WritableStream<Uint8Array>,
 	payload: Uint8Array,
@@ -284,6 +299,7 @@ async function handleProbeBidiStream(
 	const text = payload.toString("utf8");
 	if (text.startsWith("probe:bidi-reset:")) {
 		stream[WT_RESET]?.(42);
+		await settleProbeReadable(stream.readable);
 		return;
 	}
 	if (text.startsWith("probe:bidi-echo:")) {
@@ -312,6 +328,7 @@ async function handleProbeUniStream(
 	const text = payload.toString("utf8");
 	if (text.startsWith("probe:uni-stop:")) {
 		stream[WT_STOP_SENDING]?.(0);
+		await settleProbeReadable(stream);
 		return;
 	}
 	if (text.startsWith("probe:uni-echo:")) {
