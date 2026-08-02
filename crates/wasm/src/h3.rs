@@ -1666,6 +1666,35 @@ mod tests {
     }
 
     #[test]
+    fn qpack_remaining_error_and_cancellation_paths_are_bounded() {
+        // The wrapped Required Insert Count can land one full range above the
+        // peer's maximum. Exercise both the recoverable wrap-to-zero case and
+        // the hard-invalid case without weakening fail-closed decoding.
+        assert_eq!(
+            decode_required_insert_count(3, 32, 0),
+            Err(QpackError::Invalid)
+        );
+        assert_eq!(
+            decode_required_insert_count(4, 32, 0),
+            Err(QpackError::Invalid)
+        );
+
+        // Decoder-stream cancellation is a valid 01-prefixed instruction and
+        // must be consumed instead of being mistaken for an increment.
+        assert_eq!(feed_decoder_stream(&[0x40 | 7]), Ok((1, 0, Vec::new())));
+    }
+
+    #[test]
+    fn dynamic_table_max_eviction_stops_after_the_last_entry() {
+        let mut table = DynamicTable::new(64);
+        table.set_capacity(64).unwrap();
+        table.insert("x".to_string(), "y".to_string()).unwrap();
+        assert!(table.evict_to_fit(usize::MAX, None).is_ok());
+        assert!(table.is_empty());
+        assert_eq!(table.size(), 0);
+    }
+
+    #[test]
     fn insert_with_ack_floor_refuses_oversized_and_overflow() {
         let mut table = DynamicTable::new(68);
         table.set_capacity(34).unwrap();

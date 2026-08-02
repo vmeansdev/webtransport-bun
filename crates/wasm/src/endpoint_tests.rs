@@ -2141,6 +2141,76 @@ fn endpoint_surface_helpers_and_constructor_variants() {
     assert!(snap.contains("wtSessionsActive"));
     assert!(snap.contains("sessionClosedCount"));
 
+    // The caller-supplied PEM constructor follows the same live-resolver path
+    // as generated certificates and returns the exact advertised pin.
+    let pem = crate::cert::generate("pem.example", 14, now_unix).expect("pem fixture");
+    let (mut pem_server, pem_hash) =
+        WtEndpoint::new_with_pem_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+            caddr,
+            &pem.cert_pem,
+            &pem.key_pem,
+            WasmLimits::default(),
+            WasmRateLimits::default(),
+            false,
+            false,
+            CongestionControlMode::Default,
+        )
+        .expect("PEM cert server");
+    assert_eq!(pem_hash, crate::cert::sha256_base64(&pem.cert_der));
+    assert_eq!(
+        pem_server.qpack_settings(),
+        h3::QpackLocalSettings::disabled()
+    );
+    pem_server.set_qpack_settings(h3::QpackLocalSettings {
+        max_table_capacity: 64,
+        max_blocked_streams: 2,
+    });
+    assert_eq!(pem_server.qpack_settings().max_table_capacity, 64);
+    assert!(pem_server.dump_client_ticket("localhost").is_none());
+    assert!(!pem_server.import_client_ticket("localhost", &[]));
+    assert!(pem_server.dump_client_ticket("://").is_none());
+    assert!(!pem_server.import_client_ticket("://", &[]));
+    assert!(pem_server.dump_client_ticket(":123").is_none());
+    assert!(!pem_server.import_client_ticket(":123", &[]));
+    assert_eq!(shared_0rtt_client_ticket_count(":123"), 0);
+
+    let mut stats_client =
+        WtEndpoint::new_with_limits(false, caddr, saddr, WasmLimits::default()).unwrap();
+    let stats_id = stats_client.connect("localhost") as u32;
+    assert!(stats_client
+        .connection_stats_json(stats_id)
+        .contains("bytesSent"));
+    assert!(stats_client
+        .connection_peer_json(stats_id)
+        .contains("127.0.0.1"));
+    let stats_handle = stats_client.id_to_handle[&stats_id];
+    stats_client.conns.remove(&stats_handle);
+    assert!(stats_client
+        .connection_stats_json(stats_id)
+        .contains("connection gone"));
+    assert!(stats_client
+        .connection_peer_json(stats_id)
+        .contains("connection gone"));
+    assert!(stats_client
+        .connection_stats_json(999_999)
+        .contains("E_SESSION_CLOSED"));
+
+    let h = ConnectionHandle(9001);
+    let mut sessions = HashMap::new();
+    assert_eq!(note_qpack_header_blocked(&mut sessions, h, None), Ok(()));
+    let mut session = Session::default();
+    session.qpack_decoder = h3::QpackDecoder::new(&h3::QpackLocalSettings {
+        max_table_capacity: 0,
+        max_blocked_streams: 1,
+    });
+    sessions.insert(h, session);
+    assert_eq!(note_qpack_header_blocked(&mut sessions, h, None), Ok(()));
+    clear_qpack_header_blocked(
+        &mut sessions,
+        ConnectionHandle(9002),
+        StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0),
+    );
+
     let hashes = crate::verify::PinnedCertVerifier::parse_hashes(&hash).unwrap();
     let client =
         WtEndpoint::new_client_pinned_with_limits(saddr, hashes.clone(), WasmLimits::default())

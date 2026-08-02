@@ -624,5 +624,21 @@ mod tests {
         )
         .is_ok());
         assert_eq!(super::format_verify_error("x"), "x");
+
+        // Exercise the verifier's TLS 1.2 callback itself. The scheme guard
+        // rejects the synthetic RSA signature before any crypto operation, so
+        // this remains deterministic and does not require a real handshake.
+        let dss =
+            <rustls::DigitallySignedStruct as rustls::internal::msgs::codec::Codec>::read_bytes(&[
+                0x04, 0x01, 0, 0,
+            ])
+            .expect("synthetic RSA signature descriptor");
+        let verifier = PinnedCertVerifier::new(Vec::new());
+        let cert = rustls::pki_types::CertificateDer::from(Vec::<u8>::new());
+        assert_application_verification_failure(
+            verifier
+                .verify_tls12_signature(&[], &cert, &dss)
+                .map(|_| ()),
+        );
     }
 }
