@@ -313,8 +313,10 @@ fn build_quic_transport_config(
     limits: &crate::limits::Limits,
 ) -> wtransport::config::QuicTransportConfig {
     let mut config = wtransport::config::QuicTransportConfig::default();
-    crate::transport_memory::TransportMemoryPolicy::from_limits(limits)
-        .apply_flow_control(&mut config);
+    let memory_policy = crate::transport_memory::TransportMemoryPolicy::from_limits(limits)
+        .with_h1b_datagram_buffers(limits);
+    memory_policy.apply_flow_control(&mut config);
+    memory_policy.apply_datagram_buffers(&mut config);
     apply_congestion_controller(&mut config, mode);
 
     // Liveness: bound how long a silent (possibly dead) connection lingers, and
