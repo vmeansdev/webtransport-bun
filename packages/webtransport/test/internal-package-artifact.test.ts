@@ -868,7 +868,10 @@ describe.serial("package artifact cleanup", () => {
 			expect(cleanupError?.message).toContain(
 				"process-tree cleanup failed: descendant exit unproven after bounded process-group proof",
 			);
-			expect(elapsedMs).toBeLessThan(900);
+			// The bounded path includes the 600ms command deadline, the 100ms
+			// process-group proof window, and the 150ms capture stabilization
+			// window. Leave a small scheduler allowance for hosted macOS runners.
+			expect(elapsedMs).toBeLessThan(1_200);
 		},
 	);
 
