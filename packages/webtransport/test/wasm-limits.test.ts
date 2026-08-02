@@ -854,6 +854,134 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		);
 	});
 
+	test("WASM facade covers send-group stats and cancellation cleanup", async () => {
+		const { manager } = fakeManager();
+		const session = new WasmSession(manager, 1, 1n, 1200);
+		const facade = new WasmWebTransport(session);
+
+		const group = facade.createSendGroup();
+		expect(group._getId()).toBe(1);
+		expect(group._getTransport()).toBe(facade);
+		facade._recordSendGroupBytes(group._getId(), 7);
+		expect(await group.getStats()).toEqual({ bytesSent: 7 });
+
+		const datagramReservation = testReservation(2);
+		session._pushDatagram(Uint8Array.of(1, 2), datagramReservation);
+		const datagramReader = facade.datagrams.readable.getReader();
+		await datagramReader.cancel();
+		expect(datagramReservation.released).toBe(true);
+
+		const incoming = new WasmStream(manager, 1, 24, false, true);
+		const outerReader = facade.incomingUnidirectionalStreams.getReader();
+		const outerRead = readWithTimeout(
+			outerReader,
+			100,
+			"wasm facade cancellation outer read",
+		);
+		session._pushIncomingStream(incoming);
+		const readable = requireValue((await outerRead).value, "incoming stream");
+		const streamReservation = testReservation(2);
+		incoming._pushData(Uint8Array.of(3, 4), false, streamReservation);
+		const readableReader = readable.getReader();
+		await readableReader.cancel();
+		expect(streamReservation.released).toBe(true);
+
+		const queued = new WasmStream(manager, 1, 25, false, true);
+		session._pushIncomingStream(queued);
+		await outerReader.cancel();
+	});
+
+	test("WASM facade cancellation stops queued bidi streams and aborts outgoing streams", async () => {
+		const { manager } = fakeManager();
+		const session = new WasmSession(manager, 1, 1n, 1200);
+		const facade = new WasmWebTransport(session);
+		const first = new WasmStream(manager, 1, 31, true, true);
+		const second = new WasmStream(manager, 1, 32, true, true);
+		session._pushIncomingStream(first);
+		session._pushIncomingStream(second);
+		const reader = facade.incomingBidirectionalStreams.getReader();
+		const firstRead = readWithTimeout(
+			reader,
+			100,
+			"wasm facade cancellation bidi read",
+		);
+		await firstRead;
+		await reader.cancel();
+
+		const operation = operationManager(fakeOperationModule({}));
+		try {
+			const outgoing = new WasmWebTransport(
+				operation.connectClient("localhost"),
+			);
+			const writable = await outgoing.createUnidirectionalStream();
+			await writable.abort(41);
+		} finally {
+			operation.close();
+		}
+	});
+
+	test("WASM facade retries capacity errors and times out with a stable code", async () => {
+		const { manager } = fakeManager();
+		const session = new WasmSession(manager, 1, 1n, 1200);
+		let attempts = 0;
+		session.createBidirectionalStream = () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("E_QUEUE_FULL: stream capacity");
+			return new WasmStream(manager, 1, 45, true, false);
+		};
+		const facade = new WasmWebTransport(session);
+		await expect(
+			facade.createBidirectionalStream({ waitUntilAvailable: true }),
+		).resolves.toBeDefined();
+		expect(attempts).toBe(2);
+
+		const timeoutSetup = fakeManager({ backpressureTimeoutMs: 5 });
+		const timeoutSession = new WasmSession(timeoutSetup.manager, 1, 1n, 1200);
+		timeoutSession.createBidirectionalStream = () => {
+			throw new WebTransportError(E_LIMIT_EXCEEDED);
+		};
+		const timeoutFacade = new WasmWebTransport(timeoutSession);
+		await expect(
+			timeoutFacade.createBidirectionalStream({ waitUntilAvailable: true }),
+		).rejects.toMatchObject({ code: E_BACKPRESSURE_TIMEOUT });
+	});
+
+	test("WASM bytes datagrams use BYOB delivery and fail closed for a tiny view", async () => {
+		const { manager } = fakeManager();
+		const session = new WasmSession(manager, 1, 1n, 1200);
+		const facade = new WasmWebTransport(session, {
+			datagramsReadableType: "bytes",
+		});
+		const reader = facade.datagrams.readable.getReader({ mode: "byob" });
+		const read = readWithTimeout(
+			reader,
+			100,
+			"wasm facade BYOB datagram read",
+			new Uint8Array(4),
+		);
+		session._pushDatagram(Uint8Array.of(5, 6), testReservation(2));
+		const result = await read;
+		expect(result.done).toBe(false);
+		expect(result.value).toEqual(Uint8Array.of(5, 6));
+		reader.releaseLock();
+
+		const tinySession = new WasmSession(manager, 1, 1n, 1200);
+		const tinyFacade = new WasmWebTransport(tinySession, {
+			datagramsReadableType: "bytes",
+		});
+		const tinyReader = tinyFacade.datagrams.readable.getReader({
+			mode: "byob",
+		});
+		const tinyRead = readWithTimeout(
+			tinyReader,
+			100,
+			"wasm facade tiny BYOB datagram read",
+			new Uint8Array(1),
+		);
+		tinySession._pushDatagram(Uint8Array.of(7, 8), testReservation(2));
+		await expect(tinyRead).rejects.toThrow(RangeError);
+	});
+
 	test("pre-subscribe datagram bytes retain one reservation through exact limit and release on delivery", () => {
 		const { manager, errors } = fakeManager({
 			maxQueuedBytesGlobal: 4,
