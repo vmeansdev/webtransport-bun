@@ -15,6 +15,11 @@ import {
 	type ScaleCampaignConfig,
 	validateScaleCampaignConfig,
 } from "./distributed-scale.ts";
+import {
+	buildIsolatedRssTelemetry,
+	parseProcessRssMb,
+	type IsolatedRssSample,
+} from "./isolated-rss-wrapper.ts";
 
 const TEMP_ROOTS: string[] = [];
 
@@ -36,6 +41,31 @@ const ZERO_GAUGES: FinalGauges = {
 };
 
 describe("Task 14 distributed scale evidence", () => {
+	test("parses bounded process RSS samples and records exit telemetry", () => {
+		expect(parseProcessRssMb("  61440\n")).toBe(60);
+		expect(parseProcessRssMb("  PID RSS\n")).toBeNull();
+
+		const samples: IsolatedRssSample[] = [
+			{ atMs: 100, rssMb: 42.5 },
+			{ atMs: 250, rssMb: 57.25 },
+			{ atMs: 400, rssMb: 51 },
+		];
+		expect(
+			buildIsolatedRssTelemetry(samples, {
+				exitCode: 0,
+				exitSignal: null,
+				exitedWithinMs: 875,
+			}),
+		).toEqual({
+			lastSampleRssMb: 51,
+			peakRssMb: 57.25,
+			sampleCount: 3,
+			exitCode: 0,
+			exitSignal: null,
+			exitedWithinMs: 875,
+		});
+	});
+
 	test("the live harness uses server observations and an explicit overload phase", () => {
 		const source = readFileSync(
 			new URL("./distributed-scale.ts", import.meta.url),
