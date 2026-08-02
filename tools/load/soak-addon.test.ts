@@ -63,6 +63,49 @@ test("budgets the loopback datagram limiter for overlapping main and overload lo
 	expect(soakDatagramRateLimitPerSec(20, 0)).toBe(50_000);
 });
 
+test("keeps short-run residency trend findings diagnostic", () => {
+	const samples: Sample[] = [
+		{
+			ts_ms: 0,
+			phase: "steady-state",
+			rss: 100,
+			heapUsedMb: 20,
+			fd: 10,
+			sockets: 2,
+			sessions: 10,
+			streams: 10,
+			sessionTasks: 1,
+			streamTasks: 1,
+			queued: 0,
+		},
+		{
+			ts_ms: 60_000,
+			phase: "steady-state",
+			rss: 1_500,
+			heapUsedMb: 100,
+			fd: 10,
+			sockets: 2,
+			sessions: 10,
+			streams: 10,
+			sessionTasks: 1,
+			streamTasks: 1,
+			queued: 8 * 1024 * 1024,
+		},
+	];
+	const result = evaluateTrendAndRecovery(samples, [], 512 * 1024 * 1024, {
+		enforceTrend: false,
+	});
+
+	expect(result.pass).toBe(true);
+	expect(result.failures).toEqual([]);
+	expect(
+		result.diagnosticFailures.some((failure) => failure.includes("RSS")),
+	).toBe(true);
+	expect(
+		result.diagnosticFailures.some((failure) => failure.includes("queued")),
+	).toBe(true);
+});
+
 afterEach(() => {
 	for (const root of tempRoots.splice(0)) {
 		rmSync(root, { force: true, recursive: true });
@@ -199,7 +242,13 @@ function segment(
 			observedReconnects: 0,
 		},
 		phaseRecords: [],
-		trend: { pass: true, failures: [], phaseMedians: {}, steadyState: null },
+		trend: {
+			pass: true,
+			failures: [],
+			diagnosticFailures: [],
+			phaseMedians: {},
+			steadyState: null,
+		},
 		finalMetrics: {
 			rssMb: 100,
 			heapUsedMb: 24,

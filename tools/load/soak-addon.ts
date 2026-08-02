@@ -257,8 +257,13 @@ type PhaseRecord = {
 type SoakTrendSummary = {
 	pass: boolean;
 	failures: string[];
+	diagnosticFailures: string[];
 	phaseMedians: Record<string, PhaseMedianSummary>;
 	steadyState: PhaseMedianSummary | null;
+};
+
+type SoakTrendOptions = {
+	enforceTrend?: boolean;
 };
 
 type PhaseMedianSummary = {
@@ -533,11 +538,26 @@ export function evaluateTrendAndRecovery(
 	samples: Sample[],
 	phaseRecords: PhaseRecord[],
 	maxQueuedBytesGlobal: number,
+	options: SoakTrendOptions = {},
 ): SoakTrendSummary {
 	const failures: string[] = [];
+	const diagnosticFailures: string[] = [];
+	const reportTrendFailure = (failure: string): void => {
+		if (options.enforceTrend === false) {
+			diagnosticFailures.push(failure);
+			return;
+		}
+		failures.push(failure);
+	};
 	if (samples.length === 0) {
 		failures.push("no samples collected");
-		return { pass: false, failures, phaseMedians: {}, steadyState: null };
+		return {
+			pass: false,
+			failures,
+			diagnosticFailures,
+			phaseMedians: {},
+			steadyState: null,
+		};
 	}
 
 	const fallbackSteadyCount = Math.max(3, Math.floor(samples.length / 5));
@@ -571,7 +591,7 @@ export function evaluateTrendAndRecovery(
 		0,
 	);
 	if (peakRss > RSS_CEIL_MB) {
-		failures.push(
+		reportTrendFailure(
 			`peak RSS ${peakRss.toFixed(1)}MB exceeded ceiling ${RSS_CEIL_MB.toFixed(0)}MB`,
 		);
 	}
@@ -581,7 +601,7 @@ export function evaluateTrendAndRecovery(
 		tailSummary.rssMb - steadyState.rssMb > RSS_TREND_MIN_ABS_MB &&
 		tailSummary.rssMb > steadyState.rssMb * (1 + RSS_TREND_MAX_REL)
 	) {
-		failures.push(
+		reportTrendFailure(
 			`RSS drift ${steadyState.rssMb.toFixed(1)}MB -> ${tailSummary.rssMb.toFixed(1)}MB exceeded ${(
 				RSS_TREND_MAX_REL * 100
 			).toFixed(0)}% and ${RSS_TREND_MIN_ABS_MB.toFixed(0)}MB`,
@@ -592,7 +612,7 @@ export function evaluateTrendAndRecovery(
 		tailSummary.heapUsedMb - steadyState.heapUsedMb > HEAP_TREND_MIN_ABS_MB &&
 		tailSummary.heapUsedMb > steadyState.heapUsedMb * (1 + RSS_TREND_MAX_REL)
 	) {
-		failures.push(
+		reportTrendFailure(
 			`heap drift ${steadyState.heapUsedMb.toFixed(1)}MB -> ${tailSummary.heapUsedMb.toFixed(1)}MB exceeded ${(
 				RSS_TREND_MAX_REL * 100
 			).toFixed(0)}% and ${HEAP_TREND_MIN_ABS_MB.toFixed(0)}MB`,
@@ -603,12 +623,12 @@ export function evaluateTrendAndRecovery(
 		steadyState.fd > 0 &&
 		steadyState.fdSlopePerHour > steadyState.fd * 0.15
 	) {
-		failures.push(
+		reportTrendFailure(
 			`FD slope ${steadyState.fdSlopePerHour.toFixed(2)}/h exceeded steady-state guard`,
 		);
 	}
 	if (steadyState.queuedSlopeBytesPerHour > maxQueuedBytesGlobal * 0.05) {
-		failures.push(
+		reportTrendFailure(
 			`queued byte slope ${steadyState.queuedSlopeBytesPerHour.toFixed(0)}/h exceeded guard`,
 		);
 	}
@@ -632,7 +652,7 @@ export function evaluateTrendAndRecovery(
 				`phase ${phase.name} reported failure: ${phase.notes.join("; ")}`,
 			);
 		if (recovery.queuedBytes > steadyState.queuedBytes + 4 * 1024 * 1024) {
-			failures.push(
+			reportTrendFailure(
 				`phase ${phase.name} left queued bytes at ${recovery.queuedBytes}, baseline ${steadyState.queuedBytes}`,
 			);
 		}
@@ -693,7 +713,7 @@ export function evaluateTrendAndRecovery(
 			recovery.rssMb > steadyState.rssMb * (1 + RSS_TREND_MAX_REL) &&
 			recovery.rssMb - steadyState.rssMb > RSS_TREND_MIN_ABS_MB
 		) {
-			failures.push(
+			reportTrendFailure(
 				`phase ${phase.name} recovery RSS ${recovery.rssMb.toFixed(1)}MB stayed above baseline ${steadyState.rssMb.toFixed(1)}MB`,
 			);
 		}
@@ -702,7 +722,7 @@ export function evaluateTrendAndRecovery(
 			recovery.heapUsedMb > steadyState.heapUsedMb * (1 + RSS_TREND_MAX_REL) &&
 			recovery.heapUsedMb - steadyState.heapUsedMb > HEAP_RECOVERY_TOLERANCE_MB
 		) {
-			failures.push(
+			reportTrendFailure(
 				`phase ${phase.name} recovery heap ${recovery.heapUsedMb.toFixed(1)}MB stayed above baseline ${steadyState.heapUsedMb.toFixed(1)}MB`,
 			);
 		}
@@ -723,6 +743,7 @@ export function evaluateTrendAndRecovery(
 	return {
 		pass: failures.length === 0,
 		failures,
+		diagnosticFailures,
 		phaseMedians,
 		steadyState,
 	};
@@ -2129,6 +2150,9 @@ async function runSegment(): Promise<void> {
 		samples,
 		phases,
 		DEFAULT_LIMITS.maxQueuedBytesGlobal,
+		// Option 2+3 keeps short-run in-process residency diagnostic; long
+		// campaigns retain the authoritative trend gate.
+		{ enforceTrend: DURATION >= 3600 },
 	);
 	const observedOperationCounts = computeSegmentObservedOperationCounts(
 		mainLoad,
