@@ -146,6 +146,65 @@ describe("Task 14 distributed scale evidence", () => {
 		);
 	});
 
+	test("allows datagrams-only and streams-only controls but rejects an empty workload", () => {
+		expect(
+			validateScaleCampaignConfig({
+				...validConfig(),
+				streamsPerSec: 0,
+			}),
+		).not.toContain("streamsPerSec must be a finite integer greater than 0");
+		expect(
+			validateScaleCampaignConfig({
+				...validConfig(),
+				datagramsPerSec: 0,
+			}),
+		).not.toContain("datagramsPerSec must be a finite integer greater than 0");
+		const failures = validateScaleCampaignConfig({
+			...validConfig(),
+			datagramsPerSec: 0,
+			streamsPerSec: 0,
+		});
+		expect(failures).toContain(
+			"datagramsPerSec or streamsPerSec must be greater than 0",
+		);
+	});
+
+	test("requires delivery-sensitive drain-all ratios", () => {
+		const input = {
+			datagramsPerSec: 100,
+			streamsPerSec: 0,
+			workloadMode: "drain-all" as const,
+			minDeliveryRatio: 0.95,
+			clientSummaries: [
+				{
+					...validConfigClientSummary(),
+					datagramsSent: 100,
+					serverPort: 4433,
+				},
+			],
+			serverDatagramSends: 1,
+			serverDatagramsReceived: 90,
+			serverDatagramsReceivedByPort: { "4433": 90 },
+			serverBidiStreamsOpened: 0,
+			serverUniStreamsOpened: 0,
+			serverDatagramErrors: 0,
+			serverStreamErrors: 0,
+			p99HandshakeMs: 1,
+			p99DatagramEnqueueMs: 1,
+			p99StreamOpenMs: null,
+		};
+		expect(evaluateWorkloadEvidence(input)).toContain(
+			"server datagram delivery ratio 0.9000 fell below 0.9500",
+		);
+		expect(
+			evaluateWorkloadEvidence({
+				...input,
+				serverDatagramsReceived: 95,
+				serverDatagramsReceivedByPort: { "4433": 95 },
+			}),
+		).not.toContain("server datagram delivery ratio 0.9500 fell below 0.9500");
+	});
+
 	test("requires the workload to populate datagram and stream evidence before trusting p99s", () => {
 		expect(
 			evaluateWorkloadEvidence({
@@ -212,6 +271,7 @@ describe("Task 14 distributed scale evidence", () => {
 			fixturePath,
 			`
 import { spawn } from "node:child_process";
+import { writeSync } from "node:fs";
 
 if (process.argv[2] === "grandchild") {
 	process.stdout.write("grandchild stdout\\n");
@@ -219,12 +279,13 @@ if (process.argv[2] === "grandchild") {
 	setInterval(() => {}, 1_000);
 } else {
 	const grandchild = spawn(process.execPath, [process.argv[1], "grandchild"], {
-		detached: process.platform !== "win32",
+		detached: false,
 		stdio: "inherit",
 	});
 	grandchild.unref();
-	process.stdout.write("sessions ok=0 err=1\\n");
-	process.stderr.write("parent exiting\\n");
+	writeSync(1, "sessions ok=0 err=1\\n");
+	writeSync(2, "parent exiting\\n");
+	await new Promise((resolve) => setTimeout(resolve, 25));
 }
 `,
 			"utf8",
@@ -234,9 +295,9 @@ if (process.argv[2] === "grandchild") {
 			[process.execPath, fixturePath],
 			{
 				cwd: tempRoot,
-				outerTimeoutMs: 200,
-				terminateGraceMs: 75,
-				drainTimeoutMs: 75,
+				outerTimeoutMs: 2_000,
+				terminateGraceMs: 500,
+				drainTimeoutMs: 500,
 			},
 		);
 
@@ -258,6 +319,8 @@ function validConfig(): ScaleCampaignConfig {
 		basePort: 4433,
 		datagramsPerSec: 10,
 		streamsPerSec: 1,
+		workloadMode: "probe",
+		minDeliveryRatio: 0.95,
 		minSuccessRate: 1,
 		maxRssMb: 256,
 		maxRecoveryRssRatio: 1.25,
@@ -278,5 +341,47 @@ function validConfig(): ScaleCampaignConfig {
 				commandPrefix: [],
 			},
 		],
+	};
+}
+
+function validConfigClientSummary(): {
+	clientIndex: number;
+	serverPort: number;
+	requestedSessions: number;
+	okSessions: number;
+	sessionErrors: number;
+	datagramsSent: number;
+	datagramErrors: number;
+	streamsOpened: number;
+	streamErrors: number;
+	successRate: number;
+	exitCode: number;
+	exitSignal: string | null;
+	timedOut: boolean;
+	forceKilled: boolean;
+	stdoutDrainTimedOut: boolean;
+	stderrDrainTimedOut: boolean;
+	durationMs: number;
+	stderr: string;
+} {
+	return {
+		clientIndex: 0,
+		serverPort: 4433,
+		requestedSessions: 1,
+		okSessions: 1,
+		sessionErrors: 0,
+		datagramsSent: 0,
+		datagramErrors: 0,
+		streamsOpened: 0,
+		streamErrors: 0,
+		successRate: 1,
+		exitCode: 0,
+		exitSignal: null,
+		timedOut: false,
+		forceKilled: false,
+		stdoutDrainTimedOut: false,
+		stderrDrainTimedOut: false,
+		durationMs: 1,
+		stderr: "",
 	};
 }

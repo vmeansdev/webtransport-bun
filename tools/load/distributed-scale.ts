@@ -24,6 +24,8 @@ const CHILD_TERMINATE_GRACE_MS = 2_000;
 const CHILD_DRAIN_TIMEOUT_MS = 2_000;
 const SERVER_CLOSE_TIMEOUT_MS = 10_000;
 
+export type ScaleWorkloadMode = "probe" | "drain-all" | "single-reader";
+
 export type ClientLaunchConfig = {
 	label: string;
 	commandPrefix: string[];
@@ -39,6 +41,8 @@ export type ScaleCampaignConfig = {
 	basePort: number;
 	datagramsPerSec: number;
 	streamsPerSec: number;
+	workloadMode: ScaleWorkloadMode;
+	minDeliveryRatio: number;
 	minSuccessRate: number;
 	maxRssMb: number;
 	maxRecoveryRssRatio: number;
@@ -65,6 +69,7 @@ export type ClientSummary = {
 	datagramsSent: number;
 	datagramErrors: number;
 	streamsOpened: number;
+	loadStreamsOpened?: number;
 	streamErrors: number;
 	successRate: number;
 	exitCode: number;
@@ -154,8 +159,12 @@ type RunSummary = {
 	peakRssMb: number;
 	finalRssMb: number;
 	serverDatagramSends: number;
+	serverDatagramsReceived: number;
+	serverDatagramsReceivedByPort: Record<string, number>;
 	serverBidiStreamsOpened: number;
 	serverUniStreamsOpened: number;
+	serverStreamsAccepted: number;
+	serverStreamsAcceptedByPort: Record<string, number>;
 	serverDatagramErrors: number;
 	serverStreamErrors: number;
 	sourceIdentityCount: number;
@@ -353,6 +362,96 @@ export async function awaitWithTimeout<T>(
 	} finally {
 		if (timeoutId) clearTimeout(timeoutId);
 	}
+}
+
+async function nextBeforeDeadline<T>(
+	promise: Promise<T>,
+	deadlineMs: number,
+): Promise<T | null> {
+	const remainingMs = deadlineMs - Date.now();
+	if (remainingMs <= 0) return null;
+	return Promise.race([promise, Bun.sleep(remainingMs).then(() => null)]);
+}
+
+async function drainReadableBeforeDeadline(
+	readable: ReadableStream<Uint8Array>,
+	deadlineMs: number,
+): Promise<void> {
+	const reader = readable.getReader();
+	try {
+		while (Date.now() < deadlineMs) {
+			const result = await nextBeforeDeadline(reader.read(), deadlineMs);
+			if (!result || result.done) break;
+		}
+	} finally {
+		await Promise.race([reader.cancel(), Bun.sleep(100)]).catch(
+			() => undefined,
+		);
+		try {
+			reader.releaseLock();
+		} catch {
+			// A cancelled reader may already have released its lock.
+		}
+	}
+}
+
+async function drainSessionDatagramsBeforeDeadline(
+	session: ServerSession,
+	deadlineMs: number,
+	onDatagram: () => void,
+): Promise<void> {
+	const iterator = session.incomingDatagrams()[Symbol.asyncIterator]();
+	try {
+		while (Date.now() < deadlineMs) {
+			const result = await nextBeforeDeadline(iterator.next(), deadlineMs);
+			if (!result || result.done) break;
+			onDatagram();
+		}
+	} finally {
+		await iterator.return?.();
+	}
+}
+
+async function drainSessionStreamsBeforeDeadline(
+	session: ServerSession,
+	deadlineMs: number,
+	onStream: () => void,
+): Promise<void> {
+	const drainIncoming = async (
+		streams: ReadableStream<
+			| {
+					readable: ReadableStream<Uint8Array>;
+					writable: WritableStream<Uint8Array>;
+			  }
+			| ReadableStream<Uint8Array>
+		>,
+	): Promise<void> => {
+		const reader = streams.getReader();
+		try {
+			while (Date.now() < deadlineMs) {
+				const result = await nextBeforeDeadline(reader.read(), deadlineMs);
+				if (!result || result.done) break;
+				onStream();
+				const stream = result.value;
+				const readable = "readable" in stream ? stream.readable : stream;
+				await drainReadableBeforeDeadline(readable, deadlineMs);
+			}
+		} finally {
+			await Promise.race([reader.cancel(), Bun.sleep(100)]).catch(
+				() => undefined,
+			);
+			try {
+				reader.releaseLock();
+			} catch {
+				// A cancelled reader may already have released its lock.
+			}
+		}
+	};
+
+	await Promise.all([
+		drainIncoming(session.incomingBidirectionalStreams),
+		drainIncoming(session.incomingUnidirectionalStreams),
+	]);
 }
 
 function captureReadable(
@@ -577,8 +676,6 @@ export function validateScaleCampaignConfig(
 		["serverCount", config.serverCount],
 		["clientCount", config.clientCount],
 		["basePort", config.basePort],
-		["datagramsPerSec", config.datagramsPerSec],
-		["streamsPerSec", config.streamsPerSec],
 		["minLiveSessions", config.minLiveSessions],
 		["minLiveSetHoldMs", config.minLiveSetHoldMs],
 		["minSourceIdentityCount", config.minSourceIdentityCount],
@@ -589,6 +686,28 @@ export function validateScaleCampaignConfig(
 		if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
 			failures.push(`${name} must be a finite integer greater than 0`);
 		}
+	}
+	for (const [name, value] of [
+		["datagramsPerSec", config.datagramsPerSec],
+		["streamsPerSec", config.streamsPerSec],
+	] as const) {
+		if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+			failures.push(
+				`${name} must be a finite integer greater than or equal to 0`,
+			);
+		}
+	}
+	if (config.datagramsPerSec === 0 && config.streamsPerSec === 0) {
+		failures.push("datagramsPerSec or streamsPerSec must be greater than 0");
+	}
+	if (
+		!(
+			"probe" === config.workloadMode ||
+			"drain-all" === config.workloadMode ||
+			"single-reader" === config.workloadMode
+		)
+	) {
+		failures.push("workloadMode must be probe, drain-all, or single-reader");
 	}
 	const numberFields = [
 		["minSuccessRate", config.minSuccessRate],
@@ -603,6 +722,15 @@ export function validateScaleCampaignConfig(
 		if (!Number.isFinite(value) || value <= 0) {
 			failures.push(`${name} must be a finite number greater than 0`);
 		}
+	}
+	if (
+		!Number.isFinite(config.minDeliveryRatio) ||
+		config.minDeliveryRatio <= 0 ||
+		config.minDeliveryRatio > 1
+	) {
+		failures.push(
+			"minDeliveryRatio must be a finite number greater than 0 and at most 1",
+		);
 	}
 	const clientTargetHost =
 		config.clientTargetHost?.trim() ?? DEFAULT_CLIENT_TARGET_HOST;
@@ -629,10 +757,16 @@ export function validateScaleCampaignConfig(
 export function evaluateWorkloadEvidence(input: {
 	datagramsPerSec: number;
 	streamsPerSec: number;
+	workloadMode?: ScaleWorkloadMode;
+	minDeliveryRatio?: number;
 	clientSummaries: ClientSummary[];
 	serverDatagramSends: number;
+	serverDatagramsReceived?: number;
+	serverDatagramsReceivedByPort?: Record<string, number>;
 	serverBidiStreamsOpened: number;
 	serverUniStreamsOpened: number;
+	serverStreamsAccepted?: number;
+	serverStreamsAcceptedByPort?: Record<string, number>;
 	serverDatagramErrors: number;
 	serverStreamErrors: number;
 	p99HandshakeMs: number | null;
@@ -640,12 +774,15 @@ export function evaluateWorkloadEvidence(input: {
 	p99StreamOpenMs: number | null;
 }): string[] {
 	const failures: string[] = [];
+	const workloadMode = input.workloadMode ?? "probe";
+	const minDeliveryRatio = input.minDeliveryRatio ?? 0.95;
 	const totalDatagrams = input.clientSummaries.reduce(
 		(sum, summary) => sum + summary.datagramsSent,
 		0,
 	);
 	const totalStreams = input.clientSummaries.reduce(
-		(sum, summary) => sum + summary.streamsOpened,
+		(sum, summary) =>
+			sum + (summary.loadStreamsOpened ?? summary.streamsOpened),
 		0,
 	);
 	if (input.p99HandshakeMs == null) {
@@ -661,6 +798,33 @@ export function evaluateWorkloadEvidence(input: {
 			"server workload did not send any datagrams despite a positive datagram rate target",
 		);
 	}
+	if (workloadMode === "drain-all" && input.datagramsPerSec > 0) {
+		const received = input.serverDatagramsReceived ?? 0;
+		const ratio = received / Math.max(totalDatagrams, 1);
+		if (ratio < minDeliveryRatio) {
+			failures.push(
+				`server datagram delivery ratio ${ratio.toFixed(4)} fell below ${minDeliveryRatio.toFixed(4)}`,
+			);
+		}
+		const expectedByPort = input.clientSummaries.reduce<Record<string, number>>(
+			(counts, summary) => {
+				const port = String(summary.serverPort);
+				counts[port] = (counts[port] ?? 0) + summary.datagramsSent;
+				return counts;
+			},
+			{},
+		);
+		for (const [port, expected] of Object.entries(expectedByPort)) {
+			if (expected <= 0) continue;
+			const actual = input.serverDatagramsReceivedByPort?.[port] ?? 0;
+			const perServerRatio = actual / expected;
+			if (perServerRatio < minDeliveryRatio) {
+				failures.push(
+					`server datagram delivery ratio for port ${port} ${perServerRatio.toFixed(4)} fell below ${minDeliveryRatio.toFixed(4)}`,
+				);
+			}
+		}
+	}
 	if (input.streamsPerSec > 0 && totalStreams <= 0) {
 		failures.push(
 			"workload did not open any streams despite a positive stream rate target",
@@ -675,6 +839,35 @@ export function evaluateWorkloadEvidence(input: {
 		failures.push(
 			"server workload did not open any unidirectional streams despite a positive stream rate target",
 		);
+	}
+	if (workloadMode === "drain-all" && input.streamsPerSec > 0) {
+		const accepted = input.serverStreamsAccepted ?? 0;
+		const ratio = accepted / Math.max(totalStreams, 1);
+		if (ratio < minDeliveryRatio) {
+			failures.push(
+				`server stream delivery ratio ${ratio.toFixed(4)} fell below ${minDeliveryRatio.toFixed(4)}`,
+			);
+		}
+		const expectedByPort = input.clientSummaries.reduce<Record<string, number>>(
+			(counts, summary) => {
+				const port = String(summary.serverPort);
+				counts[port] =
+					(counts[port] ?? 0) +
+					(summary.loadStreamsOpened ?? summary.streamsOpened);
+				return counts;
+			},
+			{},
+		);
+		for (const [port, expected] of Object.entries(expectedByPort)) {
+			if (expected <= 0) continue;
+			const actual = input.serverStreamsAcceptedByPort?.[port] ?? 0;
+			const perServerRatio = actual / expected;
+			if (perServerRatio < minDeliveryRatio) {
+				failures.push(
+					`server stream delivery ratio for port ${port} ${perServerRatio.toFixed(4)} fell below ${minDeliveryRatio.toFixed(4)}`,
+				);
+			}
+		}
 	}
 	if (input.serverDatagramErrors > 0) {
 		failures.push(
@@ -721,6 +914,22 @@ export function evaluateOverloadEvidence(evidence: OverloadEvidence): string[] {
 function rustcVersion() {
 	const result = spawnSync("rustc", ["-V"], { cwd: ROOT, encoding: "utf8" });
 	return result.status === 0 ? result.stdout.trim() : null;
+}
+
+function sourceMetadata() {
+	const gitValue = (args: string[]) => {
+		const result = spawnSync("git", args, {
+			cwd: ROOT,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return result.status === 0 ? result.stdout.trim() : null;
+	};
+	return {
+		sha: gitValue(["rev-parse", "HEAD"]),
+		branch: gitValue(["branch", "--show-current"]),
+		commandLine: process.argv.join(" "),
+	};
 }
 
 function getRssMb() {
@@ -790,6 +999,7 @@ function parseLoadClientOutput(
 	const datagramsSent = datagrams ? Number(datagrams[1]) : 0;
 	const datagramErrors = datagrams ? Number(datagrams[2]) : 0;
 	const streamsOpened = streams ? Number(streams[1]) : 0;
+	const loadStreams = stdout.match(/load streams opened=(\d+)/);
 	const streamErrors = streams ? Number(streams[2]) : 0;
 	return {
 		clientIndex,
@@ -800,6 +1010,7 @@ function parseLoadClientOutput(
 		datagramsSent,
 		datagramErrors,
 		streamsOpened,
+		loadStreamsOpened: loadStreams ? Number(loadStreams[1]) : undefined,
 		streamErrors,
 		successRate: requestedSessions === 0 ? 0 : okSessions / requestedSessions,
 		exitCode: result.exitCode,
@@ -880,6 +1091,7 @@ async function runLoadClient(
 		datagramsPerSec: number;
 		streamsPerSec: number;
 		maxSessionErrors: number;
+		skipProbes?: boolean;
 	},
 ): Promise<ClientSummary> {
 	const targetHost = plan.launch.urlHost?.trim() || DEFAULT_CLIENT_TARGET_HOST;
@@ -902,6 +1114,7 @@ async function runLoadClient(
 		"0",
 		"--max-stream-errors",
 		"0",
+		...(options.skipProbes ? ["--skip-probes"] : []),
 	];
 	const result = await runCommandWithBoundedOutput(command, {
 		cwd: ROOT,
@@ -1001,6 +1214,7 @@ async function runOverloadPhase(
 				datagramsPerSec: 0,
 				streamsPerSec: 0,
 				maxSessionErrors: plan.requestedSessions,
+				skipProbes: true,
 			}),
 		),
 	);
@@ -1080,14 +1294,19 @@ async function runOneCampaign(
 	let peakStreams = 0;
 	let peakQueuedBytesGlobal = 0;
 	let serverDatagramSends = 0;
+	let serverDatagramsReceived = 0;
+	const serverDatagramsReceivedByPort: Record<string, number> = {};
 	let serverBidiStreamsOpened = 0;
 	let serverUniStreamsOpened = 0;
+	let serverStreamsAccepted = 0;
+	const serverStreamsAcceptedByPort: Record<string, number> = {};
 	let serverDatagramErrors = 0;
 	let serverStreamErrors = 0;
 	let liveSetHeldMs = 0;
 	let liveSetStartedAt: number | null = null;
 	let finalGauges: FinalGauges = aggregateGauges([]);
 	let serversClosed = false;
+	const drainTasks: Promise<void>[] = [];
 
 	try {
 		for (let i = 0; i < config.serverCount; i++) {
@@ -1117,15 +1336,101 @@ async function runOneCampaign(
 					},
 					onSession: (session) => {
 						serverObservedPeerIps.add(session.peer.ip);
-						if (config.datagramsPerSec > 0 && !serverDatagramProbeDone) {
+						const portKey = String(port);
+						const countDatagram = () => {
+							serverDatagramsReceived += 1;
+							serverDatagramsReceivedByPort[portKey] =
+								(serverDatagramsReceivedByPort[portKey] ?? 0) + 1;
+						};
+						const countStream = () => {
+							serverStreamsAccepted += 1;
+							serverStreamsAcceptedByPort[portKey] =
+								(serverStreamsAcceptedByPort[portKey] ?? 0) + 1;
+						};
+						const drainDeadline =
+							Date.now() + Math.max(5_000, config.durationSec * 1_000 + 5_000);
+						let sessionDatagramProbeSent = false;
+						if (
+							config.datagramsPerSec > 0 &&
+							(config.workloadMode === "drain-all" ||
+								(config.workloadMode === "single-reader" &&
+									!serverDatagramProbeDone))
+						) {
 							serverDatagramProbeDone = true;
-							void (async () => {
-								for await (const data of session.incomingDatagrams()) {
+							const task = (async () => {
+								const iterator = session
+									.incomingDatagrams()
+									[Symbol.asyncIterator]();
+								try {
+									while (Date.now() < drainDeadline) {
+										const result = await nextBeforeDeadline(
+											iterator.next(),
+											drainDeadline,
+										);
+										if (!result || result.done) break;
+										countDatagram();
+										if (!sessionDatagramProbeSent) {
+											const data = result.value;
+											await session.sendDatagram(data);
+											serverDatagramSends += 1;
+											sessionDatagramProbeSent = true;
+										}
+									}
+								} finally {
+									await iterator.return?.();
+								}
+							})();
+							drainTasks.push(task);
+							task.catch((error) => {
+								serverDatagramErrors += 1;
+								failures.push(
+									`server datagram exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							});
+						}
+						if (
+							config.workloadMode === "drain-all" &&
+							config.streamsPerSec > 0
+						) {
+							const task = drainSessionStreamsBeforeDeadline(
+								session,
+								drainDeadline,
+								countStream,
+							);
+							drainTasks.push(task);
+							task.catch((error) => {
+								serverStreamErrors += 1;
+								failures.push(
+									`server stream drain failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							});
+						}
+						if (
+							config.workloadMode === "probe" &&
+							config.datagramsPerSec > 0 &&
+							!serverDatagramProbeDone
+						) {
+							serverDatagramProbeDone = true;
+							const task = (async () => {
+								const iterator = session
+									.incomingDatagrams()
+									[Symbol.asyncIterator]();
+								try {
+									const result = await nextBeforeDeadline(
+										iterator.next(),
+										drainDeadline,
+									);
+									if (!result || result.done) return;
+									countDatagram();
+									const data = result.value;
 									await session.sendDatagram(data);
 									serverDatagramSends += 1;
-									break;
+								} finally {
+									await iterator.return?.();
 								}
-							})().catch((error) => {
+							})();
+							drainTasks.push(task);
+							task.catch((error) => {
 								serverDatagramErrors += 1;
 								failures.push(
 									`server datagram exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1134,7 +1439,7 @@ async function runOneCampaign(
 						}
 						if (config.streamsPerSec > 0 && !serverStreamProbeDone) {
 							serverStreamProbeDone = true;
-							void exerciseServerStreamProbe(
+							const task = exerciseServerStreamProbe(
 								session,
 								new TextEncoder().encode(`server-probe:${port}`),
 								() => {
@@ -1143,7 +1448,9 @@ async function runOneCampaign(
 								() => {
 									serverUniStreamsOpened += 1;
 								},
-							).catch((error) => {
+							);
+							drainTasks.push(task);
+							task.catch((error) => {
 								serverStreamErrors += 1;
 								failures.push(
 									`server stream exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1218,6 +1525,7 @@ async function runOneCampaign(
 					datagramsPerSec: config.datagramsPerSec,
 					streamsPerSec: config.streamsPerSec,
 					maxSessionErrors: 0,
+					skipProbes: config.workloadMode !== "probe",
 				}),
 			),
 		);
@@ -1335,10 +1643,16 @@ async function runOneCampaign(
 			...evaluateWorkloadEvidence({
 				datagramsPerSec: config.datagramsPerSec,
 				streamsPerSec: config.streamsPerSec,
+				workloadMode: config.workloadMode,
+				minDeliveryRatio: config.minDeliveryRatio,
 				clientSummaries,
 				serverDatagramSends,
+				serverDatagramsReceived,
+				serverDatagramsReceivedByPort,
 				serverBidiStreamsOpened,
 				serverUniStreamsOpened,
+				serverStreamsAccepted,
+				serverStreamsAcceptedByPort,
 				serverDatagramErrors,
 				serverStreamErrors,
 				p99HandshakeMs: p99Handshake,
@@ -1351,16 +1665,19 @@ async function runOneCampaign(
 				`handshake p99 ${p99Handshake.toFixed(3)}ms exceeded ${config.p99HandshakeMs.toFixed(3)}ms`,
 			);
 		}
-		if (p99Datagram == null) {
+		if (config.datagramsPerSec > 0 && p99Datagram == null) {
 			failures.push("missing datagram enqueue p99 evidence");
-		} else if (p99Datagram > config.p99DatagramEnqueueMs) {
+		} else if (
+			p99Datagram != null &&
+			p99Datagram > config.p99DatagramEnqueueMs
+		) {
 			failures.push(
 				`datagram enqueue p99 ${p99Datagram.toFixed(3)}ms exceeded ${config.p99DatagramEnqueueMs.toFixed(3)}ms`,
 			);
 		}
-		if (p99Stream == null) {
+		if (config.streamsPerSec > 0 && p99Stream == null) {
 			failures.push("missing stream open p99 evidence");
-		} else if (p99Stream > config.p99StreamOpenMs) {
+		} else if (p99Stream != null && p99Stream > config.p99StreamOpenMs) {
 			failures.push(
 				`stream open p99 ${p99Stream.toFixed(3)}ms exceeded ${config.p99StreamOpenMs.toFixed(3)}ms`,
 			);
@@ -1378,6 +1695,13 @@ async function runOneCampaign(
 			),
 		);
 		serversClosed = true;
+		const drainSettled = await Promise.race([
+			Promise.allSettled(drainTasks),
+			Bun.sleep(5_000).then(() => null),
+		]);
+		if (drainSettled === null && drainTasks.length > 0) {
+			failures.push("server workload drains did not settle within 5000ms");
+		}
 		const closeDurationMs = Number(
 			(performance.now() - closeStartedAt).toFixed(3),
 		);
@@ -1423,8 +1747,12 @@ async function runOneCampaign(
 			peakRssMb: Number(peakRssMb.toFixed(3)),
 			finalRssMb: Number(finalRssMb.toFixed(3)),
 			serverDatagramSends,
+			serverDatagramsReceived,
+			serverDatagramsReceivedByPort,
 			serverBidiStreamsOpened,
 			serverUniStreamsOpened,
+			serverStreamsAccepted,
+			serverStreamsAcceptedByPort,
 			serverDatagramErrors,
 			serverStreamErrors,
 			sourceIdentityCount,
@@ -1481,8 +1809,12 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 			peakRssMb: Number(getRssMb().toFixed(3)),
 			finalRssMb: Number(getRssMb().toFixed(3)),
 			serverDatagramSends: 0,
+			serverDatagramsReceived: 0,
+			serverDatagramsReceivedByPort: {},
 			serverBidiStreamsOpened: 0,
 			serverUniStreamsOpened: 0,
+			serverStreamsAccepted: 0,
+			serverStreamsAcceptedByPort: {},
 			serverDatagramErrors: 0,
 			serverStreamErrors: 0,
 			sourceIdentityCount: 0,
@@ -1509,6 +1841,7 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 				createdAt: new Date().toISOString(),
 				bunVersion: Bun.version,
 				rustcVersion: rustcVersion(),
+				source: sourceMetadata(),
 				config,
 				summary,
 			},
@@ -1551,6 +1884,11 @@ function configFromEnv(): ScaleCampaignConfig {
 		basePort: Number(process.env.LOAD_SCALE_BASE_PORT ?? "4433"),
 		datagramsPerSec: Number(process.env.LOAD_SCALE_DATAGRAMS_PER_SEC ?? "200"),
 		streamsPerSec: Number(process.env.LOAD_SCALE_STREAMS_PER_SEC ?? "2"),
+		workloadMode: (process.env.LOAD_SCALE_WORKLOAD_MODE ??
+			"probe") as ScaleWorkloadMode,
+		minDeliveryRatio: Number(
+			process.env.LOAD_SCALE_MIN_DELIVERY_RATIO ?? "0.95",
+		),
 		minSuccessRate: Number(process.env.LOAD_SCALE_MIN_SUCCESS_RATE ?? "1"),
 		maxRssMb: Number(process.env.LOAD_SCALE_MAX_RSS_MB ?? "1024"),
 		maxRecoveryRssRatio: Number(

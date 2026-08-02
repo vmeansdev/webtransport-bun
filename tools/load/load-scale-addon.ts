@@ -14,6 +14,13 @@ async function main() {
 		basePort: Number(process.env.LOAD_SCALE_BASE_PORT ?? "4433"),
 		datagramsPerSec: Number(process.env.LOAD_SCALE_DATAGRAMS_PER_SEC ?? "1000"),
 		streamsPerSec: Number(process.env.LOAD_SCALE_STREAMS_PER_SEC ?? "5"),
+		workloadMode: (process.env.LOAD_SCALE_WORKLOAD_MODE ?? "probe") as
+			| "probe"
+			| "drain-all"
+			| "single-reader",
+		minDeliveryRatio: Number(
+			process.env.LOAD_SCALE_MIN_DELIVERY_RATIO ?? "0.95",
+		),
 		minSuccessRate: Number(process.env.LOAD_SCALE_MIN_SUCCESS_RATE ?? "1"),
 		maxRssMb: Number(process.env.LOAD_SCALE_MAX_RSS_MB ?? "768"),
 		maxRecoveryRssRatio: Number(
