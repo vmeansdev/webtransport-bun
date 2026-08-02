@@ -1639,6 +1639,14 @@ async function runOneCampaign(
 		const p99Stream =
 			p99StreamOpenMs.length > 0 ? Math.max(...p99StreamOpenMs) : null;
 
+		const drainSettledBeforeEvidence = await Promise.race([
+			Promise.allSettled(drainTasks),
+			Bun.sleep(5_000).then(() => null),
+		]);
+		if (drainSettledBeforeEvidence === null && drainTasks.length > 0) {
+			failures.push("server workload drains did not settle within 5000ms");
+		}
+
 		failures.push(
 			...evaluateWorkloadEvidence({
 				datagramsPerSec: config.datagramsPerSec,
@@ -1695,13 +1703,6 @@ async function runOneCampaign(
 			),
 		);
 		serversClosed = true;
-		const drainSettled = await Promise.race([
-			Promise.allSettled(drainTasks),
-			Bun.sleep(5_000).then(() => null),
-		]);
-		if (drainSettled === null && drainTasks.length > 0) {
-			failures.push("server workload drains did not settle within 5000ms");
-		}
 		const closeDurationMs = Number(
 			(performance.now() - closeStartedAt).toFixed(3),
 		);

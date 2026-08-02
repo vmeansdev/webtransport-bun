@@ -19,6 +19,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const LOAD_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
@@ -583,6 +584,7 @@ async fn run_session(
             }
         }
     }
+    tokio::time::sleep(LOAD_DRAIN_GRACE).await;
     // Shutdown state machine: stop (loop exited) → close → wait-for-closed (timeout).
     conn.close(0u32.into(), b"load test done");
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
