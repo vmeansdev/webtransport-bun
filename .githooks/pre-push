@@ -14,15 +14,20 @@ fi
 # Disallow any updates to main from this repo (regular and force push).
 # development remains unrestricted by this hook.
 declare -a pushed_files=()
+empty_tree_sha="$(git hash-object -t tree /dev/null)"
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = "refs/heads/main" ]; then
     echo "pre-push: pushes to main are blocked by project policy. Use a PR into main." >&2
     exit 1
   fi
   if [ "${remote_sha:-}" != "" ] && [ "${local_sha:-}" != "" ]; then
+    base_sha="$remote_sha"
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+      base_sha="$empty_tree_sha"
+    fi
     while IFS= read -r -d '' file; do
       pushed_files+=("$file")
-    done < <(git diff --name-only --diff-filter=ACMR -z "$remote_sha" "$local_sha")
+    done < <(git diff --name-only --diff-filter=ACMR -z "$base_sha" "$local_sha")
   fi
 done
 
@@ -61,7 +66,7 @@ formatted_rust=0
 
 echo "pre-push: checking TS/JS formatting with biome"
 declare -a tsjs_files=()
-for file in "${pushed_files[@]}"; do
+for file in "${pushed_files[@]-}"; do
   case "$file" in
     *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs)
       tsjs_files+=("$file")
