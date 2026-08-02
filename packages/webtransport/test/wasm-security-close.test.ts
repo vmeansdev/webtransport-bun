@@ -105,17 +105,35 @@ describe("connection lifecycle", () => {
 	test.skipIf(!wasmAvailable)(
 		"ready rejects when the server is unreachable",
 		async () => {
-			// Nothing listens on this port; the idle timeout must reject ready.
-			const udp = await BunUdpTransport.connect("127.0.0.1", 47859);
+			// Keep a real UDP socket bound but deliberately do not speak QUIC.
+			// Connecting to an unbound port lets some hosts surface ICMP
+			// ECONNREFUSED directly from recv(), which bypasses the endpoint's
+			// handshake deadline and makes this test platform-dependent.
+			const sink = await BunUdpTransport.bind("127.0.0.1", 0);
+			sink.onPacket(() => {});
+			const port = sink.localPort;
+			if (port == null || port === 0) {
+				sink.close();
+				throw new Error("UDP sink did not report an ephemeral port");
+			}
+			const udp = await BunUdpTransport.connect("127.0.0.1", port);
 			const t0 = Date.now();
 			await expect(
-				connectWasm(wasm, udp, "localhost", "127.0.0.1:0", "127.0.0.1:47859", {
-					limits: { handshakeTimeoutMs: 50, idleTimeoutMs: 100 },
-				}),
+				connectWasm(
+					wasm,
+					udp,
+					"localhost",
+					"127.0.0.1:0",
+					`127.0.0.1:${port}`,
+					{
+						limits: { handshakeTimeoutMs: 50, idleTimeoutMs: 100 },
+					},
+				),
 			).rejects.toThrow(/E_HANDSHAKE_TIMEOUT/);
 			// The configured handshake deadline bounds an unreachable peer.
 			expect(Date.now() - t0).toBeLessThan(1_000);
 			udp.close();
+			sink.close();
 		},
 		30_000,
 	);
