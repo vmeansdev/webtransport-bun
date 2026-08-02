@@ -111,19 +111,23 @@ export class FileTicketStoreHost implements TicketStoreHost {
 		let fd: number | undefined;
 		let renamed = false;
 		try {
-			fd = openSync(
-				tmp,
-				constants.O_CREAT |
-					constants.O_WRONLY |
-					(process.platform === "win32" ? 0 : constants.O_EXCL),
-				POSIX_TICKET_FILE_MODE,
-			);
-			writeFileSync(fd, ticket);
-			if (process.platform !== "win32") {
+			if (process.platform === "win32") {
+				// Bun's Windows openSync path can report ENOENT for this already
+				// unique temporary name. The final rename remains atomic, so use
+				// the path writer on that platform and keep the exclusive fd path
+				// for POSIX mode/symlink guarantees.
+				writeFileSync(tmp, ticket);
+			} else {
+				fd = openSync(
+					tmp,
+					constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+					POSIX_TICKET_FILE_MODE,
+				);
+				writeFileSync(fd, ticket);
 				fchmodSync(fd, POSIX_TICKET_FILE_MODE);
+				closeSync(fd);
+				fd = undefined;
 			}
-			closeSync(fd);
-			fd = undefined;
 			renameSync(tmp, path);
 			renamed = true;
 		} finally {
