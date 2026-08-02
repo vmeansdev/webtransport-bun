@@ -68,6 +68,70 @@ pub mod tag {
     pub const SESSION_DRAINING: u8 = 10;
 }
 
+fn varint_width(value: u64) -> usize {
+    if value < 0x40 {
+        1
+    } else if value < 0x4000 {
+        2
+    } else if value < 0x4000_0000 {
+        4
+    } else {
+        8
+    }
+}
+
+fn encoded_capacity_hint(event: &WtEvent, host_token: Option<u32>) -> usize {
+    let mut capacity = 1usize.saturating_add(varint_width(event.conn() as u64));
+    let mut add = |additional: usize| {
+        capacity = capacity.saturating_add(additional);
+    };
+
+    match event {
+        WtEvent::Connected { .. } => {}
+        WtEvent::SessionEstablished { session_id, .. } => add(varint_width(*session_id)),
+        WtEvent::Datagram {
+            session_id, data, ..
+        } => {
+            add(varint_width(*session_id));
+            add(varint_width(data.len() as u64));
+            add(data.len());
+            add(varint_width(host_token.unwrap_or(0) as u64));
+        }
+        WtEvent::ConnectionClosed { code, .. } => add(varint_width(*code as u64)),
+        WtEvent::StreamOpened {
+            session_id, stream, ..
+        } => {
+            add(varint_width(*session_id));
+            add(varint_width(*stream as u64));
+            add(1); // bidi flag
+        }
+        WtEvent::StreamData { stream, data, .. } => {
+            add(varint_width(*stream as u64));
+            add(1); // FIN flag
+            add(varint_width(data.len() as u64));
+            add(data.len());
+            add(varint_width(host_token.unwrap_or(0) as u64));
+        }
+        WtEvent::StreamReset { stream, code, .. } | WtEvent::StreamStopped { stream, code, .. } => {
+            add(varint_width(*stream as u64));
+            add(varint_width(*code as u64));
+        }
+        WtEvent::SessionClosed {
+            session_id,
+            code,
+            reason,
+            ..
+        } => {
+            add(varint_width(*session_id));
+            add(varint_width(*code as u64));
+            add(varint_width(reason.len() as u64));
+            add(reason.len());
+        }
+        WtEvent::SessionDraining { session_id, .. } => add(varint_width(*session_id)),
+    }
+    capacity
+}
+
 impl WtEvent {
     /// Connection id this event belongs to.
     pub fn conn(&self) -> u32 {
@@ -93,7 +157,7 @@ impl WtEvent {
     /// Payload-bearing events can append a host-reservation token so JS can
     /// release Rust-side queue ownership exactly once after delivery.
     pub fn encode_with_host_token(&self, host_token: Option<u32>) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(encoded_capacity_hint(self, host_token));
         match self {
             WtEvent::Connected { conn } => {
                 out.push(tag::CONNECTED);
@@ -331,5 +395,87 @@ mod tests {
         off += 2;
         let (tok, _) = varint::decode(&wire[off..]).unwrap();
         assert_eq!(tok, 5);
+    }
+
+    #[test]
+    fn payload_event_frames_are_pre_sized_without_reallocation() {
+        let assert_frame = |event: WtEvent, host_token: Option<u32>| {
+            let expected = encoded_capacity_hint(&event, host_token);
+            let wire = event.encode_with_host_token(host_token);
+            assert_eq!(wire.len(), expected);
+            assert_eq!(wire.capacity(), expected);
+        };
+
+        for (event, host_token) in [
+            (WtEvent::Connected { conn: 1 }, None),
+            (
+                WtEvent::SessionEstablished {
+                    conn: 0x4000,
+                    session_id: 0x4000_0000,
+                },
+                None,
+            ),
+            (
+                WtEvent::Datagram {
+                    conn: 0x4000,
+                    session_id: 0x4000_0000,
+                    data: vec![0xA5; 1200],
+                },
+                Some(0x4000),
+            ),
+            (
+                WtEvent::StreamData {
+                    conn: 0x3f,
+                    stream: 0x4000,
+                    fin: true,
+                    data: vec![0x5A; 2048],
+                },
+                None,
+            ),
+            (WtEvent::ConnectionClosed { conn: 4, code: 42 }, None),
+            (
+                WtEvent::StreamOpened {
+                    conn: 5,
+                    session_id: 12,
+                    stream: 0x4000,
+                    bidi: true,
+                },
+                None,
+            ),
+            (
+                WtEvent::StreamReset {
+                    conn: 7,
+                    stream: 2,
+                    code: 1,
+                },
+                None,
+            ),
+            (
+                WtEvent::StreamStopped {
+                    conn: 8,
+                    stream: 3,
+                    code: 2,
+                },
+                None,
+            ),
+            (
+                WtEvent::SessionClosed {
+                    conn: 9,
+                    session_id: 16,
+                    code: 42,
+                    reason: "bye".to_string(),
+                },
+                None,
+            ),
+            (
+                WtEvent::SessionDraining {
+                    conn: 10,
+                    session_id: 4,
+                },
+                None,
+            ),
+        ] {
+            assert_frame(event, host_token);
+        }
     }
 }
