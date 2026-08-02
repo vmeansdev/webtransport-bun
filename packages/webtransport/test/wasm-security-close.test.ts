@@ -19,20 +19,21 @@ const dec = new TextDecoder();
 
 async function startEchoServer(port: number) {
 	const udp = await BunUdpTransport.bind("127.0.0.1", port);
+	const actualPort = udp.localPort ?? port;
 	const sessions: WasmSession[] = [];
 	const { manager, certHashBase64 } = await serveOverUdp(
 		wasm,
 		() => Promise.resolve(udp),
 		{
 			localAddress: "127.0.0.1",
-			localPort: port,
+			localPort: actualPort,
 			onSession: (session) => {
 				sessions.push(session);
 				session.onDatagram((d) => session.sendDatagram(d));
 			},
 		},
 	);
-	return { udp, manager, certHashBase64, sessions };
+	return { udp, manager, certHashBase64, sessions, port: actualPort };
 }
 
 describe("formatAddr (IPv6 vs IPv4)", () => {
@@ -51,8 +52,8 @@ describe("cert pinning (serverCertificateHashes model)", () => {
 	test.skipIf(!wasmAvailable)(
 		"correct hash connects; wrong hash rejects",
 		async () => {
-			const PORT = 47850;
-			const srv = await startEchoServer(PORT);
+			const srv = await startEchoServer(0);
+			const PORT = srv.port;
 
 			// Correct pin: session establishes and echoes.
 			const udpOk = await BunUdpTransport.connect("127.0.0.1", PORT);
