@@ -234,8 +234,6 @@ jobs:
         shell: bash
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
-      CC_wasm32_unknown_unknown: clang
-      AR_wasm32_unknown_unknown: llvm-ar
     strategy:
       fail-fast: false
       matrix:
@@ -276,6 +274,34 @@ jobs:
       - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
         with:
           deno-version: "2.9.3"
+      - name: Install wasm C toolchain
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y clang lld llvm
+              echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+              echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+              ;;
+            macOS)
+              brew install llvm
+              LLVM_PREFIX="$(brew --prefix llvm)"
+              echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
+              echo "CC_wasm32_unknown_unknown=$LLVM_PREFIX/bin/clang" >> "$GITHUB_ENV"
+              echo "AR_wasm32_unknown_unknown=$LLVM_PREFIX/bin/llvm-ar" >> "$GITHUB_ENV"
+              ;;
+            Windows)
+              choco install llvm -y --no-progress
+              echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+              echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+              echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
       - name: Install exact release tooling
         run: |
           if node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)'; then
