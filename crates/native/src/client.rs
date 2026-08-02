@@ -310,8 +310,11 @@ fn build_quic_transport_config(
     mode: CongestionControlMode,
     idle_timeout_ms: u64,
     keep_alive_interval_ms: u64,
+    limits: &crate::limits::Limits,
 ) -> wtransport::config::QuicTransportConfig {
     let mut config = wtransport::config::QuicTransportConfig::default();
+    crate::transport_memory::TransportMemoryPolicy::from_limits(limits)
+        .apply_flow_control(&mut config);
     apply_congestion_controller(&mut config, mode);
 
     // Liveness: bound how long a silent (possibly dead) connection lingers, and
@@ -369,6 +372,7 @@ pub(crate) fn build_client_tls_parts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_wtransport_client_config(
     insecure_skip_verify: bool,
     ca_pem: Option<&str>,
@@ -377,9 +381,14 @@ fn build_wtransport_client_config(
     idle_timeout_ms: u64,
     keep_alive_interval_ms: u64,
     qpack_max_table_capacity: u64,
+    limits: &crate::limits::Limits,
 ) -> std::result::Result<wtransport::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let transport_config =
-        build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
+    let transport_config = build_quic_transport_config(
+        congestion_control,
+        idle_timeout_ms,
+        keep_alive_interval_ms,
+        limits,
+    );
 
     let tls_config = build_client_tls_parts(insecure_skip_verify, ca_pem, pinned_hashes)
         .map_err(std::io::Error::other)?;
@@ -402,6 +411,7 @@ pub(crate) fn insecure_loopback_client_config(
         60_000,
         10_000,
         0,
+        &crate::limits::Limits::default(),
     )
 }
 
@@ -1414,6 +1424,7 @@ async fn run_connect(
     opts_json: String,
 ) -> std::result::Result<RunConnectResult, Box<dyn std::error::Error + Send + Sync>> {
     let opts = serde_json::from_str::<serde_json::Value>(&opts_json).unwrap_or_default();
+    let client_limits = parse_client_limits(&opts_json).map_err(std::io::Error::other)?;
 
     let tls_opts = opts.get("tls");
     let insecure_skip_verify = tls_opts
@@ -1502,6 +1513,7 @@ async fn run_connect(
         };
         let ca_pem_owned = ca_pem.map(String::from);
         let pinned_hashes_clone = pinned_hashes.clone();
+        let client_limits_for_endpoint = client_limits.clone();
         let create_endpoint = move || {
             let mut config = build_wtransport_client_config(
                 insecure_skip_verify,
@@ -1511,6 +1523,7 @@ async fn run_connect(
                 idle_timeout_ms,
                 keep_alive_interval_ms,
                 qpack_max_table_capacity,
+                &client_limits_for_endpoint,
             )?;
             if let Some(resolver) = custom_resolver {
                 config.set_dns_resolver(resolver);
@@ -1547,6 +1560,7 @@ async fn run_connect(
             keep_alive_interval_ms,
             handshake_timeout_ms,
             qpack_max_table_capacity,
+            &client_limits,
         )
         .await;
     }
@@ -1559,6 +1573,7 @@ async fn run_connect(
         idle_timeout_ms,
         keep_alive_interval_ms,
         qpack_max_table_capacity,
+        &client_limits,
     )?;
 
     if let Some(resolver) = custom_resolver {
@@ -1607,13 +1622,18 @@ async fn run_connect_0rtt(
     keep_alive_interval_ms: u64,
     handshake_timeout_ms: u64,
     qpack_max_table_capacity: u64,
+    limits: &crate::limits::Limits,
 ) -> std::result::Result<RunConnectResult, Box<dyn std::error::Error + Send + Sync>> {
     let key = crate::zero_rtt::TlsIdentityKey::new(insecure_skip_verify, ca_pem, pinned_hashes);
     let (tls_config, store) = crate::zero_rtt::shared_tls_for_identity(&key, ca_pem, pinned_hashes)
         .map_err(std::io::Error::other)?;
 
-    let transport_config =
-        build_quic_transport_config(congestion_control, idle_timeout_ms, keep_alive_interval_ms);
+    let transport_config = build_quic_transport_config(
+        congestion_control,
+        idle_timeout_ms,
+        keep_alive_interval_ms,
+        limits,
+    );
     let mut config = wtransport::ClientConfig::builder()
         .with_bind_default()
         .with_custom_tls_and_transport(tls_config, transport_config)
@@ -1704,14 +1724,21 @@ mod tests {
     // the out-of-range fallback (an idle timeout larger than the varint bound).
     #[test]
     fn build_quic_transport_config_is_panic_safe() {
+        let limits = crate::limits::Limits::default();
         // Normal: 30s idle, 10s keep-alive.
-        let _ = build_quic_transport_config(CongestionControlMode::Default, 30_000, 10_000);
+        let _ =
+            build_quic_transport_config(CongestionControlMode::Default, 30_000, 10_000, &limits);
         // Opt-out: unbounded idle, no keep-alive.
-        let _ = build_quic_transport_config(CongestionControlMode::Throughput, 0, 0);
+        let _ = build_quic_transport_config(CongestionControlMode::Throughput, 0, 0, &limits);
         // Out-of-range idle must fall back to no timeout, not panic.
-        let _ = build_quic_transport_config(CongestionControlMode::LowLatency, u64::MAX, u64::MAX);
+        let _ = build_quic_transport_config(
+            CongestionControlMode::LowLatency,
+            u64::MAX,
+            u64::MAX,
+            &limits,
+        );
         // Keep-alive with no idle bound is ignored (guarded).
-        let _ = build_quic_transport_config(CongestionControlMode::Default, 0, 5_000);
+        let _ = build_quic_transport_config(CongestionControlMode::Default, 0, 5_000, &limits);
     }
 
     #[test]
