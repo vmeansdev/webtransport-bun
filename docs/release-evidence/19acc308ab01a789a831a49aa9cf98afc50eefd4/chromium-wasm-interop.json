@@ -1,7 +1,7 @@
 {
 	"config": {
-		"configFile": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/playwright.wasm.config.ts",
-		"rootDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/tests-wasm",
+		"configFile": "<redacted-user>/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/playwright.wasm.config.ts",
+		"rootDir": "<redacted-user>/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/tests-wasm",
 		"forbidOnly": false,
 		"fullyParallel": false,
 		"globalSetup": null,
@@ -16,7 +16,7 @@
 		"preserveOutput": "always",
 		"projects": [
 			{
-				"outputDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/test-results",
+				"outputDir": "<redacted-user>/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/test-results",
 				"repeatEach": 1,
 				"retries": 0,
 				"metadata": {
@@ -24,7 +24,7 @@
 				},
 				"id": "chromium-webtransport-wasm",
 				"name": "chromium-webtransport-wasm",
-				"testDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/tests-wasm",
+				"testDir": "<redacted-user>/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop/tests-wasm",
 				"testIgnore": [],
 				"testMatch": [
 					"**/*.@(spec|test).?(c|m)[jt]s?(x)"
@@ -58,7 +58,7 @@
 		"workers": 5,
 		"webServer": {
 			"command": "WT_IDLE_TIMEOUT_MS=60000 bun run wasm-server.ts",
-			"cwd": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop",
+			"cwd": "<redacted-user>/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0/tools/interop",
 			"url": "http://127.0.0.1:4436",
 			"reuseExistingServer": false,
 			"timeout": 30000
