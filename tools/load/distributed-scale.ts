@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
 	createServer,
@@ -124,6 +124,20 @@ export type FinalGauges = {
 	limitExceededCount: number;
 };
 
+export type MemorySample = {
+	rssMb: number;
+	heapUsedMb: number;
+	externalMb: number;
+	arrayBuffersMb: number;
+};
+
+export type MemoryTelemetry = {
+	initial: MemorySample;
+	peak: MemorySample;
+	preClose: MemorySample;
+	postClose: MemorySample;
+};
+
 export type SourceIdentityProof = {
 	kind: "server-observed-peer-ip";
 	environment: "none-observed" | "loopback-only" | "external-observed";
@@ -178,6 +192,7 @@ type RunSummary = {
 	overloadClientSummaries: ClientSummary[];
 	closeDurationMs: number;
 	finalGauges: FinalGauges;
+	memory: MemoryTelemetry;
 	p99HandshakeMs: number | null;
 	p99DatagramEnqueueMs: number | null;
 	p99StreamOpenMs: number | null;
@@ -1120,8 +1135,29 @@ export function evaluateOverloadEvidence(evidence: OverloadEvidence): string[] {
 }
 
 function rustcVersion() {
-	const result = spawnSync("rustc", ["-V"], { cwd: ROOT, encoding: "utf8" });
-	return result.status === 0 ? result.stdout.trim() : null;
+	let releaseToolchain: string | null = null;
+	try {
+		const releasePolicy = JSON.parse(
+			readFileSync(resolve(ROOT, ".github/release-toolchain.json"), "utf8"),
+		) as { rust?: unknown };
+		releaseToolchain = Array.isArray(releasePolicy.rust)
+			? String(releasePolicy.rust[0] ?? "").trim() || null
+			: null;
+	} catch {
+		// Fall back to the host compiler when the release policy is unavailable.
+	}
+	const commands: string[][] = releaseToolchain
+		? [
+				["rustup", "run", releaseToolchain, "rustc", "-V"],
+				["rustc", "-V"],
+			]
+		: [["rustc", "-V"]];
+	for (const [command, ...args] of commands) {
+		if (!command) continue;
+		const result = spawnSync(command, args, { cwd: ROOT, encoding: "utf8" });
+		if (result.status === 0) return result.stdout.trim();
+	}
+	return null;
 }
 
 function sourceMetadata() {
@@ -1142,6 +1178,43 @@ function sourceMetadata() {
 
 function getRssMb() {
 	return process.memoryUsage().rss / (1024 * 1024);
+}
+
+function getMemorySample(): MemorySample {
+	const memory = process.memoryUsage();
+	const toMb = (bytes: number) => Number((bytes / (1024 * 1024)).toFixed(3));
+	return {
+		rssMb: toMb(memory.rss),
+		heapUsedMb: toMb(memory.heapUsed),
+		externalMb: toMb(memory.external),
+		arrayBuffersMb: toMb(memory.arrayBuffers),
+	};
+}
+
+export function nativeTransportPolicySnapshot() {
+	return {
+		revision:
+			process.env.LOAD_SCALE_TRANSPORT_POLICY_REVISION?.trim() ||
+			"native-h1a-flow-control-h1b-datagram-64k",
+		streamReceiveWindowBytes: DEFAULT_LIMITS.maxQueuedBytesPerStream,
+		receiveWindowBytes: DEFAULT_LIMITS.maxQueuedBytesPerSession,
+		sendWindowBytes: DEFAULT_LIMITS.maxQueuedBytesPerSession,
+		datagramReceiveBufferBytes: 64 * 1024,
+		datagramSendBufferBytes: 64 * 1024,
+		datagramChannelCapacity: 2048,
+		datagramChannelPolicy: "fixed-h2-candidate-disproved",
+		maxDatagramSizeBytes: DEFAULT_LIMITS.maxDatagramSize,
+	};
+}
+
+function processIsolatedRssTelemetry(): unknown {
+	const raw = process.env.LOAD_SCALE_PROCESS_ISOLATED_RSS_JSON?.trim();
+	if (!raw) return null;
+	try {
+		return JSON.parse(raw);
+	} catch {
+		return { invalidJson: true, raw };
+	}
 }
 
 function percentileFromHistogram(
@@ -1499,8 +1572,12 @@ async function runOneCampaign(
 	);
 	const servers: ReturnType<typeof createServer>[] = [];
 	const serverObservedPeerIps = new Set<string>();
-	const initialRssMb = getRssMb();
-	let peakRssMb = initialRssMb;
+	const initialMemory = getMemorySample();
+	let peakMemory = initialMemory;
+	let preCloseMemory = initialMemory;
+	let postCloseMemory = initialMemory;
+	const initialRssMb = initialMemory.rssMb;
+	let peakRssMb = initialMemory.rssMb;
 	let peakLiveSessions = 0;
 	let peakStreams = 0;
 	let peakQueuedBytesGlobal = 0;
@@ -1701,7 +1778,11 @@ async function runOneCampaign(
 					peakQueuedBytesGlobal,
 					gauges.queuedBytesGlobal,
 				);
-				peakRssMb = Math.max(peakRssMb, getRssMb());
+				const memorySample = getMemorySample();
+				if (memorySample.rssMb > peakMemory.rssMb) {
+					peakMemory = memorySample;
+				}
+				peakRssMb = Math.max(peakRssMb, memorySample.rssMb);
 				if (gauges.sessionsActive >= config.minLiveSessions) {
 					if (liveSetStartedAt == null) {
 						liveSetStartedAt = Date.now();
@@ -1915,6 +1996,7 @@ async function runOneCampaign(
 				`stream open p99 ${p99Stream.toFixed(3)}ms exceeded ${config.p99StreamOpenMs.toFixed(3)}ms`,
 			);
 		}
+		preCloseMemory = getMemorySample();
 
 		// Keep awaitWithTimeout("server.close", ...) visible as the shutdown contract.
 		const closeStartedAt = performance.now();
@@ -1937,7 +2019,8 @@ async function runOneCampaign(
 			server.metricsSnapshot(),
 		);
 		finalGauges = aggregateGauges(postCloseSnapshots);
-		const finalRssMb = getRssMb();
+		postCloseMemory = getMemorySample();
+		const finalRssMb = postCloseMemory.rssMb;
 
 		if (
 			finalGauges.sessionsActive !== 0 ||
@@ -1990,6 +2073,12 @@ async function runOneCampaign(
 			overloadClientSummaries: overloadResult.clientSummaries,
 			closeDurationMs,
 			finalGauges,
+			memory: {
+				initial: initialMemory,
+				peak: peakMemory,
+				preClose: preCloseMemory,
+				postClose: postCloseMemory,
+			},
 			p99HandshakeMs: p99Handshake,
 			p99DatagramEnqueueMs: p99Datagram,
 			p99StreamOpenMs: p99Stream,
@@ -2052,6 +2141,12 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 			overloadClientSummaries: [],
 			closeDurationMs: 0,
 			finalGauges: emptyGauges,
+			memory: {
+				initial: getMemorySample(),
+				peak: getMemorySample(),
+				preClose: getMemorySample(),
+				postClose: getMemorySample(),
+			},
 			p99HandshakeMs: null,
 			p99DatagramEnqueueMs: null,
 			p99StreamOpenMs: null,
@@ -2068,6 +2163,8 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 				bunVersion: Bun.version,
 				rustcVersion: rustcVersion(),
 				source: sourceMetadata(),
+				transportPolicy: nativeTransportPolicySnapshot(),
+				processIsolatedRss: processIsolatedRssTelemetry(),
 				config,
 				summary,
 			},
