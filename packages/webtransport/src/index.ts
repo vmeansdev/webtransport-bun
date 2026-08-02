@@ -828,7 +828,6 @@ export type MetricsSnapshot = {
 	sniCertSelections: number;
 	defaultCertSelections: number;
 	unknownSniRejectedCount: number;
-
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
@@ -1430,6 +1429,7 @@ class NativeServerSession implements ServerSession {
 			this.#incomingBidiCache = createServerIncomingBidiStreams(
 				this.#nativeHandle,
 				() => this.#closed,
+				this.#closedPromise,
 			);
 		}
 		return this.#incomingBidiCache;
@@ -1462,6 +1462,7 @@ class NativeServerSession implements ServerSession {
 			this.#incomingUniCache = createServerIncomingUniStreams(
 				this.#nativeHandle,
 				() => this.#closed,
+				this.#closedPromise,
 			);
 		}
 		return this.#incomingUniCache;
@@ -3164,21 +3165,35 @@ function attachServerRecvControls(
 function createServerIncomingBidiStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
+	closedPromise?: Promise<unknown>,
 ): ReadableStream<WebTransportBidirectionalStream> {
 	// Pull-based: streams are accepted from native only as fast as the
 	// consumer reads them, so a slow/stalled consumer cannot pile up
 	// unbounded native handles in the queue.
 	let cancelled = false;
+	const activeStreams = new Set<BidiStream>();
+	const disposeActiveStreams = () => {
+		for (const stream of activeStreams) stream.destroy();
+		activeStreams.clear();
+	};
+	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
 		async pull(controller) {
-			if (cancelled) return;
+			if (cancelled) {
+				disposeActiveStreams();
+				return;
+			}
 			if (isClosed()) {
+				disposeActiveStreams();
 				controller.close();
 				return;
 			}
 			try {
 				const nativeStream = await nativeHandle.acceptBidiStream();
-				if (cancelled) return;
+				if (cancelled) {
+					nativeStream?.reset?.(0);
+					return;
+				}
 				if (!nativeStream) {
 					controller.close();
 					return;
@@ -3187,11 +3202,25 @@ function createServerIncomingBidiStreams(
 					handleId: nativeStream?.id ?? 0,
 					nativeHandle: nativeStream,
 				});
+				activeStreams.add(duplex);
+				duplex.once("close", () => activeStreams.delete(duplex));
 				controller.enqueue(
-					attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
+					attachServerBidiControls(
+						duplex,
+						await nodeDuplexToWebBidi(
+							duplex,
+							undefined,
+							undefined,
+							undefined,
+							undefined,
+							false,
+							true,
+						),
+					),
 				);
 			} catch (err) {
 				if (isClosed() || isSessionCloseError(err)) {
+					disposeActiveStreams();
 					controller.close();
 					return;
 				}
@@ -3200,6 +3229,7 @@ function createServerIncomingBidiStreams(
 		},
 		cancel() {
 			cancelled = true;
+			disposeActiveStreams();
 		},
 	});
 }
@@ -3207,19 +3237,33 @@ function createServerIncomingBidiStreams(
 function createServerIncomingUniStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
+	closedPromise?: Promise<unknown>,
 ): ReadableStream<WebTransportReceiveStream> {
 	// Pull-based for the same backpressure reasons as the bidi variant.
 	let cancelled = false;
+	const activeStreams = new Set<RecvStream>();
+	const disposeActiveStreams = () => {
+		for (const stream of activeStreams) stream.destroy();
+		activeStreams.clear();
+	};
+	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
 		async pull(controller) {
-			if (cancelled) return;
+			if (cancelled) {
+				disposeActiveStreams();
+				return;
+			}
 			if (isClosed()) {
+				disposeActiveStreams();
 				controller.close();
 				return;
 			}
 			try {
 				const nativeStream = await nativeHandle.acceptUniStream();
-				if (cancelled) return;
+				if (cancelled) {
+					nativeStream?.stopSending?.(0);
+					return;
+				}
 				if (!nativeStream) {
 					controller.close();
 					return;
@@ -3228,14 +3272,17 @@ function createServerIncomingUniStreams(
 					handleId: nativeStream?.id ?? 0,
 					nativeHandle: nativeStream,
 				});
+				activeStreams.add(readable);
+				readable.once("close", () => activeStreams.delete(readable));
 				controller.enqueue(
 					attachServerRecvControls(
 						readable,
-						nodeReadableToWebReadable(readable),
+						nodeReadableToWebReadable(readable, undefined, false, true),
 					),
 				);
 			} catch (err) {
 				if (isClosed() || isSessionCloseError(err)) {
+					disposeActiveStreams();
 					controller.close();
 					return;
 				}
@@ -3244,6 +3291,7 @@ function createServerIncomingUniStreams(
 		},
 		cancel() {
 			cancelled = true;
+			disposeActiveStreams();
 		},
 	});
 }
@@ -3323,6 +3371,7 @@ function nodeDuplexToWebBidi(
 	onWriteBytes?: (bytes: number) => void,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
+	destroyOnReadableCancel = false,
 ): Promise<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
@@ -3331,6 +3380,7 @@ function nodeDuplexToWebBidi(
 		duplex,
 		onReadBytes,
 		strictW3CErrors,
+		destroyOnReadableCancel,
 	);
 	const writable = nodeWritableToWebWritable(
 		duplex,
@@ -3360,6 +3410,7 @@ function nodeReadableToWebReadable(
 	r: Readable,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
+	destroyOnCancel = true,
 ): ReadableStream<Uint8Array> {
 	const stopSendable = r as unknown as Partial<StopSendable>;
 	// Pull-based so the web stream's highWaterMark actually bounds buffering:
@@ -3387,6 +3438,7 @@ function nodeReadableToWebReadable(
 			const fn = stopSendable[WT_STOP_SENDING];
 			if (typeof fn === "function") fn.call(r, extractStreamErrorCode(reason));
 			void iter.return?.();
+			if (destroyOnCancel && !r.destroyed) r.destroy();
 		},
 	});
 }
