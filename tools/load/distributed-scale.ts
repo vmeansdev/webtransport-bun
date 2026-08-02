@@ -209,6 +209,14 @@ type ProbeUniStream = ReadableStream<Uint8Array> & {
 	[WT_STOP_SENDING]?: (code?: number) => void;
 };
 
+function isExpectedProbeControlError(error: unknown): boolean {
+	const text =
+		error && typeof error === "object" && "code" in error
+			? String((error as { code?: unknown }).code)
+			: String(error);
+	return text === "E_STOP_SENDING" || text === "E_STREAM_RESET";
+}
+
 async function endWritableProbe(
 	writable: Pick<NodeJS.WritableStream, "end" | "once">,
 	chunk: Uint8Array,
@@ -369,7 +377,7 @@ async function runProbeStreamHandlers(
 				);
 				tasks.push(
 					task.catch((error) => {
-						taskErrors.push(error);
+						if (!isExpectedProbeControlError(error)) taskErrors.push(error);
 					}),
 				);
 			}
@@ -398,7 +406,7 @@ async function runProbeStreamHandlers(
 				);
 				tasks.push(
 					task.catch((error) => {
-						taskErrors.push(error);
+						if (!isExpectedProbeControlError(error)) taskErrors.push(error);
 					}),
 				);
 			}
