@@ -379,14 +379,18 @@ pub fn get_session_metrics(session_id: &str) -> Option<Arc<SessionMetrics>> {
 /// The code and reason reach the peer as a `CLOSE_WEBTRANSPORT_SESSION` capsule
 /// on the CONNECT stream — a QUIC `CONNECTION_CLOSE` carries neither. Delivery
 /// is best-effort and off the caller's critical path; the connection is torn
-/// down once the capsule is out. Local state is marked closed first, so pending
-/// reads/writes fail immediately either way and iterators and bridge tasks
-/// unblock without waiting on the wire.
+/// down once the capsule is out. Queue the capsule before removing local state:
+/// the transport worker must observe the close command before teardown can
+/// race it and leave the peer with only a generic connection-loss signal.
+/// Local state is then marked closed so pending reads/writes fail immediately
+/// and iterators and bridge tasks unblock without waiting on the wire.
 pub fn close_session(session_id: &str, code: u32, reason: &str) {
+    if let Some(entry) = REGISTRY.get(session_id) {
+        entry.conn.close_session(code, reason);
+    }
     mark_closed_and_notify_capacity_waiters(session_id);
     if let Some((_, state)) = REGISTRY.remove(session_id) {
         mark_state_closed_and_notify(&state);
-        state.conn.close_session(code, reason);
     }
 }
 

@@ -182,6 +182,39 @@ describe("session accept (P0-A)", () => {
 		}
 	}, 120000);
 
+	it("server-initiated close code/reason propagate reliably across repeated sessions", async () => {
+		const port = nextPort(23440, 2000);
+		const sessions: any[] = [];
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: (s) => {
+				sessions.push(s);
+			},
+		});
+		const runs = 10;
+		try {
+			for (let i = 0; i < runs; i++) {
+				const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+				});
+				const accepted = await waitUntil(() => sessions.length > i, 8000);
+				expect(accepted).toBe(true);
+				const serverSession = sessions[i];
+				serverSession.close({ code: 4001, reason: "interop-close" });
+				const closeInfo = await Promise.race([
+					client.closed,
+					Bun.sleep(5000).then(() => ({ code: -1, reason: "timeout" })),
+				]);
+				expect((closeInfo as any).code).toBe(4001);
+				expect((closeInfo as any).reason).toBe("interop-close");
+				client.close();
+			}
+		} finally {
+			await server.close();
+		}
+	}, 90000);
+
 	it("writer.close before read still preserves session close code/reason", async () => {
 		const port = nextPort(23440, 2000);
 		const sessions: any[] = [];
