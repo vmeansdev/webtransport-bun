@@ -13,10 +13,16 @@ fi
 
 # Disallow any updates to main from this repo (regular and force push).
 # development remains unrestricted by this hook.
+declare -a pushed_files=()
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = "refs/heads/main" ]; then
     echo "pre-push: pushes to main are blocked by project policy. Use a PR into main." >&2
     exit 1
+  fi
+  if [ "${remote_sha:-}" != "" ] && [ "${local_sha:-}" != "" ]; then
+    while IFS= read -r -d '' file; do
+      pushed_files+=("$file")
+    done < <(git diff --name-only --diff-filter=ACMR -z "$remote_sha" "$local_sha")
   fi
 done
 
@@ -30,9 +36,24 @@ if ! command -v bunx >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "pre-push: cargo is required" >&2
+if ! command -v cargo >/dev/null 2>&1 && ! command -v rustup >/dev/null 2>&1; then
+  echo "pre-push: cargo or rustup is required" >&2
   exit 1
+fi
+
+rust_toolchain=""
+if command -v rustup >/dev/null 2>&1 && [ -f "$repo_root/.github/release-toolchain.json" ]; then
+  rust_toolchain="$(sed -nE 's/^[[:space:]]*"rust":[[:space:]]*\["([^"]+)".*$/\1/p' "$repo_root/.github/release-toolchain.json")"
+fi
+
+if [ -n "$rust_toolchain" ]; then
+  if ! rustup toolchain list | awk -v version="$rust_toolchain" '$1 == version || index($1, version "-") == 1 { found = 1 } END { exit(found ? 0 : 1) }'; then
+    echo "pre-push: required Rust toolchain $rust_toolchain is not installed" >&2
+    exit 1
+  fi
+  cargo_cmd=(rustup run "$rust_toolchain" cargo)
+else
+  cargo_cmd=(cargo)
 fi
 
 formatted_tsjs=0
@@ -40,13 +61,13 @@ formatted_rust=0
 
 echo "pre-push: checking TS/JS formatting with biome"
 declare -a tsjs_files=()
-while IFS= read -r -d '' file; do
+for file in "${pushed_files[@]}"; do
   case "$file" in
     *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs)
       tsjs_files+=("$file")
       ;;
   esac
-done < <(git ls-files -z)
+done
 
 if [ "${#tsjs_files[@]}" -gt 0 ]; then
   if ! bunx biome format "${tsjs_files[@]}"; then
@@ -57,23 +78,23 @@ if [ "${#tsjs_files[@]}" -gt 0 ]; then
     bunx biome format "${tsjs_files[@]}"
   fi
 else
-  echo "pre-push: no TS/JS files found, skipping biome check"
+  echo "pre-push: no changed TS/JS files found, skipping biome check"
 fi
 
 echo "pre-push: running TypeScript typecheck"
 bun run typecheck
 
 echo "pre-push: running Rust format check"
-if ! cargo fmt --all --check; then
+if ! "${cargo_cmd[@]}" fmt --all --check; then
   echo "pre-push: formatting Rust with cargo fmt"
-  cargo fmt --all
+  "${cargo_cmd[@]}" fmt --all
   formatted_rust=1
   echo "pre-push: re-checking Rust formatting"
-  cargo fmt --all --check
+  "${cargo_cmd[@]}" fmt --all --check
 fi
 
 echo "pre-push: running Rust workspace check"
-cargo check --workspace
+"${cargo_cmd[@]}" check --workspace
 
 if [ "$formatted_tsjs" -eq 1 ] || [ "$formatted_rust" -eq 1 ]; then
   echo "pre-push: formatters changed files. Commit formatting changes, then push again." >&2
