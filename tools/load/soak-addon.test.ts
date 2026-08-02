@@ -19,6 +19,8 @@ import {
 	phaseLoadDurationSeconds,
 	phasePlan,
 	sampleIntervalMs,
+	soakDatagramRateLimitPerSec,
+	soakStreamRateLimitPerSec,
 	type Sample,
 } from "./soak-addon.ts";
 
@@ -35,10 +37,10 @@ test("scales short smoke phase slots to fit the bounded CI window", () => {
 
 	expect(phases).toHaveLength(5);
 	expect(phases[0]?.durationMs).toBe(10_000);
-	expect(phases.at(-1)?.startOffsetMs).toBe(90_000);
+	expect(phases.at(-1)?.startOffsetMs).toBe(170_000);
 	expect(
 		(phases.at(-1)?.startOffsetMs ?? 0) + (phases.at(-1)?.durationMs ?? 0),
-	).toBe(100_000);
+	).toBe(180_000);
 });
 
 test("keeps short phase clients inside their scheduled slots", () => {
@@ -49,6 +51,16 @@ test("keeps short phase clients inside their scheduled slots", () => {
 test("samples short campaigns often enough to observe bounded phase recovery", () => {
 	expect(sampleIntervalMs(120)).toBe(5_000);
 	expect(sampleIntervalMs(3_600)).toBe(30_000);
+});
+
+test("budgets the loopback stream limiter for overlapping main and overload load", () => {
+	expect(soakStreamRateLimitPerSec(500, 5)).toBe(5_500);
+	expect(soakStreamRateLimitPerSec(20, 1)).toBe(1_000);
+});
+
+test("budgets the loopback datagram limiter for overlapping main and overload load", () => {
+	expect(soakDatagramRateLimitPerSec(500, 500)).toBe(550_000);
+	expect(soakDatagramRateLimitPerSec(20, 0)).toBe(50_000);
 });
 
 afterEach(() => {

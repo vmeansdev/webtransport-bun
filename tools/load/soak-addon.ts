@@ -1525,16 +1525,62 @@ export function phasePlan(durationSeconds: number): {
 }[] {
 	const totalMs = durationSeconds * 1000;
 	// Long campaigns retain a 45s minimum phase; short CI smoke runs scale
-	// phases down so all five phases finish within the bounded job timeout.
+	// phases down so all five phases finish within the bounded job timeout. The
+	// short-run clients still execute five bounded probes before their load
+	// window, so leave two slot-length recovery gaps between phase starts rather
+	// than allowing the probes and cleanup to overlap the next phase.
 	const minimumSlotMs = durationSeconds >= 3600 ? 45_000 : 5_000;
 	const slot = Math.max(minimumSlotMs, Math.floor(totalMs / 12));
+	const phaseStride = durationSeconds >= 3600 ? slot * 2 : slot * 4;
 	return [
 		{ name: "steady-state", startOffsetMs: slot, durationMs: slot },
-		{ name: "overload", startOffsetMs: slot * 3, durationMs: slot },
-		{ name: "idle-peers", startOffsetMs: slot * 5, durationMs: slot },
-		{ name: "reconnect-churn", startOffsetMs: slot * 7, durationMs: slot },
-		{ name: "cert-rotation", startOffsetMs: slot * 9, durationMs: slot },
+		{
+			name: "overload",
+			startOffsetMs: slot + phaseStride,
+			durationMs: slot,
+		},
+		{
+			name: "idle-peers",
+			startOffsetMs: slot + phaseStride * 2,
+			durationMs: slot,
+		},
+		{
+			name: "reconnect-churn",
+			startOffsetMs: slot + phaseStride * 3,
+			durationMs: slot,
+		},
+		{
+			name: "cert-rotation",
+			startOffsetMs: slot + phaseStride * 4,
+			durationMs: slot,
+		},
 	];
+}
+
+export function soakStreamRateLimitPerSec(
+	sessions: number,
+	streamsPerSec: number,
+): number {
+	const safeSessions = Math.max(0, sessions);
+	const safeStreamsPerSec = Math.max(0, streamsPerSec);
+	const mainStreamRate = safeSessions * safeStreamsPerSec;
+	const overloadSessions = Math.max(50, Math.floor(safeSessions * 0.6));
+	const overloadStreamsPerSec = Math.max(safeStreamsPerSec * 2, 10);
+	const overlappingOverloadRate = overloadSessions * overloadStreamsPerSec;
+	return Math.max(1_000, mainStreamRate + overlappingOverloadRate);
+}
+
+export function soakDatagramRateLimitPerSec(
+	sessions: number,
+	datagramsPerSec: number,
+): number {
+	const safeSessions = Math.max(0, sessions);
+	const safeDatagramsPerSec = Math.max(0, datagramsPerSec);
+	const mainDatagramRate = safeSessions * safeDatagramsPerSec;
+	const overloadSessions = Math.max(50, Math.floor(safeSessions * 0.6));
+	const overloadDatagramsPerSec = Math.max(safeDatagramsPerSec * 2, 1_000);
+	const overlappingOverloadRate = overloadSessions * overloadDatagramsPerSec;
+	return Math.max(10_000, mainDatagramRate + overlappingOverloadRate);
 }
 
 export function phaseLoadDurationSeconds(durationMs: number): number {
@@ -1806,6 +1852,14 @@ async function runSegment(): Promise<void> {
 	ensureDirectory(resolve(artifactsOut, ".."));
 
 	const initialTls = createTlsMaterial();
+	const streamRateLimitPerSec = soakStreamRateLimitPerSec(
+		SESSIONS,
+		STREAMS_PER_SEC,
+	);
+	const datagramRateLimitPerSec = soakDatagramRateLimitPerSec(
+		SESSIONS,
+		DATAGRAMS_PER_SEC,
+	);
 	const server = createServer({
 		port: 4433,
 		tls: initialTls
@@ -1819,10 +1873,10 @@ async function runSegment(): Promise<void> {
 			handshakesPerSec: Math.max(SESSIONS * 2, 400),
 			handshakesBurst: Math.max(SESSIONS * 4, 1000),
 			handshakesBurstPerPrefix: Math.max(SESSIONS * 4, 1000),
-			streamsPerSec: Math.max(SESSIONS * 4, 1000),
-			streamsBurst: Math.max(SESSIONS * 8, 2000),
-			datagramsPerSec: Math.max(SESSIONS * 20, 10000),
-			datagramsBurst: Math.max(SESSIONS * 40, 20000),
+			streamsPerSec: streamRateLimitPerSec,
+			streamsBurst: Math.max(streamRateLimitPerSec * 2, 2000),
+			datagramsPerSec: datagramRateLimitPerSec,
+			datagramsBurst: Math.max(datagramRateLimitPerSec * 2, 20000),
 		},
 		onSession: createLoadSessionHandler(),
 	});
