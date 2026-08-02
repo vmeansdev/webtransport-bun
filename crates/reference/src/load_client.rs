@@ -22,6 +22,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const DATAGRAM_PROBE_ATTEMPTS: usize = 3;
 const LOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
@@ -262,19 +263,6 @@ fn load_summary_json(mode: ClientMode, counters: &Counters) -> String {
     )
 }
 
-async fn read_stream_to_end(
-    recv: &mut wtransport::RecvStream,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut buf = [0u8; 1024];
-    let mut out = Vec::new();
-    loop {
-        match recv.read(&mut buf).await? {
-            Some(n) => out.extend_from_slice(&buf[..n]),
-            None => return Ok(out),
-        }
-    }
-}
-
 async fn read_stream_to_end_before(
     recv: &mut wtransport::RecvStream,
     deadline: Instant,
@@ -310,14 +298,33 @@ async fn run_datagram_echo_probe(
     counters: &Counters,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let payload = format!("{PROBE_DATAGRAM_PREFIX}{}", next_probe_id()).into_bytes();
-    conn.send_datagram(&payload)?;
-    counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
-    let received = tokio::time::timeout(PROBE_TIMEOUT, conn.receive_datagram()).await??;
-    if received.as_ref() != payload.as_slice() {
-        return Err("datagram echo mismatch".into());
+    for _ in 0..DATAGRAM_PROBE_ATTEMPTS {
+        if conn.send_datagram(&payload).is_err() {
+            continue;
+        }
+        counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + PROBE_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, conn.receive_datagram()).await {
+                Ok(Ok(received)) if received.as_ref() == payload.as_slice() => {
+                    counters.datagram_echo_ok.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Ok(Ok(_)) => {
+                    // A server-owned datagram can arrive before the echo. Keep
+                    // draining this bounded attempt until the expected payload
+                    // arrives or its deadline expires.
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => break,
+            }
+        }
     }
-    counters.datagram_echo_ok.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    Err("datagram echo probe exhausted bounded attempts".into())
 }
 
 async fn run_uni_echo_probe(
@@ -361,7 +368,8 @@ async fn run_bidi_echo_probe(
     counters.streams_opened.fetch_add(1, Ordering::Relaxed);
     send.write_all(&payload).await?;
     send.finish().await?;
-    let echoed = read_stream_to_end(&mut recv).await?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let echoed = read_stream_to_end_before(&mut recv, deadline).await?;
     if echoed != payload {
         return Err("bidi echo mismatch".into());
     }
