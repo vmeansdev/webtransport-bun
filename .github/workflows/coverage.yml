@@ -34,6 +34,10 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12.10"
+      - name: Install wasm C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      - name: Install wasm-bindgen-cli (pinned to crate version)
+        run: cargo install wasm-bindgen-cli --version 0.2.121 --locked
       - name: Install coverage tooling
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
       - name: Install deps
@@ -44,13 +48,15 @@ jobs:
         run: bun run build:native
       - name: Build adversary binary
         run: cargo build -p adversary
+      - name: Build wasm package and distribution
+        run: bun run build:wasm && bun run build:wasm:dist
       - name: Native coverage
         run: cargo +nightly-2026-07-31 llvm-cov --workspace --branch --json --output-path coverage/native-coverage.json
       - name: WASM coverage
         run: cargo +nightly-2026-07-31 llvm-cov --manifest-path crates/wasm/Cargo.toml --branch --json --output-path coverage/wasm-coverage.json
       - name: Bun coverage
         run: |
-          bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage/bun packages/
+          WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage/bun packages/
           test -f coverage/native-coverage.json || (echo "::error::Missing coverage/native-coverage.json after Bun coverage"; exit 1)
           test -f coverage/wasm-coverage.json || (echo "::error::Missing coverage/wasm-coverage.json after Bun coverage"; exit 1)
           if [ -f coverage/bun/lcov.info ]; then

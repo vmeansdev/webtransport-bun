@@ -238,6 +238,16 @@ describe("GitHub Actions release policy", () => {
 			expect(workflow.indexOf("- name: Build adversary binary")).toBeLessThan(
 				workflow.indexOf("- name: Bun coverage"),
 			);
+			expect(workflow).toContain("- name: Install wasm C toolchain");
+			expect(workflow).toContain(
+				"- name: Install wasm-bindgen-cli (pinned to crate version)",
+			);
+			expect(workflow).toContain("- name: Build wasm package and distribution");
+			expect(
+				workflow.indexOf("- name: Build wasm package and distribution"),
+			).toBeLessThan(workflow.indexOf("- name: Bun coverage"));
+			expect(workflow).toContain("WEBTRANSPORT_REQUIRE_WASM=1");
+			expect(workflow).toContain("WEBTRANSPORT_REQUIRE_WASM_DIST=1");
 		}
 	});
 
