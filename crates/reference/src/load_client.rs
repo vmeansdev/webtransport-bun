@@ -16,11 +16,14 @@ const DEFAULT_DURATION_SECS: u64 = 30;
 const DEFAULT_DATAGRAMS_PER_SEC: u64 = 1000;
 const DEFAULT_STREAMS_PER_SEC: u64 = 10;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+// A hosted soak can leave a bounded set of response drains behind the final
+// workload tick. Give those drains time to observe FIN before aborting the
+// session tasks, while keeping the client lifetime bounded by the harness.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const LOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
