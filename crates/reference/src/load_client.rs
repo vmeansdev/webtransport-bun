@@ -88,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_datagram_errors = DEFAULT_MAX_DATAGRAM_ERRORS;
     let mut max_stream_errors = DEFAULT_MAX_STREAM_ERRORS;
     let mut reconnect_hold_ms = DEFAULT_RECONNECT_HOLD_MS;
+    let mut skip_probes = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -135,12 +136,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconnect_hold_ms =
                     parse_or_default("--hold-ms", args.next(), DEFAULT_RECONNECT_HOLD_MS)
             }
+            "--skip-probes" => skip_probes = true,
             _ => {}
         }
     }
 
     println!(
-        "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} hold_ms={} budgets(session={}, datagram={}, stream={})",
+        "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
         mode.as_str(),
         url,
         sessions,
@@ -148,6 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         datagrams_per_sec,
         streams_per_sec,
         reconnect_hold_ms,
+        skip_probes,
         max_session_errors,
         max_datagram_errors,
         max_stream_errors
@@ -165,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         datagrams_per_sec,
         streams_per_sec,
         reconnect_hold: Duration::from_millis(reconnect_hold_ms),
+        skip_probes,
         budgets: ErrorBudgets {
             max_session_errors,
             max_datagram_errors,
@@ -180,6 +184,7 @@ struct Counters {
     datagrams_sent: AtomicU64,
     datagrams_err: AtomicU64,
     streams_opened: AtomicU64,
+    load_streams_opened: AtomicU64,
     streams_err: AtomicU64,
     datagram_echo_ok: AtomicU64,
     uni_echo_ok: AtomicU64,
@@ -204,6 +209,7 @@ struct RunOptions<'a> {
     datagrams_per_sec: u64,
     streams_per_sec: u64,
     reconnect_hold: Duration,
+    skip_probes: bool,
     budgets: ErrorBudgets,
 }
 
@@ -368,6 +374,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         datagrams_per_sec,
         streams_per_sec,
         reconnect_hold,
+        skip_probes,
         budgets,
     } = options;
     let config = ClientConfig::builder()
@@ -392,7 +399,9 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                     match endpoint.connect(&url).await {
                         Ok(conn) => {
                             counters.sessions_ok.fetch_add(1, Ordering::Relaxed);
-                            run_probe_suite(&conn, counters.as_ref()).await;
+                            if !skip_probes {
+                                run_probe_suite(&conn, counters.as_ref()).await;
+                            }
                             run_session(
                                 conn,
                                 duration,
@@ -448,6 +457,10 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     println!("load-client: sessions ok={} err={}", ok, err);
     println!("load-client: datagrams sent={} err={}", dg_sent, dg_err);
     println!("load-client: streams opened={} err={}", st_open, st_err);
+    println!(
+        "load-client: load streams opened={}",
+        counters.load_streams_opened.load(Ordering::Relaxed)
+    );
 
     let pass = ok > 0
         && err <= budgets.max_session_errors
@@ -529,6 +542,7 @@ async fn run_session(
                         Ok(opening) => match opening.await {
                             Ok(mut send) => {
                                 counters.streams_opened.fetch_add(1, Ordering::Relaxed);
+                                counters.load_streams_opened.fetch_add(1, Ordering::Relaxed);
                                 match send.write_all(&payload).await {
                                     Ok(()) => match send.finish().await {
                                         Ok(()) => Ok::<(), Box<dyn std::error::Error + Send + Sync>>(()),
@@ -547,6 +561,7 @@ async fn run_session(
                         Ok(opening) => match opening.await {
                             Ok((mut send, _recv)) => {
                                 counters.streams_opened.fetch_add(1, Ordering::Relaxed);
+                                counters.load_streams_opened.fetch_add(1, Ordering::Relaxed);
                                 match send.write_all(&payload).await {
                                     Ok(()) => match send.finish().await {
                                         Ok(()) => Ok::<(), Box<dyn std::error::Error + Send + Sync>>(()),
