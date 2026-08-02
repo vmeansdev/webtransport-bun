@@ -568,7 +568,11 @@ jobs:
           deno-version: "2.9.3"
       - name: Install exact release tooling
         run: |
-          npm install --global npm@11.18.0
+          if node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)'; then
+            npm install --global npm@11.18.0
+          else
+            echo "Node $(node --version) uses its bundled npm because npm@11.18.0 requires Node 20+"
+          fi
           cargo install wasm-bindgen-cli --locked --version 0.2.121
       - name: Install dependencies
         run: bun install --frozen-lockfile

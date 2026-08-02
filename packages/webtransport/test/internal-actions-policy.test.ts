@@ -322,6 +322,8 @@ describe("GitHub Actions release policy", () => {
 		expect(RELEASE_WORKFLOW).toContain(
 			`cargo install wasm-bindgen-cli --version ${RELEASE_TOOLCHAIN.wasmBindgen[0]} --locked`,
 		);
+		expect(RELEASE_WORKFLOW).toContain("npm@11.18.0 requires Node 20+");
+		expect(TEST_WORKFLOW).toContain("npm@11.18.0 requires Node 20+");
 	});
 
 	it("keeps exact-package consumers in CI aligned with the declared Node engine floor", () => {
