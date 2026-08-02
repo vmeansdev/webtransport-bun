@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "gate": "coverage-gates",
+  "status": "passed",
+  "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+  "executionIdentity": "github-actions",
+  "workflow": {
+    "name": "coverage",
+    "runId": 30739231349,
+    "url": "https://github.com/vmeansdev/webtransport-bun/actions/runs/30739231349",
+    "headSha": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298"
+  },
+  "toolchain": {
+    "rustCoverage": "nightly-2026-07-31",
+    "rustNative": "1.95.0",
+    "cargoLlvmCov": "0.8.7",
+    "bun": "1.3.14",
+    "wasmBindgen": "0.2.121"
+  },
+  "floors": {
+    "native": {
+      "crates/native/src/limits.rs": { "line": 100.0, "function": 100.0, "branch": 100.0 },
+      "crates/native/src/server.rs": { "line": 99.8221, "function": 100.0, "branch": 96.6667 },
+      "crates/native/src/session.rs": { "line": 98.6965, "function": 93.8776, "branch": 84.375 },
+      "crates/native/src/spawn_tracked.rs": { "line": 99.7423, "function": 100.0, "branch": 100.0 }
+    },
+    "wasm": {
+      "crates/wasm/src/governor.rs": { "line": 99.2899, "function": 96.8085, "branch": 92.8571 },
+      "crates/wasm/src/h3.rs": { "line": 98.0998, "function": 97.4138, "branch": 85.7143 },
+      "crates/wasm/src/endpoint.rs": { "line": 92.4937, "function": 90.6367, "branch": 80.2083 },
+      "crates/wasm/src/cert.rs": { "line": 98.0, "function": 92.3077, "branch": 100.0, "branchSites": 0 },
+      "crates/wasm/src/verify.rs": { "line": 97.4596, "function": 91.4894, "branch": 94.7368 }
+    },
+    "bun": {
+      "packages/webtransport/src/backend.ts": { "line": 99.6458, "function": 97.2414 },
+      "packages/webtransport/src/backend-wasm.ts": { "line": 99.8672, "function": 93.6508 },
+      "packages/webtransport/src/wasm-webtransport.ts": { "line": 98.8785, "function": 96.2963 }
+    }
+  },
+  "artifacts": {
+    "native-coverage.json": "a4bd6636bf8ed6f22c6243301a6a8384fe75f77296fe7aa62c89ec2e5457f1d7",
+    "wasm-coverage.json": "0e931dce3c0a689a6a75e789b0110832f4db351d989d89d14cebbe5918e39682",
+    "bun/lcov.info": "a34bcb6984d972e233adbf1bd8af2ad8e6a8c5b7e9caea773f94d0cd6e921a0a",
+    "bun/path-proof.txt": "34c3304fbb45eb0ae209fe93eff169f87a1e08712feefcdf2a799dc82268015c"
+  },
+  "notes": "Hosted native, WASM, and Bun floor checks passed. The detailed reports remain in the immutable GitHub Actions artifact; this retained summary contains their digests and floor values without runner paths."
+}

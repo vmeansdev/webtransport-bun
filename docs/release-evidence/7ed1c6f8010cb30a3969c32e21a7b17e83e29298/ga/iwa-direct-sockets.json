@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "status": "passed",
+  "startedAt": "2026-08-02T08:18:54.895Z",
+  "finishedAt": "2026-08-02T08:18:54.987Z",
+  "executionIdentity": "browser-iwa-direct-sockets",
+  "origin": "isolated-app://dwv64b62gego3yb5zkzcnol3yw4ykyvh22dw4xss7w2pdk267ciqaaic",
+  "protocol": "isolated-app:",
+  "crossOriginIsolated": true,
+  "directSockets": true,
+  "functional": {
+    "datagram": "iwa-datagram",
+    "bidi": "iwa-bidi",
+    "uni": "iwa-uni",
+    "resetCode": 37,
+    "stopSendingCode": 41,
+    "peerClose": {
+      "code": 4100,
+      "reason": "iwa-peer-close"
+    }
+  },
+  "reconnects": [
+    {
+      "attempt": 1,
+      "payload": "iwa-reconnect-1"
+    },
+    {
+      "attempt": 2,
+      "payload": "iwa-reconnect-2"
+    },
+    {
+      "attempt": 3,
+      "payload": "iwa-reconnect-3"
+    },
+    {
+      "attempt": 4,
+      "payload": "iwa-reconnect-4"
+    },
+    {
+      "attempt": 5,
+      "payload": "iwa-reconnect-5"
+    },
+    {
+      "attempt": 6,
+      "payload": "iwa-reconnect-6"
+    },
+    {
+      "attempt": 7,
+      "payload": "iwa-reconnect-7"
+    },
+    {
+      "attempt": 8,
+      "payload": "iwa-reconnect-8"
+    }
+  ],
+  "certificateRotation": {
+    "oldPinRejected": true,
+    "oldHash": "QnjJYG+bgEku/HDrsUZD4cAvhuVxXQziHJOO7E+36CE=",
+    "newHash": "tV3Al6R8jy+7Edhuo9ppoL1CtbQ8uNKCiRFKJQdC/48=",
+    "payload": "iwa-rotated-cert"
+  },
+  "browser": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+  "signedBundleArtifact": "webtransport-wasm-iwa.swbn",
+  "signedBundleSha256": "008eafe55e22c0913ba8b6d91eb90e900210011e4fab4658104e07e27e0e49c8",
+  "unsignedBundleArtifact": "webtransport-wasm-iwa.wbn",
+  "unsignedBundleSha256": "781be886451fdca53b20e228c2312e130e9385e6c5aaf5f654ee4cee3ab13f33",
+  "browserVersion": "150.0.7871.187",
+  "browserChannel": "playwright-chromium",
+  "localNetworkPermission": "pregranted-for-automated-proof",
+  "playwrightVersion": "1.58.2"
+}

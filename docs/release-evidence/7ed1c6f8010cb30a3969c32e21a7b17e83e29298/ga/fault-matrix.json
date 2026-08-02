@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "status": "passed",
+  "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+  "startedAt": "2026-08-02T08:19:34.091Z",
+  "scenarios": [
+    {
+      "profile": {
+        "name": "seeded-loss",
+        "seed": 439041101,
+        "lossRate": 0.08
+      },
+      "stats": {
+        "seen": 215,
+        "forwarded": 198,
+        "dropped": 17,
+        "duplicated": 0,
+        "delayed": 0,
+        "reordered": 0,
+        "blackHoled": 0,
+        "burstDropped": 0
+      },
+      "payload": "fault-matrix-seeded-loss",
+      "durationMs": 43
+    },
+    {
+      "profile": {
+        "name": "seeded-duplication",
+        "seed": 708529245,
+        "duplicateRate": 0.08
+      },
+      "stats": {
+        "seen": 132,
+        "forwarded": 145,
+        "dropped": 0,
+        "duplicated": 13,
+        "delayed": 0,
+        "reordered": 0,
+        "blackHoled": 0,
+        "burstDropped": 0
+      },
+      "payload": "fault-matrix-seeded-duplication",
+      "durationMs": 19
+    },
+    {
+      "profile": {
+        "name": "seeded-reordering",
+        "seed": 978017389,
+        "reorderRate": 0.08,
+        "reorderExtraMs": 20
+      },
+      "stats": {
+        "seen": 139,
+        "forwarded": 139,
+        "dropped": 0,
+        "duplicated": 0,
+        "delayed": 13,
+        "reordered": 13,
+        "blackHoled": 0,
+        "burstDropped": 0
+      },
+      "payload": "fault-matrix-seeded-reordering",
+      "durationMs": 53
+    },
+    {
+      "profile": {
+        "name": "fixed-delay",
+        "seed": 1247505533,
+        "delayMs": 30
+      },
+      "stats": {
+        "seen": 182,
+        "forwarded": 182,
+        "dropped": 0,
+        "duplicated": 0,
+        "delayed": 182,
+        "reordered": 0,
+        "blackHoled": 0,
+        "burstDropped": 0
+      },
+      "payload": "fault-matrix-fixed-delay",
+      "durationMs": 392
+    },
+    {
+      "profile": {
+        "name": "seeded-jitter",
+        "seed": 1516993677,
+        "delayMs": 20,
+        "jitterMs": 15
+      },
+      "stats": {
+        "seen": 159,
+        "forwarded": 159,
+        "dropped": 0,
+        "duplicated": 0,
+        "delayed": 159,
+        "reordered": 0,
+        "blackHoled": 0,
+        "burstDropped": 0
+      },
+      "payload": "fault-matrix-seeded-jitter",
+      "durationMs": 235
+    },
+    {
+      "profile": {
+        "name": "burst-loss",
+        "seed": 1786481821,
+        "burstLoss": {
+          "startPacket": 12,
+          "packetCount": 3
+        }
+      },
+      "stats": {
+        "seen": 202,
+        "forwarded": 196,
+        "dropped": 6,
+        "duplicated": 0,
+        "delayed": 0,
+        "reordered": 0,
+        "blackHoled": 0,
+        "burstDropped": 6
+      },
+      "payload": "fault-matrix-burst-loss",
+      "durationMs": 28
+    },
+    {
+      "profile": {
+        "name": "black-hole-recovery",
+        "seed": 2055969965,
+        "blackHole": {
+          "startMs": 750,
+          "durationMs": 500
+        }
+      },
+      "stats": {
+        "seen": 239,
+        "forwarded": 218,
+        "dropped": 21,
+        "duplicated": 0,
+        "delayed": 0,
+        "reordered": 0,
+        "blackHoled": 21,
+        "burstDropped": 0
+      },
+      "payload": "fault-matrix-black-hole-recovery",
+      "durationMs": 1646
+    }
+  ],
+  "finishedAt": "2026-08-02T08:19:36.514Z"
+}

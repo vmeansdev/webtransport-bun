@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "candidate": {
+    "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+    "branch": "codex/functional-1.0-readiness",
+    "readiness": "pending",
+    "canonicalManifest": {
+      "path": "docs/release-status.json",
+      "boundCommit": "5db80f071085d951168e9438bc930add453fffe3",
+      "status": "pending",
+      "promotion": "not-authorized"
+    }
+  },
+  "evidence": [
+    {
+      "id": "iwa-direct-sockets",
+      "path": "docs/release-evidence/7ed1c6f8010cb30a3969c32e21a7b17e83e29298/ga/iwa-direct-sockets.json",
+      "status": "passed",
+      "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "executionIdentity": "browser-iwa-direct-sockets"
+    },
+    {
+      "id": "fault-matrix",
+      "path": "docs/release-evidence/7ed1c6f8010cb30a3969c32e21a7b17e83e29298/ga/fault-matrix.json",
+      "status": "passed",
+      "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "executionIdentity": "local-playwright-fault-proxy"
+    },
+    {
+      "id": "coverage-gates",
+      "path": "docs/release-evidence/7ed1c6f8010cb30a3969c32e21a7b17e83e29298/ga/coverage-gates.json",
+      "status": "passed",
+      "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "executionIdentity": "github-actions",
+      "workflowRunId": 30739231349
+    },
+    {
+      "id": "fuzz-gates",
+      "path": "docs/release-evidence/7ed1c6f8010cb30a3969c32e21a7b17e83e29298/ga/fuzz-gates.json",
+      "status": "blocked",
+      "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "executionIdentity": "local-darwin-arm64"
+    }
+  ],
+  "hosted": {
+    "test": {
+      "runId": 30739231353,
+      "retryRunId": 30739989410,
+      "headSha": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "status": "failed",
+      "conclusion": "failure",
+      "failedJobs": [
+        {
+          "jobId": 91475553507,
+          "name": "soak",
+          "summary": "The 2-minute soak failed the idle-peers phase: soak-idle exited 1 after datagram and stream probes failed, so no PASS marker was emitted."
+        },
+        {
+          "jobId": 91475553513,
+          "name": "test (ubuntu-latest, 1.3.14)",
+          "summary": "The authoritative repeated-cycle load gate failed cycle 1 with two timed-out load bidi drains; RSS residency remained diagnostic-only."
+        },
+        {
+          "jobId": 91475553520,
+          "name": "test (ubuntu-latest, 1.3.9)",
+          "summary": "Chromium server-triggered close still surfaced Connection lost instead of closeCode 4001 and reason interop-close."
+        },
+        {
+          "jobId": 91475553551,
+          "name": "test (windows-latest, 1.3.9)",
+          "summary": "The named-curve certificate-preparation test exceeded Bun's 5-second per-test timeout while running Windows OpenSSL genpkey."
+        },
+        {
+          "jobId": 91475553585,
+          "name": "test (macos-latest, 1.3.9)",
+          "summary": "The authoritative repeated-cycle load gate timed out the cycle-2 child and terminated it with SIGTERM; RSS residency remained diagnostic-only."
+        }
+      ],
+      "passedJobs": "Parity, WASM, package-consumer, macOS 1.3.14, and Windows 1.3.14 lanes passed; the retry did not establish a cross-platform matrix pass."
+    },
+    "coverage": {
+      "runId": 30739231349,
+      "headSha": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "status": "passed"
+    },
+    "trivy": {
+      "runId": 30739745630,
+      "headSha": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+      "status": "passed"
+    },
+    "iwaWorkflow": "not registered on the default branch; local exact-head proof retained",
+    "fuzzWorkflow": "not registered on the default branch; Linux hosted fuzz remains required"
+  },
+  "gaRequired": {
+    "cross-platform-matrix": "pending",
+    "iwa-direct-sockets": "passed",
+    "native-wasm-coverage": "passed",
+    "fuzz-linux": "pending",
+    "fault-matrix": "passed",
+    "benchmark-baseline": "blocked",
+    "short-soak": "pending",
+    "auto-review-zero-p0-p4": "pending",
+    "final-no-change-confirmation": "pending",
+    "operator-release": "pending"
+  },
+  "retryClassification": {
+    "runId": 30739989410,
+    "headSha": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+    "status": "failed",
+    "reproducibleAcrossAttempts": true,
+    "notes": [
+      "The Ubuntu 1.3.14 load-scale stream timeout and Ubuntu 1.3.9 Chromium close-mapping failure reproduced on the retry.",
+      "The macOS 1.3.9 authoritative child timeout and Windows 1.3.9 certificate-preparation timeout were observed on the retry.",
+      "The short soak's idle-peer failure is a real GA-required failure; the 24h and 72h campaigns remain separately excluded from 1.0.0 promotion."
+    ]
+  },
+  "excludedFrom1_0_0": {
+    "scale-10k-multisource": {
+      "gaRequired": false,
+      "status": "excluded",
+      "reason": "Optional post-1.0 distributed diagnostic; not a 1.0.0 promotion blocker"
+    },
+    "soak-24h": {
+      "gaRequired": false,
+      "status": "excluded",
+      "reason": "Optional post-1.0 reliability campaign; not a 1.0.0 promotion blocker"
+    },
+    "soak-72h": {
+      "gaRequired": false,
+      "status": "excluded",
+      "reason": "Optional post-1.0 reliability campaign; not a 1.0.0 promotion blocker"
+    }
+  },
+  "diagnostics": {
+    "rssResidency": {
+      "status": "diagnostic-only",
+      "policy": "approved option 2+3",
+      "note": "Process-isolated repeated-cycle evidence remains authoritative; in-process RSS recovery is not a promotion claim."
+    }
+  },
+  "notes": "This index records exact-head evidence without mutating the parent-bound canonical manifest or manufacturing a GA promotion."
+}

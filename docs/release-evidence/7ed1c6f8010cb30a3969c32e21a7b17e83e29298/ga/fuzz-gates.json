@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "gate": "fuzz-gates",
+  "status": "blocked",
+  "sourceCommit": "7ed1c6f8010cb30a3969c32e21a7b17e83e29298",
+  "executionIdentity": "local-darwin-arm64",
+  "toolchain": {
+    "rust": "1.95.0",
+    "cargoFuzz": "0.13.1",
+    "llvmSymbolizer": "available"
+  },
+  "targets": {
+    "h3_frames": "blocked",
+    "qpack_huffman": "blocked",
+    "der_metadata": "blocked",
+    "cert_pin_policy": "blocked",
+    "handle_allocator": "blocked",
+    "endpoint_event_dispatch": "blocked",
+    "event_encode": "blocked",
+    "limit_arithmetic": "blocked"
+  },
+  "propertyTests": {
+    "rustWasmParser": "passed",
+    "bunEventDecoder": "passed"
+  },
+  "blocker": "Every Darwin arm64 cargo-fuzz target reaches the linker and fails on sanitizer-coverage runtime symbols. This local result is diagnostic; Linux hosted fuzz evidence remains required and is not substituted by this record.",
+  "rawDiagnostics": "not retained in release evidence"
+}
