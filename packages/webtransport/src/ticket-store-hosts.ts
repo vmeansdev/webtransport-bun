@@ -113,7 +113,9 @@ export class FileTicketStoreHost implements TicketStoreHost {
 		try {
 			fd = openSync(
 				tmp,
-				constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+				constants.O_CREAT |
+					constants.O_WRONLY |
+					(process.platform === "win32" ? 0 : constants.O_EXCL),
 				POSIX_TICKET_FILE_MODE,
 			);
 			writeFileSync(fd, ticket);
