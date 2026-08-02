@@ -1405,12 +1405,7 @@ async function runOneCampaign(
 								);
 							});
 						}
-						if (
-							config.workloadMode === "probe" &&
-							config.datagramsPerSec > 0 &&
-							!serverDatagramProbeDone
-						) {
-							serverDatagramProbeDone = true;
+						if (config.workloadMode === "probe" && config.datagramsPerSec > 0) {
 							const task = (async () => {
 								const iterator = session
 									.incomingDatagrams()
@@ -1437,8 +1432,13 @@ async function runOneCampaign(
 								);
 							});
 						}
-						if (config.streamsPerSec > 0 && !serverStreamProbeDone) {
-							serverStreamProbeDone = true;
+						const shouldRunStreamProbe =
+							config.streamsPerSec > 0 &&
+							(config.workloadMode === "probe" || !serverStreamProbeDone);
+						if (shouldRunStreamProbe) {
+							if (config.workloadMode !== "probe") {
+								serverStreamProbeDone = true;
+							}
 							const task = exerciseServerStreamProbe(
 								session,
 								new TextEncoder().encode(`server-probe:${port}`),
