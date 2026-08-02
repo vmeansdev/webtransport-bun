@@ -19,6 +19,10 @@ const RELEASE_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "release.yml"),
 	"utf8",
 );
+const COVERAGE_WORKFLOW = readFileSync(
+	join(PROJECT_ROOT, ".github", "workflows", "coverage.yml"),
+	"utf8",
+);
 const TEST_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "test.yml"),
 	"utf8",
@@ -216,6 +220,21 @@ describe("GitHub Actions release policy", () => {
 		);
 		expect(releaseBlock).not.toContain("distributed-scale-evidence");
 		expect(releaseBlock).not.toContain("distributed-scale-artifact.json");
+	});
+
+	it("builds the native addon before running combined coverage suites", () => {
+		const releaseCoverage = RELEASE_WORKFLOW.slice(
+			RELEASE_WORKFLOW.indexOf("\n  coverage:\n"),
+			RELEASE_WORKFLOW.indexOf("\n  bench-regress:\n"),
+		);
+		for (const workflow of [COVERAGE_WORKFLOW, releaseCoverage]) {
+			expect(workflow).toContain("toolchain: nightly-2026-07-31");
+			expect(workflow).toContain("toolchain: 1.95.0");
+			expect(workflow).toContain("- name: Build native addon");
+			expect(workflow.indexOf("- name: Build native addon")).toBeLessThan(
+				workflow.indexOf("- name: Native coverage"),
+			);
+		}
 	});
 
 	it("makes exact package consumers release-blocking for the release workflow across all supported operating systems", () => {
