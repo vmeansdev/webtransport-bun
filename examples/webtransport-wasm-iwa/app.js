@@ -149,7 +149,10 @@ function installServerSession(session) {
 				payload.set(chunk, offset);
 				offset += chunk.length;
 			}
-			const output = session.createUnidirectionalStream();
+			// The server facade reserves its W3C stream surface separately from
+			// the legacy callbacks above. Open the echo stream on the underlying
+			// callback session so this callback-only handler stays coherent.
+			const output = session.unwrap().createUnidirectionalStream();
 			void output
 				.writeAll(payload)
 				.then(() => output.finish())
