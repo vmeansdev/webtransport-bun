@@ -939,17 +939,21 @@ describe("TLS contract (P0.3)", () => {
 		const leafPem = `${shortCert.certPem.split("-----END CERTIFICATE-----")[0]}-----END CERTIFICATE-----\n`;
 		const der = new X509Certificate(leafPem).raw;
 		const value = new Uint8Array(createHash("sha256").update(der).digest());
-		const port = nextPort(24460, 2000);
 		const server = createServer({
-			port,
+			// Use an OS-assigned port so this live pinning proof cannot collide
+			// with the other UDP suites running concurrently in CI.
+			port: 0,
 			tls: { certPem: shortCert.certPem, keyPem: shortCert.keyPem },
 			onSession: () => {},
 		});
 		try {
-			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
-				tls: { serverName: "localhost" },
-				serverCertificateHashes: [{ algorithm: "sha-256", value }],
-			});
+			const client = await connectWithRetry(
+				`https://127.0.0.1:${server.address.port}`,
+				{
+					tls: { serverName: "localhost" },
+					serverCertificateHashes: [{ algorithm: "sha-256", value }],
+				},
+			);
 			expect(client.id).toBeDefined();
 			client.close();
 		} finally {
