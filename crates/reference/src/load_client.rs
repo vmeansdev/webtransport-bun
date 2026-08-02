@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
-use tokio::time::interval;
 use wtransport::error::StreamWriteError;
 use wtransport::ClientConfig;
 use wtransport::Endpoint;
@@ -580,8 +579,17 @@ async fn run_session(
         Duration::from_secs(3600)
     };
 
-    let mut dg_ticker = interval(datagram_interval);
-    let mut st_ticker = interval(stream_interval);
+    // Start after one interval instead of consuming Tokio's immediate first
+    // tick. This keeps the zero-rate idle phase truly idle while preserving
+    // the requested steady-state rates for active phases.
+    let mut dg_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + datagram_interval,
+        datagram_interval,
+    );
+    let mut st_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + stream_interval,
+        stream_interval,
+    );
     dg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     st_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
