@@ -34,7 +34,9 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(source).toContain("-artifact_prefix=");
 		expect(source).toContain("--fuzz-dir");
 		expect(source).toContain("--sanitizer");
-		expect(source).toContain("none");
+		expect(source).toContain('"address"');
+		expect(source).toContain("releaseFuzzToolchain");
+		expect(source).toContain("rustNightly");
 		expect(source).toContain(".release-evidence");
 		expect(source).toContain("corpora");
 		expect(source).toContain("rustup run");
@@ -146,6 +148,10 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(releaseWorkflow).toContain("fuzz-evidence");
 		expect(releaseWorkflow).toContain("Install LLVM symbolizer");
 		expect(releaseWorkflow).toContain("apt-get install -y llvm");
+		expect(releaseWorkflow).toContain("toolchain: nightly-2026-07-31");
+		expect(releaseWorkflow).toContain(
+			"rustup run nightly-2026-07-31 cargo install cargo-fuzz",
+		);
 		expect(fuzzWorkflow).toContain("schedule:");
 		expect(fuzzWorkflow).toContain("workflow_dispatch:");
 		expect(fuzzWorkflow).toContain("bun run fuzz:release-smoke");
@@ -154,6 +160,10 @@ describe("Task 14 fuzz release smoke", () => {
 		);
 		expect(fuzzWorkflow).toContain("Install LLVM symbolizer");
 		expect(fuzzWorkflow).toContain("apt-get install -y llvm");
+		expect(fuzzWorkflow).toContain("toolchain: nightly-2026-07-31");
+		expect(fuzzWorkflow).toContain(
+			"rustup run nightly-2026-07-31 cargo install cargo-fuzz",
+		);
 		expect(fuzzWorkflow).toContain("retention-days: 90");
 		expect(packageJson).toContain('"fuzz:release-smoke"');
 	});

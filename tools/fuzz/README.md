@@ -22,13 +22,16 @@ no separate job:
 
 ## Deep fuzzing (cargo-fuzz, pinned release toolchain)
 
-Release fuzzing now runs through `tools/fuzz/release-smoke.ts` using
-`rustup run 1.95.0 ...` as declared in `.github/release-toolchain.json`. The
-runner requires `cargo-fuzz` plus `llvm-symbolizer` (pinned toolchain
+Release fuzzing now runs through `tools/fuzz/release-smoke.ts` using the
+allowlisted `rustNightly` toolchain for cargo-fuzz and AddressSanitizer, while
+the stable `rust` toolchain remains the source of truth for parser/property
+tests. Both pins are declared in `.github/release-toolchain.json`. The runner
+requires `cargo-fuzz` plus `llvm-symbolizer` (the nightly toolchain's
 `llvm-tools-preview` when present, otherwise PATH / Homebrew LLVM) so crash
-artifacts stay symbolized and actionable. Invocations use `--fuzz-dir .` and
-`--sanitizer none` because this directory *is* the fuzz package and the pinned
-stable toolchain cannot build with AddressSanitizer.
+artifacts stay symbolized and actionable. Invocations use `--fuzz-dir .`
+because this directory *is* the fuzz package. Stable Rust cannot build with
+AddressSanitizer, and `--sanitizer none` still emits sanitizer-coverage hooks
+without a runtime, so release smoke deliberately uses nightly + `address`.
 
 ## JS boundary
 

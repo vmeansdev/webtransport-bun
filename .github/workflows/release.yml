@@ -161,6 +161,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
         with:
           toolchain: 1.95.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: nightly-2026-07-31
           components: llvm-tools-preview
       - name: Install LLVM symbolizer
         run: |
@@ -173,7 +176,7 @@ jobs:
         with:
           bun-version: "1.3.14"
       - name: Install pinned fuzz tooling
-        run: rustup run 1.95.0 cargo install cargo-fuzz --locked --version 0.13.1
+        run: rustup run nightly-2026-07-31 cargo install cargo-fuzz --locked --version 0.13.1
       - name: Install deps
         run: bun install --frozen-lockfile
       - name: Release fuzz smoke

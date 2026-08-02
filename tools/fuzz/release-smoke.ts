@@ -52,16 +52,32 @@ type CommandResult = {
 
 type ReleaseToolchainPolicy = {
 	rust: string[];
+	rustNightly: string[];
 };
 
-function releaseRustToolchain(): string {
-	const policy = JSON.parse(
+function releaseToolchainPolicy(): ReleaseToolchainPolicy {
+	return JSON.parse(
 		readFileSync(RELEASE_TOOLCHAIN_PATH, "utf8"),
 	) as ReleaseToolchainPolicy;
+}
+
+function releaseRustToolchain(): string {
+	const policy = releaseToolchainPolicy();
 	const version = policy.rust?.[0];
 	if (!version || !/^\d+\.\d+\.\d+/.test(version)) {
 		throw new Error(
-			`release fuzz requires one exact Rust toolchain in ${RELEASE_TOOLCHAIN_PATH}`,
+			`release fuzz requires one exact stable Rust toolchain in ${RELEASE_TOOLCHAIN_PATH}`,
+		);
+	}
+	return version;
+}
+
+function releaseFuzzToolchain(): string {
+	const policy = releaseToolchainPolicy();
+	const version = policy.rustNightly?.[0];
+	if (!version || !/^nightly-\d{4}-\d{2}-\d{2}$/.test(version)) {
+		throw new Error(
+			`release fuzz requires one pinned nightly Rust toolchain in ${RELEASE_TOOLCHAIN_PATH}`,
 		);
 	}
 	return version;
@@ -291,11 +307,12 @@ async function main() {
 	}
 
 	const toolchain = releaseRustToolchain();
-	const llvmSymbolizer = resolveLlvmSymbolizer(toolchain);
+	const fuzzToolchain = releaseFuzzToolchain();
+	const llvmSymbolizer = resolveLlvmSymbolizer(fuzzToolchain);
 	const failures: string[] = [];
 	const cargo = probe(toolchainCommand(toolchain, "cargo", "--version"));
 	const cargoFuzz = probe(
-		toolchainCommand(toolchain, "cargo", "fuzz", "--version"),
+		toolchainCommand(fuzzToolchain, "cargo", "fuzz", "--version"),
 	);
 	if (!cargo.ok) {
 		failures.push(
@@ -304,12 +321,12 @@ async function main() {
 	}
 	if (!cargoFuzz.ok) {
 		failures.push(
-			`cargo-fuzz unavailable via rustup run ${toolchain}: ${cargoFuzz.stderr || cargoFuzz.stdout}`,
+			`cargo-fuzz unavailable via rustup run ${fuzzToolchain}: ${cargoFuzz.stderr || cargoFuzz.stdout}`,
 		);
 	}
 	if (!llvmSymbolizer) {
 		failures.push(
-			`llvm-symbolizer missing for rustup toolchain ${toolchain}; install llvm-tools-preview for the pinned release toolchain`,
+			`llvm-symbolizer missing for rustup toolchain ${fuzzToolchain}; install llvm-tools-preview for the pinned fuzz toolchain`,
 		);
 	}
 
@@ -333,10 +350,11 @@ async function main() {
 		const crashDirectory = resolve(EVIDENCE_ROOT, "crashes", target.name);
 		mkdirSync(crashDirectory, { recursive: true });
 		// Match CI compile-check: this crate IS the fuzz package (`tools/fuzz`),
-		// so cargo-fuzz needs `--fuzz-dir .`. Stable 1.95.0 cannot build with
-		// AddressSanitizer (`-Zsanitizer`), so release smoke uses `--sanitizer none`.
+		// so cargo-fuzz needs `--fuzz-dir .`. AddressSanitizer is run with the
+		// pinned nightly toolchain because stable Rust rejects `-Zsanitizer` and
+		// `--sanitizer none` still emits sanitizer-coverage hooks without a runtime.
 		const command = toolchainCommand(
-			toolchain,
+			fuzzToolchain,
 			"cargo",
 			"fuzz",
 			"run",
@@ -344,7 +362,7 @@ async function main() {
 			"--fuzz-dir",
 			".",
 			"--sanitizer",
-			"none",
+			"address",
 			corpusDirectory,
 			"--",
 			`-max_total_time=${FIXED_DURATION_SECS}`,
@@ -428,8 +446,10 @@ async function main() {
 		fixedDurationSecs: FIXED_DURATION_SECS,
 		toolchain: {
 			rust: toolchain,
+			rustFuzz: fuzzToolchain,
 			cargo: cargo.stdout.trim(),
 			cargoFuzz: cargoFuzz.stdout.trim(),
+			sanitizer: "address",
 			llvmSymbolizer: llvmSymbolizer ?? "",
 		},
 		corpora: cargoFuzzTargets.map((target) => ({
