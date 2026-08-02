@@ -85,6 +85,8 @@ jobs:
         run: |
           cd tools/interop
           npx playwright@1.58.2 test -c playwright.fault.config.ts
+          bun run sanitize-evidence.ts ../../.release-evidence/interop/fault-matrix.json
+          bun run verify-evidence.ts ../../.release-evidence/interop/fault-matrix.json
         
       - name: Package IWA
         run: |
