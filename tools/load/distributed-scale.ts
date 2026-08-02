@@ -1119,7 +1119,10 @@ async function runLoadClient(
 	const result = await runCommandWithBoundedOutput(command, {
 		cwd: ROOT,
 		env: { RUST_BACKTRACE: "1" },
-		outerTimeoutMs: CHILD_EXIT_TIMEOUT_MS,
+		outerTimeoutMs: Math.max(
+			CHILD_EXIT_TIMEOUT_MS,
+			(options.durationSec + 1) * 1_000 + CHILD_EXIT_TIMEOUT_MS,
+		),
 		terminateGraceMs: CHILD_TERMINATE_GRACE_MS,
 		drainTimeoutMs: CHILD_DRAIN_TIMEOUT_MS,
 	});
