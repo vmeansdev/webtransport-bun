@@ -29,6 +29,8 @@ const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
 const DEFAULT_RECONNECT_HOLD_MS: u64 = 1_000;
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+const INITIAL_CONNECT_RETRIES: usize = 3;
+const INITIAL_CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
 const PROBE_UNI_ECHO_PREFIX: &str = "probe:uni-echo:";
 const PROBE_UNI_STOP_PREFIX: &str = "probe:uni-stop:";
@@ -99,6 +101,14 @@ where
     }
 }
 
+fn initial_connect_attempts(retry_sessions: bool) -> usize {
+    if retry_sessions {
+        INITIAL_CONNECT_RETRIES + 1
+    } else {
+        1
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut mode = ClientMode::Load;
@@ -111,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_datagram_errors = DEFAULT_MAX_DATAGRAM_ERRORS;
     let mut max_stream_errors = DEFAULT_MAX_STREAM_ERRORS;
     let mut reconnect_hold_ms = DEFAULT_RECONNECT_HOLD_MS;
+    let mut retry_sessions = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -158,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconnect_hold_ms =
                     parse_or_default("--hold-ms", args.next(), DEFAULT_RECONNECT_HOLD_MS)
             }
+            "--retry-sessions" => retry_sessions = true,
             _ => {}
         }
     }
@@ -188,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         datagrams_per_sec,
         streams_per_sec,
         reconnect_hold: Duration::from_millis(reconnect_hold_ms),
+        retry_sessions,
         budgets: ErrorBudgets {
             max_session_errors,
             max_datagram_errors,
@@ -227,6 +240,7 @@ struct RunOptions<'a> {
     datagrams_per_sec: u64,
     streams_per_sec: u64,
     reconnect_hold: Duration,
+    retry_sessions: bool,
     budgets: ErrorBudgets,
 }
 
@@ -442,6 +456,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         datagrams_per_sec,
         streams_per_sec,
         reconnect_hold,
+        retry_sessions,
         budgets,
     } = options;
     let config = ClientConfig::builder()
@@ -461,11 +476,12 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                 let endpoint = Arc::clone(&endpoint);
                 let counters = Arc::clone(&counters);
                 let probe_barrier = Arc::clone(&probe_barrier);
+                let retry_sessions = retry_sessions;
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 let handle = tokio::spawn(async move {
-                    match endpoint.connect(&url).await {
+                    match connect_initial_session(&endpoint, &url, retry_sessions).await {
                         Ok(conn) => {
                             counters.sessions_ok.fetch_add(1, Ordering::Relaxed);
                             run_probe_suite(&conn, counters.as_ref()).await;
@@ -542,6 +558,33 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+async fn connect_initial_session(
+    endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    url: &str,
+    retry_sessions: bool,
+) -> Result<wtransport::Connection, String> {
+    let attempts = initial_connect_attempts(retry_sessions);
+    let mut last_error = String::from("no connection attempt was made");
+    for attempt in 0..attempts {
+        match endpoint.connect(url).await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt + 1 < attempts {
+                    eprintln!(
+                        "load-client: initial session connect attempt {}/{} failed: {}; retrying",
+                        attempt + 1,
+                        attempts,
+                        last_error
+                    );
+                    tokio::time::sleep(INITIAL_CONNECT_RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(last_error)
 }
 
 async fn wait_for_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -715,8 +758,8 @@ async fn run_reconnect_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_uni_probe_payload, load_summary_json, parse_client_mode, parse_or_default,
-        ClientMode, Counters, UniProbeDisposition,
+        classify_uni_probe_payload, initial_connect_attempts, load_summary_json, parse_client_mode,
+        parse_or_default, ClientMode, Counters, UniProbeDisposition,
     };
     use std::sync::atomic::Ordering;
 
@@ -746,6 +789,12 @@ mod tests {
     #[test]
     fn parse_client_mode_falls_back_on_unknown_values() {
         assert_eq!(parse_client_mode(Some("unknown")), ClientMode::Load);
+    }
+
+    #[test]
+    fn initial_session_retry_budget_is_bounded() {
+        assert_eq!(initial_connect_attempts(false), 1);
+        assert_eq!(initial_connect_attempts(true), 4);
     }
 
     #[test]

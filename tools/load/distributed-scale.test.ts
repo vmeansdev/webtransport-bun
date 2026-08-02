@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
 	awaitWithTimeout,
 	buildFinalSampleOrdering,
+	buildLoadClientCommand,
 	buildScaleArtifact,
 	buildSourceIdentityProof,
 	captureMemoryTelemetrySnapshot,
@@ -39,6 +40,28 @@ const ZERO_GAUGES: FinalGauges = {
 };
 
 describe("Task 14 distributed scale evidence", () => {
+	test("enables bounded initial-session retries for the main load client", () => {
+		const command = buildLoadClientCommand(
+			"/repo/load-client",
+			{
+				clientIndex: 0,
+				serverIndex: 0,
+				serverPort: 4433,
+				requestedSessions: 200,
+				launch: { label: "main", commandPrefix: [] },
+			},
+			{
+				durationSec: 30,
+				datagramsPerSec: 1000,
+				streamsPerSec: 5,
+				maxSessionErrors: 0,
+				retryInitialSessions: true,
+			},
+		);
+
+		expect(command).toContain("--retry-sessions");
+	});
+
 	test("resolves the Rust load-client executable on each host platform", () => {
 		expect(loadClientBinaryPath("/repo", "debug", "darwin")).toBe(
 			"/repo/target/debug/load-client",

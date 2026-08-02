@@ -1030,18 +1030,21 @@ function buildMainClientPlans(config: ScaleCampaignConfig): ClientPlan[] {
 	})).filter((plan) => plan.requestedSessions > 0);
 }
 
-async function runLoadClient(
+type LoadClientRunOptions = {
+	durationSec: number;
+	datagramsPerSec: number;
+	streamsPerSec: number;
+	maxSessionErrors: number;
+	retryInitialSessions: boolean;
+};
+
+export function buildLoadClientCommand(
 	clientBin: string,
 	plan: ClientPlan,
-	options: {
-		durationSec: number;
-		datagramsPerSec: number;
-		streamsPerSec: number;
-		maxSessionErrors: number;
-	},
-): Promise<ClientSummary> {
+	options: LoadClientRunOptions,
+): string[] {
 	const targetHost = plan.launch.urlHost?.trim() || DEFAULT_CLIENT_TARGET_HOST;
-	const command = [
+	return [
 		...plan.launch.commandPrefix,
 		clientBin,
 		"--url",
@@ -1060,7 +1063,16 @@ async function runLoadClient(
 		"0",
 		"--max-stream-errors",
 		"0",
+		...(options.retryInitialSessions ? ["--retry-sessions"] : []),
 	];
+}
+
+async function runLoadClient(
+	clientBin: string,
+	plan: ClientPlan,
+	options: LoadClientRunOptions,
+): Promise<ClientSummary> {
+	const command = buildLoadClientCommand(clientBin, plan, options);
 	const result = await runCommandWithBoundedOutput(command, {
 		cwd: ROOT,
 		env: { RUST_BACKTRACE: "1" },
@@ -1165,6 +1177,7 @@ async function runOverloadPhase(
 				datagramsPerSec: 0,
 				streamsPerSec: 0,
 				maxSessionErrors: plan.requestedSessions,
+				retryInitialSessions: false,
 			}),
 		),
 	);
@@ -1390,6 +1403,7 @@ async function runOneCampaign(
 					datagramsPerSec: config.datagramsPerSec,
 					streamsPerSec: config.streamsPerSec,
 					maxSessionErrors: 0,
+					retryInitialSessions: true,
 				}),
 			),
 		);
