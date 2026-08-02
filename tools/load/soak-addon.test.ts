@@ -20,6 +20,7 @@ import {
 	phasePlan,
 	sampleIntervalMs,
 	soakDatagramRateLimitPerSec,
+	soakPhaseSessionCount,
 	soakStreamRateLimitPerSec,
 	type Sample,
 } from "./soak-addon.ts";
@@ -61,6 +62,12 @@ test("budgets the loopback stream limiter for overlapping main and overload load
 test("budgets the loopback datagram limiter for overlapping main and overload load", () => {
 	expect(soakDatagramRateLimitPerSec(500, 500)).toBe(550_000);
 	expect(soakDatagramRateLimitPerSec(20, 0)).toBe(50_000);
+});
+
+test("scales only short-campaign phase peers to avoid probe stampedes", () => {
+	expect(soakPhaseSessionCount(500, 0.6, 50, 120)).toBe(150);
+	expect(soakPhaseSessionCount(500, 0.6, 50, 3_600)).toBe(300);
+	expect(soakPhaseSessionCount(500, 0.2, 20, 120)).toBe(50);
 });
 
 test("keeps short-run residency trend findings diagnostic", () => {

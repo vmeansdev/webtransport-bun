@@ -1604,6 +1604,27 @@ export function soakDatagramRateLimitPerSec(
 	return Math.max(10_000, mainDatagramRate + overlappingOverloadRate);
 }
 
+export function soakPhaseSessionCount(
+	sessions: number,
+	fraction: number,
+	minimum: number,
+	durationSeconds: number,
+): number {
+	const safeSessions = Math.max(0, sessions);
+	const safeFraction = Math.max(0, fraction);
+	const safeMinimum = Math.max(0, Math.floor(minimum));
+	const requested = Math.max(
+		safeMinimum,
+		Math.floor(safeSessions * safeFraction),
+	);
+	// Short hosted smoke campaigns share a CPU-sensitive probe window with the
+	// main workload. Keep their phase operation classes intact while halving
+	// only phase peer counts; long campaigns retain the full requested scale.
+	return durationSeconds < 3_600
+		? Math.max(safeMinimum, Math.floor(requested / 2))
+		: requested;
+}
+
 export function phaseLoadDurationSeconds(durationMs: number): number {
 	const minimumDurationSeconds = durationMs >= 45_000 ? 45 : 5;
 	return Math.max(minimumDurationSeconds, Math.floor(durationMs / 1000));
@@ -1963,7 +1984,7 @@ async function runSegment(): Promise<void> {
 								"--url",
 								"https://127.0.0.1:4433",
 								"--sessions",
-								String(Math.max(50, Math.floor(SESSIONS * 0.6))),
+								String(soakPhaseSessionCount(SESSIONS, 0.6, 50, DURATION)),
 								"--duration",
 								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--datagrams-per-sec",
@@ -1972,7 +1993,9 @@ async function runSegment(): Promise<void> {
 								String(Math.max(STREAMS_PER_SEC * 2, 10)),
 								"--max-session-errors",
 								String(
-									Math.ceil(Math.max(50, Math.floor(SESSIONS * 0.6)) * 0.6),
+									Math.ceil(
+										soakPhaseSessionCount(SESSIONS, 0.6, 50, DURATION) * 0.6,
+									),
 								),
 								"--max-datagram-errors",
 								String(MAX_DATAGRAM_ERRORS * 2),
@@ -1991,7 +2014,7 @@ async function runSegment(): Promise<void> {
 								"--url",
 								"https://127.0.0.1:4433",
 								"--sessions",
-								String(Math.max(20, Math.floor(SESSIONS * 0.2))),
+								String(soakPhaseSessionCount(SESSIONS, 0.2, 20, DURATION)),
 								"--duration",
 								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--datagrams-per-sec",
@@ -1999,7 +2022,14 @@ async function runSegment(): Promise<void> {
 								"--streams-per-sec",
 								"0",
 								"--max-session-errors",
-								String(Math.max(5, Math.ceil(SESSIONS * 0.1))),
+								String(
+									Math.max(
+										5,
+										Math.ceil(
+											soakPhaseSessionCount(SESSIONS, 0.2, 20, DURATION) * 0.1,
+										),
+									),
+								),
 								"--max-datagram-errors",
 								"0",
 								"--max-stream-errors",
@@ -2019,14 +2049,16 @@ async function runSegment(): Promise<void> {
 								"--url",
 								"https://127.0.0.1:4433",
 								"--sessions",
-								String(Math.max(40, Math.floor(SESSIONS * 0.35))),
+								String(soakPhaseSessionCount(SESSIONS, 0.35, 40, DURATION)),
 								"--duration",
 								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--hold-ms",
 								"1000",
 								"--max-session-errors",
 								String(
-									Math.ceil(Math.max(40, Math.floor(SESSIONS * 0.35)) * 0.4),
+									Math.ceil(
+										soakPhaseSessionCount(SESSIONS, 0.35, 40, DURATION) * 0.4,
+									),
 								),
 								"--max-datagram-errors",
 								String(MAX_DATAGRAM_ERRORS),
@@ -2046,7 +2078,7 @@ async function runSegment(): Promise<void> {
 								"--url",
 								"https://127.0.0.1:4433",
 								"--sessions",
-								String(Math.max(30, Math.floor(SESSIONS * 0.25))),
+								String(soakPhaseSessionCount(SESSIONS, 0.25, 30, DURATION)),
 								"--duration",
 								String(phaseLoadDurationSeconds(phase.durationMs)),
 								"--datagrams-per-sec",
@@ -2055,7 +2087,9 @@ async function runSegment(): Promise<void> {
 								String(Math.max(1, Math.floor(STREAMS_PER_SEC * 0.5))),
 								"--max-session-errors",
 								String(
-									Math.ceil(Math.max(30, Math.floor(SESSIONS * 0.25)) * 0.4),
+									Math.ceil(
+										soakPhaseSessionCount(SESSIONS, 0.25, 30, DURATION) * 0.4,
+									),
 								),
 								"--max-datagram-errors",
 								String(MAX_DATAGRAM_ERRORS),
