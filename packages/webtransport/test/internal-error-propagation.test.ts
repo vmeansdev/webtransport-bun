@@ -195,6 +195,45 @@ describe("internal TS error propagation", () => {
 		expect(result.done).toBe(true);
 	});
 
+	it("server incoming bidi wrappers release native handles when the session closes", async () => {
+		let resolveClosed!: () => void;
+		const closed = new Promise<void>((resolve) => {
+			resolveClosed = resolve;
+		});
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return null;
+					accepted = false;
+					return {
+						id: 1,
+						read: async () => null,
+						write: async () => {},
+						finish: () => {},
+					};
+				},
+			},
+			() => false,
+			closed,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(
+			reader,
+			2000,
+			"server incoming bidi wrapper read",
+		);
+		expect(result.done).toBe(false);
+		const writer = result.value.writable.getWriter();
+		resolveClosed();
+		await Bun.sleep(0);
+		await expect(writer.write(new Uint8Array([1]))).rejects.toBeInstanceOf(
+			WebTransportError,
+		);
+		writer.releaseLock();
+		await reader.cancel();
+	});
+
 	it("Web Streams adapters apply strictW3CErrors to stream write failures", async () => {
 		const duplex = new Duplex({
 			read() {},
