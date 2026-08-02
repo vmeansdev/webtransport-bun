@@ -18,6 +18,7 @@ import {
 	evaluateTrendAndRecovery,
 	phaseLoadDurationSeconds,
 	phasePlan,
+	sampleIntervalMs,
 	type Sample,
 } from "./soak-addon.ts";
 
@@ -43,6 +44,11 @@ test("scales short smoke phase slots to fit the bounded CI window", () => {
 test("keeps short phase clients inside their scheduled slots", () => {
 	expect(phaseLoadDurationSeconds(10_000)).toBe(10);
 	expect(phaseLoadDurationSeconds(45_000)).toBe(45);
+});
+
+test("samples short campaigns often enough to observe bounded phase recovery", () => {
+	expect(sampleIntervalMs(120)).toBe(5_000);
+	expect(sampleIntervalMs(3_600)).toBe(30_000);
 });
 
 afterEach(() => {

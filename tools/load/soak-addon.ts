@@ -1542,6 +1542,10 @@ export function phaseLoadDurationSeconds(durationMs: number): number {
 	return Math.max(minimumDurationSeconds, Math.floor(durationMs / 1000));
 }
 
+export function sampleIntervalMs(durationSeconds: number): number {
+	return durationSeconds < 3_600 ? 5_000 : DEFAULT_SAMPLE_INTERVAL_MS;
+}
+
 type CapturedOutput = {
 	promise: Promise<string>;
 	cancel: () => Promise<void>;
@@ -1858,7 +1862,7 @@ async function runSegment(): Promise<void> {
 					`queuedBytesGlobal ${metrics.queuedBytesGlobal} exceeded ${DEFAULT_LIMITS.maxQueuedBytesGlobal}`,
 				);
 			}
-			await sleep(DEFAULT_SAMPLE_INTERVAL_MS);
+			await sleep(sampleIntervalMs(DURATION));
 		}
 	})();
 
