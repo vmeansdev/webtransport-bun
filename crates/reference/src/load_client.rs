@@ -20,6 +20,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const LOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
@@ -286,6 +287,18 @@ async fn read_stream_to_end_before(
         match tokio::time::timeout(remaining, recv.read(&mut buf)).await?? {
             Some(n) => out.extend_from_slice(&buf[..n]),
             None => return Ok(out),
+        }
+    }
+}
+
+async fn drain_load_bidi_response(
+    recv: &mut wtransport::RecvStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut buf = [0u8; 1024];
+    loop {
+        match recv.read(&mut buf).await? {
+            Some(_) => {}
+            None => return Ok(()),
         }
     }
 }
@@ -603,11 +616,21 @@ async fn run_session(
                     let payload = format!("{LOAD_BIDI_PREFIX}{}", next_probe_id()).into_bytes();
                     match conn.open_bi().await {
                         Ok(opening) => match opening.await {
-                            Ok((mut send, _recv)) => {
+                            Ok((mut send, mut recv)) => {
                                 counters.streams_opened.fetch_add(1, Ordering::Relaxed);
                                 match send.write_all(&payload).await {
                                     Ok(()) => match send.finish().await {
-                                        Ok(()) => Ok::<(), Box<dyn std::error::Error + Send + Sync>>(()),
+                                        Ok(()) => match tokio::time::timeout(
+                                            LOAD_RESPONSE_TIMEOUT,
+                                            drain_load_bidi_response(&mut recv),
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(_) => {
+                                                Err("timed out draining load bidi response".into())
+                                            }
+                                        },
                                         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
                                     },
                                     Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
