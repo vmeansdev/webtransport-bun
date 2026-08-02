@@ -176,7 +176,7 @@ jobs:
         with:
           bun-version: "1.3.14"
       - name: Install pinned fuzz tooling
-        run: rustup run nightly-2026-07-31 cargo install cargo-fuzz --locked --version 0.13.1
+        run: rustup run 1.95.0 cargo install cargo-fuzz --locked --version 0.13.1
       - name: Install deps
         run: bun install --frozen-lockfile
       - name: Release fuzz smoke

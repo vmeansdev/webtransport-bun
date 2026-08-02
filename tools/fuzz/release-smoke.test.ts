@@ -150,7 +150,7 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(releaseWorkflow).toContain("apt-get install -y llvm");
 		expect(releaseWorkflow).toContain("toolchain: nightly-2026-07-31");
 		expect(releaseWorkflow).toContain(
-			"rustup run nightly-2026-07-31 cargo install cargo-fuzz",
+			"rustup run 1.95.0 cargo install cargo-fuzz",
 		);
 		expect(fuzzWorkflow).toContain("schedule:");
 		expect(fuzzWorkflow).toContain("workflow_dispatch:");
@@ -162,7 +162,7 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(fuzzWorkflow).toContain("apt-get install -y llvm");
 		expect(fuzzWorkflow).toContain("toolchain: nightly-2026-07-31");
 		expect(fuzzWorkflow).toContain(
-			"rustup run nightly-2026-07-31 cargo install cargo-fuzz",
+			"rustup run 1.95.0 cargo install cargo-fuzz",
 		);
 		expect(fuzzWorkflow).toContain("retention-days: 90");
 		expect(packageJson).toContain('"fuzz:release-smoke"');
