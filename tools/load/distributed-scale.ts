@@ -385,7 +385,7 @@ function recoveredToSteadyBaseline(
 	return (
 		current.sessionsActive === baseline.sessionsActive &&
 		current.sessionTasksActive === baseline.sessionTasksActive &&
-		current.streamTasksActive === baseline.streamTasksActive &&
+		current.streamTasksActive <= baseline.streamTasksActive &&
 		current.handshakesInFlight === baseline.handshakesInFlight &&
 		current.streamsActive <= baseline.streamsActive &&
 		current.queuedBytesGlobal <= DEFAULT_LIMITS.maxQueuedBytesGlobal

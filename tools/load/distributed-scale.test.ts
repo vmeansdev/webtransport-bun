@@ -137,6 +137,19 @@ describe("Task 14 distributed scale evidence", () => {
 				...valid,
 				steadyStateBeforeOverload: {
 					...steady,
+					streamTasksActive: 1000,
+				},
+				postOverloadGauges: {
+					...recovered,
+					streamTasksActive: 0,
+				},
+			}),
+		).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
 					streamsActive: 2,
 					queuedBytesGlobal: 128,
 				},
