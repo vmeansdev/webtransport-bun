@@ -34,6 +34,7 @@ export function resolveOpenSSLExecutable(): string {
 	const configured = process.env.WEBTRANSPORT_INTEROP_OPENSSL_PATH;
 	const candidates = [
 		configured,
+		"openssl",
 		"/usr/bin/openssl",
 		"/opt/homebrew/bin/openssl",
 		"/opt/homebrew/opt/openssl@3/bin/openssl",

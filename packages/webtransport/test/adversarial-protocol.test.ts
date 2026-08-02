@@ -31,7 +31,12 @@ import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 19100;
 const REPO_ROOT = resolve(import.meta.dir, "../../..");
-const ADVERSARY_BIN = join(REPO_ROOT, "target", "debug", "adversary");
+const ADVERSARY_BIN = join(
+	REPO_ROOT,
+	"target",
+	"debug",
+	process.platform === "win32" ? "adversary.exe" : "adversary",
+);
 
 async function waitUntil(
 	predicate: () => boolean,
