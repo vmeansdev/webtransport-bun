@@ -144,12 +144,16 @@ describe("Task 14 fuzz release smoke", () => {
 			"bun run tools/interop/sanitize-evidence.ts .release-evidence/fuzz/release-smoke.json",
 		);
 		expect(releaseWorkflow).toContain("fuzz-evidence");
+		expect(releaseWorkflow).toContain("Install LLVM symbolizer");
+		expect(releaseWorkflow).toContain("apt-get install -y llvm");
 		expect(fuzzWorkflow).toContain("schedule:");
 		expect(fuzzWorkflow).toContain("workflow_dispatch:");
 		expect(fuzzWorkflow).toContain("bun run fuzz:release-smoke");
 		expect(fuzzWorkflow).toContain(
 			"bun run tools/interop/sanitize-evidence.ts .release-evidence/fuzz/release-smoke.json",
 		);
+		expect(fuzzWorkflow).toContain("Install LLVM symbolizer");
+		expect(fuzzWorkflow).toContain("apt-get install -y llvm");
 		expect(fuzzWorkflow).toContain("retention-days: 90");
 		expect(packageJson).toContain('"fuzz:release-smoke"');
 	});
