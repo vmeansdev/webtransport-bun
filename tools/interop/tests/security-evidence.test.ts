@@ -39,6 +39,18 @@ describe("interop evidence security boundary", () => {
 		expect(command).not.toContain("bun run");
 	});
 
+	it("quotes a Windows Bun path for cmd.exe instead of POSIX shells", () => {
+		const command = buildInteropWebServerCommand({
+			platform: "win32",
+			bunExecutable: "C:\\Program Files\\Bun\\bun.exe",
+		});
+
+		expect(command).toBe(
+			'"C:\\Program Files\\Bun\\bun.exe" run prepare-certs.ts && "C:\\Program Files\\Bun\\bun.exe" run addon-server.ts',
+		);
+		expect(command).not.toContain("'C:\\");
+	});
+
 	it("rejects inherited environment keys and host paths in evidence", () => {
 		expect(() =>
 			verifyEvidenceDocument({

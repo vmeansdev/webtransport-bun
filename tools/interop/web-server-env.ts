@@ -20,7 +20,8 @@ export function buildInteropWebServerEnv(
 }
 
 export function resolveBunExecutable(): string {
-	if (basename(process.execPath).toLowerCase() === "bun") return process.execPath;
+	if (basename(process.execPath).toLowerCase() === "bun")
+		return process.execPath;
 	const lookup = process.platform === "win32" ? "where.exe" : "which";
 	try {
 		const resolved = execFileSync(lookup, ["bun"], {
@@ -36,12 +37,21 @@ export function resolveBunExecutable(): string {
 	throw new Error("Bun executable could not be resolved for interop startup");
 }
 
-function shellQuote(value: string): string {
+function shellQuote(value: string, platform: NodeJS.Platform): string {
+	if (platform === "win32") {
+		return `"${value.replaceAll('"', '""')}"`;
+	}
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-export function buildInteropWebServerCommand(): string {
-	const bun = shellQuote(resolveBunExecutable());
+export function buildInteropWebServerCommand(
+	options: { platform?: NodeJS.Platform; bunExecutable?: string } = {},
+): string {
+	const platform = options.platform ?? process.platform;
+	const bun = shellQuote(
+		options.bunExecutable ?? resolveBunExecutable(),
+		platform,
+	);
 	return `${bun} run prepare-certs.ts && ${bun} run addon-server.ts`;
 }
 
