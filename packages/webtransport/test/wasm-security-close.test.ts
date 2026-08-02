@@ -53,50 +53,59 @@ describe("cert pinning (serverCertificateHashes model)", () => {
 		"correct hash connects; wrong hash rejects",
 		async () => {
 			const srv = await startEchoServer(0);
-			const PORT = srv.port;
+			let udpOk: BunUdpTransport | undefined;
+			let ok: Awaited<ReturnType<typeof connectWasm>> | undefined;
+			try {
+				// Correct pin: session establishes and echoes.
+				udpOk = await BunUdpTransport.connect("127.0.0.1", srv.port);
+				ok = await connectWasm(
+					wasm,
+					udpOk,
+					"localhost",
+					"127.0.0.1:0",
+					`127.0.0.1:${srv.port}`,
+					{ certHashBase64: srv.certHashBase64 },
+				);
+				const got = new Promise<string>((res) =>
+					ok?.session.onDatagram((d) => res(dec.decode(d))),
+				);
+				ok.session.sendDatagram(enc.encode("pinned-ok"));
+				expect(await got).toBe("pinned-ok");
+			} finally {
+				ok?.manager.close();
+				udpOk?.close();
+				srv.manager.close();
+				srv.udp.close();
+			}
 
-			// Correct pin: session establishes and echoes.
-			const udpOk = await BunUdpTransport.connect("127.0.0.1", PORT);
-			const ok = await connectWasm(
-				wasm,
-				udpOk,
-				"localhost",
-				"127.0.0.1:0",
-				`127.0.0.1:${PORT}`,
-				{ certHashBase64: srv.certHashBase64 },
-			);
-			const got = new Promise<string>((res) =>
-				ok.session.onDatagram((d) => res(dec.decode(d))),
-			);
-			ok.session.sendDatagram(enc.encode("pinned-ok"));
-			expect(await got).toBe("pinned-ok");
-			ok.manager.close();
-			udpOk.close();
-
-			// Wrong pin: the TLS handshake must fail and connectWasm reject with
-			// the TLS reason (alert 49, access_denied) rather than an opaque
-			// pre-establishment close.
-			const wrongHash = btoa(String.fromCharCode(...new Uint8Array(32)));
-			const udpBad = await BunUdpTransport.connect("127.0.0.1", PORT);
-			const rejected = await connectWasm(
-				wasm,
-				udpBad,
-				"localhost",
-				"127.0.0.1:0",
-				`127.0.0.1:${PORT}`,
-				{ certHashBase64: wrongHash },
-			).then(
-				() => null,
-				(error: unknown) => error,
-			);
-			expect((rejected as { code?: string }).code).toBe(E_TLS);
-			expect(String(rejected)).toContain(
-				"E_TLS: handshake failed with TLS alert",
-			);
-			udpBad.close();
-
-			srv.manager.close();
-			srv.udp.close();
+			// Use a fresh server endpoint for the negative handshake. Reusing the
+			// just-closed connected UDP socket can surface a stale ECONNREFUSED on
+			// hosted runners before the wrong-pin TLS path is exercised.
+			const wrongSrv = await startEchoServer(0);
+			let udpBad: BunUdpTransport | undefined;
+			try {
+				const wrongHash = btoa(String.fromCharCode(...new Uint8Array(32)));
+				udpBad = await BunUdpTransport.connect("127.0.0.1", wrongSrv.port);
+				const rejected = await connectWasm(
+					wasm,
+					udpBad,
+					"localhost",
+					"127.0.0.1:0",
+					`127.0.0.1:${wrongSrv.port}`,
+					{ certHashBase64: wrongHash },
+				).then(
+					() => null,
+					(error: unknown) => error,
+				);
+				expect((rejected as { code?: string }).code).toBe(E_TLS);
+				expect(String(rejected)).toContain(
+					"E_TLS: handshake failed with TLS alert",
+				);
+			} finally {
+				udpBad?.close();
+				wrongSrv.manager.close();
+				wrongSrv.udp.close();
+			}
 		},
 		30_000,
 	);
