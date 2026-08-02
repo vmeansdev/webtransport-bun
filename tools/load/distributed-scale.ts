@@ -8,6 +8,8 @@ import {
 	DEFAULT_LIMITS,
 	type MetricsSnapshot,
 	type ServerSession,
+	WT_RESET,
+	WT_STOP_SENDING,
 } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 
@@ -196,6 +198,17 @@ type StreamCaptureController = {
 	abort: () => void;
 };
 
+type ProbeBidiStream = {
+	readable: ReadableStream<Uint8Array>;
+	writable: WritableStream<Uint8Array>;
+	[WT_RESET]?: (code?: number) => void;
+	[WT_STOP_SENDING]?: (code?: number) => void;
+};
+
+type ProbeUniStream = ReadableStream<Uint8Array> & {
+	[WT_STOP_SENDING]?: (code?: number) => void;
+};
+
 async function endWritableProbe(
 	writable: Pick<NodeJS.WritableStream, "end" | "once">,
 	chunk: Uint8Array,
@@ -216,6 +229,173 @@ async function endWritableProbe(
 		});
 		writable.end(Buffer.from(chunk));
 	});
+}
+
+async function readFirstChunkBeforeDeadline(
+	readable: ReadableStream<Uint8Array>,
+	deadlineMs: number,
+): Promise<Buffer | null> {
+	const reader = readable.getReader();
+	let timedOut = false;
+	try {
+		const result = await nextBeforeDeadline(reader.read(), deadlineMs);
+		if (!result) {
+			timedOut = true;
+			return null;
+		}
+		if (result.done) return null;
+		return Buffer.from(result.value);
+	} finally {
+		if (timedOut) {
+			await Promise.race([reader.cancel(), Bun.sleep(100)]).catch(
+				() => undefined,
+			);
+		}
+		try {
+			reader.releaseLock();
+		} catch {
+			// Teardown can race lock release.
+		}
+	}
+}
+
+async function writeProbePayload(
+	writable: WritableStream<Uint8Array>,
+	payload: Uint8Array,
+): Promise<void> {
+	const writer = writable.getWriter();
+	try {
+		await awaitWithTimeout("probe stream write", writer.write(payload), 5000);
+		await awaitWithTimeout("probe stream close", writer.close(), 5000);
+	} finally {
+		writer.releaseLock();
+	}
+}
+
+async function handleProbeBidiStream(
+	stream: ProbeBidiStream,
+	deadlineMs: number,
+): Promise<void> {
+	const payload = await readFirstChunkBeforeDeadline(
+		stream.readable,
+		deadlineMs,
+	);
+	if (!payload) return;
+	const text = payload.toString("utf8");
+	if (text.startsWith("probe:bidi-reset:")) {
+		stream[WT_RESET]?.(42);
+		return;
+	}
+	if (text.startsWith("probe:bidi-echo:")) {
+		await writeProbePayload(stream.writable, payload);
+		return;
+	}
+	if (text.startsWith("load:bidi:")) {
+		const writer = stream.writable.getWriter();
+		try {
+			await awaitWithTimeout("load bidi close", writer.close(), 5000);
+		} finally {
+			writer.releaseLock();
+		}
+		return;
+	}
+}
+
+async function handleProbeUniStream(
+	stream: ProbeUniStream,
+	session: ServerSession,
+	deadlineMs: number,
+	onUniOpened: () => void,
+): Promise<void> {
+	const payload = await readFirstChunkBeforeDeadline(stream, deadlineMs);
+	if (!payload) return;
+	const text = payload.toString("utf8");
+	if (text.startsWith("probe:uni-stop:")) {
+		stream[WT_STOP_SENDING]?.(0);
+		return;
+	}
+	if (text.startsWith("probe:uni-echo:")) {
+		const writable = await session.createUnidirectionalStream();
+		onUniOpened();
+		await awaitWithTimeout(
+			"probe uni echo",
+			endWritableProbe(writable, payload),
+			5000,
+		);
+		return;
+	}
+}
+
+async function runProbeStreamHandlers(
+	session: ServerSession,
+	deadlineMs: number,
+	onStream: () => void,
+	onBidiOpened: () => void,
+	onUniOpened: () => void,
+): Promise<void> {
+	const bidiReader = session.incomingBidirectionalStreams.getReader();
+	const uniReader = session.incomingUnidirectionalStreams.getReader();
+	const tasks: Promise<void>[] = [];
+	const acceptBidi = (async () => {
+		try {
+			while (Date.now() < deadlineMs) {
+				const result = await nextBeforeDeadline(bidiReader.read(), deadlineMs);
+				if (!result || result.done) break;
+				onStream();
+				tasks.push(
+					handleProbeBidiStream(result.value as ProbeBidiStream, deadlineMs),
+				);
+			}
+		} finally {
+			await Promise.race([bidiReader.cancel(), Bun.sleep(100)]).catch(
+				() => undefined,
+			);
+			try {
+				bidiReader.releaseLock();
+			} catch {
+				// Teardown can race lock release.
+			}
+		}
+	})();
+	const acceptUni = (async () => {
+		try {
+			while (Date.now() < deadlineMs) {
+				const result = await nextBeforeDeadline(uniReader.read(), deadlineMs);
+				if (!result || result.done) break;
+				onStream();
+				tasks.push(
+					handleProbeUniStream(
+						result.value as ProbeUniStream,
+						session,
+						deadlineMs,
+						onUniOpened,
+					),
+				);
+			}
+		} finally {
+			await Promise.race([uniReader.cancel(), Bun.sleep(100)]).catch(
+				() => undefined,
+			);
+			try {
+				uniReader.releaseLock();
+			} catch {
+				// Teardown can race lock release.
+			}
+		}
+	})();
+	await Promise.all([acceptBidi, acceptUni]);
+	onBidiOpened();
+	const serverBidi = await session.createBidirectionalStream();
+	await awaitWithTimeout(
+		"server probe bidi close",
+		endWritableProbe(serverBidi, new Uint8Array()),
+		5000,
+	);
+	const results = await Promise.allSettled(tasks);
+	const rejected = results.find(
+		(result): result is PromiseRejectedResult => result.status === "rejected",
+	);
+	if (rejected) throw rejected.reason;
 }
 
 async function exerciseServerStreamProbe(
@@ -1435,13 +1615,27 @@ async function runOneCampaign(
 								);
 							});
 						}
-						const shouldRunStreamProbe =
-							config.streamsPerSec > 0 &&
-							(config.workloadMode === "probe" || !serverStreamProbeDone);
-						if (shouldRunStreamProbe) {
-							if (config.workloadMode !== "probe") {
-								serverStreamProbeDone = true;
-							}
+						if (config.workloadMode === "probe" && config.streamsPerSec > 0) {
+							const task = runProbeStreamHandlers(
+								session,
+								drainDeadline,
+								countStream,
+								() => {
+									serverBidiStreamsOpened += 1;
+								},
+								() => {
+									serverUniStreamsOpened += 1;
+								},
+							);
+							drainTasks.push(task);
+							task.catch((error) => {
+								serverStreamErrors += 1;
+								failures.push(
+									`server stream probe failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							});
+						} else if (config.streamsPerSec > 0 && !serverStreamProbeDone) {
+							serverStreamProbeDone = true;
 							const task = exerciseServerStreamProbe(
 								session,
 								new TextEncoder().encode(`server-probe:${port}`),
