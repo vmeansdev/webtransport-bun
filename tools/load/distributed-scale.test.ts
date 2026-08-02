@@ -12,6 +12,7 @@ import {
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
 	evaluateWorkloadEvidence,
+	loadClientBinaryPath,
 	type FinalGauges,
 	runCommandWithBoundedOutput,
 	type ScaleCampaignConfig,
@@ -38,6 +39,15 @@ const ZERO_GAUGES: FinalGauges = {
 };
 
 describe("Task 14 distributed scale evidence", () => {
+	test("resolves the Rust load-client executable on each host platform", () => {
+		expect(loadClientBinaryPath("/repo", "debug", "darwin")).toBe(
+			"/repo/target/debug/load-client",
+		);
+		expect(loadClientBinaryPath("D:/repo", "release", "win32")).toMatch(
+			/target[\\/]release[\\/]load-client\.exe$/,
+		);
+	});
+
 	test("starts the child watchdog after the process spawn event", () => {
 		const source = readFileSync(
 			new URL("./distributed-scale.ts", import.meta.url),

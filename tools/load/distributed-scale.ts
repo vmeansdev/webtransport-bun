@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	createServer,
 	DEFAULT_LIMITS,
@@ -13,8 +13,17 @@ import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/
 import { createLoadSessionHandler } from "./soak-addon.ts";
 
 const ROOT = process.cwd();
-const CLIENT_BIN_RELEASE = `${ROOT}/target/release/load-client`;
-const CLIENT_BIN_DEBUG = `${ROOT}/target/debug/load-client`;
+export function loadClientBinaryPath(
+	root: string,
+	profile: "debug" | "release",
+	platform = process.platform,
+): string {
+	const suffix = platform === "win32" ? ".exe" : "";
+	return join(root, "target", profile, `load-client${suffix}`);
+}
+
+const CLIENT_BIN_RELEASE = loadClientBinaryPath(ROOT, "release");
+const CLIENT_BIN_DEBUG = loadClientBinaryPath(ROOT, "debug");
 const DEFAULT_ARTIFACT_PATH =
 	".release-evidence/load/distributed-scale-artifact.json";
 const DEFAULT_CLIENT_TARGET_HOST = "127.0.0.1";
@@ -991,7 +1000,7 @@ async function ensureClientBinary() {
 	}
 	if (!existsSync(CLIENT_BIN_DEBUG)) {
 		throw new Error(
-			"load-client build reported success but target/debug/load-client is missing",
+			`load-client build reported success but ${CLIENT_BIN_DEBUG} is missing`,
 		);
 	}
 	return CLIENT_BIN_DEBUG;
