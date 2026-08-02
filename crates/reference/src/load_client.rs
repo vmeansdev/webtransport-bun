@@ -476,7 +476,6 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                 let endpoint = Arc::clone(&endpoint);
                 let counters = Arc::clone(&counters);
                 let probe_barrier = Arc::clone(&probe_barrier);
-                let retry_sessions = retry_sessions;
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
