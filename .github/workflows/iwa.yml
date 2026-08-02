@@ -58,7 +58,7 @@ jobs:
           
       - name: Setup IWA packaging tools
         run: |
-          bun add --no-save --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1 playwright@1.58.2
+          bun add --no-save --ignore-scripts @playwright/test@1.58.2 playwright@1.58.2 wbn@0.0.9 wbn-sign@0.3.1
           timeout 10m bunx --no-install playwright install chromium chrome-beta
 
       - name: Build native addon for Chromium interop
