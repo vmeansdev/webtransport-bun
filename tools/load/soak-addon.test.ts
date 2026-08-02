@@ -16,6 +16,7 @@ import {
 	createLoadSessionHandler,
 	computeSegmentObservedOperationCounts,
 	evaluateTrendAndRecovery,
+	phasePlan,
 	type Sample,
 } from "./soak-addon.ts";
 
@@ -26,6 +27,17 @@ const SOAK_INPUT_VALIDATOR = join(ROOT, "scripts", "validate-soak-inputs.sh");
 const tempRoots: string[] = [];
 
 type SegmentArtifact = Parameters<typeof aggregateSegments>[0][number];
+
+test("scales short smoke phase slots to fit the bounded CI window", () => {
+	const phases = phasePlan(120);
+
+	expect(phases).toHaveLength(5);
+	expect(phases[0]?.durationMs).toBe(10_000);
+	expect(phases.at(-1)?.startOffsetMs).toBe(90_000);
+	expect(
+		(phases.at(-1)?.startOffsetMs ?? 0) + (phases.at(-1)?.durationMs ?? 0),
+	).toBe(100_000);
+});
 
 afterEach(() => {
 	for (const root of tempRoots.splice(0)) {

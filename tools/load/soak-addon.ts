@@ -1518,13 +1518,16 @@ function continuityDigest(token: string): string {
 	return createHash("sha256").update(token).digest("hex");
 }
 
-function phasePlan(durationSeconds: number): {
+export function phasePlan(durationSeconds: number): {
 	name: string;
 	startOffsetMs: number;
 	durationMs: number;
 }[] {
 	const totalMs = durationSeconds * 1000;
-	const slot = Math.max(45_000, Math.floor(totalMs / 12));
+	// Long campaigns retain a 45s minimum phase; short CI smoke runs scale
+	// phases down so all five phases finish within the bounded job timeout.
+	const minimumSlotMs = durationSeconds >= 3600 ? 45_000 : 5_000;
+	const slot = Math.max(minimumSlotMs, Math.floor(totalMs / 12));
 	return [
 		{ name: "steady-state", startOffsetMs: slot, durationMs: slot },
 		{ name: "overload", startOffsetMs: slot * 3, durationMs: slot },
