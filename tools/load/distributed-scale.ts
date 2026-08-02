@@ -279,6 +279,7 @@ async function writeProbePayload(
 	payload: Uint8Array,
 ): Promise<void> {
 	const writer = writable.getWriter();
+	void writer.closed.catch(() => undefined);
 	try {
 		await awaitWithTimeout("probe stream write", writer.write(payload), 5000);
 		await awaitWithTimeout("probe stream close", writer.close(), 5000);
@@ -308,6 +309,7 @@ async function handleProbeBidiStream(
 	}
 	if (text.startsWith("load:bidi:")) {
 		const writer = stream.writable.getWriter();
+		void writer.closed.catch(() => undefined);
 		try {
 			await awaitWithTimeout("load bidi close", writer.close(), 5000);
 		} finally {
@@ -353,14 +355,22 @@ async function runProbeStreamHandlers(
 	const bidiReader = session.incomingBidirectionalStreams.getReader();
 	const uniReader = session.incomingUnidirectionalStreams.getReader();
 	const tasks: Promise<void>[] = [];
+	const taskErrors: unknown[] = [];
 	const acceptBidi = (async () => {
 		try {
 			while (Date.now() < deadlineMs) {
 				const result = await nextBeforeDeadline(bidiReader.read(), deadlineMs);
 				if (!result || result.done) break;
 				onStream();
+				onBidiOpened();
+				const task = handleProbeBidiStream(
+					result.value as ProbeBidiStream,
+					deadlineMs,
+				);
 				tasks.push(
-					handleProbeBidiStream(result.value as ProbeBidiStream, deadlineMs),
+					task.catch((error) => {
+						taskErrors.push(error);
+					}),
 				);
 			}
 		} finally {
@@ -380,13 +390,16 @@ async function runProbeStreamHandlers(
 				const result = await nextBeforeDeadline(uniReader.read(), deadlineMs);
 				if (!result || result.done) break;
 				onStream();
+				const task = handleProbeUniStream(
+					result.value as ProbeUniStream,
+					session,
+					deadlineMs,
+					onUniOpened,
+				);
 				tasks.push(
-					handleProbeUniStream(
-						result.value as ProbeUniStream,
-						session,
-						deadlineMs,
-						onUniOpened,
-					),
+					task.catch((error) => {
+						taskErrors.push(error);
+					}),
 				);
 			}
 		} finally {
@@ -401,18 +414,8 @@ async function runProbeStreamHandlers(
 		}
 	})();
 	await Promise.all([acceptBidi, acceptUni]);
-	onBidiOpened();
-	const serverBidi = await session.createBidirectionalStream();
-	await awaitWithTimeout(
-		"server probe bidi close",
-		endWritableProbe(serverBidi, new Uint8Array()),
-		5000,
-	);
-	const results = await Promise.allSettled(tasks);
-	const rejected = results.find(
-		(result): result is PromiseRejectedResult => result.status === "rejected",
-	);
-	if (rejected) throw rejected.reason;
+	await Promise.all(tasks);
+	if (taskErrors.length > 0) throw taskErrors[0];
 }
 
 async function exerciseServerStreamProbe(
