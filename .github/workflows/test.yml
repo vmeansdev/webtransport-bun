@@ -165,6 +165,29 @@ jobs:
         run: cargo test --workspace
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install openssl.light --no-progress -y
+          $openssl = Get-Command openssl.exe -ErrorAction SilentlyContinue
+          if (-not $openssl) {
+            $openssl = Get-ChildItem `
+              -Path 'C:\Program Files\OpenSSL-Win64\bin\openssl.exe', 'C:\Program Files\OpenSSL\bin\openssl.exe' `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
+          if (-not $openssl) {
+            throw 'OpenSSL installation completed but openssl.exe was not discoverable'
+          }
+          $opensslPath = $openssl.Source
+          if (-not $opensslPath) {
+            $opensslPath = $openssl.FullName
+          }
+          $opensslDir = Split-Path -Parent $opensslPath
+          $opensslDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "WEBTRANSPORT_INTEROP_OPENSSL_PATH=$opensslPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $opensslPath version
       - name: Build native addon
         run: bun run build:native
       - name: Build adversary binary
