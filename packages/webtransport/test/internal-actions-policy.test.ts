@@ -234,7 +234,26 @@ describe("GitHub Actions release policy", () => {
 			expect(workflow.indexOf("- name: Build native addon")).toBeLessThan(
 				workflow.indexOf("- name: Native coverage"),
 			);
+			expect(workflow).toContain("- name: Build adversary binary");
+			expect(workflow.indexOf("- name: Build adversary binary")).toBeLessThan(
+				workflow.indexOf("- name: Bun coverage"),
+			);
 		}
+	});
+
+	it("installs dependencies before native and adversary builds in the full test matrix", () => {
+		const testJob = parseWorkflow(TEST_WORKFLOW).jobs?.test;
+		const steps = testJob?.steps ?? [];
+		const indexOf = (name: string) =>
+			steps.findIndex((step) => step.name === name);
+
+		expect(indexOf("Install deps")).toBeGreaterThanOrEqual(0);
+		expect(indexOf("Build native addon")).toBeGreaterThan(
+			indexOf("Install deps"),
+		);
+		expect(indexOf("Build adversary binary")).toBeGreaterThan(
+			indexOf("Build native addon"),
+		);
 	});
 
 	it("makes exact package consumers release-blocking for the release workflow across all supported operating systems", () => {

@@ -163,10 +163,12 @@ jobs:
         run: cargo clippy --workspace -- -D clippy::all
       - name: cargo test
         run: cargo test --workspace
-      - name: Build native addon
-        run: bun run build:native
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
+      - name: Build adversary binary
+        run: cargo build -p adversary
       - name: Typecheck
         run: bun run typecheck
       - name: Unit tests

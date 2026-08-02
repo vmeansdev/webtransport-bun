@@ -42,6 +42,8 @@ jobs:
         run: mkdir -p coverage/bun
       - name: Build native addon
         run: bun run build:native
+      - name: Build adversary binary
+        run: cargo build -p adversary
       - name: Native coverage
         run: cargo +nightly-2026-07-31 llvm-cov --workspace --branch --json --output-path coverage/native-coverage.json
       - name: WASM coverage
