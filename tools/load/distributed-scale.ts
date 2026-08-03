@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import {
 	createServer,
 	DEFAULT_LIMITS,
+	__TESTING__,
 	type MetricsSnapshot,
 	type ServerSession,
 	WT_RESET,
@@ -497,31 +498,96 @@ async function handleProbeBidiStream(
 	stream: ProbeBidiStream,
 	deadlineMs: number,
 ): Promise<void> {
-	const payload = await readFirstChunkBeforeDeadline(
-		stream.readable,
-		deadlineMs,
-	);
-	if (!payload) return;
-	const text = payload.toString("utf8");
-	if (text.startsWith("probe:bidi-reset:")) {
-		stream[WT_RESET]?.(42);
-		await settleProbeReadable(stream.readable);
-		return;
-	}
-	if (text.startsWith("probe:bidi-echo:")) {
-		await writeProbePayload(stream.writable, payload);
-		return;
-	}
-	if (text.startsWith("load:bidi:")) {
-		const writer = stream.writable.getWriter();
-		void writer.closed.catch(() => undefined);
-		try {
-			await awaitWithTimeout("load bidi close", writer.close(), 5000);
-		} finally {
-			writer.releaseLock();
+	let explicitResetCode: number | undefined;
+	let forceReset = false;
+	try {
+		const payload = await readFirstChunkBeforeDeadline(
+			stream.readable,
+			deadlineMs,
+		);
+		if (!payload) {
+			forceReset = true;
+			return;
 		}
-		return;
+		const text = payload.toString("utf8");
+		if (text.startsWith("probe:bidi-reset:")) {
+			explicitResetCode = 42;
+			return;
+		}
+		if (text.startsWith("probe:bidi-echo:")) {
+			await writeProbePayload(stream.writable, payload);
+			return;
+		}
+		if (text.startsWith("load:bidi:")) {
+			forceReset = true;
+			const writer = stream.writable.getWriter();
+			void writer.closed.catch(() => undefined);
+			try {
+				await awaitWithTimeout("load bidi close", writer.close(), 5000);
+			} finally {
+				writer.releaseLock();
+			}
+		}
+	} finally {
+		// Probe mode intentionally reads one payload, but it must still cancel
+		// the readable half before releasing the wrapper. Otherwise every
+		// half-open bidi keeps a native read handle alive until process exit.
+		if (explicitResetCode !== undefined) {
+			stream[WT_RESET]?.(explicitResetCode);
+		} else if (forceReset) {
+			// A one-shot load/timeout probe has no peer-side readable contract to
+			// preserve. Issue the terminal reset directly so a late Node pull cannot
+			// keep the native handle alive after the wrapper is released.
+			stream[WT_RESET]?.(0);
+		}
+		await settleProbeReadable(stream.readable);
 	}
+}
+
+async function runNativeProbeStreamHandlers(
+	session: ServerSession & {
+		__handleIncomingBidiProbe: () => Promise<boolean>;
+		__handleIncomingUniProbe: () => Promise<number>;
+		__enableIncomingBidiDiscard: () => void;
+		__enableIncomingUniDiscard: () => void;
+	},
+	deadlineMs: number,
+	onStream: () => void,
+	onBidiOpened: () => void,
+	onUniOpened: () => void,
+): Promise<void> {
+	const bidiProbes = (async () => {
+		for (let index = 0; index < 2; index += 1) {
+			const accepted = await nextBeforeDeadline(
+				session.__handleIncomingBidiProbe(),
+				deadlineMs,
+			);
+			if (accepted !== true) return false;
+			onStream();
+			onBidiOpened();
+		}
+		return true;
+	})();
+	const uniProbes = (async () => {
+		for (let index = 0; index < 2; index += 1) {
+			const result = await nextBeforeDeadline(
+				session.__handleIncomingUniProbe(),
+				deadlineMs,
+			);
+			if (result === null || result < 1) return false;
+			onStream();
+			if (result >= 2) onUniOpened();
+		}
+		return true;
+	})();
+	const [bidiReady, uniReady] = await Promise.all([bidiProbes, uniProbes]);
+	if (!bidiReady || !uniReady) {
+		throw new Error(
+			`native ordered probe phase incomplete (bidi=${bidiReady}, uni=${uniReady})`,
+		);
+	}
+	session.__enableIncomingBidiDiscard();
+	session.__enableIncomingUniDiscard();
 }
 
 async function handleProbeUniStream(
@@ -530,23 +596,27 @@ async function handleProbeUniStream(
 	deadlineMs: number,
 	onUniOpened: () => void,
 ): Promise<void> {
-	const payload = await readFirstChunkBeforeDeadline(stream, deadlineMs);
-	if (!payload) return;
-	const text = payload.toString("utf8");
-	if (text.startsWith("probe:uni-stop:")) {
+	try {
+		const payload = await readFirstChunkBeforeDeadline(stream, deadlineMs);
+		if (!payload) return;
+		const text = payload.toString("utf8");
+		if (text.startsWith("probe:uni-stop:")) {
+			stream[WT_STOP_SENDING]?.(0);
+			return;
+		}
+		if (text.startsWith("probe:uni-echo:")) {
+			const writable = await session.createUnidirectionalStream();
+			onUniOpened();
+			await awaitWithTimeout(
+				"probe uni echo",
+				endWritableProbe(writable, payload),
+				5000,
+			);
+		}
+	} finally {
+		// As with bidi probes, dispose the read half after the one-shot payload.
 		stream[WT_STOP_SENDING]?.(0);
 		await settleProbeReadable(stream);
-		return;
-	}
-	if (text.startsWith("probe:uni-echo:")) {
-		const writable = await session.createUnidirectionalStream();
-		onUniOpened();
-		await awaitWithTimeout(
-			"probe uni echo",
-			endWritableProbe(writable, payload),
-			5000,
-		);
-		return;
 	}
 }
 
@@ -557,6 +627,31 @@ async function runProbeStreamHandlers(
 	onBidiOpened: () => void,
 	onUniOpened: () => void,
 ): Promise<void> {
+	const nativeSession = session as ServerSession & {
+		__handleIncomingBidiProbe?: () => Promise<boolean>;
+		__handleIncomingUniProbe?: () => Promise<number>;
+		__enableIncomingBidiDiscard?: () => void;
+		__enableIncomingUniDiscard?: () => void;
+	};
+	if (
+		typeof nativeSession.__handleIncomingBidiProbe === "function" &&
+		typeof nativeSession.__handleIncomingUniProbe === "function" &&
+		typeof nativeSession.__enableIncomingBidiDiscard === "function" &&
+		typeof nativeSession.__enableIncomingUniDiscard === "function"
+	) {
+		return runNativeProbeStreamHandlers(
+			nativeSession as ServerSession & {
+				__handleIncomingBidiProbe: () => Promise<boolean>;
+				__handleIncomingUniProbe: () => Promise<number>;
+				__enableIncomingBidiDiscard: () => void;
+				__enableIncomingUniDiscard: () => void;
+			},
+			deadlineMs,
+			onStream,
+			onBidiOpened,
+			onUniOpened,
+		);
+	}
 	const bidiReader = session.incomingBidirectionalStreams.getReader();
 	const uniReader = session.incomingUnidirectionalStreams.getReader();
 	const tasks: Promise<void>[] = [];
@@ -579,9 +674,7 @@ async function runProbeStreamHandlers(
 				);
 			}
 		} finally {
-			await Promise.race([bidiReader.cancel(), Bun.sleep(100)]).catch(
-				() => undefined,
-			);
+			await bidiReader.cancel().catch(() => undefined);
 			try {
 				bidiReader.releaseLock();
 			} catch {
@@ -608,9 +701,7 @@ async function runProbeStreamHandlers(
 				);
 			}
 		} finally {
-			await Promise.race([uniReader.cancel(), Bun.sleep(100)]).catch(
-				() => undefined,
-			);
+			await uniReader.cancel().catch(() => undefined);
 			try {
 				uniReader.releaseLock();
 			} catch {
@@ -882,6 +973,38 @@ async function drainSessionStreamsBeforeDeadline(
 	deadlineMs: number,
 	onStream: () => void,
 ): Promise<void> {
+	const discardBidiStreams = (
+		session as ServerSession & {
+			discardIncomingBidiStreams?: (
+				timeoutMs?: number,
+			) => Promise<number | null | undefined>;
+		}
+	).discardIncomingBidiStreams;
+	const discardUniStreams = (
+		session as ServerSession & {
+			discardIncomingUniStreams?: (
+				timeoutMs?: number,
+			) => Promise<number | null | undefined>;
+		}
+	).discardIncomingUniStreams;
+	if (discardBidiStreams && discardUniStreams) {
+		const drainNativeDirection = async (
+			discard: (timeoutMs?: number) => Promise<number | null | undefined>,
+		): Promise<number | null | undefined> => {
+			const remainingMs = Math.max(1, deadlineMs - Date.now());
+			return discard.call(session, remainingMs);
+		};
+		const [bidiCount, uniCount] = await Promise.all([
+			drainNativeDirection(discardBidiStreams),
+			drainNativeDirection(discardUniStreams),
+		]);
+		for (const count of [bidiCount, uniCount]) {
+			if (count == null) continue;
+			for (let i = 0; i < count; i += 1) onStream();
+		}
+		return;
+	}
+
 	const drainIncoming = async (
 		streams: ReadableStream<
 			| {
@@ -900,6 +1023,17 @@ async function drainSessionStreamsBeforeDeadline(
 				const stream = result.value;
 				const readable = "readable" in stream ? stream.readable : stream;
 				await drainReadableBeforeDeadline(readable, deadlineMs);
+				// A bidi readable can reach EOF while its writable half is still
+				// open.  The native wrapper intentionally keeps that half alive for
+				// allow-half-open semantics, so a drain-all harness must terminate it
+				// explicitly or tens of thousands of completed stream wrappers can
+				// accumulate until GC.  This is cleanup of the exercised workload,
+				// not a relaxed RSS comparator.
+				if ("readable" in stream) {
+					await Promise.race([stream.writable.abort(), Bun.sleep(100)]).catch(
+						() => undefined,
+					);
+				}
 			}
 		} finally {
 			await Promise.race([reader.cancel(), Bun.sleep(100)]).catch(
@@ -1753,6 +1887,10 @@ async function runOverloadPhase(
 		0,
 		afterAttempts.rateLimitedCount - steadyState.rateLimitedCount,
 	);
+	// Sample recovery while the primary workload is still live. Waiting for the
+	// primary client to exit first would make the steady-state comparator
+	// meaningless: every session gauge would already be zero before recovery is
+	// measured.
 	const recoveryStartedAt = performance.now();
 	const postOverloadGauges = await waitForGauges(
 		servers,
@@ -2044,6 +2182,9 @@ async function runOneCampaign(
 				.reduce((sum, plan) => sum + plan.requestedSessions, 0),
 	);
 	const servers: ReturnType<typeof createServer>[] = [];
+	const metricsSnapshotters: Array<
+		() => ReturnType<ReturnType<typeof createServer>["metricsSnapshot"]>
+	> = [];
 	const serverObservedPeerIps = new Set<string>();
 	const coldStartMemory = getMemorySample();
 	let serviceReadyMemory = coldStartMemory;
@@ -2233,6 +2374,11 @@ async function runOneCampaign(
 									} finally {
 										await iterator.return?.();
 									}
+									await drainSessionDatagramsBeforeDeadline(
+										session,
+										drainDeadline,
+										countDatagram,
+									);
 								})();
 								drainTasks.push(task);
 								task.catch((error) => {
@@ -2287,6 +2433,10 @@ async function runOneCampaign(
 				),
 			);
 		}
+
+		metricsSnapshotters.push(
+			...servers.map((server) => server.metricsSnapshot),
+		);
 
 		await Bun.sleep(1_500);
 
@@ -2538,31 +2688,88 @@ async function runOneCampaign(
 		const closeDurationMs = Number(
 			(performance.now() - closeStartedAt).toFixed(3),
 		);
-
-		await Bun.sleep(2_000);
-		// Allow settled session callbacks and N-API wrapper finalizers to run
-		// before taking the diagnostic owner snapshot. The RSS comparator below
-		// measures this same drained process state, rather than a transient JS
-		// wrapper-retention window.
+		servers.length = 0;
 		if (typeof Bun.gc === "function") {
 			for (let pass = 0; pass < 3; pass += 1) {
 				Bun.gc(true);
+				await new Promise<void>((resolve) => setImmediate(resolve));
 				await Bun.sleep(100);
 			}
 		}
-		const postCloseSnapshots = servers.map((server) =>
-			server.metricsSnapshot(),
+
+		await Bun.sleep(250);
+		// Allow settled session callbacks and N-API wrapper finalizers to run
+		// before taking the diagnostic owner snapshot. Poll the native handle
+		// counters instead of relying on a fixed delay: Node pull callbacks can
+		// settle after the transport gauges are already zero, and sampling during
+		// that short window would misclassify a transient wrapper-retention state
+		// as a native owner leak.
+		let postCloseSnapshots = metricsSnapshotters.map((snapshot) => snapshot());
+		const nativeDrainDeadline = Date.now() + SERVER_CLOSE_TIMEOUT_MS;
+		while (Date.now() < nativeDrainDeadline) {
+			const nativeTelemetryAvailable = postCloseSnapshots.every((snapshot) =>
+				[
+					snapshot.nativeSessionRegistryEntries,
+					snapshot.nativeTrackedTasks,
+					snapshot.nativeRateLimitEntries,
+					snapshot.nativeBidiHandlesLive,
+					snapshot.nativeUniSendHandlesLive,
+					snapshot.nativeUniRecvHandlesLive,
+				].every((value) => typeof value === "number"),
+			);
+			if (
+				!nativeTelemetryAvailable ||
+				postCloseSnapshots.every((snapshot) =>
+					[
+						snapshot.nativeSessionRegistryEntries,
+						snapshot.nativeTrackedTasks,
+						snapshot.nativeRateLimitEntries,
+						snapshot.nativeBidiHandlesLive,
+						snapshot.nativeUniSendHandlesLive,
+						snapshot.nativeUniRecvHandlesLive,
+					].every((value) => value === 0),
+				)
+			) {
+				break;
+			}
+			await Bun.sleep(100);
+			postCloseSnapshots = metricsSnapshotters.map((snapshot) => snapshot());
+		}
+		const nativeTelemetryStillLiveBeforeGc = postCloseSnapshots.some(
+			(snapshot) =>
+				[
+					snapshot.nativeSessionRegistryEntries,
+					snapshot.nativeTrackedTasks,
+					snapshot.nativeRateLimitEntries,
+					snapshot.nativeBidiHandlesLive,
+					snapshot.nativeUniSendHandlesLive,
+					snapshot.nativeUniRecvHandlesLive,
+				].some((value) => typeof value === "number" && value > 0),
 		);
-		nativeOwnerTelemetry = buildNativeOwnerTelemetry(
-			preCloseSnapshots,
-			postCloseSnapshots,
+		if (typeof Bun.gc === "function") {
+			for (let pass = 0; pass < 3; pass += 1) {
+				Bun.gc(true);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				await Bun.sleep(100);
+			}
+		}
+		postCloseSnapshots = metricsSnapshotters.map((snapshot) => snapshot());
+		const nativeTelemetryStillLiveAfterGc = postCloseSnapshots.some(
+			(snapshot) =>
+				[
+					snapshot.nativeSessionRegistryEntries,
+					snapshot.nativeTrackedTasks,
+					snapshot.nativeRateLimitEntries,
+					snapshot.nativeBidiHandlesLive,
+					snapshot.nativeUniSendHandlesLive,
+					snapshot.nativeUniRecvHandlesLive,
+				].some((value) => typeof value === "number" && value > 0),
 		);
-		finalGauges = aggregateGauges(postCloseSnapshots);
 		// Drop all JS references to closed native handles and settled workload
 		// promises before measuring residency. Keeping these wrappers alive would
 		// make the evidence measure harness retention instead of server close.
-		servers.length = 0;
 		drainTasks.length = 0;
+		metricsSnapshotters.length = 0;
 		if (typeof Bun.gc === "function") {
 			for (let pass = 0; pass < 3; pass += 1) {
 				Bun.gc(true);
@@ -2570,6 +2777,37 @@ async function runOneCampaign(
 			}
 		}
 		await Bun.sleep(100);
+		const globalNativeHandles =
+			__TESTING__.nativeStreamHandlesSnapshotForTests();
+		if (globalNativeHandles && postCloseSnapshots.length > 0) {
+			for (const snapshot of postCloseSnapshots) {
+				snapshot.nativeBidiHandlesLive = globalNativeHandles.bidiHandlesLive;
+				snapshot.nativeUniSendHandlesLive =
+					globalNativeHandles.uniSendHandlesLive;
+				snapshot.nativeUniRecvHandlesLive =
+					globalNativeHandles.uniRecvHandlesLive;
+			}
+		}
+		const nativeTelemetryStillLive = postCloseSnapshots.some((snapshot) =>
+			[
+				snapshot.nativeSessionRegistryEntries,
+				snapshot.nativeTrackedTasks,
+				snapshot.nativeRateLimitEntries,
+				snapshot.nativeBidiHandlesLive,
+				snapshot.nativeUniSendHandlesLive,
+				snapshot.nativeUniRecvHandlesLive,
+			].some((value) => typeof value === "number" && value > 0),
+		);
+		if (nativeTelemetryStillLive) {
+			failures.push(
+				`native owner telemetry remained live after finalizer cleanup (pre-GC=${nativeTelemetryStillLiveBeforeGc}, after-GC=${nativeTelemetryStillLiveAfterGc}): ${JSON.stringify(postCloseSnapshots)}`,
+			);
+		}
+		nativeOwnerTelemetry = buildNativeOwnerTelemetry(
+			preCloseSnapshots,
+			postCloseSnapshots,
+		);
+		finalGauges = aggregateGauges(postCloseSnapshots);
 		postCloseMemory = getMemorySample();
 		const finalRssMb = postCloseMemory.rssMb;
 		const memory = buildMemoryTelemetry({

@@ -1086,6 +1086,7 @@ type NativeBidiStreamHandle = {
 	finishWait?: () => Promise<void> | void;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
+	dispose?: () => void;
 };
 type NativeSendStreamHandle = {
 	readonly id: number;
@@ -1094,12 +1095,14 @@ type NativeSendStreamHandle = {
 	finishWait?: () => Promise<void> | void;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
+	dispose?: () => void;
 };
 type NativeRecvStreamHandle = {
 	readonly id: number;
 	read(): Promise<Buffer | null>;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
+	dispose?: () => void;
 };
 interface NativeSessionHandle {
 	id: string;
@@ -1110,12 +1113,18 @@ interface NativeSessionHandle {
 	readDatagram(): Promise<Buffer | null>;
 	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
 	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
+	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
+	discardUniStreams?: (timeoutMs?: number) => Promise<number | null>;
+	enableBidiDiscard?: () => void;
+	enableUniDiscard?: () => void;
 	createBidiStream(): Promise<NativeBidiStreamHandle>;
 	createUniStream(): Promise<NativeSendStreamHandle>;
 	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
 	waitUniCapacity?: (remainingMs: number) => Promise<void>;
 	acceptBidiStream(): Promise<NativeBidiStreamHandle | null>;
 	acceptUniStream(): Promise<NativeRecvStreamHandle | null>;
+	handleBidiProbe?: () => Promise<boolean>;
+	handleUniProbe?: () => Promise<number>;
 	metricsSnapshot(): SessionMetricsSnapshot;
 	connectionStats?(): QuicConnectionStats | null;
 	pathMaxDatagramSize?: () => number | null;
@@ -1185,6 +1194,11 @@ interface NativeAddon {
 		misses: number;
 		evictIdle?: number;
 		evictBroken?: number;
+	};
+	nativeStreamHandlesSnapshot?: () => {
+		bidiHandlesLive: number;
+		uniSendHandlesLive: number;
+		uniRecvHandlesLive: number;
 	};
 	/** 0-RTT vault (absent on older prebuilt addons). */
 	exportZeroRttVault?(
@@ -1436,6 +1450,66 @@ class NativeServerSession implements ServerSession {
 			if (isSessionCloseError(err)) return null;
 			throw toWebTransportError(err);
 		}
+	}
+
+	/** @internal Consume accepted bidi streams without materializing wrappers. */
+	async discardIncomingBidiStreams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardBidiStreams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardBidiStreams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume accepted uni streams without materializing wrappers. */
+	async discardIncomingUniStreams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardUniStreams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardUniStreams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Load/evidence path: handle one ordered bidi probe in Rust. */
+	async __handleIncomingBidiProbe(): Promise<boolean> {
+		if (this.#closed) return false;
+		try {
+			return (await this.#nativeHandle.handleBidiProbe?.()) ?? false;
+		} catch (err) {
+			if (isSessionCloseError(err)) return false;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Load/evidence path: handle one ordered uni probe in Rust. */
+	async __handleIncomingUniProbe(): Promise<number> {
+		if (this.#closed) return 0;
+		try {
+			return (await this.#nativeHandle.handleUniProbe?.()) ?? 0;
+		} catch (err) {
+			if (isSessionCloseError(err)) return 0;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Switch subsequent load streams to the native discard path. */
+	__enableIncomingBidiDiscard(): void {
+		this.#nativeHandle.enableBidiDiscard?.();
+	}
+
+	/** @internal Switch subsequent load streams to the native discard path. */
+	__enableIncomingUniDiscard(): void {
+		this.#nativeHandle.enableUniDiscard?.();
 	}
 
 	async createBidirectionalStream(
@@ -3198,6 +3272,282 @@ function attachServerRecvControls(
 	return withControls;
 }
 
+type ServerIncomingStreamResource = {
+	dispose(): void;
+	reset(code?: number): void;
+	stopSending(code?: number): void;
+};
+
+class ServerIncomingBidiResource implements ServerIncomingStreamResource {
+	handle: NativeBidiStreamHandle | null;
+	disposed = false;
+	readableDone = false;
+	writableDone = false;
+	writableCreated = false;
+	private writableStream: WritableStream<Uint8Array> | null = null;
+	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+
+	constructor(
+		nativeStream: NativeBidiStreamHandle,
+		onDisposed: (resource: ServerIncomingStreamResource) => void,
+	) {
+		this.handle = nativeStream;
+		this.onDisposed = onDisposed;
+	}
+
+	getWritable(): WritableStream<Uint8Array> {
+		this.writableCreated = true;
+		return (this.writableStream ??= new WritableStream<Uint8Array>(this));
+	}
+
+	release(abort: boolean, code = 0): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const current = this.handle;
+		this.handle = null;
+		if (current) {
+			if (abort) {
+				try {
+					current.stopSending?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+				try {
+					current.reset?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+			}
+			try {
+				current.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
+			}
+		}
+		this.onDisposed(this);
+	}
+
+	dispose(): void {
+		this.release(true);
+	}
+
+	reset(code = 0): void {
+		this.release(true, code);
+	}
+
+	stopSending(code = 0): void {
+		try {
+			this.handle?.stopSending?.(code);
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+	}
+
+	async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			controller.close();
+			return;
+		}
+		try {
+			const chunk = await current.read();
+			if (this.disposed || this.handle !== current) return;
+			if (chunk === null) {
+				this.readableDone = true;
+				this.maybeRelease();
+				controller.close();
+				return;
+			}
+			controller.enqueue(chunk);
+		} catch (err) {
+			if (this.disposed) return;
+			this.readableDone = true;
+			this.release(true);
+			controller.error(toWebTransportError(err));
+		}
+	}
+
+	cancel(reason: unknown): void {
+		this.readableDone = true;
+		this.release(true, extractStreamErrorCode(reason));
+	}
+
+	async write(chunk: Uint8Array): Promise<void> {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			await current.write(Buffer.from(chunk));
+		} catch (err) {
+			this.writableDone = true;
+			this.release(true);
+			throw toWebTransportError(err);
+		}
+	}
+
+	async close(): Promise<void> {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			const finish = current.finishWait ?? current.finish;
+			if (finish) await finish.call(current);
+			this.writableDone = true;
+			this.maybeRelease();
+		} catch (err) {
+			this.writableDone = true;
+			this.release(true);
+			throw toWebTransportError(err);
+		}
+	}
+
+	abort(reason: unknown): void {
+		this.writableDone = true;
+		this.release(true, extractStreamErrorCode(reason));
+	}
+
+	private maybeRelease(): void {
+		if (this.readableDone && this.writableDone) this.release(false);
+	}
+}
+
+/**
+ * Keep the writable half allocation lazy for read-only consumers. The W3C
+ * surface still exposes the same stable writable stream once it is requested,
+ * but high-volume receive paths no longer allocate a sink they never use.
+ */
+function createServerIncomingBidiWebStreams(
+	nativeStream: NativeBidiStreamHandle,
+	onDisposed: (resource: ServerIncomingStreamResource) => void,
+): {
+	resource: ServerIncomingStreamResource;
+	stream: WebTransportBidirectionalStream;
+} {
+	const resource = new ServerIncomingBidiResource(nativeStream, onDisposed);
+	const readable = new ReadableStream<Uint8Array>(resource, {
+		highWaterMark: 0,
+	});
+	const stream = {
+		readable,
+		get writable(): WritableStream<Uint8Array> {
+			return resource.getWritable();
+		},
+	} as WebTransportBidirectionalStream;
+	return {
+		resource,
+		stream: attachServerBidiResourceControls(stream, resource),
+	};
+}
+
+function attachServerBidiResourceControls(
+	stream: {
+		readable: ReadableStream<Uint8Array>;
+		writable: WritableStream<Uint8Array>;
+	},
+	resource: ServerIncomingStreamResource,
+): WebTransportBidirectionalStream {
+	const withControls = stream as WebTransportBidirectionalStream;
+	withControls[WT_RESET] = (code?: number) => resource.reset(code);
+	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	return withControls;
+}
+
+class ServerIncomingUniResource implements ServerIncomingStreamResource {
+	handle: NativeRecvStreamHandle | null;
+	disposed = false;
+	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+
+	constructor(
+		nativeStream: NativeRecvStreamHandle,
+		onDisposed: (resource: ServerIncomingStreamResource) => void,
+	) {
+		this.handle = nativeStream;
+		this.onDisposed = onDisposed;
+	}
+
+	release(abort: boolean, code = 0): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const current = this.handle;
+		this.handle = null;
+		if (current) {
+			if (abort) {
+				try {
+					current.stopSending?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+			}
+			try {
+				current.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
+			}
+		}
+		this.onDisposed(this);
+	}
+
+	dispose(): void {
+		this.release(true);
+	}
+
+	reset(code = 0): void {
+		this.release(true, code);
+	}
+
+	stopSending(code = 0): void {
+		try {
+			this.handle?.stopSending?.(code);
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+	}
+
+	async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			controller.close();
+			return;
+		}
+		try {
+			const chunk = await current.read();
+			if (this.disposed || this.handle !== current) return;
+			if (chunk === null) {
+				this.release(false);
+				controller.close();
+				return;
+			}
+			controller.enqueue(chunk);
+		} catch (err) {
+			if (this.disposed) return;
+			this.release(true);
+			controller.error(toWebTransportError(err));
+		}
+	}
+
+	cancel(reason: unknown): void {
+		this.release(true, extractStreamErrorCode(reason));
+	}
+}
+
+function createServerIncomingUniWebReadable(
+	nativeStream: NativeRecvStreamHandle,
+	onDisposed: (resource: ServerIncomingStreamResource) => void,
+): {
+	resource: ServerIncomingStreamResource;
+	readable: WebTransportReceiveStream;
+} {
+	const resource = new ServerIncomingUniResource(nativeStream, onDisposed);
+	const readable = new ReadableStream<Uint8Array>(resource, {
+		highWaterMark: 0,
+	});
+	const withControls = readable as WebTransportReceiveStream;
+	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	return { resource, readable: withControls };
+}
+
 function createServerIncomingBidiStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
@@ -3207,9 +3557,11 @@ function createServerIncomingBidiStreams(
 	// consumer reads them, so a slow/stalled consumer cannot pile up
 	// unbounded native handles in the queue.
 	let cancelled = false;
-	const activeStreams = new Set<BidiStream>();
+	const activeStreams = new Set<ServerIncomingStreamResource>();
+	const removeActiveStream = (resource: ServerIncomingStreamResource) =>
+		activeStreams.delete(resource);
 	const disposeActiveStreams = () => {
-		for (const stream of activeStreams) stream.destroy();
+		for (const stream of activeStreams) stream.dispose();
 		activeStreams.clear();
 	};
 	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
@@ -3234,26 +3586,12 @@ function createServerIncomingBidiStreams(
 					controller.close();
 					return;
 				}
-				const duplex = new BidiStream({
-					handleId: nativeStream?.id ?? 0,
-					nativeHandle: nativeStream,
-				});
-				activeStreams.add(duplex);
-				duplex.once("close", () => activeStreams.delete(duplex));
-				controller.enqueue(
-					attachServerBidiControls(
-						duplex,
-						await nodeDuplexToWebBidi(
-							duplex,
-							undefined,
-							undefined,
-							undefined,
-							undefined,
-							false,
-							true,
-						),
-					),
+				const direct = createServerIncomingBidiWebStreams(
+					nativeStream,
+					removeActiveStream,
 				);
+				activeStreams.add(direct.resource);
+				controller.enqueue(direct.stream);
 			} catch (err) {
 				if (isClosed() || isSessionCloseError(err)) {
 					disposeActiveStreams();
@@ -3277,9 +3615,11 @@ function createServerIncomingUniStreams(
 ): ReadableStream<WebTransportReceiveStream> {
 	// Pull-based for the same backpressure reasons as the bidi variant.
 	let cancelled = false;
-	const activeStreams = new Set<RecvStream>();
+	const activeStreams = new Set<ServerIncomingStreamResource>();
+	const removeActiveStream = (resource: ServerIncomingStreamResource) =>
+		activeStreams.delete(resource);
 	const disposeActiveStreams = () => {
-		for (const stream of activeStreams) stream.destroy();
+		for (const stream of activeStreams) stream.dispose();
 		activeStreams.clear();
 	};
 	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
@@ -3304,18 +3644,12 @@ function createServerIncomingUniStreams(
 					controller.close();
 					return;
 				}
-				const readable = new RecvStream({
-					handleId: nativeStream?.id ?? 0,
-					nativeHandle: nativeStream,
-				});
-				activeStreams.add(readable);
-				readable.once("close", () => activeStreams.delete(readable));
-				controller.enqueue(
-					attachServerRecvControls(
-						readable,
-						nodeReadableToWebReadable(readable, undefined, false, true),
-					),
+				const direct = createServerIncomingUniWebReadable(
+					nativeStream,
+					removeActiveStream,
 				);
+				activeStreams.add(direct.resource);
+				controller.enqueue(direct.readable);
 			} catch (err) {
 				if (isClosed() || isSessionCloseError(err)) {
 					disposeActiveStreams();
@@ -3470,11 +3804,15 @@ function nodeReadableToWebReadable(
 				controller.error(toWebTransportError(err, strictW3CErrors));
 			}
 		},
-		cancel(reason) {
+		async cancel(reason) {
 			const fn = stopSendable[WT_STOP_SENDING];
 			if (typeof fn === "function") fn.call(r, extractStreamErrorCode(reason));
-			void iter.return?.();
+			// Abort the Node/native stream before asking its async iterator to
+			// return. A pending iterator.next() owns the N-API stream handle; if
+			// return() runs first, cancellation can wait on that read while the
+			// native stop/reset signal is still queued behind it.
 			if (destroyOnCancel && !r.destroyed) r.destroy();
+			await iter.return?.();
 		},
 	});
 }
@@ -3555,6 +3893,8 @@ export const __TESTING__ = {
 	nativeAddonOverrideRequestsFromEnvForTests:
 		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
+	nativeStreamHandlesSnapshotForTests: () =>
+		native?.nativeStreamHandlesSnapshot?.(),
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
 };

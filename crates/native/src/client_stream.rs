@@ -8,10 +8,11 @@
 use crate::error::{from_reason as wt_from_reason, WtResult};
 use napi::Result;
 use napi_derive::napi;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use wtransport::error::{StreamReadError, StreamWriteError};
 
 use crate::RUNTIME;
@@ -44,24 +45,78 @@ pub enum StreamCmd {
     Reset(u32),
 }
 
-/// Holds a closure that runs on drop to decrement stream counters.
-/// Used by bridge tasks to properly track stream lifecycle.
+/// Drop action for a stream bridge.
+///
+/// The hot accept path creates one guard per stream. Keeping the action as a
+/// small enum avoids boxing a unique closure (and its allocation) for every
+/// short-lived accepted stream.
+enum StreamGuardAction {
+    Client {
+        metrics: Arc<crate::client::ClientMetrics>,
+    },
+    Server {
+        metrics: Arc<crate::server_metrics::ServerMetrics>,
+        session: Arc<crate::session_registry::SessionMetrics>,
+        bidi: bool,
+        capacity_notify: Option<Arc<Notify>>,
+    },
+}
+
+/// Holds the accounting action that runs when a bridge-owned stream is dropped.
 pub struct StreamGuard {
-    on_drop: Option<Box<dyn FnOnce() + Send>>,
+    action: Option<StreamGuardAction>,
 }
 
 impl StreamGuard {
-    pub fn new(f: impl FnOnce() + Send + 'static) -> Self {
+    pub fn client(metrics: Arc<crate::client::ClientMetrics>) -> Self {
         Self {
-            on_drop: Some(Box::new(f)),
+            action: Some(StreamGuardAction::Client { metrics }),
+        }
+    }
+
+    pub fn server(
+        metrics: Arc<crate::server_metrics::ServerMetrics>,
+        session: Arc<crate::session_registry::SessionMetrics>,
+        bidi: bool,
+        capacity_notify: Option<Arc<Notify>>,
+    ) -> Self {
+        Self {
+            action: Some(StreamGuardAction::Server {
+                metrics,
+                session,
+                bidi,
+                capacity_notify,
+            }),
         }
     }
 }
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        if let Some(f) = self.on_drop.take() {
-            f();
+        let Some(action) = self.action.take() else {
+            return;
+        };
+        match action {
+            StreamGuardAction::Client { metrics } => {
+                metrics.streams_active.fetch_sub(1, Ordering::Relaxed);
+            }
+            StreamGuardAction::Server {
+                metrics,
+                session,
+                bidi,
+                capacity_notify,
+            } => {
+                metrics.streams_active.fetch_sub(1, Ordering::Relaxed);
+                let counter = if bidi {
+                    &session.streams_bidi_active
+                } else {
+                    &session.streams_uni_active
+                };
+                counter.fetch_sub(1, Ordering::Relaxed);
+                if let Some(notify) = capacity_notify {
+                    notify.notify_waiters();
+                }
+            }
         }
     }
 }
@@ -86,12 +141,120 @@ pub struct StreamBudget {
     pub backpressure_timeout_ms: u64,
 }
 
+/// Configuration retained by an accepted stream before JS consumes it.
+///
+/// Accepted server streams can be created and released without ever starting
+/// a read/write bridge. Keep only the shared metrics and scalar limits in that
+/// deferred state; the per-stream counter and notifier are allocated when the
+/// first bridge actually starts.
+#[derive(Clone)]
+pub struct DeferredStreamBudgetConfig {
+    server_metrics: Arc<crate::server_metrics::ServerMetrics>,
+    session_metrics: Arc<crate::session_registry::SessionMetrics>,
+    max_global: u64,
+    max_session: u64,
+    max_stream: u64,
+    backpressure_timeout_ms: u64,
+}
+
+impl DeferredStreamBudgetConfig {
+    pub fn new(
+        server_metrics: Arc<crate::server_metrics::ServerMetrics>,
+        session_metrics: Arc<crate::session_registry::SessionMetrics>,
+        max_global: u64,
+        max_session: u64,
+        max_stream: u64,
+        backpressure_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            server_metrics,
+            session_metrics,
+            max_global,
+            max_session,
+            max_stream,
+            backpressure_timeout_ms,
+        }
+    }
+
+    fn materialize(self) -> StreamBudget {
+        StreamBudget {
+            server_metrics: self.server_metrics,
+            session_metrics: self.session_metrics,
+            stream_queued: Arc::new(AtomicU64::new(0)),
+            max_global: self.max_global,
+            max_session: self.max_session,
+            max_stream: self.max_stream,
+            capacity_notify: StreamBudget::new_notify(),
+            backpressure_timeout_ms: self.backpressure_timeout_ms,
+        }
+    }
+}
+
 /// Fallback re-check interval for budget waits: bounds how long a stream can
 /// stay parked when a *sibling* stream freed shared global/session budget (whose
 /// release notifies its own per-stream notifier, not the waiter's).
 const BUDGET_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(50);
-const STREAM_READ_BUFFER_BYTES: usize = 64 * 1024;
+// Read streams in bounded chunks. A per-bridge scratch buffer is retained for
+// the lifetime of each accepted stream, so keep it below the app-level queue
+// budget while preserving arbitrary payload delivery through repeated reads.
+pub(crate) const STREAM_READ_BUFFER_BYTES: usize = 4 * 1024;
+
+/// Consume a QUIC receive stream without allocating a bridge or copying the
+/// payload into a JS-visible buffer. The caller owns the stream accounting
+/// guard and decides how to report the result.
+pub(crate) async fn discard_recv_stream(
+    mut recv_stream: wtransport::RecvStream,
+    scratch: &mut [u8],
+) -> std::result::Result<(), String> {
+    loop {
+        match recv_stream.read(scratch).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(read_error_code(&error).to_string()),
+        }
+    }
+}
+
+/// Consume a native black-hole stream to EOF without copying payload bytes
+/// into an application buffer. Quinn's chunk API hands out the received bytes
+/// for the duration of the loop iteration; dropping each chunk immediately
+/// preserves full delivery/error accounting while avoiding a temporary copy.
+pub(crate) async fn discard_recv_stream_zero_copy(
+    mut recv_stream: wtransport::RecvStream,
+) -> std::result::Result<(), String> {
+    loop {
+        match recv_stream
+            .quic_stream_mut()
+            .read_chunk(STREAM_READ_BUFFER_BYTES, true)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                return Err(match error {
+                    wtransport::quinn::ReadError::Reset(_) => "E_STREAM_RESET",
+                    wtransport::quinn::ReadError::ConnectionLost(_)
+                    | wtransport::quinn::ReadError::ClosedStream
+                    | wtransport::quinn::ReadError::IllegalOrderedRead
+                    | wtransport::quinn::ReadError::ZeroRttRejected => "E_SESSION_CLOSED",
+                }
+                .to_string());
+            }
+        }
+    }
+}
+
 const STREAM_CHANNEL_CAPACITY: usize = 256;
+
+// Accepted server streams are exposed lazily, but a probe or application can
+// still call `read()` on many of them at once. Keep the native receive bridge
+// fan-out bounded so that each concurrent stream cannot create an unbounded
+// burst of Tokio tasks, channels, and scratch buffers. Streams beyond this
+// limit remain in their deferred state and naturally apply QUIC backpressure
+// until an earlier bridge completes or is disposed.
+const DEFERRED_READ_BRIDGE_CAPACITY: usize = 64;
+static DEFERRED_READ_BRIDGES: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(DEFERRED_READ_BRIDGE_CAPACITY)));
 
 // These counters intentionally track the NAPI stream-handle objects, not the
 // Tokio bridge tasks.  The server drain metrics already prove that bridge
@@ -256,6 +419,11 @@ type BidiBridgeParts = (
     Option<WriteErrorSlot>,
     Option<ReadErrorSlot>,
 );
+type ReadBridgeParts = (
+    mpsc::Receiver<StreamChunk>,
+    oneshot::Sender<u32>,
+    Option<ReadErrorSlot>,
+);
 
 fn read_error_code(err: &StreamReadError) -> &'static str {
     match err {
@@ -268,19 +436,51 @@ fn should_reset_on_oversized_chunk(sz: u64, budget: &Option<StreamBudget>) -> bo
     budget.as_ref().is_some_and(|b| sz > b.max_stream)
 }
 
+async fn acquire_deferred_read_bridge_permit(
+    read_abort: &Notify,
+    read_aborted: &AtomicBool,
+) -> Result<OwnedSemaphorePermit> {
+    if read_aborted.load(Ordering::Acquire) {
+        return Err(wt_from_reason("E_STREAM_RESET"));
+    }
+    let notified = read_abort.notified();
+    tokio::pin!(notified);
+    tokio::select! {
+        permit = DEFERRED_READ_BRIDGES.clone().acquire_owned() => permit
+            .map_err(|_| wt_from_reason("E_SESSION_CLOSED")),
+        _ = &mut notified => Err(wt_from_reason("E_STREAM_RESET")),
+    }
+}
+
+/// Accepted server streams start in a deferred state. Once JS actually reads
+/// or writes one, the corresponding bridge is started lazily so unread streams
+/// do not retain a task, channel, or scratch buffer for their whole lifetime.
 #[napi]
 pub struct ClientBidiStreamHandle {
-    read_rx: Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>,
+    read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
     lazy_send_stream: Mutex<Option<wtransport::SendStream>>,
+    deferred_recv: Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
-    budget: Option<StreamBudget>,
-    write_error_slot: Option<WriteErrorSlot>,
+    budget: Mutex<Option<StreamBudget>>,
+    deferred_budget: Mutex<Option<DeferredStreamBudgetConfig>>,
+    write_error_slot: Mutex<Option<WriteErrorSlot>>,
     read_error_slot: Option<ReadErrorSlot>,
+    deferred_read_error_slot: Mutex<Option<ReadErrorSlot>>,
+    /// Wakes a pending napi `read()` when JS resets/stops the readable half.
+    /// The channel receiver alone is insufficient here: the bridge can still
+    /// own its sender while the native handle is retained by the async napi
+    /// method future.
+    read_abort: Notify,
+    read_aborted: AtomicBool,
     /// Set once finish/reset is issued so a subsequent write is rejected
     /// deterministically (a closed stream never accepts more data), instead of
     /// racing into the channel behind the FIN.
-    finished: Arc<std::sync::atomic::AtomicBool>,
+    finished: AtomicBool,
+    /// Set once `dispose()` releases the native resources. The N-API wrapper
+    /// can outlive its transport use until JS finalization, so resource release
+    /// and the live-handle diagnostic must be idempotent.
+    released: AtomicBool,
 }
 
 impl ClientBidiStreamHandle {
@@ -291,14 +491,20 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
+            deferred_recv: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget: None,
-            write_error_slot: None,
+            budget: Mutex::new(None),
+            deferred_budget: Mutex::new(None),
+            write_error_slot: Mutex::new(None),
             read_error_slot: None,
-            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -321,14 +527,20 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
+            deferred_recv: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget,
-            write_error_slot,
+            budget: Mutex::new(budget),
+            deferred_budget: Mutex::new(None),
+            write_error_slot: Mutex::new(write_error_slot),
             read_error_slot,
-            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -341,14 +553,49 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
+            deferred_recv: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget,
-            write_error_slot: Some(Arc::new(Mutex::new(None))),
+            budget: Mutex::new(budget),
+            deferred_budget: Mutex::new(None),
+            write_error_slot: Mutex::new(None),
             read_error_slot,
-            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct an accepted server bidi stream without starting its receive
+    /// bridge. The bridge starts on the first `read()` call, so unread streams
+    /// remain a small bounded handle rather than retaining a task and scratch
+    /// buffer for their entire transport lifetime.
+    pub fn new_deferred(
+        recv_stream: wtransport::RecvStream,
+        send_stream: wtransport::SendStream,
+        guard: StreamGuard,
+        budget: Option<DeferredStreamBudgetConfig>,
+    ) -> Self {
+        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_rx: Mutex::new(None),
+            write_tx: Mutex::new(None),
+            lazy_send_stream: Mutex::new(Some(send_stream)),
+            deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            stop_tx: std::sync::Mutex::new(None),
+            budget: Mutex::new(None),
+            deferred_budget: Mutex::new(budget),
+            write_error_slot: Mutex::new(None),
+            read_error_slot: None,
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -358,6 +605,129 @@ impl ClientBidiStreamHandle {
         stop_tx: oneshot::Sender<u32>,
     ) -> Self {
         Self::new(read_rx, write_tx, stop_tx)
+    }
+
+    /// Consume a deferred server receive stream to EOF without creating a
+    /// JavaScript stream bridge. This is used by bounded load/evidence drains
+    /// that need acceptance and delivery accounting but do not need payloads.
+    /// Reading to EOF is important: dropping the QUIC handle early resets the
+    /// peer and turns an otherwise successful stream into a delivery error.
+    pub async fn discard_incoming(
+        &mut self,
+        scratch: &mut [u8],
+    ) -> std::result::Result<(), String> {
+        let pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| "E_INTERNAL: deferred stream lock poisoned".to_string())?
+            .take();
+        let mut result = Ok(());
+        if let Some((recv_stream, _guard)) = pending {
+            result = discard_recv_stream(recv_stream, scratch).await;
+        }
+        self.dispose_resources();
+        self.release_live_counter();
+        result
+    }
+
+    /// Read deferred server streams directly until a bridge is needed. The
+    /// common accepted-stream path reads a small number of chunks and then
+    /// cancels/resets; materializing a Tokio task, channel, and scratch-buffer
+    /// allocation for that path creates avoidable allocator churn. The receive
+    /// stream stays deferred after each successful read, so normal multi-read
+    /// consumers retain the same semantics without a per-stream bridge.
+    async fn read_deferred_direct(&self) -> Result<Option<Option<napi::bindgen_prelude::Buffer>>> {
+        let pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+            .take();
+        let Some((mut recv_stream, guard)) = pending else {
+            return Ok(None);
+        };
+        if self.read_aborted.load(Ordering::Acquire) {
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+
+        let notified = self.read_abort.notified();
+        tokio::pin!(notified);
+        let mut buf = [0u8; STREAM_READ_BUFFER_BYTES];
+        let result = tokio::select! {
+            value = recv_stream.read(&mut buf) => value,
+            _ = &mut notified => {
+                recv_stream.stop(0);
+                drop(guard);
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+        };
+        let read_result = match result {
+            Ok(value) => value,
+            Err(error) => {
+                drop(guard);
+                return Err(wt_from_reason(read_error_code(&error)));
+            }
+        };
+        let Some(n) = read_result else {
+            drop(guard);
+            return Ok(Some(None));
+        };
+        let budget = {
+            let mut budget_guard = self
+                .budget
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?;
+            if let Some(existing) = budget_guard.as_ref() {
+                Some(existing.clone())
+            } else {
+                let materialized = self
+                    .deferred_budget
+                    .lock()
+                    .map_err(|_| {
+                        napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned")
+                    })?
+                    .take()
+                    .map(DeferredStreamBudgetConfig::materialize);
+                if let Some(ref value) = materialized {
+                    *budget_guard = Some(value.clone());
+                }
+                materialized
+            }
+        };
+        if let Some(ref b) = budget {
+            if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
+                recv_stream.stop(0);
+                drop(guard);
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+            if !b.reserve_or_wait(n as u64).await {
+                recv_stream.stop(0);
+                drop(guard);
+                return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
+            }
+        }
+        if self.read_aborted.load(Ordering::Acquire) {
+            if let Some(ref b) = budget {
+                b.release(n as u64);
+            }
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        let chunk = StreamChunk::new(buf[..n].to_vec(), budget, n as u64);
+        let value = chunk.take().into();
+        let mut deferred = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?;
+        if self.read_aborted.load(Ordering::Acquire) {
+            recv_stream.stop(0);
+            drop(guard);
+        } else {
+            *deferred = Some((recv_stream, guard));
+        }
+        Ok(Some(Some(value)))
     }
 
     fn ensure_write_tx(&self) -> Result<mpsc::Sender<StreamCmd>> {
@@ -374,21 +744,142 @@ impl ClientBidiStreamHandle {
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: lazy stream lock poisoned"))?
             .take()
             .ok_or_else(|| napi::Error::from_reason("E_STREAM_RESET"))?;
-        let write_error_slot = self
-            .write_error_slot
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+        let write_error_slot = {
+            let mut slot = self
+                .write_error_slot
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: write error lock poisoned"))?;
+            if let Some(existing) = slot.as_ref() {
+                existing.clone()
+            } else {
+                let created = Arc::new(Mutex::new(None));
+                *slot = Some(created.clone());
+                created
+            }
+        };
         let (write_tx, write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
         spawn_bidi_write_bridge_on(&RUNTIME, send_stream, write_rx, write_error_slot);
         *tx_guard = Some(write_tx.clone());
         Ok(write_tx)
     }
+
+    /// Handle one ordered load/evidence bidi probe without crossing the N-API
+    /// stream-wrapper boundary. The public stream methods remain unchanged;
+    /// this helper is only used by the internal native probe harness.
+    pub(crate) async fn handle_native_probe(&self) -> Result<()> {
+        let result = async {
+            let payload = self.read_deferred_direct().await?.flatten();
+            let Some(payload) = payload else {
+                self.reset(0)?;
+                return Ok(());
+            };
+            if payload.as_ref().starts_with(b"probe:bidi-reset:") {
+                self.reset(42)?;
+            } else if payload.as_ref().starts_with(b"probe:bidi-echo:") {
+                self.write(payload).await?;
+                self.finish_wait().await?;
+            } else {
+                self.reset(0)?;
+            }
+            Ok(())
+        }
+        .await;
+        let _ = self.dispose();
+        result
+    }
+
+    fn abort_read(&self) {
+        self.read_aborted.store(true, Ordering::Release);
+        self.read_abort.notify_waiters();
+    }
+
+    async fn ensure_deferred_read_bridge(&self) -> Result<()> {
+        let has_pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+            .is_some();
+        if !has_pending {
+            return Ok(());
+        }
+
+        let permit =
+            acquire_deferred_read_bridge_permit(&self.read_abort, &self.read_aborted).await?;
+        let pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+            .take();
+        let Some((recv_stream, guard)) = pending else {
+            drop(permit);
+            return Ok(());
+        };
+        let budget = self
+            .deferred_budget
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
+            .take()
+            .map(DeferredStreamBudgetConfig::materialize);
+        let (read_rx, stop_tx, read_error_slot) = spawn_recv_bridge_on_with_permit(
+            &RUNTIME,
+            recv_stream,
+            Some(guard),
+            budget,
+            Some(permit),
+        );
+        self.read_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+            .replace(Arc::new(TokioMutex::new(read_rx)));
+        self.stop_tx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream stop lock poisoned"))?
+            .replace(stop_tx);
+        self.deferred_read_error_slot
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred error lock poisoned"))?
+            .replace(read_error_slot.expect("receive bridge always has an error slot"));
+        Ok(())
+    }
+
+    fn dispose_resources(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.abort_read();
+        if let Ok(mut stop) = self.stop_tx.lock() {
+            if let Some(tx) = stop.take() {
+                let _ = tx.send(0);
+            }
+        }
+        if let Ok(mut write) = self.write_tx.lock() {
+            write.take();
+        }
+        if let Ok(mut lazy) = self.lazy_send_stream.lock() {
+            lazy.take();
+        }
+        if let Ok(mut deferred) = self.deferred_recv.lock() {
+            deferred.take();
+        }
+        if let Ok(mut budget) = self.deferred_budget.lock() {
+            budget.take();
+        }
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.take();
+        }
+        if let Ok(mut read) = self.read_rx.lock() {
+            read.take();
+        }
+    }
+
+    fn release_live_counter(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            LIVE_BIDI_HANDLES.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for ClientBidiStreamHandle {
     fn drop(&mut self) {
-        LIVE_BIDI_HANDLES.fetch_sub(1, Ordering::Relaxed);
+        self.release_live_counter();
     }
 }
 
@@ -396,23 +887,49 @@ impl Drop for ClientBidiStreamHandle {
 impl ClientBidiStreamHandle {
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        let read_rx = Arc::clone(&self.read_rx);
+        if let Some(result) = self.read_deferred_direct().await? {
+            return Ok(result);
+        }
+        self.ensure_deferred_read_bridge().await?;
+        let read_rx = self
+            .read_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
         let mut rx = read_rx.lock().await;
-        match rx.recv().await {
+        let read_abort = self.read_abort.notified();
+        tokio::pin!(read_abort);
+        if self.read_aborted.load(Ordering::Acquire) {
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        let result = match tokio::select! {
+            value = rx.recv() => value,
+            _ = &mut read_abort => {
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+        } {
             // `chunk.take()` moves the payload out; the reservation is released
             // when the chunk drops at the end of this scope (see StreamChunk).
-            Some(chunk) => Ok(Some(chunk.take().into())),
+            Some(chunk) => Some(chunk.take().into()),
             None => {
-                if let Some(ref slot) = self.read_error_slot {
+                let deferred_slot = self
+                    .deferred_read_error_slot
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
                         if let Some(ref code) = *guard {
                             return Err(wt_from_reason(code.clone()));
                         }
                     }
                 }
-                Ok(None)
+                None
             }
-        }
+        };
+        Ok(result)
     }
 
     #[napi]
@@ -422,20 +939,27 @@ impl ClientBidiStreamHandle {
         if self.finished.load(Ordering::Acquire) {
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
-        if let Some(ref slot) = self.write_error_slot {
-            if let Ok(guard) = slot.lock() {
-                if let Some(ref code) = *guard {
-                    return Err(wt_from_reason(code.clone()));
+        if let Ok(slot) = self.write_error_slot.lock() {
+            if let Some(slot) = slot.as_ref() {
+                if let Ok(guard) = slot.lock() {
+                    if let Some(ref code) = *guard {
+                        return Err(wt_from_reason(code.clone()));
+                    }
                 }
             }
         }
-        let tx = self.ensure_write_tx()?;
         let bytes = chunk.to_vec();
         if bytes.is_empty() {
             return Ok(());
         }
+        let tx = self.ensure_write_tx()?;
         let sz = bytes.len() as u64;
-        if let Some(ref b) = self.budget {
+        let budget = self
+            .budget
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?
+            .clone();
+        if let Some(ref b) = budget {
             // Reliable-stream backpressure: park until budget frees (lossless)
             // instead of erroring, bounded by the backpressure timeout.
             if !b.reserve_or_wait(sz).await {
@@ -447,7 +971,7 @@ impl ClientBidiStreamHandle {
         // failure) drops it and releases the global/session/stream bytes.
         // Building it *after* the re-check would strand the bytes reserved by
         // reserve_or_wait when the re-check returns early — a budget leak.
-        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
+        let chunk = StreamChunk::new(bytes, budget, sz);
         // Re-check after the (awaited) reservation: finish/reset issued during
         // the park must still win — `chunk` is dropped here (releasing its
         // bytes) instead of being written after the FIN.
@@ -473,6 +997,21 @@ impl ClientBidiStreamHandle {
     #[napi]
     pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
+        // Reset must terminate the receive bridge too. The JS facade normally
+        // sends STOP_SENDING first, but native callers and delayed wrapper
+        // teardown must not leave a recv task holding the transport stream.
+        let _ = self.stop_sending(code);
+        // Accepted server bidi streams keep their send half lazy until JS writes.
+        // Resetting such a stream must not materialize a write bridge just to send
+        // one terminal control frame: that bridge can outlive the JS wrapper during
+        // session teardown and retain the native handle. Reset the transport-owned
+        // send stream directly while it is still lazy.
+        if let Ok(mut lazy) = self.lazy_send_stream.lock() {
+            if let Some(mut send_stream) = lazy.take() {
+                let _ = send_stream.reset(code);
+                return Ok(());
+            }
+        }
         if let Ok(tx) = self.ensure_write_tx() {
             send_ctrl_lossless(&Some(tx), StreamCmd::Reset(code));
         }
@@ -481,11 +1020,17 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
+        self.abort_read();
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
                 if tx.send(code).is_err() {
                     return Err(wt_from_reason("E_SESSION_CLOSED"));
                 }
+            }
+        }
+        if let Ok(mut deferred) = self.deferred_recv.lock() {
+            if let Some((recv_stream, _guard)) = deferred.take() {
+                recv_stream.stop(code);
             }
         }
         Ok(())
@@ -514,6 +1059,16 @@ impl ClientBidiStreamHandle {
             Err(_) => Err(napi::Error::from_reason("E_STREAM_RESET")),
         }
     }
+
+    /// Release transport channels and bridge ownership immediately. N-API
+    /// finalization may be delayed by the JS runtime, so stream wrappers call
+    /// this during deterministic teardown instead of relying on GC.
+    #[napi]
+    pub fn dispose(&self) -> WtResult<()> {
+        self.dispose_resources();
+        self.release_live_counter();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,21 +1077,23 @@ impl ClientBidiStreamHandle {
 
 #[napi]
 pub struct ClientUniSendHandle {
-    write_tx: Option<mpsc::Sender<StreamCmd>>,
+    write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
     budget: Option<StreamBudget>,
     write_error_slot: Option<WriteErrorSlot>,
     /// See `ClientBidiStreamHandle::finished`.
-    finished: Arc<std::sync::atomic::AtomicBool>,
+    finished: AtomicBool,
+    released: AtomicBool,
 }
 
 impl ClientUniSendHandle {
     pub fn new(write_tx: mpsc::Sender<StreamCmd>) -> Self {
         LIVE_UNI_SEND_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            write_tx: Some(write_tx),
+            write_tx: Mutex::new(Some(write_tx)),
             budget: None,
             write_error_slot: None,
-            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -554,17 +1111,31 @@ impl ClientUniSendHandle {
     ) -> Self {
         LIVE_UNI_SEND_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            write_tx: Some(write_tx),
+            write_tx: Mutex::new(Some(write_tx)),
             budget,
             write_error_slot,
-            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn dispose_resources(&self) {
+        self.finished.store(true, Ordering::Release);
+        if let Ok(mut write) = self.write_tx.lock() {
+            write.take();
+        }
+    }
+
+    fn release_live_counter(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            LIVE_UNI_SEND_HANDLES.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
 impl Drop for ClientUniSendHandle {
     fn drop(&mut self) {
-        LIVE_UNI_SEND_HANDLES.fetch_sub(1, Ordering::Relaxed);
+        self.release_live_counter();
     }
 }
 
@@ -582,9 +1153,13 @@ impl ClientUniSendHandle {
                 }
             }
         }
-        let Some(ref tx) = self.write_tx else {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
-        };
+        let tx = self
+            .write_tx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream write lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| napi::Error::from_reason("E_STREAM_RESET"))?;
         let bytes = chunk.to_vec();
         if bytes.is_empty() {
             return Ok(());
@@ -614,23 +1189,37 @@ impl ClientUniSendHandle {
     #[napi]
     pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
-        send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
+        let tx = self
+            .write_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        send_ctrl_lossless(&tx, StreamCmd::Reset(code));
         Ok(())
     }
 
     #[napi]
     pub fn finish(&self) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
-        send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
+        let tx = self
+            .write_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        send_ctrl_lossless(&tx, StreamCmd::Finish);
         Ok(())
     }
 
     #[napi]
     pub async fn finish_wait(&self) -> Result<()> {
         self.finished.store(true, Ordering::Release);
-        let Some(ref tx) = self.write_tx else {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
-        };
+        let tx = self
+            .write_tx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream write lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| napi::Error::from_reason("E_STREAM_RESET"))?;
         let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
         tx.send(StreamCmd::FinishWithAck(done_tx))
             .await
@@ -641,6 +1230,16 @@ impl ClientUniSendHandle {
             Err(_) => Err(napi::Error::from_reason("E_STREAM_RESET")),
         }
     }
+
+    /// Release transport channels and bridge ownership immediately. N-API
+    /// finalization may be delayed by the JS runtime, so stream wrappers call
+    /// this during deterministic teardown instead of relying on GC.
+    #[napi]
+    pub fn dispose(&self) -> WtResult<()> {
+        self.dispose_resources();
+        self.release_live_counter();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -649,9 +1248,16 @@ impl ClientUniSendHandle {
 
 #[napi]
 pub struct ClientUniRecvHandle {
-    read_rx: Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>,
+    read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     read_error_slot: Option<ReadErrorSlot>,
+    deferred_recv: Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
+    budget: Mutex<Option<StreamBudget>>,
+    deferred_budget: Mutex<Option<DeferredStreamBudgetConfig>>,
+    deferred_read_error_slot: Mutex<Option<ReadErrorSlot>>,
+    read_abort: Notify,
+    read_aborted: AtomicBool,
+    released: AtomicBool,
 }
 
 impl ClientUniRecvHandle {
@@ -660,9 +1266,16 @@ impl ClientUniRecvHandle {
     pub fn new(read_rx: mpsc::Receiver<StreamChunk>, stop_tx: oneshot::Sender<u32>) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot: None,
+            deferred_recv: Mutex::new(None),
+            budget: Mutex::new(None),
+            deferred_budget: Mutex::new(None),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -673,16 +1286,245 @@ impl ClientUniRecvHandle {
     ) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
-            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot,
+            deferred_recv: Mutex::new(None),
+            budget: Mutex::new(None),
+            deferred_budget: Mutex::new(None),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct an accepted server uni stream without starting its receive
+    /// bridge. The bridge starts only when the application calls `read()`.
+    pub fn new_deferred(
+        recv_stream: wtransport::RecvStream,
+        guard: StreamGuard,
+        budget: Option<DeferredStreamBudgetConfig>,
+    ) -> Self {
+        LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_rx: Mutex::new(None),
+            stop_tx: std::sync::Mutex::new(None),
+            read_error_slot: None,
+            deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            budget: Mutex::new(None),
+            deferred_budget: Mutex::new(budget),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Consume a deferred server receive stream to EOF without creating a
+    /// JavaScript stream bridge. See `ClientBidiStreamHandle::discard_incoming`.
+    pub async fn discard_incoming(
+        &mut self,
+        scratch: &mut [u8],
+    ) -> std::result::Result<(), String> {
+        let pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| "E_INTERNAL: deferred stream lock poisoned".to_string())?
+            .take();
+        let mut result = Ok(());
+        if let Some((recv_stream, _guard)) = pending {
+            result = discard_recv_stream(recv_stream, scratch).await;
+        }
+        self.dispose_resources();
+        self.release_live_counter();
+        result
+    }
+
+    /// Read a deferred receive stream without creating a bridge task or
+    /// channel. Accepted streams commonly deliver only one chunk before the
+    /// JS facade cancels them, so keeping the transport receive state deferred
+    /// avoids per-stream allocator churn while preserving repeated reads.
+    async fn read_deferred_direct(&self) -> Result<Option<Option<napi::bindgen_prelude::Buffer>>> {
+        let pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+            .take();
+        let Some((mut recv_stream, guard)) = pending else {
+            return Ok(None);
+        };
+        if self.read_aborted.load(Ordering::Acquire) {
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+
+        let notified = self.read_abort.notified();
+        tokio::pin!(notified);
+        let mut buf = [0u8; STREAM_READ_BUFFER_BYTES];
+        let result = tokio::select! {
+            value = recv_stream.read(&mut buf) => value,
+            _ = &mut notified => {
+                recv_stream.stop(0);
+                drop(guard);
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+        };
+        let read_result = match result {
+            Ok(value) => value,
+            Err(error) => {
+                drop(guard);
+                return Err(wt_from_reason(read_error_code(&error)));
+            }
+        };
+        let Some(n) = read_result else {
+            drop(guard);
+            return Ok(Some(None));
+        };
+        let budget = {
+            let mut budget_guard = self
+                .budget
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?;
+            if let Some(existing) = budget_guard.as_ref() {
+                Some(existing.clone())
+            } else {
+                let materialized = self
+                    .deferred_budget
+                    .lock()
+                    .map_err(|_| {
+                        napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned")
+                    })?
+                    .take()
+                    .map(DeferredStreamBudgetConfig::materialize);
+                if let Some(ref value) = materialized {
+                    *budget_guard = Some(value.clone());
+                }
+                materialized
+            }
+        };
+        if let Some(ref b) = budget {
+            if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
+                recv_stream.stop(0);
+                drop(guard);
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+            if !b.reserve_or_wait(n as u64).await {
+                recv_stream.stop(0);
+                drop(guard);
+                return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
+            }
+        }
+        if self.read_aborted.load(Ordering::Acquire) {
+            if let Some(ref b) = budget {
+                b.release(n as u64);
+            }
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        let chunk = StreamChunk::new(buf[..n].to_vec(), budget, n as u64);
+        let value = chunk.take().into();
+        let mut deferred = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?;
+        if self.read_aborted.load(Ordering::Acquire) {
+            recv_stream.stop(0);
+            drop(guard);
+        } else {
+            *deferred = Some((recv_stream, guard));
+        }
+        Ok(Some(Some(value)))
+    }
+
+    fn dispose_resources(&self) {
+        self.read_aborted.store(true, Ordering::Release);
+        self.read_abort.notify_waiters();
+        if let Ok(mut stop) = self.stop_tx.lock() {
+            if let Some(tx) = stop.take() {
+                let _ = tx.send(0);
+            }
+        }
+        if let Ok(mut read) = self.read_rx.lock() {
+            read.take();
+        }
+        if let Ok(mut deferred) = self.deferred_recv.lock() {
+            deferred.take();
+        }
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.take();
+        }
+        if let Ok(mut budget) = self.deferred_budget.lock() {
+            budget.take();
+        }
+    }
+
+    async fn ensure_deferred_read_bridge(&self) -> Result<()> {
+        let has_pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+            .is_some();
+        if !has_pending {
+            return Ok(());
+        }
+
+        let permit =
+            acquire_deferred_read_bridge_permit(&self.read_abort, &self.read_aborted).await?;
+        let pending = self
+            .deferred_recv
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+            .take();
+        let Some((recv_stream, guard)) = pending else {
+            drop(permit);
+            return Ok(());
+        };
+        let budget = self
+            .deferred_budget
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
+            .take()
+            .map(DeferredStreamBudgetConfig::materialize);
+        let (read_rx, stop_tx, read_error_slot) = spawn_uni_recv_bridge_on_with_permit(
+            &RUNTIME,
+            recv_stream,
+            Some(guard),
+            budget,
+            Some(permit),
+        );
+        self.read_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+            .replace(Arc::new(TokioMutex::new(read_rx)));
+        self.stop_tx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream stop lock poisoned"))?
+            .replace(stop_tx);
+        self.deferred_read_error_slot
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred error lock poisoned"))?
+            .replace(read_error_slot.expect("receive bridge always has an error slot"));
+        Ok(())
+    }
+
+    /// Read one ordered load/evidence uni probe without creating a JS wrapper.
+    pub(crate) async fn read_native_probe(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
+        Ok(self.read_deferred_direct().await?.flatten())
+    }
+
+    fn release_live_counter(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            LIVE_UNI_RECV_HANDLES.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
 impl Drop for ClientUniRecvHandle {
     fn drop(&mut self) {
-        LIVE_UNI_RECV_HANDLES.fetch_sub(1, Ordering::Relaxed);
+        self.release_live_counter();
     }
 }
 
@@ -690,27 +1532,55 @@ impl Drop for ClientUniRecvHandle {
 impl ClientUniRecvHandle {
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        let read_rx = Arc::clone(&self.read_rx);
+        if let Some(result) = self.read_deferred_direct().await? {
+            return Ok(result);
+        }
+        self.ensure_deferred_read_bridge().await?;
+        let read_rx = self
+            .read_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
         let mut rx = read_rx.lock().await;
-        match rx.recv().await {
+        let read_abort = self.read_abort.notified();
+        tokio::pin!(read_abort);
+        if self.read_aborted.load(Ordering::Acquire) {
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        let result = match tokio::select! {
+            value = rx.recv() => value,
+            _ = &mut read_abort => {
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+        } {
             // `chunk.take()` moves the payload out; the reservation is released
             // when the chunk drops at the end of this scope (see StreamChunk).
-            Some(chunk) => Ok(Some(chunk.take().into())),
+            Some(chunk) => Some(chunk.take().into()),
             None => {
-                if let Some(ref slot) = self.read_error_slot {
+                let deferred_slot = self
+                    .deferred_read_error_slot
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
                         if let Some(ref code) = *guard {
                             return Err(napi::Error::from_reason(code.clone()));
                         }
                     }
                 }
-                Ok(None)
+                None
             }
-        }
+        };
+        Ok(result)
     }
 
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
+        self.read_aborted.store(true, Ordering::Release);
+        self.read_abort.notify_waiters();
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
                 if tx.send(code).is_err() {
@@ -718,6 +1588,21 @@ impl ClientUniRecvHandle {
                 }
             }
         }
+        if let Ok(mut deferred) = self.deferred_recv.lock() {
+            if let Some((recv_stream, _guard)) = deferred.take() {
+                recv_stream.stop(code);
+            }
+        }
+        Ok(())
+    }
+
+    /// Release transport channels and bridge ownership immediately. N-API
+    /// finalization may be delayed by the JS runtime, so stream wrappers call
+    /// this during deterministic teardown instead of relying on GC.
+    #[napi]
+    pub fn dispose(&self) -> WtResult<()> {
+        self.dispose_resources();
+        self.release_live_counter();
         Ok(())
     }
 }
@@ -736,6 +1621,16 @@ pub fn spawn_bidi_bridge(
     budget: Option<StreamBudget>,
 ) -> BidiBridgeParts {
     spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
+}
+
+async fn finish_send_stream(
+    send_stream: &mut wtransport::SendStream,
+) -> std::result::Result<(), &'static str> {
+    match send_stream.finish().await {
+        Ok(()) => Ok(()),
+        Err(StreamWriteError::Stopped(_)) => Err("E_STOP_SENDING"),
+        Err(_) => Err("E_STREAM_RESET"),
+    }
 }
 
 fn spawn_bidi_write_bridge_on(
@@ -764,11 +1659,7 @@ fn spawn_bidi_write_bridge_on(
                     }
                 },
                 StreamCmd::Finish => {
-                    if let Err(e) = send_stream.finish().await {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                    if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code.to_string());
@@ -779,11 +1670,7 @@ fn spawn_bidi_write_bridge_on(
                 }
                 StreamCmd::FinishWithAck(done_tx) => {
                     let mut ret: std::result::Result<(), String> = Ok(());
-                    if let Err(e) = send_stream.finish().await {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                    if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code.to_string());
@@ -820,7 +1707,7 @@ pub fn spawn_lazy_bidi_bridge(
 pub fn spawn_lazy_bidi_bridge_on(
     rt: &tokio::runtime::Runtime,
     send_stream: wtransport::SendStream,
-    mut recv_stream: wtransport::RecvStream,
+    recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> (
@@ -829,12 +1716,36 @@ pub fn spawn_lazy_bidi_bridge_on(
     wtransport::SendStream,
     Option<ReadErrorSlot>,
 ) {
+    let (read_rx, stop_tx, read_error_slot) = spawn_recv_bridge_on(rt, recv_stream, guard, budget);
+    (read_rx, stop_tx, send_stream, read_error_slot)
+}
+
+/// Spawn only the receive half of a stream bridge. Accepted server streams use
+/// this from a deferred handle so an application that never calls `read()`
+/// does not allocate a Tokio task, channel, or scratch buffer for every stream.
+fn spawn_recv_bridge_on(
+    rt: &tokio::runtime::Runtime,
+    mut recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
+    budget: Option<StreamBudget>,
+) -> ReadBridgeParts {
+    spawn_recv_bridge_on_with_permit(rt, recv_stream, guard, budget, None)
+}
+
+fn spawn_recv_bridge_on_with_permit(
+    rt: &tokio::runtime::Runtime,
+    mut recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
+    budget: Option<StreamBudget>,
+    bridge_permit: Option<OwnedSemaphorePermit>,
+) -> ReadBridgeParts {
     let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
     let read_budget = budget;
     let read_error_slot_clone = Arc::clone(&read_error_slot);
     rt.spawn(async move {
+        let _bridge_permit = bridge_permit;
         let _guard = guard;
         let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;
@@ -902,7 +1813,7 @@ pub fn spawn_lazy_bidi_bridge_on(
             }
         }
     });
-    (read_rx, stop_tx, send_stream, Some(read_error_slot))
+    (read_rx, stop_tx, Some(read_error_slot))
 }
 
 /// Spawn bridge on a specific runtime (use CLIENT_RUNTIME for client streams).
@@ -1031,11 +1942,7 @@ pub fn spawn_bidi_bridge_on(
                     }
                 }
                 StreamCmd::Finish => {
-                    if let Err(e) = send_stream.finish().await {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                    if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code.to_string());
@@ -1046,11 +1953,7 @@ pub fn spawn_bidi_bridge_on(
                 }
                 StreamCmd::FinishWithAck(done_tx) => {
                     let mut ret: std::result::Result<(), String> = Ok(());
-                    if let Err(e) = send_stream.finish().await {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                    if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code.to_string());
@@ -1124,11 +2027,7 @@ pub fn spawn_uni_send_bridge_on(
                     }
                 }
                 StreamCmd::Finish => {
-                    if let Err(e) = send_stream.finish().await {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                    if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code.to_string());
@@ -1139,11 +2038,7 @@ pub fn spawn_uni_send_bridge_on(
                 }
                 StreamCmd::FinishWithAck(done_tx) => {
                     let mut ret: std::result::Result<(), String> = Ok(());
-                    if let Err(e) = send_stream.finish().await {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                    if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code.to_string());
@@ -1188,12 +2083,27 @@ pub fn spawn_uni_recv_bridge_on(
     oneshot::Sender<u32>,
     Option<ReadErrorSlot>,
 ) {
+    spawn_uni_recv_bridge_on_with_permit(rt, recv_stream, guard, budget, None)
+}
+
+fn spawn_uni_recv_bridge_on_with_permit(
+    rt: &tokio::runtime::Runtime,
+    mut recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
+    budget: Option<StreamBudget>,
+    bridge_permit: Option<OwnedSemaphorePermit>,
+) -> (
+    mpsc::Receiver<StreamChunk>,
+    oneshot::Sender<u32>,
+    Option<ReadErrorSlot>,
+) {
     let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
 
     let read_error_slot_clone = Arc::clone(&read_error_slot);
     rt.spawn(async move {
+        let _bridge_permit = bridge_permit;
         let _guard = guard;
         let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;

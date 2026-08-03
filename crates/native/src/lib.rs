@@ -319,6 +319,19 @@ pub fn runtime_worker_count() -> u32 {
     .unwrap_or(0)
 }
 
+/// Read process-wide native stream-handle ownership without retaining a
+/// ServerHandle. The release harness uses this after dropping JS server
+/// closures so finalizer timing cannot make the post-close sample stale.
+#[napi]
+pub fn native_stream_handles_snapshot() -> metrics::NativeStreamHandlesSnapshot {
+    let (bidi, uni_send, uni_recv) = client_stream::live_native_stream_handles();
+    metrics::NativeStreamHandlesSnapshot {
+        bidi_handles_live: bidi as u32,
+        uni_send_handles_live: uni_send as u32,
+        uni_recv_handles_live: uni_recv as u32,
+    }
+}
+
 /// Controls whether panic diagnostics include full panic payloads.
 /// Default is false (redacted/minimal). Enable only for local debugging.
 #[napi]
@@ -822,6 +835,8 @@ pub(crate) fn spawn_wtransport_server(
                                         let peer_ip_bidi = peer_ip.clone();
                                         let rl_bidi = rate_limits.clone();
                                         let stream_capacity_notify_bidi = stream_capacity_notify.clone();
+                                        let bidi_discard = session_registry::bidi_discard_state(&id)
+                                            .expect("session discard state must exist");
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             owner_server_id,
@@ -848,34 +863,56 @@ pub(crate) fn spawn_wtransport_server(
                                                                 let _ = send.reset(0);
                                                                 continue;
                                                             }
+                                                            if bidi_discard.is_enabled() {
+                                                                m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
+                                                                sm_bidi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
+                                                                let guard = crate::client_stream::StreamGuard::server(
+                                                                    Arc::clone(&m_bidi),
+                                                                    Arc::clone(&sm_bidi),
+                                                                    true,
+                                                                    stream_capacity_notify_bidi.clone(),
+                                                                );
+                                                                let result = tokio::select! {
+                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
+                                                                    _ = conn_bidi.closed() => Err("E_SESSION_CLOSED".to_string()),
+                                                                };
+                                                                drop(send);
+                                                                bidi_discard.record_direct(result);
+                                                                drop(guard);
+                                                                continue;
+                                                            }
                                                             m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
                                                             sm_bidi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
-                                                            let guard_m = Arc::clone(&m_bidi);
-                                                            let guard_sm = Arc::clone(&sm_bidi);
-                                                            let notify = stream_capacity_notify_bidi.clone();
-                                                            let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
-                                                                if let Some(ref n) = notify {
-                                                                    n.notify_waiters();
+                                                            let guard = crate::client_stream::StreamGuard::server(
+                                                                Arc::clone(&m_bidi),
+                                                                Arc::clone(&sm_bidi),
+                                                                true,
+                                                                stream_capacity_notify_bidi.clone(),
+                                                            );
+                                                            let budget = crate::client_stream::DeferredStreamBudgetConfig::new(
+                                                                Arc::clone(&m_bidi),
+                                                                Arc::clone(&sm_bidi),
+                                                                lim_bidi.max_queued_bytes_global,
+                                                                lim_bidi.max_queued_bytes_per_session,
+                                                                lim_bidi.max_queued_bytes_per_stream,
+                                                                lim_bidi.backpressure_timeout_ms,
+                                                            );
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_deferred(
+                                                                recv,
+                                                                send,
+                                                                guard,
+                                                                Some(budget),
+                                                            );
+                                                            let send_handle = bidi_accept_tx.send(Box::new(handle));
+                                                            tokio::pin!(send_handle);
+                                                            tokio::select! {
+                                                                result = &mut send_handle => {
+                                                                    if result.is_err() {
+                                                                        report_channel_closed("bidi accept");
+                                                                        break;
+                                                                    }
                                                                 }
-                                                            });
-                                                            let stream_queued = Arc::new(AtomicU64::new(0));
-                                                            let budget = crate::client_stream::StreamBudget {
-                                                                server_metrics: Arc::clone(&m_bidi),
-                                                                session_metrics: Arc::clone(&sm_bidi),
-                                                                stream_queued: Arc::clone(&stream_queued),
-                                                                max_global: lim_bidi.max_queued_bytes_global,
-                                                                max_session: lim_bidi.max_queued_bytes_per_session,
-                                                                max_stream: lim_bidi.max_queued_bytes_per_stream,
-                                                                capacity_notify: crate::client_stream::StreamBudget::new_notify(),
-                                                                backpressure_timeout_ms: lim_bidi.backpressure_timeout_ms,
-                                                            };
-                                                            let (read_rx, stop_tx, send_stream, read_err_slot) = crate::client_stream::spawn_lazy_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_lazy_with_budget_and_slot(read_rx, send_stream, stop_tx, Some(budget), read_err_slot);
-                                                            if bidi_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_closed("bidi accept");
-                                                                break;
+                                                                _ = conn_bidi.closed() => break,
                                                             }
                                                         }
                                                     }
@@ -886,6 +923,8 @@ pub(crate) fn spawn_wtransport_server(
                                         let peer_ip_uni = peer_ip.clone();
                                         let rl_uni = rate_limits.clone();
                                         let stream_capacity_notify_uni = stream_capacity_notify.clone();
+                                        let uni_discard = session_registry::uni_discard_state(&id)
+                                            .expect("session discard state must exist");
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             owner_server_id,
@@ -912,34 +951,54 @@ pub(crate) fn spawn_wtransport_server(
                                                                 recv.stop(0);
                                                                 continue;
                                                             }
+                                                            if uni_discard.is_enabled() {
+                                                                m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                                                                sm_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
+                                                                let guard = crate::client_stream::StreamGuard::server(
+                                                                    Arc::clone(&m_uni),
+                                                                    Arc::clone(&sm_uni),
+                                                                    false,
+                                                                    stream_capacity_notify_uni.clone(),
+                                                                );
+                                                                let result = tokio::select! {
+                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
+                                                                    _ = conn_uni.closed() => Err("E_SESSION_CLOSED".to_string()),
+                                                                };
+                                                                uni_discard.record_direct(result);
+                                                                drop(guard);
+                                                                continue;
+                                                            }
                                                             m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
                                                             sm_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
-                                                            let guard_m = Arc::clone(&m_uni);
-                                                            let guard_sm = Arc::clone(&sm_uni);
-                                                            let notify = stream_capacity_notify_uni.clone();
-                                                            let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
-                                                                if let Some(ref n) = notify {
-                                                                    n.notify_waiters();
+                                                            let guard = crate::client_stream::StreamGuard::server(
+                                                                Arc::clone(&m_uni),
+                                                                Arc::clone(&sm_uni),
+                                                                false,
+                                                                stream_capacity_notify_uni.clone(),
+                                                            );
+                                                            let budget = crate::client_stream::DeferredStreamBudgetConfig::new(
+                                                                Arc::clone(&m_uni),
+                                                                Arc::clone(&sm_uni),
+                                                                lim_uni.max_queued_bytes_global,
+                                                                lim_uni.max_queued_bytes_per_session,
+                                                                lim_uni.max_queued_bytes_per_stream,
+                                                                lim_uni.backpressure_timeout_ms,
+                                                            );
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_deferred(
+                                                                recv,
+                                                                guard,
+                                                                Some(budget),
+                                                            );
+                                                            let send_handle = uni_accept_tx.send(Box::new(handle));
+                                                            tokio::pin!(send_handle);
+                                                            tokio::select! {
+                                                                result = &mut send_handle => {
+                                                                    if result.is_err() {
+                                                                        report_channel_closed("uni accept");
+                                                                        break;
+                                                                    }
                                                                 }
-                                                            });
-                                                            let stream_queued = Arc::new(AtomicU64::new(0));
-                                                            let budget = crate::client_stream::StreamBudget {
-                                                                server_metrics: Arc::clone(&m_uni),
-                                                                session_metrics: Arc::clone(&sm_uni),
-                                                                stream_queued: Arc::clone(&stream_queued),
-                                                                max_global: lim_uni.max_queued_bytes_global,
-                                                                max_session: lim_uni.max_queued_bytes_per_session,
-                                                                max_stream: lim_uni.max_queued_bytes_per_stream,
-                                                                capacity_notify: crate::client_stream::StreamBudget::new_notify(),
-                                                                backpressure_timeout_ms: lim_uni.backpressure_timeout_ms,
-                                                            };
-                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget));
-                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_slot(read_rx, stop_tx, read_err_slot);
-                                                            if uni_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_closed("uni accept");
-                                                                break;
+                                                                _ = conn_uni.closed() => break,
                                                             }
                                                         }
                                                     }
@@ -979,16 +1038,12 @@ pub(crate) fn spawn_wtransport_server(
                                                             Ok((send, recv)) => {
                                                                 m_create_bi.streams_active.fetch_add(1, Ordering::Relaxed);
                                                                 sm_create_bi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
-                                                                let guard_m = Arc::clone(&m_create_bi);
-                                                                let guard_sm = Arc::clone(&sm_create_bi);
-                                                                let notify = stream_capacity_notify_create_bi.clone();
-                                                                let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                    guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                    guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
-                                                                    if let Some(ref n) = notify {
-                                                                        n.notify_waiters();
-                                                                    }
-                                                                });
+                                                                let guard = crate::client_stream::StreamGuard::server(
+                                                                    Arc::clone(&m_create_bi),
+                                                                    Arc::clone(&sm_create_bi),
+                                                                    true,
+                                                                    stream_capacity_notify_create_bi.clone(),
+                                                                );
                                                                 let stream_queued = Arc::new(AtomicU64::new(0));
                                                                 let budget = crate::client_stream::StreamBudget {
                                                                     server_metrics: Arc::clone(&m_create_bi),
@@ -1054,16 +1109,12 @@ pub(crate) fn spawn_wtransport_server(
                                                                 Ok(send) => {
                                                                     m_create_uni.streams_active.fetch_add(1, Ordering::Relaxed);
                                                                     sm_create_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
-                                                                    let guard_m = Arc::clone(&m_create_uni);
-                                                                    let guard_sm = Arc::clone(&sm_create_uni);
-                                                                    let notify = stream_capacity_notify_create_uni.clone();
-                                                                    let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                        guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                        guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
-                                                                        if let Some(ref n) = notify {
-                                                                            n.notify_waiters();
-                                                                        }
-                                                                    });
+                                                                    let guard = crate::client_stream::StreamGuard::server(
+                                                                        Arc::clone(&m_create_uni),
+                                                                        Arc::clone(&sm_create_uni),
+                                                                        false,
+                                                                        stream_capacity_notify_create_uni.clone(),
+                                                                    );
                                                                     let stream_queued = Arc::new(AtomicU64::new(0));
                                                                     let budget = crate::client_stream::StreamBudget {
                                                                         server_metrics: Arc::clone(&m_create_uni),

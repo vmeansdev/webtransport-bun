@@ -6,7 +6,7 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::Instant;
 use wtransport::Connection;
@@ -214,6 +214,100 @@ impl DatagramSlot {
 const DGRAM_CHANNEL_CAPACITY: usize = 2048;
 const STREAM_ACCEPT_CAPACITY: usize = 256;
 
+/// Shared result state for one native black-hole stream drain direction.
+///
+/// Keep the completion counter, first error, and waiter notification in one
+/// allocation. The accept loop and the N-API waiter both clone the enclosing
+/// state for every session; splitting these fields into separate `Arc`s made
+/// short-lived load streams needlessly fragment the process allocator.
+struct StreamDiscardShared {
+    completed: AtomicU64,
+    error: StdMutex<Option<String>>,
+    notify: Notify,
+}
+
+/// Native black-hole stream state used by bounded load/evidence drains.
+///
+/// Enabling this state lets the QUIC accept loop consume future streams
+/// directly instead of allocating a N-API handle and an accept-queue entry for
+/// every stream. The state is session-owned and disappears with the registry
+/// entry; it is not part of the public WebTransport API.
+#[derive(Clone)]
+pub struct StreamDiscardState {
+    enabled: Arc<AtomicBool>,
+    shared: Arc<StreamDiscardShared>,
+    closed: Arc<AtomicBool>,
+}
+
+impl StreamDiscardState {
+    fn new(closed: Arc<AtomicBool>) -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(false)),
+            shared: Arc::new(StreamDiscardShared {
+                completed: AtomicU64::new(0),
+                error: StdMutex::new(None),
+                notify: Notify::new(),
+            }),
+            closed,
+        }
+    }
+
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::Release);
+        self.shared.notify.notify_waiters();
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub fn completed(&self) -> u64 {
+        self.shared.completed.load(Ordering::Acquire)
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.shared.error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn record(&self, result: std::result::Result<(), String>) {
+        self.record_inner(result, true);
+    }
+
+    /// Record a stream consumed by the native accept loop without waking a
+    /// parked N-API drain task for every stream. Direct discard callers read
+    /// the cumulative counter at their bounded deadline; wrapper drains still
+    /// use `record` so their queued-handle waiter remains responsive.
+    pub fn record_direct(&self, result: std::result::Result<(), String>) {
+        self.record_inner(result, false);
+    }
+
+    fn record_inner(&self, result: std::result::Result<(), String>, notify: bool) {
+        match result {
+            Ok(()) => {
+                self.shared.completed.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(error) => {
+                if let Ok(mut slot) = self.shared.error.lock() {
+                    if slot.is_none() {
+                        *slot = Some(error);
+                    }
+                }
+            }
+        }
+        if notify {
+            self.shared.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn wake(&self) {
+        self.shared.notify.notify_waiters();
+    }
+}
+
 /// Request to create a bidi stream. Response via oneshot.
 pub type CreateBiReq = oneshot::Sender<std::result::Result<ClientBidiStreamHandle, String>>;
 /// Request to create a uni stream. Response via oneshot.
@@ -232,9 +326,9 @@ pub struct SessionState {
     /// Per-session metrics for stream caps and metricsSnapshot.
     pub session_metrics: Arc<SessionMetrics>,
     /// Receiver for accepted bidi streams (forwarded from accept loop).
-    pub bidi_accept_rx: Arc<Mutex<mpsc::Receiver<ClientBidiStreamHandle>>>,
+    pub bidi_accept_rx: Arc<Mutex<mpsc::Receiver<Box<ClientBidiStreamHandle>>>>,
     /// Receiver for accepted uni streams.
-    pub uni_accept_rx: Arc<Mutex<mpsc::Receiver<ClientUniRecvHandle>>>,
+    pub uni_accept_rx: Arc<Mutex<mpsc::Receiver<Box<ClientUniRecvHandle>>>>,
     /// Sender for create-bidi requests.
     pub create_bi_tx: mpsc::Sender<CreateBiReq>,
     /// Sender for create-uni requests.
@@ -245,6 +339,10 @@ pub struct SessionState {
     pub datagram_capacity_notify: Arc<Notify>,
     /// Sticky lifecycle state closes the lost-wake window around registry removal.
     pub datagram_lifecycle_closed: Arc<AtomicBool>,
+    /// Native-only direct-consume state for accepted bidi streams.
+    pub bidi_discard: StreamDiscardState,
+    /// Native-only direct-consume state for accepted uni streams.
+    pub uni_discard: StreamDiscardState,
     /// Effective limits for this session (captured from owning server).
     pub limits: crate::limits::Limits,
     /// Whether the session request arrived as 0-RTT early data (replayable).
@@ -281,8 +379,8 @@ pub fn insert(
     is_0rtt: bool,
 ) -> (
     mpsc::Sender<DatagramSlot>,
-    mpsc::Sender<ClientBidiStreamHandle>,
-    mpsc::Sender<ClientUniRecvHandle>,
+    mpsc::Sender<Box<ClientBidiStreamHandle>>,
+    mpsc::Sender<Box<ClientUniRecvHandle>>,
     mpsc::Receiver<CreateBiReq>,
     mpsc::Receiver<CreateUniReq>,
     Arc<SessionMetrics>,
@@ -297,6 +395,8 @@ pub fn insert(
     let stream_capacity_notify = Arc::new(Notify::new());
     let datagram_capacity_notify = Arc::new(Notify::new());
     let datagram_lifecycle_closed = Arc::new(AtomicBool::new(false));
+    let bidi_discard = StreamDiscardState::new(Arc::clone(&datagram_lifecycle_closed));
+    let uni_discard = StreamDiscardState::new(Arc::clone(&datagram_lifecycle_closed));
     let state = SessionState {
         owner_server_id,
         conn,
@@ -310,6 +410,8 @@ pub fn insert(
         stream_capacity_notify,
         datagram_capacity_notify: Arc::clone(&datagram_capacity_notify),
         datagram_lifecycle_closed,
+        bidi_discard,
+        uni_discard,
         limits,
         is_0rtt,
         handshake_confirmed: Arc::new(AtomicBool::new(!is_0rtt)),
@@ -337,6 +439,32 @@ pub fn get_stream_capacity_notify(session_id: &str) -> Option<Arc<Notify>> {
     REGISTRY
         .get(session_id)
         .map(|entry| Arc::clone(&entry.stream_capacity_notify))
+}
+
+pub fn enable_bidi_discard(session_id: &str) -> Option<StreamDiscardState> {
+    REGISTRY.get(session_id).map(|entry| {
+        entry.bidi_discard.enable();
+        entry.bidi_discard.clone()
+    })
+}
+
+pub fn bidi_discard_state(session_id: &str) -> Option<StreamDiscardState> {
+    REGISTRY
+        .get(session_id)
+        .map(|entry| entry.bidi_discard.clone())
+}
+
+pub fn enable_uni_discard(session_id: &str) -> Option<StreamDiscardState> {
+    REGISTRY.get(session_id).map(|entry| {
+        entry.uni_discard.enable();
+        entry.uni_discard.clone()
+    })
+}
+
+pub fn uni_discard_state(session_id: &str) -> Option<StreamDiscardState> {
+    REGISTRY
+        .get(session_id)
+        .map(|entry| entry.uni_discard.clone())
 }
 
 #[allow(clippy::type_complexity)]
@@ -374,8 +502,8 @@ pub fn get(
     Connection,
     Arc<Mutex<mpsc::Receiver<DatagramSlot>>>,
     Arc<ServerMetrics>,
-    Arc<Mutex<mpsc::Receiver<ClientBidiStreamHandle>>>,
-    Arc<Mutex<mpsc::Receiver<ClientUniRecvHandle>>>,
+    Arc<Mutex<mpsc::Receiver<Box<ClientBidiStreamHandle>>>>,
+    Arc<Mutex<mpsc::Receiver<Box<ClientUniRecvHandle>>>>,
     mpsc::Sender<CreateBiReq>,
     mpsc::Sender<CreateUniReq>,
 )> {
@@ -388,6 +516,27 @@ pub fn get(
             Arc::clone(&entry.uni_accept_rx),
             entry.create_bi_tx.clone(),
             entry.create_uni_tx.clone(),
+        )
+    })
+}
+
+/// Return the accepted-stream queues plus the close signal used to interrupt
+/// a JS accept pull that is parked while the session is being removed.
+#[allow(clippy::type_complexity)]
+pub fn get_stream_accept_state(
+    session_id: &str,
+) -> Option<(
+    Arc<Mutex<mpsc::Receiver<Box<ClientBidiStreamHandle>>>>,
+    Arc<Mutex<mpsc::Receiver<Box<ClientUniRecvHandle>>>>,
+    Arc<AtomicBool>,
+    Arc<Notify>,
+)> {
+    REGISTRY.get(session_id).map(|entry| {
+        (
+            Arc::clone(&entry.bidi_accept_rx),
+            Arc::clone(&entry.uni_accept_rx),
+            Arc::clone(&entry.datagram_lifecycle_closed),
+            Arc::clone(&entry.datagram_capacity_notify),
         )
     })
 }
@@ -500,6 +649,8 @@ fn mark_state_closed_and_notify(state: &SessionState) {
     state.stream_capacity_notify.notify_waiters();
     state.datagram_capacity_notify.notify_waiters();
     state.metrics.datagram_capacity_notify.notify_waiters();
+    state.bidi_discard.wake();
+    state.uni_discard.wake();
 }
 
 #[cfg(test)]
