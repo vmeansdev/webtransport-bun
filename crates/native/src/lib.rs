@@ -191,6 +191,46 @@ pub(crate) fn report_channel_failure(context: &str) {
     eprintln!("webtransport-native: {} channel delivery failed", context);
 }
 
+/// How many accepted streams may be black-hole drained at once, per session
+/// and direction. Draining inline in the accept loop lets one stalled peer
+/// stream block acceptance of every stream behind it, so each drain runs as its
+/// own tracked task; this bound keeps the number of streams actively reading
+/// (and holding quinn chunk buffers) small. Streams past the bound sit idle and
+/// apply QUIC backpressure until a permit frees up. Task count itself is
+/// already bounded by the per-session and global stream caps checked before the
+/// spawn.
+const DISCARD_DRAIN_CONCURRENCY: usize = 16;
+
+/// Wall-clock bound for one black-hole drain once it holds a permit. The N-API
+/// caller only polls the cumulative completion counter against its own
+/// deadline, so nothing else would ever release the permit held by a peer that
+/// opens a stream and then stops sending. On expiry the receive stream is
+/// dropped, which makes quinn send STOP_SENDING, and the stream is left
+/// uncounted — the existing "discarded but incomplete" outcome.
+const DISCARD_DRAIN_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run one black-hole drain under the concurrency bound and a per-stream
+/// deadline. Kept separate from the accept loops so the permit and timeout
+/// behaviour is testable without a live QUIC session.
+async fn run_bounded_discard<F>(
+    permits: Arc<tokio::sync::Semaphore>,
+    discard: session_registry::StreamDiscardState,
+    timeout: std::time::Duration,
+    drain: F,
+) where
+    F: std::future::Future<Output = std::result::Result<(), String>>,
+{
+    let Ok(_permit) = permits.acquire().await else {
+        return;
+    };
+    // Start the deadline once the permit is held: a stream should not be
+    // charged for the time it spent queued behind other drains.
+    let deadline = tokio::time::Instant::now() + timeout;
+    if let Ok(result) = tokio::time::timeout_at(deadline, drain).await {
+        discard.record_direct(result);
+    }
+}
+
 pub(crate) fn report_channel_closed(context: &str) {
     #[cfg(test)]
     {
@@ -846,6 +886,9 @@ pub(crate) fn spawn_wtransport_server(
                                         else {
                                             return;
                                         };
+                                        let discard_permits_bidi =
+                                            Arc::new(tokio::sync::Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+                                        let discard_id_bidi = id.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             owner_server_id,
@@ -881,13 +924,31 @@ pub(crate) fn spawn_wtransport_server(
                                                                     true,
                                                                     stream_capacity_notify_bidi.clone(),
                                                                 );
-                                                                let result = tokio::select! {
-                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
-                                                                    _ = conn_bidi.closed() => Err("E_SESSION_CLOSED".to_string()),
-                                                                };
-                                                                drop(send);
-                                                                bidi_discard.record_direct(result);
-                                                                drop(guard);
+                                                                let discard = bidi_discard.clone();
+                                                                let permits = Arc::clone(&discard_permits_bidi);
+                                                                let conn = conn_bidi.clone();
+                                                                spawn_tracked::spawn_tracked(
+                                                                    Arc::clone(&m_bidi),
+                                                                    owner_server_id,
+                                                                    spawn_tracked::TaskKind::Stream,
+                                                                    panic_guard::PanicScope::Session(discard_id_bidi.clone()),
+                                                                    async move {
+                                                                        run_bounded_discard(
+                                                                            permits,
+                                                                            discard,
+                                                                            DISCARD_DRAIN_STREAM_TIMEOUT,
+                                                                            async {
+                                                                                tokio::select! {
+                                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
+                                                                                    _ = conn.closed() => Err("E_SESSION_CLOSED".to_string()),
+                                                                                }
+                                                                            },
+                                                                        )
+                                                                        .await;
+                                                                        drop(send);
+                                                                        drop(guard);
+                                                                    },
+                                                                );
                                                                 continue;
                                                             }
                                                             m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
@@ -937,6 +998,9 @@ pub(crate) fn spawn_wtransport_server(
                                         else {
                                             return;
                                         };
+                                        let discard_permits_uni =
+                                            Arc::new(tokio::sync::Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+                                        let discard_id_uni = id.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             owner_server_id,
@@ -972,12 +1036,30 @@ pub(crate) fn spawn_wtransport_server(
                                                                     false,
                                                                     stream_capacity_notify_uni.clone(),
                                                                 );
-                                                                let result = tokio::select! {
-                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
-                                                                    _ = conn_uni.closed() => Err("E_SESSION_CLOSED".to_string()),
-                                                                };
-                                                                uni_discard.record_direct(result);
-                                                                drop(guard);
+                                                                let discard = uni_discard.clone();
+                                                                let permits = Arc::clone(&discard_permits_uni);
+                                                                let conn = conn_uni.clone();
+                                                                spawn_tracked::spawn_tracked(
+                                                                    Arc::clone(&m_uni),
+                                                                    owner_server_id,
+                                                                    spawn_tracked::TaskKind::Stream,
+                                                                    panic_guard::PanicScope::Session(discard_id_uni.clone()),
+                                                                    async move {
+                                                                        run_bounded_discard(
+                                                                            permits,
+                                                                            discard,
+                                                                            DISCARD_DRAIN_STREAM_TIMEOUT,
+                                                                            async {
+                                                                                tokio::select! {
+                                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
+                                                                                    _ = conn.closed() => Err("E_SESSION_CLOSED".to_string()),
+                                                                                }
+                                                                            },
+                                                                        )
+                                                                        .await;
+                                                                        drop(guard);
+                                                                    },
+                                                                );
                                                                 continue;
                                                             }
                                                             m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
@@ -1317,7 +1399,12 @@ pub(crate) fn spawn_wtransport_server(
 mod tests {
     use super::{report_channel_failure, send_startup_result, CHANNEL_DELIVERY_FAILURE_COUNT};
     use super::{report_tsfn_status, TSFN_DELIVERY_FAILURE_COUNT};
+    use super::{run_bounded_discard, DISCARD_DRAIN_CONCURRENCY};
+    use crate::session_registry::StreamDiscardState;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn report_tsfn_status_counts_failures_only() {
@@ -1346,5 +1433,82 @@ mod tests {
         send_startup_result(&mut opt, Err("boom".to_string()));
         assert!(opt.is_none());
         assert_eq!(CHANNEL_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 1);
+    }
+
+    // A stream that never finishes draining must not hold up the streams
+    // accepted after it: that was the head-of-line stall in the inline drain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_discard_stall_does_not_block_other_streams() {
+        let permits = Arc::new(Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+        let discard = StreamDiscardState::for_test();
+
+        let stalled = tokio::spawn(run_bounded_discard(
+            Arc::clone(&permits),
+            discard.clone(),
+            Duration::from_secs(60),
+            std::future::pending(),
+        ));
+
+        for _ in 0..8 {
+            run_bounded_discard(
+                Arc::clone(&permits),
+                discard.clone(),
+                Duration::from_secs(60),
+                std::future::ready(Ok(())),
+            )
+            .await;
+        }
+
+        assert_eq!(discard.completed(), 8);
+        assert!(discard.error().is_none());
+        assert!(!stalled.is_finished());
+        stalled.abort();
+    }
+
+    // The per-stream deadline is what returns the permit when a peer opens a
+    // stream and then stops sending; an expired drain stays uncounted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_discard_timeout_releases_permit_without_counting() {
+        let permits = Arc::new(Semaphore::new(1));
+        let discard = StreamDiscardState::for_test();
+
+        run_bounded_discard(
+            Arc::clone(&permits),
+            discard.clone(),
+            Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+
+        assert_eq!(discard.completed(), 0);
+        assert!(discard.error().is_none());
+        assert_eq!(permits.available_permits(), 1);
+
+        run_bounded_discard(
+            permits,
+            discard.clone(),
+            Duration::from_millis(50),
+            std::future::ready(Ok(())),
+        )
+        .await;
+        assert_eq!(discard.completed(), 1);
+    }
+
+    // Drain errors still reach the N-API waiter through the shared state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_discard_records_drain_error() {
+        let permits = Arc::new(Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+        let discard = StreamDiscardState::for_test();
+
+        run_bounded_discard(
+            permits,
+            discard.clone(),
+            Duration::from_secs(60),
+            std::future::ready(Err("E_STREAM_RESET".to_string())),
+        )
+        .await;
+
+        assert_eq!(discard.completed(), 0);
+        assert_eq!(discard.error().as_deref(), Some("E_STREAM_RESET"));
     }
 }
