@@ -9,8 +9,9 @@ use crate::error::{
 use crate::panic_guard;
 use crate::session::{
     accept_bidi_stream_for_session, accept_uni_stream_for_session, create_bidi_stream_for_session,
-    create_uni_stream_for_session, discard_datagram_for_session, read_datagram_for_session,
-    send_datagram_for_session, session_metrics_snapshot_from, wait_session_stream_capacity,
+    create_uni_stream_for_session, discard_datagram_for_session, discard_datagrams_for_session,
+    read_datagram_for_session, send_datagram_for_session, session_metrics_snapshot_from,
+    wait_session_stream_capacity,
 };
 use crate::session_registry;
 use crate::RUNTIME;
@@ -166,13 +167,33 @@ impl SessionHandle {
     /// This is used by bounded load/evidence drains that intentionally count
     /// delivery but do not need to inspect every payload after the probe.
     #[napi(ts_return_type = "Promise<boolean | null>")]
-    pub fn discard_datagram(&self, env: Env) -> Result<JsObject> {
+    pub fn discard_datagram(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
         env.spawn_future(async move {
             RUNTIME
-                .spawn(async move { discard_datagram_for_session(&id).await })
+                .spawn(async move {
+                    let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
+                    discard_datagram_for_session(&id, timeout).await
+                })
                 .await
                 .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    /// Consume queued datagrams until the session closes or the deadline
+    /// expires without allocating a JavaScript payload per datagram.
+    #[napi(ts_return_type = "Promise<number | null>")]
+    pub fn discard_datagrams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
+                    discard_datagrams_for_session(&id, timeout).await
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+                .map(|count| count.map(|value| value.min(u32::MAX as u64) as u32))
         })
     }
 

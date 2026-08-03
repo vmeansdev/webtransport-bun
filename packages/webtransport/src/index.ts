@@ -1108,7 +1108,8 @@ interface NativeSessionHandle {
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
 	readDatagram(): Promise<Buffer | null>;
-	discardDatagram?: () => Promise<boolean | null>;
+	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
+	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
 	createBidiStream(): Promise<NativeBidiStreamHandle>;
 	createUniStream(): Promise<NativeSendStreamHandle>;
 	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
@@ -1410,11 +1411,27 @@ class NativeServerSession implements ServerSession {
 	}
 
 	/** @internal Consume one queued datagram without materializing its payload. */
-	async discardIncomingDatagram(): Promise<boolean | null | undefined> {
+	async discardIncomingDatagram(
+		timeoutMs?: number,
+	): Promise<boolean | null | undefined> {
 		if (!this.#nativeHandle.discardDatagram) return undefined;
 		if (this.#closed) return null;
 		try {
-			return await this.#nativeHandle.discardDatagram();
+			return await this.#nativeHandle.discardDatagram(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume queued datagrams without materializing payloads. */
+	async discardIncomingDatagrams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardDatagrams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardDatagrams(timeoutMs);
 		} catch (err) {
 			if (isSessionCloseError(err)) return null;
 			throw toWebTransportError(err);
