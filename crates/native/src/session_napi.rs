@@ -9,9 +9,10 @@ use crate::error::{
 use crate::panic_guard;
 use crate::session::{
     accept_bidi_stream_for_session, accept_uni_stream_for_session, create_bidi_stream_for_session,
-    create_uni_stream_for_session, discard_datagram_for_session, discard_datagrams_for_session,
-    read_datagram_for_session, send_datagram_for_session, session_metrics_snapshot_from,
-    wait_session_stream_capacity,
+    create_uni_stream_for_session, discard_bidi_streams_for_session, discard_datagram_for_session,
+    discard_datagrams_for_session, discard_uni_streams_for_session, handle_bidi_probe_for_session,
+    handle_uni_probe_for_session, read_datagram_for_session, send_datagram_for_session,
+    session_metrics_snapshot_from, wait_session_stream_capacity,
 };
 use crate::session_registry;
 use crate::RUNTIME;
@@ -197,6 +198,52 @@ impl SessionHandle {
         })
     }
 
+    /// Consume accepted server bidi streams without creating JS stream wrappers.
+    #[napi(ts_return_type = "Promise<number | null>")]
+    pub fn discard_bidi_streams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
+                    discard_bidi_streams_for_session(&id, timeout).await
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+                .map(|count| count.map(|value| value.min(u32::MAX as u64) as u32))
+        })
+    }
+
+    /// Consume accepted server uni streams without creating JS stream wrappers.
+    #[napi(ts_return_type = "Promise<number | null>")]
+    pub fn discard_uni_streams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
+                    discard_uni_streams_for_session(&id, timeout).await
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+                .map(|count| count.map(|value| value.min(u32::MAX as u64) as u32))
+        })
+    }
+
+    /// Enable native consumption for subsequent accepted bidi streams. This
+    /// keeps bounded load/evidence drains out of the N-API wrapper path.
+    #[napi(js_name = "enableBidiDiscard")]
+    pub fn enable_bidi_discard(&self) {
+        let _ = session_registry::enable_bidi_discard(&self.id);
+    }
+
+    /// Enable native consumption for subsequent accepted uni streams. This
+    /// keeps bounded load/evidence drains out of the N-API wrapper path.
+    #[napi(js_name = "enableUniDiscard")]
+    pub fn enable_uni_discard(&self) {
+        let _ = session_registry::enable_uni_discard(&self.id);
+    }
+
     #[napi(ts_return_type = "Promise<ClientBidiStreamHandle>")]
     pub fn create_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
@@ -230,6 +277,18 @@ impl SessionHandle {
         })
     }
 
+    /// Internal load/evidence path: handle one ordered bidi probe in Rust.
+    #[napi(js_name = "handleBidiProbe", ts_return_type = "Promise<boolean>")]
+    pub fn handle_bidi_probe(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move { handle_bidi_probe_for_session(&id).await })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
     #[napi(ts_return_type = "Promise<ClientUniSendHandle>")]
     pub fn create_uni_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
@@ -258,6 +317,18 @@ impl SessionHandle {
         env.spawn_future(async move {
             RUNTIME
                 .spawn(async move { accept_uni_stream_for_session(&id).await })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    /// Internal load/evidence path: handle one ordered uni probe in Rust.
+    #[napi(js_name = "handleUniProbe", ts_return_type = "Promise<number>")]
+    pub fn handle_uni_probe(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move { handle_uni_probe_for_session(&id).await })
                 .await
                 .map_err(wt_from_upstream_error)?
         })

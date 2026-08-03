@@ -9,6 +9,7 @@ import {
 	forEachWithTimeout,
 	nextWithTimeout,
 	readWithTimeout,
+	withTimeout,
 	withHarness,
 } from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
@@ -232,6 +233,71 @@ describe("webtransport client", () => {
 				},
 			);
 			expect(Buffer.concat(chunks)).toEqual(payload);
+		});
+	}, 10000);
+
+	it("server bidi close resolves without a peer reader", async () => {
+		await withHarness(async (h) => {
+			const port = nextPort(22450, 2000);
+			let resolveServerClose!: () => void;
+			const serverClose = new Promise<void>((resolve) => {
+				resolveServerClose = resolve;
+			});
+			h.track(
+				createServer({
+					port,
+					tls: { certPem: "", keyPem: "" },
+					onSession: async (s) => {
+						void forEachWithTimeout(
+							s.incomingBidirectionalStreams,
+							5000,
+							"server bidi close without peer reader",
+							async (duplex) => {
+								const reader = duplex.readable.getReader();
+								try {
+									await readWithTimeout(
+										reader,
+										5000,
+										"server bidi close payload read",
+									);
+								} finally {
+									reader.releaseLock();
+								}
+								const writer = duplex.writable.getWriter();
+								try {
+									await writer.close();
+								} finally {
+									writer.releaseLock();
+								}
+								resolveServerClose();
+							},
+						).catch(() => {});
+					},
+				}),
+			);
+
+			const client = h.track(
+				await connectWithRetry(`https://127.0.0.1:${port}`, {
+					tls: { insecureSkipVerify: true },
+				}),
+			);
+			const bidi = await client.createBidirectionalStream();
+			await new Promise<void>((resolve, reject) => {
+				bidi.write(Buffer.from("close-without-reader"), (err) =>
+					err ? reject(err) : resolve(),
+				);
+			});
+			await new Promise<void>((resolve, reject) => {
+				bidi.end((err: Error | null | undefined) =>
+					err ? reject(err) : resolve(),
+				);
+			});
+
+			await withTimeout(
+				serverClose,
+				1000,
+				"server bidi close without peer reader completion",
+			);
 		});
 	}, 10000);
 });

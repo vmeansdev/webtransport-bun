@@ -738,7 +738,6 @@ impl ClientSessionHandle {
         let conn_uni = conn.clone();
         let conn_accept_bi = conn.clone();
         let conn_accept_uni = conn.clone();
-
         let make_budget = {
             let bm = Arc::clone(&budget_metrics);
             let sm = Arc::clone(&session_metrics);
@@ -808,10 +807,9 @@ impl ClientSessionHandle {
                         Ok(opening) => match opening.await {
                             Ok((send, recv)) => {
                                 cm_bi.streams_active.fetch_add(1, Ordering::Relaxed);
-                                let cm_guard = Arc::clone(&cm_bi);
-                                let guard = crate::client_stream::StreamGuard::new(move || {
-                                    cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                });
+                                let guard = crate::client_stream::StreamGuard::client(
+                                    Arc::clone(&cm_bi),
+                                );
                                 let budget = make_budget_bi();
                                 let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                     spawn_bidi_bridge_on(
@@ -848,10 +846,9 @@ impl ClientSessionHandle {
                         Ok(opening) => match opening.await {
                             Ok(send) => {
                                 cm_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                                let cm_guard = Arc::clone(&cm_uni);
-                                let guard = crate::client_stream::StreamGuard::new(move || {
-                                    cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                });
+                                let guard = crate::client_stream::StreamGuard::client(
+                                    Arc::clone(&cm_uni),
+                                );
                                 let budget = make_budget_uni();
                                 let (write_tx, write_err_slot) = spawn_uni_send_bridge_on(
                                     &CLIENT_RUNTIME,
@@ -883,10 +880,9 @@ impl ClientSessionHandle {
                     let r = match conn_accept_bi.accept_bi().await {
                         Ok((send, recv)) => {
                             cm_accept_bi.streams_active.fetch_add(1, Ordering::Relaxed);
-                            let cm_guard = Arc::clone(&cm_accept_bi);
-                            let guard = crate::client_stream::StreamGuard::new(move || {
-                                cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
-                            });
+                            let guard = crate::client_stream::StreamGuard::client(
+                                Arc::clone(&cm_accept_bi),
+                            );
                             let budget = make_budget_accept_bi();
                             let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                 spawn_bidi_bridge_on(
@@ -921,10 +917,9 @@ impl ClientSessionHandle {
                     let r = match conn_accept_uni.accept_uni().await {
                         Ok(recv) => {
                             cm_accept_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                            let cm_guard = Arc::clone(&cm_accept_uni);
-                            let guard = crate::client_stream::StreamGuard::new(move || {
-                                cm_guard.streams_active.fetch_sub(1, Ordering::Relaxed);
-                            });
+                            let guard = crate::client_stream::StreamGuard::client(
+                                Arc::clone(&cm_accept_uni),
+                            );
                             let budget = make_budget_accept_uni();
                             let (read_rx, stop_tx, read_err_slot) = spawn_uni_recv_bridge_on(
                                 &CLIENT_RUNTIME,

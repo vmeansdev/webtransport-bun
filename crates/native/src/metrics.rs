@@ -52,6 +52,15 @@ pub struct ServerMetricsSnapshot {
     pub stream_open_latency: Option<HistogramSnapshot>,
 }
 
+/// Process-wide native stream-handle counts used by post-close residency
+/// diagnostics after the owning ServerHandle has been released.
+#[napi(object)]
+pub struct NativeStreamHandlesSnapshot {
+    pub bidi_handles_live: u32,
+    pub uni_send_handles_live: u32,
+    pub uni_recv_handles_live: u32,
+}
+
 /// Real QUIC transport stats from quinn (wire-level, not facade tallies).
 #[napi(object)]
 pub struct QuicConnectionStats {

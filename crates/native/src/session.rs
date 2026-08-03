@@ -249,6 +249,113 @@ pub(crate) async fn discard_datagrams_for_session(
     }
 }
 
+/// Wait for native direct-consume state until the session closes or the
+/// bounded deadline expires.
+async fn wait_for_stream_discard(
+    state: session_registry::StreamDiscardState,
+    timeout: Option<Duration>,
+) -> Result<Option<u64>> {
+    let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+    loop {
+        if let Some(error) = state.error() {
+            return Err(napi::Error::from_reason(error));
+        }
+        let completed = state.completed();
+        if state.is_closed() {
+            return Ok(if completed == 0 {
+                None
+            } else {
+                Some(completed)
+            });
+        }
+        match deadline {
+            Some(deadline) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(Some(completed));
+                }
+                let poll = (deadline - now).min(Duration::from_millis(50));
+                tokio::time::sleep(poll).await;
+            }
+            None => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+}
+
+/// Consume accepted bidi streams without materializing N-API stream handles.
+/// Native direct mode drains future streams in the QUIC accept loop; only
+/// handles already queued at the mode switch cross this function.
+pub(crate) async fn discard_bidi_streams_for_session(
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<u64>> {
+    let Some(state) = session_registry::enable_bidi_discard(id) else {
+        return Ok(None);
+    };
+    let Some((bidi_rx, _, _, _)) = session_registry::get_stream_accept_state(id) else {
+        return Ok(None);
+    };
+    let mut rx = bidi_rx.lock().await;
+    let mut scratch = None;
+    loop {
+        let next = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        let Some(mut stream) = (match next {
+            Ok(value) => value,
+            Err(_) => break,
+        }) else {
+            break;
+        };
+        let scratch = scratch
+            .get_or_insert_with(|| vec![0u8; crate::client_stream::STREAM_READ_BUFFER_BYTES]);
+        let result = stream.discard_incoming(scratch).await;
+        state.record(result.clone());
+        if let Err(error) = result {
+            return Err(napi::Error::from_reason(error));
+        }
+    }
+    drop(rx);
+    // The accept queue is empty after the mode-switch window. Do not retain a
+    // per-session scratch allocation while waiting for native direct streams.
+    drop(scratch);
+    wait_for_stream_discard(state, timeout).await
+}
+
+/// Consume accepted uni streams without crossing the N-API wrapper boundary.
+pub(crate) async fn discard_uni_streams_for_session(
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<u64>> {
+    let Some(state) = session_registry::enable_uni_discard(id) else {
+        return Ok(None);
+    };
+    let Some((_, uni_rx, _, _)) = session_registry::get_stream_accept_state(id) else {
+        return Ok(None);
+    };
+    let mut rx = uni_rx.lock().await;
+    let mut scratch = None;
+    loop {
+        let next = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        let Some(mut stream) = (match next {
+            Ok(value) => value,
+            Err(_) => break,
+        }) else {
+            break;
+        };
+        let scratch = scratch
+            .get_or_insert_with(|| vec![0u8; crate::client_stream::STREAM_READ_BUFFER_BYTES]);
+        let result = stream.discard_incoming(scratch).await;
+        state.record(result.clone());
+        if let Err(error) = result {
+            return Err(napi::Error::from_reason(error));
+        }
+    }
+    drop(rx);
+    // The accept queue is empty after the mode-switch window. Do not retain a
+    // per-session scratch allocation while waiting for native direct streams.
+    drop(scratch);
+    wait_for_stream_discard(state, timeout).await
+}
+
 pub(crate) async fn create_bidi_stream_for_session(id: &str) -> Result<ClientBidiStreamHandle> {
     let Some((_, _, metrics, _, _, create_bi_tx, _)) = session_registry::get(id) else {
         return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
@@ -272,11 +379,35 @@ pub(crate) async fn create_bidi_stream_for_session(id: &str) -> Result<ClientBid
 pub(crate) async fn accept_bidi_stream_for_session(
     id: &str,
 ) -> Result<Option<ClientBidiStreamHandle>> {
-    let Some((_, _, _, bidi_rx, _, _, _)) = session_registry::get(id) else {
+    let Some((bidi_rx, _, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_stream_accept_state(id)
+    else {
         return Ok(None);
     };
+    if lifecycle_closed.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     let mut rx = bidi_rx.lock().await;
-    Ok(rx.recv().await)
+    loop {
+        if lifecycle_closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        tokio::select! {
+            value = rx.recv() => return Ok(value.map(|stream| *stream)),
+            _ = lifecycle_notify.notified() => {}
+        }
+    }
+}
+
+/// Handle one ordered bidi probe without materializing an N-API stream object.
+/// The load/evidence harness calls this only for the two protocol probes that
+/// precede its steady-state stream workload.
+pub(crate) async fn handle_bidi_probe_for_session(id: &str) -> Result<bool> {
+    let Some(stream) = accept_bidi_stream_for_session(id).await? else {
+        return Ok(false);
+    };
+    stream.handle_native_probe().await?;
+    Ok(true)
 }
 
 pub(crate) async fn create_uni_stream_for_session(id: &str) -> Result<ClientUniSendHandle> {
@@ -300,11 +431,51 @@ pub(crate) async fn create_uni_stream_for_session(id: &str) -> Result<ClientUniS
 }
 
 pub(crate) async fn accept_uni_stream_for_session(id: &str) -> Result<Option<ClientUniRecvHandle>> {
-    let Some((_, _, _, _, uni_rx, _, _)) = session_registry::get(id) else {
+    let Some((_, uni_rx, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_stream_accept_state(id)
+    else {
         return Ok(None);
     };
+    if lifecycle_closed.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     let mut rx = uni_rx.lock().await;
-    Ok(rx.recv().await)
+    loop {
+        if lifecycle_closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        tokio::select! {
+            value = rx.recv() => return Ok(value.map(|stream| *stream)),
+            _ = lifecycle_notify.notified() => {}
+        }
+    }
+}
+
+/// Handle one ordered uni probe without crossing the N-API stream-wrapper
+/// boundary. The return value is `0` when no stream was accepted, `1` when an
+/// incoming probe was handled, and `2` when it also emitted the uni echo.
+pub(crate) async fn handle_uni_probe_for_session(id: &str) -> Result<u32> {
+    let Some(stream) = accept_uni_stream_for_session(id).await? else {
+        return Ok(0);
+    };
+    let payload = stream.read_native_probe().await?;
+    let result = if let Some(payload) = payload {
+        if payload.as_ref().starts_with(b"probe:uni-echo:") {
+            let send = create_uni_stream_for_session(id).await?;
+            send.write(payload).await?;
+            send.finish_wait().await?;
+            let _ = send.dispose();
+            2
+        } else {
+            let _ = stream.stop_sending(0);
+            1
+        }
+    } else {
+        let _ = stream.stop_sending(0);
+        1
+    };
+    let _ = stream.dispose();
+    Ok(result)
 }
 
 pub(crate) async fn wait_session_stream_capacity(
