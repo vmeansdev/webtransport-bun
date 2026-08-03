@@ -143,6 +143,9 @@ export type RssWarmupTelemetry = {
 	streamStackWarmed: boolean;
 	streamWarmupSessions: number;
 	streamWarmupStreamsOpened: number;
+	datagramStackWarmed: boolean;
+	datagramWarmupSessions: number;
+	datagramWarmupDatagramsReceived: number;
 	nativeClientPrewarmed: false;
 	allocatorReliefApplied: false;
 	processRestarted: false;
@@ -296,6 +299,9 @@ export function buildMemoryTelemetry(input: {
 			streamStackWarmed: false,
 			streamWarmupSessions: 0,
 			streamWarmupStreamsOpened: 0,
+			datagramStackWarmed: false,
+			datagramWarmupSessions: 0,
+			datagramWarmupDatagramsReceived: 0,
 			nativeClientPrewarmed: false,
 			allocatorReliefApplied: false,
 			processRestarted: false,
@@ -1739,7 +1745,16 @@ function campaignServerOptions(
 	sessionCap: number,
 	overloadSessionsPerServer: number,
 	onSession: CampaignSessionHandler,
+	workload: Pick<ScaleCampaignConfig, "datagramsPerSec" | "streamsPerSec">,
 ) {
+	const datagramRate = Math.max(
+		sessionCap * Math.max(workload.datagramsPerSec, 1) * 2,
+		10_000,
+	);
+	const streamRate = Math.max(
+		sessionCap * Math.max(workload.streamsPerSec, 1) * 2,
+		1_000,
+	);
 	return {
 		port,
 		tls: { certPem: cert.certPem, keyPem: cert.keyPem },
@@ -1754,10 +1769,10 @@ function campaignServerOptions(
 			handshakesPerSec: Math.max(sessionCap * 2, 500),
 			handshakesBurst: Math.max(sessionCap * 4, 1_000),
 			handshakesBurstPerPrefix: Math.max(sessionCap * 4, 1_000),
-			streamsPerSec: Math.max(sessionCap * 4, 1_000),
-			streamsBurst: Math.max(sessionCap * 8, 2_000),
-			datagramsPerSec: Math.max(sessionCap * 20, 10_000),
-			datagramsBurst: Math.max(sessionCap * 40, 20_000),
+			streamsPerSec: streamRate,
+			streamsBurst: Math.max(streamRate * 2, 2_000),
+			datagramsPerSec: datagramRate,
+			datagramsBurst: Math.max(datagramRate * 2, 20_000),
 		},
 		onSession,
 	};
@@ -1773,6 +1788,8 @@ async function warmNativeServerForRssBaseline(
 	const warmupStreamTasks: Promise<void>[] = [];
 	let streamWarmupStreamsOpened = 0;
 	let streamWarmupSessions = 0;
+	let datagramWarmupDatagramsReceived = 0;
+	let datagramWarmupSessions = 0;
 	let warmupClosed = false;
 	try {
 		for (let i = 0; i < config.serverCount; i++) {
@@ -1784,24 +1801,41 @@ async function warmNativeServerForRssBaseline(
 						serverSessionCaps[i] ?? 0,
 						config.overloadSessionsPerServer,
 						(session) => {
-							if (config.streamsPerSec <= 0) return;
 							const deadline = Date.now() + 5_000;
-							const task = drainSessionStreamsBeforeDeadline(
-								session,
-								deadline,
-								() => {
-									streamWarmupStreamsOpened += 1;
-								},
-							);
-							warmupStreamTasks.push(task);
-							task.catch(() => undefined);
+							if (config.datagramsPerSec > 0) {
+								const task = drainSessionDatagramsBeforeDeadline(
+									session,
+									deadline,
+									() => {
+										datagramWarmupDatagramsReceived += 1;
+									},
+								);
+								warmupStreamTasks.push(task);
+								task.catch(() => undefined);
+							}
+							if (config.streamsPerSec > 0) {
+								const task = drainSessionStreamsBeforeDeadline(
+									session,
+									deadline,
+									() => {
+										streamWarmupStreamsOpened += 1;
+									},
+								);
+								warmupStreamTasks.push(task);
+								task.catch(() => undefined);
+							}
 						},
+						config,
 					),
 				),
 			);
 			if (config.streamsPerSec > 0) {
 				const warmupSessions = Math.max(1, serverSessionCaps[i] ?? 1);
 				streamWarmupSessions += warmupSessions;
+				if (config.datagramsPerSec > 0) {
+					datagramWarmupSessions += warmupSessions;
+				}
+				const datagramsBefore = datagramWarmupDatagramsReceived;
 				const launch = normalizedClientLaunches(config)[0] ?? {
 					label: "rss-stream-warmup",
 					commandPrefix: [],
@@ -1818,7 +1852,7 @@ async function warmNativeServerForRssBaseline(
 					},
 					{
 						durationSec: 1,
-						datagramsPerSec: 0,
+						datagramsPerSec: config.datagramsPerSec,
 						streamsPerSec: config.streamsPerSec,
 						maxSessionErrors: 0,
 						skipProbes: true,
@@ -1828,10 +1862,50 @@ async function warmNativeServerForRssBaseline(
 					warmupSummary.okSessions !== warmupSessions ||
 					(warmupSummary.loadStreamsOpened ?? warmupSummary.streamsOpened) <=
 						0 ||
-					warmupSummary.streamErrors > 0
+					warmupSummary.streamErrors > 0 ||
+					warmupSummary.datagramErrors > 0 ||
+					(config.datagramsPerSec > 0 &&
+						datagramWarmupDatagramsReceived <= datagramsBefore)
 				) {
 					throw new Error(
 						`RSS stream warmup failed on server ${i}: ${JSON.stringify(warmupSummary)}`,
+					);
+				}
+			}
+			if (config.streamsPerSec <= 0 && config.datagramsPerSec > 0) {
+				const warmupSessions = Math.max(1, serverSessionCaps[i] ?? 1);
+				datagramWarmupSessions += warmupSessions;
+				const datagramsBefore = datagramWarmupDatagramsReceived;
+				const launch = normalizedClientLaunches(config)[0] ?? {
+					label: "rss-datagram-warmup",
+					commandPrefix: [],
+					urlHost: DEFAULT_CLIENT_TARGET_HOST,
+				};
+				const warmupSummary = await runLoadClient(
+					clientBin,
+					{
+						clientIndex: -1,
+						serverIndex: i,
+						serverPort: warmupServers[i]?.address.port ?? 0,
+						requestedSessions: warmupSessions,
+						launch,
+					},
+					{
+						durationSec: 1,
+						datagramsPerSec: config.datagramsPerSec,
+						streamsPerSec: 0,
+						maxSessionErrors: 0,
+						skipProbes: true,
+					},
+				);
+				if (
+					warmupSummary.okSessions !== warmupSessions ||
+					warmupSummary.datagramsSent <= 0 ||
+					warmupSummary.datagramErrors > 0 ||
+					datagramWarmupDatagramsReceived <= datagramsBefore
+				) {
+					throw new Error(
+						`RSS datagram warmup failed on server ${i}: ${JSON.stringify(warmupSummary)}`,
 					);
 				}
 			}
@@ -1880,6 +1954,9 @@ async function warmNativeServerForRssBaseline(
 		streamStackWarmed: config.streamsPerSec > 0,
 		streamWarmupSessions,
 		streamWarmupStreamsOpened,
+		datagramStackWarmed: config.datagramsPerSec > 0,
+		datagramWarmupSessions,
+		datagramWarmupDatagramsReceived,
 		nativeClientPrewarmed: false,
 		allocatorReliefApplied: false,
 		processRestarted: false,
@@ -1943,6 +2020,9 @@ async function runOneCampaign(
 		streamStackWarmed: false,
 		streamWarmupSessions: 0,
 		streamWarmupStreamsOpened: 0,
+		datagramStackWarmed: false,
+		datagramWarmupSessions: 0,
+		datagramWarmupDatagramsReceived: 0,
 		nativeClientPrewarmed: false,
 		allocatorReliefApplied: false,
 		processRestarted: false,
@@ -2117,6 +2197,7 @@ async function runOneCampaign(
 								});
 							}
 						},
+						config,
 					),
 				),
 			);
