@@ -317,6 +317,34 @@ describe("Task 14 distributed scale evidence", () => {
 				...valid,
 				steadyStateBeforeOverload: {
 					...steady,
+					streamsActive: 3,
+				},
+				postOverloadGauges: {
+					...recovered,
+					streamsActive: 0,
+				},
+			}),
+		).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
+					streamsActive: 3,
+				},
+				postOverloadGauges: {
+					...recovered,
+					streamsActive: 4,
+				},
+			}),
+		).toContain(
+			"overload phase did not recover to its steady-state gauge baseline",
+		);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
 					queuedBytesGlobal: 4,
 				},
 				postOverloadGauges: recovered,

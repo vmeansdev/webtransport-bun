@@ -837,7 +837,10 @@ function recoveredToSteadyBaseline(
 		current.sessionTasksActive === baseline.sessionTasksActive &&
 		current.streamTasksActive === baseline.streamTasksActive &&
 		current.handshakesInFlight === baseline.handshakesInFlight &&
-		current.streamsActive === baseline.streamsActive &&
+		// Streams are transient work and may finish naturally while the rejected
+		// admission attempts are being measured. A lower count is recovered; any
+		// increase would indicate new live stream work and must still fail.
+		current.streamsActive <= baseline.streamsActive &&
 		current.queuedBytesGlobal <= baseline.queuedBytesGlobal
 	);
 }
