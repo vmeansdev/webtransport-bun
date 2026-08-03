@@ -4,11 +4,21 @@
 // `wasm-dist/web`, binds Direct Sockets, and returns a WasmWebTransportServer.
 // Lower-level APIs still accept an injected {@link WasmModule} for tests/custom hosts.
 //
-// CANDIDATE (coupled 1.0): `/wasm` is not yet under the package's stable 1.0.0
-// semver commitment. It joins GA only when docs/release-status.json marks
-// readiness=ready after wasm protocol bar (dynamic QPACK, multi-session, 0-RTT)
-// and wasm-facade-parity claims pass. Until then the facade may still change;
-// the frozen root entrypoint remains the native API. See docs/WASM_1.0_PLAN.md.
+// SEMVER (coupled 1.0). Two separate things, which earlier wording conflated:
+//
+//   Export list — FROZEN. Every name below is pinned by
+//   `packages/webtransport/test/public-surface-contract.test.ts`; removing or
+//   renaming one is a breaking change needing a major bump, exactly as on the
+//   root entrypoint. Additive names still need the frozen list updated.
+//
+//   Stability label — still `candidate`. docs/release-status.json marks *both*
+//   `native` and `wasm` as `candidate`; `/wasm` becomes `stable` only once its
+//   required claims (chromium-wasm-interop, iwa-direct-sockets,
+//   wasm-dynamic-qpack, wasm-multi-session, wasm-0rtt, wasm-facade-parity)
+//   pass. Until then behavior under those gates may still change.
+//
+// The cross-backend subset that is contract-tested on native *and* wasm is
+// `/portable`, not this module. See docs/WASM_1.0_PLAN.md.
 
 export {
 	type BackendKind,

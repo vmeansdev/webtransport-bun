@@ -243,14 +243,20 @@ await server.close();
 
 ### Know before you ship
 
-- **`/wasm` is a candidate surface, not stable/GA.** The canonical release
-  truth is `docs/release-status.json`. The wasm server session now mirrors the
-  native `ServerSession` shape — `incomingDatagrams()`, the incoming stream
-  `ReadableStream`s, `id`/`peer`, and `getStats()` — so one server codebase runs
-  on either backend through `webtransport-bun/portable`. What remains divergent
-  is the original callback-style API (`onDatagram`/`onIncomingStream`), kept for
-  back-compat but deprecated; it cannot be combined with the W3C surface on the
-  same session. Depend on `/wasm` only if you accept change.
+- **`/wasm` is a candidate surface, not stable/GA — but its export list is
+  frozen.** Those are two different promises. The names exported from `/wasm`
+  are pinned by `packages/webtransport/test/public-surface-contract.test.ts`, so
+  removing or renaming one is a breaking change needing a major bump. What is
+  still `candidate` is the *stability label*: `docs/release-status.json` marks
+  both `native` and `wasm` as `candidate`, and `/wasm` becomes `stable` only
+  once its required claims pass. Behavior under those gates may still change.
+  The wasm server session mirrors the native `ServerSession` shape —
+  `incomingDatagrams()`, the incoming stream `ReadableStream`s, `id`/`peer`, and
+  `getStats()` — so one server codebase runs on either backend through
+  `webtransport-bun/portable`, which is the subset actually contract-tested on
+  both. What remains divergent is the original callback-style API
+  (`onDatagram`/`onIncomingStream`), kept for back-compat but deprecated; it
+  cannot be combined with the W3C surface on the same session.
 - **The in-browser server is Chromium-only, and only inside an Isolated Web
   App.** Direct Sockets `UDPSocket` does not exist on normal web pages, in
   Firefox, or in Safari. Installing an IWA today requires `chrome://flags`
