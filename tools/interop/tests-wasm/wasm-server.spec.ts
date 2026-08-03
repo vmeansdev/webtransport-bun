@@ -352,6 +352,15 @@ test("stream reset code round-trips from the wasm server through the remap", asy
 
 	const result = await page.evaluate(
 		async ({ url, h, code }) => {
+			const readWithTimeout = (
+				globalThis as typeof globalThis & {
+					__wtReadWithTimeout?: <T>(
+						reader: ReadableStreamDefaultReader<T>,
+						timeoutMs: number,
+						label: string,
+					) => Promise<ReadableStreamReadResult<T>>;
+				}
+			).__wtReadWithTimeout;
 			const withTimeout = (
 				globalThis as typeof globalThis & {
 					__wtWithTimeout?: <T>(
@@ -361,7 +370,9 @@ test("stream reset code round-trips from the wasm server through the remap", asy
 					) => Promise<T>;
 				}
 			).__wtWithTimeout;
-			if (!withTimeout) throw new Error("bounded browser helpers missing");
+			if (!readWithTimeout || !withTimeout) {
+				throw new Error("bounded browser helpers missing");
+			}
 			const bin = Uint8Array.from(atob(h), (c) => c.charCodeAt(0));
 			const wt = new WebTransport(url, {
 				serverCertificateHashes: [{ algorithm: "sha-256", value: bin }],
@@ -373,8 +384,8 @@ test("stream reset code round-trips from the wasm server through the remap", asy
 			await w.write(new TextEncoder().encode(`__WT_RESET_${code}__`));
 			w.releaseLock();
 
-			const { value: stream } = await withTimeout(
-				incoming.read(),
+			const { value: stream } = await readWithTimeout(
+				incoming,
 				5_000,
 				"wasm reset incoming uni",
 			);
@@ -383,8 +394,8 @@ test("stream reset code round-trips from the wasm server through the remap", asy
 			const reader = (stream as ReadableStream<Uint8Array>).getReader();
 			try {
 				for (;;) {
-					const { done } = await withTimeout(
-						reader.read(),
+					const { done } = await readWithTimeout(
+						reader,
 						5_000,
 						"wasm reset read",
 					);

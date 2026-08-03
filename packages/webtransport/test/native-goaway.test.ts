@@ -16,10 +16,45 @@
 
 import { describe, expect, it } from "bun:test";
 import { createServer, type ServerSession } from "../src/index.js";
-import { withHarness, withTimeout } from "./helpers/harness.js";
+import {
+	nextWithTimeout,
+	withHarness,
+	withTimeout,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 15600;
+const TOKEN_DATAGRAM_TIMEOUT_MS = 5000;
+
+// Watches one server session for the token datagram that identifies it as the
+// one backing this client. Bounded so a session that never sees the token fails
+// the wait instead of parking the loop forever.
+async function markOnTokenDatagram(
+	session: ServerSession,
+	token: string,
+	onMatch: (session: ServerSession) => void,
+): Promise<void> {
+	const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
+	const decoder = new TextDecoder();
+	try {
+		while (true) {
+			const received = await nextWithTimeout(
+				iter,
+				TOKEN_DATAGRAM_TIMEOUT_MS,
+				"native goaway server token datagram",
+			);
+			if (received.done) {
+				return;
+			}
+			if (decoder.decode(received.value) === token) {
+				onMatch(session);
+				return;
+			}
+		}
+	} finally {
+		await iter.return?.();
+	}
+}
 
 // `connectWithRetry` may open more than one session; a token datagram
 // round-trip identifies the server session actually backing this client.
@@ -50,15 +85,9 @@ describe("native GOAWAY send path", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: (s) => {
-						void (async () => {
-							const decoder = new TextDecoder();
-							for await (const d of s.incomingDatagrams()) {
-								if (decoder.decode(d) === token) {
-									serverSession = s;
-									return;
-								}
-							}
-						})().catch(() => {});
+						void markOnTokenDatagram(s, token, (matched) => {
+							serverSession = matched;
+						}).catch(() => {});
 					},
 				}),
 			);
@@ -114,15 +143,9 @@ describe("native GOAWAY send path", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: (s) => {
-						void (async () => {
-							const decoder = new TextDecoder();
-							for await (const d of s.incomingDatagrams()) {
-								if (decoder.decode(d) === token) {
-									serverSession = s;
-									return;
-								}
-							}
-						})().catch(() => {});
+						void markOnTokenDatagram(s, token, (matched) => {
+							serverSession = matched;
+						}).catch(() => {});
 					},
 				}),
 			);

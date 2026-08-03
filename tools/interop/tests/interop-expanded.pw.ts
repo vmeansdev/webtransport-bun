@@ -373,17 +373,22 @@ test.describe("P3.3 interop expansion", () => {
 
 		const result = await page.evaluate(
 			async ({ hash, url, code }) => {
-				const withTimeout = (
-					globalThis as typeof globalThis & {
-						__wtWithTimeout?: <T>(
-							promise: PromiseLike<T>,
-							timeoutMs: number,
-							label: string,
-						) => Promise<T>;
-					}
-				).__wtWithTimeout;
-				if (!withTimeout)
-					throw new Error("missing __wtWithTimeout init script");
+				const helpers = globalThis as typeof globalThis & {
+					__wtReadWithTimeout?: <T>(
+						reader: ReadableStreamDefaultReader<T>,
+						timeoutMs: number,
+						label: string,
+					) => Promise<ReadableStreamReadResult<T>>;
+					__wtWithTimeout?: <T>(
+						promise: PromiseLike<T>,
+						timeoutMs: number,
+						label: string,
+					) => Promise<T>;
+				};
+				const readWithTimeout = helpers.__wtReadWithTimeout;
+				const withTimeout = helpers.__wtWithTimeout;
+				if (!readWithTimeout || !withTimeout)
+					throw new Error("missing bounded browser init script");
 				const opts = hash
 					? {
 							serverCertificateHashes: [
@@ -402,8 +407,8 @@ test.describe("P3.3 interop expansion", () => {
 				await w.write(new TextEncoder().encode(`__WT_RESET_${code}__`));
 				w.releaseLock();
 
-				const { value: stream } = await withTimeout(
-					incoming.read(),
+				const { value: stream } = await readWithTimeout(
+					incoming,
 					5_000,
 					"reset code incoming uni",
 				);
@@ -413,8 +418,8 @@ test.describe("P3.3 interop expansion", () => {
 				try {
 					// Drain until the reset surfaces as a read rejection.
 					for (;;) {
-						const { done } = await withTimeout(
-							reader.read(),
+						const { done } = await readWithTimeout(
+							reader,
 							5_000,
 							"reset code read",
 						);

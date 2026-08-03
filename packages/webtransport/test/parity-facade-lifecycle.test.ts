@@ -3,9 +3,13 @@
  * Verifies ready, closed, draining behavior.
  */
 
-import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { toWebTransport } from "../src/index.js";
-import { collectWithTimeout, withTimeout } from "./helpers/harness.js";
+import {
+	collectWithTimeout,
+	nextWithTimeout,
+	withTimeout,
+} from "./helpers/harness.js";
 import { connectWithRetry } from "./helpers/network.js";
 import {
 	createParityHarness,
@@ -15,6 +19,38 @@ import {
 	skipWasmParityIfUnavailable,
 	wasmParityReady,
 } from "./helpers/parity-backend.js";
+
+const TOKEN_DATAGRAM_TIMEOUT_MS = 5000;
+
+// Identifies which server session backs this client: `open()` retries, so more
+// than one can exist. Bounded so a session that never sees the token fails the
+// wait instead of parking the loop forever.
+async function markOnTokenDatagram(
+	session: ParityServerSession,
+	token: string,
+	onMatch: (session: ParityServerSession) => void,
+): Promise<void> {
+	const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
+	const decoder = new TextDecoder();
+	try {
+		while (true) {
+			const received = await nextWithTimeout(
+				iter,
+				TOKEN_DATAGRAM_TIMEOUT_MS,
+				"parity lifecycle server token datagram",
+			);
+			if (received.done) {
+				return;
+			}
+			if (decoder.decode(received.value) === token) {
+				onMatch(session);
+				return;
+			}
+		}
+	} finally {
+		await iter.return?.();
+	}
+}
 
 describe.skipIf(skipWasmParityIfUnavailable)(
 	"parity facade lifecycle (P1)",
@@ -66,15 +102,9 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			const token = `drain-${Math.random().toString(36).slice(2)}`;
 			let server: ParityServerSession | undefined;
 			onServerSession = (session) => {
-				void (async () => {
-					const decoder = new TextDecoder();
-					for await (const d of session.incomingDatagrams()) {
-						if (decoder.decode(d) === token) {
-							server = session;
-							return;
-						}
-					}
-				})().catch(() => {});
+				void markOnTokenDatagram(session, token, (matched) => {
+					server = matched;
+				}).catch(() => {});
 			};
 			try {
 				const wt = await harness.open();
