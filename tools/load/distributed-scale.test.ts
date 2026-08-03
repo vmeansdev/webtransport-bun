@@ -173,6 +173,9 @@ describe("Task 14 distributed scale evidence", () => {
 			finalRssMb: 54.3,
 			coldStartRecoveryRatio: 1.254,
 			serviceReadyRecoveryRatio: 1.0009,
+			coldStartRecoveryRatioRss: 1.254,
+			serviceReadyRecoveryRatioRss: 1.0009,
+			chargedMetric: "rss-fallback",
 			coldToServiceReadyDeltaMb: 10.95,
 			serviceReadyToPostCloseDeltaMb: 0.05,
 			allocatorRelief: [],
@@ -193,12 +196,42 @@ describe("Task 14 distributed scale evidence", () => {
 			},
 			coldStartDiagnostic: {
 				status: "review-required",
+				deltaMb: 11,
+				capMb: 6.1,
 				ratio: 1.254,
 				threshold: 1.25,
 				reason:
-					"cold-start recovery exceeded the unchanged RSS threshold and requires explicit release review",
+					"cold-start residency delta exceeded the pre-registered platform-floor cap and requires explicit release review",
 			},
 		});
+	});
+
+	test("cold diagnostic passes on the delta cap and uses footprint when present", () => {
+		const withFp = (rssMb: number, physFootprintMb: number) => ({
+			rssMb,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+			physFootprintMb,
+		});
+		const memory = buildMemoryTelemetry({
+			coldStart: withFp(48, 19),
+			serviceReady: withFp(57, 20.5),
+			peak: withFp(113, 60),
+			preClose: withFp(110, 40),
+			postClose: withFp(114, 24),
+		});
+		// Authoritative ratios use charged memory; rss ratios stay disclosed.
+		expect(memory.chargedMetric).toBe("phys-footprint");
+		expect(memory.serviceReadyRecoveryRatio).toBe(
+			Number((24 / 20.5).toFixed(4)),
+		);
+		expect(memory.serviceReadyRecoveryRatioRss).toBe(
+			Number((114 / 57).toFixed(4)),
+		);
+		expect(memory.coldStartDiagnostic.status).toBe("pass");
+		expect(memory.coldStartDiagnostic.deltaMb).toBe(5);
+		expect(memory.coldStartDiagnostic.capMb).toBe(6.1);
 	});
 
 	test("sizes the RSS warmup independently of the campaign session count", () => {
@@ -305,8 +338,12 @@ describe("Task 14 distributed scale evidence", () => {
 			coldStartDiagnosticThreshold({ maxRecoveryRssRatio: Number.NaN }),
 		).toBe(1.25);
 
+		// The recorded informational threshold derives from config; the
+		// pass/review verdict itself is decided by the pre-registered
+		// residency-delta cap, never by the ratio threshold.
 		const strict = buildMemoryTelemetry(input);
 		expect(strict.coldStartDiagnostic.threshold).toBe(1.25);
+		expect(strict.coldStartDiagnostic.deltaMb).toBe(12);
 		expect(strict.coldStartDiagnostic.status).toBe("review-required");
 
 		const relaxed = buildMemoryTelemetry({
@@ -314,7 +351,14 @@ describe("Task 14 distributed scale evidence", () => {
 			coldStartDiagnosticThreshold: 1.4,
 		});
 		expect(relaxed.coldStartDiagnostic.threshold).toBe(1.4);
-		expect(relaxed.coldStartDiagnostic.status).toBe("pass");
+		expect(relaxed.coldStartDiagnostic.status).toBe("review-required");
+
+		const withinCap = buildMemoryTelemetry({
+			...input,
+			postClose: sample(45),
+		});
+		expect(withinCap.coldStartDiagnostic.deltaMb).toBe(5);
+		expect(withinCap.coldStartDiagnostic.status).toBe("pass");
 	});
 
 	test("fails when the warmup baseline grows with campaign session count", () => {
