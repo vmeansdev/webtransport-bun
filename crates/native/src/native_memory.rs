@@ -51,53 +51,35 @@ pub fn release_drained_residency(drained: bool) -> ResidencyRelief {
     apply_relief()
 }
 
-#[cfg(target_os = "macos")]
 fn apply_relief() -> ResidencyRelief {
+    // This dylib's Rust allocations go through mimalloc (see lib.rs
+    // GLOBAL_ALLOCATOR). mi_collect(force) frees deferred segments, reclaims
+    // abandoned pages, and purges free pages back to the OS immediately —
+    // unlike macOS malloc_zone_pressure_relief, which is a measured no-op.
+    // mi_collect only affects the calling thread's heap plus abandoned
+    // segments, so long-lived runtime threads should also purge via the
+    // mi_option purge settings configured at startup.
     unsafe extern "C" {
-        fn malloc_zone_pressure_relief(zone: *mut core::ffi::c_void, goal: usize) -> usize;
+        fn mi_collect(force: bool);
     }
-    // NULL zone = all zones; goal 0 = release as much as possible.
-    let reported = unsafe { malloc_zone_pressure_relief(core::ptr::null_mut(), 0) };
-    ResidencyRelief {
-        platform: "macos",
-        applied: true,
-        reported_bytes_released: Some(reported as u64),
-        refused_reason: None,
-    }
-}
-
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn apply_relief() -> ResidencyRelief {
-    unsafe extern "C" {
-        fn malloc_trim(pad: usize) -> core::ffi::c_int;
-    }
-    // malloc_trim returns 1 when memory was released; no byte count exists.
-    let rc = unsafe { malloc_trim(0) };
-    ResidencyRelief {
-        platform: "linux-gnu",
-        applied: rc == 1,
-        reported_bytes_released: None,
-        refused_reason: None,
-    }
-}
-
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-fn apply_relief() -> ResidencyRelief {
+    unsafe { mi_collect(true) };
     ResidencyRelief {
         platform: platform_name(),
-        applied: false,
+        applied: true,
         reported_bytes_released: None,
-        refused_reason: Some("unsupported-platform"),
+        refused_reason: None,
     }
 }
 
 fn platform_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
-    } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
-        "linux-gnu"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
     } else {
-        "unsupported"
+        "other"
     }
 }
 
@@ -116,10 +98,9 @@ mod tests {
     fn relief_reports_platform_and_never_panics_when_drained() {
         let r = release_drained_residency(true);
         assert!(!r.platform.is_empty());
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        // mimalloc is the global allocator on every supported platform, so a
+        // drained relief always applies.
         assert!(r.applied);
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-        assert!(!r.applied);
     }
 
     #[test]
