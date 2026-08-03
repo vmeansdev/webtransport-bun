@@ -224,6 +224,7 @@ describe("internal TS error propagation", () => {
 			"server incoming bidi wrapper read",
 		);
 		expect(result.done).toBe(false);
+		if (result.done || !result.value) throw new Error("missing bidi stream");
 		const writer = result.value.writable.getWriter();
 		resolveClosed();
 		await Bun.sleep(0);
