@@ -190,6 +190,7 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 ### Server TLS / SNI semantics
 
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
+- `tls.keyPem` accepts unencrypted PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA (`BEGIN RSA PRIVATE KEY`) PEM. Encrypted keys are not supported. A key that does not match the leaf certificate's public key fails server construction.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
 - Server names are IDNA-normalized to canonical ASCII after trimming a trailing `.`, so Unicode inputs are matched by their punycode form.
 - Wildcards are supported only in the left-most label, for example `*.example.com`.

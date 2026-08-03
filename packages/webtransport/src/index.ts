@@ -378,7 +378,11 @@ export type ServerTlsSnapshot = {
 export type TlsOptions = {
 	/** PEM-encoded certificate (server) or CA (client). */
 	certPem: string | Uint8Array;
-	/** PEM-encoded private key (server only). */
+	/**
+	 * PEM-encoded private key (server only). Unencrypted PKCS#8
+	 * (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA
+	 * (`BEGIN RSA PRIVATE KEY`) are accepted; encrypted keys are not.
+	 */
 	keyPem: string | Uint8Array;
 	/** Optional CA PEM for client verification. */
 	caPem?: string | Uint8Array;
