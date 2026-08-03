@@ -30,6 +30,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_SMOKE_TIMEOUT_MS = 60_000;
 const DEFAULT_SMOKE_KILL_GRACE_MS = 250;
 const DEFAULT_SMOKE_TREE_KILL_TIMEOUT_MS = 5_000;
+const EXIT_POLL_INTERVAL_MS = 25;
 process.on("exit", () => rmSync(npmCacheDir, { recursive: true, force: true }));
 
 function sharedEnv(): NodeJS.ProcessEnv {
@@ -82,6 +83,36 @@ async function readCapturedText(file: string): Promise<string> {
 				: "";
 		if (code === "ENOENT") return "";
 		throw error;
+	}
+}
+
+type TreeCleanupOutcome =
+	| { kind: "completed" }
+	| { kind: "unproven"; detail: string }
+	| { kind: "command-failed"; error: Error }
+	| { kind: "command-timed-out"; error: Error };
+
+function liveness(target: number): boolean {
+	try {
+		process.kill(target, 0);
+		return true;
+	} catch (error) {
+		const code =
+			typeof error === "object" && error !== null && "code" in error
+				? String((error as { code?: unknown }).code)
+				: "";
+		// EPERM means the target still exists but belongs to another user.
+		return code === "EPERM";
+	}
+}
+
+async function waitForExit(target: number, budgetMs: number): Promise<boolean> {
+	const deadline = Date.now() + Math.max(budgetMs, 0);
+	for (;;) {
+		if (!liveness(target)) return true;
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) return false;
+		await wait(Math.min(EXIT_POLL_INTERVAL_MS, remainingMs));
 	}
 }
 
@@ -178,8 +209,8 @@ async function terminateCommandProcessTree(
 	treeKillTimeoutMs: number,
 	platform: NodeJS.Platform,
 	windowsTreeKillCommand?: string,
-): Promise<Error | undefined> {
-	if (child.pid === undefined) return undefined;
+): Promise<TreeCleanupOutcome> {
+	if (child.pid === undefined) return { kind: "completed" };
 	if (platform === "win32") {
 		let cleanupError: Error | undefined;
 		try {
@@ -191,18 +222,53 @@ async function terminateCommandProcessTree(
 		} catch (error) {
 			cleanupError = error instanceof Error ? error : new Error(String(error));
 		}
-		try {
-			child.kill("SIGKILL");
-		} catch {
-			// taskkill owns whole-tree cleanup; this is a direct-child fallback only.
+		// taskkill owns whole-tree cleanup; killing the direct child is a fallback
+		// that reclaims the root only, so it never counts as tree-wide proof.
+		const killDirectChildFallback = () => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// The child may already have exited.
+			}
+		};
+		if (cleanupError) {
+			killDirectChildFallback();
+			return cleanupError.message.startsWith("taskkill timed out")
+				? { kind: "command-timed-out", error: cleanupError }
+				: { kind: "command-failed", error: cleanupError };
 		}
-		return cleanupError;
+		if (await waitForExit(child.pid, killGraceMs)) return { kind: "completed" };
+		killDirectChildFallback();
+		return {
+			kind: "unproven",
+			detail: `taskkill reported success but pid ${child.pid} was still alive after ${killGraceMs}ms`,
+		};
 	}
 
 	signalPosixProcessTree(child.pid, child, "SIGTERM");
-	await wait(killGraceMs);
+	// A detached child leads its own group, so -pid covers every descendant
+	// that has not escaped into a new session.
+	const group = -child.pid;
+	if (await waitForExit(group, killGraceMs)) return { kind: "completed" };
 	signalPosixProcessTree(child.pid, child, "SIGKILL");
-	return undefined;
+	if (await waitForExit(group, treeKillTimeoutMs)) return { kind: "completed" };
+	return {
+		kind: "unproven",
+		detail: `process group ${child.pid} was still alive ${killGraceMs + treeKillTimeoutMs}ms after SIGTERM`,
+	};
+}
+
+function describeCleanupOutcome(outcome: TreeCleanupOutcome): string {
+	switch (outcome.kind) {
+		case "completed":
+			return "";
+		case "unproven":
+			return `; process-tree descendant exit unproven: ${outcome.detail}`;
+		case "command-timed-out":
+			return `; process-tree cleanup timed out: ${outcome.error.message}; direct-child fallback only, descendant exit unproven`;
+		case "command-failed":
+			return `; process-tree cleanup failed: ${outcome.error.message}; direct-child fallback only, descendant exit unproven`;
+	}
 }
 
 export async function runPackageCommand(
@@ -211,9 +277,11 @@ export async function runPackageCommand(
 	options: {
 		cwd?: string;
 		echoOutput?: boolean;
+		killGraceMs?: number;
 		label?: string;
 		platform?: NodeJS.Platform;
 		timeoutMs?: number;
+		treeKillTimeoutMs?: number;
 		windowsTreeKillCommand?: string;
 	},
 ): Promise<string> {
@@ -223,14 +291,18 @@ export async function runPackageCommand(
 			"WEBTRANSPORT_PACKAGE_COMMAND_TIMEOUT_MS",
 			DEFAULT_COMMAND_TIMEOUT_MS,
 		);
-	const killGraceMs = envInteger(
-		"WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS",
-		DEFAULT_SMOKE_KILL_GRACE_MS,
-	);
-	const treeKillTimeoutMs = envInteger(
-		"WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS",
-		DEFAULT_SMOKE_TREE_KILL_TIMEOUT_MS,
-	);
+	const killGraceMs =
+		options.killGraceMs ??
+		envInteger(
+			"WEBTRANSPORT_PACKAGE_SMOKE_KILL_GRACE_MS",
+			DEFAULT_SMOKE_KILL_GRACE_MS,
+		);
+	const treeKillTimeoutMs =
+		options.treeKillTimeoutMs ??
+		envInteger(
+			"WEBTRANSPORT_PACKAGE_SMOKE_TREE_KILL_TIMEOUT_MS",
+			DEFAULT_SMOKE_TREE_KILL_TIMEOUT_MS,
+		);
 	const platform = options.platform ?? process.platform;
 	const label = options.label ?? `${command} ${args.join(" ")}`;
 
@@ -265,7 +337,7 @@ export async function runPackageCommand(
 
 		let finished = false;
 		let timedOut = false;
-		let cleanupError: Error | undefined;
+		let cleanupOutcome: TreeCleanupOutcome = { kind: "completed" };
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
 		const cleanup = () => {
@@ -299,9 +371,7 @@ export async function runPackageCommand(
 			}
 			if (timedOut) {
 				child.unref();
-				const cleanupDetail = cleanupError
-					? `; process-tree cleanup failed: ${cleanupError.message}`
-					: "";
+				const cleanupDetail = describeCleanupOutcome(cleanupOutcome);
 				reject(
 					new Error(
 						`${label} timed out after ${timeoutMs}ms${cleanupDetail}${formatCapturedOutput(stdout, stderr)}`,
@@ -354,12 +424,14 @@ export async function runPackageCommand(
 				platform,
 				options.windowsTreeKillCommand,
 			)
-				.then((error) => {
-					cleanupError = error;
+				.then((outcome) => {
+					cleanupOutcome = outcome;
 				})
 				.catch((error) => {
-					cleanupError =
-						error instanceof Error ? error : new Error(String(error));
+					cleanupOutcome = {
+						kind: "command-failed",
+						error: error instanceof Error ? error : new Error(String(error)),
+					};
 				})
 				.finally(() => void finish());
 		}, timeoutMs);
