@@ -4,10 +4,11 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
+	__TESTING__,
 	createServer,
 	DEFAULT_LIMITS,
-	__TESTING__,
 	type MetricsSnapshot,
+	type ServerCloseDiagnostics,
 	type ServerSession,
 	WT_RESET,
 	WT_STOP_SENDING,
@@ -30,6 +31,14 @@ const RSS_BASELINE_POLICY =
 	"service-ready-authoritative-cold-start-hard-diagnostic";
 const RSS_AUTHORITATIVE_BASELINE = "service-ready" as const;
 const RSS_COLD_START_DIAGNOSTIC_THRESHOLD = 1.25;
+// The RSS warmup exists to pay one-time initialization costs, not to carry
+// campaign load. Its workload is pinned here so the service-ready baseline
+// cannot grow with config.sessions.
+const WARMUP_WORKLOAD_PER_SERVER = {
+	sessions: 1,
+	streamsPerSec: 1,
+	datagramsPerSec: 1,
+} as const;
 
 export type ScaleWorkloadMode = "probe" | "drain-all" | "single-reader";
 
@@ -136,6 +145,111 @@ export type MemorySample = {
 	arrayBuffersMb: number;
 };
 
+export type AllocatorReliefTelemetry = {
+	scope: "warmup" | "campaign";
+	platform: string;
+	applied: boolean;
+	reportedBytesReleased: number | null;
+	refusedReason: string | null;
+};
+
+/**
+ * Normalize what {@link WebTransportServer.close} resolved into artifact
+ * telemetry. Older close paths resolve `void`; those report no relief rather
+ * than a synthesized outcome.
+ */
+export function toAllocatorReliefTelemetry(
+	scope: AllocatorReliefTelemetry["scope"],
+	closeResult: ServerCloseDiagnostics | void | undefined,
+): AllocatorReliefTelemetry | null {
+	const relief = closeResult?.allocatorRelief;
+	if (!relief) return null;
+	return {
+		scope,
+		platform: relief.platform,
+		applied: relief.applied === true,
+		reportedBytesReleased: relief.reportedBytesReleased ?? null,
+		refusedReason: relief.refusedReason ?? null,
+	};
+}
+
+/** Relief counts as applied only when every observed close reported it. */
+export function allocatorReliefApplied(
+	entries: AllocatorReliefTelemetry[],
+): boolean {
+	return entries.length > 0 && entries.every((entry) => entry.applied);
+}
+
+export function warmupSessionsPerServer(): number {
+	return WARMUP_WORKLOAD_PER_SERVER.sessions;
+}
+
+export function warmupWorkloadPerServer(): {
+	sessions: number;
+	streamsPerSec: number;
+	datagramsPerSec: number;
+} {
+	return { ...WARMUP_WORKLOAD_PER_SERVER };
+}
+
+export function plannedWarmupSessions(config: ScaleCampaignConfig): number {
+	return config.serverCount * warmupSessionsPerServer();
+}
+
+export function coldStartDiagnosticThreshold(
+	config: Pick<ScaleCampaignConfig, "maxRecoveryRssRatio">,
+): number {
+	return Number.isFinite(config.maxRecoveryRssRatio) &&
+		config.maxRecoveryRssRatio > 0
+		? config.maxRecoveryRssRatio
+		: RSS_COLD_START_DIAGNOSTIC_THRESHOLD;
+}
+
+function medianOf(values: number[]): number {
+	const sorted = [...values].sort((a, b) => a - b);
+	const middle = Math.floor(sorted.length / 2);
+	return sorted.length % 2 === 1
+		? (sorted[middle] as number)
+		: ((sorted[middle - 1] as number) + (sorted[middle] as number)) / 2;
+}
+
+/**
+ * A service-ready baseline that grows with campaign size is a loaded baseline:
+ * the run measured its own workload instead of one-time initialization.
+ */
+export function assertWarmupNotLoaded(
+	deltas: { sessions: number; coldToServiceReadyDeltaMb: number }[],
+	toleranceMb = 1.0,
+): string[] {
+	const bySessions = new Map<number, number[]>();
+	for (const delta of deltas) {
+		const bucket = bySessions.get(delta.sessions) ?? [];
+		bucket.push(delta.coldToServiceReadyDeltaMb);
+		bySessions.set(delta.sessions, bucket);
+	}
+	if (bySessions.size < 2) {
+		return [
+			"warmup baseline scaling guard needs coldToServiceReadyDeltaMb samples from at least two session counts",
+		];
+	}
+	const medians = [...bySessions.entries()]
+		.map(([sessions, values]) => ({ sessions, median: medianOf(values) }))
+		.sort((a, b) => a.sessions - b.sessions);
+	const lowest = medians.reduce((min, entry) =>
+		entry.median < min.median ? entry : min,
+	);
+	const highest = medians.reduce((max, entry) =>
+		entry.median > max.median ? entry : max,
+	);
+	const spread = highest.median - lowest.median;
+	if (spread > toleranceMb) {
+		return [
+			`warmup baseline scales with campaign size: coldToServiceReadyDeltaMb median ${lowest.median.toFixed(3)}MB at ${lowest.sessions} sessions vs ${highest.median.toFixed(3)}MB at ${highest.sessions} sessions (delta ${spread.toFixed(3)}MB exceeds ${toleranceMb.toFixed(3)}MB tolerance)`,
+		];
+	}
+	return [];
+}
+
 export type RssWarmupTelemetry = {
 	kind: "same-process-native-server-create-close" | "not-run";
 	serverWarmupCycles: number;
@@ -148,7 +262,7 @@ export type RssWarmupTelemetry = {
 	datagramWarmupSessions: number;
 	datagramWarmupDatagramsReceived: number;
 	nativeClientPrewarmed: false;
-	allocatorReliefApplied: false;
+	allocatorReliefApplied: boolean;
 	processRestarted: false;
 };
 
@@ -173,6 +287,7 @@ export type MemoryTelemetry = {
 	serviceReadyRecoveryRatio: number | null;
 	coldToServiceReadyDeltaMb: number;
 	serviceReadyToPostCloseDeltaMb: number;
+	allocatorRelief: AllocatorReliefTelemetry[];
 	warmup: RssWarmupTelemetry;
 	coldStartDiagnostic: ColdStartDiagnostic;
 };
@@ -262,6 +377,8 @@ export function buildMemoryTelemetry(input: {
 	preClose: MemorySample;
 	postClose: MemorySample;
 	warmup?: RssWarmupTelemetry;
+	allocatorRelief?: AllocatorReliefTelemetry[];
+	coldStartDiagnosticThreshold?: number;
 	aborted?: boolean;
 }): MemoryTelemetry {
 	const ratio = (baseline: MemorySample): number | null =>
@@ -270,12 +387,29 @@ export function buildMemoryTelemetry(input: {
 			: null;
 	const coldStartRecoveryRatio = ratio(input.coldStart);
 	const serviceReadyRecoveryRatio = ratio(input.serviceReady);
+	const threshold =
+		input.coldStartDiagnosticThreshold ?? RSS_COLD_START_DIAGNOSTIC_THRESHOLD;
 	const coldStartDiagnosticStatus = input.aborted
 		? "aborted"
-		: coldStartRecoveryRatio != null &&
-				coldStartRecoveryRatio <= RSS_COLD_START_DIAGNOSTIC_THRESHOLD
+		: coldStartRecoveryRatio != null && coldStartRecoveryRatio <= threshold
 			? "pass"
 			: "review-required";
+	const allocatorRelief = input.allocatorRelief ?? [];
+	const warmup: RssWarmupTelemetry = input.warmup ?? {
+		kind: "not-run",
+		serverWarmupCycles: 0,
+		serversWarmed: 0,
+		sameProcess: false,
+		streamStackWarmed: false,
+		streamWarmupSessions: 0,
+		streamWarmupStreamsOpened: 0,
+		datagramStackWarmed: false,
+		datagramWarmupSessions: 0,
+		datagramWarmupDatagramsReceived: 0,
+		nativeClientPrewarmed: false,
+		allocatorReliefApplied: false,
+		processRestarted: false,
+	};
 	return {
 		coldStart: input.coldStart,
 		serviceReady: input.serviceReady,
@@ -294,25 +428,18 @@ export function buildMemoryTelemetry(input: {
 		serviceReadyToPostCloseDeltaMb: Number(
 			(input.postClose.rssMb - input.serviceReady.rssMb).toFixed(3),
 		),
-		warmup: input.warmup ?? {
-			kind: "not-run",
-			serverWarmupCycles: 0,
-			serversWarmed: 0,
-			sameProcess: false,
-			streamStackWarmed: false,
-			streamWarmupSessions: 0,
-			streamWarmupStreamsOpened: 0,
-			datagramStackWarmed: false,
-			datagramWarmupSessions: 0,
-			datagramWarmupDatagramsReceived: 0,
-			nativeClientPrewarmed: false,
-			allocatorReliefApplied: false,
-			processRestarted: false,
+		allocatorRelief,
+		warmup: {
+			...warmup,
+			allocatorReliefApplied:
+				input.allocatorRelief !== undefined
+					? allocatorReliefApplied(allocatorRelief)
+					: warmup.allocatorReliefApplied,
 		},
 		coldStartDiagnostic: {
 			status: coldStartDiagnosticStatus,
 			ratio: coldStartRecoveryRatio,
-			threshold: RSS_COLD_START_DIAGNOSTIC_THRESHOLD,
+			threshold,
 			reason:
 				coldStartDiagnosticStatus === "pass"
 					? "cold-start recovery stayed within the unchanged RSS threshold"
@@ -339,6 +466,9 @@ export type OverloadEvidence = {
 	admissionShedCount: number;
 	steadyStateBeforeOverload: FinalGauges;
 	postOverloadGauges: FinalGauges;
+	/** The sampled tuple that met the steady-state baseline, null if none did. */
+	recoveredGauges: FinalGauges | null;
+	/** Wall time spent waiting for that recovered sample. */
 	recoveryDurationMs: number;
 };
 
@@ -1502,6 +1632,16 @@ export function evaluateOverloadEvidence(evidence: OverloadEvidence): string[] {
 			"overload phase produced no limit/rate admission-shed evidence",
 		);
 	}
+	if (evidence.attemptedSessions > 0 && evidence.admissionShedCount === 0) {
+		failures.push(
+			`overload phase attempted ${evidence.attemptedSessions} sessions but shed none; quiescence alone is not shed-and-recover evidence`,
+		);
+	}
+	if (evidence.recoveredGauges === null) {
+		failures.push(
+			"overload phase recorded no gauge sample that met the steady-state baseline",
+		);
+	}
 	if (
 		!recoveredToSteadyBaseline(
 			evidence.steadyStateBeforeOverload,
@@ -1826,6 +1966,7 @@ function emptyOverloadEvidence(gauges: FinalGauges): OverloadEvidence {
 		admissionShedCount: 0,
 		steadyStateBeforeOverload: gauges,
 		postOverloadGauges: gauges,
+		recoveredGauges: null,
 		recoveryDurationMs: 0,
 	};
 }
@@ -1924,6 +2065,12 @@ async function runOverloadPhase(
 			admissionShedCount: limitExceededDelta + rateLimitedDelta,
 			steadyStateBeforeOverload: steadyState,
 			postOverloadGauges,
+			recoveredGauges: recoveredToSteadyBaseline(
+				steadyState,
+				postOverloadGauges,
+			)
+				? postOverloadGauges
+				: null,
 			recoveryDurationMs: Number(
 				(performance.now() - recoveryStartedAt).toFixed(3),
 			),
@@ -1983,9 +2130,13 @@ async function warmNativeServerForRssBaseline(
 	clientBin: string,
 	cert: CampaignCertificate,
 	config: ScaleCampaignConfig,
-	serverSessionCaps: number[],
-): Promise<RssWarmupTelemetry> {
+): Promise<{
+	telemetry: RssWarmupTelemetry;
+	allocatorRelief: AllocatorReliefTelemetry[];
+}> {
+	const warmupWorkload = warmupWorkloadPerServer();
 	const warmupServers: ReturnType<typeof createServer>[] = [];
+	const allocatorRelief: AllocatorReliefTelemetry[] = [];
 	const warmupStreamTasks: Promise<void>[] = [];
 	let streamWarmupStreamsOpened = 0;
 	let streamWarmupSessions = 0;
@@ -1999,8 +2150,8 @@ async function warmNativeServerForRssBaseline(
 					campaignServerOptions(
 						cert,
 						0,
-						serverSessionCaps[i] ?? 0,
-						config.overloadSessionsPerServer,
+						warmupWorkload.sessions,
+						0,
 						(session) => {
 							const deadline = Date.now() + 5_000;
 							if (config.datagramsPerSec > 0) {
@@ -2026,12 +2177,12 @@ async function warmNativeServerForRssBaseline(
 								task.catch(() => undefined);
 							}
 						},
-						config,
+						warmupWorkload,
 					),
 				),
 			);
 			if (config.streamsPerSec > 0) {
-				const warmupSessions = Math.max(1, serverSessionCaps[i] ?? 1);
+				const warmupSessions = warmupWorkload.sessions;
 				streamWarmupSessions += warmupSessions;
 				if (config.datagramsPerSec > 0) {
 					datagramWarmupSessions += warmupSessions;
@@ -2053,8 +2204,9 @@ async function warmNativeServerForRssBaseline(
 					},
 					{
 						durationSec: 1,
-						datagramsPerSec: config.datagramsPerSec,
-						streamsPerSec: config.streamsPerSec,
+						datagramsPerSec:
+							config.datagramsPerSec > 0 ? warmupWorkload.datagramsPerSec : 0,
+						streamsPerSec: warmupWorkload.streamsPerSec,
 						maxSessionErrors: 0,
 						skipProbes: true,
 					},
@@ -2074,7 +2226,7 @@ async function warmNativeServerForRssBaseline(
 				}
 			}
 			if (config.streamsPerSec <= 0 && config.datagramsPerSec > 0) {
-				const warmupSessions = Math.max(1, serverSessionCaps[i] ?? 1);
+				const warmupSessions = warmupWorkload.sessions;
 				datagramWarmupSessions += warmupSessions;
 				const datagramsBefore = datagramWarmupDatagramsReceived;
 				const launch = normalizedClientLaunches(config)[0] ?? {
@@ -2093,7 +2245,7 @@ async function warmNativeServerForRssBaseline(
 					},
 					{
 						durationSec: 1,
-						datagramsPerSec: config.datagramsPerSec,
+						datagramsPerSec: warmupWorkload.datagramsPerSec,
 						streamsPerSec: 0,
 						maxSessionErrors: 0,
 						skipProbes: true,
@@ -2123,7 +2275,7 @@ async function warmNativeServerForRssBaseline(
 				gauges.queuedBytesGlobal === 0,
 		);
 		await Promise.allSettled(warmupStreamTasks);
-		await Promise.all(
+		const warmupCloseResults = await Promise.all(
 			warmupServers.map((server) =>
 				awaitWithTimeout(
 					"rss baseline server.close",
@@ -2132,6 +2284,10 @@ async function warmNativeServerForRssBaseline(
 				),
 			),
 		);
+		for (const result of warmupCloseResults) {
+			const relief = toAllocatorReliefTelemetry("warmup", result);
+			if (relief) allocatorRelief.push(relief);
+		}
 		warmupClosed = true;
 		await Bun.sleep(250);
 	} finally {
@@ -2148,19 +2304,22 @@ async function warmNativeServerForRssBaseline(
 		}
 	}
 	return {
-		kind: "same-process-native-server-create-close",
-		serverWarmupCycles: 1,
-		serversWarmed: config.serverCount,
-		sameProcess: true,
-		streamStackWarmed: config.streamsPerSec > 0,
-		streamWarmupSessions,
-		streamWarmupStreamsOpened,
-		datagramStackWarmed: config.datagramsPerSec > 0,
-		datagramWarmupSessions,
-		datagramWarmupDatagramsReceived,
-		nativeClientPrewarmed: false,
-		allocatorReliefApplied: false,
-		processRestarted: false,
+		telemetry: {
+			kind: "same-process-native-server-create-close",
+			serverWarmupCycles: 1,
+			serversWarmed: config.serverCount,
+			sameProcess: true,
+			streamStackWarmed: config.streamsPerSec > 0,
+			streamWarmupSessions,
+			streamWarmupStreamsOpened,
+			datagramStackWarmed: config.datagramsPerSec > 0,
+			datagramWarmupSessions,
+			datagramWarmupDatagramsReceived,
+			nativeClientPrewarmed: false,
+			allocatorReliefApplied: allocatorReliefApplied(allocatorRelief),
+			processRestarted: false,
+		},
+		allocatorRelief,
 	};
 }
 
@@ -2216,6 +2375,7 @@ async function runOneCampaign(
 	let serversClosed = false;
 	const drainTasks: Promise<void>[] = [];
 	const reviewRequired: string[] = [];
+	const allocatorRelief: AllocatorReliefTelemetry[] = [];
 	let warmupTelemetry: RssWarmupTelemetry = {
 		kind: "not-run",
 		serverWarmupCycles: 0,
@@ -2233,12 +2393,13 @@ async function runOneCampaign(
 	};
 
 	try {
-		warmupTelemetry = await warmNativeServerForRssBaseline(
+		const warmup = await warmNativeServerForRssBaseline(
 			clientBin,
 			cert,
 			config,
-			serverSessionCaps,
 		);
+		warmupTelemetry = warmup.telemetry;
+		allocatorRelief.push(...warmup.allocatorRelief);
 		serviceReadyMemory = getMemorySample();
 		preCloseMemory = serviceReadyMemory;
 		postCloseMemory = serviceReadyMemory;
@@ -2680,7 +2841,7 @@ async function runOneCampaign(
 
 		// Keep awaitWithTimeout("server.close", ...) visible as the shutdown contract.
 		const closeStartedAt = performance.now();
-		await Promise.all(
+		const closeResults = await Promise.all(
 			servers.map((server) =>
 				awaitWithTimeout(
 					"server.close",
@@ -2689,6 +2850,10 @@ async function runOneCampaign(
 				),
 			),
 		);
+		for (const result of closeResults) {
+			const relief = toAllocatorReliefTelemetry("campaign", result);
+			if (relief) allocatorRelief.push(relief);
+		}
 		serversClosed = true;
 		const closeDurationMs = Number(
 			(performance.now() - closeStartedAt).toFixed(3),
@@ -2822,6 +2987,8 @@ async function runOneCampaign(
 			preClose: preCloseMemory,
 			postClose: postCloseMemory,
 			warmup: warmupTelemetry,
+			allocatorRelief,
+			coldStartDiagnosticThreshold: coldStartDiagnosticThreshold(config),
 		});
 
 		if (
@@ -2966,6 +3133,7 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 					peak: sample,
 					preClose: sample,
 					postClose: sample,
+					coldStartDiagnosticThreshold: coldStartDiagnosticThreshold(config),
 					aborted: true,
 				});
 			})(),
