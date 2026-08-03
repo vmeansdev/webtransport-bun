@@ -436,6 +436,30 @@ fn should_reset_on_oversized_chunk(sz: u64, budget: &Option<StreamBudget>) -> bo
     budget.as_ref().is_some_and(|b| sz > b.max_stream)
 }
 
+/// Budget in force for a deferred stream, materializing the retained config on
+/// first use. Whichever half of the stream is touched first — a read or a write
+/// — installs the budget, and both then share the same per-stream counter.
+fn installed_budget(
+    budget: &Mutex<Option<StreamBudget>>,
+    deferred: &Mutex<Option<DeferredStreamBudgetConfig>>,
+) -> Result<Option<StreamBudget>> {
+    let mut budget_guard = budget
+        .lock()
+        .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?;
+    if let Some(existing) = budget_guard.as_ref() {
+        return Ok(Some(existing.clone()));
+    }
+    let materialized = deferred
+        .lock()
+        .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
+        .take()
+        .map(DeferredStreamBudgetConfig::materialize);
+    if let Some(ref value) = materialized {
+        *budget_guard = Some(value.clone());
+    }
+    Ok(materialized)
+}
+
 async fn acquire_deferred_read_bridge_permit(
     read_abort: &Notify,
     read_aborted: &AtomicBool,
@@ -673,28 +697,7 @@ impl ClientBidiStreamHandle {
             drop(guard);
             return Ok(Some(None));
         };
-        let budget = {
-            let mut budget_guard = self
-                .budget
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?;
-            if let Some(existing) = budget_guard.as_ref() {
-                Some(existing.clone())
-            } else {
-                let materialized = self
-                    .deferred_budget
-                    .lock()
-                    .map_err(|_| {
-                        napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned")
-                    })?
-                    .take()
-                    .map(DeferredStreamBudgetConfig::materialize);
-                if let Some(ref value) = materialized {
-                    *budget_guard = Some(value.clone());
-                }
-                materialized
-            }
-        };
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         if let Some(ref b) = budget {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
                 recv_stream.stop(0);
@@ -934,6 +937,10 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+        self.write_bytes(chunk.to_vec()).await
+    }
+
+    async fn write_bytes(&self, bytes: Vec<u8>) -> Result<()> {
         // A finished/reset stream never accepts more data: reject deterministically
         // rather than letting a late write race into the channel behind the FIN.
         if self.finished.load(Ordering::Acquire) {
@@ -948,17 +955,15 @@ impl ClientBidiStreamHandle {
                 }
             }
         }
-        let bytes = chunk.to_vec();
         if bytes.is_empty() {
             return Ok(());
         }
         let tx = self.ensure_write_tx()?;
         let sz = bytes.len() as u64;
-        let budget = self
-            .budget
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?
-            .clone();
+        // An accepted stream that is only ever written keeps its budget deferred
+        // until here: materialize it on this side too, otherwise a push-style
+        // server bypasses the queue limits entirely.
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         if let Some(ref b) = budget {
             // Reliable-stream backpressure: park until budget frees (lossless)
             // instead of erroring, bounded by the backpressure timeout.
@@ -1382,28 +1387,7 @@ impl ClientUniRecvHandle {
             drop(guard);
             return Ok(Some(None));
         };
-        let budget = {
-            let mut budget_guard = self
-                .budget
-                .lock()
-                .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream budget lock poisoned"))?;
-            if let Some(existing) = budget_guard.as_ref() {
-                Some(existing.clone())
-            } else {
-                let materialized = self
-                    .deferred_budget
-                    .lock()
-                    .map_err(|_| {
-                        napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned")
-                    })?
-                    .take()
-                    .map(DeferredStreamBudgetConfig::materialize);
-                if let Some(ref value) = materialized {
-                    *budget_guard = Some(value.clone());
-                }
-                materialized
-            }
-        };
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         if let Some(ref b) = budget {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
                 recv_stream.stop(0);
@@ -2259,6 +2243,77 @@ mod tests {
     fn stream_chunk_without_budget_is_noop() {
         let chunk = StreamChunk::new(vec![1u8; 10], None, 0);
         drop(chunk);
+    }
+
+    fn deferred_config() -> DeferredStreamBudgetConfig {
+        DeferredStreamBudgetConfig::new(
+            Arc::new(crate::server_metrics::ServerMetrics::default()),
+            Arc::new(crate::session_registry::SessionMetrics::default()),
+            1 << 20,
+            1 << 18,
+            1 << 16,
+            1000,
+        )
+    }
+
+    /// An accepted stream that is only ever written to (push-style server) must
+    /// still install its byte budget: the deferred config is otherwise dropped
+    /// on the floor and the documented queue limits go unenforced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_path_materializes_deferred_budget() {
+        let (write_tx, _write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
+        let (_read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+        let (stop_tx, _stop_rx) = oneshot::channel::<u32>();
+        let handle = ClientBidiStreamHandle::new(read_rx, write_tx, stop_tx);
+        *handle.deferred_budget.lock().unwrap() = Some(deferred_config());
+
+        handle
+            .write_bytes(vec![7u8; 128])
+            .await
+            .expect("write must succeed");
+
+        let installed = handle.budget.lock().unwrap().clone();
+        let installed = installed.expect("write path must materialize the deferred budget");
+        assert!(
+            handle.deferred_budget.lock().unwrap().is_none(),
+            "deferred config must be consumed exactly once"
+        );
+        assert_eq!(installed.stream_queued.load(Ordering::Relaxed), 128);
+        assert_eq!(
+            installed
+                .server_metrics
+                .queued_bytes_global
+                .load(Ordering::Relaxed),
+            128
+        );
+        assert_eq!(
+            installed
+                .session_metrics
+                .queued_bytes
+                .load(Ordering::Relaxed),
+            128
+        );
+    }
+
+    /// Repeated writes must accumulate against the same materialized budget
+    /// rather than minting a fresh (empty) one per call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_writes_share_one_materialized_budget() {
+        let (write_tx, _write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
+        let (_read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+        let (stop_tx, _stop_rx) = oneshot::channel::<u32>();
+        let handle = ClientBidiStreamHandle::new(read_rx, write_tx, stop_tx);
+        *handle.deferred_budget.lock().unwrap() = Some(deferred_config());
+
+        for _ in 0..3 {
+            handle
+                .write_bytes(vec![1u8; 64])
+                .await
+                .expect("write must succeed");
+        }
+
+        let installed = handle.budget.lock().unwrap().clone().expect("budget");
+        assert_eq!(installed.stream_queued.load(Ordering::Relaxed), 192);
     }
 
     #[test]
