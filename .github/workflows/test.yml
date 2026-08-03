@@ -163,6 +163,11 @@ jobs:
         run: cargo clippy --workspace -- -D clippy::all
       - name: cargo test
         run: cargo test --workspace
+      - name: Build test-fixture binaries
+        # The adversarial-protocol suite spawns crates/adversary. Build it in a
+        # visible, retryable step so its existsSync guard passes — building it
+        # inside the test's beforeAll swallows errors and flaked across runners.
+        run: cargo build -p adversary
       - name: Install deps
         run: bun install --frozen-lockfile
       - name: Build native addon
