@@ -183,6 +183,20 @@ pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>
     }
 }
 
+pub(crate) async fn discard_datagram_for_session(id: &str) -> Result<Option<bool>> {
+    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+        return Ok(None);
+    };
+    let mut rx = dgram_rx.lock().await;
+    match rx.recv().await {
+        Some(slot) => {
+            slot.discard();
+            Ok(Some(true))
+        }
+        None => Ok(None),
+    }
+}
+
 pub(crate) async fn create_bidi_stream_for_session(id: &str) -> Result<ClientBidiStreamHandle> {
     let Some((_, _, metrics, _, _, create_bi_tx, _)) = session_registry::get(id) else {
         return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
@@ -597,6 +611,26 @@ mod tests {
             .expect("read")
             .expect("payload");
         assert_eq!(got, b"queued");
+
+        let discard_slot = session_registry::DatagramSlot::new(
+            b"discard".to_vec(),
+            Arc::clone(&sm),
+            Arc::clone(&metrics),
+            Arc::clone(&dgram_notify),
+            0,
+        );
+        dgram_tx
+            .send(discard_slot)
+            .await
+            .expect("enqueue discard datagram");
+        assert_eq!(
+            discard_datagram_for_session(&client_id)
+                .await
+                .expect("discard")
+                .expect("discard result"),
+            true
+        );
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
 
         // Closed-session path for reserve: mark closed then attempt send.
         session_registry::abort_session(&client_id, 0, b"closed");

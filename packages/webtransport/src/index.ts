@@ -1108,6 +1108,7 @@ interface NativeSessionHandle {
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
 	readDatagram(): Promise<Buffer | null>;
+	discardDatagram?: () => Promise<boolean | null>;
 	createBidiStream(): Promise<NativeBidiStreamHandle>;
 	createUniStream(): Promise<NativeSendStreamHandle>;
 	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
@@ -1406,6 +1407,18 @@ class NativeServerSession implements ServerSession {
 			})();
 		}
 		return this.#incomingDatagramsCache;
+	}
+
+	/** @internal Consume one queued datagram without materializing its payload. */
+	async discardIncomingDatagram(): Promise<boolean | null | undefined> {
+		if (!this.#nativeHandle.discardDatagram) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardDatagram();
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
 	}
 
 	async createBidirectionalStream(

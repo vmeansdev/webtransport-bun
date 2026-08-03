@@ -819,6 +819,29 @@ async function drainSessionDatagramsBeforeDeadline(
 	deadlineMs: number,
 	onDatagram: () => void,
 ): Promise<void> {
+	const discardDatagram = (
+		session as ServerSession & {
+			discardIncomingDatagram?: () => Promise<boolean | null | undefined>;
+		}
+	).discardIncomingDatagram;
+	if (discardDatagram) {
+		let fallbackToPayloadReader = false;
+		while (Date.now() < deadlineMs) {
+			const next = discardDatagram.call(session);
+			const result =
+				session.metricsSnapshot().queuedBytes > 0
+					? await next
+					: await nextBeforeDeadline(next, deadlineMs);
+			if (result === undefined) {
+				fallbackToPayloadReader = true;
+				break;
+			}
+			if (result !== true) return;
+			onDatagram();
+		}
+		if (!fallbackToPayloadReader) return;
+	}
+
 	const iterator = session.incomingDatagrams()[Symbol.asyncIterator]();
 	try {
 		while (Date.now() < deadlineMs) {
@@ -2096,6 +2119,32 @@ async function runOneCampaign(
 							) {
 								serverDatagramProbeDone = true;
 								const task = (async () => {
+									if (config.workloadMode === "drain-all") {
+										const iterator = session
+											.incomingDatagrams()
+											[Symbol.asyncIterator]();
+										try {
+											const next = iterator.next();
+											const result =
+												session.metricsSnapshot().queuedBytes > 0
+													? await next
+													: await nextBeforeDeadline(next, drainDeadline);
+											if (!result || result.done) return;
+											countDatagram();
+											await session.sendDatagram(result.value);
+											serverDatagramSends += 1;
+											sessionDatagramProbeSent = true;
+										} finally {
+											await iterator.return?.();
+										}
+										await drainSessionDatagramsBeforeDeadline(
+											session,
+											drainDeadline,
+											countDatagram,
+										);
+										return;
+									}
+
 									const iterator = session
 										.incomingDatagrams()
 										[Symbol.asyncIterator]();
