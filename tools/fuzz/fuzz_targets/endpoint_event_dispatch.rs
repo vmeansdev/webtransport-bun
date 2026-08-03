@@ -91,6 +91,17 @@ fn extract_conn(encoded: &[u8]) -> Option<u32> {
     take_varint(encoded, &mut offset).and_then(|value| u32::try_from(value).ok())
 }
 
+/// SESSION_ESTABLISHED wire: tag, conn varint, session_id varint.
+fn extract_session(encoded: &[u8]) -> Option<(u32, u64)> {
+    if encoded.first().copied() != Some(tag::SESSION_ESTABLISHED) {
+        return None;
+    }
+    let mut offset = 1_usize;
+    let conn = take_varint(encoded, &mut offset).and_then(|value| u32::try_from(value).ok())?;
+    let session_id = take_varint(encoded, &mut offset)?;
+    Some((conn, session_id))
+}
+
 fn pump(from: &mut WtEndpoint, source: SocketAddr, to: &mut WtEndpoint, now: Instant) {
     let mut packets = Vec::new();
     from.poll_transmits(now, &mut packets);
@@ -99,13 +110,20 @@ fn pump(from: &mut WtEndpoint, source: SocketAddr, to: &mut WtEndpoint, now: Ins
     }
 }
 
-fn drain_events(endpoint: &mut WtEndpoint, observed_conn: &mut Option<u32>) {
+fn drain_events(
+    endpoint: &mut WtEndpoint,
+    observed_conn: &mut Option<u32>,
+    observed_session: &mut Option<(u32, u64)>,
+) {
     for _ in 0..64 {
         let Some(encoded) = endpoint.poll_event_encoded() else {
             break;
         };
         if observed_conn.is_none() {
             *observed_conn = extract_conn(&encoded);
+        }
+        if observed_session.is_none() {
+            *observed_session = extract_session(&encoded);
         }
         maybe_release_host_token(endpoint, &encoded);
     }
@@ -141,35 +159,42 @@ fuzz_target!(|data: &[u8]| {
     }
     let client_conn = client_conn as u32;
     let mut server_conn = None;
+    let mut client_session: Option<(u32, u64)> = None;
+    let mut server_session: Option<(u32, u64)> = None;
     let mut offset = 12_usize;
 
     for _ in 0..32 {
         let now = Instant::now();
         pump(&mut client, client_addr, &mut server, now);
         pump(&mut server, server_addr, &mut client, now);
-        drain_events(&mut client, &mut None);
-        drain_events(&mut server, &mut server_conn);
+        drain_events(&mut client, &mut None, &mut client_session);
+        drain_events(&mut server, &mut server_conn, &mut server_session);
 
         match data.get(offset).copied().unwrap_or(0) % 5 {
             0 => {
-                let _ = client.send_datagram(client_conn, payload(data, offset + 1));
+                if let Some((_, session_id)) = client_session {
+                    let _ =
+                        client.send_datagram(client_conn, session_id, payload(data, offset + 1));
+                }
             }
             1 => {
-                let stream = client.open_stream(client_conn, true);
-                if stream >= 0 {
-                    let stream = stream as u32;
-                    let _ = client.stream_write(stream, payload(data, offset + 1));
-                    client.stream_finish(stream);
+                if let Some((_, session_id)) = client_session {
+                    let stream = client.open_stream(client_conn, session_id, true);
+                    if stream >= 0 {
+                        let stream = stream as u32;
+                        let _ = client.stream_write(stream, payload(data, offset + 1));
+                        client.stream_finish(stream);
+                    }
                 }
             }
             2 => {
-                if let Some(conn) = server_conn {
-                    let _ = server.send_datagram(conn, payload(data, offset + 1));
+                if let Some((conn, session_id)) = server_session {
+                    let _ = server.send_datagram(conn, session_id, payload(data, offset + 1));
                 }
             }
             3 => {
-                if let Some(conn) = server_conn {
-                    let stream = server.open_stream(conn, true);
+                if let Some((conn, session_id)) = server_session {
+                    let stream = server.open_stream(conn, session_id, true);
                     if stream >= 0 {
                         let stream = stream as u32;
                         let _ = server.stream_write(stream, payload(data, offset + 1));
