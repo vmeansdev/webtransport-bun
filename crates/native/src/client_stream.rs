@@ -8,7 +8,7 @@
 use crate::error::{from_reason as wt_from_reason, WtResult};
 use napi::Result;
 use napi_derive::napi;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
@@ -90,6 +90,24 @@ pub struct StreamBudget {
 /// stay parked when a *sibling* stream freed shared global/session budget (whose
 /// release notifies its own per-stream notifier, not the waiter's).
 const BUDGET_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(50);
+const STREAM_READ_BUFFER_BYTES: usize = 64 * 1024;
+const STREAM_CHANNEL_CAPACITY: usize = 256;
+
+// These counters intentionally track the NAPI stream-handle objects, not the
+// Tokio bridge tasks.  The server drain metrics already prove that bridge
+// owners and their task guards have gone away; these counters tell us whether
+// the JS-visible native handles are still retained after the facade closes.
+static LIVE_BIDI_HANDLES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_UNI_SEND_HANDLES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_UNI_RECV_HANDLES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn live_native_stream_handles() -> (usize, usize, usize) {
+    (
+        LIVE_BIDI_HANDLES.load(Ordering::Relaxed),
+        LIVE_UNI_SEND_HANDLES.load(Ordering::Relaxed),
+        LIVE_UNI_RECV_HANDLES.load(Ordering::Relaxed),
+    )
+}
 
 impl StreamBudget {
     /// Fresh capacity notifier for a new stream budget.
@@ -253,7 +271,8 @@ fn should_reset_on_oversized_chunk(sz: u64, budget: &Option<StreamBudget>) -> bo
 #[napi]
 pub struct ClientBidiStreamHandle {
     read_rx: Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>,
-    write_tx: Option<mpsc::Sender<StreamCmd>>,
+    write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
+    lazy_send_stream: Mutex<Option<wtransport::SendStream>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Option<StreamBudget>,
     write_error_slot: Option<WriteErrorSlot>,
@@ -270,9 +289,11 @@ impl ClientBidiStreamHandle {
         write_tx: mpsc::Sender<StreamCmd>,
         stop_tx: oneshot::Sender<u32>,
     ) -> Self {
+        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
-            write_tx: Some(write_tx),
+            write_tx: Mutex::new(Some(write_tx)),
+            lazy_send_stream: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: None,
             write_error_slot: None,
@@ -298,12 +319,34 @@ impl ClientBidiStreamHandle {
         write_error_slot: Option<WriteErrorSlot>,
         read_error_slot: Option<ReadErrorSlot>,
     ) -> Self {
+        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
-            write_tx: Some(write_tx),
+            write_tx: Mutex::new(Some(write_tx)),
+            lazy_send_stream: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget,
             write_error_slot,
+            read_error_slot,
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn new_lazy_with_budget_and_slot(
+        read_rx: mpsc::Receiver<StreamChunk>,
+        send_stream: wtransport::SendStream,
+        stop_tx: oneshot::Sender<u32>,
+        budget: Option<StreamBudget>,
+        read_error_slot: Option<ReadErrorSlot>,
+    ) -> Self {
+        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_rx: Arc::new(TokioMutex::new(read_rx)),
+            write_tx: Mutex::new(None),
+            lazy_send_stream: Mutex::new(Some(send_stream)),
+            stop_tx: std::sync::Mutex::new(Some(stop_tx)),
+            budget,
+            write_error_slot: Some(Arc::new(Mutex::new(None))),
             read_error_slot,
             finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -315,6 +358,37 @@ impl ClientBidiStreamHandle {
         stop_tx: oneshot::Sender<u32>,
     ) -> Self {
         Self::new(read_rx, write_tx, stop_tx)
+    }
+
+    fn ensure_write_tx(&self) -> Result<mpsc::Sender<StreamCmd>> {
+        let mut tx_guard = self
+            .write_tx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream write lock poisoned"))?;
+        if let Some(tx) = tx_guard.as_ref() {
+            return Ok(tx.clone());
+        }
+        let send_stream = self
+            .lazy_send_stream
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: lazy stream lock poisoned"))?
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("E_STREAM_RESET"))?;
+        let write_error_slot = self
+            .write_error_slot
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+        let (write_tx, write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
+        spawn_bidi_write_bridge_on(&RUNTIME, send_stream, write_rx, write_error_slot);
+        *tx_guard = Some(write_tx.clone());
+        Ok(write_tx)
+    }
+}
+
+impl Drop for ClientBidiStreamHandle {
+    fn drop(&mut self) {
+        LIVE_BIDI_HANDLES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -355,9 +429,7 @@ impl ClientBidiStreamHandle {
                 }
             }
         }
-        let Some(ref tx) = self.write_tx else {
-            return Err(wt_from_reason("E_STREAM_RESET"));
-        };
+        let tx = self.ensure_write_tx()?;
         let bytes = chunk.to_vec();
         if bytes.is_empty() {
             return Ok(());
@@ -401,7 +473,9 @@ impl ClientBidiStreamHandle {
     #[napi]
     pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
-        send_ctrl_lossless(&self.write_tx, StreamCmd::Reset(code));
+        if let Ok(tx) = self.ensure_write_tx() {
+            send_ctrl_lossless(&Some(tx), StreamCmd::Reset(code));
+        }
         Ok(())
     }
 
@@ -420,16 +494,16 @@ impl ClientBidiStreamHandle {
     #[napi]
     pub fn finish(&self) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
-        send_ctrl_lossless(&self.write_tx, StreamCmd::Finish);
+        if let Ok(tx) = self.ensure_write_tx() {
+            send_ctrl_lossless(&Some(tx), StreamCmd::Finish);
+        }
         Ok(())
     }
 
     #[napi]
     pub async fn finish_wait(&self) -> Result<()> {
         self.finished.store(true, Ordering::Release);
-        let Some(ref tx) = self.write_tx else {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
-        };
+        let tx = self.ensure_write_tx()?;
         let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
         tx.send(StreamCmd::FinishWithAck(done_tx))
             .await
@@ -457,6 +531,7 @@ pub struct ClientUniSendHandle {
 
 impl ClientUniSendHandle {
     pub fn new(write_tx: mpsc::Sender<StreamCmd>) -> Self {
+        LIVE_UNI_SEND_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
             write_tx: Some(write_tx),
             budget: None,
@@ -477,12 +552,19 @@ impl ClientUniSendHandle {
         budget: Option<StreamBudget>,
         write_error_slot: Option<WriteErrorSlot>,
     ) -> Self {
+        LIVE_UNI_SEND_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
             write_tx: Some(write_tx),
             budget,
             write_error_slot,
             finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+}
+
+impl Drop for ClientUniSendHandle {
+    fn drop(&mut self) {
+        LIVE_UNI_SEND_HANDLES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -576,6 +658,7 @@ impl ClientUniRecvHandle {
     // Read-only handle: the recv bridge owns the budget and each buffered
     // StreamChunk carries its own reservation, so the handle does not retain one.
     pub fn new(read_rx: mpsc::Receiver<StreamChunk>, stop_tx: oneshot::Sender<u32>) -> Self {
+        LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
@@ -588,11 +671,18 @@ impl ClientUniRecvHandle {
         stop_tx: oneshot::Sender<u32>,
         read_error_slot: Option<ReadErrorSlot>,
     ) -> Self {
+        LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
             read_rx: Arc::new(TokioMutex::new(read_rx)),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot,
         }
+    }
+}
+
+impl Drop for ClientUniRecvHandle {
+    fn drop(&mut self) {
+        LIVE_UNI_RECV_HANDLES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -648,6 +738,173 @@ pub fn spawn_bidi_bridge(
     spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
 }
 
+fn spawn_bidi_write_bridge_on(
+    rt: &tokio::runtime::Runtime,
+    mut send_stream: wtransport::SendStream,
+    mut write_rx: mpsc::Receiver<StreamCmd>,
+    write_error_slot: WriteErrorSlot,
+) {
+    let write_error_slot_clone = Arc::clone(&write_error_slot);
+    rt.spawn(async move {
+        while let Some(cmd) = write_rx.recv().await {
+            match cmd {
+                StreamCmd::Data(chunk) => match send_stream.write_all(chunk.as_bytes()).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                        break;
+                    }
+                },
+                StreamCmd::Finish => {
+                    if let Err(e) = send_stream.finish().await {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                    }
+                    break;
+                }
+                StreamCmd::FinishWithAck(done_tx) => {
+                    let mut ret: std::result::Result<(), String> = Ok(());
+                    if let Err(e) = send_stream.finish().await {
+                        let code = match &e {
+                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
+                            _ => "E_STREAM_RESET",
+                        };
+                        if let Ok(mut guard) = write_error_slot_clone.lock() {
+                            if guard.is_none() {
+                                *guard = Some(code.to_string());
+                            }
+                        }
+                        ret = Err(code.to_string());
+                    }
+                    let _ = done_tx.send(ret);
+                    break;
+                }
+                StreamCmd::Reset(code) => {
+                    let _ = send_stream.reset(code);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+pub fn spawn_lazy_bidi_bridge(
+    send_stream: wtransport::SendStream,
+    recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
+    budget: Option<StreamBudget>,
+) -> (
+    mpsc::Receiver<StreamChunk>,
+    oneshot::Sender<u32>,
+    wtransport::SendStream,
+    Option<ReadErrorSlot>,
+) {
+    spawn_lazy_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
+}
+
+pub fn spawn_lazy_bidi_bridge_on(
+    rt: &tokio::runtime::Runtime,
+    send_stream: wtransport::SendStream,
+    mut recv_stream: wtransport::RecvStream,
+    guard: Option<StreamGuard>,
+    budget: Option<StreamBudget>,
+) -> (
+    mpsc::Receiver<StreamChunk>,
+    oneshot::Sender<u32>,
+    wtransport::SendStream,
+    Option<ReadErrorSlot>,
+) {
+    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+    let (stop_tx, stop_rx) = oneshot::channel::<u32>();
+    let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
+    let read_budget = budget;
+    let read_error_slot_clone = Arc::clone(&read_error_slot);
+    rt.spawn(async move {
+        let _guard = guard;
+        let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
+        let mut stop_rx = stop_rx;
+        loop {
+            tokio::select! {
+                res = recv_stream.read(&mut buf) => {
+                    match res {
+                        Ok(Some(n)) => {
+                            let sz = n as u64;
+                            if let Some(ref b) = read_budget {
+                                if should_reset_on_oversized_chunk(sz, &read_budget) {
+                                    recv_stream.stop(0);
+                                    if let Ok(mut g) = read_error_slot_clone.lock() {
+                                        if g.is_none() {
+                                            *g = Some("E_STREAM_RESET".to_string());
+                                        }
+                                    }
+                                    break;
+                                }
+                                let mut abort_stop: Option<Option<u32>> = None;
+                                while !b.try_reserve(sz) {
+                                    let notified = b.capacity_notify.notified();
+                                    tokio::pin!(notified);
+                                    if b.try_reserve(sz) {
+                                        break;
+                                    }
+                                    tokio::select! {
+                                        _ = &mut notified => {}
+                                        _ = tokio::time::sleep(BUDGET_POLL_INTERVAL) => {}
+                                        code = &mut stop_rx => {
+                                            abort_stop = Some(code.ok());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(stop_code) = abort_stop {
+                                    if let Some(c) = stop_code {
+                                        recv_stream.stop(c);
+                                    }
+                                    break;
+                                }
+                            }
+                            let chunk = StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
+                            if read_tx.send(chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            if let Ok(mut guard) = read_error_slot_clone.lock() {
+                                if guard.is_none() {
+                                    *guard = Some(read_error_code(&e).to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                code = &mut stop_rx => {
+                    if let Ok(c) = code {
+                        recv_stream.stop(c);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    (read_rx, stop_tx, send_stream, Some(read_error_slot))
+}
+
 /// Spawn bridge on a specific runtime (use CLIENT_RUNTIME for client streams).
 pub fn spawn_bidi_bridge_on(
     rt: &tokio::runtime::Runtime,
@@ -656,8 +913,8 @@ pub fn spawn_bidi_bridge_on(
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> BidiBridgeParts {
-    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(256);
-    let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
+    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+    let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
     let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
@@ -666,7 +923,7 @@ pub fn spawn_bidi_bridge_on(
     let read_error_slot_clone = Arc::clone(&read_error_slot);
     rt.spawn(async move {
         let _guard = guard;
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;
         loop {
             tokio::select! {
@@ -837,7 +1094,7 @@ pub fn spawn_uni_send_bridge_on(
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> (mpsc::Sender<StreamCmd>, Option<WriteErrorSlot>) {
-    let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(256);
+    let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
     let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
 
     let write_error_slot_clone = Arc::clone(&write_error_slot);
@@ -931,14 +1188,14 @@ pub fn spawn_uni_recv_bridge_on(
     oneshot::Sender<u32>,
     Option<ReadErrorSlot>,
 ) {
-    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(256);
+    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
     let (stop_tx, stop_rx) = oneshot::channel::<u32>();
     let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
 
     let read_error_slot_clone = Arc::clone(&read_error_slot);
     rt.spawn(async move {
         let _guard = guard;
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;
         loop {
             tokio::select! {

@@ -234,6 +234,16 @@ pub struct SessionState {
 
 static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
 
+/// Number of registry entries still owned by one server instance.
+/// This is diagnostic-only and intentionally scoped to the owner so a
+/// concurrent server cannot hide a retained session from close evidence.
+pub fn owner_entry_count(owner_server_id: u64) -> usize {
+    REGISTRY
+        .iter()
+        .filter(|entry| entry.value().owner_server_id == owner_server_id)
+        .count()
+}
+
 /// Insert a new session into the registry.
 /// Returns the bounded channel endpoints plus session metrics and the datagram
 /// capacity notifier captured by the ingress task before any teardown race.

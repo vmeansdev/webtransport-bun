@@ -322,6 +322,31 @@ pub fn cleanup_server_entries(server_id: u64) {
     DGRAM_BUCKETS.retain(|k, _| k.0 != server_id);
 }
 
+/// Count all rate-limit entries still owned by one server instance.
+/// The count is diagnostic-only; cleanup remains the authoritative close path.
+pub fn owner_entry_count(server_id: u64) -> usize {
+    PER_IP_SESSIONS
+        .iter()
+        .filter(|entry| entry.key().0 == server_id)
+        .count()
+        + PER_PREFIX_SESSIONS
+            .iter()
+            .filter(|entry| entry.key().0 == server_id)
+            .count()
+        + HANDSHAKE_BUCKETS
+            .iter()
+            .filter(|entry| entry.key().0 == server_id)
+            .count()
+        + STREAM_BUCKETS
+            .iter()
+            .filter(|entry| entry.key().0 == server_id)
+            .count()
+        + DGRAM_BUCKETS
+            .iter()
+            .filter(|entry| entry.key().0 == server_id)
+            .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

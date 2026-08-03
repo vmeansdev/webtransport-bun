@@ -338,9 +338,20 @@ impl ServerHandle {
                 .state
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: server state lock poisoned"))?;
-            Ok(self
+            let mut snapshot = self
                 .metrics
-                .snapshot(Some(state.tls_resolver.metrics_snapshot())))
+                .snapshot(Some(state.tls_resolver.metrics_snapshot()));
+            snapshot.native_session_registry_entries =
+                crate::session_registry::owner_entry_count(self.server_id) as u32;
+            snapshot.native_tracked_tasks =
+                crate::spawn_tracked::server_task_count(self.server_id) as u32;
+            snapshot.native_rate_limit_entries =
+                crate::rate_limit::owner_entry_count(self.server_id) as u32;
+            let (bidi, uni_send, uni_recv) = crate::client_stream::live_native_stream_handles();
+            snapshot.native_bidi_handles_live = bidi as u32;
+            snapshot.native_uni_send_handles_live = uni_send as u32;
+            snapshot.native_uni_recv_handles_live = uni_recv as u32;
+            Ok(snapshot)
         })
         .map_err(wt_from_reason)
     }
