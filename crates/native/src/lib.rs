@@ -871,8 +871,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                 capacity_notify: crate::client_stream::StreamBudget::new_notify(),
                                                                 backpressure_timeout_ms: lim_bidi.backpressure_timeout_ms,
                                                             };
-                                                            let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
+                                                            let (read_rx, stop_tx, send_stream, read_err_slot) = crate::client_stream::spawn_lazy_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_lazy_with_budget_and_slot(read_rx, send_stream, stop_tx, Some(budget), read_err_slot);
                                                             if bidi_accept_tx.send(handle).await.is_err() {
                                                                 report_channel_closed("bidi accept");
                                                                 break;

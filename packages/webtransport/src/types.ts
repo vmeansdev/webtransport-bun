@@ -145,6 +145,12 @@ export type MetricsSnapshot = {
 	sniCertSelections: number;
 	defaultCertSelections: number;
 	unknownSniRejectedCount: number;
+	nativeSessionRegistryEntries?: number;
+	nativeTrackedTasks?: number;
+	nativeRateLimitEntries?: number;
+	nativeBidiHandlesLive?: number;
+	nativeUniSendHandlesLive?: number;
+	nativeUniRecvHandlesLive?: number;
 
 	handshakeLatency?: HistogramSnapshot | null;
 	datagramEnqueueLatency?: HistogramSnapshot | null;

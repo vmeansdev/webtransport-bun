@@ -32,6 +32,18 @@ pub struct ServerMetricsSnapshot {
     pub sni_cert_selections: f64,
     pub default_cert_selections: f64,
     pub unknown_sni_rejected_count: f64,
+    /// Diagnostic count of native sessions still owned by this server.
+    pub native_session_registry_entries: u32,
+    /// Diagnostic count of tracked native tasks still owned by this server.
+    pub native_tracked_tasks: u32,
+    /// Diagnostic count of rate-limit entries still owned by this server.
+    pub native_rate_limit_entries: u32,
+    /// Diagnostic count of live JS-visible native bidi stream handles.
+    pub native_bidi_handles_live: u32,
+    /// Diagnostic count of live JS-visible native unidirectional send handles.
+    pub native_uni_send_handles_live: u32,
+    /// Diagnostic count of live JS-visible native unidirectional receive handles.
+    pub native_uni_recv_handles_live: u32,
     /// Handshake latency (accept start to completion). Present when any observation.
     pub handshake_latency: Option<HistogramSnapshot>,
     /// Datagram send enqueue latency. Present when any observation.
