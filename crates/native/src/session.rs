@@ -183,17 +183,69 @@ pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>
     }
 }
 
-pub(crate) async fn discard_datagram_for_session(id: &str) -> Result<Option<bool>> {
+pub(crate) async fn discard_datagram_for_session(
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<bool>> {
     let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
         return Ok(None);
     };
     let mut rx = dgram_rx.lock().await;
-    match rx.recv().await {
+    let next = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, rx.recv()).await {
+            Ok(slot) => slot,
+            Err(_) => return Ok(Some(false)),
+        },
+        None => rx.recv().await,
+    };
+    match next {
         Some(slot) => {
             slot.discard();
             Ok(Some(true))
         }
         None => Ok(None),
+    }
+}
+
+/// Consume queued datagrams until the session closes or the bounded deadline
+/// expires, without crossing the NAPI boundary once per payload.
+///
+/// The load/evidence drain is a black-hole consumer: it needs delivery counts,
+/// not payload bytes. Keeping this loop on the native runtime avoids creating a
+/// Tokio task and JavaScript promise for every low-rate datagram while retaining
+/// the same channel ownership and reservation-release semantics as the single
+/// item helper above.
+pub(crate) async fn discard_datagrams_for_session(
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<u64>> {
+    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+        return Ok(None);
+    };
+    let mut rx = dgram_rx.lock().await;
+    let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+    let mut discarded = 0u64;
+    loop {
+        let next = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(slot) => slot,
+                Err(_) => return Ok(Some(discarded)),
+            },
+            None => rx.recv().await,
+        };
+        match next {
+            Some(slot) => {
+                slot.discard();
+                discarded = discarded.saturating_add(1);
+            }
+            None => {
+                return Ok(if discarded == 0 {
+                    None
+                } else {
+                    Some(discarded)
+                })
+            }
+        }
     }
 }
 
@@ -624,13 +676,41 @@ mod tests {
             .await
             .expect("enqueue discard datagram");
         assert_eq!(
-            discard_datagram_for_session(&client_id)
+            discard_datagram_for_session(&client_id, None)
                 .await
                 .expect("discard")
                 .expect("discard result"),
             true
         );
         assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+
+        for data in [b"batch-a".to_vec(), b"batch-b".to_vec()] {
+            dgram_tx
+                .send(session_registry::DatagramSlot::new(
+                    data,
+                    Arc::clone(&sm),
+                    Arc::clone(&metrics),
+                    Arc::clone(&dgram_notify),
+                    0,
+                ))
+                .await
+                .expect("enqueue batch datagram");
+        }
+        assert_eq!(
+            discard_datagrams_for_session(&client_id, Some(Duration::from_millis(1)))
+                .await
+                .expect("batch discard")
+                .expect("batch discard result"),
+            2
+        );
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            discard_datagram_for_session(&client_id, Some(Duration::from_millis(1)))
+                .await
+                .expect("bounded discard"),
+            Some(false)
+        );
 
         // Closed-session path for reserve: mark closed then attempt send.
         session_registry::abort_session(&client_id, 0, b"closed");

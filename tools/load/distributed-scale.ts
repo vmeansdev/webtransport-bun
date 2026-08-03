@@ -819,15 +819,33 @@ async function drainSessionDatagramsBeforeDeadline(
 	deadlineMs: number,
 	onDatagram: () => void,
 ): Promise<void> {
+	const discardDatagrams = (
+		session as ServerSession & {
+			discardIncomingDatagrams?: (
+				timeoutMs?: number,
+			) => Promise<number | null | undefined>;
+		}
+	).discardIncomingDatagrams;
+	if (discardDatagrams) {
+		const remainingMs = Math.max(1, deadlineMs - Date.now());
+		const result = await discardDatagrams.call(session, remainingMs);
+		if (result === null || result === undefined) return;
+		for (let i = 0; i < result; i += 1) onDatagram();
+		return;
+	}
+
 	const discardDatagram = (
 		session as ServerSession & {
-			discardIncomingDatagram?: () => Promise<boolean | null | undefined>;
+			discardIncomingDatagram?: (
+				timeoutMs?: number,
+			) => Promise<boolean | null | undefined>;
 		}
 	).discardIncomingDatagram;
 	if (discardDatagram) {
 		let fallbackToPayloadReader = false;
 		while (Date.now() < deadlineMs) {
-			const next = discardDatagram.call(session);
+			const remainingMs = Math.max(1, deadlineMs - Date.now());
+			const next = discardDatagram.call(session, remainingMs);
 			const result =
 				session.metricsSnapshot().queuedBytes > 0
 					? await next
@@ -836,7 +854,8 @@ async function drainSessionDatagramsBeforeDeadline(
 				fallbackToPayloadReader = true;
 				break;
 			}
-			if (result !== true) return;
+			if (result === null || result === undefined) return;
+			if (result === false) continue;
 			onDatagram();
 		}
 		if (!fallbackToPayloadReader) return;
