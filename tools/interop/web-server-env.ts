@@ -20,7 +20,8 @@ export function buildInteropWebServerEnv(
 }
 
 export function resolveBunExecutable(): string {
-	if (basename(process.execPath).toLowerCase() === "bun") return process.execPath;
+	if (basename(process.execPath).toLowerCase() === "bun")
+		return process.execPath;
 	const lookup = process.platform === "win32" ? "where.exe" : "which";
 	try {
 		const resolved = execFileSync(lookup, ["bun"], {
