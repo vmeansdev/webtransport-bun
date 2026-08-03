@@ -8,7 +8,6 @@ import {
 	createServer,
 	DEFAULT_LIMITS,
 	type MetricsSnapshot,
-	type ServerCloseDiagnostics,
 	type ServerSession,
 	WT_RESET,
 	WT_STOP_SENDING,
@@ -154,13 +153,29 @@ export type AllocatorReliefTelemetry = {
 };
 
 /**
+ * Shape a close result may resolve when an allocator-relief hook is wired.
+ * The H1 relief wiring was reverted after its A/B disproof (see
+ * crates/native/src/native_memory.rs), so current closes resolve void and
+ * artifacts honestly record no relief; the telemetry path stays for any
+ * future retry.
+ */
+type ServerCloseDiagnostics = {
+	allocatorRelief: {
+		platform: string;
+		applied: boolean;
+		reportedBytesReleased?: number | null;
+		refusedReason?: string | null;
+	} | null;
+};
+
+/**
  * Normalize what {@link WebTransportServer.close} resolved into artifact
  * telemetry. Older close paths resolve `void`; those report no relief rather
  * than a synthesized outcome.
  */
 export function toAllocatorReliefTelemetry(
 	scope: AllocatorReliefTelemetry["scope"],
-	closeResult: ServerCloseDiagnostics | void | undefined,
+	closeResult: ServerCloseDiagnostics | undefined | void,
 ): AllocatorReliefTelemetry | null {
 	const relief = closeResult?.allocatorRelief;
 	if (!relief) return null;

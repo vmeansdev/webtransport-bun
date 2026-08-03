@@ -1,12 +1,21 @@
 //! Best-effort allocator residency release after a fully drained server close.
 //!
-//! The load evidence showed post-close RSS held above the cold-start baseline
-//! while every logical gauge was zero: freed native pages stay resident in the
-//! allocator. This module asks the platform allocator to return idle pages to
-//! the OS. It runs only after the drain seam reports zero logical work, close
-//! success never depends on it, and the reported byte figure is
-//! allocator-reported — it is NOT verified against RSS and must never drive a
-//! retain/reject decision on its own.
+//! DISPROVEN FOR THIS WORKLOAD (2026-08-03, macOS): a pre-registered on/off
+//! A/B at the same SHA — two runs per arm on both the 4-session strict smoke
+//! and the 200-session drain-all lane — measured a median post-close RSS
+//! improvement of 0.086 MB (smoke) and 0.047 MB (200-session) against a
+//! 1.0 MB retention gate. `malloc_zone_pressure_relief(NULL, 0)` reported
+//! ~0 bytes released: the post-close residual is not reclaimable free pages
+//! in the default malloc zones (Bun's JS heap uses mimalloc, and quinn's
+//! buffers were not sitting in releasable spans). The close-path wiring was
+//! therefore reverted; this module and its tests remain as the recorded
+//! implementation and disproof so the experiment is not silently repeated.
+//!
+//! If a platform or allocator change makes this worth retrying, rerun the
+//! same A/B before wiring it back in. It must only ever run after the drain
+//! seam reports zero logical work, close success must never depend on it, and
+//! the reported byte figure is allocator-reported — NOT verified against RSS
+//! and never a retain/reject criterion on its own.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidencyRelief {
