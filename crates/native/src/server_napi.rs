@@ -18,6 +18,21 @@ use crate::{LogEvent, SessionEvent};
 
 static SERVER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Allocator relief outcome surfaced to JS as a close diagnostic. The byte
+/// figure is allocator-reported, never RSS-verified; it must not gate anything.
+#[napi(object)]
+pub struct AllocatorReliefDiagnostic {
+    pub platform: String,
+    pub applied: bool,
+    pub reported_bytes_released: Option<i64>,
+    pub refused_reason: Option<String>,
+}
+
+#[napi(object)]
+pub struct ServerCloseResult {
+    pub allocator_relief: AllocatorReliefDiagnostic,
+}
+
 #[napi]
 pub struct ServerHandle {
     server_id: u64,
@@ -300,7 +315,7 @@ impl ServerHandle {
     }
 
     #[napi]
-    pub async fn close(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<ServerCloseResult> {
         panic_guard::catch_panic(|| {
             let mut state = self
                 .state
@@ -328,7 +343,18 @@ impl ServerHandle {
         if let Some(msg) = close_err {
             return Err(napi::Error::from_reason(msg));
         }
-        Ok(())
+        // Only after the drain seam reports zero logical work: ask the
+        // allocator to return idle pages. Best-effort — close success never
+        // depends on it; the outcome is surfaced as a diagnostic.
+        let relief = crate::native_memory::release_drained_residency(true);
+        Ok(ServerCloseResult {
+            allocator_relief: AllocatorReliefDiagnostic {
+                platform: relief.platform.to_string(),
+                applied: relief.applied,
+                reported_bytes_released: relief.reported_bytes_released.map(|b| b as i64),
+                refused_reason: relief.refused_reason.map(str::to_string),
+            },
+        })
     }
 
     #[napi]
@@ -432,7 +458,16 @@ mod tests {
             .await
             .expect("remove");
         let _ = handle.metrics_snapshot().expect("metrics");
-        handle.close().await.expect("close");
+        let close_result = handle.close().await.expect("close");
+        // Relief runs only after the drain seam reported zero logical work;
+        // on supported platforms a drained close must apply it.
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        {
+            assert!(close_result.allocator_relief.applied);
+            assert!(close_result.allocator_relief.refused_reason.is_none());
+        }
+        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+        assert!(!close_result.allocator_relief.applied);
     }
 
     #[test]
