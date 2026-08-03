@@ -4,28 +4,35 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+	assertWarmupNotLoaded,
 	awaitWithTimeout,
 	buildArtifactDocument,
 	buildMemoryTelemetry,
 	buildNativeOwnerTelemetry,
 	buildSourceIdentityProof,
+	coldStartDiagnosticThreshold,
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
 	evaluateWorkloadEvidence,
+	type FinalGauges,
 	isPromotable,
 	nativeTransportPolicySnapshot,
-	type FinalGauges,
+	plannedWarmupSessions,
+	type RunSummary,
 	runCommandWithBoundedOutput,
 	runScaleCampaign,
-	type RunSummary,
 	type ScaleCampaignConfig,
+	toAllocatorReliefTelemetry,
 	validateScaleCampaignConfig,
+	warmupSessionsPerServer,
+	warmupWorkloadPerServer,
 } from "./distributed-scale.ts";
 import {
 	buildIsolatedRssTelemetry,
-	parseProcessRssMb,
 	type IsolatedRssSample,
+	parseProcessRssMb,
 } from "./isolated-rss-wrapper.ts";
+import { evaluateCycleRepeat } from "./rss-cycle-repeat.ts";
 
 const TEMP_ROOTS: string[] = [];
 
@@ -168,6 +175,7 @@ describe("Task 14 distributed scale evidence", () => {
 			serviceReadyRecoveryRatio: 1.0009,
 			coldToServiceReadyDeltaMb: 10.95,
 			serviceReadyToPostCloseDeltaMb: 0.05,
+			allocatorRelief: [],
 			warmup: {
 				kind: "same-process-native-server-create-close",
 				serverWarmupCycles: 1,
@@ -191,6 +199,148 @@ describe("Task 14 distributed scale evidence", () => {
 					"cold-start recovery exceeded the unchanged RSS threshold and requires explicit release review",
 			},
 		});
+	});
+
+	test("sizes the RSS warmup independently of the campaign session count", () => {
+		expect(warmupSessionsPerServer()).toBe(1);
+		expect(warmupWorkloadPerServer()).toEqual({
+			sessions: 1,
+			streamsPerSec: 1,
+			datagramsPerSec: 1,
+		});
+		expect(plannedWarmupSessions({ ...validConfig(), sessions: 4 })).toBe(
+			plannedWarmupSessions({ ...validConfig(), sessions: 200 }),
+		);
+		expect(plannedWarmupSessions({ ...validConfig(), sessions: 200 })).toBe(
+			validConfig().serverCount,
+		);
+
+		const source = readFileSync(
+			new URL("./distributed-scale.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source).not.toContain("Math.max(1, serverSessionCaps[i] ?? 1)");
+	});
+
+	test("records real allocator relief diagnostics instead of a hard-coded stub", () => {
+		const sample = {
+			rssMb: 50,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+		};
+		const applied = toAllocatorReliefTelemetry("campaign", {
+			allocatorRelief: {
+				platform: "darwin",
+				applied: true,
+				reportedBytesReleased: 1024,
+			},
+		});
+		expect(applied).toEqual({
+			scope: "campaign",
+			platform: "darwin",
+			applied: true,
+			reportedBytesReleased: 1024,
+			refusedReason: null,
+		});
+		expect(toAllocatorReliefTelemetry("warmup", undefined)).toBeNull();
+
+		const memory = buildMemoryTelemetry({
+			coldStart: sample,
+			serviceReady: sample,
+			peak: sample,
+			preClose: sample,
+			postClose: sample,
+			allocatorRelief: applied ? [applied] : [],
+		});
+		expect(memory.warmup.allocatorReliefApplied).toBe(true);
+		expect(memory.allocatorRelief).toEqual([
+			{
+				scope: "campaign",
+				platform: "darwin",
+				applied: true,
+				reportedBytesReleased: 1024,
+				refusedReason: null,
+			},
+		]);
+
+		const refused = buildMemoryTelemetry({
+			coldStart: sample,
+			serviceReady: sample,
+			peak: sample,
+			preClose: sample,
+			postClose: sample,
+			allocatorRelief: [
+				{
+					scope: "campaign",
+					platform: "linux",
+					applied: false,
+					reportedBytesReleased: null,
+					refusedReason: "unsupported-allocator",
+				},
+			],
+		});
+		expect(refused.warmup.allocatorReliefApplied).toBe(false);
+	});
+
+	test("derives the cold-start diagnostic threshold from the configured recovery ratio", () => {
+		const sample = (rssMb: number) => ({
+			rssMb,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+		});
+		const input = {
+			coldStart: sample(40),
+			serviceReady: sample(50),
+			peak: sample(60),
+			preClose: sample(58),
+			postClose: sample(52),
+		};
+
+		expect(coldStartDiagnosticThreshold({ maxRecoveryRssRatio: 1.4 })).toBe(
+			1.4,
+		);
+		expect(
+			coldStartDiagnosticThreshold({ maxRecoveryRssRatio: Number.NaN }),
+		).toBe(1.25);
+
+		const strict = buildMemoryTelemetry(input);
+		expect(strict.coldStartDiagnostic.threshold).toBe(1.25);
+		expect(strict.coldStartDiagnostic.status).toBe("review-required");
+
+		const relaxed = buildMemoryTelemetry({
+			...input,
+			coldStartDiagnosticThreshold: 1.4,
+		});
+		expect(relaxed.coldStartDiagnostic.threshold).toBe(1.4);
+		expect(relaxed.coldStartDiagnostic.status).toBe("pass");
+	});
+
+	test("fails when the warmup baseline grows with campaign session count", () => {
+		expect(
+			assertWarmupNotLoaded([
+				{ sessions: 4, coldToServiceReadyDeltaMb: 2.1 },
+				{ sessions: 4, coldToServiceReadyDeltaMb: 2.5 },
+				{ sessions: 200, coldToServiceReadyDeltaMb: 2.9 },
+				{ sessions: 200, coldToServiceReadyDeltaMb: 3.1 },
+			]),
+		).toEqual([]);
+
+		expect(
+			assertWarmupNotLoaded([
+				{ sessions: 4, coldToServiceReadyDeltaMb: 2.0 },
+				{ sessions: 200, coldToServiceReadyDeltaMb: 10.5 },
+			]),
+		).toEqual([
+			"warmup baseline scales with campaign size: coldToServiceReadyDeltaMb median 2.000MB at 4 sessions vs 10.500MB at 200 sessions (delta 8.500MB exceeds 1.000MB tolerance)",
+		]);
+
+		expect(
+			assertWarmupNotLoaded([{ sessions: 4, coldToServiceReadyDeltaMb: 2 }]),
+		).toEqual([
+			"warmup baseline scaling guard needs coldToServiceReadyDeltaMb samples from at least two session counts",
+		]);
 	});
 
 	test("aggregates owner-scoped native residency counters without hiding availability", () => {
@@ -313,6 +463,7 @@ describe("Task 14 distributed scale evidence", () => {
 			admissionShedCount: 3,
 			steadyStateBeforeOverload: steady,
 			postOverloadGauges: recovered,
+			recoveredGauges: recovered,
 			recoveryDurationMs: 10,
 		};
 		expect(evaluateOverloadEvidence(valid)).toEqual([]);
@@ -324,6 +475,10 @@ describe("Task 14 distributed scale evidence", () => {
 					streamsActive: 3,
 				},
 				postOverloadGauges: {
+					...recovered,
+					streamsActive: 0,
+				},
+				recoveredGauges: {
 					...recovered,
 					streamsActive: 0,
 				},
@@ -340,9 +495,25 @@ describe("Task 14 distributed scale evidence", () => {
 					...recovered,
 					streamsActive: 4,
 				},
+				recoveredGauges: null,
 			}),
 		).toContain(
 			"overload phase did not recover to its steady-state gauge baseline",
+		);
+		expect(
+			evaluateOverloadEvidence({ ...valid, recoveredGauges: null }),
+		).toContain(
+			"overload phase recorded no gauge sample that met the steady-state baseline",
+		);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				limitExceededDelta: 1,
+				rateLimitedDelta: 0,
+				admissionShedCount: 0,
+			}),
+		).toContain(
+			"overload phase attempted 3 sessions but shed none; quiescence alone is not shed-and-recover evidence",
 		);
 		expect(
 			evaluateOverloadEvidence({
@@ -373,12 +544,46 @@ describe("Task 14 distributed scale evidence", () => {
 					streamTasksActive: 1,
 					queuedBytesGlobal: 4,
 				},
+				recoveredGauges: null,
 			}),
 		).toEqual([
 			"overload phase did not reject any admission",
 			"overload phase produced no limit/rate admission-shed evidence",
+			"overload phase attempted 3 sessions but shed none; quiescence alone is not shed-and-recover evidence",
+			"overload phase recorded no gauge sample that met the steady-state baseline",
 			"overload phase did not recover to its steady-state gauge baseline",
 		]);
+	});
+
+	test("fails the 3-cycle repeat when post-close RSS grows across cycles", () => {
+		expect(
+			evaluateCycleRepeat([
+				{ postCloseRssMb: 60 },
+				{ postCloseRssMb: 61 },
+				{ postCloseRssMb: 62 },
+			]),
+		).toEqual({
+			ratioCycle3ToCycle1: 1.0333,
+			failures: [],
+		});
+		expect(
+			evaluateCycleRepeat([
+				{ postCloseRssMb: 60 },
+				{ postCloseRssMb: 66 },
+				{ postCloseRssMb: 70 },
+			]),
+		).toEqual({
+			ratioCycle3ToCycle1: 1.1667,
+			failures: [
+				"cycle-3 post-close RSS 70.000MB exceeded cycle-1 60.000MB * 1.05 (ratio 1.1667)",
+			],
+		});
+		expect(
+			evaluateCycleRepeat([{ postCloseRssMb: 60 }, { postCloseRssMb: 61 }]),
+		).toEqual({
+			ratioCycle3ToCycle1: null,
+			failures: ["cycle repeat recorded 2 cycles; 3 are required"],
+		});
 	});
 
 	test("rejects non-finite scale config values from env-derived input", () => {
