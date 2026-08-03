@@ -835,8 +835,17 @@ pub(crate) fn spawn_wtransport_server(
                                         let peer_ip_bidi = peer_ip.clone();
                                         let rl_bidi = rate_limits.clone();
                                         let stream_capacity_notify_bidi = stream_capacity_notify.clone();
-                                        let bidi_discard = session_registry::bidi_discard_state(&id)
-                                            .expect("session discard state must exist");
+                                        // The session can be removed between registry insert and
+                                        // this fetch (deferred 0-RTT handshake_confirmed and the
+                                        // lifecycle send are real await points; session.close()
+                                        // from onSession or server close race them). Treat a
+                                        // missing entry as session-already-gone, never panic:
+                                        // this task runs under PanicScope::Server and a panic
+                                        // here tears down every live session.
+                                        let Some(bidi_discard) = session_registry::bidi_discard_state(&id)
+                                        else {
+                                            return;
+                                        };
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
                                             owner_server_id,
@@ -923,8 +932,11 @@ pub(crate) fn spawn_wtransport_server(
                                         let peer_ip_uni = peer_ip.clone();
                                         let rl_uni = rate_limits.clone();
                                         let stream_capacity_notify_uni = stream_capacity_notify.clone();
-                                        let uni_discard = session_registry::uni_discard_state(&id)
-                                            .expect("session discard state must exist");
+                                        // Same removal race as the bidi fetch above.
+                                        let Some(uni_discard) = session_registry::uni_discard_state(&id)
+                                        else {
+                                            return;
+                                        };
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
                                             owner_server_id,
