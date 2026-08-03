@@ -139,7 +139,18 @@ impl DatagramReservation {
 
     pub fn into_slot(self, data: Vec<u8>) -> DatagramSlot {
         DatagramSlot {
-            data,
+            data: DatagramPayload::Owned(data),
+            _reservation: self,
+        }
+    }
+
+    /// Keep the transport-owned datagram buffer until a consumer actually
+    /// reads it. The old ingress path copied every payload into a second
+    /// `Vec<u8>` before enqueueing, which amplified allocator churn under a
+    /// high-rate drain-all workload.
+    pub fn into_transport_slot(self, data: wtransport::datagram::Datagram) -> DatagramSlot {
+        DatagramSlot {
+            data: DatagramPayload::Transport(data),
             _reservation: self,
         }
     }
@@ -159,8 +170,13 @@ impl Drop for DatagramReservation {
 
 /// A queued datagram whose reservation is released on dequeue or teardown.
 pub struct DatagramSlot {
-    data: Vec<u8>,
+    data: DatagramPayload,
     _reservation: DatagramReservation,
+}
+
+enum DatagramPayload {
+    Owned(Vec<u8>),
+    Transport(wtransport::datagram::Datagram),
 }
 
 impl DatagramSlot {
@@ -183,8 +199,15 @@ impl DatagramSlot {
     /// Move the payload out. The reservation is still released when the slot is
     /// dropped at the end of the caller's scope.
     pub fn take(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.data)
+        match std::mem::replace(&mut self.data, DatagramPayload::Owned(Vec::new())) {
+            DatagramPayload::Owned(data) => data,
+            DatagramPayload::Transport(data) => data.payload().to_vec(),
+        }
     }
+
+    /// Consume the slot without materializing a payload for a black-hole
+    /// consumer. Dropping the slot still releases the reserved byte budget.
+    pub fn discard(self) {}
 }
 
 /// Channel capacity for datagrams per session (bounded to prevent unbounded buffering).

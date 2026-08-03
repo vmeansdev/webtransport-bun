@@ -1182,8 +1182,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                 datagram_capacity_notify.clone(),
                                                                 sz,
                                                             );
-                                                            let payload = dgram.as_ref().to_vec();
-                                                            let slot = reservation.into_slot(payload);
+                                                            let slot = reservation.into_transport_slot(dgram);
                                                             // On send failure the slot is dropped here, releasing
                                                             // its reservation via Drop — no manual release needed.
                                                             if dgram_tx.send(slot).await.is_err() {
