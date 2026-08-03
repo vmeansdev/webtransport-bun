@@ -235,6 +235,81 @@ describe("internal TS error propagation", () => {
 		await reader.cancel();
 	});
 
+	it("readable.cancel keeps the writable half usable (W3C half-close)", async () => {
+		const calls: string[] = [];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return null;
+					accepted = false;
+					return {
+						id: 2,
+						read: () => new Promise(() => {}),
+						write: async () => {
+							calls.push("write");
+						},
+						finish: () => {
+							calls.push("finish");
+						},
+						reset: (code: number) => calls.push(`reset:${code}`),
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(reader, 2000, "half-close accept");
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const stream = result.value;
+		await stream.readable.cancel();
+		const writer = stream.writable.getWriter();
+		await writer.write(new Uint8Array([1]));
+		await writer.close();
+		expect(calls).toContain("stop:0");
+		expect(calls).toContain("write");
+		expect(calls).toContain("finish");
+		expect(calls.filter((c) => c.startsWith("reset"))).toEqual([]);
+	});
+
+	it("writable.abort keeps the readable half delivering (W3C half-close)", async () => {
+		const calls: string[] = [];
+		const chunks: (Buffer | null)[] = [Buffer.from([7]), null];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return null;
+					accepted = false;
+					return {
+						id: 3,
+						read: async () => chunks.shift() ?? null,
+						write: async () => {},
+						finish: () => {},
+						reset: (code: number) => calls.push(`reset:${code}`),
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(reader, 2000, "half-close accept 2");
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const stream = result.value;
+		const writer = stream.writable.getWriter();
+		await writer.abort();
+		const streamReader = stream.readable.getReader();
+		const first = await readWithTimeout(streamReader, 2000, "post-abort read");
+		expect(first.done).toBe(false);
+		expect(Array.from(first.value ?? [])).toEqual([7]);
+		const second = await readWithTimeout(streamReader, 2000, "post-abort EOF");
+		expect(second.done).toBe(true);
+		expect(calls).toContain("reset:0");
+		expect(calls.filter((c) => c.startsWith("stop"))).toEqual([]);
+	});
+
 	it("Web Streams adapters apply strictW3CErrors to stream write failures", async () => {
 		const duplex = new Duplex({
 			read() {},
