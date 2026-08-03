@@ -625,4 +625,17 @@ mod tests {
         .is_ok());
         assert_eq!(super::format_verify_error("x"), "x");
     }
+
+    /// A PEM block whose body is not decodable is a parse failure, not an
+    /// empty-but-valid anchor list.
+    #[test]
+    fn ca_roots_verifier_rejects_a_pem_block_with_a_corrupt_body() {
+        let corrupt = "-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n";
+        let err = super::ca_roots_verifier(
+            corrupt,
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .expect_err("a corrupt PEM body must not build a root store");
+        assert!(err.starts_with("E_TLS: caPem:"), "unexpected error: {err}");
+    }
 }
