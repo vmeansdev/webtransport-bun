@@ -105,6 +105,10 @@ import type {
 	RateLimitOptions,
 	WebTransportCloseInfo,
 } from "./types.js";
+import {
+	createW3CMappedError as createMappedError,
+	normalizeW3CBrowserName as normalizeToBrowserName,
+} from "./w3c-client-options.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
@@ -137,52 +141,6 @@ const SUPPRESS_LOG_CALLBACK_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
 const SUPPRESS_READY_REJECTION_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN === "1";
-
-/**
- * Maps known validation/connect failures to browser-style DOMException names.
- * Returns undefined for unknown cases; E_* code is always preserved.
- * No broad catch-all: unknown errors remain explicit.
- */
-function normalizeToBrowserName(code: ErrorCode): string | undefined {
-	switch (code) {
-		case E_INVALID_ARGUMENT:
-			return "TypeError";
-		case E_UNSUPPORTED_ARGUMENT:
-			return "NotSupportedError";
-		case E_TLS:
-			return "NetworkError";
-		case E_HANDSHAKE_TIMEOUT:
-		case E_BACKPRESSURE_TIMEOUT:
-			return "TimeoutError";
-		case E_SESSION_CLOSED:
-		case E_SESSION_IDLE_TIMEOUT:
-			return "InvalidStateError";
-		case E_STREAM_RESET:
-		case E_STOP_SENDING:
-			return "AbortError";
-		case E_LIMIT_EXCEEDED:
-		case E_QUEUE_FULL:
-		case E_RATE_LIMITED:
-			return "QuotaExceededError";
-		case E_INTERNAL:
-			return "OperationError";
-	}
-	return undefined;
-}
-
-function createMappedError(
-	code: ErrorCode,
-	message: string,
-	strictW3CErrors?: boolean,
-): WebTransportError {
-	const browserName =
-		strictW3CErrors === true ? normalizeToBrowserName(code) : undefined;
-	return new WebTransportError(
-		code,
-		message,
-		browserName ? { browserName } : undefined,
-	);
-}
 
 function knownCodeOrUndefined(
 	value: string | undefined,

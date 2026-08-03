@@ -74,6 +74,28 @@ export function normalizeW3CBrowserName(code: ErrorCode): string | undefined {
 	}
 }
 
+/**
+ * Re-name an existing error for strict W3C clients, preserving its stable code
+ * and message. Returns the error untouched when strict mode is off, when the
+ * code has no browser name, or when the name already matches — so both backends
+ * reach browser-style names through this one mapper.
+ */
+export function withW3CBrowserName(
+	error: unknown,
+	strictW3CErrors?: boolean,
+): unknown {
+	if (strictW3CErrors !== true || !(error instanceof WebTransportError)) {
+		return error;
+	}
+	const browserName = normalizeW3CBrowserName(error.code);
+	if (!browserName || error.name === browserName) return error;
+	return new WebTransportError(error.code, error.message, {
+		browserName,
+		source: error.source,
+		streamErrorCode: error.streamErrorCode,
+	});
+}
+
 export function createW3CMappedError(
 	code: ErrorCode,
 	message: string,

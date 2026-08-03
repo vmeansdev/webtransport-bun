@@ -21,7 +21,7 @@ import { SendScheduler, type SendPolicy } from "./send-scheduler.js";
 import type { WebTransportCloseInfo } from "./types.js";
 import {
 	createW3CMappedError,
-	normalizeW3CBrowserName,
+	withW3CBrowserName,
 	validateW3CClientOptions,
 	type W3CClientOptionSurface,
 	type W3CCongestionControl,
@@ -655,10 +655,17 @@ export class WasmWebTransport {
 		chunk: Uint8Array,
 		policy: SendPolicy,
 	): Promise<void> {
-		await this.#sendScheduler.enqueue(policy, async () => {
-			await this.session.sendDatagram(chunk);
-			this._recordSendGroupBytes(policy.groupId, chunk.byteLength);
-		});
+		try {
+			await this.#sendScheduler.enqueue(policy, async () => {
+				await this.session.sendDatagram(chunk);
+				this._recordSendGroupBytes(policy.groupId, chunk.byteLength);
+			});
+		} catch (error) {
+			// Backend errors reach the app through the W3C facade, so they carry
+			// the same browser-style names strict native clients see (E_QUEUE_FULL
+			// under send pressure becomes QuotaExceededError).
+			throw this.#mapError(error);
+		}
 	}
 
 	close(info?: WebTransportCloseInfo): void {
@@ -722,13 +729,10 @@ export class WasmWebTransport {
 
 	#mapError(error: unknown): WebTransportError {
 		if (error instanceof WebTransportError) {
-			if (!this.#strictW3CErrors) return error;
-			const browserName = normalizeW3CBrowserName(error.code);
-			if (!browserName || error.name === browserName) return error;
-			return new WebTransportError(error.code, error.message, {
-				browserName,
-				source: error.source,
-			});
+			return withW3CBrowserName(
+				error,
+				this.#strictW3CErrors,
+			) as WebTransportError;
 		}
 		return createW3CMappedError(
 			E_SESSION_CLOSED,

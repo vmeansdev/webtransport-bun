@@ -12,16 +12,20 @@
 
 import {
 	connectWasm,
+	normalizeWasmEndpointOptions,
 	type WasmConnectOptions,
 	type WasmSession,
+	WasmTransportManager,
 	wasmClientPoolMetricsSnapshot,
 	WasmWebTransport,
 } from "../../src/backend.js";
+import type { WasmModule } from "../../src/backend-wasm.js";
 import {
 	clientPoolMetricsSnapshot,
 	WebTransport,
 	type WebTransportClientOptions,
 } from "../../src/index.js";
+import { __TESTING__ } from "../../src/internal.js";
 import {
 	createServer as createPortableServer,
 	type PortableServer,
@@ -96,6 +100,17 @@ type ParityHarness = {
 	close: () => Promise<void>;
 	/** Native-only server port when backend is native; 0 for wasm. */
 	port: number;
+	/**
+	 * Drive this backend's client into a bounded handshake timeout and return
+	 * the rejection. Never awaits an unbounded network wait: native uses its
+	 * own 150ms deadline against TEST-NET, wasm dials an unbound relay address.
+	 */
+	handshakeTimeoutError: (opts: ParityOpenOptions) => Promise<unknown>;
+	/**
+	 * Send one datagram through the real client facade over a transport whose
+	 * send fails with E_QUEUE_FULL. Returns the rejecting send promise.
+	 */
+	queueFullDatagramError: (opts: ParityOpenOptions) => Promise<void>;
 };
 
 export type { ParityHarness };
@@ -168,6 +183,36 @@ async function createNativeHarness(
 		poolMetrics: () => clientPoolMetricsSnapshot(),
 		async close() {
 			await server.close();
+		},
+		async handshakeTimeoutError(clientOpts) {
+			// 192.0.2.1 (TEST-NET) is unroutable; our own 150ms deadline bounds
+			// the wait, and a refused connect can win with E_INTERNAL.
+			const wt = new WebTransport("https://192.0.2.1:443", {
+				tls: { insecureSkipVerify: true },
+				limits: { handshakeTimeoutMs: 150 },
+				...clientOpts,
+			});
+			return wt.ready.then(
+				() => {
+					throw new Error("expected ready to reject");
+				},
+				(error: unknown) => error,
+			);
+		},
+		async queueFullDatagramError(clientOpts) {
+			const session = __TESTING__.createNativeClientSessionForTests(
+				{
+					id: "strict-client",
+					peerIp: "127.0.0.1",
+					peerPort: 1,
+					sendDatagram: async () => {
+						throw new Error("E_QUEUE_FULL: synthetic queue pressure");
+					},
+					close: () => {},
+				},
+				clientOpts.strictW3CErrors === true,
+			);
+			await session.sendDatagram(new Uint8Array([1]));
 		},
 	};
 }
@@ -260,5 +305,74 @@ async function createWasmHarness(
 			spare.manager.close();
 			await server.close();
 		},
+		async handshakeTimeoutError(clientOpts) {
+			// Nothing is bound at this relay address, so the relay drops every
+			// packet and the connect can only end at the handshake deadline.
+			const deadPort = nextPort(26400, 500);
+			const clientPort = nextPort(26900, 500);
+			return connectWasm(
+				wasm,
+				relay.endpoint({ address: "127.0.0.1", port: clientPort }),
+				"localhost",
+				`127.0.0.1:${clientPort}`,
+				`127.0.0.1:${deadPort}`,
+				{
+					certHashBase64,
+					strictW3CErrors: clientOpts.strictW3CErrors,
+					limits: { handshakeTimeoutMs: 150 },
+				},
+			).then(
+				() => {
+					throw new Error("expected connect to reject");
+				},
+				(error: unknown) => error,
+			);
+		},
+		async queueFullDatagramError(clientOpts) {
+			// Real manager and real facade over a wasm ABI whose datagram send
+			// fails, mirroring the native synthetic transport.
+			const manager = WasmTransportManager.create(
+				queueFullWasmModule(),
+				relay.endpoint({
+					address: "127.0.0.1",
+					port: nextPort(27400, 500),
+				}),
+				false,
+				"127.0.0.1:5544",
+				"127.0.0.1:4433",
+				null,
+				normalizeWasmEndpointOptions(),
+			);
+			const facade = new WasmWebTransport(manager.connectClient("localhost"), {
+				strictW3CErrors: clientOpts.strictW3CErrors,
+			});
+			try {
+				await facade.datagrams.writable.getWriter().write(new Uint8Array([1]));
+			} finally {
+				manager.close();
+			}
+		},
 	};
+}
+
+/** A wasm ABI whose datagram send always reports a full queue. */
+function queueFullWasmModule(): WasmModule {
+	const base = {
+		wt_new_endpoint_with_options: () => JSON.stringify({ eid: 1 }),
+		wt_connect: () => 1,
+		wt_send_datagram: () => false,
+		wt_max_datagram_size: () => 1200,
+		wt_take_last_error: () => "E_QUEUE_FULL: datagram send queue blocked",
+		wt_poll_transmits: () => new Uint8Array(),
+		wt_poll_event: () => undefined,
+		wt_next_timeout_ms: () => -1,
+		wt_governor_snapshot: () => "{}",
+		wt_close_all() {},
+		wt_close_endpoint() {},
+	} satisfies Partial<WasmModule>;
+	return new Proxy(base as unknown as WasmModule, {
+		get(target, key) {
+			return Reflect.get(target, key) ?? (() => 0);
+		},
+	});
 }

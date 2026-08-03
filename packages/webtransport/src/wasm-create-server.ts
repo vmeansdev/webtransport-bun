@@ -294,7 +294,7 @@ class WasmWebTransportServerImpl implements WasmWebTransportServer {
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
-		this.#manager.close();
+		await this.#manager.close();
 	}
 
 	metricsSnapshot() {
@@ -434,7 +434,9 @@ export async function createServer(
 
 		return new WasmWebTransportServerImpl(manager, host, started.localPort);
 	} catch (err) {
-		manager?.close();
+		// Teardown is synchronous; the ticket-persistence promise reports its
+		// own failures and must not replace the startup error being rethrown.
+		void manager?.close();
 		throw err;
 	}
 }

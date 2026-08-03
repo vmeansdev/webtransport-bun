@@ -236,16 +236,29 @@ export class IndexedDBTicketStoreHost implements TicketStoreHost {
 		});
 	}
 
+	/**
+	 * Read and remove one ticket in a single readwrite transaction. Reading
+	 * through the public `get()` first would commit that read before the delete,
+	 * letting a concurrent `take()` observe the same ticket and replay it.
+	 */
 	async take(key: string): Promise<Uint8Array | null> {
-		const existing = await this.get(key);
-		if (!existing) return null;
 		const db = await this.db();
-		await new Promise<void>((resolve, reject) => {
+		return new Promise((resolve, reject) => {
 			const tx = db.transaction(this.storeName, "readwrite");
-			tx.objectStore(this.storeName).delete(key);
-			tx.oncomplete = () => resolve();
-			tx.onerror = () => reject(tx.error);
+			const store = tx.objectStore(this.storeName);
+			const req = store.get(key);
+			let taken: Uint8Array | null = null;
+			req.onsuccess = () => {
+				const value = req.result;
+				if (!(value instanceof Uint8Array)) return;
+				taken = value.slice();
+				store.delete(key);
+			};
+			req.onerror = () =>
+				reject(req.error ?? new Error("indexedDB ticket read failed"));
+			tx.oncomplete = () => resolve(taken);
+			tx.onerror = () =>
+				reject(tx.error ?? new Error("indexedDB ticket take failed"));
 		});
-		return existing;
 	}
 }
