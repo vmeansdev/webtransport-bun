@@ -33,6 +33,12 @@ const BASE_PORT = 19100;
 const REPO_ROOT = resolve(import.meta.dir, "../../..");
 const ADVERSARY_BIN = join(REPO_ROOT, "target", "debug", "adversary");
 
+// Per-operation deadline for the raw QUIC/H3 adversarial harness. Correctness
+// is unaffected — an operation that never completes still fails — but a loaded
+// CI runner doing debug-build QUIC handshakes needs headroom over the ~3.6s
+// this takes locally, so the deadline scales up under CI.
+const OP_DEADLINE_MS = process.env.CI ? 20000 : 5000;
+
 async function waitUntil(
 	predicate: () => boolean,
 	timeoutMs: number,
@@ -64,7 +70,7 @@ async function legitimateEcho(port: number): Promise<void> {
 		});
 		const chunks = await collectWithTimeout(
 			bidi,
-			5000,
+			OP_DEADLINE_MS,
 			"adversarial protocol legitimate echo bidi read",
 		);
 		expect(Buffer.concat(chunks)).toEqual(payload);
@@ -121,7 +127,7 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 						void (async () => {
 							await forEachWithTimeout(
 								s.incomingDatagrams(),
-								5000,
+								OP_DEADLINE_MS,
 								"adversarial protocol server incoming datagram",
 								async (d) => {
 									await s.sendDatagram(d);
@@ -131,7 +137,7 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 						void (async () => {
 							await forEachWithTimeout(
 								s.incomingBidirectionalStreams,
-								5000,
+								OP_DEADLINE_MS,
 								"adversarial protocol server incoming bidi",
 								async (duplex) => {
 									void (async () => {
@@ -140,7 +146,7 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 										while (true) {
 											const { done, value } = await readWithTimeout(
 												reader,
-												5000,
+												OP_DEADLINE_MS,
 												"adversarial protocol server bidi read",
 											);
 											if (done || value === undefined) break;
