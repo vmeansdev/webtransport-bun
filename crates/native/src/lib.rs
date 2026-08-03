@@ -390,6 +390,30 @@ pub fn set_panic_log_verbose(enabled: bool) {
     panic_guard::set_panic_log_verbose(enabled);
 }
 
+/// Force-return freed native allocator memory to the OS.
+///
+/// mimalloc heaps are per-thread, so the collection runs on the calling
+/// thread and is dispatched onto both long-lived runtime threads (each wait
+/// bounded to 500 ms; an idle runtime cannot hang the caller). Intended for
+/// long-lived servers after load spikes and for the release memory evidence
+/// after drain + GC; it is never required for correctness.
+#[napi]
+pub fn release_native_memory() -> bool {
+    panic_guard::catch_panic(|| {
+        let relief = native_memory::release_drained_residency(true);
+        for rt in [&*RUNTIME, &*CLIENT_RUNTIME] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            rt.spawn(async move {
+                native_memory::release_drained_residency(true);
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
+        }
+        Ok(relief.applied)
+    })
+    .unwrap_or(false)
+}
+
 /// Well-known close codes for stable error semantics (AGENTS.md).
 pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
 pub(crate) const LIMIT_EXCEEDED_CLOSE_CODE: u32 = 3992;

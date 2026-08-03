@@ -21,6 +21,7 @@ import {
 	E_HANDSHAKE_TIMEOUT,
 	E_INTERNAL,
 	E_LIMIT_EXCEEDED,
+	releaseNativeMemory,
 } from "../src/index.js";
 
 const BASE_PORT = 18500;
@@ -578,4 +579,54 @@ describe("server-created stream cap enforcement", () => {
 		await client.close();
 		await server.close();
 	}, 15000);
+});
+
+describe("native memory release", () => {
+	it("releaseNativeMemory during active sessions does not disturb delivery", async () => {
+		const port = nextPort(BASE_PORT, 1000);
+		let received = 0;
+		const server = trackedCreateServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: async (s) => {
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					10000,
+					"release-native-memory incoming datagram",
+					async () => {
+						received += 1;
+					},
+				);
+			},
+		});
+
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+
+		for (let batch = 0; batch < 4; batch++) {
+			for (let i = 0; i < 5; i++) {
+				await client.sendDatagram(new Uint8Array([batch, i]));
+			}
+			// Best-effort, bounded, and must not disturb in-flight delivery.
+			expect(releaseNativeMemory()).toBe(true);
+		}
+		await waitFor(
+			() => received,
+			(count) => count >= 20,
+			10000,
+			undefined,
+			"datagram delivery",
+		);
+
+		const stream = await client.createBidirectionalStream();
+		stream.write(new Uint8Array([42]));
+		releaseNativeMemory();
+		stream.write(new Uint8Array([43]));
+		stream.end();
+
+		expect(received).toBeGreaterThanOrEqual(20);
+		await client.close();
+		await server.close();
+	}, 20000);
 });

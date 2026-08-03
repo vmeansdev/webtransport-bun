@@ -1200,6 +1200,8 @@ interface NativeAddon {
 		uniSendHandlesLive: number;
 		uniRecvHandlesLive: number;
 	};
+	/** Force-return freed native allocator memory to the OS (absent on older prebuilt addons). */
+	releaseNativeMemory?: () => boolean;
 	/** 0-RTT vault (absent on older prebuilt addons). */
 	exportZeroRttVault?(
 		optsJson: string,
@@ -2383,6 +2385,20 @@ export function clientPoolMetricsSnapshot(): {
 		evictIdle: (s as any).evictIdle ?? (s as any).evict_idle ?? 0,
 		evictBroken: (s as any).evictBroken ?? (s as any).evict_broken ?? 0,
 	};
+}
+
+/**
+ * Force-return freed native allocator memory to the OS.
+ *
+ * Never required for correctness. Useful for long-lived servers after load
+ * spikes and for memory evidence: the native allocator (mimalloc) retains
+ * freed pages briefly for reuse, and this purges them immediately across the
+ * native runtime threads. Returns false when the loaded addon predates the
+ * capability.
+ */
+export function releaseNativeMemory(): boolean {
+	const native = getNativeOrThrow();
+	return native.releaseNativeMemory?.() ?? false;
 }
 
 // ---------------------------------------------------------------------------
