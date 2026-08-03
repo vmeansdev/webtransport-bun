@@ -249,37 +249,248 @@ pub(crate) async fn discard_datagrams_for_session(
     }
 }
 
-/// Wait for native direct-consume state until the session closes or the
-/// bounded deadline expires.
-async fn wait_for_stream_discard(
-    state: session_registry::StreamDiscardState,
-    timeout: Option<Duration>,
-) -> Result<Option<u64>> {
-    let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
-    loop {
-        if let Some(error) = state.error() {
-            return Err(napi::Error::from_reason(error));
+/// How long the queued-handle phase waits for the next already-accepted stream
+/// before concluding the mode-switch window is drained.
+const STREAM_DISCARD_QUEUE_IDLE: Duration = Duration::from_millis(100);
+/// Poll interval for the native direct-consume wait phase.
+const STREAM_DISCARD_POLL: Duration = Duration::from_millis(50);
+
+/// Delivery accounting for one bounded native stream drain.
+///
+/// The count is the evidence the caller asked for, so it is never replaced by
+/// an error: stream failures are counted separately and the first error is
+/// carried alongside as diagnostic metadata.
+#[derive(Default)]
+pub(crate) struct StreamDiscardOutcome {
+    pub completed: u64,
+    pub errored: u64,
+    pub timed_out: bool,
+    pub diagnostic: Option<String>,
+}
+
+impl StreamDiscardOutcome {
+    fn observe_error(&mut self, error: String) {
+        self.errored = self.errored.saturating_add(1);
+        if self.diagnostic.is_none() {
+            self.diagnostic = Some(error);
         }
-        let completed = state.completed();
+    }
+}
+
+/// A connection-close race ends the drain but is not a drain failure: no more
+/// streams can arrive, so the count collected so far is the final answer.
+fn discard_error_is_terminal(error: &str) -> bool {
+    error.starts_with("E_SESSION_CLOSED")
+}
+
+/// Close and reset races are expected while a black-hole drain runs against a
+/// peer that is tearing down. Anything else is worth a stderr note.
+fn discard_error_is_expected(error: &str) -> bool {
+    discard_error_is_terminal(error) || error.starts_with("E_STREAM_RESET")
+}
+
+/// Accounting sink for a drain. Implemented by the session-owned discard state;
+/// the indirection keeps the drain loops unit-testable without a live session.
+pub(crate) trait StreamDiscardSink {
+    fn record(&self, result: std::result::Result<(), String>);
+    fn completed(&self) -> u64;
+    fn error(&self) -> Option<String>;
+    fn is_closed(&self) -> bool;
+}
+
+impl StreamDiscardSink for session_registry::StreamDiscardState {
+    fn record(&self, result: std::result::Result<(), String>) {
+        session_registry::StreamDiscardState::record(self, result);
+    }
+
+    fn completed(&self) -> u64 {
+        session_registry::StreamDiscardState::completed(self)
+    }
+
+    fn error(&self) -> Option<String> {
+        session_registry::StreamDiscardState::error(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        session_registry::StreamDiscardState::is_closed(self)
+    }
+}
+
+/// A stream that can be consumed to EOF without materializing payload bytes.
+pub(crate) trait DiscardableStream {
+    fn discard_stream(
+        &mut self,
+        scratch: &mut [u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), String>> + Send;
+}
+
+impl DiscardableStream for ClientBidiStreamHandle {
+    fn discard_stream(
+        &mut self,
+        scratch: &mut [u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), String>> + Send {
+        self.discard_incoming(scratch)
+    }
+}
+
+impl DiscardableStream for ClientUniRecvHandle {
+    fn discard_stream(
+        &mut self,
+        scratch: &mut [u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), String>> + Send {
+        self.discard_incoming(scratch)
+    }
+}
+
+/// Acquire the accept-queue lock under the caller deadline. A parked JS accept
+/// pull holds this lock, so an unbounded wait here would hang the discard
+/// promise regardless of the caller timeout.
+async fn lock_with_deadline<T>(
+    lock: &tokio::sync::Mutex<T>,
+    deadline: Option<Instant>,
+) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, lock.lock()).await.ok(),
+        None => Some(lock.lock().await),
+    }
+}
+
+/// Drain stream handles already queued at the mode switch. Returns `false` when
+/// the drain hit its deadline or a connection-close race, meaning there is no
+/// point waiting for further native direct streams.
+async fn drain_queued_discard_streams<T, S>(
+    rx: &mut tokio::sync::mpsc::Receiver<Box<T>>,
+    state: &S,
+    deadline: Option<Instant>,
+    outcome: &mut StreamDiscardOutcome,
+) -> bool
+where
+    T: DiscardableStream,
+    S: StreamDiscardSink,
+{
+    let mut scratch = None;
+    loop {
+        let wait = match deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    outcome.timed_out = true;
+                    return false;
+                }
+                (deadline - now).min(STREAM_DISCARD_QUEUE_IDLE)
+            }
+            None => STREAM_DISCARD_QUEUE_IDLE,
+        };
+        let Ok(next) = tokio::time::timeout(wait, rx.recv()).await else {
+            // Either the queue went idle (mode-switch window drained) or the
+            // caller deadline cut the wait short.
+            outcome.timed_out = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            return !outcome.timed_out;
+        };
+        let Some(mut stream) = next else {
+            return true;
+        };
+        let scratch = scratch
+            .get_or_insert_with(|| vec![0u8; crate::client_stream::STREAM_READ_BUFFER_BYTES]);
+        let result = stream.discard_stream(scratch).await;
+        state.record(result.clone());
+        if let Err(error) = result {
+            let terminal = discard_error_is_terminal(&error);
+            outcome.observe_error(error);
+            if terminal {
+                return false;
+            }
+        }
+    }
+}
+
+/// Wait for native direct-consume state until the session closes or the
+/// bounded deadline expires. The completed count is authoritative; an error
+/// recorded by the accept loop never ends the wait or replaces the count.
+async fn wait_for_stream_discard<S: StreamDiscardSink>(
+    state: &S,
+    deadline: Option<Instant>,
+    outcome: &mut StreamDiscardOutcome,
+) {
+    loop {
+        outcome.completed = state.completed();
+        if outcome.diagnostic.is_none() {
+            outcome.diagnostic = state.error();
+        }
         if state.is_closed() {
-            return Ok(if completed == 0 {
-                None
-            } else {
-                Some(completed)
-            });
+            return;
         }
         match deadline {
             Some(deadline) => {
-                let now = tokio::time::Instant::now();
+                let now = Instant::now();
                 if now >= deadline {
-                    return Ok(Some(completed));
+                    outcome.timed_out = true;
+                    return;
                 }
-                let poll = (deadline - now).min(Duration::from_millis(50));
+                let poll = (deadline - now).min(STREAM_DISCARD_POLL);
                 tokio::time::sleep(poll).await;
             }
-            None => tokio::time::sleep(Duration::from_millis(50)).await,
+            None => tokio::time::sleep(STREAM_DISCARD_POLL).await,
         }
     }
+}
+
+/// Project a drain outcome onto the N-API contract (`number | null`). `None`
+/// means the drain saw nothing at all; every other case reports the delivered
+/// count, including close races and deadline expiry.
+fn finish_stream_discard(kind: &str, outcome: StreamDiscardOutcome) -> Option<u64> {
+    if let Some(error) = outcome.diagnostic.as_deref() {
+        if !discard_error_is_expected(error) {
+            eprintln!(
+                "webtransport-native: {} discard completed {} stream(s) with {} error(s); first: {}",
+                kind, outcome.completed, outcome.errored, error
+            );
+        }
+    }
+    if outcome.completed == 0
+        && outcome.errored == 0
+        && !outcome.timed_out
+        && outcome.diagnostic.is_none()
+    {
+        None
+    } else {
+        Some(outcome.completed)
+    }
+}
+
+async fn discard_streams_for_session<T, S>(
+    kind: &str,
+    accept_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Box<T>>>>,
+    state: S,
+    deadline: Option<Instant>,
+) -> Option<u64>
+where
+    T: DiscardableStream,
+    S: StreamDiscardSink,
+{
+    let mut outcome = StreamDiscardOutcome::default();
+    match lock_with_deadline(&accept_rx, deadline).await {
+        Some(mut rx) => {
+            let keep_waiting =
+                drain_queued_discard_streams(&mut rx, &state, deadline, &mut outcome).await;
+            // The accept queue is empty after the mode-switch window. Do not
+            // retain the guard (or a scratch allocation) while waiting for
+            // native direct streams.
+            drop(rx);
+            if keep_waiting {
+                wait_for_stream_discard(&state, deadline, &mut outcome).await;
+            } else {
+                outcome.completed = state.completed();
+            }
+        }
+        None => {
+            // A parked accept pull still owns the queue; report what the accept
+            // loop consumed directly rather than hanging past the deadline.
+            outcome.timed_out = true;
+            outcome.completed = state.completed();
+        }
+    }
+    finish_stream_discard(kind, outcome)
 }
 
 /// Consume accepted bidi streams without materializing N-API stream handles.
@@ -289,35 +500,14 @@ pub(crate) async fn discard_bidi_streams_for_session(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<u64>> {
+    let deadline = timeout.map(|limit| Instant::now() + limit);
     let Some(state) = session_registry::enable_bidi_discard(id) else {
         return Ok(None);
     };
     let Some((bidi_rx, _, _, _)) = session_registry::get_stream_accept_state(id) else {
         return Ok(None);
     };
-    let mut rx = bidi_rx.lock().await;
-    let mut scratch = None;
-    loop {
-        let next = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
-        let Some(mut stream) = (match next {
-            Ok(value) => value,
-            Err(_) => break,
-        }) else {
-            break;
-        };
-        let scratch = scratch
-            .get_or_insert_with(|| vec![0u8; crate::client_stream::STREAM_READ_BUFFER_BYTES]);
-        let result = stream.discard_incoming(scratch).await;
-        state.record(result.clone());
-        if let Err(error) = result {
-            return Err(napi::Error::from_reason(error));
-        }
-    }
-    drop(rx);
-    // The accept queue is empty after the mode-switch window. Do not retain a
-    // per-session scratch allocation while waiting for native direct streams.
-    drop(scratch);
-    wait_for_stream_discard(state, timeout).await
+    Ok(discard_streams_for_session("bidi", bidi_rx, state, deadline).await)
 }
 
 /// Consume accepted uni streams without crossing the N-API wrapper boundary.
@@ -325,35 +515,14 @@ pub(crate) async fn discard_uni_streams_for_session(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<u64>> {
+    let deadline = timeout.map(|limit| Instant::now() + limit);
     let Some(state) = session_registry::enable_uni_discard(id) else {
         return Ok(None);
     };
     let Some((_, uni_rx, _, _)) = session_registry::get_stream_accept_state(id) else {
         return Ok(None);
     };
-    let mut rx = uni_rx.lock().await;
-    let mut scratch = None;
-    loop {
-        let next = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
-        let Some(mut stream) = (match next {
-            Ok(value) => value,
-            Err(_) => break,
-        }) else {
-            break;
-        };
-        let scratch = scratch
-            .get_or_insert_with(|| vec![0u8; crate::client_stream::STREAM_READ_BUFFER_BYTES]);
-        let result = stream.discard_incoming(scratch).await;
-        state.record(result.clone());
-        if let Err(error) = result {
-            return Err(napi::Error::from_reason(error));
-        }
-    }
-    drop(rx);
-    // The accept queue is empty after the mode-switch window. Do not retain a
-    // per-session scratch allocation while waiting for native direct streams.
-    drop(scratch);
-    wait_for_stream_discard(state, timeout).await
+    Ok(discard_streams_for_session("uni", uni_rx, state, deadline).await)
 }
 
 pub(crate) async fn create_bidi_stream_for_session(id: &str) -> Result<ClientBidiStreamHandle> {
@@ -505,9 +674,178 @@ pub(crate) async fn wait_session_stream_capacity(
 mod tests {
     use super::*;
     use crate::session_napi::SessionHandle;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Notify;
+
+    /// Test double for the session-owned discard state.
+    #[derive(Default)]
+    struct FakeDiscardSink {
+        completed: AtomicU64,
+        error: std::sync::Mutex<Option<String>>,
+        closed: AtomicBool,
+    }
+
+    impl StreamDiscardSink for FakeDiscardSink {
+        fn record(&self, result: std::result::Result<(), String>) {
+            match result {
+                Ok(()) => {
+                    self.completed.fetch_add(1, Ordering::AcqRel);
+                }
+                Err(error) => {
+                    let mut slot = self.error.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(error);
+                    }
+                }
+            }
+        }
+
+        fn completed(&self) -> u64 {
+            self.completed.load(Ordering::Acquire)
+        }
+
+        fn error(&self) -> Option<String> {
+            self.error.lock().unwrap().clone()
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+    }
+
+    struct FakeDiscardStream(std::result::Result<(), String>);
+
+    impl DiscardableStream for FakeDiscardStream {
+        fn discard_stream(
+            &mut self,
+            _scratch: &mut [u8],
+        ) -> impl std::future::Future<Output = std::result::Result<(), String>> + Send {
+            let result = self.0.clone();
+            async move { result }
+        }
+    }
+
+    fn queued_streams(
+        results: Vec<std::result::Result<(), String>>,
+    ) -> tokio::sync::mpsc::Receiver<Box<FakeDiscardStream>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(results.len().max(1));
+        for result in results {
+            tx.try_send(Box::new(FakeDiscardStream(result)))
+                .expect("queue capacity");
+        }
+        rx
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_discard_preserves_completed_count_when_a_stream_errors() {
+        let sink = FakeDiscardSink::default();
+        let mut rx = queued_streams(vec![
+            Ok(()),
+            Ok(()),
+            Err("E_SESSION_CLOSED".to_string()),
+            Ok(()),
+        ]);
+        let mut outcome = StreamDiscardOutcome::default();
+        let deadline = Some(Instant::now() + Duration::from_millis(500));
+        let keep_waiting =
+            drain_queued_discard_streams(&mut rx, &sink, deadline, &mut outcome).await;
+
+        assert!(!keep_waiting, "a session-closed race ends the drain");
+        assert_eq!(sink.completed(), 2);
+        assert_eq!(outcome.errored, 1);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.diagnostic.as_deref(), Some("E_SESSION_CLOSED"));
+
+        outcome.completed = sink.completed();
+        assert_eq!(finish_stream_discard("bidi", outcome), Some(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_race_does_not_mark_the_drain_failed() {
+        let outcome = StreamDiscardOutcome {
+            completed: 7,
+            errored: 1,
+            timed_out: false,
+            diagnostic: Some("E_SESSION_CLOSED".to_string()),
+        };
+        assert_eq!(finish_stream_discard("uni", outcome), Some(7));
+
+        // A reset race is non-terminal: it is diagnostic only and must not
+        // shrink or replace the delivered count.
+        let sink = FakeDiscardSink::default();
+        let mut rx = queued_streams(vec![Err("E_STREAM_RESET".to_string()), Ok(()), Ok(())]);
+        let mut outcome = StreamDiscardOutcome::default();
+        let deadline = Some(Instant::now() + Duration::from_millis(500));
+        drain_queued_discard_streams(&mut rx, &sink, deadline, &mut outcome).await;
+        assert_eq!(sink.completed(), 2, "drain continues past a reset");
+        assert_eq!(outcome.errored, 1);
+        assert_eq!(outcome.diagnostic.as_deref(), Some("E_STREAM_RESET"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_phase_reports_completed_count_on_deadline() {
+        let sink = FakeDiscardSink::default();
+        sink.record(Ok(()));
+        sink.record(Err("E_STREAM_RESET".to_string()));
+        let mut outcome = StreamDiscardOutcome::default();
+        wait_for_stream_discard(
+            &sink,
+            Some(Instant::now() + Duration::from_millis(60)),
+            &mut outcome,
+        )
+        .await;
+        assert_eq!(outcome.completed, 1);
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.diagnostic.as_deref(), Some("E_STREAM_RESET"));
+        assert_eq!(finish_stream_discard("bidi", outcome), Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_phase_returns_count_when_session_closes() {
+        let sink = FakeDiscardSink::default();
+        sink.record(Ok(()));
+        sink.closed.store(true, Ordering::Release);
+        let mut outcome = StreamDiscardOutcome::default();
+        wait_for_stream_discard(&sink, None, &mut outcome).await;
+        assert_eq!(outcome.completed, 1);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_deadline_bounds_the_accept_lock_phase() {
+        let lock = Arc::new(tokio::sync::Mutex::new(0u8));
+        let held = Arc::clone(&lock);
+        let guard = held.lock_owned().await;
+        let started = std::time::Instant::now();
+        let acquired =
+            lock_with_deadline(&lock, Some(Instant::now() + Duration::from_millis(40))).await;
+        let elapsed = started.elapsed();
+        assert!(acquired.is_none(), "held lock must not be acquired");
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "lock phase must honour the caller deadline, took {:?}",
+            elapsed
+        );
+        drop(guard);
+        assert!(lock_with_deadline(&lock, None).await.is_some());
+    }
+
+    #[test]
+    fn discard_error_classification_separates_terminal_and_expected() {
+        assert!(discard_error_is_terminal("E_SESSION_CLOSED"));
+        assert!(!discard_error_is_terminal("E_STREAM_RESET"));
+        assert!(discard_error_is_expected("E_STREAM_RESET"));
+        assert!(!discard_error_is_expected("E_INTERNAL: poisoned"));
+    }
+
+    #[test]
+    fn empty_discard_still_reports_nothing() {
+        assert_eq!(
+            finish_stream_discard("bidi", StreamDiscardOutcome::default()),
+            None
+        );
+    }
 
     #[test]
     fn session_handle_exposes_constructor_identity() {
