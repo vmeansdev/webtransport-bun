@@ -18,6 +18,11 @@ jobs:
       contents: read
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+      # cargo-llvm-cov --branch emits -Z coverage-options=branch, which the
+      # pinned stable 1.95.0 rejects unless bootstrap is set. This is the same
+      # escape hatch cargo-llvm-cov applies internally; it keeps the pinned
+      # 1.95.0 compiler (no nightly), only unlocking the branch flag.
+      RUSTC_BOOTSTRAP: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
