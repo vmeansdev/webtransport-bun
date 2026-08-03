@@ -1914,4 +1914,137 @@ mod tests {
         assert_eq!(get(":authority"), Some("example.com"));
         assert_eq!(get(":path"), Some("/chat"));
     }
+
+    /// RFC 9204 §4.5.1.1 — the Required Insert Count is encoded modulo
+    /// `2 * MaxEntries`, so the decoder has to unwrap values that land above
+    /// the current maximum and reject those outside the representable window.
+    #[test]
+    fn required_insert_count_unwraps_within_the_window_and_rejects_outside_it() {
+        // max_capacity 64 ⇒ MaxEntries 2, FullRange 4.
+        let cap = 64;
+
+        // 8 inserts ⇒ MaxValue 10, MaxWrapped 8. Encoded 4 is RIC 7 wrapped.
+        assert_eq!(encode_required_insert_count(7, cap), Some(4));
+        assert_eq!(decode_required_insert_count(4, cap, 8), Ok(7));
+
+        // Encoded 6 would unwrap to 13, beyond MaxValue + MaxEntries (12).
+        assert_eq!(
+            decode_required_insert_count(6, cap, 8),
+            Err(QpackError::Invalid)
+        );
+
+        // With no inserts, encoded 1 unwraps to 0 — an encoded RIC of 0 is
+        // spelled as the literal 0, so a non-zero encoding must never mean it.
+        assert_eq!(
+            decode_required_insert_count(1, cap, 0),
+            Err(QpackError::Invalid)
+        );
+
+        // A zero encoding stays a literal-only section.
+        assert_eq!(decode_required_insert_count(0, cap, 8), Ok(0));
+    }
+
+    /// RFC 9204 §4.4 — a decoder-stream instruction split across TCP-ish
+    /// boundaries must be left unconsumed rather than half-applied, for every
+    /// one of the three instruction shapes.
+    #[test]
+    fn decoder_stream_leaves_truncated_instructions_unconsumed() {
+        // Stream Cancellation (01) is parsed and consumed like the others.
+        let (consumed, ici, acks) = feed_decoder_stream(&[0x45]).expect("stream cancellation");
+        assert_eq!(consumed, 1);
+        assert_eq!(ici, 0);
+        assert!(acks.is_empty(), "cancellation is not a section ack");
+
+        // Section Acknowledgement (1) with a continuation byte missing.
+        let (consumed, ici, acks) = feed_decoder_stream(&[0xff]).expect("truncated ack");
+        assert_eq!(consumed, 0, "a partial section ack must not be consumed");
+        assert_eq!(ici, 0);
+        assert!(acks.is_empty());
+
+        // Stream Cancellation (01) with a continuation byte missing.
+        let (consumed, _ici, _acks) = feed_decoder_stream(&[0x7f]).expect("truncated cancel");
+        assert_eq!(consumed, 0);
+
+        // Insert Count Increment (00) with a continuation byte missing.
+        let (consumed, ici, _acks) = feed_decoder_stream(&[0x3f]).expect("truncated ici");
+        assert_eq!(consumed, 0);
+        assert_eq!(ici, 0, "a partial increment must not be applied");
+
+        // A complete instruction ahead of a partial one is still consumed.
+        let (consumed, ici, acks) = feed_decoder_stream(&[0x81, 0x3f]).expect("mixed");
+        assert_eq!(consumed, 1);
+        assert_eq!(acks, vec![1]);
+        assert_eq!(ici, 0);
+    }
+
+    /// RFC 9204 §3.2.2 — the encoder must not evict entries the peer has not
+    /// acknowledged, and once acked the evicted absolute index stops resolving.
+    #[test]
+    fn encoder_evicts_only_acknowledged_entries_and_drops_their_indexes() {
+        // Three 34-byte entries do not fit in 96 bytes; the third needs an evict.
+        let mut enc = QpackEncoder::new(96);
+        enc.set_capacity_instruction(96).expect("capacity");
+        assert_eq!(enc.table().capacity(), 96);
+        enc.insert_literal_instruction("a", "1").expect("first");
+        enc.insert_literal_instruction("b", "2").expect("second");
+
+        assert_eq!(
+            enc.insert_literal_instruction("c", "3"),
+            Err(QpackError::Invalid),
+            "evicting an unacknowledged entry would desync the peer"
+        );
+        assert_eq!(enc.known_received_count(), 0);
+
+        enc.note_section_ack(2);
+        assert_eq!(enc.known_received_count(), 2);
+        enc.insert_literal_instruction("c", "3").expect("after ack");
+
+        assert!(
+            enc.table().get_absolute(1).is_none(),
+            "the evicted entry must stop resolving"
+        );
+        assert_eq!(enc.table().get_absolute(2), Some(("b", "2")));
+
+        // Lookup skips the evicted index and matches on name *and* value.
+        assert_eq!(enc.find_absolute("b", "2"), Some(2));
+        assert_eq!(
+            enc.find_absolute("b", "9"),
+            None,
+            "a same-name different-value entry is not a hit"
+        );
+        assert_eq!(enc.find_absolute("zzz", "1"), None);
+    }
+
+    /// An encoder with nothing inserted has no newest entry to reference, so it
+    /// must fall back to literals instead of emitting a dangling index.
+    #[test]
+    fn indexed_newest_section_is_none_before_any_insert() {
+        assert!(QpackEncoder::disabled()
+            .encode_indexed_newest_section()
+            .is_none());
+        assert!(QpackEncoder::new(4096)
+            .encode_indexed_newest_section()
+            .is_none());
+    }
+
+    /// The decoder table is bounded by our advertised SETTINGS capacity, and
+    /// the acknowledged-insert counter tracks what we told the peer.
+    #[test]
+    fn decoder_table_capacity_is_bounded_by_advertised_settings() {
+        let mut dec = QpackDecoder::new(&QpackLocalSettings {
+            max_table_capacity: 4096,
+            max_blocked_streams: 2,
+        });
+        assert_eq!(dec.known_received_count(), 0);
+        dec.note_insert_count_increment(2);
+        assert_eq!(dec.known_received_count(), 2);
+
+        dec.table_mut().set_capacity(64).expect("within advertised");
+        assert_eq!(dec.table().capacity(), 64);
+        assert_eq!(
+            dec.table_mut().set_capacity(8192),
+            Err(QpackError::Invalid),
+            "capacity above SETTINGS_QPACK_MAX_TABLE_CAPACITY must be refused"
+        );
+    }
 }

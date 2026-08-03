@@ -5593,3 +5593,624 @@ fn closing_a_session_with_unidirectional_streams_does_not_trap() {
     assert!(client.close_wt_session(cid, 0, 7, b"bye"));
     assert!(server.close_wt_session(cid, 0, 7, b"bye"));
 }
+
+/// `getStats()` must report live quinn counters for a connected peer and fail
+/// closed with a stable error for a connection id the endpoint never issued.
+#[test]
+fn connection_stats_json_reports_live_counters_and_fails_closed_when_unknown() {
+    let (mut server, mut client, cid) = endpoints();
+
+    let unknown: serde_json::Value =
+        serde_json::from_str(&client.connection_stats_json(4242)).expect("unknown stats json");
+    assert_eq!(unknown["error"], "E_SESSION_CLOSED: unknown connection");
+    assert!(unknown.get("bytesSent").is_none());
+
+    let mut established = false;
+    for _ in 0..400 {
+        let a = relay_client_to_server(&mut client, &mut server);
+        let b = relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if let WtEvent::SessionEstablished { .. } = ev {
+                established = true;
+            }
+        }
+        while server.poll_event().is_some() {}
+        if established {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(established, "session must establish");
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&client.connection_stats_json(cid)).expect("live stats json");
+    assert!(stats.get("error").is_none());
+    assert!(stats["bytesSent"].as_u64().expect("bytesSent") > 0);
+    assert!(stats["bytesReceived"].as_u64().expect("bytesReceived") > 0);
+    assert!(stats["packetsSent"].as_u64().expect("packetsSent") > 0);
+    assert!(stats["packetsReceived"].as_u64().expect("packetsReceived") > 0);
+    assert!(stats["smoothedRttMs"].as_f64().expect("smoothedRttMs") >= 0.0);
+    // W3C requires the datagram counters to exist even though quinn-proto
+    // does not track them; they must read as zero, not be absent.
+    assert_eq!(stats["datagrams"]["droppedIncoming"], 0);
+    assert_eq!(stats["datagrams"]["lostOutgoing"], 0);
+}
+
+/// Ticket keys come from the authority's *host*, so only an all-digit suffix
+/// is stripped as a port, and an authority with no host has no key at all.
+#[test]
+fn tls_server_name_from_authority_only_strips_numeric_ports() {
+    assert_eq!(
+        tls_server_name_from_authority("example.com:4433").as_deref(),
+        Some("example.com")
+    );
+    assert_eq!(
+        tls_server_name_from_authority("example.com:https").as_deref(),
+        Some("example.com:https"),
+        "a non-numeric suffix is part of the name, not a port"
+    );
+    assert_eq!(
+        tls_server_name_from_authority("example.com:").as_deref(),
+        Some("example.com:"),
+        "an empty port is not a port"
+    );
+    assert_eq!(
+        tls_server_name_from_authority("[::1]:4433").as_deref(),
+        Some("::1")
+    );
+    assert!(
+        tls_server_name_from_authority(":4433").is_none(),
+        "a host-less authority must not produce a ticket key"
+    );
+    assert!(tls_server_name_from_authority("   ").is_none());
+}
+
+/// The client ticket vault must fail closed: no 0-RTT store, an authority with
+/// no host, or a forged blob all refuse rather than hydrate session state.
+#[test]
+fn client_ticket_vault_fails_closed_without_store_host_or_valid_blob() {
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let hashes = vec![[7u8; 32]];
+    let forged = [0u8; 64];
+
+    let no_0rtt =
+        WtEndpoint::new_client_pinned_with_limits(saddr, hashes.clone(), WasmLimits::default())
+            .expect("pinned client");
+    assert!(
+        no_0rtt.dump_client_ticket("localhost:4433").is_none(),
+        "an endpoint built without 0-RTT has no ticket store to export"
+    );
+    assert!(!no_0rtt.import_client_ticket("localhost:4433", &forged));
+
+    let with_0rtt = WtEndpoint::new_client_pinned_with_limits_rate_limits_and_0rtt(
+        saddr,
+        hashes,
+        WasmLimits::default(),
+        WasmRateLimits::default(),
+        true,
+    )
+    .expect("0rtt pinned client");
+    assert!(
+        with_0rtt.dump_client_ticket("localhost:4433").is_none(),
+        "an empty store exports nothing rather than an empty blob"
+    );
+    assert!(
+        !with_0rtt.import_client_ticket("localhost:4433", &forged),
+        "an unauthenticated blob must be rejected"
+    );
+    assert!(with_0rtt.dump_client_ticket(":4433").is_none());
+    assert!(
+        !with_0rtt.import_client_ticket(":4433", &forged),
+        "a host-less authority must not hydrate any ticket key"
+    );
+}
+
+/// The PEM server constructor must pin the *supplied* leaf (not a freshly
+/// generated one), reject malformed material, and carry QPACK settings.
+#[test]
+fn pem_cert_server_pins_supplied_leaf_and_round_trips_qpack_settings() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+    let gen = crate::cert::generate("pem.test", 14, now_unix).expect("generated cert");
+
+    let (mut server, hash) =
+        WtEndpoint::new_with_pem_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+            caddr,
+            &gen.cert_pem,
+            &gen.key_pem,
+            WasmLimits::default(),
+            WasmRateLimits::default(),
+            false,
+            false,
+            CongestionControlMode::Default,
+        )
+        .expect("pem server");
+    assert_eq!(
+        hash,
+        crate::cert::sha256_base64(&gen.cert_der),
+        "the returned pin must hash the caller's leaf"
+    );
+    assert_eq!(server.peer_addr(), caddr);
+
+    assert_eq!(
+        server.qpack_settings(),
+        h3::QpackLocalSettings::disabled(),
+        "dynamic QPACK stays off until the caller opts in"
+    );
+    let tuned = h3::QpackLocalSettings {
+        max_table_capacity: 4096,
+        max_blocked_streams: 8,
+    };
+    server.set_qpack_settings(tuned);
+    assert_eq!(server.qpack_settings(), tuned);
+
+    let bad = WtEndpoint::new_with_pem_cert_with_limits_rate_limits_0rtt_ticket_share_and_cc(
+        caddr,
+        "not-a-cert",
+        "not-a-key",
+        WasmLimits::default(),
+        WasmRateLimits::default(),
+        false,
+        false,
+        CongestionControlMode::Default,
+    );
+    assert!(bad.is_err(), "malformed PEM must fail closed");
+}
+
+/// `shareProcess0RttTicketStore` selects the shared accept-any client config
+/// only when the caller supplied no crypto — a pinned client keeps its own.
+#[test]
+fn shared_ticket_store_does_not_replace_pinned_client_crypto() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+    let (mut server, hash) = WtEndpoint::new_with_generated_cert_with_limits(
+        caddr,
+        "localhost",
+        14,
+        now_unix,
+        WasmLimits::default(),
+    )
+    .expect("generated cert server");
+
+    let wrong_pin = crate::verify::PinnedCertVerifier::parse_hashes(&hash)
+        .expect("pin hashes")
+        .into_iter()
+        .map(|mut h| {
+            h[0] ^= 0xff;
+            h
+        })
+        .collect();
+    let mut client = WtEndpoint::new_client_pinned_with_limits_rate_limits_0rtt_and_ticket_share(
+        saddr,
+        wrong_pin,
+        WasmLimits::default(),
+        WasmRateLimits::default(),
+        true,
+        true,
+    )
+    .expect("shared-store pinned client");
+    assert!(client.enable_0rtt());
+
+    let cid = client.connect("localhost") as u32;
+    let mut connected = false;
+    let mut closed = false;
+    for _ in 0..2000 {
+        let a = relay_step_addr(&mut client, &mut server, caddr);
+        let b = relay_step_addr(&mut server, &mut client, saddr);
+        while server.poll_event().is_some() {}
+        while let Some(ev) = client.poll_event() {
+            match ev {
+                WtEvent::Connected { .. } => connected = true,
+                WtEvent::ConnectionClosed { conn, .. } => {
+                    assert_eq!(conn, cid);
+                    closed = true;
+                }
+                _ => {}
+            }
+        }
+        if closed {
+            break;
+        }
+        if !a && !b {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(!connected, "a wrong pin must never complete the handshake");
+    assert!(
+        closed,
+        "sharing the process ticket store must not downgrade pinning to accept-any"
+    );
+}
+
+/// A secondary CONNECT stream past its 200 carries only session capsules: DATA
+/// frames are fed to the capsule assembler, every other frame type is dropped,
+/// and an unknown stream is a no-op rather than a spin.
+#[test]
+fn extra_connect_stream_feeds_only_data_frames_to_the_capsule_parser() {
+    use quinn_proto::{Dir, Side};
+
+    let (mut server, h, _primary) =
+        server_with_request(h3::encode_connect_request("localhost", "/"));
+    let extra = StreamId::new(Side::Client, Dir::Bi, 1);
+
+    // No buffer for this stream at all: return immediately, no events.
+    server.parse_extra_connect_capsules(h, extra);
+    assert!(server.events.is_empty());
+
+    let sess = server.sessions.get_mut(&h).expect("session");
+    sess.extra_sessions.insert(extra);
+    // A non-DATA frame on a secondary CONNECT is discarded, not buffered.
+    sess.extra_rx
+        .entry(extra)
+        .or_default()
+        .extend_from_slice(&h3::frame_wrap(h3::frame::HEADERS, b"ignored"));
+    server.parse_extra_connect_capsules(h, extra);
+    assert!(
+        server.events.is_empty(),
+        "a non-DATA frame must not reach the capsule assembler"
+    );
+    assert!(
+        server
+            .sessions
+            .get(&h)
+            .and_then(|s| s.extra_rx.get(&extra))
+            .expect("buffer retained")
+            .is_empty(),
+        "the discarded frame must still be consumed from the buffer"
+    );
+
+    // A DATA frame carrying CLOSE_WEBTRANSPORT_SESSION retires just this session.
+    let close = crate::capsule::encode_close(9, b"done");
+    server
+        .sessions
+        .get_mut(&h)
+        .expect("session")
+        .extra_rx
+        .entry(extra)
+        .or_default()
+        .extend_from_slice(&h3::frame_wrap(h3::frame::DATA, &close));
+    server.parse_extra_connect_capsules(h, extra);
+
+    let closed = server
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            WtEvent::SessionClosed {
+                session_id,
+                code,
+                reason,
+                ..
+            } => Some((*session_id, *code, reason.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(closed, vec![(u64::from(extra), 9, "done".to_string())]);
+    assert!(
+        !server
+            .sessions
+            .get(&h)
+            .expect("session")
+            .extra_sessions
+            .contains(&extra),
+        "the closed secondary session must be retired"
+    );
+}
+
+/// `sni` entries are validated before the live resolver is touched, so a batch
+/// missing any required field must be rejected whole.
+#[test]
+fn parse_sni_entries_rejects_batches_missing_required_fields() {
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+    let gen = crate::cert::generate("sni.test", 14, now_unix).expect("generated cert");
+
+    let missing_name = serde_json::json!([{ "certPem": gen.cert_pem, "keyPem": gen.key_pem }]);
+    assert_eq!(
+        parse_sni_entries(Some(&missing_name)).unwrap_err(),
+        "E_TLS: sni.serverName missing"
+    );
+
+    let missing_cert = serde_json::json!([{ "serverName": "a.test", "keyPem": gen.key_pem }]);
+    assert_eq!(
+        parse_sni_entries(Some(&missing_cert)).unwrap_err(),
+        "E_TLS: sni.certPem missing"
+    );
+
+    let missing_key = serde_json::json!([{ "serverName": "a.test", "certPem": gen.cert_pem }]);
+    assert_eq!(
+        parse_sni_entries(Some(&missing_key)).unwrap_err(),
+        "E_TLS: sni.keyPem missing"
+    );
+
+    let ok = serde_json::json!([{
+        "serverName": "a.test",
+        "certPem": gen.cert_pem,
+        "keyPem": gen.key_pem,
+    }]);
+    let parsed = parse_sni_entries(Some(&ok)).expect("valid sni batch");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].0, "a.test");
+}
+
+/// QPACK blocked-stream accounting must tolerate the states the H3 parser can
+/// legitimately reach: a connection whose session is already gone, and the
+/// primary CONNECT before it has a stream id.
+#[test]
+fn qpack_blocked_accounting_tolerates_missing_session_and_unindexed_stream() {
+    use quinn_proto::{Dir, Side};
+
+    let h = ConnectionHandle(0);
+    let stream_id = StreamId::new(Side::Client, Dir::Bi, 0);
+    let mut sessions: HashMap<ConnectionHandle, Session> = HashMap::new();
+
+    // Session already torn down: accounting is a no-op, never an error.
+    assert!(note_qpack_header_blocked(&mut sessions, h, Some(stream_id)).is_ok());
+    clear_qpack_header_blocked(&mut sessions, h, stream_id);
+
+    sessions.insert(
+        h,
+        Session {
+            qpack_decoder: h3::QpackDecoder::new(&h3::QpackLocalSettings {
+                max_table_capacity: 4096,
+                max_blocked_streams: 1,
+            }),
+            ..Session::default()
+        },
+    );
+
+    // Primary CONNECT not yet indexed: only the max=0 check applies, so this
+    // must not consume one of the blocked-stream slots.
+    assert!(note_qpack_header_blocked(&mut sessions, h, None).is_ok());
+    assert!(sessions[&h].qpack_blocked_streams.is_empty());
+
+    assert!(note_qpack_header_blocked(&mut sessions, h, Some(stream_id)).is_ok());
+    assert_eq!(sessions[&h].qpack_blocked_streams.len(), 1);
+    // Re-blocking an already-blocked stream must not exceed the cap.
+    assert!(note_qpack_header_blocked(&mut sessions, h, Some(stream_id)).is_ok());
+
+    clear_qpack_header_blocked(&mut sessions, h, stream_id);
+    assert!(sessions[&h].qpack_blocked_streams.is_empty());
+}
+
+/// Only admitted *bidi HEADERS* request streams count toward the unlatched
+/// CONNECT budget — uni streams and non-HEADERS frames must not.
+#[test]
+fn count_unlatched_connect_streams_ignores_uni_and_non_headers_streams() {
+    use quinn_proto::{Dir, Side};
+
+    let mut session = Session::default();
+    let mut add = |id: StreamId, is_bidi: bool, kind: Option<u64>| {
+        session.in_streams.insert(
+            id,
+            InStream {
+                kind,
+                is_bidi,
+                sid_read: false,
+                wt_session_id: None,
+                handle: None,
+                connect_admitted: true,
+                buf: Vec::new(),
+            },
+        );
+    };
+    add(
+        StreamId::new(Side::Client, Dir::Bi, 0),
+        true,
+        Some(h3::frame::HEADERS),
+    );
+    add(
+        StreamId::new(Side::Client, Dir::Uni, 0),
+        false,
+        Some(h3::frame::HEADERS),
+    );
+    add(
+        StreamId::new(Side::Client, Dir::Bi, 1),
+        true,
+        Some(h3::frame::DATA),
+    );
+
+    assert_eq!(count_unlatched_connect_streams(&session), 1);
+}
+
+/// Resuming a stream that was never paused must be a no-op, not a spurious
+/// read pass over an unrelated connection.
+#[test]
+fn stream_resume_on_an_unpaused_stream_is_a_no_op() {
+    let (mut server, _h, _sid) = server_with_request(h3::encode_connect_request("localhost", "/"));
+    server.stream_resume(4242);
+    assert!(server.events.is_empty());
+
+    server.stream_pause(4242);
+    server.stream_resume(4242);
+    assert!(
+        !server.paused.contains(&4242),
+        "resume must clear the pause"
+    );
+}
+
+/// A CONNECT that can never be answered fails the QUIC connection exactly
+/// once; a second failure on the same handle must stay silent.
+#[test]
+fn failing_a_session_before_establish_emits_connection_closed_once() {
+    let (mut server, h, _sid) = server_with_request(h3::encode_connect_request("localhost", "/"));
+    server.fail_session_before_establish(h);
+    server.fail_session_before_establish(h);
+
+    let closed = server
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WtEvent::ConnectionClosed { conn: 1, code: 0 }))
+        .count();
+    assert_eq!(closed, 1, "a second failure must not re-emit");
+    assert!(server.sessions[&h].connect_closed);
+}
+
+/// An authority with no host cannot key a TLS server name, so `connect()` must
+/// reject it up front instead of handing an empty SNI to quinn.
+#[test]
+fn connect_with_a_host_less_authority_fails_closed() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let mut client = WtEndpoint::new(false, caddr, saddr).expect("client endpoint");
+
+    assert_eq!(client.connect(":4433"), -1);
+    assert_eq!(
+        client.take_last_error().as_deref(),
+        Some("E_INVALID_ARGUMENT: empty authority host")
+    );
+    assert!(
+        client.connect("localhost") >= 0,
+        "a real authority still connects"
+    );
+}
+
+/// Tearing down one connection must drop exactly its own stream state: a
+/// second connection's handles, pause flags and reverse index entries survive.
+#[test]
+fn connection_teardown_only_drops_the_closing_connections_stream_state() {
+    use quinn_proto::{Dir, Side};
+
+    let (mut server, h, _sid) = server_with_request(h3::encode_connect_request("localhost", "/"));
+    let other = ConnectionHandle(1);
+    let mine = StreamId::new(Side::Client, Dir::Bi, 8);
+    let theirs = StreamId::new(Side::Client, Dir::Bi, 12);
+    server.index_insert(100, h, mine, 0);
+    server.index_insert(200, other, theirs, 0);
+    server.paused.insert(100);
+    server.paused.insert(200);
+
+    server.release_connection_budget(h);
+    server.cleanup_connection(h, Instant::now());
+
+    assert!(!server.stream_index.contains_key(&100));
+    assert!(!server.paused.contains(&100));
+    assert!(!server.rev_index.contains_key(&(h, mine)));
+    assert!(!server.sessions.contains_key(&h));
+    assert!(!server.id_to_handle.contains_key(&1));
+
+    assert_eq!(server.stream_index.get(&200), Some(&(other, theirs)));
+    assert!(
+        server.paused.contains(&200),
+        "another connection's paused stream must survive"
+    );
+    assert!(server.rev_index.contains_key(&(other, theirs)));
+
+    // Removing a handle that was never indexed, and tearing the same
+    // connection down twice, are both no-ops.
+    server.index_remove(4242);
+    server.cleanup_connection(h, Instant::now());
+    assert_eq!(server.stream_index.len(), 1);
+}
+
+/// §3.2 — DRAIN is only meaningful on an established session, and each of the
+/// ways a session can be "known but not drainable" must fail closed with its
+/// own reason rather than writing a capsule into a dead stream.
+#[test]
+fn drain_wt_session_refuses_sessions_that_are_not_established() {
+    use quinn_proto::{Dir, Side};
+
+    let (mut server, h, connect_sid) =
+        server_with_request(h3::encode_connect_request("localhost", "/"));
+    let extra = StreamId::new(Side::Client, Dir::Bi, 4);
+    {
+        let s = server.sessions.get_mut(&h).expect("session");
+        s.connect_stream = Some(connect_sid);
+        s.extra_sessions.insert(extra);
+    }
+
+    assert!(!server.drain_wt_session(1, u64::from(connect_sid)));
+    assert_eq!(
+        server.take_last_error().as_deref(),
+        Some("E_SESSION_CLOSED: session not established")
+    );
+
+    assert!(!server.drain_wt_session(1, 999_999));
+    assert_eq!(
+        server.take_last_error().as_deref(),
+        Some("E_SESSION_CLOSED: unknown WebTransport session id")
+    );
+
+    // A latched secondary session *is* established, so it gets past the §3.2
+    // check and fails on the missing QUIC connection instead.
+    assert!(!server.drain_wt_session(1, u64::from(extra)));
+    assert_eq!(
+        server.take_last_error().as_deref(),
+        Some("E_SESSION_CLOSED: connection missing")
+    );
+
+    assert!(!server.drain_wt_session(4242, 0));
+    assert_eq!(
+        server.take_last_error().as_deref(),
+        Some("E_SESSION_CLOSED: unknown connection")
+    );
+}
+
+/// Stream handles are allocated from a monotonic u32; exhausting the space must
+/// fail closed rather than wrap and alias a live stream.
+#[test]
+fn open_stream_fails_closed_when_the_handle_space_is_exhausted() {
+    let (mut server, h, connect_sid) =
+        server_with_request(h3::encode_connect_request("localhost", "/"));
+    server.sessions.get_mut(&h).expect("session").connect_stream = Some(connect_sid);
+    server.next_stream = u32::MAX;
+
+    assert_eq!(server.open_stream(1, u64::from(connect_sid), true), -1);
+    assert_eq!(
+        server.take_last_error().as_deref(),
+        Some("E_LIMIT_EXCEEDED: stream handle space exhausted")
+    );
+}
+
+/// A client's own secondary CONNECT bidi lives in `self_bidi`, but it is also a
+/// CONNECT stream — the generic reader must skip it so the capsule parser owns
+/// those bytes exclusively.
+#[test]
+fn read_streams_skips_self_opened_connect_streams() {
+    use quinn_proto::{Dir, Side};
+
+    let (mut server, h, _sid) = server_with_request(h3::encode_connect_request("localhost", "/"));
+    let extra = StreamId::new(Side::Client, Dir::Bi, 4);
+    let plain = StreamId::new(Side::Client, Dir::Bi, 8);
+    {
+        let s = server.sessions.get_mut(&h).expect("session");
+        s.connect_self_opened = true;
+        s.extra_sessions.insert(extra);
+        s.self_bidi.insert(extra, 77);
+        s.self_bidi.insert(plain, 78);
+    }
+
+    server.read_streams(h, Instant::now());
+
+    // The plain self-opened stream is read (and, with no connection attached,
+    // reported as finished); the CONNECT stream must never appear, because the
+    // capsule parser owns it.
+    let touched: Vec<u32> = server
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            WtEvent::StreamData { stream, .. } | WtEvent::StreamReset { stream, .. } => {
+                Some(*stream)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !touched.contains(&77),
+        "a self-opened CONNECT stream must not be read as a WT stream: {touched:?}"
+    );
+    assert!(
+        server
+            .sessions
+            .get(&h)
+            .expect("session")
+            .extra_rx
+            .is_empty(),
+        "read_streams must not buffer capsule bytes"
+    );
+}
