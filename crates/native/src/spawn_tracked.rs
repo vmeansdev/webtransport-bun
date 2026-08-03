@@ -23,6 +23,10 @@ static TEST_STALL_SESSION_EXIT_ONCE: std::sync::atomic::AtomicBool =
 pub enum TaskKind {
     Session,
     Stream,
+    /// The server's endpoint accept loop. Tracked and abortable like any other
+    /// task, but counted apart from per-session work because it only exits on
+    /// shutdown.
+    Accept,
 }
 
 /// Spawn a future on the runtime with tracked gauges.
@@ -44,6 +48,9 @@ pub fn spawn_tracked<F>(
         TaskKind::Stream => {
             metrics.stream_tasks_active.fetch_add(1, Ordering::Relaxed);
         }
+        TaskKind::Accept => {
+            metrics.accept_tasks_active.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let metrics_clone = Arc::clone(&metrics);
     let decrement = move || match kind {
@@ -55,6 +62,11 @@ pub fn spawn_tracked<F>(
         TaskKind::Stream => {
             metrics_clone
                 .stream_tasks_active
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        TaskKind::Accept => {
+            metrics_clone
+                .accept_tasks_active
                 .fetch_sub(1, Ordering::Relaxed);
         }
     };
@@ -137,6 +149,7 @@ async fn maybe_stall_task_exit(kind: TaskKind) {
             "WEBTRANSPORT_TEST_STALL_TRACKED_STREAM_EXIT",
             &TEST_STALL_STREAM_EXIT_ONCE,
         ),
+        TaskKind::Accept => return,
     };
     if std::env::var(env_key).ok().as_deref() != Some("1") {
         return;
@@ -255,6 +268,46 @@ mod tests {
 
         assert_eq!(abort_server_tasks(41), 1);
         wait_for(|| tracked_idle(&metrics, &[41])).await;
+    }
+
+    /// The accept loop outlives every session it admits, so counting it as a
+    /// session task pinned `sessionTasksActive` at 1 for the life of the server
+    /// and made "all sessions drained" unobservable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_tasks_are_counted_apart_from_session_tasks() {
+        let _guard = lock_env();
+        clear_stall_env();
+        let metrics = Arc::new(ServerMetrics::default());
+        spawn_tracked(
+            Arc::clone(&metrics),
+            43,
+            TaskKind::Accept,
+            PanicScope::Server(43),
+            hang_task(),
+        );
+
+        assert_eq!(server_task_count(43), 1);
+        assert_eq!(metrics.accept_tasks_active.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.session_tasks_active.load(Ordering::Relaxed), 0);
+
+        spawn_tracked(
+            Arc::clone(&metrics),
+            43,
+            TaskKind::Session,
+            PanicScope::Server(43),
+            async {},
+        );
+        wait_for(|| {
+            metrics.session_tasks_active.load(Ordering::Relaxed) == 0 && server_task_count(43) == 1
+        })
+        .await;
+        assert_eq!(metrics.accept_tasks_active.load(Ordering::Relaxed), 1);
+
+        assert_eq!(abort_server_tasks(43), 1);
+        wait_for(|| {
+            metrics.accept_tasks_active.load(Ordering::Relaxed) == 0 && server_task_count(43) == 0
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

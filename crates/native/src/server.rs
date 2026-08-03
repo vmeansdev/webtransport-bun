@@ -289,6 +289,7 @@ pub(crate) async fn wait_for_server_drain(
     loop {
         let session_tasks = metrics.session_tasks_active.load(Ordering::Relaxed);
         let stream_tasks = metrics.stream_tasks_active.load(Ordering::Relaxed);
+        let accept_tasks = metrics.accept_tasks_active.load(Ordering::Relaxed);
         let sessions_active = metrics.sessions_active.load(Ordering::SeqCst);
         let tracked_tasks = crate::spawn_tracked::server_task_count(server_id);
         if server_runtime_is_idle(session_tasks, stream_tasks, sessions_active, tracked_tasks) {
@@ -304,10 +305,11 @@ pub(crate) async fn wait_for_server_drain(
                 phase_deadline = now + timing.abort_period;
             } else {
                 return Some(format!(
-                    "E_BACKPRESSURE_TIMEOUT: server close abort timed out sessionsActive={} sessionTasksActive={} streamTasksActive={} trackedTasksActive={} abortedTasks={}",
+                    "E_BACKPRESSURE_TIMEOUT: server close abort timed out sessionsActive={} sessionTasksActive={} streamTasksActive={} acceptTasksActive={} trackedTasksActive={} abortedTasks={}",
                     sessions_active,
                     session_tasks,
                     stream_tasks,
+                    accept_tasks,
                     tracked_tasks,
                     aborted_tasks,
                 ));
