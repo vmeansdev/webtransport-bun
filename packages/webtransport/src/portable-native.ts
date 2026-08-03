@@ -95,9 +95,7 @@ export async function createNativePortableServer(
 	return {
 		backend: "native",
 		address: server.address,
-		close: async () => {
-			await server.close();
-		},
+		close: () => server.close(),
 	};
 }
 

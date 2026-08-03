@@ -10,7 +10,7 @@ type ReaderLike<T, Args extends unknown[] = []> = {
 type AsyncSource<T> = AsyncIterable<T> | AsyncIterator<T>;
 
 type Closeable = {
-	close: () => MaybePromise<unknown>;
+	close: () => MaybePromise<void>;
 };
 
 const CLEANUP_CLOSE_TIMEOUT_MS = 1500;
