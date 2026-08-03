@@ -20,9 +20,11 @@ type PackageCommandRunner = (
 	args: string[],
 	options: {
 		cwd: string;
+		killGraceMs?: number;
 		label: string;
 		platform?: NodeJS.Platform;
 		timeoutMs: number;
+		treeKillTimeoutMs?: number;
 		windowsTreeKillCommand?: string;
 	},
 ) => Promise<string>;
@@ -195,6 +197,28 @@ function hangingProcessTreeSource(
 			: []),
 		"setInterval(() => {}, 1_000);",
 	].join("\n");
+}
+
+function stubbornProcessTreeSource(descendantPidFile: string): string {
+	const descendantSource = [
+		'process.on("SIGTERM", () => {});',
+		"setInterval(() => {}, 1_000);",
+	].join("\n");
+	return [
+		'const { spawn } = require("node:child_process");',
+		'const { writeFileSync } = require("node:fs");',
+		`const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });`,
+		`writeFileSync(${JSON.stringify(descendantPidFile)}, String(child.pid));`,
+		'process.on("SIGTERM", () => {});',
+		"setInterval(() => {}, 1_000);",
+	].join("\n");
+}
+
+function createNoopTaskkill(root: string): string {
+	const taskkill = join(root, "noop-taskkill");
+	writeFileSync(taskkill, ["#!/bin/sh", "exit 0"].join("\n"), "utf8");
+	chmodSync(taskkill, 0o755);
+	return taskkill;
 }
 
 async function runGuarded(
@@ -516,6 +540,140 @@ test.serial(
 		);
 		expect(cleanupError?.message).toContain("fixture command stdout");
 		expect(cleanupError?.message).toContain("fixture command stderr");
+		expect(processIsAlive(descendantPid)).toBe(true);
+	},
+);
+
+test.serial(
+	"posix cleanup stops waiting once the process tree has exited",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-prompt-"));
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const startedAt = Date.now();
+		const cleanupError = await capturedError(
+			runPackageCommand(
+				process.execPath,
+				["-e", hangingProcessTreeSource(descendantPidFile)],
+				{
+					cwd: root,
+					killGraceMs: 3_000,
+					label: "fixture prompt-exit command",
+					timeoutMs: 500,
+					treeKillTimeoutMs: 3_000,
+				},
+			),
+		);
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(cleanupError?.message).toContain("timed out after 500ms");
+		expect(cleanupError?.message).not.toContain("unproven");
+		expect(elapsedMs).toBeLessThan(2_000);
+	},
+);
+
+test.serial(
+	"posix cleanup proves descendant exit before reporting the timeout",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-proof-"));
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const cleanupError = await capturedError(
+			runPackageCommand(
+				process.execPath,
+				["-e", stubbornProcessTreeSource(descendantPidFile)],
+				{
+					cwd: root,
+					killGraceMs: 200,
+					label: "fixture stubborn command",
+					timeoutMs: 750,
+					treeKillTimeoutMs: 3_000,
+				},
+			),
+		);
+		const descendantPid = Number.parseInt(
+			readFileSync(descendantPidFile, "utf8"),
+			10,
+		);
+
+		expect(cleanupError?.message).toContain("timed out after 750ms");
+		expect(cleanupError?.message).not.toContain("unproven");
+		expect(processIsAlive(descendantPid)).toBe(false);
+	},
+);
+
+test.serial(
+	"posix cleanup reports descendant exit unproven when it cannot prove the tree died",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-unproven-"));
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const cleanupError = await capturedError(
+			runPackageCommand(
+				process.execPath,
+				["-e", stubbornProcessTreeSource(descendantPidFile)],
+				{
+					cwd: root,
+					killGraceMs: 50,
+					label: "fixture unprovable command",
+					timeoutMs: 750,
+					treeKillTimeoutMs: 0,
+				},
+			),
+		);
+
+		expect(cleanupError?.message).toContain("timed out after 750ms");
+		expect(cleanupError?.message).toContain("descendant exit unproven");
+		await expectProcessExit(descendantPidFile);
+	},
+);
+
+test.serial(
+	"win32 cleanup does not claim success when taskkill leaves the tree alive",
+	async () => {
+		if (process.platform === "win32") return;
+		const runPackageCommand = packageCommandRunner();
+		if (!runPackageCommand) return;
+		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-win32-noop-"));
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		trackedPidFiles.push(descendantPidFile);
+		const cleanupError = await capturedError(
+			runPackageCommand(
+				process.execPath,
+				["-e", stubbornProcessTreeSource(descendantPidFile)],
+				{
+					cwd: root,
+					killGraceMs: 50,
+					label: "fixture win32 noop-taskkill command",
+					platform: "win32",
+					timeoutMs: 750,
+					treeKillTimeoutMs: 250,
+					windowsTreeKillCommand: createNoopTaskkill(root),
+				},
+			),
+		);
+		await waitForFile(descendantPidFile);
+		const descendantPid = Number.parseInt(
+			readFileSync(descendantPidFile, "utf8"),
+			10,
+		);
+
+		expect(cleanupError?.message).toContain("timed out after 750ms");
+		expect(cleanupError?.message).toContain("descendant exit unproven");
+		expect(cleanupError?.message).not.toContain("cleanup failed");
 		expect(processIsAlive(descendantPid)).toBe(true);
 	},
 );
