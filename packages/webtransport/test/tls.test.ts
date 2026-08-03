@@ -957,4 +957,39 @@ describe("TLS contract (P0.3)", () => {
 			shortCert.cleanup();
 		}
 	}, 15000);
+
+	// The documented keyPem contract is "PEM private key", not "PKCS#8". openssl
+	// emits PKCS#8 from `req -newkey ec`, so every other test here exercises only
+	// that shape; `ecparam -genkey` emits SEC1, which is what operators hand us.
+	it("accepts a SEC1 ECDSA server key and completes a pinned connect", async () => {
+		const sec1Cert = generateCertForNames(
+			["localhost", "127.0.0.1"],
+			10,
+			"ec",
+			"sec1",
+		);
+		if (!sec1Cert) return;
+		expect(sec1Cert.keyPem).toContain("BEGIN EC PRIVATE KEY");
+		const { X509Certificate, createHash } = await import("node:crypto");
+		const leafPem = `${sec1Cert.certPem.split("-----END CERTIFICATE-----")[0]}-----END CERTIFICATE-----\n`;
+		const der = new X509Certificate(leafPem).raw;
+		const value = new Uint8Array(createHash("sha256").update(der).digest());
+		const port = nextPort(26520, 2000);
+		const server = createServer({
+			port,
+			tls: { certPem: sec1Cert.certPem, keyPem: sec1Cert.keyPem },
+			onSession: () => {},
+		});
+		try {
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { serverName: "localhost" },
+				serverCertificateHashes: [{ algorithm: "sha-256", value }],
+			});
+			expect(client.id).toBeDefined();
+			client.close();
+		} finally {
+			await server.close();
+			sec1Cert.cleanup();
+		}
+	}, 15000);
 });

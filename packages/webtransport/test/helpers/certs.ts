@@ -31,7 +31,13 @@ export function generateCertForNames(
 	// serverCertificateHashes pinning (W3C). Default "rsa" for the many tests
 	// that don't pin.
 	leafKeyType: "rsa" | "ec" = "rsa",
+	// PEM encoding for the emitted leaf key. openssl writes PKCS#8 ("PRIVATE
+	// KEY"); "sec1" re-encodes an EC key as "EC PRIVATE KEY".
+	keyFormat: "pkcs8" | "sec1" = "pkcs8",
 ): GeneratedCert | null {
+	if (keyFormat === "sec1" && leafKeyType !== "ec") {
+		throw new Error("sec1 key format requires an ec leaf key");
+	}
 	if (names.length === 0) return null;
 	const dir = mkdtempSync(join(tmpdir(), "webtransport-bun-cert-"));
 	const certPath = join(dir, "cert.pem");
@@ -105,10 +111,17 @@ export function generateCertForNames(
 			"-extfile",
 			extPath,
 		]);
+
+		// `openssl ec` writes SEC1 ("EC PRIVATE KEY") by default; go through a
+		// separate file so the input is never truncated under the reader.
+		const sec1Path = join(dir, "key-sec1.pem");
+		if (keyFormat === "sec1") {
+			execFileSync("openssl", ["ec", "-in", keyPath, "-out", sec1Path]);
+		}
 		return {
 			certPem:
 				readFileSync(certPath, "utf-8") + readFileSync(caCertPath, "utf-8"),
-			keyPem: readFileSync(keyPath, "utf-8"),
+			keyPem: readFileSync(keyFormat === "sec1" ? sec1Path : keyPath, "utf-8"),
 			cleanup: () => {
 				rmSync(dir, { recursive: true, force: true });
 			},

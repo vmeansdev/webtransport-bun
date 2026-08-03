@@ -388,6 +388,69 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    const EC_CERT_PEM: &str = include_str!("../tests/fixtures/tls/ec-cert.pem");
+    const EC_SEC1_KEY_PEM: &str = include_str!("../tests/fixtures/tls/ec-sec1.pem");
+    const EC_PKCS8_KEY_PEM: &str = include_str!("../tests/fixtures/tls/ec-pkcs8.pem");
+    const EC_OTHER_SEC1_KEY_PEM: &str = include_str!("../tests/fixtures/tls/ec-other-sec1.pem");
+    const RSA_CERT_PEM: &str = include_str!("../tests/fixtures/tls/rsa-cert.pem");
+    const RSA_KEY_PEM: &str = include_str!("../tests/fixtures/tls/rsa-key.pem");
+    const RSA_PKCS1_KEY_PEM: &str = include_str!("../tests/fixtures/tls/rsa-key-pkcs1.pem");
+
+    #[test]
+    fn parse_certified_key_accepts_sec1_ecdsa_key() {
+        assert!(EC_SEC1_KEY_PEM.starts_with("-----BEGIN EC PRIVATE KEY-----"));
+        parse_certified_key(EC_CERT_PEM, EC_SEC1_KEY_PEM).expect("SEC1 ECDSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_accepts_pkcs8_ecdsa_key() {
+        assert!(EC_PKCS8_KEY_PEM.starts_with("-----BEGIN PRIVATE KEY-----"));
+        parse_certified_key(EC_CERT_PEM, EC_PKCS8_KEY_PEM).expect("PKCS#8 ECDSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_accepts_rsa_key() {
+        parse_certified_key(RSA_CERT_PEM, RSA_KEY_PEM).expect("RSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_accepts_pkcs1_rsa_key() {
+        assert!(RSA_PKCS1_KEY_PEM.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        parse_certified_key(RSA_CERT_PEM, RSA_PKCS1_KEY_PEM).expect("PKCS#1 RSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_rejects_mismatched_cert_and_key() {
+        let err = parse_certified_key(EC_CERT_PEM, EC_OTHER_SEC1_KEY_PEM)
+            .expect_err("expected cert/key mismatch");
+        assert!(
+            err.starts_with("failed to build certified key:"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(!err.contains("BEGIN"), "error leaked key material: {}", err);
+    }
+
+    #[test]
+    fn parse_certified_key_rejects_malformed_key_material() {
+        let malformed =
+            "-----BEGIN EC PRIVATE KEY-----\nbm90IGEga2V5\n-----END EC PRIVATE KEY-----\n";
+        let err =
+            parse_certified_key(EC_CERT_PEM, malformed).expect_err("expected malformed key error");
+        assert!(
+            !err.contains("bm90IGEga2V5"),
+            "error leaked key bytes: {}",
+            err
+        );
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn parse_certified_key_rejects_certificate_used_as_key() {
+        let err = parse_certified_key(EC_CERT_PEM, EC_CERT_PEM).expect_err("expected key error");
+        assert_eq!(err, "private key PEM contained no private key");
+    }
+
     #[test]
     fn parse_certified_key_rejects_missing_certificates() {
         let err = parse_certified_key("", "").expect_err("expected parse error");
