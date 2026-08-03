@@ -148,12 +148,45 @@ impl DatagramReservation {
     /// reads it. The old ingress path copied every payload into a second
     /// `Vec<u8>` before enqueueing, which amplified allocator churn under a
     /// high-rate drain-all workload.
+    ///
+    /// Small payloads are copied out instead: a `wtransport::datagram::Datagram`
+    /// holds the whole received QUIC datagram as `Bytes` and exposes the payload
+    /// as a subslice of it, so queueing a 1-byte payload can pin a full-MTU
+    /// allocation that the byte reservation never accounts for.
     pub fn into_transport_slot(self, data: wtransport::datagram::Datagram) -> DatagramSlot {
-        DatagramSlot {
-            data: DatagramPayload::Transport(data),
-            _reservation: self,
+        if retains_transport_buffer(data.len()) {
+            DatagramSlot {
+                data: DatagramPayload::Transport(data),
+                _reservation: self,
+            }
+        } else {
+            DatagramSlot {
+                data: DatagramPayload::Owned(data.to_vec()),
+                _reservation: self,
+            }
         }
     }
+}
+
+/// Assumed size of the QUIC datagram buffer a transport-owned payload pins.
+///
+/// `wtransport::datagram::Datagram` keeps the full received datagram and does
+/// not expose its length (`payload()` only yields the subslice, and `Bytes`
+/// hides the underlying allocation), so the retained size is not observable.
+/// A standard 1500-byte Ethernet MTU is the practical worst case for a single
+/// received QUIC datagram.
+const TRANSPORT_DATAGRAM_BACKING_ESTIMATE: usize = 1500;
+
+/// Payload length at or above which the zero-copy path is kept.
+///
+/// At half the assumed backing size the unaccounted transport overhead is at
+/// most 2x the reserved byte budget, which keeps `maxQueuedBytes*` meaningful
+/// while leaving the high-throughput echo path (near-MTU datagrams) zero-copy.
+const TRANSPORT_ZERO_COPY_MIN_PAYLOAD: usize = TRANSPORT_DATAGRAM_BACKING_ESTIMATE / 2;
+
+/// Whether a queued payload of this size may keep the transport buffer alive.
+fn retains_transport_buffer(payload_len: usize) -> bool {
+    payload_len >= TRANSPORT_ZERO_COPY_MIN_PAYLOAD
 }
 
 impl Drop for DatagramReservation {
@@ -305,6 +338,13 @@ impl StreamDiscardState {
 
     pub(crate) fn wake(&self) {
         self.shared.notify.notify_waiters();
+    }
+
+    /// Standalone state for tests that exercise drain behaviour without a
+    /// registered session.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)))
     }
 }
 
@@ -747,6 +787,91 @@ mod tests {
             drop(slot); // session torn down with data still queued
         }
         assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+    }
+
+    // A transport-owned slot pins the whole received QUIC datagram, so small
+    // payloads must be copied out or the retained bytes escape the reservation.
+    #[test]
+    fn small_payload_does_not_retain_transport_buffer() {
+        assert!(!retains_transport_buffer(0));
+        assert!(!retains_transport_buffer(1));
+        assert!(!retains_transport_buffer(
+            TRANSPORT_ZERO_COPY_MIN_PAYLOAD - 1
+        ));
+    }
+
+    // The high-throughput echo path sends near-MTU datagrams and must stay
+    // zero-copy.
+    #[test]
+    fn large_payload_stays_zero_copy() {
+        assert!(retains_transport_buffer(TRANSPORT_ZERO_COPY_MIN_PAYLOAD));
+        assert!(retains_transport_buffer(
+            TRANSPORT_DATAGRAM_BACKING_ESTIMATE
+        ));
+        assert!(retains_transport_buffer(64 * 1024));
+    }
+
+    // The threshold is what bounds unaccounted transport overhead to 2x the
+    // reserved budget; a laxer value silently reopens the accounting hole.
+    #[test]
+    fn zero_copy_threshold_bounds_backing_overhead_to_two_x() {
+        assert!(TRANSPORT_ZERO_COPY_MIN_PAYLOAD * 2 >= TRANSPORT_DATAGRAM_BACKING_ESTIMATE);
+    }
+
+    // `into_transport_slot` cannot be exercised directly (`Datagram` has no
+    // public constructor), so pin its branch to the tested predicate.
+    #[test]
+    fn into_transport_slot_uses_the_backing_retention_policy() {
+        let source = include_str!("session_registry.rs");
+        let fn_source = source
+            .split("pub fn into_transport_slot(")
+            .nth(1)
+            .and_then(|body| body.split("\n}\n").next())
+            .expect("into_transport_slot definition must be parseable");
+        assert_eq!(
+            fn_source
+                .matches("retains_transport_buffer(data.len())")
+                .count(),
+            1,
+            "the copy-out branch must stay driven by retains_transport_buffer"
+        );
+        assert_eq!(
+            fn_source
+                .matches("DatagramPayload::Owned(data.to_vec())")
+                .count(),
+            1,
+            "small payloads must be copied into an exact-size allocation"
+        );
+    }
+
+    // Session close drops every still-queued slot; each reservation must be
+    // released exactly once, never twice and never leaked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_slots_release_once_when_channel_closes() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let sm = Arc::new(SessionMetrics::default());
+        let notify = Arc::new(Notify::new());
+        let (tx, rx) = mpsc::channel::<DatagramSlot>(8);
+
+        for _ in 0..4 {
+            reserve(&metrics, &sm, 250);
+            tx.send(DatagramSlot::new(
+                vec![1u8; 250],
+                Arc::clone(&sm),
+                Arc::clone(&metrics),
+                Arc::clone(&notify),
+                250,
+            ))
+            .await
+            .expect("channel has capacity");
+        }
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 1000);
+
+        drop(tx);
+        drop(rx);
+
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
     }
 
     fn limits() -> crate::limits::Limits {
