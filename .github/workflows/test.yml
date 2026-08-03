@@ -163,10 +163,12 @@ jobs:
         run: cargo clippy --workspace -- -D clippy::all
       - name: cargo test
         run: cargo test --workspace
-      - name: Build native addon
-        run: bun run build:native
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Build native addon
+        # Must follow `bun install`: build-native.ts resolves the pinned
+        # @napi-rs/cli from node_modules, which does not exist before install.
+        run: bun run build:native
       - name: Typecheck
         run: bun run typecheck
       - name: Unit tests
@@ -232,8 +234,6 @@ jobs:
         shell: bash
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
-      CC_wasm32_unknown_unknown: clang
-      AR_wasm32_unknown_unknown: llvm-ar
     strategy:
       fail-fast: false
       matrix:
@@ -274,6 +274,30 @@ jobs:
       - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
         with:
           deno-version: "2.9.3"
+      # ring's wasm32 C build needs an LLVM clang with the wasm32 backend; the
+      # default system/Apple clang cannot target wasm32. Match the wasm job's
+      # toolchain per OS and export the exact CC/AR into the environment.
+      - name: Install wasm C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # LLVM ships preinstalled on windows-latest runners.
+          LLVM_BIN="/c/Program Files/LLVM/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang.exe" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar.exe" >> "$GITHUB_ENV"
       - name: Install exact release tooling
         run: |
           npm install --global npm@11.18.0
