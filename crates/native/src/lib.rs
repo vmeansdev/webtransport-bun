@@ -6,6 +6,16 @@
 
 use crate::error::from_upstream_error as wt_from_upstream_error;
 use napi_derive::napi;
+
+/// Route this dylib's Rust allocations through mimalloc. The macOS system
+/// malloc keeps freed small-zone pages resident forever (pressure relief is a
+/// measured no-op on macOS 26), so transport/session churn left
+/// load-proportional RSS behind after fully drained closes. mimalloc purges
+/// freed pages back to the OS within its purge delay, letting post-close RSS
+/// actually recover. See crates/native/src/native_memory.rs for the recorded
+/// diagnosis.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
