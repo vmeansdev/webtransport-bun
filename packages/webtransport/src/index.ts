@@ -3283,7 +3283,6 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 	disposed = false;
 	readableDone = false;
 	writableDone = false;
-	writableCreated = false;
 	private writableStream: WritableStream<Uint8Array> | null = null;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
 
@@ -3296,7 +3295,6 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 	}
 
 	getWritable(): WritableStream<Uint8Array> {
-		this.writableCreated = true;
 		return (this.writableStream ??= new WritableStream<Uint8Array>(this));
 	}
 
@@ -3368,8 +3366,12 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 	}
 
 	cancel(reason: unknown): void {
+		if (this.disposed) return;
 		this.readableDone = true;
-		this.release(true, extractStreamErrorCode(reason));
+		// W3C half-close: canceling the readable stops only the peer's sending
+		// half. The writable half must stay usable for a response.
+		this.stopSending(extractStreamErrorCode(reason));
+		this.maybeRelease();
 	}
 
 	async write(chunk: Uint8Array): Promise<void> {
@@ -3381,7 +3383,12 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			await current.write(Buffer.from(chunk));
 		} catch (err) {
 			this.writableDone = true;
-			this.release(true);
+			try {
+				current.reset?.(0);
+			} catch {
+				// Session teardown may already have closed the stream.
+			}
+			this.maybeRelease();
 			throw toWebTransportError(err);
 		}
 	}
@@ -3398,14 +3405,27 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			this.maybeRelease();
 		} catch (err) {
 			this.writableDone = true;
-			this.release(true);
+			try {
+				current.reset?.(0);
+			} catch {
+				// Session teardown may already have closed the stream.
+			}
+			this.maybeRelease();
 			throw toWebTransportError(err);
 		}
 	}
 
 	abort(reason: unknown): void {
+		if (this.disposed) return;
 		this.writableDone = true;
-		this.release(true, extractStreamErrorCode(reason));
+		// W3C half-close: aborting the writable resets only our sending half;
+		// the readable half keeps delivering peer data.
+		try {
+			this.handle?.reset?.(extractStreamErrorCode(reason));
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+		this.maybeRelease();
 	}
 
 	private maybeRelease(): void {
