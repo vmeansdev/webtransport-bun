@@ -238,6 +238,7 @@ describe("hardening regressions", () => {
 			const waves = 14; // 14 * 50 = 700 > old 512-slot batcher capacity
 			const perWave = 50;
 			for (let w = 0; w < waves; w++) {
+				const acceptedBefore = acceptedIds.size;
 				await Promise.all(
 					Array.from({ length: perWave }, async () => {
 						const c = await connectWithRetry(
@@ -247,6 +248,40 @@ describe("hardening regressions", () => {
 						);
 						c.close();
 					}),
+				);
+
+				// Per-wave lifecycle gauges. A leaked handshake permit, registry
+				// entry or session task shows up here as a gauge that never returns
+				// to its floor, waves before the workload as a whole times out.
+				const wave = await waitFor(
+					() => server.metricsSnapshot(),
+					(m) =>
+						m.handshakesInFlight === 0 &&
+						m.sessionsActive === 0 &&
+						m.sessionTasksActive === 0 &&
+						m.streamsActive === 0 &&
+						m.queuedBytesGlobal === 0,
+					10000,
+					25,
+					`wave ${w} lifecycle gauges did not return to floor`,
+				);
+				expect(wave.handshakesInFlight).toBe(0);
+				expect(wave.sessionsActive).toBe(0);
+				expect(wave.sessionTasksActive).toBe(0);
+				expect(wave.streamsActive).toBe(0);
+				expect(wave.queuedBytesGlobal).toBe(0);
+				// Admission must keep making progress: each wave has to accept new
+				// sessions, otherwise the server is starving new handshakes.
+				expect(acceptedIds.size).toBeGreaterThan(acceptedBefore);
+
+				// Closed delivery must keep pace with acceptance rather than
+				// accumulating an unbounded backlog across waves.
+				await waitFor(
+					() => closedIds.size,
+					(n) => n === acceptedIds.size,
+					10000,
+					25,
+					`wave ${w} closed events delivered (${closedIds.size}/${acceptedIds.size})`,
 				);
 			}
 
@@ -263,6 +298,22 @@ describe("hardening regressions", () => {
 			);
 			const missing = [...acceptedIds].filter((id) => !closedIds.has(id));
 			expect(missing).toEqual([]);
+
+			const drained = await waitFor(
+				() => server.metricsSnapshot(),
+				(m) =>
+					m.sessionsActive === 0 &&
+					m.sessionTasksActive === 0 &&
+					m.handshakesInFlight === 0 &&
+					m.queuedBytesGlobal === 0,
+				15000,
+				25,
+				"post-churn lifecycle drain",
+			);
+			expect(drained.sessionsActive).toBe(0);
+			expect(drained.sessionTasksActive).toBe(0);
+			expect(drained.handshakesInFlight).toBe(0);
+			expect(drained.queuedBytesGlobal).toBe(0);
 		} finally {
 			await server.close();
 		}

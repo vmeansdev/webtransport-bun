@@ -658,7 +658,7 @@ pub(crate) fn spawn_wtransport_server(
             spawn_tracked::spawn_tracked(
                 Arc::clone(&metrics),
                 owner_server_id,
-                spawn_tracked::TaskKind::Session,
+                spawn_tracked::TaskKind::Accept,
                 panic_guard::PanicScope::Server(owner_server_id),
                 async move {
                     loop {

@@ -14,6 +14,9 @@ pub struct ServerMetrics {
     pub streams_active: AtomicU64,
     pub session_tasks_active: AtomicU64,
     pub stream_tasks_active: AtomicU64,
+    /// The endpoint accept loop, which lives as long as the server does. Kept
+    /// separate so per-session drain checks are not permanently offset by it.
+    pub accept_tasks_active: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
     pub datagrams_dropped: AtomicU64,
