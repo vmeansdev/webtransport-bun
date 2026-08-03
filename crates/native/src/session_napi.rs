@@ -9,8 +9,8 @@ use crate::error::{
 use crate::panic_guard;
 use crate::session::{
     accept_bidi_stream_for_session, accept_uni_stream_for_session, create_bidi_stream_for_session,
-    create_uni_stream_for_session, read_datagram_for_session, send_datagram_for_session,
-    session_metrics_snapshot_from, wait_session_stream_capacity,
+    create_uni_stream_for_session, discard_datagram_for_session, read_datagram_for_session,
+    send_datagram_for_session, session_metrics_snapshot_from, wait_session_stream_capacity,
 };
 use crate::session_registry;
 use crate::RUNTIME;
@@ -157,6 +157,20 @@ impl SessionHandle {
         env.spawn_future(async move {
             RUNTIME
                 .spawn(async move { Ok(read_datagram_for_session(&id).await?.map(Buffer::from)) })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    /// Consume one queued datagram without allocating a JavaScript payload.
+    /// This is used by bounded load/evidence drains that intentionally count
+    /// delivery but do not need to inspect every payload after the probe.
+    #[napi(ts_return_type = "Promise<boolean | null>")]
+    pub fn discard_datagram(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move { discard_datagram_for_session(&id).await })
                 .await
                 .map_err(wt_from_upstream_error)?
         })
