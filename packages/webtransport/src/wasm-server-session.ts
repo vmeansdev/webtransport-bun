@@ -25,6 +25,7 @@ export class WasmServerSession {
 	readonly #options: WasmWebTransportOptions;
 	#wt: WasmWebTransport | null = null;
 	#usedCallbacks = false;
+	#incomingDatagrams: AsyncIterable<Uint8Array> | null = null;
 
 	constructor(session: WasmSession, options: WasmWebTransportOptions = {}) {
 		this.#session = session;
@@ -91,11 +92,17 @@ export class WasmServerSession {
 		return this.#session.sendDatagram(data);
 	}
 
-	/** Datagrams as an async iterable, matching native `incomingDatagrams()`. */
+	/**
+	 * Datagrams as an async iterable, matching native `incomingDatagrams()`.
+	 *
+	 * Memoized for the same reason native memoizes: the datagram stream has one
+	 * consumer, so repeated calls must hand back the *same* iterable rather than
+	 * a second view that would fight over the reader lock.
+	 */
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
-		const readable = this.#web().datagrams.readable;
-		return {
-			async *[Symbol.asyncIterator]() {
+		if (!this.#incomingDatagrams) {
+			const readable = this.#web().datagrams.readable;
+			this.#incomingDatagrams = (async function* () {
 				const reader = readable.getReader();
 				try {
 					for (;;) {
@@ -106,8 +113,9 @@ export class WasmServerSession {
 				} finally {
 					reader.releaseLock();
 				}
-			},
-		};
+			})();
+		}
+		return this.#incomingDatagrams;
 	}
 
 	get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> {

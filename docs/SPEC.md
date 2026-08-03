@@ -43,7 +43,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
   - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
-- Remaining parity tracking and implementation sequencing are in `docs/PARITY_MATRIX.md` (see Priority Execution Order / Remaining Work).
+- Remaining parity tracking is in `docs/PARITY_MATRIX.md`, split into client-facade parity, portable server/session parity, intentional backend-specific extensions, and environment/distribution evidence.
 
 ## Pooling Semantics (allowPooling)
 
@@ -368,6 +368,32 @@ Examples (expected to work):
 - Uni stream upload and download
 
 ## API stability and semver
+
+### The three exported surfaces
+
+The package exports exactly three entrypoints, and they promise different
+things. `packages/webtransport/test/public-surface-contract.test.ts` freezes all
+three — the export lists at runtime, and the shared session/server contract both
+at compile time (`tsc --noEmit`) and against a live session from each backend.
+
+| Entrypoint | Contract |
+| --- | --- |
+| `@webtransport-bun/webtransport` (root) | Native Node-API server/client API. `createServer()` is **synchronous**. Node streams (`Duplex`/`Writable`) on the session stream constructors. Native-only capabilities live here and only here: `releaseNativeMemory()`, `exportTicketVault`/`importTicketVault`, `connect()`, `metricsToPrometheus()`, `ServerSession.goAway()`, SNI/cert rotation, keep-alive and congestion-control knobs. |
+| `@webtransport-bun/webtransport/wasm` | Async WASM/IWA API. `createServer()` returns a promise. Backend-specific extensions are allowed and documented here: Direct Sockets binding, `UdpTransport` injection, ticket-store hosts, `serveOverUdp`, self-signed cert generation and `certHashBase64` pinning. |
+| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. |
+
+Capabilities only one backend can honour stay out of `/portable` by design —
+native `goAway()` (the wasm h3 module has no control-stream `GOAWAY` handling),
+native keepalive and ticket-vault APIs, wasm ticket hosts, and IWA Direct
+Sockets. `PortableServer.certHashBase64` is the one deliberately optional field:
+wasm clients pin a hash, native clients chain-validate, so it is present on wasm
+and `undefined` on native.
+
+`/wasm` has a frozen export list but a `candidate` stability label; see
+`docs/release-status.json`. Freezing names is not the same as promising
+behavior under gates that have not passed.
+
+### Semver rules
 
 - **Stable surface**: Types and functions in this spec are the public API.
 - **Semver**: Major (X.0.0) for breaking changes; minor (x.Y.0) for additive changes; patch (x.y.Z) for fixes.
