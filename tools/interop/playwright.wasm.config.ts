@@ -10,7 +10,14 @@ export default defineConfig({
 	retries: 0,
 	reporter:
 		process.env.INTEROP_EVIDENCE === "1"
-			? [["list"], ["json", { outputFile: "interop-evidence-wasm.json" }]]
+			? [
+					["list"],
+					["json", { outputFile: "interop-evidence-wasm.json" }],
+					[
+						"./evidence-sanitizer.ts",
+						{ outputFile: "interop-evidence-wasm.json" },
+					],
+				]
 			: "list",
 	use: {
 		browserName: "chromium",
