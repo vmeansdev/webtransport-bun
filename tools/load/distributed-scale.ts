@@ -153,7 +153,7 @@ export type RssWarmupTelemetry = {
 };
 
 export type ColdStartDiagnostic = {
-	status: "pass" | "review-required";
+	status: "pass" | "review-required" | "aborted";
 	ratio: number | null;
 	threshold: number;
 	reason: string;
@@ -262,16 +262,18 @@ export function buildMemoryTelemetry(input: {
 	preClose: MemorySample;
 	postClose: MemorySample;
 	warmup?: RssWarmupTelemetry;
+	aborted?: boolean;
 }): MemoryTelemetry {
 	const ratio = (baseline: MemorySample): number | null =>
-		baseline.rssMb > 0
+		!input.aborted && baseline.rssMb > 0
 			? Number((input.postClose.rssMb / baseline.rssMb).toFixed(4))
 			: null;
 	const coldStartRecoveryRatio = ratio(input.coldStart);
 	const serviceReadyRecoveryRatio = ratio(input.serviceReady);
-	const coldStartDiagnosticStatus =
-		coldStartRecoveryRatio != null &&
-		coldStartRecoveryRatio <= RSS_COLD_START_DIAGNOSTIC_THRESHOLD
+	const coldStartDiagnosticStatus = input.aborted
+		? "aborted"
+		: coldStartRecoveryRatio != null &&
+				coldStartRecoveryRatio <= RSS_COLD_START_DIAGNOSTIC_THRESHOLD
 			? "pass"
 			: "review-required";
 	return {
@@ -340,7 +342,7 @@ export type OverloadEvidence = {
 	recoveryDurationMs: number;
 };
 
-type RunSummary = {
+export type RunSummary = {
 	label: string;
 	sessions: number;
 	durationSec: number;
@@ -2907,6 +2909,14 @@ async function runOneCampaign(
 }
 
 export async function runScaleCampaign(config: ScaleCampaignConfig) {
+	if (
+		acknowledgedReviewRequested() &&
+		config.artifactPath.includes(".release-evidence")
+	) {
+		throw new Error(
+			"LOAD_SCALE_ACK_REVIEW=1 is refused for artifacts under .release-evidence/: release evidence must never carry acknowledged review-required diagnostics",
+		);
+	}
 	let summary: RunSummary;
 	try {
 		summary = await runOneCampaign(config);
@@ -2948,12 +2958,15 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 			finalGauges: emptyGauges,
 			memory: (() => {
 				const sample = getMemorySample();
+				// The campaign died before real samples existed; never synthesize
+				// passing ratios from a single reading.
 				return buildMemoryTelemetry({
 					coldStart: sample,
 					serviceReady: sample,
 					peak: sample,
 					preClose: sample,
 					postClose: sample,
+					aborted: true,
 				});
 			})(),
 			nativeOwnerTelemetry: buildNativeOwnerTelemetry([], []),
@@ -2962,30 +2975,51 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 			p99StreamOpenMs: null,
 			clientSummaries: [],
 			failures: [error instanceof Error ? error.message : String(error)],
-			reviewRequired: [],
+			reviewRequired: ["campaign aborted before memory evidence"],
 		};
 	}
 	mkdirSync(dirname(config.artifactPath), { recursive: true });
 	writeFileSync(
 		config.artifactPath,
-		JSON.stringify(
-			{
-				createdAt: new Date().toISOString(),
-				bunVersion: Bun.version,
-				rustcVersion: rustcVersion(),
-				source: sourceMetadata(),
-				transportPolicy: nativeTransportPolicySnapshot(),
-				authoritativeRssBaseline: RSS_AUTHORITATIVE_BASELINE,
-				rssBaselinePolicy: RSS_BASELINE_POLICY,
-				processIsolatedRss: processIsolatedRssTelemetry(),
-				config,
-				summary,
-			},
-			null,
-			2,
-		),
+		JSON.stringify(buildArtifactDocument(config, summary), null, 2),
 	);
 	return summary;
+}
+
+/**
+ * A summary is promotable only when it is fully green: any failure or any
+ * unresolved review-required diagnostic blocks release-evidence promotion.
+ */
+export function isPromotable(summary: {
+	failures: string[];
+	reviewRequired: string[];
+}): boolean {
+	return summary.failures.length === 0 && summary.reviewRequired.length === 0;
+}
+
+export function acknowledgedReviewRequested(): boolean {
+	return process.env.LOAD_SCALE_ACK_REVIEW === "1";
+}
+
+export function buildArtifactDocument(
+	config: ScaleCampaignConfig,
+	summary: RunSummary,
+) {
+	return {
+		createdAt: new Date().toISOString(),
+		bunVersion: Bun.version,
+		rustcVersion: rustcVersion(),
+		source: sourceMetadata(),
+		transportPolicy: nativeTransportPolicySnapshot(),
+		authoritativeRssBaseline: RSS_AUTHORITATIVE_BASELINE,
+		rssBaselinePolicy: RSS_BASELINE_POLICY,
+		processIsolatedRss: processIsolatedRssTelemetry(),
+		promotable: isPromotable(summary),
+		acknowledgedReviewRequired:
+			acknowledgedReviewRequested() && summary.reviewRequired.length > 0,
+		config,
+		summary,
+	};
 }
 
 function configFromEnv(): ScaleCampaignConfig {
@@ -3071,6 +3105,12 @@ if (import.meta.main) {
 		.then((summary) => {
 			console.log(JSON.stringify(summary, null, 2));
 			if (summary.failures.length > 0) {
+				process.exit(1);
+			}
+			if (!isPromotable(summary) && !acknowledgedReviewRequested()) {
+				console.error(
+					"review-required diagnostics block promotion (set LOAD_SCALE_ACK_REVIEW=1 to acknowledge for diagnostics-only runs)",
+				);
 				process.exit(1);
 			}
 		})
