@@ -1,13 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { Duplex } from "node:stream";
 import {
-	E_INTERNAL,
 	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
 	E_INVALID_ARGUMENT,
 	E_LIMIT_EXCEEDED,
-	E_RATE_LIMITED,
 	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
 	E_STOP_SENDING,
@@ -233,6 +233,86 @@ describe("internal TS error propagation", () => {
 		);
 		writer.releaseLock();
 		await reader.cancel();
+	});
+
+	it("canceling the incoming bidi reader leaves accepted streams usable", async () => {
+		const calls: string[] = [];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return new Promise(() => {});
+					accepted = false;
+					return {
+						id: 11,
+						read: () => new Promise(() => {}),
+						write: async () => {
+							calls.push("write");
+						},
+						finish: () => {
+							calls.push("finish");
+						},
+						reset: (code: number) => calls.push(`reset:${code}`),
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+						dispose: () => calls.push("dispose"),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(reader, 2000, "accept before cancel");
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const stream = result.value;
+		await reader.cancel();
+		await Bun.sleep(0);
+		expect(calls).toEqual([]);
+		const writer = stream.writable.getWriter();
+		await writer.write(new Uint8Array([1]));
+		await writer.close();
+		expect(calls).toContain("write");
+		expect(calls).toContain("finish");
+		expect(calls.filter((c) => c.startsWith("reset"))).toEqual([]);
+	});
+
+	it("canceling the incoming uni reader leaves accepted streams readable", async () => {
+		const calls: string[] = [];
+		const chunks: (Buffer | null)[] = [Buffer.from([9]), null];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingUniStreamsForTests(
+			{
+				acceptUniStream: async () => {
+					if (!accepted) return new Promise(() => {});
+					accepted = false;
+					return {
+						id: 12,
+						read: async () => chunks.shift() ?? null,
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+						dispose: () => calls.push("dispose"),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(
+			reader,
+			2000,
+			"accept uni before cancel",
+		);
+		if (result.done || !result.value) throw new Error("missing uni stream");
+		const accepted0 = result.value;
+		await reader.cancel();
+		await Bun.sleep(0);
+		expect(calls).toEqual([]);
+		const streamReader = accepted0.getReader();
+		const first = await readWithTimeout(
+			streamReader,
+			2000,
+			"post-cancel uni read",
+		);
+		expect(first.done).toBe(false);
+		expect(Array.from(first.value ?? [])).toEqual([9]);
 	});
 
 	it("readable.cancel keeps the writable half usable (W3C half-close)", async () => {

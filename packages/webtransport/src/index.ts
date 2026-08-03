@@ -3587,10 +3587,7 @@ function createServerIncomingBidiStreams(
 	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
 		async pull(controller) {
-			if (cancelled) {
-				disposeActiveStreams();
-				return;
-			}
+			if (cancelled) return;
 			if (isClosed()) {
 				disposeActiveStreams();
 				controller.close();
@@ -3622,8 +3619,10 @@ function createServerIncomingBidiStreams(
 			}
 		},
 		cancel() {
+			// Only stop accepting new streams. Streams already handed to the
+			// application stay owned by it and are released by their own
+			// lifecycle or by session close.
 			cancelled = true;
-			disposeActiveStreams();
 		},
 	});
 }
@@ -3645,10 +3644,7 @@ function createServerIncomingUniStreams(
 	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
 		async pull(controller) {
-			if (cancelled) {
-				disposeActiveStreams();
-				return;
-			}
+			if (cancelled) return;
 			if (isClosed()) {
 				disposeActiveStreams();
 				controller.close();
@@ -3680,8 +3676,10 @@ function createServerIncomingUniStreams(
 			}
 		},
 		cancel() {
+			// Only stop accepting new streams. Streams already handed to the
+			// application stay owned by it and are released by their own
+			// lifecycle or by session close.
 			cancelled = true;
-			disposeActiveStreams();
 		},
 	});
 }
