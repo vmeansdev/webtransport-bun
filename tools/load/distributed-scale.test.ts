@@ -5,15 +5,19 @@ import { join } from "node:path";
 
 import {
 	awaitWithTimeout,
+	buildArtifactDocument,
 	buildMemoryTelemetry,
 	buildNativeOwnerTelemetry,
 	buildSourceIdentityProof,
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
 	evaluateWorkloadEvidence,
+	isPromotable,
 	nativeTransportPolicySnapshot,
 	type FinalGauges,
 	runCommandWithBoundedOutput,
+	runScaleCampaign,
+	type RunSummary,
 	type ScaleCampaignConfig,
 	validateScaleCampaignConfig,
 } from "./distributed-scale.ts";
@@ -631,3 +635,61 @@ function validConfigClientSummary(): {
 		stderr: "",
 	};
 }
+
+describe("release promotion gating", () => {
+	test("isPromotable rejects unresolved review-required diagnostics", () => {
+		expect(
+			isPromotable({ failures: [], reviewRequired: ["cold-start review"] }),
+		).toBe(false);
+		expect(isPromotable({ failures: ["boom"], reviewRequired: [] })).toBe(
+			false,
+		);
+		expect(isPromotable({ failures: [], reviewRequired: [] })).toBe(true);
+	});
+
+	test("artifact document embeds promotable=false for review-required summaries", () => {
+		const summary = {
+			failures: [],
+			reviewRequired: ["cold-start RSS diagnostic requires review"],
+		} as unknown as RunSummary;
+		const config = { artifactPath: "/tmp/x.json" } as ScaleCampaignConfig;
+		const doc = buildArtifactDocument(config, summary);
+		expect(doc.promotable).toBe(false);
+		expect(doc.acknowledgedReviewRequired).toBe(false);
+	});
+
+	test("LOAD_SCALE_ACK_REVIEW is refused for release-evidence artifact paths", async () => {
+		const prev = process.env.LOAD_SCALE_ACK_REVIEW;
+		process.env.LOAD_SCALE_ACK_REVIEW = "1";
+		try {
+			await expect(
+				runScaleCampaign({
+					artifactPath: ".release-evidence/load/load-scale-artifact.json",
+				} as ScaleCampaignConfig),
+			).rejects.toThrow(/refused for artifacts under \.release-evidence/);
+		} finally {
+			if (prev === undefined) delete process.env.LOAD_SCALE_ACK_REVIEW;
+			else process.env.LOAD_SCALE_ACK_REVIEW = prev;
+		}
+	});
+
+	test("aborted campaigns never synthesize passing memory ratios", () => {
+		const sample = {
+			rssMb: 50,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+		};
+		const memory = buildMemoryTelemetry({
+			coldStart: sample,
+			serviceReady: sample,
+			peak: sample,
+			preClose: sample,
+			postClose: sample,
+			aborted: true,
+		});
+		expect(memory.coldStartRecoveryRatio).toBeNull();
+		expect(memory.serviceReadyRecoveryRatio).toBeNull();
+		expect(memory.coldStartDiagnostic.status).toBe("aborted");
+	});
+});

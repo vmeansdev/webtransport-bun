@@ -2,7 +2,11 @@
 
 import { resolve } from "node:path";
 
-import { runScaleCampaign } from "./distributed-scale.ts";
+import {
+	acknowledgedReviewRequested,
+	isPromotable,
+	runScaleCampaign,
+} from "./distributed-scale.ts";
 
 async function main() {
 	const summary = await runScaleCampaign({
@@ -52,6 +56,12 @@ async function main() {
 
 	console.log(JSON.stringify(summary, null, 2));
 	if (summary.failures.length > 0) {
+		process.exit(1);
+	}
+	if (!isPromotable(summary) && !acknowledgedReviewRequested()) {
+		console.error(
+			"review-required diagnostics block promotion (set LOAD_SCALE_ACK_REVIEW=1 to acknowledge for diagnostics-only runs)",
+		);
 		process.exit(1);
 	}
 }
