@@ -10,6 +10,7 @@ import {
 	buildMemoryTelemetry,
 	buildNativeOwnerTelemetry,
 	buildSourceIdentityProof,
+	coldResidencyDeltaCapMb,
 	coldStartDiagnosticThreshold,
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
@@ -194,14 +195,19 @@ describe("Task 14 distributed scale evidence", () => {
 				allocatorReliefApplied: false,
 				processRestarted: false,
 			},
+			// An 11 MB delta lands under the Linux cap but over the macOS one, so
+			// the verdict this fixture expects is whatever the host platform's
+			// pre-registered cap says.
 			coldStartDiagnostic: {
-				status: "review-required",
+				status: coldResidencyDeltaCapMb() >= 11 ? "pass" : "review-required",
 				deltaMb: 11,
-				capMb: 6.1,
+				capMb: coldResidencyDeltaCapMb(),
 				ratio: 1.254,
 				threshold: 1.25,
 				reason:
-					"cold-start residency delta exceeded the pre-registered platform-floor cap and requires explicit release review",
+					coldResidencyDeltaCapMb() >= 11
+						? "cold-start residency delta stayed within the pre-registered platform-floor cap"
+						: "cold-start residency delta exceeded the pre-registered platform-floor cap and requires explicit release review",
 			},
 		});
 	});
@@ -222,7 +228,9 @@ describe("Task 14 distributed scale evidence", () => {
 			postClose: withFp(114, 24),
 		});
 		// Authoritative ratios use charged memory; rss ratios stay disclosed.
-		expect(memory.chargedMetric).toBe("phys-footprint");
+		expect(memory.chargedMetric).toBe(
+			process.platform === "linux" ? "smaps-lazyfree" : "phys-footprint",
+		);
 		expect(memory.serviceReadyRecoveryRatio).toBe(
 			Number((24 / 20.5).toFixed(4)),
 		);
@@ -231,7 +239,38 @@ describe("Task 14 distributed scale evidence", () => {
 		);
 		expect(memory.coldStartDiagnostic.status).toBe("pass");
 		expect(memory.coldStartDiagnostic.deltaMb).toBe(5);
-		expect(memory.coldStartDiagnostic.capMb).toBe(6.1);
+		expect(memory.coldStartDiagnostic.capMb).toBe(coldResidencyDeltaCapMb());
+	});
+
+	test("cold residency cap is pre-registered per platform", () => {
+		expect(coldResidencyDeltaCapMb("darwin")).toBe(6.1);
+		expect(coldResidencyDeltaCapMb("linux")).toBe(13.1);
+		// Unmeasured platforms are judged by the tightest registered cap rather
+		// than inheriting Linux's demand-paged-text allowance.
+		expect(coldResidencyDeltaCapMb("win32")).toBe(6.1);
+		expect(coldResidencyDeltaCapMb("freebsd")).toBe(6.1);
+	});
+
+	test("cold diagnostic flags a delta just over the host platform cap", () => {
+		const cap = coldResidencyDeltaCapMb();
+		const withFp = (physFootprintMb: number) => ({
+			rssMb: physFootprintMb * 2,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+			physFootprintMb,
+		});
+		const diagnose = (deltaMb: number) =>
+			buildMemoryTelemetry({
+				coldStart: withFp(20),
+				serviceReady: withFp(21),
+				peak: withFp(60),
+				preClose: withFp(40),
+				postClose: withFp(20 + deltaMb),
+			}).coldStartDiagnostic.status;
+
+		expect(diagnose(cap)).toBe("pass");
+		expect(diagnose(cap + 0.1)).toBe("review-required");
 	});
 
 	test("sizes the RSS warmup independently of the campaign session count", () => {
@@ -323,12 +362,15 @@ describe("Task 14 distributed scale evidence", () => {
 			externalMb: 1,
 			arrayBuffersMb: 0,
 		});
+		// Sized off the host platform's cap so the over-cap case stays over it
+		// wherever the suite runs.
+		const overCapDelta = coldResidencyDeltaCapMb() + 1;
 		const input = {
 			coldStart: sample(40),
 			serviceReady: sample(50),
 			peak: sample(60),
 			preClose: sample(58),
-			postClose: sample(52),
+			postClose: sample(40 + overCapDelta),
 		};
 
 		expect(coldStartDiagnosticThreshold({ maxRecoveryRssRatio: 1.4 })).toBe(
@@ -343,7 +385,7 @@ describe("Task 14 distributed scale evidence", () => {
 		// residency-delta cap, never by the ratio threshold.
 		const strict = buildMemoryTelemetry(input);
 		expect(strict.coldStartDiagnostic.threshold).toBe(1.25);
-		expect(strict.coldStartDiagnostic.deltaMb).toBe(12);
+		expect(strict.coldStartDiagnostic.deltaMb).toBe(overCapDelta);
 		expect(strict.coldStartDiagnostic.status).toBe("review-required");
 
 		const relaxed = buildMemoryTelemetry({
