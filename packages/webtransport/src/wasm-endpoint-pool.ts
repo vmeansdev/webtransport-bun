@@ -88,7 +88,7 @@ export function wasmPoolPut(key: string, manager: WasmTransportManager): void {
 		pool.delete(oldestKey);
 		evictions++;
 		try {
-			oldest?.close();
+			void oldest?.close();
 		} catch {
 			/* best-effort */
 		}
@@ -104,7 +104,7 @@ export function wasmClientPoolMetricsSnapshot(): WasmPoolMetrics {
 export function __resetWasmClientPoolForTests(): void {
 	for (const mgr of pool.values()) {
 		try {
-			mgr.close();
+			void mgr.close();
 		} catch {
 			/* best-effort */
 		}

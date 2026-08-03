@@ -47,6 +47,10 @@ import {
 	WebTransportError,
 } from "./errors.js";
 export type { WasmRateLimitOptions } from "./types.js";
+import {
+	createW3CMappedError,
+	withW3CBrowserName,
+} from "./w3c-client-options.js";
 import type { WebTransportLike, WtCloseInfo } from "./shared.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import { WasmWebTransport } from "./wasm-webtransport.js";
@@ -987,12 +991,13 @@ export class WasmSession {
 	}
 
 	metricsSnapshot(): SessionMetricsSnapshot {
-		const stats = this.connectionStats();
 		return {
 			datagramsIn: this.datagramsInCount,
 			datagramsOut: this.datagramsOutCount,
 			streamsActive: this.mgr._activeStreamCount(this.conn, this.sessionId),
-			queuedBytes: stats.bytesSent + stats.bytesReceived,
+			// Retained bytes, not cumulative traffic: use the same reservation
+			// accounting the governor charges limits against.
+			queuedBytes: this.mgr._sessionQueuedBytes(this.conn, this.sessionId),
 		};
 	}
 
@@ -1913,19 +1918,46 @@ export class WasmTransportManager {
 		conn: number,
 		sessionId: bigint,
 	): void {
-		const connHasLiveSession = [...this.sessions.values()].some(
-			(s) => s.conn === conn,
-		);
 		for (const reservation of [...this.hostReservations]) {
-			if (reservation.conn !== conn) continue;
-			const owner =
-				reservation.stream === undefined
-					? undefined
-					: this.streamSessionIds.get(reservation.stream);
-			const owned =
-				owner === undefined ? !connHasLiveSession : owner === sessionId;
-			if (owned) reservation.release();
+			if (this._reservationBelongsTo(reservation, conn, sessionId)) {
+				reservation.release();
+			}
 		}
+	}
+
+	/**
+	 * Whether one retained payload is owned by the given session. A stream
+	 * reservation follows its stream's session; a datagram reservation is only
+	 * connection-scoped, so it belongs to a session once no sibling session is
+	 * left on that connection.
+	 */
+	private _reservationBelongsTo(
+		reservation: ManagerHostReservation,
+		conn: number,
+		sessionId: bigint,
+	): boolean {
+		if (reservation.conn !== conn) return false;
+		if (reservation.stream === undefined) {
+			return ![...this.sessions.values()].some(
+				(s) => s.conn === conn && s.sessionId !== sessionId,
+			);
+		}
+		return this.streamSessionIds.get(reservation.stream) === sessionId;
+	}
+
+	/**
+	 * @internal Bytes currently retained by one session's inbound queues. This
+	 * is the same reservation accounting the governor enforces limits against,
+	 * so queue depth never drifts from what actually holds memory.
+	 */
+	_sessionQueuedBytes(conn: number, sessionId: bigint): number {
+		let total = 0;
+		for (const reservation of this.hostReservations) {
+			if (this._reservationBelongsTo(reservation, conn, sessionId)) {
+				total += reservation.bytes;
+			}
+		}
+		return total;
 	}
 
 	private _closeSessionForInboundPressure(
@@ -1948,19 +1980,46 @@ export class WasmTransportManager {
 	}
 
 	/**
+	 * Persist any 0-RTT ticket for the last authority. Runs first in
+	 * {@link close} because `dumpClientTicket` reads wasm state that
+	 * `finishClose` frees; only the host `put` is asynchronous.
+	 *
+	 * The returned promise always carries a handler, so a caller that ignores
+	 * it cannot raise an unhandled rejection, and it still rejects for a caller
+	 * that awaits {@link close}.
+	 */
+	private _persistTicketsOnClose(): Promise<void> {
+		const authority = this.lastAuthority;
+		if (!authority || !this.ticketStore || !this.options.enable0Rtt) {
+			return Promise.resolve();
+		}
+		const persisted = this.dumpTicketsToHost(authority).then(() => undefined);
+		persisted.catch((error) => {
+			this.emitLog("ticket_persist_failed", { authority });
+			this._reportResourceError(error);
+		});
+		return persisted;
+	}
+
+	/**
 	 * Shut down the endpoint: CONNECTION_CLOSE every session, drop wasm state,
 	 * and close an owned transport so its UDP socket/port is released.
 	 *
-	 * INFALLIBLE by contract: teardown must never throw. A step that throws
-	 * would mask the caller's original error (e.g. the connect failure that
-	 * triggered this close) and skip the steps after it — every phase is
-	 * isolated and reported instead of propagated.
+	 * Teardown itself is synchronous and INFALLIBLE by contract: it must never
+	 * throw. A step that throws would mask the caller's original error (e.g.
+	 * the connect failure that triggered this close) and skip the steps after
+	 * it — every phase is isolated and reported instead of propagated.
+	 *
+	 * The returned promise settles once 0-RTT ticket persistence has finished,
+	 * so `await manager.close()` guarantees a durable ticket store. It rejects
+	 * when persistence failed; the failure is also reported through
+	 * {@link onCallbackError}/{@link takeResourceError} for callers that do not
+	 * await. The W3C `WebTransport.close()` facade is unaffected — it closes a
+	 * session, not the manager, and stays synchronous and void.
 	 */
-	close(): void {
+	close(): Promise<void> {
 		const authority = this.lastAuthority;
-		if (authority && this.ticketStore && this.options.enable0Rtt) {
-			void this.dumpTicketsToHost(authority).catch(() => {});
-		}
+		const persisted = this._persistTicketsOnClose();
 		this.emitLog("endpoint_close", { authority });
 		const guard = (step: () => void) => {
 			try {
@@ -1995,6 +2054,7 @@ export class WasmTransportManager {
 		guard(() => this.endpoint.finishClose());
 		guard(() => this.ownedTransport?.close?.());
 		this.ownedTransport = null;
+		return persisted;
 	}
 
 	/**
@@ -2129,6 +2189,58 @@ export interface WasmConnectOptions {
 	datagramsReadableType?: "bytes" | "default";
 }
 
+/**
+ * Grace beyond the configured handshake deadline before the host gives up on
+ * its own. The wasm endpoint enforces the real deadline and reports the precise
+ * failure; this fallback only covers a stalled pump, where `ready` would
+ * otherwise stay pending forever.
+ */
+const HANDSHAKE_STALL_GRACE_MS = 500;
+
+/**
+ * Await the client handshake, applying the strict W3C name to whatever the
+ * backend reports. Connect failures reach the caller before any facade wraps
+ * the session, so this is where a strict wasm client gets browser-style names.
+ */
+async function awaitClientReady(
+	session: WasmSession,
+	mgr: WasmTransportManager,
+	strictW3CErrors?: boolean,
+): Promise<void> {
+	const timeoutMs =
+		mgr.options.limits.handshakeTimeoutMs + HANDSHAKE_STALL_GRACE_MS;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let stalled = false;
+	try {
+		await Promise.race([
+			session.ready,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					stalled = true;
+					reject(
+						createW3CMappedError(
+							E_HANDSHAKE_TIMEOUT,
+							`E_HANDSHAKE_TIMEOUT: connect stalled with no endpoint progress after ${timeoutMs}ms`,
+							strictW3CErrors,
+						),
+					);
+				}, timeoutMs);
+			}),
+		]);
+	} catch (error) {
+		if (stalled) {
+			// This connection has its own conn id even on a pooled manager, so
+			// closing it strands no sibling session. The abandoned `ready` is
+			// observed here so its later rejection cannot go unhandled.
+			session.ready.catch(() => {});
+			session.close();
+		}
+		throw withW3CBrowserName(error, strictW3CErrors);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 /** Client: connect to a WebTransport server over the given UDP transport. */
 export async function connectWasm(
 	wasm: WasmModule,
@@ -2225,12 +2337,12 @@ export async function connectWasm(
 		mgr.rememberAuthority(authority);
 		await mgr.hydrateTicketsFromHost(authority);
 		const session = mgr.connectClient(authority);
-		await session.ready;
+		await awaitClientReady(session, mgr, opts.strictW3CErrors);
 		return { session, manager: mgr };
 	} catch (err) {
 		if (!pooled) {
 			try {
-				mgr.close();
+				void mgr.close();
 			} catch {}
 			try {
 				udp.close?.();

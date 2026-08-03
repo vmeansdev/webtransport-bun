@@ -296,4 +296,80 @@ describe("wasm parity epic helpers", () => {
 			}
 		},
 	);
+
+	test.skipIf(!wasmAvailable)(
+		"session queuedBytes tracks retained payloads, not cumulative traffic",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4812 };
+			const clientAddr = { address: "127.0.0.1", port: 5812 };
+			const server = createWasmServer(
+				wasm,
+				relay.endpoint(serverAddr),
+				(session) => {
+					session.onDatagram((data) => {
+						void session.sendDatagram(data); // echo
+					});
+				},
+				"127.0.0.1:4812",
+				"127.0.0.1:5812",
+				normalizeWasmEndpointOptions({}),
+			);
+			try {
+				const { session, manager } = await connectWasm(
+					wasm,
+					relay.endpoint(clientAddr),
+					"queued.example",
+					"127.0.0.1:5812",
+					"127.0.0.1:4812",
+					{},
+				);
+
+				expect(session.metricsSnapshot().queuedBytes).toBe(0);
+
+				// No onDatagram handler yet, so every echo is retained by the
+				// session's inbound queue and holds a host reservation.
+				const payload = new Uint8Array(512).fill(7);
+				const sent = 4;
+				for (let i = 0; i < sent; i++) await session.sendDatagram(payload);
+
+				const queuedDeadline = Date.now() + 3000;
+				while (
+					session.metricsSnapshot().datagramsIn < sent &&
+					Date.now() < queuedDeadline
+				) {
+					await Bun.sleep(5);
+				}
+				const stalled = session.metricsSnapshot();
+				expect(stalled.datagramsIn).toBe(sent);
+				expect(stalled.queuedBytes).toBeGreaterThanOrEqual(
+					sent * payload.byteLength,
+				);
+
+				// Draining the queue must return the retained-byte count to zero
+				// even though cumulative traffic keeps growing.
+				let delivered = 0;
+				session.onDatagram(() => {
+					delivered += 1;
+				});
+				expect(delivered).toBe(sent);
+				expect(session.metricsSnapshot().queuedBytes).toBe(0);
+
+				const stats = session.connectionStats();
+				expect(stats.bytesSent).toBeGreaterThan(0);
+				expect(stats.bytesReceived).toBeGreaterThan(0);
+
+				// Closing with payloads still queued releases them exactly once.
+				const drained = session.metricsSnapshot().queuedBytes;
+				expect(drained).toBe(0);
+				session.close();
+				expect(session.metricsSnapshot().queuedBytes).toBe(0);
+				expect(manager.resourceSnapshot().hostReservationsActive).toBe(0);
+
+				manager.close();
+			} finally {
+				server.close();
+			}
+		},
+	);
 });
