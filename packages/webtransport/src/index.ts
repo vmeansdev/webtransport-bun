@@ -569,9 +569,29 @@ export interface WebTransportServer {
 	setUnknownSniPolicy(policy: UnknownSniPolicy): Promise<void>;
 	/** Introspect the active server TLS SNI state without exposing key material. */
 	tlsSnapshot(): ServerTlsSnapshot;
-	close(): Promise<void>;
+	/**
+	 * Close the server after draining all sessions. Resolves with close
+	 * diagnostics; existing callers that ignore the value are unaffected.
+	 */
+	close(): Promise<ServerCloseDiagnostics | void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
+
+/**
+ * Allocator relief outcome from the native drained-close path. The byte figure
+ * is allocator-reported, never RSS-verified; treat it as diagnostic only.
+ */
+export type AllocatorReliefDiagnostic = {
+	platform: string;
+	applied: boolean;
+	reportedBytesReleased?: number | null;
+	refusedReason?: string | null;
+};
+
+/** Diagnostics resolved by {@link WebTransportServer.close}. */
+export type ServerCloseDiagnostics = {
+	allocatorRelief: AllocatorReliefDiagnostic | null;
+};
 
 // ---------------------------------------------------------------------------
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
@@ -1828,7 +1848,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		},
 		tlsSnapshot: () => handle.tlsSnapshot(),
 		close: async () => {
-			await handle.close();
+			const nativeCloseResult = (await handle.close()) as
+				| { allocatorRelief?: AllocatorReliefDiagnostic }
+				| undefined;
 			for (const [id, resolve] of closedResolvers) {
 				closedResolvers.delete(id);
 				resolve({ code: 0, reason: "server closed" });
@@ -1850,6 +1872,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					if (drainTimer !== undefined) clearTimeout(drainTimer);
 				}
 			}
+			return {
+				allocatorRelief: nativeCloseResult?.allocatorRelief ?? null,
+			};
 		},
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};

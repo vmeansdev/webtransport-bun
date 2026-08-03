@@ -19,6 +19,7 @@ pub mod error;
 pub mod histogram;
 pub mod limits;
 pub mod metrics;
+pub mod native_memory;
 pub mod panic_guard;
 pub mod rate_limit;
 pub mod server;
