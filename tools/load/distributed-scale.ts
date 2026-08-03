@@ -747,7 +747,7 @@ function recoveredToSteadyBaseline(
 		current.streamTasksActive === baseline.streamTasksActive &&
 		current.handshakesInFlight === baseline.handshakesInFlight &&
 		current.streamsActive === baseline.streamsActive &&
-		current.queuedBytesGlobal === baseline.queuedBytesGlobal
+		current.queuedBytesGlobal <= baseline.queuedBytesGlobal
 	);
 }
 

@@ -315,6 +315,16 @@ describe("Task 14 distributed scale evidence", () => {
 		expect(
 			evaluateOverloadEvidence({
 				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
+					queuedBytesGlobal: 4,
+				},
+				postOverloadGauges: recovered,
+			}),
+		).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
 				acceptedSessions: 1,
 				rejectedSessions: 2,
 			}),
