@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import {
 	awaitWithTimeout,
+	buildMemoryTelemetry,
+	buildNativeOwnerTelemetry,
 	buildSourceIdentityProof,
 	evaluateOverloadEvidence,
 	evaluateSourceIdentityProof,
@@ -91,6 +93,163 @@ describe("Task 14 distributed scale evidence", () => {
 		expect(policy.datagramSendBufferBytes).toBe(64 * 1024);
 		expect(policy.datagramChannelCapacity).toBe(2048);
 		expect(policy.datagramChannelPolicy).toBe("fixed-h2-candidate-disproved");
+	});
+
+	test("records dual RSS baselines and makes service-ready authoritative", () => {
+		const coldStart = {
+			rssMb: 43.3,
+			heapUsedMb: 8,
+			externalMb: 1,
+			arrayBuffersMb: 0.1,
+		};
+		const serviceReady = {
+			rssMb: 54.25,
+			heapUsedMb: 9,
+			externalMb: 1.2,
+			arrayBuffersMb: 0.2,
+		};
+		const peak = {
+			rssMb: 59.4,
+			heapUsedMb: 10,
+			externalMb: 1.4,
+			arrayBuffersMb: 0.3,
+		};
+		const preClose = {
+			rssMb: 59.1,
+			heapUsedMb: 9.8,
+			externalMb: 1.3,
+			arrayBuffersMb: 0.25,
+		};
+		const postClose = {
+			rssMb: 54.3,
+			heapUsedMb: 9.1,
+			externalMb: 1.2,
+			arrayBuffersMb: 0.2,
+		};
+
+		expect(
+			buildMemoryTelemetry({
+				coldStart,
+				serviceReady,
+				peak,
+				preClose,
+				postClose,
+				warmup: {
+					kind: "same-process-native-server-create-close",
+					serverWarmupCycles: 1,
+					serversWarmed: 1,
+					sameProcess: true,
+					streamStackWarmed: false,
+					streamWarmupSessions: 0,
+					streamWarmupStreamsOpened: 0,
+					nativeClientPrewarmed: false,
+					allocatorReliefApplied: false,
+					processRestarted: false,
+				},
+			}),
+		).toEqual({
+			coldStart,
+			serviceReady,
+			recoveryBaseline: serviceReady,
+			peak,
+			preClose,
+			postClose,
+			coldStartRssMb: 43.3,
+			serviceReadyRssMb: 54.25,
+			finalRssMb: 54.3,
+			coldStartRecoveryRatio: 1.254,
+			serviceReadyRecoveryRatio: 1.0009,
+			coldToServiceReadyDeltaMb: 10.95,
+			serviceReadyToPostCloseDeltaMb: 0.05,
+			warmup: {
+				kind: "same-process-native-server-create-close",
+				serverWarmupCycles: 1,
+				serversWarmed: 1,
+				sameProcess: true,
+				streamStackWarmed: false,
+				streamWarmupSessions: 0,
+				streamWarmupStreamsOpened: 0,
+				nativeClientPrewarmed: false,
+				allocatorReliefApplied: false,
+				processRestarted: false,
+			},
+			coldStartDiagnostic: {
+				status: "review-required",
+				ratio: 1.254,
+				threshold: 1.25,
+				reason:
+					"cold-start recovery exceeded the unchanged RSS threshold and requires explicit release review",
+			},
+		});
+	});
+
+	test("aggregates owner-scoped native residency counters without hiding availability", () => {
+		expect(
+			buildNativeOwnerTelemetry(
+				[
+					{
+						nativeSessionRegistryEntries: 2,
+						nativeTrackedTasks: 4,
+						nativeRateLimitEntries: 6,
+						nativeBidiHandlesLive: 8,
+						nativeUniSendHandlesLive: 10,
+						nativeUniRecvHandlesLive: 12,
+					},
+					{
+						nativeSessionRegistryEntries: 1,
+						nativeTrackedTasks: 3,
+						nativeRateLimitEntries: 5,
+						nativeBidiHandlesLive: 7,
+						nativeUniSendHandlesLive: 9,
+						nativeUniRecvHandlesLive: 11,
+					},
+				],
+				[
+					{
+						nativeSessionRegistryEntries: 0,
+						nativeTrackedTasks: 0,
+						nativeRateLimitEntries: 0,
+						nativeBidiHandlesLive: 0,
+						nativeUniSendHandlesLive: 0,
+						nativeUniRecvHandlesLive: 0,
+					},
+				],
+			),
+		).toEqual({
+			preClose: {
+				available: true,
+				sessionRegistryEntries: 3,
+				trackedTasks: 7,
+				rateLimitEntries: 11,
+				bidiHandlesLive: 15,
+				uniSendHandlesLive: 19,
+				uniRecvHandlesLive: 23,
+			},
+			postClose: {
+				available: true,
+				sessionRegistryEntries: 0,
+				trackedTasks: 0,
+				rateLimitEntries: 0,
+				bidiHandlesLive: 0,
+				uniSendHandlesLive: 0,
+				uniRecvHandlesLive: 0,
+			},
+		});
+		expect(
+			buildNativeOwnerTelemetry(
+				[
+					{
+						nativeSessionRegistryEntries: 1,
+						nativeTrackedTasks: 1,
+						nativeRateLimitEntries: 1,
+						nativeBidiHandlesLive: 1,
+						nativeUniSendHandlesLive: 1,
+						nativeUniRecvHandlesLive: 1,
+					},
+				],
+				[{}],
+			).postClose.available,
+		).toBe(false);
 	});
 
 	test("actively exercises server datagram and bidi/uni stream opens so server histograms are real", () => {

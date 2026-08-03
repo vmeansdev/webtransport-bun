@@ -25,6 +25,10 @@ const CHILD_EXIT_TIMEOUT_MS = 30_000;
 const CHILD_TERMINATE_GRACE_MS = 2_000;
 const CHILD_DRAIN_TIMEOUT_MS = 2_000;
 const SERVER_CLOSE_TIMEOUT_MS = 10_000;
+const RSS_BASELINE_POLICY =
+	"service-ready-authoritative-cold-start-hard-diagnostic";
+const RSS_AUTHORITATIVE_BASELINE = "service-ready" as const;
+const RSS_COLD_START_DIAGNOSTIC_THRESHOLD = 1.25;
 
 export type ScaleWorkloadMode = "probe" | "drain-all" | "single-reader";
 
@@ -131,12 +135,182 @@ export type MemorySample = {
 	arrayBuffersMb: number;
 };
 
+export type RssWarmupTelemetry = {
+	kind: "same-process-native-server-create-close" | "not-run";
+	serverWarmupCycles: number;
+	serversWarmed: number;
+	sameProcess: boolean;
+	streamStackWarmed: boolean;
+	streamWarmupSessions: number;
+	streamWarmupStreamsOpened: number;
+	nativeClientPrewarmed: false;
+	allocatorReliefApplied: false;
+	processRestarted: false;
+};
+
+export type ColdStartDiagnostic = {
+	status: "pass" | "review-required";
+	ratio: number | null;
+	threshold: number;
+	reason: string;
+};
+
 export type MemoryTelemetry = {
-	initial: MemorySample;
+	coldStart: MemorySample;
+	serviceReady: MemorySample;
+	recoveryBaseline: MemorySample;
 	peak: MemorySample;
 	preClose: MemorySample;
 	postClose: MemorySample;
+	coldStartRssMb: number;
+	serviceReadyRssMb: number;
+	finalRssMb: number;
+	coldStartRecoveryRatio: number | null;
+	serviceReadyRecoveryRatio: number | null;
+	coldToServiceReadyDeltaMb: number;
+	serviceReadyToPostCloseDeltaMb: number;
+	warmup: RssWarmupTelemetry;
+	coldStartDiagnostic: ColdStartDiagnostic;
 };
+
+export type NativeOwnerSnapshot = {
+	available: boolean;
+	sessionRegistryEntries: number;
+	trackedTasks: number;
+	rateLimitEntries: number;
+	bidiHandlesLive: number;
+	uniSendHandlesLive: number;
+	uniRecvHandlesLive: number;
+};
+
+type NativeOwnerMetricSample = Pick<
+	MetricsSnapshot,
+	| "nativeSessionRegistryEntries"
+	| "nativeTrackedTasks"
+	| "nativeRateLimitEntries"
+	| "nativeBidiHandlesLive"
+	| "nativeUniSendHandlesLive"
+	| "nativeUniRecvHandlesLive"
+>;
+
+function aggregateNativeOwnerSnapshot(
+	snapshots: NativeOwnerMetricSample[],
+): NativeOwnerSnapshot {
+	const values = snapshots.map((snapshot) => [
+		snapshot.nativeSessionRegistryEntries,
+		snapshot.nativeTrackedTasks,
+		snapshot.nativeRateLimitEntries,
+		snapshot.nativeBidiHandlesLive,
+		snapshot.nativeUniSendHandlesLive,
+		snapshot.nativeUniRecvHandlesLive,
+	]);
+	const available =
+		values.length > 0 &&
+		values.every((entry) =>
+			entry.every(
+				(value) =>
+					typeof value === "number" && Number.isFinite(value) && value >= 0,
+			),
+		);
+	return {
+		available,
+		sessionRegistryEntries: values.reduce(
+			(sum, [registryEntries]) => sum + (registryEntries ?? 0),
+			0,
+		),
+		trackedTasks: values.reduce(
+			(sum, [, trackedTasks]) => sum + (trackedTasks ?? 0),
+			0,
+		),
+		rateLimitEntries: values.reduce(
+			(sum, [, , rateLimitEntries]) => sum + (rateLimitEntries ?? 0),
+			0,
+		),
+		bidiHandlesLive: values.reduce(
+			(sum, [, , , bidiHandlesLive]) => sum + (bidiHandlesLive ?? 0),
+			0,
+		),
+		uniSendHandlesLive: values.reduce(
+			(sum, [, , , , uniSendHandlesLive]) => sum + (uniSendHandlesLive ?? 0),
+			0,
+		),
+		uniRecvHandlesLive: values.reduce(
+			(sum, [, , , , , uniRecvHandlesLive]) => sum + (uniRecvHandlesLive ?? 0),
+			0,
+		),
+	};
+}
+
+export function buildNativeOwnerTelemetry(
+	preCloseSnapshots: NativeOwnerMetricSample[],
+	postCloseSnapshots: NativeOwnerMetricSample[],
+) {
+	return {
+		preClose: aggregateNativeOwnerSnapshot(preCloseSnapshots),
+		postClose: aggregateNativeOwnerSnapshot(postCloseSnapshots),
+	};
+}
+
+export function buildMemoryTelemetry(input: {
+	coldStart: MemorySample;
+	serviceReady: MemorySample;
+	peak: MemorySample;
+	preClose: MemorySample;
+	postClose: MemorySample;
+	warmup?: RssWarmupTelemetry;
+}): MemoryTelemetry {
+	const ratio = (baseline: MemorySample): number | null =>
+		baseline.rssMb > 0
+			? Number((input.postClose.rssMb / baseline.rssMb).toFixed(4))
+			: null;
+	const coldStartRecoveryRatio = ratio(input.coldStart);
+	const serviceReadyRecoveryRatio = ratio(input.serviceReady);
+	const coldStartDiagnosticStatus =
+		coldStartRecoveryRatio != null &&
+		coldStartRecoveryRatio <= RSS_COLD_START_DIAGNOSTIC_THRESHOLD
+			? "pass"
+			: "review-required";
+	return {
+		coldStart: input.coldStart,
+		serviceReady: input.serviceReady,
+		recoveryBaseline: input.serviceReady,
+		peak: input.peak,
+		preClose: input.preClose,
+		postClose: input.postClose,
+		coldStartRssMb: input.coldStart.rssMb,
+		serviceReadyRssMb: input.serviceReady.rssMb,
+		finalRssMb: input.postClose.rssMb,
+		coldStartRecoveryRatio,
+		serviceReadyRecoveryRatio,
+		coldToServiceReadyDeltaMb: Number(
+			(input.serviceReady.rssMb - input.coldStart.rssMb).toFixed(3),
+		),
+		serviceReadyToPostCloseDeltaMb: Number(
+			(input.postClose.rssMb - input.serviceReady.rssMb).toFixed(3),
+		),
+		warmup: input.warmup ?? {
+			kind: "not-run",
+			serverWarmupCycles: 0,
+			serversWarmed: 0,
+			sameProcess: false,
+			streamStackWarmed: false,
+			streamWarmupSessions: 0,
+			streamWarmupStreamsOpened: 0,
+			nativeClientPrewarmed: false,
+			allocatorReliefApplied: false,
+			processRestarted: false,
+		},
+		coldStartDiagnostic: {
+			status: coldStartDiagnosticStatus,
+			ratio: coldStartRecoveryRatio,
+			threshold: RSS_COLD_START_DIAGNOSTIC_THRESHOLD,
+			reason:
+				coldStartDiagnosticStatus === "pass"
+					? "cold-start recovery stayed within the unchanged RSS threshold"
+					: "cold-start recovery exceeded the unchanged RSS threshold and requires explicit release review",
+		},
+	};
+}
 
 export type SourceIdentityProof = {
 	kind: "server-observed-peer-ip";
@@ -193,11 +367,13 @@ type RunSummary = {
 	closeDurationMs: number;
 	finalGauges: FinalGauges;
 	memory: MemoryTelemetry;
+	nativeOwnerTelemetry: ReturnType<typeof buildNativeOwnerTelemetry>;
 	p99HandshakeMs: number | null;
 	p99DatagramEnqueueMs: number | null;
 	p99StreamOpenMs: number | null;
 	clientSummaries: ClientSummary[];
 	failures: string[];
+	reviewRequired: string[];
 };
 
 type BoundedCommandOptions = {
@@ -454,6 +630,7 @@ async function exerciseServerStreamProbe(
 		endWritableProbe(bidi, payload),
 		5000,
 	);
+	bidi.destroy();
 
 	const uni = await session.createUnidirectionalStream();
 	onUniOpened();
@@ -462,6 +639,7 @@ async function exerciseServerStreamProbe(
 		endWritableProbe(uni, payload),
 		5000,
 	);
+	uni.destroy();
 }
 
 function normalizeObservedPeerIp(peerIp: string): string {
@@ -1548,6 +1726,166 @@ async function runOverloadPhase(
 	};
 }
 
+type CampaignCertificate = {
+	certPem: string;
+	keyPem: string;
+};
+
+type CampaignSessionHandler = Parameters<typeof createServer>[0]["onSession"];
+
+function campaignServerOptions(
+	cert: CampaignCertificate,
+	port: number,
+	sessionCap: number,
+	overloadSessionsPerServer: number,
+	onSession: CampaignSessionHandler,
+) {
+	return {
+		port,
+		tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+		limits: {
+			maxSessions: Math.max(sessionCap, 1),
+			maxHandshakesInFlight: Math.max(
+				sessionCap + overloadSessionsPerServer,
+				256,
+			),
+		},
+		rateLimits: {
+			handshakesPerSec: Math.max(sessionCap * 2, 500),
+			handshakesBurst: Math.max(sessionCap * 4, 1_000),
+			handshakesBurstPerPrefix: Math.max(sessionCap * 4, 1_000),
+			streamsPerSec: Math.max(sessionCap * 4, 1_000),
+			streamsBurst: Math.max(sessionCap * 8, 2_000),
+			datagramsPerSec: Math.max(sessionCap * 20, 10_000),
+			datagramsBurst: Math.max(sessionCap * 40, 20_000),
+		},
+		onSession,
+	};
+}
+
+async function warmNativeServerForRssBaseline(
+	clientBin: string,
+	cert: CampaignCertificate,
+	config: ScaleCampaignConfig,
+	serverSessionCaps: number[],
+): Promise<RssWarmupTelemetry> {
+	const warmupServers: ReturnType<typeof createServer>[] = [];
+	const warmupStreamTasks: Promise<void>[] = [];
+	let streamWarmupStreamsOpened = 0;
+	let streamWarmupSessions = 0;
+	let warmupClosed = false;
+	try {
+		for (let i = 0; i < config.serverCount; i++) {
+			warmupServers.push(
+				createServer(
+					campaignServerOptions(
+						cert,
+						0,
+						serverSessionCaps[i] ?? 0,
+						config.overloadSessionsPerServer,
+						(session) => {
+							if (config.streamsPerSec <= 0) return;
+							const deadline = Date.now() + 5_000;
+							const task = drainSessionStreamsBeforeDeadline(
+								session,
+								deadline,
+								() => {
+									streamWarmupStreamsOpened += 1;
+								},
+							);
+							warmupStreamTasks.push(task);
+							task.catch(() => undefined);
+						},
+					),
+				),
+			);
+			if (config.streamsPerSec > 0) {
+				const warmupSessions = Math.max(1, serverSessionCaps[i] ?? 1);
+				streamWarmupSessions += warmupSessions;
+				const launch = normalizedClientLaunches(config)[0] ?? {
+					label: "rss-stream-warmup",
+					commandPrefix: [],
+					urlHost: DEFAULT_CLIENT_TARGET_HOST,
+				};
+				const warmupSummary = await runLoadClient(
+					clientBin,
+					{
+						clientIndex: -1,
+						serverIndex: i,
+						serverPort: warmupServers[i]?.address.port ?? 0,
+						requestedSessions: warmupSessions,
+						launch,
+					},
+					{
+						durationSec: 1,
+						datagramsPerSec: 0,
+						streamsPerSec: config.streamsPerSec,
+						maxSessionErrors: 0,
+						skipProbes: true,
+					},
+				);
+				if (
+					warmupSummary.okSessions !== warmupSessions ||
+					(warmupSummary.loadStreamsOpened ?? warmupSummary.streamsOpened) <=
+						0 ||
+					warmupSummary.streamErrors > 0
+				) {
+					throw new Error(
+						`RSS stream warmup failed on server ${i}: ${JSON.stringify(warmupSummary)}`,
+					);
+				}
+			}
+		}
+		await waitForGauges(
+			warmupServers,
+			SERVER_CLOSE_TIMEOUT_MS,
+			(gauges) =>
+				gauges.sessionsActive === 0 &&
+				gauges.sessionTasksActive === 0 &&
+				gauges.streamTasksActive === 0 &&
+				gauges.handshakesInFlight === 0 &&
+				gauges.streamsActive === 0 &&
+				gauges.queuedBytesGlobal === 0,
+		);
+		await Promise.allSettled(warmupStreamTasks);
+		await Promise.all(
+			warmupServers.map((server) =>
+				awaitWithTimeout(
+					"rss baseline server.close",
+					server.close(),
+					SERVER_CLOSE_TIMEOUT_MS,
+				),
+			),
+		);
+		warmupClosed = true;
+		await Bun.sleep(250);
+	} finally {
+		if (!warmupClosed) {
+			await Promise.allSettled(
+				warmupServers.map((server) =>
+					awaitWithTimeout(
+						"rss baseline server.close",
+						server.close(),
+						SERVER_CLOSE_TIMEOUT_MS,
+					),
+				),
+			);
+		}
+	}
+	return {
+		kind: "same-process-native-server-create-close",
+		serverWarmupCycles: 1,
+		serversWarmed: config.serverCount,
+		sameProcess: true,
+		streamStackWarmed: config.streamsPerSec > 0,
+		streamWarmupSessions,
+		streamWarmupStreamsOpened,
+		nativeClientPrewarmed: false,
+		allocatorReliefApplied: false,
+		processRestarted: false,
+	};
+}
+
 async function runOneCampaign(
 	config: ScaleCampaignConfig,
 ): Promise<RunSummary> {
@@ -1572,12 +1910,12 @@ async function runOneCampaign(
 	);
 	const servers: ReturnType<typeof createServer>[] = [];
 	const serverObservedPeerIps = new Set<string>();
-	const initialMemory = getMemorySample();
-	let peakMemory = initialMemory;
-	let preCloseMemory = initialMemory;
-	let postCloseMemory = initialMemory;
-	const initialRssMb = initialMemory.rssMb;
-	let peakRssMb = initialMemory.rssMb;
+	const coldStartMemory = getMemorySample();
+	let serviceReadyMemory = coldStartMemory;
+	let peakMemory = coldStartMemory;
+	let preCloseMemory = coldStartMemory;
+	let postCloseMemory = coldStartMemory;
+	let peakRssMb = coldStartMemory.rssMb;
 	let peakLiveSessions = 0;
 	let peakStreams = 0;
 	let peakQueuedBytesGlobal = 0;
@@ -1593,174 +1931,194 @@ async function runOneCampaign(
 	let liveSetHeldMs = 0;
 	let liveSetStartedAt: number | null = null;
 	let finalGauges: FinalGauges = aggregateGauges([]);
+	let nativeOwnerTelemetry = buildNativeOwnerTelemetry([], []);
 	let serversClosed = false;
 	const drainTasks: Promise<void>[] = [];
+	const reviewRequired: string[] = [];
+	let warmupTelemetry: RssWarmupTelemetry = {
+		kind: "not-run",
+		serverWarmupCycles: 0,
+		serversWarmed: 0,
+		sameProcess: false,
+		streamStackWarmed: false,
+		streamWarmupSessions: 0,
+		streamWarmupStreamsOpened: 0,
+		nativeClientPrewarmed: false,
+		allocatorReliefApplied: false,
+		processRestarted: false,
+	};
 
 	try {
+		warmupTelemetry = await warmNativeServerForRssBaseline(
+			clientBin,
+			cert,
+			config,
+			serverSessionCaps,
+		);
+		serviceReadyMemory = getMemorySample();
+		preCloseMemory = serviceReadyMemory;
+		postCloseMemory = serviceReadyMemory;
+		if (serviceReadyMemory.rssMb > peakMemory.rssMb) {
+			peakMemory = serviceReadyMemory;
+		}
+		peakRssMb = Math.max(peakRssMb, serviceReadyMemory.rssMb);
+
 		for (let i = 0; i < config.serverCount; i++) {
 			const port = config.basePort + i;
 			const sessionCap = serverSessionCaps[i] ?? 0;
 			let serverDatagramProbeDone = false;
 			let serverStreamProbeDone = false;
 			servers.push(
-				createServer({
-					port,
-					tls: { certPem: cert.certPem, keyPem: cert.keyPem },
-					limits: {
-						maxSessions: Math.max(sessionCap, 1),
-						maxHandshakesInFlight: Math.max(
-							sessionCap + config.overloadSessionsPerServer,
-							256,
-						),
-					},
-					rateLimits: {
-						handshakesPerSec: Math.max(sessionCap * 2, 500),
-						handshakesBurst: Math.max(sessionCap * 4, 1_000),
-						handshakesBurstPerPrefix: Math.max(sessionCap * 4, 1_000),
-						streamsPerSec: Math.max(sessionCap * 4, 1_000),
-						streamsBurst: Math.max(sessionCap * 8, 2_000),
-						datagramsPerSec: Math.max(sessionCap * 20, 10_000),
-						datagramsBurst: Math.max(sessionCap * 40, 20_000),
-					},
-					onSession: (session) => {
-						serverObservedPeerIps.add(session.peer.ip);
-						const portKey = String(port);
-						const countDatagram = () => {
-							serverDatagramsReceived += 1;
-							serverDatagramsReceivedByPort[portKey] =
-								(serverDatagramsReceivedByPort[portKey] ?? 0) + 1;
-						};
-						const countStream = () => {
-							serverStreamsAccepted += 1;
-							serverStreamsAcceptedByPort[portKey] =
-								(serverStreamsAcceptedByPort[portKey] ?? 0) + 1;
-						};
-						const drainDeadline =
-							Date.now() + Math.max(5_000, config.durationSec * 1_000 + 5_000);
-						let sessionDatagramProbeSent = false;
-						if (
-							config.datagramsPerSec > 0 &&
-							(config.workloadMode === "drain-all" ||
-								(config.workloadMode === "single-reader" &&
-									!serverDatagramProbeDone))
-						) {
-							serverDatagramProbeDone = true;
-							const task = (async () => {
-								const iterator = session
-									.incomingDatagrams()
-									[Symbol.asyncIterator]();
-								try {
-									while (Date.now() < drainDeadline) {
+				createServer(
+					campaignServerOptions(
+						cert,
+						port,
+						sessionCap,
+						config.overloadSessionsPerServer,
+						(session) => {
+							serverObservedPeerIps.add(session.peer.ip);
+							const portKey = String(port);
+							const countDatagram = () => {
+								serverDatagramsReceived += 1;
+								serverDatagramsReceivedByPort[portKey] =
+									(serverDatagramsReceivedByPort[portKey] ?? 0) + 1;
+							};
+							const countStream = () => {
+								serverStreamsAccepted += 1;
+								serverStreamsAcceptedByPort[portKey] =
+									(serverStreamsAcceptedByPort[portKey] ?? 0) + 1;
+							};
+							const drainDeadline =
+								Date.now() +
+								Math.max(5_000, config.durationSec * 1_000 + 5_000);
+							let sessionDatagramProbeSent = false;
+							if (
+								config.datagramsPerSec > 0 &&
+								(config.workloadMode === "drain-all" ||
+									(config.workloadMode === "single-reader" &&
+										!serverDatagramProbeDone))
+							) {
+								serverDatagramProbeDone = true;
+								const task = (async () => {
+									const iterator = session
+										.incomingDatagrams()
+										[Symbol.asyncIterator]();
+									try {
+										while (Date.now() < drainDeadline) {
+											const result = await nextBeforeDeadline(
+												iterator.next(),
+												drainDeadline,
+											);
+											if (!result || result.done) break;
+											countDatagram();
+											if (!sessionDatagramProbeSent) {
+												const data = result.value;
+												await session.sendDatagram(data);
+												serverDatagramSends += 1;
+												sessionDatagramProbeSent = true;
+											}
+										}
+									} finally {
+										await iterator.return?.();
+									}
+								})();
+								drainTasks.push(task);
+								task.catch((error) => {
+									serverDatagramErrors += 1;
+									failures.push(
+										`server datagram exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+									);
+								});
+							}
+							if (
+								config.workloadMode === "drain-all" &&
+								config.streamsPerSec > 0
+							) {
+								const task = drainSessionStreamsBeforeDeadline(
+									session,
+									drainDeadline,
+									countStream,
+								);
+								drainTasks.push(task);
+								task.catch((error) => {
+									serverStreamErrors += 1;
+									failures.push(
+										`server stream drain failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+									);
+								});
+							}
+							if (
+								config.workloadMode === "probe" &&
+								config.datagramsPerSec > 0
+							) {
+								const task = (async () => {
+									const iterator = session
+										.incomingDatagrams()
+										[Symbol.asyncIterator]();
+									try {
 										const result = await nextBeforeDeadline(
 											iterator.next(),
 											drainDeadline,
 										);
-										if (!result || result.done) break;
+										if (!result || result.done) return;
 										countDatagram();
-										if (!sessionDatagramProbeSent) {
-											const data = result.value;
-											await session.sendDatagram(data);
-											serverDatagramSends += 1;
-											sessionDatagramProbeSent = true;
-										}
+										const data = result.value;
+										await session.sendDatagram(data);
+										serverDatagramSends += 1;
+									} finally {
+										await iterator.return?.();
 									}
-								} finally {
-									await iterator.return?.();
-								}
-							})();
-							drainTasks.push(task);
-							task.catch((error) => {
-								serverDatagramErrors += 1;
-								failures.push(
-									`server datagram exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
-								);
-							});
-						}
-						if (
-							config.workloadMode === "drain-all" &&
-							config.streamsPerSec > 0
-						) {
-							const task = drainSessionStreamsBeforeDeadline(
-								session,
-								drainDeadline,
-								countStream,
-							);
-							drainTasks.push(task);
-							task.catch((error) => {
-								serverStreamErrors += 1;
-								failures.push(
-									`server stream drain failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
-								);
-							});
-						}
-						if (config.workloadMode === "probe" && config.datagramsPerSec > 0) {
-							const task = (async () => {
-								const iterator = session
-									.incomingDatagrams()
-									[Symbol.asyncIterator]();
-								try {
-									const result = await nextBeforeDeadline(
-										iterator.next(),
-										drainDeadline,
+								})();
+								drainTasks.push(task);
+								task.catch((error) => {
+									serverDatagramErrors += 1;
+									failures.push(
+										`server datagram exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
 									);
-									if (!result || result.done) return;
-									countDatagram();
-									const data = result.value;
-									await session.sendDatagram(data);
-									serverDatagramSends += 1;
-								} finally {
-									await iterator.return?.();
-								}
-							})();
-							drainTasks.push(task);
-							task.catch((error) => {
-								serverDatagramErrors += 1;
-								failures.push(
-									`server datagram exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+								});
+							}
+							if (config.workloadMode === "probe" && config.streamsPerSec > 0) {
+								const task = runProbeStreamHandlers(
+									session,
+									drainDeadline,
+									countStream,
+									() => {
+										serverBidiStreamsOpened += 1;
+									},
+									() => {
+										serverUniStreamsOpened += 1;
+									},
 								);
-							});
-						}
-						if (config.workloadMode === "probe" && config.streamsPerSec > 0) {
-							const task = runProbeStreamHandlers(
-								session,
-								drainDeadline,
-								countStream,
-								() => {
-									serverBidiStreamsOpened += 1;
-								},
-								() => {
-									serverUniStreamsOpened += 1;
-								},
-							);
-							drainTasks.push(task);
-							task.catch((error) => {
-								serverStreamErrors += 1;
-								failures.push(
-									`server stream probe failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+								drainTasks.push(task);
+								task.catch((error) => {
+									serverStreamErrors += 1;
+									failures.push(
+										`server stream probe failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+									);
+								});
+							} else if (config.streamsPerSec > 0 && !serverStreamProbeDone) {
+								serverStreamProbeDone = true;
+								const task = exerciseServerStreamProbe(
+									session,
+									new TextEncoder().encode(`server-probe:${port}`),
+									() => {
+										serverBidiStreamsOpened += 1;
+									},
+									() => {
+										serverUniStreamsOpened += 1;
+									},
 								);
-							});
-						} else if (config.streamsPerSec > 0 && !serverStreamProbeDone) {
-							serverStreamProbeDone = true;
-							const task = exerciseServerStreamProbe(
-								session,
-								new TextEncoder().encode(`server-probe:${port}`),
-								() => {
-									serverBidiStreamsOpened += 1;
-								},
-								() => {
-									serverUniStreamsOpened += 1;
-								},
-							);
-							drainTasks.push(task);
-							task.catch((error) => {
-								serverStreamErrors += 1;
-								failures.push(
-									`server stream exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
-								);
-							});
-						}
-					},
-				}),
+								drainTasks.push(task);
+								task.catch((error) => {
+									serverStreamErrors += 1;
+									failures.push(
+										`server stream exercise failed on port ${port}: ${error instanceof Error ? error.message : String(error)}`,
+									);
+								});
+							}
+						},
+					),
+				),
 			);
 		}
 
@@ -1920,6 +2278,7 @@ async function runOneCampaign(
 		}
 
 		const preCloseSnapshots = servers.map((server) => server.metricsSnapshot());
+		nativeOwnerTelemetry = buildNativeOwnerTelemetry(preCloseSnapshots, []);
 		const p99HandshakeMs = preCloseSnapshots
 			.map((snapshot) =>
 				percentileFromHistogram(snapshot.handshakeLatency, 0.99),
@@ -2015,12 +2374,46 @@ async function runOneCampaign(
 		);
 
 		await Bun.sleep(2_000);
+		// Allow settled session callbacks and N-API wrapper finalizers to run
+		// before taking the diagnostic owner snapshot. The RSS comparator below
+		// measures this same drained process state, rather than a transient JS
+		// wrapper-retention window.
+		if (typeof Bun.gc === "function") {
+			for (let pass = 0; pass < 3; pass += 1) {
+				Bun.gc(true);
+				await Bun.sleep(100);
+			}
+		}
 		const postCloseSnapshots = servers.map((server) =>
 			server.metricsSnapshot(),
 		);
+		nativeOwnerTelemetry = buildNativeOwnerTelemetry(
+			preCloseSnapshots,
+			postCloseSnapshots,
+		);
 		finalGauges = aggregateGauges(postCloseSnapshots);
+		// Drop all JS references to closed native handles and settled workload
+		// promises before measuring residency. Keeping these wrappers alive would
+		// make the evidence measure harness retention instead of server close.
+		servers.length = 0;
+		drainTasks.length = 0;
+		if (typeof Bun.gc === "function") {
+			for (let pass = 0; pass < 3; pass += 1) {
+				Bun.gc(true);
+				await Bun.sleep(100);
+			}
+		}
+		await Bun.sleep(100);
 		postCloseMemory = getMemorySample();
 		const finalRssMb = postCloseMemory.rssMb;
+		const memory = buildMemoryTelemetry({
+			coldStart: coldStartMemory,
+			serviceReady: serviceReadyMemory,
+			peak: peakMemory,
+			preClose: preCloseMemory,
+			postClose: postCloseMemory,
+			warmup: warmupTelemetry,
+		});
 
 		if (
 			finalGauges.sessionsActive !== 0 ||
@@ -2034,9 +2427,17 @@ async function runOneCampaign(
 				`final gauges did not recover to baseline: ${JSON.stringify(finalGauges)}`,
 			);
 		}
-		if (finalRssMb > initialRssMb * config.maxRecoveryRssRatio) {
+		if (
+			finalRssMb >
+			memory.recoveryBaseline.rssMb * config.maxRecoveryRssRatio
+		) {
 			failures.push(
-				`RSS did not recover near baseline: initial=${initialRssMb.toFixed(2)}MB final=${finalRssMb.toFixed(2)}MB ratio=${(finalRssMb / initialRssMb).toFixed(3)}`,
+				`RSS did not recover near service-ready baseline: serviceReady=${memory.recoveryBaseline.rssMb.toFixed(2)}MB final=${finalRssMb.toFixed(2)}MB ratio=${(finalRssMb / memory.recoveryBaseline.rssMb).toFixed(3)}`,
+			);
+		}
+		if (memory.coldStartDiagnostic.status === "review-required") {
+			reviewRequired.push(
+				`cold-start RSS diagnostic requires review: ratio=${memory.coldStartDiagnostic.ratio?.toFixed(3) ?? "n/a"} threshold=${memory.coldStartDiagnostic.threshold.toFixed(2)}`,
 			);
 		}
 
@@ -2073,17 +2474,14 @@ async function runOneCampaign(
 			overloadClientSummaries: overloadResult.clientSummaries,
 			closeDurationMs,
 			finalGauges,
-			memory: {
-				initial: initialMemory,
-				peak: peakMemory,
-				preClose: preCloseMemory,
-				postClose: postCloseMemory,
-			},
+			memory,
+			nativeOwnerTelemetry,
 			p99HandshakeMs: p99Handshake,
 			p99DatagramEnqueueMs: p99Datagram,
 			p99StreamOpenMs: p99Stream,
 			clientSummaries,
 			failures,
+			reviewRequired,
 		};
 	} finally {
 		if (!serversClosed) {
@@ -2141,17 +2539,23 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 			overloadClientSummaries: [],
 			closeDurationMs: 0,
 			finalGauges: emptyGauges,
-			memory: {
-				initial: getMemorySample(),
-				peak: getMemorySample(),
-				preClose: getMemorySample(),
-				postClose: getMemorySample(),
-			},
+			memory: (() => {
+				const sample = getMemorySample();
+				return buildMemoryTelemetry({
+					coldStart: sample,
+					serviceReady: sample,
+					peak: sample,
+					preClose: sample,
+					postClose: sample,
+				});
+			})(),
+			nativeOwnerTelemetry: buildNativeOwnerTelemetry([], []),
 			p99HandshakeMs: null,
 			p99DatagramEnqueueMs: null,
 			p99StreamOpenMs: null,
 			clientSummaries: [],
 			failures: [error instanceof Error ? error.message : String(error)],
+			reviewRequired: [],
 		};
 	}
 	mkdirSync(dirname(config.artifactPath), { recursive: true });
@@ -2164,6 +2568,8 @@ export async function runScaleCampaign(config: ScaleCampaignConfig) {
 				rustcVersion: rustcVersion(),
 				source: sourceMetadata(),
 				transportPolicy: nativeTransportPolicySnapshot(),
+				authoritativeRssBaseline: RSS_AUTHORITATIVE_BASELINE,
+				rssBaselinePolicy: RSS_BASELINE_POLICY,
 				processIsolatedRss: processIsolatedRssTelemetry(),
 				config,
 				summary,
