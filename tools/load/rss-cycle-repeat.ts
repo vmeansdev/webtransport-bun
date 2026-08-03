@@ -23,6 +23,15 @@ import {
 	toAllocatorReliefTelemetry,
 } from "./distributed-scale.ts";
 
+/**
+ * One uncounted warmup cycle precedes the three measured cycles: the first
+ * full create/load/close pass amortizes runtime lazy initialization (JIT
+ * tiers, allocator arenas — ~6 MB on Linux, ~1 MB on macOS), which is
+ * one-time cost, not per-cycle growth. The guard's purpose is detecting
+ * growth that purging would otherwise mask, so it judges steady-state cycles
+ * — the same principle as the harness's service-ready warmup.
+ */
+const WARMUP_CYCLES = 1;
 const CYCLES = 3;
 const MAX_CYCLE_RATIO = 1.05;
 const CLOSE_TIMEOUT_MS = 10_000;
@@ -159,6 +168,7 @@ async function runCycle(
 }
 
 export async function runCycleRepeat(): Promise<{
+	warmup: CycleSample | null;
 	cycles: CycleSample[];
 	ratioCycle3ToCycle1: number | null;
 	failures: string[];
@@ -168,13 +178,26 @@ export async function runCycleRepeat(): Promise<{
 		throw new Error("rss-cycle-repeat: failed to generate localhost TLS cert");
 	}
 	const cycles: CycleSample[] = [];
+	let warmup: CycleSample | null = null;
 	try {
+		for (let i = 1; i <= WARMUP_CYCLES; i += 1) {
+			warmup = await runCycle(0, cert);
+		}
 		for (let cycle = 1; cycle <= CYCLES; cycle += 1) {
 			cycles.push(await runCycle(cycle, cert));
 		}
 	} finally {
 		cert.cleanup();
 	}
+	const warmupFailures =
+		warmup &&
+		(warmup.sessionsObserved === 0 ||
+			warmup.streamsObserved === 0 ||
+			warmup.datagramsObserved === 0)
+			? [
+					`warmup cycle did not exercise the stack: sessions=${warmup.sessionsObserved} streams=${warmup.streamsObserved} datagrams=${warmup.datagramsObserved}`,
+				]
+			: [];
 	const workloadFailures = cycles
 		.filter(
 			(sample) =>
@@ -188,9 +211,10 @@ export async function runCycleRepeat(): Promise<{
 		);
 	const verdict = evaluateCycleRepeat(cycles);
 	return {
+		warmup,
 		cycles,
 		ratioCycle3ToCycle1: verdict.ratioCycle3ToCycle1,
-		failures: [...workloadFailures, ...verdict.failures],
+		failures: [...warmupFailures, ...workloadFailures, ...verdict.failures],
 	};
 }
 
