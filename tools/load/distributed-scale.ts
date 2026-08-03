@@ -777,7 +777,19 @@ async function nextBeforeDeadline<T>(
 ): Promise<T | null> {
 	const remainingMs = deadlineMs - Date.now();
 	if (remainingMs <= 0) return null;
-	return Promise.race([promise, Bun.sleep(remainingMs).then(() => null)]);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let settleTimeout: ((value: null) => void) | undefined;
+	const timeout = new Promise<null>((resolve) => {
+		settleTimeout = resolve;
+		timer = setTimeout(() => resolve(null), remainingMs);
+	});
+	return Promise.race([promise, timeout]).finally(() => {
+		if (timer !== undefined) clearTimeout(timer);
+		// Resolve the losing timeout immediately. This removes its race reaction
+		// instead of retaining one pending reaction per hot-loop item until the
+		// original drain deadline.
+		settleTimeout?.(null);
+	});
 }
 
 async function drainReadableBeforeDeadline(
@@ -810,7 +822,11 @@ async function drainSessionDatagramsBeforeDeadline(
 	const iterator = session.incomingDatagrams()[Symbol.asyncIterator]();
 	try {
 		while (Date.now() < deadlineMs) {
-			const result = await nextBeforeDeadline(iterator.next(), deadlineMs);
+			const next = iterator.next();
+			const result =
+				session.metricsSnapshot().queuedBytes > 0
+					? await next
+					: await nextBeforeDeadline(next, deadlineMs);
 			if (!result || result.done) break;
 			onDatagram();
 		}
@@ -2085,10 +2101,11 @@ async function runOneCampaign(
 										[Symbol.asyncIterator]();
 									try {
 										while (Date.now() < drainDeadline) {
-											const result = await nextBeforeDeadline(
-												iterator.next(),
-												drainDeadline,
-											);
+											const next = iterator.next();
+											const result =
+												session.metricsSnapshot().queuedBytes > 0
+													? await next
+													: await nextBeforeDeadline(next, drainDeadline);
 											if (!result || result.done) break;
 											countDatagram();
 											if (!sessionDatagramProbeSent) {
