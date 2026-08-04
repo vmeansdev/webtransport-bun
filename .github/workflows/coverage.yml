@@ -23,6 +23,10 @@ jobs:
       # escape hatch cargo-llvm-cov applies internally; it keeps the pinned
       # 1.95.0 compiler (no nightly), only unlocking the branch flag.
       RUSTC_BOOTSTRAP: "1"
+      # ring compiles C for wasm32; use LLVM's clang/llvm-ar (not the macOS
+      # brew paths build-wasm.sh defaults to). Mirrors the green wasm job.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
@@ -36,10 +40,21 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12.10"
+      - name: Install wasm C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
       - name: Install coverage tooling
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+      - name: Install wasm-bindgen-cli (pinned to crate version)
+        run: cargo install wasm-bindgen-cli --version 0.2.121 --locked
       - name: Install deps
         run: bun install --frozen-lockfile
+      # The Bun coverage step runs the full packages/ suite, which loads the
+      # native addon and the wasm dist; without these builds every native test
+      # fails on addon load and the wasm floors go vacuous on skips.
+      - name: Build native addon
+        run: bun run build:native
+      - name: Build wasm + dist
+        run: bun run build:wasm && bun run build:wasm:dist
       - name: Prepare coverage artifact directory
         run: mkdir -p coverage/bun
       - name: Native coverage
