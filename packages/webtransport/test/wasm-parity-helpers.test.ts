@@ -75,17 +75,16 @@ describe("wasm parity epic helpers", () => {
 			const target = join(dir, "target");
 			await Bun.write(target, new Uint8Array([9]));
 			const symlinkKey = "symlink";
-			try {
-				symlinkSync(
-					target,
-					join(
-						dir,
-						`${Buffer.from(symlinkKey, "utf8").toString("base64url")}.ticket`,
-					),
-				);
-			} catch {
-				return;
-			}
+			// No try/catch: this test already skips win32 above, and on POSIX a
+			// symlink failure must fail the test rather than silently skip the
+			// security-relevant assertion below.
+			symlinkSync(
+				target,
+				join(
+					dir,
+					`${Buffer.from(symlinkKey, "utf8").toString("base64url")}.ticket`,
+				),
+			);
 			await expect(store.get(symlinkKey)).rejects.toThrow(/symlink/i);
 		} finally {
 			process.umask(previousUmask);

@@ -1164,6 +1164,8 @@ class ManagerHostReservation implements WasmPayloadReservation {
 		readonly stream: number | undefined,
 		readonly token: number,
 		readonly bytes: number,
+		/** Owning session for datagram payloads; streams resolve via their map. */
+		readonly sessionId: bigint | undefined = undefined,
 	) {}
 
 	get released(): boolean {
@@ -1269,6 +1271,8 @@ export class WasmTransportManager {
 					undefined,
 					hostToken,
 					data.length,
+					false,
+					sessionId,
 				);
 				if (!reservation) {
 					this._closeSessionForInboundPressure(conn, sessionId);
@@ -1419,6 +1423,7 @@ export class WasmTransportManager {
 		token: number,
 		bytes: number,
 		fin = false,
+		sessionId?: bigint,
 	): WasmPayloadReservation | undefined {
 		const accountedBytes = fin && bytes === 0 ? 0 : Math.max(1, bytes);
 		const nextGlobal = this.hostQueuedBytesGlobal + accountedBytes;
@@ -1451,6 +1456,7 @@ export class WasmTransportManager {
 			stream,
 			token,
 			accountedBytes,
+			sessionId,
 		);
 		this.hostReservations.add(reservation);
 		this.hostQueuedBytesGlobal = nextGlobal;
@@ -1927,9 +1933,10 @@ export class WasmTransportManager {
 
 	/**
 	 * Whether one retained payload is owned by the given session. A stream
-	 * reservation follows its stream's session; a datagram reservation is only
-	 * connection-scoped, so it belongs to a session once no sibling session is
-	 * left on that connection.
+	 * reservation follows its stream's session; a datagram reservation carries
+	 * its owning session id from the delivery event, so per-session accounting
+	 * stays exact even when sibling sessions share the connection. The sibling
+	 * fallback only covers reservations adopted without a session id.
 	 */
 	private _reservationBelongsTo(
 		reservation: ManagerHostReservation,
@@ -1938,6 +1945,9 @@ export class WasmTransportManager {
 	): boolean {
 		if (reservation.conn !== conn) return false;
 		if (reservation.stream === undefined) {
+			if (reservation.sessionId !== undefined) {
+				return reservation.sessionId === sessionId;
+			}
 			return ![...this.sessions.values()].some(
 				(s) => s.conn === conn && s.sessionId !== sessionId,
 			);

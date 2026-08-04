@@ -200,6 +200,12 @@ async function createNativeHarness(
 			);
 		},
 		async queueFullDatagramError(clientOpts) {
+			// SCOPE: this exercises the JS error-remap layer only — the
+			// E_QUEUE_FULL producer is a synthetic stub, not native queue
+			// pressure. The real native producer is covered by error-mapping
+			// suites ("client oversized datagram returns E_QUEUE_FULL"); what
+			// parity asserts here is that both backends surface the same
+			// error name/code for an E_QUEUE_FULL-coded failure.
 			const session = __TESTING__.createNativeClientSessionForTests(
 				{
 					id: "strict-client",

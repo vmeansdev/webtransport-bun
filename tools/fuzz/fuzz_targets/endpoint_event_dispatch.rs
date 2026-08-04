@@ -161,6 +161,7 @@ fuzz_target!(|data: &[u8]| {
     let mut server_conn = None;
     let mut client_session: Option<(u32, u64)> = None;
     let mut server_session: Option<(u32, u64)> = None;
+    let mut closed_early = false;
     let mut offset = 12_usize;
 
     for _ in 0..32 {
@@ -205,6 +206,7 @@ fuzz_target!(|data: &[u8]| {
             _ => {
                 if let Some(conn) = server_conn {
                     server.close_conn(conn, 0, b"fuzz", Instant::now());
+                    closed_early = true;
                 }
             }
         }
@@ -217,4 +219,20 @@ fuzz_target!(|data: &[u8]| {
         }
         offset = offset.saturating_add(33);
     }
+
+    // Every datagram/stream arm above is gated on a session extracted from a
+    // SESSION_ESTABLISHED event. If extract_session drifts from the wire
+    // format again (the exact bit-rot 932b3b8 repaired), those arms all become
+    // no-ops and the target silently degrades to connect-only fuzzing. Inputs
+    // can legitimately prevent establishment — a 1ms fuzzed handshake/idle
+    // timeout, or the deliberate early close — so the drift check only fires
+    // on inputs whose timeouts give the in-process pump loop absurd headroom
+    // (>=200ms for a microsecond-scale exchange). The fuzzer explores such
+    // inputs constantly, so real drift still fails within seconds.
+    let generous_timeouts =
+        *data.get(10).unwrap_or(&10) >= 200 && *data.get(11).unwrap_or(&30) >= 200;
+    assert!(
+        !generous_timeouts || closed_early || client_session.is_some() || server_session.is_some(),
+        "no session established after full pump: extract_session drifted from the wire format"
+    );
 });

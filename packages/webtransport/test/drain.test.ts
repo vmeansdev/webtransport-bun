@@ -144,9 +144,9 @@ describe("drain guarantees (P1.1)", () => {
 				const m = server.metricsSnapshot();
 				return (
 					m.sessionsActive === 0 &&
-					// Task 5 now tracks the top-level accept loop explicitly, so a
-					// listening server retains one session task until server.close().
-					m.sessionTasksActive <= 1 &&
+					// The accept loop is tracked as TaskKind::Accept (6a515e2), so a
+					// listening server holds ZERO session tasks once sessions drain.
+					m.sessionTasksActive === 0 &&
 					m.streamTasksActive === 0 &&
 					m.queuedBytesGlobal <= 4 * 1024
 				);
@@ -197,9 +197,9 @@ describe("drain guarantees (P1.1)", () => {
 				const m = server.metricsSnapshot();
 				return (
 					m.sessionsActive === 0 &&
-					// Task 5 now tracks the top-level accept loop explicitly, so a
-					// listening server retains one session task until server.close().
-					m.sessionTasksActive <= 1 &&
+					// The accept loop is tracked as TaskKind::Accept (6a515e2), so a
+					// listening server holds ZERO session tasks once sessions drain.
+					m.sessionTasksActive === 0 &&
 					m.streamTasksActive === 0 &&
 					m.queuedBytesGlobal <= 4 * 1024
 				);

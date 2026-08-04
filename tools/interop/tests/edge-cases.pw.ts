@@ -280,12 +280,14 @@ test.describe("Chromium interop edge cases", () => {
 	test("close code and reason propagate on server-triggered close", async ({
 		page,
 	}) => {
+		// Ready wait (5s) + CI retry deadline (20s) must fit with margin.
+		test.setTimeout(45_000);
 		await page.goto(resolveInteropHealthUrl());
 		const hashBase64 = getCertHashBase64();
 		const interopOrigin = resolveInteropOrigin();
 
 		const result = await page.evaluate(
-			async ({ h, url }) => {
+			async ({ h, url, closeDeadlineMs }) => {
 				type ReadWithTimeout = <T>(
 					reader: ReadableStreamDefaultReader<T>,
 					timeoutMs: number,
@@ -316,15 +318,38 @@ test.describe("Chromium interop edge cases", () => {
 				}
 				const wt = new WebTransport(url, opts);
 				await withTimeout(wt.ready, 5_000, "server close ready");
-				const writer = wt.datagrams.writable.getWriter();
-				await writer.write(new TextEncoder().encode("__WT_CLOSE_4001__"));
-				writer.releaseLock();
+				// The close trigger is a fire-and-forget datagram a loaded runner
+				// can drop before the server sees it. The handler is idempotent
+				// (closes on first receipt), so re-send each second until the
+				// close arrives or the overall deadline lapses — same treatment
+				// as interop-expanded's close-propagation test.
+				const trigger = new TextEncoder().encode("__WT_CLOSE_4001__");
+				const sendTrigger = async () => {
+					const writer = wt.datagrams.writable.getWriter();
+					try {
+						await writer.write(trigger);
+					} catch {
+						// Session already closing — the trigger got through.
+					} finally {
+						writer.releaseLock();
+					}
+				};
 				try {
-					const closeInfo = await withTimeout(
-						wt.closed,
-						5_000,
-						"server close settled",
-					);
+					const deadlineAt = Date.now() + closeDeadlineMs;
+					let closeInfo: unknown;
+					for (;;) {
+						await sendTrigger();
+						try {
+							closeInfo = await withTimeout(
+								wt.closed,
+								Math.min(1_000, Math.max(1, deadlineAt - Date.now())),
+								"server close settled",
+							);
+							break;
+						} catch (e) {
+							if (Date.now() >= deadlineAt) throw e;
+						}
+					}
 					return {
 						closed: true,
 						closeCode: (closeInfo as LocalCloseInfo)?.closeCode ?? null,
@@ -343,6 +368,10 @@ test.describe("Chromium interop edge cases", () => {
 			{
 				h: hashBase64,
 				url: interopOrigin,
+				// CI runners under load have dropped the lone trigger datagram
+				// for multiple seconds at a stretch; give the retry loop real
+				// headroom.
+				closeDeadlineMs: process.env.CI ? 20_000 : 5_000,
 			},
 		);
 

@@ -3396,6 +3396,12 @@ export function buildArtifactDocument(
 		bunVersion: Bun.version,
 		rustcVersion: rustcVersion(),
 		source: sourceMetadata(),
+		// Environment knobs that change what the load-client tolerates must be
+		// visible in the evidence, not silently inherited from the CI job env.
+		loadClientEnv: {
+			probeTimeoutMs: process.env.LOAD_CLIENT_PROBE_TIMEOUT_MS ?? null,
+			clientBinOverridden: CLIENT_BIN_OVERRIDE !== null,
+		},
 		transportPolicy: nativeTransportPolicySnapshot(),
 		authoritativeRssBaseline: RSS_AUTHORITATIVE_BASELINE,
 		rssBaselinePolicy: RSS_BASELINE_POLICY,

@@ -79,6 +79,12 @@ export function normalizeW3CBrowserName(code: ErrorCode): string | undefined {
  * and message. Returns the error untouched when strict mode is off, when the
  * code has no browser name, or when the name already matches — so both backends
  * reach browser-style names through this one mapper.
+ *
+ * Deliberately NOT on the frozen `/wasm` surface, unlike its siblings
+ * {@link normalizeW3CBrowserName} and {@link createW3CMappedError}: those let
+ * consumers translate codes and construct browser-named errors; this one is
+ * the backends' internal decoration seam applied at the throw sites, and
+ * exporting it would freeze an implementation detail into the 1.0 contract.
  */
 export function withW3CBrowserName(
 	error: unknown,

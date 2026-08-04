@@ -399,3 +399,8 @@ behavior under gates that have not passed.
 - **Semver**: Major (X.0.0) for breaking changes; minor (x.Y.0) for additive changes; patch (x.y.Z) for fixes.
 - **Error codes**: E_* codes are stable; do not remove or change meaning.
 - **Metrics fields**: ServerMetricsSnapshot and SessionMetricsSnapshot field names are stable; new fields may be added in minor releases.
+- **`__TESTING__` is explicitly unstable**: the root module's `__TESTING__`
+  export is a bag of internal test seams (addon loading, session/stream
+  construction hooks). It is not part of this spec, is excluded from the frozen
+  export list, and may be reshaped or removed in any release without a major
+  bump. Do not depend on it outside this repository's own tests.

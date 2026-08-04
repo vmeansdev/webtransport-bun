@@ -155,8 +155,10 @@ async function main() {
 			// All 8 sessions share 127.0.0.1, so the default per-peer limiter
 			// (200 streams/s, burst 400) would shed ~half of the 400/s flood by
 			// design. Raise the limiter for this profile so maxErr=0 asserts the
-			// data path services the full flood; limiter-shedding semantics are
-			// covered by the contention profile.
+			// data path services the full flood. The stream limiter's shed path
+			// itself is unit-covered in crates/native/src/rate_limit.rs (no
+			// profile exercises it end-to-end; the contention profile floods
+			// the handshake limiter, not the stream limiter).
 			rateLimits: { streamsPerSec: 600, streamsBurst: 1200 },
 		},
 		{

@@ -96,7 +96,6 @@ const ROOT_EXPORTS = [
 	"WebTransport",
 	"WebTransportError",
 	"WebTransportSendGroup",
-	"__TESTING__",
 	"clientPoolMetricsSnapshot",
 	"connect",
 	"createServer",
@@ -208,7 +207,16 @@ describe("three-surface public API model", () => {
 	});
 
 	test("the native root surface is frozen", () => {
-		expect(Object.keys(rootSurface).sort()).toEqual(ROOT_EXPORTS);
+		// __TESTING__ is the one tolerated non-public name on the root module:
+		// an explicitly unstable bag of test seams (see SPEC's semver section).
+		// It is excluded from the frozen list so reshaping or deleting it is
+		// NOT a semver-major event, and pinned here so nothing else sneaks in.
+		const names = Object.keys(rootSurface).sort();
+		const extras = names.filter((name) => !ROOT_EXPORTS.includes(name));
+		expect(extras).toEqual(["__TESTING__"]);
+		expect(names.filter((name) => name !== "__TESTING__")).toEqual(
+			ROOT_EXPORTS,
+		);
 	});
 
 	test("the /wasm surface is frozen", () => {

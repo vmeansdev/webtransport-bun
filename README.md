@@ -251,8 +251,8 @@ await server.close();
   both `native` and `wasm` as `candidate`, and `/wasm` becomes `stable` only
   once its required claims pass. Behavior under those gates may still change.
   The wasm server session mirrors the native `ServerSession` shape —
-  `incomingDatagrams()`, the incoming stream `ReadableStream`s, `id`/`peer`, and
-  `getStats()` — so one server codebase runs on either backend through
+  `incomingDatagrams()`, the incoming stream `ReadableStream`s, and `id`/`peer`
+  — so one server codebase runs on either backend through
   `webtransport-bun/portable`, which is the subset actually contract-tested on
   both. What remains divergent is the original callback-style API
   (`onDatagram`/`onIncomingStream`), kept for back-compat but deprecated; it

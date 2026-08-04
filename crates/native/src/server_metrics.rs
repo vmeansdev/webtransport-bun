@@ -16,6 +16,9 @@ pub struct ServerMetrics {
     pub stream_tasks_active: AtomicU64,
     /// The endpoint accept loop, which lives as long as the server does. Kept
     /// separate so per-session drain checks are not permanently offset by it.
+    /// Diagnostic-only by design: it is read into drain-timeout error strings
+    /// but deliberately NOT exported on `MetricsSnapshot` — the idle gate is
+    /// `spawn_tracked::server_task_count`, which already counts this task.
     pub accept_tasks_active: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
