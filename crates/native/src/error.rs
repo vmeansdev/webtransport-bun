@@ -4,55 +4,55 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WtCode {
-    E_INVALID_ARGUMENT,
-    E_UNSUPPORTED_ARGUMENT,
-    E_TLS,
-    E_HANDSHAKE_TIMEOUT,
-    E_SESSION_CLOSED,
-    E_SESSION_IDLE_TIMEOUT,
-    E_STREAM_RESET,
-    E_STOP_SENDING,
-    E_QUEUE_FULL,
-    E_BACKPRESSURE_TIMEOUT,
-    E_LIMIT_EXCEEDED,
-    E_RATE_LIMITED,
-    E_INTERNAL,
+    EInvalidArgument,
+    EUnsupportedArgument,
+    ETls,
+    EHandshakeTimeout,
+    ESessionClosed,
+    ESessionIdleTimeout,
+    EStreamReset,
+    EStopSending,
+    EQueueFull,
+    EBackpressureTimeout,
+    ELimitExceeded,
+    ERateLimited,
+    EInternal,
 }
 
 impl WtCode {
     fn as_str(self) -> &'static str {
         match self {
-            Self::E_INVALID_ARGUMENT => "E_INVALID_ARGUMENT",
-            Self::E_UNSUPPORTED_ARGUMENT => "E_UNSUPPORTED_ARGUMENT",
-            Self::E_TLS => "E_TLS",
-            Self::E_HANDSHAKE_TIMEOUT => "E_HANDSHAKE_TIMEOUT",
-            Self::E_SESSION_CLOSED => "E_SESSION_CLOSED",
-            Self::E_SESSION_IDLE_TIMEOUT => "E_SESSION_IDLE_TIMEOUT",
-            Self::E_STREAM_RESET => "E_STREAM_RESET",
-            Self::E_STOP_SENDING => "E_STOP_SENDING",
-            Self::E_QUEUE_FULL => "E_QUEUE_FULL",
-            Self::E_BACKPRESSURE_TIMEOUT => "E_BACKPRESSURE_TIMEOUT",
-            Self::E_LIMIT_EXCEEDED => "E_LIMIT_EXCEEDED",
-            Self::E_RATE_LIMITED => "E_RATE_LIMITED",
-            Self::E_INTERNAL => "E_INTERNAL",
+            Self::EInvalidArgument => "E_INVALID_ARGUMENT",
+            Self::EUnsupportedArgument => "E_UNSUPPORTED_ARGUMENT",
+            Self::ETls => "E_TLS",
+            Self::EHandshakeTimeout => "E_HANDSHAKE_TIMEOUT",
+            Self::ESessionClosed => "E_SESSION_CLOSED",
+            Self::ESessionIdleTimeout => "E_SESSION_IDLE_TIMEOUT",
+            Self::EStreamReset => "E_STREAM_RESET",
+            Self::EStopSending => "E_STOP_SENDING",
+            Self::EQueueFull => "E_QUEUE_FULL",
+            Self::EBackpressureTimeout => "E_BACKPRESSURE_TIMEOUT",
+            Self::ELimitExceeded => "E_LIMIT_EXCEEDED",
+            Self::ERateLimited => "E_RATE_LIMITED",
+            Self::EInternal => "E_INTERNAL",
         }
     }
 
     fn parse(message: &str) -> Option<Self> {
         const CODES: [WtCode; 13] = [
-            WtCode::E_INVALID_ARGUMENT,
-            WtCode::E_UNSUPPORTED_ARGUMENT,
-            WtCode::E_TLS,
-            WtCode::E_HANDSHAKE_TIMEOUT,
-            WtCode::E_SESSION_CLOSED,
-            WtCode::E_SESSION_IDLE_TIMEOUT,
-            WtCode::E_STREAM_RESET,
-            WtCode::E_STOP_SENDING,
-            WtCode::E_QUEUE_FULL,
-            WtCode::E_BACKPRESSURE_TIMEOUT,
-            WtCode::E_LIMIT_EXCEEDED,
-            WtCode::E_RATE_LIMITED,
-            WtCode::E_INTERNAL,
+            WtCode::EInvalidArgument,
+            WtCode::EUnsupportedArgument,
+            WtCode::ETls,
+            WtCode::EHandshakeTimeout,
+            WtCode::ESessionClosed,
+            WtCode::ESessionIdleTimeout,
+            WtCode::EStreamReset,
+            WtCode::EStopSending,
+            WtCode::EQueueFull,
+            WtCode::EBackpressureTimeout,
+            WtCode::ELimitExceeded,
+            WtCode::ERateLimited,
+            WtCode::EInternal,
         ];
         for code in CODES {
             let marker = code.as_str();
@@ -83,9 +83,9 @@ impl WtError {
     }
 
     pub fn from_detail(detail: String) -> Self {
-        let code = WtCode::parse(&detail).unwrap_or(WtCode::E_INTERNAL);
+        let code = WtCode::parse(&detail).unwrap_or(WtCode::EInternal);
         let detail = match code {
-            WtCode::E_INTERNAL => format!("{INTERNAL_MESSAGE_PREFIX}{detail}"),
+            WtCode::EInternal => format!("{INTERNAL_MESSAGE_PREFIX}{detail}"),
             _ => detail,
         };
         Self::new(code, detail)
@@ -93,7 +93,7 @@ impl WtError {
 
     pub fn with_code(code: WtCode, detail: String) -> Self {
         let detail = match code {
-            WtCode::E_INTERNAL => {
+            WtCode::EInternal => {
                 if detail.starts_with(INTERNAL_MESSAGE_PREFIX) {
                     detail
                 } else {
@@ -134,7 +134,7 @@ pub fn from_upstream_error(detail: impl std::fmt::Display) -> napi::Error {
     let detail = detail.to_string();
     let lower = detail.to_ascii_lowercase();
     if lower.contains("connection locally closed") || lower.contains("connection closed by peer") {
-        return from_code(WtCode::E_SESSION_CLOSED, detail);
+        return from_code(WtCode::ESessionClosed, detail);
     }
     from_reason(detail)
 }

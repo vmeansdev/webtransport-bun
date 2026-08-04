@@ -784,6 +784,206 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn queued_drain_keeps_the_first_diagnostic_and_counts_every_error() {
+        let sink = FakeDiscardSink::default();
+        let mut rx = queued_streams(vec![
+            Err("E_STREAM_RESET: first".to_string()),
+            Err("E_STREAM_RESET: second".to_string()),
+            Ok(()),
+        ]);
+        let mut outcome = StreamDiscardOutcome::default();
+        drain_queued_discard_streams(
+            &mut rx,
+            &sink,
+            Some(Instant::now() + Duration::from_millis(500)),
+            &mut outcome,
+        )
+        .await;
+
+        assert_eq!(outcome.errored, 2, "every failure is counted");
+        assert_eq!(
+            outcome.diagnostic.as_deref(),
+            Some("E_STREAM_RESET: first"),
+            "the first error is kept, not the last"
+        );
+        assert_eq!(outcome.completed, 0, "the wait phase owns the count");
+        assert_eq!(sink.completed(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_drain_without_a_deadline_stops_when_the_queue_goes_idle() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Box<FakeDiscardStream>>(1);
+        tx.try_send(Box::new(FakeDiscardStream(Ok(())))).unwrap();
+        let sink = FakeDiscardSink::default();
+        let mut outcome = StreamDiscardOutcome::default();
+
+        let started = std::time::Instant::now();
+        let keep_waiting = drain_queued_discard_streams(&mut rx, &sink, None, &mut outcome).await;
+        let elapsed = started.elapsed();
+
+        // The sender is still open: the loop must end on the idle window, not
+        // on channel close, and must not be treated as a timeout.
+        assert!(keep_waiting, "an idle queue hands off to the wait phase");
+        assert!(!outcome.timed_out);
+        assert_eq!(sink.completed(), 1);
+        assert!(
+            elapsed >= STREAM_DISCARD_QUEUE_IDLE,
+            "idle window must be observed, took {elapsed:?}"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_drain_reports_an_expired_deadline_without_touching_the_queue() {
+        let sink = FakeDiscardSink::default();
+        let mut rx = queued_streams(vec![Ok(())]);
+        let mut outcome = StreamDiscardOutcome::default();
+
+        let keep_waiting = drain_queued_discard_streams(
+            &mut rx,
+            &sink,
+            Some(Instant::now() - Duration::from_millis(1)),
+            &mut outcome,
+        )
+        .await;
+
+        assert!(!keep_waiting);
+        assert!(outcome.timed_out);
+        assert_eq!(sink.completed(), 0, "an expired deadline consumes nothing");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_phase_without_a_deadline_returns_once_the_session_closes() {
+        let sink = Arc::new(FakeDiscardSink::default());
+        let closer = Arc::clone(&sink);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            closer.record(Ok(()));
+            closer.closed.store(true, Ordering::Release);
+        });
+
+        let mut outcome = StreamDiscardOutcome::default();
+        wait_for_stream_discard(sink.as_ref(), None, &mut outcome).await;
+
+        assert_eq!(outcome.completed, 1);
+        assert!(!outcome.timed_out, "a close is not a deadline expiry");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unexpected_discard_errors_are_reported_but_never_shrink_the_count() {
+        let outcome = StreamDiscardOutcome {
+            completed: 4,
+            errored: 1,
+            timed_out: false,
+            diagnostic: Some("E_INTERNAL: poisoned".to_string()),
+        };
+        assert_eq!(finish_stream_discard("bidi", outcome), Some(4));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_streams_drains_the_queue_then_reports_the_session_count() {
+        let sink = FakeDiscardSink::default();
+        sink.closed.store(true, Ordering::Release);
+        let rx = Arc::new(tokio::sync::Mutex::new(queued_streams(vec![
+            Ok(()),
+            Ok(()),
+        ])));
+
+        let count = discard_streams_for_session(
+            "bidi",
+            rx,
+            sink,
+            Some(Instant::now() + Duration::from_millis(500)),
+        )
+        .await;
+
+        assert_eq!(count, Some(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_streams_reports_the_count_when_a_close_race_ends_the_drain() {
+        let sink = FakeDiscardSink::default();
+        let rx = Arc::new(tokio::sync::Mutex::new(queued_streams(vec![
+            Ok(()),
+            Err("E_SESSION_CLOSED".to_string()),
+            Ok(()),
+        ])));
+
+        let started = std::time::Instant::now();
+        let count = discard_streams_for_session(
+            "uni",
+            rx,
+            sink,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .await;
+
+        assert_eq!(count, Some(1), "the close race keeps what was delivered");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "a terminal error must skip the wait phase"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_streams_is_bounded_by_a_parked_accept_pull() {
+        let rx = Arc::new(tokio::sync::Mutex::new(queued_streams(vec![Ok(())])));
+        let held = Arc::clone(&rx);
+        let guard = held.lock().await;
+        let sink = FakeDiscardSink::default();
+        sink.record(Ok(()));
+
+        let started = std::time::Instant::now();
+        let count = discard_streams_for_session(
+            "bidi",
+            rx,
+            sink,
+            Some(Instant::now() + Duration::from_millis(40)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            count,
+            Some(1),
+            "a held queue still reports what the accept loop consumed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the lock phase must honour the deadline, took {elapsed:?}"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_helpers_are_null_for_an_unknown_session() {
+        assert_eq!(
+            discard_bidi_streams_for_session("missing-discard", None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            discard_uni_streams_for_session("missing-discard", Some(Duration::from_millis(10)))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            discard_datagram_for_session("missing-discard", None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            discard_datagrams_for_session("missing-discard", None)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn wait_phase_reports_completed_count_on_deadline() {
         let sink = FakeDiscardSink::default();
         sink.record(Ok(()));
@@ -994,6 +1194,245 @@ mod tests {
             .expect("join")
             .expect("notify must unblock capacity wait");
         assert!(polls.load(Ordering::Relaxed) >= 2);
+    }
+
+    struct LoopbackSession {
+        id: String,
+        conn: wtransport::Connection,
+        metrics: Arc<crate::server_metrics::ServerMetrics>,
+        _endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
+        _shutdown: crate::server_spawn::ShutdownOnDrop,
+    }
+
+    /// Start a loopback server, connect a real client, and return the accepted
+    /// server-side session. Callers drive real QUIC streams through it.
+    async fn start_loopback_session(server_id: u64) -> LoopbackSession {
+        use crate::client::insecure_loopback_client_config;
+        use crate::limits::Limits;
+        use crate::rate_limit::RateLimits;
+        use crate::server_metrics::ServerMetrics;
+        use crate::server_spawn::{spawn_server_instance, ShutdownOnDrop};
+        use crate::server_tls::build_default_dev_resolver;
+        use crate::SessionEvent;
+
+        let metrics = Arc::new(ServerMetrics::default());
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(8);
+        let (shutdown_tx, port) = spawn_server_instance(
+            server_id,
+            Arc::clone(&metrics),
+            &Limits::default(),
+            &RateLimits::default(),
+            "127.0.0.1",
+            0,
+            &Some(session_tx),
+            &None,
+            build_default_dev_resolver().expect("resolver"),
+            crate::client::CongestionControlMode::Default,
+            false,
+            false,
+            false,
+            0,
+            3,
+        )
+        .expect("server start");
+        let shutdown = ShutdownOnDrop(Some(shutdown_tx));
+
+        let client_cfg = insecure_loopback_client_config().expect("client cfg");
+        let endpoint = wtransport::Endpoint::client(client_cfg).expect("client endpoint");
+        let conn = endpoint
+            .connect(format!("https://127.0.0.1:{port}/"))
+            .await
+            .expect("connect");
+        let event = tokio::time::timeout(Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("accept timeout")
+            .expect("session event");
+        let SessionEvent::Accepted(accepted) = event else {
+            panic!("expected an accepted session");
+        };
+        LoopbackSession {
+            id: accepted.id,
+            conn,
+            metrics,
+            _endpoint: endpoint,
+            _shutdown: shutdown,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_stream_discard_drains_real_streams_and_unblocks_parked_accepts() {
+        let session = start_loopback_session(u64::MAX - 32).await;
+        let id = session.id.clone();
+        let conn = &session.conn;
+
+        for tag in [b"drain-a".as_slice(), b"drain-b".as_slice()] {
+            let (mut tx, _rx) = conn.open_bi().await.expect("open bi").await.expect("bi");
+            tx.write_all(tag).await.expect("write");
+            tx.finish().await.expect("finish");
+        }
+        assert_eq!(
+            discard_bidi_streams_for_session(&id, Some(Duration::from_millis(1000)))
+                .await
+                .expect("bidi discard"),
+            Some(2),
+            "both queued bidi streams are consumed without N-API handles"
+        );
+
+        for tag in [b"uni-a".as_slice(), b"uni-b".as_slice()] {
+            let mut tx = conn.open_uni().await.expect("open uni").await.expect("uni");
+            tx.write_all(tag).await.expect("write");
+            tx.finish().await.expect("finish");
+        }
+        assert_eq!(
+            discard_uni_streams_for_session(&id, Some(Duration::from_millis(1000)))
+                .await
+                .expect("uni discard"),
+            Some(2),
+            "both queued uni streams are consumed without N-API handles"
+        );
+
+        // A parked accept must observe the lifecycle close signal, not hang.
+        let (_, _, lifecycle_closed, lifecycle_notify) =
+            session_registry::get_stream_accept_state(&id).expect("accept state");
+        let parked_id = id.clone();
+        let parked_bidi =
+            tokio::spawn(async move { accept_bidi_stream_for_session(&parked_id).await });
+        let parked_id = id.clone();
+        let parked_uni =
+            tokio::spawn(async move { accept_uni_stream_for_session(&parked_id).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        lifecycle_closed.store(true, Ordering::Release);
+        lifecycle_notify.notify_waiters();
+        assert!(tokio::time::timeout(Duration::from_secs(5), parked_bidi)
+            .await
+            .expect("parked bidi accept must wake")
+            .expect("join")
+            .expect("accept")
+            .is_none());
+        assert!(tokio::time::timeout(Duration::from_secs(5), parked_uni)
+            .await
+            .expect("parked uni accept must wake")
+            .expect("join")
+            .expect("accept")
+            .is_none());
+
+        // Once closed, further accepts return immediately.
+        assert!(accept_bidi_stream_for_session(&id).await.unwrap().is_none());
+        assert!(accept_uni_stream_for_session(&id).await.unwrap().is_none());
+
+        session_registry::close_session(&id, 0, "done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_datagram_discard_and_dead_connection_sends() {
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 33).await;
+        let server_id = u64::MAX - 33;
+        let id = session.id.clone();
+        let metrics = Arc::clone(&session.metrics);
+
+        let queue_id = format!("{id}-queue");
+        let (dgram_tx, _bidi_tx, _uni_tx, _create_bi_rx, _create_uni_rx, sm, dgram_notify) =
+            session_registry::insert(
+                queue_id.clone(),
+                server_id,
+                session.conn.clone(),
+                Arc::clone(&metrics),
+                Limits::default(),
+                false,
+            );
+        let enqueue = |payload: &[u8]| {
+            dgram_tx.try_send(session_registry::DatagramSlot::new(
+                payload.to_vec(),
+                Arc::clone(&sm),
+                Arc::clone(&metrics),
+                Arc::clone(&dgram_notify),
+                0,
+            ))
+        };
+
+        enqueue(b"single").expect("enqueue single");
+        assert_eq!(
+            discard_datagram_for_session(&queue_id, Some(Duration::from_millis(500)))
+                .await
+                .expect("bounded discard"),
+            Some(true),
+            "a bounded discard reports the datagram it dropped"
+        );
+
+        enqueue(b"batch-a").expect("enqueue batch-a");
+        enqueue(b"batch-b").expect("enqueue batch-b");
+        drop(dgram_tx);
+        assert_eq!(
+            discard_datagrams_for_session(&queue_id, None)
+                .await
+                .expect("unbounded batch discard"),
+            Some(2),
+            "an unbounded drain returns the count when the channel closes"
+        );
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            discard_datagram_for_session(&queue_id, None)
+                .await
+                .expect("closed single discard"),
+            None,
+            "a closed queue reports null, not a false drop"
+        );
+        assert_eq!(
+            discard_datagrams_for_session(&queue_id, None)
+                .await
+                .expect("closed batch discard"),
+            None,
+            "a closed empty queue reports null, not zero"
+        );
+
+        // A session marked closed fails the capacity reservation before the wire.
+        let closed_id = format!("{id}-closed");
+        session_registry::insert(
+            closed_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            Limits::default(),
+            false,
+        );
+        let (_, _, lifecycle_closed, _) =
+            session_registry::get_stream_accept_state(&closed_id).expect("accept state");
+        lifecycle_closed.store(true, Ordering::Release);
+        let err = send_datagram_for_session(&closed_id, b"x")
+            .await
+            .unwrap_err();
+        assert!(err.reason.contains("E_SESSION_CLOSED"));
+
+        // A dead connection surfaces as a closed session and is never counted.
+        let dead_id = format!("{id}-dead");
+        let (_, _, _, _, _, dead_sm, _) = session_registry::insert(
+            dead_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            Limits::default(),
+            false,
+        );
+        session.conn.close(wtransport::VarInt::from_u32(0), b"bye");
+        let err = send_datagram_for_session(&dead_id, b"x").await.unwrap_err();
+        assert!(err.reason.contains("E_SESSION_CLOSED"));
+        assert_eq!(
+            dead_sm.datagrams_out.load(Ordering::Relaxed),
+            0,
+            "a failed send is not counted as delivered"
+        );
+        assert_eq!(
+            dead_sm.queued_bytes.load(Ordering::Relaxed),
+            0,
+            "a failed send still releases its reservation"
+        );
+
+        session_registry::remove(&queue_id);
+        session_registry::remove(&closed_id);
+        session_registry::remove(&dead_id);
+        session_registry::remove(&id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
