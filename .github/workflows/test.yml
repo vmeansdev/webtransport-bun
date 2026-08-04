@@ -197,35 +197,6 @@ jobs:
             bun test packages/webtransport/test/backpressure.test.ts -t "backpressure counters exist and have correct shape"
           done
         timeout-minutes: 3
-      - name: Build reference + load-client
-        run: cargo build -p reference --bins
-      - name: Load-addon test
-        # Shared runners handshaking many concurrent sessions can push a single
-        # echo probe past the load-client's 2s default; give it headroom. The
-        # load-phase error contract is unchanged — a probe that never echoes
-        # still fails.
-        run: LOAD_CLIENT_PROBE_TIMEOUT_MS=15000 bun run test:load-addon
-        timeout-minutes: 5
-      - name: Load-scale-addon (release RSS evidence, 20 sessions)
-        # Per-push signal for the load path and the strict charged-memory RSS
-        # gate at a size that is deterministic on shared runners. The full
-        # 200-session release-evidence campaign is generated deliberately for a
-        # candidate (see docs/RELEASE_1.0_STATUS.md / release-status.json), not
-        # on every push: 200 concurrent sessions overwhelm loopback datagram
-        # delivery on shared CI runners and flake the datagram probe even with
-        # a 15s deadline, while the RSS gate itself passes. Keeping it small
-        # here preserves the signal without the contention flake.
-        run: LOAD_CLIENT_PROBE_TIMEOUT_MS=15000 LOAD_SCALE_SESSIONS=20 LOAD_SCALE_DURATION=15 LOAD_SCALE_MIN_LIVE_SESSIONS=20 bun run test:load-scale-addon
-        timeout-minutes: 5
-      - name: Benchmark (handshake)
-        run: bun run bench:handshake
-        timeout-minutes: 2
-      - name: Overload-addon test
-        run: bun run test:overload-addon
-        timeout-minutes: 2
-      - name: Load profiles (P2.1)
-        run: bun run test:load-profiles-addon
-        timeout-minutes: 5
       - name: Interop (Chromium)
         run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run prepare:interop && bun run playwright test
         timeout-minutes: 5
@@ -239,6 +210,61 @@ jobs:
           bun add file:$GITHUB_WORKSPACE/packages/webtransport
           echo 'import { createServer } from "@webtransport-bun/webtransport"; const s = createServer({ port: 19999, tls: { certPem: "", keyPem: "" }, onSession: () => {} }); console.log("ok"); s.close().then(() => process.exit(0));' > smoke.ts
           bun run smoke.ts
+
+  # Heavy load and stress campaigns run once on a dedicated Linux runner rather
+  # than in the 6-way test matrix: they flood the transport (handshake/stream/
+  # datagram floods, 200-session RSS campaign, overload shedding), and running
+  # them across 3 OS x 2 Bun on shared runners saturated loopback UDP delivery
+  # and flaked regardless of deadline tuning. The functional/RSS behavior is the
+  # same everywhere; the full 200-session release evidence is generated
+  # deliberately for a candidate (release-status.json / T11), not per push.
+  load:
+    name: Load and stress campaigns
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+      # Shared runners can push a single echo probe past the load-client's 2s
+      # default; give every load lane headroom. The load-phase error contract is
+      # unchanged — a probe that never echoes still fails.
+      LOAD_CLIENT_PROBE_TIMEOUT_MS: "15000"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # bench-regress ancestry needs first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
+      - name: Build reference + load-client
+        run: cargo build -p reference --bins
+      - name: Load-addon test
+        run: bun run test:load-addon
+        timeout-minutes: 5
+      - name: Load-scale-addon (strict RSS gate, 20 sessions)
+        run: LOAD_SCALE_SESSIONS=20 LOAD_SCALE_DURATION=15 LOAD_SCALE_MIN_LIVE_SESSIONS=20 bun run test:load-scale-addon
+        timeout-minutes: 5
+      - name: Benchmark (handshake)
+        run: bun run bench:handshake
+        timeout-minutes: 3
+      - name: Overload-addon test
+        run: bun run test:overload-addon
+        timeout-minutes: 3
+      - name: Load profiles (P2.1)
+        run: bun run test:load-profiles-addon
+        timeout-minutes: 8
 
   package-consumers:
     name: Exact package consumers (${{ matrix.os }} / Node ${{ matrix.node-version }})
