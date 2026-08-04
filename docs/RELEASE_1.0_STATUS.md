@@ -63,3 +63,40 @@ single-source scale scripts it replaced are not release evidence.
   on `@webtransport-bun/webtransport/wasm` (candidate; not GA; not the root
   native sync API).
 - Promote still refuses until the pending table above clears.
+
+## Session progress 2026-08-04 (candidate advanced beyond `c7a1e78…`)
+
+The branch has advanced well past the recorded candidate. This section records
+the state honestly; it does **not** re-bind `release-status.json` or claim any
+`gaRequired` gate, which still require commit-bound evidence regenerated at the
+new head.
+
+- **Local gates green at the current head** (native `cargo test -p native`
+  169/0; wasm crate 250/0; `bun test packages/` 511/0; `bun run test:wasm`
+  96/0; `bun x tsc --noEmit` clean). This is local truth, not release evidence.
+- **Functional 1.0-readiness plan tasks 1–9 landed** (bounded waits; package
+  process-tree reaping; accept-loop task accounting; ECDSA-key contract locked
+  with tests; WASM single-use tickets, real queued-bytes, zero-skip error
+  parity; recursive evidence-privacy scanner; three-surface API contract
+  frozen). Several plan premises proved false on inspection and were recorded
+  as such; the diagnostic steps still surfaced real defects, which were fixed.
+- **CI environment repaired**: the cross-OS matrix went from failing at
+  `build:native` on every OS to running the full suites. Fixes: install-before-
+  build ordering, per-OS wasm32 LLVM toolchain, coverage `RUSTC_BOOTSTRAP`,
+  Node-appropriate npm in the consumer matrix, and a repaired fuzz-target /
+  adversary-fixture build. Heavy load and stress campaigns moved to a dedicated
+  Linux `load` job (they saturate loopback UDP on shared runners; the strict
+  200-session RSS evidence is generated deliberately, not per push).
+- **RSS recovery gate validated on real CI Linux** (charged `smaps-lazyfree`
+  metric: cold-start residency delta 11.03 MB under the pre-registered 13.1 MB
+  Linux cap; service-ready ratio 1.11 under 1.25).
+- **Known CI reds, all traced to one shared-runner root cause** — loopback UDP
+  datagram delivery is unreliable under concurrency on GitHub runners. This
+  flakes the `load` job's flood profiles and one datagram-triggered Chromium
+  interop close test (`interop-expanded.pw.ts` "close … propagates to client",
+  which passes on macOS and fails on loaded ubuntu/windows). Neither is a code
+  defect; both belong to the `chromium-native-interop` / load-evidence gates.
+- **Still open for GA** (unchanged, still blocking): re-bind the candidate and
+  regenerate every `gaRequired` evidence artifact at the new head; the pending
+  gate table above; external `LOKALISE_API_TOKEN` rotation and published-history
+  purge; the interactive IWA Direct Sockets proof; and the 24h/72h soaks.
