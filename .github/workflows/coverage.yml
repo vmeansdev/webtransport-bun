@@ -53,6 +53,11 @@ jobs:
       # fails on addon load and the wasm floors go vacuous on skips.
       - name: Build native addon
         run: bun run build:native
+      # The adversarial suite's beforeAll only builds the adversary binary as
+      # a fallback, and its hook deadline cannot absorb a cold cargo build on
+      # a runner. Same reasoning as the test job's dedicated step (70ee91d).
+      - name: Build adversary binary
+        run: cargo build -p adversary
       - name: Build wasm + dist
         run: bun run build:wasm && bun run build:wasm:dist
       - name: Prepare coverage artifact directory

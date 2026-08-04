@@ -21,6 +21,7 @@ interface BunUdpGlobal {
 				port: number,
 				address: string,
 			): void;
+			error?(socket: BunUdpSocket, error: Error): void;
 		};
 	}): Promise<BunUdpSocket>;
 }
@@ -55,6 +56,13 @@ export class BunUdpTransport implements UdpTransport {
 			socket: {
 				// Connected socket: all packets come from the fixed server.
 				data: (_s, data) => self?.deliver(data, { address: host, port }),
+				// An ICMP port-unreachable surfaces here as a recv ECONNREFUSED.
+				// Same policy as the send path below: that is "dead peer", which
+				// for QUIC is packet loss — the handshake/idle timeout is the
+				// correct detector, not a raw errno escaping into the pump (it
+				// otherwise preempts E_HANDSHAKE_TIMEOUT on Linux, where the
+				// kernel reports refusal on connected UDP sockets).
+				error: () => {},
 			},
 		});
 		self = new BunUdpTransport(socket, true);
@@ -70,6 +78,8 @@ export class BunUdpTransport implements UdpTransport {
 			socket: {
 				data: (_s, data, p, addr) =>
 					self?.deliver(data, { address: addr, port: p }),
+				// See connect(): recv-side ICMP errors are peer loss, not faults.
+				error: () => {},
 			},
 		});
 		self = new BunUdpTransport(socket, false);
