@@ -347,7 +347,14 @@ test.describe("Chromium interop edge cases", () => {
 							);
 							break;
 						} catch (e) {
-							if (Date.now() >= deadlineAt) throw e;
+							// Only the wait timing out means "trigger may have been
+							// lost, try again". A genuine wt.closed rejection is the
+							// signal this test exists for — and retrying it would
+							// spin in microtasks (the rejected promise settles
+							// instantly) while masking the real cause.
+							const isTimeout =
+								e instanceof Error && e.message.startsWith("timeout after");
+							if (!isTimeout || Date.now() >= deadlineAt) throw e;
 						}
 					}
 					return {

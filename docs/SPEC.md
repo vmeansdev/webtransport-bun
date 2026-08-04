@@ -98,6 +98,10 @@ export type TlsOptions = {
 export type RateLimitOptions = {
   handshakesPerSec: number; handshakesBurst: number;
   handshakesBurstPerPrefix?: number; // per /24 IPv4 or /64 IPv6; default 100
+  // streams/datagrams limits are keyed PER PEER IP, not per session: N
+  // sessions from one address (NAT/CGNAT, proxies, load tests from one
+  // host) share a single budget. Size the limits for the address, not the
+  // session, when many clients can share an IP.
   streamsPerSec: number; streamsBurst: number;
   datagramsPerSec: number; datagramsBurst: number;
 };

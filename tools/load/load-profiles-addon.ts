@@ -29,7 +29,16 @@ type DiscardingSession = ServerSession & {
 };
 function drainSession(session: ServerSession): void {
 	const s = session as DiscardingSession;
-	void s.discardIncomingDatagrams?.(DRAIN_TIMEOUT_MS).catch(() => {});
+	// Asymmetry: the stream calls switch on a PERSISTENT native discard mode,
+	// but datagram discard is a bounded loop that stops at its deadline — so
+	// re-arm it until the session closes (null) or the API is absent
+	// (undefined). Without the loop, a profile longer than the timeout would
+	// silently stop draining datagrams halfway through.
+	void (async () => {
+		while ((await s.discardIncomingDatagrams?.(DRAIN_TIMEOUT_MS)) != null) {
+			// re-arm
+		}
+	})().catch(() => {});
 	void s.discardIncomingBidiStreams?.(DRAIN_TIMEOUT_MS).catch(() => {});
 	void s.discardIncomingUniStreams?.(DRAIN_TIMEOUT_MS).catch(() => {});
 }

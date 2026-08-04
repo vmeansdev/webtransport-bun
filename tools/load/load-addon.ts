@@ -39,11 +39,11 @@ function attachProbeEcho(session: ServerSession): void {
 					done: true,
 					value: undefined,
 				}));
-				reader.releaseLock();
 				const text = first.value
 					? Buffer.from(first.value).toString("utf8")
 					: "";
 				if (text.startsWith("probe:bidi-reset:")) {
+					reader.releaseLock();
 					stream[WT_RESET]?.(42);
 					return;
 				}
@@ -51,6 +51,18 @@ function attachProbeEcho(session: ServerSession): void {
 					const writer = stream.writable.getWriter();
 					await writer.write(first.value).catch(() => {});
 					await writer.close().catch(() => {});
+				}
+				// Drain to EOF: abandoning the readable after one chunk leaves an
+				// unclaimed stream — the same class that broke load-profiles and
+				// surfaces as stream errors once the send rate rises.
+				try {
+					while (!(await reader.read()).done) {
+						// discard
+					}
+				} catch {
+					// Peer reset/close while draining is fine.
+				} finally {
+					reader.releaseLock();
 				}
 			})().catch(() => {});
 		}
@@ -64,11 +76,11 @@ function attachProbeEcho(session: ServerSession): void {
 					done: true,
 					value: undefined,
 				}));
-				reader.releaseLock();
 				const text = first.value
 					? Buffer.from(first.value).toString("utf8")
 					: "";
 				if (text.startsWith("probe:uni-stop:")) {
+					reader.releaseLock();
 					stream[WT_STOP_SENDING]?.(0);
 					return;
 				}
@@ -78,6 +90,16 @@ function attachProbeEcho(session: ServerSession): void {
 						out.write(Buffer.from(first.value as Uint8Array), () => res());
 					}).catch(() => {});
 					out.end();
+				}
+				// Drain to EOF — see the bidi handler above.
+				try {
+					while (!(await reader.read()).done) {
+						// discard
+					}
+				} catch {
+					// Peer reset/close while draining is fine.
+				} finally {
+					reader.releaseLock();
 				}
 			})().catch(() => {});
 		}
