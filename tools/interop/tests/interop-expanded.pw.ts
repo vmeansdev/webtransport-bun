@@ -198,12 +198,14 @@ test.describe("P3.3 interop expansion", () => {
 	});
 
 	test("close with code and reason propagates to client", async ({ page }) => {
+		// Ready wait (5s) + CI retry deadline (20s) must fit with margin.
+		test.setTimeout(45_000);
 		await page.goto(resolveInteropHealthUrl());
 		const h = getCertHashBase64();
 		const interopOrigin = resolveInteropOrigin();
 
 		const result = await page.evaluate(
-			async ({ hash, url }) => {
+			async ({ hash, url, closeDeadlineMs }) => {
 				const withTimeout = (
 					globalThis as typeof globalThis & {
 						__wtWithTimeout?: <T>(
@@ -227,15 +229,38 @@ test.describe("P3.3 interop expansion", () => {
 					: {};
 				const wt = new WebTransport(url, opts);
 				await withTimeout(wt.ready, 5_000, "close propagation ready");
-				const w = wt.datagrams.writable.getWriter();
-				await w.write(new TextEncoder().encode("__WT_CLOSE_4001__"));
-				w.releaseLock();
+				// The close is triggered by a datagram, which is fire-and-forget:
+				// on a loaded runner the single trigger can be dropped before the
+				// server ever sees it. The server handler is idempotent (it closes
+				// the session on first receipt), so re-send the trigger each second
+				// until the close arrives or the overall deadline lapses.
+				const trigger = new TextEncoder().encode("__WT_CLOSE_4001__");
+				const sendTrigger = async () => {
+					const w = wt.datagrams.writable.getWriter();
+					try {
+						await w.write(trigger);
+					} catch {
+						// Session already closing — the trigger got through.
+					} finally {
+						w.releaseLock();
+					}
+				};
 				try {
-					const info = await withTimeout(
-						wt.closed,
-						5_000,
-						"server close propagation",
-					);
+					const deadlineAt = Date.now() + closeDeadlineMs;
+					let info: unknown;
+					for (;;) {
+						await sendTrigger();
+						try {
+							info = await withTimeout(
+								wt.closed,
+								Math.min(1_000, Math.max(1, deadlineAt - Date.now())),
+								"server close propagation",
+							);
+							break;
+						} catch (e) {
+							if (Date.now() >= deadlineAt) throw e;
+						}
+					}
 					return {
 						code: (info as { closeCode?: number })?.closeCode ?? null,
 						reason: (info as { reason?: string })?.reason ?? null,
@@ -244,7 +269,13 @@ test.describe("P3.3 interop expansion", () => {
 					return { code: null, reason: (e as Error).message };
 				}
 			},
-			{ hash: h, url: interopOrigin },
+			{
+				hash: h,
+				url: interopOrigin,
+				// CI runners under load have dropped the lone trigger datagram for
+				// multiple seconds at a stretch; give the retry loop real headroom.
+				closeDeadlineMs: process.env.CI ? 20_000 : 5_000,
+			},
 		);
 
 		// Previously satisfied by the reason merely containing "Connection", which
