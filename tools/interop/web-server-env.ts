@@ -38,6 +38,12 @@ export function resolveBunExecutable(): string {
 }
 
 function shellQuote(value: string): string {
+	// Playwright's webServer runs the command through cmd.exe on Windows,
+	// where single quotes are literal characters ("The filename, directory
+	// name, or volume label syntax is incorrect."); double quotes group there.
+	if (process.platform === "win32") {
+		return `"${value.replaceAll('"', '""')}"`;
+	}
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 

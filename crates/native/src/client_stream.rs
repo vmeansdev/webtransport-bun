@@ -1709,7 +1709,7 @@ pub fn spawn_lazy_bidi_bridge_on(
 /// does not allocate a Tokio task, channel, or scratch buffer for every stream.
 fn spawn_recv_bridge_on(
     rt: &tokio::runtime::Runtime,
-    mut recv_stream: wtransport::RecvStream,
+    recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> ReadBridgeParts {
@@ -2059,7 +2059,7 @@ pub fn spawn_uni_recv_bridge(
 
 pub fn spawn_uni_recv_bridge_on(
     rt: &tokio::runtime::Runtime,
-    mut recv_stream: wtransport::RecvStream,
+    recv_stream: wtransport::RecvStream,
     guard: Option<StreamGuard>,
     budget: Option<StreamBudget>,
 ) -> (
