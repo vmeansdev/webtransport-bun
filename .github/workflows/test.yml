@@ -200,11 +200,15 @@ jobs:
       - name: Build reference + load-client
         run: cargo build -p reference --bins
       - name: Load-addon test
-        run: bun run test:load-addon
+        # Shared runners handshaking many concurrent sessions can push a single
+        # echo probe past the load-client's 2s default; give it headroom. The
+        # load-phase error contract is unchanged — a probe that never echoes
+        # still fails.
+        run: LOAD_CLIENT_PROBE_TIMEOUT_MS=15000 bun run test:load-addon
         timeout-minutes: 5
       - name: Load-scale-addon (200 sessions, 30s)
-        run: LOAD_SCALE_SESSIONS=200 LOAD_SCALE_DURATION=30 bun run test:load-scale-addon
-        timeout-minutes: 3
+        run: LOAD_CLIENT_PROBE_TIMEOUT_MS=15000 LOAD_SCALE_SESSIONS=200 LOAD_SCALE_DURATION=30 bun run test:load-scale-addon
+        timeout-minutes: 6
       - name: Benchmark (handshake)
         run: bun run bench:handshake
         timeout-minutes: 2

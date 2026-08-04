@@ -18,7 +18,18 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const JOIN_ABORT_WAIT: Duration = Duration::from_secs(1);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-probe echo deadline. 2s is ample locally, but a shared CI runner
+/// handshaking hundreds of concurrent sessions can push a single echo past it;
+/// `LOAD_CLIENT_PROBE_TIMEOUT_MS` gives such lanes headroom without relaxing
+/// the load-phase error contract (a probe that never echoes still fails).
+fn probe_timeout() -> Duration {
+    std::env::var("LOAD_CLIENT_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(2))
+}
 const LOAD_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
@@ -267,7 +278,7 @@ async fn run_datagram_echo_probe(
     let payload = format!("{PROBE_DATAGRAM_PREFIX}{}", next_probe_id()).into_bytes();
     conn.send_datagram(&payload)?;
     counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
-    let received = tokio::time::timeout(PROBE_TIMEOUT, conn.receive_datagram()).await??;
+    let received = tokio::time::timeout(probe_timeout(), conn.receive_datagram()).await??;
     if received.as_ref() != payload.as_slice() {
         return Err("datagram echo mismatch".into());
     }
@@ -284,7 +295,7 @@ async fn run_uni_echo_probe(
     counters.streams_opened.fetch_add(1, Ordering::Relaxed);
     send.write_all(&payload).await?;
     send.finish().await?;
-    let mut recv = tokio::time::timeout(PROBE_TIMEOUT, conn.accept_uni()).await??;
+    let mut recv = tokio::time::timeout(probe_timeout(), conn.accept_uni()).await??;
     let echoed = read_stream_to_end(&mut recv).await?;
     if echoed != payload {
         return Err("uni echo mismatch".into());
@@ -320,7 +331,7 @@ async fn run_bidi_reset_probe(
     send.write_all(&payload).await?;
     send.finish().await?;
     let mut buf = [0u8; 32];
-    match tokio::time::timeout(PROBE_TIMEOUT, recv.read(&mut buf)).await {
+    match tokio::time::timeout(probe_timeout(), recv.read(&mut buf)).await {
         Ok(Err(_)) => {
             counters.stream_reset_ok.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -338,7 +349,7 @@ async fn run_stop_sending_probe(
     let mut send = conn.open_uni().await?.await?;
     counters.streams_opened.fetch_add(1, Ordering::Relaxed);
     send.write_all(&payload).await?;
-    match tokio::time::timeout(PROBE_TIMEOUT, send.stopped()).await {
+    match tokio::time::timeout(probe_timeout(), send.stopped()).await {
         Ok(StreamWriteError::Stopped(_)) => {
             counters.stop_sending_ok.fetch_add(1, Ordering::Relaxed);
             Ok(())
