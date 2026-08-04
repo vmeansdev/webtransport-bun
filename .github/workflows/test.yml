@@ -309,7 +309,15 @@ jobs:
           echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar.exe" >> "$GITHUB_ENV"
       - name: Install exact release tooling
         run: |
-          npm install --global npm@11.18.0
+          # npm@11 requires Node >=20.17; the package's engine floor is Node 18
+          # (bundled npm 10), so pin a Node-appropriate npm rather than breaking
+          # the Node-18 consumer lane with EBADENGINE.
+          NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+          if [ "$NODE_MAJOR" -ge 20 ]; then
+            npm install --global npm@11.18.0
+          else
+            npm install --global npm@10.9.4
+          fi
           cargo install wasm-bindgen-cli --locked --version 0.2.121
       - name: Install dependencies
         run: bun install --frozen-lockfile
