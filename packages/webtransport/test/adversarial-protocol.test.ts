@@ -31,7 +31,12 @@ import { connectWithRetry, nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 19100;
 const REPO_ROOT = resolve(import.meta.dir, "../../..");
-const ADVERSARY_BIN = join(REPO_ROOT, "target", "debug", "adversary");
+const ADVERSARY_BIN = join(
+	REPO_ROOT,
+	"target",
+	"debug",
+	process.platform === "win32" ? "adversary.exe" : "adversary",
+);
 
 // Per-operation deadline for the raw QUIC/H3 adversarial harness. Correctness
 // is unaffected — an operation that never completes still fails — but a loaded
@@ -202,8 +207,11 @@ describe("adversarial protocol harness (raw QUIC/H3)", () => {
 				throw new Error("adversary binary did not exit within 30s");
 			}
 			expect(peakHandshakesInFlight).toBeLessThanOrEqual(2);
-			// The accept loop itself is one tracked session task.
-			expect(peakSessionTasksActive).toBeLessThanOrEqual(3);
+			// The accept loop is tracked as TaskKind::Accept (6a515e2), not a
+			// session task, so the only session tasks are the two legitimate
+			// echo sessions (pre- and post-attack), which can overlap while the
+			// first drains. The attack itself must never add one.
+			expect(peakSessionTasksActive).toBeLessThanOrEqual(2);
 			// Attacker should complete cleanly; the server is the SUT, so a
 			// nonzero exit is surfaced but does not by itself fail the run.
 			if (exitCode !== 0) {

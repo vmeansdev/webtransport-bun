@@ -48,22 +48,47 @@ function parseArgs() {
 	const args = process.argv.slice(2);
 	let commit: string | null = null;
 	let dryRun = false;
+	let allowStale = false;
 	for (let i = 0; i < args.length; i++) {
 		const a = args[i];
 		if (a === "--dry-run") dryRun = true;
+		else if (a === "--allow-stale-candidate") allowStale = true;
 		else if (a === "--commit") {
 			commit = args[++i] ?? null;
 		}
 	}
-	return { commit, dryRun };
+	return { commit, dryRun, allowStale };
+}
+
+function commitExists(commit: string): boolean {
+	const r = spawnSync("git", ["cat-file", "-e", `${commit}^{commit}`], {
+		cwd: ROOT,
+	});
+	return r.status === 0;
 }
 
 function main() {
-	const { commit: argCommit, dryRun } = parseArgs();
+	const { commit: argCommit, dryRun, allowStale } = parseArgs();
 	const status = JSON.parse(readFileSync(STATUS_PATH, "utf8")) as Status;
 	const commit = argCommit ?? status.candidate.commit ?? gitHead();
 	if (!commit || !/^[0-9a-f]{40}$/i.test(commit)) {
 		console.error("promote-release-status: need a 40-char commit");
+		process.exit(1);
+	}
+	if (!commitExists(commit)) {
+		console.error(
+			`promote-release-status: commit ${commit} does not exist in this repository`,
+		);
+		process.exit(1);
+	}
+	// Promotion certifies the tree being promoted. Falling back to a stale
+	// candidate commit recorded in release-status.json must never silently
+	// certify a tree dozens of commits behind the working head.
+	const head = gitHead();
+	if (head && commit !== head && !allowStale) {
+		console.error(
+			`promote-release-status: commit ${commit} is not the current HEAD ${head}; pass --allow-stale-candidate to promote a non-HEAD commit deliberately`,
+		);
 		process.exit(1);
 	}
 

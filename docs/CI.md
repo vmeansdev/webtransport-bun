@@ -23,21 +23,30 @@ Canonical release truth: `docs/release-status.json`. CI evidence feeds that mani
 
 **test** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}` × `{1.3.9, 1.3.14}`
 
+Deterministic suites only; the heavy load/stress campaigns live in the
+dedicated `load` job below so shared-runner UDP contention cannot fail the
+six-way matrix.
+
 1. Rust quality gates: `cargo fmt --check`, `cargo audit`, `cargo clippy -- -D clippy::all`, `cargo test --workspace`
 2. Build native addon + install deps
 3. Typecheck (`bun run typecheck`)
 4. Unit tests (`bun test packages/`)
-5. Build reference + load-client
-6. Load-addon test (`bun run test:load-addon`)
-7. Load-scale-addon (200 sessions, 30s)
-8. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
-9. Overload-addon test (`bun run test:overload-addon`)
-10. Load profiles (`bun run test:load-profiles-addon`)
+5. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
+6. Smoke test — `bun add` from built package
+
+**load** job — `ubuntu-latest` only, `LOAD_CLIENT_PROBE_TIMEOUT_MS=15000` job-wide
+
+1. Build reference + load-client
+2. Load-addon test (`bun run test:load-addon`)
+3. Load-scale-addon — strict RSS gate, right-sized to 20 sessions / 15s for
+   shared runners (the full 200-session campaign is generated deliberately as
+   release evidence, not per push)
+4. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
+5. Overload-addon test (`bun run test:overload-addon`)
+6. Load profiles (`bun run test:load-profiles-addon`)
 
 Test log hygiene:
 - Set `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1` in CI test jobs to suppress repeated dev-only TLS warning logs when tests intentionally use `tls.insecureSkipVerify: true`.
-11. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
-12. Smoke test — `bun add` from built package
 
 **package-consumers** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}`
 

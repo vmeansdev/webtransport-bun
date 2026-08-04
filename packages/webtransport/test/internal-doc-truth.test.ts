@@ -158,7 +158,11 @@ pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 
 	return spawnSync(process.execPath, ["scripts/check-doc-truth.ts"], {
 		cwd: PROJECT_ROOT,
-		env: { ...process.env, CHECK_DOC_TRUTH_ROOT: root },
+		env: {
+			...process.env,
+			CHECK_DOC_TRUTH_ROOT: root,
+			CHECK_DOC_TRUTH_ROOT_UNSAFE_TEST_SEAM: "1",
+		},
 		encoding: "utf8",
 	});
 }

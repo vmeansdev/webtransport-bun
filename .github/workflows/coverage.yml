@@ -106,8 +106,17 @@ jobs:
           }
 
           failures = []
+          # Branch data only exists because RUSTC_BOOTSTRAP unlocks
+          # -Z coverage-options=branch on the pinned stable toolchain. If a
+          # toolchain bump silently drops branch instrumentation, every file
+          # reports zero branch sites and the count==0 vacuous-truth rule below
+          # would wave the whole branch gate through having measured nothing.
+          # Guard: the floored files must collectively expose at least one
+          # branch site.
+          total_branch_sites = 0
 
           def check_json_report(report_path, floors):
+              global total_branch_sites
               report = json.loads(Path(report_path).read_text())
               files = {}
               for datum in report.get("data", []):
@@ -127,6 +136,7 @@ jobs:
                   # llvm-cov reports 0% when a file has zero branch sites; treat
                   # that as full coverage for floor evaluation (vacuous truth).
                   branch_count = int(branches.get("count", 0) or 0)
+                  total_branch_sites += branch_count
                   branch_pct = (
                       100.0
                       if branch_count == 0
@@ -210,6 +220,13 @@ jobs:
           check_json_report("coverage/native-coverage.json", native_floors)
           check_json_report("coverage/wasm-coverage.json", wasm_floors)
           check_lcov_report("coverage/bun/lcov.info", bun_floors)
+
+          if total_branch_sites == 0:
+              failures.append(
+                  "no branch sites reported across any floored Rust file: "
+                  "branch instrumentation is missing, so the branch floors "
+                  "verified nothing"
+              )
 
           if failures:
               for failure in failures:

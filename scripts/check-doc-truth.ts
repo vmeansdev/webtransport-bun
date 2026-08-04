@@ -43,9 +43,20 @@ type ReleaseStatus = {
 	support: { claimed: SupportTuple[]; tested: SupportTuple[] };
 };
 
-const ROOT = resolve(
-	process.env.CHECK_DOC_TRUTH_ROOT ?? resolve(import.meta.dir, ".."),
-);
+// CHECK_DOC_TRUTH_ROOT is a test-only seam (internal-doc-truth.test.ts points
+// the checker at synthetic trees). Honoring it unconditionally would let a CI
+// invocation silently validate a different tree, so it requires the explicit
+// opt-in flag the test sets alongside it.
+const rootOverride =
+	process.env.CHECK_DOC_TRUTH_ROOT_UNSAFE_TEST_SEAM === "1"
+		? process.env.CHECK_DOC_TRUTH_ROOT
+		: undefined;
+if (process.env.CHECK_DOC_TRUTH_ROOT && rootOverride === undefined) {
+	console.error(
+		"check-doc-truth: ignoring CHECK_DOC_TRUTH_ROOT (set CHECK_DOC_TRUTH_ROOT_UNSAFE_TEST_SEAM=1 to honor it in tests)",
+	);
+}
+const ROOT = resolve(rootOverride ?? resolve(import.meta.dir, ".."));
 const STATUS_PATH = resolve(ROOT, "docs", "release-status.json");
 const ARCHITECTURE_PATH = resolve(ROOT, "docs", "ARCHITECTURE.md");
 const FAQ_PATH = resolve(ROOT, "docs", "FAQ.md");
@@ -117,6 +128,54 @@ function artifactCommit(value: unknown): string | undefined {
 	return undefined;
 }
 
+/**
+ * Semantic checks on a passed evidence artifact's own body. Commit identity
+ * alone proves binding, not outcome: a "passed" manifest entry pointing at an
+ * artifact whose recorded run failed (nonzero exit, failed status, failed
+ * coverage module) is a false-green and must be reported.
+ */
+function artifactSemanticFailures(value: unknown): string[] {
+	if (typeof value !== "object" || value === null) return [];
+	const record = value as Record<string, unknown>;
+	const failures: string[] = [];
+	if (typeof record.exitCode === "number" && record.exitCode !== 0) {
+		failures.push(`artifact records exitCode ${record.exitCode}`);
+	}
+	if (typeof record.status === "string" && record.status !== "passed") {
+		failures.push(`artifact records status ${JSON.stringify(record.status)}`);
+	}
+	// Coverage floor-results artifacts carry per-module verdicts.
+	for (const surface of ["native", "wasm"]) {
+		const modules = record[surface];
+		if (!Array.isArray(modules)) continue;
+		for (const module of modules) {
+			if (
+				typeof module === "object" &&
+				module !== null &&
+				(module as { pass?: unknown }).pass === false
+			) {
+				failures.push(
+					`coverage module ${(module as { module?: unknown }).module ?? "<unnamed>"} recorded pass=false`,
+				);
+			}
+		}
+	}
+	// Multi-run artifacts (e.g. dual-backend parity) record per-run exits.
+	if (Array.isArray(record.runs)) {
+		for (const [index, run] of record.runs.entries()) {
+			if (
+				typeof run === "object" &&
+				run !== null &&
+				typeof (run as { exitCode?: unknown }).exitCode === "number" &&
+				(run as { exitCode: number }).exitCode !== 0
+			) {
+				failures.push(`artifact run[${index}] records a nonzero exitCode`);
+			}
+		}
+	}
+	return failures;
+}
+
 function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
 	const evidence = new Map<string, EvidenceEntry>();
 	for (const [index, entry] of asArray<EvidenceEntry>(
@@ -173,7 +232,8 @@ function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
 		const artifactText = readText(artifactPath);
 		if (artifactText === undefined) continue;
 		try {
-			const commit = artifactCommit(JSON.parse(artifactText));
+			const artifact = JSON.parse(artifactText);
+			const commit = artifactCommit(artifact);
 			if (!commit) {
 				report(location, "evidence artifact has no commit identity");
 			} else if (
@@ -184,6 +244,9 @@ function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
 					location,
 					`evidence artifact commit ${commit} does not match manifest and candidate`,
 				);
+			}
+			for (const failure of artifactSemanticFailures(artifact)) {
+				report(location, failure);
 			}
 		} catch (error) {
 			report(

@@ -132,7 +132,10 @@ jobs:
           bun run install:browsers
           bun run prepare:interop
           INTEROP_EVIDENCE=1 bun run playwright test
-          bun run verify-evidence.ts interop-evidence.json
+          # --interop pins the strict schema + env-allowlist check; auto mode
+          # would silently degrade to the looser whole-document walk if the
+          # report ever lost its top-level `config` object.
+          bun run verify-evidence.ts --interop interop-evidence.json
         timeout-minutes: 5
       - name: Upload interop evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22

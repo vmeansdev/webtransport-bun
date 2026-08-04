@@ -138,12 +138,32 @@ export class FileTicketStoreHost implements TicketStoreHost {
 
 	async take(key: string): Promise<Uint8Array | null> {
 		const path = keyToFile(this.directory, key);
-		const value = readTicket(path);
-		if (value === null) return null;
-		unlinkSync(path);
-		return value;
+		// Claim the ticket with an atomic rename before reading it. A plain
+		// read-then-unlink lets two processes sharing this directory both read
+		// the ticket before either unlinks it and replay the same 0-RTT ticket;
+		// rename has exactly one winner (the same single-use guarantee the
+		// IndexedDB host gets from its single readwrite transaction).
+		const claim = `${path}.take-${process.pid}-${takeSequence++}`;
+		try {
+			renameSync(path, claim);
+		} catch (error) {
+			if (isErrno(error, "ENOENT")) return null;
+			throw error;
+		}
+		try {
+			return readTicket(claim);
+		} finally {
+			try {
+				unlinkSync(claim);
+			} catch (error) {
+				if (!isErrno(error, "ENOENT")) throw error;
+			}
+		}
 	}
 }
+
+/** Monotonic suffix so concurrent take() claims in one process never collide. */
+let takeSequence = 0;
 
 // Minimal local shapes for the subset of the browser IndexedDB API used
 // below. Declared locally (rather than relying on the DOM lib, which this
@@ -250,7 +270,13 @@ export class IndexedDBTicketStoreHost implements TicketStoreHost {
 			let taken: Uint8Array | null = null;
 			req.onsuccess = () => {
 				const value = req.result;
-				if (!(value instanceof Uint8Array)) return;
+				if (value === undefined) return;
+				if (!(value instanceof Uint8Array)) {
+					// Corrupt or legacy-shaped row: evict it rather than leaving a
+					// permanent tombstone that disables 0-RTT for this authority.
+					store.delete(key);
+					return;
+				}
 				taken = value.slice();
 				store.delete(key);
 			};

@@ -34,6 +34,16 @@ export const ABSOLUTE_PATH_PATTERN = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
 const HOST_PATH_ANYWHERE_PATTERN =
 	/(?:\/(?:Users|home|private|tmp|Volumes|root)\/|\/var\/folders\/|(?:^|[\s"'=(;,])[A-Za-z]:[\\/]|\\\\[^\\/\s]+\\|%USERPROFILE%|%TEMP%|\$HOME\b|\$TMPDIR\b|(?:^|\s)~\/)/i;
 
+/** Any embedded multi-segment absolute POSIX path, regardless of its root.
+ * The named-root list above documents the common cases, but a self-hosted or
+ * containerized runner rooted at /opt, /srv, /builds, /workspace, … must not
+ * slip through just because its root is not enumerated. URL paths do not match:
+ * the character before a scheme's `//` is `:`, which is deliberately absent
+ * from the prefix class. Single-segment values (`/`, `/cert-hash`) stay legal
+ * for the public-value allowlist. */
+const EMBEDDED_ABSOLUTE_PATH_PATTERN =
+	/(?:^|[\s"'=(;,])\/(?:[A-Za-z0-9._+-]+\/)+[A-Za-z0-9._+-]+/;
+
 /**
  * Genuinely public protocol values that are path-shaped. Kept as exact strings
  * so the exemption cannot widen into a subtree escape hatch.
@@ -69,6 +79,8 @@ export function unsafeStringReason(value: string): string | undefined {
 	if (ABSOLUTE_PATH_PATTERN.test(value)) return "absolute host path";
 	if (HOST_PATH_ANYWHERE_PATTERN.test(value))
 		return "home or temporary directory path";
+	if (EMBEDDED_ABSOLUTE_PATH_PATTERN.test(value))
+		return "embedded absolute path";
 	return undefined;
 }
 
@@ -121,7 +133,10 @@ export function findPrivacyViolations(document: unknown): PrivacyViolation[] {
 }
 
 function sanitizeString(value: string, repoRoot: string): string {
-	if (unsafeStringReason(value) === undefined) return value;
+	// Reroot unconditionally: gating the replacement on the value first being
+	// classified unsafe meant a repo path under an unrecognized root (/opt,
+	// /srv, …) was published verbatim. Rerooting a safe value is a no-op —
+	// an absolute repoRoot cannot occur inside a value that classified safe.
 	const rerooted =
 		repoRoot.length > 0
 			? value.replaceAll(repoRoot, REPO_ROOT_PLACEHOLDER)
@@ -149,7 +164,10 @@ export function sanitizeEvidenceDocument(
 		if (typeof node === "string") return sanitizeString(node, normalizedRoot);
 		if (Array.isArray(node)) return node.map(visit);
 		if (node === null || typeof node !== "object") return node;
-		const result: Record<string, unknown> = {};
+		// Null prototype: assigning a JSON-sourced "__proto__" member through a
+		// plain object literal hits the prototype setter and silently drops the
+		// entry instead of copying it.
+		const result: Record<string, unknown> = Object.create(null);
 		for (const [key, entry] of Object.entries(node)) {
 			if (isSecretKey(key) || unsafeStringReason(key) !== undefined) continue;
 			result[key] = visit(entry);

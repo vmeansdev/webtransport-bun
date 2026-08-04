@@ -355,10 +355,9 @@ function packageCommandRunner(): PackageCommandRunner | undefined {
 		: undefined;
 }
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"exact-package smoke kills its hanging runtime descendant and preserves diagnostics",
 	async () => {
-		if (process.platform === "win32") return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-test-"));
 		tempRoots.push(root);
 		const tarball = createFixtureTarball(root);
@@ -392,25 +391,26 @@ test.serial(
 	},
 );
 
-test.serial("win32 taskkill removes a genuine runtime descendant", async () => {
-	if (process.platform !== "win32") return;
-	const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
-	tempRoots.push(root);
-	const descendantPidFile = join(root, "descendant.pid");
-	const child = spawnHangingProcessTree(descendantPidFile);
-	await waitForFile(descendantPidFile);
-	const startedAt = Date.now();
-	await runBoundedWindowsTreeKill(child.pid as number, 5_000);
+test.serial.skipIf(process.platform !== "win32")(
+	"win32 taskkill removes a genuine runtime descendant",
+	async () => {
+		const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
+		tempRoots.push(root);
+		const descendantPidFile = join(root, "descendant.pid");
+		const child = spawnHangingProcessTree(descendantPidFile);
+		await waitForFile(descendantPidFile);
+		const startedAt = Date.now();
+		await runBoundedWindowsTreeKill(child.pid as number, 5_000);
 
-	expect(Date.now() - startedAt).toBeLessThan(7_000);
-	await expectPidExit(child.pid as number);
-	await expectProcessExit(descendantPidFile);
-});
+		expect(Date.now() - startedAt).toBeLessThan(7_000);
+		await expectPidExit(child.pid as number);
+		await expectProcessExit(descendantPidFile);
+	},
+);
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"mocked win32 tree cleanup bounds taskkill and removes a genuine descendant",
 	async () => {
-		if (process.platform === "win32") return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-smoke-win32-test-"));
 		tempRoots.push(root);
 		const descendantPidFile = join(root, "descendant.pid");
@@ -455,10 +455,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"win32 tree cleanup rejects when taskkill cannot start",
 	async () => {
-		if (process.platform === "win32") return;
 		const root = mkdtempSync(
 			join(tmpdir(), "wt-package-smoke-missing-taskkill-"),
 		);
@@ -473,10 +472,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"win32 tree cleanup rejects nonzero taskkill without claiming a live descendant was removed",
 	async () => {
-		if (process.platform === "win32") return;
 		const root = mkdtempSync(
 			join(tmpdir(), "wt-package-smoke-failing-taskkill-"),
 		);
@@ -504,10 +502,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"bounded command reports unproven win32 cleanup and uses its direct-child fallback",
 	async () => {
-		if (process.platform === "win32") return;
 		const runPackageCommand = packageCommandRunner();
 		if (!runPackageCommand) return;
 		const root = mkdtempSync(
@@ -544,10 +541,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"posix cleanup stops waiting once the process tree has exited",
 	async () => {
-		if (process.platform === "win32") return;
 		const runPackageCommand = packageCommandRunner();
 		if (!runPackageCommand) return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-prompt-"));
@@ -576,10 +572,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"posix cleanup proves descendant exit before reporting the timeout",
 	async () => {
-		if (process.platform === "win32") return;
 		const runPackageCommand = packageCommandRunner();
 		if (!runPackageCommand) return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-proof-"));
@@ -610,10 +605,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"posix cleanup reports descendant exit unproven when it cannot prove the tree died",
 	async () => {
-		if (process.platform === "win32") return;
 		const runPackageCommand = packageCommandRunner();
 		if (!runPackageCommand) return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-unproven-"));
@@ -640,10 +634,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"win32 cleanup does not claim success when taskkill leaves the tree alive",
 	async () => {
-		if (process.platform === "win32") return;
 		const runPackageCommand = packageCommandRunner();
 		if (!runPackageCommand) return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-cleanup-win32-noop-"));
@@ -678,10 +671,9 @@ test.serial(
 	},
 );
 
-test.serial(
+test.serial.skipIf(process.platform === "win32")(
 	"canonical package check bounds a hanging non-smoke npm command",
 	async () => {
-		if (process.platform === "win32") return;
 		const root = mkdtempSync(join(tmpdir(), "wt-package-command-timeout-"));
 		tempRoots.push(root);
 		createHangingNpm(root);

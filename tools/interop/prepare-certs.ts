@@ -37,6 +37,11 @@ export function resolveOpenSSLExecutable(): string {
 		"/usr/bin/openssl",
 		"/opt/homebrew/bin/openssl",
 		"/opt/homebrew/opt/openssl@3/bin/openssl",
+		// Deterministic Windows locations: Git for Windows ships OpenSSL (both
+		// present on GitHub runners), and some images carry a standalone build.
+		"C:\\Program Files\\Git\\usr\\bin\\openssl.exe",
+		"C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe",
+		"C:\\Program Files\\OpenSSL\\bin\\openssl.exe",
 	].filter((candidate): candidate is string => Boolean(candidate));
 	for (const candidate of candidates) {
 		try {
