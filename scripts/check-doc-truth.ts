@@ -83,7 +83,9 @@ type Violation = { location: string; message: string };
 const violations: Violation[] = [];
 
 function report(location: string, message: string): void {
-	violations.push({ location, message });
+	// Violation locations are repo-relative paths consumed by tests and CI
+	// logs; keep them platform-stable (Windows `relative()` yields backslashes).
+	violations.push({ location: location.replaceAll("\\", "/"), message });
 }
 
 function readText(path: string): string | undefined {
