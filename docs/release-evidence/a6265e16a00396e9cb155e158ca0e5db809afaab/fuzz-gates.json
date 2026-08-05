@@ -1,0 +1,34 @@
+{
+ "commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+ "claimId": "fuzz-gates",
+ "createdAt": "2026-08-05T12:59:39.176Z",
+ "status": "passed",
+ "notes": "fuzz release smoke: 8 targets, 30s fixed duration each, 0 crashes. Linux container rust:1.95-bookworm, cargo-fuzz 0.13.2, llvm-symbolizer present. Includes the endpoint_event_dispatch session-establishment drift assertion.",
+ "runner": "linux-container-wt-linux (rust:1.95-bookworm, aarch64)",
+ "command": [
+  "bash",
+  "-c",
+  "bun run fuzz:release-smoke"
+ ],
+ "startedAt": "2026-08-05T12:59:39.176Z",
+ "endedAt": "2026-08-05T12:59:39.176Z",
+ "durationMs": 240000,
+ "exitCode": 0,
+ "artifactSha256": "9ab0ac2809b8d94367ba3b987e0ac3e802751a5157dfa4917566936fae266348",
+ "toolchain": {
+  "rust": "1.95.0",
+  "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+  "cargoFuzz": "cargo-fuzz 0.13.2",
+  "llvmSymbolizer": "/usr/bin/llvm-symbolizer"
+ },
+ "targets": [
+  "h3_frames",
+  "qpack_huffman",
+  "der_metadata",
+  "cert_pin_policy",
+  "handle_allocator",
+  "endpoint_event_dispatch",
+  "event_encode",
+  "limit_arithmetic"
+ ]
+}
