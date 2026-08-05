@@ -111,20 +111,15 @@ export class FileTicketStoreHost implements TicketStoreHost {
 		let fd: number | undefined;
 		let renamed = false;
 		try {
-			// No mode argument on Windows: it is meaningless there (the POSIX
-			// tightening below is already skipped), and Bun 1.3.9 on Windows
-			// fails the open with a spurious ENOENT when a mode is passed.
+			// String flags, not numeric constants: Bun 1.3.9 on Windows fails an
+			// openSync with numeric O_CREAT|O_EXCL|O_WRONLY flags with a spurious
+			// ENOENT (1.3.14 is fine); "wx" is the same create-exclusive-write
+			// contract on every platform. Mode is meaningless on Windows (the
+			// POSIX tightening below is already skipped there).
 			fd =
 				process.platform === "win32"
-					? openSync(
-							tmp,
-							constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-						)
-					: openSync(
-							tmp,
-							constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-							POSIX_TICKET_FILE_MODE,
-						);
+					? openSync(tmp, "wx")
+					: openSync(tmp, "wx", POSIX_TICKET_FILE_MODE);
 			writeFileSync(fd, ticket);
 			if (process.platform !== "win32") {
 				fchmodSync(fd, POSIX_TICKET_FILE_MODE);

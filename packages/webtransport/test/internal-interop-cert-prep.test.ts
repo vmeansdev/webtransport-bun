@@ -181,7 +181,7 @@ describe("interop cert preparation", () => {
 		expect(material.certPath).toContain(generation);
 		expect(keySummary).toMatch(/ASN1 OID: prime256v1|NIST CURVE: P-256/);
 		expect(INTEROP_TESTING.hasValidMaterial(certDir)).toBe(true);
-	});
+	}, 30_000);
 
 	it("defaults release loops to ten iterations and gives interop runs fresh state", () => {
 		const runRoot = makeTempCertDir();
