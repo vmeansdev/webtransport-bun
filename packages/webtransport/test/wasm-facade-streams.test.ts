@@ -313,6 +313,35 @@ describe("wasm facade incoming streams", () => {
 		expect(incoming.calls).toEqual(["pause", "stop:0"]);
 		expect(retained.released).toBe(true);
 	});
+
+	// The cancel reason IS the STOP_SENDING application code, matching what the
+	// native facade does with the same reason. Dropping it silently degraded
+	// every W3C stop-sending code to 0 on this backend.
+	test("cancelling an incoming readable sends STOP_SENDING with the reason's code", async () => {
+		const cases: Array<{ reason: unknown; expected: string }> = [
+			{ reason: 41, expected: "stop:41" },
+			{ reason: { streamErrorCode: 41 }, expected: "stop:41" },
+			{ reason: { code: 41 }, expected: "stop:41" },
+			{ reason: new Error("boom"), expected: "stop:0" },
+		];
+
+		for (const { reason, expected } of cases) {
+			const scripted = scriptedSession();
+			const facade = new WasmWebTransport(scripted.session);
+			const incoming = scriptedStream(false);
+
+			const reader = facade.incomingUnidirectionalStreams.getReader();
+			const pending = readWithin(reader.read(), "incoming uni read");
+			await Bun.sleep(1);
+			scripted.pushIncoming(incoming.stream);
+			const readable = (await pending).value;
+			reader.releaseLock();
+			if (!readable) throw new Error("incoming uni stream missing");
+
+			await readable.cancel(reason);
+			expect(incoming.calls).toEqual([expected]);
+		}
+	});
 });
 
 describe("wasm facade writable lifecycle", () => {
@@ -337,6 +366,29 @@ describe("wasm facade writable lifecycle", () => {
 		const reasonWritable = await facade.createUnidirectionalStream();
 		await reasonWritable.getWriter().abort(new Error("boom"));
 		expect(other.calls).toEqual(["reset:0"]);
+	});
+
+	test("aborting a stream writable also accepts the object reason form", async () => {
+		const byStreamErrorCode = scriptedStream(false);
+		const byCode = scriptedStream(false);
+		const streams = [byStreamErrorCode, byCode];
+		let index = 0;
+		const scripted = scriptedSession({
+			openUni: () => {
+				const next = streams[index++];
+				if (!next) throw new Error("no scripted stream left");
+				return next.stream;
+			},
+		});
+		const facade = new WasmWebTransport(scripted.session);
+
+		const first = await facade.createUnidirectionalStream();
+		await first.getWriter().abort({ streamErrorCode: 37 });
+		expect(byStreamErrorCode.calls).toEqual(["reset:37"]);
+
+		const second = await facade.createUnidirectionalStream();
+		await second.getWriter().abort({ code: 37 });
+		expect(byCode.calls).toEqual(["reset:37"]);
 	});
 
 	test("an incoming readable surfaces a peer reset with the peer's code", async () => {
