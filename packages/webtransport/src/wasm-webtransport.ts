@@ -15,6 +15,7 @@ import {
 	E_QUEUE_FULL,
 	E_SESSION_CLOSED,
 	E_STREAM_RESET,
+	extractStreamErrorCode,
 	WebTransportError,
 } from "./errors.js";
 import { SendScheduler, type SendPolicy } from "./send-scheduler.js";
@@ -233,10 +234,12 @@ function streamReadable(
 				pullPending = true;
 				deliver();
 			},
-			cancel() {
+			cancel(reason) {
 				cancelled = true;
 				releasePending();
-				stream.stop(0);
+				// STOP_SENDING carries the cancel reason's application code, the same
+				// mapping the native facade applies to `readable.cancel()`.
+				stream.stop(extractStreamErrorCode(reason));
 			},
 		},
 		new CountQueuingStrategy({ highWaterMark: 0 }),
@@ -268,8 +271,7 @@ function streamWritable(
 			stream.finish();
 		},
 		abort(reason) {
-			const code = typeof reason === "number" ? reason : 0;
-			stream.reset(code);
+			stream.reset(extractStreamErrorCode(reason));
 		},
 	});
 }

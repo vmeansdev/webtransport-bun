@@ -97,6 +97,7 @@ import {
 	E_STREAM_RESET,
 	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
+	extractStreamErrorCode,
 	WebTransportError,
 } from "./errors.js";
 import type {
@@ -3756,20 +3757,6 @@ function nodeDuplexToWebBidi(
 		strictW3CErrors,
 	);
 	return Promise.resolve({ readable, writable });
-}
-
-/** Extract QUIC application error code from abort/cancel reason. */
-function extractStreamErrorCode(reason: unknown): number {
-	if (typeof reason === "number" && Number.isInteger(reason)) return reason;
-	const o =
-		reason && typeof reason === "object"
-			? (reason as Record<string, unknown>)
-			: null;
-	if (o) {
-		const c = (o.streamErrorCode ?? o.code) as unknown;
-		if (typeof c === "number" && Number.isInteger(c)) return c;
-	}
-	return 0;
 }
 
 function nodeReadableToWebReadable(

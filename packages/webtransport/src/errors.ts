@@ -72,6 +72,27 @@ export class WebTransportError extends Error {
 	}
 }
 
+/**
+ * Extract the QUIC application error code from an abort/cancel reason.
+ *
+ * Shared by both backends so `writable.abort(reason)` (RESET_STREAM) and
+ * `readable.cancel(reason)` (STOP_SENDING) map a reason to a code identically
+ * on native and wasm. Accepts a bare integer or anything carrying
+ * `streamErrorCode`/`code`; anything else (including no reason) means 0.
+ */
+export function extractStreamErrorCode(reason: unknown): number {
+	if (typeof reason === "number" && Number.isInteger(reason)) return reason;
+	const o =
+		reason && typeof reason === "object"
+			? (reason as Record<string, unknown>)
+			: null;
+	if (o) {
+		const c = (o.streamErrorCode ?? o.code) as unknown;
+		if (typeof c === "number" && Number.isInteger(c)) return c;
+	}
+	return 0;
+}
+
 function codeToSource(code: ErrorCode): WebTransportErrorSource {
 	switch (code) {
 		case E_STREAM_RESET:
