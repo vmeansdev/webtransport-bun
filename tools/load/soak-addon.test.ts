@@ -994,9 +994,12 @@ describe("soak trend analysis", () => {
 		expect(
 			result.failures.some((failure) => failure.includes("recovery sessions")),
 		).toBe(true);
+		// Per-phase stream recovery was removed deliberately (churn variance
+		// under the continuous main load); stuck streams are asserted by the
+		// run-final streamsActive===0 requirement instead.
 		expect(
 			result.failures.some((failure) => failure.includes("recovery streams")),
-		).toBe(true);
+		).toBe(false);
 	});
 
 	test("rejects overload recovery that leaves fd sessions and streams elevated", () => {
