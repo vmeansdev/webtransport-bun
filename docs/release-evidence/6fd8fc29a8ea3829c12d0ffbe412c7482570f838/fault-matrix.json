@@ -1,0 +1,18 @@
+{
+ "commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+ "claimId": "fault-matrix",
+ "createdAt": "2026-08-05T14:53:40.568Z",
+ "status": "passed",
+ "notes": "Seeded UDP fault matrix at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.fault.config.ts"
+ ],
+ "startedAt": "2026-08-05T14:53:36.475Z",
+ "endedAt": "2026-08-05T14:53:40.568Z",
+ "durationMs": 4094,
+ "exitCode": 0,
+ "artifactSha256": "f3bb9f4bf5d73dbbeb60d642e86595da2876bd696b553490328a083de58ecfd7"
+}

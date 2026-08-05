@@ -1,0 +1,29 @@
+{
+ "commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+ "claimId": "iwa-direct-sockets",
+ "createdAt": "2026-08-05T14:58:13.145Z",
+ "status": "passed",
+ "notes": "Hosted IWA Direct Sockets proof at the candidate (workflow iwa.yml run 31017227184, candidate_commit-pinned checkout): the wasm WebTransport server AND client ran inside a signed, developer-mode-installed Isolated Web App (isolated-app:// origin, crossOriginIsolated, Direct Sockets UDPSocket) on BOTH the pinned Playwright Chromium 145.0.7632.6 and Chrome Beta 152.0.7977.13. Functional: datagram/bidi/uni echo, RESET_STREAM code 37 via writable.abort, STOP_SENDING code 41 via readable.cancel (provable only since the shared extractStreamErrorCode parity fix in this candidate), peer close 4100, 8 reconnects, certificate rotation with the stale pin rejected. Ephemeral Ed25519 signing key; signed+unsigned bundle hashes recorded in the embedded evidence. artifactSha256 is the SHA-256 of the primary evidence.json; the chrome-beta evidence sha256 is chromeBetaEvidenceSha256.",
+ "runner": "github-hosted ubuntu-latest (xvfb)",
+ "command": [
+  "gh",
+  "workflow",
+  "iwa.yml",
+  "run-id",
+  "31017227184"
+ ],
+ "startedAt": "2026-08-05T14:58:12.968Z",
+ "endedAt": "2026-08-05T14:58:15.194Z",
+ "durationMs": 0,
+ "exitCode": 0,
+ "artifactSha256": "6961c8531560f9187b46b804c144c70cd405d339fb0526e75d0716703aa76017",
+ "chromeBetaEvidenceSha256": "c682ab180a162080b4fb51ea2e207adc81d7c730ed8c8863027fb9b96287350c",
+ "signedBundleSha256": "d3cfe4b478f581fb3b81bb49c278b5070256c3e6557554bd4f5a8f550a13c294",
+ "unsignedBundleSha256": "e82086fc17bea80fb4c88e45c6a4495e6ba88ec97162bc3e7dbe51cd70ef82f5",
+ "origin": "isolated-app://smzqbic2jehfazkdgupyyawks44fhsise6vmpbrzv2tu5mwatfyaaaic",
+ "ciRun": {
+  "id": 31017227184,
+  "url": "https://github.com/vmeansdev/webtransport-bun/actions/runs/31017227184",
+  "conclusion": "success"
+ }
+}
