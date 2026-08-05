@@ -1,0 +1,18 @@
+{
+ "commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+ "claimId": "wasm-0rtt",
+ "createdAt": "2026-08-05T14:53:11.134Z",
+ "status": "passed",
+ "notes": "Timed bun test wasm-0rtt against the wasm dist at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-0rtt.test.ts"
+ ],
+ "startedAt": "2026-08-05T14:53:08.337Z",
+ "endedAt": "2026-08-05T14:53:11.134Z",
+ "durationMs": 2798,
+ "exitCode": 0,
+ "artifactSha256": "699ec8ba7cb403b881b28eea13ea34b845a096790064940c9b2246e95cf318b2"
+}
