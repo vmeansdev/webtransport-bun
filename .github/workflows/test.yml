@@ -61,8 +61,13 @@ jobs:
       # reconnect/rotation phases and their recovery windows run around it,
       # for ~7 minutes wall (measured in container and on CI — the run that
       # hit the old 5-minute bound was healthy and mid-phase).
+      # Right-sized to the shared runner like the load job: the default
+      # 500-session campaign saturates it (queued bytes climb monotonically —
+      # under-provisioned drain, not a leak) and drowns the trend rules'
+      # signal. These are soak-long's "small" capacity-profile numbers; the
+      # full-scale campaign runs on the dedicated soak-long lane.
       - name: Soak (2 min main load)
-        run: SOAK_DURATION=120 bun tools/load/soak-addon.ts
+        run: SOAK_DURATION=120 SOAK_SESSIONS=150 SOAK_DATAGRAMS_PER_SEC=150 SOAK_STREAMS_PER_SEC=2 bun tools/load/soak-addon.ts
         timeout-minutes: 12
   wasm:
     name: WASM backend + Chromium interop
