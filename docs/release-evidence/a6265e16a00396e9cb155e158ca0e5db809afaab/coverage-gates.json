@@ -1,0 +1,25 @@
+{
+ "commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+ "claimId": "coverage-gates",
+ "createdAt": "2026-08-05T13:02:05Z",
+ "status": "passed",
+ "notes": "Hosted coverage workflow green at the candidate: cargo llvm-cov --branch (RUSTC_BOOTSTRAP=1 on pinned stable 1.95.0) risk-module floors 90/90/80 for native limits/server/session/spawn_tracked and wasm governor/h3/endpoint/cert/verify, plus Bun lcov floors 90/90 for backend.ts/backend-wasm.ts/wasm-webtransport.ts, with the zero-branch-sites vacuity guard active. Measured this candidate: session.rs 97.41/95.42/88.04, wasm-webtransport.ts 100/100. Coverage artifacts retained 90 days on the run. artifactSha256 is the SHA-256 of the captured GitHub run-metadata snapshot.",
+ "runner": "github-hosted ubuntu-latest",
+ "command": [
+  "gh",
+  "workflow",
+  "coverage.yml",
+  "run-id",
+  "31007489605"
+ ],
+ "startedAt": "2026-08-05T12:51:32Z",
+ "endedAt": "2026-08-05T13:02:05Z",
+ "durationMs": 0,
+ "exitCode": 0,
+ "artifactSha256": "54b0232e7b8936c4db8da2e6b82eaed962b43a88c4b528488610415169306c9a",
+ "ciRun": {
+  "id": 31007489605,
+  "url": "https://github.com/vmeansdev/webtransport-bun/actions/runs/31007489605",
+  "conclusion": "success"
+ }
+}

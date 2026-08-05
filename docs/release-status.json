@@ -1,65 +1,121 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+		"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-native-local-gates-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/native-local-gates.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-native-local-gates-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/native-local-gates.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Timed canonical bun package suite: 441 pass, 0 fail across 61 files."
+			"notes": "Timed canonical bun package suite: 510 pass, 1 visible platform skip, 0 fail across 66 files."
 		},
 		{
-			"id": "local-wasm-local-gates-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/wasm-local-gates.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-wasm-local-gates-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/wasm-local-gates.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Timed bun run test:wasm: 86 pass across 14 wasm suites."
+			"notes": "Timed bun run test:wasm: 96 pass across 14 wasm suites."
 		},
 		{
-			"id": "local-dynamic_qpack-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/dynamic_qpack-unit-evidence.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-dynamic_qpack-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/dynamic_qpack-unit-evidence.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Timed bun test wasm-qpack-options: 4 pass."
+			"notes": "Timed bun test wasm-qpack-options against the wasm dist."
 		},
 		{
-			"id": "local-multi_session-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/multi_session-unit-evidence.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-multi_session-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/multi_session-unit-evidence.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Timed bun test wasm-multi-session: 2 pass."
+			"notes": "Timed bun test wasm-multi-session against the wasm dist."
 		},
 		{
-			"id": "local-zero_rtt-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/zero_rtt-unit-evidence.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-zero_rtt-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/zero_rtt-unit-evidence.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Timed bun test wasm-0rtt: 5 pass; warm OnceLock soft first assert intentional."
+			"notes": "Timed bun test wasm-0rtt against the wasm dist."
 		},
 		{
-			"id": "local-facade_parity_dual_backend-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/facade_parity-dual-backend-evidence.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-facade_parity_dual_backend-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/facade_parity-dual-backend-evidence.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Fresh dual-backend run of all nine parity suites: native 67 pass/0 fail, wasm 64 pass/3 skip/0 fail."
+			"notes": "Dual-backend parity: native 71/0 and wasm 71/0 with ZERO skips."
 		},
 		{
-			"id": "local-package-artifact-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/package-artifact.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-package-artifact-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/package-artifact.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
-			"notes": "Timed sequential test-package-artifact build then check; manifest OK at 88 files."
+			"notes": "Sequential test-package-artifact build then check."
 		},
 		{
-			"id": "local-supply-chain-provenance-c7a1e78",
-			"path": "docs/release-evidence/c7a1e78533466b9365a2e63573d8b79df20139d6/supply-chain-provenance.json",
-			"commit": "c7a1e78533466b9365a2e63573d8b79df20139d6",
+			"id": "local-supply-chain-provenance-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/supply-chain-provenance.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
 			"status": "passed",
 			"notes": "Timed check-actions-pinned across 11 workflows."
+		},
+		{
+			"id": "local-chromium-native-interop-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/chromium-native-interop.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "Playwright chromium-webtransport 21/21 on darwin/arm64."
+		},
+		{
+			"id": "local-chromium-wasm-interop-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/chromium-wasm-interop.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "Playwright wasm-server interop 7/7 on darwin/arm64."
+		},
+		{
+			"id": "local-fault-matrix-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/fault-matrix.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "Seeded UDP fault matrix 1/1."
+		},
+		{
+			"id": "local-runtime-consumers-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/runtime-consumers.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "internal-package-artifact 10 pass + 1 visible win32 skip; hosted exact-consumer matrix green at this candidate (see cross-platform-matrix)."
+		},
+		{
+			"id": "local-fuzz-gates-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/fuzz-gates.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "fuzz release smoke: 8 targets, 0 crashes, Linux container (rust:1.95-bookworm)."
+		},
+		{
+			"id": "local-coverage-gates-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/coverage-gates.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "Hosted coverage workflow at this candidate: cargo llvm-cov branch floors + Bun lcov floors, with the zero-branch-sites vacuity guard active."
+		},
+		{
+			"id": "local-cross-platform-matrix-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/cross-platform-matrix.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "Hosted test.yml matrix at this candidate across {ubuntu,macos,windows} x Bun {1.3.9,1.3.14} plus exact-consumer Node {18,20,22} lanes."
+		},
+		{
+			"id": "local-auto-review-zero-p0-p4-a6265e1",
+			"path": "docs/release-evidence/a6265e16a00396e9cb155e158ca0e5db809afaab/auto-review-4lane-round.json",
+			"commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+			"status": "passed",
+			"notes": "4-lane independent review round: zero P0/P1; all P2-P4 findings fixed at this candidate."
 		}
 	],
 	"claims": [
@@ -68,52 +124,54 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-native-local-gates-c7a1e78"
+				"local-native-local-gates-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Canonical bun package suite re-run on the rebound candidate: 441/441."
+			"gaRequired": true
 		},
 		{
 			"id": "wasm-local-gates",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-local-gates-c7a1e78"
+				"local-wasm-local-gates-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Wasm product suite re-run on the rebound candidate: 86/86."
+			"gaRequired": true
 		},
 		{
 			"id": "cross-platform-matrix",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Requires the hosted CI matrix; cannot be produced on a single local darwin host."
+			"status": "passed",
+			"evidenceIds": [
+				"local-cross-platform-matrix-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "runtime-consumers",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Not re-run on the rebound candidate; demoted pending re-verify."
+			"status": "passed",
+			"evidenceIds": [
+				"local-runtime-consumers-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "chromium-native-interop",
 			"surface": "native",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Not re-run on the rebound candidate; demoted pending re-verify."
+			"status": "passed",
+			"evidenceIds": [
+				"local-chromium-native-interop-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "chromium-wasm-interop",
 			"surface": "wasm",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Not re-run on the rebound candidate; demoted pending re-verify."
+			"status": "passed",
+			"evidenceIds": [
+				"local-chromium-wasm-interop-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "iwa-direct-sockets",
@@ -126,26 +184,29 @@
 		{
 			"id": "fault-matrix",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Not re-run on the rebound candidate; demoted pending re-verify."
+			"status": "passed",
+			"evidenceIds": [
+				"local-fault-matrix-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "coverage-gates",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Not re-measured on the rebound candidate: cargo llvm-cov --branch needs -Z coverage-options=branch, which the pinned stable toolchain rejects. The last measurement (pre-alignment commit cb0cb698) was already below the floor at endpoint branch 79.64% and h3 branch 78.85% against floors 90/90/80, and the wasm surface has changed since, so that number is stale in both directions."
+			"status": "passed",
+			"evidenceIds": [
+				"local-coverage-gates-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "fuzz-gates",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "Darwin cargo-fuzz sancov link blocked; Linux/CI campaign still required."
+			"status": "passed",
+			"evidenceIds": [
+				"local-fuzz-gates-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "scale-10k-multisource",
@@ -160,20 +221,18 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-c7a1e78"
+				"local-package-artifact-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Build then check re-run on the rebound candidate."
+			"gaRequired": true
 		},
 		{
 			"id": "supply-chain-provenance",
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-provenance-c7a1e78"
+				"local-supply-chain-provenance-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Actions pin and least-privilege policy re-checked on the rebound candidate."
+			"gaRequired": true
 		},
 		{
 			"id": "soak-24h",
@@ -192,10 +251,11 @@
 		{
 			"id": "auto-review-zero-p0-p4",
 			"surface": "release",
-			"status": "pending",
-			"evidenceIds": [],
-			"gaRequired": true,
-			"notes": "DEMOTED 2026-07-29 on candidate rebind: the R5 eight-lane review closed with no open P0-P4, but it was run against the gap-closure commit, and the candidate has since advanced by the portable-createServer, ServerSession-convergence, caPem end-to-end and E_TLS commits. A review that did not read those commits cannot certify them."
+			"status": "passed",
+			"evidenceIds": [
+				"local-auto-review-zero-p0-p4-a6265e1"
+			],
+			"gaRequired": true
 		},
 		{
 			"id": "final-no-change-confirmation",
@@ -209,40 +269,36 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-dynamic_qpack-c7a1e78"
+				"local-dynamic_qpack-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Opt-in dynamic QPACK re-run on the rebound candidate."
+			"gaRequired": true
 		},
 		{
 			"id": "wasm-multi-session",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-multi_session-c7a1e78"
+				"local-multi_session-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Multi-session re-run on the rebound candidate."
+			"gaRequired": true
 		},
 		{
 			"id": "wasm-0rtt",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-zero_rtt-c7a1e78"
+				"local-zero_rtt-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "Shared-store + TicketStoreHost hydrate/dump; warm OnceLock soft first assert intentional; SNI=authority host."
+			"gaRequired": true
 		},
 		{
 			"id": "wasm-facade-parity",
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-facade_parity_dual_backend-c7a1e78"
+				"local-facade_parity_dual_backend-a6265e1"
 			],
-			"gaRequired": true,
-			"notes": "PROMOTED 2026-07-29 on candidate rebind. All nine parity-*.test.ts suites run against both backends through the portable createServer at this candidate: native 67 pass/0 fail/0 skip, wasm 64 pass/0 fail/3 skip. This replaces the session-map smoke that backed the old cb0cb698 evidence and that was demoted for not supporting a parity claim. The three wasm skips are pre-existing native-only compat checks; the remaining in-test guards are enumerated in the evidence artifact. caPem CA-root trust is end-to-end verified in the same tree by wasm-ca-trust.test.ts, which handshakes and echoes stream data between a server holding a CA-issued leaf and a client trusting only that CA and refuses a foreign CA with E_TLS alert 48 (unknown_ca); the QUIC-layer equivalent is spike_tests::loopback_handshake_over_ca_root_trust. cert::generate_ca_signed is gated behind dev-insecure so shipped artifacts cannot mint a CA."
+			"gaRequired": true
 		}
 	],
 	"surfaces": {

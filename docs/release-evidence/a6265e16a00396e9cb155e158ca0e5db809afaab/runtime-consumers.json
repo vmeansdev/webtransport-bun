@@ -1,0 +1,18 @@
+{
+ "commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+ "claimId": "runtime-consumers",
+ "createdAt": "2026-08-05T12:55:29.375Z",
+ "status": "passed",
+ "notes": "Timed internal-package-artifact suite (exact-consumer tarball, process-tree reap proof) at the rebound candidate; the hosted matrix ran the same candidate's exact-package consumers across {ubuntu,macos,windows}x{Node 18.20.4,20.19.0,22.23.1} — see the cross-platform-matrix evidence run.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun test packages/webtransport/test/internal-package-artifact.test.ts"
+ ],
+ "startedAt": "2026-08-05T12:55:18.143Z",
+ "endedAt": "2026-08-05T12:55:29.375Z",
+ "durationMs": 11232,
+ "exitCode": 0,
+ "artifactSha256": "a19071d633b4f0114a2430015a6af1abfca8aea2b8ca8a6c85b89d49073046b1"
+}
