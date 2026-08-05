@@ -21,6 +21,7 @@ import {
 const ROOT = join(import.meta.dir, "..", "..");
 const HARNESS = join(import.meta.dir, "soak-addon.ts");
 const WORKFLOW = join(ROOT, ".github", "workflows", "soak-long.yml");
+const VALIDATOR = join(ROOT, "scripts", "validate-soak-inputs.sh");
 const tempRoots: string[] = [];
 
 type SegmentArtifact = Parameters<typeof aggregateSegments>[0][number];
@@ -556,19 +557,31 @@ describe("hosted soak orchestration policy", () => {
 		expect(workflow).toContain(
 			"github.event.inputs.runner_type == 'github-hosted' && 300 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4350 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1470 || 365)",
 		);
-		expect(workflow).toContain('"github-hosted:24:5"');
-		expect(workflow).toContain('"github-hosted:72:15"');
-		expect(workflow).toContain('"self-hosted:24:1"');
-		expect(workflow).toContain('"self-hosted:72:1"');
+		// Segment policy moved into the input validator when runner_mode was
+		// added; the combos are asserted there, mode-explicitly.
+		const validator = readFileSync(VALIDATOR, "utf8");
+		for (const combo of [
+			"github-hosted:shared:24:5",
+			"github-hosted:dedicated:24:5",
+			"github-hosted:shared:72:15",
+			"github-hosted:dedicated:72:15",
+			"self-hosted:shared:24:1",
+			"self-hosted:dedicated:24:1",
+			"self-hosted:shared:72:1",
+			"self-hosted:dedicated:72:1",
+		]) {
+			expect(validator).toContain(`"${combo}"`);
+		}
 		expect(workflow).not.toContain("44640");
 	});
 
 	test("permits one-run self-hosted long soaks while retaining hosted segmentation", () => {
 		const workflow = readFileSync(WORKFLOW, "utf8");
-		expect(workflow).toContain('"self-hosted:24:1"');
-		expect(workflow).toContain('"self-hosted:72:1"');
-		expect(workflow).toContain('"github-hosted:24:5"');
-		expect(workflow).toContain('"github-hosted:72:15"');
+		const validator = readFileSync(VALIDATOR, "utf8");
+		expect(validator).toContain('"self-hosted:shared:24:1"');
+		expect(validator).toContain('"self-hosted:dedicated:72:1"');
+		expect(validator).toContain('"github-hosted:shared:24:5"');
+		expect(validator).toContain('"github-hosted:dedicated:72:15"');
 		expect(workflow).toContain(
 			"24h/72h github-hosted campaigns must use bounded multi-job segments",
 		);
@@ -646,7 +659,7 @@ describe("soak trend analysis", () => {
 			{
 				ts_ms: 240_000,
 				phase: "recovery",
-				rss: 170,
+				rss: 230,
 				heapUsedMb: 39,
 				fd: 13,
 				sockets: 8,
@@ -659,7 +672,7 @@ describe("soak trend analysis", () => {
 			{
 				ts_ms: 300_000,
 				phase: "recovery",
-				rss: 168,
+				rss: 260,
 				heapUsedMb: 38,
 				fd: 13,
 				sockets: 8,
@@ -684,9 +697,9 @@ describe("soak trend analysis", () => {
 			512 * 1024 * 1024,
 		);
 		expect(result.pass).toBe(false);
-		expect(result.failures.some((failure) => failure.includes("RSS"))).toBe(
-			true,
-		);
+		expect(
+			result.failures.some((failure) => failure.includes("charged memory")),
+		).toBe(true);
 	});
 
 	test("rejects recovery that leaves heap and sockets above baseline", () => {
@@ -940,7 +953,7 @@ describe("soak trend analysis", () => {
 				fd: 15,
 				sockets: 2,
 				sessions: 16,
-				streams: 24,
+				streams: 64,
 				sessionTasks: 0,
 				streamTasks: 0,
 				queued: 0,
@@ -953,7 +966,7 @@ describe("soak trend analysis", () => {
 				fd: 15,
 				sockets: 2,
 				sessions: 16,
-				streams: 24,
+				streams: 64,
 				sessionTasks: 0,
 				streamTasks: 0,
 				queued: 0,

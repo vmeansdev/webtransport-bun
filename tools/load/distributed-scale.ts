@@ -1846,7 +1846,7 @@ function getRssMb() {
  * moment, so it overstates process cost after page-in-heavy load. Returns
  * null off-macOS or if the syscall is unavailable.
  */
-const readPhysFootprintMb: () => number | null = (() => {
+export const readPhysFootprintMb: () => number | null = (() => {
 	if (process.platform === "linux") {
 		// Linux charged analog: Rss minus LazyFree (MADV_FREE'd pages stay in
 		// Rss until reclaim but are not charged; smaps_rollup reports them).
