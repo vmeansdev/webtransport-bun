@@ -18,6 +18,9 @@ const summary = await runScaleCampaign({
 	maxRssMb: 4096,
 	maxRecoveryRssRatio: 100,
 	maxFairnessGap: 1,
+	maxStreamErrorRate: Number(
+		process.env.LOAD_SCALE_MAX_STREAM_ERROR_RATE ?? "0",
+	),
 	p99HandshakeMs: 100000,
 	p99DatagramEnqueueMs: 100000,
 	p99StreamOpenMs: 100000,
