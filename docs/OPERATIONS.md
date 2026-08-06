@@ -176,6 +176,20 @@ When `queuedBytesGlobal` rises and stays high:
 2. Check `queuedBytesGlobal` in metrics—high queue can inflate RSS.
 3. Run `bun run test:soak-addon` with `SOAK_DURATION=300`; if RSS grows linearly, suspect leak.
 
+**Raw RSS vs charged memory on long-running servers.** The native backend
+uses a whole-program allocator (mimalloc) that keeps freed pages as
+reclaimable `MADV_FREE` arenas rather than returning them to the OS
+immediately. On a many-hour run this makes **raw RSS climb even when the
+process's charged/working-set memory is flat** — harmless with headroom, but
+on a memory-constrained host the kernel OOM-killer counts raw RSS and can
+kill an otherwise-healthy server. Call `releaseNativeMemory()` (which runs
+`mi_collect` and returns those arenas to the OS) **periodically** — e.g. every
+few minutes on a timer — for servers that run for hours on small instances.
+It is safe under live traffic (proven non-disruptive by the RSS soak) and is
+what the soak harness itself does via `SOAK_RELIEF_INTERVAL_MS`. Provision at
+least ~2× the observed steady-state RSS, and always configure swap on small
+instances.
+
 ## Troubleshooting
 1) Browser cannot connect
 - Verify UDP port open

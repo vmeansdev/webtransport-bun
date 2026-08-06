@@ -87,6 +87,17 @@ const OVERLAP_SKEW_MS = parseInt(
 );
 const SEGMENT_MAX_SECONDS = 6 * 60 * 60;
 const DEFAULT_SAMPLE_INTERVAL_MS = 30_000;
+// Return the native allocator's MADV_FREE'd arenas to the OS periodically
+// during the long main-load stretch. The charged-memory metric (Rss minus
+// LazyFree) already excludes those pages, but the kernel OOM-killer counts
+// raw RSS, so on a memory-constrained host a many-hour run grows raw RSS
+// unboundedly and is OOM-killed even though its charged footprint is flat.
+// This is the same releaseNativeMemory() a long-running production server
+// should call periodically; the phase-boundary relief only fires at the
+// sparse phase edges. Env-tunable, off when set to 0.
+const RELIEF_INTERVAL_MS = Number(
+	process.env.SOAK_RELIEF_INTERVAL_MS ?? String(5 * 60_000),
+);
 const CHILD_EXIT_GRACE_MS = Math.max(
 	1,
 	parseInt(process.env.SOAK_CHILD_EXIT_GRACE_MS ?? "10000", 10),
@@ -188,6 +199,8 @@ export type Sample = {
 	ts_ms: number;
 	phase: string;
 	rss: number;
+	/** Raw RSS (what the OOM-killer sees); rss stays the charged metric. */
+	rawRssMb?: number;
 	heapUsedMb: number;
 	fd: number;
 	sockets: number;
@@ -1843,6 +1856,7 @@ async function runSegment(): Promise<void> {
 	let activePhase = "baseline";
 	let peakSessions = 0;
 	let peakStreams = 0;
+	let lastReliefAtMs = Date.now();
 
 	// Forensics for long campaigns: every sample also streams to a JSONL
 	// sidecar as it is taken, and SIGTERM/SIGINT flush a partial artifact.
@@ -1905,8 +1919,11 @@ async function runSegment(): Promise<void> {
 				ts_ms: Date.now(),
 				phase: activePhase,
 				// Charged metric (see getChargedMb): trend and recovery rules run
-				// on what the OS charges, not on retained-arena RSS.
+				// on what the OS charges, not on retained-arena RSS. Raw RSS is
+				// recorded alongside for forensics (it is what the OOM-killer
+				// sees).
 				rss: getChargedMb(),
+				rawRssMb: getRssMb(),
 				heapUsedMb: getHeapUsedMb(),
 				fd: await getFdCount(process.pid),
 				sockets: await getSocketCount(process.pid),
@@ -1924,6 +1941,18 @@ async function runSegment(): Promise<void> {
 				throw new Error(
 					`queuedBytesGlobal ${metrics.queuedBytesGlobal} exceeded ${DEFAULT_LIMITS.maxQueuedBytesGlobal}`,
 				);
+			}
+			if (
+				RELIEF_INTERVAL_MS > 0 &&
+				Date.now() - lastReliefAtMs >= RELIEF_INTERVAL_MS
+			) {
+				try {
+					releaseNativeMemory();
+				} catch {
+					// Relief is best-effort.
+				}
+				Bun.gc(false);
+				lastReliefAtMs = Date.now();
 			}
 			await sleep(DEFAULT_SAMPLE_INTERVAL_MS);
 		}
