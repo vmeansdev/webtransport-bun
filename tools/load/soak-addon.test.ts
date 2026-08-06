@@ -659,7 +659,7 @@ describe("soak trend analysis", () => {
 			{
 				ts_ms: 240_000,
 				phase: "recovery",
-				rss: 230,
+				rss: 300,
 				heapUsedMb: 39,
 				fd: 13,
 				sockets: 8,
@@ -672,7 +672,7 @@ describe("soak trend analysis", () => {
 			{
 				ts_ms: 300_000,
 				phase: "recovery",
-				rss: 260,
+				rss: 340,
 				heapUsedMb: 38,
 				fd: 13,
 				sockets: 8,

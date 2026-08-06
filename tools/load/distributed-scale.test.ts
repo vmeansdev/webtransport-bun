@@ -866,6 +866,7 @@ function validConfig(): ScaleCampaignConfig {
 		maxRssMb: 256,
 		maxRecoveryRssRatio: 1.25,
 		maxFairnessGap: 0.1,
+		maxStreamErrorRate: 0,
 		p99HandshakeMs: 100,
 		p99DatagramEnqueueMs: 10,
 		p99StreamOpenMs: 20,

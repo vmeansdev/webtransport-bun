@@ -31,6 +31,9 @@ async function main() {
 			process.env.LOAD_SCALE_MAX_RECOVERY_RSS_RATIO ?? "1.25",
 		),
 		maxFairnessGap: Number(process.env.LOAD_SCALE_MAX_FAIRNESS_GAP ?? "0.05"),
+		maxStreamErrorRate: Number(
+			process.env.LOAD_SCALE_MAX_STREAM_ERROR_RATE ?? "0",
+		),
 		p99HandshakeMs: Number(process.env.LOAD_SCALE_P99_HANDSHAKE_MS ?? "300"),
 		p99DatagramEnqueueMs: Number(
 			process.env.LOAD_SCALE_P99_DATAGRAM_MS ?? "10",

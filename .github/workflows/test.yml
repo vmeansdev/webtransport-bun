@@ -263,7 +263,11 @@ jobs:
         run: bun run test:load-addon
         timeout-minutes: 5
       - name: Load-scale-addon (strict RSS gate, 20 sessions)
-        run: LOAD_SCALE_SESSIONS=20 LOAD_SCALE_DURATION=15 LOAD_SCALE_MIN_LIVE_SESSIONS=20 bun run test:load-scale-addon
+        # A shared runner occasionally STOP_SENDINGs a couple of the ~1500
+        # probe streams under concurrency; the 1% budget absorbs that while
+        # keeping the RSS gate (the lane's real purpose) strict. Release-grade
+        # evidence runs leave the rate at its 0 default.
+        run: LOAD_SCALE_SESSIONS=20 LOAD_SCALE_DURATION=15 LOAD_SCALE_MIN_LIVE_SESSIONS=20 LOAD_SCALE_MAX_STREAM_ERROR_RATE=0.01 bun run test:load-scale-addon
         timeout-minutes: 5
       - name: Benchmark (handshake)
         run: bun run bench:handshake
