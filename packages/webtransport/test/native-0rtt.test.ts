@@ -28,6 +28,11 @@ import {
 } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
+// Real 0-RTT handshake + resumption round trips; the 5s default is too tight
+// on the slowest shared lane (macOS + Bun 1.3.9). A functional failure still
+// throws well within this bound.
+const HANDSHAKE_TEST_TIMEOUT_MS = process.env.CI ? 20_000 : 10_000;
+
 function clientOpts(serverName: string, enable0Rtt = false): ClientOptions {
 	return {
 		tls: { insecureSkipVerify: true, serverName },
@@ -81,206 +86,238 @@ async function primeTicket(port: number, serverName: string): Promise<void> {
 }
 
 describe("native 0-RTT", () => {
-	it("sessions report no 0-RTT involvement when the feature is off", async () => {
-		const port = nextPort(24310, 2000);
-		const serverSessions: ServerSession[] = [];
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: (session) => {
-				serverSessions.push(session);
-			},
-		});
-		try {
-			const client = await connectWithRetry(
-				`https://127.0.0.1:${port}`,
-				clientOpts("no-0rtt.test"),
-			);
-			expect(client.has0Rtt).toBe(false);
-			expect(client.accepted0Rtt).toBe(false);
-			expect(client.handshakeConfirmed).toBe(true);
-			expect(await waitUntil(() => serverSessions.length === 1, 3000)).toBe(
-				true,
-			);
-			expect(serverSessions[0]!.has0Rtt).toBe(false);
-			expect(serverSessions[0]!.accepted0Rtt).toBe(false);
-			expect(serverSessions[0]!.handshakeConfirmed).toBe(true);
-			client.close();
-		} finally {
-			await server.close();
-		}
-	});
+	it(
+		"sessions report no 0-RTT involvement when the feature is off",
+		async () => {
+			const port = nextPort(24310, 2000);
+			const serverSessions: ServerSession[] = [];
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				onSession: (session) => {
+					serverSessions.push(session);
+				},
+			});
+			try {
+				const client = await connectWithRetry(
+					`https://127.0.0.1:${port}`,
+					clientOpts("no-0rtt.test"),
+				);
+				expect(client.has0Rtt).toBe(false);
+				expect(client.accepted0Rtt).toBe(false);
+				expect(client.handshakeConfirmed).toBe(true);
+				expect(await waitUntil(() => serverSessions.length === 1, 3000)).toBe(
+					true,
+				);
+				expect(serverSessions[0]!.has0Rtt).toBe(false);
+				expect(serverSessions[0]!.accepted0Rtt).toBe(false);
+				expect(serverSessions[0]!.handshakeConfirmed).toBe(true);
+				client.close();
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 
-	it("rejects enable0Rtt combined with allowPooling", async () => {
-		const port = nextPort(24320, 2000);
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			onSession: () => {},
-		});
-		try {
-			await expect(
-				connect(`https://127.0.0.1:${port}`, {
-					...clientOpts("reject-pool.test", true),
-					allowPooling: true,
-				}),
-			).rejects.toThrow(/E_INTERNAL.*enable0Rtt.*allowPooling/);
-		} finally {
-			await server.close();
-		}
-	});
+	it(
+		"rejects enable0Rtt combined with allowPooling",
+		async () => {
+			const port = nextPort(24320, 2000);
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				onSession: () => {},
+			});
+			try {
+				await expect(
+					connect(`https://127.0.0.1:${port}`, {
+						...clientOpts("reject-pool.test", true),
+						allowPooling: true,
+					}),
+				).rejects.toThrow(/E_INTERNAL.*enable0Rtt.*allowPooling/);
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 
-	it("resumed reconnect rides 0-RTT: client offers early data and it is accepted", async () => {
-		const port = nextPort(24330, 2000);
-		const name = "resume.test";
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			enable0Rtt: true,
-			allowEarlySession: true, // observe without the deferral for this test
-			onSession: () => {},
-		});
-		try {
-			await primeTicket(port, name);
+	it(
+		"resumed reconnect rides 0-RTT: client offers early data and it is accepted",
+		async () => {
+			const port = nextPort(24330, 2000);
+			const name = "resume.test";
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				enable0Rtt: true,
+				allowEarlySession: true, // observe without the deferral for this test
+				onSession: () => {},
+			});
+			try {
+				await primeTicket(port, name);
 
-			// Second connect must offer the ticket as early data and have it
-			// accepted by the same-process server (deterministic client-side).
-			const second = await connect(
-				`https://127.0.0.1:${port}`,
-				clientOpts(name, true),
-			);
-			expect(second.has0Rtt).toBe(true);
-			expect(await waitUntil(() => second.handshakeConfirmed, 3000)).toBe(true);
-			expect(second.accepted0Rtt).toBe(true);
-			second.close();
-			await second.closed;
-		} finally {
-			await server.close();
-		}
-	});
+				// Second connect must offer the ticket as early data and have it
+				// accepted by the same-process server (deterministic client-side).
+				const second = await connect(
+					`https://127.0.0.1:${port}`,
+					clientOpts(name, true),
+				);
+				expect(second.has0Rtt).toBe(true);
+				expect(await waitUntil(() => second.handshakeConfirmed, 3000)).toBe(
+					true,
+				);
+				expect(second.accepted0Rtt).toBe(true);
+				second.close();
+				await second.closed;
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 
-	it("a plain (non-resumed) connect never offers early data even with enable0Rtt", async () => {
-		const port = nextPort(24335, 2000);
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			enable0Rtt: true,
-			onSession: () => {},
-		});
-		try {
-			const first = await connectWithRetry(
-				`https://127.0.0.1:${port}`,
-				clientOpts("fresh.test", true),
-			);
-			expect(first.has0Rtt).toBe(false);
-			expect(first.handshakeConfirmed).toBe(true);
-			first.close();
-			await first.closed;
-		} finally {
-			await server.close();
-		}
-	});
+	it(
+		"a plain (non-resumed) connect never offers early data even with enable0Rtt",
+		async () => {
+			const port = nextPort(24335, 2000);
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				enable0Rtt: true,
+				onSession: () => {},
+			});
+			try {
+				const first = await connectWithRetry(
+					`https://127.0.0.1:${port}`,
+					clientOpts("fresh.test", true),
+				);
+				expect(first.has0Rtt).toBe(false);
+				expect(first.handshakeConfirmed).toBe(true);
+				first.close();
+				await first.closed;
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 
-	it("defers onSession until the handshake is confirmed (default replay-safety policy)", async () => {
-		const port = nextPort(24350, 2000);
-		const name = "deferred.test";
-		const confirmedAtCallback: boolean[] = [];
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			enable0Rtt: true,
-			// allowEarlySession omitted -> deferred default.
-			onSession: (session) => {
-				confirmedAtCallback.push(session.handshakeConfirmed);
-			},
-		});
-		try {
-			await primeTicket(port, name);
+	it(
+		"defers onSession until the handshake is confirmed (default replay-safety policy)",
+		async () => {
+			const port = nextPort(24350, 2000);
+			const name = "deferred.test";
+			const confirmedAtCallback: boolean[] = [];
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				enable0Rtt: true,
+				// allowEarlySession omitted -> deferred default.
+				onSession: (session) => {
+					confirmedAtCallback.push(session.handshakeConfirmed);
+				},
+			});
+			try {
+				await primeTicket(port, name);
 
-			const second = await connect(
-				`https://127.0.0.1:${port}`,
-				clientOpts(name, true),
-			);
-			expect(second.has0Rtt).toBe(true);
-			expect(
-				await waitUntil(() => confirmedAtCallback.length === 2, 3000),
-			).toBe(true);
-			// Invariant: under the default policy a session is never surfaced
-			// to onSession before its handshake is confirmed, whether or not the
-			// server happened to read the request as 0-RTT. This is the gate
-			// that makes the replayable session request safe by default.
-			expect(confirmedAtCallback.every((c) => c === true)).toBe(true);
-			second.close();
-			await second.closed;
-		} finally {
-			await server.close();
-		}
-	});
+				const second = await connect(
+					`https://127.0.0.1:${port}`,
+					clientOpts(name, true),
+				);
+				expect(second.has0Rtt).toBe(true);
+				expect(
+					await waitUntil(() => confirmedAtCallback.length === 2, 3000),
+				).toBe(true);
+				// Invariant: under the default policy a session is never surfaced
+				// to onSession before its handshake is confirmed, whether or not the
+				// server happened to read the request as 0-RTT. This is the gate
+				// that makes the replayable session request safe by default.
+				expect(confirmedAtCallback.every((c) => c === true)).toBe(true);
+				second.close();
+				await second.closed;
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 
-	it("allowEarlySession still establishes a working resumed session", async () => {
-		const port = nextPort(24360, 2000);
-		const name = "early.test";
-		let sessionCount = 0;
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			enable0Rtt: true,
-			allowEarlySession: true,
-			onSession: () => {
-				sessionCount++;
-			},
-		});
-		try {
-			await primeTicket(port, name);
+	it(
+		"allowEarlySession still establishes a working resumed session",
+		async () => {
+			const port = nextPort(24360, 2000);
+			const name = "early.test";
+			let sessionCount = 0;
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				enable0Rtt: true,
+				allowEarlySession: true,
+				onSession: () => {
+					sessionCount++;
+				},
+			});
+			try {
+				await primeTicket(port, name);
 
-			const second = await connect(
-				`https://127.0.0.1:${port}`,
-				clientOpts(name, true),
-			);
-			expect(second.has0Rtt).toBe(true);
-			expect(await waitUntil(() => second.handshakeConfirmed, 3000)).toBe(true);
-			expect(second.accepted0Rtt).toBe(true);
-			expect(await waitUntil(() => sessionCount === 2, 3000)).toBe(true);
-			second.close();
-			await second.closed;
-		} finally {
-			await server.close();
-		}
-	});
+				const second = await connect(
+					`https://127.0.0.1:${port}`,
+					clientOpts(name, true),
+				);
+				expect(second.has0Rtt).toBe(true);
+				expect(await waitUntil(() => second.handshakeConfirmed, 3000)).toBe(
+					true,
+				);
+				expect(second.accepted0Rtt).toBe(true);
+				expect(await waitUntil(() => sessionCount === 2, 3000)).toBe(true);
+				second.close();
+				await second.closed;
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 
-	it("vault export/import is an opaque, consume-once, process-local round trip", async () => {
-		const port = nextPort(24340, 2000);
-		const name = "vault.test";
-		const server = createServer({
-			port,
-			tls: { certPem: "", keyPem: "" },
-			enable0Rtt: true,
-			onSession: () => {},
-		});
-		try {
-			await primeTicket(port, name);
+	it(
+		"vault export/import is an opaque, consume-once, process-local round trip",
+		async () => {
+			const port = nextPort(24340, 2000);
+			const name = "vault.test";
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				enable0Rtt: true,
+				onSession: () => {},
+			});
+			try {
+				await primeTicket(port, name);
 
-			const identity = clientOpts(name, true);
-			const token = exportTicketVault(identity, name);
-			expect(token).toBeString();
-			// Draining twice yields nothing.
-			expect(exportTicketVault(identity, name)).toBeNull();
-			// Import restores the tickets; the token is consumed.
-			expect(importTicketVault(token!, identity)).toBe(true);
-			expect(importTicketVault(token!, identity)).toBe(false);
-			// Unknown tokens are refused.
-			expect(importTicketVault("wt0rtt-vault-bogus", identity)).toBe(false);
+				const identity = clientOpts(name, true);
+				const token = exportTicketVault(identity, name);
+				expect(token).toBeString();
+				// Draining twice yields nothing.
+				expect(exportTicketVault(identity, name)).toBeNull();
+				// Import restores the tickets; the token is consumed.
+				expect(importTicketVault(token!, identity)).toBe(true);
+				expect(importTicketVault(token!, identity)).toBe(false);
+				// Unknown tokens are refused.
+				expect(importTicketVault("wt0rtt-vault-bogus", identity)).toBe(false);
 
-			// The re-imported tickets still resume.
-			const resumed = await connect(
-				`https://127.0.0.1:${port}`,
-				clientOpts(name, true),
-			);
-			expect(resumed.has0Rtt).toBe(true);
-			resumed.close();
-			await resumed.closed;
-		} finally {
-			await server.close();
-		}
-	});
+				// The re-imported tickets still resume.
+				const resumed = await connect(
+					`https://127.0.0.1:${port}`,
+					clientOpts(name, true),
+				);
+				expect(resumed.has0Rtt).toBe(true);
+				resumed.close();
+				await resumed.closed;
+			} finally {
+				await server.close();
+			}
+		},
+		HANDSHAKE_TEST_TIMEOUT_MS,
+	);
 });
