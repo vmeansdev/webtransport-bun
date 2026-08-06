@@ -15,10 +15,11 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	appendFileSync,
 	existsSync,
 	mkdirSync,
-	readdirSync,
 	readFileSync,
+	readdirSync,
 	readlinkSync,
 	realpathSync,
 	statSync,
@@ -1843,6 +1844,58 @@ async function runSegment(): Promise<void> {
 	let peakSessions = 0;
 	let peakStreams = 0;
 
+	// Forensics for long campaigns: every sample also streams to a JSONL
+	// sidecar as it is taken, and SIGTERM/SIGINT flush a partial artifact.
+	// A host that dies mid-soak (reboot, OOM cascade — systemd sends TERM
+	// before KILL) otherwise leaves NOTHING: the 24h campaign that died at
+	// hour 20 was undiagnosable because all state lived in this process.
+	const samplesOut = artifactsOut.replace(/\.json$/, ".samples.jsonl");
+	writeFileSync(samplesOut, "");
+	const flushPartial = (signal: string) => {
+		try {
+			writeFileSync(
+				artifactsOut,
+				JSON.stringify(
+					{
+						version: 1,
+						status: "aborted",
+						abortSignal: signal,
+						mode: "segment-partial",
+						memoryMetric: MEMORY_METRIC,
+						candidateCommit,
+						segmentIndex,
+						segmentCount,
+						startedAtMs,
+						abortedAtMs: Date.now(),
+						elapsedSec: Math.round((Date.now() - startedAtMs) / 1000),
+						plannedDurationSec: DURATION,
+						activePhase,
+						peakSessions,
+						peakStreams,
+						sampleCount: samples.length,
+						samplesPath: samplesOut,
+						lastSample: samples[samples.length - 1] ?? null,
+						phasesCompleted: phases.map((phase) => ({
+							name: phase.name,
+							pass: phase.pass,
+							notes: phase.notes,
+						})),
+					},
+					null,
+					2,
+				),
+			);
+			console.error(
+				`soak-addon: ${signal} received at ${Math.round((Date.now() - startedAtMs) / 1000)}s — partial artifact flushed to ${artifactsOut}`,
+			);
+		} catch {
+			// Nothing else to do on the way down.
+		}
+		process.exit(143);
+	};
+	process.on("SIGTERM", () => flushPartial("SIGTERM"));
+	process.on("SIGINT", () => flushPartial("SIGINT"));
+
 	const poller = (async () => {
 		while (Date.now() - startedAtMs < (DURATION + 90) * 1000) {
 			const metrics = server.metricsSnapshot();
@@ -1863,6 +1916,10 @@ async function runSegment(): Promise<void> {
 				streamTasks: metrics.streamTasksActive,
 				queued: metrics.queuedBytesGlobal,
 			});
+			appendFileSync(
+				samplesOut,
+				`${JSON.stringify(samples[samples.length - 1])}\n`,
+			);
 			if (metrics.queuedBytesGlobal > DEFAULT_LIMITS.maxQueuedBytesGlobal) {
 				throw new Error(
 					`queuedBytesGlobal ${metrics.queuedBytesGlobal} exceeded ${DEFAULT_LIMITS.maxQueuedBytesGlobal}`,

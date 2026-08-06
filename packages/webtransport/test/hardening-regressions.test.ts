@@ -28,6 +28,13 @@ import {
 } from "./helpers/network.js";
 
 const EMPTY_TLS = { certPem: "", keyPem: "" };
+
+// Per-wave drain deadline for the churn-burst test. Correctness is unaffected
+// — a leaked permit/task/registry entry NEVER returns the gauges to floor and
+// fails at any deadline — but 50 concurrent TLS handshakes + teardowns can
+// exceed 10s of wall clock on the slowest shared lane (macOS + Bun 1.3.9,
+// ~50% of runs there). Same CI scaling the adversarial harness already uses.
+const WAVE_DEADLINE_MS = process.env.CI ? 30_000 : 10_000;
 const INSECURE = { tls: { insecureSkipVerify: true } } as const;
 
 // Rate limits high enough that a burst of connects/streams is never throttled.
@@ -261,7 +268,7 @@ describe("hardening regressions", () => {
 						m.sessionTasksActive === 0 &&
 						m.streamsActive === 0 &&
 						m.queuedBytesGlobal === 0,
-					10000,
+					WAVE_DEADLINE_MS,
 					25,
 					`wave ${w} lifecycle gauges did not return to floor`,
 				);
@@ -279,7 +286,7 @@ describe("hardening regressions", () => {
 				await waitFor(
 					() => closedIds.size,
 					(n) => n === acceptedIds.size,
-					10000,
+					WAVE_DEADLINE_MS,
 					25,
 					`wave ${w} closed events delivered (${closedIds.size}/${acceptedIds.size})`,
 				);
