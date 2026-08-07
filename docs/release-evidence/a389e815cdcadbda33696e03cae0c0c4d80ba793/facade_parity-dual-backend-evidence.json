@@ -1,0 +1,47 @@
+{
+ "id": "local-facade_parity_dual_backend-a389e81",
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "wasm-facade-parity",
+ "generatedAt": "2026-08-07",
+ "status": "passed",
+ "runner": "local-darwin-arm64",
+ "harness": "bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+ "what": "Fresh dual-backend run of all nine parity-*.test.ts suites at the rebound candidate. Since the T7 error-parity work the wasm selector runs with ZERO skips (was 3 at the prior candidate).",
+ "runs": [
+  {
+   "selector": "native",
+   "command": "bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+   "files": 9,
+   "tests": 71,
+   "pass": 71,
+   "fail": 0,
+   "skip": 0,
+   "startedAt": "2026-08-06T15:44:40.453Z",
+   "endedAt": "2026-08-06T15:44:46.980Z",
+   "durationMs": 6529,
+   "exitCode": 0
+  },
+  {
+   "selector": "wasm",
+   "command": "WEBTRANSPORT_PARITY_BACKEND=wasm WEBTRANSPORT_REQUIRE_WASM=1 bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+   "files": 9,
+   "tests": 71,
+   "pass": 71,
+   "fail": 0,
+   "skip": 0,
+   "startedAt": "2026-08-06T15:44:47.020Z",
+   "endedAt": "2026-08-06T15:44:48.116Z",
+   "durationMs": 1096,
+   "exitCode": 0
+  }
+ ],
+ "antiGaming": {
+  "requireWasmEnvSet": true,
+  "executedWasmTestCount": 71,
+  "zeroWasmSkips": true,
+  "logsSha256": {
+   "native": "edc92c2cf484486aad08349850ed623f1596d719dd08a661c4c9b7a5651f88f1",
+   "wasm": "4f1ecacf4bbe5a1a418ca7dffb9ae9cb32eafe30f6c28503ad83fdf0b5d0f9fe"
+  }
+ }
+}

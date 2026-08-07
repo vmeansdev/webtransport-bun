@@ -1,126 +1,126 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+		"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-native-local-gates-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/native-local-gates.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-native-local-gates-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/native-local-gates.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Timed canonical bun package suite: 510 pass, 1 visible platform skip, 0 fail across 66 files."
 		},
 		{
-			"id": "local-wasm-local-gates-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/wasm-local-gates.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-wasm-local-gates-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/wasm-local-gates.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Timed bun run test:wasm: 96 pass across 14 wasm suites."
 		},
 		{
-			"id": "local-dynamic_qpack-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/dynamic_qpack-unit-evidence.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-dynamic_qpack-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/dynamic_qpack-unit-evidence.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Timed bun test wasm-qpack-options against the wasm dist."
 		},
 		{
-			"id": "local-multi_session-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/multi_session-unit-evidence.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-multi_session-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/multi_session-unit-evidence.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Timed bun test wasm-multi-session against the wasm dist."
 		},
 		{
-			"id": "local-zero_rtt-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/zero_rtt-unit-evidence.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-zero_rtt-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/zero_rtt-unit-evidence.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Timed bun test wasm-0rtt against the wasm dist."
 		},
 		{
-			"id": "local-facade_parity_dual_backend-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/facade_parity-dual-backend-evidence.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-facade_parity_dual_backend-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/facade_parity-dual-backend-evidence.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Dual-backend parity: native 71/0 and wasm 71/0 with ZERO skips."
 		},
 		{
-			"id": "local-package-artifact-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/package-artifact.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-package-artifact-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/package-artifact.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Sequential test-package-artifact build then check."
 		},
 		{
-			"id": "local-supply-chain-provenance-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/supply-chain-provenance.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-supply-chain-provenance-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/supply-chain-provenance.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Timed check-actions-pinned across 11 workflows."
 		},
 		{
-			"id": "local-chromium-native-interop-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/chromium-native-interop.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-chromium-native-interop-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/chromium-native-interop.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Playwright chromium-webtransport 21/21 on darwin/arm64."
 		},
 		{
-			"id": "local-chromium-wasm-interop-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/chromium-wasm-interop.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-chromium-wasm-interop-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/chromium-wasm-interop.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Playwright wasm-server interop 7/7 on darwin/arm64."
 		},
 		{
-			"id": "local-fault-matrix-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/fault-matrix.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-fault-matrix-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/fault-matrix.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Seeded UDP fault matrix 1/1."
 		},
 		{
-			"id": "local-runtime-consumers-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/runtime-consumers.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-runtime-consumers-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/runtime-consumers.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "internal-package-artifact 10 pass + 1 visible win32 skip; hosted exact-consumer matrix green at this candidate (see cross-platform-matrix)."
 		},
 		{
-			"id": "local-fuzz-gates-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/fuzz-gates.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-fuzz-gates-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/fuzz-gates.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "fuzz release smoke: 8 targets, 0 crashes, Linux container (rust:1.95-bookworm)."
 		},
 		{
-			"id": "local-coverage-gates-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/coverage-gates.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-coverage-gates-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/coverage-gates.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Hosted coverage workflow at this candidate: cargo llvm-cov branch floors + Bun lcov floors, with the zero-branch-sites vacuity guard active."
 		},
 		{
-			"id": "local-cross-platform-matrix-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/cross-platform-matrix.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-cross-platform-matrix-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/cross-platform-matrix.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Hosted test.yml FULLY GREEN at this candidate across {ubuntu,macos,windows} x Bun {1.3.9,1.3.14} plus load, soak, parity, wasm, and exact-consumer Node {18,20,22} lanes."
 		},
 		{
-			"id": "local-iwa-direct-sockets-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/iwa-direct-sockets.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-iwa-direct-sockets-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/iwa-direct-sockets.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "Hosted signed-bundle IWA Direct Sockets proof at this candidate on pinned Chromium 145 AND Chrome Beta 152: full functional matrix incl. stop-sending code 41, 8 reconnects, certificate rotation."
 		},
 		{
-			"id": "local-auto-review-zero-p0-p4-6fd8fc2",
-			"path": "docs/release-evidence/6fd8fc29a8ea3829c12d0ffbe412c7482570f838/auto-review-4lane-round.json",
-			"commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+			"id": "local-auto-review-zero-p0-p4-a389e81",
+			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/auto-review-4lane-round.json",
+			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
 			"status": "passed",
 			"notes": "4-lane independent review round: zero P0/P1; all P2-P4 findings fixed at this candidate."
 		}
@@ -131,7 +131,7 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-native-local-gates-6fd8fc2"
+				"local-native-local-gates-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -140,7 +140,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-local-gates-6fd8fc2"
+				"local-wasm-local-gates-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -149,7 +149,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-cross-platform-matrix-6fd8fc2"
+				"local-cross-platform-matrix-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -158,7 +158,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-runtime-consumers-6fd8fc2"
+				"local-runtime-consumers-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -167,7 +167,7 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-native-interop-6fd8fc2"
+				"local-chromium-native-interop-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -176,7 +176,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-wasm-interop-6fd8fc2"
+				"local-chromium-wasm-interop-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -185,7 +185,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-iwa-direct-sockets-6fd8fc2"
+				"local-iwa-direct-sockets-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -194,7 +194,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-fault-matrix-6fd8fc2"
+				"local-fault-matrix-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -203,7 +203,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-coverage-gates-6fd8fc2"
+				"local-coverage-gates-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -212,7 +212,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-fuzz-gates-6fd8fc2"
+				"local-fuzz-gates-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -229,7 +229,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-6fd8fc2"
+				"local-package-artifact-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -238,7 +238,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-provenance-6fd8fc2"
+				"local-supply-chain-provenance-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -261,7 +261,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-auto-review-zero-p0-p4-6fd8fc2"
+				"local-auto-review-zero-p0-p4-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -277,7 +277,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-dynamic_qpack-6fd8fc2"
+				"local-dynamic_qpack-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -286,7 +286,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-multi_session-6fd8fc2"
+				"local-multi_session-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -295,7 +295,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-zero_rtt-6fd8fc2"
+				"local-zero_rtt-a389e81"
 			],
 			"gaRequired": true
 		},
@@ -304,7 +304,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-facade_parity_dual_backend-6fd8fc2"
+				"local-facade_parity_dual_backend-a389e81"
 			],
 			"gaRequired": true
 		}
