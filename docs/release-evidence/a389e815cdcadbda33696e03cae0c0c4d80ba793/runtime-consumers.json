@@ -1,0 +1,18 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "runtime-consumers",
+ "createdAt": "2026-08-06T15:45:46.122Z",
+ "status": "passed",
+ "notes": "Timed internal-package-artifact suite at the rebound candidate; the hosted matrix ran the same candidate's exact-package consumers across {ubuntu,macos,windows}x{Node 18.20.4,20.19.0,22.23.1} — see the cross-platform-matrix evidence run.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun test packages/webtransport/test/internal-package-artifact.test.ts"
+ ],
+ "startedAt": "2026-08-06T15:45:35.121Z",
+ "endedAt": "2026-08-06T15:45:46.122Z",
+ "durationMs": 11001,
+ "exitCode": 0,
+ "artifactSha256": "f6e0aaa72704775cae2a0692cd7e03d4649fe8bdafa7ebb62c0027b92a017bd3"
+}

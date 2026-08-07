@@ -1,0 +1,25 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "coverage-gates",
+ "createdAt": "2026-08-06T15:54:18Z",
+ "status": "passed",
+ "notes": "Hosted coverage workflow green at the candidate: cargo llvm-cov --branch (RUSTC_BOOTSTRAP=1 pinned 1.95.0) risk-module floors 90/90/80 native + wasm, Bun lcov floors 90/90, zero-branch-sites vacuity guard active. artifactSha256 is the SHA-256 of the captured GitHub run-metadata snapshot.",
+ "runner": "github-hosted ubuntu-latest",
+ "command": [
+  "gh",
+  "workflow",
+  "coverage.yml",
+  "run-id",
+  "31117003833"
+ ],
+ "startedAt": "2026-08-06T15:41:37Z",
+ "endedAt": "2026-08-06T15:54:18Z",
+ "durationMs": 0,
+ "exitCode": 0,
+ "artifactSha256": "3fe0d8e9e6c421c857a477a00b38b624cdaa93dc8954f370009f9a2c299957b6",
+ "ciRun": {
+  "id": 31117003833,
+  "url": "https://github.com/vmeansdev/webtransport-bun/actions/runs/31117003833",
+  "conclusion": "success"
+ }
+}
