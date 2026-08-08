@@ -1,0 +1,169 @@
+soak-addon: building load-client (release)...
+..+........+......+....+...+...+.....+......+....+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*..+................+...+.....+.+...+..+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*......+........+...+............+....+...+..+....+..+...+.+.........+..............+......+......+.+..+.......+........+......+.+......+.................+...+....+........+...............+.+......+...+..................+.....+...+....+...........+.+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+..+...+...+.......+...+.........+...+........+.+.....+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*........+...+..+...+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*.+...+.+......+......+..+.+..+...+.+.....+...+................+.....+.+...........+...+....+...+..............+...+...+.......+.....+...............+.+......+.....................+..+.+..+..........+..+......+.......+........+.........................+..+...+...............+....+..+.+........+.+........+......+....+...+.....+...+.+...+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-----
+...........+.+.................+...+..........+.....+.......+..+......+....+...+..+....+.....+............+...+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*.+.........+..+...+................+...+...+...+.........+..+..........+...+...............+.....+.+...........+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*........+.....+...+....+.....+......+.............+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+........+...+...+...+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*...+....+........+...+...+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*....+..+..........+.....+...+....+...+..+.........+.......+..................+.....+.+......+...+..+...+.........+.............+..+.......+........+.......+...........+...+......+.+............+.....+.............+...+......+...+...+..............+...+.+..+.......+..+.+............+..+.+...+..+...+......+...+...+....+...+......+......+.........+..+..........+..+......+.+..................+............+.....+.+............+...+.....+.........+...+.+.....+..........+......+...+..+....+...........+...+.+......+.............................+....+......+.........+..+.............+...+..+.+..+....+.....+...+............+.+.........+...+...+........+.......+...............+..+................+..+..........+........+.+........+............+.+...+.....+....+..+...+..........+......+...........+.............+........+..........+..+......+......+...+............+.+.....+....+....................+......+.......+......+......+...+........+...+.+......+........+.......+...+......+........+.+..+...+...............+.+......+........+....+...+.................+.............+..+..........+..+.+...+..............+...+...+.+......+..+......+.+...+..+.............+......+..+.............+..+...+.+.........+..+.......+.................+...+..........+..+.+.....+...+..........+..+.......+......+......+........+...+....+...........+....+...+...+.........+........+......+.+......+.....+.............+.........+..+......+.............+...............+......+.....+....+......+.....+.+..+...+.........+...+......+......+.............+...+.........+........+.+............+........+..........+.....+......+.+.....+..........+........+....+..+.+..............+....+..+.......+.....+......+..........+..+...+.+...+..+.+..+......+......+.+........+....+.....+.......+...+..+.+........+..........+..+....+...+......+..+...+.........+.+......+......+...+..............+.+.................+...+.+.........+.........+..+...+.+.........+..+......+...+.+...+...+..+.............+.........+.....+.+...+.....+......+.........+....+..+.+...+.........+.....+...+....+.....+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-----
+Certificate request self-signature ok
+subject=CN = localhost
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: bidi handler failed: warn: bidi payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload follow-up timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: uni handler failed: warn: uni payload timed out after 5000ms
+      at <anonymous> (/home/vmeansdev/soak-repro/tools/load/soak-addon.ts:1358:14)
+
+soak-addon: SIGTERM received at 2289s — partial artifact flushed to /home/vmeansdev/soak-repro-artifacts.json

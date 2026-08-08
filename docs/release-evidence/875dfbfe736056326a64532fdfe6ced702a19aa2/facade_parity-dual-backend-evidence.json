@@ -1,0 +1,39 @@
+{
+ "id": "local-facade_parity_dual_backend-875dfbf",
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "wasm-facade-parity",
+ "generatedAt": "2026-08-08",
+ "status": "passed",
+ "runner": "local-darwin-arm64",
+ "harness": "bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+ "what": "Fresh dual-backend run of all nine parity-*.test.ts suites at the rebound candidate; both selectors run with zero skips.",
+ "runs": [
+  {
+   "selector": "native",
+   "command": "bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+   "files": 9,
+   "tests": 71,
+   "pass": 71,
+   "fail": 0,
+   "skip": 0,
+   "startedAt": "2026-08-08T18:05:07.000Z",
+   "endedAt": "2026-08-08T18:05:14.000Z",
+   "durationMs": 7000,
+   "exitCode": 0
+  },
+  {
+   "selector": "wasm",
+   "command": "WEBTRANSPORT_PARITY_BACKEND=wasm WEBTRANSPORT_REQUIRE_WASM=1 bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
+   "files": 9,
+   "tests": 71,
+   "pass": 71,
+   "fail": 0,
+   "skip": 0,
+   "startedAt": "2026-08-08T18:05:14.000Z",
+   "endedAt": "2026-08-08T18:05:16.000Z",
+   "durationMs": 2000,
+   "exitCode": 0
+  }
+ ],
+ "artifactSha256": "59cf2c7174b8ccfc76d5e7e7432ee44802dab1e5e449dd5aecc9849059ef45de"
+}
