@@ -209,6 +209,18 @@ export type Sample = {
 	sessionTasks: number;
 	streamTasks: number;
 	queued: number;
+	/** Anonymous resident pages (Linux /proc/self/status RssAnon). */
+	rssAnonMb?: number;
+	/** Pages swapped out (Linux /proc/self/status VmSwap). RSS-based guards
+	 * are blind to these: the 2026-08-08 24h soak grew ~3.5GB committed while
+	 * sampled RSS stayed ~flat because the kernel swapped cold pages. */
+	vmSwapMb?: number;
+	/** rssAnonMb + vmSwapMb — the number that must stay bounded. */
+	committedMb?: number;
+	/** JSC heap capacity (>= heapUsed; committed JS heap). */
+	heapCapacityMb?: number;
+	/** Live JS object count. */
+	objectCount?: number;
 };
 
 type LoadClientSummary = {
@@ -1247,6 +1259,58 @@ function getHeapUsedMb(): number {
 	}
 }
 
+/** RssAnon + VmSwap from /proc/self/status (null off Linux). Swap-blind RSS
+ * reported ~flat while the 2026-08-08 soak committed 3.5GB. */
+function readProcStatusMemMb(): {
+	rssAnonMb: number;
+	vmSwapMb: number;
+} | null {
+	if (process.platform !== "linux") return null;
+	try {
+		const status = readFileSync("/proc/self/status", "utf8");
+		const grab = (key: string): number | null => {
+			const match = status.match(new RegExp(`^${key}:\\s+(\\d+) kB`, "m"));
+			return match ? Number(match[1]) / 1024 : null;
+		};
+		const rssAnonMb = grab("RssAnon");
+		const vmSwapMb = grab("VmSwap");
+		if (rssAnonMb == null || vmSwapMb == null) return null;
+		return { rssAnonMb, vmSwapMb };
+	} catch {
+		return null;
+	}
+}
+
+const HEAP_DEBUG = process.env.SOAK_HEAP_DEBUG === "1";
+const HEAP_DEBUG_INTERVAL_MS = Number(
+	process.env.SOAK_HEAP_DEBUG_INTERVAL_MS ?? 10 * 60 * 1000,
+);
+
+type JscHeapStats = {
+	heapSize: number;
+	heapCapacity: number;
+	objectCount: number;
+	objectTypeCounts: Record<string, number>;
+};
+
+let jscHeapStats: (() => JscHeapStats) | null | undefined;
+
+function getJscHeapStats(): JscHeapStats | null {
+	if (jscHeapStats === undefined) {
+		try {
+			jscHeapStats = require("bun:jsc").heapStats as () => JscHeapStats;
+		} catch {
+			jscHeapStats = null;
+		}
+	}
+	if (!jscHeapStats) return null;
+	try {
+		return jscHeapStats();
+	} catch {
+		return null;
+	}
+}
+
 async function getSocketCount(pid: number): Promise<number> {
 	try {
 		const procFdDir = `/proc/${pid}/fd`;
@@ -1910,11 +1974,16 @@ async function runSegment(): Promise<void> {
 	process.on("SIGTERM", () => flushPartial("SIGTERM"));
 	process.on("SIGINT", () => flushPartial("SIGINT"));
 
+	let lastHeapDebugAtMs = 0;
 	const poller = (async () => {
 		while (Date.now() - startedAtMs < (DURATION + 90) * 1000) {
 			const metrics = server.metricsSnapshot();
 			peakSessions = Math.max(peakSessions, metrics.sessionsActive);
 			peakStreams = Math.max(peakStreams, metrics.streamsActive);
+			const procMem = readProcStatusMemMb();
+			const heapDebugDue =
+				HEAP_DEBUG && Date.now() - lastHeapDebugAtMs >= HEAP_DEBUG_INTERVAL_MS;
+			const jscStats = heapDebugDue ? getJscHeapStats() : null;
 			samples.push({
 				ts_ms: Date.now(),
 				phase: activePhase,
@@ -1932,7 +2001,30 @@ async function runSegment(): Promise<void> {
 				sessionTasks: metrics.sessionTasksActive,
 				streamTasks: metrics.streamTasksActive,
 				queued: metrics.queuedBytesGlobal,
+				...(procMem
+					? {
+							rssAnonMb: procMem.rssAnonMb,
+							vmSwapMb: procMem.vmSwapMb,
+							committedMb: procMem.rssAnonMb + procMem.vmSwapMb,
+						}
+					: {}),
+				...(jscStats
+					? {
+							heapCapacityMb: jscStats.heapCapacity / (1024 * 1024),
+							objectCount: jscStats.objectCount,
+						}
+					: {}),
 			});
+			if (jscStats) {
+				lastHeapDebugAtMs = Date.now();
+				const top = Object.entries(jscStats.objectTypeCounts)
+					.sort((a, b) => b[1] - a[1])
+					.slice(0, 40);
+				appendFileSync(
+					`${samplesOut}.heap-types.jsonl`,
+					`${JSON.stringify({ ts_ms: Date.now(), phase: activePhase, heapUsedMb: getHeapUsedMb(), top: Object.fromEntries(top) })}\n`,
+				);
+			}
 			appendFileSync(
 				samplesOut,
 				`${JSON.stringify(samples[samples.length - 1])}\n`,
