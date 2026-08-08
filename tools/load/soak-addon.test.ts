@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import {
 	aggregateSegments,
+	bunVersionAtLeast,
 	computeSegmentObservedOperationCounts,
 	evaluateTrendAndRecovery,
 	type Sample,
@@ -80,7 +81,7 @@ function segment(
 		runnerMode: "dedicated",
 		runnerProfile: "large",
 		toolchain: {
-			bun: "1.3.9",
+			bun: "1.3.14",
 			rustc: "rustc 1.95.0",
 			cc: { path: "/usr/bin/clang", version: "clang version 18.1.8" },
 			cxx: { path: "/usr/bin/clang++", version: "clang version 18.1.8" },
@@ -387,6 +388,38 @@ describe("soak campaign integrity", () => {
 		expect(() => aggregateSegments([segment(1), compilerDrift])).toThrow(
 			"toolchain drifted",
 		);
+	});
+
+	test("aggregateSegments rejects segments recorded on a WritableStream-leaking Bun", () => {
+		// Bun <=1.3.13 leaks one WritableStream per rejected writer.close();
+		// a segment recorded there is not evidence regardless of its verdict.
+		const leakyRuntime = segment(1, {
+			toolchain: {
+				bun: "1.3.13",
+				rustc: "rustc 1.95.0",
+				cc: { path: "/usr/bin/clang", version: "clang version 18.1.8" },
+				cxx: { path: "/usr/bin/clang++", version: "clang version 18.1.8" },
+			},
+		});
+		expect(() => aggregateSegments([leakyRuntime])).toThrow(
+			/Bun 1\.3\.13.*requires Bun >= 1\.3\.14/,
+		);
+	});
+
+	test("bunVersionAtLeast is strict and fails closed", () => {
+		expect(bunVersionAtLeast("1.3.14", "1.3.14")).toBe(true);
+		expect(bunVersionAtLeast("1.3.15", "1.3.14")).toBe(true);
+		expect(bunVersionAtLeast("1.4.0", "1.3.14")).toBe(true);
+		expect(bunVersionAtLeast("1.10.0", "1.3.14")).toBe(true);
+		expect(bunVersionAtLeast("2.0.0", "1.3.14")).toBe(true);
+		expect(bunVersionAtLeast("1.3.13", "1.3.14")).toBe(false);
+		expect(bunVersionAtLeast("1.3.9", "1.3.14")).toBe(false);
+		// Prereleases and malformed strings predate or obscure the fix: closed.
+		expect(bunVersionAtLeast("1.3.14-canary.1", "1.3.14")).toBe(false);
+		expect(bunVersionAtLeast("1.4.0-beta", "1.3.14")).toBe(false);
+		expect(bunVersionAtLeast("x.3.14", "1.3.14")).toBe(false);
+		expect(bunVersionAtLeast("1.3", "1.3.14")).toBe(false);
+		expect(bunVersionAtLeast("", "1.3.14")).toBe(false);
 	});
 
 	test("aggregateSegments rejects missing required operation evidence and cleanup drift", () => {
