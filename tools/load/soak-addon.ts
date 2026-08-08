@@ -89,19 +89,35 @@ const SEGMENT_MAX_SECONDS = 6 * 60 * 60;
 const DEFAULT_SAMPLE_INTERVAL_MS = 30_000;
 // Bun <=1.3.13 leaks one WritableStream + rejection Error per server bidi
 // stream whose writer.close() rejects (the STOP_SENDING teardown path every
-// load-bidi stream takes). That leak OOM-killed the 24h soak of run
-// 31134714109 (~670MB/h committed growth). Refuse to generate soak evidence
-// on a runtime known to leak.
+// load-bidi stream takes) — enough to OOM a long soak. Segment evidence must
+// never be generated on such a runtime, and aggregation must reject segments
+// that were.
 const MIN_BUN_VERSION = "1.3.14";
-function assertBunVersion(): void {
-	const parse = (v: string): [number, number, number] => {
-		const parts = v.split(".").map((n) => parseInt(n, 10));
-		return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+
+/** Strict semver floor: every part must be a bare integer. Prereleases and
+ * malformed strings fail closed (a "1.3.14-canary" predates the fix). */
+export function bunVersionAtLeast(actual: string, floor: string): boolean {
+	const parse = (v: string): [number, number, number] | null => {
+		const parts = v.split(".");
+		if (parts.length < 3) return null;
+		const nums = parts
+			.slice(0, 3)
+			.map((p) => (/^\d+$/.test(p) ? Number(p) : Number.NaN));
+		if (nums.some((n) => Number.isNaN(n))) return null;
+		return [nums[0] ?? 0, nums[1] ?? 0, nums[2] ?? 0];
 	};
-	const [maj, min, pat] = parse(Bun.version);
-	const [rMaj, rMin, rPat] = parse(MIN_BUN_VERSION);
-	const cmp = maj - rMaj || min - rMin || pat - rPat;
-	if (Number.isNaN(cmp) || cmp < 0) {
+	const a = parse(actual);
+	const f = parse(floor);
+	if (!a || !f) return false;
+	const cmp = a[0] - f[0] || a[1] - f[1] || a[2] - f[2];
+	return cmp >= 0;
+}
+
+/** Called from runSegment(), not at module load: aggregation and the pure
+ * analysis helpers only read artifacts produced elsewhere and stay importable
+ * on any runtime. */
+function assertBunVersion(): void {
+	if (!bunVersionAtLeast(Bun.version, MIN_BUN_VERSION)) {
 		throw new Error(
 			`soak-addon requires Bun >= ${MIN_BUN_VERSION} (found ${Bun.version}): ` +
 				"older runtimes leak WritableStreams on rejected close and " +
@@ -109,7 +125,20 @@ function assertBunVersion(): void {
 		);
 	}
 }
-assertBunVersion();
+
+/** Evidence-tool env parsing fails closed: a typo'd knob must abort, not
+ * silently disable the guard it configures. */
+function requireNumberEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const value = Number(raw);
+	if (!Number.isFinite(value) || value < 0) {
+		throw new Error(
+			`${name}=${JSON.stringify(raw)} is not a non-negative number`,
+		);
+	}
+	return value;
+}
 // Return the native allocator's MADV_FREE'd arenas to the OS periodically
 // during the long main-load stretch. The charged-memory metric (Rss minus
 // LazyFree) already excludes those pages, but the kernel OOM-killer counts
@@ -235,10 +264,10 @@ export type Sample = {
 	/** Anonymous resident pages (Linux /proc/self/status RssAnon). */
 	rssAnonMb?: number;
 	/** Pages swapped out (Linux /proc/self/status VmSwap). RSS-based guards
-	 * are blind to these: the 2026-08-08 24h soak grew ~3.5GB committed while
-	 * sampled RSS stayed ~flat because the kernel swapped cold pages. */
+	 * are blind to swapped pages, so trend rules gate on committedMb. */
 	vmSwapMb?: number;
-	/** rssAnonMb + vmSwapMb — the number that must stay bounded. */
+	/** rssAnonMb + vmSwapMb — bounded by the committed drift rule and the
+	 * SOAK_COMMITTED_ABORT_MB breaker. */
 	committedMb?: number;
 	/** JSC heap capacity (>= heapUsed; committed JS heap). */
 	heapCapacityMb?: number;
@@ -300,6 +329,10 @@ type PhaseMedianSummary = {
 	fdSlopePerHour: number;
 	socketSlopePerHour: number;
 	queuedSlopeBytesPerHour: number;
+	/** Median committed memory over the samples that carry it (Linux only);
+	 * 0 when no sample in the window has committedMb. */
+	committedMb: number;
+	committedSlopeMbPerHour: number;
 };
 
 type ToolIdentity = {
@@ -328,6 +361,13 @@ export type SegmentMetadata = {
 	runnerType: string;
 	runnerMode: string;
 	runnerProfile: string;
+	/** Debug/guard knobs active during the run — recorded so evidence readers
+	 * can see measurement perturbation (heap-stats scans) and breaker config. */
+	debugKnobs?: {
+		heapDebug: boolean;
+		heapDebugIntervalMs: number;
+		committedAbortMb: number;
+	};
 	toolchain: {
 		bun: string;
 		rustc: string;
@@ -476,6 +516,9 @@ function slopePerHour(
 }
 
 function summarizeWindow(samples: Sample[]): PhaseMedianSummary {
+	const committedSamples = samples.filter(
+		(sample) => sample.committedMb !== undefined,
+	);
 	return {
 		count: samples.length,
 		rssMb: median(samples.map((sample) => sample.rss)),
@@ -492,6 +535,13 @@ function summarizeWindow(samples: Sample[]): PhaseMedianSummary {
 		fdSlopePerHour: slopePerHour(samples, (sample) => sample.fd),
 		socketSlopePerHour: slopePerHour(samples, (sample) => sample.sockets),
 		queuedSlopeBytesPerHour: slopePerHour(samples, (sample) => sample.queued),
+		committedMb: median(
+			committedSamples.map((sample) => sample.committedMb ?? 0),
+		),
+		committedSlopeMbPerHour: slopePerHour(
+			committedSamples,
+			(sample) => sample.committedMb ?? 0,
+		),
 	};
 }
 
@@ -634,6 +684,23 @@ export function evaluateTrendAndRecovery(
 			).toFixed(
 				0,
 			)}% and ${HEAP_TREND_MIN_ABS_MB.toFixed(0)}MB (warm reference)`,
+		);
+	}
+	// Committed memory (RssAnon+VmSwap) is the number the OOM-killer's world
+	// actually bounds. The charged/rss rules alone are swap-blind: a run once
+	// grew ~3.5GB committed while sampled RSS stayed flat because the kernel
+	// swapped cold pages as fast as they accumulated.
+	if (
+		warmReference.committedMb > 0 &&
+		tailSummary.committedMb - warmReference.committedMb >
+			RSS_TREND_MIN_ABS_MB &&
+		tailSummary.committedMb >
+			warmReference.committedMb * (1 + RSS_TREND_MAX_REL)
+	) {
+		failures.push(
+			`committed memory drift ${warmReference.committedMb.toFixed(1)}MB -> ${tailSummary.committedMb.toFixed(1)}MB exceeded ${(
+				RSS_TREND_MAX_REL * 100
+			).toFixed(0)}% and ${RSS_TREND_MIN_ABS_MB.toFixed(0)}MB (warm reference)`,
 		);
 	}
 
@@ -995,6 +1062,15 @@ function validateSegment(segment: SegmentMetadata): void {
 			);
 		}
 	}
+	// Segments recorded on a WritableStream-leaking runtime are not evidence,
+	// no matter what verdict they carry; refuse them at aggregation too, not
+	// just at generation.
+	if (!bunVersionAtLeast(segment.toolchain.bun, MIN_BUN_VERSION)) {
+		throw new Error(
+			`segment ${segment.segmentIndex} was recorded on Bun ${segment.toolchain.bun}; ` +
+				`soak evidence requires Bun >= ${MIN_BUN_VERSION} (WritableStream leak on rejected close)`,
+		);
+	}
 	const expectedHash = sha256Hex({
 		...segment,
 		segmentHash: undefined,
@@ -1305,13 +1381,14 @@ function readProcStatusMemMb(): {
 }
 
 const HEAP_DEBUG = process.env.SOAK_HEAP_DEBUG === "1";
-const HEAP_DEBUG_INTERVAL_MS = Number(
-	process.env.SOAK_HEAP_DEBUG_INTERVAL_MS ?? 10 * 60 * 1000,
+const HEAP_DEBUG_INTERVAL_MS = requireNumberEnv(
+	"SOAK_HEAP_DEBUG_INTERVAL_MS",
+	10 * 60 * 1000,
 );
-/** Debug-run circuit breaker: abort (with evidence flushed) once committed
- * memory crosses this, instead of letting the kernel SIGKILL the process the
- * way run 31134714109 died. 0 = disabled (default; release gates unchanged). */
-const COMMITTED_ABORT_MB = Number(process.env.SOAK_COMMITTED_ABORT_MB ?? 0);
+/** Circuit breaker: abort with a partial artifact flushed once committed
+ * memory (RssAnon+VmSwap) crosses this, instead of riding swap into an
+ * untrappable kernel SIGKILL. 0 = disabled. */
+const COMMITTED_ABORT_MB = requireNumberEnv("SOAK_COMMITTED_ABORT_MB", 0);
 
 type JscHeapStats = {
 	heapSize: number;
@@ -1720,6 +1797,7 @@ function summarizeRuntimeForHash(
 }
 
 async function runSegment(): Promise<void> {
+	assertBunVersion();
 	await cleanupPort();
 	await buildLoadClient();
 
@@ -1956,7 +2034,11 @@ async function runSegment(): Promise<void> {
 	// hour 20 was undiagnosable because all state lived in this process.
 	const samplesOut = artifactsOut.replace(/\.json$/, ".samples.jsonl");
 	writeFileSync(samplesOut, "");
-	const flushPartial = (signal: string) => {
+	// Reset the heap-debug sidecar alongside the samples file: a re-run in the
+	// same workspace must not concatenate onto stale evidence.
+	const heapTypesOut = `${samplesOut}.heap-types.jsonl`;
+	writeFileSync(heapTypesOut, "");
+	const flushPartial = (signal: string, exitCode: number) => {
 		try {
 			writeFileSync(
 				artifactsOut,
@@ -1967,6 +2049,11 @@ async function runSegment(): Promise<void> {
 						abortSignal: signal,
 						mode: "segment-partial",
 						memoryMetric: MEMORY_METRIC,
+						debugKnobs: {
+							heapDebug: HEAP_DEBUG,
+							heapDebugIntervalMs: HEAP_DEBUG_INTERVAL_MS,
+							committedAbortMb: COMMITTED_ABORT_MB,
+						},
 						candidateCommit,
 						segmentIndex,
 						segmentCount,
@@ -1991,15 +2078,23 @@ async function runSegment(): Promise<void> {
 				),
 			);
 			console.error(
-				`soak-addon: ${signal} received at ${Math.round((Date.now() - startedAtMs) / 1000)}s — partial artifact flushed to ${artifactsOut}`,
+				`soak-addon: ${signal} at ${Math.round((Date.now() - startedAtMs) / 1000)}s — partial artifact flushed to ${artifactsOut}`,
 			);
 		} catch {
 			// Nothing else to do on the way down.
 		}
-		process.exit(143);
+		process.exit(exitCode);
 	};
-	process.on("SIGTERM", () => flushPartial("SIGTERM"));
-	process.on("SIGINT", () => flushPartial("SIGINT"));
+	process.on("SIGTERM", () => flushPartial("SIGTERM", 143));
+	process.on("SIGINT", () => flushPartial("SIGINT", 143));
+	// In-loop guard failures must not become unhandled rejections that either
+	// tear the process down with no artifact or sit latent while the run keeps
+	// burning memory: flush the partial artifact and exit immediately.
+	const abortRun = (reason: string): never => {
+		console.error(`soak-addon: aborting segment — ${reason}`);
+		flushPartial(`guard: ${reason}`, 1);
+		throw new Error("unreachable: flushPartial exits");
+	};
 
 	let lastHeapDebugAtMs = 0;
 	const poller = (async () => {
@@ -2008,6 +2103,7 @@ async function runSegment(): Promise<void> {
 			peakSessions = Math.max(peakSessions, metrics.sessionsActive);
 			peakStreams = Math.max(peakStreams, metrics.streamsActive);
 			const procMem = readProcStatusMemMb();
+			const committedMb = procMem ? procMem.rssAnonMb + procMem.vmSwapMb : null;
 			const heapDebugDue =
 				HEAP_DEBUG && Date.now() - lastHeapDebugAtMs >= HEAP_DEBUG_INTERVAL_MS;
 			const jscStats = heapDebugDue ? getJscHeapStats() : null;
@@ -2028,11 +2124,11 @@ async function runSegment(): Promise<void> {
 				sessionTasks: metrics.sessionTasksActive,
 				streamTasks: metrics.streamTasksActive,
 				queued: metrics.queuedBytesGlobal,
-				...(procMem
+				...(procMem && committedMb !== null
 					? {
 							rssAnonMb: procMem.rssAnonMb,
 							vmSwapMb: procMem.vmSwapMb,
-							committedMb: procMem.rssAnonMb + procMem.vmSwapMb,
+							committedMb,
 						}
 					: {}),
 				...(jscStats
@@ -2048,7 +2144,7 @@ async function runSegment(): Promise<void> {
 					.sort((a, b) => b[1] - a[1])
 					.slice(0, 40);
 				appendFileSync(
-					`${samplesOut}.heap-types.jsonl`,
+					heapTypesOut,
 					`${JSON.stringify({ ts_ms: Date.now(), phase: activePhase, heapUsedMb: getHeapUsedMb(), top: Object.fromEntries(top) })}\n`,
 				);
 			}
@@ -2058,15 +2154,15 @@ async function runSegment(): Promise<void> {
 			);
 			if (
 				COMMITTED_ABORT_MB > 0 &&
-				procMem &&
-				procMem.rssAnonMb + procMem.vmSwapMb > COMMITTED_ABORT_MB
+				committedMb !== null &&
+				committedMb > COMMITTED_ABORT_MB
 			) {
-				throw new Error(
-					`committed memory ${(procMem.rssAnonMb + procMem.vmSwapMb).toFixed(0)}MB exceeded SOAK_COMMITTED_ABORT_MB=${COMMITTED_ABORT_MB}`,
+				abortRun(
+					`committed memory ${committedMb.toFixed(0)}MB exceeded SOAK_COMMITTED_ABORT_MB=${COMMITTED_ABORT_MB}`,
 				);
 			}
 			if (metrics.queuedBytesGlobal > DEFAULT_LIMITS.maxQueuedBytesGlobal) {
-				throw new Error(
+				abortRun(
 					`queuedBytesGlobal ${metrics.queuedBytesGlobal} exceeded ${DEFAULT_LIMITS.maxQueuedBytesGlobal}`,
 				);
 			}
@@ -2375,6 +2471,11 @@ async function runSegment(): Promise<void> {
 		runnerType: process.env.SOAK_RUNNER_TYPE ?? "local",
 		runnerMode: process.env.RUNNER_MODE ?? "local",
 		runnerProfile: process.env.SOAK_PROFILE ?? "local",
+		debugKnobs: {
+			heapDebug: HEAP_DEBUG,
+			heapDebugIntervalMs: HEAP_DEBUG_INTERVAL_MS,
+			committedAbortMb: COMMITTED_ABORT_MB,
+		},
 		toolchain: {
 			bun: Bun.version,
 			rustc: readToolVersion("rustc", ["--version"]),
