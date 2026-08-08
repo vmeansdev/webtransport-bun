@@ -844,6 +844,38 @@ function shouldSuppressInsecureSkipVerifyWarning(): boolean {
 	return v === "1" || v === "true" || v === "yes";
 }
 
+// Bun <=1.3.13 permanently retains one WritableStream + one rejection Error
+// for every stream whose close() rejects — e.g. any peer that drops its
+// receive half, which quinn surfaces as STOP_SENDING racing the close. A
+// long-running server on such a runtime leaks until the OOM-killer fires.
+// engines.bun is advisory (npm does not enforce the "bun" key), so the only
+// reliable disclosure is at runtime.
+const LEAKY_BUN_CEILING = "1.3.14";
+let warnedLeakyBunRuntime = false;
+function warnIfLeakyBunRuntime(): void {
+	if (warnedLeakyBunRuntime) return;
+	warnedLeakyBunRuntime = true;
+	const v = process.env.WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN;
+	if (v === "1" || v === "true" || v === "yes") return;
+	if (typeof Bun === "undefined" || typeof Bun.version !== "string") return;
+	const parse = (s: string): number[] | null => {
+		const parts = s.split(".").slice(0, 3);
+		if (parts.length < 3 || parts.some((p) => !/^\d+$/.test(p))) return null;
+		return parts.map(Number);
+	};
+	const actual = parse(Bun.version);
+	const floor = parse(LEAKY_BUN_CEILING);
+	if (!actual || !floor) return;
+	const cmp =
+		(actual[0] ?? 0) - (floor[0] ?? 0) ||
+		(actual[1] ?? 0) - (floor[1] ?? 0) ||
+		(actual[2] ?? 0) - (floor[2] ?? 0);
+	if (cmp >= 0) return;
+	console.warn(
+		`[webtransport] warn: Bun ${Bun.version} leaks one WritableStream per stream whose close is rejected (fixed in Bun ${LEAKY_BUN_CEILING}); long-running servers will exhaust memory — upgrade the runtime`,
+	);
+}
+
 function escapePromLabelValue(v: unknown): string {
 	return String(v)
 		.replace(/\\/g, "\\\\")
@@ -1575,6 +1607,7 @@ class NativeServerSession implements ServerSession {
  * ```
  */
 export function createServer(opts: ServerOptions): WebTransportServer {
+	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
 
 	const decodePem = (value: string | Uint8Array | undefined): string =>
@@ -2281,6 +2314,7 @@ export async function connect(
 	url: string,
 	opts?: ClientOptions,
 ): Promise<ClientSession> {
+	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
 	validateConnectUrl(url, opts?.strictW3CErrors);
 	const serverCertificateHashes = mapServerCertificateHashes(

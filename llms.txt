@@ -21,7 +21,7 @@ authoritative-docs:
   - docs/CI.md : CI and release flow
 
 notes-for-agents:
-  - Target runtime: Bun >= 1.3.9
+  - Target runtime: Bun >= 1.3.14
   - Target OS: macOS + Linux + Windows
   - Respect bounded-memory and deterministic-shutdown constraints
   - Prefer examples under examples/ for runnable integration checks

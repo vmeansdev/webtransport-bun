@@ -114,6 +114,7 @@ Detailed migration playbook:
   `docs/release-status.json` have passing evidence.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
 - Known limits: Chromium-focused browser interop target. Readiness remains pending in `docs/release-status.json` until the external evidence gates close.
+- Known runtime hazard: Bun `<= 1.3.13` permanently leaks one `WritableStream` (plus its rejection `Error`) for every stream whose close is rejected — e.g. any peer that drops its receive half. Long-running servers on those runtimes exhaust memory; the library warns once at startup. Use Bun `>= 1.3.14`.
 
 ## Configured Target Matrix
 

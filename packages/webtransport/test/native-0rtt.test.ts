@@ -29,8 +29,8 @@ import {
 import { nextPort } from "./helpers/network.js";
 
 // Real 0-RTT handshake + resumption round trips; the 5s default is too tight
-// on the slowest shared lane (macOS + Bun 1.3.14). A functional failure still
-// throws well within this bound.
+// on the slowest shared macOS lane (measured on the former Bun 1.3.9 lane).
+// A functional failure still throws well within this bound.
 const HANDSHAKE_TEST_TIMEOUT_MS = process.env.CI ? 20_000 : 10_000;
 
 function clientOpts(serverName: string, enable0Rtt = false): ClientOptions {
