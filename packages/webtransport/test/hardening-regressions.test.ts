@@ -32,8 +32,9 @@ const EMPTY_TLS = { certPem: "", keyPem: "" };
 // Per-wave drain deadline for the churn-burst test. Correctness is unaffected
 // — a leaked permit/task/registry entry NEVER returns the gauges to floor and
 // fails at any deadline — but 50 concurrent TLS handshakes + teardowns can
-// exceed 10s of wall clock on the slowest shared lane (macOS + Bun 1.3.14,
-// ~50% of runs there). Same CI scaling the adversarial harness already uses.
+// exceed 10s of wall clock on the slowest shared macOS lane (~50% of runs,
+// measured on the former Bun 1.3.9 lane; the matrix has since moved to
+// 1.3.14). Same CI scaling the adversarial harness already uses.
 const WAVE_DEADLINE_MS = process.env.CI ? 30_000 : 10_000;
 const INSECURE = { tls: { insecureSkipVerify: true } } as const;
 

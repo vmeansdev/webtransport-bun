@@ -190,6 +190,28 @@ what the soak harness itself does via `SOAK_RELIEF_INTERVAL_MS`. Provision at
 least ~2× the observed steady-state RSS, and always configure swap on small
 instances.
 
+**Committed memory, not RSS, is what the OOM-killer's world bounds.** When
+swap is active the kernel pages out cold anonymous memory, so a leaking
+process can show a flat RSS while `RssAnon + VmSwap` grows without bound.
+The soak harness samples both from `/proc/self/status` (fields `rssAnonMb`,
+`vmSwapMb`, `committedMb` in the samples sidecar) and gates on committed
+drift. Its debug knobs:
+
+- `SOAK_COMMITTED_ABORT_MB` — circuit breaker; the segment aborts with a
+  partial artifact once committed memory crosses this (0 = off). Prefer this
+  on small hosts over letting the kernel SIGKILL with no evidence.
+- `SOAK_HEAP_DEBUG=1` — appends the top JSC object-type counts to a
+  `.heap-types.jsonl` sidecar every `SOAK_HEAP_DEBUG_INTERVAL_MS` (default
+  10 min). Heap scans are stop-the-world: they perturb the measurement, and
+  the knobs are recorded in the segment artifact (`debugKnobs`) so evidence
+  readers can see when they were active.
+
+**Minimum Bun runtime: 1.3.14.** Bun `<= 1.3.13` permanently leaks one
+`WritableStream` + rejection `Error` per stream whose close is rejected
+(peer STOP_SENDING racing a close). The soak harness refuses to record or
+aggregate evidence from older runtimes, and the library warns once at
+startup on them.
+
 ## Troubleshooting
 1) Browser cannot connect
 - Verify UDP port open
