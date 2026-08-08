@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "wasm-local-gates",
+ "createdAt": "2026-08-08T18:05:04.000Z",
+ "status": "passed",
+ "notes": "Full wasm suite (build-wasm + dist + 96 tests across 14 wasm files) green at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun run test:wasm"
+ ],
+ "startedAt": "2026-08-08T18:04:54.000Z",
+ "endedAt": "2026-08-08T18:05:04.000Z",
+ "durationMs": 10000,
+ "exitCode": 0,
+ "artifactSha256": "d12b865002e567f5061fcb8f91ed9a7905f02f9b189572c59c8c7cc3a9153d50"
+}

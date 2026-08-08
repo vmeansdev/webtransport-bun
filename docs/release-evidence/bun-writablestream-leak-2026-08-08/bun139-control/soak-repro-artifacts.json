@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "status": "aborted",
+  "abortSignal": "SIGTERM",
+  "mode": "segment-partial",
+  "memoryMetric": "smaps-lazyfree",
+  "candidateCommit": "5067d47c6edd37824a4e16b7b84325d0a71fae70",
+  "segmentIndex": 1,
+  "segmentCount": 1,
+  "startedAtMs": 1786197236861,
+  "abortedAtMs": 1786199526187,
+  "elapsedSec": 2289,
+  "plannedDurationSec": 7200,
+  "activePhase": "overload",
+  "peakSessions": 100,
+  "peakStreams": 1996,
+  "sampleCount": 70,
+  "samplesPath": "/home/vmeansdev/soak-repro-artifacts.samples.jsonl",
+  "lastSample": {
+    "ts_ms": 1786199505402,
+    "phase": "overload",
+    "rss": 418.57,
+    "rawRssMb": 418.53125,
+    "heapUsedMb": 273.01909160614014,
+    "fd": 33,
+    "sockets": 5,
+    "sessions": 50,
+    "streams": 1,
+    "sessionTasks": 0,
+    "streamTasks": 250,
+    "queued": 2151261,
+    "rssAnonMb": 397.53125,
+    "vmSwapMb": 520.9140625,
+    "committedMb": 918.4453125
+  },
+  "phasesCompleted": [
+    {
+      "name": "steady-state",
+      "pass": true,
+      "notes": []
+    }
+  ]
+}

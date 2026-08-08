@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "dynamic-qpack",
+ "createdAt": "2026-08-08T18:05:04.000Z",
+ "status": "passed",
+ "notes": "wasm dynamic-QPACK options unit evidence re-run at the rebound candidate: 6 pass/0 fail (REQUIRE_WASM + REQUIRE_WASM_DIST).",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-qpack-options.test.ts"
+ ],
+ "startedAt": "2026-08-08T18:05:04.000Z",
+ "endedAt": "2026-08-08T18:05:04.000Z",
+ "durationMs": 0,
+ "exitCode": 0,
+ "artifactSha256": "e0399c8e7f62751ed43acd39d96567a6b63cb58fbc214e0440c4615da903b941"
+}

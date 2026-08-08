@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "native-local-gates",
+ "createdAt": "2026-08-08T18:04:54.000Z",
+ "status": "passed",
+ "notes": "Timed canonical bun package suite at the rebound candidate: 530 pass/0 fail across 68 files, now including the stream-retention falsifier for the Bun<=1.3.13 WritableStream leak (fails on 1.3.9, passes on 1.3.14).",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun test packages/"
+ ],
+ "startedAt": "2026-08-08T18:02:00.000Z",
+ "endedAt": "2026-08-08T18:04:54.000Z",
+ "durationMs": 174000,
+ "exitCode": 0,
+ "artifactSha256": "09fb74ce9f1df75e2a30494364c9a527ee95c047c6aec487709de0724e8a592b"
+}

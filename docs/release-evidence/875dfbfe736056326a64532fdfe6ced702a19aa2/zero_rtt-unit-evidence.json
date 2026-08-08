@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "wasm-0rtt",
+ "createdAt": "2026-08-08T18:05:07.000Z",
+ "status": "passed",
+ "notes": "wasm 0-RTT unit evidence re-run at the rebound candidate: 11 pass/0 fail (REQUIRE_WASM + REQUIRE_WASM_DIST).",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-0rtt.test.ts"
+ ],
+ "startedAt": "2026-08-08T18:05:05.000Z",
+ "endedAt": "2026-08-08T18:05:07.000Z",
+ "durationMs": 2000,
+ "exitCode": 0,
+ "artifactSha256": "a2d2c99627e20d4886d37c53481e6832d7f86cc27648af92c5b462cdeaecefff"
+}

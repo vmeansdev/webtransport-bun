@@ -1,0 +1,20 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "iwa-direct-sockets",
+ "createdAt": "2026-08-08T18:07:21Z",
+ "status": "passed",
+ "notes": "Hosted IWA Direct Sockets proof green with candidate_commit pinned to this candidate (workflow checks out and asserts the exact SHA): signed-bundle app in real Chromium (pinned Playwright build) and Chrome Beta — datagram/bidi/uni echo, stop-sending code 41, reset code 37, reconnects, cert-rotation oldPinRejected. artifactSha256 is the SHA-256 of the captured GitHub run-metadata snapshot.",
+ "runner": "github-hosted ubuntu-latest (xvfb)",
+ "command": [
+  "gh",
+  "workflow",
+  "iwa.yml",
+  "run-id",
+  "31270894960"
+ ],
+ "startedAt": "2026-08-08T18:01:37Z",
+ "endedAt": "2026-08-08T18:07:21Z",
+ "durationMs": 0,
+ "exitCode": 0,
+ "artifactSha256": "20795471c9c2acaf6b78f67ab3947f07d71dee8a3773fb08ba13ef5bb4c6702c"
+}

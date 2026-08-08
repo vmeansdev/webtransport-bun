@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "chromium-native-interop",
+ "createdAt": "2026-08-08T18:05:49.000Z",
+ "status": "passed",
+ "notes": "Playwright Chromium interop against the native server: 21 passed.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.config.ts"
+ ],
+ "startedAt": "2026-08-08T18:05:36.000Z",
+ "endedAt": "2026-08-08T18:05:49.000Z",
+ "durationMs": 13000,
+ "exitCode": 0,
+ "artifactSha256": "d3c9864ba6263fb19f2a822a6214f74b6e7938f59914cb9d089f242eb13cec53"
+}

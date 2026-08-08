@@ -1,128 +1,128 @@
 {
 	"schemaVersion": 1,
 	"candidate": {
-		"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+		"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 		"readiness": "pending"
 	},
 	"evidence": [
 		{
-			"id": "local-native-local-gates-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/native-local-gates.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-native-local-gates-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/native-local-gates.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Timed canonical bun package suite: 510 pass, 1 visible platform skip, 0 fail across 66 files."
+			"notes": "Timed canonical bun package suite at the rebound candidate: 530 pass/0 fail across 68 files, now including the stream-retention falsifier for the Bun<=1.3.13 WritableStream leak (fails on 1.3.9, passes on 1.3.14)."
 		},
 		{
-			"id": "local-wasm-local-gates-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/wasm-local-gates.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-wasm-local-gates-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/wasm-local-gates.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Timed bun run test:wasm: 96 pass across 14 wasm suites."
+			"notes": "Full wasm suite (build-wasm + dist + 96 tests across 14 wasm files) green at the rebound candidate."
 		},
 		{
-			"id": "local-dynamic_qpack-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/dynamic_qpack-unit-evidence.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-dynamic_qpack-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/dynamic_qpack-unit-evidence.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Timed bun test wasm-qpack-options against the wasm dist."
+			"notes": "wasm dynamic-QPACK options unit evidence re-run at the rebound candidate: 6 pass/0 fail (REQUIRE_WASM + REQUIRE_WASM_DIST)."
 		},
 		{
-			"id": "local-multi_session-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/multi_session-unit-evidence.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-multi_session-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/multi_session-unit-evidence.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Timed bun test wasm-multi-session against the wasm dist."
+			"notes": "wasm multi-session unit evidence re-run at the rebound candidate: 2 pass/0 fail (REQUIRE_WASM + REQUIRE_WASM_DIST)."
 		},
 		{
-			"id": "local-zero_rtt-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/zero_rtt-unit-evidence.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-zero_rtt-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/zero_rtt-unit-evidence.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Timed bun test wasm-0rtt against the wasm dist."
+			"notes": "wasm 0-RTT unit evidence re-run at the rebound candidate: 11 pass/0 fail (REQUIRE_WASM + REQUIRE_WASM_DIST)."
 		},
 		{
-			"id": "local-facade_parity_dual_backend-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/facade_parity-dual-backend-evidence.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-facade_parity_dual_backend-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/facade_parity-dual-backend-evidence.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Dual-backend parity: native 71/0 and wasm 71/0 with ZERO skips."
+			"notes": "Fresh dual-backend run of all nine parity-*.test.ts suites at the rebound candidate; both selectors run with zero skips."
 		},
 		{
-			"id": "local-package-artifact-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/package-artifact.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-package-artifact-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/package-artifact.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Sequential test-package-artifact build then check."
+			"notes": "Package artifact build + manifest check (89 files) at the rebound candidate; engines.bun floor now >=1.3.14."
 		},
 		{
-			"id": "local-supply-chain-provenance-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/supply-chain-provenance.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-supply-chain-provenance-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/supply-chain-provenance.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Timed check-actions-pinned across 11 workflows."
+			"notes": "Actions pin and least-privilege policy across all 11 workflows; bun allowlist narrowed to 1.3.14, trivy-action pinned to the v0.36.0 commit SHA."
 		},
 		{
-			"id": "local-chromium-native-interop-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/chromium-native-interop.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-chromium-native-interop-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/chromium-native-interop.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Playwright chromium-webtransport 21/21 on darwin/arm64."
+			"notes": "Playwright Chromium interop against the native server: 21 passed."
 		},
 		{
-			"id": "local-chromium-wasm-interop-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/chromium-wasm-interop.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-chromium-wasm-interop-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/chromium-wasm-interop.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Playwright wasm-server interop 7/7 on darwin/arm64."
+			"notes": "Playwright Chromium interop against the wasm backend: 7 passed (fresh build:wasm)."
 		},
 		{
-			"id": "local-fault-matrix-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/fault-matrix.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-fault-matrix-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/fault-matrix.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Seeded UDP fault matrix 1/1."
+			"notes": "Fault-injection matrix via Playwright: 1 passed."
 		},
 		{
-			"id": "local-runtime-consumers-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/runtime-consumers.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-runtime-consumers-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/runtime-consumers.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "internal-package-artifact 10 pass + 1 visible win32 skip; hosted exact-consumer matrix green at this candidate (see cross-platform-matrix)."
+			"notes": "Exact-package consumer suite (internal-package-artifact) at the rebound candidate."
 		},
 		{
-			"id": "local-fuzz-gates-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/fuzz-gates.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-fuzz-gates-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/fuzz-gates.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "fuzz release smoke: 8 targets, 0 crashes, Linux container (rust:1.95-bookworm)."
+			"notes": "fuzz release smoke: 8 targets, 30s fixed duration each, 0 crashes (failures array empty). Linux container rust:1.95-bookworm on Bun 1.3.14. Includes the endpoint_event_dispatch session-establishment drift assertion."
 		},
 		{
-			"id": "local-coverage-gates-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/coverage-gates.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-coverage-gates-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/coverage-gates.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Hosted coverage workflow at this candidate: cargo llvm-cov branch floors + Bun lcov floors, with the zero-branch-sites vacuity guard active."
+			"notes": "Hosted coverage workflow green at the candidate: cargo llvm-cov --branch (RUSTC_BOOTSTRAP=1 pinned 1.95.0) risk-module floors 90/90/80 native + wasm, Bun lcov floors 90/90, zero-branch-sites vacuity guard active, Bun pinned 1.3.14. artifactSha256 is the SHA-256 of the captured GitHub run-metadata snapshot."
 		},
 		{
-			"id": "local-cross-platform-matrix-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/cross-platform-matrix.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-cross-platform-matrix-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/cross-platform-matrix.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Hosted test.yml FULLY GREEN at this candidate across {ubuntu,macos,windows} x Bun {1.3.9,1.3.14} plus load, soak, parity, wasm, and exact-consumer Node {18,20,22} lanes."
+			"notes": "Hosted test.yml FULLY GREEN at the candidate — every job in one clean run: the test matrix ({ubuntu,macos,windows} x Bun 1.3.14 — 1.3.9 dropped from the support surface for the WritableStream leak fixed in 1.3.14), the dedicated load job (load-addon, 20-session strict RSS gate, handshake bench, overload, load profiles), the per-push soak campaign (150-session small profile with periodic native-memory relief), Parity (W3C facade), WASM backend + Chromium interop, and the 9-lane exact-consumer Node matrix. artifactSha256 is the SHA-256 of the captured GitHub run-metadata snapshot."
 		},
 		{
-			"id": "local-iwa-direct-sockets-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/iwa-direct-sockets.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-iwa-direct-sockets-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/iwa-direct-sockets.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "Hosted signed-bundle IWA Direct Sockets proof at this candidate on pinned Chromium 145 AND Chrome Beta 152: full functional matrix incl. stop-sending code 41, 8 reconnects, certificate rotation."
+			"notes": "Hosted IWA Direct Sockets proof green with candidate_commit pinned to this candidate (workflow checks out and asserts the exact SHA): signed-bundle app in real Chromium (pinned Playwright build) and Chrome Beta — datagram/bidi/uni echo, stop-sending code 41, reset code 37, reconnects, cert-rotation oldPinRejected. artifactSha256 is the SHA-256 of the captured GitHub run-metadata snapshot."
 		},
 		{
-			"id": "local-auto-review-zero-p0-p4-a389e81",
-			"path": "docs/release-evidence/a389e815cdcadbda33696e03cae0c0c4d80ba793/auto-review-4lane-round.json",
-			"commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+			"id": "local-auto-review-zero-p0-p4-875dfbf",
+			"path": "docs/release-evidence/875dfbfe736056326a64532fdfe6ced702a19aa2/auto-review-4lane-round.json",
+			"commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
 			"status": "passed",
-			"notes": "4-lane independent review round: zero P0/P1; all P2-P4 findings fixed at this candidate."
+			"notes": "Independent 4-lane review round (architect, correctness-critic, security, test-evidence) over a389e81..33b9f31 — the entire unreviewed candidate range: the Bun<=1.3.13 WritableStream-leak root-cause fix (runtime floor 1.3.14, stream-retention falsifier), soak sampler committed-memory/heap-type instrumentation, the SOAK_COMMITTED_ABORT_MB breaker, the full 1.3.9 support-surface drop, the evidence-only rebind commit, and the trivy-action bump. Verdicts: ZERO P0 in every lane; 1 P1 (user-facing disclosure of the runtime leak hazard) and all distinct P2 (9), P3 (8), and P4 (~9) findings were fixed in commits 8498ddf, b2a1b82, 61e4c37, and 875dfbf and re-verified at this candidate by the full local gate set recorded alongside (packages 530+1skip/531 across 68 files, wasm 96/96, parity 71+71 zero-skip, playwright 21+7+1, doc-truth, tsc, soak-addon 23/23 including the new bunVersionAtLeast and aggregate-floor tests). Highlights: the committed-memory metric now GATES segment verdicts (it was forensics-only); the in-loop breaker flushes a partial artifact instead of throwing into an unawaited promise; aggregation refuses segments recorded on leaking runtimes; the stream-retention falsifier was hardened against vacuity and empirically re-verified to fail on Bun 1.3.9 and pass on 1.3.14; the library now warns once at runtime on leaking Bun versions because engines.bun is advisory. The security lane independently verified the trivy-action pin is the genuine v0.36.0 (annotated-tag SHA dereferencing to ed142fd, since repinned to the commit SHA per repo convention). Root-cause evidence for the underlying runtime leak (A/B repro, version bisect, 1.3.9 positive control with 45,831 live WritableStreams, 2h Bun-1.3.14 PASS verification) is preserved under docs/release-evidence/bun-writablestream-leak-2026-08-08/."
 		}
 	],
 	"claims": [
@@ -131,7 +131,7 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-native-local-gates-a389e81"
+				"local-native-local-gates-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -140,7 +140,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-wasm-local-gates-a389e81"
+				"local-wasm-local-gates-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -149,7 +149,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-cross-platform-matrix-a389e81"
+				"local-cross-platform-matrix-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -158,7 +158,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-runtime-consumers-a389e81"
+				"local-runtime-consumers-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -167,7 +167,7 @@
 			"surface": "native",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-native-interop-a389e81"
+				"local-chromium-native-interop-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -176,7 +176,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-chromium-wasm-interop-a389e81"
+				"local-chromium-wasm-interop-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -185,7 +185,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-iwa-direct-sockets-a389e81"
+				"local-iwa-direct-sockets-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -194,7 +194,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-fault-matrix-a389e81"
+				"local-fault-matrix-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -203,7 +203,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-coverage-gates-a389e81"
+				"local-coverage-gates-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -212,7 +212,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-fuzz-gates-a389e81"
+				"local-fuzz-gates-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -229,7 +229,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-package-artifact-a389e81"
+				"local-package-artifact-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -238,7 +238,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-supply-chain-provenance-a389e81"
+				"local-supply-chain-provenance-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -261,7 +261,7 @@
 			"surface": "release",
 			"status": "passed",
 			"evidenceIds": [
-				"local-auto-review-zero-p0-p4-a389e81"
+				"local-auto-review-zero-p0-p4-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -277,7 +277,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-dynamic_qpack-a389e81"
+				"local-dynamic_qpack-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -286,7 +286,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-multi_session-a389e81"
+				"local-multi_session-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -295,7 +295,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-zero_rtt-a389e81"
+				"local-zero_rtt-875dfbf"
 			],
 			"gaRequired": true
 		},
@@ -304,7 +304,7 @@
 			"surface": "wasm",
 			"status": "passed",
 			"evidenceIds": [
-				"local-facade_parity_dual_backend-a389e81"
+				"local-facade_parity_dual_backend-875dfbf"
 			],
 			"gaRequired": true
 		}
