@@ -1,7 +1,7 @@
 # CONTRIBUTING.md
 
 ## Development setup
-1) Install Bun >= 1.3.9
+1) Install Bun >= 1.3.14
 2) Install Rust stable (rustup)
 3) Install dependencies:
 - `bun install`

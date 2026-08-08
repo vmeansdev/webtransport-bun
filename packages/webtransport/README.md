@@ -17,7 +17,7 @@ yarn add @webtransport-bun/webtransport
 
 ## Requirements
 
-- **Configured runtime targets**: Bun >= 1.3.9, Node (Node-API compatible
+- **Configured runtime targets**: Bun >= 1.3.14, Node (Node-API compatible
   runtime), Deno (npm + Node-API addon support)
 - **Configured platform targets**: macOS (arm64, x64), Linux (x64), Windows
   (x64)

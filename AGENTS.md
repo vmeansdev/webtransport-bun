@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project goal
-Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
+Build a production-ready WebTransport implementation with Bun **v1.3.14+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
 - In-process **server** support (mandatory)
 - In-process **client** support
 - **Datagrams** (message-based) with Promise backpressure
@@ -13,7 +13,7 @@ Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the
 - QUIC implementation from scratch (use wtransport)
 
 ## Supported targets
-- Bun: **>= 1.3.9** (primary target)
+- Bun: **>= 1.3.14** (primary target)
 - Node: supported (Node-API compatible runtime)
 - Deno: supported (npm + Node-API addon support)
 - OS: macOS, Linux, Windows

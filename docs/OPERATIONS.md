@@ -221,7 +221,7 @@ instances.
 
 - Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
 - Configured target matrix: macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
-- Configured runtime matrix: Bun >= 1.3.9, Node, Deno
+- Configured runtime matrix: Bun >= 1.3.14, Node, Deno
 - Node-API addon portability applies across the configured runtime matrix
 
 ## Public internet deployment

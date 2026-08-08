@@ -7,7 +7,7 @@ commit-bound passing evidence.
 
 ## Runtime targets
 
-- **Bun**: >= 1.3.9 (primary target in CI; evidence pending)
+- **Bun**: >= 1.3.14 (primary target in CI; evidence pending)
 - **Node**: Node-API compatible runtime (evidence pending)
 - **Deno**: npm + Node-API addon support target (evidence pending)
 
