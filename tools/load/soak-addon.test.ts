@@ -531,7 +531,9 @@ describe("hosted soak orchestration policy", () => {
 		}
 		expect(workflow).toContain("toolchain: 1.95.0");
 		expect(workflow).toContain('node-version: "22.23.1"');
-		expect(workflow).toContain('bun-version: "1.3.9"');
+		// 1.3.14 is a floor, not just a pin: Bun <=1.3.13 leaks WritableStreams
+		// on rejected close (OOM-killed the 24h soak, run 31134714109).
+		expect(workflow).toContain('bun-version: "1.3.14"');
 	});
 
 	test("downloads the prior artifact chain and makes aggregation mandatory", () => {
