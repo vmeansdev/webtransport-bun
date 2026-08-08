@@ -87,6 +87,29 @@ const OVERLAP_SKEW_MS = parseInt(
 );
 const SEGMENT_MAX_SECONDS = 6 * 60 * 60;
 const DEFAULT_SAMPLE_INTERVAL_MS = 30_000;
+// Bun <=1.3.13 leaks one WritableStream + rejection Error per server bidi
+// stream whose writer.close() rejects (the STOP_SENDING teardown path every
+// load-bidi stream takes). That leak OOM-killed the 24h soak of run
+// 31134714109 (~670MB/h committed growth). Refuse to generate soak evidence
+// on a runtime known to leak.
+const MIN_BUN_VERSION = "1.3.14";
+function assertBunVersion(): void {
+	const parse = (v: string): [number, number, number] => {
+		const parts = v.split(".").map((n) => parseInt(n, 10));
+		return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+	};
+	const [maj, min, pat] = parse(Bun.version);
+	const [rMaj, rMin, rPat] = parse(MIN_BUN_VERSION);
+	const cmp = maj - rMaj || min - rMin || pat - rPat;
+	if (Number.isNaN(cmp) || cmp < 0) {
+		throw new Error(
+			`soak-addon requires Bun >= ${MIN_BUN_VERSION} (found ${Bun.version}): ` +
+				"older runtimes leak WritableStreams on rejected close and " +
+				"invalidate long-soak memory evidence",
+		);
+	}
+}
+assertBunVersion();
 // Return the native allocator's MADV_FREE'd arenas to the OS periodically
 // during the long main-load stretch. The charged-memory metric (Rss minus
 // LazyFree) already excludes those pages, but the kernel OOM-killer counts
