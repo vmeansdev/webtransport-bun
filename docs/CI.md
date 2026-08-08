@@ -21,7 +21,7 @@ Canonical release truth: `docs/release-status.json`. CI evidence feeds that mani
 
 ### test.yml (push, pull_request, workflow_dispatch)
 
-**test** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}` × `{1.3.9, 1.3.14}`
+**test** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}` × `{1.3.14}`
 
 Deterministic suites only; the heavy load/stress campaigns live in the
 dedicated `load` job below so shared-runner UDP contention cannot fail the

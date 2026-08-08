@@ -73,7 +73,7 @@ Use `replaceSniCerts()` when you want to swap the full hostname map while preser
 
 ## Requirements
 
-- Bun >= 1.3.9, or Node, or Deno
+- Bun >= 1.3.14, or Node, or Deno
 - TLS certificate and key (PEM format)
 - UDP port open (default 4433)
 
