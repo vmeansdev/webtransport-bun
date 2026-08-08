@@ -42,154 +42,154 @@
 
 import type { Duplex, Readable, Writable } from "node:stream";
 
+export type { Resettable, StopSendable } from "./streams.js";
 // Re-export stream symbols and helpers
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
-export type { Resettable, StopSendable } from "./streams.js";
 
 import {
 	BidiStream,
 	RecvStream,
+	type Resettable,
 	SendStream,
+	type StopSendable,
 	WT_RESET,
 	WT_STOP_SENDING,
-	type Resettable,
-	type StopSendable,
 } from "./streams.js";
 
+export type {
+	WebTransportErrorOptions,
+	WebTransportErrorSource,
+} from "./errors.js";
 /**
  * Stable error codes. Use with {@link WebTransportError.code} for programmatic handling.
  * @see WebTransportError
  */
 export {
-	E_TLS,
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
-	E_LIMIT_EXCEEDED,
-	E_RATE_LIMITED,
-	E_INTERNAL,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
-export type {
-	ErrorCode,
-	WebTransportErrorOptions,
-	WebTransportErrorSource,
-} from "./errors.js";
+export type { ErrorCode } from "./types.js";
 
+import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
-	E_TLS,
-	E_INTERNAL,
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
 	E_LIMIT_EXCEEDED,
 	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_RATE_LIMITED,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
+	extractStreamErrorCode,
 	WebTransportError,
 } from "./errors.js";
-import type { ErrorCode } from "./errors.js";
+import type {
+	CloseInfo,
+	ErrorCode,
+	RateLimitOptions,
+	WebTransportCloseInfo,
+} from "./types.js";
+import {
+	createW3CMappedError as createMappedError,
+	normalizeW3CBrowserName as normalizeToBrowserName,
+} from "./w3c-client-options.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
 type StreamOpenOptions = { waitUntilAvailable?: boolean };
 
-const E_CODE_RE = /E_[A-Z_]+/g;
+const E_CODE_RE = /^(E_[A-Z_]+)(?::|$)/;
+/** Bun/Node often stringify napi errors as `GenericFailure, E_CODE: …`. */
+const NAPI_STATUS_PREFIX_RE =
+	/^(?:GenericFailure|Cancelled|InvalidArg|ObjectExpected|StringExpected|FunctionExpected|NumberExpected|BooleanExpected|ArrayExpected|Unknown|PendingException|EscapeCalledTwice|HandleScopeMismatch|CallbackScopeMismatch|QueueFull|Closing|BigintExpected|DateExpected|ArrayBufferExpected|DetachableArraybufferExpected|WouldDeadlock),\s*/u;
+const E_CODE_TOKEN_RE = /\b(E_[A-Z_]+)\b/gu;
+const KNOWN_ERROR_CODES = [
+	E_TLS,
+	E_HANDSHAKE_TIMEOUT,
+	E_SESSION_CLOSED,
+	E_SESSION_IDLE_TIMEOUT,
+	E_STREAM_RESET,
+	E_STOP_SENDING,
+	E_QUEUE_FULL,
+	E_BACKPRESSURE_TIMEOUT,
+	E_LIMIT_EXCEEDED,
+	E_RATE_LIMITED,
+	E_INVALID_ARGUMENT,
+	E_UNSUPPORTED_ARGUMENT,
+	E_INTERNAL,
+] as const satisfies readonly ErrorCode[];
+const KNOWN_ERROR_CODE_SET = new Set<ErrorCode>(KNOWN_ERROR_CODES);
+/** Wrapper codes that may nest a more specific causal E_* in the same message. */
+const WRAPPER_ERROR_CODES = new Set<ErrorCode>([E_SESSION_CLOSED, E_INTERNAL]);
 const SUPPRESS_LOG_CALLBACK_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
 const SUPPRESS_READY_REJECTION_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN === "1";
 
-/**
- * Maps known validation/connect failures to browser-style DOMException names.
- * Returns undefined for unknown cases; E_* code is always preserved.
- * No broad catch-all: unknown errors remain explicit.
- */
-function normalizeToBrowserName(
-	code: ErrorCode,
-	message: string,
-): string | undefined {
-	if (
-		message.includes(
-			"serverCertificateHashes cannot be used with allowPooling=true",
-		)
-	) {
-		return "NotSupportedError";
-	}
-	if (message.includes("serverCertificateHashes must be an array")) {
-		return "TypeError";
-	}
-	if (
-		message.includes("serverCertificateHashes entry value must be") ||
-		message.includes("invalid base64 in serverCertificateHashes")
-	) {
-		return "TypeError";
-	}
-	if (
-		message.includes("allowPooling must be a boolean") ||
-		message.includes("requireUnreliable must be a boolean")
-	) {
-		return "TypeError";
-	}
-	if (
-		message.includes("congestionControl must be") ||
-		message.includes("datagramsReadableType must be") ||
-		message.includes("waitUntilAvailable must be a boolean")
-	) {
-		return "TypeError";
-	}
-	switch (code) {
-		case E_TLS:
-			return "NetworkError";
-		case E_HANDSHAKE_TIMEOUT:
-		case E_BACKPRESSURE_TIMEOUT:
-			return "TimeoutError";
-		case E_SESSION_CLOSED:
-		case E_SESSION_IDLE_TIMEOUT:
-			return "InvalidStateError";
-		case E_STREAM_RESET:
-		case E_STOP_SENDING:
-			return "AbortError";
-		case E_LIMIT_EXCEEDED:
-		case E_QUEUE_FULL:
-		case E_RATE_LIMITED:
-			return "QuotaExceededError";
-		case E_INTERNAL:
-			return "OperationError";
-	}
-	return undefined;
+function knownCodeOrUndefined(
+	value: string | undefined,
+): ErrorCode | undefined {
+	return value && KNOWN_ERROR_CODE_SET.has(value as ErrorCode)
+		? (value as ErrorCode)
+		: undefined;
 }
 
-function createMappedError(
-	code: ErrorCode,
-	message: string,
-	strictW3CErrors?: boolean,
-): WebTransportError {
-	const browserName =
-		strictW3CErrors === true
-			? normalizeToBrowserName(code, message)
-			: undefined;
-	return new WebTransportError(
-		code,
-		message,
-		browserName ? { browserName } : undefined,
-	);
+/**
+ * Extract a stable E_* from native/Bun error text. Prefers a causal code when a
+ * wrapper like E_SESSION_CLOSED nests `connection closed by peer: E_LIMIT_EXCEEDED`.
+ */
+function extractMessageErrorCode(msg: string): ErrorCode | undefined {
+	const withoutStatus = msg.replace(NAPI_STATUS_PREFIX_RE, "");
+	const startCode = knownCodeOrUndefined(withoutStatus.match(E_CODE_RE)?.[1]);
+	const tokens = [...withoutStatus.matchAll(E_CODE_TOKEN_RE)]
+		.map((m) => knownCodeOrUndefined(m[1]))
+		.filter((c): c is ErrorCode => c != null);
+	const causal = [...tokens].reverse().find((c) => !WRAPPER_ERROR_CODES.has(c));
+	if (startCode && WRAPPER_ERROR_CODES.has(startCode) && causal) {
+		return causal;
+	}
+	return startCode ?? causal ?? tokens[0];
 }
 
 function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
 ): WebTransportError {
+	const explicitCode =
+		err && typeof err === "object"
+			? (err as { code?: unknown }).code
+			: undefined;
+	const knownExplicitCode =
+		typeof explicitCode === "string" &&
+		KNOWN_ERROR_CODE_SET.has(explicitCode as ErrorCode)
+			? (explicitCode as ErrorCode)
+			: undefined;
 	const msg = err instanceof Error ? err.message : String(err);
-	const match = msg.match(E_CODE_RE);
-	const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
-	return createMappedError(code, msg, strictW3CErrors);
+	if (knownExplicitCode) {
+		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
+	}
+	return createMappedError(
+		extractMessageErrorCode(msg) ?? (E_INTERNAL as ErrorCode),
+		msg,
+		strictW3CErrors,
+	);
 }
 
 function isSessionCloseError(err: unknown): boolean {
@@ -218,13 +218,44 @@ function shouldRetryStreamOpen(err: unknown): boolean {
 	);
 }
 
-function parseWaitUntilAvailable(options?: StreamOpenOptions): boolean {
+function parseWaitUntilAvailable(
+	options?: StreamOpenOptions,
+	strictW3CErrors?: boolean,
+): boolean {
 	const value = options?.waitUntilAvailable;
 	if (value === undefined) return false;
 	if (typeof value !== "boolean") {
-		throw new TypeError("waitUntilAvailable must be a boolean");
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: waitUntilAvailable must be a boolean",
+			strictW3CErrors,
+		);
 	}
 	return value;
+}
+
+function boundNativeCapacityWait(
+	handle: {
+		waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+		waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	},
+	kind: "bidi" | "uni",
+): ((remainingMs: number) => Promise<void>) | undefined {
+	let fn: ((remainingMs: number) => Promise<void>) | undefined;
+	switch (kind) {
+		case "bidi":
+			fn = handle.waitBidiCapacity;
+			break;
+		case "uni":
+			fn = handle.waitUniCapacity;
+			break;
+		default: {
+			const _exhaustive: never = kind;
+			return _exhaustive;
+		}
+	}
+	if (typeof fn !== "function") return undefined;
+	return (remainingMs) => fn.call(handle, remainingMs);
 }
 
 async function openStreamWithWait<T>(
@@ -235,13 +266,14 @@ async function openStreamWithWait<T>(
 	waitForCapacity?: (remainingMs: number) => Promise<void>,
 	strictW3CErrors?: boolean,
 ): Promise<T> {
-	const waitUntilAvailable = parseWaitUntilAvailable(options);
+	const waitUntilAvailable = parseWaitUntilAvailable(options, strictW3CErrors);
 	if (!waitUntilAvailable) {
 		return openFn();
 	}
-	const timeoutMs = Math.max(1, backpressureTimeoutMs);
-	const deadline = Date.now() + timeoutMs;
-	let backoffMs = 2;
+	const waitForCapacityWithFallback =
+		waitForCapacity ?? createPollingCapacityWaiter(isClosed);
+	const deadline = createMonotonicDeadline(backpressureTimeoutMs);
+	const timeoutMs = deadline.timeoutMs;
 	while (true) {
 		if (isClosed()) {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
@@ -252,22 +284,36 @@ async function openStreamWithWait<T>(
 			if (!shouldRetryStreamOpen(err)) {
 				throw toWebTransportError(err, strictW3CErrors);
 			}
-			if (Date.now() >= deadline) {
+			if (deadline.expired()) {
 				throw new WebTransportError(
 					E_BACKPRESSURE_TIMEOUT as ErrorCode,
 					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
 				);
 			}
-			const remaining = Math.max(0, deadline - Date.now());
-			if (waitForCapacity) {
-				await waitForCapacity(Math.max(1, remaining));
-			} else {
-				const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
-				await Bun.sleep(sleepMs);
-				backoffMs = Math.min(backoffMs * 2, 64);
-			}
+			const remaining = deadline.remainingMs();
+			await withDeadline(
+				waitForCapacityWithFallback(Math.max(1, remaining)),
+				Math.max(1, remaining),
+				{
+					timeoutMessage: `E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
+				},
+			);
 		}
 	}
+}
+
+function createPollingCapacityWaiter(
+	isClosed: () => boolean,
+): (remainingMs: number) => Promise<void> {
+	let backoffMs = 2;
+	return async (remainingMs: number): Promise<void> => {
+		if (isClosed()) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		const sleepMs = Math.max(1, Math.min(backoffMs, remainingMs));
+		backoffMs = Math.min(backoffMs * 2, 64);
+		await sleep(sleepMs);
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +337,11 @@ export type ServerTlsSnapshot = {
 export type TlsOptions = {
 	/** PEM-encoded certificate (server) or CA (client). */
 	certPem: string | Uint8Array;
-	/** PEM-encoded private key (server only). */
+	/**
+	 * PEM-encoded private key (server only). Unencrypted PKCS#8
+	 * (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA
+	 * (`BEGIN RSA PRIVATE KEY`) are accepted; encrypted keys are not.
+	 */
 	keyPem: string | Uint8Array;
 	/** Optional CA PEM for client verification. */
 	caPem?: string | Uint8Array;
@@ -309,16 +359,7 @@ export type TlsOptions = {
 // Rate-limit options
 // ---------------------------------------------------------------------------
 
-export type RateLimitOptions = {
-	handshakesPerSec: number;
-	handshakesBurst: number;
-	/** Per /24 (IPv4) or /64 (IPv6) prefix; defaults 100 */
-	handshakesBurstPerPrefix?: number;
-	streamsPerSec: number;
-	streamsBurst: number;
-	datagramsPerSec: number;
-	datagramsBurst: number;
-};
+export type { RateLimitOptions } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -347,7 +388,22 @@ export type LimitsOptions = {
 	backpressureTimeoutMs: number;
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
+	/**
+	 * Max idle time before a connection is considered dead and closed. Applies
+	 * to both the server and the client: on the client it guarantees `closed`
+	 * resolves on a dead path (NAT rebind, network drop, server power loss)
+	 * instead of hanging forever. Default 60000.
+	 */
 	idleTimeoutMs: number;
+	/**
+	 * Keep-alive ping interval in ms. Keeps a live-but-quiet connection from
+	 * being idle-closed, and is always clamped to stay safely below
+	 * `idleTimeoutMs`. On the client it defaults to `idleTimeoutMs / 3` when
+	 * omitted; on the server keep-alive is off unless set, and the effective
+	 * interval is `min(keepAliveIntervalMs, idleTimeoutMs / 3)`. Set 0 to
+	 * disable.
+	 */
+	keepAliveIntervalMs?: number;
 };
 
 /** Default limit values from AGENTS.md */
@@ -404,6 +460,46 @@ export type ServerOptions = {
 	limits?: Partial<LimitsOptions>;
 	rateLimits?: Partial<RateLimitOptions>;
 
+	/** Congestion controller for all server connections: cubic (default), BBR (throughput), or NewReno (low-latency). */
+	congestionControl?: "default" | "throughput" | "low-latency";
+
+	/**
+	 * Accept QUIC 0-RTT session establishment from resuming clients.
+	 * Off by default. When enabled, a returning client's CONNECT can arrive
+	 * as replayable early data; such sessions report `has0Rtt` and resumption
+	 * state is per-process (restarts/load balancing fall back to 1-RTT).
+	 */
+	enable0Rtt?: boolean;
+
+	/**
+	 * Deliver 0-RTT sessions to `onSession` before the handshake is confirmed.
+	 * Off by default: session establishment is the replayable unit of 0-RTT,
+	 * so by default `onSession` is deferred until the request is no longer
+	 * replayable. Opt in only when the callback's pre-confirmation work is
+	 * strictly idempotent; it can still gate side effects on
+	 * `session.handshakeConfirmed`. No effect unless `enable0Rtt` is set.
+	 */
+	allowEarlySession?: boolean;
+
+	/**
+	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+	 * to peers, in bytes. `0` (the default) advertises no table and keeps header
+	 * compression to the static table alone — unchanged wire behavior. A non-zero
+	 * value both offers a table to the peer and bounds the table this endpoint will
+	 * mirror; values above 65536 (64 KiB) are rejected. This is an interop/completeness
+	 * setting, not a throughput one: WebTransport carries headers only on the
+	 * CONNECT exchange. `SETTINGS_QPACK_BLOCKED_STREAMS` is always advertised as 0
+	 * and is not configurable. Prefer {@link enableDynamicQpack} for the preset.
+	 */
+	qpackMaxTableCapacity?: number;
+
+	/**
+	 * Convenience preset for {@link qpackMaxTableCapacity}: `true` advertises a
+	 * 4096-byte dynamic table (blocked-streams still 0). Off by default. An
+	 * explicit `qpackMaxTableCapacity` takes precedence over this flag.
+	 */
+	enableDynamicQpack?: boolean;
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -417,6 +513,8 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
+	/** Effective congestion-control mode applied to all server connections. */
+	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
 	updateCert(tls: {
 		certPem: string | Uint8Array;
@@ -443,10 +541,7 @@ export interface WebTransportServer {
 // ---------------------------------------------------------------------------
 
 /** Browser-style close info (W3C alignment). Used by {@link WebTransport.close} and {@link WebTransport.closed}. */
-export type WebTransportCloseInfo = {
-	closeCode?: number;
-	reason?: string;
-};
+export type { WebTransportCloseInfo } from "./types.js";
 
 /**
  * Options for `new WebTransport(url, options)`.
@@ -490,10 +585,10 @@ export type ClientOptions = {
 	};
 	limits?: Partial<LimitsOptions>;
 	log?: (event: LogEvent) => void;
-	/** Internal/advanced: cert pinning list serialized as base64. */
+	/** Cert pinning list; values are raw SHA-256 digests (BufferSource). */
 	serverCertificateHashes?: Array<{
 		algorithm: "sha-256";
-		valueBase64: string;
+		value: BufferSource;
 	}>;
 	/** Internal/advanced: congestion hint passed to native runtime. */
 	congestionControl?: "default" | "throughput" | "low-latency";
@@ -503,13 +598,35 @@ export type ClientOptions = {
 	requireUnreliable?: boolean;
 	/** When true, errors use browser-style DOMException names. Default false. */
 	strictW3CErrors?: boolean;
+	/**
+	 * Offer QUIC 0-RTT on reconnects to servers seen before by this process.
+	 * Off by default. Requires the server to enable 0-RTT too; incompatible
+	 * with `allowPooling`. Sessions report `has0Rtt`/`accepted0Rtt`.
+	 */
+	enable0Rtt?: boolean;
+	/**
+	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+	 * to the server, in bytes. `0` (the default) keeps header compression to the
+	 * static table alone. Values above 65536 are rejected.
+	 * `SETTINGS_QPACK_BLOCKED_STREAMS` is
+	 * always 0 and not configurable. Interop/completeness, not throughput —
+	 * WebTransport carries headers only on the CONNECT exchange. Prefer
+	 * {@link enableDynamicQpack} for the preset.
+	 */
+	qpackMaxTableCapacity?: number;
+	/**
+	 * Convenience preset for {@link qpackMaxTableCapacity}: `true` advertises a
+	 * 4096-byte dynamic table (blocked-streams still 0). Off by default. An
+	 * explicit `qpackMaxTableCapacity` takes precedence.
+	 */
+	enableDynamicQpack?: boolean;
 };
 
 // ---------------------------------------------------------------------------
 // Session types
 // ---------------------------------------------------------------------------
 
-export type CloseInfo = { code?: number; reason?: string };
+export type { CloseInfo } from "./types.js";
 
 function normalizeCloseInfo(
 	info: CloseInfo | undefined,
@@ -546,9 +663,11 @@ export class WebTransportSendGroup {
 		this.#transport = transport;
 		this.#id = id;
 	}
+	/** @internal */
 	_getTransport(): WebTransport {
 		return this.#transport;
 	}
+	/** @internal */
 	_getId(): number {
 		return this.#id;
 	}
@@ -567,10 +686,35 @@ interface CommonSession {
 	readonly id: string;
 	readonly peer: { ip: string; port: number };
 
+	/**
+	 * Whether this session involved 0-RTT early data. Client side: this
+	 * connect offered early data; server side: the CONNECT arrived as
+	 * replayable early data. Always false unless 0-RTT was enabled.
+	 */
+	readonly has0Rtt: boolean;
+	/** Whether the peer accepted the early data (false until known / when refused). */
+	readonly accepted0Rtt: boolean;
+	/** Whether the TLS handshake has completed (always true for non-0-RTT sessions). */
+	readonly handshakeConfirmed: boolean;
+
 	readonly ready: Promise<void>;
 	readonly closed: Promise<CloseInfo>;
 
+	/**
+	 * Resolves when the peer says this session is going away — a received
+	 * `WT_DRAIN_SESSION` capsule or `GOAWAY`. The session stays usable: streams
+	 * already open keep working and new ones can still be opened. This is a
+	 * warning, not an ending; await `closed` for the ending.
+	 */
+	readonly draining: Promise<void>;
+
 	close(info?: CloseInfo): void;
+
+	/**
+	 * Tell the peer this session is going away soon, without ending it. Sends a
+	 * `WT_DRAIN_SESSION` capsule and returns immediately.
+	 */
+	drain(): void;
 
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
@@ -585,6 +729,19 @@ export interface ServerSession extends CommonSession {
 	createBidirectionalStream(options?: StreamOpenOptions): Promise<Duplex>;
 	createUnidirectionalStream(options?: StreamOpenOptions): Promise<Writable>;
 	metricsSnapshot(): SessionMetricsSnapshot;
+
+	/**
+	 * Tell the peer not to open any further session on this connection. Sends an
+	 * H3 `GOAWAY` and returns immediately.
+	 *
+	 * `GOAWAY` is connection-scoped, so this is a server-initiated
+	 * graceful-shutdown signal ("I'm going away, don't start new sessions"). The
+	 * peer observes it as its `draining` settling, and the current session stays
+	 * usable. Native is single-session-per-connection, so the "refuse a second
+	 * session" enforcement is not reachable through this API — the observable
+	 * effect is the drain signal on the peer.
+	 */
+	goAway(): void;
 }
 
 /** Node client API session surface returned by connect(). */
@@ -634,7 +791,12 @@ export type MetricsSnapshot = {
 	sniCertSelections: number;
 	defaultCertSelections: number;
 	unknownSniRejectedCount: number;
-
+	nativeSessionRegistryEntries?: number;
+	nativeTrackedTasks?: number;
+	nativeRateLimitEntries?: number;
+	nativeBidiHandlesLive?: number;
+	nativeUniSendHandlesLive?: number;
+	nativeUniRecvHandlesLive?: number;
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
@@ -680,6 +842,38 @@ export const METRICS_PREFIX =
 function shouldSuppressInsecureSkipVerifyWarning(): boolean {
 	const v = process.env.WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN;
 	return v === "1" || v === "true" || v === "yes";
+}
+
+// Bun <=1.3.13 permanently retains one WritableStream + one rejection Error
+// for every stream whose close() rejects — e.g. any peer that drops its
+// receive half, which quinn surfaces as STOP_SENDING racing the close. A
+// long-running server on such a runtime leaks until the OOM-killer fires.
+// engines.bun is advisory (npm does not enforce the "bun" key), so the only
+// reliable disclosure is at runtime.
+const LEAKY_BUN_CEILING = "1.3.14";
+let warnedLeakyBunRuntime = false;
+function warnIfLeakyBunRuntime(): void {
+	if (warnedLeakyBunRuntime) return;
+	warnedLeakyBunRuntime = true;
+	const v = process.env.WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN;
+	if (v === "1" || v === "true" || v === "yes") return;
+	if (typeof Bun === "undefined" || typeof Bun.version !== "string") return;
+	const parse = (s: string): number[] | null => {
+		const parts = s.split(".").slice(0, 3);
+		if (parts.length < 3 || parts.some((p) => !/^\d+$/.test(p))) return null;
+		return parts.map(Number);
+	};
+	const actual = parse(Bun.version);
+	const floor = parse(LEAKY_BUN_CEILING);
+	if (!actual || !floor) return;
+	const cmp =
+		(actual[0] ?? 0) - (floor[0] ?? 0) ||
+		(actual[1] ?? 0) - (floor[1] ?? 0) ||
+		(actual[2] ?? 0) - (floor[2] ?? 0);
+	if (cmp >= 0) return;
+	console.warn(
+		`[webtransport] warn: Bun ${Bun.version} leaks one WritableStream per stream whose close is rejected (fixed in Bun ${LEAKY_BUN_CEILING}); long-running servers will exhaust memory — upgrade the runtime`,
+	);
 }
 
 function escapePromLabelValue(v: unknown): string {
@@ -839,6 +1033,7 @@ import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
+const NATIVE_ADDON_OVERRIDE_ENV = "WEBTRANSPORT_NATIVE_ADDON_PATH";
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-msvc.node`,
@@ -848,18 +1043,202 @@ const binaryCandidates = [
 const basePaths = ["../../../crates/native", "../prebuilds"];
 type RequireLike = (id: string) => unknown;
 type NativeLoadFailure = { request: string; message: string };
+type NativeLoadResult = {
+	addon: NativeAddon | undefined;
+	failures: NativeLoadFailure[];
+};
+type NativeLogEvent = {
+	level?: "debug" | "info" | "warn" | "error";
+	msg?: string;
+	sessionId?: string;
+	peerIp?: string;
+	peerPort?: number;
+};
+type NativeServerSessionEvent =
+	| {
+			name: "session";
+			id: string;
+			peerIp: string;
+			peerPort: number;
+	  }
+	| {
+			name: "session_closed";
+			id: string;
+			code: number;
+			reason: string;
+	  };
+type NativeClientSessionEvent = {
+	name: "session_closed";
+	id: string;
+	code: number;
+	reason: string;
+};
+type NativeBidiStreamHandle = {
+	readonly id: number;
+	read(): Promise<Buffer | null>;
+	write(chunk: Buffer | Uint8Array): Promise<void>;
+	finish(): Promise<void> | void;
+	finishWait?: () => Promise<void> | void;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+	dispose?: () => void;
+};
+type NativeSendStreamHandle = {
+	readonly id: number;
+	write(chunk: Buffer | Uint8Array): Promise<void>;
+	finish?: () => Promise<void> | void;
+	finishWait?: () => Promise<void> | void;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+	dispose?: () => void;
+};
+type NativeRecvStreamHandle = {
+	readonly id: number;
+	read(): Promise<Buffer | null>;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+	dispose?: () => void;
+};
+interface NativeSessionHandle {
+	id: string;
+	peerIp: string;
+	peerPort: number;
+	close(code: number | null, reason: string | null): void;
+	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
+	readDatagram(): Promise<Buffer | null>;
+	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
+	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
+	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
+	discardUniStreams?: (timeoutMs?: number) => Promise<number | null>;
+	enableBidiDiscard?: () => void;
+	enableUniDiscard?: () => void;
+	createBidiStream(): Promise<NativeBidiStreamHandle>;
+	createUniStream(): Promise<NativeSendStreamHandle>;
+	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+	waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	acceptBidiStream(): Promise<NativeBidiStreamHandle | null>;
+	acceptUniStream(): Promise<NativeRecvStreamHandle | null>;
+	handleBidiProbe?: () => Promise<boolean>;
+	handleUniProbe?: () => Promise<number>;
+	metricsSnapshot(): SessionMetricsSnapshot;
+	connectionStats?(): QuicConnectionStats | null;
+	pathMaxDatagramSize?: () => number | null;
+	/** 0-RTT getters (absent on older prebuilt addons). */
+	has0Rtt?: boolean;
+	accepted0Rtt?: boolean;
+	handshakeConfirmed?: boolean;
+	/** Session drain (absent on older prebuilt addons). */
+	drain?: () => void;
+	waitDraining?: () => Promise<void>;
+	/** Connection-scoped H3 GOAWAY send (absent on older prebuilt addons). */
+	goAway?: () => void;
+}
+type NativeConnectSessionHandle = {
+	id: string;
+	close(code: number | null, reason: string | null): void;
+	peerIp?: string;
+	peerPort?: number;
+} & Partial<NativeSessionHandle>;
+interface NativeServerHandle {
+	port: number;
+	close(): Promise<void>;
+	updateCert(certPem: string, keyPem: string): Promise<void>;
+	updateTls(configJson: string): Promise<void>;
+	replaceSniCerts(json: string): Promise<void>;
+	upsertSniCert(
+		serverName: string,
+		certPem: string,
+		keyPem: string,
+	): Promise<void>;
+	removeSniCert(serverName: string): Promise<void>;
+	setUnknownSniPolicy(policy: string): Promise<void>;
+	tlsSnapshot(): ServerTlsSnapshot;
+	metricsSnapshot(): MetricsSnapshot;
+}
+interface NativeAddon {
+	ServerHandle: new (
+		port: number,
+		host: string,
+		debug: boolean,
+		tlsConfigJson: string,
+		limitsJson: string,
+		rateLimitsJson: string,
+		serverOptsJson: string,
+		onSessionEvents: (events: NativeServerSessionEvent[]) => void,
+		onLog?: (events: NativeLogEvent[]) => void,
+	) => NativeServerHandle;
+	SessionHandle: new (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	) => NativeSessionHandle;
+	ClientSessionHandle: new (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	) => NativeSessionHandle;
+	connect(
+		url: string,
+		optsJson: string,
+		onClosed: (events: NativeClientSessionEvent[]) => void,
+		cb: (err: unknown, handleId?: string) => void,
+	): void;
+	takeClientSession(handleId: string): NativeSessionHandle | undefined;
+	clientPoolMetricsSnapshot(): {
+		hits: number;
+		misses: number;
+		evictIdle?: number;
+		evictBroken?: number;
+	};
+	nativeStreamHandlesSnapshot?: () => {
+		bidiHandlesLive: number;
+		uniSendHandlesLive: number;
+		uniRecvHandlesLive: number;
+	};
+	/** Force-return freed native allocator memory to the OS (absent on older prebuilt addons). */
+	releaseNativeMemory?: () => boolean;
+	/** 0-RTT vault (absent on older prebuilt addons). */
+	exportZeroRttVault?(
+		optsJson: string,
+		serverName?: string | null,
+	): string | null;
+	importZeroRttVault?(optsJson: string, token: string): boolean;
+}
+interface NativeConnectOnlyAddon {
+	connect(
+		url: string,
+		optsJson: string,
+		onClosed: (events: NativeClientSessionEvent[]) => void,
+		cb: (err: unknown, handleId?: string) => void,
+	): void;
+	takeClientSession(handleId: string): NativeConnectSessionHandle | undefined;
+}
 
 function tryLoadNativeAddon(
 	requireFn: RequireLike,
 	bases = basePaths,
 	candidates = binaryCandidates,
-): { addon: any; failures: NativeLoadFailure[] } {
+	explicitRequests: string[] = [],
+): NativeLoadResult {
 	const failures: NativeLoadFailure[] = [];
+	for (const request of explicitRequests) {
+		try {
+			return { addon: requireFn(request) as NativeAddon, failures };
+		} catch (err) {
+			failures.push({
+				request,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (explicitRequests.length > 0) {
+		return { addon: undefined, failures };
+	}
 	for (const base of bases) {
 		for (const candidate of candidates) {
 			const request = `${base}/${candidate}`;
 			try {
-				return { addon: requireFn(request), failures };
+				return { addon: requireFn(request) as NativeAddon, failures };
 			} catch (err) {
 				failures.push({
 					request,
@@ -869,6 +1248,13 @@ function tryLoadNativeAddon(
 		}
 	}
 	return { addon: undefined, failures };
+}
+
+function nativeAddonOverrideRequestsFromEnv(
+	envValue = process.env[NATIVE_ADDON_OVERRIDE_ENV],
+): string[] {
+	const trimmed = envValue?.trim();
+	return trimmed ? [trimmed] : [];
 }
 
 function buildNativeAddonLoadErrorMessage(
@@ -885,11 +1271,16 @@ function buildNativeAddonLoadErrorMessage(
 	return `Native addon not loaded. Candidate load errors:\n${details}${suffix}`;
 }
 
-const nativeLoad = tryLoadNativeAddon(_require);
-const native = nativeLoad.addon;
+const nativeLoad = tryLoadNativeAddon(
+	_require,
+	basePaths,
+	binaryCandidates,
+	nativeAddonOverrideRequestsFromEnv(),
+);
+const native = nativeLoad.addon as NativeAddon | undefined;
 const nativeLoadFailures = nativeLoad.failures;
 
-function getNativeOrThrow(): any {
+function getNativeOrThrow(): NativeAddon {
 	if (native) return native;
 	throw new Error(buildNativeAddonLoadErrorMessage(nativeLoadFailures));
 }
@@ -899,22 +1290,30 @@ function getNativeOrThrow(): any {
 // ---------------------------------------------------------------------------
 
 class NativeServerSession implements ServerSession {
-	#nativeHandle: any;
+	#nativeHandle: NativeSessionHandle;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
+	#drainingPromise: Promise<void> | null = null;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
+	#has0Rtt: boolean;
+	#handshakeConfirmedLatch = false;
+
 	constructor(
-		nativeHandle: any,
+		nativeHandle: NativeSessionHandle,
 		closedPromise: Promise<CloseInfo>,
 		streamOpenWaitTimeoutMs: number,
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
+		// Snapshot: fixed for the session's lifetime, and must survive the
+		// native registry entry being removed at close.
+		this.#has0Rtt = nativeHandle.has0Rtt ?? false;
 		this.#closedPromise = closedPromise.then((info) =>
 			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
 		);
@@ -934,6 +1333,23 @@ class NativeServerSession implements ServerSession {
 		};
 	}
 
+	get has0Rtt(): boolean {
+		return this.#has0Rtt;
+	}
+
+	get accepted0Rtt(): boolean {
+		// Server side: a request readable from early data was accepted.
+		return this.#has0Rtt;
+	}
+
+	get handshakeConfirmed(): boolean {
+		if (!this.#handshakeConfirmedLatch) {
+			this.#handshakeConfirmedLatch =
+				this.#nativeHandle.handshakeConfirmed ?? true;
+		}
+		return this.#handshakeConfirmedLatch;
+	}
+
 	get ready(): Promise<void> {
 		// Server sessions are already handshake-complete when onSession fires
 		return Promise.resolve();
@@ -943,12 +1359,36 @@ class NativeServerSession implements ServerSession {
 		return this.#closedPromise;
 	}
 
+	get draining(): Promise<void> {
+		// Raced against `closed` so a session that ends without the peer ever
+		// draining does not leave this pending forever. An older prebuilt addon
+		// has no waitDraining, in which case close is the only signal available.
+		this.#drainingPromise ??= Promise.race(
+			[
+				this.#nativeHandle.waitDraining?.(),
+				this.#closedPromise.then(
+					() => undefined,
+					() => undefined,
+				),
+			].filter((p): p is Promise<void> => p !== undefined),
+		);
+		return this.#drainingPromise;
+	}
+
 	close(info?: CloseInfo): void {
 		if (!this.#closed) {
 			this.#closed = true;
 			this.#requestedCloseInfo = normalizeCloseInfo(info);
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
+	}
+
+	drain(): void {
+		if (!this.#closed) this.#nativeHandle.drain?.();
+	}
+
+	goAway(): void {
+		if (!this.#closed) this.#nativeHandle.goAway?.();
 	}
 
 	async sendDatagram(data: Uint8Array): Promise<void> {
@@ -962,17 +1402,111 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const datagram = await this.#nativeHandle.readDatagram();
-				if (!datagram) break;
-				yield datagram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err);
-			}
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			const session = this;
+			this.#incomingDatagramsCache = (async function* () {
+				while (!session.#closed) {
+					try {
+						const datagram = await session.#nativeHandle.readDatagram();
+						if (!datagram) break;
+						yield datagram;
+					} catch (err) {
+						if (isSessionCloseError(err)) break;
+						throw toWebTransportError(err);
+					}
+				}
+			})();
 		}
+		return this.#incomingDatagramsCache;
+	}
+
+	/** @internal Consume one queued datagram without materializing its payload. */
+	async discardIncomingDatagram(
+		timeoutMs?: number,
+	): Promise<boolean | null | undefined> {
+		if (!this.#nativeHandle.discardDatagram) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardDatagram(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume queued datagrams without materializing payloads. */
+	async discardIncomingDatagrams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardDatagrams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardDatagrams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume accepted bidi streams without materializing wrappers. */
+	async discardIncomingBidiStreams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardBidiStreams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardBidiStreams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume accepted uni streams without materializing wrappers. */
+	async discardIncomingUniStreams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardUniStreams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardUniStreams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Load/evidence path: handle one ordered bidi probe in Rust. */
+	async __handleIncomingBidiProbe(): Promise<boolean> {
+		if (this.#closed) return false;
+		try {
+			return (await this.#nativeHandle.handleBidiProbe?.()) ?? false;
+		} catch (err) {
+			if (isSessionCloseError(err)) return false;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Load/evidence path: handle one ordered uni probe in Rust. */
+	async __handleIncomingUniProbe(): Promise<number> {
+		if (this.#closed) return 0;
+		try {
+			return (await this.#nativeHandle.handleUniProbe?.()) ?? 0;
+		} catch (err) {
+			if (isSessionCloseError(err)) return 0;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Switch subsequent load streams to the native discard path. */
+	__enableIncomingBidiDiscard(): void {
+		this.#nativeHandle.enableBidiDiscard?.();
+	}
+
+	/** @internal Switch subsequent load streams to the native discard path. */
+	__enableIncomingUniDiscard(): void {
+		this.#nativeHandle.enableUniDiscard?.();
 	}
 
 	async createBidirectionalStream(
@@ -986,9 +1520,7 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitBidiCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi"),
 			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1004,6 +1536,7 @@ class NativeServerSession implements ServerSession {
 			this.#incomingBidiCache = createServerIncomingBidiStreams(
 				this.#nativeHandle,
 				() => this.#closed,
+				this.#closedPromise,
 			);
 		}
 		return this.#incomingBidiCache;
@@ -1020,9 +1553,7 @@ class NativeServerSession implements ServerSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitUniCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni"),
 			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1038,6 +1569,7 @@ class NativeServerSession implements ServerSession {
 			this.#incomingUniCache = createServerIncomingUniStreams(
 				this.#nativeHandle,
 				() => this.#closed,
+				this.#closedPromise,
 			);
 		}
 		return this.#incomingUniCache;
@@ -1075,6 +1607,7 @@ class NativeServerSession implements ServerSession {
  * ```
  */
 export function createServer(opts: ServerOptions): WebTransportServer {
+	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
 
 	const decodePem = (value: string | Uint8Array | undefined): string =>
@@ -1110,8 +1643,31 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				})) ?? [],
 		});
 
+	if (
+		opts.congestionControl !== undefined &&
+		!VALID_CONGESTION.has(opts.congestionControl)
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+		);
+	}
+
+	validateQpackOptions(opts);
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
+	const serverOptsJson = JSON.stringify({
+		congestionControl: opts.congestionControl ?? "default",
+		enable0Rtt: opts.enable0Rtt === true,
+		allowEarlySession: opts.allowEarlySession === true,
+		...(opts.qpackMaxTableCapacity === undefined
+			? {}
+			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
+		...(opts.enableDynamicQpack === undefined
+			? {}
+			: { enableDynamicQpack: opts.enableDynamicQpack }),
+	});
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
 		...opts.rateLimits,
@@ -1133,7 +1689,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
-	const logCallback = (logEvents: any[]) => {
+	const logCallback = (logEvents: NativeLogEvent[]) => {
 		for (const le of logEvents) {
 			emitUserLog({
 				level: le.level ?? "info",
@@ -1152,7 +1708,8 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		tlsConfigToJson(opts.tls),
 		limitsJson,
 		rateLimitsJson,
-		(events: any[]) => {
+		serverOptsJson,
+		(events: NativeServerSessionEvent[]) => {
 			for (const evt of events) {
 				if (
 					evt.name === "session" &&
@@ -1181,9 +1738,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 						maybePromise = opts.onSession(session);
 					} catch (err) {
 						const msg = err instanceof Error ? err.message : String(err);
+						session.close({
+							code: 0,
+							reason: `onSession callback threw: ${msg}`,
+						});
 						emitUserLog({
 							level: "error",
-							msg: `E_INTERNAL: onSession callback threw: ${msg}`,
+							msg: `E_INVALID_ARGUMENT: onSession callback threw: ${msg}`,
 							sessionId: evt.id,
 							peerIp: evt.peerIp,
 							peerPort: evt.peerPort,
@@ -1194,9 +1755,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					if (maybePromise && typeof maybePromise.then === "function") {
 						maybePromise.then(onSessionCallbackDone, (err) => {
 							const msg = err instanceof Error ? err.message : String(err);
+							session.close({
+								code: 0,
+								reason: `onSession callback rejected: ${msg}`,
+							});
 							emitUserLog({
 								level: "error",
-								msg: `E_INTERNAL: onSession callback rejected: ${msg}`,
+								msg: `E_INVALID_ARGUMENT: onSession callback rejected: ${msg}`,
 								sessionId: evt.id,
 								peerIp: evt.peerIp,
 								peerPort: evt.peerPort,
@@ -1226,6 +1791,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
+		congestionControl: opts.congestionControl ?? "default",
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);
@@ -1266,12 +1832,21 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				resolve({ code: 0, reason: "server closed" });
 			}
 			if (activeOnSessionCallbacks > 0) {
-				await Promise.race([
-					new Promise<void>((r) => {
-						onSessionDrainResolve = r;
-					}),
-					new Promise<void>((r) => setTimeout(r, 5000)),
-				]);
+				// Clear the timeout timer if the drain wins the race, so it does
+				// not keep the event loop alive up to 5s after close() resolves.
+				let drainTimer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						new Promise<void>((r) => {
+							onSessionDrainResolve = r;
+						}),
+						new Promise<void>((r) => {
+							drainTimer = setTimeout(r, 5000);
+						}),
+					]);
+				} finally {
+					if (drainTimer !== undefined) clearTimeout(drainTimer);
+				}
 			}
 		},
 		metricsSnapshot: () => handle.metricsSnapshot(),
@@ -1283,16 +1858,18 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 // ---------------------------------------------------------------------------
 
 class NativeClientSession implements ClientSession {
-	#nativeHandle: any;
+	#nativeHandle: NativeSessionHandle;
 	#readyPromise: Promise<void>;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#strictW3CErrors: boolean;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
+	#drainingPromise: Promise<void> | null = null;
 
 	constructor(
-		nativeHandle: any,
+		nativeHandle: NativeSessionHandle,
 		readyPromise: Promise<void>,
 		closedPromise: Promise<CloseInfo>,
 		strictW3CErrors = false,
@@ -1321,6 +1898,18 @@ class NativeClientSession implements ClientSession {
 		};
 	}
 
+	get has0Rtt(): boolean {
+		return this.#nativeHandle.has0Rtt ?? false;
+	}
+
+	get accepted0Rtt(): boolean {
+		return this.#nativeHandle.accepted0Rtt ?? false;
+	}
+
+	get handshakeConfirmed(): boolean {
+		return this.#nativeHandle.handshakeConfirmed ?? true;
+	}
+
 	get ready(): Promise<void> {
 		return this.#readyPromise;
 	}
@@ -1329,12 +1918,32 @@ class NativeClientSession implements ClientSession {
 		return this.#closedPromise;
 	}
 
+	get draining(): Promise<void> {
+		// Raced against `closed` so a session that ends without the peer ever
+		// draining does not leave this pending forever. An older prebuilt addon
+		// has no waitDraining, in which case close is the only signal available.
+		this.#drainingPromise ??= Promise.race(
+			[
+				this.#nativeHandle.waitDraining?.(),
+				this.#closedPromise.then(
+					() => undefined,
+					() => undefined,
+				),
+			].filter((p): p is Promise<void> => p !== undefined),
+		);
+		return this.#drainingPromise;
+	}
+
 	close(info?: CloseInfo): void {
 		if (!this.#closed) {
 			this.#closed = true;
 			this.#requestedCloseInfo = normalizeCloseInfo(info);
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
+	}
+
+	drain(): void {
+		if (!this.#closed) this.#nativeHandle.drain?.();
 	}
 
 	async sendDatagram(data: Uint8Array): Promise<void> {
@@ -1348,17 +1957,23 @@ class NativeClientSession implements ClientSession {
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const dgram = await this.#nativeHandle.readDatagram();
-				if (!dgram) break;
-				yield dgram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err, this.#strictW3CErrors);
-			}
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			const session = this;
+			this.#incomingDatagramsCache = (async function* () {
+				while (!session.#closed) {
+					try {
+						const dgram = await session.#nativeHandle.readDatagram();
+						if (!dgram) break;
+						yield dgram;
+					} catch (err) {
+						if (isSessionCloseError(err)) break;
+						throw toWebTransportError(err, session.#strictW3CErrors);
+					}
+				}
+			})();
 		}
+		return this.#incomingDatagramsCache;
 	}
 
 	async createBidirectionalStream(
@@ -1372,7 +1987,8 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new BidiStream({
@@ -1411,7 +2027,8 @@ class NativeClientSession implements ClientSession {
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new SendStream({
@@ -1442,14 +2059,70 @@ class NativeClientSession implements ClientSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
+	_connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
+
+	/** Current path MTU-derived max datagram payload size, or null when unknown. */
+	/** @internal */
+	_pathMaxDatagramSize(): number | null {
+		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
+			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
+			: null;
+	}
+}
+
+/** Wire-level QUIC connection stats reported by the native layer. */
+export interface QuicConnectionStats {
+	rttMs: number;
+	bytesSent: number;
+	bytesReceived: number;
+	packetsSent: number;
+	packetsReceived: number;
+	packetsLost: number;
+	maxDatagramSize?: number | null;
 }
 
 // ---------------------------------------------------------------------------
 // connect
 // ---------------------------------------------------------------------------
 
+function validateConnectUrl(url: string, strictW3CErrors?: boolean): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch (err) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: connect URL is invalid: ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+			strictW3CErrors,
+		);
+	}
+	if (parsed.protocol !== "https:") {
+		throw createMappedError(
+			E_UNSUPPORTED_ARGUMENT as ErrorCode,
+			`E_UNSUPPORTED_ARGUMENT: connect only supports https URLs, got ${parsed.protocol}`,
+			strictW3CErrors,
+		);
+	}
+	if (!parsed.hostname) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: connect URL must include a host",
+			strictW3CErrors,
+		);
+	}
+}
+
 function connectWithNative(
-	native: any,
+	native: NativeConnectOnlyAddon,
 	url: string,
 	optsJson: string,
 	handshakeTimeout: number,
@@ -1478,7 +2151,7 @@ function connectWithNative(
 			reject(err);
 		};
 
-		const onClosed = (events: any[]) => {
+		const onClosed = (events: NativeClientSessionEvent[]) => {
 			for (const evt of events) {
 				if (evt.name === "session_closed" && evt.id != null) {
 					const resolveClosed = closedResolvers.get(evt.id);
@@ -1493,7 +2166,7 @@ function connectWithNative(
 			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
 			const browserName =
 				strictW3CErrors === true
-					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ??
+					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode) ??
 						undefined)
 					: undefined;
 			settleReject(
@@ -1505,47 +2178,52 @@ function connectWithNative(
 			);
 		}, handshakeTimeout);
 
-		native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
-			if (err) {
-				settleReject(toWebTransportError(err, strictW3CErrors));
-				return;
-			}
-			if (handleId == null) {
-				settleReject(new Error("connect succeeded but no handle id"));
-				return;
-			}
-			const handle = native.takeClientSession(handleId);
-			if (!handle) {
-				settleReject(new Error("connect: handle not found in registry"));
-				return;
-			}
-			if (settled) {
-				try {
-					handle.close?.(0, "late connect completion after timeout");
-				} catch (closeErr) {
-					const msg =
-						closeErr instanceof Error ? closeErr.message : String(closeErr);
-					console.warn(
-						`[webtransport] late connect orphan cleanup failed: ${msg}`,
-					);
+		native.connect(
+			url,
+			optsJson,
+			onClosed,
+			(err: unknown, handleId?: string) => {
+				if (err) {
+					settleReject(toWebTransportError(err, strictW3CErrors));
+					return;
 				}
-				return;
-			}
-			let closedResolve!: (info: CloseInfo) => void;
-			const closedPromise = new Promise<CloseInfo>((r) => {
-				closedResolve = r;
-			});
-			closedResolvers.set(handle.id, closedResolve);
-			settleResolve(
-				new NativeClientSession(
-					handle,
-					Promise.resolve(),
-					closedPromise,
-					strictW3CErrors,
-					streamOpenWaitTimeoutMs,
-				),
-			);
-		});
+				if (handleId == null) {
+					settleReject(new Error("connect succeeded but no handle id"));
+					return;
+				}
+				const handle = native.takeClientSession(handleId);
+				if (!handle) {
+					settleReject(new Error("connect: handle not found in registry"));
+					return;
+				}
+				if (settled) {
+					try {
+						handle.close?.(0, "late connect completion after timeout");
+					} catch (closeErr) {
+						const msg =
+							closeErr instanceof Error ? closeErr.message : String(closeErr);
+						console.warn(
+							`[webtransport] late connect orphan cleanup failed: ${msg}`,
+						);
+					}
+					return;
+				}
+				let closedResolve!: (info: CloseInfo) => void;
+				const closedPromise = new Promise<CloseInfo>((r) => {
+					closedResolve = r;
+				});
+				closedResolvers.set(handle.id, closedResolve);
+				settleResolve(
+					new NativeClientSession(
+						handle as NativeSessionHandle,
+						Promise.resolve(),
+						closedPromise,
+						strictW3CErrors,
+						streamOpenWaitTimeoutMs,
+					),
+				);
+			},
+		);
 	});
 }
 
@@ -1570,11 +2248,78 @@ function connectWithNative(
  * session.close({ code: 1000, reason: "done" });
  * ```
  */
+function mapClientTlsOptions(tls: ClientOptions["tls"]):
+	| {
+			insecureSkipVerify: boolean;
+			caPem: string | undefined;
+			serverName: string | undefined;
+	  }
+	| undefined {
+	if (!tls) return undefined;
+	return {
+		insecureSkipVerify: tls.insecureSkipVerify ?? false,
+		caPem: tls.caPem
+			? typeof tls.caPem === "string"
+				? tls.caPem
+				: new TextDecoder().decode(tls.caPem)
+			: undefined,
+		serverName: tls.serverName,
+	};
+}
+
+/** JSON identity payload the native 0-RTT vault keys client state by. */
+function clientIdentityOptsJson(opts?: ClientOptions): string {
+	return JSON.stringify({
+		tls: mapClientTlsOptions(opts?.tls),
+		serverCertificateHashes: mapServerCertificateHashes(
+			opts?.serverCertificateHashes,
+		),
+	});
+}
+
+/**
+ * Drain this process's in-memory 0-RTT tickets for a client identity
+ * (optionally scoped to one server name) into an opaque vault. Returns a
+ * token to pass to {@link importTicketVault}, or null when there is nothing
+ * to export. Tokens reference live in-process state only — they are NOT
+ * durable and mean nothing after a process restart.
+ */
+export function exportTicketVault(
+	opts?: ClientOptions,
+	serverName?: string,
+): string | null {
+	const native = getNativeOrThrow();
+	if (typeof native.exportZeroRttVault !== "function") return null;
+	return native.exportZeroRttVault(
+		clientIdentityOptsJson(opts),
+		serverName ?? null,
+	);
+}
+
+/**
+ * Import a vault previously produced by {@link exportTicketVault} into a
+ * client identity's ticket store. Consumes the token; returns false when the
+ * token is unknown or already used.
+ */
+export function importTicketVault(
+	token: string,
+	opts?: ClientOptions,
+): boolean {
+	const native = getNativeOrThrow();
+	if (typeof native.importZeroRttVault !== "function") return false;
+	return native.importZeroRttVault(clientIdentityOptsJson(opts), token);
+}
+
 export async function connect(
 	url: string,
 	opts?: ClientOptions,
 ): Promise<ClientSession> {
+	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
+	validateConnectUrl(url, opts?.strictW3CErrors);
+	const serverCertificateHashes = mapServerCertificateHashes(
+		opts?.serverCertificateHashes,
+	);
 	if (
 		opts?.tls?.insecureSkipVerify === true &&
 		(opts.log !== undefined || !shouldSuppressInsecureSkipVerifyWarning())
@@ -1588,25 +2333,27 @@ export async function connect(
 		});
 	}
 
+	if (opts?.serverCertificateHashes !== undefined) {
+		validateServerCertificateHashes(
+			opts.serverCertificateHashes,
+			opts?.strictW3CErrors,
+		);
+	}
+	if (opts !== undefined) {
+		validateQpackOptions(opts, opts.strictW3CErrors);
+	}
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
-	const tlsOpts = opts?.tls
-		? {
-				insecureSkipVerify: opts.tls.insecureSkipVerify ?? false,
-				caPem: opts.tls.caPem
-					? typeof opts.tls.caPem === "string"
-						? opts.tls.caPem
-						: new TextDecoder().decode(opts.tls.caPem)
-					: undefined,
-				serverName: opts.tls.serverName,
-			}
-		: undefined;
+	const tlsOpts = mapClientTlsOptions(opts?.tls);
 	const optsJson = JSON.stringify({
 		limits: mergedLimits,
 		tls: tlsOpts,
 		congestionControl: opts?.congestionControl,
-		serverCertificateHashes: opts?.serverCertificateHashes,
+		serverCertificateHashes: serverCertificateHashes,
 		allowPooling: opts?.allowPooling,
 		requireUnreliable: opts?.requireUnreliable,
+		enable0Rtt: opts?.enable0Rtt,
+		qpackMaxTableCapacity: opts?.qpackMaxTableCapacity,
+		enableDynamicQpack: opts?.enableDynamicQpack,
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
@@ -1637,19 +2384,47 @@ export function clientPoolMetricsSnapshot(): {
 	};
 }
 
+/**
+ * Force-return freed native allocator memory to the OS.
+ *
+ * Never required for correctness. Useful for long-lived servers after load
+ * spikes and for memory evidence: the native allocator (mimalloc) retains
+ * freed pages briefly for reuse, and this purges them immediately across the
+ * native runtime threads. Returns false when the loaded addon predates the
+ * capability.
+ */
+export function releaseNativeMemory(): boolean {
+	const native = getNativeOrThrow();
+	return native.releaseNativeMemory?.() ?? false;
+}
+
 // ---------------------------------------------------------------------------
 // Browser-style WebTransport facade (Phase P1)
 // ---------------------------------------------------------------------------
 
 function validateServerCertificateHashes(
-	arr: Array<{ algorithm: string; value: BufferSource }>,
+	arr: unknown,
 	strictW3CErrors?: boolean,
 ): void {
+	if (!Array.isArray(arr)) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
+			strictW3CErrors,
+		);
+	}
+	if (arr.length === 0) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
+			strictW3CErrors,
+		);
+	}
 	for (const entry of arr) {
 		if (entry.algorithm !== "sha-256") {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				`E_INTERNAL: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				`E_UNSUPPORTED_ARGUMENT: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
 				strictW3CErrors,
 			);
 		}
@@ -1658,20 +2433,18 @@ function validateServerCertificateHashes(
 			!ArrayBuffer.isView(entry.value)
 		) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes entry value must be BufferSource",
 				strictW3CErrors,
 			);
 		}
-		if (
-			entry.value == null ||
-			(typeof entry.value === "object" &&
-				"byteLength" in entry &&
-				entry.byteLength === 0)
-		) {
+		// A SHA-256 digest is exactly 32 bytes. The previous check inspected
+		// `entry` (the wrapper) for a `byteLength` it never has, so empty or
+		// malformed hashes passed straight through to the native pin path.
+		if (entry.value.byteLength !== 32) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be non-empty BufferSource",
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: serverCertificateHashes sha-256 value must be exactly 32 bytes, got ${entry.value.byteLength}`,
 				strictW3CErrors,
 			);
 		}
@@ -1684,17 +2457,61 @@ function bufferSourceToUint8(value: BufferSource): Uint8Array {
 		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 	}
 	throw new WebTransportError(
-		E_INTERNAL as ErrorCode,
-		"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+		E_INVALID_ARGUMENT as ErrorCode,
+		"E_INVALID_ARGUMENT: serverCertificateHashes entry value must be BufferSource",
 	);
 }
 
-function bufferSourceToBase64(value: BufferSource): string {
-	return Buffer.from(bufferSourceToUint8(value)).toString("base64");
+function mapServerCertificateHashes(
+	hashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>,
+): Array<{ algorithm: "sha-256"; value: number[] }> | undefined {
+	if (hashes === undefined) return;
+	return hashes.map((entry) => ({
+		algorithm: entry.algorithm,
+		value: Array.from(bufferSourceToUint8(entry.value)),
+	}));
 }
 
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
+/** Hard cap on advertised QPACK dynamic-table capacity (mirrors the native `MAX_QPACK_TABLE_CAPACITY`, 64 KiB). */
+const MAX_QPACK_TABLE_CAPACITY = 65536;
 const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
+
+/**
+ * Both QPACK options, validated the same way on the server and the client.
+ * A capacity above the cap is rejected rather than clamped: silently
+ * advertising something other than what was asked for would be a worse answer
+ * than saying no.
+ */
+function validateQpackOptions(
+	opts: {
+		qpackMaxTableCapacity?: number;
+		enableDynamicQpack?: boolean;
+	},
+	strictW3CErrors?: boolean,
+): void {
+	if (
+		opts.enableDynamicQpack !== undefined &&
+		typeof opts.enableDynamicQpack !== "boolean"
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: enableDynamicQpack must be a boolean",
+			strictW3CErrors,
+		);
+	}
+	const cap = opts.qpackMaxTableCapacity;
+	if (
+		cap !== undefined &&
+		(!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY)
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
+			strictW3CErrors,
+		);
+	}
+}
 
 function validateClientOptions(
 	opts?: WebTransportClientOptions,
@@ -1706,8 +2523,8 @@ function validateClientOptions(
 		typeof opts.allowPooling !== "boolean"
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: allowPooling must be a boolean",
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: allowPooling must be a boolean",
 			strictW3CErrors,
 		);
 	}
@@ -1716,8 +2533,8 @@ function validateClientOptions(
 		typeof opts.requireUnreliable !== "boolean"
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: requireUnreliable must be a boolean",
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: requireUnreliable must be a boolean",
 			strictW3CErrors,
 		);
 	}
@@ -1726,8 +2543,8 @@ function validateClientOptions(
 		!VALID_CONGESTION.has(opts.congestionControl)
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
 			strictW3CErrors,
 		);
 	}
@@ -1736,24 +2553,37 @@ function validateClientOptions(
 		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
 			strictW3CErrors,
 		);
 	}
 	if (opts.serverCertificateHashes !== undefined) {
 		if (!Array.isArray(opts.serverCertificateHashes)) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes must be an array",
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
+				strictW3CErrors,
+			);
+		}
+		// An empty array is a silent pinning downgrade: the consumer asked for
+		// cert pinning but supplied no hashes. Reject rather than fall back to
+		// accept-any.
+		if (opts.serverCertificateHashes.length === 0) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
 				strictW3CErrors,
 			);
 		}
 		if (opts.allowPooling === true) {
-			throw new WebTransportError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true",
-				{ browserName: "NotSupportedError" },
+			// W3C mandates NotSupportedError for this combination regardless of
+			// the strict flag (asserted by parity-compat) — intentionally not
+			// gated on strictW3CErrors.
+			throw createMappedError(
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
+				true,
 			);
 		}
 		validateServerCertificateHashes(
@@ -1771,10 +2601,7 @@ function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 		limits: opts.limits,
 		congestionControl: opts.congestionControl,
 		strictW3CErrors: opts.strictW3CErrors,
-		serverCertificateHashes: opts.serverCertificateHashes?.map((entry) => ({
-			algorithm: entry.algorithm,
-			valueBase64: bufferSourceToBase64(entry.value),
-		})),
+		serverCertificateHashes: opts.serverCertificateHashes,
 		allowPooling: opts.allowPooling,
 		requireUnreliable: opts.requireUnreliable,
 	};
@@ -1842,6 +2669,9 @@ class SendScheduler {
 		if (this.#running) return;
 		this.#running = true;
 		try {
+			// Yield one microtask so writes enqueued in the same tick are all
+			// visible and can be dispatched in sendOrder-priority order.
+			await Promise.resolve();
 			while (this.#groupOrder.length > 0) {
 				const groupId = this.#nextGroup();
 				if (groupId == null) break;
@@ -1852,12 +2682,14 @@ class SendScheduler {
 				}
 				const task = q.shift()!;
 				if (q.length === 0) this.#removeGroup(groupId);
-				try {
-					await task.run();
-					task.resolve();
-				} catch (err) {
-					task.reject(err);
-				}
+				// Dispatch WITHOUT awaiting completion: QUIC streams are
+				// independent, and per-stream write ordering is already
+				// guaranteed by the WritableStream sink contract (the next
+				// sink write starts only after this task's promise settles).
+				// Awaiting here would head-of-line-block every other stream
+				// and all datagrams behind one backpressured peer stream.
+				// Backpressure is enforced per stream by the native layer.
+				task.run().then(task.resolve, task.reject);
 			}
 		} finally {
 			this.#running = false;
@@ -1912,6 +2744,8 @@ export class WebTransport {
 	#drainingResolve!: () => void;
 	#session: ClientSession | null = null;
 	#state: WebTransportState;
+	/** Close info captured when close() races an in-flight connect. */
+	#pendingCloseInfo: WebTransportCloseInfo | null = null;
 	#datagramsCache: WebTransportDatagramDuplexStream | null = null;
 	readonly #datagramsReadableType: "bytes" | "default";
 	#incomingBidiCache: ReadableStream<{
@@ -1946,25 +2780,54 @@ export class WebTransport {
 			this.#ready = this.#sessionPromise.then(
 				(s) => {
 					this.#session = s;
-					if (this.#state !== "draining") this.#state = "connected";
+					if (this.#state === "draining") {
+						// close() was called while connecting: the session must not
+						// outlive the transport. Close it now so `closed` settles and
+						// the QUIC connection is released instead of leaking until
+						// idle timeout.
+						s.close({
+							code: this.#pendingCloseInfo?.closeCode,
+							reason: this.#pendingCloseInfo?.reason,
+						});
+					} else {
+						this.#state = "connected";
+					}
 				},
 				(err) => {
 					this.#state = "failed";
 					throw err;
 				},
 			);
+			// Symmetric to `#closed` below: a consumer may observe only `closed`
+			// (e.g. via nativeToWebTransportLike, which forwards `ready`
+			// untouched) and never await `ready`. Attach a no-op handler so a
+			// connect-failure rejection on `ready` does not surface as an
+			// unhandled rejection (which aborts under
+			// --unhandled-rejections=strict). The getter returns this same
+			// rejecting promise, so awaiters still see the error.
+			this.#ready.catch(() => {});
 			this.#closed = this.#sessionPromise.then(
 				(s) =>
 					s.closed.then((info) => {
 						this.#state = "closed";
 						return toCloseInfo(info);
 					}),
-				() => {
-					// Connect failed: closed never rejects (PARITY_MATRIX).
-					this.#state = "closed";
-					return toCloseInfo({ code: 0, reason: "" });
+				(err) => {
+					// Connect failed: per W3C, `closed` rejects with the same
+					// error as `ready` (a resolved {closeCode:0} was
+					// indistinguishable from a clean close). Keep the "failed"
+					// state that the `ready` handler set — don't mask it as a
+					// clean "closed", which callers like getStats() guard on.
+					if (this.#state !== "failed") {
+						this.#state = "closed";
+					}
+					throw err;
 				},
 			);
+			// A consumer may await only `ready` (which also rejects on connect
+			// failure); attach a no-op handler so the spec-correct `closed`
+			// rejection does not surface as an unhandled rejection.
+			this.#closed.catch(() => {});
 		} else {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			this.#congestionControl = options?.congestionControl ?? "default";
@@ -1983,6 +2846,29 @@ export class WebTransport {
 		this.#draining = new Promise<void>((r) => {
 			this.#drainingResolve = r;
 		});
+		// `draining` also resolves when the session enters its closing phase via a
+		// remote/server-initiated close (not just local close()). Without this, a
+		// consumer awaiting `draining` to detect server shutdown would hang
+		// forever. `#drainingResolve` is idempotent, so a later local close() is
+		// harmless. (Both settle paths handled so a connect-failure rejection
+		// doesn't leave draining pending or surface unhandled.)
+		this.#closed.then(
+			() => this.#drainingResolve?.(),
+			() => this.#drainingResolve?.(),
+		);
+		// And it resolves on the real wire signal: a peer that sends
+		// WT_DRAIN_SESSION is saying the session is going away while leaving it
+		// usable, which is the case the two paths above cannot see. The close
+		// fallbacks stay — a peer that never drains must not hang consumers.
+		this.#sessionPromise.then(
+			(s) => {
+				s.draining.then(
+					() => this.#drainingResolve?.(),
+					() => this.#drainingResolve?.(),
+				);
+			},
+			() => {},
+		);
 	}
 
 	/** Resolves when handshake completes. Rejects with WebTransportError on connect failure. */
@@ -1990,7 +2876,11 @@ export class WebTransport {
 		return this.#ready;
 	}
 
-	/** Resolves with close info when session closes. Never rejects. */
+	/**
+	 * Resolves with close info when the session closes cleanly, and rejects
+	 * with a `WebTransportError` when the connection fails to establish (same
+	 * error as `ready`), per the W3C WebTransport spec.
+	 */
 	get closed(): Promise<WebTransportCloseInfo> {
 		return this.#closed;
 	}
@@ -2010,7 +2900,7 @@ export class WebTransport {
 		return new WebTransportSendGroup(this, this.#nextSendGroupId++);
 	}
 
-	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
+	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Lazily initialized and cached. */
 	get datagrams(): WebTransportDatagramDuplexStream {
 		if (!this.#datagramsCache) {
 			this.#datagramsCache = createDatagramStreams(
@@ -2119,7 +3009,17 @@ export class WebTransport {
 		if (this.#state === "failed") {
 			throw new DOMException("Transport has failed", "InvalidStateError");
 		}
-		await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		// If getStats() is called while still connecting and the connect then
+		// fails, awaiting #sessionPromise rejects with the raw connect error;
+		// surface the consistent InvalidStateError instead.
+		const s = await this.#sessionPromise.catch(() => {
+			throw new DOMException("Transport has failed", "InvalidStateError");
+		});
+		// Prefer wire-level QUIC stats from the native layer; fall back to
+		// facade byte tallies only when the native call is unavailable.
+		const quic = (
+			s as unknown as { _connectionStats?: () => QuicConnectionStats | null }
+		)._connectionStats?.();
 		return {
 			datagrams: {
 				droppedIncoming: 0,
@@ -2127,10 +3027,12 @@ export class WebTransport {
 				expiredOutgoing: 0,
 				lostOutgoing: 0,
 			},
-			bytesSent: this.#connStats.bytesSent,
-			bytesReceived: this.#connStats.bytesReceived,
-			packetsSent: this.#connStats.datagramsOut,
-			packetsReceived: this.#connStats.datagramsIn,
+			bytesSent: quic ? quic.bytesSent : this.#connStats.bytesSent,
+			bytesReceived: quic ? quic.bytesReceived : this.#connStats.bytesReceived,
+			packetsSent: quic ? quic.packetsSent : 0,
+			packetsReceived: quic ? quic.packetsReceived : 0,
+			smoothedRtt: quic ? quic.rttMs : undefined,
+			packetsLost: quic ? quic.packetsLost : undefined,
 			estimatedSendRate: null,
 		};
 	}
@@ -2141,6 +3043,7 @@ export class WebTransport {
 		if (this.#state === "connected" || this.#state === "connecting") {
 			this.#state = "draining";
 		}
+		if (info) this.#pendingCloseInfo = info;
 		if (this.#session) {
 			this.#session.close({
 				code: info?.closeCode,
@@ -2159,20 +3062,32 @@ export class WebTransport {
 		}
 	}
 
-	/** Internal: session for adapters (not part of spec) */
+	/** @internal */
 	async _getSession(): Promise<ClientSession> {
 		return this.#sessionPromise;
 	}
 
+	/** Internal: MTU-derived datagram size from the live session, if connected */
+	/** @internal */
+	_getPathMaxDatagramSize(): number | null {
+		const s = this.#session as unknown as {
+			_pathMaxDatagramSize?: () => number | null;
+		} | null;
+		return s?._pathMaxDatagramSize?.() ?? null;
+	}
+
 	/** Internal: state for createWritable guard (not part of spec) */
+	/** @internal */
 	_getState(): WebTransportState {
 		return this.#state;
 	}
 
+	/** @internal */
 	_isStrictW3CErrors(): boolean {
 		return this.#strictW3CErrors;
 	}
 
+	/** @internal */
 	_resolveSendPolicy(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
@@ -2201,6 +3116,7 @@ export class WebTransport {
 		return { groupId, sendOrder };
 	}
 
+	/** @internal */
 	_recordSendGroupBytes(groupId: number, bytes: number): void {
 		this.#sendGroupBytesSent.set(
 			groupId,
@@ -2208,6 +3124,7 @@ export class WebTransport {
 		);
 	}
 
+	/** @internal */
 	async _getSendGroupStats(groupId: number): Promise<{
 		bytesSent?: number;
 		bytesAcknowledged?: number;
@@ -2217,6 +3134,7 @@ export class WebTransport {
 		};
 	}
 
+	/** @internal */
 	async _sendDatagramWithPolicy(
 		chunk: Uint8Array,
 		policy: SendPolicy,
@@ -2230,11 +3148,13 @@ export class WebTransport {
 		});
 	}
 
+	/** @internal */
 	_recordIncomingDatagram(chunk: Uint8Array): void {
 		this.#connStats.bytesReceived += chunk.byteLength;
 		this.#connStats.datagramsIn += 1;
 	}
 
+	/** @internal */
 	_recordIncomingStreamBytes(bytes: number): void {
 		this.#connStats.bytesReceived += bytes;
 	}
@@ -2321,7 +3241,9 @@ function createDatagramStreams(
 			return createDatagramWritable(wt, wt._resolveSendPolicy(options));
 		},
 		get maxDatagramSize(): number {
-			return DEFAULT_LIMITS.maxDatagramSize;
+			// Path-MTU-derived value from QUIC when connected; configured
+			// default until the handshake completes.
+			return wt._getPathMaxDatagramSize() ?? DEFAULT_LIMITS.maxDatagramSize;
 		},
 	};
 }
@@ -2363,30 +3285,357 @@ function attachServerRecvControls(
 	return withControls;
 }
 
+type ServerIncomingStreamResource = {
+	dispose(): void;
+	reset(code?: number): void;
+	stopSending(code?: number): void;
+};
+
+class ServerIncomingBidiResource implements ServerIncomingStreamResource {
+	handle: NativeBidiStreamHandle | null;
+	disposed = false;
+	readableDone = false;
+	writableDone = false;
+	private writableStream: WritableStream<Uint8Array> | null = null;
+	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+
+	constructor(
+		nativeStream: NativeBidiStreamHandle,
+		onDisposed: (resource: ServerIncomingStreamResource) => void,
+	) {
+		this.handle = nativeStream;
+		this.onDisposed = onDisposed;
+	}
+
+	getWritable(): WritableStream<Uint8Array> {
+		return (this.writableStream ??= new WritableStream<Uint8Array>(this));
+	}
+
+	release(abort: boolean, code = 0): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const current = this.handle;
+		this.handle = null;
+		if (current) {
+			if (abort) {
+				try {
+					current.stopSending?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+				try {
+					current.reset?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+			}
+			try {
+				current.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
+			}
+		}
+		this.onDisposed(this);
+	}
+
+	dispose(): void {
+		this.release(true);
+	}
+
+	reset(code = 0): void {
+		this.release(true, code);
+	}
+
+	stopSending(code = 0): void {
+		try {
+			this.handle?.stopSending?.(code);
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+	}
+
+	async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			controller.close();
+			return;
+		}
+		try {
+			const chunk = await current.read();
+			if (this.disposed || this.handle !== current) return;
+			if (chunk === null) {
+				this.readableDone = true;
+				this.maybeRelease();
+				controller.close();
+				return;
+			}
+			controller.enqueue(chunk);
+		} catch (err) {
+			if (this.disposed) return;
+			this.readableDone = true;
+			this.release(true);
+			controller.error(toWebTransportError(err));
+		}
+	}
+
+	cancel(reason: unknown): void {
+		if (this.disposed) return;
+		this.readableDone = true;
+		// W3C half-close: canceling the readable stops only the peer's sending
+		// half. The writable half must stay usable for a response.
+		this.stopSending(extractStreamErrorCode(reason));
+		this.maybeRelease();
+	}
+
+	async write(chunk: Uint8Array): Promise<void> {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			await current.write(Buffer.from(chunk));
+		} catch (err) {
+			this.writableDone = true;
+			try {
+				current.reset?.(0);
+			} catch {
+				// Session teardown may already have closed the stream.
+			}
+			this.maybeRelease();
+			throw toWebTransportError(err);
+		}
+	}
+
+	async close(): Promise<void> {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			const finish = current.finishWait ?? current.finish;
+			if (finish) await finish.call(current);
+			this.writableDone = true;
+			this.maybeRelease();
+		} catch (err) {
+			this.writableDone = true;
+			try {
+				current.reset?.(0);
+			} catch {
+				// Session teardown may already have closed the stream.
+			}
+			this.maybeRelease();
+			throw toWebTransportError(err);
+		}
+	}
+
+	abort(reason: unknown): void {
+		if (this.disposed) return;
+		this.writableDone = true;
+		// W3C half-close: aborting the writable resets only our sending half;
+		// the readable half keeps delivering peer data.
+		try {
+			this.handle?.reset?.(extractStreamErrorCode(reason));
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+		this.maybeRelease();
+	}
+
+	private maybeRelease(): void {
+		if (this.readableDone && this.writableDone) this.release(false);
+	}
+}
+
+/**
+ * Keep the writable half allocation lazy for read-only consumers. The W3C
+ * surface still exposes the same stable writable stream once it is requested,
+ * but high-volume receive paths no longer allocate a sink they never use.
+ */
+function createServerIncomingBidiWebStreams(
+	nativeStream: NativeBidiStreamHandle,
+	onDisposed: (resource: ServerIncomingStreamResource) => void,
+): {
+	resource: ServerIncomingStreamResource;
+	stream: WebTransportBidirectionalStream;
+} {
+	const resource = new ServerIncomingBidiResource(nativeStream, onDisposed);
+	const readable = new ReadableStream<Uint8Array>(resource, {
+		highWaterMark: 0,
+	});
+	const stream = {
+		readable,
+		get writable(): WritableStream<Uint8Array> {
+			return resource.getWritable();
+		},
+	} as WebTransportBidirectionalStream;
+	return {
+		resource,
+		stream: attachServerBidiResourceControls(stream, resource),
+	};
+}
+
+function attachServerBidiResourceControls(
+	stream: {
+		readable: ReadableStream<Uint8Array>;
+		writable: WritableStream<Uint8Array>;
+	},
+	resource: ServerIncomingStreamResource,
+): WebTransportBidirectionalStream {
+	const withControls = stream as WebTransportBidirectionalStream;
+	withControls[WT_RESET] = (code?: number) => resource.reset(code);
+	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	return withControls;
+}
+
+class ServerIncomingUniResource implements ServerIncomingStreamResource {
+	handle: NativeRecvStreamHandle | null;
+	disposed = false;
+	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+
+	constructor(
+		nativeStream: NativeRecvStreamHandle,
+		onDisposed: (resource: ServerIncomingStreamResource) => void,
+	) {
+		this.handle = nativeStream;
+		this.onDisposed = onDisposed;
+	}
+
+	release(abort: boolean, code = 0): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const current = this.handle;
+		this.handle = null;
+		if (current) {
+			if (abort) {
+				try {
+					current.stopSending?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+			}
+			try {
+				current.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
+			}
+		}
+		this.onDisposed(this);
+	}
+
+	dispose(): void {
+		this.release(true);
+	}
+
+	reset(code = 0): void {
+		this.release(true, code);
+	}
+
+	stopSending(code = 0): void {
+		try {
+			this.handle?.stopSending?.(code);
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+	}
+
+	async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			controller.close();
+			return;
+		}
+		try {
+			const chunk = await current.read();
+			if (this.disposed || this.handle !== current) return;
+			if (chunk === null) {
+				this.release(false);
+				controller.close();
+				return;
+			}
+			controller.enqueue(chunk);
+		} catch (err) {
+			if (this.disposed) return;
+			this.release(true);
+			controller.error(toWebTransportError(err));
+		}
+	}
+
+	cancel(reason: unknown): void {
+		this.release(true, extractStreamErrorCode(reason));
+	}
+}
+
+function createServerIncomingUniWebReadable(
+	nativeStream: NativeRecvStreamHandle,
+	onDisposed: (resource: ServerIncomingStreamResource) => void,
+): {
+	resource: ServerIncomingStreamResource;
+	readable: WebTransportReceiveStream;
+} {
+	const resource = new ServerIncomingUniResource(nativeStream, onDisposed);
+	const readable = new ReadableStream<Uint8Array>(resource, {
+		highWaterMark: 0,
+	});
+	const withControls = readable as WebTransportReceiveStream;
+	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	return { resource, readable: withControls };
+}
+
 function createServerIncomingBidiStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
+	closedPromise?: Promise<unknown>,
 ): ReadableStream<WebTransportBidirectionalStream> {
+	// Pull-based: streams are accepted from native only as fast as the
+	// consumer reads them, so a slow/stalled consumer cannot pile up
+	// unbounded native handles in the queue.
+	let cancelled = false;
+	const activeStreams = new Set<ServerIncomingStreamResource>();
+	const removeActiveStream = (resource: ServerIncomingStreamResource) =>
+		activeStreams.delete(resource);
+	const disposeActiveStreams = () => {
+		for (const stream of activeStreams) stream.dispose();
+		activeStreams.clear();
+	};
+	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
-		async start(controller) {
-			while (!isClosed()) {
-				try {
-					const nativeStream = await nativeHandle.acceptBidiStream();
-					if (!nativeStream) break;
-					const duplex = new BidiStream({
-						handleId: nativeStream?.id ?? 0,
-						nativeHandle: nativeStream,
-					});
-					controller.enqueue(
-						attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
-					);
-				} catch (err) {
-					if (isClosed() || isSessionCloseError(err)) break;
-					controller.error(toWebTransportError(err));
+		async pull(controller) {
+			if (cancelled) return;
+			if (isClosed()) {
+				disposeActiveStreams();
+				controller.close();
+				return;
+			}
+			try {
+				const nativeStream = await nativeHandle.acceptBidiStream();
+				if (cancelled) {
+					nativeStream?.reset?.(0);
 					return;
 				}
+				if (!nativeStream) {
+					controller.close();
+					return;
+				}
+				const direct = createServerIncomingBidiWebStreams(
+					nativeStream,
+					removeActiveStream,
+				);
+				activeStreams.add(direct.resource);
+				controller.enqueue(direct.stream);
+			} catch (err) {
+				if (isClosed() || isSessionCloseError(err)) {
+					disposeActiveStreams();
+					controller.close();
+					return;
+				}
+				controller.error(toWebTransportError(err));
 			}
-			controller.close();
+		},
+		cancel() {
+			// Only stop accepting new streams. Streams already handed to the
+			// application stay owned by it and are released by their own
+			// lifecycle or by session close.
+			cancelled = true;
 		},
 	});
 }
@@ -2394,30 +3643,56 @@ function createServerIncomingBidiStreams(
 function createServerIncomingUniStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
+	closedPromise?: Promise<unknown>,
 ): ReadableStream<WebTransportReceiveStream> {
+	// Pull-based for the same backpressure reasons as the bidi variant.
+	let cancelled = false;
+	const activeStreams = new Set<ServerIncomingStreamResource>();
+	const removeActiveStream = (resource: ServerIncomingStreamResource) =>
+		activeStreams.delete(resource);
+	const disposeActiveStreams = () => {
+		for (const stream of activeStreams) stream.dispose();
+		activeStreams.clear();
+	};
+	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
-		async start(controller) {
-			while (!isClosed()) {
-				try {
-					const nativeStream = await nativeHandle.acceptUniStream();
-					if (!nativeStream) break;
-					const readable = new RecvStream({
-						handleId: nativeStream?.id ?? 0,
-						nativeHandle: nativeStream,
-					});
-					controller.enqueue(
-						attachServerRecvControls(
-							readable,
-							nodeReadableToWebReadable(readable),
-						),
-					);
-				} catch (err) {
-					if (isClosed() || isSessionCloseError(err)) break;
-					controller.error(toWebTransportError(err));
+		async pull(controller) {
+			if (cancelled) return;
+			if (isClosed()) {
+				disposeActiveStreams();
+				controller.close();
+				return;
+			}
+			try {
+				const nativeStream = await nativeHandle.acceptUniStream();
+				if (cancelled) {
+					nativeStream?.stopSending?.(0);
 					return;
 				}
+				if (!nativeStream) {
+					controller.close();
+					return;
+				}
+				const direct = createServerIncomingUniWebReadable(
+					nativeStream,
+					removeActiveStream,
+				);
+				activeStreams.add(direct.resource);
+				controller.enqueue(direct.readable);
+			} catch (err) {
+				if (isClosed() || isSessionCloseError(err)) {
+					disposeActiveStreams();
+					controller.close();
+					return;
+				}
+				controller.error(toWebTransportError(err));
 			}
-			controller.close();
+		},
+		cancel() {
+			// Only stop accepting new streams. Streams already handed to the
+			// application stay owned by it and are released by their own
+			// lifecycle or by session close.
+			cancelled = true;
 		},
 	});
 }
@@ -2426,24 +3701,34 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
 }> {
+	// Pull-based: accept from the session only as fast as the consumer reads.
+	let iter: AsyncIterator<Duplex> | null = null;
 	return new ReadableStream({
-		async start(controller) {
-			const s = await wt._getSession();
-			for await (const duplex of s.incomingBidirectionalStreams()) {
-				controller.enqueue(
-					await nodeDuplexToWebBidi(
-						duplex,
-						undefined,
-						undefined,
-						undefined,
-						(bytes) => {
-							wt._recordIncomingStreamBytes(bytes);
-						},
-						wt._isStrictW3CErrors(),
-					),
-				);
+		async pull(controller) {
+			if (!iter) {
+				const s = await wt._getSession();
+				iter = s.incomingBidirectionalStreams()[Symbol.asyncIterator]();
 			}
-			controller.close();
+			const { value: duplex, done } = await iter.next();
+			if (done) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(
+				await nodeDuplexToWebBidi(
+					duplex,
+					undefined,
+					undefined,
+					undefined,
+					(bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					},
+					wt._isStrictW3CErrors(),
+				),
+			);
+		},
+		cancel() {
+			void iter?.return?.();
 		},
 	});
 }
@@ -2451,21 +3736,31 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 function createIncomingUniStreams(
 	wt: WebTransport,
 ): ReadableStream<ReadableStream<Uint8Array>> {
+	// Pull-based: accept from the session only as fast as the consumer reads.
+	let iter: AsyncIterator<Readable> | null = null;
 	return new ReadableStream({
-		async start(controller) {
-			const s = await wt._getSession();
-			for await (const readable of s.incomingUnidirectionalStreams()) {
-				controller.enqueue(
-					nodeReadableToWebReadable(
-						readable,
-						(bytes) => {
-							wt._recordIncomingStreamBytes(bytes);
-						},
-						wt._isStrictW3CErrors(),
-					),
-				);
+		async pull(controller) {
+			if (!iter) {
+				const s = await wt._getSession();
+				iter = s.incomingUnidirectionalStreams()[Symbol.asyncIterator]();
 			}
-			controller.close();
+			const { value: readable, done } = await iter.next();
+			if (done) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(
+				nodeReadableToWebReadable(
+					readable,
+					(bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					},
+					wt._isStrictW3CErrors(),
+				),
+			);
+		},
+		cancel() {
+			void iter?.return?.();
 		},
 	});
 }
@@ -2477,6 +3772,7 @@ function nodeDuplexToWebBidi(
 	onWriteBytes?: (bytes: number) => void,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
+	destroyOnReadableCancel = false,
 ): Promise<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
@@ -2485,6 +3781,7 @@ function nodeDuplexToWebBidi(
 		duplex,
 		onReadBytes,
 		strictW3CErrors,
+		destroyOnReadableCancel,
 	);
 	const writable = nodeWritableToWebWritable(
 		duplex,
@@ -2496,43 +3793,43 @@ function nodeDuplexToWebBidi(
 	return Promise.resolve({ readable, writable });
 }
 
-/** Extract QUIC application error code from abort/cancel reason. */
-function extractStreamErrorCode(reason: unknown): number {
-	if (typeof reason === "number" && Number.isInteger(reason)) return reason;
-	const o =
-		reason && typeof reason === "object"
-			? (reason as Record<string, unknown>)
-			: null;
-	if (o) {
-		const c = (o.streamErrorCode ?? o.code) as unknown;
-		if (typeof c === "number" && Number.isInteger(c)) return c;
-	}
-	return 0;
-}
-
 function nodeReadableToWebReadable(
 	r: Readable,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
+	destroyOnCancel = true,
 ): ReadableStream<Uint8Array> {
 	const stopSendable = r as unknown as Partial<StopSendable>;
+	// Pull-based so the web stream's highWaterMark actually bounds buffering:
+	// a slow consumer stops pulls, which stops draining the native channel,
+	// which lets QUIC flow control push back on the peer. The previous eager
+	// start() loop buffered a fast sender unboundedly.
+	const iter = r[Symbol.asyncIterator]();
 	return new ReadableStream<Uint8Array>({
-		async start(controller) {
+		async pull(controller) {
 			try {
-				for await (const chunk of r) {
-					const bytes =
-						chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-					if (onReadBytes) onReadBytes(bytes.byteLength);
-					controller.enqueue(bytes);
+				const { value: chunk, done } = await iter.next();
+				if (done) {
+					controller.close();
+					return;
 				}
-				controller.close();
+				const bytes =
+					chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+				if (onReadBytes) onReadBytes(bytes.byteLength);
+				controller.enqueue(bytes);
 			} catch (err) {
 				controller.error(toWebTransportError(err, strictW3CErrors));
 			}
 		},
-		cancel(reason) {
+		async cancel(reason) {
 			const fn = stopSendable[WT_STOP_SENDING];
 			if (typeof fn === "function") fn.call(r, extractStreamErrorCode(reason));
+			// Abort the Node/native stream before asking its async iterator to
+			// return. A pending iterator.next() owns the N-API stream handle; if
+			// return() runs first, cancellation can wait on that read while the
+			// native stop/reset signal is still queued behind it.
+			if (destroyOnCancel && !r.destroyed) r.destroy();
+			await iter.return?.();
 		},
 	});
 }
@@ -2602,6 +3899,7 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 	);
 }
 
+/** @internal */
 export const __TESTING__ = {
 	createNativeClientSessionForTests,
 	createNativeServerSessionForTests,
@@ -2609,7 +3907,13 @@ export const __TESTING__ = {
 	createServerIncomingUniStreamsForTests: createServerIncomingUniStreams,
 	tryLoadNativeAddonForTests: tryLoadNativeAddon,
 	buildNativeAddonLoadErrorMessageForTests: buildNativeAddonLoadErrorMessage,
+	nativeAddonOverrideRequestsFromEnvForTests:
+		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
+	nativeStreamHandlesSnapshotForTests: () =>
+		native?.nativeStreamHandlesSnapshot?.(),
+	nativeErrorCodes: KNOWN_ERROR_CODES,
+	extractMessageErrorCodeForTests: extractMessageErrorCode,
 };
 
 /**
@@ -2634,3 +3938,9 @@ export const __TESTING__ = {
 export function toWebTransport(session: ClientSession): WebTransport {
 	return new WebTransport(session);
 }
+
+// Backend-agnostic facade: the same contract is implemented by the wasm
+// backend (`@webtransport-bun/webtransport/wasm`), letting application code
+// run unchanged against either backend.
+export type { WebTransportLike, WtBidiStream, WtCloseInfo } from "./shared.js";
+export { nativeToWebTransportLike } from "./webtransport-like-native.js";

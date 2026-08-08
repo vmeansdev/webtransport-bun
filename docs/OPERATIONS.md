@@ -10,17 +10,48 @@ Operational requirements:
 - UDP port must be reachable from the internet (firewall rules).
 - Certificates must be valid for the hostname used by clients/browsers.
 
+Canonical release truth: `docs/release-status.json`. This page describes operational guidance for the current candidate surfaces.
+
 ## Recommended defaults
 - Keep maxSessions conservative initially (e.g., 200–500) until tested.
 - Keep per-session queued bytes low (<= 2 MiB).
 - Prefer backpressure over drops; enable drop policy only for datagrams if you accept loss.
 
+## WASM footguns (multi-session / 0-RTT / QPACK)
+
+- **Primary CONNECT close tears down the whole QUIC connection** (and every
+  extra WT session on it). Close only non-primary sessions when you want
+  siblings to survive (`SessionClosed`).
+- **Inbound host-queue pressure** can also close the entire QUIC connection
+  (budget is keyed by `conn`, not per WT `sessionId`).
+- **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless
+  you set `shareProcess0RttTicketStore: true` (loopback / same-process resume
+  only). Optional `ticketStore` (JS `TicketStoreHost`) hydrates opaque client
+  tickets into the Rust store before connect. Manager `close()` auto-dumps when
+  a store is configured; `dumpTicketsToHost(authority)` remains available for
+  explicit dump after NST. Hosts: `MemoryTicketStoreHost`, `FileTicketStoreHost`
+  (Bun/Node), `IndexedDBTicketStoreHost` (IWA/browser).
+- **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
+  decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
+  index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.
+- **CONNECT admission (wasm)**: concurrent unlatched + active WT sessions are
+  capped by `wtMaxSessions` / peer `SETTINGS_WT_MAX_SESSIONS`; over-cap
+  CONNECTs get early RESET (no MiB HEADERS buffering). Handshake /
+  stream-open **rate-limit buckets are not charged** at CONNECT classify —
+  those buckets still gate UDP handshakes and WT stream opens only. Size
+  `wtMaxSessions` for CONNECT storm resistance; do not assume handshake
+  rate limits alone throttle Extended CONNECT floods.
+
 ## Enforced caps
 - Datagram size: maxDatagramSize (must respect negotiated QUIC max)
 - Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
+- WT sessions per QUIC connection: `wtMaxSessions` / `SETTINGS_WT_MAX_SESSIONS`
+  (pending client CONNECTs and server unlatched admitted CONNECTs count toward
+  the admission occupied set; see OPERATIONS CONNECT admission note)
 
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive
+- wasm: wtSessionsActive, sessionClosedCount (governor snapshot)
 - queuedBytesGlobal
 - datagramsDropped
 - backpressureTimeoutCount
@@ -145,6 +176,42 @@ When `queuedBytesGlobal` rises and stays high:
 2. Check `queuedBytesGlobal` in metrics—high queue can inflate RSS.
 3. Run `bun run test:soak-addon` with `SOAK_DURATION=300`; if RSS grows linearly, suspect leak.
 
+**Raw RSS vs charged memory on long-running servers.** The native backend
+uses a whole-program allocator (mimalloc) that keeps freed pages as
+reclaimable `MADV_FREE` arenas rather than returning them to the OS
+immediately. On a many-hour run this makes **raw RSS climb even when the
+process's charged/working-set memory is flat** — harmless with headroom, but
+on a memory-constrained host the kernel OOM-killer counts raw RSS and can
+kill an otherwise-healthy server. Call `releaseNativeMemory()` (which runs
+`mi_collect` and returns those arenas to the OS) **periodically** — e.g. every
+few minutes on a timer — for servers that run for hours on small instances.
+It is safe under live traffic (proven non-disruptive by the RSS soak) and is
+what the soak harness itself does via `SOAK_RELIEF_INTERVAL_MS`. Provision at
+least ~2× the observed steady-state RSS, and always configure swap on small
+instances.
+
+**Committed memory, not RSS, is what the OOM-killer's world bounds.** When
+swap is active the kernel pages out cold anonymous memory, so a leaking
+process can show a flat RSS while `RssAnon + VmSwap` grows without bound.
+The soak harness samples both from `/proc/self/status` (fields `rssAnonMb`,
+`vmSwapMb`, `committedMb` in the samples sidecar) and gates on committed
+drift. Its debug knobs:
+
+- `SOAK_COMMITTED_ABORT_MB` — circuit breaker; the segment aborts with a
+  partial artifact once committed memory crosses this (0 = off). Prefer this
+  on small hosts over letting the kernel SIGKILL with no evidence.
+- `SOAK_HEAP_DEBUG=1` — appends the top JSC object-type counts to a
+  `.heap-types.jsonl` sidecar every `SOAK_HEAP_DEBUG_INTERVAL_MS` (default
+  10 min). Heap scans are stop-the-world: they perturb the measurement, and
+  the knobs are recorded in the segment artifact (`debugKnobs`) so evidence
+  readers can see when they were active.
+
+**Minimum Bun runtime: 1.3.14.** Bun `<= 1.3.13` permanently leaks one
+`WritableStream` + rejection `Error` per stream whose close is rejected
+(peer STOP_SENDING racing a close). The soak harness refuses to record or
+aggregate evidence from older runtimes, and the library warns once at
+startup on them.
+
 ## Troubleshooting
 1) Browser cannot connect
 - Verify UDP port open
@@ -174,10 +241,10 @@ When `queuedBytesGlobal` rises and stays high:
 
 ## Known limitations and compatibility
 
-- Client `connect()` fully supported: datagrams, bidi/uni streams, metrics, configurable limits
-- macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
-- Runtime support: Bun >= 1.3.9, Node, Deno
-- Node-API addon portability applies across supported runtimes
+- Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
+- Configured target matrix: macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
+- Configured runtime matrix: Bun >= 1.3.14, Node, Deno
+- Node-API addon portability applies across the configured runtime matrix
 
 ## Public internet deployment
 

@@ -12,6 +12,20 @@ The API provides:
 
 All streams must use standard Node stream backpressure semantics (write() returns false + 'drain').
 
+## Protocol posture
+
+Both backends speak the draft-02/07 wire format, because that is what Chromium
+interoperates with and interop is the bar. Elements of draft-16 are adopted
+**additively, where they are free** — a session close now travels as a
+`WT_CLOSE_SESSION` capsule, drains as `WT_DRAIN_SESSION`, and stream error
+codes go through the §4.4 `WT_APPLICATION_ERROR` mapping. None of that changes
+the wire format Chromium sees, and all of it is verified against a real browser
+(`tools/interop/`).
+
+This is **not** a claim of draft-16 conformance. Full conformance is blocked
+upstream on `RESET_STREAM_AT`, which quinn does not implement; see
+`docs/PARITY_MATRIX.md` for what is and is not present on each backend.
+
 ## W3C facade parity status (current)
 Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-2026-02-04.md`).
 
@@ -29,7 +43,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
   - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
-- Remaining parity tracking and implementation sequencing are in `docs/PARITY_MATRIX.md` (see Priority Execution Order / Remaining Work).
+- Remaining parity tracking is in `docs/PARITY_MATRIX.md`, split into client-facade parity, portable server/session parity, intentional backend-specific extensions, and environment/distribution evidence.
 
 ## Pooling Semantics (allowPooling)
 
@@ -84,6 +98,10 @@ export type TlsOptions = {
 export type RateLimitOptions = {
   handshakesPerSec: number; handshakesBurst: number;
   handshakesBurstPerPrefix?: number; // per /24 IPv4 or /64 IPv6; default 100
+  // streams/datagrams limits are keyed PER PEER IP, not per session: N
+  // sessions from one address (NAT/CGNAT, proxies, load tests from one
+  // host) share a single budget. Size the limits for the address, not the
+  // session, when many clients can share an IP.
   streamsPerSec: number; streamsBurst: number;
   datagramsPerSec: number; datagramsBurst: number;
 };
@@ -176,6 +194,7 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 ### Server TLS / SNI semantics
 
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
+- `tls.keyPem` accepts unencrypted PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA (`BEGIN RSA PRIVATE KEY`) PEM. Encrypted keys are not supported. A key that does not match the leaf certificate's public key fails server construction.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
 - Server names are IDNA-normalized to canonical ASCII after trimming a trailing `.`, so Unicode inputs are matched by their punycode form.
 - Wildcards are supported only in the left-most label, for example `*.example.com`.
@@ -354,7 +373,38 @@ Examples (expected to work):
 
 ## API stability and semver
 
+### The three exported surfaces
+
+The package exports exactly three entrypoints, and they promise different
+things. `packages/webtransport/test/public-surface-contract.test.ts` freezes all
+three — the export lists at runtime, and the shared session/server contract both
+at compile time (`tsc --noEmit`) and against a live session from each backend.
+
+| Entrypoint | Contract |
+| --- | --- |
+| `@webtransport-bun/webtransport` (root) | Native Node-API server/client API. `createServer()` is **synchronous**. Node streams (`Duplex`/`Writable`) on the session stream constructors. Native-only capabilities live here and only here: `releaseNativeMemory()`, `exportTicketVault`/`importTicketVault`, `connect()`, `metricsToPrometheus()`, `ServerSession.goAway()`, SNI/cert rotation, keep-alive and congestion-control knobs. |
+| `@webtransport-bun/webtransport/wasm` | Async WASM/IWA API. `createServer()` returns a promise. Backend-specific extensions are allowed and documented here: Direct Sockets binding, `UdpTransport` injection, ticket-store hosts, `serveOverUdp`, self-signed cert generation and `certHashBase64` pinning. |
+| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. |
+
+Capabilities only one backend can honour stay out of `/portable` by design —
+native `goAway()` (the wasm h3 module has no control-stream `GOAWAY` handling),
+native keepalive and ticket-vault APIs, wasm ticket hosts, and IWA Direct
+Sockets. `PortableServer.certHashBase64` is the one deliberately optional field:
+wasm clients pin a hash, native clients chain-validate, so it is present on wasm
+and `undefined` on native.
+
+`/wasm` has a frozen export list but a `candidate` stability label; see
+`docs/release-status.json`. Freezing names is not the same as promising
+behavior under gates that have not passed.
+
+### Semver rules
+
 - **Stable surface**: Types and functions in this spec are the public API.
 - **Semver**: Major (X.0.0) for breaking changes; minor (x.Y.0) for additive changes; patch (x.y.Z) for fixes.
 - **Error codes**: E_* codes are stable; do not remove or change meaning.
 - **Metrics fields**: ServerMetricsSnapshot and SessionMetricsSnapshot field names are stable; new fields may be added in minor releases.
+- **`__TESTING__` is explicitly unstable**: the root module's `__TESTING__`
+  export is a bag of internal test seams (addon loading, session/stream
+  construction hooks). It is not part of this spec, is excluded from the frozen
+  export list, and may be reshaped or removed in any release without a major
+  bump. Do not depend on it outside this repository's own tests.

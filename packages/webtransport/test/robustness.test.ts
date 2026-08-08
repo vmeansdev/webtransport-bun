@@ -5,6 +5,7 @@
 import { describe, it, expect } from "bun:test";
 import { connect, createServer } from "../src/index.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
+import { forEachWithTimeout, nextWithTimeout } from "./helpers/harness.js";
 
 const BASE_PORT = 14500;
 
@@ -56,9 +57,14 @@ describe("robustness (Phase 4)", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const d of s.incomingDatagrams()) {
-					await s.sendDatagram(d);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"robustness abandon iterator incoming datagram",
+					async (d) => {
+						await s.sendDatagram(d);
+					},
+				);
 			},
 		});
 		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
@@ -67,7 +73,11 @@ describe("robustness (Phase 4)", () => {
 		try {
 			await client.sendDatagram(new Uint8Array([1, 2, 3]));
 			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
-			const pendingNext = iter.next();
+			const pendingNext = nextWithTimeout(
+				iter,
+				2000,
+				"robustness pending datagram settle on close",
+			);
 
 			// Abandon iteration by closing while a next() is pending; it must settle.
 			client.close();
@@ -90,8 +100,12 @@ describe("robustness (Phase 4)", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				(async () => {
-					for await (const _ of s.incomingDatagrams()) {
-					}
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						5000,
+						"robustness random action incoming datagram",
+						async () => undefined,
+					);
 				})().catch(() => {});
 			},
 		});

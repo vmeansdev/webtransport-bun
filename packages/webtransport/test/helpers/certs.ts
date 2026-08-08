@@ -24,7 +24,20 @@ function buildSubjectAltName(names: string[]): string {
 		.join(",");
 }
 
-export function generateCertForNames(names: string[]): GeneratedCert | null {
+export function generateCertForNames(
+	names: string[],
+	days = 30,
+	// Leaf key type. "ec" produces an ECDSA P-256 leaf, required for
+	// serverCertificateHashes pinning (W3C). Default "rsa" for the many tests
+	// that don't pin.
+	leafKeyType: "rsa" | "ec" = "rsa",
+	// PEM encoding for the emitted leaf key. openssl writes PKCS#8 ("PRIVATE
+	// KEY"); "sec1" re-encodes an EC key as "EC PRIVATE KEY".
+	keyFormat: "pkcs8" | "sec1" = "pkcs8",
+): GeneratedCert | null {
+	if (keyFormat === "sec1" && leafKeyType !== "ec") {
+		throw new Error("sec1 key format requires an ec leaf key");
+	}
 	if (names.length === 0) return null;
 	const dir = mkdtempSync(join(tmpdir(), "webtransport-bun-cert-"));
 	const certPath = join(dir, "cert.pem");
@@ -63,10 +76,13 @@ export function generateCertForNames(names: string[]): GeneratedCert | null {
 			"/CN=webtransport-bun test CA",
 		]);
 
+		const leafKeyArgs =
+			leafKeyType === "ec"
+				? ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
+				: ["-newkey", "rsa:2048"];
 		execFileSync("openssl", [
 			"req",
-			"-newkey",
-			"rsa:2048",
+			...leafKeyArgs,
 			"-sha256",
 			"-nodes",
 			"-keyout",
@@ -90,15 +106,22 @@ export function generateCertForNames(names: string[]): GeneratedCert | null {
 			"-out",
 			certPath,
 			"-days",
-			"30",
+			String(days),
 			"-sha256",
 			"-extfile",
 			extPath,
 		]);
+
+		// `openssl ec` writes SEC1 ("EC PRIVATE KEY") by default; go through a
+		// separate file so the input is never truncated under the reader.
+		const sec1Path = join(dir, "key-sec1.pem");
+		if (keyFormat === "sec1") {
+			execFileSync("openssl", ["ec", "-in", keyPath, "-out", sec1Path]);
+		}
 		return {
 			certPem:
 				readFileSync(certPath, "utf-8") + readFileSync(caCertPath, "utf-8"),
-			keyPem: readFileSync(keyPath, "utf-8"),
+			keyPem: readFileSync(keyFormat === "sec1" ? sec1Path : keyPath, "utf-8"),
 			cleanup: () => {
 				rmSync(dir, { recursive: true, force: true });
 			},

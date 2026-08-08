@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>WebTransport WASM IWA Demo</title>
+		<style>
+			body { font: 14px system-ui, sans-serif; margin: 2rem; max-width: 48rem; }
+			button { font: inherit; padding: 0.4rem 0.8rem; margin-right: 0.5rem; }
+			#log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; border-radius: 6px; min-height: 12rem; }
+			.hash { font-family: monospace; word-break: break-all; }
+		</style>
+	</head>
+	<body>
+		<h1>WebTransport server + client in the browser (WASM + Direct Sockets)</h1>
+		<p>
+			Runs a WebTransport server <em>and</em> a client inside this Isolated Web
+			App. The QUIC/TLS/HTTP3/WebTransport stack is Rust compiled to WASM; UDP
+			I/O uses the Direct Sockets <code>UDPSocket</code> API.
+		</p>
+		<p>
+			<button id="start-server" type="button">Start server</button>
+			<button id="connect-client" type="button">Run release proof</button>
+		</p>
+		<p>Server cert hash (<code>serverCertificateHashes</code>): <span id="hash" class="hash">—</span></p>
+		<div id="log"></div>
+		<script type="module" src="./app.js"></script>
+	</body>
+</html>

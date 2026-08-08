@@ -1,0 +1,21 @@
+{
+	"round": 4,
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"headAtReview": "a57df57",
+	"productCommit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"status": "SUPERSEDED_BY_ROUND4",
+	"note": "Canonical round-4 ledger is auto-review-progress-round4.json (COMPLETE_NOT_READY). This file no longer claims zero P0–P4 or claimPass PASS.",
+	"seeAlso": "auto-review-progress-round4.json",
+	"claimPass": {
+		"wasm-multi-session": "PENDING_RERUN",
+		"wasm-0rtt": "PENDING_RERUN",
+		"wasm-dynamic-qpack": "PENDING_RERUN",
+		"auto-review-zero-p0-p4": "REJECT"
+	},
+	"remainingP0P4": [
+		"see auto-review-progress-round4.json"
+	],
+	"verification": {
+		"coverageFloors": "see coverage-gates-floor-results.json (passed on candidate; prior round-2 note obsolete)"
+	}
+}

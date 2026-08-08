@@ -1,0 +1,14 @@
+{
+  "lane": 1,
+  "round": 2,
+  "verdict": "READY",
+  "note": "Late [Lane 1](056dfd23-52c8-40ed-bbd1-11ccefc0e57e) SEC-04 open was against pre-fix snapshot; occupied=unlatched+active_wt is in endpoint.rs.",
+  "findings": [
+    {"id": "SEC-01", "severity": "P1", "status": "fixed"},
+    {"id": "SEC-02", "severity": "P2", "status": "fixed"},
+    {"id": "SEC-03", "severity": "P2", "status": "invalidated"},
+    {"id": "SEC-04", "severity": "P2", "status": "fixed", "summary": "admission occupied = unlatched_connects + active_wt"},
+    {"id": "SEC-05", "severity": "P3", "status": "fixed"},
+    {"id": "SEC-06", "severity": "P3", "status": "invalidated"}
+  ]
+}

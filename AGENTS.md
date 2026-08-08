@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project goal
-Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
+Build a production-ready WebTransport implementation with Bun **v1.3.14+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
 - In-process **server** support (mandatory)
 - In-process **client** support
 - **Datagrams** (message-based) with Promise backpressure
@@ -13,7 +13,7 @@ Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the
 - QUIC implementation from scratch (use wtransport)
 
 ## Supported targets
-- Bun: **>= 1.3.9** (primary target)
+- Bun: **>= 1.3.14** (primary target)
 - Node: supported (Node-API compatible runtime)
 - Deno: supported (npm + Node-API addon support)
 - OS: macOS, Linux, Windows
@@ -106,3 +106,40 @@ Per-IP token buckets (defaults)
 - Each logical change must be **one scoped commit**.
 - Commit message format: **Verb + What + Why** (e.g. `Add error codes for stable programmatic handling`).
 - Do not bundle unrelated changes in a single commit.
+
+## Learned User Preferences
+- Prefer `bunx` over `npx` for running package binaries.
+- Keep one scoped logical change per commit; do not commit planning/instruction files (`INSTRUCTIONS_CURRENT_PHASE.md`, `Task.md`, `PRODUCTION_PLAN.md`, `PARITY_PLAN.md`, `POOLING_PLAN.md`, and similar plan markdown) unless explicitly asked.
+- When told to continue until all phases or subphases are done, keep going without pausing for per-step confirmation; partial completion is not enough.
+- Prefer project markdown docs under `docs/` rather than the repo root.
+- Prefer local Chrome on this machine for browser/IWA verification when available rather than assuming Chromium/Playwright is missing.
+- When diagnosing a local-verifiable gate (IWA/interop/harness), build and run the proof yourself instead of only explaining missing artifacts or blockers.
+- Rust native code must have its own unit-test coverage, separate from TypeScript tests, during development.
+- After scoped native/coverage refactors, run an auto-review pass and report before continuing related work.
+- For release-gap closure, prefer hybrid evidence re-runs: re-prove what can run locally and demote claims that cannot be honestly re-stamped (no theater or copied evidence).
+- Target production-grade 1.0 for both native and WASM; WASM 1.0 requires protocol expansion (multi-session, 0-RTT, dynamic QPACK) plus facade/API parity with native, not evidence-hardening alone.
+- When implementing an attached plan, do not edit the plan file itself; execute the plan as specified.
+
+## Learned Workspace Facts
+- Active 1.0 production work is on branch `feat/wasm-1.0` in the worktree at `/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0` (not `release/1.0-hardening`).
+- Phase execution is driven by `INSTRUCTIONS_CURRENT_PHASE.md` → infer/update `Task.md`, then execute until all phases are done.
+- Published package entrypoints target compiled JS and `.d.ts` under `dist/` with native addon binaries under `prebuilds/`.
+- Invalid client `caPem` must map to stable `E_TLS` (not `E_INTERNAL`).
+- When GitHub Actions are unavailable due to limits, continue local 1.0 hardening without waiting on CI.
+- Keep floored Rust logic modules (`session.rs`, `server.rs`) free of NAPI Env wrappers; put bindings in `*_napi.rs` / `server_spawn.rs` so llvm-cov floors stay honest.
+- Native llvm-cov floors (90% line / 90% function / 80% branch) apply to floored logic modules only; NAPI binding modules and `server_spawn` are intentionally outside those floors.
+- WASM (`crates/wasm/`) is a separate engine from native: sans-IO `quinn-proto` + hand-rolled H3/WT with JS-owned UDP I/O; native is napi + `wtransport` + Tokio.
+- Browser WASM networking for 1.0 is constrained to Chromium IWA + Direct Sockets; general browser-server outside that path is out of scope.
+- IWA Direct Sockets proofs need generated/signed web-bundle assets (`origin.txt`, `.wbn`/`.swbn`; typically gitignored) before `tools/interop/run-iwa.mjs`; packaged artifacts often live under `.release-evidence/iwa/`.
+- WASM soft facade gaps (pooling, `waitUntilAvailable`, real `getStats`/CC, sendOrder/sendGroup, live TLS/SNI, metrics/log, `WasmServerSession`) are largely closed on the candidate; ticket hosts use IndexedDB in IWA and memory/file on Bun; remaining non-parity is product/API (async `/wasm` vs native sync root, session shape, IWA-only browser host, Bun still prefers native).
+- WASM IWA plug-and-play server is async `createServer` / `createIwaServer` from the `/wasm` entrypoint over Direct Sockets; distinct from the root native sync `createServer`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as local markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.

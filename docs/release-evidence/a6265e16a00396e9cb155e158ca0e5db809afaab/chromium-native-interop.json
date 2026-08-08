@@ -1,0 +1,18 @@
+{
+ "commit": "a6265e16a00396e9cb155e158ca0e5db809afaab",
+ "claimId": "chromium-native-interop",
+ "createdAt": "2026-08-05T12:55:08.986Z",
+ "status": "passed",
+ "notes": "Full Playwright chromium-webtransport suite against the native addon server at the rebound candidate (includes the close-capsule peer-wait fork fix).",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.config.ts"
+ ],
+ "startedAt": "2026-08-05T12:54:58.931Z",
+ "endedAt": "2026-08-05T12:55:08.986Z",
+ "durationMs": 10055,
+ "exitCode": 0,
+ "artifactSha256": "2d79101a42ac0a684b30833f174e1af2a3e8a1703cb0f17830efdfb57e5c2792"
+}

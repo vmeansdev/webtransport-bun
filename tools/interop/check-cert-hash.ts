@@ -3,15 +3,11 @@
  * Cert hash self-check (no browser). Run: bun run check-cert-hash.ts
  * Validates getCertHashBase64() matches openssl certificate DER hash.
  */
-import { getCertHashBase64 } from "./cert-hash.js";
+import { getCertHashBase64, getInteropCertPath } from "./cert-hash.js";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const certPath = join(__dirname, "certs", "cert.pem");
+const certPath = getInteropCertPath();
 
 if (!existsSync(certPath)) {
 	console.error("Run: bun run prepare:interop");

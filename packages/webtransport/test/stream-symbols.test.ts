@@ -61,15 +61,16 @@ describe("WT stream symbols", () => {
 		expect(calls).toEqual([88]);
 	});
 
-	it("destroy without error does not emit reset/stopSending control frames", () => {
+	it("destroy without completed halves aborts the native bidi handle", () => {
 		const bidiCalls: number[] = [];
+		const bidiStopCalls: number[] = [];
 		const sendCalls: number[] = [];
 		const recvCalls: number[] = [];
 		const bidi = new BidiStream({
 			handleId: 10,
 			nativeHandle: {
 				reset: (code: number) => bidiCalls.push(code),
-				stopSending: (_code: number) => {},
+				stopSending: (code: number) => bidiStopCalls.push(code),
 				read: async () => null,
 				write: async (_chunk: Buffer) => {},
 				finish: () => {},
@@ -93,11 +94,75 @@ describe("WT stream symbols", () => {
 		bidi.destroy();
 		send.destroy();
 		recv.destroy();
-		expect(bidiCalls).toEqual([]);
+		expect(bidiCalls).toEqual([0]);
+		expect(bidiStopCalls).toEqual([0]);
 		expect(sendCalls).toEqual([]);
 		expect(recvCalls).toEqual([]);
 	});
 
+	it("clean completion of both halves emits no reset/stopSending control frames", async () => {
+		const resetCalls: number[] = [];
+		const stopCalls: number[] = [];
+		let disposed = false;
+		const bidi = new BidiStream({
+			handleId: 17,
+			nativeHandle: {
+				reset: (code: number) => resetCalls.push(code),
+				stopSending: (code: number) => stopCalls.push(code),
+				read: async () => null,
+				write: async (_chunk: Buffer) => {},
+				finish: () => {},
+				dispose: () => {
+					disposed = true;
+				},
+			},
+		});
+		const closed = new Promise<void>((resolve) => bidi.once("close", resolve));
+		bidi.resume();
+		bidi.end();
+		await closed;
+		expect(resetCalls).toEqual([]);
+		expect(stopCalls).toEqual([]);
+		expect(disposed).toBe(true);
+	});
+
+	it("destroy releases native stream resources before wrapper finalization", () => {
+		const disposed: string[] = [];
+		const bidi = new BidiStream({
+			handleId: 14,
+			nativeHandle: {
+				reset: () => {},
+				stopSending: () => {},
+				read: async () => null,
+				write: async () => {},
+				finish: () => {},
+				dispose: () => disposed.push("bidi"),
+			},
+		});
+		const send = new SendStream({
+			handleId: 15,
+			nativeHandle: {
+				reset: () => {},
+				write: async () => {},
+				finish: () => {},
+				dispose: () => disposed.push("send"),
+			},
+		});
+		const recv = new RecvStream({
+			handleId: 16,
+			nativeHandle: {
+				stopSending: () => {},
+				read: async () => null,
+				dispose: () => disposed.push("recv"),
+			},
+		});
+
+		bidi.destroy();
+		send.destroy();
+		recv.destroy();
+
+		expect(disposed.sort()).toEqual(["bidi", "recv", "send"]);
+	});
 	it("destroy(error) without external error listener logs fallback warning", async () => {
 		const stream = new BidiStream({
 			handleId: 13,

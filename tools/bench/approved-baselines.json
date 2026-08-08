@@ -1,0 +1,33 @@
+{
+  "status": "blocked",
+  "approvedAt": null,
+  "approver": null,
+  "commit": null,
+  "candidateRelationship": null,
+  "maxAncestryDistance": 32,
+  "machine": null,
+  "bunVersion": null,
+  "rustcVersion": null,
+  "toolchainHash": null,
+  "artifactSha256": null,
+  "artifactPath": null,
+  "minimumDetectableEffect": {
+    "relative": 0.1,
+    "confidence": 0.95
+  },
+  "designWarmups": 3,
+  "designRounds": 15,
+  "notes": [
+    "Populate this file only from a successful release-candidate benchmark capture.",
+    "Do not guess thresholds. bench-regress compares confidence intervals against the approved measured baseline in this file.",
+    "Gate design: detect a ≥10% relative non-overlapping CI95 regression at 95% confidence (warmups=3, rounds=15).",
+    "Approved baselines require: approver, artifactSha256+artifactPath (artifact.commit === baseline.commit), machine, toolchainHash."
+  ],
+  "thresholds": {},
+  "lastAttempt": {
+    "at": "2026-07-22T00:00:00Z",
+    "command": "bun run build:native && bun run bench:baseline",
+    "exitCode": 1,
+    "reason": "Local Task 14 baseline capture is blocked because the current rustc toolchain cannot build the native addon: rcgen 0.14.8 and time 0.3.47 require rustc 1.88+, while the workspace build path resolved to rustc 1.85.0."
+  }
+}

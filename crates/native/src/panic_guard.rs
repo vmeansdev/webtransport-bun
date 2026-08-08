@@ -45,10 +45,23 @@ where
     }
 }
 
+/// Teardown scope applied when a QUIC task panics. Keeps the blast radius
+/// proportional to what the task could have corrupted: never the whole process.
+pub enum PanicScope {
+    /// Close a single server-side session (stream/session-scoped tasks).
+    Session(String),
+    /// Close every session owned by one server instance (accept-loop tasks).
+    Server(u64),
+    /// Close a specific connection (client-side tasks).
+    Conn(wtransport::Connection),
+    /// Nothing to tear down beyond the task itself; log only.
+    LogOnly,
+}
+
 /// Spawn a Tokio task that touches QUIC. Panics in the task are contained:
-/// the runtime continues; a watcher logs and triggers teardown of all sessions.
+/// the runtime continues; a watcher logs and tears down only the given scope.
 /// Use this instead of `Runtime::spawn` for any task that drives wtransport/quinn.
-pub fn spawn_quic_task<F>(fut: F)
+pub fn spawn_quic_task_scoped<F>(scope: PanicScope, fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -64,8 +77,27 @@ where
                 } else {
                     eprintln!("webtransport-native: QUIC task panicked (contained)");
                 }
-                crate::session_registry::close_all(0, b"panic teardown");
+                match scope {
+                    PanicScope::Session(id) => {
+                        crate::session_registry::abort_session(&id, 0, b"panic teardown");
+                    }
+                    PanicScope::Server(owner) => {
+                        crate::session_registry::close_all_for_owner(owner, 0, b"panic teardown");
+                    }
+                    PanicScope::Conn(conn) => {
+                        conn.close(wtransport::VarInt::from_u32(0), b"panic teardown");
+                    }
+                    PanicScope::LogOnly => {}
+                }
             }
         }
     });
+}
+
+/// Legacy unscoped spawn: log-only containment. Prefer `spawn_quic_task_scoped`.
+pub fn spawn_quic_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    spawn_quic_task_scoped(PanicScope::LogOnly, fut);
 }

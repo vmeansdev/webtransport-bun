@@ -4,102 +4,210 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   parity:
     name: Parity (W3C facade)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          bun-version: "1.3.9"
-      - name: Build native addon
-        run: bun run build:native
+          # Ancestry checks for bench-regress need first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
       - name: Parity tests
         run: bun run test:parity
   soak:
     runs-on: ubuntu-latest
+    timeout-minutes: 18
+    permissions:
+      contents: read
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          bun-version: "1.3.9"
-      - run: bun run build:native
+          # Ancestry checks for bench-regress need first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
       - run: bun install --frozen-lockfile
-      - name: Soak (2 min)
-        run: SOAK_DURATION=120 bun tools/load/soak-addon.ts
-        timeout-minutes: 5
+      - run: bun run build:native
+      # The "2 min" is the main-load duration; the campaign's overload/idle/
+      # reconnect/rotation phases and their recovery windows run around it,
+      # for ~7 minutes wall (measured in container and on CI — the run that
+      # hit the old 5-minute bound was healthy and mid-phase).
+      # Right-sized to the shared runner like the load job: the default
+      # 500-session campaign saturates it (queued bytes climb monotonically —
+      # under-provisioned drain, not a leak) and drowns the trend rules'
+      # signal. These are soak-long's "small" capacity-profile numbers; the
+      # full-scale campaign runs on the dedicated soak-long lane.
+      - name: Soak (2 min main load)
+        run: SOAK_DURATION=120 SOAK_SESSIONS=150 SOAK_DATAGRAMS_PER_SEC=150 SOAK_STREAMS_PER_SEC=2 bun tools/load/soak-addon.ts
+        timeout-minutes: 12
+  wasm:
+    name: WASM backend + Chromium interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+      # ring compiles C for wasm32; use LLVM's clang/llvm-ar (not the macOS brew
+      # paths build-wasm.sh defaults to).
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Ancestry checks for bench-regress need first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install wasm C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      - name: Install wasm-bindgen-cli (pinned to crate version)
+        run: cargo install wasm-bindgen-cli --version 0.2.121 --locked
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Build native (for wasm-native-interop)
+        run: bun run build:native
+      - name: Build wasm + wasm-dist + full wasm Bun suite
+        run: bun run test:wasm
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Wasm native interop (requires pkg + native)
+        run: bun run test:wasm:interop
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Hole test — delete pkg and expect wasm suite red
+        run: |
+          rm -rf crates/wasm/pkg
+          if bun run test:wasm:hole; then
+            echo "expected wasm suite to fail without pkg" >&2
+            exit 1
+          fi
+          echo "hole test OK (suite failed without pkg)"
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Hole test — delete wasm-dist and expect dist behavioral red
+        run: |
+          rm -rf packages/webtransport/wasm-dist
+          if bun run test:wasm:dist-hole; then
+            echo "expected dist behavioral suite to fail without wasm-dist" >&2
+            exit 1
+          fi
+          echo "dist hole test OK"
+        env:
+          WEBTRANSPORT_REQUIRE_WASM_DIST: "1"
+      - name: Rebuild wasm after hole test
+        run: bun run build:wasm && bun run build:wasm:dist
+      - name: Interop (Chromium native client -> wasm server)
+        run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run playwright test -c playwright.wasm.config.ts
+        timeout-minutes: 6
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
     defaults:
       run:
         shell: bash
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        bun-version: ["1.3.9", "latest"]
+        bun: ["1.3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Ancestry checks for bench-regress need first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ${{ matrix.bun-version }}
+          bun-version: ${{ matrix.bun }}
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo audit
-        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2026-0009
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
+          cargo audit --file crates/wasm/Cargo.lock
       - name: cargo clippy
         run: cargo clippy --workspace -- -D clippy::all
       - name: cargo test
         run: cargo test --workspace
-      - name: Build native addon
-        run: bun run build:native
+      - name: Build test-fixture binaries
+        # The adversarial-protocol suite spawns crates/adversary. Build it in a
+        # visible, retryable step so its existsSync guard passes — building it
+        # inside the test's beforeAll swallows errors and flaked across runners.
+        run: cargo build -p adversary
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Build native addon
+        # Must follow `bun install`: build-native.ts resolves the pinned
+        # @napi-rs/cli from node_modules, which does not exist before install.
+        run: bun run build:native
       - name: Typecheck
         run: bun run typecheck
       - name: Unit tests
-        run: bun test packages/
-      - name: Flake guard (critical suites x3)
+        # Wasm Bun suites are ubuntu-only (wasm job). Exclude them here so
+        # existsSync(pkg) skipIf cannot false-green the OS/bun matrix.
+        run: >
+          bun test packages/
+          --path-ignore-patterns='**/wasm-*.test.ts'
+          --path-ignore-patterns='**/webtransport-like.test.ts'
+      - name: Flake guard (critical suite P3-10 x3)
         run: |
           for i in 1 2 3; do
             echo "RUN:$i acceptance P3-10"
             bun test packages/webtransport/test/acceptance.test.ts -t "P3-10: moderate load completes without panic"
+          done
+        timeout-minutes: 6
+      - name: Flake guard (critical suite P1.2 x3)
+        run: |
+          for i in 1 2 3; do
             echo "RUN:$i backpressure P1.2"
             bun test packages/webtransport/test/backpressure.test.ts -t "backpressure counters exist and have correct shape"
           done
-        timeout-minutes: 4
-      - name: Build reference + load-client
-        run: cargo build -p reference --bins
-      - name: Load-addon test
-        run: bun run test:load-addon
-        timeout-minutes: 5
-      - name: Load-scale-addon (200 sessions, 30s)
-        run: LOAD_SCALE_SESSIONS=200 LOAD_SCALE_DURATION=30 bun run test:load-scale-addon
         timeout-minutes: 3
-      - name: Benchmark (handshake)
-        run: bun run bench:handshake
-        timeout-minutes: 2
-      - name: Overload-addon test
-        run: bun run test:overload-addon
-        timeout-minutes: 2
-      - name: Load profiles (P2.1)
-        run: bun run test:load-profiles-addon
-        timeout-minutes: 5
       - name: Interop (Chromium)
-        run: cd tools/interop && bun install && bun run install:browsers && bun run prepare:interop && bun run playwright test
+        run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run prepare:interop && bun run playwright test
         timeout-minutes: 5
       - name: Smoke test (bun add from package)
         run: |
@@ -111,3 +219,159 @@ jobs:
           bun add file:$GITHUB_WORKSPACE/packages/webtransport
           echo 'import { createServer } from "@webtransport-bun/webtransport"; const s = createServer({ port: 19999, tls: { certPem: "", keyPem: "" }, onSession: () => {} }); console.log("ok"); s.close().then(() => process.exit(0));' > smoke.ts
           bun run smoke.ts
+
+  # Heavy load and stress campaigns run once on a dedicated Linux runner rather
+  # than in the 6-way test matrix: they flood the transport (handshake/stream/
+  # datagram floods, 200-session RSS campaign, overload shedding), and running
+  # them across 3 OS x 2 Bun on shared runners saturated loopback UDP delivery
+  # and flaked regardless of deadline tuning. The functional/RSS behavior is the
+  # same everywhere; the full 200-session release evidence is generated
+  # deliberately for a candidate (release-status.json / T11), not per push.
+  load:
+    name: Load and stress campaigns
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+      # Shared runners can push a single echo probe past the load-client's 2s
+      # default; give every load lane headroom. The load-phase error contract is
+      # unchanged — a probe that never echoes still fails.
+      LOAD_CLIENT_PROBE_TIMEOUT_MS: "15000"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # bench-regress ancestry needs first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
+      - name: Build reference + load-client
+        run: cargo build -p reference --bins
+      - name: Load-addon test
+        run: bun run test:load-addon
+        timeout-minutes: 5
+      - name: Load-scale-addon (strict RSS gate, 20 sessions)
+        # A shared runner occasionally STOP_SENDINGs a couple of the ~1500
+        # probe streams under concurrency; the 1% budget absorbs that while
+        # keeping the RSS gate (the lane's real purpose) strict. Release-grade
+        # evidence runs leave the rate at its 0 default.
+        run: LOAD_SCALE_SESSIONS=20 LOAD_SCALE_DURATION=15 LOAD_SCALE_MIN_LIVE_SESSIONS=20 LOAD_SCALE_MAX_STREAM_ERROR_RATE=0.01 bun run test:load-scale-addon
+        timeout-minutes: 5
+      - name: Benchmark (handshake)
+        run: bun run bench:handshake
+        timeout-minutes: 3
+      - name: Overload-addon test
+        run: bun run test:overload-addon
+        timeout-minutes: 3
+      - name: Load profiles (P2.1)
+        run: bun run test:load-profiles-addon
+        timeout-minutes: 8
+
+  package-consumers:
+    name: Exact package consumers (${{ matrix.os }} / Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node-version: "18.20.4"
+          - os: ubuntu-latest
+            node-version: "20.19.0"
+          - os: ubuntu-latest
+            node-version: "22.23.1"
+          - os: macos-latest
+            node-version: "18.20.4"
+          - os: macos-latest
+            node-version: "20.19.0"
+          - os: macos-latest
+            node-version: "22.23.1"
+          - os: windows-latest
+            node-version: "18.20.4"
+          - os: windows-latest
+            node-version: "20.19.0"
+          - os: windows-latest
+            node-version: "22.23.1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Ancestry checks for bench-regress need first-parent history beyond the tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
+        with:
+          deno-version: "2.9.3"
+      # ring's wasm32 C build needs an LLVM clang with the wasm32 backend; the
+      # default system/Apple clang cannot target wasm32. Match the wasm job's
+      # toolchain per OS and export the exact CC/AR into the environment.
+      - name: Install wasm C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # LLVM ships preinstalled on windows-latest runners.
+          LLVM_BIN="/c/Program Files/LLVM/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang.exe" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar.exe" >> "$GITHUB_ENV"
+      - name: Install exact release tooling
+        run: |
+          # npm@11 requires Node >=20.17; the package's engine floor is Node 18
+          # (bundled npm 10), so pin a Node-appropriate npm rather than breaking
+          # the Node-18 consumer lane with EBADENGINE.
+          NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+          if [ "$NODE_MAJOR" -ge 20 ]; then
+            npm install --global npm@11.18.0
+          else
+            npm install --global npm@10.9.4
+          fi
+          cargo install wasm-bindgen-cli --locked --version 0.2.121
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build and smoke the exact tarball in every supported runtime
+        run: |
+          bun scripts/test-package-artifact.ts build \
+            --verify-reproducible \
+            --runtime bun \
+            --runtime node \
+            --runtime deno

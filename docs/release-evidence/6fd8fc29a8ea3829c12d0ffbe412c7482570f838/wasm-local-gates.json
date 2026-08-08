@@ -1,0 +1,18 @@
+{
+ "commit": "6fd8fc29a8ea3829c12d0ffbe412c7482570f838",
+ "claimId": "wasm-local-gates",
+ "createdAt": "2026-08-05T14:53:07.977Z",
+ "status": "passed",
+ "notes": "bun run test:wasm at the rebound candidate (rebuild + dist + wasm suites).",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun run test:wasm"
+ ],
+ "startedAt": "2026-08-05T14:52:58.053Z",
+ "endedAt": "2026-08-05T14:53:07.977Z",
+ "durationMs": 9924,
+ "exitCode": 0,
+ "artifactSha256": "5ad21e16ddd512ec6ef03ecbebe6f087c31d991bc180c372b38e4caebbfa427b"
+}

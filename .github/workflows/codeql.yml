@@ -8,10 +8,17 @@ on:
   schedule:
     - cron: "18 3 * * 1"
 
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       security-events: write
       actions: read
@@ -22,15 +29,15 @@ jobs:
         language: ["javascript-typescript", "rust"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@e4c79b4e9ebfe577d446333c2e31ed81079e7b03 # v4 resolved 2026-07-21
         with:
           languages: ${{ matrix.language }}
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+        uses: github/codeql-action/autobuild@e4c79b4e9ebfe577d446333c2e31ed81079e7b03 # v4 resolved 2026-07-21
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@e4c79b4e9ebfe577d446333c2e31ed81079e7b03 # v4 resolved 2026-07-21

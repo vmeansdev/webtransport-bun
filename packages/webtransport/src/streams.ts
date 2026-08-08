@@ -58,12 +58,20 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	private readonly _handleId: StreamHandleId;
 	#nativeHandle: any;
 	#destroyed = false;
+	#readableEnded = false;
+	#writableFinished = false;
+	#nativeTerminationRequested = false;
 	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
 
 	constructor(opts: BidiStreamOptions) {
 		super({
 			...opts,
 			allowHalfOpen: true,
+			// autoDestroy stays false: it interferes with the separately-exposed
+			// Web Readable/Writable lifecycle. Instead we free the native handle
+			// explicitly once BOTH halves complete (see the end/finish listeners
+			// below) — previously the handle was stranded until GC on a bidi
+			// stream that completed cleanly.
 			autoDestroy: false,
 			readableHighWaterMark: opts.readableHighWaterMark ?? 256 * 1024,
 			writableHighWaterMark: opts.writableHighWaterMark ?? 256 * 1024,
@@ -72,6 +80,28 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		this.#nativeHandle = opts.nativeHandle;
 		this.#strictStreamErrors =
 			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		// Free the native handle when the stream completes cleanly: with
+		// autoDestroy:false, a bidi stream whose readable reaches EOF and whose
+		// writable finishes never runs _destroy() on its own, stranding the
+		// native handle until GC. Destroy once BOTH halves are done (half-open
+		// lifetimes are preserved because we wait for both events).
+		let readableEnded = false;
+		let writableFinished = false;
+		const freeWhenBothDone = () => {
+			if (readableEnded && writableFinished && !this.#destroyed) {
+				this.destroy();
+			}
+		};
+		this.once("end", () => {
+			readableEnded = true;
+			this.#readableEnded = true;
+			freeWhenBothDone();
+		});
+		this.once("finish", () => {
+			writableFinished = true;
+			this.#writableFinished = true;
+			freeWhenBothDone();
+		});
 		this.on("error", (err) => {
 			if (this.listenerCount("error") > 1) return;
 			const e = normalizeError(err);
@@ -150,15 +180,33 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	): void {
 		if (!this.#destroyed) {
 			this.#destroyed = true;
-			if (error) {
+			const nativeHandle = this.#nativeHandle;
+			// A forced destroy can leave a pending native read() promise holding the
+			// N-API handle alive. Abort both halves unless both Node halves completed
+			// cleanly, so session teardown wakes that read and releases the native
+			// stream object without adding a reset to a clean FIN/finish path.
+			if (
+				!this.#nativeTerminationRequested &&
+				(error || !this.#readableEnded || !this.#writableFinished)
+			) {
 				try {
-					this.#nativeHandle?.reset?.(0);
+					nativeHandle?.stopSending?.(0);
+				} catch {
+					// Session teardown may already have closed the native stream.
+				}
+				try {
+					nativeHandle?.reset?.(0);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					console.warn(
 						`[webtransport] bidi stream reset on destroy failed: ${msg}`,
 					);
 				}
+			}
+			try {
+				nativeHandle?.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
 			}
 			this.#nativeHandle = null;
 		}
@@ -168,7 +216,12 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	// -- Stream control extensions -------------------------------------------
 
 	[WT_RESET](code?: number): void {
-		this.#nativeHandle?.reset(code ?? 0);
+		this.#nativeTerminationRequested = true;
+		const resetCode = code ?? 0;
+		// Reset aborts the writable half. Stop the readable half as well so a
+		// pending native read bridge cannot retain the N-API handle after reset.
+		this.#nativeHandle?.stopSending?.(resetCode);
+		this.#nativeHandle?.reset(resetCode);
 		this.destroy();
 	}
 
@@ -265,15 +318,21 @@ export class SendStream extends Writable implements Resettable {
 	): void {
 		if (!this.#destroyed) {
 			this.#destroyed = true;
+			const nativeHandle = this.#nativeHandle;
 			if (error) {
 				try {
-					this.#nativeHandle?.reset?.(0);
+					nativeHandle?.reset?.(0);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					console.warn(
 						`[webtransport] unidirectional send stream reset on destroy failed: ${msg}`,
 					);
 				}
+			}
+			try {
+				nativeHandle?.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
 			}
 			this.#nativeHandle = null;
 		}
@@ -347,15 +406,21 @@ export class RecvStream extends Readable implements StopSendable {
 	): void {
 		if (!this.#destroyed) {
 			this.#destroyed = true;
+			const nativeHandle = this.#nativeHandle;
 			if (error) {
 				try {
-					this.#nativeHandle?.stopSending?.(0);
+					nativeHandle?.stopSending?.(0);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
 					console.warn(
 						`[webtransport] unidirectional recv stream stopSending on destroy failed: ${msg}`,
 					);
 				}
+			}
+			try {
+				nativeHandle?.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
 			}
 			this.#nativeHandle = null;
 		}

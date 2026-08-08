@@ -73,7 +73,7 @@ Use `replaceSniCerts()` when you want to swap the full hostname map while preser
 
 ## Requirements
 
-- Bun >= 1.3.9, or Node, or Deno
+- Bun >= 1.3.14, or Node, or Deno
 - TLS certificate and key (PEM format)
 - UDP port open (default 4433)
 
@@ -97,6 +97,50 @@ stream.on("data", (chunk: Buffer) => console.log("received:", chunk));
 // Clean up
 session.close();
 ```
+
+## WASM backend (server in the browser, or native-free hosts)
+
+The `/wasm` subpath runs the whole stack as WebAssembly — no `.node` addon.
+Read `docs/COMPATIBILITY.md` § "WASM backend" first: the in-browser *server*
+only works in a Chromium Isolated Web App (Direct Sockets), and pinned certs
+live at most 14 days.
+
+```ts
+import {
+  loadWasmModule,
+  serveOverUdp,
+  DirectSocketsUdpTransport,
+} from "@webtransport-bun/webtransport/wasm";
+
+const wasm = await loadWasmModule(); // prebuilt wasm shipped in the package
+
+// DirectSocketsUdpTransport.bind works inside a Chromium IWA;
+// pass a Bun UDP or InMemoryRelay bind factory elsewhere.
+const { manager, certHashBase64 } = await serveOverUdp(
+  wasm,
+  DirectSocketsUdpTransport.bind,
+  {
+    localPort: 4433,
+    onSession: (session) => session.onDatagram((d) => session.sendDatagram(d)),
+  },
+);
+
+// Give certHashBase64 to clients — they pin it:
+// new WebTransport("https://host:4433", { serverCertificateHashes: [
+//   { algorithm: "sha-256", value: base64ToArrayBuffer(certHashBase64) },
+// ]})
+```
+
+What you must handle yourself:
+
+- **Packet pumping and timers** — the core is sans-IO. The shipped adapters
+  (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) do this for you; a
+  custom transport must implement `UdpTransport` and honor the timeout hints.
+- **Cert rotation** — regenerate before the ≤ 14-day window closes and get the
+  new hash to your clients. Unlike the native server's `updateCert()`,
+  re-pinning is a client-side change: plan the distribution channel.
+- **IWA install** — flags, signing, and dev-mode install are documented in
+  `examples/webtransport-wasm-iwa/README.md`.
 
 ## Client (W3C-like facade)
 

@@ -1,0 +1,18 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "package-artifact",
+ "createdAt": "2026-08-06T15:44:55.393Z",
+ "status": "passed",
+ "notes": "Sequential test-package-artifact build then check at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun scripts/test-package-artifact.ts build && bun scripts/test-package-artifact.ts check"
+ ],
+ "startedAt": "2026-08-06T15:44:48.151Z",
+ "endedAt": "2026-08-06T15:44:55.393Z",
+ "durationMs": 7242,
+ "exitCode": 0,
+ "artifactSha256": "71a1077ca345c98605728a0c154b1f821d6d595d26235f36b83ece19dc91fb4f"
+}

@@ -1,0 +1,14 @@
+# Force LF for all text files on every platform. Policy tests assert exact
+# multi-line content of workflows and docs (internal-actions-policy,
+# internal-doc-truth); a CRLF checkout on Windows breaks those assertions and
+# any byte-exact evidence hashing.
+* text=auto eol=lf
+
+# Fuzz corpus seeds are raw byte inputs; never normalize them.
+tools/fuzz/corpora/** -text
+
+# Binary artifacts.
+*.node binary
+*.wasm binary
+*.png binary
+*.jpg binary

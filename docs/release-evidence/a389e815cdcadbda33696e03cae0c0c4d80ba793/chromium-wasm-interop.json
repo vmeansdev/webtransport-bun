@@ -1,0 +1,18 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "chromium-wasm-interop",
+ "createdAt": "2026-08-06T15:45:35.082Z",
+ "status": "passed",
+ "notes": "Chromium native client against the wasm server (playwright.wasm.config.ts) at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun run build:wasm && cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.wasm.config.ts"
+ ],
+ "startedAt": "2026-08-06T15:45:29.220Z",
+ "endedAt": "2026-08-06T15:45:35.082Z",
+ "durationMs": 5863,
+ "exitCode": 0,
+ "artifactSha256": "468d433837594783b579c010a6cdd421b9f267f7fbdd932b1d934a4d8369de00"
+}

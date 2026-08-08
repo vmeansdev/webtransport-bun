@@ -15,23 +15,15 @@ import {
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "../src/index.js";
-import { withHarness } from "./helpers/harness.js";
+import {
+	nextWithTimeout,
+	readWithTimeout,
+	waitFor,
+	withHarness,
+} from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 14700;
-
-async function waitUntil(
-	condition: () => boolean,
-	timeoutMs: number,
-	intervalMs = 25,
-): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (condition()) return true;
-		await Bun.sleep(intervalMs);
-	}
-	return condition();
-}
 
 async function connectWithRateLimitRetry(
 	url: string,
@@ -75,8 +67,13 @@ describe("P0.2 stable error codes", () => {
 			const client = h.track(
 				await connectWithRateLimitRetry(`https://127.0.0.1:${port}`, 4000),
 			);
-			const accepted = await waitUntil(() => serverSession != null, 4000);
-			if (!accepted) throw new Error("onSession never fired");
+			await waitFor(
+				() => serverSession,
+				Boolean,
+				4000,
+				25,
+				"server onSession acceptance",
+			);
 			const info = await serverSession.closed;
 			client.close();
 
@@ -148,15 +145,26 @@ describe("P0.2 stable error codes", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: async (s) => {
-						for await (const duplex of s.incomingBidirectionalStreams) {
+						const incoming =
+							s.incomingBidirectionalStreams[Symbol.asyncIterator]();
+						const next = await nextWithTimeout(
+							incoming,
+							5000,
+							"stopSending server incoming bidi",
+						);
+						if (!next.done && next.value) {
+							const duplex = next.value;
 							const reader = duplex.readable.getReader();
-							const first = await reader.read();
+							const first = await readWithTimeout(
+								reader,
+								5000,
+								"stopSending server first bidi chunk",
+							);
 							if (!first.done) {
 								(duplex as any)[WT_STOP_SENDING](0);
 								stopSendingCalled = true;
 							}
 							reader.releaseLock();
-							break;
 						}
 					},
 				}),
@@ -177,7 +185,13 @@ describe("P0.2 stable error codes", () => {
 				});
 			});
 			stream.write(Buffer.from("hello"));
-			while (!stopSendingCalled) await Bun.sleep(50);
+			await waitFor(
+				() => stopSendingCalled,
+				Boolean,
+				4000,
+				50,
+				"stopSending callback",
+			);
 			await Bun.sleep(300);
 
 			const writeWithCallback = (): Promise<void> =>
@@ -212,9 +226,16 @@ describe("P0.2 stable error codes", () => {
 					port,
 					tls: { certPem: "", keyPem: "" },
 					onSession: async (s) => {
-						for await (const duplex of s.incomingBidirectionalStreams) {
+						const incoming =
+							s.incomingBidirectionalStreams[Symbol.asyncIterator]();
+						const next = await nextWithTimeout(
+							incoming,
+							5000,
+							"E_STREAM_RESET incoming bidi",
+						);
+						if (!next.done && next.value) {
+							const duplex = next.value;
 							(duplex as any)[WT_RESET](42);
-							break;
 						}
 					},
 				}),

@@ -98,6 +98,7 @@ Detailed migration playbook:
 ## Documentation
 
 - Docs portal: `docs/START_HERE.md`
+- Canonical release truth: `docs/release-status.json`
 - Pooling semantics (`allowPooling`): `docs/SPEC.md` — Pooling Semantics section
 - GitHub Pages docs site: `https://vmeansdev.github.io/webtransport-bun/`
 - FAQ / troubleshooting: `docs/FAQ.md`
@@ -105,16 +106,20 @@ Detailed migration playbook:
 - AI-agent entrypoint: `llms.txt`
 
 ## Status
-- In active hardening.
-- Version: `0.3.0` (release candidate, not yet stable/GA).
-- Runtime support: Bun (`>= 1.3.9`), Node, Deno.
+- Native surface is a release candidate: `1.0.0-rc.1`.
+- Version: `1.0.0-rc.1`. The canonical release status lives in
+  `docs/release-status.json`; the native root entrypoint and `/wasm` are
+  candidate surfaces, not stable/GA.
+- Configured release targets: Bun (`>= 1.3.14`), Node, and Deno. Candidate support remains unclaimed until the matching entries in
+  `docs/release-status.json` have passing evidence.
 - Server and client APIs are available from `@webtransport-bun/webtransport`.
-- Known limits: Chromium-focused browser interop target, API still stabilizing through the `0.3.0` RC window.
+- Known limits: Chromium-focused browser interop target. Readiness remains pending in `docs/release-status.json` until the external evidence gates close.
+- Known runtime hazard: Bun `<= 1.3.13` permanently leaks one `WritableStream` (plus its rejection `Error`) for every stream whose close is rejected — e.g. any peer that drops its receive half. Long-running servers on those runtimes exhaust memory; the library warns once at startup. Use Bun `>= 1.3.14`.
 
-## Support Matrix
+## Configured Target Matrix
 
 ### Runtime
-- Bun `>= 1.3.9`
+- Bun `>= 1.3.14`
 - Node (Node-API compatible runtime)
 - Deno (npm + Node-API addon support)
 
@@ -135,9 +140,9 @@ pnpm add @webtransport-bun/webtransport
 yarn add @webtransport-bun/webtransport
 ```
 
-Published npm package contents:
+The candidate 1.0 npm artifact is configured to contain:
 - `dist/` compiled JS + TypeScript declarations (`index`, `errors`, `streams`)
-- `prebuilds/` native addon binaries (`.node`) for supported targets
+- `prebuilds/` native addon binaries (`.node`) for the configured target matrix
 - `README.md` and `LICENSE`
 
 Note: GitHub source zip/tar downloads are source snapshots and may not include generated `dist/`. Use npm install (or the release `.tgz` package asset) for a ready-to-run package.
@@ -180,6 +185,115 @@ Run multi-node compose collaboration example:
 ```bash
 bun run example:compose:collab
 ```
+
+## WASM Backend: WebTransport Server in the Browser
+
+Beyond the native napi-rs addon, the package ships a **sans-IO wasm backend**
+(`@webtransport-bun/webtransport/wasm`) that runs the full
+QUIC/TLS1.3/HTTP3/WebTransport stack compiled to `wasm32-unknown-unknown` —
+including a **server running inside the browser** (issue #12: bring your own
+UDP socket).
+
+The current release status is pending in `docs/release-status.json`; treat the
+`/wasm` surface as a candidate, not stable/GA.
+
+- **Bring your own socket**: the core never touches the network. Any transport
+  implementing `UdpTransport` (`send(data, dest)` + `onPacket(data, source)`)
+  feeds it raw UDP payloads — Direct Sockets `UDPSocket` in a Chromium
+  Isolated Web App, `Bun.udpSocket` in Bun, or an in-memory relay in tests.
+- **Server + client**: `serveOverUdp(...)` accepts sessions (multi-client,
+  routed per source address) and returns the `serverCertificateHashes` value;
+  `connectWasm(...)` / `createUnifiedClient(...)` connect as a client.
+- **Backend-agnostic contract**: `WebTransportLike` (exported from both the
+  root and `/wasm` subpaths) lets application code run unchanged against the
+  native or wasm backend.
+- **One server, either backend**: `webtransport-bun/portable` exports an async
+  `createServer` that dispatches on the runtime, handing your `onSession` the
+  same session shape on both. See below.
+- **Certs**: `generateCert` produces browser-pinnable ECDSA P-256 certs
+  (validity clamped to the 14-day `serverCertificateHashes` limit).
+
+```ts
+import { loadWasmModule, serveOverUdp } from "@webtransport-bun/webtransport/wasm";
+
+const wasm = await loadWasmModule(); // prebuilt artifact shipped in the package
+const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
+  localPort: 4433,
+  onSession: (session) => session.onDatagram((d) => session.sendDatagram(d)),
+});
+```
+
+The same echo server, written once and run on whichever backend the runtime
+provides:
+
+```ts
+import { createServer } from "@webtransport-bun/webtransport/portable";
+
+const server = await createServer({
+  port: 4433,
+  tls: { allowSelfSigned: true }, // wasm-only; pass certPem/keyPem on native
+  onSession: async (session) => {
+    for await (const d of session.incomingDatagrams()) {
+      await session.sendDatagram(d);
+    }
+  },
+});
+// wasm clients pin server.certHashBase64
+await server.close();
+```
+
+### Know before you ship
+
+- **`/wasm` is a candidate surface, not stable/GA — but its export list is
+  frozen.** Those are two different promises. The names exported from `/wasm`
+  are pinned by `packages/webtransport/test/public-surface-contract.test.ts`, so
+  removing or renaming one is a breaking change needing a major bump. What is
+  still `candidate` is the *stability label*: `docs/release-status.json` marks
+  both `native` and `wasm` as `candidate`, and `/wasm` becomes `stable` only
+  once its required claims pass. Behavior under those gates may still change.
+  The wasm server session mirrors the native `ServerSession` shape —
+  `incomingDatagrams()`, the incoming stream `ReadableStream`s, and `id`/`peer`
+  — so one server codebase runs on either backend through
+  `webtransport-bun/portable`, which is the subset actually contract-tested on
+  both. What remains divergent is the original callback-style API
+  (`onDatagram`/`onIncomingStream`), kept for back-compat but deprecated; it
+  cannot be combined with the W3C surface on the same session.
+- **The in-browser server is Chromium-only, and only inside an Isolated Web
+  App.** Direct Sockets `UDPSocket` does not exist on normal web pages, in
+  Firefox, or in Safari. Installing an IWA today requires `chrome://flags`
+  (`#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`) or
+  enterprise policy. Chromium permission naming is compatibility-sensitive:
+  accept `direct-sockets`, the legacy `direct-sockets-private`, and Chrome 151
+  `local-network` / `loopback-network` labels where the browser exposes them.
+  *Connecting* to a wasm server needs no flags - any standard WebTransport
+  client works.
+- **Certificates expire in ≤ 14 days by design.** `serverCertificateHashes`
+  pinning (the only option without a CA-trusted cert) requires ECDSA P-256 and
+  a validity window of at most two weeks — `generateCert` clamps to this.
+  Plan for rotation: regenerate and redistribute the hash before expiry;
+  clients pin the hash, so a new cert means a new hash.
+- **You bring the I/O — unless you use IWA plug-and-play.** The wasm core is
+  sans-IO: it never opens sockets, reads clocks, or schedules timers by itself.
+  Shipped adapters (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) pump
+  packets and drive timeouts. Inside a Chromium IWA with Direct Sockets,
+  `await createServer(...)` from `@webtransport-bun/webtransport/wasm` (alias
+  `createIwaServer`) owns bind + pumps for you. That is not the root package's
+  native sync `createServer`, and it still cannot run on a normal webpage.
+- **Client-side wasm works anywhere wasm runs** (Bun, Node, browsers) against
+  any WebTransport server — the IWA constraint applies only to hosting a
+  *server* in the browser.
+
+Typical use cases: browser-to-browser P2P on a LAN without WebRTC signaling,
+kiosk/enterprise IWAs accepting connections from local devices, offline or
+air-gapped networks, and in-page loopback for protocol testing against
+Chromium's own native client.
+
+See `examples/webtransport-wasm-iwa/` for the in-browser (IWA) reference,
+`tools/interop/WASM_INTEROP.md` for the cross-stack interop matrix, and
+`docs/PARITY_MATRIX.md` for native-vs-wasm feature parity (pooling, stats, CC,
+sendOrder, durable tickets, live TLS, metrics — IWA async `createServer` on
+`/wasm` is available as a candidate; lower-level hosts may still supply
+`UdpTransport`).
 
 ## Quickstart
 
@@ -258,7 +372,7 @@ await wt.closed;
 W3C-facade option semantics in this runtime:
 - `allowPooling`: when `true`, endpoint-level pooling reuses compatible connects; when `false`, dedicated sessions.
 - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities.
-- `serverCertificateHashes`: supported (SHA-256 leaf pinning) and rejected when combined with `allowPooling: true`.
+- `serverCertificateHashes`: supported (SHA-256 leaf pinning, W3C semantics — the pin replaces CA/hostname validation so self-signed pinned certs are accepted, with a ≤14-day cert-validity guard) and rejected when combined with `allowPooling: true`.
 - `datagramsReadableType`: `"bytes"` uses `ReadableByteStream` with BYOB; `"default"` uses normal `ReadableStream`.
 - `congestionControl`: accepted and surfaced via effective-mode behavior.
 

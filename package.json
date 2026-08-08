@@ -8,16 +8,26 @@
 	],
 	"scripts": {
 		"setup:hooks": "bash scripts/install-git-hooks.sh",
-		"build:native": "bun x @napi-rs/cli build --cwd crates/native --platform --release",
+		"build:native": "bun scripts/build-native.ts",
+		"build:wasm": "crates/wasm/build-wasm.sh",
+		"build:wasm:web": "crates/wasm/build-wasm.sh web",
+		"build:wasm:dist": "crates/wasm/build-wasm.sh dist",
+		"test:wasm": "crates/wasm/build-wasm.sh && bun run build:wasm:dist && bash -c 'n=$(ls packages/webtransport/test/wasm-*.test.ts | wc -l | tr -d \" \"); test \"$n\" -ge 14 || { echo \"expected ≥14 wasm-*.test.ts, found $n\" >&2; exit 1; }' && WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-0rtt.test.ts packages/webtransport/test/wasm-abuse.test.ts packages/webtransport/test/wasm-bun-udp.test.ts packages/webtransport/test/wasm-cert.test.ts packages/webtransport/test/wasm-datagram-echo.test.ts packages/webtransport/test/wasm-dist-behavioral.test.ts packages/webtransport/test/wasm-facade-options.test.ts packages/webtransport/test/wasm-facade.test.ts packages/webtransport/test/wasm-limits.test.ts packages/webtransport/test/wasm-multi-session.test.ts packages/webtransport/test/wasm-qpack-options.test.ts packages/webtransport/test/wasm-security-close.test.ts packages/webtransport/test/wasm-stream-echo.test.ts packages/webtransport/test/webtransport-like.test.ts",
+		"test:wasm:interop": "crates/wasm/build-wasm.sh && bun run build:native && WEBTRANSPORT_REQUIRE_WASM=1 bun test packages/webtransport/test/wasm-native-interop.test.ts",
+		"test:wasm:hole": "WEBTRANSPORT_REQUIRE_WASM=1 bun test packages/webtransport/test/wasm-datagram-echo.test.ts",
+		"test:wasm:dist-hole": "WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-dist-behavioral.test.ts",
 		"example:echo": "bun run examples/echo-playground/server.ts",
 		"example:echo:cert": "mkdir -p examples/echo-playground/certs && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 10 -nodes -keyout examples/echo-playground/certs/key.pem -out examples/echo-playground/certs/cert.pem -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost,IP:127.0.0.1'",
 		"example:echo:docker": "bash examples/echo-playground/run-docker.sh",
 		"example:compose:collab": "bash examples/compose-collab/run-compose.sh",
 		"test": "WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun test packages/",
+		"test:packages:cold-loop": "bun scripts/run-cold-loop.ts packages",
 		"test:ci-local": "bash scripts/test_ci_local.sh",
 		"test:parity": "WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun test --max-concurrency=1 packages/webtransport/test/parity-*.test.ts",
 		"typecheck": "tsc -p tsconfig.json",
-		"test:interop": "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun run playwright test",
+		"test:interop": "bun scripts/run-cold-loop.ts interop",
+		"test:interop:once": "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun run test:once",
+		"test:interop:wasm-server": "bun run build:wasm && cd tools/interop && bunx playwright test -c playwright.wasm.config.ts",
 		"test:load": "bun tools/load/load.ts",
 		"test:soak": "bun tools/load/soak.ts",
 		"test:overload": "bun tools/load/overload-session.ts",
@@ -34,12 +44,14 @@
 		"bench:stream": "bun tools/bench/stream-throughput.ts",
 		"bench:baseline": "bun tools/bench/baseline.ts",
 		"bench:regress": "bun tools/bench/bench-regress.ts",
-		"release:npm": "npm publish -w @webtransport-bun/webtransport --access public"
+		"fuzz:release-smoke": "bun tools/fuzz/release-smoke.ts",
+		"release:npm": "node -e \"console.error('Direct npm publishing is disabled. Use the GitHub Actions publish workflow from a successful release run.'); process.exit(1)\""
 	},
-  "devDependencies": {
-    "@biomejs/biome": "^2.2.4",
-    "@types/bun": "latest",
-    "@types/node": "^22.15.3",
-    "typescript": "^5"
-  }
+	"devDependencies": {
+		"@biomejs/biome": "2.4.4",
+		"@napi-rs/cli": "3.3.0",
+		"@types/bun": "1.3.14",
+		"@types/node": "22.19.11",
+		"typescript": "5.9.3"
+	}
 }

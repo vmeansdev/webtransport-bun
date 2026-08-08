@@ -1,6 +1,6 @@
 {
 	"name": "@webtransport-bun/webtransport",
-	"version": "0.3.0",
+	"version": "1.0.0-rc.1",
 	"description": "Production-focused WebTransport for Bun, Node, and Deno with datagrams and streams via a Rust napi-rs addon",
 	"license": "MIT",
 	"repository": {
@@ -27,16 +27,25 @@
 		".": {
 			"import": "./dist/index.js",
 			"types": "./dist/index.d.ts"
+		},
+		"./wasm": {
+			"import": "./dist/wasm.js",
+			"types": "./dist/wasm.d.ts"
+		},
+		"./portable": {
+			"import": "./dist/portable.js",
+			"types": "./dist/portable.d.ts"
 		}
 	},
 	"files": [
 		"dist/**/*",
 		"prebuilds/**/*",
+		"wasm-dist/**/*",
 		"README.md",
 		"LICENSE"
 	],
 	"engines": {
-		"bun": ">=1.3.9",
+		"bun": ">=1.3.14",
 		"node": ">=18"
 	},
 	"os": [
@@ -57,8 +66,12 @@
 		"prebuild:native": "cd ../.. && bun scripts/copy-prebuilds.ts",
 		"prebuild:build-and-copy": "cd ../.. && bun run build:native && bun scripts/copy-prebuilds.ts",
 		"prebuild:checksums": "cd ../.. && bun scripts/write-sha256sums.ts packages/webtransport/prebuilds",
-		"pack:check": "npm pack --dry-run",
-		"prepublishOnly": "npm run clean && npm run build && npm run prebuild:build-and-copy && npm run prebuild:checksums && npm run pack:check",
+		"build:wasm-dist": "cd ../.. && crates/wasm/build-wasm.sh dist",
+		"artifact:check": "bun ../../scripts/test-package-artifact.ts check",
+		"artifact:build": "bun ../../scripts/test-package-artifact.ts build",
+		"artifact:smoke": "bun ../../scripts/test-package-artifact.ts smoke",
+		"pack:check": "npm run artifact:check",
+		"prepublishOnly": "npm run artifact:build -- --verify-reproducible",
 		"test": "bun test",
 		"typecheck": "tsc --noEmit"
 	}

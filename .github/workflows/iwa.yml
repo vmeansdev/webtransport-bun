@@ -9,6 +9,12 @@ on:
   schedule:
     - cron: '0 4 * * *' # Daily at 4am
   workflow_dispatch:
+    inputs:
+      candidate_commit:
+        description: "Exact commit SHA to check out and bind the proof to (defaults to the dispatched ref)"
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -29,13 +35,19 @@ jobs:
       AR_wasm32_unknown_unknown: llvm-ar
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Release evidence must bind to the exact candidate commit even when
+          # the workflow definition rides a later branch head (same pattern as
+          # soak-long.yml's candidate_commit input).
+          ref: ${{ github.event.inputs.candidate_commit || github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
         with:
           toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.9"
+          bun-version: "1.3.14"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
         with:
           node-version: "22.23.1"
@@ -58,8 +70,21 @@ jobs:
           
       - name: Setup IWA packaging tools
         run: |
-          npm install --no-save --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1 playwright@1.58.2
-          timeout 10m npx playwright@1.58.2 install chromium chrome-beta
+          # npm's arborist crashes resolving inside the bun workspace root
+          # ("Cannot read properties of null (reading 'matches')"), so the
+          # bundling tools live in an isolated prefix; NODE_PATH covers the
+          # CJS require of wbn-sign and PATH covers the wbn CLI. Browser deps
+          # come from the interop package's own pinned lockfile.
+          mkdir -p "$RUNNER_TEMP/iwa-tools"
+          cd "$RUNNER_TEMP/iwa-tools"
+          npm init -y >/dev/null
+          npm install --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1
+          cd "$GITHUB_WORKSPACE"
+          echo "NODE_PATH=$RUNNER_TEMP/iwa-tools/node_modules" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/iwa-tools/node_modules/.bin" >> "$GITHUB_PATH"
+          cd tools/interop
+          bun install --frozen-lockfile
+          timeout 10m bun run playwright install chromium chrome-beta
 
       - name: Build native addon for Chromium interop
         run: bun run build:native
@@ -67,7 +92,7 @@ jobs:
       - name: Prove Chromium against the native addon server
         run: |
           cd tools/interop
-          INTEROP_EVIDENCE=1 npx playwright@1.58.2 test
+          INTEROP_EVIDENCE=1 bun run playwright test
 
       - name: Build node-target WASM for Chromium interop
         run: bun run build:wasm
@@ -75,14 +100,15 @@ jobs:
       - name: Prove Chromium against the WASM server under Bun
         run: |
           cd tools/interop
-          INTEROP_EVIDENCE=1 npx playwright@1.58.2 test -c playwright.wasm.config.ts
+          INTEROP_EVIDENCE=1 bun run playwright test -c playwright.wasm.config.ts
 
       - name: Prove the seeded user-space UDP fault matrix
         env:
           WT_FAULT_EVIDENCE_PATH: ${{ github.workspace }}/.release-evidence/interop/fault-matrix.json
         run: |
           cd tools/interop
-          npx playwright@1.58.2 test -c playwright.fault.config.ts
+          bun install --frozen-lockfile
+          bun run playwright test -c playwright.fault.config.ts
         
       - name: Package IWA
         run: |

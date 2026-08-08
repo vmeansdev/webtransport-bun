@@ -1,0 +1,20 @@
+{
+	"schemaVersion": 1,
+	"kind": "command",
+	"name": "supply-chain-provenance",
+	"commit": "b97e622d9e1ff6b6655e778e1e2281746c5616f7",
+	"platform": {
+		"os": "darwin",
+		"arch": "arm64",
+		"runtime": "bun"
+	},
+	"command": [
+		"bun",
+		"scripts/check-actions-pinned.ts"
+	],
+	"exitCode": 0,
+	"startedAt": "2026-07-27T14:44:34.143894+00:00",
+	"finishedAt": "2026-07-27T14:45:26.143894+00:00",
+	"notes": "actions pin policy (wall window ~1s; rebind batch stamp corrected in round-3 L6 follow-up) Rebound to candidate b97e622 after local gate re-verify.",
+	"artifactSha256": "8b9cfe0b16efb39ba6e5ddbb339678bf4c32356ab1fa3f246c0f5901b547351b"
+}

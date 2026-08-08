@@ -1,0 +1,8 @@
+{
+  "commit": "854e230e9958092fc01c94352cf2910ce6157eac",
+  "claimId": "wasm-multi-session",
+  "createdAt": "2026-07-27T12:19:28Z",
+  "status": "passed",
+  "notes": "Product surface: WtEvent session_id demux, session-scoped APIs, JS (conn,sessionId) map, openSession, SessionClosed; bun wasm-multi-session.test.ts + crates/wasm cargo test; Chromium wasm 5/5.",
+  "runner": "local-darwin-arm64"
+}

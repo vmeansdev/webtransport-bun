@@ -1,0 +1,17 @@
+{
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"claimId": "supply-chain-provenance",
+	"createdAt": "2026-07-27T16:23:54.641632Z",
+	"status": "passed",
+	"notes": "Actions pin and least-privilege policy passed across 11 workflows.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"bun",
+		"scripts/check-actions-pinned.ts"
+	],
+	"startedAt": "2026-07-27T16:23:54.609589Z",
+	"endedAt": "2026-07-27T16:23:54.641632Z",
+	"durationMs": 32,
+	"exitCode": 0,
+	"artifactSha256": "733bab2e9c61289cb48cf9b8af5be0a817d22f63f9a2cfdf68893312f40ece54"
+}

@@ -1,0 +1,10 @@
+{
+  "lane": 8,
+  "round": 2,
+  "verdict": "READY",
+  "findings": [
+    {"id": "L8-P1-qpack-half", "severity": "P1", "status": "fixed", "summary": "peer ICI→KRC + indexed outbound"},
+    {"id": "L8-P1-0rtt-nst", "severity": "P1", "status": "fixed", "summary": "NST flush + shared ClientConfig has0Rtt"},
+    {"id": "L8-P2-wire-ver", "severity": "P2", "status": "fixed", "summary": "eventWireVersion documented"}
+  ]
+}

@@ -49,3 +49,29 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # phase instructions and task tracking (do not commit)
 INSTRUCTIONS_CURRENT_PHASE.md
 Task.md
+
+# Local agent/session tooling — never committed to the product repo
+.chunkhound.json
+.chunkhound/
+.codex/
+.cursor/
+.mcp.json
+.mempalace/
+.omc/
+.zed/
+entities.json
+mempalace.yaml
+memory/
+scripts/mempal-sync-codex-convos.sh
+
+# Nested git worktrees checked out inside the repo directory
+/feat-wasm-1.0/
+
+# Prebuilt wasm artifacts (produced by build:wasm:dist at publish time)
+packages/webtransport/wasm-dist/
+
+# Generated release evidence artifacts
+.release-evidence/
+
+# Local planning/tracker scratch files — never committed
+/.scratch/

@@ -1,16 +1,93 @@
 import { describe, expect, it } from "bun:test";
 import { Duplex } from "node:stream";
 import {
-	__TESTING__,
+	E_BACKPRESSURE_TIMEOUT,
+	E_HANDSHAKE_TIMEOUT,
 	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
 	E_STOP_SENDING,
-	WebTransportError,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransport,
+	WebTransportError,
 } from "../src/index.js";
+import { __TESTING__ } from "../src/internal.js";
+import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
 
 describe("internal TS error propagation", () => {
+	it("native error parser only recognizes enumerated stable codes", async () => {
+		expect(__TESTING__.nativeErrorCodes).toEqual([
+			E_TLS,
+			E_HANDSHAKE_TIMEOUT,
+			E_SESSION_CLOSED,
+			E_SESSION_IDLE_TIMEOUT,
+			E_STREAM_RESET,
+			E_STOP_SENDING,
+			E_QUEUE_FULL,
+			E_BACKPRESSURE_TIMEOUT,
+			E_LIMIT_EXCEEDED,
+			E_RATE_LIMITED,
+			E_INVALID_ARGUMENT,
+			E_UNSUPPORTED_ARGUMENT,
+			E_INTERNAL,
+		]);
+
+		const session = __TESTING__.createNativeClientSessionForTests({
+			sendDatagram: async () => {
+				throw new Error("E_HANDSHAKE_TIMEOUTX: not a real code");
+			},
+			close: () => {},
+		});
+		await expect(
+			session.sendDatagram(new Uint8Array([1])),
+		).rejects.toMatchObject({
+			code: E_INTERNAL,
+		});
+	});
+
+	it("native error parser prefers explicit err.code when present", async () => {
+		const wrapped = new Error("not a real code message") as Error & {
+			code: string;
+		};
+		wrapped.code = "E_HANDSHAKE_TIMEOUT";
+		const session = __TESTING__.createNativeClientSessionForTests({
+			sendDatagram: async () => {
+				throw wrapped;
+			},
+			close: () => {},
+		});
+		await expect(
+			session.sendDatagram(new Uint8Array([1])),
+		).rejects.toMatchObject({
+			code: E_HANDSHAKE_TIMEOUT,
+			message: "not a real code message",
+		});
+	});
+
+	it("native error parser strips Bun GenericFailure prefix and prefers causal codes", () => {
+		expect(
+			__TESTING__.extractMessageErrorCodeForTests(
+				"GenericFailure, E_RATE_LIMITED: E_RATE_LIMITED: server rejected",
+			),
+		).toBe(E_RATE_LIMITED);
+		expect(
+			__TESTING__.extractMessageErrorCodeForTests(
+				"GenericFailure, E_SESSION_CLOSED: connection closed by peer: E_LIMIT_EXCEEDED (code 3992)",
+			),
+		).toBe(E_LIMIT_EXCEEDED);
+		expect(
+			__TESTING__.extractMessageErrorCodeForTests(
+				"E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out",
+			),
+		).toBe(E_BACKPRESSURE_TIMEOUT);
+	});
+
 	it("NativeClientSession.incomingDatagrams propagates non-close errors", async () => {
 		const session = __TESTING__.createNativeClientSessionForTests({
 			readDatagram: async () => {
@@ -21,7 +98,7 @@ describe("internal TS error propagation", () => {
 		const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
 		let err: unknown;
 		try {
-			await iter.next();
+			await nextWithTimeout(iter, 2000, "datagram error propagation read");
 		} catch (e) {
 			err = e;
 		}
@@ -37,7 +114,11 @@ describe("internal TS error propagation", () => {
 			close: () => {},
 		});
 		const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
-		const first = await iter.next();
+		const first = await nextWithTimeout(
+			iter,
+			2000,
+			"session-close datagram EOF read",
+		);
 		expect(first.done).toBe(true);
 	});
 
@@ -51,7 +132,7 @@ describe("internal TS error propagation", () => {
 		const iter = session.incomingBidirectionalStreams()[Symbol.asyncIterator]();
 		let err: unknown;
 		try {
-			await iter.next();
+			await nextWithTimeout(iter, 2000, "bidi accept error propagation read");
 		} catch (e) {
 			err = e;
 		}
@@ -69,7 +150,11 @@ describe("internal TS error propagation", () => {
 		const iter = session
 			.incomingUnidirectionalStreams()
 			[Symbol.asyncIterator]();
-		const first = await iter.next();
+		const first = await nextWithTimeout(
+			iter,
+			2000,
+			"idle-timeout uni EOF read",
+		);
 		expect(first.done).toBe(true);
 	});
 
@@ -83,7 +168,13 @@ describe("internal TS error propagation", () => {
 			() => false,
 		);
 		const reader = readable.getReader();
-		await expect(reader.read()).rejects.toMatchObject({ code: E_INTERNAL });
+		await expect(
+			readWithTimeout(
+				reader,
+				2000,
+				"server incoming bidi error propagation read",
+			),
+		).rejects.toMatchObject({ code: E_INTERNAL });
 	});
 
 	it("server incoming uni stream wrapper closes on session-closed failure", async () => {
@@ -96,8 +187,207 @@ describe("internal TS error propagation", () => {
 			() => false,
 		);
 		const reader = readable.getReader();
-		const result = await reader.read();
+		const result = await readWithTimeout(
+			reader,
+			2000,
+			"server incoming uni EOF read",
+		);
 		expect(result.done).toBe(true);
+	});
+
+	it("server incoming bidi wrappers release native handles when the session closes", async () => {
+		let resolveClosed!: () => void;
+		const closed = new Promise<void>((resolve) => {
+			resolveClosed = resolve;
+		});
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return null;
+					accepted = false;
+					return {
+						id: 1,
+						read: async () => null,
+						write: async () => {},
+						finish: () => {},
+					};
+				},
+			},
+			() => false,
+			closed,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(
+			reader,
+			2000,
+			"server incoming bidi wrapper read",
+		);
+		expect(result.done).toBe(false);
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const writer = result.value.writable.getWriter();
+		resolveClosed();
+		await Bun.sleep(0);
+		await expect(writer.write(new Uint8Array([1]))).rejects.toBeInstanceOf(
+			WebTransportError,
+		);
+		writer.releaseLock();
+		await reader.cancel();
+	});
+
+	it("canceling the incoming bidi reader leaves accepted streams usable", async () => {
+		const calls: string[] = [];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return new Promise(() => {});
+					accepted = false;
+					return {
+						id: 11,
+						read: () => new Promise(() => {}),
+						write: async () => {
+							calls.push("write");
+						},
+						finish: () => {
+							calls.push("finish");
+						},
+						reset: (code: number) => calls.push(`reset:${code}`),
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+						dispose: () => calls.push("dispose"),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(reader, 2000, "accept before cancel");
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const stream = result.value;
+		await reader.cancel();
+		await Bun.sleep(0);
+		expect(calls).toEqual([]);
+		const writer = stream.writable.getWriter();
+		await writer.write(new Uint8Array([1]));
+		await writer.close();
+		expect(calls).toContain("write");
+		expect(calls).toContain("finish");
+		expect(calls.filter((c) => c.startsWith("reset"))).toEqual([]);
+	});
+
+	it("canceling the incoming uni reader leaves accepted streams readable", async () => {
+		const calls: string[] = [];
+		const chunks: (Buffer | null)[] = [Buffer.from([9]), null];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingUniStreamsForTests(
+			{
+				acceptUniStream: async () => {
+					if (!accepted) return new Promise(() => {});
+					accepted = false;
+					return {
+						id: 12,
+						read: async () => chunks.shift() ?? null,
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+						dispose: () => calls.push("dispose"),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(
+			reader,
+			2000,
+			"accept uni before cancel",
+		);
+		if (result.done || !result.value) throw new Error("missing uni stream");
+		const accepted0 = result.value;
+		await reader.cancel();
+		await Bun.sleep(0);
+		expect(calls).toEqual([]);
+		const streamReader = accepted0.getReader();
+		const first = await readWithTimeout(
+			streamReader,
+			2000,
+			"post-cancel uni read",
+		);
+		expect(first.done).toBe(false);
+		expect(Array.from(first.value ?? [])).toEqual([9]);
+	});
+
+	it("readable.cancel keeps the writable half usable (W3C half-close)", async () => {
+		const calls: string[] = [];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return null;
+					accepted = false;
+					return {
+						id: 2,
+						read: () => new Promise(() => {}),
+						write: async () => {
+							calls.push("write");
+						},
+						finish: () => {
+							calls.push("finish");
+						},
+						reset: (code: number) => calls.push(`reset:${code}`),
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(reader, 2000, "half-close accept");
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const stream = result.value;
+		await stream.readable.cancel();
+		const writer = stream.writable.getWriter();
+		await writer.write(new Uint8Array([1]));
+		await writer.close();
+		expect(calls).toContain("stop:0");
+		expect(calls).toContain("write");
+		expect(calls).toContain("finish");
+		expect(calls.filter((c) => c.startsWith("reset"))).toEqual([]);
+	});
+
+	it("writable.abort keeps the readable half delivering (W3C half-close)", async () => {
+		const calls: string[] = [];
+		const chunks: (Buffer | null)[] = [Buffer.from([7]), null];
+		let accepted = true;
+		const readable = __TESTING__.createServerIncomingBidiStreamsForTests(
+			{
+				acceptBidiStream: async () => {
+					if (!accepted) return null;
+					accepted = false;
+					return {
+						id: 3,
+						read: async () => chunks.shift() ?? null,
+						write: async () => {},
+						finish: () => {},
+						reset: (code: number) => calls.push(`reset:${code}`),
+						stopSending: (code: number) => calls.push(`stop:${code}`),
+					};
+				},
+			},
+			() => false,
+		);
+		const reader = readable.getReader();
+		const result = await readWithTimeout(reader, 2000, "half-close accept 2");
+		if (result.done || !result.value) throw new Error("missing bidi stream");
+		const stream = result.value;
+		const writer = stream.writable.getWriter();
+		await writer.abort();
+		const streamReader = stream.readable.getReader();
+		const first = await readWithTimeout(streamReader, 2000, "post-abort read");
+		expect(first.done).toBe(false);
+		expect(Array.from(first.value ?? [])).toEqual([7]);
+		const second = await readWithTimeout(streamReader, 2000, "post-abort EOF");
+		expect(second.done).toBe(true);
+		expect(calls).toContain("reset:0");
+		expect(calls.filter((c) => c.startsWith("stop"))).toEqual([]);
 	});
 
 	it("Web Streams adapters apply strictW3CErrors to stream write failures", async () => {
@@ -111,9 +401,14 @@ describe("internal TS error propagation", () => {
 		const session = {
 			id: "wrapped",
 			peer: { ip: "127.0.0.1", port: 4433 },
+			has0Rtt: false,
+			accepted0Rtt: false,
+			handshakeConfirmed: true,
 			ready: Promise.resolve(),
 			closed,
+			draining: new Promise<void>(() => {}),
 			close() {},
+			drain() {},
 			sendDatagram: async () => {},
 			async *incomingDatagrams() {},
 			createBidirectionalStream: async () => duplex,

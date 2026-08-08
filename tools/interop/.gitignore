@@ -5,6 +5,7 @@ node_modules
 out
 dist
 interop-evidence.json
+interop-evidence-wasm.json
 *.tgz
 
 # code coverage

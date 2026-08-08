@@ -6,8 +6,42 @@
  */
 
 import { createServer } from "../../packages/webtransport/src/index.ts";
+import type { ServerSession } from "../../packages/webtransport/src/index.ts";
 import { $ } from "bun";
 import { existsSync } from "node:fs";
+
+/**
+ * Consume everything the client floods at us. A no-op handler leaves incoming
+ * streams unclaimed, so per-session active-stream limits fill up and the
+ * server rejects the overflow with reset/stop_sending(0) — which the
+ * load-client counts as stream errors. Use the native zero-copy discard path
+ * (same one distributed-scale drains with): streams are consumed in Rust and
+ * their guards release without a JS round-trip per stream, so the flood is
+ * serviced at wire speed. Echo is deliberately absent — probe echo coverage
+ * lives in load-addon/load-scale, and the client runs with --skip-probes.
+ */
+const DRAIN_TIMEOUT_MS = 120_000;
+type DiscardFn = (timeoutMs?: number) => Promise<number | null | undefined>;
+type DiscardingSession = ServerSession & {
+	discardIncomingDatagrams?: DiscardFn;
+	discardIncomingBidiStreams?: DiscardFn;
+	discardIncomingUniStreams?: DiscardFn;
+};
+function drainSession(session: ServerSession): void {
+	const s = session as DiscardingSession;
+	// Asymmetry: the stream calls switch on a PERSISTENT native discard mode,
+	// but datagram discard is a bounded loop that stops at its deadline — so
+	// re-arm it until the session closes (null) or the API is absent
+	// (undefined). Without the loop, a profile longer than the timeout would
+	// silently stop draining datagrams halfway through.
+	void (async () => {
+		while ((await s.discardIncomingDatagrams?.(DRAIN_TIMEOUT_MS)) != null) {
+			// re-arm
+		}
+	})().catch(() => {});
+	void s.discardIncomingBidiStreams?.(DRAIN_TIMEOUT_MS).catch(() => {});
+	void s.discardIncomingUniStreams?.(DRAIN_TIMEOUT_MS).catch(() => {});
+}
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/debug/load-client`;
@@ -32,7 +66,12 @@ async function runProfile(
 	datagramsPerSec: number,
 	streamsPerSec: number,
 	maxSessionErrors: number,
-	rateLimits?: { handshakesBurst?: number; handshakesPerSec?: number },
+	rateLimits?: {
+		handshakesBurst?: number;
+		handshakesPerSec?: number;
+		streamsPerSec?: number;
+		streamsBurst?: number;
+	},
 ): Promise<{ pass: boolean; msg: string }> {
 	await killPort4433();
 
@@ -41,7 +80,7 @@ async function runProfile(
 		tls: { certPem: "", keyPem: "" },
 		limits: { maxSessions: Math.min(sessions + 50, 5000) },
 		rateLimits: rateLimits ?? undefined,
-		onSession: () => {},
+		onSession: drainSession,
 	});
 	await Bun.sleep(5000);
 
@@ -60,6 +99,10 @@ async function runProfile(
 			String(streamsPerSec),
 			"--max-session-errors",
 			String(maxSessionErrors),
+			// Profiles measure flood robustness against a non-echoing server;
+			// the per-session probe suite requires the echo protocol (covered by
+			// load-addon and load-scale) and would fail every session here.
+			"--skip-probes",
 		],
 		{
 			cwd: ROOT,
@@ -96,7 +139,12 @@ async function main() {
 		dg: number;
 		st: number;
 		maxErr: number;
-		rateLimits?: { handshakesBurst?: number; handshakesPerSec?: number };
+		rateLimits?: {
+			handshakesBurst?: number;
+			handshakesPerSec?: number;
+			streamsPerSec?: number;
+			streamsBurst?: number;
+		};
 	}> = [
 		{
 			name: "handshake flood",
@@ -113,6 +161,14 @@ async function main() {
 			dg: 5,
 			st: 50,
 			maxErr: 0,
+			// All 8 sessions share 127.0.0.1, so the default per-peer limiter
+			// (200 streams/s, burst 400) would shed ~half of the 400/s flood by
+			// design. Raise the limiter for this profile so maxErr=0 asserts the
+			// data path services the full flood. The stream limiter's shed path
+			// itself is unit-covered in crates/native/src/rate_limit.rs (no
+			// profile exercises it end-to-end; the contention profile floods
+			// the handshake limiter, not the stream limiter).
+			rateLimits: { streamsPerSec: 600, streamsBurst: 1200 },
 		},
 		{
 			name: "datagram flood",

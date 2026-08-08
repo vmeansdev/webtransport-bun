@@ -6,22 +6,31 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+webtransport_test_seams = []
+
 [dependencies]
 dashmap = "6"
 napi = { version = "2", features = ["async", "tokio_rt"] }
 napi-derive = "2"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time", "io-util"] }
-wtransport = { version = "=0.7.0", features = ["dangerous-configuration", "quinn"] }
+wtransport = { workspace = true }
 once_cell = "1"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.8"
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
 sha2 = "0.10"
 base64 = "0.22"
 idna = "1"
+x509-parser = "0.18.1"
+# Global allocator for this dylib's Rust allocations. The macOS system malloc
+# never returns freed small-zone pages to the OS (malloc_zone_pressure_relief
+# is a measured no-op on macOS 26), which left load-proportional RSS resident
+# after fully drained closes. mimalloc purges freed pages back to the OS.
+mimalloc = { version = "0.1", default-features = false }
 
 [build-dependencies]
 napi-build = "2"
