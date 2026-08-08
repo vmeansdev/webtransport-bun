@@ -1285,6 +1285,10 @@ const HEAP_DEBUG = process.env.SOAK_HEAP_DEBUG === "1";
 const HEAP_DEBUG_INTERVAL_MS = Number(
 	process.env.SOAK_HEAP_DEBUG_INTERVAL_MS ?? 10 * 60 * 1000,
 );
+/** Debug-run circuit breaker: abort (with evidence flushed) once committed
+ * memory crosses this, instead of letting the kernel SIGKILL the process the
+ * way run 31134714109 died. 0 = disabled (default; release gates unchanged). */
+const COMMITTED_ABORT_MB = Number(process.env.SOAK_COMMITTED_ABORT_MB ?? 0);
 
 type JscHeapStats = {
 	heapSize: number;
@@ -2029,6 +2033,15 @@ async function runSegment(): Promise<void> {
 				samplesOut,
 				`${JSON.stringify(samples[samples.length - 1])}\n`,
 			);
+			if (
+				COMMITTED_ABORT_MB > 0 &&
+				procMem &&
+				procMem.rssAnonMb + procMem.vmSwapMb > COMMITTED_ABORT_MB
+			) {
+				throw new Error(
+					`committed memory ${(procMem.rssAnonMb + procMem.vmSwapMb).toFixed(0)}MB exceeded SOAK_COMMITTED_ABORT_MB=${COMMITTED_ABORT_MB}`,
+				);
+			}
 			if (metrics.queuedBytesGlobal > DEFAULT_LIMITS.maxQueuedBytesGlobal) {
 				throw new Error(
 					`queuedBytesGlobal ${metrics.queuedBytesGlobal} exceeded ${DEFAULT_LIMITS.maxQueuedBytesGlobal}`,
