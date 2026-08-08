@@ -55,6 +55,16 @@ on:
         description: "Stable continuity token reused across every segment of one campaign"
         required: true
         type: string
+      committed_abort_mb:
+        description: "Abort with a partial artifact once RssAnon+VmSwap exceeds this many MB (0 disables); avoids evidence-free kernel SIGKILLs on small hosts"
+        required: false
+        default: "1500"
+        type: string
+      heap_debug:
+        description: "1 streams periodic JSC object-type counts to a heap-types sidecar (stop-the-world scans; recorded in debugKnobs)"
+        required: false
+        default: "0"
+        type: string
 jobs:
   soak:
     permissions:
@@ -237,6 +247,8 @@ jobs:
           INPUT_CANDIDATE_REF: ${{ github.event.inputs.candidate_ref }}
           INPUT_CAMPAIGN_SEED: ${{ github.event.inputs.campaign_seed }}
           INPUT_CONTINUITY_TOKEN: ${{ github.event.inputs.continuity_token }}
+          INPUT_COMMITTED_ABORT_MB: ${{ github.event.inputs.committed_abort_mb }}
+          INPUT_HEAP_DEBUG: ${{ github.event.inputs.heap_debug }}
           INPUT_DURATION_HOURS: ${{ github.event.inputs.duration_hours || '1' }}
           INPUT_RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
           INPUT_SEGMENT_INDEX: ${{ github.event.inputs.segment_index || '1' }}
@@ -306,6 +318,8 @@ jobs:
           SOAK_SEED="$INPUT_CAMPAIGN_SEED" \
           SOAK_CONTINUITY_TOKEN="$INPUT_CONTINUITY_TOKEN" \
           SOAK_PREVIOUS_FINAL_HASH="${PREVIOUS_FINAL_HASH:-}" \
+          SOAK_COMMITTED_ABORT_MB="${INPUT_COMMITTED_ABORT_MB:-1500}" \
+          SOAK_HEAP_DEBUG="${INPUT_HEAP_DEBUG:-0}" \
           bun tools/load/soak-addon.ts
         timeout-minutes: ${{ github.event.inputs.runner_type == 'github-hosted' && 300 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4350 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1470 || 365) }}
       - name: Validate segment evidence contract
