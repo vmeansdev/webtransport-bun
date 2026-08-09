@@ -176,6 +176,19 @@ When `queuedBytesGlobal` rises and stays high:
 2. Check `queuedBytesGlobal` in metrics—high queue can inflate RSS.
 3. Run `bun run test:soak-addon` with `SOAK_DURATION=300`; if RSS grows linearly, suspect leak.
 
+**Received native payload ownership.** Package/native ABI version 1 resolves
+datagrams and stream chunks into exact-length ArrayBuffers allocated by the JS
+engine, then copies the Rust-owned bytes and releases the queue reservation.
+Production package code fails closed with `E_INTERNAL` if it is paired with an
+older addon instead of silently returning an external native Buffer. Sustained
+receive traffic therefore does not require an application `Bun.gc(...)` timer;
+monitor the post-warmup tail because Bun may retain engine pages after a natural
+collection even when live `arrayBuffers` has fallen.
+
+`releaseNativeMemory()` is separate: it asks the Rust allocator to purge freed
+native arenas. It does not finalize JavaScript objects, schedule JS collection,
+or repair a mismatched package/addon pair.
+
 **Raw RSS vs charged memory on long-running servers.** The native backend
 uses a whole-program allocator (mimalloc) that keeps freed pages as
 reclaimable `MADV_FREE` arenas rather than returning them to the OS
