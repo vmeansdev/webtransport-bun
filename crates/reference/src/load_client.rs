@@ -389,7 +389,6 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         skip_probes,
         budgets,
     } = options;
-    validate_workload_rates(mode, datagrams_per_sec, streams_per_sec)?;
     let config = ClientConfig::builder()
         .with_bind_default()
         .with_no_cert_validation()
@@ -489,17 +488,6 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn validate_workload_rates(
-    mode: ClientMode,
-    datagrams_per_sec: u64,
-    streams_per_sec: u64,
-) -> Result<(), &'static str> {
-    if mode == ClientMode::Load && datagrams_per_sec == 0 && streams_per_sec == 0 {
-        return Err("load mode requires a non-zero datagram or stream rate");
-    }
-    Ok(())
-}
-
 async fn wait_for_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
     while Instant::now() < join_deadline {
@@ -538,6 +526,7 @@ async fn run_session(
     while start.elapsed() < duration {
         tokio::select! {
             _ = conn.closed() => break,
+            _ = wait_for_session_deadline(start, duration) => break,
             _ = tick_if_enabled(&mut dg_ticker) => {
                 let payload = format!("load:datagram:{}", next_probe_id());
                 if conn.send_datagram(payload.as_bytes()).is_ok() {
@@ -598,6 +587,10 @@ async fn run_session(
     // Shutdown state machine: stop (loop exited) → close → wait-for-closed (timeout).
     conn.close(0u32.into(), b"load test done");
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
+}
+
+async fn wait_for_session_deadline(start: Instant, duration: Duration) {
+    tokio::time::sleep(duration.saturating_sub(start.elapsed())).await;
 }
 
 fn ticker_for_rate(rate_per_sec: u64) -> Option<tokio::time::Interval> {
@@ -661,7 +654,7 @@ async fn run_reconnect_worker(
 mod tests {
     use super::{
         load_summary_json, parse_client_mode, parse_or_default, ticker_for_rate,
-        validate_workload_rates, ClientMode, Counters,
+        wait_for_session_deadline, ClientMode, Counters,
     };
     use std::sync::atomic::Ordering;
 
@@ -707,11 +700,16 @@ mod tests {
         assert!(ticker_for_rate(1).is_some());
     }
 
-    #[test]
-    fn load_mode_rejects_an_empty_workload() {
-        assert!(validate_workload_rates(ClientMode::Load, 0, 0).is_err());
-        assert!(validate_workload_rates(ClientMode::Load, 1, 0).is_ok());
-        assert!(validate_workload_rates(ClientMode::Load, 0, 1).is_ok());
-        assert!(validate_workload_rates(ClientMode::Reconnect, 0, 0).is_ok());
+    #[tokio::test]
+    async fn empty_workload_keeps_a_duration_deadline_wake() {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_session_deadline(
+                std::time::Instant::now(),
+                std::time::Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("duration deadline must wake an idle session");
     }
 }
