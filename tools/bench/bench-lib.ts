@@ -114,6 +114,25 @@ export type RegressionArtifact = {
 	failures: string[];
 };
 
+export type BenchmarkCaptureArtifact = {
+	createdAt: string;
+	commit: string;
+	machine: string;
+	bunVersion: string;
+	rustcVersion: string;
+	toolchainHash: string;
+	warmups: number;
+	rounds: number;
+	runs: BenchmarkRun[];
+};
+
+export type ApprovedBaselineCaptureBinding = {
+	approver: string;
+	artifactPath: string;
+	artifactSha256: string;
+	approvedAt?: string;
+};
+
 type HandshakeBenchmarkOutput = {
 	p50_ms: number;
 	p95_ms: number;
@@ -504,24 +523,20 @@ export function sha256File(path: string): string {
 export function gitFirstParentDistance(
 	ancestor: string,
 	descendant: string,
+	repository = ROOT,
 ): number | null {
 	if (ancestor.toLowerCase() === descendant.toLowerCase()) return 0;
-	const result = spawnSync(
-		"git",
-		["rev-list", "--first-parent", "--count", `${ancestor}..${descendant}`],
-		{ cwd: ROOT, encoding: "utf8" },
-	);
+	const result = spawnSync("git", ["rev-list", "--first-parent", descendant], {
+		cwd: repository,
+		encoding: "utf8",
+	});
 	if (result.status !== 0) return null;
-	const count = Number(result.stdout.trim());
-	if (!Number.isFinite(count)) return null;
-	// Confirm ancestor is actually an ancestor on first-parent.
-	const isAncestor = spawnSync(
-		"git",
-		["merge-base", "--is-ancestor", ancestor, descendant],
-		{ cwd: ROOT, encoding: "utf8" },
+	const normalizedAncestor = ancestor.toLowerCase();
+	const chain = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+	const distance = chain.findIndex(
+		(commit) => commit.toLowerCase() === normalizedAncestor,
 	);
-	if (isAncestor.status !== 0) return null;
-	return count;
+	return distance === -1 ? null : distance;
 }
 
 export function machineIdentity(): string {
@@ -977,6 +992,94 @@ export function validateBenchmarkRuns(runs: BenchmarkRun[]): string[] {
 		}
 	}
 	return failures;
+}
+
+export function approvedBaselineFromCapture(
+	capture: BenchmarkCaptureArtifact,
+	binding: ApprovedBaselineCaptureBinding,
+): ApprovedBaselines {
+	const approver = binding.approver.trim();
+	if (!approver) {
+		throw new Error("BENCH_BASELINE_APPROVER must identify the approver");
+	}
+	if (!/^[0-9a-f]{40}$/i.test(capture.commit)) {
+		throw new Error("benchmark capture commit must be a full Git SHA");
+	}
+	if (!capture.machine.trim() || !capture.bunVersion.trim()) {
+		throw new Error("benchmark capture requires machine and Bun identity");
+	}
+	if (!capture.rustcVersion.trim()) {
+		throw new Error("benchmark capture requires Rust identity");
+	}
+	if (
+		capture.toolchainHash !==
+		toolchainHash(capture.bunVersion, capture.rustcVersion)
+	) {
+		throw new Error("benchmark capture toolchain hash is invalid");
+	}
+	if (
+		capture.warmups !== BENCH_DESIGN_WARMUPS ||
+		capture.rounds !== BENCH_DESIGN_ROUNDS
+	) {
+		throw new Error(
+			`benchmark capture design must be ${BENCH_DESIGN_WARMUPS}/${BENCH_DESIGN_ROUNDS}`,
+		);
+	}
+	const runFailures = validateBenchmarkRuns(capture.runs);
+	if (runFailures.length > 0) {
+		throw new Error(`invalid benchmark capture: ${runFailures.join("; ")}`);
+	}
+	for (const run of capture.runs) {
+		if (run.samples.length !== BENCH_DESIGN_ROUNDS) {
+			throw new Error(
+				`${run.name}: expected ${BENCH_DESIGN_ROUNDS} measured samples`,
+			);
+		}
+	}
+	if (!binding.artifactPath.trim()) {
+		throw new Error("benchmark capture artifact path is required");
+	}
+	if (!/^[0-9a-f]{64}$/i.test(binding.artifactSha256)) {
+		throw new Error("benchmark capture artifact SHA-256 is invalid");
+	}
+	const approvedAt = binding.approvedAt ?? capture.createdAt;
+	if (!Number.isFinite(Date.parse(approvedAt))) {
+		throw new Error("benchmark baseline approval timestamp is invalid");
+	}
+
+	return {
+		status: "approved",
+		approvedAt,
+		approver,
+		commit: capture.commit,
+		candidateRelationship: "ancestry",
+		maxAncestryDistance: 8,
+		machine: capture.machine,
+		bunVersion: capture.bunVersion,
+		rustcVersion: capture.rustcVersion,
+		toolchainHash: capture.toolchainHash,
+		artifactSha256: binding.artifactSha256,
+		artifactPath: binding.artifactPath,
+		minimumDetectableEffect: BENCH_MINIMUM_DETECTABLE_EFFECT,
+		designWarmups: BENCH_DESIGN_WARMUPS,
+		designRounds: BENCH_DESIGN_ROUNDS,
+		notes: [
+			"Thresholds are derived exclusively from the bound capture samples.",
+		],
+		thresholds: Object.fromEntries(
+			capture.runs.map((run) => {
+				const rule = METRIC_RULES[run.name as keyof typeof METRIC_RULES];
+				return [
+					run.name,
+					{
+						direction: rule.direction,
+						approved: sampleSummary(run.samples),
+						unit: rule.unit,
+					},
+				];
+			}),
+		),
+	};
 }
 
 export function loadApprovedBaselines(

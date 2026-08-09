@@ -13,17 +13,39 @@ measured-baseline artifact. `bun run bench:regress` now:
 ## Approved baseline artifact
 
 - **Path**: `tools/bench/approved-baselines.json`
-- **Status today**: `blocked`
-- **Reason**: the 2026-07-22 local baseline attempt (`bun run build:native && bun run bench:baseline`) failed because the local native build path resolved to `rustc 1.85.0`, while the current dependency graph requires `rustc 1.88+`.
+- **Current status**: read the canonical file; `blocked` means no governed hosted
+  measurement has been promoted, while `approved` must satisfy every contract
+  below.
 - **Rule**: do not populate thresholds by hand. Only promote this file to
-  `status: "approved"` from a successful release-candidate capture on the exact
-  machine/runtime you want to gate.
-- **Provenance contract**: an approved file must declare
-  `candidateRelationship: "exact"` and the full candidate Git SHA, machine
-  identity, Bun version, and Rust version. `bench:regress` rejects stale SHAs,
-  another machine, or runtime drift before accepting the comparison. Set
-  `BENCH_MACHINE_IDENTITY` to a stable runner identity when the host name is not
-  the intended machine contract.
+  `status: "approved"` through `bun run bench:capture` from a successful
+  release-candidate capture on the exact machine/runtime you want to gate.
+- **Capture contract**: the command requires a clean worktree plus explicit
+  `BENCH_MACHINE_IDENTITY` and `BENCH_BASELINE_APPROVER` bindings, runs the fixed
+  3-warmup/15-round design, writes an immutable capture JSON, hashes its exact
+  bytes, and atomically derives `approved-baselines.json` from those samples.
+  It never invents or accepts hand-written metric thresholds.
+- **Hosted approval**: checked-in release baselines come only from the manually
+  dispatched `bench-baseline-capture.yml` workflow. The workflow authenticates
+  the approver input against `github.actor`, checks out full history, and uses
+  stable machine identity `github-actions-ubuntu-latest-x64`. Local captures are
+  diagnostic and cannot approve the hosted release runner's baseline.
+
+## Candidate binding
+
+An external baseline file measured at the exact candidate SHA may use
+`candidateRelationship: "exact"`. A baseline checked into this repository must
+live in an evidence-only child commit, so it uses
+`candidateRelationship: "ancestry"`: `baseline.commit` is the capture JSON's
+measured source SHA, and the comparator requires that SHA to occur on the
+candidate's actual first-parent chain no more than eight commits behind it.
+A commit that is merely reachable through a merged side branch is rejected.
+Any source or workflow edit after capture invalidates the evidence and requires
+a fresh hosted capture.
+
+Both relationships also bind the machine identity, Bun version, Rust version,
+toolchain hash, capture path, and SHA-256 of the capture bytes. `bench:regress`
+rejects source, runner, runtime, toolchain, or artifact drift before comparing
+measurements.
 
 ## Captured metrics
 

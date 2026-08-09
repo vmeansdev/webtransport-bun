@@ -1,13 +1,22 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import * as benchLib from "./bench-lib.ts";
 import {
 	type ApprovedBaselines,
 	type BenchmarkRun,
 	benchmarkBindingFailures,
 	compareAgainstBaseline,
+	gitFirstParentDistance,
 	runCommand,
 	sampleSummary,
 	studentTCritical95,
@@ -26,6 +35,34 @@ afterEach(() => {
 });
 
 describe("Task 14 benchmark evidence", () => {
+	test("accepts only commits on the descendant's first-parent chain", () => {
+		const repository = mkdtempSync(resolve(tmpdir(), "wt-bench-git-"));
+		TEMP_ROOTS.push(repository);
+		git(repository, "init", "-b", "main");
+		git(repository, "config", "user.email", "bench@example.test");
+		git(repository, "config", "user.name", "Benchmark Test");
+		writeFileSync(resolve(repository, "root.txt"), "root\n");
+		git(repository, "add", "root.txt");
+		git(repository, "commit", "-m", "root");
+		const root = git(repository, "rev-parse", "HEAD");
+
+		git(repository, "checkout", "-b", "side");
+		writeFileSync(resolve(repository, "side.txt"), "side\n");
+		git(repository, "add", "side.txt");
+		git(repository, "commit", "-m", "side");
+		const side = git(repository, "rev-parse", "HEAD");
+
+		git(repository, "checkout", "main");
+		writeFileSync(resolve(repository, "main.txt"), "main\n");
+		git(repository, "add", "main.txt");
+		git(repository, "commit", "-m", "main");
+		git(repository, "merge", "--no-ff", "side", "-m", "merge side");
+		const merge = git(repository, "rev-parse", "HEAD");
+
+		expect(gitFirstParentDistance(root, merge, repository)).toBe(2);
+		expect(gitFirstParentDistance(side, merge, repository)).toBeNull();
+	});
+
 	test("uses a small-sample confidence interval instead of a normal approximation", () => {
 		const summary = sampleSummary([1, 2, 3, 4, 5]);
 
@@ -317,11 +354,99 @@ describe("Task 14 coverage workflow", () => {
 });
 
 describe("Task 14 benchmark gate contract", () => {
-	test("keeps benchmark baselines explicitly blocked until an approved measured capture exists", () => {
-		const baseline = readFileSync(
-			resolve(ROOT, "tools/bench/approved-baselines.json"),
+	test("derives an ancestry-bound approved baseline only from a valid capture", () => {
+		const runs = requiredCaptureRuns();
+		const capture = {
+			createdAt: "2026-08-09T12:00:00.000Z",
+			commit: "a".repeat(40),
+			machine: "github-actions-ubuntu-latest-x64",
+			bunVersion: "1.3.14",
+			rustcVersion: "rustc 1.95.0",
+			toolchainHash:
+				toolchainHash("1.3.14", "rustc 1.95.0") ?? "missing-toolchain-hash",
+			warmups: 3,
+			rounds: 15,
+			runs,
+		};
+		const artifactPath = "tools/bench/baselines/capture.json";
+		const artifactSha256 = "c".repeat(64);
+		const captureFactory = Reflect.get(benchLib, "approvedBaselineFromCapture");
+		expect(typeof captureFactory).toBe("function");
+		if (typeof captureFactory !== "function") return;
+
+		expect(() =>
+			captureFactory(capture, {
+				approver: "",
+				artifactPath,
+				artifactSha256,
+			}),
+		).toThrow("BENCH_BASELINE_APPROVER");
+
+		const result = captureFactory(capture, {
+			approver: "authenticated-owner",
+			artifactPath,
+			artifactSha256,
+		});
+		expect(result.candidateRelationship).toBe("ancestry");
+		expect(result.maxAncestryDistance).toBe(8);
+		expect(result.commit).toBe(capture.commit);
+		for (const run of runs) {
+			expect(result.thresholds[run.name]?.approved.samples).toEqual(
+				run.samples,
+			);
+		}
+	});
+
+	test("keeps capture and hosted release workflows fail closed", () => {
+		const capturePath = resolve(ROOT, "tools/bench/capture-baseline.ts");
+		const captureWorkflowPath = resolve(
+			ROOT,
+			".github/workflows/bench-baseline-capture.yml",
+		);
+		expect(existsSync(capturePath)).toBeTrue();
+		expect(existsSync(captureWorkflowPath)).toBeTrue();
+		if (!existsSync(capturePath) || !existsSync(captureWorkflowPath)) return;
+		const captureSource = readFileSync(capturePath, "utf8");
+		const packageJson = readFileSync(resolve(ROOT, "package.json"), "utf8");
+		const captureWorkflow = readFileSync(captureWorkflowPath, "utf8");
+		const releaseWorkflow = readFileSync(
+			resolve(ROOT, ".github/workflows/release.yml"),
 			"utf8",
 		);
+
+		expect(packageJson).toContain('"bench:capture"');
+		for (const contract of [
+			"gitWorkingTreeDirty",
+			"BENCH_MACHINE_IDENTITY",
+			"BENCH_BASELINE_APPROVER",
+			"BENCH_DESIGN_WARMUPS",
+			"BENCH_DESIGN_ROUNDS",
+			"validateBenchmarkRuns",
+			"sha256",
+			"wx",
+			"renameSync",
+		]) {
+			expect(captureSource).toContain(contract);
+		}
+		expect(captureSource).not.toMatch(
+			/handshake-p50-ms[\s\S]{0,100}(approved|samples):\s*\[[\d.]/,
+		);
+		expect(captureWorkflow).toContain("fetch-depth: 0");
+		expect(captureWorkflow).toContain("github-actions-ubuntu-latest-x64");
+		expect(captureWorkflow).toContain("github.actor");
+		expect(captureWorkflow).toContain("inputs.approver");
+		expect(releaseWorkflow).toContain("fetch-depth: 0");
+		expect(releaseWorkflow).toContain("github-actions-ubuntu-latest-x64");
+		expect(releaseWorkflow).toContain("verification_only");
+	});
+
+	test("allows only an explicit block or a measured approved baseline", () => {
+		const baseline = JSON.parse(
+			readFileSync(
+				resolve(ROOT, "tools/bench/approved-baselines.json"),
+				"utf8",
+			),
+		) as ApprovedBaselines;
 		const doc = readFileSync(
 			resolve(ROOT, "docs/BENCHMARK_BASELINES.md"),
 			"utf8",
@@ -331,8 +456,19 @@ describe("Task 14 benchmark gate contract", () => {
 			"utf8",
 		);
 
-		expect(baseline).toContain('"status": "blocked"');
-		expect(baseline).toContain('"thresholds": {}');
+		expect(["approved", "blocked"]).toContain(baseline.status);
+		if (baseline.status === "blocked") {
+			expect(baseline.thresholds).toEqual({});
+		} else {
+			expect(Object.keys(baseline.thresholds).sort()).toEqual(
+				requiredRuns()
+					.map((run) => run.name)
+					.sort(),
+			);
+			expect(baseline.candidateRelationship).toBe("ancestry");
+			expect(baseline.maxAncestryDistance).toBe(8);
+			expect(baseline.artifactSha256).toMatch(/^[0-9a-f]{64}$/);
+		}
 		expect(doc).toContain("do not populate thresholds by hand");
 		expect(releaseWorkflow).toContain("bench:regress");
 		expect(releaseWorkflow).toContain("approved baseline");
@@ -394,6 +530,23 @@ function requiredRuns(): BenchmarkRun[] {
 		benchmarkRun("cpu-user-ms", 1),
 		benchmarkRun("peak-rss-mib", 1),
 	];
+}
+
+function requiredCaptureRuns(): BenchmarkRun[] {
+	return requiredRuns().map((run) => {
+		const initialSample = run.samples[0] ?? 0;
+		const samples = Array.from({ length: 15 }, (_, index) =>
+			Number((initialSample + index / 100).toFixed(3)),
+		);
+		return { ...run, samples, summary: sampleSummary(samples) };
+	});
+}
+
+function git(repository: string, ...args: string[]): string {
+	return execFileSync("git", args, {
+		cwd: repository,
+		encoding: "utf8",
+	}).trim();
 }
 
 function approvedBaseline(

@@ -64,6 +64,19 @@ Test log hygiene:
 
 ### release.yml (tag push `v*`, workflow_dispatch)
 
+Manual dispatch is verification-only and requires the explicit boolean input
+`verification_only=true`. That path runs every security, correctness,
+benchmark, four-target prebuild, reproducibility, and Bun/Node/Deno exact-package
+consumer gate, but skips the immutable npm publish-input upload and GitHub
+release creation. A false or missing manual input fails before root release jobs
+start. Tag pushes retain the publishing handoff and release-creation steps.
+
+The blocking benchmark job checks out full Git history and binds the comparator
+to `github-actions-ubuntu-latest-x64`. New checked-in baselines are created only
+by `bench-baseline-capture.yml`, whose approver must equal authenticated
+`github.actor`; it uploads the immutable measured capture and proposed baseline
+without committing, pushing, tagging, or releasing.
+
 **P3.2**: Security gates block release. Jobs run before build:
 
 1. **security** — cargo audit, Trivy filesystem scan, Trivy library vulnerability scan (CRITICAL/HIGH blocking)

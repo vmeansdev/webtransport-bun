@@ -19,6 +19,10 @@ const RELEASE_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "release.yml"),
 	"utf8",
 );
+const BENCH_BASELINE_CAPTURE_WORKFLOW = readFileSync(
+	join(PROJECT_ROOT, ".github", "workflows", "bench-baseline-capture.yml"),
+	"utf8",
+);
 const TEST_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "test.yml"),
 	"utf8",
@@ -61,6 +65,10 @@ const WEBTRANSPORT_PACKAGE_JSON = JSON.parse(
 };
 const roots: string[] = [];
 const PIN = "0123456789abcdef0123456789abcdef01234567";
+const GITHUB_ACTOR_EXPRESSION = "$" + "{{ github.actor }}";
+const APPROVER_INPUT_EXPRESSION = "$" + "{{ inputs.approver }}";
+const VERIFICATION_ONLY_CONDITION =
+	"$" + "{{ github.event_name != 'workflow_dispatch' }}";
 
 setDefaultTimeout(30_000);
 
@@ -161,6 +169,55 @@ function parseWorkflow(document: string): {
 }
 
 describe("GitHub Actions release policy", () => {
+	it("accepts only authenticated benchmark capture governance", () => {
+		const accepted = runPolicy(
+			BENCH_BASELINE_CAPTURE_WORKFLOW,
+			"bench-baseline-capture.yml",
+		);
+		expect(accepted.status).toBe(0);
+
+		const unauthenticated = runPolicy(
+			BENCH_BASELINE_CAPTURE_WORKFLOW.replace(
+				`BENCH_BASELINE_APPROVER: ${GITHUB_ACTOR_EXPRESSION}`,
+				`BENCH_BASELINE_APPROVER: ${APPROVER_INPUT_EXPRESSION}`,
+			),
+			"bench-baseline-capture.yml",
+		);
+		expect(unauthenticated.status).toBe(1);
+		expect(unauthenticated.stderr).toContain(
+			"benchmark capture must authenticate github.actor",
+		);
+	});
+
+	it("rejects a manual release path that can publish or skip governed comparison", () => {
+		const accepted = runPolicy(RELEASE_WORKFLOW, "release.yml");
+		expect(accepted.status).toBe(0);
+
+		const publishingDispatch = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				`if: "${VERIFICATION_ONLY_CONDITION}"`,
+				"if: always()",
+			),
+			"release.yml",
+		);
+		expect(publishingDispatch.status).toBe(1);
+		expect(publishingDispatch.stderr).toContain(
+			"release workflow_dispatch must be fail-closed verification-only",
+		);
+
+		const shallowComparator = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				"          fetch-depth: 0",
+				"          fetch-depth: 1",
+			),
+			"release.yml",
+		);
+		expect(shallowComparator.status).toBe(1);
+		expect(shallowComparator.stderr).toContain(
+			"release workflow_dispatch must be fail-closed verification-only",
+		);
+	});
+
 	it("makes coverage, benchmark regression, and >=10k distributed scale release-blocking with downloaded evidence", () => {
 		const workflow = parseWorkflow(RELEASE_WORKFLOW);
 		const releaseJob = workflow.jobs?.release;
@@ -1061,7 +1118,7 @@ jobs:
 		expect(SOAK_WORKFLOW).toContain("validate-soak-inputs.sh");
 		expect(SOAK_WORKFLOW).toContain(
 			"INPUT_CANDIDATE_COMMIT: " +
-				"${{ github.event.inputs.candidate_commit }}",
+				("$" + "{{ github.event.inputs.candidate_commit }}"),
 		);
 	});
 });

@@ -25,6 +25,8 @@ const EXPECTED_COMMIT_SOURCE =
 const EXPECTED_TAG_SOURCE = "$" + "{{ steps.release-run.outputs.release_tag }}";
 const EXPECTED_ATTEMPT_SOURCE =
 	"$" + "{{ steps.release-run.outputs.run_attempt }}";
+const VERIFICATION_ONLY_PUBLISH_CONDITION =
+	"$" + "{{ github.event_name != 'workflow_dispatch' }}";
 const EXACT_RELEASE_RUN_JQ_COMMAND = [
 	"jq -e",
 	'--argjson runId "$RELEASE_RUN_ID"',
@@ -786,6 +788,118 @@ function validatePublishHandoff(
 	}
 }
 
+function validateBenchmarkCaptureWorkflow(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+): void {
+	const dispatch = workflowTriggerBlock(lines, "workflow_dispatch").join("\n");
+	const capture = jobs.find((job) => job.name === "capture");
+	const block = capture ? lines.slice(capture.start, capture.end + 1) : [];
+	const text = block.join("\n");
+	const validInput =
+		/^ {6}approver:\s*$/m.test(dispatch) &&
+		/^ {8}required:\s*true\s*$/m.test(dispatch) &&
+		/^ {8}type:\s*string\s*$/m.test(dispatch);
+	const authenticatedApprover =
+		/BENCH_BASELINE_APPROVER:\s*\$\{\{ github\.actor \}\}/.test(text) &&
+		/INPUT_APPROVER:\s*\$\{\{ inputs\.approver \}\}/.test(text) &&
+		/AUTHENTICATED_ACTOR:\s*\$\{\{ github\.actor \}\}/.test(text) &&
+		/test "\$INPUT_APPROVER" = "\$AUTHENTICATED_ACTOR"/.test(text);
+	const stableRunner =
+		/BENCH_MACHINE_IDENTITY:\s*github-actions-ubuntu-latest-x64/.test(text);
+	const fullCheckout = /fetch-depth:\s*0/.test(text);
+	const captureOnly =
+		/bun run bench:capture/.test(text) &&
+		/tools\/bench\/baselines\/\*\.json/.test(text) &&
+		/tools\/bench\/approved-baselines\.json/.test(text) &&
+		!/(?:\bgit\s+(?:commit|push)\b|softprops\/action-gh-release|\bgh\s+release\b)/.test(
+			text,
+		);
+	if (
+		!capture ||
+		!validInput ||
+		!authenticatedApprover ||
+		!stableRunner ||
+		!fullCheckout ||
+		!captureOnly
+	) {
+		add(
+			capture?.start ?? 0,
+			"benchmark capture must authenticate github.actor and upload only full-history governed evidence",
+		);
+	}
+}
+
+function validateVerificationOnlyRelease(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+): void {
+	const dispatch = workflowTriggerBlock(lines, "workflow_dispatch").join("\n");
+	const policy = jobs.find((job) => job.name === "dispatch-policy");
+	const bench = jobs.find((job) => job.name === "bench-regress");
+	const release = jobs.find((job) => job.name === "release");
+	const policyText = policy
+		? lines.slice(policy.start, policy.end + 1).join("\n")
+		: "";
+	const benchText = bench
+		? lines.slice(bench.start, bench.end + 1).join("\n")
+		: "";
+	const verificationInput =
+		/^ {6}verification_only:\s*$/m.test(dispatch) &&
+		/^ {8}required:\s*true\s*$/m.test(dispatch) &&
+		/^ {8}type:\s*boolean\s*$/m.test(dispatch);
+	const failClosedPolicy =
+		/EVENT_NAME:\s*\$\{\{ github\.event_name \}\}/.test(policyText) &&
+		/VERIFICATION_ONLY:\s*\$\{\{ inputs\.verification_only \}\}/.test(
+			policyText,
+		) &&
+		/"\$EVENT_NAME" = "workflow_dispatch"/.test(policyText) &&
+		/"\$VERIFICATION_ONLY" != "true"/.test(policyText);
+	const rootJobsDependOnPolicy = ["security", "codeql"].every((name) => {
+		const job = jobs.find((candidate) => candidate.name === name);
+		return Boolean(
+			job &&
+				/needs:\s*\[dispatch-policy\]/.test(
+					lines.slice(job.start, job.end + 1).join("\n"),
+				),
+		);
+	});
+	const governedComparator =
+		/bench:regress/.test(benchText) &&
+		/fetch-depth:\s*0/.test(benchText) &&
+		/BENCH_MACHINE_IDENTITY:\s*github-actions-ubuntu-latest-x64/.test(
+			benchText,
+		);
+	const releaseSteps = release ? stepBlocks(lines, release) : [];
+	const nonPublishingDispatch = [
+		"Bind npm publish input to this immutable release run",
+		"Upload immutable npm publish input",
+		"Create release",
+	].every((name) => {
+		const step = releaseSteps.find(
+			(candidate) => stepScalar(candidate, "name") === name,
+		);
+		if (!step) return false;
+		return stepScalar(step, "if") === VERIFICATION_ONLY_PUBLISH_CONDITION;
+	});
+	if (
+		!verificationInput ||
+		!policy ||
+		!failClosedPolicy ||
+		!rootJobsDependOnPolicy ||
+		!governedComparator ||
+		!release ||
+		!nonPublishingDispatch
+	) {
+		add(
+			policy?.start ?? 0,
+			"release workflow_dispatch must be fail-closed verification-only with governed benchmarks and no publish side effects",
+		);
+	}
+}
+
 function hasPermission(
 	block: string[],
 	scope: string,
@@ -882,6 +996,15 @@ function scanWorkflow(path: string): Violation[] {
 	const jobs = jobBlocks(lines);
 	if (file === "publish.yml" || file === "publish.yaml") {
 		validatePublishHandoff(lines, jobs, add);
+	}
+	if (
+		file === "bench-baseline-capture.yml" ||
+		file === "bench-baseline-capture.yaml"
+	) {
+		validateBenchmarkCaptureWorkflow(lines, jobs, add);
+	}
+	if (file === "release.yml" || file === "release.yaml") {
+		validateVerificationOnlyRelease(lines, jobs, add);
 	}
 
 	for (const job of jobs) {

@@ -5,7 +5,12 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      verification_only:
+        description: Run every release verification gate without creating publish input or a GitHub release
+        required: true
+        type: boolean
 
 permissions: {}
 
@@ -14,8 +19,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  dispatch-policy:
+    name: Authorize release workflow mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require verification-only mode for manual dispatch
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERIFICATION_ONLY: ${{ inputs.verification_only }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$VERIFICATION_ONLY" != "true" ]; then
+            echo "::error::Manual branch dispatch requires verification_only=true"
+            exit 1
+          fi
+
   security:
     name: Security gates (blocking)
+    needs: [dispatch-policy]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -53,6 +77,7 @@ jobs:
 
   codeql:
     name: CodeQL
+    needs: [dispatch-policy]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -218,9 +243,12 @@ jobs:
     permissions:
       contents: read
     env:
+      BENCH_MACHINE_IDENTITY: github-actions-ubuntu-latest-x64
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
         with:
           toolchain: 1.95.0
@@ -497,6 +525,7 @@ jobs:
             --runtime node \
             --runtime deno
       - name: Bind npm publish input to this immutable release run
+        if: "${{ github.event_name != 'workflow_dispatch' }}"
         env:
           RELEASE_RUN_ID: ${{ github.run_id }}
           RELEASE_RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -546,6 +575,7 @@ jobs:
             "$OUTPUT_DIR/candidate-identity.json" >/dev/null
           test "$(shasum -a 256 "$OUTPUT_DIR/$TARBALL_NAME" | cut -d' ' -f1)" = "$TARBALL_SHA256"
       - name: Upload immutable npm publish input
+        if: "${{ github.event_name != 'workflow_dispatch' }}"
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
         with:
           name: npm-publish-input-${{ github.run_attempt }}
@@ -553,6 +583,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Create release
+        if: "${{ github.event_name != 'workflow_dispatch' }}"
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 resolved 2026-07-22
         with:
           files: |
