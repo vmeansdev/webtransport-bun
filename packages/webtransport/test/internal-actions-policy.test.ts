@@ -210,6 +210,7 @@ describe("GitHub Actions release policy", () => {
 		const coverageText = JSON.stringify(coverage);
 		expect(coverageText).toContain("./.github/workflows/coverage.yml");
 		expect(COVERAGE_WORKFLOW).toContain(nightly);
+		expect(COVERAGE_WORKFLOW).toContain(stable);
 		expect(COVERAGE_WORKFLOW).toContain("llvm-cov --workspace --branch");
 		expect(COVERAGE_WORKFLOW).toContain("coverage/wasm-coverage.json");
 		expect(COVERAGE_WORKFLOW).toContain("--coverage-reporter=lcov");
@@ -268,6 +269,17 @@ describe("GitHub Actions release policy", () => {
 
 		const acceptedCoverage = runPolicy(COVERAGE_WORKFLOW, "coverage.yml");
 		expect(acceptedCoverage.status).toBe(0);
+		const missingStableCoverageToolchain = runPolicy(
+			COVERAGE_WORKFLOW.replace(
+				/      - uses: dtolnay\/rust-toolchain@[a-f0-9]+ # immutable action pin resolved 2026-07-21\n        with:\n          toolchain: 1\.95\.0\n/,
+				"",
+			),
+			"coverage.yml",
+		);
+		expect(missingStableCoverageToolchain.status).toBe(1);
+		expect(missingStableCoverageToolchain.stderr).toContain(
+			"native coverage prerequisites require the governed stable Rust toolchain",
+		);
 		const bootstrapCoverage = runPolicy(
 			COVERAGE_WORKFLOW.replace(
 				'      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"',

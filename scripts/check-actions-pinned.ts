@@ -1049,10 +1049,23 @@ function validateCoverageExecutionPrerequisites(
 	add: (line: number, message: string) => void,
 ) {
 	const nightly = TOOLCHAIN.rustNightly[0] ?? "";
+	const stable = TOOLCHAIN.rust[0] ?? "";
 	for (const job of jobs) {
 		const text = lines.slice(job.start, job.end + 1).join("\n");
 		if (!text.includes("cargo llvm-cov") || !text.includes("--branch"))
 			continue;
+		const stableToolchain = `toolchain: ${stable}`;
+		const nightlyToolchain = `toolchain: ${nightly}`;
+		if (
+			!stable ||
+			!text.includes(stableToolchain) ||
+			text.indexOf(stableToolchain) > text.indexOf(nightlyToolchain)
+		) {
+			add(
+				job.start,
+				"native coverage prerequisites require the governed stable Rust toolchain",
+			);
+		}
 		if (!nightly || !text.includes(`toolchain: ${nightly}`)) {
 			add(job.start, "branch coverage requires the governed nightly toolchain");
 		}

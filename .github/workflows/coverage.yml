@@ -25,6 +25,12 @@ jobs:
       AR_wasm32_unknown_unknown: llvm-ar
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The addon build script deliberately selects the production toolchain
+      # with `rustup run`; install it before switching the job default to the
+      # governed nightly used only for branch instrumentation.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # immutable action pin resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # immutable action pin resolved 2026-07-21
         with:
           toolchain: nightly-2026-07-15
