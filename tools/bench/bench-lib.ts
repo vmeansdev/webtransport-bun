@@ -1271,12 +1271,57 @@ export function validateApprovedBaselineContext(
 				);
 			}
 			try {
-				const parsed = JSON.parse(readFileSync(artifactFull, "utf8")) as {
-					commit?: string;
-				};
+				const parsed = JSON.parse(
+					readFileSync(artifactFull, "utf8"),
+				) as BenchmarkCaptureArtifact;
 				if (!parsed.commit || parsed.commit !== baseline.commit) {
 					failures.push(
 						"capture artifact commit does not equal baseline.commit",
+					);
+				}
+				if (parsed.machine !== baseline.machine) {
+					failures.push(
+						"capture artifact machine does not equal baseline.machine",
+					);
+				}
+				if (parsed.bunVersion !== baseline.bunVersion) {
+					failures.push(
+						"capture artifact Bun runtime does not equal baseline.bunVersion",
+					);
+				}
+				if (parsed.rustcVersion !== baseline.rustcVersion) {
+					failures.push(
+						"capture artifact Rust runtime does not equal baseline.rustcVersion",
+					);
+				}
+				if (parsed.toolchainHash !== baseline.toolchainHash) {
+					failures.push(
+						"capture artifact toolchain hash does not equal baseline.toolchainHash",
+					);
+				}
+				if (
+					parsed.warmups !== baseline.designWarmups ||
+					parsed.rounds !== baseline.designRounds
+				) {
+					failures.push(
+						"capture artifact design does not equal baseline warmups/rounds",
+					);
+				}
+				try {
+					const derived = approvedBaselineFromCapture(parsed, {
+						approver: baseline.approver ?? "",
+						artifactPath: baseline.artifactPath,
+						artifactSha256: baseline.artifactSha256 ?? "",
+						approvedAt: baseline.approvedAt ?? undefined,
+					});
+					if (!thresholdsEqual(baseline.thresholds, derived.thresholds)) {
+						failures.push(
+							"approved baseline thresholds are not derived from capture artifact runs",
+						);
+					}
+				} catch (error) {
+					failures.push(
+						`capture artifact is invalid: ${error instanceof Error ? error.message : String(error)}`,
 					);
 				}
 			} catch {
@@ -1285,6 +1330,32 @@ export function validateApprovedBaselineContext(
 		}
 	}
 	return failures;
+}
+
+function thresholdsEqual(
+	actual: Record<string, BenchmarkMetricThreshold>,
+	expected: Record<string, BenchmarkMetricThreshold>,
+): boolean {
+	const actualNames = Object.keys(actual).sort();
+	const expectedNames = Object.keys(expected).sort();
+	if (actualNames.join("\n") !== expectedNames.join("\n")) return false;
+	return actualNames.every((name) => {
+		const actualThreshold = actual[name];
+		const expectedThreshold = expected[name];
+		if (!actualThreshold || !expectedThreshold) return false;
+		if (
+			actualThreshold.direction !== expectedThreshold.direction ||
+			actualThreshold.unit !== expectedThreshold.unit
+		) {
+			return false;
+		}
+		const actualSamples = actualThreshold.approved.samples;
+		const expectedSamples = expectedThreshold.approved.samples;
+		return (
+			actualSamples.length === expectedSamples.length &&
+			actualSamples.every((sample, index) => sample === expectedSamples[index])
+		);
+	});
 }
 
 export function writeArtifact(

@@ -13,6 +13,7 @@ import { resolve } from "node:path";
 import * as benchLib from "./bench-lib.ts";
 import {
 	type ApprovedBaselines,
+	type BenchmarkCaptureArtifact,
 	type BenchmarkRun,
 	benchmarkBindingFailures,
 	compareAgainstBaseline,
@@ -179,16 +180,20 @@ describe("Task 14 benchmark evidence", () => {
 		const tempRoot = mkdtempSync(resolve(tmpdir(), "wt-bench-base-"));
 		TEMP_ROOTS.push(tempRoot);
 		const artifactPath = resolve(tempRoot, "capture.json");
-		const artifactBody = JSON.stringify({ commit, runs: [] });
+		const capture = captureArtifact({ commit });
+		const artifactBody = JSON.stringify(capture);
 		writeFileSync(artifactPath, artifactBody);
 		const artifactSha256 = createHash("sha256")
 			.update(artifactBody)
 			.digest("hex");
-		const baseline = approvedBaseline({
-			commit,
-			artifactPath,
-			artifactSha256,
-		});
+		const baseline = {
+			...benchLib.approvedBaselineFromCapture(capture, {
+				approver: "test-approver",
+				artifactPath,
+				artifactSha256,
+			}),
+			candidateRelationship: "exact" as const,
+		};
 		const current = {
 			commit,
 			machine: "darwin/arm64/local/runner-a",
@@ -250,6 +255,51 @@ describe("Task 14 benchmark evidence", () => {
 			}),
 		).toContain(
 			"approved baseline Rust runtime does not match candidate runtime",
+		);
+	});
+
+	test("rejects baseline fields or thresholds that diverge from the bound capture", () => {
+		const commit = "a".repeat(40);
+		const tempRoot = mkdtempSync(resolve(tmpdir(), "wt-bench-bound-"));
+		TEMP_ROOTS.push(tempRoot);
+		const artifactPath = resolve(tempRoot, "capture.json");
+		const capture = captureArtifact({ commit });
+		const artifactBody = JSON.stringify(capture);
+		writeFileSync(artifactPath, artifactBody);
+		const artifactSha256 = createHash("sha256")
+			.update(artifactBody)
+			.digest("hex");
+		const baseline = benchLib.approvedBaselineFromCapture(capture, {
+			approver: "test-approver",
+			artifactPath,
+			artifactSha256,
+		});
+		const current = {
+			commit,
+			machine: capture.machine,
+			bunVersion: capture.bunVersion,
+			rustcVersion: capture.rustcVersion,
+		};
+
+		expect(validateApprovedBaselineContext(baseline, current)).toEqual([]);
+		expect(
+			validateApprovedBaselineContext(
+				{ ...baseline, machine: "forged-runner" },
+				{ ...current, machine: "forged-runner" },
+			),
+		).toContain("capture artifact machine does not equal baseline.machine");
+		const forgedThresholds = structuredClone(baseline.thresholds);
+		const forgedHandshake = forgedThresholds["handshake-p50-ms"];
+		if (!forgedHandshake)
+			throw new Error("missing handshake fixture threshold");
+		forgedHandshake.approved.samples[0] = 999;
+		expect(
+			validateApprovedBaselineContext(
+				{ ...baseline, thresholds: forgedThresholds },
+				current,
+			),
+		).toContain(
+			"approved baseline thresholds are not derived from capture artifact runs",
 		);
 	});
 
@@ -540,6 +590,27 @@ function requiredCaptureRuns(): BenchmarkRun[] {
 		);
 		return { ...run, samples, summary: sampleSummary(samples) };
 	});
+}
+
+function captureArtifact(
+	overrides: Partial<BenchmarkCaptureArtifact> = {},
+): BenchmarkCaptureArtifact {
+	const bunVersion = overrides.bunVersion ?? "1.3.14";
+	const rustcVersion = overrides.rustcVersion ?? "rustc 1.95.0";
+	const hash = toolchainHash(bunVersion, rustcVersion);
+	if (!hash) throw new Error("fixture toolchain identity must be complete");
+	return {
+		createdAt: "2026-07-22T00:00:00.000Z",
+		commit: "a".repeat(40),
+		machine: "darwin/arm64/local/runner-a",
+		bunVersion,
+		rustcVersion,
+		toolchainHash: hash,
+		warmups: 3,
+		rounds: 15,
+		runs: requiredCaptureRuns(),
+		...overrides,
+	};
 }
 
 function git(repository: string, ...args: string[]): string {
