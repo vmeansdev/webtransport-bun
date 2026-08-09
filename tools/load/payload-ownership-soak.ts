@@ -15,6 +15,7 @@ export type PayloadSoakConfig = {
 	streamEvery: number;
 	batchSize: number;
 	datagramsPerSecond: number;
+	maxTailRssSlopeMbPerMinute: number;
 	port: number;
 	outputPath: string;
 };
@@ -24,6 +25,15 @@ function positiveInteger(env: Env, name: string, fallback: number): number {
 	const value = raw == null || raw === "" ? fallback : Number(raw);
 	if (!Number.isSafeInteger(value) || value <= 0) {
 		throw new Error(`${name} must be a positive integer`);
+	}
+	return value;
+}
+
+function positiveNumber(env: Env, name: string, fallback: number): number {
+	const raw = env[name];
+	const value = raw == null || raw === "" ? fallback : Number(raw);
+	if (!Number.isFinite(value) || value <= 0) {
+		throw new Error(`${name} must be a positive number`);
 	}
 	return value;
 }
@@ -51,6 +61,11 @@ export function parsePayloadSoakConfig(env: Env): PayloadSoakConfig {
 			env,
 			"PAYLOAD_SOAK_DATAGRAMS_PER_SECOND",
 			1000,
+		),
+		maxTailRssSlopeMbPerMinute: positiveNumber(
+			env,
+			"PAYLOAD_SOAK_MAX_TAIL_RSS_SLOPE_MB_PER_MINUTE",
+			4,
 		),
 		port: positiveInteger(
 			env,
@@ -96,21 +111,46 @@ function p99(values: number[]): number {
 }
 
 function slopeMbPerMinute(
-	samples: Array<{ elapsedMs: number; chargedMb: number }>,
+	samples: Array<{ elapsedMs: number; rssMb: number }>,
 ): number {
 	if (samples.length < 2) return 0;
-	const tail = samples.slice(Math.floor(samples.length / 3));
 	const meanX =
-		tail.reduce((sum, sample) => sum + sample.elapsedMs, 0) / tail.length;
+		samples.reduce((sum, sample) => sum + sample.elapsedMs, 0) / samples.length;
 	const meanY =
-		tail.reduce((sum, sample) => sum + sample.chargedMb, 0) / tail.length;
+		samples.reduce((sum, sample) => sum + sample.rssMb, 0) / samples.length;
 	let numerator = 0;
 	let denominator = 0;
-	for (const sample of tail) {
-		numerator += (sample.elapsedMs - meanX) * (sample.chargedMb - meanY);
+	for (const sample of samples) {
+		numerator += (sample.elapsedMs - meanX) * (sample.rssMb - meanY);
 		denominator += (sample.elapsedMs - meanX) ** 2;
 	}
 	return denominator === 0 ? 0 : (numerator / denominator) * 60_000;
+}
+
+export function evaluateRssPlateau(
+	samples: Array<{ elapsedMs: number; rssMb: number }>,
+	maxSlopeMbPerMinute: number,
+) {
+	const tailSampleCount = Math.max(4, Math.ceil(samples.length / 4));
+	if (samples.length < tailSampleCount) {
+		return {
+			passed: false,
+			tailSampleCount: samples.length,
+			tailRssSlopeMbPerMinute: Number.POSITIVE_INFINITY,
+			reason: "insufficient RSS samples for a plateau verdict",
+		};
+	}
+	const tail = samples.slice(-tailSampleCount);
+	const tailRssSlopeMbPerMinute = slopeMbPerMinute(tail);
+	const passed = tailRssSlopeMbPerMinute <= maxSlopeMbPerMinute;
+	return {
+		passed,
+		tailSampleCount,
+		tailRssSlopeMbPerMinute,
+		reason: passed
+			? null
+			: `tail RSS slope ${tailRssSlopeMbPerMinute.toFixed(3)} MiB/min exceeds ${maxSlopeMbPerMinute.toFixed(3)} MiB/min`,
+	};
 }
 
 function writeNodeStream(
@@ -152,7 +192,7 @@ export async function runPayloadOwnershipSoak(config: PayloadSoakConfig) {
 	const serverTasks: Promise<void>[] = [];
 	const server = api.createServer({
 		port: config.port,
-		tls: { certPem: "", keyPem: "" },
+		tls: { certPem: "", keyPem: "", allowSelfSigned: true },
 		onSession(session: any) {
 			serverSession = session;
 			serverTasks.push(
@@ -275,7 +315,6 @@ export async function runPayloadOwnershipSoak(config: PayloadSoakConfig) {
 		samples.push({
 			elapsedMs: Date.now() - startedAt,
 			rssMb: memory.rss / 1048576,
-			chargedMb: memory.rss / 1048576,
 			heapUsedMb: memory.heapUsed / 1048576,
 			externalMb: memory.external / 1048576,
 			arrayBuffersMb: memory.arrayBuffers / 1048576,
@@ -365,8 +404,12 @@ export async function runPayloadOwnershipSoak(config: PayloadSoakConfig) {
 
 	const elapsedMs = Date.now() - startedAt;
 	const cpu = process.cpuUsage(startedCpu);
+	const rssPlateau = evaluateRssPlateau(
+		samples as Array<{ elapsedMs: number; rssMb: number }>,
+		config.maxTailRssSlopeMbPerMinute,
+	);
 	const summary = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		packageRoot: config.packageRoot,
 		packageJsSha256: sha256(entry),
 		addonSha256: sha256(addon),
@@ -374,7 +417,7 @@ export async function runPayloadOwnershipSoak(config: PayloadSoakConfig) {
 			typeof (globalThis as any).Bun?.version === "string"
 				? `bun ${(globalThis as any).Bun.version}`
 				: `node ${process.version}`,
-		memoryMetric: "rss-fallback",
+		memoryMetric: "process.memoryUsage().rss",
 		durationMs: elapsedMs,
 		sentDatagrams,
 		datagrams,
@@ -383,9 +426,11 @@ export async function runPayloadOwnershipSoak(config: PayloadSoakConfig) {
 		throughputDatagramsPerSecond: datagrams / (elapsedMs / 1000),
 		p99LatencyMs: p99(latenciesMs),
 		cpuPercent: ((cpu.user + cpu.system) / 1000 / elapsedMs) * 100,
-		chargedSlopeMbPerMinute: slopeMbPerMinute(
-			samples as Array<{ elapsedMs: number; chargedMb: number }>,
-		),
+		memoryGate: {
+			verdict: rssPlateau.passed ? "pass" : "fail",
+			maxTailRssSlopeMbPerMinute: config.maxTailRssSlopeMbPerMinute,
+			...rssPlateau,
+		},
 		first: samples[0],
 		last: samples.at(-1),
 		peakRssMb: Math.max(...samples.map((sample) => sample.rssMb!)),
@@ -393,6 +438,9 @@ export async function runPayloadOwnershipSoak(config: PayloadSoakConfig) {
 	};
 	writeFileSync(config.outputPath, JSON.stringify(summary, null, 2));
 	process.stdout.write(`${JSON.stringify(summary)}\n`);
+	if (!rssPlateau.passed) {
+		throw new Error(`payload memory gate failed: ${rssPlateau.reason}`);
+	}
 	return summary;
 }
 

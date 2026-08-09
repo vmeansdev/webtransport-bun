@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parsePayloadSoakConfig } from "./payload-ownership-soak.ts";
+import {
+	evaluateRssPlateau,
+	parsePayloadSoakConfig,
+} from "./payload-ownership-soak.ts";
 
 describe("payload ownership soak", () => {
 	it("parses a bounded deterministic workload", () => {
@@ -19,6 +22,22 @@ describe("payload ownership soak", () => {
 		expect(config.sampleMs).toBe(250);
 		expect(config.streamEvery).toBe(50);
 		expect(config.datagramsPerSecond).toBe(800);
+		expect(config.maxTailRssSlopeMbPerMinute).toBe(4);
+	});
+
+	it("passes a flat tail and rejects continued RSS growth", () => {
+		const flat = Array.from({ length: 12 }, (_, index) => ({
+			elapsedMs: index * 1000,
+			rssMb: index < 8 ? 50 + index : 59,
+		}));
+		const growing = Array.from({ length: 12 }, (_, index) => ({
+			elapsedMs: index * 1000,
+			rssMb: 50 + index * 0.1,
+		}));
+		expect(evaluateRssPlateau(flat, 4).passed).toBeTrue();
+		const verdict = evaluateRssPlateau(growing, 4);
+		expect(verdict.passed).toBeFalse();
+		expect(verdict.reason).toContain("tail RSS slope");
 	});
 
 	it("rejects missing package roots and unbounded timing", () => {
@@ -48,5 +67,8 @@ describe("payload ownership soak", () => {
 		for (const symbol of forbidden)
 			expect(implementation).not.toContain(symbol);
 		expect(implementation).toContain("withTimeout");
+		expect(implementation).toContain(
+			'tls: { certPem: "", keyPem: "", allowSelfSigned: true }',
+		);
 	});
 });
