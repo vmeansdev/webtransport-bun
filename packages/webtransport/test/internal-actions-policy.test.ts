@@ -58,6 +58,11 @@ const RELEASE_TOOLCHAIN = JSON.parse(
 	cargoFuzz: string[];
 	napiRsCli: string[];
 };
+const RELEASE_STATUS = JSON.parse(
+	readFileSync(join(PROJECT_ROOT, "docs", "release-status.json"), "utf8"),
+) as {
+	claims: Array<{ id: string; gaRequired: boolean }>;
+};
 const ROOT_PACKAGE_JSON = JSON.parse(
 	readFileSync(join(PROJECT_ROOT, "package.json"), "utf8"),
 ) as {
@@ -103,7 +108,7 @@ function runPolicy(workflow: string, filename = "test.yml") {
 			node: ["18.20.4", "20.19.0", "22.23.1"],
 			deno: ["2.9.3"],
 			python: ["3.12.10"],
-			npm: ["11.18.0"],
+			npm: ["10.9.4", "11.18.0"],
 			wasmBindgen: ["0.2.121"],
 			cargoAudit: ["0.22.2"],
 			cargoFuzz: ["0.13.1"],
@@ -271,7 +276,7 @@ describe("GitHub Actions release policy", () => {
 		expect(acceptedCoverage.status).toBe(0);
 		const missingStableCoverageToolchain = runPolicy(
 			COVERAGE_WORKFLOW.replace(
-				/      - uses: dtolnay\/rust-toolchain@[a-f0-9]+ # immutable action pin resolved 2026-07-21\n        with:\n          toolchain: 1\.95\.0\n/,
+				/ {6}- uses: dtolnay\/rust-toolchain@[a-f0-9]+ # immutable action pin resolved 2026-07-21\n {8}with:\n {10}toolchain: 1\.95\.0\n/,
 				"",
 			),
 			"coverage.yml",
@@ -385,7 +390,7 @@ describe("GitHub Actions release policy", () => {
 		expect([...new Set(pins(RELEASE_WORKFLOW))]).toEqual(canonicalPins);
 	});
 
-	it("makes coverage, benchmark regression, and >=10k distributed scale release-blocking with downloaded evidence", () => {
+	it("makes coverage, benchmark regression, strict scale probe, and 10k recovery release-blocking with downloaded evidence", () => {
 		const workflow = parseWorkflow(RELEASE_WORKFLOW);
 		const releaseJob = workflow.jobs?.release;
 		expect(releaseJob).toBeDefined();
@@ -403,7 +408,8 @@ describe("GitHub Actions release policy", () => {
 				"parity",
 				"coverage",
 				"bench-regress",
-				"distributed-scale",
+				"scale-probe",
+				"scale-10k-recovery",
 				"fuzz",
 				"package-consumers",
 			]),
@@ -413,8 +419,10 @@ describe("GitHub Actions release policy", () => {
 		expect(RELEASE_WORKFLOW).toContain("path: coverage-artifacts");
 		expect(RELEASE_WORKFLOW).toContain("name: bench-regress-evidence");
 		expect(RELEASE_WORKFLOW).toContain("path: bench-regress-evidence");
-		expect(RELEASE_WORKFLOW).toContain("name: distributed-scale-evidence");
-		expect(RELEASE_WORKFLOW).toContain("path: distributed-scale-evidence");
+		expect(RELEASE_WORKFLOW).toContain("name: scale-probe-evidence");
+		expect(RELEASE_WORKFLOW).toContain("path: scale-probe-evidence");
+		expect(RELEASE_WORKFLOW).toContain("name: scale-10k-evidence");
+		expect(RELEASE_WORKFLOW).toContain("path: scale-10k-evidence");
 		expect(RELEASE_WORKFLOW).toContain(
 			'find coverage-artifacts -name "native-coverage.json" -type f | grep -q .',
 		);
@@ -431,8 +439,42 @@ describe("GitHub Actions release policy", () => {
 			'find bench-regress-evidence -name "bench-regress-artifact.json" -type f | grep -q .',
 		);
 		expect(RELEASE_WORKFLOW).toContain(
-			'find distributed-scale-evidence -name "distributed-scale-artifact.json" -type f | grep -q .',
+			'find scale-probe-evidence -name "scale-probe-artifact.json" -type f | grep -q .',
 		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find scale-10k-evidence -name "scale-10k-artifact.json" -type f | grep -q .',
+		);
+	});
+
+	it("locks the honest two-lane scale claim split", () => {
+		const accepted = runPolicy(RELEASE_WORKFLOW, "release.yml");
+		expect(accepted.status).toBe(0);
+		expect(
+			RELEASE_STATUS.claims.find(
+				(claim) => claim.id === "scale-10k-loopback-recovery",
+			)?.gaRequired,
+		).toBe(true);
+
+		for (const [search, replacement] of [
+			['LOAD_SCALE_STREAMS_PER_SEC: "0"', 'LOAD_SCALE_STREAMS_PER_SEC: "1"'],
+			[
+				"LOAD_SCALE_WORKLOAD_MODE: drain-all",
+				"LOAD_SCALE_WORKLOAD_MODE: probe",
+			],
+			[
+				'LOAD_SCALE_MAX_RECOVERY_RSS_RATIO: "1.25"',
+				'LOAD_SCALE_MAX_RECOVERY_RSS_RATIO: "1.26"',
+			],
+		] as const) {
+			const rejected = runPolicy(
+				RELEASE_WORKFLOW.replace(search, replacement),
+				"release.yml",
+			);
+			expect(rejected.status).toBe(1);
+			expect(rejected.stderr).toContain(
+				"release scale evidence must preserve the strict probe and 10k recovery contracts",
+			);
+		}
 	});
 
 	it("makes exact package consumers release-blocking for the release workflow across all supported operating systems", () => {
@@ -470,7 +512,23 @@ describe("GitHub Actions release policy", () => {
 		);
 		for (const lane of lanes) {
 			expect(RELEASE_TOOLCHAIN.node).toContain(String(lane["node-version"]));
+			const nodeMajor = Number(String(lane["node-version"]).split(".")[0]);
+			expect(lane["npm-version"]).toBe(nodeMajor === 18 ? "10.9.4" : "11.18.0");
 		}
+
+		const accepted = runPolicy(RELEASE_WORKFLOW, "release.yml");
+		expect(accepted.status).toBe(0);
+		const rejected = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				'node-version: "18.20.4"\n            npm-version: "10.9.4"',
+				'node-version: "18.20.4"\n            npm-version: "11.18.0"',
+			),
+			"release.yml",
+		);
+		expect(rejected.status).toBe(1);
+		expect(rejected.stderr).toContain(
+			"release package consumers require Node-compatible npm and a preceding wasm C toolchain",
+		);
 	});
 
 	it("pins the release exact-package path to the Rust and wasm policy toolchain", () => {

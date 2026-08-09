@@ -6,8 +6,8 @@ Package version: `1.0.0-rc.1`.
 
 **Coupled GA model:** `1.0.0` only when every `gaRequired: true` claim is
 `passed` with commit-bound evidence and
-`bun scripts/promote-release-status.ts` succeeds. `scale-10k-multisource` is
-`gaRequired: false`.
+`bun scripts/promote-release-status.ts` succeeds. The strict scale probe and
+10k loopback recovery artifacts are GA-blocking release evidence.
 
 ## Local progress on candidate `c7a1e78…`
 
@@ -37,14 +37,14 @@ commit; nothing was carried over.
 | `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
 | `final-no-change-confirmation` | Requires immutable freeze after all other gates |
 
-### Not GA-blocking
+### Remaining GA-blocking scale evidence
 
 | Claim | Harness | Evidence artifact |
 |---|---|---|
-| `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; `.release-evidence/load/distributed-scale-artifact.json` |
+| `scale-10k-loopback-recovery` (`gaRequired: true`, `pending`) | `tools/load/distributed-scale.ts` | strict `.release-evidence/load/scale-probe-artifact.json` plus `.release-evidence/load/scale-10k-artifact.json` |
 
-`distributed-scale.ts` is the authoritative multisource harness; the earlier
-single-source scale scripts it replaced are not release evidence.
+The hosted artifacts are explicitly one-source loopback evidence. The harness
+can record real external source diversity, but does not infer it from processes.
 
 ## What is safe to say today
 
@@ -85,8 +85,9 @@ new head.
   build ordering, per-OS wasm32 LLVM toolchain, coverage `RUSTC_BOOTSTRAP`,
   Node-appropriate npm in the consumer matrix, and a repaired fuzz-target /
   adversary-fixture build. Heavy load and stress campaigns moved to a dedicated
-  Linux `load` job (they saturate loopback UDP on shared runners; the strict
-  200-session RSS evidence is generated deliberately, not per push).
+  Linux `load` job (they saturate loopback UDP on shared runners). The current
+  release workflow deliberately generates a strict 20-session protocol/stream
+  probe and a separate 10k datagram/recovery artifact.
 - **RSS recovery gate validated on real CI Linux** (charged `smaps-lazyfree`
   metric: cold-start residency delta 11.03 MB under the pre-registered 13.1 MB
   Linux cap; service-ready ratio 1.11 under 1.25).

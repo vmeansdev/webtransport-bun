@@ -181,16 +181,17 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(testPlan).not.toContain("tools/fuzz/release-smoke-artifact.json");
 	});
 
-	test("release status names distributed scale as the authoritative 10k multisource harness", () => {
+	test("release status describes the honest split loopback scale evidence", () => {
 		const releaseStatus = readFileSync(
 			resolve(import.meta.dir, "../../docs/RELEASE_1.0_STATUS.md"),
 			"utf8",
 		);
 
 		expect(releaseStatus).toContain("distributed-scale.ts");
-		expect(releaseStatus).toContain(
-			".release-evidence/load/distributed-scale-artifact.json",
-		);
+		expect(releaseStatus).toContain("scale-probe-artifact.json");
+		expect(releaseStatus).toContain("scale-10k-artifact.json");
+		expect(releaseStatus).toContain("one-source loopback evidence");
+		expect(releaseStatus).not.toContain("authoritative multisource");
 		expect(releaseStatus).not.toContain("load-scale.ts");
 		expect(releaseStatus).not.toContain("load-scale-artifact.json");
 		expect(releaseStatus).not.toContain("load-scale-addon.ts");

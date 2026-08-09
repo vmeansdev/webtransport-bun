@@ -2,7 +2,7 @@
 /**
  * Promote docs/release-status.json readiness only when every gaRequired claim
  * is passed with commit-bound evidence that check-doc-truth would accept.
- * Claims with `gaRequired: false` (e.g. scale-10k-multisource) are tracked but
+ * Claims with `gaRequired: false` are tracked but
  * do not block GA.
  *
  * Usage:

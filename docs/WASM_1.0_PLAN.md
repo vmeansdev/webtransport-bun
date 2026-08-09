@@ -18,7 +18,7 @@ A single `1.0.0` ships only when **both** native and WASM meet the bar:
    auto-review, final no-change, etc.).
 4. `bun scripts/promote-release-status.ts` succeeds (`readiness=ready`).
 
-`scale-10k-multisource` stays in the manifest with `gaRequired: false`
+`scale-10k-loopback-recovery` is a GA-blocking release gate
 (instrumentation only).
 
 Engine strategy: keep sans-IO `quinn-proto` + hand-rolled H3/WT in

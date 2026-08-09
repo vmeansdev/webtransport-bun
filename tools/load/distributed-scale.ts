@@ -31,6 +31,7 @@ const DEFAULT_CLIENT_TARGET_HOST = "127.0.0.1";
 const CHILD_EXIT_TIMEOUT_MS = 30_000;
 const CHILD_TERMINATE_GRACE_MS = 2_000;
 const CHILD_DRAIN_TIMEOUT_MS = 2_000;
+const CLIENT_SESSION_LAUNCH_INTERVAL_MS = 10;
 const SERVER_CLOSE_TIMEOUT_MS = 10_000;
 const RSS_BASELINE_POLICY =
 	"service-ready-authoritative-cold-start-hard-diagnostic";
@@ -2144,9 +2145,9 @@ async function runLoadClient(
 	const result = await runCommandWithBoundedOutput(command, {
 		cwd: ROOT,
 		env: { RUST_BACKTRACE: "1" },
-		outerTimeoutMs: Math.max(
-			CHILD_EXIT_TIMEOUT_MS,
-			(options.durationSec + 1) * 1_000 + CHILD_EXIT_TIMEOUT_MS,
+		outerTimeoutMs: loadClientOuterTimeoutMs(
+			plan.requestedSessions,
+			options.durationSec,
 		),
 		terminateGraceMs: CHILD_TERMINATE_GRACE_MS,
 		drainTimeoutMs: CHILD_DRAIN_TIMEOUT_MS,
@@ -2156,6 +2157,20 @@ async function runLoadClient(
 		plan.clientIndex,
 		plan.serverPort,
 		plan.requestedSessions,
+	);
+}
+
+export function loadClientOuterTimeoutMs(
+	requestedSessions: number,
+	durationSec: number,
+): number {
+	const launchRampMs =
+		Math.max(0, Math.floor(requestedSessions) - 1) *
+		CLIENT_SESSION_LAUNCH_INTERVAL_MS;
+	const workloadMs = Math.max(0, durationSec) * 1_000;
+	return Math.max(
+		CHILD_EXIT_TIMEOUT_MS,
+		launchRampMs + workloadMs + CHILD_EXIT_TIMEOUT_MS,
 	);
 }
 

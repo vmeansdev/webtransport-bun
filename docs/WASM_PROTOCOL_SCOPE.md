@@ -88,7 +88,6 @@ These are **1.0 requirements**, not permanent product omissions. Treat
   bounded by the QUIC path MTU / quinn datagram limits.
 - Porting `wtransport` into wasm32 (Tokio / native UDP).
 - Browser server outside Chromium Isolated Web App + Direct Sockets.
-- Treating `scale-10k-multisource` as a GA blocker (`gaRequired: false`).
 
 ## Server-in-browser constraint
 

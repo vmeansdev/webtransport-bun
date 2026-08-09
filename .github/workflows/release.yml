@@ -286,8 +286,8 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  distributed-scale:
-    name: Distributed scale >=10k sessions (blocking)
+  scale-probe:
+    name: Strict protocol and stream scale probe (blocking)
     needs: [security, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -307,13 +307,72 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Build native addon
         run: bun run build:native
-      - name: Distributed scale campaign (>=10k sessions)
+      - name: Strict protocol and stream scale probe
+        env:
+          LOAD_SCALE_LABEL: strict-protocol-stream-probe
+          LOAD_SCALE_SESSIONS: "20"
+          LOAD_SCALE_DURATION: "3"
+          LOAD_SCALE_SERVER_COUNT: "2"
+          LOAD_SCALE_CLIENT_COUNT: "2"
+          LOAD_SCALE_DATAGRAMS_PER_SEC: "1"
+          LOAD_SCALE_STREAMS_PER_SEC: "1"
+          LOAD_SCALE_WORKLOAD_MODE: probe
+          LOAD_SCALE_MIN_LIVE_SESSIONS: "18"
+          LOAD_SCALE_MIN_SOURCE_IDENTITIES: "1"
+          LOAD_SCALE_MAX_STREAM_ERROR_RATE: "0"
+          LOAD_SCALE_MAX_RECOVERY_RSS_RATIO: "1.25"
+          LOAD_SCALE_ARTIFACT_OUT: .release-evidence/load/scale-probe-artifact.json
         run: bun tools/load/distributed-scale.ts
-      - name: Upload distributed scale evidence
+      - name: Upload strict protocol and stream probe evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
         with:
-          name: distributed-scale-evidence
-          path: .release-evidence/load/
+          name: scale-probe-evidence
+          path: .release-evidence/load/scale-probe-artifact.json
+          if-no-files-found: error
+          retention-days: 90
+
+  scale-10k-recovery:
+    name: 10k loopback datagram and recovery scale (blocking)
+    needs: [security, codeql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
+      - name: 10k loopback datagram and recovery campaign
+        env:
+          LOAD_SCALE_LABEL: scale-10k-loopback-datagram-recovery
+          LOAD_SCALE_SESSIONS: "10000"
+          LOAD_SCALE_DURATION: "60"
+          LOAD_SCALE_SERVER_COUNT: "2"
+          LOAD_SCALE_CLIENT_COUNT: "2"
+          LOAD_SCALE_DATAGRAMS_PER_SEC: "1"
+          LOAD_SCALE_STREAMS_PER_SEC: "0"
+          LOAD_SCALE_WORKLOAD_MODE: drain-all
+          LOAD_SCALE_MIN_LIVE_SESSIONS: "9000"
+          LOAD_SCALE_MIN_SOURCE_IDENTITIES: "1"
+          LOAD_SCALE_MAX_STREAM_ERROR_RATE: "0"
+          LOAD_SCALE_MAX_RECOVERY_RSS_RATIO: "1.25"
+          LOAD_SCALE_ARTIFACT_OUT: .release-evidence/load/scale-10k-artifact.json
+        run: bun tools/load/distributed-scale.ts
+      - name: Upload 10k loopback datagram and recovery evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: scale-10k-evidence
+          path: .release-evidence/load/scale-10k-artifact.json
           if-no-files-found: error
           retention-days: 90
 
@@ -384,30 +443,37 @@ jobs:
         shell: bash
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
-      CC_wasm32_unknown_unknown: clang
-      AR_wasm32_unknown_unknown: llvm-ar
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             node-version: "18.20.4"
+            npm-version: "10.9.4"
           - os: ubuntu-latest
             node-version: "20.19.0"
+            npm-version: "11.18.0"
           - os: ubuntu-latest
             node-version: "22.23.1"
+            npm-version: "11.18.0"
           - os: macos-latest
             node-version: "18.20.4"
+            npm-version: "10.9.4"
           - os: macos-latest
             node-version: "20.19.0"
+            npm-version: "11.18.0"
           - os: macos-latest
             node-version: "22.23.1"
+            npm-version: "11.18.0"
           - os: windows-latest
             node-version: "18.20.4"
+            npm-version: "10.9.4"
           - os: windows-latest
             node-version: "20.19.0"
+            npm-version: "11.18.0"
           - os: windows-latest
             node-version: "22.23.1"
+            npm-version: "11.18.0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -428,9 +494,29 @@ jobs:
       - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
         with:
           deno-version: "2.9.3"
+      - name: Install wasm C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          LLVM_BIN="/c/Program Files/LLVM/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang.exe" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar.exe" >> "$GITHUB_ENV"
       - name: Install exact release tooling
         run: |
-          npm install --global npm@11.18.0
+          npm install --global npm@${{ matrix.npm-version }}
           cargo install wasm-bindgen-cli --locked --version 0.2.121
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -452,7 +538,8 @@ jobs:
         parity,
         coverage,
         bench-regress,
-        distributed-scale,
+        scale-probe,
+        scale-10k-recovery,
         fuzz,
         package-consumers,
       ]
@@ -490,8 +577,12 @@ jobs:
           path: bench-regress-evidence
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: distributed-scale-evidence
-          path: distributed-scale-evidence
+          name: scale-probe-evidence
+          path: scale-probe-evidence
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: scale-10k-evidence
+          path: scale-10k-evidence
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
         with:
           toolchain: 1.95.0
@@ -519,7 +610,8 @@ jobs:
           find coverage-artifacts -path "*/bun/lcov.info" -type f | grep -q . || (echo "::error::Missing Bun lcov.info"; exit 1)
           find coverage-artifacts -path "*/bun/path-proof.txt" -type f | grep -q . || (echo "::error::Missing Bun path-proof.txt"; exit 1)
           find bench-regress-evidence -name "bench-regress-artifact.json" -type f | grep -q . || (echo "::error::Missing bench-regress-artifact.json"; exit 1)
-          find distributed-scale-evidence -name "distributed-scale-artifact.json" -type f | grep -q . || (echo "::error::Missing distributed-scale-artifact.json"; exit 1)
+          find scale-probe-evidence -name "scale-probe-artifact.json" -type f | grep -q . || (echo "::error::Missing scale-probe-artifact.json"; exit 1)
+          find scale-10k-evidence -name "scale-10k-artifact.json" -type f | grep -q . || (echo "::error::Missing scale-10k-artifact.json"; exit 1)
       - name: Regenerate combined SHA256SUMS (all targets)
         run: |
           set -euo pipefail

@@ -1016,6 +1016,156 @@ function validateReleaseExecutionPrerequisites(
 	}
 
 	validateFuzzExecutionPrerequisites(lines, jobs, add);
+	validateReleaseScaleEvidence(lines, jobs, add);
+	validateReleasePackageConsumers(lines, jobs, add);
+}
+
+function validateReleaseScaleEvidence(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+) {
+	const expected = new Map<string, Record<string, string>>([
+		[
+			"scale-probe",
+			{
+				LOAD_SCALE_SESSIONS: "20",
+				LOAD_SCALE_DURATION: "3",
+				LOAD_SCALE_SERVER_COUNT: "2",
+				LOAD_SCALE_CLIENT_COUNT: "2",
+				LOAD_SCALE_DATAGRAMS_PER_SEC: "1",
+				LOAD_SCALE_STREAMS_PER_SEC: "1",
+				LOAD_SCALE_WORKLOAD_MODE: "probe",
+				LOAD_SCALE_MIN_LIVE_SESSIONS: "18",
+				LOAD_SCALE_MIN_SOURCE_IDENTITIES: "1",
+				LOAD_SCALE_MAX_STREAM_ERROR_RATE: "0",
+				LOAD_SCALE_MAX_RECOVERY_RSS_RATIO: "1.25",
+				LOAD_SCALE_ARTIFACT_OUT:
+					".release-evidence/load/scale-probe-artifact.json",
+			},
+		],
+		[
+			"scale-10k-recovery",
+			{
+				LOAD_SCALE_SESSIONS: "10000",
+				LOAD_SCALE_DURATION: "60",
+				LOAD_SCALE_SERVER_COUNT: "2",
+				LOAD_SCALE_CLIENT_COUNT: "2",
+				LOAD_SCALE_DATAGRAMS_PER_SEC: "1",
+				LOAD_SCALE_STREAMS_PER_SEC: "0",
+				LOAD_SCALE_WORKLOAD_MODE: "drain-all",
+				LOAD_SCALE_MIN_LIVE_SESSIONS: "9000",
+				LOAD_SCALE_MIN_SOURCE_IDENTITIES: "1",
+				LOAD_SCALE_MAX_STREAM_ERROR_RATE: "0",
+				LOAD_SCALE_MAX_RECOVERY_RSS_RATIO: "1.25",
+				LOAD_SCALE_ARTIFACT_OUT:
+					".release-evidence/load/scale-10k-artifact.json",
+			},
+		],
+	]);
+	let valid = true;
+	for (const [jobName, contract] of expected) {
+		const job = jobs.find((candidate) => candidate.name === jobName);
+		const campaign = job
+			? stepBlocks(lines, job).find((step) =>
+					stepRun(step).includes("bun tools/load/distributed-scale.ts"),
+				)
+			: undefined;
+		const env = campaign ? stepSection(campaign, "env") : new Map();
+		if (
+			!campaign ||
+			Object.entries(contract).some(([key, value]) => env.get(key) !== value)
+		) {
+			valid = false;
+		}
+	}
+	const release = jobs.find((job) => job.name === "release");
+	const releaseText = release
+		? lines.slice(release.start, release.end + 1).join("\n")
+		: "";
+	for (const required of [
+		"scale-probe",
+		"scale-10k-recovery",
+		"scale-probe-evidence",
+		"scale-10k-evidence",
+		"scale-probe-artifact.json",
+		"scale-10k-artifact.json",
+	]) {
+		if (!releaseText.includes(required)) valid = false;
+	}
+	if (!valid) {
+		add(
+			jobs.find((job) => job.name === "scale-probe")?.start ?? 0,
+			"release scale evidence must preserve the strict probe and 10k recovery contracts",
+		);
+	}
+}
+
+function validateReleasePackageConsumers(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+) {
+	const job = jobs.find((candidate) => candidate.name === "package-consumers");
+	if (!job) {
+		add(
+			0,
+			"release package consumers require Node-compatible npm and a preceding wasm C toolchain",
+		);
+		return;
+	}
+	const text = lines.slice(job.start, job.end + 1).join("\n");
+	const lanes = [
+		...text.matchAll(
+			/- os:\s*(\S+)\s*\n\s*node-version:\s*["']?([0-9.]+)["']?\s*\n\s*npm-version:\s*["']?([0-9.]+)["']?/g,
+		),
+	].map((match) => ({ os: match[1], node: match[2], npm: match[3] }));
+	const expectedLanes = new Set(
+		["ubuntu-latest", "macos-latest", "windows-latest"].flatMap((os) => [
+			`${os}:18.20.4:10.9.4`,
+			`${os}:20.19.0:11.18.0`,
+			`${os}:22.23.1:11.18.0`,
+		]),
+	);
+	const actualLanes = new Set(
+		lanes.map((lane) => `${lane.os}:${lane.node}:${lane.npm}`),
+	);
+	const steps = stepBlocks(lines, job);
+	const buildIndex = steps.findIndex((step) =>
+		stepRun(step).includes("scripts/test-package-artifact.ts build"),
+	);
+	const requiredToolchainSteps = [
+		["Install wasm C toolchain (Linux)", "apt-get install -y clang lld llvm"],
+		["Install wasm C toolchain (macOS)", "brew install llvm"],
+		["Install wasm C toolchain (Windows)", "Program Files/LLVM/bin"],
+	] as const;
+	const toolchainsPrecedeBuild = requiredToolchainSteps.every(
+		([name, command]) => {
+			const index = steps.findIndex(
+				(step) =>
+					stepScalar(step, "name") === name && stepRun(step).includes(command),
+			);
+			return index >= 0 && buildIndex > index;
+		},
+	);
+	const exactTooling = steps.some(
+		(step) =>
+			stepScalar(step, "name") === "Install exact release tooling" &&
+			stepRun(step).includes(
+				"npm install --global npm@$" + "{{ matrix.npm-version }}",
+			),
+	);
+	const valid =
+		expectedLanes.size === actualLanes.size &&
+		[...expectedLanes].every((lane) => actualLanes.has(lane)) &&
+		toolchainsPrecedeBuild &&
+		exactTooling;
+	if (!valid) {
+		add(
+			job.start,
+			"release package consumers require Node-compatible npm and a preceding wasm C toolchain",
+		);
+	}
 }
 
 function validateFuzzExecutionPrerequisites(

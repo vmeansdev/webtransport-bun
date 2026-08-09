@@ -217,12 +217,12 @@
 			"gaRequired": true
 		},
 		{
-			"id": "scale-10k-multisource",
+			"id": "scale-10k-loopback-recovery",
 			"surface": "release",
 			"status": "pending",
 			"evidenceIds": [],
-			"gaRequired": false,
-			"notes": "Instrumentation target; gaRequired=false."
+			"gaRequired": true,
+			"notes": "One-source hosted loopback session-scale datagram and recovery gate; strict stream semantics are proven by the separate small probe. Both artifacts are required."
 		},
 		{
 			"id": "package-artifact",

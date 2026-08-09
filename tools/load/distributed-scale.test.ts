@@ -17,6 +17,7 @@ import {
 	evaluateWorkloadEvidence,
 	type FinalGauges,
 	isPromotable,
+	loadClientOuterTimeoutMs,
 	nativeTransportPolicySnapshot,
 	plannedWarmupSessions,
 	type RunSummary,
@@ -55,6 +56,11 @@ const ZERO_GAUGES: FinalGauges = {
 };
 
 describe("Task 14 distributed scale evidence", () => {
+	test("load-client timeout includes the fixed per-session launch ramp", () => {
+		expect(loadClientOuterTimeoutMs(1, 3)).toBe(33_000);
+		expect(loadClientOuterTimeoutMs(5_000, 60)).toBe(139_990);
+	});
+
 	test("parses bounded process RSS samples and records exit telemetry", () => {
 		expect(parseProcessRssMb("  61440\n")).toBe(60);
 		expect(parseProcessRssMb("  PID RSS\n")).toBeNull();
