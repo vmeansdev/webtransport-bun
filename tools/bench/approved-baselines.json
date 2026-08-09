@@ -1,16 +1,16 @@
 {
-  "status": "blocked",
-  "approvedAt": null,
-  "approver": null,
-  "commit": null,
-  "candidateRelationship": null,
-  "maxAncestryDistance": 32,
-  "machine": null,
-  "bunVersion": null,
-  "rustcVersion": null,
-  "toolchainHash": null,
-  "artifactSha256": null,
-  "artifactPath": null,
+  "status": "approved",
+  "approvedAt": "2026-08-09T16:43:50.325Z",
+  "approver": "vmeansdev",
+  "commit": "490f5ea4963625a61a3d495ff342bb2ced78d5c3",
+  "candidateRelationship": "ancestry",
+  "maxAncestryDistance": 8,
+  "machine": "github-actions-ubuntu-latest-x64",
+  "bunVersion": "1.3.14",
+  "rustcVersion": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "toolchainHash": "014a615d1a2923195986c335b2a2a0f3842a48d4be61a5996c6f70ec30390526",
+  "artifactSha256": "52990940fdb32e7268b02396d3d6950858324a1af8bff0391f015c716d7bae4b",
+  "artifactPath": "tools/bench/baselines/490f5ea4963625a61a3d495ff342bb2ced78d5c3-github-actions-ubuntu-latest-x64.json",
   "minimumDetectableEffect": {
     "relative": 0.1,
     "confidence": 0.95
@@ -18,16 +18,298 @@
   "designWarmups": 3,
   "designRounds": 15,
   "notes": [
-    "Populate this file only from a successful release-candidate benchmark capture.",
-    "Do not guess thresholds. bench-regress compares confidence intervals against the approved measured baseline in this file.",
-    "Gate design: detect a ≥10% relative non-overlapping CI95 regression at 95% confidence (warmups=3, rounds=15).",
-    "Approved baselines require: approver, artifactSha256+artifactPath (artifact.commit === baseline.commit), machine, toolchainHash."
+    "Thresholds are derived exclusively from the bound capture samples."
   ],
-  "thresholds": {},
-  "lastAttempt": {
-    "at": "2026-07-22T00:00:00Z",
-    "command": "bun run build:native && bun run bench:baseline",
-    "exitCode": 1,
-    "reason": "Local Task 14 baseline capture is blocked because the current rustc toolchain cannot build the native addon: rcgen 0.14.8 and time 0.3.47 require rustc 1.88+, while the workspace build path resolved to rustc 1.85.0."
+  "thresholds": {
+    "handshake-p50-ms": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          7.04,
+          6.995,
+          6.963,
+          7.844,
+          6.915,
+          6.947,
+          7.054,
+          6.874,
+          7.338,
+          7.02,
+          7.326,
+          6.981,
+          6.944,
+          6.976,
+          6.93
+        ],
+        "mean": 7.076,
+        "min": 6.874,
+        "max": 7.844,
+        "stddev": 0.252,
+        "ci95Low": 6.937,
+        "ci95High": 7.216
+      },
+      "unit": "ms"
+    },
+    "handshake-p95-ms": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          8.336,
+          8.482,
+          8.379,
+          9.128,
+          8.446,
+          8.45,
+          8.417,
+          8.5,
+          8.511,
+          8.343,
+          8.57,
+          8.522,
+          8.421,
+          8.421,
+          8.368
+        ],
+        "mean": 8.486,
+        "min": 8.336,
+        "max": 9.128,
+        "stddev": 0.19,
+        "ci95Low": 8.381,
+        "ci95High": 8.592
+      },
+      "unit": "ms"
+    },
+    "handshake-p99-ms": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          9.145,
+          8.814,
+          8.981,
+          10.08,
+          8.992,
+          8.812,
+          8.872,
+          9.165,
+          9.221,
+          8.93,
+          9.042,
+          11.029,
+          9.144,
+          9.259,
+          9.304
+        ],
+        "mean": 9.253,
+        "min": 8.812,
+        "max": 11.029,
+        "stddev": 0.579,
+        "ci95Low": 8.932,
+        "ci95High": 9.573
+      },
+      "unit": "ms"
+    },
+    "close-latency-p99-ms": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          0.455,
+          0.261,
+          0.287,
+          0.42,
+          0.535,
+          0.434,
+          0.425,
+          0.33,
+          0.343,
+          0.48,
+          0.379,
+          0.289,
+          0.251,
+          0.489,
+          0.23
+        ],
+        "mean": 0.374,
+        "min": 0.23,
+        "max": 0.535,
+        "stddev": 0.097,
+        "ci95Low": 0.32,
+        "ci95High": 0.428
+      },
+      "unit": "ms"
+    },
+    "stream-throughput-mbps": {
+      "direction": "higher-is-better",
+      "approved": {
+        "samples": [
+          1.56,
+          1.52,
+          1.55,
+          1.54,
+          1.52,
+          1.54,
+          1.54,
+          1.55,
+          1.54,
+          1.54,
+          1.5,
+          1.52,
+          1.53,
+          1.54,
+          1.53
+        ],
+        "mean": 1.535,
+        "min": 1.5,
+        "max": 1.56,
+        "stddev": 0.015,
+        "ci95Low": 1.526,
+        "ci95High": 1.543
+      },
+      "unit": "MiB/s"
+    },
+    "datagram-throughput-dgrams-per-sec": {
+      "direction": "higher-is-better",
+      "approved": {
+        "samples": [
+          6760.325,
+          6640.872,
+          6673.846,
+          6593.001,
+          6782.793,
+          6711.776,
+          6650.866,
+          6678.253,
+          6674.376,
+          6641.886,
+          6735.184,
+          6750.055,
+          6666.413,
+          6726.884,
+          6773.555
+        ],
+        "mean": 6697.339,
+        "min": 6593.001,
+        "max": 6782.793,
+        "stddev": 56.113,
+        "ci95Low": 6666.262,
+        "ci95High": 6728.416
+      },
+      "unit": "dgram/s"
+    },
+    "datagram-loss-ratio": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          0.481,
+          0.4761,
+          0.4821,
+          0.4785,
+          0.482,
+          0.4838,
+          0.481,
+          0.4774,
+          0.4822,
+          0.4808,
+          0.4798,
+          0.4804,
+          0.4818,
+          0.4797,
+          0.4815
+        ],
+        "mean": 0.481,
+        "min": 0.476,
+        "max": 0.484,
+        "stddev": 0.002,
+        "ci95Low": 0.479,
+        "ci95High": 0.482
+      },
+      "unit": "ratio"
+    },
+    "event-loop-delay-p99-ms": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          0.476,
+          0.767,
+          0.453,
+          0.388,
+          0.966,
+          0.458,
+          0.52,
+          0.455,
+          0.409,
+          0.457,
+          0.549,
+          0.481,
+          0.457,
+          0.504,
+          0.436
+        ],
+        "mean": 0.518,
+        "min": 0.388,
+        "max": 0.966,
+        "stddev": 0.152,
+        "ci95Low": 0.434,
+        "ci95High": 0.602
+      },
+      "unit": "ms"
+    },
+    "cpu-user-ms": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          340.924,
+          339.427,
+          341.261,
+          371.256,
+          335.481,
+          317.364,
+          336.617,
+          348.944,
+          342.47,
+          334.255,
+          342.473,
+          345.88,
+          319.174,
+          339.531,
+          318.386
+        ],
+        "mean": 338.23,
+        "min": 317.364,
+        "max": 371.256,
+        "stddev": 13.464,
+        "ci95Low": 330.773,
+        "ci95High": 345.686
+      },
+      "unit": "ms"
+    },
+    "peak-rss-mib": {
+      "direction": "lower-is-better",
+      "approved": {
+        "samples": [
+          86.98,
+          86.668,
+          86.383,
+          85.891,
+          86.555,
+          86.258,
+          87.281,
+          86.973,
+          88.641,
+          87.063,
+          87.996,
+          86.59,
+          87.172,
+          87.105,
+          88.105
+        ],
+        "mean": 87.044,
+        "min": 85.891,
+        "max": 88.641,
+        "stddev": 0.739,
+        "ci95Low": 86.635,
+        "ci95High": 87.453
+      },
+      "unit": "MiB"
+    }
   }
 }
