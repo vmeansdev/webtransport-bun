@@ -19,6 +19,10 @@ const RELEASE_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "release.yml"),
 	"utf8",
 );
+const TRIVY_WORKFLOW = readFileSync(
+	join(PROJECT_ROOT, ".github", "workflows", "trivy.yml"),
+	"utf8",
+);
 const BENCH_BASELINE_CAPTURE_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "bench-baseline-capture.yml"),
 	"utf8",
@@ -252,6 +256,16 @@ describe("GitHub Actions release policy", () => {
 			"uses: ./.github/workflows/bench-baseline-capture.yml",
 		);
 		expect(BENCH_BASELINE_CAPTURE_WORKFLOW).toContain("workflow_call:");
+	});
+
+	it("keeps release security scans on the same resolvable immutable Trivy action", () => {
+		const pins = (workflow: string) =>
+			[...workflow.matchAll(/aquasecurity\/trivy-action@([0-9a-f]{40})/g)].map(
+				(match) => match[1],
+			);
+		const canonicalPins = [...new Set(pins(TRIVY_WORKFLOW))];
+		expect(canonicalPins).toHaveLength(1);
+		expect([...new Set(pins(RELEASE_WORKFLOW))]).toEqual(canonicalPins);
 	});
 
 	it("makes coverage, benchmark regression, and >=10k distributed scale release-blocking with downloaded evidence", () => {
