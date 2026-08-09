@@ -40,6 +40,11 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(source).toContain("rustup run");
 		expect(source).toContain(".github/release-toolchain.json");
 		expect(source).toContain("ASAN_SYMBOLIZER_PATH");
+		expect(source).toContain("LLVM_SYMBOLIZER_PATH");
+		expect(source).toMatch(
+			/toolchainCommand\([\s\S]*?"cargo",\s*"fuzz",\s*"build"/,
+		);
+		expect(source).toContain("fuzz prebuild timed out");
 	});
 
 	test("enforces an outer watchdog per command and artifacts timeout state", () => {
@@ -140,10 +145,14 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(releaseWorkflow).toContain("fuzz:");
 		expect(releaseWorkflow).toContain("needs: [security, codeql, fuzz]");
 		expect(releaseWorkflow).toContain("bun run fuzz:release-smoke");
+		expect(releaseWorkflow).toContain("llvm-symbolizer-18");
+		expect(releaseWorkflow).toContain("LLVM_SYMBOLIZER_PATH");
 		expect(releaseWorkflow).toContain("fuzz-evidence");
 		expect(fuzzWorkflow).toContain("schedule:");
 		expect(fuzzWorkflow).toContain("workflow_dispatch:");
 		expect(fuzzWorkflow).toContain("bun run fuzz:release-smoke");
+		expect(fuzzWorkflow).toContain("llvm-symbolizer-18");
+		expect(fuzzWorkflow).toContain("LLVM_SYMBOLIZER_PATH");
 		expect(fuzzWorkflow).toContain("retention-days: 90");
 		expect(packageJson).toContain('"fuzz:release-smoke"');
 	});

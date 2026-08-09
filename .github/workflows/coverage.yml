@@ -1,5 +1,6 @@
 name: coverage
 on:
+  workflow_call:
   workflow_dispatch:
   push:
   pull_request:
@@ -18,20 +19,15 @@ jobs:
       contents: read
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
-      # cargo-llvm-cov --branch emits -Z coverage-options=branch, which the
-      # pinned stable 1.95.0 rejects unless bootstrap is set. This is the same
-      # escape hatch cargo-llvm-cov applies internally; it keeps the pinned
-      # 1.95.0 compiler (no nightly), only unlocking the branch flag.
-      RUSTC_BOOTSTRAP: "1"
       # ring compiles C for wasm32; use LLVM's clang/llvm-ar (not the macOS
       # brew paths build-wasm.sh defaults to). Mirrors the green wasm job.
       CC_wasm32_unknown_unknown: clang
       AR_wasm32_unknown_unknown: llvm-ar
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # immutable action pin resolved 2026-07-21
         with:
-          toolchain: 1.95.0
+          toolchain: nightly-2026-07-15
           components: llvm-tools-preview
           targets: wasm32-unknown-unknown
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -111,9 +107,9 @@ jobs:
           }
 
           failures = []
-          # Branch data only exists because RUSTC_BOOTSTRAP unlocks
-          # -Z coverage-options=branch on the pinned stable toolchain. If a
-          # toolchain bump silently drops branch instrumentation, every file
+          # Branch data comes from the exact governed nightly toolchain because
+          # cargo-llvm-cov emits -Z coverage-options=branch. If a toolchain
+          # bump silently drops branch instrumentation, every file
           # reports zero branch sites and the count==0 vacuous-truth rule below
           # would wave the whole branch gate through having measured nothing.
           # Guard: the floored files must collectively expose at least one

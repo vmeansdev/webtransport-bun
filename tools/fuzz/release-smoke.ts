@@ -105,6 +105,10 @@ function rustHostTriple(toolchain: string): string | null {
 }
 
 function resolveLlvmSymbolizer(toolchain: string): string | null {
+	const configured = process.env.LLVM_SYMBOLIZER_PATH?.trim();
+	if (configured) {
+		return existsSync(configured) ? configured : null;
+	}
 	const sysroot = probe(
 		toolchainCommand(toolchain, "rustc", "--print", "sysroot"),
 	);
@@ -119,20 +123,6 @@ function resolveLlvmSymbolizer(toolchain: string): string | null {
 			"llvm-symbolizer",
 		);
 		if (existsSync(toolchainPath)) return toolchainPath;
-	}
-	// rustup's llvm-tools-preview on some hosts (notably current darwin) omits
-	// llvm-symbolizer; accept a PATH / Homebrew binary so crash artifacts still
-	// symbolize instead of failing the smoke as a false tooling blocker.
-	const fromPath = probe(["sh", "-c", "command -v llvm-symbolizer"]);
-	if (fromPath.ok) {
-		const resolved = fromPath.stdout.trim().split("\n")[0]?.trim();
-		if (resolved && existsSync(resolved)) return resolved;
-	}
-	for (const candidate of [
-		"/opt/homebrew/opt/llvm/bin/llvm-symbolizer",
-		"/usr/local/opt/llvm/bin/llvm-symbolizer",
-	]) {
-		if (existsSync(candidate)) return candidate;
 	}
 	return null;
 }
@@ -309,7 +299,7 @@ async function main() {
 	}
 	if (!llvmSymbolizer) {
 		failures.push(
-			`llvm-symbolizer missing for rustup toolchain ${toolchain}; install llvm-tools-preview for the pinned release toolchain`,
+			`llvm-symbolizer missing for rustup toolchain ${toolchain}; set LLVM_SYMBOLIZER_PATH to the governed executable or install llvm-tools-preview for the pinned release toolchain`,
 		);
 	}
 
@@ -321,8 +311,41 @@ async function main() {
 			}
 		: {};
 	const fuzzCommandTimeoutMs = FIXED_DURATION_SECS * 1_000 + 30_000;
-
+	let prebuildPassed = true;
 	for (const target of cargoFuzzTargets) {
+		const fuzzPrebuild = await runCommand(
+			toolchainCommand(
+				toolchain,
+				"cargo",
+				"fuzz",
+				"build",
+				target.name,
+				"--fuzz-dir",
+				".",
+				"--sanitizer",
+				"none",
+			),
+			{
+				cwd: import.meta.dir,
+				env: commonEnv,
+				timeoutMs: 10 * 60_000,
+			},
+		);
+		commandResults.push(fuzzPrebuild);
+		if (fuzzPrebuild.timedOut) {
+			prebuildPassed = false;
+			failures.push(
+				`${target.name}: fuzz prebuild timed out after ${fuzzPrebuild.timeoutMs}ms (${fuzzPrebuild.timeoutSignal ?? "timeout"})`,
+			);
+		} else if (fuzzPrebuild.exitCode !== 0) {
+			prebuildPassed = false;
+			failures.push(
+				`${target.name}: fuzz prebuild exited ${fuzzPrebuild.exitCode}: ${fuzzPrebuild.stderr || fuzzPrebuild.stdout}`,
+			);
+		}
+	}
+
+	for (const target of prebuildPassed ? cargoFuzzTargets : []) {
 		const corpusDirectory = resolve(CORPUS_ROOT, target.corpus);
 		if (corpusFiles(corpusDirectory).length === 0) {
 			failures.push(

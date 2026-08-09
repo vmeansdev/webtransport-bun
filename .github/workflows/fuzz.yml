@@ -29,10 +29,11 @@ jobs:
         run: rustup run 1.95.0 cargo install cargo-fuzz --locked --version 0.13.1
       - name: Install deps
         run: bun install --frozen-lockfile
-      - name: Compile-check fuzz targets (PR-time safety net)
+      - name: Bind deterministic LLVM symbolizer
         run: |
-          rustup run 1.95.0 cargo fuzz build --fuzz-dir tools/fuzz --sanitizer none || \
-          (cd tools/fuzz && rustup run 1.95.0 cargo check --all-targets)
+          LLVM_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-18)"
+          test -x "$LLVM_SYMBOLIZER_PATH"
+          echo "LLVM_SYMBOLIZER_PATH=$LLVM_SYMBOLIZER_PATH" >> "$GITHUB_ENV"
       - name: Scheduled fuzz smoke
         run: bun run fuzz:release-smoke
       - name: Upload fuzz evidence

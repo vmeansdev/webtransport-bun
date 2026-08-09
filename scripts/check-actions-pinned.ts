@@ -121,6 +121,7 @@ type ReleaseToolchain = {
 	schemaVersion: 1;
 	bun: string[];
 	rust: string[];
+	rustNightly: string[];
 	node: string[];
 	deno: string[];
 	python: string[];
@@ -149,12 +150,14 @@ function loadToolchain(): ReleaseToolchain {
 	}
 	for (const [tool, versions] of Object.entries(parsed)) {
 		if (tool === "schemaVersion") continue;
+		const exactVersion =
+			tool === "rustNightly" ? /^nightly-\d{4}-\d{2}-\d{2}$/ : EXACT_SEMVER;
 		if (
 			!Array.isArray(versions) ||
 			versions.length === 0 ||
-			!versions.every((version) => EXACT_SEMVER.test(String(version)))
+			!versions.every((version) => exactVersion.test(String(version)))
 		) {
-			throw new Error(`${tool} must list one or more exact semantic versions`);
+			throw new Error(`${tool} must list one or more exact versions`);
 		}
 	}
 	return parsed;
@@ -163,6 +166,9 @@ function loadToolchain(): ReleaseToolchain {
 const TOOLCHAIN = loadToolchain();
 
 function approvedVersions(key: string): string[] {
+	if (key === "toolchain") {
+		return [...TOOLCHAIN.rust, ...TOOLCHAIN.rustNightly];
+	}
 	const mapping: Record<string, keyof ReleaseToolchain> = {
 		"bun-version": "bun",
 		"node-version": "node",
@@ -210,6 +216,10 @@ function exactVersionViolation(
 	lines: string[],
 ): string | undefined {
 	const normalized = scalar(value);
+	const exactVersion =
+		key === "toolchain"
+			? /^(?:\d+\.\d+\.\d+|nightly-\d{4}-\d{2}-\d{2})$/
+			: EXACT_SEMVER;
 	const matrixReference = /^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$/.exec(
 		normalized,
 	)?.[1];
@@ -230,7 +240,7 @@ function exactVersionViolation(
 				values.length > 0 &&
 				values.every(
 					(candidate) =>
-						EXACT_SEMVER.test(candidate) && approved.includes(candidate),
+						exactVersion.test(candidate) && approved.includes(candidate),
 				)
 			) {
 				return undefined;
@@ -244,7 +254,7 @@ function exactVersionViolation(
 			.map((candidate) => (candidate ? scalar(candidate) : undefined))
 			.filter(
 				(candidate): candidate is string =>
-					typeof candidate === "string" && EXACT_SEMVER.test(candidate),
+					typeof candidate === "string" && exactVersion.test(candidate),
 			);
 		const approved = approvedVersions(key);
 		if (
@@ -255,8 +265,10 @@ function exactVersionViolation(
 		}
 		return `${key} matrix ${matrixReference} must contain only exact three-part versions`;
 	}
-	if (!EXACT_SEMVER.test(normalized)) {
-		return `${key} must be an exact three-part version, not ${JSON.stringify(normalized)}`;
+	if (!exactVersion.test(normalized)) {
+		return key === "toolchain"
+			? `${key} must be an exact approved version, not ${JSON.stringify(normalized)}`
+			: `${key} must be an exact three-part version, not ${JSON.stringify(normalized)}`;
 	}
 	const approved = approvedVersions(key);
 	if (!approved.includes(normalized)) {
@@ -956,6 +968,115 @@ function validateVerificationOnlyRelease(
 	}
 }
 
+function validateReleaseExecutionPrerequisites(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+) {
+	for (const job of jobs) {
+		let dependenciesInstalled = false;
+		for (const step of stepBlocks(lines, job)) {
+			const command = stepRun(step);
+			if (/\bbun install --frozen-lockfile\b/.test(command)) {
+				dependenciesInstalled = true;
+			}
+			if (
+				/(?:\bbun run build:native\b|\bbunx @napi-rs\/cli@\d+\.\d+\.\d+ build\b)/.test(
+					command,
+				) &&
+				!dependenciesInstalled
+			) {
+				add(
+					step.start,
+					"native builds require a preceding frozen dependency install",
+				);
+			}
+		}
+	}
+
+	const coverage = jobs.find((job) => job.name === "coverage");
+	if (
+		!coverage ||
+		jobScalar(lines, coverage, "uses") !== "./.github/workflows/coverage.yml"
+	) {
+		add(
+			coverage?.start ?? 0,
+			"release coverage must reuse the canonical full coverage gate",
+		);
+	}
+	for (const job of jobs) {
+		if (job.name === "coverage") continue;
+		const text = lines.slice(job.start, job.end + 1).join("\n");
+		if (TOOLCHAIN.rustNightly.some((version) => text.includes(version))) {
+			add(
+				job.start,
+				"the governed nightly toolchain is restricted to coverage",
+			);
+		}
+	}
+
+	validateFuzzExecutionPrerequisites(lines, jobs, add);
+}
+
+function validateFuzzExecutionPrerequisites(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+) {
+	for (const job of jobs) {
+		let symbolizerBound = false;
+		for (const step of stepBlocks(lines, job)) {
+			const command = stepRun(step);
+			if (
+				command.includes("command -v llvm-symbolizer-18") &&
+				command.includes("LLVM_SYMBOLIZER_PATH=$LLVM_SYMBOLIZER_PATH")
+			) {
+				symbolizerBound = true;
+			}
+			if (!command.includes("bun run fuzz:release-smoke")) continue;
+			if (symbolizerBound) continue;
+			add(
+				step.start,
+				"fuzz release smoke requires deterministic symbolizer setup",
+			);
+		}
+	}
+}
+
+function validateCoverageExecutionPrerequisites(
+	lines: string[],
+	jobs: JobBlock[],
+	add: (line: number, message: string) => void,
+) {
+	const nightly = TOOLCHAIN.rustNightly[0] ?? "";
+	for (const job of jobs) {
+		const text = lines.slice(job.start, job.end + 1).join("\n");
+		if (!text.includes("cargo llvm-cov") || !text.includes("--branch"))
+			continue;
+		if (!nightly || !text.includes(`toolchain: ${nightly}`)) {
+			add(job.start, "branch coverage requires the governed nightly toolchain");
+		}
+		if (text.includes("RUSTC_BOOTSTRAP")) {
+			add(job.start, "branch coverage must not use RUSTC_BOOTSTRAP");
+		}
+		for (const required of [
+			"coverage/native-coverage.json",
+			"coverage/wasm-coverage.json",
+			"--coverage-reporter=lcov",
+			"coverage/bun/path-proof.txt",
+			"Enforce risk-module coverage floors",
+		]) {
+			if (!text.includes(required)) {
+				add(
+					job.start,
+					"coverage workflow must enforce native, WASM, and Bun floors",
+				);
+				break;
+			}
+		}
+	}
+}
+
 function hasPermission(
 	block: string[],
 	scope: string,
@@ -1061,6 +1182,13 @@ function scanWorkflow(path: string): Violation[] {
 	}
 	if (file === "release.yml" || file === "release.yaml") {
 		validateVerificationOnlyRelease(lines, jobs, add);
+		validateReleaseExecutionPrerequisites(lines, jobs, add);
+	}
+	if (file === "coverage.yml" || file === "coverage.yaml") {
+		validateCoverageExecutionPrerequisites(lines, jobs, add);
+	}
+	if (file === "fuzz.yml" || file === "fuzz.yaml") {
+		validateFuzzExecutionPrerequisites(lines, jobs, add);
 	}
 
 	for (const job of jobs) {

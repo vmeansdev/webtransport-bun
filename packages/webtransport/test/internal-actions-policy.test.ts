@@ -35,6 +35,10 @@ const SOAK_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "soak-long.yml"),
 	"utf8",
 );
+const COVERAGE_WORKFLOW = readFileSync(
+	join(PROJECT_ROOT, ".github", "workflows", "coverage.yml"),
+	"utf8",
+);
 const LOCAL_CI_SCRIPT = readFileSync(
 	join(PROJECT_ROOT, "scripts", "test_ci_local.sh"),
 	"utf8",
@@ -48,6 +52,7 @@ const RELEASE_TOOLCHAIN = JSON.parse(
 ) as {
 	node: string[];
 	rust: string[];
+	rustNightly: string[];
 	wasmBindgen: string[];
 	cargoAudit: string[];
 	cargoFuzz: string[];
@@ -94,6 +99,7 @@ function runPolicy(workflow: string, filename = "test.yml") {
 			schemaVersion: 1,
 			bun: ["1.3.9", "1.3.14"],
 			rust: ["1.95.0"],
+			rustNightly: ["nightly-2026-07-15"],
 			node: ["18.20.4", "20.19.0", "22.23.1"],
 			deno: ["2.9.3"],
 			python: ["3.12.10"],
@@ -175,6 +181,105 @@ function parseWorkflow(document: string): {
 }
 
 describe("GitHub Actions release policy", () => {
+	it("requires release dependencies before every native build", () => {
+		const accepted = runPolicy(RELEASE_WORKFLOW, "release.yml");
+		expect(accepted.status).toBe(0);
+
+		const misordered = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				"      - name: Install deps\n        run: bun install --frozen-lockfile\n      - name: Build native addon",
+				"      - name: Build native addon\n        run: bun run build:native\n      - name: Install deps",
+			),
+			"release.yml",
+		);
+		expect(misordered.status).toBe(1);
+		expect(misordered.stderr).toContain(
+			"native builds require a preceding frozen dependency install",
+		);
+	});
+
+	it("scopes nightly branch coverage and deterministic fuzz setup to their release jobs", () => {
+		const workflow = parseWorkflow(RELEASE_WORKFLOW);
+		const coverage = workflow.jobs?.coverage;
+		const fuzz = workflow.jobs?.fuzz;
+		const nightly = RELEASE_TOOLCHAIN.rustNightly[0] as string;
+		const stable = RELEASE_TOOLCHAIN.rust[0] as string;
+		expect(coverage).toBeDefined();
+		expect(fuzz).toBeDefined();
+
+		const coverageText = JSON.stringify(coverage);
+		expect(coverageText).toContain("./.github/workflows/coverage.yml");
+		expect(COVERAGE_WORKFLOW).toContain(nightly);
+		expect(COVERAGE_WORKFLOW).toContain("llvm-cov --workspace --branch");
+		expect(COVERAGE_WORKFLOW).toContain("coverage/wasm-coverage.json");
+		expect(COVERAGE_WORKFLOW).toContain("--coverage-reporter=lcov");
+		expect(COVERAGE_WORKFLOW).toContain("Enforce risk-module coverage floors");
+
+		for (const [name, job] of Object.entries(workflow.jobs ?? {})) {
+			if (name === "coverage") continue;
+			expect(JSON.stringify(job)).not.toContain(nightly);
+		}
+
+		const fuzzText = JSON.stringify(fuzz);
+		expect(fuzzText).toContain("llvm-symbolizer-18");
+		expect(fuzzText).toContain("LLVM_SYMBOLIZER_PATH");
+
+		const stableCoverage = runPolicy(
+			COVERAGE_WORKFLOW.replaceAll(nightly, stable),
+			"coverage.yml",
+		);
+		expect(stableCoverage.status).toBe(1);
+		expect(stableCoverage.stderr).toContain(
+			"branch coverage requires the governed nightly toolchain",
+		);
+
+		const missingSymbolizer = runPolicy(
+			RELEASE_WORKFLOW.replace("llvm-symbolizer-18", "llvm-symbolizer"),
+			"release.yml",
+		);
+		expect(missingSymbolizer.status).toBe(1);
+		expect(missingSymbolizer.stderr).toContain(
+			"fuzz release smoke requires deterministic symbolizer setup",
+		);
+
+		const misorderedSymbolizer = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				/ {6}- name: Bind deterministic LLVM symbolizer[\s\S]*? {6}- name: Release fuzz smoke\n {8}run: bun run fuzz:release-smoke/,
+				'      - name: Release fuzz smoke\n        run: bun run fuzz:release-smoke\n      - name: Bind deterministic LLVM symbolizer\n        run: |\n          LLVM_SYMBOLIZER_PATH="$(command -v llvm-symbolizer-18)"\n          echo "LLVM_SYMBOLIZER_PATH=$LLVM_SYMBOLIZER_PATH" >> "$GITHUB_ENV"',
+			),
+			"release.yml",
+		);
+		expect(misorderedSymbolizer.status).toBe(1);
+		expect(misorderedSymbolizer.stderr).toContain(
+			"fuzz release smoke requires deterministic symbolizer setup",
+		);
+
+		const nativeOnlyRelease = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				"    uses: ./.github/workflows/coverage.yml",
+				"    runs-on: ubuntu-latest",
+			),
+			"release.yml",
+		);
+		expect(nativeOnlyRelease.status).toBe(1);
+		expect(nativeOnlyRelease.stderr).toContain(
+			"release coverage must reuse the canonical full coverage gate",
+		);
+
+		const acceptedCoverage = runPolicy(COVERAGE_WORKFLOW, "coverage.yml");
+		expect(acceptedCoverage.status).toBe(0);
+		const bootstrapCoverage = runPolicy(
+			COVERAGE_WORKFLOW.replace(
+				'      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"',
+				'      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"\n      RUSTC_BOOTSTRAP: "1"',
+			),
+			"coverage.yml",
+		);
+		expect(bootstrapCoverage.status).toBe(1);
+		expect(bootstrapCoverage.stderr).toContain(
+			"branch coverage must not use RUSTC_BOOTSTRAP",
+		);
+	});
 	it("accepts only authenticated benchmark capture governance", () => {
 		const accepted = runPolicy(
 			BENCH_BASELINE_CAPTURE_WORKFLOW,
@@ -300,6 +405,15 @@ describe("GitHub Actions release policy", () => {
 		expect(RELEASE_WORKFLOW).toContain("path: distributed-scale-evidence");
 		expect(RELEASE_WORKFLOW).toContain(
 			'find coverage-artifacts -name "native-coverage.json" -type f | grep -q .',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find coverage-artifacts -name "wasm-coverage.json" -type f | grep -q .',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find coverage-artifacts -path "*/bun/lcov.info" -type f | grep -q .',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'find coverage-artifacts -path "*/bun/path-proof.txt" -type f | grep -q .',
 		);
 		expect(RELEASE_WORKFLOW).toContain(
 			'find bench-regress-evidence -name "bench-regress-artifact.json" -type f | grep -q .',
