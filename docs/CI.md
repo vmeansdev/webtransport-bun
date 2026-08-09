@@ -73,9 +73,19 @@ start. Tag pushes retain the publishing handoff and release-creation steps.
 
 The blocking benchmark job checks out full Git history and binds the comparator
 to `github-actions-ubuntu-latest-x64`. New checked-in baselines are created only
-by `bench-baseline-capture.yml`, whose approver must equal authenticated
-`github.actor`; it uploads the immutable measured capture and proposed baseline
-without committing, pushing, tagging, or releasing.
+by the governed `bench-baseline-capture.yml` implementation, whose approver must
+equal authenticated `github.actor`; it uploads the immutable measured capture
+and proposed baseline without committing, pushing, tagging, or releasing. Until
+that new workflow is registered on the default branch, manual `release.yml`
+dispatch can set `capture_baseline=true` and the exact authenticated
+`benchmark_approver`; a separate `capture-baseline-bootstrap` job delegates to
+the same reusable workflow and is intentionally absent from the final release
+job's dependency chain. Supplying an approver when capture is false is rejected.
+
+The first bootstrap run may fail the still-blocked comparator; only its capture
+artifact is certifying. The final all-gates proof is a second manual release run
+on the evidence child with `verification_only=true`, `capture_baseline=false`,
+and no benchmark approver.
 
 **P3.2**: Security gates block release. Jobs run before build:
 

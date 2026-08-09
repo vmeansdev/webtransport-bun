@@ -27,6 +27,9 @@ const EXPECTED_ATTEMPT_SOURCE =
 	"$" + "{{ steps.release-run.outputs.run_attempt }}";
 const VERIFICATION_ONLY_PUBLISH_CONDITION =
 	"$" + "{{ github.event_name != 'workflow_dispatch' }}";
+const CAPTURE_BASELINE_CONDITION =
+	"$" + "{{ inputs.capture_baseline == true }}";
+const BENCHMARK_APPROVER_INPUT = "$" + "{{ inputs.benchmark_approver }}";
 const EXACT_RELEASE_RUN_JQ_COMMAND = [
 	"jq -e",
 	'--argjson runId "$RELEASE_RUN_ID"',
@@ -794,13 +797,17 @@ function validateBenchmarkCaptureWorkflow(
 	add: (line: number, message: string) => void,
 ): void {
 	const dispatch = workflowTriggerBlock(lines, "workflow_dispatch").join("\n");
+	const workflowCall = workflowTriggerBlock(lines, "workflow_call").join("\n");
 	const capture = jobs.find((job) => job.name === "capture");
 	const block = capture ? lines.slice(capture.start, capture.end + 1) : [];
 	const text = block.join("\n");
 	const validInput =
 		/^ {6}approver:\s*$/m.test(dispatch) &&
 		/^ {8}required:\s*true\s*$/m.test(dispatch) &&
-		/^ {8}type:\s*string\s*$/m.test(dispatch);
+		/^ {8}type:\s*string\s*$/m.test(dispatch) &&
+		/^ {6}approver:\s*$/m.test(workflowCall) &&
+		/^ {8}required:\s*true\s*$/m.test(workflowCall) &&
+		/^ {8}type:\s*string\s*$/m.test(workflowCall);
 	const authenticatedApprover =
 		/BENCH_BASELINE_APPROVER:\s*\$\{\{ github\.actor \}\}/.test(text) &&
 		/INPUT_APPROVER:\s*\$\{\{ inputs\.approver \}\}/.test(text) &&
@@ -850,6 +857,13 @@ function validateVerificationOnlyRelease(
 		/^ {6}verification_only:\s*$/m.test(dispatch) &&
 		/^ {8}required:\s*true\s*$/m.test(dispatch) &&
 		/^ {8}type:\s*boolean\s*$/m.test(dispatch);
+	const captureInputs =
+		/^ {6}capture_baseline:\s*$[\s\S]*?^ {8}default:\s*false\s*$[\s\S]*?^ {8}type:\s*boolean\s*$/m.test(
+			dispatch,
+		) &&
+		/^ {6}benchmark_approver:\s*$[\s\S]*?^ {8}default:\s*["']{2}\s*$[\s\S]*?^ {8}type:\s*string\s*$/m.test(
+			dispatch,
+		);
 	const failClosedPolicy =
 		/EVENT_NAME:\s*\$\{\{ github\.event_name \}\}/.test(policyText) &&
 		/VERIFICATION_ONLY:\s*\$\{\{ inputs\.verification_only \}\}/.test(
@@ -857,6 +871,17 @@ function validateVerificationOnlyRelease(
 		) &&
 		/"\$EVENT_NAME" = "workflow_dispatch"/.test(policyText) &&
 		/"\$VERIFICATION_ONLY" != "true"/.test(policyText);
+	const captureDispatchPolicy =
+		/CAPTURE_BASELINE:\s*\$\{\{ inputs\.capture_baseline \}\}/.test(
+			policyText,
+		) &&
+		/BENCHMARK_APPROVER:\s*\$\{\{ inputs\.benchmark_approver \}\}/.test(
+			policyText,
+		) &&
+		/AUTHENTICATED_ACTOR:\s*\$\{\{ github\.actor \}\}/.test(policyText) &&
+		/"\$CAPTURE_BASELINE" = "true"/.test(policyText) &&
+		/test "\$BENCHMARK_APPROVER" = "\$AUTHENTICATED_ACTOR"/.test(policyText) &&
+		/elif \[ -n "\$BENCHMARK_APPROVER" \]/.test(policyText);
 	const rootJobsDependOnPolicy = ["security", "codeql"].every((name) => {
 		const job = jobs.find((candidate) => candidate.name === name);
 		return Boolean(
@@ -873,6 +898,31 @@ function validateVerificationOnlyRelease(
 			benchText,
 		);
 	const releaseSteps = release ? stepBlocks(lines, release) : [];
+	const bootstrap = jobs.find(
+		(job) => job.name === "capture-baseline-bootstrap",
+	);
+	const bootstrapText = bootstrap
+		? lines.slice(bootstrap.start, bootstrap.end + 1).join("\n")
+		: "";
+	const bootstrapWith = bootstrap
+		? jobSection(lines, bootstrap, "with")
+		: new Map<string, string>();
+	const governedBootstrap =
+		Boolean(bootstrap) &&
+		/needs:\s*\[dispatch-policy\]/.test(bootstrapText) &&
+		jobScalar(lines, bootstrap as JobBlock, "if") ===
+			CAPTURE_BASELINE_CONDITION &&
+		jobScalar(lines, bootstrap as JobBlock, "uses") ===
+			"./.github/workflows/bench-baseline-capture.yml" &&
+		bootstrapWith.get("approver") === BENCHMARK_APPROVER_INPUT &&
+		hasPermission(bootstrapText.split("\n"), "contents", "read") &&
+		!/(?:\bbench:capture\b|\bgit\s+(?:commit|push)\b|\bgh\s+release\b)/.test(
+			bootstrapText,
+		) &&
+		!lines
+			.slice(release?.start ?? 0, (release?.end ?? -1) + 1)
+			.join("\n")
+			.includes("capture-baseline-bootstrap");
 	const nonPublishingDispatch = [
 		"Bind npm publish input to this immutable release run",
 		"Upload immutable npm publish input",
@@ -896,6 +946,12 @@ function validateVerificationOnlyRelease(
 		add(
 			policy?.start ?? 0,
 			"release workflow_dispatch must be fail-closed verification-only with governed benchmarks and no publish side effects",
+		);
+	}
+	if (!captureInputs || !captureDispatchPolicy || !governedBootstrap) {
+		add(
+			bootstrap?.start ?? 0,
+			"release benchmark bootstrap must reuse authenticated governed capture",
 		);
 	}
 }

@@ -24,11 +24,20 @@ measured-baseline artifact. `bun run bench:regress` now:
   3-warmup/15-round design, writes an immutable capture JSON, hashes its exact
   bytes, and atomically derives `approved-baselines.json` from those samples.
   It never invents or accepts hand-written metric thresholds.
-- **Hosted approval**: checked-in release baselines come only from the manually
-  dispatched `bench-baseline-capture.yml` workflow. The workflow authenticates
-  the approver input against `github.actor`, checks out full history, and uses
-  stable machine identity `github-actions-ubuntu-latest-x64`. Local captures are
-  diagnostic and cannot approve the hosted release runner's baseline.
+- **Hosted approval**: checked-in release baselines come only from the governed
+  `bench-baseline-capture.yml` implementation. Once registered on the default
+  branch it can be dispatched directly. Before registration, the existing
+  `release.yml` workflow can call it through the policy-enforced
+  `capture-baseline-bootstrap` job. Both paths authenticate the approver against
+  `github.actor`, check out full history, and use stable machine identity
+  `github-actions-ubuntu-latest-x64`. Local captures are diagnostic and cannot
+  approve the hosted release runner's baseline.
+
+The bootstrap release run is capture-only evidence: its normal comparator is
+expected to remain blocked before the baseline exists, so the overall run may
+fail. Only the successful capture-job artifact is promoted. The final release
+verdict requires a second `release.yml` run with `verification_only=true` on the
+evidence child and `capture_baseline=false`.
 
 ## Candidate binding
 

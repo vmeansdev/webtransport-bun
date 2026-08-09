@@ -69,6 +69,8 @@ const GITHUB_ACTOR_EXPRESSION = "$" + "{{ github.actor }}";
 const APPROVER_INPUT_EXPRESSION = "$" + "{{ inputs.approver }}";
 const VERIFICATION_ONLY_CONDITION =
 	"$" + "{{ github.event_name != 'workflow_dispatch' }}";
+const CAPTURE_BASELINE_CONDITION =
+	"$" + "{{ inputs.capture_baseline == true }}";
 
 setDefaultTimeout(30_000);
 
@@ -216,6 +218,40 @@ describe("GitHub Actions release policy", () => {
 		expect(shallowComparator.stderr).toContain(
 			"release workflow_dispatch must be fail-closed verification-only",
 		);
+
+		const forgedApprover = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				'test "$BENCHMARK_APPROVER" = "$AUTHENTICATED_ACTOR"',
+				'test -n "$BENCHMARK_APPROVER"',
+			),
+			"release.yml",
+		);
+		expect(forgedApprover.status).toBe(1);
+		expect(forgedApprover.stderr).toContain(
+			"release benchmark bootstrap must reuse authenticated governed capture",
+		);
+
+		const detachedBootstrap = runPolicy(
+			RELEASE_WORKFLOW.replace(
+				`    needs: [dispatch-policy]\n    if: "${CAPTURE_BASELINE_CONDITION}"\n    permissions:\n      contents: read\n    uses: ./.github/workflows/bench-baseline-capture.yml`,
+				"    if: always()\n    permissions:\n      contents: read\n    uses: ./.github/workflows/bench-baseline-capture.yml",
+			),
+			"release.yml",
+		);
+		expect(detachedBootstrap.status).toBe(1);
+		expect(detachedBootstrap.stderr).toContain(
+			"release benchmark bootstrap must reuse authenticated governed capture",
+		);
+	});
+
+	it("routes feature-branch capture through a governed reusable bootstrap job", () => {
+		expect(RELEASE_WORKFLOW).toContain("capture_baseline:");
+		expect(RELEASE_WORKFLOW).toContain("benchmark_approver:");
+		expect(RELEASE_WORKFLOW).toContain("capture-baseline-bootstrap:");
+		expect(RELEASE_WORKFLOW).toContain(
+			"uses: ./.github/workflows/bench-baseline-capture.yml",
+		);
+		expect(BENCH_BASELINE_CAPTURE_WORKFLOW).toContain("workflow_call:");
 	});
 
 	it("makes coverage, benchmark regression, and >=10k distributed scale release-blocking with downloaded evidence", () => {

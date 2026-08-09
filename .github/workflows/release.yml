@@ -11,6 +11,16 @@ on:
         description: Run every release verification gate without creating publish input or a GitHub release
         required: true
         type: boolean
+      capture_baseline:
+        description: Bootstrap a governed benchmark capture from this registered workflow
+        required: false
+        default: false
+        type: boolean
+      benchmark_approver:
+        description: Authenticated GitHub login; required only when capture_baseline is true
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -30,12 +40,40 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           VERIFICATION_ONLY: ${{ inputs.verification_only }}
+          CAPTURE_BASELINE: ${{ inputs.capture_baseline }}
+          BENCHMARK_APPROVER: ${{ inputs.benchmark_approver }}
+          AUTHENTICATED_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$VERIFICATION_ONLY" != "true" ]; then
             echo "::error::Manual branch dispatch requires verification_only=true"
             exit 1
           fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$CAPTURE_BASELINE" = "true" ]; then
+              test -n "$BENCHMARK_APPROVER" || {
+                echo "::error::benchmark_approver is required when capture_baseline=true"
+                exit 1
+              }
+              test "$BENCHMARK_APPROVER" = "$AUTHENTICATED_ACTOR" || {
+                echo "::error::benchmark_approver must equal authenticated github.actor"
+                exit 1
+              }
+            elif [ -n "$BENCHMARK_APPROVER" ]; then
+              echo "::error::benchmark_approver is forbidden when capture_baseline=false"
+              exit 1
+            fi
+          fi
+
+  capture-baseline-bootstrap:
+    name: Bootstrap governed benchmark capture
+    needs: [dispatch-policy]
+    if: "${{ inputs.capture_baseline == true }}"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/bench-baseline-capture.yml
+    with:
+      approver: ${{ inputs.benchmark_approver }}
 
   security:
     name: Security gates (blocking)

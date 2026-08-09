@@ -1,6 +1,12 @@
 name: benchmark baseline capture
 
 on:
+  workflow_call:
+    inputs:
+      approver:
+        description: Authenticated GitHub login approving the measured baseline
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       approver:
