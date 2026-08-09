@@ -172,15 +172,20 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) async fn read_datagram_slot_for_session(
+    id: &str,
+) -> Result<Option<session_registry::DatagramSlot>> {
     let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
         return Ok(None);
     };
     let mut rx = dgram_rx.lock().await;
-    match rx.recv().await {
-        Some(slot) => Ok(Some(slot.take())),
-        None => Ok(None),
-    }
+    Ok(rx.recv().await)
+}
+
+pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>>> {
+    Ok(read_datagram_slot_for_session(id)
+        .await?
+        .map(session_registry::DatagramSlot::take))
 }
 
 pub(crate) async fn discard_datagram_for_session(
@@ -629,9 +634,9 @@ pub(crate) async fn handle_uni_probe_for_session(id: &str) -> Result<u32> {
     };
     let payload = stream.read_native_probe().await?;
     let result = if let Some(payload) = payload {
-        if payload.as_ref().starts_with(b"probe:uni-echo:") {
+        if payload.as_bytes().starts_with(b"probe:uni-echo:") {
             let send = create_uni_stream_for_session(id).await?;
-            send.write(payload).await?;
+            send.write(payload.take().into()).await?;
             send.finish_wait().await?;
             let _ = send.dispose();
             2

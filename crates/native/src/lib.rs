@@ -25,6 +25,7 @@ use tokio::sync::watch;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
+mod engine_owned_payload;
 pub mod error;
 pub mod histogram;
 pub mod limits;
@@ -43,6 +44,15 @@ pub mod session_registry;
 pub mod spawn_tracked;
 pub mod transport_memory;
 pub mod zero_rtt;
+
+/// Version of the native-to-JS payload ownership ABI.
+///
+/// Version 1 guarantees that payload-returning `*_owned` methods allocate the
+/// destination ArrayBuffer in the JS engine before copying Rust-owned bytes.
+#[napi]
+pub fn payload_ownership_version() -> u32 {
+    1
+}
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton

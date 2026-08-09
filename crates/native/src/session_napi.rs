@@ -3,6 +3,7 @@ use napi::bindgen_prelude::Buffer;
 use napi::{Env, JsObject, Result};
 use napi_derive::napi;
 
+use crate::engine_owned_payload::EngineOwnedPayload;
 use crate::error::{
     from_reason as wt_from_reason, from_upstream_error as wt_from_upstream_error, WtResult,
 };
@@ -11,8 +12,8 @@ use crate::session::{
     accept_bidi_stream_for_session, accept_uni_stream_for_session, create_bidi_stream_for_session,
     create_uni_stream_for_session, discard_bidi_streams_for_session, discard_datagram_for_session,
     discard_datagrams_for_session, discard_uni_streams_for_session, handle_bidi_probe_for_session,
-    handle_uni_probe_for_session, read_datagram_for_session, send_datagram_for_session,
-    session_metrics_snapshot_from, wait_session_stream_capacity,
+    handle_uni_probe_for_session, read_datagram_for_session, read_datagram_slot_for_session,
+    send_datagram_for_session, session_metrics_snapshot_from, wait_session_stream_capacity,
 };
 use crate::session_registry;
 use crate::RUNTIME;
@@ -159,6 +160,24 @@ impl SessionHandle {
         env.spawn_future(async move {
             RUNTIME
                 .spawn(async move { Ok(read_datagram_for_session(&id).await?.map(Buffer::from)) })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    /// Resolve an exact-length engine-owned Uint8Array. The Tokio phase carries
+    /// only Rust state; `EngineOwnedPayload::to_napi_value` performs the single
+    /// ArrayBuffer allocation and copy in napi-rs's JS-thread resolver.
+    #[napi(ts_return_type = "Promise<Uint8Array | null>")]
+    pub fn read_datagram_owned(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    Ok(read_datagram_slot_for_session(&id)
+                        .await?
+                        .map(EngineOwnedPayload::new))
+                })
                 .await
                 .map_err(wt_from_upstream_error)?
         })

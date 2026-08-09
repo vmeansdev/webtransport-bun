@@ -238,9 +238,43 @@ impl DatagramSlot {
         }
     }
 
+    /// Payload length while retaining the queued-byte reservation.
+    pub fn payload_len(&self) -> usize {
+        match &self.data {
+            DatagramPayload::Owned(data) => data.len(),
+            DatagramPayload::Transport(data) => data.payload().len(),
+        }
+    }
+
+    /// Copy the payload while retaining its queued-byte reservation. The
+    /// engine-owned N-API resolver calls this synchronously on the JS thread and
+    /// releases the reservation only when the slot drops afterwards.
+    pub fn copy_payload_to(&self, destination: &mut [u8]) {
+        match &self.data {
+            DatagramPayload::Owned(data) => destination.copy_from_slice(data),
+            DatagramPayload::Transport(data) => destination.copy_from_slice(&data.payload()),
+        }
+    }
+
     /// Consume the slot without materializing a payload for a black-hole
     /// consumer. Dropping the slot still releases the reserved byte budget.
     pub fn discard(self) {}
+}
+
+impl crate::engine_owned_payload::EnginePayloadSource for DatagramSlot {
+    fn payload_len(&self) -> usize {
+        self.payload_len()
+    }
+
+    fn copy_payload_to(&self, destination: &mut [u8]) -> napi::Result<()> {
+        if destination.len() != self.payload_len() {
+            return Err(napi::Error::from_reason(
+                "E_INTERNAL: datagram copy length mismatch",
+            ));
+        }
+        self.copy_payload_to(destination);
+        Ok(())
+    }
 }
 
 /// Channel capacity for datagrams per session (bounded to prevent unbounded buffering).
@@ -772,6 +806,30 @@ mod tests {
         assert_eq!(data.len(), 500);
         assert_eq!(data[0], 7);
         assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn datagram_slot_borrow_holds_reservation_until_engine_copy_finishes() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let sm = Arc::new(SessionMetrics::default());
+        let notify = Arc::new(Notify::new());
+        reserve(&metrics, &sm, 3);
+        let slot = DatagramSlot::new(
+            vec![1, 2, 3],
+            Arc::clone(&sm),
+            Arc::clone(&metrics),
+            notify,
+            3,
+        );
+
+        let mut copied = vec![0; slot.payload_len()];
+        slot.copy_payload_to(&mut copied);
+        assert_eq!(copied, [1, 2, 3]);
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 3);
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 3);
+        drop(slot);
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
     }
 
     // Many sessions abandoning queued datagrams must not accumulate the global

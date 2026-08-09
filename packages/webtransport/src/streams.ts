@@ -8,12 +8,13 @@
  * to avoid name collisions with Node stream methods.
  */
 
-import { Duplex, Readable, Writable } from "node:stream";
 import type {
 	DuplexOptions,
 	ReadableOptions,
 	WritableOptions,
 } from "node:stream";
+import { Duplex, Readable, Writable } from "node:stream";
+import { readNativePayload } from "./native-payload.js";
 
 /**
  * Symbol to call stream reset (abort receiving). Use on BidiStream, SendStream, RecvStream.
@@ -52,6 +53,8 @@ export interface BidiStreamOptions extends DuplexOptions {
 	handleId: StreamHandleId;
 	nativeHandle?: any;
 	strictStreamErrors?: boolean;
+	/** @internal Legacy native reads are allowed only for explicit test doubles. */
+	allowLegacyPayloadReads?: boolean;
 }
 
 export class BidiStream extends Duplex implements Resettable, StopSendable {
@@ -62,6 +65,7 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	#writableFinished = false;
 	#nativeTerminationRequested = false;
 	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
+	#allowLegacyPayloadReads = false;
 
 	constructor(opts: BidiStreamOptions) {
 		super({
@@ -80,6 +84,7 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		this.#nativeHandle = opts.nativeHandle;
 		this.#strictStreamErrors =
 			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		this.#allowLegacyPayloadReads = opts.allowLegacyPayloadReads ?? false;
 		// Free the native handle when the stream completes cleanly: with
 		// autoDestroy:false, a bidi stream whose readable reaches EOF and whose
 		// writable finishes never runs _destroy() on its own, stranding the
@@ -125,8 +130,12 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			this.push(null);
 			return;
 		}
-		h.read()
-			.then((buf: Buffer | null) => {
+		readNativePayload(
+			h.readOwned?.bind(h),
+			h.read?.bind(h),
+			this.#allowLegacyPayloadReads,
+		)
+			.then((buf: Uint8Array | null) => {
 				if (buf && !this.#destroyed) this.push(buf);
 				else this.push(null);
 			})
@@ -353,6 +362,8 @@ export interface RecvStreamOptions extends ReadableOptions {
 	handleId: StreamHandleId;
 	nativeHandle?: any;
 	strictStreamErrors?: boolean;
+	/** @internal Legacy native reads are allowed only for explicit test doubles. */
+	allowLegacyPayloadReads?: boolean;
 }
 
 export class RecvStream extends Readable implements StopSendable {
@@ -360,6 +371,7 @@ export class RecvStream extends Readable implements StopSendable {
 	#nativeHandle: any;
 	#destroyed = false;
 	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
+	#allowLegacyPayloadReads = false;
 
 	constructor(opts: RecvStreamOptions) {
 		super({
@@ -371,6 +383,7 @@ export class RecvStream extends Readable implements StopSendable {
 		this.#nativeHandle = opts.nativeHandle;
 		this.#strictStreamErrors =
 			opts.strictStreamErrors ?? DEFAULT_STRICT_STREAM_ERRORS;
+		this.#allowLegacyPayloadReads = opts.allowLegacyPayloadReads ?? false;
 		this.on("error", (err) => {
 			if (this.listenerCount("error") > 1) return;
 			const e = normalizeError(err);
@@ -392,8 +405,12 @@ export class RecvStream extends Readable implements StopSendable {
 			this.push(null);
 			return;
 		}
-		h.read()
-			.then((buf: Buffer | null) => {
+		readNativePayload(
+			h.readOwned?.bind(h),
+			h.read?.bind(h),
+			this.#allowLegacyPayloadReads,
+		)
+			.then((buf: Uint8Array | null) => {
 				if (buf && !this.#destroyed) this.push(buf);
 				else this.push(null);
 			})

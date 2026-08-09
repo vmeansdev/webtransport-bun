@@ -5,6 +5,7 @@
 //! - Read bridge: sends Vec<u8> to a bounded mpsc channel; selects on a stop_sending oneshot.
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
+use crate::engine_owned_payload::{EngineOwnedPayload, EnginePayloadSource};
 use crate::error::{from_reason as wt_from_reason, WtResult};
 use napi::Result;
 use napi_derive::napi;
@@ -404,6 +405,22 @@ impl Drop for StreamChunk {
     }
 }
 
+impl EnginePayloadSource for StreamChunk {
+    fn payload_len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn copy_payload_to(&self, destination: &mut [u8]) -> Result<()> {
+        if destination.len() != self.data.len() {
+            return Err(napi::Error::from_reason(
+                "E_INTERNAL: stream payload copy length mismatch",
+            ));
+        }
+        destination.copy_from_slice(&self.data);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bidi stream handle
 // ---------------------------------------------------------------------------
@@ -660,7 +677,7 @@ impl ClientBidiStreamHandle {
     /// allocation for that path creates avoidable allocator churn. The receive
     /// stream stays deferred after each successful read, so normal multi-read
     /// consumers retain the same semantics without a per-stream bridge.
-    async fn read_deferred_direct(&self) -> Result<Option<Option<napi::bindgen_prelude::Buffer>>> {
+    async fn read_deferred_direct(&self) -> Result<Option<Option<StreamChunk>>> {
         let pending = self
             .deferred_recv
             .lock()
@@ -719,7 +736,6 @@ impl ClientBidiStreamHandle {
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         let chunk = StreamChunk::new(buf[..n].to_vec(), budget, n as u64);
-        let value = chunk.take().into();
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -730,7 +746,50 @@ impl ClientBidiStreamHandle {
         } else {
             *deferred = Some((recv_stream, guard));
         }
-        Ok(Some(Some(value)))
+        Ok(Some(Some(chunk)))
+    }
+
+    async fn read_chunk(&self) -> Result<Option<StreamChunk>> {
+        if let Some(result) = self.read_deferred_direct().await? {
+            return Ok(result);
+        }
+        self.ensure_deferred_read_bridge().await?;
+        let read_rx = self
+            .read_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
+        let mut rx = read_rx.lock().await;
+        let read_abort = self.read_abort.notified();
+        tokio::pin!(read_abort);
+        if self.read_aborted.load(Ordering::Acquire) {
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        match tokio::select! {
+            value = rx.recv() => value,
+            _ = &mut read_abort => {
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+        } {
+            Some(chunk) => Ok(Some(chunk)),
+            None => {
+                let deferred_slot = self
+                    .deferred_read_error_slot
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
+                    if let Ok(guard) = slot.lock() {
+                        if let Some(ref code) = *guard {
+                            return Err(wt_from_reason(code.clone()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn ensure_write_tx(&self) -> Result<mpsc::Sender<StreamCmd>> {
@@ -776,10 +835,10 @@ impl ClientBidiStreamHandle {
                 self.reset(0)?;
                 return Ok(());
             };
-            if payload.as_ref().starts_with(b"probe:bidi-reset:") {
+            if payload.as_bytes().starts_with(b"probe:bidi-reset:") {
                 self.reset(42)?;
-            } else if payload.as_ref().starts_with(b"probe:bidi-echo:") {
-                self.write(payload).await?;
+            } else if payload.as_bytes().starts_with(b"probe:bidi-echo:") {
+                self.write_bytes(payload.take()).await?;
                 self.finish_wait().await?;
             } else {
                 self.reset(0)?;
@@ -890,49 +949,16 @@ impl Drop for ClientBidiStreamHandle {
 impl ClientBidiStreamHandle {
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        if let Some(result) = self.read_deferred_direct().await? {
-            return Ok(result);
-        }
-        self.ensure_deferred_read_bridge().await?;
-        let read_rx = self
-            .read_rx
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
-        let mut rx = read_rx.lock().await;
-        let read_abort = self.read_abort.notified();
-        tokio::pin!(read_abort);
-        if self.read_aborted.load(Ordering::Acquire) {
-            return Err(wt_from_reason("E_STREAM_RESET"));
-        }
-        let result = match tokio::select! {
-            value = rx.recv() => value,
-            _ = &mut read_abort => {
-                return Err(wt_from_reason("E_STREAM_RESET"));
-            }
-        } {
-            // `chunk.take()` moves the payload out; the reservation is released
-            // when the chunk drops at the end of this scope (see StreamChunk).
-            Some(chunk) => Some(chunk.take().into()),
-            None => {
-                let deferred_slot = self
-                    .deferred_read_error_slot
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.clone());
-                if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
-                    if let Ok(guard) = slot.lock() {
-                        if let Some(ref code) = *guard {
-                            return Err(wt_from_reason(code.clone()));
-                        }
-                    }
-                }
-                None
-            }
-        };
-        Ok(result)
+        Ok(self
+            .read_chunk()
+            .await?
+            .map(StreamChunk::take)
+            .map(Into::into))
+    }
+
+    #[napi(ts_return_type = "Promise<Uint8Array | null>")]
+    pub async fn read_owned(&self) -> Result<Option<EngineOwnedPayload>> {
+        Ok(self.read_chunk().await?.map(EngineOwnedPayload::new))
     }
 
     #[napi]
@@ -1350,7 +1376,7 @@ impl ClientUniRecvHandle {
     /// channel. Accepted streams commonly deliver only one chunk before the
     /// JS facade cancels them, so keeping the transport receive state deferred
     /// avoids per-stream allocator churn while preserving repeated reads.
-    async fn read_deferred_direct(&self) -> Result<Option<Option<napi::bindgen_prelude::Buffer>>> {
+    async fn read_deferred_direct(&self) -> Result<Option<Option<StreamChunk>>> {
         let pending = self
             .deferred_recv
             .lock()
@@ -1409,7 +1435,6 @@ impl ClientUniRecvHandle {
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         let chunk = StreamChunk::new(buf[..n].to_vec(), budget, n as u64);
-        let value = chunk.take().into();
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -1420,7 +1445,50 @@ impl ClientUniRecvHandle {
         } else {
             *deferred = Some((recv_stream, guard));
         }
-        Ok(Some(Some(value)))
+        Ok(Some(Some(chunk)))
+    }
+
+    async fn read_chunk(&self) -> Result<Option<StreamChunk>> {
+        if let Some(result) = self.read_deferred_direct().await? {
+            return Ok(result);
+        }
+        self.ensure_deferred_read_bridge().await?;
+        let read_rx = self
+            .read_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
+        let mut rx = read_rx.lock().await;
+        let read_abort = self.read_abort.notified();
+        tokio::pin!(read_abort);
+        if self.read_aborted.load(Ordering::Acquire) {
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        match tokio::select! {
+            value = rx.recv() => value,
+            _ = &mut read_abort => {
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+        } {
+            Some(chunk) => Ok(Some(chunk)),
+            None => {
+                let deferred_slot = self
+                    .deferred_read_error_slot
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
+                    if let Ok(guard) = slot.lock() {
+                        if let Some(ref code) = *guard {
+                            return Err(napi::Error::from_reason(code.clone()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn dispose_resources(&self) {
@@ -1495,7 +1563,7 @@ impl ClientUniRecvHandle {
     }
 
     /// Read one ordered load/evidence uni probe without creating a JS wrapper.
-    pub(crate) async fn read_native_probe(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
+    pub(crate) async fn read_native_probe(&self) -> Result<Option<StreamChunk>> {
         Ok(self.read_deferred_direct().await?.flatten())
     }
 
@@ -1516,49 +1584,16 @@ impl Drop for ClientUniRecvHandle {
 impl ClientUniRecvHandle {
     #[napi]
     pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        if let Some(result) = self.read_deferred_direct().await? {
-            return Ok(result);
-        }
-        self.ensure_deferred_read_bridge().await?;
-        let read_rx = self
-            .read_rx
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
-        let mut rx = read_rx.lock().await;
-        let read_abort = self.read_abort.notified();
-        tokio::pin!(read_abort);
-        if self.read_aborted.load(Ordering::Acquire) {
-            return Err(wt_from_reason("E_STREAM_RESET"));
-        }
-        let result = match tokio::select! {
-            value = rx.recv() => value,
-            _ = &mut read_abort => {
-                return Err(wt_from_reason("E_STREAM_RESET"));
-            }
-        } {
-            // `chunk.take()` moves the payload out; the reservation is released
-            // when the chunk drops at the end of this scope (see StreamChunk).
-            Some(chunk) => Some(chunk.take().into()),
-            None => {
-                let deferred_slot = self
-                    .deferred_read_error_slot
-                    .lock()
-                    .ok()
-                    .and_then(|guard| guard.clone());
-                if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
-                    if let Ok(guard) = slot.lock() {
-                        if let Some(ref code) = *guard {
-                            return Err(napi::Error::from_reason(code.clone()));
-                        }
-                    }
-                }
-                None
-            }
-        };
-        Ok(result)
+        Ok(self
+            .read_chunk()
+            .await?
+            .map(StreamChunk::take)
+            .map(Into::into))
+    }
+
+    #[napi(ts_return_type = "Promise<Uint8Array | null>")]
+    pub async fn read_owned(&self) -> Result<Option<EngineOwnedPayload>> {
+        Ok(self.read_chunk().await?.map(EngineOwnedPayload::new))
     }
 
     #[napi]
@@ -2231,6 +2266,27 @@ mod tests {
         let data = chunk.take();
         assert_eq!(data.len(), 400);
         assert_eq!(data[0], 9);
+        assert_eq!(
+            b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stream_chunk_borrow_holds_reservation_until_engine_copy_finishes() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(b.try_reserve(3));
+        let chunk = StreamChunk::new(vec![7, 8, 9], Some(b.clone()), 3);
+
+        assert_eq!(chunk.as_bytes(), &[7, 8, 9]);
+        assert_eq!(
+            b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 3);
+        drop(chunk);
         assert_eq!(
             b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
             0

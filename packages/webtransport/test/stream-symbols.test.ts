@@ -1,8 +1,8 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import {
 	BidiStream,
-	SendStream,
 	RecvStream,
+	SendStream,
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "../src/streams.js";
@@ -110,6 +110,7 @@ describe("WT stream symbols", () => {
 				reset: (code: number) => resetCalls.push(code),
 				stopSending: (code: number) => stopCalls.push(code),
 				read: async () => null,
+				readOwned: async () => null,
 				write: async (_chunk: Buffer) => {},
 				finish: () => {},
 				dispose: () => {

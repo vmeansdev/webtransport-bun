@@ -66,4 +66,20 @@ describe("internal native addon loader", () => {
 			},
 		]);
 	});
+
+	it("requires the engine-owned payload ABI before production use", () => {
+		expect(() => __TESTING__.assertNativePayloadOwnershipForTests({})).toThrow(
+			"E_INTERNAL: native addon payload ownership capability mismatch",
+		);
+		expect(() =>
+			__TESTING__.assertNativePayloadOwnershipForTests({
+				payloadOwnershipVersion: () => 2,
+			}),
+		).toThrow("expected 1, received 2");
+		expect(() =>
+			__TESTING__.assertNativePayloadOwnershipForTests({
+				payloadOwnershipVersion: () => 1,
+			}),
+		).not.toThrow();
+	});
 });

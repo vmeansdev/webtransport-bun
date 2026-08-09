@@ -20,11 +20,59 @@ pub struct ClientMetrics {
     pub queued_bytes: AtomicU64,
 }
 
+struct ClientDatagramPayload {
+    bytes: Vec<u8>,
+    metrics: Arc<ClientMetrics>,
+    reserved: u64,
+}
+
+impl ClientDatagramPayload {
+    fn new(bytes: Vec<u8>, metrics: Arc<ClientMetrics>) -> Self {
+        let reserved = bytes.len() as u64;
+        Self {
+            bytes,
+            metrics,
+            reserved,
+        }
+    }
+
+    fn take(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for ClientDatagramPayload {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            self.metrics
+                .queued_bytes
+                .fetch_sub(self.reserved, Ordering::Relaxed);
+        }
+    }
+}
+
+impl EnginePayloadSource for ClientDatagramPayload {
+    fn payload_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn copy_payload_to(&self, destination: &mut [u8]) -> Result<()> {
+        if destination.len() != self.bytes.len() {
+            return Err(napi::Error::from_reason(
+                "E_INTERNAL: client datagram copy length mismatch",
+            ));
+        }
+        destination.copy_from_slice(&self.bytes);
+        Ok(())
+    }
+}
+
 use crate::client_pool::{self, PoolKey, PoolReleaseGuard};
 use crate::client_stream::{
     spawn_bidi_bridge_on, spawn_uni_recv_bridge_on, spawn_uni_send_bridge_on,
     ClientBidiStreamHandle, ClientUniRecvHandle, ClientUniSendHandle, StreamBudget,
 };
+use crate::engine_owned_payload::{EngineOwnedPayload, EnginePayloadSource};
 use crate::error::{from_upstream_error as wt_from_upstream_error, WtResult};
 use crate::server_metrics::ServerMetrics;
 use crate::session_registry::SessionMetrics;
@@ -443,6 +491,13 @@ pub struct ClientSessionHandle {
 
 #[napi]
 impl ClientSessionHandle {
+    async fn receive_datagram_payload(&self) -> Option<ClientDatagramPayload> {
+        let mut rx = self.dgram_recv_rx.lock().await;
+        rx.recv()
+            .await
+            .map(|bytes| ClientDatagramPayload::new(bytes, Arc::clone(&self.client_metrics)))
+    }
+
     #[napi(getter)]
     pub fn id(&self) -> String {
         self.id.clone()
@@ -544,16 +599,21 @@ impl ClientSessionHandle {
 
     #[napi]
     pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
-        let mut rx = self.dgram_recv_rx.lock().await;
-        match rx.recv().await {
-            Some(bytes) => {
-                self.client_metrics
-                    .queued_bytes
-                    .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
-                Ok(Some(bytes.into()))
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .receive_datagram_payload()
+            .await
+            .map(ClientDatagramPayload::take)
+            .map(Into::into))
+    }
+
+    /// Resolve through napi-rs's JS-thread promise resolver so no JS pointer or
+    /// typed-array view crosses the async receive boundary.
+    #[napi(ts_return_type = "Promise<Uint8Array | null>")]
+    pub async fn read_datagram_owned(&self) -> Result<Option<EngineOwnedPayload>> {
+        Ok(self
+            .receive_datagram_payload()
+            .await
+            .map(EngineOwnedPayload::new))
     }
 
     #[napi]
@@ -1697,14 +1757,43 @@ mod tests {
         build_client_tls_config, build_quic_transport_config, build_root_cert_store,
         congestion_controller_label, handle_connect_callback_status, insert_registry_entry,
         parse_client_limits, parse_congestion_control, parse_qpack_max_table_capacity,
-        remove_registry_entry, ClientMetrics, ClientSessionHandle, CongestionControlMode,
-        CLIENT_HANDLE_REGISTRY, MAX_QPACK_TABLE_CAPACITY, QPACK_DYNAMIC_PRESET_CAPACITY,
+        remove_registry_entry, ClientDatagramPayload, ClientMetrics, ClientSessionHandle,
+        CongestionControlMode, CLIENT_HANDLE_REGISTRY, MAX_QPACK_TABLE_CAPACITY,
+        QPACK_DYNAMIC_PRESET_CAPACITY,
     };
+    use crate::engine_owned_payload::EnginePayloadSource;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
+
+    #[test]
+    fn client_datagram_borrow_holds_reservation_until_engine_copy_finishes() {
+        let metrics = Arc::new(ClientMetrics::default());
+        metrics.queued_bytes.store(4, Ordering::Relaxed);
+        let payload = ClientDatagramPayload::new(vec![1, 2, 3, 4], Arc::clone(&metrics));
+        let mut destination = vec![0; payload.payload_len()];
+
+        payload
+            .copy_payload_to(&mut destination)
+            .expect("engine copy should succeed");
+        assert_eq!(destination, vec![1, 2, 3, 4]);
+        assert_eq!(metrics.queued_bytes.load(Ordering::Relaxed), 4);
+
+        drop(payload);
+        assert_eq!(metrics.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn client_datagram_take_then_drop_releases_reservation_once() {
+        let metrics = Arc::new(ClientMetrics::default());
+        metrics.queued_bytes.store(3, Ordering::Relaxed);
+        let payload = ClientDatagramPayload::new(vec![7, 8, 9], Arc::clone(&metrics));
+
+        assert_eq!(payload.take(), vec![7, 8, 9]);
+        assert_eq!(metrics.queued_bytes.load(Ordering::Relaxed), 0);
+    }
 
     // serverCertificateHashes replaces PKI chain validation, so its verifier
     // must build even when the platform root store is empty. Handshake

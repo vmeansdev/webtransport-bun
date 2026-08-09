@@ -100,6 +100,7 @@ import {
 	extractStreamErrorCode,
 	WebTransportError,
 } from "./errors.js";
+import { readNativePayload } from "./native-payload.js";
 import type {
 	CloseInfo,
 	ErrorCode,
@@ -1076,6 +1077,7 @@ type NativeClientSessionEvent = {
 type NativeBidiStreamHandle = {
 	readonly id: number;
 	read(): Promise<Buffer | null>;
+	readOwned?: () => Promise<Uint8Array | null>;
 	write(chunk: Buffer | Uint8Array): Promise<void>;
 	finish(): Promise<void> | void;
 	finishWait?: () => Promise<void> | void;
@@ -1095,6 +1097,7 @@ type NativeSendStreamHandle = {
 type NativeRecvStreamHandle = {
 	readonly id: number;
 	read(): Promise<Buffer | null>;
+	readOwned?: () => Promise<Uint8Array | null>;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
@@ -1106,6 +1109,7 @@ interface NativeSessionHandle {
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
 	readDatagram(): Promise<Buffer | null>;
+	readDatagramOwned?: () => Promise<Uint8Array | null>;
 	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
 	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
 	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
@@ -1156,6 +1160,7 @@ interface NativeServerHandle {
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
+	payloadOwnershipVersion?: () => number;
 	ServerHandle: new (
 		port: number,
 		host: string,
@@ -1280,8 +1285,25 @@ const nativeLoad = tryLoadNativeAddon(
 const native = nativeLoad.addon as NativeAddon | undefined;
 const nativeLoadFailures = nativeLoad.failures;
 
+const NATIVE_PAYLOAD_OWNERSHIP_VERSION = 1;
+
+function assertNativePayloadOwnership(
+	addon: Pick<NativeAddon, "payloadOwnershipVersion">,
+): void {
+	const received = addon.payloadOwnershipVersion?.();
+	if (received !== NATIVE_PAYLOAD_OWNERSHIP_VERSION) {
+		throw new Error(
+			"E_INTERNAL: native addon payload ownership capability mismatch: " +
+				`expected ${NATIVE_PAYLOAD_OWNERSHIP_VERSION}, received ${received ?? "absent"}`,
+		);
+	}
+}
+
 function getNativeOrThrow(): NativeAddon {
-	if (native) return native;
+	if (native) {
+		assertNativePayloadOwnership(native);
+		return native;
+	}
 	throw new Error(buildNativeAddonLoadErrorMessage(nativeLoadFailures));
 }
 
@@ -1297,6 +1319,7 @@ class NativeServerSession implements ServerSession {
 	#streamOpenWaitTimeoutMs: number;
 	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
 	#drainingPromise: Promise<void> | null = null;
+	#allowLegacyPayloadReads: boolean;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
@@ -1308,9 +1331,11 @@ class NativeServerSession implements ServerSession {
 		nativeHandle: NativeSessionHandle,
 		closedPromise: Promise<CloseInfo>,
 		streamOpenWaitTimeoutMs: number,
+		allowLegacyPayloadReads = false,
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
+		this.#allowLegacyPayloadReads = allowLegacyPayloadReads;
 		// Snapshot: fixed for the session's lifetime, and must survive the
 		// native registry entry being removed at close.
 		this.#has0Rtt = nativeHandle.has0Rtt ?? false;
@@ -1408,8 +1433,14 @@ class NativeServerSession implements ServerSession {
 			this.#incomingDatagramsCache = (async function* () {
 				while (!session.#closed) {
 					try {
-						const datagram = await session.#nativeHandle.readDatagram();
-						if (!datagram) break;
+						const datagram = await readNativePayload(
+							session.#nativeHandle.readDatagramOwned?.bind(
+								session.#nativeHandle,
+							),
+							session.#nativeHandle.readDatagram?.bind(session.#nativeHandle),
+							session.#allowLegacyPayloadReads,
+						);
+						if (datagram === null) break;
 						yield datagram;
 					} catch (err) {
 						if (isSessionCloseError(err)) break;
@@ -1525,6 +1556,7 @@ class NativeServerSession implements ServerSession {
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
 				nativeHandle: nativeStream,
+				allowLegacyPayloadReads: this.#allowLegacyPayloadReads,
 			});
 		} catch (err) {
 			throw toWebTransportError(err);
@@ -1537,6 +1569,7 @@ class NativeServerSession implements ServerSession {
 				this.#nativeHandle,
 				() => this.#closed,
 				this.#closedPromise,
+				this.#allowLegacyPayloadReads,
 			);
 		}
 		return this.#incomingBidiCache;
@@ -1570,6 +1603,7 @@ class NativeServerSession implements ServerSession {
 				this.#nativeHandle,
 				() => this.#closed,
 				this.#closedPromise,
+				this.#allowLegacyPayloadReads,
 			);
 		}
 		return this.#incomingUniCache;
@@ -1867,6 +1901,7 @@ class NativeClientSession implements ClientSession {
 	#streamOpenWaitTimeoutMs: number;
 	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
 	#drainingPromise: Promise<void> | null = null;
+	#allowLegacyPayloadReads: boolean;
 
 	constructor(
 		nativeHandle: NativeSessionHandle,
@@ -1874,6 +1909,7 @@ class NativeClientSession implements ClientSession {
 		closedPromise: Promise<CloseInfo>,
 		strictW3CErrors = false,
 		streamOpenWaitTimeoutMs = DEFAULT_LIMITS.backpressureTimeoutMs,
+		allowLegacyPayloadReads = false,
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#readyPromise = readyPromise;
@@ -1882,6 +1918,7 @@ class NativeClientSession implements ClientSession {
 		);
 		this.#strictW3CErrors = strictW3CErrors;
 		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
+		this.#allowLegacyPayloadReads = allowLegacyPayloadReads;
 		this.#closedPromise.then(() => {
 			this.#closed = true;
 		});
@@ -1963,8 +2000,14 @@ class NativeClientSession implements ClientSession {
 			this.#incomingDatagramsCache = (async function* () {
 				while (!session.#closed) {
 					try {
-						const dgram = await session.#nativeHandle.readDatagram();
-						if (!dgram) break;
+						const dgram = await readNativePayload(
+							session.#nativeHandle.readDatagramOwned?.bind(
+								session.#nativeHandle,
+							),
+							session.#nativeHandle.readDatagram?.bind(session.#nativeHandle),
+							session.#allowLegacyPayloadReads,
+						);
+						if (dgram === null) break;
 						yield dgram;
 					} catch (err) {
 						if (isSessionCloseError(err)) break;
@@ -1994,6 +2037,7 @@ class NativeClientSession implements ClientSession {
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
 				nativeHandle: nativeStream,
+				allowLegacyPayloadReads: this.#allowLegacyPayloadReads,
 			});
 		} catch (err) {
 			throw toWebTransportError(err, this.#strictW3CErrors);
@@ -2008,6 +2052,7 @@ class NativeClientSession implements ClientSession {
 				yield new BidiStream({
 					handleId: nativeStream?.id ?? 0,
 					nativeHandle: nativeStream,
+					allowLegacyPayloadReads: this.#allowLegacyPayloadReads,
 				});
 			} catch (err) {
 				if (isSessionCloseError(err)) break;
@@ -2048,6 +2093,7 @@ class NativeClientSession implements ClientSession {
 				yield new RecvStream({
 					handleId: nativeStream?.id ?? 0,
 					nativeHandle: nativeStream,
+					allowLegacyPayloadReads: this.#allowLegacyPayloadReads,
 				});
 			} catch (err) {
 				if (isSessionCloseError(err)) break;
@@ -3298,17 +3344,23 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 	writableDone = false;
 	private writableStream: WritableStream<Uint8Array> | null = null;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+	readonly allowLegacyPayloadReads: boolean;
 
 	constructor(
 		nativeStream: NativeBidiStreamHandle,
 		onDisposed: (resource: ServerIncomingStreamResource) => void,
+		allowLegacyPayloadReads: boolean,
 	) {
 		this.handle = nativeStream;
 		this.onDisposed = onDisposed;
+		this.allowLegacyPayloadReads = allowLegacyPayloadReads;
 	}
 
 	getWritable(): WritableStream<Uint8Array> {
-		return (this.writableStream ??= new WritableStream<Uint8Array>(this));
+		if (!this.writableStream) {
+			this.writableStream = new WritableStream<Uint8Array>(this);
+		}
+		return this.writableStream;
 	}
 
 	release(abort: boolean, code = 0): void {
@@ -3361,7 +3413,11 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = await current.read();
+			const chunk = await readNativePayload(
+				current.readOwned?.bind(current),
+				current.read?.bind(current),
+				this.allowLegacyPayloadReads,
+			);
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.readableDone = true;
@@ -3454,11 +3510,16 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 function createServerIncomingBidiWebStreams(
 	nativeStream: NativeBidiStreamHandle,
 	onDisposed: (resource: ServerIncomingStreamResource) => void,
+	allowLegacyPayloadReads: boolean,
 ): {
 	resource: ServerIncomingStreamResource;
 	stream: WebTransportBidirectionalStream;
 } {
-	const resource = new ServerIncomingBidiResource(nativeStream, onDisposed);
+	const resource = new ServerIncomingBidiResource(
+		nativeStream,
+		onDisposed,
+		allowLegacyPayloadReads,
+	);
 	const readable = new ReadableStream<Uint8Array>(resource, {
 		highWaterMark: 0,
 	});
@@ -3491,13 +3552,16 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 	handle: NativeRecvStreamHandle | null;
 	disposed = false;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+	readonly allowLegacyPayloadReads: boolean;
 
 	constructor(
 		nativeStream: NativeRecvStreamHandle,
 		onDisposed: (resource: ServerIncomingStreamResource) => void,
+		allowLegacyPayloadReads: boolean,
 	) {
 		this.handle = nativeStream;
 		this.onDisposed = onDisposed;
+		this.allowLegacyPayloadReads = allowLegacyPayloadReads;
 	}
 
 	release(abort: boolean, code = 0): void {
@@ -3545,7 +3609,11 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = await current.read();
+			const chunk = await readNativePayload(
+				current.readOwned?.bind(current),
+				current.read?.bind(current),
+				this.allowLegacyPayloadReads,
+			);
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.release(false);
@@ -3568,11 +3636,16 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 function createServerIncomingUniWebReadable(
 	nativeStream: NativeRecvStreamHandle,
 	onDisposed: (resource: ServerIncomingStreamResource) => void,
+	allowLegacyPayloadReads: boolean,
 ): {
 	resource: ServerIncomingStreamResource;
 	readable: WebTransportReceiveStream;
 } {
-	const resource = new ServerIncomingUniResource(nativeStream, onDisposed);
+	const resource = new ServerIncomingUniResource(
+		nativeStream,
+		onDisposed,
+		allowLegacyPayloadReads,
+	);
 	const readable = new ReadableStream<Uint8Array>(resource, {
 		highWaterMark: 0,
 	});
@@ -3585,6 +3658,7 @@ function createServerIncomingBidiStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
 	closedPromise?: Promise<unknown>,
+	allowLegacyPayloadReads = false,
 ): ReadableStream<WebTransportBidirectionalStream> {
 	// Pull-based: streams are accepted from native only as fast as the
 	// consumer reads them, so a slow/stalled consumer cannot pile up
@@ -3619,6 +3693,7 @@ function createServerIncomingBidiStreams(
 				const direct = createServerIncomingBidiWebStreams(
 					nativeStream,
 					removeActiveStream,
+					allowLegacyPayloadReads,
 				);
 				activeStreams.add(direct.resource);
 				controller.enqueue(direct.stream);
@@ -3644,6 +3719,7 @@ function createServerIncomingUniStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
 	closedPromise?: Promise<unknown>,
+	allowLegacyPayloadReads = false,
 ): ReadableStream<WebTransportReceiveStream> {
 	// Pull-based for the same backpressure reasons as the bidi variant.
 	let cancelled = false;
@@ -3676,6 +3752,7 @@ function createServerIncomingUniStreams(
 				const direct = createServerIncomingUniWebReadable(
 					nativeStream,
 					removeActiveStream,
+					allowLegacyPayloadReads,
 				);
 				activeStreams.add(direct.resource);
 				controller.enqueue(direct.readable);
@@ -3882,12 +3959,15 @@ function nodeWritableToWebWritable(
 function createNativeClientSessionForTests(
 	nativeHandle: any,
 	strictW3CErrors = false,
+	options: { legacyPayloadReads?: boolean } = {},
 ): ClientSession {
 	return new NativeClientSession(
 		nativeHandle,
 		Promise.resolve(),
 		new Promise<CloseInfo>(() => {}),
 		strictW3CErrors,
+		DEFAULT_LIMITS.backpressureTimeoutMs,
+		options.legacyPayloadReads ?? true,
 	);
 }
 
@@ -3896,6 +3976,7 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 		nativeHandle,
 		new Promise<CloseInfo>(() => {}),
 		DEFAULT_LIMITS.backpressureTimeoutMs,
+		true,
 	);
 }
 
@@ -3903,10 +3984,26 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 export const __TESTING__ = {
 	createNativeClientSessionForTests,
 	createNativeServerSessionForTests,
-	createServerIncomingBidiStreamsForTests: createServerIncomingBidiStreams,
-	createServerIncomingUniStreamsForTests: createServerIncomingUniStreams,
+	createServerIncomingBidiStreamsForTests: (
+		nativeHandle: any,
+		isClosed: () => boolean,
+		closedPromise?: Promise<unknown>,
+	) =>
+		createServerIncomingBidiStreams(
+			nativeHandle,
+			isClosed,
+			closedPromise,
+			true,
+		),
+	createServerIncomingUniStreamsForTests: (
+		nativeHandle: any,
+		isClosed: () => boolean,
+		closedPromise?: Promise<unknown>,
+	) =>
+		createServerIncomingUniStreams(nativeHandle, isClosed, closedPromise, true),
 	tryLoadNativeAddonForTests: tryLoadNativeAddon,
 	buildNativeAddonLoadErrorMessageForTests: buildNativeAddonLoadErrorMessage,
+	assertNativePayloadOwnershipForTests: assertNativePayloadOwnership,
 	nativeAddonOverrideRequestsFromEnvForTests:
 		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
