@@ -629,12 +629,21 @@ pub(crate) async fn accept_uni_stream_for_session(id: &str) -> Result<Option<Cli
 /// boundary. The return value is `0` when no stream was accepted, `1` when an
 /// incoming probe was handled, and `2` when it also emitted the uni echo.
 pub(crate) async fn handle_uni_probe_for_session(id: &str) -> Result<u32> {
-    let Some(stream) = accept_uni_stream_for_session(id).await? else {
+    let Some(mut stream) = accept_uni_stream_for_session(id).await? else {
         return Ok(0);
     };
     let payload = stream.read_native_probe().await?;
     let result = if let Some(payload) = payload {
         if payload.as_bytes().starts_with(b"probe:uni-echo:") {
+            // The first direct read leaves the receive stream deferred. Drain
+            // through FIN before disposing it; dropping the live receive half
+            // can otherwise race the client's finish acknowledgement and turn
+            // a successful echo into an intermittent STOP_SENDING(0).
+            let mut scratch = [0u8; 1024];
+            stream
+                .discard_incoming(&mut scratch)
+                .await
+                .map_err(napi::Error::from_reason)?;
             let send = create_uni_stream_for_session(id).await?;
             send.write(payload.take().into()).await?;
             send.finish_wait().await?;

@@ -389,6 +389,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         skip_probes,
         budgets,
     } = options;
+    validate_workload_rates(mode, datagrams_per_sec, streams_per_sec)?;
     let config = ClientConfig::builder()
         .with_bind_default()
         .with_no_cert_validation()
@@ -488,6 +489,17 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn validate_workload_rates(
+    mode: ClientMode,
+    datagrams_per_sec: u64,
+    streams_per_sec: u64,
+) -> Result<(), &'static str> {
+    if mode == ClientMode::Load && datagrams_per_sec == 0 && streams_per_sec == 0 {
+        return Err("load mode requires a non-zero datagram or stream rate");
+    }
+    Ok(())
+}
+
 async fn wait_for_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
     while Instant::now() < join_deadline {
@@ -520,26 +532,13 @@ async fn run_session(
 ) {
     let start = Instant::now();
     let mut stream_sequence = 0u64;
-    let datagram_interval = if datagrams_per_sec > 0 {
-        Duration::from_secs_f64(1.0 / datagrams_per_sec as f64)
-    } else {
-        Duration::from_secs(3600)
-    };
-    let stream_interval = if streams_per_sec > 0 {
-        Duration::from_secs_f64(1.0 / streams_per_sec as f64)
-    } else {
-        Duration::from_secs(3600)
-    };
-
-    let mut dg_ticker = interval(datagram_interval);
-    let mut st_ticker = interval(stream_interval);
-    dg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    st_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dg_ticker = ticker_for_rate(datagrams_per_sec);
+    let mut st_ticker = ticker_for_rate(streams_per_sec);
 
     while start.elapsed() < duration {
         tokio::select! {
             _ = conn.closed() => break,
-            _ = dg_ticker.tick() => {
+            _ = tick_if_enabled(&mut dg_ticker) => {
                 let payload = format!("load:datagram:{}", next_probe_id());
                 if conn.send_datagram(payload.as_bytes()).is_ok() {
                     counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
@@ -547,7 +546,7 @@ async fn run_session(
                     counters.datagrams_err.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            _ = st_ticker.tick() => {
+            _ = tick_if_enabled(&mut st_ticker) => {
                 let result = if stream_sequence.is_multiple_of(2) {
                     let payload = format!("{LOAD_UNI_PREFIX}{}", next_probe_id()).into_bytes();
                     match conn.open_uni().await {
@@ -601,6 +600,24 @@ async fn run_session(
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
 }
 
+fn ticker_for_rate(rate_per_sec: u64) -> Option<tokio::time::Interval> {
+    if rate_per_sec == 0 {
+        return None;
+    }
+    let mut ticker = interval(Duration::from_secs_f64(1.0 / rate_per_sec as f64));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(ticker)
+}
+
+async fn tick_if_enabled(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(ticker) => {
+            ticker.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn run_reconnect_worker(
     endpoint: Arc<Endpoint<wtransport::endpoint::endpoint_side::Client>>,
     url: String,
@@ -642,7 +659,10 @@ async fn run_reconnect_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_summary_json, parse_client_mode, parse_or_default, ClientMode, Counters};
+    use super::{
+        load_summary_json, parse_client_mode, parse_or_default, ticker_for_rate,
+        validate_workload_rates, ClientMode, Counters,
+    };
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -679,5 +699,19 @@ mod tests {
         counters.reconnects_ok.store(3, Ordering::Relaxed);
         let summary = load_summary_json(ClientMode::Reconnect, &counters);
         assert!(summary.contains("\"observedReconnects\":3"));
+    }
+
+    #[tokio::test]
+    async fn zero_rate_disables_the_operation_ticker() {
+        assert!(ticker_for_rate(0).is_none());
+        assert!(ticker_for_rate(1).is_some());
+    }
+
+    #[test]
+    fn load_mode_rejects_an_empty_workload() {
+        assert!(validate_workload_rates(ClientMode::Load, 0, 0).is_err());
+        assert!(validate_workload_rates(ClientMode::Load, 1, 0).is_ok());
+        assert!(validate_workload_rates(ClientMode::Load, 0, 1).is_ok());
+        assert!(validate_workload_rates(ClientMode::Reconnect, 0, 0).is_ok());
     }
 }
