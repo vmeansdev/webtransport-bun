@@ -1,15 +1,16 @@
-# P2.2: Long soak jobs (1h, 24h, 72h). Trigger manually via workflow_dispatch.
+# P2.2: Long soak jobs (1h, 2h, 24h, 72h). Trigger manually via workflow_dispatch.
 name: soak-long
 on:
   workflow_dispatch:
     inputs:
       duration_hours:
-        description: "Soak duration in hours (1, 24, or 72)"
+        description: "Soak duration in hours (1, 2, 24, or 72)"
         required: true
         default: "1"
         type: choice
         options:
           - "1"
+          - "2"
           - "24"
           - "72"
       runner_type:
