@@ -660,7 +660,9 @@ impl ClientBidiStreamHandle {
     /// allocation for that path creates avoidable allocator churn. The receive
     /// stream stays deferred after each successful read, so normal multi-read
     /// consumers retain the same semantics without a per-stream bridge.
-    async fn read_deferred_direct(&self) -> Result<Option<Option<napi::bindgen_prelude::Buffer>>> {
+    async fn read_deferred_direct(
+        &self,
+    ) -> Result<Option<Option<crate::payload_buffer::PayloadBuffer>>> {
         let pending = self
             .deferred_recv
             .lock()
@@ -779,7 +781,7 @@ impl ClientBidiStreamHandle {
             if payload.as_ref().starts_with(b"probe:bidi-reset:") {
                 self.reset(42)?;
             } else if payload.as_ref().starts_with(b"probe:bidi-echo:") {
-                self.write(payload).await?;
+                self.write(payload.into_vec().into()).await?;
                 self.finish_wait().await?;
             } else {
                 self.reset(0)?;
@@ -889,7 +891,7 @@ impl Drop for ClientBidiStreamHandle {
 #[napi]
 impl ClientBidiStreamHandle {
     #[napi]
-    pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
+    pub async fn read(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
         }
@@ -1350,7 +1352,9 @@ impl ClientUniRecvHandle {
     /// channel. Accepted streams commonly deliver only one chunk before the
     /// JS facade cancels them, so keeping the transport receive state deferred
     /// avoids per-stream allocator churn while preserving repeated reads.
-    async fn read_deferred_direct(&self) -> Result<Option<Option<napi::bindgen_prelude::Buffer>>> {
+    async fn read_deferred_direct(
+        &self,
+    ) -> Result<Option<Option<crate::payload_buffer::PayloadBuffer>>> {
         let pending = self
             .deferred_recv
             .lock()
@@ -1495,7 +1499,9 @@ impl ClientUniRecvHandle {
     }
 
     /// Read one ordered load/evidence uni probe without creating a JS wrapper.
-    pub(crate) async fn read_native_probe(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
+    pub(crate) async fn read_native_probe(
+        &self,
+    ) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
         Ok(self.read_deferred_direct().await?.flatten())
     }
 
@@ -1515,7 +1521,7 @@ impl Drop for ClientUniRecvHandle {
 #[napi]
 impl ClientUniRecvHandle {
     #[napi]
-    pub async fn read(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
+    pub async fn read(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
         }

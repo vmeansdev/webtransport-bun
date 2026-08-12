@@ -543,7 +543,7 @@ impl ClientSessionHandle {
     }
 
     #[napi]
-    pub async fn read_datagram(&self) -> Result<Option<napi::bindgen_prelude::Buffer>> {
+    pub async fn read_datagram(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
         let mut rx = self.dgram_recv_rx.lock().await;
         match rx.recv().await {
             Some(bytes) => {

@@ -158,7 +158,11 @@ impl SessionHandle {
         let id = self.id.clone();
         env.spawn_future(async move {
             RUNTIME
-                .spawn(async move { Ok(read_datagram_for_session(&id).await?.map(Buffer::from)) })
+                .spawn(async move {
+                    Ok(read_datagram_for_session(&id)
+                        .await?
+                        .map(crate::payload_buffer::PayloadBuffer::from))
+                })
                 .await
                 .map_err(wt_from_upstream_error)?
         })

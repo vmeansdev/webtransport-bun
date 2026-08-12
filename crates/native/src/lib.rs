@@ -31,6 +31,7 @@ pub mod limits;
 pub mod metrics;
 pub mod native_memory;
 pub mod panic_guard;
+pub mod payload_buffer;
 pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;

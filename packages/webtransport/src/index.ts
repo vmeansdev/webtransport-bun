@@ -1075,7 +1075,7 @@ type NativeClientSessionEvent = {
 };
 type NativeBidiStreamHandle = {
 	readonly id: number;
-	read(): Promise<Buffer | null>;
+	read(): Promise<Uint8Array | null>;
 	write(chunk: Buffer | Uint8Array): Promise<void>;
 	finish(): Promise<void> | void;
 	finishWait?: () => Promise<void> | void;
@@ -1094,7 +1094,7 @@ type NativeSendStreamHandle = {
 };
 type NativeRecvStreamHandle = {
 	readonly id: number;
-	read(): Promise<Buffer | null>;
+	read(): Promise<Uint8Array | null>;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
@@ -1105,7 +1105,7 @@ interface NativeSessionHandle {
 	peerPort: number;
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
-	readDatagram(): Promise<Buffer | null>;
+	readDatagram(): Promise<Uint8Array | null>;
 	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
 	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
 	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
