@@ -259,16 +259,20 @@ jobs:
           RUNNER_TYPE="$INPUT_RUNNER_TYPE"
           case "${RUNNER_TYPE}:${H}" in
             "github-hosted:1"|"self-hosted:1") TOTAL_SECONDS=3600; DEFAULT_SEGMENTS=1 ;;
+            "github-hosted:2"|"self-hosted:2") TOTAL_SECONDS=7200; DEFAULT_SEGMENTS=1 ;;
             "github-hosted:24") TOTAL_SECONDS=86400; DEFAULT_SEGMENTS=5 ;;
             "github-hosted:72") TOTAL_SECONDS=259200; DEFAULT_SEGMENTS=15 ;;
             "self-hosted:24") TOTAL_SECONDS=86400; DEFAULT_SEGMENTS=1 ;;
             "self-hosted:72") TOTAL_SECONDS=259200; DEFAULT_SEGMENTS=1 ;;
-            *)  TOTAL_SECONDS=3600; DEFAULT_SEGMENTS=1 ;;
+            *)
+              echo "::error::unmapped duration_hours '${H}' for runner '${RUNNER_TYPE}' — refusing to run a mislabeled soak"
+              exit 1
+              ;;
           esac
           SEGMENT_COUNT="$INPUT_SEGMENT_COUNT"
           SEGMENT_INDEX="$INPUT_SEGMENT_INDEX"
           if [ "$SEGMENT_COUNT" = "1" ]; then
-            if [ "$RUNNER_TYPE" = "github-hosted" ] && [ "$H" != "1" ]; then
+            if [ "$RUNNER_TYPE" = "github-hosted" ] && [ "$H" != "1" ] && [ "$H" != "2" ]; then
               echo "::error::24h/72h github-hosted campaigns must use bounded multi-job segments"
               exit 1
             fi
