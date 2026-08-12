@@ -34,6 +34,8 @@ fi
 case "$RUNNER_TYPE:$RUNNER_MODE:$DURATION_HOURS:$SEGMENT_COUNT" in
 	"github-hosted:shared:1:1"|"github-hosted:dedicated:1:1"|\
 	"self-hosted:shared:1:1"|"self-hosted:dedicated:1:1"|\
+	"github-hosted:shared:2:1"|"github-hosted:dedicated:2:1"|\
+	"self-hosted:shared:2:1"|"self-hosted:dedicated:2:1"|\
 	"github-hosted:shared:24:5"|"github-hosted:dedicated:24:5"|\
 	"github-hosted:shared:72:15"|"github-hosted:dedicated:72:15"|\
 	"self-hosted:shared:24:1"|"self-hosted:dedicated:24:1"|\
