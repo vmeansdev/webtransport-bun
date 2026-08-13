@@ -428,5 +428,9 @@ jobs:
         with:
           name: soak-aggregate-${{ github.event.inputs.duration_hours }}h-${{ github.event.inputs.candidate_commit }}
           path: .release-evidence/soak-aggregate-*.json
+          # upload-artifact v4.4+ silently skips dot-directories by default;
+          # .release-evidence is one, which made this step fail with
+          # "No files were found" on an otherwise green soak.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
