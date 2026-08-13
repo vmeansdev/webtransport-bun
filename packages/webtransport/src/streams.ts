@@ -126,7 +126,13 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			return;
 		}
 		h.read()
-			.then((buf: Buffer | null) => {
+			.then((buf: Buffer | string | null) => {
+				// Never-reject sentinel: a string result IS an error code
+				// (see unwrapNativeValue) — never deliverable as payload.
+				if (typeof buf === "string") {
+					this.destroy(new Error(buf));
+					return;
+				}
 				if (buf && !this.#destroyed) this.push(buf);
 				else this.push(null);
 			})
@@ -144,7 +150,9 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			return;
 		}
 		h.write(chunk)
-			.then(() => callback())
+			.then((code: string | null | undefined) =>
+				typeof code === "string" ? callback(new Error(code)) : callback(),
+			)
 			.catch(callback);
 	}
 
@@ -163,7 +171,8 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			const ret = finishFn.call(h);
 			if (ret && typeof ret.then === "function") {
 				ret.then(
-					() => callback(),
+					(code: string | null | undefined) =>
+						typeof code === "string" ? callback(new Error(code)) : callback(),
 					(err: Error) => callback(err),
 				);
 				return;
@@ -282,7 +291,9 @@ export class SendStream extends Writable implements Resettable {
 			return;
 		}
 		h.write(chunk)
-			.then(() => callback())
+			.then((code: string | null | undefined) =>
+				typeof code === "string" ? callback(new Error(code)) : callback(),
+			)
 			.catch(callback);
 	}
 
@@ -301,7 +312,8 @@ export class SendStream extends Writable implements Resettable {
 			const ret = finishFn.call(h);
 			if (ret && typeof ret.then === "function") {
 				ret.then(
-					() => callback(),
+					(code: string | null | undefined) =>
+						typeof code === "string" ? callback(new Error(code)) : callback(),
 					(err: Error) => callback(err),
 				);
 				return;
@@ -393,7 +405,13 @@ export class RecvStream extends Readable implements StopSendable {
 			return;
 		}
 		h.read()
-			.then((buf: Buffer | null) => {
+			.then((buf: Buffer | string | null) => {
+				// Never-reject sentinel: a string result IS an error code
+				// (see unwrapNativeValue) — never deliverable as payload.
+				if (typeof buf === "string") {
+					this.destroy(new Error(buf));
+					return;
+				}
 				if (buf && !this.#destroyed) this.push(buf);
 				else this.push(null);
 			})

@@ -506,8 +506,18 @@ impl ClientSessionHandle {
             .map(|n| n as u32))
     }
 
+    /// Never rejects: rejected async napi calls leak a strong self-ref on
+    /// this SESSION handle under Bun, so errors resolve as their code
+    /// string (null on success) and the TS layer throws.
     #[napi]
-    pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
+    pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Option<String> {
+        match self.send_datagram_inner(data).await {
+            Ok(()) => None,
+            Err(error) => Some(error.reason.clone()),
+        }
+    }
+
+    async fn send_datagram_inner(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         }
@@ -603,8 +613,20 @@ impl ClientSessionHandle {
         })
     }
 
+    /// Never rejects (see send_datagram): resolves the handle, or the error
+    /// code string.
     #[napi]
-    pub async fn create_bidi_stream(&self) -> Result<ClientBidiStreamHandle> {
+    pub async fn create_bidi_stream(
+        &self,
+    ) -> napi::bindgen_prelude::Either<ClientBidiStreamHandle, String> {
+        use napi::bindgen_prelude::Either;
+        match self.create_bidi_stream_inner().await {
+            Ok(handle) => Either::A(handle),
+            Err(error) => Either::B(error.reason.clone()),
+        }
+    }
+
+    async fn create_bidi_stream_inner(&self) -> Result<ClientBidiStreamHandle> {
         let Some(ref tx) = self.stream_open_bi_tx else {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
@@ -618,8 +640,20 @@ impl ClientSessionHandle {
             .map_err(wt_from_upstream_error)
     }
 
+    /// Never rejects (see send_datagram): resolves the handle, or the error
+    /// code string.
     #[napi]
-    pub async fn create_uni_stream(&self) -> Result<ClientUniSendHandle> {
+    pub async fn create_uni_stream(
+        &self,
+    ) -> napi::bindgen_prelude::Either<ClientUniSendHandle, String> {
+        use napi::bindgen_prelude::Either;
+        match self.create_uni_stream_inner().await {
+            Ok(handle) => Either::A(handle),
+            Err(error) => Either::B(error.reason.clone()),
+        }
+    }
+
+    async fn create_uni_stream_inner(&self) -> Result<ClientUniSendHandle> {
         let Some(ref tx) = self.stream_open_uni_tx else {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };

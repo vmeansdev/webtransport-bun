@@ -358,6 +358,7 @@ export type SessionMetricsSnapshot = {
 
 ### Semantics (must be implemented)
 - `sendDatagram()` Promise resolves only when accepted into a bounded internal queue (or sent). If queues are full, it must wait (backpressure). If waiting exceeds `backpressureTimeoutMs`, reject with `E_BACKPRESSURE_TIMEOUT`.
+- Reliable-stream receive paths apply the same bound: when the byte budget (`maxQueuedBytesPerStream`/`maxQueuedBytesPerSession`) stays exhausted — a reader that consumes nothing for a full `backpressureTimeoutMs` — the stream is stopped and pending reads reject with `E_BACKPRESSURE_TIMEOUT`. A reader that frees any capacity within the window keeps the stream. This bound is load-bearing for memory: an abandoned reader must not pin the stream's native state for the life of the process.
 - Incoming datagrams are delivered via AsyncIterable on both server/client sessions.
 - Incoming streams are delivered as ReadableStream properties on `ServerSession` and as AsyncIterable methods on `ClientSession`.
 - On session close, iterators/streams must terminate promptly.
