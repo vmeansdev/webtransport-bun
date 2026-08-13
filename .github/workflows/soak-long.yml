@@ -254,6 +254,9 @@ jobs:
           INPUT_RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
           INPUT_SEGMENT_INDEX: ${{ github.event.inputs.segment_index || '1' }}
           INPUT_SEGMENT_COUNT: ${{ github.event.inputs.segment_count || '1' }}
+          # Native-drift forensics: the addon's mimalloc prints allocated-vs-
+          # committed stats to stderr at process exit (captured in this log).
+          MIMALLOC_SHOW_STATS: "1"
         run: |
           H="$INPUT_DURATION_HOURS"
           RUNNER_TYPE="$INPUT_RUNNER_TYPE"

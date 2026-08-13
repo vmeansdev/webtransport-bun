@@ -273,6 +273,14 @@ export type Sample = {
 	heapCapacityMb?: number;
 	/** Live JS object count. */
 	objectCount?: number;
+	/** Written-to private pages (smaps_rollup Private_Dirty): live data the
+	 * process actually holds. Drift here = real allocations, not arena slack. */
+	privateDirtyMb?: number;
+	/** MADV_FREE'd pages still counted in Rss (smaps_rollup LazyFree): freed
+	 * allocator arenas awaiting reclaim. Drift here = allocator retention. */
+	lazyFreeMb?: number;
+	/** Total anonymous mappings (smaps_rollup Anonymous). */
+	anonymousMb?: number;
 };
 
 type LoadClientSummary = {
@@ -1380,6 +1388,34 @@ function readProcStatusMemMb(): {
 	}
 }
 
+/** Private_Dirty / LazyFree / Anonymous from /proc/self/smaps_rollup (null
+ * off Linux). Splits committed drift into live data (Private_Dirty growing)
+ * vs allocator arena slack (LazyFree growing) — the discriminator the
+ * committed metric alone cannot provide. */
+function readSmapsRollupMb(): {
+	privateDirtyMb: number;
+	lazyFreeMb: number;
+	anonymousMb: number;
+} | null {
+	if (process.platform !== "linux") return null;
+	try {
+		const rollup = readFileSync("/proc/self/smaps_rollup", "utf8");
+		const grab = (key: string): number | null => {
+			const match = rollup.match(new RegExp(`^${key}:\\s+(\\d+) kB`, "m"));
+			return match ? Number(match[1]) / 1024 : null;
+		};
+		const privateDirtyMb = grab("Private_Dirty");
+		if (privateDirtyMb == null) return null;
+		return {
+			privateDirtyMb,
+			lazyFreeMb: grab("LazyFree") ?? 0,
+			anonymousMb: grab("Anonymous") ?? 0,
+		};
+	} catch {
+		return null;
+	}
+}
+
 const HEAP_DEBUG = process.env.SOAK_HEAP_DEBUG === "1";
 const HEAP_DEBUG_INTERVAL_MS = requireNumberEnv(
 	"SOAK_HEAP_DEBUG_INTERVAL_MS",
@@ -2104,6 +2140,7 @@ async function runSegment(): Promise<void> {
 			peakStreams = Math.max(peakStreams, metrics.streamsActive);
 			const procMem = readProcStatusMemMb();
 			const committedMb = procMem ? procMem.rssAnonMb + procMem.vmSwapMb : null;
+			const smapsMem = readSmapsRollupMb();
 			const heapDebugDue =
 				HEAP_DEBUG && Date.now() - lastHeapDebugAtMs >= HEAP_DEBUG_INTERVAL_MS;
 			const jscStats = heapDebugDue ? getJscHeapStats() : null;
@@ -2131,6 +2168,7 @@ async function runSegment(): Promise<void> {
 							committedMb,
 						}
 					: {}),
+				...(smapsMem ?? {}),
 				...(jscStats
 					? {
 							heapCapacityMb: jscStats.heapCapacity / (1024 * 1024),
