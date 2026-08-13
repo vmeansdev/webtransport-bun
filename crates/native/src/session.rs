@@ -631,8 +631,8 @@ pub(crate) async fn handle_uni_probe_for_session(id: &str) -> Result<u32> {
     let result = if let Some(payload) = payload {
         if payload.as_ref().starts_with(b"probe:uni-echo:") {
             let send = create_uni_stream_for_session(id).await?;
-            send.write(payload.into_vec().into()).await?;
-            send.finish_wait().await?;
+            send.write_inner(payload.into_vec().into()).await?;
+            send.finish_wait_inner().await?;
             let _ = send.dispose();
             2
         } else {

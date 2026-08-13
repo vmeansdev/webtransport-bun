@@ -102,3 +102,29 @@ function codeToSource(code: ErrorCode): WebTransportErrorSource {
 			return "session";
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Never-reject native sentinels
+// ---------------------------------------------------------------------------
+
+/**
+ * Hot async napi methods resolve their error-code string instead of
+ * rejecting: a rejected async napi call leaks a strong self-reference on
+ * its handle under Bun (verified 1.3.14 and 1.4.0-canary), permanently
+ * pinning the wrapper and its native state. ANY string result from those
+ * methods is an error — there is deliberately no allowlist, so an unknown
+ * code still throws instead of being delivered as payload.
+ *
+ * The thrown Error carries the full native reason as its message, exactly
+ * like the rejections it replaces, so every downstream catch/mapping path
+ * (toWebTransportError, extractMessageErrorCode) behaves unchanged.
+ */
+export function unwrapNativeValue<T>(result: T | string): T {
+	if (typeof result === "string") throw new Error(result);
+	return result;
+}
+
+/** Void-method variant of {@link unwrapNativeValue}: null/undefined = ok. */
+export function unwrapNativeVoid(result: string | null | undefined): void {
+	if (typeof result === "string") throw new Error(result);
+}

@@ -311,6 +311,39 @@ impl StreamBudget {
     }
 }
 
+enum RecvReserveOutcome {
+    Reserved,
+    TimedOut,
+    Stopped(Option<u32>),
+}
+
+/// Bounded receive-side reservation: parks until capacity frees, the
+/// backpressure deadline elapses, or the JS side stops the stream.
+///
+/// The deadline is load-bearing for memory: an abandoned reader frees no
+/// capacity, so an unbounded park left the bridge task alive forever, kept
+/// the pending JS `read()` unsettled, and its napi self-reference pinned the
+/// stream handle (plus its native channels and budget) across session close
+/// and every GC. A reader that consumes anything within
+/// `backpressure_timeout_ms` keeps the stream.
+async fn reserve_for_recv(
+    budget: &StreamBudget,
+    sz: u64,
+    stop_rx: &mut oneshot::Receiver<u32>,
+) -> RecvReserveOutcome {
+    let _probe = await_probe::enter(&await_probe::BRIDGE_BUDGET_WAIT);
+    tokio::select! {
+        reserved = budget.reserve_or_wait(sz) => {
+            if reserved {
+                RecvReserveOutcome::Reserved
+            } else {
+                RecvReserveOutcome::TimedOut
+            }
+        }
+        code = stop_rx => RecvReserveOutcome::Stopped(code.ok()),
+    }
+}
+
 impl StreamBudget {
     pub fn try_reserve(&self, n: u64) -> bool {
         if !self
@@ -460,6 +493,55 @@ fn installed_budget(
     Ok(materialized)
 }
 
+/// Await-point accounting for leak forensics: each counter tracks how many
+/// futures are CURRENTLY inside a given await. A counter that still holds
+/// thousands after teardown names the stuck await pinning napi handles.
+/// Guards decrement on drop, so cancelled futures are accounted correctly.
+pub(crate) mod await_probe {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    pub static READ_METHOD: AtomicI64 = AtomicI64::new(0);
+    pub static WRITE_METHOD: AtomicI64 = AtomicI64::new(0);
+    pub static FINISH_METHOD: AtomicI64 = AtomicI64::new(0);
+    pub static PERMIT_WAIT: AtomicI64 = AtomicI64::new(0);
+    pub static RX_MUTEX: AtomicI64 = AtomicI64::new(0);
+    pub static RX_RECV: AtomicI64 = AtomicI64::new(0);
+    pub static DIRECT_QUINN_READ: AtomicI64 = AtomicI64::new(0);
+    pub static DIRECT_BUDGET_WAIT: AtomicI64 = AtomicI64::new(0);
+    pub static BRIDGE_SELECT: AtomicI64 = AtomicI64::new(0);
+    pub static BRIDGE_BUDGET_WAIT: AtomicI64 = AtomicI64::new(0);
+    pub static BRIDGE_SEND: AtomicI64 = AtomicI64::new(0);
+
+    pub struct Guard(&'static AtomicI64);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    pub fn enter(counter: &'static AtomicI64) -> Guard {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Guard(counter)
+    }
+    pub fn snapshot() -> Vec<(&'static str, i64)> {
+        [
+            ("readMethod", &READ_METHOD),
+            ("writeMethod", &WRITE_METHOD),
+            ("finishMethod", &FINISH_METHOD),
+            ("permitWait", &PERMIT_WAIT),
+            ("rxMutex", &RX_MUTEX),
+            ("rxRecv", &RX_RECV),
+            ("directQuinnRead", &DIRECT_QUINN_READ),
+            ("directBudgetWait", &DIRECT_BUDGET_WAIT),
+            ("bridgeSelect", &BRIDGE_SELECT),
+            ("bridgeBudgetWait", &BRIDGE_BUDGET_WAIT),
+            ("bridgeSend", &BRIDGE_SEND),
+        ]
+        .iter()
+        .map(|(name, counter)| (*name, counter.load(Ordering::Relaxed)))
+        .collect()
+    }
+}
+
 async fn acquire_deferred_read_bridge_permit(
     read_abort: &Notify,
     read_aborted: &AtomicBool,
@@ -469,6 +551,7 @@ async fn acquire_deferred_read_bridge_permit(
     }
     let notified = read_abort.notified();
     tokio::pin!(notified);
+    let _probe = await_probe::enter(&await_probe::PERMIT_WAIT);
     tokio::select! {
         permit = DEFERRED_READ_BRIDGES.clone().acquire_owned() => permit
             .map_err(|_| wt_from_reason("E_SESSION_CLOSED")),
@@ -680,6 +763,7 @@ impl ClientBidiStreamHandle {
         let notified = self.read_abort.notified();
         tokio::pin!(notified);
         let mut buf = [0u8; STREAM_READ_BUFFER_BYTES];
+        let _probe_direct = await_probe::enter(&await_probe::DIRECT_QUINN_READ);
         let result = tokio::select! {
             value = recv_stream.read(&mut buf) => value,
             _ = &mut notified => {
@@ -706,7 +790,10 @@ impl ClientBidiStreamHandle {
                 drop(guard);
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
-            if !b.reserve_or_wait(n as u64).await {
+            if !{
+                let _probe = await_probe::enter(&await_probe::DIRECT_BUDGET_WAIT);
+                b.reserve_or_wait(n as u64).await
+            } {
                 recv_stream.stop(0);
                 drop(guard);
                 return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
@@ -781,8 +868,8 @@ impl ClientBidiStreamHandle {
             if payload.as_ref().starts_with(b"probe:bidi-reset:") {
                 self.reset(42)?;
             } else if payload.as_ref().starts_with(b"probe:bidi-echo:") {
-                self.write(payload.into_vec().into()).await?;
-                self.finish_wait().await?;
+                self.write_inner(payload.into_vec().into()).await?;
+                self.finish_wait_inner().await?;
             } else {
                 self.reset(0)?;
             }
@@ -890,8 +977,28 @@ impl Drop for ClientBidiStreamHandle {
 
 #[napi]
 impl ClientBidiStreamHandle {
+    /// Never rejects: rejected async napi calls leak a strong self-ref on
+    /// this handle under Bun (verified 1.3.14 and 1.4.0-canary), so errors
+    /// resolve as their code string and the TS layer throws. Data resolves
+    /// as PayloadBuffer, EOF as null.
     #[napi]
-    pub async fn read(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
+    pub async fn read(
+        &self,
+    ) -> napi::bindgen_prelude::Either3<
+        crate::payload_buffer::PayloadBuffer,
+        napi::bindgen_prelude::Null,
+        String,
+    > {
+        use napi::bindgen_prelude::{Either3, Null};
+        match self.read_inner().await {
+            Ok(Some(payload)) => Either3::A(payload),
+            Ok(None) => Either3::B(Null),
+            Err(error) => Either3::C(error.reason.clone()),
+        }
+    }
+
+    pub(crate) async fn read_inner(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
+        let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
         }
@@ -903,12 +1010,16 @@ impl ClientBidiStreamHandle {
             .as_ref()
             .cloned()
             .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
-        let mut rx = read_rx.lock().await;
+        let mut rx = {
+            let _probe = await_probe::enter(&await_probe::RX_MUTEX);
+            read_rx.lock().await
+        };
         let read_abort = self.read_abort.notified();
         tokio::pin!(read_abort);
         if self.read_aborted.load(Ordering::Acquire) {
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
+        let _probe_recv = await_probe::enter(&await_probe::RX_RECV);
         let result = match tokio::select! {
             value = rx.recv() => value,
             _ = &mut read_abort => {
@@ -937,12 +1048,22 @@ impl ClientBidiStreamHandle {
         Ok(result)
     }
 
+    /// Never rejects (see read): resolves null on success, the error code
+    /// string on failure.
     #[napi]
-    pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+    pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Option<String> {
+        match self.write_inner(chunk).await {
+            Ok(()) => None,
+            Err(error) => Some(error.reason.clone()),
+        }
+    }
+
+    pub(crate) async fn write_inner(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
         self.write_bytes(chunk.to_vec()).await
     }
 
     async fn write_bytes(&self, bytes: Vec<u8>) -> Result<()> {
+        let _probe_method = await_probe::enter(&await_probe::WRITE_METHOD);
         // A finished/reset stream never accepts more data: reject deterministically
         // rather than letting a late write race into the channel behind the FIN.
         if self.finished.load(Ordering::Acquire) {
@@ -1052,8 +1173,18 @@ impl ClientBidiStreamHandle {
         Ok(())
     }
 
+    /// Never rejects (see read): resolves null on success, the error code
+    /// string on failure.
     #[napi]
-    pub async fn finish_wait(&self) -> Result<()> {
+    pub async fn finish_wait(&self) -> Option<String> {
+        match self.finish_wait_inner().await {
+            Ok(()) => None,
+            Err(error) => Some(error.reason.clone()),
+        }
+    }
+
+    pub(crate) async fn finish_wait_inner(&self) -> Result<()> {
+        let _probe_method = await_probe::enter(&await_probe::FINISH_METHOD);
         self.finished.store(true, Ordering::Release);
         let tx = self.ensure_write_tx()?;
         let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
@@ -1148,8 +1279,17 @@ impl Drop for ClientUniSendHandle {
 
 #[napi]
 impl ClientUniSendHandle {
+    /// Never rejects (see read): resolves null on success, the error code
+    /// string on failure.
     #[napi]
-    pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
+    pub async fn write(&self, chunk: napi::bindgen_prelude::Buffer) -> Option<String> {
+        match self.write_inner(chunk).await {
+            Ok(()) => None,
+            Err(error) => Some(error.reason.clone()),
+        }
+    }
+
+    pub(crate) async fn write_inner(&self, chunk: napi::bindgen_prelude::Buffer) -> Result<()> {
         if self.finished.load(Ordering::Acquire) {
             return Err(napi::Error::from_reason("E_STREAM_RESET"));
         }
@@ -1217,8 +1357,18 @@ impl ClientUniSendHandle {
         Ok(())
     }
 
+    /// Never rejects (see read): resolves null on success, the error code
+    /// string on failure.
     #[napi]
-    pub async fn finish_wait(&self) -> Result<()> {
+    pub async fn finish_wait(&self) -> Option<String> {
+        match self.finish_wait_inner().await {
+            Ok(()) => None,
+            Err(error) => Some(error.reason.clone()),
+        }
+    }
+
+    pub(crate) async fn finish_wait_inner(&self) -> Result<()> {
+        let _probe_method = await_probe::enter(&await_probe::FINISH_METHOD);
         self.finished.store(true, Ordering::Release);
         let tx = self
             .write_tx
@@ -1372,6 +1522,7 @@ impl ClientUniRecvHandle {
         let notified = self.read_abort.notified();
         tokio::pin!(notified);
         let mut buf = [0u8; STREAM_READ_BUFFER_BYTES];
+        let _probe_direct = await_probe::enter(&await_probe::DIRECT_QUINN_READ);
         let result = tokio::select! {
             value = recv_stream.read(&mut buf) => value,
             _ = &mut notified => {
@@ -1398,7 +1549,10 @@ impl ClientUniRecvHandle {
                 drop(guard);
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
-            if !b.reserve_or_wait(n as u64).await {
+            if !{
+                let _probe = await_probe::enter(&await_probe::DIRECT_BUDGET_WAIT);
+                b.reserve_or_wait(n as u64).await
+            } {
                 recv_stream.stop(0);
                 drop(guard);
                 return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
@@ -1520,8 +1674,28 @@ impl Drop for ClientUniRecvHandle {
 
 #[napi]
 impl ClientUniRecvHandle {
+    /// Never rejects: rejected async napi calls leak a strong self-ref on
+    /// this handle under Bun (verified 1.3.14 and 1.4.0-canary), so errors
+    /// resolve as their code string and the TS layer throws. Data resolves
+    /// as PayloadBuffer, EOF as null.
     #[napi]
-    pub async fn read(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
+    pub async fn read(
+        &self,
+    ) -> napi::bindgen_prelude::Either3<
+        crate::payload_buffer::PayloadBuffer,
+        napi::bindgen_prelude::Null,
+        String,
+    > {
+        use napi::bindgen_prelude::{Either3, Null};
+        match self.read_inner().await {
+            Ok(Some(payload)) => Either3::A(payload),
+            Ok(None) => Either3::B(Null),
+            Err(error) => Either3::C(error.reason.clone()),
+        }
+    }
+
+    pub(crate) async fn read_inner(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
+        let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
         }
@@ -1533,12 +1707,16 @@ impl ClientUniRecvHandle {
             .as_ref()
             .cloned()
             .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
-        let mut rx = read_rx.lock().await;
+        let mut rx = {
+            let _probe = await_probe::enter(&await_probe::RX_MUTEX);
+            read_rx.lock().await
+        };
         let read_abort = self.read_abort.notified();
         tokio::pin!(read_abort);
         if self.read_aborted.load(Ordering::Acquire) {
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
+        let _probe_recv = await_probe::enter(&await_probe::RX_RECV);
         let result = match tokio::select! {
             value = rx.recv() => value,
             _ = &mut read_abort => {
@@ -1740,6 +1918,7 @@ fn spawn_recv_bridge_on_with_permit(
         let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;
         loop {
+            let _probe_select = await_probe::enter(&await_probe::BRIDGE_SELECT);
             tokio::select! {
                 res = recv_stream.read(&mut buf) => {
                     match res {
@@ -1755,32 +1934,48 @@ fn spawn_recv_bridge_on_with_permit(
                                     }
                                     break;
                                 }
-                                let mut abort_stop: Option<Option<u32>> = None;
-                                while !b.try_reserve(sz) {
-                                    let notified = b.capacity_notify.notified();
-                                    tokio::pin!(notified);
-                                    if b.try_reserve(sz) {
+                                // Bounded backpressure park (see reserve_for_recv):
+                                // an abandoned reader must not pin this bridge, the
+                                // pending read(), or the handle forever.
+                                match reserve_for_recv(b, sz, &mut stop_rx).await {
+                                    RecvReserveOutcome::Reserved => {}
+                                    RecvReserveOutcome::TimedOut => {
+                                        recv_stream.stop(0);
+                                        if let Ok(mut g) = read_error_slot_clone.lock() {
+                                            if g.is_none() {
+                                                *g = Some(
+                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                );
+                                            }
+                                        }
                                         break;
                                     }
-                                    tokio::select! {
-                                        _ = &mut notified => {}
-                                        _ = tokio::time::sleep(BUDGET_POLL_INTERVAL) => {}
-                                        code = &mut stop_rx => {
-                                            abort_stop = Some(code.ok());
-                                            break;
+                                    RecvReserveOutcome::Stopped(code) => {
+                                        if let Some(c) = code {
+                                            recv_stream.stop(c);
                                         }
+                                        break;
                                     }
                                 }
-                                if let Some(stop_code) = abort_stop {
-                                    if let Some(c) = stop_code {
+                            }
+                            let chunk = StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
+                            // Bounded send: a full read channel with an abandoned
+                            // reader must not park this bridge forever either. On
+                            // the stop branch the chunk drops here, releasing its
+                            // reservation via Drop.
+                            let _probe_send = await_probe::enter(&await_probe::BRIDGE_SEND);
+                            tokio::select! {
+                                sent = read_tx.send(chunk) => {
+                                    if sent.is_err() {
+                                        break;
+                                    }
+                                }
+                                code = &mut stop_rx => {
+                                    if let Ok(c) = code {
                                         recv_stream.stop(c);
                                     }
                                     break;
                                 }
-                            }
-                            let chunk = StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
-                            if read_tx.send(chunk).await.is_err() {
-                                break;
                             }
                         }
                         Ok(None) => break,
@@ -1827,6 +2022,7 @@ pub fn spawn_bidi_bridge_on(
         let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;
         loop {
+            let _probe_select = await_probe::enter(&await_probe::BRIDGE_SELECT);
             tokio::select! {
                 res = recv_stream.read(&mut buf) => {
                     match res {
@@ -1846,42 +2042,52 @@ pub fn spawn_bidi_bridge_on(
                                     }
                                     break;
                                 }
-                                // Lossless backpressure (see uni recv bridge): park
-                                // on a full budget instead of resetting the stream,
-                                // letting QUIC flow control push back on the sender.
-                                let mut abort_stop: Option<Option<u32>> = None;
-                                while !b.try_reserve(sz) {
-                                    let notified = b.capacity_notify.notified();
-                                    tokio::pin!(notified);
-                                    if b.try_reserve(sz) {
+                                // Bounded backpressure park (see uni recv bridge and
+                                // reserve_for_recv): wait for capacity while QUIC
+                                // flow control pushes back on the sender, but give
+                                // up after backpressure_timeout_ms — an abandoned
+                                // reader frees no capacity and an unbounded park
+                                // pinned the handle and bridge for the process
+                                // lifetime.
+                                match reserve_for_recv(b, sz, &mut stop_rx).await {
+                                    RecvReserveOutcome::Reserved => {}
+                                    RecvReserveOutcome::TimedOut => {
+                                        recv_stream.stop(0);
+                                        if let Ok(mut g) = read_error_slot_clone.lock() {
+                                            if g.is_none() {
+                                                *g = Some(
+                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                );
+                                            }
+                                        }
                                         break;
                                     }
-                                    tokio::select! {
-                                        _ = &mut notified => {}
-                                        // Periodic re-check: shared session/global
-                                        // budget freed by a sibling stream notifies
-                                        // its own notifier, not ours, so poll to
-                                        // avoid an indefinite stall (stays lossless).
-                                        _ = tokio::time::sleep(BUDGET_POLL_INTERVAL) => {}
-                                        code = &mut stop_rx => {
-                                            abort_stop = Some(code.ok());
-                                            break;
+                                    RecvReserveOutcome::Stopped(code) => {
+                                        if let Some(c) = code {
+                                            recv_stream.stop(c);
                                         }
+                                        break;
                                     }
-                                }
-                                if let Some(stop_code) = abort_stop {
-                                    if let Some(c) = stop_code {
-                                        recv_stream.stop(c);
-                                    }
-                                    break;
                                 }
                             }
                             let chunk =
                                 StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
-                            // On send failure the chunk is dropped here, releasing
-                            // its reservation via Drop — no manual release needed.
-                            if read_tx.send(chunk).await.is_err() {
-                                break;
+                            // Bounded send (chunk drops on the stop branch or send
+                            // failure, releasing its reservation via Drop — no
+                            // manual release needed).
+                            let _probe_send = await_probe::enter(&await_probe::BRIDGE_SEND);
+                            tokio::select! {
+                                sent = read_tx.send(chunk) => {
+                                    if sent.is_err() {
+                                        break;
+                                    }
+                                }
+                                code = &mut stop_rx => {
+                                    if let Ok(c) = code {
+                                        recv_stream.stop(c);
+                                    }
+                                    break;
+                                }
                             }
                         }
                         Ok(None) => break,
@@ -2098,6 +2304,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
         let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
         let mut stop_rx = stop_rx;
         loop {
+            let _probe_select = await_probe::enter(&await_probe::BRIDGE_SELECT);
             tokio::select! {
                 res = recv_stream.read(&mut buf) => {
                     match res {
@@ -2116,49 +2323,53 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                     }
                                     break;
                                 }
-                                // Lossless backpressure: if the byte budget is
-                                // momentarily full (slow consumer), park until a
-                                // read() releases capacity rather than resetting
-                                // the stream. While parked we stop pulling from
-                                // quinn, so QUIC flow control pushes back on the
-                                // sender — no data is dropped. `stop_rx` still
-                                // aborts promptly. On loop exit the budget is
-                                // reserved exactly once.
-                                let mut abort_stop: Option<Option<u32>> = None;
-                                while !b.try_reserve(sz) {
-                                    // Register the wakeup BEFORE re-checking so a
-                                    // release() between the failed try_reserve and
-                                    // the await cannot be lost.
-                                    let notified = b.capacity_notify.notified();
-                                    tokio::pin!(notified);
-                                    if b.try_reserve(sz) {
+                                // Bounded backpressure park: if the byte budget is
+                                // momentarily full (slow consumer), wait for a
+                                // read() to release capacity — QUIC flow control
+                                // pushes back on the sender meanwhile — but give up
+                                // after backpressure_timeout_ms: an abandoned
+                                // reader frees no capacity, and an unbounded park
+                                // pinned the handle and this bridge forever.
+                                // `stop_rx` still aborts promptly. On the Reserved
+                                // arm the budget is reserved exactly once.
+                                match reserve_for_recv(b, sz, &mut stop_rx).await {
+                                    RecvReserveOutcome::Reserved => {}
+                                    RecvReserveOutcome::TimedOut => {
+                                        recv_stream.stop(0);
+                                        if let Ok(mut g) = read_error_slot_clone.lock() {
+                                            if g.is_none() {
+                                                *g = Some(
+                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                );
+                                            }
+                                        }
                                         break;
                                     }
-                                    tokio::select! {
-                                        _ = &mut notified => {}
-                                        // Periodic re-check: shared session/global
-                                        // budget freed by a sibling stream notifies
-                                        // its own notifier, not ours, so poll to
-                                        // avoid an indefinite stall (stays lossless).
-                                        _ = tokio::time::sleep(BUDGET_POLL_INTERVAL) => {}
-                                        code = &mut stop_rx => {
-                                            abort_stop = Some(code.ok());
-                                            break;
+                                    RecvReserveOutcome::Stopped(code) => {
+                                        if let Some(c) = code {
+                                            recv_stream.stop(c);
                                         }
+                                        break;
                                     }
                                 }
-                                if let Some(stop_code) = abort_stop {
-                                    if let Some(c) = stop_code {
+                            }
+                            let chunk = StreamChunk::new(buf[..n].to_vec(), budget.clone(), sz);
+                            // Bounded send (chunk drops on the stop branch or send
+                            // failure, releasing its reservation via Drop — no
+                            // manual release needed).
+                            let _probe_send = await_probe::enter(&await_probe::BRIDGE_SEND);
+                            tokio::select! {
+                                sent = read_tx.send(chunk) => {
+                                    if sent.is_err() {
+                                        break;
+                                    }
+                                }
+                                code = &mut stop_rx => {
+                                    if let Ok(c) = code {
                                         recv_stream.stop(c);
                                     }
                                     break;
                                 }
-                            }
-                            let chunk = StreamChunk::new(buf[..n].to_vec(), budget.clone(), sz);
-                            // On send failure the chunk is dropped here, releasing
-                            // its reservation via Drop — no manual release needed.
-                            if read_tx.send(chunk).await.is_err() {
-                                break;
                             }
                         }
                         Ok(None) => break,

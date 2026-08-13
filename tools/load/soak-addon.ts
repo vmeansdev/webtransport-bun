@@ -29,6 +29,7 @@ import { basename, extname, join, resolve } from "node:path";
 import { $ } from "bun";
 
 import {
+	__TESTING__,
 	createServer,
 	DEFAULT_LIMITS,
 	releaseNativeMemory,
@@ -2675,6 +2676,11 @@ async function maybeProtectedDump(): Promise<void> {
 		}
 		histo[key] = (histo[key] ?? 0) + 1;
 	}
+	const probe = (
+		__TESTING__ as unknown as {
+			nativeAwaitProbeSnapshotForTests?: () => Record<string, number>;
+		}
+	).nativeAwaitProbeSnapshotForTests?.();
 	console.log(
 		"soak-addon: PROTECTED_DUMP",
 		JSON.stringify(
@@ -2682,6 +2688,7 @@ async function maybeProtectedDump(): Promise<void> {
 				postGcTopTypes: top,
 				protectedCount: prot.length,
 				protectedHisto: Object.entries(histo).sort((a, b) => b[1] - a[1]),
+				awaitProbe: probe ?? "unavailable",
 			},
 			null,
 			1,

@@ -98,6 +98,8 @@ import {
 	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
 	extractStreamErrorCode,
+	unwrapNativeValue,
+	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
 import type {
@@ -1075,26 +1077,28 @@ type NativeClientSessionEvent = {
 };
 type NativeBidiStreamHandle = {
 	readonly id: number;
-	read(): Promise<Uint8Array | null>;
-	write(chunk: Buffer | Uint8Array): Promise<void>;
-	finish(): Promise<void> | void;
-	finishWait?: () => Promise<void> | void;
+	// Never-reject sentinels: string results are error codes (see
+	// unwrapNativeValue) — rejected async napi calls leak handle refs.
+	read(): Promise<Uint8Array | string | null>;
+	write(chunk: Buffer | Uint8Array): Promise<string | null>;
+	finish(): Promise<string | null> | void;
+	finishWait?: () => Promise<string | null> | void;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
 };
 type NativeSendStreamHandle = {
 	readonly id: number;
-	write(chunk: Buffer | Uint8Array): Promise<void>;
-	finish?: () => Promise<void> | void;
-	finishWait?: () => Promise<void> | void;
+	write(chunk: Buffer | Uint8Array): Promise<string | null>;
+	finish?: () => Promise<string | null> | void;
+	finishWait?: () => Promise<string | null> | void;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
 };
 type NativeRecvStreamHandle = {
 	readonly id: number;
-	read(): Promise<Uint8Array | null>;
+	read(): Promise<Uint8Array | string | null>;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
@@ -1104,7 +1108,7 @@ interface NativeSessionHandle {
 	peerIp: string;
 	peerPort: number;
 	close(code: number | null, reason: string | null): void;
-	sendDatagram(data: Buffer | Uint8Array): Promise<void>;
+	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
 	readDatagram(): Promise<Uint8Array | null>;
 	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
 	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
@@ -1112,8 +1116,8 @@ interface NativeSessionHandle {
 	discardUniStreams?: (timeoutMs?: number) => Promise<number | null>;
 	enableBidiDiscard?: () => void;
 	enableUniDiscard?: () => void;
-	createBidiStream(): Promise<NativeBidiStreamHandle>;
-	createUniStream(): Promise<NativeSendStreamHandle>;
+	createBidiStream(): Promise<NativeBidiStreamHandle | string>;
+	createUniStream(): Promise<NativeSendStreamHandle | string>;
 	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
 	waitUniCapacity?: (remainingMs: number) => Promise<void>;
 	acceptBidiStream(): Promise<NativeBidiStreamHandle | null>;
@@ -1195,6 +1199,9 @@ interface NativeAddon {
 		uniSendHandlesLive: number;
 		uniRecvHandlesLive: number;
 	};
+	/** Leak-forensics: futures currently parked per instrumented await
+	 * (absent on older prebuilt addons). Diagnostic only. */
+	nativeAwaitProbeSnapshot?: () => Record<string, number>;
 	/** Force-return freed native allocator memory to the OS (absent on older prebuilt addons). */
 	releaseNativeMemory?: () => boolean;
 	/** 0-RTT vault (absent on older prebuilt addons). */
@@ -1396,7 +1403,7 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-			await this.#nativeHandle.sendDatagram(buf);
+			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err);
 		}
@@ -1516,7 +1523,7 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createBidiStream(),
+				() => this.#nativeHandle.createBidiStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
@@ -1549,7 +1556,7 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createUniStream(),
+				() => this.#nativeHandle.createUniStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
@@ -1951,7 +1958,7 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-			await this.#nativeHandle.sendDatagram(buf);
+			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
@@ -1983,7 +1990,7 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createBidiStream(),
+				() => this.#nativeHandle.createBidiStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
@@ -2023,7 +2030,7 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createUniStream(),
+				() => this.#nativeHandle.createUniStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
@@ -3361,7 +3368,7 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = await current.read();
+			const chunk = unwrapNativeValue(await current.read());
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.readableDone = true;
@@ -3393,7 +3400,7 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		}
 		try {
-			await current.write(Buffer.from(chunk));
+			unwrapNativeVoid(await current.write(Buffer.from(chunk)));
 		} catch (err) {
 			this.writableDone = true;
 			try {
@@ -3413,7 +3420,7 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 		}
 		try {
 			const finish = current.finishWait ?? current.finish;
-			if (finish) await finish.call(current);
+			if (finish) unwrapNativeVoid((await finish.call(current)) ?? null);
 			this.writableDone = true;
 			this.maybeRelease();
 		} catch (err) {
@@ -3545,7 +3552,7 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = await current.read();
+			const chunk = unwrapNativeValue(await current.read());
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.release(false);
@@ -3912,6 +3919,7 @@ export const __TESTING__ = {
 	connectWithNativeForTests: connectWithNative,
 	nativeStreamHandlesSnapshotForTests: () =>
 		native?.nativeStreamHandlesSnapshot?.(),
+	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
 };

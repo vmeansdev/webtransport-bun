@@ -398,6 +398,16 @@ pub fn set_panic_log_verbose(enabled: bool) {
 /// bounded to 500 ms; an idle runtime cannot hang the caller). Intended for
 /// long-lived servers after load spikes and for the release memory evidence
 /// after drain + GC; it is never required for correctness.
+/// Leak-forensics: how many futures are currently parked inside each
+/// instrumented await (see client_stream::await_probe). Diagnostic only.
+#[napi]
+pub fn native_await_probe_snapshot() -> std::collections::HashMap<String, i64> {
+    client_stream::await_probe::snapshot()
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+}
+
 #[napi]
 pub fn release_native_memory() -> bool {
     panic_guard::catch_panic(|| {
