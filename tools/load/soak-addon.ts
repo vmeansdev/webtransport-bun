@@ -2619,6 +2619,7 @@ async function runSegment(): Promise<void> {
 				2,
 			),
 		);
+		await maybeProtectedDump();
 		process.exit(1);
 	}
 
@@ -2639,11 +2640,53 @@ async function runSegment(): Promise<void> {
 	);
 
 	initialTls?.cleanup();
+	await maybeProtectedDump();
 	// Explicit exit: the accept loops keep one pending read (plus the
 	// idle-retry timer) alive per session by design, so the event loop no
 	// longer drains on its own once the verdict is written. Relying on
 	// natural drain hung the process indefinitely after printing PASS.
 	process.exit(0);
+}
+
+/** Local forensics only (SOAK_PROTECTED_DUMP=1): post-teardown double full
+ * GC, then dump surviving heap types and what native refs still root. */
+async function maybeProtectedDump(): Promise<void> {
+	if (process.env.SOAK_PROTECTED_DUMP !== "1") return;
+	Bun.gc(true);
+	await new Promise((r) => setTimeout(r, 2000));
+	Bun.gc(true);
+	const jsc = require("bun:jsc");
+	const counts = jsc.heapStats().objectTypeCounts as Record<string, number>;
+	const top = Object.entries(counts)
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, 15);
+	const prot = jsc.getProtectedObjects() as unknown[];
+	const histo: Record<string, number> = {};
+	for (const o of prot) {
+		let key: string;
+		try {
+			key =
+				o !== null && (typeof o === "object" || typeof o === "function")
+					? ((o as { constructor?: { name?: string } })?.constructor?.name ??
+						"<anon>")
+					: typeof o;
+		} catch {
+			key = "<unprintable>";
+		}
+		histo[key] = (histo[key] ?? 0) + 1;
+	}
+	console.log(
+		"soak-addon: PROTECTED_DUMP",
+		JSON.stringify(
+			{
+				postGcTopTypes: top,
+				protectedCount: prot.length,
+				protectedHisto: Object.entries(histo).sort((a, b) => b[1] - a[1]),
+			},
+			null,
+			1,
+		),
+	);
 }
 
 export function aggregateFromDisk(paths: string[]): AggregateSummary {
