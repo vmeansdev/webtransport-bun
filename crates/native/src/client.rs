@@ -7,9 +7,9 @@ use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify};
 
 /// Per-client-session atomic metrics.
 #[derive(Default)]
@@ -110,12 +110,13 @@ fn remove_client_registry_entry(handle_id: &str) -> RegistryMutation<Option<Clie
 
 fn finalize_client_terminal_state(
     handle_id: &str,
-    closed_flag: &Arc<std::sync::atomic::AtomicBool>,
+    closed_flag: &AtomicBool,
+    lifecycle_notify: &Notify,
     close_code: Option<u32>,
     close_reason: Option<String>,
     on_closed: Option<&ThreadsafeFunction<ClientSessionClosed, ErrorStrategy::Fatal>>,
 ) {
-    closed_flag.store(true, Ordering::Relaxed);
+    mark_client_closed_and_notify(closed_flag, lifecycle_notify);
     let removal = remove_client_registry_entry(handle_id);
     if removal.poison_recovered {
         report_client_registry_recovery("finalize", handle_id);
@@ -194,6 +195,326 @@ fn try_reserve_client_queued_bytes(metrics: &ClientMetrics, budget_bytes: u64, n
                 .and_then(|next| (next <= budget_bytes).then_some(next))
         })
         .is_ok()
+}
+
+/// Slots in the client's receive datagram channel. Named because the batch
+/// path's capacity conservation is asserted against it: a held batch must
+/// release exactly its own slots back to the forwarder and no more.
+pub(crate) const CLIENT_DATAGRAM_RECV_CAPACITY: usize = 256;
+
+/// Largest batch one client delivery call may carry. Matches the server cap:
+/// the N-API round-trip win is flat well before here, and a larger cap only
+/// widens the window in which dequeued payloads sit outside the byte
+/// reservation.
+const CLIENT_DATAGRAM_BATCH_MAX: u32 = 256;
+
+/// How long the terminal task waits for the receive forwarder to signal exit
+/// before running its final drain anyway. With the forwarder's interruptible
+/// enqueue, a live forwarder always exits well inside this; expiry therefore
+/// means the task panicked or was killed by panic containment, and a dead
+/// forwarder cannot charge. This is panic insurance, not the mechanism.
+const FORWARDER_EXIT_WAIT: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+
+/// Clamp a caller-supplied batch size into range. Out-of-range values are
+/// corrected silently: a rejected async N-API call leaks its self-reference
+/// under Bun, so user input must never become an `Err`.
+fn clamp_client_batch_max(max: u32) -> usize {
+    max.clamp(1, CLIENT_DATAGRAM_BATCH_MAX) as usize
+}
+
+/// Store the sticky close flag and wake every parked datagram reader and the
+/// receive forwarder. The `Release` store is paired with the `Acquire` loads
+/// in the read routine and the forwarder, so a waker that observes the flag
+/// also observes everything that led to the close.
+fn mark_client_closed_and_notify(closed: &AtomicBool, lifecycle_notify: &Notify) {
+    closed.store(true, Ordering::Release);
+    lifecycle_notify.notify_waiters();
+}
+
+/// Drop every datagram still queued and give its reserved bytes back.
+///
+/// The receive reservation is charged at enqueue and refunded on reader take;
+/// there is no `DatagramSlot` whose `Drop` could refund a discarded one, so a
+/// dropped datagram would otherwise strand its bytes in `queued_bytes` on a
+/// live handle. Holding the receiver mutex is what makes this safe to call
+/// from several places: each item is removable exactly once by exactly one
+/// holder, and the remover is the refunder, so a double refund is
+/// structurally impossible.
+fn drain_and_refund_queued_datagrams(
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    metrics: &ClientMetrics,
+) -> usize {
+    let mut drained = 0;
+    while let Ok(bytes) = rx.try_recv() {
+        metrics
+            .queued_bytes
+            .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+        drained += 1;
+    }
+    drained
+}
+
+async fn lock_drain_and_refund(
+    rx: &TokioMutex<mpsc::Receiver<Vec<u8>>>,
+    metrics: &ClientMetrics,
+) -> usize {
+    let mut guard = rx.lock().await;
+    drain_and_refund_queued_datagrams(&mut guard, metrics)
+}
+
+/// Outcome of waiting for the first datagram of a batch.
+enum FirstDatagram {
+    Item(Vec<u8>),
+    /// The session closed. Whatever is still queued is dropped, not drained.
+    Closed,
+    /// Every sender is gone and nothing is left.
+    Disconnected,
+}
+
+/// Wait for one datagram, waking on session close rather than only on the
+/// senders being dropped.
+///
+/// An already-queued datagram is returned without touching the `Notify` at
+/// all: registering a waiter costs two waiter-list lock acquisitions, which
+/// the batch path amortizes over up to 256 payloads but the max=1 lane would
+/// pay per datagram. The sticky flag is still read first, so a read entered
+/// after a close reports EOF instead of draining the remainder.
+///
+/// Once the queue is empty the registration order matters: the `Notified` is
+/// created and `enable()`d before the sticky flag is re-read, so a close
+/// landing in that window is still delivered as a wake (tokio's `Notify`
+/// stores no permit for a future that has not registered). The select is
+/// `biased` so a close racing a queued datagram wins deterministically rather
+/// than by coin flip.
+async fn recv_first_datagram(
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    closed: &AtomicBool,
+    lifecycle_notify: &Notify,
+) -> FirstDatagram {
+    if closed.load(Ordering::Acquire) {
+        return FirstDatagram::Closed;
+    }
+    match rx.try_recv() {
+        Ok(bytes) => return FirstDatagram::Item(bytes),
+        Err(mpsc::error::TryRecvError::Disconnected) => return FirstDatagram::Disconnected,
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+
+    loop {
+        let notified = lifecycle_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if closed.load(Ordering::Acquire) {
+            return FirstDatagram::Closed;
+        }
+        tokio::select! {
+            biased;
+            // A spurious wake loops and rechecks; only the sticky flag ends
+            // the wait.
+            _ = notified => {}
+            received = rx.recv() => {
+                return match received {
+                    Some(bytes) => FirstDatagram::Item(bytes),
+                    None => FirstDatagram::Disconnected,
+                };
+            }
+        }
+    }
+}
+
+/// Everything a datagram read needs, cloned out of the handle so a parked read
+/// never holds an exclusive napi borrow of it.
+#[derive(Clone)]
+pub(crate) struct ClientDatagramReadState {
+    rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    metrics: Arc<ClientMetrics>,
+    closed: Arc<AtomicBool>,
+    lifecycle_notify: Arc<Notify>,
+}
+
+impl ClientDatagramReadState {
+    /// Read up to `max` datagrams with one blocking wait: park for the first,
+    /// then take whatever else is already queued. Never yields an empty batch —
+    /// the result is a non-empty batch or `None` for EOF/close.
+    pub(crate) async fn read_batch(&self, max: u32) -> Option<Vec<Vec<u8>>> {
+        let cap = clamp_client_batch_max(max);
+        let mut rx = self.rx.lock().await;
+
+        let first = match recv_first_datagram(&mut rx, &self.closed, &self.lifecycle_notify).await {
+            FirstDatagram::Item(bytes) => bytes,
+            FirstDatagram::Closed => {
+                // Reader-owned drain: still holding the guard, so nothing can
+                // slip between observing the close and settling the bytes.
+                drain_and_refund_queued_datagrams(&mut rx, &self.metrics);
+                return None;
+            }
+            FirstDatagram::Disconnected => return None,
+        };
+
+        let mut batch = Vec::with_capacity(cap);
+        self.refund(&first);
+        batch.push(first);
+        while batch.len() < cap {
+            let Ok(bytes) = rx.try_recv() else {
+                break;
+            };
+            self.refund(&bytes);
+            batch.push(bytes);
+        }
+        Some(batch)
+    }
+
+    /// The legacy single-datagram lane, expressed as the max=1 extraction over
+    /// the same routine so both lanes share one close and accounting path.
+    pub(crate) async fn read_one(&self) -> Option<Vec<u8>> {
+        self.read_batch(1).await?.into_iter().next()
+    }
+
+    fn refund(&self, bytes: &[u8]) {
+        self.metrics
+            .queued_bytes
+            .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Signals that the receive forwarder's body has finished.
+///
+/// `spawn_quic_task_scoped` consumes the `JoinHandle` inside its watchdog, so
+/// there is no handle to await and swapping in a bare `tokio::spawn` would
+/// lose `PanicScope::Conn` containment. A guard held for the whole body fires
+/// on normal exit *and* on panic unwind, which is what makes the terminal
+/// task's wait panic-safe.
+struct ForwarderDoneGuard(Option<oneshot::Sender<()>>);
+
+impl ForwarderDoneGuard {
+    fn new() -> (Self, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (Self(Some(tx)), rx)
+    }
+}
+
+impl Drop for ForwarderDoneGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Move received datagrams onto the handle's receive channel, charging their
+/// bytes at enqueue and refunding anything charged but not handed over.
+///
+/// `next_datagram` yields wire payloads until the connection ends. Two
+/// properties make close teardown bounded:
+///
+/// * the sticky flag is checked with `Acquire` before each charge, which
+///   shrinks — but does not close — the window in which a charge lands after a
+///   drain, because check → charge → send straddles an `.await`;
+/// * the enqueue is interruptible. A full channel is an ordinary backpressure
+///   state (256 slots x ~1150 B fills long before the per-session byte budget
+///   binds) and closing the QUIC connection neither frees a slot nor drops the
+///   receiver, so an uninterruptible `send().await` would park forever and
+///   deadlock the terminal task's wait against the only task that can free a
+///   slot.
+///
+/// On exit the forwarder takes the receiver mutex and drains once itself.
+/// That runs in its own task strictly after its last possible charge, so it
+/// settles the residual case of a descheduled-but-live forwarder charging
+/// after the terminal task's final drain. Drains are idempotent under the
+/// mutex, so this strengthens rather than replaces the terminal sequence.
+async fn run_client_datagram_forwarder<S, F>(
+    mut next_datagram: S,
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    metrics: Arc<ClientMetrics>,
+    budget_bytes: u64,
+    closed: Arc<AtomicBool>,
+    lifecycle_notify: Arc<Notify>,
+) where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    loop {
+        let Some(bytes) = next_datagram().await else {
+            break;
+        };
+        if closed.load(Ordering::Acquire) {
+            break;
+        }
+        let sz = bytes.len() as u64;
+        if !try_reserve_client_queued_bytes(&metrics, budget_bytes, sz) {
+            continue;
+        }
+        metrics.datagrams_in.fetch_add(1, Ordering::Relaxed);
+
+        let notified = lifecycle_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if closed.load(Ordering::Acquire) {
+            metrics.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
+            break;
+        }
+        let handed_over = tokio::select! {
+            biased;
+            // `Sender::send` is cancel-safe: a cancelled send delivers
+            // nothing, so refunding here cannot double-count.
+            _ = notified => false,
+            result = tx.send(bytes) => result.is_ok(),
+        };
+        if !handed_over {
+            metrics.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
+            break;
+        }
+    }
+
+    // Release the last sender before contending for the receiver mutex. On an
+    // ordinary end-of-connection exit there is no close to wake a parked
+    // reader, and that reader holds the mutex; the disconnect is what lets it
+    // finish so this drain can run.
+    drop(tx);
+    lock_drain_and_refund(&rx, &metrics).await;
+}
+
+/// Settle every receive-side byte after a session ends, in the one order that
+/// leaves no charge outstanding.
+///
+/// 1. Store the sticky flag and fire the lifecycle notify, so parked readers
+///    return EOF and a send-parked forwarder unparks.
+/// 2. Drain immediately. This is the primary deadlock breaker: it frees
+///    channel capacity for a forwarder parked on a full channel. It must come
+///    before the wait — a `Notified` created after `notify_waiters()` has
+///    already fired receives no permit, so the notify alone is not a
+///    guaranteed unpark path.
+/// 3. `after_first_drain` runs here rather than after the wait, so the
+///    JS-visible close callback keeps its current latency even when the
+///    forwarder has panicked and the wait must time out.
+/// 4. Wait, bounded, for the forwarder to signal exit.
+/// 5. Drain again. The forwarder is the sole receive-side charger, so once it
+///    has exited no further charge or enqueue is possible and this drain is
+///    genuinely final.
+async fn settle_client_receive_accounting_after_close(
+    rx: &TokioMutex<mpsc::Receiver<Vec<u8>>>,
+    metrics: &ClientMetrics,
+    closed: &AtomicBool,
+    lifecycle_notify: &Notify,
+    forwarder_done: oneshot::Receiver<()>,
+    after_first_drain: impl FnOnce(),
+) {
+    mark_client_closed_and_notify(closed, lifecycle_notify);
+    lock_drain_and_refund(rx, metrics).await;
+    after_first_drain();
+    if tokio::time::timeout(FORWARDER_EXIT_WAIT, forwarder_done)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "webtransport-native: client receive forwarder did not signal exit within {:?}; \
+             draining anyway",
+            FORWARDER_EXIT_WAIT
+        );
+    }
+    lock_drain_and_refund(rx, metrics).await;
 }
 
 fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Limits, String> {
@@ -434,7 +755,12 @@ pub struct ClientSessionHandle {
     stream_accept_uni_tx: Option<mpsc::Sender<AcceptUniReq>>,
     close_tx: Option<Arc<watch::Sender<(u32, String)>>>,
     client_metrics: Arc<ClientMetrics>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+    closed: Arc<AtomicBool>,
+    /// Fired once, on either close origin, right after the sticky `closed`
+    /// store. Dedicated to datagram lifecycle: a shared capacity notify would
+    /// wake parked readers proportionally to send rate on the exact hot path
+    /// batching exists to relieve.
+    datagram_lifecycle_notify: Arc<Notify>,
     /// Connection handle for wire-level stats (None for detached/test handles).
     conn: Option<wtransport::Connection>,
     /// 0-RTT status for this connect (None when enable0Rtt was off).
@@ -552,18 +878,52 @@ impl ClientSessionHandle {
         }
     }
 
-    #[napi]
-    pub async fn read_datagram(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
-        let mut rx = self.dgram_recv_rx.lock().await;
-        match rx.recv().await {
-            Some(bytes) => {
-                self.client_metrics
-                    .queued_bytes
-                    .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
-                Ok(Some(bytes.into()))
-            }
-            None => Ok(None),
-        }
+    /// Read one datagram, or `null` on EOF or close.
+    ///
+    /// Spawned rather than written as `async fn(&self)` for two reasons: a
+    /// parked read must not hold an exclusive napi borrow of the handle (Bun
+    /// rejects concurrent `async fn &self` calls, so a concurrent `close()`
+    /// could not reach the direct wake path), and a rejected async napi method
+    /// leaks its self-reference under Bun, so no data, EOF, or closure may
+    /// become an `Err`.
+    #[napi(ts_return_type = "Promise<Uint8Array | null>")]
+    pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
+        let state = self.datagram_read_state();
+        env.spawn_future(async move {
+            CLIENT_RUNTIME
+                .spawn(async move {
+                    Ok(state
+                        .read_one()
+                        .await
+                        .map(crate::payload_buffer::PayloadBuffer::from))
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
+    }
+
+    /// Read up to `max` datagrams with a single delivery call.
+    ///
+    /// Blocks for the first datagram, then takes whatever else is already
+    /// queued, which amortizes the N-API round trip across the batch. `max` is
+    /// clamped into 1..=256 silently, and a closed session or a closed queue
+    /// resolves `null` — never a rejection and never an empty array.
+    #[napi(ts_return_type = "Promise<Uint8Array[] | null>")]
+    pub fn read_datagram_batch(&self, env: Env, max: u32) -> Result<JsObject> {
+        let state = self.datagram_read_state();
+        env.spawn_future(async move {
+            CLIENT_RUNTIME
+                .spawn(async move {
+                    Ok(state.read_batch(max).await.map(|batch| {
+                        batch
+                            .into_iter()
+                            .map(crate::payload_buffer::PayloadBuffer::from)
+                            .collect::<Vec<_>>()
+                    }))
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
+        })
     }
 
     #[napi]
@@ -707,8 +1067,23 @@ impl ClientSessionHandle {
 }
 
 impl ClientSessionHandle {
+    /// Clone everything a read needs out of the handle, so the wait itself
+    /// borrows nothing from it.
+    pub(crate) fn datagram_read_state(&self) -> ClientDatagramReadState {
+        ClientDatagramReadState {
+            rx: Arc::clone(&self.dgram_recv_rx),
+            metrics: Arc::clone(&self.client_metrics),
+            closed: Arc::clone(&self.closed),
+            lifecycle_notify: Arc::clone(&self.datagram_lifecycle_notify),
+        }
+    }
+
+    /// Synchronous by necessity — it is called from napi entrypoints and from
+    /// callback-failure cleanup, neither of which can await. It therefore only
+    /// stores the flag and wakes; the byte drain belongs to the reader and to
+    /// the terminal task, which can.
     fn initiate_close(&self, code: u32, reason: String) {
-        self.closed.store(true, Ordering::Relaxed);
+        mark_client_closed_and_notify(&self.closed, &self.datagram_lifecycle_notify);
         if let Some(ref tx) = self.close_tx {
             if tx.send((code, reason.clone())).is_err() {
                 crate::report_channel_closed("client close signal");
@@ -732,14 +1107,17 @@ impl ClientSessionHandle {
         zero_rtt: Option<crate::zero_rtt::ZeroRttHandleState>,
     ) -> Self {
         let (dgram_send_tx, mut dgram_send_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (dgram_recv_tx, dgram_recv_rx) =
+            mpsc::channel::<Vec<u8>>(CLIENT_DATAGRAM_RECV_CAPACITY);
+        let dgram_recv_rx = Arc::new(TokioMutex::new(dgram_recv_rx));
         let (open_bi_tx, mut open_bi_rx) = mpsc::channel::<OpenBiReq>(8);
         let (open_uni_tx, mut open_uni_rx) = mpsc::channel::<OpenUniReq>(8);
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel::<AcceptBiReq>(8);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel::<AcceptUniReq>(8);
         let (close_tx, mut close_rx) = watch::channel((0u32, String::new()));
         let cm = Arc::new(ClientMetrics::default());
-        let closed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_flag = Arc::new(AtomicBool::new(false));
+        let lifecycle_notify = Arc::new(Notify::new());
 
         let budget_metrics = Arc::new(ServerMetrics::default());
         let session_metrics = Arc::new(SessionMetrics::default());
@@ -753,7 +1131,7 @@ impl ClientSessionHandle {
             peer_ip: peer_ip.clone(),
             peer_port,
             dgram_send_tx: Some(dgram_send_tx.clone()),
-            dgram_recv_rx: Arc::new(TokioMutex::new(dgram_recv_rx)),
+            dgram_recv_rx: Arc::clone(&dgram_recv_rx),
             datagram_budget_bytes,
             backpressure_timeout_ms,
             max_datagram_size: limits.max_datagram_size,
@@ -764,6 +1142,7 @@ impl ClientSessionHandle {
             close_tx: Some(Arc::new(close_tx)),
             client_metrics: Arc::clone(&cm),
             closed: Arc::clone(&closed_flag),
+            datagram_lifecycle_notify: Arc::clone(&lifecycle_notify),
             conn: Some(conn.clone()),
             zero_rtt,
         };
@@ -819,18 +1198,29 @@ impl ClientSessionHandle {
 
             let cm_recv = Arc::clone(&cm);
             let recv_budget_bytes = datagram_budget_bytes;
+            let recv_rx = Arc::clone(&dgram_recv_rx);
+            let recv_closed = Arc::clone(&closed_flag);
+            let recv_notify = Arc::clone(&lifecycle_notify);
+            let (forwarder_done, forwarder_exited) = ForwarderDoneGuard::new();
             crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
-                while let Ok(dgram) = conn_dgram_recv.receive_datagram().await {
-                    let sz = dgram.len() as u64;
-                    if !try_reserve_client_queued_bytes(&cm_recv, recv_budget_bytes, sz) {
-                        continue;
-                    }
-                    cm_recv.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                    if dgram_recv_tx.send(dgram.as_ref().to_vec()).await.is_err() {
-                        cm_recv.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
-                        break;
-                    }
-                }
+                let _done = forwarder_done;
+                let source = &conn_dgram_recv;
+                run_client_datagram_forwarder(
+                    move || async move {
+                        source
+                            .receive_datagram()
+                            .await
+                            .ok()
+                            .map(|dgram| dgram.as_ref().to_vec())
+                    },
+                    dgram_recv_tx,
+                    recv_rx,
+                    cm_recv,
+                    recv_budget_bytes,
+                    recv_closed,
+                    recv_notify,
+                )
+                .await;
             });
 
             let cm_bi = Arc::clone(&cm);
@@ -985,13 +1375,24 @@ impl ClientSessionHandle {
                     (Some(code), Some(reason))
                 }
             };
-            finalize_client_terminal_state(
-                &id,
+            settle_client_receive_accounting_after_close(
+                &dgram_recv_rx,
+                &cm,
                 &closed_flag,
-                close_code,
-                close_reason,
-                on_closed.as_ref(),
-            );
+                &lifecycle_notify,
+                forwarder_exited,
+                || {
+                    finalize_client_terminal_state(
+                        &id,
+                        &closed_flag,
+                        &lifecycle_notify,
+                        close_code,
+                        close_reason,
+                        on_closed.as_ref(),
+                    );
+                },
+            )
+            .await;
         });
 
         handle
@@ -1729,16 +2130,144 @@ async fn run_connect_0rtt(
 mod tests {
     use super::{
         build_client_tls_config, build_quic_transport_config, build_root_cert_store,
-        congestion_controller_label, handle_connect_callback_status, insert_registry_entry,
-        parse_client_limits, parse_congestion_control, parse_qpack_max_table_capacity,
-        remove_registry_entry, ClientMetrics, ClientSessionHandle, CongestionControlMode,
-        CLIENT_HANDLE_REGISTRY, MAX_QPACK_TABLE_CAPACITY, QPACK_DYNAMIC_PRESET_CAPACITY,
+        clamp_client_batch_max, congestion_controller_label, handle_connect_callback_status,
+        insert_registry_entry, mark_client_closed_and_notify, parse_client_limits,
+        parse_congestion_control, parse_qpack_max_table_capacity, remove_registry_entry,
+        run_client_datagram_forwarder, settle_client_receive_accounting_after_close,
+        try_reserve_client_queued_bytes, ClientDatagramReadState, ClientMetrics,
+        ClientSessionHandle, CongestionControlMode, ForwarderDoneGuard, CLIENT_DATAGRAM_BATCH_MAX,
+        CLIENT_DATAGRAM_RECV_CAPACITY, CLIENT_HANDLE_REGISTRY, MAX_QPACK_TABLE_CAPACITY,
+        QPACK_DYNAMIC_PRESET_CAPACITY,
     };
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
+    use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Notify};
+    use tokio::time::{timeout, Duration};
+
+    /// Every wait in these tests is bounded; a hang is a failure, not a stall.
+    const BOUND: Duration = Duration::from_secs(1);
+    /// Comfortably past the terminal task's own 1s forwarder wait, so a test
+    /// that exercises the full teardown sequence still fails rather than hangs.
+    const TEARDOWN_BOUND: Duration = Duration::from_secs(5);
+    const PAYLOAD: usize = 8;
+
+    /// A detached handle plus the plumbing a datagram test needs. Handles built
+    /// here have `conn: None`, so `initiate_close` exercises exactly the local
+    /// close origin: sticky flag, lifecycle notify, close watch.
+    struct DatagramTestHarness {
+        handle: ClientSessionHandle,
+        /// `Option` so a test can drop every sender and turn the empty queue
+        /// into a genuine EOF.
+        dgram_recv_tx: Option<mpsc::Sender<Vec<u8>>>,
+        rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+        metrics: Arc<ClientMetrics>,
+        closed: Arc<AtomicBool>,
+        lifecycle_notify: Arc<Notify>,
+        budget_bytes: u64,
+        _close_rx: watch::Receiver<(u32, String)>,
+    }
+
+    impl DatagramTestHarness {
+        fn new(id: &str, recv_capacity: usize, budget_bytes: u64) -> Self {
+            let (dgram_send_tx, _dgram_send_rx) = mpsc::channel::<Vec<u8>>(recv_capacity);
+            let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(recv_capacity);
+            let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
+            let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
+            let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
+            let (accept_uni_tx, _accept_uni_rx) = mpsc::channel(1);
+            let (close_tx, close_rx) = watch::channel((0u32, String::new()));
+            let rx = Arc::new(TokioMutex::new(dgram_recv_rx));
+            let metrics = Arc::new(ClientMetrics::default());
+            let closed = Arc::new(AtomicBool::new(false));
+            let lifecycle_notify = Arc::new(Notify::new());
+            let handle = ClientSessionHandle {
+                id: id.to_string(),
+                peer_ip: "127.0.0.1".to_string(),
+                peer_port: 4433,
+                dgram_send_tx: Some(dgram_send_tx),
+                dgram_recv_rx: Arc::clone(&rx),
+                datagram_budget_bytes: budget_bytes,
+                backpressure_timeout_ms: 50,
+                max_datagram_size: 1200,
+                stream_open_bi_tx: Some(open_bi_tx),
+                stream_open_uni_tx: Some(open_uni_tx),
+                stream_accept_bi_tx: Some(accept_bi_tx),
+                stream_accept_uni_tx: Some(accept_uni_tx),
+                close_tx: Some(Arc::new(close_tx)),
+                client_metrics: Arc::clone(&metrics),
+                closed: Arc::clone(&closed),
+                datagram_lifecycle_notify: Arc::clone(&lifecycle_notify),
+                conn: None,
+                zero_rtt: None,
+            };
+            Self {
+                handle,
+                dgram_recv_tx: Some(dgram_recv_tx),
+                rx,
+                metrics,
+                closed,
+                lifecycle_notify,
+                budget_bytes,
+                _close_rx: close_rx,
+            }
+        }
+
+        fn read_state(&self) -> ClientDatagramReadState {
+            self.handle.datagram_read_state()
+        }
+
+        fn sender(&self) -> &mpsc::Sender<Vec<u8>> {
+            self.dgram_recv_tx.as_ref().expect("sender still held")
+        }
+
+        /// Drop every sender, which is what makes an empty queue report EOF.
+        fn close_senders(&mut self) {
+            self.dgram_recv_tx = None;
+        }
+
+        fn queued_bytes(&self) -> u64 {
+            self.metrics.queued_bytes.load(Ordering::Relaxed)
+        }
+
+        /// Enqueue exactly as the forwarder does: charge, then hand over.
+        fn charge_and_enqueue(&self, bytes: Vec<u8>) {
+            assert!(
+                try_reserve_client_queued_bytes(
+                    &self.metrics,
+                    self.budget_bytes,
+                    bytes.len() as u64
+                ),
+                "test budget too small to charge {} bytes",
+                bytes.len()
+            );
+            self.sender()
+                .try_send(bytes)
+                .expect("test receive channel had a free slot");
+        }
+
+        /// `queued_bytes` is one counter shared with the send direction, so
+        /// settle assertions poll within a bound rather than reading once.
+        async fn assert_queued_bytes_settles_to(&self, expected: u64) {
+            let deadline = tokio::time::Instant::now() + BOUND;
+            loop {
+                let observed = self.queued_bytes();
+                if observed == expected {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "queued_bytes settled at {observed}, expected {expected}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    fn payload(tag: u8) -> Vec<u8> {
+        vec![tag; PAYLOAD]
+    }
 
     // serverCertificateHashes replaces PKI chain validation, so its verifier
     // must build even when the platform root store is empty. Handshake
@@ -1906,6 +2435,7 @@ mod tests {
             close_tx: Some(Arc::new(close_tx)),
             client_metrics: Arc::new(ClientMetrics::default()),
             closed: Arc::clone(&closed_flag),
+            datagram_lifecycle_notify: Arc::new(Notify::new()),
             conn: None,
             zero_rtt: None,
         };
@@ -1955,6 +2485,7 @@ mod tests {
                 close_tx: Some(Arc::new(close_tx)),
                 client_metrics: Arc::new(ClientMetrics::default()),
                 closed: Arc::new(AtomicBool::new(false)),
+                datagram_lifecycle_notify: Arc::new(Notify::new()),
                 conn: None,
                 zero_rtt: None,
             },
@@ -1971,5 +2502,593 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(remaining.get(&handle_id).is_none());
+    }
+
+    // --- batch datagram read -------------------------------------------
+
+    #[test]
+    fn batch_max_is_clamped_into_range_silently() {
+        assert_eq!(clamp_client_batch_max(0), 1);
+        assert_eq!(clamp_client_batch_max(1), 1);
+        assert_eq!(clamp_client_batch_max(64), 64);
+        assert_eq!(clamp_client_batch_max(CLIENT_DATAGRAM_BATCH_MAX), 256);
+        assert_eq!(clamp_client_batch_max(CLIENT_DATAGRAM_BATCH_MAX + 1), 256);
+        assert_eq!(clamp_client_batch_max(u32::MAX), 256);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_drains_in_order_up_to_its_cap_and_leaves_the_rest_queued() {
+        let h = DatagramTestHarness::new("batch-order", 16, 1 << 20);
+        for tag in 0..6u8 {
+            h.charge_and_enqueue(payload(tag));
+        }
+
+        let batch = timeout(BOUND, h.read_state().read_batch(4))
+            .await
+            .expect("batch read is bounded")
+            .expect("a queued batch");
+        assert_eq!(batch.len(), 4, "the cap is exact");
+        for (index, item) in batch.iter().enumerate() {
+            assert_eq!(item, &payload(index as u8), "batches keep queue order");
+        }
+        // Exactly the drained items were refunded, and only those.
+        assert_eq!(h.queued_bytes(), 2 * PAYLOAD as u64);
+
+        let rest = timeout(BOUND, h.read_state().read_batch(32))
+            .await
+            .expect("bounded")
+            .expect("the remainder");
+        assert_eq!(rest, vec![payload(4), payload(5)]);
+        assert_eq!(h.queued_bytes(), 0);
+    }
+
+    /// A batch never resolves empty: with nothing queued it parks for the first
+    /// item and returns it alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_parks_for_its_first_item_and_never_resolves_empty() {
+        let h = DatagramTestHarness::new("batch-first-item", 8, 1 << 20);
+        let state = h.read_state();
+        let parked = tokio::spawn(async move { state.read_batch(16).await });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !parked.is_finished(),
+            "an empty queue must park, not return"
+        );
+
+        h.charge_and_enqueue(payload(7));
+        let batch = timeout(BOUND, parked)
+            .await
+            .expect("bounded")
+            .expect("join")
+            .expect("one item");
+        assert_eq!(batch, vec![payload(7)]);
+        assert_eq!(h.queued_bytes(), 0);
+    }
+
+    /// Partial-then-EOF: the queued remainder is delivered as a short batch,
+    /// and only the next call reports EOF.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partial_batch_precedes_eof_when_every_sender_is_gone() {
+        let mut h = DatagramTestHarness::new("batch-partial-eof", 8, 1 << 20);
+        h.charge_and_enqueue(payload(1));
+        h.charge_and_enqueue(payload(2));
+        h.close_senders();
+
+        let batch = timeout(BOUND, h.read_state().read_batch(64))
+            .await
+            .expect("bounded")
+            .expect("the queued remainder arrives before EOF");
+        assert_eq!(batch, vec![payload(1), payload(2)]);
+        assert_eq!(h.queued_bytes(), 0);
+
+        // Only the next call reports EOF.
+        assert!(timeout(BOUND, h.read_state().read_batch(64))
+            .await
+            .expect("bounded")
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_with_no_items_resolves_null_on_both_lanes() {
+        for lane in ["batch", "single"] {
+            let mut h = DatagramTestHarness::new("batch-eof", 8, 1 << 20);
+            h.close_senders();
+            let empty = match lane {
+                "batch" => timeout(BOUND, h.read_state().read_batch(8))
+                    .await
+                    .expect("bounded")
+                    .is_none(),
+                _ => timeout(BOUND, h.read_state().read_one())
+                    .await
+                    .expect("bounded")
+                    .is_none(),
+            };
+            assert!(empty, "{lane}: EOF with nothing queued resolves null");
+        }
+    }
+
+    /// One decrement per drained item, never per call and never per byte twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_drained_item_decrements_queued_bytes_exactly_once() {
+        let h = DatagramTestHarness::new("batch-accounting", 64, 1 << 20);
+        for tag in 0..10u8 {
+            h.charge_and_enqueue(payload(tag));
+        }
+        assert_eq!(h.queued_bytes(), 10 * PAYLOAD as u64);
+
+        let batch = timeout(BOUND, h.read_state().read_batch(10))
+            .await
+            .expect("bounded")
+            .expect("ten items");
+        assert_eq!(batch.len(), 10);
+        assert_eq!(h.queued_bytes(), 0);
+
+        // A second read on an empty-but-open queue parks; it must not refund.
+        let state = h.read_state();
+        let parked = tokio::spawn(async move { state.read_batch(4).await });
+        tokio::task::yield_now().await;
+        assert_eq!(h.queued_bytes(), 0);
+        mark_client_closed_and_notify(&h.closed, &h.lifecycle_notify);
+        assert!(timeout(BOUND, parked)
+            .await
+            .expect("bounded")
+            .expect("join")
+            .is_none());
+        assert_eq!(h.queued_bytes(), 0);
+    }
+
+    /// Capacity conservation at the real channel size: a held batch releases
+    /// exactly its own slots back, and byte accounting covers only what is
+    /// actually queued natively.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_batch_releases_exactly_its_own_slots() {
+        let budget = (CLIENT_DATAGRAM_RECV_CAPACITY as u64 + 512) * PAYLOAD as u64;
+        let h = DatagramTestHarness::new("batch-capacity", CLIENT_DATAGRAM_RECV_CAPACITY, budget);
+        for _ in 0..CLIENT_DATAGRAM_RECV_CAPACITY {
+            h.charge_and_enqueue(payload(1));
+        }
+        assert!(
+            h.sender().try_send(payload(2)).is_err(),
+            "the channel is full at its named capacity"
+        );
+
+        let batch_len = 64usize;
+        let held = timeout(BOUND, h.read_state().read_batch(batch_len as u32))
+            .await
+            .expect("bounded")
+            .expect("a full batch");
+        assert_eq!(held.len(), batch_len);
+
+        for _ in 0..batch_len {
+            h.charge_and_enqueue(payload(3));
+        }
+        assert!(
+            h.sender().try_send(payload(4)).is_err(),
+            "a held batch releases its own slots and not one more"
+        );
+
+        let native_queued = CLIENT_DATAGRAM_RECV_CAPACITY;
+        assert_eq!(
+            native_queued + held.len(),
+            CLIENT_DATAGRAM_RECV_CAPACITY + batch_len,
+            "native-plus-held items"
+        );
+        assert_eq!(
+            h.queued_bytes(),
+            (native_queued * PAYLOAD) as u64,
+            "reservation covers the refilled native queue only, not the held batch"
+        );
+    }
+
+    // --- close semantics: drop-not-drain, both lanes, both origins ------
+
+    /// Documented deviation 3: a close discards what is still queued instead of
+    /// draining it first, on both lanes and from both close origins — and the
+    /// bytes those discarded datagrams reserved come back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_drops_queued_datagrams_instead_of_draining_them() {
+        for lane in ["batch", "single"] {
+            for origin in ["local", "terminal"] {
+                let h = DatagramTestHarness::new("batch-drop-not-drain", 16, 1 << 20);
+                let state = h.read_state();
+                let parked = match lane {
+                    "batch" => tokio::spawn(async move { state.read_batch(8).await }),
+                    _ => tokio::spawn(async move { state.read_one().await.map(|one| vec![one]) }),
+                };
+                tokio::task::yield_now().await;
+                assert!(
+                    !parked.is_finished(),
+                    "{lane}/{origin}: read must be parked"
+                );
+
+                // Queue three datagrams and close without letting the reader
+                // run in between, so the biased select — not scheduling luck —
+                // decides the outcome.
+                for tag in 0..3u8 {
+                    h.charge_and_enqueue(payload(tag));
+                }
+                assert_eq!(h.queued_bytes(), 3 * PAYLOAD as u64);
+                match origin {
+                    "local" => h.handle.initiate_close(0, "test".to_string()),
+                    _ => mark_client_closed_and_notify(&h.closed, &h.lifecycle_notify),
+                }
+
+                let result = timeout(BOUND, parked)
+                    .await
+                    .unwrap_or_else(|_| panic!("{lane}/{origin}: close must wake the read"))
+                    .expect("join");
+                assert!(
+                    result.is_none(),
+                    "{lane}/{origin}: a closed session reports EOF, it does not drain"
+                );
+                h.assert_queued_bytes_settles_to(0).await;
+            }
+        }
+    }
+
+    /// A read entered after the close reports EOF straight away and settles the
+    /// bytes of whatever the close left behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_entered_after_a_close_reports_eof_and_settles_the_remainder() {
+        let h = DatagramTestHarness::new("batch-post-close-read", 16, 1 << 20);
+        for tag in 0..4u8 {
+            h.charge_and_enqueue(payload(tag));
+        }
+        h.handle.initiate_close(0, "test".to_string());
+
+        assert!(timeout(BOUND, h.read_state().read_batch(8))
+            .await
+            .expect("bounded")
+            .is_none());
+        h.assert_queued_bytes_settles_to(0).await;
+    }
+
+    // --- teardown accounting -------------------------------------------
+
+    /// The terminal sequence settles the queue when no reader is attached and
+    /// none ever re-enters, and it fires the close callback along the way.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_terminal_sequence_settles_a_queue_no_reader_will_ever_take() {
+        let h = DatagramTestHarness::new("batch-terminal-drain", 16, 1 << 20);
+        for tag in 0..5u8 {
+            h.charge_and_enqueue(payload(tag));
+        }
+        let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
+        drop(done_guard); // stand-in for a forwarder that has already exited
+
+        let closed_callback = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed_callback);
+        timeout(
+            TEARDOWN_BOUND,
+            settle_client_receive_accounting_after_close(
+                &h.rx,
+                &h.metrics,
+                &h.closed,
+                &h.lifecycle_notify,
+                forwarder_exited,
+                move || flag.store(true, Ordering::Relaxed),
+            ),
+        )
+        .await
+        .expect("teardown is bounded");
+
+        assert!(
+            closed_callback.load(Ordering::Relaxed),
+            "close callback fired"
+        );
+        assert!(h.closed.load(Ordering::Acquire));
+        assert_eq!(h.queued_bytes(), 0);
+    }
+
+    /// A forwarder that never signals must not wedge teardown: the bounded wait
+    /// expires, the final drain still runs, and the callback already fired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forwarder_that_never_signals_cannot_wedge_teardown() {
+        let h = DatagramTestHarness::new("batch-terminal-timeout", 16, 1 << 20);
+        h.charge_and_enqueue(payload(1));
+        // Held for the whole test: this stands in for a forwarder that panicked
+        // in a way that never runs its guard, so the wait can only expire.
+        let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
+
+        let closed_callback = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed_callback);
+        let started = tokio::time::Instant::now();
+        timeout(
+            TEARDOWN_BOUND,
+            settle_client_receive_accounting_after_close(
+                &h.rx,
+                &h.metrics,
+                &h.closed,
+                &h.lifecycle_notify,
+                forwarder_exited,
+                move || flag.store(true, Ordering::Relaxed),
+            ),
+        )
+        .await
+        .expect("the wait is bounded, not indefinite");
+        assert!(
+            started.elapsed() >= super::FORWARDER_EXIT_WAIT,
+            "the wait really did run to its bound"
+        );
+        drop(done_guard);
+
+        assert!(closed_callback.load(Ordering::Relaxed));
+        assert_eq!(h.queued_bytes(), 0);
+    }
+
+    /// The required interleaving: the receive channel is FULL, no reader is
+    /// attached, and the forwarder is parked mid-enqueue when the session
+    /// closes. Teardown must still complete, fire the callback, and settle the
+    /// bytes. Note that this passes on either design — the first drain frees
+    /// the slot the forwarder is waiting for, so it unparks even without the
+    /// select. `the_forwarder_refunds_everything_it_charged_on_its_own_exit` is
+    /// the strict discriminator: it wedges the forwarder identically with no
+    /// terminal drain at all, and an uninterruptible send hangs it forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_unparks_a_forwarder_blocked_on_a_full_receive_channel() {
+        let capacity = CLIENT_DATAGRAM_RECV_CAPACITY;
+        let budget = (capacity as u64 + 1024) * PAYLOAD as u64;
+        let h = DatagramTestHarness::new("batch-full-channel-close", capacity, budget);
+        let wire = Arc::new(TokioMutex::new({
+            let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(capacity * 2);
+            for tag in 0..(capacity as u32 + 8) {
+                wire_tx.try_send(payload(tag as u8)).expect("wire slot");
+            }
+            drop(wire_tx);
+            wire_rx
+        }));
+
+        let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
+        let forwarder = {
+            let tx = h.sender().clone();
+            let rx = Arc::clone(&h.rx);
+            let metrics = Arc::clone(&h.metrics);
+            let closed = Arc::clone(&h.closed);
+            let notify = Arc::clone(&h.lifecycle_notify);
+            let wire = Arc::clone(&wire);
+            tokio::spawn(async move {
+                let _done = done_guard;
+                let source = &wire;
+                run_client_datagram_forwarder(
+                    move || async move { source.lock().await.recv().await },
+                    tx,
+                    rx,
+                    metrics,
+                    budget,
+                    closed,
+                    notify,
+                )
+                .await;
+            })
+        };
+
+        // Wait until the forwarder is genuinely wedged: the channel is full and
+        // it has charged the payload it cannot hand over.
+        let full_at = (capacity as u64 + 1) * PAYLOAD as u64;
+        let deadline = tokio::time::Instant::now() + TEARDOWN_BOUND;
+        while h.queued_bytes() < full_at {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "forwarder never filled the channel (queued {})",
+                h.queued_bytes()
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let closed_callback = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed_callback);
+        timeout(
+            TEARDOWN_BOUND,
+            settle_client_receive_accounting_after_close(
+                &h.rx,
+                &h.metrics,
+                &h.closed,
+                &h.lifecycle_notify,
+                forwarder_exited,
+                move || flag.store(true, Ordering::Relaxed),
+            ),
+        )
+        .await
+        .expect("teardown must not deadlock against a send-parked forwarder");
+
+        timeout(TEARDOWN_BOUND, forwarder)
+            .await
+            .expect("the forwarder exits after the close")
+            .expect("forwarder task");
+        assert!(closed_callback.load(Ordering::Relaxed));
+        h.assert_queued_bytes_settles_to(0).await;
+    }
+
+    /// The same teardown while the forwarder is actively delivering onto a
+    /// non-full channel with a reader parked on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_while_the_forwarder_is_actively_delivering_settles_cleanly() {
+        let h =
+            DatagramTestHarness::new("batch-active-close", CLIENT_DATAGRAM_RECV_CAPACITY, 1 << 22);
+        let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(8);
+        let wire = Arc::new(TokioMutex::new(wire_rx));
+
+        let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
+        let forwarder = {
+            let tx = h.sender().clone();
+            let rx = Arc::clone(&h.rx);
+            let metrics = Arc::clone(&h.metrics);
+            let closed = Arc::clone(&h.closed);
+            let notify = Arc::clone(&h.lifecycle_notify);
+            let wire = Arc::clone(&wire);
+            tokio::spawn(async move {
+                let _done = done_guard;
+                let source = &wire;
+                run_client_datagram_forwarder(
+                    move || async move { source.lock().await.recv().await },
+                    tx,
+                    rx,
+                    metrics,
+                    1 << 22,
+                    closed,
+                    notify,
+                )
+                .await;
+            })
+        };
+
+        let feeder = tokio::spawn(async move {
+            for tag in 0..2_000u32 {
+                if wire_tx.send(payload(tag as u8)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let reader = {
+            let state = h.read_state();
+            tokio::spawn(async move {
+                let mut seen = 0usize;
+                while let Some(batch) = state.read_batch(32).await {
+                    seen += batch.len();
+                }
+                seen
+            })
+        };
+
+        // Let real delivery get going before closing.
+        let deadline = tokio::time::Instant::now() + TEARDOWN_BOUND;
+        while h.metrics.datagrams_in.load(Ordering::Relaxed) < 64 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the forwarder never started delivering"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let closed_callback = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed_callback);
+        timeout(
+            TEARDOWN_BOUND,
+            settle_client_receive_accounting_after_close(
+                &h.rx,
+                &h.metrics,
+                &h.closed,
+                &h.lifecycle_notify,
+                forwarder_exited,
+                move || flag.store(true, Ordering::Relaxed),
+            ),
+        )
+        .await
+        .expect("teardown is bounded while delivery is in flight");
+
+        timeout(TEARDOWN_BOUND, forwarder)
+            .await
+            .expect("the forwarder exits")
+            .expect("forwarder task");
+        let delivered = timeout(TEARDOWN_BOUND, reader)
+            .await
+            .expect("the reader sees EOF")
+            .expect("reader task");
+        assert!(delivered > 0, "the test must observe real delivery");
+        feeder.abort();
+        assert!(closed_callback.load(Ordering::Relaxed));
+        h.assert_queued_bytes_settles_to(0).await;
+    }
+
+    /// The forwarder's own exit-refund: whatever it charged but could not hand
+    /// over comes back, without any terminal task running at all.
+    ///
+    /// This is the strict falsifier for both the interruptible enqueue (an
+    /// uninterruptible `send().await` on the full channel never returns, so the
+    /// forwarder never exits) and the forwarder's self-drain (without it the
+    /// four datagrams left in the channel strand their reservation).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_forwarder_refunds_everything_it_charged_on_its_own_exit() {
+        let h = DatagramTestHarness::new("batch-forwarder-refund", 4, 1 << 20);
+        let wire = Arc::new(TokioMutex::new({
+            let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(16);
+            for tag in 0..12u8 {
+                wire_tx.try_send(payload(tag)).expect("wire slot");
+            }
+            drop(wire_tx);
+            wire_rx
+        }));
+
+        let tx = h.sender().clone();
+        let rx = Arc::clone(&h.rx);
+        let metrics = Arc::clone(&h.metrics);
+        let closed = Arc::clone(&h.closed);
+        let notify = Arc::clone(&h.lifecycle_notify);
+        let forwarder = tokio::spawn(async move {
+            let source = &wire;
+            run_client_datagram_forwarder(
+                move || async move { source.lock().await.recv().await },
+                tx,
+                rx,
+                metrics,
+                1 << 20,
+                closed,
+                notify,
+            )
+            .await;
+        });
+
+        // Wedge it on a full 4-slot channel, then close with no reader and no
+        // terminal drain: only the forwarder's own exit path can settle this.
+        let deadline = tokio::time::Instant::now() + TEARDOWN_BOUND;
+        while h.queued_bytes() < 5 * PAYLOAD as u64 {
+            assert!(tokio::time::Instant::now() < deadline, "never filled");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        mark_client_closed_and_notify(&h.closed, &h.lifecycle_notify);
+
+        timeout(TEARDOWN_BOUND, forwarder)
+            .await
+            .expect("the forwarder exits on close")
+            .expect("forwarder task");
+        assert_eq!(
+            h.queued_bytes(),
+            0,
+            "the forwarder's own drain settles the queue"
+        );
+    }
+
+    /// A oneshot, not a notify: the guard fires even if the waiter registers
+    /// after the forwarder has already finished, so there is no lost wake.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_forwarder_done_signal_cannot_be_lost() {
+        let (guard, exited) = ForwarderDoneGuard::new();
+        drop(guard);
+        assert!(timeout(BOUND, exited).await.expect("bounded").is_ok());
+    }
+
+    /// The signal fires on panic unwind too, which is what makes the bounded
+    /// wait panic insurance rather than a hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_forwarder_done_signal_fires_on_panic_unwind() {
+        let (guard, exited) = ForwarderDoneGuard::new();
+        let panicked = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("forwarder body panicked");
+        });
+        assert!(timeout(BOUND, exited).await.expect("bounded").is_ok());
+        assert!(panicked.await.is_err());
+    }
+
+    /// The napi read lanes both go through one routine, so `read_one` is the
+    /// max=1 extraction over `read_batch` and shares its close path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_single_read_lane_is_the_max_one_extraction() {
+        let h = DatagramTestHarness::new("batch-single-lane", 8, 1 << 20);
+        h.charge_and_enqueue(payload(1));
+        h.charge_and_enqueue(payload(2));
+
+        let one = timeout(BOUND, h.read_state().read_one())
+            .await
+            .expect("bounded")
+            .expect("one item");
+        assert_eq!(one, payload(1));
+        assert_eq!(
+            h.queued_bytes(),
+            PAYLOAD as u64,
+            "the single lane takes exactly one item's bytes"
+        );
     }
 }

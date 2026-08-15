@@ -401,6 +401,38 @@ pub fn native_stream_handles_snapshot() -> metrics::NativeStreamHandlesSnapshot 
     }
 }
 
+/// Which delivery path payloads actually took this process: `"arraybuffer"`
+/// (default) or `"buffer-copy"` (the `WEBTRANSPORT_PAYLOAD_DELIVERY` escape
+/// hatch). Read-only — it reports the already-resolved decision and neither
+/// rereads nor mutates the environment, so it can never disagree with the
+/// conversion that payloads are getting.
+#[napi]
+pub fn native_payload_delivery_mode() -> &'static str {
+    payload_buffer::payload_delivery_mode().as_str()
+}
+
+/// The inclusive payload size at or below which delivery stays engine-owned.
+/// Larger payloads take the accounted external handover. Diagnostic only.
+#[napi]
+pub fn native_payload_engine_owned_max_bytes() -> f64 {
+    payload_buffer::ENGINE_OWNED_MAX_BYTES as f64
+}
+
+/// Internal test seam: materialize a batch of payloads through napi-rs's real
+/// per-element array conversion, so the branch a batch delivery takes is the
+/// branch under test. It copies its input and hands back `PayloadBuffer`s; it
+/// reimplements neither materialization nor accounting, and no production
+/// session path calls it.
+#[napi]
+pub fn materialize_payload_batch_for_tests(
+    payloads: Vec<napi::bindgen_prelude::Buffer>,
+) -> Vec<payload_buffer::PayloadBuffer> {
+    payloads
+        .into_iter()
+        .map(|buffer| payload_buffer::PayloadBuffer::from(buffer.as_ref().to_vec()))
+        .collect()
+}
+
 /// Controls whether panic diagnostics include full panic payloads.
 /// Default is false (redacted/minimal). Enable only for local debugging.
 #[napi]
