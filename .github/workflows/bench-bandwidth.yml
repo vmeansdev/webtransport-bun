@@ -29,6 +29,11 @@ on:
         required: false
         default: "27,54,109,217,326,435"
         type: string
+      probe_only:
+        description: "Run only the GSO/GRO host probe, skip the ladder"
+        required: false
+        default: "false"
+        type: string
 jobs:
   bench:
     permissions:
@@ -52,7 +57,24 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.3.14"
+      - name: GSO/GRO host probe
+        if: ${{ github.event.inputs.probe_only == 'true' }}
+        run: |
+          echo "== kernel =="
+          uname -a
+          IFACE="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+          echo "iface=$IFACE"
+          if command -v ethtool >/dev/null 2>&1 && [ -n "$IFACE" ]; then
+            echo "== driver =="
+            ethtool -i "$IFACE" || true
+            echo "== offload features (udp/gso/gro) =="
+            ethtool -k "$IFACE" | grep -Ei 'udp|gso|gro|segmentation' || true
+          else
+            echo "ethtool unavailable or iface not found; skipping feature dump"
+          fi
+          cargo run --release -p reference --bin gso-probe
       - name: Install deps
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         run: bun install --frozen-lockfile
       - name: Select supported C/C++ compiler
         run: |
@@ -75,6 +97,7 @@ jobs:
           echo "::error::No supported compiler found. Install clang (preferred) or gcc-10+ on this self-hosted runner."
           exit 1
       - name: Build native addon
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         run: bun run build:native
       - name: Profile runner capacity
         run: |
@@ -82,6 +105,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -92,7 +116,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
+        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*
