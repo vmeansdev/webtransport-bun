@@ -76,6 +76,51 @@ function serverMemMb(): { rssMb: number; committedMb: number | null } {
 	return { rssMb, committedMb: (kb("RssAnon") + kb("VmSwap")) / 1024 };
 }
 
+type UdpSnapshot = {
+	inDatagrams: number;
+	inErrors: number;
+	rcvbufErrors: number;
+	sndbufErrors: number;
+	outDatagrams: number;
+};
+
+/** Host-wide UDP counters from /proc/net/snmp; per-step deltas attribute
+ * missing datagrams to kernel-side drops (RcvbufErrors) vs sender-side
+ * (quinn's congestion-limited send-buffer drops never reach the wire). */
+function readUdpStats(): UdpSnapshot | null {
+	if (!HAS_PROC) return null;
+	const lines = readFileSync("/proc/net/snmp", "utf8").split("\n");
+	const headerIdx = lines.findIndex((l) => l.startsWith("Udp:"));
+	if (headerIdx < 0 || !lines[headerIdx + 1]?.startsWith("Udp:")) return null;
+	const keys = (lines[headerIdx] ?? "").trim().split(/\s+/).slice(1);
+	const vals = (lines[headerIdx + 1] ?? "").trim().split(/\s+/).slice(1);
+	const get = (key: string) => {
+		const i = keys.indexOf(key);
+		return i >= 0 ? Number(vals[i] ?? 0) : 0;
+	};
+	return {
+		inDatagrams: get("InDatagrams"),
+		inErrors: get("InErrors"),
+		rcvbufErrors: get("RcvbufErrors"),
+		sndbufErrors: get("SndbufErrors"),
+		outDatagrams: get("OutDatagrams"),
+	};
+}
+
+function udpDelta(
+	before: UdpSnapshot | null,
+	after: UdpSnapshot | null,
+): UdpSnapshot | null {
+	if (!before || !after) return null;
+	return {
+		inDatagrams: after.inDatagrams - before.inDatagrams,
+		inErrors: after.inErrors - before.inErrors,
+		rcvbufErrors: after.rcvbufErrors - before.rcvbufErrors,
+		sndbufErrors: after.sndbufErrors - before.sndbufErrors,
+		outDatagrams: after.outDatagrams - before.outDatagrams,
+	};
+}
+
 type StepResult = {
 	perSessionRate: number;
 	targetMbps: number;
@@ -101,6 +146,7 @@ type StepResult = {
 	sessionsOk: number;
 	sessionsErr: number;
 	elapsedSec: number;
+	udp: UdpSnapshot | null;
 };
 
 function median(values: number[]): number | null {
@@ -190,6 +236,7 @@ async function main(): Promise<void> {
 		const echo0 = echoSent;
 		const echoErr0 = echoErr;
 		const cpuMs0 = serverCpuMs();
+		const udp0 = readUdpStats();
 		const startedAt = Date.now();
 
 		const child = Bun.spawn(
@@ -305,10 +352,11 @@ async function main(): Promise<void> {
 			sessionsOk,
 			sessionsErr,
 			elapsedSec,
+			udp: udpDelta(udp0, readUdpStats()),
 		};
 		steps.push(step);
 		console.log(
-			`bench-bandwidth: step ${index + 1} done offered=${step.offeredMbps.toFixed(1)}Mbps serverRx=${step.serverRxMbps.toFixed(1)}Mbps echoRx=${step.echoDeliveredMbps.toFixed(1)}Mbps up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} down=${step.downDeliveryRatio?.toFixed(3) ?? "n/a"} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}% serverCpu=${step.serverCpuPct.toFixed(0)}% rssMax=${step.rssMbMax.toFixed(0)}MB`,
+			`bench-bandwidth: step ${index + 1} done offered=${step.offeredMbps.toFixed(1)}Mbps serverRx=${step.serverRxMbps.toFixed(1)}Mbps echoRx=${step.echoDeliveredMbps.toFixed(1)}Mbps up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} down=${step.downDeliveryRatio?.toFixed(3) ?? "n/a"} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}% serverCpu=${step.serverCpuPct.toFixed(0)}% rssMax=${step.rssMbMax.toFixed(0)}MB udp[in=${step.udp?.inDatagrams ?? "n/a"} out=${step.udp?.outDatagrams ?? "n/a"} rcvbufErr=${step.udp?.rcvbufErrors ?? "n/a"} sndbufErr=${step.udp?.sndbufErrors ?? "n/a"} inErr=${step.udp?.inErrors ?? "n/a"}]`,
 		);
 		// Brief settle between steps so queues drain and CPU baselines reset.
 		await new Promise((res) => setTimeout(res, 10_000));
@@ -335,11 +383,11 @@ async function main(): Promise<void> {
 	writeFileSync(OUT_JSON, `${JSON.stringify(result, null, 2)}\n`);
 	console.log(`bench-bandwidth: wrote ${OUT_JSON} and ${OUT_CSV}`);
 	console.log(
-		"step | target | offered | serverRx | echoRx | up | down | hostCpu | srvCpu | rssMax",
+		"step | target | offered | serverRx | echoRx | up | down | hostCpu | srvCpu | rssMax | rcvbufErr | sndbufErr",
 	);
 	for (const [i, s] of steps.entries()) {
 		console.log(
-			`${String(i + 1).padStart(4)} | ${s.targetMbps.toFixed(0).padStart(6)} | ${s.offeredMbps.toFixed(1).padStart(7)} | ${s.serverRxMbps.toFixed(1).padStart(8)} | ${s.echoDeliveredMbps.toFixed(1).padStart(6)} | ${(s.upDeliveryRatio ?? 0).toFixed(2)} | ${(s.downDeliveryRatio ?? 0).toFixed(2)} | ${s.hostCpuPctMedian?.toFixed(0).padStart(7) ?? "    n/a"} | ${s.serverCpuPct.toFixed(0).padStart(6)} | ${s.rssMbMax.toFixed(0).padStart(6)}`,
+			`${String(i + 1).padStart(4)} | ${s.targetMbps.toFixed(0).padStart(6)} | ${s.offeredMbps.toFixed(1).padStart(7)} | ${s.serverRxMbps.toFixed(1).padStart(8)} | ${s.echoDeliveredMbps.toFixed(1).padStart(6)} | ${(s.upDeliveryRatio ?? 0).toFixed(2)} | ${(s.downDeliveryRatio ?? 0).toFixed(2)} | ${s.hostCpuPctMedian?.toFixed(0).padStart(7) ?? "    n/a"} | ${s.serverCpuPct.toFixed(0).padStart(6)} | ${s.rssMbMax.toFixed(0).padStart(6)} | ${String(s.udp?.rcvbufErrors ?? "n/a").padStart(9)} | ${String(s.udp?.sndbufErrors ?? "n/a").padStart(9)}`,
 		);
 	}
 }
