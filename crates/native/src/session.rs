@@ -172,15 +172,92 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>>> {
-    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+/// Largest batch one delivery call may carry.
+///
+/// The point of batching is amortizing the N-API round trip, and the win is
+/// already flat well before here; a larger cap only widens the window in which
+/// dequeued payloads are held outside the queue's byte reservation.
+const DATAGRAM_BATCH_MAX: u32 = 256;
+
+/// Clamp a caller-supplied batch size into range. Out-of-range values are
+/// corrected silently: a rejected async N-API call leaks its self-reference
+/// under Bun, so user input must never become an `Err`.
+fn clamp_batch_max(max: u32) -> usize {
+    max.clamp(1, DATAGRAM_BATCH_MAX) as usize
+}
+
+/// Wait for one datagram, waking on session close rather than only on the
+/// sender being dropped.
+///
+/// The registration order matters: the `Notified` future is created and
+/// `enable()`d before the sticky flag is re-read, so a close landing in that
+/// window is still delivered as a wake (tokio's `Notify` stores no permit for
+/// a future that has not registered). A spurious wake loops and rechecks; only
+/// the sticky flag ends the wait.
+async fn recv_datagram_slot(
+    rx: &mut tokio::sync::mpsc::Receiver<session_registry::DatagramSlot>,
+    lifecycle_closed: &std::sync::atomic::AtomicBool,
+    lifecycle_notify: &Notify,
+) -> Option<session_registry::DatagramSlot> {
+    loop {
+        let notified = lifecycle_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if lifecycle_closed.load(Ordering::Acquire) {
+            return None;
+        }
+        tokio::select! {
+            // Biased so a close that races a queued datagram wins
+            // deterministically: a closed session discards what is still
+            // queued instead of draining it first.
+            biased;
+            _ = notified => {}
+            slot = rx.recv() => return slot,
+        }
+    }
+}
+
+/// Read up to `max` datagrams with one blocking wait: park for the first, then
+/// take whatever else is already queued. Never yields an empty batch — the
+/// result is a non-empty batch or `None` for EOF/close.
+async fn read_datagram_batch_from_state(
+    dgram_rx: &tokio::sync::Mutex<tokio::sync::mpsc::Receiver<session_registry::DatagramSlot>>,
+    lifecycle_closed: &std::sync::atomic::AtomicBool,
+    lifecycle_notify: &Notify,
+    max: u32,
+) -> Option<Vec<Vec<u8>>> {
+    let cap = clamp_batch_max(max);
+    let mut rx = dgram_rx.lock().await;
+    let first = recv_datagram_slot(&mut rx, lifecycle_closed, lifecycle_notify).await?;
+
+    let mut batch = Vec::with_capacity(cap);
+    batch.push(first.take());
+    while batch.len() < cap {
+        let Ok(slot) = rx.try_recv() else {
+            break;
+        };
+        batch.push(slot.take());
+    }
+    Some(batch)
+}
+
+pub(crate) async fn read_datagram_batch_for_session(
+    id: &str,
+    max: u32,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let Some((dgram_rx, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_datagram_read_state(id)
+    else {
         return Ok(None);
     };
-    let mut rx = dgram_rx.lock().await;
-    match rx.recv().await {
-        Some(slot) => Ok(Some(slot.take())),
-        None => Ok(None),
-    }
+    Ok(read_datagram_batch_from_state(&dgram_rx, &lifecycle_closed, &lifecycle_notify, max).await)
+}
+
+pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>>> {
+    Ok(read_datagram_batch_for_session(id, 1)
+        .await?
+        .and_then(|batch| batch.into_iter().next()))
 }
 
 pub(crate) async fn discard_datagram_for_session(
@@ -1702,5 +1779,367 @@ mod tests {
         drop(_shutdown);
         drop(client_conn);
         session_registry::remove(&client_id);
+    }
+
+    /// A read parked on an empty datagram queue must observe the sticky close
+    /// flag, not sit there until the ingress task happens to drop its sender.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_while_parked_wakes_the_legacy_datagram_read() {
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 40).await;
+        let id = format!("{}-legacy-parked", session.id);
+        // Holding the sender for the whole test is the point: the read must
+        // wake from the lifecycle signal alone.
+        let (_dgram_tx, _b, _u, _cb, _cu, _sm, _notify) = session_registry::insert(
+            id.clone(),
+            u64::MAX - 40,
+            session.conn.clone(),
+            Arc::clone(&session.metrics),
+            Limits::default(),
+            false,
+        );
+
+        let parked_id = id.clone();
+        let parked = tokio::spawn(async move { read_datagram_for_session(&parked_id).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session_registry::remove(&id);
+
+        let got = tokio::time::timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("parked legacy read must wake within 1s of session close")
+            .expect("join")
+            .expect("read");
+        assert!(got.is_none(), "a closed session reads as EOF");
+
+        session_registry::close_session(&session.id, 0, "done");
+    }
+
+    /// A datagram queue plus the lifecycle signals a reader parks on, without
+    /// a live QUIC session behind it.
+    #[derive(Clone)]
+    struct TestDatagramQueue {
+        tx: tokio::sync::mpsc::Sender<session_registry::DatagramSlot>,
+        rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<session_registry::DatagramSlot>>>,
+        closed: Arc<AtomicBool>,
+        lifecycle_notify: Arc<Notify>,
+        capacity_notify: Arc<Notify>,
+        metrics: Arc<crate::server_metrics::ServerMetrics>,
+        session_metrics: Arc<SessionMetrics>,
+    }
+
+    impl TestDatagramQueue {
+        fn new(capacity: usize) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+            Self {
+                tx,
+                rx: Arc::new(tokio::sync::Mutex::new(rx)),
+                closed: Arc::new(AtomicBool::new(false)),
+                lifecycle_notify: Arc::new(Notify::new()),
+                capacity_notify: Arc::new(Notify::new()),
+                metrics: Arc::new(crate::server_metrics::ServerMetrics::default()),
+                session_metrics: Arc::new(SessionMetrics::default()),
+            }
+        }
+
+        fn slot(&self, data: Vec<u8>, reserved: u64) -> session_registry::DatagramSlot {
+            session_registry::DatagramSlot::new(
+                data,
+                Arc::clone(&self.session_metrics),
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.capacity_notify),
+                reserved,
+            )
+        }
+
+        fn queue(&self, data: &[u8]) {
+            assert!(
+                self.tx.try_send(self.slot(data.to_vec(), 0)).is_ok(),
+                "test queue must accept the datagram"
+            );
+        }
+
+        async fn read(&self, max: u32) -> Option<Vec<Vec<u8>>> {
+            read_datagram_batch_from_state(&self.rx, &self.closed, &self.lifecycle_notify, max)
+                .await
+        }
+    }
+
+    #[test]
+    fn batch_max_is_clamped_into_range() {
+        assert_eq!(clamp_batch_max(0), 1);
+        assert_eq!(clamp_batch_max(1), 1);
+        assert_eq!(clamp_batch_max(64), 64);
+        assert_eq!(clamp_batch_max(256), 256);
+        assert_eq!(clamp_batch_max(257), 256);
+        assert_eq!(clamp_batch_max(u32::MAX), 256);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_read_blocks_for_the_first_item_then_drains_the_queue_in_order() {
+        let queue = TestDatagramQueue::new(8);
+        let parked = queue.clone();
+        let task = tokio::spawn(async move { parked.read(8).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "an empty queue must park the batch read"
+        );
+
+        for tag in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+            queue.queue(tag);
+        }
+        let batch = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the batch read must wake on the first item")
+            .expect("join")
+            .expect("a queued batch is never null");
+        assert_eq!(
+            batch,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the drain preserves arrival order"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_read_stops_at_the_clamped_cap_and_leaves_the_rest_queued() {
+        let queue = TestDatagramQueue::new(16);
+        for i in 0..10u8 {
+            queue.queue(&[i]);
+        }
+
+        let first = queue.read(4).await.expect("a queued batch is never null");
+        assert_eq!(first, (0..4u8).map(|i| vec![i]).collect::<Vec<_>>());
+        let rest = queue.read(64).await.expect("a queued batch is never null");
+        assert_eq!(rest, (4..10u8).map(|i| vec![i]).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_read_delivers_a_partial_batch_before_reporting_eof() {
+        let queue = TestDatagramQueue::new(8);
+        queue.queue(b"x");
+        queue.queue(b"y");
+
+        let TestDatagramQueue {
+            tx,
+            rx,
+            closed,
+            lifecycle_notify,
+            ..
+        } = queue;
+        drop(tx);
+
+        let batch = read_datagram_batch_from_state(&rx, &closed, &lifecycle_notify, 8)
+            .await
+            .expect("the queued remainder is delivered before EOF");
+        assert_eq!(batch, vec![b"x".to_vec(), b"y".to_vec()]);
+        assert!(
+            read_datagram_batch_from_state(&rx, &closed, &lifecycle_notify, 8)
+                .await
+                .is_none(),
+            "EOF with no items is null, never an empty array"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_read_is_null_for_a_missing_session() {
+        assert!(read_datagram_batch_for_session("missing-batch", 8)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(read_datagram_batch_for_session("missing-batch", 0)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // A batch handed to JavaScript is memory that the queue no longer accounts
+    // for: its reservations are released the moment the slots are taken. Pin
+    // the resulting in-flight bound at one channel plus one batch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_batch_bounds_in_flight_datagrams_to_one_channel_plus_one_batch() {
+        const PAYLOAD: u64 = 1000;
+        const GLOBAL_MAX: u64 = 1 << 24;
+        const SESSION_MAX: u64 = 1 << 24;
+
+        let capacity = session_registry::DGRAM_CHANNEL_CAPACITY;
+        assert_eq!(capacity, 2048, "the in-flight bound is stated against 2048");
+        let queue = TestDatagramQueue::new(capacity);
+        let reserve = || {
+            assert!(queue.metrics.try_reserve_queued_bytes_with_session(
+                &queue.session_metrics.queued_bytes,
+                PAYLOAD,
+                GLOBAL_MAX,
+                SESSION_MAX,
+            ));
+        };
+        let full_slot = || queue.slot(vec![0u8; PAYLOAD as usize], PAYLOAD);
+
+        for _ in 0..capacity {
+            reserve();
+            assert!(queue.tx.try_send(full_slot()).is_ok());
+        }
+        reserve();
+        assert!(
+            queue.tx.try_send(full_slot()).is_err(),
+            "the channel is full at capacity"
+        );
+
+        let batch = queue.read(512).await.expect("a full queue yields a batch");
+        assert_eq!(batch.len(), 256, "512 clamps to the 256-item cap");
+        for _ in 0..batch.len() {
+            reserve();
+            assert!(queue.tx.try_send(full_slot()).is_ok());
+        }
+        reserve();
+        assert!(
+            queue.tx.try_send(full_slot()).is_err(),
+            "the refilled channel is full again"
+        );
+
+        assert_eq!(
+            capacity + batch.len(),
+            2048 + 256,
+            "at most one channel plus one held batch is in flight"
+        );
+        assert_eq!(
+            queue.session_metrics.queued_bytes.load(Ordering::Relaxed),
+            capacity as u64 * PAYLOAD,
+            "reservations cover only the refilled native queue, not the held batch"
+        );
+    }
+
+    /// The batch read must park on the lifecycle signal for the same reason the
+    /// legacy read does: nothing else wakes it when the session goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_while_parked_wakes_the_batch_datagram_read() {
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 41).await;
+        let id = format!("{}-batch-parked", session.id);
+        let (_dgram_tx, _b, _u, _cb, _cu, _sm, _notify) = session_registry::insert(
+            id.clone(),
+            u64::MAX - 41,
+            session.conn.clone(),
+            Arc::clone(&session.metrics),
+            Limits::default(),
+            false,
+        );
+
+        let parked_id = id.clone();
+        let parked =
+            tokio::spawn(async move { read_datagram_batch_for_session(&parked_id, 32).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session_registry::remove(&id);
+
+        let got = tokio::time::timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("parked batch read must wake within 1s of session close")
+            .expect("join")
+            .expect("read");
+        assert!(got.is_none(), "a closed session reads as EOF");
+
+        session_registry::close_session(&session.id, 0, "done");
+    }
+
+    /// Documented semantic deviation: a closed session discards whatever is
+    /// still queued instead of draining it first. Both read lanes must agree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_session_drops_queued_datagrams_instead_of_draining_them() {
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 42).await;
+
+        let legacy_id = format!("{}-legacy-drop", session.id);
+        let (legacy_tx, .., legacy_sm, legacy_notify) = session_registry::insert(
+            legacy_id.clone(),
+            u64::MAX - 42,
+            session.conn.clone(),
+            Arc::clone(&session.metrics),
+            Limits::default(),
+            false,
+        );
+        let (legacy_rx, legacy_closed, _) =
+            session_registry::get_datagram_read_state(&legacy_id).expect("read state");
+        for i in 0..3u8 {
+            assert!(legacy_tx
+                .try_send(session_registry::DatagramSlot::new(
+                    vec![i],
+                    Arc::clone(&legacy_sm),
+                    Arc::clone(&session.metrics),
+                    Arc::clone(&legacy_notify),
+                    0,
+                ))
+                .is_ok());
+        }
+        // The registry entry is still present: this is the window in which a
+        // reader finds the state after the close signal is already stored.
+        legacy_closed.store(true, Ordering::Release);
+        let got = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_datagram_for_session(&legacy_id),
+        )
+        .await
+        .expect("a closed session must not park the legacy read")
+        .expect("read");
+        assert!(
+            got.is_none(),
+            "the legacy read reports EOF instead of draining the remainder"
+        );
+        let mut remaining = 0;
+        while legacy_rx.lock().await.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(
+            remaining, 3,
+            "every queued datagram was dropped, not delivered"
+        );
+
+        let batch_id = format!("{}-batch-drop", session.id);
+        let (batch_tx, .., batch_sm, batch_notify) = session_registry::insert(
+            batch_id.clone(),
+            u64::MAX - 42,
+            session.conn.clone(),
+            Arc::clone(&session.metrics),
+            Limits::default(),
+            false,
+        );
+        let (batch_rx, batch_closed, _) =
+            session_registry::get_datagram_read_state(&batch_id).expect("read state");
+        for i in 0..3u8 {
+            assert!(batch_tx
+                .try_send(session_registry::DatagramSlot::new(
+                    vec![i],
+                    Arc::clone(&batch_sm),
+                    Arc::clone(&session.metrics),
+                    Arc::clone(&batch_notify),
+                    0,
+                ))
+                .is_ok());
+        }
+        batch_closed.store(true, Ordering::Release);
+        let got = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_datagram_batch_for_session(&batch_id, 8),
+        )
+        .await
+        .expect("a closed session must not park the batch read")
+        .expect("read");
+        assert!(
+            got.is_none(),
+            "the batch read reports EOF instead of draining the remainder"
+        );
+        let mut remaining = 0;
+        while batch_rx.lock().await.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(
+            remaining, 3,
+            "every queued datagram was dropped, not delivered"
+        );
+
+        session_registry::remove(&legacy_id);
+        session_registry::remove(&batch_id);
+        session_registry::close_session(&session.id, 0, "done");
     }
 }
