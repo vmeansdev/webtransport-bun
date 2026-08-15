@@ -423,11 +423,15 @@ mod tests {
         assert!(PayloadDeliveryPlan::ExternalAccounted.charges_external_memory());
     }
 
-    /// No engine-owned payload size constructs a guard at all, so no adjuster
-    /// call can be made on those paths.
+    /// Classifier-level only: no size in the engine-owned band, in either
+    /// mode, is routed to the accounted plan. That the engine-owned arms then
+    /// make no adjustment is structural rather than asserted here — the guard
+    /// is constructed in exactly one place, `external_payload_to_napi_value`,
+    /// which only the `ExternalAccounted` arm calls, and running
+    /// `to_napi_value` itself needs a real `napi_env`. The guard's own
+    /// behaviour is covered by the three tests below.
     #[test]
-    fn engine_owned_and_buffer_copy_sizes_make_no_adjustment() {
-        let adjuster = RecordingAdjuster::default();
+    fn no_engine_owned_size_is_classified_as_externally_accounted() {
         for mode in [
             PayloadDeliveryMode::ArrayBuffer,
             PayloadDeliveryMode::BufferCopy,
@@ -435,12 +439,8 @@ mod tests {
             for len in [0usize, 1, 1150, ENGINE_OWNED_MAX_BYTES] {
                 let plan = plan_delivery(len, mode);
                 assert!(!plan.charges_external_memory(), "{plan:?} for {len} bytes");
-                if plan.charges_external_memory() {
-                    let _ = ExternalAccountingGuard::charge(&adjuster, len);
-                }
             }
         }
-        assert!(adjuster.deltas().is_empty(), "{:?}", adjuster.deltas());
     }
 
     /// Successful handover: exactly one charge stays outstanding, because the

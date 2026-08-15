@@ -418,11 +418,12 @@ impl Drop for ForwarderDoneGuard {
 ///   deadlock the terminal task's wait against the only task that can free a
 ///   slot.
 ///
-/// On exit the forwarder takes the receiver mutex and drains once itself.
-/// That runs in its own task strictly after its last possible charge, so it
-/// settles the residual case of a descheduled-but-live forwarder charging
-/// after the terminal task's final drain. Drains are idempotent under the
-/// mutex, so this strengthens rather than replaces the terminal sequence.
+/// On exit, and only if the session is already closed, the forwarder takes the
+/// receiver mutex and drains once itself. That runs in its own task strictly
+/// after its last possible charge, so it settles the residual case of a
+/// descheduled-but-live forwarder charging after the terminal task's final
+/// drain. Drains are idempotent under the mutex, so this strengthens rather
+/// than replaces the terminal sequence.
 async fn run_client_datagram_forwarder<S, F>(
     mut next_datagram: S,
     tx: mpsc::Sender<Vec<u8>>,
@@ -446,7 +447,6 @@ async fn run_client_datagram_forwarder<S, F>(
         if !try_reserve_client_queued_bytes(&metrics, budget_bytes, sz) {
             continue;
         }
-        metrics.datagrams_in.fetch_add(1, Ordering::Relaxed);
 
         let notified = lifecycle_notify.notified();
         tokio::pin!(notified);
@@ -466,14 +466,26 @@ async fn run_client_datagram_forwarder<S, F>(
             metrics.queued_bytes.fetch_sub(sz, Ordering::Relaxed);
             break;
         }
+        // Counted only once the datagram is actually in the reader's queue, so
+        // a handover cancelled by a close is not reported as received.
+        metrics.datagrams_in.fetch_add(1, Ordering::Relaxed);
     }
 
     // Release the last sender before contending for the receiver mutex. On an
     // ordinary end-of-connection exit there is no close to wake a parked
     // reader, and that reader holds the mutex; the disconnect is what lets it
-    // finish so this drain can run.
+    // finish, and it is also what turns the drained-empty queue into EOF.
     drop(tx);
-    lock_drain_and_refund(&rx, &metrics).await;
+
+    // Only a closed session discards what is still queued. On a clean
+    // end-of-connection exit the sticky flag is still false — the terminal task
+    // has not run yet — and a reader is fully entitled to the remainder, so
+    // draining here would silently destroy up to a full channel of deliverable
+    // datagrams. The close case still cannot strand bytes: the terminal task
+    // always runs on connection end and drains after setting the flag.
+    if closed.load(Ordering::Acquire) {
+        lock_drain_and_refund(&rx, &metrics).await;
+    }
 }
 
 /// Settle every receive-side byte after a session ends, in the one order that
@@ -502,6 +514,13 @@ async fn settle_client_receive_accounting_after_close(
     after_first_drain: impl FnOnce(),
 ) {
     mark_client_closed_and_notify(closed, lifecycle_notify);
+    // LOAD-BEARING INVARIANT: every holder of the `dgram_recv_rx` mutex must
+    // observe the sticky flag and release promptly. This lock is untimed, and
+    // the JS-visible close callback below sits behind it — unlike the
+    // forwarder wait, there is no timeout to catch a holder that parks
+    // indefinitely after the flag is set. Today the only holders are the read
+    // routine (whose wait ends on the flag) and the two drains (which never
+    // await while holding it). Do not add a holder that can outlive the flag.
     lock_drain_and_refund(rx, metrics).await;
     after_first_drain();
     if tokio::time::timeout(FORWARDER_EXIT_WAIT, forwarder_done)
@@ -3048,6 +3067,71 @@ mod tests {
             0,
             "the forwarder's own drain settles the queue"
         );
+    }
+
+    /// A clean end of connection is not a close. When the forwarder runs its
+    /// source to exhaustion with datagrams still queued and the sticky flag
+    /// still false, a reader is entitled to every one of them: the forwarder's
+    /// exit must not drain them away. Only the disconnect-driven EOF follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_connection_end_delivers_the_remainder_instead_of_discarding_it() {
+        let mut h =
+            DatagramTestHarness::new("batch-clean-eof", CLIENT_DATAGRAM_RECV_CAPACITY, 1 << 20);
+        let queued = 40usize;
+        let wire = Arc::new(TokioMutex::new({
+            let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(queued);
+            for tag in 0..queued {
+                wire_tx.try_send(payload(tag as u8)).expect("wire slot");
+            }
+            // Dropping the wire sender is what makes the source run dry, which
+            // is how a cleanly ended connection reaches the forwarder.
+            drop(wire_tx);
+            wire_rx
+        }));
+
+        let tx = h.sender().clone();
+        let rx = Arc::clone(&h.rx);
+        let metrics = Arc::clone(&h.metrics);
+        let closed = Arc::clone(&h.closed);
+        let notify = Arc::clone(&h.lifecycle_notify);
+        let forwarder = tokio::spawn(async move {
+            let source = &wire;
+            run_client_datagram_forwarder(
+                move || async move { source.lock().await.recv().await },
+                tx,
+                rx,
+                metrics,
+                1 << 20,
+                closed,
+                notify,
+            )
+            .await;
+        });
+        timeout(TEARDOWN_BOUND, forwarder)
+            .await
+            .expect("the forwarder finishes when its source runs dry")
+            .expect("forwarder task");
+
+        // No close happened, so nothing may have been discarded.
+        assert!(!h.closed.load(Ordering::Acquire), "this is not a close");
+        h.close_senders();
+
+        let mut delivered = Vec::new();
+        while let Some(batch) = timeout(TEARDOWN_BOUND, h.read_state().read_batch(16))
+            .await
+            .expect("bounded")
+        {
+            delivered.extend(batch);
+        }
+        assert_eq!(
+            delivered.len(),
+            queued,
+            "every datagram the forwarder accepted must still be deliverable"
+        );
+        for (index, item) in delivered.iter().enumerate() {
+            assert_eq!(item, &payload(index as u8), "and in order");
+        }
+        assert_eq!(h.queued_bytes(), 0, "and their bytes settle on delivery");
     }
 
     /// A oneshot, not a notify: the guard fires even if the waiter registers
