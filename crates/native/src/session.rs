@@ -189,16 +189,32 @@ fn clamp_batch_max(max: u32) -> usize {
 /// Wait for one datagram, waking on session close rather than only on the
 /// sender being dropped.
 ///
-/// The registration order matters: the `Notified` future is created and
-/// `enable()`d before the sticky flag is re-read, so a close landing in that
-/// window is still delivered as a wake (tokio's `Notify` stores no permit for
-/// a future that has not registered). A spurious wake loops and rechecks; only
-/// the sticky flag ends the wait.
+/// A datagram that is already queued is returned without touching the
+/// `Notify` at all: registering a waiter costs two waiter-list lock
+/// acquisitions (`enable()` plus the drop-time deregister), which the batch
+/// path amortizes over up to 256 payloads but the max=1 lane would pay per
+/// datagram. The sticky flag is still read first, so a newly entered read on a
+/// closed session reports EOF instead of draining what is left queued.
+///
+/// Once the queue is empty the registration order matters: the `Notified`
+/// future is created and `enable()`d before the sticky flag is re-read, so a
+/// close landing in that window is still delivered as a wake (tokio's `Notify`
+/// stores no permit for a future that has not registered). A spurious wake
+/// loops and rechecks; only the sticky flag ends the wait.
 async fn recv_datagram_slot(
     rx: &mut tokio::sync::mpsc::Receiver<session_registry::DatagramSlot>,
     lifecycle_closed: &std::sync::atomic::AtomicBool,
     lifecycle_notify: &Notify,
 ) -> Option<session_registry::DatagramSlot> {
+    if lifecycle_closed.load(Ordering::Acquire) {
+        return None;
+    }
+    match rx.try_recv() {
+        Ok(slot) => return Some(slot),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+    }
+
     loop {
         let notified = lifecycle_notify.notified();
         tokio::pin!(notified);
