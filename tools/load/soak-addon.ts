@@ -2978,6 +2978,25 @@ const H7_RATES = {
 	datagramsPerSec: 500,
 	streamsPerSec: 5,
 } as const;
+/**
+ * How far the recorded wall span may sit from the declared duration.
+ *
+ * `durationSeconds` is self-declared, so on its own it proves nothing: a
+ * five-minute run mislabeled 7200 would clear an equality check. The span
+ * between `startedAtMs` and `endedAtMs` brackets the whole segment, and the
+ * phase plan is partitioned *within* `durationSeconds`, so the only legitimate
+ * slack is the baseline/final snapshots and teardown — seconds in practice.
+ * Ten minutes is ~8% of the 2h lane: loose enough to survive a slow host,
+ * tight enough that nothing meaningfully shorter or longer can pass.
+ */
+const H7_DURATION_TOLERANCE_MS = 10 * 60 * 1000;
+/**
+ * Minimum fraction of the samples a full run would produce. The charged-peak
+ * ceiling is a max over `samples`, so a sampler that died early yields a
+ * cheap, meaningless peak; requiring the series to be substantially complete
+ * is what makes that ceiling mean anything.
+ */
+const H7_MIN_SAMPLE_DENSITY = 0.8;
 
 function expectExact(label: string, actual: unknown, expected: unknown): void {
 	if (!Object.is(actual, expected)) {
@@ -3221,8 +3240,32 @@ export function verifyH7Hosted(
 		}
 	}
 
+	// The declared duration must be corroborated by the clock, not merely
+	// asserted. Without this, everything downstream — including the charged
+	// ceiling — could describe a run of any length at all.
+	const wallSpanMs = segment.endedAtMs - segment.startedAtMs;
+	if (!Number.isFinite(wallSpanMs) || wallSpanMs <= 0) {
+		throw new Error("segment wall span is not a positive interval");
+	}
+	const declaredMs = expectations.durationSeconds * 1000;
+	if (Math.abs(wallSpanMs - declaredMs) > H7_DURATION_TOLERANCE_MS) {
+		throw new Error(
+			`segment wall span ${(wallSpanMs / 1000).toFixed(0)}s does not corroborate the declared ${expectations.durationSeconds}s ` +
+				`(tolerance ${H7_DURATION_TOLERANCE_MS / 1000}s)`,
+		);
+	}
+
 	if (segment.samples.length === 0) {
 		throw new Error("segment carries no memory samples");
+	}
+	const expectedSamples =
+		(expectations.durationSeconds * 1000) / DEFAULT_SAMPLE_INTERVAL_MS;
+	const minimumSamples = Math.floor(expectedSamples * H7_MIN_SAMPLE_DENSITY);
+	if (segment.samples.length < minimumSamples) {
+		throw new Error(
+			`segment carries ${segment.samples.length} memory samples, below the ${minimumSamples} required ` +
+				`(${H7_MIN_SAMPLE_DENSITY * 100}% of the ${expectedSamples} a full ${expectations.durationSeconds}s run produces)`,
+		);
 	}
 	let chargedPeakMb = 0;
 	for (const sample of segment.samples) {

@@ -228,6 +228,25 @@ const H7_TOKEN = "h7-continuity-token";
 const H7_SEED = "h7-campaign-seed";
 const H7_DURATION_SECONDS = 7200;
 const H7_RSS_CEIL_MB = 1750;
+const H7_STARTED_AT_MS = 1_700_000_000_000;
+/** The sampler ticks every 30s, so a real 2h segment carries ~240 samples. */
+const H7_SAMPLE_COUNT = 240;
+
+function h7Samples(count: number, rssMb = 1200): Sample[] {
+	return Array.from({ length: count }, (_, index) => ({
+		ts_ms: H7_STARTED_AT_MS + index * 30_000,
+		phase: "main-load",
+		rss: rssMb,
+		heapUsedMb: 40,
+		fd: 30,
+		sockets: 4,
+		sessions: 500,
+		streams: 20,
+		sessionTasks: 500,
+		streamTasks: 20,
+		queued: 0,
+	}));
+}
 
 const H7_EXPECTATIONS: H7HostedExpectations = {
 	sha: H7_SHA,
@@ -250,6 +269,10 @@ function h7Segment(overrides: Record<string, unknown> = {}): SegmentArtifact {
 		segmentCount: 1,
 		previousFinalHash: null,
 		durationSeconds: H7_DURATION_SECONDS,
+		// A realistic 2h wall span, not the 1s the first draft carried: the
+		// declared duration is cross-checked against it.
+		startedAtMs: H7_STARTED_AT_MS,
+		endedAtMs: H7_STARTED_AT_MS + H7_DURATION_SECONDS * 1000,
 		candidateRef: H7_REF,
 		seed: H7_SEED,
 		continuityTokenDigest: createHash("sha256").update(H7_TOKEN).digest("hex"),
@@ -289,21 +312,7 @@ function h7Segment(overrides: Record<string, unknown> = {}): SegmentArtifact {
 			datagramsSent: 1_000_000,
 			datagramsReceived: 990_000,
 		},
-		samples: [
-			{
-				ts_ms: 1,
-				phase: "main-load",
-				rss: 1200,
-				heapUsedMb: 40,
-				fd: 30,
-				sockets: 4,
-				sessions: 500,
-				streams: 20,
-				sessionTasks: 500,
-				streamTasks: 20,
-				queued: 0,
-			},
-		],
+		samples: h7Samples(H7_SAMPLE_COUNT),
 		...overrides,
 	} as unknown as SegmentArtifact);
 }
@@ -895,9 +904,12 @@ describe("hosted soak orchestration policy", () => {
 		expect(workflow).toContain(
 			`run-name: soak-long-${gh("inputs.campaign_seed")}`,
 		);
-		// The validator computes the checked-out HEAD itself; a self-hosted
-		// runner cannot pre-seed it through the workflow.
-		expect(workflow).not.toContain("ACTUAL_HEAD");
+		// The validator computes the checked-out HEAD itself. The workflow may
+		// only ever STRIP the seam, never assign it.
+		expect(workflow).toContain(
+			"env -u ACTUAL_HEAD bash scripts/validate-soak-inputs.sh",
+		);
+		expect(workflow).not.toMatch(/ACTUAL_HEAD\s*[:=]/);
 	});
 
 	test("validates campaign inputs before any toolchain setup", () => {
@@ -929,11 +941,19 @@ describe("hosted soak orchestration policy", () => {
 			["DATAGRAM_BATCH", "32"],
 			["RSS_CEILING_MB", "1024"],
 			["COMMITTED_ABORT_MB", "1500"],
+			// Rejected by the earlier index-within-count rule rather than by the
+			// H7 tuple itself; the tuple arm is defense in depth.
+			["SEGMENT_INDEX", "2"],
 		] as const) {
 			expect(runH7Validator({ [key]: value }).status, key).toBe(1);
 		}
 
 		const workflow = readFileSync(WORKFLOW, "utf8");
+		// The seam must be stripped before the validator runs: a dispatch cannot
+		// set ACTUAL_HEAD, but a self-hosted runner's environment could.
+		expect(workflow).toContain(
+			"env -u ACTUAL_HEAD bash scripts/validate-soak-inputs.sh",
+		);
 		expect(workflow).toContain("h7-batch-delivery-[0-9a-f]{40}");
 		expect(workflow).toContain('PROFILE="h7-fixed-large"');
 		expect(workflow).toContain("H7 hosted lane requires >= 5 CPUs");
@@ -985,40 +1005,69 @@ describe("h7 hosted evidence contract", () => {
 	});
 
 	test("rejects one wrong field at a time", () => {
-		const cases: Array<[string, Record<string, unknown>]> = [
-			["dirty tree", { source: { head: H7_SHA, dirty: true } }],
-			["wrong head", { source: { head: "e".repeat(40), dirty: false } }],
-			["missing workflow ref", { workflowSource: { ref: null, sha: H7_SHA } }],
+		// Each case names the message that must reject it, so a refactor cannot
+		// silently turn a specific binding into an incidental failure elsewhere.
+		const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+			[
+				"dirty tree",
+				{ source: { head: H7_SHA, dirty: true } },
+				/source tree cleanliness/i,
+			],
+			[
+				"wrong head",
+				{ source: { head: "e".repeat(40), dirty: false } },
+				/source head commit/i,
+			],
+			[
+				"missing workflow ref",
+				{ workflowSource: { ref: null, sha: H7_SHA } },
+				/workflowSource\.ref/i,
+			],
 			[
 				"wrong workflow ref",
 				{ workflowSource: { ref: "refs/heads/main", sha: H7_SHA } },
+				/workflowSource\.ref/i,
 			],
-			["missing workflow sha", { workflowSource: { ref: H7_REF, sha: null } }],
+			[
+				"missing workflow sha",
+				{ workflowSource: { ref: H7_REF, sha: null } },
+				/workflowSource\.sha/i,
+			],
 			[
 				"wrong workflow sha",
 				{ workflowSource: { ref: H7_REF, sha: "f".repeat(40) } },
+				/workflowSource\.sha/i,
 			],
-			["wrong seed", { seed: "other-seed" }],
-			["wrong continuity token", { continuityTokenDigest: "0".repeat(64) }],
-			["wrong runner type", { runnerType: "github-hosted" }],
-			["wrong runner mode", { runnerMode: "shared" }],
-			["wrong runner profile", { runnerProfile: "large" }],
+			["wrong seed", { seed: "other-seed" }, /seed/i],
+			[
+				"wrong continuity token",
+				{ continuityTokenDigest: "0".repeat(64) },
+				/continuityTokenDigest/i,
+			],
+			["wrong runner type", { runnerType: "github-hosted" }, /runnerType/i],
+			["wrong runner mode", { runnerMode: "shared" }, /runnerMode/i],
+			["wrong runner profile", { runnerProfile: "large" }, /runnerProfile/i],
 			[
 				"wrong sessions rate",
 				{ rates: { sessions: 300, datagramsPerSec: 500, streamsPerSec: 5 } },
+				/rates\.sessions/i,
 			],
 			[
 				"wrong datagram rate",
 				{ rates: { sessions: 500, datagramsPerSec: 300, streamsPerSec: 5 } },
+				/rates\.datagramsPerSec/i,
 			],
 			[
 				"wrong stream rate",
 				{ rates: { sessions: 500, datagramsPerSec: 500, streamsPerSec: 4 } },
+				/rates\.streamsPerSec/i,
 			],
-			["wrong duration", { durationSeconds: 3600 }],
-			["wrong segment count", { segmentCount: 2 }],
+			["wrong duration", { durationSeconds: 3600 }, /durationSeconds/i],
+			// Caught by the aggregator's segment-count rule before the verifier's
+			// own check — fail-closed either way, and the regex records which.
+			["wrong segment count", { segmentCount: 2 }, /expected 2 segments/i],
 		];
-		for (const [label, override] of cases) {
+		for (const [label, override, pattern] of cases) {
 			const { aggregatePath, segmentPath } = writeH7Pair(
 				"neg",
 				h7Segment(override),
@@ -1026,7 +1075,7 @@ describe("h7 hosted evidence contract", () => {
 			expect(
 				() => verifyH7Hosted(aggregatePath, segmentPath, H7_EXPECTATIONS),
 				label,
-			).toThrow();
+			).toThrow(pattern);
 		}
 	});
 
@@ -1047,16 +1096,26 @@ describe("h7 hosted evidence contract", () => {
 				...patch,
 			},
 		});
-		const cases: Array<[string, Record<string, unknown>]> = [
-			["requested batch", delivery({ datagramBatchRequested: "32" })],
-			["resolved batch", delivery({ datagramBatchResolved: 32 })],
+		const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+			[
+				"requested batch",
+				delivery({ datagramBatchRequested: "32" }),
+				/datagramBatchRequested/i,
+			],
+			[
+				"resolved batch",
+				delivery({ datagramBatchResolved: 32 }),
+				/datagramBatchResolved/i,
+			],
 			[
 				"requested payload mode",
 				delivery({ payloadDeliveryRequested: "buffer-copy" }),
+				/payloadDeliveryRequested/i,
 			],
 			[
 				"resolved payload mode",
 				delivery({ payloadDeliveryResolved: "buffer-copy" }),
+				/payloadDeliveryResolved/i,
 			],
 			[
 				"diagnostics enabled",
@@ -1064,18 +1123,27 @@ describe("h7 hosted evidence contract", () => {
 					diagnosticsEnabled: true,
 					diagnostics: { batchReadCalls: 1 },
 				}),
+				/diagnosticsEnabled/i,
 			],
 			[
 				"low delivery ratio",
 				delivery({ datagramsReceived: 900_000, deliveryRatio: 0.9 }),
+				/delivery ratio/i,
 			],
-			["no datagrams sent", delivery({ datagramsSent: 0, deliveryRatio: 0 })],
+			[
+				"no datagrams sent",
+				delivery({ datagramsSent: 0, deliveryRatio: 0 }),
+				/no datagrams sent/i,
+			],
+			// Caught one layer earlier, by validateDeliveryRecord's finiteness
+			// rule inside aggregateSegments.
 			[
 				"non-finite ratio",
 				delivery({ deliveryRatio: null as unknown as number }),
+				/non-finite or negative deliveryRatio/i,
 			],
 		];
-		for (const [label, override] of cases) {
+		for (const [label, override, pattern] of cases) {
 			const { aggregatePath, segmentPath } = writeH7Pair(
 				"delivery",
 				h7Segment(override),
@@ -1083,31 +1151,154 @@ describe("h7 hosted evidence contract", () => {
 			expect(
 				() => verifyH7Hosted(aggregatePath, segmentPath, H7_EXPECTATIONS),
 				label,
-			).toThrow();
+			).toThrow(pattern);
 		}
 	});
 
-	test("rejects an excessive charged peak, heap debug, and a wrong breaker", () => {
-		const peak = writeH7Pair(
-			"peak",
+	test("rejects a declared duration the wall span does not support", () => {
+		// Exactly the hole the first draft shipped: a one-second span carrying a
+		// single sample, self-declaring a two-hour run. Every other gate passed.
+		const todaysHole = writeH7Pair(
+			"hole",
 			h7Segment({
-				samples: [
-					{
-						ts_ms: 1,
-						phase: "overload",
-						rss: H7_RSS_CEIL_MB + 1,
-						heapUsedMb: 40,
-						fd: 30,
-						sockets: 4,
-						sessions: 500,
-						streams: 20,
-						sessionTasks: 500,
-						streamTasks: 20,
-						queued: 0,
-					},
+				startedAtMs: 1_000,
+				endedAtMs: 2_000,
+				samples: h7Samples(1),
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				todaysHole.aggregatePath,
+				todaysHole.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/wall span/i);
+
+		// A five-minute run mislabeled as two hours.
+		const short = writeH7Pair(
+			"short",
+			h7Segment({
+				endedAtMs: H7_STARTED_AT_MS + 300 * 1000,
+				samples: h7Samples(10),
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(short.aggregatePath, short.segmentPath, H7_EXPECTATIONS),
+		).toThrow(/wall span/i);
+
+		// Span longer than declared is equally a mislabel.
+		const long = writeH7Pair(
+			"long",
+			h7Segment({
+				endedAtMs: H7_STARTED_AT_MS + 14_400 * 1000,
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(long.aggregatePath, long.segmentPath, H7_EXPECTATIONS),
+		).toThrow(/wall span/i);
+
+		// Inside the stated tolerance the real overhead of a genuine run passes.
+		const withinTolerance = writeH7Pair(
+			"tolerated",
+			h7Segment({
+				endedAtMs: H7_STARTED_AT_MS + (H7_DURATION_SECONDS + 120) * 1000,
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				withinTolerance.aggregatePath,
+				withinTolerance.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).not.toThrow();
+	});
+
+	test("rejects a segment whose sampler died partway through", () => {
+		// 7200s at one sample per 30s is 240 expected; the floor is 80% of that.
+		for (const count of [1, 100, 191]) {
+			const sparse = writeH7Pair(
+				"sparse",
+				h7Segment({ samples: h7Samples(count) }),
+			);
+			expect(
+				() =>
+					verifyH7Hosted(
+						sparse.aggregatePath,
+						sparse.segmentPath,
+						H7_EXPECTATIONS,
+					),
+				`count=${count}`,
+			).toThrow(/sample/i);
+		}
+		const atFloor = writeH7Pair(
+			"floor",
+			h7Segment({ samples: h7Samples(192) }),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				atFloor.aggregatePath,
+				atFloor.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).not.toThrow();
+	});
+
+	test("rejects a missing or unobserved datagram-echo operation class", () => {
+		const notRequired = writeH7Pair(
+			"noreq",
+			h7Segment({
+				requiredOperationClasses: [
+					"uni-echo",
+					"bidi-echo",
+					"stream-reset",
+					"stop-sending",
+					"idle-peers",
+					"overload",
+					"reconnect-churn",
+					"cert-rotation",
 				],
 			}),
 		);
+		expect(() =>
+			verifyH7Hosted(
+				notRequired.aggregatePath,
+				notRequired.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/did not require the datagram-echo/i);
+
+		const unobserved = writeH7Pair(
+			"noobs",
+			h7Segment({
+				observedOperationCounts: {
+					"datagram-echo": 0,
+					"uni-echo": 3,
+					"bidi-echo": 3,
+					"stream-reset": 2,
+					"stop-sending": 2,
+					"idle-peers": 1,
+					overload: 1,
+					"reconnect-churn": 1,
+					"cert-rotation": 1,
+				},
+			}),
+		);
+		// Caught one layer earlier, by the aggregator's required-class rule.
+		expect(() =>
+			verifyH7Hosted(
+				unobserved.aggregatePath,
+				unobserved.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/required operation class|canonically equal/i);
+	});
+
+	test("rejects an excessive charged peak, heap debug, and a wrong breaker", () => {
+		// A full series, so this fails on the ceiling rather than on density.
+		const overCeiling = h7Samples(H7_SAMPLE_COUNT);
+		const spike = overCeiling[10];
+		if (spike) spike.rss = H7_RSS_CEIL_MB + 1;
+		const peak = writeH7Pair("peak", h7Segment({ samples: overCeiling }));
 		expect(() =>
 			verifyH7Hosted(peak.aggregatePath, peak.segmentPath, H7_EXPECTATIONS),
 		).toThrow(/peak|ceiling/i);
