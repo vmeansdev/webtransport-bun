@@ -35,6 +35,9 @@ const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
 const DEFAULT_RECONNECT_HOLD_MS: u64 = 1_000;
+/// 0 keeps the legacy tiny string payloads; a positive value pads every load
+/// datagram to exactly that many bytes for bandwidth-oriented runs.
+const DEFAULT_PAYLOAD_BYTES: usize = 0;
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
 const PROBE_UNI_ECHO_PREFIX: &str = "probe:uni-echo:";
@@ -101,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_stream_errors = DEFAULT_MAX_STREAM_ERRORS;
     let mut reconnect_hold_ms = DEFAULT_RECONNECT_HOLD_MS;
     let mut skip_probes = false;
+    let mut payload_bytes = DEFAULT_PAYLOAD_BYTES;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -149,18 +153,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parse_or_default("--hold-ms", args.next(), DEFAULT_RECONNECT_HOLD_MS)
             }
             "--skip-probes" => skip_probes = true,
+            "--payload-bytes" => {
+                payload_bytes =
+                    parse_or_default("--payload-bytes", args.next(), DEFAULT_PAYLOAD_BYTES)
+            }
             _ => {}
         }
     }
 
     println!(
-        "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
+        "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} payload_bytes={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
         mode.as_str(),
         url,
         sessions,
         duration_secs,
         datagrams_per_sec,
         streams_per_sec,
+        payload_bytes,
         reconnect_hold_ms,
         skip_probes,
         max_session_errors,
@@ -181,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         streams_per_sec,
         reconnect_hold: Duration::from_millis(reconnect_hold_ms),
         skip_probes,
+        payload_bytes,
         budgets: ErrorBudgets {
             max_session_errors,
             max_datagram_errors,
@@ -195,6 +205,9 @@ struct Counters {
     sessions_err: AtomicU64,
     datagrams_sent: AtomicU64,
     datagrams_err: AtomicU64,
+    datagrams_received: AtomicU64,
+    datagram_bytes_sent: AtomicU64,
+    datagram_bytes_received: AtomicU64,
     streams_opened: AtomicU64,
     load_streams_opened: AtomicU64,
     streams_err: AtomicU64,
@@ -222,6 +235,7 @@ struct RunOptions<'a> {
     streams_per_sec: u64,
     reconnect_hold: Duration,
     skip_probes: bool,
+    payload_bytes: usize,
     budgets: ErrorBudgets,
 }
 
@@ -245,7 +259,10 @@ fn load_summary_json(mode: ClientMode, counters: &Counters) -> String {
             "\"stream-reset\":{},",
             "\"stop-sending\":{}",
             "}},",
-            "\"observedReconnects\":{}",
+            "\"observedReconnects\":{},",
+            "\"datagramsReceived\":{},",
+            "\"datagramBytesSent\":{},",
+            "\"datagramBytesReceived\":{}",
             "}}"
         ),
         mode.as_str(),
@@ -255,6 +272,9 @@ fn load_summary_json(mode: ClientMode, counters: &Counters) -> String {
         counters.stream_reset_ok.load(Ordering::Relaxed),
         counters.stop_sending_ok.load(Ordering::Relaxed),
         counters.reconnects_ok.load(Ordering::Relaxed),
+        counters.datagrams_received.load(Ordering::Relaxed),
+        counters.datagram_bytes_sent.load(Ordering::Relaxed),
+        counters.datagram_bytes_received.load(Ordering::Relaxed),
     )
 }
 
@@ -387,6 +407,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         streams_per_sec,
         reconnect_hold,
         skip_probes,
+        payload_bytes,
         budgets,
     } = options;
     let config = ClientConfig::builder()
@@ -419,6 +440,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                                 duration,
                                 datagrams_per_sec,
                                 streams_per_sec,
+                                payload_bytes,
                                 counters.as_ref(),
                             )
                             .await;
@@ -468,6 +490,12 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     );
     println!("load-client: sessions ok={} err={}", ok, err);
     println!("load-client: datagrams sent={} err={}", dg_sent, dg_err);
+    println!(
+        "load-client: datagrams received={} bytes tx={} rx={}",
+        counters.datagrams_received.load(Ordering::Relaxed),
+        counters.datagram_bytes_sent.load(Ordering::Relaxed),
+        counters.datagram_bytes_received.load(Ordering::Relaxed)
+    );
     println!("load-client: streams opened={} err={}", st_open, st_err);
     println!(
         "load-client: load streams opened={}",
@@ -516,6 +544,7 @@ async fn run_session(
     duration: Duration,
     datagrams_per_sec: u64,
     streams_per_sec: u64,
+    payload_bytes: usize,
     counters: &Counters,
 ) {
     let start = Instant::now();
@@ -536,15 +565,44 @@ async fn run_session(
     dg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     st_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Padded template for bandwidth runs; the per-datagram id is stamped over
+    // the prefix region so every payload stays unique without a fresh alloc.
+    let mut padded = if payload_bytes > 0 {
+        vec![b'x'; payload_bytes]
+    } else {
+        Vec::new()
+    };
+
     while start.elapsed() < duration {
         tokio::select! {
             _ = conn.closed() => break,
             _ = dg_ticker.tick() => {
-                let payload = format!("load:datagram:{}", next_probe_id());
-                if conn.send_datagram(payload.as_bytes()).is_ok() {
+                let sent = if payload_bytes > 0 {
+                    let header = format!("load:datagram:{}:", next_probe_id());
+                    let n = header.len().min(padded.len());
+                    padded[..n].copy_from_slice(&header.as_bytes()[..n]);
+                    conn.send_datagram(&padded)
+                } else {
+                    let payload = format!("load:datagram:{}", next_probe_id());
+                    conn.send_datagram(payload.as_bytes())
+                };
+                if sent.is_ok() {
                     counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+                    let len = if payload_bytes > 0 { payload_bytes as u64 } else { 0 };
+                    counters.datagram_bytes_sent.fetch_add(len, Ordering::Relaxed);
                 } else {
                     counters.datagrams_err.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            received = conn.receive_datagram() => {
+                match received {
+                    Ok(datagram) => {
+                        counters.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                        counters
+                            .datagram_bytes_received
+                            .fetch_add(datagram.as_ref().len() as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => break,
                 }
             }
             _ = st_ticker.tick() => {
