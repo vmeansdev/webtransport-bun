@@ -57,6 +57,7 @@ pub struct StreamBudget {
     pub max_global: u64,
     pub max_session: u64,
     pub max_stream: u64,
+    pub backpressure_timeout_ms: u64,
 }
 
 impl StreamBudget {
@@ -100,6 +101,32 @@ impl StreamBudget {
             return false;
         }
         true
+    }
+
+    /// Reserve, waiting up to `backpressure_timeout_ms` for capacity to drain.
+    /// Applies backpressure instead of failing on a momentarily-full queue.
+    /// Returns false only on timeout. Updates backpressure wait/timeout metrics.
+    pub async fn reserve_or_wait(&self, n: u64) -> bool {
+        if self.try_reserve(n) {
+            return true;
+        }
+        self.server_metrics
+            .backpressure_wait_count
+            .fetch_add(1, Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            if self.try_reserve(n) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.server_metrics
+                    .backpressure_timeout_count
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
     }
 
     pub fn release(&self, n: u64) {
@@ -240,8 +267,8 @@ impl ClientBidiStreamHandle {
         }
         let sz = bytes.len() as u64;
         if let Some(ref b) = self.budget {
-            if !b.try_reserve(sz) {
-                return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+            if !b.reserve_or_wait(sz).await {
+                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
         if tx.send(StreamCmd::Data(bytes)).await.is_err() {
@@ -360,8 +387,8 @@ impl ClientUniSendHandle {
         }
         let sz = bytes.len() as u64;
         if let Some(ref b) = self.budget {
-            if !b.try_reserve(sz) {
-                return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+            if !b.reserve_or_wait(sz).await {
+                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
         if tx.send(StreamCmd::Data(bytes)).await.is_err() {
@@ -540,7 +567,7 @@ pub fn spawn_bidi_bridge_on(
                         Ok(Some(n)) => {
                             let sz = n as u64;
                             if let Some(ref b) = read_budget {
-                                if !b.try_reserve(sz) {
+                                if !b.reserve_or_wait(sz).await {
                                     recv_stream.stop(VarInt::from_u32(0));
                                     break;
                                 }
@@ -781,7 +808,7 @@ pub fn spawn_uni_recv_bridge_on(
                         Ok(Some(n)) => {
                             let sz = n as u64;
                             if let Some(ref b) = budget {
-                                if !b.try_reserve(sz) {
+                                if !b.reserve_or_wait(sz).await {
                                     recv_stream.stop(VarInt::from_u32(0));
                                     break;
                                 }

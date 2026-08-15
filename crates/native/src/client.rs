@@ -425,6 +425,7 @@ impl ClientSessionHandle {
                 max_global,
                 max_session,
                 max_stream,
+                backpressure_timeout_ms,
             }
         };
 
@@ -865,13 +866,15 @@ fn build_client_tls_config(
             .dangerous()
             .set_certificate_verifier(Arc::new(InsecureVerifier));
     } else if !pinned_hashes.is_empty() {
-        let base = rustls::client::WebPkiServerVerifier::builder(Arc::clone(&root_store))
-            .build()
-            .map_err(|e| format!("E_TLS: failed to build certificate verifier: {}", e))?;
+        // W3C serverCertificateHashes semantics: the pin REPLACES chain trust
+        // (self-signed short-lived certs are the intended use). Chain building
+        // via WebPkiServerVerifier is wrong here twice over: it panics when no
+        // process-level CryptoProvider is installed (rustls builder_with_provider
+        // configs never install one), and an empty/unrelated root store can
+        // never validate the self-signed leaf the pin points at.
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(PinnedCertVerifier {
-                inner: base,
                 pins: pinned_hashes.to_vec(),
             }));
     }
@@ -933,7 +936,6 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 
 #[derive(Debug)]
 struct PinnedCertVerifier {
-    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     pins: Vec<[u8; 32]>,
 }
 
@@ -941,18 +943,11 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
-        now: rustls::pki_types::UnixTime,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        )?;
         let mut hasher = Sha256::new();
         hasher.update(end_entity.as_ref());
         let actual: [u8; 32] = hasher.finalize().into();
@@ -971,7 +966,12 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -980,11 +980,18 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
