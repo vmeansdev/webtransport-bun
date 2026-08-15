@@ -411,11 +411,16 @@ async function runChildTrial(trial: number): Promise<ChildOutcome> {
 				timer = setTimeout(() => r("timeout"), TRIAL_TIMEOUT_MS);
 			}),
 		]);
-		const stdout = await new Response(proc.stdout).text();
-		const stderr = await new Response(proc.stderr).text();
+		// Kill BEFORE draining. A hung child never exits and never closes its
+		// pipes, so draining first blocks forever in exactly the scenario the
+		// deadline exists for — the timeout would not bound anything.
 		if (exited === "timeout") {
 			timedOut = true;
 			proc.kill("SIGKILL");
+		}
+		const stdout = await new Response(proc.stdout).text();
+		const stderr = await new Response(proc.stderr).text();
+		if (exited === "timeout") {
 			return {
 				trial,
 				pass: false,
@@ -459,7 +464,14 @@ async function runChildTrial(trial: number): Promise<ChildOutcome> {
 async function runParent(): Promise<void> {
 	const head = gitOutput(["rev-parse", "HEAD"]);
 	const dirty = gitOutput(["status", "--porcelain"]).length > 0;
-	const candidate = process.env.SOAK_CANDIDATE_COMMIT ?? head;
+	// Only an externally supplied candidate binds anything: falling back to HEAD
+	// compares the value to itself. The fallback stays, because the documented
+	// invocation sets no such variable and a local diagnostic run is still
+	// useful — but the artifact says which of the two happened, so a reader
+	// cannot mistake a self-comparison for a binding.
+	const externalCandidate = process.env.SOAK_CANDIDATE_COMMIT;
+	const candidate = externalCandidate ?? head;
+	const candidateBinding = externalCandidate ? "external" : "self-reference";
 
 	const trials: ChildOutcome[] = [];
 	// Sequential: three concurrent QUIC churn trials on one host would measure
@@ -488,6 +500,7 @@ async function runParent(): Promise<void> {
 		generatedAtMs: Date.now(),
 		head,
 		candidate,
+		candidateBinding,
 		dirty,
 		trials: TRIALS,
 		sessionPairs: SESSION_PAIRS,
@@ -500,6 +513,13 @@ async function runParent(): Promise<void> {
 	};
 	mkdirSync(dirname(ARTIFACT_PATH), { recursive: true });
 	writeFileSync(ARTIFACT_PATH, JSON.stringify(artifact, null, 2));
+	if (candidateBinding === "self-reference") {
+		console.warn(
+			"datagram-batch-churn: SOAK_CANDIDATE_COMMIT is unset, so the " +
+				"HEAD-equals-candidate check compared HEAD to itself. Set it to bind " +
+				"this artifact to a candidate externally.",
+		);
+	}
 	console.log(
 		artifact.status === "pass"
 			? "datagram-batch-churn: PASS"

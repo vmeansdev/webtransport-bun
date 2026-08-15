@@ -1215,9 +1215,18 @@ jobs:
 			["DATAGRAM_BATCH", "32"],
 			["RSS_CEILING_MB", "1024"],
 			["COMMITTED_ABORT_MB", "1500"],
+			// Rejected by the earlier index-within-count rule rather than by the
+			// H7 tuple itself; the tuple arm is defense in depth.
+			["SEGMENT_INDEX", "2"],
 		] as const) {
 			expect(runH7SoakInputValidation({ [key]: value }).status, key).toBe(1);
 		}
+		// The validator must always compute HEAD itself: a dispatch cannot set
+		// ACTUAL_HEAD, but a self-hosted runner's exported environment could, so
+		// the step strips it the same way it strips the delivery knobs.
+		expect(SOAK_WORKFLOW).toContain(
+			"env -u ACTUAL_HEAD bash scripts/validate-soak-inputs.sh",
+		);
 		// Non-H7 lanes keep the previous candidate-ref policy.
 		expect(
 			runSoakInputValidation({ CANDIDATE_REF: "refs/tags/v1.0.0" }).status,
