@@ -91,7 +91,10 @@ describe("internal TS error propagation", () => {
 		).toBe(E_BACKPRESSURE_TIMEOUT);
 	});
 
-	it("NativeClientSession.incomingDatagrams propagates non-close errors", async () => {
+	// Under the default knob these drive readDatagramBatch; the legacy
+	// readDatagram equivalents run in the bounded child at the bottom of this
+	// describe, where WEBTRANSPORT_DATAGRAM_BATCH=0 is set before module load.
+	it("NativeClientSession.incomingDatagrams propagates non-close batch-read errors", async () => {
 		const session = __TESTING__.createNativeClientSessionForTests({
 			readDatagram: async () => {
 				throw new Error("E_INTERNAL: synthetic datagram failure");
@@ -112,7 +115,7 @@ describe("internal TS error propagation", () => {
 		expect((err as WebTransportError).code).toBe(E_INTERNAL);
 	});
 
-	it("NativeClientSession.incomingDatagrams treats session-close errors as EOF", async () => {
+	it("NativeClientSession.incomingDatagrams treats session-close batch-read errors as EOF", async () => {
 		const session = __TESTING__.createNativeClientSessionForTests({
 			readDatagram: async () => {
 				throw new Error(`${E_SESSION_CLOSED}: closed`);
