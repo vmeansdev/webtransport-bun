@@ -127,23 +127,66 @@ function mutatePublishWorkflowOccurrence(
 	return `${PUBLISH_WORKFLOW.slice(0, index)}${replacement}${PUBLISH_WORKFLOW.slice(index + search.length)}`;
 }
 
-function runSoakInputValidation(overrides: Record<string, string> = {}) {
+/** A GitHub Actions expression. Built rather than written literally so the
+ * `${` sigil never appears inside a plain string. */
+const gh = (body: string): string => `${"$"}{{ ${body} }}`;
+
+const H7_CANDIDATE_SHA = "0123456789abcdef0123456789abcdef01234567";
+const H7_CANDIDATE_REF = `refs/tags/h7-batch-delivery-${H7_CANDIDATE_SHA}`;
+
+function runSoakInputValidation(
+	overrides: Record<string, string | undefined> = {},
+) {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	Object.assign(env, {
+		CANDIDATE_COMMIT: "0123456789abcdef0123456789abcdef01234567",
+		CANDIDATE_REF: "refs/tags/v1.0.0",
+		CAMPAIGN_SEED: "seed-01",
+		CONTINUITY_TOKEN: "continuity-01",
+		DURATION_HOURS: "1",
+		RUNNER_TYPE: "github-hosted",
+		RUNNER_MODE: "shared",
+		SEGMENT_INDEX: "1",
+		SEGMENT_COUNT: "1",
+		DATAGRAM_BATCH: "64",
+		RSS_CEILING_MB: "1750",
+		COMMITTED_ABORT_MB: "1500",
+		WORKFLOW_REF: "refs/heads/main",
+		WORKFLOW_SHA: "89abcdef0123456789abcdef0123456789abcdef",
+	});
+	for (const [key, value] of Object.entries(overrides)) {
+		if (value === undefined) delete env[key];
+		else env[key] = value;
+	}
 	return spawnSync("bash", ["scripts/validate-soak-inputs.sh"], {
 		cwd: PROJECT_ROOT,
-		env: {
-			...process.env,
-			CANDIDATE_COMMIT: "0123456789abcdef0123456789abcdef01234567",
-			CANDIDATE_REF: "refs/tags/v1.0.0",
-			CAMPAIGN_SEED: "seed-01",
-			CONTINUITY_TOKEN: "continuity-01",
-			DURATION_HOURS: "1",
-			RUNNER_TYPE: "github-hosted",
-			RUNNER_MODE: "shared",
-			SEGMENT_INDEX: "1",
-			SEGMENT_COUNT: "1",
-			...overrides,
-		},
+		env,
 		encoding: "utf8",
+	});
+}
+
+/** The complete fixed hosted-H7 lane tuple, valid as supplied. */
+function runH7SoakInputValidation(
+	overrides: Record<string, string | undefined> = {},
+) {
+	return runSoakInputValidation({
+		CANDIDATE_COMMIT: H7_CANDIDATE_SHA,
+		CANDIDATE_REF: H7_CANDIDATE_REF,
+		WORKFLOW_REF: H7_CANDIDATE_REF,
+		WORKFLOW_SHA: H7_CANDIDATE_SHA,
+		ACTUAL_HEAD: H7_CANDIDATE_SHA,
+		DURATION_HOURS: "2",
+		RUNNER_TYPE: "self-hosted",
+		RUNNER_MODE: "dedicated",
+		SEGMENT_INDEX: "1",
+		SEGMENT_COUNT: "1",
+		DATAGRAM_BATCH: "64",
+		RSS_CEILING_MB: "1750",
+		COMMITTED_ABORT_MB: "2200",
+		...overrides,
 	});
 }
 
@@ -1063,5 +1106,135 @@ jobs:
 			"INPUT_CANDIDATE_COMMIT: " +
 				"${{ github.event.inputs.candidate_commit }}",
 		);
+	});
+
+	it("bounds the datagram batch and RSS ceiling soak inputs", () => {
+		for (const [key, value] of [
+			["DATAGRAM_BATCH", ""],
+			["DATAGRAM_BATCH", "-1"],
+			["DATAGRAM_BATCH", "257"],
+			["DATAGRAM_BATCH", "1.5"],
+			["DATAGRAM_BATCH", undefined],
+			["RSS_CEILING_MB", ""],
+			["RSS_CEILING_MB", "0"],
+			["RSS_CEILING_MB", "-1"],
+			["RSS_CEILING_MB", "1.5"],
+			["RSS_CEILING_MB", undefined],
+		] as const) {
+			const result = runSoakInputValidation({ [key]: value });
+			expect(result.status, `${key}=${String(value)}`).toBe(1);
+		}
+		expect(runSoakInputValidation({ DATAGRAM_BATCH: "0" }).status).toBe(0);
+		expect(runSoakInputValidation({ DATAGRAM_BATCH: "256" }).status).toBe(0);
+		expect(runSoakInputValidation({ RSS_CEILING_MB: "1" }).status).toBe(0);
+	});
+
+	it("declares the new soak inputs and threads them into the validator and run", () => {
+		const workflow = parseWorkflow(SOAK_WORKFLOW);
+		const inputs = (
+			Bun.YAML.parse(SOAK_WORKFLOW) as {
+				on?: {
+					workflow_dispatch?: {
+						inputs?: Record<string, { default?: unknown; required?: boolean }>;
+					};
+				};
+			}
+		).on?.workflow_dispatch?.inputs;
+		expect(inputs?.datagram_batch?.default).toBe("64");
+		expect(inputs?.datagram_batch?.required).toBe(true);
+		expect(inputs?.rss_ceiling_mb?.default).toBe("1750");
+		expect(inputs?.rss_ceiling_mb?.required).toBe(true);
+		// Existing lanes keep their current defaults, so a routine 1h/24h/72h
+		// dispatch behaves exactly as before.
+		expect(inputs?.committed_abort_mb?.default).toBe("1500");
+		expect(inputs?.duration_hours?.default).toBe("1");
+		expect(inputs?.runner_mode?.default).toBe("shared");
+
+		const steps = workflow.jobs?.soak?.steps ?? [];
+		const validateIndex = steps.findIndex(
+			(step) => step.name === "Validate campaign inputs",
+		);
+		const checkoutIndex = steps.findIndex((step) =>
+			String(step.uses ?? "").startsWith("actions/checkout@"),
+		);
+		expect(checkoutIndex).toBe(0);
+		expect(validateIndex).toBe(1);
+		const validateEnv = (steps[validateIndex]?.env ?? {}) as Record<
+			string,
+			string
+		>;
+		expect(validateEnv.DATAGRAM_BATCH).toBe(
+			gh("github.event.inputs.datagram_batch"),
+		);
+		expect(validateEnv.RSS_CEILING_MB).toBe(
+			gh("github.event.inputs.rss_ceiling_mb"),
+		);
+		expect(validateEnv.COMMITTED_ABORT_MB).toBe(
+			gh("github.event.inputs.committed_abort_mb"),
+		);
+		expect(validateEnv.WORKFLOW_REF).toBe(gh("github.ref"));
+		expect(validateEnv.WORKFLOW_SHA).toBe(gh("github.sha"));
+		expect(validateEnv).not.toHaveProperty("ACTUAL_HEAD");
+
+		const capacityEnv = (steps.find(
+			(step) => step.name === "Profile runner capacity",
+		)?.env ?? {}) as Record<string, string>;
+		expect(capacityEnv.WORKFLOW_REF).toBe(gh("github.ref"));
+		expect(capacityEnv.CANDIDATE_REF).toBe(
+			gh("github.event.inputs.candidate_ref"),
+		);
+
+		expect(SOAK_WORKFLOW).toContain(
+			`run-name: soak-long-${gh("inputs.campaign_seed")}`,
+		);
+		expect(SOAK_WORKFLOW).toContain(
+			`WEBTRANSPORT_DATAGRAM_BATCH: ${gh("github.event.inputs.datagram_batch")}`,
+		);
+		expect(SOAK_WORKFLOW).toContain(
+			`SOAK_RSS_CEIL_MB: ${gh("github.event.inputs.rss_ceiling_mb")}`,
+		);
+		expect(SOAK_WORKFLOW).toContain(
+			"env -u WEBTRANSPORT_PAYLOAD_DELIVERY -u WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS \\",
+		);
+	});
+
+	it("pins the hosted H7 tag identity and its fixed capacity profile", () => {
+		expect(runH7SoakInputValidation().status).toBe(0);
+		for (const [key, value] of [
+			["WORKFLOW_REF", "refs/heads/main"],
+			["WORKFLOW_SHA", "89abcdef0123456789abcdef0123456789abcdef"],
+			["ACTUAL_HEAD", "fedcba9876543210fedcba9876543210fedcba98"],
+			[
+				"CANDIDATE_REF",
+				"refs/tags/h7-batch-delivery-fedcba9876543210fedcba9876543210fedcba98",
+			],
+			["DURATION_HOURS", "1"],
+			["RUNNER_TYPE", "github-hosted"],
+			["RUNNER_MODE", "shared"],
+			["SEGMENT_COUNT", "5"],
+			["DATAGRAM_BATCH", "32"],
+			["RSS_CEILING_MB", "1024"],
+			["COMMITTED_ABORT_MB", "1500"],
+		] as const) {
+			expect(runH7SoakInputValidation({ [key]: value }).status, key).toBe(1);
+		}
+		// Non-H7 lanes keep the previous candidate-ref policy.
+		expect(
+			runSoakInputValidation({ CANDIDATE_REF: "refs/tags/v1.0.0" }).status,
+		).toBe(0);
+		expect(runSoakInputValidation({ CANDIDATE_REF: "" }).status).toBe(0);
+
+		// A qualifying H7 runner must never take the shared halving or the
+		// small-profile downscale branches.
+		const capacityRun = String(
+			(parseWorkflow(SOAK_WORKFLOW).jobs?.soak?.steps ?? []).find(
+				(step) => step.name === "Profile runner capacity",
+			)?.run ?? "",
+		);
+		expect(capacityRun).toContain('PROFILE="h7-fixed-large"');
+		expect(capacityRun).toContain("SOAK_SESSIONS=500");
+		expect(capacityRun).toContain("H7 hosted lane requires >= 5 CPUs");
+		expect(capacityRun).toContain("H7_FIXED=1");
+		expect(capacityRun).toMatch(/if \[ "\$H7_FIXED" != "1" \]/);
 	});
 });

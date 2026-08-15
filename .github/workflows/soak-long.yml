@@ -1,5 +1,8 @@
 # P2.2: Long soak jobs (1h, 2h, 24h, 72h). Trigger manually via workflow_dispatch.
 name: soak-long
+# Neutral and unique per campaign: an H7 dispatch has to be identifiable
+# without mislabeling the routine 1h/24h/72h runs that share this workflow.
+run-name: soak-long-${{ inputs.campaign_seed }}
 on:
   workflow_dispatch:
     inputs:
@@ -66,6 +69,16 @@ on:
         required: false
         default: "0"
         type: string
+      datagram_batch:
+        description: "WEBTRANSPORT_DATAGRAM_BATCH for the run (integer 0-256; 0 is the legacy one-at-a-time path)"
+        required: true
+        default: "64"
+        type: string
+      rss_ceiling_mb:
+        description: "Preregistered charged-memory ceiling in MB. 1750 matches the harness default max(1024, sessions*3.5) at the fixed 500-session H7 profile"
+        required: true
+        default: "1750"
+        type: string
 jobs:
   soak:
     permissions:
@@ -81,15 +94,8 @@ jobs:
         with:
           ref: ${{ github.event.inputs.candidate_commit }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
-        with:
-          toolchain: 1.95.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
-        with:
-          node-version: "22.23.1"
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: "1.3.14"
+      # Immediately after checkout, before any toolchain setup: a bad dispatch
+      # must fail in seconds, not after minutes of Rust/Node/Bun installs.
       - name: Validate campaign inputs
         env:
           CANDIDATE_COMMIT: ${{ github.event.inputs.candidate_commit }}
@@ -101,8 +107,22 @@ jobs:
           RUNNER_MODE: ${{ github.event.inputs.runner_mode }}
           SEGMENT_INDEX: ${{ github.event.inputs.segment_index }}
           SEGMENT_COUNT: ${{ github.event.inputs.segment_count }}
+          DATAGRAM_BATCH: ${{ github.event.inputs.datagram_batch }}
+          RSS_CEILING_MB: ${{ github.event.inputs.rss_ceiling_mb }}
+          COMMITTED_ABORT_MB: ${{ github.event.inputs.committed_abort_mb }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           bash scripts/validate-soak-inputs.sh
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
       - name: Install deps
         run: bun install --frozen-lockfile
       - name: Select supported C/C++ compiler
@@ -136,6 +156,8 @@ jobs:
       - name: Profile runner capacity
         env:
           RUNNER_MODE_INPUT: ${{ github.event.inputs.runner_mode || 'shared' }}
+          WORKFLOW_REF: ${{ github.ref }}
+          CANDIDATE_REF: ${{ github.event.inputs.candidate_ref }}
         run: |
           RUNNER_MODE="$RUNNER_MODE_INPUT"
           CPUS="$(nproc 2>/dev/null || echo 1)"
@@ -149,7 +171,27 @@ jobs:
           SOAK_DATAGRAMS_PER_SEC=500
           SOAK_STREAMS_PER_SEC=5
 
-          if [ "$CPUS" -le 1 ] || [ "$MEM_GB_CEIL" -lt 2 ]; then
+          # The hosted H7 lane is a fixed, preregistered workload. Its identity
+          # is re-derived here from the two dispatch values rather than trusted
+          # from an earlier step, and a runner too small for it fails instead of
+          # quietly producing evidence for a different workload than the one the
+          # claim names.
+          H7_FIXED=0
+          if [ "$WORKFLOW_REF" = "$CANDIDATE_REF" ] &&
+             printf '%s' "$CANDIDATE_REF" | grep -Eq '^refs/tags/h7-batch-delivery-[0-9a-f]{40}$'; then
+            H7_FIXED=1
+          fi
+
+          if [ "$H7_FIXED" = "1" ]; then
+            if [ "$CPUS" -lt 5 ] || [ "$MEM_GB_CEIL" -lt 8 ]; then
+              echo "::error::H7 hosted lane requires >= 5 CPUs and >= 8GB memory; this runner has ${CPUS} CPUs and ~${MEM_GB_CEIL}GB and must not be downscaled"
+              exit 1
+            fi
+            PROFILE="h7-fixed-large"
+            SOAK_SESSIONS=500
+            SOAK_DATAGRAMS_PER_SEC=500
+            SOAK_STREAMS_PER_SEC=5
+          elif [ "$CPUS" -le 1 ] || [ "$MEM_GB_CEIL" -lt 2 ]; then
             PROFILE="tiny"
             SOAK_SESSIONS=50
             SOAK_DATAGRAMS_PER_SEC=50
@@ -166,15 +208,17 @@ jobs:
             SOAK_STREAMS_PER_SEC=4
           fi
 
-          if [ "$RUNNER_MODE" = "shared" ]; then
-            SOAK_SESSIONS=$((SOAK_SESSIONS / 2))
-            SOAK_DATAGRAMS_PER_SEC=$((SOAK_DATAGRAMS_PER_SEC / 2))
-            SOAK_STREAMS_PER_SEC=$((SOAK_STREAMS_PER_SEC / 2))
-          fi
+          if [ "$H7_FIXED" != "1" ]; then
+            if [ "$RUNNER_MODE" = "shared" ]; then
+              SOAK_SESSIONS=$((SOAK_SESSIONS / 2))
+              SOAK_DATAGRAMS_PER_SEC=$((SOAK_DATAGRAMS_PER_SEC / 2))
+              SOAK_STREAMS_PER_SEC=$((SOAK_STREAMS_PER_SEC / 2))
+            fi
 
-          if [ "$SOAK_SESSIONS" -lt 20 ]; then SOAK_SESSIONS=20; fi
-          if [ "$SOAK_DATAGRAMS_PER_SEC" -lt 20 ]; then SOAK_DATAGRAMS_PER_SEC=20; fi
-          if [ "$SOAK_STREAMS_PER_SEC" -lt 1 ]; then SOAK_STREAMS_PER_SEC=1; fi
+            if [ "$SOAK_SESSIONS" -lt 20 ]; then SOAK_SESSIONS=20; fi
+            if [ "$SOAK_DATAGRAMS_PER_SEC" -lt 20 ]; then SOAK_DATAGRAMS_PER_SEC=20; fi
+            if [ "$SOAK_STREAMS_PER_SEC" -lt 1 ]; then SOAK_STREAMS_PER_SEC=1; fi
+          fi
 
           echo "RUNNER_MODE=$RUNNER_MODE" >> "$GITHUB_ENV"
           echo "RUNNER_CPUS=$CPUS" >> "$GITHUB_ENV"
@@ -254,6 +298,8 @@ jobs:
           INPUT_RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
           INPUT_SEGMENT_INDEX: ${{ github.event.inputs.segment_index || '1' }}
           INPUT_SEGMENT_COUNT: ${{ github.event.inputs.segment_count || '1' }}
+          INPUT_DATAGRAM_BATCH: ${{ github.event.inputs.datagram_batch }}
+          INPUT_RSS_CEILING_MB: ${{ github.event.inputs.rss_ceiling_mb }}
           # Native-drift forensics: the addon's mimalloc prints allocated-vs-
           # committed stats to stderr at process exit (captured in this log).
           MIMALLOC_SHOW_STATS: "1"
@@ -328,7 +374,10 @@ jobs:
           SOAK_PREVIOUS_FINAL_HASH="${PREVIOUS_FINAL_HASH:-}" \
           SOAK_COMMITTED_ABORT_MB="${INPUT_COMMITTED_ABORT_MB:-1500}" \
           SOAK_HEAP_DEBUG="${INPUT_HEAP_DEBUG:-0}" \
-          bun tools/load/soak-addon.ts
+          WEBTRANSPORT_DATAGRAM_BATCH=$INPUT_DATAGRAM_BATCH \
+          SOAK_RSS_CEIL_MB=$INPUT_RSS_CEILING_MB \
+          env -u WEBTRANSPORT_PAYLOAD_DELIVERY -u WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS \
+            bun tools/load/soak-addon.ts
         timeout-minutes: ${{ github.event.inputs.runner_type == 'github-hosted' && 300 || (github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '72' && 4350 || github.event.inputs.segment_count == '1' && github.event.inputs.duration_hours == '24' && 1470 || 365) }}
       - name: Validate segment evidence contract
         run: |
@@ -418,6 +467,10 @@ jobs:
         if: github.event.inputs.segment_index == github.event.inputs.segment_count
         env:
           INPUT_DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          # Aggregation only reads artifacts, but it loads the same module, so
+          # the resolved knobs stay identical to the ones the segments ran on.
+          WEBTRANSPORT_DATAGRAM_BATCH: ${{ github.event.inputs.datagram_batch }}
+          SOAK_RSS_CEIL_MB: ${{ github.event.inputs.rss_ceiling_mb }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.release-evidence"
           SOAK_AGGREGATE_OUT="$GITHUB_WORKSPACE/.release-evidence/soak-aggregate-${INPUT_DURATION_HOURS}h.json" \

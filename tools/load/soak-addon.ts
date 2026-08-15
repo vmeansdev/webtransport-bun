@@ -18,8 +18,8 @@ import {
 	appendFileSync,
 	existsSync,
 	mkdirSync,
-	readFileSync,
 	readdirSync,
+	readFileSync,
 	readlinkSync,
 	realpathSync,
 	statSync,
@@ -37,11 +37,11 @@ import {
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "../../packages/webtransport/src/index.ts";
-import { readPhysFootprintMb } from "./distributed-scale.ts";
 import {
 	type GeneratedCert,
 	generateLocalhostCert,
 } from "../../packages/webtransport/test/helpers/certs.ts";
+import { readPhysFootprintMb } from "./distributed-scale.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
@@ -75,9 +75,41 @@ const RSS_TREND_MIN_ABS_MB = parseFloat(
 // 3.5MB/session: observed overload-burst peaks at SESSIONS=500 range
 // 1073-1322MB across identical runs (scheduling variance), so 1750MB gives
 // ~30% headroom over the worst observed while still failing a 2x runaway.
-const RSS_CEIL_MB = parseFloat(
-	process.env.SOAK_RSS_CEIL_MB ?? String(Math.max(1024, SESSIONS * 3.5)),
-);
+export function loadProportionalRssCeilMb(sessions: number): number {
+	return Math.max(1024, sessions * 3.5);
+}
+
+/**
+ * Resolve the charged-memory ceiling.
+ *
+ * A dispatched `SOAK_RSS_CEIL_MB` may only *tighten* the load-proportional
+ * default, never loosen it. The hosted H7 lane needs 1750 because 1024 sits
+ * below its legitimately observed 1073-1322MB overload peaks at 500 sessions —
+ * a false-red fix scoped to that one lane. But the workflow propagates the
+ * input to every segment step, and handing a 250-session 1h run the same 1750
+ * would loosen a gate the H7 work never intended to touch. At 500 sessions the
+ * two numbers are identical (500 x 3.5 = 1750), so clamping costs H7 nothing.
+ *
+ * Fails closed on a malformed or non-positive value: the previous parseFloat
+ * turned a typo into NaN, and every `peak > NaN` comparison is false, which
+ * silently disabled the ceiling instead of aborting.
+ */
+export function resolveRssCeilMb(
+	requested: string | undefined,
+	sessions: number,
+): number {
+	const proportional = loadProportionalRssCeilMb(sessions);
+	if (requested === undefined || requested === "") return proportional;
+	const value = Number(requested);
+	if (!Number.isFinite(value) || value <= 0) {
+		throw new Error(
+			`SOAK_RSS_CEIL_MB=${JSON.stringify(requested)} is not a positive number`,
+		);
+	}
+	return Math.min(value, proportional);
+}
+
+const RSS_CEIL_MB = resolveRssCeilMb(process.env.SOAK_RSS_CEIL_MB, SESSIONS);
 const MAX_AGGREGATE_GAP_MS = parseInt(
 	process.env.SOAK_MAX_SEGMENT_GAP_MS ?? `${5 * 60 * 1000}`,
 	10,
@@ -304,6 +336,9 @@ type LoadClientSummary = {
 	sessionsErr: number;
 	datagramsSent: number;
 	datagramsErr: number;
+	/** Echoed back to the load client; `datagramsSent` alone cannot show that
+	 * the batched read path actually delivered what the server received. */
+	datagramsReceived: number;
 	streamsOpened: number;
 	streamsErr: number;
 	passLineSeen: boolean;
@@ -356,6 +391,44 @@ type ToolIdentity = {
 	version: string;
 };
 
+/** Which tree produced the evidence. A dirty worktree means the artifact
+ * cannot be bound to any commit, so H7 verification refuses it outright. */
+export type SourceRecord = {
+	head: string;
+	dirty: boolean;
+};
+
+/** The dispatch identity, taken only from the Actions context. Local and
+ * diagnostic runs legitimately have neither and record null. */
+export type WorkflowSourceRecord = {
+	ref: string | null;
+	sha: string | null;
+};
+
+export type H7DeliveryRecord = {
+	/** Raw `WEBTRANSPORT_DATAGRAM_BATCH`, before any parsing. */
+	datagramBatchRequested: string | null;
+	/** What the library resolved that request to, read from its own snapshot. */
+	datagramBatchResolved: number;
+	payloadDeliveryRequested: string | null;
+	payloadDeliveryResolved: "arraybuffer" | "buffer-copy";
+	diagnosticsEnabled: boolean;
+	/** Null when diagnostics are off — the harness never turns them on to
+	 * populate this field. */
+	diagnostics: Record<string, number> | null;
+	datagramsSent: number;
+	datagramsReceived: number;
+	deliveryRatio: number;
+};
+
+/** The configuration half of the delivery record: identical across every
+ * segment of one campaign, so it belongs in the aggregate hash. The counters
+ * are per-segment measurement and stay out of it. */
+export type H7DeliveryConfig = Omit<
+	H7DeliveryRecord,
+	"diagnostics" | "datagramsSent" | "datagramsReceived" | "deliveryRatio"
+>;
+
 export type SegmentMetadata = {
 	version: 1;
 	status: "pass" | "fail";
@@ -377,6 +450,9 @@ export type SegmentMetadata = {
 	runnerType: string;
 	runnerMode: string;
 	runnerProfile: string;
+	source: SourceRecord;
+	workflowSource: WorkflowSourceRecord;
+	h7Delivery: H7DeliveryRecord;
 	/** Debug/guard knobs active during the run — recorded so evidence readers
 	 * can see measurement perturbation (heap-stats scans) and breaker config. */
 	debugKnobs?: {
@@ -433,6 +509,26 @@ export type AggregateSummary = {
 	candidateCommit: string;
 	seed: string;
 	continuityTokenDigest: string;
+	/** Campaign-invariant identity and configuration, carried up so the
+	 * aggregate hash binds the workload that was actually run rather than just
+	 * the chain of segment hashes. Every field here must agree across all
+	 * segments or aggregation fails. */
+	source: SourceRecord;
+	workflowSource: WorkflowSourceRecord;
+	runnerType: string;
+	runnerMode: string;
+	runnerProfile: string;
+	rates: {
+		sessions: number;
+		datagramsPerSec: number;
+		streamsPerSec: number;
+	};
+	thresholds: SegmentMetadata["thresholds"];
+	debugKnobs: SegmentMetadata["debugKnobs"] | null;
+	h7Delivery: H7DeliveryConfig;
+	datagramsSent: number;
+	datagramsReceived: number;
+	deliveryRatio: number;
 	toolchain: {
 		bun: string;
 		rustc: string;
@@ -907,6 +1003,7 @@ function summarizeLoadClient(
 		sessionsErr: parseSummaryCounter(stdout, /sessions ok=\d+ err=(\d+)/),
 		datagramsSent: parseSummaryCounter(stdout, /datagrams sent=(\d+)/),
 		datagramsErr: parseSummaryCounter(stdout, /datagrams sent=\d+ err=(\d+)/),
+		datagramsReceived: parseSummaryCounter(stdout, /datagrams received=(\d+)/),
 		streamsOpened: parseSummaryCounter(stdout, /streams opened=(\d+)/),
 		streamsErr: parseSummaryCounter(stdout, /streams opened=\d+ err=(\d+)/),
 		passLineSeen: /\bload-client:\s+PASS\b/.test(stdout),
@@ -1031,6 +1128,55 @@ function gitCommit(): string {
 	}
 }
 
+/** Fails closed: a tree whose state cannot be read is treated as dirty, so an
+ * unreadable checkout can never masquerade as clean evidence. */
+function gitTreeDirty(): boolean {
+	try {
+		return (
+			execFileSync("git", ["status", "--porcelain"], {
+				encoding: "utf8",
+			}).trim().length > 0
+		);
+	} catch {
+		return true;
+	}
+}
+
+/** Both delivery knobs come from the library's own resolved snapshot; the
+ * harness never re-parses `WEBTRANSPORT_DATAGRAM_BATCH` itself. */
+function resolveH7Delivery(mainLoad: LoadClientSummary): H7DeliveryRecord {
+	const testing = __TESTING__ as unknown as {
+		datagramBatchConfigForTests: () => {
+			batchSize: number;
+			diagnosticsEnabled: boolean;
+		};
+		datagramBatchDiagnosticsSnapshotForTests: () => Record<string, number>;
+		nativePayloadDeliveryModeForTests: () => string | undefined;
+	};
+	const config = testing.datagramBatchConfigForTests();
+	const mode = testing.nativePayloadDeliveryModeForTests();
+	if (mode !== "arraybuffer" && mode !== "buffer-copy") {
+		throw new Error(
+			`native payload delivery mode ${JSON.stringify(mode)} is not a known mode`,
+		);
+	}
+	const sent = mainLoad.datagramsSent;
+	const received = mainLoad.datagramsReceived;
+	return {
+		datagramBatchRequested: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
+		datagramBatchResolved: config.batchSize,
+		payloadDeliveryRequested: process.env.WEBTRANSPORT_PAYLOAD_DELIVERY ?? null,
+		payloadDeliveryResolved: mode,
+		diagnosticsEnabled: config.diagnosticsEnabled,
+		diagnostics: config.diagnosticsEnabled
+			? testing.datagramBatchDiagnosticsSnapshotForTests()
+			: null,
+		datagramsSent: sent,
+		datagramsReceived: received,
+		deliveryRatio: sent > 0 ? received / sent : 0,
+	};
+}
+
 function ensureDirectory(path: string): void {
 	mkdirSync(resolve(path), { recursive: true });
 }
@@ -1051,6 +1197,49 @@ function listSegmentFiles(paths: string[]): string[] {
 		}
 	}
 	return [...new Set(resolved)].sort();
+}
+
+/** The delivery record's configuration half, with the counters stripped. */
+function h7DeliveryConfig(record: H7DeliveryRecord): H7DeliveryConfig {
+	return {
+		datagramBatchRequested: record.datagramBatchRequested,
+		datagramBatchResolved: record.datagramBatchResolved,
+		payloadDeliveryRequested: record.payloadDeliveryRequested,
+		payloadDeliveryResolved: record.payloadDeliveryResolved,
+		diagnosticsEnabled: record.diagnosticsEnabled,
+	};
+}
+
+function validateDeliveryRecord(segment: SegmentMetadata): void {
+	const delivery = segment.h7Delivery;
+	const label = `segment ${segment.segmentIndex}`;
+	if (!delivery || typeof delivery !== "object") {
+		throw new Error(`${label} is missing its h7Delivery record`);
+	}
+	if (!Number.isInteger(delivery.datagramBatchResolved)) {
+		throw new Error(`${label} has a non-integer resolved datagram batch`);
+	}
+	if (
+		delivery.payloadDeliveryResolved !== "arraybuffer" &&
+		delivery.payloadDeliveryResolved !== "buffer-copy"
+	) {
+		throw new Error(`${label} has an unknown resolved payload delivery mode`);
+	}
+	if (typeof delivery.diagnosticsEnabled !== "boolean") {
+		throw new Error(`${label} did not record whether diagnostics were on`);
+	}
+	if (!delivery.diagnosticsEnabled && delivery.diagnostics !== null) {
+		throw new Error(`${label} recorded diagnostics while reporting them off`);
+	}
+	for (const [field, value] of [
+		["datagramsSent", delivery.datagramsSent],
+		["datagramsReceived", delivery.datagramsReceived],
+		["deliveryRatio", delivery.deliveryRatio],
+	] as const) {
+		if (!Number.isFinite(value) || (value as number) < 0) {
+			throw new Error(`${label} has a non-finite or negative ${field}`);
+		}
+	}
 }
 
 function validateSegment(segment: SegmentMetadata): void {
@@ -1094,6 +1283,20 @@ function validateSegment(segment: SegmentMetadata): void {
 	if (segment.segmentHash !== expectedHash) {
 		throw new Error(`segment ${segment.segmentIndex} hash mismatch`);
 	}
+	if (!segment.source || typeof segment.source.head !== "string") {
+		throw new Error(`segment ${segment.segmentIndex} is missing its source`);
+	}
+	if (typeof segment.source.dirty !== "boolean") {
+		throw new Error(
+			`segment ${segment.segmentIndex} did not record tree cleanliness`,
+		);
+	}
+	if (!segment.workflowSource) {
+		throw new Error(
+			`segment ${segment.segmentIndex} is missing its workflow source`,
+		);
+	}
+	validateDeliveryRecord(segment);
 	const observedOperationCounts = normalizeSegmentOperationCounts(
 		segment.observedOperationCounts,
 	);
@@ -1190,6 +1393,27 @@ export function aggregateSegments(
 		if (sha256Hex(current.toolchain) !== sha256Hex(first.toolchain)) {
 			throw new Error(`segment ${current.segmentIndex} toolchain drifted`);
 		}
+		for (const [field, left, right] of [
+			["source", current.source, first.source],
+			["workflowSource", current.workflowSource, first.workflowSource],
+			["runnerType", current.runnerType, first.runnerType],
+			["runnerMode", current.runnerMode, first.runnerMode],
+			["runnerProfile", current.runnerProfile, first.runnerProfile],
+			["rates", current.rates, first.rates],
+			["thresholds", current.thresholds, first.thresholds],
+			["debugKnobs", current.debugKnobs ?? null, first.debugKnobs ?? null],
+			[
+				"delivery configuration",
+				h7DeliveryConfig(current.h7Delivery),
+				h7DeliveryConfig(first.h7Delivery),
+			],
+		] as const) {
+			if (sha256Hex(left) !== sha256Hex(right)) {
+				throw new Error(
+					`segment ${current.segmentIndex} ${field} drifted from segment 1`,
+				);
+			}
+		}
 		if (index === 0) {
 			if (current.previousFinalHash !== null) {
 				throw new Error("segment 1 cannot have a predecessor");
@@ -1217,6 +1441,15 @@ export function aggregateSegments(
 		}
 	}
 
+	const datagramsSent = ordered.reduce(
+		(sum, segment) => sum + segment.h7Delivery.datagramsSent,
+		0,
+	);
+	const datagramsReceived = ordered.reduce(
+		(sum, segment) => sum + segment.h7Delivery.datagramsReceived,
+		0,
+	);
+
 	const aggregatePayload = {
 		mode: "aggregate" as const,
 		status: "pass" as const,
@@ -1225,6 +1458,18 @@ export function aggregateSegments(
 		candidateCommit: first.candidateCommit,
 		seed: first.seed,
 		continuityTokenDigest: first.continuityTokenDigest,
+		source: first.source,
+		workflowSource: first.workflowSource,
+		runnerType: first.runnerType,
+		runnerMode: first.runnerMode,
+		runnerProfile: first.runnerProfile,
+		rates: first.rates,
+		thresholds: first.thresholds,
+		debugKnobs: first.debugKnobs ?? null,
+		h7Delivery: h7DeliveryConfig(first.h7Delivery),
+		datagramsSent,
+		datagramsReceived,
+		deliveryRatio: datagramsSent > 0 ? datagramsReceived / datagramsSent : 0,
 		toolchain: first.toolchain,
 		segments: ordered.map((segment) => ({
 			index: segment.segmentIndex,
@@ -2517,6 +2762,14 @@ async function runSegment(): Promise<void> {
 		runnerType: process.env.SOAK_RUNNER_TYPE ?? "local",
 		runnerMode: process.env.RUNNER_MODE ?? "local",
 		runnerProfile: process.env.SOAK_PROFILE ?? "local",
+		source: { head: actualCommit, dirty: gitTreeDirty() },
+		// Only the Actions context may populate these; a local run records
+		// nulls rather than inventing a dispatch identity.
+		workflowSource: {
+			ref: process.env.GITHUB_REF ?? null,
+			sha: process.env.GITHUB_SHA ?? null,
+		},
+		h7Delivery: resolveH7Delivery(mainLoad),
 		debugKnobs: {
 			heapDebug: HEAP_DEBUG,
 			heapDebugIntervalMs: HEAP_DEBUG_INTERVAL_MS,
@@ -2703,6 +2956,364 @@ async function maybeProtectedDump(): Promise<void> {
 	);
 }
 
+export type H7HostedExpectations = {
+	sha: string;
+	batch: number;
+	rssCeilMb: number;
+	durationSeconds: number;
+	seed: string;
+	continuityToken: string;
+	workflowRef: string;
+};
+
+const H7_TAG_PATTERN = /^refs\/tags\/h7-batch-delivery-[0-9a-f]{40}$/;
+const H7_MIN_DELIVERY_RATIO = 0.95;
+/** Dispatched circuit breaker. It gates RssAnon+VmSwap while `rssCeilMb`
+ * gates the charged metric, so sitting above the ceiling is a margin
+ * heuristic between two different metrics, not a guarantee that the breaker
+ * cannot fire first. */
+const H7_COMMITTED_ABORT_MB = 2200;
+const H7_RATES = {
+	sessions: 500,
+	datagramsPerSec: 500,
+	streamsPerSec: 5,
+} as const;
+
+function expectExact(label: string, actual: unknown, expected: unknown): void {
+	if (!Object.is(actual, expected)) {
+		throw new Error(
+			`${label}: expected ${JSON.stringify(expected)}, found ${JSON.stringify(actual)}`,
+		);
+	}
+}
+
+function readJsonFile<T>(label: string, path: string): T {
+	const full = resolve(path);
+	if (!existsSync(full)) throw new Error(`${label} ${full} does not exist`);
+	try {
+		return JSON.parse(readFileSync(full, "utf8")) as T;
+	} catch (error) {
+		throw new Error(`${label} ${full} is not parseable JSON: ${String(error)}`);
+	}
+}
+
+/**
+ * Bind a downloaded hosted-H7 campaign to the exact run that was
+ * preregistered for it. Every field is checked against a supplied
+ * expectation rather than against whatever the artifact happens to claim, and
+ * anything missing, malformed, mismatched, or non-finite throws.
+ *
+ * The exact source SHA is what binds the already-documented symmetric
+ * allocator-relief sampling; this verifier neither invokes nor relaxes it.
+ */
+export function verifyH7Hosted(
+	aggregatePath: string,
+	segmentPath: string,
+	expectations: H7HostedExpectations,
+): void {
+	if (!/^[0-9a-f]{40}$/.test(expectations.sha)) {
+		throw new Error("expected sha must be an exact lowercase 40-hex commit");
+	}
+	if (!H7_TAG_PATTERN.test(expectations.workflowRef)) {
+		throw new Error(
+			"expected workflow ref must be refs/tags/h7-batch-delivery-<40-hex>",
+		);
+	}
+	expectExact(
+		"expected workflow ref must name the expected commit",
+		expectations.workflowRef,
+		`refs/tags/h7-batch-delivery-${expectations.sha}`,
+	);
+	if (!Number.isInteger(expectations.batch)) {
+		throw new Error("expected batch must be an integer");
+	}
+	if (
+		!Number.isFinite(expectations.rssCeilMb) ||
+		expectations.rssCeilMb <= 0 ||
+		!Number.isInteger(expectations.durationSeconds) ||
+		expectations.durationSeconds <= 0
+	) {
+		throw new Error("expected ceiling and duration must be positive numbers");
+	}
+
+	const segment = readJsonFile<SegmentMetadata>("segment", segmentPath);
+	const aggregate = readJsonFile<AggregateSummary>("aggregate", aggregatePath);
+
+	expectExact(
+		"segment hash",
+		segment.segmentHash,
+		sha256Hex({ ...segment, segmentHash: undefined }),
+	);
+	expectExact(
+		"aggregate hash",
+		aggregate.aggregateHash,
+		sha256Hex({ ...aggregate, aggregateHash: undefined }),
+	);
+
+	// Re-running the real aggregator is what proves the downloaded aggregate
+	// says nothing its segment does not; it also re-applies every structural
+	// and cleanup-to-baseline guard aggregation already enforces.
+	const rederived = aggregateSegments([segment]);
+	if (
+		JSON.stringify(canonicalize(rederived)) !==
+		JSON.stringify(canonicalize(aggregate))
+	) {
+		throw new Error(
+			"downloaded aggregate is not canonically equal to the one re-derived from its segment",
+		);
+	}
+
+	expectExact("segment status", segment.status, "pass");
+	expectExact(
+		"segment candidateCommit",
+		segment.candidateCommit,
+		expectations.sha,
+	);
+	expectExact("segment actualCommit", segment.actualCommit, expectations.sha);
+	expectExact(
+		"aggregate candidateCommit",
+		aggregate.candidateCommit,
+		expectations.sha,
+	);
+
+	for (const [label, source] of [
+		["segment", segment.source],
+		["aggregate", aggregate.source],
+	] as const) {
+		expectExact(`${label} source head commit`, source.head, expectations.sha);
+		expectExact(`${label} source tree cleanliness`, source.dirty, false);
+	}
+	for (const [label, workflowSource] of [
+		["segment", segment.workflowSource],
+		["aggregate", aggregate.workflowSource],
+	] as const) {
+		expectExact(
+			`${label} workflowSource.sha`,
+			workflowSource.sha,
+			expectations.sha,
+		);
+		expectExact(
+			`${label} workflowSource.ref`,
+			workflowSource.ref,
+			expectations.workflowRef,
+		);
+	}
+
+	const tokenDigest = continuityDigest(expectations.continuityToken);
+	for (const [label, document] of [
+		["segment", segment],
+		["aggregate", aggregate],
+	] as const) {
+		expectExact(`${label} seed`, document.seed, expectations.seed);
+		expectExact(
+			`${label} continuityTokenDigest`,
+			document.continuityTokenDigest,
+			tokenDigest,
+		);
+		expectExact(`${label} runnerType`, document.runnerType, "self-hosted");
+		expectExact(`${label} runnerMode`, document.runnerMode, "dedicated");
+		expectExact(
+			`${label} runnerProfile`,
+			document.runnerProfile,
+			"h7-fixed-large",
+		);
+		for (const rate of [
+			"sessions",
+			"datagramsPerSec",
+			"streamsPerSec",
+		] as const) {
+			expectExact(
+				`${label} rates.${rate}`,
+				document.rates[rate],
+				H7_RATES[rate],
+			);
+		}
+		expectExact(
+			`${label} thresholds.rssCeilMb`,
+			document.thresholds?.rssCeilMb,
+			expectations.rssCeilMb,
+		);
+		const knobs = document.debugKnobs;
+		if (!knobs) throw new Error(`${label} is missing its debug knobs`);
+		expectExact(`${label} heapDebug`, knobs.heapDebug, false);
+		expectExact(
+			`${label} committedAbortMb breaker`,
+			knobs.committedAbortMb,
+			H7_COMMITTED_ABORT_MB,
+		);
+		const delivery = document.h7Delivery;
+		expectExact(
+			`${label} datagramBatchRequested`,
+			delivery.datagramBatchRequested,
+			String(expectations.batch),
+		);
+		expectExact(
+			`${label} datagramBatchResolved`,
+			delivery.datagramBatchResolved,
+			expectations.batch,
+		);
+		expectExact(
+			`${label} payloadDeliveryRequested`,
+			delivery.payloadDeliveryRequested,
+			null,
+		);
+		expectExact(
+			`${label} payloadDeliveryResolved`,
+			delivery.payloadDeliveryResolved,
+			"arraybuffer",
+		);
+		expectExact(
+			`${label} diagnosticsEnabled`,
+			delivery.diagnosticsEnabled,
+			false,
+		);
+	}
+
+	expectExact("segment index", segment.segmentIndex, 1);
+	expectExact("segment count", segment.segmentCount, 1);
+	expectExact("aggregate segmentCount", aggregate.segmentCount, 1);
+	expectExact(
+		"aggregate expectedSegmentCount",
+		aggregate.expectedSegmentCount,
+		1,
+	);
+	expectExact(
+		"segment durationSeconds",
+		segment.durationSeconds,
+		expectations.durationSeconds,
+	);
+	expectExact(
+		"aggregate totalDurationSeconds",
+		aggregate.totalDurationSeconds,
+		expectations.durationSeconds,
+	);
+
+	expectExact(
+		"segment diagnostics payload",
+		segment.h7Delivery.diagnostics,
+		null,
+	);
+	if (!segment.requiredOperationClasses.includes("datagram-echo")) {
+		throw new Error(
+			"segment did not require the datagram-echo operation class",
+		);
+	}
+	if ((segment.observedOperationCounts["datagram-echo"] ?? 0) <= 0) {
+		throw new Error("segment observed no datagram-echo operations");
+	}
+
+	const { datagramsSent, datagramsReceived } = segment.h7Delivery;
+	if (!(datagramsSent > 0)) {
+		throw new Error("segment recorded no datagrams sent");
+	}
+	for (const [label, sent, received] of [
+		["segment", datagramsSent, datagramsReceived],
+		["aggregate", aggregate.datagramsSent, aggregate.datagramsReceived],
+	] as const) {
+		if (!Number.isFinite(sent) || !Number.isFinite(received) || sent <= 0) {
+			throw new Error(`${label} datagram counters are not usable`);
+		}
+		const ratio = received / sent;
+		if (!(ratio >= H7_MIN_DELIVERY_RATIO)) {
+			throw new Error(
+				`${label} delivery ratio ${ratio.toFixed(4)} is below ${H7_MIN_DELIVERY_RATIO}`,
+			);
+		}
+	}
+
+	if (segment.samples.length === 0) {
+		throw new Error("segment carries no memory samples");
+	}
+	let chargedPeakMb = 0;
+	for (const sample of segment.samples) {
+		if (!Number.isFinite(sample.rss)) {
+			throw new Error("segment sample has a non-finite charged memory reading");
+		}
+		chargedPeakMb = Math.max(chargedPeakMb, sample.rss);
+	}
+	if (chargedPeakMb > expectations.rssCeilMb) {
+		throw new Error(
+			`charged memory peak ${chargedPeakMb.toFixed(1)}MB exceeded the ${expectations.rssCeilMb}MB ceiling`,
+		);
+	}
+	if (!segment.trend.pass) {
+		throw new Error(
+			`segment charged trend/recovery guards failed: ${segment.trend.failures.join("; ")}`,
+		);
+	}
+}
+
+/** Every flag is required and single-valued; an unknown or repeated flag is a
+ * malformed invocation, not something to ignore. */
+function parseH7HostedArgs(argv: string[]): {
+	aggregatePath: string;
+	segmentPath: string;
+	expectations: H7HostedExpectations;
+} {
+	const positional: string[] = [];
+	const flags = new Map<string, string>();
+	for (let index = 0; index < argv.length; index += 1) {
+		const token = argv[index] ?? "";
+		if (!token.startsWith("--")) {
+			positional.push(token);
+			continue;
+		}
+		const value = argv[index + 1];
+		if (value === undefined || value.startsWith("--")) {
+			throw new Error(`${token} requires a value`);
+		}
+		if (flags.has(token)) throw new Error(`${token} was supplied twice`);
+		flags.set(token, value);
+		index += 1;
+	}
+	if (positional.length !== 2) {
+		throw new Error(
+			"usage: verify-h7-hosted <aggregate-json> <segment-json> --sha <40-hex> --batch <int> --rss-ceil-mb <number> --duration-seconds <int> --seed <string> --continuity-token <string> --workflow-ref <ref>",
+		);
+	}
+	const required = (name: string): string => {
+		const value = flags.get(name);
+		if (value === undefined) throw new Error(`${name} is required`);
+		return value;
+	};
+	const integer = (name: string): number => {
+		const raw = required(name);
+		if (!/^\d+$/.test(raw)) {
+			throw new Error(`${name} must be a decimal integer, found ${raw}`);
+		}
+		return Number(raw);
+	};
+	const known = new Set([
+		"--sha",
+		"--batch",
+		"--rss-ceil-mb",
+		"--duration-seconds",
+		"--seed",
+		"--continuity-token",
+		"--workflow-ref",
+	]);
+	for (const flag of flags.keys()) {
+		if (!known.has(flag)) throw new Error(`unknown flag ${flag}`);
+	}
+	const rssCeilMb = Number(required("--rss-ceil-mb"));
+	if (!Number.isFinite(rssCeilMb)) {
+		throw new Error("--rss-ceil-mb must be a finite number");
+	}
+	return {
+		aggregatePath: positional[0] ?? "",
+		segmentPath: positional[1] ?? "",
+		expectations: {
+			sha: required("--sha"),
+			batch: integer("--batch"),
+			rssCeilMb,
+			durationSeconds: integer("--duration-seconds"),
+			seed: required("--seed"),
+			continuityToken: required("--continuity-token"),
+			workflowRef: required("--workflow-ref"),
+		},
+	};
+}
+
 export function aggregateFromDisk(paths: string[]): AggregateSummary {
 	const files = listSegmentFiles(paths);
 	if (files.length === 0) throw new Error("no json files found to aggregate");
@@ -2714,6 +3325,13 @@ export function aggregateFromDisk(paths: string[]): AggregateSummary {
 
 async function main(): Promise<void> {
 	const [mode = "run", ...rest] = process.argv.slice(2);
+	if (mode === "verify-h7-hosted") {
+		const { aggregatePath, segmentPath, expectations } =
+			parseH7HostedArgs(rest);
+		verifyH7Hosted(aggregatePath, segmentPath, expectations);
+		console.log("soak-addon: H7 hosted PASS");
+		return;
+	}
 	if (mode === "aggregate") {
 		const aggregate = aggregateFromDisk(
 			rest.length > 0 ? rest : [join(ROOT, "tools/load")],
