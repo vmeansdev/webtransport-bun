@@ -232,9 +232,17 @@ const H7_STARTED_AT_MS = 1_700_000_000_000;
 /** The sampler ticks every 30s, so a real 2h segment carries ~240 samples. */
 const H7_SAMPLE_COUNT = 240;
 
-function h7Samples(count: number, rssMb = 1200): Sample[] {
+/** `count` samples spread evenly across `spanMs`, defaulting to the real 30s
+ * sampler cadence. Spreading is separable from counting because the verifier
+ * gates on both, and a series can satisfy one without the other. */
+function h7Samples(
+	count: number,
+	rssMb = 1200,
+	spanMs = (count - 1) * 30_000,
+): Sample[] {
+	const step = count > 1 ? spanMs / (count - 1) : 0;
 	return Array.from({ length: count }, (_, index) => ({
-		ts_ms: H7_STARTED_AT_MS + index * 30_000,
+		ts_ms: H7_STARTED_AT_MS + Math.round(index * step),
 		phase: "main-load",
 		rss: rssMb,
 		heapUsedMb: 40,
@@ -1063,9 +1071,14 @@ describe("h7 hosted evidence contract", () => {
 				/rates\.streamsPerSec/i,
 			],
 			["wrong duration", { durationSeconds: 3600 }, /durationSeconds/i],
-			// Caught by the aggregator's segment-count rule before the verifier's
-			// own check — fail-closed either way, and the regex records which.
+			// Both caught by the aggregator before the verifier's own check —
+			// fail-closed either way, and the regex records which layer.
 			["wrong segment count", { segmentCount: 2 }, /expected 2 segments/i],
+			[
+				"wrong segment index",
+				{ segmentIndex: 2 },
+				/missing or duplicate segment index/i,
+			],
 		];
 		for (const [label, override, pattern] of cases) {
 			const { aggregatePath, segmentPath } = writeH7Pair(
@@ -1213,12 +1226,190 @@ describe("h7 hosted evidence contract", () => {
 		).not.toThrow();
 	});
 
+	test("rejects a sample series that does not actually cover the wall span", () => {
+		// All three of these carry a full 240-sample count and were accepted by
+		// the count-only floor. A count is not a density.
+		const oneInstant = writeH7Pair(
+			"instant",
+			h7Segment({
+				samples: h7Samples(H7_SAMPLE_COUNT).map((sample) => ({
+					...sample,
+					ts_ms: H7_STARTED_AT_MS + 1000,
+				})),
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				oneInstant.aggregatePath,
+				oneInstant.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/share one timestamp/i);
+
+		// 240 samples crammed into 240s of a declared 7200s span.
+		const crammed = writeH7Pair(
+			"crammed",
+			h7Segment({
+				samples: h7Samples(H7_SAMPLE_COUNT).map((sample, index) => ({
+					...sample,
+					ts_ms: H7_STARTED_AT_MS + index * 1000,
+				})),
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				crammed.aggregatePath,
+				crammed.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/sample series spans/i);
+
+		// Timestamps entirely outside [startedAtMs, endedAtMs].
+		const outside = writeH7Pair(
+			"outside",
+			h7Segment({
+				samples: h7Samples(H7_SAMPLE_COUNT).map((sample) => ({
+					...sample,
+					ts_ms: sample.ts_ms + H7_DURATION_SECONDS * 1000 * 2,
+				})),
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				outside.aggregatePath,
+				outside.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/outside the segment wall span/i);
+	});
+
+	test("bounds the wall span asymmetrically: never short, boundedly long", () => {
+		// A genuine run's span is always >= the declared duration, because the
+		// harness awaits its poller (which itself runs to DURATION + 90s) before
+		// reading endedAtMs. Anything shorter cannot legitimately occur.
+		const shortBySecond = writeH7Pair(
+			"short1s",
+			h7Segment({
+				endedAtMs: H7_STARTED_AT_MS + (H7_DURATION_SECONDS - 1) * 1000,
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				shortBySecond.aggregatePath,
+				shortBySecond.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/shorter than the declared/i);
+
+		// The old symmetric -600s arm admitted a 110-minute run labelled two
+		// hours; it must not any more.
+		const oneHundredTen = writeH7Pair(
+			"110min",
+			h7Segment({ endedAtMs: H7_STARTED_AT_MS + 6600 * 1000 }),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				oneHundredTen.aggregatePath,
+				oneHundredTen.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/shorter than the declared/i);
+
+		// Upper boundary: +300s passes, +301s does not.
+		const atUpperBound = writeH7Pair(
+			"upper-ok",
+			h7Segment({
+				endedAtMs: H7_STARTED_AT_MS + (H7_DURATION_SECONDS + 300) * 1000,
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				atUpperBound.aggregatePath,
+				atUpperBound.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).not.toThrow();
+
+		const overUpperBound = writeH7Pair(
+			"upper-bad",
+			h7Segment({
+				endedAtMs: H7_STARTED_AT_MS + (H7_DURATION_SECONDS + 301) * 1000,
+			}),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				overUpperBound.aggregatePath,
+				overUpperBound.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/exceeds the declared/i);
+	});
+
+	test("requires a throughput floor the H7 claim actually depends on", () => {
+		// 1,000,000 for the 2h lane, expressed per hour so it scales.
+		const atFloor = writeH7Pair("tp-ok", h7Segment());
+		expect(() =>
+			verifyH7Hosted(
+				atFloor.aggregatePath,
+				atFloor.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).not.toThrow();
+
+		for (const sent of [1, 999_999]) {
+			const belowFloor = writeH7Pair(
+				"tp-low",
+				h7Segment({
+					h7Delivery: {
+						datagramBatchRequested: "64",
+						datagramBatchResolved: 64,
+						payloadDeliveryRequested: null,
+						payloadDeliveryResolved: "arraybuffer",
+						diagnosticsEnabled: false,
+						diagnostics: null,
+						datagramsSent: sent,
+						datagramsReceived: sent,
+						deliveryRatio: 1,
+					},
+				}),
+			);
+			expect(
+				() =>
+					verifyH7Hosted(
+						belowFloor.aggregatePath,
+						belowFloor.segmentPath,
+						H7_EXPECTATIONS,
+					),
+				`sent=${sent}`,
+			).toThrow(/throughput floor/i);
+		}
+	});
+
 	test("rejects a segment whose sampler died partway through", () => {
-		// 7200s at one sample per 30s is 240 expected; the floor is 80% of that.
+		const fullSpanMs = H7_DURATION_SECONDS * 1000;
+
+		// A sampler that stops early fails BOTH gates: too few rows, and a
+		// series covering too little of the run. At the real 30s cadence 192
+		// rows reach only 5730s of the 7200s span, so the span gate speaks
+		// first — which is the more precise diagnosis of what went wrong.
+		const truncated = writeH7Pair(
+			"truncated",
+			h7Segment({ samples: h7Samples(192) }),
+		);
+		expect(() =>
+			verifyH7Hosted(
+				truncated.aggregatePath,
+				truncated.segmentPath,
+				H7_EXPECTATIONS,
+			),
+		).toThrow(/sample series spans/i);
+
+		// The count floor in isolation: rows thinned but still covering the run.
+		// 7200s at one sample per 30s is 240 expected, so 192 is the boundary.
 		for (const count of [1, 100, 191]) {
 			const sparse = writeH7Pair(
 				"sparse",
-				h7Segment({ samples: h7Samples(count) }),
+				h7Segment({ samples: h7Samples(count, 1200, fullSpanMs) }),
 			);
 			expect(
 				() =>
@@ -1228,11 +1419,11 @@ describe("h7 hosted evidence contract", () => {
 						H7_EXPECTATIONS,
 					),
 				`count=${count}`,
-			).toThrow(/sample/i);
+			).toThrow(/memory samples, below/i);
 		}
 		const atFloor = writeH7Pair(
 			"floor",
-			h7Segment({ samples: h7Samples(192) }),
+			h7Segment({ samples: h7Samples(192, 1200, fullSpanMs) }),
 		);
 		expect(() =>
 			verifyH7Hosted(
