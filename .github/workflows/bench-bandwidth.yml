@@ -1,0 +1,101 @@
+# Bandwidth saturation ladder on the heavy self-hosted runner. Measurement
+# only — locates where a host saturates (CPU%, memory vs aggregate Mbps); it
+# is not a release gate. Trigger manually via workflow_dispatch.
+name: bench-bandwidth
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_commit:
+        description: "Exact commit SHA to benchmark"
+        required: true
+        type: string
+      sessions:
+        description: "Concurrent sessions held for every ladder step"
+        required: false
+        default: "100"
+        type: string
+      payload_bytes:
+        description: "Datagram payload size in bytes (MTU-ish for video-style framing)"
+        required: false
+        default: "1150"
+        type: string
+      step_seconds:
+        description: "Seconds to hold each ladder step"
+        required: false
+        default: "180"
+        type: string
+      rates:
+        description: "Comma-separated per-session datagrams/s ladder"
+        required: false
+        default: "27,54,109,217,326,435"
+        type: string
+jobs:
+  bench:
+    permissions:
+      contents: read
+    runs-on: ["self-hosted", "Linux", "X64", "heavy"]
+    timeout-minutes: 120
+    concurrency:
+      group: bench-bandwidth
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.inputs.candidate_commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Select supported C/C++ compiler
+        run: |
+          if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
+            echo "CC=$(realpath "$(command -v clang)")" >> "$GITHUB_ENV"
+            echo "CXX=$(realpath "$(command -v clang++)")" >> "$GITHUB_ENV"
+            echo "Selected resolved clang/clang++ paths"
+            exit 0
+          fi
+
+          for v in 12 11 10; do
+            if command -v "gcc-$v" >/dev/null 2>&1 && command -v "g++-$v" >/dev/null 2>&1; then
+              echo "CC=$(realpath "$(command -v "gcc-$v")")" >> "$GITHUB_ENV"
+              echo "CXX=$(realpath "$(command -v "g++-$v")")" >> "$GITHUB_ENV"
+              echo "Selected resolved gcc-$v/g++-$v paths"
+              exit 0
+            fi
+          done
+
+          echo "::error::No supported compiler found. Install clang (preferred) or gcc-10+ on this self-hosted runner."
+          exit 1
+      - name: Build native addon
+        run: bun run build:native
+      - name: Profile runner capacity
+        run: |
+          CPUS="$(nproc 2>/dev/null || echo 1)"
+          MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+          echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      - name: Run bandwidth ladder
+        env:
+          BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
+          BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
+          BENCH_STEP_SECONDS: ${{ github.event.inputs.step_seconds }}
+          BENCH_RATES: ${{ github.event.inputs.rates }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-bandwidth.ts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/bench-bandwidth-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
