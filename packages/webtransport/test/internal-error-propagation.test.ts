@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Duplex } from "node:stream";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -93,6 +96,9 @@ describe("internal TS error propagation", () => {
 			readDatagram: async () => {
 				throw new Error("E_INTERNAL: synthetic datagram failure");
 			},
+			readDatagramBatch: async () => {
+				throw new Error("E_INTERNAL: synthetic datagram failure");
+			},
 			close: () => {},
 		});
 		const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
@@ -111,6 +117,9 @@ describe("internal TS error propagation", () => {
 			readDatagram: async () => {
 				throw new Error(`${E_SESSION_CLOSED}: closed`);
 			},
+			readDatagramBatch: async () => {
+				throw new Error(`${E_SESSION_CLOSED}: closed`);
+			},
 			close: () => {},
 		});
 		const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
@@ -121,6 +130,140 @@ describe("internal TS error propagation", () => {
 		);
 		expect(first.done).toBe(true);
 	});
+
+	// The batched native read is reject-free by construction: closure arrives as
+	// a resolved `null`, not as a thrown session-closed error. The two tests
+	// above keep the rejection path covered for the synthetic/legacy case;
+	// these pin the shape the real addon actually produces.
+	for (const make of [
+		[
+			"NativeClientSession",
+			__TESTING__.createNativeClientSessionForTests,
+		] as const,
+		[
+			"NativeServerSession",
+			__TESTING__.createNativeServerSessionForTests,
+		] as const,
+	]) {
+		const [label, create] = make;
+		it(`${label}.incomingDatagrams ends on a resolved null batch without rejecting`, async () => {
+			let batchCalls = 0;
+			const session = create({
+				readDatagram: async () => {
+					throw new Error("legacy readDatagram must not be called");
+				},
+				readDatagramBatch: async () => {
+					batchCalls++;
+					return batchCalls === 1 ? [new Uint8Array([7])] : null;
+				},
+				close: () => {},
+			});
+			const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
+			const first = await nextWithTimeout(iter, 2000, `${label} batch item`);
+			expect(first.done).toBe(false);
+			expect(Array.from(first.value as Uint8Array)).toEqual([7]);
+			const end = await nextWithTimeout(iter, 2000, `${label} batch EOF`);
+			expect(end.done).toBe(true);
+			expect(batchCalls).toBe(2);
+		});
+
+		it(`${label}.incomingDatagrams reports a missing batch method instead of falling back`, async () => {
+			let legacyCalls = 0;
+			const session = create({
+				readDatagram: async () => {
+					legacyCalls++;
+					return new Uint8Array([1]);
+				},
+				close: () => {},
+			});
+			const iter = session.incomingDatagrams()[Symbol.asyncIterator]();
+			let err: unknown;
+			try {
+				await nextWithTimeout(iter, 2000, `${label} mismatch read`);
+			} catch (e) {
+				err = e;
+			}
+			expect(err).toBeInstanceOf(WebTransportError);
+			expect((err as WebTransportError).code).toBe(E_INTERNAL);
+			expect((err as WebTransportError).message).toBe(
+				"E_INTERNAL: native addon/JavaScript version mismatch; rebuild the matching prebuild",
+			);
+			expect(legacyCalls).toBe(0);
+		});
+	}
+
+	it("legacy knob keeps the readDatagram rejection assertions intact", async () => {
+		// WEBTRANSPORT_DATAGRAM_BATCH is resolved once at module initialization,
+		// so the legacy path can only be asserted in a fresh process.
+		const dir = mkdtempSync(join(tmpdir(), "wt-h7-legacy-"));
+		const script = join(dir, "child.ts");
+		const internalModule = new URL("../src/internal.ts", import.meta.url)
+			.pathname;
+		await Bun.write(
+			script,
+			`
+			const { __TESTING__ } = await import(${JSON.stringify(internalModule)});
+			const cfg = __TESTING__.datagramBatchConfigForTests();
+			if (cfg.batchSize !== 0) throw new Error("child did not resolve the legacy knob");
+
+			const results: Record<string, unknown> = {};
+			let batchCalls = 0;
+			// A legacy-knob session must never touch the batch entrypoint, even
+			// when the handle offers one.
+			const failing = __TESTING__.createNativeClientSessionForTests({
+				readDatagram: async () => { throw new Error("E_INTERNAL: synthetic datagram failure"); },
+				readDatagramBatch: async () => { batchCalls++; return null; },
+				close: () => {},
+			});
+			try {
+				await failing.incomingDatagrams()[Symbol.asyncIterator]().next();
+				results.propagated = "no-throw";
+			} catch (e: any) {
+				results.propagated = e?.code ?? String(e);
+			}
+
+			const closing = __TESTING__.createNativeClientSessionForTests({
+				readDatagram: async () => { throw new Error("E_SESSION_CLOSED: closed"); },
+				readDatagramBatch: async () => { batchCalls++; return null; },
+				close: () => {},
+			});
+			const end = await closing.incomingDatagrams()[Symbol.asyncIterator]().next();
+			results.closeIsEof = end.done;
+			results.batchCalls = batchCalls;
+			console.log("__RESULT__" + JSON.stringify(results));
+			`,
+		);
+		try {
+			const proc = Bun.spawn([process.execPath, script], {
+				env: { ...process.env, WEBTRANSPORT_DATAGRAM_BATCH: "0" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const exited = await Promise.race([
+				proc.exited,
+				Bun.sleep(60_000).then(() => "timeout" as const),
+			]);
+			const stdout = await new Response(proc.stdout).text();
+			const stderr = await new Response(proc.stderr).text();
+			if (exited === "timeout") {
+				proc.kill();
+				throw new Error(`legacy-knob child did not exit\n${stdout}\n${stderr}`);
+			}
+			expect(exited).toBe(0);
+			const line = stdout
+				.split("\n")
+				.find((l) => l.startsWith("__RESULT__"))
+				?.slice("__RESULT__".length);
+			if (!line) throw new Error(`no result line\n${stdout}\n${stderr}`);
+			expect(JSON.parse(line)).toEqual({
+				propagated: E_INTERNAL,
+				closeIsEof: true,
+				batchCalls: 0,
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 90_000);
 
 	it("NativeClientSession.incomingBidirectionalStreams propagates non-close errors", async () => {
 		const session = __TESTING__.createNativeClientSessionForTests({

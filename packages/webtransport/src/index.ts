@@ -1115,6 +1115,9 @@ interface NativeSessionHandle {
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
 	readDatagram(): Promise<Uint8Array | null>;
+	/** Batched datagram read (absent on older prebuilt addons). Resolves a
+	 * non-empty array, or `null` at EOF/close — it never rejects. */
+	readDatagramBatch?: (max: number) => Promise<Uint8Array[] | null>;
 	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
 	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
 	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
@@ -1207,6 +1210,17 @@ interface NativeAddon {
 	/** Leak-forensics: futures currently parked per instrumented await
 	 * (absent on older prebuilt addons). Diagnostic only. */
 	nativeAwaitProbeSnapshot?: () => Record<string, number>;
+	/** Which payload delivery path this process resolved: exactly
+	 * `"arraybuffer"` or `"buffer-copy"` (absent on older prebuilt addons). */
+	nativePayloadDeliveryMode?: () => string;
+	/** Inclusive payload size at or below which delivery stays engine-owned
+	 * (absent on older prebuilt addons). Diagnostic only. */
+	nativePayloadEngineOwnedMaxBytes?: () => number;
+	/** Test seam: runs payloads through napi-rs's real per-element array
+	 * conversion (absent on older prebuilt addons). Never used in production. */
+	materializePayloadBatchForTests?: (
+		payloads: (Buffer | Uint8Array)[],
+	) => Uint8Array[];
 	/** Force-return freed native allocator memory to the OS (absent on older prebuilt addons). */
 	releaseNativeMemory?: () => boolean;
 	/** 0-RTT vault (absent on older prebuilt addons). */
@@ -1296,6 +1310,198 @@ function getNativeOrThrow(): NativeAddon {
 	if (native) return native;
 	throw new Error(buildNativeAddonLoadErrorMessage(nativeLoadFailures));
 }
+
+// ---------------------------------------------------------------------------
+// Incoming-datagram delivery
+// ---------------------------------------------------------------------------
+
+const DATAGRAM_BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
+const DATAGRAM_BATCH_DIAGNOSTICS_ENV = "WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
+const DEFAULT_DATAGRAM_BATCH = 64;
+const MAX_DATAGRAM_BATCH = 256;
+const DATAGRAM_BATCH_MISMATCH_MESSAGE =
+	"E_INTERNAL: native addon/JavaScript version mismatch; rebuild the matching prebuild";
+
+/**
+ * Resolve the datagram batch size from its raw environment value.
+ *
+ * Anything that is not a plain decimal integer — empty, non-numeric,
+ * fractional, exponential, hex, Infinity — is "invalid" and falls back to the
+ * default. Values that *are* decimal integers are clamped into `0..256`, so a
+ * negative request means 0 (the legacy one-at-a-time path) rather than the
+ * default.
+ */
+function parseDatagramBatchSize(raw: string | undefined): number {
+	if (raw === undefined) return DEFAULT_DATAGRAM_BATCH;
+	const trimmed = raw.trim();
+	if (!/^[+-]?\d+$/.test(trimmed)) return DEFAULT_DATAGRAM_BATCH;
+	const value = Number(trimmed);
+	if (!Number.isFinite(value)) return DEFAULT_DATAGRAM_BATCH;
+	if (value <= 0) return 0;
+	return value > MAX_DATAGRAM_BATCH ? MAX_DATAGRAM_BATCH : value;
+}
+
+// Both knobs are read exactly once, here, so a process cannot change delivery
+// shape halfway through a session's lifetime.
+const datagramBatchSize = parseDatagramBatchSize(
+	process.env[DATAGRAM_BATCH_ENV],
+);
+const datagramBatchDiagnosticsEnabled =
+	process.env[DATAGRAM_BATCH_DIAGNOSTICS_ENV] === "1";
+
+type DatagramBatchDiagnostics = {
+	legacyReadCalls: number;
+	batchReadCalls: number;
+	materializedItems: number;
+	yieldedItems: number;
+	maxBatchSize: number;
+	meanBatchSize: number;
+	abandonedItems: number;
+};
+
+const datagramBatchCounters = {
+	legacyReadCalls: 0,
+	batchReadCalls: 0,
+	materializedItems: 0,
+	yieldedItems: 0,
+	maxBatchSize: 0,
+	abandonedItems: 0,
+};
+
+function datagramBatchDiagnosticsSnapshot(): DatagramBatchDiagnostics {
+	const c = datagramBatchCounters;
+	return {
+		legacyReadCalls: c.legacyReadCalls,
+		batchReadCalls: c.batchReadCalls,
+		materializedItems: c.materializedItems,
+		yieldedItems: c.yieldedItems,
+		maxBatchSize: c.maxBatchSize,
+		meanBatchSize:
+			c.batchReadCalls > 0 ? c.materializedItems / c.batchReadCalls : 0,
+		abandonedItems: c.abandonedItems,
+	};
+}
+
+type DatagramSource = Pick<NativeSessionHandle, "readDatagram"> & {
+	readDatagramBatch?: (max: number) => Promise<Uint8Array[] | null>;
+};
+
+type DatagramIterator = (
+	handle: DatagramSource,
+	isClosed: () => boolean,
+	batchSize: number,
+	mapError: (err: unknown) => unknown,
+) => AsyncGenerator<Uint8Array, void, undefined>;
+
+function datagramBatchMismatchError(): WebTransportError {
+	return new WebTransportError(
+		E_INTERNAL as ErrorCode,
+		DATAGRAM_BATCH_MISMATCH_MESSAGE,
+	);
+}
+
+/**
+ * The production incoming-datagram loop for both native session classes.
+ *
+ * `batchSize === 0` keeps the legacy one-call-per-datagram path; anything else
+ * uses the batched N-API call and drains the returned array fully before asking
+ * for the next one. Session-close failures end the iteration like an EOF, which
+ * is what both callers did before batching existed.
+ */
+const iterateIncomingDatagrams: DatagramIterator = async function* (
+	handle,
+	isClosed,
+	batchSize,
+	mapError,
+) {
+	if (batchSize === 0) {
+		while (!isClosed()) {
+			let datagram: Uint8Array | null;
+			try {
+				datagram = await handle.readDatagram();
+			} catch (err) {
+				if (isSessionCloseError(err)) return;
+				throw mapError(err);
+			}
+			if (!datagram) return;
+			yield datagram;
+		}
+		return;
+	}
+	const readBatch = handle.readDatagramBatch;
+	if (typeof readBatch !== "function") throw datagramBatchMismatchError();
+	while (!isClosed()) {
+		let batch: Uint8Array[] | null;
+		try {
+			batch = await readBatch.call(handle, batchSize);
+		} catch (err) {
+			if (isSessionCloseError(err)) return;
+			throw mapError(err);
+		}
+		if (!batch || batch.length === 0) return;
+		for (const datagram of batch) yield datagram;
+	}
+};
+
+/**
+ * Counter-carrying twin of {@link iterateIncomingDatagrams}. It is a separate
+ * generator rather than a flag inside the production one so that the disabled
+ * case has no diagnostic branch at all in its per-item path.
+ */
+const iterateIncomingDatagramsInstrumented: DatagramIterator =
+	async function* (handle, isClosed, batchSize, mapError) {
+		const counters = datagramBatchCounters;
+		if (batchSize === 0) {
+			while (!isClosed()) {
+				let datagram: Uint8Array | null;
+				try {
+					counters.legacyReadCalls++;
+					datagram = await handle.readDatagram();
+				} catch (err) {
+					if (isSessionCloseError(err)) return;
+					throw mapError(err);
+				}
+				if (!datagram) return;
+				counters.materializedItems++;
+				counters.yieldedItems++;
+				yield datagram;
+			}
+			return;
+		}
+		const readBatch = handle.readDatagramBatch;
+		if (typeof readBatch !== "function") throw datagramBatchMismatchError();
+		while (!isClosed()) {
+			let batch: Uint8Array[] | null;
+			try {
+				counters.batchReadCalls++;
+				batch = await readBatch.call(handle, batchSize);
+			} catch (err) {
+				if (isSessionCloseError(err)) return;
+				throw mapError(err);
+			}
+			if (!batch || batch.length === 0) return;
+			counters.materializedItems += batch.length;
+			if (batch.length > counters.maxBatchSize)
+				counters.maxBatchSize = batch.length;
+			let delivered = 0;
+			try {
+				for (const datagram of batch) {
+					delivered++;
+					counters.yieldedItems++;
+					yield datagram;
+				}
+			} finally {
+				counters.abandonedItems += batch.length - delivered;
+			}
+		}
+	};
+
+// Selected once, at module initialization — never per generator and never per
+// item. Task 7's floor benchmark imports this same binding.
+const createIncomingDatagramIterator: DatagramIterator =
+	datagramBatchDiagnosticsEnabled
+		? iterateIncomingDatagramsInstrumented
+		: iterateIncomingDatagrams;
 
 // ---------------------------------------------------------------------------
 // Server session implementation
@@ -1417,18 +1623,12 @@ class NativeServerSession implements ServerSession {
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
 		if (!this.#incomingDatagramsCache) {
 			const session = this;
-			this.#incomingDatagramsCache = (async function* () {
-				while (!session.#closed) {
-					try {
-						const datagram = await session.#nativeHandle.readDatagram();
-						if (!datagram) break;
-						yield datagram;
-					} catch (err) {
-						if (isSessionCloseError(err)) break;
-						throw toWebTransportError(err);
-					}
-				}
-			})();
+			this.#incomingDatagramsCache = createIncomingDatagramIterator(
+				session.#nativeHandle,
+				() => session.#closed,
+				datagramBatchSize,
+				(err) => toWebTransportError(err),
+			);
 		}
 		return this.#incomingDatagramsCache;
 	}
@@ -1972,18 +2172,12 @@ class NativeClientSession implements ClientSession {
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
 		if (!this.#incomingDatagramsCache) {
 			const session = this;
-			this.#incomingDatagramsCache = (async function* () {
-				while (!session.#closed) {
-					try {
-						const dgram = await session.#nativeHandle.readDatagram();
-						if (!dgram) break;
-						yield dgram;
-					} catch (err) {
-						if (isSessionCloseError(err)) break;
-						throw toWebTransportError(err, session.#strictW3CErrors);
-					}
-				}
-			})();
+			this.#incomingDatagramsCache = createIncomingDatagramIterator(
+				session.#nativeHandle,
+				() => session.#closed,
+				datagramBatchSize,
+				(err) => toWebTransportError(err, session.#strictW3CErrors),
+			);
 		}
 		return this.#incomingDatagramsCache;
 	}
@@ -3927,6 +4121,29 @@ export const __TESTING__ = {
 	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
+	parseDatagramBatchSizeForTests: parseDatagramBatchSize,
+	/** Frozen snapshot of what this process resolved at module init. */
+	datagramBatchConfigForTests: (): Readonly<{
+		batchSize: number;
+		diagnosticsEnabled: boolean;
+		defaultBatchSize: number;
+		maxBatchSize: number;
+	}> =>
+		Object.freeze({
+			batchSize: datagramBatchSize,
+			diagnosticsEnabled: datagramBatchDiagnosticsEnabled,
+			defaultBatchSize: DEFAULT_DATAGRAM_BATCH,
+			maxBatchSize: MAX_DATAGRAM_BATCH,
+		}),
+	/** The exact generator both native session classes run. */
+	createIncomingDatagramIteratorForTests: createIncomingDatagramIterator,
+	datagramBatchDiagnosticsSnapshotForTests: datagramBatchDiagnosticsSnapshot,
+	datagramBatchMismatchMessageForTests: DATAGRAM_BATCH_MISMATCH_MESSAGE,
+	nativePayloadDeliveryModeForTests: () => native?.nativePayloadDeliveryMode?.(),
+	nativePayloadEngineOwnedMaxBytesForTests: () =>
+		native?.nativePayloadEngineOwnedMaxBytes?.(),
+	materializePayloadBatchForTests: (payloads: (Buffer | Uint8Array)[]) =>
+		native?.materializePayloadBatchForTests?.(payloads),
 };
 
 /**
