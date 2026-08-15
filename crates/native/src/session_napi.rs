@@ -11,8 +11,8 @@ use crate::session::{
     accept_bidi_stream_for_session, accept_uni_stream_for_session, create_bidi_stream_for_session,
     create_uni_stream_for_session, discard_bidi_streams_for_session, discard_datagram_for_session,
     discard_datagrams_for_session, discard_uni_streams_for_session, handle_bidi_probe_for_session,
-    handle_uni_probe_for_session, read_datagram_for_session, send_datagram_for_session,
-    session_metrics_snapshot_from, wait_session_stream_capacity,
+    handle_uni_probe_for_session, read_datagram_batch_for_session, read_datagram_for_session,
+    send_datagram_for_session, session_metrics_snapshot_from, wait_session_stream_capacity,
 };
 use crate::session_registry;
 use crate::RUNTIME;
@@ -177,6 +177,32 @@ impl SessionHandle {
             Ok(read_datagram_for_session(&id)
                 .await?
                 .map(crate::payload_buffer::PayloadBuffer::from))
+        })
+    }
+
+    /// Read up to `max` datagrams with a single delivery call.
+    ///
+    /// Blocks for the first datagram, then takes whatever else is already
+    /// queued, which amortizes the N-API round trip across the batch. `max` is
+    /// clamped into 1..=256 silently, and a closed session or a closed queue
+    /// resolves `null` — never a rejection and never an empty array.
+    #[napi(ts_return_type = "Promise<Uint8Array[] | null>")]
+    pub fn read_datagram_batch(&self, env: Env, max: u32) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            RUNTIME
+                .spawn(async move {
+                    Ok(read_datagram_batch_for_session(&id, max)
+                        .await?
+                        .map(|batch| {
+                            batch
+                                .into_iter()
+                                .map(crate::payload_buffer::PayloadBuffer::from)
+                                .collect::<Vec<_>>()
+                        }))
+                })
+                .await
+                .map_err(wt_from_upstream_error)?
         })
     }
 

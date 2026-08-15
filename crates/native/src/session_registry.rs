@@ -247,7 +247,7 @@ impl DatagramSlot {
 }
 
 /// Channel capacity for datagrams per session (bounded to prevent unbounded buffering).
-const DGRAM_CHANNEL_CAPACITY: usize = 2048;
+pub(crate) const DGRAM_CHANNEL_CAPACITY: usize = 2048;
 const STREAM_ACCEPT_CAPACITY: usize = 256;
 
 /// Shared result state for one native black-hole stream drain direction.
@@ -380,6 +380,12 @@ pub struct SessionState {
     pub stream_capacity_notify: Arc<Notify>,
     /// Notifies waiters when datagram queued-byte capacity or lifecycle may have changed.
     pub datagram_capacity_notify: Arc<Notify>,
+    /// Wakes datagram readers when the session closes, and nothing else.
+    ///
+    /// Deliberately not `datagram_capacity_notify`: that one fires on every
+    /// send-capacity release, so a parked reader sharing it would wake and
+    /// re-arm proportionally to the send rate on the datagram hot path.
+    pub datagram_lifecycle_notify: Arc<Notify>,
     /// Sticky lifecycle state closes the lost-wake window around registry removal.
     pub datagram_lifecycle_closed: Arc<AtomicBool>,
     /// Native-only direct-consume state for accepted bidi streams.
@@ -437,6 +443,7 @@ pub fn insert(
     let session_metrics = Arc::new(SessionMetrics::default());
     let stream_capacity_notify = Arc::new(Notify::new());
     let datagram_capacity_notify = Arc::new(Notify::new());
+    let datagram_lifecycle_notify = Arc::new(Notify::new());
     let datagram_lifecycle_closed = Arc::new(AtomicBool::new(false));
     let bidi_discard = StreamDiscardState::new(Arc::clone(&datagram_lifecycle_closed));
     let uni_discard = StreamDiscardState::new(Arc::clone(&datagram_lifecycle_closed));
@@ -452,6 +459,7 @@ pub fn insert(
         create_uni_tx,
         stream_capacity_notify,
         datagram_capacity_notify: Arc::clone(&datagram_capacity_notify),
+        datagram_lifecycle_notify,
         datagram_lifecycle_closed,
         bidi_discard,
         uni_discard,
@@ -584,6 +592,28 @@ pub fn get_stream_accept_state(
     })
 }
 
+/// Return the datagram queue plus the signals a parked read waits on.
+///
+/// The sticky flag and the dedicated lifecycle notifier travel together so a
+/// reader that captured this state before registry removal still observes the
+/// close: the flag is stored with `Release` before the notify fires.
+#[allow(clippy::type_complexity)]
+pub fn get_datagram_read_state(
+    session_id: &str,
+) -> Option<(
+    Arc<Mutex<mpsc::Receiver<DatagramSlot>>>,
+    Arc<AtomicBool>,
+    Arc<Notify>,
+)> {
+    REGISTRY.get(session_id).map(|entry| {
+        (
+            Arc::clone(&entry.dgram_rx),
+            Arc::clone(&entry.datagram_lifecycle_closed),
+            Arc::clone(&entry.datagram_lifecycle_notify),
+        )
+    })
+}
+
 /// Remove session from registry. Call when connection closes.
 pub fn remove(session_id: &str) {
     mark_closed_and_notify_capacity_waiters(session_id);
@@ -691,6 +721,7 @@ fn mark_state_closed_and_notify(state: &SessionState) {
         .store(true, Ordering::Release);
     state.stream_capacity_notify.notify_waiters();
     state.datagram_capacity_notify.notify_waiters();
+    state.datagram_lifecycle_notify.notify_waiters();
     state.metrics.datagram_capacity_notify.notify_waiters();
     state.bidi_discard.wake();
     state.uni_discard.wake();
@@ -1291,5 +1322,30 @@ mod tests {
         assert_eq!(owner_a_sm.queued_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(owner_b.queued_bytes_global.load(Ordering::Relaxed), 0);
         assert_eq!(owner_b_sm.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unknown_session_has_no_datagram_read_state() {
+        assert!(get_datagram_read_state("missing-read-state").is_none());
+    }
+
+    // The read-side lifecycle wait gets its own notifier on purpose:
+    // `release_datagram_capacity` fires the capacity notifier on every send, so
+    // sharing it would wake a parked reader proportionally to the send rate on
+    // the exact hot path the batch read exists to speed up.
+    #[test]
+    fn every_close_path_fires_the_dedicated_datagram_lifecycle_notify() {
+        let source = include_str!("session_registry.rs");
+        let body = source
+            .split("fn mark_state_closed_and_notify(")
+            .nth(1)
+            .and_then(|body| body.split("\n}\n").next())
+            .expect("mark_state_closed_and_notify must be parseable");
+        assert_eq!(
+            body.matches("datagram_lifecycle_notify.notify_waiters()")
+                .count(),
+            1,
+            "the single close funnel must wake read-side lifecycle waiters"
+        );
     }
 }
