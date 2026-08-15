@@ -56,10 +56,15 @@ async function runChild(
 		stderr: "pipe",
 		cwd: new URL("../../..", import.meta.url).pathname,
 	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
+		// The deadline timer is cleared on every path; an uncancelled one would
+		// keep the test runner's loop alive for its full duration per child.
 		const exited = await Promise.race([
 			proc.exited,
-			Bun.sleep(timeoutMs).then(() => "timeout" as const),
+			new Promise<"timeout">((resolve) => {
+				timer = setTimeout(() => resolve("timeout"), timeoutMs);
+			}),
 		]);
 		const stdout = await new Response(proc.stdout).text();
 		const stderr = await new Response(proc.stderr).text();
@@ -80,6 +85,7 @@ async function runChild(
 			stderr,
 		};
 	} finally {
+		if (timer !== undefined) clearTimeout(timer);
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
@@ -266,9 +272,14 @@ describe("abandoning a batch mid-array", () => {
 		target.close();
 		if (lane === "server") client.close();
 		// Reservations must come back to baseline once the session tears down.
+		// A gauge that cannot be read is NOT a gauge at baseline, so an
+		// unreadable snapshot keeps polling and ultimately fails the child
+		// rather than satisfying the assertion having observed nothing.
+		let teardownSnapshotAvailable = false;
 		const queuedAfterTeardown = await pollUntil("reservation baseline", 5000, () => {
 			const s = snapOr(lane === "server" ? serverSession : client);
-			if (s === null) return 0; // handle gone: nothing can be stranded
+			if (s === null) return null;
+			teardownSnapshotAvailable = true;
 			return s.queuedBytes === 0 ? 0 : null;
 		});
 		await server.close();
@@ -280,6 +291,7 @@ describe("abandoning a batch mid-array", () => {
 			yieldedItems: diag.yieldedItems,
 			batchReadCalls: diag.batchReadCalls,
 			queuedAfterTeardown,
+			teardownSnapshotAvailable,
 		});
 		process.exit(0);
 	`;
@@ -302,6 +314,9 @@ describe("abandoning a batch mid-array", () => {
 			expect(res.yieldedItems).toBe(1);
 			expect(res.abandonedItems).toBe(res.observedBatchSize - 1);
 			expect(res.abandonedItems).toBe(3);
+			// The gauge was actually read, so the baseline claim rests on an
+			// observation rather than on an unreadable handle.
+			expect(res.teardownSnapshotAvailable).toBe(true);
 			expect(res.queuedAfterTeardown).toBe(0);
 		}, 45_000);
 	}
@@ -365,9 +380,13 @@ describe("sticky close drops the queued remainder on both lanes", () => {
 		const drainMs = Date.now() - closeAt;
 
 		// queued_bytes is shared with the send direction, so poll it back down.
+		// An unreadable snapshot must not satisfy criterion 6 by default: it
+		// keeps polling, and the child fails if a real reading never arrives.
+		let closeSnapshotAvailable = false;
 		const queuedAfterClose = await pollUntil("queued_bytes baseline", 5000, () => {
 			const s = snapOr(target);
-			if (s === null) return 0;
+			if (s === null) return null;
+			closeSnapshotAvailable = true;
 			return s.queuedBytes === 0 ? 0 : null;
 		});
 
@@ -385,6 +404,7 @@ describe("sticky close drops the queued remainder on both lanes", () => {
 			drainMs,
 			queuedAtClose,
 			queuedAfterClose,
+			closeSnapshotAvailable,
 		});
 		process.exit(0);
 	`;
@@ -431,7 +451,9 @@ describe("sticky close drops the queued remainder on both lanes", () => {
 						expect(res.delivered).toBeLessThanOrEqual(res.sent);
 					}
 
-					// Criterion 6: no stranded gauge on either lane.
+					// Criterion 6: no stranded gauge on either lane, and the gauge
+					// was genuinely read rather than assumed clean.
+					expect(res.closeSnapshotAvailable).toBe(true);
 					expect(res.queuedAfterClose).toBe(0);
 				}, 45_000);
 			}

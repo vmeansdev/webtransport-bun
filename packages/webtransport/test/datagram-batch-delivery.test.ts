@@ -61,10 +61,15 @@ async function runChild(
 		stderr: "pipe",
 		cwd: new URL("../../..", import.meta.url).pathname,
 	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
+		// The deadline timer is cleared on every path; an uncancelled one would
+		// keep the test runner's loop alive for its full duration per child.
 		const exited = await Promise.race([
 			proc.exited,
-			Bun.sleep(timeoutMs).then(() => "timeout" as const),
+			new Promise<"timeout">((resolve) => {
+				timer = setTimeout(() => resolve("timeout"), timeoutMs);
+			}),
 		]);
 		const stdout = await new Response(proc.stdout).text();
 		const stderr = await new Response(proc.stderr).text();
@@ -85,6 +90,7 @@ async function runChild(
 			stderr,
 		};
 	} finally {
+		if (timer !== undefined) clearTimeout(timer);
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
@@ -122,6 +128,18 @@ describe("datagram batch knob parsing", () => {
 		]) {
 			expect([raw, parse(raw)]).toEqual([raw, 64]);
 		}
+	});
+
+	it("treats a decimal integer that overflows a double as invalid", () => {
+		// This is why the Number.isFinite guard is not redundant with the
+		// regex: these match /^[+-]?\d+$/ and still convert to Infinity, and
+		// the spec classifies non-finite as invalid rather than as a clamp.
+		const parse = __TESTING__.parseDatagramBatchSizeForTests;
+		const overflow = "9".repeat(400);
+		expect(/^[+-]?\d+$/.test(overflow)).toBe(true);
+		expect(Number(overflow)).toBe(Number.POSITIVE_INFINITY);
+		expect(parse(overflow)).toBe(64);
+		expect(parse(`-${overflow}`)).toBe(64);
 	});
 
 	it("clamps valid decimal integers into 0..256", () => {
@@ -281,7 +299,14 @@ describe("real-addon batch payload materialization (requirement E)", () => {
 		// Exactly one byte past the bound takes the accounted external handover.
 		expect([overMax.len, overMax.isBuffer]).toEqual([res.max + 1, true]);
 		expect(overMax.len).toBe(atMax.len + 1);
-		// The zero-length payload takes its own arm and allocates nothing.
+		// The zero-length payload comes back as an empty Buffer. Note what this
+		// does NOT prove: JavaScript cannot distinguish the Empty arm from the
+		// accounted-external arm, because both surface as a `Buffer`. So a
+		// 0-byte payload misrouted into external handover would still satisfy
+		// this assertion. Only three of the four arms are discriminable from
+		// here; size 0 => PayloadDeliveryPlan::Empty is pinned on the Rust side
+		// by `empty_payloads_plan_the_engine_owned_empty_buffer_in_either_mode`
+		// in crates/native/src/payload_buffer.rs.
 		expect([empty.len, empty.isBuffer]).toEqual([0, true]);
 	});
 

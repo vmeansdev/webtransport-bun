@@ -1115,9 +1115,13 @@ interface NativeSessionHandle {
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
 	readDatagram(): Promise<Uint8Array | null>;
-	/** Batched datagram read (absent on older prebuilt addons). Resolves a
-	 * non-empty array, or `null` at EOF/close — it never rejects. */
-	readDatagramBatch?: (max: number) => Promise<Uint8Array[] | null>;
+	/** Batched datagram read. Resolves a non-empty array, or `null` at
+	 * EOF/close — it never rejects. Required, not optional-with-fallback: it is
+	 * version-bound with the bundled prebuild, so a caller that drops it must
+	 * fail to compile rather than silently degrade to the legacy path. A
+	 * mismatched *override* addon is still caught at runtime by the first-pull
+	 * guard in {@link iterateIncomingDatagrams}. */
+	readDatagramBatch: (max: number) => Promise<Uint8Array[] | null>;
 	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
 	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
 	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
@@ -1336,6 +1340,9 @@ function parseDatagramBatchSize(raw: string | undefined): number {
 	const trimmed = raw.trim();
 	if (!/^[+-]?\d+$/.test(trimmed)) return DEFAULT_DATAGRAM_BATCH;
 	const value = Number(trimmed);
+	// Not redundant with the regex: a decimal-integer string long enough to
+	// overflow a double (309+ digits) matches it and still converts to
+	// Infinity, which the spec classifies as invalid rather than as a clamp.
 	if (!Number.isFinite(value)) return DEFAULT_DATAGRAM_BATCH;
 	if (value <= 0) return 0;
 	return value > MAX_DATAGRAM_BATCH ? MAX_DATAGRAM_BATCH : value;
