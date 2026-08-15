@@ -2979,24 +2979,38 @@ const H7_RATES = {
 	streamsPerSec: 5,
 } as const;
 /**
- * How far the recorded wall span may sit from the declared duration.
+ * How far the recorded wall span may sit ABOVE the declared duration.
  *
- * `durationSeconds` is self-declared, so on its own it proves nothing: a
- * five-minute run mislabeled 7200 would clear an equality check. The span
- * between `startedAtMs` and `endedAtMs` brackets the whole segment, and the
- * phase plan is partitioned *within* `durationSeconds`, so the only legitimate
- * slack is the baseline/final snapshots and teardown — seconds in practice.
- * Ten minutes is ~8% of the 2h lane: loose enough to survive a slow host,
- * tight enough that nothing meaningfully shorter or longer can pass.
+ * The bound is asymmetric because a genuine run's span can never be short.
+ * `runSegment` awaits its sampling poller — which itself loops until
+ * `DURATION + 90s` — before reading `endedAtMs`, and only then does the
+ * post-run sleep, server close, and up to 60s of drain. So the structural
+ * overhead is roughly 90s (poller bound) + 30s (a sample sleep already in
+ * flight) + 5s + 60s (drain) ≈ 185s, always positive. 300s leaves headroom
+ * over that without admitting anything meaningful; a shorter-than-declared
+ * span cannot legitimately occur at all, so the low side is exactly zero.
  */
-const H7_DURATION_TOLERANCE_MS = 10 * 60 * 1000;
+const H7_SPAN_OVERHEAD_MAX_MS = 300_000;
 /**
- * Minimum fraction of the samples a full run would produce. The charged-peak
- * ceiling is a max over `samples`, so a sampler that died early yields a
- * cheap, meaningless peak; requiring the series to be substantially complete
- * is what makes that ceiling mean anything.
+ * Minimum fraction of a full run's samples, AND of the wall span those samples
+ * must actually cover. The charged-peak ceiling is a max over `samples`, so a
+ * sampler that died early — or a hand-edited series bunched into one instant —
+ * yields a cheap, meaningless peak. Counting rows is not enough: the series
+ * has to span the run.
  */
 const H7_MIN_SAMPLE_DENSITY = 0.8;
+/**
+ * Throughput floor, expressed per hour so it scales with the declared
+ * duration: 500k/h is 1,000,000 for the 2h lane, i.e. ~139 datagrams/s.
+ *
+ * H7's whole claim is throughput, so an evidence contract for it must not
+ * accept a run that carried nothing — `sent > 0` alone passes a two-hour run
+ * that moved a single datagram at a 1/1 ratio. The number sits ~18x below the
+ * 24h soak's observed ~2,477/s and ~90x below the pre-H7 server ceiling of
+ * ~12,500/s, so it cannot false-red a real run while still catching a wedged
+ * or degenerate one.
+ */
+const H7_MIN_DATAGRAMS_PER_HOUR = 500_000;
 
 function expectExact(label: string, actual: unknown, expected: unknown): void {
 	if (!Object.is(actual, expected)) {
@@ -3225,6 +3239,20 @@ export function verifyH7Hosted(
 	if (!(datagramsSent > 0)) {
 		throw new Error("segment recorded no datagrams sent");
 	}
+	const minimumDatagrams = Math.floor(
+		(H7_MIN_DATAGRAMS_PER_HOUR * expectations.durationSeconds) / 3600,
+	);
+	for (const [label, sent] of [
+		["segment", datagramsSent],
+		["aggregate", aggregate.datagramsSent],
+	] as const) {
+		if (!Number.isFinite(sent) || sent < minimumDatagrams) {
+			throw new Error(
+				`${label} carried ${sent} datagrams, below the ${minimumDatagrams} throughput floor for ` +
+					`a ${expectations.durationSeconds}s run (${H7_MIN_DATAGRAMS_PER_HOUR}/hour)`,
+			);
+		}
+	}
 	for (const [label, sent, received] of [
 		["segment", datagramsSent, datagramsReceived],
 		["aggregate", aggregate.datagramsSent, aggregate.datagramsReceived],
@@ -3248,10 +3276,17 @@ export function verifyH7Hosted(
 		throw new Error("segment wall span is not a positive interval");
 	}
 	const declaredMs = expectations.durationSeconds * 1000;
-	if (Math.abs(wallSpanMs - declaredMs) > H7_DURATION_TOLERANCE_MS) {
+	const spanDeltaMs = wallSpanMs - declaredMs;
+	if (spanDeltaMs < 0) {
 		throw new Error(
-			`segment wall span ${(wallSpanMs / 1000).toFixed(0)}s does not corroborate the declared ${expectations.durationSeconds}s ` +
-				`(tolerance ${H7_DURATION_TOLERANCE_MS / 1000}s)`,
+			`segment wall span ${(wallSpanMs / 1000).toFixed(0)}s is shorter than the declared ${expectations.durationSeconds}s, ` +
+				"which a genuine run cannot be",
+		);
+	}
+	if (spanDeltaMs > H7_SPAN_OVERHEAD_MAX_MS) {
+		throw new Error(
+			`segment wall span ${(wallSpanMs / 1000).toFixed(0)}s exceeds the declared ${expectations.durationSeconds}s ` +
+				`by more than ${H7_SPAN_OVERHEAD_MAX_MS / 1000}s`,
 		);
 	}
 
@@ -3265,6 +3300,42 @@ export function verifyH7Hosted(
 		throw new Error(
 			`segment carries ${segment.samples.length} memory samples, below the ${minimumSamples} required ` +
 				`(${H7_MIN_SAMPLE_DENSITY * 100}% of the ${expectedSamples} a full ${expectations.durationSeconds}s run produces)`,
+		);
+	}
+	// A count is not a density. The series must lie inside the run and actually
+	// cover it, or a hand-edited artifact can carry a full row count that
+	// describes no elapsed time at all. The harness awaits its poller before
+	// reading endedAtMs, so no legitimate sample falls outside the span and no
+	// grace is needed on either side.
+	for (const sample of segment.samples) {
+		if (
+			!Number.isFinite(sample.ts_ms) ||
+			sample.ts_ms < segment.startedAtMs ||
+			sample.ts_ms > segment.endedAtMs
+		) {
+			throw new Error(
+				`segment has a sample timestamped ${sample.ts_ms} outside the segment wall span ` +
+					`[${segment.startedAtMs}, ${segment.endedAtMs}]`,
+			);
+		}
+	}
+	const firstSample = segment.samples[0];
+	const lastSample = segment.samples[segment.samples.length - 1];
+	if (!firstSample || !lastSample) {
+		throw new Error("segment sample series is not indexable");
+	}
+	const seriesSpanMs = lastSample.ts_ms - firstSample.ts_ms;
+	if (seriesSpanMs <= 0) {
+		throw new Error(
+			`segment sample series carries no elapsed time — all ${segment.samples.length} samples share one timestamp`,
+		);
+	}
+	const minimumSeriesSpanMs = wallSpanMs * H7_MIN_SAMPLE_DENSITY;
+	if (seriesSpanMs < minimumSeriesSpanMs) {
+		throw new Error(
+			`segment sample series spans ${(seriesSpanMs / 1000).toFixed(0)}s, under the ` +
+				`${(minimumSeriesSpanMs / 1000).toFixed(0)}s required (${H7_MIN_SAMPLE_DENSITY * 100}% of the ` +
+				`${(wallSpanMs / 1000).toFixed(0)}s wall span)`,
 		);
 	}
 	let chargedPeakMb = 0;
