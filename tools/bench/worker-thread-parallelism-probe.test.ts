@@ -17,6 +17,7 @@ import {
 	parseCpusAllowedListFromStatus,
 	parseLoadClientSentProgress,
 	parseSsUdpSkmem,
+	parseProcNetUdpListenDrops,
 	parseAppliedCongestion,
 	pickDisjointPhysicalCpus,
 	parseProcNetstatUdp,
@@ -93,6 +94,11 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 		clientAffinityOk: true,
 		skRcvbuf: null,
 		skDrops: null,
+		skDrops0: null,
+		skDrops1: null,
+		skDropSampleMs0: null,
+		skDropSampleMs1: null,
+		skListenMatchCount: null,
 		appliedCongestion: "cubic",
 		workerProof: {
 			configured: 2,
@@ -858,6 +864,52 @@ describe("parseSsUdpSkmem", () => {
 
 	test("returns null for a different port", () => {
 		expect(parseSsUdpSkmem(sample, 50111)).toBeNull();
+	});
+});
+
+describe("parseProcNetUdpListenDrops", () => {
+	const header =
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";
+	const unconn =
+		" 3508: 0100007F:C3BE 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 123456 2 0000000000000000 42";
+	const estab =
+		" 3509: 0100007F:C3BE 0100007F:C3AF 01 00000000:00000000 00:00000000 00000000     0        0 123457 2 0000000000000000 99";
+
+	test("reads UNCONN drops for the listen port", () => {
+		expect(parseProcNetUdpListenDrops(`${header}\n${unconn}\n`, 50110)).toEqual(
+			{
+				drops: 42,
+				inode: "123456",
+				rxQueue: 0,
+				matchCount: 1,
+			},
+		);
+	});
+
+	test("ignores ESTAB clones on the same port", () => {
+		expect(
+			parseProcNetUdpListenDrops(`${header}\n${estab}\n${unconn}\n`, 50110),
+		).toEqual({
+			drops: 42,
+			inode: "123456",
+			rxQueue: 0,
+			matchCount: 1,
+		});
+	});
+
+	test("counts two UNCONN rows", () => {
+		const second =
+			" 3510: 00000000:C3BE 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 123458 2 0000000000000000 7";
+		expect(
+			parseProcNetUdpListenDrops(`${header}\n${unconn}\n${second}\n`, 50110)
+				?.matchCount,
+		).toBe(2);
+	});
+
+	test("returns null when the port is absent", () => {
+		expect(
+			parseProcNetUdpListenDrops(`${header}\n${unconn}\n`, 50111),
+		).toBeNull();
 	});
 });
 

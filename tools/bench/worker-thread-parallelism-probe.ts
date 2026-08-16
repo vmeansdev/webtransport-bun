@@ -280,6 +280,11 @@ export type ArmRun = {
 	clientAffinityOk: boolean;
 	skRcvbuf: number | null;
 	skDrops: number | null;
+	skDrops0: number | null;
+	skDrops1: number | null;
+	skDropSampleMs0: number | null;
+	skDropSampleMs1: number | null;
+	skListenMatchCount: number | null;
 	appliedCongestion: string | null;
 };
 
@@ -813,6 +818,56 @@ export function readSsUdpSkmem(
 	return parseSsUdpSkmem(`${result.stdout}\n${result.stderr}`, port);
 }
 
+export type ProcNetUdpListen = {
+	drops: number;
+	inode: string;
+	rxQueue: number;
+	matchCount: number;
+};
+
+export function parseProcNetUdpListenDrops(
+	text: string,
+	port: number,
+): ProcNetUdpListen | null {
+	const portHex = port.toString(16).padStart(4, "0").toLowerCase();
+	const matches: Omit<ProcNetUdpListen, "matchCount">[] = [];
+	for (const line of text.split("\n")) {
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 13) continue;
+		if ((parts[0] ?? "").startsWith("sl")) continue;
+		const localPort = (parts[1] ?? "").split(":")[1]?.toLowerCase();
+		if (localPort !== portHex) continue;
+		const rem = (parts[2] ?? "").toLowerCase();
+		if (rem !== "00000000:0000") continue;
+		const rxHex = (parts[4] ?? "").split(":")[1] ?? "0";
+		const drops = Number.parseInt(parts[12] ?? "", 10);
+		if (!Number.isFinite(drops)) continue;
+		matches.push({
+			drops,
+			inode: parts[9] ?? "",
+			rxQueue: Number.parseInt(rxHex, 16) || 0,
+		});
+	}
+	const first = matches[0];
+	if (!first) return null;
+	return { ...first, matchCount: matches.length };
+}
+
+export function readProcNetUdpListenDrops(port: number): {
+	listen: ProcNetUdpListen | null;
+	sampleMs: number;
+} {
+	const started = performance.now();
+	let text = "";
+	try {
+		text = readFileSync("/proc/net/udp", "utf8");
+	} catch {
+		return { listen: null, sampleMs: performance.now() - started };
+	}
+	const sampleMs = performance.now() - started;
+	return { listen: parseProcNetUdpListenDrops(text, port), sampleMs };
+}
+
 export function classifyPipeCap(input: {
 	frameTxPerSec: number | null;
 	ingestedPerSec: number;
@@ -1207,6 +1262,7 @@ async function runChild(
 	const metrics0 = server.metricsSnapshot();
 	const streams0 = acceptedStreams;
 	const stats0 = sumConnectionStats(sessionRefs);
+	const listen0 = readProcNetUdpListenDrops(port);
 	const udp0 = readLinuxUdpSnapshot();
 	const t0 = performance.now();
 	await Bun.sleep(MEASURE_SEC * 1_000);
@@ -1215,6 +1271,7 @@ async function runChild(
 	const cpu1 = process.cpuUsage();
 	const probe1 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
 	const metrics1 = server.metricsSnapshot();
+	const listen1 = readProcNetUdpListenDrops(port);
 	const stats1 = sumConnectionStats(sessionRefs);
 	const udp1 = readLinuxUdpSnapshot();
 	const t1 = performance.now();
@@ -1371,6 +1428,17 @@ async function runChild(
 		clientAffinityOk,
 		skRcvbuf: skmemAfter?.recvbuf ?? skmem?.recvbuf ?? null,
 		skDrops: skmemAfter?.drops ?? skmem?.drops ?? null,
+		skDrops0: listen0.listen?.drops ?? null,
+		skDrops1: listen1.listen?.drops ?? null,
+		skDropSampleMs0: listen0.sampleMs,
+		skDropSampleMs1: listen1.sampleMs,
+		skListenMatchCount: (() => {
+			const counts = [
+				listen0.listen?.matchCount,
+				listen1.listen?.matchCount,
+			].filter((n): n is number => n != null);
+			return counts.length > 0 ? Math.max(...counts) : null;
+		})(),
 		appliedCongestion: parseAppliedCongestion(stdout),
 	};
 	if (sessionsOk === 0) {

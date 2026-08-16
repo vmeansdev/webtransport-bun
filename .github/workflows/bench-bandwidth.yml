@@ -133,11 +133,16 @@ jobs:
           cargo tree -p quinn-udp -e features 2>/dev/null | head -5 || true
           echo "== fast-apple-datapath enabled anywhere? =="
           cargo tree -e features -i quinn-udp 2>/dev/null | grep -c "fast-apple-datapath" || echo "0 (not enabled)"
-          echo "== GRO on the default interface =="
+          echo "== GRO on the default interface (print-only; NIC is not lo) =="
           IFACE="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
           if command -v ethtool >/dev/null 2>&1 && [ -n "$IFACE" ]; then
             ethtool -k "$IFACE" | grep -Ei 'gro|gso' || true
           fi
+          echo "== quinn-udp gso-probe (classifier GRO; not ethtool) =="
+          CARGO_TARGET_DIR="$PWD/target" cargo run --release -p reference --bin gso-probe | tee /tmp/gso-probe.txt
+          GRO="$(awk '/quinn-udp gro_segments/{print $NF}' /tmp/gso-probe.txt)"
+          echo "WT_PROBE_GRO_SEGMENTS=$GRO"
+          echo "WT_PROBE_GRO_SEGMENTS=$GRO" >> "$GITHUB_ENV"
       - name: Run worker load sweep
         if: ${{ github.event.inputs.worker_probe == 'true' }}
         env:
@@ -146,11 +151,12 @@ jobs:
           SWEEP_CLIENTS: ${{ github.event.inputs.worker_sweep_clients }}
           SWEEP_SEND_MODES: wait
           SWEEP_CPU_MODES: shared
-          SWEEP_RMEM_MODES: default,raised
+          SWEEP_RMEM_MODES: default
           SWEEP_CC_MODES: bbr
           SWEEP_RATES: "160000"
           SWEEP_WORKERS: "2"
           SWEEP_MEASURE_SEC: "15"
+          SWEEP_REPS: "3"
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           SWEEP_OUT="$GITHUB_WORKSPACE/.bench-evidence/worker-load-sweep-${{ github.event.inputs.candidate_commit }}.json" \

@@ -198,6 +198,12 @@ export type SweepRun = {
 	clientAffinityOk: boolean;
 	skRcvbuf: number | null;
 	skDrops: number | null;
+	skDrops0: number | null;
+	skDrops1: number | null;
+	skDropSampleMs0: number | null;
+	skDropSampleMs1: number | null;
+	skListenMatchCount: number | null;
+	windowMs: number;
 	appliedCongestion: string | null;
 };
 
@@ -330,6 +336,12 @@ async function runOne(
 			clientAffinityOk: run.clientAffinityOk !== false,
 			skRcvbuf: run.skRcvbuf ?? null,
 			skDrops: run.skDrops ?? null,
+			skDrops0: run.skDrops0 ?? null,
+			skDrops1: run.skDrops1 ?? null,
+			skDropSampleMs0: run.skDropSampleMs0 ?? null,
+			skDropSampleMs1: run.skDropSampleMs1 ?? null,
+			skListenMatchCount: run.skListenMatchCount ?? null,
+			windowMs: run.windowMs,
 			appliedCongestion: run.appliedCongestion ?? null,
 		};
 	} finally {
@@ -855,6 +867,121 @@ export function classifyBbrRmem(input: {
 	};
 }
 
+export type BbrSkdropsBucket = "incomplete" | "socket-drops" | "not-socket";
+
+export type BbrSkdropsCap = {
+	dropRatePerSec: number | null;
+	holePerSec: number | null;
+	ratio: number | null;
+	groSegments: number | null;
+	udpTxOverFrameTx: number | null;
+	d0: number | null;
+	d1: number | null;
+	stopBucket: BbrSkdropsBucket;
+};
+
+export function classifyBbrSkdrops(input: {
+	summaries: readonly ArmSummary[];
+	groSegments: number | null;
+	ccModes: readonly string[];
+	rmemModes: readonly string[];
+	cpuModes: readonly string[];
+	sessions: number;
+}): BbrSkdropsCap {
+	const runs = input.summaries.flatMap((s) => s.runs);
+	const dropRates: number[] = [];
+	const holes: number[] = [];
+	const d0s: number[] = [];
+	const d1s: number[] = [];
+	const udpOverFrame: number[] = [];
+	let samplesOk = runs.length > 0;
+	for (const r of runs) {
+		const d0 = r.skDrops0;
+		const d1 = r.skDrops1;
+		const windowSec = r.windowMs / 1000;
+		const frameTx = r.gap?.frameTxDatagramPerSec ?? null;
+		const udpTx = r.gap?.udpTxPerSec ?? null;
+		if (
+			d0 == null ||
+			d1 == null ||
+			d1 < d0 ||
+			!(windowSec > 0) ||
+			frameTx == null ||
+			udpTx == null ||
+			frameTx <= 0 ||
+			r.skListenMatchCount !== 1 ||
+			r.skDropSampleMs0 == null ||
+			r.skDropSampleMs1 == null ||
+			r.skDropSampleMs0 > 100 ||
+			r.skDropSampleMs1 > 100
+		) {
+			samplesOk = false;
+			continue;
+		}
+		dropRates.push((d1 - d0) / windowSec);
+		holes.push(frameTx - r.ingestedPerSec);
+		d0s.push(d0);
+		d1s.push(d1);
+		udpOverFrame.push(udpTx / frameTx);
+	}
+	const dropRatePerSec = dropRates.length > 0 ? median(dropRates) : null;
+	const holePerSec = holes.length > 0 ? median(holes) : null;
+	const ratio =
+		dropRatePerSec != null && holePerSec != null && holePerSec > 0
+			? dropRatePerSec / holePerSec
+			: null;
+	const udpTxOverFrameTx =
+		udpOverFrame.length > 0 ? median(udpOverFrame) : null;
+	const ingest = medianIngest(input.summaries);
+	const frameTx = medianFrameTx(input.summaries);
+	const printMatches =
+		runs.length > 0 && runs.every((r) => r.appliedCongestion === "bbr");
+	const sessionsHealthy = runs.every(
+		(r) => r.sessionsOk >= 0.9 * input.sessions,
+	);
+	const cubicPresent = input.ccModes.some((m) => m === "cubic");
+	const raisedPresent = input.rmemModes.some((m) => m === "raised");
+	const mixedCpu = input.cpuModes.some((m) => m !== "shared");
+	const ingestOk = ingest != null && ingest >= 40_000 && ingest <= 60_000;
+	const frameOk = frameTx != null && frameTx >= 120_000;
+	const groOk = input.groSegments === 1;
+	const udpRatioOk =
+		udpTxOverFrameTx != null &&
+		udpTxOverFrameTx >= 0.8 &&
+		udpTxOverFrameTx <= 1.25;
+	const halfHole = ratio != null && ratio >= 0.4 && ratio < 0.9;
+	const incomplete =
+		!samplesOk ||
+		dropRatePerSec == null ||
+		holePerSec == null ||
+		ratio == null ||
+		!printMatches ||
+		!sessionsHealthy ||
+		cubicPresent ||
+		raisedPresent ||
+		mixedCpu ||
+		!ingestOk ||
+		!frameOk ||
+		!groOk ||
+		!udpRatioOk ||
+		halfHole;
+	let stopBucket: BbrSkdropsBucket = "incomplete";
+	if (!incomplete && holePerSec != null && ratio != null) {
+		if (ratio >= 0.9 && holePerSec > 5_000) stopBucket = "socket-drops";
+		else if (ratio < 0.4) stopBucket = "not-socket";
+	}
+	return {
+		dropRatePerSec,
+		holePerSec,
+		ratio,
+		groSegments: input.groSegments,
+		udpTxOverFrameTx,
+		d0: d0s.length > 0 ? median(d0s) : null,
+		d1: d1s.length > 0 ? median(d1s) : null,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -965,6 +1092,17 @@ async function main(): Promise<void> {
 		ccModes: CC_MODES,
 		sessions: SESSIONS,
 	});
+	const groRaw = process.env.WT_PROBE_GRO_SEGMENTS?.trim() ?? "";
+	const groSegments = groRaw === "" ? null : Number(groRaw);
+	const bbrSkdrops = classifyBbrSkdrops({
+		summaries,
+		groSegments:
+			groSegments != null && Number.isFinite(groSegments) ? groSegments : null,
+		ccModes: CC_MODES,
+		rmemModes: RMEM_MODES,
+		cpuModes: CPU_MODES,
+		sessions: SESSIONS,
+	});
 	const failures = [
 		...proofFailures(summaries),
 		...(gitOutput(["rev-parse", "HEAD"]) === head
@@ -1015,6 +1153,7 @@ async function main(): Promise<void> {
 		rmem,
 		cc,
 		bbrRmem,
+		bbrSkdrops,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -1027,6 +1166,12 @@ async function main(): Promise<void> {
 		CC_MODES.length === 1 &&
 		CC_MODES[0] === "bbr" &&
 		RMEM_MODES.includes("raised");
+	const bbrSocketStamp =
+		CC_MODES.length === 1 &&
+		CC_MODES[0] === "bbr" &&
+		RMEM_MODES.length === 1 &&
+		RMEM_MODES[0] === "default";
+	const hideGapStop = bbrRmemStamp || bbrSocketStamp;
 
 	console.log(
 		`\n  ${"arm".padEnd(16)}${"requested".padStart(10)}${"offered".padStart(10)}` +
@@ -1044,7 +1189,7 @@ async function main(): Promise<void> {
 				`${String(s.datagramThreads).padStart(5)}${s.requestMet ? "" : "  (request not met)"}`,
 		);
 		for (const r of s.runs) {
-			if (!bbrRmemStamp) {
+			if (!hideGapStop) {
 				if (r.gap)
 					console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
 				if (r.pipeCap)
@@ -1055,13 +1200,18 @@ async function main(): Promise<void> {
 				console.log(
 					`  ${s.key} r${r.round} ingest=${Math.round(r.ingestedPerSec)} ` +
 						`frameTx=${n(r.gap.frameTxDatagramPerSec)} ` +
+						`udpTx=${n(r.gap.udpTxPerSec)} ` +
 						`rcvbufDelta=${n(r.gap.udpRcvbufErrorsDelta)} ` +
 						`cong=${r.pipeCap ? Math.round(r.pipeCap.congPerSec ?? 0) : "n/a"}`,
 				);
 			}
-			if (r.skRcvbuf != null) {
+			if (r.skRcvbuf != null || r.skDrops0 != null) {
 				console.log(
-					`  ${s.key} r${r.round} sk: rcvbuf=${r.skRcvbuf} drops=${r.skDrops ?? "n/a"}`,
+					`  ${s.key} r${r.round} sk: rcvbuf=${r.skRcvbuf ?? "n/a"} ` +
+						`dropsAfter=${r.skDrops ?? "n/a"} ` +
+						`d0=${r.skDrops0 ?? "n/a"} d1=${r.skDrops1 ?? "n/a"} ` +
+						`sampleMs=${r.skDropSampleMs0 ?? "n/a"}/${r.skDropSampleMs1 ?? "n/a"} ` +
+						`matches=${r.skListenMatchCount ?? "n/a"}`,
 				);
 			}
 			if (r.appliedCongestion) {
@@ -1107,7 +1257,7 @@ async function main(): Promise<void> {
 				"hypothesis; a 'no collapse' reading here is unearned.",
 		);
 	}
-	if (waitVsDrop.stopBucket !== "incomplete") {
+	if (waitVsDrop.stopBucket !== "incomplete" && !bbrSocketStamp) {
 		const n = (value: number | null): string =>
 			value == null ? "n/a" : String(Math.round(value));
 		console.log(
@@ -1163,6 +1313,19 @@ async function main(): Promise<void> {
 				`ratio=${bbrRmem.ratio == null ? "n/a" : bbrRmem.ratio.toFixed(2)} ` +
 				`defaultSk=${n(bbrRmem.defaultSkRcvbuf)} raisedSk=${n(bbrRmem.raisedSkRcvbuf)} ` +
 				`wrote=${bbrRmem.rmemDefaultWrote} STOP=${bbrRmem.stopBucket}`,
+		);
+	}
+	if (bbrSocketStamp) {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  bbr-skdrops: D=${n(bbrSkdrops.dropRatePerSec)} ` +
+				`H=${n(bbrSkdrops.holePerSec)} ` +
+				`ratio=${bbrSkdrops.ratio == null ? "n/a" : bbrSkdrops.ratio.toFixed(2)} ` +
+				`gro=${n(bbrSkdrops.groSegments)} ` +
+				`udpTx/frameTx=${bbrSkdrops.udpTxOverFrameTx == null ? "n/a" : bbrSkdrops.udpTxOverFrameTx.toFixed(2)} ` +
+				`d0=${n(bbrSkdrops.d0)} d1=${n(bbrSkdrops.d1)} ` +
+				`STOP=${bbrSkdrops.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)

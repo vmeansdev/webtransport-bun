@@ -3,6 +3,7 @@ import {
 	type ArmSummary,
 	armKey,
 	classifyBbrRmem,
+	classifyBbrSkdrops,
 	classifyCc,
 	classifyCoresplit,
 	classifyRmem,
@@ -322,6 +323,12 @@ function withFrameTx(
 				clientAffinityOk: true,
 				skRcvbuf,
 				skDrops: 0,
+				skDrops0: 0,
+				skDrops1: 0,
+				skDropSampleMs0: 1,
+				skDropSampleMs1: 1,
+				skListenMatchCount: 1,
+				windowMs: 15_000,
 				appliedCongestion: key.endsWith("@bbr") ? "bbr" : "cubic",
 			},
 		],
@@ -687,6 +694,92 @@ describe("classifyBbrRmem", () => {
 						100_000,
 					),
 				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+});
+
+describe("classifyBbrSkdrops", () => {
+	const base = {
+		groSegments: 1 as number | null,
+		ccModes: ["bbr"],
+		rmemModes: ["default"],
+		cpuModes: ["shared"],
+		sessions: 100,
+	};
+
+	function armAt(
+		dropRatePerSec: number,
+		over: Record<string, unknown> = {},
+	): ArmSummary {
+		const summary = withFrameTx(
+			"w2@160000@wait@bbr",
+			135_000,
+			138_000,
+			4_194_304,
+			50_000,
+		);
+		const run = summary.runs[0];
+		if (!run) throw new Error("withFrameTx produced no run");
+		summary.runs = [
+			{
+				...run,
+				skDrops0: 1_000,
+				skDrops1: 1_000 + Math.round(dropRatePerSec * 15),
+				...over,
+			},
+		];
+		return summary;
+	}
+
+	test("D covering 90% of the hole is socket-drops", () => {
+		expect(
+			classifyBbrSkdrops({ ...base, summaries: [armAt(80_000)] }).stopBucket,
+		).toBe("socket-drops");
+	});
+
+	test("D under 40% of the hole is not-socket", () => {
+		expect(
+			classifyBbrSkdrops({ ...base, summaries: [armAt(10_000)] }).stopBucket,
+		).toBe("not-socket");
+	});
+
+	test("half-hole packet/dgram ratio is incomplete", () => {
+		expect(
+			classifyBbrSkdrops({ ...base, summaries: [armAt(42_000)] }).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("GRO not 1 is incomplete", () => {
+		expect(
+			classifyBbrSkdrops({
+				...base,
+				groSegments: 32,
+				summaries: [armAt(80_000)],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("udp_tx far from frame_tx is incomplete", () => {
+		const summary = armAt(80_000);
+		const run = summary.runs[0];
+		if (!run?.gap) throw new Error("expected gap");
+		summary.runs = [
+			{
+				...run,
+				gap: { ...run.gap, udpTxPerSec: 270_000 },
+			},
+		];
+		expect(
+			classifyBbrSkdrops({ ...base, summaries: [summary] }).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("listen matchCount not 1 is incomplete", () => {
+		expect(
+			classifyBbrSkdrops({
+				...base,
+				summaries: [armAt(80_000, { skListenMatchCount: 2 })],
 			}).stopBucket,
 		).toBe("incomplete");
 	});
