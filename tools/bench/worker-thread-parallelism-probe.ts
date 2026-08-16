@@ -85,12 +85,48 @@ const CLIENTS = Number(process.env.WT_PROBE_CLIENTS ?? "1");
  * say anything about it.
  */
 const ECHO = process.env.WT_PROBE_ECHO === "1";
+/**
+ * Drain via `discardIncomingDatagram` (one N-API call per datagram) instead of
+ * `incomingDatagrams` / `readDatagram`. Mutually exclusive with ECHO: discard
+ * does not materialise a payload to send back.
+ */
+const DISCARD = process.env.WT_PROBE_DISCARD === "1";
 /** Per-session stream opens/s, to make the accept path hot. */
 const STREAMS_PER_SEC = Number(process.env.WT_PROBE_STREAMS_PER_SEC ?? "0");
+/** Restrict the worker sweep, e.g. `1` for a hop A/B at the collapse default. */
+const WORKER_FILTER = (process.env.WT_PROBE_WORKERS ?? "")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s) => s.length > 0);
+const SKIP_SESSION_SWEEP =
+	process.env.WT_PROBE_SKIP_SESSION === "1" ||
+	ECHO ||
+	DISCARD ||
+	STREAMS_PER_SEC > 0;
+
+export function artifactSuffix(opts: {
+	clients: number;
+	echo: boolean;
+	discard: boolean;
+	streamsPerSec: number;
+}): string {
+	const parts: string[] = [];
+	if (opts.clients > 1) parts.push(`c${opts.clients}`);
+	if (opts.echo) parts.push("echo");
+	if (opts.discard) parts.push("discard");
+	if (opts.streamsPerSec > 0) parts.push(`streams${opts.streamsPerSec}`);
+	return parts.length > 0 ? `-${parts.join("-")}` : "";
+}
+
 const ARTIFACT_PATH = join(
 	ROOT,
 	".investigation",
-	`worker-thread-parallelism-probe${CLIENTS > 1 ? `-c${CLIENTS}` : ""}.json`,
+	`worker-thread-parallelism-probe${artifactSuffix({
+		clients: CLIENTS,
+		echo: ECHO,
+		discard: DISCARD,
+		streamsPerSec: STREAMS_PER_SEC,
+	})}.json`,
 );
 const CHILD_TIMEOUT_MS =
 	(WARMUP_SEC + MEASURE_SEC) * 1_000 + BIND_WAIT_MS + 60_000;
@@ -117,12 +153,14 @@ export type Arm = {
 /** worker_threads sweep at the load where the plateau appeared. */
 export function workerArms(): Arm[] {
 	const perSession = Math.round(AGGREGATE_PER_SEC / SATURATION_SESSIONS);
-	return ["1", "2", "4", "auto"].map((workers) => ({
+	const all = ["1", "2", "4", "auto"].map((workers) => ({
 		label: `workers=${workers}`,
 		workers,
 		sessions: SATURATION_SESSIONS,
 		rate: perSession,
 	}));
+	if (WORKER_FILTER.length === 0) return all;
+	return all.filter((arm) => WORKER_FILTER.includes(arm.workers));
 }
 
 /** Session-count sweep at fixed aggregate offered load, one worker. */
@@ -296,32 +334,63 @@ async function runChild(
 		limits: {
 			maxSessions: sessions + 100,
 			maxHandshakesInFlight: sessions + 100,
+			...(STREAMS_PER_SEC > 0
+				? {
+						maxStreamsGlobal: 200_000,
+						maxStreamsPerSessionBidi: 2_000,
+						maxStreamsPerSessionUni: 2_000,
+					}
+				: {}),
 		},
 		rateLimits: {
 			handshakesPerSec: Math.max(sessions * 2, 400),
 			handshakesBurst: Math.max(sessions * 4, 1000),
 			handshakesBurstPerPrefix: Math.max(sessions * 4, 1000),
-			streamsPerSec: 1000,
-			streamsBurst: 2000,
+			// Scale with the driven open rate, or the limiter becomes the thing
+			// being measured instead of the accept path.
+			streamsPerSec: Math.max(1000, sessions * STREAMS_PER_SEC * 4),
+			streamsBurst: Math.max(2000, sessions * STREAMS_PER_SEC * 8),
 			// Measure the delivery path, never the limiter.
 			datagramsPerSec: aggregateOffered * 4,
 			datagramsBurst: aggregateOffered * 8,
 		},
 		onSession: (session) => {
-			// Receive-only by default: an echo would put the send path in the
-			// measurement and halve the pps headroom on the same host. ECHO turns
-			// it on deliberately, when the send path is what is being measured.
-			void (async () => {
-				for await (const datagram of session.incomingDatagrams()) {
-					received += 1;
-					receivedBytes += datagram.byteLength;
-					if (ECHO) {
-						// Unawaited: awaiting would serialise the reader behind the
-						// send and measure the round trip instead of send capacity.
-						void session.sendDatagram(datagram).catch(() => {});
+			if (DISCARD) {
+				const discard = (
+					session as {
+						discardIncomingDatagram?: (
+							timeoutMs?: number,
+						) => Promise<boolean | null | undefined>;
 					}
+				).discardIncomingDatagram?.bind(session);
+				if (!discard) {
+					throw new Error(
+						"WT_PROBE_DISCARD=1 but session.discardIncomingDatagram is missing",
+					);
 				}
-			})().catch(() => {});
+				void (async () => {
+					for (;;) {
+						const got = await discard();
+						if (got == null) break;
+						if (got) received += 1;
+					}
+				})().catch(() => {});
+			} else {
+				// Receive-only by default: an echo would put the send path in the
+				// measurement and halve the pps headroom on the same host. ECHO turns
+				// it on deliberately, when the send path is what is being measured.
+				void (async () => {
+					for await (const datagram of session.incomingDatagrams()) {
+						received += 1;
+						receivedBytes += datagram.byteLength;
+						if (ECHO) {
+							// Unawaited: awaiting would serialise the reader behind the
+							// send and measure the round trip instead of send capacity.
+							void session.sendDatagram(datagram).catch(() => {});
+						}
+					}
+				})().catch(() => {});
+			}
 			if (STREAMS_PER_SEC > 0) {
 				// ServerSession exposes incoming streams as a ReadableStream, not an
 				// async-iterable method as the client session does.
@@ -637,6 +706,12 @@ function printSweep(name: string, summaries: ArmSummary[]): void {
 		console.log(
 			`    ${s.label.padEnd(16)} ` +
 				`${Math.round(s.medianReceivedPerSec).toLocaleString().padStart(9)} recv/s  ` +
+				`${Math.round(median(s.runs.map((r) => r.datagramsOutPerSec)))
+					.toLocaleString()
+					.padStart(9)} send/s  ` +
+				`${Math.round(median(s.runs.map((r) => r.acceptedStreamsPerSec)))
+					.toLocaleString()
+					.padStart(7)} acc/s  ` +
 				`${s.medianServerCpuCores.toFixed(2)} cores  ` +
 				`sat ${s.maxSaturationRatio.toFixed(3)}  ` +
 				`workers=${s.configuredWorkers}  ` +
@@ -650,6 +725,13 @@ async function runParent(): Promise<void> {
 		console.error(
 			`probe: REFUSED\n  ${CLIENT_BIN} is missing; build it with ` +
 				"`CARGO_TARGET_DIR=$PWD/target cargo build -p reference --bin load-client --release`",
+		);
+		process.exit(1);
+	}
+
+	if (ECHO && DISCARD) {
+		console.error(
+			"probe: REFUSED\n  WT_PROBE_ECHO and WT_PROBE_DISCARD cannot both be set",
 		);
 		process.exit(1);
 	}
@@ -673,14 +755,18 @@ async function runParent(): Promise<void> {
 	const seed = Number(process.env.WT_PROBE_SEED ?? "20260816");
 	const rng = makeRng(seed);
 	const workers = workerArms();
-	const sessions = sessionArms();
+	if (workers.length === 0) {
+		console.error(
+			"probe: REFUSED\n  WT_PROBE_WORKERS matched no arms; expected 1,2,4,auto",
+		);
+		process.exit(1);
+	}
+	const sessions = SKIP_SESSION_SWEEP ? [] : sessionArms();
 	const workerSweep = await runSweep("workers", workers, rng, BASE_PORT);
-	const sessionSweep = await runSweep(
-		"sessions",
-		sessions,
-		rng,
-		BASE_PORT + 200,
-	);
+	const sessionSweep =
+		sessions.length > 0
+			? await runSweep("sessions", sessions, rng, BASE_PORT + 200)
+			: { runs: [] as ArmRun[], order: [] as string[] };
 
 	const workerSummary = summarizeSweep(workers, workerSweep.runs);
 	const sessionSummary = summarizeSweep(sessions, sessionSweep.runs);
@@ -729,10 +815,26 @@ async function runParent(): Promise<void> {
 			measureSec: MEASURE_SEC,
 			reps: REPS,
 			clients: CLIENTS,
+			echo: ECHO,
+			discard: DISCARD,
+			streamsPerSec: STREAMS_PER_SEC,
+			skipSessionSweep: SKIP_SESSION_SWEEP,
 			saturationCeiling: SATURATION_CEILING,
 			seed,
 			workerOrder: workerSweep.order,
 			sessionOrder: sessionSweep.order,
+			hops: {
+				readDatagramViaServerRuntime:
+					process.env.WEBTRANSPORT_READ_DATAGRAM_VIA_SERVER_RUNTIME ?? "",
+				sendDatagramViaServerRuntime:
+					process.env.WEBTRANSPORT_SEND_DATAGRAM_VIA_SERVER_RUNTIME ?? "",
+				discardDatagramViaServerRuntime:
+					process.env.WEBTRANSPORT_DISCARD_DATAGRAM_VIA_SERVER_RUNTIME ?? "",
+				streamOpsViaServerRuntime:
+					process.env.WEBTRANSPORT_STREAM_OPS_VIA_SERVER_RUNTIME ?? "",
+				globalQueueInterval:
+					process.env.WEBTRANSPORT_SERVER_GLOBAL_QUEUE_INTERVAL ?? "",
+			},
 		},
 		workerSweep: workerSummary,
 		sessionSweep: sessionSummary,
@@ -746,10 +848,12 @@ async function runParent(): Promise<void> {
 		`WORKER SWEEP (${SATURATION_SESSIONS} sessions, ~${AGGREGATE_PER_SEC.toLocaleString()}/s offered)`,
 		workerSummary,
 	);
-	printSweep(
-		`SESSION SWEEP (workers=1, ~${AGGREGATE_PER_SEC.toLocaleString()}/s offered)`,
-		sessionSummary,
-	);
+	if (sessionSummary.length > 0) {
+		printSweep(
+			`SESSION SWEEP (workers=1, ~${AGGREGATE_PER_SEC.toLocaleString()}/s offered)`,
+			sessionSummary,
+		);
+	}
 	console.log(
 		`\n  best worker arm / workers=1: ${workerSpeedup?.toFixed(4) ?? "n/a"}x (${best.label})`,
 	);

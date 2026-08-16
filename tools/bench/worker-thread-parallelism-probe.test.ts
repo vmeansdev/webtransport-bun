@@ -4,6 +4,7 @@ import {
 	type Arm,
 	type ArmRun,
 	type ArmSummary,
+	artifactSuffix,
 	dirtyPaths,
 	makeRng,
 	median,
@@ -181,5 +182,45 @@ describe("proofFailures", () => {
 	test("refuses when the addon has no worker probe at all", () => {
 		const failures = proofFailures([summary({ configuredWorkers: null })]);
 		expect(failures[0]).toContain("no worker-probe snapshot");
+	});
+});
+
+describe("artifact naming", () => {
+	test("the baseline receive-only single-client run keeps the original name", () => {
+		expect(
+			artifactSuffix({
+				clients: 1,
+				echo: false,
+				discard: false,
+				streamsPerSec: 0,
+			}),
+		).toBe("");
+	});
+
+	test("load-shape suffixes do not clobber the baseline artifact", () => {
+		expect(
+			artifactSuffix({
+				clients: 3,
+				echo: true,
+				discard: false,
+				streamsPerSec: 0,
+			}),
+		).toBe("-c3-echo");
+		expect(
+			artifactSuffix({
+				clients: 3,
+				echo: false,
+				discard: true,
+				streamsPerSec: 0,
+			}),
+		).toBe("-c3-discard");
+		expect(
+			artifactSuffix({
+				clients: 3,
+				echo: false,
+				discard: false,
+				streamsPerSec: 10,
+			}),
+		).toBe("-c3-streams10");
 	});
 });

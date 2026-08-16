@@ -200,19 +200,26 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<boolean | null>")]
     pub fn discard_datagram(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move {
-                    let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
-                    discard_datagram_for_session(&id, timeout).await
-                })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
+        // See crate::discard_datagram_via_server_runtime for why this is gated.
+        if crate::discard_datagram_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move { discard_datagram_for_session(&id, timeout).await })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
+        env.spawn_future(async move { discard_datagram_for_session(&id, timeout).await })
     }
 
     /// Consume queued datagrams until the session closes or the deadline
     /// expires without allocating a JavaScript payload per datagram.
+    ///
+    /// The hop stays. This is one injected task that then loops on the server
+    /// runtime — moving it onto napi-rs's `current_thread` runtime would
+    /// monopolise the JS thread for the whole drain. Not the per-call cadence
+    /// that collapsed `read_datagram`.
     #[napi(ts_return_type = "Promise<number | null>")]
     pub fn discard_datagrams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();

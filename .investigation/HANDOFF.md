@@ -272,7 +272,11 @@ it, which a busier server or more sessions could undo.
 STILL OPEN: the same `env.spawn_future -> RUNTIME.spawn` shape appears on the
 other `session_napi.rs` methods (`send_datagram`, `discard_datagram`, the stream
 opens). Only `read_datagram` was measured. Review the others for the same
-reasoning rather than changing them on faith.
+reasoning rather than changing them on faith. **In progress 2026-08-16:**
+gates exist, defaults keep every unmeasured hop, load shapes added
+(`WT_PROBE_ECHO`, `WT_PROBE_DISCARD`, `WT_PROBE_STREAMS_PER_SEC`). Predictions
+are in `measurement.md` under "Run J / K / L" — measure next, do not flip
+defaults on the prior session's un-artifacted numbers.
 
 Starting hypotheses, in the order I would test them:
 1. **A timer or poll interval somewhere in the delivery path.** Work out what

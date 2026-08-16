@@ -627,4 +627,79 @@ gh workflow run bench-bandwidth.yml --ref investigate/quic-parallelism \
 ```
 
 Knobs: `WT_PROBE_CLIENTS`, `WT_PROBE_SESSIONS`, `WT_PROBE_AGGREGATE`,
-`WT_PROBE_REPS`, `WT_PROBE_WARMUP_SEC`, `WT_PROBE_MEASURE_SEC`, `WT_PROBE_SEED`.
+`WT_PROBE_REPS`, `WT_PROBE_WARMUP_SEC`, `WT_PROBE_MEASURE_SEC`, `WT_PROBE_SEED`,
+`WT_PROBE_ECHO`, `WT_PROBE_DISCARD`, `WT_PROBE_STREAMS_PER_SEC`,
+`WT_PROBE_WORKERS` (restrict the worker sweep, e.g. `1`),
+`WT_PROBE_SKIP_SESSION`. Hop A/B knobs:
+`WEBTRANSPORT_SEND_DATAGRAM_VIA_SERVER_RUNTIME`,
+`WEBTRANSPORT_DISCARD_DATAGRAM_VIA_SERVER_RUNTIME`,
+`WEBTRANSPORT_STREAM_OPS_VIA_SERVER_RUNTIME`,
+`WEBTRANSPORT_SERVER_GLOBAL_QUEUE_INTERVAL`.
+
+## Run J / K / L — remaining spawn sites (predictions, 2026-08-16)
+
+Same `env.spawn_future -> RUNTIME.spawn` shape as `read_datagram`. Method:
+source first, prediction, then a load shape that stresses *that* path, then
+the `global_queue_interval` falsifier if the hop A/B moves. Defaults keep
+every unmeasured hop. Results fill in below after the artifacts land.
+
+### `send_datagram` (Run J)
+
+**Source.** `send_datagram_for_session` (`session.rs:133`) awaits
+`reserve_datagram_capacity` (Notify + `tokio::time::timeout` deadline) then
+`conn.send_datagram` synchronously. No IO driver, no connection-driver
+affinity. The timer needs *a* tokio time driver; napi-rs's current_thread
+runtime provides one (`tokio_runtime.rs:17`, `enable_all`).
+
+**Prediction.** Under echo at the collapse condition the send hop *will* bind.
+Each `sendDatagram` is an outside spawn into a worker whose local queue is
+already full of session tasks, so sends should sit near the same ~5,000/s
+cadence as the old read path — or a small multiple if send tasks complete
+fast enough for intermittent bulk drains. Removing the hop should lift
+`datagramsOutPerSec` toward the receive rate (echo ratio → ~100%). Falsifier:
+with the hop on, `sends × interval` should be roughly constant.
+
+**Load shape.** `WT_PROBE_ECHO=1`, 3 clients, workers=1, ~150k/s offered.
+Receive-only never calls send at all.
+
+### Stream open/accept (Run K)
+
+**Source.** `accept_*` is mutex + mpsc recv + lifecycle Notify (`session.rs:548`,
+`:602`) — same class as `read_datagram`. `create_*` is a oneshot round trip
+to the session task (`:528`, `:582`). Could move.
+
+**Prediction.** The cadence will **not** bind. Sustained stream opens on this
+host top out well under 5,000/s (QUIC stream setup + JS ReadableStream
+wrappers). Forcing `global_queue_interval` across a wide span should move
+accepts by a small fraction, not the 66× the read path moved. Recommendation
+leans keep-the-hop unless the product is constant.
+
+**Load shape.** `WT_PROBE_STREAMS_PER_SEC` high enough that the limiter is not
+the thing being measured (probe raises `maxStreams*` and `streamsPerSec`).
+
+### `discard_datagram` (Run L)
+
+**Source.** `discard_datagram_for_session` (`session.rs:186`) is mutex + mpsc
+recv, plus optional `tokio::time::timeout`. Same as `read_datagram` with a
+timer. Production `incomingDatagrams()` uses `readDatagram`, not this;
+load/evidence drains use it as a per-datagram JS loop.
+
+**Prediction.** A per-call JS loop **will** bind to the same ~5,000/s floor
+as the old read path. Removing the hop should lift it the same way. The bulk
+`discard_datagrams` loop is a different site — one injected task that then
+loops on the server runtime — and **keeps** the hop so it does not monopolise
+napi-rs's current_thread runtime.
+
+**Load shape.** `WT_PROBE_DISCARD=1` (calls `discardIncomingDatagram` in a
+loop). Mutually exclusive with echo: there is no payload to send back.
+
+### Sites reviewed and not gated
+
+| site | hop | reason |
+|---|---|---|
+| `discard_datagrams` / `discard_*_streams` | keep | one spawn, native loop; moving it pins the JS thread |
+| `wait_draining` | keep | `conn.draining()` is a wtransport future; must run on the server runtime |
+| `wait_*_capacity` | keep | timeout wait, not a hot path |
+| `handle_*_probe` | keep | evidence harness; does real stream IO |
+| client `wait_draining` | keep | same as server, on `CLIENT_RUNTIME` |
+
