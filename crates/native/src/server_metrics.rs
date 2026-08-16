@@ -55,6 +55,7 @@ pub struct ServerMetrics {
     pub datagrams_dropped_too_large: AtomicU64,
     pub datagrams_dropped_queue_global: AtomicU64,
     pub datagrams_dropped_queue_session: AtomicU64,
+    pub datagrams_skipped_queue_full: AtomicU64,
     pub queued_bytes_global: AtomicU64,
     pub backpressure_wait_count: AtomicU64,
     pub backpressure_timeout_count: AtomicU64,
@@ -97,6 +98,24 @@ impl ServerMetrics {
 
     pub fn release_queued_bytes(&self, n: u64) {
         self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    pub fn session_queue_cannot_fit(
+        session_queued: &std::sync::atomic::AtomicU64,
+        session_max: u64,
+        min_next_bytes: u64,
+    ) -> bool {
+        session_queued
+            .load(Ordering::Relaxed)
+            .saturating_add(min_next_bytes)
+            > session_max
+    }
+
+    /// Count one park of `receive_datagram` because session slack cannot fit
+    /// `max_datagram_size`. Not a drop: nothing was pulled into the addon.
+    pub fn record_datagram_skip_queue_full(&self) {
+        self.datagrams_skipped_queue_full
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Try to reserve n bytes against both global and per-session budget using CAS.
@@ -202,6 +221,9 @@ impl ServerMetrics {
             ),
             datagrams_dropped_queue_session: Some(
                 self.datagrams_dropped_queue_session.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_skipped_queue_full: Some(
+                self.datagrams_skipped_queue_full.load(Ordering::Relaxed) as f64,
             ),
             queued_bytes_global: self.queued_bytes_global.load(Ordering::Relaxed) as f64,
             backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as f64,
@@ -379,6 +401,56 @@ mod tests {
         assert_eq!(metrics.rate_limited_count.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
         assert_eq!(session.load(Ordering::Relaxed), 0);
+        assert_drop_identity(&metrics);
+    }
+
+    #[test]
+    fn session_queue_cannot_fit_matches_legal_datagram_reserve() {
+        let queued = std::sync::atomic::AtomicU64::new(0);
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 100, 10));
+        queued.store(90, Ordering::Relaxed);
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 100, 10));
+        queued.store(91, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(&queued, 100, 10));
+        queued.store(100, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(&queued, 100, 1));
+
+        // 1150 B into 2 MiB: 1823 packets leave 702 B slack, which cannot fit 1200.
+        const PACKED: u64 = 1823 * 1150;
+        const SESSION_MAX: u64 = 2 * 1024 * 1024;
+        const MAX_DATAGRAM: u64 = 1200;
+        assert_eq!(PACKED, 2_096_450);
+        assert_eq!(SESSION_MAX, 2_097_152);
+        queued.store(PACKED, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(
+            &queued,
+            SESSION_MAX,
+            MAX_DATAGRAM
+        ));
+        assert!(!ServerMetrics::session_queue_cannot_fit(
+            &queued,
+            SESSION_MAX,
+            702
+        ));
+    }
+
+    #[test]
+    fn skip_queue_full_does_not_count_as_datagram_drop() {
+        let metrics = ServerMetrics::default();
+        metrics.record_datagram_skip_queue_full();
+        assert_eq!(
+            metrics.datagrams_skipped_queue_full.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed),
+            0
+        );
+        let snap = metrics.snapshot(None);
+        assert_eq!(snap.datagrams_skipped_queue_full, Some(1.0));
         assert_drop_identity(&metrics);
     }
 

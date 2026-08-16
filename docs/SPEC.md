@@ -330,6 +330,7 @@ export type MetricsSnapshot = {
   datagramsDroppedTooLarge?: number;
   datagramsDroppedQueueGlobal?: number;
   datagramsDroppedQueueSession?: number;
+  datagramsSkippedQueueFull?: number;
 
   queuedBytesGlobal: number;
   backpressureWaitCount: number;
