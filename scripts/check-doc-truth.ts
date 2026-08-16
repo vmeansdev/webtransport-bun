@@ -77,9 +77,16 @@ const HISTORICAL_HARDENING_PLAN_PATH = resolve(
 );
 const RUNTIME_SOURCE_PATH = resolve(ROOT, "crates", "native", "src", "lib.rs");
 const SHA40 = /^[0-9a-f]{40}$/;
-// Each runtime pins its own worker count. The server runs two as a mitigation
-// for datagram-delivery starvation at one worker; the client is unmeasured and
-// stays at one. See the threading-model section of docs/ARCHITECTURE.md.
+const SESSION_NAPI_SOURCE_PATH = resolve(
+	ROOT,
+	"crates",
+	"native",
+	"src",
+	"session_napi.rs",
+);
+// Each runtime pins its own worker count. The server runs two as headroom on
+// top of the delivery-path fix; the client is unmeasured and stays at one. See
+// the threading-model section of docs/ARCHITECTURE.md.
 const RUNTIME_CONTRACTS = [
 	{ name: "RUNTIME", threadName: "wt-server", workers: 2 },
 	{ name: "CLIENT_RUNTIME", threadName: "wt-client", workers: 1 },
@@ -465,6 +472,79 @@ function checkRuntimeContract(): void {
 	}
 }
 
+// Wrapping a per-datagram N-API call in `RUNTIME.spawn` puts it on the server
+// runtime's injection queue, which a busy worker services one task per tick —
+// the ~5,000/s collapse. The documented contract is that read, send, and
+// per-datagram discard stay on the N-API runtime, so policy it at the source
+// rather than trusting prose. Bulk `discard_datagrams` is a different site.
+const DATAGRAM_NO_HOP_METHODS = [
+	{
+		fn: "send_datagram",
+		signature: "pub fn send_datagram(&self, env: Env",
+		label: "sendDatagram",
+	},
+	{
+		fn: "read_datagram",
+		signature: "pub fn read_datagram(&self, env: Env)",
+		label: "readDatagram",
+	},
+	{
+		fn: "discard_datagram",
+		signature: "pub fn discard_datagram(&self, env: Env",
+		label: "discardDatagram",
+	},
+] as const;
+
+function methodBody(source: string, signature: string): string | undefined {
+	const start = source.indexOf(signature);
+	if (start < 0) return undefined;
+	const rest = source.slice(start);
+	const next = rest.search(/\n    pub fn /);
+	return next < 0 ? rest : rest.slice(0, next);
+}
+
+function checkDatagramDeliveryPath(): void {
+	const architecture = readText(ARCHITECTURE_PATH);
+	const source = readText(SESSION_NAPI_SOURCE_PATH);
+	if (architecture === undefined || source === undefined) return;
+
+	if (!/must\s+not be wrapped in `RUNTIME\.spawn`/.test(architecture)) {
+		report(
+			relative(ROOT, ARCHITECTURE_PATH),
+			"must document that readDatagram, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`",
+		);
+	}
+	for (const method of DATAGRAM_NO_HOP_METHODS) {
+		if (!architecture.includes(method.label)) {
+			report(
+				relative(ROOT, ARCHITECTURE_PATH),
+				`must name ${method.label} in the no-hop delivery contract`,
+			);
+		}
+		const body = methodBody(source, method.signature);
+		if (body === undefined) {
+			report(
+				relative(ROOT, SESSION_NAPI_SOURCE_PATH),
+				`missing ${method.fn} entry point`,
+			);
+			continue;
+		}
+		if (
+			/RUNTIME\s*\.\s*spawn/.test(
+				body
+					.split("\n")
+					.filter((line) => !/^\s*\/\//.test(line))
+					.join("\n"),
+			)
+		) {
+			report(
+				relative(ROOT, SESSION_NAPI_SOURCE_PATH),
+				`${method.fn} must not hop onto the server runtime: RUNTIME.spawn puts the call on the injection queue and caps it near 5,000/s`,
+			);
+		}
+	}
+}
+
 function checkNarrativeStatusTruth(): void {
 	const faq = readText(FAQ_PATH);
 	if (faq !== undefined) {
@@ -635,6 +715,7 @@ if (status) {
 	}
 }
 checkRuntimeContract();
+checkDatagramDeliveryPath();
 checkNarrativeStatusTruth();
 
 if (violations.length > 0) {

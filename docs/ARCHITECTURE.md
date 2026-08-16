@@ -18,37 +18,63 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
   runtimes with `Builder::new_current_thread()` would leave spawned work without
   a continuously driven executor. The two builders provide separate,
   independently driven server and client executors.
-- The server runs **two** workers as a **mitigation, not a fix**, for a
-  measured availability defect. At one worker the server ingests datagrams off
-  the wire normally and then discards 80-95% of them under sustained load,
-  collapsing to a fixed ~5,300 delivered/s while most of the machine sits idle.
-  It is a cliff, not a ceiling: delivered throughput falls about 10x in response
-  to a 2x rise in offered load. On a 4-vCPU Linux host, 40k offered/s delivered
-  5,283/s at one worker and 39,497/s with zero drops at two.
-  - The cliff still exists at two workers, only further out: 80k offered on that
-    same host still dropped 48%. The root cause — a collapsed floor of ~5,300/s
-    that is identical on macOS and Linux despite a 32x difference in
-    receive-path cost, which rules out a CPU-cost explanation and points at a
-    fixed-cadence wake — is unresolved and tracked separately. Do not read this
-    section as saying the problem is solved.
-  - Two is not proven optimal, and higher is not better: on macOS, two workers
-    delivered 89,002/s, four delivered 81,682/s, and ten delivered 48,042/s.
-    Nothing here justifies `available_parallelism()`. The only Linux host
-    available has 4 vCPU and only one- and two-worker arms were testable on it,
-    so the count is not calibrated to production hardware.
-  - The count is a hardcoded constant with no environment override. Every
-    measured alternative to 2 was worse, so a knob would only offer users ways
-    to regress, and the right value may change when the root cause is fixed.
-- The client runtime stays at one worker. The measurements above cover the
+- The server runs **two** workers, not for parallelism in the abstract but as
+  independent headroom on top of the delivery-path fix described below. Two is
+  not proven optimal, and higher is not better: on macOS, two workers delivered
+  89,002/s, four delivered 81,682/s, and ten delivered 48,042/s. Nothing here
+  justifies `available_parallelism()`. The only Linux host available has 4 vCPU
+  and only the one- and two-worker arms were testable on it, so the count is not
+  calibrated to production hardware. It is a hardcoded constant with no
+  environment override: every measured alternative was worse, so a knob would
+  only offer ways to regress.
+- The client runtime stays at one worker. Every delivery measurement covers the
   server receive path only; raising the client for symmetry would be an
   unmeasured change.
+
+### Datagram delivery must not hop between runtimes
+- `readDatagram`, `sendDatagram`, and per-datagram `discardDatagram` run
+  **directly on the N-API runtime** that `Env::spawn_future` provides. They must
+  not be wrapped in `RUNTIME.spawn`, and `scripts/check-doc-truth.ts` pins that.
+- Dispatching it as `env.spawn_future(async { RUNTIME.spawn(...).await })` was a
+  **root-cause availability defect**, not a performance nicety. `RUNTIME.spawn`
+  called from the N-API runtime is a spawn from *outside* the server runtime, so
+  every delivery landed in that runtime's **injection queue**. A worker reaches
+  the injection queue either by running dry — which drains it in bulk — or on a
+  tick that takes **exactly one** task, and tokio time-targets that tick at one
+  check per 200µs of work. Under sustained load the worker's local queue never
+  ran dry, so every delivery trickled through the tick path at ~5,000/s. The
+  server ingested datagrams off the wire normally and then discarded 80-95% of
+  them, a cliff rather than a ceiling: delivered throughput fell about 10x in
+  response to a 2x rise in offered load, with the same floor on macOS and Linux
+  despite a 32x difference in receive-path cost — a scheduler policy constant,
+  which is exactly why a cheaper receive path never moved it.
+- Confirmed by falsifier, not inspection: pinning `global_queue_interval`
+  disables tokio's tuner, and `delivered x interval` held constant at
+  ~93,000 ± 3% across a 64x span of the knob (2 → 47,930/s, 127 → 726/s).
+- Removing the hop is what fixes it: at one worker, 5,266 delivered/s with 95%
+  dropped became 84,823/s with none dropped, a 16.1x improvement; at two workers
+  it is slightly faster on about 10% less CPU. Two workers alone would only have
+  made workers run dry often enough to dodge the tick path, which a busier
+  server or a larger session count could undo.
+- The hop is safe to delete on those three paths: `read_datagram_for_session`
+  only locks a Tokio mutex and receives from a Tokio mpsc; `send_datagram`
+  awaits a Notify plus a timer deadline then makes a synchronous quinn call;
+  per-datagram `discard_datagram` is the read path plus an optional
+  `tokio::time::timeout`. napi-rs's current_thread runtime already has a time
+  driver. Measured at one worker: send 5,213 → 55,306/s (echo 15% → 100%);
+  discard 5,374 → 83,479/s (94.5% → 0% dropped). Stream open/accept and the
+  bulk `discard_datagrams` loop **keep** their hops: opens never bound the
+  cadence (~1,530/s either way), and the bulk drain is one spawn then a native
+  loop that must not monopolise the JS thread.
 - `scripts/check-doc-truth.ts` source-policies both runtime declarations, their
   individual worker counts, and their dedicated thread names, and rejects a
   worker count derived from the environment or from `available_parallelism()`,
   so the documented constructors and the implementation cannot drift silently.
 - Isolation prevents same-process deadlock when client and server share a process (e.g. tests).
 - All wtransport objects are owned and driven on these runtimes.
-- JS calls enqueue commands to the runtimes via bounded channels.
+- JS calls enqueue commands to the runtimes via bounded channels. Datagram
+  read, send, and per-datagram discard are the exception: they run directly on
+  the N-API runtime rather than hopping onto the server runtime first.
 - Runtimes emit events back to JS via ThreadsafeFunction (TSFN) using batching.
 
 ## Object model and lifetimes

@@ -141,52 +141,67 @@ impl SessionHandle {
 
     /// Spawn on the addon runtime without holding an exclusive napi borrow of
     /// `self` across `.await` (Bun rejects concurrent `async fn &self` calls).
+    ///
+    /// Do NOT wrap this in `RUNTIME.spawn`. Same injection-queue collapse as
+    /// `read_datagram`: under echo at one worker, sends sat at 5,213/s with the
+    /// hop and rose to 55,306/s (100% echo) without it. `send_datagram_for_session`
+    /// awaits a Notify plus a timer deadline, then makes a synchronous quinn
+    /// call — no server-runtime IO-driver affinity. napi-rs's current_thread
+    /// runtime already has a time driver.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn send_datagram(&self, env: Env, data: Buffer) -> Result<JsObject> {
         let id = self.id.clone();
         let bytes = data.as_ref().to_vec();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { send_datagram_for_session(&id, &bytes).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        env.spawn_future(async move { send_datagram_for_session(&id, &bytes).await })
     }
 
+    /// Reads on the N-API runtime `spawn_future` already provides. Do NOT
+    /// reintroduce a `RUNTIME.spawn` hop here: spawning into the server runtime
+    /// from the N-API runtime is a spawn from *outside* it, so the task lands
+    /// in the server runtime's injection queue. A worker whose local queue
+    /// never runs dry only services that queue on a tick, one task per
+    /// `global_queue_interval` polls, and tokio tunes that interval to one
+    /// check per 200µs of work — capping delivery at ~5,000/s whatever the
+    /// platform or the load. That was the measured collapse: 5,266 delivered/s
+    /// with 95% of datagrams dropped, against 84,823/s with none dropped once
+    /// the hop is gone.
+    ///
+    /// The hop bought nothing. `read_datagram_for_session` only locks a Tokio
+    /// mutex and receives from a Tokio mpsc — no timers, no IO driver, no
+    /// server-runtime context of any kind. `scripts/check-doc-truth.ts` pins
+    /// this against the documented delivery path in `docs/ARCHITECTURE.md`.
     #[napi(ts_return_type = "Promise<Buffer | null>")]
     pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
         env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move {
-                    Ok(read_datagram_for_session(&id)
-                        .await?
-                        .map(crate::payload_buffer::PayloadBuffer::from))
-                })
-                .await
-                .map_err(wt_from_upstream_error)?
+            Ok(read_datagram_for_session(&id)
+                .await?
+                .map(crate::payload_buffer::PayloadBuffer::from))
         })
     }
 
     /// Consume one queued datagram without allocating a JavaScript payload.
     /// This is used by bounded load/evidence drains that intentionally count
     /// delivery but do not need to inspect every payload after the probe.
+    ///
+    /// Same no-hop contract as `read_datagram`. A per-call JS loop with the hop
+    /// collapsed to 5,374/s and 94.5% dropped; without it, 83,479/s and zero
+    /// drops. The optional `tokio::time::timeout` runs on the N-API runtime's
+    /// time driver. Bulk `discard_datagrams` is a different site and keeps its
+    /// hop — one spawn then a native loop, so it does not pin that runtime.
     #[napi(ts_return_type = "Promise<boolean | null>")]
     pub fn discard_datagram(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move {
-                    let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
-                    discard_datagram_for_session(&id, timeout).await
-                })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
+        env.spawn_future(async move { discard_datagram_for_session(&id, timeout).await })
     }
 
     /// Consume queued datagrams until the session closes or the deadline
     /// expires without allocating a JavaScript payload per datagram.
+    ///
+    /// The hop stays. This is one injected task that then loops on the server
+    /// runtime; moving it onto napi-rs's current_thread runtime would monopolise
+    /// the JS thread for the whole drain.
     #[napi(ts_return_type = "Promise<number | null>")]
     pub fn discard_datagrams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
