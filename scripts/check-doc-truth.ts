@@ -555,6 +555,11 @@ const DATAGRAM_NO_HOP_METHODS = [
 		label: "readDatagram",
 	},
 	{
+		fn: "read_datagram_batch",
+		signature: "pub fn read_datagram_batch(&self, env: Env",
+		label: "readDatagramBatch",
+	},
+	{
 		fn: "discard_datagram",
 		signature: "pub fn discard_datagram(&self, env: Env",
 		label: "discardDatagram",
@@ -577,7 +582,7 @@ function checkDatagramDeliveryPath(): void {
 	if (!/must\s+not be wrapped in `RUNTIME\.spawn`/.test(architecture)) {
 		report(
 			relative(ROOT, ARCHITECTURE_PATH),
-			"must document that readDatagram, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`",
+			"must document that readDatagram, readDatagramBatch, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`",
 		);
 	}
 	for (const method of DATAGRAM_NO_HOP_METHODS) {

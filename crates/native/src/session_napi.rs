@@ -186,23 +186,22 @@ impl SessionHandle {
     /// queued, which amortizes the N-API round trip across the batch. `max` is
     /// clamped into 1..=256 silently, and a closed session or a closed queue
     /// resolves `null` — never a rejection and never an empty array.
+    ///
+    /// Same no-hop contract as `read_datagram`. A `RUNTIME.spawn` here would
+    /// put one injection-queue task per batch and reopen the ~5,000/s cliff
+    /// at fill 1, or cap batches at that cadence.
     #[napi(ts_return_type = "Promise<Uint8Array[] | null>")]
     pub fn read_datagram_batch(&self, env: Env, max: u32) -> Result<JsObject> {
         let id = self.id.clone();
         env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move {
-                    Ok(read_datagram_batch_for_session(&id, max)
-                        .await?
-                        .map(|batch| {
-                            batch
-                                .into_iter()
-                                .map(crate::payload_buffer::PayloadBuffer::from)
-                                .collect::<Vec<_>>()
-                        }))
-                })
-                .await
-                .map_err(wt_from_upstream_error)?
+            Ok(read_datagram_batch_for_session(&id, max)
+                .await?
+                .map(|batch| {
+                    batch
+                        .into_iter()
+                        .map(crate::payload_buffer::PayloadBuffer::from)
+                        .collect::<Vec<_>>()
+                }))
         })
     }
 

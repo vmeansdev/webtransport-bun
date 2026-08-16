@@ -150,7 +150,7 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 		[
 			"The server runtime uses `Builder::new_multi_thread().worker_threads(2)`.",
 			"The client runtime uses `Builder::new_multi_thread().worker_threads(1)`.",
-			"readDatagram, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
+			"readDatagram, readDatagramBatch, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
 		].join("\n"),
 	);
 	writeFileSync(
@@ -163,6 +163,11 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
         let id = self.id.clone();
         env.spawn_future(async move {
             Ok(read_datagram_for_session(&id).await?.map(PayloadBuffer::from))
+        })
+    }
+    pub fn read_datagram_batch(&self, env: Env, max: u32) -> Result<JsObject> {
+        env.spawn_future(async move {
+            Ok(read_datagram_batch_for_session(&id, max).await?.map(|batch| batch))
         })
     }
     pub fn discard_datagram(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
@@ -390,6 +395,23 @@ describe("documentation truth policy", () => {
 		);
 	});
 
+	it("rejects a datagram batch read that hops back onto the server runtime", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "session_napi.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"Ok(read_datagram_batch_for_session(&id, max).await?.map(|batch| batch))",
+					"RUNTIME.spawn(async move { read_datagram_batch_for_session(&id, max).await }).await.map_err(wt_from_upstream_error)?",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"read_datagram_batch must not hop onto the server runtime",
+		);
+	});
+
 	it("rejects a datagram send that hops back onto the server runtime", () => {
 		const result = runPolicy((_fixture, root) => {
 			const path = join(root, "crates", "native", "src", "session_napi.rs");
@@ -430,14 +452,14 @@ describe("documentation truth policy", () => {
 			writeFileSync(
 				path,
 				readFileSync(path, "utf8").replace(
-					"readDatagram, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
+					"readDatagram, readDatagramBatch, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
 					"Datagram methods are dispatched onto the server runtime.",
 				),
 			);
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"must document that readDatagram, sendDatagram, and discardDatagram run on the N-API runtime",
+			"must document that readDatagram, readDatagramBatch, sendDatagram, and discardDatagram run on the N-API runtime",
 		);
 	});
 
