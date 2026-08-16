@@ -1202,6 +1202,9 @@ interface NativeAddon {
 	/** Leak-forensics: futures currently parked per instrumented await
 	 * (absent on older prebuilt addons). Diagnostic only. */
 	nativeAwaitProbeSnapshot?: () => Record<string, number>;
+	/** Investigation probe (investigate/quic-parallelism): server runtime worker
+	 * count as configured, and per-OS-thread datagram counts. Diagnostic only. */
+	nativeWorkerProbeSnapshot?: () => Record<string, number>;
 	/** Force-return freed native allocator memory to the OS (absent on older prebuilt addons). */
 	releaseNativeMemory?: () => boolean;
 	/** 0-RTT vault (absent on older prebuilt addons). */
@@ -3920,6 +3923,8 @@ export const __TESTING__ = {
 	nativeStreamHandlesSnapshotForTests: () =>
 		native?.nativeStreamHandlesSnapshot?.(),
 	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
+	nativeWorkerProbeSnapshotForTests: () =>
+		native?.nativeWorkerProbeSnapshot?.(),
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
 };

@@ -43,16 +43,91 @@ pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
 pub mod transport_memory;
+pub mod worker_probe;
 pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
 
+/// Environment override for the server runtime's worker count, read once when
+/// the runtime is first built.
+///
+/// INVESTIGATION ONLY (branch investigate/quic-parallelism). The default is 1,
+/// so an unset environment reproduces the shipped runtime exactly. Accepts a
+/// positive integer or `auto` for `available_parallelism()`.
+pub(crate) const SERVER_WORKER_THREADS_ENV: &str = "WEBTRANSPORT_SERVER_WORKER_THREADS";
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Resolve the requested worker count, aborting rather than falling back.
+///
+/// A silent fallback to 1 is the one failure this experiment cannot tolerate:
+/// an arm that quietly ran with the default would look like a real negative
+/// result and be indistinguishable from one.
+fn resolve_worker_threads(raw: Option<&str>) -> Result<usize, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(1),
+        Some("auto") => Ok(available_parallelism()),
+        Some(other) => match other.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!(
+                "{SERVER_WORKER_THREADS_ENV}={other:?} is not a positive integer or \"auto\""
+            )),
+        },
+    }
+}
+
+#[cfg(test)]
+mod worker_threads_tests {
+    use super::{available_parallelism, resolve_worker_threads};
+
+    #[test]
+    fn unset_and_blank_keep_the_shipped_default() {
+        assert_eq!(resolve_worker_threads(None), Ok(1));
+        assert_eq!(resolve_worker_threads(Some("  ")), Ok(1));
+    }
+
+    #[test]
+    fn explicit_counts_and_auto_resolve() {
+        assert_eq!(resolve_worker_threads(Some("4")), Ok(4));
+        assert_eq!(resolve_worker_threads(Some(" 2 ")), Ok(2));
+        assert_eq!(
+            resolve_worker_threads(Some("auto")),
+            Ok(available_parallelism())
+        );
+    }
+
+    #[test]
+    fn garbage_is_rejected_rather_than_defaulted() {
+        for bad in ["0", "-1", "two", "2.5"] {
+            assert!(
+                resolve_worker_threads(Some(bad)).is_err(),
+                "{bad} must not silently become 1"
+            );
+        }
+    }
+}
+
+fn server_worker_threads() -> usize {
+    let raw = std::env::var(SERVER_WORKER_THREADS_ENV).ok();
+    match resolve_worker_threads(raw.as_deref()) {
+        Ok(n) => n,
+        Err(message) => {
+            eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
+            std::process::abort();
+        }
+    }
+}
+
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(server_worker_threads())
         .enable_all()
         .thread_name("wt-server")
         .build()
@@ -406,6 +481,32 @@ pub fn native_await_probe_snapshot() -> std::collections::HashMap<String, i64> {
         .into_iter()
         .map(|(name, value)| (name.to_string(), value))
         .collect()
+}
+
+/// Investigation probe: how the server runtime was configured, and which OS
+/// threads actually processed datagrams. Keys are `configuredServerWorkerThreads`,
+/// `availableParallelism`, `datagramThreads` (threads with a non-zero count) and
+/// one `thread:<name>#ThreadId(n)` entry per registered thread.
+#[napi]
+pub fn native_worker_probe_snapshot() -> std::collections::HashMap<String, i64> {
+    let mut out = std::collections::HashMap::new();
+    out.insert(
+        "configuredServerWorkerThreads".to_string(),
+        server_worker_threads() as i64,
+    );
+    out.insert(
+        "availableParallelism".to_string(),
+        available_parallelism() as i64,
+    );
+    let per_thread = worker_probe::snapshot();
+    out.insert(
+        "datagramThreads".to_string(),
+        per_thread.iter().filter(|(_, n)| *n > 0).count() as i64,
+    );
+    for (label, count) in per_thread {
+        out.insert(format!("thread:{label}"), count as i64);
+    }
+    out
 }
 
 #[napi]
@@ -1346,6 +1447,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     return;
                                                                 }
                                                             };
+                                                            worker_probe::record_datagram();
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
