@@ -162,6 +162,41 @@ fn server_global_queue_interval() -> Option<u32> {
     }
 }
 
+/// Whether a session N-API method hops onto the server runtime, per method.
+///
+/// `env.spawn_future` already runs on the N-API runtime, so `RUNTIME.spawn`
+/// from there is a spawn from *outside* the server runtime and lands in its
+/// injection queue — the cadence that caps `read_datagram` at ~5,000/s under
+/// overload (see `.investigation/measurement.md`, Run I).
+///
+/// Each method is gated separately because the decision is per method: some
+/// genuinely need the server runtime, and some are better left on it even
+/// though they could move, because the N-API runtime is `new_current_thread`
+/// (napi-2.16.17 `tokio_runtime.rs:17`) — a single thread that a long-lived
+/// native drain would monopolise.
+fn hop_flag(var: &str, default_hop: bool) -> bool {
+    match std::env::var(var).ok().as_deref().map(str::trim) {
+        None | Some("") => default_hop,
+        Some("0") => false,
+        Some(_) => true,
+    }
+}
+
+/// Send path. Default keeps the hop: unlike the read path this was not yet
+/// measured, so the shipped behaviour stands until it is.
+pub(crate) fn send_datagram_via_server_runtime() -> bool {
+    static V: Lazy<bool> =
+        Lazy::new(|| hop_flag("WEBTRANSPORT_SEND_DATAGRAM_VIA_SERVER_RUNTIME", true));
+    *V
+}
+
+/// Stream open/accept paths. Same reasoning as the send path.
+pub(crate) fn stream_ops_via_server_runtime() -> bool {
+    static V: Lazy<bool> =
+        Lazy::new(|| hop_flag("WEBTRANSPORT_STREAM_OPS_VIA_SERVER_RUNTIME", true));
+    *V
+}
+
 /// Route `read_datagram` back through the server runtime (the old behaviour).
 ///
 /// Off by default: the hop is what caps delivery at the injection queue's

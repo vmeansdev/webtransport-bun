@@ -145,12 +145,16 @@ impl SessionHandle {
     pub fn send_datagram(&self, env: Env, data: Buffer) -> Result<JsObject> {
         let id = self.id.clone();
         let bytes = data.as_ref().to_vec();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { send_datagram_for_session(&id, &bytes).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        // See crate::send_datagram_via_server_runtime for why this is gated.
+        if crate::send_datagram_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move { send_datagram_for_session(&id, &bytes).await })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
+        env.spawn_future(async move { send_datagram_for_session(&id, &bytes).await })
     }
 
     #[napi(ts_return_type = "Promise<Buffer | null>")]
@@ -273,12 +277,15 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientBidiStreamHandle>")]
     pub fn create_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { create_bidi_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        if crate::stream_ops_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move { create_bidi_stream_for_session(&id).await })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
+        env.spawn_future(async move { create_bidi_stream_for_session(&id).await })
     }
 
     #[napi(ts_return_type = "Promise<void>")]
@@ -295,12 +302,15 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientBidiStreamHandle | null>")]
     pub fn accept_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { accept_bidi_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        if crate::stream_ops_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move { accept_bidi_stream_for_session(&id).await })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
+        env.spawn_future(async move { accept_bidi_stream_for_session(&id).await })
     }
 
     /// Internal load/evidence path: handle one ordered bidi probe in Rust.
@@ -318,12 +328,15 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientUniSendHandle>")]
     pub fn create_uni_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { create_uni_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        if crate::stream_ops_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move { create_uni_stream_for_session(&id).await })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
+        env.spawn_future(async move { create_uni_stream_for_session(&id).await })
     }
 
     #[napi(ts_return_type = "Promise<void>")]
@@ -340,12 +353,15 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientUniRecvHandle | null>")]
     pub fn accept_uni_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move { accept_uni_stream_for_session(&id).await })
-                .await
-                .map_err(wt_from_upstream_error)?
-        })
+        if crate::stream_ops_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move { accept_uni_stream_for_session(&id).await })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
+        env.spawn_future(async move { accept_uni_stream_for_session(&id).await })
     }
 
     /// Internal load/evidence path: handle one ordered uni probe in Rust.

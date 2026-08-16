@@ -31,6 +31,8 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 		sessionsErr: 0,
 		windowMs: 20_000,
 		saturationRatio: 0.357,
+		acceptedStreamsPerSec: 0,
+		datagramsOutPerSec: 0,
 		drops: {
 			datagramsIn: 0,
 			datagramsDropped: 0,

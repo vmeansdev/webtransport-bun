@@ -79,6 +79,14 @@ const BIND_WAIT_MS = 3_000;
  * reporting the generator's limit, not the server's.
  */
 const CLIENTS = Number(process.env.WT_PROBE_CLIENTS ?? "1");
+/**
+ * Echo every received datagram, making `send_datagram` as hot as the read path.
+ * The default receive-only shape never calls the send path at all, so it cannot
+ * say anything about it.
+ */
+const ECHO = process.env.WT_PROBE_ECHO === "1";
+/** Per-session stream opens/s, to make the accept path hot. */
+const STREAMS_PER_SEC = Number(process.env.WT_PROBE_STREAMS_PER_SEC ?? "0");
 const ARTIFACT_PATH = join(
 	ROOT,
 	".investigation",
@@ -143,6 +151,10 @@ export type ArmRun = {
 	sessionsErr: number;
 	windowMs: number;
 	saturationRatio: number;
+	/** Server-side bidi stream accepts/s, non-zero only when streams are driven. */
+	acceptedStreamsPerSec: number;
+	/** Server-side datagram sends/s, non-zero only in echo mode. */
+	datagramsOutPerSec: number;
 	/** Arrivals and the reject paths, so a delivery gap can be attributed. */
 	drops: {
 		datagramsIn: number;
@@ -276,6 +288,7 @@ async function runChild(
 
 	let received = 0;
 	let receivedBytes = 0;
+	let acceptedStreams = 0;
 	const aggregateOffered = sessions * rate;
 	const server = createServer({
 		port,
@@ -295,14 +308,36 @@ async function runChild(
 			datagramsBurst: aggregateOffered * 8,
 		},
 		onSession: (session) => {
-			// Receive-only. An echo would put the send path in the measurement and
-			// halve the pps headroom on the same host.
+			// Receive-only by default: an echo would put the send path in the
+			// measurement and halve the pps headroom on the same host. ECHO turns
+			// it on deliberately, when the send path is what is being measured.
 			void (async () => {
 				for await (const datagram of session.incomingDatagrams()) {
 					received += 1;
 					receivedBytes += datagram.byteLength;
+					if (ECHO) {
+						// Unawaited: awaiting would serialise the reader behind the
+						// send and measure the round trip instead of send capacity.
+						void session.sendDatagram(datagram).catch(() => {});
+					}
 				}
 			})().catch(() => {});
+			if (STREAMS_PER_SEC > 0) {
+				// ServerSession exposes incoming streams as a ReadableStream, not an
+				// async-iterable method as the client session does.
+				void (async () => {
+					const reader = session.incomingBidirectionalStreams.getReader();
+					for (;;) {
+						const { done, value } = await reader.read();
+						if (done) break;
+						acceptedStreams += 1;
+						// Drain and drop; the accept rate is the measurement.
+						void value.readable
+							.pipeTo(new WritableStream({ write() {} }))
+							.catch(() => {});
+					}
+				})().catch(() => {});
+			}
 		},
 	});
 	await Bun.sleep(BIND_WAIT_MS);
@@ -324,7 +359,7 @@ async function runChild(
 				"--datagrams-per-sec",
 				String(rate),
 				"--streams-per-sec",
-				"0",
+				String(STREAMS_PER_SEC),
 				"--payload-bytes",
 				String(PAYLOAD_BYTES),
 				"--max-session-errors",
@@ -351,6 +386,7 @@ async function runChild(
 	const cpu0 = process.cpuUsage();
 	const probe0 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
 	const metrics0 = server.metricsSnapshot();
+	const streams0 = acceptedStreams;
 	const t0 = performance.now();
 	await Bun.sleep(MEASURE_SEC * 1_000);
 	const rx1 = received;
@@ -406,6 +442,11 @@ async function runChild(
 		// Which drop path discarded what the receive path took in but the JS
 		// reader never saw. datagramsIn counts arrivals; the two reject counters
 		// separate the rate limiter from the queue-budget reservation.
+		acceptedStreamsPerSec: ((acceptedStreams - streams0) / windowMs) * 1000,
+		datagramsOutPerSec:
+			(((metrics1.datagramsOut ?? 0) - (metrics0.datagramsOut ?? 0)) /
+				windowMs) *
+			1000,
 		drops: {
 			datagramsIn: metrics1.datagramsIn - metrics0.datagramsIn,
 			datagramsDropped: metrics1.datagramsDropped - metrics0.datagramsDropped,
