@@ -68,6 +68,58 @@ describe("verdict: proceed / stop, both sides of the reference ratio", () => {
 	});
 });
 
+describe("the stop rationale states the mechanism, not the precondition", () => {
+	const mechanism = {
+		meanBatchSize: 1.231,
+		batchReadCalls: 840_027,
+		materializedItems: 1_034_073,
+		legacyReadCalls: 0,
+		drainItemsPerSec: 12_176_454,
+		drainSource: "floor bench batch 64 median @ eae4a60",
+	};
+
+	test("names batch fill and the call-reduction arithmetic", () => {
+		const { rationale } = summarizeProbe(runs(50_741, 50_845), mechanism);
+		expect(rationale).toContain("mean batch fill was 1.231");
+		expect(rationale).toContain("840,027");
+		expect(rationale).toContain("1,034,073");
+		// 1 - 840027/1034073 = 18.8%
+		expect(rationale).toContain("18.8% reduction in N-API calls");
+		expect(rationale).toContain("nothing to amortize");
+	});
+
+	test("names the drain-versus-arrival gap with its source", () => {
+		const { rationale } = summarizeProbe(runs(50_741, 50_845), mechanism);
+		expect(rationale).toContain("12,176,454 items/s");
+		expect(rationale).toContain("floor bench batch 64 median @ eae4a60");
+		expect(rationale).toContain("backlog at the JS reader");
+		// 12,176,454 / 50,741 = 240x
+		expect(rationale).toContain("240x gap");
+	});
+
+	test("does not blame saturation, which is only the precondition", () => {
+		const { rationale } = summarizeProbe(runs(50_741, 50_845), mechanism);
+		expect(rationale).not.toContain("saturat");
+	});
+
+	test("omits an unmeasured clause rather than asserting a stale number", () => {
+		const { rationale } = summarizeProbe(runs(50_741, 50_845), {
+			...mechanism,
+			drainItemsPerSec: null,
+			drainSource: null,
+		});
+		expect(rationale).toContain("mean batch fill");
+		expect(rationale).not.toContain("gap");
+	});
+
+	test("degrades to the bare ratio when no mechanism was measured", () => {
+		const { rationale, verdict } = summarizeProbe(runs(50_741, 50_845));
+		expect(verdict).toBe("stop");
+		expect(rationale).toContain("1.0020x");
+		expect(rationale).not.toContain("mean batch fill");
+	});
+});
+
 describe("verdict: inconclusive protects against measuring the sender", () => {
 	test("a legacy arm at exactly the saturation ceiling is inconclusive", () => {
 		const summary = summarizeProbe(runs(50_000, 200_000, SATURATION_CEILING));
