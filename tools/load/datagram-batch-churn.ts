@@ -42,7 +42,20 @@ const ARTIFACT_PATH = join(
 );
 
 const TRIALS = 3;
-const TRIAL_TIMEOUT_MS = 60_000;
+/**
+ * Per-trial deadline — 120s, deliberately raised from the plan's pinned 60s.
+ *
+ * This bound is a HANG DETECTOR, not a threshold on anything measured. No part
+ * of the retention result — protected-object deltas, the watched constructors,
+ * the await gauges — depends on how long a trial is permitted to take, so
+ * lengthening it cannot weaken the gate. It was raised because observed
+ * healthy trials run 19.0-40.2s on an idle laptop, putting the worst case at
+ * 67% of a 60s deadline, and Task 10 runs this same command once on the final
+ * candidate: a slow-but-healthy trial reported as a hang would be a false red
+ * on expensive evidence. A hung child is still caught and SIGKILLed before its
+ * pipes are drained; the only cost is waiting an extra 60s to say so.
+ */
+const TRIAL_TIMEOUT_MS = 120_000;
 const SESSION_PAIRS = 100;
 const CONCURRENCY = 10;
 const DATAGRAMS_PER_SESSION = 10;
