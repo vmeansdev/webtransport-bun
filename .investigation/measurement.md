@@ -604,8 +604,12 @@ changed.
 - `.investigation/native-recv-floor-control-c3.json` — Run D
 - `.investigation/thread-profile.json` — Run G (per-thread CPU, limiter timing,
   recv syscall)
-- `.investigation/worker-load-sweep-linux.json` — Run H, downloaded from the
-  heavy-runner artifact of run 31943971720
+- `.investigation/worker-thread-parallelism-probe-c3-echo-hop-{on,off}.json` and
+  `*-echo-gqi{2,8,32}.json` — Run J
+- `.investigation/worker-thread-parallelism-probe-c3-streams20-hop-{on,off}.json`
+  and `*-streams20-gqi{2,32}.json` — Run K
+- `.investigation/worker-thread-parallelism-probe-c3-discard-hop-{on,off}.json`
+  and `*-discard-gqi{2,8,32}.json` — Run L
 
 ```sh
 CARGO_TARGET_DIR=$PWD/target cargo build -p reference \
@@ -636,62 +640,107 @@ Knobs: `WT_PROBE_CLIENTS`, `WT_PROBE_SESSIONS`, `WT_PROBE_AGGREGATE`,
 `WEBTRANSPORT_STREAM_OPS_VIA_SERVER_RUNTIME`,
 `WEBTRANSPORT_SERVER_GLOBAL_QUEUE_INTERVAL`.
 
-## Run J / K / L — remaining spawn sites (predictions, 2026-08-16)
+## Run J / K / L — remaining spawn sites (measured 2026-08-16, HEAD `28b570d`)
 
 Same `env.spawn_future -> RUNTIME.spawn` shape as `read_datagram`. Method:
 source first, prediction, then a load shape that stresses *that* path, then
-the `global_queue_interval` falsifier if the hop A/B moves. Defaults keep
-every unmeasured hop. Results fill in below after the artifacts land.
+the `global_queue_interval` falsifier. Host: macOS M1 Max, 3 load-clients,
+150 sessions, ~150k/s offered, workers=1, 10s window. Read hop already off
+(the Run I fix), so receive is not itself collapsed unless the path under
+test reintroduces the injection queue.
 
-### `send_datagram` (Run J)
+### `send_datagram` (Run J) — REMOVE the hop
 
 **Source.** `send_datagram_for_session` (`session.rs:133`) awaits
 `reserve_datagram_capacity` (Notify + `tokio::time::timeout` deadline) then
-`conn.send_datagram` synchronously. No IO driver, no connection-driver
-affinity. The timer needs *a* tokio time driver; napi-rs's current_thread
-runtime provides one (`tokio_runtime.rs:17`, `enable_all`).
+`conn.send_datagram` synchronously. No IO-driver affinity. The timer needs *a*
+tokio time driver; napi-rs's current_thread runtime provides one.
 
-**Prediction.** Under echo at the collapse condition the send hop *will* bind.
-Each `sendDatagram` is an outside spawn into a worker whose local queue is
-already full of session tasks, so sends should sit near the same ~5,000/s
-cadence as the old read path — or a small multiple if send tasks complete
-fast enough for intermittent bulk drains. Removing the hop should lift
-`datagramsOutPerSec` toward the receive rate (echo ratio → ~100%). Falsifier:
-with the hop on, `sends × interval` should be roughly constant.
+**Prediction.** Under echo at the collapse condition the send hop *will* bind
+to the ~5,000/s cadence.
 
-**Load shape.** `WT_PROBE_ECHO=1`, 3 clients, workers=1, ~150k/s offered.
-Receive-only never calls send at all.
+**Result.** Confirmed.
 
-### Stream open/accept (Run K)
+| send hop | recv/s | send/s | echo | dropped | cores |
+|---|---|---|---|---|---|
+| yes (shipped) | 34,929 | **5,213** | 15% | 1,546 | 1.63 |
+| **no (fix)** | 55,306 | **55,306** | **100%** | **0** | 2.71 |
 
-**Source.** `accept_*` is mutex + mpsc recv + lifecycle Notify (`session.rs:548`,
-`:602`) — same class as `read_datagram`. `create_*` is a oneshot round trip
-to the session task (`:528`, `:582`). Could move.
+Sends sat on the same floor as the old read path. Removing the hop is a
+**10.6x** send lift and takes echo to 1:1. Receive also rose (the worker was
+spending injection-queue polls on send tasks). Artifacts:
+`worker-thread-parallelism-probe-c3-echo-hop-{on,off}.json`.
 
-**Prediction.** The cadence will **not** bind. Sustained stream opens on this
-host top out well under 5,000/s (QUIC stream setup + JS ReadableStream
-wrappers). Forcing `global_queue_interval` across a wide span should move
-accepts by a small fraction, not the 66× the read path moved. Recommendation
-leans keep-the-hop unless the product is constant.
+**Falsifier (hop on).** Directional, not as clean as the read-path product
+because echo couples two paths:
 
-**Load shape.** `WT_PROBE_STREAMS_PER_SEC` high enough that the limiter is not
-the thing being measured (probe raises `maxStreams*` and `streamsPerSec`).
+| gqi | send/s | recv/s | send × gqi |
+|---|---|---|---|
+| 2 | 30,995 | 38,957 | 61,990 (ceiling: almost keeping up with recv) |
+| 8 | 8,490 | 70,999 | 67,923 |
+| 32 | 4,297 | 59,436 | 137,518 |
+| unset (tuned) | 5,213 | 34,929 | implies ~18 against a ~94k poll rate |
 
-### `discard_datagram` (Run L)
+gqi=2 is not injection-bound (send ≈ recv). The hop A/B is the deciding
+evidence; the interval still moves send the right way.
+
+**Recommendation.** Remove. Same defect as `read_datagram`, same fix.
+
+### Stream open/accept (Run K) — KEEP the hop
+
+**Source.** `accept_*` is mutex + mpsc recv + lifecycle Notify; `create_*` is
+a oneshot round trip to the session task. Could move.
+
+**Prediction.** The cadence will **not** bind. Host stream-open capacity sits
+well under 5,000/s.
+
+**Result.** Confirmed. Datagram flood kept the worker busy so a dry-queue
+bulk drain could not hide a miss.
+
+| stream hop | acc/s | recv/s | cores |
+|---|---|---|---|
+| yes (shipped) | **1,531** | 78,909 | 2.69 |
+| no | **1,532** | 79,515 | 2.69 |
+| gqi=2 | 1,516 | 73,699 | 2.60 |
+| gqi=32 | 1,538 | 79,655 | 2.63 |
+
+Accepts moved **1.4%** across a 16× interval span; the read path moved 66×.
+Offered stream load was 3,000/s (20/session × 150); the host capped at
+~1,530/s either way. Artifacts: `*-c3-streams20-*.json`.
+
+**Recommendation.** Leave. Changing an unmeasured-benefit path costs more
+than it buys. Revisit only if a host can drive >5,000 opens/s.
+
+### `discard_datagram` (Run L) — REMOVE the hop
 
 **Source.** `discard_datagram_for_session` (`session.rs:186`) is mutex + mpsc
-recv, plus optional `tokio::time::timeout`. Same as `read_datagram` with a
-timer. Production `incomingDatagrams()` uses `readDatagram`, not this;
-load/evidence drains use it as a per-datagram JS loop.
+recv plus optional `tokio::time::timeout`. Same class as `read_datagram`.
+Production `incomingDatagrams()` uses `readDatagram`; load/evidence drains
+call this per datagram from JS.
 
-**Prediction.** A per-call JS loop **will** bind to the same ~5,000/s floor
-as the old read path. Removing the hop should lift it the same way. The bulk
-`discard_datagrams` loop is a different site — one injected task that then
-loops on the server runtime — and **keeps** the hop so it does not monopolise
-napi-rs's current_thread runtime.
+**Prediction.** A per-call JS loop **will** bind to the same ~5,000/s floor.
 
-**Load shape.** `WT_PROBE_DISCARD=1` (calls `discardIncomingDatagram` in a
-loop). Mutually exclusive with echo: there is no payload to send back.
+**Result.** Confirmed, including the product test.
+
+| discard hop | delivered/s | dropped | cores |
+|---|---|---|---|
+| yes (shipped) | **5,374** | **94.5%** | 1.27 |
+| **no (fix)** | **83,479** | **0%** | 2.46 |
+
+**15.5x**, drops to zero. Floor matches read (5,374 vs 5,266).
+
+| gqi | delivered/s | dropped | delivered × gqi |
+|---|---|---|---|
+| 2 | 58,450 | 0.1% | 116,900 (approaching ceiling) |
+| 8 | 10,614 | 88.3% | **84,914** |
+| 32 | 2,643 | 97.4% | **84,578** |
+| unset (tuned) | 5,374 | 94.5% | implies ~16 |
+
+Product constant at ~85,000 ± 0.2% across 8 and 32. Artifacts:
+`*-c3-discard-*.json`.
+
+**Recommendation.** Remove. Bulk `discard_datagrams` **keeps** its hop: that
+is one injected task that then loops on the server runtime.
 
 ### Sites reviewed and not gated
 
@@ -702,4 +751,12 @@ loop). Mutually exclusive with echo: there is no payload to send back.
 | `wait_*_capacity` | keep | timeout wait, not a hot path |
 | `handle_*_probe` | keep | evidence harness; does real stream IO |
 | client `wait_draining` | keep | same as server, on `CLIENT_RUNTIME` |
+
+### Ship recommendation (remaining sites)
+
+On the investigation branch, send and discard hops now default off (flags
+retained so the A/B can be re-run). Stream hops stay on. The shippable
+`fix/server-worker-threads` commit should delete the send and discard
+wrappers the same way it deletes the read wrapper — **without** shipping
+the measurement flags.
 

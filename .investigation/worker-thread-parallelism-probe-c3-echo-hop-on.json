@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "mode": "worker-thread-parallelism-probe",
+  "kind": "probe",
+  "status": "ok",
+  "generatedAtMs": 1786884336465,
+  "head": "28b570d89ce3f01531e3c75afcae5a38670cf522",
+  "dirty": false,
+  "bunVersion": "1.3.14",
+  "platform": "darwin/arm64",
+  "machine": "Nikitas-MacBook-Pro.local",
+  "command": "bun tools/bench/worker-thread-parallelism-probe.ts",
+  "design": {
+    "aggregateOfferedPerSec": 150000,
+    "saturationSessions": 150,
+    "payloadBytes": 1150,
+    "warmupSec": 5,
+    "measureSec": 10,
+    "reps": 2,
+    "clients": 3,
+    "echo": true,
+    "discard": false,
+    "streamsPerSec": 0,
+    "skipSessionSweep": true,
+    "saturationCeiling": 0.9,
+    "seed": 20260816,
+    "workerOrder": [
+      "r1:workers=1",
+      "r2:workers=1"
+    ],
+    "sessionOrder": [],
+    "hops": {
+      "readDatagramViaServerRuntime": "",
+      "sendDatagramViaServerRuntime": "",
+      "discardDatagramViaServerRuntime": "",
+      "streamOpsViaServerRuntime": "",
+      "globalQueueInterval": ""
+    }
+  },
+  "workerSweep": [
+    {
+      "label": "workers=1",
+      "workers": "1",
+      "sessions": 150,
+      "ratePerSession": 1000,
+      "medianReceivedPerSec": 34929.3963756328,
+      "medianServerCpuCores": 1.6339726717824377,
+      "maxSaturationRatio": 0.2962580888856398,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "label": "workers=1",
+          "round": 1,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 41850.503915644724,
+          "offeredPerSec": 141263.66666666666,
+          "received": 423721,
+          "receivedBytes": 487279150,
+          "clientSent": 2118955,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 10124.633167000002,
+          "saturationRatio": 0.2962580888856398,
+          "serverCpuCores": 1.7368784340075636,
+          "acceptedStreamsPerSec": 0,
+          "datagramsOutPerSec": 5093.320335602831,
+          "drops": {
+            "datagramsIn": 564401,
+            "datagramsDropped": 1546,
+            "rateLimited": 0,
+            "backpressureWait": 9669,
+            "backpressureTimeout": 0
+          },
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 564393
+            },
+            "cpuBefore": {
+              "rateLimitNanos:unnamed#ThreadId(1)": 0,
+              "rateLimitCalls:wt-server#ThreadId(12)": 0,
+              "rateLimitCalls:unnamed#ThreadId(1)": 0,
+              "cpuNanos:unnamed#ThreadId(1)": 2463479208,
+              "thread:wt-server#ThreadId(12)": 265697,
+              "cpuNanos:wt-server#ThreadId(12)": 3534024583,
+              "rateLimitNanos:wt-server#ThreadId(12)": 0,
+              "thread:unnamed#ThreadId(1)": 0
+            },
+            "cpuAfter": {
+              "cpuNanos:wt-server#ThreadId(12)": 10791341458,
+              "thread:unnamed#ThreadId(1)": 0,
+              "rateLimitNanos:wt-server#ThreadId(12)": 0,
+              "rateLimitNanos:unnamed#ThreadId(1)": 0,
+              "rateLimitCalls:unnamed#ThreadId(1)": 0,
+              "thread:wt-server#ThreadId(12)": 830090,
+              "rateLimitCalls:wt-server#ThreadId(12)": 0,
+              "cpuNanos:unnamed#ThreadId(1)": 7620512791
+            }
+          }
+        },
+        {
+          "label": "workers=1",
+          "round": 2,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 28008.288835620886,
+          "offeredPerSec": 140217.4,
+          "received": 283013,
+          "receivedBytes": 325464950,
+          "clientSent": 2103261,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 10104.615874999998,
+          "saturationRatio": 0.1997490242696048,
+          "serverCpuCores": 1.531066909557312,
+          "acceptedStreamsPerSec": 0,
+          "datagramsOutPerSec": 5333.602055407179,
+          "drops": {
+            "datagramsIn": 363637,
+            "datagramsDropped": 0,
+            "rateLimited": 0,
+            "backpressureWait": 0,
+            "backpressureTimeout": 0
+          },
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 363640
+            },
+            "cpuBefore": {
+              "rateLimitCalls:unnamed#ThreadId(1)": 0,
+              "thread:wt-server#ThreadId(12)": 152047,
+              "rateLimitNanos:wt-server#ThreadId(12)": 0,
+              "thread:unnamed#ThreadId(1)": 0,
+              "cpuNanos:unnamed#ThreadId(1)": 1716582500,
+              "rateLimitNanos:unnamed#ThreadId(1)": 0,
+              "cpuNanos:wt-server#ThreadId(12)": 3225387166,
+              "rateLimitCalls:wt-server#ThreadId(12)": 0
+            },
+            "cpuAfter": {
+              "rateLimitCalls:wt-server#ThreadId(12)": 0,
+              "thread:unnamed#ThreadId(1)": 0,
+              "thread:wt-server#ThreadId(12)": 515687,
+              "cpuNanos:unnamed#ThreadId(1)": 5801812458,
+              "rateLimitCalls:unnamed#ThreadId(1)": 0,
+              "rateLimitNanos:wt-server#ThreadId(12)": 0,
+              "rateLimitNanos:unnamed#ThreadId(1)": 0,
+              "cpuNanos:wt-server#ThreadId(12)": 10103863000
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "sessionSweep": [],
+  "workerSpeedup": 1,
+  "failures": []
+}

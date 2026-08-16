@@ -12,8 +12,9 @@ parallelism, which is **root-caused with the fix measured** (see ACTION 2).
 | Track | Branch | HEAD | Pushed | Status |
 |---|---|---|---|---|
 | H7 batching | `feat/h7-batch-delivery` | `17be997` | no | HALTED at its own stop/go gate, 9 tasks complete and reviewed |
-| QUIC parallelism | `investigate/quic-parallelism` | `f40f689` | **yes** | ROOT CAUSED + fix measured; ship decision outstanding |
+| QUIC parallelism | `investigate/quic-parallelism` | `28b570d` | **yes** (this HEAD not yet) | ROOT CAUSED; remaining spawn sites measured (Run J/K/L) |
 | Mainline | `rebind4-staging` | `db9e7c6` | yes | GSO probe work only |
+| Two-worker ship | `fix/server-worker-threads` | `6cfbe8d` | ? | two workers landed; hop removal still to add |
 
 Worktrees:
 - `webtransport-bun-worktrees/h7-batch-delivery` — do not touch, finished work.
@@ -269,42 +270,20 @@ REVISED RECOMMENDATION: ship the hop removal AND two workers. Two workers alone
 leaves the defect in place — it only makes workers run dry often enough to dodge
 it, which a busier server or more sessions could undo.
 
-STILL OPEN: the same `env.spawn_future -> RUNTIME.spawn` shape appears on the
-other `session_napi.rs` methods (`send_datagram`, `discard_datagram`, the stream
-opens). Only `read_datagram` was measured. Review the others for the same
-reasoning rather than changing them on faith. **In progress 2026-08-16:**
-gates exist, defaults keep every unmeasured hop, load shapes added
-(`WT_PROBE_ECHO`, `WT_PROBE_DISCARD`, `WT_PROBE_STREAMS_PER_SEC`). Predictions
-are in `measurement.md` under "Run J / K / L" — measure next, do not flip
-defaults on the prior session's un-artifacted numbers.
+REMAINING SPAWN SITES — measured 2026-08-16 (Run J/K/L, HEAD `28b570d`):
 
-Starting hypotheses, in the order I would test them:
-1. **A timer or poll interval somewhere in the delivery path.** Work out what
-   cadence would produce ~5,300 deliveries/s and look for it. If delivery is
-   batched per wake, 5,300/s could be e.g. ~5.3 items per 1 ms tick, or ~26 per
-   5 ms. Find the wake source.
-2. **quinn's `RECV_TIME_BOUND = 50µs`** (`quinn-0.11.11/src/lib.rs:136`, used at
-   `endpoint.rs:499/511/861`) bounds the recv loop, and `IO_LOOP_BOUND = 160`
-   (`lib.rs:128`) bounds `handle_events`. Determine whether the endpoint driver
-   yields often enough for delivery futures to be scheduled, and what happens to
-   that yielding under sustained load.
-3. **The queued-bytes reservation release path** — this is the confirmed reject
-   site. Find what releases reservations and at what rate; if release is tied to
-   a periodic sweep rather than to reader progress, that is the fixed cadence.
-4. **The TSFN / N-API call scheduling** — whether delivery futures are woken by
-   the JS thread's event-loop turn rather than by the runtime, which would tie
-   throughput to Bun's loop cadence rather than to CPU.
+| site | verdict | evidence |
+|---|---|---|
+| `send_datagram` | **REMOVE hop** | echo: 5,213 → 55,306 send/s, 15% → 100% echo |
+| `discard_datagram` | **REMOVE hop** | 5,374 → 83,479/s, 94.5% → 0% dropped; gqi product ~85k |
+| stream open/accept | **KEEP hop** | 1,531 vs 1,532 acc/s; gqi 2→32 moved 1.4% |
+| bulk `discard_datagrams` / waits / probes | **KEEP hop** | one spawn then a loop, or a wtransport future |
 
-Method, non-negotiable given this session's history: **measure before
-theorising, and prove the mechanism by making it move.** A root cause is only
-established when changing the suspected cadence changes the floor
-proportionally. The floor being identical across platforms is the strongest
-lead available — use it as the falsifier for every hypothesis.
+Investigation-branch defaults now match: send and discard hops off, stream
+hops on. Flags retained for A/B. The shippable branch should delete the send
+and discard wrappers with the read wrapper, **without** the measurement flags.
 
-Useful existing instrumentation: `worker_probe.rs` already attributes datagrams
-per OS thread and times the rate limiter behind
-`WEBTRANSPORT_WORKER_PROBE_TIMING=1`; the reject-path attribution from `5fff9c0`
-already distinguishes the queued-bytes reservation from the rate limiter.
+Full write-up: `measurement.md` "Run J / K / L".
 
 ### ACTION 3 — smaller follow-ups, independent of the above
 
@@ -316,8 +295,8 @@ already distinguishes the queued-bytes reservation from the rate limiter.
   control (115,557/s on 0.98 cores with the delivery hop deleted, versus
   89,002/s on 3.29 cores with it). **That gap is the real optimisation target**
   now that both batching and the JS drain are ruled out.
-- A larger Linux runner would settle whether 4 workers beats 2 there; the 4-vCPU
-  box cannot.
+- Carry send + discard hop removal onto `fix/server-worker-threads` (no
+  measurement flags), next to the read-hop commit already in flight.
 
 ---
 

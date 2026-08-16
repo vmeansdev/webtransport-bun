@@ -182,32 +182,29 @@ fn hop_flag(var: &str, default_hop: bool) -> bool {
     }
 }
 
-/// Send path. Default keeps the hop until Run J stamps an artifact: unlike
-/// the read path this was not measured at the commit that gated it.
-/// `send_datagram_for_session` awaits a Notify with a timer deadline, then
-/// makes a synchronous quinn call — no IO-driver affinity, but the timer
-/// does need *a* tokio time driver, which napi-rs's current_thread runtime
-/// provides.
+/// Send path: hop REMOVED by default. Run J: under echo at one worker,
+/// sends sat at 5,213/s (the injection cadence) with the hop and rose to
+/// 55,306/s with it gone, echo ratio 15% → 100%. See measurement.md.
 pub(crate) fn send_datagram_via_server_runtime() -> bool {
     static V: Lazy<bool> =
-        Lazy::new(|| hop_flag("WEBTRANSPORT_SEND_DATAGRAM_VIA_SERVER_RUNTIME", true));
+        Lazy::new(|| hop_flag("WEBTRANSPORT_SEND_DATAGRAM_VIA_SERVER_RUNTIME", false));
     *V
 }
 
-/// Per-datagram discard. Same shape as `read_datagram` (mutex + mpsc recv)
-/// plus an optional `tokio::time::timeout`. Predicted to bind to the injection
-/// cadence under a per-call JS loop; default keeps the hop until Run L
-/// measures it. The bulk `discard_datagrams` loop is a different site and is
-/// not gated — one spawn then a native loop is the point of that path.
+/// Per-datagram discard: hop REMOVED by default. Run L: 5,374/s delivered
+/// (94.5% dropped) with the hop, 83,479/s and zero drops without. The gqi
+/// product was constant at ~85,000 for interval 8 and 32. Bulk
+/// `discard_datagrams` is a different site and still hops — one spawn then a
+/// native loop, so it does not pin napi-rs's current_thread runtime.
 pub(crate) fn discard_datagram_via_server_runtime() -> bool {
     static V: Lazy<bool> =
-        Lazy::new(|| hop_flag("WEBTRANSPORT_DISCARD_DATAGRAM_VIA_SERVER_RUNTIME", true));
+        Lazy::new(|| hop_flag("WEBTRANSPORT_DISCARD_DATAGRAM_VIA_SERVER_RUNTIME", false));
     *V
 }
 
-/// Stream open/accept paths. Gated so the A/B can run; default keeps the hop
-/// until Run K measures it. Accept is pure channel work; create is a oneshot
-/// round trip to the session task.
+/// Stream open/accept paths: hop RETAINED. Run K: accepts sat at ~1,530/s
+/// with or without the hop, and pinning gqi 2 vs 32 moved them 1.4%. The
+/// host cannot drive this path into the ~5,000/s cadence. See measurement.md.
 pub(crate) fn stream_ops_via_server_runtime() -> bool {
     static V: Lazy<bool> =
         Lazy::new(|| hop_flag("WEBTRANSPORT_STREAM_OPS_VIA_SERVER_RUNTIME", true));
