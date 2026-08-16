@@ -135,6 +135,11 @@ export type MetricsSnapshot = {
 	datagramsIn: number;
 	datagramsOut: number;
 	datagramsDropped: number;
+	/** Native ingest only. Present when the snapshot includes reason counters. */
+	datagramsDroppedRateLimited?: number;
+	datagramsDroppedTooLarge?: number;
+	datagramsDroppedQueueGlobal?: number;
+	datagramsDroppedQueueSession?: number;
 
 	queuedBytesGlobal: number;
 	backpressureWaitCount: number;

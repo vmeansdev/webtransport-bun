@@ -7,6 +7,34 @@ use tokio::sync::Notify;
 use super::histogram::{self, LatencyHistogram};
 use super::metrics::HistogramSnapshot;
 
+/// Result of a global+session queued-bytes reservation.
+///
+/// Recv ingest maps `Global`/`Session` onto datagram drop reasons. The send
+/// path treats both as “not reserved yet” and waits — it must not count as
+/// `datagrams_dropped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveQueuedBytes {
+    Ok,
+    Global,
+    Session,
+}
+
+impl ReserveQueuedBytes {
+    pub fn is_ok(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
+/// Why one inbound datagram was dropped at ingest. Handshake/stream rate-limit
+/// rejects use `rate_limited_count` only and must not appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramDropReason {
+    RateLimited,
+    TooLarge,
+    QueueGlobal,
+    QueueSession,
+}
+
 #[derive(Default)]
 pub struct ServerMetrics {
     pub sessions_active: AtomicU64,
@@ -23,6 +51,10 @@ pub struct ServerMetrics {
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
     pub datagrams_dropped: AtomicU64,
+    pub datagrams_dropped_rate_limited: AtomicU64,
+    pub datagrams_dropped_too_large: AtomicU64,
+    pub datagrams_dropped_queue_global: AtomicU64,
+    pub datagrams_dropped_queue_session: AtomicU64,
     pub queued_bytes_global: AtomicU64,
     pub backpressure_wait_count: AtomicU64,
     pub backpressure_timeout_count: AtomicU64,
@@ -74,9 +106,9 @@ impl ServerMetrics {
         n: u64,
         global_max: u64,
         session_max: u64,
-    ) -> bool {
+    ) -> ReserveQueuedBytes {
         if !self.try_reserve_queued_bytes(n, global_max) {
-            return false;
+            return ReserveQueuedBytes::Global;
         }
         let ok = session_queued
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -87,8 +119,34 @@ impl ServerMetrics {
             .is_ok();
         if !ok {
             self.release_queued_bytes(n);
+            return ReserveQueuedBytes::Session;
         }
-        ok
+        ReserveQueuedBytes::Ok
+    }
+
+    /// Count one inbound datagram drop. Increments `datagrams_dropped` and the
+    /// matching reason. Datagram rate-limit also bumps `rate_limited_count`.
+    pub fn record_datagram_drop(&self, reason: DatagramDropReason) {
+        self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+        match reason {
+            DatagramDropReason::RateLimited => {
+                self.datagrams_dropped_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                self.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+            }
+            DatagramDropReason::TooLarge => {
+                self.datagrams_dropped_too_large
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DatagramDropReason::QueueGlobal => {
+                self.datagrams_dropped_queue_global
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DatagramDropReason::QueueSession => {
+                self.datagrams_dropped_queue_session
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn release_session_queued_bytes(
@@ -123,7 +181,7 @@ impl ServerMetrics {
             default_cert_selections: 0,
             unknown_sni_rejected_count: 0,
         });
-        ServerMetricsSnapshot {
+        let snap = ServerMetricsSnapshot {
             now_ms: js_sys_timestamp(),
             sessions_active: self.sessions_active.load(Ordering::Relaxed) as u32,
             session_tasks_active: self.session_tasks_active.load(Ordering::Relaxed) as u32,
@@ -133,6 +191,18 @@ impl ServerMetrics {
             datagrams_in: self.datagrams_in.load(Ordering::Relaxed) as f64,
             datagrams_out: self.datagrams_out.load(Ordering::Relaxed) as f64,
             datagrams_dropped: self.datagrams_dropped.load(Ordering::Relaxed) as f64,
+            datagrams_dropped_rate_limited: Some(
+                self.datagrams_dropped_rate_limited.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_dropped_too_large: Some(
+                self.datagrams_dropped_too_large.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_dropped_queue_global: Some(
+                self.datagrams_dropped_queue_global.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_dropped_queue_session: Some(
+                self.datagrams_dropped_queue_session.load(Ordering::Relaxed) as f64,
+            ),
             queued_bytes_global: self.queued_bytes_global.load(Ordering::Relaxed) as f64,
             backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as f64,
             backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed)
@@ -151,7 +221,16 @@ impl ServerMetrics {
             handshake_latency: Some(histogram_to_snapshot(&self.handshake_histogram)),
             datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
             stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),
-        }
+        };
+        debug_assert_eq!(
+            self.datagrams_dropped.load(Ordering::Relaxed),
+            self.datagrams_dropped_rate_limited.load(Ordering::Relaxed)
+                + self.datagrams_dropped_too_large.load(Ordering::Relaxed)
+                + self.datagrams_dropped_queue_global.load(Ordering::Relaxed)
+                + self.datagrams_dropped_queue_session.load(Ordering::Relaxed),
+            "native datagram drop identity: total must equal the four ingest reasons",
+        );
+        snap
     }
 }
 
@@ -221,5 +300,102 @@ mod tests {
 
         assert_eq!(admitted, 4);
         assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 4);
+    }
+
+    fn assert_drop_identity(metrics: &ServerMetrics) {
+        let total = metrics.datagrams_dropped.load(Ordering::Relaxed);
+        let sum = metrics
+            .datagrams_dropped_rate_limited
+            .load(Ordering::Relaxed)
+            + metrics.datagrams_dropped_too_large.load(Ordering::Relaxed)
+            + metrics
+                .datagrams_dropped_queue_global
+                .load(Ordering::Relaxed)
+            + metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed);
+        assert_eq!(total, sum);
+        let snap = metrics.snapshot(None);
+        assert_eq!(snap.datagrams_dropped, total as f64);
+        assert_eq!(
+            snap.datagrams_dropped,
+            snap.datagrams_dropped_rate_limited.unwrap()
+                + snap.datagrams_dropped_too_large.unwrap()
+                + snap.datagrams_dropped_queue_global.unwrap()
+                + snap.datagrams_dropped_queue_session.unwrap()
+        );
+    }
+
+    #[test]
+    fn datagram_drop_reasons_cover_all_four_ingest_paths() {
+        use super::{DatagramDropReason, ReserveQueuedBytes};
+
+        let metrics = ServerMetrics::default();
+        let session = std::sync::atomic::AtomicU64::new(0);
+
+        assert_eq!(
+            metrics.try_reserve_queued_bytes_with_session(&session, 10, 100, 100),
+            ReserveQueuedBytes::Ok
+        );
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 10);
+        ServerMetrics::release_session_queued_bytes(&session, &metrics, 10);
+
+        metrics.record_datagram_drop(DatagramDropReason::RateLimited);
+        metrics.record_datagram_drop(DatagramDropReason::TooLarge);
+        assert_eq!(
+            metrics.try_reserve_queued_bytes_with_session(&session, 10, 5, 100),
+            ReserveQueuedBytes::Global
+        );
+        metrics.record_datagram_drop(DatagramDropReason::QueueGlobal);
+        assert_eq!(
+            metrics.try_reserve_queued_bytes_with_session(&session, 10, 100, 5),
+            ReserveQueuedBytes::Session
+        );
+        metrics.record_datagram_drop(DatagramDropReason::QueueSession);
+
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_rate_limited
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.datagrams_dropped_too_large.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_global
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.rate_limited_count.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+        assert_drop_identity(&metrics);
+    }
+
+    #[test]
+    fn handshake_rate_limit_does_not_count_as_datagram_drop() {
+        let metrics = ServerMetrics::default();
+        metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_rate_limited
+                .load(Ordering::Relaxed),
+            0
+        );
+        metrics.record_datagram_drop(super::DatagramDropReason::RateLimited);
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.rate_limited_count.load(Ordering::Relaxed), 2);
+        assert_drop_identity(&metrics);
     }
 }

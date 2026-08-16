@@ -1594,23 +1594,29 @@ pub(crate) fn spawn_wtransport_server(
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             if !worker_probe::time_rate_limit(|| rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst)) {
-                                                                m_dgram.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                                m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::RateLimited);
                                                                 continue;
                                                             }
                                                             if dgram.len() > lim_dgram.max_datagram_size {
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                                m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::TooLarge);
                                                                 continue;
                                                             }
                                                             let sz = dgram.len() as u64;
-                                                            if !m_dgram.try_reserve_queued_bytes_with_session(
+                                                            match m_dgram.try_reserve_queued_bytes_with_session(
                                                                 &sm_dgram.queued_bytes,
                                                                 sz,
                                                                 lim_dgram.max_queued_bytes_global,
                                                                 lim_dgram.max_queued_bytes_per_session,
                                                             ) {
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                                                                continue;
+                                                                crate::server_metrics::ReserveQueuedBytes::Ok => {}
+                                                                crate::server_metrics::ReserveQueuedBytes::Global => {
+                                                                    m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::QueueGlobal);
+                                                                    continue;
+                                                                }
+                                                                crate::server_metrics::ReserveQueuedBytes::Session => {
+                                                                    m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::QueueSession);
+                                                                    continue;
+                                                                }
                                                             }
                                                             let reservation = crate::session_registry::DatagramReservation::new(
                                                                 std::sync::Arc::clone(&sm_dgram),
