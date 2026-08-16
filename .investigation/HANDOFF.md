@@ -233,11 +233,44 @@ Evidence to cite in the commit: two platforms, twelve collapsed runs, identical
 rung where 1 collapsed; 2 beat 4 (81,682/s) and 10 (48,042/s) on macOS; nothing
 justifies `available_parallelism()`.
 
-### ACTION 2 — root-cause the fixed-cadence floor
+### ACTION 2 — root-cause the fixed-cadence floor — ✅ SOLVED 2026-08-16
 
-**This is the actual bug.** The ~5,300/s floor is platform-independent across a
-32x change in receive cost, which rules out a CPU-cost explanation and points at
-something servicing the starved delivery future on a fixed schedule.
+**FOUND. It is tokio's `global_queue_interval`.** Full write-up in
+`measurement.md` under "Run I — ROOT CAUSE". Summary:
+
+Every `readDatagram` goes `env.spawn_future` -> `RUNTIME.spawn`
+(`session_napi.rs:157`). Spawning into the server runtime from the N-API runtime
+is a spawn from *outside*, so the task lands in the **injection queue**. A
+worker with 150 always-ready session tasks never runs dry, so it never hits the
+bulk drain at `worker.rs:1533` and can only reach the injection queue via
+`worker.rs:1077`, `tick % global_queue_interval == 0`, which takes **one** task
+per check. Tokio tunes that interval to `200us / task_poll_time_ewma`
+(`stats.rs:34,63`) — one delivery per ~200us of work, i.e. ~5,000/s, a scheduler
+policy constant and therefore identical on both platforms.
+
+FALSIFIER RUN (this is what establishes it): pinning the interval disables the
+tuner, and the floor tracked it inversely with `delivered x interval` constant
+at ~93,000 +/- 3% across a 64x span — gqi 2 -> 47,930/s (2% drops), 8 -> 11,678,
+32 -> 2,836, 127 -> 726. Tuned floor implies an effective interval of ~18.
+
+**SMALLEST CORRECT FIX, measured:** delete the `RUNTIME.spawn` wrapper in
+`read_datagram`. It buys nothing — `read_datagram_for_session` only locks a
+Tokio mutex and receives from an mpsc, with no timers, IO driver or
+server-runtime context — so it runs correctly on the N-API runtime that
+`spawn_future` already provides. At one worker under the collapse condition:
+**5,266 -> 84,823/s delivered, 95% -> 0% dropped (16.1x)**. At two workers,
+103,549 vs 101,272 on ~10% less CPU. Implemented on this branch behind
+`WEBTRANSPORT_READ_DATAGRAM_VIA_SERVER_RUNTIME` (default = fixed path) so the
+A/B can be re-run. Suite green: 451 pass / 0 fail, 188 Rust tests, clippy clean.
+
+REVISED RECOMMENDATION: ship the hop removal AND two workers. Two workers alone
+leaves the defect in place — it only makes workers run dry often enough to dodge
+it, which a busier server or more sessions could undo.
+
+STILL OPEN: the same `env.spawn_future -> RUNTIME.spawn` shape appears on the
+other `session_napi.rs` methods (`send_datagram`, `discard_datagram`, the stream
+opens). Only `read_datagram` was measured. Review the others for the same
+reasoning rather than changing them on faith.
 
 Starting hypotheses, in the order I would test them:
 1. **A timer or poll interval somewhere in the delivery path.** Work out what

@@ -162,6 +162,22 @@ fn server_global_queue_interval() -> Option<u32> {
     }
 }
 
+/// Route `read_datagram` back through the server runtime (the old behaviour).
+///
+/// Off by default: the hop is what caps delivery at the injection queue's
+/// servicing cadence. Retained so the A/B that established that can be re-run.
+pub(crate) fn read_datagram_via_server_runtime() -> bool {
+    static VIA_RUNTIME: Lazy<bool> = Lazy::new(|| {
+        std::env::var("WEBTRANSPORT_READ_DATAGRAM_VIA_SERVER_RUNTIME")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    });
+    *VIA_RUNTIME
+}
+
 fn server_worker_threads() -> usize {
     let raw = std::env::var(SERVER_WORKER_THREADS_ENV).ok();
     match resolve_worker_threads(raw.as_deref()) {

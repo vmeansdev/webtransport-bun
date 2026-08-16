@@ -469,6 +469,121 @@ the macOS ordering (2 > 4 > 10) may not transfer to a many-core Linux server,
 and testing that needs a runner with more than 4 vCPU. And nothing here
 justifies `available_parallelism()`, which was the worst arm on macOS.
 
+## Run I — ROOT CAUSE: tokio's injection-queue servicing cadence
+
+**The fixed cadence is `tokio`'s `global_queue_interval`, and the ~5,300/s floor
+is one delivery per ~200µs of worker time. Established by falsifier, not by
+inspection.**
+
+### The path
+
+`session_napi.rs:157` dispatches every single `readDatagram()` like this:
+
+```rust
+env.spawn_future(async move {           // runs on the N-API runtime
+    RUNTIME.spawn(async move { ... })   // spawns into the SERVER runtime
+        .await
+})
+```
+
+`RUNTIME.spawn` called from the N-API runtime is a spawn from *outside* the
+server runtime, so the task goes to that runtime's **injection queue**, not to
+any worker's local queue. A worker reaches the injection queue two ways
+(`tokio-1.53.1/src/runtime/scheduler/multi_thread/worker.rs`):
+
+- **when it runs dry** — line 1533, `while let Some(task) = self.next_remote_task()`,
+  which drains it in bulk;
+- **on a tick counter** — line 1077:
+
+```rust
+if self.tick % self.global_queue_interval == 0 {
+    self.tune_global_queue_interval(worker);
+    ... .next_remote_task()     // exactly ONE task
+}
+```
+
+Under sustained overload with 150 always-ready session tasks, a single worker's
+local queue **never** runs dry, so the first path never fires and every delivery
+must come through the second — one per `global_queue_interval` polls.
+
+And that interval is *time-targeted* (`stats.rs:34,63`):
+
+```rust
+const TARGET_GLOBAL_QUEUE_INTERVAL: f64 = Duration::from_micros(200).as_nanos() as f64;
+let tasks_per_interval = (TARGET_GLOBAL_QUEUE_INTERVAL / self.task_poll_time_ewma) as u32;
+tasks_per_interval.clamp(2, 127)
+```
+
+One remote task per **200µs of work**. That is 5,000 deliveries/s — and it is a
+scheduler policy constant, which is precisely why a 32x cheaper receive path did
+not move it: the tuner re-derives the same 200µs of *work* whatever that work
+costs per datagram.
+
+### The falsifier
+
+Setting the interval explicitly disables the tuner (`stats.rs:58`), so if this
+is the mechanism the floor must track it inversely. Collapse condition, one
+worker, 150 sessions, 3 generators, ~150k/s offered:
+
+| `global_queue_interval` | delivered/s | dropped | delivered x interval |
+|---|---|---|---|
+| 2 | **47,930** | **2%** | 95,860 |
+| 8 | 11,678 | 89% | 93,424 |
+| 32 | 2,836 | 97% | 90,752 |
+| 127 | 726 | 99% | 92,202 |
+| unset (tuned) | 5,112 | 93% | — implies effective ≈ 18 |
+
+**The product is constant at ~93,000 ± 3% across a 64x span of the knob.** That
+is `delivered = poll_rate / global_queue_interval` exactly as one-task-per-check
+predicts, with ~93,000 local polls/s. The tuned floor corresponds to an
+effective interval of ~18, i.e. a mean task poll time of ~11µs against the
+200µs target. Hypothesis confirmed quantitatively, not just directionally.
+
+This also explains why two workers fixed it and why the JS thread stayed idle:
+with the work spread, workers intermittently run dry and hit the *bulk* drain at
+line 1533, so the tick path stops being the only route.
+
+### The smallest correct fix
+
+The hop buys nothing. `read_datagram_for_session` only locks a Tokio mutex and
+receives from a Tokio mpsc — no timers, no IO driver, no server-runtime context
+of any kind — so it runs correctly on the N-API runtime `spawn_future` already
+provides. Deleting the `RUNTIME.spawn` wrapper removes the injection queue from
+the delivery path entirely.
+
+A/B at the collapse condition (`WEBTRANSPORT_READ_DATAGRAM_VIA_SERVER_RUNTIME`
+retained only so this can be re-run):
+
+| runtime hop | workers | delivered/s | ingested/s | dropped | cores |
+|---|---|---|---|---|---|
+| yes (today) | 1 | 5,266 | 97,951 | **95%** | 1.23 |
+| **no (fix)** | 1 | **84,823** | 84,820 | **0%** | 2.51 |
+| yes | 2 | 101,272 | 100,585 | 0% | 3.19 |
+| no (fix) | 2 | 103,549 | 103,774 | 0% | 2.87 |
+
+**A 16.1x improvement at the shipped worker count, with drops going to zero.**
+It fixes the defect rather than masking it: the single-worker default becomes
+safe on its own, and at two workers it is slightly faster on ~10% less CPU.
+
+Cost: one deleted `RUNTIME.spawn` wrapper in `session_napi.rs`. Full suite green
+(451 pass / 0 fail / 81 skip, 532 tests), 188 Rust tests, clippy clean.
+
+Two caveats. The fix moves read work onto the N-API runtime's threads, so
+one-worker CPU rises from 1.23 to 2.51 cores — it is buying throughput with
+parallelism that was previously unreachable, not making delivery cheaper. And
+the same `env.spawn_future -> RUNTIME.spawn` shape appears on the other session
+methods in `session_napi.rs` (`send_datagram`, `discard_datagram`, the stream
+opens); only `read_datagram` was measured, and the others should be reviewed for
+the same reasoning rather than changed on faith.
+
+### Recommendation revised
+
+Ship **both**, in this order of importance: remove the runtime hop from
+`read_datagram` (fixes the root cause, high confidence, falsifier-backed), and
+keep two workers (independent headroom, already approved). Two workers alone
+leaves the defect in place — it only ensures workers run dry often enough to
+dodge it, which a busier server or a larger session count could undo.
+
 ## Recorded gate breakage
 
 `scripts/check-doc-truth.ts` pins the exact constructor string

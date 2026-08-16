@@ -156,15 +156,37 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<Buffer | null>")]
     pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
+        // INVESTIGATION (investigate/quic-parallelism): hopping onto RUNTIME
+        // here is what collapses delivery under overload. `RUNTIME.spawn` from
+        // the N-API runtime is a spawn from *outside* the server runtime, so
+        // the task lands in the injection queue; a worker whose local queue
+        // never drains services that queue once per `global_queue_interval`
+        // polls, one task per check, capping delivery at ~5,000/s regardless of
+        // platform or load.
+        //
+        // The hop buys nothing. `read_datagram_for_session` only locks a Tokio
+        // mutex and receives from a Tokio mpsc — no timers, no IO driver, no
+        // server-runtime context of any kind — so it runs correctly on the
+        // N-API runtime that `spawn_future` already provides.
+        //
+        // Kept switchable only so the A/B can be re-run; the default is the
+        // direct path.
+        if crate::read_datagram_via_server_runtime() {
+            return env.spawn_future(async move {
+                RUNTIME
+                    .spawn(async move {
+                        Ok(read_datagram_for_session(&id)
+                            .await?
+                            .map(crate::payload_buffer::PayloadBuffer::from))
+                    })
+                    .await
+                    .map_err(wt_from_upstream_error)?
+            });
+        }
         env.spawn_future(async move {
-            RUNTIME
-                .spawn(async move {
-                    Ok(read_datagram_for_session(&id)
-                        .await?
-                        .map(crate::payload_buffer::PayloadBuffer::from))
-                })
-                .await
-                .map_err(wt_from_upstream_error)?
+            Ok(read_datagram_for_session(&id)
+                .await?
+                .map(crate::payload_buffer::PayloadBuffer::from))
         })
     }
 
