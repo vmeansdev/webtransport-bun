@@ -1982,12 +1982,15 @@ mod tests {
         assert_eq!(capacity, 2048, "the in-flight bound is stated against 2048");
         let queue = TestDatagramQueue::new(capacity);
         let reserve = || {
-            assert!(queue.metrics.try_reserve_queued_bytes_with_session(
-                &queue.session_metrics.queued_bytes,
-                PAYLOAD,
-                GLOBAL_MAX,
-                SESSION_MAX,
-            ));
+            assert!(queue
+                .metrics
+                .try_reserve_queued_bytes_with_session(
+                    &queue.session_metrics.queued_bytes,
+                    PAYLOAD,
+                    GLOBAL_MAX,
+                    SESSION_MAX,
+                )
+                .is_ok());
         };
         let full_slot = || queue.slot(vec![0u8; PAYLOAD as usize], PAYLOAD);
 
