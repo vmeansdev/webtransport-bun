@@ -1216,6 +1216,8 @@ interface NativeAddon {
 	/** Leak-forensics: futures currently parked per instrumented await
 	 * (absent on older prebuilt addons). Diagnostic only. */
 	nativeAwaitProbeSnapshot?: () => Record<string, number>;
+	/** Throwaway worker-probe snapshot. Do not merge to staging. */
+	nativeWorkerProbeSnapshot?: () => Record<string, number>;
 	/** Which payload delivery path this process resolved: exactly
 	 * `"arraybuffer"` or `"buffer-copy"` (absent on older prebuilt addons). */
 	nativePayloadDeliveryMode?: () => string;
@@ -4133,6 +4135,8 @@ export const __TESTING__ = {
 	nativeStreamHandlesSnapshotForTests: () =>
 		native?.nativeStreamHandlesSnapshot?.(),
 	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
+	nativeWorkerProbeSnapshotForTests: () =>
+		native?.nativeWorkerProbeSnapshot?.(),
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
 	parseDatagramBatchSizeForTests: parseDatagramBatchSize,
