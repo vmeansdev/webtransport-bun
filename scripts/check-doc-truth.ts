@@ -63,6 +63,7 @@ const FAQ_PATH = resolve(ROOT, "docs", "FAQ.md");
 const COMPATIBILITY_PATH = resolve(ROOT, "docs", "COMPATIBILITY.md");
 const CI_PATH = resolve(ROOT, "docs", "CI.md");
 const RELEASE_CHECKLIST_PATH = resolve(ROOT, "docs", "RELEASE_CHECKLIST.md");
+const LOAD_README_PATH = resolve(ROOT, "tools", "load", "README.md");
 const ROOT_README_PATH = resolve(ROOT, "README.md");
 const PACKAGE_README_PATH = resolve(
 	ROOT,
@@ -95,6 +96,56 @@ const RUNTIME_CONTRACTS = [
 function exactConstructor(workers: number): string {
 	return `Builder::new_multi_thread().worker_threads(${workers})`;
 }
+/**
+ * The hosted H7 closure lane is a preregistered dispatch: every value below is
+ * enforced somewhere in `.github/workflows/soak-long.yml`,
+ * `scripts/validate-soak-inputs.sh`, or `verify-h7-hosted` in
+ * `tools/load/soak-addon.ts`. Operator docs that disagree with these send a
+ * dispatch the validator rejects, or worse, one it accepts for the wrong
+ * workload, so all three carry the identical contract.
+ */
+const H7_REQUIRED_TEXT = [
+	"H7 hosted closure lane",
+	"duration_hours=2",
+	"runner_type=self-hosted",
+	"runner_mode=dedicated",
+	"datagram_batch=64",
+	"rss_ceiling_mb=1750",
+	"soak-long-<campaign_seed>",
+	"runner_profile=h7-fixed-large",
+	"sessions=500",
+	"datagrams_per_sec=500",
+	"streams_per_sec=5",
+	"at least 5 CPUs and 8 GiB",
+	"fails closed rather than downscaling",
+	"refs/tags/h7-batch-delivery-<candidate-sha>",
+	"verify-h7-hosted",
+	"does not replace the 24h/72h release soak",
+] as const;
+/** Mode lists written before the 2-hour lane existed. */
+const STALE_SOAK_MODE_LISTS = [
+	"1h/24h/72h",
+	"1h, 24h, 72h",
+	"1h, 24h, or 72h",
+] as const;
+/** Self-hosted segmentation the workflow refuses; only `segment_count=1` runs. */
+const STALE_SELF_HOSTED_SEGMENTATION = [
+	"segment_count=4",
+	"segment_count=12",
+	"4x6h",
+	"12x6h",
+] as const;
+const LOCAL_DIAGNOSTIC_MARKERS = [
+	"soak.ts",
+	"30-minute",
+	"30 minutes",
+	"nightly",
+] as const;
+const HOSTED_EVIDENCE_WORDS = [
+	"H7",
+	"release evidence",
+	"soak-long evidence",
+] as const;
 
 type Violation = { location: string; message: string };
 const violations: Violation[] = [];
@@ -644,6 +695,96 @@ function checkNarrativeStatusTruth(): void {
 	}
 }
 
+/**
+ * The three operator-facing soak contracts have to agree on the hosted H7 lane
+ * exactly, and none of them may present it as a substitute for the release
+ * soak policy it supplements.
+ */
+function checkHostedH7Contract(): void {
+	for (const path of [CI_PATH, RELEASE_CHECKLIST_PATH, LOAD_README_PATH]) {
+		const doc = readText(path);
+		if (doc === undefined) continue;
+		const location = relative(ROOT, path);
+		for (const required of H7_REQUIRED_TEXT) {
+			if (!doc.includes(required)) {
+				report(
+					location,
+					`H7 hosted closure lane contract is missing required text: ${required}`,
+				);
+			}
+		}
+		if (path === RELEASE_CHECKLIST_PATH) continue;
+		for (const stale of STALE_SOAK_MODE_LISTS) {
+			if (doc.includes(stale)) {
+				report(
+					location,
+					`soak-long mode list "${stale}" omits the 2-hour H7 hosted closure lane`,
+				);
+			}
+		}
+	}
+
+	const checklist = readText(RELEASE_CHECKLIST_PATH);
+	if (checklist !== undefined) {
+		const location = relative(ROOT, RELEASE_CHECKLIST_PATH);
+		for (const stale of STALE_SELF_HOSTED_SEGMENTATION) {
+			if (checklist.includes(stale)) {
+				report(
+					location,
+					`contradicts the workflow-enforced self-hosted segmentation: "${stale}"`,
+				);
+			}
+		}
+		// Matched against collapsed lowercase text so the required sentence may
+		// wrap or start a sentence in prose.
+		const normalized = checklist.toLowerCase().replaceAll(/\s+/g, " ");
+		if (
+			!normalized.includes(
+				"self-hosted 24h and 72h campaigns use segment_count=1",
+			)
+		) {
+			report(
+				location,
+				"must state that self-hosted 24h and 72h campaigns use segment_count=1",
+			);
+		}
+		for (const hosted of ["segment_count=5", "segment_count=15"]) {
+			if (!checklist.includes(hosted)) {
+				report(
+					location,
+					`must retain the GitHub-hosted segmentation value ${hosted}`,
+				);
+			}
+		}
+	}
+
+	const loadReadme = readText(LOAD_README_PATH);
+	if (loadReadme !== undefined) {
+		const location = relative(ROOT, LOAD_README_PATH);
+		if (!loadReadme.includes("legacy local diagnostic")) {
+			report(
+				location,
+				"must label the 30-minute soak.ts path a legacy local diagnostic",
+			);
+		}
+		for (const line of loadReadme.split("\n")) {
+			const isLocalDiagnostic = LOCAL_DIAGNOSTIC_MARKERS.some((marker) =>
+				line.includes(marker),
+			);
+			const claimsHostedEvidence = HOSTED_EVIDENCE_WORDS.some((word) =>
+				line.includes(word),
+			);
+			if (isLocalDiagnostic && claimsHostedEvidence) {
+				report(
+					location,
+					"the local soak.ts diagnostic must not be described as H7, release, or soak-long evidence",
+				);
+				break;
+			}
+		}
+	}
+}
+
 const status = readStatus();
 if (status) {
 	if (status.schemaVersion !== 1) {
@@ -717,6 +858,7 @@ if (status) {
 checkRuntimeContract();
 checkDatagramDeliveryPath();
 checkNarrativeStatusTruth();
+checkHostedH7Contract();
 
 if (violations.length > 0) {
 	for (const violation of violations) {

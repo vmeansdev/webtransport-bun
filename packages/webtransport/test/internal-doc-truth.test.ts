@@ -14,6 +14,54 @@ const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
 const COMMIT = "0123456789abcdef0123456789abcdef01234567";
 const roots: string[] = [];
 
+/** The exact hosted-H7 contract every operator doc has to carry verbatim. */
+const H7_CONTRACT = [
+	"### H7 hosted closure lane",
+	"",
+	"Dispatch `soak-long` from the immutable tag",
+	"`refs/tags/h7-batch-delivery-<candidate-sha>` with duration_hours=2,",
+	"runner_type=self-hosted, runner_mode=dedicated, segment_index=1,",
+	"segment_count=1, datagram_batch=64, rss_ceiling_mb=1750,",
+	"committed_abort_mb=2200, and heap_debug=0. The run identity is",
+	"`soak-long-<campaign_seed>`.",
+	"",
+	"The workload is fixed and preregistered: runner_profile=h7-fixed-large,",
+	"sessions=500, datagrams_per_sec=500, streams_per_sec=5. The runner must",
+	"provide at least 5 CPUs and 8 GiB of memory; an under-capacity runner",
+	"fails closed rather than downscaling the load, because a downscaled run is",
+	"evidence for a different workload than the claim names.",
+	"",
+	"Acceptance is the fail-closed `verify-h7-hosted` mode run against the same",
+	"candidate SHA. This lane supplements the release soak policy: it",
+	"does not replace the 24h/72h release soak.",
+].join("\n");
+
+/** Every token the policy must require in all three operator docs. */
+const H7_REQUIRED_TOKENS = [
+	"H7 hosted closure lane",
+	"duration_hours=2",
+	"runner_type=self-hosted",
+	"runner_mode=dedicated",
+	"datagram_batch=64",
+	"rss_ceiling_mb=1750",
+	"soak-long-<campaign_seed>",
+	"runner_profile=h7-fixed-large",
+	"sessions=500",
+	"datagrams_per_sec=500",
+	"streams_per_sec=5",
+	"at least 5 CPUs and 8 GiB",
+	"fails closed rather than downscaling",
+	"refs/tags/h7-batch-delivery-<candidate-sha>",
+	"verify-h7-hosted",
+	"does not replace the 24h/72h release soak",
+] as const;
+
+const H7_DOCS = [
+	"docs/CI.md",
+	"docs/RELEASE_CHECKLIST.md",
+	"tools/load/README.md",
+] as const;
+
 type Fixture = ReturnType<typeof validStatus>;
 
 afterEach(() => {
@@ -85,6 +133,7 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 	mkdirSync(join(root, "crates", "native", "src"), { recursive: true });
 	mkdirSync(join(root, ".release-evidence"), { recursive: true });
 	mkdirSync(join(root, "packages", "webtransport"), { recursive: true });
+	mkdirSync(join(root, "tools", "load"), { recursive: true });
 
 	const fixture = validStatus();
 	writeFileSync(
@@ -131,11 +180,33 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 	);
 	writeFileSync(
 		join(root, "docs", "CI.md"),
-		"The release blocks on fuzz and package-consumers.",
+		[
+			"The release blocks on fuzz and package-consumers.",
+			"The soak-long workflow offers 1h/2h/24h/72h modes.",
+			"",
+			H7_CONTRACT,
+		].join("\n"),
 	);
 	writeFileSync(
 		join(root, "docs", "RELEASE_CHECKLIST.md"),
-		"Required release gates: fuzz and package-consumers.",
+		[
+			"Required release gates: fuzz and package-consumers.",
+			"GitHub-hosted campaigns use segment_count=5 for 24h and",
+			"segment_count=15 for 72h; self-hosted 24h and 72h campaigns use",
+			"segment_count=1.",
+			"",
+			H7_CONTRACT,
+		].join("\n"),
+	);
+	writeFileSync(
+		join(root, "tools", "load", "README.md"),
+		[
+			"`soak.ts` is a legacy local diagnostic (30-minute, 500-session) and is",
+			"not part of any hosted campaign.",
+			"The soak-long workflow offers 1h/2h/24h/72h modes.",
+			"",
+			H7_CONTRACT,
+		].join("\n"),
 	);
 	writeFileSync(
 		join(root, "docs", "RELEASE_1.0_HARDENING_PLAN.md"),
@@ -491,6 +562,151 @@ describe("documentation truth policy", () => {
 		);
 		expect(result.stderr).toContain(
 			"packages/webtransport/README.md: must include the release-truth phrase: Support is claimed only after",
+		);
+	});
+});
+
+function rewriteDoc(
+	root: string,
+	doc: string,
+	edit: (text: string) => string,
+): void {
+	const path = join(root, ...doc.split("/"));
+	writeFileSync(path, edit(readFileSync(path, "utf8")));
+}
+
+describe("hosted H7 operator documentation policy", () => {
+	it("accepts the shared H7 closure-lane contract across all three operator docs", () => {
+		const result = runPolicy();
+		expect(result.status, result.stderr).toBe(0);
+	});
+
+	for (const doc of H7_DOCS) {
+		for (const token of H7_REQUIRED_TOKENS) {
+			it(`rejects ${doc} when it drops the required H7 text: ${token}`, () => {
+				const result = runPolicy((_fixture, root) => {
+					rewriteDoc(root, doc, (text) => text.replaceAll(token, ""));
+				});
+				expect(result.status).toBe(1);
+				expect(result.stderr).toContain(
+					`${doc}: H7 hosted closure lane contract is missing required text: ${token}`,
+				);
+			});
+		}
+	}
+
+	for (const doc of ["docs/CI.md", "tools/load/README.md"] as const) {
+		it(`rejects ${doc} when it keeps an exclusive 1h/24h/72h soak-long mode list`, () => {
+			const result = runPolicy((_fixture, root) => {
+				rewriteDoc(root, doc, (text) =>
+					text.replace("1h/2h/24h/72h", "1h/24h/72h"),
+				);
+			});
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain(
+				`${doc}: soak-long mode list "1h/24h/72h" omits the 2-hour H7 hosted closure lane`,
+			);
+		});
+	}
+
+	it("rejects a release checklist that drops the H7 non-substitution sentence", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(root, "docs/RELEASE_CHECKLIST.md", (text) =>
+				text.replace(
+					"does not replace the 24h/72h release soak",
+					"replaces the 24h/72h release soak",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"docs/RELEASE_CHECKLIST.md: H7 hosted closure lane contract is missing required text: does not replace the 24h/72h release soak",
+		);
+	});
+
+	it("rejects a 30-minute local diagnostic advertised as H7 evidence", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(
+				root,
+				"tools/load/README.md",
+				(text) =>
+					`${text}\nThe 30-minute soak.ts run is acceptable H7 evidence.\n`,
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"tools/load/README.md: the local soak.ts diagnostic must not be described as H7, release, or soak-long evidence",
+		);
+	});
+
+	it("rejects a nightly local diagnostic advertised as release evidence", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(
+				root,
+				"tools/load/README.md",
+				(text) => `${text}\nThe nightly soak doubles as release evidence.\n`,
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"tools/load/README.md: the local soak.ts diagnostic must not be described as H7, release, or soak-long evidence",
+		);
+	});
+
+	it("rejects a load README that never labels soak.ts a legacy local diagnostic", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(root, "tools/load/README.md", (text) =>
+				text.replace("legacy local diagnostic", "supported soak path"),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"tools/load/README.md: must label the 30-minute soak.ts path a legacy local diagnostic",
+		);
+	});
+
+	it("rejects the stale self-hosted segment_count=4|12 campaign wording", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(root, "docs/RELEASE_CHECKLIST.md", (text) =>
+				text.replace(
+					"self-hosted 24h and 72h campaigns use\nsegment_count=1.",
+					"on self-hosted runners use segment_count=4 or segment_count=12.",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			'docs/RELEASE_CHECKLIST.md: contradicts the workflow-enforced self-hosted segmentation: "segment_count=4"',
+		);
+		expect(result.stderr).toContain(
+			"docs/RELEASE_CHECKLIST.md: must state that self-hosted 24h and 72h campaigns use segment_count=1",
+		);
+	});
+
+	it("rejects stale 4x6h/12x6h self-hosted segment wording", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(
+				root,
+				"docs/RELEASE_CHECKLIST.md",
+				(text) =>
+					`${text}\nThe workflow uses bounded 4x6h or 12x6h segments on self-hosted runners.\n`,
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			'docs/RELEASE_CHECKLIST.md: contradicts the workflow-enforced self-hosted segmentation: "4x6h"',
+		);
+	});
+
+	it("rejects a release checklist that drops GitHub-hosted 5/15 segmentation", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(root, "docs/RELEASE_CHECKLIST.md", (text) =>
+				text.replace("segment_count=15", "segment_count=16"),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"docs/RELEASE_CHECKLIST.md: must retain the GitHub-hosted segmentation value segment_count=15",
 		);
 	});
 });
