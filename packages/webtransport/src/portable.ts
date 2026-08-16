@@ -66,11 +66,12 @@ export interface PortableServerSession {
 	 * consumer abandons the iterator mid-batch, and at close time discards
 	 * rather than drains whatever is still queued natively (drop-not-drain;
 	 * effective buffering is `2048 + max` per server session and `256 + max`
-	 * per client session). Wasm is not batched: its
-	 * Web Streams queue still surfaces chunks that were already enqueued when
-	 * the session closed. How much tail you see on a clean peer close therefore
-	 * depends on the configured native batch size, and no count is guaranteed
-	 * on either backend.
+	 * per client session). Wasm is not batched, but it is not a draining
+	 * backend either: its `close()` releases its own pending datagram backlog
+	 * before closing the stream controller, so only a chunk already handed to
+	 * that controller can still surface. How much tail you see on a clean peer
+	 * close therefore depends on the configured native batch size, and no
+	 * count is guaranteed on either backend.
 	 *
 	 * See `docs/SPEC.md` ("Incoming datagram delivery") for the full contract
 	 * and `docs/PARITY_MATRIX.md` for the per-backend bounds.

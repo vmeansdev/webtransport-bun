@@ -77,6 +77,11 @@ fails closed on an identity mismatch. Diagnostics
 (`WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS=1`) are a measurement aid: the floor,
 bandwidth, scale, and hosted-soak lanes refuse a diagnostics-enabled run.
 
+Landing order: the unit/lifecycle and churn lanes run today. The batch=4
+Chromium test and its report verifier arrive with Task 6, the floor bench with
+Task 7, `BENCH_ECHO` and the bandwidth comparator with Task 8, the napi-growth
+harness with Task 9, and the hosted 2-hour lane executes in Task 10.
+
 ### Unit and lifecycle (no artifacts)
 
 ```bash
