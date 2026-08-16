@@ -196,6 +196,24 @@ export type IngestGap = {
 	stopBucket: IngestGapBucket;
 };
 
+export type PipeCapBucket =
+	| "server-ingest"
+	| "cc"
+	| "client-cpu"
+	| "unexplained"
+	| "incomplete";
+
+export type PipeCap = {
+	frameTxPerSec: number | null;
+	ingestedPerSec: number;
+	predictedPps: number | null;
+	bdpBps: number | null;
+	clientCpuCores: number | null;
+	congPerSec: number | null;
+	bytesPerDatagram: number | null;
+	stopBucket: PipeCapBucket;
+};
+
 export type ArmRun = {
 	label: string;
 	round: number;
@@ -250,6 +268,7 @@ export type ArmRun = {
 		cpuAfter: Record<string, number>;
 	};
 	gap: IngestGap;
+	pipeCap: PipeCap;
 };
 
 export function median(values: number[]): number {
@@ -312,13 +331,19 @@ export function dirtyPaths(porcelain: string): string[] {
 }
 
 export const SENT_PROGRESS_RE =
-	/^load-client: t_ms=(\d+) sent=(\d+)(?: frame_tx_datagram=(\d+) udp_tx=(\d+))?\s*$/gm;
+	/^load-client: t_ms=(\d+) sent=(\d+)(?: frame_tx_datagram=(\d+) udp_tx=(\d+)(?: udp_tx_bytes=(\d+) cwnd=(\d+) rtt_us=(\d+) cong=(\d+) bdp_bps=(\d+) cpu_ms=(\d+))?)?\s*$/gm;
 
 export type SentProgressSample = {
 	tMs: number;
 	sent: number;
 	frameTxDatagram: number | null;
 	udpTx: number | null;
+	udpTxBytes: number | null;
+	cwnd: number | null;
+	rttUs: number | null;
+	cong: number | null;
+	bdpBps: number | null;
+	cpuMs: number | null;
 };
 
 export type WindowSentDelta = {
@@ -330,7 +355,20 @@ export type WindowSentDelta = {
 	frameTx1: number | null;
 	udpTx0: number | null;
 	udpTx1: number | null;
+	udpTxBytes0: number | null;
+	udpTxBytes1: number | null;
+	cong0: number | null;
+	cong1: number | null;
+	cpuMs0: number | null;
+	cpuMs1: number | null;
+	cwnd1: number | null;
+	rttUs1: number | null;
+	bdpBps1: number | null;
 };
+
+function optionalInt(value: string | undefined): number | null {
+	return value == null ? null : Number.parseInt(value, 10);
+}
 
 export function parseLoadClientSentProgress(
 	text: string,
@@ -340,8 +378,14 @@ export function parseLoadClientSentProgress(
 		samples.push({
 			tMs: Number.parseInt(match[1] ?? "0", 10),
 			sent: Number.parseInt(match[2] ?? "0", 10),
-			frameTxDatagram: match[3] == null ? null : Number.parseInt(match[3], 10),
-			udpTx: match[4] == null ? null : Number.parseInt(match[4], 10),
+			frameTxDatagram: optionalInt(match[3]),
+			udpTx: optionalInt(match[4]),
+			udpTxBytes: optionalInt(match[5]),
+			cwnd: optionalInt(match[6]),
+			rttUs: optionalInt(match[7]),
+			cong: optionalInt(match[8]),
+			bdpBps: optionalInt(match[9]),
+			cpuMs: optionalInt(match[10]),
 		});
 	}
 	return samples;
@@ -364,6 +408,13 @@ export function windowSentDelta(
 	const frameTxPresent =
 		t0Sample.frameTxDatagram != null && t1Sample.frameTxDatagram != null;
 	const udpTxPresent = t0Sample.udpTx != null && t1Sample.udpTx != null;
+	const pipePresent =
+		t0Sample.udpTxBytes != null &&
+		t1Sample.udpTxBytes != null &&
+		t0Sample.cong != null &&
+		t1Sample.cong != null &&
+		t0Sample.cpuMs != null &&
+		t1Sample.cpuMs != null;
 	return {
 		sent0: t0Sample.sent,
 		sent1: t1Sample.sent,
@@ -373,6 +424,15 @@ export function windowSentDelta(
 		frameTx1: frameTxPresent ? t1Sample.frameTxDatagram : null,
 		udpTx0: udpTxPresent ? t0Sample.udpTx : null,
 		udpTx1: udpTxPresent ? t1Sample.udpTx : null,
+		udpTxBytes0: pipePresent ? t0Sample.udpTxBytes : null,
+		udpTxBytes1: pipePresent ? t1Sample.udpTxBytes : null,
+		cong0: pipePresent ? t0Sample.cong : null,
+		cong1: pipePresent ? t1Sample.cong : null,
+		cpuMs0: pipePresent ? t0Sample.cpuMs : null,
+		cpuMs1: pipePresent ? t1Sample.cpuMs : null,
+		cwnd1: t1Sample.cwnd,
+		rttUs1: t1Sample.rttUs,
+		bdpBps1: t1Sample.bdpBps,
 	};
 }
 
@@ -491,6 +551,127 @@ export function sumWindowUdpTxPerSec(
 ): number | null {
 	return sumWindowCounterPerSec(clientStdouts, warmupMs, measureMs, (d) =>
 		d.udpTx0 != null && d.udpTx1 != null ? { a: d.udpTx0, b: d.udpTx1 } : null,
+	);
+}
+
+export function sumWindowUdpTxBytesPerSec(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	return sumWindowCounterPerSec(clientStdouts, warmupMs, measureMs, (d) =>
+		d.udpTxBytes0 != null && d.udpTxBytes1 != null
+			? { a: d.udpTxBytes0, b: d.udpTxBytes1 }
+			: null,
+	);
+}
+
+export function sumWindowCongPerSec(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	return sumWindowCounterPerSec(clientStdouts, warmupMs, measureMs, (d) =>
+		d.cong0 != null && d.cong1 != null ? { a: d.cong0, b: d.cong1 } : null,
+	);
+}
+
+export function sumWindowClientCpuCores(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	const msPerSec = sumWindowCounterPerSec(
+		clientStdouts,
+		warmupMs,
+		measureMs,
+		(d) =>
+			d.cpuMs0 != null && d.cpuMs1 != null
+				? { a: d.cpuMs0, b: d.cpuMs1 }
+				: null,
+	);
+	return msPerSec == null ? null : msPerSec / 1000;
+}
+
+export function sumWindowBdpBps(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	let sum = 0;
+	let any = false;
+	for (const text of clientStdouts) {
+		const delta = windowSentDelta(
+			parseLoadClientSentProgress(text),
+			warmupMs,
+			measureMs,
+		);
+		if (!delta || delta.bdpBps1 == null) continue;
+		any = true;
+		sum += delta.bdpBps1;
+	}
+	return any ? sum : null;
+}
+
+export function classifyPipeCap(input: {
+	frameTxPerSec: number | null;
+	ingestedPerSec: number;
+	bdpBps: number | null;
+	udpTxBytesPerSec: number | null;
+	clientCpuCores: number | null;
+	congPerSec: number | null;
+}): PipeCap {
+	const frameTx = input.frameTxPerSec;
+	const bytesPerDatagram =
+		frameTx != null &&
+		frameTx > 0 &&
+		input.udpTxBytesPerSec != null &&
+		input.udpTxBytesPerSec > 0
+			? input.udpTxBytesPerSec / frameTx
+			: null;
+	const predictedPps =
+		input.bdpBps != null && bytesPerDatagram != null && bytesPerDatagram > 0
+			? input.bdpBps / bytesPerDatagram
+			: null;
+
+	let stopBucket: PipeCapBucket;
+	if (frameTx == null || input.bdpBps == null) {
+		stopBucket = "incomplete";
+	} else if (input.ingestedPerSec < 0.9 * frameTx) {
+		stopBucket = "server-ingest";
+	} else if (predictedPps != null && predictedPps <= 1.15 * frameTx) {
+		stopBucket = "cc";
+	} else if (
+		predictedPps != null &&
+		predictedPps > 1.25 * frameTx &&
+		input.clientCpuCores != null &&
+		input.clientCpuCores >= 1.5
+	) {
+		stopBucket = "client-cpu";
+	} else {
+		stopBucket = "unexplained";
+	}
+
+	return {
+		frameTxPerSec: frameTx,
+		ingestedPerSec: input.ingestedPerSec,
+		predictedPps,
+		bdpBps: input.bdpBps,
+		clientCpuCores: input.clientCpuCores,
+		congPerSec: input.congPerSec,
+		bytesPerDatagram,
+		stopBucket,
+	};
+}
+
+export function formatPipeCapLine(pipe: PipeCap): string {
+	const n = (value: number | null): string =>
+		value == null ? "n/a" : String(Math.round(value));
+	return (
+		`pipe: frameTx=${n(pipe.frameTxPerSec)} ingest=${Math.round(pipe.ingestedPerSec)} ` +
+		`predicted=${n(pipe.predictedPps)} bdpBps=${n(pipe.bdpBps)} ` +
+		`clientCpu=${pipe.clientCpuCores == null ? "n/a" : pipe.clientCpuCores.toFixed(2)} ` +
+		`cong=${n(pipe.congPerSec)} STOP=${pipe.stopBucket}`
 	);
 }
 
@@ -875,6 +1056,26 @@ async function runChild(
 		udpTxPerSec,
 		windowSec: windowMs / 1000,
 	});
+	const pipeCap = classifyPipeCap({
+		frameTxPerSec: frameTxDatagramPerSec,
+		ingestedPerSec,
+		bdpBps: sumWindowBdpBps(stdout, WARMUP_SEC * 1_000, MEASURE_SEC * 1_000),
+		udpTxBytesPerSec: sumWindowUdpTxBytesPerSec(
+			stdout,
+			WARMUP_SEC * 1_000,
+			MEASURE_SEC * 1_000,
+		),
+		clientCpuCores: sumWindowClientCpuCores(
+			stdout,
+			WARMUP_SEC * 1_000,
+			MEASURE_SEC * 1_000,
+		),
+		congPerSec: sumWindowCongPerSec(
+			stdout,
+			WARMUP_SEC * 1_000,
+			MEASURE_SEC * 1_000,
+		),
+	});
 
 	// Window delta, so a thread that only worked during warmup does not count as
 	// having carried load.
@@ -941,6 +1142,7 @@ async function runChild(
 			cpuAfter: timingKeys(probe1),
 		},
 		gap,
+		pipeCap,
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);

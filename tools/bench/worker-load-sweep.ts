@@ -43,7 +43,9 @@ import { classify, threadRows } from "./thread-profile.ts";
 import {
 	dirtyPaths,
 	formatGapLine,
+	formatPipeCapLine,
 	type IngestGap,
+	type PipeCap,
 	makeRng,
 	median,
 	shuffled,
@@ -152,6 +154,7 @@ export type SweepRun = {
 	clientSendErrors: number;
 	threads: { label: string; cores: number; datagrams: number }[];
 	gap: IngestGap | null;
+	pipeCap: PipeCap | null;
 };
 
 function gitOutput(args: string[]): string {
@@ -247,6 +250,7 @@ async function runOne(
 				datagrams: r.datagrams,
 			})),
 			gap: run.gap ?? null,
+			pipeCap: run.pipeCap ?? null,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -558,8 +562,9 @@ async function main(): Promise<void> {
 				`${String(s.datagramThreads).padStart(5)}${s.requestMet ? "" : "  (request not met)"}`,
 		);
 		for (const r of s.runs) {
-			if (!r.gap) continue;
-			console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
+			if (r.gap) console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
+			if (r.pipeCap)
+				console.log(`  ${s.key} r${r.round} ${formatPipeCapLine(r.pipeCap)}`);
 		}
 	}
 	const withDrops = summaries.filter((s) => s.droppedPct > 0.05);

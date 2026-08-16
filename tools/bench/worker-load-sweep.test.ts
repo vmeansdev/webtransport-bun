@@ -310,6 +310,7 @@ describe("classifyWaitVsDrop", () => {
 					unexplainedPerSec: 0,
 					stopBucket: "unexplained",
 				},
+				pipeCap: null,
 			},
 		],
 	});

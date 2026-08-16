@@ -6,6 +6,7 @@ import {
 	type ArmSummary,
 	artifactSuffix,
 	classifyIngestGap,
+	classifyPipeCap,
 	dirtyPaths,
 	formatGapLine,
 	makeRng,
@@ -67,6 +68,16 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 			udpTxPerSec: null,
 			unexplainedPerSec: 90_000,
 			stopBucket: "unexplained",
+		},
+		pipeCap: {
+			frameTxPerSec: null,
+			ingestedPerSec: 50_000,
+			predictedPps: null,
+			bdpBps: null,
+			clientCpuCores: null,
+			congPerSec: null,
+			bytesPerDatagram: null,
+			stopBucket: "incomplete",
 		},
 		workerProof: {
 			configured: 2,
@@ -220,9 +231,42 @@ describe("parseLoadClientSentProgress", () => {
 			"datagrams sent=150000 err=0",
 		].join("\n");
 		expect(parseLoadClientSentProgress(stdout)).toEqual([
-			{ tMs: 0, sent: 0, frameTxDatagram: null, udpTx: null },
-			{ tMs: 1000, sent: 50_000, frameTxDatagram: null, udpTx: null },
-			{ tMs: 2000, sent: 100_000, frameTxDatagram: null, udpTx: null },
+			{
+				tMs: 0,
+				sent: 0,
+				frameTxDatagram: null,
+				udpTx: null,
+				udpTxBytes: null,
+				cwnd: null,
+				rttUs: null,
+				cong: null,
+				bdpBps: null,
+				cpuMs: null,
+			},
+			{
+				tMs: 1000,
+				sent: 50_000,
+				frameTxDatagram: null,
+				udpTx: null,
+				udpTxBytes: null,
+				cwnd: null,
+				rttUs: null,
+				cong: null,
+				bdpBps: null,
+				cpuMs: null,
+			},
+			{
+				tMs: 2000,
+				sent: 100_000,
+				frameTxDatagram: null,
+				udpTx: null,
+				udpTxBytes: null,
+				cwnd: null,
+				rttUs: null,
+				cong: null,
+				bdpBps: null,
+				cpuMs: null,
+			},
 		]);
 	});
 
@@ -232,7 +276,39 @@ describe("parseLoadClientSentProgress", () => {
 				"load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000",
 			),
 		).toEqual([
-			{ tMs: 1000, sent: 50_000, frameTxDatagram: 40_000, udpTx: 41_000 },
+			{
+				tMs: 1000,
+				sent: 50_000,
+				frameTxDatagram: 40_000,
+				udpTx: 41_000,
+				udpTxBytes: null,
+				cwnd: null,
+				rttUs: null,
+				cong: null,
+				bdpBps: null,
+				cpuMs: null,
+			},
+		]);
+	});
+
+	test("parses pipe-cap path and cpu fields", () => {
+		expect(
+			parseLoadClientSentProgress(
+				"load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000 udp_tx_bytes=50000000 cwnd=120000 rtt_us=250 cong=3 bdp_bps=480000000 cpu_ms=900",
+			),
+		).toEqual([
+			{
+				tMs: 1000,
+				sent: 50_000,
+				frameTxDatagram: 40_000,
+				udpTx: 41_000,
+				udpTxBytes: 50_000_000,
+				cwnd: 120_000,
+				rttUs: 250,
+				cong: 3,
+				bdpBps: 480_000_000,
+				cpuMs: 900,
+			},
 		]);
 	});
 });
@@ -278,6 +354,15 @@ describe("windowSentDelta", () => {
 			frameTx1: null,
 			udpTx0: null,
 			udpTx1: null,
+			udpTxBytes0: null,
+			udpTxBytes1: null,
+			cong0: null,
+			cong1: null,
+			cpuMs0: null,
+			cpuMs1: null,
+			cwnd1: null,
+			rttUs1: null,
+			bdpBps1: null,
 		});
 	});
 
@@ -297,6 +382,15 @@ describe("windowSentDelta", () => {
 			frameTx1: 160_000,
 			udpTx0: 41_000,
 			udpTx1: 165_000,
+			udpTxBytes0: null,
+			udpTxBytes1: null,
+			cong0: null,
+			cong1: null,
+			cpuMs0: null,
+			cpuMs1: null,
+			cwnd1: null,
+			rttUs1: null,
+			bdpBps1: null,
 		});
 	});
 
@@ -632,5 +726,48 @@ describe("artifact naming", () => {
 				streamsPerSec: 10,
 			}),
 		).toBe("-c3-streams10");
+	});
+});
+
+describe("classifyPipeCap", () => {
+	const base = {
+		frameTxPerSec: 108_000 as number | null,
+		ingestedPerSec: 105_000,
+		bdpBps: 500_000_000 as number | null,
+		udpTxBytesPerSec: 130_000_000 as number | null,
+		clientCpuCores: 0.8 as number | null,
+		congPerSec: 0 as number | null,
+	};
+
+	test("ingest short of frame_tx is server-ingest", () => {
+		expect(
+			classifyPipeCap({ ...base, ingestedPerSec: 80_000 }).stopBucket,
+		).toBe("server-ingest");
+	});
+
+	test("predicted pps without 15% headroom is cc", () => {
+		expect(
+			classifyPipeCap({
+				...base,
+				bdpBps: 120_000_000,
+				udpTxBytesPerSec: 130_000_000,
+			}).stopBucket,
+		).toBe("cc");
+	});
+
+	test("bdp headroom plus hot client is client-cpu", () => {
+		expect(classifyPipeCap({ ...base, clientCpuCores: 1.8 }).stopBucket).toBe(
+			"client-cpu",
+		);
+	});
+
+	test("bdp headroom without hot client is unexplained", () => {
+		expect(classifyPipeCap(base).stopBucket).toBe("unexplained");
+	});
+
+	test("missing bdp is incomplete", () => {
+		expect(classifyPipeCap({ ...base, bdpBps: null }).stopBucket).toBe(
+			"incomplete",
+		);
 	});
 });
