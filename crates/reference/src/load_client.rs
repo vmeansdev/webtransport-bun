@@ -2,7 +2,7 @@
 //! Used by tools/load for CI and soak tests.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
 use wtransport::error::StreamWriteError;
@@ -244,8 +244,21 @@ fn next_probe_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn format_sent_progress(t_ms: u64, sent: u64) -> String {
-    format!("load-client: t_ms={t_ms} sent={sent}")
+fn format_sent_progress(t_ms: u64, sent: u64, frame_tx_datagram: u64, udp_tx: u64) -> String {
+    format!(
+        "load-client: t_ms={t_ms} sent={sent} frame_tx_datagram={frame_tx_datagram} udp_tx={udp_tx}"
+    )
+}
+
+fn sum_quic_tx(conns: &[wtransport::Connection]) -> (u64, u64) {
+    let mut frame_tx = 0u64;
+    let mut udp_tx = 0u64;
+    for conn in conns {
+        let stats = conn.quic_connection().stats();
+        frame_tx += stats.frame_tx.datagram;
+        udp_tx += stats.udp_tx.datagrams;
+    }
+    (frame_tx, udp_tx)
 }
 
 fn load_summary_json(mode: ClientMode, counters: &Counters) -> String {
@@ -425,8 +438,10 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     match mode {
         ClientMode::Load => {
             let started = Instant::now();
-            println!("{}", format_sent_progress(0, 0));
+            let live = Arc::new(Mutex::new(Vec::<wtransport::Connection>::new()));
+            println!("{}", format_sent_progress(0, 0, 0, 0));
             let progress_counters = Arc::clone(&counters);
+            let progress_live = Arc::clone(&live);
             let progress = tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(1));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -435,7 +450,11 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                     ticker.tick().await;
                     let t_ms = started.elapsed().as_millis() as u64;
                     let sent = progress_counters.datagrams_sent.load(Ordering::Relaxed);
-                    println!("{}", format_sent_progress(t_ms, sent));
+                    let (frame_tx, udp_tx) = {
+                        let guard = progress_live.lock().unwrap_or_else(|e| e.into_inner());
+                        sum_quic_tx(&guard)
+                    };
+                    println!("{}", format_sent_progress(t_ms, sent, frame_tx, udp_tx));
                 }
             });
             let mut handles = Vec::with_capacity(num_sessions);
@@ -443,6 +462,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                 let url = url.to_string();
                 let endpoint = Arc::clone(&endpoint);
                 let counters = Arc::clone(&counters);
+                let live = Arc::clone(&live);
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -450,6 +470,10 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                     match endpoint.connect(&url).await {
                         Ok(conn) => {
                             counters.sessions_ok.fetch_add(1, Ordering::Relaxed);
+                            {
+                                let mut guard = live.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.push(conn.clone());
+                            }
                             if !skip_probes {
                                 run_probe_suite(&conn, counters.as_ref()).await;
                             }
@@ -755,10 +779,13 @@ mod tests {
 
     #[test]
     fn format_sent_progress_matches_parser_line() {
-        assert_eq!(format_sent_progress(0, 0), "load-client: t_ms=0 sent=0");
         assert_eq!(
-            format_sent_progress(1000, 50_000),
-            "load-client: t_ms=1000 sent=50000"
+            format_sent_progress(0, 0, 0, 0),
+            "load-client: t_ms=0 sent=0 frame_tx_datagram=0 udp_tx=0"
+        );
+        assert_eq!(
+            format_sent_progress(1000, 50_000, 40_000, 41_000),
+            "load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000"
         );
     }
 
