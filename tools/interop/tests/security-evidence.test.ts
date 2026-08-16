@@ -10,9 +10,11 @@ import {
 } from "../evidence-privacy.ts";
 import EvidenceSanitizer from "../evidence-sanitizer.ts";
 import {
+	H7_TEST_TITLE,
 	isInteropReport,
 	verifyDocumentPrivacy,
 	verifyEvidenceDocument,
+	verifyH7PlaywrightReport,
 	verifyInteropSchema,
 } from "../verify-evidence.ts";
 import {
@@ -61,6 +63,37 @@ describe("interop evidence security boundary", () => {
 			WEBTRANSPORT_INTEROP_QUIC_PORT: "4433",
 			WEBTRANSPORT_INTEROP_HEALTH_PORT: "4434",
 		});
+	});
+
+	// The server-env policy is duplicated on purpose: the launcher decides what
+	// reaches the addon server, the verifier decides what may appear in
+	// published evidence. A knob added to only one of them either never reaches
+	// the server or gets the evidence rejected, so both halves are pinned here.
+	it("forwards the H7 datagram batch knob to the interop server", () => {
+		expect(
+			buildInteropWebServerEnv({ WEBTRANSPORT_DATAGRAM_BATCH: "4" }),
+		).toEqual({ WEBTRANSPORT_DATAGRAM_BATCH: "4" });
+	});
+
+	it("accepts the H7 datagram batch knob in published evidence", () => {
+		expect(() =>
+			verifyEvidenceDocument({
+				config: { webServer: { env: { WEBTRANSPORT_DATAGRAM_BATCH: "4" } } },
+			}),
+		).not.toThrow();
+	});
+
+	it("drops an undocumented key at the launcher and rejects it in evidence", () => {
+		expect(
+			buildInteropWebServerEnv({ WEBTRANSPORT_DATAGRAM_BATCH_TURBO: "9" }),
+		).toEqual({});
+		expect(() =>
+			verifyEvidenceDocument({
+				config: {
+					webServer: { env: { WEBTRANSPORT_DATAGRAM_BATCH_TURBO: "9" } },
+				},
+			}),
+		).toThrow(/unexpected environment key/i);
 	});
 
 	it("uses the current Bun executable instead of PATH lookup", () => {
@@ -254,6 +287,242 @@ describe("whole-document evidence privacy walk", () => {
 				command: "bun run wasm-server.ts",
 			}),
 		).toEqual([]);
+	});
+});
+
+describe("H7 Playwright report verification", () => {
+	type ResultFixture = { status: string };
+	type TestFixture = { status: string; results: ResultFixture[] };
+	type SpecFixture = { title: string; ok: boolean; tests: TestFixture[] };
+	type SuiteFixture = {
+		title: string;
+		specs: SpecFixture[];
+		suites?: SuiteFixture[];
+	};
+	type ReportFixture = {
+		config: unknown;
+		errors: unknown[];
+		stats?: {
+			expected: number;
+			skipped: number;
+			unexpected: number;
+			flaky: number;
+		};
+		suites: SuiteFixture[];
+	};
+
+	/** The shape Playwright's JSON reporter writes for a single passing case. */
+	function h7Report(): ReportFixture {
+		return {
+			config: { webServer: { env: { WEBTRANSPORT_DATAGRAM_BATCH: "4" } } },
+			errors: [],
+			stats: { expected: 1, skipped: 0, unexpected: 0, flaky: 0 },
+			suites: [
+				{
+					title: "h7-datagram-batch.pw.ts",
+					specs: [
+						{
+							title: H7_TEST_TITLE,
+							ok: true,
+							tests: [{ status: "expected", results: [{ status: "passed" }] }],
+						},
+					],
+				},
+			],
+		};
+	}
+
+	type Mutate = (report: ReportFixture) => void;
+
+	function mutated(mutate: Mutate): ReportFixture {
+		const report = h7Report();
+		mutate(report);
+		return report;
+	}
+
+	/** Non-null accessors so a fixture typo fails loudly instead of silently
+	 * mutating `undefined` into a passing "rejection". */
+	function onlySuite(report: ReportFixture): SuiteFixture {
+		const suite = report.suites[0];
+		if (!suite) throw new Error("fixture lost its suite");
+		return suite;
+	}
+
+	function onlySpec(report: ReportFixture): SpecFixture {
+		const spec = onlySuite(report).specs[0];
+		if (!spec) throw new Error("fixture lost its spec");
+		return spec;
+	}
+
+	function onlyTest(report: ReportFixture): TestFixture {
+		const entry = onlySpec(report).tests[0];
+		if (!entry) throw new Error("fixture lost its test entry");
+		return entry;
+	}
+
+	function onlyResult(report: ReportFixture): ResultFixture {
+		const result = onlyTest(report).results[0];
+		if (!result) throw new Error("fixture lost its result");
+		return result;
+	}
+
+	it("accepts a report with exactly one passing H7 case", () => {
+		expect(() => verifyH7PlaywrightReport(h7Report())).not.toThrow();
+	});
+
+	const rejections: ReadonlyArray<readonly [string, Mutate, RegExp]> = [
+		[
+			"a report with no suites array",
+			(r) => Reflect.deleteProperty(r, "suites"),
+			/suites/i,
+		],
+		[
+			"a second discovered case in the same suite",
+			(r) => onlySuite(r).specs.push({ ...onlySpec(r) }),
+			/exactly one test case/i,
+		],
+		[
+			"a second case hidden in a nested suite",
+			(r) => {
+				onlySuite(r).suites = [{ title: "inner", specs: [onlySpec(r)] }];
+			},
+			/exactly one test case/i,
+		],
+		[
+			"zero discovered cases",
+			(r) => {
+				onlySuite(r).specs = [];
+			},
+			/exactly one test case/i,
+		],
+		[
+			"a mismatched title",
+			(r) => {
+				onlySpec(r).title = "H7 batch=4 delivers something else";
+			},
+			/title/i,
+		],
+		[
+			"a case with no test entry",
+			(r) => {
+				onlySpec(r).tests = [];
+			},
+			/exactly one executed/i,
+		],
+		[
+			"a retried case with two results",
+			(r) => onlyTest(r).results.push({ status: "passed" }),
+			/exactly one executed/i,
+		],
+		[
+			"a failed spec flag",
+			(r) => {
+				onlySpec(r).ok = false;
+			},
+			/\bok\b/i,
+		],
+		["reporter errors", (r) => (r.errors = [{ message: "boom" }]), /errors/i],
+		[
+			"a missing stats block",
+			(r) => Reflect.deleteProperty(r, "stats"),
+			/stats/i,
+		],
+		[
+			"stats.expected other than one",
+			(r) => {
+				if (r.stats) r.stats.expected = 2;
+			},
+			/stats\.expected/i,
+		],
+		[
+			"a skipped count",
+			(r) => {
+				if (r.stats) r.stats.skipped = 1;
+			},
+			/stats\.skipped/i,
+		],
+		[
+			"an unexpected count",
+			(r) => {
+				if (r.stats) r.stats.unexpected = 1;
+			},
+			/stats\.unexpected/i,
+		],
+		[
+			"a flaky count",
+			(r) => {
+				if (r.stats) r.stats.flaky = 1;
+			},
+			/stats\.flaky/i,
+		],
+	];
+
+	for (const [label, mutate, pattern] of rejections) {
+		it(`rejects ${label}`, () => {
+			expect(() => verifyH7PlaywrightReport(mutated(mutate))).toThrow(pattern);
+		});
+	}
+
+	// A suite-level skip surfaces as a non-`passed` result status rather than an
+	// absent case, which is exactly why the reporter — not the source scan — is
+	// the authoritative executed count.
+	for (const status of ["skipped", "failed", "timedOut", "interrupted"]) {
+		it(`rejects a result whose status is ${status}`, () => {
+			expect(() =>
+				verifyH7PlaywrightReport(
+					mutated((r) => {
+						onlyResult(r).status = status;
+					}),
+				),
+			).toThrow(/result status/i);
+		});
+	}
+
+	for (const status of ["skipped", "unexpected", "flaky"]) {
+		it(`rejects a test entry whose status is ${status}`, () => {
+			expect(() =>
+				verifyH7PlaywrightReport(
+					mutated((r) => {
+						onlyTest(r).status = status;
+					}),
+				),
+			).toThrow(/test status/i);
+		});
+	}
+});
+
+describe("H7 interop test source constraints", () => {
+	const source = readFileSync(
+		resolve(import.meta.dir, "h7-datagram-batch.pw.ts"),
+		"utf8",
+	);
+
+	it("declares exactly one test, under the title the verifier enforces", () => {
+		expect(source).toContain(H7_TEST_TITLE);
+		expect(source.match(/^test\(/gm) ?? []).toHaveLength(1);
+	});
+
+	// The reporter verifier is the authoritative executed/skipped count; this
+	// scan only stops the source from asking to be skipped in the first place.
+	for (const construct of [
+		"test.skip",
+		"test.fixme",
+		"test.describe.skip",
+		"test.describe.fixme",
+	]) {
+		it(`never uses ${construct}`, () => {
+			expect(source).not.toContain(construct);
+		});
+	}
+
+	it("has no early return that could silence the assertions", () => {
+		// Everything from the `test(` declaration onwards is the Playwright-side
+		// case body, where a `return` — conditional or not — would end the run
+		// before the expectations execute. The browser-side burst helper is
+		// hoisted above that point precisely so it can still return its counters.
+		const caseBody = source.slice(source.search(/^test\(/m));
+		expect(caseBody).not.toMatch(/\breturn\b/);
+		expect(caseBody).toMatch(/\bexpect\(/);
 	});
 });
 

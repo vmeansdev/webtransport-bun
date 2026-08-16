@@ -1,9 +1,13 @@
+// Kept deliberately in step with `ALLOWED_ENV_KEYS` in `verify-evidence.ts`:
+// this list decides what reaches the interop server, that one decides what may
+// appear in published evidence. `security-evidence.test.ts` pins both halves.
 const SERVER_ENV_KEYS = [
 	"WT_IDLE_TIMEOUT_MS",
 	"WT_QPACK_MAX_TABLE_CAPACITY",
 	"WEBTRANSPORT_INTEROP_HOST",
 	"WEBTRANSPORT_INTEROP_QUIC_PORT",
 	"WEBTRANSPORT_INTEROP_HEALTH_PORT",
+	"WEBTRANSPORT_DATAGRAM_BATCH",
 ] as const;
 
 type ServerEnvKey = (typeof SERVER_ENV_KEYS)[number];
