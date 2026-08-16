@@ -31,6 +31,13 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 		sessionsErr: 0,
 		windowMs: 20_000,
 		saturationRatio: 0.357,
+		drops: {
+			datagramsIn: 0,
+			datagramsDropped: 0,
+			rateLimited: 0,
+			backpressureWait: 0,
+			backpressureTimeout: 0,
+		},
 		serverCpuCores: 2.1,
 		workerProof: {
 			configured: 2,

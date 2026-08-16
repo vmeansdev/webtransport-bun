@@ -143,6 +143,14 @@ export type ArmRun = {
 	sessionsErr: number;
 	windowMs: number;
 	saturationRatio: number;
+	/** Arrivals and the reject paths, so a delivery gap can be attributed. */
+	drops: {
+		datagramsIn: number;
+		datagramsDropped: number;
+		rateLimited: number;
+		backpressureWait: number;
+		backpressureTimeout: number;
+	};
 	/** Whole server process (Bun JS thread + tokio workers), fraction of a core. */
 	serverCpuCores: number;
 	/**
@@ -264,7 +272,7 @@ async function runChild(
 	let received = 0;
 	let receivedBytes = 0;
 	const aggregateOffered = sessions * rate;
-	createServer({
+	const server = createServer({
 		port,
 		tls: { certPem: tls.certPem, keyPem: tls.keyPem },
 		limits: {
@@ -337,12 +345,14 @@ async function runChild(
 	const bytes0 = receivedBytes;
 	const cpu0 = process.cpuUsage();
 	const probe0 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
+	const metrics0 = server.metricsSnapshot();
 	const t0 = performance.now();
 	await Bun.sleep(MEASURE_SEC * 1_000);
 	const rx1 = received;
 	const bytes1 = receivedBytes;
 	const cpu1 = process.cpuUsage();
 	const probe1 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
+	const metrics1 = server.metricsSnapshot();
 	const t1 = performance.now();
 
 	for (const c of clients) await c.exited;
@@ -388,6 +398,18 @@ async function runChild(
 		saturationRatio: offeredPerSec > 0 ? receivedPerSec / offeredPerSec : 0,
 		serverCpuCores:
 			(cpu1.user - cpu0.user + (cpu1.system - cpu0.system)) / 1_000 / windowMs,
+		// Which drop path discarded what the receive path took in but the JS
+		// reader never saw. datagramsIn counts arrivals; the two reject counters
+		// separate the rate limiter from the queue-budget reservation.
+		drops: {
+			datagramsIn: metrics1.datagramsIn - metrics0.datagramsIn,
+			datagramsDropped: metrics1.datagramsDropped - metrics0.datagramsDropped,
+			rateLimited: metrics1.rateLimitedCount - metrics0.rateLimitedCount,
+			backpressureWait:
+				metrics1.backpressureWaitCount - metrics0.backpressureWaitCount,
+			backpressureTimeout:
+				metrics1.backpressureTimeoutCount - metrics0.backpressureTimeoutCount,
+		},
 		workerProof: {
 			configured: probe1.configuredServerWorkerThreads ?? null,
 			availableParallelism: probe1.availableParallelism ?? null,
