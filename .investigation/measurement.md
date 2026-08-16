@@ -364,6 +364,111 @@ sweep.
   50,704/s with no collapse at all, and `workers=2` with identical
   instrumentation delivered 16x more than `workers=1`.
 
+## Run H — Linux heavy runner: does the cliff reproduce off macOS?
+
+Everything above was measured where quinn-udp resolves `BATCH_SIZE` to 1, so the
+endpoint driver makes one `recvmsg` syscall per datagram. Linux takes the
+`#[cfg(not(apple_slow))]` branch and batches 32 per `recvmmsg`. That changes the
+per-datagram economics enough that repeating one macOS operating point would
+prove nothing, so this sweeps offered load against worker count instead.
+
+Run [31943971720](https://github.com/vmeansdev/webtransport-bun/actions/runs/31943971720)
+at `fc280de`, dispatched to the existing `bench-bandwidth` workflow with
+`--ref investigate/quic-parallelism` and a new `worker_probe` input (GitHub will
+not register a dispatch-only workflow that lives only on a non-default branch).
+Artifact downloaded, not console-scraped. `status: ok`, zero failures.
+
+**Runner capacity, read from the workflow rather than assumed:** 4 vCPU, 7,423 MB,
+AMD Ryzen 5 3550H, Ubuntu, `linux/x64`. Two and a half times smaller than the
+M1 Max, with both load-generator processes co-resident, so absolute rates are
+not comparable to the macOS runs — only the shapes are.
+
+100 sessions, 1150-byte payloads, 2 generator processes, 2 reps interleaved,
+5s warmup and a 15s window.
+
+| arm | requested/s | offered/s | delivered/s | ingested/s | drop % | process | tokio | JS | threads |
+|---|---|---|---|---|---|---|---|---|---|
+| workers=1 | 20,000 | 19,985 | **20,000** | 20,001 | 0.0 | 1.79 | 0.96 | 0.37 | 1 |
+| workers=1 | 40,000 | 39,905 | **5,283** | 39,521 | **80.5** | 1.65 | 0.99 | 0.31 | 1 |
+| workers=1 | 80,000 | 79,762 | 5,366 | 55,095 | 89.6 | 1.61 | 0.98 | 0.30 | 1 |
+| workers=1 | 160,000 | 159,479 | 5,360 | 52,823 | 88.8 | 1.50 | 0.96 | 0.27 | 1 |
+| workers=2 | 20,000 | 19,987 | 20,001 | 20,000 | 0.0 | 1.73 | 1.05 | 0.32 | 2 |
+| workers=2 | 40,000 | 39,855 | **39,497** | 39,492 | **0.0** | 2.38 | 1.62 | 0.41 | 2 |
+| workers=2 | 80,000 | 78,476 | 36,543 | 77,041 | 48.3 | 2.28 | 1.67 | 0.35 | 2 |
+| workers=2 | 160,000 | 150,816 | 27,046 | 104,010 | 74.0 | 2.13 | 1.62 | 0.30 | 2 |
+
+**The cliff reproduces, and the knee is now bracketed.** At one worker the
+server is perfectly clean at 20k offered — 20,000 delivered, not one datagram
+dropped — and has collapsed by 40k. The knee for `workers=1` on this host is
+between 20,000/s and 40,000/s offered.
+
+**No arm was generator-limited.** `generatorLimitedRates` is empty. Offered
+tracked requested to within 0.7% at every rung up to 160k (19,985 / 39,905 /
+79,762 / 159,479), so the trap that invalidated Runs A through C did not bite
+here. `testedTheCliff` is true.
+
+**The collapsed floor is the same number on both platforms.** macOS
+5,364-5,393/s; Linux 5,250-5,367/s. Same on a different ISA, a different OS, a
+different core count, and a receive path that batches 32 instead of 1. A
+CPU-cost explanation cannot survive that: the 32x cheaper syscall path did not
+move the floor at all. Whatever services the starved delivery future runs at a
+fixed rate independent of the platform underneath it.
+
+The rest of the signature matches too. The single worker is pinned at
+0.96-0.99 cores in every collapsed arm (macOS: 0.96). The JS thread idles at
+0.27-0.37 cores (macOS: 0.13) — nowhere near saturated on either. `rateLimited`
+is 0 in all sixteen runs, so the drops are the queued-bytes reservation, same
+as macOS. Per-round spread is tight: 5,315/5,250 and 5,364/5,367.
+
+**Two workers is not a cure on a host this small, only a large improvement.**
+It is clean through 40k where one worker has already collapsed, but degrades to
+48% drops at 80k and 74% at 160k. Note that at those rungs the two workers sit
+at 0.81 cores each rather than pinned, on a 4-vCPU box also running two
+generator processes — so they may be runnable-but-unscheduled rather than out
+of work, which per-thread CPU time cannot distinguish. That reading is a
+limitation of this host, not a property of the code.
+
+### macOS versus Linux
+
+| | macOS (M1 Max, 10 cores) | Linux (Ryzen 5 3550H, 4 vCPU) |
+|---|---|---|
+| `BATCH_SIZE` | 1 (one `recvmsg` per datagram) | 32 (`recvmmsg`) |
+| Clean at one worker up to | ~70k offered | 20k offered |
+| Collapsed by | ~145k offered | 40k offered |
+| Collapsed floor | 5,364-5,393/s | 5,250-5,367/s |
+| Worker CPU when collapsed | 0.96 cores | 0.96-0.99 cores |
+| JS thread when collapsed | 0.13 cores | 0.27-0.31 cores |
+| Reject path | queued-bytes reservation | queued-bytes reservation |
+| `rateLimited` | 0 | 0 |
+| Two workers at the collapse point | 89,002/s, 0% dropped | 39,497/s, 0% dropped |
+
+The knee arrives at lower absolute load on Linux, which is what a host with 40%
+of the cores and co-resident generators should do; it is not evidence that
+Linux is worse per core. What matters is that the failure mode is identical in
+kind, in floor, and in reject path on both platforms.
+
+## What worker count the evidence supports
+
+**`worker_threads(1)` should not ship.** It is the current default, and on both
+platforms it turns a manageable overload into a ~10x throughput *reduction*
+with 80-95% of ingested datagrams discarded, while the process leaves most of
+the machine idle. Two independent platforms, twelve independent collapsed runs,
+same floor, same reject path. Confidence: **high**.
+
+**Two workers is the supported choice.** It eliminated the drops entirely at
+every rung where one worker collapsed, on both hosts, and on macOS it also beat
+four (81,682/s) and ten (48,042/s). Confidence: **moderate** — it is clearly
+better than one and better than many, but the sweep has only two Linux worker
+counts, and the 4-vCPU runner cannot say whether four would help a larger Linux
+box. A worker count is also a mitigation rather than a fix: two workers still
+degraded to 48% drops at 80k on the small host, so the underlying starvation
+still bites, just further out.
+
+**What I would not conclude yet.** That two is optimal on production hardware;
+the macOS ordering (2 > 4 > 10) may not transfer to a many-core Linux server,
+and testing that needs a runner with more than 4 vCPU. And nothing here
+justifies `available_parallelism()`, which was the worst arm on macOS.
+
 ## Recorded gate breakage
 
 `scripts/check-doc-truth.ts` pins the exact constructor string
@@ -384,6 +489,8 @@ changed.
 - `.investigation/native-recv-floor-control-c3.json` — Run D
 - `.investigation/thread-profile.json` — Run G (per-thread CPU, limiter timing,
   recv syscall)
+- `.investigation/worker-load-sweep-linux.json` — Run H, downloaded from the
+  heavy-runner artifact of run 31943971720
 
 ```sh
 CARGO_TARGET_DIR=$PWD/target cargo build -p reference \
@@ -395,6 +502,13 @@ WT_PROBE_CLIENTS=3 bun tools/bench/worker-thread-parallelism-probe.ts   # E
 bun tools/bench/native-recv-floor-control.ts                       # C
 WT_PROBE_CLIENTS=3 bun tools/bench/native-recv-floor-control.ts    # D
 bun tools/bench/thread-profile.ts                                  # G
+
+# H: Linux heavy runner. bench-bandwidth is already registered, so dispatching
+# it with --ref runs the branch's copy of the file including the new input.
+gh workflow run bench-bandwidth.yml --ref investigate/quic-parallelism \
+  -f candidate_commit=$(git rev-parse HEAD) -f worker_probe=true \
+  -f sessions=100 -f worker_sweep_rates=20000,40000,80000,160000 \
+  -f worker_sweep_workers=1,2 -f worker_sweep_clients=2
 ```
 
 Knobs: `WT_PROBE_CLIENTS`, `WT_PROBE_SESSIONS`, `WT_PROBE_AGGREGATE`,

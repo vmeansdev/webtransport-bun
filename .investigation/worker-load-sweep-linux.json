@@ -1,0 +1,730 @@
+{
+  "version": 1,
+  "mode": "worker-load-sweep",
+  "kind": "probe",
+  "status": "ok",
+  "generatedAtMs": 1786879741476,
+  "head": "fc280de47d76c1f7ad4b09c7d7ef6951a4caadfc",
+  "bunVersion": "1.3.14",
+  "platform": "linux/x64",
+  "machine": "v-ubuntu-home",
+  "command": "bun tools/bench/worker-load-sweep.ts",
+  "capacity": {
+    "cpus": 4,
+    "memoryMb": 7423,
+    "model": "AMD Ryzen 5 3550H with Radeon Vega Mobile Gfx"
+  },
+  "design": {
+    "sessions": 100,
+    "clients": 2,
+    "workers": [
+      "1",
+      "2"
+    ],
+    "requestedRates": [
+      20000,
+      40000,
+      80000,
+      160000
+    ],
+    "payloadBytes": 1150,
+    "warmupSec": 5,
+    "measureSec": 15,
+    "reps": 2,
+    "order": [
+      "r1:w2@160000",
+      "r1:w2@20000",
+      "r1:w1@80000",
+      "r1:w1@160000",
+      "r1:w2@40000",
+      "r1:w1@40000",
+      "r1:w2@80000",
+      "r1:w1@20000",
+      "r2:w2@40000",
+      "r2:w1@20000",
+      "r2:w2@160000",
+      "r2:w1@80000",
+      "r2:w1@160000",
+      "r2:w1@40000",
+      "r2:w2@20000",
+      "r2:w2@80000"
+    ]
+  },
+  "arms": [
+    {
+      "key": "w1@20000",
+      "workers": "1",
+      "requestedPerSec": 20000,
+      "offeredPerSec": 19985.4,
+      "deliveredPerSec": 19999.810077475973,
+      "ingestedPerSec": 20000.943150430627,
+      "droppedPct": 0,
+      "processCores": 1.785997274197856,
+      "tokioCores": 0.9615525107990563,
+      "jsCores": 0.3709380090515902,
+      "datagramThreads": 1,
+      "configuredWorkers": 1,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w1@20000",
+          "workers": "1",
+          "requestedPerSec": 20000,
+          "round": 1,
+          "offeredPerSec": 19985.95,
+          "deliveredPerSec": 20002.748973710295,
+          "ingestedPerSec": 19999.749101341265,
+          "droppedPct": 0,
+          "rateLimited": 0,
+          "processCores": 1.7914418489371975,
+          "tokioCores": 0.9637190099249872,
+          "jsCores": 0.3715246042456675,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9637190099249872,
+              "datagrams": 300010
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.3715246042456675,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w1@20000",
+          "workers": "1",
+          "requestedPerSec": 20000,
+          "round": 2,
+          "offeredPerSec": 19984.85,
+          "deliveredPerSec": 19996.87118124165,
+          "ingestedPerSec": 20002.137199519988,
+          "droppedPct": 0,
+          "rateLimited": 0,
+          "processCores": 1.7805526994585144,
+          "tokioCores": 0.9593860116731255,
+          "jsCores": 0.37035141385751286,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9593860116731255,
+              "datagrams": 300071
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.37035141385751286,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w1@40000",
+      "workers": "1",
+      "requestedPerSec": 40000,
+      "offeredPerSec": 39905.175,
+      "deliveredPerSec": 5282.596359041328,
+      "ingestedPerSec": 39520.955009643425,
+      "droppedPct": 80.54531624405058,
+      "processCores": 1.651407069261957,
+      "tokioCores": 0.9866177149011525,
+      "jsCores": 0.31259975943868956,
+      "datagramThreads": 1,
+      "configuredWorkers": 1,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w1@40000",
+          "workers": "1",
+          "requestedPerSec": 40000,
+          "round": 1,
+          "offeredPerSec": 39907.15,
+          "deliveredPerSec": 5315.412654460793,
+          "ingestedPerSec": 39472.71600224121,
+          "droppedPct": 80.49687364388076,
+          "rateLimited": 0,
+          "processCores": 1.6529477680538607,
+          "tokioCores": 0.9863858991554698,
+          "jsCores": 0.31321033461030345,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9863858991554698,
+              "datagrams": 592230
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.31321033461030345,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w1@40000",
+          "workers": "1",
+          "requestedPerSec": 40000,
+          "round": 2,
+          "offeredPerSec": 39903.2,
+          "deliveredPerSec": 5249.780063621862,
+          "ingestedPerSec": 39569.194017045644,
+          "droppedPct": 80.59375884422042,
+          "rateLimited": 0,
+          "processCores": 1.6498663704700531,
+          "tokioCores": 0.9868495306468351,
+          "jsCores": 0.3119891842670757,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9868495306468351,
+              "datagrams": 593626
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.3119891842670757,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w1@80000",
+      "workers": "1",
+      "requestedPerSec": 80000,
+      "offeredPerSec": 79761.5,
+      "deliveredPerSec": 5365.550625746462,
+      "ingestedPerSec": 55094.70953131796,
+      "droppedPct": 89.58497667796343,
+      "processCores": 1.608436922604217,
+      "tokioCores": 0.9796099821549394,
+      "jsCores": 0.3001944710368002,
+      "datagramThreads": 1,
+      "configuredWorkers": 1,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w1@80000",
+          "workers": "1",
+          "requestedPerSec": 80000,
+          "round": 1,
+          "offeredPerSec": 79762.8,
+          "deliveredPerSec": 5363.847656834088,
+          "ingestedPerSec": 54818.80702007341,
+          "droppedPct": 89.37081168369251,
+          "rateLimited": 0,
+          "processCores": 1.608164744581939,
+          "tokioCores": 0.9797536876401148,
+          "jsCores": 0.30099048527397143,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9797536876401148,
+              "datagrams": 822384
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.30099048527397143,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w1@80000",
+          "workers": "1",
+          "requestedPerSec": 80000,
+          "round": 2,
+          "offeredPerSec": 79760.2,
+          "deliveredPerSec": 5367.253594658837,
+          "ingestedPerSec": 55370.61204256251,
+          "droppedPct": 89.79914167223436,
+          "rateLimited": 0,
+          "processCores": 1.608709100626495,
+          "tokioCores": 0.979466276669764,
+          "jsCores": 0.2993984567996289,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.979466276669764,
+              "datagrams": 830694
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.2993984567996289,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w1@160000",
+      "workers": "1",
+      "requestedPerSec": 160000,
+      "offeredPerSec": 159479.4,
+      "deliveredPerSec": 5359.935022956012,
+      "ingestedPerSec": 52823.07022545476,
+      "droppedPct": 88.77952194823321,
+      "processCores": 1.496869444348469,
+      "tokioCores": 0.9609325272574987,
+      "jsCores": 0.27188191636827724,
+      "datagramThreads": 1,
+      "configuredWorkers": 1,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w1@160000",
+          "workers": "1",
+          "requestedPerSec": 160000,
+          "round": 1,
+          "offeredPerSec": 159434.55,
+          "deliveredPerSec": 5358.128372777779,
+          "ingestedPerSec": 52926.75762717808,
+          "droppedPct": 88.76309681092104,
+          "rateLimited": 0,
+          "processCores": 1.4904949153734808,
+          "tokioCores": 0.9612807423388634,
+          "jsCores": 0.2691626409381923,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9612807423388634,
+              "datagrams": 793991
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.2691626409381923,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w1@160000",
+          "workers": "1",
+          "requestedPerSec": 160000,
+          "round": 2,
+          "offeredPerSec": 159524.25,
+          "deliveredPerSec": 5361.7416731342455,
+          "ingestedPerSec": 52719.38282373144,
+          "droppedPct": 88.79594708554538,
+          "rateLimited": 0,
+          "processCores": 1.5032439733234573,
+          "tokioCores": 0.9605843121761339,
+          "jsCores": 0.2746011917983622,
+          "datagramThreads": 1,
+          "configuredWorkers": 1,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.9605843121761339,
+              "datagrams": 790942
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.2746011917983622,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w2@20000",
+      "workers": "2",
+      "requestedPerSec": 20000,
+      "offeredPerSec": 19986.6,
+      "deliveredPerSec": 20000.873046501118,
+      "ingestedPerSec": 20000.006417199234,
+      "droppedPct": 0,
+      "processCores": 1.7307883311366636,
+      "tokioCores": 1.0488881046177037,
+      "jsCores": 0.31537126362068235,
+      "datagramThreads": 2,
+      "configuredWorkers": 2,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w2@20000",
+          "workers": "2",
+          "requestedPerSec": 20000,
+          "round": 1,
+          "offeredPerSec": 19986.65,
+          "deliveredPerSec": 20000.17907559537,
+          "ingestedPerSec": 19999.979086470594,
+          "droppedPct": 0,
+          "rateLimited": 0,
+          "processCores": 1.7312249242710946,
+          "tokioCores": 1.0506175158667301,
+          "jsCores": 0.3159043114183891,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.5254949050108607,
+              "datagrams": 149851
+            },
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.5251226108558694,
+              "datagrams": 150162
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.3159043114183891,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w2@20000",
+          "workers": "2",
+          "requestedPerSec": 20000,
+          "round": 2,
+          "offeredPerSec": 19986.55,
+          "deliveredPerSec": 20001.56701740687,
+          "ingestedPerSec": 20000.03374792787,
+          "droppedPct": 0,
+          "rateLimited": 0,
+          "processCores": 1.7303517380022326,
+          "tokioCores": 1.0471586933686772,
+          "jsCores": 0.3148382158229756,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.5256119519680633,
+              "datagrams": 150317
+            },
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.5215467414006139,
+              "datagrams": 149701
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.3148382158229756,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w2@40000",
+      "workers": "2",
+      "requestedPerSec": 40000,
+      "offeredPerSec": 39854.8,
+      "deliveredPerSec": 39496.91993876823,
+      "ingestedPerSec": 39492.386894168136,
+      "droppedPct": 0,
+      "processCores": 2.3831307023454222,
+      "tokioCores": 1.6219591589584306,
+      "jsCores": 0.41379182326570063,
+      "datagramThreads": 2,
+      "configuredWorkers": 2,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w2@40000",
+          "workers": "2",
+          "requestedPerSec": 40000,
+          "round": 1,
+          "offeredPerSec": 39873.8,
+          "deliveredPerSec": 39590.49199288126,
+          "ingestedPerSec": 39585.958832216624,
+          "droppedPct": 0,
+          "rateLimited": 0,
+          "processCores": 2.3869548805703387,
+          "tokioCores": 1.6228373252432364,
+          "jsCores": 0.4134401248105206,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.8128465075681472,
+              "datagrams": 296014
+            },
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.8099908176750893,
+              "datagrams": 297803
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.4134401248105206,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w2@40000",
+          "workers": "2",
+          "requestedPerSec": 40000,
+          "round": 2,
+          "offeredPerSec": 39835.8,
+          "deliveredPerSec": 39403.34788465521,
+          "ingestedPerSec": 39398.81495611965,
+          "droppedPct": 0,
+          "rateLimited": 0,
+          "processCores": 2.379306524120506,
+          "tokioCores": 1.6210809926736247,
+          "jsCores": 0.4141435217208807,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.8198582679448994,
+              "datagrams": 300615
+            },
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.8012227247287255,
+              "datagrams": 290416
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.4141435217208807,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w2@80000",
+      "workers": "2",
+      "requestedPerSec": 80000,
+      "offeredPerSec": 78475.625,
+      "deliveredPerSec": 36542.560039321164,
+      "ingestedPerSec": 77040.71266228904,
+      "droppedPct": 48.284431045254735,
+      "processCores": 2.28171594116934,
+      "tokioCores": 1.6710109838003957,
+      "jsCores": 0.3536303981351978,
+      "datagramThreads": 2,
+      "configuredWorkers": 2,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w2@80000",
+          "workers": "2",
+          "requestedPerSec": 80000,
+          "round": 1,
+          "offeredPerSec": 78130.5,
+          "deliveredPerSec": 36114.866379416,
+          "ingestedPerSec": 76556.94893170078,
+          "droppedPct": 48.723552908973375,
+          "rateLimited": 0,
+          "processCores": 2.2854746116396725,
+          "tokioCores": 1.6819472807269062,
+          "jsCores": 0.34844456712933114,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.8474316115380304,
+              "datagrams": 582328
+            },
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.8345156691888759,
+              "datagrams": 567011
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.34844456712933114,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w2@80000",
+          "workers": "2",
+          "requestedPerSec": 80000,
+          "round": 2,
+          "offeredPerSec": 78820.75,
+          "deliveredPerSec": 36970.25369922633,
+          "ingestedPerSec": 77524.4763928773,
+          "droppedPct": 47.8453091815361,
+          "rateLimited": 0,
+          "processCores": 2.277957270699007,
+          "tokioCores": 1.660074686873885,
+          "jsCores": 0.35881622914106454,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.8319886713114929,
+              "datagrams": 582506
+            },
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.828086015562392,
+              "datagrams": 581898
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.35881622914106454,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "w2@160000",
+      "workers": "2",
+      "requestedPerSec": 160000,
+      "offeredPerSec": 150815.59999999998,
+      "deliveredPerSec": 27046.365724709,
+      "ingestedPerSec": 104010.23273281586,
+      "droppedPct": 73.99049760762446,
+      "processCores": 2.1314903755391,
+      "tokioCores": 1.623654323003346,
+      "jsCores": 0.29732833765766686,
+      "datagramThreads": 2,
+      "configuredWorkers": 2,
+      "requestMet": true,
+      "runs": [
+        {
+          "key": "w2@160000",
+          "workers": "2",
+          "requestedPerSec": 160000,
+          "round": 1,
+          "offeredPerSec": 150981.15,
+          "deliveredPerSec": 27660.911017565883,
+          "ingestedPerSec": 103562.93080773589,
+          "droppedPct": 73.28016581057943,
+          "rateLimited": 0,
+          "processCores": 2.134783653152883,
+          "tokioCores": 1.62020513205355,
+          "jsCores": 0.30063883711588385,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.8105289359221292,
+              "datagrams": 779557
+            },
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.8096761961314208,
+              "datagrams": 774023
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.30063883711588385,
+              "datagrams": 0
+            }
+          ]
+        },
+        {
+          "key": "w2@160000",
+          "workers": "2",
+          "requestedPerSec": 160000,
+          "round": 2,
+          "offeredPerSec": 150650.05,
+          "deliveredPerSec": 26431.820431852117,
+          "ingestedPerSec": 104457.53465789583,
+          "droppedPct": 74.70082940466949,
+          "rateLimited": 0,
+          "processCores": 2.1281970979253173,
+          "tokioCores": 1.627103513953142,
+          "jsCores": 0.29401783819944993,
+          "datagramThreads": 2,
+          "configuredWorkers": 2,
+          "sessionsOk": 100,
+          "clientSendErrors": 0,
+          "threads": [
+            {
+              "label": "wt-server#ThreadId(6)",
+              "cores": 0.8231406391192565,
+              "datagrams": 799544
+            },
+            {
+              "label": "wt-server#ThreadId(7)",
+              "cores": 0.8039628748338855,
+              "datagrams": 768228
+            },
+            {
+              "label": "unnamed#ThreadId(1)",
+              "cores": 0.29401783819944993,
+              "datagrams": 0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "generatorLimitedRates": [],
+  "collapse": {
+    "1": {
+      "collapsed": true,
+      "peakPerSec": 19999.810077475973,
+      "atPeakOffered": 19985.4,
+      "worstPerSec": 5282.596359041328,
+      "worstOffered": 39905.175
+    },
+    "2": {
+      "collapsed": false,
+      "peakPerSec": 39496.91993876823,
+      "atPeakOffered": 39854.8,
+      "worstPerSec": 27046.365724709,
+      "worstOffered": 150815.59999999998
+    }
+  },
+  "testedTheCliff": true,
+  "failures": []
+}
