@@ -199,6 +199,12 @@ function assertSessionContract(session: PortableServerSession): void {
 
 /** Datagrams a live peer pushes at the server, in the order given. */
 const DATAGRAM_BURST = 8;
+/**
+ * Both live sessions run over loopback against a local in-process server and
+ * deliver all 8. The floor absorbs two losses so an unlucky run cannot flake,
+ * and still fails a backend that drops most of a burst.
+ */
+const MIN_DATAGRAMS_DELIVERED = 6;
 
 /**
  * The COMMON half of the narrowed `/portable` incoming-datagram contract, run
@@ -241,7 +247,7 @@ async function assertIncomingDatagramFlow(
 		ids.push((next.value as Uint8Array)[0] as number);
 	}
 
-	expect(ids.length).toBeGreaterThanOrEqual(2);
+	expect(ids.length).toBeGreaterThanOrEqual(MIN_DATAGRAMS_DELIVERED);
 	expect(new Set(ids).size).toBe(ids.length);
 	expect([...ids].sort((a, b) => a - b)).toEqual(ids);
 	return iterator;
