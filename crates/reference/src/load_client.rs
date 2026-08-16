@@ -244,6 +244,10 @@ fn next_probe_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn format_sent_progress(t_ms: u64, sent: u64) -> String {
+    format!("load-client: t_ms={t_ms} sent={sent}")
+}
+
 fn load_summary_json(mode: ClientMode, counters: &Counters) -> String {
     format!(
         concat!(
@@ -420,6 +424,20 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
 
     match mode {
         ClientMode::Load => {
+            let started = Instant::now();
+            println!("{}", format_sent_progress(0, 0));
+            let progress_counters = Arc::clone(&counters);
+            let progress = tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(1));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let t_ms = started.elapsed().as_millis() as u64;
+                    let sent = progress_counters.datagrams_sent.load(Ordering::Relaxed);
+                    println!("{}", format_sent_progress(t_ms, sent));
+                }
+            });
             let mut handles = Vec::with_capacity(num_sessions);
             for i in 0..num_sessions {
                 let url = url.to_string();
@@ -454,6 +472,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                 handles.push(handle);
             }
             tokio::time::sleep(duration).await;
+            progress.abort();
             wait_for_handles(handles).await;
         }
         ClientMode::Reconnect => {
@@ -700,7 +719,10 @@ async fn run_reconnect_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_summary_json, parse_client_mode, parse_or_default, ClientMode, Counters};
+    use super::{
+        format_sent_progress, load_summary_json, parse_client_mode, parse_or_default, ClientMode,
+        Counters,
+    };
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -729,6 +751,15 @@ mod tests {
     #[test]
     fn parse_client_mode_falls_back_on_unknown_values() {
         assert_eq!(parse_client_mode(Some("unknown")), ClientMode::Load);
+    }
+
+    #[test]
+    fn format_sent_progress_matches_parser_line() {
+        assert_eq!(format_sent_progress(0, 0), "load-client: t_ms=0 sent=0");
+        assert_eq!(
+            format_sent_progress(1000, 50_000),
+            "load-client: t_ms=1000 sent=50000"
+        );
     }
 
     #[test]
