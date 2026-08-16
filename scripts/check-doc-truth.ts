@@ -122,6 +122,21 @@ const H7_REQUIRED_TEXT = [
 	"verify-h7-hosted",
 	"does not replace the 24h/72h release soak",
 ] as const;
+/**
+ * Numeric dispatch parameters whose wrong value would send an operator into a
+ * rejected — or worse, an accepted-but-mislabeled — run. Requiring the right
+ * token is not enough: a doc can carry `datagram_batch=64` and offer
+ * `datagram_batch=32` in the next sentence. Only these three are pinned this
+ * way, because only these three appear as `name=value` dispatch inputs whose
+ * value is fixed for the lane; `segment_count` legitimately varies (self-hosted
+ * 1 versus GitHub-hosted 5/15). Prose about the ceiling clamp mentions 1024 as
+ * a bare number rather than as `rss_ceiling_mb=1024`, so it does not trip.
+ */
+const H7_PINNED_VALUES = [
+	["datagram_batch", "64"],
+	["rss_ceiling_mb", "1750"],
+	["sessions", "500"],
+] as const;
 /** Mode lists written before the 2-hour lane existed. */
 const STALE_SOAK_MODE_LISTS = [
 	"1h/24h/72h",
@@ -710,6 +725,24 @@ function checkHostedH7Contract(): void {
 				report(
 					location,
 					`H7 hosted closure lane contract is missing required text: ${required}`,
+				);
+			}
+		}
+		for (const [parameter, pinned] of H7_PINNED_VALUES) {
+			// The leading boundary keeps `sessions=` from matching a longer
+			// parameter such as `max_sessions=`, and only digit values are read so
+			// placeholder text stays out of it.
+			const dispatched = new RegExp(`(?<![\\w-])${parameter}=(\\d+)`, "g");
+			const reported = new Set<string>();
+			for (const match of doc.matchAll(dispatched)) {
+				const found = match[1];
+				if (found === undefined || found === pinned || reported.has(found)) {
+					continue;
+				}
+				reported.add(found);
+				report(
+					location,
+					`contradicts the pinned H7 dispatch value ${parameter}=${pinned}: found ${parameter}=${found}`,
 				);
 			}
 		}
