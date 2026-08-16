@@ -32,9 +32,10 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
   unmeasured change.
 
 ### Datagram delivery must not hop between runtimes
-- `readDatagram`, `sendDatagram`, and per-datagram `discardDatagram` run
-  **directly on the N-API runtime** that `Env::spawn_future` provides. They must
-  not be wrapped in `RUNTIME.spawn`, and `scripts/check-doc-truth.ts` pins that.
+- `readDatagram`, `readDatagramBatch`, `sendDatagram`, and per-datagram
+  `discardDatagram` run **directly on the N-API runtime** that
+  `Env::spawn_future` provides. They must not be wrapped in `RUNTIME.spawn`,
+  and `scripts/check-doc-truth.ts` pins that.
 - Dispatching it as `env.spawn_future(async { RUNTIME.spawn(...).await })` was a
   **root-cause availability defect**, not a performance nicety. `RUNTIME.spawn`
   called from the N-API runtime is a spawn from *outside* the server runtime, so
@@ -56,16 +57,16 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
   it is slightly faster on about 10% less CPU. Two workers alone would only have
   made workers run dry often enough to dodge the tick path, which a busier
   server or a larger session count could undo.
-- The hop is safe to delete on those three paths: `read_datagram_for_session`
-  only locks a Tokio mutex and receives from a Tokio mpsc; `send_datagram`
-  awaits a Notify plus a timer deadline then makes a synchronous quinn call;
-  per-datagram `discard_datagram` is the read path plus an optional
-  `tokio::time::timeout`. napi-rs's current_thread runtime already has a time
-  driver. Measured at one worker: send 5,213 → 55,306/s (echo 15% → 100%);
-  discard 5,374 → 83,479/s (94.5% → 0% dropped). Stream open/accept and the
-  bulk `discard_datagrams` loop **keep** their hops: opens never bound the
-  cadence (~1,530/s either way), and the bulk drain is one spawn then a native
-  loop that must not monopolise the JS thread.
+- The hop is safe to delete on those four paths: `read_datagram_for_session`
+  and `read_datagram_batch_for_session` only lock a Tokio mutex and receive
+  from a Tokio mpsc; `send_datagram` awaits a Notify plus a timer deadline then
+  makes a synchronous quinn call; per-datagram `discard_datagram` is the read
+  path plus an optional `tokio::time::timeout`. napi-rs's current_thread
+  runtime already has a time driver. Measured at one worker: send
+  5,213 → 55,306/s (echo 15% → 100%); discard 5,374 → 83,479/s (94.5% → 0%
+  dropped). Stream open/accept and the bulk `discard_datagrams` loop **keep**
+  their hops: opens never bound the cadence (~1,530/s either way), and the bulk
+  drain is one spawn then a native loop that must not monopolise the JS thread.
 - `scripts/check-doc-truth.ts` source-policies both runtime declarations, their
   individual worker counts, and their dedicated thread names, and rejects a
   worker count derived from the environment or from `available_parallelism()`,
@@ -73,8 +74,8 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
 - Isolation prevents same-process deadlock when client and server share a process (e.g. tests).
 - All wtransport objects are owned and driven on these runtimes.
 - JS calls enqueue commands to the runtimes via bounded channels. Datagram
-  read, send, and per-datagram discard are the exception: they run directly on
-  the N-API runtime rather than hopping onto the server runtime first.
+  read, batch read, send, and per-datagram discard are the exception: they run
+  directly on the N-API runtime rather than hopping onto the server runtime first.
 - Runtimes emit events back to JS via ThreadsafeFunction (TSFN) using batching.
 
 ## Object model and lifetimes
