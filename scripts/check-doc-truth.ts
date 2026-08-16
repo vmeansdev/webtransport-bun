@@ -77,7 +77,17 @@ const HISTORICAL_HARDENING_PLAN_PATH = resolve(
 );
 const RUNTIME_SOURCE_PATH = resolve(ROOT, "crates", "native", "src", "lib.rs");
 const SHA40 = /^[0-9a-f]{40}$/;
-const EXACT_CONSTRUCTOR = "Builder::new_multi_thread().worker_threads(1)";
+// Each runtime pins its own worker count. The server runs two as a mitigation
+// for datagram-delivery starvation at one worker; the client is unmeasured and
+// stays at one. See the threading-model section of docs/ARCHITECTURE.md.
+const RUNTIME_CONTRACTS = [
+	{ name: "RUNTIME", threadName: "wt-server", workers: 2 },
+	{ name: "CLIENT_RUNTIME", threadName: "wt-client", workers: 1 },
+] as const;
+
+function exactConstructor(workers: number): string {
+	return `Builder::new_multi_thread().worker_threads(${workers})`;
+}
 
 type Violation = { location: string; message: string };
 const violations: Violation[] = [];
@@ -412,28 +422,38 @@ function checkRuntimeContract(): void {
 	const architecture = readText(ARCHITECTURE_PATH);
 	const source = readText(RUNTIME_SOURCE_PATH);
 	if (architecture === undefined || source === undefined) return;
-	if (!architecture.includes(EXACT_CONSTRUCTOR)) {
-		report(
-			relative(ROOT, ARCHITECTURE_PATH),
-			`must state the exact runtime constructor ${EXACT_CONSTRUCTOR}`,
-		);
-	}
-	for (const [name, threadName] of [
-		["RUNTIME", "wt-server"],
-		["CLIENT_RUNTIME", "wt-client"],
-	] as const) {
+	for (const { name, threadName, workers } of RUNTIME_CONTRACTS) {
+		const constructor = exactConstructor(workers);
+		if (!architecture.includes(constructor)) {
+			report(
+				relative(ROOT, ARCHITECTURE_PATH),
+				`must state the exact runtime constructor ${constructor} for ${name}`,
+			);
+		}
 		const block = runtimeBlock(source, name);
 		if (!block) {
 			report(relative(ROOT, RUNTIME_SOURCE_PATH), `missing ${name} runtime`);
 			continue;
 		}
 		if (
-			!/Builder::new_multi_thread\(\)\s*\.worker_threads\(1\)/s.test(block) ||
+			!new RegExp(
+				`Builder::new_multi_thread\\(\\)\\s*\\.worker_threads\\(${workers}\\)`,
+				"s",
+			).test(block) ||
 			block.includes("new_current_thread")
 		) {
 			report(
 				relative(ROOT, RUNTIME_SOURCE_PATH),
-				`${name} contradicts ${EXACT_CONSTRUCTOR}`,
+				`${name} contradicts ${constructor}`,
+			);
+		}
+		// The worker count is a deliberate constant: every measured alternative
+		// was worse. A runtime-derived count would make the pinned contract
+		// unverifiable, so reject the shapes that could produce one.
+		if (/available_parallelism|worker_threads\(\s*[a-z_]/i.test(block)) {
+			report(
+				relative(ROOT, RUNTIME_SOURCE_PATH),
+				`${name} must hardcode its worker count, not derive it at runtime`,
 			);
 		}
 		if (!block.includes(`.thread_name("${threadName}")`)) {
