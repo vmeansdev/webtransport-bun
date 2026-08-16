@@ -101,7 +101,25 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 		[
 			"The server runtime uses `Builder::new_multi_thread().worker_threads(2)`.",
 			"The client runtime uses `Builder::new_multi_thread().worker_threads(1)`.",
+			"readDatagram, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
 		].join("\n"),
+	);
+	writeFileSync(
+		join(root, "crates", "native", "src", "session_napi.rs"),
+		`impl SessionHandle {
+    pub fn send_datagram(&self, env: Env, data: Buffer) -> Result<JsObject> {
+        env.spawn_future(async move { send_datagram_for_session(&id, &bytes).await })
+    }
+    pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
+        let id = self.id.clone();
+        env.spawn_future(async move {
+            Ok(read_datagram_for_session(&id).await?.map(PayloadBuffer::from))
+        })
+    }
+    pub fn discard_datagram(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
+        env.spawn_future(async move { discard_datagram_for_session(&id, timeout).await })
+    }
+}`,
 	);
 	writeFileSync(
 		join(root, "docs", "FAQ.md"),
@@ -278,6 +296,77 @@ describe("documentation truth policy", () => {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
 			"must state the exact runtime constructor Builder::new_multi_thread().worker_threads(2) for RUNTIME",
+		);
+	});
+
+	// Regression: the RUNTIME.spawn hop put every delivery on the server
+	// runtime's injection queue, capping datagram delivery near 5,000/s with
+	// 95% dropped. If this test stops failing, the hop can come back unnoticed.
+	it("rejects a datagram read that hops back onto the server runtime", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "session_napi.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"Ok(read_datagram_for_session(&id).await?.map(PayloadBuffer::from))",
+					"RUNTIME.spawn(async move { read_datagram_for_session(&id).await }).await.map_err(wt_from_upstream_error)?",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"read_datagram must not hop onto the server runtime",
+		);
+	});
+
+	it("rejects a datagram send that hops back onto the server runtime", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "session_napi.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"env.spawn_future(async move { send_datagram_for_session(&id, &bytes).await })",
+					"env.spawn_future(async move { RUNTIME.spawn(async move { send_datagram_for_session(&id, &bytes).await }).await })",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"send_datagram must not hop onto the server runtime",
+		);
+	});
+
+	it("rejects a per-datagram discard that hops back onto the server runtime", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "session_napi.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"env.spawn_future(async move { discard_datagram_for_session(&id, timeout).await })",
+					"env.spawn_future(async move { RUNTIME.spawn(async move { discard_datagram_for_session(&id, timeout).await }).await })",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"discard_datagram must not hop onto the server runtime",
+		);
+	});
+
+	it("rejects architecture text that drops the delivery-path contract", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "docs", "ARCHITECTURE.md");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"readDatagram, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
+					"Datagram methods are dispatched onto the server runtime.",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"must document that readDatagram, sendDatagram, and discardDatagram run on the N-API runtime",
 		);
 	});
 
