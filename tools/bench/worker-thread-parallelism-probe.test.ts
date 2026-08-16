@@ -17,6 +17,7 @@ import {
 	parseCpusAllowedListFromStatus,
 	parseLoadClientSentProgress,
 	parseSsUdpSkmem,
+	parseAppliedCongestion,
 	pickDisjointPhysicalCpus,
 	parseProcNetstatUdp,
 	parseProcSnmpUdp,
@@ -92,6 +93,7 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 		clientAffinityOk: true,
 		skRcvbuf: null,
 		skDrops: null,
+		appliedCongestion: "cubic",
 		workerProof: {
 			configured: 2,
 			availableParallelism: 10,
@@ -856,5 +858,24 @@ describe("parseSsUdpSkmem", () => {
 
 	test("returns null for a different port", () => {
 		expect(parseSsUdpSkmem(sample, 50111)).toBeNull();
+	});
+});
+
+describe("parseAppliedCongestion", () => {
+	test("reads matching factory labels", () => {
+		expect(
+			parseAppliedCongestion([
+				"load-client: mode=load url=https://127.0.0.1:1 sessions=50 duration=20s datagrams/s=1600 streams/s=0 payload_bytes=1150 hold_ms=1000 skip_probes=true congestion=bbr budgets(session=50, datagram=1, stream=1)\n",
+			]),
+		).toBe("bbr");
+	});
+
+	test("null when labels disagree", () => {
+		expect(
+			parseAppliedCongestion([
+				"load-client: mode=load congestion=cubic budgets()\n",
+				"load-client: mode=load congestion=bbr budgets()\n",
+			]),
+		).toBeNull();
 	});
 });

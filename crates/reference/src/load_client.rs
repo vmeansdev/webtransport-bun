@@ -2,11 +2,15 @@
 //! Used by tools/load for CI and soak tests.
 
 use bytes::Bytes;
+use rustls::RootCertStore;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
+use wtransport::config::QuicTransportConfig;
 use wtransport::error::StreamWriteError;
+use wtransport::tls::client::build_default_tls_config;
+use wtransport::tls::client::NoServerVerification;
 use wtransport::ClientConfig;
 use wtransport::Endpoint;
 
@@ -75,6 +79,51 @@ fn parse_client_mode(raw: Option<&str>) -> ClientMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Congestion {
+    Cubic,
+    Bbr,
+}
+
+impl Congestion {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Bbr => "bbr",
+        }
+    }
+}
+
+fn parse_congestion(raw: Option<&str>) -> Result<Congestion, String> {
+    match raw {
+        None | Some("cubic") => Ok(Congestion::Cubic),
+        Some("bbr") => Ok(Congestion::Bbr),
+        Some(other) => Err(format!(
+            "load-client: invalid value for --congestion ('{other}'); expected cubic or bbr"
+        )),
+    }
+}
+
+fn build_insecure_client_config(
+    congestion: Congestion,
+) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let tls = build_default_tls_config(
+        Arc::new(RootCertStore::empty()),
+        Some(Arc::new(NoServerVerification::new())),
+    );
+    let mut transport = QuicTransportConfig::default();
+    let factory: Arc<dyn wtransport::quinn::congestion::ControllerFactory + Send + Sync + 'static> =
+        match congestion {
+            Congestion::Cubic => Arc::new(wtransport::quinn::congestion::CubicConfig::default()),
+            Congestion::Bbr => Arc::new(wtransport::quinn::congestion::BbrConfig::default()),
+        };
+    transport.congestion_controller_factory(factory);
+    Ok(ClientConfig::builder()
+        .with_bind_default()
+        .with_custom_tls_and_transport(tls, transport)
+        .build())
+}
+
 fn parse_or_default<T>(flag: &str, raw: Option<String>, default: T) -> T
 where
     T: std::str::FromStr + Copy,
@@ -106,6 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect_hold_ms = DEFAULT_RECONNECT_HOLD_MS;
     let mut skip_probes = false;
     let mut payload_bytes = DEFAULT_PAYLOAD_BYTES;
+    let mut congestion_raw: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -158,12 +208,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload_bytes =
                     parse_or_default("--payload-bytes", args.next(), DEFAULT_PAYLOAD_BYTES)
             }
+            "--congestion" => {
+                congestion_raw = args.next();
+                if congestion_raw.is_none() {
+                    eprintln!("load-client: --congestion requires cubic or bbr");
+                    std::process::exit(1);
+                }
+            }
             _ => {}
         }
     }
 
+    let congestion = match parse_congestion(congestion_raw.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let config = build_insecure_client_config(congestion)?;
+
     println!(
-        "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} payload_bytes={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
+        "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} payload_bytes={} hold_ms={} skip_probes={} congestion={} budgets(session={}, datagram={}, stream={})",
         mode.as_str(),
         url,
         sessions,
@@ -173,6 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload_bytes,
         reconnect_hold_ms,
         skip_probes,
+        congestion.as_str(),
         max_session_errors,
         max_datagram_errors,
         max_stream_errors
@@ -182,22 +249,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
 
-    rt.block_on(run(RunOptions {
-        mode,
-        url: &url,
-        num_sessions: sessions,
-        duration: Duration::from_secs(duration_secs),
-        datagrams_per_sec,
-        streams_per_sec,
-        reconnect_hold: Duration::from_millis(reconnect_hold_ms),
-        skip_probes,
-        payload_bytes,
-        budgets: ErrorBudgets {
-            max_session_errors,
-            max_datagram_errors,
-            max_stream_errors,
+    rt.block_on(run(
+        RunOptions {
+            mode,
+            url: &url,
+            num_sessions: sessions,
+            duration: Duration::from_secs(duration_secs),
+            datagrams_per_sec,
+            streams_per_sec,
+            reconnect_hold: Duration::from_millis(reconnect_hold_ms),
+            skip_probes,
+            payload_bytes,
+            budgets: ErrorBudgets {
+                max_session_errors,
+                max_datagram_errors,
+                max_stream_errors,
+            },
         },
-    }))
+        config,
+    ))
 }
 
 #[derive(Default)]
@@ -524,7 +594,10 @@ async fn run_probe_suite(conn: &wtransport::Connection, counters: &Counters) {
     }
 }
 
-async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    options: RunOptions<'_>,
+    config: ClientConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let RunOptions {
         mode,
         url,
@@ -537,10 +610,6 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         payload_bytes,
         budgets,
     } = options;
-    let config = ClientConfig::builder()
-        .with_bind_default()
-        .with_no_cert_validation()
-        .build();
 
     let endpoint = Arc::new(Endpoint::client(config)?);
     let counters = Arc::new(Counters::default());
@@ -896,7 +965,8 @@ async fn run_reconnect_worker(
 mod tests {
     use super::{
         cpu_ms_from_stat, format_sent_progress, frame_wt_datagram, load_summary_json,
-        parse_client_mode, parse_or_default, ClientMode, Counters, ProgressSnap,
+        parse_client_mode, parse_congestion, parse_or_default, ClientMode, Congestion, Counters,
+        ProgressSnap,
     };
     use std::sync::atomic::Ordering;
 
@@ -926,6 +996,14 @@ mod tests {
     #[test]
     fn parse_client_mode_falls_back_on_unknown_values() {
         assert_eq!(parse_client_mode(Some("unknown")), ClientMode::Load);
+    }
+
+    #[test]
+    fn parse_congestion_maps_cubic_and_bbr() {
+        assert_eq!(parse_congestion(None).unwrap(), Congestion::Cubic);
+        assert_eq!(parse_congestion(Some("cubic")).unwrap(), Congestion::Cubic);
+        assert_eq!(parse_congestion(Some("bbr")).unwrap(), Congestion::Bbr);
+        assert!(parse_congestion(Some("newreno")).is_err());
     }
 
     #[test]

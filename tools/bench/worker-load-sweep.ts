@@ -80,6 +80,10 @@ const RMEM_MODES = (process.env.SWEEP_RMEM_MODES ?? "default")
 	.split(",")
 	.map((s) => s.trim())
 	.filter((s): s is "default" | "raised" => s === "default" || s === "raised");
+const CC_MODES = (process.env.SWEEP_CC_MODES ?? "cubic")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s): s is "cubic" | "bbr" => s === "cubic" || s === "bbr");
 const RMEM_RAISED_BYTES = 8 * 1024 * 1024;
 /** Load-generator processes sharing the sessions. */
 const CLIENTS = Number(process.env.SWEEP_CLIENTS ?? "2");
@@ -116,6 +120,7 @@ export type SweepArm = {
 	sendMode: "drop" | "wait";
 	cpuMode: "shared" | "split";
 	rmemMode: "default" | "raised";
+	ccMode: "cubic" | "bbr";
 };
 
 export function sweepArms(): SweepArm[] {
@@ -125,17 +130,20 @@ export function sweepArms(): SweepArm[] {
 			for (const sendMode of SEND_MODES) {
 				for (const workers of WORKERS) {
 					for (const requestedPerSec of RATES) {
-						arms.push({
-							workers,
-							requestedPerSec,
-							ratePerSession: Math.max(
-								1,
-								Math.round(requestedPerSec / SESSIONS),
-							),
-							sendMode,
-							cpuMode,
-							rmemMode,
-						});
+						for (const ccMode of CC_MODES) {
+							arms.push({
+								workers,
+								requestedPerSec,
+								ratePerSession: Math.max(
+									1,
+									Math.round(requestedPerSec / SESSIONS),
+								),
+								sendMode,
+								cpuMode,
+								rmemMode,
+								ccMode,
+							});
+						}
 					}
 				}
 			}
@@ -150,11 +158,13 @@ export const armKey = (a: {
 	sendMode?: "drop" | "wait";
 	cpuMode?: "shared" | "split";
 	rmemMode?: "default" | "raised";
+	ccMode?: "cubic" | "bbr";
 }): string => {
 	let key = `w${a.workers}@${a.requestedPerSec}`;
 	if (a.sendMode && a.sendMode !== "drop") key += `@${a.sendMode}`;
 	if (a.cpuMode && a.cpuMode !== "shared") key += `@${a.cpuMode}`;
 	if (a.rmemMode && a.rmemMode !== "default") key += `@${a.rmemMode}`;
+	if (a.ccMode && a.ccMode !== "cubic") key += `@${a.ccMode}`;
 	return key;
 };
 
@@ -187,6 +197,7 @@ export type SweepRun = {
 	clientAffinityOk: boolean;
 	skRcvbuf: number | null;
 	skDrops: number | null;
+	appliedCongestion: string | null;
 };
 
 function gitOutput(args: string[]): string {
@@ -257,6 +268,7 @@ async function runOne(
 				WT_PROBE_PAYLOAD_BYTES: String(PAYLOAD_BYTES),
 				WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1",
 				WT_PROBE_CLIENT_TASKSET: arm.cpuMode === "split" ? splitTaskset : "",
+				WT_PROBE_CONGESTION: arm.ccMode,
 			},
 		},
 	);
@@ -317,6 +329,7 @@ async function runOne(
 			clientAffinityOk: run.clientAffinityOk !== false,
 			skRcvbuf: run.skRcvbuf ?? null,
 			skDrops: run.skDrops ?? null,
+			appliedCongestion: run.appliedCongestion ?? null,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -658,6 +671,82 @@ export function classifyRmem(input: {
 	};
 }
 
+export type CcBucket = "cc" | "not-cc" | "incomplete";
+
+export type CcCap = {
+	cubicFrameTxPerSec: number | null;
+	bbrFrameTxPerSec: number | null;
+	ratio: number | null;
+	stopBucket: CcBucket;
+};
+
+export function classifyCc(input: {
+	summaries: readonly ArmSummary[];
+	rmemModes: readonly string[];
+	cpuModes: readonly string[];
+	sessions: number;
+}): CcCap {
+	const cubic = input.summaries.filter((s) => !s.key.endsWith("@bbr"));
+	const bbr = input.summaries.filter((s) => s.key.endsWith("@bbr"));
+	const cubicFrameTxPerSec = medianFrameTx(cubic);
+	const bbrFrameTxPerSec = medianFrameTx(bbr);
+	const ratio =
+		cubicFrameTxPerSec != null &&
+		bbrFrameTxPerSec != null &&
+		cubicFrameTxPerSec > 0
+			? bbrFrameTxPerSec / cubicFrameTxPerSec
+			: null;
+	const cubicReproduced =
+		cubicFrameTxPerSec != null &&
+		cubicFrameTxPerSec >= SHARED_FRAME_TX_MIN &&
+		cubicFrameTxPerSec <= SHARED_FRAME_TX_MAX;
+	const printMatches = (
+		arms: readonly ArmSummary[],
+		expected: string,
+	): boolean =>
+		arms.length > 0 &&
+		arms.every((s) => s.runs.every((r) => r.appliedCongestion === expected));
+	const sessionsHealthy = (arms: readonly ArmSummary[]): boolean =>
+		arms.every((s) =>
+			s.runs.every((r) => r.sessionsOk >= 0.9 * input.sessions),
+		);
+	const mixedRmem = input.rmemModes.some((m) => m !== "default");
+	const mixedCpu = input.cpuModes.some((m) => m !== "shared");
+	const incomplete =
+		mixedRmem ||
+		mixedCpu ||
+		bbr.length === 0 ||
+		cubicFrameTxPerSec == null ||
+		bbrFrameTxPerSec == null ||
+		bbrFrameTxPerSec === 0 ||
+		!cubicReproduced ||
+		!printMatches(cubic, "cubic") ||
+		!printMatches(bbr, "bbr") ||
+		!sessionsHealthy(cubic) ||
+		!sessionsHealthy(bbr) ||
+		bbrFrameTxPerSec < SHARED_FRAME_TX_MIN ||
+		(ratio != null &&
+			ratio >= CORESPLIT_RATIO &&
+			bbrFrameTxPerSec <= SHARED_FRAME_TX_MAX);
+	let stopBucket: CcBucket = "incomplete";
+	if (!incomplete && ratio != null && bbrFrameTxPerSec != null) {
+		if (ratio >= CORESPLIT_RATIO && bbrFrameTxPerSec > SHARED_FRAME_TX_MAX) {
+			stopBucket = "cc";
+		} else if (
+			ratio < CORESPLIT_RATIO &&
+			bbrFrameTxPerSec >= SHARED_FRAME_TX_MIN
+		) {
+			stopBucket = "not-cc";
+		}
+	}
+	return {
+		cubicFrameTxPerSec,
+		bbrFrameTxPerSec,
+		ratio,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -680,7 +769,7 @@ async function main(): Promise<void> {
 	console.log(
 		`sweep: host cpus=${capacity.cpus} mem=${capacity.memoryMb}MB sessions=${SESSIONS} ` +
 			`clients=${CLIENTS} workers=[${WORKERS.join(",")}] rates=[${RATES.join(",")}] ` +
-			`cpuModes=[${CPU_MODES.join(",")}]`,
+			`cpuModes=[${CPU_MODES.join(",")}] ccModes=[${CC_MODES.join(",")}]`,
 	);
 
 	const siblingMap = readHostSiblingMap(capacity.cpus);
@@ -757,6 +846,12 @@ async function main(): Promise<void> {
 		rmemDefaultWrote,
 		controlRmemDefault: origRmemDefault,
 	});
+	const cc = classifyCc({
+		summaries,
+		rmemModes: RMEM_MODES,
+		cpuModes: CPU_MODES,
+		sessions: SESSIONS,
+	});
 	const failures = [
 		...proofFailures(summaries),
 		...(gitOutput(["rev-parse", "HEAD"]) === head
@@ -796,6 +891,7 @@ async function main(): Promise<void> {
 			sendModes: SEND_MODES,
 			cpuModes: CPU_MODES,
 			rmemModes: RMEM_MODES,
+			ccModes: CC_MODES,
 			rmemDefault: origRmemDefault,
 			rmemMax: origRmemMax,
 			rmemRaised: raisedBytes,
@@ -804,6 +900,7 @@ async function main(): Promise<void> {
 		waitVsDrop,
 		coresplit,
 		rmem,
+		cc,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -834,6 +931,11 @@ async function main(): Promise<void> {
 			if (r.skRcvbuf != null) {
 				console.log(
 					`  ${s.key} r${r.round} sk: rcvbuf=${r.skRcvbuf} drops=${r.skDrops ?? "n/a"}`,
+				);
+			}
+			if (r.appliedCongestion) {
+				console.log(
+					`  ${s.key} r${r.round} cc: applied=${r.appliedCongestion}`,
 				);
 			}
 		}
@@ -908,6 +1010,16 @@ async function main(): Promise<void> {
 				`ratio=${rmem.ratio == null ? "n/a" : rmem.ratio.toFixed(2)} ` +
 				`defaultSk=${n(rmem.defaultSkRcvbuf)} raisedSk=${n(rmem.raisedSkRcvbuf)} ` +
 				`wrote=${rmem.rmemDefaultWrote} STOP=${rmem.stopBucket}`,
+		);
+	}
+	if (CC_MODES.includes("bbr")) {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  cc: cubicFrameTx=${n(cc.cubicFrameTxPerSec)} ` +
+				`bbrFrameTx=${n(cc.bbrFrameTxPerSec)} ` +
+				`ratio=${cc.ratio == null ? "n/a" : cc.ratio.toFixed(2)} ` +
+				`STOP=${cc.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)

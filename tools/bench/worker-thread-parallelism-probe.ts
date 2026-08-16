@@ -97,6 +97,8 @@ const DISCARD = process.env.WT_PROBE_DISCARD === "1";
 const STREAMS_PER_SEC = Number(process.env.WT_PROBE_STREAMS_PER_SEC ?? "0");
 /** `taskset -c` list for load-client only; empty means unpinned (shared arm). */
 const CLIENT_TASKSET = (process.env.WT_PROBE_CLIENT_TASKSET ?? "").trim();
+/** load-client CC factory: cubic (control) or bbr. */
+const CONGESTION = (process.env.WT_PROBE_CONGESTION ?? "cubic").trim();
 /** Restrict the worker sweep, e.g. `1` for a hop A/B at the collapse default. */
 const WORKER_FILTER = (process.env.WT_PROBE_WORKERS ?? "")
 	.split(",")
@@ -278,7 +280,23 @@ export type ArmRun = {
 	clientAffinityOk: boolean;
 	skRcvbuf: number | null;
 	skDrops: number | null;
+	appliedCongestion: string | null;
 };
+
+export function parseAppliedCongestion(
+	stdout: readonly string[],
+): string | null {
+	const labels = stdout
+		.flatMap((text) =>
+			[...text.matchAll(/^load-client: .* congestion=(\w+)/gm)].map(
+				(m) => m[1] ?? "",
+			),
+		)
+		.filter((s) => s.length > 0);
+	if (labels.length === 0) return null;
+	const first = labels[0] ?? null;
+	return first != null && labels.every((s) => s === first) ? first : null;
+}
 
 export function median(values: number[]): number {
 	const sorted = [...values].sort((a, b) => a - b);
@@ -1155,6 +1173,8 @@ async function runChild(
 			"1000000000",
 			"--max-stream-errors",
 			"1000000000",
+			"--congestion",
+			CONGESTION === "bbr" ? "bbr" : "cubic",
 		];
 		return Bun.spawn(
 			CLIENT_TASKSET ? ["taskset", "-c", CLIENT_TASKSET, ...args] : args,
@@ -1350,6 +1370,7 @@ async function runChild(
 		clientAffinityOk,
 		skRcvbuf: skmem?.recvbuf ?? null,
 		skDrops: skmem?.drops ?? null,
+		appliedCongestion: parseAppliedCongestion(stdout),
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);

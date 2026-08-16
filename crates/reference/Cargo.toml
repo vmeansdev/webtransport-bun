@@ -21,6 +21,7 @@ path = "src/gso_probe.rs"
 
 [dependencies]
 wtransport = { workspace = true }
+rustls = { version = "0.23", features = ["ring"] }
 bytes = "1"
 quinn-udp = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }

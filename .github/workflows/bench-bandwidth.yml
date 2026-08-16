@@ -143,12 +143,13 @@ jobs:
         env:
           SWEEP_SESSIONS: ${{ github.event.inputs.sessions }}
           SWEEP_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
-          SWEEP_RATES: ${{ github.event.inputs.worker_sweep_rates }}
-          SWEEP_WORKERS: ${{ github.event.inputs.worker_sweep_workers }}
           SWEEP_CLIENTS: ${{ github.event.inputs.worker_sweep_clients }}
           SWEEP_SEND_MODES: wait
           SWEEP_CPU_MODES: shared
-          SWEEP_RMEM_MODES: default,raised
+          SWEEP_RMEM_MODES: default
+          SWEEP_CC_MODES: cubic,bbr
+          SWEEP_RATES: "160000"
+          SWEEP_WORKERS: "2"
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           SWEEP_OUT="$GITHUB_WORKSPACE/.bench-evidence/worker-load-sweep-${{ github.event.inputs.candidate_commit }}.json" \

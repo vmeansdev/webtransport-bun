@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	type ArmSummary,
 	armKey,
+	classifyCc,
 	classifyCoresplit,
 	classifyRmem,
 	classifyWaitVsDrop,
@@ -319,6 +320,7 @@ function withFrameTx(
 				clientAffinityOk: true,
 				skRcvbuf,
 				skDrops: 0,
+				appliedCongestion: key.endsWith("@bbr") ? "bbr" : "cubic",
 			},
 		],
 	};
@@ -483,6 +485,84 @@ describe("classifyRmem", () => {
 					withFrameTx("w2@160000@wait", 105_000, 105_000, 212_992),
 					withFrameTx("w2@160000@wait@raised", 130_000, 130_000, 300_000),
 				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+});
+
+describe("classifyCc", () => {
+	const base = {
+		rmemModes: ["default"],
+		cpuModes: ["shared"],
+		sessions: 100,
+	};
+
+	test("bbr 20% above cubic and above 120k is cc", () => {
+		expect(
+			classifyCc({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@bbr", 130_000, 130_000),
+				],
+			}).stopBucket,
+		).toBe("cc");
+	});
+
+	test("same leftover band is not-cc", () => {
+		expect(
+			classifyCc({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@bbr", 106_000, 106_000),
+				],
+			}).stopBucket,
+		).toBe("not-cc");
+	});
+
+	test("gray cell 105k to 121k is not-cc", () => {
+		expect(
+			classifyCc({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@bbr", 121_000, 121_000),
+				],
+			}).stopBucket,
+		).toBe("not-cc");
+	});
+
+	test("91k to 110k stays incomplete", () => {
+		expect(
+			classifyCc({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 91_000, 91_000),
+					withFrameTx("w2@160000@wait@bbr", 110_000, 110_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("print mismatch is incomplete", () => {
+		const bbr = withFrameTx("w2@160000@wait@bbr", 130_000, 130_000);
+		bbr.runs[0]!.appliedCongestion = "cubic";
+		expect(
+			classifyCc({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), bbr],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("sessions_ok below 90 of 100 is incomplete", () => {
+		const bbr = withFrameTx("w2@160000@wait@bbr", 130_000, 130_000);
+		bbr.runs[0]!.sessionsOk = 80;
+		expect(
+			classifyCc({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), bbr],
 			}).stopBucket,
 		).toBe("incomplete");
 	});
