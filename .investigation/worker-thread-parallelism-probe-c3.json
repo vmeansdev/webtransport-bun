@@ -1,0 +1,833 @@
+{
+  "version": 1,
+  "mode": "worker-thread-parallelism-probe",
+  "kind": "probe",
+  "status": "ok",
+  "generatedAtMs": 1786875776362,
+  "head": "d27f1b8b745a232866086d09a49dcadcd2c9509c",
+  "dirty": false,
+  "bunVersion": "1.3.14",
+  "platform": "darwin/arm64",
+  "machine": "Nikitas-MacBook-Pro.local",
+  "command": "bun tools/bench/worker-thread-parallelism-probe.ts",
+  "design": {
+    "aggregateOfferedPerSec": 150000,
+    "saturationSessions": 150,
+    "payloadBytes": 1150,
+    "warmupSec": 5,
+    "measureSec": 20,
+    "reps": 3,
+    "clients": 3,
+    "saturationCeiling": 0.9,
+    "seed": 20260816,
+    "workerOrder": [
+      "r1:workers=2",
+      "r1:workers=auto",
+      "r1:workers=4",
+      "r1:workers=1",
+      "r2:workers=1",
+      "r2:workers=auto",
+      "r2:workers=4",
+      "r2:workers=2",
+      "r3:workers=1",
+      "r3:workers=2",
+      "r3:workers=4",
+      "r3:workers=auto"
+    ],
+    "sessionOrder": [
+      "r1:sessions=4",
+      "r1:sessions=150",
+      "r1:sessions=64",
+      "r1:sessions=16",
+      "r2:sessions=16",
+      "r2:sessions=150",
+      "r2:sessions=4",
+      "r2:sessions=64",
+      "r3:sessions=64",
+      "r3:sessions=16",
+      "r3:sessions=150",
+      "r3:sessions=4"
+    ]
+  },
+  "workerSweep": [
+    {
+      "label": "workers=1",
+      "workers": "1",
+      "sessions": 150,
+      "ratePerSession": 1000,
+      "medianReceivedPerSec": 5373.382473517285,
+      "medianServerCpuCores": 1.3020159393366393,
+      "maxSaturationRatio": 0.03597767581508595,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "label": "workers=1",
+          "round": 1,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 5373.382473517285,
+          "offeredPerSec": 149779.6,
+          "received": 107471,
+          "receivedBytes": 123591650,
+          "clientSent": 3744490,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.623542,
+          "saturationRatio": 0.03587526254254441,
+          "serverCpuCores": 1.3051873580432196,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 2141458
+            }
+          }
+        },
+        {
+          "label": "workers=1",
+          "round": 2,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 5383.335314890213,
+          "offeredPerSec": 149629.88,
+          "received": 107670,
+          "receivedBytes": 123820500,
+          "clientSent": 3740747,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.611833000003,
+          "saturationRatio": 0.03597767581508595,
+          "serverCpuCores": 1.3019853201207816,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 2144948
+            }
+          }
+        },
+        {
+          "label": "workers=1",
+          "round": 3,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 5363.902004967242,
+          "offeredPerSec": 149381.48,
+          "received": 107282,
+          "receivedBytes": 123374300,
+          "clientSent": 3734537,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.73825,
+          "saturationRatio": 0.035907409706793916,
+          "serverCpuCores": 1.3020159393366393,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 2063447
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "workers=2",
+      "workers": "2",
+      "sessions": 150,
+      "ratePerSession": 1000,
+      "medianReceivedPerSec": 89002.15091787625,
+      "medianServerCpuCores": 3.2869834818521846,
+      "maxSaturationRatio": 0.7007434968229107,
+      "minDatagramThreads": 2,
+      "maxDatagramThreads": 2,
+      "configuredWorkers": 2,
+      "runs": [
+        {
+          "label": "workers=2",
+          "round": 1,
+          "workers": "2",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 89002.15091787625,
+          "offeredPerSec": 149315.12,
+          "received": 1780276,
+          "receivedBytes": 2047317400,
+          "clientSent": 3732878,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20002.617708,
+          "saturationRatio": 0.596069245484826,
+          "serverCpuCores": 3.2869834818521846,
+          "workerProof": {
+            "configured": 2,
+            "availableParallelism": 10,
+            "datagramThreads": 2,
+            "perThread": {
+              "wt-server#ThreadId(13)": 884937,
+              "wt-server#ThreadId(12)": 895320
+            }
+          }
+        },
+        {
+          "label": "workers=2",
+          "round": 2,
+          "workers": "2",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 83079.14986589398,
+          "offeredPerSec": 149517.52,
+          "received": 1661598,
+          "receivedBytes": 1910837700,
+          "clientSent": 3737938,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.180583,
+          "saturationRatio": 0.5556482602566842,
+          "serverCpuCores": 2.902546092475949,
+          "workerProof": {
+            "configured": 2,
+            "availableParallelism": 10,
+            "datagramThreads": 2,
+            "perThread": {
+              "wt-server#ThreadId(12)": 834544,
+              "wt-server#ThreadId(13)": 826917
+            }
+          }
+        },
+        {
+          "label": "workers=2",
+          "round": 3,
+          "workers": "2",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 104845.77455970149,
+          "offeredPerSec": 149620.76,
+          "received": 2096932,
+          "receivedBytes": 2411471800,
+          "clientSent": 3740519,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.157457999998,
+          "saturationRatio": 0.7007434968229107,
+          "serverCpuCores": 3.3744694331396,
+          "workerProof": {
+            "configured": 2,
+            "availableParallelism": 10,
+            "datagramThreads": 2,
+            "perThread": {
+              "wt-server#ThreadId(13)": 1045093,
+              "wt-server#ThreadId(12)": 1051700
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "workers=4",
+      "workers": "4",
+      "sessions": 150,
+      "ratePerSession": 1000,
+      "medianReceivedPerSec": 81681.7168992787,
+      "medianServerCpuCores": 3.2653856783974513,
+      "maxSaturationRatio": 0.6156045035335892,
+      "minDatagramThreads": 4,
+      "maxDatagramThreads": 4,
+      "configuredWorkers": 4,
+      "runs": [
+        {
+          "label": "workers=4",
+          "round": 1,
+          "workers": "4",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 92050.1594527308,
+          "offeredPerSec": 149528.08,
+          "received": 1845540,
+          "receivedBytes": 2122371000,
+          "clientSent": 3738202,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20049.286291,
+          "saturationRatio": 0.6156045035335892,
+          "serverCpuCores": 3.8086704879005113,
+          "workerProof": {
+            "configured": 4,
+            "availableParallelism": 10,
+            "datagramThreads": 4,
+            "perThread": {
+              "wt-server#ThreadId(14)": 467727,
+              "wt-server#ThreadId(15)": 461725,
+              "wt-server#ThreadId(12)": 464704,
+              "wt-server#ThreadId(13)": 465468
+            }
+          }
+        },
+        {
+          "label": "workers=4",
+          "round": 2,
+          "workers": "4",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 81271.8379367041,
+          "offeredPerSec": 147962,
+          "received": 1626858,
+          "receivedBytes": 1870886700,
+          "clientSent": 3699050,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20017.4875,
+          "saturationRatio": 0.5492750701984571,
+          "serverCpuCores": 3.2653856783974513,
+          "workerProof": {
+            "configured": 4,
+            "availableParallelism": 10,
+            "datagramThreads": 4,
+            "perThread": {
+              "wt-server#ThreadId(14)": 457029,
+              "wt-server#ThreadId(15)": 452329,
+              "wt-server#ThreadId(13)": 457581,
+              "wt-server#ThreadId(12)": 458564
+            }
+          }
+        },
+        {
+          "label": "workers=4",
+          "round": 3,
+          "workers": "4",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 81681.7168992787,
+          "offeredPerSec": 148996.8,
+          "received": 1637766,
+          "receivedBytes": 1883430900,
+          "clientSent": 3724920,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20050.582458,
+          "saturationRatio": 0.5482112159407364,
+          "serverCpuCores": 3.210122904650035,
+          "workerProof": {
+            "configured": 4,
+            "availableParallelism": 10,
+            "datagramThreads": 4,
+            "perThread": {
+              "wt-server#ThreadId(14)": 474112,
+              "wt-server#ThreadId(15)": 473505,
+              "wt-server#ThreadId(13)": 474507,
+              "wt-server#ThreadId(12)": 472732
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "workers=auto",
+      "workers": "auto",
+      "sessions": 150,
+      "ratePerSession": 1000,
+      "medianReceivedPerSec": 48041.569057164495,
+      "medianServerCpuCores": 3.0962773348774673,
+      "maxSaturationRatio": 0.4029236098798591,
+      "minDatagramThreads": 10,
+      "maxDatagramThreads": 10,
+      "configuredWorkers": 10,
+      "runs": [
+        {
+          "label": "workers=auto",
+          "round": 1,
+          "workers": "auto",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 35400.89709143194,
+          "offeredPerSec": 144405.88,
+          "received": 713352,
+          "receivedBytes": 820354800,
+          "clientSent": 3610147,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20150.675791,
+          "saturationRatio": 0.24514858461048777,
+          "serverCpuCores": 2.408022515139279,
+          "workerProof": {
+            "configured": 10,
+            "availableParallelism": 10,
+            "datagramThreads": 10,
+            "perThread": {
+              "wt-server#ThreadId(21)": 157182,
+              "wt-server#ThreadId(14)": 153414,
+              "wt-server#ThreadId(19)": 154423,
+              "wt-server#ThreadId(16)": 158568,
+              "wt-server#ThreadId(13)": 156600,
+              "wt-server#ThreadId(12)": 156718,
+              "wt-server#ThreadId(18)": 161129,
+              "wt-server#ThreadId(17)": 159628,
+              "wt-server#ThreadId(20)": 155370,
+              "wt-server#ThreadId(15)": 161772
+            }
+          }
+        },
+        {
+          "label": "workers=auto",
+          "round": 2,
+          "workers": "auto",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 59955.22655345578,
+          "offeredPerSec": 148800.48,
+          "received": 1199270,
+          "receivedBytes": 1379160500,
+          "clientSent": 3720012,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20002.759875000003,
+          "saturationRatio": 0.4029236098798591,
+          "serverCpuCores": 3.5020089946462947,
+          "workerProof": {
+            "configured": 10,
+            "availableParallelism": 10,
+            "datagramThreads": 10,
+            "perThread": {
+              "wt-server#ThreadId(21)": 175768,
+              "wt-server#ThreadId(17)": 172503,
+              "wt-server#ThreadId(12)": 171530,
+              "wt-server#ThreadId(19)": 171308,
+              "wt-server#ThreadId(15)": 167898,
+              "wt-server#ThreadId(20)": 172274,
+              "wt-server#ThreadId(14)": 171496,
+              "wt-server#ThreadId(16)": 177203,
+              "wt-server#ThreadId(13)": 178302,
+              "wt-server#ThreadId(18)": 172883
+            }
+          }
+        },
+        {
+          "label": "workers=auto",
+          "round": 3,
+          "workers": "auto",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 48041.569057164495,
+          "offeredPerSec": 148914.8,
+          "received": 961713,
+          "receivedBytes": 1105969950,
+          "clientSent": 3722870,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20018.351167,
+          "saturationRatio": 0.3226111108980739,
+          "serverCpuCores": 3.0962773348774673,
+          "workerProof": {
+            "configured": 10,
+            "availableParallelism": 10,
+            "datagramThreads": 10,
+            "perThread": {
+              "wt-server#ThreadId(17)": 165978,
+              "wt-server#ThreadId(13)": 162380,
+              "wt-server#ThreadId(15)": 164056,
+              "wt-server#ThreadId(16)": 160908,
+              "wt-server#ThreadId(18)": 162857,
+              "wt-server#ThreadId(19)": 165787,
+              "wt-server#ThreadId(14)": 161951,
+              "wt-server#ThreadId(20)": 161641,
+              "wt-server#ThreadId(21)": 163116,
+              "wt-server#ThreadId(12)": 163644
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "sessionSweep": [
+    {
+      "label": "sessions=4",
+      "workers": "1",
+      "sessions": 4,
+      "ratePerSession": 37500,
+      "medianReceivedPerSec": 4999.44521517636,
+      "medianServerCpuCores": 1.1886113501171558,
+      "maxSaturationRatio": 0.06781539021213313,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "label": "sessions=4",
+          "round": 1,
+          "workers": "1",
+          "sessions": 4,
+          "ratePerSession": 37500,
+          "receivedPerSec": 9695.845738036347,
+          "offeredPerSec": 142974.12,
+          "received": 193924,
+          "receivedBytes": 223012600,
+          "clientSent": 3574353,
+          "clientSendErrors": 0,
+          "sessionsOk": 4,
+          "sessionsErr": 0,
+          "windowMs": 20000.73075,
+          "saturationRatio": 0.06781539021213313,
+          "serverCpuCores": 1.3000466495455425,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 2081071
+            }
+          }
+        },
+        {
+          "label": "sessions=4",
+          "round": 2,
+          "workers": "1",
+          "sessions": 4,
+          "ratePerSession": 37500,
+          "receivedPerSec": 4849.478025327294,
+          "offeredPerSec": 134347.12,
+          "received": 96994,
+          "receivedBytes": 111543100,
+          "clientSent": 3358678,
+          "clientSendErrors": 0,
+          "sessionsOk": 4,
+          "sessionsErr": 0,
+          "windowMs": 20000.915458000003,
+          "saturationRatio": 0.03609662808795078,
+          "serverCpuCores": 1.1583676781521046,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1145757
+            }
+          }
+        },
+        {
+          "label": "sessions=4",
+          "round": 3,
+          "workers": "1",
+          "sessions": 4,
+          "ratePerSession": 37500,
+          "receivedPerSec": 4999.44521517636,
+          "offeredPerSec": 135726.4,
+          "received": 99992,
+          "receivedBytes": 114990800,
+          "clientSent": 3393160,
+          "clientSendErrors": 0,
+          "sessionsOk": 4,
+          "sessionsErr": 0,
+          "windowMs": 20000.619208,
+          "saturationRatio": 0.03683472939071809,
+          "serverCpuCores": 1.1886113501171558,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1178201
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "sessions=16",
+      "workers": "1",
+      "sessions": 16,
+      "ratePerSession": 9375,
+      "medianReceivedPerSec": 5365.1130741923425,
+      "medianServerCpuCores": 1.2178573253238225,
+      "maxSaturationRatio": 0.036447447121787206,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "label": "sessions=16",
+          "round": 1,
+          "workers": "1",
+          "sessions": 16,
+          "ratePerSession": 9375,
+          "receivedPerSec": 5390.04529658435,
+          "offeredPerSec": 147885.4,
+          "received": 107815,
+          "receivedBytes": 123987250,
+          "clientSent": 3697135,
+          "clientSendErrors": 0,
+          "sessionsOk": 16,
+          "sessionsErr": 0,
+          "windowMs": 20002.614833,
+          "saturationRatio": 0.036447447121787206,
+          "serverCpuCores": 1.2178573253238225,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1817642
+            }
+          }
+        },
+        {
+          "label": "sessions=16",
+          "round": 2,
+          "workers": "1",
+          "sessions": 16,
+          "ratePerSession": 9375,
+          "receivedPerSec": 5365.1130741923425,
+          "offeredPerSec": 148580.88,
+          "received": 107307,
+          "receivedBytes": 123403050,
+          "clientSent": 3714522,
+          "clientSendErrors": 0,
+          "sessionsOk": 16,
+          "sessionsErr": 0,
+          "windowMs": 20000.883209,
+          "saturationRatio": 0.03610904090884603,
+          "serverCpuCores": 1.2264216406684583,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1689561
+            }
+          }
+        },
+        {
+          "label": "sessions=16",
+          "round": 3,
+          "workers": "1",
+          "sessions": 16,
+          "ratePerSession": 9375,
+          "receivedPerSec": 5321.1043496444445,
+          "offeredPerSec": 146908.52,
+          "received": 106426,
+          "receivedBytes": 122389900,
+          "clientSent": 3672713,
+          "clientSendErrors": 0,
+          "sessionsOk": 16,
+          "sessionsErr": 0,
+          "windowMs": 20000.735375,
+          "saturationRatio": 0.0362205292766168,
+          "serverCpuCores": 1.201108486742328,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1550436
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "sessions=64",
+      "workers": "1",
+      "sessions": 64,
+      "ratePerSession": 2344,
+      "medianReceivedPerSec": 5376.614873910796,
+      "medianServerCpuCores": 1.1977826834069252,
+      "maxSaturationRatio": 0.036864508761935685,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "label": "sessions=64",
+          "round": 1,
+          "workers": "1",
+          "sessions": 64,
+          "ratePerSession": 2344,
+          "receivedPerSec": 5389.480621240053,
+          "offeredPerSec": 149403.4,
+          "received": 107799,
+          "receivedBytes": 123968850,
+          "clientSent": 3735085,
+          "clientSendErrors": 0,
+          "sessionsOk": 64,
+          "sessionsErr": 0,
+          "windowMs": 20001.741833,
+          "saturationRatio": 0.03607334653187312,
+          "serverCpuCores": 1.2944011184708304,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 2077622
+            }
+          }
+        },
+        {
+          "label": "sessions=64",
+          "round": 2,
+          "workers": "1",
+          "sessions": 64,
+          "ratePerSession": 2344,
+          "receivedPerSec": 5376.614873910796,
+          "offeredPerSec": 145848,
+          "received": 107537,
+          "receivedBytes": 123667550,
+          "clientSent": 3646200,
+          "clientSendErrors": 0,
+          "sessionsOk": 64,
+          "sessionsErr": 0,
+          "windowMs": 20000.874625,
+          "saturationRatio": 0.036864508761935685,
+          "serverCpuCores": 1.0910388375078373,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1207192
+            }
+          }
+        },
+        {
+          "label": "sessions=64",
+          "round": 3,
+          "workers": "1",
+          "sessions": 64,
+          "ratePerSession": 2344,
+          "receivedPerSec": 5372.881395283856,
+          "offeredPerSec": 147580.4,
+          "received": 107467,
+          "receivedBytes": 123587050,
+          "clientSent": 3689510,
+          "clientSendErrors": 0,
+          "sessionsOk": 64,
+          "sessionsErr": 0,
+          "windowMs": 20001.744333,
+          "saturationRatio": 0.036406469932889846,
+          "serverCpuCores": 1.1977826834069252,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1345516
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "sessions=150",
+      "workers": "1",
+      "sessions": 150,
+      "ratePerSession": 1000,
+      "medianReceivedPerSec": 5364.914754996597,
+      "medianServerCpuCores": 1.2035373756612653,
+      "maxSaturationRatio": 0.03656136087546113,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "label": "sessions=150",
+          "round": 1,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 5352.40284183274,
+          "offeredPerSec": 148486.12,
+          "received": 107052,
+          "receivedBytes": 123109800,
+          "clientSent": 3712153,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.736709,
+          "saturationRatio": 0.03604648597345489,
+          "serverCpuCores": 1.270073516270495,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1815744
+            }
+          }
+        },
+        {
+          "label": "sessions=150",
+          "round": 2,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 5364.914754996597,
+          "offeredPerSec": 148039.12,
+          "received": 107312,
+          "receivedBytes": 123408800,
+          "clientSent": 3700978,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20002.554541999998,
+          "saturationRatio": 0.036239844947717856,
+          "serverCpuCores": 1.2035373756612653,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1357662
+            }
+          }
+        },
+        {
+          "label": "sessions=150",
+          "round": 3,
+          "workers": "1",
+          "sessions": 150,
+          "ratePerSession": 1000,
+          "receivedPerSec": 5407.308277125899,
+          "offeredPerSec": 147896.8,
+          "received": 108150,
+          "receivedBytes": 124372500,
+          "clientSent": 3697420,
+          "clientSendErrors": 0,
+          "sessionsOk": 150,
+          "sessionsErr": 0,
+          "windowMs": 20000.709125,
+          "saturationRatio": 0.03656136087546113,
+          "serverCpuCores": 1.1698718707304834,
+          "workerProof": {
+            "configured": 1,
+            "availableParallelism": 10,
+            "datagramThreads": 1,
+            "perThread": {
+              "wt-server#ThreadId(12)": 1261500
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "workerSpeedup": 16.563524252465434,
+  "failures": []
+}

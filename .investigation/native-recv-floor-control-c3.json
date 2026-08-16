@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "mode": "native-recv-floor-control",
+  "kind": "probe",
+  "status": "ok",
+  "generatedAtMs": 1786874996020,
+  "head": "750bc91042e40029d7b195f8d3208dda5f05c36c",
+  "bunVersion": "1.3.14",
+  "platform": "darwin/arm64",
+  "machine": "Nikitas-MacBook-Pro.local",
+  "command": "bun tools/bench/native-recv-floor-control.ts",
+  "design": {
+    "sessions": 150,
+    "aggregateOfferedPerSec": 150000,
+    "payloadBytes": 1150,
+    "warmupSec": 5,
+    "measureSec": 20,
+    "reps": 3,
+    "clients": 3,
+    "arms": [
+      "1",
+      "auto"
+    ]
+  },
+  "arms": [
+    {
+      "workers": "1",
+      "medianReceivedPerSec": 115556.551,
+      "medianServerCpuCores": 0.9836,
+      "maxSaturationRatio": 0.7810359853386701,
+      "minDatagramThreads": 1,
+      "maxDatagramThreads": 1,
+      "configuredWorkers": 1,
+      "runs": [
+        {
+          "workers": "1",
+          "round": 1,
+          "receivedPerSec": 116362.74,
+          "offeredPerSec": 148985.12,
+          "received": 2327367,
+          "windowMs": 20000.964,
+          "saturationRatio": 0.7810359853386701,
+          "serverCpuCores": 0.9875,
+          "configuredWorkers": 1,
+          "datagramThreads": 1,
+          "sessionsAccepted": 150,
+          "clientSent": 3724628,
+          "clientSendErrors": 0,
+          "sessionsOk": 150
+        },
+        {
+          "workers": "1",
+          "round": 2,
+          "receivedPerSec": 115131.871,
+          "offeredPerSec": 148869.08,
+          "received": 2302758,
+          "windowMs": 20001.047,
+          "saturationRatio": 0.7733766541715715,
+          "serverCpuCores": 0.9836,
+          "configuredWorkers": 1,
+          "datagramThreads": 1,
+          "sessionsAccepted": 150,
+          "clientSent": 3721727,
+          "clientSendErrors": 0,
+          "sessionsOk": 150
+        },
+        {
+          "workers": "1",
+          "round": 3,
+          "receivedPerSec": 115556.551,
+          "offeredPerSec": 149053.36,
+          "received": 2311272,
+          "windowMs": 20001.22,
+          "saturationRatio": 0.7752696819447747,
+          "serverCpuCores": 0.9834,
+          "configuredWorkers": 1,
+          "datagramThreads": 1,
+          "sessionsAccepted": 150,
+          "clientSent": 3726334,
+          "clientSendErrors": 0,
+          "sessionsOk": 150
+        }
+      ]
+    },
+    {
+      "workers": "auto",
+      "medianReceivedPerSec": 106508.369,
+      "medianServerCpuCores": 2.8736,
+      "maxSaturationRatio": 0.7283496083081615,
+      "minDatagramThreads": 10,
+      "maxDatagramThreads": 10,
+      "configuredWorkers": 10,
+      "runs": [
+        {
+          "workers": "auto",
+          "round": 1,
+          "receivedPerSec": 108274.763,
+          "offeredPerSec": 148657.68,
+          "received": 2165640,
+          "windowMs": 20001.337,
+          "saturationRatio": 0.7283496083081615,
+          "serverCpuCores": 2.9473,
+          "configuredWorkers": 10,
+          "datagramThreads": 10,
+          "sessionsAccepted": 150,
+          "clientSent": 3716442,
+          "clientSendErrors": 0,
+          "sessionsOk": 150
+        },
+        {
+          "workers": "auto",
+          "round": 2,
+          "receivedPerSec": 106508.369,
+          "offeredPerSec": 148314.76,
+          "received": 2130275,
+          "windowMs": 20001.01,
+          "saturationRatio": 0.7181238671053373,
+          "serverCpuCores": 2.8736,
+          "configuredWorkers": 10,
+          "datagramThreads": 10,
+          "sessionsAccepted": 150,
+          "clientSent": 3707869,
+          "clientSendErrors": 0,
+          "sessionsOk": 150
+        },
+        {
+          "workers": "auto",
+          "round": 3,
+          "receivedPerSec": 105437.392,
+          "offeredPerSec": 148676.04,
+          "received": 2108851,
+          "windowMs": 20000.978,
+          "saturationRatio": 0.709175412527802,
+          "serverCpuCores": 2.7929,
+          "configuredWorkers": 10,
+          "datagramThreads": 10,
+          "sessionsAccepted": 150,
+          "clientSent": 3716901,
+          "clientSendErrors": 0,
+          "sessionsOk": 150
+        }
+      ]
+    }
+  ],
+  "failures": []
+}
