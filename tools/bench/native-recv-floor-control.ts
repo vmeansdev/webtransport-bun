@@ -36,11 +36,6 @@ import {
 } from "./worker-thread-parallelism-probe.ts";
 
 const ROOT = resolve(import.meta.dir, "..", "..");
-const ARTIFACT_PATH = join(
-	ROOT,
-	".investigation",
-	"native-recv-floor-control.json",
-);
 const CLIENT_BIN = join(ROOT, "target", "release", "load-client");
 const SERVER_BIN = join(ROOT, "target", "release", "recv-floor-server");
 const COMMAND = "bun tools/bench/native-recv-floor-control.ts";
@@ -53,6 +48,13 @@ const MEASURE_SEC = Number(process.env.WT_PROBE_MEASURE_SEC ?? "20");
 const REPS = Number(process.env.WT_PROBE_REPS ?? "3");
 const BASE_PORT = 49_110;
 const BIND_WAIT_MS = 2_000;
+/** Load-generator processes sharing the session count. */
+const CLIENTS = Number(process.env.WT_PROBE_CLIENTS ?? "1");
+const ARTIFACT_PATH = join(
+	ROOT,
+	".investigation",
+	`native-recv-floor-control${CLIENTS > 1 ? `-c${CLIENTS}` : ""}.json`,
+);
 const ARMS = ["1", "auto"] as const;
 
 type Run = {
@@ -101,35 +103,51 @@ async function runOne(
 	const serverStderr = new Response(server.stderr).text();
 	await Bun.sleep(BIND_WAIT_MS);
 
-	const client = Bun.spawn(
-		[
-			CLIENT_BIN,
-			"--url",
-			`https://127.0.0.1:${port}`,
-			"--mode",
-			"load",
-			"--skip-probes",
-			"--sessions",
-			String(SESSIONS),
-			"--duration",
-			String(WARMUP_SEC + MEASURE_SEC),
-			"--datagrams-per-sec",
-			String(rate),
-			"--streams-per-sec",
-			"0",
-			"--payload-bytes",
-			String(PAYLOAD_BYTES),
-			"--max-session-errors",
-			String(SESSIONS),
-			"--max-datagram-errors",
-			"1000000000",
-			"--max-stream-errors",
-			"1000000000",
-		],
-		{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
+	// One load-client offers a stubbornly flat ~65k/s here regardless of what the
+	// server does, which is close enough to the measured receive rate that the
+	// generator itself is a candidate for the ceiling. Sharding the same session
+	// count over several client processes tells the two apart.
+	const perClientSessions = Math.floor(SESSIONS / CLIENTS);
+	const clients = Array.from({ length: CLIENTS }, (_, i) =>
+		Bun.spawn(
+			[
+				CLIENT_BIN,
+				"--url",
+				`https://127.0.0.1:${port}`,
+				"--mode",
+				"load",
+				"--skip-probes",
+				"--sessions",
+				String(
+					i === 0
+						? SESSIONS - perClientSessions * (CLIENTS - 1)
+						: perClientSessions,
+				),
+				"--duration",
+				String(WARMUP_SEC + MEASURE_SEC),
+				"--datagrams-per-sec",
+				String(rate),
+				"--streams-per-sec",
+				"0",
+				"--payload-bytes",
+				String(PAYLOAD_BYTES),
+				"--max-session-errors",
+				String(SESSIONS),
+				"--max-datagram-errors",
+				"1000000000",
+				"--max-stream-errors",
+				"1000000000",
+			],
+			{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
+		),
 	);
-	const clientStdout = await new Response(client.stdout).text();
-	await client.exited;
+	const clientOutputs = await Promise.all(
+		clients.map(async (c) => {
+			const text = await new Response(c.stdout).text();
+			await c.exited;
+			return text;
+		}),
+	);
 
 	const out = await serverStdout;
 	server.kill("SIGKILL");
@@ -141,10 +159,11 @@ async function runOne(
 		);
 	}
 	const server_ = JSON.parse(line.slice("__SERVER_RESULT__".length));
-	const num = (re: RegExp): number => {
-		const m = clientStdout.match(re);
-		return m?.[1] ? Number.parseInt(m[1], 10) : 0;
-	};
+	const num = (re: RegExp): number =>
+		clientOutputs.reduce((total, text) => {
+			const m = text.match(re);
+			return total + (m?.[1] ? Number.parseInt(m[1], 10) : 0);
+		}, 0);
 	const clientSent = num(/datagrams sent=(\d+)/);
 	const offeredPerSec = clientSent / (WARMUP_SEC + MEASURE_SEC);
 	return {
@@ -242,6 +261,7 @@ async function main(): Promise<void> {
 			warmupSec: WARMUP_SEC,
 			measureSec: MEASURE_SEC,
 			reps: REPS,
+			clients: CLIENTS,
 			arms: [...ARMS],
 		},
 		arms: byArm,
@@ -251,7 +271,7 @@ async function main(): Promise<void> {
 	writeFileSync(ARTIFACT_PATH, JSON.stringify(artifact, null, 2));
 
 	console.log(
-		`\n  NATIVE CONTROL (${SESSIONS} sessions, no addon / no N-API / no JS)`,
+		`\n  NATIVE CONTROL (${SESSIONS} sessions over ${CLIENTS} client process(es), no addon / no N-API / no JS)`,
 	);
 	for (const arm of byArm) {
 		console.log(
