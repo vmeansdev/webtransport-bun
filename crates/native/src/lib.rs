@@ -483,12 +483,22 @@ pub fn native_await_probe_snapshot() -> std::collections::HashMap<String, i64> {
         .collect()
 }
 
-/// Investigation probe: how the server runtime was configured, and which OS
-/// threads actually processed datagrams. Keys are `configuredServerWorkerThreads`,
-/// `availableParallelism`, `datagramThreads` (threads with a non-zero count) and
-/// one `thread:<name>#ThreadId(n)` entry per registered thread.
+/// Investigation probe: how the server runtime was configured, which OS threads
+/// processed datagrams, and how much CPU each of them consumed.
+///
+/// This function necessarily executes on Bun's JS thread, which is what lets it
+/// report that thread's own CPU clock — the number needed to say whether the JS
+/// thread or the tokio worker is the pinned one. Keys are
+/// `configuredServerWorkerThreads`, `availableParallelism`, `datagramThreads`,
+/// `timingEnabled`, and per registered thread `thread:<label>` (datagrams),
+/// `cpuNanos:<label>`, `rateLimitNanos:<label>` and `rateLimitCalls:<label>`.
+/// The JS thread appears with a zero datagram count and a non-zero CPU time.
 #[napi]
 pub fn native_worker_probe_snapshot() -> std::collections::HashMap<String, i64> {
+    // Registers Bun's JS thread on first call and refreshes its CPU reading on
+    // every call, so it shows up in the table alongside the tokio workers.
+    worker_probe::record_current_thread_cpu();
+
     let mut out = std::collections::HashMap::new();
     out.insert(
         "configuredServerWorkerThreads".to_string(),
@@ -498,13 +508,29 @@ pub fn native_worker_probe_snapshot() -> std::collections::HashMap<String, i64> 
         "availableParallelism".to_string(),
         available_parallelism() as i64,
     );
+    out.insert(
+        "timingEnabled".to_string(),
+        i64::from(*worker_probe::TIMING_ENABLED),
+    );
     let per_thread = worker_probe::snapshot();
     out.insert(
         "datagramThreads".to_string(),
-        per_thread.iter().filter(|(_, n)| *n > 0).count() as i64,
+        per_thread.iter().filter(|s| s.datagrams > 0).count() as i64,
     );
-    for (label, count) in per_thread {
-        out.insert(format!("thread:{label}"), count as i64);
+    for sample in per_thread {
+        out.insert(format!("thread:{}", sample.label), sample.datagrams as i64);
+        out.insert(
+            format!("cpuNanos:{}", sample.label),
+            sample.cpu_nanos as i64,
+        );
+        out.insert(
+            format!("rateLimitNanos:{}", sample.label),
+            sample.rate_limit_nanos as i64,
+        );
+        out.insert(
+            format!("rateLimitCalls:{}", sample.label),
+            sample.rate_limit_calls as i64,
+        );
     }
     out
 }
@@ -1450,7 +1476,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             worker_probe::record_datagram();
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                                                            if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
+                                                            if !worker_probe::time_rate_limit(|| rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst)) {
                                                                 m_dgram.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
                                                                 continue;

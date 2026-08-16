@@ -155,6 +155,14 @@ export type ArmRun = {
 		availableParallelism: number | null;
 		datagramThreads: number | null;
 		perThread: Record<string, number>;
+		/**
+		 * Raw per-thread CPU and rate-limit counters at both ends of the window,
+		 * for tools/bench/thread-profile.ts to difference. Carried rather than
+		 * reduced here because which thread is hot is a separate question from
+		 * how many threads carried load.
+		 */
+		cpuBefore: Record<string, number>;
+		cpuAfter: Record<string, number>;
 	};
 };
 
@@ -215,6 +223,22 @@ export function dirtyPaths(porcelain: string): string[] {
 // ---------------------------------------------------------------------------
 // Child: one arm, one round, one fresh process (the knob is read at runtime init)
 // ---------------------------------------------------------------------------
+
+/** The per-thread CPU and rate-limit keys, which the profiler differences. */
+function timingKeys(snapshot: Record<string, number>): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const [key, value] of Object.entries(snapshot)) {
+		if (
+			key.startsWith("cpuNanos:") ||
+			key.startsWith("rateLimitNanos:") ||
+			key.startsWith("rateLimitCalls:") ||
+			key.startsWith("thread:")
+		) {
+			out[key] = value;
+		}
+	}
+	return out;
+}
 
 /** Per-thread datagram counts, minus the bookkeeping keys the addon also returns. */
 function threadCounts(
@@ -369,6 +393,8 @@ async function runChild(
 			availableParallelism: probe1.availableParallelism ?? null,
 			datagramThreads: Object.keys(perThread).length,
 			perThread,
+			cpuBefore: timingKeys(probe0),
+			cpuAfter: timingKeys(probe1),
 		},
 	};
 	if (sessionsOk === 0) {

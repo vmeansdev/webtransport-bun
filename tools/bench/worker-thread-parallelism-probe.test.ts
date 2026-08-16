@@ -37,6 +37,8 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 			availableParallelism: 10,
 			datagramThreads: 2,
 			perThread: { "wt-server#ThreadId(3)": 600, "wt-server#ThreadId(4)": 400 },
+			cpuBefore: {},
+			cpuAfter: {},
 		},
 		...over,
 	};
