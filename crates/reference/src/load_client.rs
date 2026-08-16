@@ -281,21 +281,94 @@ fn frame_wt_datagram(session_id: u64, payload: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
-fn format_sent_progress(t_ms: u64, sent: u64, frame_tx_datagram: u64, udp_tx: u64) -> String {
+struct ProgressSnap {
+    t_ms: u64,
+    sent: u64,
+    frame_tx_datagram: u64,
+    udp_tx: u64,
+    udp_tx_bytes: u64,
+    cwnd: u64,
+    rtt_us: u64,
+    cong: u64,
+    bdp_bps: u64,
+    cpu_ms: u64,
+}
+
+fn format_sent_progress(snap: ProgressSnap) -> String {
     format!(
-        "load-client: t_ms={t_ms} sent={sent} frame_tx_datagram={frame_tx_datagram} udp_tx={udp_tx}"
+        "load-client: t_ms={} sent={} frame_tx_datagram={} udp_tx={} udp_tx_bytes={} cwnd={} rtt_us={} cong={} bdp_bps={} cpu_ms={}",
+        snap.t_ms,
+        snap.sent,
+        snap.frame_tx_datagram,
+        snap.udp_tx,
+        snap.udp_tx_bytes,
+        snap.cwnd,
+        snap.rtt_us,
+        snap.cong,
+        snap.bdp_bps,
+        snap.cpu_ms,
     )
 }
 
-fn sum_quic_tx(conns: &[wtransport::Connection]) -> (u64, u64) {
-    let mut frame_tx = 0u64;
-    let mut udp_tx = 0u64;
+fn cpu_ms_from_stat(text: &str) -> Option<u64> {
+    let rest = text.rsplit_once(')')?.1.trim();
+    let mut fields = rest.split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime.saturating_add(stime).saturating_mul(10))
+}
+
+fn linux_cpu_ms() -> u64 {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|text| cpu_ms_from_stat(&text))
+        .unwrap_or(0)
+}
+
+struct QuicSnap {
+    frame_tx: u64,
+    udp_tx: u64,
+    udp_tx_bytes: u64,
+    cwnd: u64,
+    rtt_us: u64,
+    cong: u64,
+    bdp_bps: u64,
+}
+
+fn sum_quic_snap(conns: &[wtransport::Connection]) -> QuicSnap {
+    let mut snap = QuicSnap {
+        frame_tx: 0,
+        udp_tx: 0,
+        udp_tx_bytes: 0,
+        cwnd: 0,
+        rtt_us: 0,
+        cong: 0,
+        bdp_bps: 0,
+    };
+    let mut rtt_n = 0u64;
     for conn in conns {
         let stats = conn.quic_connection().stats();
-        frame_tx += stats.frame_tx.datagram;
-        udp_tx += stats.udp_tx.datagrams;
+        snap.frame_tx += stats.frame_tx.datagram;
+        snap.udp_tx += stats.udp_tx.datagrams;
+        snap.udp_tx_bytes += stats.udp_tx.bytes;
+        snap.cwnd += stats.path.cwnd;
+        snap.cong += stats.path.congestion_events;
+        let rtt_us = u64::try_from(stats.path.rtt.as_micros()).unwrap_or(u64::MAX);
+        if let Some(bps) = stats
+            .path
+            .cwnd
+            .saturating_mul(1_000_000)
+            .checked_div(rtt_us)
+        {
+            snap.bdp_bps = snap.bdp_bps.saturating_add(bps);
+            snap.rtt_us = snap.rtt_us.saturating_add(rtt_us);
+            rtt_n += 1;
+        }
     }
-    (frame_tx, udp_tx)
+    if let Some(mean) = snap.rtt_us.checked_div(rtt_n) {
+        snap.rtt_us = mean;
+    }
+    snap
 }
 
 fn load_summary_json(mode: ClientMode, counters: &Counters) -> String {
@@ -476,7 +549,21 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         ClientMode::Load => {
             let started = Instant::now();
             let live = Arc::new(Mutex::new(Vec::<wtransport::Connection>::new()));
-            println!("{}", format_sent_progress(0, 0, 0, 0));
+            println!(
+                "{}",
+                format_sent_progress(ProgressSnap {
+                    t_ms: 0,
+                    sent: 0,
+                    frame_tx_datagram: 0,
+                    udp_tx: 0,
+                    udp_tx_bytes: 0,
+                    cwnd: 0,
+                    rtt_us: 0,
+                    cong: 0,
+                    bdp_bps: 0,
+                    cpu_ms: linux_cpu_ms(),
+                })
+            );
             let progress_counters = Arc::clone(&counters);
             let progress_live = Arc::clone(&live);
             let progress = tokio::spawn(async move {
@@ -487,11 +574,25 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                     ticker.tick().await;
                     let t_ms = started.elapsed().as_millis() as u64;
                     let sent = progress_counters.datagrams_sent.load(Ordering::Relaxed);
-                    let (frame_tx, udp_tx) = {
+                    let quic = {
                         let guard = progress_live.lock().unwrap_or_else(|e| e.into_inner());
-                        sum_quic_tx(&guard)
+                        sum_quic_snap(&guard)
                     };
-                    println!("{}", format_sent_progress(t_ms, sent, frame_tx, udp_tx));
+                    println!(
+                        "{}",
+                        format_sent_progress(ProgressSnap {
+                            t_ms,
+                            sent,
+                            frame_tx_datagram: quic.frame_tx,
+                            udp_tx: quic.udp_tx,
+                            udp_tx_bytes: quic.udp_tx_bytes,
+                            cwnd: quic.cwnd,
+                            rtt_us: quic.rtt_us,
+                            cong: quic.cong,
+                            bdp_bps: quic.bdp_bps,
+                            cpu_ms: linux_cpu_ms(),
+                        })
+                    );
                 }
             });
             let mut handles = Vec::with_capacity(num_sessions);
@@ -794,8 +895,8 @@ async fn run_reconnect_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_sent_progress, frame_wt_datagram, load_summary_json, parse_client_mode,
-        parse_or_default, ClientMode, Counters,
+        cpu_ms_from_stat, format_sent_progress, frame_wt_datagram, load_summary_json,
+        parse_client_mode, parse_or_default, ClientMode, Counters, ProgressSnap,
     };
     use std::sync::atomic::Ordering;
 
@@ -830,13 +931,41 @@ mod tests {
     #[test]
     fn format_sent_progress_matches_parser_line() {
         assert_eq!(
-            format_sent_progress(0, 0, 0, 0),
-            "load-client: t_ms=0 sent=0 frame_tx_datagram=0 udp_tx=0"
+            format_sent_progress(ProgressSnap {
+                t_ms: 0,
+                sent: 0,
+                frame_tx_datagram: 0,
+                udp_tx: 0,
+                udp_tx_bytes: 0,
+                cwnd: 0,
+                rtt_us: 0,
+                cong: 0,
+                bdp_bps: 0,
+                cpu_ms: 0,
+            }),
+            "load-client: t_ms=0 sent=0 frame_tx_datagram=0 udp_tx=0 udp_tx_bytes=0 cwnd=0 rtt_us=0 cong=0 bdp_bps=0 cpu_ms=0"
         );
         assert_eq!(
-            format_sent_progress(1000, 50_000, 40_000, 41_000),
-            "load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000"
+            format_sent_progress(ProgressSnap {
+                t_ms: 1000,
+                sent: 50_000,
+                frame_tx_datagram: 40_000,
+                udp_tx: 41_000,
+                udp_tx_bytes: 50_000_000,
+                cwnd: 120_000,
+                rtt_us: 250,
+                cong: 3,
+                bdp_bps: 480_000_000,
+                cpu_ms: 900,
+            }),
+            "load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000 udp_tx_bytes=50000000 cwnd=120000 rtt_us=250 cong=3 bdp_bps=480000000 cpu_ms=900"
         );
+    }
+
+    #[test]
+    fn cpu_ms_from_stat_uses_utime_plus_stime_at_100_hz() {
+        let line = "1 (load-client) S 0 0 0 0 0 0 0 0 0 0 40 10 0 0 0 0 0 0 0 0 0";
+        assert_eq!(cpu_ms_from_stat(line), Some(500));
     }
 
     #[test]
