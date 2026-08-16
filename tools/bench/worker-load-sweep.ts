@@ -84,7 +84,8 @@ const CC_MODES = (process.env.SWEEP_CC_MODES ?? "cubic")
 	.split(",")
 	.map((s) => s.trim())
 	.filter((s): s is "cubic" | "bbr" => s === "cubic" || s === "bbr");
-const RMEM_RAISED_BYTES = 8 * 1024 * 1024;
+const RMEM_RAISED_BYTES = 16 * 1024 * 1024;
+const RMEM_MAX_TRY_BYTES = 32 * 1024 * 1024;
 /** Load-generator processes sharing the sessions. */
 const CLIENTS = Number(process.env.SWEEP_CLIENTS ?? "2");
 const REPS = Number(process.env.SWEEP_REPS ?? "2");
@@ -747,6 +748,113 @@ export function classifyCc(input: {
 	};
 }
 
+export type BbrRmemBucket = "rmem" | "not-rmem" | "incomplete";
+
+export type BbrRmemCap = {
+	defaultIngestPerSec: number | null;
+	raisedIngestPerSec: number | null;
+	raisedFrameTxPerSec: number | null;
+	ratio: number | null;
+	defaultSkRcvbuf: number | null;
+	raisedSkRcvbuf: number | null;
+	rmemDefaultWrote: boolean;
+	stopBucket: BbrRmemBucket;
+};
+
+function medianIngest(summaries: readonly ArmSummary[]): number | null {
+	const vals = summaries.flatMap((s) =>
+		s.runs.map((r) => r.ingestedPerSec).filter((n) => n > 0),
+	);
+	return vals.length > 0 ? median(vals) : null;
+}
+
+export function classifyBbrRmem(input: {
+	summaries: readonly ArmSummary[];
+	rmemDefaultWrote: boolean;
+	controlRmemDefault: number | null;
+	cpuModes: readonly string[];
+	ccModes: readonly string[];
+	sessions: number;
+}): BbrRmemCap {
+	const def = input.summaries.filter((s) => !s.key.includes("@raised"));
+	const raised = input.summaries.filter((s) => s.key.includes("@raised"));
+	const defaultIngestPerSec = medianIngest(def);
+	const raisedIngestPerSec = medianIngest(raised);
+	const raisedFrameTxPerSec = medianFrameTx(raised);
+	const ratio =
+		defaultIngestPerSec != null &&
+		raisedIngestPerSec != null &&
+		defaultIngestPerSec > 0
+			? raisedIngestPerSec / defaultIngestPerSec
+			: null;
+	const medianSk = (arms: readonly ArmSummary[]): number | null => {
+		const vals = arms.flatMap((s) =>
+			s.runs
+				.map((r) => r.skRcvbuf)
+				.filter((n): n is number => n != null && n > 0),
+		);
+		return vals.length > 0 ? median(vals) : null;
+	};
+	const defaultSkRcvbuf = medianSk(def);
+	const raisedSkRcvbuf = medianSk(raised);
+	const socketGrew =
+		defaultSkRcvbuf != null &&
+		raisedSkRcvbuf != null &&
+		raisedSkRcvbuf >= RMEM_RAISED_BYTES &&
+		raisedSkRcvbuf >= 2 * defaultSkRcvbuf;
+	const defaultReproduced =
+		defaultIngestPerSec != null &&
+		defaultIngestPerSec >= 40_000 &&
+		defaultIngestPerSec <= 60_000;
+	const printMatches = (arms: readonly ArmSummary[]): boolean =>
+		arms.length > 0 &&
+		arms.every((s) => s.runs.every((r) => r.appliedCongestion === "bbr"));
+	const sessionsHealthy = (arms: readonly ArmSummary[]): boolean =>
+		arms.every((s) =>
+			s.runs.every((r) => r.sessionsOk >= 0.9 * input.sessions),
+		);
+	const cubicPresent = input.ccModes.some((m) => m === "cubic");
+	const mixedCpu = input.cpuModes.some((m) => m !== "shared");
+	const noTreatment =
+		input.controlRmemDefault != null &&
+		input.controlRmemDefault >= RMEM_RAISED_BYTES;
+	const incomplete =
+		!input.rmemDefaultWrote ||
+		noTreatment ||
+		!socketGrew ||
+		raised.length === 0 ||
+		defaultIngestPerSec == null ||
+		raisedIngestPerSec == null ||
+		!defaultReproduced ||
+		!printMatches(def) ||
+		!printMatches(raised) ||
+		!sessionsHealthy(def) ||
+		!sessionsHealthy(raised) ||
+		raisedIngestPerSec < 40_000 ||
+		(raisedFrameTxPerSec != null && raisedFrameTxPerSec < 120_000) ||
+		raisedFrameTxPerSec == null ||
+		mixedCpu ||
+		cubicPresent;
+	let stopBucket: BbrRmemBucket = "incomplete";
+	if (!incomplete && ratio != null && raisedIngestPerSec != null) {
+		if (ratio >= 1.2 && raisedIngestPerSec >= 90_000) {
+			stopBucket = "rmem";
+		} else {
+			stopBucket = "not-rmem";
+		}
+	}
+	return {
+		defaultIngestPerSec,
+		raisedIngestPerSec,
+		raisedFrameTxPerSec,
+		ratio,
+		defaultSkRcvbuf,
+		raisedSkRcvbuf,
+		rmemDefaultWrote: input.rmemDefaultWrote,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -800,12 +908,9 @@ async function main(): Promise<void> {
 				order.push(`r${round}:${armKey(arm)}`);
 				console.log(`sweep: round ${round}/${REPS} ${armKey(arm)} ...`);
 				if (arm.rmemMode === "raised") {
-					const maxOk = writeSysctl(
-						"net.core.rmem_max",
-						Math.max(origRmemMax ?? raisedBytes, raisedBytes),
-					);
-					const defOk = writeSysctl("net.core.rmem_default", raisedBytes);
-					rmemDefaultWrote = rmemDefaultWrote && maxOk && defOk;
+					writeSysctl("net.core.rmem_max", RMEM_MAX_TRY_BYTES);
+					const defOk = writeSysctl("net.core.rmem_default", RMEM_RAISED_BYTES);
+					rmemDefaultWrote = rmemDefaultWrote && defOk;
 				} else {
 					if (origRmemMax != null)
 						writeSysctl("net.core.rmem_max", origRmemMax);
@@ -850,6 +955,14 @@ async function main(): Promise<void> {
 		summaries,
 		rmemModes: RMEM_MODES,
 		cpuModes: CPU_MODES,
+		sessions: SESSIONS,
+	});
+	const bbrRmem = classifyBbrRmem({
+		summaries,
+		rmemDefaultWrote,
+		controlRmemDefault: origRmemDefault,
+		cpuModes: CPU_MODES,
+		ccModes: CC_MODES,
 		sessions: SESSIONS,
 	});
 	const failures = [
@@ -901,6 +1014,7 @@ async function main(): Promise<void> {
 		coresplit,
 		rmem,
 		cc,
+		bbrRmem,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -908,6 +1022,11 @@ async function main(): Promise<void> {
 	};
 	mkdirSync(dirname(ARTIFACT_PATH), { recursive: true });
 	writeFileSync(ARTIFACT_PATH, JSON.stringify(artifact, null, 2));
+
+	const bbrRmemStamp =
+		CC_MODES.length === 1 &&
+		CC_MODES[0] === "bbr" &&
+		RMEM_MODES.includes("raised");
 
 	console.log(
 		`\n  ${"arm".padEnd(16)}${"requested".padStart(10)}${"offered".padStart(10)}` +
@@ -925,9 +1044,21 @@ async function main(): Promise<void> {
 				`${String(s.datagramThreads).padStart(5)}${s.requestMet ? "" : "  (request not met)"}`,
 		);
 		for (const r of s.runs) {
-			if (r.gap) console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
-			if (r.pipeCap)
-				console.log(`  ${s.key} r${r.round} ${formatPipeCapLine(r.pipeCap)}`);
+			if (!bbrRmemStamp) {
+				if (r.gap)
+					console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
+				if (r.pipeCap)
+					console.log(`  ${s.key} r${r.round} ${formatPipeCapLine(r.pipeCap)}`);
+			} else if (r.gap) {
+				const n = (value: number | null): string =>
+					value == null ? "n/a" : String(Math.round(value));
+				console.log(
+					`  ${s.key} r${r.round} ingest=${Math.round(r.ingestedPerSec)} ` +
+						`frameTx=${n(r.gap.frameTxDatagramPerSec)} ` +
+						`rcvbufDelta=${n(r.gap.udpRcvbufErrorsDelta)} ` +
+						`cong=${r.pipeCap ? Math.round(r.pipeCap.congPerSec ?? 0) : "n/a"}`,
+				);
+			}
 			if (r.skRcvbuf != null) {
 				console.log(
 					`  ${s.key} r${r.round} sk: rcvbuf=${r.skRcvbuf} drops=${r.skDrops ?? "n/a"}`,
@@ -1001,7 +1132,7 @@ async function main(): Promise<void> {
 				`STOP=${coresplit.stopBucket}`,
 		);
 	}
-	if (RMEM_MODES.includes("raised")) {
+	if (RMEM_MODES.includes("raised") && !bbrRmemStamp) {
 		const n = (value: number | null): string =>
 			value == null ? "n/a" : String(Math.round(value));
 		console.log(
@@ -1012,7 +1143,7 @@ async function main(): Promise<void> {
 				`wrote=${rmem.rmemDefaultWrote} STOP=${rmem.stopBucket}`,
 		);
 	}
-	if (CC_MODES.includes("bbr")) {
+	if (CC_MODES.includes("cubic") && CC_MODES.includes("bbr")) {
 		const n = (value: number | null): string =>
 			value == null ? "n/a" : String(Math.round(value));
 		console.log(
@@ -1020,6 +1151,18 @@ async function main(): Promise<void> {
 				`bbrFrameTx=${n(cc.bbrFrameTxPerSec)} ` +
 				`ratio=${cc.ratio == null ? "n/a" : cc.ratio.toFixed(2)} ` +
 				`STOP=${cc.stopBucket}`,
+		);
+	}
+	if (bbrRmemStamp) {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  bbr-rmem: defaultIngest=${n(bbrRmem.defaultIngestPerSec)} ` +
+				`raisedIngest=${n(bbrRmem.raisedIngestPerSec)} ` +
+				`raisedFrameTx=${n(bbrRmem.raisedFrameTxPerSec)} ` +
+				`ratio=${bbrRmem.ratio == null ? "n/a" : bbrRmem.ratio.toFixed(2)} ` +
+				`defaultSk=${n(bbrRmem.defaultSkRcvbuf)} raisedSk=${n(bbrRmem.raisedSkRcvbuf)} ` +
+				`wrote=${bbrRmem.rmemDefaultWrote} STOP=${bbrRmem.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)

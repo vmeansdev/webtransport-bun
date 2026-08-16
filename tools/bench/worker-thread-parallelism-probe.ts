@@ -1222,6 +1222,7 @@ async function runChild(
 	for (const c of clients) await c.exited;
 	const stdout = await stdoutPromise;
 	const stderr = (await stderrPromise).join("\n");
+	const skmemAfter = readSsUdpSkmem(port);
 	const num = (re: RegExp): number =>
 		stdout.reduce((total, text) => {
 			const m = text.match(re);
@@ -1368,8 +1369,8 @@ async function runChild(
 		clientTaskset: CLIENT_TASKSET,
 		clientCpusAllowed,
 		clientAffinityOk,
-		skRcvbuf: skmem?.recvbuf ?? null,
-		skDrops: skmem?.drops ?? null,
+		skRcvbuf: skmemAfter?.recvbuf ?? skmem?.recvbuf ?? null,
+		skDrops: skmemAfter?.drops ?? skmem?.drops ?? null,
 		appliedCongestion: parseAppliedCongestion(stdout),
 	};
 	if (sessionsOk === 0) {

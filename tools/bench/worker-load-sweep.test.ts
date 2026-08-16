@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	type ArmSummary,
 	armKey,
+	classifyBbrRmem,
 	classifyCc,
 	classifyCoresplit,
 	classifyRmem,
@@ -269,6 +270,7 @@ function withFrameTx(
 	frameTxDatagramPerSec: number,
 	offeredPerSec: number,
 	skRcvbuf: number | null = 212_992,
+	ingestedPerSec: number = frameTxDatagramPerSec,
 ): ArmSummary {
 	return {
 		...arm({
@@ -287,7 +289,7 @@ function withFrameTx(
 				round: 1,
 				offeredPerSec,
 				deliveredPerSec: frameTxDatagramPerSec,
-				ingestedPerSec: frameTxDatagramPerSec,
+				ingestedPerSec,
 				droppedPct: 0,
 				rateLimited: 0,
 				droppedTooLarge: 0,
@@ -304,7 +306,7 @@ function withFrameTx(
 				threads: [],
 				gap: {
 					windowOfferedPerSec: offeredPerSec,
-					ingestedPerSec: frameTxDatagramPerSec,
+					ingestedPerSec,
 					packetsLostDelta: 0,
 					packetsReceivedDelta: 0,
 					udpInErrorsDelta: 0,
@@ -563,6 +565,128 @@ describe("classifyCc", () => {
 			classifyCc({
 				...base,
 				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), bbr],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+});
+
+describe("classifyBbrRmem", () => {
+	const base = {
+		rmemDefaultWrote: true,
+		controlRmemDefault: 4_194_304,
+		cpuModes: ["shared"],
+		ccModes: ["bbr"],
+		sessions: 100,
+	};
+	const defSk = 4_194_304;
+	const raisedSk = 16_777_216;
+
+	test("ingest 49k to 100k with frame_tx 136k is rmem", () => {
+		expect(
+			classifyBbrRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@bbr", 136_000, 138_000, defSk, 49_000),
+					withFrameTx(
+						"w2@160000@wait@raised@bbr",
+						136_000,
+						138_000,
+						raisedSk,
+						100_000,
+					),
+				],
+			}).stopBucket,
+		).toBe("rmem");
+	});
+
+	test("ingest stayed ~49k is not-rmem", () => {
+		expect(
+			classifyBbrRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@bbr", 136_000, 138_000, defSk, 49_000),
+					withFrameTx(
+						"w2@160000@wait@raised@bbr",
+						136_000,
+						138_000,
+						raisedSk,
+						50_000,
+					),
+				],
+			}).stopBucket,
+		).toBe("not-rmem");
+	});
+
+	test("ingest 80k is not-rmem because below 90k", () => {
+		expect(
+			classifyBbrRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@bbr", 136_000, 138_000, defSk, 49_000),
+					withFrameTx(
+						"w2@160000@wait@raised@bbr",
+						136_000,
+						138_000,
+						raisedSk,
+						80_000,
+					),
+				],
+			}).stopBucket,
+		).toBe("not-rmem");
+	});
+
+	test("raised frame_tx below 120k is incomplete", () => {
+		expect(
+			classifyBbrRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@bbr", 136_000, 138_000, defSk, 49_000),
+					withFrameTx(
+						"w2@160000@wait@raised@bbr",
+						110_000,
+						110_000,
+						raisedSk,
+						100_000,
+					),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("control rmem_max 16 MiB is not incomplete", () => {
+		expect(
+			classifyBbrRmem({
+				...base,
+				controlRmemDefault: 4_194_304,
+				summaries: [
+					withFrameTx("w2@160000@wait@bbr", 136_000, 138_000, defSk, 49_000),
+					withFrameTx(
+						"w2@160000@wait@raised@bbr",
+						136_000,
+						138_000,
+						raisedSk,
+						100_000,
+					),
+				],
+			}).stopBucket,
+		).toBe("rmem");
+	});
+
+	test("cubic arm present is incomplete", () => {
+		expect(
+			classifyBbrRmem({
+				...base,
+				ccModes: ["cubic", "bbr"],
+				summaries: [
+					withFrameTx("w2@160000@wait@bbr", 136_000, 138_000, defSk, 49_000),
+					withFrameTx(
+						"w2@160000@wait@raised@bbr",
+						136_000,
+						138_000,
+						raisedSk,
+						100_000,
+					),
+				],
 			}).stopBucket,
 		).toBe("incomplete");
 	});
