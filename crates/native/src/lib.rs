@@ -51,13 +51,13 @@ pub mod zero_rtt;
 
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
 ///
-/// Two workers, not one. At one worker the server ingests datagrams from the
-/// wire and then discards 80-95% of them under sustained load, collapsing to a
-/// fixed ~5,300/s delivered while the machine sits idle. Two workers move that
-/// cliff far enough out to matter (40k offered: 5,283 delivered at one worker,
-/// 39,497 with zero drops at two) but do NOT remove it — 80k offered still
-/// dropped 48% on a 4-vCPU host. This is a mitigation; the starvation root
-/// cause is still open. Higher counts measured worse (macOS: 89k/s at two,
+/// Two workers, not one. The ~5,300/s delivery cliff was tokio's injection
+/// queue: per-datagram N-API methods used to `RUNTIME.spawn` from outside this
+/// runtime, and a busy worker only drains that queue one task per ~200µs of
+/// work. Those hops are gone (`read_datagram`, `send_datagram`,
+/// `discard_datagram`); two workers is leftover headroom, not the fix. Two
+/// workers alone still dropped 48% at 80k offered on a 4-vCPU host while the
+/// hops were in place. Higher counts measured worse (macOS: 89k/s at two,
 /// 82k/s at four, 48k/s at ten), so this is a fixed constant rather than
 /// `available_parallelism()`, and `scripts/check-doc-truth.ts` pins it.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
