@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-
 import {
 	type ArmSummary,
 	armKey,
@@ -7,6 +6,7 @@ import {
 	generatorLimitedRates,
 	proofFailures,
 } from "./worker-load-sweep.ts";
+import { formatGapLine } from "./worker-thread-parallelism-probe.ts";
 
 function arm(over: Partial<ArmSummary> = {}): ArmSummary {
 	const base: ArmSummary = {
@@ -199,6 +199,25 @@ describe("generatorLimitedRates", () => {
 			}),
 		];
 		expect(generatorLimitedRates(summaries)).toEqual([]);
+	});
+});
+
+describe("gap print", () => {
+	test("omitted UDP rcvbuf prints n/a, not 0", () => {
+		expect(
+			formatGapLine({
+				windowOfferedPerSec: null,
+				ingestedPerSec: 99_000,
+				packetsLostDelta: null,
+				packetsReceivedDelta: null,
+				udpInErrorsDelta: null,
+				udpRcvbufErrorsDelta: null,
+				unexplainedPerSec: 48_000,
+				stopBucket: "unexplained",
+			}),
+		).toBe(
+			"gap: windowOffered=n/a ingest=99000 lost=n/a rcvbuf=n/a unexplained=48000 STOP=unexplained",
+		);
 	});
 });
 

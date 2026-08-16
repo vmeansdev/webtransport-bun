@@ -42,6 +42,8 @@ import { dirname, join, resolve } from "node:path";
 import { classify, threadRows } from "./thread-profile.ts";
 import {
 	dirtyPaths,
+	formatGapLine,
+	type IngestGap,
 	makeRng,
 	median,
 	shuffled,
@@ -137,6 +139,7 @@ export type SweepRun = {
 	sessionsOk: number;
 	clientSendErrors: number;
 	threads: { label: string; cores: number; datagrams: number }[];
+	gap: IngestGap | null;
 };
 
 function gitOutput(args: string[]): string {
@@ -230,6 +233,7 @@ async function runOne(
 				cores: r.cores,
 				datagrams: r.datagrams,
 			})),
+			gap: run.gap ?? null,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -481,6 +485,10 @@ async function main(): Promise<void> {
 				`${s.tokioCores.toFixed(2).padStart(7)}${s.jsCores.toFixed(2).padStart(6)}` +
 				`${String(s.datagramThreads).padStart(5)}${s.requestMet ? "" : "  (request not met)"}`,
 		);
+		for (const r of s.runs) {
+			if (!r.gap) continue;
+			console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
+		}
 	}
 	const withDrops = summaries.filter((s) => s.droppedPct > 0.05);
 	if (withDrops.length > 0) {

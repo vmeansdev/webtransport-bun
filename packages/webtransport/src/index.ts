@@ -1804,6 +1804,12 @@ class NativeServerSession implements ServerSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
 }
 
 // ---------------------------------------------------------------------------

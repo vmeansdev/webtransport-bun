@@ -41,13 +41,15 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import {
 	__TESTING__,
 	createServer,
+	type QuicConnectionStats,
+	type ServerSession,
 } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 
@@ -173,6 +175,23 @@ export function sessionArms(): Arm[] {
 	}));
 }
 
+export type IngestGapBucket =
+	| "window-accounting"
+	| "quic-loss"
+	| "udp-rcvbuf"
+	| "unexplained";
+
+export type IngestGap = {
+	windowOfferedPerSec: number | null;
+	ingestedPerSec: number;
+	packetsLostDelta: number | null;
+	packetsReceivedDelta: number | null;
+	udpInErrorsDelta: number | null;
+	udpRcvbufErrorsDelta: number | null;
+	unexplainedPerSec: number | null;
+	stopBucket: IngestGapBucket;
+};
+
 export type ArmRun = {
 	label: string;
 	round: number;
@@ -226,6 +245,7 @@ export type ArmRun = {
 		cpuBefore: Record<string, number>;
 		cpuAfter: Record<string, number>;
 	};
+	gap: IngestGap;
 };
 
 export function median(values: number[]): number {
@@ -349,14 +369,22 @@ export function procRow(
 	return out;
 }
 
-export function parseProcSnmpUdp(
-	text: string,
-): { InDatagrams: number; InErrors: number } | null {
-	const row = procRow(text, "Udp", ["InDatagrams", "InErrors"]);
-	if (!row) return null;
+export function parseProcSnmpUdp(text: string): {
+	InDatagrams: number;
+	InErrors: number;
+	rcvbufErrors?: number;
+} | null {
+	const required = procRow(text, "Udp", ["InDatagrams", "InErrors"]);
+	if (!required) return null;
+	const withRcvbuf = procRow(text, "Udp", [
+		"InDatagrams",
+		"InErrors",
+		"RcvbufErrors",
+	]);
 	return {
-		InDatagrams: row.InDatagrams ?? 0,
-		InErrors: row.InErrors ?? 0,
+		InDatagrams: required.InDatagrams ?? 0,
+		InErrors: required.InErrors ?? 0,
+		...(withRcvbuf ? { rcvbufErrors: withRcvbuf.RcvbufErrors ?? 0 } : {}),
 	};
 }
 
@@ -369,6 +397,139 @@ export function parseProcNetstatUdp(
 		RcvbufErrors: row.RcvbufErrors ?? 0,
 		SndbufErrors: row.SndbufErrors ?? 0,
 	};
+}
+
+export function sumWindowOfferedPerSec(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	let sum = 0;
+	let any = false;
+	for (const text of clientStdouts) {
+		const delta = windowSentDelta(
+			parseLoadClientSentProgress(text),
+			warmupMs,
+			measureMs,
+		);
+		if (!delta) continue;
+		any = true;
+		sum += (delta.sent1 - delta.sent0) / ((delta.t1 - delta.t0) / 1000);
+	}
+	return any ? sum : null;
+}
+
+const GAP_STOP_PER_SEC = 5_000;
+const ACCOUNTS_FRACTION = 0.9;
+
+export function classifyIngestGap(input: {
+	windowOfferedPerSec: number | null;
+	offeredPerSec: number;
+	ingestedPerSec: number;
+	packetsLostDelta: number | null;
+	packetsReceivedDelta: number | null;
+	udpInErrorsDelta: number | null;
+	udpRcvbufErrorsDelta: number | null;
+	windowSec: number;
+}): IngestGap {
+	const offered = input.windowOfferedPerSec ?? input.offeredPerSec;
+	const gap = Math.max(0, offered - input.ingestedPerSec);
+	const rate = (delta: number | null): number | null =>
+		delta != null && input.windowSec > 0 ? delta / input.windowSec : null;
+	const lostRate = rate(input.packetsLostDelta);
+	const rcvbufRate = rate(input.udpRcvbufErrorsDelta);
+
+	let stopBucket: IngestGapBucket;
+	let accounted = 0;
+	if (gap < GAP_STOP_PER_SEC) {
+		stopBucket = "window-accounting";
+	} else if (lostRate != null && lostRate >= ACCOUNTS_FRACTION * gap) {
+		stopBucket = "quic-loss";
+		accounted = lostRate;
+	} else if (rcvbufRate != null && rcvbufRate >= ACCOUNTS_FRACTION * gap) {
+		stopBucket = "udp-rcvbuf";
+		accounted = rcvbufRate;
+	} else {
+		stopBucket = "unexplained";
+	}
+
+	return {
+		windowOfferedPerSec: input.windowOfferedPerSec,
+		ingestedPerSec: input.ingestedPerSec,
+		packetsLostDelta: input.packetsLostDelta,
+		packetsReceivedDelta: input.packetsReceivedDelta,
+		udpInErrorsDelta: input.udpInErrorsDelta,
+		udpRcvbufErrorsDelta: input.udpRcvbufErrorsDelta,
+		unexplainedPerSec: Math.max(0, gap - accounted),
+		stopBucket,
+	};
+}
+
+export function formatGapLine(gap: IngestGap): string {
+	const n = (value: number | null): string =>
+		value == null ? "n/a" : String(Math.round(value));
+	return (
+		`gap: windowOffered=${n(gap.windowOfferedPerSec)} ingest=${Math.round(gap.ingestedPerSec)} ` +
+		`lost=${n(gap.packetsLostDelta)} rcvbuf=${n(gap.udpRcvbufErrorsDelta)} ` +
+		`unexplained=${n(gap.unexplainedPerSec)} STOP=${gap.stopBucket}`
+	);
+}
+
+type UdpSnapshot = {
+	inErrors: number | null;
+	rcvbufErrors: number | null;
+};
+
+function readLinuxUdpSnapshot(): UdpSnapshot | null {
+	if (process.platform !== "linux") return null;
+	let snmpText: string;
+	try {
+		snmpText = readFileSync("/proc/net/snmp", "utf8");
+	} catch {
+		return null;
+	}
+	const snmp = parseProcSnmpUdp(snmpText);
+	if (!snmp) return null;
+	let rcvbufErrors: number | null = snmp.rcvbufErrors ?? null;
+	if (rcvbufErrors == null) {
+		try {
+			rcvbufErrors =
+				parseProcNetstatUdp(readFileSync("/proc/net/netstat", "utf8"))
+					?.RcvbufErrors ?? null;
+		} catch {
+			rcvbufErrors = null;
+		}
+	}
+	return { inErrors: snmp.InErrors, rcvbufErrors };
+}
+
+function deltaOrNull(
+	before: number | null | undefined,
+	after: number | null | undefined,
+): number | null {
+	if (before == null || after == null) return null;
+	return after - before;
+}
+
+type SessionWithStats = ServerSession & {
+	connectionStats?: () => QuicConnectionStats | null;
+};
+
+function sumConnectionStats(sessions: readonly SessionWithStats[]): {
+	packetsLost: number;
+	packetsReceived: number;
+} | null {
+	let packetsLost = 0;
+	let packetsReceived = 0;
+	let any = false;
+	for (const session of sessions) {
+		const stats = session.connectionStats?.();
+		if (!stats) continue;
+		any = true;
+		packetsLost += stats.packetsLost;
+		packetsReceived += stats.packetsReceived;
+	}
+	return any ? { packetsLost, packetsReceived } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +576,7 @@ async function runChild(
 	let received = 0;
 	let receivedBytes = 0;
 	let acceptedStreams = 0;
+	const sessionRefs: SessionWithStats[] = [];
 	const aggregateOffered = sessions * rate;
 	const server = createServer({
 		port,
@@ -443,6 +605,7 @@ async function runChild(
 			datagramsBurst: aggregateOffered * 8,
 		},
 		onSession: (session) => {
+			sessionRefs.push(session as SessionWithStats);
 			if (DISCARD) {
 				const discard = (
 					session as {
@@ -544,6 +707,8 @@ async function runChild(
 	const probe0 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
 	const metrics0 = server.metricsSnapshot();
 	const streams0 = acceptedStreams;
+	const stats0 = sumConnectionStats(sessionRefs);
+	const udp0 = readLinuxUdpSnapshot();
 	const t0 = performance.now();
 	await Bun.sleep(MEASURE_SEC * 1_000);
 	const rx1 = received;
@@ -551,6 +716,8 @@ async function runChild(
 	const cpu1 = process.cpuUsage();
 	const probe1 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
 	const metrics1 = server.metricsSnapshot();
+	const stats1 = sumConnectionStats(sessionRefs);
+	const udp1 = readLinuxUdpSnapshot();
 	const t1 = performance.now();
 
 	for (const c of clients) await c.exited;
@@ -568,6 +735,36 @@ async function runChild(
 	// it. Good enough for its only job, which is detecting non-saturation.
 	const offeredPerSec = clientSent / (WARMUP_SEC + MEASURE_SEC);
 	const receivedPerSec = ((rx1 - rx0) / windowMs) * 1000;
+	const ingestedPerSec =
+		((metrics1.datagramsIn - metrics0.datagramsIn) / windowMs) * 1000;
+	const windowOfferedPerSec = sumWindowOfferedPerSec(
+		stdout,
+		WARMUP_SEC * 1_000,
+		MEASURE_SEC * 1_000,
+	);
+	const packetsLostDelta = deltaOrNull(
+		stats0?.packetsLost,
+		stats1?.packetsLost,
+	);
+	const packetsReceivedDelta = deltaOrNull(
+		stats0?.packetsReceived,
+		stats1?.packetsReceived,
+	);
+	const udpInErrorsDelta = deltaOrNull(udp0?.inErrors, udp1?.inErrors);
+	const udpRcvbufErrorsDelta = deltaOrNull(
+		udp0?.rcvbufErrors,
+		udp1?.rcvbufErrors,
+	);
+	const gap = classifyIngestGap({
+		windowOfferedPerSec,
+		offeredPerSec,
+		ingestedPerSec,
+		packetsLostDelta,
+		packetsReceivedDelta,
+		udpInErrorsDelta,
+		udpRcvbufErrorsDelta,
+		windowSec: windowMs / 1000,
+	});
 
 	// Window delta, so a thread that only worked during warmup does not count as
 	// having carried load.
@@ -633,6 +830,7 @@ async function runChild(
 			cpuBefore: timingKeys(probe0),
 			cpuAfter: timingKeys(probe1),
 		},
+		gap,
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);

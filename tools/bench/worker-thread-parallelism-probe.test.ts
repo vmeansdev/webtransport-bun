@@ -5,7 +5,9 @@ import {
 	type ArmRun,
 	type ArmSummary,
 	artifactSuffix,
+	classifyIngestGap,
 	dirtyPaths,
+	formatGapLine,
 	makeRng,
 	median,
 	parseLoadClientSentProgress,
@@ -16,6 +18,7 @@ import {
 	sessionArms,
 	shuffled,
 	summarizeSweep,
+	sumWindowOfferedPerSec,
 	windowSentDelta,
 	workerArms,
 } from "./worker-thread-parallelism-probe.ts";
@@ -51,6 +54,16 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 			datagramsDroppedRateLimited: 0,
 		},
 		serverCpuCores: 2.1,
+		gap: {
+			windowOfferedPerSec: null,
+			ingestedPerSec: 50_000,
+			packetsLostDelta: null,
+			packetsReceivedDelta: null,
+			udpInErrorsDelta: null,
+			udpRcvbufErrorsDelta: null,
+			unexplainedPerSec: 90_000,
+			stopBucket: "unexplained",
+		},
 		workerProof: {
 			configured: 2,
 			availableParallelism: 10,
@@ -290,7 +303,32 @@ describe("parseProcSnmpUdp", () => {
 		expect(parseProcSnmpUdp(text)).toEqual({
 			InDatagrams: 1_234_567,
 			InErrors: 12,
+			rcvbufErrors: 0,
 		});
+	});
+
+	test("reads RcvbufErrors from the snmp Udp line when the column exists", () => {
+		const text = [
+			"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti",
+			"Udp: 10 20 30 40 777 50 0 0",
+		].join("\n");
+		expect(parseProcSnmpUdp(text)).toEqual({
+			InDatagrams: 10,
+			InErrors: 30,
+			rcvbufErrors: 777,
+		});
+	});
+
+	test("omits rcvbufErrors when the snmp Udp header has no such column", () => {
+		const text = [
+			"Udp: InDatagrams NoPorts InErrors OutDatagrams",
+			"Udp: 100 200 300 400",
+		].join("\n");
+		expect(parseProcSnmpUdp(text)).toEqual({
+			InDatagrams: 100,
+			InErrors: 300,
+		});
+		expect(parseProcSnmpUdp(text)).not.toHaveProperty("rcvbufErrors");
 	});
 });
 
@@ -306,6 +344,137 @@ describe("parseProcNetstatUdp", () => {
 			RcvbufErrors: 500,
 			SndbufErrors: 600,
 		});
+	});
+});
+
+describe("sumWindowOfferedPerSec", () => {
+	const client = (sent0: number, sent1: number): string =>
+		[
+			`load-client: t_ms=5000 sent=${sent0}`,
+			`load-client: t_ms=20000 sent=${sent1}`,
+		].join("\n");
+
+	test("sums per-client window sent rates instead of parsing concatenated stdout", () => {
+		const a = client(50_000, 200_000);
+		const b = client(10_000, 160_000);
+		expect(sumWindowOfferedPerSec([a, b], 5000, 15_000)).toBe(20_000);
+		expect(sumWindowOfferedPerSec([`${a}\n${b}`], 5000, 15_000)).not.toBe(
+			20_000,
+		);
+	});
+
+	test("returns null when no client produced a window", () => {
+		expect(
+			sumWindowOfferedPerSec(["datagrams sent=100"], 5000, 15_000),
+		).toBeNull();
+	});
+});
+
+describe("classifyIngestGap", () => {
+	const base = {
+		windowOfferedPerSec: 147_000 as number | null,
+		offeredPerSec: 140_000,
+		ingestedPerSec: 99_000,
+		packetsLostDelta: 0 as number | null,
+		packetsReceivedDelta: 1_500_000 as number | null,
+		udpInErrorsDelta: 0 as number | null,
+		udpRcvbufErrorsDelta: 0 as number | null,
+		windowSec: 15,
+	};
+
+	test("ingest near offered is window-accounting", () => {
+		const gap = classifyIngestGap({
+			...base,
+			windowOfferedPerSec: 100_000,
+			ingestedPerSec: 99_000,
+		});
+		expect(gap.stopBucket).toBe("window-accounting");
+		expect(gap.windowOfferedPerSec).toBe(100_000);
+		expect(gap.ingestedPerSec).toBe(99_000);
+	});
+
+	test("gap under 5000/s is window-accounting even if loss is present", () => {
+		expect(
+			classifyIngestGap({
+				...base,
+				windowOfferedPerSec: 103_000,
+				ingestedPerSec: 99_000,
+				packetsLostDelta: 1_000_000,
+			}).stopBucket,
+		).toBe("window-accounting");
+	});
+
+	test("lost rate at least 90% of the gap is quic-loss", () => {
+		const gap = classifyIngestGap({
+			...base,
+			packetsLostDelta: 648_000,
+		});
+		expect(gap.stopBucket).toBe("quic-loss");
+		expect(gap.packetsLostDelta).toBe(648_000);
+	});
+
+	test("rcvbuf rate at least 90% of the gap is udp-rcvbuf", () => {
+		const gap = classifyIngestGap({
+			...base,
+			packetsLostDelta: 0,
+			udpRcvbufErrorsDelta: 700_000,
+		});
+		expect(gap.stopBucket).toBe("udp-rcvbuf");
+		expect(gap.udpRcvbufErrorsDelta).toBe(700_000);
+	});
+
+	test("uses whole-run offered when window offered is absent", () => {
+		const gap = classifyIngestGap({
+			...base,
+			windowOfferedPerSec: null,
+			offeredPerSec: 147_000,
+			packetsLostDelta: 648_000,
+		});
+		expect(gap.stopBucket).toBe("quic-loss");
+		expect(gap.windowOfferedPerSec).toBeNull();
+	});
+
+	test("otherwise the leftover is unexplained", () => {
+		const gap = classifyIngestGap({
+			...base,
+			packetsLostDelta: 1_000,
+			udpRcvbufErrorsDelta: 1_000,
+		});
+		expect(gap.stopBucket).toBe("unexplained");
+		expect(gap.unexplainedPerSec).toBeGreaterThan(40_000);
+	});
+
+	test("omitted UDP and QUIC counters stay null rather than zero", () => {
+		const gap = classifyIngestGap({
+			...base,
+			packetsLostDelta: null,
+			packetsReceivedDelta: null,
+			udpInErrorsDelta: null,
+			udpRcvbufErrorsDelta: null,
+		});
+		expect(gap.stopBucket).toBe("unexplained");
+		expect(gap.packetsLostDelta).toBeNull();
+		expect(gap.udpRcvbufErrorsDelta).toBeNull();
+		expect(gap.udpInErrorsDelta).toBeNull();
+	});
+});
+
+describe("formatGapLine", () => {
+	test("prints n/a for omitted counters rather than 0", () => {
+		expect(
+			formatGapLine({
+				windowOfferedPerSec: 147_000,
+				ingestedPerSec: 99_000,
+				packetsLostDelta: 10,
+				packetsReceivedDelta: 1_000,
+				udpInErrorsDelta: null,
+				udpRcvbufErrorsDelta: null,
+				unexplainedPerSec: 48_000,
+				stopBucket: "unexplained",
+			}),
+		).toBe(
+			"gap: windowOffered=147000 ingest=99000 lost=10 rcvbuf=n/a unexplained=48000 STOP=unexplained",
+		);
 	});
 });
 
