@@ -788,6 +788,8 @@ export type MetricsSnapshot = {
 	datagramsDroppedTooLarge?: number;
 	datagramsDroppedQueueGlobal?: number;
 	datagramsDroppedQueueSession?: number;
+	/** Native ingest only. Park events when session slack cannot fit maxDatagramSize. */
+	datagramsSkippedQueueFull?: number;
 
 	queuedBytesGlobal: number;
 	backpressureWaitCount: number;

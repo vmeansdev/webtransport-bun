@@ -20,6 +20,7 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | datagramsDropped | number | Inbound datagrams dropped at ingest (oversize, datagram rate-limit, or queued-bytes budget). Native identity: this equals the four reason fields below when those fields are present. |
 | datagramsDroppedTooLarge | number? | Native ingest: datagram larger than `maxDatagramSize`. Omitted on WASM. |
 | datagramsDroppedQueueSession | number? | Native ingest: per-session queued-bytes budget. Omitted on WASM. |
+| datagramsSkippedQueueFull | number? | Native ingest: times the session task parked `receive_datagram` because remaining session slack could not fit `maxDatagramSize`. Park events, not datagrams. Not part of the drop-reason identity. Omitted on WASM. |
 | datagramsDroppedQueueGlobal | number? | Native ingest: global queued-bytes budget. Omitted on WASM. |
 | datagramsDroppedRateLimited | number? | Native ingest: per-IP datagram ingress rate limit. Also counted in `rateLimitedCount`. Omitted on WASM. |
 | queuedBytesGlobal | number | Bytes queued globally |
@@ -69,6 +70,11 @@ present:
 WASM omits the reason fields. Do not treat omitted-or-undefined reasons as
 zero, and do not use mixed `rateLimitedCount` (handshakes + streams + datagrams)
 to attribute datagram drops. Prometheus `datagrams_dropped` remains the sum.
+
+`datagramsSkippedQueueFull` is a separate native counter of **park events**
+(ingest did not call `receive_datagram` because remaining per-session slack
+could not fit `maxDatagramSize`). It is not a fifth drop reason and is omitted
+on WASM. Do not treat omit as zero.
 
 Send-path queued-bytes waits time out as `E_BACKPRESSURE_TIMEOUT` and do **not**
 increment `datagramsDropped`.

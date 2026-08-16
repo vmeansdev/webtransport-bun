@@ -29,6 +29,8 @@ pub struct ServerMetricsSnapshot {
     pub datagrams_dropped_too_large: Option<f64>,
     pub datagrams_dropped_queue_global: Option<f64>,
     pub datagrams_dropped_queue_session: Option<f64>,
+    /// Native ingest only. Park events when session slack cannot fit maxDatagramSize.
+    pub datagrams_skipped_queue_full: Option<f64>,
     pub queued_bytes_global: f64,
     pub backpressure_wait_count: f64,
     pub backpressure_timeout_count: f64,
