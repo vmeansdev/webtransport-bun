@@ -59,12 +59,15 @@ pub async fn reserve_datagram_capacity(
             return Err(DatagramCapacityError::Closed);
         }
 
-        if metrics.try_reserve_queued_bytes_with_session(
-            &session_metrics.queued_bytes,
-            reserved,
-            limits.max_queued_bytes_global,
-            limits.max_queued_bytes_per_session,
-        ) {
+        if metrics
+            .try_reserve_queued_bytes_with_session(
+                &session_metrics.queued_bytes,
+                reserved,
+                limits.max_queued_bytes_global,
+                limits.max_queued_bytes_per_session,
+            )
+            .is_ok()
+        {
             if lifecycle_closed.load(Ordering::Acquire) {
                 metrics.release_datagram_capacity(
                     &session_metrics.queued_bytes,
@@ -702,12 +705,9 @@ mod tests {
     const SESSION_MAX: u64 = 1 << 18;
 
     fn reserve(metrics: &Arc<ServerMetrics>, sm: &Arc<SessionMetrics>, n: u64) {
-        assert!(metrics.try_reserve_queued_bytes_with_session(
-            &sm.queued_bytes,
-            n,
-            GLOBAL_MAX,
-            SESSION_MAX,
-        ));
+        assert!(metrics
+            .try_reserve_queued_bytes_with_session(&sm.queued_bytes, n, GLOBAL_MAX, SESSION_MAX,)
+            .is_ok());
     }
 
     // Dropping a queued datagram without dequeuing it (session teardown path)
@@ -1150,6 +1150,98 @@ mod tests {
         assert_eq!(result, Err(DatagramCapacityError::Closed));
         assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
         assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datagram_send_backpressure_timeout_does_not_count_as_drop() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let sm = Arc::new(SessionMetrics::default());
+        let notify = Arc::new(Notify::new());
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limits = crate::limits::Limits {
+            max_queued_bytes_global: 100,
+            max_queued_bytes_per_session: 100,
+            backpressure_timeout_ms: 20,
+            ..crate::limits::Limits::default()
+        };
+        assert!(metrics
+            .try_reserve_queued_bytes_with_session(&sm.queued_bytes, 100, 100, 100)
+            .is_ok());
+
+        let result = reserve_datagram_capacity(
+            &metrics,
+            &sm,
+            &notify,
+            &closed,
+            &limits,
+            1,
+            Instant::now() + Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(result, Err(DatagramCapacityError::Timeout));
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_global
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics.datagrams_dropped_too_large.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .datagrams_dropped_rate_limited
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(metrics.backpressure_timeout_count.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datagram_send_global_budget_wait_does_not_count_as_drop() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let filled = Arc::new(SessionMetrics::default());
+        let waiter_sm = Arc::new(SessionMetrics::default());
+        let notify = Arc::new(Notify::new());
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limits = crate::limits::Limits {
+            max_queued_bytes_global: 50,
+            max_queued_bytes_per_session: 100,
+            backpressure_timeout_ms: 20,
+            ..crate::limits::Limits::default()
+        };
+        assert!(metrics
+            .try_reserve_queued_bytes_with_session(&filled.queued_bytes, 50, 50, 100)
+            .is_ok());
+
+        let result = reserve_datagram_capacity(
+            &metrics,
+            &waiter_sm,
+            &notify,
+            &closed,
+            &limits,
+            1,
+            Instant::now() + Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(result, Err(DatagramCapacityError::Timeout));
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_global
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
