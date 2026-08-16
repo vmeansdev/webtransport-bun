@@ -7,10 +7,14 @@ import {
 	artifactSuffix,
 	classifyIngestGap,
 	classifyPipeCap,
+	cpuListsEqual,
+	cpusSharePhysicalCore,
 	dirtyPaths,
 	formatGapLine,
 	makeRng,
 	median,
+	parseCpuList,
+	parseCpusAllowedListFromStatus,
 	parseLoadClientSentProgress,
 	parseProcNetstatUdp,
 	parseProcSnmpUdp,
@@ -74,11 +78,16 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 			ingestedPerSec: 50_000,
 			predictedPps: null,
 			bdpBps: null,
+			cwnd: null,
+			rttUs: null,
 			clientCpuCores: null,
 			congPerSec: null,
 			bytesPerDatagram: null,
 			stopBucket: "incomplete",
 		},
+		clientTaskset: "",
+		clientCpusAllowed: [],
+		clientAffinityOk: true,
 		workerProof: {
 			configured: 2,
 			availableParallelism: 10,
@@ -734,6 +743,8 @@ describe("classifyPipeCap", () => {
 		frameTxPerSec: 108_000 as number | null,
 		ingestedPerSec: 105_000,
 		bdpBps: 500_000_000 as number | null,
+		cwnd: 240_000 as number | null,
+		rttUs: 1_500 as number | null,
 		udpTxBytesPerSec: 130_000_000 as number | null,
 		clientCpuCores: 0.8 as number | null,
 		congPerSec: 0 as number | null,
@@ -769,5 +780,33 @@ describe("classifyPipeCap", () => {
 		expect(classifyPipeCap({ ...base, bdpBps: null }).stopBucket).toBe(
 			"incomplete",
 		);
+	});
+});
+
+describe("cpu list helpers", () => {
+	test("parseCpuList expands ranges and singles", () => {
+		expect(parseCpuList("0-1")).toEqual([0, 1]);
+		expect(parseCpuList("0,2")).toEqual([0, 2]);
+		expect(parseCpuList(" 0-1,3 ")).toEqual([0, 1, 3]);
+	});
+
+	test("cpuListsEqual is order-sensitive after parse sort", () => {
+		expect(cpuListsEqual(parseCpuList("1,0"), parseCpuList("0-1"))).toBe(true);
+		expect(cpuListsEqual([0, 1], [0, 2])).toBe(false);
+	});
+
+	test("cpusSharePhysicalCore treats self and sibling lists", () => {
+		expect(cpusSharePhysicalCore(0, 0, [0, 4])).toBe(true);
+		expect(cpusSharePhysicalCore(0, 4, [0, 4])).toBe(true);
+		expect(cpusSharePhysicalCore(0, 1, [0, 4])).toBe(false);
+	});
+
+	test("parseCpusAllowedListFromStatus reads the proc line", () => {
+		expect(
+			parseCpusAllowedListFromStatus(
+				"Name:\tload-client\nCpus_allowed_list:\t0-1\n",
+			),
+		).toEqual([0, 1]);
+		expect(parseCpusAllowedListFromStatus("Name:\tload-client\n")).toBeNull();
 	});
 });

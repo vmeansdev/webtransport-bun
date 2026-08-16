@@ -95,6 +95,8 @@ const ECHO = process.env.WT_PROBE_ECHO === "1";
 const DISCARD = process.env.WT_PROBE_DISCARD === "1";
 /** Per-session stream opens/s, to make the accept path hot. */
 const STREAMS_PER_SEC = Number(process.env.WT_PROBE_STREAMS_PER_SEC ?? "0");
+/** `taskset -c` list for load-client only; empty means unpinned (shared arm). */
+const CLIENT_TASKSET = (process.env.WT_PROBE_CLIENT_TASKSET ?? "").trim();
 /** Restrict the worker sweep, e.g. `1` for a hop A/B at the collapse default. */
 const WORKER_FILTER = (process.env.WT_PROBE_WORKERS ?? "")
 	.split(",")
@@ -208,6 +210,8 @@ export type PipeCap = {
 	ingestedPerSec: number;
 	predictedPps: number | null;
 	bdpBps: number | null;
+	cwnd: number | null;
+	rttUs: number | null;
 	clientCpuCores: number | null;
 	congPerSec: number | null;
 	bytesPerDatagram: number | null;
@@ -269,6 +273,9 @@ export type ArmRun = {
 	};
 	gap: IngestGap;
 	pipeCap: PipeCap;
+	clientTaskset: string;
+	clientCpusAllowed: number[][];
+	clientAffinityOk: boolean;
 };
 
 export function median(values: number[]): number {
@@ -613,10 +620,121 @@ export function sumWindowBdpBps(
 	return any ? sum : null;
 }
 
+export function sumWindowCwnd(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	let sum = 0;
+	let any = false;
+	for (const text of clientStdouts) {
+		const delta = windowSentDelta(
+			parseLoadClientSentProgress(text),
+			warmupMs,
+			measureMs,
+		);
+		if (!delta || delta.cwnd1 == null) continue;
+		any = true;
+		sum += delta.cwnd1;
+	}
+	return any ? sum : null;
+}
+
+export function meanWindowRttUs(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	let sum = 0;
+	let n = 0;
+	for (const text of clientStdouts) {
+		const delta = windowSentDelta(
+			parseLoadClientSentProgress(text),
+			warmupMs,
+			measureMs,
+		);
+		if (!delta || delta.rttUs1 == null) continue;
+		sum += delta.rttUs1;
+		n += 1;
+	}
+	return n > 0 ? sum / n : null;
+}
+
+export function parseCpuList(spec: string): number[] {
+	const cpus = new Set<number>();
+	for (const part of spec.split(",")) {
+		const token = part.trim();
+		if (!token) continue;
+		const range = token.split("-");
+		if (range.length === 1) {
+			const n = Number.parseInt(range[0] ?? "", 10);
+			if (Number.isFinite(n)) cpus.add(n);
+			continue;
+		}
+		const lo = Number.parseInt(range[0] ?? "", 10);
+		const hi = Number.parseInt(range[1] ?? "", 10);
+		if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) continue;
+		for (let cpu = lo; cpu <= hi; cpu += 1) cpus.add(cpu);
+	}
+	return [...cpus].sort((a, b) => a - b);
+}
+
+export function cpuListsEqual(
+	left: readonly number[],
+	right: readonly number[],
+): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((cpu, i) => cpu === right[i]);
+}
+
+export function cpusSharePhysicalCore(
+	cpuA: number,
+	cpuB: number,
+	siblingsOfA: readonly number[],
+): boolean {
+	if (cpuA === cpuB) return true;
+	return siblingsOfA.includes(cpuB);
+}
+
+export function parseCpusAllowedListFromStatus(
+	statusText: string,
+): number[] | null {
+	const line = statusText
+		.split("\n")
+		.find((row) => row.startsWith("Cpus_allowed_list:"));
+	if (!line) return null;
+	return parseCpuList(line.slice("Cpus_allowed_list:".length));
+}
+
+export function readCpusAllowedList(pid: number): number[] | null {
+	try {
+		return parseCpusAllowedListFromStatus(
+			readFileSync(`/proc/${pid}/status`, "utf8"),
+		);
+	} catch {
+		return null;
+	}
+}
+
+export function readThreadSiblings(cpu: number): number[] | null {
+	try {
+		return parseCpuList(
+			readFileSync(
+				`/sys/devices/system/cpu/cpu${cpu}/topology/thread_siblings_list`,
+				"utf8",
+			).trim(),
+		);
+	} catch {
+		return null;
+	}
+}
+
 export function classifyPipeCap(input: {
 	frameTxPerSec: number | null;
 	ingestedPerSec: number;
 	bdpBps: number | null;
+	cwnd: number | null;
+	rttUs: number | null;
 	udpTxBytesPerSec: number | null;
 	clientCpuCores: number | null;
 	congPerSec: number | null;
@@ -657,6 +775,8 @@ export function classifyPipeCap(input: {
 		ingestedPerSec: input.ingestedPerSec,
 		predictedPps,
 		bdpBps: input.bdpBps,
+		cwnd: input.cwnd,
+		rttUs: input.rttUs,
 		clientCpuCores: input.clientCpuCores,
 		congPerSec: input.congPerSec,
 		bytesPerDatagram,
@@ -670,6 +790,7 @@ export function formatPipeCapLine(pipe: PipeCap): string {
 	return (
 		`pipe: frameTx=${n(pipe.frameTxPerSec)} ingest=${Math.round(pipe.ingestedPerSec)} ` +
 		`predicted=${n(pipe.predictedPps)} bdpBps=${n(pipe.bdpBps)} ` +
+		`cwnd=${n(pipe.cwnd)} rtt_us=${n(pipe.rttUs)} ` +
 		`clientCpu=${pipe.clientCpuCores == null ? "n/a" : pipe.clientCpuCores.toFixed(2)} ` +
 		`cong=${n(pipe.congPerSec)} STOP=${pipe.stopBucket}`
 	);
@@ -942,35 +1063,47 @@ async function runChild(
 	await Bun.sleep(BIND_WAIT_MS);
 
 	const perClient = Math.floor(sessions / CLIENTS);
-	const clients = Array.from({ length: CLIENTS }, (_, i) =>
-		Bun.spawn(
-			[
-				CLIENT_BIN,
-				"--url",
-				`https://127.0.0.1:${port}`,
-				"--mode",
-				"load",
-				"--skip-probes",
-				"--sessions",
-				String(i === 0 ? sessions - perClient * (CLIENTS - 1) : perClient),
-				"--duration",
-				String(WARMUP_SEC + MEASURE_SEC),
-				"--datagrams-per-sec",
-				String(rate),
-				"--streams-per-sec",
-				String(STREAMS_PER_SEC),
-				"--payload-bytes",
-				String(PAYLOAD_BYTES),
-				"--max-session-errors",
-				String(sessions),
-				"--max-datagram-errors",
-				"1000000000",
-				"--max-stream-errors",
-				"1000000000",
-			],
+	const expectedClientCpus = CLIENT_TASKSET ? parseCpuList(CLIENT_TASKSET) : [];
+	const clients = Array.from({ length: CLIENTS }, (_, i) => {
+		const args = [
+			CLIENT_BIN,
+			"--url",
+			`https://127.0.0.1:${port}`,
+			"--mode",
+			"load",
+			"--skip-probes",
+			"--sessions",
+			String(i === 0 ? sessions - perClient * (CLIENTS - 1) : perClient),
+			"--duration",
+			String(WARMUP_SEC + MEASURE_SEC),
+			"--datagrams-per-sec",
+			String(rate),
+			"--streams-per-sec",
+			String(STREAMS_PER_SEC),
+			"--payload-bytes",
+			String(PAYLOAD_BYTES),
+			"--max-session-errors",
+			String(sessions),
+			"--max-datagram-errors",
+			"1000000000",
+			"--max-stream-errors",
+			"1000000000",
+		];
+		return Bun.spawn(
+			CLIENT_TASKSET ? ["taskset", "-c", CLIENT_TASKSET, ...args] : args,
 			{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
-		),
+		);
+	});
+	const clientCpusAllowed = clients.map((client) =>
+		client.pid == null ? [] : (readCpusAllowedList(client.pid) ?? []),
 	);
+	const clientAffinityOk =
+		!CLIENT_TASKSET ||
+		(expectedClientCpus.length > 0 &&
+			clientCpusAllowed.length === CLIENTS &&
+			clientCpusAllowed.every((allowed) =>
+				cpuListsEqual(allowed, expectedClientCpus),
+			));
 	const stdoutPromise = Promise.all(
 		clients.map((c) => new Response(c.stdout).text()),
 	);
@@ -1060,6 +1193,8 @@ async function runChild(
 		frameTxPerSec: frameTxDatagramPerSec,
 		ingestedPerSec,
 		bdpBps: sumWindowBdpBps(stdout, WARMUP_SEC * 1_000, MEASURE_SEC * 1_000),
+		cwnd: sumWindowCwnd(stdout, WARMUP_SEC * 1_000, MEASURE_SEC * 1_000),
+		rttUs: meanWindowRttUs(stdout, WARMUP_SEC * 1_000, MEASURE_SEC * 1_000),
 		udpTxBytesPerSec: sumWindowUdpTxBytesPerSec(
 			stdout,
 			WARMUP_SEC * 1_000,
@@ -1143,6 +1278,9 @@ async function runChild(
 		},
 		gap,
 		pipeCap,
+		clientTaskset: CLIENT_TASKSET,
+		clientCpusAllowed,
+		clientAffinityOk,
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);

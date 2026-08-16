@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	type ArmSummary,
 	armKey,
+	classifyCoresplit,
 	classifyWaitVsDrop,
 	collapseFor,
 	generatorLimitedRates,
@@ -261,12 +262,12 @@ describe("proofFailures", () => {
 	});
 });
 
-describe("classifyWaitVsDrop", () => {
-	const withFrameTx = (
-		key: string,
-		frameTxDatagramPerSec: number,
-		offeredPerSec: number,
-	): ArmSummary => ({
+function withFrameTx(
+	key: string,
+	frameTxDatagramPerSec: number,
+	offeredPerSec: number,
+): ArmSummary {
+	return {
 		...arm({
 			workers: "2",
 			requestedPerSec: 160_000,
@@ -311,10 +312,15 @@ describe("classifyWaitVsDrop", () => {
 					stopBucket: "unexplained",
 				},
 				pipeCap: null,
+				clientTaskset: "",
+				clientCpusAllowed: [],
+				clientAffinityOk: true,
 			},
 		],
-	});
+	};
+}
 
+describe("classifyWaitVsDrop", () => {
 	test("wait frame_tx at least 10% above drop is drop-starves-tx", () => {
 		const result = classifyWaitVsDrop([
 			withFrameTx("w2@160000", 100_000, 147_000),
@@ -337,6 +343,88 @@ describe("classifyWaitVsDrop", () => {
 		expect(
 			classifyWaitVsDrop([withFrameTx("w2@160000", 100_000, 147_000)])
 				.stopBucket,
+		).toBe("incomplete");
+	});
+});
+
+describe("classifyCoresplit", () => {
+	const base = {
+		nproc: 4,
+		tasksetOk: true,
+		cpu0Siblings: [0, 4],
+		cpu1Siblings: [1, 5],
+	};
+
+	test("split 20% above shared is co-residence", () => {
+		expect(
+			classifyCoresplit({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@split", 130_000, 130_000),
+				],
+			}).stopBucket,
+		).toBe("co-residence");
+	});
+
+	test("flat split is not-coresidence, not path/cc", () => {
+		expect(
+			classifyCoresplit({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@split", 106_000, 106_000),
+				],
+			}).stopBucket,
+		).toBe("not-coresidence");
+	});
+
+	test("shared outside the reproduce band is incomplete", () => {
+		expect(
+			classifyCoresplit({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 80_000, 80_000),
+					withFrameTx("w2@160000@wait@split", 100_000, 100_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("nproc under 4 is incomplete", () => {
+		expect(
+			classifyCoresplit({
+				...base,
+				nproc: 2,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@split", 130_000, 130_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("HT siblings of 0 and 1 is incomplete", () => {
+		expect(
+			classifyCoresplit({
+				...base,
+				cpu0Siblings: [0, 1],
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@split", 130_000, 130_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("unverified split affinity is incomplete", () => {
+		const split = withFrameTx("w2@160000@wait@split", 130_000, 130_000);
+		split.runs[0]!.clientAffinityOk = false;
+		expect(
+			classifyCoresplit({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), split],
+			}).stopBucket,
 		).toBe("incomplete");
 	});
 });

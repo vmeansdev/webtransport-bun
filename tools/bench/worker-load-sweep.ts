@@ -46,8 +46,10 @@ import {
 	formatPipeCapLine,
 	type IngestGap,
 	type PipeCap,
+	cpusSharePhysicalCore,
 	makeRng,
 	median,
+	readThreadSiblings,
 	shuffled,
 } from "./worker-thread-parallelism-probe.ts";
 
@@ -70,6 +72,10 @@ const SEND_MODES = (process.env.SWEEP_SEND_MODES ?? "drop")
 	.split(",")
 	.map((s) => s.trim())
 	.filter((s): s is "drop" | "wait" => s === "drop" || s === "wait");
+const CPU_MODES = (process.env.SWEEP_CPU_MODES ?? "shared")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s): s is "shared" | "split" => s === "shared" || s === "split");
 /** Load-generator processes sharing the sessions. */
 const CLIENTS = Number(process.env.SWEEP_CLIENTS ?? "2");
 const REPS = Number(process.env.SWEEP_REPS ?? "2");
@@ -103,19 +109,23 @@ export type SweepArm = {
 	requestedPerSec: number;
 	ratePerSession: number;
 	sendMode: "drop" | "wait";
+	cpuMode: "shared" | "split";
 };
 
 export function sweepArms(): SweepArm[] {
 	const arms: SweepArm[] = [];
-	for (const sendMode of SEND_MODES) {
-		for (const workers of WORKERS) {
-			for (const requestedPerSec of RATES) {
-				arms.push({
-					workers,
-					requestedPerSec,
-					ratePerSession: Math.max(1, Math.round(requestedPerSec / SESSIONS)),
-					sendMode,
-				});
+	for (const cpuMode of CPU_MODES) {
+		for (const sendMode of SEND_MODES) {
+			for (const workers of WORKERS) {
+				for (const requestedPerSec of RATES) {
+					arms.push({
+						workers,
+						requestedPerSec,
+						ratePerSession: Math.max(1, Math.round(requestedPerSec / SESSIONS)),
+						sendMode,
+						cpuMode,
+					});
+				}
 			}
 		}
 	}
@@ -126,10 +136,13 @@ export const armKey = (a: {
 	workers: string;
 	requestedPerSec: number;
 	sendMode?: "drop" | "wait";
-}): string =>
-	a.sendMode && a.sendMode !== "drop"
-		? `w${a.workers}@${a.requestedPerSec}@${a.sendMode}`
-		: `w${a.workers}@${a.requestedPerSec}`;
+	cpuMode?: "shared" | "split";
+}): string => {
+	let key = `w${a.workers}@${a.requestedPerSec}`;
+	if (a.sendMode && a.sendMode !== "drop") key += `@${a.sendMode}`;
+	if (a.cpuMode && a.cpuMode !== "shared") key += `@${a.cpuMode}`;
+	return key;
+};
 
 export type SweepRun = {
 	key: string;
@@ -155,6 +168,9 @@ export type SweepRun = {
 	threads: { label: string; cores: number; datagrams: number }[];
 	gap: IngestGap | null;
 	pipeCap: PipeCap | null;
+	clientTaskset: string;
+	clientCpusAllowed: number[][];
+	clientAffinityOk: boolean;
 };
 
 function gitOutput(args: string[]): string {
@@ -196,6 +212,7 @@ async function runOne(
 				WT_PROBE_MEASURE_SEC: String(MEASURE_SEC),
 				WT_PROBE_PAYLOAD_BYTES: String(PAYLOAD_BYTES),
 				WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1",
+				WT_PROBE_CLIENT_TASKSET: arm.cpuMode === "split" ? "0-1" : "",
 			},
 		},
 	);
@@ -251,6 +268,9 @@ async function runOne(
 			})),
 			gap: run.gap ?? null,
 			pipeCap: run.pipeCap ?? null,
+			clientTaskset: run.clientTaskset ?? "",
+			clientCpusAllowed: run.clientCpusAllowed ?? [],
+			clientAffinityOk: run.clientAffinityOk !== false,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -420,8 +440,8 @@ function medianFrameTx(summaries: readonly ArmSummary[]): number | null {
 export function classifyWaitVsDrop(
 	summaries: readonly ArmSummary[],
 ): WaitVsDrop {
-	const drop = summaries.filter((s) => !s.key.endsWith("@wait"));
-	const wait = summaries.filter((s) => s.key.endsWith("@wait"));
+	const drop = summaries.filter((s) => !s.key.includes("@wait"));
+	const wait = summaries.filter((s) => s.key.includes("@wait"));
 	const dropFrameTxPerSec = medianFrameTx(drop);
 	const waitFrameTxPerSec = medianFrameTx(wait);
 	const dropOfferedPerSec =
@@ -453,6 +473,76 @@ export function classifyWaitVsDrop(
 	};
 }
 
+export type CoresplitBucket = "co-residence" | "not-coresidence" | "incomplete";
+
+export type Coresplit = {
+	sharedFrameTxPerSec: number | null;
+	splitFrameTxPerSec: number | null;
+	ratio: number | null;
+	nproc: number;
+	tasksetOk: boolean;
+	affinityOk: boolean;
+	htSiblings: boolean;
+	stopBucket: CoresplitBucket;
+};
+
+const SHARED_FRAME_TX_MIN = 90_000;
+const SHARED_FRAME_TX_MAX = 120_000;
+const CORESPLIT_RATIO = 1.2;
+
+export function classifyCoresplit(input: {
+	summaries: readonly ArmSummary[];
+	nproc: number;
+	tasksetOk: boolean;
+	cpu0Siblings: number[] | null;
+	cpu1Siblings: number[] | null;
+}): Coresplit {
+	const shared = input.summaries.filter((s) => !s.key.endsWith("@split"));
+	const split = input.summaries.filter((s) => s.key.endsWith("@split"));
+	const sharedFrameTxPerSec = medianFrameTx(shared);
+	const splitFrameTxPerSec = medianFrameTx(split);
+	const ratio =
+		sharedFrameTxPerSec != null &&
+		splitFrameTxPerSec != null &&
+		sharedFrameTxPerSec > 0
+			? splitFrameTxPerSec / sharedFrameTxPerSec
+			: null;
+	const affinityOk = split.every((s) =>
+		s.runs.every((r) => r.clientAffinityOk),
+	);
+	const htSiblings =
+		input.cpu0Siblings != null &&
+		cpusSharePhysicalCore(0, 1, input.cpu0Siblings);
+	const sharedReproduced =
+		sharedFrameTxPerSec != null &&
+		sharedFrameTxPerSec >= SHARED_FRAME_TX_MIN &&
+		sharedFrameTxPerSec <= SHARED_FRAME_TX_MAX;
+	const incomplete =
+		input.nproc < 4 ||
+		!input.tasksetOk ||
+		!affinityOk ||
+		split.length === 0 ||
+		sharedFrameTxPerSec == null ||
+		splitFrameTxPerSec == null ||
+		input.cpu0Siblings == null ||
+		htSiblings ||
+		!sharedReproduced;
+	let stopBucket: CoresplitBucket = "incomplete";
+	if (!incomplete && ratio != null) {
+		stopBucket = ratio >= CORESPLIT_RATIO ? "co-residence" : "not-coresidence";
+	}
+	return {
+		sharedFrameTxPerSec,
+		splitFrameTxPerSec,
+		ratio,
+		nproc: input.nproc,
+		tasksetOk: input.tasksetOk,
+		affinityOk,
+		htSiblings,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -474,7 +564,8 @@ async function main(): Promise<void> {
 	};
 	console.log(
 		`sweep: host cpus=${capacity.cpus} mem=${capacity.memoryMb}MB sessions=${SESSIONS} ` +
-			`clients=${CLIENTS} workers=[${WORKERS.join(",")}] rates=[${RATES.join(",")}]`,
+			`clients=${CLIENTS} workers=[${WORKERS.join(",")}] rates=[${RATES.join(",")}] ` +
+			`cpuModes=[${CPU_MODES.join(",")}]`,
 	);
 
 	const arms = sweepArms();
@@ -498,6 +589,16 @@ async function main(): Promise<void> {
 		ReturnType<typeof collapseFor>
 	> = Object.fromEntries(WORKERS.map((w) => [w, collapseFor(summaries, w)]));
 	const waitVsDrop = classifyWaitVsDrop(summaries);
+	const tasksetOk =
+		spawnSync("taskset", ["-c", "0", "true"], { encoding: "utf8" }).status ===
+		0;
+	const coresplit = classifyCoresplit({
+		summaries,
+		nproc: capacity.cpus,
+		tasksetOk,
+		cpu0Siblings: readThreadSiblings(0),
+		cpu1Siblings: readThreadSiblings(1),
+	});
 	const failures = [
 		...proofFailures(summaries),
 		...(gitOutput(["rev-parse", "HEAD"]) === head
@@ -535,9 +636,11 @@ async function main(): Promise<void> {
 			reps: REPS,
 			order,
 			sendModes: SEND_MODES,
+			cpuModes: CPU_MODES,
 		},
 		arms: summaries,
 		waitVsDrop,
+		coresplit,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -613,6 +716,18 @@ async function main(): Promise<void> {
 				`waitOffered=${n(waitVsDrop.waitOfferedPerSec)} ` +
 				`ratio=${waitVsDrop.ratio == null ? "n/a" : waitVsDrop.ratio.toFixed(2)} ` +
 				`STOP=${waitVsDrop.stopBucket}`,
+		);
+	}
+	{
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  coresplit: sharedFrameTx=${n(coresplit.sharedFrameTxPerSec)} ` +
+				`splitFrameTx=${n(coresplit.splitFrameTxPerSec)} ` +
+				`ratio=${coresplit.ratio == null ? "n/a" : coresplit.ratio.toFixed(2)} ` +
+				`nproc=${coresplit.nproc} taskset=${coresplit.tasksetOk} ` +
+				`affinity=${coresplit.affinityOk} htSiblings=${coresplit.htSiblings} ` +
+				`STOP=${coresplit.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)
