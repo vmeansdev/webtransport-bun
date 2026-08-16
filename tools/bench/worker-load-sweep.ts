@@ -513,7 +513,9 @@ async function main(): Promise<void> {
 		console.log(`\n  ${"arm".padEnd(16)}${"skipPark".padStart(12)}`);
 		for (const s of withSkips) {
 			console.log(
-				`  ${s.key.padEnd(16)}${Math.round(s.skippedQueueFull ?? Number.NaN).toLocaleString().padStart(12)}`,
+				`  ${s.key.padEnd(16)}${Math.round(s.skippedQueueFull ?? Number.NaN)
+					.toLocaleString()
+					.padStart(12)}`,
 			);
 		}
 	}
