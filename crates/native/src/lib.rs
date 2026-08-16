@@ -103,12 +103,61 @@ mod worker_threads_tests {
     }
 
     #[test]
+    fn the_global_queue_interval_is_unset_unless_asked_for() {
+        use super::resolve_global_queue_interval;
+        assert_eq!(resolve_global_queue_interval(None), Ok(None));
+        assert_eq!(resolve_global_queue_interval(Some(" ")), Ok(None));
+        assert_eq!(resolve_global_queue_interval(Some("2")), Ok(Some(2)));
+        assert_eq!(resolve_global_queue_interval(Some(" 127 ")), Ok(Some(127)));
+        for bad in ["0", "-1", "many"] {
+            assert!(resolve_global_queue_interval(Some(bad)).is_err());
+        }
+    }
+
+    #[test]
     fn garbage_is_rejected_rather_than_defaulted() {
         for bad in ["0", "-1", "two", "2.5"] {
             assert!(
                 resolve_worker_threads(Some(bad)).is_err(),
                 "{bad} must not silently become 1"
             );
+        }
+    }
+}
+
+/// Override for tokio's injection-queue servicing cadence, unset by default.
+///
+/// INVESTIGATION ONLY. Every `readDatagram` reaches the server runtime through
+/// `env.spawn_future` -> `RUNTIME.spawn` from outside the runtime, so it lands
+/// in the injection queue. A worker whose local queue never drains reaches that
+/// queue only at `worker.rs:1077`, `tick % global_queue_interval == 0`, and
+/// takes exactly one task per check. Tokio auto-tunes the interval to
+/// `TARGET_GLOBAL_QUEUE_INTERVAL / task_poll_time_ewma`, i.e. one remote task
+/// per ~200us of work — about 5,000/s, which is the floor this branch measured
+/// on two platforms. Setting the interval explicitly disables the tuner
+/// (`stats.rs:58`), which is what makes this a falsifier rather than a guess.
+pub(crate) const SERVER_GLOBAL_QUEUE_INTERVAL_ENV: &str =
+    "WEBTRANSPORT_SERVER_GLOBAL_QUEUE_INTERVAL";
+
+fn resolve_global_queue_interval(raw: Option<&str>) -> Result<Option<u32>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(other) => match other.parse::<u32>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(format!(
+                "{SERVER_GLOBAL_QUEUE_INTERVAL_ENV}={other:?} is not a positive integer"
+            )),
+        },
+    }
+}
+
+fn server_global_queue_interval() -> Option<u32> {
+    let raw = std::env::var(SERVER_GLOBAL_QUEUE_INTERVAL_ENV).ok();
+    match resolve_global_queue_interval(raw.as_deref()) {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
+            std::process::abort();
         }
     }
 }
@@ -126,18 +175,21 @@ fn server_worker_threads() -> usize {
 
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .worker_threads(server_worker_threads())
         .enable_all()
-        .thread_name("wt-server")
-        .build()
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "webtransport-native: FATAL E_INTERNAL: failed to create server Tokio runtime: {}",
-                e
-            );
-            std::process::abort();
-        })
+        .thread_name("wt-server");
+    if let Some(interval) = server_global_queue_interval() {
+        builder.global_queue_interval(interval);
+    }
+    builder.build().unwrap_or_else(|e| {
+        eprintln!(
+            "webtransport-native: FATAL E_INTERNAL: failed to create server Tokio runtime: {}",
+            e
+        );
+        std::process::abort();
+    })
 });
 
 /// Client runtime: drives client connections and client-side stream bridges.
