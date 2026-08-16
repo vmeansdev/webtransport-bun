@@ -34,6 +34,26 @@ on:
         required: false
         default: "false"
         type: string
+      worker_probe:
+        description: "Run the tokio worker-count load sweep instead of the ladder"
+        required: false
+        default: "false"
+        type: string
+      worker_sweep_rates:
+        description: "Comma-separated aggregate offered datagrams/s rungs for the worker sweep"
+        required: false
+        default: "20000,40000,80000,160000"
+        type: string
+      worker_sweep_workers:
+        description: "Comma-separated tokio worker counts for the worker sweep"
+        required: false
+        default: "1,2"
+        type: string
+      worker_sweep_clients:
+        description: "Load-generator processes sharing the sessions in the worker sweep"
+        required: false
+        default: "2"
+        type: string
 jobs:
   bench:
     permissions:
@@ -104,8 +124,49 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      # Tokio worker-count load sweep. Answers whether delivered throughput ever
+      # falls as offered load rises, and at which worker counts. macOS found a
+      # 16x collapse at one worker, but on a receive path where quinn-udp's
+      # BATCH_SIZE is 1; Linux batches 32 with GRO, so the operating point does
+      # not transfer and the rate has to be swept rather than repeated.
+      - name: Build load generator
+        if: ${{ github.event.inputs.worker_probe == 'true' }}
+        run: CARGO_TARGET_DIR="$PWD/target" cargo build -p reference --bin load-client --release
+      - name: Verify quinn-udp recv batching on this host
+        if: ${{ github.event.inputs.worker_probe == 'true' }}
+        run: |
+          # BATCH_SIZE is a cfg, not a runtime value, so record what the feature
+          # graph resolved. recvmmsg in the syscall trace means the batched path.
+          cargo tree -p quinn-udp -e features 2>/dev/null | head -5 || true
+          echo "== fast-apple-datapath enabled anywhere? =="
+          cargo tree -e features -i quinn-udp 2>/dev/null | grep -c "fast-apple-datapath" || echo "0 (not enabled)"
+          echo "== GRO on the default interface =="
+          IFACE="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+          if command -v ethtool >/dev/null 2>&1 && [ -n "$IFACE" ]; then
+            ethtool -k "$IFACE" | grep -Ei 'gro|gso' || true
+          fi
+      - name: Run worker load sweep
+        if: ${{ github.event.inputs.worker_probe == 'true' }}
+        env:
+          SWEEP_SESSIONS: ${{ github.event.inputs.sessions }}
+          SWEEP_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
+          SWEEP_RATES: ${{ github.event.inputs.worker_sweep_rates }}
+          SWEEP_WORKERS: ${{ github.event.inputs.worker_sweep_workers }}
+          SWEEP_CLIENTS: ${{ github.event.inputs.worker_sweep_clients }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          SWEEP_OUT="$GITHUB_WORKSPACE/.bench-evidence/worker-load-sweep-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/bench/worker-load-sweep.ts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.worker_probe == 'true' }}
+        with:
+          name: worker-load-sweep-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/worker-load-sweep-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.worker_probe != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -116,7 +177,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.worker_probe != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*

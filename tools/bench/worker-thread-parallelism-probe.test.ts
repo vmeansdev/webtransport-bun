@@ -101,11 +101,12 @@ describe("dirtyPaths", () => {
 		expect(dirtyPaths("")).toEqual([]);
 	});
 
-	test("source changes count, the probe's own output directory does not", () => {
+	test("source changes count, the probes' own output directories do not", () => {
 		const porcelain = [
 			" M crates/native/src/lib.rs",
 			"?? .investigation/worker-thread-parallelism-probe.json",
 			"?? .investigation/measurement.md",
+			"?? .bench-evidence/worker-load-sweep-abc123.json",
 		].join("\n");
 		expect(dirtyPaths(porcelain)).toEqual(["crates/native/src/lib.rs"]);
 	});

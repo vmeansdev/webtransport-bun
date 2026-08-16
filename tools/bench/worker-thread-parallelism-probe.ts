@@ -215,9 +215,10 @@ function gitOutput(args: string[]): string {
 /**
  * Uncommitted changes to anything the measurement runs on.
  *
- * `.investigation/` is where this probe writes its own artifact and where the
- * write-up lives, so it is excluded: the run must not be able to fail itself by
- * producing its output. Everything else — source, harness, addon — counts.
+ * `.investigation/` is where these probes write their artifacts and where the
+ * write-up lives, and `.bench-evidence/` is where CI collects them for upload.
+ * Both are excluded: a run must not be able to fail itself by producing its own
+ * output. Everything else — source, harness, addon — counts.
  */
 export function dirtyPaths(porcelain: string): string[] {
 	return porcelain
@@ -225,7 +226,11 @@ export function dirtyPaths(porcelain: string): string[] {
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0)
 		.map((line) => line.replace(/^\S+\s+/, ""))
-		.filter((path) => !path.startsWith(".investigation/"));
+		.filter(
+			(path) =>
+				!path.startsWith(".investigation/") &&
+				!path.startsWith(".bench-evidence/"),
+		);
 }
 
 // ---------------------------------------------------------------------------
