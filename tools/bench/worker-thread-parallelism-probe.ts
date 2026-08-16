@@ -52,11 +52,6 @@ import {
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 
 const ROOT = resolve(import.meta.dir, "..", "..");
-const ARTIFACT_PATH = join(
-	ROOT,
-	".investigation",
-	"worker-thread-parallelism-probe.json",
-);
 const CLIENT_BIN = join(ROOT, "target", "release", "load-client");
 const WORKERS_ENV = "WEBTRANSPORT_SERVER_WORKER_THREADS";
 const COMMAND = "bun tools/bench/worker-thread-parallelism-probe.ts";
@@ -74,6 +69,21 @@ const MEASURE_SEC = Number(process.env.WT_PROBE_MEASURE_SEC ?? "20");
 export const REPS = Number(process.env.WT_PROBE_REPS ?? "3");
 const BASE_PORT = 48_610;
 const BIND_WAIT_MS = 3_000;
+/**
+ * Load-generator processes sharing the session count.
+ *
+ * One load-client tops out near 65k datagrams/s on this host, which the native
+ * control (tools/bench/native-recv-floor-control.ts) showed is the ceiling the
+ * first run of this sweep actually measured: sharded over three clients the
+ * same one-worker Rust server took 115k/s. Any arm run with a single client is
+ * reporting the generator's limit, not the server's.
+ */
+const CLIENTS = Number(process.env.WT_PROBE_CLIENTS ?? "1");
+const ARTIFACT_PATH = join(
+	ROOT,
+	".investigation",
+	`worker-thread-parallelism-probe${CLIENTS > 1 ? `-c${CLIENTS}` : ""}.json`,
+);
 const CHILD_TIMEOUT_MS =
 	(WARMUP_SEC + MEASURE_SEC) * 1_000 + BIND_WAIT_MS + 60_000;
 
@@ -260,35 +270,42 @@ async function runChild(
 	});
 	await Bun.sleep(BIND_WAIT_MS);
 
-	const client = Bun.spawn(
-		[
-			CLIENT_BIN,
-			"--url",
-			`https://127.0.0.1:${port}`,
-			"--mode",
-			"load",
-			"--skip-probes",
-			"--sessions",
-			String(sessions),
-			"--duration",
-			String(WARMUP_SEC + MEASURE_SEC),
-			"--datagrams-per-sec",
-			String(rate),
-			"--streams-per-sec",
-			"0",
-			"--payload-bytes",
-			String(PAYLOAD_BYTES),
-			"--max-session-errors",
-			String(sessions),
-			"--max-datagram-errors",
-			"1000000000",
-			"--max-stream-errors",
-			"1000000000",
-		],
-		{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
+	const perClient = Math.floor(sessions / CLIENTS);
+	const clients = Array.from({ length: CLIENTS }, (_, i) =>
+		Bun.spawn(
+			[
+				CLIENT_BIN,
+				"--url",
+				`https://127.0.0.1:${port}`,
+				"--mode",
+				"load",
+				"--skip-probes",
+				"--sessions",
+				String(i === 0 ? sessions - perClient * (CLIENTS - 1) : perClient),
+				"--duration",
+				String(WARMUP_SEC + MEASURE_SEC),
+				"--datagrams-per-sec",
+				String(rate),
+				"--streams-per-sec",
+				"0",
+				"--payload-bytes",
+				String(PAYLOAD_BYTES),
+				"--max-session-errors",
+				String(sessions),
+				"--max-datagram-errors",
+				"1000000000",
+				"--max-stream-errors",
+				"1000000000",
+			],
+			{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
+		),
 	);
-	const stdoutPromise = new Response(client.stdout).text();
-	const stderrPromise = new Response(client.stderr).text();
+	const stdoutPromise = Promise.all(
+		clients.map((c) => new Response(c.stdout).text()),
+	);
+	const stderrPromise = Promise.all(
+		clients.map((c) => new Response(c.stderr).text()),
+	);
 
 	// Steady state only: let handshakes and cwnd settle before the window opens.
 	await Bun.sleep(WARMUP_SEC * 1_000);
@@ -304,13 +321,14 @@ async function runChild(
 	const probe1 = __TESTING__.nativeWorkerProbeSnapshotForTests() ?? {};
 	const t1 = performance.now();
 
-	await client.exited;
+	for (const c of clients) await c.exited;
 	const stdout = await stdoutPromise;
-	const stderr = await stderrPromise;
-	const num = (re: RegExp): number => {
-		const m = stdout.match(re);
-		return m?.[1] ? Number.parseInt(m[1], 10) : 0;
-	};
+	const stderr = (await stderrPromise).join("\n");
+	const num = (re: RegExp): number =>
+		stdout.reduce((total, text) => {
+			const m = text.match(re);
+			return total + (m?.[1] ? Number.parseInt(m[1], 10) : 0);
+		}, 0);
 	const clientSent = num(/datagrams sent=(\d+)/);
 	const sessionsOk = num(/sessions ok=(\d+)/);
 	const windowMs = t1 - t0;
@@ -616,6 +634,7 @@ async function runParent(): Promise<void> {
 			warmupSec: WARMUP_SEC,
 			measureSec: MEASURE_SEC,
 			reps: REPS,
+			clients: CLIENTS,
 			saturationCeiling: SATURATION_CEILING,
 			seed,
 			workerOrder: workerSweep.order,
