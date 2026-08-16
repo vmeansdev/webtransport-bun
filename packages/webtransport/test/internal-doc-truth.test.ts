@@ -98,7 +98,10 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 	);
 	writeFileSync(
 		join(root, "docs", "ARCHITECTURE.md"),
-		"Both runtimes use `Builder::new_multi_thread().worker_threads(1)`.",
+		[
+			"The server runtime uses `Builder::new_multi_thread().worker_threads(2)`.",
+			"The client runtime uses `Builder::new_multi_thread().worker_threads(1)`.",
+		].join("\n"),
 	);
 	writeFileSync(
 		join(root, "docs", "FAQ.md"),
@@ -133,7 +136,7 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 		join(root, "crates", "native", "src", "lib.rs"),
 		`pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
   tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(1)
+    .worker_threads(2)
     .thread_name("wt-server")
     .build().unwrap()
 });
@@ -215,7 +218,10 @@ describe("documentation truth policy", () => {
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"must state the exact runtime constructor Builder::new_multi_thread().worker_threads(1)",
+			"must state the exact runtime constructor Builder::new_multi_thread().worker_threads(2) for RUNTIME",
+		);
+		expect(result.stderr).toContain(
+			"must state the exact runtime constructor Builder::new_multi_thread().worker_threads(1) for CLIENT_RUNTIME",
 		);
 	});
 
@@ -234,7 +240,61 @@ describe("documentation truth policy", () => {
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"RUNTIME contradicts Builder::new_multi_thread().worker_threads(1)",
+			"RUNTIME contradicts Builder::new_multi_thread().worker_threads(2)",
+		);
+	});
+
+	// Regression: one server worker discards 80-95% of datagrams under load.
+	// If this test starts passing with worker_threads(1), the gate has stopped
+	// protecting the mitigation.
+	it("rejects a server runtime that reverts to a single worker", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "lib.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					".worker_threads(2)",
+					".worker_threads(1)",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"RUNTIME contradicts Builder::new_multi_thread().worker_threads(2)",
+		);
+	});
+
+	it("rejects architecture text that documents a single server worker", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "docs", "ARCHITECTURE.md");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"worker_threads(2)",
+					"worker_threads(1)",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"must state the exact runtime constructor Builder::new_multi_thread().worker_threads(2) for RUNTIME",
+		);
+	});
+
+	it("rejects a worker count derived at runtime instead of hardcoded", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "lib.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					".worker_threads(2)",
+					".worker_threads(2)\n    .max_blocking_threads(std::thread::available_parallelism().unwrap().get())",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"RUNTIME must hardcode its worker count, not derive it at runtime",
 		);
 	});
 

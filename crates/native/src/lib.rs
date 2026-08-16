@@ -50,9 +50,19 @@ pub mod zero_rtt;
 // ---------------------------------------------------------------------------
 
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
+///
+/// Two workers, not one. At one worker the server ingests datagrams from the
+/// wire and then discards 80-95% of them under sustained load, collapsing to a
+/// fixed ~5,300/s delivered while the machine sits idle. Two workers move that
+/// cliff far enough out to matter (40k offered: 5,283 delivered at one worker,
+/// 39,497 with zero drops at two) but do NOT remove it — 80k offered still
+/// dropped 48% on a 4-vCPU host. This is a mitigation; the starvation root
+/// cause is still open. Higher counts measured worse (macOS: 89k/s at two,
+/// 82k/s at four, 48k/s at ten), so this is a fixed constant rather than
+/// `available_parallelism()`, and `scripts/check-doc-truth.ts` pins it.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .thread_name("wt-server")
         .build()
@@ -67,6 +77,10 @@ pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 
 /// Client runtime: drives client connections and client-side stream bridges.
 /// Isolated from server to avoid same-process deadlock when client+server share a process.
+///
+/// Stays at one worker: the starvation measurements covered the server receive
+/// path only, and nothing in them says anything about the client. Raising this
+/// for symmetry would be an unmeasured change.
 pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -361,14 +375,12 @@ pub fn client_pool_metrics_snapshot() -> napi::Result<metrics::ClientPoolMetrics
     })
 }
 
-/// Returns the number of Tokio worker threads (should be 1).
+/// Returns the server runtime's worker-thread count, read from the live runtime
+/// rather than restated as a literal, so callers observe what was actually
+/// built. Expected to be 2; see the `RUNTIME` constructor.
 #[napi]
 pub fn runtime_worker_count() -> u32 {
-    panic_guard::catch_panic(|| {
-        let _ = &*RUNTIME;
-        Ok(1u32)
-    })
-    .unwrap_or(0)
+    panic_guard::catch_panic(|| Ok(RUNTIME.metrics().num_workers() as u32)).unwrap_or(0)
 }
 
 /// Read process-wide native stream-handle ownership without retaining a
@@ -1446,11 +1458,70 @@ mod tests {
     use super::{report_channel_failure, send_startup_result, CHANNEL_DELIVERY_FAILURE_COUNT};
     use super::{report_tsfn_status, TSFN_DELIVERY_FAILURE_COUNT};
     use super::{run_bounded_discard, DISCARD_DRAIN_CONCURRENCY};
+    use super::{CLIENT_RUNTIME, RUNTIME};
     use crate::session_registry::StreamDiscardState;
+    use std::collections::HashSet;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn server_runtime_has_two_workers() {
+        assert_eq!(
+            RUNTIME.metrics().num_workers(),
+            2,
+            "server runtime must keep two workers; at one it drops 80-95% of \
+             datagrams under sustained load"
+        );
+        assert_eq!(super::runtime_worker_count(), 2);
+    }
+
+    // num_workers() alone would still pass if the threads never materialised.
+    // A *blocking* rendezvous can only be cleared by two OS threads sitting
+    // inside it at the same moment, so each task reports the worker thread it
+    // actually occupies. On a one-worker runtime the second task is never
+    // polled, nothing is reported, and the recv times out.
+    #[test]
+    fn server_runtime_runs_tasks_on_two_wt_server_threads() {
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        for _ in 0..2 {
+            let rendezvous = Arc::clone(&rendezvous);
+            let tx = tx.clone();
+            RUNTIME.spawn(async move {
+                rendezvous.wait();
+                let thread = std::thread::current();
+                let _ = tx.send((thread.id(), thread.name().unwrap_or_default().to_string()));
+            });
+        }
+        drop(tx);
+
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            observed.push(
+                rx.recv_timeout(Duration::from_secs(10))
+                    .expect("two worker threads must occupy the rendezvous at once"),
+            );
+        }
+
+        let distinct: HashSet<_> = observed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(distinct.len(), 2, "expected two distinct worker threads");
+        for (_, name) in &observed {
+            assert!(
+                name.starts_with("wt-server"),
+                "worker thread named {name:?} must keep the wt-server name"
+            );
+        }
+    }
+
+    // The starvation evidence covers the server receive path only; the client
+    // runtime stays at one worker until something measures it.
+    #[test]
+    fn client_runtime_stays_single_worker() {
+        assert_eq!(CLIENT_RUNTIME.metrics().num_workers(), 1);
+    }
 
     #[test]
     fn report_tsfn_status_counts_failures_only() {
