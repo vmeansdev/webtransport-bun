@@ -3,7 +3,7 @@
 Written 2026-08-16 because the session may end on usage limits. Everything
 needed to resume without re-deriving anything is here. Two independent tracks:
 H7 datagram batching, which is **finished and halted**, and QUIC server-side
-parallelism, which is **live with two actions outstanding**.
+parallelism, which is **root-caused with the fix measured** (see ACTION 2).
 
 ---
 
@@ -12,7 +12,7 @@ parallelism, which is **live with two actions outstanding**.
 | Track | Branch | HEAD | Pushed | Status |
 |---|---|---|---|---|
 | H7 batching | `feat/h7-batch-delivery` | `17be997` | no | HALTED at its own stop/go gate, 9 tasks complete and reviewed |
-| QUIC parallelism | `investigate/quic-parallelism` | `df798b4` | **yes** | Investigation complete; 2 actions outstanding |
+| QUIC parallelism | `investigate/quic-parallelism` | `f40f689` | **yes** | ROOT CAUSED + fix measured; ship decision outstanding |
 | Mainline | `rebind4-staging` | `db9e7c6` | yes | GSO probe work only |
 
 Worktrees:
@@ -119,7 +119,9 @@ live `sample(1)` showing `recvmsg`, never `recvmsg_x`).
 A 32x cheaper receive path did not move the floor at all. **Whatever services the
 starved delivery future runs at a fixed rate independent of the platform
 underneath it.** That points at a fixed-cadence wake — a timer, a poll interval,
-a yield budget — not at CPU exhaustion.
+a yield budget — not at CPU exhaustion. **This clue was correct and led straight
+to the answer: tokio's `global_queue_interval`, one injected task per ~200us of
+work. See ACTION 2, now solved.**
 
 Supporting facts, identical on both platforms:
 - The single worker is pinned at **0.96-0.99 cores** in every collapsed arm.
