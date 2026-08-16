@@ -16,6 +16,7 @@ import {
 	parseCpuList,
 	parseCpusAllowedListFromStatus,
 	parseLoadClientSentProgress,
+	pickDisjointPhysicalCpus,
 	parseProcNetstatUdp,
 	parseProcSnmpUdp,
 	procRow,
@@ -808,5 +809,30 @@ describe("cpu list helpers", () => {
 			),
 		).toEqual([0, 1]);
 		expect(parseCpusAllowedListFromStatus("Name:\tload-client\n")).toBeNull();
+	});
+
+	test("pickDisjointPhysicalCpus skips an HT pair", () => {
+		expect(
+			pickDisjointPhysicalCpus({
+				0: [0, 1],
+				1: [0, 1],
+				2: [2, 3],
+				3: [2, 3],
+			}),
+		).toEqual([0, 2]);
+		expect(
+			pickDisjointPhysicalCpus({
+				0: [0, 1],
+				1: [0, 1],
+			}),
+		).toBeNull();
+		expect(
+			pickDisjointPhysicalCpus({
+				0: [0],
+				1: [1],
+				2: [2],
+				3: [3],
+			}),
+		).toEqual([0, 1]);
 	});
 });

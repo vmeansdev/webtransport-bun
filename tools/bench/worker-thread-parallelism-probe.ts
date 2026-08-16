@@ -696,6 +696,40 @@ export function cpusSharePhysicalCore(
 	return siblingsOfA.includes(cpuB);
 }
 
+/** First two logical CPUs whose HT sibling sets do not overlap. */
+export function pickDisjointPhysicalCpus(
+	siblingByCpu: Readonly<Record<number, readonly number[]>>,
+): number[] | null {
+	const cpus = Object.keys(siblingByCpu)
+		.map((key) => Number.parseInt(key, 10))
+		.filter((cpu) => Number.isFinite(cpu))
+		.sort((a, b) => a - b);
+	for (let i = 0; i < cpus.length; i += 1) {
+		const a = cpus[i]!;
+		const siblingsA = new Set(siblingByCpu[a] ?? [a]);
+		for (let j = i + 1; j < cpus.length; j += 1) {
+			const b = cpus[j]!;
+			const overlap = (siblingByCpu[b] ?? [b]).some((cpu) =>
+				siblingsA.has(cpu),
+			);
+			if (!overlap) return [a, b];
+		}
+	}
+	return null;
+}
+
+export function readHostSiblingMap(
+	nproc: number,
+): Record<number, number[]> | null {
+	const out: Record<number, number[]> = {};
+	for (let cpu = 0; cpu < nproc; cpu += 1) {
+		const siblings = readThreadSiblings(cpu);
+		if (!siblings) return null;
+		out[cpu] = siblings;
+	}
+	return out;
+}
+
 export function parseCpusAllowedListFromStatus(
 	statusText: string,
 ): number[] | null {

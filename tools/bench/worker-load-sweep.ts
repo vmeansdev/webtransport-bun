@@ -46,10 +46,10 @@ import {
 	formatPipeCapLine,
 	type IngestGap,
 	type PipeCap,
-	cpusSharePhysicalCore,
 	makeRng,
 	median,
-	readThreadSiblings,
+	pickDisjointPhysicalCpus,
+	readHostSiblingMap,
 	shuffled,
 } from "./worker-thread-parallelism-probe.ts";
 
@@ -182,6 +182,7 @@ async function runOne(
 	arm: SweepArm,
 	round: number,
 	port: number,
+	splitTaskset: string,
 ): Promise<SweepRun> {
 	const child = Bun.spawn(
 		[
@@ -212,7 +213,7 @@ async function runOne(
 				WT_PROBE_MEASURE_SEC: String(MEASURE_SEC),
 				WT_PROBE_PAYLOAD_BYTES: String(PAYLOAD_BYTES),
 				WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1",
-				WT_PROBE_CLIENT_TASKSET: arm.cpuMode === "split" ? "0-1" : "",
+				WT_PROBE_CLIENT_TASKSET: arm.cpuMode === "split" ? splitTaskset : "",
 			},
 		},
 	);
@@ -482,6 +483,7 @@ export type Coresplit = {
 	nproc: number;
 	tasksetOk: boolean;
 	affinityOk: boolean;
+	clientCpus: number[] | null;
 	htSiblings: boolean;
 	stopBucket: CoresplitBucket;
 };
@@ -494,8 +496,7 @@ export function classifyCoresplit(input: {
 	summaries: readonly ArmSummary[];
 	nproc: number;
 	tasksetOk: boolean;
-	cpu0Siblings: number[] | null;
-	cpu1Siblings: number[] | null;
+	clientCpus: number[] | null;
 }): Coresplit {
 	const shared = input.summaries.filter((s) => !s.key.endsWith("@split"));
 	const split = input.summaries.filter((s) => s.key.endsWith("@split"));
@@ -510,9 +511,7 @@ export function classifyCoresplit(input: {
 	const affinityOk = split.every((s) =>
 		s.runs.every((r) => r.clientAffinityOk),
 	);
-	const htSiblings =
-		input.cpu0Siblings != null &&
-		cpusSharePhysicalCore(0, 1, input.cpu0Siblings);
+	const htSiblings = input.clientCpus == null || input.clientCpus.length < 2;
 	const sharedReproduced =
 		sharedFrameTxPerSec != null &&
 		sharedFrameTxPerSec >= SHARED_FRAME_TX_MIN &&
@@ -524,7 +523,6 @@ export function classifyCoresplit(input: {
 		split.length === 0 ||
 		sharedFrameTxPerSec == null ||
 		splitFrameTxPerSec == null ||
-		input.cpu0Siblings == null ||
 		htSiblings ||
 		!sharedReproduced;
 	let stopBucket: CoresplitBucket = "incomplete";
@@ -538,6 +536,7 @@ export function classifyCoresplit(input: {
 		nproc: input.nproc,
 		tasksetOk: input.tasksetOk,
 		affinityOk,
+		clientCpus: input.clientCpus,
 		htSiblings,
 		stopBucket,
 	};
@@ -568,6 +567,14 @@ async function main(): Promise<void> {
 			`cpuModes=[${CPU_MODES.join(",")}]`,
 	);
 
+	const siblingMap = readHostSiblingMap(capacity.cpus);
+	const clientCpus = siblingMap ? pickDisjointPhysicalCpus(siblingMap) : null;
+	const clientTaskset = clientCpus ? clientCpus.join(",") : "";
+	console.log(
+		`sweep: clientCpus=${clientCpus ? clientCpus.join(",") : "n/a"} ` +
+			`taskset=${clientTaskset || "none"}`,
+	);
+
 	const arms = sweepArms();
 	const rng = makeRng(Number(process.env.SWEEP_SEED ?? "20260816"));
 	const runs: SweepRun[] = [];
@@ -578,7 +585,9 @@ async function main(): Promise<void> {
 		for (const arm of shuffled(arms, rng)) {
 			order.push(`r${round}:${armKey(arm)}`);
 			console.log(`sweep: round ${round}/${REPS} ${armKey(arm)} ...`);
-			runs.push(await runOne(arm, round, BASE_PORT + runs.length));
+			runs.push(
+				await runOne(arm, round, BASE_PORT + runs.length, clientTaskset),
+			);
 		}
 	}
 
@@ -596,8 +605,7 @@ async function main(): Promise<void> {
 		summaries,
 		nproc: capacity.cpus,
 		tasksetOk,
-		cpu0Siblings: readThreadSiblings(0),
-		cpu1Siblings: readThreadSiblings(1),
+		clientCpus,
 	});
 	const failures = [
 		...proofFailures(summaries),
@@ -725,7 +733,8 @@ async function main(): Promise<void> {
 			`\n  coresplit: sharedFrameTx=${n(coresplit.sharedFrameTxPerSec)} ` +
 				`splitFrameTx=${n(coresplit.splitFrameTxPerSec)} ` +
 				`ratio=${coresplit.ratio == null ? "n/a" : coresplit.ratio.toFixed(2)} ` +
-				`nproc=${coresplit.nproc} taskset=${coresplit.tasksetOk} ` +
+				`nproc=${coresplit.nproc} clientCpus=${coresplit.clientCpus?.join(",") ?? "n/a"} ` +
+				`taskset=${coresplit.tasksetOk} ` +
 				`affinity=${coresplit.affinityOk} htSiblings=${coresplit.htSiblings} ` +
 				`STOP=${coresplit.stopBucket}`,
 		);

@@ -351,8 +351,7 @@ describe("classifyCoresplit", () => {
 	const base = {
 		nproc: 4,
 		tasksetOk: true,
-		cpu0Siblings: [0, 4],
-		cpu1Siblings: [1, 5],
+		clientCpus: [0, 2],
 	};
 
 	test("split 20% above shared is co-residence", () => {
@@ -404,11 +403,11 @@ describe("classifyCoresplit", () => {
 		).toBe("incomplete");
 	});
 
-	test("HT siblings of 0 and 1 is incomplete", () => {
+	test("no disjoint physical CPU pair is incomplete", () => {
 		expect(
 			classifyCoresplit({
 				...base,
-				cpu0Siblings: [0, 1],
+				clientCpus: null,
 				summaries: [
 					withFrameTx("w2@160000@wait", 105_000, 105_000),
 					withFrameTx("w2@160000@wait@split", 130_000, 130_000),
