@@ -18,7 +18,9 @@ import {
 	sessionArms,
 	shuffled,
 	summarizeSweep,
+	sumWindowFrameTxPerSec,
 	sumWindowOfferedPerSec,
+	sumWindowUdpTxPerSec,
 	windowSentDelta,
 	workerArms,
 } from "./worker-thread-parallelism-probe.ts";
@@ -61,6 +63,8 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 			packetsReceivedDelta: null,
 			udpInErrorsDelta: null,
 			udpRcvbufErrorsDelta: null,
+			frameTxDatagramPerSec: null,
+			udpTxPerSec: null,
 			unexplainedPerSec: 90_000,
 			stopBucket: "unexplained",
 		},
@@ -216,9 +220,19 @@ describe("parseLoadClientSentProgress", () => {
 			"datagrams sent=150000 err=0",
 		].join("\n");
 		expect(parseLoadClientSentProgress(stdout)).toEqual([
-			{ tMs: 0, sent: 0 },
-			{ tMs: 1000, sent: 50_000 },
-			{ tMs: 2000, sent: 100_000 },
+			{ tMs: 0, sent: 0, frameTxDatagram: null, udpTx: null },
+			{ tMs: 1000, sent: 50_000, frameTxDatagram: null, udpTx: null },
+			{ tMs: 2000, sent: 100_000, frameTxDatagram: null, udpTx: null },
+		]);
+	});
+
+	test("parses optional frame_tx_datagram and udp_tx", () => {
+		expect(
+			parseLoadClientSentProgress(
+				"load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000",
+			),
+		).toEqual([
+			{ tMs: 1000, sent: 50_000, frameTxDatagram: 40_000, udpTx: 41_000 },
 		]);
 	});
 });
@@ -260,6 +274,29 @@ describe("windowSentDelta", () => {
 			sent1: 200_000,
 			t0: 5000,
 			t1: 20_000,
+			frameTx0: null,
+			frameTx1: null,
+			udpTx0: null,
+			udpTx1: null,
+		});
+	});
+
+	test("carries frame_tx and udp_tx when both samples have them", () => {
+		const samples = parseLoadClientSentProgress(
+			[
+				"load-client: t_ms=5000 sent=50000 frame_tx_datagram=40000 udp_tx=41000",
+				"load-client: t_ms=20000 sent=200000 frame_tx_datagram=160000 udp_tx=165000",
+			].join("\n"),
+		);
+		expect(windowSentDelta(samples, 5000, 15_000)).toEqual({
+			sent0: 50_000,
+			sent1: 200_000,
+			t0: 5000,
+			t1: 20_000,
+			frameTx0: 40_000,
+			frameTx1: 160_000,
+			udpTx0: 41_000,
+			udpTx1: 165_000,
 		});
 	});
 
@@ -370,6 +407,36 @@ describe("sumWindowOfferedPerSec", () => {
 	});
 });
 
+describe("sumWindowFrameTxPerSec", () => {
+	const client = (
+		sent0: number,
+		sent1: number,
+		frame0: number,
+		frame1: number,
+	): string =>
+		[
+			`load-client: t_ms=5000 sent=${sent0} frame_tx_datagram=${frame0} udp_tx=${frame0}`,
+			`load-client: t_ms=20000 sent=${sent1} frame_tx_datagram=${frame1} udp_tx=${frame1}`,
+		].join("\n");
+
+	test("sums per-client window frame_tx rates", () => {
+		const a = client(50_000, 200_000, 40_000, 160_000);
+		const b = client(10_000, 160_000, 8_000, 128_000);
+		expect(sumWindowFrameTxPerSec([a, b], 5000, 15_000)).toBe(16_000);
+		expect(sumWindowUdpTxPerSec([a, b], 5000, 15_000)).toBe(16_000);
+	});
+
+	test("returns null when progress lines omit frame_tx", () => {
+		expect(
+			sumWindowFrameTxPerSec(
+				["load-client: t_ms=5000 sent=1\nload-client: t_ms=20000 sent=2"],
+				5000,
+				15_000,
+			),
+		).toBeNull();
+	});
+});
+
 describe("classifyIngestGap", () => {
 	const base = {
 		windowOfferedPerSec: 147_000 as number | null,
@@ -456,6 +523,54 @@ describe("classifyIngestGap", () => {
 		expect(gap.packetsLostDelta).toBeNull();
 		expect(gap.udpRcvbufErrorsDelta).toBeNull();
 		expect(gap.udpInErrorsDelta).toBeNull();
+		expect(gap.frameTxDatagramPerSec).toBeNull();
+	});
+
+	test("offered minus frame_tx covering 90% of the gap is client-cc", () => {
+		const gap = classifyIngestGap({
+			...base,
+			frameTxDatagramPerSec: 99_000,
+		});
+		expect(gap.stopBucket).toBe("client-cc");
+		expect(gap.frameTxDatagramPerSec).toBe(99_000);
+		expect(gap.unexplainedPerSec).toBe(0);
+	});
+
+	test("frame_tx minus ingest covering 90% of the gap is wire", () => {
+		const gap = classifyIngestGap({
+			...base,
+			frameTxDatagramPerSec: 147_000,
+		});
+		expect(gap.stopBucket).toBe("wire");
+		expect(gap.unexplainedPerSec).toBe(0);
+	});
+
+	test("partial frame_tx leftover stays unexplained", () => {
+		expect(
+			classifyIngestGap({
+				...base,
+				frameTxDatagramPerSec: 123_000,
+			}).stopBucket,
+		).toBe("unexplained");
+	});
+
+	test("omitted frame_tx does not fire client-cc", () => {
+		expect(
+			classifyIngestGap({
+				...base,
+				frameTxDatagramPerSec: null,
+			}).stopBucket,
+		).toBe("unexplained");
+	});
+
+	test("quic-loss still wins when it accounts before client-cc", () => {
+		expect(
+			classifyIngestGap({
+				...base,
+				packetsLostDelta: 648_000,
+				frameTxDatagramPerSec: 99_000,
+			}).stopBucket,
+		).toBe("quic-loss");
 	});
 });
 
@@ -469,11 +584,13 @@ describe("formatGapLine", () => {
 				packetsReceivedDelta: 1_000,
 				udpInErrorsDelta: null,
 				udpRcvbufErrorsDelta: null,
+				frameTxDatagramPerSec: 99_000,
+				udpTxPerSec: null,
 				unexplainedPerSec: 48_000,
 				stopBucket: "unexplained",
 			}),
 		).toBe(
-			"gap: windowOffered=147000 ingest=99000 lost=10 rcvbuf=n/a unexplained=48000 STOP=unexplained",
+			"gap: windowOffered=147000 ingest=99000 frameTx=99000 udpTx=n/a lost=10 rcvbuf=n/a unexplained=48000 STOP=unexplained",
 		);
 	});
 });

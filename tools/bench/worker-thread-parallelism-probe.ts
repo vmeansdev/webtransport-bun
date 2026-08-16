@@ -179,6 +179,8 @@ export type IngestGapBucket =
 	| "window-accounting"
 	| "quic-loss"
 	| "udp-rcvbuf"
+	| "client-cc"
+	| "wire"
 	| "unexplained";
 
 export type IngestGap = {
@@ -188,6 +190,8 @@ export type IngestGap = {
 	packetsReceivedDelta: number | null;
 	udpInErrorsDelta: number | null;
 	udpRcvbufErrorsDelta: number | null;
+	frameTxDatagramPerSec: number | null;
+	udpTxPerSec: number | null;
 	unexplainedPerSec: number | null;
 	stopBucket: IngestGapBucket;
 };
@@ -307,9 +311,26 @@ export function dirtyPaths(porcelain: string): string[] {
 		);
 }
 
-export const SENT_PROGRESS_RE = /^load-client: t_ms=(\d+) sent=(\d+)\s*$/gm;
+export const SENT_PROGRESS_RE =
+	/^load-client: t_ms=(\d+) sent=(\d+)(?: frame_tx_datagram=(\d+) udp_tx=(\d+))?\s*$/gm;
 
-export type SentProgressSample = { tMs: number; sent: number };
+export type SentProgressSample = {
+	tMs: number;
+	sent: number;
+	frameTxDatagram: number | null;
+	udpTx: number | null;
+};
+
+export type WindowSentDelta = {
+	sent0: number;
+	sent1: number;
+	t0: number;
+	t1: number;
+	frameTx0: number | null;
+	frameTx1: number | null;
+	udpTx0: number | null;
+	udpTx1: number | null;
+};
 
 export function parseLoadClientSentProgress(
 	text: string,
@@ -319,6 +340,8 @@ export function parseLoadClientSentProgress(
 		samples.push({
 			tMs: Number.parseInt(match[1] ?? "0", 10),
 			sent: Number.parseInt(match[2] ?? "0", 10),
+			frameTxDatagram: match[3] == null ? null : Number.parseInt(match[3], 10),
+			udpTx: match[4] == null ? null : Number.parseInt(match[4], 10),
 		});
 	}
 	return samples;
@@ -328,7 +351,7 @@ export function windowSentDelta(
 	samples: readonly SentProgressSample[],
 	warmupMs: number,
 	measureMs: number,
-): { sent0: number; sent1: number; t0: number; t1: number } | null {
+): WindowSentDelta | null {
 	const endMs = warmupMs + measureMs;
 	let t0Sample: SentProgressSample | null = null;
 	let t1Sample: SentProgressSample | null = null;
@@ -338,11 +361,18 @@ export function windowSentDelta(
 	}
 	if (!t0Sample || !t1Sample) return null;
 	if (t1Sample.tMs <= t0Sample.tMs) return null;
+	const frameTxPresent =
+		t0Sample.frameTxDatagram != null && t1Sample.frameTxDatagram != null;
+	const udpTxPresent = t0Sample.udpTx != null && t1Sample.udpTx != null;
 	return {
 		sent0: t0Sample.sent,
 		sent1: t1Sample.sent,
 		t0: t0Sample.tMs,
 		t1: t1Sample.tMs,
+		frameTx0: frameTxPresent ? t0Sample.frameTxDatagram : null,
+		frameTx1: frameTxPresent ? t1Sample.frameTxDatagram : null,
+		udpTx0: udpTxPresent ? t0Sample.udpTx : null,
+		udpTx1: udpTxPresent ? t1Sample.udpTx : null,
 	};
 }
 
@@ -419,6 +449,51 @@ export function sumWindowOfferedPerSec(
 	return any ? sum : null;
 }
 
+export function sumWindowCounterPerSec(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+	pick: (d: WindowSentDelta) => { a: number; b: number } | null,
+): number | null {
+	let sum = 0;
+	let any = false;
+	for (const text of clientStdouts) {
+		const delta = windowSentDelta(
+			parseLoadClientSentProgress(text),
+			warmupMs,
+			measureMs,
+		);
+		if (!delta) continue;
+		const pair = pick(delta);
+		if (!pair) continue;
+		any = true;
+		sum += (pair.b - pair.a) / ((delta.t1 - delta.t0) / 1000);
+	}
+	return any ? sum : null;
+}
+
+export function sumWindowFrameTxPerSec(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	return sumWindowCounterPerSec(clientStdouts, warmupMs, measureMs, (d) =>
+		d.frameTx0 != null && d.frameTx1 != null
+			? { a: d.frameTx0, b: d.frameTx1 }
+			: null,
+	);
+}
+
+export function sumWindowUdpTxPerSec(
+	clientStdouts: readonly string[],
+	warmupMs: number,
+	measureMs: number,
+): number | null {
+	return sumWindowCounterPerSec(clientStdouts, warmupMs, measureMs, (d) =>
+		d.udpTx0 != null && d.udpTx1 != null ? { a: d.udpTx0, b: d.udpTx1 } : null,
+	);
+}
+
 const GAP_STOP_PER_SEC = 5_000;
 const ACCOUNTS_FRACTION = 0.9;
 
@@ -430,6 +505,8 @@ export function classifyIngestGap(input: {
 	packetsReceivedDelta: number | null;
 	udpInErrorsDelta: number | null;
 	udpRcvbufErrorsDelta: number | null;
+	frameTxDatagramPerSec?: number | null;
+	udpTxPerSec?: number | null;
 	windowSec: number;
 }): IngestGap {
 	const offered = input.windowOfferedPerSec ?? input.offeredPerSec;
@@ -438,6 +515,12 @@ export function classifyIngestGap(input: {
 		delta != null && input.windowSec > 0 ? delta / input.windowSec : null;
 	const lostRate = rate(input.packetsLostDelta);
 	const rcvbufRate = rate(input.udpRcvbufErrorsDelta);
+	const frameTx = input.frameTxDatagramPerSec ?? null;
+	const udpTx = input.udpTxPerSec ?? null;
+	const acceptedNotFramed =
+		frameTx != null ? Math.max(0, offered - frameTx) : null;
+	const framedNotIngested =
+		frameTx != null ? Math.max(0, frameTx - input.ingestedPerSec) : null;
 
 	let stopBucket: IngestGapBucket;
 	let accounted = 0;
@@ -449,6 +532,18 @@ export function classifyIngestGap(input: {
 	} else if (rcvbufRate != null && rcvbufRate >= ACCOUNTS_FRACTION * gap) {
 		stopBucket = "udp-rcvbuf";
 		accounted = rcvbufRate;
+	} else if (
+		acceptedNotFramed != null &&
+		acceptedNotFramed >= ACCOUNTS_FRACTION * gap
+	) {
+		stopBucket = "client-cc";
+		accounted = acceptedNotFramed;
+	} else if (
+		framedNotIngested != null &&
+		framedNotIngested >= ACCOUNTS_FRACTION * gap
+	) {
+		stopBucket = "wire";
+		accounted = framedNotIngested;
 	} else {
 		stopBucket = "unexplained";
 	}
@@ -460,6 +555,8 @@ export function classifyIngestGap(input: {
 		packetsReceivedDelta: input.packetsReceivedDelta,
 		udpInErrorsDelta: input.udpInErrorsDelta,
 		udpRcvbufErrorsDelta: input.udpRcvbufErrorsDelta,
+		frameTxDatagramPerSec: frameTx,
+		udpTxPerSec: udpTx,
 		unexplainedPerSec: Math.max(0, gap - accounted),
 		stopBucket,
 	};
@@ -470,6 +567,7 @@ export function formatGapLine(gap: IngestGap): string {
 		value == null ? "n/a" : String(Math.round(value));
 	return (
 		`gap: windowOffered=${n(gap.windowOfferedPerSec)} ingest=${Math.round(gap.ingestedPerSec)} ` +
+		`frameTx=${n(gap.frameTxDatagramPerSec)} udpTx=${n(gap.udpTxPerSec)} ` +
 		`lost=${n(gap.packetsLostDelta)} rcvbuf=${n(gap.udpRcvbufErrorsDelta)} ` +
 		`unexplained=${n(gap.unexplainedPerSec)} STOP=${gap.stopBucket}`
 	);

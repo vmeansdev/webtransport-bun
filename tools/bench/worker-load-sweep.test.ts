@@ -212,11 +212,13 @@ describe("gap print", () => {
 				packetsReceivedDelta: null,
 				udpInErrorsDelta: null,
 				udpRcvbufErrorsDelta: null,
+				frameTxDatagramPerSec: null,
+				udpTxPerSec: null,
 				unexplainedPerSec: 48_000,
 				stopBucket: "unexplained",
 			}),
 		).toBe(
-			"gap: windowOffered=n/a ingest=99000 lost=n/a rcvbuf=n/a unexplained=48000 STOP=unexplained",
+			"gap: windowOffered=n/a ingest=99000 frameTx=n/a udpTx=n/a lost=n/a rcvbuf=n/a unexplained=48000 STOP=unexplained",
 		);
 	});
 });
