@@ -996,6 +996,7 @@ dependencies = [
 name = "reference"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "quinn-udp",
  "tokio",
  "wtransport",
