@@ -363,7 +363,7 @@ export type SessionMetricsSnapshot = {
 ### Semantics (must be implemented)
 - `sendDatagram()` Promise resolves only when accepted into a bounded internal queue (or sent). If queues are full, it must wait (backpressure). If waiting exceeds `backpressureTimeoutMs`, reject with `E_BACKPRESSURE_TIMEOUT`.
 - Reliable-stream receive paths apply the same bound: when the byte budget (`maxQueuedBytesPerStream`/`maxQueuedBytesPerSession`) stays exhausted — a reader that consumes nothing for a full `backpressureTimeoutMs` — the stream is stopped and pending reads reject with `E_BACKPRESSURE_TIMEOUT`. A reader that frees any capacity within the window keeps the stream. This bound is load-bearing for memory: an abandoned reader must not pin the stream's native state for the life of the process.
-- Incoming datagrams are delivered via AsyncIterable on both server/client sessions.
+- Incoming datagrams are delivered via AsyncIterable on both server/client sessions. See "Incoming datagram delivery" below for the delivery contract and the native batching knob.
 - Incoming streams are delivered as ReadableStream properties on `ServerSession` and as AsyncIterable methods on `ClientSession`.
 - On session close, iterators/streams must terminate promptly.
 - Node stream backpressure:
@@ -375,6 +375,98 @@ Examples (expected to work):
 - Datagram echo server and client
 - Bidi stream echo server and client
 - Uni stream upload and download
+
+## Incoming datagram delivery
+
+`incomingDatagrams()` is the same public API on both native session classes and
+on `/portable`: an `AsyncIterable<Uint8Array>`, memoized per session, yielding
+one datagram at a time, in the order the backend received them, terminating
+once the session is closed. Datagrams are droppable by contract — nothing below
+turns a lost datagram into an error.
+
+Internally the native backend no longer crosses Node-API once per datagram. The
+generator calls `readDatagramBatch(max)` on the native handle, which resolves
+`Uint8Array[] | null`, and yields the returned items one by one before asking
+for the next batch. `max` is clamped silently to `1..=256` in native; the
+JavaScript layer clamps first, so the native clamp is a backstop. The batch
+methods are reject-free: data, EOF, closure, and an out-of-range `max` all
+resolve rather than throw. Only a runtime panic or an unrecoverable Node-API
+allocation failure can still reject, exactly as on the pre-existing single-read
+path.
+
+### `WEBTRANSPORT_DATAGRAM_BATCH`
+
+| Value | Effect |
+| --- | --- |
+| unset or invalid | `64` (the default) |
+| `0` | legacy path: one `readDatagram()` call per datagram |
+| `1` | the new batch path with degenerate one-item batches |
+| `2`–`256` | batch size |
+| negative | `0` |
+| greater than `256` | `256` |
+
+"Invalid" means empty, non-decimal, non-finite, or non-integer. The variable is
+read **once at module initialization**, so a process cannot change delivery
+shape halfway through a session's lifetime, and it is **native-only** — wasm
+datagram delivery does not go through Node-API and is unaffected.
+
+The knob is a performance dial, but it is not purely one: because batching wins
+the close race by needing one round-trip instead of one per datagram, the batch
+size visibly changes how much tail a consumer receives when the peer ends the
+connection cleanly (see deviation 3 below). Do not treat a change in observed
+tail length as a bug.
+
+### Buffering bounds
+
+Draining moves up to `max` items out of the native channel per acquisition, so
+effective buffering becomes `2048 + max` datagrams per server session and
+`256 + max` per client session, and the per-session byte budget
+(`maxQueuedBytesPerSession` on the server, the client datagram budget) is
+loosened by up to one batch of payload bytes. The pull model still bounds total
+in-flight data: no new batch is requested until the consumer has drained the
+previous one.
+
+### Semantic deviations
+
+Three JS-visible behaviors changed. All three are permitted for an unreliable,
+droppable transport, and all three are stated rather than hidden.
+
+1. **Post-close prefetch.** The generator may yield up to `max` already-
+   delivered datagrams after the session is closed, instead of at most 1.
+2. **Mid-batch abandonment.** Abandoning the iterator mid-batch discards up to
+   `max - 1` already-received datagrams, instead of at most 1.
+3. **Close-time drop-not-drain.** On a sticky close, a parked or newly entered
+   read returns EOF immediately and datagrams still queued natively are
+   discarded. Previously a parked read drained every buffered item before
+   yielding EOF. This applies to **both** handles and **both** lanes — the
+   legacy `WEBTRANSPORT_DATAGRAM_BATCH=0` path shares the same sticky lifecycle
+   wake, so it is not confined to batch mode. It is JS-visible delivery only:
+   reservation accounting for the discarded remainder is settled internally in
+   both directions, so no budget or gauge is stranded, but settlement is
+   bounded rather than instantaneous.
+
+On a clean connection end, how much of the remaining tail a consumer receives
+**depends on the configured batch size, and no count is guaranteed**. Measured
+on the same 12-datagram tail: 2 of 12 delivered at `WEBTRANSPORT_DATAGRAM_BATCH=0`
+versus 12 of 12 at `64`. The forwarder is no longer an independent
+unconditional discarder, but in production forwarder EOF and connection end
+coincide and the terminal drain still discards that remainder — the improvement
+is a **race window that batching is more likely to win, not a delivery
+guarantee**.
+
+### `iter.throw()` mapping
+
+The shared generator now yields outside its `try`, so an error injected with
+`iter.throw()` at a yield point is no longer passed through the error mapper: it
+propagates as the caller's own error. Nothing in this repository calls
+`iter.throw()`, and `AsyncIterator.prototype.throw` is optional in the language
+spec so `AsyncIterable<Uint8Array>` promises nothing about it, but the method is
+reachable from user code because `incomingDatagrams()` returns the generator and
+its `[Symbol.asyncIterator]()` returns itself. The new behavior is strictly
+better than the old: previously an injected error whose message merely resembled
+a session-close error was silently converted into a clean `done: true`, and any
+other injected error was rewrapped as a `WebTransportError` the caller never
+threw.
 
 ## API stability and semver
 
@@ -389,7 +481,7 @@ at compile time (`tsc --noEmit`) and against a live session from each backend.
 | --- | --- |
 | `@webtransport-bun/webtransport` (root) | Native Node-API server/client API. `createServer()` is **synchronous**. Node streams (`Duplex`/`Writable`) on the session stream constructors. Native-only capabilities live here and only here: `releaseNativeMemory()`, `exportTicketVault`/`importTicketVault`, `connect()`, `metricsToPrometheus()`, `ServerSession.goAway()`, SNI/cert rotation, keep-alive and congestion-control knobs. |
 | `@webtransport-bun/webtransport/wasm` | Async WASM/IWA API. `createServer()` returns a promise. Backend-specific extensions are allowed and documented here: Direct Sockets binding, `UdpTransport` injection, ticket-store hosts, `serveOverUdp`, self-signed cert generation and `certHashBase64` pinning. |
-| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. |
+| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. `incomingDatagrams()` is equal *within the contract*: same item type, memoization, receive order, and bounded termination, but not identical hidden buffering — native batching stays active behind `/portable`, with the bounds in "Incoming datagram delivery" above. |
 
 Capabilities only one backend can honour stay out of `/portable` by design —
 native `goAway()` (the wasm h3 module has no control-stream `GOAWAY` handling),

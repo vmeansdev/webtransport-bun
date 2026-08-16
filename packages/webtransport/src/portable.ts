@@ -49,6 +49,32 @@ export interface PortableServerSession {
 	drain(): void;
 
 	sendDatagram(data: Uint8Array): Promise<void>;
+
+	/**
+	 * Received datagrams, in the order this backend surfaced them.
+	 *
+	 * The portable contract is what applications may depend on: one memoized
+	 * single-consumer iterable, `Uint8Array` items, each backend's own receive
+	 * order preserved, bounded termination, and tolerance of dropped datagrams
+	 * (this is an unreliable transport).
+	 *
+	 * It deliberately does **not** promise equal hidden buffering. The native
+	 * backend reads datagrams from the addon in batches of
+	 * `WEBTRANSPORT_DATAGRAM_BATCH` (default 64, native-only, read once at
+	 * module load), so relative to the wasm backend it may hold up to `max`
+	 * already-materialized items after close, discards up to `max - 1` when the
+	 * consumer abandons the iterator mid-batch, and at close time discards
+	 * rather than drains whatever is still queued natively (drop-not-drain;
+	 * effective buffering is `2048 + max` per server session and `256 + max`
+	 * per client session). Wasm is not batched: its
+	 * Web Streams queue still surfaces chunks that were already enqueued when
+	 * the session closed. How much tail you see on a clean peer close therefore
+	 * depends on the configured native batch size, and no count is guaranteed
+	 * on either backend.
+	 *
+	 * See `docs/SPEC.md` ("Incoming datagram delivery") for the full contract
+	 * and `docs/PARITY_MATRIX.md` for the per-backend bounds.
+	 */
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
 
 	readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
