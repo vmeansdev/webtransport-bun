@@ -158,6 +158,129 @@ count from 4 to 150 — the collapse does not care how the load is divided.
 
 ---
 
+## Run G — per-thread profile: which thread is actually pinned?
+
+`process.cpuUsage()` is process-wide and Bun's
+`performance.eventLoopUtilization()` is a stub that returns zeroes, so neither
+could answer this. Each thread therefore reads its own
+`CLOCK_THREAD_CPUTIME_ID` — the tokio workers from the datagram path, the JS
+thread from the N-API getter, which by definition runs on it. Deltas over the
+same 20s window as the throughput; the residual against the process total is
+reported rather than hidden.
+
+`ingested/s` is counted where quinn hands the datagram over, **before** the
+rate-limit check and the queue reservation. `delivered/s` is what the JS reader
+actually saw. The gap between them is the finding.
+
+| workers | clients | delivered/s | ingested/s | dropped | process | tokio | JS | unattributed |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 50,899 | 50,897 | 0% | 2.11 | 0.82 | 0.46 | 0.83 |
+| 1 | 3 | 5,393 | **102,993** | **95%** | 1.30 | **0.96** | **0.13** | 0.21 |
+| 2 | 3 | 94,732 | 94,633 | 0% | 3.23 | 1.55 | 0.64 | 1.05 |
+| auto (10) | 3 | 72,660 | 93,745 | 22% | 4.02 | 2.67 | 0.47 | 0.87 |
+
+**Neither thread was pinned in the condition that started this investigation.**
+At one worker and one client the tokio worker sits at 0.82 cores and the JS
+thread at 0.46. The reading that ~2.05-2.16 cores meant "both threads
+saturated" was wrong; 0.83 cores belongs to threads that touch neither path
+(Bun's GC and helper threads), and the server had headroom it never used
+because the generator was the limit.
+
+**In the collapse, the tokio worker is pinned at 0.96 cores and the JS thread
+is starved at 0.13.** That is the mechanism, and it is not the one I guessed.
+The single worker takes 102,993 datagrams/s *off the wire* — within 11% of what
+the pure-Rust control manages — and then delivers 5,393/s of them, discarding
+95%. The transport half is healthy. What collapses is delivery: with one
+worker, the quinn recv and demux work monopolises it, the per-session delivery
+futures get almost no service, the queue budget fills, and arriving datagrams
+are dropped at the reservation. The JS thread is idle at 0.13 cores waiting for
+work that never arrives.
+
+**Two workers eliminates the drops entirely**: 94,633 ingested against 94,732
+delivered. Give the delivery half its own thread and it keeps up.
+
+The reject path is identified. Differencing the server's own counters over the
+window:
+
+| workers | datagramsIn | datagramsDropped | rateLimited | backpressureWait | delivered/s |
+|---|---|---|---|---|---|
+| 1 | 1,932,921 | **1,825,573** (94.4%) | **0** | 0 | 5,368 |
+| 2 | 2,007,214 | **0** | 0 | 0 | 100,248 |
+
+`rateLimited` is zero, so the limiter is not throwing anything away — the drops
+are the queued-bytes reservation
+(`try_reserve_queued_bytes_with_session`). The queue budget fills because the
+starved delivery future never drains it, and from then on every arriving
+datagram is rejected at reservation. At two workers the budget never fills and
+not one datagram is dropped.
+
+The whole profile replicated on an independent rerun (47,793 / 5,392 / 94,712 /
+72,588 delivered per second, with the same per-thread split to within 0.04
+cores), so these are not single-shot numbers.
+
+**Ten workers brings the drops back** (22%) while ingesting no more than two
+did. This is where extra workers stop paying.
+
+## Run G, continued — rate-limiter contention
+
+`try_acquire_datagram_ingress` takes a mutex inside a `DashMap` entry keyed by
+`(server_id, peer_ip)`. On loopback every session is `127.0.0.1`, so all 150
+share one bucket and every worker contends for it once per datagram. Timing is
+opt-in (`WEBTRANSPORT_WORKER_PROBE_TIMING=1`) because it costs two clock reads
+per datagram; the throughput arms above ran without it.
+
+| workers | limiter cores | calls | ns per call |
+|---|---|---|---|
+| 1 (1 client) | 0.009 | 1,017,946 | 173 |
+| 1 (3 clients) | 0.012 | 2,059,865 | 119 |
+| 2 | 0.028 | 1,892,651 | **296** |
+| auto (10) | 0.152 | 1,874,896 | **1,623** |
+
+**The contention the analysis predicted is real and scales with worker count**:
+119 ns per call uncontended, 296 ns at two workers, 1,623 ns at ten — 13.6x.
+At ten workers the limiter alone burns 0.152 cores, and because it is
+serialised it caps aggregate ingress around 620k/s on its own. It is not yet
+the binding constraint, but it is a direct contributor to why ten workers is
+worse than two rather than merely no better.
+
+Two caveats, both important. This is a **loopback worst case**: distinct client
+IPs in production would hash to different `DashMap` shards and different
+mutexes, so real deployments will contend far less. And the key is built with
+`peer_ip.to_string()` — a heap allocation per datagram on the hot path,
+independent of contention and present at every worker count.
+
+## Run G, continued — quinn-udp `BATCH_SIZE` on this platform
+
+Confirmed two independent ways.
+
+**By feature resolution.** `quinn-udp-0.5.14/build.rs` defines
+`apple_slow: { all(apple, not(feature = "fast-apple-datapath")) }`, and
+`unix.rs:790-795` sets `BATCH_SIZE` to 32 under `not(apple_slow)` and **1**
+under `apple_slow`. `cargo tree -i -e features quinn-udp@0.5.14` on this
+workspace resolves exactly three features — `default`, `log`, `tracing`.
+Nothing in the graph enables `fast-apple-datapath`.
+
+**By live stack.** `sample(1)` taken mid-window against the running server
+found `recvmsg` and never `recvmsg_x` in three of four profiled cases (the
+fourth is a tooling miss — `sample` wrote to a file instead of stdout — not a
+contradiction). `recvmsg_x` is the batched Apple datapath and is only compiled
+in under `apple_fast`.
+
+So **the endpoint driver on this host performs one `recvmsg` syscall per
+datagram**, all of it serialised under the endpoint mutex that
+`quinn-0.11.11/src/endpoint.rs:370` holds across `drive_recv` and
+`handle_events`. On Linux with GRO the same code path batches 32.
+
+**Every number in this document therefore comes from a receive path that is
+substantially more expensive per datagram than the deployment target's.** This
+does not invalidate the collapse finding — at one worker the server still
+ingests 103k/s, so the syscall cost is not what starves delivery — but it does
+mean the absolute rates are a macOS floor, and the balance between "endpoint
+driver work" and "per-connection work" is different on Linux. A Linux rerun
+before acting on any specific worker count is warranted.
+
+---
+
 ## What this says
 
 **1. The single tokio worker is a real and serious limit, but as a cliff rather
@@ -179,6 +302,26 @@ optimization target, and it is a per-datagram cost — which is consistent with
 the batching investigation's finding that the JS reader is not the bottleneck,
 since the cost is in the crossing rather than the drain.
 
+**5. The collapse is delivery starvation, not a receive limit, and the JS
+thread is innocent.** The per-thread profile settles the question the A/B could
+not: at one worker under real load the tokio worker is pinned at 0.96 cores
+while the JS thread idles at 0.13, and the server ingests 102,993 datagrams/s
+off the wire while delivering 5,393/s. The receive half is working fine and
+throwing away 95% of what it takes in, because the delivery futures cannot get
+scheduled on the one worker that the recv/demux loop is monopolising. Two
+workers gives delivery its own thread and the drops vanish completely.
+
+**6. The premise that motivated the profile does not hold, in a way that
+strengthens the result.** ~2.1 cores was never "two threads saturated": it is
+0.82 tokio + 0.46 JS + 0.83 in Bun's other threads. The JS thread has never been
+the constraint at any load or worker count measured here, peaking at 0.64 cores.
+
+**7. Multi-worker contention on our own rate limiter is real** — 119 ns per
+call at one worker, 1,623 ns at ten — and is part of why ten workers is worse
+than two. It is a loopback worst case (one shared bucket for all 150 sessions)
+and should be far milder with distinct production client IPs, but the
+per-datagram `peer_ip.to_string()` allocation in the key is unconditional.
+
 **4. The measurement that motivated this investigation was measuring the
 sender.** Both of its data points were generator-limited, and the
 "per-connection cost" signature it showed does not survive a controlled session
@@ -186,16 +329,26 @@ sweep.
 
 ## What this measurement cannot see
 
-- **The collapse mechanism is not established.** I have a reproducible
-  behaviour and no root cause. The constancy of the floor (~5,380/s across every
-  session count, client count and offered rate above the knee) argues against
-  simple starvation, which would vary with load, and points at something with a
-  fixed service rate — a per-tick handoff between the single worker and the JS
-  thread. That is a hypothesis, not a finding. Proving it needs a profile or a
-  tokio task-scheduling trace, not another throughput number.
+- **The collapse mechanism is now located but not fully explained.** The
+  profile establishes *where* it happens — the worker is pinned, the JS thread
+  is starved, 95% of ingested datagrams are discarded before delivery — but not
+  *why the floor is so precisely constant* at ~5,380/s across every session
+  count, client count and offered rate above the knee. Pure starvation would be
+  expected to vary with load. Something downstream of the starved delivery
+  future is running at a fixed service rate. Identifying it needs a tokio task
+  trace, not another throughput number.
+- **Whether the queue budget is per-session or global is not separated.** The
+  drops are the queued-bytes reservation and not the rate limiter, but
+  `try_reserve_queued_bytes_with_session` checks both ceilings and increments
+  one counter for either.
 - **The knee is not located.** I have 50k delivered at ~70k offered and 5.4k at
   ~145k. A proper ladder between those two would say where production traffic
   actually sits relative to the cliff. This matters more than any number above.
+- **The recv path here is macOS-specific and more expensive than production's.**
+  quinn-udp resolves `BATCH_SIZE` to 1 on this host (verified above), so the
+  endpoint driver makes one `recvmsg` syscall per datagram under the endpoint
+  mutex, where Linux with GRO batches 32. Absolute rates are a macOS floor and
+  the recv/per-connection work balance differs on the deployment target.
 - **Everything is loopback on one machine**, with generators, server and harness
   contending for the same 10 cores. Cross-host numbers will differ, possibly a
   lot, and the ordering of arms is more trustworthy here than the magnitudes.
@@ -229,6 +382,8 @@ changed.
 - `.investigation/worker-thread-parallelism-probe-c3.json` — Run E
 - `.investigation/native-recv-floor-control.json` — Run C
 - `.investigation/native-recv-floor-control-c3.json` — Run D
+- `.investigation/thread-profile.json` — Run G (per-thread CPU, limiter timing,
+  recv syscall)
 
 ```sh
 CARGO_TARGET_DIR=$PWD/target cargo build -p reference \
@@ -239,6 +394,7 @@ bun tools/bench/worker-thread-parallelism-probe.ts                 # A + B
 WT_PROBE_CLIENTS=3 bun tools/bench/worker-thread-parallelism-probe.ts   # E
 bun tools/bench/native-recv-floor-control.ts                       # C
 WT_PROBE_CLIENTS=3 bun tools/bench/native-recv-floor-control.ts    # D
+bun tools/bench/thread-profile.ts                                  # G
 ```
 
 Knobs: `WT_PROBE_CLIENTS`, `WT_PROBE_SESSIONS`, `WT_PROBE_AGGREGATE`,

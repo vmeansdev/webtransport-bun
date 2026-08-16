@@ -1,0 +1,220 @@
+{
+  "version": 1,
+  "mode": "thread-profile",
+  "kind": "probe",
+  "generatedAtMs": 1786877680328,
+  "head": "5fff9c0c3dbba409a2cc5c6f0b0b33d5ef396008",
+  "bunVersion": "1.3.14",
+  "platform": "darwin/arm64",
+  "machine": "Nikitas-MacBook-Pro.local",
+  "design": {
+    "sessions": 150,
+    "aggregateOfferedPerSec": 150000,
+    "warmupSec": 5,
+    "measureSec": 15
+  },
+  "cases": [
+    {
+      "workers": "1",
+      "clients": 1,
+      "receivedPerSec": 47793.45302370802,
+      "offeredPerSec": 85613.05,
+      "processCores": 2.091176698897633,
+      "tokioCores": 0.8165509792466672,
+      "jsCores": 0.4561185152981458,
+      "unattributedCores": 0.8185072043528201,
+      "rateLimitCores": 0.008505001815794356,
+      "rateLimitCalls": 716876,
+      "threads": [
+        {
+          "label": "wt-server#ThreadId(12)",
+          "datagrams": 716876,
+          "cores": 0.8165509792466672,
+          "rateLimitCores": 0.008505001815794356,
+          "rateLimitCalls": 716876
+        },
+        {
+          "label": "unnamed#ThreadId(1)",
+          "datagrams": 0,
+          "cores": 0.4561185152981458,
+          "rateLimitCores": 0,
+          "rateLimitCalls": 0
+        }
+      ],
+      "recvSyscall": {
+        "recvmsg": true,
+        "recvmsgX": false,
+        "error": null
+      }
+    },
+    {
+      "workers": "1",
+      "clients": 3,
+      "receivedPerSec": 5391.62351040023,
+      "offeredPerSec": 149525.95,
+      "processCores": 1.2820088420472442,
+      "tokioCores": 0.9484625260976365,
+      "jsCores": 0.12978982455717292,
+      "unattributedCores": 0.2037564913924348,
+      "rateLimitCores": 0.012659591863426047,
+      "rateLimitCalls": 1502943,
+      "threads": [
+        {
+          "label": "wt-server#ThreadId(12)",
+          "datagrams": 1502943,
+          "cores": 0.9484625260976365,
+          "rateLimitCores": 0.012659591863426047,
+          "rateLimitCalls": 1502943
+        },
+        {
+          "label": "unnamed#ThreadId(1)",
+          "datagrams": 0,
+          "cores": 0.12978982455717292,
+          "rateLimitCores": 0,
+          "rateLimitCalls": 0
+        }
+      ],
+      "recvSyscall": {
+        "recvmsg": true,
+        "recvmsgX": false,
+        "error": null
+      }
+    },
+    {
+      "workers": "2",
+      "clients": 3,
+      "receivedPerSec": 94711.61219935572,
+      "offeredPerSec": 149447.55,
+      "processCores": 3.152776413429199,
+      "tokioCores": 1.5075698307174688,
+      "jsCores": 0.6191749082875122,
+      "unattributedCores": 1.0260316744242182,
+      "rateLimitCores": 0.032554255494924876,
+      "rateLimitCalls": 1422238,
+      "threads": [
+        {
+          "label": "wt-server#ThreadId(12)",
+          "datagrams": 714701,
+          "cores": 0.7548465145291535,
+          "rateLimitCores": 0.017292193231356875,
+          "rateLimitCalls": 714701
+        },
+        {
+          "label": "wt-server#ThreadId(13)",
+          "datagrams": 707537,
+          "cores": 0.7527233161883153,
+          "rateLimitCores": 0.015262062263567999,
+          "rateLimitCalls": 707537
+        },
+        {
+          "label": "unnamed#ThreadId(1)",
+          "datagrams": 0,
+          "cores": 0.6191749082875122,
+          "rateLimitCores": 0,
+          "rateLimitCalls": 0
+        }
+      ],
+      "recvSyscall": {
+        "recvmsg": true,
+        "recvmsgX": false,
+        "error": null
+      }
+    },
+    {
+      "workers": "auto",
+      "clients": 3,
+      "receivedPerSec": 72587.90046562806,
+      "offeredPerSec": 149294.05,
+      "processCores": 3.749082604692206,
+      "tokioCores": 2.524827162767077,
+      "jsCores": 0.45424580917356666,
+      "unattributedCores": 0.7700096327515626,
+      "rateLimitCores": 0.21135935615441526,
+      "rateLimitCalls": 1348351,
+      "threads": [
+        {
+          "label": "unnamed#ThreadId(1)",
+          "datagrams": 0,
+          "cores": 0.45424580917356666,
+          "rateLimitCores": 0,
+          "rateLimitCalls": 0
+        },
+        {
+          "label": "wt-server#ThreadId(13)",
+          "datagrams": 138696,
+          "cores": 0.2612618859374605,
+          "rateLimitCores": 0.017466993426368902,
+          "rateLimitCalls": 138696
+        },
+        {
+          "label": "wt-server#ThreadId(15)",
+          "datagrams": 136347,
+          "cores": 0.2556338268879644,
+          "rateLimitCores": 0.019064676815620307,
+          "rateLimitCalls": 136347
+        },
+        {
+          "label": "wt-server#ThreadId(20)",
+          "datagrams": 134936,
+          "cores": 0.2543400993195812,
+          "rateLimitCores": 0.019129681061804057,
+          "rateLimitCalls": 134936
+        },
+        {
+          "label": "wt-server#ThreadId(21)",
+          "datagrams": 134546,
+          "cores": 0.25241537262270713,
+          "rateLimitCores": 0.02446398040488371,
+          "rateLimitCalls": 134546
+        },
+        {
+          "label": "wt-server#ThreadId(14)",
+          "datagrams": 134138,
+          "cores": 0.2521185114698152,
+          "rateLimitCores": 0.0215646134033962,
+          "rateLimitCalls": 134138
+        },
+        {
+          "label": "wt-server#ThreadId(19)",
+          "datagrams": 134657,
+          "cores": 0.25178329032455116,
+          "rateLimitCores": 0.024262588311656782,
+          "rateLimitCalls": 134657
+        },
+        {
+          "label": "wt-server#ThreadId(12)",
+          "datagrams": 133893,
+          "cores": 0.2502216117936288,
+          "rateLimitCores": 0.020934522049482627,
+          "rateLimitCalls": 133893
+        },
+        {
+          "label": "wt-server#ThreadId(17)",
+          "datagrams": 135793,
+          "cores": 0.24980108470407555,
+          "rateLimitCores": 0.018973032182183252,
+          "rateLimitCalls": 135793
+        },
+        {
+          "label": "wt-server#ThreadId(18)",
+          "datagrams": 133936,
+          "cores": 0.24968029368690045,
+          "rateLimitCores": 0.024484413899298105,
+          "rateLimitCalls": 133936
+        },
+        {
+          "label": "wt-server#ThreadId(16)",
+          "datagrams": 131409,
+          "cores": 0.24757118602039282,
+          "rateLimitCores": 0.021014854599721355,
+          "rateLimitCalls": 131409
+        }
+      ],
+      "recvSyscall": {
+        "recvmsg": false,
+        "recvmsgX": false,
+        "error": "Sampling process 98857 for 2 seconds with 1 millisecond of run time between samples\nSampling completed, processing symbols...\nSample analysis of process 98857 written to file /tmp/bun_2026-08-16_125425_aJPA.sample.txt\n"
+      }
+    }
+  ]
+}
