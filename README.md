@@ -436,12 +436,13 @@ unreliable transport but worth knowing:
   session is closed, instead of at most one.
 - Abandoning the iterator mid-batch discards up to `max - 1` already-received
   datagrams, instead of at most one.
-- Close-time drop-not-drain: on close, a parked read returns end-of-stream
-  immediately and datagrams still queued in native are discarded rather than
-  drained (previously they were drained first). This one applies to the
-  legacy `WEBTRANSPORT_DATAGRAM_BATCH=0` lane too, since both share the same
-  close wake. Internal budgets and gauges still settle; the drop is about what
-  reaches JavaScript.
+- Close-time drop-not-drain: on close, a parked *or newly entered* read returns
+  end-of-stream immediately and datagrams still queued in native are discarded
+  rather than drained (previously they were drained first). This one applies on
+  both the server and client handles, and to the legacy
+  `WEBTRANSPORT_DATAGRAM_BATCH=0` lane too, since they all share the same close
+  wake. Internal budgets and gauges still settle; the drop is about what reaches
+  JavaScript.
 
 Effective receive buffering per session becomes `2048 + max` datagrams on the
 server and `256 + max` on the client, and the per-session byte budget is
@@ -452,8 +453,10 @@ bounded.
 The knob is a performance dial, but it is not only that: on a clean peer close
 the amount of tail a consumer receives **depends on the batch size and is not
 guaranteed**. Batching wins that race more often because it needs one
-round-trip instead of one per datagram — measured 2 of 12 tail datagrams
-delivered at `0` versus 12 of 12 at `64`. Treat a tail length change after
+round-trip instead of one per datagram — in one measured run, 2 of 12 tail
+datagrams at `0` versus 12 of 12 at `64`. Those counts illustrate the effect;
+being the outcome of a race, they are not a figure to hold the library to.
+Treat a tail length change after
 retuning the knob as expected, not as a bug.
 
 Full contract: `docs/SPEC.md` → "Incoming datagram delivery"; per-backend

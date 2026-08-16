@@ -446,9 +446,11 @@ droppable transport, and all three are stated rather than hidden.
    bounded rather than instantaneous.
 
 On a clean connection end, how much of the remaining tail a consumer receives
-**depends on the configured batch size, and no count is guaranteed**. Measured
-on the same 12-datagram tail: 2 of 12 delivered at `WEBTRANSPORT_DATAGRAM_BATCH=0`
-versus 12 of 12 at `64`. The forwarder is no longer an independent
+**depends on the configured batch size, and no count is guaranteed**. In one
+measured run over the same 12-datagram tail: 2 of 12 delivered at
+`WEBTRANSPORT_DATAGRAM_BATCH=0` versus 12 of 12 at `64`. Those counts are an
+illustration of the effect, not a specification of it — the quantity is racy,
+which is why the tests that cover it assert ranges rather than equalities. The forwarder is no longer an independent
 unconditional discarder, but in production forwarder EOF and connection end
 coincide and the terminal drain still discards that remainder — the improvement
 is a **race window that batching is more likely to win, not a delivery
