@@ -64,6 +64,10 @@ const WORKERS = (process.env.SWEEP_WORKERS ?? "1,2")
 	.split(",")
 	.map((w) => w.trim())
 	.filter((w) => w.length > 0);
+const SEND_MODES = (process.env.SWEEP_SEND_MODES ?? "drop")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s): s is "drop" | "wait" => s === "drop" || s === "wait");
 /** Load-generator processes sharing the sessions. */
 const CLIENTS = Number(process.env.SWEEP_CLIENTS ?? "2");
 const REPS = Number(process.env.SWEEP_REPS ?? "2");
@@ -96,17 +100,21 @@ export type SweepArm = {
 	workers: string;
 	requestedPerSec: number;
 	ratePerSession: number;
+	sendMode: "drop" | "wait";
 };
 
 export function sweepArms(): SweepArm[] {
 	const arms: SweepArm[] = [];
-	for (const workers of WORKERS) {
-		for (const requestedPerSec of RATES) {
-			arms.push({
-				workers,
-				requestedPerSec,
-				ratePerSession: Math.max(1, Math.round(requestedPerSec / SESSIONS)),
-			});
+	for (const sendMode of SEND_MODES) {
+		for (const workers of WORKERS) {
+			for (const requestedPerSec of RATES) {
+				arms.push({
+					workers,
+					requestedPerSec,
+					ratePerSession: Math.max(1, Math.round(requestedPerSec / SESSIONS)),
+					sendMode,
+				});
+			}
 		}
 	}
 	return arms;
@@ -115,7 +123,11 @@ export function sweepArms(): SweepArm[] {
 export const armKey = (a: {
 	workers: string;
 	requestedPerSec: number;
-}): string => `w${a.workers}@${a.requestedPerSec}`;
+	sendMode?: "drop" | "wait";
+}): string =>
+	a.sendMode && a.sendMode !== "drop"
+		? `w${a.workers}@${a.requestedPerSec}@${a.sendMode}`
+		: `w${a.workers}@${a.requestedPerSec}`;
 
 export type SweepRun = {
 	key: string;
@@ -175,6 +187,7 @@ async function runOne(
 			env: {
 				...(process.env as Record<string, string>),
 				WEBTRANSPORT_SERVER_WORKER_THREADS: arm.workers,
+				LOAD_CLIENT_DATAGRAM_WAIT: arm.sendMode === "wait" ? "1" : "0",
 				WT_PROBE_CLIENTS: String(CLIENTS),
 				WT_PROBE_WARMUP_SEC: String(WARMUP_SEC),
 				WT_PROBE_MEASURE_SEC: String(MEASURE_SEC),
@@ -380,6 +393,62 @@ export function proofFailures(summaries: ArmSummary[]): string[] {
 	return failures;
 }
 
+export type WaitVsDropBucket = "path-cap" | "drop-starves-tx" | "incomplete";
+
+export type WaitVsDrop = {
+	dropFrameTxPerSec: number | null;
+	waitFrameTxPerSec: number | null;
+	dropOfferedPerSec: number | null;
+	waitOfferedPerSec: number | null;
+	ratio: number | null;
+	stopBucket: WaitVsDropBucket;
+};
+
+function medianFrameTx(summaries: readonly ArmSummary[]): number | null {
+	const vals = summaries.flatMap((s) =>
+		s.runs
+			.map((r) => r.gap?.frameTxDatagramPerSec)
+			.filter((n): n is number => n != null),
+	);
+	return vals.length > 0 ? median(vals) : null;
+}
+
+export function classifyWaitVsDrop(
+	summaries: readonly ArmSummary[],
+): WaitVsDrop {
+	const drop = summaries.filter((s) => !s.key.endsWith("@wait"));
+	const wait = summaries.filter((s) => s.key.endsWith("@wait"));
+	const dropFrameTxPerSec = medianFrameTx(drop);
+	const waitFrameTxPerSec = medianFrameTx(wait);
+	const dropOfferedPerSec =
+		drop.length > 0 ? median(drop.map((s) => s.offeredPerSec)) : null;
+	const waitOfferedPerSec =
+		wait.length > 0 ? median(wait.map((s) => s.offeredPerSec)) : null;
+	if (
+		dropFrameTxPerSec == null ||
+		waitFrameTxPerSec == null ||
+		dropFrameTxPerSec <= 0
+	) {
+		return {
+			dropFrameTxPerSec,
+			waitFrameTxPerSec,
+			dropOfferedPerSec,
+			waitOfferedPerSec,
+			ratio: null,
+			stopBucket: "incomplete",
+		};
+	}
+	const ratio = waitFrameTxPerSec / dropFrameTxPerSec;
+	return {
+		dropFrameTxPerSec,
+		waitFrameTxPerSec,
+		dropOfferedPerSec,
+		waitOfferedPerSec,
+		ratio,
+		stopBucket: ratio >= 1.1 ? "drop-starves-tx" : "path-cap",
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -424,6 +493,7 @@ async function main(): Promise<void> {
 		string,
 		ReturnType<typeof collapseFor>
 	> = Object.fromEntries(WORKERS.map((w) => [w, collapseFor(summaries, w)]));
+	const waitVsDrop = classifyWaitVsDrop(summaries);
 	const failures = [
 		...proofFailures(summaries),
 		...(gitOutput(["rev-parse", "HEAD"]) === head
@@ -460,8 +530,10 @@ async function main(): Promise<void> {
 			measureSec: MEASURE_SEC,
 			reps: REPS,
 			order,
+			sendModes: SEND_MODES,
 		},
 		arms: summaries,
+		waitVsDrop,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -524,6 +596,18 @@ async function main(): Promise<void> {
 			"\n  NOT TESTED: no rung both met its requested load and pushed the server " +
 				"into dropping. This host did not generate enough load to test the " +
 				"hypothesis; a 'no collapse' reading here is unearned.",
+		);
+	}
+	if (waitVsDrop.stopBucket !== "incomplete") {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  wait-vs-drop: dropFrameTx=${n(waitVsDrop.dropFrameTxPerSec)} ` +
+				`waitFrameTx=${n(waitVsDrop.waitFrameTxPerSec)} ` +
+				`dropOffered=${n(waitVsDrop.dropOfferedPerSec)} ` +
+				`waitOffered=${n(waitVsDrop.waitOfferedPerSec)} ` +
+				`ratio=${waitVsDrop.ratio == null ? "n/a" : waitVsDrop.ratio.toFixed(2)} ` +
+				`STOP=${waitVsDrop.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)

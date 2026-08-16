@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	type ArmSummary,
 	armKey,
+	classifyWaitVsDrop,
 	collapseFor,
 	generatorLimitedRates,
 	proofFailures,
@@ -257,5 +258,84 @@ describe("proofFailures", () => {
 		expect(proofFailures([arm({ configuredWorkers: null })])[0]).toContain(
 			"no worker-probe snapshot",
 		);
+	});
+});
+
+describe("classifyWaitVsDrop", () => {
+	const withFrameTx = (
+		key: string,
+		frameTxDatagramPerSec: number,
+		offeredPerSec: number,
+	): ArmSummary => ({
+		...arm({
+			workers: "2",
+			requestedPerSec: 160_000,
+			offeredPerSec,
+			configuredWorkers: 2,
+			datagramThreads: 2,
+		}),
+		key,
+		runs: [
+			{
+				key,
+				workers: "2",
+				requestedPerSec: 160_000,
+				round: 1,
+				offeredPerSec,
+				deliveredPerSec: frameTxDatagramPerSec,
+				ingestedPerSec: frameTxDatagramPerSec,
+				droppedPct: 0,
+				rateLimited: 0,
+				droppedTooLarge: 0,
+				droppedQueueSession: 0,
+				droppedQueueGlobal: 0,
+				droppedRateLimited: 0,
+				processCores: 2,
+				tokioCores: 1,
+				jsCores: 0.5,
+				datagramThreads: 2,
+				configuredWorkers: 2,
+				sessionsOk: 100,
+				clientSendErrors: 0,
+				threads: [],
+				gap: {
+					windowOfferedPerSec: offeredPerSec,
+					ingestedPerSec: frameTxDatagramPerSec,
+					packetsLostDelta: 0,
+					packetsReceivedDelta: 0,
+					udpInErrorsDelta: 0,
+					udpRcvbufErrorsDelta: 0,
+					frameTxDatagramPerSec,
+					udpTxPerSec: frameTxDatagramPerSec,
+					unexplainedPerSec: 0,
+					stopBucket: "unexplained",
+				},
+			},
+		],
+	});
+
+	test("wait frame_tx at least 10% above drop is drop-starves-tx", () => {
+		const result = classifyWaitVsDrop([
+			withFrameTx("w2@160000", 100_000, 147_000),
+			withFrameTx("w2@160000@wait", 120_000, 120_000),
+		]);
+		expect(result.stopBucket).toBe("drop-starves-tx");
+		expect(result.ratio).toBeCloseTo(1.2);
+	});
+
+	test("wait frame_tx matching drop is path-cap", () => {
+		expect(
+			classifyWaitVsDrop([
+				withFrameTx("w2@160000", 100_000, 147_000),
+				withFrameTx("w2@160000@wait", 101_000, 101_000),
+			]).stopBucket,
+		).toBe("path-cap");
+	});
+
+	test("missing wait arm is incomplete, not path-cap", () => {
+		expect(
+			classifyWaitVsDrop([withFrameTx("w2@160000", 100_000, 147_000)])
+				.stopBucket,
+		).toBe("incomplete");
 	});
 });
