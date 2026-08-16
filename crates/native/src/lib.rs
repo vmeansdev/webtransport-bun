@@ -1367,6 +1367,51 @@ pub(crate) fn spawn_wtransport_server(
                                                     released: false,
                                                 };
                                                 loop {
+                                                    if crate::server_metrics::ServerMetrics::session_queue_cannot_fit(
+                                                        &sm_dgram.queued_bytes,
+                                                        lim_dgram.max_queued_bytes_per_session,
+                                                        lim_dgram.max_datagram_size as u64,
+                                                    ) {
+                                                        let session_notified =
+                                                            datagram_capacity_notify.notified();
+                                                        tokio::pin!(session_notified);
+                                                        session_notified.as_mut().enable();
+                                                        let owner_notified =
+                                                            m_dgram.datagram_capacity_notify.notified();
+                                                        tokio::pin!(owner_notified);
+                                                        owner_notified.as_mut().enable();
+                                                        if crate::server_metrics::ServerMetrics::session_queue_cannot_fit(
+                                                            &sm_dgram.queued_bytes,
+                                                            lim_dgram.max_queued_bytes_per_session,
+                                                            lim_dgram.max_datagram_size as u64,
+                                                        ) {
+                                                            m_dgram.record_datagram_skip_queue_full();
+                                                            tokio::select! {
+                                                                biased;
+                                                                _ = session_notified => {}
+                                                                _ = owner_notified => {}
+                                                                close_err = conn_dgram.closed() => {
+                                                                    let (close_code, close_reason) =
+                                                                        resolve_close_info(&conn_dgram, &close_err).await;
+                                                                    counters.release();
+                                                                    if let Some(ref tx) = closed_tx {
+                                                                        if tx
+                                                                            .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .await
+                                                                            .is_err()
+                                                                        {
+                                                                            eprintln!(
+                                                                                "webtransport-native: session closed event dropped for id={} (listener gone)",
+                                                                                id
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                    return;
+                                                                }
+                                                            }
+                                                            continue;
+                                                        }
+                                                    }
                                                     tokio::select! {
                                                         biased;
                                                         res = conn_dgram.receive_datagram() => {
