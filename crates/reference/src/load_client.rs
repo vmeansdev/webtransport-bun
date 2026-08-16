@@ -1,6 +1,7 @@
 //! WebTransport load client. Connects to a server and generates datagram + stream load.
 //! Used by tools/load for CI and soak tests.
 
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -242,6 +243,42 @@ struct RunOptions<'a> {
 fn next_probe_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn datagram_wait() -> bool {
+    matches!(
+        std::env::var("LOAD_CLIENT_DATAGRAM_WAIT").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// HTTP/3 DATAGRAM prefix: QUIC varint of the quarter-stream-id (`session_id >> 2`).
+fn encode_varint(value: u64, out: &mut Vec<u8>) {
+    if value < 64 {
+        out.push(value as u8);
+    } else if value < 16_384 {
+        out.push(0x40 | ((value >> 8) as u8));
+        out.push(value as u8);
+    } else if value < 1_073_741_824 {
+        out.extend_from_slice(&[
+            0x80 | ((value >> 24) as u8),
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ]);
+    } else {
+        let bytes = value.to_be_bytes();
+        out.push(0xc0 | bytes[0]);
+        out.extend_from_slice(&bytes[1..]);
+    }
+}
+
+fn frame_wt_datagram(session_id: u64, payload: &[u8]) -> Bytes {
+    let qstream = session_id >> 2;
+    let mut out = Vec::with_capacity(8 + payload.len());
+    encode_varint(qstream, &mut out);
+    out.extend_from_slice(payload);
+    Bytes::from(out)
 }
 
 fn format_sent_progress(t_ms: u64, sent: u64, frame_tx_datagram: u64, udp_tx: u64) -> String {
@@ -590,6 +627,9 @@ async fn run_session(
     payload_bytes: usize,
     counters: &Counters,
 ) {
+    let wait = datagram_wait();
+    let quic = conn.quic_connection().clone();
+    let session_id = conn.session_id().into_u64();
     let start = Instant::now();
     let mut stream_sequence = 0u64;
     let datagram_interval = if datagrams_per_sec > 0 {
@@ -620,14 +660,24 @@ async fn run_session(
         tokio::select! {
             _ = conn.closed() => break,
             _ = dg_ticker.tick() => {
-                let sent = if payload_bytes > 0 {
+                if payload_bytes > 0 {
                     let header = format!("load:datagram:{}:", next_probe_id());
                     let n = header.len().min(padded.len());
                     padded[..n].copy_from_slice(&header.as_bytes()[..n]);
-                    conn.send_datagram(&padded)
+                }
+                let sent = if wait {
+                    let framed = if payload_bytes > 0 {
+                        frame_wt_datagram(session_id, &padded)
+                    } else {
+                        let payload = format!("load:datagram:{}", next_probe_id());
+                        frame_wt_datagram(session_id, payload.as_bytes())
+                    };
+                    quic.send_datagram_wait(framed).await.map_err(|_| ())
+                } else if payload_bytes > 0 {
+                    conn.send_datagram(&padded).map_err(|_| ())
                 } else {
                     let payload = format!("load:datagram:{}", next_probe_id());
-                    conn.send_datagram(payload.as_bytes())
+                    conn.send_datagram(payload.as_bytes()).map_err(|_| ())
                 };
                 if sent.is_ok() {
                     counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
@@ -744,8 +794,8 @@ async fn run_reconnect_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_sent_progress, load_summary_json, parse_client_mode, parse_or_default, ClientMode,
-        Counters,
+        format_sent_progress, frame_wt_datagram, load_summary_json, parse_client_mode,
+        parse_or_default, ClientMode, Counters,
     };
     use std::sync::atomic::Ordering;
 
@@ -787,6 +837,12 @@ mod tests {
             format_sent_progress(1000, 50_000, 40_000, 41_000),
             "load-client: t_ms=1000 sent=50000 frame_tx_datagram=40000 udp_tx=41000"
         );
+    }
+
+    #[test]
+    fn frame_wt_datagram_prefixes_quarter_stream_id_varint() {
+        assert_eq!(&frame_wt_datagram(0, b"abc")[..], b"\x00abc");
+        assert_eq!(&frame_wt_datagram(4, b"x")[..], b"\x01x");
     }
 
     #[test]
