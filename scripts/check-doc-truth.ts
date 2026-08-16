@@ -740,9 +740,16 @@ function checkHostedH7Contract(): void {
 					continue;
 				}
 				reported.add(found);
+				// The rule is deliberately blunt, so the message has to carry the
+				// way out. Someone describing another lane or a past configuration
+				// trips this honestly, and without a stated remedy the tempting fix
+				// is to weaken the rule that closes the contradiction bypass.
 				report(
 					location,
-					`contradicts the pinned H7 dispatch value ${parameter}=${pinned}: found ${parameter}=${found}`,
+					`contradicts the pinned H7 dispatch value ${parameter}=${pinned}: found ${parameter}=${found}. ` +
+						`If that value belongs to a different lane or to a past configuration, write it in prose ` +
+						`("8 datagrams per batch", "a 900 MB ceiling") instead: the ${parameter}=<value> form is ` +
+						`reserved for the pinned H7 dispatch values, so do not relax this rule to make room for it.`,
 				);
 			}
 		}
