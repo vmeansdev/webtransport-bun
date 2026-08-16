@@ -1320,7 +1320,8 @@ function getNativeOrThrow(): NativeAddon {
 // ---------------------------------------------------------------------------
 
 const DATAGRAM_BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
-const DATAGRAM_BATCH_DIAGNOSTICS_ENV = "WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
+const DATAGRAM_BATCH_DIAGNOSTICS_ENV =
+	"WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
 const DEFAULT_DATAGRAM_BATCH = 64;
 const MAX_DATAGRAM_BATCH = 256;
 const DATAGRAM_BATCH_MISMATCH_MESSAGE =
@@ -1455,53 +1456,57 @@ const iterateIncomingDatagrams: DatagramIterator = async function* (
  * generator rather than a flag inside the production one so that the disabled
  * case has no diagnostic branch at all in its per-item path.
  */
-const iterateIncomingDatagramsInstrumented: DatagramIterator =
-	async function* (handle, isClosed, batchSize, mapError) {
-		const counters = datagramBatchCounters;
-		if (batchSize === 0) {
-			while (!isClosed()) {
-				let datagram: Uint8Array | null;
-				try {
-					counters.legacyReadCalls++;
-					datagram = await handle.readDatagram();
-				} catch (err) {
-					if (isSessionCloseError(err)) return;
-					throw mapError(err);
-				}
-				if (!datagram) return;
-				counters.materializedItems++;
-				counters.yieldedItems++;
-				yield datagram;
-			}
-			return;
-		}
-		const readBatch = handle.readDatagramBatch;
-		if (typeof readBatch !== "function") throw datagramBatchMismatchError();
+const iterateIncomingDatagramsInstrumented: DatagramIterator = async function* (
+	handle,
+	isClosed,
+	batchSize,
+	mapError,
+) {
+	const counters = datagramBatchCounters;
+	if (batchSize === 0) {
 		while (!isClosed()) {
-			let batch: Uint8Array[] | null;
+			let datagram: Uint8Array | null;
 			try {
-				counters.batchReadCalls++;
-				batch = await readBatch.call(handle, batchSize);
+				counters.legacyReadCalls++;
+				datagram = await handle.readDatagram();
 			} catch (err) {
 				if (isSessionCloseError(err)) return;
 				throw mapError(err);
 			}
-			if (!batch || batch.length === 0) return;
-			counters.materializedItems += batch.length;
-			if (batch.length > counters.maxBatchSize)
-				counters.maxBatchSize = batch.length;
-			let delivered = 0;
-			try {
-				for (const datagram of batch) {
-					delivered++;
-					counters.yieldedItems++;
-					yield datagram;
-				}
-			} finally {
-				counters.abandonedItems += batch.length - delivered;
-			}
+			if (!datagram) return;
+			counters.materializedItems++;
+			counters.yieldedItems++;
+			yield datagram;
 		}
-	};
+		return;
+	}
+	const readBatch = handle.readDatagramBatch;
+	if (typeof readBatch !== "function") throw datagramBatchMismatchError();
+	while (!isClosed()) {
+		let batch: Uint8Array[] | null;
+		try {
+			counters.batchReadCalls++;
+			batch = await readBatch.call(handle, batchSize);
+		} catch (err) {
+			if (isSessionCloseError(err)) return;
+			throw mapError(err);
+		}
+		if (!batch || batch.length === 0) return;
+		counters.materializedItems += batch.length;
+		if (batch.length > counters.maxBatchSize)
+			counters.maxBatchSize = batch.length;
+		let delivered = 0;
+		try {
+			for (const datagram of batch) {
+				delivered++;
+				counters.yieldedItems++;
+				yield datagram;
+			}
+		} finally {
+			counters.abandonedItems += batch.length - delivered;
+		}
+	}
+};
 
 // Selected once, at module initialization — never per generator and never per
 // item. Task 7's floor benchmark imports this same binding.
@@ -4146,7 +4151,8 @@ export const __TESTING__ = {
 	createIncomingDatagramIteratorForTests: createIncomingDatagramIterator,
 	datagramBatchDiagnosticsSnapshotForTests: datagramBatchDiagnosticsSnapshot,
 	datagramBatchMismatchMessageForTests: DATAGRAM_BATCH_MISMATCH_MESSAGE,
-	nativePayloadDeliveryModeForTests: () => native?.nativePayloadDeliveryMode?.(),
+	nativePayloadDeliveryModeForTests: () =>
+		native?.nativePayloadDeliveryMode?.(),
 	nativePayloadEngineOwnedMaxBytesForTests: () =>
 		native?.nativePayloadEngineOwnedMaxBytes?.(),
 	materializePayloadBatchForTests: (payloads: (Buffer | Uint8Array)[]) =>
