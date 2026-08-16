@@ -197,6 +197,77 @@ function assertSessionContract(session: PortableServerSession): void {
 	expect(session.incomingDatagrams()).toBe(session.incomingDatagrams());
 }
 
+/** Datagrams a live peer pushes at the server, in the order given. */
+const DATAGRAM_BURST = 8;
+
+/**
+ * The COMMON half of the narrowed `/portable` incoming-datagram contract, run
+ * on a live session of each backend: one memoized single-consumer iterable,
+ * `Uint8Array` items delivered one per yield, and this backend's own receive
+ * order preserved.
+ *
+ * What it deliberately does not assert is hidden buffering — how deep either
+ * backend reads ahead, and how much of a close-time backlog survives. Native
+ * batches its Node-API reads and wasm does not, so those numbers differ by
+ * design; the native depth is pinned in the Task 3 batch tests instead. Loss is
+ * tolerated here too, because this is an unreliable transport.
+ */
+async function assertIncomingDatagramFlow(
+	session: PortableServerSession,
+	send: (payload: Uint8Array) => Promise<void>,
+): Promise<AsyncIterator<Uint8Array>> {
+	const iterable = session.incomingDatagrams();
+	expect(iterable).toBe(session.incomingDatagrams());
+	expect(typeof iterable[Symbol.asyncIterator]).toBe("function");
+	const iterator = iterable[Symbol.asyncIterator]();
+
+	for (let id = 0; id < DATAGRAM_BURST; id += 1) {
+		await send(new Uint8Array([id]));
+	}
+
+	const ids: number[] = [];
+	while (ids.length < DATAGRAM_BURST) {
+		const next = await withTimeout(
+			iterator.next(),
+			5000,
+			"portable incoming datagram",
+		).catch(() => null);
+		// A datagram that never arrives is loss, not a contract breach: stop
+		// waiting and judge what did arrive.
+		if (next === null || next.done) break;
+		// One item per yield — a batched backend must not surface its batch.
+		expect(next.value).toBeInstanceOf(Uint8Array);
+		expect((next.value as Uint8Array).length).toBe(1);
+		ids.push((next.value as Uint8Array)[0] as number);
+	}
+
+	expect(ids.length).toBeGreaterThanOrEqual(2);
+	expect(new Set(ids).size).toBe(ids.length);
+	expect([...ids].sort((a, b) => a - b)).toEqual(ids);
+	return iterator;
+}
+
+/**
+ * Bounded termination: once the session is closed the iterable ends, and every
+ * item it yields on the way out is still a `Uint8Array`. The count of those
+ * trailing items is per-backend buffering and is intentionally not asserted.
+ */
+async function assertIncomingDatagramsTerminate(
+	iterator: AsyncIterator<Uint8Array>,
+): Promise<void> {
+	let done = false;
+	for (let step = 0; step < DATAGRAM_BURST * 4 && !done; step += 1) {
+		const next = await withTimeout(
+			iterator.next(),
+			5000,
+			"portable incoming datagram termination",
+		);
+		if (next.done) done = true;
+		else expect(next.value).toBeInstanceOf(Uint8Array);
+	}
+	expect(done).toBe(true);
+}
+
 describe("three-surface public API model", () => {
 	test("the package exports exactly the three documented subpaths", () => {
 		expect(Object.keys(packageJson.exports).sort()).toEqual([
@@ -293,8 +364,14 @@ describe("/portable runtime contract", () => {
 				"portable native session",
 			);
 			assertSessionContract(session);
+			const writer = wt.datagrams.writable.getWriter();
+			const datagrams = await assertIncomingDatagramFlow(session, (payload) =>
+				writer.write(payload),
+			);
+			writer.releaseLock();
 			expect(session.drain()).toBeUndefined();
 			expect(session.close({ code: 0, reason: "" })).toBeUndefined();
+			await assertIncomingDatagramsTerminate(datagrams);
 			wt.close();
 		} finally {
 			const closed = server.close();
@@ -342,8 +419,12 @@ describe("/portable runtime contract", () => {
 					"portable wasm session",
 				);
 				assertSessionContract(session);
+				const datagrams = await assertIncomingDatagramFlow(session, (payload) =>
+					clientSession.sendDatagram(payload),
+				);
 				expect(session.drain()).toBeUndefined();
 				expect(session.close({ code: 0, reason: "" })).toBeUndefined();
+				await assertIncomingDatagramsTerminate(datagrams);
 				manager.close();
 			} finally {
 				const closed = server.close();
