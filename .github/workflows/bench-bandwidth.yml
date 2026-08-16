@@ -34,6 +34,11 @@ on:
         required: false
         default: "false"
         type: string
+      h7_batch_probe:
+        description: "H7 only: recv-only BATCH=0 vs 64 at 160k-class load; skip the echo ladder. Do not copy onto staging."
+        required: false
+        default: "false"
+        type: string
 jobs:
   bench:
     permissions:
@@ -105,7 +110,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.h7_batch_probe != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -115,11 +120,28 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
+      - name: H7 batch probe (recv-only BATCH=0 vs 64)
+        if: ${{ github.event.inputs.h7_batch_probe == 'true' }}
+        env:
+          H7_PROBE_SESSIONS: ${{ github.event.inputs.sessions }}
+          H7_PROBE_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
+          H7_PROBE_RATE: "1600"
+        run: |
+          cargo build --release -p reference --bin load-client
+          bun tools/bench/datagram-batch-e2e-probe.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.h7_batch_probe != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.h7_batch_probe == 'true' }}
+        with:
+          name: h7-batch-probe-${{ github.event.inputs.candidate_commit }}
+          path: .release-evidence/h7/datagram-batch-e2e-probe.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
