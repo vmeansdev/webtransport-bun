@@ -300,7 +300,7 @@ describe("H7 Playwright report verification", () => {
 		suites?: SuiteFixture[];
 	};
 	type ReportFixture = {
-		config: unknown;
+		config: { webServer: { env: Record<string, string> } };
 		errors: unknown[];
 		stats?: {
 			expected: number;
@@ -371,6 +371,29 @@ describe("H7 Playwright report verification", () => {
 	});
 
 	const rejections: ReadonlyArray<readonly [string, Mutate, RegExp]> = [
+		// A structurally perfect report from a run that never crossed a batch
+		// boundary still proves nothing, and it is the report most likely to be
+		// presented by mistake: the generic interop suite runs the same case
+		// without the knob and overwrites the same evidence filename.
+		[
+			"a run with the batch knob absent",
+			(r) => {
+				r.config.webServer.env = {};
+			},
+			/WEBTRANSPORT_DATAGRAM_BATCH/,
+		],
+		[
+			"a run at the default batch of 64, which crosses no boundary",
+			(r) => {
+				r.config.webServer.env.WEBTRANSPORT_DATAGRAM_BATCH = "64";
+			},
+			/WEBTRANSPORT_DATAGRAM_BATCH/,
+		],
+		[
+			"a report with no webServer env at all",
+			(r) => Reflect.deleteProperty(r.config, "webServer"),
+			/config\.webServer/,
+		],
 		[
 			"a report with no suites array",
 			(r) => Reflect.deleteProperty(r, "suites"),
@@ -497,18 +520,27 @@ describe("H7 interop test source constraints", () => {
 		"utf8",
 	);
 
+	/** A bare `test(` call at any indentation. The preceding-character guard,
+	 * rather than a column-zero anchor, is what excludes `test.beforeEach(` and
+	 * friends — so nesting or indenting the declaration cannot hide it. */
+	const DECLARATION = /(?<![.\w])test\(/;
+
 	it("declares exactly one test, under the title the verifier enforces", () => {
 		expect(source).toContain(H7_TEST_TITLE);
-		expect(source.match(/^test\(/gm) ?? []).toHaveLength(1);
+		expect(source.match(new RegExp(DECLARATION, "g")) ?? []).toHaveLength(1);
 	});
 
 	// The reporter verifier is the authoritative executed/skipped count; this
 	// scan only stops the source from asking to be skipped in the first place.
+	// `.only` is here for the opposite reason: it does not skip this case, it
+	// silently deselects every other one in the run.
 	for (const construct of [
 		"test.skip",
 		"test.fixme",
+		"test.only",
 		"test.describe.skip",
 		"test.describe.fixme",
+		"test.describe.only",
 	]) {
 		it(`never uses ${construct}`, () => {
 			expect(source).not.toContain(construct);
@@ -520,7 +552,7 @@ describe("H7 interop test source constraints", () => {
 		// case body, where a `return` — conditional or not — would end the run
 		// before the expectations execute. The browser-side burst helper is
 		// hoisted above that point precisely so it can still return its counters.
-		const caseBody = source.slice(source.search(/^test\(/m));
+		const caseBody = source.slice(source.search(DECLARATION));
 		expect(caseBody).not.toMatch(/\breturn\b/);
 		expect(caseBody).toMatch(/\bexpect\(/);
 	});

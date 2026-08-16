@@ -86,6 +86,16 @@ export function verifyEvidenceDocument(document: unknown): void {
 export const H7_TEST_TITLE =
 	"H7 batch=4 delivers a unique bounded Chromium burst";
 
+/**
+ * The batch size the H7 case is only meaningful at. A 100-datagram burst
+ * crosses ~25 boundaries at 4 and none at the default of 64, so a report from a
+ * run without the knob proves nothing about batch boundaries while still
+ * carrying the words "H7 batch=4". The generic interop suite runs the same case
+ * without the knob and overwrites `interop-evidence.json`, so this is the
+ * report most likely to be presented by mistake.
+ */
+export const H7_REQUIRED_BATCH = "4";
+
 function h7Fail(message: string): never {
 	throw new Error(`unusable H7 playwright report: ${message}`);
 }
@@ -137,6 +147,16 @@ function requireCount(
  */
 export function verifyH7PlaywrightReport(document: unknown): void {
 	const report = asObject(document, "report");
+
+	// Which run produced this, before anything about how it went.
+	const config = asObject(report.config, "config");
+	const webServer = asObject(config.webServer, "config.webServer");
+	const env = asObject(webServer.env, "config.webServer.env");
+	const batch = env.WEBTRANSPORT_DATAGRAM_BATCH;
+	if (batch !== H7_REQUIRED_BATCH)
+		h7Fail(
+			`config.webServer.env.WEBTRANSPORT_DATAGRAM_BATCH is ${JSON.stringify(batch)}, expected ${JSON.stringify(H7_REQUIRED_BATCH)} — this report is from a run that did not cross batch boundaries`,
+		);
 
 	const errors = asArray(report.errors ?? [], "errors");
 	if (errors.length > 0) h7Fail(`reporter recorded ${errors.length} errors`);

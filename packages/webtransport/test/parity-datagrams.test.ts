@@ -83,6 +83,10 @@ describe.skipIf(skipWasmParityIfUnavailable)("parity datagrams (P2)", () => {
 	// is not part of it — native reads the addon in batches and wasm does not —
 	// so nothing below counts what either backend held back.
 	const BURST = 8;
+	// These run over loopback against a local in-process server, where both
+	// backends deliver all 8. The floor absorbs two losses so an unlucky run
+	// cannot flake, and still fails a backend that drops most of a burst.
+	const MIN_DELIVERED = 6;
 
 	test("datagrams.readable yields one Uint8Array per datagram, in receive order", async () => {
 		const wt = await harness.open();
@@ -111,7 +115,7 @@ describe.skipIf(skipWasmParityIfUnavailable)("parity datagrams (P2)", () => {
 		reader.releaseLock();
 		wt.close();
 
-		expect(ids.length).toBeGreaterThanOrEqual(2);
+		expect(ids.length).toBeGreaterThanOrEqual(MIN_DELIVERED);
 		expect(new Set(ids).size).toBe(ids.length);
 		expect([...ids].sort((a, b) => a - b)).toEqual(ids);
 	});
@@ -126,21 +130,32 @@ describe.skipIf(skipWasmParityIfUnavailable)("parity datagrams (P2)", () => {
 		wt.close();
 
 		// Bounded termination: the stream must stop producing. How many
-		// already-buffered chunks precede the end is per-backend and unasserted;
-		// a rejected read is an ending too, an unbounded hang is not.
+		// already-buffered chunks precede the end is per-backend and unasserted.
+		// A read that ends in error is still an ending; a read that runs out the
+		// clock is the hang this test exists to catch, so the two rejections must
+		// not be collapsed — `readWithTimeout` signals the deadline by rejecting
+		// with `timeout after <ms>ms: <label>`.
+		const label = "parity datagram termination read";
 		let ended = false;
-		for (let step = 0; step < BURST * 4 && !ended; step += 1) {
-			const next = await readWithTimeout(
-				reader,
-				5000,
-				"parity datagram termination read",
-			).then(
+		let hung = false;
+		for (let step = 0; step < BURST * 4 && !ended && !hung; step += 1) {
+			const next = await readWithTimeout(reader, 5000, label).then(
 				(result) => result,
-				() => ({ done: true, value: undefined }) as const,
+				(error: unknown) => {
+					const message =
+						error instanceof Error ? error.message : String(error);
+					if (message.startsWith("timeout after") && message.endsWith(label)) {
+						hung = true;
+						return null;
+					}
+					return { done: true, value: undefined } as const;
+				},
 			);
+			if (next === null) continue;
 			if (next.done) ended = true;
 			else expect(next.value).toBeInstanceOf(Uint8Array);
 		}
+		expect(hung).toBe(false);
 		expect(ended).toBe(true);
 	});
 
