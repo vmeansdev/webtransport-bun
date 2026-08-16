@@ -698,6 +698,44 @@ describe("hosted H7 operator documentation policy", () => {
 		);
 	});
 
+	// Presence of the right token does not exclude the wrong one sitting beside
+	// it: a doc can satisfy a presence-only contract and still tell an operator
+	// to dispatch a different value in the next sentence.
+	for (const doc of H7_DOCS) {
+		for (const [parameter, pinned, contradiction] of [
+			["datagram_batch", "64", "32"],
+			["rss_ceiling_mb", "1750", "1024"],
+			["sessions", "500", "250"],
+		] as const) {
+			it(`rejects ${doc} offering ${parameter}=${contradiction} beside the required ${parameter}=${pinned}`, () => {
+				const result = runPolicy((_fixture, root) => {
+					rewriteDoc(
+						root,
+						doc,
+						(text) =>
+							`${text}\nOperators may instead set \`${parameter}=${contradiction}\`.\n`,
+					);
+				});
+				expect(result.status).toBe(1);
+				expect(result.stderr).toContain(
+					`${doc}: contradicts the pinned H7 dispatch value ${parameter}=${pinned}: found ${parameter}=${contradiction}`,
+				);
+			});
+		}
+	}
+
+	it("accepts prose explaining the ceiling clamp without a competing dispatch value", () => {
+		const result = runPolicy((_fixture, root) => {
+			rewriteDoc(
+				root,
+				"tools/load/README.md",
+				(text) =>
+					`${text}\nThe ceiling clamps to \`max(1024, sessions * 3.5)\`, which leaves smaller lanes at 1024 while H7 resolves to 1750.\n`,
+			);
+		});
+		expect(result.status, result.stderr).toBe(0);
+	});
+
 	it("rejects a release checklist that drops GitHub-hosted 5/15 segmentation", () => {
 		const result = runPolicy((_fixture, root) => {
 			rewriteDoc(root, "docs/RELEASE_CHECKLIST.md", (text) =>

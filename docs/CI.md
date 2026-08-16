@@ -71,9 +71,11 @@ branch — with `duration_hours=2`, `runner_type=self-hosted`,
 `runner_mode=dedicated`, `segment_index=1`, `segment_count=1`,
 `datagram_batch=64`, `rss_ceiling_mb=1750`, `committed_abort_mb=2200`, and
 `heap_debug=0`. `scripts/validate-soak-inputs.sh` pins that whole tuple and
-rejects any other combination on an H7 tag. The run appears in Actions as
-`soak-long-<campaign_seed>`, so pick a campaign seed unique to the attempt and
-use it to find the run.
+rejects any other combination on an H7 tag. The run appears in Actions under the
+display title `soak-long-<campaign_seed>`, so pick a campaign seed unique to the
+attempt and find the run by that title together with the candidate SHA — the
+seed alone does not distinguish a re-dispatch on a different candidate. Download
+its segment and aggregate artifacts by that run's immutable ID.
 
 The workload is fixed rather than capacity-derived: `runner_profile=h7-fixed-large`,
 `sessions=500`, `datagrams_per_sec=500`, `streams_per_sec=5`, with no shared-mode
