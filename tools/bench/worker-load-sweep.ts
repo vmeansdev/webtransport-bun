@@ -35,7 +35,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { cpus, hostname, totalmem } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -76,6 +76,11 @@ const CPU_MODES = (process.env.SWEEP_CPU_MODES ?? "shared")
 	.split(",")
 	.map((s) => s.trim())
 	.filter((s): s is "shared" | "split" => s === "shared" || s === "split");
+const RMEM_MODES = (process.env.SWEEP_RMEM_MODES ?? "default")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s): s is "default" | "raised" => s === "default" || s === "raised");
+const RMEM_RAISED_BYTES = 8 * 1024 * 1024;
 /** Load-generator processes sharing the sessions. */
 const CLIENTS = Number(process.env.SWEEP_CLIENTS ?? "2");
 const REPS = Number(process.env.SWEEP_REPS ?? "2");
@@ -110,21 +115,28 @@ export type SweepArm = {
 	ratePerSession: number;
 	sendMode: "drop" | "wait";
 	cpuMode: "shared" | "split";
+	rmemMode: "default" | "raised";
 };
 
 export function sweepArms(): SweepArm[] {
 	const arms: SweepArm[] = [];
-	for (const cpuMode of CPU_MODES) {
-		for (const sendMode of SEND_MODES) {
-			for (const workers of WORKERS) {
-				for (const requestedPerSec of RATES) {
-					arms.push({
-						workers,
-						requestedPerSec,
-						ratePerSession: Math.max(1, Math.round(requestedPerSec / SESSIONS)),
-						sendMode,
-						cpuMode,
-					});
+	for (const rmemMode of RMEM_MODES) {
+		for (const cpuMode of CPU_MODES) {
+			for (const sendMode of SEND_MODES) {
+				for (const workers of WORKERS) {
+					for (const requestedPerSec of RATES) {
+						arms.push({
+							workers,
+							requestedPerSec,
+							ratePerSession: Math.max(
+								1,
+								Math.round(requestedPerSec / SESSIONS),
+							),
+							sendMode,
+							cpuMode,
+							rmemMode,
+						});
+					}
 				}
 			}
 		}
@@ -137,10 +149,12 @@ export const armKey = (a: {
 	requestedPerSec: number;
 	sendMode?: "drop" | "wait";
 	cpuMode?: "shared" | "split";
+	rmemMode?: "default" | "raised";
 }): string => {
 	let key = `w${a.workers}@${a.requestedPerSec}`;
 	if (a.sendMode && a.sendMode !== "drop") key += `@${a.sendMode}`;
 	if (a.cpuMode && a.cpuMode !== "shared") key += `@${a.cpuMode}`;
+	if (a.rmemMode && a.rmemMode !== "default") key += `@${a.rmemMode}`;
 	return key;
 };
 
@@ -171,11 +185,40 @@ export type SweepRun = {
 	clientTaskset: string;
 	clientCpusAllowed: number[][];
 	clientAffinityOk: boolean;
+	skRcvbuf: number | null;
+	skDrops: number | null;
 };
 
 function gitOutput(args: string[]): string {
 	const result = spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
 	return result.status === 0 ? result.stdout.trim() : "";
+}
+
+function readSysctl(name: string): number | null {
+	try {
+		const text = readFileSync(`/proc/sys/${name.replaceAll(".", "/")}`, "utf8");
+		const n = Number.parseInt(text.trim(), 10);
+		return Number.isFinite(n) ? n : null;
+	} catch {
+		return null;
+	}
+}
+
+function writeSysctl(name: string, value: number): boolean {
+	const path = `/proc/sys/${name.replaceAll(".", "/")}`;
+	try {
+		writeFileSync(path, `${value}\n`);
+		return readSysctl(name) === value;
+	} catch {
+		const result = spawnSync("sysctl", ["-w", `${name}=${value}`], {
+			encoding: "utf8",
+		});
+		if (result.status === 0 && readSysctl(name) === value) return true;
+		const sudo = spawnSync("sudo", ["-n", "sysctl", "-w", `${name}=${value}`], {
+			encoding: "utf8",
+		});
+		return sudo.status === 0 && readSysctl(name) === value;
+	}
 }
 
 async function runOne(
@@ -272,6 +315,8 @@ async function runOne(
 			clientTaskset: run.clientTaskset ?? "",
 			clientCpusAllowed: run.clientCpusAllowed ?? [],
 			clientAffinityOk: run.clientAffinityOk !== false,
+			skRcvbuf: run.skRcvbuf ?? null,
+			skDrops: run.skDrops ?? null,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -542,6 +587,77 @@ export function classifyCoresplit(input: {
 	};
 }
 
+export type RmemBucket = "rmem" | "not-rmem" | "incomplete";
+
+export type RmemCap = {
+	defaultFrameTxPerSec: number | null;
+	raisedFrameTxPerSec: number | null;
+	ratio: number | null;
+	defaultSkRcvbuf: number | null;
+	raisedSkRcvbuf: number | null;
+	rmemDefaultWrote: boolean;
+	stopBucket: RmemBucket;
+};
+
+export function classifyRmem(input: {
+	summaries: readonly ArmSummary[];
+	rmemDefaultWrote: boolean;
+	controlRmemDefault: number | null;
+}): RmemCap {
+	const def = input.summaries.filter((s) => !s.key.endsWith("@raised"));
+	const raised = input.summaries.filter((s) => s.key.endsWith("@raised"));
+	const defaultFrameTxPerSec = medianFrameTx(def);
+	const raisedFrameTxPerSec = medianFrameTx(raised);
+	const ratio =
+		defaultFrameTxPerSec != null &&
+		raisedFrameTxPerSec != null &&
+		defaultFrameTxPerSec > 0
+			? raisedFrameTxPerSec / defaultFrameTxPerSec
+			: null;
+	const medianSk = (arms: readonly ArmSummary[]): number | null => {
+		const vals = arms.flatMap((s) =>
+			s.runs
+				.map((r) => r.skRcvbuf)
+				.filter((n): n is number => n != null && n > 0),
+		);
+		return vals.length > 0 ? median(vals) : null;
+	};
+	const defaultSkRcvbuf = medianSk(def);
+	const raisedSkRcvbuf = medianSk(raised);
+	const socketGrew =
+		defaultSkRcvbuf != null &&
+		raisedSkRcvbuf != null &&
+		raisedSkRcvbuf >= 4 * defaultSkRcvbuf;
+	const defaultReproduced =
+		defaultFrameTxPerSec != null &&
+		defaultFrameTxPerSec >= SHARED_FRAME_TX_MIN &&
+		defaultFrameTxPerSec <= SHARED_FRAME_TX_MAX;
+	const noTreatment =
+		input.controlRmemDefault != null &&
+		input.controlRmemDefault >= RMEM_RAISED_BYTES;
+	const incomplete =
+		!input.rmemDefaultWrote ||
+		noTreatment ||
+		!socketGrew ||
+		raised.length === 0 ||
+		defaultFrameTxPerSec == null ||
+		raisedFrameTxPerSec == null ||
+		!defaultReproduced;
+	let stopBucket: RmemBucket = "incomplete";
+	if (!incomplete && ratio != null) {
+		stopBucket = ratio >= CORESPLIT_RATIO ? "rmem" : "not-rmem";
+	}
+	return {
+		defaultFrameTxPerSec,
+		raisedFrameTxPerSec,
+		ratio,
+		defaultSkRcvbuf,
+		raisedSkRcvbuf,
+		rmemDefaultWrote: input.rmemDefaultWrote,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -581,13 +697,42 @@ async function main(): Promise<void> {
 	const order: string[] = [];
 	// Interleave: a host that heats up part-way through must not hand the whole
 	// penalty to whichever worker count happened to run last.
-	for (let round = 1; round <= REPS; round += 1) {
-		for (const arm of shuffled(arms, rng)) {
-			order.push(`r${round}:${armKey(arm)}`);
-			console.log(`sweep: round ${round}/${REPS} ${armKey(arm)} ...`);
-			runs.push(
-				await runOne(arm, round, BASE_PORT + runs.length, clientTaskset),
-			);
+	const origRmemDefault = readSysctl("net.core.rmem_default");
+	const origRmemMax = readSysctl("net.core.rmem_max");
+	const raisedBytes = Math.max(origRmemDefault ?? 0, RMEM_RAISED_BYTES);
+	let rmemDefaultWrote = true;
+	console.log(
+		`sweep: rmem_default=${origRmemDefault ?? "n/a"} rmem_max=${origRmemMax ?? "n/a"} ` +
+			`raised=${raisedBytes} rmemModes=[${RMEM_MODES.join(",")}]`,
+	);
+	try {
+		for (let round = 1; round <= REPS; round += 1) {
+			for (const arm of shuffled(arms, rng)) {
+				order.push(`r${round}:${armKey(arm)}`);
+				console.log(`sweep: round ${round}/${REPS} ${armKey(arm)} ...`);
+				if (arm.rmemMode === "raised") {
+					const maxOk = writeSysctl(
+						"net.core.rmem_max",
+						Math.max(origRmemMax ?? raisedBytes, raisedBytes),
+					);
+					const defOk = writeSysctl("net.core.rmem_default", raisedBytes);
+					rmemDefaultWrote = rmemDefaultWrote && maxOk && defOk;
+				} else {
+					if (origRmemMax != null)
+						writeSysctl("net.core.rmem_max", origRmemMax);
+					if (origRmemDefault != null) {
+						writeSysctl("net.core.rmem_default", origRmemDefault);
+					}
+				}
+				runs.push(
+					await runOne(arm, round, BASE_PORT + runs.length, clientTaskset),
+				);
+			}
+		}
+	} finally {
+		if (origRmemMax != null) writeSysctl("net.core.rmem_max", origRmemMax);
+		if (origRmemDefault != null) {
+			writeSysctl("net.core.rmem_default", origRmemDefault);
 		}
 	}
 
@@ -606,6 +751,11 @@ async function main(): Promise<void> {
 		nproc: capacity.cpus,
 		tasksetOk,
 		clientCpus,
+	});
+	const rmem = classifyRmem({
+		summaries,
+		rmemDefaultWrote,
+		controlRmemDefault: origRmemDefault,
 	});
 	const failures = [
 		...proofFailures(summaries),
@@ -645,10 +795,15 @@ async function main(): Promise<void> {
 			order,
 			sendModes: SEND_MODES,
 			cpuModes: CPU_MODES,
+			rmemModes: RMEM_MODES,
+			rmemDefault: origRmemDefault,
+			rmemMax: origRmemMax,
+			rmemRaised: raisedBytes,
 		},
 		arms: summaries,
 		waitVsDrop,
 		coresplit,
+		rmem,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -676,6 +831,11 @@ async function main(): Promise<void> {
 			if (r.gap) console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
 			if (r.pipeCap)
 				console.log(`  ${s.key} r${r.round} ${formatPipeCapLine(r.pipeCap)}`);
+			if (r.skRcvbuf != null) {
+				console.log(
+					`  ${s.key} r${r.round} sk: rcvbuf=${r.skRcvbuf} drops=${r.skDrops ?? "n/a"}`,
+				);
+			}
 		}
 	}
 	const withDrops = summaries.filter((s) => s.droppedPct > 0.05);
@@ -726,7 +886,7 @@ async function main(): Promise<void> {
 				`STOP=${waitVsDrop.stopBucket}`,
 		);
 	}
-	{
+	if (CPU_MODES.includes("split")) {
 		const n = (value: number | null): string =>
 			value == null ? "n/a" : String(Math.round(value));
 		console.log(
@@ -737,6 +897,17 @@ async function main(): Promise<void> {
 				`taskset=${coresplit.tasksetOk} ` +
 				`affinity=${coresplit.affinityOk} htSiblings=${coresplit.htSiblings} ` +
 				`STOP=${coresplit.stopBucket}`,
+		);
+	}
+	if (RMEM_MODES.includes("raised")) {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  rmem: defaultFrameTx=${n(rmem.defaultFrameTxPerSec)} ` +
+				`raisedFrameTx=${n(rmem.raisedFrameTxPerSec)} ` +
+				`ratio=${rmem.ratio == null ? "n/a" : rmem.ratio.toFixed(2)} ` +
+				`defaultSk=${n(rmem.defaultSkRcvbuf)} raisedSk=${n(rmem.raisedSkRcvbuf)} ` +
+				`wrote=${rmem.rmemDefaultWrote} STOP=${rmem.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)

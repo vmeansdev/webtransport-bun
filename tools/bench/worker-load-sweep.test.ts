@@ -3,6 +3,7 @@ import {
 	type ArmSummary,
 	armKey,
 	classifyCoresplit,
+	classifyRmem,
 	classifyWaitVsDrop,
 	collapseFor,
 	generatorLimitedRates,
@@ -266,6 +267,7 @@ function withFrameTx(
 	key: string,
 	frameTxDatagramPerSec: number,
 	offeredPerSec: number,
+	skRcvbuf: number | null = 212_992,
 ): ArmSummary {
 	return {
 		...arm({
@@ -315,6 +317,8 @@ function withFrameTx(
 				clientTaskset: "",
 				clientCpusAllowed: [],
 				clientAffinityOk: true,
+				skRcvbuf,
+				skDrops: 0,
 			},
 		],
 	};
@@ -423,6 +427,62 @@ describe("classifyCoresplit", () => {
 			classifyCoresplit({
 				...base,
 				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), split],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+});
+
+describe("classifyRmem", () => {
+	const base = {
+		rmemDefaultWrote: true,
+		controlRmemDefault: 212_992,
+	};
+
+	test("socket grew and frame_tx rose 20% is rmem", () => {
+		expect(
+			classifyRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000, 212_992),
+					withFrameTx("w2@160000@wait@raised", 130_000, 130_000, 8_388_608),
+				],
+			}).stopBucket,
+		).toBe("rmem");
+	});
+
+	test("socket grew but pipe stayed is not-rmem", () => {
+		expect(
+			classifyRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000, 212_992),
+					withFrameTx("w2@160000@wait@raised", 106_000, 106_000, 8_388_608),
+				],
+			}).stopBucket,
+		).toBe("not-rmem");
+	});
+
+	test("sysctl write failed is incomplete", () => {
+		expect(
+			classifyRmem({
+				...base,
+				rmemDefaultWrote: false,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000, 212_992),
+					withFrameTx("w2@160000@wait@raised", 130_000, 130_000, 8_388_608),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("raised socket not 4x default is incomplete", () => {
+		expect(
+			classifyRmem({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000, 212_992),
+					withFrameTx("w2@160000@wait@raised", 130_000, 130_000, 300_000),
+				],
 			}).stopBucket,
 		).toBe("incomplete");
 	});

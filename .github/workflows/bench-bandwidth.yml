@@ -147,7 +147,8 @@ jobs:
           SWEEP_WORKERS: ${{ github.event.inputs.worker_sweep_workers }}
           SWEEP_CLIENTS: ${{ github.event.inputs.worker_sweep_clients }}
           SWEEP_SEND_MODES: wait
-          SWEEP_CPU_MODES: shared,split
+          SWEEP_CPU_MODES: shared
+          SWEEP_RMEM_MODES: default,raised
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           SWEEP_OUT="$GITHUB_WORKSPACE/.bench-evidence/worker-load-sweep-${{ github.event.inputs.candidate_commit }}.json" \

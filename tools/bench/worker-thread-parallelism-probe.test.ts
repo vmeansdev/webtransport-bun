@@ -16,6 +16,7 @@ import {
 	parseCpuList,
 	parseCpusAllowedListFromStatus,
 	parseLoadClientSentProgress,
+	parseSsUdpSkmem,
 	pickDisjointPhysicalCpus,
 	parseProcNetstatUdp,
 	parseProcSnmpUdp,
@@ -89,6 +90,8 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 		clientTaskset: "",
 		clientCpusAllowed: [],
 		clientAffinityOk: true,
+		skRcvbuf: null,
+		skDrops: null,
 		workerProof: {
 			configured: 2,
 			availableParallelism: 10,
@@ -834,5 +837,24 @@ describe("cpu list helpers", () => {
 				3: [3],
 			}),
 		).toEqual([0, 1]);
+	});
+});
+
+describe("parseSsUdpSkmem", () => {
+	const sample = [
+		"State Recv-Q Send-Q Local Address:Port Peer Address:Port",
+		"UNCONN 0 0 127.0.0.1:50110 0.0.0.0:*",
+		"\t skmem:(r0,rb212992,t0,tb212992,f0,w0,o0,bl0,d12)",
+	].join("\n");
+
+	test("reads rb and d for the listen port", () => {
+		expect(parseSsUdpSkmem(sample, 50110)).toEqual({
+			recvbuf: 212_992,
+			drops: 12,
+		});
+	});
+
+	test("returns null for a different port", () => {
+		expect(parseSsUdpSkmem(sample, 50111)).toBeNull();
 	});
 });

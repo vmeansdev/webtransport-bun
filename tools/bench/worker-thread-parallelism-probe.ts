@@ -276,6 +276,8 @@ export type ArmRun = {
 	clientTaskset: string;
 	clientCpusAllowed: number[][];
 	clientAffinityOk: boolean;
+	skRcvbuf: number | null;
+	skDrops: number | null;
 };
 
 export function median(values: number[]): number {
@@ -763,6 +765,36 @@ export function readThreadSiblings(cpu: number): number[] | null {
 	}
 }
 
+export function parseSsUdpSkmem(
+	text: string,
+	port: number,
+): { recvbuf: number; drops: number | null } | null {
+	const lines = text.split("\n");
+	const portRe = new RegExp(`[:\\]]${port}\\b`);
+	for (let i = 0; i < lines.length; i += 1) {
+		if (!portRe.test(lines[i] ?? "")) continue;
+		const block = `${lines[i]}\n${lines[i + 1] ?? ""}\n${lines[i + 2] ?? ""}`;
+		const rb = block.match(/\brb(\d+)/);
+		if (!rb?.[1]) continue;
+		const drops = block.match(/,d(\d+)/);
+		return {
+			recvbuf: Number.parseInt(rb[1], 10),
+			drops: drops?.[1] == null ? null : Number.parseInt(drops[1], 10),
+		};
+	}
+	return null;
+}
+
+export function readSsUdpSkmem(
+	port: number,
+): { recvbuf: number; drops: number | null } | null {
+	const result = spawnSync("ss", ["-uamp", `sport = :${port}`], {
+		encoding: "utf8",
+	});
+	if (result.status !== 0) return null;
+	return parseSsUdpSkmem(`${result.stdout}\n${result.stderr}`, port);
+}
+
 export function classifyPipeCap(input: {
 	frameTxPerSec: number | null;
 	ingestedPerSec: number;
@@ -1095,6 +1127,7 @@ async function runChild(
 		},
 	});
 	await Bun.sleep(BIND_WAIT_MS);
+	const skmem = readSsUdpSkmem(port);
 
 	const perClient = Math.floor(sessions / CLIENTS);
 	const expectedClientCpus = CLIENT_TASKSET ? parseCpuList(CLIENT_TASKSET) : [];
@@ -1315,6 +1348,8 @@ async function runChild(
 		clientTaskset: CLIENT_TASKSET,
 		clientCpusAllowed,
 		clientAffinityOk,
+		skRcvbuf: skmem?.recvbuf ?? null,
+		skDrops: skmem?.drops ?? null,
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);
