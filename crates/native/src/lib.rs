@@ -43,6 +43,7 @@ pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
 pub mod transport_memory;
+pub mod worker_probe;
 pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
@@ -455,6 +456,40 @@ pub fn native_await_probe_snapshot() -> std::collections::HashMap<String, i64> {
         .into_iter()
         .map(|(name, value)| (name.to_string(), value))
         .collect()
+}
+
+/// Throwaway worker-probe snapshot. Do not merge this module to staging.
+#[napi]
+pub fn native_worker_probe_snapshot() -> std::collections::HashMap<String, i64> {
+    worker_probe::record_current_thread_cpu();
+
+    let mut out = std::collections::HashMap::new();
+    out.insert("configuredServerWorkerThreads".to_string(), 2);
+    out.insert(
+        "timingEnabled".to_string(),
+        i64::from(*worker_probe::TIMING_ENABLED),
+    );
+    let per_thread = worker_probe::snapshot();
+    out.insert(
+        "datagramThreads".to_string(),
+        per_thread.iter().filter(|s| s.datagrams > 0).count() as i64,
+    );
+    for sample in per_thread {
+        out.insert(format!("thread:{}", sample.label), sample.datagrams as i64);
+        out.insert(
+            format!("cpuNanos:{}", sample.label),
+            sample.cpu_nanos as i64,
+        );
+        out.insert(
+            format!("rateLimitNanos:{}", sample.label),
+            sample.rate_limit_nanos as i64,
+        );
+        out.insert(
+            format!("rateLimitCalls:{}", sample.label),
+            sample.rate_limit_calls as i64,
+        );
+    }
+    out
 }
 
 #[napi]
@@ -1395,6 +1430,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     return;
                                                                 }
                                                             };
+                                                            worker_probe::record_datagram();
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
