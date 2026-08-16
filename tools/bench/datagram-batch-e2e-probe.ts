@@ -26,13 +26,21 @@
  * "inconclusive" rather than "stop" when the legacy arm was never driven past
  * its own capacity.
  *
+ * Saturation is only that precondition, though — it is not why batching would
+ * fail. So after the measurement rounds the parent runs one deliberately
+ * instrumented round per arm, whose rates are discarded and whose counters are
+ * kept: mean batch fill is what says whether batching had anything to
+ * amortize, and it is what the stop rationale is written from. Those rounds
+ * also prove the two arms ran different code rather than the knob having
+ * silently done nothing.
+ *
  * Usage:
  *   bun tools/bench/datagram-batch-e2e-probe.ts            # parent
  *   bun tools/bench/datagram-batch-e2e-probe.ts --arm N --port P --round R
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -44,6 +52,7 @@ import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/
 import {
 	DIAGNOSTICS_ENV,
 	diagnosticsFailures,
+	GATE_BATCH_SIZE,
 	identityFailures,
 	MIN_MEDIAN_SPEEDUP,
 	makeRng,
@@ -60,6 +69,13 @@ const ARTIFACT_PATH = join(
 	"h7",
 	"datagram-batch-e2e-probe.json",
 );
+const FLOOR_ARTIFACT_PATH = join(
+	ROOT,
+	".release-evidence",
+	"h7",
+	"datagram-delivery-floor.json",
+);
+const DRAIN_UNAVAILABLE = { itemsPerSec: null, source: null };
 const CLIENT_BIN = join(ROOT, "target", "release", "load-client");
 const BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
 const COMMAND = "bun tools/bench/datagram-batch-e2e-probe.ts";
@@ -114,12 +130,42 @@ export type ArmRun = {
 	/** Server-process CPU over the window, as a fraction of one core. */
 	serverCpuCores: number;
 	/**
-	 * Only populated by a deliberately diagnostics-enabled mechanism run, which
-	 * is never the measurement (the parent refuses diagnostics). `meanBatchSize`
-	 * is the number that says whether batching had anything to amortize.
+	 * Populated only by the diagnostics-enabled mechanism rounds, which run the
+	 * instrumented twin and are therefore excluded from the rate comparison.
+	 * `meanBatchSize` is the number that says whether batching had anything to
+	 * amortize, and no throughput figure can substitute for it.
 	 */
 	batchDiagnostics: Record<string, number> | null;
 };
+
+/**
+ * The JS reader's drain rate, read out of the sibling floor artifact rather
+ * than recalled. Returns nulls if that artifact is absent or was produced at a
+ * different commit, in which case the rationale simply omits the gap clause —
+ * an unavailable number is better than a stale one asserted as current.
+ */
+function readFloorDrainRate(): {
+	itemsPerSec: number | null;
+	source: string | null;
+} {
+	try {
+		const raw = readFileSync(FLOOR_ARTIFACT_PATH, "utf8");
+		const floor = JSON.parse(raw) as {
+			head?: string;
+			arms?: { name?: string; median?: number }[];
+		};
+		const gateArm = floor.arms?.find(
+			(a) => a.name === `generator-batch-${GATE_BATCH_SIZE}`,
+		);
+		if (typeof gateArm?.median !== "number") return DRAIN_UNAVAILABLE;
+		return {
+			itemsPerSec: gateArm.median,
+			source: `floor bench batch ${GATE_BATCH_SIZE} median @ ${(floor.head ?? "unknown").slice(0, 7)}`,
+		};
+	} catch {
+		return DRAIN_UNAVAILABLE;
+	}
+}
 
 function gitOutput(args: string[]): string {
 	const result = spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
@@ -273,6 +319,7 @@ async function runOne(
 	arm: number,
 	round: number,
 	port: number,
+	withDiagnostics = false,
 ): Promise<ArmRun> {
 	const child = Bun.spawn(
 		[
@@ -293,6 +340,10 @@ async function runOne(
 				...process.env,
 				[BATCH_ENV]: String(arm),
 				WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1",
+				// Measurement rounds run the production loop. Only the mechanism
+				// round selects the instrumented twin, and its rate is never fed
+				// into the comparison.
+				[DIAGNOSTICS_ENV]: withDiagnostics ? "1" : "",
 			},
 		},
 	);
@@ -313,7 +364,71 @@ async function runOne(
 	}
 }
 
-export function summarizeProbe(runs: ArmRun[]) {
+/**
+ * What the mechanism round measured, and what the JS floor bench says the
+ * reader can drain. Both are measurements, not recalled constants: the batch
+ * fill comes from a diagnostics-enabled round of this same run, and the drain
+ * rate is read out of the sibling floor artifact with its commit recorded. A
+ * stop rationale that cited either from memory would be prose asserting itself
+ * as evidence, which is the thing this artifact exists to avoid.
+ */
+export type MechanismContext = {
+	meanBatchSize: number | null;
+	batchReadCalls: number | null;
+	materializedItems: number | null;
+	legacyReadCalls: number | null;
+	drainItemsPerSec: number | null;
+	drainSource: string | null;
+};
+
+/**
+ * Why a stop is a stop, in the terms that can falsify it.
+ *
+ * Saturation is a precondition for the comparison to be valid, not the reason
+ * batching failed, so it does not belong in the rationale. The reason is that
+ * batching had nothing to amortize: the batch read returned `meanBatchSize`
+ * items per call, which folds only `1 - calls/items` of the N-API crossings,
+ * and no call reduction below the reference ratio can produce it. Underneath
+ * that is the precondition batching actually needs — a backlog at the JS
+ * reader — which cannot exist while the reader drains orders of magnitude
+ * faster than datagrams arrive.
+ */
+function stopRationale(
+	ratio: number,
+	arrivalPerSec: number,
+	mechanism: MechanismContext | undefined,
+): string {
+	const parts = [
+		`the real receive path shows ${ratio.toFixed(4)}x against a ${MIN_MEDIAN_SPEEDUP}x reference`,
+	];
+	if (
+		mechanism?.meanBatchSize != null &&
+		mechanism.batchReadCalls != null &&
+		mechanism.materializedItems != null &&
+		mechanism.materializedItems > 0
+	) {
+		const reduction =
+			1 - mechanism.batchReadCalls / mechanism.materializedItems;
+		parts.push(
+			`because batching had nothing to amortize: mean batch fill was ` +
+				`${mechanism.meanBatchSize.toFixed(3)}, so ${mechanism.batchReadCalls.toLocaleString()} ` +
+				`batch reads delivered ${mechanism.materializedItems.toLocaleString()} datagrams — a ` +
+				`${(reduction * 100).toFixed(1)}% reduction in N-API calls, arithmetically ` +
+				`incapable of ${MIN_MEDIAN_SPEEDUP}x`,
+		);
+	}
+	if (mechanism?.drainItemsPerSec != null && arrivalPerSec > 0) {
+		parts.push(
+			`the precondition for a batch to fill is a backlog at the JS reader, and ` +
+				`there is none: the reader drains ~${Math.round(mechanism.drainItemsPerSec).toLocaleString()} items/s ` +
+				`(${mechanism.drainSource ?? "floor bench"}) against ~${Math.round(arrivalPerSec).toLocaleString()}/s arriving, a ` +
+				`~${Math.round(mechanism.drainItemsPerSec / arrivalPerSec)}x gap`,
+		);
+	}
+	return parts.join("; ");
+}
+
+export function summarizeProbe(runs: ArmRun[], mechanism?: MechanismContext) {
 	const byArm = ARMS.map((arm) => {
 		const armRuns = runs.filter((r) => r.arm === arm);
 		const rates = armRuns.map((r) => r.receivedPerSec);
@@ -354,7 +469,11 @@ export function summarizeProbe(runs: ArmRun[]) {
 		rationale = `the real receive path shows >= ${MIN_MEDIAN_SPEEDUP}x`;
 	} else {
 		verdict = "stop";
-		rationale = `the real receive path shows < ${MIN_MEDIAN_SPEEDUP}x with the receiver demonstrably saturated`;
+		rationale = stopRationale(
+			ratio,
+			legacy?.medianReceivedPerSec ?? 0,
+			mechanism,
+		);
 	}
 	return { byArm, ratio, verdict, rationale };
 }
@@ -404,7 +523,37 @@ async function runParent(): Promise<void> {
 		}
 	}
 
-	const summary = summarizeProbe(runs);
+	// Mechanism rounds, one per arm, deliberately instrumented. Their RATES are
+	// discarded — the instrumented twin is a different loop — but their counters
+	// are the only way to say why the comparison came out as it did, and they
+	// also prove the two arms really ran different code rather than the knob
+	// having silently done nothing.
+	const mechanismRuns: ArmRun[] = [];
+	for (const arm of ARMS) {
+		console.log(`e2e-probe: mechanism round arm batch=${arm} ...`);
+		mechanismRuns.push(
+			await runOne(
+				arm,
+				0,
+				BASE_PORT + runs.length + mechanismRuns.length,
+				true,
+			),
+		);
+	}
+	const batchedMechanism = mechanismRuns.find(
+		(r) => r.arm === 64,
+	)?.batchDiagnostics;
+	const drain = readFloorDrainRate();
+	const mechanism: MechanismContext = {
+		meanBatchSize: batchedMechanism?.meanBatchSize ?? null,
+		batchReadCalls: batchedMechanism?.batchReadCalls ?? null,
+		materializedItems: batchedMechanism?.materializedItems ?? null,
+		legacyReadCalls: batchedMechanism?.legacyReadCalls ?? null,
+		drainItemsPerSec: drain.itemsPerSec,
+		drainSource: drain.source,
+	};
+
+	const summary = summarizeProbe(runs, mechanism);
 	const failures = [
 		...diagnosticsFailures(diagnostics),
 		...identityFailures(identity),
@@ -442,6 +591,11 @@ async function runParent(): Promise<void> {
 		},
 		ratio: summary.ratio,
 		arms: summary.byArm,
+		/**
+		 * Instrumented rounds. Rates here are NOT comparable to the arms above —
+		 * they ran the counter-carrying twin — and are excluded from the ratio.
+		 */
+		mechanism: { ...mechanism, runs: mechanismRuns },
 		failures,
 	};
 	mkdirSync(dirname(ARTIFACT_PATH), { recursive: true });

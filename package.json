@@ -44,6 +44,7 @@
 		"bench:stream": "bun tools/bench/stream-throughput.ts",
 		"bench:baseline": "bun tools/bench/baseline.ts",
 		"bench:h7-floor": "bun tools/bench/datagram-delivery-floor.ts",
+		"bench:h7-e2e-probe": "bun tools/bench/datagram-batch-e2e-probe.ts",
 		"bench:regress": "bun tools/bench/bench-regress.ts",
 		"fuzz:release-smoke": "bun tools/fuzz/release-smoke.ts",
 		"release:npm": "node -e \"console.error('Direct npm publishing is disabled. Use the GitHub Actions publish workflow from a successful release run.'); process.exit(1)\""
