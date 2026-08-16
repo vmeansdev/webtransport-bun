@@ -840,6 +840,16 @@ async function runChild(
 		WARMUP_SEC * 1_000,
 		MEASURE_SEC * 1_000,
 	);
+	const frameTxDatagramPerSec = sumWindowFrameTxPerSec(
+		stdout,
+		WARMUP_SEC * 1_000,
+		MEASURE_SEC * 1_000,
+	);
+	const udpTxPerSec = sumWindowUdpTxPerSec(
+		stdout,
+		WARMUP_SEC * 1_000,
+		MEASURE_SEC * 1_000,
+	);
 	const packetsLostDelta = deltaOrNull(
 		stats0?.packetsLost,
 		stats1?.packetsLost,
@@ -861,6 +871,8 @@ async function runChild(
 		packetsReceivedDelta,
 		udpInErrorsDelta,
 		udpRcvbufErrorsDelta,
+		frameTxDatagramPerSec,
+		udpTxPerSec,
 		windowSec: windowMs / 1000,
 	});
 
