@@ -24,6 +24,11 @@ pub struct ServerMetricsSnapshot {
     pub datagrams_in: f64,
     pub datagrams_out: f64,
     pub datagrams_dropped: f64,
+    /// Present on native snapshots. Omit on WASM (do not zero).
+    pub datagrams_dropped_rate_limited: Option<f64>,
+    pub datagrams_dropped_too_large: Option<f64>,
+    pub datagrams_dropped_queue_global: Option<f64>,
+    pub datagrams_dropped_queue_session: Option<f64>,
     pub queued_bytes_global: f64,
     pub backpressure_wait_count: f64,
     pub backpressure_timeout_count: f64,

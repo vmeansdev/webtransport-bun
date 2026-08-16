@@ -55,11 +55,16 @@ pub mod zero_rtt;
 /// queue: per-datagram N-API methods used to `RUNTIME.spawn` from outside this
 /// runtime, and a busy worker only drains that queue one task per ~200µs of
 /// work. Those hops are gone (`read_datagram`, `send_datagram`,
-/// `discard_datagram`); two workers is leftover headroom, not the fix. Two
-/// workers alone still dropped 48% at 80k offered on a 4-vCPU host while the
-/// hops were in place. Higher counts measured worse (macOS: 89k/s at two,
-/// 82k/s at four, 48k/s at ten), so this is a fixed constant rather than
-/// `available_parallelism()`, and `scripts/check-doc-truth.ts` pins it.
+/// `discard_datagram`); hop removal is the cliff fix, two workers is leftover
+/// headroom. After hops-gone, two workers at 80k offered delivered with 0% JS
+/// drop on the Linux heavy runner (run 31951922171). The leftover drop% at
+/// 160k offered on that host is not injection-queue starvation: delivery is
+/// not pinned near 5,300/s, and datagram rate-limit is not the binder.
+/// Ingest drop reasons are counted separately so a later artifact can name
+/// session queue vs global queue vs size. Higher worker counts measured worse
+/// (macOS: 89k/s at two, 82k/s at four, 48k/s at ten), so this is a fixed
+/// constant rather than `available_parallelism()`, and
+/// `scripts/check-doc-truth.ts` pins it.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1361,23 +1366,29 @@ pub(crate) fn spawn_wtransport_server(
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
-                                                                m_dgram.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                                m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::RateLimited);
                                                                 continue;
                                                             }
                                                             if dgram.len() > lim_dgram.max_datagram_size {
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                                m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::TooLarge);
                                                                 continue;
                                                             }
                                                             let sz = dgram.len() as u64;
-                                                            if !m_dgram.try_reserve_queued_bytes_with_session(
+                                                            match m_dgram.try_reserve_queued_bytes_with_session(
                                                                 &sm_dgram.queued_bytes,
                                                                 sz,
                                                                 lim_dgram.max_queued_bytes_global,
                                                                 lim_dgram.max_queued_bytes_per_session,
                                                             ) {
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                                                                continue;
+                                                                crate::server_metrics::ReserveQueuedBytes::Ok => {}
+                                                                crate::server_metrics::ReserveQueuedBytes::Global => {
+                                                                    m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::QueueGlobal);
+                                                                    continue;
+                                                                }
+                                                                crate::server_metrics::ReserveQueuedBytes::Session => {
+                                                                    m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::QueueSession);
+                                                                    continue;
+                                                                }
                                                             }
                                                             let reservation = crate::session_registry::DatagramReservation::new(
                                                                 std::sync::Arc::clone(&sm_dgram),

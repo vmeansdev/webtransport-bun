@@ -17,7 +17,11 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | streamTasksActive | number | Internal stream tasks |
 | datagramsIn | number | Datagrams received |
 | datagramsOut | number | Datagrams sent |
-| datagramsDropped | number | Datagrams dropped (oversize, rate limit, or budget) |
+| datagramsDropped | number | Inbound datagrams dropped at ingest (oversize, datagram rate-limit, or queued-bytes budget). Native identity: this equals the four reason fields below when those fields are present. |
+| datagramsDroppedTooLarge | number? | Native ingest: datagram larger than `maxDatagramSize`. Omitted on WASM. |
+| datagramsDroppedQueueSession | number? | Native ingest: per-session queued-bytes budget. Omitted on WASM. |
+| datagramsDroppedQueueGlobal | number? | Native ingest: global queued-bytes budget. Omitted on WASM. |
+| datagramsDroppedRateLimited | number? | Native ingest: per-IP datagram ingress rate limit. Also counted in `rateLimitedCount`. Omitted on WASM. |
 | queuedBytesGlobal | number | Bytes queued globally |
 | backpressureWaitCount | number | Times server session send waited on backpressure (incremented on timeout) |
 | backpressureTimeoutCount | number | Times server session send_datagram timed out (E_BACKPRESSURE_TIMEOUT) |
@@ -52,13 +56,22 @@ Use `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket
 
 ## Drop reasons (datagramsDropped)
 
-The single `datagramsDropped` counter aggregates:
+Native snapshots expose four optional ingest-reason fields. When they are
+present:
 
-- **Oversize**: Datagram > maxDatagramSize
-- **Budget**: Global or per-session queued-bytes budget exceeded
-- **Rate limit**: Per-IP datagram rate exceeded (future)
+`datagramsDropped == datagramsDroppedTooLarge + datagramsDroppedQueueSession + datagramsDroppedQueueGlobal + datagramsDroppedRateLimited`
 
-For finer-grained attribution, monitor `rateLimitedCount` and `limitExceededCount` alongside `datagramsDropped`.
+- **datagramsDroppedTooLarge**: datagram larger than `maxDatagramSize`
+- **datagramsDroppedQueueSession**: per-session queued-bytes budget
+- **datagramsDroppedQueueGlobal**: global queued-bytes budget
+- **datagramsDroppedRateLimited**: per-IP datagram ingress rate limit (also counted in `rateLimitedCount`)
+
+WASM omits the reason fields. Do not treat omitted-or-undefined reasons as
+zero, and do not use mixed `rateLimitedCount` (handshakes + streams + datagrams)
+to attribute datagram drops. Prometheus `datagrams_dropped` remains the sum.
+
+Send-path queued-bytes waits time out as `E_BACKPRESSURE_TIMEOUT` and do **not**
+increment `datagramsDropped`.
 
 ## Structured logs
 
