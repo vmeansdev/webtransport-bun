@@ -287,6 +287,90 @@ export function dirtyPaths(porcelain: string): string[] {
 		);
 }
 
+export const SENT_PROGRESS_RE = /^load-client: t_ms=(\d+) sent=(\d+)\s*$/gm;
+
+export type SentProgressSample = { tMs: number; sent: number };
+
+export function parseLoadClientSentProgress(
+	text: string,
+): SentProgressSample[] {
+	const samples: SentProgressSample[] = [];
+	for (const match of text.matchAll(SENT_PROGRESS_RE)) {
+		samples.push({
+			tMs: Number.parseInt(match[1] ?? "0", 10),
+			sent: Number.parseInt(match[2] ?? "0", 10),
+		});
+	}
+	return samples;
+}
+
+export function windowSentDelta(
+	samples: readonly SentProgressSample[],
+	warmupMs: number,
+	measureMs: number,
+): { sent0: number; sent1: number; t0: number; t1: number } | null {
+	const endMs = warmupMs + measureMs;
+	let t0Sample: SentProgressSample | null = null;
+	let t1Sample: SentProgressSample | null = null;
+	for (const sample of samples) {
+		if (sample.tMs <= warmupMs) t0Sample = sample;
+		if (sample.tMs <= endMs) t1Sample = sample;
+	}
+	if (!t0Sample || !t1Sample) return null;
+	if (t1Sample.tMs <= t0Sample.tMs) return null;
+	return {
+		sent0: t0Sample.sent,
+		sent1: t1Sample.sent,
+		t0: t0Sample.tMs,
+		t1: t1Sample.tMs,
+	};
+}
+
+export function procRow(
+	text: string,
+	section: string,
+	keys: readonly string[],
+): Record<string, number> | null {
+	const lines = text.split("\n");
+	const prefix = `${section}:`;
+	const headerIdx = lines.findIndex((line) => line.startsWith(prefix));
+	if (headerIdx < 0) return null;
+	const valueLine = lines[headerIdx + 1];
+	if (!valueLine?.startsWith(prefix)) return null;
+	const headerKeys = (lines[headerIdx] ?? "").trim().split(/\s+/).slice(1);
+	const vals = valueLine.trim().split(/\s+/).slice(1);
+	if (headerKeys.length !== vals.length) return null;
+	const out: Record<string, number> = {};
+	for (const key of keys) {
+		const i = headerKeys.indexOf(key);
+		if (i < 0) return null;
+		out[key] = Number.parseInt(vals[i] ?? "0", 10);
+	}
+	return out;
+}
+
+export function parseProcSnmpUdp(
+	text: string,
+): { InDatagrams: number; InErrors: number } | null {
+	const row = procRow(text, "Udp", ["InDatagrams", "InErrors"]);
+	if (!row) return null;
+	return {
+		InDatagrams: row.InDatagrams ?? 0,
+		InErrors: row.InErrors ?? 0,
+	};
+}
+
+export function parseProcNetstatUdp(
+	text: string,
+): { RcvbufErrors: number; SndbufErrors: number } | null {
+	const row = procRow(text, "Udp", ["RcvbufErrors", "SndbufErrors"]);
+	if (!row) return null;
+	return {
+		RcvbufErrors: row.RcvbufErrors ?? 0,
+		SndbufErrors: row.SndbufErrors ?? 0,
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Child: one arm, one round, one fresh process (the knob is read at runtime init)
 // ---------------------------------------------------------------------------

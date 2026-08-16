@@ -8,10 +8,15 @@ import {
 	dirtyPaths,
 	makeRng,
 	median,
+	parseLoadClientSentProgress,
+	parseProcNetstatUdp,
+	parseProcSnmpUdp,
+	procRow,
 	proofFailures,
 	sessionArms,
 	shuffled,
 	summarizeSweep,
+	windowSentDelta,
 	workerArms,
 } from "./worker-thread-parallelism-probe.ts";
 
@@ -186,6 +191,121 @@ describe("proofFailures", () => {
 	test("refuses when the addon has no worker probe at all", () => {
 		const failures = proofFailures([summary({ configuredWorkers: null })]);
 		expect(failures[0]).toContain("no worker-probe snapshot");
+	});
+});
+
+describe("parseLoadClientSentProgress", () => {
+	test("collects load-client progress lines and ignores the summary line", () => {
+		const stdout = [
+			"load-client: t_ms=0 sent=0",
+			"load-client: t_ms=1000 sent=50000",
+			"load-client: t_ms=2000 sent=100000",
+			"datagrams sent=150000 err=0",
+		].join("\n");
+		expect(parseLoadClientSentProgress(stdout)).toEqual([
+			{ tMs: 0, sent: 0 },
+			{ tMs: 1000, sent: 50_000 },
+			{ tMs: 2000, sent: 100_000 },
+		]);
+	});
+});
+
+describe("windowSentDelta", () => {
+	test("uses the last sample at-or-before warmup and warmup+measure", () => {
+		const samples = parseLoadClientSentProgress(
+			[
+				"load-client: t_ms=0 sent=0",
+				"load-client: t_ms=1000 sent=10000",
+				"load-client: t_ms=2000 sent=20000",
+				"load-client: t_ms=3000 sent=30000",
+				"load-client: t_ms=4000 sent=40000",
+				"load-client: t_ms=5000 sent=50000",
+				"load-client: t_ms=6000 sent=60000",
+				"load-client: t_ms=7000 sent=70000",
+				"load-client: t_ms=8000 sent=80000",
+				"load-client: t_ms=9000 sent=90000",
+				"load-client: t_ms=10000 sent=100000",
+				"load-client: t_ms=11000 sent=110000",
+				"load-client: t_ms=12000 sent=120000",
+				"load-client: t_ms=13000 sent=130000",
+				"load-client: t_ms=14000 sent=140000",
+				"load-client: t_ms=15000 sent=150000",
+				"load-client: t_ms=16000 sent=160000",
+				"load-client: t_ms=17000 sent=170000",
+				"load-client: t_ms=18000 sent=180000",
+				"load-client: t_ms=19000 sent=190000",
+				"load-client: t_ms=20000 sent=200000",
+				"load-client: t_ms=21000 sent=210000",
+				"load-client: t_ms=22000 sent=220000",
+				"load-client: t_ms=23000 sent=230000",
+				"load-client: t_ms=24000 sent=240000",
+				"load-client: t_ms=25000 sent=250000",
+			].join("\n"),
+		);
+		expect(windowSentDelta(samples, 5000, 15000)).toEqual({
+			sent0: 50_000,
+			sent1: 200_000,
+			t0: 5000,
+			t1: 20_000,
+		});
+	});
+
+	test("returns null when the measure boundary does not advance past warmup", () => {
+		const samples = parseLoadClientSentProgress(
+			"load-client: t_ms=0 sent=0\nload-client: t_ms=1000 sent=1000",
+		);
+		expect(windowSentDelta(samples, 5000, 15_000)).toBeNull();
+	});
+});
+
+describe("procRow", () => {
+	const snmp = [
+		"Ip: Forwarding DefaultTTL",
+		"Ip: 2 64",
+		"Udp: InDatagrams NoPorts InErrors OutDatagrams",
+		"Udp: 100 200 300 400",
+	].join("\n");
+
+	test("maps header keys to the following values line", () => {
+		expect(procRow(snmp, "Udp", ["InDatagrams", "InErrors"])).toEqual({
+			InDatagrams: 100,
+			InErrors: 300,
+		});
+	});
+
+	test("returns null when the values line is missing or column counts differ", () => {
+		expect(procRow("Udp: InDatagrams\n", "Udp", ["InDatagrams"])).toBeNull();
+		expect(
+			procRow("Udp: InDatagrams InErrors\nUdp: 1\n", "Udp", ["InDatagrams"]),
+		).toBeNull();
+	});
+});
+
+describe("parseProcSnmpUdp", () => {
+	test("reads InDatagrams and InErrors from /proc/net/snmp", () => {
+		const text = [
+			"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors",
+			"Udp: 1234567 89 12 3456789 0 0",
+		].join("\n");
+		expect(parseProcSnmpUdp(text)).toEqual({
+			InDatagrams: 1_234_567,
+			InErrors: 12,
+		});
+	});
+});
+
+describe("parseProcNetstatUdp", () => {
+	test("reads RcvbufErrors and SndbufErrors from /proc/net/netstat", () => {
+		const text = [
+			"UdpLite: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors",
+			"UdpLite: 1 2 3 4 5 6",
+			"Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors",
+			"Udp: 10 20 30 40 500 600 0 0 0",
+		].join("\n");
+		expect(parseProcNetstatUdp(text)).toEqual({
+			RcvbufErrors: 500,
+			SndbufErrors: 600,
+		});
 	});
 });
 
