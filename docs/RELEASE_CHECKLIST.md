@@ -44,7 +44,7 @@ Do not start the 24h or 72h campaign until the exact release candidate commit is
 Campaign requirements:
 
 1. Use `workflow_dispatch` on `soak-long` with the exact `candidate_commit`, `campaign_seed`, and `continuity_token` for every segment.
-2. On GitHub-hosted runners, use `segment_count=5` for 24h and `segment_count=15` for 72h, dispatching indices in order. Each 4.8h workload leaves setup, cleanup, and artifact-upload headroom under GitHub's hard 6h job limit. On self-hosted runners use `segment_count=4` or `12` respectively. The workflow resolves each predecessor artifact and `finalStateHash` itself; a missing or invalid predecessor stops the next segment.
+2. On GitHub-hosted runners, use `segment_count=5` for 24h and `segment_count=15` for 72h, dispatching indices in order. Each 4.8h workload leaves setup, cleanup, and artifact-upload headroom under GitHub's hard 6h job limit. Self-hosted 24h and 72h campaigns use segment_count=1: the workflow maps both durations to a single unsegmented run and refuses any other segment count. The workflow resolves each predecessor artifact and `finalStateHash` itself; a missing or invalid predecessor stops the next segment.
 3. Keep the same Bun, Rust, resolved CC/CXX paths and versions, and checkout commit for the whole chain. The harness records them and aggregation rejects drift.
 4. The final segment automatically downloads all prior artifacts for that candidate and performs mandatory aggregation. No manual side-loaded directory is accepted by the release workflow. For forensic local re-verification only, run `bun tools/load/soak-addon.ts aggregate /path/to/segment-artifacts`.
 5. Aggregation is release-blocking. It rejects:
@@ -60,7 +60,7 @@ Campaign requirements:
 Self-hosted runner requirements:
 
 1. Linux x64 runner tagged `soak` with stable `clang` or `gcc-10+`, exact release-policy Bun and Rust versions, `openssl`, GitHub CLI (`gh`), `jq`, and `unzip`, plus enough headroom for the configured session/datagram/stream profile.
-2. The workflow uses bounded 4x6h or 12x6h segments on self-hosted runners. Each segment must produce the same tamper-evident hash-chained JSON/CSV artifact set, and the final aggregate is mandatory.
+2. Self-hosted 24h and 72h campaigns run as one unsegmented job (`segment_count=1`) with the job timeout raised to match. The single segment must still produce the same tamper-evident hash-chained JSON/CSV artifact set, and its aggregate is mandatory.
 
 Workflow artifact naming contract:
 
@@ -79,6 +79,32 @@ What the long-run harness now proves per segment:
 Retain the segment JSON, CSV, stderr/stdout logs, and aggregate JSON in the release evidence bundle or release-blocking issue.
 
 Retain soak artifacts and link them in release notes (or a release-blocking issue) for audit.
+
+## H7 hosted closure lane
+
+The 2-hour `soak-long` mode closes the H7 batched-datagram-delivery claim. It is
+an addition to the table above, not a discount on it: H7 evidence supplements the
+routine/RC/stable soak policy and does not replace the 24h/72h release soak. A
+stable cut still needs its mandatory 24h campaign.
+
+| Dispatch input | Required value |
+|----------------|----------------|
+| workflow ref | the immutable tag `refs/tags/h7-batch-delivery-<candidate-sha>` |
+| `duration_hours` | duration_hours=2 |
+| `runner_type` | runner_type=self-hosted |
+| `runner_mode` | runner_mode=dedicated |
+| `segment_index` / `segment_count` | 1 of segment_count=1 |
+| `datagram_batch` | datagram_batch=64 |
+| `rss_ceiling_mb` | rss_ceiling_mb=1750 |
+| `committed_abort_mb` | 2200 |
+| `heap_debug` | 0 |
+
+1. Dispatch from the candidate tag itself, never from a branch. `scripts/validate-soak-inputs.sh` re-derives the tag suffix, the workflow SHA, and the checked-out HEAD, and rejects the run unless all three equal `candidate_commit` and the whole input tuple matches exactly.
+2. The workload is preregistered and capacity-independent: runner_profile=h7-fixed-large, sessions=500, datagrams_per_sec=500, streams_per_sec=5. Shared-mode halving and the small/medium downscale ladder are both bypassed on this lane.
+3. The runner must provide at least 5 CPUs and 8 GiB of memory. An under-capacity runner fails closed rather than downscaling the load — a smaller load is not acceptable H7 evidence, so the job must fail instead of silently producing evidence for a different workload.
+4. The `rss_ceiling_mb` input may only tighten the harness default `max(1024, sessions * 3.5)`. At the fixed 500-session profile that default is exactly 1750, so the H7 ceiling resolves to 1750 while smaller lanes keep 1024.
+5. Find the run by its unique display title `soak-long-<campaign_seed>` together with the candidate SHA, then download the segment and aggregate artifacts by that exact immutable run ID rather than by name alone.
+6. Acceptance is fail-closed re-verification, not a green checkmark: run `bun tools/load/soak-addon.ts verify-h7-hosted <aggregate.json> <segment.json> --sha <candidate-sha> --batch 64 --rss-ceil-mb 1750 --duration-seconds 7200 --seed <campaign_seed> --continuity-token <token> --workflow-ref refs/tags/h7-batch-delivery-<candidate-sha>`. It re-derives the aggregate from its segment and pins runner type, runner mode, profile, rates, thresholds, debug knobs, and the resolved delivery knobs.
 
 ## Evidence links (auditable)
 

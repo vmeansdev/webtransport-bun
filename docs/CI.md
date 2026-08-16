@@ -60,7 +60,35 @@ Test log hygiene:
 1. Build native addon + install deps
 2. Run W3C facade parity suite (`bun run test:parity`)
 
-**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/24h/72h) — trigger via workflow_dispatch; each run retains `soak-artifacts-seg-*.json`/CSV plus logs, and the final segment emits the validated `.release-evidence/soak-aggregate-<duration>h.json` campaign record.
+**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/2h/24h/72h) — trigger via workflow_dispatch; each run retains `soak-artifacts-seg-*.json`/CSV plus logs, and the final segment emits the validated `.release-evidence/soak-aggregate-<duration>h.json` campaign record.
+
+#### H7 hosted closure lane
+
+The 2-hour mode exists for one purpose: closing the H7 batched-datagram-delivery
+claim on a hosted runner under a fixed, preregistered workload. Dispatch it from
+the immutable tag `refs/tags/h7-batch-delivery-<candidate-sha>` — never a mutable
+branch — with `duration_hours=2`, `runner_type=self-hosted`,
+`runner_mode=dedicated`, `segment_index=1`, `segment_count=1`,
+`datagram_batch=64`, `rss_ceiling_mb=1750`, `committed_abort_mb=2200`, and
+`heap_debug=0`. `scripts/validate-soak-inputs.sh` pins that whole tuple and
+rejects any other combination on an H7 tag. The run appears in Actions as
+`soak-long-<campaign_seed>`, so pick a campaign seed unique to the attempt and
+use it to find the run.
+
+The workload is fixed rather than capacity-derived: `runner_profile=h7-fixed-large`,
+`sessions=500`, `datagrams_per_sec=500`, `streams_per_sec=5`, with no shared-mode
+halving. The runner must provide at least 5 CPUs and 8 GiB of memory; an
+under-capacity runner fails closed rather than downscaling the load, because a
+downscaled run is evidence for a workload the claim does not name. The dispatched
+`rss_ceiling_mb` may only tighten the harness default `max(1024, sessions * 3.5)`,
+which at 500 sessions is exactly 1750, so H7 keeps its ceiling while smaller
+lanes stay at 1024.
+
+Acceptance is not "the run was green". Download the segment and aggregate JSON by
+that run's immutable ID and re-verify them with the fail-closed
+`bun tools/load/soak-addon.ts verify-h7-hosted` mode against the same candidate
+SHA and the same workload tuple. This lane supplements the release soak policy in
+docs/RELEASE_CHECKLIST.md: it does not replace the 24h/72h release soak.
 
 ### release.yml (tag push `v*`, workflow_dispatch)
 
