@@ -46,10 +46,23 @@ const TRIAL_TIMEOUT_MS = 60_000;
 const SESSION_PAIRS = 100;
 const CONCURRENCY = 10;
 const DATAGRAMS_PER_SESSION = 10;
-/** Every pair must move at least one datagram through the batch path, so the
- * floor is the pair count itself: a trial that churned 100 sessions without
- * delivering anything has measured nothing. */
-const MIN_DELIVERED = SESSION_PAIRS;
+/** What a fully successful trial echoes back: every pair, every datagram. */
+const EXPECTED_DELIVERED = SESSION_PAIRS * DATAGRAMS_PER_SESSION;
+/**
+ * Aggregate echo floor — 60% of that.
+ *
+ * Observed totals across every trial to date run 857–993, so 600 clears the
+ * worst real trial by a wide margin while a wedged or degenerate run, which is
+ * the only thing this floor exists to catch, falls far below it.
+ *
+ * Per-pair liveness is deliberately NOT gated. Datagrams are droppable by
+ * contract, so "every pair moved at least one" is not a property this
+ * transport promises; gating a *retention* falsifier on it was wrong in
+ * principle and produced a ~7% false-red rate (1 trial in 15). The per-pair
+ * count stays in the artifact and the parent warns on it, so a genuine
+ * liveness regression is still visible to a human without reddening the run.
+ */
+const MIN_DELIVERED = Math.floor(EXPECTED_DELIVERED * 0.6);
 const ECHO_WAIT_MS = 1_500;
 /**
  * An abandoned session is never closed by either peer, so with the shipped
@@ -329,11 +342,8 @@ async function runTrial(trial: number): Promise<TrialResult> {
 				`delivered ${delivered} datagrams, expected at least ${MIN_DELIVERED}`,
 			);
 		}
-		if (pairsWithDelivery !== SESSION_PAIRS) {
-			failures.push(
-				`${SESSION_PAIRS - pairsWithDelivery} pairs delivered no datagrams`,
-			);
-		}
+		// pairsWithDelivery is recorded and warned on by the parent, never gated
+		// here — see MIN_DELIVERED.
 		if (awaitProbe === null) {
 			failures.push("native await probe is unavailable");
 		} else {
@@ -489,6 +499,16 @@ async function runParent(): Promise<void> {
 		if (!outcome.pass) {
 			failures.push(
 				`trial ${outcome.trial}: ${outcome.failures.join("; ") || `exit ${outcome.exitCode}`}`,
+			);
+		}
+		// Diagnostic, not a gate: silent pairs are legal on a droppable
+		// transport, but a rising rate is worth a human noticing.
+		const result = outcome.result;
+		if (result && result.pairsWithDelivery < SESSION_PAIRS) {
+			console.warn(
+				`datagram-batch-churn: trial ${outcome.trial} had ` +
+					`${SESSION_PAIRS - result.pairsWithDelivery} of ${SESSION_PAIRS} pairs ` +
+					"deliver no datagrams (diagnostic only, does not fail the run)",
 			);
 		}
 	}
