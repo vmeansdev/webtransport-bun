@@ -40,6 +40,10 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 			rateLimited: 0,
 			backpressureWait: 0,
 			backpressureTimeout: 0,
+			datagramsDroppedTooLarge: 0,
+			datagramsDroppedQueueSession: 0,
+			datagramsDroppedQueueGlobal: 0,
+			datagramsDroppedRateLimited: 0,
 		},
 		serverCpuCores: 2.1,
 		workerProof: {

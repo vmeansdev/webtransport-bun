@@ -200,6 +200,10 @@ export type ArmRun = {
 		rateLimited: number;
 		backpressureWait: number;
 		backpressureTimeout: number;
+		datagramsDroppedTooLarge: number;
+		datagramsDroppedQueueSession: number;
+		datagramsDroppedQueueGlobal: number;
+		datagramsDroppedRateLimited: number;
 	};
 	/** Whole server process (Bun JS thread + tokio workers), fraction of a core. */
 	serverCpuCores: number;
@@ -524,6 +528,18 @@ async function runChild(
 				metrics1.backpressureWaitCount - metrics0.backpressureWaitCount,
 			backpressureTimeout:
 				metrics1.backpressureTimeoutCount - metrics0.backpressureTimeoutCount,
+			datagramsDroppedTooLarge:
+				(metrics1.datagramsDroppedTooLarge ?? 0) -
+				(metrics0.datagramsDroppedTooLarge ?? 0),
+			datagramsDroppedQueueSession:
+				(metrics1.datagramsDroppedQueueSession ?? 0) -
+				(metrics0.datagramsDroppedQueueSession ?? 0),
+			datagramsDroppedQueueGlobal:
+				(metrics1.datagramsDroppedQueueGlobal ?? 0) -
+				(metrics0.datagramsDroppedQueueGlobal ?? 0),
+			datagramsDroppedRateLimited:
+				(metrics1.datagramsDroppedRateLimited ?? 0) -
+				(metrics0.datagramsDroppedRateLimited ?? 0),
 		},
 		workerProof: {
 			configured: probe1.configuredServerWorkerThreads ?? null,

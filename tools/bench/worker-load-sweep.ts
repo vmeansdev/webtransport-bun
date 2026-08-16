@@ -125,6 +125,10 @@ export type SweepRun = {
 	ingestedPerSec: number;
 	droppedPct: number;
 	rateLimited: number;
+	droppedTooLarge: number;
+	droppedQueueSession: number;
+	droppedQueueGlobal: number;
+	droppedRateLimited: number;
 	processCores: number;
 	tokioCores: number;
 	jsCores: number;
@@ -206,6 +210,10 @@ async function runOne(
 			ingestedPerSec: ingested,
 			droppedPct: ingested > 0 ? (dropped / ingested) * 100 : 0,
 			rateLimited: run.drops?.rateLimited ?? 0,
+			droppedTooLarge: run.drops?.datagramsDroppedTooLarge ?? 0,
+			droppedQueueSession: run.drops?.datagramsDroppedQueueSession ?? 0,
+			droppedQueueGlobal: run.drops?.datagramsDroppedQueueGlobal ?? 0,
+			droppedRateLimited: run.drops?.datagramsDroppedRateLimited ?? 0,
 			processCores: run.serverCpuCores,
 			tokioCores: rows
 				.filter((r) => classify(r) === "tokio-worker")
@@ -236,6 +244,10 @@ export type ArmSummary = {
 	deliveredPerSec: number;
 	ingestedPerSec: number;
 	droppedPct: number;
+	droppedTooLarge: number;
+	droppedQueueSession: number;
+	droppedQueueGlobal: number;
+	droppedRateLimited: number;
 	processCores: number;
 	tokioCores: number;
 	jsCores: number;
@@ -259,6 +271,10 @@ export function summarize(arms: SweepArm[], runs: SweepRun[]): ArmSummary[] {
 			deliveredPerSec: med((r) => r.deliveredPerSec),
 			ingestedPerSec: med((r) => r.ingestedPerSec),
 			droppedPct: med((r) => r.droppedPct),
+			droppedTooLarge: med((r) => r.droppedTooLarge),
+			droppedQueueSession: med((r) => r.droppedQueueSession),
+			droppedQueueGlobal: med((r) => r.droppedQueueGlobal),
+			droppedRateLimited: med((r) => r.droppedRateLimited),
 			processCores: med((r) => r.processCores),
 			tokioCores: med((r) => r.tokioCores),
 			jsCores: med((r) => r.jsCores),
@@ -465,6 +481,20 @@ async function main(): Promise<void> {
 				`${s.tokioCores.toFixed(2).padStart(7)}${s.jsCores.toFixed(2).padStart(6)}` +
 				`${String(s.datagramThreads).padStart(5)}${s.requestMet ? "" : "  (request not met)"}`,
 		);
+	}
+	const withDrops = summaries.filter((s) => s.droppedPct > 0.05);
+	if (withDrops.length > 0) {
+		console.log(
+			`\n  ${"arm".padEnd(16)}${"tooLarge".padStart(10)}${"sessionQ".padStart(10)}${"globalQ".padStart(10)}${"dgramRL".padStart(10)}`,
+		);
+		for (const s of withDrops) {
+			console.log(
+				`  ${s.key.padEnd(16)}${Math.round(s.droppedTooLarge).toLocaleString().padStart(10)}` +
+					`${Math.round(s.droppedQueueSession).toLocaleString().padStart(10)}` +
+					`${Math.round(s.droppedQueueGlobal).toLocaleString().padStart(10)}` +
+					`${Math.round(s.droppedRateLimited).toLocaleString().padStart(10)}`,
+			);
+		}
 	}
 	for (const w of WORKERS) {
 		const c = collapse[w] ?? collapseFor(summaries, w);
