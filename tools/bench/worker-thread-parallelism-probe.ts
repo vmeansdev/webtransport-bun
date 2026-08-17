@@ -286,6 +286,7 @@ export type ArmRun = {
 	skDropSampleMs1: number | null;
 	skListenMatchCount: number | null;
 	appliedCongestion: string | null;
+	udpGroOff: boolean | null;
 };
 
 export function parseAppliedCongestion(
@@ -1440,6 +1441,8 @@ async function runChild(
 			return counts.length > 0 ? Math.max(...counts) : null;
 		})(),
 		appliedCongestion: parseAppliedCongestion(stdout),
+		udpGroOff:
+			probe1.udpGroOff === 1 ? true : probe1.udpGroOff === 0 ? false : null,
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);

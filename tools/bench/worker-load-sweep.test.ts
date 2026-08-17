@@ -330,6 +330,7 @@ function withFrameTx(
 				skListenMatchCount: 1,
 				windowMs: 15_000,
 				appliedCongestion: key.endsWith("@bbr") ? "bbr" : "cubic",
+				udpGroOff: true,
 			},
 		],
 	};
@@ -744,18 +745,27 @@ describe("classifyBbrSkdrops", () => {
 		).toBe("not-socket");
 	});
 
-	test("half-hole packet/dgram ratio is incomplete", () => {
+	test("half-hole with GRO off is partial-socket", () => {
 		expect(
 			classifyBbrSkdrops({ ...base, summaries: [armAt(42_000)] }).stopBucket,
-		).toBe("incomplete");
+		).toBe("partial-socket");
 	});
 
-	test("GRO not 1 is incomplete", () => {
+	test("gso-probe gro_segments 64 is not incomplete when GRO is off", () => {
 		expect(
 			classifyBbrSkdrops({
 				...base,
-				groSegments: 32,
+				groSegments: 64,
 				summaries: [armAt(80_000)],
+			}).stopBucket,
+		).toBe("socket-drops");
+	});
+
+	test("udp gro not off is incomplete", () => {
+		expect(
+			classifyBbrSkdrops({
+				...base,
+				summaries: [armAt(80_000, { udpGroOff: false })],
 			}).stopBucket,
 		).toBe("incomplete");
 	});

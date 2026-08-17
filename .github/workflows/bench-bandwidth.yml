@@ -157,6 +157,7 @@ jobs:
           SWEEP_WORKERS: "2"
           SWEEP_MEASURE_SEC: "15"
           SWEEP_REPS: "3"
+          WT_PROBE_UDP_GRO: off
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           SWEEP_OUT="$GITHUB_WORKSPACE/.bench-evidence/worker-load-sweep-${{ github.event.inputs.candidate_commit }}.json" \

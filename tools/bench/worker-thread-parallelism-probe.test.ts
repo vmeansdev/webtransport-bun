@@ -100,6 +100,7 @@ function run(over: Partial<ArmRun> = {}): ArmRun {
 		skDropSampleMs1: null,
 		skListenMatchCount: null,
 		appliedCongestion: "cubic",
+		udpGroOff: null,
 		workerProof: {
 			configured: 2,
 			availableParallelism: 10,

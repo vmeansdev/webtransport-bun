@@ -205,6 +205,7 @@ export type SweepRun = {
 	skListenMatchCount: number | null;
 	windowMs: number;
 	appliedCongestion: string | null;
+	udpGroOff: boolean | null;
 };
 
 function gitOutput(args: string[]): string {
@@ -343,6 +344,8 @@ async function runOne(
 			skListenMatchCount: run.skListenMatchCount ?? null,
 			windowMs: run.windowMs,
 			appliedCongestion: run.appliedCongestion ?? null,
+			udpGroOff:
+				run.udpGroOff === true ? true : run.udpGroOff === false ? false : null,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -867,13 +870,18 @@ export function classifyBbrRmem(input: {
 	};
 }
 
-export type BbrSkdropsBucket = "incomplete" | "socket-drops" | "not-socket";
+export type BbrSkdropsBucket =
+	| "incomplete"
+	| "socket-drops"
+	| "partial-socket"
+	| "not-socket";
 
 export type BbrSkdropsCap = {
 	dropRatePerSec: number | null;
 	holePerSec: number | null;
 	ratio: number | null;
 	groSegments: number | null;
+	udpGroOff: boolean;
 	udpTxOverFrameTx: number | null;
 	d0: number | null;
 	d1: number | null;
@@ -944,12 +952,11 @@ export function classifyBbrSkdrops(input: {
 	const mixedCpu = input.cpuModes.some((m) => m !== "shared");
 	const ingestOk = ingest != null && ingest >= 40_000 && ingest <= 60_000;
 	const frameOk = frameTx != null && frameTx >= 120_000;
-	const groOk = input.groSegments === 1;
+	const udpGroOff = runs.length > 0 && runs.every((r) => r.udpGroOff === true);
 	const udpRatioOk =
 		udpTxOverFrameTx != null &&
 		udpTxOverFrameTx >= 0.8 &&
 		udpTxOverFrameTx <= 1.25;
-	const halfHole = ratio != null && ratio >= 0.4 && ratio < 0.9;
 	const incomplete =
 		!samplesOk ||
 		dropRatePerSec == null ||
@@ -962,19 +969,20 @@ export function classifyBbrSkdrops(input: {
 		mixedCpu ||
 		!ingestOk ||
 		!frameOk ||
-		!groOk ||
-		!udpRatioOk ||
-		halfHole;
+		!udpGroOff ||
+		!udpRatioOk;
 	let stopBucket: BbrSkdropsBucket = "incomplete";
 	if (!incomplete && holePerSec != null && ratio != null) {
 		if (ratio >= 0.9 && holePerSec > 5_000) stopBucket = "socket-drops";
-		else if (ratio < 0.4) stopBucket = "not-socket";
+		else if (ratio >= 0.4) stopBucket = "partial-socket";
+		else stopBucket = "not-socket";
 	}
 	return {
 		dropRatePerSec,
 		holePerSec,
 		ratio,
 		groSegments: input.groSegments,
+		udpGroOff,
 		udpTxOverFrameTx,
 		d0: d0s.length > 0 ? median(d0s) : null,
 		d1: d1s.length > 0 ? median(d1s) : null,
@@ -1216,7 +1224,8 @@ async function main(): Promise<void> {
 			}
 			if (r.appliedCongestion) {
 				console.log(
-					`  ${s.key} r${r.round} cc: applied=${r.appliedCongestion}`,
+					`  ${s.key} r${r.round} cc: applied=${r.appliedCongestion}` +
+						` udpGroOff=${r.udpGroOff == null ? "n/a" : r.udpGroOff ? 1 : 0}`,
 				);
 			}
 		}
@@ -1322,7 +1331,7 @@ async function main(): Promise<void> {
 			`\n  bbr-skdrops: D=${n(bbrSkdrops.dropRatePerSec)} ` +
 				`H=${n(bbrSkdrops.holePerSec)} ` +
 				`ratio=${bbrSkdrops.ratio == null ? "n/a" : bbrSkdrops.ratio.toFixed(2)} ` +
-				`gro=${n(bbrSkdrops.groSegments)} ` +
+				`groOff=${bbrSkdrops.udpGroOff ? 1 : 0} ` +
 				`udpTx/frameTx=${bbrSkdrops.udpTxOverFrameTx == null ? "n/a" : bbrSkdrops.udpTxOverFrameTx.toFixed(2)} ` +
 				`d0=${n(bbrSkdrops.d0)} d1=${n(bbrSkdrops.d1)} ` +
 				`STOP=${bbrSkdrops.stopBucket}`,

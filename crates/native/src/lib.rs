@@ -43,6 +43,7 @@ pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
 pub mod transport_memory;
+pub mod udp_gro;
 pub mod worker_probe;
 pub mod zero_rtt;
 
@@ -465,6 +466,10 @@ pub fn native_worker_probe_snapshot() -> std::collections::HashMap<String, i64> 
 
     let mut out = std::collections::HashMap::new();
     out.insert("configuredServerWorkerThreads".to_string(), 2);
+    let udp_gro_off = udp_gro::snapshot_udp_gro_off();
+    if udp_gro_off >= 0 {
+        out.insert("udpGroOff".to_string(), udp_gro_off);
+    }
     out.insert(
         "timingEnabled".to_string(),
         i64::from(*worker_probe::TIMING_ENABLED),
@@ -723,6 +728,29 @@ pub(crate) fn spawn_wtransport_server(
                 Ok(s) => match s.local_addr() {
                     Ok(addr) => {
                         let bound_port = addr.port();
+                        if std::env::var("WT_PROBE_UDP_GRO").ok().as_deref() == Some("off")
+                        {
+                            match udp_gro::disable_listen_udp_gro(bound_port) {
+                                Ok(()) => emit_log(
+                                    &log_tx,
+                                    !debug_logs,
+                                    "info",
+                                    "udp_gro=off",
+                                    None,
+                                    None,
+                                    None,
+                                ),
+                                Err(e) => emit_log(
+                                    &log_tx,
+                                    !debug_logs,
+                                    "warn",
+                                    &format!("udp_gro disable failed: {e}"),
+                                    None,
+                                    None,
+                                    None,
+                                ),
+                            }
+                        }
                         emit_log(
                             &log_tx,
                             !debug_logs,
