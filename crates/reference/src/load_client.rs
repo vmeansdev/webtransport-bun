@@ -31,6 +31,10 @@ fn probe_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(2))
 }
 const LOAD_DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// Streams are reliable, so closing the session too soon after `finish()` can
+/// discard unacknowledged tail bytes and make a healthy step look truncated.
+/// 3s comfortably covers the in-flight window on any path this runs on.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_secs(3);
 const DEFAULT_MAX_SESSION_ERRORS: u64 = 0;
 const DEFAULT_MAX_DATAGRAM_ERRORS: u64 = 0;
 const DEFAULT_MAX_STREAM_ERRORS: u64 = 0;
@@ -38,6 +42,10 @@ const DEFAULT_RECONNECT_HOLD_MS: u64 = 1_000;
 /// 0 keeps the legacy tiny string payloads; a positive value pads every load
 /// datagram to exactly that many bytes for bandwidth-oriented runs.
 const DEFAULT_PAYLOAD_BYTES: usize = 0;
+const DEFAULT_STREAM_WRITE_BYTES: usize = 65_536;
+const DEFAULT_STREAM_CONCURRENCY: usize = 4;
+/// 0 means unpaced (write as fast as flow control allows).
+const DEFAULT_STREAM_TARGET_BYTES_PER_SEC: u64 = 0;
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
 const PROBE_UNI_ECHO_PREFIX: &str = "probe:uni-echo:";
@@ -52,6 +60,8 @@ enum ClientMode {
     #[default]
     Load,
     Reconnect,
+    /// Bulk / churn unidirectional stream load for the stream-throughput axis.
+    Stream,
 }
 
 impl ClientMode {
@@ -59,6 +69,7 @@ impl ClientMode {
         match self {
             Self::Load => "load",
             Self::Reconnect => "reconnect",
+            Self::Stream => "stream",
         }
     }
 }
@@ -67,9 +78,41 @@ fn parse_client_mode(raw: Option<&str>) -> ClientMode {
     match raw {
         Some("load") | None => ClientMode::Load,
         Some("reconnect") => ClientMode::Reconnect,
+        Some("stream") => ClientMode::Stream,
         Some(other) => {
             eprintln!("load-client: invalid value for --mode ('{other}'); using default");
             ClientMode::Load
+        }
+    }
+}
+
+/// Which shape the `stream` mode drives: sustained bytes on long-lived streams,
+/// or open/write/finish churn to find the stream-lifecycle ceiling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StreamWorkload {
+    #[default]
+    Bulk,
+    Churn,
+}
+
+impl StreamWorkload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bulk => "bulk",
+            Self::Churn => "churn",
+        }
+    }
+}
+
+fn parse_stream_workload(raw: Option<&str>) -> StreamWorkload {
+    match raw {
+        Some("bulk") | None => StreamWorkload::Bulk,
+        Some("churn") => StreamWorkload::Churn,
+        Some(other) => {
+            eprintln!(
+                "load-client: invalid value for --stream-workload ('{other}'); using default"
+            );
+            StreamWorkload::Bulk
         }
     }
 }
@@ -105,6 +148,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect_hold_ms = DEFAULT_RECONNECT_HOLD_MS;
     let mut skip_probes = false;
     let mut payload_bytes = DEFAULT_PAYLOAD_BYTES;
+    let mut stream_workload = StreamWorkload::Bulk;
+    let mut stream_write_bytes = DEFAULT_STREAM_WRITE_BYTES;
+    let mut stream_concurrency = DEFAULT_STREAM_CONCURRENCY;
+    let mut stream_target_bytes_per_sec = DEFAULT_STREAM_TARGET_BYTES_PER_SEC;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -157,9 +204,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload_bytes =
                     parse_or_default("--payload-bytes", args.next(), DEFAULT_PAYLOAD_BYTES)
             }
+            "--stream-workload" => stream_workload = parse_stream_workload(args.next().as_deref()),
+            "--stream-write-bytes" => {
+                stream_write_bytes = parse_or_default(
+                    "--stream-write-bytes",
+                    args.next(),
+                    DEFAULT_STREAM_WRITE_BYTES,
+                )
+            }
+            "--stream-concurrency" => {
+                stream_concurrency = parse_or_default(
+                    "--stream-concurrency",
+                    args.next(),
+                    DEFAULT_STREAM_CONCURRENCY,
+                )
+            }
+            "--stream-target-bytes-per-sec" => {
+                stream_target_bytes_per_sec = parse_or_default(
+                    "--stream-target-bytes-per-sec",
+                    args.next(),
+                    DEFAULT_STREAM_TARGET_BYTES_PER_SEC,
+                )
+            }
             _ => {}
         }
     }
+
+    let stream_concurrency = stream_concurrency.max(1);
+    let stream_write_bytes = stream_write_bytes.max(1);
 
     println!(
         "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} payload_bytes={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
@@ -176,6 +248,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_datagram_errors,
         max_stream_errors
     );
+    if mode == ClientMode::Stream {
+        println!(
+            "load-client: stream workload={} write_bytes={} concurrency={} target_bytes_per_sec_per_session={}",
+            stream_workload.as_str(),
+            stream_write_bytes,
+            stream_concurrency,
+            stream_target_bytes_per_sec
+        );
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -191,6 +272,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconnect_hold: Duration::from_millis(reconnect_hold_ms),
         skip_probes,
         payload_bytes,
+        stream: StreamOptions {
+            workload: stream_workload,
+            write_bytes: stream_write_bytes,
+            concurrency: stream_concurrency,
+            target_bytes_per_sec: stream_target_bytes_per_sec,
+        },
         budgets: ErrorBudgets {
             max_session_errors,
             max_datagram_errors,
@@ -217,6 +304,43 @@ struct Counters {
     stream_reset_ok: AtomicU64,
     stop_sending_ok: AtomicU64,
     reconnects_ok: AtomicU64,
+    stream_bytes_written: AtomicU64,
+    stream_writes: AtomicU64,
+    streams_completed: AtomicU64,
+    // quinn per-connection UDP stats, summed over sessions at session teardown.
+    // `ios` is the syscall count; `datagrams` the UDP datagram count. Their
+    // ratio is the only direct read on whether GSO/GRO actually engaged, as
+    // opposed to merely being available (see gso-probe for capability).
+    udp_tx_datagrams: AtomicU64,
+    udp_tx_bytes: AtomicU64,
+    udp_tx_ios: AtomicU64,
+    udp_rx_datagrams: AtomicU64,
+    udp_rx_bytes: AtomicU64,
+    udp_rx_ios: AtomicU64,
+}
+
+/// Snapshot the connection's quinn UDP counters into the run totals. Called
+/// once per session, just before close, while the connection is still alive.
+fn record_udp_stats(conn: &wtransport::Connection, counters: &Counters) {
+    let stats = conn.quic_connection().stats();
+    counters
+        .udp_tx_datagrams
+        .fetch_add(stats.udp_tx.datagrams, Ordering::Relaxed);
+    counters
+        .udp_tx_bytes
+        .fetch_add(stats.udp_tx.bytes, Ordering::Relaxed);
+    counters
+        .udp_tx_ios
+        .fetch_add(stats.udp_tx.ios, Ordering::Relaxed);
+    counters
+        .udp_rx_datagrams
+        .fetch_add(stats.udp_rx.datagrams, Ordering::Relaxed);
+    counters
+        .udp_rx_bytes
+        .fetch_add(stats.udp_rx.bytes, Ordering::Relaxed);
+    counters
+        .udp_rx_ios
+        .fetch_add(stats.udp_rx.ios, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy)]
@@ -224,6 +348,15 @@ struct ErrorBudgets {
     max_session_errors: u64,
     max_datagram_errors: u64,
     max_stream_errors: u64,
+}
+
+#[derive(Clone, Copy)]
+struct StreamOptions {
+    workload: StreamWorkload,
+    write_bytes: usize,
+    concurrency: usize,
+    /// Per-session target. 0 means unpaced.
+    target_bytes_per_sec: u64,
 }
 
 struct RunOptions<'a> {
@@ -236,6 +369,7 @@ struct RunOptions<'a> {
     reconnect_hold: Duration,
     skip_probes: bool,
     payload_bytes: usize,
+    stream: StreamOptions,
     budgets: ErrorBudgets,
 }
 
@@ -408,6 +542,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         reconnect_hold,
         skip_probes,
         payload_bytes,
+        stream,
         budgets,
     } = options;
     let config = ClientConfig::builder()
@@ -456,6 +591,36 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
             tokio::time::sleep(duration).await;
             wait_for_handles(handles).await;
         }
+        ClientMode::Stream => {
+            let mut handles = Vec::with_capacity(num_sessions);
+            for i in 0..num_sessions {
+                let url = url.to_string();
+                let endpoint = Arc::clone(&endpoint);
+                let counters = Arc::clone(&counters);
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let handle = tokio::spawn(async move {
+                    match endpoint.connect(&url).await {
+                        Ok(conn) => {
+                            counters.sessions_ok.fetch_add(1, Ordering::Relaxed);
+                            run_stream_session(conn, duration, stream, counters).await;
+                        }
+                        Err(e) => {
+                            counters.sessions_err.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("load-client: session connect failed: {e}");
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+            tokio::time::sleep(duration).await;
+            // Stream sessions tail off with STREAM_DRAIN_GRACE + CLOSE_TIMEOUT
+            // after the step ends; the default join window would abort them
+            // mid-teardown and lose their quinn UDP stats.
+            wait_for_handles_within(handles, JOIN_TIMEOUT + STREAM_DRAIN_GRACE + CLOSE_TIMEOUT)
+                .await;
+        }
         ClientMode::Reconnect => {
             let deadline = Instant::now() + duration;
             let mut handles = Vec::with_capacity(num_sessions);
@@ -501,6 +666,23 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         "load-client: load streams opened={}",
         counters.load_streams_opened.load(Ordering::Relaxed)
     );
+    println!(
+        "load-client: stream bytes written={} writes={} completed={}",
+        counters.stream_bytes_written.load(Ordering::Relaxed),
+        counters.stream_writes.load(Ordering::Relaxed),
+        counters.streams_completed.load(Ordering::Relaxed)
+    );
+    // GSO/GRO engagement evidence. datagrams/ios > 1 means quinn-udp coalesced;
+    // == 1 means it silently fell back to one packet per syscall.
+    println!(
+        "load-client: udp tx datagrams={} bytes={} ios={} rx datagrams={} bytes={} ios={}",
+        counters.udp_tx_datagrams.load(Ordering::Relaxed),
+        counters.udp_tx_bytes.load(Ordering::Relaxed),
+        counters.udp_tx_ios.load(Ordering::Relaxed),
+        counters.udp_rx_datagrams.load(Ordering::Relaxed),
+        counters.udp_rx_bytes.load(Ordering::Relaxed),
+        counters.udp_rx_ios.load(Ordering::Relaxed)
+    );
 
     let pass = ok > 0
         && err <= budgets.max_session_errors
@@ -517,7 +699,11 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn wait_for_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
-    let join_deadline = Instant::now() + JOIN_TIMEOUT;
+    wait_for_handles_within(handles, JOIN_TIMEOUT).await
+}
+
+async fn wait_for_handles_within(handles: Vec<tokio::task::JoinHandle<()>>, timeout: Duration) {
+    let join_deadline = Instant::now() + timeout;
     while Instant::now() < join_deadline {
         if handles.iter().all(|h| h.is_finished()) {
             break;
@@ -564,6 +750,16 @@ async fn run_session(
     let mut st_ticker = interval(stream_interval);
     dg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     st_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval` fires its first tick immediately, so a rate of 0 still emitted
+    // one datagram / opened one stream per session. Burn that tick when the
+    // arm is meant to be off, or a datagram-only run measures a few stray
+    // streams too.
+    if datagrams_per_sec == 0 {
+        dg_ticker.tick().await;
+    }
+    if streams_per_sec == 0 {
+        st_ticker.tick().await;
+    }
 
     // Padded template for bandwidth runs; the per-datagram id is stamped over
     // the prefix region so every payload stays unique without a fresh alloc.
@@ -654,9 +850,168 @@ async fn run_session(
         }
     }
     tokio::time::sleep(LOAD_DRAIN_GRACE).await;
+    record_udp_stats(&conn, counters);
     // Shutdown state machine: stop (loop exited) → close → wait-for-closed (timeout).
     conn.close(0u32.into(), b"load test done");
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
+}
+
+/// Stream-throughput session: fan out `concurrency` unidirectional writers and
+/// let them run for the whole step. Bulk writers hold one stream open for the
+/// step; churn writers open/write/finish in a loop.
+async fn run_stream_session(
+    conn: wtransport::Connection,
+    duration: Duration,
+    options: StreamOptions,
+    counters: Arc<Counters>,
+) {
+    let per_worker_target = if options.target_bytes_per_sec > 0 {
+        (options.target_bytes_per_sec / options.concurrency as u64).max(1)
+    } else {
+        0
+    };
+
+    let mut handles = Vec::with_capacity(options.concurrency);
+    for _ in 0..options.concurrency {
+        let conn = conn.clone();
+        let counters = Arc::clone(&counters);
+        handles.push(tokio::spawn(async move {
+            match options.workload {
+                StreamWorkload::Bulk => {
+                    run_bulk_stream_worker(
+                        &conn,
+                        duration,
+                        options.write_bytes,
+                        per_worker_target,
+                        counters.as_ref(),
+                    )
+                    .await
+                }
+                StreamWorkload::Churn => {
+                    run_churn_stream_worker(&conn, duration, options.write_bytes, counters.as_ref())
+                        .await
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    tokio::time::sleep(STREAM_DRAIN_GRACE).await;
+    record_udp_stats(&conn, counters.as_ref());
+    conn.close(0u32.into(), b"stream bench done");
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, conn.closed()).await;
+}
+
+/// One long-lived stream, written for the whole step. `target_bytes_per_sec`
+/// of 0 is unpaced — the write loop then runs at whatever flow control allows,
+/// which is what the bulk ladder wants.
+async fn run_bulk_stream_worker(
+    conn: &wtransport::Connection,
+    duration: Duration,
+    write_bytes: usize,
+    target_bytes_per_sec: u64,
+    counters: &Counters,
+) {
+    let buf = vec![b'x'; write_bytes];
+    let mut send = match open_uni_send(conn, counters).await {
+        Some(send) => send,
+        None => return,
+    };
+
+    let start = Instant::now();
+    let mut written: u64 = 0;
+    while start.elapsed() < duration {
+        if let Err(e) = send.write_all(&buf).await {
+            counters.streams_err.fetch_add(1, Ordering::Relaxed);
+            eprintln!("load-client: bulk stream write failed: {e}");
+            return;
+        }
+        written += write_bytes as u64;
+        counters
+            .stream_bytes_written
+            .fetch_add(write_bytes as u64, Ordering::Relaxed);
+        counters.stream_writes.fetch_add(1, Ordering::Relaxed);
+
+        if target_bytes_per_sec > 0 {
+            let due = Duration::from_secs_f64(written as f64 / target_bytes_per_sec as f64);
+            let elapsed = start.elapsed();
+            if due > elapsed {
+                tokio::time::sleep(due - elapsed).await;
+            }
+        }
+    }
+
+    match send.finish().await {
+        Ok(()) => {
+            counters.streams_completed.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            counters.streams_err.fetch_add(1, Ordering::Relaxed);
+            eprintln!("load-client: bulk stream finish failed: {e}");
+        }
+    }
+}
+
+/// Open / write / finish as fast as the peer allows, to find the stream
+/// lifecycle ceiling rather than the byte ceiling. Bails on the first error so
+/// a rejecting server produces one error, not a hot loop of them.
+async fn run_churn_stream_worker(
+    conn: &wtransport::Connection,
+    duration: Duration,
+    write_bytes: usize,
+    counters: &Counters,
+) {
+    let buf = vec![b'x'; write_bytes];
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        let mut send = match open_uni_send(conn, counters).await {
+            Some(send) => send,
+            None => return,
+        };
+        if let Err(e) = send.write_all(&buf).await {
+            counters.streams_err.fetch_add(1, Ordering::Relaxed);
+            eprintln!("load-client: churn stream write failed: {e}");
+            return;
+        }
+        if let Err(e) = send.finish().await {
+            counters.streams_err.fetch_add(1, Ordering::Relaxed);
+            eprintln!("load-client: churn stream finish failed: {e}");
+            return;
+        }
+        counters
+            .stream_bytes_written
+            .fetch_add(write_bytes as u64, Ordering::Relaxed);
+        counters.stream_writes.fetch_add(1, Ordering::Relaxed);
+        counters.streams_completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn open_uni_send(
+    conn: &wtransport::Connection,
+    counters: &Counters,
+) -> Option<wtransport::SendStream> {
+    let opening = match conn.open_uni().await {
+        Ok(opening) => opening,
+        Err(e) => {
+            counters.streams_err.fetch_add(1, Ordering::Relaxed);
+            eprintln!("load-client: open_uni failed: {e}");
+            return None;
+        }
+    };
+    match opening.await {
+        Ok(send) => {
+            counters.streams_opened.fetch_add(1, Ordering::Relaxed);
+            counters.load_streams_opened.fetch_add(1, Ordering::Relaxed);
+            Some(send)
+        }
+        Err(e) => {
+            counters.streams_err.fetch_add(1, Ordering::Relaxed);
+            eprintln!("load-client: uni stream open await failed: {e}");
+            None
+        }
+    }
 }
 
 async fn run_reconnect_worker(
@@ -700,8 +1055,27 @@ async fn run_reconnect_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_summary_json, parse_client_mode, parse_or_default, ClientMode, Counters};
+    use super::{
+        load_summary_json, parse_client_mode, parse_or_default, parse_stream_workload, ClientMode,
+        Counters, StreamWorkload,
+    };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn parse_client_mode_parses_stream() {
+        assert_eq!(parse_client_mode(Some("stream")), ClientMode::Stream);
+    }
+
+    #[test]
+    fn parse_stream_workload_parses_churn() {
+        assert_eq!(parse_stream_workload(Some("churn")), StreamWorkload::Churn);
+    }
+
+    #[test]
+    fn parse_stream_workload_falls_back_on_unknown_values() {
+        assert_eq!(parse_stream_workload(Some("nope")), StreamWorkload::Bulk);
+        assert_eq!(parse_stream_workload(None), StreamWorkload::Bulk);
+    }
 
     #[test]
     fn parse_or_default_parses_valid_integer() {
