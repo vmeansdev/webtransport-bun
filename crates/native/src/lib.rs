@@ -155,7 +155,7 @@ fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     redact: bool,
     level: &str,
-    msg: &str,
+    msg: std::fmt::Arguments<'_>,
     session_id: Option<&str>,
     peer_ip: Option<&str>,
     peer_port: Option<u32>,
@@ -165,6 +165,8 @@ fn emit_log(
     if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
+    // Without a JS listener nothing below is observable; build nothing.
+    let Some(tx) = tx else { return };
     let out_msg = if redact {
         match level {
             "error" => "native error (redacted)",
@@ -177,7 +179,7 @@ fn emit_log(
     } else {
         msg.to_string()
     };
-    if let Some(tx) = tx {
+    {
         if tx
             .try_send(LogEvent {
                 level: level.to_string(),
@@ -537,9 +539,9 @@ pub(crate) async fn resolve_close_info(
 /// these counters: `sessions_active` inflates → false `maxSessions` rejections,
 /// and the peer IP stays permanently blocked from reconnecting.
 struct SessionCounters {
-    id: String,
+    id: std::sync::Arc<str>,
     owner_server_id: u64,
-    peer_ip: String,
+    peer_ip: std::net::IpAddr,
     metrics: Arc<crate::server_metrics::ServerMetrics>,
     released: bool,
 }
@@ -567,7 +569,7 @@ impl SessionCounters {
         }
         self.released = true;
         session_registry::remove(&self.id);
-        rate_limit::release_per_ip_session(self.owner_server_id, &self.peer_ip);
+        rate_limit::release_per_ip_session(self.owner_server_id, self.peer_ip);
         self.metrics
             .sessions_active
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -623,7 +625,7 @@ pub(crate) fn spawn_wtransport_server(
                 match server_tls::build_server_tls_config(Arc::clone(&tls_resolver)) {
                     Ok(config) => config,
                     Err(msg) => {
-                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                         report_startup(Err(msg));
                         return;
                     }
@@ -662,7 +664,7 @@ pub(crate) fn spawn_wtransport_server(
                 Ok(builder) => builder,
                 Err(e) => {
                     let msg = format!("failed to apply idle timeout: {:?}", e);
-                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                     report_startup(Err(msg));
                     return;
                 }
@@ -692,7 +694,7 @@ pub(crate) fn spawn_wtransport_server(
                             &log_tx,
                             !debug_logs,
                             "info",
-                            &format!("endpoint created for port {}", bound_port),
+                            format_args!("endpoint created for port {}", bound_port),
                             None,
                             None,
                             None,
@@ -702,14 +704,14 @@ pub(crate) fn spawn_wtransport_server(
                     }
                     Err(e) => {
                         let msg = format!("failed to read bound address: {:?}", e);
-                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                         report_startup(Err(msg));
                         return;
                     }
                 },
                 Err(e) => {
                     let msg = format!("failed to create endpoint: {:?}", e);
-                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                     report_startup(Err(msg));
                     return;
                 }
@@ -737,7 +739,7 @@ pub(crate) fn spawn_wtransport_server(
                                 if !metrics.try_acquire_handshake(limits.max_handshakes_in_flight) {
                                     incoming_session.refuse();
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("limit exceeded: maxHandshakesInFlight"), None, None, None);
                                     continue;
                                 }
                                 let handshake_admission = HandshakeAdmission::new(Arc::clone(&metrics));
@@ -750,7 +752,7 @@ pub(crate) fn spawn_wtransport_server(
                                 let _handshake_admission = handshake_admission;
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
-                                        emit_log(&ltx, !debug_logs, "debug", &format!("CONNECT received authority={:?}", r.authority()), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "debug", format_args!("CONNECT received authority={:?}", r.authority()), None, None, None);
                                         r
                                     }
                                     Err(e) => {
@@ -762,7 +764,7 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, !debug_logs, "warn", &format!("handshake failed (incoming_session): {}", chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake failed (incoming_session): {}", chain), None, None, None);
                                         return;
                                     }
                                 };
@@ -771,25 +773,26 @@ pub(crate) fn spawn_wtransport_server(
                                 let is_0rtt = session_request.is_0rtt();
                                 let authority = session_request.authority().to_string();
                                 let peer_addr = session_request.remote_address();
-                                let peer_ip = peer_addr.ip().to_string();
+                                let peer_ip_addr = peer_addr.ip();
+                                let peer_ip = peer_ip_addr.to_string();
                                 let peer_port = peer_addr.port() as u32;
                                 if !rate_limit::try_acquire_handshake(owner_server_id,
-                                    &peer_ip,
+                                    peer_ip_addr,
                                     rate_limits.handshakes_per_sec,
                                     rate_limits.handshakes_burst,
                                 ) {
                                     metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("rate limited: handshake token bucket"), None, Some(&peer_ip), Some(peer_port));
                                     session_request.too_many_requests().await;
                                     return;
                                 }
                                 if !rate_limit::try_acquire_per_ip_session_with_prefix(owner_server_id,
-                                    &peer_ip,
+                                    peer_ip_addr,
                                     rate_limits.handshakes_burst_per_ip,
                                     rate_limits.handshakes_burst_per_prefix,
                                 ) {
                                     metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("rate limited: per-IP handshake burst"), None, Some(&peer_ip), Some(peer_port));
                                     session_request.too_many_requests().await;
                                     return;
                                 }
@@ -797,7 +800,7 @@ pub(crate) fn spawn_wtransport_server(
                                 if prev_sessions >= limits.max_sessions {
                                     metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, Some(&peer_ip), Some(peer_port));
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("limit exceeded: maxSessions"), None, Some(&peer_ip), Some(peer_port));
                                     let reject_timeout = tokio::time::Duration::from_millis(
                                         limits.handshake_timeout_ms,
                                     );
@@ -806,7 +809,7 @@ pub(crate) fn spawn_wtransport_server(
                                         session_request.accept(),
                                     )
                                     .await;
-                                    rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
+                                    rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
                                             connection.close(
@@ -819,7 +822,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 &ltx,
                                                 !debug_logs,
                                                 "debug",
-                                                &format!(
+                                                format_args!(
                                                     "maxSessions reject accept failed authority={:?} error={}",
                                                     authority, e
                                                 ),
@@ -833,7 +836,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 &ltx,
                                                 !debug_logs,
                                                 "warn",
-                                                &format!(
+                                                format_args!(
                                                     "maxSessions reject handshake timed out authority={:?}",
                                                     authority
                                                 ),
@@ -858,27 +861,28 @@ pub(crate) fn spawn_wtransport_server(
                                     Ok(r) => r,
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                        rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
-                                        emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
+                                        rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, None, None);
                                         return;
                                     }
                                 };
                                 match accept_result {
                                     Ok(connection) => {
                                         metrics.handshake_histogram.observe(accept_start.elapsed());
-                                        emit_log(&ltx, !debug_logs, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
+                                        emit_log(&ltx, !debug_logs, "info", format_args!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
                                         drop(_handshake_admission);
 
-                                        let id = format!(
+                                        let id: std::sync::Arc<str> = format!(
                                             "sess-{:016x}",
                                             SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                                 ^ *SESSION_ID_SEED
-                                        );
+                                        )
+                                        .into();
 
                                         // P0-1: Register session BEFORE emitting to JS so acceptBidiStream etc. find it
                                         let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics, datagram_capacity_notify) =
                                             session_registry::insert(
-                                                id.clone(),
+                                                id.to_string(),
                                                 owner_server_id,
                                                 connection.clone(),
                                                 metrics.clone(),
@@ -939,7 +943,7 @@ pub(crate) fn spawn_wtransport_server(
                                             // instead of try_send (bounded by maxSessions churn).
                                             if tx
                                                 .send(SessionEvent::Accepted(SessionAccepted {
-                                                    id: id.clone(),
+                                                    id: id.to_string(),
                                                     peer_ip: peer_ip.clone(),
                                                     peer_port,
                                                 }))
@@ -967,7 +971,7 @@ pub(crate) fn spawn_wtransport_server(
                                         let sm_dgram = Arc::clone(&session_metrics);
 
                                         // Bidi stream accept loop: forward to JS via channel (4.4.2: shed if over limits)
-                                        let peer_ip_bidi = peer_ip.clone();
+                                        let peer_ip_bidi = peer_ip_addr;
                                         let rl_bidi = rate_limits.clone();
                                         let stream_capacity_notify_bidi = stream_capacity_notify.clone();
                                         // The session can be removed between registry insert and
@@ -995,7 +999,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_bidi.closed() => break,
                                                         res = conn_bidi.accept_bi() => {
                                                             let Ok((mut send, recv)) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
                                                                 m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 let _ = send.reset(0);
                                                                 continue;
@@ -1085,7 +1089,7 @@ pub(crate) fn spawn_wtransport_server(
                                             },
                                         );
                                         // Uni stream accept loop: forward to JS via channel (4.4.2; P1-5)
-                                        let peer_ip_uni = peer_ip.clone();
+                                        let peer_ip_uni = peer_ip_addr;
                                         let rl_uni = rate_limits.clone();
                                         let stream_capacity_notify_uni = stream_capacity_notify.clone();
                                         // Same removal race as the bidi fetch above.
@@ -1107,7 +1111,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         _ = conn_uni.closed() => break,
                                                         res = conn_uni.accept_uni() => {
                                                             let Ok(recv) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, &peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
                                                                 m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                                                 recv.stop(0);
                                                                 continue;
@@ -1348,7 +1352,7 @@ pub(crate) fn spawn_wtransport_server(
                                         // Datagram forward to channel (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
                                         let closed_tx = stx.clone();
                                         let rl_dgram = rate_limits.clone();
-                                        let peer_ip_for_release = peer_ip.clone();
+                                        let peer_ip_for_release = peer_ip_addr;
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
                                             owner_server_id,
@@ -1362,7 +1366,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 let mut counters = SessionCounters {
                                                     id: id.clone(),
                                                     owner_server_id,
-                                                    peer_ip: peer_ip_for_release.clone(),
+                                                    peer_ip: peer_ip_for_release,
                                                     metrics: m_dgram.clone(),
                                                     released: false,
                                                 };
@@ -1396,7 +1400,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
-                                                                            .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .send(SessionEvent::Closed { id: id.to_string(), code: close_code, reason: close_reason })
                                                                             .await
                                                                             .is_err()
                                                                         {
@@ -1427,7 +1431,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
-                                                                            .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .send(SessionEvent::Closed { id: id.to_string(), code: close_code, reason: close_reason })
                                                                             .await
                                                                             .is_err()
                                                                         {
@@ -1442,7 +1446,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             };
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                                                            if !rate_limit::try_acquire_datagram_ingress(owner_server_id, &peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
+                                                            if !rate_limit::try_acquire_datagram_ingress(owner_server_id, peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
                                                                 m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::RateLimited);
                                                                 continue;
                                                             }
@@ -1486,7 +1490,7 @@ pub(crate) fn spawn_wtransport_server(
                                                             counters.release();
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
-                                                                    .send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                    .send(SessionEvent::Closed { id: id.to_string(), code: close_code, reason: close_reason })
                                                                     .await
                                                                     .is_err()
                                                                 {
@@ -1503,7 +1507,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 counters.release();
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
-                                                        .send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
+                                                        .send(SessionEvent::Closed { id: id.to_string(), code: None, reason: None })
                                                         .await
                                                         .is_err()
                                                     {
@@ -1518,7 +1522,7 @@ pub(crate) fn spawn_wtransport_server(
                                     }
                                     Err(e) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                        rate_limit::release_per_ip_session(owner_server_id, &peer_ip);
+                                        rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());
@@ -1527,7 +1531,7 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, !debug_logs, "error", &format!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "error", format_args!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
                                     }
                                 }
                                     },
