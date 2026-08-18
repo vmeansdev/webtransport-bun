@@ -109,15 +109,37 @@ struct LatencyProbe {
     echo_unstamped: AtomicU64,
     ticks_skipped: AtomicU64,
     send_events: AtomicU64,
+    /// Longest window any single session actually spent offering load, and the
+    /// sum across sessions that offered any. Requested volume is derived from
+    /// the measured window, never from the nominal `--duration`: a step that ran
+    /// short would otherwise be judged against load it was never given time to
+    /// send, and a session that died would be judged against nothing.
+    drive_ns_max: AtomicU64,
+    drive_ns_total: AtomicU64,
+    sessions_driving: AtomicU64,
 }
 
 impl LatencyProbe {
+    /// One session finished offering load, having done so for `drive_ns`.
+    fn record_drive(&self, drive_ns: u64) {
+        self.drive_ns_max.fetch_max(drive_ns, Ordering::Relaxed);
+        self.drive_ns_total.fetch_add(drive_ns, Ordering::Relaxed);
+        self.sessions_driving.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn to_json(&self, arrival: ArrivalProfile, effective_rate: f64) -> String {
+        let driving = self.sessions_driving.load(Ordering::Relaxed);
+        let mean_drive_sec = if driving == 0 {
+            0.0
+        } else {
+            self.drive_ns_total.load(Ordering::Relaxed) as f64 / driving as f64 / 1e9
+        };
         format!(
             concat!(
                 "{{\"arrival\":\"{}\",\"effectiveDatagramsPerSecPerSession\":{:.3},",
                 "\"rtt\":{},\"scheduleLag\":{},\"burstSpread\":{},",
-                "\"echoUnstamped\":{},\"ticksSkipped\":{},\"sendEvents\":{}}}"
+                "\"echoUnstamped\":{},\"ticksSkipped\":{},\"sendEvents\":{},",
+                "\"driveWindowSec\":{:.6},\"driveWindowMeanSec\":{:.6},\"sessionsDriving\":{}}}"
             ),
             arrival.as_str(),
             effective_rate,
@@ -127,6 +149,9 @@ impl LatencyProbe {
             self.echo_unstamped.load(Ordering::Relaxed),
             self.ticks_skipped.load(Ordering::Relaxed),
             self.send_events.load(Ordering::Relaxed),
+            self.drive_ns_max.load(Ordering::Relaxed) as f64 / 1e9,
+            mean_drive_sec,
+            driving,
         )
     }
 }
@@ -931,6 +956,9 @@ async fn run_session(
             }
         }
     }
+    if let Some(probe) = latency.as_ref() {
+        probe.record_drive(start.elapsed().as_nanos() as u64);
+    }
     tokio::time::sleep(LOAD_DRAIN_GRACE).await;
     // Shutdown state machine: stop (loop exited) → close → wait-for-closed (timeout).
     conn.close(0u32.into(), b"load test done");
@@ -980,7 +1008,7 @@ async fn run_reconnect_worker(
 mod tests {
     use super::{
         load_summary_json, parse_arrival_profile, parse_client_mode, parse_or_default,
-        ArrivalProfile, ClientMode, Counters, DatagramSchedule,
+        ArrivalProfile, ClientMode, Counters, DatagramSchedule, LatencyProbe,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -1014,6 +1042,25 @@ mod tests {
         sched.index += 1;
         assert_eq!(sched.deadline(), anchor + Duration::from_millis(2));
         assert_eq!(sched.intended_ns(), 1_002_000_000);
+    }
+
+    /// The bench derives requested volume from `driveWindowSec`, so it has to be
+    /// the longest window a session actually offered load for — not the nominal
+    /// duration, and not an average dragged down by a session that died early.
+    #[test]
+    fn drive_window_reports_the_longest_session_and_the_mean() {
+        let probe = LatencyProbe::default();
+        probe.record_drive(60_000_000_000);
+        probe.record_drive(30_000_000_000);
+        let json = probe.to_json(ArrivalProfile::Uniform, 100.0);
+        assert!(json.contains("\"driveWindowSec\":60.000000"), "{json}");
+        assert!(json.contains("\"driveWindowMeanSec\":45.000000"), "{json}");
+        assert!(json.contains("\"sessionsDriving\":2"), "{json}");
+
+        let idle = LatencyProbe::default();
+        let json = idle.to_json(ArrivalProfile::Uniform, 100.0);
+        assert!(json.contains("\"driveWindowSec\":0.000000"), "{json}");
+        assert!(json.contains("\"sessionsDriving\":0"), "{json}");
     }
 
     #[test]
