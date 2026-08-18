@@ -70,6 +70,9 @@ struct Options {
     datagram_interval: Duration,
     payload_bytes: usize,
     connect_timeout: Duration,
+    /// Spread each session's send phase evenly across one interval instead of
+    /// letting every session tick on the same instant.
+    stagger_sends: bool,
     json_out: Option<String>,
 }
 
@@ -380,6 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         datagram_interval: Duration::from_millis(DEFAULT_DATAGRAM_INTERVAL_MS),
         payload_bytes: DEFAULT_PAYLOAD_BYTES,
         connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+        stagger_sends: false,
         json_out: None,
     };
 
@@ -441,13 +445,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DEFAULT_CONNECT_TIMEOUT_SECS,
                 ));
             }
+            "--stagger-sends" => options.stagger_sends = true,
             "--json-out" => options.json_out = args.next(),
             _ => {}
         }
     }
 
     println!(
-        "loss-client: url={} sessions={} endpoints={} connect_concurrency={} steady={}s idle={}s interval={}ms payload={}B",
+        "loss-client: url={} sessions={} endpoints={} connect_concurrency={} steady={}s idle={}s interval={}ms payload={}B stagger_sends={}",
         options.url,
         options.sessions,
         options.endpoints,
@@ -456,6 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.idle.as_secs(),
         options.datagram_interval.as_millis(),
         options.payload_bytes,
+        options.stagger_sends,
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -492,6 +498,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let mut phase = phase_rx.clone();
         let interval = options.datagram_interval;
         let payload_bytes = options.payload_bytes;
+        // Deterministic, evenly spaced, and independent of connect order, so
+        // the spread arm differs from the aligned arm in exactly one thing.
+        let phase_offset = if options.stagger_sends {
+            i as f64 / options.sessions as f64
+        } else {
+            0.0
+        };
         handles.push(tokio::spawn(async move {
             let permit = match permits.acquire_owned().await {
                 Ok(p) => p,
@@ -524,7 +537,15 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 live.push(conn.quic_connection().clone());
             }
             counters.connect_done.fetch_add(1, Ordering::Relaxed);
-            hold_session(conn, &mut phase, interval, payload_bytes, counters.as_ref()).await;
+            hold_session(
+                conn,
+                &mut phase,
+                interval,
+                payload_bytes,
+                phase_offset,
+                counters.as_ref(),
+            )
+            .await;
         }));
     }
 
@@ -628,6 +649,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         concat!(
             "{{",
             "\"schema\":\"loss-client/1\",",
+            "\"staggerSends\":{},",
             "\"sessionsRequested\":{},",
             "\"sessionsOk\":{},",
             "\"sessionsErr\":{},",
@@ -644,6 +666,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             "\"connectErrorsSample\":[{}]",
             "}}"
         ),
+        options.stagger_sends,
         options.sessions,
         sessions_ok,
         sessions_err,
@@ -698,6 +721,14 @@ async fn hold_session(
     phase: &mut watch::Receiver<u8>,
     interval: Duration,
     payload_bytes: usize,
+    // Fraction of one interval to delay this session's first tick by. Zero
+    // reproduces the session-scale client exactly: every session waits for the
+    // same phase signal and then ticks on the same schedule, so the aggregate
+    // arrival process is not `sessions / interval` per second, it is one
+    // `sessions`-packet impulse every interval. Spreading the phase turns the
+    // same mean rate into a smooth arrival process without changing anything
+    // else, which is what separates a burst-tolerance limit from a rate limit.
+    phase_offset: f64,
     counters: &Counters,
 ) {
     while *phase.borrow() == PHASE_CONNECT {
@@ -711,7 +742,9 @@ async fn hold_session(
     // Start one interval in, not immediately: tokio's first tick fires at once,
     // which would put one extra send in every session and inflate the offered
     // rate above 1.0 — the very ratio that detects a saturated generator.
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    let offset = interval.mul_f64(phase_offset.clamp(0.0, 1.0));
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + interval + offset, interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_tick = Instant::now();
 

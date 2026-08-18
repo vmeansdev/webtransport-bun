@@ -67,6 +67,11 @@ const CONNECT_TIMEOUT_SECONDS = parseInt(
 );
 const SAMPLE_INTERVAL_MS = parseInt(process.env.LOSS_SAMPLE_MS ?? "2000", 10);
 const DRAIN_GRACE_MS = parseInt(process.env.LOSS_DRAIN_GRACE_MS ?? "1000", 10);
+/** Spread each session's send phase across the interval instead of letting all
+ * of them tick together. The aligned shape is the session-scale client's, and
+ * at N sessions it offers one N-packet impulse per interval rather than
+ * N/interval per second — a burst the mean-rate label does not describe. */
+const STAGGER_SENDS = process.env.LOSS_STAGGER_SENDS === "1";
 const PORT = parseInt(process.env.LOSS_PORT ?? "4433", 10);
 const OUT_JSON =
 	process.env.LOSS_OUT ?? join(ROOT, "tools/load/bench-loss-attribution.json");
@@ -487,6 +492,7 @@ async function main(): Promise<void> {
 				String(PAYLOAD_BYTES),
 				"--connect-timeout-secs",
 				String(CONNECT_TIMEOUT_SECONDS),
+				...(STAGGER_SENDS ? ["--stagger-sends"] : []),
 				"--json-out",
 				jsonOut,
 			],
@@ -718,6 +724,7 @@ async function main(): Promise<void> {
 					},
 					config: {
 						ladder: LADDER,
+						staggerSends: STAGGER_SENDS,
 						payloadBytes: PAYLOAD_BYTES,
 						datagramIntervalMs: INTERVAL_MS,
 						steadySeconds: STEADY_SECONDS,
