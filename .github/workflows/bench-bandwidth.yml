@@ -34,6 +34,46 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder)"
+        required: false
+        default: "bandwidth"
+        type: string
+      scale_sessions:
+        description: "session-scale: comma-separated session-count ladder"
+        required: false
+        default: "100,1000,5000,10000,25000,50000"
+        type: string
+      scale_interval_ms:
+        description: "session-scale: per-session datagram interval in ms (5000 = 0.2/s)"
+        required: false
+        default: "5000"
+        type: string
+      scale_payload_bytes:
+        description: "session-scale: datagram payload size in bytes"
+        required: false
+        default: "100"
+        type: string
+      scale_steady_seconds:
+        description: "session-scale: steady-state hold per rung"
+        required: false
+        default: "120"
+        type: string
+      scale_idle_seconds:
+        description: "session-scale: idle tail per rung (isolates idle per-session cost)"
+        required: false
+        default: "30"
+        type: string
+      scale_endpoints:
+        description: "session-scale: client endpoints, one distinct 127.0.k.1 source IP each"
+        required: false
+        default: "64"
+        type: string
+      scale_connect_concurrency:
+        description: "session-scale: concurrent handshakes in flight from the client"
+        required: false
+        default: "500"
+        type: string
 jobs:
   bench:
     permissions:
@@ -105,7 +145,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'session-scale' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -115,11 +155,36 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
+      # Session-count ladder: session count is the only variable, per-session
+      # rate is held deliberately low. Buckets and STOP conditions are
+      # pre-registered in docs/research/preregistrations/session-scale.md.
+      - name: Run session-scale ladder
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'session-scale' }}
+        env:
+          SCALE_SESSIONS: ${{ github.event.inputs.scale_sessions }}
+          SCALE_INTERVAL_MS: ${{ github.event.inputs.scale_interval_ms }}
+          SCALE_PAYLOAD_BYTES: ${{ github.event.inputs.scale_payload_bytes }}
+          SCALE_STEADY_SECONDS: ${{ github.event.inputs.scale_steady_seconds }}
+          SCALE_IDLE_SECONDS: ${{ github.event.inputs.scale_idle_seconds }}
+          SCALE_ENDPOINTS: ${{ github.event.inputs.scale_endpoints }}
+          SCALE_CONNECT_CONCURRENCY: ${{ github.event.inputs.scale_connect_concurrency }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          # Raise the fd soft limit to the hard limit. The pre-registration
+          # expects fd count to be flat in session count (shared QUIC
+          # endpoints); this makes sure a low soft limit cannot masquerade
+          # as a server-side wall if it is not.
+          ulimit -n "$(ulimit -Hn)" || true
+          echo "fd soft limit: $(ulimit -n)"
+          SCALE_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-session-scale-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-session-scale.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
-          path: .bench-evidence/bench-bandwidth-*
+          path: |
+            .bench-evidence/bench-bandwidth-*
+            .bench-evidence/bench-session-scale-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
