@@ -271,6 +271,21 @@ Everything else in this document — the ladder, the arms, the latency buckets,
 the batch A/B rule, the tick-absorption rule, and STOP conditions 2 through 5 —
 is unchanged from the original registration.
 
+## Harness corrections (no registered rule changes)
+
+Defects found by review of the harness before any complete run. They change what
+the numbers *are*, not what the rules *say*, so they are logged here rather than
+amended above.
+
+- **Settle window was on the wrong side of the snapshot.** Each step was read at
+  the moment the load client's process exited and the histogram was then reset,
+  so datagrams still in flight — the ones that had queued longest, i.e. the tail
+  — were counted into no step at all. The 10 s settle is now spent first, as
+  drain grace, and the step is snapshotted after it. Step separation is
+  unchanged; `drainArrivals` reports how many late datagrams the old shape would
+  have discarded. Server CPU keeps the client-process window as its denominator,
+  because the drain is idle.
+
 ## Amendment 2 — A/B resolution, 2026-08-18, before any complete run
 
 **Status:** written after a review of the harness code, before any classified

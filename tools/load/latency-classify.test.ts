@@ -76,6 +76,8 @@ function step(o: StepOverrides = {}): LatencyStep {
 		serverUnstamped: 0,
 		echoSent: 0,
 		echoErr: 0,
+		drainMs: 10_000,
+		drainArrivals: 0,
 		upDeliveryRatio,
 		ingest: histogram(
 			new Array(samples).fill(o.ingestNs ?? 0.4 * MS),
