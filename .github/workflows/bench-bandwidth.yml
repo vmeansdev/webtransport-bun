@@ -84,6 +84,16 @@ on:
         required: false
         default: "10,25,50,100"
         type: string
+      egress_fanout_modes:
+        description: "Fan-out sweeps to run. Both are needed to separate N from rate."
+        required: false
+        default: "per-subscriber,constant-aggregate"
+        type: string
+      egress_fanout_aggregate:
+        description: "Forward egress the constant-aggregate sweep pins, datagrams/s"
+        required: false
+        default: "16500"
+        type: string
 jobs:
   bench:
     permissions:
@@ -220,6 +230,8 @@ jobs:
           EGRESS_STEP_SECONDS: ${{ github.event.inputs.egress_step_seconds }}
           EGRESS_RATES: ${{ github.event.inputs.egress_rates }}
           EGRESS_FANOUT_N: ${{ github.event.inputs.egress_fanout_n }}
+          EGRESS_FANOUT_MODES: ${{ github.event.inputs.egress_fanout_modes }}
+          EGRESS_FANOUT_AGGREGATE: ${{ github.event.inputs.egress_fanout_aggregate }}
           EGRESS_PROFILES: ${{ github.event.inputs.egress_profiles }}
         run: |
           set -euo pipefail
@@ -243,11 +255,21 @@ jobs:
               EGRESS_OUT="$OUT" bun tools/load/bench-egress.ts
             FRAGMENTS="$FRAGMENTS $OUT"
           done
-          PORT=$((PORT + 1))
-          FAN="$OUTDIR/bench-egress-$SHA-fanout.json"
-          echo "== egress fan-out on port $PORT =="
-          EGRESS_SHAPE=fanout EGRESS_PORT="$PORT" EGRESS_OUT="$FAN" bun tools/load/bench-egress.ts
-          FRAGMENTS="$FRAGMENTS $FAN"
+          # Both fan-out sweeps, each its own server process and its own fragment.
+          # An effect that shows up when the per-subscriber rate is held and
+          # vanishes when the aggregate is pinned is a rate effect, not an N
+          # effect, and only running both can tell the two apart.
+          IFS=',' read -ra FANOUT_MODES <<< "$EGRESS_FANOUT_MODES"
+          for MODE in "${FANOUT_MODES[@]}"; do
+            MODE="$(echo "$MODE" | tr -d '[:space:]')"
+            [ -n "$MODE" ] || continue
+            PORT=$((PORT + 1))
+            FAN="$OUTDIR/bench-egress-$SHA-fanout-$MODE.json"
+            echo "== egress fan-out sweep $MODE on port $PORT =="
+            EGRESS_SHAPE=fanout EGRESS_FANOUT_MODE="$MODE" EGRESS_PORT="$PORT" \
+              EGRESS_OUT="$FAN" bun tools/load/bench-egress.ts
+            FRAGMENTS="$FRAGMENTS $FAN"
+          done
           # shellcheck disable=SC2086
           bun tools/load/egress-classify.ts \
             "$OUTDIR/bench-egress-$SHA-classified.json" $FRAGMENTS
