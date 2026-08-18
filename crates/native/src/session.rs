@@ -280,16 +280,25 @@ pub(crate) async fn discard_datagram_for_session(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<bool>> {
-    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+    let Some((dgram_rx, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_datagram_read_state(id)
+    else {
         return Ok(None);
     };
     let mut rx = dgram_rx.lock().await;
     let next = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, rx.recv()).await {
-            Ok(slot) => slot,
-            Err(_) => return Ok(Some(false)),
-        },
-        None => rx.recv().await,
+        Some(limit) => {
+            match tokio::time::timeout(
+                limit,
+                recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify),
+            )
+            .await
+            {
+                Ok(slot) => slot,
+                Err(_) => return Ok(Some(false)),
+            }
+        }
+        None => recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify).await,
     };
     match next {
         Some(slot) => {
@@ -303,6 +312,12 @@ pub(crate) async fn discard_datagram_for_session(
 /// Consume queued datagrams until the session closes or the bounded deadline
 /// expires, without crossing the NAPI boundary once per payload.
 ///
+/// The wait is the same lifecycle-aware one the read path uses. Waiting on the
+/// channel alone would end only when every sender is dropped, so a deadline-free
+/// drain on a session that has already been closed would keep its N-API promise
+/// unsettled — and an unsettled promise keeps the host event loop referenced
+/// long after `server.close()` has resolved.
+///
 /// The load/evidence drain is a black-hole consumer: it needs delivery counts,
 /// not payload bytes. Keeping this loop on the native runtime avoids creating a
 /// Tokio task and JavaScript promise for every low-rate datagram while retaining
@@ -312,7 +327,9 @@ pub(crate) async fn discard_datagrams_for_session(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<u64>> {
-    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+    let Some((dgram_rx, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_datagram_read_state(id)
+    else {
         return Ok(None);
     };
     let mut rx = dgram_rx.lock().await;
@@ -320,11 +337,18 @@ pub(crate) async fn discard_datagrams_for_session(
     let mut discarded = 0u64;
     loop {
         let next = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(slot) => slot,
-                Err(_) => return Ok(Some(discarded)),
-            },
-            None => rx.recv().await,
+            Some(deadline) => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify),
+                )
+                .await
+                {
+                    Ok(slot) => slot,
+                    Err(_) => return Ok(Some(discarded)),
+                }
+            }
+            None => recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify).await,
         };
         match next {
             Some(slot) => {
@@ -1827,6 +1851,54 @@ mod tests {
             .expect("join")
             .expect("read");
         assert!(got.is_none(), "a closed session reads as EOF");
+
+        session_registry::close_session(&session.id, 0, "done");
+    }
+
+    /// The deadline-free discard drains are N-API futures like any other, so
+    /// they have to end on the session closing rather than on the last sender
+    /// being dropped. One that waits on the channel alone stays unsettled for
+    /// as long as the ingress task lives, and an unsettled N-API future keeps
+    /// the host event loop referenced after `server.close()` has resolved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_free_discards_wake_on_close_not_on_the_last_sender() {
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 41).await;
+        for (suffix, drain) in [("single", false), ("bulk", true)] {
+            let id = format!("{}-discard-parked-{suffix}", session.id);
+            // Held for the whole test: only the lifecycle signal may end these.
+            let (_dgram_tx, _b, _u, _cb, _cu, _sm, _notify) = session_registry::insert(
+                id.clone(),
+                u64::MAX - 41,
+                session.conn.clone(),
+                Arc::clone(&session.metrics),
+                Limits::default(),
+                false,
+            );
+
+            let parked_id = id.clone();
+            let parked = tokio::spawn(async move {
+                if drain {
+                    discard_datagrams_for_session(&parked_id, None)
+                        .await
+                        .map(|count| count.is_none())
+                } else {
+                    discard_datagram_for_session(&parked_id, None)
+                        .await
+                        .map(|taken| taken.is_none())
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session_registry::remove(&id);
+
+            let ended_as_eof = tokio::time::timeout(Duration::from_secs(1), parked)
+                .await
+                .unwrap_or_else(|_| panic!("parked {suffix} discard must wake within 1s of close"))
+                .expect("join")
+                .expect("discard");
+            assert!(ended_as_eof, "a closed session drains as EOF ({suffix})");
+        }
 
         session_registry::close_session(&session.id, 0, "done");
     }
