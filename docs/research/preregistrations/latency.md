@@ -336,6 +336,52 @@ own quantization is labelled `ab-unresolvable` and its bucket is advisory, the
 same way a delivery-ratio gap already makes one `ab-confounded`. This can only
 weaken a claim, never manufacture one.
 
+## Amendment 3 — rungs are labelled by effective rate, 2026-08-18, before any complete run
+
+**Status:** written from harness review, before any classified latency result
+existed (the single dispatch, run 32159708926, aborted as a harness fault and is
+logged below). No measured latency value informed it. The rule being amended is
+quoted in full first.
+
+**Original rule (Ladder), quoted verbatim:**
+
+> 100 sessions, 1150 B payloads (identical to the closed bandwidth ladder, so the
+> two are comparable). Per-session rates and their aggregate offered load:
+>
+> | step | per-session /s | aggregate /s |
+> |---|---|---|
+> | 1 | 100 | 10,000 |
+> | 2 | 250 | 25,000 |
+> | 3 | 500 | 50,000 |
+> | 4 | 750 | 75,000 |
+> | 5 | 900 | 90,000 |
+> | 6 | 1100 | 110,000 |
+
+**What was wrong.** Those are the rates *requested*. The tick arm cannot produce
+them: at 64 Hz a session sends `round(rate / 64)` datagrams per tick, so its real
+per-session rate is that rounded burst times 64. The requested column and the
+produced column are not the same ladder:
+
+| requested /s/session | tick burst | tick effective /s/session | tick effective aggregate /s |
+|---|---|---|---|
+| 100 | 2 | 128 | 12,800 |
+| 250 | 4 | 256 | 25,600 |
+| 500 | 8 | 512 | 51,200 |
+| 750 | 12 | 768 | 76,800 |
+| 900 | 14 | 896 | 89,600 |
+| 1100 | 17 | 1088 | 108,800 |
+
+The first rung is mislabelled by 28%. The uniform arm quantizes too, by well
+under one datagram per second per session, and the ladder is unchanged for it.
+
+**Amended:** the ladder above stays exactly as the set of rates *requested*, and
+every rung is **labelled by the effective rate the generator reported**
+(`effectiveDatagramsPerSecPerSession × sessions`), which is also what the A/B
+pairs on — the batch rule already says "at equal offered rate", and two arms that
+were asked for the same rung but produced different loads were never a
+comparison. The requested rate is kept beside it on every row and is never a
+label. No bucket, boundary or STOP changes.
+
 ## Dispatch log
 
 Every dispatch of this axis is logged here, including aborted ones, per the
