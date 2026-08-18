@@ -382,6 +382,39 @@ were asked for the same rung but produced different loads were never a
 comparison. The requested rate is kept beside it on every row and is never a
 label. No bucket, boundary or STOP changes.
 
+## Amendment 4 — offered-shortfall is measured against the actual window, 2026-08-18, before any complete run
+
+**Status:** written from harness review, before any classified latency result
+existed (the single dispatch, run 32159708926, aborted as a harness fault and is
+logged below). No measured latency value informed it. The rule being amended is
+quoted in full first.
+
+**Original rule 2, quoted verbatim:**
+
+> 2. **`offered-shortfall`** — datagrams actually sent < 0.90 × requested
+>    (`sessions × rate × stepSeconds`). The step did not run the load it claims.
+
+**What was wrong.** Two of the three factors were wrong. `rate` was the
+requested rate, not the produced one — Amendment 3 deals with that. `stepSeconds`
+was the nominal step length, but the load client does not offer load for
+`stepSeconds`: it connects, staggers 100 sessions 10 ms apart, drives, then
+joins. Any step that ends early — a client killed, a session that lost its
+connection at 50 s — was still judged against a full step's worth of datagrams,
+so the rule could fire on a step that offered everything it had time to offer,
+and a genuinely short run and a genuinely slow generator were indistinguishable.
+
+**Amended rule 2:** datagrams actually sent < 0.90 × (registered sessions ×
+**effective** per-session rate × **measured drive window**), where the drive
+window is the longest interval any single session actually spent offering load,
+reported by the client as `driveWindowSec`. Longest, not mean: a session that
+died at 5 s must not shrink the denominator and hide itself. Sessions that never
+connected drive nothing and stay in the session multiplier, so they show up as
+the shortfall they are. The 0.90 tolerance and rule 2's position in the STOP
+order are unchanged. If the client reports no drive window at all the nominal
+step length stands in, the fallback is flagged in the artifact
+(`driveWindowMeasured: false`), and the step is `clock-invalid` for the missing
+client block anyway.
+
 ## Dispatch log
 
 Every dispatch of this axis is logged here, including aborted ones, per the
