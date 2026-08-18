@@ -510,3 +510,190 @@ Registered here, as the same clause made mechanical: a gate's capacity is
 reported as a **floor** when **no complete rung above it failed that gate** —
 "no crossing observed". A rung that is `incomplete` is evidence of nothing and
 neither establishes nor refutes a crossing.
+
+### Amendment 8 — the fan-out shape is replaced, and both of its falsifiers are registered (2026-08-19)
+
+The fan-out ladder registered below was **retracted** by
+`docs/research/2026-08-18-four-axes-measurement.md`: it measured the harness's
+serial JS forward loop against one co-resident subscriber process, with no
+demonstrable ingest (an origination lag of 9–31 µs against the ladder's
+1.4–4.9 ms proves the path never resembled ingest-then-forward), with N
+confounded with aggregate rate, and with its send-cost instrument hardcoded
+empty. Nothing from that run is reused here — not its numbers, and not its
+N=50, which is re-derived from arithmetic in the effort spec (326 pps × 50 =
+16.3k/s forward egress).
+
+This amendment is written **before any replacement harness code exists** and
+before the first dispatch of this axis (the dispatch log above is still empty).
+It quotes the text it replaces in full.
+
+**Original text, quoted in full:**
+
+> ## Fan-out shape (1 ingest → N egress)
+>
+> Run separately from the ladder, because SFU / desktop-share / video-call are all
+> 1→N, not N independent bidirectional sessions.
+>
+> One publisher process (`--sessions 1`, frame-bursty via `--arrival tick
+> --tick-hz 30`, 330 datagrams/s = 11 per frame = 3 Mbps) plus one subscriber
+> process holding N receive-only sessions. The server is a minimal SFU: any
+> datagram arriving from a session is forwarded **verbatim** to every other
+> session. The publisher's own stamp therefore survives the fan-out untouched, and
+> the subscriber measures publisher-send → subscriber-receive with **no server
+> clock in the path at all** — both ends are load-client processes on one host.
+>
+> N ∈ {10, 25, 50, 100}, 45 s each. Aggregate egress = 330 × N, i.e. 3,300 /
+> 8,250 / 16,500 / 33,000 datagrams/s. The server additionally records its own
+> ingest→forward-issue lag as a diagnostic.
+
+and, in the classifier section:
+
+> ### Fan-out — per N, on publisher-send → subscriber-receive p99
+>
+> Same latency buckets as above. Additionally `fanoutScaling` = p99(N) / p99(10),
+> reported raw with no bucket, because there is no pre-registered expectation for
+> its shape and inventing one after the fact would be the thing this document
+> exists to prevent.
+
+**Replacement, registered here in its place.**
+
+#### Shape
+
+Three processes, and the separation is the point:
+
+- **publisher** — one `load-client` process, `--sessions 1 --latency-stamp
+  --arrival tick --tick-hz 30`, 330 datagrams/s (11 per 33.3 ms frame ≈ 3 Mbps
+  at 1150 B). It writes the stamp. It is a Rust process, so the JS
+  origination-saturation finding of the ladder does not apply to it, and its
+  own honesty is checked separately (below).
+- **server** — the Bun server, a minimal SFU. A datagram arriving from the
+  publisher session is forwarded **verbatim** to every subscriber session. The
+  payload is never re-stamped, so no server clock enters the measured interval.
+- **subscribers** — a **separate** `load-client` process, N receive-only
+  sessions (`--egress-recv --datagrams-per-sec 0`). It decodes the publisher's
+  stamp against its own `CLOCK_MONOTONIC` read.
+
+The measured interval is therefore **publisher actual-send → subscriber
+receive**, between two processes that share the system clock, with the server
+in the middle and none of its clocks in the number.
+
+#### Send-cost instrument (wired, not hardcoded)
+
+The retracted run reported an empty histogram where the send cost belongs. Three
+server-side instruments are registered, recorded per forwarded frame:
+
+| name | interval |
+|---|---|
+| `forwardIssueSpread` | first forward `sendDatagram` call → last one, inside one arrival's fan-out |
+| `forwardSettle` | first forward call → all N of that arrival's sends settled |
+| `handlerToForward` | JS handler entry → first forward call (diagnostic; legitimately µs, and **not** gated) |
+
+`forwardIssueSpread / max(N,1)` is the per-target crossing cost the send-batch
+lever would act on. It is recorded, not acted on: this axis may not optimize.
+
+#### N decoupled from rate
+
+Two sweeps, both registered, over the same N ∈ {10, 25, 50, 100}:
+
+- **`per-subscriber`** (default) — per-subscriber rate held at 330/s for every
+  N. Aggregate forward egress = 330 × N = 3,300 / 8,250 / 16,500 / 33,000 /s.
+- **`constant-aggregate`** — aggregate forward egress pinned at 16,500/s (the
+  N=50 arithmetic point the effort spec derives). The publisher rate is
+  `round(16,500 / N)`, so N varies at fixed forward load.
+
+An effect present in `per-subscriber` and absent in `constant-aggregate` is a
+rate effect, not an N effect. That comparison is the decoupling; neither sweep
+alone licenses an N claim.
+
+#### Falsifier 1 — ingest-reality (registered, run-invalidating)
+
+The retracted run's defining failure. Three mechanical conditions, all evaluated
+per fan-out step; any failure marks the step `incomplete` with stop
+`ingest-unreal`, and an `incomplete` step never carries a capacity number.
+
+1. **`ingestToForwardLag` p50 ≥ 100 µs.** `ingestToForwardLag` is the publisher's
+   own `actual` stamp → the first forward send issued for that datagram: the
+   whole ingest path (loopback UDP, quinn decrypt, the N-API crossing, the JS
+   event loop) plus the forward decision. The retracted signature was 9–31 µs;
+   100 µs is 3.2× the top of it, chosen as the line below which a µs-scale
+   in-process shortcut cannot hide. It is a falsifier threshold and **not** a
+   claim about what real ingest costs — the observed value is reported in full
+   (p50/p90/p99/p999/max) whatever it is.
+2. **Cadence.** `serverInterArrival` = gaps between consecutive server-observed
+   publisher datagrams. `frameGapFraction` = the fraction of those gaps that are
+   ≥ 0.5 × the publisher's grid period must lie inside
+   `[0.5 × 1/perEvent, 2.0 × 1/perEvent]`, where `perEvent` is the publisher's
+   registered datagrams-per-frame. A source that never crossed a network carries
+   no frame cadence, and this condition sees that structurally rather than by
+   the size of a number.
+3. **Stamp provenance.** `publisherStamped ≥ 0.99 × ingested`. A server that is
+   not decoding real publisher stamps has no ingest to describe.
+
+#### Falsifier 2 — sink-saturation pre-check (registered, run-invalidating)
+
+The subscriber process is co-resident on the same 4 vCPU. If it saturates, the
+fan-out p99 is a number about the subscriber process, and reporting it as fan-out
+capacity is exactly the retracted mistake in a new place.
+
+Before each distinct N, the harness runs a **pre-check arm**: the server
+originates directly into that same subscriber process (`constant` profile, no
+publisher, no forwarding) at **1.5 ×** the aggregate the fan-out step will impose
+on it, for 20 s. The pre-check **passes** iff
+
+- `downDeliveryRatio ≥ 0.99` (the same bar G4 sets on forward delivery, met at
+  1.5× the load), **and**
+- `egressOneWay` p99 < 33.3 ms (the frame gate), **and**
+- the pre-check arm did not itself trip `generator-saturation` — if the JS
+  originator saturated, the arm says nothing about the sink.
+
+A failed pre-check marks every fan-out step at that N `incomplete` with stop
+`sink-saturation`; a pre-check that tripped the JS generator marks them
+`incomplete` with stop `sink-precheck-inconclusive`. In both cases **no capacity
+number is claimed at that N** — the result is a statement about the rig, and it
+is reported as one.
+
+#### Generator STOPs sit on the publisher side
+
+The publisher is Rust, so the ladder's JS `generator-saturation` rule does not
+apply to a fan-out step. Its replacement, same shape:
+
+- **`publisher-shortfall`** — the publisher's own counters show
+  `datagrams sent < 0.9 × (rate × driveWindowSec)`, **or** its
+  `ticksSkipped ≥ 0.10 × (ticksSkipped + sendEvents)`.
+
+#### Capacity STOPs sit on the forward side
+
+- **`forward-shortfall`** — the server issued
+  `forwarded < 0.9 × ingested × subscribersConnected`; the forward side did not
+  offer the registered shape.
+- **`forward-overrun`** — a reported **label, never a STOP**:
+  `forwardSettle` p99 ≥ the publisher's grid period, i.e. the server could not
+  finish fanning one frame out before the next one arrived. That is a capacity
+  finding at that N and discarding it as `incomplete` would be throwing the
+  answer away.
+
+#### STOP order for a fan-out step
+
+Evaluated in this order, first match wins:
+`sink-saturation` / `sink-precheck-inconclusive` → `ingest-unreal` →
+`publisher-shortfall` → `forward-shortfall` → `clock-invalid` →
+`delivery-collapse` → `sample-starvation`.
+
+#### Buckets and reported numbers
+
+The latency buckets of the ladder, unchanged, applied to publisher-send →
+subscriber-receive p99. Additionally, per N: `forwardDeliveryRatio` =
+subscriber-received / server-forwarded; `fanoutScaling` = p99(N) / p99(smallest
+complete N), reported raw with **no** bucket, because no expectation for its
+shape was registered and inventing one after the fact is the thing this document
+exists to prevent. `fanoutScaling` is reported per sweep and is never compared
+across sweeps.
+
+#### What this shape may not do
+
+It may not report a number from a step that any falsifier marked `incomplete`;
+it may not compare a `per-subscriber` rung to a `constant-aggregate` rung as if
+they were the same measurement; and it may not quote a local macOS smoke number
+as a result — the local smoke exists only to prove the harness runs, and to
+prove that both falsifiers fire when the condition they exist to catch is
+introduced deliberately.
