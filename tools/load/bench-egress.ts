@@ -105,8 +105,25 @@ const GENERATOR_SECONDS = parseInt(
 	process.env.EGRESS_GENERATOR_SECONDS ?? "5",
 	10,
 );
+/** The pre-registered origination-lag bound for a passing generator rung. */
+const GENERATOR_LAG_BOUND_NS = 5e6;
 /** Seconds allowed for every subscriber session to hand shake before a step starts. */
 const CONNECT_BUDGET_S = parseInt(process.env.EGRESS_CONNECT_BUDGET ?? "8", 10);
+/** Seconds allowed for the previous step's sessions to close before the next one. */
+const DRAIN_BUDGET_S = parseInt(process.env.EGRESS_DRAIN_BUDGET ?? "15", 10);
+/**
+ * Slack on the client's `--duration` past what the driver needs.
+ *
+ * The client counts its duration from process start, the driver starts its
+ * clock once the sessions are up. Without slack a step that spends its whole
+ * connect budget has the receiver exiting on the same instant the originator
+ * stops, and the tail of the step is measured against a client that is already
+ * tearing down.
+ */
+const CLIENT_DURATION_SLACK_S = parseInt(
+	process.env.EGRESS_CLIENT_SLACK ?? "10",
+	10,
+);
 const OUT_JSON =
 	process.env.EGRESS_OUT ??
 	join(ROOT, `tools/load/bench-egress-${SHAPE}-${PROFILE}.json`);
@@ -327,11 +344,12 @@ async function runGeneratorProbe(clock: {
 		sunk += Buffer.from(bytes).length;
 	};
 
-	// The lag bound is relative to this platform's own idle timer-wake
-	// granularity, measured by the first rung. An absolute bound would fail on a
-	// host whose `setTimeout` floor happens to be a few milliseconds, voiding the
-	// control for a reason that has nothing to do with load — the same trap the
-	// latency axis had to amend its way out of.
+	// The bound is the flat 5 ms the pre-registration fixed. A floor-relative
+	// bound was tempting — this platform's idle timer-wake granularity is not
+	// load — but every way of relaxing it makes the ceiling larger, and a larger
+	// ceiling makes the `generator-headroom` STOP easier to clear. That STOP is
+	// the maintainer's non-negotiable, so it is left exactly as registered and
+	// the floor is recorded as a diagnostic only.
 	let lagFloorNs = Number.POSITIVE_INFINITY;
 
 	for (const aggregate of GENERATOR_RATES) {
@@ -352,9 +370,7 @@ async function runGeneratorProbe(clock: {
 			emittedFraction: fraction,
 			originationLagP99Ns: p99,
 			lagFloorNs: Number.isFinite(lagFloorNs) ? lagFloorNs : 0,
-			passes:
-				fraction >= 0.95 &&
-				p99 < Math.max(5e6, 3 * (Number.isFinite(lagFloorNs) ? lagFloorNs : 0)),
+			passes: fraction >= 0.95 && p99 < GENERATOR_LAG_BOUND_NS,
 		};
 		rungs.push(rung);
 		console.log(
@@ -584,6 +600,27 @@ async function main(): Promise<void> {
 		return subscribers.length;
 	};
 
+	/**
+	 * Wait for the previous step's sessions to actually leave.
+	 *
+	 * `subscribers` is one array for the whole run and entries are removed when
+	 * `session.closed` settles, which is later than the previous client's exit.
+	 * Without this, `waitForSessions` returns instantly on the *old* sessions and
+	 * the step drives datagrams into connections that are on their way out —
+	 * which reads as a delivery collapse that has nothing to do with egress.
+	 */
+	const waitForDrain = async (): Promise<void> => {
+		const deadline = Date.now() + DRAIN_BUDGET_S * 1000;
+		while (Date.now() < deadline && subscribers.length > 0) {
+			await Bun.sleep(100);
+		}
+		if (subscribers.length > 0) {
+			console.warn(
+				`bench-egress: ${subscribers.length} session(s) still open after ${DRAIN_BUDGET_S}s drain`,
+			);
+		}
+	};
+
 	const steps: EgressStep[] = [];
 
 	const runStep = async (
@@ -591,7 +628,9 @@ async function main(): Promise<void> {
 		sessionsRequested: number,
 	): Promise<void> => {
 		const plan = planFor(PROFILE, perSessionRate);
-		const durationSec = STEP_SECONDS + CONNECT_BUDGET_S;
+		const durationSec =
+			STEP_SECONDS + CONNECT_BUDGET_S + CLIENT_DURATION_SLACK_S;
+		await waitForDrain();
 		const sub = spawnClient(subscriberArgs(sessionsRequested, durationSec));
 		const connected = await waitForSessions(sessionsRequested);
 		if (connected === 0) {
@@ -667,7 +706,9 @@ async function main(): Promise<void> {
 	};
 
 	const runFanoutStep = async (n: number): Promise<void> => {
-		const durationSec = STEP_SECONDS + CONNECT_BUDGET_S;
+		const durationSec =
+			STEP_SECONDS + CONNECT_BUDGET_S + CLIENT_DURATION_SLACK_S;
+		await waitForDrain();
 		const sub = spawnClient(subscriberArgs(n, durationSec));
 		const connected = await waitForSessions(n);
 		if (connected === 0) {
