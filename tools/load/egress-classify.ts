@@ -48,15 +48,23 @@ const FRAME_PERIOD_NS = 33.3333 * MS;
 const CLOCK_RESIDUAL_LIMIT_NS = 50_000;
 const MIN_SAMPLES = 10_000;
 
+/**
+ * The loaded-server headroom arm, per pre-registration amendment 1. `burnNs` is
+ * the falsifier's synthetic per-datagram cost: any non-zero value means the run
+ * exists to prove the STOP fires, and it may never carry a capacity number.
+ */
+export type HeadroomFragment = {
+	ceilingPerSec: number;
+	burnNs?: number;
+	rungs: Array<Record<string, unknown>>;
+};
+
 export type Fragment = {
-	shape: "ladder" | "fanout" | "generator";
+	shape: "ladder" | "fanout" | "headroom";
 	profile?: EgressProfile;
 	clock: { calibrationResidualNs: number; source: string };
 	config?: Record<string, unknown>;
-	generator?: {
-		ceilingPerSec: number;
-		rungs: Array<Record<string, unknown>>;
-	};
+	headroom?: HeadroomFragment | null;
 	steps?: RawStep[];
 };
 
@@ -67,6 +75,7 @@ type RawStep = {
 	sessionsRequested: number;
 	sessionsConnected: number;
 	aggregateRate: number;
+	/** Wall clock across the step. Disclosure only: no rate divides by it. */
 	elapsedSec: number;
 	originator: {
 		sent: number;
@@ -77,7 +86,8 @@ type RawStep = {
 		originationLag: LatencyHistogramJson;
 		sendIssueSpread: LatencyHistogramJson;
 		peakWindowDatagrams: number;
-		effectiveRatePerSession: number;
+		/** The interval the originator was driving. Every rate divides by this. */
+		driveWindowSec: number;
 	};
 	clientReceived: number;
 	client: {
@@ -86,11 +96,17 @@ type RawStep = {
 		recvUnstamped: number;
 	} | null;
 	downDeliveryRatio: number | null;
+	/** Percent of one core, so the threshold below scales with `hostCpuCount`. */
 	hostCpuPctMedian: number | null;
+	hostCpuCount?: number;
 	serverCpuPct: number;
 	ingested: number;
 	forwardLag: LatencyHistogramJson | null;
 };
+
+/** Co-residence advisory: host CPU at this fraction of total host capacity. */
+const CO_RESIDENCE_HOST_FRACTION = 0.97;
+const CO_RESIDENCE_DELIVERY = 0.95;
 
 export type ClassifiedStep = {
 	shape: "ladder" | "fanout";
@@ -117,8 +133,20 @@ export type ClassifiedStep = {
 	sendEventsSkipped: number;
 	sendEventsScheduled: number;
 	hostCpuPctMedian: number | null;
+	hostCpuCount: number | null;
 	serverCpuPct: number;
+	/** The interval the rates below divide by. */
+	driveWindowSec: number;
+	/** Wall clock across the step, for disclosure of the overshoot. */
+	elapsedSec: number;
 	deliveredPerSec: number;
+	/**
+	 * The load the step *demanded*, from the profile generator's own arithmetic.
+	 * The headroom STOP divides by this rather than by `deliveredPerSec`: a
+	 * generator-bound run depresses what was delivered, and a rule that divides
+	 * by a depressed number passes exactly when it should fire.
+	 */
+	offeredPerSec: number;
 };
 
 function summarize(json: LatencyHistogramJson | null): LatencySummary | null {
@@ -158,6 +186,9 @@ export function stopFor(
 	endToEnd: LatencySummary | null,
 	lag: LatencySummary,
 ): StopReason | null {
+	// `sendEventsScheduled` is every grid event the plan put inside the step,
+	// run and skipped alike, so this ratio is the registered `skipped/scheduled`
+	// and not `skipped/ran`.
 	const events = step.originator.sendEventsScheduled;
 	if (events > 0 && step.originator.sendEventsSkipped >= 0.1 * events) {
 		return "generator-saturation";
@@ -166,6 +197,9 @@ export function stopFor(
 		return "generator-saturation";
 	}
 
+	// Both halves of `offered-shortfall` (amendment 2): a rung driven into fewer
+	// than 95% of its registered sessions is not the registered shape, and a rung
+	// that issued under 90% of the plan's own count did not offer it.
 	const scheduled = step.originator.scheduledDatagrams;
 	if (scheduled > 0 && step.originator.sent < 0.9 * scheduled) {
 		return "offered-shortfall";
@@ -211,6 +245,13 @@ export function classifySteps(
 			new LatencyHistogram().summary();
 		const floor = floors.get(`${step.shape}:${step.profile}`) ?? 0;
 		const stop = stopFor(step, residualNs, floor, oneWay, endToEnd, lag);
+		// Rates divide by the drive window, never by the step's wall clock, which
+		// also contains the CPU sampler, the client's exit and (on fan-out) a
+		// process spawn. Older fragments without the field fall back to it.
+		const window =
+			step.originator.driveWindowSec > 0
+				? step.originator.driveWindowSec
+				: step.elapsedSec;
 		const complete = stop === null;
 		const resolved = oneWay ?? new LatencyHistogram().summary();
 		const isFrameArm =
@@ -233,9 +274,13 @@ export function classifySteps(
 						: "burst-overrun"
 					: null,
 			burstSpreadMs: complete ? (resolved.p99Ns - resolved.p50Ns) / MS : null,
+			// Host CPU arrives as percent-of-one-core, so the registered "≥ 97% of
+			// the host" is 97% of `100 × cores` — 388 on the 4 vCPU rig. Reading a
+			// bare 97 against that unit would fire on almost every step.
 			coResidenceBound:
-				(step.hostCpuPctMedian ?? 0) >= 97 &&
-				(step.downDeliveryRatio ?? 1) < 0.95,
+				(step.hostCpuPctMedian ?? 0) >=
+					CO_RESIDENCE_HOST_FRACTION * 100 * (step.hostCpuCount ?? 1) &&
+				(step.downDeliveryRatio ?? 1) < CO_RESIDENCE_DELIVERY,
 			oneWay: resolved,
 			endToEnd,
 			originationLag: lag,
@@ -252,9 +297,13 @@ export function classifySteps(
 			sendEventsSkipped: step.originator.sendEventsSkipped,
 			sendEventsScheduled: step.originator.sendEventsScheduled,
 			hostCpuPctMedian: step.hostCpuPctMedian,
+			hostCpuCount: step.hostCpuCount ?? null,
 			serverCpuPct: step.serverCpuPct,
-			deliveredPerSec:
-				step.elapsedSec > 0 ? step.clientReceived / step.elapsedSec : 0,
+			driveWindowSec: window,
+			elapsedSec: step.elapsedSec,
+			deliveredPerSec: window > 0 ? step.clientReceived / window : 0,
+			offeredPerSec:
+				window > 0 ? step.originator.scheduledDatagrams / window : 0,
 		};
 	});
 }
@@ -265,7 +314,12 @@ export type ProfileVerdict = {
 	/** Highest complete aggregate rate under each gate, or null if none. */
 	capacityRealtimePerSec: number | null;
 	capacityFramePerSec: number | null;
-	/** True when the top rung still cleared the gate: the number is a floor. */
+	/**
+	 * True when no complete rung above the capacity was ever seen to *fail* the
+	 * gate — the pre-registration's own "no crossing observed" clause. A rung
+	 * excluded by a STOP is evidence of nothing and neither establishes nor
+	 * refutes a crossing, so it cannot turn a floor into a point estimate.
+	 */
 	realtimeIsFloor: boolean;
 	frameIsFloor: boolean;
 };
@@ -288,10 +342,6 @@ export function verdictForProfile(
 		(atOrAboveFloor.length === 0 || atOrAboveFloor.some((s) => s.complete));
 
 	const complete = own.filter((s) => s.complete);
-	const top = own.reduce(
-		(a, b) => (b.aggregateRate > a ? b.aggregateRate : a),
-		0,
-	);
 	const under = (gate: number) =>
 		complete
 			.filter((s) => s.oneWay.p99Ns < gate)
@@ -299,6 +349,10 @@ export function verdictForProfile(
 				(a, b) => (a === null || b.aggregateRate > a ? b.aggregateRate : a),
 				null,
 			);
+	/** No crossing observed: nothing complete above the capacity failed the gate. */
+	const isFloor = (gate: number, capacity: number | null) =>
+		capacity !== null &&
+		!complete.some((s) => s.aggregateRate > capacity && s.oneWay.p99Ns >= gate);
 	const realtime = under(GATE_REALTIME_NS);
 	const frame = under(GATE_FRAME_NS);
 	return {
@@ -306,8 +360,8 @@ export function verdictForProfile(
 		armComplete,
 		capacityRealtimePerSec: armComplete ? realtime : null,
 		capacityFramePerSec: armComplete ? frame : null,
-		realtimeIsFloor: realtime !== null && realtime === top,
-		frameIsFloor: frame !== null && frame === top,
+		realtimeIsFloor: isFloor(GATE_REALTIME_NS, realtime),
+		frameIsFloor: isFloor(GATE_FRAME_NS, frame),
 	};
 }
 
@@ -371,57 +425,80 @@ export function summarizeFanout(steps: ClassifiedStep[]): FanoutVerdict[] {
 
 export type RunVerdict = {
 	complete: boolean;
-	stop: "generator-headroom" | "constant-arm-incomplete" | null;
+	stop:
+		| "harness-falsifier"
+		| "generator-headroom"
+		| "constant-arm-incomplete"
+		| null;
 	generatorCeilingPerSec: number;
+	/** The denominator of the headroom rule: offered load, not delivered. */
+	maxOfferedPerSec: number;
+	/** Reported beside it, so the gap between demanded and delivered is visible. */
 	maxDeliveredPerSec: number;
 	headroomRatio: number | null;
+	headroomBurnNs: number;
 };
 
+/** The registered headroom factor. Do not touch. */
+export const HEADROOM_FACTOR = 1.5;
+
 /**
- * The run-level gate the maintainer made non-negotiable: unless the JS
- * originator demonstrably offers materially more than the transport delivered,
- * the ladder measured the generator and the stamp is `incomplete`.
+ * The run-level gate the maintainer made non-negotiable, as amended.
+ *
+ * The originator must demonstrably have been able to source materially more
+ * than the ladder *asked of it*, measured on the loaded box. Two properties do
+ * the work, and the arm this replaced had neither: the ceiling comes from a
+ * loaded-server arm rather than an idle one, and the denominator is the profile
+ * generator's own offered rate rather than delivered throughput — a
+ * generator-bound run depresses delivered, so dividing by it made the rule pass
+ * precisely when it should have fired.
  */
 export function verdictForRun(
 	steps: ClassifiedStep[],
-	generatorCeilingPerSec: number,
+	headroom: HeadroomFragment | null,
 	profiles: ProfileVerdict[],
 ): RunVerdict {
+	const generatorCeilingPerSec = headroom?.ceilingPerSec ?? 0;
+	const burnNs = headroom?.burnNs ?? 0;
+	// Offered, over the complete rungs only: an incomplete rung supports no
+	// capacity claim, so it sets no bar for the generator either.
+	const maxOffered = steps.reduce(
+		(a, s) => (s.complete ? Math.max(a, s.offeredPerSec) : a),
+		0,
+	);
 	const maxDelivered = steps.reduce(
 		(a, s) => Math.max(a, s.deliveredPerSec),
 		0,
 	);
-	const ratio = maxDelivered > 0 ? generatorCeilingPerSec / maxDelivered : null;
-	if (ratio !== null && ratio < 1.5) {
-		return {
-			complete: false,
-			stop: "generator-headroom",
-			generatorCeilingPerSec,
-			maxDeliveredPerSec: maxDelivered,
-			headroomRatio: ratio,
-		};
-	}
-	const constant = profiles.find((p) => p.profile === "constant");
-	if (constant && !constant.armComplete) {
-		return {
-			complete: false,
-			stop: "constant-arm-incomplete",
-			generatorCeilingPerSec,
-			maxDeliveredPerSec: maxDelivered,
-			headroomRatio: ratio,
-		};
-	}
-	return {
-		complete: true,
-		stop: null,
+	const ratio = maxOffered > 0 ? generatorCeilingPerSec / maxOffered : null;
+	const base = {
 		generatorCeilingPerSec,
+		maxOfferedPerSec: maxOffered,
 		maxDeliveredPerSec: maxDelivered,
 		headroomRatio: ratio,
+		headroomBurnNs: burnNs,
 	};
+	// A starved originator is a proof that the STOP fires, never a measurement.
+	if (burnNs > 0) {
+		return { complete: false, stop: "harness-falsifier", ...base };
+	}
+	// The two run-level STOPs are unordered in the pre-registration; the control
+	// arm is checked first because a run whose control collapsed has no offered
+	// load for the headroom rule to divide by, and would otherwise be reported
+	// under the less specific of the two names.
+	const constant = profiles.find((p) => p.profile === "constant");
+	if (constant && !constant.armComplete) {
+		return { complete: false, stop: "constant-arm-incomplete", ...base };
+	}
+	if (ratio === null || ratio < HEADROOM_FACTOR) {
+		return { complete: false, stop: "generator-headroom", ...base };
+	}
+	return { complete: true, stop: null, ...base };
 }
 
 export function classify(fragments: Fragment[]) {
-	const generator = fragments.find((f) => f.shape === "generator")?.generator;
+	const headroom =
+		fragments.find((f) => f.shape === "headroom")?.headroom ?? null;
 	const residualNs = fragments.reduce(
 		(a, f) => Math.max(a, f.clock?.calibrationResidualNs ?? 0),
 		0,
@@ -431,7 +508,7 @@ export function classify(fragments: Fragment[]) {
 	const profiles = [
 		...new Set(steps.filter((s) => s.shape === "ladder").map((s) => s.profile)),
 	].map((p) => verdictForProfile(p, steps));
-	const run = verdictForRun(steps, generator?.ceilingPerSec ?? 0, profiles);
+	const run = verdictForRun(steps, headroom, profiles);
 
 	return {
 		version: 1,
@@ -442,7 +519,7 @@ export function classify(fragments: Fragment[]) {
 			frameMs: GATE_FRAME_NS / MS,
 		},
 		clockResidualNs: residualNs,
-		generator: generator ?? null,
+		headroom,
 		run,
 		profiles,
 		alignment: compareAlignment(steps),
@@ -469,8 +546,13 @@ if (import.meta.main) {
 		`egress-classify: run complete=${result.run.complete} stop=${result.run.stop ?? "none"}`,
 	);
 	console.log(
-		`egress-classify: generator ceiling=${result.run.generatorCeilingPerSec}/s maxDelivered=${result.run.maxDeliveredPerSec.toFixed(0)}/s headroom=${result.run.headroomRatio?.toFixed(2) ?? "n/a"}x`,
+		`egress-classify: generator ceiling=${result.run.generatorCeilingPerSec.toFixed(0)}/s (loaded) maxOffered=${result.run.maxOfferedPerSec.toFixed(0)}/s maxDelivered=${result.run.maxDeliveredPerSec.toFixed(0)}/s headroom=${result.run.headroomRatio?.toFixed(2) ?? "n/a"}x`,
 	);
+	if (result.run.headroomBurnNs > 0) {
+		console.log(
+			`egress-classify: EGRESS_HEADROOM_BURN_NS=${result.run.headroomBurnNs} — falsifier artifact, no capacity number may be read from this run`,
+		);
+	}
 	for (const p of result.profiles) {
 		console.log(
 			`egress-classify: ${p.profile} armComplete=${p.armComplete} capacity(p99<5ms)=${p.capacityRealtimePerSec ?? "none"}${p.realtimeIsFloor ? "+" : ""}/s capacity(p99<33.3ms)=${p.capacityFramePerSec ?? "none"}${p.frameIsFloor ? "+" : ""}/s`,
