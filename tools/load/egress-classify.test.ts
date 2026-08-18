@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
 	type AlignmentBucket,
-	type ClassifiedStep,
-	type EgressBucket,
 	alignmentBucketFor,
 	bucketFor,
+	type ClassifiedStep,
 	classify,
 	classifySteps,
 	compareAlignment,
+	type EgressBucket,
 	summarizeFanout,
 	verdictForProfile,
 	verdictForRun,
@@ -69,7 +69,7 @@ function step(
 			originationLag: flat(1 * MS, 1000),
 			sendIssueSpread: flat(0, 1000),
 			peakWindowDatagrams: 326,
-			effectiveRatePerSession: 326,
+			driveWindowSec: 45,
 		},
 		clientReceived: received,
 		client: {
@@ -78,7 +78,9 @@ function step(
 			recvUnstamped: 0,
 		},
 		downDeliveryRatio: sent > 0 ? received / sent : null,
+		// Percent of one core on a 4 vCPU rig: 60 of a possible 400.
 		hostCpuPctMedian: 60,
+		hostCpuCount: 4,
 		serverCpuPct: 90,
 		ingested: 0,
 		forwardLag: null,
@@ -252,12 +254,45 @@ describe("STOP conditions", () => {
 	});
 
 	test("co-residence is labelled, never a STOP", () => {
+		// 390 of a possible 400 on the 4 vCPU rig: over the registered 97% of the
+		// host, in the percent-of-one-core unit every axis reports.
 		const [s] = classifySteps(
-			[step({ hostCpuPctMedian: 99 }, { sent: 20_000, received: 18_000 })],
+			[step({ hostCpuPctMedian: 390 }, { sent: 20_000, received: 18_000 })],
 			0,
 		);
 		expect(s?.complete).toBe(true);
 		expect(s?.coResidenceBound).toBe(true);
+	});
+
+	test("co-residence reads 97% of the host, not 97% of one core", () => {
+		// The old threshold was a bare 97, which in this unit is under one core
+		// busy — it would have labelled a nearly idle rig as co-residence-bound.
+		const [s] = classifySteps(
+			[step({ hostCpuPctMedian: 100 }, { sent: 20_000, received: 18_000 })],
+			0,
+		);
+		expect(s?.coResidenceBound).toBe(false);
+	});
+});
+
+describe("rates divide by the drive window", () => {
+	test("the sampler join and the client's exit are outside the denominator", () => {
+		const base = step({}, { sent: 45_000, received: 45_000 });
+		const [s] = classifySteps(
+			[
+				{
+					...base,
+					// Six seconds of sampler join and client reaping past the drive.
+					elapsedSec: 51,
+					originator: { ...base.originator, driveWindowSec: 45 },
+				},
+			],
+			0,
+		);
+		expect(s?.driveWindowSec).toBe(45);
+		expect(s?.elapsedSec).toBe(51);
+		expect(s?.deliveredPerSec).toBeCloseTo(1000, 5);
+		expect(s?.offeredPerSec).toBeCloseTo(1000, 5);
 	});
 });
 
@@ -291,6 +326,32 @@ describe("capacity under the registered gates", () => {
 		const v = verdictForProfile("constant", steps);
 		expect(v.capacityRealtimePerSec).toBe(30_000);
 		expect(v.realtimeIsFloor).toBe(true);
+	});
+
+	test("an incomplete top rung leaves the capacity below it a floor", () => {
+		// No crossing was ever observed: the rung above was excluded, and an
+		// excluded rung is evidence of nothing. Reading it as a point estimate
+		// would claim more than the run saw.
+		const steps = classifySteps(
+			[
+				step({ perSessionRate: 100, aggregateRate: 10_000 }),
+				step(
+					{ perSessionRate: 200, aggregateRate: 20_000 },
+					{ sent: 20_000, received: 2_000 },
+				),
+			],
+			0,
+		);
+		const v = verdictForProfile("constant", steps);
+		expect(v.capacityRealtimePerSec).toBe(10_000);
+		expect(v.realtimeIsFloor).toBe(true);
+	});
+
+	test("a complete rung that crossed the gate ends the floor", () => {
+		const steps = ladder([1, 60]);
+		const v = verdictForProfile("constant", steps);
+		expect(v.capacityRealtimePerSec).toBe(10_000);
+		expect(v.realtimeIsFloor).toBe(false);
 	});
 
 	test("an arm whose loaded rungs all stopped contributes nothing", () => {
@@ -384,20 +445,57 @@ describe("fan-out", () => {
 });
 
 describe("the run-level generator gate", () => {
+	const ceiling = (perSec: number) => ({ ceilingPerSec: perSec, rungs: [] });
 	const steps: ClassifiedStep[] = classifySteps([step()], 0);
 	const profiles = [verdictForProfile("constant", steps)];
-	const delivered = steps[0]?.deliveredPerSec ?? 0;
+	const offered = steps[0]?.offeredPerSec ?? 0;
 
-	test("a generator that barely outruns the transport voids the run", () => {
-		const v = verdictForRun(steps, Math.round(delivered * 1.2), profiles);
+	test("a generator that barely outruns what the ladder asked voids the run", () => {
+		const v = verdictForRun(steps, ceiling(offered * 1.2), profiles);
 		expect(v.complete).toBe(false);
 		expect(v.stop).toBe("generator-headroom");
 	});
 
 	test("1.5x headroom is the registered pass", () => {
-		const v = verdictForRun(steps, Math.ceil(delivered * 1.5), profiles);
+		const v = verdictForRun(steps, ceiling(offered * 1.5), profiles);
 		expect(v.complete).toBe(true);
 		expect(v.stop).toBeNull();
+	});
+
+	test("the denominator is offered load, so saturation cannot buy headroom", () => {
+		// The failure the amendment names: a step that delivered a tenth of what
+		// it offered. Against delivered, a mediocre generator would clear 1.5x
+		// tenfold over; against offered — the load the capacity claim rests on —
+		// the same generator fails, which is the correct verdict.
+		const starved = classifySteps(
+			[step({}, { sent: 20_000, received: 18_000 })].map((s) => ({
+				...s,
+				clientReceived: 2_000,
+				downDeliveryRatio: 0.9,
+			})),
+			0,
+		);
+		const delivered = starved[0]?.deliveredPerSec ?? 0;
+		const v = verdictForRun(starved, ceiling(delivered * 3), [
+			verdictForProfile("constant", starved),
+		]);
+		expect(v.stop).toBe("generator-headroom");
+		expect(v.maxOfferedPerSec).toBeGreaterThan(v.maxDeliveredPerSec);
+	});
+
+	test("a missing headroom arm is a stop, never a silent pass", () => {
+		const v = verdictForRun(steps, null, profiles);
+		expect(v.stop).toBe("generator-headroom");
+	});
+
+	test("a falsifier artifact can never carry a capacity number", () => {
+		const v = verdictForRun(
+			steps,
+			{ ceilingPerSec: offered * 100, rungs: [], burnNs: 20_000 },
+			profiles,
+		);
+		expect(v.complete).toBe(false);
+		expect(v.stop).toBe("harness-falsifier");
 	});
 
 	test("a stopped constant arm voids the run even with headroom", () => {
@@ -405,7 +503,7 @@ describe("the run-level generator gate", () => {
 			[step({}, { sent: 20_000, received: 2_000 })],
 			0,
 		);
-		const v = verdictForRun(stopped, 10_000_000, [
+		const v = verdictForRun(stopped, ceiling(10_000_000), [
 			verdictForProfile("constant", stopped),
 		]);
 		expect(v.stop).toBe("constant-arm-incomplete");
@@ -413,12 +511,12 @@ describe("the run-level generator gate", () => {
 });
 
 describe("fragment merge", () => {
-	test("the generator fragment supplies the ceiling and the clock residual is the worst seen", () => {
+	test("the headroom fragment supplies the ceiling and the clock residual is the worst seen", () => {
 		const result = classify([
 			{
-				shape: "generator",
+				shape: "headroom",
 				clock: { calibrationResidualNs: 0, source: "ffi" },
-				generator: { ceilingPerSec: 240_000, rungs: [] },
+				headroom: { ceilingPerSec: 240_000, rungs: [] },
 			},
 			{
 				shape: "ladder",
