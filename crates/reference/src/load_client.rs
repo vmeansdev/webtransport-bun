@@ -98,6 +98,22 @@ fn parse_arrival_profile(raw: Option<&str>) -> ArrivalProfile {
 #[derive(Default)]
 struct LatencyProbe {
     rtt: AtomicHistogram,
+    /// Server echo send instant → this datagram returning from
+    /// `receive_datagram`. The egress half of the registered ingest-vs-egress
+    /// cross-check, measured on the same datagram as the ingest half and against
+    /// the same `CLOCK_MONOTONIC` both processes read.
+    egress: AtomicHistogram,
+    /// This client's send instant → the server's echo send instant: the server's
+    /// ingest and turnaround legs added together, computed here from two stamps
+    /// in one payload. Its whole job is to be compared against the server's own
+    /// two histograms — if the two processes disagree about the same datagrams,
+    /// the shared-clock assumption is broken and the cross-check is void.
+    upstream_plus_turnaround: AtomicHistogram,
+    /// Echoes that came back stamped but with no echo instant in them — a
+    /// version-1 stamp, or a server that did not stamp. Counted, never inferred:
+    /// treating a missing instant as zero would report an egress latency of
+    /// "since the machine booted".
+    echo_missing_echo_instant: AtomicU64,
     /// Wake lateness only: the *first* datagram of each send event against its
     /// deadline. Recording every datagram would fold the burst's own duration
     /// into the tick arm's lag and make it grow with rate for a structural
@@ -138,6 +154,8 @@ impl LatencyProbe {
             concat!(
                 "{{\"arrival\":\"{}\",\"effectiveDatagramsPerSecPerSession\":{:.3},",
                 "\"rtt\":{},\"scheduleLag\":{},\"burstSpread\":{},",
+                "\"egressOneWay\":{},\"upstreamPlusTurnaround\":{},",
+                "\"echoMissingEchoInstant\":{},",
                 "\"echoUnstamped\":{},\"ticksSkipped\":{},\"sendEvents\":{},",
                 "\"driveWindowSec\":{:.6},\"driveWindowMeanSec\":{:.6},\"sessionsDriving\":{}}}"
             ),
@@ -146,6 +164,9 @@ impl LatencyProbe {
             self.rtt.to_json(),
             self.schedule_lag.to_json(),
             self.burst_spread.to_json(),
+            self.egress.to_json(),
+            self.upstream_plus_turnaround.to_json(),
+            self.echo_missing_echo_instant.load(Ordering::Relaxed),
             self.echo_unstamped.load(Ordering::Relaxed),
             self.ticks_skipped.load(Ordering::Relaxed),
             self.send_events.load(Ordering::Relaxed),
@@ -891,14 +912,29 @@ async fn run_session(
                             .datagram_bytes_received
                             .fetch_add(datagram.as_ref().len() as u64, Ordering::Relaxed);
                         if let Some(probe) = latency.as_ref() {
-                            // The server echoes verbatim, so the stamp coming
-                            // back is the one this process wrote — round-trip
+                            // The server echoes the same payload back, so the
+                            // stamp is the one this process wrote — round-trip
                             // time against a single clock, no cross-process
-                            // assumption anywhere in it.
+                            // assumption anywhere in it. The server adds one
+                            // field on the way out, its own send instant, which
+                            // splits that round trip into legs.
                             match read_stamp(datagram.as_ref()) {
-                                Some(stamp) => probe
-                                    .rtt
-                                    .record_signed(monotonic_ns() as i64 - stamp.actual_ns as i64),
+                                Some(stamp) => {
+                                    let now = monotonic_ns() as i64;
+                                    probe.rtt.record_signed(now - stamp.actual_ns as i64);
+                                    if stamp.echo_actual_ns == 0 {
+                                        probe
+                                            .echo_missing_echo_instant
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        probe
+                                            .egress
+                                            .record_signed(now - stamp.echo_actual_ns as i64);
+                                        probe.upstream_plus_turnaround.record_signed(
+                                            stamp.echo_actual_ns as i64 - stamp.actual_ns as i64,
+                                        );
+                                    }
+                                }
                                 None => {
                                     probe.echo_unstamped.fetch_add(1, Ordering::Relaxed);
                                 }

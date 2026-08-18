@@ -55,6 +55,8 @@ type StepOverrides = {
 	upDeliveryRatio?: number;
 	negative?: number;
 	ticksSkipped?: number;
+	turnaroundNs?: number;
+	egressNs?: number;
 };
 
 function step(o: StepOverrides = {}): LatencyStep {
@@ -80,6 +82,7 @@ function step(o: StepOverrides = {}): LatencyStep {
 		serverUnstamped: 0,
 		echoSent: 0,
 		echoErr: 0,
+		echoStampFailures: 0,
 		drainMs: 10_000,
 		drainArrivals: 0,
 		upDeliveryRatio,
@@ -87,12 +90,19 @@ function step(o: StepOverrides = {}): LatencyStep {
 			new Array(samples).fill(o.ingestNs ?? 0.4 * MS),
 			o.negative ?? 0,
 		).toJson(),
+		turnaround: flat(o.turnaroundNs ?? 0.05 * MS, 1000).toJson(),
 		client: {
 			arrival: "uniform",
 			effectiveDatagramsPerSecPerSession: aggregateRate / 100,
 			rtt: flat(o.rttNs ?? 3 * MS, 1000).toJson(),
 			scheduleLag: flat(o.lagNs ?? 0.01 * MS, 1000).toJson(),
 			burstSpread: flat(0, 1000).toJson(),
+			egressOneWay: flat(o.egressNs ?? 0.3 * MS, 1000).toJson(),
+			upstreamPlusTurnaround: flat(
+				(o.ingestNs ?? 0.4 * MS) + (o.turnaroundNs ?? 0.05 * MS),
+				1000,
+			).toJson(),
+			echoMissingEchoInstant: 0,
 			echoUnstamped: 0,
 			ticksSkipped: o.ticksSkipped ?? 0,
 			sendEvents: 1000,
