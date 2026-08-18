@@ -96,6 +96,32 @@ does not replace the 24h/72h release soak.
 - **load.ts** — Orchestrates reference server + load-client, checks RSS growth.
 - **soak.ts** — Same, with 30 min duration and 500 sessions (release build). Legacy local diagnostic; hosted campaigns use `soak-addon.ts`.
 
+## Latency axis
+
+`bench-latency.ts` measures *when* a datagram arrives, which every other tool
+here ignores. It runs one arm per process — the datagram batch knob is read once
+at import, so it cannot be varied inside a process — and the arms are merged and
+judged by `latency-classify.ts`. Method, classifier buckets and STOP conditions
+are pre-registered in `docs/research/preregistrations/latency.md`; the classifier
+is a transcription of that document, not a place to decide anything.
+
+Reusable pieces, kept separate on purpose so another axis can reverse the
+direction of measurement without touching the driver:
+
+- `latency-clock.ts` — `CLOCK_MONOTONIC` from Bun via `bun:ffi`, the same
+  counter `crates/reference/src/latency_probe.rs` reads from Rust. Shared epoch,
+  so a one-way number across the two processes is real.
+- `latency-stamp.ts` — the 28-byte payload header (intended send, actual send,
+  sequence) both ends agree on.
+- `latency-histogram.ts` — log-linear histogram, bucketing identical to the Rust
+  side so client and server percentiles are the same arithmetic.
+
+The load client grows three flags for this: `--latency-stamp`, `--arrival
+uniform|tick` and `--tick-hz`. All three are off by default and no existing
+caller's arrival shape changes.
+
+In CI: `bench-bandwidth` with `latency_probe=true`.
+
 ## Production gates (10.2)
 
 The load harness enforces:
