@@ -120,6 +120,13 @@ The load client grows three flags for this: `--latency-stamp`, `--arrival
 uniform|tick` and `--tick-hz`. All three are off by default and no existing
 caller's arrival shape changes.
 
+Reading the output: rungs are labelled by the **effective** rate the generator
+produced, not the requested one — the tick arm rounds its per-tick burst, so a
+requested 100/s/session at 64 Hz is really 128. The requested rate rides along on
+every row. Each step is snapshotted *after* its drain grace, so the datagrams
+that queued longest are in it, and the console line and the artifact come from
+that one snapshot.
+
 In CI: `bench-bandwidth` with `latency_probe=true`.
 
 ## Production gates (10.2)
