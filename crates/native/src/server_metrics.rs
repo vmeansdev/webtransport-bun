@@ -100,11 +100,20 @@ impl ServerMetrics {
         self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
     }
 
+    /// Whether the datagram receive loop should park until session capacity
+    /// frees. A park is deferral, not denial: a budget that can NEVER hold a
+    /// `min_next_bytes` datagram (session_max < min_next_bytes) must not park
+    /// — no release could ever satisfy it and ingest would stall forever.
+    /// Such sessions fall through to receive + actual-size reservation, where
+    /// a genuinely oversized payload is rejected per datagram as before.
     pub fn session_queue_cannot_fit(
         session_queued: &std::sync::atomic::AtomicU64,
         session_max: u64,
         min_next_bytes: u64,
     ) -> bool {
+        if min_next_bytes > session_max {
+            return false;
+        }
         session_queued
             .load(Ordering::Relaxed)
             .saturating_add(min_next_bytes)
@@ -431,6 +440,28 @@ mod tests {
             &queued,
             SESSION_MAX,
             702
+        ));
+    }
+
+    /// A session budget smaller than max_datagram_size can never satisfy the
+    /// park condition — parking there stalls ingest forever (zero datagrams
+    /// ever delivered, the backpressure-suite regression). Degenerate budgets
+    /// must fall through to receive + actual-size reservation instead.
+    #[test]
+    fn a_budget_below_the_min_datagram_never_parks() {
+        let queued = std::sync::atomic::AtomicU64::new(0);
+        // Empty queue, budget 4 bytes, max datagram 1200: park would wait on a
+        // release that can never come.
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 4, 1200));
+        // Even a partially filled degenerate budget must not park.
+        queued.store(2, Ordering::Relaxed);
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 4, 1200));
+        // Boundary: a budget of exactly one max-size datagram parks normally.
+        queued.store(1, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(&queued, 1200, 1200));
+        queued.store(0, Ordering::Relaxed);
+        assert!(!ServerMetrics::session_queue_cannot_fit(
+            &queued, 1200, 1200
         ));
     }
 
