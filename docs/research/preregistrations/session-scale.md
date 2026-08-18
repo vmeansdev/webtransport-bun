@@ -150,6 +150,37 @@ Linearity and the knee are reported only across rungs classified `ok`. A knee
 that coincides with a `generator-limited` rung is reported as a generator
 artifact, explicitly not as a server knee.
 
+## Addendum — measurement hygiene fixed during harness build
+
+Added while building the harness and **before any run on the runner**, from the
+local macOS smoke. Recorded here rather than silently, because each one changes
+a number the classifier reads. None of them moves a threshold.
+
+1. **First-tick suppression.** tokio's `interval` fires immediately, which gave
+   every session one extra send per rung and pushed `offeredRatio` to 1.06 in
+   the smoke. The generator now starts one interval in
+   (`interval_at(now + interval)`), so `offeredRatio` cannot run rich and hide a
+   saturated generator behind an inflated numerator.
+2. **Phase-boundary ordering.** The client switches sessions to idle, waits
+   250 ms for every task to observe it, and only then snapshots its send
+   counter and prints the marker. Without this, sends racing the phase change
+   were counted by the server but not the client, giving `deliveryRatio > 1`.
+3. **Drain grace.** The harness closes the server-side steady window 1000 ms
+   after the client's idle marker. Datagrams still in flight at the boundary
+   were otherwise booked as loss — the smoke read 0.941 delivery on a lossless
+   loopback path, which would have mis-bucketed a clean rung as `server-limited`.
+   The grace is borrowed from the idle phase, which sends nothing, so it cannot
+   import load into the steady window.
+4. **Source-IP fallback.** If binding `127.0.<k>.1` fails, that endpoint falls
+   back to the default bind instead of aborting the run, and the report stamps
+   `distinctSourceIps` — so a run with fewer distinct rate-limit keys than
+   intended is visible rather than assumed. (macOS needs interface aliases for
+   these addresses and reports 0; Linux routes all of `127/8` to `lo`.)
+5. **Curve memory metric.** Committed (RssAnon+VmSwap) is used when available
+   and RSS otherwise, and which one was used is stamped as `memoryMetric`. On
+   the runner this is always `committed`; the fallback exists so the local smoke
+   produces a parseable curve, and smoke numbers are never results.
+
 ## Not a gate
 
 No threshold in this document is a merge bar, and the harness is not to be tuned
