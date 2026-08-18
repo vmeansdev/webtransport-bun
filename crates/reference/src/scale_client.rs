@@ -79,6 +79,12 @@ struct Counters {
     datagrams_err: AtomicU64,
     datagrams_received: AtomicU64,
     sessions_lost: AtomicU64,
+    /// Ticks the steady schedule actually became due for, summed over sessions.
+    /// Each session computes its own from the clock its ticker runs on, at the
+    /// instant it leaves the steady phase — so the boundary tick is counted as
+    /// due exactly when it fired, instead of being predicted by a formula that
+    /// has to guess how a coin came down.
+    steady_ticks_due: AtomicU64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -87,6 +93,7 @@ struct CounterSnapshot {
     err: u64,
     received: u64,
     lost: u64,
+    ticks_due: u64,
 }
 
 impl Counters {
@@ -96,6 +103,7 @@ impl Counters {
             err: self.datagrams_err.load(Ordering::Relaxed),
             received: self.datagrams_received.load(Ordering::Relaxed),
             lost: self.sessions_lost.load(Ordering::Relaxed),
+            ticks_due: self.steady_ticks_due.load(Ordering::Relaxed),
         }
     }
 }
@@ -164,6 +172,44 @@ fn spawn_rss_guard() {
             }
         }
     });
+}
+
+/// Offset of a session's first steady tick: half an interval, not a whole one.
+///
+/// The window edge is where `offeredRatio` used to break. With the first tick
+/// one full interval in, the last tick's deadline lands exactly on the phase
+/// change, so whether it fires is a coin flip between two timers in the same
+/// slot — the local smoke read 1.16 and 0.90 out of the same schedule depending
+/// only on which side of that flip the count was taken. Half an interval of
+/// phase offset moves every tick to the middle of its slot: the window holds
+/// `steady / interval` ticks exactly, none of them within half an interval of
+/// either edge, and the offered rate label is the nominal rate rather than one
+/// tick short of it. Window length and per-session rate are unchanged.
+fn first_tick_offset(interval: Duration) -> Duration {
+    interval / 2
+}
+
+/// Ticks whose deadline has passed, `elapsed` into a steady phase using the
+/// half-interval offset above. Shared by the per-session denominator and the
+/// nominal figure, so the two can never drift apart.
+fn ticks_due_after(elapsed: Duration, interval: Duration) -> u64 {
+    let interval_ns = interval.as_nanos();
+    if interval_ns == 0 {
+        return 0;
+    }
+    let first = first_tick_offset(interval);
+    if elapsed < first {
+        return 0;
+    }
+    u64::try_from((elapsed - first).as_nanos() / interval_ns + 1).unwrap_or(u64::MAX)
+}
+
+/// Nominal ticks per session under the configured schedule. A diagnostic: the
+/// `offeredRatio` denominator is measured per session (see `account_steady`),
+/// and this figure is reported beside it so a reader can see the generator's
+/// sessions kept their own clocks.
+fn expected_ticks(steady: Duration, interval: Duration) -> u64 {
+    ticks_due_after(steady, interval)
 }
 
 fn open_fd_count() -> Option<u64> {
@@ -425,6 +471,11 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let connect_wall = connect_started.elapsed();
+    // CPU is reported as a windowed rate per phase, never as a cumulative
+    // average: the connect ramp is by far the most CPU-hungry part of a rung, so
+    // folding it into the steady number would make steady CPU decay with window
+    // length instead of describing the steady phase.
+    let cpu_after_connect = self_cpu_ms();
     let sessions_ok = counters.sessions_ok.load(Ordering::Relaxed);
     let sessions_err = counters.sessions_err.load(Ordering::Relaxed);
     println!(
@@ -437,6 +488,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let after_connect = counters.snapshot();
     let _ = phase_tx.send(PHASE_STEADY);
+    let steady_started = Instant::now();
     // Phase markers are line-buffered onto stdout so the harness can snapshot
     // server-side counters at the exact same boundaries this process uses.
     println!("scale-client: phase steady");
@@ -448,6 +500,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     // counts but this snapshot does not, pushing the harness's delivery ratio
     // above 1.0. The marker is printed after the snapshot for the same reason.
     let _ = phase_tx.send(PHASE_IDLE);
+    let steady_wall = steady_started.elapsed();
     tokio::time::sleep(PHASE_SETTLE).await;
     let after_steady = counters.snapshot();
     let rss_steady = self_rss_mb();
@@ -473,24 +526,29 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut sorted = latencies.lock().map(|l| l.clone()).unwrap_or_default();
     sorted.sort_unstable();
-    let expected_steady_sends = (sessions_ok as f64) * options.steady.as_secs_f64()
-        / options.datagram_interval.as_secs_f64();
+    // Measured, not predicted: every session books the ticks its own schedule
+    // made due. `ticks_per_session` is the schedule's nominal figure, reported
+    // beside it so a reader can see the two agree (or see by how much the
+    // generator's sessions fell behind their own clocks).
+    let ticks_per_session = expected_ticks(options.steady, options.datagram_interval);
+    let expected_steady_sends = after_steady
+        .ticks_due
+        .saturating_sub(after_connect.ticks_due);
     let steady_sent = after_steady.sent.saturating_sub(after_connect.sent);
     let recorded_errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
 
-    let cpu_steady_ms = match (cpu0, cpu_after_steady) {
+    let window_ms = |from: Option<f64>, to: Option<f64>| match (from, to) {
         (Some(a), Some(b)) => Some(b - a),
         _ => None,
     };
-    let cpu_idle_ms = match (cpu_after_steady, cpu_after_idle) {
-        (Some(a), Some(b)) => Some(b - a),
-        _ => None,
-    };
+    let cpu_connect_ms = window_ms(cpu0, cpu_after_connect);
+    let cpu_steady_ms = window_ms(cpu_after_connect, cpu_after_steady);
+    let cpu_idle_ms = window_ms(cpu_after_steady, cpu_after_idle);
 
     let json = format!(
         concat!(
             "{{",
-            "\"schema\":\"scale-client/1\",",
+            "\"schema\":\"scale-client/2\",",
             "\"sessionsRequested\":{},",
             "\"sessionsOk\":{},",
             "\"sessionsErr\":{},",
@@ -499,9 +557,9 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             "\"connectTimedOut\":{},",
             "\"acceptsPerSec\":{},",
             "\"acceptMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
-            "\"steady\":{{\"sent\":{},\"err\":{},\"received\":{},\"expectedSends\":{}}},",
+            "\"steady\":{{\"sent\":{},\"err\":{},\"received\":{},\"expectedSends\":{},\"expectedTicksPerSession\":{},\"wallSec\":{:.3}}},",
             "\"idle\":{{\"sent\":{},\"err\":{},\"received\":{}}},",
-            "\"client\":{{\"rssMbSteady\":{},\"rssMbIdle\":{},\"cpuMsSteady\":{},\"cpuMsIdle\":{},\"fdCount\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
+            "\"client\":{{\"rssMbSteady\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsIdle\":{},\"fdCount\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
             "\"connectErrorsSample\":[{}]",
             "}}"
         ),
@@ -523,12 +581,15 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         steady_sent,
         after_steady.err.saturating_sub(after_connect.err),
         after_steady.received.saturating_sub(after_connect.received),
-        json_num(Some(expected_steady_sends)),
+        expected_steady_sends,
+        ticks_per_session,
+        steady_wall.as_secs_f64(),
         after_idle.sent.saturating_sub(after_steady.sent),
         after_idle.err.saturating_sub(after_steady.err),
         after_idle.received.saturating_sub(after_steady.received),
         json_num(rss_steady),
         json_num(rss_idle),
+        json_num(cpu_connect_ms),
         json_num(cpu_steady_ms),
         json_num(cpu_idle_ms),
         json_u64(fds),
@@ -548,6 +609,30 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Books this session's share of the steady-phase denominator, once, at the
+/// instant it stops sending.
+///
+/// The count comes from this session's own elapsed steady time on the clock its
+/// ticker runs on, not from the configured window, so a session that entered
+/// steady late or died early is charged for exactly the ticks its own schedule
+/// reached. Combined with the half-interval offset, every counted tick is one
+/// whose deadline passed comfortably inside the window, so a shortfall against
+/// this denominator is a generator that failed to source the load and nothing
+/// else.
+fn account_steady(
+    counters: &Counters,
+    started_at: tokio::time::Instant,
+    interval: Duration,
+    accounted: &mut bool,
+) {
+    if *accounted {
+        return;
+    }
+    *accounted = true;
+    let due = ticks_due_after(started_at.elapsed(), interval);
+    counters.steady_ticks_due.fetch_add(due, Ordering::Relaxed);
+}
+
 async fn hold_session(
     conn: wtransport::Connection,
     phase: &mut watch::Receiver<u8>,
@@ -565,19 +650,25 @@ async fn hold_session(
 
     let mut payload = vec![b'x'; payload_bytes];
     let mut sequence: u64 = 0;
-    // Start one interval in, not immediately: tokio's first tick fires at once,
+    // Half an interval in, not immediately: tokio's first tick fires at once,
     // which would put one extra send in every session and inflate the harness's
     // offeredRatio above 1.0 — exactly the ratio that detects a saturated
-    // generator, so it must not run rich.
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    // generator, so it must not run rich. Half rather than a whole interval so
+    // no tick shares a timer slot with a phase boundary (see first_tick_offset).
+    let steady_started_at = tokio::time::Instant::now();
+    let mut ticker =
+        tokio::time::interval_at(steady_started_at + first_tick_offset(interval), interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut steady_accounted = false;
 
     loop {
         let current = *phase.borrow();
         if current == PHASE_STOP {
+            account_steady(counters, steady_started_at, interval, &mut steady_accounted);
             break;
         }
         if current == PHASE_IDLE {
+            account_steady(counters, steady_started_at, interval, &mut steady_accounted);
             // Idle phase: no application sends. Stay alive so the server pays
             // whatever an idle session costs, and notice if it drops us.
             tokio::select! {
@@ -599,7 +690,10 @@ async fn hold_session(
 
         tokio::select! {
             changed = phase.changed() => {
-                if changed.is_err() { break; }
+                if changed.is_err() {
+                    account_steady(counters, steady_started_at, interval, &mut steady_accounted);
+                    break;
+                }
             }
             _ = ticker.tick() => {
                 sequence = sequence.wrapping_add(1);
@@ -615,6 +709,10 @@ async fn hold_session(
                 match received {
                     Ok(_) => { counters.datagrams_received.fetch_add(1, Ordering::Relaxed); }
                     Err(_) => {
+                        // A session lost mid-steady still offered whatever its
+                        // schedule had made due up to the moment it died; not
+                        // accounting for it would quietly forgive the shortfall.
+                        account_steady(counters, steady_started_at, interval, &mut steady_accounted);
                         counters.sessions_lost.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -628,7 +726,47 @@ async fn hold_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, json_num, json_u64, parse_or_default, percentile};
+    use super::{
+        escape, expected_ticks, json_num, json_u64, parse_or_default, percentile, ticks_due_after,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn expected_ticks_matches_the_nominal_rate() {
+        // Pre-registered profile: 120 s window, 5 s interval, ticks at
+        // 2.5, 7.5 .. 117.5 s. Exactly 24 — the nominal 0.2/s — with no tick
+        // within half an interval of either edge.
+        assert_eq!(
+            expected_ticks(Duration::from_secs(120), Duration::from_secs(5)),
+            24
+        );
+        assert_eq!(
+            expected_ticks(Duration::from_secs(121), Duration::from_secs(5)),
+            24
+        );
+    }
+
+    #[test]
+    fn ticks_due_is_stable_across_the_window_edge() {
+        let interval = Duration::from_secs(5);
+        // The half-interval offset puts the boundary in the middle of a slot, so
+        // a snapshot taken slightly early or slightly late books the same count.
+        for skew_ms in [-100i64, -1, 0, 1, 100] {
+            let elapsed = Duration::from_millis((120_000 + skew_ms) as u64);
+            assert_eq!(ticks_due_after(elapsed, interval), 24, "skew {skew_ms}ms");
+        }
+    }
+
+    #[test]
+    fn expected_ticks_is_zero_when_no_tick_fits() {
+        // Half an interval in, so a window shorter than that holds no tick.
+        assert_eq!(
+            expected_ticks(Duration::from_secs(2), Duration::from_secs(5)),
+            0
+        );
+        assert_eq!(expected_ticks(Duration::ZERO, Duration::from_secs(5)), 0);
+        assert_eq!(expected_ticks(Duration::from_secs(5), Duration::ZERO), 0);
+    }
 
     #[test]
     fn parse_or_default_falls_back_on_garbage() {
