@@ -29,14 +29,21 @@ pub fn monotonic_ns() -> u64 {
 }
 
 pub const STAMP_MAGIC: u16 = 0x4c54; // "LT"
-pub const STAMP_VERSION: u16 = 1;
-pub const STAMP_BYTES: usize = 28;
+pub const STAMP_VERSION: u16 = 2;
+/// Bytes a version-2 stamp needs — what a writer must reserve.
+pub const STAMP_BYTES: usize = 36;
+/// Bytes a version-1 stamp needs. Still decoded; never written.
+pub const STAMP_BYTES_V1: usize = 28;
 
 const OFFSET_INTENDED: usize = 4;
 const OFFSET_ACTUAL: usize = 12;
 const OFFSET_SEQUENCE: usize = 20;
+const OFFSET_ECHO_ACTUAL: usize = 28;
 
-/// Write the 28-byte header in place. The caller owns the padding beyond it.
+/// Write the 36-byte header in place. The caller owns the padding beyond it.
+///
+/// `echo_actual` is left zero: it belongs to the server, which writes it into the
+/// same payload just before echoing (Amendment 6 of the latency pre-registration).
 pub fn write_stamp(buf: &mut [u8], intended_ns: u64, actual_ns: u64, sequence: u64) {
     debug_assert!(buf.len() >= STAMP_BYTES);
     buf[0..2].copy_from_slice(&STAMP_MAGIC.to_le_bytes());
@@ -44,6 +51,7 @@ pub fn write_stamp(buf: &mut [u8], intended_ns: u64, actual_ns: u64, sequence: u
     buf[OFFSET_INTENDED..OFFSET_INTENDED + 8].copy_from_slice(&intended_ns.to_le_bytes());
     buf[OFFSET_ACTUAL..OFFSET_ACTUAL + 8].copy_from_slice(&actual_ns.to_le_bytes());
     buf[OFFSET_SEQUENCE..OFFSET_SEQUENCE + 8].copy_from_slice(&sequence.to_le_bytes());
+    buf[OFFSET_ECHO_ACTUAL..OFFSET_ECHO_ACTUAL + 8].copy_from_slice(&0u64.to_le_bytes());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,17 +59,24 @@ pub struct Stamp {
     pub intended_ns: u64,
     pub actual_ns: u64,
     pub sequence: u64,
+    /// Server's echo send instant. Zero upstream, and zero for a version-1 stamp
+    /// — the egress leg simply produces no sample rather than one measured from
+    /// the epoch.
+    pub echo_actual_ns: u64,
 }
 
 /// Decode a stamp, or `None` when the datagram is not one of ours — a probe
 /// frame, a short payload, a version we don't speak.
 pub fn read_stamp(buf: &[u8]) -> Option<Stamp> {
-    if buf.len() < STAMP_BYTES {
+    if buf.len() < STAMP_BYTES_V1 {
         return None;
     }
     let magic = u16::from_le_bytes([buf[0], buf[1]]);
     let version = u16::from_le_bytes([buf[2], buf[3]]);
-    if magic != STAMP_MAGIC || version != STAMP_VERSION {
+    if magic != STAMP_MAGIC || !(version == 1 || version == 2) {
+        return None;
+    }
+    if version == 2 && buf.len() < STAMP_BYTES {
         return None;
     }
     let read = |at: usize| {
@@ -73,6 +88,11 @@ pub fn read_stamp(buf: &[u8]) -> Option<Stamp> {
         intended_ns: read(OFFSET_INTENDED),
         actual_ns: read(OFFSET_ACTUAL),
         sequence: read(OFFSET_SEQUENCE),
+        echo_actual_ns: if version == 2 {
+            read(OFFSET_ECHO_ACTUAL)
+        } else {
+            0
+        },
     })
 }
 
@@ -231,17 +251,62 @@ mod tests {
                 intended_ns: 1_234_567_890_123,
                 actual_ns: 1_234_567_899_999,
                 sequence: 8_589_934_593,
+                echo_actual_ns: 0,
             })
         );
     }
 
     #[test]
     fn stamp_rejects_foreign_payloads() {
-        assert_eq!(read_stamp(&[0u8; STAMP_BYTES - 1]), None);
+        assert_eq!(read_stamp(&[0u8; STAMP_BYTES_V1 - 1]), None);
         let mut buf = [0u8; STAMP_BYTES];
         write_stamp(&mut buf, 1, 2, 3);
         assert!(read_stamp(&buf).is_some());
         buf[0] ^= 0xff;
+        assert_eq!(read_stamp(&buf), None);
+    }
+
+    /// The server writes the echo instant into the same payload it received, so
+    /// the client can split its round trip into legs that sum to it exactly.
+    #[test]
+    fn stamp_carries_the_servers_echo_instant() {
+        let mut buf = [0u8; STAMP_BYTES];
+        write_stamp(&mut buf, 10, 20, 30);
+        buf[OFFSET_ECHO_ACTUAL..OFFSET_ECHO_ACTUAL + 8]
+            .copy_from_slice(&9_876_543_210u64.to_le_bytes());
+        assert_eq!(
+            read_stamp(&buf).map(|s| s.echo_actual_ns),
+            Some(9_876_543_210)
+        );
+    }
+
+    /// A version-1 payload — an older binary, an older fragment — still decodes,
+    /// and simply reports no echo instant rather than one measured from zero.
+    #[test]
+    fn version_one_stamps_still_decode_without_an_echo_instant() {
+        let mut buf = [0u8; STAMP_BYTES_V1];
+        buf[0..2].copy_from_slice(&STAMP_MAGIC.to_le_bytes());
+        buf[2..4].copy_from_slice(&1u16.to_le_bytes());
+        buf[OFFSET_INTENDED..OFFSET_INTENDED + 8].copy_from_slice(&11u64.to_le_bytes());
+        buf[OFFSET_ACTUAL..OFFSET_ACTUAL + 8].copy_from_slice(&22u64.to_le_bytes());
+        buf[OFFSET_SEQUENCE..OFFSET_SEQUENCE + 8].copy_from_slice(&33u64.to_le_bytes());
+        assert_eq!(
+            read_stamp(&buf),
+            Some(Stamp {
+                intended_ns: 11,
+                actual_ns: 22,
+                sequence: 33,
+                echo_actual_ns: 0,
+            })
+        );
+    }
+
+    /// A version-2 header that claims more than the frame carries is not ours.
+    #[test]
+    fn truncated_version_two_stamps_are_rejected() {
+        let mut buf = [0u8; STAMP_BYTES - 1];
+        buf[0..2].copy_from_slice(&STAMP_MAGIC.to_le_bytes());
+        buf[2..4].copy_from_slice(&2u16.to_le_bytes());
         assert_eq!(read_stamp(&buf), None);
     }
 
