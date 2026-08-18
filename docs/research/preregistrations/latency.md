@@ -256,6 +256,11 @@ exactly:
 | 900 | 2 | 2.222 ms |
 | 1100 | 3 | 2.727 ms |
 
+The floor is applied to latency-stamped runs only. Every other caller of the
+load client keeps the historical one-datagram-per-wake shape, because changing
+the arrival process of an existing gate would silently invalidate comparisons
+against every stamp already taken with it.
+
 **Disclosed consequence:** at 750/s/session and above, "uniform" means micro-bursts
 of two or three datagrams, not one. Sessions remain phase-staggered across the
 period, so aggregate arrivals stay spread, and the tick arm's 64 Hz bursts (2 to
