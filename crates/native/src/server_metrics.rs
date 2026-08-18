@@ -63,12 +63,45 @@ pub struct ServerMetrics {
     pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
     pub limit_exceeded_count: AtomicU64,
+    /// Sessions the QUIC idle timeout ended — the peer stopped speaking and
+    /// never came back.
+    pub sessions_closed_by_idle: AtomicU64,
+    /// Sessions this server ended itself on shutdown.
+    pub sessions_closed_by_reap: AtomicU64,
+    /// Sessions that ended with some other application close code — the peer
+    /// closing, or a local close carrying a code. Kept so reaped-vs-lost is
+    /// read against the rest of the classified closes, not against a total.
+    pub sessions_closed_other: AtomicU64,
     pub handshake_histogram: LatencyHistogram,
     pub datagram_enqueue_histogram: LatencyHistogram,
     pub stream_open_histogram: LatencyHistogram,
 }
 
 impl ServerMetrics {
+    /// Classify one session teardown by the close code the server observed.
+    ///
+    /// Reaped-vs-lost is the distinction the session-scale axis needs: a
+    /// session this server ended on shutdown says nothing about delivery,
+    /// while one the idle timeout ended says the peer stopped speaking.
+    ///
+    /// A teardown with no observed code is left unclassified rather than
+    /// bucketed as "other": a locally closed connection carries no code on the
+    /// error, and the reap path counts itself at the point it decides to reap.
+    pub fn record_session_close(&self, code: Option<u32>) {
+        let counter = match code {
+            Some(crate::IDLE_TIMEOUT_CLOSE_CODE) => &self.sessions_closed_by_idle,
+            Some(crate::SERVER_CLOSING_CLOSE_CODE) => &self.sessions_closed_by_reap,
+            Some(_) => &self.sessions_closed_other,
+            None => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One session ended because this server is shutting down.
+    pub fn record_session_reaped(&self) {
+        self.sessions_closed_by_reap.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn try_acquire_handshake(&self, max: u64) -> bool {
         self.handshakes_in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -240,6 +273,14 @@ impl ServerMetrics {
                 as f64,
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as f64,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as f64,
+            sessions_closed_by_idle: Some(
+                self.sessions_closed_by_idle.load(Ordering::Relaxed) as f64
+            ),
+            sessions_closed_by_reap: Some(
+                self.sessions_closed_by_reap.load(Ordering::Relaxed) as f64
+            ),
+            sessions_closed_other: Some(self.sessions_closed_other.load(Ordering::Relaxed) as f64),
+            native_async_ops_pending: 0,
             sni_cert_selections: tls_metrics.sni_cert_selections as f64,
             default_cert_selections: tls_metrics.default_cert_selections as f64,
             unknown_sni_rejected_count: tls_metrics.unknown_sni_rejected_count as f64,
