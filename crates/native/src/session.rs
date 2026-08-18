@@ -741,7 +741,7 @@ pub(crate) async fn handle_uni_probe_for_session(id: &str) -> Result<u32> {
 }
 
 pub(crate) async fn wait_session_stream_capacity(
-    id: String,
+    id: std::sync::Arc<str>,
     timeout_ms: u32,
     kind: &'static str,
 ) -> Result<()> {
@@ -1592,10 +1592,10 @@ mod tests {
             .unwrap_err();
         assert!(queue_err.reason.contains("E_QUEUE_FULL"));
 
-        wait_session_stream_capacity(id.clone(), 200, "bidi")
+        wait_session_stream_capacity(id.clone().into(), 200, "bidi")
             .await
             .expect("bidi capacity");
-        wait_session_stream_capacity(id.clone(), 200, "uni")
+        wait_session_stream_capacity(id.clone().into(), 200, "uni")
             .await
             .expect("uni capacity");
 
