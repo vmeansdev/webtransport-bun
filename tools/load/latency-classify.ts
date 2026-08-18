@@ -14,8 +14,12 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { LatencyHistogram, type LatencySummary } from "./latency-histogram.ts";
 import type { LatencyStep } from "./bench-latency.ts";
+import {
+	LatencyHistogram,
+	type LatencySummary,
+	quantizationNs,
+} from "./latency-histogram.ts";
 
 const MS = 1e6;
 
@@ -195,6 +199,14 @@ export type BatchAbEntry = {
 	deltaMs: number;
 	bucket: "batch-helps" | "batch-free" | "batch-cheap" | "batch-expensive";
 	confounded: boolean;
+	/**
+	 * Worst-case histogram quantization on Δ: half a bucket on each arm's p99.
+	 * Reported so the bucket can never be quoted more precisely than the
+	 * instrument resolves (Amendment 2).
+	 */
+	deltaUncertaintyMs: number;
+	/** `false` when |Δ| is inside its own quantization — the bucket is advisory. */
+	resolvable: boolean;
 	defaultUpDeliveryRatio: number | null;
 	batch0UpDeliveryRatio: number | null;
 };
@@ -231,11 +243,17 @@ export function classifyBatchAb(steps: ClassifiedStep[]): BatchAbEntry[] {
 		const defaultP99Ms = slot.def.ingest.p99Ns / MS;
 		const batch0P99Ms = slot.zero.ingest.p99Ns / MS;
 		const deltaMs = defaultP99Ms - batch0P99Ms;
+		const deltaUncertaintyMs =
+			(quantizationNs(slot.def.ingest.p99Ns) +
+				quantizationNs(slot.zero.ingest.p99Ns)) /
+			MS;
 		out.push({
 			aggregateRate,
 			defaultP99Ms,
 			batch0P99Ms,
 			deltaMs,
+			deltaUncertaintyMs,
+			resolvable: Math.abs(deltaMs) > deltaUncertaintyMs,
 			bucket: batchBucket(deltaMs),
 			confounded:
 				Math.abs(
@@ -332,7 +350,7 @@ function render(result: ReturnType<typeof classifyRun>): string {
 		lines.push("H7 batch tail cost (default - batch0), complete steps only:");
 		for (const ab of result.batchAb) {
 			lines.push(
-				`${String(ab.aggregateRate).padStart(7)} | default=${ab.defaultP99Ms.toFixed(3)}ms batch0=${ab.batch0P99Ms.toFixed(3)}ms delta=${ab.deltaMs.toFixed(3)}ms ${ab.bucket}${ab.confounded ? " ab-confounded" : ""}`,
+				`${String(ab.aggregateRate).padStart(7)} | default=${ab.defaultP99Ms.toFixed(3)}ms batch0=${ab.batch0P99Ms.toFixed(3)}ms delta=${ab.deltaMs.toFixed(3)}±${ab.deltaUncertaintyMs.toFixed(3)}ms ${ab.bucket}${ab.resolvable ? "" : " ab-unresolvable"}${ab.confounded ? " ab-confounded" : ""}`,
 			);
 		}
 	} else {
