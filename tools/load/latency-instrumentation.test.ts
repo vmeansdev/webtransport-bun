@@ -64,6 +64,18 @@ describe("latency histogram", () => {
 		expect(revived.summary()).toEqual(h.summary());
 	});
 
+	test("a fragment written mid-record reports its skew and keeps its percentiles", () => {
+		const h = new LatencyHistogram();
+		for (let i = 0; i < 1_000; i += 1) h.record(1_000_000);
+		// What a torn snapshot from the Rust side looks like: the counter ran
+		// ahead of the buckets that were serialized.
+		const torn = { ...h.toJson(), recordedTotal: 1_007 };
+		const revived = LatencyHistogram.fromJson(torn);
+		expect(revived.summary().skew).toBe(7);
+		expect(revived.summary().count).toBe(1_000);
+		expect(revived.summary().p99Ns).toBe(h.summary().p99Ns);
+	});
+
 	test("json is sparse and carries the bucketing it was written with", () => {
 		const h = new LatencyHistogram();
 		h.record(1_000);

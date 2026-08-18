@@ -150,10 +150,21 @@ impl AtomicHistogram {
     /// Sparse: 9,984 slots of which a step fills a few hundred. The bucketing is
     /// stamped into the document so a fragment written by one build can never be
     /// read as if it came from another.
+    ///
+    /// `count` is the sum of the buckets this very pass emitted, never the
+    /// separate `total` counter. `record` is five independent relaxed atomics,
+    /// so a snapshot taken while sessions are still sending can see a `total`
+    /// that its bucket array does not support — and a percentile reader given a
+    /// rank its buckets cannot reach walks off the end and reports the maximum.
+    /// The counter is still published as `recordedTotal`: equal to `count` for a
+    /// quiesced producer, and the size of the gap is the evidence when it isn't.
+    /// `minNs`/`maxNs`/`sumNs` are loaded after the sweep and may belong to a
+    /// marginally later instant; no pre-registered rule reads them.
     pub fn to_json(&self) -> String {
         let mut buckets = String::with_capacity(1024);
         buckets.push('[');
         let mut written = 0usize;
+        let mut summed = 0u64;
         for (i, slot) in self.counts.iter().enumerate() {
             let count = slot.load(Ordering::Relaxed);
             if count == 0 {
@@ -164,10 +175,11 @@ impl AtomicHistogram {
             }
             buckets.push_str(&format!("[{i},{count}]"));
             written += 1;
+            summed += count;
         }
         buckets.push(']');
         let total = self.total.load(Ordering::Relaxed);
-        let min = if total == 0 {
+        let min = if summed == 0 {
             0
         } else {
             self.min.load(Ordering::Relaxed)
@@ -181,7 +193,7 @@ impl AtomicHistogram {
             SUB_BITS,
             MAX_OCTAVE,
             buckets,
-            total,
+            summed,
             total,
             self.negative.load(Ordering::Relaxed),
             min,
@@ -282,6 +294,20 @@ mod tests {
         assert_eq!(buckets.matches('[').count(), 3, "{json}");
         assert!(buckets.contains(",2]"), "{json}");
         assert!(json.contains("\"count\":3,\"recordedTotal\":3"), "{json}");
+    }
+
+    /// A snapshot taken mid-record must describe itself, not the counter: the
+    /// percentile reader is driven by `count`, and a count its buckets cannot
+    /// support silently reports the maximum as every high percentile.
+    #[test]
+    fn json_count_comes_from_the_buckets_it_emitted() {
+        let h = AtomicHistogram::new();
+        h.record(1_000);
+        // Stand-in for the window inside `record` where `total` has been bumped
+        // and the bucket has not.
+        h.total.fetch_add(7, Ordering::Relaxed);
+        let json = h.to_json();
+        assert!(json.contains("\"count\":1,\"recordedTotal\":8"), "{json}");
     }
 
     #[test]
