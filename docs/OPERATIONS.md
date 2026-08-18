@@ -239,6 +239,58 @@ startup on them.
 - **Throughput**: increase per-session limits, larger highWaterMark on streams
 - **queuedBytesGlobal rising**: slow consumers or too many concurrent streams; reduce limits or scale out
 
+### Flow-control windows
+
+Two different things bound memory, and they used to be one knob:
+
+- **Byte governors** (`maxQueuedBytesGlobal` / `PerSession` / `PerStream`) —
+  application-level accounting of bytes queued across the JS boundary. They
+  drive backpressure, `E_QUEUE_FULL`, and the native datagram channel.
+- **QUIC flow-control windows** (`streamReceiveWindow`, `receiveWindow`,
+  `sendWindow`) — what the transport advertises to the peer. They decide how
+  much data can be in flight, and therefore throughput on a path with any
+  meaningful bandwidth-delay product.
+
+Leave the window fields unset and each one is derived from a governor, exactly
+as it always has been: `streamReceiveWindow` from `maxQueuedBytesPerStream`,
+and both connection windows from `maxQueuedBytesPerSession` (raised, if needed,
+to cover one stream window). Set them and only the transport moves — the
+governors, backpressure and the datagram channel stay where you put them.
+Native backend only.
+
+**Budget them explicitly.** Per session, the advertised worst case is
+
+```
+receiveWindow + sendWindow + datagramChannelCapacity × maxDatagramSize
+```
+
+where `datagramChannelCapacity = ceil(maxQueuedBytesPerSession / maxDatagramSize)`
+capped at 2048. `maxQueuedBytesGlobal` does **not** bound this — it is a
+different accounting, so a 512 MiB global governor gives no protection at all
+against the window ceiling.
+
+| config | per session | × 2000 sessions | sessions that fit 8 GB |
+|---|---|---|---|
+| defaults (256 KiB / 2 MiB) | 6.00 MiB | 12.6 GB | 1365 |
+| windows 8 MiB / 32 MiB, governors default | 66.0 MiB | 138 GB | 124 |
+| governor route to the same windows (`maxQueuedBytesPerSession` 64 MiB) | 130.3 MiB | 273 GB | 62 |
+
+Read that table as the reason `maxSessions` and the windows are one decision:
+even the shipped defaults over-commit an 8 GB box at `maxSessions` 2000 by 1.5×.
+Nothing is allocated up front — a window is a ceiling a peer must actually
+drive you to, and a session that reads promptly never approaches it — but it is
+the only bound the transport gives you, so pick `maxSessions` against the
+window you configure rather than against the default.
+
+**What widening buys.** Measured on the 4 vCPU rig over loopback, 4 sessions ×
+4 concurrent uni streams (run 32193538952): 256 KiB → 16 MiB per-stream, a 64×
+memory increase, moved delivered throughput 0.781 → 1.037 Gbps (+33%), with no
+knee below 8 MiB. On loopback the bandwidth-delay product is far below even the
+256 KiB default, so that curve is the *cost* of a window on this rig, not the
+benefit on a real path: over a WAN, where BDP routinely exceeds 256 KiB, the
+default window — not the CPU — is what caps a single stream. Widen when you
+measure a stalled sender on a long path; do not widen speculatively.
+
 ## Known limitations and compatibility
 
 - Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
