@@ -5,6 +5,7 @@ import {
 	classifyCc,
 	classifyCoresplit,
 	classifyOffbox,
+	classifyOffboxBbr,
 	classifyRmem,
 	classifyWaitVsDrop,
 	collapseFor,
@@ -738,5 +739,143 @@ describe("armKey genMode", () => {
 				genMode: "onbox",
 			}),
 		).toBe("w2@160000@wait");
+	});
+});
+
+describe("classifyOffboxBbr", () => {
+	const base = {
+		genModes: ["offbox"],
+		rmemModes: ["default"],
+		cpuModes: ["shared"],
+		sessions: 100,
+		provisioned: true,
+	};
+
+	test("bbr 20% above cubic-offbox and above 120k is bbr-lifts", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 64_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 155_000),
+				],
+			}).stopBucket,
+		).toBe("bbr-lifts");
+	});
+
+	test("bbr recovering into the 90k-120k band is path-only", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 64_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 105_000, 150_000),
+				],
+			}).stopBucket,
+		).toBe("path-only");
+	});
+
+	test("bbr below the 1.20 ratio is not-bbr", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 64_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 70_000, 150_000),
+				],
+			}).stopBucket,
+		).toBe("not-bbr");
+	});
+
+	test("bbr improved but still under 90k stays incomplete", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 64_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 85_000, 150_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("cubic-offbox control outside 40k-90k is incomplete", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 95_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 150_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("onbox arms in the design are incomplete", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				genModes: ["onbox", "offbox"],
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 64_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 150_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("applied-cc print mismatch is incomplete", () => {
+		const bbr = withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 150_000);
+		bbr.runs[0]!.appliedCongestion = "cubic";
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait@offbox", 64_000, 151_000), bbr],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("sessions_ok below 90 of 100 is incomplete", () => {
+		const bbr = withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 150_000);
+		bbr.runs[0]!.sessionsOk = 80;
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait@offbox", 64_000, 151_000), bbr],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("unprovisioned generator is incomplete", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				provisioned: false,
+				summaries: [
+					withFrameTx("w2@160000@wait@offbox", 64_000, 151_000),
+					withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 150_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("missing bbr arms are incomplete", () => {
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait@offbox", 64_000, 151_000)],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("missing remote mark on the bbr arm is incomplete", () => {
+		const bbr = withFrameTx("w2@160000@wait@bbr@offbox", 130_000, 150_000);
+		bbr.runs[0]!.offboxSsh = null;
+		expect(
+			classifyOffboxBbr({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait@offbox", 64_000, 151_000), bbr],
+			}).stopBucket,
+		).toBe("incomplete");
 	});
 });

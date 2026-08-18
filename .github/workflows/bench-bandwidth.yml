@@ -59,6 +59,11 @@ on:
         required: false
         default: "false"
         type: string
+      offbox_bbr:
+        description: "Pure off-box stamp: Cubic control vs BBR treatment over the virtual switch"
+        required: false
+        default: "false"
+        type: string
 jobs:
   bench:
     permissions:
@@ -152,8 +157,8 @@ jobs:
           SWEEP_SEND_MODES: wait
           SWEEP_CPU_MODES: shared
           SWEEP_RMEM_MODES: default
-          SWEEP_CC_MODES: ${{ github.event.inputs.offbox_probe == 'true' && 'cubic' || 'cubic,bbr' }}
-          SWEEP_GEN_MODES: ${{ github.event.inputs.offbox_probe == 'true' && 'onbox,offbox' || 'onbox' }}
+          SWEEP_CC_MODES: ${{ github.event.inputs.offbox_bbr == 'true' && 'cubic,bbr' || (github.event.inputs.offbox_probe == 'true' && 'cubic' || 'cubic,bbr') }}
+          SWEEP_GEN_MODES: ${{ github.event.inputs.offbox_bbr == 'true' && 'offbox' || (github.event.inputs.offbox_probe == 'true' && 'onbox,offbox' || 'onbox') }}
           SWEEP_OFFBOX_SSH: hermes-admin@192.168.2.36
           SWEEP_OFFBOX_HOST: 192.168.2.35
           SWEEP_RATES: "160000"

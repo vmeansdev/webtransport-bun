@@ -861,6 +861,99 @@ export function classifyOffbox(input: {
 	};
 }
 
+export type OffboxBbrBucket =
+	| "bbr-lifts"
+	| "path-only"
+	| "not-bbr"
+	| "incomplete";
+
+export type OffboxBbrCap = {
+	cubicOffboxFrameTxPerSec: number | null;
+	bbrOffboxFrameTxPerSec: number | null;
+	ratio: number | null;
+	provisioned: boolean;
+	stopBucket: OffboxBbrBucket;
+};
+
+/** Cubic over the virtual switch framed ~64k; a control outside this band is
+ * a different path regime, not a reproduction. */
+const OFFBOX_CUBIC_MIN = 40_000;
+const OFFBOX_CUBIC_MAX = 90_000;
+
+export function classifyOffboxBbr(input: {
+	summaries: readonly ArmSummary[];
+	genModes: readonly string[];
+	rmemModes: readonly string[];
+	cpuModes: readonly string[];
+	sessions: number;
+	provisioned: boolean;
+}): OffboxBbrCap {
+	const cubicOff = input.summaries.filter(
+		(s) => s.key.endsWith("@offbox") && !s.key.includes("@bbr"),
+	);
+	const bbrOff = input.summaries.filter(
+		(s) => s.key.endsWith("@offbox") && s.key.includes("@bbr"),
+	);
+	const cubicOffboxFrameTxPerSec = medianFrameTx(cubicOff);
+	const bbrOffboxFrameTxPerSec = medianFrameTx(bbrOff);
+	const ratio =
+		cubicOffboxFrameTxPerSec != null &&
+		bbrOffboxFrameTxPerSec != null &&
+		cubicOffboxFrameTxPerSec > 0
+			? bbrOffboxFrameTxPerSec / cubicOffboxFrameTxPerSec
+			: null;
+	const controlReproduced =
+		cubicOffboxFrameTxPerSec != null &&
+		cubicOffboxFrameTxPerSec >= OFFBOX_CUBIC_MIN &&
+		cubicOffboxFrameTxPerSec <= OFFBOX_CUBIC_MAX;
+	const applied = (arms: readonly ArmSummary[], expected: string): boolean =>
+		arms.length > 0 &&
+		arms.every((s) => s.runs.every((r) => r.appliedCongestion === expected));
+	const sessionsHealthy = (arms: readonly ArmSummary[]): boolean =>
+		arms.every((s) =>
+			s.runs.every((r) => r.sessionsOk >= 0.9 * input.sessions),
+		);
+	const remoteMarked = (arms: readonly ArmSummary[]): boolean =>
+		arms.length > 0 &&
+		arms.every((s) => s.runs.every((r) => r.offboxSsh != null));
+	const mixedGen = input.genModes.some((m) => m !== "offbox");
+	const mixedRmem = input.rmemModes.some((m) => m !== "default");
+	const mixedCpu = input.cpuModes.some((m) => m !== "shared");
+	const incomplete =
+		mixedGen ||
+		mixedRmem ||
+		mixedCpu ||
+		!input.provisioned ||
+		bbrOff.length === 0 ||
+		cubicOffboxFrameTxPerSec == null ||
+		bbrOffboxFrameTxPerSec == null ||
+		bbrOffboxFrameTxPerSec === 0 ||
+		!controlReproduced ||
+		!remoteMarked(cubicOff) ||
+		!remoteMarked(bbrOff) ||
+		!applied(cubicOff, "cubic") ||
+		!applied(bbrOff, "bbr") ||
+		!sessionsHealthy(cubicOff) ||
+		!sessionsHealthy(bbrOff);
+	let stopBucket: OffboxBbrBucket = "incomplete";
+	if (!incomplete && ratio != null && bbrOffboxFrameTxPerSec != null) {
+		if (ratio < CORESPLIT_RATIO) {
+			stopBucket = "not-bbr";
+		} else if (bbrOffboxFrameTxPerSec > SHARED_FRAME_TX_MAX) {
+			stopBucket = "bbr-lifts";
+		} else if (bbrOffboxFrameTxPerSec >= SHARED_FRAME_TX_MIN) {
+			stopBucket = "path-only";
+		}
+	}
+	return {
+		cubicOffboxFrameTxPerSec,
+		bbrOffboxFrameTxPerSec,
+		ratio,
+		provisioned: input.provisioned,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -887,6 +980,8 @@ async function main(): Promise<void> {
 	);
 
 	const offboxStamp = GEN_MODES.includes("offbox");
+	const offboxBbrStamp =
+		offboxStamp && !GEN_MODES.includes("onbox") && CC_MODES.includes("bbr");
 	let offboxProvisioned = false;
 	if (offboxStamp) {
 		if (!OFFBOX_SSH || !OFFBOX_HOST) {
@@ -1023,6 +1118,14 @@ async function main(): Promise<void> {
 		sessions: SESSIONS,
 		provisioned: offboxProvisioned,
 	});
+	const offboxBbr = classifyOffboxBbr({
+		summaries,
+		genModes: GEN_MODES,
+		rmemModes: RMEM_MODES,
+		cpuModes: CPU_MODES,
+		sessions: SESSIONS,
+		provisioned: offboxProvisioned,
+	});
 	const failures = [
 		...proofFailures(summaries),
 		...(gitOutput(["rev-parse", "HEAD"]) === head
@@ -1077,6 +1180,7 @@ async function main(): Promise<void> {
 		rmem,
 		cc,
 		offbox,
+		offboxBbr,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -1191,7 +1295,7 @@ async function main(): Promise<void> {
 				`wrote=${rmem.rmemDefaultWrote} STOP=${rmem.stopBucket}`,
 		);
 	}
-	if (CC_MODES.includes("bbr")) {
+	if (CC_MODES.includes("bbr") && !offboxBbrStamp) {
 		const n = (value: number | null): string =>
 			value == null ? "n/a" : String(Math.round(value));
 		console.log(
@@ -1201,7 +1305,7 @@ async function main(): Promise<void> {
 				`STOP=${cc.stopBucket}`,
 		);
 	}
-	if (offboxStamp) {
+	if (offboxStamp && !offboxBbrStamp) {
 		const n = (value: number | null): string =>
 			value == null ? "n/a" : String(Math.round(value));
 		console.log(
@@ -1209,6 +1313,16 @@ async function main(): Promise<void> {
 				`offboxFrameTx=${n(offbox.offboxFrameTxPerSec)} ` +
 				`ratio=${offbox.ratio == null ? "n/a" : offbox.ratio.toFixed(2)} ` +
 				`provisioned=${offbox.provisioned} STOP=${offbox.stopBucket}`,
+		);
+	}
+	if (offboxBbrStamp) {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  offbox-bbr: cubicOffFrameTx=${n(offboxBbr.cubicOffboxFrameTxPerSec)} ` +
+				`bbrOffFrameTx=${n(offboxBbr.bbrOffboxFrameTxPerSec)} ` +
+				`ratio=${offboxBbr.ratio == null ? "n/a" : offboxBbr.ratio.toFixed(2)} ` +
+				`provisioned=${offboxBbr.provisioned} STOP=${offboxBbr.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)
