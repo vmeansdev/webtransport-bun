@@ -1,15 +1,23 @@
 /**
- * Log-linear latency histogram — 32 sub-buckets per octave, so ~3% relative
+ * Log-linear latency histogram — 256 sub-buckets per octave, so ≤0.4% relative
  * error at every magnitude from 1 ns to ~9 hours.
  *
+ * The resolution is set by what the histogram is asked to resolve, not by
+ * taste. The pre-registered H7 A/B calls a `|Δp99|` below 0.2 ms `batch-free`,
+ * and Δ is a difference of two independently quantized percentiles, so the
+ * bucket width has to stay well under half that band at the percentiles being
+ * differenced (tens of ms). At 32 sub-buckets per octave it did not: ~3% of a
+ * 15 ms p99 is ±0.45 ms per arm, which is wider than the band it is being
+ * compared against. See Amendment 2 in the pre-registration.
+ *
  * Recording is allocation-free and branch-light: at 100k datagrams/s the
- * histogram itself must not become the thing being measured. Values below 32 ns
- * get their own exact bucket, which keeps the low end honest without a special
- * case in the percentile reader.
+ * histogram itself must not become the thing being measured. Values below 256
+ * ns get their own exact bucket, which keeps the low end honest without a
+ * special case in the percentile reader.
  */
 
-const SUB_BITS = 5;
-const SUB = 1 << SUB_BITS; // 32
+const SUB_BITS = 8;
+const SUB = 1 << SUB_BITS; // 256
 const MAX_OCTAVE = 45; // 2^45 ns ≈ 9.8 hours
 const BUCKETS = (MAX_OCTAVE - SUB_BITS + 1) * SUB + SUB;
 
@@ -28,8 +36,20 @@ export type LatencySummary = {
 };
 
 export type LatencyHistogramJson = {
-	counts: number[];
+	/** Bumped when the bucketing or the encoding changes. */
+	version: 2;
+	/** Bucketing the producer used; a mismatch is a hard read error. */
+	subBits: number;
+	maxOctave: number;
+	/** Non-empty buckets only, `[index, count]`, ascending by index. */
+	buckets: [number, number][];
+	/** Sum of `buckets`, computed by the producer in the same pass. */
 	count: number;
+	/**
+	 * The producer's running sample counter. Equal to `count` for a quiesced
+	 * producer; a gap means the snapshot was taken while recording continued.
+	 */
+	recordedTotal: number;
 	negative: number;
 	minNs: number;
 	maxNs: number;
@@ -111,11 +131,23 @@ export class LatencyHistogram {
 		};
 	}
 
-	/** Sparse-ish JSON form; the counts array is 1.4k slots and compresses well. */
+	/**
+	 * Sparse JSON: 9,984 slots of which a latency step fills a few hundred, so
+	 * the dense form would be almost all zeros in every artifact.
+	 */
 	toJson(): LatencyHistogramJson {
+		const buckets: [number, number][] = [];
+		for (let i = 0; i < BUCKETS; i += 1) {
+			const c = this.counts[i] ?? 0;
+			if (c > 0) buckets.push([i, c]);
+		}
 		return {
-			counts: Array.from(this.counts),
+			version: 2,
+			subBits: SUB_BITS,
+			maxOctave: MAX_OCTAVE,
+			buckets,
 			count: this.total,
+			recordedTotal: this.total,
 			negative: this.negativeCount,
 			minNs: this.total === 0 ? 0 : this.min,
 			maxNs: this.max,
@@ -124,13 +156,21 @@ export class LatencyHistogram {
 	}
 
 	static fromJson(json: LatencyHistogramJson): LatencyHistogram {
-		const h = new LatencyHistogram();
-		for (let i = 0; i < BUCKETS && i < json.counts.length; i += 1) {
-			h.counts[i] = json.counts[i] ?? 0;
+		if (json.subBits !== SUB_BITS || json.maxOctave !== MAX_OCTAVE) {
+			throw new Error(
+				`histogram bucketing mismatch: fragment has subBits=${json.subBits} maxOctave=${json.maxOctave}, this build reads subBits=${SUB_BITS} maxOctave=${MAX_OCTAVE}`,
+			);
 		}
-		h.total = json.count;
+		const h = new LatencyHistogram();
+		for (const [index, count] of json.buckets) {
+			if (index < 0 || index >= BUCKETS) {
+				throw new Error(`histogram bucket index out of range: ${index}`);
+			}
+			h.counts[index] = (h.counts[index] ?? 0) + count;
+			h.total += count;
+		}
 		h.negativeCount = json.negative;
-		h.min = json.count === 0 ? Number.POSITIVE_INFINITY : json.minNs;
+		h.min = h.total === 0 ? Number.POSITIVE_INFINITY : json.minNs;
 		h.max = json.maxNs;
 		h.sum = json.sumNs;
 		return h;
@@ -148,4 +188,11 @@ export class LatencyHistogram {
 }
 
 export const HISTOGRAM_BUCKETS = BUCKETS;
+/**
+ * Worst-case absolute quantization error of a reported value: buckets are
+ * reported at their midpoint and a bucket is at most `value / SUB` wide.
+ */
+export function quantizationNs(valueNs: number): number {
+	return valueNs / (2 * SUB);
+}
 export const __testing = { bucketIndex, bucketValue };
