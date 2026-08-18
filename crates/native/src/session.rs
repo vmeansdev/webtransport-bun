@@ -131,23 +131,65 @@ pub(crate) fn session_metrics_snapshot_from(
 }
 
 pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<()> {
-    let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
-        session_registry::get_datagram_send_state(id)
-    else {
+    let Some(state) = session_registry::get_datagram_send_state(id) else {
         return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
     };
+    let deadline = Instant::now() + Duration::from_millis(state.3.backpressure_timeout_ms);
+    send_datagram_on_state(&state, bytes, deadline).await
+}
+
+/// Send up to `DATAGRAM_BATCH_MAX` datagrams across one N-API crossing.
+///
+/// The session's send state and the backpressure deadline are both resolved
+/// once, at entry, and shared by every element: a caller who asked for one call
+/// gets one call's worth of patience, where per-element deadlines would let a
+/// 256-element batch park for 256 × `backpressure_timeout_ms`. Reservation
+/// stays strictly per element — reserving `sum(len)` against
+/// `max_queued_bytes_per_session` would be the park-forever class fixed by
+/// `5ad0245`, waiting on a release that can never come whenever a configured
+/// budget is smaller than the batch. At N=1 this is the same state lookup, the
+/// same deadline expression and the same reservation call as
+/// `send_datagram_for_session`, so batch-of-1 is that function.
+pub(crate) async fn send_datagram_batch_for_session(
+    id: &str,
+    prepared: crate::datagram_batch::PreparedBatch,
+) -> crate::datagram_batch::DatagramBatchResult {
+    let Some(state) = session_registry::get_datagram_send_state(id) else {
+        return crate::datagram_batch::DatagramBatchResult::new(
+            0,
+            Some("E_SESSION_CLOSED".to_string()),
+        );
+    };
+    let deadline = Instant::now() + Duration::from_millis(state.3.backpressure_timeout_ms);
+    crate::datagram_batch::send_prepared(prepared, |bytes| {
+        let state = &state;
+        async move {
+            send_datagram_on_state(state, &bytes, deadline)
+                .await
+                .map_err(|err| err.reason.clone())
+        }
+    })
+    .await
+}
+
+/// One datagram against an already-resolved session state and deadline.
+async fn send_datagram_on_state(
+    state: &session_registry::DatagramSendState,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    let (conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed) = state;
     let sz = bytes.len();
     if sz > limits.max_datagram_size {
         return Err(napi::Error::from_reason("E_QUEUE_FULL"));
     }
     let sz_u64 = sz as u64;
-    let deadline = Instant::now() + Duration::from_millis(limits.backpressure_timeout_ms);
     session_registry::reserve_datagram_capacity(
-        &metrics,
-        &sm,
-        &datagram_capacity_notify,
-        &lifecycle_closed,
-        &limits,
+        metrics,
+        sm,
+        datagram_capacity_notify,
+        lifecycle_closed,
+        limits,
         sz_u64,
         deadline,
     )
@@ -164,7 +206,7 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
     let result = conn
         .send_datagram(bytes)
         .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
-    metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
+    metrics.release_datagram_capacity(&sm.queued_bytes, datagram_capacity_notify, sz_u64);
     result?;
     metrics.datagram_enqueue_histogram.observe(start.elapsed());
     metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -172,12 +214,7 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-/// Largest batch one delivery call may carry.
-///
-/// The point of batching is amortizing the N-API round trip, and the win is
-/// already flat well before here; a larger cap only widens the window in which
-/// dequeued payloads are held outside the queue's byte reservation.
-const DATAGRAM_BATCH_MAX: u32 = 256;
+use crate::datagram_batch::DATAGRAM_BATCH_MAX;
 
 /// Clamp a caller-supplied batch size into range. Out-of-range values are
 /// corrected silently: a rejected async N-API call leaks its self-reference
