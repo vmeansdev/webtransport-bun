@@ -1,6 +1,9 @@
 //! WebTransport load client. Connects to a server and generates datagram + stream load.
 //! Used by tools/load for CI and soak tests.
 
+mod latency_probe;
+
+use latency_probe::{monotonic_ns, read_stamp, write_stamp, AtomicHistogram, STAMP_BYTES};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +41,8 @@ const DEFAULT_RECONNECT_HOLD_MS: u64 = 1_000;
 /// 0 keeps the legacy tiny string payloads; a positive value pads every load
 /// datagram to exactly that many bytes for bandwidth-oriented runs.
 const DEFAULT_PAYLOAD_BYTES: usize = 0;
+/// 64 Hz is the competitive-FPS default and the one the latency axis registers.
+const DEFAULT_TICK_HZ: u64 = 64;
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
 const PROBE_UNI_ECHO_PREFIX: &str = "probe:uni-echo:";
@@ -46,6 +51,113 @@ const PROBE_BIDI_ECHO_PREFIX: &str = "probe:bidi-echo:";
 const PROBE_BIDI_RESET_PREFIX: &str = "probe:bidi-reset:";
 const LOAD_UNI_PREFIX: &str = "load:uni:";
 const LOAD_BIDI_PREFIX: &str = "load:bidi:";
+
+/// How the load client spaces its datagrams in time.
+///
+/// `Uniform` is the shape every previous bench used: one datagram per interval,
+/// with each session phase-offset so arrivals spread out. `Tick` is the game
+/// server shape: every session fires its whole per-tick quota back-to-back at
+/// the *same* shared deadline, then goes quiet. Same aggregate rate, completely
+/// different arrival process — best case for batch fill, worst case for the tail.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ArrivalProfile {
+    #[default]
+    Uniform,
+    Tick,
+}
+
+impl ArrivalProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Tick => "tick",
+        }
+    }
+}
+
+fn parse_arrival_profile(raw: Option<&str>) -> ArrivalProfile {
+    match raw {
+        Some("uniform") | None => ArrivalProfile::Uniform,
+        Some("tick") => ArrivalProfile::Tick,
+        Some(other) => {
+            eprintln!("load-client: invalid value for --arrival ('{other}'); using default");
+            ArrivalProfile::Uniform
+        }
+    }
+}
+
+/// Client-side half of the latency instrumentation: round-trip time against the
+/// client's own clock (no cross-process clock assumption at all), and the
+/// client's own send-schedule lag, which is how generator saturation gets
+/// separated from server latency instead of being blamed on the server.
+#[derive(Default)]
+struct LatencyProbe {
+    rtt: AtomicHistogram,
+    schedule_lag: AtomicHistogram,
+    echo_unstamped: AtomicU64,
+    ticks_skipped: AtomicU64,
+    send_events: AtomicU64,
+}
+
+impl LatencyProbe {
+    fn to_json(&self, arrival: ArrivalProfile, effective_rate: f64) -> String {
+        format!(
+            concat!(
+                "{{\"arrival\":\"{}\",\"effectiveDatagramsPerSecPerSession\":{:.3},",
+                "\"rtt\":{},\"scheduleLag\":{},",
+                "\"echoUnstamped\":{},\"ticksSkipped\":{},\"sendEvents\":{}}}"
+            ),
+            arrival.as_str(),
+            effective_rate,
+            self.rtt.to_json(),
+            self.schedule_lag.to_json(),
+            self.echo_unstamped.load(Ordering::Relaxed),
+            self.ticks_skipped.load(Ordering::Relaxed),
+            self.send_events.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Deadline generator shared by both arrival profiles.
+///
+/// Both profiles are the same machine with different `(period, burst)`: uniform
+/// is `(1/rate, 1)`, tick is `(1/tick_hz, rate/tick_hz)`. Keeping one
+/// implementation means the two arms cannot drift apart in some detail nobody
+/// looked at.
+struct DatagramSchedule {
+    anchor: Instant,
+    anchor_ns: u64,
+    period_ns: u64,
+    burst: u64,
+    /// Index of the *next* send event, 1-based against the anchor.
+    index: u64,
+}
+
+impl DatagramSchedule {
+    fn deadline(&self) -> Instant {
+        self.anchor + Duration::from_nanos(self.period_ns.saturating_mul(self.index))
+    }
+
+    fn intended_ns(&self) -> u64 {
+        self.anchor_ns + self.period_ns.saturating_mul(self.index)
+    }
+
+    /// Skip past events whose deadline is already in the past, the way
+    /// `MissedTickBehavior::Skip` does — a backlogged generator must not run
+    /// away and reshape the offered load. The skipped count is reported so the
+    /// shortfall shows up as evidence rather than as a mystery.
+    fn catch_up(&mut self, now: Instant) -> u64 {
+        let elapsed = now.saturating_duration_since(self.anchor).as_nanos() as u64;
+        let min_index = elapsed / self.period_ns + 1;
+        if min_index > self.index {
+            let skipped = min_index - self.index;
+            self.index = min_index;
+            skipped
+        } else {
+            0
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ClientMode {
@@ -105,6 +217,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reconnect_hold_ms = DEFAULT_RECONNECT_HOLD_MS;
     let mut skip_probes = false;
     let mut payload_bytes = DEFAULT_PAYLOAD_BYTES;
+    let mut arrival = ArrivalProfile::Uniform;
+    let mut tick_hz = DEFAULT_TICK_HZ;
+    let mut latency_stamp = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -157,10 +272,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload_bytes =
                     parse_or_default("--payload-bytes", args.next(), DEFAULT_PAYLOAD_BYTES)
             }
+            "--arrival" => arrival = parse_arrival_profile(args.next().as_deref()),
+            "--tick-hz" => tick_hz = parse_or_default("--tick-hz", args.next(), DEFAULT_TICK_HZ),
+            "--latency-stamp" => latency_stamp = true,
             _ => {}
         }
     }
 
+    if latency_stamp && payload_bytes < STAMP_BYTES {
+        return Err(format!(
+            "--latency-stamp needs --payload-bytes >= {STAMP_BYTES}, got {payload_bytes}"
+        )
+        .into());
+    }
+    if arrival == ArrivalProfile::Tick && tick_hz == 0 {
+        return Err("--arrival tick needs --tick-hz > 0".into());
+    }
+
+    println!(
+        "load-client: arrival={} tick_hz={} latency_stamp={}",
+        arrival.as_str(),
+        tick_hz,
+        latency_stamp
+    );
     println!(
         "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} payload_bytes={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
         mode.as_str(),
@@ -191,6 +325,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconnect_hold: Duration::from_millis(reconnect_hold_ms),
         skip_probes,
         payload_bytes,
+        arrival,
+        tick_hz,
+        latency_stamp,
         budgets: ErrorBudgets {
             max_session_errors,
             max_datagram_errors,
@@ -236,6 +373,9 @@ struct RunOptions<'a> {
     reconnect_hold: Duration,
     skip_probes: bool,
     payload_bytes: usize,
+    arrival: ArrivalProfile,
+    tick_hz: u64,
+    latency_stamp: bool,
     budgets: ErrorBudgets,
 }
 
@@ -408,6 +548,9 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         reconnect_hold,
         skip_probes,
         payload_bytes,
+        arrival,
+        tick_hz,
+        latency_stamp,
         budgets,
     } = options;
     let config = ClientConfig::builder()
@@ -417,6 +560,28 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
 
     let endpoint = Arc::new(Endpoint::client(config)?);
     let counters = Arc::new(Counters::default());
+    let latency = latency_stamp.then(|| Arc::new(LatencyProbe::default()));
+    // One anchor for the whole run, captured before any session exists. In tick
+    // mode every session lands on this same grid — that is the thundering herd.
+    // In uniform mode each session is phase-offset off it, so arrivals spread.
+    let anchor = Instant::now();
+    let anchor_ns = monotonic_ns();
+    let (period_ns, burst) = match arrival {
+        ArrivalProfile::Uniform => (
+            1_000_000_000u64
+                .checked_div(datagrams_per_sec)
+                .map(|ns| ns.max(1))
+                .unwrap_or(3_600_000_000_000),
+            1,
+        ),
+        ArrivalProfile::Tick => (
+            (1_000_000_000 / tick_hz.max(1)).max(1),
+            (datagrams_per_sec as f64 / tick_hz.max(1) as f64)
+                .round()
+                .max(1.0) as u64,
+        ),
+    };
+    let effective_rate = burst as f64 * (1e9 / period_ns.max(1) as f64);
 
     match mode {
         ClientMode::Load => {
@@ -425,6 +590,15 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                 let url = url.to_string();
                 let endpoint = Arc::clone(&endpoint);
                 let counters = Arc::clone(&counters);
+                let latency = latency.clone();
+                // Uniform spreads sessions evenly across one send period; tick
+                // deliberately does not.
+                let phase_ns = match arrival {
+                    ArrivalProfile::Uniform if num_sessions > 0 => {
+                        period_ns * i as u64 / num_sessions as u64
+                    }
+                    _ => 0,
+                };
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -438,9 +612,18 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                             run_session(
                                 conn,
                                 duration,
-                                datagrams_per_sec,
-                                streams_per_sec,
-                                payload_bytes,
+                                SessionLoad {
+                                    schedule: DatagramSchedule {
+                                        anchor: anchor + Duration::from_nanos(phase_ns),
+                                        anchor_ns: anchor_ns + phase_ns,
+                                        period_ns,
+                                        burst,
+                                        index: 1,
+                                    },
+                                    streams_per_sec,
+                                    payload_bytes,
+                                    latency,
+                                },
                                 counters.as_ref(),
                             )
                             .await;
@@ -501,6 +684,12 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         "load-client: load streams opened={}",
         counters.load_streams_opened.load(Ordering::Relaxed)
     );
+    if let Some(probe) = latency.as_ref() {
+        println!(
+            "load-client: latency-json {}",
+            probe.to_json(arrival, effective_rate)
+        );
+    }
 
     let pass = ok > 0
         && err <= budgets.max_session_errors
@@ -539,30 +728,35 @@ async fn wait_for_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
     }
 }
 
+struct SessionLoad {
+    schedule: DatagramSchedule,
+    streams_per_sec: u64,
+    payload_bytes: usize,
+    latency: Option<Arc<LatencyProbe>>,
+}
+
 async fn run_session(
     conn: wtransport::Connection,
     duration: Duration,
-    datagrams_per_sec: u64,
-    streams_per_sec: u64,
-    payload_bytes: usize,
+    load: SessionLoad,
     counters: &Counters,
 ) {
+    let SessionLoad {
+        mut schedule,
+        streams_per_sec,
+        payload_bytes,
+        latency,
+    } = load;
     let start = Instant::now();
     let mut stream_sequence = 0u64;
-    let datagram_interval = if datagrams_per_sec > 0 {
-        Duration::from_secs_f64(1.0 / datagrams_per_sec as f64)
-    } else {
-        Duration::from_secs(3600)
-    };
+    let mut datagram_sequence = 0u64;
     let stream_interval = if streams_per_sec > 0 {
         Duration::from_secs_f64(1.0 / streams_per_sec as f64)
     } else {
         Duration::from_secs(3600)
     };
 
-    let mut dg_ticker = interval(datagram_interval);
     let mut st_ticker = interval(stream_interval);
-    dg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     st_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Padded template for bandwidth runs; the per-datagram id is stamped over
@@ -573,25 +767,49 @@ async fn run_session(
         Vec::new()
     };
 
+    schedule.catch_up(Instant::now());
     while start.elapsed() < duration {
+        let deadline = schedule.deadline();
         tokio::select! {
             _ = conn.closed() => break,
-            _ = dg_ticker.tick() => {
-                let sent = if payload_bytes > 0 {
-                    let header = format!("load:datagram:{}:", next_probe_id());
-                    let n = header.len().min(padded.len());
-                    padded[..n].copy_from_slice(&header.as_bytes()[..n]);
-                    conn.send_datagram(&padded)
-                } else {
-                    let payload = format!("load:datagram:{}", next_probe_id());
-                    conn.send_datagram(payload.as_bytes())
-                };
-                if sent.is_ok() {
-                    counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
-                    let len = if payload_bytes > 0 { payload_bytes as u64 } else { 0 };
-                    counters.datagram_bytes_sent.fetch_add(len, Ordering::Relaxed);
-                } else {
-                    counters.datagrams_err.fetch_add(1, Ordering::Relaxed);
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                let intended_ns = schedule.intended_ns();
+                if let Some(probe) = latency.as_ref() {
+                    probe.send_events.fetch_add(1, Ordering::Relaxed);
+                }
+                for _ in 0..schedule.burst {
+                    let sent = if payload_bytes > 0 {
+                        if let Some(probe) = latency.as_ref() {
+                            let actual_ns = monotonic_ns();
+                            write_stamp(&mut padded, intended_ns, actual_ns, datagram_sequence);
+                            datagram_sequence += 1;
+                            probe
+                                .schedule_lag
+                                .record_signed(actual_ns as i64 - intended_ns as i64);
+                        } else {
+                            let header = format!("load:datagram:{}:", next_probe_id());
+                            let n = header.len().min(padded.len());
+                            padded[..n].copy_from_slice(&header.as_bytes()[..n]);
+                        }
+                        conn.send_datagram(&padded)
+                    } else {
+                        let payload = format!("load:datagram:{}", next_probe_id());
+                        conn.send_datagram(payload.as_bytes())
+                    };
+                    if sent.is_ok() {
+                        counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+                        let len = if payload_bytes > 0 { payload_bytes as u64 } else { 0 };
+                        counters.datagram_bytes_sent.fetch_add(len, Ordering::Relaxed);
+                    } else {
+                        counters.datagrams_err.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                schedule.index += 1;
+                let skipped = schedule.catch_up(Instant::now());
+                if skipped > 0 {
+                    if let Some(probe) = latency.as_ref() {
+                        probe.ticks_skipped.fetch_add(skipped, Ordering::Relaxed);
+                    }
                 }
             }
             received = conn.receive_datagram() => {
@@ -601,6 +819,20 @@ async fn run_session(
                         counters
                             .datagram_bytes_received
                             .fetch_add(datagram.as_ref().len() as u64, Ordering::Relaxed);
+                        if let Some(probe) = latency.as_ref() {
+                            // The server echoes verbatim, so the stamp coming
+                            // back is the one this process wrote — round-trip
+                            // time against a single clock, no cross-process
+                            // assumption anywhere in it.
+                            match read_stamp(datagram.as_ref()) {
+                                Some(stamp) => probe
+                                    .rtt
+                                    .record_signed(monotonic_ns() as i64 - stamp.actual_ns as i64),
+                                None => {
+                                    probe.echo_unstamped.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
@@ -700,8 +932,55 @@ async fn run_reconnect_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_summary_json, parse_client_mode, parse_or_default, ClientMode, Counters};
+    use super::{
+        load_summary_json, parse_arrival_profile, parse_client_mode, parse_or_default,
+        ArrivalProfile, ClientMode, Counters, DatagramSchedule,
+    };
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn schedule(period_ns: u64, anchor: Instant) -> DatagramSchedule {
+        DatagramSchedule {
+            anchor,
+            anchor_ns: 1_000_000_000,
+            period_ns,
+            burst: 1,
+            index: 1,
+        }
+    }
+
+    #[test]
+    fn parse_arrival_profile_accepts_tick_and_falls_back_otherwise() {
+        assert_eq!(parse_arrival_profile(Some("tick")), ArrivalProfile::Tick);
+        assert_eq!(parse_arrival_profile(None), ArrivalProfile::Uniform);
+        assert_eq!(
+            parse_arrival_profile(Some("burst")),
+            ArrivalProfile::Uniform
+        );
+    }
+
+    #[test]
+    fn schedule_deadlines_advance_by_one_period() {
+        let anchor = Instant::now();
+        let mut sched = schedule(1_000_000, anchor);
+        assert_eq!(sched.deadline(), anchor + Duration::from_millis(1));
+        assert_eq!(sched.intended_ns(), 1_001_000_000);
+        sched.index += 1;
+        assert_eq!(sched.deadline(), anchor + Duration::from_millis(2));
+        assert_eq!(sched.intended_ns(), 1_002_000_000);
+    }
+
+    #[test]
+    fn schedule_catches_up_past_missed_deadlines_instead_of_running_away() {
+        let anchor = Instant::now();
+        let mut sched = schedule(1_000_000, anchor);
+        // 10 ms of wall clock burned means ten 1 ms events are gone.
+        let skipped = sched.catch_up(anchor + Duration::from_millis(10));
+        assert_eq!(skipped, 10);
+        assert_eq!(sched.index, 11);
+        // A second catch-up at the same instant is a no-op.
+        assert_eq!(sched.catch_up(anchor + Duration::from_millis(10)), 0);
+    }
 
     #[test]
     fn parse_or_default_parses_valid_integer() {
