@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+	type AlignmentBucket,
 	type ClassifiedStep,
+	type EgressBucket,
 	alignmentBucketFor,
 	bucketFor,
 	classify,
@@ -85,7 +87,7 @@ function step(
 }
 
 describe("latency buckets sit exactly on the registered boundaries", () => {
-	test.each([
+	test.each<[number, EgressBucket]>([
 		[4.9, "ok-realtime"],
 		[5.0, "ok-interactive"],
 		[19.9, "ok-interactive"],
@@ -98,7 +100,7 @@ describe("latency buckets sit exactly on the registered boundaries", () => {
 		expect(bucketFor(ms * MS)).toBe(expected);
 	});
 
-	test.each([
+	test.each<[number, AlignmentBucket]>([
 		[0.9, "alignment-free"],
 		[1.0, "alignment-cheap"],
 		[9.9, "alignment-cheap"],
