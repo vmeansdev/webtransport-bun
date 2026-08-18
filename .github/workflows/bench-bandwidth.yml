@@ -59,12 +59,30 @@ on:
         required: false
         default: "64"
         type: string
+      latency_ab:
+        description: "Run the interleaved H7 A/B dispatch (86 short alternating arms, medians + CIs, ingest-vs-egress cross-check) instead of the ladder"
+        required: false
+        default: "false"
+        type: string
+      latency_ab_drive_seconds:
+        description: "Seconds each interleaved arm drives load"
+        required: false
+        default: "20"
+        type: string
+      latency_ab_settle_ms:
+        description: "Drain grace held before each interleaved arm is snapshotted"
+        required: false
+        default: "6000"
+        type: string
 jobs:
   bench:
     permissions:
       contents: read
     runs-on: ["self-hosted", "Linux", "X64", "heavy"]
-    timeout-minutes: 120
+    # The interleaved A/B is the longest thing this workflow runs: 86 arms at
+    # ~32 s each is ~46 min of arms on top of checkout, install and the native
+    # build. 120 left too little room for a slow runner to finish honestly.
+    timeout-minutes: 180
     concurrency:
       group: bench-bandwidth
       cancel-in-progress: false
@@ -129,12 +147,45 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
-      # Latency axis. Three arms, one server process each, because the datagram
+      # Interleaved H7 A/B. One dispatch of 86 short alternating arm-processes
+      # (4 rungs x 10 pairs x 2 arms, plus 3 floor pairs), because two arms run as
+      # two long sequential ladders is one paired observation per rate and no
+      # dispersion at all. Order, floor rule, honesty check, interval estimator
+      # and the four cross-check readings are pre-registered in
+      # docs/research/preregistrations/latency-ab.md.
+      - name: Run interleaved H7 A/B
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_ab == 'true' }}
+        env:
+          LATENCY_AB_SESSIONS: ${{ github.event.inputs.sessions }}
+          LATENCY_AB_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
+          LATENCY_AB_DRIVE_SECONDS: ${{ github.event.inputs.latency_ab_drive_seconds }}
+          LATENCY_AB_SETTLE_MS: ${{ github.event.inputs.latency_ab_settle_ms }}
+        run: |
+          set -euo pipefail
+          OUTDIR="$GITHUB_WORKSPACE/.bench-evidence"
+          mkdir -p "$OUTDIR"
+          SHA="${{ github.event.inputs.candidate_commit }}"
+          LATENCY_AB_OUT_DIR="$OUTDIR" LATENCY_AB_TAG="$SHA" \
+            bun tools/load/latency-ab-conduct.ts
+          # Classify whatever the dispatch produced. A cell that wrote no fragment
+          # is already in the manifest; it is not silently dropped here.
+          bun tools/load/latency-ab-classify.ts \
+            "$OUTDIR/bench-latency-ab-$SHA-classified.json" \
+            "$OUTDIR"/bench-latency-ab-"$SHA"-[0-9]*.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_ab == 'true' }}
+        with:
+          name: bench-latency-ab-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/bench-latency-ab-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+      # Latency ladder. Three arms, one server process each, because the datagram
       # batch knob is read once at import and cannot be varied inside a process.
       # Method, classifier buckets and STOP conditions are pre-registered in
       # docs/research/preregistrations/latency.md.
       - name: Run latency axis
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_ab != 'true' && github.event.inputs.latency_probe == 'true' }}
         env:
           LATENCY_SESSIONS: ${{ github.event.inputs.sessions }}
           LATENCY_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -173,7 +224,7 @@ jobs:
           bun tools/load/latency-classify.ts \
             "$OUTDIR/bench-latency-$SHA-classified.json" $FRAGMENTS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_ab != 'true' && github.event.inputs.latency_probe == 'true' }}
         with:
           name: bench-latency-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-latency-*
@@ -181,7 +232,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_ab != 'true' && github.event.inputs.latency_probe != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -192,7 +243,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_ab != 'true' && github.event.inputs.latency_probe != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*
