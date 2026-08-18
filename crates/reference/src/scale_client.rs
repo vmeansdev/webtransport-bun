@@ -41,6 +41,15 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 /// Grace for every session task to observe a phase change before counters are
 /// snapshotted at that boundary.
 const PHASE_SETTLE: Duration = Duration::from_millis(250);
+/// Self-guard ceiling for this process's own RSS. Above it the generator has
+/// stopped being a measurement instrument and started being the thing that
+/// takes the host down — run 32168754965 swap-killed an 8 GB runner and left
+/// zero evidence behind. Aborting here costs one rung; not aborting cost a run.
+const CLIENT_RSS_LIMIT_MB: f64 = 3584.0;
+const RSS_GUARD_INTERVAL: Duration = Duration::from_secs(2);
+/// Distinct exit code for the self-guard, paired with the stdout marker the
+/// harness matches on.
+const EXIT_RSS_GUARD: i32 = 91;
 
 const PHASE_CONNECT: u8 = 0;
 const PHASE_STEADY: u8 = 1;
@@ -127,6 +136,34 @@ fn self_cpu_ms() -> Option<f64> {
     let stime: f64 = fields.get(12)?.parse().ok()?;
     let hz = 100.0; // USER_HZ is 100 on every Linux target this runs on.
     Some((utime + stime) * 1000.0 / hz)
+}
+
+/// Watches this process's own RSS and aborts the run if it crosses the ceiling.
+/// The marker is flushed to stdout before exiting so the harness can record that
+/// the guard fired even though no run JSON was produced.
+fn spawn_rss_guard() {
+    match self_rss_mb() {
+        Some(rss) => println!(
+            "scale-client: rss guard armed limitMb={CLIENT_RSS_LIMIT_MB:.0} sampleMs={} rssMb={rss:.1}",
+            RSS_GUARD_INTERVAL.as_millis()
+        ),
+        // No /proc (the local macOS smoke). Say so rather than let a silent
+        // no-op read as a guard that was watching.
+        None => println!("scale-client: rss guard inactive (no /proc/self/status)"),
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RSS_GUARD_INTERVAL).await;
+            let Some(rss) = self_rss_mb() else { continue };
+            if rss > CLIENT_RSS_LIMIT_MB {
+                println!(
+                    "scale-client: abort client-rss-guard rssMb={rss:.1} limitMb={CLIENT_RSS_LIMIT_MB:.0}"
+                );
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                std::process::exit(EXIT_RSS_GUARD);
+            }
+        }
+    });
 }
 
 fn open_fd_count() -> Option<u64> {
@@ -316,6 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+    spawn_rss_guard();
     let EndpointPool {
         endpoints,
         distinct_source_ips,

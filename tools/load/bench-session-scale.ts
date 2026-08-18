@@ -16,10 +16,12 @@
  * exact mistake the probe ladder was built to avoid.
  */
 
+import { type ChildProcess, spawn } from "node:child_process";
 import {
 	appendFileSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -49,6 +51,14 @@ const CONNECT_TIMEOUT_SECONDS = parseInt(
 	10,
 );
 const SAMPLE_INTERVAL_MS = parseInt(process.env.SCALE_SAMPLE_MS ?? "2000", 10);
+/** Memory watchdog cadence. Independent of the phase sampler above so the
+ * connect ramp — where run 32168754965 died — is covered like any other phase. */
+const WATCHDOG_INTERVAL_MS = Math.min(
+	2000,
+	parseInt(process.env.SCALE_WATCHDOG_MS ?? "2000", 10),
+);
+/** How long the emergency path waits on server.close() before exiting anyway. */
+const ABORT_CLOSE_TIMEOUT_MS = 3000;
 /** Settling time between the client's last steady send and the server-side
  * counter snapshot that closes the steady window. Must stay far below
  * SCALE_IDLE_SECONDS, which is the window it borrows from. */
@@ -70,6 +80,12 @@ const T = {
 	clientCpuPctLimited: 300,
 	hostCpuPctLimited: 360,
 	hostMemAvailableFloorMb: 500,
+	/** S3 abort floor, raised from 500MB by Amendment 1 of the pre-registration
+	 * after run 32168754965 swap-killed the host before the 500MB rule could
+	 * fire. Deliberately *not* the same number as the bucket-4 classifier rule
+	 * above, which stays at its pre-registered 500MB: tightening a STOP may only
+	 * make the ladder stop earlier, never reclassify a rung. */
+	hostMemAvailableAbortMb: 1000,
 	coResidentRssCeilingMb: 6500,
 	acceptWallLimitSec: 120,
 } as const;
@@ -142,6 +158,34 @@ function hostMemAvailableMb(): number | null {
 		return m?.[1] ? parseInt(m[1], 10) / 1024 : null;
 	} catch {
 		return null;
+	}
+}
+
+// The load client is spawned detached so it leads its own process group, and one
+// negative-pid kill takes its whole tree. Run 32168754965 left bench processes
+// alive after job teardown; those orphans, not the ladder, drove the host into
+// swap-death, so teardown here is unconditional on every exit path.
+let activeChild: ChildProcess | null = null;
+/** Set once the ladder is running, so a throw at top level still flushes the
+ * rungs that already completed. */
+let emergencyTeardown: (reason: string) => void = () => {};
+
+function killChildGroup(signal: NodeJS.Signals = "SIGKILL"): void {
+	const child = activeChild;
+	if (!child) return;
+	const pid = child.pid;
+	if (pid !== undefined) {
+		try {
+			process.kill(-pid, signal);
+			return;
+		} catch {
+			// Group already reaped, or the child never became a group leader.
+		}
+	}
+	try {
+		child.kill(signal);
+	} catch {
+		// Nothing left to kill.
 	}
 }
 
@@ -223,6 +267,8 @@ type Rung = {
 	idleServerRx: number;
 	sessionsLost: number;
 	clientDistinctSourceIps: number | null;
+	/** The generator's own RSS self-guard tripped and it aborted the rung. */
+	clientRssGuardFired: boolean;
 	connectErrorsSample: string[];
 };
 
@@ -251,7 +297,17 @@ function classify(r: {
 	clientCpuPctSteady: number | null;
 	hostCpuPctMedianSteady: number | null;
 	threw: boolean;
+	clientRssGuardFired: boolean;
 }): { bucket: string; reason: string } {
+	// The client's RSS self-guard routes here rather than into a bucket of its
+	// own: a generator that aborted itself produced no rung verdict, which is
+	// exactly what bucket 1 already means. No bucket is added or reordered.
+	if (r.clientRssGuardFired) {
+		return {
+			bucket: "harness-error",
+			reason: "client RSS self-guard fired: generator aborted its own run",
+		};
+	}
 	if (r.threw || r.sessionsOk === 0) {
 		return { bucket: "harness-error", reason: "rung threw or zero sessions" };
 	}
@@ -452,7 +508,116 @@ async function main(): Promise<void> {
 	);
 
 	const rungs: Rung[] = [];
+	const startedAt = new Date().toISOString();
 	let ladderAborted: string | null = null;
+	/** Lowest MemAvailable seen in the current rung, written by both the phase
+	 * sampler and the independent watchdog. */
+	let rungMemAvailableMin: number | null = null;
+
+	const buildResult = () => ({
+		version: 1,
+		schema: "bench-session-scale/1",
+		startedAt,
+		writtenAt: new Date().toISOString(),
+		complete: rungs.length === LADDER.length && ladderAborted === null,
+		preRegistration: "docs/research/preregistrations/session-scale.md",
+		host: {
+			platform: process.platform,
+			cpus: navigator?.hardwareConcurrency ?? null,
+			bunVersion: Bun.version,
+		},
+		config: {
+			ladder: LADDER,
+			payloadBytes: PAYLOAD_BYTES,
+			datagramIntervalMs: INTERVAL_MS,
+			steadySeconds: STEADY_SECONDS,
+			idleSeconds: IDLE_SECONDS,
+			settleSeconds: SETTLE_SECONDS,
+			drainGraceMs: DRAIN_GRACE_MS,
+			endpoints: ENDPOINTS,
+			connectConcurrency: CONNECT_CONCURRENCY,
+			watchdogIntervalMs: WATCHDOG_INTERVAL_MS,
+			echo: false,
+			thresholds: T,
+		},
+		rungs,
+		notRun: LADDER.filter((s) => !rungs.some((r) => r.sessions === s)),
+		ladderAborted,
+		curve: curveShape(rungs),
+	});
+
+	// Written after every rung and on every abort path, by atomic rename over the
+	// same path. Run 32168754965 crashed 29 minutes in and left nothing at all;
+	// completed rungs are evidence and must survive the run that produced them.
+	const flushResult = () => {
+		const tmp = `${OUT_JSON}.partial`;
+		writeFileSync(tmp, `${JSON.stringify(buildResult(), null, 2)}\n`);
+		renameSync(tmp, OUT_JSON);
+	};
+
+	let tornDown = false;
+	const teardown = (reason: string) => {
+		if (tornDown) return;
+		tornDown = true;
+		ladderAborted ??= reason;
+		killChildGroup("SIGKILL");
+		try {
+			flushResult();
+		} catch (err) {
+			console.error(`bench-session-scale: partial flush failed: ${err}`);
+		}
+	};
+
+	emergencyTeardown = teardown;
+
+	// Last-resort net: even an unhandled throw must not leave the client running.
+	process.on("exit", () => killChildGroup("SIGKILL"));
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		process.on(signal, () => {
+			teardown(`signal ${signal}`);
+			process.exit(128);
+		});
+	}
+
+	// S3 (pre-registration Amendment 1): MemAvailable sampled on a timer that
+	// knows nothing about phases, so the connect ramp is covered too, and the
+	// abort tears the load down instead of waiting for a graceful drain.
+	let watchdogSamples = 0;
+	let aborting = false;
+	const emergencyAbort = (reason: string) => {
+		if (aborting) return;
+		aborting = true;
+		console.error(`bench-session-scale: WATCHDOG ABORT — ${reason}`);
+		teardown(reason);
+		// Bounded: the point of the abort is to stop consuming memory now. A
+		// server that will not close in a few seconds is not worth waiting for.
+		void Promise.race([
+			server.close(),
+			new Promise((res) => setTimeout(res, ABORT_CLOSE_TIMEOUT_MS)),
+		]).finally(() => process.exit(0));
+	};
+	const watchdog = setInterval(() => {
+		watchdogSamples += 1;
+		const avail = hostMemAvailableMb();
+		if (avail !== null) {
+			rungMemAvailableMin = Math.min(rungMemAvailableMin ?? avail, avail);
+			if (avail < T.hostMemAvailableAbortMb) {
+				emergencyAbort(
+					`S3 host memory floor: MemAvailable ${avail.toFixed(0)}MB < ${T.hostMemAvailableAbortMb}MB`,
+				);
+			}
+		}
+		// Heartbeat so a run log proves the watchdog was alive, not just armed.
+		if (watchdogSamples % 15 === 1) {
+			console.log(
+				`bench-session-scale: watchdog samples=${watchdogSamples} memAvailable=${avail?.toFixed(0) ?? "n/a"}MB`,
+			);
+		}
+	}, WATCHDOG_INTERVAL_MS);
+	watchdog.unref?.();
+	console.log(
+		`bench-session-scale: memory watchdog armed every ${WATCHDOG_INTERVAL_MS}ms, abort below ${T.hostMemAvailableAbortMb}MB MemAvailable${HAS_PROC ? "" : " (no /proc on this platform: readings are null)"}`,
+	);
 
 	for (const [index, sessions] of LADDER.entries()) {
 		if (ladderAborted) {
@@ -465,9 +630,13 @@ async function main(): Promise<void> {
 			`bench-session-scale: rung ${index + 1}/${LADDER.length} sessions=${sessions}`,
 		);
 		const jsonOut = `${OUT_JSON}.rung-${sessions}.json`;
-		const child = Bun.spawn(
+		rungMemAvailableMin = null;
+		// detached: the client leads its own process group, so teardown can take
+		// the whole tree with one kill instead of hoping the direct child is all
+		// there is.
+		const child = spawn(
+			CLIENT_BIN,
 			[
-				CLIENT_BIN,
 				"--url",
 				`https://127.0.0.1:${PORT}`,
 				"--sessions",
@@ -489,8 +658,9 @@ async function main(): Promise<void> {
 				"--json-out",
 				jsonOut,
 			],
-			{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
+			{ cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], detached: true },
 		);
+		activeChild = child;
 
 		const boundary = (): Window => ({
 			serverRx,
@@ -515,12 +685,14 @@ async function main(): Promise<void> {
 			steadyEnd: Window | null;
 			idleEnd: Window | null;
 			report: ClientReport | null;
+			clientRssGuardFired: boolean;
 		} = {
 			phase: "connect",
 			steadyStart: null,
 			steadyEnd: null,
 			idleEnd: null,
 			report: null,
+			clientRssGuardFired: false,
 		};
 		const rungStart = boundary();
 
@@ -530,8 +702,8 @@ async function main(): Promise<void> {
 		const stdoutPump = (async () => {
 			const decoder = new TextDecoder();
 			let buffered = "";
-			for await (const chunk of child.stdout as ReadableStream<Uint8Array>) {
-				buffered += decoder.decode(chunk, { stream: true });
+			for await (const chunk of child.stdout ?? []) {
+				buffered += decoder.decode(chunk as Uint8Array, { stream: true });
 				const lines = buffered.split("\n");
 				buffered = lines.pop() ?? "";
 				for (const line of lines) {
@@ -553,6 +725,10 @@ async function main(): Promise<void> {
 						state.idleEnd = boundary();
 						state.phase = "stop";
 					}
+					if (line.includes("abort client-rss-guard")) {
+						state.clientRssGuardFired = true;
+						console.error(`bench-session-scale: ${line}`);
+					}
 					const jsonMatch = line.match(/^scale-client: json (\{.*\})$/);
 					if (jsonMatch?.[1]) {
 						state.report = JSON.parse(jsonMatch[1]) as ClientReport;
@@ -561,18 +737,28 @@ async function main(): Promise<void> {
 			}
 			if (buffered) stdoutText.push(buffered);
 		})();
-		const stderrPromise = new Response(child.stderr).text();
+		const stderrPromise = (async () => {
+			const chunks: string[] = [];
+			const decoder = new TextDecoder();
+			for await (const chunk of child.stderr ?? []) {
+				chunks.push(decoder.decode(chunk as Uint8Array, { stream: true }));
+			}
+			return chunks.join("");
+		})();
 
 		const hostSteady: number[] = [];
 		let serverRssMbMax = 0;
 		let serverCommittedMbMax: number | null = null;
 		let serverFdCountMax: number | null = null;
 		let clientRssMbMax: number | null = null;
-		let memAvailableMin: number | null = null;
 		let sessionsActiveMax = 0;
 		let prevHost = readHostCpu();
 		let running = true;
-		const exited = child.exited.then(() => {
+		const exitCode = new Promise<number>((res) => {
+			child.on("exit", (code, signal) => res(code ?? (signal ? 128 : -1)));
+			child.on("error", () => res(-1));
+		});
+		const exited = exitCode.then(() => {
 			running = false;
 		});
 		while (running) {
@@ -585,7 +771,7 @@ async function main(): Promise<void> {
 			prevHost = nextHost;
 			const mem = serverMem();
 			const fds = serverFdCount();
-			const cRss = clientRssMb(child.pid);
+			const cRss = child.pid === undefined ? null : clientRssMb(child.pid);
 			const avail = hostMemAvailableMb();
 			const active = server.metricsSnapshot().sessionsActive;
 			serverRssMbMax = Math.max(serverRssMbMax, mem.rssMb);
@@ -598,7 +784,7 @@ async function main(): Promise<void> {
 			if (fds !== null) serverFdCountMax = Math.max(serverFdCountMax ?? 0, fds);
 			if (cRss !== null) clientRssMbMax = Math.max(clientRssMbMax ?? 0, cRss);
 			if (avail !== null) {
-				memAvailableMin = Math.min(memAvailableMin ?? avail, avail);
+				rungMemAvailableMin = Math.min(rungMemAvailableMin ?? avail, avail);
 			}
 			sessionsActiveMax = Math.max(sessionsActiveMax, active);
 			if (state.phase === "steady" && host !== null) hostSteady.push(host);
@@ -614,9 +800,12 @@ async function main(): Promise<void> {
 			);
 		}
 
-		await child.exited;
+		await exitCode;
 		await stdoutPump;
 		const stderr = await stderrPromise;
+		// The rung is over either way; make sure nothing it spawned survives it.
+		killChildGroup("SIGKILL");
+		activeChild = null;
 		if (!state.steadyEnd) state.steadyEnd = boundary();
 		if (!state.idleEnd) state.idleEnd = boundary();
 
@@ -671,7 +860,7 @@ async function main(): Promise<void> {
 			deliveryRatio: steadySent > 0 ? steadyServerRx / steadySent : null,
 			rateLimitedTotal,
 			limitExceededTotal,
-			hostMemAvailableMbMin: memAvailableMin,
+			hostMemAvailableMbMin: rungMemAvailableMin,
 			serverRssMbMax,
 			clientRssMbMax,
 			connectWallSec: parsed?.connectWallSec ?? 0,
@@ -679,6 +868,7 @@ async function main(): Promise<void> {
 			clientCpuPctSteady,
 			hostCpuPctMedianSteady: median(hostSteady),
 			threw: parsed === null,
+			clientRssGuardFired: state.clientRssGuardFired,
 		};
 		const { bucket, reason } = classify(metrics);
 
@@ -706,7 +896,7 @@ async function main(): Promise<void> {
 			hostCpuPctMedianSteady: metrics.hostCpuPctMedianSteady,
 			clientRssMbMax,
 			clientCpuPctSteady,
-			hostMemAvailableMbMin: memAvailableMin,
+			hostMemAvailableMbMin: rungMemAvailableMin,
 			rateLimitedTotal,
 			limitExceededTotal,
 			datagramsDroppedTotal: droppedTotal,
@@ -716,6 +906,7 @@ async function main(): Promise<void> {
 			idleServerRx,
 			sessionsLost: parsed?.sessionsLost ?? 0,
 			clientDistinctSourceIps: parsed?.client.distinctSourceIps ?? null,
+			clientRssGuardFired: state.clientRssGuardFired,
 			connectErrorsSample: parsed?.connectErrorsSample ?? [],
 		};
 		rungs.push(rung);
@@ -725,49 +916,28 @@ async function main(): Promise<void> {
 
 		// STOP conditions that end the ladder rather than the rung.
 		if (
-			memAvailableMin !== null &&
-			memAvailableMin < T.hostMemAvailableFloorMb
+			rungMemAvailableMin !== null &&
+			rungMemAvailableMin < T.hostMemAvailableAbortMb
 		) {
-			ladderAborted = `S3 host memory floor: MemAvailable ${memAvailableMin.toFixed(0)}MB`;
+			ladderAborted = `S3 host memory floor: MemAvailable ${rungMemAvailableMin.toFixed(0)}MB`;
 		} else if (bucket === "harness-error") {
 			ladderAborted = "S5 harness error";
 		}
 
+		// Every completed rung is on disk before the next one starts.
+		flushResult();
+		console.log(
+			`bench-session-scale: flushed ${rungs.length} rung(s) to ${OUT_JSON}`,
+		);
+
 		await new Promise((res) => setTimeout(res, SETTLE_SECONDS * 1000));
 	}
 
+	clearInterval(watchdog);
 	await server.close();
 
-	const notRun = LADDER.filter((s) => !rungs.some((r) => r.sessions === s));
-	const result = {
-		version: 1,
-		schema: "bench-session-scale/1",
-		startedAt: new Date().toISOString(),
-		preRegistration: "docs/research/preregistrations/session-scale.md",
-		host: {
-			platform: process.platform,
-			cpus: navigator?.hardwareConcurrency ?? null,
-			bunVersion: Bun.version,
-		},
-		config: {
-			ladder: LADDER,
-			payloadBytes: PAYLOAD_BYTES,
-			datagramIntervalMs: INTERVAL_MS,
-			steadySeconds: STEADY_SECONDS,
-			idleSeconds: IDLE_SECONDS,
-			settleSeconds: SETTLE_SECONDS,
-			drainGraceMs: DRAIN_GRACE_MS,
-			endpoints: ENDPOINTS,
-			connectConcurrency: CONNECT_CONCURRENCY,
-			echo: false,
-			thresholds: T,
-		},
-		rungs,
-		notRun,
-		ladderAborted,
-		curve: curveShape(rungs),
-	};
-	writeFileSync(OUT_JSON, `${JSON.stringify(result, null, 2)}\n`);
+	const result = buildResult();
+	flushResult();
 	console.log(`bench-session-scale: wrote ${OUT_JSON} and ${OUT_CSV}`);
 	console.log(
 		"sessions | bucket | connected | offered | delivered | acceptP99 | accepts/s | rssMB | committedMB | fd | srvCpuSteady | srvCpuIdle | clientRssMB",
@@ -781,7 +951,17 @@ async function main(): Promise<void> {
 	if (ladderAborted) console.log(`ladder aborted: ${ladderAborted}`);
 }
 
-await main();
+try {
+	await main();
+} catch (err) {
+	// A throw must not cost the rungs that already completed, and must not leave
+	// the generator running: both are what turned run 32168754965 into a
+	// force-restart with zero evidence.
+	emergencyTeardown(`harness threw: ${err}`);
+	killChildGroup("SIGKILL");
+	console.error(err);
+	process.exit(1);
+}
 // Server-side sessions left behind by an abruptly exiting client have no QUIC idle
 // timeout and keep the event loop referenced after close — a clean drain can hang
 // forever (observed on the runner, latency run 32159708926). Output is already
