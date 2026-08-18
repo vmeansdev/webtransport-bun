@@ -43,9 +43,10 @@ const DEFAULT_RECONNECT_HOLD_MS: u64 = 1_000;
 const DEFAULT_PAYLOAD_BYTES: usize = 0;
 /// 64 Hz is the competitive-FPS default and the one the latency axis registers.
 const DEFAULT_TICK_HZ: u64 = 64;
-/// Floor on the uniform arm's wake period. Comfortably above the ~1 ms timer
-/// granularity both Linux and macOS give tokio, so a requested rate is actually
-/// produced instead of quietly halved.
+/// Floor on the uniform arm's wake period, applied to latency-stamped runs
+/// only. Comfortably above the ~1 ms timer granularity both Linux and macOS
+/// give tokio, so a requested rate above ~500/s/session is actually produced
+/// instead of quietly halved.
 const MIN_UNIFORM_PERIOD_NS: u64 = 2_000_000;
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
@@ -589,7 +590,16 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         // rather than hidden — and sessions stay phase-staggered, so aggregate
         // arrivals remain spread.
         ArrivalProfile::Uniform if datagrams_per_sec > 0 => {
-            let burst = (datagrams_per_sec * MIN_UNIFORM_PERIOD_NS)
+            // The floor applies to latency runs only. Every other caller keeps
+            // the historical one-datagram-per-wake shape, because changing the
+            // arrival process of an existing gate would silently invalidate
+            // comparisons against every stamp already taken with it.
+            let min_period_ns = if latency_stamp {
+                MIN_UNIFORM_PERIOD_NS
+            } else {
+                1
+            };
+            let burst = (datagrams_per_sec * min_period_ns)
                 .div_ceil(1_000_000_000)
                 .max(1);
             ((burst * 1_000_000_000 / datagrams_per_sec).max(1), burst)
