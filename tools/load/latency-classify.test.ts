@@ -66,6 +66,8 @@ function step(o: StepOverrides = {}): LatencyStep {
 	return {
 		perSessionRate: aggregateRate / 100,
 		aggregateRate,
+		nominalPerSessionRate: aggregateRate / 100,
+		nominalAggregateRate: aggregateRate,
 		elapsedSec: 60,
 		requestedDatagrams: requested,
 		clientSent,
@@ -271,6 +273,21 @@ describe("batch A/B", () => {
 		expect(ab[0]?.deltaMs).toBeCloseTo(1.1, 1);
 		expect(ab[0]?.bucket).toBe("batch-expensive");
 		expect(ab[0]?.confounded).toBe(false);
+	});
+
+	test("arms are paired on what they produced, not on what was requested", () => {
+		const asked = 50_000;
+		const def = classifyStep(
+			step({ aggregateRate: asked }),
+			fragment("default", []),
+		);
+		// Same rung on the ladder, 12% less load actually offered.
+		const zero = classifyStep(
+			{ ...step({ aggregateRate: 44_000 }), nominalAggregateRate: asked },
+			fragment("batch0", []),
+		);
+		expect(zero.nominalAggregateRate).toBe(asked);
+		expect(classifyBatchAb([def, zero])).toHaveLength(0);
 	});
 
 	test("a delta inside its own quantization is not resolvable", () => {
