@@ -255,9 +255,12 @@ async function startServer(
 			handshakesBurstPerPrefix: Math.max(cfg.sessions * 8, 1000),
 			// The bench measures the host, not the limiter. Both stream and
 			// datagram limiters sit far above any ladder step; a step that
-			// trips one is discarded by the classifier, not reported.
+			// trips one is discarded by the classifier, not reported. These two
+			// are the values the pre-registration names, verbatim — a bench that
+			// runs a different limiter config than the one on record has not run
+			// the registered experiment.
 			streamsPerSec: 10_000_000,
-			streamsBurst: 20_000_000,
+			streamsBurst: 10_000_000,
 			datagramsPerSec: cfg.datagramsPerSec ?? 10_000_000,
 			datagramsBurst: (cfg.datagramsPerSec ?? 10_000_000) * 2,
 		},
@@ -376,6 +379,13 @@ type StepObservation = {
 	serverStreamErrors: number;
 	serverDatagrams: number;
 	serverDatagramBytes: number;
+	/** Child spawn -> child exit. The interval both CPU percentages divide by. */
+	driveSec: number;
+	/** Child exit -> counters quiescent. Keeps a step's tail out of the next step. */
+	settleSec: number;
+	/** Counters were still moving when the settle budget ran out. */
+	settleTimedOut: boolean;
+	/** driveSec + settleSec: the interval the counter and CPU-ms totals cover. */
 	elapsedSec: number;
 	/**
 	 * Rate denominator. The child's wall time also covers connect, drain grace
@@ -385,8 +395,17 @@ type StepObservation = {
 	windowSec: number;
 	hostCpuPctMedian: number | null;
 	hostCpuPctMax: number | null;
+	/** Percent of one core over driveSec — same denominator as clientCpuPct. */
 	serverCpuPct: number;
+	/** Percent of one core over driveSec. */
 	clientCpuPct: number | null;
+	/**
+	 * Total server CPU milliseconds for the step, drive plus settle. Carries no
+	 * time denominator, so cost-per-bit derives from it without mixing windows.
+	 */
+	serverCpuMs: number;
+	/** Total client CPU milliseconds over driveSec. Same denominator-free role. */
+	clientCpuMs: number | null;
 	rssMbMax: number;
 	udp: UdpSnapshot | null;
 	rateLimitedDelta: number;
@@ -394,6 +413,49 @@ type StepObservation = {
 	requestedSessions: number;
 	exitCode: number;
 };
+
+/** Poll cadence and budget for the post-child drain settle. */
+const SETTLE_POLL_MS = parseInt(process.env.BENCH_SETTLE_POLL_MS ?? "250", 10);
+const SETTLE_QUIET_POLLS = parseInt(
+	process.env.BENCH_SETTLE_QUIET_POLLS ?? "4",
+	10,
+);
+const SETTLE_MAX_MS = parseInt(process.env.BENCH_SETTLE_MAX_MS ?? "15000", 10);
+
+function counterTotal(c: ServerCounters): number {
+	return (
+		c.bytes +
+		c.datagramBytes +
+		c.chunks +
+		c.datagrams +
+		c.streamsAccepted +
+		c.streamsCompleted
+	);
+}
+
+/**
+ * Wait for the server counters to stop moving after the client has exited, so
+ * a step's in-flight tail is charged to that step instead of leaking into the
+ * next one's delta. Returns how long it took and whether the budget ran out
+ * with the counters still moving — an unsettled step is not a capacity number.
+ */
+async function settleCounters(
+	harness: Harness,
+): Promise<{ settleSec: number; timedOut: boolean }> {
+	const startedAt = Date.now();
+	let last = counterTotal(harness.counters);
+	let quiet = 0;
+	while (Date.now() - startedAt < SETTLE_MAX_MS) {
+		await Bun.sleep(SETTLE_POLL_MS);
+		const now = counterTotal(harness.counters);
+		quiet = now === last ? quiet + 1 : 0;
+		last = now;
+		if (quiet >= SETTLE_QUIET_POLLS) {
+			return { settleSec: (Date.now() - startedAt) / 1000, timedOut: false };
+		}
+	}
+	return { settleSec: (Date.now() - startedAt) / 1000, timedOut: true };
+}
 
 async function runStep(
 	arm: string,
@@ -451,7 +513,9 @@ async function runStep(
 	const exitCode = await child.exited;
 	const stdout = await stdoutPromise;
 	const stderr = await stderrPromise;
-	const elapsedSec = (Date.now() - startedAt) / 1000;
+	const exitedAt = Date.now();
+	const driveSec = (exitedAt - startedAt) / 1000;
+	const cpuMsAtExit = serverCpuMs();
 	const client = parseClientSummary(stdout);
 	if (exitCode !== 0 && client.sessionsOk === 0) {
 		console.error(stderr.slice(-2000));
@@ -460,10 +524,19 @@ async function runStep(
 		);
 	}
 
-	const clientCpuPct =
+	// Bytes still in flight when the client exits arrive after it, and every
+	// counter here is a delta against the next step's opening snapshot. Without
+	// a settle the tail of step N is charged to step N+1 — the ladder's shape
+	// then partly reflects when each client happened to die.
+	const settle = await settleCounters(harness);
+	const elapsedSec = (Date.now() - startedAt) / 1000;
+
+	const clientCpuMs =
 		clientTicks0 !== null && clientTicksLast !== null
-			? ((clientTicksLast - clientTicks0) / CLK_TCK / elapsedSec) * 100
+			? ((clientTicksLast - clientTicks0) / CLK_TCK) * 1000
 			: null;
+	const clientCpuPct =
+		clientCpuMs !== null ? (clientCpuMs / (driveSec * 1000)) * 100 : null;
 	const m1 = metricsOf(harness);
 
 	return {
@@ -479,13 +552,17 @@ async function runStep(
 		serverStreamErrors: harness.counters.streamErrors - c0.streamErrors,
 		serverDatagrams: harness.counters.datagrams - c0.datagrams,
 		serverDatagramBytes: harness.counters.datagramBytes - c0.datagramBytes,
+		driveSec,
+		settleSec: settle.settleSec,
+		settleTimedOut: settle.timedOut,
 		elapsedSec,
 		windowSec: stepSeconds,
 		hostCpuPctMedian: median(hostSamples),
 		hostCpuPctMax: hostSamples.length ? Math.max(...hostSamples) : null,
-		serverCpuPct:
-			((serverCpuMs() - cpuMs0) / Math.max(elapsedSec * 1000, 1)) * 100,
+		serverCpuPct: ((cpuMsAtExit - cpuMs0) / Math.max(driveSec * 1000, 1)) * 100,
 		clientCpuPct,
+		serverCpuMs: serverCpuMs() - cpuMs0,
+		clientCpuMs,
 		rssMbMax,
 		udp: udpDelta(udp0, readUdpStats()),
 		rateLimitedDelta: m1.rateLimitedCount - m0.rateLimitedCount,
@@ -501,36 +578,57 @@ async function runStep(
 
 const INCOMPLETE_BUCKETS = new Set([
 	"session-failure",
+	"server-stream-errors",
 	"limiter-engaged",
 	"drain-incomplete",
+	"counter-contamination",
+	"drain-unsettled",
+	"instrumentation-missing",
 	"host-saturated",
 	"generator-saturated",
 	"offer-shortfall",
 ]);
 
-/** Rules 1-5 of the pre-registration, shared by every arm, in precedence order. */
+/**
+ * Rules 1-5 of the pre-registration plus the harness-integrity rules that make
+ * them checkable, in precedence order. Every rule here says "this step is not a
+ * measurement"; none of them says anything about the server's capacity.
+ */
 function commonBucket(step: StepObservation): string | null {
-	// Rule 1 is the client's error contract, per the pre-registration.
-	// serverStreamErrors is recorded but deliberately not a trip: a reader that
-	// loses its tail because the client tore the session down first is a
-	// shutdown artifact, and `drain-incomplete` is the rule that catches a
-	// genuinely truncated step.
 	if (
 		step.client.sessionsOk < step.requestedSessions ||
 		step.client.streamsErr > 0
 	) {
 		return "session-failure";
 	}
+	// The server's own reader errors are part of rule 1's question — did every
+	// stream in this step complete? A reader that threw dropped bytes the step
+	// is about, whatever tore it down, so it cannot be waved off as a shutdown
+	// artifact and still leave the step a capacity number.
+	if (step.serverStreamErrors > 0) return "server-stream-errors";
 	if (step.rateLimitedDelta > 0 || step.limitExceededDelta > 0) {
 		return "limiter-engaged";
 	}
+	// Two-sided. Short of the client's bytes means the step ended mid-flight;
+	// past them means a previous step's tail landed inside this delta, which is
+	// the same defect seen from the other side.
 	const written = step.client.streamBytesWritten;
 	if (written > 0 && written - step.serverBytes > 0.05 * written) {
 		return "drain-incomplete";
 	}
-	if ((step.hostCpuPctMedian ?? 0) >= 90) return "host-saturated";
+	if (written > 0 && step.serverBytes - written > 0.05 * written) {
+		return "counter-contamination";
+	}
+	if (step.settleTimedOut) return "drain-unsettled";
+	// Rules 4 and 5 are checks, and a check that could not run is not a pass.
+	// Treating a missing clientCpuPct as "not generator-saturated" would let the
+	// one step whose generator honesty is unknown be the step that sets the
+	// ceiling — which is exactly the number the STOP conditions exist to guard.
+	if (step.hostCpuPctMedian === null || step.clientCpuPct === null) {
+		return "instrumentation-missing";
+	}
+	if (step.hostCpuPctMedian >= 90) return "host-saturated";
 	if (
-		step.clientCpuPct !== null &&
 		step.clientCpuPct >= 150 &&
 		step.clientCpuPct >= 1.5 * step.serverCpuPct
 	) {
@@ -550,10 +648,12 @@ function classifyThroughput(
 ): string {
 	const common = commonBucket(step);
 	if (common) return common;
-	if (
-		step.serverCpuPct >= 90 &&
-		step.serverCpuPct >= (step.clientCpuPct ?? 0)
-	) {
+	// commonBucket has already rejected the step if either CPU series is
+	// missing, so these reads are non-null by construction rather than by a
+	// `?? 0` that would quietly decide the comparison.
+	const hostCpu = step.hostCpuPctMedian as number;
+	const clientCpu = step.clientCpuPct as number;
+	if (step.serverCpuPct >= 90 && step.serverCpuPct >= clientCpu) {
 		return "server-boundary-bound";
 	}
 	const now = deliveredMbps(step);
@@ -562,9 +662,9 @@ function classifyThroughput(
 		before !== null &&
 		before > 0 &&
 		Math.abs(now - before) < 0.05 * before &&
-		(step.hostCpuPctMedian ?? 0) < 70 &&
+		hostCpu < 70 &&
 		step.serverCpuPct < 70 &&
-		(step.clientCpuPct ?? 0) < 100
+		clientCpu < 100
 	) {
 		return "flow-control-bound";
 	}
@@ -602,6 +702,25 @@ function coalescingVerdict(
 	};
 }
 
+/**
+ * What the per-Gbit packet counter actually counts, carried in the artifact so
+ * the number cannot be read as a wire-packet count by a later reader.
+ *
+ * `/proc/net/snmp` `Udp: InDatagrams` counts datagrams handed to UDP sockets,
+ * not frames on the wire, and it differs from a wire count two ways at once.
+ * Under GRO a single counted datagram is a coalesced super-packet of many
+ * segments; and the file is host-wide, so on this on-box loopback rig it sums
+ * the server's receives and the co-resident client's receives. Neither can be
+ * undone from this counter alone, so the figure is reported as what it is
+ * rather than converted into a wire-packet estimate the data cannot support.
+ * Read it beside each step's `gso`/`gro` verdicts.
+ */
+const SNMP_DATAGRAM_COUNTER_NOTE =
+	"/proc/net/snmp Udp.InDatagrams counts socket-layer datagrams, NOT wire " +
+	"packets: under GRO each count is a coalesced super-packet, and the counter " +
+	"is host-wide so it sums server and co-resident client receives. Not " +
+	"convertible to a wire-packet count; read with the gso/gro verdicts";
+
 type ClassifiedStep = StepObservation & {
 	bucket: string;
 	incomplete: boolean;
@@ -611,7 +730,11 @@ type ClassifiedStep = StepObservation & {
 	boundaryEventsPerSec: number;
 	gso: ReturnType<typeof coalescingVerdict>;
 	gro: ReturnType<typeof coalescingVerdict>;
-	wirePacketsPerGbit: number | null;
+	/** Socket-layer UDP datagrams per delivered Gbit. See the note above. */
+	snmpUdpInDatagramsPerGbit: number | null;
+	/** Cost per delivered bit, free of any time denominator. */
+	serverCpuMsPerGbit: number | null;
+	clientCpuMsPerGbit: number | null;
 };
 
 function classify(
@@ -624,7 +747,15 @@ function classify(
 			? classifyThroughput(step, prev)
 			: classifyChurn(step, prev);
 	const mbps = deliveredMbps(step);
-	const gbitDelivered = (mbps * step.windowSec) / 1000;
+	// Bits actually delivered in this step, not a rate: cost-per-bit figures
+	// divide by it and so inherit no window choice at all.
+	const gbitDelivered = (step.serverBytes + step.serverDatagramBytes) * 8e-9;
+	const gro = coalescingVerdict(
+		step.client.udpRxDatagrams,
+		step.client.udpRxIos,
+	);
+	const snmpPerGbit =
+		step.udp && gbitDelivered > 0 ? step.udp.inDatagrams / gbitDelivered : null;
 	return {
 		...step,
 		bucket,
@@ -636,10 +767,13 @@ function classify(
 		boundaryEventsPerSec:
 			(step.serverChunks + step.serverDatagrams) / step.windowSec,
 		gso: coalescingVerdict(step.client.udpTxDatagrams, step.client.udpTxIos),
-		gro: coalescingVerdict(step.client.udpRxDatagrams, step.client.udpRxIos),
-		wirePacketsPerGbit:
-			step.udp && gbitDelivered > 0
-				? step.udp.inDatagrams / gbitDelivered
+		gro,
+		snmpUdpInDatagramsPerGbit: snmpPerGbit,
+		serverCpuMsPerGbit:
+			gbitDelivered > 0 ? step.serverCpuMs / gbitDelivered : null,
+		clientCpuMsPerGbit:
+			gbitDelivered > 0 && step.clientCpuMs !== null
+				? step.clientCpuMs / gbitDelivered
 				: null,
 	};
 }
@@ -656,7 +790,11 @@ function printStep(step: ClassifiedStep): void {
 			0,
 		)}% cliCpu=${step.clientCpuPct?.toFixed(0) ?? "n/a"}% rss=${step.rssMbMax.toFixed(
 			0,
-		)}MB gso=${step.gso.verdict}(${step.gso.segmentsPerIo?.toFixed(2) ?? "-"}) gro=${step.gro.verdict}(${step.gro.segmentsPerIo?.toFixed(2) ?? "-"})`,
+		)}MB srvCpuMs/Gbit=${step.serverCpuMsPerGbit?.toFixed(0) ?? "n/a"} settle=${step.settleSec.toFixed(
+			1,
+		)}s${
+			step.settleTimedOut ? "(TIMEOUT)" : ""
+		} gso=${step.gso.verdict}(${step.gso.segmentsPerIo?.toFixed(2) ?? "-"}) gro=${step.gro.verdict}(${step.gro.segmentsPerIo?.toFixed(2) ?? "-"})`,
 	);
 }
 
@@ -919,6 +1057,15 @@ function compareArmC(steps: ClassifiedStep[], targetMbps: number) {
 	if (!dgram || !stream) {
 		return { bucket: "offer-shortfall", reason: "a sub-arm did not run" };
 	}
+	// A comparison between two steps is at most as sound as the weaker step, so
+	// an INCOMPLETE sub-arm ends the comparison rather than contributing half of
+	// one.
+	if (dgram.incomplete || stream.incomplete) {
+		return {
+			bucket: "sub-arm-incomplete",
+			reason: `dgram=${dgram.bucket} stream=${stream.bucket}; an INCOMPLETE sub-arm is not a capacity number and no comparison is made`,
+		};
+	}
 	const offeredMbps = (s: ClassifiedStep) => {
 		const bytes =
 			s.label === "datagram"
@@ -950,24 +1097,36 @@ function compareArmC(steps: ClassifiedStep[], targetMbps: number) {
 		dgramOffered,
 		streamOffered,
 		dgramDeliveryRatio: dgramRatio,
-		datagram: {
-			deliveredMbps: dgram.deliveredMbps,
-			wirePacketsPerGbit: dgram.wirePacketsPerGbit,
-			boundaryEventsPerSec: dgram.boundaryEventsPerSec,
-			serverCpuPct: dgram.serverCpuPct,
-			serverCpuPctPerGbps: dgram.serverCpuPct / (dgram.deliveredMbps / 1000),
-			hostCpuPctMedian: dgram.hostCpuPctMedian,
-			gso: dgram.gso,
-		},
-		stream: {
-			deliveredMbps: stream.deliveredMbps,
-			wirePacketsPerGbit: stream.wirePacketsPerGbit,
-			boundaryEventsPerSec: stream.boundaryEventsPerSec,
-			serverCpuPct: stream.serverCpuPct,
-			serverCpuPctPerGbps: stream.serverCpuPct / (stream.deliveredMbps / 1000),
-			hostCpuPctMedian: stream.hostCpuPctMedian,
-			gso: stream.gso,
-		},
+		snmpCounterNote: SNMP_DATAGRAM_COUNTER_NOTE,
+		denominatorNote:
+			"cost per bit is CPU-ms per delivered Gbit (no time denominator); " +
+			"CPU percentages are percent-of-one-core over driveSec; delivered and " +
+			"offered rates divide by windowSec. Percentages and rates are never " +
+			"combined into a ratio",
+		datagram: armCSide(dgram),
+		stream: armCSide(stream),
+	};
+}
+
+/** One side of the Arm C comparison, with every figure's denominator fixed. */
+function armCSide(step: ClassifiedStep) {
+	return {
+		deliveredMbps: step.deliveredMbps,
+		snmpUdpInDatagramsPerGbit: step.snmpUdpInDatagramsPerGbit,
+		boundaryEventsPerSec: step.boundaryEventsPerSec,
+		serverCpuPct: step.serverCpuPct,
+		clientCpuPct: step.clientCpuPct,
+		// Was serverCpuPct / (deliveredMbps/1000), which divided a driveSec rate
+		// by a windowSec rate and silently scaled the answer by their ratio.
+		serverCpuMsPerGbit: step.serverCpuMsPerGbit,
+		clientCpuMsPerGbit: step.clientCpuMsPerGbit,
+		hostCpuPctMedian: step.hostCpuPctMedian,
+		driveSec: step.driveSec,
+		windowSec: step.windowSec,
+		gso: step.gso,
+		gro: step.gro,
+		bucket: step.bucket,
+		incomplete: step.incomplete,
 	};
 }
 
@@ -1046,15 +1205,42 @@ async function main(): Promise<void> {
 			: null;
 	// STOP conditions 1 and 2: if the top of the ladder is a generator or host
 	// number, the arm yields a lower bound, not a ceiling.
-	const armATopIncomplete =
-		ladderA.length > 0 &&
-		ladderA.reduce((a, b) => (b.deliveredMbps > a.deliveredMbps ? b : a))
-			.incomplete;
+	const armATop =
+		ladderA.length > 0
+			? ladderA.reduce((a, b) => (b.deliveredMbps > a.deliveredMbps ? b : a))
+			: null;
+	const controlVerdict = ARMS.includes("A") ? evaluateArmAControl(armA) : null;
+	// STOP condition 4 is the third way this ceiling is a lower bound, and it
+	// has to move the flag with the other two: if the raised-window control beat
+	// the default by more than 10%, every Arm A number is a flow-control-window
+	// measurement and the boundary sits somewhere above it.
+	const lowerBoundReasons: string[] = [];
+	if (armATop?.incomplete) {
+		lowerBoundReasons.push(
+			`top-of-ladder step ${armATop.label} is INCOMPLETE (${armATop.bucket})`,
+		);
+	}
+	if (controlVerdict?.verdict === "WINDOW-BOUND") {
+		lowerBoundReasons.push(
+			"A6 control is WINDOW-BOUND: arm A measures the flow-control window, not the N-API boundary",
+		);
+	}
 
 	const result = {
 		version: 1,
 		startedAt: new Date().toISOString(),
 		preregistration: "docs/research/preregistrations/stream-throughput.md",
+		notes: {
+			snmpCounter: SNMP_DATAGRAM_COUNTER_NOTE,
+			denominators:
+				"deliveredMbps / streamsPerSec / boundaryEventsPerSec divide by " +
+				"windowSec (the configured drive window). serverCpuPct and " +
+				"clientCpuPct are percent-of-one-core over driveSec (spawn -> child " +
+				"exit), the one interval both processes share. Cost per bit is " +
+				"CPU-ms per delivered Gbit and has no time denominator. Counters are " +
+				"read after settleSec so a step's in-flight tail is charged to that " +
+				"step, not the next one",
+		},
 		host: {
 			platform: process.platform,
 			cpus: navigator?.hardwareConcurrency ?? null,
@@ -1063,6 +1249,11 @@ async function main(): Promise<void> {
 		},
 		config: {
 			arms: ARMS,
+			settle: {
+				pollMs: SETTLE_POLL_MS,
+				quietPolls: SETTLE_QUIET_POLLS,
+				maxMs: SETTLE_MAX_MS,
+			},
 			a: {
 				sessions: A_SESSIONS,
 				concurrency: A_CONCURRENCY,
@@ -1090,10 +1281,11 @@ async function main(): Promise<void> {
 		verdicts: {
 			bulkCeilingMbps: bestA?.deliveredMbps ?? null,
 			bulkCeilingWriteSize: bestA?.label ?? null,
-			bulkCeilingIsLowerBoundOnly: armATopIncomplete,
+			bulkCeilingIsLowerBoundOnly: lowerBoundReasons.length > 0,
+			bulkCeilingLowerBoundReasons: lowerBoundReasons,
 			streamOpenClosePerSec: bestB?.streamsPerSec ?? null,
 			streamOpenCloseAt: bestB?.label ?? null,
-			flowControlControl: ARMS.includes("A") ? evaluateArmAControl(armA) : null,
+			flowControlControl: controlVerdict,
 			datagramVsStream: ARMS.includes("C")
 				? compareArmC(armC, C_TARGET_MBPS)
 				: null,
