@@ -203,6 +203,67 @@ the run is retried with different knobs until it produces one.
   into these buckets. Local numbers are never quoted as results.
 - Measure first, optimize never: any lever this surfaces is recorded, not built.
 
+## Amendment 1 — 2026-08-18, before any dispatch
+
+Written after a ledger review of the harness against this document and **before
+the first run of any arm** (no run id exists for this axis at the time of
+writing; the run log below is empty). Recorded here rather than by editing the
+tables above, so the diff against the original registration stays legible.
+
+**Rate limits.** The harness ran `streamsBurst` at 20,000,000 against the
+10,000,000 registered above. Code aligned to this document; the registered value
+stands.
+
+**Classifier — harness-integrity rules added ahead of rules 4-5.** These do not
+relabel any capacity number; each one moves a step to INCOMPLETE that the
+original table would have scored as a measurement it is not:
+
+| bucket | rule | why |
+|---|---|---|
+| `server-stream-errors` | `serverStreamErrors > 0` | Rule 1 asks whether every stream in the step completed. Server-side reader errors answer that question too, and the original harness excluded them as shutdown artifacts — an exclusion that lets a step lose bytes and still be a capacity number. |
+| `counter-contamination` | `serverBytes - clientBytesWritten > 0.05 * clientBytesWritten` | The other side of `drain-incomplete`. Server counters exceeding what the client wrote means a previous step's tail landed inside this step's delta. |
+| `drain-unsettled` | server counters still moving when the post-child settle budget (15 s) expires | The step's own tail never landed, so neither this delta nor the next one is clean. |
+| `instrumentation-missing` | `hostCpuPctMedian === null` or `clientCpuPct === null` | Rules 4 and 5 are checks; a check that could not run is not a pass. Without `clientCpuPct` the generator-saturation STOP cannot be evaluated, and an unevaluable step may not be the step that sets the ceiling. This is also what makes every local macOS run INCOMPLETE by construction, which is the intended outcome. |
+| `sub-arm-incomplete` (Arm C, before C1) | either sub-arm INCOMPLETE | A comparison is at most as sound as its weaker side. |
+
+**Cross-step counter hygiene.** Each step now waits for the server counters to
+go quiet after the client exits (250 ms polls, 4 consecutive quiet polls, 15 s
+budget) before its closing snapshot is taken. Without it a step's in-flight tail
+was charged to the following step's delta, so the ladder's shape partly recorded
+when each client happened to exit. `settleSec` and `settleTimedOut` are reported
+per step.
+
+**Denominators.** Fixed and stated in the artifact under `notes.denominators`:
+
+- delivered/offered rates, `streamsPerSec`, `boundaryEventsPerSec` — `windowSec`
+  (the configured drive window), as registered;
+- `serverCpuPct` and `clientCpuPct` — percent of one core over `driveSec`
+  (spawn → child exit), the one interval both processes share, so the classifier
+  rules that compare them compare like with like;
+- cost per delivered bit — **CPU-ms per delivered Gbit**, which carries no time
+  denominator at all. This replaces Arm C's `serverCpuPctPerGbps`, which divided
+  a `driveSec` rate by a `windowSec` rate and so scaled the answer by the ratio
+  of the two.
+
+**A6 and the lower-bound flag.** STOP condition 4 now moves
+`verdicts.bulkCeilingIsLowerBoundOnly`, alongside STOP conditions 1 and 2: a
+`WINDOW-BOUND` control means Arm A measured the flow-control window, so its
+ceiling bounds the boundary from below. `verdicts.bulkCeilingLowerBoundReasons`
+names which conditions fired.
+
+**`wirePacketsPerGbit` renamed `snmpUdpInDatagramsPerGbit`.** The name asserted a
+wire-packet count the counter does not provide: `/proc/net/snmp` `Udp.InDatagrams`
+counts socket-layer datagrams, each one a coalesced super-packet under GRO, and
+the file is host-wide so on this on-box rig it sums the server's and the
+co-resident client's receives. Neither is invertible from this counter, so the
+figure is reported as what it is, beside the `gso`/`gro` verdicts, and no
+wire-packet estimate is derived from it. Counting real wire packets is deferred
+with the rest of the list below.
+
+## Run log
+
+No dispatches yet.
+
 ## Deferred (out of scope for this harness)
 
 Listed so the gap is explicit rather than silent:
