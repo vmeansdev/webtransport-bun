@@ -10,6 +10,10 @@
  *   A  bulk bytes/s against client write size, plus a raised-window control
  *   B  stream open/close rate ceiling against in-flight concurrency
  *   C  datagrams vs streams at a matched offered byte rate
+ *   W  flow-control window sweep: delivered Gbps and the memory pair per rung
+ *
+ * W is opt-in (`BENCH_STREAM_ARMS=W`) because it is its own dispatch and its own
+ * server per rung; A, B and C stay the default set.
  *
  * Every step is classified mechanically by the pre-registered rules and the
  * bucket is printed next to the number. Steps that classify INCOMPLETE are not
@@ -19,8 +23,22 @@
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { $ } from "bun";
-import { createServer } from "../../packages/webtransport/src/index.ts";
+import {
+	createServer,
+	releaseNativeMemory,
+} from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
+import {
+	assertWindowMathMirror,
+	DEFAULT_MAX_DATAGRAM_SIZE,
+	DEFAULT_MAX_SESSIONS,
+	DEFAULT_QUEUED_BYTES_PER_STREAM,
+	evaluateWindowSweep,
+	WINDOW_MEMORY_NOTE,
+	type WindowMath,
+	type WindowRungRole,
+	windowMath,
+} from "./window-sweep.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
@@ -77,10 +95,33 @@ const C_STREAM_WRITE_BYTES = parseInt(
 	10,
 );
 
+// --- Arm W: flow-control window sweep --------------------------------------
+const W_SESSIONS = parseInt(process.env.BENCH_W_SESSIONS ?? "4", 10);
+const W_CONCURRENCY = parseInt(process.env.BENCH_W_CONCURRENCY ?? "4", 10);
+const W_STEP_SECONDS = parseInt(process.env.BENCH_W_STEP_SECONDS ?? "60", 10);
+/** Same write size as A4/A6, so a rung is comparable to both. */
+const W_WRITE_BYTES = parseInt(process.env.BENCH_W_WRITE_BYTES ?? "262144", 10);
+const W_WINDOWS = (
+	process.env.BENCH_W_WINDOWS ??
+	"262144,524288,1048576,2097152,4194304,8388608,16777216"
+)
+	.split(",")
+	.map((v) => parseInt(v.trim(), 10))
+	.filter((v) => Number.isFinite(v) && v > 0);
+/** Shipped per-session : per-stream ratio (2 MiB : 256 KiB). One swept knob. */
+const W_SESSION_RATIO = parseInt(process.env.BENCH_W_SESSION_RATIO ?? "8", 10);
+/** Seconds of quiet before a rung's RSS baseline is taken. */
+const W_QUIESCE_SECONDS = parseInt(
+	process.env.BENCH_W_QUIESCE_SECONDS ?? "5",
+	10,
+);
+
 const PORT_A = 4433;
 const PORT_A_CONTROL = 4436;
 const PORT_B = 4437;
 const PORT_C = 4438;
+/** Arm W gives every rung its own port; each rung is a fresh server. */
+const PORT_W_BASE = 4440;
 
 // ---------------------------------------------------------------------------
 // Host / process instrumentation
@@ -689,6 +730,24 @@ function classifyChurn(
 	return "churn-ceiling";
 }
 
+/**
+ * Arm W (Amendment 2). The swept variable is the window itself, so the shape
+ * question is only whether a bigger window still bought throughput; Arm A's
+ * `flow-control-bound` rule would be circular here.
+ */
+function classifyWindow(
+	step: StepObservation,
+	prev: StepObservation | null,
+): string {
+	const common = commonBucket(step);
+	if (common) return common;
+	const before = prev ? deliveredMbps(prev) : null;
+	if (before !== null && before > 0 && deliveredMbps(step) >= 1.1 * before) {
+		return "window-scaling";
+	}
+	return "window-plateau";
+}
+
 /** GSO/GRO engagement, per the pre-registered 1.05 threshold. */
 function coalescingVerdict(
 	datagrams: number,
@@ -740,12 +799,14 @@ type ClassifiedStep = StepObservation & {
 function classify(
 	step: StepObservation,
 	prev: StepObservation | null,
-	kind: "throughput" | "churn",
+	kind: "throughput" | "churn" | "window",
 ): ClassifiedStep {
 	const bucket =
 		kind === "throughput"
 			? classifyThroughput(step, prev)
-			: classifyChurn(step, prev);
+			: kind === "churn"
+				? classifyChurn(step, prev)
+				: classifyWindow(step, prev);
 	const mbps = deliveredMbps(step);
 	// Bits actually delivered in this step, not a rate: cost-per-bit figures
 	// divide by it and so inherit no window choice at all.
@@ -1050,6 +1111,156 @@ async function runArmC(tls: {
 	return out;
 }
 
+// --- Arm W: flow-control window sweep --------------------------------------
+
+type WindowRung = {
+	rung: string;
+	/** `ladder` rungs are the sweep; the other two are not compared against it. */
+	role: "ladder" | "tie-in" | "retention-falsifier";
+	math: WindowMath;
+	step: ClassifiedStep;
+	deliveredGbps: number;
+	rssMbBaseline: number;
+	rssMbPeak: number;
+	rssMbDelta: number;
+};
+
+/**
+ * RSS baseline for the next rung: the previous server is already closed, so
+ * return the native allocator's arenas and let the process go quiet before
+ * reading. Retention that survives this is what `W-repeat` exists to detect.
+ */
+async function quiesceRss(): Promise<number> {
+	releaseNativeMemory();
+	await Bun.sleep(W_QUIESCE_SECONDS * 1000);
+	releaseNativeMemory();
+	return serverRssMb();
+}
+
+async function runArmW(tls: {
+	certPem: string;
+	keyPem: string;
+}): Promise<WindowRung[]> {
+	assertWindowMathMirror();
+	const plan: Array<{
+		rung: string;
+		role: WindowRung["role"];
+		perStream: number;
+		perSession: number;
+	}> = W_WINDOWS.map((perStream, i) => ({
+		rung: `W${i + 1}`,
+		role: "ladder" as const,
+		perStream,
+		perSession: perStream * W_SESSION_RATIO,
+	}));
+	// A6's exact config, so the sweep and Arm A's falsifier share one axis
+	// instead of being two configurations that cannot be compared.
+	plan.push({
+		rung: "W-a6",
+		role: "tie-in",
+		perStream: 16 * 1024 * 1024,
+		perSession: 64 * 1024 * 1024,
+	});
+	// The first rung again, last: if its RSS does not come back down, every
+	// per-rung delta above it was served from retained memory.
+	plan.push({
+		rung: "W-repeat",
+		role: "retention-falsifier",
+		perStream: W_WINDOWS[0] ?? DEFAULT_QUEUED_BYTES_PER_STREAM,
+		perSession:
+			(W_WINDOWS[0] ?? DEFAULT_QUEUED_BYTES_PER_STREAM) * W_SESSION_RATIO,
+	});
+
+	const out: WindowRung[] = [];
+	let prevLadder: StepObservation | null = null;
+	for (const [i, entry] of plan.entries()) {
+		const math = windowMath(
+			entry.perStream,
+			entry.perSession,
+			W_SESSIONS,
+			DEFAULT_MAX_SESSIONS,
+			DEFAULT_MAX_DATAGRAM_SIZE,
+		);
+		const rssMbBaseline = await quiesceRss();
+		const port = PORT_W_BASE + i;
+		const harness = await startServer(
+			{
+				port,
+				sessions: W_SESSIONS,
+				queuedBytesPerStream: entry.perStream,
+				queuedBytesPerSession: entry.perSession,
+			},
+			tls,
+		);
+		console.log(
+			`bench-stream: arm W ${entry.rung} up on ${port} perStream=${(entry.perStream / 1024).toFixed(0)}KiB perSession=${(entry.perSession / 1024 / 1024).toFixed(1)}MiB worstCase/session=${(math.perSessionWorstCaseBytes / 1024 / 1024).toFixed(1)}MiB baselineRss=${rssMbBaseline.toFixed(0)}MB`,
+		);
+		let step: StepObservation;
+		try {
+			step = await runStep(
+				"W",
+				entry.rung,
+				harness,
+				W_SESSIONS,
+				W_STEP_SECONDS,
+				streamArgs({
+					port,
+					sessions: W_SESSIONS,
+					seconds: W_STEP_SECONDS,
+					workload: "bulk",
+					writeBytes: W_WRITE_BYTES,
+					concurrency: W_CONCURRENCY,
+					targetBytesPerSecPerSession: 0,
+				}),
+				i + 1,
+			);
+		} finally {
+			await harness.server.close();
+		}
+		// Only ladder rungs are compared against each other; the tie-in and the
+		// falsifier are different configurations answering different questions.
+		const classified = classify(
+			step,
+			entry.role === "ladder" ? prevLadder : null,
+			"window",
+		);
+		printStep(classified);
+		const rung: WindowRung = {
+			rung: entry.rung,
+			role: entry.role,
+			math,
+			step: classified,
+			deliveredGbps: classified.deliveredMbps / 1000,
+			rssMbBaseline,
+			rssMbPeak: classified.rssMbMax,
+			rssMbDelta: classified.rssMbMax - rssMbBaseline,
+		};
+		console.log(
+			`bench-stream: arm W ${entry.rung} delivered=${rung.deliveredGbps.toFixed(3)}Gbps advertisedWorstCase/session=${(math.perSessionWorstCaseBytes / 1024 / 1024).toFixed(1)}MiB atMaxSessions=${(math.atMaxSessionsBytes / 1024 / 1024 / 1024).toFixed(2)}GiB observedRss peak=${rung.rssMbPeak.toFixed(0)}MB delta=${rung.rssMbDelta.toFixed(0)}MB`,
+		);
+		out.push(rung);
+		if (entry.role === "ladder") prevLadder = step;
+		await Bun.sleep(10_000);
+	}
+	return out;
+}
+
+/** Arm W's pre-registered verdict, over the facts the rules are allowed to see. */
+function evaluateArmW(rungs: WindowRung[]) {
+	return evaluateWindowSweep(
+		rungs.map((r) => ({
+			rung: r.rung,
+			role: r.role,
+			math: r.math,
+			bucket: r.step.bucket,
+			incomplete: r.step.incomplete,
+			deliveredMbps: r.step.deliveredMbps,
+			rssMbBaseline: r.rssMbBaseline,
+			rssMbPeak: r.rssMbPeak,
+		})),
+	);
+}
+
 /** Arm C's pre-registered pre-comparison gate (C1/C2/C3). */
 function compareArmC(steps: ClassifiedStep[], targetMbps: number) {
 	const dgram = steps.find((s) => s.label === "datagram");
@@ -1191,6 +1402,7 @@ async function main(): Promise<void> {
 	const armA = ARMS.includes("A") ? await runArmA(creds) : [];
 	const armB = ARMS.includes("B") ? await runArmB(creds) : [];
 	const armC = ARMS.includes("C") ? await runArmC(creds) : [];
+	const armW = ARMS.includes("W") ? await runArmW(creds) : [];
 
 	const ladderA = armA.filter((s) => !s.label.startsWith("control-"));
 	const usableA = ladderA.filter((s) => !s.incomplete);
@@ -1232,6 +1444,7 @@ async function main(): Promise<void> {
 		preregistration: "docs/research/preregistrations/stream-throughput.md",
 		notes: {
 			snmpCounter: SNMP_DATAGRAM_COUNTER_NOTE,
+			committedMemory: WINDOW_MEMORY_NOTE,
 			denominators:
 				"deliveredMbps / streamsPerSec / boundaryEventsPerSec divide by " +
 				"windowSec (the configured drive window). serverCpuPct and " +
@@ -1274,10 +1487,22 @@ async function main(): Promise<void> {
 				datagramBytes: C_DATAGRAM_BYTES,
 				streamWriteBytes: C_STREAM_WRITE_BYTES,
 			},
+			w: {
+				sessions: W_SESSIONS,
+				concurrency: W_CONCURRENCY,
+				stepSeconds: W_STEP_SECONDS,
+				writeBytes: W_WRITE_BYTES,
+				windows: W_WINDOWS,
+				sessionRatio: W_SESSION_RATIO,
+				quiesceSeconds: W_QUIESCE_SECONDS,
+				maxSessionsForMath: DEFAULT_MAX_SESSIONS,
+				maxDatagramSizeForMath: DEFAULT_MAX_DATAGRAM_SIZE,
+			},
 		},
 		armA,
 		armB,
 		armC,
+		armW,
 		verdicts: {
 			bulkCeilingMbps: bestA?.deliveredMbps ?? null,
 			bulkCeilingWriteSize: bestA?.label ?? null,
@@ -1289,7 +1514,13 @@ async function main(): Promise<void> {
 			datagramVsStream: ARMS.includes("C")
 				? compareArmC(armC, C_TARGET_MBPS)
 				: null,
-			gsoOnStreamSendPath: gsoVerdictOf([...armA, ...armB, ...armC]),
+			windowSweep: ARMS.includes("W") ? evaluateArmW(armW) : null,
+			gsoOnStreamSendPath: gsoVerdictOf([
+				...armA,
+				...armB,
+				...armC,
+				...armW.map((r) => r.step),
+			]),
 		},
 	};
 	writeFileSync(OUT_JSON, `${JSON.stringify(result, null, 2)}\n`);

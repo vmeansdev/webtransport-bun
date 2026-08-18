@@ -40,7 +40,7 @@ on:
         default: "bandwidth"
         type: string
       stream_arms:
-        description: "stream mode: comma-separated arms to run (A=bulk bytes/write size, B=open/close ceiling, C=datagram vs stream)"
+        description: "stream mode: comma-separated arms to run (A=bulk bytes/write size, B=open/close ceiling, C=datagram vs stream, W=flow-control window sweep)"
         required: false
         default: "A,B,C"
         type: string
@@ -73,6 +73,21 @@ on:
         description: "stream mode: matched offered aggregate rate for Arm C"
         required: false
         default: "600"
+        type: string
+      stream_w_step_seconds:
+        description: "stream mode: seconds per Arm W window rung"
+        required: false
+        default: "60"
+        type: string
+      stream_w_windows:
+        description: "stream mode: comma-separated Arm W maxQueuedBytesPerStream rungs (per-session follows at the ratio below)"
+        required: false
+        default: "262144,524288,1048576,2097152,4194304,8388608,16777216"
+        type: string
+      stream_w_session_ratio:
+        description: "stream mode: Arm W maxQueuedBytesPerSession as a multiple of per-stream (8 = the shipped 2 MiB : 256 KiB ratio)"
+        required: false
+        default: "8"
         type: string
 jobs:
   bench:
@@ -171,6 +186,9 @@ jobs:
           BENCH_B_CONCURRENCY: ${{ github.event.inputs.stream_b_concurrency }}
           BENCH_C_STEP_SECONDS: ${{ github.event.inputs.stream_c_step_seconds }}
           BENCH_C_TARGET_MBPS: ${{ github.event.inputs.stream_c_target_mbps }}
+          BENCH_W_STEP_SECONDS: ${{ github.event.inputs.stream_w_step_seconds }}
+          BENCH_W_WINDOWS: ${{ github.event.inputs.stream_w_windows }}
+          BENCH_W_SESSION_RATIO: ${{ github.event.inputs.stream_w_session_ratio }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-stream-${{ github.event.inputs.candidate_commit }}.json" \
