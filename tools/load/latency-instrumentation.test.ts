@@ -9,7 +9,9 @@ import {
 	decodeStamp,
 	encodeStamp,
 	STAMP_BYTES,
+	STAMP_BYTES_V1,
 	STAMP_MAGIC,
+	writeEchoActual,
 } from "./latency-stamp.ts";
 
 describe("latency histogram", () => {
@@ -102,16 +104,22 @@ describe("latency stamp", () => {
 			intendedNs: 1_234_567_890_123,
 			actualNs: 1_234_567_899_999,
 			sequence: 8_589_934_593,
+			echoActualNs: 1_234_567_999_999,
 		};
 		encodeStamp(bytes, stamp);
 		expect(decodeStamp(bytes)).toEqual(stamp);
 	});
 
 	test("rejects short, unmagic and wrong-version payloads", () => {
-		expect(decodeStamp(new Uint8Array(STAMP_BYTES - 1))).toBeNull();
+		expect(decodeStamp(new Uint8Array(STAMP_BYTES_V1 - 1))).toBeNull();
 
 		const bytes = new Uint8Array(STAMP_BYTES);
-		encodeStamp(bytes, { intendedNs: 1, actualNs: 2, sequence: 3 });
+		encodeStamp(bytes, {
+			intendedNs: 1,
+			actualNs: 2,
+			sequence: 3,
+			echoActualNs: 0,
+		});
 		expect(decodeStamp(bytes)).not.toBeNull();
 
 		const wrongMagic = bytes.slice();
@@ -121,13 +129,70 @@ describe("latency stamp", () => {
 		const wrongVersion = bytes.slice();
 		new DataView(wrongVersion.buffer).setUint16(2, 99, true);
 		expect(decodeStamp(wrongVersion)).toBeNull();
+
+		// A version-2 header on a frame too short to carry its last field is not
+		// ours; reading it would report an echo instant of whatever follows.
+		const truncated = bytes.slice(0, STAMP_BYTES - 1);
+		expect(decodeStamp(truncated)).toBeNull();
 	});
 
-	test("decodes at a non-zero byteOffset", () => {
+	test("decodes a version-1 stamp with no echo instant", () => {
+		const bytes = new Uint8Array(STAMP_BYTES_V1);
+		const view = new DataView(bytes.buffer);
+		view.setUint16(0, STAMP_MAGIC, true);
+		view.setUint16(2, 1, true);
+		view.setUint32(12, 4242, true);
+		expect(decodeStamp(bytes)).toEqual({
+			intendedNs: 0,
+			actualNs: 4242,
+			sequence: 0,
+			echoActualNs: 0,
+		});
+	});
+
+	test("the server can stamp its echo instant without touching client fields", () => {
+		const bytes = new Uint8Array(STAMP_BYTES);
+		encodeStamp(bytes, {
+			intendedNs: 5,
+			actualNs: 6,
+			sequence: 7,
+			echoActualNs: 0,
+		});
+		expect(writeEchoActual(bytes, 1_234_567_890_123)).toBe(true);
+		expect(decodeStamp(bytes)).toEqual({
+			intendedNs: 5,
+			actualNs: 6,
+			sequence: 7,
+			echoActualNs: 1_234_567_890_123,
+		});
+	});
+
+	test("echo stamping refuses payloads that cannot carry the field", () => {
+		expect(writeEchoActual(new Uint8Array(STAMP_BYTES - 1), 1)).toBe(false);
+
+		const v1 = new Uint8Array(STAMP_BYTES);
+		const view = new DataView(v1.buffer);
+		view.setUint16(0, STAMP_MAGIC, true);
+		view.setUint16(2, 1, true);
+		expect(writeEchoActual(v1, 1)).toBe(false);
+
+		expect(writeEchoActual(new Uint8Array(STAMP_BYTES), 1)).toBe(false);
+	});
+
+	test("decodes and stamps at a non-zero byteOffset", () => {
 		const backing = new Uint8Array(STAMP_BYTES + 8);
 		const window = backing.subarray(8);
-		encodeStamp(window, { intendedNs: 7, actualNs: 9, sequence: 11 });
+		encodeStamp(window, {
+			intendedNs: 7,
+			actualNs: 9,
+			sequence: 11,
+			echoActualNs: 0,
+		});
 		expect(decodeStamp(window)?.actualNs).toBe(9);
+		expect(writeEchoActual(window, 13)).toBe(true);
+		expect(decodeStamp(window)?.echoActualNs).toBe(13);
+		// The bytes before the window are untouched.
+		expect(backing.subarray(0, 8).every((b) => b === 0)).toBe(true);
 	});
 });
 
