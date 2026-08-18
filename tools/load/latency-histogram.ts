@@ -33,6 +33,12 @@ export type LatencySummary = {
 	p9999Ns: number;
 	/** Samples that arrived negative — a shared-clock violation, not a latency. */
 	negative: number;
+	/**
+	 * Samples the producer counted but whose buckets this snapshot does not
+	 * contain. Non-zero means the snapshot was taken while recording continued;
+	 * the percentiles above are of the buckets that were there.
+	 */
+	skew: number;
 };
 
 export type LatencyHistogramJson = {
@@ -77,6 +83,12 @@ function bucketValue(index: number): number {
 export class LatencyHistogram {
 	private readonly counts = new Uint32Array(BUCKETS);
 	private total = 0;
+	/**
+	 * What the producer said it recorded. Equal to `total` for a histogram this
+	 * process filled; read from the fragment for one another process wrote, where
+	 * a gap means its snapshot was taken while recording continued.
+	 */
+	private recorded = 0;
 	private negativeCount = 0;
 	private min = Number.POSITIVE_INFINITY;
 	private max = 0;
@@ -91,6 +103,7 @@ export class LatencyHistogram {
 		const i = bucketIndex(ns);
 		this.counts[i] = (this.counts[i] ?? 0) + 1;
 		this.total += 1;
+		this.recorded += 1;
 		this.sum += ns;
 		if (ns < this.min) this.min = ns;
 		if (ns > this.max) this.max = ns;
@@ -128,6 +141,7 @@ export class LatencyHistogram {
 			p999Ns: this.percentile(0.999),
 			p9999Ns: this.percentile(0.9999),
 			negative: this.negativeCount,
+			skew: this.recorded - this.total,
 		};
 	}
 
@@ -147,7 +161,7 @@ export class LatencyHistogram {
 			maxOctave: MAX_OCTAVE,
 			buckets,
 			count: this.total,
-			recordedTotal: this.total,
+			recordedTotal: Math.max(this.recorded, this.total),
 			negative: this.negativeCount,
 			minNs: this.total === 0 ? 0 : this.min,
 			maxNs: this.max,
@@ -169,6 +183,7 @@ export class LatencyHistogram {
 			h.counts[index] = (h.counts[index] ?? 0) + count;
 			h.total += count;
 		}
+		h.recorded = json.recordedTotal;
 		h.negativeCount = json.negative;
 		h.min = h.total === 0 ? Number.POSITIVE_INFINITY : json.minNs;
 		h.max = json.maxNs;
@@ -180,6 +195,7 @@ export class LatencyHistogram {
 	reset(): void {
 		this.counts.fill(0);
 		this.total = 0;
+		this.recorded = 0;
 		this.negativeCount = 0;
 		this.min = Number.POSITIVE_INFINITY;
 		this.max = 0;

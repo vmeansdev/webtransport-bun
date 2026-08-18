@@ -69,6 +69,12 @@ export type ClassifiedStep = {
 	ticksSkipped: number;
 	sendEvents: number;
 	upDeliveryRatio: number | null;
+	/**
+	 * Largest snapshot skew among this step's histograms — samples a producer
+	 * counted but whose buckets its snapshot did not carry. Zero for a quiesced
+	 * producer; reported, never a STOP, because it is not a registered rule.
+	 */
+	histogramSkew: number;
 	offeredFraction: number;
 	stampedSamples: number;
 	hostCpuPctMedian: number | null;
@@ -182,6 +188,12 @@ export function classifyStep(
 		ticksSkipped: step.client?.ticksSkipped ?? 0,
 		sendEvents: step.client?.sendEvents ?? 0,
 		upDeliveryRatio: step.upDeliveryRatio,
+		histogramSkew: Math.max(
+			ingest.skew,
+			rtt?.skew ?? 0,
+			lag?.skew ?? 0,
+			burstSpread?.skew ?? 0,
+		),
 		offeredFraction:
 			step.requestedDatagrams > 0
 				? step.clientSent / step.requestedDatagrams
@@ -337,6 +349,12 @@ function render(result: ReturnType<typeof classifyRun>): string {
 			const verdict = s.complete ? s.bucket : `STOP:${s.stop}`;
 			lines.push(
 				`${String(s.aggregateRate).padStart(7)} | ${fmt(s.ingest.p50Ns).padStart(7)} | ${fmt(s.ingest.p90Ns).padStart(7)} | ${fmt(s.ingest.p99Ns).padStart(7)} | ${fmt(s.ingest.p999Ns).padStart(7)} | ${fmt(s.ingest.maxNs).padStart(7)} | ${(s.scheduleLag ? fmt(s.scheduleLag.p99Ns) : "n/a").padStart(7)} | ${(s.rtt ? fmt(s.rtt.p99Ns) : "n/a").padStart(7)} | ${(s.upDeliveryRatio ?? 0).toFixed(3)} | ${String(s.stampedSamples).padStart(7)} | ${verdict}`,
+			);
+		}
+		const skewed = arm.steps.filter((s) => s.histogramSkew > 0);
+		if (skewed.length > 0) {
+			lines.push(
+				`  histogram snapshot skew on ${skewed.length} step(s), max ${Math.max(...skewed.map((s) => s.histogramSkew))} samples — a producer was still recording when its fragment was written`,
 			);
 		}
 		for (const crossing of arm.crossings) {
