@@ -36,6 +36,16 @@ pub struct ServerMetricsSnapshot {
     pub backpressure_timeout_count: f64,
     pub rate_limited_count: f64,
     pub limit_exceeded_count: f64,
+    /// Native only. Sessions the QUIC idle timeout ended.
+    pub sessions_closed_by_idle: Option<f64>,
+    /// Native only. Sessions this server ended itself on shutdown.
+    pub sessions_closed_by_reap: Option<f64>,
+    /// Native only. Every other way a session ended (peer close, transport error).
+    pub sessions_closed_other: Option<f64>,
+    /// Diagnostic count of unsettled N-API async operations owned by this
+    /// server. Non-zero after `close()` resolves means the host event loop is
+    /// still referenced by this addon.
+    pub native_async_ops_pending: u32,
     pub sni_cert_selections: f64,
     pub default_cert_selections: f64,
     pub unknown_sni_rejected_count: f64,
