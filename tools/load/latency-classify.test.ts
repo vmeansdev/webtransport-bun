@@ -271,6 +271,24 @@ describe("batch A/B", () => {
 		expect(ab[0]?.confounded).toBe(false);
 	});
 
+	test("a delta inside its own quantization is not resolvable", () => {
+		const steps = [
+			classifyStep(
+				step({ aggregateRate: 50_000, ingestNs: 15 * MS, rttNs: 40 * MS }),
+				fragment("default", []),
+			),
+			classifyStep(
+				step({ aggregateRate: 50_000, ingestNs: 15 * MS, rttNs: 40 * MS }),
+				fragment("batch0", []),
+			),
+		];
+		const ab = classifyBatchAb(steps)[0];
+		expect(ab?.deltaMs).toBe(0);
+		expect(ab?.resolvable).toBe(false);
+		// Amendment 2: the instrument must resolve well inside the 0.2 ms band.
+		expect(ab?.deltaUncertaintyMs).toBeLessThan(0.1);
+	});
+
 	test("a delivery-ratio gap marks the comparison confounded", () => {
 		const steps = [
 			classifyStep(

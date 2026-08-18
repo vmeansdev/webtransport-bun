@@ -271,6 +271,56 @@ Everything else in this document — the ladder, the arms, the latency buckets,
 the batch A/B rule, the tick-absorption rule, and STOP conditions 2 through 5 —
 is unchanged from the original registration.
 
+## Amendment 2 — A/B resolution, 2026-08-18, before any complete run
+
+**Status:** written after a review of the harness code, before any classified
+latency result existed. The only dispatch this axis has ever had (run
+32159708926, logged below) aborted as a harness fault and produced no classifier
+output, so no measured Δ, p99 or bucket informed this change. The rule being
+amended is quoted in full first.
+
+**Original rule (H7 batch tail cost), quoted verbatim:**
+
+> ### H7 batch tail cost — `Δ = p99(default) − p99(batch0)` at equal offered rate
+>
+> Computed only for rates where **both** arms produced a complete step.
+>
+> | bucket | rule |
+> |---|---|
+> | `batch-helps` | Δ ≤ −0.2 ms |
+> | `batch-free` | −0.2 ms < Δ < 0.2 ms |
+> | `batch-cheap` | 0.2 ms ≤ Δ < 1.0 ms |
+> | `batch-expensive` | Δ ≥ 1.0 ms |
+
+**What was wrong.** The band was registered without checking it against the
+instrument. The histogram had 32 sub-buckets per octave, so a reported
+percentile carries up to ±1.6% of its own value, and Δ is a difference of two
+such values. At a p99 of 15 ms that is ±0.24 ms per arm and ±0.48 ms on Δ —
+wider than the ±0.2 ms `batch-free` band it would have been read against. Every
+`batch-free` and most `batch-cheap` verdicts would have been quantization noise
+wearing a bucket label.
+
+**The choice, and why.** Two ways out: widen the band, or resolve finer. Widening
+is the wrong one — the band is not arbitrary, it is a claim about what a game
+server's tick budget can absorb, and stretching it to ±0.5 ms to fit the
+instrument would make the axis unable to say the thing it exists to say.
+**The bucketing is changed instead: 256 sub-buckets per octave** (≤0.4% of value,
+≤0.2% after midpoint reporting), which puts Δ's worst-case quantization at about
+±0.06 ms at a 15 ms p99 — comfortably inside the band. The registered band, and
+every bucket boundary in it, is unchanged.
+
+Cost: the bucket array grows from 1,344 to 9,984 slots (40 KB per histogram, 80 KB
+on the Rust side). Recording is still one relaxed add. Artifacts stay small
+because the JSON encoding becomes sparse — non-empty buckets only — and stamps
+the bucketing it was written with, so a fragment from one build cannot be read
+as if it came from another.
+
+**Added, not changed:** every A/B row now also reports `deltaUncertaintyMs`
+(half a bucket on each arm's p99) and a `resolvable` flag. A Δ smaller than its
+own quantization is labelled `ab-unresolvable` and its bucket is advisory, the
+same way a delivery-ratio gap already makes one `ab-confounded`. This can only
+weaken a claim, never manufacture one.
+
 ## Dispatch log
 
 Every dispatch of this axis is logged here, including aborted ones, per the

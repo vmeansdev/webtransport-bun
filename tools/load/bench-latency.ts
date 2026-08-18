@@ -34,7 +34,7 @@ import {
 	LatencyHistogram,
 	type LatencyHistogramJson,
 } from "./latency-histogram.ts";
-import { STAMP_BYTES, decodeStamp } from "./latency-stamp.ts";
+import { decodeStamp, STAMP_BYTES } from "./latency-stamp.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;

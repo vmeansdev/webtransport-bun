@@ -1,27 +1,38 @@
 import { describe, expect, test } from "bun:test";
 import { createMonotonicClock } from "./latency-clock.ts";
-import { LatencyHistogram, __testing } from "./latency-histogram.ts";
 import {
-	STAMP_BYTES,
-	STAMP_MAGIC,
+	__testing,
+	LatencyHistogram,
+	quantizationNs,
+} from "./latency-histogram.ts";
+import {
 	decodeStamp,
 	encodeStamp,
+	STAMP_BYTES,
+	STAMP_MAGIC,
 } from "./latency-stamp.ts";
 
 describe("latency histogram", () => {
-	test("buckets are monotonic and within 4% of the recorded value", () => {
+	test("buckets are monotonic and within 0.2% of the recorded value", () => {
 		let previous = -1;
 		for (const ns of [
-			0, 1, 31, 32, 33, 63, 64, 1_000, 9_999, 100_000, 1_500_000, 20_000_000,
-			1_000_000_000, 60_000_000_000,
+			0, 1, 255, 256, 257, 511, 512, 1_000, 9_999, 100_000, 1_500_000,
+			15_625_000, 20_000_000, 1_000_000_000, 60_000_000_000,
 		]) {
 			const index = __testing.bucketIndex(ns);
 			expect(index).toBeGreaterThan(previous - 1);
 			previous = index;
 			const value = __testing.bucketValue(index);
 			const error = Math.abs(value - ns) / Math.max(ns, 1);
-			expect(error).toBeLessThan(0.04);
+			expect(error).toBeLessThan(0.002);
 		}
+	});
+
+	test("resolution stays under the 0.2 ms A/B band at a tens-of-ms p99", () => {
+		// Amendment 2: Δ is a difference of two quantized p99s, so the per-arm
+		// error has to stay well under half the band.
+		const p99Ns = 15 * 1e6;
+		expect(quantizationNs(p99Ns) * 2).toBeLessThan(0.2 * 1e6 * 0.5);
 	});
 
 	test("percentiles track a known distribution", () => {
@@ -51,6 +62,24 @@ describe("latency histogram", () => {
 		h.record(-1);
 		const revived = LatencyHistogram.fromJson(h.toJson());
 		expect(revived.summary()).toEqual(h.summary());
+	});
+
+	test("json is sparse and carries the bucketing it was written with", () => {
+		const h = new LatencyHistogram();
+		h.record(1_000);
+		h.record(1_000);
+		h.record(2_000_000);
+		const json = h.toJson();
+		expect(json.buckets).toHaveLength(2);
+		expect(json.buckets.map(([, c]) => c).reduce((a, b) => a + b, 0)).toBe(3);
+		expect(json.count).toBe(3);
+		expect(json.subBits).toBe(8);
+		expect(() => LatencyHistogram.fromJson({ ...json, subBits: 5 })).toThrow(
+			/bucketing mismatch/,
+		);
+		expect(() =>
+			LatencyHistogram.fromJson({ ...json, buckets: [[999_999, 1]] }),
+		).toThrow(/out of range/);
 	});
 });
 
