@@ -556,6 +556,9 @@ describe("internal TS error propagation", () => {
 			close() {},
 			drain() {},
 			sendDatagram: async () => {},
+			sendDatagramBatch: async (datagrams: readonly Uint8Array[]) => ({
+				sent: datagrams.length,
+			}),
 			async *incomingDatagrams() {},
 			createBidirectionalStream: async () => duplex,
 			async *incomingBidirectionalStreams() {},
