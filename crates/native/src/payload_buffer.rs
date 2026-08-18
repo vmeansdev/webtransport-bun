@@ -247,6 +247,67 @@ impl<A: ExternalMemoryAdjuster> Drop for ExternalAccountingGuard<'_, A> {
     }
 }
 
+/// Allocate an engine-owned arraybuffer of `len` bytes, let `fill` write the
+/// payload into it once, and wrap it in a `Uint8Array`.
+///
+/// The fill callback is what lets a payload assembled from several transport
+/// segments pay exactly one copy: the segments are written straight into the
+/// engine's allocation instead of being concatenated into an intermediate
+/// `Vec` first.
+pub(crate) unsafe fn engine_owned_arraybuffer(
+    env: sys::napi_env,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> Result<sys::napi_value> {
+    let mut data = ptr::null_mut();
+    let mut ab = ptr::null_mut();
+    napi::check_status!(
+        unsafe { sys::napi_create_arraybuffer(env, len, &mut data, &mut ab) },
+        "Failed to create payload arraybuffer"
+    )?;
+    fill(unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), len) });
+    let mut ret = ptr::null_mut();
+    napi::check_status!(
+        unsafe {
+            sys::napi_create_typedarray(env, sys::TypedarrayType::uint8_array, len, ab, 0, &mut ret)
+        },
+        "Failed to create payload typedarray"
+    )?;
+    Ok(ret)
+}
+
+/// The `buffer-copy` escape hatch for a segmented payload: an engine-allocated
+/// `Buffer` the caller fills in place. `napi_create_buffer_copy` cannot express
+/// this without an intermediate concatenation, and the two differ only in who
+/// writes the bytes — the buffer is engine-owned and engine-accounted either
+/// way.
+pub(crate) unsafe fn engine_owned_buffer(
+    env: sys::napi_env,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> Result<sys::napi_value> {
+    let mut data = ptr::null_mut();
+    let mut ret = ptr::null_mut();
+    napi::check_status!(
+        unsafe { sys::napi_create_buffer(env, len, &mut data, &mut ret) },
+        "Failed to create payload buffer"
+    )?;
+    fill(unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), len) });
+    Ok(ret)
+}
+
+/// The empty payload: Rust hands out a dangling pointer for empty allocations,
+/// which the external path rejects, and an empty engine buffer needs no
+/// accounting.
+pub(crate) unsafe fn empty_payload_value(env: sys::napi_env) -> Result<sys::napi_value> {
+    let mut ret = ptr::null_mut();
+    napi::check_status!(
+        unsafe { sys::napi_create_buffer(env, 0, ptr::null_mut(), &mut ret) },
+        "Failed to create empty payload buffer"
+    )?;
+    Ok(ret)
+}
+
 unsafe extern "C" fn finalize_payload(env: sys::napi_env, _data: *mut c_void, hint: *mut c_void) {
     if hint.is_null() {
         return;
@@ -258,7 +319,7 @@ unsafe extern "C" fn finalize_payload(env: sys::napi_env, _data: *mut c_void, hi
 
 /// Hand our own allocation to the engine, with the one explicit charge held by
 /// an armed guard until the finalizer takes over the matching decrement.
-unsafe fn external_payload_to_napi_value(
+pub(crate) unsafe fn external_payload_to_napi_value(
     env: sys::napi_env,
     bytes: Vec<u8>,
     len: usize,
@@ -312,48 +373,17 @@ unsafe fn external_payload_to_napi_value(
 impl ToNapiValue for PayloadBuffer {
     unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
         let len = val.as_ref().len();
-        let mut ret = ptr::null_mut();
         match plan_delivery(len, payload_delivery_mode()) {
-            PayloadDeliveryPlan::Empty => {
-                // Rust hands out a dangling pointer for empty vectors, which
-                // the external path rejects; an engine-owned empty buffer
-                // needs no accounting either.
-                napi::check_status!(
-                    unsafe { sys::napi_create_buffer(env, 0, ptr::null_mut(), &mut ret) },
-                    "Failed to create empty payload buffer"
-                )?;
-                Ok(ret)
-            }
-            PayloadDeliveryPlan::EngineOwnedArrayBuffer => {
-                let mut data = ptr::null_mut();
-                let mut ab = ptr::null_mut();
-                napi::check_status!(
-                    unsafe { sys::napi_create_arraybuffer(env, len, &mut data, &mut ab) },
-                    "Failed to create payload arraybuffer"
-                )?;
-                unsafe {
-                    ptr::copy_nonoverlapping(val.as_ref().as_ptr(), data.cast::<u8>(), len);
-                }
-                napi::check_status!(
-                    unsafe {
-                        sys::napi_create_typedarray(
-                            env,
-                            sys::TypedarrayType::uint8_array,
-                            len,
-                            ab,
-                            0,
-                            &mut ret,
-                        )
-                    },
-                    "Failed to create payload typedarray"
-                )?;
-                Ok(ret)
-            }
+            PayloadDeliveryPlan::Empty => unsafe { empty_payload_value(env) },
+            PayloadDeliveryPlan::EngineOwnedArrayBuffer => unsafe {
+                engine_owned_arraybuffer(env, len, |dst| dst.copy_from_slice(val.as_ref()))
+            },
             PayloadDeliveryPlan::EngineOwnedBufferCopy => {
                 // Escape-hatch path: an engine-allocated copy whose bytes land
                 // in JSC aux memory. Collectable, but its allocation never
                 // drives the collector — long floods rely on a full GC
                 // something else causes.
+                let mut ret = ptr::null_mut();
                 napi::check_status!(
                     unsafe {
                         sys::napi_create_buffer_copy(
