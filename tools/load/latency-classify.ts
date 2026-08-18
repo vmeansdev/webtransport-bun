@@ -58,6 +58,8 @@ export type ClassifiedStep = {
 	perSessionRate: number;
 	/** What the ladder asked for. Never a label, only a disclosure. */
 	nominalAggregateRate: number;
+	/** Window the load was offered over — the denominator `offeredFraction` uses. */
+	driveWindowSec: number;
 	complete: boolean;
 	stop: StopReason | null;
 	bucket: LatencyBucket | null;
@@ -173,6 +175,7 @@ export function classifyStep(
 		aggregateRate: step.aggregateRate,
 		perSessionRate: step.perSessionRate,
 		nominalAggregateRate: step.nominalAggregateRate,
+		driveWindowSec: step.driveWindowSec,
 		complete,
 		stop,
 		bucket: complete ? bucketFor(ingest.p99Ns) : null,
