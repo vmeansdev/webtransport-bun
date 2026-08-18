@@ -260,6 +260,124 @@ figure is reported as what it is, beside the `gso`/`gro` verdicts, and no
 wire-packet estimate is derived from it. Counting real wire packets is deferred
 with the rest of the list below.
 
+## Amendment 2 — 2026-08-19, before any dispatch (Arm W: window sweep)
+
+Deferred item 3 below — "flow-control window sweep beyond the single A6
+falsifier" — is promoted into this axis as **Arm W**, per ticket 08 of the
+production-grade-scenarios effort. Written before the first run of any arm of
+this axis (the run log above is still empty), and committed ahead of the harness
+code that implements it. Arms A, B and C are unchanged; A6 keeps its role.
+
+Arm W **decides nothing**. It supplies delivered Gbps and a memory pair per rung.
+The decouple-vs-raise-budgets decision belongs to ticket 09.
+
+### Design
+
+Fixed, so the only variable is the window: 4 sessions × 4 concurrent
+unidirectional streams (16 in flight), client write size **262,144 B** — the same
+point as steps A4 and A6, so a sweep rung is directly comparable to both.
+Unpaced, 60 s per rung. One **fresh server per rung**, since the windows are
+server configuration.
+
+Ladder over `maxQueuedBytesPerStream`, log-spaced from the shipped default to the
+A6 config, with `maxQueuedBytesPerSession` held at the **shipped 8× ratio**
+(2 MiB : 256 KiB) so the sweep moves one parameter and not two:
+
+| rung | per-stream | per-session |
+|---|---|---|
+| W1 | 256 KiB (**shipped default**) | 2 MiB (default) |
+| W2 | 512 KiB | 4 MiB |
+| W3 | 1 MiB | 8 MiB |
+| W4 | 2 MiB | 16 MiB |
+| W5 | 4 MiB | 32 MiB |
+| W6 | 8 MiB | 64 MiB |
+| W7 | 16 MiB | 128 MiB |
+| W-a6 | 16 MiB | **64 MiB** (A6's ratio, 4×) |
+| W-repeat | 256 KiB | 2 MiB (replay of W1) |
+
+`W-a6` is a tie-in, not a rung of the sweep: it is exactly Arm A's control
+config, so the sweep and the A6 falsifier sit on one axis instead of being two
+configurations that cannot be compared. `W-repeat` is the retention falsifier
+described below. Rungs run strictly ascending, then `W-a6`, then `W-repeat`.
+
+### The two memory numbers, and why they are never merged
+
+Spec §Windows math asks for "peak committed memory" per rung. That is reported as
+a **pair**, because the two available numbers mean different things and averaging
+or substituting them would be a claim the data does not support.
+
+**(i) Advertised worst case (derived).** What a peer is licensed to make the
+server buffer. Mirrored from `crates/native/src/transport_memory.rs`:
+
+```
+stream_receive_window = clamp(max(perStream,  maxDatagramSize), 1, 2^62-1)
+receive_window = send_window = clamp(max(perSession, stream_receive_window), …)
+datagramChannel = clamp(ceil(perSession / maxDatagramSize), 1, 2048)
+perSessionWorstCase = receive_window + send_window + datagramChannel × maxDatagramSize
+```
+
+Reported per rung as `perSessionWorstCase`, `atArmSessions` (×4) and
+`atMaxSessions` (×`maxSessions` = 2000) against the rig's 8 GB, plus whether it
+stays inside the shipped 2 MiB / 512 MiB budgets. `maxQueuedBytesGlobal` does not
+bound this. The harness asserts its mirror against `transport_memory.rs`'s own
+unit-test values at the defaults (256 KiB / 2 MiB / 2 MiB, channel 1748) and
+**aborts the run** if they disagree — a drifted mirror produces a memory column
+that describes code that is not running.
+
+**(ii) Observed resident (measured).** `rssMbBaseline` sampled after the previous
+rung's server is closed, `releaseNativeMemory()` is called and the process has
+quiesced; `rssMbPeak` over the rung; `rssMbDelta` between them. RSS is resident,
+not committed, and it is charged to the whole Bun process including the harness.
+
+Three honesty rules on the observed number, pre-registered:
+
+- Advertisement is not allocation. (i) is an exposure ceiling; (ii) is what the
+  rung actually touched. A rung may show (ii) ≪ (i) and that is the expected
+  result on loopback, not a defect.
+- All rungs share one Bun process and the allocator retains freed arenas, so a
+  later rung can be served from an earlier rung's retained memory and show a
+  falsely small delta. Hence ascending order — each rung is the largest so far —
+  and hence `W-repeat`. **Verdict `memoryRetention`**: `CLEAN` if `W-repeat`'s
+  peak RSS is within 20% of `W1`'s peak; otherwise `CONTAMINATED`, and then no
+  per-rung delta is quoted (see W-STOP-B).
+- RSS also tracks delivered throughput, since bytes in flight cross into JS. A
+  rung's RSS is therefore not attributable to its windows alone. Disclosed in the
+  artifact, not corrected for.
+
+### Classifier
+
+`commonBucket` rules 1–5 and every Amendment 1 integrity rule apply verbatim and
+first. Then:
+
+| # | bucket | rule | status |
+|---|---|---|---|
+| W6 | `window-scaling` | `delivered >= 1.10 * prev` | capacity number, knee not yet reached |
+| W7 | `window-plateau` | otherwise | capacity number |
+
+`W-a6` and `W-repeat` are classified but excluded from the ladder comparison
+(they are not ascending rungs); `W2` compares against `W1` and so on.
+
+### Knee, fixed before the run
+
+**knee = the smallest complete rung whose delivered bytes/s is ≥ 0.95 × the
+maximum delivered across all complete rungs.** Reported with both memory numbers
+at that rung.
+
+If the top rung (`W7`) is itself `window-scaling`, **no knee is reported**: the
+sweep did not bracket it and the honest output is the open statement "knee is at
+or above 16 MiB". The top rung is never named the knee by default.
+
+### STOP conditions
+
+Original STOP conditions 1 (generator saturation), 2 (host saturation), 3
+(limiter engaged) and 5 (GSO uncomputable) apply verbatim. Two additions:
+
+- **W-STOP-A:** fewer than 3 complete rungs → no knee and no memory curve. The
+  arm reports the rungs it has and nothing derived from their shape.
+- **W-STOP-B:** `memoryRetention: CONTAMINATED` → no per-rung RSS delta is
+  quoted. The memory statement is made on the derived worst case plus the
+  absolute peak series only. This is not a rerun trigger; it is a narrower claim.
+
 ## Run log
 
 No dispatches yet.
@@ -272,6 +390,12 @@ Listed so the gap is explicit rather than silent:
    drain server) to decompose the ceiling into transport cost vs N-API boundary
    cost. Arm A gives the boundary-inclusive ceiling; it does not attribute it.
 2. **Server→client stream egress.** Different axis.
-3. **Flow-control window sweep** beyond the single A6 falsifier.
+3. ~~**Flow-control window sweep** beyond the single A6 falsifier.~~ Promoted to
+   Arm W by Amendment 2.
 4. **Bidirectional streams.** Arms use unidirectional only; bidi adds an
    acceptance path but not a different byte path.
+5. **Window sweep under a BDP that exceeds the default window.** Arm W runs on
+   loopback, where the bandwidth-delay product is far below 256 KiB; a rung that
+   plateaus here has not been shown to plateau on a real path. The sweep answers
+   what the windows cost and buy *on this rig*, which is what the decision in
+   ticket 09 is allowed to rest on.
