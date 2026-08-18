@@ -271,6 +271,15 @@ Everything else in this document — the ladder, the arms, the latency buckets,
 the batch A/B rule, the tick-absorption rule, and STOP conditions 2 through 5 —
 is unchanged from the original registration.
 
+## Dispatch log
+
+Every dispatch of this axis is logged here, including aborted ones, per the
+effort's process rules. A run that is not in this table did not happen.
+
+| # | run id | candidate SHA | outcome | artifact hash |
+|---|---|---|---|---|
+| 1 | 32159708926 | `5cbf02f` predecessor (`8704588`) | **aborted — harness fault.** The `default` arm wrote its fragment and then the Bun driver sat 55+ minutes in `epoll` with zero sockets open: sessions abandoned by an exiting load client keep the event loop referenced after `server.close()` resolves. No classifier output was produced and no latency value from this dispatch is used anywhere. Fixed by `5cbf02f`. | none (no classified artifact) |
+
 ## Reusability note (egress axis)
 
 The stamp layout, the shared clock, and the histogram are separate modules with
