@@ -26,7 +26,15 @@ export type StopReason =
 	| "offered-shortfall"
 	| "clock-invalid"
 	| "delivery-collapse"
-	| "sample-starvation";
+	| "sample-starvation"
+	// Fan-out only, all registered by amendment 8. The first two are the shape's
+	// two falsifiers; the last two are its generator and capacity STOPs, which
+	// sit on the publisher side and the forward side respectively.
+	| "sink-saturation"
+	| "sink-precheck-inconclusive"
+	| "ingest-unreal"
+	| "publisher-shortfall"
+	| "forward-shortfall";
 
 export type EgressBucket =
 	| "ok-realtime"
@@ -86,6 +94,8 @@ type RawStep = {
 		originationLag: LatencyHistogramJson;
 		sendIssueSpread: LatencyHistogramJson;
 		peakWindowDatagrams: number;
+		/** The send grid's period. On fan-out, the publisher's frame interval. */
+		gridPeriodNs?: number;
 		/** The interval the originator was driving. Every rate divides by this. */
 		driveWindowSec: number;
 	};
@@ -102,6 +112,32 @@ type RawStep = {
 	serverCpuPct: number;
 	ingested: number;
 	forwardLag: LatencyHistogramJson | null;
+	fanout?: FanoutRecordJson | null;
+};
+
+/**
+ * The fan-out shape's own record. Only the fields the classifier reads are
+ * named here; `bench-egress.ts` writes considerably more, and the artifact
+ * keeps all of it.
+ */
+export type FanoutRecordJson = {
+	mode: "per-subscriber" | "constant-aggregate";
+	publisherRatePerSec: number;
+	datagramsPerTick: number;
+	ingested: number;
+	publisherStamped: number;
+	forwarded: number;
+	forwardDeliveryRatio: number | null;
+	frameGapFraction: number;
+	ingestToForward: LatencyHistogramJson;
+	forwardIssueSpread: LatencyHistogramJson;
+	forwardSettle: LatencyHistogramJson;
+	ingestReality: { real: boolean; reasons: string[] };
+	publisherShortfall: boolean;
+	forwardShortfall: boolean;
+	precheck: {
+		outcome: "pass" | "sink-saturation" | "sink-precheck-inconclusive";
+	};
 };
 
 /** Co-residence advisory: host CPU at this fraction of total host capacity. */
@@ -147,6 +183,15 @@ export type ClassifiedStep = {
 	 * by a depressed number passes exactly when it should fire.
 	 */
 	offeredPerSec: number;
+	/** Fan-out only: everything the shape's instruments and falsifiers produced. */
+	fanout: FanoutRecordJson | null;
+	/**
+	 * Fan-out only, and a **label rather than a STOP**: the server could not
+	 * finish fanning one frame out before the next one arrived. That is a
+	 * capacity finding at that N, and marking the step incomplete over it would
+	 * be discarding the answer.
+	 */
+	forwardOverrun: boolean | null;
 };
 
 function summarize(json: LatencyHistogramJson | null): LatencySummary | null {
@@ -186,6 +231,19 @@ export function stopFor(
 	endToEnd: LatencySummary | null,
 	lag: LatencySummary,
 ): StopReason | null {
+	// The fan-out shape has no JS scheduler and no rate ladder, so the ladder's
+	// first two STOPs do not describe it. Its own four run first, in the order
+	// amendment 8 registered, and then the three shared ones apply unchanged.
+	if (step.shape === "fanout") {
+		const fan = step.fanout;
+		if (!fan) return "ingest-unreal";
+		if (fan.precheck.outcome !== "pass") return fan.precheck.outcome;
+		if (!fan.ingestReality.real) return "ingest-unreal";
+		if (fan.publisherShortfall) return "publisher-shortfall";
+		if (fan.forwardShortfall) return "forward-shortfall";
+		return sharedStops(step, residualNs, oneWay, endToEnd);
+	}
+
 	// `sendEventsScheduled` is every grid event the plan put inside the step,
 	// run and skipped alike, so this ratio is the registered `skipped/scheduled`
 	// and not `skipped/ran`.
@@ -208,6 +266,21 @@ export function stopFor(
 		return "offered-shortfall";
 	}
 
+	return sharedStops(step, residualNs, oneWay, endToEnd);
+}
+
+/**
+ * The three STOPs both shapes share, in the registered order: a run whose clock
+ * cannot be trusted, one whose delivery collapsed far enough to make an
+ * arrival-conditioned tail survivorship-biased, and one with too few samples to
+ * read a p99 off.
+ */
+function sharedStops(
+	step: RawStep,
+	residualNs: number,
+	oneWay: LatencySummary | null,
+	endToEnd: LatencySummary | null,
+): StopReason | null {
 	if (residualNs > CLOCK_RESIDUAL_LIMIT_NS) return "clock-invalid";
 	if (!oneWay) return "clock-invalid";
 	const stamped = oneWay.count + oneWay.negative;
@@ -304,6 +377,12 @@ export function classifySteps(
 			deliveredPerSec: window > 0 ? step.clientReceived / window : 0,
 			offeredPerSec:
 				window > 0 ? step.originator.scheduledDatagrams / window : 0,
+			fanout: step.fanout ?? null,
+			forwardOverrun:
+				step.shape === "fanout" && step.fanout
+					? (summarize(step.fanout.forwardSettle)?.p99Ns ?? 0) >=
+						(step.originator.gridPeriodNs ?? 0)
+					: null,
 		};
 	});
 }
@@ -399,28 +478,85 @@ export function compareAlignment(
 }
 
 export type FanoutVerdict = {
+	/** Which registered sweep this rung belongs to. Rungs never cross sweeps. */
+	mode: "per-subscriber" | "constant-aggregate" | "unknown";
 	subscribers: number;
+	publisherRatePerSec: number;
+	/** Forward egress the server had to originate: publisher rate × N. */
+	forwardAggregatePerSec: number;
 	complete: boolean;
 	stop: StopReason | null;
 	p99Ms: number;
 	bucket: EgressBucket | null;
-	/** p99(N) / p99(smallest N). Reported raw: no expectation was registered. */
+	forwardDeliveryRatio: number | null;
+	forwardOverrun: boolean | null;
+	/** Publisher actual-send → first forward issue. Falsifier 1 reads its p50. */
+	ingestToForwardP50Ms: number | null;
+	/** The send-cost instrument the retracted run left hardcoded empty. */
+	forwardIssueSpreadP99Ms: number | null;
+	forwardIssuePerTargetNs: number | null;
+	ingestReal: boolean | null;
+	ingestUnrealReasons: string[];
+	precheck: "pass" | "sink-saturation" | "sink-precheck-inconclusive" | null;
+	/**
+	 * p99(N) / p99(smallest **complete** N of the same sweep). Reported raw, with
+	 * no bucket, because no expectation for its shape was registered and
+	 * inventing one after the fact is what the pre-registration exists to
+	 * prevent. Null until a complete rung exists to divide by — a scaling curve
+	 * anchored on an incomplete rung is a curve about nothing.
+	 */
 	scaling: number | null;
 };
 
+/**
+ * One entry per fan-out rung, grouped by sweep.
+ *
+ * The grouping is not cosmetic: a `per-subscriber` rung and a
+ * `constant-aggregate` rung at the same N carry different forward load, so a
+ * scaling ratio computed across them would be the rate effect wearing N's name
+ * — the confound that got the original fan-out arm retracted.
+ */
 export function summarizeFanout(steps: ClassifiedStep[]): FanoutVerdict[] {
 	const fan = steps
 		.filter((s) => s.shape === "fanout")
 		.sort((a, b) => a.sessionsConnected - b.sessionsConnected);
-	const base = fan[0]?.oneWay.p99Ns ?? 0;
-	return fan.map((s) => ({
-		subscribers: s.sessionsConnected,
-		complete: s.complete,
-		stop: s.stop,
-		p99Ms: s.oneWay.p99Ns / MS,
-		bucket: s.bucket,
-		scaling: base > 0 ? s.oneWay.p99Ns / base : null,
-	}));
+	const baselines = new Map<string, number>();
+	for (const s of fan) {
+		if (!s.complete) continue;
+		const key = s.fanout?.mode ?? "unknown";
+		if (!baselines.has(key)) baselines.set(key, s.oneWay.p99Ns);
+	}
+	return fan.map((s) => {
+		const mode = s.fanout?.mode ?? "unknown";
+		const base = baselines.get(mode) ?? 0;
+		const issue = summarize(s.fanout?.forwardIssueSpread ?? null);
+		const perTarget =
+			issue && s.sessionsConnected > 0
+				? issue.meanNs / s.sessionsConnected
+				: null;
+		return {
+			mode,
+			subscribers: s.sessionsConnected,
+			publisherRatePerSec: s.fanout?.publisherRatePerSec ?? s.perSessionRate,
+			forwardAggregatePerSec: s.aggregateRate,
+			complete: s.complete,
+			stop: s.stop,
+			p99Ms: s.oneWay.p99Ns / MS,
+			bucket: s.bucket,
+			forwardDeliveryRatio: s.fanout?.forwardDeliveryRatio ?? null,
+			forwardOverrun: s.forwardOverrun,
+			ingestToForwardP50Ms: s.fanout
+				? (summarize(s.fanout.ingestToForward)?.p50Ns ?? 0) / MS
+				: null,
+			forwardIssueSpreadP99Ms: issue ? issue.p99Ns / MS : null,
+			forwardIssuePerTargetNs: perTarget,
+			ingestReal: s.fanout?.ingestReality.real ?? null,
+			ingestUnrealReasons: s.fanout?.ingestReality.reasons ?? [],
+			precheck: s.fanout?.precheck.outcome ?? null,
+			// Only a complete rung anchors the curve, and only within its sweep.
+			scaling: s.complete && base > 0 ? s.oneWay.p99Ns / base : null,
+		};
+	});
 }
 
 export type RunVerdict = {
@@ -429,6 +565,14 @@ export type RunVerdict = {
 		| "harness-falsifier"
 		| "generator-headroom"
 		| "constant-arm-incomplete"
+		/**
+		 * No ladder step was present to set the headroom rule's denominator — a
+		 * fan-out-only fragment set, for instance. The rule is about the JS
+		 * scheduler and there was no scheduler arm to hold to it, so it was not
+		 * evaluated. The run still claims nothing; it just says so accurately
+		 * instead of reporting a STOP that never ran.
+		 */
+		| "headroom-not-evaluated"
 		| null;
 	generatorCeilingPerSec: number;
 	/** The denominator of the headroom rule: offered load, not delivered. */
@@ -462,8 +606,13 @@ export function verdictForRun(
 	const burnNs = headroom?.burnNs ?? 0;
 	// Offered, over the complete rungs only: an incomplete rung supports no
 	// capacity claim, so it sets no bar for the generator either.
+	// Ladder steps only, exactly as amendment 1 words it ("across the run's
+	// complete *ladder* steps"). The headroom arm measured the JS scheduler; the
+	// fan-out's originator is a forward loop driven by arrivals, and holding the
+	// scheduler to a bar set by a different originator would compare two things.
 	const maxOffered = steps.reduce(
-		(a, s) => (s.complete ? Math.max(a, s.offeredPerSec) : a),
+		(a, s) =>
+			s.complete && s.shape === "ladder" ? Math.max(a, s.offeredPerSec) : a,
 		0,
 	);
 	const maxDelivered = steps.reduce(
@@ -489,6 +638,9 @@ export function verdictForRun(
 	const constant = profiles.find((p) => p.profile === "constant");
 	if (constant && !constant.armComplete) {
 		return { complete: false, stop: "constant-arm-incomplete", ...base };
+	}
+	if (maxOffered === 0) {
+		return { complete: false, stop: "headroom-not-evaluated", ...base };
 	}
 	if (ratio === null || ratio < HEADROOM_FACTOR) {
 		return { complete: false, stop: "generator-headroom", ...base };
@@ -556,6 +708,17 @@ if (import.meta.main) {
 	for (const p of result.profiles) {
 		console.log(
 			`egress-classify: ${p.profile} armComplete=${p.armComplete} capacity(p99<5ms)=${p.capacityRealtimePerSec ?? "none"}${p.realtimeIsFloor ? "+" : ""}/s capacity(p99<33.3ms)=${p.capacityFramePerSec ?? "none"}${p.frameIsFloor ? "+" : ""}/s`,
+		);
+	}
+	for (const f of result.fanout) {
+		console.log(
+			`egress-classify: fanout/${f.mode} N=${f.subscribers} pub=${f.publisherRatePerSec}/s forward=${f.forwardAggregatePerSec}/s ` +
+				`${f.complete ? (f.bucket ?? "") : `INCOMPLETE(${f.stop})`} p99=${f.p99Ms.toFixed(2)}ms ` +
+				`fwdDelivery=${f.forwardDeliveryRatio?.toFixed(4) ?? "n/a"} scaling=${f.scaling?.toFixed(2) ?? "n/a"} ` +
+				`ingestToForward p50=${f.ingestToForwardP50Ms?.toFixed(3) ?? "n/a"}ms issueSpread p99=${f.forwardIssueSpreadP99Ms?.toFixed(3) ?? "n/a"}ms ` +
+				`perTarget=${f.forwardIssuePerTargetNs?.toFixed(0) ?? "n/a"}ns precheck=${f.precheck ?? "n/a"} ` +
+				`ingestReal=${f.ingestReal ?? "n/a"}${f.ingestUnrealReasons.length > 0 ? ` (${f.ingestUnrealReasons.join(",")})` : ""}` +
+				`${f.forwardOverrun ? " forward-overrun" : ""}`,
 		);
 	}
 	for (const s of result.steps) {

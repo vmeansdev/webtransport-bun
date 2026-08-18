@@ -19,9 +19,14 @@
  *                the ladder asked, *here*?" before any transport number is
  *                allowed to mean anything.
  *   `ladder`   — N subscriber sessions, one burst profile, a rate ladder.
- *   `fanout`   — one publisher, N subscribers, the server forwarding verbatim.
- *                The publisher's own stamp survives the fan-out, so this shape
- *                has no server clock in its path at all.
+ *   `fanout`   — a publisher *process*, the server forwarding verbatim, and N
+ *                subscriber sessions in a *separate* process. The publisher's
+ *                own stamp survives the fan-out, so this shape has no server
+ *                clock in its path at all. Two registered sweeps decouple N
+ *                from rate, and two registered falsifiers — ingest-reality and
+ *                the sink-saturation pre-check — must clear before any step of
+ *                it carries a number. Amendment 8 replaced the retracted
+ *                original wholesale; nothing from it is reused.
  *
  * Method, gates, buckets and STOP conditions are pre-registered in
  * `docs/research/preregistrations/egress.md`. This file implements that
@@ -40,6 +45,19 @@ import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	datagramsPerTick,
+	type FanoutMode,
+	forwardShortfall,
+	type IngestRealityVerdict,
+	ingestRealityVerdict,
+	isFanoutMode,
+	publisherRateFor,
+	publisherShortfall,
+	SINK_HEADROOM_FACTOR,
+	type SinkPrecheckOutcome,
+	sinkPrecheckVerdict,
+} from "./egress-fanout.ts";
+import {
 	amplitudeAt,
 	type EgressPlan,
 	type EgressProfile,
@@ -56,6 +74,7 @@ import {
 	type LatencyHistogramJson,
 } from "./latency-histogram.ts";
 import {
+	decodeStamp,
 	OFFSET_ACTUAL,
 	OFFSET_INTENDED,
 	OFFSET_MAGIC,
@@ -92,9 +111,35 @@ const FANOUT_N = (process.env.EGRESS_FANOUT_N ?? "10,25,50,100")
 	.split(",")
 	.map((v) => parseInt(v.trim(), 10))
 	.filter((v) => Number.isFinite(v) && v > 0);
-/** Publisher rate for the fan-out shape: 11 datagrams a frame at 30 fps. */
+/** Publisher rate for the `per-subscriber` sweep: 11 datagrams a frame at 30 fps. */
 const FANOUT_PUBLISH_RATE = parseInt(
 	process.env.EGRESS_FANOUT_PUBLISH_RATE ?? "330",
+	10,
+);
+/**
+ * Which of the two registered sweeps to run (amendment 8). `per-subscriber`
+ * holds each subscriber's rate while N grows; `constant-aggregate` pins the
+ * aggregate forward load at `EGRESS_FANOUT_AGGREGATE` and divides it across N.
+ * Neither alone licenses an N claim — an effect in the first and not the second
+ * is a rate effect, and that comparison is the whole point of running both.
+ */
+const RAW_FANOUT_MODE = process.env.EGRESS_FANOUT_MODE ?? "per-subscriber";
+if (!isFanoutMode(RAW_FANOUT_MODE)) {
+	throw new Error(
+		`EGRESS_FANOUT_MODE=${RAW_FANOUT_MODE} is not a registered sweep`,
+	);
+}
+const FANOUT_MODE: FanoutMode = RAW_FANOUT_MODE;
+/** Aggregate forward egress the `constant-aggregate` sweep pins: 330 × 50. */
+const FANOUT_AGGREGATE = parseInt(
+	process.env.EGRESS_FANOUT_AGGREGATE ?? "16500",
+	10,
+);
+/** The publisher's frame grid. 30 fps, the cadence the reality check looks for. */
+const FANOUT_TICK_HZ = parseInt(process.env.EGRESS_FANOUT_TICK_HZ ?? "30", 10);
+/** Seconds of the sink-saturation pre-check that gates every fan-out N. */
+const FANOUT_PRECHECK_SECONDS = parseInt(
+	process.env.EGRESS_FANOUT_PRECHECK_SECONDS ?? "20",
 	10,
 );
 /**
@@ -142,7 +187,14 @@ const CLIENT_DURATION_SLACK_S = parseInt(
 );
 const OUT_JSON =
 	process.env.EGRESS_OUT ??
-	join(ROOT, `tools/load/bench-egress-${SHAPE}-${PROFILE}.json`);
+	join(
+		ROOT,
+		SHAPE === "fanout"
+			? // The two sweeps are separate measurements and must not land on one
+				// filename, or running both leaves only the second one.
+				`tools/load/bench-egress-fanout-${FANOUT_MODE}.json`
+			: `tools/load/bench-egress-${SHAPE}-${PROFILE}.json`,
+	);
 
 const HAS_PROC = process.platform === "linux";
 /** Cores the box has. The CPU unit below is per-core, so this is the scale. */
@@ -523,8 +575,67 @@ export type EgressStep = {
 	serverCpuPct: number;
 	/** Fan-out only: datagrams the publisher pushed into the server. */
 	ingested: number;
-	/** Fan-out only: arrival → forward issue, inside the server. */
+	/** Fan-out only: JS handler entry → first forward issue, inside the server. */
 	forwardLag: LatencyHistogramJson | null;
+	/** Everything the fan-out shape's falsifiers and instruments produced. */
+	fanout: FanoutRecord | null;
+};
+
+/**
+ * The fan-out shape's own record: the send-cost instrument the retracted run
+ * left hardcoded empty, the two falsifiers' inputs and verdicts, and the
+ * publisher's own honesty counters.
+ */
+export type FanoutRecord = {
+	mode: FanoutMode;
+	subscribers: number;
+	publisherRatePerSec: number;
+	tickHz: number;
+	datagramsPerTick: number;
+	/** Publisher arrivals the server observed, and the stamped part of them. */
+	ingested: number;
+	publisherStamped: number;
+	forwarded: number;
+	forwardErrors: number;
+	forwardDeliveryRatio: number | null;
+	/** Publisher actual-send stamp → first forward send issued. Falsifier 1. */
+	ingestToForward: LatencyHistogramJson;
+	/** JS handler entry → first forward issue. Diagnostic; legitimately µs. */
+	handlerToForward: LatencyHistogramJson;
+	/** First forward send call → last one, inside one arrival's fan-out. */
+	forwardIssueSpread: LatencyHistogramJson;
+	/** First forward send call → all of that arrival's sends settled. */
+	forwardSettle: LatencyHistogramJson;
+	/** Gaps between consecutive server-observed publisher arrivals. */
+	serverInterArrival: LatencyHistogramJson;
+	interArrivalGaps: number;
+	frameGaps: number;
+	frameGapFraction: number;
+	ingestReality: IngestRealityVerdict;
+	publisherShortfall: boolean;
+	forwardShortfall: boolean;
+	publisher: {
+		sent: number;
+		sendErrors: number;
+		effectiveRatePerSec: number;
+		ticksSkipped: number;
+		sendEvents: number;
+		scheduleLag: LatencyHistogramJson | null;
+	};
+	precheck: FanoutPrecheck;
+};
+
+/** The sink-saturation pre-check that gates one N. Falsifier 2. */
+export type FanoutPrecheck = {
+	outcome: SinkPrecheckOutcome;
+	subscribers: number;
+	perSessionRate: number;
+	offeredPerSec: number;
+	deliveredPerSec: number;
+	deliveryRatio: number | null;
+	oneWayP99Ns: number | null;
+	generatorSaturated: boolean;
+	seconds: number;
 };
 
 type ClientHandle = {
@@ -615,24 +726,87 @@ async function main(): Promise<void> {
 	type Sub = { send: SendFn; id: number };
 	const subscribers: Sub[] = [];
 	let nextId = 1;
-	let ingested = 0;
+
 	/**
-	 * First and last server-observed ingest of the publisher's datagrams. The
-	 * fan-out step's drive window is the span between them: a wall clock from
-	 * before the publisher process was spawned to after it exited would carry a
-	 * far larger overshoot than the ladder's, and every derived rate would be
-	 * biased down by a different amount on each shape.
+	 * Everything the server observes about one fan-out step, reset before each.
+	 *
+	 * The retracted run recorded an arrival timestamp and a second clock read
+	 * taken immediately after it, which is why its "ingest→forward lag" read
+	 * 9–31 µs: it measured two adjacent clock reads, not a path. Here the ingest
+	 * interval is anchored on the *publisher's own stamp*, which is a different
+	 * process on the same system clock, so the number contains the loopback UDP
+	 * hop, quinn's decrypt, the N-API crossing and the JS event loop — or it
+	 * doesn't, and the falsifier says so.
 	 */
-	let firstIngestNs = 0;
-	let lastIngestNs = 0;
-	const forwardLag = new LatencyHistogram();
-	let fanoutForwarded = 0;
-	let fanoutForwardErrors = 0;
-	let fanoutActive = false;
+	type FanoutState = {
+		active: boolean;
+		publisherId: number | null;
+		ingested: number;
+		stamped: number;
+		forwarded: number;
+		forwardErrors: number;
+		firstIngestNs: number;
+		lastIngestNs: number;
+		prevArrivalNs: number;
+		gaps: number;
+		frameGaps: number;
+		frameGapThresholdNs: number;
+		ingestToForward: LatencyHistogram;
+		handlerToForward: LatencyHistogram;
+		forwardIssueSpread: LatencyHistogram;
+		forwardSettle: LatencyHistogram;
+		interArrival: LatencyHistogram;
+	};
+
+	const fanout: FanoutState = {
+		active: false,
+		publisherId: null,
+		ingested: 0,
+		stamped: 0,
+		forwarded: 0,
+		forwardErrors: 0,
+		firstIngestNs: 0,
+		lastIngestNs: 0,
+		prevArrivalNs: 0,
+		gaps: 0,
+		frameGaps: 0,
+		frameGapThresholdNs: 0,
+		ingestToForward: new LatencyHistogram(),
+		handlerToForward: new LatencyHistogram(),
+		forwardIssueSpread: new LatencyHistogram(),
+		forwardSettle: new LatencyHistogram(),
+		interArrival: new LatencyHistogram(),
+	};
+
+	const resetFanout = (gridPeriodNs: number): void => {
+		fanout.publisherId = null;
+		fanout.ingested = 0;
+		fanout.stamped = 0;
+		fanout.forwarded = 0;
+		fanout.forwardErrors = 0;
+		fanout.firstIngestNs = 0;
+		fanout.lastIngestNs = 0;
+		fanout.prevArrivalNs = 0;
+		fanout.gaps = 0;
+		fanout.frameGaps = 0;
+		// A gap at least half a frame long is a frame boundary; anything shorter is
+		// inside one tick's burst. The registered cadence check counts the ratio.
+		fanout.frameGapThresholdNs = gridPeriodNs / 2;
+		fanout.ingestToForward.reset();
+		fanout.handlerToForward.reset();
+		fanout.forwardIssueSpread.reset();
+		fanout.forwardSettle.reset();
+		fanout.interArrival.reset();
+	};
 
 	const peakSessions = Math.max(SESSIONS, ...FANOUT_N) + 2;
+	// The heaviest aggregate any shape asks for: the ladder's top rung, the
+	// fan-out's forward egress, and the sink pre-check's 1.5× of it. The limiter
+	// is set four times this so it is never the thing being measured.
 	const aggregatePeak = Math.max(
 		peakSessions * Math.max(...RATES, FANOUT_PUBLISH_RATE),
+		Math.round(SINK_HEADROOM_FACTOR * FANOUT_AGGREGATE),
+		Math.max(...FANOUT_N) * FANOUT_PUBLISH_RATE,
 		1,
 	);
 	const server = createServer({
@@ -667,21 +841,47 @@ async function main(): Promise<void> {
 			void (async () => {
 				for await (const datagram of session.incomingDatagrams()) {
 					const arrivedNs = clock.now();
-					ingested += 1;
-					if (firstIngestNs === 0) firstIngestNs = arrivedNs;
-					lastIngestNs = arrivedNs;
-					if (!fanoutActive) continue;
-					// Minimal SFU: forward verbatim to everyone else, so the
-					// publisher's own stamp survives and the measured interval has
-					// no server clock in it at all.
+					if (!fanout.active) continue;
+					const stamp = decodeStamp(datagram);
+					// The publisher is whoever sends us a stamped datagram first.
+					// Subscribers are spawned with `--datagrams-per-sec 0`, so any
+					// other sender is a harness fault and is counted, not forwarded.
+					if (stamp && fanout.publisherId === null) {
+						fanout.publisherId = entry.id;
+					}
+					if (entry.id !== fanout.publisherId) continue;
+
+					fanout.ingested += 1;
+					if (fanout.firstIngestNs === 0) fanout.firstIngestNs = arrivedNs;
+					fanout.lastIngestNs = arrivedNs;
+					if (fanout.prevArrivalNs > 0) {
+						const gapNs = arrivedNs - fanout.prevArrivalNs;
+						fanout.interArrival.record(gapNs);
+						fanout.gaps += 1;
+						if (gapNs >= fanout.frameGapThresholdNs) fanout.frameGaps += 1;
+					}
+					fanout.prevArrivalNs = arrivedNs;
+					if (!stamp) continue;
+					fanout.stamped += 1;
+
+					// Minimal SFU: forward verbatim to every subscriber, so the
+					// publisher's own stamp survives and the measured interval has no
+					// server clock in it at all. `sendDatagram` copies synchronously
+					// before its first await, so issuing all of them and then settling
+					// is safe — and it is the shape that makes the issue spread mean
+					// "N boundary crossings" rather than "N round trips".
 					const targets = subscribers.filter((s) => s !== entry);
-					forwardLag.record(clock.now() - arrivedNs);
-					const results = await Promise.allSettled(
-						targets.map((s) => s.send(datagram)),
-					);
+					const issuedNs = clock.now();
+					fanout.handlerToForward.record(issuedNs - arrivedNs);
+					fanout.ingestToForward.record(issuedNs - stamp.actualNs);
+					const pending: Array<Promise<unknown>> = [];
+					for (const target of targets) pending.push(target.send(datagram));
+					fanout.forwardIssueSpread.record(clock.now() - issuedNs);
+					const results = await Promise.allSettled(pending);
+					fanout.forwardSettle.record(clock.now() - issuedNs);
 					for (const r of results) {
-						if (r.status === "fulfilled") fanoutForwarded += 1;
-						else fanoutForwardErrors += 1;
+						if (r.status === "fulfilled") fanout.forwarded += 1;
+						else fanout.forwardErrors += 1;
 					}
 				}
 			})().catch(() => {});
@@ -721,20 +921,41 @@ async function main(): Promise<void> {
 
 	const steps: EgressStep[] = [];
 
-	const runStep = async (
+	/**
+	 * Drive one server-originated arm into a fresh subscriber process.
+	 *
+	 * Shared by the ladder and by the fan-out's sink pre-check: the pre-check
+	 * needs the ladder's exact origination path, because the question it asks is
+	 * "can this subscriber process absorb the load the fan-out is about to put on
+	 * it", and answering it with a second, differently-shaped originator would be
+	 * answering a different question.
+	 */
+	type DirectArm = {
+		connected: number;
+		stats: OriginatorStats;
+		client: ClientEgressJson | null;
+		clientReceived: number;
+		hostSamples: number[];
+		cpuMsDrive: number;
+		elapsedSec: number;
+	};
+
+	const runDirectArm = async (
+		profile: EgressProfile,
 		perSessionRate: number,
 		sessionsRequested: number,
-	): Promise<void> => {
-		const plan = planFor(PROFILE, perSessionRate);
-		const durationSec =
-			STEP_SECONDS + CONNECT_BUDGET_S + CLIENT_DURATION_SLACK_S;
+		seconds: number,
+		label: string,
+	): Promise<DirectArm> => {
+		const plan = planFor(profile, perSessionRate);
+		const durationSec = seconds + CONNECT_BUDGET_S + CLIENT_DURATION_SLACK_S;
 		await waitForDrain();
 		const sub = spawnClient(subscriberArgs(sessionsRequested, durationSec));
 		const connected = await waitForSessions(sessionsRequested);
 		if (connected === 0) {
 			sub.child.kill();
 			throw new Error(
-				`rate ${perSessionRate}: no subscriber session connected in ${CONNECT_BUDGET_S}s`,
+				`${label}: no subscriber session connected in ${CONNECT_BUDGET_S}s`,
 			);
 		}
 
@@ -757,7 +978,7 @@ async function main(): Promise<void> {
 		const stats = await driveProfile(
 			plan,
 			snapshot.map((s) => s.send),
-			STEP_SECONDS,
+			seconds,
 			clock,
 		);
 		// Read before the sampler is joined and before the client is reaped, so
@@ -772,43 +993,154 @@ async function main(): Promise<void> {
 		const stderr = await sub.stderr;
 		const client = parseClientJson(stdout);
 		if (!client) console.warn(stderr.slice(-1500));
-		const clientReceived = parseCount(stdout, /datagrams received=(\d+)/);
+		return {
+			connected,
+			stats,
+			client,
+			clientReceived: parseCount(stdout, /datagrams received=(\d+)/),
+			hostSamples,
+			cpuMsDrive,
+			elapsedSec,
+		};
+	};
+
+	const runStep = async (
+		perSessionRate: number,
+		sessionsRequested: number,
+	): Promise<void> => {
+		const arm = await runDirectArm(
+			PROFILE,
+			perSessionRate,
+			sessionsRequested,
+			STEP_SECONDS,
+			`rate ${perSessionRate}`,
+		);
+		const { stats } = arm;
 
 		steps.push({
 			shape: SHAPE,
 			profile: PROFILE,
 			perSessionRate,
 			sessionsRequested,
-			sessionsConnected: connected,
-			aggregateRate: Math.round(plan.effectiveRatePerSession * connected),
-			elapsedSec,
+			sessionsConnected: arm.connected,
+			aggregateRate: Math.round(
+				planFor(PROFILE, perSessionRate).effectiveRatePerSession *
+					arm.connected,
+			),
+			elapsedSec: arm.elapsedSec,
 			originator: stats,
-			clientReceived,
-			client,
-			downDeliveryRatio: stats.sent > 0 ? clientReceived / stats.sent : null,
-			hostCpuPctMedian: median(hostSamples),
+			clientReceived: arm.clientReceived,
+			client: arm.client,
+			downDeliveryRatio:
+				stats.sent > 0 ? arm.clientReceived / stats.sent : null,
+			hostCpuPctMedian: median(arm.hostSamples),
 			hostCpuCount: HOST_CPU_COUNT,
 			// Percent of one core, over the drive window — not over `elapsedSec`,
 			// which also contains the sampler join and the client's exit.
-			serverCpuPct: (cpuMsDrive / (stats.driveWindowSec * 1000)) * 100,
+			serverCpuPct: (arm.cpuMsDrive / (stats.driveWindowSec * 1000)) * 100,
 			ingested: 0,
 			forwardLag: null,
+			fanout: null,
 		});
 
-		const oneWay = client
-			? LatencyHistogram.fromJson(client.egressOneWay).summary()
+		const oneWay = arm.client
+			? LatencyHistogram.fromJson(arm.client.egressOneWay).summary()
 			: null;
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
 		console.log(
-			`bench-egress: rate=${perSessionRate}/s/session sessions=${connected} sent=${stats.sent}/${stats.scheduledDatagrams} recv=${clientReceived} ` +
+			`bench-egress: rate=${perSessionRate}/s/session sessions=${arm.connected} sent=${stats.sent}/${stats.scheduledDatagrams} recv=${arm.clientReceived} ` +
 				(oneWay
 					? `p50=${ms(oneWay.p50Ns)}ms p99=${ms(oneWay.p99Ns)}ms p999=${ms(oneWay.p999Ns)}ms neg=${oneWay.negative} `
 					: "no-client-json ") +
-				`peakWindow=${stats.peakWindowDatagrams} skipped=${stats.sendEventsSkipped}/${stats.sendEventsScheduled} host=${median(hostSamples)?.toFixed(0) ?? "n/a"}%`,
+				`peakWindow=${stats.peakWindowDatagrams} skipped=${stats.sendEventsSkipped}/${stats.sendEventsScheduled} host=${median(arm.hostSamples)?.toFixed(0) ?? "n/a"}%`,
 		);
 	};
 
+	/**
+	 * Falsifier 2, run before every fan-out N.
+	 *
+	 * The subscriber process is co-resident on the same 4 vCPU as the server and
+	 * the publisher. If it is the binding constraint, a fan-out p99 is a number
+	 * about the subscriber process — which is exactly the mistake that got the
+	 * original fan-out arm retracted, wearing different clothes. So the sink is
+	 * asked, first and separately, to absorb 1.5× the load the step will impose,
+	 * on the ladder's own proven origination path.
+	 *
+	 * A pre-check whose own JS originator saturated is `inconclusive`, never a
+	 * pass: a starved generator offers less load, which is indistinguishable from
+	 * a healthy sink.
+	 */
+	const runSinkPrecheck = async (
+		subscriberCount: number,
+		fanoutPerSubscriberRate: number,
+	): Promise<FanoutPrecheck> => {
+		const perSessionRate = Math.max(
+			1,
+			Math.round(SINK_HEADROOM_FACTOR * fanoutPerSubscriberRate),
+		);
+		const arm = await runDirectArm(
+			"constant",
+			perSessionRate,
+			subscriberCount,
+			FANOUT_PRECHECK_SECONDS,
+			`sink pre-check N=${subscriberCount}`,
+		);
+		const { stats } = arm;
+		const events = stats.sendEventsScheduled;
+		// The registered `generator-saturation` conditions that a single arm can
+		// evaluate. The third — the within-profile lag floor — needs a ladder of
+		// steps to establish a floor from, and one arm is not a ladder.
+		const generatorSaturated =
+			(events > 0 && stats.sendEventsSkipped >= 0.1 * events) ||
+			(stats.scheduledDatagrams > 0 &&
+				stats.sent < 0.9 * stats.scheduledDatagrams);
+		const deliveryRatio =
+			stats.sent > 0 ? arm.clientReceived / stats.sent : null;
+		const oneWayP99Ns = arm.client
+			? LatencyHistogram.fromJson(arm.client.egressOneWay).percentile(0.99)
+			: null;
+		const precheck: FanoutPrecheck = {
+			outcome: sinkPrecheckVerdict({
+				subscribers: arm.connected,
+				offeredPerSec: stats.scheduledDatagrams / stats.driveWindowSec,
+				deliveryRatio,
+				oneWayP99Ns,
+				generatorSaturated,
+			}),
+			subscribers: arm.connected,
+			perSessionRate,
+			offeredPerSec: stats.scheduledDatagrams / stats.driveWindowSec,
+			deliveredPerSec: arm.clientReceived / stats.driveWindowSec,
+			deliveryRatio,
+			oneWayP99Ns,
+			generatorSaturated,
+			seconds: FANOUT_PRECHECK_SECONDS,
+		};
+		console.log(
+			`bench-egress: sink pre-check N=${arm.connected} at ${perSessionRate}/s/session ` +
+				`(${precheck.offeredPerSec.toFixed(0)}/s offered, ${SINK_HEADROOM_FACTOR}x the step) ` +
+				`delivery=${deliveryRatio?.toFixed(4) ?? "n/a"} p99=${oneWayP99Ns !== null ? (oneWayP99Ns / 1e6).toFixed(2) : "n/a"}ms → ${precheck.outcome}`,
+		);
+		return precheck;
+	};
+
 	const runFanoutStep = async (n: number): Promise<void> => {
+		const publishRate = publisherRateFor(
+			FANOUT_MODE,
+			n,
+			FANOUT_PUBLISH_RATE,
+			FANOUT_AGGREGATE,
+		);
+		const perTick = datagramsPerTick(publishRate, FANOUT_TICK_HZ);
+		// The Rust client sends `round(rate/hz)` per tick, so the rate it actually
+		// offers is that burst times the grid — quantized, and labelled as such.
+		const effectiveRate = perTick * FANOUT_TICK_HZ;
+		const gridPeriodNs = Math.round(1e9 / FANOUT_TICK_HZ);
+
+		// Falsifier 2 first: a saturated sink makes every number below meaningless,
+		// so there is no point in producing them before it has been ruled out.
+		const precheck = await runSinkPrecheck(n, effectiveRate);
+
 		const durationSec =
 			STEP_SECONDS + CONNECT_BUDGET_S + CLIENT_DURATION_SLACK_S;
 		await waitForDrain();
@@ -819,22 +1151,17 @@ async function main(): Promise<void> {
 			throw new Error(`fan-out N=${n}: no subscriber connected`);
 		}
 
-		const ingest0 = ingested;
-		const fwd0 = fanoutForwarded;
-		const fwdErr0 = fanoutForwardErrors;
-		forwardLag.reset();
-		firstIngestNs = 0;
-		lastIngestNs = 0;
+		resetFanout(gridPeriodNs);
 		const cpuMs0 = serverCpuMs();
 		const startedAt = Date.now();
 		const hostSamples: number[] = [];
 		let prevHost = readHostCpu();
 
-		fanoutActive = true;
-		// The publisher is the same load client in its ordinary sending mode: one
-		// session, 30 Hz ticks of 11 datagrams. Its stamp is the one the
-		// subscribers measure against, so the fan-out path is timed end to end
-		// between two processes that share a clock and never involve the server's.
+		fanout.active = true;
+		// The publisher is a *separate process* from the subscribers: one load
+		// client, one session, 30 Hz ticks. Its stamp is the one the subscribers
+		// measure against, so the fan-out interval is timed end to end between two
+		// processes that share a clock and never contains the server's.
 		const pub = spawnClient([
 			"--url",
 			`https://127.0.0.1:${PORT}`,
@@ -845,13 +1172,13 @@ async function main(): Promise<void> {
 			"--arrival",
 			"tick",
 			"--tick-hz",
-			"30",
+			String(FANOUT_TICK_HZ),
 			"--sessions",
 			"1",
 			"--duration",
 			String(STEP_SECONDS),
 			"--datagrams-per-sec",
-			String(FANOUT_PUBLISH_RATE),
+			String(publishRate),
 			"--streams-per-sec",
 			"0",
 			"--payload-bytes",
@@ -875,8 +1202,8 @@ async function main(): Promise<void> {
 			prevHost = next;
 			if (pct !== null) hostSamples.push(pct);
 		}
-		await pub.stdout;
-		fanoutActive = false;
+		const pubStdout = await pub.stdout;
+		fanout.active = false;
 		const cpuMsDrive = serverCpuMs() - cpuMs0;
 		const elapsedSec = (Date.now() - startedAt) / 1000;
 		// First to last server-observed ingest, on the shared clock: the interval
@@ -884,56 +1211,134 @@ async function main(): Promise<void> {
 		// the client's exit outside it. Same definition of "drive window" the
 		// ladder uses, so rates on the two shapes are comparable.
 		const driveWindowSec =
-			lastIngestNs > firstIngestNs
-				? (lastIngestNs - firstIngestNs) / 1e9
+			fanout.lastIngestNs > fanout.firstIngestNs
+				? (fanout.lastIngestNs - fanout.firstIngestNs) / 1e9
 				: Math.max(elapsedSec, 1);
 
 		await sub.child.exited;
 		const stdout = await sub.stdout;
 		const client = parseClientJson(stdout);
 		const clientReceived = parseCount(stdout, /datagrams received=(\d+)/);
-		const forwarded = fanoutForwarded - fwd0;
-		const ingestedNow = ingested - ingest0;
+		const pubJson = parseClientJson(pubStdout) as
+			| (ClientEgressJson & {
+					effectiveDatagramsPerSecPerSession?: number;
+					ticksSkipped?: number;
+					sendEvents?: number;
+					scheduleLag?: LatencyHistogramJson;
+			  })
+			| null;
+		const pubSent = parseCount(pubStdout, /datagrams sent=(\d+)/);
+		const pubErrors = parseCount(pubStdout, /datagrams sent=\d+ err=(\d+)/);
+
+		const frameGapFraction =
+			fanout.gaps > 0 ? fanout.frameGaps / fanout.gaps : 0;
+		const reality = ingestRealityVerdict({
+			ingestToForwardP50Ns: fanout.ingestToForward.percentile(0.5),
+			frameGapFraction,
+			datagramsPerTick: perTick,
+			publisherStamped: fanout.stamped,
+			ingested: fanout.ingested,
+		});
+		const publisherLate = publisherShortfall({
+			sent: pubSent,
+			effectiveRatePerSec:
+				pubJson?.effectiveDatagramsPerSecPerSession ?? effectiveRate,
+			driveWindowSec,
+			ticksSkipped: pubJson?.ticksSkipped ?? 0,
+			sendEvents: pubJson?.sendEvents ?? 0,
+		});
+		const forwardLate = forwardShortfall(
+			fanout.forwarded,
+			fanout.stamped,
+			connected,
+		);
+
+		const record: FanoutRecord = {
+			mode: FANOUT_MODE,
+			subscribers: connected,
+			publisherRatePerSec: publishRate,
+			tickHz: FANOUT_TICK_HZ,
+			datagramsPerTick: perTick,
+			ingested: fanout.ingested,
+			publisherStamped: fanout.stamped,
+			forwarded: fanout.forwarded,
+			forwardErrors: fanout.forwardErrors,
+			forwardDeliveryRatio:
+				fanout.forwarded > 0 ? clientReceived / fanout.forwarded : null,
+			ingestToForward: fanout.ingestToForward.toJson(),
+			handlerToForward: fanout.handlerToForward.toJson(),
+			forwardIssueSpread: fanout.forwardIssueSpread.toJson(),
+			forwardSettle: fanout.forwardSettle.toJson(),
+			serverInterArrival: fanout.interArrival.toJson(),
+			interArrivalGaps: fanout.gaps,
+			frameGaps: fanout.frameGaps,
+			frameGapFraction,
+			ingestReality: reality,
+			publisherShortfall: publisherLate,
+			forwardShortfall: forwardLate,
+			publisher: {
+				sent: pubSent,
+				sendErrors: pubErrors,
+				effectiveRatePerSec:
+					pubJson?.effectiveDatagramsPerSecPerSession ?? effectiveRate,
+				ticksSkipped: pubJson?.ticksSkipped ?? 0,
+				sendEvents: pubJson?.sendEvents ?? 0,
+				scheduleLag: pubJson?.scheduleLag ?? null,
+			},
+			precheck,
+		};
 
 		steps.push({
 			shape: SHAPE,
 			profile: PROFILE,
-			perSessionRate: FANOUT_PUBLISH_RATE,
+			perSessionRate: publishRate,
 			sessionsRequested: n,
 			sessionsConnected: connected,
-			aggregateRate: FANOUT_PUBLISH_RATE * connected,
+			// Forward egress: what the server had to originate, not what one
+			// publisher offered. This is the number the capacity claim is about.
+			aggregateRate: Math.round(effectiveRate * connected),
 			elapsedSec,
 			originator: {
-				sent: forwarded,
-				sendErrors: fanoutForwardErrors - fwdErr0,
-				sendEventsScheduled: ingestedNow,
+				// The forward side is the originator in this shape: the server sent
+				// `forwarded` datagrams and the arrivals asked it for one per
+				// subscriber. No JS scheduler exists here, so no grid is invented for
+				// one — the publisher-side generator STOP lives in `fanout` instead.
+				sent: fanout.forwarded,
+				sendErrors: fanout.forwardErrors,
+				sendEventsScheduled: fanout.stamped,
 				sendEventsSkipped: 0,
-				scheduledDatagrams: ingestedNow * connected,
-				originationLag: forwardLag.toJson(),
-				sendIssueSpread: new LatencyHistogram().toJson(),
-				gridPeriodNs: Math.round(1e9 / 30),
-				peakWindowDatagrams: 11 * connected,
+				scheduledDatagrams: fanout.stamped * connected,
+				originationLag: fanout.ingestToForward.toJson(),
+				sendIssueSpread: fanout.forwardIssueSpread.toJson(),
+				gridPeriodNs,
+				peakWindowDatagrams: perTick * connected,
 				driveWindowSec,
 			},
 			clientReceived,
 			client,
-			downDeliveryRatio: forwarded > 0 ? clientReceived / forwarded : null,
+			downDeliveryRatio:
+				fanout.forwarded > 0 ? clientReceived / fanout.forwarded : null,
 			hostCpuPctMedian: median(hostSamples),
 			hostCpuCount: HOST_CPU_COUNT,
 			serverCpuPct: (cpuMsDrive / (driveWindowSec * 1000)) * 100,
-			ingested: ingestedNow,
-			forwardLag: forwardLag.toJson(),
+			ingested: fanout.ingested,
+			forwardLag: fanout.handlerToForward.toJson(),
+			fanout: record,
 		});
 
 		const oneWay = client
 			? LatencyHistogram.fromJson(client.egressOneWay).summary()
 			: null;
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
+		const issue = fanout.forwardIssueSpread.summary();
 		console.log(
-			`bench-egress: fanout N=${connected} ingest=${ingestedNow} forwarded=${forwarded} recv=${clientReceived} ` +
+			`bench-egress: fanout ${FANOUT_MODE} N=${connected} pub=${publishRate}/s ingest=${fanout.stamped} forwarded=${fanout.forwarded} recv=${clientReceived} ` +
 				(oneWay
-					? `p50=${ms(oneWay.p50Ns)}ms p99=${ms(oneWay.p99Ns)}ms p999=${ms(oneWay.p999Ns)}ms`
-					: "no-client-json"),
+					? `p50=${ms(oneWay.p50Ns)}ms p99=${ms(oneWay.p99Ns)}ms p999=${ms(oneWay.p999Ns)}ms `
+					: "no-client-json ") +
+				`ingestToForward p50=${ms(fanout.ingestToForward.percentile(0.5))}ms issueSpread p99=${ms(issue.p99Ns)}ms ` +
+				`cadence=${frameGapFraction.toFixed(4)} (band ${reality.band.low.toFixed(4)}..${reality.band.high.toFixed(4)}) ` +
+				`ingestReal=${reality.real}${reality.real ? "" : ` (${reality.reasons.join(",")})`}`,
 		);
 	};
 
@@ -972,7 +1377,11 @@ async function main(): Promise<void> {
 		);
 	} else if (SHAPE === "fanout") {
 		console.log(
-			`bench-egress: fan-out N=[${FANOUT_N.join(",")}] publisher=${FANOUT_PUBLISH_RATE}/s step=${STEP_SECONDS}s`,
+			`bench-egress: fan-out sweep=${FANOUT_MODE} N=[${FANOUT_N.join(",")}] ` +
+				(FANOUT_MODE === "per-subscriber"
+					? `publisher=${FANOUT_PUBLISH_RATE}/s per N`
+					: `aggregate pinned at ${FANOUT_AGGREGATE}/s`) +
+				` tick=${FANOUT_TICK_HZ}Hz step=${STEP_SECONDS}s precheck=${FANOUT_PRECHECK_SECONDS}s`,
 		);
 		for (const n of FANOUT_N) {
 			await runFanoutStep(n);
@@ -1014,7 +1423,11 @@ async function main(): Promise<void> {
 				stepSeconds: STEP_SECONDS,
 				ratesPerSession: RATES,
 				fanoutN: FANOUT_N,
+				fanoutMode: FANOUT_MODE,
 				fanoutPublishRate: FANOUT_PUBLISH_RATE,
+				fanoutAggregate: FANOUT_AGGREGATE,
+				fanoutTickHz: FANOUT_TICK_HZ,
+				fanoutPrecheckSeconds: FANOUT_PRECHECK_SECONDS,
 				headroomMultipliers: HEADROOM_MULTIPLIERS,
 				headroomRatePerSession: HEADROOM_RATE,
 				headroomSeconds: HEADROOM_SECONDS,
