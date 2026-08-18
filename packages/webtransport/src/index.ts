@@ -82,6 +82,11 @@ export {
 } from "./errors.js";
 export type { ErrorCode } from "./types.js";
 
+import {
+	DATAGRAM_BATCH_MAX,
+	type NativeDatagramBatchResult,
+	sendDatagramBatchChunked,
+} from "./datagram-batch.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -720,6 +725,34 @@ interface CommonSession {
 
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
+
+	/**
+	 * Send many datagrams across one native crossing.
+	 *
+	 * Native-only, like batched receiving: the wasm backend has no crossing to
+	 * amortize, so `/portable` keeps `sendDatagram` as the portable contract.
+	 *
+	 * Resolves rather than rejects for transport conditions, because a partial
+	 * send is normal on an unreliable transport and throwing would discard the
+	 * `sent` count that makes the result actionable. The result has **prefix**
+	 * semantics: `sent = k` means elements `0..k` went out, in order; `error`
+	 * (when present) is why element `k` failed; elements after `k` were not
+	 * attempted. So the caller drops `datagrams[sent]`, or retries it, and
+	 * re-calls with the remainder.
+	 *
+	 * There is no length limit — arrays longer than the native cap are chunked
+	 * — but it does throw synchronously: a `TypeError` for a non-array argument
+	 * or a non-`Uint8Array` element, and a `WebTransportError` with
+	 * `E_SESSION_CLOSED` on an already-closed session.
+	 *
+	 * A single datagram should still go through {@link sendDatagram}: array
+	 * marshalling has a fixed cost that a batch of one has nothing to amortize
+	 * it over.
+	 */
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }>;
+
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
 }
 
@@ -1116,6 +1149,14 @@ interface NativeSessionHandle {
 	peerPort: number;
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
+	/** Batched datagram send. Resolves `{sent, code?}` with prefix semantics —
+	 * it never rejects, for the same reason `readDatagramBatch` does not.
+	 * Required rather than optional-with-fallback: it is version-bound with the
+	 * bundled prebuild, so a caller that drops it must fail to compile rather
+	 * than silently degrade. */
+	sendDatagramBatch: (
+		datagrams: Uint8Array[],
+	) => Promise<NativeDatagramBatchResult>;
 	readDatagram(): Promise<Uint8Array | null>;
 	/** Batched datagram read. Resolves a non-empty array, or `null` at
 	 * EOF/close — it never rejects. Required, not optional-with-fallback: it is
@@ -1325,7 +1366,7 @@ const DATAGRAM_BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
 const DATAGRAM_BATCH_DIAGNOSTICS_ENV =
 	"WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
 const DEFAULT_DATAGRAM_BATCH = 64;
-const MAX_DATAGRAM_BATCH = 256;
+const MAX_DATAGRAM_BATCH = DATAGRAM_BATCH_MAX;
 const DATAGRAM_BATCH_MISMATCH_MESSAGE =
 	"E_INTERNAL: native addon/JavaScript version mismatch; rebuild the matching prebuild";
 
@@ -1632,6 +1673,22 @@ class NativeServerSession implements ServerSession {
 		} catch (err) {
 			throw toWebTransportError(err);
 		}
+	}
+
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }> {
+		if (this.#closed)
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		const handle = this.#nativeHandle;
+		return sendDatagramBatchChunked(
+			(chunk) => handle.sendDatagramBatch(chunk),
+			datagrams,
+		).then(({ sent, code }) =>
+			code === undefined
+				? { sent }
+				: { sent, error: toWebTransportError(new Error(code)) },
+		);
 	}
 
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
@@ -2181,6 +2238,23 @@ class NativeClientSession implements ClientSession {
 		} catch (err) {
 			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
+	}
+
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }> {
+		if (this.#closed)
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		const handle = this.#nativeHandle;
+		const strict = this.#strictW3CErrors;
+		return sendDatagramBatchChunked(
+			(chunk) => handle.sendDatagramBatch(chunk),
+			datagrams,
+		).then(({ sent, code }) =>
+			code === undefined
+				? { sent }
+				: { sent, error: toWebTransportError(new Error(code), strict) },
+		);
 	}
 
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
