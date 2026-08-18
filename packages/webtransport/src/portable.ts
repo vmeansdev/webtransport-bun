@@ -48,6 +48,16 @@ export interface PortableServerSession {
 	 */
 	drain(): void;
 
+	/**
+	 * Send one datagram. This is the portable sending contract, and the whole
+	 * of it.
+	 *
+	 * Batched *sending* (`sendDatagramBatch`) is native-only, mirroring batched
+	 * receiving: it exists to amortize the N-API crossing, which the wasm
+	 * backend does not have, so promising it here would be a shape no backend
+	 * but one could honor. An application that needs it must hold the native
+	 * root session.
+	 */
 	sendDatagram(data: Uint8Array): Promise<void>;
 
 	/**
