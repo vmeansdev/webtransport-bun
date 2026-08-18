@@ -3,16 +3,15 @@
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use std::net::IpAddr;
-use std::str::FromStr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Rate-limit map key scoped to an owning server instance, so two
 /// `ServerHandle`s in one process never share per-IP/per-prefix budgets (a
 /// burst against one server must not throttle or exhaust the other's limits).
-/// The IP/prefix string is kept intact for prefix derivation.
-type ScopedKey = (u64, String);
+/// Keyed by `IpAddr` (Copy) so per-datagram lookups never allocate.
+type ScopedKey = (u64, IpAddr);
 
 static PER_IP_SESSIONS: Lazy<DashMap<ScopedKey, AtomicU64>> = Lazy::new(DashMap::new);
 static PER_PREFIX_SESSIONS: Lazy<DashMap<ScopedKey, AtomicU64>> = Lazy::new(DashMap::new);
@@ -120,30 +119,25 @@ impl RateLimits {
     }
 }
 
-/// Extract /24 (IPv4) or /64 (IPv6) prefix from peer IP string.
-pub fn ip_to_prefix(peer_ip: &str) -> String {
-    if let Ok(ip) = IpAddr::from_str(peer_ip) {
-        match ip {
-            IpAddr::V4(a) => {
-                let octets = a.octets();
-                format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2])
-            }
-            IpAddr::V6(a) => {
-                let segs = a.segments();
-                format!(
-                    "{:x}:{:x}:{:x}:{:x}::/64",
-                    segs[0], segs[1], segs[2], segs[3]
-                )
-            }
+/// The /24 (IPv4) or /64 (IPv6) prefix as a masked address, allocation-free.
+/// Prefixes live only as `PER_PREFIX_SESSIONS` keys (a separate map), so a
+/// masked address can never collide with a literal peer address.
+pub fn ip_prefix(peer_ip: IpAddr) -> IpAddr {
+    match peer_ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 0))
         }
-    } else {
-        peer_ip.to_string()
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
     }
 }
 
 /// Check if this IP (and its prefix) can accept a new session. Returns true if allowed.
 /// Increments both per-IP and per-prefix counters; caller must call release_per_ip_session when session closes.
-pub fn try_acquire_per_ip_session(server_id: u64, peer_ip: &str, burst_limit: u64) -> bool {
+pub fn try_acquire_per_ip_session(server_id: u64, peer_ip: IpAddr, burst_limit: u64) -> bool {
     try_acquire_per_ip_session_with_prefix(
         server_id,
         peer_ip,
@@ -154,7 +148,7 @@ pub fn try_acquire_per_ip_session(server_id: u64, peer_ip: &str, burst_limit: u6
 
 pub fn try_acquire_per_ip_session_with_prefix(
     server_id: u64,
-    peer_ip: &str,
+    peer_ip: IpAddr,
     burst_limit: u64,
     prefix_burst_limit: u64,
 ) -> bool {
@@ -168,10 +162,10 @@ pub fn try_acquire_per_ip_session_with_prefix(
     } else {
         DEFAULT_HANDSHAKES_BURST_PER_PREFIX
     };
-    let prefix = ip_to_prefix(peer_ip);
+    let prefix = ip_prefix(peer_ip);
 
     let ip_ok = PER_IP_SESSIONS
-        .entry((server_id, peer_ip.to_string()))
+        .entry((server_id, peer_ip))
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             if n < burst {
@@ -186,7 +180,7 @@ pub fn try_acquire_per_ip_session_with_prefix(
     }
 
     let prefix_ok = PER_PREFIX_SESSIONS
-        .entry((server_id, prefix.clone()))
+        .entry((server_id, prefix))
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             if n < prefix_burst {
@@ -203,8 +197,8 @@ pub fn try_acquire_per_ip_session_with_prefix(
     true
 }
 
-fn release_per_ip_session_inner(server_id: u64, peer_ip: &str) {
-    let key = (server_id, peer_ip.to_string());
+fn release_per_ip_session_inner(server_id: u64, peer_ip: IpAddr) {
+    let key = (server_id, peer_ip);
     if let Some(entry) = PER_IP_SESSIONS.get(&key) {
         let prev = entry
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -221,8 +215,8 @@ fn release_per_ip_session_inner(server_id: u64, peer_ip: &str) {
     }
 }
 
-fn release_per_prefix_session_inner(server_id: u64, prefix: &str) {
-    let key = (server_id, prefix.to_string());
+fn release_per_prefix_session_inner(server_id: u64, prefix: IpAddr) {
+    let key = (server_id, prefix);
     if let Some(entry) = PER_PREFIX_SESSIONS.get(&key) {
         let prev = entry
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -237,20 +231,20 @@ fn release_per_prefix_session_inner(server_id: u64, prefix: &str) {
 }
 
 /// Release a session for this IP. Call when session closes.
-pub fn release_per_ip_session(server_id: u64, peer_ip: &str) {
-    let prefix = ip_to_prefix(peer_ip);
+pub fn release_per_ip_session(server_id: u64, peer_ip: IpAddr) {
+    let prefix = ip_prefix(peer_ip);
     release_per_ip_session_inner(server_id, peer_ip);
-    release_per_prefix_session_inner(server_id, &prefix);
+    release_per_prefix_session_inner(server_id, prefix);
 }
 
 fn try_acquire_token(
     buckets: &DashMap<ScopedKey, BucketEntry>,
     server_id: u64,
-    peer_ip: &str,
+    peer_ip: IpAddr,
     rate_per_sec: f64,
     burst: f64,
 ) -> bool {
-    let key = (server_id, peer_ip.to_string());
+    let key = (server_id, peer_ip);
     let entry = buckets.entry(key).or_insert_with(|| {
         (
             std::sync::Mutex::new((burst, Instant::now())),
@@ -273,17 +267,22 @@ fn try_acquire_token(
 }
 
 /// Try to acquire one token for opening a stream from this IP. Returns false if rate limited.
-pub fn try_acquire_stream_open(server_id: u64, peer_ip: &str, rate: f64, burst: f64) -> bool {
+pub fn try_acquire_stream_open(server_id: u64, peer_ip: IpAddr, rate: f64, burst: f64) -> bool {
     try_acquire_token(&STREAM_BUCKETS, server_id, peer_ip, rate, burst)
 }
 
 /// Try to acquire one token for datagram ingress from this IP. Returns false if rate limited.
-pub fn try_acquire_datagram_ingress(server_id: u64, peer_ip: &str, rate: f64, burst: f64) -> bool {
+pub fn try_acquire_datagram_ingress(
+    server_id: u64,
+    peer_ip: IpAddr,
+    rate: f64,
+    burst: f64,
+) -> bool {
     try_acquire_token(&DGRAM_BUCKETS, server_id, peer_ip, rate, burst)
 }
 
 /// Try to acquire one token for a handshake from this IP. Returns false if rate limited.
-pub fn try_acquire_handshake(server_id: u64, peer_ip: &str, rate: f64, burst: f64) -> bool {
+pub fn try_acquire_handshake(server_id: u64, peer_ip: IpAddr, rate: f64, burst: f64) -> bool {
     try_acquire_token(&HANDSHAKE_BUCKETS, server_id, peer_ip, rate, burst)
 }
 
@@ -354,21 +353,28 @@ mod tests {
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(100);
 
-    fn unique_ip() -> String {
+    fn unique_ip() -> IpAddr {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("100.{}.{}.{}", (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF)
+        IpAddr::V4(Ipv4Addr::new(
+            100,
+            ((n >> 16) & 0xFF) as u8,
+            ((n >> 8) & 0xFF) as u8,
+            (n & 0xFF) as u8,
+        ))
     }
 
     #[test]
-    fn test_ip_to_prefix_v4() {
-        assert_eq!(ip_to_prefix("192.168.1.42"), "192.168.1.0/24");
-        assert_eq!(ip_to_prefix("10.0.0.1"), "10.0.0.0/24");
+    fn test_ip_prefix_v4() {
+        let ip: IpAddr = "192.168.1.42".parse().unwrap();
+        assert_eq!(ip_prefix(ip), "192.168.1.0".parse::<IpAddr>().unwrap());
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(ip_prefix(ip), "10.0.0.0".parse::<IpAddr>().unwrap());
     }
 
     #[test]
-    fn test_ip_to_prefix_v6() {
-        let prefix = ip_to_prefix("2001:db8:85a3::8a2e:370:7334");
-        assert_eq!(prefix, "2001:db8:85a3:0::/64");
+    fn test_ip_prefix_v6() {
+        let ip: IpAddr = "2001:db8:85a3::8a2e:370:7334".parse().unwrap();
+        assert_eq!(ip_prefix(ip), "2001:db8:85a3::".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -376,36 +382,36 @@ mod tests {
         let ip = unique_ip();
         let limit = 3u64;
         for _ in 0..3 {
-            assert!(try_acquire_per_ip_session(1, &ip, limit));
+            assert!(try_acquire_per_ip_session(1, ip, limit));
         }
-        assert!(!try_acquire_per_ip_session(1, &ip, limit));
-        release_per_ip_session(1, &ip);
-        assert!(try_acquire_per_ip_session(1, &ip, limit));
+        assert!(!try_acquire_per_ip_session(1, ip, limit));
+        release_per_ip_session(1, ip);
+        assert!(try_acquire_per_ip_session(1, ip, limit));
     }
 
     #[test]
     fn test_per_prefix_burst() {
-        let base = TEST_COUNTER.fetch_add(10, Ordering::SeqCst);
-        let ip1 = format!("200.{}.0.1", base);
-        let ip2 = format!("200.{}.0.2", base);
-        let ip3 = format!("200.{}.0.3", base);
+        let base = (TEST_COUNTER.fetch_add(10, Ordering::SeqCst) & 0xFF) as u8;
+        let ip1 = IpAddr::V4(Ipv4Addr::new(200, base, 0, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(200, base, 0, 2));
+        let ip3 = IpAddr::V4(Ipv4Addr::new(200, base, 0, 3));
         let ip_burst = 100u64;
         let prefix_burst = 2u64;
         assert!(try_acquire_per_ip_session_with_prefix(
             1,
-            &ip1,
+            ip1,
             ip_burst,
             prefix_burst
         ));
         assert!(try_acquire_per_ip_session_with_prefix(
             1,
-            &ip2,
+            ip2,
             ip_burst,
             prefix_burst
         ));
         assert!(!try_acquire_per_ip_session_with_prefix(
             1,
-            &ip3,
+            ip3,
             ip_burst,
             prefix_burst
         ));
@@ -417,9 +423,9 @@ mod tests {
         let rate = 10.0;
         let burst = 5.0;
         for _ in 0..5 {
-            assert!(try_acquire_stream_open(1, &ip, rate, burst));
+            assert!(try_acquire_stream_open(1, ip, rate, burst));
         }
-        assert!(!try_acquire_stream_open(1, &ip, rate, burst));
+        assert!(!try_acquire_stream_open(1, ip, rate, burst));
     }
 
     #[test]
@@ -429,9 +435,9 @@ mod tests {
         let rate = 0.0;
         let burst = 10.0;
         for _ in 0..10 {
-            assert!(try_acquire_datagram_ingress(1, &ip, rate, burst));
+            assert!(try_acquire_datagram_ingress(1, ip, rate, burst));
         }
-        assert!(!try_acquire_datagram_ingress(1, &ip, rate, burst));
+        assert!(!try_acquire_datagram_ingress(1, ip, rate, burst));
     }
 
     #[test]
@@ -439,10 +445,10 @@ mod tests {
         let ip_a = unique_ip();
         let ip_b = unique_ip();
         let limit = 2u64;
-        assert!(try_acquire_per_ip_session(1, &ip_a, limit));
-        assert!(try_acquire_per_ip_session(1, &ip_a, limit));
-        assert!(!try_acquire_per_ip_session(1, &ip_a, limit));
-        assert!(try_acquire_per_ip_session(1, &ip_b, limit));
+        assert!(try_acquire_per_ip_session(1, ip_a, limit));
+        assert!(try_acquire_per_ip_session(1, ip_a, limit));
+        assert!(!try_acquire_per_ip_session(1, ip_a, limit));
+        assert!(try_acquire_per_ip_session(1, ip_b, limit));
     }
 
     // Two ServerHandles (distinct server_id) must not share per-IP budgets: a
@@ -455,20 +461,20 @@ mod tests {
         let server_a = 7000;
         let server_b = 7001;
         // Exhaust server A's per-IP session budget for this IP.
-        assert!(try_acquire_per_ip_session(server_a, &ip, limit));
-        assert!(try_acquire_per_ip_session(server_a, &ip, limit));
-        assert!(!try_acquire_per_ip_session(server_a, &ip, limit));
+        assert!(try_acquire_per_ip_session(server_a, ip, limit));
+        assert!(try_acquire_per_ip_session(server_a, ip, limit));
+        assert!(!try_acquire_per_ip_session(server_a, ip, limit));
         // Server B's budget for the same IP is untouched.
-        assert!(try_acquire_per_ip_session(server_b, &ip, limit));
-        assert!(try_acquire_per_ip_session(server_b, &ip, limit));
-        assert!(!try_acquire_per_ip_session(server_b, &ip, limit));
+        assert!(try_acquire_per_ip_session(server_b, ip, limit));
+        assert!(try_acquire_per_ip_session(server_b, ip, limit));
+        assert!(!try_acquire_per_ip_session(server_b, ip, limit));
 
         // Token buckets are likewise isolated.
         let rate = 0.0;
         let burst = 1.0;
-        assert!(try_acquire_stream_open(server_a, &ip, rate, burst));
-        assert!(!try_acquire_stream_open(server_a, &ip, rate, burst));
-        assert!(try_acquire_stream_open(server_b, &ip, rate, burst));
+        assert!(try_acquire_stream_open(server_a, ip, rate, burst));
+        assert!(!try_acquire_stream_open(server_a, ip, rate, burst));
+        assert!(try_acquire_stream_open(server_b, ip, rate, burst));
     }
 
     // Malformed rate/burst floats (NaN/Infinity/negative) must not slip into the
@@ -490,12 +496,12 @@ mod tests {
     fn test_cleanup_removes_zero_sessions() {
         let ip = unique_ip();
         let limit = 5u64;
-        assert!(try_acquire_per_ip_session(1, &ip, limit));
-        release_per_ip_session(1, &ip);
+        assert!(try_acquire_per_ip_session(1, ip, limit));
+        release_per_ip_session(1, ip);
         // Keep bucket entries intact to avoid interfering with other tests that
         // share global token-bucket state and run in parallel.
         cleanup_stale_entries(f64::MAX);
-        assert!(!PER_IP_SESSIONS.contains_key(&(1, ip.clone())));
+        assert!(!PER_IP_SESSIONS.contains_key(&(1, ip)));
     }
 
     #[test]
@@ -525,9 +531,9 @@ mod tests {
         let rate = 5.0;
         let burst = 3.0;
         for _ in 0..3 {
-            assert!(try_acquire_handshake(1, &ip, rate, burst));
+            assert!(try_acquire_handshake(1, ip, rate, burst));
         }
-        assert!(!try_acquire_handshake(1, &ip, rate, burst));
+        assert!(!try_acquire_handshake(1, ip, rate, burst));
     }
 
     #[test]
@@ -535,10 +541,10 @@ mod tests {
         let ip = unique_ip();
         let rate = 1000.0;
         let burst = 1.0;
-        assert!(try_acquire_handshake(1, &ip, rate, burst));
-        assert!(!try_acquire_handshake(1, &ip, rate, burst));
+        assert!(try_acquire_handshake(1, ip, rate, burst));
+        assert!(!try_acquire_handshake(1, ip, rate, burst));
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(try_acquire_handshake(1, &ip, rate, burst));
+        assert!(try_acquire_handshake(1, ip, rate, burst));
     }
 
     #[test]
@@ -571,26 +577,26 @@ mod tests {
         let sid_b: u64 = 9001;
 
         // Populate all 5 maps for server 9000.
-        assert!(try_acquire_per_ip_session(sid_a, &ip, 100));
-        assert!(try_acquire_handshake(sid_a, &ip, 10.0, 10.0));
-        assert!(try_acquire_stream_open(sid_a, &ip, 10.0, 10.0));
-        assert!(try_acquire_datagram_ingress(sid_a, &ip, 10.0, 10.0));
+        assert!(try_acquire_per_ip_session(sid_a, ip, 100));
+        assert!(try_acquire_handshake(sid_a, ip, 10.0, 10.0));
+        assert!(try_acquire_stream_open(sid_a, ip, 10.0, 10.0));
+        assert!(try_acquire_datagram_ingress(sid_a, ip, 10.0, 10.0));
 
         // Populate server 9001 to prove isolation.
-        assert!(try_acquire_per_ip_session(sid_b, &ip, 100));
+        assert!(try_acquire_per_ip_session(sid_b, ip, 100));
 
         // Cleanup server 9000.
         cleanup_server_entries(sid_a);
 
         // All 9000 entries must be gone.
-        assert!(!PER_IP_SESSIONS.contains_key(&(sid_a, ip.clone())));
-        let prefix = ip_to_prefix(&ip);
-        assert!(!PER_PREFIX_SESSIONS.contains_key(&(sid_a, prefix.clone())));
-        assert!(!HANDSHAKE_BUCKETS.contains_key(&(sid_a, ip.clone())));
-        assert!(!STREAM_BUCKETS.contains_key(&(sid_a, ip.clone())));
-        assert!(!DGRAM_BUCKETS.contains_key(&(sid_a, ip.clone())));
+        assert!(!PER_IP_SESSIONS.contains_key(&(sid_a, ip)));
+        let prefix = ip_prefix(ip);
+        assert!(!PER_PREFIX_SESSIONS.contains_key(&(sid_a, prefix)));
+        assert!(!HANDSHAKE_BUCKETS.contains_key(&(sid_a, ip)));
+        assert!(!STREAM_BUCKETS.contains_key(&(sid_a, ip)));
+        assert!(!DGRAM_BUCKETS.contains_key(&(sid_a, ip)));
 
         // 9001 entry must still be present.
-        assert!(PER_IP_SESSIONS.contains_key(&(sid_b, ip.clone())));
+        assert!(PER_IP_SESSIONS.contains_key(&(sid_b, ip)));
     }
 }

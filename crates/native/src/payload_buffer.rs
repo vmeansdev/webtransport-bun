@@ -123,25 +123,55 @@ pub(crate) fn plan_delivery(len: usize, mode: PayloadDeliveryMode) -> PayloadDel
 /// A payload handed to JavaScript as a `Uint8Array`, sized so the engine can
 /// actually feel it: arraybuffer-backed copy for ordinary payloads, accounted
 /// external `Buffer` for large ones.
-pub struct PayloadBuffer(Vec<u8>);
+///
+/// `Shared` carries a refcounted transport buffer straight to the engine-owned
+/// copy, so a retained datagram or stream chunk pays exactly one copy — the
+/// arraybuffer one — instead of a dequeue copy first.
+pub struct PayloadBuffer(PayloadSource);
+
+enum PayloadSource {
+    Owned(Vec<u8>),
+    Shared(bytes::Bytes),
+}
 
 impl From<Vec<u8>> for PayloadBuffer {
     fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(PayloadSource::Owned(bytes))
+    }
+}
+
+impl From<bytes::Bytes> for PayloadBuffer {
+    fn from(bytes: bytes::Bytes) -> Self {
+        Self(PayloadSource::Shared(bytes))
     }
 }
 
 impl AsRef<[u8]> for PayloadBuffer {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        match &self.0 {
+            PayloadSource::Owned(v) => v,
+            PayloadSource::Shared(b) => b,
+        }
     }
 }
 
 impl PayloadBuffer {
     /// Take the bytes back for a payload that stays inside Rust (probe
-    /// handlers echo without ever crossing into JS).
+    /// handlers echo without ever crossing into JS). Copies under `Shared`;
+    /// in-Rust consumers should prefer `into_bytes`.
     pub fn into_vec(self) -> Vec<u8> {
-        self.0
+        match self.0 {
+            PayloadSource::Owned(v) => v,
+            PayloadSource::Shared(b) => b.to_vec(),
+        }
+    }
+
+    /// The bytes as a refcounted buffer, copy-free from either arm.
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self.0 {
+            PayloadSource::Owned(v) => bytes::Bytes::from(v),
+            PayloadSource::Shared(b) => b,
+        }
     }
 }
 
@@ -281,7 +311,7 @@ unsafe fn external_payload_to_napi_value(
 
 impl ToNapiValue for PayloadBuffer {
     unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
-        let len = val.0.len();
+        let len = val.as_ref().len();
         let mut ret = ptr::null_mut();
         match plan_delivery(len, payload_delivery_mode()) {
             PayloadDeliveryPlan::Empty => {
@@ -302,7 +332,7 @@ impl ToNapiValue for PayloadBuffer {
                     "Failed to create payload arraybuffer"
                 )?;
                 unsafe {
-                    ptr::copy_nonoverlapping(val.0.as_ptr(), data.cast::<u8>(), len);
+                    ptr::copy_nonoverlapping(val.as_ref().as_ptr(), data.cast::<u8>(), len);
                 }
                 napi::check_status!(
                     unsafe {
@@ -329,7 +359,7 @@ impl ToNapiValue for PayloadBuffer {
                         sys::napi_create_buffer_copy(
                             env,
                             len,
-                            val.0.as_ptr().cast::<c_void>(),
+                            val.as_ref().as_ptr().cast::<c_void>(),
                             ptr::null_mut(),
                             &mut ret,
                         )
@@ -338,8 +368,12 @@ impl ToNapiValue for PayloadBuffer {
                 )?;
                 Ok(ret)
             }
+            // The external handover's finalizer owns a `Vec`; a `Shared`
+            // payload above the engine-owned bound falls back to one copy.
+            // Unreachable in practice: datagrams sit under the MTU and the
+            // in-scope stream chunks under 4 KiB, both far below the bound.
             PayloadDeliveryPlan::ExternalAccounted => unsafe {
-                external_payload_to_napi_value(env, val.0, len)
+                external_payload_to_napi_value(env, val.into_vec(), len)
             },
         }
     }
@@ -500,5 +534,72 @@ mod tests {
         assert_eq!(bound, ENGINE_OWNED_MAX_BYTES);
         assert!(!plan_delivery(bound, payload_delivery_mode()).charges_external_memory());
         assert!(plan_delivery(bound + 1, payload_delivery_mode()).charges_external_memory());
+    }
+}
+
+#[cfg(test)]
+mod alloc_falsifier {
+    use super::*;
+    use crate::alloc_counter::measure;
+
+    /// The refactor's claim, asserted: moving a payload from either arm into
+    /// (and back out of) `PayloadBuffer` performs zero heap allocations. The
+    /// only copy a payload pays is the napi arraybuffer at the JS boundary.
+    #[test]
+    fn payload_buffer_conversions_do_not_allocate() {
+        let owned_src = vec![7u8; 1150];
+        let shared_src = bytes::Bytes::from(vec![9u8; 1150]);
+
+        let ((), owned_allocs) = measure(|| {
+            let pb = PayloadBuffer::from(owned_src);
+            assert_eq!(pb.as_ref().len(), 1150);
+            let b = pb.into_bytes();
+            assert_eq!(b.len(), 1150);
+            drop(b);
+        });
+        assert_eq!(owned_allocs, 0, "Owned round-trip must be moves only");
+
+        // First share of a Vec-backed `Bytes` promotes it to its Arc-shared
+        // form — one control-block allocation, surfaced by this very harness.
+        // Promote outside the measured window; steady state is what the hot
+        // path sees, and it must be allocation-free.
+        let shared_src = shared_src.slice(..);
+        let ((), shared_allocs) = measure(|| {
+            let pb = PayloadBuffer::from(shared_src.slice(..));
+            assert_eq!(pb.as_ref().len(), 1150);
+            let b = pb.into_bytes();
+            assert_eq!(b.len(), 1150);
+            drop(b);
+        });
+        assert_eq!(
+            shared_allocs, 0,
+            "Shared round-trip must be refcount bumps only"
+        );
+    }
+
+    /// `DatagramSlot::take`'s Transport arm returns `Datagram::payload()`,
+    /// which is `Bytes::slice` of the retained buffer. `Datagram` itself is
+    /// not constructible outside wtransport, so the arm's allocation-freedom
+    /// is asserted via the identical operation: slicing a `Bytes` allocates
+    /// nothing. (Before the refactor this arm paid a full `to_vec` per
+    /// dequeued datagram.)
+    #[test]
+    fn bytes_slicing_the_transport_arm_operation_does_not_allocate() {
+        let backing = bytes::Bytes::from(vec![3u8; 1500]);
+        let ((), first) = measure(|| {
+            drop(backing.slice(350..));
+        });
+        // One-time promotion of the Vec-backed buffer to Arc-shared form;
+        // amortized once per received parent datagram, not per payload.
+        assert!(first <= 1, "first slice may only pay the Arc promotion");
+        let ((), steady) = measure(|| {
+            let payload = backing.slice(350..);
+            assert_eq!(payload.len(), 1150);
+            drop(payload);
+        });
+        assert_eq!(
+            steady, 0,
+            "steady-state Bytes::slice must be a refcount bump"
+        );
     }
 }

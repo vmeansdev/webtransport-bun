@@ -49,7 +49,7 @@ where
 /// proportional to what the task could have corrupted: never the whole process.
 pub enum PanicScope {
     /// Close a single server-side session (stream/session-scoped tasks).
-    Session(String),
+    Session(std::sync::Arc<str>),
     /// Close every session owned by one server instance (accept-loop tasks).
     Server(u64),
     /// Close a specific connection (client-side tasks).

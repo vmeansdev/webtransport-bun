@@ -12,6 +12,19 @@ pub fn encode(value: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Encoded width of `value`, matching what `encode` would push.
+pub fn width(value: u64) -> usize {
+    if value < 0x40 {
+        1
+    } else if value < 0x4000 {
+        2
+    } else if value < 0x4000_0000 {
+        4
+    } else {
+        8
+    }
+}
+
 /// Returns (value, bytes_consumed) or None if `buf` is too short.
 pub fn decode(buf: &[u8]) -> Option<(u64, usize)> {
     let first = *buf.first()?;
@@ -47,6 +60,24 @@ mod tests {
             let (got, used) = decode(&buf).unwrap();
             assert_eq!(got, n, "value {n:#x}");
             assert_eq!(used, buf.len(), "len for {n:#x}");
+        }
+    }
+
+    #[test]
+    fn width_matches_encode() {
+        for &n in &[
+            0u64,
+            0x3f,
+            0x40,
+            0x3fff,
+            0x4000,
+            0x3fff_ffff,
+            0x4000_0000,
+            u64::MAX >> 2,
+        ] {
+            let mut buf = Vec::new();
+            encode(n, &mut buf);
+            assert_eq!(width(n), buf.len(), "width for {n:#x}");
         }
     }
 
