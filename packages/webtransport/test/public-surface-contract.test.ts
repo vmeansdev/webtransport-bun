@@ -62,6 +62,24 @@ type _AssertNoGoAwayOnPortable = Assert<
 type _AssertNoUnwrapOnPortable = Assert<
 	Not<Extends<PortableServerSession, { unwrap(): unknown }>>
 >;
+// `sendDatagramBatch()` is native-only for the same reason batched *receiving*
+// is: it exists to amortize the N-API crossing, and wasm has none.
+type _AssertNoSendDatagramBatchOnPortable = Assert<
+	Not<
+		Extends<
+			PortableServerSession,
+			{ sendDatagramBatch(datagrams: readonly Uint8Array[]): unknown }
+		>
+	>
+>;
+// ...and it is genuinely on the native session, so the assertion above is a
+// statement about the portable surface rather than about a method nobody has.
+type _AssertSendDatagramBatchOnNative = Assert<
+	Extends<
+		rootSurface.ServerSession,
+		{ sendDatagramBatch(datagrams: readonly Uint8Array[]): unknown }
+	>
+>;
 type _AssertNoGetStatsOnPortable = Assert<
 	Not<Extends<PortableServerSession, { getStats(): unknown }>>
 >;
@@ -191,6 +209,12 @@ function assertSessionContract(session: PortableServerSession): void {
 			"number",
 		);
 	}
+
+	// Native-only members must be absent in fact, not merely absent from the
+	// type: the native adapter projects the session member by member, and a
+	// projection that leaked one would make the portable surface backend-shaped.
+	expect(bag.sendDatagramBatch).toBeUndefined();
+	expect(bag.goAway).toBeUndefined();
 
 	// One datagram consumer per session: repeated calls hand back the same
 	// iterable rather than a second view racing for the same source.
