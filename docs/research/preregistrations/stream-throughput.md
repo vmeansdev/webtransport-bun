@@ -380,7 +380,21 @@ Original STOP conditions 1 (generator saturation), 2 (host saturation), 3
 
 ## Run log
 
-No dispatches yet.
+| # | date | run id | candidate SHA | arms | outcome | artifact sha256 |
+|---|---|---|---|---|---|---|
+| 1 | 2026-08-18 | [32193538952](https://github.com/vmeansdev/webtransport-bun/actions/runs/32193538952) | `29c3b694b0a28aac8b68802e886643e92f9a2a9f` | W | complete, stamped | `827a474cf6342c7634338eb49f14a09e03b252eee2a3daad64c379d9ac5de1e5` (`bench-stream-29c3b69….json`), `91ce57f522dd453bd5fd5237cb3ad61069f5eb8b7043fa979647797b8d7a87a0` (`.csv`) |
+
+Run 1, `bench-bandwidth.yml` on `[self-hosted, Linux, X64, heavy]`, started
+2026-08-18T22:54:18.988Z, Bun 1.3.14, 4 CPUs, procfs present. All nine rungs
+complete, zero STOPs, `memoryRetention: CLEAN` (W-repeat 0.774 vs W1 0.781
+Gbps). Delivered Gbps: W1 0.781 · W2 0.814 · W3 0.853 · W4 0.896 · W5 0.931 ·
+W6 1.003 · W7 1.037 · W-a6 1.030. Every rung classified `window-plateau`, so
+the ladder never met the `window-scaling` rule and the knee rule applied
+normally: **knee = W6** (8 MiB per-stream / 64 MiB per-session), the smallest
+complete rung ≥ 0.95 × the best complete rung (W7). Only W1 and its W-repeat
+replay are `insideShippedPerSessionBudget`; W6's advertised worst case at
+`max_sessions` = 31.8× the rig's 8 GB. No rerun; this is the single dispatch
+this axis' sweep was budgeted. Decision consumed by ticket 09.
 
 ## Deferred (out of scope for this harness)
 
