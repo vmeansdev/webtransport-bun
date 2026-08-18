@@ -8,12 +8,13 @@
  * to avoid name collisions with Node stream methods.
  */
 
-import { Duplex, Readable, Writable } from "node:stream";
 import type {
 	DuplexOptions,
 	ReadableOptions,
 	WritableOptions,
 } from "node:stream";
+import { Duplex, Readable, Writable } from "node:stream";
+import { readStreamChunk } from "./stream-chunk-batch.js";
 
 /**
  * Symbol to call stream reset (abort receiving). Use on BidiStream, SendStream, RecvStream.
@@ -125,8 +126,11 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			this.push(null);
 			return;
 		}
-		h.read()
-			.then((buf: Buffer | string | null) => {
+		// One crossing, one push: batching enlarges the chunk and never turns a
+		// single push into a loop, so `push() === false` still stops the reader
+		// exactly where it did before.
+		readStreamChunk(h)
+			.then((buf: Uint8Array | string | null) => {
 				// Never-reject sentinel: a string result IS an error code
 				// (see unwrapNativeValue) — never deliverable as payload.
 				if (typeof buf === "string") {
@@ -404,8 +408,11 @@ export class RecvStream extends Readable implements StopSendable {
 			this.push(null);
 			return;
 		}
-		h.read()
-			.then((buf: Buffer | string | null) => {
+		// One crossing, one push: batching enlarges the chunk and never turns a
+		// single push into a loop, so `push() === false` still stops the reader
+		// exactly where it did before.
+		readStreamChunk(h)
+			.then((buf: Uint8Array | string | null) => {
 				// Never-reject sentinel: a string result IS an error code
 				// (see unwrapNativeValue) — never deliverable as payload.
 				if (typeof buf === "string") {
