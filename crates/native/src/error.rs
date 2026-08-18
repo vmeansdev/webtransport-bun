@@ -106,6 +106,18 @@ impl WtError {
     }
 }
 
+impl WtError {
+    /// The `E_CODE: detail` wire message, built in one exact-size allocation.
+    fn napi_message(&self) -> String {
+        let code = self.code.as_str();
+        let mut msg = String::with_capacity(code.len() + 2 + self.detail.len());
+        msg.push_str(code);
+        msg.push_str(": ");
+        msg.push_str(&self.detail);
+        msg
+    }
+}
+
 impl fmt::Display for WtError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.code.as_str(), self.detail)
@@ -118,7 +130,7 @@ impl From<WtError> for napi::Error {
     fn from(err: WtError) -> Self {
         // Sync napi entrypoints require `Error` (Status), not `Error<String>`.
         // Preserve `E_CODE: detail` so JS classification stays message-stable.
-        napi::Error::from_reason(err.to_string())
+        napi::Error::from_reason(err.napi_message())
     }
 }
 
@@ -126,15 +138,44 @@ pub fn from_reason(detail: impl std::fmt::Display) -> napi::Error {
     WtError::from_detail(detail.to_string()).into()
 }
 
+/// A bare `&'static` code as the whole detail (`E_CODE: E_CODE`), skipping the
+/// parse walk and building the message in one allocation.
+pub fn from_static_code(code: &'static str) -> napi::Error {
+    debug_assert!(WtCode::parse(code).is_some(), "unknown wire code {code}");
+    let mut msg = String::with_capacity(code.len() * 2 + 2);
+    msg.push_str(code);
+    msg.push_str(": ");
+    msg.push_str(code);
+    napi::Error::from_reason(msg)
+}
+
 pub fn from_code(code: WtCode, detail: impl std::fmt::Display) -> napi::Error {
     WtError::with_code(code, detail.to_string()).into()
 }
 
-pub fn from_upstream_error(detail: impl std::fmt::Display) -> napi::Error {
-    let detail = detail.to_string();
-    let lower = detail.to_ascii_lowercase();
-    if lower.contains("connection locally closed") || lower.contains("connection closed by peer") {
-        return from_code(WtCode::ESessionClosed, detail);
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return n.is_empty();
     }
-    from_reason(detail)
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// The final wire message for an upstream error, without the intermediate
+/// lowercase copy or double `Display` pass.
+pub fn upstream_error_message(detail: impl std::fmt::Display) -> String {
+    let detail = detail.to_string();
+    let err = if contains_ignore_ascii_case(&detail, "connection locally closed")
+        || contains_ignore_ascii_case(&detail, "connection closed by peer")
+    {
+        WtError::with_code(WtCode::ESessionClosed, detail)
+    } else {
+        WtError::from_detail(detail)
+    };
+    err.napi_message()
+}
+
+pub fn from_upstream_error(detail: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(upstream_error_message(detail))
 }
