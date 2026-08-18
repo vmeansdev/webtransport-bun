@@ -309,7 +309,19 @@ async function main(): Promise<void> {
 		// the late arrivals away. The settle window between steps is the same
 		// 10 s; it is now on the useful side of the snapshot.
 		await Bun.sleep(SETTLE_MS);
+
+		// One snapshot, taken here, used by both the artifact and the console
+		// line. The server keeps running between these statements, so reading the
+		// live histogram twice — once into the JSON and once for the log — printed
+		// a p99 the artifact does not contain, and the counters read one at a time
+		// could disagree with each other about the same step.
 		const drainArrivals = serverRx - rxAtClientExit;
+		const ingestJson = ingest.toJson();
+		const rxTotal = serverRx;
+		const stampedTotal = serverStamped;
+		const unstampedTotal = serverUnstamped;
+		const echoTotal = echoSent;
+		const echoErrTotal = echoErr;
 
 		const num = (re: RegExp): number => {
 			const m = stdout.match(re);
@@ -372,15 +384,15 @@ async function main(): Promise<void> {
 			clientSent: num(/datagrams sent=(\d+)/),
 			clientErr: num(/datagrams sent=\d+ err=(\d+)/),
 			clientReceived: num(/datagrams received=(\d+)/),
-			serverRx: serverRx - rx0,
-			serverStamped: serverStamped - stamped0,
-			serverUnstamped: serverUnstamped - unstamped0,
-			echoSent: echoSent - echo0,
-			echoErr: echoErr - echoErr0,
+			serverRx: rxTotal - rx0,
+			serverStamped: stampedTotal - stamped0,
+			serverUnstamped: unstampedTotal - unstamped0,
+			echoSent: echoTotal - echo0,
+			echoErr: echoErrTotal - echoErr0,
 			drainMs: SETTLE_MS,
 			drainArrivals,
 			upDeliveryRatio: null,
-			ingest: ingest.toJson(),
+			ingest: ingestJson,
 			client,
 			hostCpuPctMedian: median(hostSamples),
 			// Over the client-process window only: the drain that follows it is
@@ -394,7 +406,7 @@ async function main(): Promise<void> {
 			step.clientSent > 0 ? step.serverRx / step.clientSent : null;
 		steps.push(step);
 
-		const s = ingest.summary();
+		const s = LatencyHistogram.fromJson(step.ingest).summary();
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
 		console.log(
 			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} effective=${step.aggregateRate}/s up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} over ${step.driveWindowSec.toFixed(1)}s drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
