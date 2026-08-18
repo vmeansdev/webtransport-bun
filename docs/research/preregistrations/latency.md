@@ -415,6 +415,118 @@ step length stands in, the fallback is flagged in the artifact
 (`driveWindowMeasured: false`), and the step is `clock-invalid` for the missing
 client block anyway.
 
+## Amendment 5 — the interleaved A/B dispatch, 2026-08-19, before any interleaved arm ran
+
+**Status:** written before any harness code for the interleaved dispatch existed
+and before any interleaved arm was run. The only latency dispatch this axis has
+ever had (run 32159708926) aborted as a harness fault and produced no classifier
+output, so no measured latency value informed this amendment either. The rules
+being amended are quoted in full first.
+
+A second registration, `docs/research/preregistrations/latency-ab.md`, fixes the
+interleaved dispatch's rungs, replicate count, interleave order, floor rule,
+generator-honesty check, interval estimator and cross-check readings. It inherits
+everything in this document. Three registered rules here are shaped around a
+*ladder* and cannot be transcribed onto a dispatch where one process runs one
+rung; they are amended **for that dispatch only**, and the ladder's own form is
+untouched.
+
+**Original rule (schedule-lag floor, inside STOP 1), quoted verbatim:**
+
+> - `scheduleLag p99 ≥ 4 × scheduleLagFloor`, where `scheduleLagFloor` is the
+>   minimum `scheduleLag p99` across every step of the *same arm*. A within-arm
+>   control, so the platform's fixed timer-wake granularity — which is present
+>   at idle and is not queueing — is subtracted rather than mistaken for load.
+
+**Why it cannot be transcribed.** In the interleaved dispatch an arm-process runs
+exactly one rung, so "the minimum across every step of the same arm" is that
+step's own value, the ratio is identically 1, and the rule can never fire. A STOP
+that cannot fire is not a control.
+
+**Amended, for the interleaved dispatch only:** the floor is the *dispatch-level*
+`floorLagP99Ns` — the median client schedule-lag p99 across six dedicated floor
+arms run at 1,000/s aggregate (one fifteenth of the lowest measured rung), spread
+across the dispatch. The 4× multiplier and STOP 1's position are unchanged. This
+is a *stricter* test than the ladder's within-arm minimum, because the floor is
+measured where queueing cannot exist rather than at whichever rung happened to be
+the arm's quietest. The ladder dispatch keeps the original rule verbatim.
+
+**Original rules (arm-level and run-level STOP), quoted verbatim:**
+
+> **Arm-level STOP:** if every step at or above 50,000 aggregate /s is incomplete,
+> the whole arm is `incomplete` and contributes nothing.
+>
+> **Run-level STOP:** if the `default` arm is arm-level incomplete, the run is
+> `incomplete` and no latency claim is made. A run that stops is a result about the
+> harness or the host, and it will be reported as such rather than rationalized.
+
+**Why they cannot be transcribed.** Both are stated against a ladder that climbs
+past 50,000/s. The interleaved dispatch deliberately stays inside 10,000–25,000/s,
+the band the ladder proved the co-resident generator can actually source, so both
+rules would mark every arm incomplete by construction — for having declined to run
+a load the ladder already established it cannot offer.
+
+**Amended, for the interleaved dispatch only:** a *cell* (one arm, one rung, one
+replicate) is complete when it trips no STOP 1–6; a *rung* is `measured` when at
+least 8 of 10 replicates are complete in **both** arms; the dispatch is complete
+when the 15,000/s rung is `measured`. The interleaved dispatch is correspondingly
+forbidden from making any ladder, crossing-rate or capacity claim — that
+prohibition is registered in `latency-ab.md` alongside these rules. The ladder
+dispatch keeps the original rules verbatim.
+
+**Also registered in the same amendment:** a sixth STOP, `arm-timeout`, for the
+interleaved dispatch — an arm-process that exceeds a 120 s wall-clock guard is
+killed and its cell recorded incomplete. This document's dispatch log already
+carries one run that hung 55+ minutes after writing its fragment; an 86-arm
+dispatch cannot afford to find that out the same way.
+
+**Not changed by this amendment:** the ladder, the arms, the stamp layout, the
+clock, the latency buckets, the batch-A/B bands, the tick-absorption rule, and
+STOP conditions 2 through 5.
+
+## Amendment 6 — stamp version 2 carries the echo's send instant, 2026-08-19, before any interleaved arm ran
+
+**Status:** written before any interleaved arm was run; no measured latency value
+informed it. The layout being amended is quoted in full first.
+
+**Original payload stamp layout, quoted verbatim:**
+
+> 28-byte little-endian header, then `x` padding to `--payload-bytes`:
+>
+> | offset | size | field |
+> |---|---|---|
+> | 0 | 2 | magic `0x4C54` (`"LT"`) |
+> | 2 | 2 | version = 1 |
+> | 4 | 8 | intended send, CLOCK_MONOTONIC ns |
+> | 12 | 8 | actual send, CLOCK_MONOTONIC ns |
+> | 20 | 8 | per-session sequence |
+>
+> `--payload-bytes` < 28 is rejected at startup.
+
+**Why it changes.** The registered ingest-vs-egress cross-check
+(`latency-ab.md`) needs the server's *echo send* instant to travel back to the
+client, so the round trip can be split into three intervals that sum to it
+exactly. Version 1 has nowhere to put it.
+
+**Amended — version 2, 36 bytes:** the five version-1 fields keep their offsets
+and meanings; one field is appended.
+
+| offset | size | field |
+|---|---|---|
+| 0 | 2 | magic `0x4C54` (`"LT"`) |
+| 2 | 2 | version = 2 |
+| 4 | 8 | intended send, CLOCK_MONOTONIC ns |
+| 12 | 8 | actual send, CLOCK_MONOTONIC ns |
+| 20 | 8 | per-session sequence |
+| 28 | 8 | echo actual send, CLOCK_MONOTONIC ns — **written by the server**, zero on the upstream leg |
+
+`--payload-bytes` < 36 is rejected at startup. The 1150 B ladder payload is
+unaffected. Version 1 stamps are still decoded, with `echoActualNs = 0`, so a
+fragment or a binary from before this amendment reads correctly and simply
+produces no egress samples. Nothing about how `ingest` is measured changes: it is
+still `handler entry − actual send`, and the new field is written after that
+reading is taken.
+
 ## Dispatch log
 
 Every dispatch of this axis is logged here, including aborted ones, per the
