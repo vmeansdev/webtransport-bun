@@ -108,6 +108,10 @@ export type LatencyStep = {
 	serverUnstamped: number;
 	echoSent: number;
 	echoErr: number;
+	/** Drain grace held open after the client exited, before the snapshot. */
+	drainMs: number;
+	/** Datagrams that landed during that grace — this step's longest queued. */
+	drainArrivals: number;
 	upDeliveryRatio: number | null;
 	/** Server-side one-way: client send call → JS handler body. */
 	ingest: LatencyHistogramJson;
@@ -278,6 +282,18 @@ async function main(): Promise<void> {
 		const stdout = await stdoutPromise;
 		const stderr = await stderrPromise;
 		const elapsedSec = (Date.now() - startedAt) / 1000;
+		const cpuMsAtClientExit = serverCpuMs();
+		const rxAtClientExit = serverRx;
+
+		// Drain grace, spent before the step is snapshotted rather than after.
+		// Datagrams still in flight when the client process exits are this step's
+		// — and they are the ones that queued longest, which is the tail this axis
+		// exists to measure. Reading the histogram at client exit truncated
+		// exactly that tail, and the reset at the top of the next step then threw
+		// the late arrivals away. The settle window between steps is the same
+		// 10 s; it is now on the useful side of the snapshot.
+		await Bun.sleep(SETTLE_MS);
+		const drainArrivals = serverRx - rxAtClientExit;
 
 		const num = (re: RegExp): number => {
 			const m = stdout.match(re);
@@ -314,12 +330,16 @@ async function main(): Promise<void> {
 			serverUnstamped: serverUnstamped - unstamped0,
 			echoSent: echoSent - echo0,
 			echoErr: echoErr - echoErr0,
+			drainMs: SETTLE_MS,
+			drainArrivals,
 			upDeliveryRatio: null,
 			ingest: ingest.toJson(),
 			client,
 			hostCpuPctMedian: median(hostSamples),
+			// Over the client-process window only: the drain that follows it is
+			// idle and would dilute the rate it is supposed to report.
 			serverCpuPct:
-				((serverCpuMs() - cpuMs0) / Math.max(elapsedSec * 1000, 1)) * 100,
+				((cpuMsAtClientExit - cpuMs0) / Math.max(elapsedSec * 1000, 1)) * 100,
 			sessionsOk,
 			sessionsErr: num(/sessions ok=\d+ err=(\d+)/),
 		};
@@ -330,9 +350,8 @@ async function main(): Promise<void> {
 		const s = ingest.summary();
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
 		console.log(
-			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
+			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
 		);
-		await Bun.sleep(SETTLE_MS);
 	}
 
 	await server.close();
