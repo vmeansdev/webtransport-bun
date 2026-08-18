@@ -59,6 +59,31 @@ on:
         required: false
         default: "64"
         type: string
+      egress_probe:
+        description: "Run the egress axis (server originates, p99 gate, burst profiles, 1->N fan-out) instead of the bandwidth ladder"
+        required: false
+        default: "false"
+        type: string
+      egress_profiles:
+        description: "Comma-separated egress burst profiles: constant,frame-bursty,keyframe-aligned,desktop-share"
+        required: false
+        default: "constant,frame-bursty,keyframe-aligned,desktop-share"
+        type: string
+      egress_rates:
+        description: "Comma-separated per-session datagrams/s ladder for the egress axis (326 is 3 Mbps at 1150 B)"
+        required: false
+        default: "110,220,326,490,652,815"
+        type: string
+      egress_step_seconds:
+        description: "Seconds to hold each egress ladder step"
+        required: false
+        default: "45"
+        type: string
+      egress_fanout_n:
+        description: "Comma-separated subscriber counts for the 1-ingest-to-N-egress shape"
+        required: false
+        default: "10,25,50,100"
+        type: string
 jobs:
   bench:
     permissions:
@@ -134,7 +159,7 @@ jobs:
       # Method, classifier buckets and STOP conditions are pre-registered in
       # docs/research/preregistrations/latency.md.
       - name: Run latency axis
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.egress_probe != 'true' && github.event.inputs.latency_probe == 'true' }}
         env:
           LATENCY_SESSIONS: ${{ github.event.inputs.sessions }}
           LATENCY_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -173,15 +198,67 @@ jobs:
           bun tools/load/latency-classify.ts \
             "$OUTDIR/bench-latency-$SHA-classified.json" $FRAGMENTS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.egress_probe != 'true' && github.event.inputs.latency_probe == 'true' }}
         with:
           name: bench-latency-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-latency-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
+      # Egress axis. The generator-headroom control runs first and alone: unless
+      # the JS originator demonstrably outruns the transport, no capacity number
+      # from the ladder below is allowed to mean anything. One server process per
+      # burst profile, then the 1->N fan-out shape.
+      # Method, gates, buckets and STOP conditions are pre-registered in
+      # docs/research/preregistrations/egress.md.
+      - name: Run egress axis
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.egress_probe == 'true' }}
+        env:
+          EGRESS_SESSIONS: ${{ github.event.inputs.sessions }}
+          EGRESS_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
+          EGRESS_STEP_SECONDS: ${{ github.event.inputs.egress_step_seconds }}
+          EGRESS_RATES: ${{ github.event.inputs.egress_rates }}
+          EGRESS_FANOUT_N: ${{ github.event.inputs.egress_fanout_n }}
+          EGRESS_PROFILES: ${{ github.event.inputs.egress_profiles }}
+        run: |
+          set -euo pipefail
+          OUTDIR="$GITHUB_WORKSPACE/.bench-evidence"
+          mkdir -p "$OUTDIR"
+          SHA="${{ github.event.inputs.candidate_commit }}"
+          PORT=4450
+          GEN="$OUTDIR/bench-egress-$SHA-generator.json"
+          echo "== egress generator-headroom control =="
+          EGRESS_SHAPE=generator EGRESS_OUT="$GEN" bun tools/load/bench-egress.ts
+          FRAGMENTS="$GEN"
+          IFS=',' read -ra PROFILES <<< "$EGRESS_PROFILES"
+          for PROFILE in "${PROFILES[@]}"; do
+            PROFILE="$(echo "$PROFILE" | tr -d '[:space:]')"
+            [ -n "$PROFILE" ] || continue
+            PORT=$((PORT + 1))
+            OUT="$OUTDIR/bench-egress-$SHA-ladder-$PROFILE.json"
+            echo "== egress ladder profile $PROFILE on port $PORT =="
+            EGRESS_SHAPE=ladder EGRESS_PROFILE="$PROFILE" EGRESS_PORT="$PORT" \
+              EGRESS_OUT="$OUT" bun tools/load/bench-egress.ts
+            FRAGMENTS="$FRAGMENTS $OUT"
+          done
+          PORT=$((PORT + 1))
+          FAN="$OUTDIR/bench-egress-$SHA-fanout.json"
+          echo "== egress fan-out on port $PORT =="
+          EGRESS_SHAPE=fanout EGRESS_PORT="$PORT" EGRESS_OUT="$FAN" bun tools/load/bench-egress.ts
+          FRAGMENTS="$FRAGMENTS $FAN"
+          # shellcheck disable=SC2086
+          bun tools/load/egress-classify.ts \
+            "$OUTDIR/bench-egress-$SHA-classified.json" $FRAGMENTS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.egress_probe == 'true' }}
+        with:
+          name: bench-egress-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/bench-egress-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' && github.event.inputs.egress_probe != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -192,7 +269,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' && github.event.inputs.egress_probe != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*
