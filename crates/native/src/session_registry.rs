@@ -409,6 +409,12 @@ static REGISTRY: Lazy<DashMap<String, SessionState>> = Lazy::new(DashMap::new);
 /// Number of registry entries still owned by one server instance.
 /// This is diagnostic-only and intentionally scoped to the owner so a
 /// concurrent server cannot hide a retained session from close evidence.
+/// Which server owns a session, if it is still registered. Read once when a
+/// `SessionHandle` is built so per-call async-op accounting needs no lookup.
+pub fn owner_of(session_id: &str) -> Option<u64> {
+    REGISTRY.get(session_id).map(|entry| entry.owner_server_id)
+}
+
 pub fn owner_entry_count(owner_server_id: u64) -> usize {
     REGISTRY
         .iter()
@@ -706,6 +712,10 @@ pub fn close_all_for_owner(owner_server_id: u64, code: u32, reason: &[u8]) {
         mark_closed_and_notify_capacity_waiters(&key);
         if let Some((_, state)) = REGISTRY.remove(&key) {
             mark_state_closed_and_notify(&state);
+            // Counted here, not at teardown: a locally closed connection
+            // reports no application code, so this is the only place that
+            // knows the session was reaped rather than lost.
+            state.metrics.record_session_reaped();
             state.conn.close(wtransport::VarInt::from_u32(code), reason);
         }
     }
