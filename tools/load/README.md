@@ -111,8 +111,9 @@ direction of measurement without touching the driver:
 - `latency-clock.ts` — `CLOCK_MONOTONIC` from Bun via `bun:ffi`, the same
   counter `crates/reference/src/latency_probe.rs` reads from Rust. Shared epoch,
   so a one-way number across the two processes is real.
-- `latency-stamp.ts` — the 28-byte payload header (intended send, actual send,
-  sequence) both ends agree on.
+- `latency-stamp.ts` — the 36-byte payload header (intended send, actual send,
+  sequence, and the server's echo send instant) both ends agree on. Version-1
+  28-byte stamps still decode, with no echo instant.
 - `latency-histogram.ts` — log-linear histogram, bucketing identical to the Rust
   side so client and server percentiles are the same arithmetic.
 
@@ -128,6 +129,37 @@ that queued longest are in it, and the console line and the artifact come from
 that one snapshot.
 
 In CI: `bench-bandwidth` with `latency_probe=true`.
+
+### Interleaved H7 A/B
+
+The ladder above runs each arm as one long process, which gives one paired
+observation per rate and no dispersion at all. `latency-ab-conduct.ts` runs the
+same two arms as **86 short alternating processes in one dispatch** — 4 rungs
+(10k/15k/20k/25k aggregate) × 10 pairs × 2 arms, plus 3 floor pairs at 1,000/s —
+so the two arms of a comparison are ~64 s apart instead of half an hour apart and
+there are ten replicates to put an interval on.
+
+- `latency-ab-schedule.ts` — the dispatch order, as a pure tested function. It is
+  a registered rule: pairs are adjacent, and odd/even replicates alternate which
+  arm leads (ABBA) so residual drift cancels rather than favouring one arm.
+- `latency-ab-classify.ts` — medians with distribution-free order-statistic
+  intervals, the pinned floor rule, the generator-honesty precondition at 15k, and
+  the registered ingest-vs-egress cross-check.
+
+The cross-check is why the stamp grew a field. The server writes its own echo
+send instant into the payload, which splits the client's round trip into
+`ingest + turnaround + egress` — three legs that sum to it exactly, per datagram.
+The H7 batch wait lives in `ingest` and nowhere else, so the `batch0` arm
+subtracts it with the egress leg held fixed. That is the whole isolation, and it
+needs no second harness.
+
+Pre-registered in `docs/research/preregistrations/latency-ab.md`, which fixes the
+rungs, the replicate count, the order, the floor rule, the honesty conditions, the
+interval estimator and the four readings the cross-check is allowed to produce —
+all before the run.
+
+In CI: `bench-bandwidth` with `latency_ab=true`. Locally, `LATENCY_AB_LIMIT=n`
+runs the first *n* cells as a smoke; local numbers are never results.
 
 ## Production gates (10.2)
 
