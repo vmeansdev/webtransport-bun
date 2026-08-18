@@ -1,6 +1,7 @@
 //! Sans-IO WebTransport endpoint: quinn-proto QUIC + a minimal H3/WT session
 //! layer. JS owns UDP, timers, and event pumping; this type is pure protocol.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -266,6 +267,9 @@ pub struct WtEndpoint {
     event_reservations: VecDeque<Option<Reservation>>,
     client_config: Option<ClientConfig>,
     endpoint_tx: Vec<(Vec<u8>, SocketAddr)>,
+    /// Scratch for quinn's stateless responses (retry / version negotiation).
+    /// Reused across `recv` calls; cleared on entry, never read before use.
+    stateless_resp: Vec<u8>,
     governor: Governor,
     rate_limiter: PeerRateLimiter,
     handshake_reservations: HashMap<ConnectionHandle, Reservation>,
@@ -292,7 +296,7 @@ pub struct WtEndpoint {
     session_closed_count: u64,
     /// Local QPACK SETTINGS (advertised + decoder bound). Default disabled (0).
     qpack_settings: h3::QpackLocalSettings,
-    last_error: Option<String>,
+    last_error: Option<Cow<'static, str>>,
     /// Live TLS resolver when the server was built with rotatable certs.
     tls_resolver: Option<crate::server_tls::LiveServerCertResolver>,
 }
@@ -621,7 +625,7 @@ fn classify_connect_status(status: Option<u16>) -> ConnectStatusKind {
     }
 }
 
-fn headers_are_webtransport_connect(headers: &[(String, String)]) -> bool {
+fn headers_are_webtransport_connect(headers: &[h3::HeaderField]) -> bool {
     headers
         .iter()
         .any(|(k, v)| k == ":method" && v == "CONNECT")
@@ -644,6 +648,11 @@ const KEEP_ALIVE_INTERVAL_MS: u64 = 3_000;
 const MAX_H3_FRAME_SIZE: u64 = 1 << 20; // 1 MiB
 /// Bound non-application protocol parsing work per read batch.
 const PROTOCOL_READ_CHUNK: usize = 64 * 1024;
+/// Starting capacity for a read batch's scratch buffer. Sized to absorb the
+/// usual multi-chunk read without regrowing, while staying far below the read
+/// limits so a large budget cannot turn into a large speculative allocation.
+const PROTOCOL_READ_BUF_CAP: usize = 4 * 1024;
+const DATA_READ_BUF_CAP: usize = 16 * 1024;
 /// Prevent one busy connection from monopolizing a host pump.
 const MAX_READ_BATCHES_PER_PUMP: usize = 64;
 /// Prevent one capacity change from waking every blocked connection at once.
@@ -1218,6 +1227,7 @@ impl WtEndpoint {
             event_reservations: VecDeque::new(),
             client_config,
             endpoint_tx: Vec::new(),
+            stateless_resp: Vec::new(),
             governor,
             rate_limiter,
             handshake_reservations: HashMap::new(),
@@ -1297,12 +1307,12 @@ impl WtEndpoint {
         Ok(id)
     }
 
-    pub(crate) fn set_last_error(&mut self, error: impl Into<String>) {
+    pub(crate) fn set_last_error(&mut self, error: impl Into<Cow<'static, str>>) {
         self.last_error = Some(error.into());
     }
 
     pub fn take_last_error(&mut self) -> Option<String> {
-        self.last_error.take()
+        self.last_error.take().map(String::from)
     }
 
     /// Configure SETTINGS_WT_MAX_SESSIONS (per QUIC connection). Clamped to
@@ -1681,12 +1691,15 @@ impl WtEndpoint {
     /// Feed an inbound UDP datagram into the QUIC endpoint. `source` is the real
     /// remote address the datagram came from; quinn-proto routes by it.
     pub fn recv(&mut self, now: Instant, source: SocketAddr, data: &[u8]) {
-        let mut resp = Vec::new();
+        self.stateless_resp.clear();
         let buf = BytesMut::from(data);
         // Drive only the connection this packet belongs to — quinn names it —
         // rather than every connection on a multi-client endpoint.
         let mut affected: Option<ConnectionHandle> = None;
-        if let Some(ev) = self.inner.handle(now, source, None, None, buf, &mut resp) {
+        if let Some(ev) = self
+            .inner
+            .handle(now, source, None, None, buf, &mut self.stateless_resp)
+        {
             match ev {
                 DatagramEvent::NewConnection(incoming) => {
                     let mut accept_buf = Vec::new();
@@ -1755,7 +1768,11 @@ impl WtEndpoint {
                     }
                 }
                 DatagramEvent::Response(t) => {
-                    push_transmit_if_ready(&mut self.endpoint_tx, resp, Some(t.destination));
+                    push_transmit_if_ready(
+                        &mut self.endpoint_tx,
+                        self.stateless_resp.clone(),
+                        Some(t.destination),
+                    );
                 }
             }
         }
@@ -1772,9 +1789,9 @@ impl WtEndpoint {
         }
     }
 
-    fn try_push_event(&mut self, ev: WtEvent) -> Result<(), String> {
+    fn try_push_event(&mut self, ev: WtEvent) -> Result<(), Cow<'static, str>> {
         if self.events.len() >= MAX_PENDING_EVENTS {
-            return Err("E_QUEUE_FULL: event queue item cap reached".to_string());
+            return Err("E_QUEUE_FULL: event queue item cap reached".into());
         }
         let reservation = match &ev {
             WtEvent::Datagram { conn, data, .. } => self
@@ -2119,7 +2136,7 @@ impl WtEndpoint {
         if is_connect_self {
             let mut final_outcome = ReadOutcome::Open;
             for _ in 0..MAX_READ_BATCHES_PER_PUMP {
-                let mut data = Vec::new();
+                let mut data = Vec::with_capacity(PROTOCOL_READ_CHUNK.min(PROTOCOL_READ_BUF_CAP));
                 let outcome =
                     read_stream(self.conns.get_mut(&h), id, &mut data, PROTOCOL_READ_CHUNK);
                 let made_progress = !data.is_empty();
@@ -2150,7 +2167,7 @@ impl WtEndpoint {
         if is_pending {
             let mut final_outcome = ReadOutcome::Open;
             for _ in 0..MAX_READ_BATCHES_PER_PUMP {
-                let mut data = Vec::new();
+                let mut data = Vec::with_capacity(PROTOCOL_READ_CHUNK.min(PROTOCOL_READ_BUF_CAP));
                 let outcome =
                     read_stream(self.conns.get_mut(&h), id, &mut data, PROTOCOL_READ_CHUNK);
                 let made_progress = !data.is_empty();
@@ -2194,7 +2211,7 @@ impl WtEndpoint {
         if is_extra_self {
             let mut final_outcome = ReadOutcome::Open;
             for _ in 0..MAX_READ_BATCHES_PER_PUMP {
-                let mut data = Vec::new();
+                let mut data = Vec::with_capacity(PROTOCOL_READ_CHUNK.min(PROTOCOL_READ_BUF_CAP));
                 let outcome =
                     read_stream(self.conns.get_mut(&h), id, &mut data, PROTOCOL_READ_CHUNK);
                 let made_progress = !data.is_empty();
@@ -2244,7 +2261,7 @@ impl WtEndpoint {
                     return;
                 }
                 let read_limit = self.in_stream_read_limit(h, id);
-                let mut data = Vec::new();
+                let mut data = Vec::with_capacity(read_limit.min(DATA_READ_BUF_CAP));
                 let outcome = read_stream(self.conns.get_mut(&h), id, &mut data, read_limit);
                 let made_progress = !data.is_empty();
                 if should_backpressure_zero_progress_read(
@@ -2296,7 +2313,7 @@ impl WtEndpoint {
                     return;
                 }
                 let read_limit = self.governor.available_event_bytes(conn, Some(handle));
-                let mut data = Vec::new();
+                let mut data = Vec::with_capacity(read_limit.min(DATA_READ_BUF_CAP));
                 let outcome = read_stream(self.conns.get_mut(&h), id, &mut data, read_limit);
                 let made_progress = !data.is_empty();
                 if should_backpressure_zero_progress_read(
@@ -2686,7 +2703,7 @@ impl WtEndpoint {
                 opened: Option<(u32, u64, u32, bool)>,
             },
             RejectWt {
-                error: String,
+                error: Cow<'static, str>,
                 bidi: bool,
                 /// QUIC code for the RESET_STREAM / STOP_SENDING (§4.6 uses
                 /// WT_BUFFERED_STREAM_REJECTED for a WT stream we cannot take).
@@ -2698,8 +2715,15 @@ impl WtEndpoint {
             let Some(s) = self.sessions.get_mut(&h) else {
                 return;
             };
-            // Snapshot known WT session ids before borrowing `in_streams` mutably.
-            let known_session_ids: HashSet<u64> = s.live_connect_streams().map(u64::from).collect();
+            // Snapshot known WT session ids before borrowing `in_streams`
+            // mutably — only the once-per-stream read that still has to resolve
+            // the session-id varint consults them.
+            let known_session_ids: HashSet<u64> =
+                if s.in_streams.get(&id).is_some_and(|st| !st.sid_read) {
+                    s.live_connect_streams().map(u64::from).collect()
+                } else {
+                    HashSet::new()
+                };
             let unlatched_connects = count_unlatched_connect_streams(s);
             let active_wt = s.active_wt_count();
             let connect_cap = self.wt_max_sessions.max(1) as usize;
@@ -2741,7 +2765,7 @@ impl WtEndpoint {
                                 st.buf.clear();
                                 break 'route Route::RejectWt {
                                     error: "E_LIMIT_EXCEEDED: unlatched CONNECT admission cap"
-                                        .to_string(),
+                                        .into(),
                                     bidi: true,
                                     code: 0,
                                 };
@@ -2751,8 +2775,7 @@ impl WtEndpoint {
                         if st.buf.len() > MAX_H3_FRAME_SIZE as usize {
                             st.buf.clear();
                             break 'route Route::RejectWt {
-                                error: "E_LIMIT_EXCEEDED: CONNECT request buffer exceeded"
-                                    .to_string(),
+                                error: "E_LIMIT_EXCEEDED: CONNECT request buffer exceeded".into(),
                                 bidi: true,
                                 code: 0,
                             };
@@ -2778,7 +2801,7 @@ impl WtEndpoint {
                                     st.buf.clear();
                                     break 'route Route::RejectWt {
                                         error: "E_SESSION_CLOSED: unknown WebTransport session id"
-                                            .to_string(),
+                                            .into(),
                                         bidi: st.is_bidi,
                                         code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                     };
@@ -2798,7 +2821,7 @@ impl WtEndpoint {
                                     st.buf.clear();
                                     break 'route Route::RejectWt {
                                         error: "E_LIMIT_EXCEEDED: stream handle space exhausted"
-                                            .to_string(),
+                                            .into(),
                                         bidi: st.is_bidi,
                                         code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                     };
@@ -2820,7 +2843,7 @@ impl WtEndpoint {
                                     ) {
                                         st.buf.clear();
                                         break 'route Route::RejectWt {
-                                            error: err,
+                                            error: err.into(),
                                             bidi: st.is_bidi,
                                             code: crate::wt_error::WT_BUFFERED_STREAM_REJECTED,
                                         };
@@ -3711,7 +3734,7 @@ impl WtEndpoint {
         let configured = self.governor.limits().max_datagram_size;
         let &h = self.id_to_handle.get(&conn_id)?;
         let _ = self.sessions.get(&h)?.resolve_wt_session(session_id)?;
-        let context_len = h3::wrap_datagram(session_id, &[]).len();
+        let context_len = h3::datagram_prefix_len(session_id);
         let transport = self.conns.get_mut(&h)?.datagrams().max_size()?;
         Some(configured.min(transport.saturating_sub(context_len)))
     }
@@ -4256,10 +4279,15 @@ fn parse_sni_entries(
 /// and the connection-close flush so their behavior can't diverge.
 fn drain_conn_transmits(conn: &mut Connection, now: Instant, out: &mut Vec<(Vec<u8>, SocketAddr)>) {
     let mtu = conn.current_mtu() as usize;
+    // One scratch buffer for the whole drain. quinn-proto writes each packet
+    // from offset 0, so it must be empty at every poll_transmit call.
+    let mut scratch = Vec::with_capacity(mtu);
     loop {
-        let mut buf = Vec::with_capacity(mtu);
-        match conn.poll_transmit(now, 1, &mut buf) {
-            Some(t) => out.push((buf, t.destination)),
+        scratch.clear();
+        match conn.poll_transmit(now, 1, &mut scratch) {
+            // Sized to the packet rather than the MTU: most transmits (ACKs,
+            // probes) are a fraction of it.
+            Some(t) => out.push((scratch.as_slice().to_vec(), t.destination)),
             None => break,
         }
     }

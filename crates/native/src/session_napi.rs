@@ -19,7 +19,7 @@ use crate::RUNTIME;
 
 #[napi]
 pub struct SessionHandle {
-    id: String,
+    id: std::sync::Arc<str>,
     peer_ip: String,
     peer_port: u32,
 }
@@ -29,7 +29,7 @@ impl SessionHandle {
     #[napi(constructor)]
     pub fn new(id: String, peer_ip: String, peer_port: u32) -> Self {
         Self {
-            id,
+            id: id.into(),
             peer_ip,
             peer_port,
         }
@@ -37,7 +37,7 @@ impl SessionHandle {
 
     #[napi(getter)]
     pub fn id(&self) -> String {
-        self.id.clone()
+        self.id.to_string()
     }
 
     #[napi(getter)]

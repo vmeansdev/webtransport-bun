@@ -185,7 +185,7 @@ const TRANSPORT_DATAGRAM_BACKING_ESTIMATE: usize = 1500;
 /// At half the assumed backing size the unaccounted transport overhead is at
 /// most 2x the reserved byte budget, which keeps `maxQueuedBytes*` meaningful
 /// while leaving the high-throughput echo path (near-MTU datagrams) zero-copy.
-const TRANSPORT_ZERO_COPY_MIN_PAYLOAD: usize = TRANSPORT_DATAGRAM_BACKING_ESTIMATE / 2;
+pub(crate) const TRANSPORT_ZERO_COPY_MIN_PAYLOAD: usize = TRANSPORT_DATAGRAM_BACKING_ESTIMATE / 2;
 
 /// Whether a queued payload of this size may keep the transport buffer alive.
 fn retains_transport_buffer(payload_len: usize) -> bool {
@@ -233,11 +233,13 @@ impl DatagramSlot {
     }
 
     /// Move the payload out. The reservation is still released when the slot is
-    /// dropped at the end of the caller's scope.
-    pub fn take(mut self) -> Vec<u8> {
+    /// dropped at the end of the caller's scope. A transport-retained payload
+    /// leaves as the refcounted slice it arrived as; the napi arraybuffer copy
+    /// downstream is the only copy it ever pays.
+    pub fn take(mut self) -> bytes::Bytes {
         match std::mem::replace(&mut self.data, DatagramPayload::Owned(Vec::new())) {
-            DatagramPayload::Owned(data) => data,
-            DatagramPayload::Transport(data) => data.payload().to_vec(),
+            DatagramPayload::Owned(data) => bytes::Bytes::from(data),
+            DatagramPayload::Transport(data) => data.payload(),
         }
     }
 

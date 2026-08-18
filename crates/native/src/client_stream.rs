@@ -5,7 +5,9 @@
 //! - Read bridge: sends Vec<u8> to a bounded mpsc channel; selects on a stop_sending oneshot.
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
-use crate::error::{from_reason as wt_from_reason, WtResult};
+use crate::error::{
+    from_reason as wt_from_reason, from_static_code as wt_from_static_code, WtResult,
+};
 use napi::Result;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
@@ -231,14 +233,7 @@ pub(crate) async fn discard_recv_stream_zero_copy(
             Ok(Some(_)) => {}
             Ok(None) => return Ok(()),
             Err(error) => {
-                return Err(match error {
-                    wtransport::quinn::ReadError::Reset(_) => "E_STREAM_RESET",
-                    wtransport::quinn::ReadError::ConnectionLost(_)
-                    | wtransport::quinn::ReadError::ClosedStream
-                    | wtransport::quinn::ReadError::IllegalOrderedRead
-                    | wtransport::quinn::ReadError::ZeroRttRejected => "E_SESSION_CLOSED",
-                }
-                .to_string());
+                return Err(quic_read_error_code(&error).to_string());
             }
         }
     }
@@ -400,15 +395,31 @@ impl StreamBudget {
 /// chunks release their own bytes). This makes the reservation impossible to
 /// leak on any teardown path.
 pub struct StreamChunk {
-    data: Vec<u8>,
+    data: StreamData,
     budget: Option<StreamBudget>,
     reserved: u64,
+}
+
+enum StreamData {
+    Owned(Vec<u8>),
+    Shared(bytes::Bytes),
 }
 
 impl StreamChunk {
     pub fn new(data: Vec<u8>, budget: Option<StreamBudget>, reserved: u64) -> Self {
         Self {
-            data,
+            data: StreamData::Owned(data),
+            budget,
+            reserved,
+        }
+    }
+
+    /// A chunk over the transport's refcounted buffer. Only the synchronous
+    /// deferred-read path uses this: the chunk is taken immediately, so the
+    /// parent recv buffer is never pinned in a queue.
+    pub fn new_shared(data: bytes::Bytes, budget: Option<StreamBudget>, reserved: u64) -> Self {
+        Self {
+            data: StreamData::Shared(data),
             budget,
             reserved,
         }
@@ -417,13 +428,27 @@ impl StreamChunk {
     /// Move the payload out. The reservation is still released when the chunk is
     /// dropped at the end of the caller's scope.
     pub fn take(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.data)
+        match std::mem::replace(&mut self.data, StreamData::Owned(Vec::new())) {
+            StreamData::Owned(v) => v,
+            StreamData::Shared(b) => b.to_vec(),
+        }
+    }
+
+    /// Move the payload out refcounted, copy-free from either arm.
+    pub fn take_bytes(mut self) -> bytes::Bytes {
+        match std::mem::replace(&mut self.data, StreamData::Owned(Vec::new())) {
+            StreamData::Owned(v) => bytes::Bytes::from(v),
+            StreamData::Shared(b) => b,
+        }
     }
 
     /// Borrow the payload while keeping the reservation held (write bridge: the
     /// budget stays reserved until the write completes and the chunk drops).
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        match &self.data {
+            StreamData::Owned(v) => v,
+            StreamData::Shared(b) => b,
+        }
     }
 }
 
@@ -442,9 +467,9 @@ impl Drop for StreamChunk {
 // ---------------------------------------------------------------------------
 
 /// Shared slot for write failure error code (E_STOP_SENDING, E_STREAM_RESET).
-type WriteErrorSlot = Arc<Mutex<Option<String>>>;
+type WriteErrorSlot = Arc<Mutex<Option<&'static str>>>;
 /// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
-type ReadErrorSlot = Arc<Mutex<Option<String>>>;
+type ReadErrorSlot = Arc<Mutex<Option<&'static str>>>;
 type BidiBridgeParts = (
     mpsc::Receiver<StreamChunk>,
     mpsc::Sender<StreamCmd>,
@@ -457,6 +482,18 @@ type ReadBridgeParts = (
     oneshot::Sender<u32>,
     Option<ReadErrorSlot>,
 );
+
+/// The wire code for quinn's chunk-level read errors, matching the mapping the
+/// coalescing `read()` path reports for the same conditions.
+fn quic_read_error_code(err: &wtransport::quinn::ReadError) -> &'static str {
+    match err {
+        wtransport::quinn::ReadError::Reset(_) => "E_STREAM_RESET",
+        wtransport::quinn::ReadError::ConnectionLost(_)
+        | wtransport::quinn::ReadError::ClosedStream
+        | wtransport::quinn::ReadError::IllegalOrderedRead
+        | wtransport::quinn::ReadError::ZeroRttRejected => "E_SESSION_CLOSED",
+    }
+}
 
 fn read_error_code(err: &StreamReadError) -> &'static str {
     match err {
@@ -762,10 +799,13 @@ impl ClientBidiStreamHandle {
 
         let notified = self.read_abort.notified();
         tokio::pin!(notified);
-        let mut buf = [0u8; STREAM_READ_BUFFER_BYTES];
+        // read_chunk hands out the transport's refcounted bytes: no 4 KiB
+        // stack scratch inflating the boxed future, no copy-out. One quinn
+        // assembler chunk per call (the coalescing read() could merge several),
+        // so chunk sizes JS observes may be smaller, never larger.
         let _probe_direct = await_probe::enter(&await_probe::DIRECT_QUINN_READ);
         let result = tokio::select! {
-            value = recv_stream.read(&mut buf) => value,
+            value = recv_stream.quic_stream_mut().read_chunk(STREAM_READ_BUFFER_BYTES, true) => value,
             _ = &mut notified => {
                 recv_stream.stop(0);
                 drop(guard);
@@ -776,13 +816,14 @@ impl ClientBidiStreamHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
-                return Err(wt_from_reason(read_error_code(&error)));
+                return Err(wt_from_static_code(quic_read_error_code(&error)));
             }
         };
-        let Some(n) = read_result else {
+        let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
             drop(guard);
             return Ok(Some(None));
         };
+        let n = chunk_bytes.len();
         let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         if let Some(ref b) = budget {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
@@ -807,8 +848,8 @@ impl ClientBidiStreamHandle {
             drop(guard);
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
-        let chunk = StreamChunk::new(buf[..n].to_vec(), budget, n as u64);
-        let value = chunk.take().into();
+        let chunk = StreamChunk::new_shared(chunk_bytes, budget, n as u64);
+        let value = chunk.take_bytes().into();
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -868,7 +909,7 @@ impl ClientBidiStreamHandle {
             if payload.as_ref().starts_with(b"probe:bidi-reset:") {
                 self.reset(42)?;
             } else if payload.as_ref().starts_with(b"probe:bidi-echo:") {
-                self.write_inner(payload.into_vec().into()).await?;
+                self.write_bytes(payload.into_vec()).await?;
                 self.finish_wait_inner().await?;
             } else {
                 self.reset(0)?;
@@ -1037,8 +1078,8 @@ impl ClientBidiStreamHandle {
                     .and_then(|guard| guard.clone());
                 if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
-                        if let Some(ref code) = *guard {
-                            return Err(wt_from_reason(code.clone()));
+                        if let Some(code) = *guard {
+                            return Err(wt_from_static_code(code));
                         }
                     }
                 }
@@ -1072,8 +1113,8 @@ impl ClientBidiStreamHandle {
         if let Ok(slot) = self.write_error_slot.lock() {
             if let Some(slot) = slot.as_ref() {
                 if let Ok(guard) = slot.lock() {
-                    if let Some(ref code) = *guard {
-                        return Err(wt_from_reason(code.clone()));
+                    if let Some(code) = *guard {
+                        return Err(wt_from_static_code(code));
                     }
                 }
             }
@@ -1295,8 +1336,8 @@ impl ClientUniSendHandle {
         }
         if let Some(ref slot) = self.write_error_slot {
             if let Ok(guard) = slot.lock() {
-                if let Some(ref code) = *guard {
-                    return Err(napi::Error::from_reason(code.clone()));
+                if let Some(code) = *guard {
+                    return Err(napi::Error::from_reason(code));
                 }
             }
         }
@@ -1521,10 +1562,13 @@ impl ClientUniRecvHandle {
 
         let notified = self.read_abort.notified();
         tokio::pin!(notified);
-        let mut buf = [0u8; STREAM_READ_BUFFER_BYTES];
+        // read_chunk hands out the transport's refcounted bytes: no 4 KiB
+        // stack scratch inflating the boxed future, no copy-out. One quinn
+        // assembler chunk per call (the coalescing read() could merge several),
+        // so chunk sizes JS observes may be smaller, never larger.
         let _probe_direct = await_probe::enter(&await_probe::DIRECT_QUINN_READ);
         let result = tokio::select! {
-            value = recv_stream.read(&mut buf) => value,
+            value = recv_stream.quic_stream_mut().read_chunk(STREAM_READ_BUFFER_BYTES, true) => value,
             _ = &mut notified => {
                 recv_stream.stop(0);
                 drop(guard);
@@ -1535,13 +1579,14 @@ impl ClientUniRecvHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
-                return Err(wt_from_reason(read_error_code(&error)));
+                return Err(wt_from_static_code(quic_read_error_code(&error)));
             }
         };
-        let Some(n) = read_result else {
+        let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
             drop(guard);
             return Ok(Some(None));
         };
+        let n = chunk_bytes.len();
         let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         if let Some(ref b) = budget {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
@@ -1566,8 +1611,8 @@ impl ClientUniRecvHandle {
             drop(guard);
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
-        let chunk = StreamChunk::new(buf[..n].to_vec(), budget, n as u64);
-        let value = chunk.take().into();
+        let chunk = StreamChunk::new_shared(chunk_bytes, budget, n as u64);
+        let value = chunk.take_bytes().into();
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -1734,8 +1779,8 @@ impl ClientUniRecvHandle {
                     .and_then(|guard| guard.clone());
                 if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
-                        if let Some(ref code) = *guard {
-                            return Err(napi::Error::from_reason(code.clone()));
+                        if let Some(code) = *guard {
+                            return Err(napi::Error::from_reason(code));
                         }
                     }
                 }
@@ -1820,7 +1865,7 @@ fn spawn_bidi_write_bridge_on(
                         };
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         break;
@@ -1830,7 +1875,7 @@ fn spawn_bidi_write_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                     }
@@ -1841,7 +1886,7 @@ fn spawn_bidi_write_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         ret = Err(code.to_string());
@@ -1929,7 +1974,7 @@ fn spawn_recv_bridge_on_with_permit(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET".to_string());
+                                            *g = Some("E_STREAM_RESET");
                                         }
                                     }
                                     break;
@@ -1944,7 +1989,7 @@ fn spawn_recv_bridge_on_with_permit(
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
                                                 *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                    "E_BACKPRESSURE_TIMEOUT",
                                                 );
                                             }
                                         }
@@ -1982,7 +2027,7 @@ fn spawn_recv_bridge_on_with_permit(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e).to_string());
+                                    *guard = Some(read_error_code(&e));
                                 }
                             }
                             break;
@@ -2037,7 +2082,7 @@ pub fn spawn_bidi_bridge_on(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET".to_string());
+                                            *g = Some("E_STREAM_RESET");
                                         }
                                     }
                                     break;
@@ -2056,7 +2101,7 @@ pub fn spawn_bidi_bridge_on(
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
                                                 *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                    "E_BACKPRESSURE_TIMEOUT",
                                                 );
                                             }
                                         }
@@ -2094,7 +2139,7 @@ pub fn spawn_bidi_bridge_on(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e).to_string());
+                                    *guard = Some(read_error_code(&e));
                                 }
                             }
                             break;
@@ -2130,7 +2175,7 @@ pub fn spawn_bidi_bridge_on(
                             };
                             if let Ok(mut guard) = write_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(code.to_string());
+                                    *guard = Some(code);
                                 }
                             }
                             break;
@@ -2141,7 +2186,7 @@ pub fn spawn_bidi_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                     }
@@ -2152,7 +2197,7 @@ pub fn spawn_bidi_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         ret = Err(code.to_string());
@@ -2215,7 +2260,7 @@ pub fn spawn_uni_send_bridge_on(
                             };
                             if let Ok(mut guard) = write_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(code.to_string());
+                                    *guard = Some(code);
                                 }
                             }
                             break;
@@ -2226,7 +2271,7 @@ pub fn spawn_uni_send_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                     }
@@ -2237,7 +2282,7 @@ pub fn spawn_uni_send_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         ret = Err(code.to_string());
@@ -2318,7 +2363,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET".to_string());
+                                            *g = Some("E_STREAM_RESET");
                                         }
                                     }
                                     break;
@@ -2339,7 +2384,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
                                                 *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                    "E_BACKPRESSURE_TIMEOUT",
                                                 );
                                             }
                                         }
@@ -2376,7 +2421,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e).to_string());
+                                    *guard = Some(read_error_code(&e));
                                 }
                             }
                             break;

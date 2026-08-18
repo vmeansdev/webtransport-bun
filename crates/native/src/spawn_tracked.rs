@@ -384,7 +384,7 @@ mod tests {
             Arc::clone(&metrics),
             94,
             TaskKind::Session,
-            PanicScope::Session("missing-session".to_string()),
+            PanicScope::Session("missing-session".into()),
             panic_task(),
         );
         spawn_tracked(

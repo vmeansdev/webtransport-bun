@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -736,10 +737,10 @@ impl Governor {
         self.inner.borrow().limits.clone()
     }
 
-    pub fn reserve_handshake(&self) -> Result<Reservation, String> {
+    pub fn reserve_handshake(&self) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         if inner.handshakes_in_flight >= inner.limits.max_handshakes_in_flight {
-            return Err("E_LIMIT_EXCEEDED: maxHandshakesInFlight reached".to_string());
+            return Err("E_LIMIT_EXCEEDED: maxHandshakesInFlight reached".into());
         }
         inner.handshakes_in_flight += 1;
         Ok(Reservation::new(
@@ -748,10 +749,10 @@ impl Governor {
         ))
     }
 
-    pub fn reserve_session(&self, conn: u32) -> Result<Reservation, String> {
+    pub fn reserve_session(&self, conn: u32) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         if inner.sessions_active >= inner.limits.max_sessions {
-            return Err("E_LIMIT_EXCEEDED: maxSessions reached".to_string());
+            return Err("E_LIMIT_EXCEEDED: maxSessions reached".into());
         }
         inner.sessions_active += 1;
         Ok(Reservation::new(
@@ -765,10 +766,10 @@ impl Governor {
         conn: u32,
         _stream: u32,
         kind: StreamKind,
-    ) -> Result<Reservation, String> {
+    ) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         if inner.streams_active_global >= inner.limits.max_streams_global {
-            return Err("E_LIMIT_EXCEEDED: maxStreamsGlobal reached".to_string());
+            return Err("E_LIMIT_EXCEEDED: maxStreamsGlobal reached".into());
         }
         let per_session_limit = match kind {
             StreamKind::Bidi => inner.limits.max_streams_per_session_bidi,
@@ -784,7 +785,7 @@ impl Governor {
                 StreamKind::Bidi => "maxStreamsPerSessionBidi",
                 StreamKind::Uni => "maxStreamsPerSessionUni",
             };
-            return Err(format!("E_LIMIT_EXCEEDED: {name} reached"));
+            return Err(format!("E_LIMIT_EXCEEDED: {name} reached").into());
         }
         map.insert(conn, per_session + 1);
         inner.streams_active_global += 1;
@@ -799,25 +800,25 @@ impl Governor {
         conn: u32,
         stream: Option<u32>,
         bytes: usize,
-    ) -> Result<Reservation, String> {
+    ) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         let next_global = inner
             .queued_bytes_global
             .checked_add(bytes)
-            .ok_or_else(|| "E_QUEUE_FULL: queued byte counter overflow".to_string())?;
+            .ok_or(Cow::Borrowed("E_QUEUE_FULL: queued byte counter overflow"))?;
         if next_global > inner.limits.max_queued_bytes_global {
-            return Err("E_QUEUE_FULL: maxQueuedBytesGlobal reached".to_string());
+            return Err("E_QUEUE_FULL: maxQueuedBytesGlobal reached".into());
         }
         let session_current = inner
             .queued_bytes_per_session
             .get(&conn)
             .copied()
             .unwrap_or(0);
-        let next_session = session_current
-            .checked_add(bytes)
-            .ok_or_else(|| "E_QUEUE_FULL: session queued byte counter overflow".to_string())?;
+        let next_session = session_current.checked_add(bytes).ok_or(Cow::Borrowed(
+            "E_QUEUE_FULL: session queued byte counter overflow",
+        ))?;
         if next_session > inner.limits.max_queued_bytes_per_session {
-            return Err("E_QUEUE_FULL: maxQueuedBytesPerSession reached".to_string());
+            return Err("E_QUEUE_FULL: maxQueuedBytesPerSession reached".into());
         }
         if let Some(stream_id) = stream {
             let key = (conn, stream_id);
@@ -826,11 +827,11 @@ impl Governor {
                 .get(&key)
                 .copied()
                 .unwrap_or(0);
-            let next_stream = stream_current
-                .checked_add(bytes)
-                .ok_or_else(|| "E_QUEUE_FULL: stream queued byte counter overflow".to_string())?;
+            let next_stream = stream_current.checked_add(bytes).ok_or(Cow::Borrowed(
+                "E_QUEUE_FULL: stream queued byte counter overflow",
+            ))?;
             if next_stream > inner.limits.max_queued_bytes_per_stream {
-                return Err("E_QUEUE_FULL: maxQueuedBytesPerStream reached".to_string());
+                return Err("E_QUEUE_FULL: maxQueuedBytesPerStream reached".into());
             }
             inner.queued_bytes_per_stream.insert(key, next_stream);
         }

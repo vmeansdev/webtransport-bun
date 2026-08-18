@@ -242,7 +242,7 @@ async fn read_datagram_batch_from_state(
     lifecycle_closed: &std::sync::atomic::AtomicBool,
     lifecycle_notify: &Notify,
     max: u32,
-) -> Option<Vec<Vec<u8>>> {
+) -> Option<Vec<bytes::Bytes>> {
     let cap = clamp_batch_max(max);
     let mut rx = dgram_rx.lock().await;
     let first = recv_datagram_slot(&mut rx, lifecycle_closed, lifecycle_notify).await?;
@@ -261,7 +261,7 @@ async fn read_datagram_batch_from_state(
 pub(crate) async fn read_datagram_batch_for_session(
     id: &str,
     max: u32,
-) -> Result<Option<Vec<Vec<u8>>>> {
+) -> Result<Option<Vec<bytes::Bytes>>> {
     let Some((dgram_rx, lifecycle_closed, lifecycle_notify)) =
         session_registry::get_datagram_read_state(id)
     else {
@@ -270,7 +270,7 @@ pub(crate) async fn read_datagram_batch_for_session(
     Ok(read_datagram_batch_from_state(&dgram_rx, &lifecycle_closed, &lifecycle_notify, max).await)
 }
 
-pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) async fn read_datagram_for_session(id: &str) -> Result<Option<bytes::Bytes>> {
     Ok(read_datagram_batch_for_session(id, 1)
         .await?
         .and_then(|batch| batch.into_iter().next()))
@@ -741,7 +741,7 @@ pub(crate) async fn handle_uni_probe_for_session(id: &str) -> Result<u32> {
 }
 
 pub(crate) async fn wait_session_stream_capacity(
-    id: String,
+    id: std::sync::Arc<str>,
     timeout_ms: u32,
     kind: &'static str,
 ) -> Result<()> {
@@ -1592,10 +1592,10 @@ mod tests {
             .unwrap_err();
         assert!(queue_err.reason.contains("E_QUEUE_FULL"));
 
-        wait_session_stream_capacity(id.clone(), 200, "bidi")
+        wait_session_stream_capacity(id.clone().into(), 200, "bidi")
             .await
             .expect("bidi capacity");
-        wait_session_stream_capacity(id.clone(), 200, "uni")
+        wait_session_stream_capacity(id.clone().into(), 200, "uni")
             .await
             .expect("uni capacity");
 
@@ -1703,7 +1703,7 @@ mod tests {
             .await
             .expect("read")
             .expect("payload");
-        assert_eq!(got, b"queued");
+        assert_eq!(got.as_ref(), b"queued");
 
         let discard_slot = session_registry::DatagramSlot::new(
             b"discard".to_vec(),
@@ -1875,7 +1875,7 @@ mod tests {
             );
         }
 
-        async fn read(&self, max: u32) -> Option<Vec<Vec<u8>>> {
+        async fn read(&self, max: u32) -> Option<Vec<bytes::Bytes>> {
             read_datagram_batch_from_state(&self.rx, &self.closed, &self.lifecycle_notify, max)
                 .await
         }
