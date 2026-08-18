@@ -70,11 +70,22 @@ pub(crate) struct PreparedBatch {
 /// no ordinary caller ever reaches this; a raw-addon caller gets the honest
 /// `{sent: <=256, code: "E_BATCH_TOO_LARGE"}` and can re-call with the rest.
 pub(crate) fn prepare_batch(data: &[Uint8Array]) -> PreparedBatch {
+    let (take, truncated) = split_at_cap(data.len());
+    PreparedBatch {
+        items: data[..take].iter().map(|item| item.to_vec()).collect(),
+        truncated,
+    }
+}
+
+/// How much of a caller's array one native call may carry, and what to report
+/// about the rest.
+fn split_at_cap(len: usize) -> (usize, Option<String>) {
     let cap = DATAGRAM_BATCH_MAX as usize;
-    let take = data.len().min(cap);
-    let items = data[..take].iter().map(|item| item.to_vec()).collect();
-    let truncated = (data.len() > cap).then(|| "E_BATCH_TOO_LARGE".to_string());
-    PreparedBatch { items, truncated }
+    if len > cap {
+        (cap, Some("E_BATCH_TOO_LARGE".to_string()))
+    } else {
+        (len, None)
+    }
 }
 
 /// Send a prepared batch element by element, stopping at the first failure.
@@ -111,6 +122,27 @@ mod tests {
         let prepared = prepare_batch(&[]);
         assert!(prepared.items.is_empty());
         assert!(prepared.truncated.is_none());
+    }
+
+    #[test]
+    fn input_at_or_under_the_cap_is_carried_whole() {
+        assert_eq!(split_at_cap(0), (0, None));
+        assert_eq!(split_at_cap(1), (1, None));
+        let cap = DATAGRAM_BATCH_MAX as usize;
+        assert_eq!(split_at_cap(cap), (cap, None));
+    }
+
+    #[test]
+    fn input_over_the_cap_is_truncated_and_says_so_rather_than_dropping_silently() {
+        let cap = DATAGRAM_BATCH_MAX as usize;
+        assert_eq!(
+            split_at_cap(cap + 1),
+            (cap, Some("E_BATCH_TOO_LARGE".to_string()))
+        );
+        assert_eq!(
+            split_at_cap(10_000),
+            (cap, Some("E_BATCH_TOO_LARGE".to_string()))
+        );
     }
 
     #[tokio::test]
