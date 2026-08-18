@@ -1565,6 +1565,159 @@ mod tests {
         session_registry::remove(&id);
     }
 
+    /// The two properties that make a batched send safe rather than merely
+    /// fast: one deadline for the whole call, and a reservation per element.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_datagram_batch_shares_one_deadline_and_reserves_per_element() {
+        use crate::datagram_batch::PreparedBatch;
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 40).await;
+        let server_id = u64::MAX - 40;
+        let id = session.id.clone();
+        let metrics = Arc::clone(&session.metrics);
+
+        // A per-session budget an order of magnitude smaller than the batch's
+        // total bytes still drains completely, because each element reserves,
+        // sends and releases on its own. A `sum(len)` reservation here would
+        // wait on a release that can never come — the park-forever class.
+        let tight_id = format!("{id}-tight-budget");
+        let tight = Limits {
+            max_queued_bytes_per_session: 512,
+            backpressure_timeout_ms: 2_000,
+            ..Default::default()
+        };
+        let (.., tight_sm, _) = session_registry::insert(
+            tight_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            tight,
+            false,
+        );
+        let started = std::time::Instant::now();
+        let result = send_datagram_batch_for_session(
+            &tight_id,
+            PreparedBatch {
+                items: vec![vec![7u8; 100]; 256],
+                truncated: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            (result.sent, result.code.as_deref()),
+            (256, None),
+            "256 × 100 B drains through a 512 B session budget one element at a time"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "the batch must not have spent its backpressure deadline waiting"
+        );
+        assert_eq!(
+            tight_sm.datagrams_out.load(Ordering::Relaxed),
+            256,
+            "every element is counted exactly once"
+        );
+        assert_eq!(
+            tight_sm.queued_bytes.load(Ordering::Relaxed),
+            0,
+            "every element released its own reservation"
+        );
+
+        // A budget no element can ever fit makes every reservation time out.
+        // The whole call must cost one `backpressure_timeout_ms`, not one per
+        // element, and it reports the index it stopped at.
+        let starved_id = format!("{id}-starved");
+        let starved = Limits {
+            max_queued_bytes_per_session: 1,
+            backpressure_timeout_ms: 150,
+            ..Default::default()
+        };
+        session_registry::insert(
+            starved_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            starved,
+            false,
+        );
+        let started = std::time::Instant::now();
+        let result = send_datagram_batch_for_session(
+            &starved_id,
+            PreparedBatch {
+                items: vec![vec![7u8; 100]; 32],
+                truncated: None,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            (result.sent, result.code.as_deref()),
+            (0, Some("E_BACKPRESSURE_TIMEOUT")),
+            "element 0 could never be reserved, so nothing after it was attempted"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "32 elements shared one 150 ms deadline; per-element deadlines would \
+             have cost ~4.8 s, and this took {elapsed:?}"
+        );
+
+        // Oversize stops the batch at its own index, under today's code string.
+        let sized_id = format!("{id}-sized");
+        let sized = Limits {
+            max_datagram_size: 64,
+            ..Default::default()
+        };
+        session_registry::insert(
+            sized_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            sized,
+            false,
+        );
+        let result = send_datagram_batch_for_session(
+            &sized_id,
+            PreparedBatch {
+                items: vec![vec![1u8; 8], vec![2u8; 8], vec![3u8; 4096], vec![4u8; 8]],
+                truncated: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            (result.sent, result.code.as_deref()),
+            (2, Some("E_QUEUE_FULL")),
+            "the oversize element is at index 2 == sent, and index 3 was not attempted"
+        );
+        let single = send_datagram_for_session(&sized_id, &vec![3u8; 4096])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            single.reason.as_str(),
+            result.code.as_deref().expect("batch code"),
+            "the batch may not invent a code the single-datagram path does not use"
+        );
+
+        // A missing session is an envelope, never a rejection.
+        let gone = send_datagram_batch_for_session(
+            "missing-batch",
+            PreparedBatch {
+                items: vec![vec![1u8; 8]],
+                truncated: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            (gone.sent, gone.code.as_deref()),
+            (0, Some("E_SESSION_CLOSED"))
+        );
+
+        session_registry::remove(&tight_id);
+        session_registry::remove(&starved_id);
+        session_registry::remove(&sized_id);
+        session_registry::remove(&id);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loopback_covers_datagram_stream_and_stats_paths() {
         use crate::client::insecure_loopback_client_config;
