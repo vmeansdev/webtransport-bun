@@ -697,3 +697,22 @@ they were the same measurement; and it may not quote a local macOS smoke number
 as a result — the local smoke exists only to prove the harness runs, and to
 prove that both falsifiers fire when the condition they exist to catch is
 introduced deliberately.
+
+#### Amendment 8, two mechanical forms recorded before the first run
+
+Both are transcriptions of rules amendment 8 already states in prose, written
+down here so the classifier is not choosing between readings. Neither moves a
+threshold, and the dispatch log above is still empty.
+
+1. **"the pre-check did not itself trip `generator-saturation`"** is evaluated
+   with the two conditions a single arm can support: `sendEventsSkipped ≥ 0.10 ×
+   sendEventsScheduled`, or `sent < 0.90 × scheduledDatagrams`. The registered
+   third condition — origination-lag p99 against the *within-profile floor* —
+   needs a ladder of steps to establish a floor from, and the pre-check is one
+   arm.
+2. **A fragment set containing no ladder step reports the run-level headroom
+   rule as `headroom-not-evaluated`**, not as `generator-headroom`. The rule's
+   denominator is the ladder's offered load and its ceiling is the JS
+   scheduler's; a fan-out-only artifact has neither. The run still claims
+   nothing — `complete` stays false — it just names the reason accurately
+   instead of reporting a STOP that never ran.
