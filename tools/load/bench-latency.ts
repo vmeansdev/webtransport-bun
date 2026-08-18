@@ -34,7 +34,7 @@ import {
 	LatencyHistogram,
 	type LatencyHistogramJson,
 } from "./latency-histogram.ts";
-import { decodeStamp, STAMP_BYTES } from "./latency-stamp.ts";
+import { decodeStamp, STAMP_BYTES, writeEchoActual } from "./latency-stamp.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
@@ -58,6 +58,21 @@ const RATES = (process.env.LATENCY_RATES ?? "100,250,500,750,900,1100")
 	.filter((v) => Number.isFinite(v) && v > 0);
 const OUT_JSON =
 	process.env.LATENCY_OUT ?? join(ROOT, `tools/load/bench-latency-${ARM}.json`);
+/**
+ * Cell identity in an interleaved dispatch: which rung, which replicate, and
+ * where in the dispatch's fixed order this process ran. The conductor sets them;
+ * a ladder run leaves them null and the classifier treats the fragment as a
+ * ladder fragment. See `docs/research/preregistrations/latency-ab.md`.
+ */
+const RUNG = process.env.LATENCY_RUNG ?? null;
+const REPLICATE = process.env.LATENCY_REPLICATE
+	? parseInt(process.env.LATENCY_REPLICATE, 10)
+	: null;
+const CELL_INDEX = process.env.LATENCY_CELL_INDEX
+	? parseInt(process.env.LATENCY_CELL_INDEX, 10)
+	: null;
+/** The conductor builds `load-client` once for the whole dispatch. */
+const SKIP_BUILD = process.env.LATENCY_SKIP_BUILD === "1";
 
 const HAS_PROC = process.platform === "linux";
 
@@ -90,6 +105,12 @@ export type ClientLatencyJson = {
 	scheduleLag: LatencyHistogramJson;
 	/** First-to-last duration of one send event; zero in the uniform arm. */
 	burstSpread: LatencyHistogramJson;
+	/** Server echo send instant → this client's receive. The egress leg. */
+	egressOneWay: LatencyHistogramJson;
+	/** This client's send → the server's echo send: the server's first two legs. */
+	upstreamPlusTurnaround: LatencyHistogramJson;
+	/** Echoes that came back stamped but with no echo instant to measure from. */
+	echoMissingEchoInstant: number;
 	echoUnstamped: number;
 	ticksSkipped: number;
 	sendEvents: number;
@@ -122,6 +143,8 @@ export type LatencyStep = {
 	serverUnstamped: number;
 	echoSent: number;
 	echoErr: number;
+	/** Echoes whose payload could not carry the echo instant — no egress sample. */
+	echoStampFailures: number;
 	/** Drain grace held open after the client exited, before the snapshot. */
 	drainMs: number;
 	/** Datagrams that landed during that grace — this step's longest queued. */
@@ -129,6 +152,8 @@ export type LatencyStep = {
 	upDeliveryRatio: number | null;
 	/** Server-side one-way: client send call → JS handler body. */
 	ingest: LatencyHistogramJson;
+	/** Server-side: JS handler body → the echo's send call. */
+	turnaround: LatencyHistogramJson;
 	client: ClientLatencyJson | null;
 	hostCpuPctMedian: number | null;
 	serverCpuPct: number;
@@ -156,25 +181,40 @@ async function main(): Promise<void> {
 		`bench-latency: arm=${ARM} arrival=${ARRIVAL} clock=${clock.source} residual=${clock.calibrationResidualNs.toFixed(0)}ns spread=${clock.calibrationSpreadNs.toFixed(0)}ns batchEnv=${process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? "(default)"}`,
 	);
 
-	console.log("bench-latency: building load-client (release)...");
-	try {
-		await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client --release`.quiet();
-	} catch (err) {
-		if (!(await Bun.file(CLIENT_BIN).exists())) throw err;
-		console.warn(
-			"bench-latency: cargo build failed; falling back to existing load-client binary",
-		);
+	if (SKIP_BUILD) {
+		if (!(await Bun.file(CLIENT_BIN).exists())) {
+			throw new Error(
+				`LATENCY_SKIP_BUILD=1 but ${CLIENT_BIN} does not exist; build it first`,
+			);
+		}
+	} else {
+		console.log("bench-latency: building load-client (release)...");
+		try {
+			await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client --release`.quiet();
+		} catch (err) {
+			if (!(await Bun.file(CLIENT_BIN).exists())) throw err;
+			console.warn(
+				"bench-latency: cargo build failed; falling back to existing load-client binary",
+			);
+		}
 	}
 
 	const tls = generateLocalhostCert();
 	if (!tls) throw new Error("failed to generate localhost cert");
 
 	const ingest = new LatencyHistogram();
+	// JS handler entry → the echo's send call. The middle leg of the registered
+	// ingest-vs-egress cross-check: with it, `ingest + turnaround + egress` adds
+	// up to the client's round trip exactly, per datagram, so the two processes
+	// can be checked against each other instead of trusted.
+	const turnaround = new LatencyHistogram();
 	let serverRx = 0;
 	let serverStamped = 0;
 	let serverUnstamped = 0;
 	let echoSent = 0;
 	let echoErr = 0;
+	/** Echoes whose payload could not carry the echo instant. */
+	let echoStampFailures = 0;
 
 	// The tick arm rounds its per-tick burst up, so the effective rate can exceed
 	// the requested one by up to a tick's worth of datagrams per session.
@@ -211,6 +251,16 @@ async function main(): Promise<void> {
 						ingest.record(arrivedNs - stamp.actualNs);
 					}
 					if (!ECHO) continue;
+					// Stamp the send instant into the payload the client is about
+					// to get back, as late as possible before handing it over, so
+					// the egress leg the client measures starts here and not
+					// somewhere earlier in this function.
+					const echoAtNs = clock.now();
+					if (writeEchoActual(datagram, echoAtNs)) {
+						turnaround.record(echoAtNs - arrivedNs);
+					} else {
+						echoStampFailures += 1;
+					}
 					try {
 						await session.sendDatagram(datagram);
 						echoSent += 1;
@@ -234,6 +284,8 @@ async function main(): Promise<void> {
 			`bench-latency: step ${index + 1}/${RATES.length} requesting rate=${rate}/s/session aggregate=${nominalAggregate}/s`,
 		);
 		ingest.reset();
+		turnaround.reset();
+		const stampFailures0 = echoStampFailures;
 		const rx0 = serverRx;
 		const stamped0 = serverStamped;
 		const unstamped0 = serverUnstamped;
@@ -317,6 +369,8 @@ async function main(): Promise<void> {
 		// could disagree with each other about the same step.
 		const drainArrivals = serverRx - rxAtClientExit;
 		const ingestJson = ingest.toJson();
+		const turnaroundJson = turnaround.toJson();
+		const stampFailuresTotal = echoStampFailures;
 		const rxTotal = serverRx;
 		const stampedTotal = serverStamped;
 		const unstampedTotal = serverUnstamped;
@@ -389,10 +443,12 @@ async function main(): Promise<void> {
 			serverUnstamped: unstampedTotal - unstamped0,
 			echoSent: echoTotal - echo0,
 			echoErr: echoErrTotal - echoErr0,
+			echoStampFailures: stampFailuresTotal - stampFailures0,
 			drainMs: SETTLE_MS,
 			drainArrivals,
 			upDeliveryRatio: null,
 			ingest: ingestJson,
+			turnaround: turnaroundJson,
 			client,
 			hostCpuPctMedian: median(hostSamples),
 			// Over the client-process window only: the drain that follows it is
@@ -407,7 +463,14 @@ async function main(): Promise<void> {
 		steps.push(step);
 
 		const s = LatencyHistogram.fromJson(step.ingest).summary();
+		const t = LatencyHistogram.fromJson(step.turnaround).summary();
+		const e = step.client
+			? LatencyHistogram.fromJson(step.client.egressOneWay).summary()
+			: null;
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
+		console.log(
+			`bench-latency: step ${index + 1} legs ingestP99=${ms(s.p99Ns)}ms turnaroundP99=${ms(t.p99Ns)}ms egressP99=${e ? ms(e.p99Ns) : "n/a"}ms egressN=${e?.count ?? 0} stampFail=${step.echoStampFailures} noEchoInstant=${step.client?.echoMissingEchoInstant ?? "n/a"}`,
+		);
 		console.log(
 			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} effective=${step.aggregateRate}/s up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} over ${step.driveWindowSec.toFixed(1)}s drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
 		);
@@ -418,6 +481,10 @@ async function main(): Promise<void> {
 	const result = {
 		version: 1,
 		arm: ARM,
+		/** Non-null only in an interleaved dispatch; see `LATENCY_RUNG` above. */
+		rung: RUNG,
+		replicate: REPLICATE,
+		cellIndex: CELL_INDEX,
 		startedAt: new Date().toISOString(),
 		host: {
 			platform: process.platform,
@@ -433,6 +500,7 @@ async function main(): Promise<void> {
 			sessions: SESSIONS,
 			payloadBytes: PAYLOAD_BYTES,
 			stepSeconds: STEP_SECONDS,
+			settleMs: SETTLE_MS,
 			ratesPerSession: RATES,
 			arrival: ARRIVAL,
 			tickHz: TICK_HZ,
