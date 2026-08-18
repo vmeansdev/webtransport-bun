@@ -43,6 +43,10 @@ const DEFAULT_RECONNECT_HOLD_MS: u64 = 1_000;
 const DEFAULT_PAYLOAD_BYTES: usize = 0;
 /// 64 Hz is the competitive-FPS default and the one the latency axis registers.
 const DEFAULT_TICK_HZ: u64 = 64;
+/// Floor on the uniform arm's wake period. Comfortably above the ~1 ms timer
+/// granularity both Linux and macOS give tokio, so a requested rate is actually
+/// produced instead of quietly halved.
+const MIN_UNIFORM_PERIOD_NS: u64 = 2_000_000;
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PROBE_DATAGRAM_PREFIX: &str = "probe:datagram-echo:";
 const PROBE_UNI_ECHO_PREFIX: &str = "probe:uni-echo:";
@@ -93,7 +97,14 @@ fn parse_arrival_profile(raw: Option<&str>) -> ArrivalProfile {
 #[derive(Default)]
 struct LatencyProbe {
     rtt: AtomicHistogram,
+    /// Wake lateness only: the *first* datagram of each send event against its
+    /// deadline. Recording every datagram would fold the burst's own duration
+    /// into the tick arm's lag and make it grow with rate for a structural
+    /// reason that has nothing to do with saturation.
     schedule_lag: AtomicHistogram,
+    /// How long a whole send event took to push out, first datagram to last.
+    /// Always zero in the uniform arm, where a send event is one datagram.
+    burst_spread: AtomicHistogram,
     echo_unstamped: AtomicU64,
     ticks_skipped: AtomicU64,
     send_events: AtomicU64,
@@ -104,13 +115,14 @@ impl LatencyProbe {
         format!(
             concat!(
                 "{{\"arrival\":\"{}\",\"effectiveDatagramsPerSecPerSession\":{:.3},",
-                "\"rtt\":{},\"scheduleLag\":{},",
+                "\"rtt\":{},\"scheduleLag\":{},\"burstSpread\":{},",
                 "\"echoUnstamped\":{},\"ticksSkipped\":{},\"sendEvents\":{}}}"
             ),
             arrival.as_str(),
             effective_rate,
             self.rtt.to_json(),
             self.schedule_lag.to_json(),
+            self.burst_spread.to_json(),
             self.echo_unstamped.load(Ordering::Relaxed),
             self.ticks_skipped.load(Ordering::Relaxed),
             self.send_events.load(Ordering::Relaxed),
@@ -567,13 +579,22 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     let anchor = Instant::now();
     let anchor_ns = monotonic_ns();
     let (period_ns, burst) = match arrival {
-        ArrivalProfile::Uniform => (
-            1_000_000_000u64
-                .checked_div(datagrams_per_sec)
-                .map(|ns| ns.max(1))
-                .unwrap_or(3_600_000_000_000),
-            1,
-        ),
+        // A per-datagram timer cannot outrun the OS timer wheel: asking tokio
+        // for a 0.9 ms period on a ~1 ms granularity clock silently halves the
+        // offered rate. So the uniform arm keeps its period at or above
+        // MIN_UNIFORM_PERIOD_NS and sends the smallest whole burst that still
+        // hits the requested rate exactly. Below ~500/s/session that is one
+        // datagram per wake, exactly as before; above it the arm becomes
+        // mildly bursty (at most a handful of datagrams), which is disclosed
+        // rather than hidden — and sessions stay phase-staggered, so aggregate
+        // arrivals remain spread.
+        ArrivalProfile::Uniform if datagrams_per_sec > 0 => {
+            let burst = (datagrams_per_sec * MIN_UNIFORM_PERIOD_NS)
+                .div_ceil(1_000_000_000)
+                .max(1);
+            ((burst * 1_000_000_000 / datagrams_per_sec).max(1), burst)
+        }
+        ArrivalProfile::Uniform => (3_600_000_000_000, 1),
         ArrivalProfile::Tick => (
             (1_000_000_000 / tick_hz.max(1)).max(1),
             (datagrams_per_sec as f64 / tick_hz.max(1) as f64)
@@ -777,15 +798,21 @@ async fn run_session(
                 if let Some(probe) = latency.as_ref() {
                     probe.send_events.fetch_add(1, Ordering::Relaxed);
                 }
-                for _ in 0..schedule.burst {
+                let mut first_actual_ns = 0u64;
+                let mut last_actual_ns = 0u64;
+                for burst_index in 0..schedule.burst {
                     let sent = if payload_bytes > 0 {
                         if let Some(probe) = latency.as_ref() {
                             let actual_ns = monotonic_ns();
                             write_stamp(&mut padded, intended_ns, actual_ns, datagram_sequence);
                             datagram_sequence += 1;
-                            probe
-                                .schedule_lag
-                                .record_signed(actual_ns as i64 - intended_ns as i64);
+                            if burst_index == 0 {
+                                first_actual_ns = actual_ns;
+                                probe
+                                    .schedule_lag
+                                    .record_signed(actual_ns as i64 - intended_ns as i64);
+                            }
+                            last_actual_ns = actual_ns;
                         } else {
                             let header = format!("load:datagram:{}:", next_probe_id());
                             let n = header.len().min(padded.len());
@@ -803,6 +830,11 @@ async fn run_session(
                     } else {
                         counters.datagrams_err.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                if let Some(probe) = latency.as_ref() {
+                    probe
+                        .burst_spread
+                        .record_signed(last_actual_ns as i64 - first_actual_ns as i64);
                 }
                 schedule.index += 1;
                 let skipped = schedule.catch_up(Instant::now());

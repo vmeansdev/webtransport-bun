@@ -164,10 +164,21 @@ would have to hide.
 Evaluated per step, in this order. First match wins and is recorded as the step's
 `stop` reason.
 
-1. **`generator-saturation`** — client schedule-lag p99 ≥ 2.0 ms, **or**
-   schedule-lag p99 ≥ 0.5 × server-ingest p99. The generator is queueing on its
-   own send path and the measured tail is at least half the client's, not the
-   server's. This is the canonical STOP for this axis.
+1. **`generator-saturation`** — *amended, see Amendment 1 below; the original
+   rule is preserved there.* The generator did not offer the registered load,
+   shown by either:
+   - `ticksSkipped ≥ 0.10 × sendEvents` — the send scheduler dropped whole send
+     events. Same 10 % tolerance rule 2 already registers for volume, expressed
+     on send events rather than datagrams, because in the tick arm one event
+     carries a whole burst; **or**
+   - `scheduleLag p99 ≥ 4 × scheduleLagFloor`, where `scheduleLagFloor` is the
+     minimum `scheduleLag p99` across every step of the *same arm*. A within-arm
+     control, so the platform's fixed timer-wake granularity — which is present
+     at idle and is not queueing — is subtracted rather than mistaken for load.
+
+   `scheduleLag` measures wake lateness only: the first datagram of each send
+   event against its deadline. `burstSpread` (first-to-last within one send
+   event) is reported separately and is never a STOP.
 2. **`offered-shortfall`** — datagrams actually sent < 0.90 × requested
    (`sessions × rate × stepSeconds`). The step did not run the load it claims.
 3. **`clock-invalid`** — negative one-way latency samples > 0.1 % of stamped
@@ -195,6 +206,65 @@ harness or the host, and it will be reported as such rather than rationalized.
 - It may not quote a local macOS smoke number as a result. The local smoke exists
   only to prove the harness runs and that its output parses into the buckets
   above.
+
+## Amendment 1 — generator-saturation, 2026-08-18, before any measurement run
+
+**Status:** amended after local macOS harness smoke, **before** any run was
+dispatched to the runner. No measurement data existed when this was written. The
+original rule is quoted in full so the change is auditable rather than quiet.
+
+**Original rule 1:** *client schedule-lag p99 ≥ 2.0 ms, or schedule-lag p99 ≥
+0.5 × server-ingest p99.*
+
+**Why it was wrong.** Local smoke at trivial load — 8 sessions, 1,600
+datagrams/s aggregate, three orders of magnitude below anything that could
+queue — produced schedule-lag p99 of 2.6–6.1 ms in all three arms. That is
+tokio/OS timer wake granularity: a constant floor present at idle, not
+queueing. Both halves of the original rule fire on that floor, so every step of
+every arm would have been voided regardless of load, and the run would have
+reported `incomplete` for a reason that has nothing to do with the host.
+
+The second half was also mis-aimed. Server ingest latency is measured from the
+*actual* send instant written into the payload, so client lag before that
+instant is excluded from the server's number by construction — client lag cannot
+inflate server latency, only the offered load's shape. Rule 1's job is to detect
+that the shape was not the registered one; the amended form measures that
+directly, and rule 2 (`offered-shortfall`) remains the blunt check on volume.
+
+**Also changed, in the same amendment:** `scheduleLag` now records only the first
+datagram of each send event. Recording every datagram folded a burst's own
+duration into the tick arm's lag, which grows with rate for a purely structural
+reason (burst size is `rate / tick_hz`) and would have stopped the tick arm at
+its top rungs by construction. That duration is now reported separately as
+`burstSpread`, which is a diagnostic and never a STOP.
+
+**Third change, same amendment — the uniform arm's wake period has a floor.**
+The original design asked tokio for one wake per datagram, which at the top
+rungs means a 0.9–1.1 ms period against a timer wheel whose granularity is about
+1 ms on both Linux and macOS. The generator would then have silently produced
+roughly half the requested rate and the ladder's top would have measured a load
+that was never offered. The uniform arm now keeps its wake period at or above
+**2 ms** and sends the smallest whole burst that still hits the requested rate
+exactly:
+
+| per-session rate | burst | period |
+|---|---|---|
+| 100 | 1 | 10.000 ms |
+| 250 | 1 | 4.000 ms |
+| 500 | 1 | 2.000 ms |
+| 750 | 2 | 2.667 ms |
+| 900 | 2 | 2.222 ms |
+| 1100 | 3 | 2.727 ms |
+
+**Disclosed consequence:** at 750/s/session and above, "uniform" means micro-bursts
+of two or three datagrams, not one. Sessions remain phase-staggered across the
+period, so aggregate arrivals stay spread, and the tick arm's 64 Hz bursts (2 to
+17 datagrams, all sessions on one shared deadline) remain a categorically
+different shape. Any p50/p99 read at the top two rungs carries this caveat.
+
+Everything else in this document — the ladder, the arms, the latency buckets,
+the batch A/B rule, the tick-absorption rule, and STOP conditions 2 through 5 —
+is unchanged from the original registration.
 
 ## Reusability note (egress axis)
 
