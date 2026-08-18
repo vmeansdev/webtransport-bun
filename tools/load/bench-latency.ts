@@ -93,6 +93,11 @@ export type ClientLatencyJson = {
 	echoUnstamped: number;
 	ticksSkipped: number;
 	sendEvents: number;
+	/** Longest window any one session spent offering load, in seconds. */
+	driveWindowSec: number;
+	/** Mean of the same across sessions that offered any. */
+	driveWindowMeanSec: number;
+	sessionsDriving: number;
 };
 
 export type LatencyStep = {
@@ -102,7 +107,12 @@ export type LatencyStep = {
 	/** What was asked for. Kept so the request and the load stay separable. */
 	nominalPerSessionRate: number;
 	nominalAggregateRate: number;
+	/** Client-process wall clock: spawn to exit, drain excluded. */
 	elapsedSec: number;
+	/** Window the load was actually offered over — the rate denominator. */
+	driveWindowSec: number;
+	/** False when the client reported none and the nominal step length stood in. */
+	driveWindowMeasured: boolean;
 	requestedDatagrams: number;
 	clientSent: number;
 	clientErr: number;
@@ -332,13 +342,33 @@ async function main(): Promise<void> {
 			client?.effectiveDatagramsPerSecPerSession ?? rate;
 		const aggregate = Math.round(SESSIONS * effectivePerSessionRate);
 
+		// Requested volume is the registered session count times the effective
+		// rate times the window the load was actually offered over — never the
+		// nominal step length. The client process spends time connecting,
+		// staggering and joining that it does not spend sending, so
+		// `STEP_SECONDS` overstated the request, and a step cut short was judged
+		// against load it was never given time to send. Sessions that never
+		// connected drive nothing and stay in the multiplier, so they still show
+		// up as the shortfall they are.
+		const measuredWindow = client?.sessionsDriving
+			? client.driveWindowSec
+			: null;
+		if (measuredWindow === null) {
+			console.warn(
+				`bench-latency: step ${index + 1} reported no drive window; falling back to the nominal ${STEP_SECONDS}s`,
+			);
+		}
+		const driveWindowSec = measuredWindow ?? STEP_SECONDS;
+
 		const step: LatencyStep = {
 			perSessionRate: effectivePerSessionRate,
 			aggregateRate: aggregate,
 			nominalPerSessionRate: rate,
 			nominalAggregateRate: nominalAggregate,
 			elapsedSec,
-			requestedDatagrams: aggregate * STEP_SECONDS,
+			driveWindowSec,
+			driveWindowMeasured: measuredWindow !== null,
+			requestedDatagrams: Math.round(aggregate * driveWindowSec),
 			clientSent: num(/datagrams sent=(\d+)/),
 			clientErr: num(/datagrams sent=\d+ err=(\d+)/),
 			clientReceived: num(/datagrams received=(\d+)/),
@@ -367,7 +397,7 @@ async function main(): Promise<void> {
 		const s = ingest.summary();
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
 		console.log(
-			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} effective=${step.aggregateRate}/s up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
+			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} effective=${step.aggregateRate}/s up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} over ${step.driveWindowSec.toFixed(1)}s drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
 		);
 	}
 
