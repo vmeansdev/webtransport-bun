@@ -76,8 +76,8 @@ pub fn read_stamp(buf: &[u8]) -> Option<Stamp> {
     })
 }
 
-const SUB_BITS: u32 = 5;
-const SUB: u64 = 1 << SUB_BITS; // 32
+const SUB_BITS: u32 = 8;
+const SUB: u64 = 1 << SUB_BITS; // 256
 const MAX_OCTAVE: u32 = 45;
 /// Must equal `HISTOGRAM_BUCKETS` in `tools/load/latency-histogram.ts`.
 pub const BUCKETS: usize = ((MAX_OCTAVE - SUB_BITS + 1) as usize + 1) * SUB as usize;
@@ -95,7 +95,7 @@ fn bucket_index(ns: u64) -> usize {
     ((octave - SUB_BITS + 1) as usize) * SUB as usize + sub as usize
 }
 
-/// Shared across every session task. Relaxed adds on a 1344-slot array: the
+/// Shared across every session task. Relaxed adds on a 9984-slot array: the
 /// contention is real but it is nanoseconds against a path that already costs
 /// microseconds, and it stays off the critical section a mutex would create.
 pub struct AtomicHistogram {
@@ -146,16 +146,26 @@ impl AtomicHistogram {
 
     /// The exact JSON shape `LatencyHistogram.fromJson` consumes, so the client
     /// histogram and the server histogram are read by one implementation.
+    ///
+    /// Sparse: 9,984 slots of which a step fills a few hundred. The bucketing is
+    /// stamped into the document so a fragment written by one build can never be
+    /// read as if it came from another.
     pub fn to_json(&self) -> String {
-        let mut counts = String::with_capacity(BUCKETS * 3);
-        counts.push('[');
+        let mut buckets = String::with_capacity(1024);
+        buckets.push('[');
+        let mut written = 0usize;
         for (i, slot) in self.counts.iter().enumerate() {
-            if i > 0 {
-                counts.push(',');
+            let count = slot.load(Ordering::Relaxed);
+            if count == 0 {
+                continue;
             }
-            counts.push_str(&slot.load(Ordering::Relaxed).to_string());
+            if written > 0 {
+                buckets.push(',');
+            }
+            buckets.push_str(&format!("[{i},{count}]"));
+            written += 1;
         }
-        counts.push(']');
+        buckets.push(']');
         let total = self.total.load(Ordering::Relaxed);
         let min = if total == 0 {
             0
@@ -163,8 +173,15 @@ impl AtomicHistogram {
             self.min.load(Ordering::Relaxed)
         };
         format!(
-            "{{\"counts\":{},\"count\":{},\"negative\":{},\"minNs\":{},\"maxNs\":{},\"sumNs\":{}}}",
-            counts,
+            concat!(
+                "{{\"version\":2,\"subBits\":{},\"maxOctave\":{},\"buckets\":{},",
+                "\"count\":{},\"recordedTotal\":{},\"negative\":{},",
+                "\"minNs\":{},\"maxNs\":{},\"sumNs\":{}}}"
+            ),
+            SUB_BITS,
+            MAX_OCTAVE,
+            buckets,
+            total,
             total,
             self.negative.load(Ordering::Relaxed),
             min,
@@ -220,13 +237,22 @@ mod tests {
     /// and the server ingest curve are drawn on different graph paper.
     #[test]
     fn bucket_layout_matches_the_typescript_side() {
-        assert_eq!(BUCKETS, 1344);
+        assert_eq!(BUCKETS, 9984);
         assert_eq!(bucket_index(0), 0);
-        assert_eq!(bucket_index(31), 31);
-        assert_eq!(bucket_index(32), 32);
-        assert_eq!(bucket_index(33), 33);
-        assert_eq!(bucket_index(64), 64);
+        assert_eq!(bucket_index(255), 255);
+        assert_eq!(bucket_index(256), 256);
+        assert_eq!(bucket_index(257), 257);
+        assert_eq!(bucket_index(512), 512);
         assert_eq!(bucket_index(u64::MAX), BUCKETS - 1);
+        // 0.4% is the resolution the pre-registered 0.2 ms A/B band needs at a
+        // tens-of-milliseconds p99.
+        for ns in [1_000u64, 15_625_000, 33_300_000, 1_000_000_000] {
+            let idx = bucket_index(ns);
+            let octave = 63 - ns.leading_zeros();
+            let scale = 1u64 << (octave - SUB_BITS);
+            assert!(scale as f64 / ns as f64 <= 0.004, "bucket too wide at {ns}");
+            assert!(idx < BUCKETS);
+        }
         // Strictly non-decreasing across a wide sweep.
         let mut previous = 0usize;
         let mut ns = 1u64;
@@ -236,6 +262,26 @@ mod tests {
             previous = idx;
             ns = ns + 1 + ns / 7;
         }
+    }
+
+    #[test]
+    fn json_is_sparse_and_stamps_its_bucketing() {
+        let h = AtomicHistogram::new();
+        h.record(1_000);
+        h.record(1_000);
+        h.record(2_000_000);
+        let json = h.to_json();
+        assert!(json.contains("\"version\":2"), "{json}");
+        assert!(json.contains("\"subBits\":8,\"maxOctave\":45"), "{json}");
+        // Two distinct buckets, one of them with two samples; nothing else.
+        let buckets = json
+            .split("\"buckets\":")
+            .nth(1)
+            .and_then(|s| s.split("],\"count\"").next())
+            .unwrap_or_default();
+        assert_eq!(buckets.matches('[').count(), 3, "{json}");
+        assert!(buckets.contains(",2]"), "{json}");
+        assert!(json.contains("\"count\":3,\"recordedTotal\":3"), "{json}");
     }
 
     #[test]
