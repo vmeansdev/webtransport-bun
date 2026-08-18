@@ -458,11 +458,15 @@ function curveShape(rungs: Rung[]) {
 	// always available on the Linux runner. RSS is the fallback so the local
 	// macOS smoke still produces a parseable curve; which one was used is
 	// stamped, because the two are not interchangeable as evidence.
-	const metric: "committed" | "rss" = ok.every(
-		(r) => r.serverCommittedMbMax !== null,
-	)
-		? "committed"
-		: "rss";
+	// null, not "committed", when no rung qualified: an empty curve has no
+	// memory metric, and vacuously claiming one reads as evidence that isn't
+	// there.
+	const metric: "committed" | "rss" | null =
+		ok.length === 0
+			? null
+			: ok.every((r) => r.serverCommittedMbMax !== null)
+				? "committed"
+				: "rss";
 	const memMb = (r: Rung) =>
 		metric === "committed" ? (r.serverCommittedMbMax ?? 0) : r.serverRssMbMax;
 	const marginals: {
