@@ -34,6 +34,31 @@ on:
         required: false
         default: "false"
         type: string
+      latency_probe:
+        description: "Run the latency axis instead of the bandwidth ladder (p50/p99/p999 vs offered rate, BATCH=0 A/B, 64Hz tick arm)"
+        required: false
+        default: "false"
+        type: string
+      latency_arms:
+        description: "Comma-separated latency arms: default,batch0,tick"
+        required: false
+        default: "default,batch0,tick"
+        type: string
+      latency_rates:
+        description: "Comma-separated per-session datagrams/s ladder for the latency axis"
+        required: false
+        default: "100,250,500,750,900,1100"
+        type: string
+      latency_step_seconds:
+        description: "Seconds to hold each latency ladder step"
+        required: false
+        default: "60"
+        type: string
+      latency_tick_hz:
+        description: "Tick rate for the synchronized-burst arm"
+        required: false
+        default: "64"
+        type: string
 jobs:
   bench:
     permissions:
@@ -104,8 +129,59 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      # Latency axis. Three arms, one server process each, because the datagram
+      # batch knob is read once at import and cannot be varied inside a process.
+      # Method, classifier buckets and STOP conditions are pre-registered in
+      # docs/research/preregistrations/latency.md.
+      - name: Run latency axis
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        env:
+          LATENCY_SESSIONS: ${{ github.event.inputs.sessions }}
+          LATENCY_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
+          LATENCY_STEP_SECONDS: ${{ github.event.inputs.latency_step_seconds }}
+          LATENCY_RATES: ${{ github.event.inputs.latency_rates }}
+          LATENCY_TICK_HZ: ${{ github.event.inputs.latency_tick_hz }}
+          LATENCY_ARMS: ${{ github.event.inputs.latency_arms }}
+        run: |
+          set -euo pipefail
+          OUTDIR="$GITHUB_WORKSPACE/.bench-evidence"
+          mkdir -p "$OUTDIR"
+          SHA="${{ github.event.inputs.candidate_commit }}"
+          PORT=4433
+          FRAGMENTS=""
+          IFS=',' read -ra ARMS <<< "$LATENCY_ARMS"
+          for ARM in "${ARMS[@]}"; do
+            ARM="$(echo "$ARM" | tr -d '[:space:]')"
+            [ -n "$ARM" ] || continue
+            PORT=$((PORT + 1))
+            OUT="$OUTDIR/bench-latency-$SHA-$ARM.json"
+            echo "== latency arm $ARM on port $PORT =="
+            case "$ARM" in
+              batch0) ARM_ENV="WEBTRANSPORT_DATAGRAM_BATCH=0"; ARRIVAL=uniform ;;
+              tick)   ARM_ENV="";                              ARRIVAL=tick ;;
+              *)      ARM_ENV="";                              ARRIVAL=uniform ;;
+            esac
+            env $ARM_ENV \
+              LATENCY_ARM="$ARM" \
+              LATENCY_ARRIVAL="$ARRIVAL" \
+              LATENCY_PORT="$PORT" \
+              LATENCY_OUT="$OUT" \
+              bun tools/load/bench-latency.ts
+            FRAGMENTS="$FRAGMENTS $OUT"
+          done
+          # shellcheck disable=SC2086
+          bun tools/load/latency-classify.ts \
+            "$OUTDIR/bench-latency-$SHA-classified.json" $FRAGMENTS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        with:
+          name: bench-latency-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/bench-latency-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -116,7 +192,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*
