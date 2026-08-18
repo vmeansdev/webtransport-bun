@@ -236,6 +236,159 @@ changes what any rung reports:
    every exit path (normal, abort, signal). The orphans that outlived the job are
    what turned a failed rung into a force-restart.
 
+## Amendment 2 — measurement definitions tightened before the second dispatch
+
+**Written 2026-08-18, before any measurement data exists.** The first dispatch
+(`32168754965`) produced zero artifacts, so as with Amendment 1 nothing below is
+informed by a measured number from this axis. What informed it is a review of the
+harness against the effort spec's binding metric definitions
+(`.scratch/production-grade-scenarios/spec.md` rev 2, §Metric definitions) plus a
+local macOS smoke used only to exercise code paths — smoke numbers are never
+results, and none is quoted as one.
+
+Each item quotes what it changes. **No classifier threshold moves.** Items 1–2
+are amendments to what this document registered; items 3–6 are the harness being
+made to do what this document already said, and are listed so the difference is
+on the record rather than assumed.
+
+### 1. `offeredRatio` denominator — amended
+
+Original, verbatim:
+
+> - `offeredRatio  = clientDatagramsSent / (sessionsOk * steadySeconds / 5)` — how much of the intended offered load the generator actually sourced
+
+and, from the addendum:
+
+> 1. **First-tick suppression.** tokio's `interval` fires immediately, which gave
+>    every session one extra send per rung and pushed `offeredRatio` to 1.06 in
+>    the smoke. The generator now starts one interval in
+>    (`interval_at(now + interval)`), so `offeredRatio` cannot run rich and hide a
+>    saturated generator behind an inflated numerator.
+
+Both are replaced. With the first tick a full interval in, the *last* tick of the
+steady window is scheduled at exactly the instant the phase change is published,
+so the two land in the same timer slot and which one the session sees first is a
+coin flip. A schedule-derived denominator therefore cannot be right: the smoke
+produced `offeredRatio` 1.16 and 0.90 from an identical schedule depending only
+on which side of that flip the count was taken. A ratio that can be either is not
+a measurement of the generator, and it is the ratio S1 keys off.
+
+**The new rule:**
+
+> - Steady-phase ticks are offset by **half an interval** (first tick at
+>   `interval/2`, then every `interval`). The window then holds exactly
+>   `steady / interval` ticks — the nominal per-session rate — and no tick lies
+>   within half an interval of either window edge.
+> - `offeredRatio = clientDatagramsSent(steady) / steadyTicksDue`, where
+>   `steadyTicksDue` is **measured**, not derived: each session books
+>   `ticksDue(elapsed)` against the clock its own ticker runs on, at the instant
+>   it leaves the steady phase, including sessions that die mid-window (charged
+>   for what their schedule reached, never forgiven). The schedule's nominal
+>   figure is reported beside it as `expectedTicksPerSession`.
+
+Window length, per-session rate, payload, direction and every classifier
+threshold are unchanged. The change makes the ratio a property of the generator
+rather than of a timer race; it can move a rung's `offeredRatio` in either
+direction relative to the original denominator, which is exactly why it is
+registered here before the run rather than chosen after one.
+
+### 2. Degraded rungs — amended (additive)
+
+Original, verbatim:
+
+> | 8 | `ok` | `connectedRatio >= 0.99` and `offeredRatio >= 0.90` and `deliveryRatio >= 0.95` |
+
+> Anything that reaches the end without matching `ok` is `unclassified` and is
+> treated as `incomplete`, never as a capacity number.
+
+The buckets and their order are unchanged. What is added is a condition under
+which a rung may not reach `ok` at all:
+
+> A rung is **degraded** if any phase boundary had to be synthesized (a client
+> phase marker never arrived, so the window was closed at the client's exit
+> instead of at the boundary it was supposed to have), or if the rung started
+> with sessions from the previous rung still active. Every such reason is
+> recorded on the rung. A degraded rung is excluded from the curve, and any
+> verdict that depends on the server-side windows (`ok`, `server-limited`,
+> `host-limited`) is demoted to `unclassified` — i.e. to `incomplete`, the
+> category this document already defines for it. Verdicts computed from the
+> client's own report (`generator-limited`, `limiter-contaminated`,
+> `harness-error`) stand, since they do not read those windows.
+
+This can only move a rung *out* of a verdict, never into one, and adds no bucket.
+It closes a path by which a rung whose steady window was never measured could
+still be reported as a clean capacity point.
+
+### 3. CPU is a windowed rate per phase — conformance
+
+The effort spec binds it:
+
+> **CPU** = windowed rate over the reported phase (never cumulative average);
+> percent-of-one-core everywhere (4 vCPU box = 400 max)
+
+The harness's per-sample CSV column was a running average since rung start, and
+the client's "steady" CPU was divided by a window that included the connect ramp.
+Both are now windowed over the phase they name (`connect`, `steady`, `idle`
+reported separately on both processes), with `steady` measured between the steady
+and idle markers and `idle` from the end of the drain grace. Nothing this
+document registered changes; the numbers it asks for are now the numbers it
+meant.
+
+### 4. Per-stage delivery counters — conformance (reporting only)
+
+Original deliverable list, verbatim:
+
+> Per rung: `sessions, bucket, connectedRatio, offeredRatio, deliveryRatio,
+> acceptP50/P99/maxMs, acceptsPerSec, connectWallSec, serverRssMb,
+> serverCommittedMb, serverFdCount, serverCpuPct(steady), serverCpuPct(idle),
+> hostCpuPctMedian, clientRssMb, clientCpuPct, rateLimitedTotal, limitExceededTotal`.
+
+Unchanged, and added to: each rung also reports server receives split
+`connect / steady / drain / idle`, and the CSV carries the receive count per
+sample window. `deliveryRatio` is still `steady + drain` over steady sends — the
+same number as before — but a deficit is now localizable to a stage instead of
+being a single figure with nowhere to point. Addendum item 3 (drain grace) is
+unchanged; this only makes what it absorbs visible.
+
+### 5. S1 propagation — conformance
+
+Original, verbatim:
+
+> - **S1 — generator saturation (canonical).** `offeredRatio < 0.90`. The rung and
+>   every rung above it are reported `incomplete-unless-off-box`.
+
+The harness marked the shortfall rung and left the rungs above it eligible for
+the curve. Propagation is now recorded on every rung above the first shortfall
+and excludes them from the curve whatever their own bucket says. The rule is
+unchanged; it is now implemented.
+
+### 6. S5 labelling — conformance
+
+Original, verbatim:
+
+> - **S5 — connect timeout.** connect phase exceeding 300 s aborts that rung
+>   (`harness-error`) and the ladder stops.
+
+The harness stamped `S5` on *any* harness-error abort. S5 is now applied only to
+its registered trigger (a connect phase past the timeout), which buckets the rung
+`harness-error` and stops the ladder as registered; any other failure still stops
+the ladder but is logged under what it actually was. This is a labelling fix — no
+rung's verdict changes — and it matters because a mislabelled STOP would let an
+unregistered failure be read as a pre-registered one.
+
+### 7. Inter-rung drain — conformance to the profile
+
+Original, verbatim, from the per-session profile table:
+
+> | settle between rungs | 15 s | queues drain, CPU baseline resets |
+
+The settle wait is a guess at a drain; `sessionsActive` is the fact. The harness
+now waits (bounded, 180 s, backstopped by the server's 120 s idle timeout) for
+`sessionsActive` to return to zero after the settle wait, records what each rung
+started with, and marks a rung degraded if it started dirty. The 15 s settle is
+unchanged and still happens first. Without this, a rung could be charged the
+memory of the rung before it — and per-session memory is the deliverable.
+
 ## Not a gate
 
 No threshold in this document is a merge bar, and the harness is not to be tuned
