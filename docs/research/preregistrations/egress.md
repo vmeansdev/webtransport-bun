@@ -299,3 +299,214 @@ never run, an off-box claim — is out of scope for this document.
 - It may not quote a local macOS smoke number as a result. The local smoke exists
   only to prove the harness runs and that its output parses into the buckets
   above.
+
+## Dispatch log
+
+Every dispatch of this axis is logged here — run id, candidate SHA, artifact
+hash — including aborted ones, per the effort spec's process rules.
+
+| dispatched | run id | candidate SHA | artifact hash | outcome |
+|---|---|---|---|---|
+| — | — | — | — | **no dispatch has been made** |
+
+## Amendments
+
+Every amendment below was written **before the first dispatch of this axis**
+(the dispatch log above is empty at the time of writing) and quotes the text it
+replaces verbatim, so the change is auditable rather than silent. An amendment
+made after a dispatch would be a finding against the author; these are not.
+
+### Amendment 1 — the generator-headroom probe is replaced (2026-08-18)
+
+**Original text, quoted in full:**
+
+> **Generator headroom probe.** Before the ladder, and once per run, the driver
+> runs the *same* scheduler and the *same* per-datagram stamping and
+> `Buffer.from` copy into a counting sink — everything the originator does except
+> the native call. It escalates aggregate rate over
+> `20k, 40k, 80k, 160k, 240k, 320k` datagrams/s, 5 s each, and reports
+> `generatorCeilingPerSec` = the highest rate at which it both emitted ≥ 0.95 of
+> the scheduled count and kept `originationLag` p99 under 5 ms.
+>
+> **Run-level STOP `generator-headroom`:** if
+> `generatorCeilingPerSec < 1.5 × maxDeliveredAggregatePerSec` observed anywhere in
+> the ladder, **the run is `incomplete` and no capacity number is claimed.** This
+> is the maintainer's non-negotiable, written as arithmetic so it cannot be
+> rationalized afterwards.
+
+**Why it is replaced.** As registered, the probe cannot fail in the situation it
+exists to catch. Two independent defects, either one fatal:
+
+1. **It is not in situ.** The probe runs on an *idle* box: no server process, no
+   quinn runtime, no receiver, nothing else contending for the 4 vCPU. The
+   ceiling it measures is therefore the ceiling of a JS loop that owns the whole
+   machine, while the ladder's originator shares that machine with the transport
+   it is feeding and with a co-resident receiver. The number is an upper bound
+   on a quantity nobody asked about.
+2. **The denominator is saturation-depressed.** `maxDeliveredAggregatePerSec`
+   is what the transport *delivered*. If the JS originator is the binder — the
+   exact failure this STOP exists to detect — then delivered is *low*, so
+   `ceiling / delivered` is *large*, so the STOP *passes*. The rule is
+   anti-correlated with the condition it tests. Any run that is generator-bound
+   clears it by being generator-bound.
+
+**Replacement, registered here in its place.**
+
+**Loaded-server headroom arm.** A dedicated arm (`EGRESS_SHAPE=headroom`), run
+once per run, on the same server, with the same 100 real subscriber sessions
+connected by the same load client. The transport carries the **top ladder rung**
+(`headroomRatePerSession`, default 815/s/session = 81,500/s aggregate) for the
+whole arm — that is the loaded-server condition, and it is the ladder's own
+heaviest CPU state. Concurrently, and **from the same single JS originator and
+the same scheduler**, a shadow set of `round(m × sessions)` sink sessions is
+driven at the same per-session rate and the same burst profile, where the sink
+does everything the real path does except the native call (per-datagram stamp
+write and `Buffer.from` copy into a counting sink).
+
+`m` escalates over `0.5, 1, 2, 4`, 20 s each, stopping at the first failure. A
+rung passes iff, **counting real and shadow sessions together**, the originator
+emitted ≥ 0.95 of the plan's own scheduled count **and** kept `originationLag`
+p99 under 5 ms — the same two conditions, and the same 5 ms bound, as the
+original text.
+
+`generatorCeilingPerSec` = the combined offered rate of the highest passing
+rung = `(1 + m) × sessions × effectiveRatePerSession`. It is a demonstrated
+number: the originator *did* source that many datagrams per second, on the
+loaded box, while the transport was carrying the top rung.
+
+**Run-level STOP `generator-headroom` (replacement):** if
+
+    generatorCeilingPerSec < 1.5 × maxOfferedAggregatePerSec
+
+the run is `incomplete` and no capacity number is claimed, where
+**`maxOfferedAggregatePerSec` = the largest `scheduledDatagrams / driveWindowSec`
+across the run's *complete* ladder steps** — the offered load the capacity claim
+rests on, computed from the profile generator's own arithmetic. That number is
+fixed by the plan before the run and cannot be depressed by saturation, which is
+the property the original denominator lacked. The 1.5 factor and the
+"incomplete, no capacity number" consequence are unchanged.
+
+The escalation set is chosen so that the threshold is not free: the lowest rung
+(`m = 0.5`) yields exactly 1.5× the top rung's offered load, so the STOP passes
+only if the originator demonstrably sourced at least half again the load the
+ladder asked of it, under load, with the transport running.
+
+**Falsifier, and its guard.** `EGRESS_HEADROOM_BURN_NS` inserts a synthetic
+per-datagram busy-wait in the originator, which is how the new probe is proven
+to fire: a deliberately starved originator must produce a lower ceiling and a
+`generator-headroom` STOP. Because a starved originator is not a measurement,
+any artifact carrying a non-zero burn marks the run `incomplete` with stop
+`harness-falsifier`, and no capacity number may be read from it.
+
+**Cost and contamination.** The headroom arm is a separate arm, so it does not
+perturb any gated rung. It costs ≈ 4 × 20 s plus one connect.
+
+### Amendment 2 — the session-connect guard is registered (2026-08-18)
+
+The harness enforced a STOP the original document never registered: a step whose
+connected session count fell below 0.95 of the requested count was recorded as
+`offered-shortfall`. Registering it is the honest resolution — a rung driven
+into 80 of the 100 registered sessions is not the registered shape, and silently
+bucketing it would be worse than the unregistered guard.
+
+**Original text, quoted in full:**
+
+> 2. **`offered-shortfall`** — datagrams the server actually issued
+>    < 0.90 × the profile generator's own scheduled count for the step.
+
+**Replacement:**
+
+> 2. **`offered-shortfall`** — either the step did not run on the registered
+>    session count (`sessionsConnected < 0.95 × sessionsRequested`), **or**
+>    datagrams the server actually issued < 0.90 × the profile generator's own
+>    scheduled count for the step.
+
+### Amendment 3 — the constant arm's amplitude formula (2026-08-18)
+
+The document's formula and the harness's arithmetic disagree, and the harness is
+the honest one: `round(rate / 200)` quantizes a 110/s rung up to 200/s, an 82 %
+overshoot of the registered rate, while the harness spreads the rate across the
+grid so the offered rate is exact.
+
+**Original text, quoted in full (table row `constant`):**
+
+> | `constant` | 200 Hz (5 ms) | `round(rate / 200)`, sessions phase-staggered across the 5 ms period |
+
+**Replacement:**
+
+> | `constant` | 200 Hz (5 ms) | `round(rate)` datagrams spread evenly across the 200 events of one second (event `i` carries `floor((i+1)·rate/200) − floor(i·rate/200)`), so the offered rate is exact rather than grid-quantized; sessions phase-staggered across the 5 ms period |
+
+The frame arms' `round(rate / 30)` quantization and the keyframe arm's 6.67 %
+mean increase are unchanged and were already disclosed.
+
+### Amendment 4 — the skip-ratio denominator (2026-08-18)
+
+`sendEventsScheduled` counted only the events that actually ran, so the ratio in
+STOP 1 was `skipped / ran`, not `skipped / scheduled`. The wording is
+unchanged; the harness is corrected so that `sendEventsScheduled` means what it
+says — every grid event the plan put inside the step, run or skipped — and the
+STOP's arithmetic is the arithmetic that was registered.
+
+### Amendment 5 — CPU unit parity, and the co-residence threshold (2026-08-18)
+
+The effort spec binds every axis to **percent-of-one-core** (a 4 vCPU box reads
+up to 400). `hostCpuPct` was computed from `/proc/stat` as percent-of-the-whole-
+box (0–100), so it disagreed in unit with `serverCpuPct` beside it and with every
+other axis. It is converted to percent-of-one-core, and `hostCpuCount` is
+recorded in every fragment so the conversion is visible and the classifier is not
+guessing at the scale.
+
+The co-residence advisory keeps the meaning it was registered with, restated in
+the new unit so that a bare `97` cannot silently become "under one core busy":
+
+**Original text, quoted in full:**
+
+> **Advisory label, never a STOP:** `co-residence-bound` when host CPU median
+> ≥ 97 % and `downDeliveryRatio` < 0.95. On-box co-residence is a disclosed
+> property of this rig, not a defect of the run.
+
+**Replacement:**
+
+> **Advisory label, never a STOP:** `co-residence-bound` when the host CPU
+> median is ≥ 97 % of total host capacity (i.e. ≥ `0.97 × 100 × hostCpuCount`
+> in the percent-of-one-core unit — 388 on the 4 vCPU rig) and
+> `downDeliveryRatio` < 0.95. On-box co-residence is a disclosed property of
+> this rig, not a defect of the run.
+
+### Amendment 6 — rates divide by the drive window (2026-08-18)
+
+The effort spec binds rates to the drive window, never to a wall clock that
+includes samplers and drains. The harness divided by an `elapsedSec` that ran
+from the start of the drive to *after* the CPU sampler was joined (up to one
+5 s sampler period of overshoot on the ladder), and on the fan-out shape from
+before the publisher process was spawned to after it exited — a different and
+much larger overshoot on the same field. Every derived rate therefore carried an
+asymmetric, shape-dependent downward bias.
+
+Registered here: rates divide by **`driveWindowSec`**, defined per shape as
+
+- **ladder** — the interval the originator was actually driving, measured on the
+  shared monotonic clock across the drive loop alone;
+- **fan-out** — first to last server-observed ingest of the publisher's
+  datagrams, on the same clock.
+
+`elapsedSec` is still recorded, beside it, so the overshoot is visible rather
+than hidden.
+
+### Amendment 7 — "capacity is a floor" is decided by crossings, not by rung index (2026-08-18)
+
+The original clause:
+
+> If the top rung still satisfies a gate, the result is reported as
+> `≥ 81,500 /s` — a floor, never extrapolated.
+
+is a statement about *evidence*: a gate that was never observed to be crossed
+bounds the capacity from below only. The harness implemented it as an index
+comparison — capacity equals the highest rung *attempted* — which reads a floor
+as a point estimate whenever the topmost rung was excluded by a STOP, even
+though no crossing was observed there either.
+
+Registered here, as the same clause made mechanical: a gate's capacity is
+reported as a **floor** when **no complete rung above it failed that gate** —
+"no crossing observed". A rung that is `incomplete` is evidence of nothing and
+neither establishes nor refutes a crossing.
