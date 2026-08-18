@@ -102,6 +102,7 @@ import {
 	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
+import { createServerCloseContract } from "./server-close.js";
 import type {
 	CloseInfo,
 	ErrorCode,
@@ -806,6 +807,18 @@ export type MetricsSnapshot = {
 	nativeBidiHandlesLive?: number;
 	nativeUniSendHandlesLive?: number;
 	nativeUniRecvHandlesLive?: number;
+	/**
+	 * Native only. Unsettled N-API async operations this server still owns.
+	 * Non-zero after `close()` resolves means the addon is still holding the
+	 * host event loop open.
+	 */
+	nativeAsyncOpsPending?: number;
+	/** Native only. Sessions the QUIC idle timeout ended (peer went away). */
+	sessionsClosedByIdle?: number;
+	/** Native only. Sessions this server ended itself while shutting down. */
+	sessionsClosedByReap?: number;
+	/** Native only. Every other way a session ended (peer close, transport error). */
+	sessionsClosedOther?: number;
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
@@ -2051,30 +2064,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			await handle.setUnknownSniPolicy(policy);
 		},
 		tlsSnapshot: () => handle.tlsSnapshot(),
-		close: async () => {
-			await handle.close();
-			for (const [id, resolve] of closedResolvers) {
-				closedResolvers.delete(id);
-				resolve({ code: 0, reason: "server closed" });
-			}
-			if (activeOnSessionCallbacks > 0) {
-				// Clear the timeout timer if the drain wins the race, so it does
-				// not keep the event loop alive up to 5s after close() resolves.
-				let drainTimer: ReturnType<typeof setTimeout> | undefined;
-				try {
-					await Promise.race([
-						new Promise<void>((r) => {
-							onSessionDrainResolve = r;
-						}),
-						new Promise<void>((r) => {
-							drainTimer = setTimeout(r, 5000);
-						}),
-					]);
-				} finally {
-					if (drainTimer !== undefined) clearTimeout(drainTimer);
+		close: createServerCloseContract({
+			closeNative: () => handle.close(),
+			resolveOwnedSessions: (info) => {
+				for (const [id, resolve] of closedResolvers) {
+					closedResolvers.delete(id);
+					resolve(info);
 				}
-			}
-		},
+			},
+			pendingOnSessionCallbacks: () => activeOnSessionCallbacks,
+			awaitOnSessionDrain: () =>
+				new Promise<void>((resolve) => {
+					onSessionDrainResolve = resolve;
+				}),
+		}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
