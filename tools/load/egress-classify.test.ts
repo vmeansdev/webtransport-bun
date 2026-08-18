@@ -8,6 +8,7 @@ import {
 	classifySteps,
 	compareAlignment,
 	type EgressBucket,
+	type StopReason,
 	summarizeFanout,
 	verdictForProfile,
 	verdictForRun,
@@ -86,6 +87,74 @@ function step(
 		forwardLag: null,
 	};
 	return { ...base, ...overrides } as RawStep;
+}
+
+type FanoutRecordJson = NonNullable<RawStep["fanout"]>;
+
+/**
+ * A fan-out rung that clears both registered falsifiers, so a test can knock out
+ * exactly the one condition it is about. The ingest lag is a millisecond and the
+ * cadence is one long gap per 11-datagram tick burst — a real loopback path.
+ */
+function fanoutStep(
+	subscribers: number,
+	oneWayMs: number,
+	fanoutOverrides: Partial<FanoutRecordJson> = {},
+	stepOverrides: Partial<RawStep> = {},
+): RawStep {
+	// Enough forwards to clear the 10k-sample floor, and the stamped-sample count
+	// has to equal what the subscriber received or the fixture trips
+	// `clock-invalid` for reasons that have nothing to do with the test.
+	const ingested = Math.ceil(20_000 / subscribers);
+	const forwarded = ingested * subscribers;
+	const fanout: FanoutRecordJson = {
+		mode: "per-subscriber",
+		publisherRatePerSec: 330,
+		datagramsPerTick: 11,
+		ingested,
+		publisherStamped: ingested,
+		forwarded,
+		forwardDeliveryRatio: 1,
+		frameGapFraction: 1 / 11,
+		ingestToForward: flat(0.9 * MS, 1000),
+		forwardIssueSpread: flat(0.2 * MS, 1000),
+		forwardSettle: flat(1 * MS, 1000),
+		ingestReality: { real: true, reasons: [] },
+		publisherShortfall: false,
+		forwardShortfall: false,
+		precheck: { outcome: "pass" },
+		...fanoutOverrides,
+	};
+	return step({
+		shape: "fanout",
+		perSessionRate: 330,
+		sessionsRequested: subscribers,
+		sessionsConnected: subscribers,
+		aggregateRate: 330 * subscribers,
+		ingested,
+		forwardLag: flat(30_000, 1000),
+		fanout,
+		originator: {
+			sent: forwarded,
+			sendErrors: 0,
+			sendEventsScheduled: ingested,
+			sendEventsSkipped: 0,
+			scheduledDatagrams: forwarded,
+			originationLag: flat(0.9 * MS, 1000),
+			sendIssueSpread: flat(0.2 * MS, 1000),
+			peakWindowDatagrams: 11 * subscribers,
+			gridPeriodNs: Math.round(1e9 / 30),
+			driveWindowSec: 45,
+		},
+		clientReceived: forwarded,
+		client: {
+			egressOneWay: flat(oneWayMs * MS, forwarded),
+			endToEnd: flat((oneWayMs + 1) * MS, forwarded),
+			recvUnstamped: 0,
+		},
+		downDeliveryRatio: 1,
+		...stepOverrides,
+	});
 }
 
 describe("latency buckets sit exactly on the registered boundaries", () => {
@@ -411,36 +480,143 @@ describe("alignment A/B", () => {
 });
 
 describe("fan-out", () => {
-	test("scaling is reported raw against the smallest N", () => {
+	test("scaling is reported raw against the smallest complete N of the sweep", () => {
+		const steps = classifySteps([fanoutStep(10, 4), fanoutStep(100, 16)], 0);
+		const out = summarizeFanout(steps);
+		expect(out[0]?.complete).toBe(true);
+		expect(out[0]?.scaling).toBe(1);
+		expect(out[1]?.scaling).toBeCloseTo(4, 1);
+		expect(out[1]?.bucket).toBe("ok-interactive");
+	});
+
+	test("the send-cost instrument is reported, not left empty", () => {
+		const out = summarizeFanout(classifySteps([fanoutStep(50, 4)], 0));
+		expect(out[0]?.forwardIssueSpreadP99Ms).toBeCloseTo(0.2, 1);
+		expect(out[0]?.forwardIssuePerTargetNs).toBeGreaterThan(0);
+		expect(out[0]?.ingestToForwardP50Ms).toBeCloseTo(0.9, 1);
+	});
+
+	/**
+	 * The two sweeps carry different forward load at the same N, so anchoring one
+	 * on the other would report the rate effect under N's name — the confound the
+	 * retracted arm was built on.
+	 */
+	test("the two sweeps are never anchored on each other", () => {
 		const steps = classifySteps(
 			[
-				step({
-					shape: "fanout",
-					sessionsConnected: 10,
-					sessionsRequested: 10,
-					client: {
-						egressOneWay: flat(4 * MS, 20_000),
-						endToEnd: flat(5 * MS, 20_000),
-						recvUnstamped: 0,
-					},
-				}),
-				step({
-					shape: "fanout",
-					sessionsConnected: 100,
-					sessionsRequested: 100,
-					client: {
-						egressOneWay: flat(16 * MS, 20_000),
-						endToEnd: flat(17 * MS, 20_000),
-						recvUnstamped: 0,
-					},
+				fanoutStep(10, 4),
+				fanoutStep(10, 12, {
+					mode: "constant-aggregate",
+					publisherRatePerSec: 1650,
 				}),
 			],
 			0,
 		);
 		const out = summarizeFanout(steps);
+		expect(out.map((f) => f.mode)).toEqual([
+			"per-subscriber",
+			"constant-aggregate",
+		]);
 		expect(out[0]?.scaling).toBe(1);
-		expect(out[1]?.scaling).toBeCloseTo(4, 1);
-		expect(out[1]?.bucket).toBe("ok-interactive");
+		expect(out[1]?.scaling).toBe(1);
+	});
+
+	test("an incomplete rung anchors nothing", () => {
+		const steps = classifySteps(
+			[
+				fanoutStep(10, 4, { precheck: { outcome: "sink-saturation" } }),
+				fanoutStep(50, 9),
+			],
+			0,
+		);
+		const out = summarizeFanout(steps);
+		expect(out[0]?.complete).toBe(false);
+		expect(out[0]?.scaling).toBeNull();
+		// The 50-rung is the first complete one, so the curve starts there.
+		expect(out[1]?.scaling).toBe(1);
+	});
+
+	test("a healthy rung clears both falsifiers", () => {
+		const [s] = classifySteps([fanoutStep(50, 9)], 0);
+		expect(s?.stop).toBeNull();
+		expect(s?.complete).toBe(true);
+	});
+
+	test.each<[string, Partial<FanoutRecordJson>, string]>([
+		[
+			"a µs-scale ingest path",
+			{ ingestReality: { real: false, reasons: ["lag-microsecond"] } },
+			"ingest-unreal",
+		],
+		[
+			"a saturated sink",
+			{ precheck: { outcome: "sink-saturation" } },
+			"sink-saturation",
+		],
+		[
+			"a pre-check whose own generator saturated",
+			{ precheck: { outcome: "sink-precheck-inconclusive" } },
+			"sink-precheck-inconclusive",
+		],
+		[
+			"a publisher that under-offered",
+			{ publisherShortfall: true },
+			"publisher-shortfall",
+		],
+		[
+			"a forward side that dropped sends",
+			{ forwardShortfall: true },
+			"forward-shortfall",
+		],
+	])("%s stops the rung with %s", (_name, overrides, expected) => {
+		const [s] = classifySteps([fanoutStep(50, 9, overrides)], 0);
+		expect(s?.complete).toBe(false);
+		expect(s?.stop).toBe(expected as StopReason);
+	});
+
+	test("the sink pre-check is evaluated before anything downstream of it", () => {
+		const [s] = classifySteps(
+			[
+				fanoutStep(50, 9, {
+					precheck: { outcome: "sink-saturation" },
+					ingestReality: { real: false, reasons: ["lag-microsecond"] },
+					publisherShortfall: true,
+				}),
+			],
+			0,
+		);
+		expect(s?.stop).toBe("sink-saturation");
+	});
+
+	test("a fan-out step with no fan-out record is not a measurement", () => {
+		const [s] = classifySteps(
+			[step({ shape: "fanout", sessionsConnected: 50, sessionsRequested: 50 })],
+			0,
+		);
+		expect(s?.stop).toBe("ingest-unreal");
+	});
+
+	/**
+	 * A capacity finding, so it is a label. Marking the rung incomplete over it
+	 * would throw away the answer the rung was run to get.
+	 */
+	test("a server that cannot fan one frame out before the next is labelled, not stopped", () => {
+		const [s] = classifySteps(
+			[fanoutStep(100, 9, { forwardSettle: flat(40 * MS, 1000) })],
+			0,
+		);
+		expect(s?.complete).toBe(true);
+		expect(s?.forwardOverrun).toBe(true);
+		expect(classifySteps([fanoutStep(100, 9)], 0)[0]?.forwardOverrun).toBe(
+			false,
+		);
+	});
+
+	test("a fan-out-only fragment set says the headroom rule was never evaluated", () => {
+		const steps = classifySteps([fanoutStep(50, 9)], 0);
+		const v = verdictForRun(steps, { ceilingPerSec: 0, rungs: [] }, []);
+		expect(v.stop).toBe("headroom-not-evaluated");
+		expect(v.complete).toBe(false);
 	});
 });
 
