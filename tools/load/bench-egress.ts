@@ -12,14 +12,16 @@
  *
  * Three shapes, selected by `EGRESS_SHAPE`:
  *
- *   `generator` — the pre-registered saturation control. The same scheduler and
- *                 the same per-datagram stamping and copy, into a counting sink.
- *                 Answers "could the JS originator have offered more?" before
- *                 any transport number is allowed to mean anything.
- *   `ladder`    — N subscriber sessions, one burst profile, a rate ladder.
- *   `fanout`    — one publisher, N subscribers, the server forwarding verbatim.
- *                 The publisher's own stamp survives the fan-out, so this shape
- *                 has no server clock in its path at all.
+ *   `headroom` — the saturation control, on a loaded server. The transport
+ *                carries the ladder's top rung while the same scheduler on the
+ *                same thread additionally drives shadow sessions into a counting
+ *                sink. Answers "could the JS originator have offered more than
+ *                the ladder asked, *here*?" before any transport number is
+ *                allowed to mean anything.
+ *   `ladder`   — N subscriber sessions, one burst profile, a rate ladder.
+ *   `fanout`   — one publisher, N subscribers, the server forwarding verbatim.
+ *                The publisher's own stamp survives the fan-out, so this shape
+ *                has no server clock in its path at all.
  *
  * Method, gates, buckets and STOP conditions are pre-registered in
  * `docs/research/preregistrations/egress.md`. This file implements that
@@ -32,14 +34,15 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { cpus } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	amplitudeAt,
 	type EgressPlan,
 	type EgressProfile,
-	amplitudeAt,
 	eventsForSeconds,
 	isEgressProfile,
 	peakWindowDatagrams,
@@ -66,7 +69,7 @@ import {
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
 
-export type EgressShape = "ladder" | "fanout" | "generator";
+export type EgressShape = "ladder" | "fanout" | "headroom";
 
 const RAW_PROFILE = process.env.EGRESS_PROFILE ?? "constant";
 if (!isEgressProfile(RAW_PROFILE)) {
@@ -94,19 +97,32 @@ const FANOUT_PUBLISH_RATE = parseInt(
 	process.env.EGRESS_FANOUT_PUBLISH_RATE ?? "330",
 	10,
 );
-/** Aggregate rates the generator-headroom probe escalates through. */
-const GENERATOR_RATES = (
-	process.env.EGRESS_GENERATOR_RATES ?? "20000,40000,80000,160000,240000,320000"
+/**
+ * Shadow-arm multipliers the loaded-server headroom arm escalates through
+ * (amendment 1). At multiplier `m` the originator is asked for `1 + m` times the
+ * top ladder rung: the real sessions through the transport, plus `m × sessions`
+ * sink sessions. `0.5` is the lowest rung on purpose — it is exactly the 1.5×
+ * the run-level STOP demands, so clearing that STOP is never free.
+ */
+const HEADROOM_MULTIPLIERS = (
+	process.env.EGRESS_HEADROOM_MULTIPLIERS ?? "0.5,1,2,4"
 )
 	.split(",")
-	.map((v) => parseInt(v.trim(), 10))
+	.map((v) => Number.parseFloat(v.trim()))
 	.filter((v) => Number.isFinite(v) && v > 0);
-const GENERATOR_SECONDS = parseInt(
-	process.env.EGRESS_GENERATOR_SECONDS ?? "5",
+const HEADROOM_SECONDS = parseInt(
+	process.env.EGRESS_HEADROOM_SECONDS ?? "20",
 	10,
 );
-/** The pre-registered origination-lag bound for a passing generator rung. */
-const GENERATOR_LAG_BOUND_NS = 5e6;
+/** Per-session rate the headroom arm loads the transport at: the ladder's top rung. */
+const HEADROOM_RATE = parseInt(
+	process.env.EGRESS_HEADROOM_RATE ?? String(Math.max(...RATES)),
+	10,
+);
+/** The pre-registered origination-lag bound for a passing headroom rung. */
+const HEADROOM_LAG_BOUND_NS = 5e6;
+/** The pre-registered emitted fraction for a passing headroom rung. */
+const HEADROOM_EMITTED_FRACTION = 0.95;
 /** Seconds allowed for every subscriber session to hand shake before a step starts. */
 const CONNECT_BUDGET_S = parseInt(process.env.EGRESS_CONNECT_BUDGET ?? "8", 10);
 /** Seconds allowed for the previous step's sessions to close before the next one. */
@@ -129,6 +145,8 @@ const OUT_JSON =
 	join(ROOT, `tools/load/bench-egress-${SHAPE}-${PROFILE}.json`);
 
 const HAS_PROC = process.platform === "linux";
+/** Cores the box has. The CPU unit below is per-core, so this is the scale. */
+const HOST_CPU_COUNT = cpus().length;
 
 function serverCpuMs(): number {
 	const usage = process.cpuUsage();
@@ -146,9 +164,17 @@ function readHostCpu(): CpuSnapshot | null {
 	return { busy: total - idle, total };
 }
 
+/**
+ * Host CPU as **percent of one core**, the unit the effort spec binds every axis
+ * to — a 4 vCPU box reads up to 400, and this number is directly comparable to
+ * the `serverCpuPct` reported beside it. `/proc/stat`'s aggregate is
+ * percent-of-the-whole-box, so it is scaled by the core count, which the
+ * artifact also records so the scale is never inferred.
+ */
 function hostCpuPct(prev: CpuSnapshot | null, next: CpuSnapshot | null) {
 	if (!prev || !next || next.total === prev.total) return null;
-	return ((next.busy - prev.busy) / (next.total - prev.total)) * 100;
+	const ofBox = (next.busy - prev.busy) / (next.total - prev.total);
+	return ofBox * 100 * HOST_CPU_COUNT;
 }
 
 function median(values: number[]): number | null {
@@ -196,6 +222,7 @@ function writeU64(view: DataView, offset: number, value: number): void {
 export type OriginatorStats = {
 	sent: number;
 	sendErrors: number;
+	/** Every grid event the plan put inside the step — run *and* skipped. */
 	sendEventsScheduled: number;
 	sendEventsSkipped: number;
 	scheduledDatagrams: number;
@@ -205,10 +232,34 @@ export type OriginatorStats = {
 	sendIssueSpread: LatencyHistogramJson;
 	gridPeriodNs: number;
 	peakWindowDatagrams: number;
-	effectiveRatePerSession: number;
+	/**
+	 * The interval the originator was actually driving, on the shared monotonic
+	 * clock. Every rate divides by this and never by a wall clock that also
+	 * contains the CPU sampler, the client's exit or a process spawn.
+	 */
+	driveWindowSec: number;
 };
 
 type SendFn = (bytes: Uint8Array) => Promise<unknown>;
+
+/**
+ * The falsifier for the headroom arm: a synthetic per-datagram cost in the
+ * originator, so a deliberately starved generator can be shown to trip the STOP
+ * that exists to catch one. Any artifact carrying a non-zero burn is marked
+ * `harness-falsifier` by the classifier and can never carry a capacity number.
+ */
+const HEADROOM_BURN_NS = parseInt(
+	process.env.EGRESS_HEADROOM_BURN_NS ?? "0",
+	10,
+);
+
+function burn(clock: { now(): number }, ns: number): void {
+	if (ns <= 0) return;
+	const end = clock.now() + ns;
+	while (clock.now() < end) {
+		// deliberate busy-wait
+	}
+}
 
 /**
  * Drive one burst profile against a set of send functions for `seconds`.
@@ -226,13 +277,14 @@ async function driveProfile(
 	sends: SendFn[],
 	seconds: number,
 	clock: { now(): number },
+	burnNs = 0,
 ): Promise<OriginatorStats> {
 	const sessions = sends.length;
 	const originationLag = new LatencyHistogram();
 	const sendIssueSpread = new LatencyHistogram();
 	let sent = 0;
 	let sendErrors = 0;
-	let eventsScheduled = 0;
+	let eventsRun = 0;
 	let eventsSkipped = 0;
 
 	const anchorNs = clock.now() + 50_000_000; // 50 ms so every loop starts armed
@@ -255,19 +307,17 @@ async function driveProfile(
 			if (waitMs > 0) await Bun.sleep(waitMs);
 
 			// Skip whole events we are already past, then send the current one.
-			let wokeNs = clock.now();
-			const behind = Math.floor((wokeNs - intendedNs) / plan.gridPeriodNs);
+			const behind = Math.floor((clock.now() - intendedNs) / plan.gridPeriodNs);
 			if (behind > 0) {
 				eventsSkipped += behind;
 				eventIndex += behind;
 				const shifted = base + eventIndex * plan.gridPeriodNs;
 				if (shifted >= endNs) break;
-				wokeNs = clock.now();
 			}
 			const effectiveIntendedNs = base + eventIndex * plan.gridPeriodNs;
 
 			const amplitude = amplitudeAt(plan, index, sessions, eventIndex);
-			eventsScheduled += 1;
+			eventsRun += 1;
 			let firstActualNs = 0;
 			let lastActualNs = 0;
 			for (let k = 0; k < amplitude; k += 1) {
@@ -282,6 +332,7 @@ async function driveProfile(
 				} catch {
 					sendErrors += 1;
 				}
+				burn(clock, burnNs);
 			}
 			if (amplitude > 0) {
 				originationLag.record(firstActualNs - effectiveIntendedNs);
@@ -292,101 +343,153 @@ async function driveProfile(
 	};
 
 	await Promise.all(sends.map((_, i) => runSession(i)));
+	const driveEndNs = clock.now();
 
 	return {
 		sent,
 		sendErrors,
-		sendEventsScheduled: eventsScheduled,
+		// Run plus skipped: the denominator the `generator-saturation` STOP is
+		// written against is every grid event the plan put inside the step, not
+		// only the ones that survived to run.
+		sendEventsScheduled: eventsRun + eventsSkipped,
 		sendEventsSkipped: eventsSkipped,
 		scheduledDatagrams: scheduledDatagrams(plan, sessions, events),
 		originationLag: originationLag.toJson(),
 		sendIssueSpread: sendIssueSpread.toJson(),
 		gridPeriodNs: plan.gridPeriodNs,
 		peakWindowDatagrams: peakWindowDatagrams(plan, sessions),
-		effectiveRatePerSession: plan.effectiveRatePerSession,
+		driveWindowSec: Math.max(driveEndNs - anchorNs, 1) / 1e9,
 	};
 }
 
-export type GeneratorRung = {
-	aggregateRate: number;
+export type HeadroomRung = {
+	/** Sink sessions per real session at this rung. */
+	multiplier: number;
+	realSessions: number;
+	shadowSessions: number;
 	perSessionRate: number;
+	/** Datagrams/s the originator was asked for, real and shadow together. */
+	offeredPerSec: number;
+	/** Datagrams/s it actually sourced. */
+	emittedPerSec: number;
 	emitted: number;
 	scheduled: number;
 	emittedFraction: number;
+	/** Of `emitted`, the part that went through the real transport. */
+	realEmitted: number;
+	shadowEmitted: number;
 	originationLagP99Ns: number;
-	/** Lowest `originationLagP99Ns` seen so far: this platform's timer-wake floor. */
-	lagFloorNs: number;
+	sendEventsSkipped: number;
+	sendEventsScheduled: number;
+	driveWindowSec: number;
+	hostCpuPct: number | null;
 	passes: boolean;
 };
 
-export type GeneratorProbe = {
-	seconds: number;
-	sessions: number;
-	rungs: GeneratorRung[];
+export type HeadroomProbe = {
+	secondsPerRung: number;
+	profile: EgressProfile;
+	perSessionRate: number;
+	realSessions: number;
+	burnNs: number;
+	rungs: HeadroomRung[];
 	ceilingPerSec: number;
 };
 
 /**
- * The pre-registered generator-saturation control.
+ * The loaded-server generator-headroom arm (pre-registration amendment 1).
  *
- * Everything the originator does except the native call: the same per-session
- * loops, the same stamping, the same `Buffer.from` copy `sendDatagram` would
- * make. If this ceiling is not comfortably above what the transport delivered,
- * the ladder measured the generator and the run is `incomplete`. That rule is
- * arithmetic in `egress-classify.ts`, not a judgement call here.
+ * The question is "could the JS originator have offered more than the ladder
+ * asked of it, on the box the ladder actually ran on?" — so it is answered
+ * there: the transport carries the top ladder rung for the whole arm, and the
+ * *same* scheduler on the *same* thread additionally drives `m × sessions`
+ * shadow sessions into a counting sink, doing everything the real path does
+ * except the native call. A rung passes when the originator kept its registered
+ * emitted fraction and lag bound across real and shadow together, and the
+ * ceiling is the combined rate it demonstrably sourced.
+ *
+ * The arm it replaced ran on an idle box with no server in the picture, and its
+ * STOP divided by delivered throughput — a quantity a generator-bound run
+ * depresses, so the rule passed exactly when it should have fired. Neither
+ * property survives here: the box is loaded, and the classifier divides by the
+ * plan's own offered rate.
  */
-async function runGeneratorProbe(clock: {
-	now(): number;
-}): Promise<GeneratorProbe> {
-	const rungs: GeneratorRung[] = [];
-	let sunk = 0;
+async function runHeadroomArm(
+	clock: { now(): number },
+	realSends: SendFn[],
+	sampleHostCpu: () => number | null,
+): Promise<HeadroomProbe> {
+	const rungs: HeadroomRung[] = [];
+	const plan = planFor(PROFILE, HEADROOM_RATE);
+	let shadowEmitted = 0;
+	let realEmitted = 0;
 	const sink: SendFn = async (bytes) => {
-		sunk += Buffer.from(bytes).length;
+		// Everything `sendDatagram` does on the JS side before the native call.
+		shadowEmitted += Buffer.from(bytes).length > 0 ? 1 : 0;
 	};
+	const counted: SendFn[] = realSends.map((send) => async (bytes) => {
+		const result = await send(bytes);
+		realEmitted += 1;
+		return result;
+	});
 
-	// The bound is the flat 5 ms the pre-registration fixed. A floor-relative
-	// bound was tempting — this platform's idle timer-wake granularity is not
-	// load — but every way of relaxing it makes the ceiling larger, and a larger
-	// ceiling makes the `generator-headroom` STOP easier to clear. That STOP is
-	// the maintainer's non-negotiable, so it is left exactly as registered and
-	// the floor is recorded as a diagnostic only.
-	let lagFloorNs = Number.POSITIVE_INFINITY;
-
-	for (const aggregate of GENERATOR_RATES) {
-		const perSession = Math.max(1, Math.round(aggregate / SESSIONS));
-		const plan = planFor("constant", perSession);
-		const sends = new Array<SendFn>(SESSIONS).fill(sink);
-		const stats = await driveProfile(plan, sends, GENERATOR_SECONDS, clock);
-		const hist = LatencyHistogram.fromJson(stats.originationLag);
-		const p99 = hist.percentile(0.99);
-		if (p99 > 0) lagFloorNs = Math.min(lagFloorNs, p99);
+	for (const multiplier of HEADROOM_MULTIPLIERS) {
+		const shadowSessions = Math.max(1, Math.round(multiplier * counted.length));
+		const sends = [...counted, ...new Array<SendFn>(shadowSessions).fill(sink)];
+		realEmitted = 0;
+		shadowEmitted = 0;
+		sampleHostCpu();
+		const stats = await driveProfile(
+			plan,
+			sends,
+			HEADROOM_SECONDS,
+			clock,
+			HEADROOM_BURN_NS,
+		);
+		const p99 = LatencyHistogram.fromJson(stats.originationLag).percentile(
+			0.99,
+		);
 		const fraction =
 			stats.scheduledDatagrams > 0 ? stats.sent / stats.scheduledDatagrams : 0;
-		const rung: GeneratorRung = {
-			aggregateRate: perSession * SESSIONS,
-			perSessionRate: perSession,
+		const rung: HeadroomRung = {
+			multiplier,
+			realSessions: counted.length,
+			shadowSessions,
+			perSessionRate: plan.effectiveRatePerSession,
+			offeredPerSec: stats.scheduledDatagrams / stats.driveWindowSec,
+			emittedPerSec: stats.sent / stats.driveWindowSec,
 			emitted: stats.sent,
 			scheduled: stats.scheduledDatagrams,
 			emittedFraction: fraction,
+			realEmitted,
+			shadowEmitted,
 			originationLagP99Ns: p99,
-			lagFloorNs: Number.isFinite(lagFloorNs) ? lagFloorNs : 0,
-			passes: fraction >= 0.95 && p99 < GENERATOR_LAG_BOUND_NS,
+			sendEventsSkipped: stats.sendEventsSkipped,
+			sendEventsScheduled: stats.sendEventsScheduled,
+			driveWindowSec: stats.driveWindowSec,
+			hostCpuPct: sampleHostCpu(),
+			passes:
+				fraction >= HEADROOM_EMITTED_FRACTION && p99 < HEADROOM_LAG_BOUND_NS,
 		};
 		rungs.push(rung);
 		console.log(
-			`bench-egress: generator ${rung.aggregateRate}/s emitted=${(fraction * 100).toFixed(1)}% lagP99=${(p99 / 1e6).toFixed(2)}ms ${rung.passes ? "ok" : "SATURATED"}`,
+			`bench-egress: headroom m=${multiplier} real=${rung.realSessions} shadow=${shadowSessions} offered=${rung.offeredPerSec.toFixed(0)}/s emitted=${(fraction * 100).toFixed(1)}% (${rung.emittedPerSec.toFixed(0)}/s) lagP99=${(p99 / 1e6).toFixed(2)}ms ${rung.passes ? "ok" : "SATURATED"}`,
 		);
 		if (!rung.passes) break;
 	}
-	void sunk;
 
-	const ceilingPerSec =
-		rungs.filter((r) => r.passes).at(-1)?.aggregateRate ?? 0;
+	// The ceiling is what the originator demonstrably sourced, not what it was
+	// asked for: a rung that passed emitted at least 0.95 of its schedule, and
+	// the smaller of the two is the honest number.
+	const best = rungs.filter((r) => r.passes).at(-1);
 	return {
-		seconds: GENERATOR_SECONDS,
-		sessions: SESSIONS,
+		secondsPerRung: HEADROOM_SECONDS,
+		profile: PROFILE,
+		perSessionRate: plan.effectiveRatePerSession,
+		realSessions: realSends.length,
+		burnNs: HEADROOM_BURN_NS,
 		rungs,
-		ceilingPerSec,
+		ceilingPerSec: best ? Math.min(best.offeredPerSec, best.emittedPerSec) : 0,
 	};
 }
 
@@ -404,12 +507,19 @@ export type EgressStep = {
 	sessionsRequested: number;
 	sessionsConnected: number;
 	aggregateRate: number;
+	/**
+	 * Wall clock across the whole step, samplers and process lifetimes included.
+	 * Reported for disclosure only: no rate divides by it. That is
+	 * `originator.driveWindowSec`.
+	 */
 	elapsedSec: number;
 	originator: OriginatorStats;
 	clientReceived: number;
 	client: ClientEgressJson | null;
 	downDeliveryRatio: number | null;
+	/** Percent of one core (4 vCPU box reads up to 400), same unit as `serverCpuPct`. */
 	hostCpuPctMedian: number | null;
+	hostCpuCount: number;
 	serverCpuPct: number;
 	/** Fan-out only: datagrams the publisher pushed into the server. */
 	ingested: number;
@@ -483,33 +593,10 @@ async function main(): Promise<void> {
 		`bench-egress: shape=${SHAPE} profile=${PROFILE} clock=${clock.source} residual=${clock.calibrationResidualNs.toFixed(0)}ns spread=${clock.calibrationSpreadNs.toFixed(0)}ns batchEnv=${process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? "(default)"}`,
 	);
 
-	// The generator control needs no server and no clients at all.
-	if (SHAPE === "generator") {
-		const probe = await runGeneratorProbe(clock);
-		writeFileSync(
-			OUT_JSON,
-			`${JSON.stringify({
-				version: 1,
-				shape: SHAPE,
-				startedAt: new Date().toISOString(),
-				host: {
-					platform: process.platform,
-					cpus: navigator?.hardwareConcurrency ?? null,
-					bunVersion: Bun.version,
-				},
-				clock: {
-					source: clock.source,
-					calibrationResidualNs: clock.calibrationResidualNs,
-					calibrationSpreadNs: clock.calibrationSpreadNs,
-				},
-				config: { sessions: SESSIONS, payloadBytes: PAYLOAD_BYTES },
-				generator: probe,
-			})}\n`,
+	if (HEADROOM_BURN_NS > 0) {
+		console.warn(
+			`bench-egress: EGRESS_HEADROOM_BURN_NS=${HEADROOM_BURN_NS} — this is the falsifier. The artifact is marked harness-falsifier and carries no capacity number.`,
 		);
-		console.log(
-			`bench-egress: generator ceiling ${probe.ceilingPerSec}/s -> ${OUT_JSON}`,
-		);
-		return;
 	}
 
 	console.log("bench-egress: building load-client (release)...");
@@ -529,6 +616,15 @@ async function main(): Promise<void> {
 	const subscribers: Sub[] = [];
 	let nextId = 1;
 	let ingested = 0;
+	/**
+	 * First and last server-observed ingest of the publisher's datagrams. The
+	 * fan-out step's drive window is the span between them: a wall clock from
+	 * before the publisher process was spawned to after it exited would carry a
+	 * far larger overshoot than the ladder's, and every derived rate would be
+	 * biased down by a different amount on each shape.
+	 */
+	let firstIngestNs = 0;
+	let lastIngestNs = 0;
 	const forwardLag = new LatencyHistogram();
 	let fanoutForwarded = 0;
 	let fanoutForwardErrors = 0;
@@ -572,6 +668,8 @@ async function main(): Promise<void> {
 				for await (const datagram of session.incomingDatagrams()) {
 					const arrivedNs = clock.now();
 					ingested += 1;
+					if (firstIngestNs === 0) firstIngestNs = arrivedNs;
+					lastIngestNs = arrivedNs;
 					if (!fanoutActive) continue;
 					// Minimal SFU: forward verbatim to everyone else, so the
 					// publisher's own stamp survives and the measured interval has
@@ -662,6 +760,9 @@ async function main(): Promise<void> {
 			STEP_SECONDS,
 			clock,
 		);
+		// Read before the sampler is joined and before the client is reaped, so
+		// the numerator covers the drive window the denominator does.
+		const cpuMsDrive = serverCpuMs() - cpuMs0;
 		sampling = false;
 		await sampler;
 		const elapsedSec = (Date.now() - startedAt) / 1000;
@@ -686,8 +787,10 @@ async function main(): Promise<void> {
 			client,
 			downDeliveryRatio: stats.sent > 0 ? clientReceived / stats.sent : null,
 			hostCpuPctMedian: median(hostSamples),
-			serverCpuPct:
-				((serverCpuMs() - cpuMs0) / Math.max(elapsedSec * 1000, 1)) * 100,
+			hostCpuCount: HOST_CPU_COUNT,
+			// Percent of one core, over the drive window — not over `elapsedSec`,
+			// which also contains the sampler join and the client's exit.
+			serverCpuPct: (cpuMsDrive / (stats.driveWindowSec * 1000)) * 100,
 			ingested: 0,
 			forwardLag: null,
 		});
@@ -720,6 +823,8 @@ async function main(): Promise<void> {
 		const fwd0 = fanoutForwarded;
 		const fwdErr0 = fanoutForwardErrors;
 		forwardLag.reset();
+		firstIngestNs = 0;
+		lastIngestNs = 0;
 		const cpuMs0 = serverCpuMs();
 		const startedAt = Date.now();
 		const hostSamples: number[] = [];
@@ -772,7 +877,16 @@ async function main(): Promise<void> {
 		}
 		await pub.stdout;
 		fanoutActive = false;
+		const cpuMsDrive = serverCpuMs() - cpuMs0;
 		const elapsedSec = (Date.now() - startedAt) / 1000;
+		// First to last server-observed ingest, on the shared clock: the interval
+		// the publisher was actually driving, with the spawn, the handshake and
+		// the client's exit outside it. Same definition of "drive window" the
+		// ladder uses, so rates on the two shapes are comparable.
+		const driveWindowSec =
+			lastIngestNs > firstIngestNs
+				? (lastIngestNs - firstIngestNs) / 1e9
+				: Math.max(elapsedSec, 1);
 
 		await sub.child.exited;
 		const stdout = await sub.stdout;
@@ -799,14 +913,14 @@ async function main(): Promise<void> {
 				sendIssueSpread: new LatencyHistogram().toJson(),
 				gridPeriodNs: Math.round(1e9 / 30),
 				peakWindowDatagrams: 11 * connected,
-				effectiveRatePerSession: FANOUT_PUBLISH_RATE,
+				driveWindowSec,
 			},
 			clientReceived,
 			client,
 			downDeliveryRatio: forwarded > 0 ? clientReceived / forwarded : null,
 			hostCpuPctMedian: median(hostSamples),
-			serverCpuPct:
-				((serverCpuMs() - cpuMs0) / Math.max(elapsedSec * 1000, 1)) * 100,
+			hostCpuCount: HOST_CPU_COUNT,
+			serverCpuPct: (cpuMsDrive / (driveWindowSec * 1000)) * 100,
 			ingested: ingestedNow,
 			forwardLag: forwardLag.toJson(),
 		});
@@ -823,7 +937,40 @@ async function main(): Promise<void> {
 		);
 	};
 
-	if (SHAPE === "fanout") {
+	let headroom: HeadroomProbe | null = null;
+
+	if (SHAPE === "headroom") {
+		console.log(
+			`bench-egress: headroom arm sessions=${SESSIONS} rate=${HEADROOM_RATE}/s/session profile=${PROFILE} multipliers=[${HEADROOM_MULTIPLIERS.join(",")}] ${HEADROOM_SECONDS}s each`,
+		);
+		const armSeconds =
+			HEADROOM_MULTIPLIERS.length * (HEADROOM_SECONDS + 2) + CONNECT_BUDGET_S;
+		const sub = spawnClient(
+			subscriberArgs(SESSIONS, armSeconds + CLIENT_DURATION_SLACK_S),
+		);
+		const connected = await waitForSessions(SESSIONS);
+		if (connected === 0) {
+			sub.child.kill();
+			throw new Error(`headroom: no subscriber session connected`);
+		}
+		let prevHost = readHostCpu();
+		const sampleHostCpu = (): number | null => {
+			const next = readHostCpu();
+			const pct = hostCpuPct(prevHost, next);
+			prevHost = next;
+			return pct;
+		};
+		headroom = await runHeadroomArm(
+			clock,
+			subscribers.slice(0, connected).map((s) => s.send),
+			sampleHostCpu,
+		);
+		sub.child.kill();
+		await sub.child.exited;
+		console.log(
+			`bench-egress: headroom ceiling ${headroom.ceilingPerSec.toFixed(0)}/s (loaded, ${connected} real sessions at ${HEADROOM_RATE}/s)`,
+		);
+	} else if (SHAPE === "fanout") {
 		console.log(
 			`bench-egress: fan-out N=[${FANOUT_N.join(",")}] publisher=${FANOUT_PUBLISH_RATE}/s step=${STEP_SECONDS}s`,
 		);
@@ -853,6 +1000,7 @@ async function main(): Promise<void> {
 			host: {
 				platform: process.platform,
 				cpus: navigator?.hardwareConcurrency ?? null,
+				cpuCount: HOST_CPU_COUNT,
 				bunVersion: Bun.version,
 			},
 			clock: {
@@ -867,8 +1015,13 @@ async function main(): Promise<void> {
 				ratesPerSession: RATES,
 				fanoutN: FANOUT_N,
 				fanoutPublishRate: FANOUT_PUBLISH_RATE,
+				headroomMultipliers: HEADROOM_MULTIPLIERS,
+				headroomRatePerSession: HEADROOM_RATE,
+				headroomSeconds: HEADROOM_SECONDS,
+				headroomBurnNs: HEADROOM_BURN_NS,
 				datagramBatchEnv: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
 			},
+			headroom,
 			steps,
 		})}\n`,
 	);
