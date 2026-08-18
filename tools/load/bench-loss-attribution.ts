@@ -47,10 +47,33 @@ import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/loss-client`;
 
-const LADDER = (process.env.LOSS_SESSIONS ?? "1000,5000,7500,10000")
-	.split(",")
-	.map((v) => parseInt(v.trim(), 10))
-	.filter((v) => Number.isFinite(v) && v > 0);
+/**
+ * One rung is `sessions[@intervalMs][@stagger]`, so a single run can hold burst
+ * size, mean rate and arrival shape apart from each other without needing a
+ * dispatch per arm. `10000@5000` is one 10,000-packet impulse every 5 s;
+ * `5000@2500` is the same 2,000/s mean at half the burst; `10000@5000@stagger`
+ * is the same mean and the same session count with the impulse spread out.
+ */
+type Rung = { sessions: number; intervalMs: number; stagger: boolean };
+
+function parseLadder(spec: string, defaultIntervalMs: number): Rung[] {
+	const rungs: Rung[] = [];
+	for (const entry of spec.split(",")) {
+		const parts = entry.trim().split("@");
+		const sessions = parseInt(parts[0] ?? "", 10);
+		if (!Number.isFinite(sessions) || sessions <= 0) continue;
+		const parsedInterval = parts[1] ? parseInt(parts[1], 10) : Number.NaN;
+		rungs.push({
+			sessions,
+			intervalMs:
+				Number.isFinite(parsedInterval) && parsedInterval > 0
+					? parsedInterval
+					: defaultIntervalMs,
+			stagger: parts.slice(1).some((p) => p === "stagger"),
+		});
+	}
+	return rungs;
+}
 const PAYLOAD_BYTES = parseInt(process.env.LOSS_PAYLOAD_BYTES ?? "100", 10);
 const INTERVAL_MS = parseInt(process.env.LOSS_INTERVAL_MS ?? "5000", 10);
 const STEADY_SECONDS = parseInt(process.env.LOSS_STEADY_SECONDS ?? "120", 10);
@@ -72,14 +95,21 @@ const DRAIN_GRACE_MS = parseInt(process.env.LOSS_DRAIN_GRACE_MS ?? "1000", 10);
  * at N sessions it offers one N-packet impulse per interval rather than
  * N/interval per second — a burst the mean-rate label does not describe. */
 const STAGGER_SENDS = process.env.LOSS_STAGGER_SENDS === "1";
+const LADDER = parseLadder(
+	process.env.LOSS_SESSIONS ?? "1000,5000,7500,10000",
+	INTERVAL_MS,
+).map((r) => ({ ...r, stagger: r.stagger || STAGGER_SENDS }));
 const PORT = parseInt(process.env.LOSS_PORT ?? "4433", 10);
 const OUT_JSON =
 	process.env.LOSS_OUT ?? join(ROOT, "tools/load/bench-loss-attribution.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
 
 const HAS_PROC = process.platform === "linux";
-/** Sequence number every session is expected to reach by the end of steady. */
-const EXPECTED_SEQ_MAX = Math.floor((STEADY_SECONDS * 1000) / INTERVAL_MS);
+/** Sequence number every session is expected to reach by the end of steady.
+ * Per rung, because a rung may override the interval. */
+function expectedSeqMax(intervalMs: number): number {
+	return Math.floor((STEADY_SECONDS * 1000) / intervalMs);
+}
 
 type CpuSnapshot = { busy: number; total: number };
 
@@ -253,7 +283,10 @@ type LedgerSummary = {
 	deliveredPerSessionHistogram: Record<string, number>;
 };
 
-function summarize(ledgers: Iterable<SessionLedger>): LedgerSummary {
+function summarize(
+	ledgers: Iterable<SessionLedger>,
+	seqMax: number,
+): LedgerSummary {
 	const histogram: Record<string, number> = {};
 	let sessions = 0;
 	let delivered = 0;
@@ -270,11 +303,11 @@ function summarize(ledgers: Iterable<SessionLedger>): LedgerSummary {
 		histogram[bucket] = (histogram[bucket] ?? 0) + 1;
 		if (l.count === 0) {
 			silent += 1;
-			suffixMissing += EXPECTED_SEQ_MAX;
+			suffixMissing += seqMax;
 			continue;
 		}
 		prefixMissing += l.first - 1;
-		suffixMissing += Math.max(0, EXPECTED_SEQ_MAX - l.last);
+		suffixMissing += Math.max(0, seqMax - l.last);
 		interiorGaps += Math.max(0, l.last - l.first + 1 - l.count);
 	}
 	return {
@@ -382,8 +415,9 @@ async function main(): Promise<void> {
 
 	let jsDelivered = 0;
 	let ledgers: SessionLedger[] = [];
-	const topSessions = Math.max(...LADDER);
-	const aggregatePeak = Math.ceil((topSessions * 1000) / INTERVAL_MS);
+	const topSessions = Math.max(...LADDER.map((r) => r.sessions));
+	const minIntervalMs = Math.min(...LADDER.map((r) => r.intervalMs));
+	const aggregatePeak = Math.ceil((topSessions * 1000) / minIntervalMs);
 	const server = createServer({
 		port: PORT,
 		tls: { certPem: tls.certPem, keyPem: tls.keyPem },
@@ -434,7 +468,7 @@ async function main(): Promise<void> {
 	// createServer has no readiness promise (same pattern as load-addon.ts).
 	await Bun.sleep(3000);
 	console.log(
-		`bench-loss-attribution: server up on ${PORT}; ladder=[${LADDER.join(",")}] interval=${INTERVAL_MS}ms payload=${PAYLOAD_BYTES}B steady=${STEADY_SECONDS}s expectedSeqMax=${EXPECTED_SEQ_MAX}`,
+		`bench-loss-attribution: server up on ${PORT}; ladder=[${LADDER.map((r) => `${r.sessions}@${r.intervalMs}${r.stagger ? "@stagger" : ""}`).join(",")}] payload=${PAYLOAD_BYTES}B steady=${STEADY_SECONDS}s`,
 	);
 
 	writeFileSync(
@@ -463,9 +497,11 @@ async function main(): Promise<void> {
 	const rungs: unknown[] = [];
 	const startedAt = new Date().toISOString();
 
-	for (const [index, sessions] of LADDER.entries()) {
+	for (const [index, arm] of LADDER.entries()) {
+		const { sessions, intervalMs, stagger } = arm;
+		const seqMax = expectedSeqMax(intervalMs);
 		console.log(
-			`bench-loss-attribution: rung ${index + 1}/${LADDER.length} sessions=${sessions}`,
+			`bench-loss-attribution: rung ${index + 1}/${LADDER.length} sessions=${sessions} interval=${intervalMs}ms stagger=${stagger} expectedSeqMax=${seqMax}`,
 		);
 		jsDelivered = 0;
 		ledgers = [];
@@ -487,12 +523,12 @@ async function main(): Promise<void> {
 				"--idle-secs",
 				String(IDLE_SECONDS),
 				"--datagram-interval-ms",
-				String(INTERVAL_MS),
+				String(intervalMs),
 				"--payload-bytes",
 				String(PAYLOAD_BYTES),
 				"--connect-timeout-secs",
 				String(CONNECT_TIMEOUT_SECONDS),
-				...(STAGGER_SENDS ? ["--stagger-sends"] : []),
+				...(stagger ? ["--stagger-sends"] : []),
 				"--json-out",
 				jsonOut,
 			],
@@ -506,7 +542,7 @@ async function main(): Promise<void> {
 			jsDelivered,
 			native: nativeMetrics(),
 			kernel: readKernelUdp(),
-			ledger: summarize(ledgers),
+			ledger: summarize(ledgers, seqMax),
 		});
 
 		const state: {
@@ -626,10 +662,12 @@ async function main(): Promise<void> {
 		// The ledger is cumulative per session across the whole rung, and the
 		// client only sends during steady, so the end-of-window summary IS the
 		// steady-window summary.
-		const ledger = to?.ledger ?? summarize(ledgers);
+		const ledger = to?.ledger ?? summarize(ledgers, seqMax);
 
 		const rung = {
 			sessions,
+			intervalMs,
+			staggerSends: stagger,
 			ladderIndex: index + 1,
 			// --- the ledger the ticket asked for, one row per stage ---
 			stages: {
@@ -674,7 +712,7 @@ async function main(): Promise<void> {
 			},
 			kernelUdpSteady: diffKernelUdp(from?.kernel ?? null, to?.kernel ?? null),
 			perSession: ledger,
-			expectedSeqMax: EXPECTED_SEQ_MAX,
+			expectedSeqMax: seqMax,
 			clientQuic: report?.steadyQuic ?? null,
 			clientPerConn: report?.steadyPerConn ?? null,
 			clientTicksLate: report?.steady.ticksLate ?? null,
@@ -706,7 +744,7 @@ async function main(): Promise<void> {
 		rungs.push(rung);
 
 		console.log(
-			`bench-loss-attribution: rung ${sessions} enqueued=${clientEnqueued} wireTx=${clientWireTx} quinnRx=${quinnToNative} js=${jsDeliveredWindow} delivery=${rung.deliveryRatio?.toFixed(3) ?? "n/a"} silentSessions=${ledger.sessionsSilent} prefix=${ledger.prefixMissing} suffix=${ledger.suffixMissing} interior=${ledger.interiorGaps} skipQueueFull=${skippedQueueFull}`,
+			`bench-loss-attribution: rung ${sessions}@${intervalMs}${stagger ? "@stagger" : ""} enqueued=${clientEnqueued} wireTx=${clientWireTx} quinnRx=${quinnToNative} js=${jsDeliveredWindow} delivery=${rung.deliveryRatio?.toFixed(3) ?? "n/a"} silentSessions=${ledger.sessionsSilent} prefix=${ledger.prefixMissing} suffix=${ledger.suffixMissing} interior=${ledger.interiorGaps} skipQueueFull=${skippedQueueFull}`,
 		);
 
 		writeFileSync(
@@ -726,14 +764,13 @@ async function main(): Promise<void> {
 						ladder: LADDER,
 						staggerSends: STAGGER_SENDS,
 						payloadBytes: PAYLOAD_BYTES,
-						datagramIntervalMs: INTERVAL_MS,
+						defaultDatagramIntervalMs: INTERVAL_MS,
 						steadySeconds: STEADY_SECONDS,
 						idleSeconds: IDLE_SECONDS,
 						settleSeconds: SETTLE_SECONDS,
 						endpoints: ENDPOINTS,
 						connectConcurrency: CONNECT_CONCURRENCY,
 						drainGraceMs: DRAIN_GRACE_MS,
-						expectedSeqMax: EXPECTED_SEQ_MAX,
 					},
 					rungs,
 				},

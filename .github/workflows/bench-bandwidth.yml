@@ -34,6 +34,41 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "bandwidth (rate ladder, default) | loss-attribution (per-stage counting taps)"
+        required: false
+        default: "bandwidth"
+        type: string
+      loss_sessions:
+        description: "loss-attribution: comma-separated rungs, each sessions[@intervalMs][@stagger]"
+        required: false
+        default: "10000@5000,5000@2500,10000@10000,10000@5000@stagger"
+        type: string
+      loss_payload_bytes:
+        description: "loss-attribution: datagram payload size in bytes"
+        required: false
+        default: "100"
+        type: string
+      loss_steady_seconds:
+        description: "loss-attribution: steady-state hold per rung"
+        required: false
+        default: "120"
+        type: string
+      loss_idle_seconds:
+        description: "loss-attribution: idle tail per rung"
+        required: false
+        default: "30"
+        type: string
+      loss_endpoints:
+        description: "loss-attribution: client endpoints, one distinct 127.0.k.1 source IP each"
+        required: false
+        default: "64"
+        type: string
+      loss_connect_concurrency:
+        description: "loss-attribution: concurrent handshakes in flight from the client"
+        required: false
+        default: "500"
+        type: string
 jobs:
   bench:
     permissions:
@@ -104,8 +139,41 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      - name: Report kernel receive-path settings
+        if: ${{ github.event.inputs.mode == 'loss-attribution' }}
+        run: |
+          # The mechanism under study is a receive-socket-buffer overflow, so the
+          # buffer sizes and the pre-run kernel counters are part of the evidence,
+          # not background detail.
+          sysctl net.core.rmem_default net.core.rmem_max net.core.netdev_max_backlog || true
+          grep -A1 '^Udp:' /proc/net/snmp || true
+      - name: Build loss-attribution client
+        if: ${{ github.event.inputs.mode == 'loss-attribution' }}
+        run: cargo build --release -p reference --bin loss-client
+      - name: Run loss-attribution ladder
+        if: ${{ github.event.inputs.mode == 'loss-attribution' }}
+        env:
+          LOSS_SESSIONS: ${{ github.event.inputs.loss_sessions }}
+          LOSS_PAYLOAD_BYTES: ${{ github.event.inputs.loss_payload_bytes }}
+          LOSS_STEADY_SECONDS: ${{ github.event.inputs.loss_steady_seconds }}
+          LOSS_IDLE_SECONDS: ${{ github.event.inputs.loss_idle_seconds }}
+          LOSS_ENDPOINTS: ${{ github.event.inputs.loss_endpoints }}
+          LOSS_CONNECT_CONCURRENCY: ${{ github.event.inputs.loss_connect_concurrency }}
+          WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          LOSS_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-loss-attribution-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-loss-attribution.ts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.mode == 'loss-attribution' }}
+        with:
+          name: bench-loss-attribution-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/bench-loss-attribution-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'loss-attribution' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -116,7 +184,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'loss-attribution' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*
