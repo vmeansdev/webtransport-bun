@@ -123,6 +123,14 @@ export type LimitsOptions = {
   maxQueuedBytesPerSession: number;
   maxQueuedBytesPerStream: number;
 
+  // QUIC flow-control windows, native backend only. Omitted, each is derived
+  // from a byte governor above (the shipped behaviour); set, it moves the
+  // transport window without moving the governor. See docs/OPERATIONS.md
+  // ("Flow-control windows") for the per-session memory math.
+  streamReceiveWindow?: number;
+  receiveWindow?: number;
+  sendWindow?: number;
+
   backpressureTimeoutMs: number;
   handshakeTimeoutMs: number;
   idleTimeoutMs: number;

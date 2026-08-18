@@ -30,18 +30,23 @@ pub(crate) struct TransportMemoryPolicy {
 impl TransportMemoryPolicy {
     pub(crate) fn from_limits(limits: &Limits) -> Self {
         let max_datagram_size = (limits.max_datagram_size as u64).max(1);
-        let stream_receive_window =
-            clamp_quic_window(limits.max_queued_bytes_per_stream.max(max_datagram_size));
-        let receive_window = clamp_quic_window(
+        // An explicit window replaces the governor-derived one and nothing
+        // else: the byte governors, and with them the datagram channel below,
+        // keep whatever the caller configured. The payload floor still applies
+        // so a window can never be smaller than one datagram.
+        let stream_receive_window = clamp_quic_window(
             limits
-                .max_queued_bytes_per_session
-                .max(stream_receive_window),
+                .stream_receive_window
+                .unwrap_or(limits.max_queued_bytes_per_stream)
+                .max(max_datagram_size),
         );
-        let send_window = clamp_quic_window(
-            limits
-                .max_queued_bytes_per_session
-                .max(stream_receive_window),
-        );
+        // With only the stream window set, the connection windows still rise to
+        // cover one stream — the invariant the derived path has always held.
+        let session_window = limits
+            .max_queued_bytes_per_session
+            .max(stream_receive_window);
+        let receive_window = clamp_quic_window(limits.receive_window.unwrap_or(session_window));
+        let send_window = clamp_quic_window(limits.send_window.unwrap_or(session_window));
         let datagram_channel_capacity = ceil_div(
             limits.max_queued_bytes_per_session.max(1),
             max_datagram_size,
@@ -210,5 +215,70 @@ mod tests {
         let mut config = wtransport::config::QuicTransportConfig::default();
 
         policy.apply_datagram_buffers(&mut config);
+    }
+
+    #[test]
+    fn explicit_windows_replace_the_derived_ones_and_leave_the_governors_alone() {
+        let limits = Limits {
+            stream_receive_window: Some(8 * 1024 * 1024),
+            receive_window: Some(32 * 1024 * 1024),
+            send_window: Some(4 * 1024 * 1024),
+            ..Limits::default()
+        };
+
+        let policy = TransportMemoryPolicy::from_limits(&limits);
+
+        assert_eq!(policy.stream_receive_window, 8 * 1024 * 1024);
+        assert_eq!(policy.receive_window, 32 * 1024 * 1024);
+        assert_eq!(policy.send_window, 4 * 1024 * 1024);
+        // The datagram channel is sized off the per-session governor, which the
+        // window fields do not touch: same 1748 slots as the shipped default.
+        assert_eq!(policy.datagram_channel_capacity, 1748);
+    }
+
+    #[test]
+    fn explicit_stream_window_still_lifts_the_derived_connection_windows() {
+        let limits = Limits {
+            stream_receive_window: Some(8 * 1024 * 1024),
+            ..Limits::default()
+        };
+
+        let policy = TransportMemoryPolicy::from_limits(&limits);
+
+        assert_eq!(policy.stream_receive_window, 8 * 1024 * 1024);
+        assert_eq!(policy.receive_window, 8 * 1024 * 1024);
+        assert_eq!(policy.send_window, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn explicit_connection_windows_may_sit_below_the_stream_window() {
+        let limits = Limits {
+            stream_receive_window: Some(8 * 1024 * 1024),
+            receive_window: Some(1024 * 1024),
+            send_window: Some(1024 * 1024),
+            ..Limits::default()
+        };
+
+        let policy = TransportMemoryPolicy::from_limits(&limits);
+
+        assert_eq!(policy.stream_receive_window, 8 * 1024 * 1024);
+        assert_eq!(policy.receive_window, 1024 * 1024);
+        assert_eq!(policy.send_window, 1024 * 1024);
+    }
+
+    #[test]
+    fn explicit_windows_keep_the_payload_floor_and_the_varint_ceiling() {
+        let limits = Limits {
+            stream_receive_window: Some(1),
+            receive_window: Some(u64::MAX),
+            send_window: Some(u64::MAX),
+            ..Limits::default()
+        };
+
+        let policy = TransportMemoryPolicy::from_limits(&limits);
+
+        assert_eq!(policy.stream_receive_window, 1200);
+        assert_eq!(policy.receive_window, super::QUIC_VARINT_MAX);
+        assert_eq!(policy.send_window, super::QUIC_VARINT_MAX);
     }
 }
