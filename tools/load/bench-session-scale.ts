@@ -63,6 +63,17 @@ const ABORT_CLOSE_TIMEOUT_MS = 3000;
  * counter snapshot that closes the steady window. Must stay far below
  * SCALE_IDLE_SECONDS, which is the window it borrows from. */
 const DRAIN_GRACE_MS = parseInt(process.env.SCALE_DRAIN_GRACE_MS ?? "1000", 10);
+/** How long a rung's sessions may take to disappear from the server before the
+ * next rung starts anyway (and starts contaminated, and says so). Generous
+ * because the backstop is the 120 s server idle timeout: sessions a killed
+ * client left behind are reaped, not leaked. */
+const DRAIN_TIMEOUT_SECONDS = parseInt(
+	process.env.SCALE_DRAIN_TIMEOUT_SECONDS ?? "180",
+	10,
+);
+/** Sessions allowed to still be open when the next rung starts. Zero: any
+ * survivor is another rung's memory being charged to this one. */
+const DRAIN_BASELINE_SESSIONS = 0;
 const PORT = parseInt(process.env.SCALE_PORT ?? "4433", 10);
 const OUT_JSON =
 	process.env.SCALE_OUT ?? join(ROOT, "tools/load/bench-session-scale.json");
@@ -209,11 +220,18 @@ type ClientReport = {
 		err: number;
 		received: number;
 		expectedSends: number;
+		/** Ticks one session is scheduled to fire inside the steady window. The
+		 * boundary tick is excluded by construction — see scale_client.rs. */
+		expectedTicksPerSession: number;
+		wallSec: number;
 	};
 	idle: { sent: number; err: number; received: number };
 	client: {
 		rssMbSteady: number | null;
 		rssMbIdle: number | null;
+		/** CPU ms per phase window, not cumulative: connect is the expensive
+		 * phase and must not leak into the steady rate. */
+		cpuMsConnect: number | null;
 		cpuMsSteady: number | null;
 		cpuMsIdle: number | null;
 		fdCount: number | null;
@@ -242,6 +260,15 @@ type Rung = {
 	sessions: number;
 	bucket: string;
 	bucketReason: string;
+	/** S1 propagation: true on the generator-limited rung itself and on every
+	 * rung above it. Such a rung is never a server capacity number and never
+	 * enters the curve, whatever its own bucket says. */
+	incompleteUnlessOffBox: boolean;
+	s1PropagatedFromSessions: number | null;
+	/** Non-empty when a measurement window had to be synthesized or the rung
+	 * started dirty. A degraded rung is excluded from the curve and can never
+	 * read `ok`. */
+	degraded: string[];
 	connectedRatio: number | null;
 	offeredRatio: number | null;
 	deliveryRatio: number | null;
@@ -252,19 +279,40 @@ type Rung = {
 	serverRssMbMax: number;
 	serverCommittedMbMax: number | null;
 	serverFdCountMax: number | null;
+	/** All three are windowed rates over their own phase, percent of one core. */
+	serverCpuPctConnect: number | null;
 	serverCpuPctSteady: number | null;
 	serverCpuPctIdle: number | null;
 	hostCpuPctMedianSteady: number | null;
 	clientRssMbMax: number | null;
+	clientCpuPctConnect: number | null;
 	clientCpuPctSteady: number | null;
+	clientCpuPctIdle: number | null;
 	hostMemAvailableMbMin: number | null;
 	rateLimitedTotal: number;
 	limitExceededTotal: number;
 	datagramsDroppedTotal: number;
 	sessionsActiveMax: number;
+	/** sessionsActive on the server the instant this rung started. Anything
+	 * above zero is a previous rung's sessions still being paid for here. */
+	sessionsActiveAtStart: number;
 	steadySent: number;
 	steadyServerRx: number;
 	idleServerRx: number;
+	/** Per-stage receive counters, so a delivery deficit is localizable instead
+	 * of being one number that could mean anything:
+	 *   connect — datagrams the server saw before the steady marker (should be 0)
+	 *   steady  — inside the steady window proper
+	 *   drain   — arrived during the post-boundary grace (in-flight at the edge)
+	 *   idle    — after the steady window closed (should be 0: idle sends nothing)
+	 * deliveryRatio counts steady+drain, so a large `drain` is a boundary
+	 * artifact and a deficit with a small `drain` is real loss. */
+	phaseServerRx: {
+		connect: number;
+		steady: number;
+		drain: number;
+		idle: number;
+	};
 	sessionsLost: number;
 	clientDistinctSourceIps: number | null;
 	/** The generator's own RSS self-guard tripped and it aborted the rung. */
@@ -297,6 +345,7 @@ function classify(r: {
 	clientCpuPctSteady: number | null;
 	hostCpuPctMedianSteady: number | null;
 	threw: boolean;
+	connectTimedOut: boolean;
 	clientRssGuardFired: boolean;
 }): { bucket: string; reason: string } {
 	// The client's RSS self-guard routes here rather than into a bucket of its
@@ -310,6 +359,15 @@ function classify(r: {
 	}
 	if (r.threw || r.sessionsOk === 0) {
 		return { bucket: "harness-error", reason: "rung threw or zero sessions" };
+	}
+	// S5's registered trigger and its registered bucket, together: the connect
+	// phase ran past its timeout, so the rung is a harness error and the ladder
+	// stops. This is the only thing that may be labelled S5.
+	if (r.connectTimedOut) {
+		return {
+			bucket: "harness-error",
+			reason: `S5 connect timeout: connect phase ${r.connectWallSec.toFixed(1)}s exceeded the timeout`,
+		};
 	}
 	if (r.rateLimitedTotal > 0 || r.limitExceededTotal > 0) {
 		return {
@@ -389,7 +447,13 @@ function classify(r: {
  * rungs are excluded by construction.
  */
 function curveShape(rungs: Rung[]) {
-	const ok = rungs.filter((r) => r.bucket === "ok");
+	// `ok` is necessary but not sufficient: a rung at or above a generator-limited
+	// one is incomplete-unless-off-box by pre-registration, and a rung whose
+	// measurement windows were synthesized has no trustworthy memory curve point.
+	const ok = rungs.filter(
+		(r) =>
+			r.bucket === "ok" && !r.incompleteUnlessOffBox && r.degraded.length === 0,
+	);
 	// Committed (RssAnon+VmSwap) is the pre-registered memory metric and is
 	// always available on the Linux runner. RSS is the fallback so the local
 	// macOS smoke still produces a parseable curve; which one was used is
@@ -502,9 +566,12 @@ async function main(): Promise<void> {
 		`bench-session-scale: server up on ${PORT}; ladder=[${LADDER.join(",")}] interval=${INTERVAL_MS}ms payload=${PAYLOAD_BYTES}B steady=${STEADY_SECONDS}s idle=${IDLE_SECONDS}s endpoints=${ENDPOINTS}`,
 	);
 
+	// serverCpuPct is a windowed rate over the sample interval, and serverRxDelta
+	// is the receive count inside that same window: a per-phase loss question is
+	// answered by summing rows of one phase, not by differencing two run totals.
 	writeFileSync(
 		OUT_CSV,
-		"rung,sessions,ts_ms,phase,hostCpuPct,serverCpuPct,serverRssMb,serverCommittedMb,serverFd,clientRssMb,memAvailableMb,sessionsActive\n",
+		"rung,sessions,ts_ms,phase,windowMs,hostCpuPct,serverCpuPct,serverRssMb,serverCommittedMb,serverFd,clientRssMb,memAvailableMb,sessionsActive,serverRxDelta,serverRxSinceRungStart\n",
 	);
 
 	const rungs: Rung[] = [];
@@ -513,6 +580,12 @@ async function main(): Promise<void> {
 	/** Lowest MemAvailable seen in the current rung, written by both the phase
 	 * sampler and the independent watchdog. */
 	let rungMemAvailableMin: number | null = null;
+	/** S1: the first rung the generator could not source. Pre-registration: that
+	 * rung *and every rung above it* are incomplete-unless-off-box, because a
+	 * generator that could not fill rung N cannot be assumed to have filled
+	 * rung N+1 — its own numbers there are a client measurement wearing a server
+	 * label. Set once, never cleared. */
+	let s1LimitedAtSessions: number | null = null;
 
 	const buildResult = () => ({
 		version: 1,
@@ -534,6 +607,7 @@ async function main(): Promise<void> {
 			idleSeconds: IDLE_SECONDS,
 			settleSeconds: SETTLE_SECONDS,
 			drainGraceMs: DRAIN_GRACE_MS,
+			drainTimeoutSeconds: DRAIN_TIMEOUT_SECONDS,
 			endpoints: ENDPOINTS,
 			connectConcurrency: CONNECT_CONCURRENCY,
 			watchdogIntervalMs: WATCHDOG_INTERVAL_MS,
@@ -682,6 +756,9 @@ async function main(): Promise<void> {
 		const state: {
 			phase: string;
 			steadyStart: Window | null;
+			/** The client's idle marker: end of the steady window proper. */
+			steadyMark: Window | null;
+			/** steadyMark + drain grace: end of the steady *accounting* window. */
 			steadyEnd: Window | null;
 			idleEnd: Window | null;
 			report: ClientReport | null;
@@ -689,12 +766,16 @@ async function main(): Promise<void> {
 		} = {
 			phase: "connect",
 			steadyStart: null,
+			steadyMark: null,
 			steadyEnd: null,
 			idleEnd: null,
 			report: null,
 			clientRssGuardFired: false,
 		};
 		const rungStart = boundary();
+		// Zero unless a previous rung's sessions outlived it — which would mean
+		// this rung's memory and CPU are partly someone else's.
+		const sessionsActiveAtStart = rungStart.metrics.sessionsActive;
 
 		// Phase markers arrive on the client's stdout the instant it switches
 		// phases, so both sides use the same boundaries.
@@ -712,7 +793,11 @@ async function main(): Promise<void> {
 						state.steadyStart = boundary();
 						state.phase = "steady";
 					} else if (line.includes("phase idle")) {
-						state.phase = "idle";
+						state.steadyMark = boundary();
+						// Labelled `drain`, not `idle`: these samples carry datagrams
+						// that belong to the steady window, and calling them idle
+						// would make the per-stage CSV lie about where they landed.
+						state.phase = "drain";
 						// Datagrams sent in the last instant of the steady phase are
 						// still in flight when the client stops. Counting the server
 						// side immediately would book them as loss; the idle phase
@@ -720,6 +805,7 @@ async function main(): Promise<void> {
 						// correctly instead of manufacturing a delivery deficit.
 						setTimeout(() => {
 							state.steadyEnd = boundary();
+							state.phase = "idle";
 						}, DRAIN_GRACE_MS);
 					} else if (line.includes("phase stop")) {
 						state.idleEnd = boundary();
@@ -747,6 +833,11 @@ async function main(): Promise<void> {
 		})();
 
 		const hostSteady: number[] = [];
+		let prevSample = {
+			wallMs: rungStart.wallMs,
+			cpuMs: rungStart.serverCpuMs,
+			serverRx: rungStart.serverRx,
+		};
 		let serverRssMbMax = 0;
 		let serverCommittedMbMax: number | null = null;
 		let serverFdCountMax: number | null = null;
@@ -788,15 +879,20 @@ async function main(): Promise<void> {
 			}
 			sessionsActiveMax = Math.max(sessionsActiveMax, active);
 			if (state.phase === "steady" && host !== null) hostSteady.push(host);
+			// Windowed, never cumulative: a running average since rung start decays
+			// with elapsed time and would report a saturated steady phase as a
+			// comfortable one just because the rung had been going a while.
+			const nowMs = Date.now();
+			const nowCpuMs = serverCpuMs();
+			const windowMs = Math.max(nowMs - prevSample.wallMs, 1);
+			const cpuPct = ((nowCpuMs - prevSample.cpuMs) / windowMs) * 100;
+			const rxDelta = serverRx - prevSample.serverRx;
+			prevSample = { wallMs: nowMs, cpuMs: nowCpuMs, serverRx };
 			appendFileSync(
 				OUT_CSV,
-				`${index + 1},${sessions},${Date.now()},${state.phase},${host?.toFixed(1) ?? ""},${(
-					((serverCpuMs() - rungStart.serverCpuMs) /
-						Math.max(Date.now() - rungStart.wallMs, 1)) *
-						100
-				).toFixed(
+				`${index + 1},${sessions},${nowMs},${state.phase},${windowMs},${host?.toFixed(1) ?? ""},${cpuPct.toFixed(
 					1,
-				)},${mem.rssMb.toFixed(1)},${mem.committedMb?.toFixed(1) ?? ""},${fds ?? ""},${cRss?.toFixed(1) ?? ""},${avail?.toFixed(0) ?? ""},${active}\n`,
+				)},${mem.rssMb.toFixed(1)},${mem.committedMb?.toFixed(1) ?? ""},${fds ?? ""},${cRss?.toFixed(1) ?? ""},${avail?.toFixed(0) ?? ""},${active},${rxDelta},${serverRx - rungStart.serverRx}\n`,
 			);
 		}
 
@@ -806,8 +902,33 @@ async function main(): Promise<void> {
 		// The rung is over either way; make sure nothing it spawned survives it.
 		killChildGroup("SIGKILL");
 		activeChild = null;
-		if (!state.steadyEnd) state.steadyEnd = boundary();
-		if (!state.idleEnd) state.idleEnd = boundary();
+		// A missing phase marker means the client died before printing it. The
+		// windows can still be closed at the child's exit so the rung reports
+		// *something*, but a synthesized boundary is not the boundary that was
+		// asked for: it silently stretches the steady window over whatever the
+		// client was doing when it died. Every synthesis is recorded, and the
+		// rung is degraded — never `ok`, never a point on the curve.
+		const degraded: string[] = [];
+		if (!state.steadyStart) {
+			degraded.push("steadyStart marker never arrived");
+		}
+		if (!state.steadyMark) {
+			degraded.push("idle marker never arrived: steady window synthesized");
+			state.steadyMark = boundary();
+		}
+		if (!state.steadyEnd) {
+			degraded.push("drain grace never closed: steadyEnd synthesized");
+			state.steadyEnd = boundary();
+		}
+		if (!state.idleEnd) {
+			degraded.push("stop marker never arrived: idleEnd synthesized");
+			state.idleEnd = boundary();
+		}
+		if (sessionsActiveAtStart > 0) {
+			degraded.push(
+				`rung started with ${sessionsActiveAtStart} session(s) still active from the previous rung`,
+			);
+		}
 
 		const parsed: ClientReport | null = state.report;
 		if (!parsed) {
@@ -826,14 +947,19 @@ async function main(): Promise<void> {
 				((to.serverCpuMs - from.serverCpuMs) / (to.wallMs - from.wallMs)) * 100
 			);
 		};
-		const steadyServerRx =
-			state.steadyStart && state.steadyEnd
-				? state.steadyEnd.serverRx - state.steadyStart.serverRx
-				: 0;
-		const idleServerRx =
-			state.steadyEnd && state.idleEnd
-				? state.idleEnd.serverRx - state.steadyEnd.serverRx
-				: 0;
+		const rxBetween = (from: Window | null, to: Window | null): number =>
+			from && to ? to.serverRx - from.serverRx : 0;
+		// Per stage, so a delivery deficit says *where* it happened. `drain` is
+		// the boundary artifact the grace exists to absorb; `idle` should be zero
+		// because the idle phase sends nothing.
+		const phaseServerRx = {
+			connect: rxBetween(rungStart, state.steadyStart),
+			steady: rxBetween(state.steadyStart, state.steadyMark),
+			drain: rxBetween(state.steadyMark, state.steadyEnd),
+			idle: rxBetween(state.steadyEnd, state.idleEnd),
+		};
+		const steadyServerRx = phaseServerRx.steady + phaseServerRx.drain;
+		const idleServerRx = phaseServerRx.idle;
 		const rateLimitedTotal =
 			(state.idleEnd?.metrics.rateLimited ?? 0) - rungStart.metrics.rateLimited;
 		const limitExceededTotal =
@@ -846,12 +972,34 @@ async function main(): Promise<void> {
 		const sessionsOk = parsed?.sessionsOk ?? 0;
 		const steadySent = parsed?.steady.sent ?? 0;
 		const expectedSends = parsed?.steady.expectedSends ?? 0;
-		const clientCpuPctSteady =
-			parsed?.client.cpuMsSteady != null && state.steadyStart && state.steadyEnd
-				? (parsed.client.cpuMsSteady /
-						(state.steadyEnd.wallMs - rungStart.wallMs)) *
-					100
-				: null;
+		// The client reports CPU per phase window; divide by the same window, from
+		// the steady marker to the idle marker. Dividing a steady-phase CPU
+		// figure by a window that includes the connect ramp is the cumulative
+		// average this ledger is fixing.
+		const pctOver = (
+			cpuMs: number | null | undefined,
+			from: Window | null,
+			to: Window | null,
+		): number | null => {
+			if (cpuMs == null || !from || !to || to.wallMs <= from.wallMs)
+				return null;
+			return (cpuMs / (to.wallMs - from.wallMs)) * 100;
+		};
+		const clientCpuPctSteady = pctOver(
+			parsed?.client.cpuMsSteady,
+			state.steadyStart,
+			state.steadyMark,
+		);
+		const clientCpuPctIdle = pctOver(
+			parsed?.client.cpuMsIdle,
+			state.steadyMark,
+			state.idleEnd,
+		);
+		const clientCpuPctConnect = pctOver(
+			parsed?.client.cpuMsConnect,
+			rungStart,
+			state.steadyStart,
+		);
 
 		const metrics = {
 			sessionsOk,
@@ -864,18 +1012,40 @@ async function main(): Promise<void> {
 			serverRssMbMax,
 			clientRssMbMax,
 			connectWallSec: parsed?.connectWallSec ?? 0,
-			serverCpuPctSteady: windowPct(state.steadyStart, state.steadyEnd),
+			serverCpuPctSteady: windowPct(state.steadyStart, state.steadyMark),
 			clientCpuPctSteady,
 			hostCpuPctMedianSteady: median(hostSteady),
 			threw: parsed === null,
+			connectTimedOut: parsed?.connectTimedOut ?? false,
 			clientRssGuardFired: state.clientRssGuardFired,
 		};
-		const { bucket, reason } = classify(metrics);
+		let { bucket, reason } = classify(metrics);
+		// Degradation cannot invent a bucket — the buckets are pre-registered —
+		// but it must not be possible to read a verdict off a window that was
+		// never measured. Only the verdicts that *depend* on the server-side
+		// windows are demoted, into the already-registered incomplete category;
+		// generator- and limiter-side verdicts are computed from the client
+		// report and stand on their own.
+		const windowDependent = new Set(["ok", "server-limited", "host-limited"]);
+		if (degraded.length > 0 && windowDependent.has(bucket)) {
+			reason = `${bucket} demoted: ${degraded.join("; ")}`;
+			bucket = "unclassified";
+		}
+
+		if (bucket === "generator-limited" && s1LimitedAtSessions === null) {
+			s1LimitedAtSessions = sessions;
+		}
+		if (s1LimitedAtSessions !== null && s1LimitedAtSessions !== sessions) {
+			reason = `${reason} [S1: incomplete-unless-off-box, generator ran out at ${s1LimitedAtSessions} sessions]`;
+		}
 
 		const rung: Rung = {
 			sessions,
 			bucket,
 			bucketReason: reason,
+			incompleteUnlessOffBox: s1LimitedAtSessions !== null,
+			s1PropagatedFromSessions: s1LimitedAtSessions,
+			degraded,
 			connectedRatio: metrics.connectedRatio,
 			offeredRatio: metrics.offeredRatio,
 			deliveryRatio: metrics.deliveryRatio,
@@ -891,19 +1061,26 @@ async function main(): Promise<void> {
 			serverRssMbMax,
 			serverCommittedMbMax,
 			serverFdCountMax,
+			serverCpuPctConnect: windowPct(rungStart, state.steadyStart),
 			serverCpuPctSteady: metrics.serverCpuPctSteady,
+			// From the end of the drain grace, so the idle rate is not diluted by
+			// the last second of steady-phase arrivals.
 			serverCpuPctIdle: windowPct(state.steadyEnd, state.idleEnd),
 			hostCpuPctMedianSteady: metrics.hostCpuPctMedianSteady,
 			clientRssMbMax,
+			clientCpuPctConnect,
 			clientCpuPctSteady,
+			clientCpuPctIdle,
 			hostMemAvailableMbMin: rungMemAvailableMin,
 			rateLimitedTotal,
 			limitExceededTotal,
 			datagramsDroppedTotal: droppedTotal,
 			sessionsActiveMax,
+			sessionsActiveAtStart,
 			steadySent,
 			steadyServerRx,
 			idleServerRx,
+			phaseServerRx,
 			sessionsLost: parsed?.sessionsLost ?? 0,
 			clientDistinctSourceIps: parsed?.client.distinctSourceIps ?? null,
 			clientRssGuardFired: state.clientRssGuardFired,
@@ -911,17 +1088,22 @@ async function main(): Promise<void> {
 		};
 		rungs.push(rung);
 		console.log(
-			`bench-session-scale: rung ${sessions} bucket=${bucket} (${reason}) connected=${rung.connectedRatio?.toFixed(3)} offered=${rung.offeredRatio?.toFixed(3) ?? "n/a"} delivered=${rung.deliveryRatio?.toFixed(3) ?? "n/a"} acceptP99=${rung.acceptMs.p99 ?? "n/a"}ms accepts/s=${rung.acceptsPerSec?.toFixed(0) ?? "n/a"} rss=${serverRssMbMax.toFixed(0)}MB committed=${serverCommittedMbMax?.toFixed(0) ?? "n/a"}MB fd=${serverFdCountMax ?? "n/a"} srvCpu(steady)=${rung.serverCpuPctSteady?.toFixed(0) ?? "n/a"}% srvCpu(idle)=${rung.serverCpuPctIdle?.toFixed(0) ?? "n/a"}% clientRss=${clientRssMbMax?.toFixed(0) ?? "n/a"}MB`,
+			`bench-session-scale: rung ${sessions} bucket=${bucket} (${reason}) connected=${rung.connectedRatio?.toFixed(3)} offered=${rung.offeredRatio?.toFixed(3) ?? "n/a"} delivered=${rung.deliveryRatio?.toFixed(3) ?? "n/a"} rx(connect/steady/drain/idle)=${phaseServerRx.connect}/${phaseServerRx.steady}/${phaseServerRx.drain}/${phaseServerRx.idle} acceptP99=${rung.acceptMs.p99 ?? "n/a"}ms accepts/s=${rung.acceptsPerSec?.toFixed(0) ?? "n/a"} rss=${serverRssMbMax.toFixed(0)}MB committed=${serverCommittedMbMax?.toFixed(0) ?? "n/a"}MB fd=${serverFdCountMax ?? "n/a"} srvCpu(steady)=${rung.serverCpuPctSteady?.toFixed(0) ?? "n/a"}% srvCpu(idle)=${rung.serverCpuPctIdle?.toFixed(0) ?? "n/a"}% clientRss=${clientRssMbMax?.toFixed(0) ?? "n/a"}MB${rung.incompleteUnlessOffBox ? " INCOMPLETE-UNLESS-OFF-BOX" : ""}${degraded.length > 0 ? ` DEGRADED(${degraded.join("; ")})` : ""}`,
 		);
 
-		// STOP conditions that end the ladder rather than the rung.
+		// STOP conditions that end the ladder rather than the rung. S5 is a
+		// registered STOP with one trigger — a connect phase past its timeout —
+		// and it may not be used as a label for whatever else went wrong; an
+		// unregistered failure still stops the ladder, under its own name.
 		if (
 			rungMemAvailableMin !== null &&
 			rungMemAvailableMin < T.hostMemAvailableAbortMb
 		) {
 			ladderAborted = `S3 host memory floor: MemAvailable ${rungMemAvailableMin.toFixed(0)}MB`;
+		} else if (parsed?.connectTimedOut) {
+			ladderAborted = `S5 connect timeout: connect phase ${metrics.connectWallSec.toFixed(0)}s exceeded ${CONNECT_TIMEOUT_SECONDS}s at ${sessions} sessions`;
 		} else if (bucket === "harness-error") {
-			ladderAborted = "S5 harness error";
+			ladderAborted = `harness error at ${sessions} sessions (not a registered STOP): ${reason}`;
 		}
 
 		// Every completed rung is on disk before the next one starts.
@@ -931,6 +1113,31 @@ async function main(): Promise<void> {
 		);
 
 		await new Promise((res) => setTimeout(res, SETTLE_SECONDS * 1000));
+
+		// The settle window is a guess; sessionsActive is the fact. A rung that
+		// starts while the previous rung's sessions are still open measures both
+		// of them, and the memory curve — the whole deliverable — is the first
+		// thing that lie corrupts. Wait for the count to come back to the
+		// baseline before the next rung is allowed to start.
+		if (!ladderAborted && index + 1 < LADDER.length) {
+			const drainDeadline = Date.now() + DRAIN_TIMEOUT_SECONDS * 1000;
+			let active = server.metricsSnapshot().sessionsActive;
+			while (active > DRAIN_BASELINE_SESSIONS && Date.now() < drainDeadline) {
+				await new Promise((res) => setTimeout(res, 1000));
+				active = server.metricsSnapshot().sessionsActive;
+			}
+			if (active > DRAIN_BASELINE_SESSIONS) {
+				// Not fatal — the next rung records it as `sessionsActiveAtStart`
+				// and is marked degraded — but it must be loud in the run log.
+				console.warn(
+					`bench-session-scale: rung ${sessions} left ${active} session(s) active after ${DRAIN_TIMEOUT_SECONDS}s of drain; next rung starts contaminated`,
+				);
+			} else {
+				console.log(
+					`bench-session-scale: drained to ${active} active session(s) before the next rung`,
+				);
+			}
+		}
 	}
 
 	clearInterval(watchdog);
@@ -940,11 +1147,22 @@ async function main(): Promise<void> {
 	flushResult();
 	console.log(`bench-session-scale: wrote ${OUT_JSON} and ${OUT_CSV}`);
 	console.log(
-		"sessions | bucket | connected | offered | delivered | acceptP99 | accepts/s | rssMB | committedMB | fd | srvCpuSteady | srvCpuIdle | clientRssMB",
+		"sessions | bucket | usable | connected | offered | delivered | rx steady/drain/idle | acceptP99 | accepts/s | rssMB | committedMB | fd | srvCpuSteady | srvCpuIdle | clientRssMB",
 	);
 	for (const r of rungs) {
+		// `usable` is the honest headline: a rung can pass every threshold and
+		// still be unusable as a server number because the generator ran out
+		// below it or its windows were synthesized.
+		const usable =
+			r.bucket === "ok" && !r.incompleteUnlessOffBox && r.degraded.length === 0
+				? "yes"
+				: r.incompleteUnlessOffBox
+					? "S1 "
+					: r.degraded.length > 0
+						? "deg"
+						: "no ";
 		console.log(
-			`${String(r.sessions).padStart(8)} | ${r.bucket.padEnd(20)} | ${(r.connectedRatio ?? 0).toFixed(3)} | ${(r.offeredRatio ?? 0).toFixed(3)} | ${(r.deliveryRatio ?? 0).toFixed(3)} | ${String(r.acceptMs.p99 ?? "n/a").padStart(9)} | ${(r.acceptsPerSec ?? 0).toFixed(0).padStart(9)} | ${r.serverRssMbMax.toFixed(0).padStart(5)} | ${(r.serverCommittedMbMax ?? 0).toFixed(0).padStart(11)} | ${String(r.serverFdCountMax ?? "n/a").padStart(4)} | ${(r.serverCpuPctSteady ?? 0).toFixed(0).padStart(12)} | ${(r.serverCpuPctIdle ?? 0).toFixed(0).padStart(10)} | ${(r.clientRssMbMax ?? 0).toFixed(0).padStart(11)}`,
+			`${String(r.sessions).padStart(8)} | ${r.bucket.padEnd(20)} | ${usable} | ${(r.connectedRatio ?? 0).toFixed(3)} | ${(r.offeredRatio ?? 0).toFixed(3)} | ${(r.deliveryRatio ?? 0).toFixed(3)} | ${`${r.phaseServerRx.steady}/${r.phaseServerRx.drain}/${r.phaseServerRx.idle}`.padStart(20)} | ${String(r.acceptMs.p99 ?? "n/a").padStart(9)} | ${(r.acceptsPerSec ?? 0).toFixed(0).padStart(9)} | ${r.serverRssMbMax.toFixed(0).padStart(5)} | ${(r.serverCommittedMbMax ?? 0).toFixed(0).padStart(11)} | ${String(r.serverFdCountMax ?? "n/a").padStart(4)} | ${(r.serverCpuPctSteady ?? 0).toFixed(0).padStart(12)} | ${(r.serverCpuPctIdle ?? 0).toFixed(0).padStart(10)} | ${(r.clientRssMbMax ?? 0).toFixed(0).padStart(11)}`,
 		);
 	}
 	console.log(`curve: ${JSON.stringify(result.curve)}`);
