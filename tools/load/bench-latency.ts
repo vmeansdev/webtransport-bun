@@ -96,8 +96,12 @@ export type ClientLatencyJson = {
 };
 
 export type LatencyStep = {
+	/** Effective — what the generator produced. Rungs are labelled by this. */
 	perSessionRate: number;
 	aggregateRate: number;
+	/** What was asked for. Kept so the request and the load stay separable. */
+	nominalPerSessionRate: number;
+	nominalAggregateRate: number;
 	elapsedSec: number;
 	requestedDatagrams: number;
 	clientSent: number;
@@ -162,7 +166,9 @@ async function main(): Promise<void> {
 	let echoSent = 0;
 	let echoErr = 0;
 
-	const aggregatePeak = SESSIONS * Math.max(...RATES);
+	// The tick arm rounds its per-tick burst up, so the effective rate can exceed
+	// the requested one by up to a tick's worth of datagrams per session.
+	const aggregatePeak = SESSIONS * (Math.max(...RATES) + TICK_HZ);
 	const server = createServer({
 		port: PORT,
 		tls: { certPem: tls.certPem, keyPem: tls.keyPem },
@@ -213,9 +219,9 @@ async function main(): Promise<void> {
 
 	const steps: LatencyStep[] = [];
 	for (const [index, rate] of RATES.entries()) {
-		const aggregate = SESSIONS * rate;
+		const nominalAggregate = SESSIONS * rate;
 		console.log(
-			`bench-latency: step ${index + 1}/${RATES.length} rate=${rate}/s/session aggregate=${aggregate}/s`,
+			`bench-latency: step ${index + 1}/${RATES.length} requesting rate=${rate}/s/session aggregate=${nominalAggregate}/s`,
 		);
 		ingest.reset();
 		const rx0 = serverRx;
@@ -317,9 +323,20 @@ async function main(): Promise<void> {
 			);
 		}
 
+		// The rung is labelled by what the generator can actually produce, never
+		// by what was asked for. The tick arm sends `round(rate / tickHz)`
+		// datagrams per tick, so a requested 100/s/session at 64 Hz is really
+		// 128/s/session — a 28% mislabel if the request is used as the label.
+		// The uniform arm quantizes too, by well under a datagram per second.
+		const effectivePerSessionRate =
+			client?.effectiveDatagramsPerSecPerSession ?? rate;
+		const aggregate = Math.round(SESSIONS * effectivePerSessionRate);
+
 		const step: LatencyStep = {
-			perSessionRate: rate,
+			perSessionRate: effectivePerSessionRate,
 			aggregateRate: aggregate,
+			nominalPerSessionRate: rate,
+			nominalAggregateRate: nominalAggregate,
 			elapsedSec,
 			requestedDatagrams: aggregate * STEP_SECONDS,
 			clientSent: num(/datagrams sent=(\d+)/),
@@ -350,7 +367,7 @@ async function main(): Promise<void> {
 		const s = ingest.summary();
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
 		console.log(
-			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
+			`bench-latency: step ${index + 1} done n=${s.count} p50=${ms(s.p50Ns)}ms p99=${ms(s.p99Ns)}ms p999=${ms(s.p999Ns)}ms max=${ms(s.maxNs)}ms neg=${s.negative} effective=${step.aggregateRate}/s up=${step.upDeliveryRatio?.toFixed(3) ?? "n/a"} sent=${step.clientSent}/${step.requestedDatagrams} drained=${drainArrivals} hostCpu=${step.hostCpuPctMedian?.toFixed(0) ?? "n/a"}%`,
 		);
 	}
 

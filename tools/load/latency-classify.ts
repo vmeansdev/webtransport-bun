@@ -53,8 +53,11 @@ export type ArmFragment = {
 
 export type ClassifiedStep = {
 	arm: string;
+	/** Effective offered rate — the label every curve and every A/B pairs on. */
 	aggregateRate: number;
 	perSessionRate: number;
+	/** What the ladder asked for. Never a label, only a disclosure. */
+	nominalAggregateRate: number;
 	complete: boolean;
 	stop: StopReason | null;
 	bucket: LatencyBucket | null;
@@ -169,6 +172,7 @@ export function classifyStep(
 		arm: fragment.arm,
 		aggregateRate: step.aggregateRate,
 		perSessionRate: step.perSessionRate,
+		nominalAggregateRate: step.nominalAggregateRate,
 		complete,
 		stop,
 		bucket: complete ? bucketFor(ingest.p99Ns) : null,
@@ -242,10 +246,14 @@ export function classifyBatchAb(steps: ClassifiedStep[]): BatchAbEntry[] {
 	>();
 	for (const step of steps) {
 		if (!step.complete) continue;
-		const slot = byRate.get(step.aggregateRate) ?? {};
+		// Paired on the effective rate, per the registered "at equal offered
+		// rate": two arms that were asked for the same rung but produced
+		// different loads are not a comparison.
+		const key = Math.round(step.aggregateRate);
+		const slot = byRate.get(key) ?? {};
 		if (step.arm === "default") slot.def = step;
 		if (step.arm === "batch0") slot.zero = step;
-		byRate.set(step.aggregateRate, slot);
+		byRate.set(key, slot);
 	}
 	const out: BatchAbEntry[] = [];
 	for (const [aggregateRate, slot] of [...byRate.entries()].sort(
@@ -343,12 +351,12 @@ function render(result: ReturnType<typeof classifyRun>): string {
 			`arm=${arm.arm} arrival=${arm.arrival} batchEnv=${arm.datagramBatchEnv ?? "(default)"} complete=${arm.complete} highestRealtimeRate=${arm.highestRealtimeRate ?? "none"} lagFloor=${fmt(arm.steps[0]?.scheduleLagFloorNs ?? 0)}ms`,
 		);
 		lines.push(
-			"  agg/s |     p50 |     p90 |     p99 |    p999 |     max |  lagP99 |  rttP99 |    up | n       | verdict",
+			"eff agg/s |     p50 |     p90 |     p99 |    p999 |     max |  lagP99 |  rttP99 |    up | n       | verdict",
 		);
 		for (const s of arm.steps) {
 			const verdict = s.complete ? s.bucket : `STOP:${s.stop}`;
 			lines.push(
-				`${String(s.aggregateRate).padStart(7)} | ${fmt(s.ingest.p50Ns).padStart(7)} | ${fmt(s.ingest.p90Ns).padStart(7)} | ${fmt(s.ingest.p99Ns).padStart(7)} | ${fmt(s.ingest.p999Ns).padStart(7)} | ${fmt(s.ingest.maxNs).padStart(7)} | ${(s.scheduleLag ? fmt(s.scheduleLag.p99Ns) : "n/a").padStart(7)} | ${(s.rtt ? fmt(s.rtt.p99Ns) : "n/a").padStart(7)} | ${(s.upDeliveryRatio ?? 0).toFixed(3)} | ${String(s.stampedSamples).padStart(7)} | ${verdict}`,
+				`${String(s.aggregateRate).padStart(9)} | ${fmt(s.ingest.p50Ns).padStart(7)} | ${fmt(s.ingest.p90Ns).padStart(7)} | ${fmt(s.ingest.p99Ns).padStart(7)} | ${fmt(s.ingest.p999Ns).padStart(7)} | ${fmt(s.ingest.maxNs).padStart(7)} | ${(s.scheduleLag ? fmt(s.scheduleLag.p99Ns) : "n/a").padStart(7)} | ${(s.rtt ? fmt(s.rtt.p99Ns) : "n/a").padStart(7)} | ${(s.upDeliveryRatio ?? 0).toFixed(3)} | ${String(s.stampedSamples).padStart(7)} | ${verdict}`,
 			);
 		}
 		const skewed = arm.steps.filter((s) => s.histogramSkew > 0);
@@ -359,7 +367,7 @@ function render(result: ReturnType<typeof classifyRun>): string {
 		}
 		for (const crossing of arm.crossings) {
 			lines.push(
-				`  p99 crosses ${crossing.thresholdMs}ms at ${crossing.aggregateRate ?? "no complete step"} datagrams/s`,
+				`  p99 crosses ${crossing.thresholdMs}ms at ${crossing.aggregateRate ?? "no complete step"} datagrams/s effective`,
 			);
 		}
 	}
