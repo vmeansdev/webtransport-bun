@@ -8,9 +8,14 @@
 //! pass still needs broader encoder strategies, decoder-stream acks, and interop
 //! evidence — see remaining gaps in module tests / `docs/WASM_PROTOCOL_SCOPE.md`.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use crate::varint;
+
+/// A decoded header name/value pair. Static-table hits borrow the table's
+/// `&'static str`s; dynamic-table and literal fields own their bytes.
+pub type HeaderField = (Cow<'static, str>, Cow<'static, str>);
 
 pub mod stream_type {
     pub const CONTROL: u64 = 0x00;
@@ -904,9 +909,11 @@ pub fn encode_status_response(status: &str) -> Vec<u8> {
 
 /// Wrap a payload as a typed, length-prefixed HTTP/3 frame.
 pub fn frame_wrap(frame_type: u64, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let len = payload.len() as u64;
+    let mut out =
+        Vec::with_capacity(varint::width(frame_type) + varint::width(len) + payload.len());
     varint::encode(frame_type, &mut out);
-    varint::encode(payload.len() as u64, &mut out);
+    varint::encode(len, &mut out);
     out.extend_from_slice(payload);
     out
 }
@@ -1034,7 +1041,7 @@ const QPACK_STATIC_TABLE: [(&str, &str); 99] = [
 /// Decode a QPACK field section into (name, value) pairs without a dynamic
 /// table (RIC must be 0; dynamic refs fail). Prefer [`decode_field_section`]
 /// when a [`QpackDecoder`] is available.
-pub fn decode_literal_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
+pub fn decode_literal_headers(buf: &[u8]) -> Option<Vec<HeaderField>> {
     let decoder = QpackDecoder::disabled();
     decode_field_section(buf, &decoder)
         .ok()
@@ -1051,7 +1058,7 @@ pub fn decode_literal_headers(buf: &[u8]) -> Option<Vec<(String, String)>> {
 pub fn decode_field_section(
     mut buf: &[u8],
     decoder: &QpackDecoder,
-) -> Result<(Vec<(String, String)>, u64), QpackError> {
+) -> Result<(Vec<HeaderField>, u64), QpackError> {
     if buf.len() < 2 {
         return Err(QpackError::Invalid);
     }
@@ -1090,13 +1097,13 @@ pub fn decode_field_section(
             buf = buf.get(n..).ok_or(QpackError::Invalid)?;
             let (name, value) = if static_table {
                 let (n, v) = qpack_static(idx).ok_or(QpackError::Invalid)?;
-                (n.to_string(), v.to_string())
+                (Cow::Borrowed(n), Cow::Borrowed(v))
             } else {
                 let (n, v) = decoder
                     .table
                     .get_relative(idx, base)
                     .ok_or(QpackError::Invalid)?;
-                (n.to_string(), v.to_string())
+                (Cow::Owned(n.to_string()), Cow::Owned(v.to_string()))
             };
             out.push((name, value));
         } else if first & 0x40 != 0 {
@@ -1105,16 +1112,18 @@ pub fn decode_field_section(
             let (idx, n) = qpack_int_decode(buf, 4).ok_or(QpackError::Invalid)?;
             buf = buf.get(n..).ok_or(QpackError::Invalid)?;
             let name = if static_table {
-                qpack_static(idx).ok_or(QpackError::Invalid)?.0.to_string()
+                Cow::Borrowed(qpack_static(idx).ok_or(QpackError::Invalid)?.0)
             } else {
-                decoder
-                    .table
-                    .get_relative(idx, base)
-                    .ok_or(QpackError::Invalid)?
-                    .0
-                    .to_string()
+                Cow::Owned(
+                    decoder
+                        .table
+                        .get_relative(idx, base)
+                        .ok_or(QpackError::Invalid)?
+                        .0
+                        .to_string(),
+                )
             };
-            let value = read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?;
+            let value = Cow::Owned(read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?);
             out.push((name, value));
         } else if first & 0x20 != 0 {
             // Literal Field Line With Literal Name: 001 N H nameLen(3).
@@ -1124,8 +1133,8 @@ pub fn decode_field_section(
             let nlen_us = usize::try_from(nlen).map_err(|_| QpackError::Invalid)?;
             let raw = buf.get(..nlen_us).ok_or(QpackError::Invalid)?;
             buf = buf.get(nlen_us..).ok_or(QpackError::Invalid)?;
-            let name = decode_qpack_bytes(raw, huffman).ok_or(QpackError::Invalid)?;
-            let value = read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?;
+            let name = Cow::Owned(decode_qpack_bytes(raw, huffman).ok_or(QpackError::Invalid)?);
+            let value = Cow::Owned(read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?);
             out.push((name, value));
         } else if first & 0x10 != 0 {
             // Indexed Field Line With Post-Base Index: 0001 index(4).
@@ -1135,19 +1144,21 @@ pub fn decode_field_section(
                 .table
                 .get_post_base(idx, base)
                 .ok_or(QpackError::Invalid)
-                .map(|(n, v)| (n.to_string(), v.to_string()))?;
+                .map(|(n, v)| (Cow::Owned(n.to_string()), Cow::Owned(v.to_string())))?;
             out.push((name, value));
         } else {
             // Literal Field Line With Post-Base Name Reference: 0000 N index(3).
             let (idx, n) = qpack_int_decode(buf, 3).ok_or(QpackError::Invalid)?;
             buf = buf.get(n..).ok_or(QpackError::Invalid)?;
-            let name = decoder
-                .table
-                .get_post_base(idx, base)
-                .ok_or(QpackError::Invalid)?
-                .0
-                .to_string();
-            let value = read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?;
+            let name = Cow::Owned(
+                decoder
+                    .table
+                    .get_post_base(idx, base)
+                    .ok_or(QpackError::Invalid)?
+                    .0
+                    .to_string(),
+            );
+            let value = Cow::Owned(read_qpack_string(&mut buf).ok_or(QpackError::Invalid)?);
             out.push((name, value));
         }
     }
@@ -1205,9 +1216,15 @@ fn qpack_int_decode(buf: &[u8], n: u8) -> Option<(u64, usize)> {
     Some((value, i))
 }
 
+/// Bytes `wrap_datagram` prepends for this session — the quarter-session-id
+/// varint.
+pub fn datagram_prefix_len(connect_stream_id: u64) -> usize {
+    varint::width(connect_stream_id / 4)
+}
+
 /// Prepend the quarter-session-id to an application datagram payload.
 pub fn wrap_datagram(connect_stream_id: u64, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(datagram_prefix_len(connect_stream_id) + payload.len());
     varint::encode(connect_stream_id / 4, &mut out);
     out.extend_from_slice(payload);
     out
@@ -1557,7 +1574,7 @@ mod tests {
         let (len, n1) = varint::decode(rest).unwrap();
         let payload = &rest[n1..n1 + len as usize];
         let hdrs = decode_literal_headers(payload).unwrap();
-        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_ref());
         assert_eq!(get(":method"), Some("CONNECT"));
         assert_eq!(get(":protocol"), Some("webtransport"));
         assert_eq!(get(":authority"), Some("example.com"));
@@ -1614,7 +1631,7 @@ mod tests {
         payload.extend_from_slice(&huffman_string(0x00, 7, "/chat"));
 
         let hdrs = decode_literal_headers(&payload).expect("decode must consume all field lines");
-        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_ref());
         assert_eq!(get(":method"), Some("CONNECT"));
         assert_eq!(get(":protocol"), Some("webtransport"));
         assert_eq!(get(":scheme"), Some("https"));
@@ -1642,6 +1659,34 @@ mod tests {
         let wrapped = wrap_datagram(8, b"x"); // stream 8 -> qsid 2
         let (qsid, _) = unwrap_datagram(&wrapped).unwrap();
         assert_eq!(qsid, 2);
+    }
+
+    #[test]
+    fn datagram_prefix_len_matches_wrap() {
+        // Both raw varint boundaries and the session ids (stream ids, always a
+        // multiple of 4) that straddle them once quartered.
+        let cases = [
+            0u64,
+            63,
+            64,
+            16383,
+            16384,
+            (1 << 30) - 1,
+            1 << 30,
+            252,
+            256,
+            65532,
+            65536,
+            4 * ((1u64 << 30) - 1),
+            4u64 << 30,
+        ];
+        for sid in cases {
+            assert_eq!(
+                datagram_prefix_len(sid),
+                wrap_datagram(sid, &[]).len(),
+                "session id {sid}"
+            );
+        }
     }
 
     #[test]
@@ -1776,7 +1821,7 @@ mod tests {
         b1.extend_from_slice(b"/index.html");
         assert_eq!(
             decode_literal_headers(&b1).unwrap(),
-            vec![(":path".to_string(), "/index.html".to_string())]
+            vec![(":path".into(), "/index.html".into())]
         );
 
         // Decoder with the advertised 220-byte capacity from the examples.
@@ -1812,8 +1857,8 @@ mod tests {
         assert_eq!(
             b2_hdrs,
             vec![
-                (":authority".to_string(), "www.example.com".to_string()),
-                (":path".to_string(), "/sample/path".to_string()),
+                (":authority".into(), "www.example.com".into()),
+                (":path".into(), "/sample/path".into()),
             ]
         );
 
@@ -1852,9 +1897,9 @@ mod tests {
         assert_eq!(
             b4_hdrs,
             vec![
-                (":authority".to_string(), "www.example.com".to_string()),
-                (":path".to_string(), "/".to_string()),
-                ("custom-key".to_string(), "custom-value".to_string()),
+                (":authority".into(), "www.example.com".into()),
+                (":path".into(), "/".into()),
+                ("custom-key".into(), "custom-value".into()),
             ]
         );
 
@@ -1908,7 +1953,7 @@ mod tests {
         let (hdrs, ric) = decode_field_section(section, &dec).unwrap();
         assert_eq!(ric, encoded.ric);
         assert_eq!(ric, dec.table().insert_count());
-        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| hdrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_ref());
         assert_eq!(get(":method"), Some("CONNECT"));
         assert_eq!(get(":protocol"), Some("webtransport"));
         assert_eq!(get(":authority"), Some("example.com"));

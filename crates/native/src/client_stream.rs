@@ -5,7 +5,9 @@
 //! - Read bridge: sends Vec<u8> to a bounded mpsc channel; selects on a stop_sending oneshot.
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
-use crate::error::{from_reason as wt_from_reason, WtResult};
+use crate::error::{
+    from_reason as wt_from_reason, from_static_code as wt_from_static_code, WtResult,
+};
 use napi::Result;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
@@ -442,9 +444,9 @@ impl Drop for StreamChunk {
 // ---------------------------------------------------------------------------
 
 /// Shared slot for write failure error code (E_STOP_SENDING, E_STREAM_RESET).
-type WriteErrorSlot = Arc<Mutex<Option<String>>>;
+type WriteErrorSlot = Arc<Mutex<Option<&'static str>>>;
 /// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
-type ReadErrorSlot = Arc<Mutex<Option<String>>>;
+type ReadErrorSlot = Arc<Mutex<Option<&'static str>>>;
 type BidiBridgeParts = (
     mpsc::Receiver<StreamChunk>,
     mpsc::Sender<StreamCmd>,
@@ -776,7 +778,7 @@ impl ClientBidiStreamHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
-                return Err(wt_from_reason(read_error_code(&error)));
+                return Err(wt_from_static_code(read_error_code(&error)));
             }
         };
         let Some(n) = read_result else {
@@ -1037,8 +1039,8 @@ impl ClientBidiStreamHandle {
                     .and_then(|guard| guard.clone());
                 if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
-                        if let Some(ref code) = *guard {
-                            return Err(wt_from_reason(code.clone()));
+                        if let Some(code) = *guard {
+                            return Err(wt_from_static_code(code));
                         }
                     }
                 }
@@ -1072,8 +1074,8 @@ impl ClientBidiStreamHandle {
         if let Ok(slot) = self.write_error_slot.lock() {
             if let Some(slot) = slot.as_ref() {
                 if let Ok(guard) = slot.lock() {
-                    if let Some(ref code) = *guard {
-                        return Err(wt_from_reason(code.clone()));
+                    if let Some(code) = *guard {
+                        return Err(wt_from_static_code(code));
                     }
                 }
             }
@@ -1295,8 +1297,8 @@ impl ClientUniSendHandle {
         }
         if let Some(ref slot) = self.write_error_slot {
             if let Ok(guard) = slot.lock() {
-                if let Some(ref code) = *guard {
-                    return Err(napi::Error::from_reason(code.clone()));
+                if let Some(code) = *guard {
+                    return Err(napi::Error::from_reason(code));
                 }
             }
         }
@@ -1535,7 +1537,7 @@ impl ClientUniRecvHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
-                return Err(wt_from_reason(read_error_code(&error)));
+                return Err(wt_from_static_code(read_error_code(&error)));
             }
         };
         let Some(n) = read_result else {
@@ -1734,8 +1736,8 @@ impl ClientUniRecvHandle {
                     .and_then(|guard| guard.clone());
                 if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
-                        if let Some(ref code) = *guard {
-                            return Err(napi::Error::from_reason(code.clone()));
+                        if let Some(code) = *guard {
+                            return Err(napi::Error::from_reason(code));
                         }
                     }
                 }
@@ -1820,7 +1822,7 @@ fn spawn_bidi_write_bridge_on(
                         };
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         break;
@@ -1830,7 +1832,7 @@ fn spawn_bidi_write_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                     }
@@ -1841,7 +1843,7 @@ fn spawn_bidi_write_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         ret = Err(code.to_string());
@@ -1929,7 +1931,7 @@ fn spawn_recv_bridge_on_with_permit(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET".to_string());
+                                            *g = Some("E_STREAM_RESET");
                                         }
                                     }
                                     break;
@@ -1944,7 +1946,7 @@ fn spawn_recv_bridge_on_with_permit(
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
                                                 *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                    "E_BACKPRESSURE_TIMEOUT",
                                                 );
                                             }
                                         }
@@ -1982,7 +1984,7 @@ fn spawn_recv_bridge_on_with_permit(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e).to_string());
+                                    *guard = Some(read_error_code(&e));
                                 }
                             }
                             break;
@@ -2037,7 +2039,7 @@ pub fn spawn_bidi_bridge_on(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET".to_string());
+                                            *g = Some("E_STREAM_RESET");
                                         }
                                     }
                                     break;
@@ -2056,7 +2058,7 @@ pub fn spawn_bidi_bridge_on(
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
                                                 *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                    "E_BACKPRESSURE_TIMEOUT",
                                                 );
                                             }
                                         }
@@ -2094,7 +2096,7 @@ pub fn spawn_bidi_bridge_on(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e).to_string());
+                                    *guard = Some(read_error_code(&e));
                                 }
                             }
                             break;
@@ -2130,7 +2132,7 @@ pub fn spawn_bidi_bridge_on(
                             };
                             if let Ok(mut guard) = write_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(code.to_string());
+                                    *guard = Some(code);
                                 }
                             }
                             break;
@@ -2141,7 +2143,7 @@ pub fn spawn_bidi_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                     }
@@ -2152,7 +2154,7 @@ pub fn spawn_bidi_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         ret = Err(code.to_string());
@@ -2215,7 +2217,7 @@ pub fn spawn_uni_send_bridge_on(
                             };
                             if let Ok(mut guard) = write_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(code.to_string());
+                                    *guard = Some(code);
                                 }
                             }
                             break;
@@ -2226,7 +2228,7 @@ pub fn spawn_uni_send_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                     }
@@ -2237,7 +2239,7 @@ pub fn spawn_uni_send_bridge_on(
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
-                                *guard = Some(code.to_string());
+                                *guard = Some(code);
                             }
                         }
                         ret = Err(code.to_string());
@@ -2318,7 +2320,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET".to_string());
+                                            *g = Some("E_STREAM_RESET");
                                         }
                                     }
                                     break;
@@ -2339,7 +2341,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
                                                 *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT".to_string(),
+                                                    "E_BACKPRESSURE_TIMEOUT",
                                                 );
                                             }
                                         }
@@ -2376,7 +2378,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e).to_string());
+                                    *guard = Some(read_error_code(&e));
                                 }
                             }
                             break;
