@@ -205,10 +205,11 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
-      # Egress axis. The generator-headroom control runs first and alone: unless
-      # the JS originator demonstrably outruns the transport, no capacity number
-      # from the ladder below is allowed to mean anything. One server process per
-      # burst profile, then the 1->N fan-out shape.
+      # Egress axis. The generator-headroom control runs first, on a loaded
+      # server: unless the JS originator demonstrably outruns what the ladder
+      # asks of it, while the transport is carrying the ladder's top rung, no
+      # capacity number from the ladder below is allowed to mean anything. One
+      # server process per burst profile, then the 1->N fan-out shape.
       # Method, gates, buckets and STOP conditions are pre-registered in
       # docs/research/preregistrations/egress.md.
       - name: Run egress axis
@@ -226,9 +227,10 @@ jobs:
           mkdir -p "$OUTDIR"
           SHA="${{ github.event.inputs.candidate_commit }}"
           PORT=4450
-          GEN="$OUTDIR/bench-egress-$SHA-generator.json"
-          echo "== egress generator-headroom control =="
-          EGRESS_SHAPE=generator EGRESS_OUT="$GEN" bun tools/load/bench-egress.ts
+          GEN="$OUTDIR/bench-egress-$SHA-headroom.json"
+          echo "== egress generator-headroom control (loaded server) =="
+          EGRESS_SHAPE=headroom EGRESS_PORT="$PORT" EGRESS_OUT="$GEN" \
+            bun tools/load/bench-egress.ts
           FRAGMENTS="$GEN"
           IFS=',' read -ra PROFILES <<< "$EGRESS_PROFILES"
           for PROFILE in "${PROFILES[@]}"; do
