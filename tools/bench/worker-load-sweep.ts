@@ -45,9 +45,9 @@ import {
 	formatGapLine,
 	formatPipeCapLine,
 	type IngestGap,
-	type PipeCap,
 	makeRng,
 	median,
+	type PipeCap,
 	pickDisjointPhysicalCpus,
 	readHostSiblingMap,
 	shuffled,
@@ -84,6 +84,15 @@ const CC_MODES = (process.env.SWEEP_CC_MODES ?? "cubic")
 	.split(",")
 	.map((s) => s.trim())
 	.filter((s): s is "cubic" | "bbr" => s === "cubic" || s === "bbr");
+const GEN_MODES = (process.env.SWEEP_GEN_MODES ?? "onbox")
+	.split(",")
+	.map((s) => s.trim())
+	.filter((s): s is "onbox" | "offbox" => s === "onbox" || s === "offbox");
+/** ssh destination for the off-box generator, e.g. user@192.168.2.36. */
+const OFFBOX_SSH = (process.env.SWEEP_OFFBOX_SSH ?? "").trim();
+/** LAN address of this server as seen from the off-box generator. */
+const OFFBOX_HOST = (process.env.SWEEP_OFFBOX_HOST ?? "").trim();
+const OFFBOX_BIN = (process.env.SWEEP_OFFBOX_BIN ?? "/tmp/load-client").trim();
 const RMEM_RAISED_BYTES = 8 * 1024 * 1024;
 /** Load-generator processes sharing the sessions. */
 const CLIENTS = Number(process.env.SWEEP_CLIENTS ?? "2");
@@ -121,6 +130,7 @@ export type SweepArm = {
 	cpuMode: "shared" | "split";
 	rmemMode: "default" | "raised";
 	ccMode: "cubic" | "bbr";
+	genMode: "onbox" | "offbox";
 };
 
 export function sweepArms(): SweepArm[] {
@@ -131,18 +141,21 @@ export function sweepArms(): SweepArm[] {
 				for (const workers of WORKERS) {
 					for (const requestedPerSec of RATES) {
 						for (const ccMode of CC_MODES) {
-							arms.push({
-								workers,
-								requestedPerSec,
-								ratePerSession: Math.max(
-									1,
-									Math.round(requestedPerSec / SESSIONS),
-								),
-								sendMode,
-								cpuMode,
-								rmemMode,
-								ccMode,
-							});
+							for (const genMode of GEN_MODES) {
+								arms.push({
+									workers,
+									requestedPerSec,
+									ratePerSession: Math.max(
+										1,
+										Math.round(requestedPerSec / SESSIONS),
+									),
+									sendMode,
+									cpuMode,
+									rmemMode,
+									ccMode,
+									genMode,
+								});
+							}
 						}
 					}
 				}
@@ -159,12 +172,14 @@ export const armKey = (a: {
 	cpuMode?: "shared" | "split";
 	rmemMode?: "default" | "raised";
 	ccMode?: "cubic" | "bbr";
+	genMode?: "onbox" | "offbox";
 }): string => {
 	let key = `w${a.workers}@${a.requestedPerSec}`;
 	if (a.sendMode && a.sendMode !== "drop") key += `@${a.sendMode}`;
 	if (a.cpuMode && a.cpuMode !== "shared") key += `@${a.cpuMode}`;
 	if (a.rmemMode && a.rmemMode !== "default") key += `@${a.rmemMode}`;
 	if (a.ccMode && a.ccMode !== "cubic") key += `@${a.ccMode}`;
+	if (a.genMode && a.genMode !== "onbox") key += `@${a.genMode}`;
 	return key;
 };
 
@@ -198,6 +213,7 @@ export type SweepRun = {
 	skRcvbuf: number | null;
 	skDrops: number | null;
 	appliedCongestion: string | null;
+	offboxSsh: string | null;
 };
 
 function gitOutput(args: string[]): string {
@@ -238,6 +254,14 @@ async function runOne(
 	port: number,
 	splitTaskset: string,
 ): Promise<SweepRun> {
+	if (arm.genMode === "offbox") {
+		// A prior run's stragglers must not share the generator with this arm.
+		spawnSync(
+			"ssh",
+			["-o", "BatchMode=yes", OFFBOX_SSH, "pkill", "-x", "load-client"],
+			{ encoding: "utf8" },
+		);
+	}
 	const child = Bun.spawn(
 		[
 			"bun",
@@ -269,6 +293,9 @@ async function runOne(
 				WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1",
 				WT_PROBE_CLIENT_TASKSET: arm.cpuMode === "split" ? splitTaskset : "",
 				WT_PROBE_CONGESTION: arm.ccMode,
+				WT_PROBE_OFFBOX_SSH: arm.genMode === "offbox" ? OFFBOX_SSH : "",
+				WT_PROBE_OFFBOX_URL_HOST: arm.genMode === "offbox" ? OFFBOX_HOST : "",
+				WT_PROBE_OFFBOX_BIN: OFFBOX_BIN,
 			},
 		},
 	);
@@ -330,6 +357,7 @@ async function runOne(
 			skRcvbuf: run.skRcvbuf ?? null,
 			skDrops: run.skDrops ?? null,
 			appliedCongestion: run.appliedCongestion ?? null,
+			offboxSsh: run.offboxSsh ?? null,
 		};
 	} finally {
 		clearTimeout(timer);
@@ -747,6 +775,92 @@ export function classifyCc(input: {
 	};
 }
 
+export type OffboxBucket = "offbox-lifts" | "not-offbox" | "incomplete";
+
+export type OffboxCap = {
+	onboxFrameTxPerSec: number | null;
+	offboxFrameTxPerSec: number | null;
+	ratio: number | null;
+	provisioned: boolean;
+	stopBucket: OffboxBucket;
+};
+
+export function classifyOffbox(input: {
+	summaries: readonly ArmSummary[];
+	ccModes: readonly string[];
+	rmemModes: readonly string[];
+	cpuModes: readonly string[];
+	sessions: number;
+	provisioned: boolean;
+}): OffboxCap {
+	const onbox = input.summaries.filter((s) => !s.key.endsWith("@offbox"));
+	const offbox = input.summaries.filter((s) => s.key.endsWith("@offbox"));
+	const onboxFrameTxPerSec = medianFrameTx(onbox);
+	const offboxFrameTxPerSec = medianFrameTx(offbox);
+	const ratio =
+		onboxFrameTxPerSec != null &&
+		offboxFrameTxPerSec != null &&
+		onboxFrameTxPerSec > 0
+			? offboxFrameTxPerSec / onboxFrameTxPerSec
+			: null;
+	const onboxReproduced =
+		onboxFrameTxPerSec != null &&
+		onboxFrameTxPerSec >= SHARED_FRAME_TX_MIN &&
+		onboxFrameTxPerSec <= SHARED_FRAME_TX_MAX;
+	const allCubic = (arms: readonly ArmSummary[]): boolean =>
+		arms.length > 0 &&
+		arms.every((s) => s.runs.every((r) => r.appliedCongestion === "cubic"));
+	const sessionsHealthy = (arms: readonly ArmSummary[]): boolean =>
+		arms.every((s) =>
+			s.runs.every((r) => r.sessionsOk >= 0.9 * input.sessions),
+		);
+	// The remote mark separates a real off-box run from a mislabeled local one.
+	const remoteMarked =
+		offbox.length > 0 &&
+		offbox.every((s) => s.runs.every((r) => r.offboxSsh != null)) &&
+		onbox.every((s) => s.runs.every((r) => r.offboxSsh == null));
+	const mixedCc = input.ccModes.some((m) => m !== "cubic");
+	const mixedRmem = input.rmemModes.some((m) => m !== "default");
+	const mixedCpu = input.cpuModes.some((m) => m !== "shared");
+	const incomplete =
+		mixedCc ||
+		mixedRmem ||
+		mixedCpu ||
+		!input.provisioned ||
+		offbox.length === 0 ||
+		onboxFrameTxPerSec == null ||
+		offboxFrameTxPerSec == null ||
+		offboxFrameTxPerSec === 0 ||
+		!onboxReproduced ||
+		!remoteMarked ||
+		!allCubic(onbox) ||
+		!allCubic(offbox) ||
+		!sessionsHealthy(onbox) ||
+		!sessionsHealthy(offbox) ||
+		offboxFrameTxPerSec < SHARED_FRAME_TX_MIN ||
+		(ratio != null &&
+			ratio >= CORESPLIT_RATIO &&
+			offboxFrameTxPerSec <= SHARED_FRAME_TX_MAX);
+	let stopBucket: OffboxBucket = "incomplete";
+	if (!incomplete && ratio != null && offboxFrameTxPerSec != null) {
+		if (ratio >= CORESPLIT_RATIO && offboxFrameTxPerSec > SHARED_FRAME_TX_MAX) {
+			stopBucket = "offbox-lifts";
+		} else if (
+			ratio < CORESPLIT_RATIO &&
+			offboxFrameTxPerSec >= SHARED_FRAME_TX_MIN
+		) {
+			stopBucket = "not-offbox";
+		}
+	}
+	return {
+		onboxFrameTxPerSec,
+		offboxFrameTxPerSec,
+		ratio,
+		provisioned: input.provisioned,
+		stopBucket,
+	};
+}
+
 async function main(): Promise<void> {
 	if (!(await Bun.file(CLIENT_BIN).exists())) {
 		console.error(`sweep: REFUSED\n  ${CLIENT_BIN} is missing`);
@@ -771,6 +885,55 @@ async function main(): Promise<void> {
 			`clients=${CLIENTS} workers=[${WORKERS.join(",")}] rates=[${RATES.join(",")}] ` +
 			`cpuModes=[${CPU_MODES.join(",")}] ccModes=[${CC_MODES.join(",")}]`,
 	);
+
+	const offboxStamp = GEN_MODES.includes("offbox");
+	let offboxProvisioned = false;
+	if (offboxStamp) {
+		if (!OFFBOX_SSH || !OFFBOX_HOST) {
+			console.error(
+				"sweep: REFUSED\n  SWEEP_OFFBOX_SSH and SWEEP_OFFBOX_HOST are required for offbox arms",
+			);
+			process.exit(1);
+		}
+		const ping = spawnSync(
+			"ssh",
+			["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", OFFBOX_SSH, "true"],
+			{ encoding: "utf8" },
+		);
+		const copy =
+			ping.status === 0
+				? spawnSync(
+						"scp",
+						[
+							"-q",
+							"-o",
+							"BatchMode=yes",
+							CLIENT_BIN,
+							`${OFFBOX_SSH}:${OFFBOX_BIN}`,
+						],
+						{ encoding: "utf8" },
+					)
+				: null;
+		const mark =
+			copy?.status === 0
+				? spawnSync(
+						"ssh",
+						["-o", "BatchMode=yes", OFFBOX_SSH, "chmod", "+x", OFFBOX_BIN],
+						{ encoding: "utf8" },
+					)
+				: null;
+		offboxProvisioned = mark?.status === 0;
+		console.log(
+			`sweep: offbox ssh=${OFFBOX_SSH} host=${OFFBOX_HOST} bin=${OFFBOX_BIN} ` +
+				`provisioned=${offboxProvisioned}`,
+		);
+		if (!offboxProvisioned) {
+			console.error(
+				`sweep: REFUSED\n  offbox provisioning failed (${(ping.stderr || copy?.stderr || mark?.stderr || "").trim().slice(0, 300)})`,
+			);
+			process.exit(1);
+		}
+	}
 
 	const siblingMap = readHostSiblingMap(capacity.cpus);
 	const clientCpus = siblingMap ? pickDisjointPhysicalCpus(siblingMap) : null;
@@ -852,6 +1015,14 @@ async function main(): Promise<void> {
 		cpuModes: CPU_MODES,
 		sessions: SESSIONS,
 	});
+	const offbox = classifyOffbox({
+		summaries,
+		ccModes: CC_MODES,
+		rmemModes: RMEM_MODES,
+		cpuModes: CPU_MODES,
+		sessions: SESSIONS,
+		provisioned: offboxProvisioned,
+	});
 	const failures = [
 		...proofFailures(summaries),
 		...(gitOutput(["rev-parse", "HEAD"]) === head
@@ -892,6 +1063,10 @@ async function main(): Promise<void> {
 			cpuModes: CPU_MODES,
 			rmemModes: RMEM_MODES,
 			ccModes: CC_MODES,
+			genModes: GEN_MODES,
+			offboxSsh: OFFBOX_SSH || null,
+			offboxHost: OFFBOX_HOST || null,
+			offboxProvisioned,
 			rmemDefault: origRmemDefault,
 			rmemMax: origRmemMax,
 			rmemRaised: raisedBytes,
@@ -901,6 +1076,7 @@ async function main(): Promise<void> {
 		coresplit,
 		rmem,
 		cc,
+		offbox,
 		generatorLimitedRates: generatorLimited,
 		collapse,
 		testedTheCliff,
@@ -925,8 +1101,11 @@ async function main(): Promise<void> {
 				`${String(s.datagramThreads).padStart(5)}${s.requestMet ? "" : "  (request not met)"}`,
 		);
 		for (const r of s.runs) {
-			if (r.gap) console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
-			if (r.pipeCap)
+			// Under the offbox stamp the older per-run STOP lines would invite
+			// flipping on the wrong classifier; the offbox line is the stamp.
+			if (r.gap && !offboxStamp)
+				console.log(`  ${s.key} r${r.round} ${formatGapLine(r.gap)}`);
+			if (r.pipeCap && !offboxStamp)
 				console.log(`  ${s.key} r${r.round} ${formatPipeCapLine(r.pipeCap)}`);
 			if (r.skRcvbuf != null) {
 				console.log(
@@ -1020,6 +1199,16 @@ async function main(): Promise<void> {
 				`bbrFrameTx=${n(cc.bbrFrameTxPerSec)} ` +
 				`ratio=${cc.ratio == null ? "n/a" : cc.ratio.toFixed(2)} ` +
 				`STOP=${cc.stopBucket}`,
+		);
+	}
+	if (offboxStamp) {
+		const n = (value: number | null): string =>
+			value == null ? "n/a" : String(Math.round(value));
+		console.log(
+			`\n  offbox: onboxFrameTx=${n(offbox.onboxFrameTxPerSec)} ` +
+				`offboxFrameTx=${n(offbox.offboxFrameTxPerSec)} ` +
+				`ratio=${offbox.ratio == null ? "n/a" : offbox.ratio.toFixed(2)} ` +
+				`provisioned=${offbox.provisioned} STOP=${offbox.stopBucket}`,
 		);
 	}
 	if (failures.length > 0)

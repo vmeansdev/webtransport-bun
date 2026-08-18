@@ -4,6 +4,7 @@ import {
 	armKey,
 	classifyCc,
 	classifyCoresplit,
+	classifyOffbox,
 	classifyRmem,
 	classifyWaitVsDrop,
 	collapseFor,
@@ -320,7 +321,8 @@ function withFrameTx(
 				clientAffinityOk: true,
 				skRcvbuf,
 				skDrops: 0,
-				appliedCongestion: key.endsWith("@bbr") ? "bbr" : "cubic",
+				appliedCongestion: key.includes("@bbr") ? "bbr" : "cubic",
+				offboxSsh: key.endsWith("@offbox") ? "hermes-admin@192.168.2.36" : null,
 			},
 		],
 	};
@@ -565,5 +567,176 @@ describe("classifyCc", () => {
 				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), bbr],
 			}).stopBucket,
 		).toBe("incomplete");
+	});
+});
+
+describe("classifyOffbox", () => {
+	const base = {
+		ccModes: ["cubic"],
+		rmemModes: ["default"],
+		cpuModes: ["shared"],
+		sessions: 100,
+		provisioned: true,
+	};
+
+	test("offbox 20% above onbox and above 120k is offbox-lifts", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@offbox", 140_000, 140_000),
+				],
+			}).stopBucket,
+		).toBe("offbox-lifts");
+	});
+
+	test("same leftover band is not-offbox", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@offbox", 110_000, 110_000),
+				],
+			}).stopBucket,
+		).toBe("not-offbox");
+	});
+
+	test("gray cell 105k to 121k without the ratio is not-offbox", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@offbox", 121_000, 121_000),
+				],
+			}).stopBucket,
+		).toBe("not-offbox");
+	});
+
+	test("ratio met but offbox still inside the band is incomplete", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 91_000, 91_000),
+					withFrameTx("w2@160000@wait@offbox", 112_000, 112_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("onbox control out of the 90k-120k band is incomplete", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 80_000, 80_000),
+					withFrameTx("w2@160000@wait@offbox", 140_000, 140_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("offbox path collapsing below 90k is incomplete, not not-offbox", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@offbox", 70_000, 70_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("mixed cc modes are incomplete", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				ccModes: ["cubic", "bbr"],
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@offbox", 140_000, 140_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("unprovisioned generator is incomplete", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				provisioned: false,
+				summaries: [
+					withFrameTx("w2@160000@wait", 105_000, 105_000),
+					withFrameTx("w2@160000@wait@offbox", 140_000, 140_000),
+				],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("offbox run missing the remote mark is incomplete", () => {
+		const off = withFrameTx("w2@160000@wait@offbox", 140_000, 140_000);
+		off.runs[0]!.offboxSsh = null;
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), off],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("onbox run carrying a remote mark is incomplete", () => {
+		const on = withFrameTx("w2@160000@wait", 105_000, 105_000);
+		on.runs[0]!.offboxSsh = "hermes-admin@192.168.2.36";
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [on, withFrameTx("w2@160000@wait@offbox", 140_000, 140_000)],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("sessions_ok below 90 of 100 is incomplete", () => {
+		const off = withFrameTx("w2@160000@wait@offbox", 140_000, 140_000);
+		off.runs[0]!.sessionsOk = 80;
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000), off],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+
+	test("missing offbox arms are incomplete", () => {
+		expect(
+			classifyOffbox({
+				...base,
+				summaries: [withFrameTx("w2@160000@wait", 105_000, 105_000)],
+			}).stopBucket,
+		).toBe("incomplete");
+	});
+});
+
+describe("armKey genMode", () => {
+	test("offbox appends and onbox is omitted", () => {
+		expect(
+			armKey({
+				workers: "2",
+				requestedPerSec: 160_000,
+				sendMode: "wait",
+				genMode: "offbox",
+			}),
+		).toBe("w2@160000@wait@offbox");
+		expect(
+			armKey({
+				workers: "2",
+				requestedPerSec: 160_000,
+				sendMode: "wait",
+				genMode: "onbox",
+			}),
+		).toBe("w2@160000@wait");
 	});
 });

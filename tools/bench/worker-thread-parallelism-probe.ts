@@ -99,6 +99,14 @@ const STREAMS_PER_SEC = Number(process.env.WT_PROBE_STREAMS_PER_SEC ?? "0");
 const CLIENT_TASKSET = (process.env.WT_PROBE_CLIENT_TASKSET ?? "").trim();
 /** load-client CC factory: cubic (control) or bbr. */
 const CONGESTION = (process.env.WT_PROBE_CONGESTION ?? "cubic").trim();
+/** ssh destination that runs load-client off-box; empty = spawn locally. */
+const OFFBOX_SSH = (process.env.WT_PROBE_OFFBOX_SSH ?? "").trim();
+/** Server address the off-box client dials instead of loopback. */
+const OFFBOX_URL_HOST = (process.env.WT_PROBE_OFFBOX_URL_HOST ?? "").trim();
+/** load-client path on the off-box host (provisioned by the sweep). */
+const OFFBOX_BIN = (
+	process.env.WT_PROBE_OFFBOX_BIN ?? "/tmp/load-client"
+).trim();
 /** Restrict the worker sweep, e.g. `1` for a hop A/B at the collapse default. */
 const WORKER_FILTER = (process.env.WT_PROBE_WORKERS ?? "")
 	.split(",")
@@ -281,6 +289,7 @@ export type ArmRun = {
 	skRcvbuf: number | null;
 	skDrops: number | null;
 	appliedCongestion: string | null;
+	offboxSsh: string | null;
 };
 
 export function parseAppliedCongestion(
@@ -1149,11 +1158,19 @@ async function runChild(
 
 	const perClient = Math.floor(sessions / CLIENTS);
 	const expectedClientCpus = CLIENT_TASKSET ? parseCpuList(CLIENT_TASKSET) : [];
+	if (OFFBOX_SSH && CLIENT_TASKSET) {
+		console.error("probe: REFUSED\n  offbox and client taskset cannot combine");
+		process.exit(1);
+	}
+	if (OFFBOX_SSH && !OFFBOX_URL_HOST) {
+		console.error("probe: REFUSED\n  WT_PROBE_OFFBOX_URL_HOST is required");
+		process.exit(1);
+	}
 	const clients = Array.from({ length: CLIENTS }, (_, i) => {
 		const args = [
-			CLIENT_BIN,
+			OFFBOX_SSH ? OFFBOX_BIN : CLIENT_BIN,
 			"--url",
-			`https://127.0.0.1:${port}`,
+			`https://${OFFBOX_SSH ? OFFBOX_URL_HOST : "127.0.0.1"}:${port}`,
 			"--mode",
 			"load",
 			"--skip-probes",
@@ -1176,14 +1193,29 @@ async function runChild(
 			"--congestion",
 			CONGESTION === "bbr" ? "bbr" : "cubic",
 		];
-		return Bun.spawn(
-			CLIENT_TASKSET ? ["taskset", "-c", CLIENT_TASKSET, ...args] : args,
-			{ cwd: ROOT, stdout: "pipe", stderr: "pipe" },
-		);
+		// A dead ssh channel must not orphan a remote generator: the remote
+		// process carries its own deadline.
+		const argv = OFFBOX_SSH
+			? [
+					"ssh",
+					"-o",
+					"BatchMode=yes",
+					OFFBOX_SSH,
+					"timeout",
+					String(WARMUP_SEC + MEASURE_SEC + 30),
+					...args,
+				]
+			: CLIENT_TASKSET
+				? ["taskset", "-c", CLIENT_TASKSET, ...args]
+				: args;
+		return Bun.spawn(argv, { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
 	});
-	const clientCpusAllowed = clients.map((client) =>
-		client.pid == null ? [] : (readCpusAllowedList(client.pid) ?? []),
-	);
+	// Off-box the local pid is ssh, not load-client; affinity is not ours.
+	const clientCpusAllowed = OFFBOX_SSH
+		? []
+		: clients.map((client) =>
+				client.pid == null ? [] : (readCpusAllowedList(client.pid) ?? []),
+			);
 	const clientAffinityOk =
 		!CLIENT_TASKSET ||
 		(expectedClientCpus.length > 0 &&
@@ -1371,6 +1403,7 @@ async function runChild(
 		skRcvbuf: skmem?.recvbuf ?? null,
 		skDrops: skmem?.drops ?? null,
 		appliedCongestion: parseAppliedCongestion(stdout),
+		offboxSsh: OFFBOX_SSH || null,
 	};
 	if (sessionsOk === 0) {
 		console.error(`load-client produced no sessions:\n${stderr.slice(-2000)}`);
