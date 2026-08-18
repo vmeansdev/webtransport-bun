@@ -208,6 +208,37 @@ pub(crate) const CLIENT_DATAGRAM_RECV_CAPACITY: usize = 256;
 /// reservation.
 const CLIENT_DATAGRAM_BATCH_MAX: u32 = 256;
 
+/// Queued-slot depth at or above which the forwarder copies instead of
+/// retaining the transport buffer. Retention pins the datagram's GRO parent
+/// (one recvmsg allocation shared by up to 64 segments), so a deep, slowly
+/// drained queue could hold many parents alive; a shallow one cannot.
+/// The guard BOUNDS that exposure, it does not close the payload-vs-backing
+/// accounting gap (charging happens before send, so depth is an estimate).
+const CLIENT_DATAGRAM_RETAIN_MAX_DEPTH: usize = 64;
+
+/// `WEBTRANSPORT_CLIENT_DATAGRAM_RETAIN=0` restores copy-always delivery.
+fn client_datagram_retain_enabled() -> bool {
+    static RETAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RETAIN
+        .get_or_init(|| std::env::var("WEBTRANSPORT_CLIENT_DATAGRAM_RETAIN").as_deref() != Ok("0"))
+}
+
+/// The server's transport-retention policy, applied at the client forwarder:
+/// small payloads are copied out so a tiny datagram cannot pin an MTU/GRO
+/// backing in the queue; large ones keep the refcounted transport buffer and
+/// pay their one copy at the napi arraybuffer instead.
+fn client_recv_payload(dgram: wtransport::datagram::Datagram, queue_depth: usize) -> bytes::Bytes {
+    let payload = dgram.payload();
+    if client_datagram_retain_enabled()
+        && payload.len() >= crate::session_registry::TRANSPORT_ZERO_COPY_MIN_PAYLOAD
+        && queue_depth < CLIENT_DATAGRAM_RETAIN_MAX_DEPTH
+    {
+        payload
+    } else {
+        bytes::Bytes::from(payload.to_vec())
+    }
+}
+
 /// How long the terminal task waits for the receive forwarder to signal exit
 /// before running its final drain anyway. With the forwarder's interruptible
 /// enqueue, a live forwarder always exits well inside this; expiry therefore
@@ -241,7 +272,7 @@ fn mark_client_closed_and_notify(closed: &AtomicBool, lifecycle_notify: &Notify)
 /// holder, and the remover is the refunder, so a double refund is
 /// structurally impossible.
 fn drain_and_refund_queued_datagrams(
-    rx: &mut mpsc::Receiver<Vec<u8>>,
+    rx: &mut mpsc::Receiver<bytes::Bytes>,
     metrics: &ClientMetrics,
 ) -> usize {
     let mut drained = 0;
@@ -255,7 +286,7 @@ fn drain_and_refund_queued_datagrams(
 }
 
 async fn lock_drain_and_refund(
-    rx: &TokioMutex<mpsc::Receiver<Vec<u8>>>,
+    rx: &TokioMutex<mpsc::Receiver<bytes::Bytes>>,
     metrics: &ClientMetrics,
 ) -> usize {
     let mut guard = rx.lock().await;
@@ -264,7 +295,7 @@ async fn lock_drain_and_refund(
 
 /// Outcome of waiting for the first datagram of a batch.
 enum FirstDatagram {
-    Item(Vec<u8>),
+    Item(bytes::Bytes),
     /// The session closed. Whatever is still queued is dropped, not drained.
     Closed,
     /// Every sender is gone and nothing is left.
@@ -287,7 +318,7 @@ enum FirstDatagram {
 /// `biased` so a close racing a queued datagram wins deterministically rather
 /// than by coin flip.
 async fn recv_first_datagram(
-    rx: &mut mpsc::Receiver<Vec<u8>>,
+    rx: &mut mpsc::Receiver<bytes::Bytes>,
     closed: &AtomicBool,
     lifecycle_notify: &Notify,
 ) -> FirstDatagram {
@@ -327,7 +358,7 @@ async fn recv_first_datagram(
 /// never holds an exclusive napi borrow of it.
 #[derive(Clone)]
 pub(crate) struct ClientDatagramReadState {
-    rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    rx: Arc<TokioMutex<mpsc::Receiver<bytes::Bytes>>>,
     metrics: Arc<ClientMetrics>,
     closed: Arc<AtomicBool>,
     lifecycle_notify: Arc<Notify>,
@@ -337,7 +368,7 @@ impl ClientDatagramReadState {
     /// Read up to `max` datagrams with one blocking wait: park for the first,
     /// then take whatever else is already queued. Never yields an empty batch —
     /// the result is a non-empty batch or `None` for EOF/close.
-    pub(crate) async fn read_batch(&self, max: u32) -> Option<Vec<Vec<u8>>> {
+    pub(crate) async fn read_batch(&self, max: u32) -> Option<Vec<bytes::Bytes>> {
         let cap = clamp_client_batch_max(max);
         let mut rx = self.rx.lock().await;
 
@@ -367,7 +398,7 @@ impl ClientDatagramReadState {
 
     /// The legacy single-datagram lane, expressed as the max=1 extraction over
     /// the same routine so both lanes share one close and accounting path.
-    pub(crate) async fn read_one(&self) -> Option<Vec<u8>> {
+    pub(crate) async fn read_one(&self) -> Option<bytes::Bytes> {
         self.read_batch(1).await?.into_iter().next()
     }
 
@@ -426,15 +457,15 @@ impl Drop for ForwarderDoneGuard {
 /// than replaces the terminal sequence.
 async fn run_client_datagram_forwarder<S, F>(
     mut next_datagram: S,
-    tx: mpsc::Sender<Vec<u8>>,
-    rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    tx: mpsc::Sender<bytes::Bytes>,
+    rx: Arc<TokioMutex<mpsc::Receiver<bytes::Bytes>>>,
     metrics: Arc<ClientMetrics>,
     budget_bytes: u64,
     closed: Arc<AtomicBool>,
     lifecycle_notify: Arc<Notify>,
 ) where
     S: FnMut() -> F,
-    F: std::future::Future<Output = Option<Vec<u8>>>,
+    F: std::future::Future<Output = Option<bytes::Bytes>>,
 {
     loop {
         let Some(bytes) = next_datagram().await else {
@@ -506,7 +537,7 @@ async fn run_client_datagram_forwarder<S, F>(
 ///    has exited no further charge or enqueue is possible and this drain is
 ///    genuinely final.
 async fn settle_client_receive_accounting_after_close(
-    rx: &TokioMutex<mpsc::Receiver<Vec<u8>>>,
+    rx: &TokioMutex<mpsc::Receiver<bytes::Bytes>>,
     metrics: &ClientMetrics,
     closed: &AtomicBool,
     lifecycle_notify: &Notify,
@@ -764,7 +795,7 @@ pub struct ClientSessionHandle {
     peer_ip: String,
     peer_port: u32,
     dgram_send_tx: Option<mpsc::Sender<Vec<u8>>>,
-    dgram_recv_rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    dgram_recv_rx: Arc<TokioMutex<mpsc::Receiver<bytes::Bytes>>>,
     datagram_budget_bytes: u64,
     backpressure_timeout_ms: u64,
     max_datagram_size: usize,
@@ -1127,7 +1158,7 @@ impl ClientSessionHandle {
     ) -> Self {
         let (dgram_send_tx, mut dgram_send_rx) = mpsc::channel::<Vec<u8>>(256);
         let (dgram_recv_tx, dgram_recv_rx) =
-            mpsc::channel::<Vec<u8>>(CLIENT_DATAGRAM_RECV_CAPACITY);
+            mpsc::channel::<bytes::Bytes>(CLIENT_DATAGRAM_RECV_CAPACITY);
         let dgram_recv_rx = Arc::new(TokioMutex::new(dgram_recv_rx));
         let (open_bi_tx, mut open_bi_rx) = mpsc::channel::<OpenBiReq>(8);
         let (open_uni_tx, mut open_uni_rx) = mpsc::channel::<OpenUniReq>(8);
@@ -1224,13 +1255,15 @@ impl ClientSessionHandle {
             crate::panic_guard::spawn_quic_task_scoped(crate::panic_guard::PanicScope::Conn(conn.clone()), async move {
                 let _done = forwarder_done;
                 let source = &conn_dgram_recv;
+                let depth_probe = dgram_recv_tx.clone();
+                let depth_probe = &depth_probe;
                 run_client_datagram_forwarder(
                     move || async move {
-                        source
-                            .receive_datagram()
-                            .await
-                            .ok()
-                            .map(|dgram| dgram.as_ref().to_vec())
+                        source.receive_datagram().await.ok().map(|dgram| {
+                            let depth = CLIENT_DATAGRAM_RECV_CAPACITY
+                                .saturating_sub(depth_probe.capacity());
+                            client_recv_payload(dgram, depth)
+                        })
                     },
                     dgram_recv_tx,
                     recv_rx,
@@ -2179,8 +2212,8 @@ mod tests {
         handle: ClientSessionHandle,
         /// `Option` so a test can drop every sender and turn the empty queue
         /// into a genuine EOF.
-        dgram_recv_tx: Option<mpsc::Sender<Vec<u8>>>,
-        rx: Arc<TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+        dgram_recv_tx: Option<mpsc::Sender<bytes::Bytes>>,
+        rx: Arc<TokioMutex<mpsc::Receiver<bytes::Bytes>>>,
         metrics: Arc<ClientMetrics>,
         closed: Arc<AtomicBool>,
         lifecycle_notify: Arc<Notify>,
@@ -2191,7 +2224,7 @@ mod tests {
     impl DatagramTestHarness {
         fn new(id: &str, recv_capacity: usize, budget_bytes: u64) -> Self {
             let (dgram_send_tx, _dgram_send_rx) = mpsc::channel::<Vec<u8>>(recv_capacity);
-            let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(recv_capacity);
+            let (dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<bytes::Bytes>(recv_capacity);
             let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
             let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
             let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
@@ -2237,7 +2270,7 @@ mod tests {
             self.handle.datagram_read_state()
         }
 
-        fn sender(&self) -> &mpsc::Sender<Vec<u8>> {
+        fn sender(&self) -> &mpsc::Sender<bytes::Bytes> {
             self.dgram_recv_tx.as_ref().expect("sender still held")
         }
 
@@ -2251,7 +2284,7 @@ mod tests {
         }
 
         /// Enqueue exactly as the forwarder does: charge, then hand over.
-        fn charge_and_enqueue(&self, bytes: Vec<u8>) {
+        fn charge_and_enqueue(&self, bytes: bytes::Bytes) {
             assert!(
                 try_reserve_client_queued_bytes(
                     &self.metrics,
@@ -2284,8 +2317,8 @@ mod tests {
         }
     }
 
-    fn payload(tag: u8) -> Vec<u8> {
-        vec![tag; PAYLOAD]
+    fn payload(tag: u8) -> bytes::Bytes {
+        bytes::Bytes::from(vec![tag; PAYLOAD])
     }
 
     // serverCertificateHashes replaces PKI chain validation, so its verifier
@@ -2431,7 +2464,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn delivery_failure_removes_registry_entry_and_signals_close() {
         let handle_id = "delivery-failure-client".to_string();
-        let (dgram_send_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (dgram_send_tx, _dgram_send_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (_dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<bytes::Bytes>(1);
         let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
         let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
         let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
@@ -2480,7 +2514,8 @@ mod tests {
     fn remove_registry_entry_recovers_poison_and_removes_entry() {
         let local_registry = Mutex::new(HashMap::<String, ClientSessionHandle>::new());
         let handle_id = "poisoned-entry".to_string();
-        let (dgram_send_tx, dgram_recv_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (dgram_send_tx, _dgram_send_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (_dgram_recv_tx, dgram_recv_rx) = mpsc::channel::<bytes::Bytes>(1);
         let (open_bi_tx, _open_bi_rx) = mpsc::channel(1);
         let (open_uni_tx, _open_uni_rx) = mpsc::channel(1);
         let (accept_bi_tx, _accept_bi_rx) = mpsc::channel(1);
@@ -2850,7 +2885,7 @@ mod tests {
         let budget = (capacity as u64 + 1024) * PAYLOAD as u64;
         let h = DatagramTestHarness::new("batch-full-channel-close", capacity, budget);
         let wire = Arc::new(TokioMutex::new({
-            let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(capacity * 2);
+            let (wire_tx, wire_rx) = mpsc::channel::<bytes::Bytes>(capacity * 2);
             for tag in 0..(capacity as u32 + 8) {
                 wire_tx.try_send(payload(tag as u8)).expect("wire slot");
             }
@@ -2925,7 +2960,7 @@ mod tests {
     async fn a_close_while_the_forwarder_is_actively_delivering_settles_cleanly() {
         let h =
             DatagramTestHarness::new("batch-active-close", CLIENT_DATAGRAM_RECV_CAPACITY, 1 << 22);
-        let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (wire_tx, wire_rx) = mpsc::channel::<bytes::Bytes>(8);
         let wire = Arc::new(TokioMutex::new(wire_rx));
 
         let (done_guard, forwarder_exited) = ForwarderDoneGuard::new();
@@ -3022,7 +3057,7 @@ mod tests {
     async fn the_forwarder_refunds_everything_it_charged_on_its_own_exit() {
         let h = DatagramTestHarness::new("batch-forwarder-refund", 4, 1 << 20);
         let wire = Arc::new(TokioMutex::new({
-            let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(16);
+            let (wire_tx, wire_rx) = mpsc::channel::<bytes::Bytes>(16);
             for tag in 0..12u8 {
                 wire_tx.try_send(payload(tag)).expect("wire slot");
             }
@@ -3079,7 +3114,7 @@ mod tests {
             DatagramTestHarness::new("batch-clean-eof", CLIENT_DATAGRAM_RECV_CAPACITY, 1 << 20);
         let queued = 40usize;
         let wire = Arc::new(TokioMutex::new({
-            let (wire_tx, wire_rx) = mpsc::channel::<Vec<u8>>(queued);
+            let (wire_tx, wire_rx) = mpsc::channel::<bytes::Bytes>(queued);
             for tag in 0..queued {
                 wire_tx.try_send(payload(tag as u8)).expect("wire slot");
             }
