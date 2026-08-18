@@ -716,6 +716,10 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         counters.load_streams_opened.load(Ordering::Relaxed)
     );
     if let Some(probe) = latency.as_ref() {
+        // Serialized only after `wait_for_handles`, which either joins every
+        // session task or aborts it and awaits the abort. Nothing is recording
+        // by the time these histograms are read; `recordedTotal` in the output
+        // is what proves it rather than what assumes it.
         println!(
             "load-client: latency-json {}",
             probe.to_json(arrival, effective_rate)
