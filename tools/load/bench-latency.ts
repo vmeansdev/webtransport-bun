@@ -415,6 +415,21 @@ async function main(): Promise<void> {
 
 	await server.close();
 
+	// Read once close has resolved. The whole point of this arm is that the
+	// addon lets the process end afterwards, so the numbers that say whether it
+	// still holds the event loop belong in the artifact next to the latency:
+	// `nativeAsyncOpsPending` is the direct hold, and the reaped/idle split says
+	// how the abandoned sessions actually ended.
+	const closeSnapshot = server.metricsSnapshot();
+	const liveness = {
+		nativeAsyncOpsPending: closeSnapshot.nativeAsyncOpsPending ?? null,
+		nativeSessionRegistryEntries:
+			closeSnapshot.nativeSessionRegistryEntries ?? null,
+		sessionsClosedByIdle: closeSnapshot.sessionsClosedByIdle ?? null,
+		sessionsClosedByReap: closeSnapshot.sessionsClosedByReap ?? null,
+		sessionsClosedOther: closeSnapshot.sessionsClosedOther ?? null,
+	};
+
 	const result = {
 		version: 1,
 		arm: ARM,
@@ -440,15 +455,17 @@ async function main(): Promise<void> {
 			datagramBatchEnv: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
 		},
 		steps,
+		liveness,
 	};
 	writeFileSync(OUT_JSON, `${JSON.stringify(result)}\n`);
+	console.log(
+		`bench-latency: liveness asyncOpsPending=${liveness.nativeAsyncOpsPending ?? "n/a"} registry=${liveness.nativeSessionRegistryEntries ?? "n/a"} closedByIdle=${liveness.sessionsClosedByIdle ?? "n/a"} closedByReap=${liveness.sessionsClosedByReap ?? "n/a"} closedOther=${liveness.sessionsClosedOther ?? "n/a"}`,
+	);
 	console.log(`bench-latency: wrote ${OUT_JSON}`);
 }
 
 await main();
-// Server-side sessions left behind by an abruptly exiting client have no QUIC idle
-// timeout and keep the event loop referenced after close — a clean drain can hang
-// forever (observed on the runner, latency run 32159708926: default arm wrote its
-// JSON, then hung 55+ minutes with zero sockets open). Output is already flushed
-// synchronously above.
-process.exit(0);
+// Deliberately no process.exit(). The earlier workaround (5cbf02f) forced the
+// driver down because the addon held the loop open after close; this arm exists
+// to confirm the liveness fixes removed that hold, so the run passes only if the
+// process ends on its own.

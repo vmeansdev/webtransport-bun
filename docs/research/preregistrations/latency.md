@@ -415,6 +415,48 @@ step length stands in, the fallback is flagged in the artifact
 (`driveWindowMeasured: false`), and the step is `clock-invalid` for the missing
 client block anyway.
 
+## Amendment 5 — liveness confirmation arm, 2026-08-19, before any complete run
+
+**Status:** written before the run it describes. No measured latency value
+informed it. This amendment registers a run whose subject is the harness fault
+that aborted dispatch 1, not the latency ladder.
+
+**Why.** Dispatch 1 aborted because the driver could not end: sessions abandoned
+by an exiting load client kept the addon holding the host event loop after
+`server.close()` resolved. `5cbf02f` papered over that with `process.exit(0)` so
+the axis could run at all. Ticket 03 attributes the hold to a class — unsettled
+N-API futures owned by a session — fixes two proven instances of it, and makes
+the rest observable (`nativeAsyncOpsPending`, plus a
+`sessionsClosedByIdle` / `sessionsClosedByReap` / `sessionsClosedOther` split).
+Whether that is enough on the runner's Linux/epoll instance is not decidable on
+macOS, where the pin never reproduced.
+
+**The candidate.** `probe/liveness-confirm-01` = the ticket 03 liveness commits
+(`liveness/close-contract-01` @ `2dc93ac`) with this axis's harness cherry-picked
+on top, and the `process.exit(0)` workaround **removed**. Every arm run from this
+branch is therefore also a liveness assertion: nothing forces the driver down.
+
+**Pass condition, pre-registered.** The run passes iff, for every arm:
+
+1. the Bun driver process **exits on its own** after writing its fragment (the
+   workflow step would otherwise hang to the job timeout), and
+2. the fragment's new `liveness` block reports `nativeAsyncOpsPending === 0`.
+
+`sessionsClosedByIdle` / `sessionsClosedByReap` / `sessionsClosedOther` are
+recorded for attribution — they say how the abandoned sessions ended — and are
+**not** pass/fail: no expected split is pre-registered for them, because none is
+known.
+
+**What a failure means.** A hang, or a non-zero `nativeAsyncOpsPending`, is the
+runner instance surviving the fix, and the reported per-kind breakdown
+(`datagram` / `stream` / `lifecycle`) names where it lives. That is a ticket 03
+result, not a latency result.
+
+**What this run may not do.** Its latency numbers are not a substitute for the
+axis's own ladder: the arm shape here exists to exercise close, and any
+classified output it produces is disclosed as coming from the confirmation
+dispatch.
+
 ## Dispatch log
 
 Every dispatch of this axis is logged here, including aborted ones, per the
