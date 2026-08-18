@@ -14,8 +14,66 @@ use napi_derive::napi;
 /// freed pages back to the OS within its purge delay, letting post-close RSS
 /// actually recover. See crates/native/src/native_memory.rs for the recorded
 /// diagnosis.
+#[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Test builds interpose a counting delegate over the same mimalloc so
+/// allocation-freedom claims are assertions, not narrative. Delegation keeps
+/// `native_memory.rs`'s "mimalloc is the global allocator" premise true.
+#[cfg(test)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: alloc_counter::CountingMiMalloc = alloc_counter::CountingMiMalloc;
+
+#[cfg(test)]
+pub(crate) mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub struct CountingMiMalloc;
+
+    unsafe impl GlobalAlloc for CountingMiMalloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// Run `f` with this thread's allocations counted. Only same-thread
+    /// allocations are observed — drive measured work on the current thread.
+    pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        COUNT.with(|c| c.set(0));
+        ARMED.with(|a| a.set(true));
+        let result = f();
+        ARMED.with(|a| a.set(false));
+        (result, COUNT.with(Cell::get))
+    }
+}
 use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
