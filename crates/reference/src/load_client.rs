@@ -109,6 +109,17 @@ struct LatencyProbe {
     echo_unstamped: AtomicU64,
     ticks_skipped: AtomicU64,
     send_events: AtomicU64,
+    /// Egress axis: server *actual send* stamp → this client's receive. The
+    /// server-originated mirror of `rtt`, and the only interval the egress gate
+    /// is allowed to be read off.
+    egress_one_way: AtomicHistogram,
+    /// Egress axis: server *intended send* stamp → this client's receive. Equal
+    /// to `egress_one_way` plus the server scheduler's own queueing, so the two
+    /// together say whether a tail belongs to the transport or to the generator.
+    end_to_end: AtomicHistogram,
+    /// Datagrams received that carried no stamp we recognise. Non-zero means the
+    /// two ends disagree about the payload contract, which voids the step.
+    recv_unstamped: AtomicU64,
 }
 
 impl LatencyProbe {
@@ -117,6 +128,7 @@ impl LatencyProbe {
             concat!(
                 "{{\"arrival\":\"{}\",\"effectiveDatagramsPerSecPerSession\":{:.3},",
                 "\"rtt\":{},\"scheduleLag\":{},\"burstSpread\":{},",
+                "\"egressOneWay\":{},\"endToEnd\":{},\"recvUnstamped\":{},",
                 "\"echoUnstamped\":{},\"ticksSkipped\":{},\"sendEvents\":{}}}"
             ),
             arrival.as_str(),
@@ -124,6 +136,9 @@ impl LatencyProbe {
             self.rtt.to_json(),
             self.schedule_lag.to_json(),
             self.burst_spread.to_json(),
+            self.egress_one_way.to_json(),
+            self.end_to_end.to_json(),
+            self.recv_unstamped.load(Ordering::Relaxed),
             self.echo_unstamped.load(Ordering::Relaxed),
             self.ticks_skipped.load(Ordering::Relaxed),
             self.send_events.load(Ordering::Relaxed),
@@ -233,6 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arrival = ArrivalProfile::Uniform;
     let mut tick_hz = DEFAULT_TICK_HZ;
     let mut latency_stamp = false;
+    let mut egress_recv = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -288,25 +304,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--arrival" => arrival = parse_arrival_profile(args.next().as_deref()),
             "--tick-hz" => tick_hz = parse_or_default("--tick-hz", args.next(), DEFAULT_TICK_HZ),
             "--latency-stamp" => latency_stamp = true,
+            "--egress-recv" => {
+                egress_recv = true;
+                latency_stamp = true;
+            }
             _ => {}
         }
     }
 
-    if latency_stamp && payload_bytes < STAMP_BYTES {
+    // A receive-only client never writes a stamp, so the payload floor is about
+    // what it *sends*; requiring it here would force the egress driver to pass a
+    // payload size it will never use.
+    if latency_stamp && !egress_recv && payload_bytes < STAMP_BYTES {
         return Err(format!(
             "--latency-stamp needs --payload-bytes >= {STAMP_BYTES}, got {payload_bytes}"
         )
         .into());
+    }
+    // Receive-only means receive-only. A subscriber that also sends would show
+    // up on the server as a publisher in the fan-out shape, and would put its
+    // own load on the path it is supposed to be measuring.
+    if egress_recv && datagrams_per_sec > 0 {
+        return Err("--egress-recv needs --datagrams-per-sec 0".into());
     }
     if arrival == ArrivalProfile::Tick && tick_hz == 0 {
         return Err("--arrival tick needs --tick-hz > 0".into());
     }
 
     println!(
-        "load-client: arrival={} tick_hz={} latency_stamp={}",
+        "load-client: arrival={} tick_hz={} latency_stamp={} egress_recv={}",
         arrival.as_str(),
         tick_hz,
-        latency_stamp
+        latency_stamp,
+        egress_recv
     );
     println!(
         "load-client: mode={} url={} sessions={} duration={}s datagrams/s={} streams/s={} payload_bytes={} hold_ms={} skip_probes={} budgets(session={}, datagram={}, stream={})",
@@ -341,6 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arrival,
         tick_hz,
         latency_stamp,
+        egress_recv,
         budgets: ErrorBudgets {
             max_session_errors,
             max_datagram_errors,
@@ -389,6 +420,7 @@ struct RunOptions<'a> {
     arrival: ArrivalProfile,
     tick_hz: u64,
     latency_stamp: bool,
+    egress_recv: bool,
     budgets: ErrorBudgets,
 }
 
@@ -564,6 +596,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
         arrival,
         tick_hz,
         latency_stamp,
+        egress_recv,
         budgets,
     } = options;
     let config = ClientConfig::builder()
@@ -580,6 +613,9 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
     let anchor = Instant::now();
     let anchor_ns = monotonic_ns();
     let (period_ns, burst) = match arrival {
+        // Receive-only. Park the send schedule an hour out so no arrival profile
+        // can quietly turn a subscriber into a second load source.
+        _ if egress_recv => (3_600_000_000_000, 0),
         // A per-datagram timer cannot outrun the OS timer wheel: asking tokio
         // for a 0.9 ms period on a ~1 ms granularity clock silently halves the
         // offered rate. So the uniform arm keeps its period at or above
@@ -654,6 +690,7 @@ async fn run(options: RunOptions<'_>) -> Result<(), Box<dyn std::error::Error>> 
                                     streams_per_sec,
                                     payload_bytes,
                                     latency,
+                                    egress_recv,
                                 },
                                 counters.as_ref(),
                             )
@@ -764,6 +801,7 @@ struct SessionLoad {
     streams_per_sec: u64,
     payload_bytes: usize,
     latency: Option<Arc<LatencyProbe>>,
+    egress_recv: bool,
 }
 
 async fn run_session(
@@ -777,6 +815,7 @@ async fn run_session(
         streams_per_sec,
         payload_bytes,
         latency,
+        egress_recv,
     } = load;
     let start = Instant::now();
     let mut stream_sequence = 0u64;
@@ -862,14 +901,32 @@ async fn run_session(
                             .datagram_bytes_received
                             .fetch_add(datagram.as_ref().len() as u64, Ordering::Relaxed);
                         if let Some(probe) = latency.as_ref() {
-                            // The server echoes verbatim, so the stamp coming
-                            // back is the one this process wrote — round-trip
-                            // time against a single clock, no cross-process
-                            // assumption anywhere in it.
+                            // Ingest axis: the server echoes verbatim, so the
+                            // stamp coming back is the one this process wrote —
+                            // round-trip time against a single clock, no
+                            // cross-process assumption anywhere in it.
+                            //
+                            // Egress axis: the stamp was written by whoever
+                            // originated the datagram (the Bun server, or the
+                            // publisher client in the fan-out shape). Both read
+                            // the same system-wide CLOCK_MONOTONIC, so the
+                            // difference is a real one-way interval.
+                            let arrived_ns = monotonic_ns();
                             match read_stamp(datagram.as_ref()) {
+                                Some(stamp) if egress_recv => {
+                                    probe.egress_one_way.record_signed(
+                                        arrived_ns as i64 - stamp.actual_ns as i64,
+                                    );
+                                    probe.end_to_end.record_signed(
+                                        arrived_ns as i64 - stamp.intended_ns as i64,
+                                    );
+                                }
                                 Some(stamp) => probe
                                     .rtt
-                                    .record_signed(monotonic_ns() as i64 - stamp.actual_ns as i64),
+                                    .record_signed(arrived_ns as i64 - stamp.actual_ns as i64),
+                                None if egress_recv => {
+                                    probe.recv_unstamped.fetch_add(1, Ordering::Relaxed);
+                                }
                                 None => {
                                     probe.echo_unstamped.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -976,7 +1033,7 @@ async fn run_reconnect_worker(
 mod tests {
     use super::{
         load_summary_json, parse_arrival_profile, parse_client_mode, parse_or_default,
-        ArrivalProfile, ClientMode, Counters, DatagramSchedule,
+        ArrivalProfile, ClientMode, Counters, DatagramSchedule, LatencyProbe,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -1022,6 +1079,20 @@ mod tests {
         assert_eq!(sched.index, 11);
         // A second catch-up at the same instant is a no-op.
         assert_eq!(sched.catch_up(anchor + Duration::from_millis(10)), 0);
+    }
+
+    /// The egress driver parses these keys out of the client's `latency-json`
+    /// line; a rename here would silently produce a run with no egress data.
+    #[test]
+    fn latency_json_carries_the_egress_histograms() {
+        let probe = LatencyProbe::default();
+        probe.egress_one_way.record(1_000);
+        probe.end_to_end.record(2_000);
+        probe.recv_unstamped.fetch_add(3, Ordering::Relaxed);
+        let json = probe.to_json(ArrivalProfile::Uniform, 0.0);
+        assert!(json.contains("\"egressOneWay\":{"), "{json}");
+        assert!(json.contains("\"endToEnd\":{"), "{json}");
+        assert!(json.contains("\"recvUnstamped\":3"), "{json}");
     }
 
     #[test]
