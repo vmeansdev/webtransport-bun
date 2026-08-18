@@ -289,6 +289,15 @@ parent document: the schedule-lag floor that STOP 1 compares against is the
 within-arm minimum across ladder steps — an arm-process here runs one rung, so a
 within-process minimum is that rung's own value and the rule could never fire.
 
+**Floor-arm clause.** STOP 1's schedule-lag half compares a cell's lag against
+`floorLagP99Ns`, which the floor arms themselves define. Evaluating it on a floor
+arm is circular, so on a floor arm that half is inert and STOPs 2–5 (and the
+`ticksSkipped` half of STOP 1, which is absolute) do the work. A floor arm that
+trips any of those is excluded from the floor, and the floor is the median of
+those that remain. If fewer than 3 floor arms survive, `floor-not-quiet` fires and
+no adjusted figure is produced. *(Registered 2026-08-19 with the rest of this
+document, before any run: it closes a gap in the rules rather than changing one.)*
+
 Added for this dispatch:
 
 6. **`arm-timeout`** — the arm-process exceeded its 120 s wall-clock guard and was
