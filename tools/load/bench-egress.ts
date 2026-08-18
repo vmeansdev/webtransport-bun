@@ -876,3 +876,8 @@ async function main(): Promise<void> {
 }
 
 await main();
+// Server-side sessions left behind by an abruptly exiting client have no QUIC idle
+// timeout and keep the event loop referenced after close — a clean drain can hang
+// forever (observed on the runner, latency run 32159708926). Output is already
+// flushed synchronously above.
+process.exit(0);
