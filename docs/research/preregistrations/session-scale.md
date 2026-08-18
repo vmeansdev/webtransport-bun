@@ -181,6 +181,61 @@ a number the classifier reads. None of them moves a threshold.
    the runner this is always `committed`; the fallback exists so the local smoke
    produces a parseable curve, and smoke numbers are never results.
 
+## Amendment 1 — S3 abort threshold raised to 1000 MB, sampled continuously
+
+**Written 2026-08-18, after the first dispatch and before any measurement data
+existed.** Run `32168754965` produced **zero artifacts**: no rung JSON, no CSV,
+no log. Nothing in this amendment is informed by a measured number, because
+there is no measured number to be informed by.
+
+**What happened.** The ladder failed roughly 29 minutes in, on the 4 vCPU / 8 GB
+heavy runner. Bench processes survived job teardown, total memory demand reached
+about 10.8 GB against 8 GB of assigned RAM, and the host went into swap-death:
+`sshd` and the runner listener were killed and the VM had to be force-restarted
+from the hypervisor. Everything the run had completed was lost with it.
+
+**The original rule, verbatim:**
+
+> - **S3 — host memory floor.** any sample with `MemAvailable < 500 MB` aborts the
+>   remainder of the ladder; unrun rungs are reported `not-run`, never extrapolated.
+
+The rule did not fire. Two mechanisms are consistent with the evidence available
+(which is only the hypervisor's view, since the run produced none): allocation at
+the large rungs outran the sampling — the host went from above the floor to
+swap-death inside one sampling gap — and/or the crash happened during a connect
+ramp, while sampling was tied to phase progress rather than running unconditionally.
+
+**The new rule, replacing S3:**
+
+> - **S3 — host memory floor.** `MemAvailable` is sampled at least every 2 seconds
+>   by a timer independent of phase logic, during **all** phases including the
+>   connect ramp. Any sample with `MemAvailable < 1000 MB` aborts the remainder of
+>   the ladder immediately: the load client's process group is killed, the partial
+>   results JSON is flushed, and the server is closed on a bounded timeout rather
+>   than a graceful drain. Unrun rungs are reported `not-run`, never extrapolated.
+
+This tightens a pre-registered STOP. It can only make the ladder stop **earlier**
+and report **less**; it cannot turn an incomplete rung into a capacity number, and
+it moves no classifier threshold. Bucket 4 (`host-memory-limited`) keeps its
+`hostMemAvailableMbMin < 500` rule unchanged, so the buckets are exactly as
+pre-registered — a rung aborted between 1000 MB and 500 MB is reported
+`incomplete` with the ladder stopped, not reclassified.
+
+Three harness mechanics land with it. None of them is a threshold, and none
+changes what any rung reports:
+
+1. **Incremental evidence flush.** The results JSON is written after every rung
+   and on every abort path, by atomic rename over the same path. A crash can no
+   longer erase completed rungs; the incident's total data loss was a harness
+   defect, not a property of the question.
+2. **Client self-guard.** The generator aborts its own run if its RSS exceeds
+   3.5 GB, emitting a distinct marker. The driver records that the guard fired and
+   buckets the rung through the existing `harness-error` path — no new bucket.
+   A generator that eats the host is not a server result.
+3. **Process-group teardown.** The driver kills the client's process group on
+   every exit path (normal, abort, signal). The orphans that outlived the job are
+   what turned a failed rung into a force-restart.
+
 ## Not a gate
 
 No threshold in this document is a merge bar, and the harness is not to be tuned
