@@ -369,7 +369,32 @@ happen; an empty row is never removed.
 
 | # | date (UTC) | run id | candidate SHA | staging base SHA | ladder | stagger | outcome | artifact hash |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 2026-08-19 | _pending dispatch_ | `probe/session-scale-01` head at dispatch — last harness commit `36eddb10b7c6`, filled in by the dispatcher from `git rev-parse` | `5ad02457` (`rebind4-staging` tip) | 100,1000,5000,10000 | true | _pending_ | _pending_ |
+| 1 | 2026-08-19 | `32207919468` | `10c5cccb69f3a737e6424612d6885161f9bb1da5` (`probe/session-scale-01` head at dispatch) | `5ad0245742cbe5c231e0b06b8a42c93622f1ff14` (`rebind4-staging` tip) | 100,1000,5000,10000 | true | **PASS** — C1/C2/C3/C4a/C4b all pass, P1–P5 hold, D1 disclosed | `ee6d73bcbd65ccc4db408b1c592659c7085cc76c0a0bfa3299f051f8fc6ecc2d` |
+
+Artifact hashes (sha256), run `32207919468`, artifact bundle
+`bench-bandwidth-10c5cccb69f3a737e6424612d6885161f9bb1da5`:
+
+| file | sha256 |
+|---|---|
+| `bench-session-scale-…json` (final) | `ee6d73bcbd65ccc4db408b1c592659c7085cc76c0a0bfa3299f051f8fc6ecc2d` |
+| `…json.rung-100.json` | `906512bf774f63b63404a3c03fa00bd829e145aaed311ecc3cf47f2f67eb86f5` |
+| `…json.rung-1000.json` | `072ab5ced74f8ddca89c5aa1abf8d6e8bf0846547d8aba0307276a9cbb5e363c` |
+| `…json.rung-5000.json` | `a07369247812b578e24829ed15c2b030ce89d363c5c7349e96f895c24373aa41` |
+| `…json.rung-10000.json` | `3caccd5fcb5ab559b701fb61acde83835ef70248bae29f0e0d6e680ea0572154` |
+| `bench-session-scale-…csv` (2 s sampler) | `0f77e74350fb1f8d8190663936bb5b552c5078180c7854843b65c92fbdc2135d` |
+
+Run metadata verified against GitHub, not taken from the artifact:
+`headSha = 10c5cccb69f3a737e6424612d6885161f9bb1da5`, `headBranch =
+probe/session-scale-01`, `event = workflow_dispatch`, `conclusion = success`,
+02:15:41 → 02:31:28 UTC. `git merge-base --is-ancestor 5ad02457 10c5ccc` holds
+and `git merge-base 10c5ccc rebind4-staging` = `5ad02457` = `git rev-parse
+rebind4-staging`, so the candidate is the staging tip plus this branch's
+instrument commits and nothing else.
+
+The candidate is `10c5ccc`, one commit past the `36eddb1` this row predicted:
+`10c5ccc` is the commit that wrote this dispatch log itself, which is what the
+original row's own wording ("head at dispatch") required. No harness change lies
+between them — `git diff 36eddb1 10c5ccc` touches this file only.
 
 **Candidate composition (spec §Process rules).** G1 measures the shipped
 configuration and needs no lever commits, so the probe branch's merge-base with
@@ -386,7 +411,41 @@ nothing here):
 | 2026-08-18 | `32174398131` | rung 4 delivery 0.694 — the observation that opened ticket 02 |
 | 2026-08-19 | `32192153026` | ticket 02's confirmation run (loss-attribution branch, not this harness) |
 
-## 10. Not a tuning target
+## 10. Verdict (stamped 2026-08-19 from run `32207919468`)
+
+**G1 = PASS**, staggered arrival only. Clause-by-clause, recomputed from the raw
+artifact by the gate agent (not read off `gateG1`):
+
+| clause | threshold | measured | verdict |
+|---|---|---|---|
+| C1 delivery @10k | ≥ 0.995 | 1.000 (235,027 / 235,027); `kernelDropsSocket = 0`, `RcvbufErrors = 0` — measured zero, so nothing excluded | PASS |
+| C2 ingest p99 @10k | ≤ 50 ms, raw | **2.945 ms** (p50 0.371, p90 1.214, p999 5.202, max 11.525; n = 235,027, unstamped 0, negative 0, skew 0); `clientScheduleLagP99Ms = 2.066 ms` ≤ 50 → not INCOMPLETE | PASS |
+| C3 marginal | \|Δ\| ≤ 20% of ref | ref(1k→5k) 126.879 KB/session, 10k(5k→10k) 128.142 KB/session, deviation **1.0%** | PASS |
+| C4a stage residuals | each ≤ 0.1% of 235,027 (= 235.0) | ingress 0, kernel 0, native 0 | PASS |
+| C4b serverObserved | ≥ 0.995 × kernelDelivered | 235,027 / 235,027 = 1.000 | PASS |
+
+Preconditions: **P1** 10k `bucket = ok`, `degraded = []`; **P2** `rateLimitedTotal
+= limitExceededTotal = 0` at all four rungs; **P3** `offeredRatio` 1.000 / 1.000 /
+0.999983 / 0.999987 ≥ 0.90; **P4** `staggerSends = true` stamped in both `config`
+and `gateG1`, client schema `scale-client/3`; **P5** `ingestClockSource = "ffi"`,
+one host (`platform linux`, 4 cpus, generator co-resident). `complete = true`,
+`ladderAborted = null`, all four rungs `ok`.
+
+C3 was re-derived independently from the 2 s sampler CSV rather than trusting the
+harness field: idle-phase rows only (n = 14–15 per rung, i.e. the 30 s idle tail),
+medians 30.7 / 147.4 / 643.0 / 1268.7 MB → 126.874 and 128.143 KB/session, matching
+`gateG1.c3` to CSV rounding. The sampling is the pinned idle-phase median, not the
+per-rung max (max committed 31.29 / 150.70 / 653.64 / 1290.75 MB is reported
+beside it and gives 128.75 / 130.48, a 1.3% deviation — same story).
+
+Two observations that change no clause but belong on the record: at the 10k rung
+the client reports `quicSteady.lostPackets = 362` of 239,330 sent packets while
+every one of the 235,027 datagrams was observed at `datagramsIn`, so the declared
+losses carried no datagram frames; and `kernelUdpSteady.IgnoredMulti = 2` with
+`InDatagrams` 478,665 vs `OutDatagrams` 478,662 — a 3-datagram sampling skew across
+the two boundary reads, four orders of magnitude inside the C4a band.
+
+## 11. Not a tuning target
 
 No threshold in this document may be moved by anything measured under it. The
 harness is not to be adjusted toward a clause after data exists. This branch is
