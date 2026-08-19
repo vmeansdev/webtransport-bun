@@ -74,6 +74,11 @@ on:
         required: false
         default: "500"
         type: string
+      scale_stagger:
+        description: "session-scale: spread each session's send schedule over one interval (gate G1's registered arrival process)"
+        required: false
+        default: "false"
+        type: string
 jobs:
   bench:
     permissions:
@@ -168,6 +173,7 @@ jobs:
           SCALE_IDLE_SECONDS: ${{ github.event.inputs.scale_idle_seconds }}
           SCALE_ENDPOINTS: ${{ github.event.inputs.scale_endpoints }}
           SCALE_CONNECT_CONCURRENCY: ${{ github.event.inputs.scale_connect_concurrency }}
+          SCALE_STAGGER: ${{ github.event.inputs.scale_stagger }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           # Raise the fd soft limit to the hard limit. The pre-registration

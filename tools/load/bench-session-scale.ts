@@ -28,6 +28,9 @@ import { join } from "node:path";
 import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
+import { createMonotonicClock } from "./latency-clock.ts";
+import { LatencyHistogram } from "./latency-histogram.ts";
+import { decodeStamp } from "./latency-stamp.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/scale-client`;
@@ -75,6 +78,12 @@ const DRAIN_TIMEOUT_SECONDS = parseInt(
  * survivor is another rung's memory being charged to this one. */
 const DRAIN_BASELINE_SESSIONS = 0;
 const PORT = parseInt(process.env.SCALE_PORT ?? "4433", 10);
+/** Staggered arrival: session i of N phase-shifts by i/N of an interval.
+ * Registered for gate G1 (docs/research/preregistrations/gate-g1.md §2) because
+ * releasing every session on one phase signal offers an N-packet impulse per
+ * interval, which run 32192153026 showed the kernel receive buffer eats before
+ * QUIC ever sees it. Off reproduces the original session-scale arrival process. */
+const STAGGER = (process.env.SCALE_STAGGER ?? "false").toLowerCase() === "true";
 const OUT_JSON =
 	process.env.SCALE_OUT ?? join(ROOT, "tools/load/bench-session-scale.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
@@ -172,6 +181,85 @@ function hostMemAvailableMb(): number | null {
 	}
 }
 
+/**
+ * Kernel UDP receive-path counters — G1 clause C4's tap 3, the only place a
+ * datagram that left the wire and never reached quinn can be seen.
+ *
+ * `serverSocketDrops` is the primary: the `drops` column of `/proc/net/udp` for
+ * sockets bound to the bench port, which is this server's own receive-buffer
+ * overflow and nobody else's. Host-wide `RcvbufErrors` from `/proc/net/snmp` is
+ * the cross-check and an *upper* bound, because the generator is co-resident and
+ * its sockets are counted in it too.
+ */
+type KernelUdp = Record<string, number>;
+
+function readServerSocketDrops(): number | null {
+	try {
+		const hexPort = PORT.toString(16).toUpperCase().padStart(4, "0");
+		let drops = 0;
+		let found = false;
+		for (const table of ["/proc/net/udp", "/proc/net/udp6"]) {
+			let text: string;
+			try {
+				text = readFileSync(table, "utf8");
+			} catch {
+				continue;
+			}
+			const lines = text.split("\n").slice(1);
+			for (const line of lines) {
+				const fields = line.trim().split(/\s+/);
+				const local = fields[1];
+				if (!local?.endsWith(`:${hexPort}`)) continue;
+				const value = fields[12];
+				if (value === undefined) continue;
+				drops += parseInt(value, 10);
+				found = true;
+			}
+		}
+		return found ? drops : null;
+	} catch {
+		return null;
+	}
+}
+
+function readKernelUdp(): KernelUdp | null {
+	if (!HAS_PROC) return null;
+	try {
+		const snmp = readFileSync("/proc/net/snmp", "utf8").split("\n");
+		const headerIndex = snmp.findIndex((l) => l.startsWith("Udp:"));
+		if (headerIndex < 0) return null;
+		const keys = snmp[headerIndex]?.trim().split(/\s+/).slice(1) ?? [];
+		const values = snmp[headerIndex + 1]?.trim().split(/\s+/).slice(1) ?? [];
+		const out: KernelUdp = {};
+		for (const [i, key] of keys.entries()) {
+			const raw = values[i];
+			if (raw !== undefined) out[key] = parseInt(raw, 10);
+		}
+		const socketDrops = readServerSocketDrops();
+		// -1, not 0: a counter that could not be read must never be reported as a
+		// counter that read zero. C4 goes INCOMPLETE on it rather than pass.
+		out.serverSocketDrops = socketDrops ?? -1;
+		return out;
+	} catch {
+		return null;
+	}
+}
+
+function diffKernelUdp(
+	from: KernelUdp | null,
+	to: KernelUdp | null,
+): KernelUdp | null {
+	if (!from || !to) return null;
+	const out: KernelUdp = {};
+	for (const [key, value] of Object.entries(to)) {
+		const base = from[key];
+		if (base === undefined) continue;
+		// An unreadable sample stays unreadable through the subtraction.
+		out[key] = value < 0 || base < 0 ? -1 : value - base;
+	}
+	return out;
+}
+
 // The load client is spawned detached so it leads its own process group, and one
 // negative-pid kill takes its whole tree. Run 32168754965 left bench processes
 // alive after job teardown; those orphans, not the ladder, drove the host into
@@ -241,6 +329,22 @@ type ClientReport = {
 		 * keys than intended, which the stamp must not hide. */
 		distinctSourceIps: number;
 	};
+	/** True when the generator ran the staggered arrival process G1 registers.
+	 * Absent on a `scale-client/2` report, which could only have run aligned. */
+	staggerSends?: boolean;
+	/** QUIC tap over the steady window. `frameTxDatagram` is what reached the
+	 * wire; its gap to `steady.sent` is quinn's silent send-buffer eviction. */
+	quicSteady?: {
+		connections: number;
+		frameTxDatagram: number;
+		udpTxDatagrams: number;
+		sentPackets: number;
+		lostPackets: number;
+		congestionEvents: number;
+	};
+	/** Generator schedule lag over the steady window: actual send minus the
+	 * deadline it was aiming at. The floor reported beside every ingest p99. */
+	scheduleLagSteady?: unknown;
 	connectErrorsSample: string[];
 };
 
@@ -248,11 +352,24 @@ type Window = {
 	serverRx: number;
 	serverCpuMs: number;
 	wallMs: number;
+	kernel: KernelUdp | null;
 	metrics: {
 		rateLimited: number;
 		limitExceeded: number;
 		datagramsDropped: number;
 		sessionsActive: number;
+		/** Tap 4: incremented the instant `receive_datagram()` returns, before any
+		 * native queue — so `datagramsIn - serverRx` is the native pipeline's own
+		 * account, not a subtraction across the whole path. */
+		datagramsIn: number;
+		/** Every drop reason and the park counter. `datagramsSkippedQueueFull` is
+		 * NOT part of `datagramsDropped`: a run can park millions of times and
+		 * still report "all drop counters zero". */
+		datagramsDroppedRateLimited: number;
+		datagramsDroppedTooLarge: number;
+		datagramsDroppedQueueGlobal: number;
+		datagramsDroppedQueueSession: number;
+		datagramsSkippedQueueFull: number;
 	};
 };
 
@@ -313,6 +430,42 @@ type Rung = {
 		drain: number;
 		idle: number;
 	};
+	/** Median committed over the idle phase — the sampling G1 clause C3 pins for
+	 * the marginal, because the idle window is the only one in a rung with no
+	 * sends, no connect ramp and nothing in flight. `serverCommittedMbMax` stays
+	 * beside it: if the two tell different stories, both get reported. */
+	serverCommittedMbIdleMedian: number | null;
+	/** Stage ledger for G1 clause C4, over the steady window. Every field is a
+	 * measured delta; `null` means not measured on this platform, never zero. */
+	stageLedger: {
+		clientEnqueued: number;
+		clientWireTx: number | null;
+		kernelDropsSocket: number | null;
+		kernelRcvbufErrors: number | null;
+		serverObserved: number | null;
+		jsDelivered: number;
+		nativeDropped: number | null;
+		nativeSkippedQueueFull: number | null;
+	};
+	kernelUdpSteady: KernelUdp | null;
+	/** Ingest latency over the steady+drain window: actual client send stamp to
+	 * JS handler entry, on the shared CLOCK_MONOTONIC. `unstamped` counts
+	 * datagrams that carried no readable stamp — anything but ~0 means the two
+	 * ends disagree about the payload contract and the percentile is partial. */
+	ingest: {
+		count: number;
+		unstamped: number;
+		p50Ms: number | null;
+		p90Ms: number | null;
+		p99Ms: number | null;
+		p999Ms: number | null;
+		maxMs: number | null;
+		negative: number;
+		skew: number;
+	} | null;
+	/** The generator's own lag against its schedule, reported beside the ingest
+	 * percentile as G1's registered floor. */
+	clientScheduleLagP99Ms: number | null;
 	sessionsLost: number;
 	clientDistinctSourceIps: number | null;
 	/** The generator's own RSS self-guard tripped and it aborted the rung. */
@@ -515,6 +668,67 @@ function curveShape(rungs: Rung[]) {
 	};
 }
 
+/**
+ * G1 clause C3's marginals, on the sampling that pre-registration pins: the
+ * median committed over each rung's idle phase.
+ *
+ * Deliberately separate from `curveShape`, which keeps the axis's own
+ * registered rule (max committed, 2x linearity band) untouched — a gate does not
+ * get to redefine the axis it borrows. Both are reported; if they disagree, that
+ * disagreement is itself evidence.
+ */
+function g1Marginals(rungs: Rung[]) {
+	const usable = rungs.filter(
+		(r) =>
+			r.bucket === "ok" &&
+			!r.incompleteUnlessOffBox &&
+			r.degraded.length === 0 &&
+			r.serverCommittedMbIdleMedian !== null,
+	);
+	const marginals: {
+		fromSessions: number;
+		toSessions: number;
+		kbPerSession: number;
+	}[] = [];
+	for (let i = 1; i < usable.length; i += 1) {
+		const prev = usable[i - 1];
+		const cur = usable[i];
+		if (!prev || !cur) continue;
+		const dSessions = cur.sessions - prev.sessions;
+		if (dSessions <= 0) continue;
+		const dMb =
+			(cur.serverCommittedMbIdleMedian ?? 0) -
+			(prev.serverCommittedMbIdleMedian ?? 0);
+		marginals.push({
+			fromSessions: prev.sessions,
+			toSessions: cur.sessions,
+			kbPerSession: (dMb * 1024) / dSessions,
+		});
+	}
+	const reference = marginals.find(
+		(m) => m.fromSessions === 1000 && m.toSessions === 5000,
+	);
+	const at10k = marginals.find(
+		(m) => m.fromSessions === 5000 && m.toSessions === 10000,
+	);
+	// INCOMPLETE, not a pass: a clause whose inputs are missing has no verdict.
+	const withinBand =
+		reference && at10k && reference.kbPerSession !== 0
+			? Math.abs(at10k.kbPerSession - reference.kbPerSession) <=
+				0.2 * Math.abs(reference.kbPerSession)
+			: null;
+	return {
+		sampling: "median committed (RssAnon+VmSwap) over the idle phase",
+		usableRungs: usable.map((r) => r.sessions),
+		marginals,
+		referenceKbPerSession: reference?.kbPerSession ?? null,
+		at10kKbPerSession: at10k?.kbPerSession ?? null,
+		withinTwentyPercent: withinBand,
+		caveat:
+			"not a provisioning number: idle floor is not separated from marginal cost, generator is co-resident, committed is retention not demand",
+	};
+}
+
 async function main(): Promise<void> {
 	if (LADDER.length === 0) throw new Error("SCALE_SESSIONS parsed empty");
 	console.log("bench-session-scale: building scale-client (release)...");
@@ -531,6 +745,12 @@ async function main(): Promise<void> {
 	if (!tls) throw new Error("failed to generate localhost cert");
 
 	let serverRx = 0;
+	// FFI read, not the `Bun.nanoseconds()` fast path: at 2,000 datagrams/s the
+	// ~100 ns per read is nothing, and paying it removes the fast path's
+	// same-counter assumption from the gate's evidence chain (gate-g1 §4/C2).
+	const clock = await createMonotonicClock(false);
+	const ingest = new LatencyHistogram();
+	let ingestUnstamped = 0;
 	const topSessions = Math.max(...LADDER);
 	const aggregatePeak = Math.ceil((topSessions * 1000) / INTERVAL_MS);
 	const server = createServer({
@@ -558,8 +778,15 @@ async function main(): Promise<void> {
 			void (async () => {
 				// Fan-in shape: consume, never echo. Echo would double the packet
 				// rate and re-introduce the throughput axis this run excludes.
-				for await (const _datagram of session.incomingDatagrams()) {
+				for await (const datagram of session.incomingDatagrams()) {
+					// First statement of the handler body: this instant is what the
+					// gate's ingest latency ends at, so nothing the harness does
+					// afterwards can be charged to the server.
+					const entryNs = clock.now();
 					serverRx += 1;
+					const stamp = decodeStamp(datagram);
+					if (stamp === null) ingestUnstamped += 1;
+					else ingest.record(entryNs - stamp.actualNs);
 				}
 			})().catch(() => {});
 		},
@@ -615,6 +842,7 @@ async function main(): Promise<void> {
 			endpoints: ENDPOINTS,
 			connectConcurrency: CONNECT_CONCURRENCY,
 			watchdogIntervalMs: WATCHDOG_INTERVAL_MS,
+			staggerSends: STAGGER,
 			echo: false,
 			thresholds: T,
 		},
@@ -622,6 +850,12 @@ async function main(): Promise<void> {
 		notRun: LADDER.filter((s) => !rungs.some((r) => r.sessions === s)),
 		ladderAborted,
 		curve: curveShape(rungs),
+		gateG1: {
+			preRegistration: "docs/research/preregistrations/gate-g1.md",
+			staggerSends: STAGGER,
+			ingestClockSource: clock.source,
+			c3: g1Marginals(rungs),
+		},
 	});
 
 	// Written after every rung and on every abort path, by atomic rename over the
@@ -735,6 +969,7 @@ async function main(): Promise<void> {
 				String(CONNECT_TIMEOUT_SECONDS),
 				"--json-out",
 				jsonOut,
+				...(STAGGER ? ["--stagger-sends"] : []),
 			],
 			{ cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], detached: true },
 		);
@@ -744,6 +979,7 @@ async function main(): Promise<void> {
 			serverRx,
 			serverCpuMs: serverCpuMs(),
 			wallMs: Date.now(),
+			kernel: readKernelUdp(),
 			metrics: (() => {
 				const m = server.metricsSnapshot();
 				return {
@@ -751,6 +987,12 @@ async function main(): Promise<void> {
 					limitExceeded: m.limitExceededCount,
 					datagramsDropped: m.datagramsDropped,
 					sessionsActive: m.sessionsActive,
+					datagramsIn: m.datagramsIn,
+					datagramsDroppedRateLimited: m.datagramsDroppedRateLimited ?? 0,
+					datagramsDroppedTooLarge: m.datagramsDroppedTooLarge ?? 0,
+					datagramsDroppedQueueGlobal: m.datagramsDroppedQueueGlobal ?? 0,
+					datagramsDroppedQueueSession: m.datagramsDroppedQueueSession ?? 0,
+					datagramsSkippedQueueFull: m.datagramsSkippedQueueFull ?? 0,
 				};
 			})(),
 		});
@@ -767,6 +1009,9 @@ async function main(): Promise<void> {
 			idleEnd: Window | null;
 			report: ClientReport | null;
 			clientRssGuardFired: boolean;
+			/** Snapshotted with steadyEnd, from the same quiesced instant. */
+			ingestSteady: ReturnType<LatencyHistogram["summary"]> | null;
+			ingestUnstamped: number;
 		} = {
 			phase: "connect",
 			steadyStart: null,
@@ -775,6 +1020,8 @@ async function main(): Promise<void> {
 			idleEnd: null,
 			report: null,
 			clientRssGuardFired: false,
+			ingestSteady: null,
+			ingestUnstamped: 0,
 		};
 		const rungStart = boundary();
 		// Zero unless a previous rung's sessions outlived it — which would mean
@@ -796,6 +1043,12 @@ async function main(): Promise<void> {
 					if (line.includes("phase steady")) {
 						state.steadyStart = boundary();
 						state.phase = "steady";
+						// Scope the ingest percentile to exactly the window
+						// deliveryRatio uses: reset at the steady marker, snapshot
+						// after the drain grace. Connect-phase arrivals are not
+						// steady-state latency and idle sends nothing.
+						ingest.reset();
+						ingestUnstamped = 0;
 					} else if (line.includes("phase idle")) {
 						state.steadyMark = boundary();
 						// Labelled `drain`, not `idle`: these samples carry datagrams
@@ -809,6 +1062,8 @@ async function main(): Promise<void> {
 						// correctly instead of manufacturing a delivery deficit.
 						setTimeout(() => {
 							state.steadyEnd = boundary();
+							state.ingestSteady = ingest.summary();
+							state.ingestUnstamped = ingestUnstamped;
 							state.phase = "idle";
 						}, DRAIN_GRACE_MS);
 					} else if (line.includes("phase stop")) {
@@ -844,6 +1099,10 @@ async function main(): Promise<void> {
 		};
 		let serverRssMbMax = 0;
 		let serverCommittedMbMax: number | null = null;
+		/** Committed samples taken while the rung was idle. C3's marginal is the
+		 * median of these: a max over the whole rung is one sample of a transient,
+		 * and a marginal built from two transients is a difference of outliers. */
+		const committedIdle: number[] = [];
 		let serverFdCountMax: number | null = null;
 		let clientRssMbMax: number | null = null;
 		let sessionsActiveMax = 0;
@@ -875,6 +1134,7 @@ async function main(): Promise<void> {
 					serverCommittedMbMax ?? 0,
 					mem.committedMb,
 				);
+				if (state.phase === "idle") committedIdle.push(mem.committedMb);
 			}
 			if (fds !== null) serverFdCountMax = Math.max(serverFdCountMax ?? 0, fds);
 			if (cRss !== null) clientRssMbMax = Math.max(clientRssMbMax ?? 0, cRss);
@@ -973,6 +1233,47 @@ async function main(): Promise<void> {
 			(state.idleEnd?.metrics.datagramsDropped ?? 0) -
 			rungStart.metrics.datagramsDropped;
 
+		// --- G1 clause C4: the stage ledger over the steady+drain window ---
+		// Every quantity is a delta between the same two boundaries the delivery
+		// ratio uses, so the residuals below compare like with like. Anything that
+		// could not be measured stays null; a tap that did not read is never
+		// reported as a tap that read zero.
+		const kernelUdpSteady = diffKernelUdp(
+			state.steadyStart?.kernel ?? null,
+			state.steadyEnd?.kernel ?? null,
+		);
+		const kernelValue = (key: string): number | null => {
+			const v = kernelUdpSteady?.[key];
+			return v === undefined || v < 0 ? null : v;
+		};
+		const metricBetween = (key: keyof Window["metrics"]): number | null =>
+			state.steadyStart && state.steadyEnd
+				? state.steadyEnd.metrics[key] - state.steadyStart.metrics[key]
+				: null;
+		const nativeDropped = (() => {
+			const parts = (
+				[
+					"datagramsDroppedRateLimited",
+					"datagramsDroppedTooLarge",
+					"datagramsDroppedQueueGlobal",
+					"datagramsDroppedQueueSession",
+				] as const
+			).map(metricBetween);
+			return parts.some((p) => p === null)
+				? null
+				: parts.reduce((a: number, b) => a + (b ?? 0), 0);
+		})();
+		const stageLedger = {
+			clientEnqueued: parsed?.steady.sent ?? 0,
+			clientWireTx: parsed?.quicSteady?.frameTxDatagram ?? null,
+			kernelDropsSocket: kernelValue("serverSocketDrops"),
+			kernelRcvbufErrors: kernelValue("RcvbufErrors"),
+			serverObserved: metricBetween("datagramsIn"),
+			jsDelivered: phaseServerRx.steady + phaseServerRx.drain,
+			nativeDropped,
+			nativeSkippedQueueFull: metricBetween("datagramsSkippedQueueFull"),
+		};
+
 		const sessionsOk = parsed?.sessionsOk ?? 0;
 		const steadySent = parsed?.steady.sent ?? 0;
 		const expectedSends = parsed?.steady.expectedSends ?? 0;
@@ -1004,6 +1305,43 @@ async function main(): Promise<void> {
 			rungStart,
 			state.steadyStart,
 		);
+
+		// Ingest latency: actual client send stamp to JS handler entry, over the
+		// same steady+drain window as delivery. Reported in ms; the histogram
+		// itself keeps nanoseconds.
+		const msOf = (ns: number | null | undefined): number | null =>
+			ns === null || ns === undefined ? null : ns / 1e6;
+		const ingestSummary = state.ingestSteady
+			? {
+					count: state.ingestSteady.count,
+					unstamped: state.ingestUnstamped,
+					p50Ms: msOf(state.ingestSteady.p50Ns),
+					p90Ms: msOf(state.ingestSteady.p90Ns),
+					p99Ms: msOf(state.ingestSteady.p99Ns),
+					p999Ms: msOf(state.ingestSteady.p999Ns),
+					maxMs: msOf(state.ingestSteady.maxNs),
+					negative: state.ingestSteady.negative,
+					skew: state.ingestSteady.skew,
+				}
+			: null;
+		// The generator's own lag against its schedule. Nothing is subtracted from
+		// the ingest number with it — the stamp is taken at the actual send, so the
+		// lag is outside the measured interval by construction — but a generator
+		// lagging by the size of the whole budget is not offering the registered
+		// arrival process, and the gate reads this to say so.
+		const scheduleLagP99Ms = (() => {
+			const raw = parsed?.scheduleLagSteady;
+			if (!raw || typeof raw !== "object") return null;
+			try {
+				return (
+					LatencyHistogram.fromJson(
+						raw as Parameters<typeof LatencyHistogram.fromJson>[0],
+					).percentile(0.99) / 1e6
+				);
+			} catch {
+				return null;
+			}
+		})();
 
 		const metrics = {
 			sessionsOk,
@@ -1085,6 +1423,11 @@ async function main(): Promise<void> {
 			steadyServerRx,
 			idleServerRx,
 			phaseServerRx,
+			serverCommittedMbIdleMedian: median(committedIdle),
+			stageLedger,
+			kernelUdpSteady,
+			ingest: ingestSummary,
+			clientScheduleLagP99Ms: scheduleLagP99Ms,
 			sessionsLost: parsed?.sessionsLost ?? 0,
 			clientDistinctSourceIps: parsed?.client.distinctSourceIps ?? null,
 			clientRssGuardFired: state.clientRssGuardFired,
@@ -1092,7 +1435,7 @@ async function main(): Promise<void> {
 		};
 		rungs.push(rung);
 		console.log(
-			`bench-session-scale: rung ${sessions} bucket=${bucket} (${reason}) connected=${rung.connectedRatio?.toFixed(3)} offered=${rung.offeredRatio?.toFixed(3) ?? "n/a"} delivered=${rung.deliveryRatio?.toFixed(3) ?? "n/a"} rx(connect/steady/drain/idle)=${phaseServerRx.connect}/${phaseServerRx.steady}/${phaseServerRx.drain}/${phaseServerRx.idle} acceptP99=${rung.acceptMs.p99 ?? "n/a"}ms accepts/s=${rung.acceptsPerSec?.toFixed(0) ?? "n/a"} rss=${serverRssMbMax.toFixed(0)}MB committed=${serverCommittedMbMax?.toFixed(0) ?? "n/a"}MB fd=${serverFdCountMax ?? "n/a"} srvCpu(steady)=${rung.serverCpuPctSteady?.toFixed(0) ?? "n/a"}% srvCpu(idle)=${rung.serverCpuPctIdle?.toFixed(0) ?? "n/a"}% clientRss=${clientRssMbMax?.toFixed(0) ?? "n/a"}MB${rung.incompleteUnlessOffBox ? " INCOMPLETE-UNLESS-OFF-BOX" : ""}${degraded.length > 0 ? ` DEGRADED(${degraded.join("; ")})` : ""}`,
+			`bench-session-scale: rung ${sessions} bucket=${bucket} (${reason}) connected=${rung.connectedRatio?.toFixed(3)} offered=${rung.offeredRatio?.toFixed(3) ?? "n/a"} delivered=${rung.deliveryRatio?.toFixed(3) ?? "n/a"} rx(connect/steady/drain/idle)=${phaseServerRx.connect}/${phaseServerRx.steady}/${phaseServerRx.drain}/${phaseServerRx.idle} acceptP99=${rung.acceptMs.p99 ?? "n/a"}ms accepts/s=${rung.acceptsPerSec?.toFixed(0) ?? "n/a"} rss=${serverRssMbMax.toFixed(0)}MB committed=${serverCommittedMbMax?.toFixed(0) ?? "n/a"}MB fd=${serverFdCountMax ?? "n/a"} srvCpu(steady)=${rung.serverCpuPctSteady?.toFixed(0) ?? "n/a"}% srvCpu(idle)=${rung.serverCpuPctIdle?.toFixed(0) ?? "n/a"}% clientRss=${clientRssMbMax?.toFixed(0) ?? "n/a"}MB ingestP99=${ingestSummary?.p99Ms?.toFixed(1) ?? "n/a"}ms lagP99=${scheduleLagP99Ms?.toFixed(1) ?? "n/a"}ms wireTx=${stageLedger.clientWireTx ?? "n/a"} kernelDrops=${stageLedger.kernelDropsSocket ?? "n/a"} datagramsIn=${stageLedger.serverObserved ?? "n/a"}${rung.incompleteUnlessOffBox ? " INCOMPLETE-UNLESS-OFF-BOX" : ""}${degraded.length > 0 ? ` DEGRADED(${degraded.join("; ")})` : ""}`,
 		);
 
 		// STOP conditions that end the ladder rather than the rung. S5 is a
@@ -1151,7 +1494,7 @@ async function main(): Promise<void> {
 	flushResult();
 	console.log(`bench-session-scale: wrote ${OUT_JSON} and ${OUT_CSV}`);
 	console.log(
-		"sessions | bucket | usable | connected | offered | delivered | rx steady/drain/idle | acceptP99 | accepts/s | rssMB | committedMB | fd | srvCpuSteady | srvCpuIdle | clientRssMB",
+		"sessions | bucket | usable | connected | offered | delivered | rx steady/drain/idle | acceptP99 | accepts/s | rssMB | committedMB | committedIdleMed | fd | srvCpuSteady | srvCpuIdle | clientRssMB | ingestP99ms | lagP99ms | kernelDrops",
 	);
 	for (const r of rungs) {
 		// `usable` is the honest headline: a rung can pass every threshold and
@@ -1166,10 +1509,11 @@ async function main(): Promise<void> {
 						? "deg"
 						: "no ";
 		console.log(
-			`${String(r.sessions).padStart(8)} | ${r.bucket.padEnd(20)} | ${usable} | ${(r.connectedRatio ?? 0).toFixed(3)} | ${(r.offeredRatio ?? 0).toFixed(3)} | ${(r.deliveryRatio ?? 0).toFixed(3)} | ${`${r.phaseServerRx.steady}/${r.phaseServerRx.drain}/${r.phaseServerRx.idle}`.padStart(20)} | ${String(r.acceptMs.p99 ?? "n/a").padStart(9)} | ${(r.acceptsPerSec ?? 0).toFixed(0).padStart(9)} | ${r.serverRssMbMax.toFixed(0).padStart(5)} | ${(r.serverCommittedMbMax ?? 0).toFixed(0).padStart(11)} | ${String(r.serverFdCountMax ?? "n/a").padStart(4)} | ${(r.serverCpuPctSteady ?? 0).toFixed(0).padStart(12)} | ${(r.serverCpuPctIdle ?? 0).toFixed(0).padStart(10)} | ${(r.clientRssMbMax ?? 0).toFixed(0).padStart(11)}`,
+			`${String(r.sessions).padStart(8)} | ${r.bucket.padEnd(20)} | ${usable} | ${(r.connectedRatio ?? 0).toFixed(3)} | ${(r.offeredRatio ?? 0).toFixed(3)} | ${(r.deliveryRatio ?? 0).toFixed(3)} | ${`${r.phaseServerRx.steady}/${r.phaseServerRx.drain}/${r.phaseServerRx.idle}`.padStart(20)} | ${String(r.acceptMs.p99 ?? "n/a").padStart(9)} | ${(r.acceptsPerSec ?? 0).toFixed(0).padStart(9)} | ${r.serverRssMbMax.toFixed(0).padStart(5)} | ${(r.serverCommittedMbMax ?? 0).toFixed(0).padStart(11)} | ${(r.serverCommittedMbIdleMedian ?? 0).toFixed(0).padStart(16)} | ${String(r.serverFdCountMax ?? "n/a").padStart(4)} | ${(r.serverCpuPctSteady ?? 0).toFixed(0).padStart(12)} | ${(r.serverCpuPctIdle ?? 0).toFixed(0).padStart(10)} | ${(r.clientRssMbMax ?? 0).toFixed(0).padStart(11)} | ${String(r.ingest?.p99Ms?.toFixed(1) ?? "n/a").padStart(11)} | ${String(r.clientScheduleLagP99Ms?.toFixed(1) ?? "n/a").padStart(8)} | ${String(r.stageLedger.kernelDropsSocket ?? "n/a").padStart(11)}`,
 		);
 	}
 	console.log(`curve: ${JSON.stringify(result.curve)}`);
+	console.log(`gate-g1: ${JSON.stringify(result.gateG1)}`);
 	if (ladderAborted) console.log(`ladder aborted: ${ladderAborted}`);
 }
 
