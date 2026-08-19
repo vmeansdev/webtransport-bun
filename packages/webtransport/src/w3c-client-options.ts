@@ -12,6 +12,7 @@ import {
 	E_LIMIT_EXCEEDED,
 	E_QUEUE_FULL,
 	E_RATE_LIMITED,
+	E_SERVER_CLOSING,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
 	E_STOP_SENDING,
@@ -66,6 +67,11 @@ export function normalizeW3CBrowserName(code: ErrorCode): string | undefined {
 			return "QuotaExceededError";
 		case E_INTERNAL:
 			return "OperationError";
+		case E_SERVER_CLOSING:
+			// Close reason only, never a thrown WebTransportError.code, so it
+			// has no browser name to map to. Listed explicitly rather than left
+			// to `default` so the exhaustiveness check keeps its teeth.
+			return undefined;
 		default: {
 			const _exhaustive: never = code;
 			void _exhaustive;
