@@ -457,6 +457,114 @@ axis's own ladder: the arm shape here exists to exercise close, and any
 classified output it produces is disclosed as coming from the confirmation
 dispatch.
 
+## Amendment 6 — SEND_SYNC=0 positive control arm (Arm B), 2026-08-19, before the run it registers
+
+**Status and disclosure.** Written before this run is dispatched, and written
+*after* phase 1 of the production-grade-scenarios effort closed. Phase-1 results
+are therefore known to the author and are disclosed here in full rather than
+pretended away: G1 PASS-narrowed, G2 INCOMPLETE, G3 INCOMPLETE, G4 PASS, G5
+NO-VERDICT; Amendment 5's confirmation arm (Arm A, run 32209051975, candidate
+`9ebb89e`) exited on its own with `nativeAsyncOpsPending = 0`, and the earlier
+promise-path run 32194978159 (tree `598e04b` = the same harness minus exactly the
+two fix commits) never ended and was cancelled after 1h54m. Every threshold below
+is derived from first principles or from evidence that predates this run — the
+ticket 03 Docker discrimination, dispatch 1, and the two runs just named. None is
+derived from the run this amendment will judge, and no threshold is set where a
+particular outcome becomes more likely.
+
+**Subject.** The registered-but-never-run positive control for the process-pin
+class named in ticket 03 (second class: one loop-ref per N-API promise, host
+drops the TSFN release under load). Arm A rode the promise-free send; this arm is
+the same binary and the same load with the escape hatch engaged
+(`WEBTRANSPORT_DATAGRAM_SEND_SYNC=0`), which routes every session `sendDatagram`
+back through the N-API promise path. It converts the existing evidence from a
+cross-run, cross-tree A/B into an on-runner, one-binary, env-seam A/B.
+
+**Shape.** Identical to Amendment 5's arm — 100 sessions, 1150 B payload, rates
+`900,1100`, 60 s steps, echo on, uniform arrival, `process.exit` workaround
+removed — with exactly one delta, the env var. Candidate: `probe/liveness-confirm-01`
+at the commit that carries this amendment and the watchdog. **ONE dispatch.**
+
+**Registered outcomes.** Both are results; neither is a failure of this arm, and
+neither licenses a rerun.
+
+1. **Pinned** (`fragmentWritten = true` and `killedByWatchdog = true`): the pin
+   reproduces on the runner with the fix as the only delta on one binary. Ruling
+   1a's owed evidence is complete on-runner and the `SEND_SYNC` default-ON
+   landing is backed by a positive control rather than by a cross-run inference.
+2. **Clean exit** (`exitCode = 0`, `killedByWatchdog = false`): the control did
+   not fire on this draw. Pre-registered reading, binding: this **falsifies
+   nothing** and triggers **no** rerun. Ticket 03 measures the pin as stochastic
+   at 17/37 ≈ 46 % per run on the promise path, so P(clean | pin class present)
+   ≈ 0.54 — a single clean exit is the more likely of the two outcomes even when
+   the class is fully present. The recorded conclusion in that case is that the
+   on-runner A/B stays what it already is (cross-run 32194978159 vs 32209051975,
+   plus the Docker 17/37 vs 0/12), and the stochastic caveat stands, written into
+   ticket 03 and the synthesis. "Run it again until it pins" is expressly
+   forbidden by this registration.
+3. **No fragment** (`fragmentWritten = false`): harness fault. The step fails,
+   the dispatch is logged as aborted, and neither reading above is available.
+
+**Liveness pass condition, restated for this arm.** Amendment 5 read condition 1
+("the driver exits on its own") off the workflow step hanging to the job timeout.
+That is no longer how it is read, because the watchdog below now terminates a
+pinned driver by design. From this amendment on, condition 1 is read from the
+watchdog sidecar `bench-latency-<sha>-<arm>.watchdog.json`
+(`exitCode`, `killedByWatchdog`, `fragmentWritten`, `secondsToFragment`,
+`secondsAfterFragment`), and condition 2 is unchanged
+(`liveness.nativeAsyncOpsPending === 0` in the fragment). For Arm-A-shaped runs
+the pass condition is unchanged in substance: `killedByWatchdog = false`.
+
+**Watchdog, and why these numbers.** A pinned driver holds the heavy runner, and
+the effort's concurrency rule keeps exactly one queued run behind it, so an
+unbounded hang costs the queue the full job timeout (2 h — what run 32194978159
+cost before it was cancelled by hand). The watchdog bounds it:
+
+- **Grace = 900 s after the fragment is written.** Derivation, first principles:
+  nothing in the driver's post-write path does work — no I/O, no timers, no
+  awaited handle — so a healthy process has no mechanism by which to exit
+  *later* than the write; the exit is a loop-reference release, not a
+  computation. Prior-phase datum consistent with that: Arm A's step completed in
+  the same second as its write. The failure class is unbounded on the other side
+  (dispatch 1 sat 55+ min in `epoll` with zero sockets; 32194978159 ran 1h54m).
+  Any cut between "same second" and "unbounded" separates the classes; 900 s is
+  ~3 orders of magnitude above the observed clean-exit latency, so the
+  false-pin risk is negligible, and it is small enough that a pinned control arm
+  costs the queue ≈ 20 min, not 2 h.
+- **Ceiling = 1200 s from arm start, pre-write only.** The registered arm's work
+  is 2 rungs × (60 s step + 10 s settle) + 100-session stagger (100 × 10 ms) ≈
+  150 s plus the one-time `load-client` release build; the entire prior
+  confirmation run — checkout, install, native build, arm — took 6 m 40 s of
+  wall clock end to end. 1200 s is therefore ≈ 8× the whole arm's observed
+  budget. An arm that has not written its fragment by then is broken, not slow,
+  and is reported as outcome 3. The ceiling applies only until the fragment
+  exists; after that the grace governs, so the ceiling can never clip the
+  15-minute discrimination window.
+- **Step `timeout-minutes: 75`** as a backstop under the 120-minute job timeout,
+  in case the watchdog loop itself fails. It bounds the worst case where all
+  three arms of a full ladder dispatch hang pre-write.
+- The watchdog kills the driver and any surviving `load-client` child, records
+  the sidecar, and **does not fail the step** when a fragment exists — a kill is
+  outcome 1, which is a result to be read, not an error to be swallowed.
+
+**Manual fallback runbook** (only if the watchdog itself fails and the step is
+still running past its own deadline; the runner is the self-hosted heavy box):
+
+```
+ssh <heavy-runner>
+pgrep -af 'bun tools/load/bench-latency.ts'        # find the pinned driver
+ls -l ~/actions-runner/_work/*/*/.bench-evidence/  # confirm the fragment exists
+kill -9 <pid>                                      # 137 == pinned, per ticket 03
+pkill -9 -f 'target/release/load-client'           # stragglers, if any
+```
+
+Killing after the fragment exists preserves the evidence; the artifact upload
+step runs `if: always()`.
+
+**What this arm may not do.** It produces no latency verdict. Its classified
+output, if any, is disclosed as coming from the control dispatch, exactly as
+Amendment 5 requires of the confirmation dispatch.
+
 ## Dispatch log
 
 Every dispatch of this axis is logged here, including aborted ones, per the
@@ -465,6 +573,7 @@ effort's process rules. A run that is not in this table did not happen.
 | # | run id | candidate SHA | outcome | artifact hash |
 |---|---|---|---|---|
 | 1 | 32159708926 | `5cbf02f` predecessor (`8704588`) | **aborted — harness fault.** The `default` arm wrote its fragment and then the Bun driver sat 55+ minutes in `epoll` with zero sockets open: sessions abandoned by an exiting load client keep the event loop referenced after `server.close()` resolves. No classifier output was produced and no latency value from this dispatch is used anywhere. Fixed by `5cbf02f`. | none (no classified artifact) |
+| 2 | 32209051975 | `9ebb89e7fa2bb4d7941ff4997c06ad21941fd5f2` | **Amendment 5 confirmation arm (Arm A), passed.** The driver exited on its own the same second it wrote its fragment; `nativeAsyncOpsPending = 0`, registry 0, closedByIdle 3, closedByReap 6, closedOther 147, `datagramSendsAsync = 464`. Latency numbers from this dispatch are disclosed as confirmation-dispatch output and are not an axis result. Stamped in ticket 03 §RESOLVED. | not recorded at stamp time |
 
 ## Reusability note (egress axis)
 
