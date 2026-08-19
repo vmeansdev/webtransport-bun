@@ -34,8 +34,21 @@ pub struct ServerMetricsSnapshot {
     pub queued_bytes_global: f64,
     pub backpressure_wait_count: f64,
     pub backpressure_timeout_count: f64,
+    /// Native only. Datagram sends that had to take the parking N-API path and
+    /// therefore created a host event-loop reference for their promise.
+    pub datagram_sends_async: Option<f64>,
     pub rate_limited_count: f64,
     pub limit_exceeded_count: f64,
+    /// Native only. Sessions the QUIC idle timeout ended.
+    pub sessions_closed_by_idle: Option<f64>,
+    /// Native only. Sessions this server ended itself on shutdown.
+    pub sessions_closed_by_reap: Option<f64>,
+    /// Native only. Every other way a session ended (peer close, transport error).
+    pub sessions_closed_other: Option<f64>,
+    /// Diagnostic count of unsettled N-API async operations owned by this
+    /// server. Non-zero after `close()` resolves means the host event loop is
+    /// still referenced by this addon.
+    pub native_async_ops_pending: u32,
     pub sni_cert_selections: f64,
     pub default_cert_selections: f64,
     pub unknown_sni_rejected_count: f64,
@@ -66,6 +79,17 @@ pub struct NativeStreamHandlesSnapshot {
     pub bidi_handles_live: u32,
     pub uni_send_handles_live: u32,
     pub uni_recv_handles_live: u32,
+}
+
+/// The QUIC flow-control snapshot a given limits JSON resolves to. Diagnostic
+/// only: it reports what the transport would be configured with, so callers can
+/// see whether an explicit window took effect or a derived one did.
+#[napi(object)]
+pub struct TransportWindowsSnapshot {
+    pub stream_receive_window: f64,
+    pub receive_window: f64,
+    pub send_window: f64,
+    pub datagram_channel_capacity: f64,
 }
 
 /// Real QUIC transport stats from quinn (wire-level, not facade tallies).

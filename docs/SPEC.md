@@ -123,6 +123,14 @@ export type LimitsOptions = {
   maxQueuedBytesPerSession: number;
   maxQueuedBytesPerStream: number;
 
+  // QUIC flow-control windows, native backend only. Omitted, each is derived
+  // from a byte governor above (the shipped behaviour); set, it moves the
+  // transport window without moving the governor. See docs/OPERATIONS.md
+  // ("Flow-control windows") for the per-session memory math.
+  streamReceiveWindow?: number;
+  receiveWindow?: number;
+  sendWindow?: number;
+
   backpressureTimeoutMs: number;
   handshakeTimeoutMs: number;
   idleTimeoutMs: number;
@@ -258,6 +266,10 @@ export interface CommonSession {
 
   // Datagrams
   sendDatagram(data: Uint8Array): Promise<void>;
+  // Native-only; see "Outgoing datagram batching".
+  sendDatagramBatch(
+    datagrams: readonly Uint8Array[],
+  ): Promise<{ sent: number; error?: WebTransportError }>;
   incomingDatagrams(): AsyncIterable<Uint8Array>;
 }
 
@@ -377,6 +389,61 @@ Examples (expected to work):
 - Bidi stream echo server and client
 - Uni stream upload and download
 
+## Outgoing datagram batching
+
+`sendDatagramBatch(datagrams)` sends many datagrams across one Node-API
+crossing. It is **native-only**, for the same reason batched receiving is: the
+crossing is what it amortizes, and the wasm backend has none. `/portable` keeps
+`sendDatagram()` as the whole of its sending contract.
+
+It **resolves** rather than rejects for transport conditions, with **prefix**
+semantics:
+
+```ts
+const { sent, error } = await session.sendDatagramBatch(datagrams);
+// datagrams[0 .. sent) went out, in order.
+// error (when present) is why datagrams[sent] failed.
+// datagrams[sent + 1 ..] were not attempted.
+```
+
+A partial send is normal on an unreliable transport, and throwing would discard
+the `sent` count that makes the outcome actionable: the caller drops or retries
+`datagrams[sent]` and re-calls with the remainder. `error` carries the same
+codes the single-datagram path throws — `E_QUEUE_FULL` for an element longer
+than `maxDatagramSize`, `E_BACKPRESSURE_TIMEOUT`, `E_SESSION_CLOSED` — because
+the batch inherits each handle's per-datagram semantics element by element and
+does not invent behavior of its own.
+
+It still **throws** synchronously, before any crossing: `TypeError` for a
+non-array argument or a non-`Uint8Array` element, and `WebTransportError` with
+`E_SESSION_CLOSED` on an already-closed session.
+
+Contract points worth stating:
+
+- **Payloads are copied before the promise is returned.** A caller may reuse or
+  overwrite its arrays immediately.
+- **One backpressure deadline for the whole call.** A caller who made one call
+  waits at most one `backpressureTimeoutMs`, not one per element.
+- **The byte reservation is per element**, never `sum(len)` against
+  `maxQueuedBytesPerSession`: a whole-batch reservation larger than the session
+  budget would wait on a release that can never come.
+- **No length limit.** Native carries at most 256 elements per call (the same
+  constant as the receive cap) and the JavaScript layer chunks, so `sent` is
+  always an absolute index into the caller's array. A raw-addon caller that
+  exceeds the cap gets `{sent: ≤256, code: "E_BATCH_TOO_LARGE"}` rather than a
+  silently truncated send.
+- **Send one datagram with `sendDatagram()`.** Array marshalling has a fixed
+  cost that a batch of one has nothing to amortize it over.
+
+The W3C `datagrams.writable` surface has **no** batch API and is not planned to
+grow one. A single `WritableStream` writer structurally cannot present more than
+one chunk to its sink — the microtask that would flush a coalesced batch runs
+between two sink invocations — so a batching sink measures a mean batch size of
+1.00 in practice, and reaching a real batch through one writer would require
+either a timer-based fill or resolving `write()` before delivery. Applications
+that need batched sending must hold the native session handle; the W3C path
+costs roughly one crossing per datagram and that asymmetry is deliberate.
+
 ## Incoming datagram delivery
 
 `incomingDatagrams()` is the same public API on both native session classes and
@@ -470,6 +537,42 @@ better than the old: previously an injected error whose message merely resembled
 a session-close error was silently converted into a clean `done: true`, and any
 other injected error was rewrapped as a `WebTransportError` the caller never
 threw.
+
+## Incoming stream chunk delivery
+
+Receive-side stream data crosses Node-API once per quinn assembler chunk by
+default. `WEBTRANSPORT_STREAM_BATCH_BYTES` turns on a coalescing crossing
+instead: the addon's `readBatch(maxBytes)` parks for the first chunk and then
+takes only what is *already* queued — no timer and no fill wait — and delivers
+the run as one `Uint8Array`, one copy, straight into the engine's allocation.
+
+The knob is **off by default**: unset, invalid, or non-positive means every
+receive path calls the pre-existing `read()` and behaves exactly as before.
+Positive values are the per-crossing byte budget, clamped to `1 MiB` in
+JavaScript and again in native against the per-stream receive window
+(`maxQueuedBytesPerStream`) — a budget above the window can never be filled.
+Like the datagram knob, it is read **once at module initialization**.
+
+Batching changes chunk sizes and nothing else:
+
+- **Terminal events are never merged.** A batch that runs into FIN, RESET or
+  STOP_SENDING delivers its bytes and leaves the terminal event for the next
+  call, which observes it exactly as an unbatched read would. Chunk boundaries
+  were never framing (they are not in QUIC either), so a larger chunk is
+  within the existing contract.
+- **Byte accounting is unchanged.** Each coalesced chunk keeps its three-tier
+  reservation until the payload has been materialized for JavaScript, so
+  reservations are released on consumption, never at coalesce time, and the
+  documented `E_BACKPRESSURE_TIMEOUT` bound above still applies per chunk.
+- **Node `push()` and BYOB are unaffected.** One crossing still produces one
+  `push()`, so `push() === false` stops the reader where it did before, and
+  BYOB readers see a larger view and nothing else.
+
+`WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1` accumulates per-process crossing
+counters — crossings/s, mean bytes per crossing, largest batch — over both the
+batched and the unbatched path, so a comparison between them is measured by one
+instrument. The snapshot is reachable only through the unstable `__TESTING__`
+bag.
 
 ## API stability and semver
 

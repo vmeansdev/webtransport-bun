@@ -82,6 +82,11 @@ export {
 } from "./errors.js";
 export type { ErrorCode } from "./types.js";
 
+import {
+	DATAGRAM_BATCH_MAX,
+	type NativeDatagramBatchResult,
+	sendDatagramBatchChunked,
+} from "./datagram-batch.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -102,6 +107,14 @@ import {
 	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
+import { createServerCloseContract } from "./server-close.js";
+import {
+	parseStreamBatchBytes,
+	readStreamChunk,
+	resetStreamBatchDiagnostics,
+	streamBatchConfig,
+	streamBatchDiagnosticsSnapshot,
+} from "./stream-chunk-batch.js";
 import type {
 	CloseInfo,
 	ErrorCode,
@@ -387,6 +400,36 @@ export type LimitsOptions = {
 	maxQueuedBytesGlobal: number;
 	maxQueuedBytesPerSession: number;
 	maxQueuedBytesPerStream: number;
+	/**
+	 * QUIC per-stream receive window in bytes — how much a peer may have
+	 * outstanding on one incoming stream. Omitted (the default), it is derived
+	 * from `maxQueuedBytesPerStream`, so raising the application byte governor
+	 * also widens the transport window. Set it to move the window on its own
+	 * and leave the governor (and with it backpressure and the datagram
+	 * channel) where it is.
+	 *
+	 * Memory: windows are advertised limits, not allocations, but they are the
+	 * ceiling a peer can drive you to. Worst case per session is
+	 * `receiveWindow + sendWindow + datagramChannel × maxDatagramSize`, and
+	 * `maxQueuedBytesGlobal` does **not** bound it — budget it against
+	 * `maxSessions` yourself. See `docs/OPERATIONS.md` ("Flow-control windows").
+	 *
+	 * Native backend only; the wasm backend has no QUIC transport config.
+	 */
+	streamReceiveWindow?: number;
+	/**
+	 * QUIC connection receive window in bytes, across all incoming streams of
+	 * one session. Omitted, it is derived from `maxQueuedBytesPerSession`
+	 * (raised to cover one stream window). Native backend only.
+	 */
+	receiveWindow?: number;
+	/**
+	 * QUIC connection send window in bytes — outgoing stream bytes that may be
+	 * unacknowledged at once. Omitted, it is derived from
+	 * `maxQueuedBytesPerSession` (raised to cover one stream window). Native
+	 * backend only.
+	 */
+	sendWindow?: number;
 	backpressureTimeoutMs: number;
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
@@ -720,6 +763,34 @@ interface CommonSession {
 
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
+
+	/**
+	 * Send many datagrams across one native crossing.
+	 *
+	 * Native-only, like batched receiving: the wasm backend has no crossing to
+	 * amortize, so `/portable` keeps `sendDatagram` as the portable contract.
+	 *
+	 * Resolves rather than rejects for transport conditions, because a partial
+	 * send is normal on an unreliable transport and throwing would discard the
+	 * `sent` count that makes the result actionable. The result has **prefix**
+	 * semantics: `sent = k` means elements `0..k` went out, in order; `error`
+	 * (when present) is why element `k` failed; elements after `k` were not
+	 * attempted. So the caller drops `datagrams[sent]`, or retries it, and
+	 * re-calls with the remainder.
+	 *
+	 * There is no length limit — arrays longer than the native cap are chunked
+	 * — but it does throw synchronously: a `TypeError` for a non-array argument
+	 * or a non-`Uint8Array` element, and a `WebTransportError` with
+	 * `E_SESSION_CLOSED` on an already-closed session.
+	 *
+	 * A single datagram should still go through {@link sendDatagram}: array
+	 * marshalling has a fixed cost that a batch of one has nothing to amortize
+	 * it over.
+	 */
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }>;
+
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
 }
 
@@ -794,6 +865,13 @@ export type MetricsSnapshot = {
 	queuedBytesGlobal: number;
 	backpressureWaitCount: number;
 	backpressureTimeoutCount: number;
+	/**
+	 * Native only. Datagram sends that had to fall back to the parking N-API
+	 * call. Each one hands JavaScript a promise backed by a ThreadsafeFunction,
+	 * which is a reference on the host event loop, so this is the exposure
+	 * meter for that class — not a latency signal.
+	 */
+	datagramSendsAsync?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
@@ -806,6 +884,18 @@ export type MetricsSnapshot = {
 	nativeBidiHandlesLive?: number;
 	nativeUniSendHandlesLive?: number;
 	nativeUniRecvHandlesLive?: number;
+	/**
+	 * Native only. Unsettled N-API async operations this server still owns.
+	 * Non-zero after `close()` resolves means the addon is still holding the
+	 * host event loop open.
+	 */
+	nativeAsyncOpsPending?: number;
+	/** Native only. Sessions the QUIC idle timeout ended (peer went away). */
+	sessionsClosedByIdle?: number;
+	/** Native only. Sessions this server ended itself while shutting down. */
+	sessionsClosedByReap?: number;
+	/** Native only. Every other way a session ended (peer close, transport error). */
+	sessionsClosedOther?: number;
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
@@ -1087,6 +1177,9 @@ type NativeBidiStreamHandle = {
 	// Never-reject sentinels: string results are error codes (see
 	// unwrapNativeValue) — rejected async napi calls leak handle refs.
 	read(): Promise<Uint8Array | string | null>;
+	/** Coalescing read (see stream-chunk-batch.ts). Optional so an override
+	 * addon without it degrades to `read` instead of throwing. */
+	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
 	write(chunk: Buffer | Uint8Array): Promise<string | null>;
 	finish(): Promise<string | null> | void;
 	finishWait?: () => Promise<string | null> | void;
@@ -1106,6 +1199,7 @@ type NativeSendStreamHandle = {
 type NativeRecvStreamHandle = {
 	readonly id: number;
 	read(): Promise<Uint8Array | string | null>;
+	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
@@ -1116,6 +1210,19 @@ interface NativeSessionHandle {
 	peerPort: number;
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
+	/** Non-parking send. Returns null when queued, `E_WOULD_BLOCK` when the
+	 * caller must fall back to {@link sendDatagram}, or an error code. Optional
+	 * so an older override addon still works — it just keeps paying a promise
+	 * (and a host event-loop reference) per datagram. */
+	trySendDatagram?: (data: Buffer | Uint8Array) => string | null;
+	/** Batched datagram send. Resolves `{sent, code?}` with prefix semantics —
+	 * it never rejects, for the same reason `readDatagramBatch` does not.
+	 * Required rather than optional-with-fallback: it is version-bound with the
+	 * bundled prebuild, so a caller that drops it must fail to compile rather
+	 * than silently degrade. */
+	sendDatagramBatch: (
+		datagrams: Uint8Array[],
+	) => Promise<NativeDatagramBatchResult>;
 	readDatagram(): Promise<Uint8Array | null>;
 	/** Batched datagram read. Resolves a non-empty array, or `null` at
 	 * EOF/close — it never rejects. Required, not optional-with-fallback: it is
@@ -1222,6 +1329,14 @@ interface NativeAddon {
 	/** Inclusive payload size at or below which delivery stays engine-owned
 	 * (absent on older prebuilt addons). Diagnostic only. */
 	nativePayloadEngineOwnedMaxBytes?: () => number;
+	/** The QUIC flow-control config a limits JSON resolves to (absent on older
+	 * prebuilt addons). Pure function of its argument; diagnostic only. */
+	nativeTransportWindows?: (limitsJson: string) => {
+		streamReceiveWindow: number;
+		receiveWindow: number;
+		sendWindow: number;
+		datagramChannelCapacity: number;
+	};
 	/** Test seam: runs payloads through napi-rs's real per-element array
 	 * conversion (absent on older prebuilt addons). Never used in production. */
 	materializePayloadBatchForTests?: (
@@ -1325,7 +1440,7 @@ const DATAGRAM_BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
 const DATAGRAM_BATCH_DIAGNOSTICS_ENV =
 	"WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
 const DEFAULT_DATAGRAM_BATCH = 64;
-const MAX_DATAGRAM_BATCH = 256;
+const MAX_DATAGRAM_BATCH = DATAGRAM_BATCH_MAX;
 const DATAGRAM_BATCH_MISMATCH_MESSAGE =
 	"E_INTERNAL: native addon/JavaScript version mismatch; rebuild the matching prebuild";
 
@@ -1390,6 +1505,46 @@ function datagramBatchDiagnosticsSnapshot(): DatagramBatchDiagnostics {
 			c.batchReadCalls > 0 ? c.materializedItems / c.batchReadCalls : 0,
 		abandonedItems: c.abandonedItems,
 	};
+}
+
+/** What the native non-parking send returns when the byte budget is full. */
+const DATAGRAM_SEND_WOULD_BLOCK = "E_WOULD_BLOCK";
+
+/**
+ * Escape hatch back to a native promise per datagram
+ * (`WEBTRANSPORT_DATAGRAM_SEND_SYNC=0`), read once at module load like the
+ * other native-path knobs. It exists to make the host-loop reference class
+ * reproducible on demand: with the promise-free send off, an echo server under
+ * overload can again outlive its own `close()`.
+ */
+const datagramSyncSendEnabled =
+	process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC !== "0";
+
+/**
+ * Send without handing JavaScript a native promise.
+ *
+ * An async N-API call is not free on the host side: napi-rs backs every promise
+ * it returns with a ThreadsafeFunction, and a live TSFN is a reference on the
+ * event loop that the addon cannot see or count — the Rust future finishing and
+ * that reference being released are two different events. A datagram that has
+ * queue budget does not need any of it, so it takes the synchronous call and
+ * never creates the reference; only a send that must wait falls back.
+ *
+ * Returns true when the datagram is queued and the caller is done, false when
+ * the caller must fall back to the parking send. A real failure throws, exactly
+ * as the parking path's error envelope does.
+ */
+function sendDatagramWithoutPromise(
+	handle: Pick<NativeSessionHandle, "trySendDatagram">,
+	payload: Buffer | Uint8Array,
+): boolean {
+	if (!datagramSyncSendEnabled) return false;
+	const trySend = handle.trySendDatagram;
+	if (typeof trySend !== "function") return false;
+	const code = trySend.call(handle, payload);
+	if (code === DATAGRAM_SEND_WOULD_BLOCK) return false;
+	unwrapNativeVoid(code);
+	return true;
 }
 
 type DatagramSource = Pick<NativeSessionHandle, "readDatagram"> & {
@@ -1628,18 +1783,34 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+			if (sendDatagramWithoutPromise(this.#nativeHandle, buf)) return;
 			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err);
 		}
 	}
 
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }> {
+		if (this.#closed)
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		const handle = this.#nativeHandle;
+		return sendDatagramBatchChunked(
+			(chunk) => handle.sendDatagramBatch(chunk),
+			datagrams,
+		).then(({ sent, code }) =>
+			code === undefined
+				? { sent }
+				: { sent, error: toWebTransportError(new Error(code)) },
+		);
+	}
+
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
 		if (!this.#incomingDatagramsCache) {
-			const session = this;
 			this.#incomingDatagramsCache = createIncomingDatagramIterator(
-				session.#nativeHandle,
-				() => session.#closed,
+				this.#nativeHandle,
+				() => this.#closed,
 				datagramBatchSize,
 				(err) => toWebTransportError(err),
 			);
@@ -2051,30 +2222,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			await handle.setUnknownSniPolicy(policy);
 		},
 		tlsSnapshot: () => handle.tlsSnapshot(),
-		close: async () => {
-			await handle.close();
-			for (const [id, resolve] of closedResolvers) {
-				closedResolvers.delete(id);
-				resolve({ code: 0, reason: "server closed" });
-			}
-			if (activeOnSessionCallbacks > 0) {
-				// Clear the timeout timer if the drain wins the race, so it does
-				// not keep the event loop alive up to 5s after close() resolves.
-				let drainTimer: ReturnType<typeof setTimeout> | undefined;
-				try {
-					await Promise.race([
-						new Promise<void>((r) => {
-							onSessionDrainResolve = r;
-						}),
-						new Promise<void>((r) => {
-							drainTimer = setTimeout(r, 5000);
-						}),
-					]);
-				} finally {
-					if (drainTimer !== undefined) clearTimeout(drainTimer);
+		close: createServerCloseContract({
+			closeNative: () => handle.close(),
+			resolveOwnedSessions: (info) => {
+				for (const [id, resolve] of closedResolvers) {
+					closedResolvers.delete(id);
+					resolve(info);
 				}
-			}
-		},
+			},
+			pendingOnSessionCallbacks: () => activeOnSessionCallbacks,
+			awaitOnSessionDrain: () =>
+				new Promise<void>((resolve) => {
+					onSessionDrainResolve = resolve;
+				}),
+		}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
@@ -2177,20 +2338,37 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+			if (sendDatagramWithoutPromise(this.#nativeHandle, buf)) return;
 			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
 	}
 
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }> {
+		if (this.#closed)
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		const handle = this.#nativeHandle;
+		const strict = this.#strictW3CErrors;
+		return sendDatagramBatchChunked(
+			(chunk) => handle.sendDatagramBatch(chunk),
+			datagrams,
+		).then(({ sent, code }) =>
+			code === undefined
+				? { sent }
+				: { sent, error: toWebTransportError(new Error(code), strict) },
+		);
+	}
+
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
 		if (!this.#incomingDatagramsCache) {
-			const session = this;
 			this.#incomingDatagramsCache = createIncomingDatagramIterator(
-				session.#nativeHandle,
-				() => session.#closed,
+				this.#nativeHandle,
+				() => this.#closed,
 				datagramBatchSize,
-				(err) => toWebTransportError(err, session.#strictW3CErrors),
+				(err) => toWebTransportError(err, this.#strictW3CErrors),
 			);
 		}
 		return this.#incomingDatagramsCache;
@@ -3581,7 +3759,7 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = unwrapNativeValue(await current.read());
+			const chunk = unwrapNativeValue(await readStreamChunk(current));
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.readableDone = true;
@@ -3765,7 +3943,7 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = unwrapNativeValue(await current.read());
+			const chunk = unwrapNativeValue(await readStreamChunk(current));
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.release(false);
@@ -4153,10 +4331,24 @@ export const __TESTING__ = {
 	createIncomingDatagramIteratorForTests: createIncomingDatagramIterator,
 	datagramBatchDiagnosticsSnapshotForTests: datagramBatchDiagnosticsSnapshot,
 	datagramBatchMismatchMessageForTests: DATAGRAM_BATCH_MISMATCH_MESSAGE,
+	parseStreamBatchBytesForTests: parseStreamBatchBytes,
+	/** Frozen snapshot of what this process resolved at module init. */
+	streamBatchConfigForTests: streamBatchConfig,
+	/** G5's crossing instrument: crossings/s, mean bytes/crossing, max batch. */
+	streamBatchDiagnosticsSnapshotForTests: streamBatchDiagnosticsSnapshot,
+	resetStreamBatchDiagnosticsForTests: resetStreamBatchDiagnostics,
+	/** The exact receive-side crossing both incoming-stream readables run. */
+	readStreamChunkForTests: readStreamChunk,
 	nativePayloadDeliveryModeForTests: () =>
 		native?.nativePayloadDeliveryMode?.(),
 	nativePayloadEngineOwnedMaxBytesForTests: () =>
 		native?.nativePayloadEngineOwnedMaxBytes?.(),
+	/** What the addon would configure for a given limits object — the same
+	 * merge `createServer` performs, so a test sees the production JSON. */
+	transportWindowsForLimitsForTests: (limits?: Partial<LimitsOptions>) =>
+		native?.nativeTransportWindows?.(
+			JSON.stringify({ ...DEFAULT_LIMITS, ...limits }),
+		),
 	materializePayloadBatchForTests: (payloads: (Buffer | Uint8Array)[]) =>
 		native?.materializePayloadBatchForTests?.(payloads),
 };

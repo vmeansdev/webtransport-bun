@@ -83,6 +83,9 @@ These are default values; they must be configurable via server/client options.
 - backpressureTimeoutMs: 5000
 - handshakeTimeoutMs: 10000
 - idleTimeoutMs: 60000
+- streamReceiveWindow / receiveWindow / sendWindow: unset (QUIC windows, native
+  only; derived from maxQueuedBytesPerStream and maxQueuedBytesPerSession unless
+  set — see docs/OPERATIONS.md "Flow-control windows" for the memory math)
 
 Per-IP token buckets (defaults)
 - handshakes: 20/s burst 40

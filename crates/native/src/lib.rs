@@ -80,9 +80,11 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
+pub mod async_ops;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
+pub mod datagram_batch;
 pub mod error;
 pub mod histogram;
 pub mod limits;
@@ -471,6 +473,22 @@ pub fn native_payload_delivery_mode() -> &'static str {
     payload_buffer::payload_delivery_mode().as_str()
 }
 
+/// What flow-control config a `createServer`/`connect` limits JSON resolves
+/// to. Pure function of the argument — it configures nothing and reads no
+/// process state — so a caller can confirm that an explicit `receiveWindow`
+/// (or the governor-derived default) is the value the transport would get.
+#[napi]
+pub fn native_transport_windows(limits_json: String) -> metrics::TransportWindowsSnapshot {
+    let limits = limits::Limits::from_json(&limits_json);
+    let policy = transport_memory::TransportMemoryPolicy::from_limits(&limits);
+    metrics::TransportWindowsSnapshot {
+        stream_receive_window: policy.stream_receive_window as f64,
+        receive_window: policy.receive_window as f64,
+        send_window: policy.send_window as f64,
+        datagram_channel_capacity: policy.datagram_channel_capacity as f64,
+    }
+}
+
 /// The inclusive payload size at or below which delivery stays engine-owned.
 /// Larger payloads take the accounted external handover. Diagnostic only.
 #[napi]
@@ -537,6 +555,12 @@ pub fn release_native_memory() -> bool {
 /// Well-known close codes for stable error semantics (AGENTS.md).
 pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
 pub(crate) const LIMIT_EXCEEDED_CLOSE_CODE: u32 = 3992;
+/// A session this server ended itself while shutting down. Distinct from an
+/// application close so the app — and the reaped-vs-lost counters — can tell
+/// "we took this session down" from "we lost it".
+pub const SERVER_CLOSING_CLOSE_CODE: u32 = 3993;
+/// Close reason paired with [`SERVER_CLOSING_CLOSE_CODE`].
+pub const SERVER_CLOSING_CLOSE_REASON: &str = "E_SERVER_CLOSING";
 
 /// Extract (code, reason) from ConnectionError for CloseInfo.
 pub(crate) fn extract_close_info(
@@ -785,7 +809,10 @@ pub(crate) fn spawn_wtransport_server(
                         let incoming = server.accept();
                         tokio::select! {
                             _ = shutdown_rx.changed() => {
-                                server.close(VarInt::from_u32(0), b"server closing");
+                                server.close(
+                                    VarInt::from_u32(SERVER_CLOSING_CLOSE_CODE),
+                                    SERVER_CLOSING_CLOSE_REASON.as_bytes(),
+                                );
                                 break;
                             }
                             incoming_session = incoming => {
@@ -1455,6 +1482,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                 close_err = conn_dgram.closed() => {
                                                                     let (close_code, close_reason) =
                                                                         resolve_close_info(&conn_dgram, &close_err).await;
+                                                                    m_dgram.record_session_close(close_code);
                                                                     counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
@@ -1486,6 +1514,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                         close_code = code2;
                                                                         close_reason = reason2;
                                                                     }
+                                                                    m_dgram.record_session_close(close_code);
                                                                     counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
@@ -1545,6 +1574,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         close_err = conn_dgram.closed() => {
                                                             let (close_code, close_reason) =
                                                                 resolve_close_info(&conn_dgram, &close_err).await;
+                                                            m_dgram.record_session_close(close_code);
                                                             counters.release();
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
@@ -1562,6 +1592,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         }
                                                     }
                                                 }
+                                                m_dgram.record_session_close(None);
                                                 counters.release();
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
