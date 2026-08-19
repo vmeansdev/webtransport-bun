@@ -68,6 +68,12 @@ import {
 	planFor,
 	scheduledDatagrams,
 } from "./egress-schedule.ts";
+import {
+	gsoAmortization,
+	readUdpStats,
+	type UdpSnapshot,
+	udpDelta,
+} from "./egress-socket.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	LatencyHistogram,
@@ -577,6 +583,14 @@ export type EgressStep = {
 	ingested: number;
 	/** Fan-out only: JS handler entry → first forward issue, inside the server. */
 	forwardLag: LatencyHistogramJson | null;
+	/**
+	 * Host-wide `/proc/net/snmp` `Udp:` deltas over the same drive window the
+	 * rates above divide by, and the syscall amortisation they imply
+	 * (amendment 9). Diagnostic: no bucket, no STOP, no gate reads it. Null off
+	 * Linux.
+	 */
+	udp: UdpSnapshot | null;
+	gsoAmortization: number | null;
 	/** Everything the fan-out shape's falsifiers and instruments produced. */
 	fanout: FanoutRecord | null;
 };
@@ -636,6 +650,9 @@ export type FanoutPrecheck = {
 	oneWayP99Ns: number | null;
 	generatorSaturated: boolean;
 	seconds: number;
+	/** Amendment 9, on the pre-check's own drive window. Diagnostic. */
+	udp: UdpSnapshot | null;
+	gsoAmortization: number | null;
 };
 
 type ClientHandle = {
@@ -938,6 +955,7 @@ async function main(): Promise<void> {
 		hostSamples: number[];
 		cpuMsDrive: number;
 		elapsedSec: number;
+		udp: UdpSnapshot | null;
 	};
 
 	const runDirectArm = async (
@@ -960,6 +978,7 @@ async function main(): Promise<void> {
 		}
 
 		const cpuMs0 = serverCpuMs();
+		const udp0 = readUdpStats();
 		const startedAt = Date.now();
 		const hostSamples: number[] = [];
 		let prevHost = readHostCpu();
@@ -982,8 +1001,10 @@ async function main(): Promise<void> {
 			clock,
 		);
 		// Read before the sampler is joined and before the client is reaped, so
-		// the numerator covers the drive window the denominator does.
+		// the numerator covers the drive window the denominator does. The socket
+		// counters are bracketed on the same window for the same reason.
 		const cpuMsDrive = serverCpuMs() - cpuMs0;
+		const udp = udpDelta(udp0, readUdpStats());
 		sampling = false;
 		await sampler;
 		const elapsedSec = (Date.now() - startedAt) / 1000;
@@ -1001,6 +1022,7 @@ async function main(): Promise<void> {
 			hostSamples,
 			cpuMsDrive,
 			elapsedSec,
+			udp,
 		};
 	};
 
@@ -1040,6 +1062,8 @@ async function main(): Promise<void> {
 			serverCpuPct: (arm.cpuMsDrive / (stats.driveWindowSec * 1000)) * 100,
 			ingested: 0,
 			forwardLag: null,
+			udp: arm.udp,
+			gsoAmortization: gsoAmortization(stats.sent, arm.udp),
 			fanout: null,
 		});
 
@@ -1115,6 +1139,8 @@ async function main(): Promise<void> {
 			oneWayP99Ns,
 			generatorSaturated,
 			seconds: FANOUT_PRECHECK_SECONDS,
+			udp: arm.udp,
+			gsoAmortization: gsoAmortization(stats.sent, arm.udp),
 		};
 		console.log(
 			`bench-egress: sink pre-check N=${arm.connected} at ${perSessionRate}/s/session ` +
@@ -1153,6 +1179,7 @@ async function main(): Promise<void> {
 
 		resetFanout(gridPeriodNs);
 		const cpuMs0 = serverCpuMs();
+		const udp0 = readUdpStats();
 		const startedAt = Date.now();
 		const hostSamples: number[] = [];
 		let prevHost = readHostCpu();
@@ -1205,6 +1232,7 @@ async function main(): Promise<void> {
 		const pubStdout = await pub.stdout;
 		fanout.active = false;
 		const cpuMsDrive = serverCpuMs() - cpuMs0;
+		const udp = udpDelta(udp0, readUdpStats());
 		const elapsedSec = (Date.now() - startedAt) / 1000;
 		// First to last server-observed ingest, on the shared clock: the interval
 		// the publisher was actually driving, with the spawn, the handshake and
@@ -1323,6 +1351,10 @@ async function main(): Promise<void> {
 			serverCpuPct: (cpuMsDrive / (driveWindowSec * 1000)) * 100,
 			ingested: fanout.ingested,
 			forwardLag: fanout.handlerToForward.toJson(),
+			udp,
+			// The forward direction is what this shape asks the socket for, so the
+			// numerator is what the server handed it, not what one publisher offered.
+			gsoAmortization: gsoAmortization(fanout.forwarded, udp),
 			fanout: record,
 		});
 
@@ -1338,7 +1370,10 @@ async function main(): Promise<void> {
 					: "no-client-json ") +
 				`ingestToForward p50=${ms(fanout.ingestToForward.percentile(0.5))}ms issueSpread p99=${ms(issue.p99Ns)}ms ` +
 				`cadence=${frameGapFraction.toFixed(4)} (band ${reality.band.low.toFixed(4)}..${reality.band.high.toFixed(4)}) ` +
-				`ingestReal=${reality.real}${reality.real ? "" : ` (${reality.reasons.join(",")})`}`,
+				`ingestReal=${reality.real}${reality.real ? "" : ` (${reality.reasons.join(",")})`} ` +
+				(udp
+					? `udpOut=${udp.outDatagrams} sndbufErr=${udp.sndbufErrors} rcvbufErr=${udp.rcvbufErrors} gso=${gsoAmortization(fanout.forwarded, udp)?.toFixed(2) ?? "n/a"}`
+					: "udp=n/a"),
 		);
 	};
 
@@ -1433,6 +1468,15 @@ async function main(): Promise<void> {
 				headroomSeconds: HEADROOM_SECONDS,
 				headroomBurnNs: HEADROOM_BURN_NS,
 				datagramBatchEnv: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
+				// The fan-out's forward emitter, registered in
+				// docs/research/preregistrations/g4-sfu.md before the run: pipelined
+				// per-target `sendDatagram`, settled together. `sendDatagram` takes
+				// the promise-free `trySendDatagram` path whenever the datagram has
+				// queue budget unless this knob is "0", so the artifact says which
+				// send path was live rather than leaving it to be inferred.
+				forwardEmitter: "sendDatagram-pipelined",
+				datagramSendSyncEnv:
+					process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC ?? null,
 			},
 			headroom,
 			steps,
