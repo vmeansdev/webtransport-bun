@@ -683,7 +683,13 @@ async fn run_subscriber_session(index: usize, conn: wtransport::Connection, shar
 /// bare `thread::sleep` p99 3.1 ms — `crates/reference/tests/timer_precision.rs`
 /// re-measures it), which is §7 V-F's exact failure. Sleeping to the window's
 /// edge and spinning the rest measured p99 1.25 ms on the same rig.
-const PROBE_SPIN_WINDOW: Duration = Duration::from_millis(4);
+// 10 ms, not 4: even at user-interactive QoS this Mac's coarse sleep still
+// wakes >4 ms late about 1% of the time (cable floor arm read scheduleLag
+// p99 3.76 ms with a 4 ms window — every miss past the window is raw lag).
+// The widened window prices at ~2 core-seconds/s at the gate's 100 × 2 Hz
+// cadence, phased, on a 10-core generator; the floor arm's 20 × 2 Hz is a
+// fifth of that.
+const PROBE_SPIN_WINDOW: Duration = Duration::from_millis(10);
 
 /// Cross `deadline - now`, arriving on time: coarse `thread::sleep` to the
 /// spin window's edge, then spin to the instant. Only ever runs on a probe
