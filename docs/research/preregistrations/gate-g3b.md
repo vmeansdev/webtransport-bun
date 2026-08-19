@@ -560,6 +560,47 @@ arms, the rung, the block structure, the bound, H1–H6, C1–C4 or §7's
 predictions. The rerun is the same registration, on the same inputs as run
 `32238304133`, from a candidate carrying the three commits above.
 
+### Dispatch 2 (rerun under §10) — `bench-bandwidth`, `EGRESS_SHAPE=gate`, heavy self-hosted runner
+
+| field | value |
+|---|---|
+| run id | `32253714315` |
+| candidate SHA | `99106a51429fbc554c9142c7cfb21208f85a9b94` (`probe/egress-01`) |
+| staging base SHA | `2a4145d0556a35f8b4a0849e5953927b5e028b64` — unchanged from Dispatch 1 |
+| product identity | `git diff 7abd641..99106a5` touches only `tools/load/*` (7 files) and this file. `git diff 7abd641..99106a5 --stat -- . ':(exclude)tools/load' ':(exclude)docs/research/preregistrations/gate-g3b.md'` is empty; the `crates/`, `packages/`, `Cargo.lock` and `package.json` tree objects are identical across the two candidates. The rerun changed the instrument and nothing the instrument points at, as §10's clause requires. |
+| registration text | §1–§8 unedited since before Dispatch 1 |
+| fragments | started `2026-08-19T12:43:27.694Z` (headroom serial), `12:44:53.057Z` (pipelined), `12:46:18.628Z` (batch), `13:28:26.910Z` (gate); classified `13:28:27.018Z` |
+| host | linux, 4 vCPU, Bun 1.3.14; clock `source: ffi`, `calibrationResidualNs = 0` (limit 50,000), spread 210,687–271,489 ns |
+| **V1** | **PASS.** Spreads 1.182× / 1.394× / 1.584× / 1.904× at m = 0.5/1/2/4; worst **1.904×** against the registered 2× bound; `skippedMultipliers: []`; `runValid: true`. Computed in the artifact (`gateG3.v1`) and re-derived by hand from the per-rung `schedulerLagP99Ns` by the gate agent. |
+| **outcome** | **VALID. C1 PASS** (5/5 blocks complete, `armStop: null`, `headroomFailedOn: {}`, `halfPeriodDependent: false`, `lagInstrument: scheduler-handoff`); **C2 PASS** (median 1.196 ms, interval [1.163, 1.196] ms, 93.75 % coverage, bar 33.3 ms); **C3 MEASURED**, `lever-negative` (median +0.098 ms, [+0.098, +0.131] ms, (c) vs (b)), unverdicted under 5/5 CPU asymmetry; **C4 PASS** (30/30 steps with UDP counters, GSO/GRO active at 64). **`G3` CONVERTS TO PASS.** |
+| §7 | prediction 4 missed and reported as a miss: (a) and (b) pass H2 at every rung. Predictions 2 and 5 (pass half) confirmed; 1 confirmed but for serial at m = 4 (2.589 ms, above the 2 ms band); 3 confirmed in direction. |
+| alignment cost | not stated — all 15 pairs CPU-asymmetric, `bucket: null` on every one, as §6 pre-committed |
+| stamp | `.scratch/production-grade-scenarios/issues/26-g3-reregistration.md`, section "G3b rerun stamp" — every clause re-derived from the raw fragments, the shadow-sink qualifier on the ladder, the CPU disclosure, and what the camera scenario does and does not license |
+
+Artifact sha256:
+
+```
+dbc1963abdb4a52be2f125ffdd6d7eb4006b42004eb60c06bf479030dad9369c  ...-headroom-batch.json
+f8766d28c28a79cdb19fa6544fed839164392e643a24a35e19f60b06669e0002  ...-headroom-pipelined.json
+b40b6d0e0e63b04d57004736a5b1725a19625944ca032b0587cb628005bd68ad  ...-headroom-serial.json
+029767d11e3ad3d6d99994647611bc7dc749dc4f82a54008a59b103f50bd943f  ...-classified.json
+5f10a63903ad0762cdde2c61017a2eb434415a150f66a440bd6eafee08d84b2f  ...-gate.json
+```
+
+(prefix `bench-egress-99106a51429fbc554c9142c7cfb21208f85a9b94` on every name)
+
+Two things carried against this pass rather than left for a reader to find.
+**The early-wake clamp is generous**: 84–87 % of `frame-bursty` samples are
+clamped to zero, so the reported p99 is the ~93rd percentile of the late subset.
+It cannot raise a lag number and so cannot manufacture a pass, and the margin
+absorbs it — the largest lag p99 anywhere in the run is 3.506 ms against a
+16.667 ms bound. **The box coupling the fix said it could not remove is
+visible**: applying V1's arithmetic to the gate blocks, the clause-bearing
+`frame-bursty` blocks spread 1.09–1.39× in 5 of 5, but the non-clause
+`keyframe-aligned` blocks spread 1.53–2.40× and exceed 2× in 2 of 5, serial
+highest in all five. V1 is registered on the headroom control and passes there;
+this is disclosed as one reason the stamp extends nothing to the aligned profile.
+
 ---
 
 ## 10. What this registration may not do
@@ -578,19 +619,35 @@ predictions. The rerun is the same registration, on the same inputs as run
 
 ## 11. Verdict
 
-**G3b is INVALID. `V1` (§2.4) fired: the three arms' `schedulerLag` p99 spread by
-3.85× at m = 0.5, 2.28× at m = 1 and 2.32× at m = 2 — and by 2.2–2.9× on all ten
-gate blocks — against a registered bound of 2×.** Per §2.4 that is a harness
-fault under §10's rerun clause, not a gate result, so this run stamps no clause
-and **G3 remains INCOMPLETE**. Four of the five §7 predictions were missed,
-including V1 itself; per §7 that is reported as a miss and no third registration
-follows.
-
-The full stamp — every clause re-derived from the raw fragments, the
-`halfPeriodDependent` disclosure, the ceiling arithmetic under `T/2` vs `T/4`,
-the CPU-asymmetry disclosure and the prediction reconciliation — is in
+**Dispatch 1 (`32238304133`) is INVALID. `V1` (§2.4) fired: the three arms'
+`schedulerLag` p99 spread by 3.85× at m = 0.5, 2.28× at m = 1 and 2.32× at
+m = 2 — and by 2.2–2.9× on all ten gate blocks — against a registered bound of
+2×.** Per §2.4 that is a harness fault under §10's rerun clause, not a gate
+result, so that run stamps no clause. Its full stamp is in
 `.scratch/production-grade-scenarios/issues/26-g3-reregistration.md`, section
-"G3b stamp". No threshold, clause or bound in §1–§8 was edited after the run.
+"G3b stamp".
+
+**Dispatch 2 (`32253714315`), the §10 rerun on a byte-identical product, is
+VALID and every registered clause passes. `V1` PASS at a worst spread of
+1.904× against the 2× bound (`runValid: true`); C1 PASS with
+`headroomFailedOn: {}` and `halfPeriodDependent: false`; C2 PASS at
+`egressOneWay` p99 1.196 ms, interval [1.163, 1.196] ms, against the 33.3 ms
+bar; C3 MEASURED and `lever-negative`, unverdicted under 5/5 CPU asymmetry;
+C4 PASS. `G3` CONVERTS TO PASS.**
+
+§7's prediction 4 — that arms (a) and (b) would fail H2 at m = 0.5 — is missed
+and reported as a miss under §7: both arms pass H2 at every rung with zero
+drops and zero skips. The per-datagram origination ceiling that motivated this
+axis was an artifact of two successive instruments; it is not present at the
+registered rung. No third registration was needed.
+
+The full stamp — every clause re-derived from the raw fragments, the product
+byte-identity check, the shadow-sink qualifier on the ladder, the CPU
+disclosure, the prediction reconciliation and what the camera scenario does and
+does not license — is in
+`.scratch/production-grade-scenarios/issues/26-g3-reregistration.md`, section
+"G3b rerun stamp". No threshold, clause or bound in §1–§8 was edited after
+either run.
 
 ---
 
