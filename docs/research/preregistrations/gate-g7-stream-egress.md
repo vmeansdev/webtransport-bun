@@ -512,4 +512,74 @@ _No dispatch has occurred._
 <!-- Numbered, each quoting the original text in full, each dated, each made
      before the dispatch it affects. -->
 
-_None._
+### Amendment 1 — 2026-08-19, before any dispatch: V2b needed a second
+### condition, and the rate denominator needed naming precisely
+
+Both items were found while building the harness against the design, which is
+where they should be found. Neither moves a bar; one **tightens** a falsifier
+against the gate.
+
+**1a. V2b could have excused a product miss.** The original §5 text read, in
+full:
+
+> **V2b** | **originator-bound.** `offered < 0.95 × pace` **and**
+> `p99(pacerLateness) > oneWriteInterval` | that cell is **ORIGINATOR-BOUND /
+> INCOMPLETE**, not a product miss. A shortfall with *small* lateness is a
+> genuine product shortfall and is disclosed as such |
+
+The flaw: on this gate the pacer runs on the server's own event loop — it *is*
+the server (§3.3). A slow write path delays the next wake, so the product's own
+cost appears as pacer lateness, and the rule as written would have converted a
+genuine product shortfall into an INCOMPLETE cell. That is the one direction a
+falsifier must never lean.
+
+**Amended rule:** V2b fires only when the lateness is *not* the write call's
+own doing —
+
+> `offered < 0.95 × pace` **and** `p99(pacerLateness) > oneWriteInterval`
+> **and** `p99(writeSettle) < 0.5 × p99(pacerLateness)`.
+>
+> If `p99(writeSettle) ≥ 0.5 × p99(pacerLateness)` the cell is labelled
+> **PRODUCT-BOUND**, V2b does **not** fire, and the shortfall stands as the
+> product's finding. If `writeSettle` is unmeasured, the lateness cannot be
+> attributed and the cell is INCOMPLETE (an unattributable shortfall is not a
+> passing one either way).
+
+The 0.5 share is the natural split point and is fixed here, before the run: at
+half, the write call and everything else contribute equally, and the rule
+resolves the tie **against** the product being excused. Implemented and
+unit-tested in `g7-classify.ts` (`ORIGINATOR_SETTLE_SHARE`), including the case
+where large lateness is *mostly* write-settle and V2b correctly declines to fire.
+
+**1b. The rate denominator is the write window, named exactly.** The original
+§3.5 read:
+
+> G7 reports every rate on **both** `windowSec` (the nominal drive window) and
+> `driveSec` (spawn→exit wall time), and **C2 must clear on the `driveSec`
+> denominator**, which is the conservative one and the one the spec's metric
+> definition names.
+
+Building the conductor exposed an ambiguity: on G7 the *server* drives, so
+"spawn→exit" is the **sink child's** lifetime, which includes the fleet's
+staggered connect ramp — up to ~10 s of a 60 s step at 1,000 sessions. Dividing
+by it would understate the offer for a reason unrelated to the product, and
+would do so *asymmetrically* across the two arms.
+
+**Amended:** three denominators are recorded on every cell and all three are
+published —
+
+- `writeWindowSec` = last writer's end − first writer's start. **The binding
+  denominator for C2 and C5**: it is the interval the pacer was actually
+  running, and it still includes the ramp between the first and last session's
+  first write, so it errs conservative.
+- `childDriveSec` = sink spawn → sink exit. Published; the most conservative.
+- `windowSec` = the nominal step seconds. Published for comparability with the
+  ingest direction, and **binding on nothing**.
+
+**C2 must clear on `writeWindowSec` and the `childDriveSec` figure is stated
+beside it**, so a reader can see both. Because streams are reliable and V4
+requires the byte ledger to close exactly, delivered and offered are the same
+byte count over the same window — the registration already says the delivery
+clause is drain-completeness plus pace fidelity (§2.5), and this makes the
+arithmetic of that explicit rather than leaving two numbers that must be equal
+looking like two measurements.

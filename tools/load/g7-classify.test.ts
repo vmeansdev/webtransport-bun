@@ -42,13 +42,14 @@ const cleanBulk = (over: Partial<BulkRepeatFacts> = {}): BulkRepeatFacts => ({
 	streamBatchBytesEnv: 0,
 	clientRcvbufErrors: 0,
 	serverSndbufErrors: 0,
-	driveSec: 63,
+	writeWindowSec: 63,
+	childDriveSec: 66,
 	windowSec: 60,
 	writeBytes: 65536,
 	paceBytesPerSec: 156_250_000,
-	offeredBytesPerSecDrive: 156_250_000,
-	deliveredBytesPerSecDrive: 156_250_000,
-	deliveredBytesPerSecWindow: 164_062_500,
+	offeredBytesPerSecWriteWindow: 156_250_000,
+	deliveredBytesPerSecWriteWindow: 156_250_000,
+	deliveredBytesPerSecNominal: 164_062_500,
 	serverBytesWritten: 65536 * 150_000,
 	sinkBytesRead: 65536 * 150_000,
 	writeCalls: 150_000,
@@ -85,7 +86,8 @@ const cleanToken = (
 	streamBatchBytesEnv: 0,
 	clientRcvbufErrors: 0,
 	serverSndbufErrors: 0,
-	driveSec: 62,
+	writeWindowSec: 62,
+	childDriveSec: 70,
 	windowSec: 60,
 	sessions: 1000,
 	writeBytes: 40,
@@ -135,13 +137,13 @@ describe("falsifiers fire on the signature each exists to reject", () => {
 	test("V2 fires on an overshoot the pacer cannot produce", () => {
 		expect(
 			v2Overshoot({
-				offeredBytesPerSecDrive: 156_250_000 * 1.03,
+				offeredBytesPerSecWriteWindow: 156_250_000 * 1.03,
 				paceBytesPerSec: 156_250_000,
 			}).fired,
 		).toBe(true);
 		expect(
 			v2Overshoot({
-				offeredBytesPerSecDrive: 156_250_000 * 1.0004,
+				offeredBytesPerSecWriteWindow: 156_250_000 * 1.0004,
 				paceBytesPerSec: 156_250_000,
 			}).fired,
 		).toBe(false);
@@ -149,7 +151,7 @@ describe("falsifiers fire on the signature each exists to reject", () => {
 
 	test("V2 treats a missing offer counter as INVALID, not as a zero", () => {
 		const v = v2Overshoot({
-			offeredBytesPerSecDrive: null,
+			offeredBytesPerSecWriteWindow: null,
 			paceBytesPerSec: 156_250_000,
 		});
 		expect(v.fired).toBe(true);
@@ -158,29 +160,58 @@ describe("falsifiers fire on the signature each exists to reject", () => {
 
 	test("V2b separates an originator-bound shortfall from a product shortfall", () => {
 		const originatorBound = v2bOriginator({
-			offeredBytesPerSecDrive: 156_250_000 * 0.7,
+			offeredBytesPerSecWriteWindow: 156_250_000 * 0.7,
 			paceBytesPerSec: 156_250_000,
 			pacerLateness: samplesOf([20, 30, 40]),
+			writeSettle: samplesOf([0.1, 0.2, 0.3]),
 			writeIntervalMs: 6.71,
 		});
 		expect(originatorBound.fired).toBe(true);
 		expect(originatorBound.detail).toContain("ORIGINATOR-BOUND");
 
 		const productShortfall = v2bOriginator({
-			offeredBytesPerSecDrive: 156_250_000 * 0.7,
+			offeredBytesPerSecWriteWindow: 156_250_000 * 0.7,
 			paceBytesPerSec: 156_250_000,
 			pacerLateness: samplesOf([0.1, 0.2, 0.3]),
+			writeSettle: samplesOf([0.05]),
 			writeIntervalMs: 6.71,
 		});
 		expect(productShortfall.fired).toBe(false);
 	});
 
+	test("V2b refuses to excuse a shortfall the write path itself produced", () => {
+		// Lateness is large, but the write call accounts for most of it: the
+		// event loop was late because the product was slow. That is a MISS.
+		const v = v2bOriginator({
+			offeredBytesPerSecWriteWindow: 156_250_000 * 0.6,
+			paceBytesPerSec: 156_250_000,
+			pacerLateness: samplesOf([30, 30, 30]),
+			writeSettle: samplesOf([25, 25, 25]),
+			writeIntervalMs: 6.71,
+		});
+		expect(v.fired).toBe(false);
+		expect(v.detail).toContain("PRODUCT-BOUND");
+	});
+
+	test("V2b cannot attribute lateness it has no settle instrument for", () => {
+		const v = v2bOriginator({
+			offeredBytesPerSecWriteWindow: 156_250_000 * 0.6,
+			paceBytesPerSec: 156_250_000,
+			pacerLateness: samplesOf([30, 30, 30]),
+			writeSettle: emptySamples(),
+			writeIntervalMs: 6.71,
+		});
+		expect(v.fired).toBe(true);
+		expect(v.detail).toContain("cannot be attributed");
+	});
+
 	test("V2b never fires when the offer was met — the rule is one-sided", () => {
 		expect(
 			v2bOriginator({
-				offeredBytesPerSecDrive: 156_250_000,
+				offeredBytesPerSecWriteWindow: 156_250_000,
 				paceBytesPerSec: 156_250_000,
 				pacerLateness: samplesOf([500, 600]),
+				writeSettle: samplesOf([0.1]),
 				writeIntervalMs: 6.71,
 			}).fired,
 		).toBe(false);
@@ -268,8 +299,8 @@ describe("clauses", () => {
 	test("C2 binds on the drive denominator, not the flattering one", () => {
 		// 0.98 Gbps over the drive window, 1.03 Gbps over the nominal one.
 		const facts = cleanBulk({
-			deliveredBytesPerSecDrive: 122_500_000,
-			deliveredBytesPerSecWindow: 128_750_000,
+			deliveredBytesPerSecWriteWindow: 122_500_000,
+			deliveredBytesPerSecNominal: 128_750_000,
 			sinkBytesRead: 65536 * 150_000,
 			serverBytesWritten: 65536 * 150_000,
 		});

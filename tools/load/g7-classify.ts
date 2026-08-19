@@ -112,9 +112,14 @@ export type CommonFacts = {
 	/** Kernel counters, both directions. Null means "not measured", never zero. */
 	clientRcvbufErrors: number | null;
 	serverSndbufErrors: number | null;
-	/** Spawn to exit. The binding rate denominator (K14). */
-	driveSec: number;
-	/** The nominal drive window. Reported for comparability, never binding. */
+	/**
+	 * Last writer's end minus the first writer's start: the interval the pacer
+	 * was actually running, and the binding rate denominator (K14, Amendment 1b).
+	 */
+	writeWindowSec: number;
+	/** Sink spawn to sink exit. Published, the most conservative, never binding. */
+	childDriveSec: number;
+	/** The nominal step seconds. Published for comparability, binding on nothing. */
 	windowSec: number;
 };
 
@@ -123,12 +128,12 @@ export type BulkRepeatFacts = CommonFacts & {
 	repeat: number;
 	writeBytes: number;
 	paceBytesPerSec: number;
-	/** Server write bytes over `driveSec`: what was actually offered. */
-	offeredBytesPerSecDrive: number | null;
-	/** Sink read bytes over `driveSec`. The binding denominator (K14). */
-	deliveredBytesPerSecDrive: number | null;
+	/** Server write bytes over `writeWindowSec`: what was actually offered. */
+	offeredBytesPerSecWriteWindow: number | null;
+	/** Sink read bytes over `writeWindowSec`. The binding denominator (K14). */
+	deliveredBytesPerSecWriteWindow: number | null;
 	/** Sink read bytes over the nominal window. Reported for comparability. */
-	deliveredBytesPerSecWindow: number | null;
+	deliveredBytesPerSecNominal: number | null;
 	serverBytesWritten: number;
 	sinkBytesRead: number;
 	writeCalls: number;
@@ -222,18 +227,18 @@ export function v1Sink(f: CommonFacts): FalsifierResult {
 
 /** V2: the cumulative-deadline pacer cannot write ahead of its clock. */
 export function v2Overshoot(f: {
-	offeredBytesPerSecDrive: number | null;
+	offeredBytesPerSecWriteWindow: number | null;
 	paceBytesPerSec: number;
 }): FalsifierResult {
 	if (f.paceBytesPerSec <= 0) return ok("V2-overshoot", "INVALID");
-	if (f.offeredBytesPerSecDrive === null)
+	if (f.offeredBytesPerSecWriteWindow === null)
 		return {
 			id: "V2-overshoot",
 			fired: true,
 			effect: "INVALID",
 			detail: "pace-unmeasurable: no server-side write-byte counter",
 		};
-	const ratio = f.offeredBytesPerSecDrive / f.paceBytesPerSec;
+	const ratio = f.offeredBytesPerSecWriteWindow / f.paceBytesPerSec;
 	if (ratio > PACE_OVERSHOOT_RATIO)
 		return {
 			id: "V2-overshoot",
@@ -246,18 +251,32 @@ export function v2Overshoot(f: {
 
 /**
  * V2b: a shortfall the originator caused is an INCOMPLETE cell, not a product
- * miss. A shortfall with small pacer lateness is a genuine product shortfall
- * and is disclosed as one — the rule is deliberately one-sided.
+ * miss.
+ *
+ * The rule needs a second condition that the first draft of the registration
+ * did not have, and Amendment 1 adds it. On this gate the pacer runs on the
+ * server's own event loop — it *is* the server — so a slow write path delays
+ * the next wake and shows up as pacer lateness. Without the second condition, a
+ * genuine product shortfall could be excused as originator-bound, which is
+ * precisely the direction a gate must never lean.
+ *
+ * So lateness only counts as the *originator's* when the write call is not what
+ * produced it: `p99(writeSettle) < 0.5 x p99(pacerLateness)`. If the write call
+ * accounts for half or more of the lateness, the lateness is the product's cost
+ * and the shortfall is the product's finding.
  */
+export const ORIGINATOR_SETTLE_SHARE = 0.5;
+
 export function v2bOriginator(f: {
-	offeredBytesPerSecDrive: number | null;
+	offeredBytesPerSecWriteWindow: number | null;
 	paceBytesPerSec: number;
 	pacerLateness: LatencySamples;
+	writeSettle: LatencySamples;
 	writeIntervalMs: number;
 }): FalsifierResult {
-	if (f.offeredBytesPerSecDrive === null || f.paceBytesPerSec <= 0)
+	if (f.offeredBytesPerSecWriteWindow === null || f.paceBytesPerSec <= 0)
 		return ok("V2b-originator", "INCOMPLETE");
-	const ratio = f.offeredBytesPerSecDrive / f.paceBytesPerSec;
+	const ratio = f.offeredBytesPerSecWriteWindow / f.paceBytesPerSec;
 	if (ratio >= PACE_SHORTFALL_RATIO) return ok("V2b-originator", "INCOMPLETE");
 	const lateP99 = percentileMs(f.pacerLateness, 0.99);
 	if (lateP99 === null)
@@ -267,14 +286,28 @@ export function v2bOriginator(f: {
 			effect: "INCOMPLETE",
 			detail: `shortfall ${ratio.toFixed(3)} with pacer lateness unmeasured`,
 		};
-	if (lateP99 > f.writeIntervalMs)
+	if (lateP99 <= f.writeIntervalMs) return ok("V2b-originator", "INCOMPLETE");
+	const settleP99 = percentileMs(f.writeSettle, 0.99);
+	if (settleP99 === null)
 		return {
 			id: "V2b-originator",
 			fired: true,
 			effect: "INCOMPLETE",
-			detail: `ORIGINATOR-BOUND: offered/pace ${ratio.toFixed(3)} with pacer lateness p99 ${lateP99} ms > one write interval ${f.writeIntervalMs} ms`,
+			detail: `shortfall ${ratio.toFixed(3)} with write settle time unmeasured: the lateness cannot be attributed`,
 		};
-	return ok("V2b-originator", "INCOMPLETE");
+	if (settleP99 >= ORIGINATOR_SETTLE_SHARE * lateP99)
+		return {
+			id: "V2b-originator",
+			fired: false,
+			effect: "INCOMPLETE",
+			detail: `PRODUCT-BOUND shortfall ${ratio.toFixed(3)}: write settle p99 ${settleP99} ms is ${((settleP99 / lateP99) * 100).toFixed(0)}% of pacer lateness p99 ${lateP99} ms, so the lateness is the write path's own cost`,
+		};
+	return {
+		id: "V2b-originator",
+		fired: true,
+		effect: "INCOMPLETE",
+		detail: `ORIGINATOR-BOUND: offered/pace ${ratio.toFixed(3)}, pacer lateness p99 ${lateP99} ms > one write interval ${f.writeIntervalMs} ms, and write settle p99 ${settleP99} ms accounts for under half of it`,
+	};
 }
 
 /** V3: one clock, one box — a negative one-way is a broken clock domain. */
@@ -464,8 +497,10 @@ function worstStatus(fired: FalsifierResult[]): CellStatus {
 }
 
 export type BulkCellSummary = CellSummary<BulkCellName> & {
-	deliveredGbpsDrive: number | null;
-	deliveredGbpsWindow: number | null;
+	deliveredGbpsWriteWindow: number | null;
+	deliveredGbpsNominal: number | null;
+	/** The same bytes over the sink child's whole lifetime: the floor figure. */
+	deliveredGbpsChildDrive: number | null;
 	offeredOverPace: number | null;
 	writesPerSec: number | null;
 	writeSettleP50Ms: number | null;
@@ -485,14 +520,14 @@ export function summariseBulkCell(
 		bulkFalsifiers(r).filter((v) => v.fired),
 	);
 	const deliveredDrive = repeats.map((r) =>
-		r.deliveredBytesPerSecDrive === null
+		r.deliveredBytesPerSecWriteWindow === null
 			? Number.NaN
-			: (r.deliveredBytesPerSecDrive * 8) / 1e9,
+			: (r.deliveredBytesPerSecWriteWindow * 8) / 1e9,
 	);
 	const deliveredWindow = repeats.map((r) =>
-		r.deliveredBytesPerSecWindow === null
+		r.deliveredBytesPerSecNominal === null
 			? Number.NaN
-			: (r.deliveredBytesPerSecWindow * 8) / 1e9,
+			: (r.deliveredBytesPerSecNominal * 8) / 1e9,
 	);
 	const cpuPerGbit = repeats.map((r) => {
 		if (r.serverCpuMs === null) return Number.NaN;
@@ -505,7 +540,7 @@ export function summariseBulkCell(
 			: (r.serverCpuMs * 1e6) / r.writeCalls,
 	);
 	const writesPerSec = repeats.map((r) =>
-		r.driveSec > 0 ? r.writeCalls / r.driveSec : Number.NaN,
+		r.writeWindowSec > 0 ? r.writeCalls / r.writeWindowSec : Number.NaN,
 	);
 	const dropDisclosure = repeats.map((r) => ({
 		repeat: r.repeat,
@@ -522,13 +557,20 @@ export function summariseBulkCell(
 		firedFalsifiers: fired,
 		dropDisclosure,
 		deliveredIsLowerBound,
-		deliveredGbpsDrive: median(deliveredDrive),
-		deliveredGbpsWindow: median(deliveredWindow),
+		deliveredGbpsWriteWindow: median(deliveredDrive),
+		deliveredGbpsNominal: median(deliveredWindow),
+		deliveredGbpsChildDrive: median(
+			repeats.map((r) =>
+				r.childDriveSec > 0
+					? (r.sinkBytesRead * 8) / 1e9 / r.childDriveSec
+					: Number.NaN,
+			),
+		),
 		offeredOverPace: median(
 			repeats.map((r) =>
-				r.offeredBytesPerSecDrive === null || r.paceBytesPerSec <= 0
+				r.offeredBytesPerSecWriteWindow === null || r.paceBytesPerSec <= 0
 					? Number.NaN
-					: r.offeredBytesPerSecDrive / r.paceBytesPerSec,
+					: r.offeredBytesPerSecWriteWindow / r.paceBytesPerSec,
 			),
 		),
 		writesPerSec: median(writesPerSec),
@@ -615,7 +657,7 @@ export function summariseTokenCell(
 		),
 		writesPerSec: median(
 			repeats.map((r) =>
-				r.driveSec > 0 ? r.writesIssued / r.driveSec : Number.NaN,
+				r.writeWindowSec > 0 ? r.writesIssued / r.writeWindowSec : Number.NaN,
 			),
 		),
 		deliveryExact: repeats.every(
@@ -682,13 +724,15 @@ export function evaluateClauses(
 		);
 	} else {
 		results.push(
-			gate.deliveredGbpsDrive === null
+			gate.deliveredGbpsWriteWindow === null
 				? notEvaluated("C2", "delivered rate not measured")
 				: {
 						id: "C2",
 						verdict:
-							gate.deliveredGbpsDrive >= BULK_TARGET_GBPS ? "PASS" : "MISS",
-						detail: `${gate.deliveredGbpsDrive.toFixed(4)} Gbps on driveSec (window denominator ${gate.deliveredGbpsWindow?.toFixed(4) ?? "n/a"}) vs bar ${BULK_TARGET_GBPS}`,
+							gate.deliveredGbpsWriteWindow >= BULK_TARGET_GBPS
+								? "PASS"
+								: "MISS",
+						detail: `${gate.deliveredGbpsWriteWindow.toFixed(4)} Gbps on writeWindowSec vs bar ${BULK_TARGET_GBPS}; same bytes over the sink child's whole lifetime ${gate.deliveredGbpsChildDrive?.toFixed(4) ?? "n/a"} Gbps, over the nominal window ${gate.deliveredGbpsNominal?.toFixed(4) ?? "n/a"} Gbps`,
 					},
 		);
 		const ledgerFired = gate.firedFalsifiers.some((v) => v.id === "V4-ledger");
