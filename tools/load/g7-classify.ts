@@ -106,7 +106,14 @@ export type CommonFacts = {
 	rateLimitedDelta: number | null;
 	limitExceededDelta: number | null;
 	sessionsErr: number;
-	exitCode: number;
+	/** `null` only when a killed sink never reaped. */
+	exitCode: number | null;
+	/**
+	 * The sink outlived its pre-registered deadline and the conductor killed it
+	 * (ticket 01's formula). V8 is what refuses the cell: a killed sink quiesces
+	 * at once, so the settle barrier says nothing about a window cut in half.
+	 */
+	deadlineBreached: boolean;
 	/** Must be 0/unset: the receive knob is irrelevant here and may not be on. */
 	streamBatchBytesEnv: number;
 	/** Kernel counters, both directions. Null means "not measured", never zero. */
@@ -189,7 +196,8 @@ export type FalsifierId =
 	| "V4-ledger"
 	| "V5-stamp"
 	| "V6-quiescence"
-	| "V7-saturation";
+	| "V7-saturation"
+	| "V8-deadline";
 
 export type FalsifierResult = {
 	id: FalsifierId;
@@ -395,7 +403,8 @@ export function v6Quiescence(f: CommonFacts): FalsifierResult {
 			`limiter engaged: rateLimited ${f.rateLimitedDelta}, limitExceeded ${f.limitExceededDelta}`,
 		);
 	if (f.sessionsErr !== 0) problems.push(`sessionsErr ${f.sessionsErr}`);
-	if (f.exitCode !== 0) problems.push(`exitCode ${f.exitCode}`);
+	if (f.exitCode === null) problems.push("exit code never reaped");
+	else if (f.exitCode !== 0) problems.push(`exitCode ${f.exitCode}`);
 	if (f.streamBatchBytesEnv !== 0)
 		problems.push(
 			`receive-side batch knob set to ${f.streamBatchBytesEnv}: no G7 cell may run with it on`,
@@ -408,6 +417,26 @@ export function v6Quiescence(f: CommonFacts): FalsifierResult {
 			detail: problems.join("; "),
 		};
 	return ok("V6-quiescence", "INCOMPLETE");
+}
+
+/**
+ * V8: the sink outlived the cell's pre-registered deadline and was killed.
+ *
+ * INVALID rather than INCOMPLETE, and it has to be its own falsifier: killing
+ * the sink stops every counter at once, so the quiescence and settle checks all
+ * pass on a window that was cut short. This is the falsifier G7's wedged run
+ * did not have.
+ */
+export function v8Deadline(f: CommonFacts): FalsifierResult {
+	if (f.deadlineBreached)
+		return {
+			id: "V8-deadline",
+			fired: true,
+			effect: "INVALID",
+			detail:
+				"the sink was killed at its deadline: this cell's window is truncated and every counter under it is partial",
+		};
+	return ok("V8-deadline", "INVALID");
 }
 
 /** V7: a saturated host is NO-VERDICT, never a MISS. */
@@ -431,6 +460,7 @@ export function v7Saturation(f: CommonFacts): FalsifierResult {
 
 export function bulkFalsifiers(f: BulkRepeatFacts): FalsifierResult[] {
 	return [
+		v8Deadline(f),
 		v6Quiescence(f),
 		v7Saturation(f),
 		v1Sink(f),
@@ -443,6 +473,7 @@ export function bulkFalsifiers(f: BulkRepeatFacts): FalsifierResult[] {
 
 export function tokenFalsifiers(f: TokenRepeatFacts): FalsifierResult[] {
 	return [
+		v8Deadline(f),
 		v6Quiescence(f),
 		v7Saturation(f),
 		v1Sink(f),

@@ -16,7 +16,10 @@ import {
 	v3Negative,
 	v4Ledger,
 	v5Stamp,
+	type FalsifierResult,
+	bulkFalsifiers,
 	v6Quiescence,
+	v8Deadline,
 	v7Saturation,
 } from "./g7-classify.ts";
 import { emptySamples, G7Histogram } from "./g7-histogram.ts";
@@ -33,6 +36,7 @@ const cleanBulk = (over: Partial<BulkRepeatFacts> = {}): BulkRepeatFacts => ({
 	repeat: 1,
 	bucket: "paced-cell",
 	incomplete: false,
+	deadlineBreached: false,
 	hostCpuPctMedian: 50,
 	sinkCpuPctMedian: 60,
 	rateLimitedDelta: 0,
@@ -77,6 +81,7 @@ const cleanToken = (
 	repeat: 1,
 	bucket: "token-cell",
 	incomplete: false,
+	deadlineBreached: false,
 	hostCpuPctMedian: 45,
 	sinkCpuPctMedian: 40,
 	rateLimitedDelta: 0,
@@ -258,6 +263,27 @@ describe("falsifiers fire on the signature each exists to reject", () => {
 		});
 		expect(v.fired).toBe(true);
 		expect(v.detail).toContain("no G7 cell may run with it on");
+	});
+
+	test("V8 refuses a cell whose sink was killed at its deadline", () => {
+		// The trap: killing the sink stops every counter at once, so the
+		// quiescence and settle checks all pass on a half-measured window.
+		const breached = cleanBulk({ deadlineBreached: true });
+		const v = v8Deadline(breached);
+		expect(v.fired).toBe(true);
+		expect(v.effect).toBe("INVALID");
+		expect(v6Quiescence(breached).fired).toBe(false);
+		expect(
+			bulkFalsifiers(breached).filter((f: FalsifierResult) => f.fired),
+		).toEqual([v]);
+		expect(v8Deadline(cleanBulk()).fired).toBe(false);
+		expect(v8Deadline(cleanToken({ deadlineBreached: true })).fired).toBe(true);
+	});
+
+	test("V6 fires when a killed sink never reaped an exit code", () => {
+		expect(v6Quiescence(cleanBulk({ exitCode: null })).detail).toContain(
+			"never reaped",
+		);
 	});
 
 	test("V7 makes saturation a NO-VERDICT and never a MISS", () => {

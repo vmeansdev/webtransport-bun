@@ -30,6 +30,12 @@ import {
 	createServer,
 	DEFAULT_LIMITS,
 } from "../../packages/webtransport/src/index.ts";
+import {
+	cellDeadlineMs,
+	DEADLINE_REAP_GRACE_MS,
+	valueOrAfter,
+	waitForChildWithDeadline,
+} from "./bench-child-deadline.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
 	type BulkRepeatFacts,
@@ -214,7 +220,11 @@ type StepEnvelope = {
 	childDriveSec: number;
 	settleSec: number;
 	settleTimedOut: boolean;
-	exitCode: number;
+	/** The sink outlived its pre-registered deadline and was killed. INVALID. */
+	deadlineBreached: boolean;
+	deadlineMs: number;
+	/** `null` only when a killed sink never reaped. */
+	exitCode: number | null;
 	hostCpuPctMedian: number | null;
 	sinkCpuPctMedian: number | null;
 	serverCpuMs: number;
@@ -294,33 +304,45 @@ async function runStep(
 	let sinkTicksLast = sinkTicks0;
 	const hostSamples: number[] = [];
 	let prevHost: CpuSnapshot | null = readHostCpu();
-	let done = false;
-	const exited = child.exited.then(() => {
-		done = true;
+	// The deadline this gate lost a 117-minute run without. Its formula is
+	// pre-registered in ticket 01: drive + total connect stagger + settle +
+	// margin. G7 staggers *per session*, so the ramp term is the whole ramp.
+	const deadlineMs = cellDeadlineMs({
+		driveMs: STEP_SECONDS * 1000,
+		connectStaggerMs: CONNECT_STAGGER_MS * driver.sessions,
+		settleMaxMs: SETTLE_MAX_MS,
 	});
-	while (!done) {
-		await Promise.race([
-			exited,
-			new Promise((res) => setTimeout(res, SAMPLE_INTERVAL_MS)),
-		]);
-		const nextHost = readHostCpu();
-		const host = hostCpuPct(prevHost, nextHost);
-		prevHost = nextHost;
-		if (host !== null) hostSamples.push(host);
-		const ticks = readPidCpuTicks(child.pid);
-		if (ticks !== null) sinkTicksLast = ticks;
-		appendFileSync(
-			OUT_CSV,
-			`${label},${csvIndex},${Date.now()},${host?.toFixed(1) ?? ""},${(
-				((serverCpuMsNow() - cpuMs0) / Math.max(Date.now() - startedAt, 1)) *
-					100
-			).toFixed(1)},${record.writeCalls},${record.bytesWritten}\n`,
-		);
-	}
+	const wait = await waitForChildWithDeadline(child, {
+		deadlineMs,
+		sampleIntervalMs: SAMPLE_INTERVAL_MS,
+		onSample: () => {
+			const nextHost = readHostCpu();
+			const host = hostCpuPct(prevHost, nextHost);
+			prevHost = nextHost;
+			if (host !== null) hostSamples.push(host);
+			const ticks = readPidCpuTicks(child.pid);
+			if (ticks !== null) sinkTicksLast = ticks;
+			appendFileSync(
+				OUT_CSV,
+				`${label},${csvIndex},${Date.now()},${host?.toFixed(1) ?? ""},${(
+					((serverCpuMsNow() - cpuMs0) / Math.max(Date.now() - startedAt, 1)) *
+						100
+				).toFixed(1)},${record.writeCalls},${record.bytesWritten}\n`,
+			);
+		},
+		onBreach: (phase) =>
+			console.error(
+				`g7: ${label} passed its ${(deadlineMs / 1000).toFixed(0)} s deadline — ${phase}; this cell is INVALID`,
+			),
+	});
 
-	const exitCode = await child.exited;
-	const stdout = await stdoutPromise;
-	const stderr = await stderrPromise;
+	const exitCode = wait.exitCode;
+	const [stdout, stderr] = wait.deadlineBreached
+		? await Promise.all([
+				valueOrAfter(stdoutPromise, DEADLINE_REAP_GRACE_MS, ""),
+				valueOrAfter(stderrPromise, DEADLINE_REAP_GRACE_MS, ""),
+			])
+		: [await stdoutPromise, await stderrPromise];
 	const childDriveSec = (Date.now() - startedAt) / 1000;
 	const settle = await settleRecord(record);
 	const serverCpuMs = serverCpuMsNow() - cpuMs0;
@@ -337,11 +359,16 @@ async function runStep(
 
 	return {
 		record,
-		sink: parseSinkSummary(stdout),
+		// A killed sink's summary is a truncated window, not a short cell:
+		// parsing it would put half-measured numbers into the artifact beside the
+		// flag that says they are not measurements.
+		sink: wait.deadlineBreached ? null : parseSinkSummary(stdout),
 		sinkPort,
 		childDriveSec,
 		settleSec: settle.settleSec,
 		settleTimedOut: settle.timedOut,
+		deadlineBreached: wait.deadlineBreached,
+		deadlineMs,
 		exitCode,
 		hostCpuPctMedian: median(hostSamples),
 		sinkCpuPctMedian: pidCpuPct(sinkTicks0, sinkTicksLast, childDriveSec),
@@ -494,8 +521,13 @@ function bulkFacts(
 	return {
 		cell,
 		repeat,
-		bucket: env.settleTimedOut ? "drain-unsettled" : "paced-cell",
-		incomplete: env.settleTimedOut,
+		bucket: env.deadlineBreached
+			? "deadline-breached"
+			: env.settleTimedOut
+				? "drain-unsettled"
+				: "paced-cell",
+		incomplete: env.settleTimedOut || env.deadlineBreached,
+		deadlineBreached: env.deadlineBreached,
 		hostCpuPctMedian: env.hostCpuPctMedian,
 		sinkCpuPctMedian: env.sinkCpuPctMedian,
 		rateLimitedDelta: env.rateLimitedDelta,
@@ -713,8 +745,13 @@ function tokenFacts(
 	return {
 		cell,
 		repeat,
-		bucket: env.settleTimedOut ? "drain-unsettled" : "token-cell",
-		incomplete: env.settleTimedOut,
+		bucket: env.deadlineBreached
+			? "deadline-breached"
+			: env.settleTimedOut
+				? "drain-unsettled"
+				: "token-cell",
+		incomplete: env.settleTimedOut || env.deadlineBreached,
+		deadlineBreached: env.deadlineBreached,
 		hostCpuPctMedian: env.hostCpuPctMedian,
 		sinkCpuPctMedian: env.sinkCpuPctMedian,
 		rateLimitedDelta: env.rateLimitedDelta,
