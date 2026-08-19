@@ -48,23 +48,47 @@ export type ServerCloseDeps = {
  * Build the `close` implementation. Calling it more than once returns the same
  * promise: closing twice must not start a second drain, and a caller racing
  * two closes must not get one that resolves before the work is done.
+ *
+ * A *successful* close is what gets memoized. A failed one is not: the native
+ * close reports what was still in flight when its budget ran out, and that is a
+ * condition the caller can reasonably retry — memoizing the rejection would
+ * mean a server that failed to close once can never be closed again for the
+ * life of the process.
  */
 export function createServerCloseContract(
 	deps: ServerCloseDeps,
 ): () => Promise<void> {
 	let inFlight: Promise<void> | null = null;
 	return () => {
-		inFlight ??= runClose(deps);
+		if (inFlight === null) {
+			const attempt = runClose(deps);
+			inFlight = attempt;
+			// Release the memo when this attempt fails, so the next call runs a
+			// fresh one. Callers already holding `attempt` still see the
+			// rejection; this handler only clears the slot, so it does not
+			// swallow the failure or leave it unhandled.
+			attempt.catch(() => {
+				if (inFlight === attempt) inFlight = null;
+			});
+		}
 		return inFlight;
 	};
 }
 
 async function runClose(deps: ServerCloseDeps): Promise<void> {
-	await deps.closeNative();
-	deps.resolveOwnedSessions({
-		code: SERVER_CLOSING_CLOSE_CODE,
-		reason: SERVER_CLOSING_CLOSE_REASON,
-	});
+	try {
+		await deps.closeNative();
+	} finally {
+		// Whatever the native side reported, the endpoint has stopped accepting
+		// and these sessions are not coming back. Resolving them here rather
+		// than after a successful close is what keeps a failed close from
+		// leaving every `session.closed` promise unsettled forever — the app
+		// would hang on the one path that is meant to report trouble.
+		deps.resolveOwnedSessions({
+			code: SERVER_CLOSING_CLOSE_CODE,
+			reason: SERVER_CLOSING_CLOSE_REASON,
+		});
+	}
 	if (deps.pendingOnSessionCallbacks() <= 0) return;
 	const budget = deps.drainTimeoutMs ?? ONSESSION_DRAIN_TIMEOUT_MS;
 	// Clear the timer if the drain wins the race, so a resolved close does not
