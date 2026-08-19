@@ -7,6 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	createWallClock,
+	createWallClockWithSource,
 	Deframer,
 	decodeFrame,
 	encodeFrame,
@@ -179,11 +180,34 @@ describe("wall clock", () => {
 		const a = now();
 		const b = now();
 		expect(b).toBeGreaterThanOrEqual(a);
-		// Within 50 ms of the system clock: the anchor is a tick edge, so the
-		// only error is the drift between CLOCK_REALTIME and the monotonic
-		// clock over the life of this test.
+		// Within 50 ms of the system clock: it *is* the system clock, read
+		// through FFI, so the only slack is this test's own execution.
 		const drift = Math.abs(nsToMs(a) - Date.now());
 		expect(drift).toBeLessThan(50);
+	});
+
+	test("the clock reads CLOCK_REALTIME through FFI, not an anchored Date.now()", () => {
+		// The anchored fallback drifts against another process's CLOCK_REALTIME:
+		// on a loopback wiring check it turned ~2% of one-way samples negative
+		// against the Rust generator while producing none against a JS peer. V-N
+		// would have invalidated the gate for that. The FFI reader shares the
+		// system clock with `SystemTime::now()` by construction, so the source is
+		// asserted rather than hoped for on every platform this test runs on.
+		const clock = createWallClockWithSource();
+		expect(clock.source).toBe("ffi-clock-realtime");
+		const a = clock.now();
+		const b = clock.now();
+		expect(b).toBeGreaterThanOrEqual(a);
+		expect(Math.abs(nsToMs(a) - Date.now())).toBeLessThan(50);
+	});
+
+	test("the stamp stays exact past the range a double can hold", () => {
+		// Realtime nanoseconds are ~1.79e18, far past 2^53, so a reader that goes
+		// through a double would quietly round the low digits away — and the
+		// rounding would be invisible in every value except a latency difference.
+		const now = createWallClock()();
+		expect(now).toBeGreaterThan(1_700_000_000_000_000_000n);
+		expect(now % 1_000_000n).not.toBe(0n);
 	});
 
 	test("nanoseconds convert to milliseconds as a float", () => {

@@ -51,7 +51,7 @@ import {
 	type TunnelCellFacts,
 } from "./g11-classify.ts";
 import {
-	createWallClock,
+	createWallClockWithSource,
 	Deframer,
 	encodeFrame,
 	FrameClass,
@@ -129,6 +129,9 @@ const SMOKE_SECONDS = Number(process.env.G11_SMOKE_SECONDS ?? 4);
 
 const KNOB = streamBatchConfig();
 const CPU_CORES = cpus().length;
+
+/** Which clock the last cell stamped with; recorded in the artifact. */
+let wallClockSource = "unset";
 
 let portCursor = BASE_PORT;
 const nextPort = () => portCursor++;
@@ -738,7 +741,9 @@ async function runStep(
 ): Promise<StepEnvelope> {
 	const record = newRecord();
 	const port = nextPort();
-	const wallNs = createWallClock();
+	const clock = createWallClockWithSource();
+	const wallNs = clock.now;
+	wallClockSource = clock.source;
 	const liveSessions = new Set<ServerSession>();
 	let sessionIndex = 0;
 
@@ -1225,6 +1230,7 @@ async function main(): Promise<void> {
 			datagramBatchSizeEnv: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
 			datagramSendSyncEnv: process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC ?? null,
 			bunVersion: Bun.version,
+			wallClockSource,
 			cpuCores: CPU_CORES,
 			hasProc: HAS_PROC,
 			stepSeconds: STEP_SECONDS,
