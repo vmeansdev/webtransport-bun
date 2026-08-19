@@ -582,7 +582,9 @@ version 4, additively. v1–v3 keep decoding exactly as today.
 `STAMP_BYTES_V4 = 48` — unchanged, the arm byte comes out of the v3 reserved
 field, so the 200 B payload arithmetic in §1.2 does not move.
 
-Classes used here: `BROADCAST = 5`, `PROBE = 6`, `PROBE_ECHO = 7`.
+Classes used here: `BROADCAST = 6`, `PROBE = 7`, `PROBE_ECHO = 8`
+(amendment 1, §11c — the original text assigned 5/6/7, but 5 was already
+`CLASS_RAID_JOIN`).
 
 **The arm byte is what makes the interleave readable.** Every broadcast datagram
 carries the arm that emitted it, so the Mac attributes each message's spread to
@@ -967,8 +969,17 @@ by design, so the conductor cannot accidentally use a self-flattering one.
 
 ## 11c. Amendment log
 
-**None.** This document's first commit is its registration, and every threshold
-on this page was fixed in that commit. Two things are worth naming so a later
+**Amendment 1 (2026-08-19, before first dispatch — legal under §10).** §6.1's
+class-id line originally read, in full: *"Classes used here: `BROADCAST = 5`,
+`PROBE = 6`, `PROBE_ECHO = 7`."* It now reads 6/7/8. Why: class 5 was already
+`CLASS_RAID_JOIN` in the landed `tools/load/latency-stamp.ts`, and both halves
+of stamp v4 — the TS conductor and the Rust `broadcast_client` — were built
+against the code's 6/7/8, because the wire is what the two ends must agree on.
+Nothing scored reads a class id; no threshold moves. The prose is corrected to
+match the wire rather than the wire quietly diverging from the registration.
+
+Otherwise none: this document's first commit is its registration, and every
+threshold on this page was fixed in that commit. Two things are worth naming so a later
 reader does not mistake them for silent edits:
 
 - **K18 was superseded before registration, not amended after it.** Its original
