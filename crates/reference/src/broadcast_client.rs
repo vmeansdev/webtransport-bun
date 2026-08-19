@@ -573,7 +573,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             established.add_permits(1);
             let probes = index < options.probe_cohort;
             if probes {
-                run_probe_session(index, conn, &options, shared.as_ref()).await;
+                run_probe_session(index, conn, &options, Arc::clone(&shared)).await;
             } else {
                 run_subscriber_session(index, conn, shared.as_ref()).await;
             }
@@ -677,50 +677,75 @@ async fn run_subscriber_session(index: usize, conn: wtransport::Connection, shar
 /// forward, and a deadline already more than a period in the past is skipped and
 /// counted rather than caught up. Catching up would emit a burst this role never
 /// offers and would report a lag it created itself.
+/// How far ahead of a probe deadline the coarse sleep hands over to spinning.
+/// Every async-runtime timer on this rig wakes milliseconds late (measured on
+/// an idle Mac, launchd Background context: tokio `sleep_until` p99 7.2 ms,
+/// bare `thread::sleep` p99 3.1 ms — `crates/reference/tests/timer_precision.rs`
+/// re-measures it), which is §7 V-F's exact failure. Sleeping to the window's
+/// edge and spinning the rest measured p99 1.25 ms on the same rig.
+const PROBE_SPIN_WINDOW: Duration = Duration::from_millis(4);
+
+/// Cross `deadline - now`, arriving on time: coarse `thread::sleep` to the
+/// spin window's edge, then spin to the instant. Only ever runs on a probe
+/// timing thread, never on a runtime worker.
+fn sleep_until_precise(deadline: Instant) {
+    let coarse = deadline - PROBE_SPIN_WINDOW;
+    let now = Instant::now();
+    if coarse > now {
+        std::thread::sleep(coarse - now);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
+/// The probe role, split across two executors on purpose. The async half is a
+/// pure receiver — identical shape to `run_subscriber_session`, so a probe's
+/// receive instants carry no branch a subscriber's do not. The timing half is
+/// a dedicated OS thread per probe session: `send_datagram` is synchronous in
+/// wtransport, so the send leaves from the thread that kept the deadline, and
+/// the probe's cadence never rides the async runtime's timer wheel (whose
+/// wakeup tail is what V-F bounds — see `PROBE_SPIN_WINDOW`).
+///
+/// The window is sized to the host's own wake tail, not to elegance: ~1% of
+/// thread wakes on the bench Mac arrive ≥9 ms late whatever primitive armed
+/// them, so a window under that keeps V-F's p99 exactly where the tail is.
+/// 16 ms of spinning per probe per period is the disclosed price of a p99 the
+/// scheduler cannot write; at the gate's 100 × 2 Hz cadence that is ≤3.2
+/// core-seconds per second on a 10-core generator, phased so at most a few
+/// spin at once.
 async fn run_probe_session(
     index: usize,
     conn: wtransport::Connection,
     options: &Options,
-    shared: &Shared,
+    shared: Arc<Shared>,
 ) {
-    let mut payload = vec![0u8; options.payload_bytes.max(STAMP_BYTES_V4)];
-    let mut pending: HashMap<u64, u64> = HashMap::new();
-    let mut sequence = 0u64;
-    let period = if options.probe_hz > 0.0 {
-        Duration::from_secs_f64(1.0 / options.probe_hz)
-    } else {
-        Duration::from_secs(3_600)
-    };
-    // Phase the cohort across one period so a hundred probes do not leave as one
-    // burst that the server would then answer as one burst.
-    let phase = if options.probe_cohort > 0 {
-        period.mul_f64(index as f64 / options.probe_cohort as f64)
-    } else {
-        Duration::ZERO
-    };
-    let start = Instant::now();
-    let mut deadline = start + phase;
+    let pending: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    loop {
-        tokio::select! {
-            received = conn.receive_datagram() => {
-                match received {
-                    Ok(datagram) => {
-                        let at_ns = monotonic_ns();
-                        consume(index, datagram.as_ref(), at_ns, shared, Some(&mut pending));
-                    }
-                    Err(_) => {
-                        if !shared.stop.load(Ordering::Relaxed) {
-                            shared.sessions_lost.fetch_add(1, Ordering::Relaxed);
-                        }
-                        return;
-                    }
-                }
+    let sender = {
+        let conn = conn.clone();
+        let pending = Arc::clone(&pending);
+        let shared = Arc::clone(&shared);
+        let payload_bytes = options.payload_bytes.max(STAMP_BYTES_V4);
+        let probe_hz = options.probe_hz;
+        let probe_cohort = options.probe_cohort;
+        std::thread::spawn(move || {
+            if probe_hz <= 0.0 {
+                return;
             }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                if options.probe_hz <= 0.0 {
-                    return;
-                }
+            let mut payload = vec![0u8; payload_bytes];
+            let mut sequence = 0u64;
+            let period = Duration::from_secs_f64(1.0 / probe_hz);
+            // Phase the cohort across one period so a hundred probes do not
+            // leave as one burst that the server would answer as one burst.
+            let phase = if probe_cohort > 0 {
+                period.mul_f64(index as f64 / probe_cohort as f64)
+            } else {
+                Duration::ZERO
+            };
+            let mut deadline = Instant::now() + phase;
+            while !shared.stop.load(Ordering::Relaxed) {
+                sleep_until_precise(deadline);
                 shared.probe_intended.fetch_add(1, Ordering::Relaxed);
                 let now = Instant::now();
                 let lag = now.saturating_duration_since(deadline);
@@ -750,16 +775,47 @@ async fn run_probe_session(
                 match conn.send_datagram(&payload) {
                     Ok(()) => {
                         shared.probe_sent.fetch_add(1, Ordering::Relaxed);
-                        pending.insert(sequence, lag.as_nanos() as u64);
+                        pending
+                            .lock()
+                            .expect("probe pending map poisoned")
+                            .insert(sequence, lag.as_nanos() as u64);
                     }
                     Err(e) => {
-                        shared.probe_errors.fetch_add(1, Ordering::Relaxed);
-                        shared.record_error(format!("probe send {index}: {e}"));
+                        // A dead connection will not recover; one record, not
+                        // one per period until the window ends.
+                        if !shared.stop.load(Ordering::Relaxed) {
+                            shared.probe_errors.fetch_add(1, Ordering::Relaxed);
+                            shared.record_error(format!("probe send {index}: {e}"));
+                        }
+                        return;
                     }
                 }
             }
+        })
+    };
+
+    loop {
+        match conn.receive_datagram().await {
+            Ok(datagram) => {
+                let at_ns = monotonic_ns();
+                let mut map = pending.lock().expect("probe pending map poisoned");
+                consume(index, datagram.as_ref(), at_ns, &shared, Some(&mut map));
+            }
+            Err(_) => {
+                if !shared.stop.load(Ordering::Relaxed) {
+                    shared.sessions_lost.fetch_add(1, Ordering::Relaxed);
+                }
+                break;
+            }
         }
     }
+    // The timing thread exits on the stop flag or on its send failing after
+    // the connection died; joining keeps the counters it writes ahead of the
+    // report that reads them.
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = sender.join();
+    })
+    .await;
 }
 
 /// One arrival, classified. Split out so the probe and the receive-only session
