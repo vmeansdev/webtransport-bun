@@ -59,6 +59,11 @@ pub struct ServerMetrics {
     pub queued_bytes_global: AtomicU64,
     pub backpressure_wait_count: AtomicU64,
     pub backpressure_timeout_count: AtomicU64,
+    /// Datagram sends that could not be served synchronously and had to take
+    /// the parking N-API path. Every one of those hands JavaScript a promise
+    /// backed by a ThreadsafeFunction — a host event-loop reference — so this
+    /// counter is how exposed a server is to that class, not a latency metric.
+    pub datagram_sends_async: AtomicU64,
     /// Wakes datagram senders competing for this server instance's global byte budget.
     pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
@@ -271,6 +276,7 @@ impl ServerMetrics {
             backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as f64,
             backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed)
                 as f64,
+            datagram_sends_async: Some(self.datagram_sends_async.load(Ordering::Relaxed) as f64),
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as f64,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as f64,
             sessions_closed_by_idle: Some(

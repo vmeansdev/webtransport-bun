@@ -130,12 +130,75 @@ pub(crate) fn session_metrics_snapshot_from(
     }
 }
 
+/// Error code the non-parking send returns when the byte budget cannot fit the
+/// payload right now. Not a failure: the caller is expected to fall back to the
+/// parking send, which is the only path allowed to wait.
+pub(crate) const WOULD_BLOCK: &str = "E_WOULD_BLOCK";
+
+/// Send one datagram without ever waiting.
+///
+/// This exists because of what an async N-API method costs on the host side:
+/// napi-rs backs every promise it hands JavaScript with a ThreadsafeFunction,
+/// and a live TSFN is a *reference on the host event loop*. The Rust future
+/// finishing is not the same event as that reference being released — the
+/// release is queued back to the JS thread — so a per-datagram promise puts one
+/// host-loop reference per datagram through a path the addon cannot see or
+/// count. A send that has budget needs none of that: quinn's `send_datagram` is
+/// synchronous, and the only asynchronous part of the old path was our own
+/// capacity wait.
+///
+/// Returns `None` when the datagram was queued, `Some(WOULD_BLOCK)` when the
+/// caller should fall back to the parking send, and `Some(code)` for a real
+/// failure. It never rejects and never blocks the JS thread.
+pub(crate) fn try_send_datagram_for_session(id: &str, bytes: &[u8]) -> Option<&'static str> {
+    let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
+        session_registry::get_datagram_send_state(id)
+    else {
+        return Some("E_SESSION_CLOSED");
+    };
+    let sz = bytes.len();
+    if sz > limits.max_datagram_size {
+        return Some("E_QUEUE_FULL");
+    }
+    if lifecycle_closed.load(Ordering::Acquire) {
+        return Some("E_SESSION_CLOSED");
+    }
+    let sz_u64 = sz as u64;
+    if !metrics
+        .try_reserve_queued_bytes_with_session(
+            &sm.queued_bytes,
+            sz_u64,
+            limits.max_queued_bytes_global,
+            limits.max_queued_bytes_per_session,
+        )
+        .is_ok()
+    {
+        return Some(WOULD_BLOCK);
+    }
+    let start = std::time::Instant::now();
+    // Same order as the parking path: the reservation is released whatever the
+    // send does, so a failed send cannot strand budget.
+    let sent = conn.send_datagram(bytes).is_ok();
+    metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
+    if !sent {
+        return Some("E_SESSION_CLOSED");
+    }
+    metrics.datagram_enqueue_histogram.observe(start.elapsed());
+    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+    sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
 pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<()> {
     let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
         session_registry::get_datagram_send_state(id)
     else {
         return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
     };
+    // Counted here rather than at the binding: this function *is* the parking
+    // path, so the counter reads as "datagrams that needed an N-API promise",
+    // which is the exposure this server has to the host-loop reference class.
+    metrics.datagram_sends_async.fetch_add(1, Ordering::Relaxed);
     let sz = bytes.len();
     if sz > limits.max_datagram_size {
         return Err(napi::Error::from_reason("E_QUEUE_FULL"));
@@ -1616,6 +1679,32 @@ mod tests {
             .unwrap_err();
         assert!(queue_err.reason.contains("E_QUEUE_FULL"));
 
+        // The promise-free send: same outcomes, no N-API future, and it does
+        // not count against the parking-path exposure meter.
+        let async_sends_before = metrics
+            .datagram_sends_async
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            try_send_datagram_for_session(&id, b"sync-ping"),
+            None,
+            "a send with budget must be served without a promise"
+        );
+        assert_eq!(
+            try_send_datagram_for_session(&id, &oversized),
+            Some("E_QUEUE_FULL")
+        );
+        assert_eq!(
+            try_send_datagram_for_session("missing-loopback", b"x"),
+            Some("E_SESSION_CLOSED")
+        );
+        assert_eq!(
+            metrics
+                .datagram_sends_async
+                .load(std::sync::atomic::Ordering::Relaxed),
+            async_sends_before,
+            "the synchronous path must not count as a parking send"
+        );
+
         wait_session_stream_capacity(id.clone().into(), 200, "bidi")
             .await
             .expect("bidi capacity");
@@ -1710,10 +1799,28 @@ mod tests {
         .unwrap_err();
         assert!(deadline_err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
 
+        // No budget: the synchronous send declines instead of waiting, and only
+        // the fallback pays for a promise — which is exactly what the counter
+        // is there to report.
+        assert_eq!(
+            try_send_datagram_for_session(&client_id, b"ab"),
+            Some(WOULD_BLOCK),
+            "a send with no budget must decline rather than block the JS thread"
+        );
+        let async_sends_before_fallback = metrics
+            .datagram_sends_async
+            .load(std::sync::atomic::Ordering::Relaxed);
         let timeout_err = send_datagram_for_session(&client_id, b"ab")
             .await
             .unwrap_err();
         assert!(timeout_err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
+        assert_eq!(
+            metrics
+                .datagram_sends_async
+                .load(std::sync::atomic::Ordering::Relaxed),
+            async_sends_before_fallback + 1,
+            "the parking send must count itself"
+        );
 
         let slot = session_registry::DatagramSlot::new(
             b"queued".to_vec(),

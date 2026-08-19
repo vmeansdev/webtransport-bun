@@ -34,6 +34,9 @@ pub struct ServerMetricsSnapshot {
     pub queued_bytes_global: f64,
     pub backpressure_wait_count: f64,
     pub backpressure_timeout_count: f64,
+    /// Native only. Datagram sends that had to take the parking N-API path and
+    /// therefore created a host event-loop reference for their promise.
+    pub datagram_sends_async: Option<f64>,
     pub rate_limited_count: f64,
     pub limit_exceeded_count: f64,
     /// Native only. Sessions the QUIC idle timeout ended.
