@@ -320,7 +320,7 @@ falsifier in §4 fired.
 | **C2** | downstream offered rate | 300 Mbps ± 2% | §1.4 |
 | **C3** | byte accounting closes exactly, both directions | delivered = written, **exact** | streams are reliable; anything else is loss the transport promised not to have |
 | **C4** | drain completeness | 0 stream errors, 0 resets, 0 `E_BACKPRESSURE_TIMEOUT`, every stream FINs both halves | K17 makes this the clause most worth stating; a cross-direction budget stall would surface here first |
-| **C5** | per-session fairness, each direction | max ÷ min delivered bytes ≤ **1.05**, and min ≥ 0.95 × its own paced offer | the axis's 5% integrity band (used in five independent places on this axis). The pacer's own residual is one frame interval over the step = 3.739 ms ÷ 60 s = **0.0062%**, four orders below the band, so any observed spread is scheduling, not pacing |
+| **C5** | per-session fairness, each direction | max ÷ min delivered bytes ≤ **1.05**, and min ≥ 0.95 × its own paced offer | the axis's 5% integrity band (used in five independent places on this axis). The pacer's own residual is one frame interval over the step = 3.739 ms ÷ 60 s = **0.0062%**, ~800× smaller than the band (Amendment 1), so any observed spread is scheduling, not pacing |
 | **C6** | upstream one-way p99 | ≤ **25 ms**, raw | §1.6 |
 | **C7** | downstream one-way p99 | ≤ **25 ms**, raw | §1.6 |
 | **C8** | memory statement | advertised per-session worst case stays inside the shipped 2 MiB / 512 MiB budgets; peak RSS reported | K10; a ≥ N-tunnel claim may not borrow a budget it does not stay inside |
@@ -471,6 +471,32 @@ Written before the run so the stamp cannot widen it.
   document is written not to.
 - Agent separation (spec §Separation): the agent that dispatches must not be the
   agent that implemented the levers this gate rides.
+
+## §11b — Amendments (each quotes its original in full, all pre-dispatch)
+
+### Amendment 1 — the pacer-residual comparison in clause C5 (2026-08-19)
+
+Found by mechanising the arithmetic in `tools/load/g11-plan.ts`, before any
+harness existed and before any dispatch. **No threshold moves**: the 5% fairness
+band and the 0.0062% residual are both unchanged; what was wrong was the phrase
+comparing them.
+
+Original, quoted in full:
+
+> The pacer's own residual is one frame interval over the step = 3.739 ms ÷
+> 60 s = **0.0062%**, four orders below the band, so any observed spread is
+> scheduling, not pacing
+
+Corrected to:
+
+> The pacer's own residual is one frame interval over the step = 3.739 ms ÷
+> 60 s = **0.0062%**, **~800× smaller than the band**, so any observed spread is
+> scheduling, not pacing
+
+0.05 ÷ 0.0000623 = 803, which is 2.9 orders of magnitude, not four. The clause's
+reasoning is unaffected — the residual is still far too small for the band to be
+measuring the pacer — but a factor stated wrong on a pre-registration is a factor
+stated wrong, and `g11-plan.test.ts` now pins the ratio so it cannot drift again.
 
 ## §12 — Run log
 
