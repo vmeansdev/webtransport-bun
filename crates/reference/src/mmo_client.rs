@@ -34,7 +34,7 @@ mod latency_probe;
 
 use latency_probe::{
     monotonic_ns, read_stamp, write_stamp_v3, AtomicHistogram, CLASS_ACK, CLASS_ACTION, CLASS_MOVE,
-    CLASS_RAID, CLASS_SNAPSHOT, STAMP_BYTES_V3,
+    CLASS_RAID, CLASS_RAID_JOIN, CLASS_SNAPSHOT, STAMP_BYTES_V3,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1027,6 +1027,17 @@ async fn hold_session(
     let mut payload = vec![b'x'; options.payload_bytes];
     let mut sequence: u64 = 0;
     let mut severed_yet = false;
+
+    // The server has no path or authority to key a role off, so a receive-only
+    // session says what it is exactly once. One datagram per subscriber, sent
+    // before any measurement window opens, and excluded from every rate.
+    if receive_only {
+        let now = monotonic_ns();
+        write_stamp_v3(&mut payload, now, now, 0, CLASS_RAID_JOIN);
+        if conn.send_datagram(&payload).is_err() {
+            shared.realm.send_err.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     let started_at = tokio::time::Instant::now();
     let started_ns = monotonic_ns();

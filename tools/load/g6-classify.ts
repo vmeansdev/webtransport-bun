@@ -380,7 +380,21 @@ export type HotspotFacts = {
 	forwarded: number;
 	subscriberReceived: number;
 	/** H4 inputs, ticket 14's falsifier verbatim. */
-	ingestToForwardP50Ns: number;
+	/**
+	 * p50 of publisher-send → subscriber-receive, **on the subscribers' own
+	 * clock**. Amendment 2 of the registration: ticket 14's rule read
+	 * "publisher-send → first forward issued", which on-box was one clock and
+	 * off-box spans two hosts and cannot be differenced at all. The subscriber's
+	 * one-way covers the same question strictly more strongly — it contains two
+	 * cable traversals — and is measurable.
+	 */
+	pathP50Ns: number;
+	/**
+	 * Server-internal arrival → first-forward dwell. Disclosure only: it is one
+	 * process on one clock and is *expected* to be µs-scale, so feeding it to the
+	 * µs-signature rule would fire the falsifier on every valid run.
+	 */
+	serverForwardDwellP50Ns: number;
 	frameGapFraction: number;
 	datagramsPerTick: number;
 	publisherStamped: number;
@@ -426,7 +440,7 @@ export function clauseH2(f: HotspotFacts): ClauseResult {
  */
 export function falsifierIngestReality(f: HotspotFacts): FalsifierResult {
 	const verdict = ingestRealityVerdict({
-		ingestToForwardP50Ns: f.ingestToForwardP50Ns,
+		ingestToForwardP50Ns: f.pathP50Ns,
 		frameGapFraction: f.frameGapFraction,
 		datagramsPerTick: f.datagramsPerTick,
 		publisherStamped: f.publisherStamped,

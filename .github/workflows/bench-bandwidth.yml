@@ -34,6 +34,76 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | g6-mmo (MMO realm gate)"
+        required: false
+        default: "bandwidth"
+        type: string
+      scale_sessions:
+        description: "session-scale: comma-separated session-count ladder"
+        required: false
+        default: "100,1000,5000,10000,25000,50000"
+        type: string
+      scale_interval_ms:
+        description: "session-scale: per-session datagram interval in ms (5000 = 0.2/s)"
+        required: false
+        default: "5000"
+        type: string
+      scale_payload_bytes:
+        description: "session-scale: datagram payload size in bytes"
+        required: false
+        default: "100"
+        type: string
+      scale_steady_seconds:
+        description: "session-scale: steady-state hold per rung"
+        required: false
+        default: "120"
+        type: string
+      scale_idle_seconds:
+        description: "session-scale: idle tail per rung (isolates idle per-session cost)"
+        required: false
+        default: "30"
+        type: string
+      scale_endpoints:
+        description: "session-scale: client endpoints, one distinct 127.0.k.1 source IP each"
+        required: false
+        default: "64"
+        type: string
+      scale_connect_concurrency:
+        description: "session-scale: concurrent handshakes in flight from the client"
+        required: false
+        default: "500"
+        type: string
+      scale_stagger:
+        description: "session-scale: spread each session's send schedule over one interval (gate G1's registered arrival process)"
+        required: false
+        default: "false"
+        type: string
+      g6_arms:
+        description: "g6-mmo: arms to run (steady,hotspot,storm). Every rate is derived in tools/load/g6-plan.ts, not here."
+        required: false
+        default: "steady,hotspot,storm"
+        type: string
+      g6_ladder:
+        description: "g6-mmo: realm population ladder. The gate rung is the last one."
+        required: false
+        default: "500,2500,5000"
+        type: string
+      g6_steady_seconds:
+        description: "g6-mmo: steady window per arm"
+        required: false
+        default: "120"
+        type: string
+      g6_offbox_ssh:
+        description: "g6-mmo: ssh destination of the Mac generator over the cable. EMPTY MEANS CO-RESIDENT, which can never be a G6 result."
+        required: false
+        default: ""
+        type: string
+      g6_server_address:
+        description: "g6-mmo: the server's address on the bench subnet, as the off-box generator dials it"
+        required: false
+        default: "10.99.0.2"
+        type: string
 jobs:
   bench:
     permissions:
@@ -105,7 +175,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'session-scale' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -115,11 +185,59 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
+      # Session-count ladder: session count is the only variable, per-session
+      # rate is held deliberately low. Buckets and STOP conditions are
+      # pre-registered in docs/research/preregistrations/session-scale.md.
+      - name: Run session-scale ladder
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'session-scale' }}
+        env:
+          SCALE_SESSIONS: ${{ github.event.inputs.scale_sessions }}
+          SCALE_INTERVAL_MS: ${{ github.event.inputs.scale_interval_ms }}
+          SCALE_PAYLOAD_BYTES: ${{ github.event.inputs.scale_payload_bytes }}
+          SCALE_STEADY_SECONDS: ${{ github.event.inputs.scale_steady_seconds }}
+          SCALE_IDLE_SECONDS: ${{ github.event.inputs.scale_idle_seconds }}
+          SCALE_ENDPOINTS: ${{ github.event.inputs.scale_endpoints }}
+          SCALE_CONNECT_CONCURRENCY: ${{ github.event.inputs.scale_connect_concurrency }}
+          SCALE_STAGGER: ${{ github.event.inputs.scale_stagger }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          # Raise the fd soft limit to the hard limit. The pre-registration
+          # expects fd count to be flat in session count (shared QUIC
+          # endpoints); this makes sure a low soft limit cannot masquerade
+          # as a server-side wall if it is not.
+          ulimit -n "$(ulimit -Hn)" || true
+          echo "fd soft limit: $(ulimit -n)"
+          SCALE_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-session-scale-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-session-scale.ts
+      # G6: the MMO realm gate. Rates, bounds and the cable STOP's requirements
+      # are derived in tools/load/g6-plan.ts from the scenario constants, so the
+      # workflow carries populations and windows and no thresholds at all.
+      # Registration: docs/research/preregistrations/gate-g6-mmo.md.
+      - name: Run G6 MMO realm gate
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' }}
+        env:
+          G6_ARMS: ${{ github.event.inputs.g6_arms }}
+          G6_LADDER: ${{ github.event.inputs.g6_ladder }}
+          G6_STEADY_SECONDS: ${{ github.event.inputs.g6_steady_seconds }}
+          G6_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
+          G6_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          ulimit -n "$(ulimit -Hn)" || true
+          echo "fd soft limit: $(ulimit -n)"
+          if [ -z "${G6_OFFBOX_SSH}" ]; then
+            echo "::warning::G6 ran with a CO-RESIDENT generator. The registration requires the Mac over the cable; this run is a wiring check and can never be a G6 result."
+          fi
+          G6_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-g6-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-g6.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
-          path: .bench-evidence/bench-bandwidth-*
+          path: |
+            .bench-evidence/bench-bandwidth-*
+            .bench-evidence/bench-session-scale-*
+            .bench-evidence/bench-g6-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90

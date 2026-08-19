@@ -52,6 +52,10 @@ pub const CLASS_ACTION: u8 = 1;
 pub const CLASS_ACK: u8 = 2;
 pub const CLASS_SNAPSHOT: u8 = 3;
 pub const CLASS_RAID: u8 = 4;
+/// A raid subscriber's one-datagram hello: the server has no path to key a role
+/// off, so a receive-only session says what it is once. Not load, and excluded
+/// from every rate.
+pub const CLASS_RAID_JOIN: u8 = 5;
 
 /// Write the 36-byte header in place. The caller owns the padding beyond it.
 ///

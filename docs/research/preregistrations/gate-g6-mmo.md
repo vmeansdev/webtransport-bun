@@ -661,6 +661,56 @@ The constant now lives in `tools/load/g6-plan.ts` (`AOI_ENTITIES = 100`) and its
 unit test asserts the 3-datagram result, so this class of drift cannot recur
 silently.
 
+## 11b. Amendment 2 — the ingest-reality falsifier, made measurable off-box
+
+**Written before the first dispatch. §12 is empty. Found by the local wiring
+smoke, which is what a smoke is for: the harness reported a 14 µs
+"ingest-to-forward" on a run where nothing was wrong.**
+
+Original text of §3 H4, verbatim:
+
+> Publisher→server ingest must be demonstrably real: `ingestToForwardP50 ≥ 100
+> µs` (3.2× the top of the retracted run's 9–31 µs signature), the publisher's
+> frame cadence visible in the server's own inter-arrival gaps inside the
+> registered band, and ≥ 99% of arrivals carrying a decodable publisher stamp.
+> Any failure → **arm 2 INVALID**, not a slow number.
+
+**The defect.** Ticket 14's `ingestToForwardP50Ns` is "publisher actual-send →
+first forward issued". On-box — which is where G4 discharged it — publisher and
+server shared one clock and that subtraction was legal. **Off-box it spans two
+hosts and cannot be computed at all.** What the harness can compute server-side
+is *arrival → first forward issued*, which is one process on one clock and is
+therefore µs-scale on **every** valid run. Registering that quantity against a
+µs-signature floor would fire the falsifier against reality on every G6 run,
+which is worse than not having it.
+
+**Changed to:**
+
+> Publisher→server ingest must be demonstrably real:
+>
+> * **`pathP50 ≥ 100 µs`**, where `pathP50` is the p50 of publisher-send →
+>   subscriber-receive **on the subscribers' own clock** (both processes on the
+>   Mac, §3). This covers ticket 14's question strictly more strongly than the
+>   original: the interval contains two cable traversals and the whole server
+>   path, so an in-process source cannot produce it, and it is measurable.
+> * the publisher's frame cadence visible in the server's own inter-arrival gaps
+>   inside the registered band (unchanged, server-local), and
+> * ≥ 99% of arrivals carrying a decodable publisher stamp (unchanged; an
+>   in-process source could not carry the publisher's clock at all).
+>
+> Any failure → **arm 2 INVALID**, not a slow number.
+>
+> The server-internal **`serverForwardDwell`** (arrival → first forward, one
+> clock) is still recorded and **published as a disclosure**. It is explicitly
+> not a falsifier input, and its expected µs-scale value is stated here so a
+> reader does not mistake it for the retracted signature.
+
+**No threshold moved:** the 100 µs floor, the cadence band and the 99%
+provenance fraction are unchanged; one of the three now reads a quantity that
+exists. The change is enforced in `tools/load/g6-classify.ts`
+(`HotspotFacts.pathP50Ns` / `serverForwardDwellP50Ns`) and pinned by a unit test
+that asserts the dwell cannot fire the rule.
+
 ## 12. Dispatch log
 
 Every dispatch of this gate, including aborted ones. A run that is not in this
