@@ -236,6 +236,14 @@ pub(crate) fn send_datagram_mirror_for_owner(
         crate::datagram_mirror::split_at_cap(targets.len()) as u64,
         Ordering::Relaxed,
     );
+    // Prototype, off by default (`crates/native/docs/egress-pacer.md`): with
+    // `WEBTRANSPORT_PACER_PPS` set the fan-out goes to a native schedule instead
+    // of running here, because this loop *is* the burst the measured path sheds.
+    // Knob unset, this is one load of a `OnceLock` and a branch — the loop
+    // below is reached with the same arguments it has always had.
+    if let Some(cfg) = crate::egress_pacer::config() {
+        return crate::egress_pacer::submit(cfg, owner_server_id, targets, payload);
+    }
     crate::datagram_mirror::fan_out(targets.len(), |index| {
         let Some(state) =
             session_registry::get_datagram_send_state_for_owner(&targets[index], owner_server_id)

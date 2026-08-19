@@ -376,6 +376,15 @@ impl ServerHandle {
         .into_napi()
     }
 
+    /// Egress-pacer counters as a JSON string, `"{}"` when the pacer knob is
+    /// off. Prototype instrumentation for the microbench and the cable
+    /// validation (`crates/native/docs/egress-pacer.md`); deliberately untyped,
+    /// because the prototype commits to no schema.
+    #[napi(js_name = "pacerStatsJson")]
+    pub fn pacer_stats_json(&self) -> String {
+        crate::egress_pacer::stats_json()
+    }
+
     #[napi]
     pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::ServerMetricsSnapshot> {
         panic_guard::catch_panic(|| {
