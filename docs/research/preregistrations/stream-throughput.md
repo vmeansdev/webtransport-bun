@@ -398,6 +398,7 @@ document cannot encounter an arm it never mentioned.
 | # | date | run id | candidate SHA | arms | outcome | artifact sha256 |
 |---|---|---|---|---|---|---|
 | 1 | 2026-08-18 | [32193538952](https://github.com/vmeansdev/webtransport-bun/actions/runs/32193538952) | `29c3b694b0a28aac8b68802e886643e92f9a2a9f` | W | complete, stamped | `827a474cf6342c7634338eb49f14a09e03b252eee2a3daad64c379d9ac5de1e5` (`bench-stream-29c3b69….json`), `91ce57f522dd453bd5fd5237cb3ad61069f5eb8b7043fa979647797b8d7a87a0` (`.csv`) |
+| 2 | 2026-08-19 | [32220018998](https://github.com/vmeansdev/webtransport-bun/actions/runs/32220018998) | `40b220cc0525cea54ddc3c5aaf12c8482bf82c4a` | G | **NO-VERDICT** (G-STOP-A), stamped | `82295847394714f13d249d43f6ff1581f199d45af2ca54d1cbf2f4f9eec68d68` (knoboff `.json`), `fe9f11be459d0aaced49b3b8a6c756e5dfae07ab0b190f7d1e9e0604dd67a401` (knoboff `.csv`), `f47d3599b9ec177a13a351313de67ef4177b4fbec4c2fd69b0d0d46e5f902e9b` (knobon `.json`), `088f4c727b70d641cbc52720d453d310de222c8af99c6027dd698d231202e85c` (knobon `.csv`), `146aaf50b0d66987dd1e9749315dce06ef4fdfe0c841b3a4993131f04fdda051` (verdict `.json`) |
 
 Run 1, `bench-bandwidth.yml` on `[self-hosted, Linux, X64, heavy]`, started
 2026-08-18T22:54:18.988Z, Bun 1.3.14, 4 CPUs, procfs present. All nine rungs
@@ -410,6 +411,30 @@ complete rung ≥ 0.95 × the best complete rung (W7). Only W1 and its W-repeat
 replay are `insideShippedPerSessionBudget`; W6's advertised worst case at
 `max_sessions` = 31.8× the rig's 8 GB. No rerun; this is the single dispatch
 this axis' sweep was budgeted. Decision consumed by ticket 09.
+
+Run 2 is gate G5's Arm G, registered in full in
+`docs/research/preregistrations/gate-g5-bulk.md`, where the stamp lives. Three
+invocations (knob unset, knob 65536, evaluator), eight step fragments, all
+complete, no harness fault. **No gate verdict:** both knob-ON cells
+(`G-batch`, `G-window-batch`) classified `host-saturated` in both repeats —
+STOP condition 2, `hostCpuPctMedian` 92.3–93.0 against the 90 bar — so G-STOP-A
+fired and clauses 1/2/4/5 had no gradeable input. Clauses 3 (inside shipped
+budgets) and 6 (`G-control` `serverSocketDrops == 0`, both repeats) **passed**.
+Delivered Gbps, median of two: `G-control` 0.880 · `G-window-ref` 1.142 ·
+`G-batch` *3.961* · `G-window-batch` *4.046* (italic = unusable, host-saturated,
+lower bound only). Both controls sit ~11–13% above run 1's W1 0.781 / W-a6
+1.030 on a different candidate base; disclosed, not attributed.
+
+**A6 re-run at the chosen default (knob unset):** 1.142 / 0.880 = **1.297** >
+1.10 ⇒ `WINDOW-BOUND`, reproducing run 1's 1.319. `verdicts.bulkCeilingIsLowerBoundOnly`
+stands with that reason. A6 knob-ON is `unknown` — both its cells are unusable.
+
+**Mechanism:** the batching lever moved delivered throughput 4.50× on the
+shipped governors at 54.9 KB per JS crossing (`maxBatchBytes` = 65536, both
+crossing instruments 0.000% apart), and the registered co-residence honesty rule
+bound before any product limit. Closing G5 on this rig needs off-box generation
+or a paced gate — either is a new registration. **Rerun of Arm G is forbidden:**
+this was a valid run.
 
 ## Deferred (out of scope for this harness)
 
