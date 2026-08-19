@@ -163,3 +163,47 @@ G6's rule. Roughly: `g11_arms`, `g11_ladder`, `g11_step_seconds`,
    `cargo clippy -p reference --all-targets`, `bun run typecheck`, and
    `bunx biome check` on every new file, all clean.
 5. One dispatch. A miss on a valid run is final (spec §Rerun policy).
+
+---
+
+## 6. Built (2026-08-19)
+
+Everything §1–§4 specified now exists, plus three modules the spec assumed and
+did not name. Nothing about the contract changed; four instrument facts the
+build found are registered as **Amendment 4** in the registration.
+
+| file | what it is | tests |
+|---|---|---|
+| `crates/reference/src/tunnel_client.rs` → bin `tunnel-client` | §1's reference generator, both arms | 4 (incl. the cross-language byte pin) |
+| `tools/load/g11-client.ts` | §2's addon driver, Arms J and D | driven by the local smoke |
+| `tools/load/bench-g11.ts` | §3's conductor and server | driven by the local smoke |
+| `tools/load/g11-histogram.ts` | the histogram and the percentile both ends' snapshots are read through | 10 |
+| `tools/load/g11-pacer.ts` | the server-side cumulative-deadline writer (copied from `g7-pacer.ts`) | 9 |
+| `tools/load/g11-procfs.ts` | host CPU, per-pid CPU, UDP and per-socket drop taps (copied from `g7-procfs.ts`) | exercised through the conductor |
+| `.github/workflows/bench-bandwidth.yml` | `mode=g11-bidi`, two invocations | — |
+
+Three build decisions worth stating, because a reader of the artifact will meet
+all three:
+
+1. **Two invocations, not one.** `WEBTRANSPORT_STREAM_BATCH_BYTES` is read once
+   per process, so a knob-off cell and a knob-on cell cannot share one. The
+   conductor **refuses** to run a cell registered at a knob state other than its
+   own rather than running it mislabelled — V-K's failure mode, prevented
+   instead of detected.
+2. **Two hard preconditions.** Without `WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1`
+   the crossing counters read zero everywhere, which V-K would mistake for "an
+   addon ran and batched nothing"; without procfs, V-S compares against an
+   unmeasured host and silently does not fire while V-B sees a null for every
+   cell. The conductor refuses to start in either case.
+3. **`G11_SMOKE=1` is a wiring check and cannot produce a verdict.** It shrinks
+   populations and windows below the registered ladder, stamps
+   `wiringCheckOnly: true` into the artifact, and suppresses the roll-up
+   entirely — K16 enforced by construction rather than by memory.
+
+Local smoke (macOS, `G11_SMOKE=1`; **no number below is a result**): every arm
+drove end to end, the byte ledger closed exactly in both directions on Arm T and
+Arm J, per-session vectors were complete, the settle barrier quiesced on every
+cell, `crossings.client` was `null` on Arm T and a real snapshot on Arm J,
+V-C's two counts agreed exactly (2,141 vs 2,141), Arm X's server-observed
+accepts equalled client-observed opens with peak concurrency 1, and Arm D's
+`D-00` control produced a non-zero write-latency p99 on both ends.
