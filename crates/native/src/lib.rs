@@ -85,6 +85,7 @@ pub mod client;
 pub mod client_pool;
 pub mod client_stream;
 pub mod datagram_batch;
+pub mod datagram_mirror;
 pub mod error;
 pub mod histogram;
 pub mod limits;
