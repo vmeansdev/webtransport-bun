@@ -616,8 +616,19 @@ export function rollUpExchangeArm(facts: ExchangeCellFacts): TunnelRollUp {
 
 // --- Arm D: the cross-direction budget probe (mechanism arm, no verdict) ----
 
+/**
+ * Which end of the bidi stream holds the slow reader. Amendment 2: the two ends
+ * read through different native paths — the server-accepted handle reads
+ * deferred-direct (transient reservation), the client-opened handle reads
+ * through a read-ahead bridge that holds its reservation until JS consumes —
+ * so a probe that does not separate them measures the wrong path and reports
+ * "no coupling" as if it were general.
+ */
+export type StreamEnd = "client-opened" | "server-accepted";
+
 export type CouplingCellFacts = {
 	cell: string;
+	end: StreamEnd;
 	backlogFraction: number;
 	downstreamWriteP99Ms: number;
 	backpressureTimeouts: number;
@@ -631,16 +642,29 @@ export type CouplingReading = {
 	detail: string;
 };
 
+export type CouplingArmReading = {
+	perEnd: Record<StreamEnd, CouplingReading>;
+	/**
+	 * The registered reading of the pair. `PATH-ASYMMETRY-HELD` is D-P1′;
+	 * `COUPLING-ABSENT` is D-F1′'s first branch; `PATH-ASYMMETRY-REFUTED` is its
+	 * second — the more interesting refutation of the two, per §2.
+	 */
+	verdictFreeReading:
+		| "PATH-ASYMMETRY-HELD"
+		| "PATH-ASYMMETRY-REFUTED"
+		| "COUPLING-ABSENT"
+		| "COUPLING-BOTH-ENDS"
+		| "INDETERMINATE";
+	detail: string;
+};
+
 /**
- * D-P1 vs D-F1, both registered in §2 before the run.
- *
- * D-P1 (the K17 reading): downstream write latency rises with inbound backlog
- * and downstream writes fail with E_BACKPRESSURE_TIMEOUT near the per-stream
- * budget. D-F1 (the falsifier of my own reading): flat latency across the
- * fractions and no timeout at the top fraction refutes K17, and the
- * registration says so rather than quietly keeping it.
+ * D-P1′ vs D-F1′ for one end, both registered in §2 and Amendment 2 before the
+ * run: downstream write latency rising with inbound backlog, or a
+ * E_BACKPRESSURE_TIMEOUT at the top fraction, reads as coupling; flat latency
+ * with no timeout refutes it for that end.
  */
-export function readCouplingArm(
+export function readCouplingEnd(
 	cells: readonly CouplingCellFacts[],
 ): CouplingReading {
 	const control = cells.find((c) => c.backlogFraction === 0);
@@ -669,4 +693,40 @@ export function readCouplingArm(
 		return { reading: "COUPLING-OBSERVED", detail };
 	}
 	return { reading: "COUPLING-REFUTED", detail };
+}
+
+/**
+ * The pair reading. D-P1′ predicts coupling on the client-opened end and none
+ * on the server-accepted end; every other combination is named here so that the
+ * outcome the run produces is one this document already anticipated, rather
+ * than one it interprets afterwards.
+ */
+export function readCouplingArm(
+	cells: readonly CouplingCellFacts[],
+): CouplingArmReading {
+	const perEnd: Record<StreamEnd, CouplingReading> = {
+		"client-opened": readCouplingEnd(
+			cells.filter((c) => c.end === "client-opened"),
+		),
+		"server-accepted": readCouplingEnd(
+			cells.filter((c) => c.end === "server-accepted"),
+		),
+	};
+	const client = perEnd["client-opened"].reading;
+	const server = perEnd["server-accepted"].reading;
+	const detail = `client-opened: ${perEnd["client-opened"].detail} || server-accepted: ${perEnd["server-accepted"].detail}`;
+
+	if (client === "INDETERMINATE" || server === "INDETERMINATE") {
+		return { perEnd, verdictFreeReading: "INDETERMINATE", detail };
+	}
+	if (client === "COUPLING-OBSERVED" && server === "COUPLING-REFUTED") {
+		return { perEnd, verdictFreeReading: "PATH-ASYMMETRY-HELD", detail };
+	}
+	if (client === "COUPLING-REFUTED" && server === "COUPLING-OBSERVED") {
+		return { perEnd, verdictFreeReading: "PATH-ASYMMETRY-REFUTED", detail };
+	}
+	if (client === "COUPLING-OBSERVED" && server === "COUPLING-OBSERVED") {
+		return { perEnd, verdictFreeReading: "COUPLING-BOTH-ENDS", detail };
+	}
+	return { perEnd, verdictFreeReading: "COUPLING-ABSENT", detail };
 }

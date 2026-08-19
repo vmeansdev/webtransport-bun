@@ -20,9 +20,11 @@ import {
 	knobProvenanceHolds,
 	meanBytesPerCrossing,
 	readCouplingArm,
+	readCouplingEnd,
 	rollUpExchangeArm,
 	rollUpTunnelGate,
 	SCHEDULER_LAG_P99_BAR_MS,
+	type StreamEnd,
 	type TunnelCellFacts,
 } from "./g11-classify.ts";
 import {
@@ -436,11 +438,13 @@ describe("Arm X — the acceptance path", () => {
 // --- Arm D ------------------------------------------------------------------
 
 function couplingCell(
+	end: StreamEnd,
 	fraction: number,
 	over: Partial<CouplingCellFacts> = {},
 ): CouplingCellFacts {
 	return {
-		cell: `D-${Math.round(fraction * 100)}`,
+		cell: `D-${Math.round(fraction * 100)}-${end}`,
+		end,
 		backlogFraction: fraction,
 		downstreamWriteP99Ms: 0.4,
 		backpressureTimeouts: 0,
@@ -450,35 +454,88 @@ function couplingCell(
 	};
 }
 
-describe("Arm D — D-P1 against D-F1, both registered before the run", () => {
+/** The flat, uncoupled pair of cells for one end. */
+function quietEnd(end: StreamEnd): CouplingCellFacts[] {
+	return [
+		couplingCell(end, 0),
+		couplingCell(end, 0.25, { downstreamWriteP99Ms: 0.42 }),
+		couplingCell(end, 0.95, { downstreamWriteP99Ms: 0.55 }),
+	];
+}
+
+describe("Arm D, per end — D-P1' against D-F1' (Amendment 2)", () => {
 	test("a backpressure timeout at the top fraction reads as coupling", () => {
-		const reading = readCouplingArm([
-			couplingCell(0),
-			couplingCell(0.95, { backpressureTimeouts: 4 }),
-		]);
-		expect(reading.reading).toBe("COUPLING-OBSERVED");
+		expect(
+			readCouplingEnd([
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, { backpressureTimeouts: 4 }),
+			]).reading,
+		).toBe("COUPLING-OBSERVED");
 	});
 
 	test("a latency blow-up alone is enough to read as coupling", () => {
-		const reading = readCouplingArm([
-			couplingCell(0),
-			couplingCell(0.95, { downstreamWriteP99Ms: 3.2 }),
-		]);
-		expect(reading.reading).toBe("COUPLING-OBSERVED");
+		expect(
+			readCouplingEnd([
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, { downstreamWriteP99Ms: 3.2 }),
+			]).reading,
+		).toBe("COUPLING-OBSERVED");
 	});
 
-	test("flat latency and no timeouts REFUTES this registration's own reading", () => {
-		const reading = readCouplingArm([
-			couplingCell(0),
-			couplingCell(0.25, { downstreamWriteP99Ms: 0.42 }),
-			couplingCell(0.95, { downstreamWriteP99Ms: 0.55 }),
-		]);
-		expect(reading.reading).toBe("COUPLING-REFUTED");
+	test("flat latency and no timeouts refutes coupling for that end", () => {
+		expect(readCouplingEnd(quietEnd("server-accepted")).reading).toBe(
+			"COUPLING-REFUTED",
+		);
 	});
 
 	test("a missing control cell is indeterminate, never a reading", () => {
-		expect(readCouplingArm([couplingCell(0.95)]).reading).toBe("INDETERMINATE");
-		expect(readCouplingArm([]).reading).toBe("INDETERMINATE");
+		expect(readCouplingEnd([couplingCell("client-opened", 0.95)]).reading).toBe(
+			"INDETERMINATE",
+		);
+		expect(readCouplingEnd([]).reading).toBe("INDETERMINATE");
+	});
+});
+
+describe("Arm D, the pair reading — every outcome is named in advance", () => {
+	test("D-P1' held: coupling on the client-opened end only", () => {
+		const reading = readCouplingArm([
+			couplingCell("client-opened", 0),
+			couplingCell("client-opened", 0.95, { backpressureTimeouts: 2 }),
+			...quietEnd("server-accepted"),
+		]);
+		expect(reading.verdictFreeReading).toBe("PATH-ASYMMETRY-HELD");
+	});
+
+	test("the more interesting refutation: coupling on the server-accepted end only", () => {
+		const reading = readCouplingArm([
+			...quietEnd("client-opened"),
+			couplingCell("server-accepted", 0),
+			couplingCell("server-accepted", 0.95, { downstreamWriteP99Ms: 9 }),
+		]);
+		expect(reading.verdictFreeReading).toBe("PATH-ASYMMETRY-REFUTED");
+	});
+
+	test("no coupling anywhere refutes the K17 reading outright", () => {
+		const reading = readCouplingArm([
+			...quietEnd("client-opened"),
+			...quietEnd("server-accepted"),
+		]);
+		expect(reading.verdictFreeReading).toBe("COUPLING-ABSENT");
+	});
+
+	test("coupling on both ends is its own named outcome, not the prediction", () => {
+		const reading = readCouplingArm([
+			couplingCell("client-opened", 0),
+			couplingCell("client-opened", 0.95, { backpressureTimeouts: 1 }),
+			couplingCell("server-accepted", 0),
+			couplingCell("server-accepted", 0.95, { backpressureTimeouts: 1 }),
+		]);
+		expect(reading.verdictFreeReading).toBe("COUPLING-BOTH-ENDS");
+	});
+
+	test("one end missing its control makes the pair indeterminate", () => {
+		const reading = readCouplingArm([...quietEnd("client-opened")]);
+		expect(reading.verdictFreeReading).toBe("INDETERMINATE");
 	});
 });
 
