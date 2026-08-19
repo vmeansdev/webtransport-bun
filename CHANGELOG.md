@@ -75,6 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Wire-visible: sessions closed by `server.close()` now report close code
+  `3993` with reason `E_SERVER_CLOSING`** (previously application code `0` with
+  the free-text reason `"server closing"`). The new pair is a stable, well-known
+  code alongside `3990` (idle timeout) and `3992` (limit exceeded), and it lets a
+  peer tell a deliberate server shutdown — reconnect now — from a session that
+  was simply lost. `E_SERVER_CLOSING` joins the stable error codes and is
+  exported from the root entrypoint; it is a close *reason* only and never
+  appears as a thrown `WebTransportError.code`. Documented in `docs/SPEC.md`
+  ("Server shutdown close semantics"). Native only: the wasm backend still
+  closes its endpoint with code `0` / `"endpoint closed"` (the peer sees
+  `{ closeCode: 0 }` and no reason), a divergence recorded in
+  `docs/PARITY_MATRIX.md`. Applications matching on the old pair must update.
 - Upgraded `wtransport` from `=0.7.0` to `=0.7.1`, then switched both the native
   addon and the reference server from the crates.io release to a Git dependency
   on the `vmeansdev/wtransport` fork (branch `feat/qpack-dynamic`, which stacks
