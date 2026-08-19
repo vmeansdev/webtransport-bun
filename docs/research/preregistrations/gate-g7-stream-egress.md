@@ -462,8 +462,20 @@ headline after a top rung disappoints (G6's forcing).
    SHA at dispatch time. SHAs from `git rev-parse` only, never typed.
 2. Push under a **new** remote ref so no earlier candidate becomes unreachable.
 3. **One** dispatch, `[self-hosted, Linux, X64, heavy]`, dedicated:
-   `mode=g7-stream-egress`, arms and ladders as workflow inputs (populations and
-   windows only — **no thresholds are workflow inputs**).
+
+   ```
+   gh workflow run bench-bandwidth.yml \
+     --ref probe/g7-stream-egress-01 \
+     -f candidate_commit=<composed SHA> \
+     -f mode=g7-stream-egress
+   ```
+
+   Arms and ladders default to the registered ones and are inputs only as
+   populations and windows — **no threshold is a workflow input**, so a dispatch
+   cannot move a bar. Fourteen cell-repeats (4 bulk cells + 3 token cells,
+   × 2) × 60 s ≈ 20 min of steps plus the addon and sink builds.
+   Artifacts: `bench-g7-<sha>.json` and `.csv` in the
+   `bench-bandwidth-<sha>` bundle; the job prints their `sha256sum`.
 4. Log the dispatch in §11 — run id, candidate SHA, artifact sha256s —
    **including if it aborts**.
 5. **Rerun policy:** one complete run stamps. A rerun requires a declared,
