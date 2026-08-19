@@ -44,6 +44,10 @@ const payloadBytes = Number.parseInt(args["payload-bytes"] ?? "200", 10);
 const count = Number.parseInt(args.count ?? "10000", 10);
 const bursts = Number.parseInt(args.bursts ?? "30", 10);
 const gapMs = Number.parseInt(args["gap-ms"] ?? "1000", 10);
+// 0 means blast (the emitter's natural shape). A positive value paces each
+// burst at that many packets per second — the lever-1 experiment: does
+// smearing the impulse below the path's sustained ceiling recover delivery?
+const pacePps = Number.parseInt(args["pace-pps"] ?? "0", 10);
 
 if (payloadBytes < 8) throw new Error("payload must hold burst id + sequence");
 
@@ -137,6 +141,16 @@ if (role === "recv") {
 		let blocked = 0;
 		view.setUint32(0, b);
 		for (let s = 0; s < count; s += 1) {
+			if (pacePps > 0) {
+				// Stay on the pacing schedule: packet s is due at s/pace seconds
+				// after the burst started. Ahead of schedule → yield; the loop
+				// re-checks rather than sleeping, because timers here wake far
+				// coarser than the ~13 µs inter-packet grid.
+				const dueNs = BigInt(Math.round((s * 1e9) / pacePps));
+				while (process.hrtime.bigint() - started < dueNs) {
+					await new Promise((r) => setImmediate(r));
+				}
+			}
 			view.setUint32(4, s);
 			// A full socket buffer is the NIC serializing slower than the CPU
 			// offers — yield and resend, so every sequence goes out exactly once.
@@ -169,6 +183,7 @@ if (role === "recv") {
 			bursts,
 			count,
 			payloadBytes,
+			pacePps,
 			emitMsP50: percentile(sorted, 0.5),
 			emitMsP99: percentile(sorted, 0.99),
 			emitMsMax: sorted.at(-1) ?? null,
