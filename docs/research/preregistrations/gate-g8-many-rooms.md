@@ -213,10 +213,10 @@ frames is a different measurement and G8 does not make it.
 ### §1.7 The forward-issue budget, derived
 
 At arm A's top rung the conductor issues `50,000` forward sends per second. At
-K7's K=10 column that is `50,000 × 9.73 µs = 0.487 s` of CPU per second — **49%
+K7's K=10 column that is `50,000 × 9.73 µs = 0.4865 s` of CPU per second — **49%
 of one core**, on a 4 vCPU box, for the issue loop alone, before ingest handling,
 before the library, before quinn. At arm C's top rung it is `45,000 × 9.73 µs =
-0.438 s/s`.
+0.4379 s/s`.
 
 This is the number that makes P3 (§7) a real prediction rather than a hedge, and
 it is also why V-H exists: at half a core of pure issue loop, the question "is
