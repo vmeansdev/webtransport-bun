@@ -582,3 +582,11 @@ their own commits (`tools/load/latency-clock.ts`, `latency-histogram.ts`,
 `latency-stamp.ts`, `crates/reference/src/latency_probe.rs`) precisely so the
 egress axis can branch from `probe/latency-01` and reverse the direction of
 measurement without touching the bench driver.
+
+
+<!-- Arm B dispatch log entry (appended by orchestrator per Amendment 6's rule) -->
+Arm B control dispatch: run 32236097706, candidate 989469223fe8dded611895ffae31ee45a2d7804d,
+2026-08-19. OUTCOME 1 — PINNED: fragment at 206s, killedByWatchdog=true after 903s
+post-write grace; sendSyncEnv="0", datagramSendsAsync=2,440,542 (promise path proven
+exercised), nativeAsyncOpsPending=0. Ruling-1a on-runner env-seam A/B complete:
+promise path pins, promise-free path (run 32209051975) exits same-second.
