@@ -12,6 +12,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import type { EgressEmitter } from "./egress-emitter.ts";
 import type { EgressProfile } from "./egress-schedule.ts";
 import {
 	LatencyHistogram,
@@ -64,21 +65,40 @@ const MIN_SAMPLES = 10_000;
 export type HeadroomFragment = {
 	ceilingPerSec: number;
 	burnNs?: number;
+	/** The arm whose ceiling this is. Absent on pre-G3 fragments (serial). */
+	emitter?: EgressEmitter;
 	rungs: Array<Record<string, unknown>>;
 };
 
 export type Fragment = {
-	shape: "ladder" | "fanout" | "headroom";
+	shape: "ladder" | "fanout" | "headroom" | "gate";
 	profile?: EgressProfile;
 	clock: { calibrationResidualNs: number; source: string };
 	config?: Record<string, unknown>;
+	/** quinn-udp capability read, once per fragment. Never a per-send count. */
+	gso?: { maxGsoSegments: number | null; groSegments: number | null } | null;
 	headroom?: HeadroomFragment | null;
 	steps?: RawStep[];
 };
 
+/** Host UDP counter deltas across one step's drive window. */
+export type UdpDeltaJson = {
+	inDatagrams: number;
+	outDatagrams: number;
+	inErrors: number;
+	rcvbufErrors: number;
+	sndbufErrors: number;
+};
+
 type RawStep = {
-	shape: "ladder" | "fanout";
+	shape: "ladder" | "fanout" | "gate";
 	profile: EgressProfile;
+	/** Which originator arm drove the step. Absent on pre-G3 fragments. */
+	emitter?: EgressEmitter;
+	/** Replicate block, and position inside it. Gate shape only. */
+	block?: number | null;
+	positionInBlock?: number | null;
+	udp?: UdpDeltaJson | null;
 	perSessionRate: number;
 	sessionsRequested: number;
 	sessionsConnected: number;
@@ -115,6 +135,11 @@ type RawStep = {
 	fanout?: FanoutRecordJson | null;
 };
 
+/** Steps without an emitter field predate G3 and were the serial-await arm. */
+function emitterOf(step: { emitter?: EgressEmitter }): EgressEmitter {
+	return step.emitter ?? "serial";
+}
+
 /**
  * The fan-out shape's own record. Only the fields the classifier reads are
  * named here; `bench-egress.ts` writes considerably more, and the artifact
@@ -145,8 +170,12 @@ const CO_RESIDENCE_HOST_FRACTION = 0.97;
 const CO_RESIDENCE_DELIVERY = 0.95;
 
 export type ClassifiedStep = {
-	shape: "ladder" | "fanout";
+	shape: "ladder" | "fanout" | "gate";
 	profile: EgressProfile;
+	emitter: EgressEmitter;
+	block: number | null;
+	positionInBlock: number | null;
+	udp: UdpDeltaJson | null;
 	perSessionRate: number;
 	aggregateRate: number;
 	sessionsConnected: number;
@@ -306,7 +335,10 @@ export function classifySteps(
 	for (const step of steps) {
 		const p99 = summarize(step.originator.originationLag)?.p99Ns ?? 0;
 		if (p99 <= 0) continue;
-		const key = `${step.shape}:${step.profile}`;
+		// The floor never crosses an arm (gate-g3 §H3): taking it across arms
+		// would let a cheap arm's floor make an expensive arm's honest behaviour
+		// read as saturation, or the reverse.
+		const key = `${step.shape}:${step.profile}:${emitterOf(step)}`;
 		floors.set(key, Math.min(floors.get(key) ?? p99, p99));
 	}
 
@@ -316,7 +348,8 @@ export function classifySteps(
 		const lag =
 			summarize(step.originator.originationLag) ??
 			new LatencyHistogram().summary();
-		const floor = floors.get(`${step.shape}:${step.profile}`) ?? 0;
+		const floor =
+			floors.get(`${step.shape}:${step.profile}:${emitterOf(step)}`) ?? 0;
 		const stop = stopFor(step, residualNs, floor, oneWay, endToEnd, lag);
 		// Rates divide by the drive window, never by the step's wall clock, which
 		// also contains the CPU sampler, the client's exit and (on fan-out) a
@@ -334,6 +367,10 @@ export function classifySteps(
 		return {
 			shape: step.shape,
 			profile: step.profile,
+			emitter: emitterOf(step),
+			block: step.block ?? null,
+			positionInBlock: step.positionInBlock ?? null,
+			udp: step.udp ?? null,
 			perSessionRate: step.perSessionRate,
 			aggregateRate: step.aggregateRate,
 			sessionsConnected: step.sessionsConnected,
@@ -389,6 +426,7 @@ export function classifySteps(
 
 export type ProfileVerdict = {
 	profile: EgressProfile;
+	emitter: EgressEmitter;
 	armComplete: boolean;
 	/** Highest complete aggregate rate under each gate, or null if none. */
 	capacityRealtimePerSec: number | null;
@@ -408,10 +446,12 @@ const ARM_FLOOR_AGGREGATE = 32_600;
 
 export function verdictForProfile(
 	profile: EgressProfile,
+	emitter: EgressEmitter,
 	steps: ClassifiedStep[],
 ): ProfileVerdict {
 	const own = steps.filter(
-		(s) => s.profile === profile && s.shape === "ladder",
+		(s) =>
+			s.profile === profile && s.shape === "ladder" && s.emitter === emitter,
 	);
 	const atOrAboveFloor = own.filter(
 		(s) => s.aggregateRate >= ARM_FLOOR_AGGREGATE,
@@ -436,6 +476,7 @@ export function verdictForProfile(
 	const frame = under(GATE_FRAME_NS);
 	return {
 		profile,
+		emitter,
 		armComplete,
 		capacityRealtimePerSec: armComplete ? realtime : null,
 		capacityFramePerSec: armComplete ? frame : null,
@@ -444,13 +485,74 @@ export function verdictForProfile(
 	};
 }
 
-export type AlignmentComparison = {
-	aggregateRate: number;
-	deltaMs: number;
-	bucket: AlignmentBucket;
+/**
+ * CPU-symmetry tolerance between two compared arms, registered in
+ * `docs/research/preregistrations/gate-g3.md` §7 before any CPU reading from
+ * this gate existed. Both numbers are percent-of-one-core, the unit the effort
+ * spec binds every axis to (a 4 vCPU box reads up to 400).
+ */
+export const CPU_SYMMETRY_SERVER_PCT = 10;
+export const CPU_SYMMETRY_HOST_PCT = 20;
+/** Delivery-ratio gap past which a paired comparison is confounded. */
+export const AB_CONFOUND_DELIVERY = 0.02;
+
+export type PairSymmetry = {
+	serverCpuGapPct: number;
+	hostCpuGapPct: number | null;
+	cpuSymmetric: boolean;
 	abConfounded: boolean;
 };
 
+/**
+ * Is a paired comparison between two arms measurable, or only disclosable?
+ *
+ * The spec allows the alignment cost to be re-measured "only with CPU symmetry
+ * between compared arms (or disclosed asymmetry + tolerance)". An asymmetric
+ * pair is not discarded — it is published with both CPU numbers and the gap,
+ * and it carries no bucket verdict.
+ */
+export function pairSymmetry(
+	a: ClassifiedStep,
+	b: ClassifiedStep,
+): PairSymmetry {
+	const serverGap = Math.abs(a.serverCpuPct - b.serverCpuPct);
+	const hostGap =
+		a.hostCpuPctMedian !== null && b.hostCpuPctMedian !== null
+			? Math.abs(a.hostCpuPctMedian - b.hostCpuPctMedian)
+			: null;
+	return {
+		serverCpuGapPct: serverGap,
+		hostCpuGapPct: hostGap,
+		cpuSymmetric:
+			serverGap <= CPU_SYMMETRY_SERVER_PCT &&
+			(hostGap === null || hostGap <= CPU_SYMMETRY_HOST_PCT),
+		abConfounded:
+			Math.abs((a.downDeliveryRatio ?? 1) - (b.downDeliveryRatio ?? 1)) >
+			AB_CONFOUND_DELIVERY,
+	};
+}
+
+export type AlignmentComparison = {
+	emitter: EgressEmitter;
+	block: number | null;
+	aggregateRate: number;
+	deltaMs: number;
+	/** Null when the pair is CPU-asymmetric: disclosed, never bucketed. */
+	bucket: AlignmentBucket | null;
+	abConfounded: boolean;
+	cpuSymmetric: boolean;
+	serverCpuGapPct: number;
+	hostCpuGapPct: number | null;
+};
+
+/**
+ * `keyframe-aligned` minus `frame-bursty` at equal offered rate, **inside one
+ * emitter arm and paired inside one replicate block**.
+ *
+ * Pairing across arms would compare alignment against an originator change, and
+ * pairing across blocks would let the box's drift into the number; both are the
+ * confounds this gate's block design exists to remove.
+ */
 export function compareAlignment(
 	steps: ClassifiedStep[],
 ): AlignmentComparison[] {
@@ -462,19 +564,167 @@ export function compareAlignment(
 	);
 	const out: AlignmentComparison[] = [];
 	for (const a of aligned) {
-		const b = bursty.find((s) => s.perSessionRate === a.perSessionRate);
+		const b = bursty.find(
+			(s) =>
+				s.perSessionRate === a.perSessionRate &&
+				s.emitter === a.emitter &&
+				s.block === a.block,
+		);
 		if (!b) continue;
 		const delta = a.oneWay.p99Ns - b.oneWay.p99Ns;
+		const sym = pairSymmetry(a, b);
 		out.push({
+			emitter: a.emitter,
+			block: a.block,
 			aggregateRate: b.aggregateRate,
 			deltaMs: delta / MS,
-			bucket: alignmentBucketFor(delta),
-			abConfounded:
-				Math.abs((a.downDeliveryRatio ?? 1) - (b.downDeliveryRatio ?? 1)) >
-				0.02,
+			bucket: sym.cpuSymmetric ? alignmentBucketFor(delta) : null,
+			abConfounded: sym.abConfounded,
+			cpuSymmetric: sym.cpuSymmetric,
+			serverCpuGapPct: sym.serverCpuGapPct,
+			hostCpuGapPct: sym.hostCpuGapPct,
 		});
 	}
 	return out;
+}
+
+/**
+ * Median with the distribution-free order-statistic interval `[min, max]`.
+ *
+ * For `n` replicates the pair `(k=1, k=n)` covers the true median with
+ * probability `1 − 2^(1−n)` — 93.75 % at the registered n = 5. There is no
+ * distributional assumption anywhere in it, which is why the pre-registration
+ * chose it over anything with a standard error in it.
+ */
+export function orderStatistic(values: number[]): {
+	n: number;
+	median: number | null;
+	low: number | null;
+	high: number | null;
+	coverage: number | null;
+} {
+	const sorted = [...values].sort((a, b) => a - b);
+	const n = sorted.length;
+	if (n === 0)
+		return { n, median: null, low: null, high: null, coverage: null };
+	const mid =
+		n % 2 === 1
+			? (sorted[(n - 1) / 2] as number)
+			: ((sorted[n / 2 - 1] as number) + (sorted[n / 2] as number)) / 2;
+	return {
+		n,
+		median: mid,
+		low: sorted[0] as number,
+		high: sorted[n - 1] as number,
+		coverage: n > 1 ? 1 - 2 ** (1 - n) : null,
+	};
+}
+
+export type LeverReading =
+	| "lever-positive"
+	| "lever-negative"
+	| "lever-inconclusive";
+
+export type EmitterComparison = {
+	profile: EgressProfile;
+	aggregateRate: number;
+	/** The arm under test, and the arm it is stated against. */
+	emitter: EgressEmitter;
+	against: EgressEmitter;
+	/** Blocks where both arms were complete. */
+	pairedBlocks: number[];
+	/** Blocks dropped from the median because the pair was confounded. */
+	confoundedBlocks: number[];
+	/** Blocks whose pair was CPU-asymmetric — disclosed, still counted. */
+	asymmetricBlocks: number[];
+	deltaMsByBlock: Array<{
+		block: number | null;
+		deltaMs: number;
+		abConfounded: boolean;
+		cpuSymmetric: boolean;
+		serverCpuGapPct: number;
+		hostCpuGapPct: number | null;
+	}>;
+	medianDeltaMs: number | null;
+	lowDeltaMs: number | null;
+	highDeltaMs: number | null;
+	coverage: number | null;
+	reading: LeverReading | null;
+	/** True when ≥ 2 blocks were confounded: the whole reading is advisory. */
+	advisory: boolean;
+};
+
+/**
+ * The lever value, paired inside a block: `p99(emitter) − p99(against)`.
+ *
+ * Negative means the arm under test is faster. A median on the good side of
+ * zero whose interval crosses zero is `lever-inconclusive`, in those words —
+ * the pre-registration fixed that reading before the run so it could not be
+ * argued into a win afterwards.
+ */
+export function compareEmitters(
+	steps: ClassifiedStep[],
+	profile: EgressProfile,
+	emitter: EgressEmitter,
+	against: EgressEmitter,
+): EmitterComparison {
+	const own = steps.filter((s) => s.profile === profile && s.complete);
+	const rows: EmitterComparison["deltaMsByBlock"] = [];
+	const paired: number[] = [];
+	const confounded: number[] = [];
+	const asymmetric: number[] = [];
+	let aggregateRate = 0;
+	for (const a of own.filter((s) => s.emitter === emitter)) {
+		const b = own.find(
+			(s) =>
+				s.emitter === against &&
+				s.block === a.block &&
+				s.perSessionRate === a.perSessionRate,
+		);
+		if (!b) continue;
+		const sym = pairSymmetry(a, b);
+		aggregateRate = Math.max(aggregateRate, a.aggregateRate);
+		if (a.block !== null) paired.push(a.block);
+		if (sym.abConfounded && a.block !== null) confounded.push(a.block);
+		if (!sym.cpuSymmetric && a.block !== null) asymmetric.push(a.block);
+		rows.push({
+			block: a.block,
+			deltaMs: (a.oneWay.p99Ns - b.oneWay.p99Ns) / MS,
+			abConfounded: sym.abConfounded,
+			cpuSymmetric: sym.cpuSymmetric,
+			serverCpuGapPct: sym.serverCpuGapPct,
+			hostCpuGapPct: sym.hostCpuGapPct,
+		});
+	}
+	// A confounded block's delta is published and excluded from the median: an
+	// arm that dropped more shows a better tail for free.
+	const stat = orderStatistic(
+		rows.filter((r) => !r.abConfounded).map((r) => r.deltaMs),
+	);
+	const reading: LeverReading | null =
+		stat.low === null || stat.high === null
+			? null
+			: stat.high < 0
+				? "lever-positive"
+				: stat.low > 0
+					? "lever-negative"
+					: "lever-inconclusive";
+	return {
+		profile,
+		aggregateRate,
+		emitter,
+		against,
+		pairedBlocks: paired,
+		confoundedBlocks: confounded,
+		asymmetricBlocks: asymmetric,
+		deltaMsByBlock: rows,
+		medianDeltaMs: stat.median,
+		lowDeltaMs: stat.low,
+		highDeltaMs: stat.high,
+		coverage: stat.coverage,
+		reading,
+		advisory: confounded.length >= 2,
+	};
 }
 
 export type FanoutVerdict = {
@@ -581,6 +831,8 @@ export type RunVerdict = {
 	maxDeliveredPerSec: number;
 	headroomRatio: number | null;
 	headroomBurnNs: number;
+	/** Which originator arm this verdict is about. A ceiling never crosses arms. */
+	emitter: EgressEmitter;
 };
 
 /** The registered headroom factor. Do not touch. */
@@ -598,10 +850,15 @@ export const HEADROOM_FACTOR = 1.5;
  * precisely when it should have fired.
  */
 export function verdictForRun(
-	steps: ClassifiedStep[],
+	allSteps: ClassifiedStep[],
 	headroom: HeadroomFragment | null,
 	profiles: ProfileVerdict[],
+	emitter: EgressEmitter = "serial",
 ): RunVerdict {
+	// Per arm (gate-g3 §H2): an arm that could not honestly source its own load
+	// contributes nothing, and holding it to another arm's ceiling — or lending
+	// it one — would be the failure this rule exists to catch.
+	const steps = allSteps.filter((s) => s.emitter === emitter);
 	const generatorCeilingPerSec = headroom?.ceilingPerSec ?? 0;
 	const burnNs = headroom?.burnNs ?? 0;
 	// Offered, over the complete rungs only: an incomplete rung supports no
@@ -610,9 +867,14 @@ export function verdictForRun(
 	// complete *ladder* steps"). The headroom arm measured the JS scheduler; the
 	// fan-out's originator is a forward loop driven by arrivals, and holding the
 	// scheduler to a bar set by a different originator would compare two things.
+	// The JS-scheduler shapes only — the ladder and the gate's block arms. The
+	// fan-out's originator is a forward loop driven by arrivals, and holding the
+	// scheduler to a bar set by a different originator would compare two things.
 	const maxOffered = steps.reduce(
 		(a, s) =>
-			s.complete && s.shape === "ladder" ? Math.max(a, s.offeredPerSec) : a,
+			s.complete && (s.shape === "ladder" || s.shape === "gate")
+				? Math.max(a, s.offeredPerSec)
+				: a,
 		0,
 	);
 	const maxDelivered = steps.reduce(
@@ -621,6 +883,7 @@ export function verdictForRun(
 	);
 	const ratio = maxOffered > 0 ? generatorCeilingPerSec / maxOffered : null;
 	const base = {
+		emitter,
 		generatorCeilingPerSec,
 		maxOfferedPerSec: maxOffered,
 		maxDeliveredPerSec: maxDelivered,
@@ -635,7 +898,9 @@ export function verdictForRun(
 	// arm is checked first because a run whose control collapsed has no offered
 	// load for the headroom rule to divide by, and would otherwise be reported
 	// under the less specific of the two names.
-	const constant = profiles.find((p) => p.profile === "constant");
+	const constant = profiles.find(
+		(p) => p.profile === "constant" && p.emitter === emitter,
+	);
 	if (constant && !constant.armComplete) {
 		return { complete: false, stop: "constant-arm-incomplete", ...base };
 	}
@@ -648,33 +913,225 @@ export function verdictForRun(
 	return { complete: true, stop: null, ...base };
 }
 
+/**
+ * Gate G3's own verdict, transcribed from
+ * `docs/research/preregistrations/gate-g3.md` §6. Nothing here decides
+ * anything; every threshold and every name below was fixed before the run.
+ */
+export type GateG3Verdict = {
+	rungAggregatePerSec: number;
+	profile: EgressProfile;
+	/** C1 — every block of the batch arm complete. */
+	c1: {
+		verdict: "PASS" | "INCOMPLETE";
+		blocks: number;
+		completeBlocks: number;
+		stops: Array<{ block: number | null; stop: StopReason | null }>;
+	};
+	/** C2 — egressOneWay p99 under the frame gate, on the batch arm. */
+	c2: {
+		verdict: "PASS" | "INCONCLUSIVE-AT-BAR" | "FAIL" | "INCOMPLETE";
+		medianP99Ms: number | null;
+		lowP99Ms: number | null;
+		highP99Ms: number | null;
+		coverage: number | null;
+		barMs: number;
+	};
+	/** C3 — the lever value, stated as (c) vs (b), never (c) vs (a). */
+	c3: {
+		verdict:
+			| "MEASURED"
+			| "CEILING-MOVED"
+			| "CEILING-MOVED-AGAINST"
+			| "INCOMPLETE";
+		statedAgainst: EgressEmitter;
+		comparison: EmitterComparison | null;
+		/** Published as a diagnostic only, per the spec's explicit instruction. */
+		diagnosticVsSerial: EmitterComparison | null;
+		ceilings: Partial<Record<EgressEmitter, number>>;
+		headroomRatios: Partial<Record<EgressEmitter, number | null>>;
+	};
+	/** C4 — the instrumentation obligation. */
+	c4: {
+		verdict: "PASS" | "INCOMPLETE";
+		gsoRead: boolean;
+		stepsWithUdpCounters: number;
+		steps: number;
+	};
+	/** Inherited from G2's stamp and carried on this gate's face. */
+	crossCheckR4: "open";
+};
+
+export function gateVerdictG3(
+	steps: ClassifiedStep[],
+	runs: RunVerdict[],
+	gsoRead: boolean,
+	profile: EgressProfile = "frame-bursty",
+): GateG3Verdict {
+	const gateSteps = steps.filter(
+		(s) => s.shape === "gate" && s.profile === profile,
+	);
+	const batch = gateSteps.filter((s) => s.emitter === "batch");
+	const blocks = new Set(batch.map((s) => s.block)).size;
+	const completeBlocks = batch.filter((s) => s.complete).length;
+	const c1Pass = blocks > 0 && completeBlocks === batch.length;
+
+	const p99s = batch.filter((s) => s.complete).map((s) => s.oneWay.p99Ns / MS);
+	const stat = orderStatistic(p99s);
+	const barMs = GATE_FRAME_NS / MS;
+	const c2Verdict = !c1Pass
+		? "INCOMPLETE"
+		: stat.median === null || stat.high === null
+			? "INCOMPLETE"
+			: stat.median >= barMs
+				? "FAIL"
+				: stat.high < barMs
+					? "PASS"
+					: "INCONCLUSIVE-AT-BAR";
+
+	const honest = (emitter: EgressEmitter) => {
+		const run = runs.find((r) => r.emitter === emitter);
+		const own = gateSteps.filter((s) => s.emitter === emitter);
+		return (
+			(run?.complete ?? false) && own.length > 0 && own.every((s) => s.complete)
+		);
+	};
+	const ceilings: Partial<Record<EgressEmitter, number>> = {};
+	const headroomRatios: Partial<Record<EgressEmitter, number | null>> = {};
+	for (const r of runs) {
+		ceilings[r.emitter] = r.generatorCeilingPerSec;
+		headroomRatios[r.emitter] = r.headroomRatio;
+	}
+
+	// §H5, registered before the run: if one side of the pair could not honestly
+	// source the load and the other could, the lever's value is that the
+	// originator's ceiling moved — and the gate reports that instead of a tail
+	// delta it has no honest pair for.
+	const batchHonest = honest("batch");
+	const pipelinedHonest = honest("pipelined");
+	const c3Verdict =
+		batchHonest && pipelinedHonest
+			? "MEASURED"
+			: batchHonest && !pipelinedHonest
+				? "CEILING-MOVED"
+				: !batchHonest && pipelinedHonest
+					? "CEILING-MOVED-AGAINST"
+					: "INCOMPLETE";
+
+	const withUdp = gateSteps.filter((s) => s.udp !== null).length;
+
+	return {
+		rungAggregatePerSec: Math.max(0, ...gateSteps.map((s) => s.aggregateRate)),
+		profile,
+		c1: {
+			verdict: c1Pass ? "PASS" : "INCOMPLETE",
+			blocks,
+			completeBlocks,
+			stops: batch.map((s) => ({ block: s.block, stop: s.stop })),
+		},
+		c2: {
+			verdict: c2Verdict,
+			medianP99Ms: stat.median,
+			lowP99Ms: stat.low,
+			highP99Ms: stat.high,
+			coverage: stat.coverage,
+			barMs,
+		},
+		c3: {
+			verdict: c3Verdict,
+			statedAgainst: "pipelined",
+			comparison:
+				c3Verdict === "MEASURED"
+					? compareEmitters(steps, profile, "batch", "pipelined")
+					: null,
+			diagnosticVsSerial: honest("serial")
+				? compareEmitters(steps, profile, "batch", "serial")
+				: null,
+			ceilings,
+			headroomRatios,
+		},
+		c4: {
+			verdict:
+				gsoRead && gateSteps.length > 0 && withUdp === gateSteps.length
+					? "PASS"
+					: "INCOMPLETE",
+			gsoRead,
+			stepsWithUdpCounters: withUdp,
+			steps: gateSteps.length,
+		},
+		// G2's stamp records R4 inconclusive; this gate inherits it and does not
+		// close it. Its egress p99 and G2's ingest p99 are not comparable units.
+		crossCheckR4: "open",
+	};
+}
+
 export function classify(fragments: Fragment[]) {
-	const headroom =
-		fragments.find((f) => f.shape === "headroom")?.headroom ?? null;
+	// One headroom fragment per arm: the ceiling never crosses arms, so neither
+	// does the fragment that carries it.
+	const headroomByEmitter = new Map<EgressEmitter, HeadroomFragment>();
+	for (const f of fragments) {
+		if (f.shape !== "headroom" || !f.headroom) continue;
+		headroomByEmitter.set(f.headroom.emitter ?? "serial", f.headroom);
+	}
+	const headroom = headroomByEmitter.get("serial") ?? null;
+	const gso = fragments.find((f) => f.gso)?.gso ?? null;
 	const residualNs = fragments.reduce(
 		(a, f) => Math.max(a, f.clock?.calibrationResidualNs ?? 0),
 		0,
 	);
 	const raw = fragments.flatMap((f) => f.steps ?? []);
 	const steps = classifySteps(raw, residualNs);
-	const profiles = [
-		...new Set(steps.filter((s) => s.shape === "ladder").map((s) => s.profile)),
-	].map((p) => verdictForProfile(p, steps));
-	const run = verdictForRun(steps, headroom, profiles);
+	const emitters = [
+		...new Set([...steps.map((s) => s.emitter), ...headroomByEmitter.keys()]),
+	];
+	const profiles = emitters.flatMap((emitter) =>
+		[
+			...new Set(
+				steps
+					.filter((s) => s.shape === "ladder" && s.emitter === emitter)
+					.map((s) => s.profile),
+			),
+		].map((p) => verdictForProfile(p, emitter, steps)),
+	);
+	const runs = emitters.map((emitter) =>
+		verdictForRun(
+			steps,
+			headroomByEmitter.get(emitter) ?? null,
+			profiles,
+			emitter,
+		),
+	);
+	// The run-level statement over every arm: complete only if every arm that ran
+	// cleared its own headroom rule, and named by the first arm that did not.
+	const failed = runs.find((r) => !r.complete);
+	const run = failed ?? runs[0] ?? verdictForRun(steps, headroom, profiles);
+	const gateSteps = steps.filter((s) => s.shape === "gate");
+	const gateProfiles = [...new Set(gateSteps.map((s) => s.profile))];
 
 	return {
 		version: 1,
 		generatedAt: new Date().toISOString(),
 		preregistration: "docs/research/preregistrations/egress.md",
+		gatePreregistration: "docs/research/preregistrations/gate-g3.md",
 		gates: {
 			realtimeMs: GATE_REALTIME_NS / MS,
 			frameMs: GATE_FRAME_NS / MS,
 		},
 		clockResidualNs: residualNs,
+		gso,
 		headroom,
+		headroomByEmitter: Object.fromEntries(headroomByEmitter),
 		run,
+		runs,
 		profiles,
 		alignment: compareAlignment(steps),
+		emitterComparisons: gateProfiles.flatMap((p) => [
+			compareEmitters(steps, p, "batch", "pipelined"),
+			compareEmitters(steps, p, "batch", "serial"),
+			compareEmitters(steps, p, "pipelined", "serial"),
+		]),
+		gateG3:
+			gateSteps.length > 0 ? gateVerdictG3(steps, runs, gso !== null) : null,
 		fanout: summarizeFanout(steps),
 		steps,
 	};
@@ -697,17 +1154,55 @@ if (import.meta.main) {
 	console.log(
 		`egress-classify: run complete=${result.run.complete} stop=${result.run.stop ?? "none"}`,
 	);
-	console.log(
-		`egress-classify: generator ceiling=${result.run.generatorCeilingPerSec.toFixed(0)}/s (loaded) maxOffered=${result.run.maxOfferedPerSec.toFixed(0)}/s maxDelivered=${result.run.maxDeliveredPerSec.toFixed(0)}/s headroom=${result.run.headroomRatio?.toFixed(2) ?? "n/a"}x`,
-	);
+	if (result.gso) {
+		console.log(
+			`egress-classify: quinn-udp maxGsoSegments=${result.gso.maxGsoSegments ?? "n/a"} groSegments=${result.gso.groSegments ?? "n/a"} (capability, not a per-send segment count)`,
+		);
+	}
+	for (const r of result.runs) {
+		console.log(
+			`egress-classify: arm ${r.emitter} complete=${r.complete} stop=${r.stop ?? "none"} ceiling=${r.generatorCeilingPerSec.toFixed(0)}/s (loaded) maxOffered=${r.maxOfferedPerSec.toFixed(0)}/s maxDelivered=${r.maxDeliveredPerSec.toFixed(0)}/s headroom=${r.headroomRatio?.toFixed(2) ?? "n/a"}x`,
+		);
+	}
 	if (result.run.headroomBurnNs > 0) {
 		console.log(
 			`egress-classify: EGRESS_HEADROOM_BURN_NS=${result.run.headroomBurnNs} — falsifier artifact, no capacity number may be read from this run`,
 		);
 	}
+	if (result.gateG3) {
+		const g = result.gateG3;
+		console.log(
+			`egress-classify: G3 rung=${g.rungAggregatePerSec}/s ${g.profile} C1=${g.c1.verdict} (${g.c1.completeBlocks}/${g.c1.stops.length} batch arms complete, ${g.c1.blocks} blocks)`,
+		);
+		console.log(
+			`egress-classify: G3 C2=${g.c2.verdict} batch p99 median=${g.c2.medianP99Ms?.toFixed(3) ?? "n/a"}ms [${g.c2.lowP99Ms?.toFixed(3) ?? "n/a"}, ${g.c2.highP99Ms?.toFixed(3) ?? "n/a"}] coverage=${g.c2.coverage?.toFixed(4) ?? "n/a"} bar=${g.c2.barMs}ms`,
+		);
+		const c = g.c3.comparison;
+		console.log(
+			`egress-classify: G3 C3=${g.c3.verdict} lever (batch vs pipelined)=` +
+				(c
+					? `${c.reading} median=${c.medianDeltaMs?.toFixed(3) ?? "n/a"}ms [${c.lowDeltaMs?.toFixed(3) ?? "n/a"}, ${c.highDeltaMs?.toFixed(3) ?? "n/a"}] n=${c.pairedBlocks.length}${c.advisory ? " ADVISORY" : ""}`
+					: "not available — one side of the pair is not a measurement") +
+				` ceilings=${JSON.stringify(g.c3.ceilings)}`,
+		);
+		console.log(
+			`egress-classify: G3 C4=${g.c4.verdict} udpCounters=${g.c4.stepsWithUdpCounters}/${g.c4.steps} gsoRead=${g.c4.gsoRead}; cross-check R4 is ${g.crossCheckR4} — G2 ingest p99 and this egress p99 are NOT comparable units`,
+		);
+	}
+	for (const c of result.emitterComparisons) {
+		if (c.deltaMsByBlock.length === 0) continue;
+		console.log(
+			`egress-classify: ${c.profile} ${c.emitter} vs ${c.against}: ${c.reading ?? "n/a"} median=${c.medianDeltaMs?.toFixed(3) ?? "n/a"}ms [${c.lowDeltaMs?.toFixed(3) ?? "n/a"}, ${c.highDeltaMs?.toFixed(3) ?? "n/a"}] paired=${c.pairedBlocks.length} confounded=${c.confoundedBlocks.length} cpuAsymmetric=${c.asymmetricBlocks.length}`,
+		);
+	}
+	for (const a of result.alignment) {
+		console.log(
+			`egress-classify: alignment ${a.emitter} block=${a.block ?? "n/a"} agg=${a.aggregateRate}/s delta=${a.deltaMs.toFixed(3)}ms ${a.bucket ?? "cpu-asymmetric (disclosed, no bucket)"} serverCpuGap=${a.serverCpuGapPct.toFixed(1)} hostCpuGap=${a.hostCpuGapPct?.toFixed(1) ?? "n/a"}${a.abConfounded ? " ab-confounded" : ""}`,
+		);
+	}
 	for (const p of result.profiles) {
 		console.log(
-			`egress-classify: ${p.profile} armComplete=${p.armComplete} capacity(p99<5ms)=${p.capacityRealtimePerSec ?? "none"}${p.realtimeIsFloor ? "+" : ""}/s capacity(p99<33.3ms)=${p.capacityFramePerSec ?? "none"}${p.frameIsFloor ? "+" : ""}/s`,
+			`egress-classify: ${p.profile}/${p.emitter} armComplete=${p.armComplete} capacity(p99<5ms)=${p.capacityRealtimePerSec ?? "none"}${p.realtimeIsFloor ? "+" : ""}/s capacity(p99<33.3ms)=${p.capacityFramePerSec ?? "none"}${p.frameIsFloor ? "+" : ""}/s`,
 		);
 	}
 	for (const f of result.fanout) {
@@ -723,7 +1218,7 @@ if (import.meta.main) {
 	}
 	for (const s of result.steps) {
 		console.log(
-			`egress-classify: ${s.shape}/${s.profile} agg=${s.aggregateRate}/s ${s.complete ? (s.bucket ?? "") : `INCOMPLETE(${s.stop})`} p50=${(s.oneWay.p50Ns / MS).toFixed(2)}ms p99=${(s.oneWay.p99Ns / MS).toFixed(2)}ms p999=${(s.oneWay.p999Ns / MS).toFixed(2)}ms down=${s.downDeliveryRatio?.toFixed(3) ?? "n/a"}`,
+			`egress-classify: ${s.shape}/${s.profile}/${s.emitter}${s.block !== null ? ` block=${s.block}` : ""} agg=${s.aggregateRate}/s ${s.complete ? (s.bucket ?? "") : `INCOMPLETE(${s.stop})`} p50=${(s.oneWay.p50Ns / MS).toFixed(2)}ms p99=${(s.oneWay.p99Ns / MS).toFixed(2)}ms p999=${(s.oneWay.p999Ns / MS).toFixed(2)}ms down=${s.downDeliveryRatio?.toFixed(3) ?? "n/a"}`,
 		);
 	}
 	console.log(`egress-classify: wrote ${out}`);

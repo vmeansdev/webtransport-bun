@@ -7,7 +7,10 @@ import {
 	classify,
 	classifySteps,
 	compareAlignment,
+	compareEmitters,
 	type EgressBucket,
+	gateVerdictG3,
+	orderStatistic,
 	type StopReason,
 	summarizeFanout,
 	verdictForProfile,
@@ -384,7 +387,7 @@ describe("capacity under the registered gates", () => {
 
 	test("capacity is the highest complete rung under each gate", () => {
 		const steps = ladder([1, 2, 8, 30, 60]);
-		const v = verdictForProfile("constant", steps);
+		const v = verdictForProfile("constant", "serial", steps);
 		expect(v.capacityRealtimePerSec).toBe(20_000);
 		expect(v.capacityFramePerSec).toBe(40_000);
 		expect(v.realtimeIsFloor).toBe(false);
@@ -392,7 +395,7 @@ describe("capacity under the registered gates", () => {
 
 	test("a gate the top rung still clears is reported as a floor", () => {
 		const steps = ladder([1, 1, 1]);
-		const v = verdictForProfile("constant", steps);
+		const v = verdictForProfile("constant", "serial", steps);
 		expect(v.capacityRealtimePerSec).toBe(30_000);
 		expect(v.realtimeIsFloor).toBe(true);
 	});
@@ -411,14 +414,14 @@ describe("capacity under the registered gates", () => {
 			],
 			0,
 		);
-		const v = verdictForProfile("constant", steps);
+		const v = verdictForProfile("constant", "serial", steps);
 		expect(v.capacityRealtimePerSec).toBe(10_000);
 		expect(v.realtimeIsFloor).toBe(true);
 	});
 
 	test("a complete rung that crossed the gate ends the floor", () => {
 		const steps = ladder([1, 60]);
-		const v = verdictForProfile("constant", steps);
+		const v = verdictForProfile("constant", "serial", steps);
 		expect(v.capacityRealtimePerSec).toBe(10_000);
 		expect(v.realtimeIsFloor).toBe(false);
 	});
@@ -434,7 +437,7 @@ describe("capacity under the registered gates", () => {
 			],
 			0,
 		);
-		const v = verdictForProfile("constant", steps);
+		const v = verdictForProfile("constant", "serial", steps);
 		expect(v.armComplete).toBe(false);
 		expect(v.capacityRealtimePerSec).toBeNull();
 	});
@@ -623,7 +626,7 @@ describe("fan-out", () => {
 describe("the run-level generator gate", () => {
 	const ceiling = (perSec: number) => ({ ceilingPerSec: perSec, rungs: [] });
 	const steps: ClassifiedStep[] = classifySteps([step()], 0);
-	const profiles = [verdictForProfile("constant", steps)];
+	const profiles = [verdictForProfile("constant", "serial", steps)];
 	const offered = steps[0]?.offeredPerSec ?? 0;
 
 	test("a generator that barely outruns what the ladder asked voids the run", () => {
@@ -653,7 +656,7 @@ describe("the run-level generator gate", () => {
 		);
 		const delivered = starved[0]?.deliveredPerSec ?? 0;
 		const v = verdictForRun(starved, ceiling(delivered * 3), [
-			verdictForProfile("constant", starved),
+			verdictForProfile("constant", "serial", starved),
 		]);
 		expect(v.stop).toBe("generator-headroom");
 		expect(v.maxOfferedPerSec).toBeGreaterThan(v.maxDeliveredPerSec);
@@ -680,7 +683,7 @@ describe("the run-level generator gate", () => {
 			0,
 		);
 		const v = verdictForRun(stopped, ceiling(10_000_000), [
-			verdictForProfile("constant", stopped),
+			verdictForProfile("constant", "serial", stopped),
 		]);
 		expect(v.stop).toBe("constant-arm-incomplete");
 	});
@@ -705,5 +708,281 @@ describe("fragment merge", () => {
 		expect(result.clockResidualNs).toBe(120);
 		expect(result.run.complete).toBe(true);
 		expect(result.steps).toHaveLength(1);
+	});
+});
+
+describe("gate G3 — the three-arm comparison", () => {
+	/** One gate arm: a (profile, emitter) cell inside one replicate block. */
+	function gateStep(
+		emitter: "serial" | "pipelined" | "batch",
+		block: number,
+		oneWayMs: number,
+		overrides: Partial<RawStep> = {},
+		profile: RawStep["profile"] = "frame-bursty",
+	): RawStep {
+		return step(
+			{
+				shape: "gate",
+				profile,
+				emitter,
+				block,
+				positionInBlock: 0,
+				udp: {
+					inDatagrams: 10,
+					outDatagrams: 20_000,
+					inErrors: 0,
+					rcvbufErrors: 0,
+					sndbufErrors: 0,
+				},
+				...overrides,
+			},
+			{ oneWayMs, endToEndMs: oneWayMs + 1 },
+		);
+	}
+
+	const runFor = (
+		emitter: "serial" | "pipelined" | "batch",
+		complete: boolean,
+	) => ({
+		complete,
+		stop: complete ? null : ("generator-headroom" as const),
+		emitter,
+		generatorCeilingPerSec: complete ? 100_000 : 20_000,
+		maxOfferedPerSec: 32_600,
+		maxDeliveredPerSec: 32_600,
+		headroomRatio: complete ? 3 : 0.6,
+		headroomBurnNs: 0,
+	});
+
+	test("the origination-lag floor never crosses an arm", () => {
+		// A cheap arm at 1 ms and an expensive arm at 6 ms. With one shared floor
+		// the expensive arm reads as saturated (6 >= 4 x 1); per arm, each is its
+		// own floor and neither is condemned by the other.
+		const steps = classifySteps(
+			[
+				gateStep("batch", 0, 2, {
+					originator: {
+						...gateStep("batch", 0, 2).originator,
+						originationLag: flat(1 * MS, 1000),
+					},
+				}),
+				gateStep("serial", 0, 2, {
+					originator: {
+						...gateStep("serial", 0, 2).originator,
+						originationLag: flat(6 * MS, 1000),
+					},
+				}),
+			],
+			0,
+		);
+		expect(steps.map((s) => s.stop)).toEqual([null, null]);
+		// Histogram bucketing rounds a little; the point is that each arm's floor
+		// is its own p99 and not the other arm's.
+		expect(steps[0]?.originationLagFloorNs).toBeCloseTo(1 * MS, -5);
+		expect(steps[1]?.originationLagFloorNs).toBeCloseTo(6 * MS, -5);
+	});
+
+	test("the lever delta is paired inside a block and read from the interval", () => {
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].flatMap((block) => [
+				gateStep("pipelined", block, 10),
+				gateStep("batch", block, 6),
+			]),
+			0,
+		);
+		const c = compareEmitters(steps, "frame-bursty", "batch", "pipelined");
+		expect(c.pairedBlocks).toEqual([0, 1, 2, 3, 4]);
+		expect(c.medianDeltaMs).toBeCloseTo(-4, 0);
+		expect(c.reading).toBe("lever-positive");
+		expect(c.coverage).toBeCloseTo(0.9375, 6);
+		expect(c.advisory).toBe(false);
+	});
+
+	test("an interval spanning zero is inconclusive, whatever the median says", () => {
+		const steps = classifySteps(
+			[
+				gateStep("pipelined", 0, 10),
+				gateStep("batch", 0, 6),
+				gateStep("pipelined", 1, 10),
+				gateStep("batch", 1, 9),
+				gateStep("pipelined", 2, 10),
+				gateStep("batch", 2, 12),
+			],
+			0,
+		);
+		const c = compareEmitters(steps, "frame-bursty", "batch", "pipelined");
+		expect(c.medianDeltaMs).toBeLessThan(0);
+		expect(c.reading).toBe("lever-inconclusive");
+	});
+
+	test("a confounded block is published and excluded from the median", () => {
+		const steps = classifySteps(
+			[
+				// The batch arm drops 10% more: a better tail bought by delivery.
+				gateStep("pipelined", 0, 10),
+				gateStep("batch", 0, 1, {}, "frame-bursty"),
+				gateStep("pipelined", 1, 10),
+				gateStep("batch", 1, 9),
+				gateStep("pipelined", 2, 10),
+				gateStep("batch", 2, 9),
+			].map((s, i) =>
+				i === 1 ? { ...s, clientReceived: 17_000, downDeliveryRatio: 0.85 } : s,
+			),
+			0,
+		);
+		const c = compareEmitters(steps, "frame-bursty", "batch", "pipelined");
+		expect(c.confoundedBlocks).toEqual([0]);
+		expect(c.deltaMsByBlock).toHaveLength(3);
+		// The -9 ms outlier is published in the rows but not in the median.
+		expect(c.medianDeltaMs).toBeCloseTo(-1, 0);
+	});
+
+	test("CPU asymmetry disclosed: the pair keeps its delta and loses its bucket", () => {
+		const steps = classifySteps(
+			[
+				gateStep("batch", 0, 4, {}, "frame-bursty"),
+				gateStep("batch", 0, 9, { serverCpuPct: 250 }, "keyframe-aligned"),
+			],
+			0,
+		);
+		const [a] = compareAlignment(steps);
+		expect(a?.deltaMs).toBeCloseTo(5, 0);
+		expect(a?.cpuSymmetric).toBe(false);
+		expect(a?.bucket).toBeNull();
+		expect(a?.serverCpuGapPct).toBeCloseTo(160, 6);
+	});
+
+	test("alignment pairs never cross an arm or a block", () => {
+		const steps = classifySteps(
+			[
+				gateStep("batch", 0, 4, {}, "frame-bursty"),
+				gateStep("pipelined", 1, 20, {}, "keyframe-aligned"),
+			],
+			0,
+		);
+		expect(compareAlignment(steps)).toEqual([]);
+	});
+
+	test("C1/C2: a batch arm complete and wholly under the bar passes", () => {
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].flatMap((b) => [
+				gateStep("batch", b, 10),
+				gateStep("pipelined", b, 20),
+			]),
+			0,
+		);
+		const g = gateVerdictG3(
+			steps,
+			[runFor("batch", true), runFor("pipelined", true)],
+			true,
+		);
+		expect(g.c1.verdict).toBe("PASS");
+		expect(g.c2.verdict).toBe("PASS");
+		expect(g.c3.verdict).toBe("MEASURED");
+		expect(g.c4.verdict).toBe("PASS");
+		expect(g.crossCheckR4).toBe("open");
+	});
+
+	test("C2: an interval straddling the bar is INCONCLUSIVE-AT-BAR, never a pass", () => {
+		const steps = classifySteps(
+			[10, 12, 20, 30, 40].map((ms, b) => gateStep("batch", b, ms)),
+			0,
+		);
+		const g = gateVerdictG3(steps, [runFor("batch", true)], true);
+		expect(g.c2.medianP99Ms).toBeLessThan(33.3);
+		expect(g.c2.highP99Ms).toBeGreaterThan(33.3);
+		expect(g.c2.verdict).toBe("INCONCLUSIVE-AT-BAR");
+	});
+
+	test("C1: one incomplete block makes the clause incomplete, not a majority pass", () => {
+		const steps = classifySteps(
+			[
+				gateStep("batch", 0, 10),
+				gateStep("batch", 1, 10),
+				gateStep("batch", 2, 10, {
+					clientReceived: 2_000,
+					downDeliveryRatio: 0.1,
+				}),
+			],
+			0,
+		);
+		const g = gateVerdictG3(steps, [runFor("batch", true)], true);
+		expect(g.c1.verdict).toBe("INCOMPLETE");
+		expect(g.c2.verdict).toBe("INCOMPLETE");
+	});
+
+	test("C3: a dishonest pipelined arm yields a ceiling finding, never a delta", () => {
+		const steps = classifySteps(
+			[0, 1, 2].flatMap((b) => [
+				gateStep("batch", b, 10),
+				gateStep("pipelined", b, 20),
+			]),
+			0,
+		);
+		const g = gateVerdictG3(
+			steps,
+			[runFor("batch", true), runFor("pipelined", false)],
+			true,
+		);
+		expect(g.c3.verdict).toBe("CEILING-MOVED");
+		expect(g.c3.comparison).toBeNull();
+		expect(g.c3.ceilings.batch).toBe(100_000);
+		expect(g.c3.ceilings.pipelined).toBe(20_000);
+	});
+
+	test("C4: a step without UDP counters leaves the obligation unmet", () => {
+		const steps = classifySteps([gateStep("batch", 0, 10, { udp: null })], 0);
+		const g = gateVerdictG3(steps, [runFor("batch", true)], true);
+		expect(g.c4.verdict).toBe("INCOMPLETE");
+		expect(
+			gateVerdictG3(steps, [runFor("batch", true)], false).c4.gsoRead,
+		).toBe(false);
+	});
+
+	test("the headroom rule is evaluated per arm, and the run reports the failing one", () => {
+		const result = classify([
+			{
+				shape: "headroom",
+				clock: { calibrationResidualNs: 0, source: "ffi" },
+				headroom: { ceilingPerSec: 10_000_000, emitter: "batch", rungs: [] },
+			},
+			{
+				shape: "headroom",
+				clock: { calibrationResidualNs: 0, source: "ffi" },
+				headroom: { ceilingPerSec: 100, emitter: "pipelined", rungs: [] },
+			},
+			{
+				shape: "gate",
+				profile: "frame-bursty",
+				clock: { calibrationResidualNs: 0, source: "ffi" },
+				gso: { maxGsoSegments: 64, groSegments: 64 },
+				steps: [gateStep("batch", 0, 10), gateStep("pipelined", 0, 20)],
+			},
+		]);
+		const batch = result.runs.find((r) => r.emitter === "batch");
+		const pipelined = result.runs.find((r) => r.emitter === "pipelined");
+		expect(batch?.complete).toBe(true);
+		expect(pipelined?.complete).toBe(false);
+		expect(pipelined?.stop).toBe("generator-headroom");
+		// The run-level line names the arm that failed, not the one that passed.
+		expect(result.run.complete).toBe(false);
+		expect(result.gateG3?.c3.verdict).toBe("CEILING-MOVED");
+		expect(result.gso?.maxGsoSegments).toBe(64);
+	});
+});
+
+describe("order-statistic interval", () => {
+	test("the median and the [min,max] pair with its exact coverage", () => {
+		const o = orderStatistic([5, 1, 3, 2, 4]);
+		expect(o).toMatchObject({ n: 5, median: 3, low: 1, high: 5 });
+		expect(o.coverage).toBeCloseTo(0.9375, 6);
+	});
+
+	test("an even count averages the two middle values", () => {
+		expect(orderStatistic([1, 2, 3, 4]).median).toBe(2.5);
+	});
+
+	test("no replicates is null everywhere, never zero", () => {
+		expect(orderStatistic([])).toMatchObject({ median: null, coverage: null });
 	});
 });
