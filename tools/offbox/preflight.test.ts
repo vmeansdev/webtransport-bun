@@ -135,6 +135,14 @@ describe("ping", () => {
 		});
 	});
 
+	test("reads the Linux summary line the peer vantage produces", () => {
+		expect(
+			parsePingLoss(
+				"600 packets transmitted, 600 received, 0% packet loss, time 60376ms",
+			),
+		).toEqual({ transmitted: 600, received: 600, lossPct: 0 });
+	});
+
 	test("an empty peer baseline falls back to the generator's own ping", () => {
 		const generator = summarizeRtt(pingOutput);
 		const empty = summarizeRtt("no samples here");

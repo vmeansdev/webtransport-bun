@@ -350,12 +350,18 @@ async function main(): Promise<void> {
 	let peerRtt: RttBaseline | null = null;
 	const rttPeerStep = plan.find((s) => s.what === "rtt-peer");
 	if (rttPeerStep) {
-		const localAddress = routeOut
+		// macOS `route -n get` prints a `local:` line only for some route kinds;
+		// the interface's own address is authoritative when it doesn't.
+		let localAddress = routeOut
 			? (routeOut.stdout.match(/^\s*local:\s*(\S+)/m)?.[1] ?? "")
 			: "";
+		if (!localAddress && interfaceName) {
+			const res = await run(["ipconfig", "getifaddr", interfaceName]);
+			localAddress = res.stdout.trim();
+		}
 		if (!localAddress) {
 			notes.push(
-				"rtt-peer requested but the route lookup produced no local address; peer baseline not taken",
+				"rtt-peer requested but neither the route lookup nor the interface produced a local address; peer baseline not taken",
 			);
 		} else {
 			const argv = rttPeerStep.argv.map((a) =>

@@ -137,8 +137,9 @@ export function parsePingTimes(pingOutput: string): number[] {
 export function parsePingLoss(
 	pingOutput: string,
 ): { transmitted: number; received: number; lossPct: number } | null {
+	// macOS says "N packets received", Linux (the peer vantage) just "N received".
 	const match = pingOutput.match(
-		/(\d+) packets transmitted, (\d+) packets received/,
+		/(\d+) packets transmitted, (\d+)(?: packets)? received/,
 	);
 	if (!match?.[1] || !match[2]) return null;
 	const transmitted = Number(match[1]);
