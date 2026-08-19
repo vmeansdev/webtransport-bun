@@ -260,9 +260,9 @@ describe("batched datagram send — chunking", () => {
 		// Every later crossing reports strictly more, and it is real elapsed
 		// time — three sleeps of 12 ms have happened by the last one.
 		for (let i = 1; i < seen.length; i += 1) {
-			expect(seen[i]).toBeGreaterThan(seen[i - 1]);
+			expect(seen[i] as number).toBeGreaterThan(seen[i - 1] as number);
 		}
-		expect(seen[3]).toBeGreaterThanOrEqual(30);
+		expect(seen[3] as number).toBeGreaterThanOrEqual(30);
 	});
 
 	it("an empty array is a resolved zero, with no crossing at all", async () => {
