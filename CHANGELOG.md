@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One payload to many sessions.** `WebTransportServer.sendDatagramMirror(targets, payload)`
+  fans one datagram out to many of that server's sessions across a single
+  Node-API crossing. Synchronous and non-parking — the fan-out of
+  `trySendDatagram`, not of `sendDatagram` — with a failures-only envelope that
+  is a **set, not a prefix**: every target is attempted independently, so a
+  reaped subscriber never stops a broadcast. Targets are owner-scoped by server,
+  duplicates are delivered to twice, the peak byte reservation is one payload,
+  and the cap is 10,000 targets (over it throws `RangeError` before anything is
+  sent). Native-only, additive, no knob. See `docs/SPEC.md` → "One payload to
+  many sessions". New metrics: `datagramMirrorCalls`, `datagramMirrorTargets`;
+  `datagramSendsAsync` deliberately does not move, because the call creates no
+  promise.
 - **Native GOAWAY send.** `ServerSession.goAway()` sends the connection-scoped
   H3 `GOAWAY`, surfacing the fork's `Connection::send_goaway`. The peer observes
   it as its `draining` settling (the fork folds a received `GOAWAY` into the same

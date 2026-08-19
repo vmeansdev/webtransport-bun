@@ -88,6 +88,11 @@ import {
 	type NativeDatagramBatchResult,
 	sendDatagramBatchChunked,
 } from "./datagram-batch.js";
+import {
+	type DatagramMirrorResult,
+	type NativeDatagramMirrorResult,
+	sendDatagramMirrorChecked,
+} from "./datagram-mirror.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -578,9 +583,38 @@ export interface WebTransportServer {
 	setUnknownSniPolicy(policy: UnknownSniPolicy): Promise<void>;
 	/** Introspect the active server TLS SNI state without exposing key material. */
 	tlsSnapshot(): ServerTlsSnapshot;
+	/**
+	 * Send one payload to many of this server's sessions across a single native
+	 * crossing.
+	 *
+	 * Synchronous and non-parking — the fan-out of `session.trySendDatagram()`,
+	 * not of `session.sendDatagram()`. Every target is attempted independently:
+	 * a subscriber that left between the caller's snapshot and this call lands
+	 * in `failures` and the rest still receive. Duplicated ids are delivered to
+	 * twice, and ids belonging to another server in this process are reported as
+	 * `E_SESSION_CLOSED` and receive nothing.
+	 *
+	 * `failures` is the actionable half: `E_SESSION_CLOSED` entries are the reap
+	 * list, `E_QUEUE_FULL` entries are the ones to retry on the parking path
+	 * (`session.sendDatagram()`), which is the only path allowed to wait.
+	 *
+	 * Throws `TypeError` for a malformed argument and `RangeError` for more than
+	 * 10,000 targets — programming errors, checked before anything is sent.
+	 * Never throws for a transport condition. Native-only; see
+	 * `docs/PARITY_MATRIX.md` section 3.
+	 */
+	sendDatagramMirror(
+		targets: readonly string[],
+		payload: Uint8Array,
+	): DatagramMirrorResult;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
+
+export type {
+	DatagramMirrorFailure,
+	DatagramMirrorResult,
+} from "./datagram-mirror.js";
 
 // ---------------------------------------------------------------------------
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
@@ -873,6 +907,18 @@ export type MetricsSnapshot = {
 	 * meter for that class — not a latency signal.
 	 */
 	datagramSendsAsync?: number;
+	/**
+	 * Native only. `sendDatagramMirror()` calls served. Deliberately separate
+	 * from {@link datagramSendsAsync}: the mirror hands JavaScript no promise,
+	 * so folding it in would misreport host-loop exposure.
+	 */
+	datagramMirrorCalls?: number;
+	/**
+	 * Native only. Targets those mirror calls attempted. Delivery is counted per
+	 * session in `datagramsOut`, exactly as for every other send path, so a
+	 * mirrored datagram is indistinguishable from a looped one there.
+	 */
+	datagramMirrorTargets?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
@@ -1282,6 +1328,15 @@ interface NativeServerHandle {
 	removeSniCert(serverName: string): Promise<void>;
 	setUnknownSniPolicy(policy: string): Promise<void>;
 	tlsSnapshot(): ServerTlsSnapshot;
+	/** Synchronous one-payload-to-many-sessions send. Returns the failures-only
+	 * envelope; never rejects and never throws for a transport condition.
+	 * Required rather than optional-with-fallback: it is version-bound with the
+	 * bundled prebuild, so a caller that drops it must fail to compile rather
+	 * than silently degrade to a per-target loop. */
+	sendDatagramMirror(
+		targets: string[],
+		payload: Uint8Array,
+	): NativeDatagramMirrorResult;
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2226,6 +2281,12 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			await handle.setUnknownSniPolicy(policy);
 		},
 		tlsSnapshot: () => handle.tlsSnapshot(),
+		sendDatagramMirror: (targets, payload) =>
+			sendDatagramMirrorChecked(
+				(ids, bytes) => handle.sendDatagramMirror(ids, bytes),
+				targets,
+				payload,
+			),
 		close: createServerCloseContract({
 			closeNative: () => handle.close(),
 			resolveOwnedSessions: (info) => {

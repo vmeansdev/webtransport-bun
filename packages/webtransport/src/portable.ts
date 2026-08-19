@@ -152,6 +152,16 @@ export type PortableCreateServerOptions = {
 	wasmBind?: (localAddress: string, localPort: number) => Promise<UdpTransport>;
 };
 
+/**
+ * The common server contract both backends implement.
+ *
+ * Fan-out sending (`sendDatagramMirror`) is native-only, exactly as batched
+ * sending and batched receiving are: it exists to amortize the Node-API
+ * crossing, which wasm does not have, and it fans out through a native session
+ * registry wasm has no equivalent of. `/portable` therefore promises
+ * per-session `sendDatagram()` as the whole sending contract on both backends.
+ * See `docs/PARITY_MATRIX.md` section 3.
+ */
 export interface PortableServer {
 	readonly backend: BackendKind;
 	readonly address: { host: string; port: number };

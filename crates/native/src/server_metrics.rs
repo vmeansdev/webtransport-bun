@@ -64,6 +64,17 @@ pub struct ServerMetrics {
     /// backed by a ThreadsafeFunction — a host event-loop reference — so this
     /// counter is how exposed a server is to that class, not a latency metric.
     pub datagram_sends_async: AtomicU64,
+    /// Mirror (one-payload-to-many-sessions) calls this server has served.
+    ///
+    /// Deliberately not folded into `datagram_sends_async`: the mirror hands
+    /// JavaScript no promise, and that counter's meaning is host-loop exposure.
+    /// A new send path invisible to its own meter is the defect these two exist
+    /// to avoid.
+    pub datagram_mirror_calls: AtomicU64,
+    /// Targets those calls *attempted*. Delivery is per-session `datagrams_out`,
+    /// which the mirror increments exactly as every other send path does, so a
+    /// mirrored datagram is indistinguishable from a looped one there.
+    pub datagram_mirror_targets: AtomicU64,
     /// Wakes datagram senders competing for this server instance's global byte budget.
     pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
@@ -277,6 +288,10 @@ impl ServerMetrics {
             backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed)
                 as f64,
             datagram_sends_async: Some(self.datagram_sends_async.load(Ordering::Relaxed) as f64),
+            datagram_mirror_calls: Some(self.datagram_mirror_calls.load(Ordering::Relaxed) as f64),
+            datagram_mirror_targets: Some(
+                self.datagram_mirror_targets.load(Ordering::Relaxed) as f64
+            ),
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as f64,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as f64,
             sessions_closed_by_idle: Some(

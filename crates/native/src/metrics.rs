@@ -37,6 +37,12 @@ pub struct ServerMetricsSnapshot {
     /// Native only. Datagram sends that had to take the parking N-API path and
     /// therefore created a host event-loop reference for their promise.
     pub datagram_sends_async: Option<f64>,
+    /// Native only. Mirror calls served — one payload fanned out to many
+    /// sessions across a single Node-API crossing. Never counted in
+    /// `datagram_sends_async`: the mirror creates no promise.
+    pub datagram_mirror_calls: Option<f64>,
+    /// Native only. Targets those mirror calls attempted.
+    pub datagram_mirror_targets: Option<f64>,
     pub rate_limited_count: f64,
     pub limit_exceeded_count: f64,
     /// Native only. Sessions the QUIC idle timeout ended.
