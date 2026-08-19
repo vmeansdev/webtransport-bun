@@ -14,6 +14,7 @@
  * what it could not finish.
  */
 
+import { E_SERVER_CLOSING } from "./errors.js";
 import type { CloseInfo } from "./types.js";
 
 /**
@@ -21,9 +22,12 @@ import type { CloseInfo } from "./types.js";
  * shutdown. Mirrors `SERVER_CLOSING_CLOSE_CODE` in the native addon so an app
  * sees the same reason whether the event came off the wire or from this
  * fallback, and can tell a reaped session from a lost one.
+ *
+ * Documented in `docs/SPEC.md` ("Server shutdown close semantics"); the code is
+ * wire-visible, so changing either value is a breaking change.
  */
 export const SERVER_CLOSING_CLOSE_CODE = 3993;
-export const SERVER_CLOSING_CLOSE_REASON = "E_SERVER_CLOSING";
+export const SERVER_CLOSING_CLOSE_REASON = E_SERVER_CLOSING;
 
 /** How long the contract waits for in-flight `onSession` callbacks. */
 export const ONSESSION_DRAIN_TIMEOUT_MS = 5000;

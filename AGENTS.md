@@ -97,6 +97,7 @@ Per-IP token buckets (defaults)
 - E_HANDSHAKE_TIMEOUT
 - E_SESSION_CLOSED
 - E_SESSION_IDLE_TIMEOUT
+- E_SERVER_CLOSING (close reason only, paired with close code 3993)
 - E_STREAM_RESET
 - E_STOP_SENDING
 - E_QUEUE_FULL

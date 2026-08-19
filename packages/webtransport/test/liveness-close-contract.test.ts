@@ -13,7 +13,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connect, createServer } from "../src/index.js";
+import { connect, createServer, E_SERVER_CLOSING } from "../src/index.js";
 import {
 	createServerCloseContract,
 	SERVER_CLOSING_CLOSE_CODE,
@@ -152,6 +152,19 @@ describe("server close terminal contract", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it("pins the documented shutdown close pair", () => {
+		// These two values are wire-visible and documented in docs/SPEC.md
+		// ("Server shutdown close semantics"). Every other assertion in this
+		// file compares against the constants, which would happily follow a
+		// silent edit; this one is the literal the peer actually reads, so
+		// moving it fails here and forces the SPEC/CHANGELOG entry to move too.
+		expect(SERVER_CLOSING_CLOSE_CODE).toBe(3993);
+		expect(SERVER_CLOSING_CLOSE_REASON).toBe("E_SERVER_CLOSING");
+		// The reason string is also the stable code exported from the root
+		// entrypoint — one source, not two strings that happen to match.
+		expect(SERVER_CLOSING_CLOSE_REASON).toBe(E_SERVER_CLOSING);
+	});
 
 	it("reports reaped sessions with a distinct close reason", async () => {
 		const cert = generateCertForNames(["localhost", "127.0.0.1"]);
