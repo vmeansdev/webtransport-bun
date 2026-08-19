@@ -82,7 +82,9 @@ function sleep(ms: number): Promise<void> {
  */
 export function writeArtifactDurable(path: string, contents: string): void {
 	writeFileSync(path, contents);
-	const fd = openSync(path, "r");
+	// Opened "r+": fsync on a read-only descriptor is permitted but not
+	// universally honoured, and this call is the whole point of the function.
+	const fd = openSync(path, "r+");
 	try {
 		fsyncSync(fd);
 	} finally {
