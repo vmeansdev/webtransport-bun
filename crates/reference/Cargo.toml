@@ -19,7 +19,12 @@ path = "src/smoke_client.rs"
 name = "gso-probe"
 path = "src/gso_probe.rs"
 
+[[bin]]
+name = "mmo-client"
+path = "src/mmo_client.rs"
+
 [dependencies]
 wtransport = { workspace = true }
 quinn-udp = "0.5"
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
