@@ -88,6 +88,13 @@ export type PacedWriterOptions = {
 	fill?: (chunk: Uint8Array, index: number, intendedMs: number) => void;
 	/** Called after each write settles; the token arm records arrivals with it. */
 	onSettled?: (index: number, actualMs: number, settledMs: number) => void;
+	/**
+	 * How the per-stream buffer is allocated. The conductor passes
+	 * `Buffer.allocUnsafe` so the chunk reaching the addon is already a Buffer
+	 * and the Node adapter has nothing to convert; the default keeps this module
+	 * runnable in a plain unit test.
+	 */
+	allocChunk?: (bytes: number) => Uint8Array;
 };
 
 /**
@@ -102,7 +109,9 @@ export type PacedWriterOptions = {
 export async function runPacedStream(
 	opts: PacedWriterOptions,
 ): Promise<PacedWriteResult> {
-	const chunk = new Uint8Array(opts.writeBytes);
+	const chunk = (opts.allocChunk ?? ((n: number) => new Uint8Array(n)))(
+		opts.writeBytes,
+	);
 	const lateness = new G7Histogram();
 	const settle = new G7Histogram();
 	const start = opts.now();

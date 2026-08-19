@@ -34,6 +34,36 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "bandwidth (default ladder) | g7-stream-egress (gate G7)"
+        required: false
+        default: "bandwidth"
+        type: string
+      g7_arms:
+        description: "G7 arms: bulk,tokens"
+        required: false
+        default: "bulk,tokens"
+        type: string
+      g7_bulk_cells:
+        description: "G7 S-bulk ladder (write sizes). Populations only — no threshold is an input."
+        required: false
+        default: "B-64k,B-16k,B-4k,B-1k"
+        type: string
+      g7_token_cells:
+        description: "G7 S-tokens ladder (session counts)"
+        required: false
+        default: "T-250,T-1k,T-2.5k"
+        type: string
+      g7_step_seconds:
+        description: "G7 seconds per cell repeat"
+        required: false
+        default: "60"
+        type: string
+      g7_repeats:
+        description: "G7 repeats per cell"
+        required: false
+        default: "2"
+        type: string
 jobs:
   bench:
     permissions:
@@ -104,8 +134,30 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      # Gate G7 — server→client bulk over reliable streams.
+      # Contract: docs/research/preregistrations/gate-g7-stream-egress.md.
+      # Only populations and windows are inputs here; every threshold lives in
+      # tools/load/g7-plan.ts and every clause in tools/load/g7-classify.ts, so
+      # a dispatch cannot move a bar.
+      - name: Build G7 sink
+        if: ${{ github.event.inputs.mode == 'g7-stream-egress' }}
+        run: cargo build -p reference --release --bin g7-sink
+      - name: Run gate G7
+        if: ${{ github.event.inputs.mode == 'g7-stream-egress' }}
+        env:
+          G7_ARMS: ${{ github.event.inputs.g7_arms }}
+          G7_BULK_CELLS: ${{ github.event.inputs.g7_bulk_cells }}
+          G7_TOKEN_CELLS: ${{ github.event.inputs.g7_token_cells }}
+          G7_STEP_SECONDS: ${{ github.event.inputs.g7_step_seconds }}
+          G7_REPEATS: ${{ github.event.inputs.g7_repeats }}
+          WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          G7_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-g7-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-g7.ts
+          sha256sum "$GITHUB_WORKSPACE"/.bench-evidence/bench-g7-* || true
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'g7-stream-egress' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -119,7 +171,9 @@ jobs:
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
-          path: .bench-evidence/bench-bandwidth-*
+          path: |
+            .bench-evidence/bench-bandwidth-*
+            .bench-evidence/bench-g7-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
