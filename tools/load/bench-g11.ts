@@ -46,6 +46,11 @@ import {
 	waitForChildWithDeadline,
 } from "./bench-child-deadline.ts";
 import {
+	closeBounded,
+	finishRun,
+	writeArtifactDurable,
+} from "./bench-shutdown.ts";
+import {
 	type CouplingCellFacts,
 	type CrossingFacts,
 	type ExchangeCellFacts,
@@ -138,6 +143,14 @@ const CPU_CORES = cpus().length;
 
 /** Which clock the last cell stamped with; recorded in the artifact. */
 let wallClockSource = "unset";
+
+/**
+ * Cells whose server did not close cleanly. Not a falsifier: a cell's numbers
+ * are all taken before its teardown, so a stuck close cannot move one. It is
+ * recorded because a non-zero count is the retained-N-API-reference signature,
+ * and the reason this run needed an explicit exit rather than getting one.
+ */
+let serverCloseFailures = 0;
 
 let portCursor = BASE_PORT;
 const nextPort = () => portCursor++;
@@ -888,7 +901,20 @@ async function runStep(
 		? null
 		: parseSummary(stdout, prefix);
 
-	await server.close?.();
+	// Bounded, and never thrown. A cell's close rejects with
+	// `E_BACKPRESSURE_TIMEOUT: ... asyncOpsPending=N` when the native drain
+	// cannot reach idle — sessions whose peer was killed and never reaped. That
+	// is a fact about this cell's teardown, not a reason to lose the fifteen
+	// cells behind it, and the count travels in the artifact.
+	const close = await closeBounded(() => server.close?.() ?? Promise.resolve());
+	if (close.closeState !== "closed") {
+		serverCloseFailures += 1;
+		console.error(
+			`g11: ${cell.name}#${repeat} server close ${close.closeState} after ${close.closeMs} ms${
+				close.closeError ? `: ${close.closeError}` : ""
+			}`,
+		);
+	}
 
 	return {
 		cell,
@@ -1252,6 +1278,7 @@ async function main(): Promise<void> {
 		registration: "docs/research/preregistrations/gate-g11-bidi.md",
 		wiringCheckOnly: SMOKE,
 		runId: RUN_ID,
+		serverCloseFailures,
 		host: HOST,
 		candidateSha: process.env.G11_CANDIDATE_SHA ?? null,
 		stagingBaseSha: process.env.G11_STAGING_BASE_SHA ?? null,
@@ -1282,7 +1309,7 @@ async function main(): Promise<void> {
 		coupling,
 		cells: raw,
 	};
-	writeFileSync(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
+	writeArtifactDurable(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
 
 	if (gateRepeats.length > 0) {
 		console.log(`\ng11 gate (${GATE_CELL}): ${gate.verdict} — ${gate.reason}`);
@@ -1307,3 +1334,13 @@ async function main(): Promise<void> {
 }
 
 await main();
+
+// Every cell's server was already closed inside `runStep`, and the artifact is
+// fsynced. What is left is the part the runtime cannot be asked to do: the
+// unsettled N-API promises of sessions whose peers were killed keep Bun's event
+// loop referenced with nothing running, which is the 18 minutes invocation 1
+// spent past a complete artifact. The exit is taken rather than awaited.
+await finishRun({
+	closeServer: async () => {},
+	onNote: (note) => console.log(`g11 shutdown: ${note}`),
+});
