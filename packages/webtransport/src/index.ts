@@ -400,6 +400,36 @@ export type LimitsOptions = {
 	maxQueuedBytesGlobal: number;
 	maxQueuedBytesPerSession: number;
 	maxQueuedBytesPerStream: number;
+	/**
+	 * QUIC per-stream receive window in bytes — how much a peer may have
+	 * outstanding on one incoming stream. Omitted (the default), it is derived
+	 * from `maxQueuedBytesPerStream`, so raising the application byte governor
+	 * also widens the transport window. Set it to move the window on its own
+	 * and leave the governor (and with it backpressure and the datagram
+	 * channel) where it is.
+	 *
+	 * Memory: windows are advertised limits, not allocations, but they are the
+	 * ceiling a peer can drive you to. Worst case per session is
+	 * `receiveWindow + sendWindow + datagramChannel × maxDatagramSize`, and
+	 * `maxQueuedBytesGlobal` does **not** bound it — budget it against
+	 * `maxSessions` yourself. See `docs/OPERATIONS.md` ("Flow-control windows").
+	 *
+	 * Native backend only; the wasm backend has no QUIC transport config.
+	 */
+	streamReceiveWindow?: number;
+	/**
+	 * QUIC connection receive window in bytes, across all incoming streams of
+	 * one session. Omitted, it is derived from `maxQueuedBytesPerSession`
+	 * (raised to cover one stream window). Native backend only.
+	 */
+	receiveWindow?: number;
+	/**
+	 * QUIC connection send window in bytes — outgoing stream bytes that may be
+	 * unacknowledged at once. Omitted, it is derived from
+	 * `maxQueuedBytesPerSession` (raised to cover one stream window). Native
+	 * backend only.
+	 */
+	sendWindow?: number;
 	backpressureTimeoutMs: number;
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
@@ -1299,6 +1329,14 @@ interface NativeAddon {
 	/** Inclusive payload size at or below which delivery stays engine-owned
 	 * (absent on older prebuilt addons). Diagnostic only. */
 	nativePayloadEngineOwnedMaxBytes?: () => number;
+	/** The QUIC flow-control config a limits JSON resolves to (absent on older
+	 * prebuilt addons). Pure function of its argument; diagnostic only. */
+	nativeTransportWindows?: (limitsJson: string) => {
+		streamReceiveWindow: number;
+		receiveWindow: number;
+		sendWindow: number;
+		datagramChannelCapacity: number;
+	};
 	/** Test seam: runs payloads through napi-rs's real per-element array
 	 * conversion (absent on older prebuilt addons). Never used in production. */
 	materializePayloadBatchForTests?: (
@@ -1770,10 +1808,9 @@ class NativeServerSession implements ServerSession {
 
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
 		if (!this.#incomingDatagramsCache) {
-			const session = this;
 			this.#incomingDatagramsCache = createIncomingDatagramIterator(
-				session.#nativeHandle,
-				() => session.#closed,
+				this.#nativeHandle,
+				() => this.#closed,
 				datagramBatchSize,
 				(err) => toWebTransportError(err),
 			);
@@ -2327,12 +2364,11 @@ class NativeClientSession implements ClientSession {
 
 	incomingDatagrams(): AsyncIterable<Uint8Array> {
 		if (!this.#incomingDatagramsCache) {
-			const session = this;
 			this.#incomingDatagramsCache = createIncomingDatagramIterator(
-				session.#nativeHandle,
-				() => session.#closed,
+				this.#nativeHandle,
+				() => this.#closed,
 				datagramBatchSize,
-				(err) => toWebTransportError(err, session.#strictW3CErrors),
+				(err) => toWebTransportError(err, this.#strictW3CErrors),
 			);
 		}
 		return this.#incomingDatagramsCache;
@@ -4307,6 +4343,12 @@ export const __TESTING__ = {
 		native?.nativePayloadDeliveryMode?.(),
 	nativePayloadEngineOwnedMaxBytesForTests: () =>
 		native?.nativePayloadEngineOwnedMaxBytes?.(),
+	/** What the addon would configure for a given limits object — the same
+	 * merge `createServer` performs, so a test sees the production JSON. */
+	transportWindowsForLimitsForTests: (limits?: Partial<LimitsOptions>) =>
+		native?.nativeTransportWindows?.(
+			JSON.stringify({ ...DEFAULT_LIMITS, ...limits }),
+		),
 	materializePayloadBatchForTests: (payloads: (Buffer | Uint8Array)[]) =>
 		native?.materializePayloadBatchForTests?.(payloads),
 };

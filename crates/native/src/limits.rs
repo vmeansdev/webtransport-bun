@@ -11,6 +11,15 @@ pub struct Limits {
     pub max_queued_bytes_global: u64,
     pub max_queued_bytes_per_session: u64,
     pub max_queued_bytes_per_stream: u64,
+    /// QUIC per-stream receive window, in bytes. `None` derives it from
+    /// `max_queued_bytes_per_stream` (the shipped behaviour).
+    pub stream_receive_window: Option<u64>,
+    /// QUIC connection receive window, in bytes. `None` derives it from
+    /// `max_queued_bytes_per_session` (the shipped behaviour).
+    pub receive_window: Option<u64>,
+    /// QUIC connection send window, in bytes. `None` derives it from
+    /// `max_queued_bytes_per_session` (the shipped behaviour).
+    pub send_window: Option<u64>,
     pub backpressure_timeout_ms: u64,
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
@@ -30,12 +39,19 @@ impl Default for Limits {
             max_queued_bytes_global: 512 * 1024 * 1024, // 512 MiB
             max_queued_bytes_per_session: 2 * 1024 * 1024, // 2 MiB
             max_queued_bytes_per_stream: 256 * 1024,    // 256 KiB
+            stream_receive_window: None,
+            receive_window: None,
+            send_window: None,
             backpressure_timeout_ms: 5000,
             handshake_timeout_ms: 10_000,
             idle_timeout_ms: 60_000,
             keep_alive_interval_ms: None,
         }
     }
+}
+
+fn positive_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0)
 }
 
 impl Limits {
@@ -69,6 +85,12 @@ impl Limits {
             if let Some(n) = v.get("maxQueuedBytesPerStream").and_then(|x| x.as_u64()) {
                 lim.max_queued_bytes_per_stream = n;
             }
+            // Explicit QUIC windows. Omitted, non-numeric or zero leaves the
+            // window derived from the byte governors, so the shipped config is
+            // byte-identical to before these fields existed.
+            lim.stream_receive_window = positive_u64(&v, "streamReceiveWindow");
+            lim.receive_window = positive_u64(&v, "receiveWindow");
+            lim.send_window = positive_u64(&v, "sendWindow");
             if let Some(n) = v.get("backpressureTimeoutMs").and_then(|x| x.as_u64()) {
                 lim.backpressure_timeout_ms = n.max(100);
             }
@@ -258,6 +280,37 @@ mod tests {
         assert_eq!(lim.backpressure_timeout_ms, 100);
         assert_eq!(lim.handshake_timeout_ms, 100);
         assert_eq!(lim.idle_timeout_ms, 1000);
+    }
+
+    #[test]
+    fn window_fields_default_to_derived() {
+        let lim = Limits::from_json("{}");
+        assert_eq!(lim.stream_receive_window, None);
+        assert_eq!(lim.receive_window, None);
+        assert_eq!(lim.send_window, None);
+    }
+
+    #[test]
+    fn window_fields_parse_when_present() {
+        let lim = Limits::from_json(
+            r#"{"streamReceiveWindow": 8388608, "receiveWindow": 33554432, "sendWindow": 4194304}"#,
+        );
+        assert_eq!(lim.stream_receive_window, Some(8 * 1024 * 1024));
+        assert_eq!(lim.receive_window, Some(32 * 1024 * 1024));
+        assert_eq!(lim.send_window, Some(4 * 1024 * 1024));
+        // The governors they decouple from are untouched.
+        assert_eq!(lim.max_queued_bytes_per_session, 2 * 1024 * 1024);
+        assert_eq!(lim.max_queued_bytes_per_stream, 256 * 1024);
+    }
+
+    #[test]
+    fn zero_or_malformed_windows_stay_derived() {
+        let lim = Limits::from_json(
+            r#"{"streamReceiveWindow": 0, "receiveWindow": "big", "sendWindow": -1}"#,
+        );
+        assert_eq!(lim.stream_receive_window, None);
+        assert_eq!(lim.receive_window, None);
+        assert_eq!(lim.send_window, None);
     }
 
     #[test]
