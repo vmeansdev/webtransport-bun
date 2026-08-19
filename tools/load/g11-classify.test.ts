@@ -214,14 +214,31 @@ describe("each falsifier rejects the signature it exists for (§4)", () => {
 		const facts = healthyCell({ knobBytes: 65_536 });
 		facts.crossings.server.batchedCrossings =
 			facts.crossings.server.dataCrossings;
-		facts.crossings.client.batchedCrossings = 0;
+		if (facts.crossings.client) facts.crossings.client.batchedCrossings = 0;
 		expect(fired(facts)).toContain("V-K");
 		expect(knobProvenanceHolds(facts)).toBe(false);
+	});
+
+	test("V-K — a reference-generator cell has no client end to grade", () => {
+		// Amendment 3: Arm T's generator has no addon, so `null` is the honest
+		// value. It must not be read as "an addon ran and batched nothing".
+		const facts = healthyCell();
+		facts.crossings.client = null;
+		expect(fired(facts)).not.toContain("V-K");
+		const knobOn = healthyCell({ knobBytes: 65_536 });
+		knobOn.crossings.client = null;
+		knobOn.crossings.server.batchedCrossings =
+			knobOn.crossings.server.dataCrossings;
+		expect(fired(knobOn)).not.toContain("V-K");
+		expect(
+			falsifiersForTunnelCell(knobOn).find((f) => f.id === "V-K")?.detail,
+		).toContain("no addon on this end");
 	});
 
 	test("V-K — a knob-on cell that batched on both ends passes", () => {
 		const facts = healthyCell({ knobBytes: 65_536 });
 		for (const end of [facts.crossings.server, facts.crossings.client]) {
+			if (!end) continue;
 			end.batchedCrossings = end.dataCrossings;
 			end.maxBatchBytes = 65_536;
 		}

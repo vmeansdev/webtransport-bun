@@ -201,6 +201,7 @@ destroy the simultaneity that is the point.
 | **`T-100`** | **100** | **off (shipped default)** | **2** | **the gate cell**; every clause in §5 is about this cell |
 | `T-100-batch` | 100 | `WEBTRANSPORT_STREAM_BATCH_BYTES=65536` | 1 | disclosure: the knob's **bidi** behaviour, on both ends (K12). Grades nothing |
 | `T-200` | 200 | off | 1 | exploratory (§6). Produces no gate verdict |
+| `J-control` / `J-batch` | 50 | off / 65536 | 1 each | **Amendment 3**: the addon on both ends, so the knob's client-receive behaviour on a bidi handle is measurable at all. Verdict-free |
 
 **The gate cell is the shipped default with the knob off.** G2's lesson: a gate
 on a non-default configuration is a weaker claim than a gate on the shipped one.
@@ -560,6 +561,58 @@ where the mechanism is predicted **not** to live and would have reported
 
 Clause C4 is unaffected: it already reads `E_BACKPRESSURE_TIMEOUT` on the gate
 cell, from whichever end produces it.
+
+### Amendment 3 — where the generator lives, and the cell the ticket's "both ends" requirement actually needs (2026-08-19)
+
+Found while specifying the harness, before any harness process existed and
+before any dispatch. **No gate threshold moves and no clause changes**; one
+verdict-free cell is added and one instrument is declared unmeasurable where it
+was previously assumed available.
+
+The ticket requires that "chunk batching applies receive-side on BOTH ends here
+— the knob's bidi behaviour is itself unmeasured". §5 C9 was written to disclose
+exactly that. **With the reference generator it cannot be measured at all**, and
+the reason is structural rather than incidental:
+
+`crates/reference` speaks QUIC through `wtransport` directly. It contains no
+addon, therefore no `StreamBudget`, no `readBatch`, and no
+`stream-chunk-batch.ts` diagnostics counter. A Rust-generated arm has a client
+end with **no JS boundary to cross**, so "bytes per receive-side JS crossing on
+the client end" is not a small number there — it is not a number.
+
+Registered consequences:
+
+1. **Arm T keeps the reference generator**, deliberately. A co-resident addon
+   client at the gate rung would pay the same ~53,495 crossings/s the server
+   pays, and the arm's whole purpose is a server capacity statement that
+   co-residence taxes as little as possible. `crossings.client` is recorded as
+   **`null`** on Arm T, and the classifier now distinguishes `null` (no addon
+   ran on that end) from `0` (an addon ran and batched nothing) — because the
+   second is a V-K finding and the first is not.
+2. **Arm J is added**: the addon on **both** ends, at the **50-tunnel rung**,
+   one knob-off cell and one knob-on cell, 60 s each. It is **verdict-free** —
+   it grades nothing, exactly like C9 — and its output is the both-ends crossing
+   disclosure the ticket asks for, plus the first measurement of the knob's
+   behaviour on a client-opened bidi handle.
+3. **Arm D runs the addon on both ends too**, for the same structural reason
+   sharpened in Amendment 2: the read-ahead bridge whose reservations the
+   coupling prediction is about (`spawn_bidi_bridge_on`) exists only on an
+   **addon-opened** handle. A reference-client Arm D would have exercised
+   neither of the two paths the amendment separates.
+
+Arm J's rung is derived, not chosen for comfort: at 50 tunnels each end pays
+26,748 crossings/s, which by E1's scaling is ~77% of one core per process and
+~38.6% of the box for the pair — well inside V-S, so the disclosure is not taken
+from a saturated cell. At the 100 rung the pair would sit near 78% of the box
+with the unverified "a write costs what a read costs" assumption (K11) doing the
+work, which is a bad place to take a first measurement of anything.
+
+Registered expectation **E5** (labelled; no clause reads it): the knob's
+client-end mean bytes per crossing on `J-batch` lands in the same
+[1,402, 2,804] B band E2 predicts for the server end, because both ends see the
+same per-stream cadence. If the two ends differ materially, that difference is
+the finding — the client end reads through a read-ahead bridge and the server
+end reads deferred-direct (Amendment 2), and nothing has ever compared them.
 
 ## §12 — Run log
 
