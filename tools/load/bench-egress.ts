@@ -49,6 +49,7 @@ import {
 	headroomLagBoundNs,
 	type OriginatorStats,
 	quarterGridNs,
+	releaseEgressClock,
 } from "./egress-driver.ts";
 import {
 	createSinkSender,
@@ -1571,6 +1572,8 @@ async function main(): Promise<void> {
 		})}\n`,
 	);
 	console.log(`bench-egress: wrote ${OUT_JSON}`);
+	// The schedule clock is one worker for the whole run; it goes when the run does.
+	releaseEgressClock();
 }
 
 await main();

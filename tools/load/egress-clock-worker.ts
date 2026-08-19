@@ -52,12 +52,26 @@ self.postMessage({
 	clockSource: clock.source,
 });
 
+let driving = false;
+
 self.onmessage = (event: MessageEvent) => {
 	const message = event.data as ClockStartMessage;
 	if (message?.type !== "start") return;
-	run(message).catch((err) => {
-		self.postMessage({ type: "error", message: String(err) });
-	});
+	if (driving) {
+		self.postMessage({
+			type: "error",
+			message: "clock worker was asked to drive two steps at once",
+		});
+		return;
+	}
+	driving = true;
+	run(message)
+		.catch((err) => {
+			self.postMessage({ type: "error", message: String(err) });
+		})
+		.finally(() => {
+			driving = false;
+		});
 };
 
 async function run(message: ClockStartMessage): Promise<void> {

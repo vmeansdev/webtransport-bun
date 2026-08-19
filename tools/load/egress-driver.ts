@@ -419,14 +419,97 @@ export async function driveProfileInProcess(
 	};
 }
 
-/** How far apart the two threads' clocks may read at handshake before we refuse
- *  to believe they are the same counter. Both are `CLOCK_MONOTONIC`, so the true
- *  gap is one message round trip; 50 ms is a decade of margin over that and
- *  still catches a different epoch, which differs by the process uptime. */
-const CLOCK_EPOCH_GUARD_NS = 50_000_000;
+/**
+ * Longest the emitter parks on an empty ring before re-checking it.
+ *
+ * The obvious primitive here is `Atomics.waitAsync`, and it is deliberately not
+ * used: on Bun 1.3.14 a run that parks on it repeatedly wedges the timer queue —
+ * after the ring drains, `Bun.sleep()` inside the arm's own sends stops firing
+ * and the drive hangs at 0 % CPU with everything parked in `kevent64`. It
+ * reproduced on every `bun test` run of the falsifier and disappeared the moment
+ * the wait became a plain sleep. So the consumer polls: a zero-delay turn while
+ * the ring has work (which also gives the arm its macrotask turns), and a 1 ms
+ * park when it is empty. The cost is one timer turn per millisecond of idle, and
+ * `handoffDelay` carries whatever that adds — it is a diagnostic, and no honesty
+ * condition reads it.
+ */
+const RING_IDLE_MS = 1;
 
-/** Longest the emitter parks on an empty ring before re-checking the done flag. */
-const RING_WAIT_MS = 2;
+/**
+ * One clock worker per process, reused across drives.
+ *
+ * A worker per drive was the obvious shape and it is the wrong one: a bench run
+ * makes dozens of drives, and creating and terminating a worker that fast is a
+ * race the harness does not need to win — under load a freshly created worker's
+ * first message was observed to go missing, and the drive then waited on a
+ * handshake that never arrived. One long-lived clock also pays `dlopen` and the
+ * thread start once instead of per rung.
+ *
+ * The worker holds no per-drive state: every drive hands it a fresh ring and
+ * gets one report back. It is `unref`'d while idle so it can never hold a
+ * process open.
+ */
+type ClockHandle = {
+	worker: Worker;
+	/** The worker's clock at handshake. Diagnostic; the epoch is enforced per
+	 *  drive by the drive window, which cannot go stale. */
+	probeNs: number;
+	pending: {
+		resolve: (report: ClockReport) => void;
+		reject: (err: Error) => void;
+	} | null;
+};
+
+let clockHandle: Promise<ClockHandle> | null = null;
+
+function acquireClock(): Promise<ClockHandle> {
+	if (clockHandle) return clockHandle;
+	clockHandle = new Promise<ClockHandle>((resolve, reject) => {
+		const worker = new Worker(
+			new URL("./egress-clock-worker.ts", import.meta.url).href,
+			{ type: "module" },
+		);
+		const handle: ClockHandle = { worker, probeNs: 0, pending: null };
+		let handshaken = false;
+		const die = (err: Error): void => {
+			// A dead clock must not be handed to the next drive.
+			clockHandle = null;
+			handle.pending?.reject(err);
+			handle.pending = null;
+			if (!handshaken) reject(err);
+			worker.terminate();
+		};
+		worker.onmessage = (event: MessageEvent) => {
+			const message = event.data as ClockMessage;
+			if (message.type === "ready") {
+				handshaken = true;
+				handle.probeNs = message.clockProbeNs;
+				worker.unref?.();
+				resolve(handle);
+			} else if (message.type === "report") {
+				const pending = handle.pending;
+				handle.pending = null;
+				pending?.resolve(message);
+			} else {
+				die(new Error(`egress-driver: clock worker: ${message.message}`));
+			}
+		};
+		worker.onerror = (event: ErrorEvent) => {
+			die(new Error(`egress-driver: clock worker failed: ${event.message}`));
+		};
+	});
+	return clockHandle;
+}
+
+/** Tear the clock worker down. A bench calls this once, at the end of a run. */
+export function releaseEgressClock(): void {
+	const handle = clockHandle;
+	clockHandle = null;
+	handle?.then(
+		(h) => h.worker.terminate(),
+		() => {},
+	);
+}
 
 /**
  * Drive one burst profile against a set of send functions for `seconds`, with
@@ -451,6 +534,10 @@ export async function driveProfile(
 	emitter: EgressEmitter,
 	options: DriveOptions,
 ): Promise<OriginatorStats> {
+	const trace = process.env.EGRESS_DRIVER_TRACE
+		? (phase: string) => process.stderr.write(`[drive ${emitter}] ${phase}\n`)
+		: () => {};
+	trace("enter");
 	const sessions = senders.length;
 	const capacity = options.ringCapacity ?? RING_CAPACITY;
 	const sab = createRingBuffer(capacity);
@@ -474,53 +561,29 @@ export async function driveProfile(
 	const inFlight: Array<Promise<void> | null> = new Array(sessions).fill(null);
 	const waiting: Array<PendingEvent | null> = new Array(sessions).fill(null);
 
-	const worker = new Worker(
-		new URL("./egress-clock-worker.ts", import.meta.url).href,
-		{ type: "module" },
-	);
-
-	let onReady: ((m: ClockMessage) => void) | null = null;
-	let onReport: ((m: ClockReport) => void) | null = null;
-	let fail: ((err: Error) => void) | null = null;
-	const ready = new Promise<ClockMessage>((resolve, reject) => {
-		onReady = resolve;
-		fail = reject;
-	});
+	const handle = await acquireClock();
+	trace("clock acquired");
+	if (handle.pending) {
+		throw new Error(
+			"egress-driver: the clock worker is already driving a step",
+		);
+	}
+	let clockFailure: Error | null = null;
+	/** Cleared only on the normal path; anything else tears the clock down, so a
+	 *  half-finished drive can never leave a stale report for the next one. */
+	let completed = false;
 	const reported = new Promise<ClockReport>((resolve, reject) => {
-		onReport = resolve;
-		const previous = fail;
-		fail = (err) => {
-			previous?.(err);
-			reject(err);
+		handle.pending = {
+			resolve,
+			reject: (err) => {
+				clockFailure = err;
+				reject(err);
+			},
 		};
 	});
-	worker.onmessage = (event: MessageEvent) => {
-		const message = event.data as ClockMessage;
-		if (message.type === "ready") onReady?.(message);
-		else if (message.type === "report") onReport?.(message);
-		else fail?.(new Error(`egress-driver: clock worker: ${message.message}`));
-	};
-	worker.onerror = (event: ErrorEvent) => {
-		fail?.(new Error(`egress-driver: clock worker failed: ${event.message}`));
-	};
 
 	try {
-		const handshake = await ready;
-		if (handshake.type !== "ready") {
-			throw new Error("egress-driver: clock worker did not hand shake");
-		}
-		// Both threads must be reading one counter, or `handoffDelay` and the
-		// in-datagram `intended` stamp are nonsense. `Bun.nanoseconds()` is *not*
-		// that counter across threads — its epoch is per-thread — so this guard
-		// exists to catch a caller that passed one.
-		const skewNs = Math.abs(clock.now() - handshake.clockProbeNs);
-		if (!(skewNs < CLOCK_EPOCH_GUARD_NS)) {
-			throw new Error(
-				`egress-driver: driver clock and clock worker are on different epochs ` +
-					`(${(skewNs / 1e6).toFixed(1)} ms apart) — the driver clock must be ` +
-					`CLOCK_MONOTONIC (latency-clock.ts), not Bun.nanoseconds()`,
-			);
-		}
+		handle.worker.ref?.();
 
 		const pump = (index: number): void => {
 			if (inFlight[index] !== null) return;
@@ -556,7 +619,7 @@ export async function driveProfile(
 				});
 		};
 
-		worker.postMessage({
+		handle.worker.postMessage({
 			type: "start",
 			sab,
 			capacity,
@@ -566,10 +629,24 @@ export async function driveProfile(
 			anchorLeadNs: 50_000_000, // 50 ms so every session loop starts armed
 		});
 
+		trace("start posted");
 		let tail = 0;
-		const waitAsync = Atomics.waitAsync as typeof Atomics.waitAsync | undefined;
+		// A clock that dies without setting its done flag must not hang the run:
+		// the drive is bounded, so anything past the drive plus this slack is a
+		// fault to report, never a wait to keep.
+		const deadlineNs =
+			clock.now() + (seconds + 0.05) * 1e9 + Math.max(30e9, seconds * 1e9);
 		while (true) {
+			if (clockFailure) throw clockFailure;
+			if (clock.now() > deadlineNs) {
+				throw new Error(
+					`egress-driver: clock worker did not finish a ${seconds}s drive ` +
+						`(published ${Atomics.load(ctrl, CTRL_HEAD)}, consumed ${tail}, ` +
+						`done=${Atomics.load(ctrl, CTRL_DONE)})`,
+				);
+			}
 			const head = Atomics.load(ctrl, CTRL_HEAD);
+			const drained = head - tail;
 			while (tail < head) {
 				const base = (tail % capacity) * RECORD_FIELDS;
 				const index = records[base + FIELD_SESSION] as number;
@@ -595,25 +672,45 @@ export async function driveProfile(
 			) {
 				break;
 			}
-			if (waitAsync) {
-				const parked = waitAsync(ctrl, CTRL_HEAD, tail, RING_WAIT_MS);
-				if (parked.async) await parked.value;
-				else await Promise.resolve();
-			} else {
-				await Bun.sleep(0);
-			}
+			await Bun.sleep(drained > 0 ? 0 : RING_IDLE_MS);
 		}
 
+		trace("ring drained");
 		const report = await reported;
+		trace("report received");
+		// The clock has stopped; what is left is the arm's own tail. Bounded, and
+		// bounded loudly: a send that never settles must name itself rather than
+		// hang a gate run.
+		const settleDeadlineNs = clock.now() + 60e9;
 		for (let i = 0; i < sessions; i += 1) {
 			while (waiting[i] !== null || inFlight[i] !== null) {
+				if (clock.now() > settleDeadlineNs) {
+					throw new Error(
+						`egress-driver: session ${i} did not settle 60s after the clock ` +
+							`stopped (waiting=${waiting[i] !== null}, inFlight=${inFlight[i] !== null})`,
+					);
+				}
 				const pending = inFlight[i];
 				if (pending) await pending;
-				else await Promise.resolve();
+				else await Bun.sleep(0);
 			}
 		}
+		trace("sends settled");
 		const driveEndNs = clock.now();
+		// The same epoch guard, after the fact and stronger: a drive window that is
+		// negative or wildly longer than the drive means the two threads were not on
+		// one counter, whatever the handshake said.
+		const windowNs = driveEndNs - report.anchorNs;
+		if (!(windowNs > 0 && windowNs < (seconds + 30) * 1e9)) {
+			throw new Error(
+				`egress-driver: driver clock and clock worker are on different epochs ` +
+					`(a ${seconds}s drive measured ${(windowNs / 1e9).toFixed(3)}s) — the ` +
+					`driver clock must be CLOCK_MONOTONIC (latency-clock.ts), not ` +
+					`Bun.nanoseconds()`,
+			);
+		}
 
+		completed = true;
 		return {
 			emitter,
 			sent,
@@ -640,10 +737,12 @@ export async function driveProfile(
 			sendIssueSpread: sendIssueSpread.toJson(),
 			gridPeriodNs: plan.gridPeriodNs,
 			peakWindowDatagrams: peakWindowDatagrams(plan, sessions),
-			driveWindowSec: Math.max(driveEndNs - report.anchorNs, 1) / 1e9,
+			driveWindowSec: windowNs / 1e9,
 		};
 	} finally {
 		Atomics.store(ctrl, CTRL_ABORT, 1);
-		worker.terminate();
+		handle.pending = null;
+		handle.worker.unref?.();
+		if (!completed) releaseEgressClock();
 	}
 }
