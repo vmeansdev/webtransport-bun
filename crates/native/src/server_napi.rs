@@ -311,7 +311,11 @@ impl ServerHandle {
                 let _ = tx.send(());
             }
             crate::rate_limit::cleanup_server_entries(self.server_id);
-            crate::session_registry::close_all_for_owner(self.server_id, 0, b"server closing");
+            crate::session_registry::close_all_for_owner(
+                self.server_id,
+                crate::SERVER_CLOSING_CLOSE_CODE,
+                crate::SERVER_CLOSING_CLOSE_REASON.as_bytes(),
+            );
             self.session_tx
                 .lock()
                 .map_err(|_| napi::Error::from_reason("E_INTERNAL: session tx lock poisoned"))?
@@ -347,6 +351,8 @@ impl ServerHandle {
                 crate::spawn_tracked::server_task_count(self.server_id) as u32;
             snapshot.native_rate_limit_entries =
                 crate::rate_limit::owner_entry_count(self.server_id) as u32;
+            snapshot.native_async_ops_pending =
+                crate::async_ops::owner_pending(self.server_id).min(u32::MAX as u64) as u32;
             let (bidi, uni_send, uni_recv) = crate::client_stream::live_native_stream_handles();
             snapshot.native_bidi_handles_live = bidi as u32;
             snapshot.native_uni_send_handles_live = uni_send as u32;
