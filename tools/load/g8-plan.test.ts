@@ -20,9 +20,9 @@ import {
 	rungPlan,
 	sinkProcessFor,
 	tolerance,
-	voicePayloadBytes,
 	VIDEO_BOUND_NS,
 	VOICE_BOUND_NS,
+	voicePayloadBytes,
 } from "./g8-plan.ts";
 import { STAMP_BYTES_V3 } from "./latency-stamp.ts";
 

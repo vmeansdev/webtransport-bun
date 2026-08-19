@@ -488,8 +488,12 @@ prohibitions on the per-arrival path: no array construction, no `filter`, no
 `sort`, no scan over sessions, no string keys built per arrival. (The W3C
 scheduler's `q.sort()` and linear `includes` per datagram — spec §Lever
 contracts — is the exact cost shape being excluded.) A committed microbench
-asserts per-arrival routing cost is flat from M=10 to M=100; it is a pure
-function and runs off-runner.
+asserts per-arrival routing cost is flat from M=10 to M=100: **the highest M's
+ns-per-arrival may exceed the lowest M's by at most 1.5×**. Tighter than
+V-H(b)'s factor because the microbench has no I/O, no scheduler and no other
+tenant — if an O(1) router cannot look flat there, it is not O(1). It is a pure
+function and runs off-runner. **A missing or single-point microbench fires the
+falsifier**, so the check cannot be silently skipped.
 
 **V-H(b) — the M-dependence discriminator.** `handlerToForward` p99 at the
 largest complete rung of an arm must be `≤ 2 ×` its value at the smallest
@@ -517,11 +521,37 @@ if the forward loop blocks the loop for 5 ms, that 5 ms is inside every
 `roomOneWay` sample and the reader must know. Registered discriminator: the
 probe performs **no send, no await on I/O, and no allocation per tick**.
 
+### V-F — forward shortfall
+
+`forwardShortfall` from `egress-fanout.ts`, G4's registered rule, applied per
+room: the conductor must have issued at least 90% of `ingested × targets`. A
+room whose forwards never happened has a delivery ratio that is a statement
+about the conductor, not the transport.
+
 ### V-N — negative samples
 
 Any histogram with `negative > 0` on a gate quantity makes the rung INVALID.
 One clock, one host: a negative one-way is a clock or a decode defect, not a
 fast packet. Counted, never dropped.
+
+### Which falsifiers invalidate
+
+**V-I, V-S, V-G, V-H(a), V-H(c), V-F and V-N make the rung INVALID.**
+**V-H(b) does not** — it withholds C3 (§8, outcome S3) and leaves the absolute
+clauses standing, because those are end-to-end statements that include the
+conductor honestly.
+
+V-S additionally requires the pre-check to have driven **the rung's own sink
+pool shape**; a pre-check run against a different process count is not a
+statement about this rung's sink and makes the rung INVALID for that reason
+separately from its own outcome.
+
+### One source of truth for the aggregate
+
+`aggregateOneWay` is **derived by merging the per-room histograms**, not
+reported separately by the conductor. C2 and C2b therefore cannot be reading
+different data, and a room missing from the aggregate is a room missing from
+C2b.
 
 ---
 
