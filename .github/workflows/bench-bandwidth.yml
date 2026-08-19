@@ -34,6 +34,36 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "bandwidth (rate ladder, default) | g10-broadcast (mass-broadcast gate)"
+        required: false
+        default: "bandwidth"
+        type: string
+      g10_rate_ladder:
+        description: "g10-broadcast: message-rate ladder. R=50 is wire-excluded and must not be added here; tools/load/g10-plan.ts is what decides."
+        required: false
+        default: "1,5,20"
+        type: string
+      g10_arms:
+        description: "g10-broadcast: A1,A2[,A3]. A3 is dropped with a warning if the candidate exposes no sendDatagramMirror — never a run failure."
+        required: false
+        default: "A1,A2,A3"
+        type: string
+      g10_window_seconds:
+        description: "g10-broadcast: steady window per rung, across which the arms interleave in 10 s blocks"
+        required: false
+        default: "120"
+        type: string
+      g10_offbox_ssh:
+        description: "g10-broadcast: ssh destination of the Mac holding the 10,000 subscribers. EMPTY MEANS CO-RESIDENT, which can never be a G10 result."
+        required: false
+        default: ""
+        type: string
+      g10_server_address:
+        description: "g10-broadcast: the server's address on the bench subnet, as the off-box subscribers dial it"
+        required: false
+        default: "10.99.0.2"
+        type: string
 jobs:
   bench:
     permissions:
@@ -105,7 +135,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'g10-broadcast' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -115,11 +145,37 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
+      # G10: the mass-broadcast gate. Every rate, bound and cable requirement is
+      # derived in tools/load/g10-plan.ts from the scenario constants, so this
+      # workflow carries a ladder, a window and an ssh destination — and no
+      # thresholds at all. Registration:
+      # docs/research/preregistrations/gate-g10-broadcast.md.
+      - name: Run G10 mass-broadcast gate
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g10-broadcast' }}
+        env:
+          G10_RATE_LADDER: ${{ github.event.inputs.g10_rate_ladder }}
+          G10_ARMS: ${{ github.event.inputs.g10_arms }}
+          G10_WINDOW_SECONDS: ${{ github.event.inputs.g10_window_seconds }}
+          G10_OFFBOX_SSH: ${{ github.event.inputs.g10_offbox_ssh }}
+          G10_SERVER_ADDRESS: ${{ github.event.inputs.g10_server_address }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          # The fleet is 10,000 sessions; a low soft limit would look like a
+          # server-side wall if it were not raised.
+          ulimit -n "$(ulimit -Hn)" || true
+          echo "fd soft limit: $(ulimit -n)"
+          if [ -z "${G10_OFFBOX_SSH}" ]; then
+            echo "::warning::G10 ran with CO-RESIDENT subscribers. The registration requires the Mac over the cable; this run is a wiring check and can never be a G10 result."
+          fi
+          G10_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-g10-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-g10.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
-          path: .bench-evidence/bench-bandwidth-*
+          path: |
+            .bench-evidence/bench-bandwidth-*
+            .bench-evidence/bench-g10-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90

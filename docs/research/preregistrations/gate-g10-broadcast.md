@@ -883,8 +883,10 @@ checking whether this gate may dispatch reads this table, not the commit log.
 | `tools/load/g10-emitter.ts` (+ test) | the three arms of §2 over an injected send interface, plus §6.6a's stall instrument — so arm shape, chunk boundary, counters, the optional-mirror resolution and the stall measurement are all testable with no cable and no runner | built, validated off-runner |
 | `tools/load/bench-g10.ts` | the runner-side conductor: fleet establish, the interleave, the emitter, the probe echo, §6.6b's loop sampler, the drain barrier, the artifact | built, **smoke-run on macOS only** — and a macOS smoke run is never a result (§10) |
 | `.github/workflows/bench-bandwidth.yml` `mode: g10-broadcast` | the dispatch surface of §11a step 1 | built |
-| `crates/reference/src/broadcast_client.rs` | the Rust subscriber role the Mac runs: 10,000 sessions, per-sequence receive stamps, the probe cohort's own loop, the spread histogram | **NOT BUILT** |
-| stamp v4 (§6.1) in `tools/load/latency-stamp.ts` and `crates/reference/src/latency_probe.rs` | the arm byte, and classes `BROADCAST`/`PROBE`/`PROBE_ECHO` | **NOT BUILT** |
+| `tools/load/latency-stamp.ts` v4 (+ test) | §6.1's arm byte out of v3's reserved field — still 48 B — plus classes `BROADCAST`/`PROBE`/`PROBE_ECHO`, additively: v1–v3 decode exactly as before | built, validated off-runner |
+| `tools/load/latency-histogram.ts` | the shared log-linear histogram every percentile in this gate is computed by, unchanged from the gate that introduced it | vendored onto this branch |
+| `crates/reference/src/broadcast_client.rs` | the Rust subscriber role the Mac runs: 10,000 sessions, per-sequence receive stamps, the probe cohort's own loop, the spread histogram, the v4 stamp's reader | **NOT BUILT** |
+| `crates/reference/src/latency_probe.rs` v4 | the Rust half of the stamp — the arm byte on the subscriber's side | **NOT BUILT** |
 | `tools/offbox/preflight.ts` + `preflight-lib.ts` | ticket 29's cable pre-flight, which §8's STOP calls | **NOT ON THIS BRANCH** — it lives on `prep/mac-generator-01` and arrives with ticket 29's landing |
 
 **No part of this gate dispatches while any row above says NOT BUILT or NOT ON
@@ -906,10 +908,38 @@ reader does not mistake them for silent edits:
 
 ## 11d. Instrument validation — off-runner, and what it does and does not prove
 
-The commands and their outcomes are recorded in the branch's working notes. They
-prove that the arithmetic on this page reproduces in code and that every clause
-and falsifier fires on the signature it was written for. **They prove nothing
-about the product**, and no number they print is a result.
+Run on the maintainer's macOS arm64 box, before the first dispatch:
+
+| command | outcome |
+|---|---|
+| `bun test tools/load/` | 221 pass, 0 fail |
+| `bun run typecheck` | clean |
+| `bunx biome check tools/load/g10-*.ts tools/load/bench-g10.ts tools/load/latency-stamp*.ts` | clean |
+| `G10_SMOKE=1 G10_SMOKE_FLEET=24 G10_RATE_LADDER=5 G10_ARMS=A1,A2,A3 G10_WINDOW_SECONDS=8 bun tools/load/bench-g10.ts` | conductor ran end to end: A3 resolved absent and the gate degraded to two arms with the registered warning; 40 broadcasts, 960 send attempts, the ledger closed; all eight clauses evaluated on both arms; both stall instruments recorded |
+
+**What the smoke proves.** That the conductor's wiring works: arm resolution,
+the interleave, the deadline-aimed emitter, the stamp, the probe echo path, the
+per-arm ledger, both stall instruments, the falsifiers and the artifact. Nothing
+else.
+
+**What it does not prove, and this is the larger half.** No number it printed is
+a result — the fleet was 24 rather than 10,000, the subscribers were co-resident
+with the emitter and shared its event loop, there was no cable, and macOS is not
+the runner. **Local macOS smoke output is never a result** (§10), and the
+artifact it writes carries that sentence in a field so a stray copy cannot be
+mistaken for one.
+
+**Two defects the smoke caught**, recorded because a passing smoke that found
+nothing would have been the less useful outcome:
+
+1. Clauses **C2b and C6 were never evaluated** by the conductor. Every other
+   clause was, so the artifact looked complete. A gate can only miss a clause it
+   computes.
+2. The emitter polled at a quarter of the message period instead of aiming a
+   timer at each deadline, manufacturing **46 ms of scheduler-handoff lag** out
+   of its own poll granularity. C6 reads that lag and V-A compares it across
+   arms; the instrument would have been reporting itself. Deadline-aimed
+   re-arming brought it to 2–4 ms on an unquiesced laptop.
 
 ## 12. Dispatch log
 
