@@ -111,8 +111,16 @@ export type TunnelCellFacts = {
 	serverCpuPctOfOneCore: number;
 	serverRssMb: number;
 
-	/** The package's process-global diagnostics counter, per end. */
-	crossings: Record<"server" | "client", CrossingFacts>;
+	/**
+	 * The package's process-global diagnostics counter, per end.
+	 *
+	 * The client end is `null` when no addon ran there — Arm T's generator is
+	 * the reference client, which speaks QUIC directly and has no JS boundary to
+	 * cross (Amendment 3). `null` and `0` are different findings and the
+	 * classifier keeps them apart: `0` means an addon ran and batched nothing,
+	 * which V-K grades; `null` means there was nothing to grade.
+	 */
+	crossings: { server: CrossingFacts; client: CrossingFacts | null };
 	/** The harness's own count of server-side reads, for V-C. */
 	harnessServerReadCrossings: number;
 
@@ -262,7 +270,9 @@ export function falsifiersForTunnelCell(
  * first to read the client end at all.
  */
 export function knobProvenanceHolds(facts: TunnelCellFacts): boolean {
-	const ends = [facts.crossings.server, facts.crossings.client];
+	const ends = [facts.crossings.server, facts.crossings.client].filter(
+		(end): end is CrossingFacts => end !== null,
+	);
 	if (facts.knobBytes === 0) {
 		return ends.every(
 			(end) => end.batchedCrossings === 0 && end.maxBatchBytes <= FRAME_BYTES,
@@ -275,8 +285,10 @@ export function knobProvenanceHolds(facts: TunnelCellFacts): boolean {
 }
 
 function knobProvenanceDetail(facts: TunnelCellFacts): string {
-	const fmt = (name: string, end: CrossingFacts) =>
-		`${name}: data ${end.dataCrossings}, batched ${end.batchedCrossings}, max ${end.maxBatchBytes} B`;
+	const fmt = (name: string, end: CrossingFacts | null) =>
+		end === null
+			? `${name}: no addon on this end (Amendment 3), nothing to grade`
+			: `${name}: data ${end.dataCrossings}, batched ${end.batchedCrossings}, max ${end.maxBatchBytes} B`;
 	return `knob ${facts.knobBytes} B — ${fmt("server", facts.crossings.server)}; ${fmt("client", facts.crossings.client)}`;
 }
 
@@ -377,7 +389,7 @@ export function clausesForTunnelCell(facts: TunnelCellFacts): ClauseResult[] {
 	out.push({
 		id: "C9",
 		pass: true,
-		detail: `DISCLOSURE ONLY (graded on nothing): server ${meanBytesPerCrossing(facts.crossings.server).toFixed(1)} B/crossing, client ${meanBytesPerCrossing(facts.crossings.client).toFixed(1)} B/crossing at knob ${facts.knobBytes} B`,
+		detail: `DISCLOSURE ONLY (graded on nothing): server ${meanBytesPerCrossing(facts.crossings.server).toFixed(1)} B/crossing, client ${facts.crossings.client === null ? "no addon on this end (Amendment 3)" : `${meanBytesPerCrossing(facts.crossings.client).toFixed(1)} B/crossing`} at knob ${facts.knobBytes} B`,
 	});
 
 	return out;
