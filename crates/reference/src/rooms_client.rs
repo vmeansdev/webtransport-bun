@@ -811,14 +811,14 @@ fn emit_report(options: &Options, shared: &Shared) {
         rooms,
         errors,
     );
-    match options.json_out.as_ref() {
-        Some(path) => {
-            if let Err(e) = std::fs::write(path, &report) {
-                eprintln!("rooms-client: could not write {path}: {e}");
-                println!("{report}");
-            }
+    // Always on stdout with a prefix the conductor greps for, and additionally
+    // to a file when asked: a report that exists only in a pipe is lost the
+    // moment the pipe is.
+    println!("rooms-client: json {report}");
+    if let Some(path) = options.json_out.as_ref() {
+        if let Err(e) = std::fs::write(path, &report) {
+            eprintln!("rooms-client: could not write {path}: {e}");
         }
-        None => println!("{report}"),
     }
 }
 

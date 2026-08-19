@@ -34,6 +34,41 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "bandwidth (default) or g8-many-rooms"
+        required: false
+        default: "bandwidth"
+        type: string
+      g8_arms:
+        description: "G8 arms to run: voice,video,mutual"
+        required: false
+        default: "voice,video,mutual"
+        type: string
+      g8_ladder_voice:
+        description: "G8 arm A room ladder"
+        required: false
+        default: "10,50,100"
+        type: string
+      g8_ladder_video:
+        description: "G8 arm B room ladder"
+        required: false
+        default: "2,5,10"
+        type: string
+      g8_ladder_mutual:
+        description: "G8 arm C room ladder"
+        required: false
+        default: "2,5,10"
+        type: string
+      g8_drive_seconds:
+        description: "G8 steady drive window per rung"
+        required: false
+        default: "60"
+        type: string
+      g8_precheck_seconds:
+        description: "G8 sink pre-check window per rung (V-S)"
+        required: false
+        default: "20"
+        type: string
 jobs:
   bench:
     permissions:
@@ -104,8 +139,37 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      # G8 (gate-g8-many-rooms.md). Populations, ladders and windows only — no
+      # threshold is settable from here, and the artifact carries raw fields that
+      # `tools/load/g8-report.ts` turns into a verdict off the runner.
+      - name: Build the many-rooms generator
+        if: ${{ github.event.inputs.mode == 'g8-many-rooms' }}
+        run: cargo build --release -p reference --bin rooms-client
+      - name: Run gate G8
+        if: ${{ github.event.inputs.mode == 'g8-many-rooms' }}
+        env:
+          G8_ARMS: ${{ github.event.inputs.g8_arms }}
+          G8_LADDER_VOICE: ${{ github.event.inputs.g8_ladder_voice }}
+          G8_LADDER_VIDEO: ${{ github.event.inputs.g8_ladder_video }}
+          G8_LADDER_MUTUAL: ${{ github.event.inputs.g8_ladder_mutual }}
+          G8_DRIVE_SECONDS: ${{ github.event.inputs.g8_drive_seconds }}
+          G8_PRECHECK_SECONDS: ${{ github.event.inputs.g8_precheck_seconds }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-g8-${{ github.event.inputs.candidate_commit }}.json"
+          G8_OUT="$OUT" bun tools/load/bench-g8.ts
+          bun tools/load/g8-report.ts "$OUT" \
+            | tee "$GITHUB_WORKSPACE/.bench-evidence/bench-g8-${{ github.event.inputs.candidate_commit }}.verdict.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() && github.event.inputs.mode == 'g8-many-rooms' }}
+        with:
+          name: bench-g8-${{ github.event.inputs.candidate_commit }}
+          path: .bench-evidence/bench-g8-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'g8-many-rooms' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -116,7 +180,7 @@ jobs:
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'g8-many-rooms' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: .bench-evidence/bench-bandwidth-*

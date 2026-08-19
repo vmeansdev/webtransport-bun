@@ -157,6 +157,12 @@ export type RungPlan = ArmShape & {
 	/** Bytes per second the forward direction offers. Disclosure, not a gate. */
 	forwardBytesPerSec: number;
 	publisherProcesses: number;
+	/**
+	 * Sessions that receive forwarded media. The subscribers in a broadcast room;
+	 * the members themselves in a mutual one, where the sink pool is not a second
+	 * pool. V-S drives this shape.
+	 */
+	sinkSessions: number;
 	sinkProcesses: number;
 	/** Rooms allowed to be out of spec: `floor(0.01 × M)`. §5. */
 	roomTolerance: number;
@@ -195,6 +201,7 @@ export function rungPlan(arm: G8Arm, rooms: number): RungPlan {
 		totalPerSec: ingestPerSec + forwardPerSec,
 		forwardBytesPerSec: forwardPerSec * shape.payloadBytes,
 		publisherProcesses,
+		sinkSessions: subscribers > 0 ? subscribers : publishers,
 		// A mutual room's members publish *and* receive on the same session, so
 		// its sink pool is not a second pool — it is the publisher pool. Reporting
 		// a separate count would imply an isolation the shape does not have.
