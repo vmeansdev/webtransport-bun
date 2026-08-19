@@ -428,6 +428,10 @@ async function main(): Promise<void> {
 		sessionsClosedByIdle: closeSnapshot.sessionsClosedByIdle ?? null,
 		sessionsClosedByReap: closeSnapshot.sessionsClosedByReap ?? null,
 		sessionsClosedOther: closeSnapshot.sessionsClosedOther ?? null,
+		// Exposure meter for the promise-per-send class: sends that fell back to
+		// the parking (promise) path. Large vs echoed datagrams = the arm never
+		// exercised the promise-free fix and a clean exit proves nothing.
+		datagramSendsAsync: closeSnapshot.datagramSendsAsync ?? null,
 	};
 
 	const result = {
@@ -459,7 +463,7 @@ async function main(): Promise<void> {
 	};
 	writeFileSync(OUT_JSON, `${JSON.stringify(result)}\n`);
 	console.log(
-		`bench-latency: liveness asyncOpsPending=${liveness.nativeAsyncOpsPending ?? "n/a"} registry=${liveness.nativeSessionRegistryEntries ?? "n/a"} closedByIdle=${liveness.sessionsClosedByIdle ?? "n/a"} closedByReap=${liveness.sessionsClosedByReap ?? "n/a"} closedOther=${liveness.sessionsClosedOther ?? "n/a"}`,
+		`bench-latency: liveness asyncOpsPending=${liveness.nativeAsyncOpsPending ?? "n/a"} registry=${liveness.nativeSessionRegistryEntries ?? "n/a"} closedByIdle=${liveness.sessionsClosedByIdle ?? "n/a"} closedByReap=${liveness.sessionsClosedByReap ?? "n/a"} closedOther=${liveness.sessionsClosedOther ?? "n/a"} sendsAsync=${liveness.datagramSendsAsync ?? "n/a"}`,
 	);
 	console.log(`bench-latency: wrote ${OUT_JSON}`);
 }
