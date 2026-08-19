@@ -394,10 +394,21 @@ struct Shared {
     counters: Counters,
     /// Downstream one-way (tunnel) or exchange RTT (exchange).
     latency: Mutex<Histogram>,
-    /// The generator's own honesty clock: actual wake − intended deadline.
-    /// This is the V-G floor, and it is measured off the product's thread by
-    /// construction because this process contains no product code.
+    /// The generator's own honesty clock: actual wake − intended deadline,
+    /// read *before* the write it precedes. This is the V-G floor, and it is
+    /// measured off the product's thread by construction because this process
+    /// contains no product code.
+    ///
+    /// It deliberately excludes the time the write itself took. A `write_all`
+    /// that parks on a full send window is a transport fact, not an instrument
+    /// fault, and folding it in here made V-G fire on cells that were merely
+    /// flow-controlled — which is exactly what Arm D sets out to produce. The
+    /// blocking time is kept separately in `write_settle`, which mirrors the
+    /// `lateness`/`settle` split `tools/load/g11-pacer.ts` already carries.
     scheduler_lag: Mutex<Histogram>,
+    /// write call → write settled, per frame. A disclosure, not a floor: it
+    /// names how long the transport held the writer, and nothing grades it.
+    write_settle: Mutex<Histogram>,
     per_session: Mutex<Vec<SessionTotals>>,
 }
 
@@ -407,6 +418,7 @@ impl Shared {
             counters: Counters::default(),
             latency: Mutex::new(Histogram::new()),
             scheduler_lag: Mutex::new(Histogram::new()),
+            write_settle: Mutex::new(Histogram::new()),
             per_session: Mutex::new(Vec::new()),
         }
     }
@@ -620,11 +632,27 @@ async fn run_tunnel_session(
     // flow-control block is absorbed rather than repaid.
     let mut chunk = vec![b'x'; frame_bytes];
     let mut lag = Histogram::new();
+    let mut settle = Histogram::new();
     let start = Instant::now();
     let mut written: u64 = 0;
     let mut frames_written: u64 = 0;
     let mut write_failed = false;
     while start.elapsed() < duration {
+        // Pace first, then write. `written` is the bytes already on the wire,
+        // so `written / rate` is this frame's own cumulative deadline; the lag
+        // reading is taken here, with nothing but the wake between it and the
+        // deadline it is measured against.
+        if target_bytes_per_sec > 0 {
+            let due = Duration::from_secs_f64(written as f64 / target_bytes_per_sec as f64);
+            let elapsed = start.elapsed();
+            if due > elapsed {
+                tokio::time::sleep(due - elapsed).await;
+            }
+            lag.record_ns_signed(start.elapsed().saturating_sub(due).as_nanos() as i64);
+            if start.elapsed() >= duration {
+                break;
+            }
+        }
         encode_frame(
             &mut chunk,
             Frame {
@@ -636,27 +664,16 @@ async fn run_tunnel_session(
                 send_wall_ns: wall_ns(),
             },
         );
+        let write_started = Instant::now();
         if let Err(e) = send.write_all(&chunk).await {
             shared.counters.streams_err.fetch_add(1, Ordering::Relaxed);
             eprintln!("tunnel-client: session {index} write failed: {e}");
             write_failed = true;
             break;
         }
+        settle.record_ns_signed(write_started.elapsed().as_nanos() as i64);
         written += frame_bytes as u64;
         frames_written += 1;
-
-        if target_bytes_per_sec > 0 {
-            let due = Duration::from_secs_f64(written as f64 / target_bytes_per_sec as f64);
-            let elapsed = start.elapsed();
-            if due > elapsed {
-                tokio::time::sleep(due - elapsed).await;
-                // Lateness of the wake against the deadline it was aiming at.
-                let overshoot = start.elapsed().saturating_sub(due);
-                lag.record_ns_signed(overshoot.as_nanos() as i64);
-            } else {
-                lag.record_ns_signed((elapsed - due).as_nanos() as i64);
-            }
-        }
     }
 
     let mut finished = false;
@@ -680,6 +697,9 @@ async fn run_tunnel_session(
 
     if let Ok(mut global) = shared.scheduler_lag.lock() {
         global.merge(&lag);
+    }
+    if let Ok(mut global) = shared.write_settle.lock() {
+        global.merge(&settle);
     }
     shared
         .counters
@@ -724,6 +744,21 @@ async fn run_exchange_session(
     let mut frames_read: u64 = 0;
 
     while start.elapsed() < duration {
+        // Same ordering as the tunnel writer: pace first, read the lag against
+        // the deadline just woken for, then do the work. An exchange that takes
+        // longer than its own period is an RTT fact — `latency` already carries
+        // it — and must not be re-reported as generator scheduler lag.
+        if exchanges_per_sec > 0.0 {
+            let due = Duration::from_secs_f64(issued as f64 / exchanges_per_sec);
+            let elapsed = start.elapsed();
+            if due > elapsed {
+                tokio::time::sleep(due - elapsed).await;
+            }
+            lag.record_ns_signed(start.elapsed().saturating_sub(due).as_nanos() as i64);
+            if start.elapsed() >= duration {
+                break;
+            }
+        }
         shared
             .counters
             .exchanges_attempted
@@ -759,17 +794,6 @@ async fn run_exchange_session(
             .counters
             .peak_concurrent_bidi_per_session
             .fetch_max(1, Ordering::Relaxed);
-
-        if exchanges_per_sec > 0.0 {
-            let due = Duration::from_secs_f64(issued as f64 / exchanges_per_sec);
-            let elapsed = start.elapsed();
-            if due > elapsed {
-                tokio::time::sleep(due - elapsed).await;
-                lag.record_ns_signed(start.elapsed().saturating_sub(due).as_nanos() as i64);
-            } else {
-                lag.record_ns_signed((elapsed - due).as_nanos() as i64);
-            }
-        }
     }
 
     if let Ok(mut global) = shared.latency.lock() {
@@ -947,6 +971,11 @@ fn summary_json(opts: &Options, shared: &Shared, elapsed: Duration) -> String {
         .lock()
         .map(|h| h.to_json())
         .unwrap_or_else(|_| "null".to_string());
+    let write_settle = shared
+        .write_settle
+        .lock()
+        .map(|h| h.to_json())
+        .unwrap_or_else(|_| "null".to_string());
     format!(
         concat!(
             "{{\"arm\":\"{}\",\"runId\":\"{}\",\"host\":\"{}\",",
@@ -958,7 +987,7 @@ fn summary_json(opts: &Options, shared: &Shared, elapsed: Duration) -> String {
             "\"exchangesAttempted\":{},\"exchangesCompleted\":{},",
             "\"peakConcurrentBidiPerSession\":{},",
             "\"udpRxDatagrams\":{},\"udpTxDatagrams\":{},",
-            "\"perSession\":[{}],\"latency\":{},\"schedulerLag\":{}}}"
+            "\"perSession\":[{}],\"latency\":{},\"schedulerLag\":{},\"writeSettle\":{}}}"
         ),
         match opts.arm {
             Arm::Tunnel => "tunnel",
@@ -988,6 +1017,7 @@ fn summary_json(opts: &Options, shared: &Shared, elapsed: Duration) -> String {
         sessions,
         latency,
         lag,
+        write_settle,
     )
 }
 

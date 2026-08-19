@@ -71,6 +71,15 @@ export type FloorReport = {
 	drivingSessions: number;
 	schedulerLagP99Ms: number;
 	schedulerLagMaxMs: number;
+	/**
+	 * write call → write settled, from the same generator. Pure disclosure: no
+	 * clause reads it. It exists so a cell whose generator was flow-controlled
+	 * can be told apart from one whose generator was late — the two used to be
+	 * summed into `schedulerLag`, which fired V-G on healthy Arm T and Arm D
+	 * cells where blocking is the expected condition.
+	 */
+	writeSettleP99Ms: number | null;
+	writeSettleMaxMs: number | null;
 };
 
 export type CrossingFacts = {

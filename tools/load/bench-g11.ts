@@ -617,6 +617,8 @@ type ClientSummary = {
 	}[];
 	latency: LatencySnapshot;
 	schedulerLag: LatencySnapshot;
+	/** Rust generator only: write call → write settled. Disclosure, not a bar. */
+	writeSettle?: LatencySnapshot;
 	writeLatency?: LatencySnapshot;
 	writeLatencyP99Ms?: number;
 	backpressureTimeouts?: number;
@@ -949,12 +951,15 @@ async function runStep(
 function floorOf(env: StepEnvelope): FloorReport {
 	const c = env.client;
 	const lag = c?.schedulerLag ?? emptySnapshot();
+	const settle = c?.writeSettle ?? null;
 	return {
 		runId: c?.runId ?? "missing",
 		host: c?.host ?? "missing",
 		drivingSessions: c?.drivingSessions ?? 0,
 		schedulerLagP99Ms: percentileMs(lag, 0.99),
 		schedulerLagMaxMs: lag.maxMs,
+		writeSettleP99Ms: settle ? percentileMs(settle, 0.99) : null,
+		writeSettleMaxMs: settle ? settle.maxMs : null,
 	};
 }
 
