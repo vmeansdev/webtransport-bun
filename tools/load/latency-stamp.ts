@@ -81,6 +81,18 @@ export const CLASS_RAID = 4;
  * hello is not load and is excluded from every rate.
  */
 export const CLASS_RAID_JOIN = 5;
+/**
+ * G8's room hello (`gate-g8-many-rooms.md` §3). Same reason as `RAID_JOIN`: the
+ * server surface exposes no request path, so a session states its room id once,
+ * in `sequence`. Not load, and excluded from every rate.
+ */
+export const CLASS_ROOM_JOIN = 6;
+/**
+ * G8's room media. One rule routes it — forward to every other member of the
+ * sender's room — which is `K` targets in a broadcast room and `P − 1` in a
+ * mutual one, with no role for the server to know.
+ */
+export const CLASS_ROOM_MEDIA = 7;
 
 export type LatencyStamp = {
 	intendedNs: number;

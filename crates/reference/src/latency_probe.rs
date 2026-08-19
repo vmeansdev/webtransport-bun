@@ -56,6 +56,14 @@ pub const CLASS_RAID: u8 = 4;
 /// off, so a receive-only session says what it is once. Not load, and excluded
 /// from every rate.
 pub const CLASS_RAID_JOIN: u8 = 5;
+/// G8's room hello (gate-g8-many-rooms.md §3). Same reason as `RAID_JOIN`: the
+/// server surface exposes no request path, so a session states its room id once,
+/// in `sequence`. Not load, and excluded from every rate.
+pub const CLASS_ROOM_JOIN: u8 = 6;
+/// G8's room media. One rule routes it: forward to every other member of the
+/// sender's room. That is `K` targets in a broadcast room and `P − 1` in a
+/// mutual one, with no role for the server to know.
+pub const CLASS_ROOM_MEDIA: u8 = 7;
 
 /// Write the 36-byte header in place. The caller owns the padding beyond it.
 ///
