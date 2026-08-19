@@ -548,7 +548,11 @@ function spawnSubscribers(rate: number, port: number): SpawnedClient {
 	});
 	const child = spawn(cmd, [...cmdArgs], {
 		cwd: ROOT,
-		stdio: ["ignore", "pipe", "pipe"],
+		// stderr is inherited, not piped: a piped stderr nobody drains fills its
+		// 64 KB buffer, ssh then cannot flush the remote's stderr, never exits,
+		// and the conductor waits on an exit that cannot come — every rung
+		// breached its deadline with a perfectly healthy child before this.
+		stdio: ["ignore", "pipe", "inherit"],
 		detached: true,
 	});
 	activeChildren.add(child);
