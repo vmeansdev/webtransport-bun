@@ -35,7 +35,11 @@ export type StopReason =
 	| "sink-precheck-inconclusive"
 	| "ingest-unreal"
 	| "publisher-shortfall"
-	| "forward-shortfall";
+	| "forward-shortfall"
+	// G3b §H6: a gate step whose fragment carries only phase 1's
+	// send-inclusive `originationLag` cannot be judged against the corrected
+	// registration, and is never silently read as if it could.
+	| "legacy-lag-instrument";
 
 export type EgressBucket =
 	| "ok-realtime"
@@ -62,12 +66,33 @@ const MIN_SAMPLES = 10_000;
  * the falsifier's synthetic per-datagram cost: any non-zero value means the run
  * exists to prove the STOP fires, and it may never carry a capacity number.
  */
+/**
+ * The rung fields the classifier reads. G3b splits the phase-1 `passes` boolean
+ * into the rig half and the arm half, because fusing them is how a product
+ * result was reported as a rig incompleteness.
+ */
+export type HeadroomRungJson = {
+	multiplier?: number;
+	schedulerLagP99Ns?: number;
+	sendCallDurationP99Ns?: number;
+	handoffDelayP99Ns?: number;
+	lagBoundNs?: number;
+	lagUnderQuarterGrid?: boolean;
+	emittedFraction?: number;
+	sendEventsDropped?: number;
+	passesRig?: boolean;
+	passesArm?: boolean;
+	failedOn?: "lag" | "skips" | "count" | null;
+	passes?: boolean;
+	[key: string]: unknown;
+};
+
 export type HeadroomFragment = {
 	ceilingPerSec: number;
 	burnNs?: number;
 	/** The arm whose ceiling this is. Absent on pre-G3 fragments (serial). */
 	emitter?: EgressEmitter;
-	rungs: Array<Record<string, unknown>>;
+	rungs: Array<HeadroomRungJson>;
 };
 
 export type Fragment = {
@@ -110,8 +135,20 @@ type RawStep = {
 		sendErrors: number;
 		sendEventsScheduled: number;
 		sendEventsSkipped: number;
+		/** Events the emitter could not take. Absent on pre-G3b fragments. */
+		sendEventsDropped?: number;
 		scheduledDatagrams: number;
-		originationLag: LatencyHistogramJson;
+		/**
+		 * Phase 1's instrument: recorded across `await send(...)`, so it contains
+		 * the product's send time. Present only on pre-G3b fragments, and never
+		 * read as `schedulerLag`.
+		 */
+		originationLag?: LatencyHistogramJson;
+		/** G3b's honesty instrument: scheduler readiness against the grid. */
+		schedulerLag?: LatencyHistogramJson;
+		/** G3b's product-side diagnostics. Never part of an honesty condition. */
+		sendCallDuration?: LatencyHistogramJson;
+		handoffDelay?: LatencyHistogramJson;
 		sendIssueSpread: LatencyHistogramJson;
 		peakWindowDatagrams: number;
 		/** The send grid's period. On fan-out, the publisher's frame interval. */
@@ -187,8 +224,18 @@ export type ClassifiedStep = {
 	coResidenceBound: boolean;
 	oneWay: LatencySummary;
 	endToEnd: LatencySummary | null;
-	originationLag: LatencySummary;
-	originationLagFloorNs: number;
+	/**
+	 * Which instrument the fragment carried. `legacy-send-inclusive` fragments
+	 * predate the G3b correction and cannot be judged by its bound.
+	 */
+	lagInstrument: "scheduler-handoff" | "legacy-send-inclusive" | "absent";
+	/** Whatever lag instrument the fragment carried, named by `lagInstrument`. */
+	schedulerLag: LatencySummary;
+	schedulerLagFloorNs: number;
+	/** Product-side diagnostics, reported and never gating. */
+	sendCallDuration: LatencySummary | null;
+	handoffDelay: LatencySummary | null;
+	sendEventsDropped: number;
 	peakWindowDatagrams: number;
 	sent: number;
 	scheduled: number;
@@ -273,6 +320,16 @@ export function stopFor(
 		return sharedStops(step, residualNs, oneWay, endToEnd);
 	}
 
+	// G3b §H6. Only the gate shape is held to the corrected instrument: it is the
+	// only shape whose registration is written against it, and reclassifying the
+	// other axes' fragments as incomplete would be a silent scope change.
+	if (
+		step.shape === "gate" &&
+		lagInstrumentOf(step.originator) !== "scheduler-handoff"
+	) {
+		return "legacy-lag-instrument";
+	}
+
 	// `sendEventsScheduled` is every grid event the plan put inside the step,
 	// run and skipped alike, so this ratio is the registered `skipped/scheduled`
 	// and not `skipped/ran`.
@@ -326,6 +383,30 @@ function sharedStops(
 	return null;
 }
 
+type RawOriginator = RawStep["originator"];
+
+/**
+ * Which lag instrument a fragment carried.
+ *
+ * The two are different quantities — phase 1's was recorded across
+ * `await send(...)` and contains the product's send time — so they are never
+ * merged into one field with one name. A fragment with neither is a shape that
+ * has no JS send grid (fan-out).
+ */
+export function lagInstrumentOf(
+	originator: RawOriginator,
+): "scheduler-handoff" | "legacy-send-inclusive" | "absent" {
+	if (originator.schedulerLag) return "scheduler-handoff";
+	if (originator.originationLag) return "legacy-send-inclusive";
+	return "absent";
+}
+
+function lagHistogramOf(
+	originator: RawOriginator,
+): LatencyHistogramJson | null {
+	return originator.schedulerLag ?? originator.originationLag ?? null;
+}
+
 export function classifySteps(
 	steps: RawStep[],
 	residualNs: number,
@@ -333,7 +414,7 @@ export function classifySteps(
 	// Floor per profile, computed across that profile's whole ladder.
 	const floors = new Map<string, number>();
 	for (const step of steps) {
-		const p99 = summarize(step.originator.originationLag)?.p99Ns ?? 0;
+		const p99 = summarize(lagHistogramOf(step.originator))?.p99Ns ?? 0;
 		if (p99 <= 0) continue;
 		// The floor never crosses an arm (gate-g3 §H3): taking it across arms
 		// would let a cheap arm's floor make an expensive arm's honest behaviour
@@ -346,8 +427,9 @@ export function classifySteps(
 		const oneWay = summarize(step.client?.egressOneWay ?? null);
 		const endToEnd = summarize(step.client?.endToEnd ?? null);
 		const lag =
-			summarize(step.originator.originationLag) ??
+			summarize(lagHistogramOf(step.originator)) ??
 			new LatencyHistogram().summary();
+		const instrument = lagInstrumentOf(step.originator);
 		const floor =
 			floors.get(`${step.shape}:${step.profile}:${emitterOf(step)}`) ?? 0;
 		const stop = stopFor(step, residualNs, floor, oneWay, endToEnd, lag);
@@ -393,8 +475,12 @@ export function classifySteps(
 				(step.downDeliveryRatio ?? 1) < CO_RESIDENCE_DELIVERY,
 			oneWay: resolved,
 			endToEnd,
-			originationLag: lag,
-			originationLagFloorNs: floor,
+			lagInstrument: instrument,
+			schedulerLag: lag,
+			schedulerLagFloorNs: floor,
+			sendCallDuration: summarize(step.originator.sendCallDuration ?? null),
+			handoffDelay: summarize(step.originator.handoffDelay ?? null),
+			sendEventsDropped: step.originator.sendEventsDropped ?? 0,
 			peakWindowDatagrams: step.originator.peakWindowDatagrams,
 			sent: step.originator.sent,
 			scheduled: step.originator.scheduledDatagrams,
@@ -929,6 +1015,19 @@ export type GateG3Verdict = {
 		/** H1/H2's arm-level STOP — per-arm, so it has no block to sit in. */
 		armStop: RunVerdict["stop"];
 		stops: Array<{ block: number | null; stop: StopReason | null }>;
+		/** G3b §H6: which instrument the batch arm's fragments carried. */
+		lagInstrument: ClassifiedStep["lagInstrument"] | null;
+		/**
+		 * G3b §3.4: true when arm (c)'s headroom lag cleared the half-period bound
+		 * but not the quarter-period diagnostic, i.e. the PASS depends on the
+		 * registered choice of `T/2`. Written on the face of the verdict, always.
+		 */
+		halfPeriodDependent: boolean;
+		/**
+		 * G3b §4: why each arm's headroom control stopped, kept as a rig-vs-arm
+		 * distinction rather than one fused boolean.
+		 */
+		headroomFailedOn: Partial<Record<EgressEmitter, "lag" | "skips" | "count">>;
 	};
 	/** C2 — egressOneWay p99 under the frame gate, on the batch arm. */
 	c2: {
@@ -969,6 +1068,7 @@ export function gateVerdictG3(
 	runs: RunVerdict[],
 	gsoRead: boolean,
 	profile: EgressProfile = "frame-bursty",
+	headrooms: HeadroomFragment[] = [],
 ): GateG3Verdict {
 	const gateSteps = steps.filter(
 		(s) => s.shape === "gate" && s.profile === profile,
@@ -992,6 +1092,27 @@ export function gateVerdictG3(
 	const armStop = runs.find((r) => r.emitter === "batch")?.stop ?? null;
 	const c1Pass =
 		blocks > 0 && completeBlocks === batch.length && honest("batch");
+
+	const lagInstrument = batch[0]?.lagInstrument ?? null;
+	// G3b §4: the two halves of the old `passes` boolean, kept apart. `lag`/`skips`
+	// is a statement about the rig, `count` is a statement about that emitter.
+	const headroomFailedOn: Partial<
+		Record<EgressEmitter, "lag" | "skips" | "count">
+	> = {};
+	for (const fragment of headrooms) {
+		const arm = fragment.emitter ?? "serial";
+		const failed = fragment.rungs.find((r) => r.failedOn);
+		if (failed?.failedOn) headroomFailedOn[arm] = failed.failedOn;
+	}
+	// G3b §3.4: a PASS that rests on the half-period choice says so. The last
+	// rung arm (c) passed is the one its ceiling came from.
+	const batchRungs =
+		headrooms.find((h) => (h.emitter ?? "serial") === "batch")?.rungs ?? [];
+	const lastPassing = [...batchRungs].reverse().find((r) => r.passes === true);
+	const halfPeriodDependent =
+		c1Pass &&
+		lastPassing !== undefined &&
+		lastPassing.lagUnderQuarterGrid === false;
 
 	const p99s = batch.filter((s) => s.complete).map((s) => s.oneWay.p99Ns / MS);
 	const stat = orderStatistic(p99s);
@@ -1039,6 +1160,9 @@ export function gateVerdictG3(
 			completeBlocks,
 			armStop,
 			stops: batch.map((s) => ({ block: s.block, stop: s.stop })),
+			lagInstrument,
+			halfPeriodDependent,
+			headroomFailedOn,
 		},
 		c2: {
 			verdict: c2Verdict,
@@ -1142,7 +1266,11 @@ export function classify(fragments: Fragment[]) {
 			compareEmitters(steps, p, "pipelined", "serial"),
 		]),
 		gateG3:
-			gateSteps.length > 0 ? gateVerdictG3(steps, runs, gso !== null) : null,
+			gateSteps.length > 0
+				? gateVerdictG3(steps, runs, gso !== null, "frame-bursty", [
+						...headroomByEmitter.values(),
+					])
+				: null,
 		fanout: summarizeFanout(steps),
 		steps,
 	};
