@@ -489,3 +489,44 @@ registration)*
 ## 11. Verdict
 
 *(open — no run has been made under this registration)*
+
+---
+
+## 12. Amendments
+
+Every amendment is made **before any dispatch under this registration** — the
+§9 log is empty at each one — and each quotes what it changes.
+
+### Amendment 1 — the handoff slot has depth one, not zero (pre-run)
+
+§2.2 as written said:
+
+> if the emitter is still busy with the previous event, the event is **dropped**
+> and counted in `sendEventsDropped` — never queued, never caught up.
+
+Implementing it exposed an accounting error in that rule, and it is corrected
+here rather than discovered in a verdict. Drop-on-busy makes the emitted
+fraction discontinuous in the emitter's cost: an arm needing 1.05 T per event
+can genuinely source 1/1.05 = 95 % of the registered rate — and did, in phase 1,
+where the awaiting loop measured exactly that — but under drop-on-busy it would
+alternate run/drop and report 50 %. H2's bar is 0.95, so the rule would have
+converted a 5 % shortfall into a 50 % one and failed arms that can source the
+load.
+
+**The rule as implemented:** one event is in flight and at most one waits behind
+it. An event arriving with the waiting slot free is queued and taken the instant
+the emitter frees; an event arriving with the slot already occupied is dropped
+and counted in `sendEventsDropped`. So an arm slower than the grid emits back to
+back exactly as the awaiting loop made it, and its sourcing shows up as a rate.
+
+What this does **not** change is the property the correction exists for: the
+timing loop still never awaits the emitter, so `schedulerLag` is still read at a
+moment no product call can delay. The one thing the queue introduces —
+scheduler-ready → the emitter actually taking the event — is recorded as its own
+third instrument, `handoffDelay`, reported for every arm and part of **no**
+honesty condition. Nothing in §3 (the bound), §4 (H1/H2/H2b) or §6 (the clauses)
+moves.
+
+Pinned by `tools/load/egress-driver.test.ts`: an emitter slower than the grid
+produces `sendEventsDropped > 0` with the skip counter still inside its own bar,
+and the counts close (`scheduled = skipped + dropped + sent + errors`).
