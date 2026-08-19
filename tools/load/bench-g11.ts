@@ -1030,7 +1030,10 @@ function tunnelFacts(env: StepEnvelope): TunnelCellFacts {
 
 		floor: floorOf(env),
 		hostCpuMedianPctOfBox: env.hostCpuMedianPct ?? Number.NaN,
-		clientCpuPctOfOneCore: env.clientCpuPct ?? 0,
+		// NaN, not 0: an unsampled client is un-evaluable, and V-S2 fires on it.
+		// A 0 here is the idlest possible client, which clears every ceiling by
+		// construction.
+		clientCpuPctOfOneCore: env.clientCpuPct ?? Number.NaN,
 		// The generator is multi-threaded tokio, so its honest ceiling is every
 		// core on the box. Stated rather than assumed: V-S2 only means anything
 		// against the ceiling the process can actually reach.

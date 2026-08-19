@@ -219,31 +219,57 @@ export function falsifiersForTunnelCell(
 		});
 	}
 
+	// An unmeasured reading is not a passing reading. `median()` returns null
+	// when no sample survived — a cell shorter than two sample intervals, or one
+	// killed early, produces exactly that — and `NaN > bar` is false, so the
+	// unmeasured case used to read as "comfortably under the bar".
+	const hostCpuMeasured = Number.isFinite(facts.hostCpuMedianPctOfBox);
 	results.push({
 		id: "V-S",
-		fired: facts.hostCpuMedianPctOfBox > HOST_CPU_BAR_PCT_OF_BOX,
-		detail: `host CPU median ${facts.hostCpuMedianPctOfBox}% of box against a ${HOST_CPU_BAR_PCT_OF_BOX}% bar`,
+		fired:
+			!hostCpuMeasured || facts.hostCpuMedianPctOfBox > HOST_CPU_BAR_PCT_OF_BOX,
+		detail: hostCpuMeasured
+			? `host CPU median ${facts.hostCpuMedianPctOfBox}% of box against a ${HOST_CPU_BAR_PCT_OF_BOX}% bar`
+			: `host CPU was not measured (no sample survived the cell); the ${HOST_CPU_BAR_PCT_OF_BOX}% bar cannot be cleared by an absent reading`,
 	});
 
 	const offeredShort = DIRECTIONS.some(
 		(dir) => ratio(facts.offeredBytes[dir], targetBytesPerDirection) < 1,
 	);
+	// Same rule as V-S: an absent client-CPU reading is un-evaluable, not clear.
+	// The harness used to substitute 0 for a missing sample, which is the idlest
+	// possible client and can never reach a ceiling.
+	const clientCpuMeasured = Number.isFinite(facts.clientCpuPctOfOneCore);
 	results.push({
 		id: "V-S2",
 		fired:
-			offeredShort &&
-			facts.clientCpuPctOfOneCore >= facts.clientCpuCeilingPctOfOneCore,
-		detail: `client CPU ${facts.clientCpuPctOfOneCore}% against its ${facts.clientCpuCeilingPctOfOneCore}% ceiling while offered < target`,
+			!clientCpuMeasured ||
+			(offeredShort &&
+				facts.clientCpuPctOfOneCore >= facts.clientCpuCeilingPctOfOneCore),
+		detail: clientCpuMeasured
+			? `client CPU ${facts.clientCpuPctOfOneCore}% against its ${facts.clientCpuCeilingPctOfOneCore}% ceiling while offered < target`
+			: `client CPU was not measured; its ${facts.clientCpuCeilingPctOfOneCore}% ceiling cannot be cleared by an absent reading`,
 	});
 
 	const agreement = ratio(
 		facts.crossings.server.dataCrossings,
 		facts.harnessServerReadCrossings,
 	);
+	// V-C is imported from G5b to catch a *disagreeing* instrument, so it has to
+	// catch a silent one too: with a zero denominator `agreement` is NaN and
+	// `Math.abs(NaN - 1) > tol` is false, which left the falsifier quiet in the
+	// one case where a layer produced nothing at all.
+	const bothCounted =
+		Number.isFinite(agreement) &&
+		facts.harnessServerReadCrossings > 0 &&
+		facts.crossings.server.dataCrossings > 0;
 	results.push({
 		id: "V-C",
-		fired: Math.abs(agreement - 1) > CROSSING_AGREEMENT_TOLERANCE,
-		detail: `package dataCrossings ${facts.crossings.server.dataCrossings} vs harness reads ${facts.harnessServerReadCrossings} (${pct(agreement - 1)} apart, tolerance ${pct(CROSSING_AGREEMENT_TOLERANCE)})`,
+		fired:
+			!bothCounted || Math.abs(agreement - 1) > CROSSING_AGREEMENT_TOLERANCE,
+		detail: bothCounted
+			? `package dataCrossings ${facts.crossings.server.dataCrossings} vs harness reads ${facts.harnessServerReadCrossings} (${pct(agreement - 1)} apart, tolerance ${pct(CROSSING_AGREEMENT_TOLERANCE)})`
+			: `instrument produced no crossings: package dataCrossings ${facts.crossings.server.dataCrossings}, harness reads ${facts.harnessServerReadCrossings} — the layers cannot be compared`,
 	});
 
 	results.push({
@@ -572,9 +598,16 @@ export function falsifiersForExchangeCell(
 			detail: `${facts.negativeSamples} negative RTT samples of ${facts.rttSamples}`,
 		},
 		{
+			// Arm X's copy of the tunnel V-S, and of its NaN blindness: the same
+			// `hostCpuMedianPct ?? NaN` reaches both, and an unmeasured host must
+			// not clear the bar here either.
 			id: "V-S",
-			fired: facts.hostCpuMedianPctOfBox > HOST_CPU_BAR_PCT_OF_BOX,
-			detail: `host CPU median ${facts.hostCpuMedianPctOfBox}%`,
+			fired:
+				!Number.isFinite(facts.hostCpuMedianPctOfBox) ||
+				facts.hostCpuMedianPctOfBox > HOST_CPU_BAR_PCT_OF_BOX,
+			detail: Number.isFinite(facts.hostCpuMedianPctOfBox)
+				? `host CPU median ${facts.hostCpuMedianPctOfBox}%`
+				: "host CPU was not measured; an absent reading cannot clear the bar",
 		},
 		{
 			id: "V-L",

@@ -199,11 +199,39 @@ describe("each falsifier rejects the signature it exists for (§4)", () => {
 		expect(fired(facts)).not.toContain("V-S2");
 	});
 
+	test("V-S — an unmeasured host is not a clear host", () => {
+		expect(fired(healthyCell({ hostCpuMedianPctOfBox: Number.NaN }))).toContain(
+			"V-S",
+		);
+	});
+
+	test("V-S2 — an unmeasured generator is not an idle generator", () => {
+		// The cell is otherwise perfect: the offer was met, so the ordinary V-S2
+		// condition is false. Only the absent reading can fire it.
+		expect(fired(healthyCell({ clientCpuPctOfOneCore: Number.NaN }))).toContain(
+			"V-S2",
+		);
+	});
+
 	test("V-C — a lost crossing between the two layers", () => {
 		const facts = healthyCell();
 		facts.harnessServerReadCrossings = Math.floor(
 			facts.crossings.server.dataCrossings * 0.9,
 		);
+		expect(fired(facts)).toContain("V-C");
+	});
+
+	test("V-C — a harness that counted nothing at all", () => {
+		const facts = healthyCell();
+		facts.harnessServerReadCrossings = 0;
+		expect(fired(facts)).toContain("V-C");
+		const result = falsifiersForTunnelCell(facts).find((f) => f.id === "V-C");
+		expect(result?.detail).toContain("instrument produced no crossings");
+	});
+
+	test("V-C — a package that counted nothing at all", () => {
+		const facts = healthyCell();
+		facts.crossings.server.dataCrossings = 0;
 		expect(fired(facts)).toContain("V-C");
 	});
 
@@ -443,6 +471,20 @@ describe("Arm X — the acceptance path", () => {
 	test("V-X2 — an arm that measured the shipped per-session stream cap", () => {
 		const facts = healthyExchange({ peakConcurrentBidiPerSession: 200 });
 		expect(rollUpExchangeArm(facts).verdict).toBe("INVALID");
+	});
+
+	test("V-S — an unmeasured host refuses the exchange cell too", () => {
+		const facts = healthyExchange({ hostCpuMedianPctOfBox: Number.NaN });
+		expect(
+			falsifiersForExchangeCell(facts)
+				.filter((f) => f.fired)
+				.map((f) => f.id),
+		).toEqual(["V-S"]);
+		// V-S is the arm's registered INCOMPLETE route, not its INVALID one — the
+		// point of the fix is that an absent reading takes that route at all
+		// instead of passing straight through to a verdict.
+		expect(rollUpExchangeArm(facts).verdict).toBe("INCOMPLETE");
+		expect(rollUpExchangeArm(facts).verdict).not.toBe("PASS");
 	});
 
 	test("V-W — a killed generator's exchange cell is refused", () => {
