@@ -530,3 +530,11 @@ moves.
 Pinned by `tools/load/egress-driver.test.ts`: an emitter slower than the grid
 produces `sendEventsDropped > 0` with the skip counter still inside its own bar,
 and the counts close (`scheduled = skipped + dropped + sent + errors`).
+
+
+<!-- §9 candidate composition record (orchestrator, pre-dispatch) -->
+Candidate composed 2026-08-19: probe/egress-01 rebased onto rebind4-staging
+@ 2a4145d0556a35f8b4a0849e5953927b5e028b64 (levers + 3993 formalization +
+ticket-23 hardening incl. the one-deadline and spawn_counted fixes in arm (c)'s
+call path). Rebased head = candidate: 066a342f92af (from git rev-parse).
+Pre-rebase head acfff6a preserved at keep/egress-01-g3b-pre23.
