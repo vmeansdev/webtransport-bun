@@ -29,13 +29,43 @@ on:
         required: false
         default: "27,54,109,217,326,435"
         type: string
+      g11_arms:
+        description: "g11-bidi mode: comma-separated arms (T=tunnel, X=acceptance, J=addon-both-ends, D=cross-direction budget probe)"
+        required: false
+        default: "T,X,J,D"
+        type: string
+      g11_cells:
+        description: "g11-bidi mode: explicit comma-separated cell list; overrides g11_arms. Every cell must be registered at this invocation's knob state"
+        required: false
+        default: ""
+        type: string
+      g11_step_seconds:
+        description: "g11-bidi mode: seconds of drive per Arm T / Arm J cell"
+        required: false
+        default: "60"
+        type: string
+      g11_exchange_step_seconds:
+        description: "g11-bidi mode: seconds of drive per Arm X cell"
+        required: false
+        default: "30"
+        type: string
+      g11_coupling_step_seconds:
+        description: "g11-bidi mode: seconds of drive per Arm D cell"
+        required: false
+        default: "30"
+        type: string
+      g11_repeats:
+        description: "g11-bidi mode: repeats of the gate cell T-100 (the registration says 2)"
+        required: false
+        default: "2"
+        type: string
       probe_only:
         description: "Run only the GSO/GRO host probe, skip the ladder"
         required: false
         default: "false"
         type: string
       mode:
-        description: "bandwidth (datagram ladder, default), stream (stream-throughput axis), gate-g5 (gate G5, unpaced), or gate-g5b (gate G5 paced; both gates take no tunable inputs — their config is pre-registered)"
+        description: "bandwidth (datagram ladder, default), stream (stream-throughput axis), gate-g5 (gate G5, unpaced), gate-g5b (gate G5 paced), or g11-bidi (gate G11, bidirectional tunnels; the gates take no threshold inputs — their bars are pre-registered)"
         required: false
         default: "bandwidth"
         type: string
@@ -117,7 +147,7 @@ jobs:
       # from quinn's own counters, and capability-without-engagement is exactly
       # the silent-fallback case worth catching side by side.
       - name: GSO/GRO host probe
-        if: ${{ github.event.inputs.probe_only == 'true' || github.event.inputs.mode == 'stream' || github.event.inputs.mode == 'gate-g5' || github.event.inputs.mode == 'gate-g5b' }}
+        if: ${{ github.event.inputs.probe_only == 'true' || github.event.inputs.mode == 'stream' || github.event.inputs.mode == 'gate-g5' || github.event.inputs.mode == 'gate-g5b' || github.event.inputs.mode == 'g11-bidi' }}
         run: |
           echo "== kernel =="
           uname -a
@@ -164,7 +194,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'stream' && github.event.inputs.mode != 'gate-g5' && github.event.inputs.mode != 'gate-g5b' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'stream' && github.event.inputs.mode != 'gate-g5' && github.event.inputs.mode != 'gate-g5b' && github.event.inputs.mode != 'g11-bidi' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -274,6 +304,54 @@ jobs:
               "$EV/bench-stream-g5b-knobon-$SHA.json"
 
           sha256sum "$EV"/bench-stream-g5b-*.json
+      # Gate G11 — bidirectional tunnels. Pre-registration:
+      # docs/research/preregistrations/gate-g11-bidi.md
+      #
+      # Populations and windows are inputs; no threshold is. Two invocations,
+      # because WEBTRANSPORT_STREAM_BATCH_BYTES is read once per process and a
+      # cell whose knob state is not what its label says is what V-K rejects:
+      #
+      #   1. knob OFF — the gate cell T-100 (x2) and every ladder, acceptance
+      #      and coupling cell. This invocation is the one that stamps.
+      #   2. knob ON at 65536 — T-100-batch and J-batch, both verdict-free
+      #      disclosure cells (C9 grades nothing).
+      - name: Run gate G11 (bidirectional tunnels)
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g11-bidi' }}
+        env:
+          WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS: "1"
+          G11_ARMS: ${{ github.event.inputs.g11_arms }}
+          G11_STEP_SECONDS: ${{ github.event.inputs.g11_step_seconds }}
+          G11_EXCHANGE_STEP_SECONDS: ${{ github.event.inputs.g11_exchange_step_seconds }}
+          G11_COUPLING_STEP_SECONDS: ${{ github.event.inputs.g11_coupling_step_seconds }}
+          G11_REPEATS: ${{ github.event.inputs.g11_repeats }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          EV="$GITHUB_WORKSPACE/.bench-evidence"
+          SHA="${{ github.event.inputs.candidate_commit }}"
+          RUN_ID="g11-$SHA-${{ github.run_id }}"
+
+          echo "::group::G11 invocation 1 — knob OFF (the gate cell and every ladder)"
+          G11_RUN_ID="$RUN_ID" \
+            G11_CANDIDATE_SHA="$SHA" \
+            G11_STAGING_BASE_SHA="$(git merge-base HEAD origin/rebind4-staging 2>/dev/null || echo unknown)" \
+            G11_CELLS="${{ github.event.inputs.g11_cells }}" \
+            G11_OUT="$EV/bench-g11-knoboff-$SHA.json" \
+            bun tools/load/bench-g11.ts
+          echo "::endgroup::"
+
+          echo "::group::G11 invocation 2 — knob ON at 65536 (T-100-batch, J-batch; verdict-free)"
+          WEBTRANSPORT_STREAM_BATCH_BYTES=65536 \
+            G11_RUN_ID="$RUN_ID" \
+            G11_CANDIDATE_SHA="$SHA" \
+            G11_CELLS="T-100-batch,J-batch" \
+            G11_SKIP_BUILD=1 \
+            G11_BASE_PORT=4620 \
+            G11_OUT="$EV/bench-g11-knobon-$SHA.json" \
+            bun tools/load/bench-g11.ts
+          echo "::endgroup::"
+
+          sha256sum "$EV"/bench-g11-*.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
