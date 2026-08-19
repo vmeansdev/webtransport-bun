@@ -450,3 +450,32 @@ the two boundary reads, four orders of magnitude inside the C4a band.
 No threshold in this document may be moved by anything measured under it. The
 harness is not to be adjusted toward a clause after data exists. This branch is
 never-merge; the gate's product is a stamped verdict and its evidence, not code.
+
+## 12. Maintainer ruling on the stagger re-registration (2026-08-19)
+
+The effort's final adversarial review challenged this gate's PASS on process
+grounds: spec §G1's pre-registered branch authorized re-registering the
+*statement* (the server-side accounting clauses C4a/C4b) when T02 attributed
+the loss to the client/harness — it did not, by its literal text, authorize
+changing the *offered arrival process*, and stagger was selected after the
+synchronized shape was known to measure 0.699.
+
+**Ruling (maintainer, option 2b): the PASS is upheld, and the review's point
+is conceded on the record.** The re-registration exceeded the branch's literal
+authorization. The pass stands because the synchronized impulse was never a
+registered workload property — it was an artifact of the harness releasing all
+sessions on one phase signal (T02: "the 2,000/s label misdescribes the offered
+process"), while the registered scenario (a GPS fleet at 0.2 pps per device)
+is naturally unsynchronized, and the drop mechanism lives in the client-side
+kernel socket before this server's stack sees a packet.
+
+Binding consequences of this ruling:
+
+1. **Aligned-arrival burst tolerance is a named, unmeasured axis.** Every
+   citation of G1's GPS capacity must carry it alongside D1: a wall-clock-
+   synchronized fleet at this session count measured delivery 0.699 (run
+   32192153026 arm A), and no gate covers that shape.
+2. Precedent for future gates: a change to the offered load — arrival shape
+   included — is a re-registration of the gate itself and requires either an
+   explicitly authorizing spec branch or a fresh registration, not an
+   amendment under an adjacent branch.
