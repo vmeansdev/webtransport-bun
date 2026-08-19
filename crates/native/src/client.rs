@@ -291,6 +291,40 @@ impl ClientDatagramSendState {
             }
         }
     }
+
+    /// The non-parking twin of [`send_one`](Self::send_one).
+    ///
+    /// `None` means queued. A full channel is the one condition the parking
+    /// path would have waited out, so it — and only it — reports
+    /// `E_WOULD_BLOCK` for the caller to retry on the promise path.
+    fn try_send_one(&self, bytes: &[u8]) -> Option<&'static str> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Some("E_SESSION_CLOSED");
+        }
+        if bytes.len() > self.max_datagram_size {
+            return Some("E_QUEUE_FULL");
+        }
+        let sz = bytes.len() as u64;
+        if !try_reserve_client_queued_bytes(&self.client_metrics, self.datagram_budget_bytes, sz) {
+            return Some("E_QUEUE_FULL");
+        }
+        match self.tx.try_send(bytes.to_vec()) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(sz, Ordering::Relaxed);
+                Some(crate::session::WOULD_BLOCK)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(sz, Ordering::Relaxed);
+                crate::report_channel_failure("client datagram enqueue");
+                Some("E_SESSION_CLOSED")
+            }
+        }
+    }
 }
 
 /// Clamp a caller-supplied batch size into range. Out-of-range values are
@@ -938,6 +972,31 @@ impl ClientSessionHandle {
             Ok(()) => None,
             Err(error) => Some(error.reason.clone()),
         }
+    }
+
+    /// Send one datagram without creating an N-API promise.
+    ///
+    /// The client twin of `SessionHandle::trySendDatagram`, and for the same
+    /// reason: every async N-API method is backed by a ThreadsafeFunction, and
+    /// a live TSFN is a reference on the *host* event loop, released outside
+    /// anything this addon can observe. A send that does not have to wait needs
+    /// no promise at all.
+    ///
+    /// Returns `null` when the datagram was queued, `"E_WOULD_BLOCK"` when the
+    /// caller must retry on {@link ClientSessionHandle::send_datagram} — the
+    /// only path allowed to wait — or an error code. Never throws.
+    ///
+    /// This is `send_datagram_inner` with the one await removed. The single
+    /// place that path can block is handing the payload to the send channel, so
+    /// that becomes `try_send` and a full channel is the whole of
+    /// `E_WOULD_BLOCK`; every other outcome keeps the parking path's code,
+    /// including the client's deliberate fail-fast on byte budget.
+    #[napi(js_name = "trySendDatagram")]
+    pub fn try_send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Option<String> {
+        let Some(state) = self.datagram_send_state() else {
+            return Some("E_SESSION_CLOSED".to_string());
+        };
+        state.try_send_one(data.as_ref()).map(str::to_string)
     }
 
     async fn send_datagram_inner(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
