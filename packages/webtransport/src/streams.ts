@@ -120,6 +120,35 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 
 	// -- Node stream overrides -----------------------
 
+	/**
+	 * Settle writes issued after the writable has already errored.
+	 *
+	 * `autoDestroy` is false (see the constructor), so a `_write` error leaves
+	 * this stream `errored` but not `destroyed`. Node then buffers every later
+	 * chunk without ever calling `_write` — and therefore without ever calling
+	 * that write's callback. A caller which keeps writing after an error, as a
+	 * paced driver does, waits on a promise nothing will ever settle, with no
+	 * native work outstanding to explain it.
+	 *
+	 * An auto-destroying stream answers those writes with the error instead.
+	 * Do the same, without destroying the readable half — a failure to send says
+	 * nothing about the peer's ability to keep sending, and half-open lifetimes
+	 * are the reason `autoDestroy` is off in the first place.
+	 */
+	override write(
+		chunk: unknown,
+		encoding?: BufferEncoding | ((error?: Error | null) => void),
+		callback?: (error?: Error | null) => void,
+	): boolean {
+		const errored = this.errored;
+		if (errored) {
+			const cb = typeof encoding === "function" ? encoding : callback;
+			if (typeof cb === "function") process.nextTick(cb, errored);
+			return false;
+		}
+		return super.write(chunk as never, encoding as never, callback as never);
+	}
+
 	override _read(_size: number): void {
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) {
