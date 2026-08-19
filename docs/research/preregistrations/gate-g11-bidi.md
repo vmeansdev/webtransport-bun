@@ -614,6 +614,85 @@ same per-stream cadence. If the two ends differ materially, that difference is
 the finding — the client end reads through a read-ahead bridge and the server
 end reads deferred-direct (Amendment 2), and nothing has ever compared them.
 
+### Amendment 4 — four harness facts the build found, each pre-dispatch (2026-08-19)
+
+Found while building and smoking the harness, before any dispatch. **No
+threshold moves, no clause changes, no cell is added or removed.** Four things
+this document assumed about instruments turned out to be different in the tree,
+and each is recorded here rather than discovered in a run's artifact.
+
+**(a) V-K's knob-off condition is about the *server* end, and the harness only
+applies it there.** §4 V-K, quoted in full:
+
+> | **V-K** | knob provenance: knob-off cells have `batchedCrossings` = 0 and
+> `maxBatchBytes` ≤ one QUIC frame; the knob cell has `batchedCrossings` =
+> `dataCrossings` | exact | a cell whose knob state is not what the label says |
+
+"`maxBatchBytes` ≤ one QUIC frame" holds on a **server-accepted** handle, which
+reads deferred-direct: one crossing is one assembler chunk. It does **not** hold
+on an **addon-opened** handle even with the knob off, because the read-ahead
+bridge (Amendment 2) delivers **4 KiB channel chunks**, so a knob-off crossing
+there can legitimately carry several frames. A local wiring check showed exactly
+that: `maxBatchBytes` 1,420 B server-side and 4,096 B client-side in the same
+knob-off cell.
+
+This changes nothing about the gate, and the reason is structural rather than
+lucky: V-K is computed by `rollUpTunnelGate`, which runs on the **gate cell
+only**, and the gate cell's `crossings.client` is `null` (Amendment 3). Arm J
+and Arm D are verdict-free and no falsifier is applied to them. Recorded so that
+a reader of Arm J's disclosure does not mistake a 4 KiB knob-off maximum for a
+knob whose state was mislabelled. It is also a first reading of the two receive
+paths that E5 asks about.
+
+**(b) The client end's stream budget has no JS reader, so Arm D reports it as
+`null` and never as `0`.** §2's measured list, quoted in full:
+
+> Measured per cell: downstream `write()` completion latency distribution, count
+> of `E_BACKPRESSURE_TIMEOUT`, count of stream errors and resets, server
+> `queued_bytes` per session, and delivered bytes both directions.
+
+`queued_bytes` is measurable on the server. On the client it is not: a client
+session's stream budget is built over a `SessionMetrics` created at
+`client.rs:1321` and shared only with `make_budget` (`client.rs:1352`), while
+`metricsSnapshot()` reads `ClientMetrics.queued_bytes` (`client.rs:1170`) — a
+different counter, charged by the datagram budget. The bytes the read-ahead
+bridge holds against the shared per-handle budget therefore have **no JS reader
+on the client end at all**.
+
+Arm D is not disarmed by this: D-P1′ and D-F1′ are stated in terms of write
+latency and `E_BACKPRESSURE_TIMEOUT`, both observable on both ends. What is lost
+is one corroborating figure on one end, and the artifact says
+`peakQueuedBytesBothEnds.client: null` rather than `0` — the all-cells
+drop-disclosure lesson applied to a byte counter.
+
+**(c) Arm D's withhold has to clear the JS-side buffer before it reaches the
+budget.** §2 sizes the slow reader by "a registered per-frame delay, so
+unconsumed inbound reservation grows toward a target fraction `f` of the shipped
+`maxQueuedBytesPerStream` = 262,144 B", computed by
+`consumptionDelayMsForBacklog`. A `BidiStream` is a Node Duplex with a **256 KiB
+`readableHighWaterMark`** (`streams.ts:77`) sitting *in front of* the native
+budget; bytes it absorbs are already consumed as far as the bridge is concerned,
+so their reservations are released. A reader withholding only
+`consumptionDelayMsForBacklog(f × 262,144)` fills the JS buffer and never
+touches the budget the arm exists to load.
+
+The driver therefore withholds for
+`consumptionDelayMsForBacklog(f × 262,144 + 262,144)`. **The registered
+fractions do not move**: they still name a fraction of the shipped
+`maxQueuedBytesPerStream`, and this is what makes the driver actually reach
+them. The high-water mark used travels in every Arm D artifact.
+
+**(d) A teardown race would have charged C4 for stream errors the run did not
+suffer.** When one end observes EOF it may close its session while the peer's
+own `close()` on its write half is still in flight; that close then fails with
+`E_STREAM_RESET`. Smoking Arm D's control cell reproduced it in roughly half of
+runs — on a cell that is meant to be error-free by construction. Both generators
+now wait 500 ms after their last stream completes before closing the connection.
+The delay is entirely outside the drive window and outside every counter either
+generator reports; with it, five consecutive control smokes were clean where
+three of five had been dirty. C4's bar is unchanged, and this is the difference
+between it grading the product and it grading a shutdown ordering.
+
 ## §12 — Run log
 
 *(empty — no dispatch has occurred)*
