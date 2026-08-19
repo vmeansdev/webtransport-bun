@@ -386,9 +386,16 @@ export type HeadroomRung = {
 	shadowEmitted: number;
 	/**
 	 * The honesty instrument (gate-g3b §2.2): scheduler readiness against the
-	 * grid, with no product time in it.
+	 * grid, with no product time in it. Measured on the clock worker's thread,
+	 * so no arrangement of the emitter's work can reach it.
 	 */
 	schedulerLagP99Ns: number;
+	/** Which thread the honesty instrument was read on. V1 is about `worker`. */
+	lagInstrumentThread: OriginatorStats["lagInstrumentThread"];
+	/** Early clock wakes, ranked at zero rather than dropped from the rank. */
+	schedulerEarlyWakes: number;
+	/** Events the emitter thread failed to drain from the ring; charged to the arm. */
+	ringOverflowEvents: number;
 	/** Product-side diagnostics, reported on every rung and gating nothing. */
 	sendCallDurationP99Ns: number;
 	handoffDelayP99Ns: number;
@@ -522,6 +529,9 @@ async function runHeadroomArm(
 			realEmitted,
 			shadowEmitted,
 			schedulerLagP99Ns: p99,
+			lagInstrumentThread: stats.lagInstrumentThread,
+			schedulerEarlyWakes: stats.schedulerEarlyWakes,
+			ringOverflowEvents: stats.ringOverflowEvents,
 			sendCallDurationP99Ns: LatencyHistogram.fromJson(
 				stats.sendCallDuration,
 			).percentile(0.99),
@@ -1383,6 +1393,11 @@ async function main(): Promise<void> {
 				// this used to borrow the field for is `fanout.ingestToForward` and
 				// `forwardLag`, where it is named for what it is.
 				schedulerLag: new LatencyHistogram().toJson(),
+				schedulerEarlyWakes: 0,
+				// No grid, so no clock worker either: this shape has no schedule
+				// thread to be honest or dishonest about.
+				lagInstrumentThread: "none",
+				ringOverflowEvents: 0,
 				handoffDelay: new LatencyHistogram().toJson(),
 				sendCallDuration: fanout.ingestToForward.toJson(),
 				sendIssueSpread: fanout.forwardIssueSpread.toJson(),
