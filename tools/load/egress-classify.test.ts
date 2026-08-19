@@ -70,7 +70,7 @@ function step(
 			sendEventsScheduled: 2_000,
 			sendEventsSkipped: 0,
 			scheduledDatagrams: sent,
-			originationLag: flat(1 * MS, 1000),
+			schedulerLag: flat(1 * MS, 1000),
 			sendIssueSpread: flat(0, 1000),
 			peakWindowDatagrams: 326,
 			driveWindowSec: 45,
@@ -143,7 +143,7 @@ function fanoutStep(
 			sendEventsScheduled: ingested,
 			sendEventsSkipped: 0,
 			scheduledDatagrams: forwarded,
-			originationLag: flat(0.9 * MS, 1000),
+			schedulerLag: flat(0.9 * MS, 1000),
 			sendIssueSpread: flat(0.2 * MS, 1000),
 			peakWindowDatagrams: 11 * subscribers,
 			gridPeriodNs: Math.round(1e9 / 30),
@@ -214,7 +214,7 @@ describe("STOP conditions", () => {
 		const expensive = step({
 			perSessionRate: 815,
 			aggregateRate: 81_500,
-			originator: { ...step().originator, originationLag: flat(4 * MS, 1000) },
+			originator: { ...step().originator, schedulerLag: flat(4 * MS, 1000) },
 		});
 		const out = classifySteps([cheap, expensive], 0);
 		expect(out[0]?.complete).toBe(true);
@@ -763,13 +763,13 @@ describe("gate G3 — the three-arm comparison", () => {
 				gateStep("batch", 0, 2, {
 					originator: {
 						...gateStep("batch", 0, 2).originator,
-						originationLag: flat(1 * MS, 1000),
+						schedulerLag: flat(1 * MS, 1000),
 					},
 				}),
 				gateStep("serial", 0, 2, {
 					originator: {
 						...gateStep("serial", 0, 2).originator,
-						originationLag: flat(6 * MS, 1000),
+						schedulerLag: flat(6 * MS, 1000),
 					},
 				}),
 			],
@@ -778,8 +778,8 @@ describe("gate G3 — the three-arm comparison", () => {
 		expect(steps.map((s) => s.stop)).toEqual([null, null]);
 		// Histogram bucketing rounds a little; the point is that each arm's floor
 		// is its own p99 and not the other arm's.
-		expect(steps[0]?.originationLagFloorNs).toBeCloseTo(1 * MS, -5);
-		expect(steps[1]?.originationLagFloorNs).toBeCloseTo(6 * MS, -5);
+		expect(steps[0]?.schedulerLagFloorNs).toBeCloseTo(1 * MS, -5);
+		expect(steps[1]?.schedulerLagFloorNs).toBeCloseTo(6 * MS, -5);
 	});
 
 	test("the lever delta is paired inside a block and read from the interval", () => {
@@ -905,6 +905,130 @@ describe("gate G3 — the three-arm comparison", () => {
 		expect(g.c1.armStop).toBe("generator-headroom");
 		expect(g.c2.verdict).toBe("INCOMPLETE");
 		expect(g.c3.verdict).toBe("INCOMPLETE");
+	});
+
+	test("G3b H6: a gate step carrying only the phase-1 lag field cannot be judged", () => {
+		// The struck instrument recorded lag across `await send(...)`. A fragment
+		// carrying it is not a G3b measurement and is never silently read as one.
+		const legacy = [0, 1, 2, 3, 4].map((b) => {
+			const raw = gateStep("batch", b, 10);
+			const { schedulerLag, ...rest } = raw.originator;
+			return {
+				...raw,
+				originator: { ...rest, originationLag: schedulerLag },
+			} as RawStep;
+		});
+		const steps = classifySteps(legacy, 0);
+		expect(steps.every((s) => s.stop === "legacy-lag-instrument")).toBe(true);
+		expect(steps[0]?.lagInstrument).toBe("legacy-send-inclusive");
+
+		const g = gateVerdictG3(steps, [runFor("batch", true)], true);
+		expect(g.c1.verdict).toBe("INCOMPLETE");
+		expect(g.c1.lagInstrument).toBe("legacy-send-inclusive");
+		expect(g.c2.verdict).toBe("INCOMPLETE");
+	});
+
+	test("G3b H6: the guard is the gate's, and does not reclassify the other axes", () => {
+		// Only G3b is registered against the corrected instrument; making every
+		// ladder and fan-out fragment in the repo incomplete would be a scope
+		// change nobody registered.
+		const raw = step();
+		const { schedulerLag, ...rest } = raw.originator;
+		const ladder = {
+			...raw,
+			originator: { ...rest, originationLag: schedulerLag },
+		} as RawStep;
+		const steps = classifySteps([ladder], 0);
+		expect(steps[0]?.lagInstrument).toBe("legacy-send-inclusive");
+		expect(steps[0]?.stop).toBeNull();
+	});
+
+	test("G3b §3.4: a PASS resting on the half-period choice says so on its face", () => {
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].map((b) => gateStep("batch", b, 10)),
+			0,
+		);
+		const headroom = (underQuarter: boolean) => [
+			{
+				ceilingPerSec: 100_000,
+				emitter: "batch" as const,
+				rungs: [
+					{
+						multiplier: 0.5,
+						passes: true,
+						passesRig: true,
+						passesArm: true,
+						failedOn: null,
+						lagUnderQuarterGrid: underQuarter,
+					},
+				],
+			},
+		];
+		const dependent = gateVerdictG3(
+			steps,
+			[runFor("batch", true)],
+			true,
+			"frame-bursty",
+			headroom(false),
+		);
+		expect(dependent.c1.verdict).toBe("PASS");
+		expect(dependent.c1.halfPeriodDependent).toBe(true);
+
+		const clear = gateVerdictG3(
+			steps,
+			[runFor("batch", true)],
+			true,
+			"frame-bursty",
+			headroom(true),
+		);
+		expect(clear.c1.halfPeriodDependent).toBe(false);
+	});
+
+	test("G3b §4: the headroom failure keeps its rig-vs-arm attribution", () => {
+		// Phase 1 fused these: an arm that sourced 100.005% of its schedule with
+		// zero skips failed on lag and the miss was written up as a rig finding.
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].map((b) => gateStep("batch", b, 10)),
+			0,
+		);
+		const g = gateVerdictG3(
+			steps,
+			[runFor("batch", false)],
+			true,
+			"frame-bursty",
+			[
+				{
+					ceilingPerSec: 0,
+					emitter: "batch" as const,
+					rungs: [
+						{
+							multiplier: 0.5,
+							passes: false,
+							passesRig: true,
+							passesArm: false,
+							failedOn: "count" as const,
+							emittedFraction: 0.61,
+						},
+					],
+				},
+				{
+					ceilingPerSec: 0,
+					emitter: "serial" as const,
+					rungs: [
+						{
+							multiplier: 0.5,
+							passes: false,
+							passesRig: false,
+							passesArm: true,
+							failedOn: "lag" as const,
+						},
+					],
+				},
+			],
+		);
+		// `count` is a statement about the emitter; `lag` is one about the rig.
+		expect(g.c1.headroomFailedOn.batch).toBe("count");
+		expect(g.c1.headroomFailedOn.serial).toBe("lag");
 	});
 
 	test("C2: an interval straddling the bar is INCONCLUSIVE-AT-BAR, never a pass", () => {
