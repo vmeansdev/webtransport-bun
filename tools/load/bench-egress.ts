@@ -45,10 +45,15 @@ import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	driveProfile,
+	headroomLagBoundNs,
+	type OriginatorStats,
+	quarterGridNs,
+} from "./egress-driver.ts";
+import {
 	createSinkSender,
 	EGRESS_EMITTERS,
 	type EgressEmitter,
-	emitEvent,
 	isEgressEmitter,
 	type SessionSender,
 } from "./egress-emitter.ts";
@@ -66,32 +71,16 @@ import {
 	sinkPrecheckVerdict,
 } from "./egress-fanout.ts";
 import {
-	amplitudeAt,
-	type EgressPlan,
 	type EgressProfile,
-	eventsForSeconds,
 	isEgressProfile,
-	peakWindowDatagrams,
-	phaseNsFor,
 	planFor,
-	scheduledDatagrams,
 } from "./egress-schedule.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	LatencyHistogram,
 	type LatencyHistogramJson,
 } from "./latency-histogram.ts";
-import {
-	decodeStamp,
-	OFFSET_ACTUAL,
-	OFFSET_INTENDED,
-	OFFSET_MAGIC,
-	OFFSET_SEQUENCE,
-	OFFSET_VERSION,
-	STAMP_BYTES,
-	STAMP_MAGIC,
-	STAMP_VERSION,
-} from "./latency-stamp.ts";
+import { decodeStamp, STAMP_BYTES } from "./latency-stamp.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
@@ -212,10 +201,23 @@ const HEADROOM_RATE = parseInt(
 	process.env.EGRESS_HEADROOM_RATE ?? String(Math.max(...RATES)),
 	10,
 );
-/** The pre-registered origination-lag bound for a passing headroom rung. */
-const HEADROOM_LAG_BOUND_NS = 5e6;
+/**
+ * The skip fraction H1 reads. Unchanged from the axis's `generator-saturation`
+ * bar; the lag half of H1 is grid-derived and lives in `headroomLagBoundNs`.
+ */
+const HEADROOM_SKIP_FRACTION = 0.1;
 /** The pre-registered emitted fraction for a passing headroom rung. */
 const HEADROOM_EMITTED_FRACTION = 0.95;
+/**
+ * The falsifier for the headroom arm: a synthetic per-datagram cost in the
+ * originator, so a deliberately starved generator can be shown to trip the STOP
+ * that exists to catch one. Any artifact carrying a non-zero burn is marked
+ * `harness-falsifier` by the classifier and can never carry a capacity number.
+ */
+const HEADROOM_BURN_NS = parseInt(
+	process.env.EGRESS_HEADROOM_BURN_NS ?? "0",
+	10,
+);
 /** Seconds allowed for every subscriber session to hand shake before a step starts. */
 const CONNECT_BUDGET_S = parseInt(process.env.EGRESS_CONNECT_BUDGET ?? "8", 10);
 /** Seconds allowed for the previous step's sessions to close before the next one. */
@@ -366,201 +368,6 @@ function median(values: number[]): number | null {
 	return sorted[Math.floor(sorted.length / 2)] ?? null;
 }
 
-/**
- * One payload buffer with its stamp fields written in place.
- *
- * Fields are written through a retained DataView rather than `encodeStamp` so
- * the hot path allocates nothing at all — the layout still comes from
- * `latency-stamp.ts`, so there is one source of truth for it.
- *
- * Sessions hold a *pool* of these, one per position within a grid event, not
- * one shared buffer: the batched send copies its elements at the call, after
- * every element has been stamped, so a shared buffer would put the last stamp
- * on every datagram in the batch. All three arms use the pool, so no arm is
- * measured against a different allocation shape than another
- * (`docs/research/preregistrations/gate-g3.md` §3.1).
- */
-class StampedPayload {
-	readonly bytes: Uint8Array;
-	private readonly view: DataView;
-
-	constructor(byteLength: number) {
-		if (byteLength < STAMP_BYTES) {
-			throw new Error(`payload must be at least ${STAMP_BYTES} bytes`);
-		}
-		this.bytes = new Uint8Array(byteLength).fill(0x78 /* 'x' */);
-		this.view = new DataView(this.bytes.buffer);
-		this.view.setUint16(OFFSET_MAGIC, STAMP_MAGIC, true);
-		this.view.setUint16(OFFSET_VERSION, STAMP_VERSION, true);
-	}
-
-	stamp(intendedNs: number, actualNs: number, sequence: number): void {
-		writeU64(this.view, OFFSET_INTENDED, intendedNs);
-		writeU64(this.view, OFFSET_ACTUAL, actualNs);
-		writeU64(this.view, OFFSET_SEQUENCE, sequence);
-	}
-}
-
-function writeU64(view: DataView, offset: number, value: number): void {
-	const low = value % 4294967296;
-	view.setUint32(offset, low, true);
-	view.setUint32(offset + 4, (value - low) / 4294967296, true);
-}
-
-export type OriginatorStats = {
-	sent: number;
-	sendErrors: number;
-	/** Every grid event the plan put inside the step — run *and* skipped. */
-	sendEventsScheduled: number;
-	sendEventsSkipped: number;
-	scheduledDatagrams: number;
-	/** intended send → actual send, first datagram of each send event. */
-	originationLag: LatencyHistogramJson;
-	/** first to last datagram inside one send event. */
-	sendIssueSpread: LatencyHistogramJson;
-	gridPeriodNs: number;
-	peakWindowDatagrams: number;
-	/**
-	 * The interval the originator was actually driving, on the shared monotonic
-	 * clock. Every rate divides by this and never by a wall clock that also
-	 * contains the CPU sampler, the client's exit or a process spawn.
-	 */
-	driveWindowSec: number;
-	/** Which originator arm produced these numbers. */
-	emitter: EgressEmitter;
-};
-
-/**
- * The falsifier for the headroom arm: a synthetic per-datagram cost in the
- * originator, so a deliberately starved generator can be shown to trip the STOP
- * that exists to catch one. Any artifact carrying a non-zero burn is marked
- * `harness-falsifier` by the classifier and can never carry a capacity number.
- */
-const HEADROOM_BURN_NS = parseInt(
-	process.env.EGRESS_HEADROOM_BURN_NS ?? "0",
-	10,
-);
-
-function burn(clock: { now(): number }, ns: number): void {
-	if (ns <= 0) return;
-	const end = clock.now() + ns;
-	while (clock.now() < end) {
-		// deliberate busy-wait
-	}
-}
-
-/**
- * Drive one burst profile against a set of send functions for `seconds`.
- *
- * One loop per session, each on its own phase offset — the shape the
- * pre-registration describes. Every grid period is ≥ 5 ms, an order of magnitude
- * above the ~1 ms timer granularity, so the loop cannot become a measurement of
- * `setTimeout`. Missed deadlines are skipped rather than caught up, the way the
- * Rust load client's schedule does, so a backlogged originator cannot run away
- * and reshape the offered load; the skip count is what the
- * `generator-saturation` STOP reads.
- */
-async function driveProfile(
-	plan: EgressPlan,
-	senders: SessionSender[],
-	seconds: number,
-	clock: { now(): number },
-	emitter: EgressEmitter,
-	burnNs = 0,
-): Promise<OriginatorStats> {
-	const sessions = senders.length;
-	const originationLag = new LatencyHistogram();
-	const sendIssueSpread = new LatencyHistogram();
-	let sent = 0;
-	let sendErrors = 0;
-	let eventsRun = 0;
-	let eventsSkipped = 0;
-
-	const anchorNs = clock.now() + 50_000_000; // 50 ms so every loop starts armed
-	const endNs = anchorNs + seconds * 1e9;
-	const events = eventsForSeconds(plan, seconds);
-	// One slot per position inside the largest grid event this plan produces.
-	const poolSize = Math.max(1, ...plan.amplitudes);
-
-	const runSession = async (index: number): Promise<void> => {
-		const sender = senders[index];
-		if (!sender) return;
-		const pool = Array.from(
-			{ length: poolSize },
-			() => new StampedPayload(PAYLOAD_BYTES),
-		);
-		const phaseNs = phaseNsFor(plan, index, sessions);
-		const base = anchorNs + phaseNs;
-		let eventIndex = 0;
-		let sequence = 0;
-
-		while (true) {
-			const intendedNs = base + eventIndex * plan.gridPeriodNs;
-			if (intendedNs >= endNs) break;
-			const waitMs = (intendedNs - clock.now()) / 1e6;
-			if (waitMs > 0) await Bun.sleep(waitMs);
-
-			// Skip whole events we are already past, then send the current one.
-			const behind = Math.floor((clock.now() - intendedNs) / plan.gridPeriodNs);
-			if (behind > 0) {
-				eventsSkipped += behind;
-				eventIndex += behind;
-				const shifted = base + eventIndex * plan.gridPeriodNs;
-				if (shifted >= endNs) break;
-			}
-			const effectiveIntendedNs = base + eventIndex * plan.gridPeriodNs;
-
-			const amplitude = amplitudeAt(plan, index, sessions, eventIndex);
-			eventsRun += 1;
-			const outcome = await emitEvent(
-				emitter,
-				sender,
-				pool,
-				amplitude,
-				effectiveIntendedNs,
-				sequence,
-				// The falsifier's synthetic per-datagram cost is spent *after* the
-				// stamp is read and before the element is handed over, so it lands
-				// inside the originator on every arm — including the batched one,
-				// where there is no per-datagram await to hang it off.
-				() => {
-					const t = clock.now();
-					burn(clock, burnNs);
-					return t;
-				},
-			);
-			sequence += amplitude;
-			sent += outcome.sent;
-			sendErrors += outcome.errors;
-			if (amplitude > 0) {
-				originationLag.record(outcome.firstActualNs - effectiveIntendedNs);
-				sendIssueSpread.record(outcome.lastActualNs - outcome.firstActualNs);
-			}
-			eventIndex += 1;
-		}
-	};
-
-	await Promise.all(senders.map((_, i) => runSession(i)));
-	const driveEndNs = clock.now();
-
-	return {
-		emitter,
-		sent,
-		sendErrors,
-		// Run plus skipped: the denominator the `generator-saturation` STOP is
-		// written against is every grid event the plan put inside the step, not
-		// only the ones that survived to run.
-		sendEventsScheduled: eventsRun + eventsSkipped,
-		sendEventsSkipped: eventsSkipped,
-		scheduledDatagrams: scheduledDatagrams(plan, sessions, events),
-		originationLag: originationLag.toJson(),
-		sendIssueSpread: sendIssueSpread.toJson(),
-		gridPeriodNs: plan.gridPeriodNs,
-		peakWindowDatagrams: peakWindowDatagrams(plan, sessions),
-		driveWindowSec: Math.max(driveEndNs - anchorNs, 1) / 1e9,
-	};
-}
-
 export type HeadroomRung = {
 	/** Sink sessions per real session at this rung. */
 	multiplier: number;
@@ -577,11 +384,29 @@ export type HeadroomRung = {
 	/** Of `emitted`, the part that went through the real transport. */
 	realEmitted: number;
 	shadowEmitted: number;
-	originationLagP99Ns: number;
+	/**
+	 * The honesty instrument (gate-g3b §2.2): scheduler readiness against the
+	 * grid, with no product time in it.
+	 */
+	schedulerLagP99Ns: number;
+	/** Product-side diagnostics, reported on every rung and gating nothing. */
+	sendCallDurationP99Ns: number;
+	handoffDelayP99Ns: number;
+	/** The grid-derived bound this rung's lag was judged against (§3.3). */
+	lagBoundNs: number;
+	/** The quarter-grid diagnostic §3.4 requires whether or not it is convenient. */
+	lagUnderQuarterGrid: boolean;
 	sendEventsSkipped: number;
+	sendEventsDropped: number;
 	sendEventsScheduled: number;
 	driveWindowSec: number;
 	hostCpuPct: number | null;
+	/** H1: the *scheduler* was honest — lag inside the bound, no period skipped. */
+	passesRig: boolean;
+	/** H2: this *arm* sourced the load. A product property, never a rig one. */
+	passesArm: boolean;
+	/** Which half failed, so the two can never be fused again by a later reader. */
+	failedOn: "lag" | "skips" | "count" | null;
 	passes: boolean;
 };
 
@@ -658,13 +483,32 @@ async function runHeadroomArm(
 			HEADROOM_SECONDS,
 			clock,
 			emitter,
-			HEADROOM_BURN_NS,
+			{
+				burnNs: HEADROOM_BURN_NS,
+				payloadBytes: PAYLOAD_BYTES,
+			},
 		);
-		const p99 = LatencyHistogram.fromJson(stats.originationLag).percentile(
-			0.99,
-		);
+		const p99 = LatencyHistogram.fromJson(stats.schedulerLag).percentile(0.99);
 		const fraction =
 			stats.scheduledDatagrams > 0 ? stats.sent / stats.scheduledDatagrams : 0;
+		// H1 and H2 are different questions and are answered separately: a
+		// scheduler that could not hold the grid is a rig finding, an arm that
+		// could not source the load is a product finding, and phase 1 reported the
+		// second as the first (gate-g3b §4).
+		const bound = headroomLagBoundNs(stats.gridPeriodNs);
+		const skipsOk =
+			stats.sendEventsScheduled === 0 ||
+			stats.sendEventsSkipped <
+				HEADROOM_SKIP_FRACTION * stats.sendEventsScheduled;
+		const passesRig = p99 < bound && skipsOk;
+		const passesArm = fraction >= HEADROOM_EMITTED_FRACTION;
+		const failedOn = !skipsOk
+			? ("skips" as const)
+			: p99 >= bound
+				? ("lag" as const)
+				: passesArm
+					? null
+					: ("count" as const);
 		const rung: HeadroomRung = {
 			multiplier,
 			realSessions: counted.length,
@@ -677,17 +521,28 @@ async function runHeadroomArm(
 			emittedFraction: fraction,
 			realEmitted,
 			shadowEmitted,
-			originationLagP99Ns: p99,
+			schedulerLagP99Ns: p99,
+			sendCallDurationP99Ns: LatencyHistogram.fromJson(
+				stats.sendCallDuration,
+			).percentile(0.99),
+			handoffDelayP99Ns: LatencyHistogram.fromJson(
+				stats.handoffDelay,
+			).percentile(0.99),
+			lagBoundNs: bound,
+			lagUnderQuarterGrid: p99 < quarterGridNs(stats.gridPeriodNs),
 			sendEventsSkipped: stats.sendEventsSkipped,
+			sendEventsDropped: stats.sendEventsDropped,
 			sendEventsScheduled: stats.sendEventsScheduled,
 			driveWindowSec: stats.driveWindowSec,
 			hostCpuPct: sampleHostCpu(),
-			passes:
-				fraction >= HEADROOM_EMITTED_FRACTION && p99 < HEADROOM_LAG_BOUND_NS,
+			passesRig,
+			passesArm,
+			failedOn,
+			passes: passesRig && passesArm,
 		};
 		rungs.push(rung);
 		console.log(
-			`bench-egress: headroom m=${multiplier} real=${rung.realSessions} shadow=${shadowSessions} offered=${rung.offeredPerSec.toFixed(0)}/s emitted=${(fraction * 100).toFixed(1)}% (${rung.emittedPerSec.toFixed(0)}/s) lagP99=${(p99 / 1e6).toFixed(2)}ms ${rung.passes ? "ok" : "SATURATED"}`,
+			`bench-egress: headroom m=${multiplier} real=${rung.realSessions} shadow=${shadowSessions} offered=${rung.offeredPerSec.toFixed(0)}/s emitted=${(fraction * 100).toFixed(1)}% (${rung.emittedPerSec.toFixed(0)}/s) schedLagP99=${(p99 / 1e6).toFixed(2)}ms (bound ${(bound / 1e6).toFixed(2)}ms) sendCallP99=${(rung.sendCallDurationP99Ns / 1e6).toFixed(2)}ms ${rung.passes ? "ok" : `STOP:${failedOn}`}`,
 		);
 		if (!rung.passes) break;
 	}
@@ -1169,6 +1024,7 @@ async function main(): Promise<void> {
 			seconds,
 			clock,
 			emitter,
+			{ payloadBytes: PAYLOAD_BYTES },
 		);
 		// Read before the sampler is joined and before the client is reaped, so
 		// the numerator covers the drive window the denominator does.
@@ -1256,7 +1112,9 @@ async function main(): Promise<void> {
 				(oneWay
 					? `p50=${ms(oneWay.p50Ns)}ms p99=${ms(oneWay.p99Ns)}ms p999=${ms(oneWay.p999Ns)}ms neg=${oneWay.negative} `
 					: "no-client-json ") +
-				`peakWindow=${stats.peakWindowDatagrams} skipped=${stats.sendEventsSkipped}/${stats.sendEventsScheduled} host=${median(arm.hostSamples)?.toFixed(0) ?? "n/a"}%`,
+				`peakWindow=${stats.peakWindowDatagrams} skipped=${stats.sendEventsSkipped} dropped=${stats.sendEventsDropped} /${stats.sendEventsScheduled} ` +
+				`schedLagP99=${ms(LatencyHistogram.fromJson(stats.schedulerLag).percentile(0.99))}ms sendCallP99=${ms(LatencyHistogram.fromJson(stats.sendCallDuration).percentile(0.99))}ms ` +
+				`host=${median(arm.hostSamples)?.toFixed(0) ?? "n/a"}%`,
 		);
 	};
 
@@ -1518,8 +1376,15 @@ async function main(): Promise<void> {
 				sendErrors: fanout.forwardErrors,
 				sendEventsScheduled: fanout.stamped,
 				sendEventsSkipped: 0,
+				sendEventsDropped: 0,
 				scheduledDatagrams: fanout.stamped * connected,
-				originationLag: fanout.ingestToForward.toJson(),
+				// There is no JS send grid in this shape, so there is no scheduler
+				// lateness to report and none is invented. The forward-side interval
+				// this used to borrow the field for is `fanout.ingestToForward` and
+				// `forwardLag`, where it is named for what it is.
+				schedulerLag: new LatencyHistogram().toJson(),
+				handoffDelay: new LatencyHistogram().toJson(),
+				sendCallDuration: fanout.ingestToForward.toJson(),
 				sendIssueSpread: fanout.forwardIssueSpread.toJson(),
 				gridPeriodNs,
 				peakWindowDatagrams: perTick * connected,
