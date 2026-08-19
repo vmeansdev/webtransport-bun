@@ -139,7 +139,14 @@ if (role === "recv") {
 			view.setUint32(4, s);
 			// A full socket buffer is the NIC serializing slower than the CPU
 			// offers — yield and resend, so every sequence goes out exactly once.
-			while (!socket.send(payload)) {
+			// Bun reports that as `false` on macOS and as a thrown EAGAIN on
+			// Linux; both mean the same backoff.
+			for (;;) {
+				try {
+					if (socket.send(payload)) break;
+				} catch (err) {
+					if ((err as { code?: string }).code !== "EAGAIN") throw err;
+				}
 				blocked += 1;
 				await new Promise((r) => setTimeout(r, 0));
 			}

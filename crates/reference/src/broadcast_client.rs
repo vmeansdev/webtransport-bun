@@ -733,6 +733,20 @@ async fn run_probe_session(
             if probe_hz <= 0.0 {
                 return;
             }
+            // An ssh session's threads run at background QoS on macOS, where
+            // the scheduler wakes them 5–10 ms late — past the spin window, so
+            // the spin never runs and §7 V-F reads pure scheduler latency
+            // (measured over the cable: p99 7.15 ms against the 2 ms floor).
+            // User-interactive QoS is this thread asking for the wake latency
+            // its deadline grid actually needs; it holds no lock and runs at
+            // probe_hz, so the priority costs nobody anything.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(
+                    libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                    0,
+                );
+            }
             let mut payload = vec![0u8; payload_bytes];
             let mut sequence = 0u64;
             let period = Duration::from_secs_f64(1.0 / probe_hz);
