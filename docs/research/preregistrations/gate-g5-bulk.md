@@ -315,6 +315,7 @@ The axis's STOP conditions 1 (generator saturation), 2 (host saturation), 3
 | # | date | run id | candidate SHA | invocations | outcome | artifact sha256 |
 |---|---|---|---|---|---|---|
 | 1 | 2026-08-19 | [32220018998](https://github.com/vmeansdev/webtransport-bun/actions/runs/32220018998) | `40b220cc0525cea54ddc3c5aaf12c8482bf82c4a` | knoboff · knobon · verdict | **NO-VERDICT** (G-STOP-A), stamped | see below |
+| 2 | 2026-08-19 | [32242618831](https://github.com/vmeansdev/webtransport-bun/actions/runs/32242618831) | `0d32d2784aa7597e2fc86d171427f62081398b7d` | knoboff · knobon · verdict | **ORCHESTRATOR MIS-DISPATCH — not a rerun, licenses nothing** | see below |
 
 Artifact sha256 (all five, as downloaded from `bench-bandwidth-40b220cc0525…`):
 
@@ -327,6 +328,40 @@ Artifact sha256 (all five, as downloaded from `bench-bandwidth-40b220cc0525…`)
 | `bench-stream-g5-verdict-40b220cc…json` | `146aaf50b0d66987dd1e9749315dce06ef4fdfe0c841b3a4993131f04fdda051` |
 
 Every dispatch is logged here, including aborted ones.
+
+### Run 2 — orchestrator mis-dispatch (2026-08-19), logged, licenses nothing
+
+On 2026-08-19 the orchestrator dispatched the **paced** gate's candidate
+(`probe/stream-throughput-01` @ `0d32d2784aa7597e2fc86d171427f62081398b7d`,
+based on staging `2a4145d`) with `mode=gate-g5` instead of `mode=gate-g5b` — an
+input error, disclosed by the orchestrator in ticket 27 and logged here by the
+stamping agent because it executed **this** registration's Arm G.
+
+It reproduced this registration's stamped shape on the newer tree:
+`G-control` 0.864 / 0.866, `G-window-ref` 1.093 / 1.110 (both `gate-cell`),
+`G-batch` 3.890 / 3.861 and `G-window-batch` 3.973 / 3.945, the two knob-ON
+cells `host-saturated` in both repeats — **G-STOP-A, NO-VERDICT**, exactly as
+run 1.
+
+**This is not a rerun and is not offered as one.** This registration is closed:
+run 1 was valid, its NO-VERDICT is final for the effort, and re-running Arm G is
+forbidden by spec §Rerun policy and by this document. Run 2 changes nothing
+here — no verdict, no number, no threshold, no disclosure is revised by it. It
+is recorded so that a reader who finds a second `mode=gate-g5` artifact bundle
+on the runner knows what it is and what it is not. Its outcome does, in passing,
+confirm the design finding this registration closed on — the knob-ON cells cross
+the host bar on this rig at any tree — which is why the paced gate exists.
+
+| file | sha256 |
+|---|---|
+| `bench-stream-g5-knoboff-0d32d278…json` | `8e7d938b98f20700a665b4ef3dfe31d414172ee34204cb115c08142f6284ab63` |
+| `bench-stream-g5-knoboff-0d32d278…csv` | `adb6728ee89e2e080ae3f8f81db3a8536c415ba397e335344e6210e3616edaed` |
+| `bench-stream-g5-knobon-0d32d278…json` | `7a4c6edf064b7ce2e3e613fb7f73617aace97d765749e9f0e17c65ea4b6424ad` |
+| `bench-stream-g5-knobon-0d32d278…csv` | `a0ca19c2c9a30534a9704408b97f3a9a454b1e878530056d9493ce2905934f05` |
+| `bench-stream-g5-verdict-0d32d278…json` | `256b5a8ed50991ac67b4390dd2f4d753abb0ca4e92df25e98669a5ba6686d75d` |
+
+The correct `mode=gate-g5b` dispatch that followed it is run 32244004915, logged
+and stamped against `docs/research/preregistrations/gate-g5b.md`.
 
 ---
 
