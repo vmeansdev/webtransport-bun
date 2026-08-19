@@ -538,7 +538,7 @@ is the recorded cert/TLS lever.
 
 | id | fires when | effect |
 |---|---|---|
-| **V-P** | the arrival clock was not a cumulative-deadline clock: `arrivalsIssued` outside `[0.98, 1.02] × R × steadySec`; **or** `arrivalsIssued ≈ cyclesCompleted` within 0.5% while `meanCycleSec × R > 1` (the completion-driven signature); **or** `inFlightHighWater ≤ 1` while `meanCycleSec × R > 1` | **run INVALID.** No rate claim of any kind |
+| **V-P** | the arrival clock was not a cumulative-deadline clock: `arrivalsIssued` outside `[0.98, 1.02] × R × steadySec` (**the load-bearing reading**); **or** `inFlightHighWater ≤ 1` while `meanCycleSec × R > 1`. A shortfall additionally carries the `poolBound` mechanism annotation when the achieved rate equals `inFlightHighWater / meanCycleSec` and not the clock (Amendment 3) | **run INVALID.** No rate claim of any kind |
 | **V-L (generator reading)** | `acceptRate × clientMeanConnectSec` sits within ±10% of a declared connect-concurrency pool. `connectConcurrency === null` (the registered configuration: no pool) cannot fire it | strips **verdict force** — numbers published as characterization, exactly K1's shape |
 | **V-L (server reading)** | `acceptRate × serverMeanHandshakeSpanSec` ≈ 200 (K19) within ±10% | **not a falsifier — a finding.** Raises `admissionGateBinding`. It is the shipped admission gate doing its job, which is what §1.6b predicted, and it is the same arithmetic as the generator reading landing on a different population. The two are distinguished by *which* population the product lands on, and the classifier reports both |
 | **V-F** | the generator's same-day floor arm on the **actual generator host** shows `scheduleLagP99 > 1.333 ms` (§1.7); or the floor report is from the wrong day, the wrong host, or zero driving sessions | rung **INCOMPLETE** |
@@ -634,6 +634,36 @@ the smallest power of two clearing the factor of ten — was and remains correct
 and 8 stays the registered value; what was wrong was the falsifying case named
 beside it. Corrected to S = 4, and a unit test now pins both sides plus the
 one-sidedness of the bound, so the argument cannot be run backwards again.
+
+### Amendment 3 — V-P's second reading was a steady-state signature, not a pool signature
+
+Original (§7, V-P): *"…**or** `arrivalsIssued ≈ cyclesCompleted` within 0.5%
+while `meanCycleSec × R > 1` (the completion-driven signature)…"*
+
+**That rule fires on every healthy gate cell.** At steady state arrivals and
+completions are equal *by definition* — that is what steady state means. The
+first unit test written against it, on an otherwise perfect arm (72,000 arrivals,
+71,940 completions, 310 in flight), fired the rule.
+
+Restated with the reasoning on the record. Under a permit pool of size P with
+mean cycle L, throughput is `P / L` and in-flight is pinned at P; under clock
+pacing at R, throughput is R whatever L does. **So a pool that binds necessarily
+misses the clock band, and a pool that does not bind is not an artifact.** The
+first reading — the arrival count must be explainable by the wall clock alone —
+is therefore already a complete test, and it is the one that carries V-P.
+
+What replaces the struck rule is a **mechanism annotation**, `poolBound`, which
+speaks only when the clock band has already fired: if the achieved rate equals
+`inFlightHighWater / meanCycleSec` and does not equal R, concurrency was capped
+somewhere and the shortfall's cause is named rather than left open. It cannot
+fire alone, and a unit test pins that it stays silent whenever the clock was met.
+The serialization reading (`inFlightHighWater ≤ 1`) is unchanged; it is kept as
+the degenerate case and as a guard against an `arrivalsIssued` computed from the
+schedule rather than counted at the handoff.
+
+**No threshold moved and V-P's scope is still `run`/INVALID.** What moved is that
+V-P can no longer void an honest run — which is the failure mode a falsifier is
+least able to survive, since a rule that voids everything voids nothing.
 
 The downstream figures are unaffected and were independently correct: 13.33 ms
 per-shard interval, 1.333 ms V-F bound, 0.011% pacer residual, and 3 arrivals
