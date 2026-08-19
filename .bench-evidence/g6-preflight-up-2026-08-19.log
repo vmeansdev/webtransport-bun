@@ -1,0 +1,13 @@
+preflight: udp rung 1/6 at 100 Mbit/s (64 B)
+preflight:   offered=77297pps delivered=77176pps loss=0.157% jitter=0.011ms
+preflight: udp rung 2/6 at 250 Mbit/s (64 B)
+preflight:   offered=80177pps delivered=80018pps loss=0.198% jitter=0.007ms
+preflight: udp rung 3/6 at 500 Mbit/s (64 B)
+preflight:   offered=101126pps delivered=100731pps loss=0.391% jitter=0.006ms
+preflight: udp rung 4/6 at 750 Mbit/s (64 B)
+preflight:   offered=107462pps delivered=107028pps loss=0.404% jitter=0.007ms
+preflight: udp rung 5/6 at 900 Mbit/s (64 B)
+preflight:   offered=107878pps delivered=107333pps loss=0.505% jitter=0.008ms
+preflight: udp rung 6/6 at 1000 Mbit/s (64 B)
+preflight: wrote /private/tmp/claude-501/-Users-vmeansdev-Developer-Codex-Apps-webtransport-bun/f7e8ee1a-04f7-4e2f-b074-2fe3aca95eee/scratchpad/preflight-64.json — mtu=1500 rttP50=1.549ms rttP99=2.583ms tcp=860Mbit/s cleanPps=107028
+preflight: note — iperf3 UDP 1000M failed: Error: iperf3 UDP output has no end.sum 
