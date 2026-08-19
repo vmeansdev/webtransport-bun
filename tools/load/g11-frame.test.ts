@@ -56,6 +56,26 @@ describe("codec", () => {
 		expect(decodeFrame(makeFrame(1, stamp)).sendWallNs).toBe(stamp);
 	});
 
+	test("the header encodes to the exact bytes the Rust generator pins", () => {
+		// The cross-language pin. `crates/reference/src/tunnel_client.rs` has a
+		// unit test asserting this same byte vector for these same field values.
+		// The two ends stamp each other's clocks, so a silent layout drift would
+		// not fail loudly on the wire — it would produce plausible-looking
+		// garbage latencies. One of these two tests fails instead.
+		const bytes = new Uint8Array(24);
+		encodeFrame(bytes, {
+			totalLength: 24,
+			frameClass: FrameClass.TunnelDown,
+			session: 0x01020304,
+			sequence: 0x05060708,
+			sendWallNs: 0x0102030405060708n,
+		});
+		expect(Array.from(bytes.subarray(0, FRAME_HEADER_BYTES))).toEqual([
+			0x18, 0x00, 0x01, 0x01, 0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,
+			0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+		]);
+	});
+
 	test("an exchange frame is smaller and still legal", () => {
 		const decoded = decodeFrame(makeFrame(3, 1n, 120, FrameClass.Request, 900));
 		expect(decoded.totalLength).toBe(120);
