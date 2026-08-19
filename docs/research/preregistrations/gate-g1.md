@@ -369,7 +369,13 @@ happen; an empty row is never removed.
 
 | # | date (UTC) | run id | candidate SHA | staging base SHA | ladder | stagger | outcome | artifact hash |
 |---|---|---|---|---|---|---|---|---|
-| 1 | _pending_ | _pending_ | _pending_ | _pending_ | 100,1000,5000,10000 | true | _pending_ | _pending_ |
+| 1 | 2026-08-19 | _pending dispatch_ | `probe/session-scale-01` head at dispatch — last harness commit `36eddb10b7c6`, filled in by the dispatcher from `git rev-parse` | `5ad02457` (`rebind4-staging` tip) | 100,1000,5000,10000 | true | _pending_ | _pending_ |
+
+**Candidate composition (spec §Process rules).** G1 measures the shipped
+configuration and needs no lever commits, so the probe branch's merge-base with
+`rebind4-staging` already *is* the staging tip (`git merge-base` =
+`5ad02457…` = `git rev-parse rebind4-staging`) and no rebase is required. The
+recorded candidate is the probe head; the branch is never merged back.
 
 Prior runs on this axis, for continuity (they are not G1 dispatches and stamp
 nothing here):
