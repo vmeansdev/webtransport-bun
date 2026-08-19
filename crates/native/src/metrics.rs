@@ -81,6 +81,17 @@ pub struct NativeStreamHandlesSnapshot {
     pub uni_recv_handles_live: u32,
 }
 
+/// The QUIC flow-control snapshot a given limits JSON resolves to. Diagnostic
+/// only: it reports what the transport would be configured with, so callers can
+/// see whether an explicit window took effect or a derived one did.
+#[napi(object)]
+pub struct TransportWindowsSnapshot {
+    pub stream_receive_window: f64,
+    pub receive_window: f64,
+    pub send_window: f64,
+    pub datagram_channel_capacity: f64,
+}
+
 /// Real QUIC transport stats from quinn (wire-level, not facade tallies).
 #[napi(object)]
 pub struct QuicConnectionStats {
