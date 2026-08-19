@@ -482,12 +482,18 @@ Evaluated at the end of the 30 s quiet settle (§1.8). Five parts, all required:
 1. **The ledger closes exactly.**
    `acceptsTotal − sessionsActiveAtSettleEnd == closedByIdle + closedByReap + closedOther`.
    An unexplained difference is a session that ended without being accounted.
-2. `nativeAsyncOpsPending == 0` (K10, the ticket-03 instrument).
+2. `nativeAsyncOpsPending == 0` **after `server.close()` resolves** — ticket
+   03's terminal contract (K10), and the reading run `32209051975` stamped. The
+   same counter at the settle sample is a **disclosure, not a bar**
+   (Amendment 4).
 3. `nativeBidiHandlesLive == 0` **and** `nativeUniSendHandlesLive == 0` **and**
    `nativeUniRecvHandlesLive == 0`. The base uses datagrams only, so zero is the
    correct expectation and not an approximation (§1.2).
-4. `nativeSessionRegistryEntries == baseSessions` and
-   `sessionsActive == baseSessions`.
+4. `nativeSessionRegistryEntries == sessionsActive` **and**
+   `sessionsActive == baseCohortAliveAtSettle` — the registry agrees with the
+   active count, and every session the server still holds belongs to the base
+   cohort. Both halves are read from the server, so neither can fail because the
+   generator fell short; that case is V-B's (Amendment 5).
 5. **No drift during the arm.** Least-squares slope of
    `nativeSessionRegistryEntries` over the steady window, extrapolated across it,
    is under one session: `max(0, slope) × steadySec < 1.0`.
@@ -542,6 +548,7 @@ is the recorded cert/TLS lever.
 | **V-L (generator reading)** | `acceptRate × clientMeanConnectSec` sits within ±10% of a declared connect-concurrency pool. `connectConcurrency === null` (the registered configuration: no pool) cannot fire it | strips **verdict force** — numbers published as characterization, exactly K1's shape |
 | **V-L (server reading)** | `acceptRate × serverMeanHandshakeSpanSec` ≈ 200 (K19) within ±10% | **not a falsifier — a finding.** Raises `admissionGateBinding`. It is the shipped admission gate doing its job, which is what §1.6b predicted, and it is the same arithmetic as the generator reading landing on a different population. The two are distinguished by *which* population the product lands on, and the classifier reports both |
 | **V-F** | the generator's same-day floor arm on the **actual generator host** shows `scheduleLagP99 > 1.333 ms` (§1.7); or the floor report is from the wrong day, the wrong host, or zero driving sessions | rung **INCOMPLETE** |
+| **V-B** | the base tier never reached its configured population: server-observed base cohort < 99% of configured (Amendment 5) | rung **INCOMPLETE** — a generator problem, never a leak or base ill-health |
 | **V-G** | generator saturated: client process CPU ≥ 90% of its available cores over the drive | rung **INCOMPLETE**, never MISS |
 | **V-M** | measured mean cycle lifetime > 2.333 s (§1.6c), i.e. the arm is measuring `max_sessions`; or `sessionsActive` reached `max_sessions` | rung **INCOMPLETE** |
 | **V-C** | instrument inconsistency: the server's partial-span handshake p99 **exceeds** the client's full-span connect p99 on any rung. The partial span is contained in the full span, so this is arithmetically impossible and indicates a clock or instrument fault | rung **INCOMPLETE** |
@@ -581,6 +588,19 @@ INCOMPLETE rather than a MISS.
 Under either host: `offboxSsh` is recorded in the artifact, and a run whose
 `offboxSsh` is null is stamped on its face as the co-resident lower-bound
 variant.
+
+**A limitation of local smoking, registered before the run.** Linux treats the
+whole of `127.0.0.0/8` as local, so the on-box pool binds 64 addresses there.
+**macOS does not** — only `127.0.0.1` exists unless aliases are added by hand —
+so on the design machine every endpoint falls back to the default bind, the pool
+collapses to one source IP, and the shipped per-IP caps (K20, K21) become the
+binding ceiling for both tiers. Every local smoke of this harness therefore
+exercises the *single-source* path, and `distinctSourceIps` reports `0` on those
+runs. **The 64-endpoint pool is first exercised on the runner**, and the
+generator counts its bind failures rather than collapsing quietly, so a run that
+silently lost its pool is visible in the artifact rather than showing up as an
+unexplained rate ceiling. V-B exists partly because this is the shape a
+collapsed pool produces.
 
 ---
 
@@ -669,6 +689,48 @@ The downstream figures are unaffected and were independently correct: 13.33 ms
 per-shard interval, 1.333 ms V-F bound, 0.011% pacer residual, and 3 arrivals
 of deficit per shard against 24 globally at K11's 40.6 ms maximum — all four
 are now pinned by tests.
+
+### Amendments 4 and 5 — two clauses the local smoke proved unmeetable
+
+Both were raised by the first end-to-end local smoke, on a cell where nothing
+was wrong. Neither moves a bar; both move a clause off a quantity it could not
+have measured.
+
+**Amendment 4 — `nativeAsyncOpsPending` at the settle sample.**
+
+Original (§C5 part 2): *"`nativeAsyncOpsPending == 0` (K10, the ticket-03
+instrument)"*, evaluated at the end of the quiet settle.
+
+The settle sample is taken **with the base tier still up** — deliberately, since
+C5 part 4 needs the base sessions to still be there. But every live session
+holds an in-flight N-API read future, so that counter is *supposed* to be
+non-zero then: the smoke read **78** on a clean cell with 39 live base sessions.
+Registered as written, C5 would have failed every valid run.
+
+The bar moves to **after `server.close()` resolves**, which is the only place
+zero is meaningful and is exactly what ticket 03's terminal contract promises —
+"resolves after owned sessions marked closed and native futures settled,
+bounded" — and exactly the reading its confirmation arm (run `32209051975`)
+stamped at zero. The settle-sample value is still published, as a disclosure.
+The conductor now takes a post-close sample for this.
+
+**Amendment 5 — the registry compared against a number the generator controls.**
+
+Original (§C5 part 4): *"`nativeSessionRegistryEntries == baseSessions` and
+`sessionsActive == baseSessions`."*
+
+`baseSessions` there meant the *configured* base population. On the smoke the
+generator established 39 of 200 — a source-IP pool that collapsed to one address
+put the shipped per-IP concurrency cap (K21) in front of the base tier — and C5
+would have reported a **leak** for what was a generator shortfall. A leak clause
+whose failure mode includes "the client couldn't connect" is not a leak clause.
+
+Both halves now read the **server's** own view: the registry must agree with the
+active count, and everything still active must belong to the base cohort. The
+question C5 asks is unchanged and is if anything sharper — *is any churn session
+still registered?* — and it is now answerable no matter what the generator
+managed. The configured-population question moves to a new falsifier, **V-B**,
+which is INCOMPLETE at the cell.
 
 ---
 

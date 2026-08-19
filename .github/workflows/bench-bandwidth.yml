@@ -34,6 +34,31 @@ on:
         required: false
         default: "false"
         type: string
+      mode:
+        description: "ladder (default) or gate-g9 (sustained session churn)"
+        required: false
+        default: "ladder"
+        type: string
+      g9_cells:
+        description: "G9: comma-separated cell ids; empty runs the whole registered plan"
+        required: false
+        default: ""
+        type: string
+      g9_offbox_ssh:
+        description: "G9: ssh target for the off-box generator. Empty is the registered co-resident FALLBACK and its result is a lower bound"
+        required: false
+        default: ""
+        type: string
+      g9_server_address:
+        description: "G9: address the generator reaches this server on"
+        required: false
+        default: "127.0.0.1"
+        type: string
+      g9_bind_prefix:
+        description: "G9: first two octets of the generator's source-address pool (127.0 on-box)"
+        required: false
+        default: "127.0"
+        type: string
 jobs:
   bench:
     permissions:
@@ -105,7 +130,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'gate-g9' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -115,11 +140,31 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-bandwidth.ts
+      # G9: sustained session churn. No threshold lives here — the cells, the
+      # ladder and every bound come from tools/load/g9-plan.ts, which is the
+      # registration mechanized. This step passes populations and hosts only.
+      - name: Build G9 generator
+        if: ${{ github.event.inputs.mode == 'gate-g9' }}
+        run: cargo build --release -p reference --bin churn-client
+      - name: Run G9 sustained-churn gate
+        if: ${{ github.event.inputs.mode == 'gate-g9' }}
+        env:
+          G9_CELLS: ${{ github.event.inputs.g9_cells }}
+          G9_OFFBOX_SSH: ${{ github.event.inputs.g9_offbox_ssh }}
+          G9_SERVER_ADDRESS: ${{ github.event.inputs.g9_server_address }}
+          G9_BIND_PREFIX: ${{ github.event.inputs.g9_bind_prefix }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          G9_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-g9-${{ github.event.inputs.candidate_commit }}.json" \
+            bun tools/load/bench-g9.ts
+          sha256sum "$GITHUB_WORKSPACE"/.bench-evidence/bench-g9-* || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
-          path: .bench-evidence/bench-bandwidth-*
+          path: |
+            .bench-evidence/bench-bandwidth-*
+            .bench-evidence/bench-g9-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90

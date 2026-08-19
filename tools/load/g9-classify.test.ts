@@ -19,6 +19,7 @@ import {
 	clauseC5,
 	clauseC6,
 	clauseLimiter,
+	falsifierBaseTier,
 	falsifierExchangeReality,
 	falsifierFloor,
 	falsifierGenerator,
@@ -238,13 +239,14 @@ describe("C5 leaked sessions and handles", () => {
 		closedByReap: 0,
 		closedOther: 72_200,
 		closedByIdleDuringChurn: 0,
-		nativeAsyncOpsPending: 0,
+		nativeAsyncOpsPendingAfterClose: 0,
+		nativeAsyncOpsPendingAtSettle: 78,
 		nativeBidiHandlesLive: 0,
 		nativeUniSendHandlesLive: 0,
 		nativeUniRecvHandlesLive: 0,
 		nativeSessionRegistryEntries: BASE_SESSIONS,
 		nativeRateLimitEntries: 324,
-		baseSessions: BASE_SESSIONS,
+		baseCohortAliveAtSettle: BASE_SESSIONS,
 		registrySlopePerSec: 0.001,
 		steadySec: 120,
 	};
@@ -259,10 +261,19 @@ describe("C5 leaked sessions and handles", () => {
 		expect(r.reasons.join(" ")).toContain("ledger does not close");
 	});
 
-	test("one unsettled N-API op is a miss — ticket 03's instrument", () => {
-		expect(clauseC5({ ...clean, nativeAsyncOpsPending: 1 }).verdict).toBe(
-			"MISS",
-		);
+	test("one unsettled N-API op AFTER close is a miss — ticket 03's instrument", () => {
+		expect(
+			clauseC5({ ...clean, nativeAsyncOpsPendingAfterClose: 1 }).verdict,
+		).toBe("MISS");
+	});
+
+	test("pending ops at the settle sample are the LIVE base tier, and never a bar", () => {
+		// The local smoke read 78 on a perfectly clean cell: 39 live base
+		// sessions each holding an in-flight read future. A zero bar here would
+		// have been unmeetable by construction.
+		expect(
+			clauseC5({ ...clean, nativeAsyncOpsPendingAtSettle: 4_000 }).verdict,
+		).toBe("PASS");
 	});
 
 	test("one live bidi handle is a miss, which is why the exchange is a stream", () => {
@@ -294,7 +305,7 @@ describe("C5 leaked sessions and handles", () => {
 	});
 
 	test("an unreadable counter is INCOMPLETE and is never booked as its expected value", () => {
-		const r = clauseC5({ ...clean, nativeAsyncOpsPending: null });
+		const r = clauseC5({ ...clean, nativeAsyncOpsPendingAfterClose: null });
 		expect(r.verdict).toBe("INCOMPLETE");
 		expect(r.reasons.join(" ")).toContain("not booked as 0");
 	});
@@ -314,11 +325,37 @@ describe("C5 leaked sessions and handles", () => {
 		);
 	});
 
-	test("registry entries left above the base is a miss", () => {
+	test("the registry disagreeing with the active count is a miss", () => {
 		expect(
 			clauseC5({ ...clean, nativeSessionRegistryEntries: BASE_SESSIONS + 3 })
 				.verdict,
 		).toBe("MISS");
+	});
+
+	test("a churn session still registered after the settle is a miss", () => {
+		const r = clauseC5({
+			...clean,
+			sessionsActiveAtSettleEnd: BASE_SESSIONS + 2,
+			nativeSessionRegistryEntries: BASE_SESSIONS + 2,
+			closedOther: 72_198,
+		});
+		expect(r.verdict).toBe("MISS");
+		expect(r.reasons.join(" ")).toContain("churn session(s) still registered");
+	});
+
+	test("a base tier that fell short is NOT a leak — the registry follows the server", () => {
+		// The generator established 39 of its 200. C5 compares the registry to
+		// what the server holds, so it passes; V-B is what makes the cell
+		// INCOMPLETE.
+		expect(
+			clauseC5({
+				...clean,
+				sessionsActiveAtSettleEnd: 39,
+				nativeSessionRegistryEntries: 39,
+				baseCohortAliveAtSettle: 39,
+				closedOther: 72_361,
+			}).verdict,
+		).toBe("PASS");
 	});
 });
 
@@ -579,6 +616,36 @@ describe("V-F — the generator floor", () => {
 
 	test("no floor at all is refused rather than assumed clean", () => {
 		expect(falsifierFloor({ ...ok, scheduleLagP99Ms: null }).fired).toBe(true);
+	});
+});
+
+describe("V-B — the base tier has to exist before anything can be said about it", () => {
+	test("a base tier that reached its population does not fire", () => {
+		expect(
+			falsifierBaseTier({
+				configuredBaseSessions: 200,
+				serverObservedBaseCohort: 200,
+			}).fired,
+		).toBe(false);
+	});
+
+	test("the local smoke's collapsed pool fires it, as INCOMPLETE and not a miss", () => {
+		const r = falsifierBaseTier({
+			configuredBaseSessions: 200,
+			serverObservedBaseCohort: 70,
+		});
+		expect(r.fired).toBe(true);
+		expect(r.scope).toBe("cell");
+		expect(r.reasons.join(" ")).toContain("never reached its population");
+	});
+
+	test("a cell that carries no base cannot fire it", () => {
+		expect(
+			falsifierBaseTier({
+				configuredBaseSessions: 0,
+				serverObservedBaseCohort: 0,
+			}).fired,
+		).toBe(false);
 	});
 });
 

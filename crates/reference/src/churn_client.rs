@@ -800,9 +800,14 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::new();
 
     if options.role == "base" || options.base_sessions > 0 {
-        // The base outlives the churn: it must still be there when the leak
-        // clause reads the registry at the end of the settle window.
-        let runs_for = options.ramp + options.steady + options.settle;
+        // The base outlives the churn *and* the conductor's settle sample. The
+        // leak clause reads `registryEntries == baseSessions` at the end of the
+        // settle window, and C4 counts base sessions lost — so a base tier that
+        // exits on the same clock as the sample makes both of those read zero
+        // base sessions and pass or fail for the wrong reason. A full extra
+        // settle window of headroom is the margin; the conductor closes the
+        // server, which is what actually ends these sessions.
+        let runs_for = options.ramp + options.steady + options.settle * 2;
         for i in 0..options.base_sessions {
             let endpoint = Arc::clone(&endpoints[i % endpoints.len()]);
             handles.push(tokio::spawn(run_base_session(

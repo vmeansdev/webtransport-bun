@@ -350,13 +350,31 @@ export type LeakFacts = {
 	closedOther: number;
 	/** `sessionsClosedByIdle` accrued over the churn window alone. */
 	closedByIdleDuringChurn: number;
-	nativeAsyncOpsPending: number | null;
+	/**
+	 * `nativeAsyncOpsPending` **after `server.close()` resolved** — ticket 03's
+	 * terminal contract, and the only place zero is a meaningful bar. See the
+	 * note on `nativeAsyncOpsPendingAtSettle`.
+	 */
+	nativeAsyncOpsPendingAfterClose: number | null;
+	/**
+	 * The same counter at the end of the quiet settle, while the base tier is
+	 * still up. **Disclosure only.** A live session legitimately holds an
+	 * in-flight N-API read future, so a zero bar here would be unmeetable by
+	 * construction — the local smoke read 78 on a perfectly clean cell.
+	 */
+	nativeAsyncOpsPendingAtSettle: number | null;
 	nativeBidiHandlesLive: number | null;
 	nativeUniSendHandlesLive: number | null;
 	nativeUniRecvHandlesLive: number | null;
 	nativeSessionRegistryEntries: number | null;
 	nativeRateLimitEntries: number | null;
-	baseSessions: number;
+	/**
+	 * Base-cohort sessions the **server** still holds at the settle sample. C5
+	 * compares the registry against this rather than against the configured base
+	 * size: a generator that could not establish its population is a generator
+	 * problem (V-B) and never a leak.
+	 */
+	baseCohortAliveAtSettle: number;
 	/**
 	 * Least-squares slope of the registry series over the graded window, in
 	 * sessions per second.
@@ -394,12 +412,16 @@ export function clauseC5(f: LeakFacts): ClauseResult {
 		);
 	}
 
-	// 2, 3, 4.
+	// 2. Ticket 03's terminal contract: `close()` resolves after owned sessions
+	// are marked closed and native futures have settled. Anything still pending
+	// then is the addon holding the host event loop, which is the whole reason
+	// the counter exists. Evaluated here and NOT at the settle sample, where the
+	// base tier is deliberately still up and holding legitimate read futures.
 	readable =
 		requireCounter(
 			reasons,
-			"nativeAsyncOpsPending",
-			f.nativeAsyncOpsPending,
+			"nativeAsyncOpsPending (after close)",
+			f.nativeAsyncOpsPendingAfterClose,
 			0,
 		) && readable;
 	readable =
@@ -423,16 +445,20 @@ export function clauseC5(f: LeakFacts): ClauseResult {
 			f.nativeUniRecvHandlesLive,
 			0,
 		) && readable;
+	// 4. The registry agrees with the active count, and every session the server
+	// still holds belongs to the base cohort. Both halves are read from the
+	// server, so neither can fail because the generator fell short — that case is
+	// V-B's, and it is INCOMPLETE rather than a leak.
 	readable =
 		requireCounter(
 			reasons,
 			"nativeSessionRegistryEntries",
 			f.nativeSessionRegistryEntries,
-			f.baseSessions,
+			f.sessionsActiveAtSettleEnd,
 		) && readable;
-	if (f.sessionsActiveAtSettleEnd !== f.baseSessions) {
+	if (f.sessionsActiveAtSettleEnd !== f.baseCohortAliveAtSettle) {
 		reasons.push(
-			`C5: ${f.sessionsActiveAtSettleEnd} sessions active after settle, expected the ${f.baseSessions} base sessions`,
+			`C5: ${f.sessionsActiveAtSettleEnd} sessions active after settle against ${f.baseCohortAliveAtSettle} live base-cohort sessions — ${f.sessionsActiveAtSettleEnd - f.baseCohortAliveAtSettle} churn session(s) still registered`,
 		);
 	}
 
@@ -471,8 +497,11 @@ export function clauseC5(f: LeakFacts): ClauseResult {
 		{
 			ledgerAccountedFor: accountedFor,
 			ledgerShouldBeClosed: shouldBeClosed,
-			asyncOpsPending: f.nativeAsyncOpsPending,
+			asyncOpsPendingAfterClose: f.nativeAsyncOpsPendingAfterClose,
+			// Disclosure. Non-zero here is the live base tier, not a leak.
+			asyncOpsPendingAtSettle: f.nativeAsyncOpsPendingAtSettle,
 			registryEntries: f.nativeSessionRegistryEntries,
+			baseCohortAliveAtSettle: f.baseCohortAliveAtSettle,
 			rateLimitEntries: f.nativeRateLimitEntries,
 			rateLimitEntryBound: RATE_LIMIT_ENTRY_BOUND,
 			registryDriftSessions:
@@ -821,6 +850,39 @@ export function falsifierFloor(input: {
 		fired: reasons.length > 0,
 		reasons,
 		observed: { ...input },
+		scope: "cell",
+	};
+}
+
+/**
+ * V-B. The base tier has to actually exist before C4 can say anything about it
+ * and before C5 can say what the registry should hold. A generator that could
+ * not establish its configured population is a **generator** problem — it fires
+ * on exactly the shape the local smoke produced, where a collapsed source-IP
+ * pool put the per-IP concurrency cap in front of the base tier. Registered as
+ * INCOMPLETE so that case can never be read as a leak or as base ill-health.
+ */
+export const BASE_ESTABLISHMENT_FLOOR = 0.99;
+
+export function falsifierBaseTier(input: {
+	configuredBaseSessions: number;
+	serverObservedBaseCohort: number;
+}): FalsifierResult {
+	const reasons: string[] = [];
+	const { configuredBaseSessions, serverObservedBaseCohort } = input;
+	if (configuredBaseSessions > 0) {
+		const floor = BASE_ESTABLISHMENT_FLOOR * configuredBaseSessions;
+		if (serverObservedBaseCohort < floor) {
+			reasons.push(
+				`V-B: the server saw ${serverObservedBaseCohort} base-cohort sessions against a configured ${configuredBaseSessions} — the base tier never reached its population, so neither C4 nor C5 is measuring what it names`,
+			);
+		}
+	}
+	return {
+		id: "V-B",
+		fired: reasons.length > 0,
+		reasons,
+		observed: { ...input, floor: BASE_ESTABLISHMENT_FLOOR },
 		scope: "cell",
 	};
 }
