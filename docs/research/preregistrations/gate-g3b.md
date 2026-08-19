@@ -470,6 +470,29 @@ is logged here with run id, candidate SHA, staging base SHA and artifact hash.
 *(empty at the time of writing — no dispatch has been made under this
 registration)*
 
+**Dispatch 1 — `bench-bandwidth`, `EGRESS_SHAPE=gate`, heavy self-hosted runner.**
+
+| field | value |
+|---|---|
+| run id | `32238304133` |
+| candidate SHA | `7abd6411b3786a0c546c2d802dc1b0fa5013aca3` (`probe/egress-01`) |
+| staging base SHA | `2a4145d0556a35f8b4a0849e5953927b5e028b64` |
+| §1 note | §9's composition record named `066a342f92af`; the dispatched SHA is one commit later. `git diff --stat 066a342 7abd641` = this file, +8 lines (the composition record itself). No harness or product difference. |
+| fragments | started `2026-08-19T09:39:33.177Z` (headroom serial), `09:40:58.424Z` (pipelined), `09:42:23.652Z` (batch), `10:17:02.076Z` (gate) |
+| outcome | **INVALID — V1 (§2.4) tripped.** No gate verdict stamped; G3 remains INCOMPLETE. |
+
+Artifact sha256:
+
+```
+000504649ee9ce8fc371579c9906ed0bdfbd7eed8e71f41a14a341e0dbbbf3f8  ...-headroom-batch.json
+bd1805ef8a3d3d3dd0a331fd8376b5b4e8d537dd2a3973982e2d0bda23ed1c55  ...-headroom-pipelined.json
+d4a2385c0d3279fb750b1ab940a4d16df9fec9c0e86cd820a5ddbac76c775a1e  ...-headroom-serial.json
+3ec56db15d8c0218a91b63d04e15ae54631076ae10ef81b53560d9d069d57130  ...-classified.json
+4c262ee9d4e0632632b1cf4fb49b7764dbbea0836ac3153d5f0eb3f24641d952  ...-gate.json
+```
+
+(prefix `bench-egress-7abd6411b3786a0c546c2d802dc1b0fa5013aca3` on every name)
+
 ---
 
 ## 10. What this registration may not do
@@ -488,7 +511,19 @@ registration)*
 
 ## 11. Verdict
 
-*(open — no run has been made under this registration)*
+**G3b is INVALID. `V1` (§2.4) fired: the three arms' `schedulerLag` p99 spread by
+3.85× at m = 0.5, 2.28× at m = 1 and 2.32× at m = 2 — and by 2.2–2.9× on all ten
+gate blocks — against a registered bound of 2×.** Per §2.4 that is a harness
+fault under §10's rerun clause, not a gate result, so this run stamps no clause
+and **G3 remains INCOMPLETE**. Four of the five §7 predictions were missed,
+including V1 itself; per §7 that is reported as a miss and no third registration
+follows.
+
+The full stamp — every clause re-derived from the raw fragments, the
+`halfPeriodDependent` disclosure, the ceiling arithmetic under `T/2` vs `T/4`,
+the CPU-asymmetry disclosure and the prediction reconciliation — is in
+`.scratch/production-grade-scenarios/issues/26-g3-reregistration.md`, section
+"G3b stamp". No threshold, clause or bound in §1–§8 was edited after the run.
 
 ---
 
