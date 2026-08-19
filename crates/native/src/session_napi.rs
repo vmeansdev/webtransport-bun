@@ -1,5 +1,5 @@
 //! NAPI bindings for SessionHandle. Risk-module coverage floors target `session.rs` logic.
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Uint8Array};
 use napi::{Env, JsObject, Result};
 use napi_derive::napi;
 
@@ -13,7 +13,8 @@ use crate::session::{
     create_uni_stream_for_session, discard_bidi_streams_for_session, discard_datagram_for_session,
     discard_datagrams_for_session, discard_uni_streams_for_session, handle_bidi_probe_for_session,
     handle_uni_probe_for_session, read_datagram_batch_for_session, read_datagram_for_session,
-    send_datagram_for_session, session_metrics_snapshot_from, wait_session_stream_capacity,
+    send_datagram_batch_for_session, send_datagram_for_session, session_metrics_snapshot_from,
+    wait_session_stream_capacity,
 };
 use crate::session_registry;
 use crate::RUNTIME;
@@ -208,6 +209,27 @@ impl SessionHandle {
         self.spawn_counted(env, AsyncOpKind::Datagram, async move {
             send_datagram_for_session(&id, &bytes).await
         })
+    }
+
+    /// Send up to 256 datagrams across one N-API crossing.
+    ///
+    /// Resolves `{sent, code?}` and never rejects: `sent = k` means elements
+    /// `0..k` went out in order, `code` is why element `k` failed, and elements
+    /// after `k` were not attempted. A partial send is normal on an unreliable
+    /// transport, so the caller drops element `k` and re-calls with the rest.
+    ///
+    /// Every payload is copied here, synchronously, before `spawn_future` — the
+    /// caller may reuse its arrays the moment this returns. More than 256
+    /// elements resolves `{sent: <=256, code: "E_BATCH_TOO_LARGE"}` rather than
+    /// silently dropping the tail; the TypeScript wrapper chunks so no ordinary
+    /// caller sees it.
+    ///
+    /// Same no-hop contract as `send_datagram`.
+    #[napi(ts_return_type = "Promise<DatagramBatchResult>")]
+    pub fn send_datagram_batch(&self, env: Env, data: Vec<Uint8Array>) -> Result<JsObject> {
+        let id = self.id.clone();
+        let prepared = crate::datagram_batch::prepare_batch(&data);
+        env.spawn_future(async move { Ok(send_datagram_batch_for_session(&id, prepared).await) })
     }
 
     /// Reads on the N-API runtime `spawn_future` already provides. Do NOT

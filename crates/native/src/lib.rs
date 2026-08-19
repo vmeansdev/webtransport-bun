@@ -84,6 +84,7 @@ pub mod async_ops;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
+pub mod datagram_batch;
 pub mod error;
 pub mod histogram;
 pub mod limits;

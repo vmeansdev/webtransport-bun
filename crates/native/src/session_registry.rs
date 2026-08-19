@@ -526,17 +526,20 @@ pub fn uni_discard_state(session_id: &str) -> Option<StreamDiscardState> {
         .map(|entry| entry.uni_discard.clone())
 }
 
-#[allow(clippy::type_complexity)]
-pub fn get_datagram_send_state(
-    session_id: &str,
-) -> Option<(
+/// Everything one datagram send needs from the registry. Resolved once per
+/// N-API call — a batch shares the lookup across its elements, and looking it
+/// up per element would put a registry hit back on the hot path batching exists
+/// to relieve.
+pub type DatagramSendState = (
     Connection,
     Arc<ServerMetrics>,
     Arc<SessionMetrics>,
     crate::limits::Limits,
     Arc<Notify>,
     Arc<AtomicBool>,
-)> {
+);
+
+pub fn get_datagram_send_state(session_id: &str) -> Option<DatagramSendState> {
     REGISTRY.get(session_id).map(|entry| {
         (
             entry.conn.clone(),
