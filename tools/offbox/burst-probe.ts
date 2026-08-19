@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * Burst-drain probe: the sink-side measurement V-SP's loopback arm cannot make.
  *
@@ -19,8 +20,17 @@
  * Wire format per datagram: u32 burst id, u32 sequence, zero padding to
  * `--payload-bytes`. Nothing else — this measures the kernel and the socket,
  * not a client.
+ *
+ * `--out <path>` writes the same JSON to a file, in both roles. That file is
+ * the machine-readable path V-SP rides: `bench-g10` reads it through
+ * `G10_BURST_RECV_JSON` / `G10_BURST_SEND_JSON` and refuses a C1 verdict
+ * without it. Both artifacts stamp their own `date` and `host`, because the
+ * falsifier's first question is whether the reading belongs to this run's day
+ * and to the sink it claims to describe.
  */
 
+import { writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { udpSocket } from "bun";
 
 type Args = Record<string, string>;
@@ -48,6 +58,7 @@ const gapMs = Number.parseInt(args["gap-ms"] ?? "1000", 10);
 // burst at that many packets per second — the lever-1 experiment: does
 // smearing the impulse below the path's sustained ceiling recover delivery?
 const pacePps = Number.parseInt(args["pace-pps"] ?? "0", 10);
+const outPath = args.out ?? "";
 
 if (payloadBytes < 8) throw new Error("payload must hold burst id + sequence");
 
@@ -55,6 +66,23 @@ function percentile(sorted: number[], q: number): number {
 	if (sorted.length === 0) return Number.NaN;
 	const idx = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1);
 	return sorted[Math.max(0, idx)] as number;
+}
+
+/** Local calendar day, which is what "same-day artifact" means to the gate. */
+function localDate(): string {
+	const d = new Date();
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** Print the report, and register it as an artifact when `--out` asks. */
+function publish(report: Record<string, unknown>): void {
+	const text = JSON.stringify(report, null, 2);
+	console.log(text);
+	if (outPath !== "") {
+		writeFileSync(outPath, `${text}\n`);
+		console.error(`burst-probe: wrote ${outPath}`);
+	}
 }
 
 if (role === "recv") {
@@ -110,25 +138,21 @@ if (role === "recv") {
 		}));
 	const drains = rows.map((r) => r.drainMs).sort((a, b) => a - b);
 	const completeness = rows.map((r) => r.completeness).sort((a, b) => a - b);
-	console.log(
-		JSON.stringify(
-			{
-				role: "recv",
-				port,
-				payloadBytes,
-				expected: { bursts, count },
-				burstsSeen: rows.length,
-				totalReceived: total,
-				drainMsP50: percentile(drains, 0.5),
-				drainMsP99: percentile(drains, 0.99),
-				drainMsMax: drains.at(-1) ?? null,
-				completenessMin: completeness[0] ?? null,
-				perBurst: rows,
-			},
-			null,
-			2,
-		),
-	);
+	publish({
+		role: "recv",
+		date: localDate(),
+		host: hostname(),
+		port,
+		payloadBytes,
+		expected: { bursts, count },
+		burstsSeen: rows.length,
+		totalReceived: total,
+		drainMsP50: percentile(drains, 0.5),
+		drainMsP99: percentile(drains, 0.99),
+		drainMsMax: drains.at(-1) ?? null,
+		completenessMin: completeness[0] ?? null,
+		perBurst: rows,
+	});
 } else if (role === "send") {
 	const peer = args.peer ?? "";
 	if (peer === "") throw new Error("send role needs --peer");
@@ -175,24 +199,24 @@ if (role === "recv") {
 	}
 	socket.close();
 	const sorted = [...emits].sort((a, b) => a - b);
-	console.log(
-		JSON.stringify({
-			role: "send",
-			peer,
-			port,
-			bursts,
-			count,
-			payloadBytes,
-			pacePps,
-			emitMsP50: percentile(sorted, 0.5),
-			emitMsP99: percentile(sorted, 0.99),
-			emitMsMax: sorted.at(-1) ?? null,
-			perBurstEmitMs: emits,
-		}),
-	);
+	publish({
+		role: "send",
+		date: localDate(),
+		host: hostname(),
+		peer,
+		port,
+		bursts,
+		count,
+		payloadBytes,
+		pacePps,
+		emitMsP50: percentile(sorted, 0.5),
+		emitMsP99: percentile(sorted, 0.99),
+		emitMsMax: sorted.at(-1) ?? null,
+		perBurstEmitMs: emits,
+	});
 } else {
 	console.error(
-		"usage: burst-probe.ts --role recv|send [--peer H] [--port N] [--count N] [--bursts N] [--gap-ms N] [--payload-bytes N]",
+		"usage: burst-probe.ts --role recv|send [--peer H] [--port N] [--count N] [--bursts N] [--gap-ms N] [--payload-bytes N] [--out PATH]",
 	);
 	process.exit(2);
 }

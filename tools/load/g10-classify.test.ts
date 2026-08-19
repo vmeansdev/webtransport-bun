@@ -4,6 +4,7 @@ import {
 	armComparabilityFalsifier,
 	cableFalsifier,
 	completenessFalsifierFires,
+	deadlineFalsifier,
 	denominatorFalsifier,
 	evaluateEmitterHonesty,
 	evaluateFleetDelivery,
@@ -16,7 +17,6 @@ import {
 	excludedMessageFraction,
 	gateVerdict,
 	generatorFalsifier,
-	deadlineFalsifier,
 	invalidatesRun,
 	leverStatement,
 	loopLagSamplerFalsifier,
@@ -53,27 +53,32 @@ describe("C1 — spread, and the guards around it", () => {
 	};
 
 	test("passes inside the amended path-derived bound", () => {
-		const r = evaluateSpreadClause(base);
+		const r = evaluateSpreadClause(base, false);
 		expect(r.status).toBe("pass");
 		expect(r.bound).toBeCloseTo(119.915, 2);
 		expect(r.reason).toContain("21.28");
 	});
 
 	test("fails above the bound", () => {
-		expect(evaluateSpreadClause({ ...base, spreadP99Ms: 121 }).status).toBe(
-			"fail",
-		);
+		expect(
+			evaluateSpreadClause({ ...base, spreadP99Ms: 121 }, false).status,
+		).toBe("fail");
 	});
 
 	test("R = 20 is not-applicable, never a miss — the wire forbids the bound", () => {
-		const r = evaluateSpreadClause({ ...base, rate: 20, spreadP99Ms: 40 });
+		const r = evaluateSpreadClause(
+			{ ...base, rate: 20, spreadP99Ms: 40 },
+			false,
+		);
 		expect(r.status).toBe("not-applicable");
 		expect(r.status).not.toBe("fail");
 		expect(r.reason).toContain("serialize");
 	});
 
 	test("R = 1 applies with room to spare", () => {
-		expect(evaluateSpreadClause({ ...base, rate: 1 }).status).toBe("pass");
+		expect(evaluateSpreadClause({ ...base, rate: 1 }, false).status).toBe(
+			"pass",
+		);
 	});
 
 	test("a message that reached half the fleet does not count for spread", () => {
@@ -93,7 +98,7 @@ describe("C1 — spread, and the guards around it", () => {
 		};
 		expect(excludedMessageFraction(facts)).toBeCloseTo(0.4, 6);
 		expect(completenessFalsifierFires(facts)).toBe(true);
-		const r = evaluateSpreadClause(facts);
+		const r = evaluateSpreadClause(facts, false);
 		expect(r.status).toBe("no-verdict-force");
 		expect(r.status).not.toBe("pass");
 		expect(r.reason).toContain("V-X");
@@ -123,9 +128,9 @@ describe("C1 — spread, and the guards around it", () => {
 	});
 
 	test("a missing percentile is no-verdict-force, not a pass", () => {
-		expect(evaluateSpreadClause({ ...base, spreadP99Ms: null }).status).toBe(
-			"no-verdict-force",
-		);
+		expect(
+			evaluateSpreadClause({ ...base, spreadP99Ms: null }, false).status,
+		).toBe("no-verdict-force");
 	});
 
 	test("no messages at all excludes everything", () => {

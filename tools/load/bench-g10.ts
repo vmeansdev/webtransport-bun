@@ -38,7 +38,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { $ } from "bun";
 import {
@@ -51,6 +51,7 @@ import {
 	waitForChildWithDeadline,
 } from "./bench-child-deadline.ts";
 import { finishRun, writeArtifactDurable } from "./bench-shutdown.ts";
+import { burstFloorFacts } from "./g10-burst-floor.ts";
 import {
 	type ArmClauses,
 	type ArmId,
@@ -72,6 +73,7 @@ import {
 	negativeFalsifier,
 	scoreMirrorStallPrediction,
 	skewFalsifier,
+	spreadFloorFalsifier,
 } from "./g10-classify.ts";
 import {
 	armForElapsed,
@@ -191,6 +193,66 @@ const FLEET = SMOKE
  */
 const SMOKE_RUST = SMOKE && process.env.G10_SMOKE_RUST === "1";
 const HIDE_MIRROR = process.env.G10_HIDE_MIRROR === "1";
+
+/**
+ * V-SP's inputs: the same-day burst-probe artifacts, written by
+ * `tools/offbox/burst-probe.ts --out`. The recv artifact is the sink's drain
+ * and carries the provenance; the send artifact is the emission it is judged
+ * against. Unset, unreadable or stale → the falsifier fires and C1 comes back
+ * `no-verdict-force`, which is the honest reading of a day with no probe.
+ */
+const BURST_RECV_JSON = process.env.G10_BURST_RECV_JSON ?? "";
+const BURST_SEND_JSON = process.env.G10_BURST_SEND_JSON ?? "";
+/**
+ * The host the recv artifact must name. Defaults to the host half of the
+ * offbox ssh target, so the ordinary dispatch needs no extra knob; with
+ * neither set it is `""`, which no artifact can match — unconfigured fires.
+ */
+const BURST_EXPECT_HOST =
+	process.env.G10_BURST_HOST ?? OFFBOX_SSH.split("@").at(-1) ?? "";
+
+function readJsonOrNull(path: string): unknown {
+	if (path === "") return null;
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch (err) {
+		console.error(
+			`bench-g10: burst artifact ${path} unreadable (${String(err)}); V-SP will fire`,
+		);
+		return null;
+	}
+}
+
+function localDate(at: Date): string {
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+
+// Read once, at start-up, so every rung is graded against the same reading and
+// the run says out loud which way V-SP went before it costs an hour of wire.
+const BURST_FLOOR = spreadFloorFalsifier(
+	burstFloorFacts({
+		recv: readJsonOrNull(BURST_RECV_JSON),
+		send: readJsonOrNull(BURST_SEND_JSON),
+		runDate: localDate(new Date()),
+		expectedHost: BURST_EXPECT_HOST,
+	}),
+);
+console.error(`bench-g10: ${BURST_FLOOR.reason}`);
+if (BURST_FLOOR.fires) {
+	// Said at start-up, not discovered in the artifact: every C1 this run
+	// produces will be no-verdict-force. The ssh target's host half is a guess
+	// at what the sink calls itself, and `hostname()` on a Mac is usually
+	// `something.local` — so name the knob rather than leaving the operator to
+	// infer it from a mismatch message an hour later.
+	console.error(
+		"bench-g10: C1 will render no verdict this run. V-SP needs same-day " +
+			"burst-probe artifacts: run `tools/offbox/burst-probe.ts --role recv " +
+			"--out PATH` on the sink and `--role send --out PATH` on this box, " +
+			"then set G10_BURST_RECV_JSON / G10_BURST_SEND_JSON, and " +
+			`G10_BURST_HOST to the sink's own hostname (currently "${BURST_EXPECT_HOST}").`,
+	);
+}
 
 const OUT_JSON = process.env.G10_OUT ?? join(ROOT, "tools/load/bench-g10.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
@@ -1125,13 +1187,16 @@ async function main(): Promise<void> {
 				...perSubscriber,
 			};
 			const clauses = [
-				evaluateSpreadClause({
-					rate,
-					subscribers: FLEET,
-					spreadP99Ms: offbox.spreadP99Ms ?? null,
-					messagesIssued,
-					messagesComplete: offbox.messagesComplete ?? 0,
-				}),
+				evaluateSpreadClause(
+					{
+						rate,
+						subscribers: FLEET,
+						spreadP99Ms: offbox.spreadP99Ms ?? null,
+						messagesIssued,
+						messagesComplete: offbox.messagesComplete ?? 0,
+					},
+					BURST_FLOOR.fires,
+				),
 				evaluateFleetDelivery(delivery),
 				evaluatePerSubscriberDelivery(delivery),
 				evaluateRtt({
@@ -1279,6 +1344,7 @@ async function main(): Promise<void> {
 				"V-A": vA,
 				"V-L": vL,
 				"V-G": vG,
+				"V-SP": BURST_FLOOR,
 				"V-N": negativeFalsifier(hists),
 				"V-K": skewFalsifier(hists),
 				"V-D": denominatorFalsifier(hists),

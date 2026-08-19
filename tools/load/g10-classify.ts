@@ -35,10 +35,10 @@ import {
 	SINK_DELIVERY_FLOOR,
 	STAGE_RESIDUAL_FRACTION,
 	SUBSCRIBERS,
+	sinkDrainCeilingMs,
 	sinkPrecheckPps,
 	spreadBoundMs,
 	spreadClauseApplies,
-	sinkDrainCeilingMs,
 	VERDICT_ARM,
 } from "./g10-plan";
 
@@ -127,7 +127,13 @@ export function completenessFalsifierFires(facts: SpreadFacts): boolean {
  */
 export function evaluateSpreadClause(
 	facts: SpreadFacts,
-	spreadFloorFalsifierFired = false,
+	/**
+	 * Required, with no default. Amendment 4 rewrote V-SP and left the call site
+	 * passing one argument, so the flag defaulted to `false` on every run and the
+	 * branch below was dead in production — the exact G3b shape the amendment
+	 * exists to prevent. Making it required puts `tsc` on the wire instead.
+	 */
+	spreadFloorFalsifierFired: boolean,
 ): ClauseResult {
 	const payload = facts.payloadBytes ?? MESSAGE_PAYLOAD_BYTES;
 	const link = facts.linkBitsPerSec ?? GIGABIT;
