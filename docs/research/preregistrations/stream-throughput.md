@@ -378,6 +378,21 @@ Original STOP conditions 1 (generator saturation), 2 (host saturation), 3
   quoted. The memory statement is made on the derived worst case plus the
   absolute peak series only. This is not a rerun trigger; it is a narrower claim.
 
+## Amendment 3 — 2026-08-19, pointer only (Arm G: gate G5)
+
+This axis' harness gains a fourth arm, **Arm G**, which executes gate G5 of the
+production-grade-scenarios effort. Its arms, batch budget, instruments,
+thresholds and STOP conditions are registered in full in
+`docs/research/preregistrations/gate-g5-bulk.md`, written and committed before
+its harness existed and before its first dispatch.
+
+Nothing above changes. Arm G inherits rules 1–5 and every Amendment 1 integrity
+rule verbatim and adds two of its own
+(`crossing-instrument-disagreement`, `server-socket-drops-unmeasurable`), both
+of which only ever move a step to INCOMPLETE. Arms A, B, C and W are untouched,
+and run 1's numbers are unaffected. This entry exists so a reader of this
+document cannot encounter an arm it never mentioned.
+
 ## Run log
 
 | # | date | run id | candidate SHA | arms | outcome | artifact sha256 |
