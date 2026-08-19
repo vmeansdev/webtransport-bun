@@ -132,6 +132,12 @@ export type TunnelCellFacts = {
 	rateLimitedCount: number;
 	limitExceededCount: number;
 	settled: boolean;
+	/**
+	 * The generator outlived its pre-registered deadline and the conductor killed
+	 * it. A killed child quiesces at once, so `settled` says nothing about such a
+	 * cell — V-W is what refuses it (ticket 01's pre-registered formula).
+	 */
+	deadlineBreached: boolean;
 
 	maxQueuedBytesPerSession: number;
 	maxQueuedBytesGlobal: number;
@@ -241,6 +247,14 @@ export function falsifiersForTunnelCell(
 		id: "V-L",
 		fired: facts.rateLimitedCount > 0 || facts.limitExceededCount > 0,
 		detail: `rateLimited ${facts.rateLimitedCount}, limitExceeded ${facts.limitExceededCount}`,
+	});
+
+	results.push({
+		id: "V-W",
+		fired: facts.deadlineBreached,
+		detail: facts.deadlineBreached
+			? "deadline breached: the generator was killed mid-cell, so this window is truncated and every counter under it is partial"
+			: "generator exited inside its pre-registered deadline",
 	});
 
 	results.push({
@@ -511,6 +525,8 @@ export type ExchangeCellFacts = {
 	rateLimitedCount: number;
 	limitExceededCount: number;
 	settled: boolean;
+	/** See `TunnelCellFacts.deadlineBreached`. */
+	deadlineBreached: boolean;
 };
 
 export const EXCHANGE_COMPLETION_BAR = 0.999;
@@ -555,6 +571,13 @@ export function falsifiersForExchangeCell(
 			id: "V-L",
 			fired: facts.rateLimitedCount > 0 || facts.limitExceededCount > 0,
 			detail: `rateLimited ${facts.rateLimitedCount}, limitExceeded ${facts.limitExceededCount}`,
+		},
+		{
+			id: "V-W",
+			fired: facts.deadlineBreached,
+			detail: facts.deadlineBreached
+				? "deadline breached: the generator was killed mid-cell, so this window is truncated"
+				: "generator exited inside its pre-registered deadline",
 		},
 		{
 			id: "V-D",
@@ -646,6 +669,8 @@ export type CouplingCellFacts = {
 	backpressureTimeouts: number;
 	streamErrors: number;
 	peakSessionQueuedBytes: number;
+	/** See `TunnelCellFacts.deadlineBreached`. Arm D drops such a cell. */
+	deadlineBreached: boolean;
 };
 
 export type CouplingReading = {
@@ -679,6 +704,17 @@ export type CouplingArmReading = {
 export function readCouplingEnd(
 	cells: readonly CouplingCellFacts[],
 ): CouplingReading {
+	// A breached cell is a truncated window, and Arm D reads a *pair* of cells
+	// against each other: silently dropping one would compare a full window with
+	// a partial one and call the difference coupling. The end reads
+	// INDETERMINATE instead.
+	const breached = cells.filter((c) => c.deadlineBreached);
+	if (breached.length > 0) {
+		return {
+			reading: "INDETERMINATE",
+			detail: `deadline breached on ${breached.map((c) => c.cell).join(", ")}; a truncated cell is not a control and not a load point`,
+		};
+	}
 	const control = cells.find((c) => c.backlogFraction === 0);
 	const top = cells.reduce<CouplingCellFacts | undefined>(
 		(best, c) =>

@@ -40,6 +40,12 @@ import {
 } from "../../packages/webtransport/src/stream-chunk-batch.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	cellDeadlineMs,
+	DEADLINE_REAP_GRACE_MS,
+	valueOrAfter,
+	waitForChildWithDeadline,
+} from "./bench-child-deadline.ts";
+import {
 	type CouplingCellFacts,
 	type CrossingFacts,
 	type ExchangeCellFacts,
@@ -612,7 +618,11 @@ type StepEnvelope = {
 	client: ClientSummary | null;
 	childDriveSec: number;
 	settleTimedOut: boolean;
-	exitCode: number;
+	/** The child outlived its pre-registered deadline and was killed. INVALID. */
+	deadlineBreached: boolean;
+	deadlineMs: number;
+	/** `null` only when a killed child never reaped. */
+	exitCode: number | null;
 	hostCpuMedianPct: number | null;
 	clientCpuPct: number | null;
 	serverCpuPct: number | null;
@@ -814,35 +824,44 @@ async function runStep(
 	let clientTicksLast = clientTicks0;
 	const hostSamples: number[] = [];
 	let prevHost: CpuSnapshot | null = readHostCpu();
-	let done = false;
-	const exited = child.exited.then(() => {
-		done = true;
+	const deadlineMs = cellDeadlineMs({
+		driveMs: cell.stepSeconds * 1000,
+		connectStaggerMs: CONNECT_STAGGER_MS,
+		settleMaxMs: SETTLE_MAX_MS,
 	});
-	while (!done) {
-		await Promise.race([
-			exited,
-			new Promise((res) => setTimeout(res, SAMPLE_INTERVAL_MS)),
-		]);
-		const nextHost = readHostCpu();
-		const host = hostCpuPct(prevHost, nextHost);
-		prevHost = nextHost;
-		if (host !== null) hostSamples.push(host);
-		const ticks = readPidCpuTicks(child.pid);
-		if (ticks !== null) clientTicksLast = ticks;
-		for (const s of liveSessions) {
-			const queued = s.metricsSnapshot?.().queuedBytes ?? 0;
-			if (queued > record.peakSessionQueuedBytes)
-				record.peakSessionQueuedBytes = queued;
-		}
-		appendFileSync(
-			OUT_CSV,
-			`${cell.name},${repeat},${Date.now()},${host?.toFixed(1) ?? ""},${record.upFrames},${record.downFrames},${record.peakSessionQueuedBytes}\n`,
-		);
-	}
+	const wait = await waitForChildWithDeadline(child, {
+		deadlineMs,
+		sampleIntervalMs: SAMPLE_INTERVAL_MS,
+		onSample: () => {
+			const nextHost = readHostCpu();
+			const host = hostCpuPct(prevHost, nextHost);
+			prevHost = nextHost;
+			if (host !== null) hostSamples.push(host);
+			const ticks = readPidCpuTicks(child.pid);
+			if (ticks !== null) clientTicksLast = ticks;
+			for (const s of liveSessions) {
+				const queued = s.metricsSnapshot?.().queuedBytes ?? 0;
+				if (queued > record.peakSessionQueuedBytes)
+					record.peakSessionQueuedBytes = queued;
+			}
+			appendFileSync(
+				OUT_CSV,
+				`${cell.name},${repeat},${Date.now()},${host?.toFixed(1) ?? ""},${record.upFrames},${record.downFrames},${record.peakSessionQueuedBytes}\n`,
+			);
+		},
+		onBreach: (phase) =>
+			console.error(
+				`g11: ${cell.name}#${repeat} passed its ${(deadlineMs / 1000).toFixed(0)} s deadline — ${phase}; this cell is INVALID`,
+			),
+	});
 
-	const exitCode = await child.exited;
-	const stdout = await stdoutPromise;
-	const stderr = await stderrPromise;
+	const exitCode = wait.exitCode;
+	const [stdout, stderr] = wait.deadlineBreached
+		? await Promise.all([
+				valueOrAfter(stdoutPromise, DEADLINE_REAP_GRACE_MS, ""),
+				valueOrAfter(stderrPromise, DEADLINE_REAP_GRACE_MS, ""),
+			])
+		: [await stdoutPromise, await stderrPromise];
 	const childDriveSec = (Date.now() - startedAt) / 1000;
 	const settle = await settleRecord(record);
 	const cpu1 = process.cpuUsage(cpu0);
@@ -862,6 +881,12 @@ async function runStep(
 	const serverCrossings = streamBatchDiagnosticsSnapshot();
 	const serverRssMb = process.memoryUsage().rss / (1024 * 1024);
 	if (exitCode !== 0) console.error(stderr.slice(-2000));
+	// The client summary of a killed child is a truncated window, not a short
+	// cell: parsing it would put half-measured numbers into the artifact beside
+	// the flag that says they are not measurements.
+	const clientSummary = wait.deadlineBreached
+		? null
+		: parseSummary(stdout, prefix);
 
 	await server.close?.();
 
@@ -869,9 +894,11 @@ async function runStep(
 		cell,
 		repeat,
 		record,
-		client: parseSummary(stdout, prefix),
+		client: clientSummary,
 		childDriveSec,
 		settleTimedOut: settle.timedOut,
+		deadlineBreached: wait.deadlineBreached,
+		deadlineMs,
 		exitCode,
 		hostCpuMedianPct: median(hostSamples),
 		clientCpuPct: pidCpuPct(clientTicks0, clientTicksLast, childDriveSec),
@@ -992,6 +1019,7 @@ function tunnelFacts(env: StepEnvelope): TunnelCellFacts {
 		rateLimitedCount: env.rateLimitedDelta,
 		limitExceededCount: env.limitExceededDelta,
 		settled: !env.settleTimedOut,
+		deadlineBreached: env.deadlineBreached,
 
 		maxQueuedBytesPerSession: DEFAULT_LIMITS.maxQueuedBytesPerSession,
 		maxQueuedBytesGlobal: DEFAULT_LIMITS.maxQueuedBytesGlobal,
@@ -1020,6 +1048,7 @@ function exchangeFacts(env: StepEnvelope): ExchangeCellFacts {
 		rateLimitedCount: env.rateLimitedDelta,
 		limitExceededCount: env.limitExceededDelta,
 		settled: !env.settleTimedOut,
+		deadlineBreached: env.deadlineBreached,
 	};
 }
 
@@ -1048,6 +1077,7 @@ function couplingFacts(env: StepEnvelope): CouplingCellFacts {
 		// there would report "no backlog" for a quantity that was never read —
 		// the all-cells-drop-disclosure lesson, applied to a byte counter.
 		peakSessionQueuedBytes: record.peakSessionQueuedBytes,
+		deadlineBreached: env.deadlineBreached,
 	};
 }
 
@@ -1202,9 +1232,11 @@ async function main(): Promise<void> {
 				raw[`${cell.name}#${r}`] = facts;
 			}
 			console.log(
-				`g11:   exit ${env.exitCode}, settled ${!env.settleTimedOut}, host CPU ${
-					env.hostCpuMedianPct?.toFixed(1) ?? "n/a"
-				}%`,
+				`g11:   exit ${env.exitCode ?? "unreaped"}, settled ${!env.settleTimedOut}${
+					env.deadlineBreached
+						? `, DEADLINE BREACHED (${(env.deadlineMs / 1000).toFixed(0)} s) — INVALID`
+						: ""
+				}, host CPU ${env.hostCpuMedianPct?.toFixed(1) ?? "n/a"}%`,
 			);
 		}
 	}

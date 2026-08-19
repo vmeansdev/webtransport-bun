@@ -97,6 +97,7 @@ function healthyCell(over: Partial<TunnelCellFacts> = {}): TunnelCellFacts {
 		rateLimitedCount: 0,
 		limitExceededCount: 0,
 		settled: true,
+		deadlineBreached: false,
 		maxQueuedBytesPerSession: SHIPPED_QUEUED_BYTES_PER_SESSION,
 		maxQueuedBytesGlobal: SHIPPED_QUEUED_BYTES_GLOBAL,
 		...over,
@@ -254,6 +255,17 @@ describe("each falsifier rejects the signature it exists for (§4)", () => {
 		expect(fired(healthyCell({ settled: false }))).toContain("V-D");
 	});
 
+	test("V-W — a killed generator's cell is refused even though it settled", () => {
+		// The trap this exists for: killing the child stops every counter at once,
+		// so the settle barrier quiesces immediately and V-D stays silent on a
+		// window that was cut in half.
+		const truncated = healthyCell({ deadlineBreached: true, settled: true });
+		expect(fired(truncated)).toContain("V-W");
+		expect(fired(truncated)).not.toContain("V-D");
+		expect(rollUpTunnelGate([truncated]).verdict).toBe("INVALID");
+		expect(fired(healthyCell())).not.toContain("V-W");
+	});
+
 	test("V-B — a drop tap that was never read is not a zero", () => {
 		expect(fired(healthyCell({ serverSocketDrops: null }))).toContain("V-B");
 		expect(fired(healthyCell({ serverSocketDrops: 0 }))).not.toContain("V-B");
@@ -404,6 +416,7 @@ function healthyExchange(
 		rateLimitedCount: 0,
 		limitExceededCount: 0,
 		settled: true,
+		deadlineBreached: false,
 		...over,
 	};
 }
@@ -425,6 +438,16 @@ describe("Arm X — the acceptance path", () => {
 
 	test("V-X2 — an arm that measured the shipped per-session stream cap", () => {
 		const facts = healthyExchange({ peakConcurrentBidiPerSession: 200 });
+		expect(rollUpExchangeArm(facts).verdict).toBe("INVALID");
+	});
+
+	test("V-W — a killed generator's exchange cell is refused", () => {
+		const facts = healthyExchange({ deadlineBreached: true, settled: true });
+		expect(
+			falsifiersForExchangeCell(facts)
+				.filter((f) => f.fired)
+				.map((f) => f.id),
+		).toEqual(["V-W"]);
 		expect(rollUpExchangeArm(facts).verdict).toBe("INVALID");
 	});
 
@@ -467,6 +490,7 @@ function couplingCell(
 		backpressureTimeouts: 0,
 		streamErrors: 0,
 		peakSessionQueuedBytes: 4096,
+		deadlineBreached: false,
 		...over,
 	};
 }
@@ -503,6 +527,27 @@ describe("Arm D, per end — D-P1' against D-F1' (Amendment 2)", () => {
 		expect(readCouplingEnd(quietEnd("server-accepted")).reading).toBe(
 			"COUPLING-REFUTED",
 		);
+	});
+
+	test("a deadline-breached cell makes its end indeterminate, not coupled", () => {
+		// Reading a truncated load cell against a full control would report the
+		// missing half of the window as an absence of coupling.
+		expect(
+			readCouplingEnd([
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, { deadlineBreached: true }),
+			]).reading,
+		).toBe("INDETERMINATE");
+		expect(
+			readCouplingArm([
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, {
+					backpressureTimeouts: 2,
+					deadlineBreached: true,
+				}),
+				...quietEnd("server-accepted"),
+			]).verdictFreeReading,
+		).toBe("INDETERMINATE");
 	});
 
 	test("a missing control cell is indeterminate, never a reading", () => {
