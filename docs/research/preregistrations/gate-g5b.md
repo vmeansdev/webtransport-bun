@@ -453,6 +453,62 @@ run it judges.
 
 | # | date | run id | candidate SHA | invocations | outcome | artifact sha256 |
 |---|---|---|---|---|---|---|
-| — | — | — | — | — | — | **no dispatch has been made** |
+| 1 | 2026-08-19 | [32242618831](https://github.com/vmeansdev/webtransport-bun/actions/runs/32242618831) | `0d32d2784aa7597e2fc86d171427f62081398b7d` | **mis-dispatch — `mode=gate-g5`**, so `arms: ["G"]`, four Arm G cells, no Arm P step | **NO-VERDICT (G-STOP-A)**, phase-1 shape reproduced; **licenses nothing for either registration** | below |
+| 2 | 2026-08-19 | [32244004915](https://github.com/vmeansdev/webtransport-bun/actions/runs/32244004915) | `0d32d2784aa7597e2fc86d171427f62081398b7d` | knoboff · knobon · verdict (`mode=gate-g5b`, `arms: ["P"]`) | **PASS**, all six clauses; stamped in ticket 27 | below |
 
 Every dispatch is logged here, including aborted ones.
+
+Both runs carry the same `headSha` and the same candidate because the
+orchestrator dispatched the same ref twice with different `mode` inputs. The
+candidate is `probe/stream-throughput-01` @ `0d32d278…`, rebased onto staging
+`2a4145d0556a35f8b4a0849e5953927b5e028b64` (the merge of `fix/lever-hardening-01`,
+i.e. ticket 23's five critical fixes including the `RESET_STREAM` terminal
+latch in `client_stream.rs`). `b4af780ad3902c27ae69ca9f2f3a7c8c3172cdb7` — the
+staging tip this document named while ticket 23 was open — is an ancestor of
+`2a4145d`, so the registration's "dispatched only on a candidate containing
+ticket 23's fixes" precondition is met and verified, not assumed.
+
+### Run 1 — orchestrator mis-dispatch, disclosed
+
+Dispatched with `mode=gate-g5`, the **phase-1** registration's mode, instead of
+`gate-g5b`. The workflow therefore ran `gate-g5-bulk.md`'s Arm G on this
+candidate: `G-control` 0.864 / 0.866, `G-window-ref` 1.093 / 1.110,
+`G-batch` 3.890 / 3.861 (**median 3.876 Gbps**, `host-saturated` in both
+repeats), `G-window-batch` 3.973 / 3.945 (`host-saturated` ×2) — G-STOP-A,
+**NO-VERDICT**, the same shape phase-1 stamped. It is an input error, not a
+rerun: the phase-1 registration is closed at NO-VERDICT and forbids re-running
+Arm G, and this run is neither offered as nor capable of changing that. It is
+logged in **both** pre-registrations' run logs because it executed the phase-1
+harness while occupying this gate's runner slot, and it licenses nothing.
+
+| file | sha256 |
+|---|---|
+| `bench-stream-g5-knoboff-0d32d278…json` | `8e7d938b98f20700a665b4ef3dfe31d414172ee34204cb115c08142f6284ab63` |
+| `bench-stream-g5-knoboff-0d32d278…csv` | `adb6728ee89e2e080ae3f8f81db3a8536c415ba397e335344e6210e3616edaed` |
+| `bench-stream-g5-knobon-0d32d278…json` | `7a4c6edf064b7ce2e3e613fb7f73617aace97d765749e9f0e17c65ea4b6424ad` |
+| `bench-stream-g5-knobon-0d32d278…csv` | `a0ca19c2c9a30534a9704408b97f3a9a454b1e878530056d9493ce2905934f05` |
+| `bench-stream-g5-verdict-0d32d278…json` | `256b5a8ed50991ac67b4390dd2f4d753abb0ca4e92df25e98669a5ba6686d75d` |
+
+### Run 2 — the gate run
+
+`bench-bandwidth.yml`, `mode: gate-g5b`, `[self-hosted, Linux, X64, heavy]`,
+dedicated, no other inputs. Bun 1.3.14, 4 CPUs, procfs present. Ten step
+fragments (8 knob-off + 2 knob-on), none missing, no harness abort, no declared
+infra fault — a **valid run**, final for the effort per spec §Rerun policy.
+
+| file | sha256 |
+|---|---|
+| `bench-stream-g5b-knoboff-0d32d278…json` | `6e4c7c31f449294cfe76d55a9573beff8c7e302564fb0d511d07485816cf9399` |
+| `bench-stream-g5b-knoboff-0d32d278…csv` | `42472bce8938e9485df26b4ef29e355d57790ca4c54be4872bb61ff49a6c69c3` |
+| `bench-stream-g5b-knobon-0d32d278…json` | `87309b40bc42bac2622f25414dd0551a845c160acedd4ff32b650489d8791efa` |
+| `bench-stream-g5b-knobon-0d32d278…csv` | `ff4a515cc8c99832c5abe8c868cb4f9b876fbee9b0aec81401cdb07a3a774fd0` |
+| `bench-stream-g5b-verdict-0d32d278…json` | `8b63991944f5a1ea6c8c3268f8fc4f7b25758ed26fe7c8a4b18bc8b0d0333537` |
+
+These five hashes were computed twice: once over the artifact bundle handed to
+the stamping agent and once over the bundle re-downloaded from run
+32244004915 with `gh run download`. They match bit for bit, so the numbers
+stamped in ticket 27 are provably the numbers this run produced.
+
+**Verdict: PASS.** The stamp — every clause re-derived from the raw step
+fragments rather than read off the evaluator's booleans — is
+`.scratch/production-grade-scenarios/issues/27-g5-paced-gate.md` §"G5b stamp".
