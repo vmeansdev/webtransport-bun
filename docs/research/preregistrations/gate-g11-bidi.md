@@ -223,12 +223,16 @@ at 3 Mbps paced while **delaying its own consumption of the upstream** by a
 registered per-frame delay, so unconsumed inbound reservation grows toward a
 target fraction `f` of the shipped `maxQueuedBytesPerStream` = 262,144 B.
 
-| cell | inbound backlog target `f` | bytes |
-|---|---|---|
-| `D-00` | 0 (no consumption delay) | control |
-| `D-25` | 0.25 | 65,536 |
-| `D-75` | 0.75 | 196,608 |
-| `D-95` | 0.95 | 249,036 |
+Amendment 2 splits every cell by **which end** holds the slow reader, because
+the two ends read through different paths and the mechanism is predicted to live
+on only one of them.
+
+| cell | slow reader on | inbound backlog target `f` | bytes |
+|---|---|---|---|
+| `D-00-client` / `D-00-server` | client-opened / server-accepted | 0 (no delay) | control |
+| `D-25-*` | both ends, separately | 0.25 | 65,536 |
+| `D-75-*` | both ends, separately | 0.75 | 196,608 |
+| `D-95-*` | both ends, separately | 0.95 | 249,036 |
 
 Measured per cell: downstream `write()` completion latency distribution, count of
 `E_BACKPRESSURE_TIMEOUT`, count of stream errors and resets, server
@@ -238,12 +242,15 @@ Measured per cell: downstream `write()` completion latency distribution, count o
 `StreamBudget` is charged by both directions of a bidi handle, downstream write
 completion latency rises with inbound backlog, and downstream writes fail with
 `E_BACKPRESSURE_TIMEOUT` once inbound unconsumed bytes approach 262,144 B,
-bounded by the shipped `backpressureTimeoutMs` = 5,000 ms.
+bounded by the shipped `backpressureTimeoutMs` = 5,000 ms. **Superseded by
+D-P1′ (Amendment 2), which makes it path-specific.**
 
 **Registered falsifier of my own reading, D-F1:** if downstream write latency is
 flat across `f` (p99 spread < 2× between `D-00` and `D-95`) and no
 `E_BACKPRESSURE_TIMEOUT` appears at `f` = 0.95, the K17 reading is **REFUTED**
-and this document's §9 says so.
+and this document's §9 says so. **Superseded by D-F1′ (Amendment 2)**, which
+adds the reverse refutation: coupling observed on the server-accepted end would
+refute the path asymmetry instead.
 
 Arm D **produces no gate verdict** either way. If D-P1 holds it routes to a
 defect ticket: an application whose reader is slow breaks its own *writer* on the
@@ -497,6 +504,62 @@ Corrected to:
 reasoning is unaffected — the residual is still far too small for the band to be
 measuring the pacer — but a factor stated wrong on a pre-registration is a factor
 stated wrong, and `g11-plan.test.ts` now pins the ratio so it cannot drift again.
+
+### Amendment 2 — K17 is path-asymmetric, and Arm D has to be built to see it (2026-08-19)
+
+Found while designing Arm D's harness, before any harness code was committed and
+before any dispatch. **No threshold moves and no clause changes**; what changes
+is which end of a bidi stream Arm D loads, and the prediction becomes sharper
+and falsifiable in a way the original was not.
+
+K17, quoted in full:
+
+> **A bidi handle owns ONE `StreamBudget`, charged by both directions.**
+> `ClientBidiStreamHandle.budget` (`client_stream.rs:1014`) is read by the write
+> path (`client_stream.rs:1602`) and by both deferred read paths
+> (`client_stream.rs:786`, `client_stream.rs:1250`); `try_reserve`
+> (`client_stream.rs:343`) charges one `stream_queued` counter against
+> `max_stream` and one `session_metrics.queued_bytes` against `max_session`
+
+That is true, and it is not sufficient, because the two ends of a bidi stream
+read through **different** paths:
+
+- **Server-accepted** handles are built by `ClientBidiStreamHandle::new_deferred`
+  (`lib.rs:1154`) and read through the **deferred-direct** path. Its reservation
+  is taken inside `read()` and released when the `StreamChunk` drops at the end
+  of that same call (`client_stream.rs:428`, `455`). Unread inbound bytes sit in
+  quinn's 256 KiB per-stream flow-control window, **not** in the shared budget.
+- **Client-opened** handles are built by `spawn_bidi_bridge_on`
+  (`client_stream.rs:2583`), whose read bridge **reads ahead** into a 256-slot
+  channel of 4 KiB chunks and holds each chunk's reservation **until JS consumes
+  it** (`reserve_for_recv`, `client_stream.rs:324`). The budget's 256 KiB binds
+  before the channel's 1 MiB does, at 64 chunks.
+
+So the sharpened prediction, replacing D-P1 as written:
+
+> **D-P1′.** On a **client-opened** bidi handle whose JS reader falls behind,
+> read-ahead reservations accumulate against the shared per-handle budget, and
+> **writes on that same handle** park in `reserve_or_wait` and fail with
+> `E_BACKPRESSURE_TIMEOUT` after the shipped 5,000 ms — while the read bridge
+> independently resets the stream with the same code on its own 5 s deadline.
+> On a **server-accepted** handle the same slow reader produces **no such
+> coupling**, because its reservations are transient.
+>
+> **D-F1′.** If the client-opened cells show flat downstream-write latency
+> across the backlog fractions and no `E_BACKPRESSURE_TIMEOUT` at f = 0.95, the
+> reading is REFUTED. If the **server-accepted** cells *do* show coupling, the
+> path asymmetry above is refuted instead, and that is the more interesting
+> refutation of the two.
+
+Harness consequence, and the reason this had to be an amendment rather than a
+note: Arm D's slow reader must be placed on **both** ends as separate cells
+(`D-*-client` on the client-opened handle, `D-*-server` on the server-accepted
+one), because a probe that only slowed the server would have measured the path
+where the mechanism is predicted **not** to live and would have reported
+"no coupling" as if it were a general result.
+
+Clause C4 is unaffected: it already reads `E_BACKPRESSURE_TIMEOUT` on the gate
+cell, from whichever end produces it.
 
 ## §12 — Run log
 
