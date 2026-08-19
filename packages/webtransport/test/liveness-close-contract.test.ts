@@ -184,6 +184,53 @@ describe("server close terminal contract", () => {
 	}, 30_000);
 });
 
+describe("promise-free datagram send", () => {
+	/**
+	 * Round 2's finding, as an assertion: a send that has queue budget must not
+	 * create an N-API promise. Each of those promises is a ThreadsafeFunction,
+	 * which is a reference on the host event loop that this addon can neither
+	 * see nor release — the class that kept a driver alive for two hours after
+	 * `close()` had already reported a clean shutdown. `datagramSendsAsync` is
+	 * the exposure meter, and on a healthy echo it has to read zero.
+	 */
+	it("echoes without taking the parking N-API path", async () => {
+		const cert = generateCertForNames(["localhost", "127.0.0.1"]);
+		expect(cert).not.toBeNull();
+		if (!cert) return;
+		let echoed = 0;
+		const server = createServer({
+			port: 0,
+			host: "127.0.0.1",
+			tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+			onSession: (session) => {
+				void (async () => {
+					for await (const datagram of session.incomingDatagrams()) {
+						await session.sendDatagram(datagram);
+						echoed++;
+					}
+				})().catch(() => {});
+			},
+		});
+		try {
+			const session = await connect(
+				`https://127.0.0.1:${server.address.port}/echo`,
+				{ tls: { insecureSkipVerify: true } },
+			);
+			const payload = new Uint8Array(512);
+			for (let i = 0; i < 200; i++) await session.sendDatagram(payload);
+			const deadline = Date.now() + 10_000;
+			while (echoed < 50 && Date.now() < deadline) await Bun.sleep(20);
+			expect(echoed).toBeGreaterThan(0);
+			const snap = server.metricsSnapshot();
+			expect(snap.datagramSendsAsync ?? -1).toBe(0);
+			session.close();
+		} finally {
+			await server.close();
+			cert.cleanup();
+		}
+	}, 30_000);
+});
+
 describe("createServerCloseContract", () => {
 	it("resolves sessions only after the native close and drains callbacks", async () => {
 		const order: string[] = [];
