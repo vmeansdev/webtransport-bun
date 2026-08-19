@@ -1,0 +1,672 @@
+/**
+ * Gate G11's clauses, validity falsifiers and roll-up, separated from the
+ * harness that drives them so every one of them runs without a runner.
+ *
+ * The contract is docs/research/preregistrations/gate-g11-bidi.md, committed
+ * before this file existed. Every threshold here is quoted from that document
+ * or computed by `g11-plan.ts` from the constants that document derives.
+ * Nothing here looks at a number to decide which question to ask of it.
+ *
+ * G3b is the reason this file exists in this shape. Its validity falsifier V1
+ * lived only in a hand derivation, so nothing computed it until after the run
+ * it invalidated. Every falsifier below is a function, is exercised against the
+ * signature it exists to reject, and is computed by the same code path that
+ * computes the clauses.
+ */
+
+import {
+	advertisedPerSessionBytes,
+	exchangeRttBoundMs,
+	FRAME_BYTES,
+	oneWayBoundMs,
+	SHIPPED_MAX_STREAMS_PER_SESSION_BIDI,
+	SHIPPED_QUEUED_BYTES_GLOBAL,
+	SHIPPED_QUEUED_BYTES_PER_SESSION,
+	tunnelRung,
+} from "./g11-plan.ts";
+
+export type Direction = "up" | "down";
+export const DIRECTIONS: readonly Direction[] = ["up", "down"] as const;
+
+// --- Pre-registered thresholds ----------------------------------------------
+
+/** §4 V-G: 20% of the one-way bound. Raw p99, nothing subtracted. */
+export const SCHEDULER_LAG_P99_BAR_MS = 5;
+/** §4 V-P: the cumulative-deadline pacer cannot overshoot; this is a falsifier. */
+export const PACE_BAND = { low: 0.98, high: 1.02 } as const;
+/** §4 V-S: G5's host bar, percent of the whole box. */
+export const HOST_CPU_BAR_PCT_OF_BOX = 90;
+/** §4 V-C: G5b's layer-consistency tolerance. */
+export const CROSSING_AGREEMENT_TOLERANCE = 0.01;
+/** §5 C5: the axis's own 5% integrity band. */
+export const FAIRNESS_SPREAD_BAR = 1.05;
+export const FAIRNESS_MIN_SHARE = 0.95;
+/** §2 Arm D: the falsifier of this registration's own K17 reading. */
+export const COUPLING_REFUTED_SPREAD = 2;
+
+export type Verdict = "PASS" | "MISS" | "INVALID" | "INCOMPLETE";
+
+export type ClauseResult = {
+	id: string;
+	pass: boolean;
+	detail: string;
+};
+
+export type FalsifierResult = {
+	id: string;
+	fired: boolean;
+	detail: string;
+};
+
+// --- Facts the harness must produce ----------------------------------------
+
+/**
+ * The generator-honesty report. It is refused unless it belongs to this run,
+ * this host and a cell that actually drove sessions — G6's `floorReportIsUsable`,
+ * kept because a floor borrowed from another step is not a floor.
+ */
+export type FloorReport = {
+	runId: string;
+	host: string;
+	drivingSessions: number;
+	schedulerLagP99Ms: number;
+	schedulerLagMaxMs: number;
+};
+
+export type CrossingFacts = {
+	dataCrossings: number;
+	batchedCrossings: number;
+	terminalCrossings: number;
+	bytes: number;
+	maxBatchBytes: number;
+};
+
+export type TunnelCellFacts = {
+	cell: string;
+	sessions: number;
+	repeat: number;
+	/** 0 means the chunk-batching knob is off (the gate cell). */
+	knobBytes: number;
+	windowSec: number;
+	runId: string;
+	host: string;
+
+	offeredBytes: Record<Direction, number>;
+	deliveredBytes: Record<Direction, number>;
+	writtenBytes: Record<Direction, number>;
+	perSessionDeliveredBytes: Record<Direction, number[]>;
+	oneWayP99Ms: Record<Direction, number>;
+	oneWaySamples: Record<Direction, number>;
+	negativeSamples: Record<Direction, number>;
+
+	streamErrors: number;
+	streamResets: number;
+	backpressureTimeouts: number;
+	streamsClosedBothHalves: number;
+
+	floor: FloorReport;
+	hostCpuMedianPctOfBox: number;
+	clientCpuPctOfOneCore: number;
+	clientCpuCeilingPctOfOneCore: number;
+	serverCpuPctOfOneCore: number;
+	serverRssMb: number;
+
+	/** The package's process-global diagnostics counter, per end. */
+	crossings: Record<"server" | "client", CrossingFacts>;
+	/** The harness's own count of server-side reads, for V-C. */
+	harnessServerReadCrossings: number;
+
+	/**
+	 * Server-side kernel rcvbuf drops. `null` means the tap was not read — which
+	 * is NOT a zero, and V-B says so.
+	 */
+	serverSocketDrops: number | null;
+	rateLimitedCount: number;
+	limitExceededCount: number;
+	settled: boolean;
+
+	maxQueuedBytesPerSession: number;
+	maxQueuedBytesGlobal: number;
+};
+
+// --- Small helpers ----------------------------------------------------------
+
+function ratio(actual: number, target: number): number {
+	if (target <= 0) return Number.NaN;
+	return actual / target;
+}
+
+function spread(values: readonly number[]): number {
+	if (values.length === 0) return Number.NaN;
+	const min = Math.min(...values);
+	const max = Math.max(...values);
+	if (min <= 0) return Number.POSITIVE_INFINITY;
+	return max / min;
+}
+
+function pct(value: number): string {
+	return `${(value * 100).toFixed(3)}%`;
+}
+
+export function floorReportIsUsable(
+	floor: FloorReport,
+	cell: { runId: string; host: string },
+): boolean {
+	return (
+		floor.runId === cell.runId &&
+		floor.host === cell.host &&
+		floor.drivingSessions > 0
+	);
+}
+
+// --- Validity falsifiers (§4) -----------------------------------------------
+
+export function falsifiersForTunnelCell(
+	facts: TunnelCellFacts,
+): FalsifierResult[] {
+	const rung = tunnelRung(facts.sessions);
+	const targetBytesPerDirection =
+		rung.bytesPerSecPerDirectionPerTunnel * facts.sessions * facts.windowSec;
+
+	const results: FalsifierResult[] = [];
+
+	results.push({
+		id: "V-G2",
+		fired: !floorReportIsUsable(facts.floor, facts),
+		detail: `floor run=${facts.floor.runId}/host=${facts.floor.host}/driving=${facts.floor.drivingSessions} against cell run=${facts.runId}/host=${facts.host}`,
+	});
+
+	results.push({
+		id: "V-G",
+		fired: facts.floor.schedulerLagP99Ms > SCHEDULER_LAG_P99_BAR_MS,
+		detail: `client scheduler-lag p99 ${facts.floor.schedulerLagP99Ms} ms (max ${facts.floor.schedulerLagMaxMs} ms) against a ${SCHEDULER_LAG_P99_BAR_MS} ms bar, raw`,
+	});
+
+	for (const dir of DIRECTIONS) {
+		const r = ratio(facts.offeredBytes[dir], targetBytesPerDirection);
+		results.push({
+			id: `V-P/${dir}`,
+			fired: !(r >= PACE_BAND.low && r <= PACE_BAND.high),
+			detail: `offered/target ${r.toFixed(5)} against [${PACE_BAND.low}, ${PACE_BAND.high}]`,
+		});
+		results.push({
+			id: `V-N/${dir}`,
+			fired: facts.negativeSamples[dir] > 0,
+			detail: `${facts.negativeSamples[dir]} negative one-way samples of ${facts.oneWaySamples[dir]} on a single clock`,
+		});
+	}
+
+	results.push({
+		id: "V-S",
+		fired: facts.hostCpuMedianPctOfBox > HOST_CPU_BAR_PCT_OF_BOX,
+		detail: `host CPU median ${facts.hostCpuMedianPctOfBox}% of box against a ${HOST_CPU_BAR_PCT_OF_BOX}% bar`,
+	});
+
+	const offeredShort = DIRECTIONS.some(
+		(dir) => ratio(facts.offeredBytes[dir], targetBytesPerDirection) < 1,
+	);
+	results.push({
+		id: "V-S2",
+		fired:
+			offeredShort &&
+			facts.clientCpuPctOfOneCore >= facts.clientCpuCeilingPctOfOneCore,
+		detail: `client CPU ${facts.clientCpuPctOfOneCore}% against its ${facts.clientCpuCeilingPctOfOneCore}% ceiling while offered < target`,
+	});
+
+	const agreement = ratio(
+		facts.crossings.server.dataCrossings,
+		facts.harnessServerReadCrossings,
+	);
+	results.push({
+		id: "V-C",
+		fired: Math.abs(agreement - 1) > CROSSING_AGREEMENT_TOLERANCE,
+		detail: `package dataCrossings ${facts.crossings.server.dataCrossings} vs harness reads ${facts.harnessServerReadCrossings} (${pct(agreement - 1)} apart, tolerance ${pct(CROSSING_AGREEMENT_TOLERANCE)})`,
+	});
+
+	results.push({
+		id: "V-K",
+		fired: !knobProvenanceHolds(facts),
+		detail: knobProvenanceDetail(facts),
+	});
+
+	results.push({
+		id: "V-L",
+		fired: facts.rateLimitedCount > 0 || facts.limitExceededCount > 0,
+		detail: `rateLimited ${facts.rateLimitedCount}, limitExceeded ${facts.limitExceededCount}`,
+	});
+
+	results.push({
+		id: "V-D",
+		fired: !facts.settled,
+		detail: facts.settled
+			? "settle barrier quiesced before counters were read"
+			: "drain-unsettled: counters read while the server was still receiving",
+	});
+
+	results.push({
+		id: "V-B",
+		fired: facts.serverSocketDrops === null,
+		detail:
+			facts.serverSocketDrops === null
+				? "server socket drop tap was not read; an unread tap is not a zero"
+				: `server socket drops ${facts.serverSocketDrops}`,
+	});
+
+	return results;
+}
+
+/**
+ * §4 V-K. A knob-off cell must show no batched crossings and a maximum batch of
+ * one QUIC stream frame; the knob cell must have batched every data crossing.
+ * G5b's exact discrimination, applied to both ends because this gate is the
+ * first to read the client end at all.
+ */
+export function knobProvenanceHolds(facts: TunnelCellFacts): boolean {
+	const ends = [facts.crossings.server, facts.crossings.client];
+	if (facts.knobBytes === 0) {
+		return ends.every(
+			(end) => end.batchedCrossings === 0 && end.maxBatchBytes <= FRAME_BYTES,
+		);
+	}
+	return ends.every(
+		(end) =>
+			end.dataCrossings > 0 && end.batchedCrossings === end.dataCrossings,
+	);
+}
+
+function knobProvenanceDetail(facts: TunnelCellFacts): string {
+	const fmt = (name: string, end: CrossingFacts) =>
+		`${name}: data ${end.dataCrossings}, batched ${end.batchedCrossings}, max ${end.maxBatchBytes} B`;
+	return `knob ${facts.knobBytes} B — ${fmt("server", facts.crossings.server)}; ${fmt("client", facts.crossings.client)}`;
+}
+
+// --- Gate clauses (§5) ------------------------------------------------------
+
+export function clausesForTunnelCell(facts: TunnelCellFacts): ClauseResult[] {
+	const rung = tunnelRung(facts.sessions);
+	const targetBytesPerDirection =
+		rung.bytesPerSecPerDirectionPerTunnel * facts.sessions * facts.windowSec;
+	const perSessionTarget =
+		rung.bytesPerSecPerDirectionPerTunnel * facts.windowSec;
+	const bound = oneWayBoundMs();
+	const out: ClauseResult[] = [];
+
+	// C1 / C2 — offered rate, per direction.
+	const clauseIds: Record<Direction, string> = { up: "C1", down: "C2" };
+	for (const dir of DIRECTIONS) {
+		const r = ratio(facts.offeredBytes[dir], targetBytesPerDirection);
+		out.push({
+			id: clauseIds[dir],
+			pass: r >= PACE_BAND.low && r <= PACE_BAND.high,
+			detail: `${dir} offered ${(facts.offeredBytes[dir] / facts.windowSec / 125_000).toFixed(3)} Mbps, ratio ${r.toFixed(5)}`,
+		});
+	}
+
+	// C3 — reliable streams: the accounting closes exactly, both directions.
+	const c3 = DIRECTIONS.every(
+		(dir) => facts.deliveredBytes[dir] === facts.writtenBytes[dir],
+	);
+	out.push({
+		id: "C3",
+		pass: c3,
+		detail: DIRECTIONS.map(
+			(dir) =>
+				`${dir} delivered ${facts.deliveredBytes[dir]} vs written ${facts.writtenBytes[dir]}`,
+		).join("; "),
+	});
+
+	// C4 — drain completeness. K17 makes this the clause most worth stating.
+	const c4 =
+		facts.streamErrors === 0 &&
+		facts.streamResets === 0 &&
+		facts.backpressureTimeouts === 0 &&
+		facts.streamsClosedBothHalves === facts.sessions;
+	out.push({
+		id: "C4",
+		pass: c4,
+		detail: `errors ${facts.streamErrors}, resets ${facts.streamResets}, backpressure timeouts ${facts.backpressureTimeouts}, streams closed both halves ${facts.streamsClosedBothHalves}/${facts.sessions}`,
+	});
+
+	// C5 — per-session fairness, each direction.
+	const fairness = DIRECTIONS.map((dir) => {
+		const values = facts.perSessionDeliveredBytes[dir];
+		const s = spread(values);
+		const minShare =
+			values.length > 0 ? Math.min(...values) / perSessionTarget : 0;
+		return { dir, s, minShare, count: values.length };
+	});
+	const c5 = fairness.every(
+		(f) =>
+			f.count === facts.sessions &&
+			f.s <= FAIRNESS_SPREAD_BAR &&
+			f.minShare >= FAIRNESS_MIN_SHARE,
+	);
+	out.push({
+		id: "C5",
+		pass: c5,
+		detail: fairness
+			.map(
+				(f) =>
+					`${f.dir} spread ${f.s.toFixed(4)} (bar ${FAIRNESS_SPREAD_BAR}), min share ${f.minShare.toFixed(4)} (bar ${FAIRNESS_MIN_SHARE}), ${f.count}/${facts.sessions} sessions`,
+			)
+			.join("; "),
+	});
+
+	// C6 / C7 — one-way p99, raw, per direction.
+	const latencyIds: Record<Direction, string> = { up: "C6", down: "C7" };
+	for (const dir of DIRECTIONS) {
+		out.push({
+			id: latencyIds[dir],
+			pass: facts.oneWaySamples[dir] > 0 && facts.oneWayP99Ms[dir] <= bound,
+			detail: `${dir} one-way p99 ${facts.oneWayP99Ms[dir]} ms (raw) against ${bound} ms, ${facts.oneWaySamples[dir]} samples, floor p99 ${facts.floor.schedulerLagP99Ms} ms reported beside it`,
+		});
+	}
+
+	// C8 — memory statement.
+	const advertised = advertisedPerSessionBytes(facts.maxQueuedBytesPerSession);
+	const c8 =
+		facts.maxQueuedBytesPerSession <= SHIPPED_QUEUED_BYTES_PER_SESSION &&
+		facts.maxQueuedBytesGlobal <= SHIPPED_QUEUED_BYTES_GLOBAL;
+	out.push({
+		id: "C8",
+		pass: c8,
+		detail: `per-session governor ${facts.maxQueuedBytesPerSession} B, global ${facts.maxQueuedBytesGlobal} B, advertised worst case ${advertised} B/session, peak RSS ${facts.serverRssMb} MB`,
+	});
+
+	// C9 — the crossing disclosure. Graded on nothing, by construction.
+	out.push({
+		id: "C9",
+		pass: true,
+		detail: `DISCLOSURE ONLY (graded on nothing): server ${meanBytesPerCrossing(facts.crossings.server).toFixed(1)} B/crossing, client ${meanBytesPerCrossing(facts.crossings.client).toFixed(1)} B/crossing at knob ${facts.knobBytes} B`,
+	});
+
+	return out;
+}
+
+export function meanBytesPerCrossing(end: CrossingFacts): number {
+	if (end.dataCrossings === 0) return 0;
+	return end.bytes / end.dataCrossings;
+}
+
+// --- Roll-up ----------------------------------------------------------------
+
+export type TunnelRollUp = {
+	verdict: Verdict;
+	reason: string;
+	clauses: Record<string, ClauseResult[]>;
+	falsifiers: Record<string, FalsifierResult[]>;
+};
+
+/**
+ * The gate is PASS only if every clause passes on every gate-cell repeat and no
+ * falsifier fired. A fired falsifier makes the cell INVALID — never a miss, and
+ * never a pass, no matter how many clauses computed PASS underneath it. That
+ * ordering is the whole lesson of G3b's stamp and it is tested directly.
+ *
+ * V-S is the one falsifier that produces INCOMPLETE rather than INVALID: a
+ * saturated host did not measure the product wrongly, it measured a rig that
+ * had nothing left to give, and a saturated rung is not a capacity number.
+ */
+export function rollUpTunnelGate(
+	gateCellRepeats: readonly TunnelCellFacts[],
+): TunnelRollUp {
+	const clauses: Record<string, ClauseResult[]> = {};
+	const falsifiers: Record<string, FalsifierResult[]> = {};
+
+	if (gateCellRepeats.length === 0) {
+		return {
+			verdict: "INCOMPLETE",
+			reason: "no gate-cell repeats were produced",
+			clauses,
+			falsifiers,
+		};
+	}
+
+	for (const facts of gateCellRepeats) {
+		const key = `${facts.cell}#${facts.repeat}`;
+		clauses[key] = clausesForTunnelCell(facts);
+		falsifiers[key] = falsifiersForTunnelCell(facts);
+	}
+
+	const firedSaturation = Object.entries(falsifiers).flatMap(([key, list]) =>
+		list
+			.filter((f) => f.fired && (f.id === "V-S" || f.id === "V-S2"))
+			.map((f) => `${key} ${f.id}: ${f.detail}`),
+	);
+	const firedOther = Object.entries(falsifiers).flatMap(([key, list]) =>
+		list
+			.filter((f) => f.fired && f.id !== "V-S" && f.id !== "V-S2")
+			.map((f) => `${key} ${f.id}: ${f.detail}`),
+	);
+
+	if (firedOther.length > 0) {
+		return {
+			verdict: "INVALID",
+			reason: `validity falsifier fired: ${firedOther.join(" | ")}`,
+			clauses,
+			falsifiers,
+		};
+	}
+	if (firedSaturation.length > 0) {
+		return {
+			verdict: "INCOMPLETE",
+			reason: `saturation STOP: ${firedSaturation.join(" | ")}`,
+			clauses,
+			falsifiers,
+		};
+	}
+
+	const failed = Object.entries(clauses).flatMap(([key, list]) =>
+		list.filter((c) => !c.pass).map((c) => `${key} ${c.id}: ${c.detail}`),
+	);
+	if (failed.length > 0) {
+		return {
+			verdict: "MISS",
+			reason: `clause failed: ${failed.join(" | ")}`,
+			clauses,
+			falsifiers,
+		};
+	}
+
+	return {
+		verdict: "PASS",
+		reason: `every clause passed on ${gateCellRepeats.length} repeat(s) with no falsifier fired`,
+		clauses,
+		falsifiers,
+	};
+}
+
+// --- Arm X: the acceptance path ---------------------------------------------
+
+export type ExchangeCellFacts = {
+	cell: string;
+	sessions: number;
+	windowSec: number;
+	runId: string;
+	host: string;
+	attemptedExchanges: number;
+	completedExchanges: number;
+	/** Counted at the SERVER, on the server's own clock. */
+	serverAcceptedStreams: number;
+	/** Counted at the client; recorded, and never used as the accept rate. */
+	clientOpenedStreams: number;
+	peakConcurrentBidiPerSession: number;
+	exchangeRttP99Ms: number;
+	rttSamples: number;
+	negativeSamples: number;
+	floor: FloorReport;
+	hostCpuMedianPctOfBox: number;
+	rateLimitedCount: number;
+	limitExceededCount: number;
+	settled: boolean;
+};
+
+export const EXCHANGE_COMPLETION_BAR = 0.999;
+
+export function falsifiersForExchangeCell(
+	facts: ExchangeCellFacts,
+): FalsifierResult[] {
+	return [
+		{
+			id: "V-G2",
+			fired: !floorReportIsUsable(facts.floor, facts),
+			detail: `floor run=${facts.floor.runId}/host=${facts.floor.host}/driving=${facts.floor.drivingSessions}`,
+		},
+		{
+			id: "V-G",
+			fired: facts.floor.schedulerLagP99Ms > SCHEDULER_LAG_P99_BAR_MS,
+			detail: `client scheduler-lag p99 ${facts.floor.schedulerLagP99Ms} ms against ${SCHEDULER_LAG_P99_BAR_MS} ms`,
+		},
+		{
+			id: "V-A",
+			fired: facts.serverAcceptedStreams !== facts.clientOpenedStreams,
+			detail: `server-observed accepts ${facts.serverAcceptedStreams} vs client-observed opens ${facts.clientOpenedStreams}`,
+		},
+		{
+			id: "V-X2",
+			fired:
+				facts.peakConcurrentBidiPerSession >=
+				SHIPPED_MAX_STREAMS_PER_SESSION_BIDI,
+			detail: `peak concurrent bidi/session ${facts.peakConcurrentBidiPerSession} against the shipped cap ${SHIPPED_MAX_STREAMS_PER_SESSION_BIDI}`,
+		},
+		{
+			id: "V-N",
+			fired: facts.negativeSamples > 0,
+			detail: `${facts.negativeSamples} negative RTT samples of ${facts.rttSamples}`,
+		},
+		{
+			id: "V-S",
+			fired: facts.hostCpuMedianPctOfBox > HOST_CPU_BAR_PCT_OF_BOX,
+			detail: `host CPU median ${facts.hostCpuMedianPctOfBox}%`,
+		},
+		{
+			id: "V-L",
+			fired: facts.rateLimitedCount > 0 || facts.limitExceededCount > 0,
+			detail: `rateLimited ${facts.rateLimitedCount}, limitExceeded ${facts.limitExceededCount}`,
+		},
+		{
+			id: "V-D",
+			fired: !facts.settled,
+			detail: facts.settled ? "quiesced" : "drain-unsettled",
+		},
+	];
+}
+
+export function clausesForExchangeCell(
+	facts: ExchangeCellFacts,
+): ClauseResult[] {
+	const completion = ratio(facts.completedExchanges, facts.attemptedExchanges);
+	const bound = exchangeRttBoundMs();
+	return [
+		{
+			id: "X1",
+			pass: completion >= EXCHANGE_COMPLETION_BAR,
+			detail: `completed ${facts.completedExchanges}/${facts.attemptedExchanges} = ${completion.toFixed(5)} against ${EXCHANGE_COMPLETION_BAR}`,
+		},
+		{
+			id: "X2",
+			pass: facts.rttSamples > 0 && facts.exchangeRttP99Ms <= bound,
+			detail: `exchange RTT p99 ${facts.exchangeRttP99Ms} ms (raw) against ${bound} ms, ${facts.rttSamples} samples, floor p99 ${facts.floor.schedulerLagP99Ms} ms`,
+		},
+		{
+			id: "X3",
+			pass:
+				facts.serverAcceptedStreams >=
+				facts.attemptedExchanges * EXCHANGE_COMPLETION_BAR,
+			detail: `server-side accepts ${facts.serverAcceptedStreams} against ${facts.attemptedExchanges} attempted opens — measured at the server, never inferred from client pacing`,
+		},
+	];
+}
+
+export function rollUpExchangeArm(facts: ExchangeCellFacts): TunnelRollUp {
+	const key = facts.cell;
+	const cellClauses = clausesForExchangeCell(facts);
+	const cellFalsifiers = falsifiersForExchangeCell(facts);
+	const clauses = { [key]: cellClauses };
+	const falsifiers = { [key]: cellFalsifiers };
+	const fired = cellFalsifiers.filter((f) => f.fired);
+	const saturation = fired.filter((f) => f.id === "V-S");
+	const other = fired.filter((f) => f.id !== "V-S");
+	if (other.length > 0) {
+		return {
+			verdict: "INVALID",
+			reason: other.map((f) => `${f.id}: ${f.detail}`).join(" | "),
+			clauses,
+			falsifiers,
+		};
+	}
+	if (saturation.length > 0) {
+		return {
+			verdict: "INCOMPLETE",
+			reason: saturation.map((f) => `${f.id}: ${f.detail}`).join(" | "),
+			clauses,
+			falsifiers,
+		};
+	}
+	const failed = cellClauses.filter((c) => !c.pass);
+	return failed.length > 0
+		? {
+				verdict: "MISS",
+				reason: failed.map((c) => `${c.id}: ${c.detail}`).join(" | "),
+				clauses,
+				falsifiers,
+			}
+		: { verdict: "PASS", reason: "all clauses passed", clauses, falsifiers };
+}
+
+// --- Arm D: the cross-direction budget probe (mechanism arm, no verdict) ----
+
+export type CouplingCellFacts = {
+	cell: string;
+	backlogFraction: number;
+	downstreamWriteP99Ms: number;
+	backpressureTimeouts: number;
+	streamErrors: number;
+	peakSessionQueuedBytes: number;
+};
+
+export type CouplingReading = {
+	/** Never a gate verdict — Arm D grades nothing. */
+	reading: "COUPLING-OBSERVED" | "COUPLING-REFUTED" | "INDETERMINATE";
+	detail: string;
+};
+
+/**
+ * D-P1 vs D-F1, both registered in §2 before the run.
+ *
+ * D-P1 (the K17 reading): downstream write latency rises with inbound backlog
+ * and downstream writes fail with E_BACKPRESSURE_TIMEOUT near the per-stream
+ * budget. D-F1 (the falsifier of my own reading): flat latency across the
+ * fractions and no timeout at the top fraction refutes K17, and the
+ * registration says so rather than quietly keeping it.
+ */
+export function readCouplingArm(
+	cells: readonly CouplingCellFacts[],
+): CouplingReading {
+	const control = cells.find((c) => c.backlogFraction === 0);
+	const top = cells.reduce<CouplingCellFacts | undefined>(
+		(best, c) =>
+			best === undefined || c.backlogFraction > best.backlogFraction ? c : best,
+		undefined,
+	);
+	if (!control || !top || control === top) {
+		return {
+			reading: "INDETERMINATE",
+			detail:
+				"Arm D needs a control cell at fraction 0 and at least one loaded cell",
+		};
+	}
+	if (control.downstreamWriteP99Ms <= 0) {
+		return {
+			reading: "INDETERMINATE",
+			detail: "control cell reported no downstream write latency",
+		};
+	}
+	const spreadRatio = top.downstreamWriteP99Ms / control.downstreamWriteP99Ms;
+	const timedOut = top.backpressureTimeouts > 0;
+	const detail = `control p99 ${control.downstreamWriteP99Ms} ms vs f=${top.backlogFraction} p99 ${top.downstreamWriteP99Ms} ms (${spreadRatio.toFixed(2)}x), backpressure timeouts at top ${top.backpressureTimeouts}, peak session queued ${top.peakSessionQueuedBytes} B`;
+	if (timedOut || spreadRatio >= COUPLING_REFUTED_SPREAD) {
+		return { reading: "COUPLING-OBSERVED", detail };
+	}
+	return { reading: "COUPLING-REFUTED", detail };
+}
