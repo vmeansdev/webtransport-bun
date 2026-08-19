@@ -14,6 +14,16 @@ export const E_HANDSHAKE_TIMEOUT = "E_HANDSHAKE_TIMEOUT";
 export const E_SESSION_CLOSED = "E_SESSION_CLOSED";
 /** Session idle timeout exceeded. */
 export const E_SESSION_IDLE_TIMEOUT = "E_SESSION_IDLE_TIMEOUT";
+/**
+ * The server ended this session while shutting down (`server.close()`).
+ *
+ * Unlike its peers this code is a **close reason**, not a thrown
+ * `WebTransportError.code`: it arrives as `CloseInfo.reason` paired with close
+ * code `3993` (`SERVER_CLOSING_CLOSE_CODE`), which is why it is deliberately
+ * absent from the native error-message parser's list. See `docs/SPEC.md`
+ * ("Server shutdown close semantics").
+ */
+export const E_SERVER_CLOSING = "E_SERVER_CLOSING";
 /** Stream was reset by peer. */
 export const E_STREAM_RESET = "E_STREAM_RESET";
 /** Peer sent stopSending. */
