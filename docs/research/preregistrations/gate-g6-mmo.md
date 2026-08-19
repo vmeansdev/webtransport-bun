@@ -617,6 +617,50 @@ merge-base equality in the present tense that stopped being true two hours later
 (final-round, prereg-drift 6); this document states its base as of dispatch and
 says so.
 
+## 11a. Amendment 1 — the AoI figure, corrected before any dispatch
+
+**Written before the first dispatch. The dispatch log in §12 is empty, and this
+amendment is what made me check it: mechanizing §1.3 in `tools/load/g6-plan.ts`
+showed the stated arithmetic does not produce the stated result.**
+
+Original text of §1.3, verbatim:
+
+> - Snapshot size: a populated zone puts ≈ **50 entities** in a player's AoI, at
+>   ≈ **24 B** per entity delta (id + quantized position + state bits) ≈ 1,200 B
+>   of body, which does **not** fit one datagram at the rig's registered 1150 B
+>   payload. Split into **3 datagrams** per snapshot.
+
+50 × 24 B = 1,200 B, which is `ceil(1200 / 1150) = 2` datagrams, not 3. The
+number 3 was right for the scenario I meant and wrong for the AoI figure I
+wrote down.
+
+**Changed to:**
+
+> - Snapshot size: a **contested zone or capital cluster** puts ≈ **100
+>   entities** in a player's AoI — players, pets and NPCs in view where a realm
+>   is actually under load — at ≈ **24 B** per entity delta ≈ 2,400 B of body,
+>   which is `ceil(2400 / 1150)` = **3 datagrams** per snapshot at the rig's
+>   registered 1150 B payload.
+
+**Why 100 and not "whatever makes 3".** The gate takes the demanding end of
+every scenario axis it registers: 5,000 players (top of the 2,500–5,000 range),
+a 40-player raid (the largest standard cohort), the populated-zone AoI. 100
+entities is that axis's demanding end and it is the figure the scenario was
+always about; 50 is the median quiet zone. **The quiet-zone shape (2 datagrams
+per snapshot, 10 pps/session, 50,000/s aggregate at the gate rung) is registered
+as NOT COVERED** and no G6 number speaks for it.
+
+**What this does and does not move.** Every derived figure in §1.5, §8 and §9 is
+unchanged, because they were all computed from the 3-datagram snapshot: 15
+pps/session, 75,000/s snapshot aggregate, 25,000 crossings/s, 97,500/s server
+total, R-down at 75,000 pps. **No threshold moved.** What moved is one scenario
+constant, so that the arithmetic on the page produces the numbers the page
+already claimed.
+
+The constant now lives in `tools/load/g6-plan.ts` (`AOI_ENTITIES = 100`) and its
+unit test asserts the 3-datagram result, so this class of drift cannot recur
+silently.
+
 ## 12. Dispatch log
 
 Every dispatch of this gate, including aborted ones. A run that is not in this
