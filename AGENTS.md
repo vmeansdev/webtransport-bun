@@ -62,7 +62,7 @@ Build a production-ready WebTransport implementation with Bun **v1.3.14+** as th
 ## Implementation constraints (must follow)
 1. Node streams for stream surfaces (Readable/Writable/Duplex).
 2. Promise-based datagram sending with bounded in-flight/backpressure.
-3. Two dedicated Tokio runtimes (server + client), each single-threaded and owned by the addon; cross-runtime communication must stay bounded and deterministic.
+3. Two dedicated Tokio runtimes owned by the addon (server: 2 `wt-server` worker threads as a fixed constant, not `available_parallelism()`; client: 1 worker); cross-runtime communication must stay bounded and deterministic. Per-datagram N-API methods (`read_datagram`, `send_datagram`, `discard_datagram`) must not `RUNTIME.spawn`.
 4. Bounded queues for all JS↔Rust crossings; all buffers counted against budgets.
 5. JS callback delivery must be rate-limited/batched to prevent per-packet callback storms.
 6. W3C client-facade divergences MUST be explicit in `docs/PARITY_MATRIX.md`; no silent no-op behavior for declared options.
@@ -118,16 +118,16 @@ Per-IP token buckets (defaults)
 - After scoped native/coverage refactors, run an auto-review pass and report before continuing related work.
 - For release-gap closure, prefer hybrid evidence re-runs: re-prove what can run locally and demote claims that cannot be honestly re-stamped (no theater or copied evidence).
 - Target production-grade 1.0 for both native and WASM; WASM 1.0 requires protocol expansion (multi-session, 0-RTT, dynamic QPACK) plus facade/API parity with native, not evidence-hardening alone.
-- When implementing an attached plan, do not edit the plan file itself; execute the plan as specified.
+- When implementing an attached plan, do not edit the plan file itself; execute the plan as specified. For throughput/ingest work, pass architect and critic before executing.
+- Measure on the same host/runner before attributing leftover throughput; do not ship measurement flags; keep hop-removal and worker-count as separate commits. Treat near-2x two-worker scaling as the worker-count result; leftover discard versus offered load is a separate ingest question. Keep ingest-gap probes throwaway with no product change on `rebind4-staging`.
 
 ## Learned Workspace Facts
-- Active 1.0 production work is on branch `feat/wasm-1.0` in the worktree at `/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/feat-wasm-1.0` (not `release/1.0-hardening`).
+- Active native/throughput work is on `rebind4-staging` at `/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun` (not `feat/wasm-1.0` or `release/1.0-hardening`); the `feat-wasm-1.0` worktree is gone. Hop-removal is landed; leftover work is ingest versus offered load (skip-recv/H7, send_datagram accepted vs UDP written), not worker-count.
 - Phase execution is driven by `INSTRUCTIONS_CURRENT_PHASE.md` → infer/update `Task.md`, then execute until all phases are done.
 - Published package entrypoints target compiled JS and `.d.ts` under `dist/` with native addon binaries under `prebuilds/`.
 - Invalid client `caPem` must map to stable `E_TLS` (not `E_INTERNAL`).
-- When GitHub Actions are unavailable due to limits, continue local 1.0 hardening without waiting on CI.
-- Keep floored Rust logic modules (`session.rs`, `server.rs`) free of NAPI Env wrappers; put bindings in `*_napi.rs` / `server_spawn.rs` so llvm-cov floors stay honest.
-- Native llvm-cov floors (90% line / 90% function / 80% branch) apply to floored logic modules only; NAPI binding modules and `server_spawn` are intentionally outside those floors.
+- Recv-full datagrams drop (`E_QUEUE_FULL`); send-full waits then `E_BACKPRESSURE_TIMEOUT`. Do not raise default 2 MiB/session or 512 MiB global budgets to hide leftover discard.
+- Keep floored Rust logic modules (`session.rs`, `server.rs`) free of NAPI Env wrappers; put bindings in `*_napi.rs` / `server_spawn.rs` so llvm-cov floors stay honest. Native llvm-cov floors (90% line / 90% function / 80% branch) apply to floored logic modules only; NAPI binding modules and `server_spawn` are outside those floors.
 - WASM (`crates/wasm/`) is a separate engine from native: sans-IO `quinn-proto` + hand-rolled H3/WT with JS-owned UDP I/O; native is napi + `wtransport` + Tokio.
 - Browser WASM networking for 1.0 is constrained to Chromium IWA + Direct Sockets; general browser-server outside that path is out of scope.
 - IWA Direct Sockets proofs need generated/signed web-bundle assets (`origin.txt`, `.wbn`/`.swbn`; typically gitignored) before `tools/interop/run-iwa.mjs`; packaged artifacts often live under `.release-evidence/iwa/`.
