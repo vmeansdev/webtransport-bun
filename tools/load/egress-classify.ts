@@ -12,7 +12,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import type { EgressEmitter } from "./egress-emitter.ts";
+import { EGRESS_EMITTERS, type EgressEmitter } from "./egress-emitter.ts";
 import type { EgressProfile } from "./egress-schedule.ts";
 import {
 	LatencyHistogram,
@@ -1004,9 +1004,49 @@ export function verdictForRun(
  * `docs/research/preregistrations/gate-g3.md` §6. Nothing here decides
  * anything; every threshold and every name below was fixed before the run.
  */
+/**
+ * V1, the registered validity falsifier for the corrected instrument
+ * (gate-g3b §2.4), computed from the artifact rather than by hand.
+ *
+ * > Across the three arms of one headroom control at one multiplier, on one box,
+ * > `schedulerLag` p99 must agree within **2×** (max/min ≤ 2). If the arms still
+ * > spread by more than 2×, the decoupling did not work and **the run is invalid
+ * > for G3b** — reported as a harness fault under §10's rerun clause, not as a
+ * > gate result.
+ *
+ * Run `32238304133` violated it at three of four multipliers and no field in
+ * `classified.json` said so: the stamp agent had to derive it from raw
+ * fragments, and a reader taking `c1.verdict` at face value would have stamped a
+ * PASS on an invalid run. That is the reason this type exists.
+ */
+export type ValidityV1 = {
+	verdict: "PASS" | "VIOLATED" | "INCOMPLETE";
+	/** The registered bar. Not configurable, not movable after the run. */
+	bound: number;
+	/** Largest `max/min` seen across the evaluated multipliers. */
+	worstSpread: number | null;
+	rungs: Array<{
+		multiplier: number;
+		/** `schedulerLag` p99 in ms, per arm, at this multiplier. */
+		lagP99MsByArm: Partial<Record<EgressEmitter, number>>;
+		spread: number;
+		withinBound: boolean;
+	}>;
+	/** Multipliers skipped because an arm was missing or carried no lag number. */
+	skippedMultipliers: number[];
+};
+
 export type GateG3Verdict = {
 	rungAggregatePerSec: number;
 	profile: EgressProfile;
+	/**
+	 * V1 (§2.4). When this is not `PASS` the run is a **harness fault**, not a
+	 * gate result: the clause verdicts below are computed and published, but
+	 * nothing they say has verdict force.
+	 */
+	v1: ValidityV1;
+	/** `false` whenever V1 did not pass. The artifact carries its own validity. */
+	runValid: boolean;
 	/** C1 — every block of the batch arm complete. */
 	c1: {
 		verdict: "PASS" | "INCOMPLETE";
@@ -1062,6 +1102,73 @@ export type GateG3Verdict = {
 	/** Inherited from G2's stamp and carried on this gate's face. */
 	crossCheckR4: "open";
 };
+
+/** The registered V1 bar. §10 forbids moving it after the run. */
+export const V1_SPREAD_BOUND = 2;
+
+/**
+ * Evaluate V1 across the per-arm headroom controls.
+ *
+ * One multiplier is one "headroom control at one multiplier" in §2.4's sense, so
+ * the spread is taken within a multiplier and never across the ladder — arms
+ * stop at their first failure, and comparing an arm's m = 4 against another's
+ * m = 0.5 would compare two different offered rates.
+ */
+export function validityV1(headrooms: HeadroomFragment[]): ValidityV1 {
+	const byMultiplier = new Map<
+		number,
+		Partial<Record<EgressEmitter, number>>
+	>();
+	for (const fragment of headrooms) {
+		const arm = fragment.emitter ?? "serial";
+		for (const rung of fragment.rungs) {
+			const m = rung.multiplier;
+			const lag = rung.schedulerLagP99Ns;
+			if (typeof m !== "number" || typeof lag !== "number" || !(lag > 0)) {
+				continue;
+			}
+			const row = byMultiplier.get(m) ?? {};
+			row[arm] = lag / MS;
+			byMultiplier.set(m, row);
+		}
+	}
+
+	const rungs: ValidityV1["rungs"] = [];
+	const skippedMultipliers: number[] = [];
+	for (const m of [...byMultiplier.keys()].sort((a, b) => a - b)) {
+		const row = byMultiplier.get(m) as Partial<Record<EgressEmitter, number>>;
+		const values = EGRESS_EMITTERS.map((arm) => row[arm]).filter(
+			(v): v is number => typeof v === "number",
+		);
+		// Three arms or it is not the comparison §2.4 registered.
+		if (values.length < EGRESS_EMITTERS.length) {
+			skippedMultipliers.push(m);
+			continue;
+		}
+		const spread = Math.max(...values) / Math.min(...values);
+		rungs.push({
+			multiplier: m,
+			lagP99MsByArm: row,
+			spread,
+			withinBound: spread <= V1_SPREAD_BOUND,
+		});
+	}
+
+	const worstSpread =
+		rungs.length === 0 ? null : Math.max(...rungs.map((r) => r.spread));
+	return {
+		verdict:
+			rungs.length === 0
+				? "INCOMPLETE"
+				: rungs.every((r) => r.withinBound)
+					? "PASS"
+					: "VIOLATED",
+		bound: V1_SPREAD_BOUND,
+		worstSpread,
+		rungs,
+		skippedMultipliers,
+	};
+}
 
 export function gateVerdictG3(
 	steps: ClassifiedStep[],
@@ -1151,9 +1258,13 @@ export function gateVerdictG3(
 
 	const withUdp = gateSteps.filter((s) => s.udp !== null).length;
 
+	const v1 = validityV1(headrooms);
+
 	return {
 		rungAggregatePerSec: Math.max(0, ...gateSteps.map((s) => s.aggregateRate)),
 		profile,
+		v1,
+		runValid: v1.verdict === "PASS",
 		c1: {
 			verdict: c1Pass ? "PASS" : "INCOMPLETE",
 			blocks,
@@ -1310,6 +1421,22 @@ if (import.meta.main) {
 	}
 	if (result.gateG3) {
 		const g = result.gateG3;
+		// V1 first, and before any clause: if it did not pass, nothing below has
+		// verdict force and the run is a harness fault under §10.
+		console.log(
+			`egress-classify: G3 V1=${g.v1.verdict} (schedulerLag p99 max/min across arms, bound ${g.v1.bound}x, worst ${g.v1.worstSpread?.toFixed(2) ?? "n/a"}x) ` +
+				g.v1.rungs
+					.map((r) => `m=${r.multiplier}:${r.spread.toFixed(2)}x`)
+					.join(" ") +
+				(g.v1.skippedMultipliers.length > 0
+					? ` skipped=${g.v1.skippedMultipliers.join(",")}`
+					: ""),
+		);
+		if (!g.runValid) {
+			console.log(
+				`egress-classify: G3 RUN INVALID — V1 ${g.v1.verdict}. The clause lines below are computed and published but stamp no gate verdict (gate-g3b §2.4, §10).`,
+			);
+		}
 		console.log(
 			`egress-classify: G3 rung=${g.rungAggregatePerSec}/s ${g.profile} C1=${g.c1.verdict} (${g.c1.completeBlocks}/${g.c1.stops.length} batch arms complete, ${g.c1.blocks} blocks, armStop=${g.c1.armStop ?? "none"})`,
 		);

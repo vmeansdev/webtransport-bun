@@ -984,6 +984,102 @@ describe("gate G3 — the three-arm comparison", () => {
 		expect(clear.c1.halfPeriodDependent).toBe(false);
 	});
 
+	test("G3b §2.4: V1 is computed from the artifact, and a violation invalidates the run", () => {
+		// The numbers are run 32238304133's own, re-read from its raw fragments:
+		// 6.881 / 6.619 / 1.786 ms at m = 0.5 is 3.85x, which is what the stamp
+		// agent had to derive by hand because no field carried it.
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].map((b) => gateStep("batch", b, 10)),
+			0,
+		);
+		const headrooms = (lagMsByArm: Record<string, number[]>) =>
+			(["serial", "pipelined", "batch"] as const).map((emitter) => ({
+				ceilingPerSec: 100_000,
+				emitter,
+				rungs: (lagMsByArm[emitter] as number[]).map((ms, i) => ({
+					multiplier: [0.5, 1][i] as number,
+					schedulerLagP99Ns: ms * MS,
+					passes: true,
+					passesRig: true,
+					passesArm: true,
+					failedOn: null,
+					lagUnderQuarterGrid: true,
+				})),
+			}));
+
+		const invalid = gateVerdictG3(
+			steps,
+			[runFor("batch", true)],
+			true,
+			"frame-bursty",
+			headrooms({
+				serial: [6.881, 10.355],
+				pipelined: [6.619, 10.617],
+				batch: [1.786, 4.653],
+			}),
+		);
+		expect(invalid.v1.verdict).toBe("VIOLATED");
+		expect(invalid.runValid).toBe(false);
+		expect(invalid.v1.bound).toBe(2);
+		expect(invalid.v1.rungs[0]?.spread).toBeCloseTo(3.853, 2);
+		expect(invalid.v1.rungs[0]?.withinBound).toBe(false);
+		expect(invalid.v1.rungs[1]?.spread).toBeCloseTo(2.282, 2);
+		expect(invalid.v1.worstSpread).toBeCloseTo(3.853, 2);
+		// The clauses are still computed and published — they simply carry no
+		// verdict force while the run is invalid.
+		expect(invalid.c1.verdict).toBe("PASS");
+
+		const valid = gateVerdictG3(
+			steps,
+			[runFor("batch", true)],
+			true,
+			"frame-bursty",
+			headrooms({
+				serial: [1.4, 1.9],
+				pipelined: [1.2, 1.5],
+				batch: [1.1, 1.3],
+			}),
+		);
+		expect(valid.v1.verdict).toBe("PASS");
+		expect(valid.runValid).toBe(true);
+		expect(valid.v1.worstSpread).toBeCloseTo(1.462, 2);
+	});
+
+	test("G3b §2.4: exactly 2x is inside the bound and a missing arm is not judged", () => {
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].map((b) => gateStep("batch", b, 10)),
+			0,
+		);
+		const rung = (emitter: "serial" | "pipelined" | "batch", ms: number) => ({
+			ceilingPerSec: 100_000,
+			emitter,
+			rungs: [{ multiplier: 0.5, schedulerLagP99Ns: ms * MS, passes: true }],
+		});
+		// max/min <= 2 is the registered predicate; the boundary is a pass.
+		const atBound = gateVerdictG3(
+			steps,
+			[runFor("batch", true)],
+			true,
+			"frame-bursty",
+			[rung("serial", 2), rung("pipelined", 1.5), rung("batch", 1)],
+		);
+		expect(atBound.v1.rungs[0]?.spread).toBe(2);
+		expect(atBound.v1.verdict).toBe("PASS");
+
+		// Two arms is not "across the three arms": the multiplier is skipped, and
+		// with nothing left to judge the falsifier is INCOMPLETE, never a pass.
+		const partial = gateVerdictG3(
+			steps,
+			[runFor("batch", true)],
+			true,
+			"frame-bursty",
+			[rung("serial", 8), rung("batch", 1)],
+		);
+		expect(partial.v1.verdict).toBe("INCOMPLETE");
+		expect(partial.v1.skippedMultipliers).toEqual([0.5]);
+		expect(partial.runValid).toBe(false);
+	});
+
 	test("G3b §4: the headroom failure keeps its rig-vs-arm attribution", () => {
 		// Phase 1 fused these: an arm that sourced 100.005% of its schedule with
 		// zero skips failed on lag and the miss was written up as a rig finding.
