@@ -235,6 +235,12 @@ pub(crate) async fn send_datagram_batch_for_session(
             Some("E_SESSION_CLOSED".to_string()),
         );
     };
+    // Every element of a batched send rides one N-API promise, so each one is
+    // exposed to the host-loop reference class the single-send path counts.
+    state
+        .1
+        .datagram_sends_async
+        .fetch_add(prepared.items.len() as u64, Ordering::Relaxed);
     let deadline = Instant::now()
         + Duration::from_millis(state.3.backpressure_timeout_ms.saturating_sub(elapsed_ms));
     crate::datagram_batch::send_prepared(prepared, |bytes| {

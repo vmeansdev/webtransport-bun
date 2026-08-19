@@ -242,6 +242,50 @@ describe("promise-free datagram send", () => {
 			cert.cleanup();
 		}
 	}, 30_000);
+
+	/**
+	 * The batched send takes the promise path by construction — it is a
+	 * `spawn_future`, not a synchronous quinn call — so it is exactly the
+	 * exposure `datagramSendsAsync` exists to report. It counted nothing,
+	 * leaving a batching server reading a flat zero while every one of its
+	 * datagrams held an N-API promise.
+	 */
+	it("counts batched sends on the exposure meter", async () => {
+		const cert = generateCertForNames(["localhost", "127.0.0.1"]);
+		expect(cert).not.toBeNull();
+		if (!cert) return;
+		let sent = 0;
+		const BATCH = 300;
+		const server = createServer({
+			port: 0,
+			host: "127.0.0.1",
+			tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+			onSession: (session) => {
+				void (async () => {
+					const batch = Array.from({ length: BATCH }, () => new Uint8Array(64));
+					const res = await session.sendDatagramBatch(batch);
+					sent = res.sent;
+				})().catch(() => {});
+			},
+		});
+		try {
+			const session = await connect(
+				`https://127.0.0.1:${server.address.port}/batch`,
+				{ tls: { insecureSkipVerify: true } },
+			);
+			const deadline = Date.now() + 10_000;
+			while (sent === 0 && Date.now() < deadline) await Bun.sleep(20);
+			expect(sent).toBeGreaterThan(0);
+			const snap = server.metricsSnapshot();
+			// One per element, matching how the single-send path counts, and
+			// the array was long enough to be split across crossings.
+			expect(snap.datagramSendsAsync ?? 0).toBeGreaterThanOrEqual(sent);
+			session.close();
+		} finally {
+			await server.close();
+			cert.cleanup();
+		}
+	}, 30_000);
 });
 
 describe("createServerCloseContract", () => {
