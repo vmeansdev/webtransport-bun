@@ -1022,10 +1022,20 @@ impl ClientSessionHandle {
     /// them the moment the call returns. The backpressure deadline is computed
     /// once here and shared by all elements — one call, one call's worth of
     /// patience — while the byte reservation stays strictly per element.
+    ///
+    /// `elapsedMs` carries that guarantee across the crossing cap: an array
+    /// longer than 256 becomes several of these calls, and the deadline is what
+    /// remains of the budget rather than a fresh one per crossing.
     #[napi(ts_return_type = "Promise<DatagramBatchResult>")]
-    pub fn send_datagram_batch(&self, env: Env, data: Vec<Uint8Array>) -> Result<JsObject> {
+    pub fn send_datagram_batch(
+        &self,
+        env: Env,
+        data: Vec<Uint8Array>,
+        elapsed_ms: Option<u32>,
+    ) -> Result<JsObject> {
         let prepared = crate::datagram_batch::prepare_batch(&data);
         let state = self.datagram_send_state();
+        let elapsed = u64::from(elapsed_ms.unwrap_or(0));
         env.spawn_future(async move {
             let Some(state) = state else {
                 return Ok(crate::datagram_batch::DatagramBatchResult::new(
@@ -1034,7 +1044,9 @@ impl ClientSessionHandle {
                 ));
             };
             let deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_millis(state.backpressure_timeout_ms);
+                + tokio::time::Duration::from_millis(
+                    state.backpressure_timeout_ms.saturating_sub(elapsed),
+                );
             Ok(crate::datagram_batch::send_prepared(prepared, |bytes| {
                 let state = &state;
                 async move {
