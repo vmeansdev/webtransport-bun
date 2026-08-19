@@ -978,6 +978,34 @@ against the code's 6/7/8, because the wire is what the two ends must agree on.
 Nothing scored reads a class id; no threshold moves. The prose is corrected to
 match the wire rather than the wire quietly diverging from the registration.
 
+**Amendment 2 (2026-08-19, before first dispatch — instrument vantage, no
+threshold moves).** §8 requires "a pre-flight artifact … produced by
+`tools/offbox/preflight.ts`" and bounds **idle RTT p99 ≤ 2 ms**; the bound is
+unchanged. What changed is which end of the wire stamps the samples the
+artifact's `rtt` carries. Evidence, all from cable day before any dispatch:
+
+- The generator's own `ping -c 600 -i 0.1` read p99 6.114 ms with the runner
+  under G7 load, 6.199 ms with the runner idle, and 5.519 ms (max 10.807) as a
+  bare control outside the harness — the tail did not care what the far end
+  was doing.
+- The same wire measured from the peer (`ping -c 600 -i 0.1` from the runner
+  toward the generator) read p99 2.23 ms, and 1.75 ms after two host-adapter
+  settings were corrected (below). Reverse-direction traffic crosses the same
+  cable, the same vSwitch and the same USB NIC kernel path, so the 4–9 ms
+  excursions unique to generator-originated samples are the generator's own
+  send-side scheduling, not the link.
+- Rig change, disclosed: the Windows host's bench adapter ("Ethernet 3",
+  Realtek PCIe GbE) had **Energy-Efficient Ethernet** and **Interrupt
+  Moderation** enabled; both were disabled before the registered artifact was
+  taken (idle p50 1.62 → 1.26 ms, p99 2.23 → 1.75 ms from the peer vantage).
+
+The instrument now takes the baseline from the peer's side when invoked with
+`--rtt-peer-ssh` (schema 2): `artifact.rtt` carries the peer-vantage samples,
+`artifact.rttVantage` names the vantage, and `artifact.rttGeneratorSide` keeps
+the generator's own baseline beside it, disclosed, never discarded. The object
+of §8 is the link; a bound read through a jitterier clock than the thing it
+bounds would refuse every wire regardless of the wire.
+
 Otherwise none: this document's first commit is its registration, and every
 threshold on this page was fixed in that commit. Two things are worth naming so a later
 reader does not mistake them for silent edits:

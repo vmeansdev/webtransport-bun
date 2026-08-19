@@ -37,21 +37,22 @@ import { mkdirSync } from "node:fs";
 import { arch, cpus, hostname, platform, totalmem } from "node:os";
 import { dirname } from "node:path";
 import {
+	chooseRttBaseline,
 	DEFAULT_CABLE_SUBNET,
+	derivePpsCeiling,
 	guardPeerAddress,
 	type IperfTcpResult,
 	interfaceIsTunnelled,
 	mtuFromDfPayload,
+	PREFLIGHT_SCHEMA_VERSION,
+	type PreflightArtifact,
 	parseIperf3Tcp,
 	parseIperf3Udp,
 	parseRouteInterface,
 	pingSaysTooBig,
-	type PreflightArtifact,
-	PREFLIGHT_SCHEMA_VERSION,
 	type RttBaseline,
 	summarizeRtt,
 	type UdpRung,
-	derivePpsCeiling,
 } from "./preflight-lib.ts";
 
 type Options = {
@@ -68,6 +69,14 @@ type Options = {
 	lossBoundPct: number;
 	iperfPort: number;
 	out: string | null;
+	/**
+	 * ssh destination on the peer used to take the idle-RTT baseline from the
+	 * peer's side of the wire (peer pings the generator). Registered by §11c
+	 * amendment 2 of gate-g10-broadcast: the generator's own ping stamps its
+	 * samples through 4–9 ms of send-side scheduling jitter the wire does not
+	 * have; the generator-side baseline stays in the artifact, disclosed.
+	 */
+	rttPeerSsh: string | null;
 	plan: boolean;
 };
 
@@ -88,6 +97,7 @@ function parseArgs(argv: string[]): Options {
 		lossBoundPct: 0.5,
 		iperfPort: 5201,
 		out: null,
+		rttPeerSsh: null,
 		plan: false,
 	};
 	for (let i = 0; i < argv.length; i += 1) {
@@ -126,6 +136,9 @@ function parseArgs(argv: string[]): Options {
 				break;
 			case "--out":
 				opts.out = next();
+				break;
+			case "--rtt-peer-ssh":
+				opts.rttPeerSsh = next();
 				break;
 			case "--plan":
 				opts.plan = true;
@@ -172,6 +185,20 @@ function steps(opts: Options): Step[] {
 			expect:
 				"0.0% loss, sub-millisecond times on a direct cable (0.15-0.4 ms is typical)",
 		},
+		...(opts.rttPeerSsh
+			? [
+					{
+						what: "rtt-peer",
+						argv: [
+							"ssh",
+							opts.rttPeerSsh,
+							`ping -c ${opts.pingCount} -i 0.1 <generator-cable-address>`,
+						],
+						expect:
+							"the same wire from the peer's side; this baseline is what evaluatePreflight reads, the generator-side one stays disclosed",
+					},
+				]
+			: []),
 		{
 			what: "tcp",
 			argv: [
@@ -310,13 +337,41 @@ async function main(): Promise<void> {
 	}
 
 	// rtt ---------------------------------------------------------------------
-	let rtt: RttBaseline | null = null;
+	let generatorRtt: RttBaseline | null = null;
 	const rttStep = plan.find((s) => s.what === "rtt");
 	if (rttStep) {
 		const res = await run(rttStep.argv);
-		rtt = summarizeRtt(res.stdout);
-		if (rtt.samples === 0) notes.push("idle ping produced no RTT samples");
+		generatorRtt = summarizeRtt(res.stdout);
+		if (generatorRtt.samples === 0)
+			notes.push("idle ping produced no RTT samples");
 	}
+
+	// rtt from the peer's side of the same wire --------------------------------
+	let peerRtt: RttBaseline | null = null;
+	const rttPeerStep = plan.find((s) => s.what === "rtt-peer");
+	if (rttPeerStep) {
+		const localAddress = routeOut
+			? (routeOut.stdout.match(/^\s*local:\s*(\S+)/m)?.[1] ?? "")
+			: "";
+		if (!localAddress) {
+			notes.push(
+				"rtt-peer requested but the route lookup produced no local address; peer baseline not taken",
+			);
+		} else {
+			const argv = rttPeerStep.argv.map((a) =>
+				a.replace("<generator-cable-address>", localAddress),
+			);
+			const res = await run(argv);
+			peerRtt = summarizeRtt(res.stdout);
+			if (peerRtt.samples === 0) {
+				notes.push(
+					`peer-side idle ping produced no RTT samples: ${res.stderr.slice(0, 200)}`,
+				);
+				peerRtt = null;
+			}
+		}
+	}
+	const { rtt, vantage: rttVantage } = chooseRttBaseline(generatorRtt, peerRtt);
 
 	// tcp ---------------------------------------------------------------------
 	let tcp: IperfTcpResult | null = null;
@@ -382,6 +437,8 @@ async function main(): Promise<void> {
 		},
 		guards,
 		rtt,
+		rttVantage,
+		rttGeneratorSide: generatorRtt,
 		tcp,
 		udpRungs,
 		ceiling,
@@ -401,7 +458,7 @@ async function main(): Promise<void> {
 	mkdirSync(dirname(out), { recursive: true });
 	await Bun.write(out, `${JSON.stringify(artifact, null, 2)}\n`);
 	console.log(
-		`preflight: wrote ${out} — mtu=${artifact.link.mtuBytes ?? "n/a"} rttP50=${rtt?.p50Ms ?? "n/a"}ms rttP99=${rtt?.p99Ms ?? "n/a"}ms tcp=${tcp ? (tcp.bitsPerSec / 1e6).toFixed(0) : "n/a"}Mbit/s cleanPps=${ceiling?.cleanPps ? Math.round(ceiling.cleanPps) : "n/a"}`,
+		`preflight: wrote ${out} — mtu=${artifact.link.mtuBytes ?? "n/a"} rttP50=${rtt?.p50Ms ?? "n/a"}ms rttP99=${rtt?.p99Ms ?? "n/a"}ms (${rttVantage}) tcp=${tcp ? (tcp.bitsPerSec / 1e6).toFixed(0) : "n/a"}Mbit/s cleanPps=${ceiling?.cleanPps ? Math.round(ceiling.cleanPps) : "n/a"}`,
 	);
 	for (const note of notes) console.warn(`preflight: note — ${note}`);
 }

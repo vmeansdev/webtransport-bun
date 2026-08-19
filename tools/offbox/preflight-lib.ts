@@ -14,7 +14,7 @@
  * gate's own results.
  */
 
-export const PREFLIGHT_SCHEMA_VERSION = 1;
+export const PREFLIGHT_SCHEMA_VERSION = 2;
 
 /* -------------------------------------------------------------------------- */
 /* Address guards                                                             */
@@ -185,6 +185,27 @@ export function summarizeRtt(pingOutput: string): RttBaseline {
 		p99Ms: percentile(times, 0.99),
 		maxMs: times.length > 0 ? Math.max(...times) : null,
 	};
+}
+
+/** Which end originated the idle-RTT ping samples the artifact's `rtt` carries. */
+export type RttVantage = "generator-toward-peer" | "peer-toward-generator";
+
+/**
+ * Pick the RTT baseline the artifact registers. The wire is symmetric; the two
+ * vantages differ only in whose userland stamps the samples. When the peer
+ * vantage exists it wins — the generator's own ping was measured (2026-08-19)
+ * adding 4–9 ms of send-side scheduling excursions that the reverse direction
+ * over the same wire does not show — and the generator-side baseline is always
+ * kept beside it, disclosed, never discarded.
+ */
+export function chooseRttBaseline(
+	generatorSide: RttBaseline | null,
+	peerSide: RttBaseline | null,
+): { rtt: RttBaseline | null; vantage: RttVantage } {
+	if (peerSide && peerSide.samples > 0) {
+		return { rtt: peerSide, vantage: "peer-toward-generator" };
+	}
+	return { rtt: generatorSide, vantage: "generator-toward-peer" };
 }
 
 /**
@@ -379,6 +400,10 @@ export type PreflightArtifact = {
 	};
 	guards: { name: string; ok: boolean; detail: string }[];
 	rtt: RttBaseline | null;
+	/** Which end originated `rtt`'s samples. Absent in schema 1 (generator side). */
+	rttVantage?: RttVantage;
+	/** The generator's own ping baseline, disclosed whenever `rtt` is peer-vantage. */
+	rttGeneratorSide?: RttBaseline | null;
 	tcp: IperfTcpResult | null;
 	udpRungs: UdpRung[];
 	ceiling: PpsCeiling | null;

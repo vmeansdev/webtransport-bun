@@ -1,20 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import {
+	chooseRttBaseline,
 	derivePpsCeiling,
 	evaluatePreflight,
 	guardPeerAddress,
 	interfaceIsTunnelled,
 	mtuFromDfPayload,
+	PREFLIGHT_SCHEMA_VERSION,
+	type PreflightArtifact,
 	parseIperf3Tcp,
 	parseIperf3Udp,
 	parsePingLoss,
 	parsePingTimes,
 	parseRouteInterface,
 	percentile,
-	PREFLIGHT_SCHEMA_VERSION,
-	type PreflightArtifact,
-	type UdpRung,
 	summarizeRtt,
+	type UdpRung,
 } from "./preflight-lib.ts";
 
 describe("address guards", () => {
@@ -123,6 +124,28 @@ describe("ping", () => {
 
 	test("MTU adds the IPv4 and ICMP headers the DF payload did not count", () => {
 		expect(mtuFromDfPayload(1472)).toBe(1500);
+	});
+
+	test("the peer vantage wins when it has samples, and never erases the generator's", () => {
+		const generator = summarizeRtt(pingOutput);
+		const peer = { ...generator, p99Ms: 1.75 };
+		expect(chooseRttBaseline(generator, peer)).toEqual({
+			rtt: peer,
+			vantage: "peer-toward-generator",
+		});
+	});
+
+	test("an empty peer baseline falls back to the generator's own ping", () => {
+		const generator = summarizeRtt(pingOutput);
+		const empty = summarizeRtt("no samples here");
+		expect(chooseRttBaseline(generator, empty)).toEqual({
+			rtt: generator,
+			vantage: "generator-toward-peer",
+		});
+		expect(chooseRttBaseline(generator, null)).toEqual({
+			rtt: generator,
+			vantage: "generator-toward-peer",
+		});
 	});
 });
 
