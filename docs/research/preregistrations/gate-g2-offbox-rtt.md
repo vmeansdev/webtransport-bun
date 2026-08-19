@@ -289,6 +289,15 @@ rttP99CensoredNs(cell) = rttHistogram.percentile(0.99 / (1 - f))     for f < 0.0
 **The gate is evaluated on `rttP99CensoredNs`.** The raw survivor p99 is reported
 beside it always. The correction can only move the figure up.
 
+**One part of `f` is not loss at all, and its size is bounded now.** When the
+client process exits at the end of the drive window, the datagrams still in
+flight never come back and leave no RTT sample. That censors approximately
+`RTT / driveWindow` of the sends — at a 10 ms round trip over a 20 s window,
+**0.0005**, fifty times below H5's 0.01 bar and a hundred times below the
+delivery-collapse STOP. It is disclosed rather than corrected: it moves `f`
+upward, so it can only make the gate harder, and if `f` ever approaches the bar
+the cause is loss, not this.
+
 **Loss attribution, so a path fault is not filed as a product miss and a product
 drop is not excused as a path fault.** Per cell the harness records the server's
 `/proc/net/snmp` `Udp:` deltas (`InErrors`, `RcvbufErrors`) and both directional
@@ -472,7 +481,15 @@ below with its own timestamp, quoting the original text verbatim, and stating
 whether any run had produced output at the time it was written. No clause above
 may be edited in place.
 
-*(none)*
+**Pre-dispatch clarification, 2026-08-19** — added to §7 before any dispatch of
+this gate existed, while smoke-testing the harness on a laptop (5 sessions,
+50/s, macOS; local numbers are never results and none is used here). The smoke
+showed `f` sitting at 0.02 in a run with no loss whatsoever, because at 50/s a
+5 s window leaves a visible fraction of the sends in flight when the client
+exits. The clarification states that effect, derives its magnitude at the gate's
+own rung (0.0005) and confirms it moves `f` in the conservative direction. **No
+threshold moved**; §7's 0.01, 0.05 and 0.1 are unchanged from the original
+commit, and the added paragraph could only make the gate harder to pass.
 
 ---
 
