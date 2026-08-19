@@ -409,14 +409,60 @@ ticket's shape and not this gate's.
 - It may not report a `(c)` number against a pre-composition egress number
   (§1).
 
-## 11. Dispatch log
+## 11. The dispatch, fixed before it is made
 
-Every dispatch is logged here — run id, candidate SHA, artifact hash — including
-aborted ones, per the effort spec's process rules.
+One dispatch, `bench-bandwidth` on the heavy runner, `egress_gate=true`:
+
+| input | value |
+|---|---|
+| `candidate_commit` | the tip of `probe/egress-01` carrying this section (recorded in the log below) |
+| `egress_probe` | `true` |
+| `egress_gate` | `true` |
+| `egress_gate_emitters` | `serial,pipelined,batch` |
+| `egress_gate_profiles` | `frame-bursty,keyframe-aligned` |
+| `egress_gate_blocks` | `5` |
+| `egress_gate_rate` | `326` |
+| `sessions` | `100` |
+| `payload_bytes` | `1150` |
+| `egress_step_seconds` | `30` |
+
+The workflow runs, in this order: the loaded-server headroom control once per
+arm (`EGRESS_SHAPE=headroom`, `frame-bursty`, `EGRESS_HEADROOM_RATE=326`), then
+one `EGRESS_SHAPE=gate` process driving all 5 blocks × 6 arms, then one
+`egress-classify` call over all four fragments. The ladder and the fan-out
+shapes do **not** run in this dispatch; the gate needs neither and the run
+budget is one dispatch.
+
+Expected wall clock ≈ 50 min against the workflow's 120 min timeout: 3 headroom
+arms (4 multiplier rungs × 20 s each plus connect), 30 gate arms at ≈ 55 s each
+including the subscriber process's own lifetime, plus the cargo and bun builds.
+
+### Dispatch log
+
+Every dispatch is logged here — run id, candidate SHA, artifact hash —
+including aborted ones, per the effort spec's process rules.
 
 | dispatched | run id | candidate SHA | artifact hash | outcome |
 |---|---|---|---|---|
 | — | — | — | — | **no dispatch has been made** |
+
+## 11a. Local smoke (not a result)
+
+Run on macOS before the dispatch, at 4 sessions / 60 per-session / 2 blocks /
+4 s arms, purely to show the harness runs and its output parses into the buckets
+above. **No number from it is a result** and none is quoted anywhere.
+
+What it demonstrated: all three arms drove and delivered 1.000; the block
+rotation put a different cell first in block 1; the batched arm made one call
+per grid event carrying distinct stamps; each arm produced its own headroom
+ceiling; `EGRESS_HEADROOM_BURN_NS` marked the batched arm's run
+`harness-falsifier`; the classifier resolved every clause of §6 mechanically
+(`C1/C2/C3/C4 = INCOMPLETE`, correctly — 1,034 samples per arm against the
+registered 10,000-sample floor, and macOS has no `/proc/net/snmp`).
+
+That last point is a property of the smoke host, not of the gate: on the Linux
+runner an arm carries ≈ 978,000 stamped samples and the UDP counters exist, so
+C4's instrumentation obligation is met there and only there.
 
 ## 12. Verdict
 
