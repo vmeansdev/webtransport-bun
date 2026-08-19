@@ -471,6 +471,42 @@ a session-close error was silently converted into a clean `done: true`, and any
 other injected error was rewrapped as a `WebTransportError` the caller never
 threw.
 
+## Incoming stream chunk delivery
+
+Receive-side stream data crosses Node-API once per quinn assembler chunk by
+default. `WEBTRANSPORT_STREAM_BATCH_BYTES` turns on a coalescing crossing
+instead: the addon's `readBatch(maxBytes)` parks for the first chunk and then
+takes only what is *already* queued — no timer and no fill wait — and delivers
+the run as one `Uint8Array`, one copy, straight into the engine's allocation.
+
+The knob is **off by default**: unset, invalid, or non-positive means every
+receive path calls the pre-existing `read()` and behaves exactly as before.
+Positive values are the per-crossing byte budget, clamped to `1 MiB` in
+JavaScript and again in native against the per-stream receive window
+(`maxQueuedBytesPerStream`) — a budget above the window can never be filled.
+Like the datagram knob, it is read **once at module initialization**.
+
+Batching changes chunk sizes and nothing else:
+
+- **Terminal events are never merged.** A batch that runs into FIN, RESET or
+  STOP_SENDING delivers its bytes and leaves the terminal event for the next
+  call, which observes it exactly as an unbatched read would. Chunk boundaries
+  were never framing (they are not in QUIC either), so a larger chunk is
+  within the existing contract.
+- **Byte accounting is unchanged.** Each coalesced chunk keeps its three-tier
+  reservation until the payload has been materialized for JavaScript, so
+  reservations are released on consumption, never at coalesce time, and the
+  documented `E_BACKPRESSURE_TIMEOUT` bound above still applies per chunk.
+- **Node `push()` and BYOB are unaffected.** One crossing still produces one
+  `push()`, so `push() === false` stops the reader where it did before, and
+  BYOB readers see a larger view and nothing else.
+
+`WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1` accumulates per-process crossing
+counters — crossings/s, mean bytes per crossing, largest batch — over both the
+batched and the unbatched path, so a comparison between them is measured by one
+instrument. The snapshot is reachable only through the unstable `__TESTING__`
+bag.
+
 ## API stability and semver
 
 ### The three exported surfaces

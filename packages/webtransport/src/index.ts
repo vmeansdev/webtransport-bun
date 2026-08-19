@@ -103,6 +103,13 @@ import {
 	WebTransportError,
 } from "./errors.js";
 import { createServerCloseContract } from "./server-close.js";
+import {
+	parseStreamBatchBytes,
+	readStreamChunk,
+	resetStreamBatchDiagnostics,
+	streamBatchConfig,
+	streamBatchDiagnosticsSnapshot,
+} from "./stream-chunk-batch.js";
 import type {
 	CloseInfo,
 	ErrorCode,
@@ -1107,6 +1114,9 @@ type NativeBidiStreamHandle = {
 	// Never-reject sentinels: string results are error codes (see
 	// unwrapNativeValue) — rejected async napi calls leak handle refs.
 	read(): Promise<Uint8Array | string | null>;
+	/** Coalescing read (see stream-chunk-batch.ts). Optional so an override
+	 * addon without it degrades to `read` instead of throwing. */
+	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
 	write(chunk: Buffer | Uint8Array): Promise<string | null>;
 	finish(): Promise<string | null> | void;
 	finishWait?: () => Promise<string | null> | void;
@@ -1126,6 +1136,7 @@ type NativeSendStreamHandle = {
 type NativeRecvStreamHandle = {
 	readonly id: number;
 	read(): Promise<Uint8Array | string | null>;
+	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
@@ -3638,7 +3649,7 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = unwrapNativeValue(await current.read());
+			const chunk = unwrapNativeValue(await readStreamChunk(current));
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.readableDone = true;
@@ -3822,7 +3833,7 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 			return;
 		}
 		try {
-			const chunk = unwrapNativeValue(await current.read());
+			const chunk = unwrapNativeValue(await readStreamChunk(current));
 			if (this.disposed || this.handle !== current) return;
 			if (chunk === null) {
 				this.release(false);
@@ -4210,6 +4221,14 @@ export const __TESTING__ = {
 	createIncomingDatagramIteratorForTests: createIncomingDatagramIterator,
 	datagramBatchDiagnosticsSnapshotForTests: datagramBatchDiagnosticsSnapshot,
 	datagramBatchMismatchMessageForTests: DATAGRAM_BATCH_MISMATCH_MESSAGE,
+	parseStreamBatchBytesForTests: parseStreamBatchBytes,
+	/** Frozen snapshot of what this process resolved at module init. */
+	streamBatchConfigForTests: streamBatchConfig,
+	/** G5's crossing instrument: crossings/s, mean bytes/crossing, max batch. */
+	streamBatchDiagnosticsSnapshotForTests: streamBatchDiagnosticsSnapshot,
+	resetStreamBatchDiagnosticsForTests: resetStreamBatchDiagnostics,
+	/** The exact receive-side crossing both incoming-stream readables run. */
+	readStreamChunkForTests: readStreamChunk,
 	nativePayloadDeliveryModeForTests: () =>
 		native?.nativePayloadDeliveryMode?.(),
 	nativePayloadEngineOwnedMaxBytesForTests: () =>
