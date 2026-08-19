@@ -45,6 +45,14 @@ import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	createSinkSender,
+	EGRESS_EMITTERS,
+	type EgressEmitter,
+	emitEvent,
+	isEgressEmitter,
+	type SessionSender,
+} from "./egress-emitter.ts";
+import {
 	datagramsPerTick,
 	type FanoutMode,
 	forwardShortfall,
@@ -88,7 +96,7 @@ import {
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/load-client`;
 
-export type EgressShape = "ladder" | "fanout" | "headroom";
+export type EgressShape = "ladder" | "fanout" | "headroom" | "gate";
 
 const RAW_PROFILE = process.env.EGRESS_PROFILE ?? "constant";
 if (!isEgressProfile(RAW_PROFILE)) {
@@ -96,6 +104,46 @@ if (!isEgressProfile(RAW_PROFILE)) {
 }
 const PROFILE: EgressProfile = RAW_PROFILE;
 const SHAPE = (process.env.EGRESS_SHAPE ?? "ladder") as EgressShape;
+/**
+ * Which originator arm drives — the one variable gate G3 compares. The ladder,
+ * the fan-out and one headroom arm each run a single emitter; the `gate` shape
+ * runs all three, interleaved and paired within a block.
+ */
+const RAW_EMITTER = process.env.EGRESS_EMITTER ?? "serial";
+if (!isEgressEmitter(RAW_EMITTER)) {
+	throw new Error(`EGRESS_EMITTER=${RAW_EMITTER} is not a registered arm`);
+}
+const EMITTER: EgressEmitter = RAW_EMITTER;
+/** Emitter arms the `gate` shape puts inside every block, in this order. */
+const GATE_EMITTERS = (
+	process.env.EGRESS_GATE_EMITTERS ?? EGRESS_EMITTERS.join(",")
+)
+	.split(",")
+	.map((v) => v.trim())
+	.filter((v) => v.length > 0)
+	.map((v) => {
+		if (!isEgressEmitter(v)) {
+			throw new Error(`EGRESS_GATE_EMITTERS: ${v} is not a registered arm`);
+		}
+		return v;
+	});
+/** Burst profiles the `gate` shape puts inside every block, in this order. */
+const GATE_PROFILES = (
+	process.env.EGRESS_GATE_PROFILES ?? "frame-bursty,keyframe-aligned"
+)
+	.split(",")
+	.map((v) => v.trim())
+	.filter((v) => v.length > 0)
+	.map((v) => {
+		if (!isEgressProfile(v)) {
+			throw new Error(`EGRESS_GATE_PROFILES: ${v} is not a registered profile`);
+		}
+		return v;
+	});
+/** Replicate blocks the `gate` shape runs. Every block holds every arm once. */
+const GATE_BLOCKS = parseInt(process.env.EGRESS_GATE_BLOCKS ?? "5", 10);
+/** The single rung G3 is registered at: 326/s/session × 100 = 32,600/s. */
+const GATE_RATE = parseInt(process.env.EGRESS_GATE_RATE ?? "326", 10);
 const SESSIONS = parseInt(process.env.EGRESS_SESSIONS ?? "100", 10);
 const PAYLOAD_BYTES = parseInt(process.env.EGRESS_PAYLOAD_BYTES ?? "1150", 10);
 const STEP_SECONDS = parseInt(process.env.EGRESS_STEP_SECONDS ?? "45", 10);
@@ -193,7 +241,9 @@ const OUT_JSON =
 			? // The two sweeps are separate measurements and must not land on one
 				// filename, or running both leaves only the second one.
 				`tools/load/bench-egress-fanout-${FANOUT_MODE}.json`
-			: `tools/load/bench-egress-${SHAPE}-${PROFILE}.json`,
+			: SHAPE === "gate"
+				? "tools/load/bench-egress-gate.json"
+				: `tools/load/bench-egress-${SHAPE}-${PROFILE}-${EMITTER}.json`,
 	);
 
 const HAS_PROC = process.platform === "linux";
@@ -229,6 +279,87 @@ function hostCpuPct(prev: CpuSnapshot | null, next: CpuSnapshot | null) {
 	return ofBox * 100 * HOST_CPU_COUNT;
 }
 
+/**
+ * Host-wide UDP counters, per arm, as deltas across the drive window.
+ *
+ * G3 requires server-side UDP counters on. `/proc/net/snmp` is host-wide rather
+ * than per-socket, and on this shape that is still attributable: the subscriber
+ * processes run `--datagrams-per-sec 0`, so `OutDatagrams` over an arm is the
+ * server's egress and `SndbufErrors` is the egress-side kernel drop counter the
+ * gate cares about. The fan-out shape is the only one with a second sender, and
+ * the gate does not run it.
+ */
+export type UdpSnapshot = {
+	inDatagrams: number;
+	outDatagrams: number;
+	inErrors: number;
+	rcvbufErrors: number;
+	sndbufErrors: number;
+};
+
+function readUdpStats(): UdpSnapshot | null {
+	if (!HAS_PROC) return null;
+	const lines = readFileSync("/proc/net/snmp", "utf8").split("\n");
+	const headerIdx = lines.findIndex((l) => l.startsWith("Udp:"));
+	if (headerIdx < 0 || !lines[headerIdx + 1]?.startsWith("Udp:")) return null;
+	const keys = (lines[headerIdx] ?? "").trim().split(/\s+/).slice(1);
+	const vals = (lines[headerIdx + 1] ?? "").trim().split(/\s+/).slice(1);
+	const get = (key: string) => {
+		const i = keys.indexOf(key);
+		return i >= 0 ? Number(vals[i] ?? 0) : 0;
+	};
+	return {
+		inDatagrams: get("InDatagrams"),
+		outDatagrams: get("OutDatagrams"),
+		inErrors: get("InErrors"),
+		rcvbufErrors: get("RcvbufErrors"),
+		sndbufErrors: get("SndbufErrors"),
+	};
+}
+
+export function udpDelta(
+	before: UdpSnapshot | null,
+	after: UdpSnapshot | null,
+): UdpSnapshot | null {
+	if (!before || !after) return null;
+	return {
+		inDatagrams: after.inDatagrams - before.inDatagrams,
+		outDatagrams: after.outDatagrams - before.outDatagrams,
+		inErrors: after.inErrors - before.inErrors,
+		rcvbufErrors: after.rcvbufErrors - before.rcvbufErrors,
+		sndbufErrors: after.sndbufErrors - before.sndbufErrors,
+	};
+}
+
+/**
+ * What quinn-udp negotiated on this host, read once per run.
+ *
+ * A capability read, not a measurement: the kernel exposes no per-send GSO
+ * segment count, so no claim of the form "the batch produced N-segment writes"
+ * can be made from it, and none is.
+ */
+async function readGsoCapability(): Promise<{
+	maxGsoSegments: number | null;
+	groSegments: number | null;
+	raw: string | null;
+}> {
+	try {
+		const out =
+			await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo run -q -p reference --bin gso-probe --release`.text();
+		const num = (re: RegExp) => {
+			const m = out.match(re);
+			return m?.[1] ? Number(m[1]) : null;
+		};
+		return {
+			maxGsoSegments: num(/max_gso_segments\s*=\s*(\d+)/),
+			groSegments: num(/gro_segments\s*=\s*(\d+)/),
+			raw: out.trim(),
+		};
+	} catch {
+		return { maxGsoSegments: null, groSegments: null, raw: null };
+	}
+}
+
 function median(values: number[]): number | null {
 	if (values.length === 0) return null;
 	const sorted = [...values].sort((a, b) => a - b);
@@ -236,13 +367,18 @@ function median(values: number[]): number | null {
 }
 
 /**
- * A per-session payload buffer with its stamp fields written in place.
+ * One payload buffer with its stamp fields written in place.
  *
- * `sendDatagram` does `Buffer.from(data)` synchronously before it awaits
- * anything, so one buffer per session is safe and the originator does not spend
- * the ladder allocating. Fields are written through a retained DataView rather
- * than `encodeStamp` so the hot path allocates nothing at all — the layout still
- * comes from `latency-stamp.ts`, so there is one source of truth for it.
+ * Fields are written through a retained DataView rather than `encodeStamp` so
+ * the hot path allocates nothing at all — the layout still comes from
+ * `latency-stamp.ts`, so there is one source of truth for it.
+ *
+ * Sessions hold a *pool* of these, one per position within a grid event, not
+ * one shared buffer: the batched send copies its elements at the call, after
+ * every element has been stamped, so a shared buffer would put the last stamp
+ * on every datagram in the batch. All three arms use the pool, so no arm is
+ * measured against a different allocation shape than another
+ * (`docs/research/preregistrations/gate-g3.md` §3.1).
  */
 class StampedPayload {
 	readonly bytes: Uint8Array;
@@ -290,9 +426,9 @@ export type OriginatorStats = {
 	 * contains the CPU sampler, the client's exit or a process spawn.
 	 */
 	driveWindowSec: number;
+	/** Which originator arm produced these numbers. */
+	emitter: EgressEmitter;
 };
-
-type SendFn = (bytes: Uint8Array) => Promise<unknown>;
 
 /**
  * The falsifier for the headroom arm: a synthetic per-datagram cost in the
@@ -326,12 +462,13 @@ function burn(clock: { now(): number }, ns: number): void {
  */
 async function driveProfile(
 	plan: EgressPlan,
-	sends: SendFn[],
+	senders: SessionSender[],
 	seconds: number,
 	clock: { now(): number },
+	emitter: EgressEmitter,
 	burnNs = 0,
 ): Promise<OriginatorStats> {
-	const sessions = sends.length;
+	const sessions = senders.length;
 	const originationLag = new LatencyHistogram();
 	const sendIssueSpread = new LatencyHistogram();
 	let sent = 0;
@@ -342,11 +479,16 @@ async function driveProfile(
 	const anchorNs = clock.now() + 50_000_000; // 50 ms so every loop starts armed
 	const endNs = anchorNs + seconds * 1e9;
 	const events = eventsForSeconds(plan, seconds);
+	// One slot per position inside the largest grid event this plan produces.
+	const poolSize = Math.max(1, ...plan.amplitudes);
 
 	const runSession = async (index: number): Promise<void> => {
-		const send = sends[index];
-		if (!send) return;
-		const payload = new StampedPayload(PAYLOAD_BYTES);
+		const sender = senders[index];
+		if (!sender) return;
+		const pool = Array.from(
+			{ length: poolSize },
+			() => new StampedPayload(PAYLOAD_BYTES),
+		);
 		const phaseNs = phaseNsFor(plan, index, sessions);
 		const base = anchorNs + phaseNs;
 		let eventIndex = 0;
@@ -370,34 +512,39 @@ async function driveProfile(
 
 			const amplitude = amplitudeAt(plan, index, sessions, eventIndex);
 			eventsRun += 1;
-			let firstActualNs = 0;
-			let lastActualNs = 0;
-			for (let k = 0; k < amplitude; k += 1) {
-				const actualNs = clock.now();
-				if (k === 0) firstActualNs = actualNs;
-				lastActualNs = actualNs;
-				sequence += 1;
-				payload.stamp(effectiveIntendedNs, actualNs, sequence);
-				try {
-					await send(payload.bytes);
-					sent += 1;
-				} catch {
-					sendErrors += 1;
-				}
-				burn(clock, burnNs);
-			}
+			const outcome = await emitEvent(
+				emitter,
+				sender,
+				pool,
+				amplitude,
+				effectiveIntendedNs,
+				sequence,
+				// The falsifier's synthetic per-datagram cost is spent *after* the
+				// stamp is read and before the element is handed over, so it lands
+				// inside the originator on every arm — including the batched one,
+				// where there is no per-datagram await to hang it off.
+				() => {
+					const t = clock.now();
+					burn(clock, burnNs);
+					return t;
+				},
+			);
+			sequence += amplitude;
+			sent += outcome.sent;
+			sendErrors += outcome.errors;
 			if (amplitude > 0) {
-				originationLag.record(firstActualNs - effectiveIntendedNs);
-				sendIssueSpread.record(lastActualNs - firstActualNs);
+				originationLag.record(outcome.firstActualNs - effectiveIntendedNs);
+				sendIssueSpread.record(outcome.lastActualNs - outcome.firstActualNs);
 			}
 			eventIndex += 1;
 		}
 	};
 
-	await Promise.all(sends.map((_, i) => runSession(i)));
+	await Promise.all(senders.map((_, i) => runSession(i)));
 	const driveEndNs = clock.now();
 
 	return {
+		emitter,
 		sent,
 		sendErrors,
 		// Run plus skipped: the denominator the `generator-saturation` STOP is
@@ -441,6 +588,8 @@ export type HeadroomRung = {
 export type HeadroomProbe = {
 	secondsPerRung: number;
 	profile: EgressProfile;
+	/** The arm this ceiling belongs to. A ceiling never crosses arms. */
+	emitter: EgressEmitter;
 	perSessionRate: number;
 	realSessions: number;
 	burnNs: number;
@@ -468,26 +617,38 @@ export type HeadroomProbe = {
  */
 async function runHeadroomArm(
 	clock: { now(): number },
-	realSends: SendFn[],
+	realSenders: SessionSender[],
 	sampleHostCpu: () => number | null,
+	emitter: EgressEmitter,
 ): Promise<HeadroomProbe> {
 	const rungs: HeadroomRung[] = [];
 	const plan = planFor(PROFILE, HEADROOM_RATE);
 	let shadowEmitted = 0;
 	let realEmitted = 0;
-	const sink: SendFn = async (bytes) => {
-		// Everything `sendDatagram` does on the JS side before the native call.
-		shadowEmitted += Buffer.from(bytes).length > 0 ? 1 : 0;
-	};
-	const counted: SendFn[] = realSends.map((send) => async (bytes) => {
-		const result = await send(bytes);
-		realEmitted += 1;
-		return result;
+	// Everything this arm's JS path does before the native call, and nothing
+	// else. Per arm, because the arms do different JS work.
+	const sink = createSinkSender(emitter, (n) => {
+		shadowEmitted += n;
 	});
+	const counted: SessionSender[] = realSenders.map((sender) => ({
+		sendDatagram: async (bytes) => {
+			const result = await sender.sendDatagram(bytes);
+			realEmitted += 1;
+			return result;
+		},
+		sendDatagramBatch: async (datagrams) => {
+			const result = await sender.sendDatagramBatch(datagrams);
+			realEmitted += result.sent;
+			return result;
+		},
+	}));
 
 	for (const multiplier of HEADROOM_MULTIPLIERS) {
 		const shadowSessions = Math.max(1, Math.round(multiplier * counted.length));
-		const sends = [...counted, ...new Array<SendFn>(shadowSessions).fill(sink)];
+		const sends = [
+			...counted,
+			...new Array<SessionSender>(shadowSessions).fill(sink),
+		];
 		realEmitted = 0;
 		shadowEmitted = 0;
 		sampleHostCpu();
@@ -496,6 +657,7 @@ async function runHeadroomArm(
 			sends,
 			HEADROOM_SECONDS,
 			clock,
+			emitter,
 			HEADROOM_BURN_NS,
 		);
 		const p99 = LatencyHistogram.fromJson(stats.originationLag).percentile(
@@ -537,8 +699,9 @@ async function runHeadroomArm(
 	return {
 		secondsPerRung: HEADROOM_SECONDS,
 		profile: PROFILE,
+		emitter,
 		perSessionRate: plan.effectiveRatePerSession,
-		realSessions: realSends.length,
+		realSessions: realSenders.length,
 		burnNs: HEADROOM_BURN_NS,
 		rungs,
 		ceilingPerSec: best ? Math.min(best.offeredPerSec, best.emittedPerSec) : 0,
@@ -555,6 +718,15 @@ export type ClientEgressJson = {
 export type EgressStep = {
 	shape: EgressShape;
 	profile: EgressProfile;
+	/** Which originator arm drove this step. */
+	emitter: EgressEmitter;
+	/**
+	 * Replicate block this step belongs to, and its position inside it. Every
+	 * comparison G3 makes is paired within a block, and the running order rotates
+	 * block to block, so a monotone drift in the box cannot become an arm effect.
+	 */
+	block: number | null;
+	positionInBlock: number | null;
 	perSessionRate: number;
 	sessionsRequested: number;
 	sessionsConnected: number;
@@ -579,6 +751,8 @@ export type EgressStep = {
 	forwardLag: LatencyHistogramJson | null;
 	/** Everything the fan-out shape's falsifiers and instruments produced. */
 	fanout: FanoutRecord | null;
+	/** Host UDP counter deltas across this step's drive window. */
+	udp: UdpSnapshot | null;
 };
 
 /**
@@ -701,7 +875,7 @@ async function main(): Promise<void> {
 
 	const clock = await createMonotonicClock();
 	console.log(
-		`bench-egress: shape=${SHAPE} profile=${PROFILE} clock=${clock.source} residual=${clock.calibrationResidualNs.toFixed(0)}ns spread=${clock.calibrationSpreadNs.toFixed(0)}ns batchEnv=${process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? "(default)"}`,
+		`bench-egress: shape=${SHAPE} profile=${PROFILE} emitter=${EMITTER} clock=${clock.source} residual=${clock.calibrationResidualNs.toFixed(0)}ns spread=${clock.calibrationSpreadNs.toFixed(0)}ns batchEnv=${process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? "(default)"}`,
 	);
 
 	if (HEADROOM_BURN_NS > 0) {
@@ -709,6 +883,11 @@ async function main(): Promise<void> {
 			`bench-egress: EGRESS_HEADROOM_BURN_NS=${HEADROOM_BURN_NS} — this is the falsifier. The artifact is marked harness-falsifier and carries no capacity number.`,
 		);
 	}
+
+	const gso = await readGsoCapability();
+	console.log(
+		`bench-egress: quinn-udp maxGsoSegments=${gso.maxGsoSegments ?? "n/a"} groSegments=${gso.groSegments ?? "n/a"}`,
+	);
 
 	console.log("bench-egress: building load-client (release)...");
 	try {
@@ -723,7 +902,7 @@ async function main(): Promise<void> {
 	const tls = generateLocalhostCert();
 	if (!tls) throw new Error("failed to generate localhost cert");
 
-	type Sub = { send: SendFn; id: number };
+	type Sub = { sender: SessionSender; id: number };
 	const subscribers: Sub[] = [];
 	let nextId = 1;
 
@@ -829,7 +1008,11 @@ async function main(): Promise<void> {
 		onSession: (session) => {
 			const entry: Sub = {
 				id: nextId++,
-				send: (bytes) => session.sendDatagram(bytes),
+				sender: {
+					sendDatagram: (bytes) => session.sendDatagram(bytes),
+					sendDatagramBatch: (datagrams) =>
+						session.sendDatagramBatch(datagrams),
+				},
 			};
 			subscribers.push(entry);
 			void session.closed
@@ -875,7 +1058,9 @@ async function main(): Promise<void> {
 					fanout.handlerToForward.record(issuedNs - arrivedNs);
 					fanout.ingestToForward.record(issuedNs - stamp.actualNs);
 					const pending: Array<Promise<unknown>> = [];
-					for (const target of targets) pending.push(target.send(datagram));
+					for (const target of targets) {
+						pending.push(target.sender.sendDatagram(datagram));
+					}
 					fanout.forwardIssueSpread.record(clock.now() - issuedNs);
 					const results = await Promise.allSettled(pending);
 					fanout.forwardSettle.record(clock.now() - issuedNs);
@@ -938,6 +1123,7 @@ async function main(): Promise<void> {
 		hostSamples: number[];
 		cpuMsDrive: number;
 		elapsedSec: number;
+		udp: UdpSnapshot | null;
 	};
 
 	const runDirectArm = async (
@@ -946,6 +1132,7 @@ async function main(): Promise<void> {
 		sessionsRequested: number,
 		seconds: number,
 		label: string,
+		emitter: EgressEmitter = EMITTER,
 	): Promise<DirectArm> => {
 		const plan = planFor(profile, perSessionRate);
 		const durationSec = seconds + CONNECT_BUDGET_S + CLIENT_DURATION_SLACK_S;
@@ -960,6 +1147,7 @@ async function main(): Promise<void> {
 		}
 
 		const cpuMs0 = serverCpuMs();
+		const udp0 = readUdpStats();
 		const startedAt = Date.now();
 		const hostSamples: number[] = [];
 		let prevHost = readHostCpu();
@@ -977,13 +1165,15 @@ async function main(): Promise<void> {
 		const snapshot = subscribers.slice(0, connected);
 		const stats = await driveProfile(
 			plan,
-			snapshot.map((s) => s.send),
+			snapshot.map((s) => s.sender),
 			seconds,
 			clock,
+			emitter,
 		);
 		// Read before the sampler is joined and before the client is reaped, so
 		// the numerator covers the drive window the denominator does.
 		const cpuMsDrive = serverCpuMs() - cpuMs0;
+		const udp = udpDelta(udp0, readUdpStats());
 		sampling = false;
 		await sampler;
 		const elapsedSec = (Date.now() - startedAt) / 1000;
@@ -1001,30 +1191,43 @@ async function main(): Promise<void> {
 			hostSamples,
 			cpuMsDrive,
 			elapsedSec,
+			udp,
 		};
 	};
 
 	const runStep = async (
 		perSessionRate: number,
 		sessionsRequested: number,
+		opts: {
+			profile?: EgressProfile;
+			emitter?: EgressEmitter;
+			block?: number;
+			positionInBlock?: number;
+		} = {},
 	): Promise<void> => {
+		const profile = opts.profile ?? PROFILE;
+		const emitter = opts.emitter ?? EMITTER;
 		const arm = await runDirectArm(
-			PROFILE,
+			profile,
 			perSessionRate,
 			sessionsRequested,
 			STEP_SECONDS,
-			`rate ${perSessionRate}`,
+			`${profile}/${emitter} rate ${perSessionRate}`,
+			emitter,
 		);
 		const { stats } = arm;
 
 		steps.push({
 			shape: SHAPE,
-			profile: PROFILE,
+			profile,
+			emitter,
+			block: opts.block ?? null,
+			positionInBlock: opts.positionInBlock ?? null,
 			perSessionRate,
 			sessionsRequested,
 			sessionsConnected: arm.connected,
 			aggregateRate: Math.round(
-				planFor(PROFILE, perSessionRate).effectiveRatePerSession *
+				planFor(profile, perSessionRate).effectiveRatePerSession *
 					arm.connected,
 			),
 			elapsedSec: arm.elapsedSec,
@@ -1041,6 +1244,7 @@ async function main(): Promise<void> {
 			ingested: 0,
 			forwardLag: null,
 			fanout: null,
+			udp: arm.udp,
 		});
 
 		const oneWay = arm.client
@@ -1048,7 +1252,7 @@ async function main(): Promise<void> {
 			: null;
 		const ms = (ns: number) => (ns / 1e6).toFixed(3);
 		console.log(
-			`bench-egress: rate=${perSessionRate}/s/session sessions=${arm.connected} sent=${stats.sent}/${stats.scheduledDatagrams} recv=${arm.clientReceived} ` +
+			`bench-egress: ${profile}/${emitter}${opts.block !== undefined ? ` block=${opts.block}` : ""} rate=${perSessionRate}/s/session sessions=${arm.connected} sent=${stats.sent}/${stats.scheduledDatagrams} recv=${arm.clientReceived} ` +
 				(oneWay
 					? `p50=${ms(oneWay.p50Ns)}ms p99=${ms(oneWay.p99Ns)}ms p999=${ms(oneWay.p999Ns)}ms neg=${oneWay.negative} `
 					: "no-client-json ") +
@@ -1153,6 +1357,7 @@ async function main(): Promise<void> {
 
 		resetFanout(gridPeriodNs);
 		const cpuMs0 = serverCpuMs();
+		const fanoutUdp0 = readUdpStats();
 		const startedAt = Date.now();
 		const hostSamples: number[] = [];
 		let prevHost = readHostCpu();
@@ -1291,6 +1496,12 @@ async function main(): Promise<void> {
 		steps.push({
 			shape: SHAPE,
 			profile: PROFILE,
+			// The fan-out's originator is a forward loop driven by arrivals, not
+			// one of G3's three JS arms. It is labelled `serial` because that is
+			// what the forward loop does, and it never enters an arm comparison.
+			emitter: "serial",
+			block: null,
+			positionInBlock: null,
 			perSessionRate: publishRate,
 			sessionsRequested: n,
 			sessionsConnected: connected,
@@ -1313,6 +1524,7 @@ async function main(): Promise<void> {
 				gridPeriodNs,
 				peakWindowDatagrams: perTick * connected,
 				driveWindowSec,
+				emitter: "serial",
 			},
 			clientReceived,
 			client,
@@ -1324,6 +1536,7 @@ async function main(): Promise<void> {
 			ingested: fanout.ingested,
 			forwardLag: fanout.handlerToForward.toJson(),
 			fanout: record,
+			udp: udpDelta(fanoutUdp0, readUdpStats()),
 		});
 
 		const oneWay = client
@@ -1346,7 +1559,7 @@ async function main(): Promise<void> {
 
 	if (SHAPE === "headroom") {
 		console.log(
-			`bench-egress: headroom arm sessions=${SESSIONS} rate=${HEADROOM_RATE}/s/session profile=${PROFILE} multipliers=[${HEADROOM_MULTIPLIERS.join(",")}] ${HEADROOM_SECONDS}s each`,
+			`bench-egress: headroom arm emitter=${EMITTER} sessions=${SESSIONS} rate=${HEADROOM_RATE}/s/session profile=${PROFILE} multipliers=[${HEADROOM_MULTIPLIERS.join(",")}] ${HEADROOM_SECONDS}s each`,
 		);
 		const armSeconds =
 			HEADROOM_MULTIPLIERS.length * (HEADROOM_SECONDS + 2) + CONNECT_BUDGET_S;
@@ -1367,14 +1580,44 @@ async function main(): Promise<void> {
 		};
 		headroom = await runHeadroomArm(
 			clock,
-			subscribers.slice(0, connected).map((s) => s.send),
+			subscribers.slice(0, connected).map((s) => s.sender),
 			sampleHostCpu,
+			EMITTER,
 		);
 		sub.child.kill();
 		await sub.child.exited;
 		console.log(
-			`bench-egress: headroom ceiling ${headroom.ceilingPerSec.toFixed(0)}/s (loaded, ${connected} real sessions at ${HEADROOM_RATE}/s)`,
+			`bench-egress: headroom ceiling ${headroom.ceilingPerSec.toFixed(0)}/s for ${EMITTER} (loaded, ${connected} real sessions at ${HEADROOM_RATE}/s)`,
 		);
+	} else if (SHAPE === "gate") {
+		// Gate G3's block design: every block holds every (profile, emitter) arm
+		// exactly once, and block `r` runs them in the fixed list rotated left by
+		// `r`. Over the registered blocks each arm therefore occupies a different
+		// position in the running order every time, so a monotone drift in the box
+		// cannot masquerade as an arm effect. Every comparison the classifier makes
+		// is paired inside one block.
+		const cells = GATE_PROFILES.flatMap((profile) =>
+			GATE_EMITTERS.map((emitter) => ({ profile, emitter })),
+		);
+		console.log(
+			`bench-egress: gate rung=${GATE_RATE}/s/session × ${SESSIONS} sessions blocks=${GATE_BLOCKS} ` +
+				`arms/block=${cells.length} [${cells.map((c) => `${c.profile}/${c.emitter}`).join(" ")}] step=${STEP_SECONDS}s`,
+		);
+		for (let block = 0; block < GATE_BLOCKS; block += 1) {
+			const rotation = block % cells.length;
+			const order = [...cells.slice(rotation), ...cells.slice(0, rotation)];
+			for (let position = 0; position < order.length; position += 1) {
+				const cell = order[position];
+				if (!cell) continue;
+				await runStep(GATE_RATE, SESSIONS, {
+					profile: cell.profile,
+					emitter: cell.emitter,
+					block,
+					positionInBlock: position,
+				});
+				await Bun.sleep(SETTLE_MS);
+			}
+		}
 	} else if (SHAPE === "fanout") {
 		console.log(
 			`bench-egress: fan-out sweep=${FANOUT_MODE} N=[${FANOUT_N.join(",")}] ` +
@@ -1417,7 +1660,16 @@ async function main(): Promise<void> {
 				calibrationResidualNs: clock.calibrationResidualNs,
 				calibrationSpreadNs: clock.calibrationSpreadNs,
 			},
+			// What quinn-udp negotiated, read once. A capability, not a per-send
+			// segment count — the kernel exposes none, and no claim is made of one.
+			gso,
+			udpBaseline: readUdpStats(),
 			config: {
+				emitter: EMITTER,
+				gateEmitters: GATE_EMITTERS,
+				gateProfiles: GATE_PROFILES,
+				gateBlocks: GATE_BLOCKS,
+				gateRatePerSession: GATE_RATE,
 				sessions: SESSIONS,
 				payloadBytes: PAYLOAD_BYTES,
 				stepSeconds: STEP_SECONDS,
