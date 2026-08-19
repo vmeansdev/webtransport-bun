@@ -26,6 +26,8 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | queuedBytesGlobal | number | Bytes queued globally |
 | backpressureWaitCount | number | Times server session send waited on backpressure (incremented on timeout) |
 | backpressureTimeoutCount | number | Times server session send_datagram timed out (E_BACKPRESSURE_TIMEOUT) |
+| datagramMirrorCalls | number? | Native only: `server.sendDatagramMirror()` calls served. Never counted in `datagramSendsAsync` — the mirror hands JavaScript no promise, so it creates none of the host-loop exposure that counter names. Omitted on WASM. |
+| datagramMirrorTargets | number? | Native only: targets those mirror calls **attempted** (an over-cap tail is reported, never attempted, and is not counted here). Delivery is per-session `datagramsOut`, which the mirror increments exactly as every other send path does, so a mirrored datagram is indistinguishable from a looped one there. Omitted on WASM. |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
 | sniCertSelections | number | Handshakes served by hostname-specific SNI certificates |

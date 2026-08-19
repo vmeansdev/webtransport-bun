@@ -193,6 +193,22 @@ export interface WebTransportServer {
   setUnknownSniPolicy(policy: "reject" | "default"): Promise<void>;
   /** Inspect active SNI names and policy without exposing key material. */
   tlsSnapshot(): { sniServerNames: string[]; unknownSniPolicy: "reject" | "default" };
+  /**
+   * Send one payload to many of this server's sessions across one Node-API
+   * crossing. Synchronous and non-parking; native-only.
+   * See "One payload to many sessions".
+   */
+  sendDatagramMirror(
+    targets: readonly string[],
+    payload: Uint8Array,
+  ): {
+    sent: number;
+    failures: readonly {
+      target: string;
+      index: number;
+      error: WebTransportError;
+    }[];
+  };
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -348,6 +364,8 @@ export type MetricsSnapshot = {
   queuedBytesGlobal: number;
   backpressureWaitCount: number;
   backpressureTimeoutCount: number;
+  datagramMirrorCalls?: number;
+  datagramMirrorTargets?: number;
 
   rateLimitedCount: number;
   limitExceededCount: number;
@@ -496,6 +514,78 @@ between two sink invocations — so a batching sink measures a mean batch size o
 either a timer-based fill or resolving `write()` before delivery. Applications
 that need batched sending must hold the native session handle; the W3C path
 costs roughly one crossing per datagram and that asymmetry is deliberate.
+
+## One payload to many sessions
+
+`server.sendDatagramMirror(targets, payload)` sends the same payload to many of
+that server's sessions across a single Node-API crossing. It is **native-only**,
+for a stronger reason than batched sending: the crossing it amortizes does not
+exist on wasm, and the wasm backend has no session registry to fan out through.
+
+It is the fan-out of `trySendDatagram`, **not** of `sendDatagram`: the call is
+synchronous, hands JavaScript no promise, and never waits. A promise costs more
+than the whole fan-out below roughly a thousand targets; a serial parking
+fan-out would let one slow subscriber hold every other; a concurrent one would
+allocate a future per target — the allocation the API exists to avoid.
+
+The envelope is a **set, not a prefix**:
+
+```ts
+const { sent, failures } = server.sendDatagramMirror(targets, payload);
+// Every target was attempted, independently and in list order.
+// sent + failures.length === targets.length, always.
+```
+
+A target list has no ordering obligation — subscriber 4 being gone says nothing
+about subscriber 5 — so a dead target never stops the broadcast. This is the
+sharpest difference from `sendDatagramBatch`, whose prefix envelope is correct
+only because element `k+1` of one session's batch genuinely cannot precede
+element `k`.
+
+`failures` is the actionable half, and it names the failing **session id** as
+well as its index:
+
+- `E_SESSION_CLOSED` — unknown, reaped, or owned by another server in this
+  process. At ten thousand subscribers reaping is normal, so this list *is* the
+  reap list.
+- `E_QUEUE_FULL` — the payload is longer than `maxDatagramSize`, or the target
+  had no queued-byte budget at this instant. The mirror never waits, so this is
+  where backpressure lands; the remedy is `session.sendDatagram()` on just those
+  targets, which is the only path allowed to park.
+
+Contract points worth stating:
+
+- **The payload is copied once, before the fan-out**, and shared by reference
+  with every target: `N` copies out of JavaScript become one. A caller may
+  overwrite its array the moment the call returns.
+- **The peak byte reservation is one payload**, never `N × len`. Reserving a
+  whole fan-out against a per-session budget is meaningless (they are different
+  sessions) and against the global budget it would fail broadcasts every
+  individual send would have made.
+- **No deadline, because nothing waits.** The call performs `N`
+  reserve/try-send/release triples and returns.
+- **Targets are owner-scoped.** An id belonging to another server in the same
+  process is reported `E_SESSION_CLOSED` and receives nothing.
+- **Duplicate targets are delivered to twice.** The parameter is a list, not a
+  set; deduplicating would cost a hash set per call to second-guess a caller who
+  may have meant it.
+- **At most 10,000 targets per call**, a JavaScript-thread stall budget
+  expressed in targets. Over-cap throws `RangeError` synchronously, before
+  anything is sent — safe precisely because the call is synchronous, so there is
+  no promise to reject. The JavaScript layer deliberately does **not** chunk:
+  splitting a target list across two calls is observably identical to one call
+  over the union (no deadline to divide, no ordering across targets), so the
+  caller owns the decision of when to yield the loop. That is exactly the
+  property `sendDatagramBatch` lacks, which is why *it* chunks.
+- **It throws only for programming errors**: `TypeError` for a non-array target
+  list, a non-string element or a non-`Uint8Array` payload, and `RangeError`
+  over the cap. Never for a transport condition.
+- **Metrics.** `datagramMirrorCalls` and `datagramMirrorTargets` count the
+  calls and the targets they attempted. `datagramSendsAsync` deliberately does
+  **not** move: the mirror creates no promise, and that counter's meaning is
+  host-loop exposure. Per-session `datagramsOut` increments once per delivered
+  target, so a mirrored datagram is indistinguishable from a looped one in the
+  per-session counters a delivery ratio reads.
 
 ## Incoming datagram delivery
 
