@@ -31,7 +31,7 @@ import {
 	streamBatchDiagnosticsSnapshot,
 } from "../../packages/webtransport/src/stream-chunk-batch.ts";
 import {
-	createWallClock,
+	createWallClockWithSource,
 	Deframer,
 	encodeFrame,
 	FrameClass,
@@ -313,7 +313,8 @@ async function main(): Promise<void> {
 				"addon ran and batched nothing'. Refusing to drive an uninstrumented cell.",
 		);
 	}
-	const wallNs = createWallClock();
+	const clock = createWallClockWithSource();
+	const wallNs = clock.now;
 
 	// The counter's window is the drive window, not the process lifetime.
 	resetStreamBatchDiagnostics();
@@ -342,6 +343,7 @@ async function main(): Promise<void> {
 		backlogFraction: args.backlogFraction,
 		readableHighWaterMarkBytes: READABLE_HIGH_WATER_MARK,
 		knobBytes: config.batchBytes,
+		wallClockSource: clock.source,
 		sessionsOk,
 		sessionsErr,
 		streamErrors,

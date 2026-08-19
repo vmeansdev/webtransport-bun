@@ -614,10 +614,10 @@ same per-stream cadence. If the two ends differ materially, that difference is
 the finding — the client end reads through a read-ahead bridge and the server
 end reads deferred-direct (Amendment 2), and nothing has ever compared them.
 
-### Amendment 4 — four harness facts the build found, each pre-dispatch (2026-08-19)
+### Amendment 4 — five harness facts the build found, each pre-dispatch (2026-08-19)
 
 Found while building and smoking the harness, before any dispatch. **No
-threshold moves, no clause changes, no cell is added or removed.** Four things
+threshold moves, no clause changes, no cell is added or removed.** Five things
 this document assumed about instruments turned out to be different in the tree,
 and each is recorded here rather than discovered in a run's artifact.
 
@@ -681,6 +681,30 @@ The driver therefore withholds for
 fractions do not move**: they still name a fraction of the shipped
 `maxQueuedBytesPerStream`, and this is what makes the driver actually reach
 them. The high-water mark used travels in every Arm D artifact.
+
+**(e) The one-way clock had to become an FFI `CLOCK_REALTIME` read, or V-N
+would have invalidated the gate for an instrument fault.** §1.2's reason for
+putting this gate on one box, quoted in full:
+
+> - **One clock.** Both endpoints on one host makes per-direction **one-way**
+>   delay measurable. A cross-host design could only give a round trip, and this
+>   gate's latency and fairness clauses are per-direction.
+
+One host is necessary and it was not sufficient. The JS side's first instrument
+anchored `Date.now()` at a millisecond tick edge and advanced it with the
+monotonic clock; against the Rust generator's `SystemTime::now()` that produced
+**~2% negative one-way samples** on a loopback wiring check (62 of 3,210), while
+the same server against a JS peer produced **zero** — the signature of two
+epochs, not of a transport delivering frames before they were sent. V-N is
+registered to invalidate exactly that, so the gate would have come back INVALID
+for a clock.
+
+The JS side now reads `clock_gettime(CLOCK_REALTIME)` through FFI, which is the
+same system clock `SystemTime::now()` reads — `latency-clock.ts`'s precedent on
+the G7 branch, applied to a different clock id. Nothing about the frame, the
+field, the Rust side or any threshold changes; the negative counts went to zero
+on both arms and the clock source travels in every artifact. The anchored reader
+remains as a fallback, and a cell that used it says so.
 
 **(d) A teardown race would have charged C4 for stream errors the run did not
 suffer.** When one end observes EOF it may close its session while the peer's
