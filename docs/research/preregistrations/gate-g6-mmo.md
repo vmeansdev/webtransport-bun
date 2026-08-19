@@ -775,8 +775,67 @@ table did not happen.
 
 | # | date | run id | candidate SHA | staging base | pre-flight artifact + date | arms | outcome |
 |---|---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — | *no dispatch yet* |
+| A1 | 2026-08-19 | *none — never dispatched* | `523fcd161236451a6e1c2dfb968d0469555cafde` | `2a4145d0556a35f8b4a0849e5953927b5e028b64` | `preflight-1150.json` (2026-08-19T14:11:58Z), `preflight-64.json` (2026-08-19T14:16:56Z) | *none taken* | **ABORTED before dispatch — V-C fired on R-up** |
+
+### A1 — pre-dispatch abort, 2026-08-19
+
+Step 0 of §11c was executed on the Mac and both artifacts were evaluated through
+`evaluatePreflight` against `preflightRequirements()`. **R-down passes, R-up
+fails, so the §8 cable STOP fires and the gate does not run.** No arm was taken,
+no dispatch was made, and no threshold in this document was touched.
+
+| requirement | offered | payload | verdict | clean ceiling @ 0.1% | headroom | MTU | idle RTT p99 |
+|---|---|---|---|---|---|---|---|
+| **R-down** | 75,000 pps | 1150 B | **PASS** | 81,508 pps | 1.087× | 1500 B | 4.967 ms |
+| **R-up** | 20,000 pps | 64 B | **FAIL** | *none* | — | 1500 B | 2.583 ms |
+
+`evaluatePreflight` returns exactly one reason on R-up: `no UDP rung at 64 B
+stayed under 0.1% loss`.
+
+**The mechanism, stated honestly.** This is not a measurement showing the link
+cannot carry 20,000 pps at 64 B. It is the *absence* of any measurement that
+speaks to R-up. `preflight.ts` defaults `--rates-mbit` to
+`[100,250,500,750,900,1000]`, a ladder sized for 1150 B where 100 Mbit/s is
+~10,900 pps. The 64 B run changed `--payload-bytes` and left the ladder alone,
+so every rung landed 18× higher in pps than intended: the **lowest** rung
+measured was 77,297 pps — 3.9× the requirement — and at that rate the path is
+already sender/receiver-bound at 0.157% loss. All five rungs sit between 0.157%
+and 0.505%, so `derivePpsCeiling(…, 0.1)` finds no clean rung and returns
+`null`. The requirement's own rate was never offered.
+
+**This falsifies P1** (§9), which predicted R-down would be the binding
+pre-flight requirement. R-down passed; R-up is what stopped the gate. P1 is
+scored a miss on the record, and it is scored against the *procedure* — the
+prediction was about the link, and the link was never asked the question.
+
+**What is not licensed by this row.** Not a lower gate rung, not a loopback
+substitute, not the loadgen VM, and not reading R-up off the 1150 B artifact.
+§8 is explicit and it was followed.
+
+**The single unblocking action**, for whoever takes it: re-run step 0's second
+command with a ladder that brackets 20,000 pps at 64 B (20,000 × 64 × 8 =
+10.24 Mbit/s, so e.g. `--rates-mbit 10,25,50,100`), same calendar day as the
+dispatch. That re-runs the registered tool at the registered requirement; it
+moves nothing. Both honesty arms (V-F floor, V-S sink) must then also be taken
+on the dispatch day, since both are same-day preconditions.
+
+**State of the other pre-dispatch checks at abort time:**
+
+- **Candidate (§11)** — verified from `git ls-remote` / `git merge-base`, never
+  typed. `probe/g6-mmo-01` head is `523fcd161236451a6e1c2dfb968d0469555cafde`
+  and its merge-base with `rebind4-staging` is
+  `2a4145d0556a35f8b4a0849e5953927b5e028b64`, equal to the header's base.
+  Staging has **not** moved, so §11's re-derivation clause does not apply.
+- **V-F floor** — **not taken.** Blocked by the STOP above, and the host was in
+  no state to produce one: load average 7.79 / 11.55 / 11.62 at 16:24 local. A
+  floor measured under that is not this machine's floor. The
+  `mac-generator-entry.sh` contract was verified non-destructively with
+  `--plan`: full SHA accepted, 7-character abbreviation refused (exit 3),
+  `~/wt-macgen` clean, candidate object present, `load-client` release binary
+  in place.
+- **V-S sink** — **not taken.** Same reason.
 
 ## 13. Verdict
 
-*Not yet run.*
+*Not yet run.* The first attempt aborted before dispatch on the §8 cable STOP;
+see §12 row A1.

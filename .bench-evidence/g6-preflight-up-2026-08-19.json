@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "startedAt": "2026-08-19T14:16:56.866Z",
+  "generator": {
+    "hostname": "Nikitas-MacBook-Pro.local",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpus": 10,
+    "memoryBytes": 68719476736
+  },
+  "link": {
+    "localAddress": "",
+    "peerAddress": "10.99.0.2",
+    "subnet": "10.99.0.0/24",
+    "interfaceName": "en8",
+    "mtuBytes": 1500,
+    "mtuProbePayloadBytes": 1472
+  },
+  "guards": [
+    {
+      "name": "peer-on-cable-subnet",
+      "ok": true,
+      "detail": "10.99.0.2 in 10.99.0.0/24"
+    },
+    {
+      "name": "peer-routes-over-wire",
+      "ok": true,
+      "detail": "interface en8"
+    }
+  ],
+  "rtt": {
+    "samples": 600,
+    "transmitted": 600,
+    "received": 600,
+    "lossPct": 0,
+    "p50Ms": 1.549,
+    "p99Ms": 2.583,
+    "maxMs": 7.395
+  },
+  "tcp": {
+    "bitsPerSec": 859840059.3985854,
+    "retransmits": 0,
+    "seconds": 10.009666
+  },
+  "udpRungs": [
+    {
+      "offeredBitsPerSec": 100000000,
+      "payloadBytes": 64,
+      "sentPackets": 1160070,
+      "receivedPackets": 1158250,
+      "lostPackets": 1820,
+      "lossPct": 0.1568870844000793,
+      "jitterMs": 0.011237374955998141,
+      "seconds": 15.007883,
+      "deliveredPps": 77176.1080493498,
+      "offeredPps": 77297.3776514649
+    },
+    {
+      "offeredBitsPerSec": 250000000,
+      "payloadBytes": 64,
+      "sentPackets": 1203349,
+      "receivedPackets": 1200963,
+      "lostPackets": 2386,
+      "lossPct": 0.1982799669921195,
+      "jitterMs": 0.007481945992120456,
+      "seconds": 15.008715,
+      "deliveredPps": 80017.7097106581,
+      "offeredPps": 80176.68401325497
+    },
+    {
+      "offeredBitsPerSec": 500000000,
+      "payloadBytes": 64,
+      "sentPackets": 1517548,
+      "receivedPackets": 1511612,
+      "lostPackets": 5936,
+      "lossPct": 0.3911573142991194,
+      "jitterMs": 0.005745046391769366,
+      "seconds": 15.00645,
+      "deliveredPps": 100730.81908112846,
+      "offeredPps": 101126.3823222681
+    },
+    {
+      "offeredBitsPerSec": 750000000,
+      "payloadBytes": 64,
+      "sentPackets": 1612397,
+      "receivedPackets": 1605879,
+      "lostPackets": 6518,
+      "lossPct": 0.40424287566895745,
+      "jitterMs": 0.006545526844663782,
+      "seconds": 15.004313,
+      "deliveredPps": 107027.82593245023,
+      "offeredPps": 107462.23435888068
+    },
+    {
+      "offeredBitsPerSec": 900000000,
+      "payloadBytes": 64,
+      "sentPackets": 1618714,
+      "receivedPackets": 1610540,
+      "lostPackets": 8174,
+      "lossPct": 0.5049687591507827,
+      "jitterMs": 0.00787239825799458,
+      "seconds": 15.005085,
+      "deliveredPps": 107332.947464143,
+      "offeredPps": 107877.69612767939
+    }
+  ],
+  "ceiling": {
+    "cleanPps": 107027.82593245023,
+    "cleanOfferedPps": 107462.23435888068,
+    "peakDeliveredPps": 107332.947464143,
+    "lossBoundPct": 0.5,
+    "cleanRungs": 4
+  },
+  "registeredProperties": {
+    "mtuBytes": 1500,
+    "idleRttP50Ms": 1.549,
+    "idleRttP99Ms": 2.583,
+    "cleanPpsCeiling": 107027.82593245023,
+    "lossBoundPct": 0.5,
+    "payloadBytes": 64
+  },
+  "notes": [
+    "iperf3 UDP 1000M failed: Error: iperf3 UDP output has no end.sum "
+  ]
+}
