@@ -11,6 +11,10 @@ import {
 	WebTransport,
 	WebTransportError,
 } from "../src/index.js";
+import {
+	SERVER_CLOSING_CLOSE_CODE,
+	SERVER_CLOSING_CLOSE_REASON,
+} from "../src/server-close.js";
 import { nextWithTimeout } from "./helpers/harness.js";
 import {
 	createParityHarness,
@@ -113,6 +117,43 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 				onServerSession = () => {};
 			}
 		});
+
+		test("server shutdown close values are backend-specific and pinned", async () => {
+			// `server.close()` puts a close code and reason on the wire, and the
+			// two backends put DIFFERENT ones there. That divergence is recorded
+			// in docs/PARITY_MATRIX.md ("Session shutdown on the wire"); this
+			// test is what stops either side of it from drifting silently.
+			//
+			// Native names the event: 3993 / E_SERVER_CLOSING, so a peer can
+			// tell "the server took this session down" from "the session was
+			// lost" (docs/SPEC.md, "Server shutdown close semantics").
+			// Wasm cannot name it — WasmTransportManager.close() is the same
+			// call for a client releasing its own endpoint — so it stays on a
+			// plain application close.
+			//
+			// A dedicated harness: closing the shared one would end the suite.
+			const own = await createParityHarness();
+			const wt = await own.open();
+			await wt.ready;
+			const closed = wt.closed;
+			await own.close();
+			const info = await closed;
+			if (isWasmParityBackend()) {
+				expect(wasmParityReady()).toBe(true);
+				// Wasm sends `wt_close_all(eid, 0, "endpoint closed")`, and the
+				// peer reads back only the code: the wasm client fills
+				// `reason` from its own last-error detail, not from the
+				// CONNECTION_CLOSE reason, so a shutdown arrives nameless.
+				expect(info.closeCode).toBe(0);
+				expect(info.reason).toBeUndefined();
+				return;
+			}
+			expect(info.closeCode).toBe(SERVER_CLOSING_CLOSE_CODE);
+			expect(info.reason).toBe(SERVER_CLOSING_CLOSE_REASON);
+			// The literals, not just the constants — the values a peer reads.
+			expect(info.closeCode).toBe(3993);
+			expect(info.reason).toBe("E_SERVER_CLOSING");
+		}, 30_000);
 
 		test("WebTransportError has code, message, source (spec-like shape)", () => {
 			const err = new WebTransportError(

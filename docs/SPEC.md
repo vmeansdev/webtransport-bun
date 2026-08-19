@@ -68,6 +68,7 @@ On supported targets (Bun/Node/Deno on macOS/Linux/Windows), the transport backe
 - **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path, session, and Web Streams facade errors use browser-style DOMException names while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
 - **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError; other E_INTERNAL cases → OperationError.
 - **Unknown errors:** No broad catch-all; unmapped cases keep `name: "WebTransportError"`.
+- **Close-reason-only codes:** `E_SERVER_CLOSING` is in the `ErrorCode` union and exported like its peers, but it is only ever produced as a `CloseInfo.reason` (with close code `3993`), never as a thrown `WebTransportError.code` — so it has no `strictW3CErrors` mapping. See "Server shutdown close semantics".
 
 ## TypeScript API (authoritative)
 
@@ -382,12 +383,58 @@ export type SessionMetricsSnapshot = {
 - Node stream backpressure:
 * writing beyond buffer returns `false`, then `'drain'` fires when writable resumes.
 - Idle timeout: a session with no activity (configurable definition) must close with `E_SESSION_IDLE_TIMEOUT` / close info.
+- Server shutdown: sessions the server ends during `server.close()` close with code `3993` / reason `E_SERVER_CLOSING`. See "Server shutdown close semantics" below.
 - Limits and rate limits must be enforced before allocating unbounded buffers.
 
 Examples (expected to work):
 - Datagram echo server and client
 - Bidi stream echo server and client
 - Uni stream upload and download
+
+## Server shutdown close semantics
+
+When `server.close()` ends sessions the server still owns, those sessions close
+with a dedicated, wire-visible code and reason:
+
+| Field | Value |
+|---|---|
+| Close code | `3993` (`SERVER_CLOSING_CLOSE_CODE`) |
+| Close reason | `"E_SERVER_CLOSING"` (`E_SERVER_CLOSING`, exported from the root entrypoint) |
+
+**When it is sent.** Every path by which `server.close()` terminates a session
+uses this pair, so the peer sees one answer regardless of which one ran:
+
+- the accept loop's endpoint close, once the shutdown signal fires;
+- the registry sweep that closes each session this server still owns;
+- the drain watchdog's abort phase, when the grace period expires with sessions
+  still live;
+- the JS-side fallback in `createServerCloseContract`, which resolves the
+  `closed` promise of every still-owned session with the same `{ code, reason }`
+  so an app sees identical values whether the event arrived off the wire or from
+  the local fallback.
+
+**Why it is distinct.** `3993` sits with the other well-known server-originated
+close codes (`3990` idle timeout, `3992` limit exceeded) and answers a question
+the application close code `0` could not: *this session was taken down
+deliberately by its server, it was not lost*. A peer can therefore reconnect
+immediately instead of treating the close as a transport failure, and the server's
+own `sessionsClosedByReap` metric is keyed off the same code.
+
+**`E_SERVER_CLOSING` is a close reason, not a thrown error.** It never appears as
+`WebTransportError.code`, so it is deliberately absent from the native
+error-message parser's code list and from the `strictW3CErrors` mapping table
+above; it is in the `ErrorCode` union and exported alongside its peers because
+the reason string is API and callers compare against it.
+
+**Changed in 1.0.0-pre:** these sessions previously closed with application code
+`0` and the free-text reason `"server closing"`, which was indistinguishable
+from an ordinary application close and carried no stable code. Applications
+matching on the old pair must switch to `3993` / `E_SERVER_CLOSING`.
+
+The wasm backend does not send this pair — its endpoint close is code `0` /
+`"endpoint closed"`, and the peer observes `{ closeCode: 0 }` with no reason. See
+`docs/PARITY_MATRIX.md`, "Session shutdown on the wire", for the recorded
+divergence and why it stands.
 
 ## Outgoing datagram batching
 

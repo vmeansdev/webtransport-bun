@@ -111,10 +111,12 @@ the TypeScript signature.
 ### Session shutdown on the wire
 
 These rows cover how a session close, a drain, and a stream error actually reach
-the peer. **Two of the five behaviors below are implemented on both backends
-(`WT_CLOSE_SESSION`, `WT_DRAIN_SESSION`), plus the `WT_APPLICATION_ERROR` remap;
-`GOAWAY` is native-only and buffered-stream reject is wasm-only, both by
-design** — see section 3. The evidence that matters here is Chromium, not
+the peer. **Two of the five capsule/remap behaviors below are implemented on both
+backends (`WT_CLOSE_SESSION`, `WT_DRAIN_SESSION`), plus the
+`WT_APPLICATION_ERROR` remap; `GOAWAY` is native-only and buffered-stream reject
+is wasm-only, both by design** — see section 3. The last row is not a capsule at
+all but the close *values* a server shutdown puts on the wire, and it is the one
+recorded divergence here. The evidence that matters here is Chromium, not
 native-to-native: a QUIC `CONNECTION_CLOSE` looks like a valid close to another
 copy of ourselves while telling a browser nothing, which is exactly how the old
 interop gates passed while the defect was live.
@@ -124,12 +126,26 @@ interop gates passed while the defect was live.
 | `WT_CLOSE_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_registry.rs,client.rs,lib.rs}` (via the fork's `Connection::close_session`); `crates/wasm/src/{capsule.rs,endpoint.rs}` | Real Chromium reads back both fields on both backends: `tools/interop/tests/edge-cases.pw.ts`, `tools/interop/tests/interop-expanded.pw.ts`, `tools/interop/tests-wasm/wasm-server.spec.ts`. Backend-to-backend: `packages/webtransport/test/parity-error-close.test.ts` ("close code and reason cross the wire from the peer"). WASM unit: `crates/wasm/src/endpoint_tests.rs::primary_session_close_conveys_code_and_reason_over_capsule` |
 | `WT_DRAIN_SESSION` capsule (send + receive) | `implemented` | `implemented` | `crates/native/src/{session_napi.rs,session_registry.rs,client.rs}` over the fork's `drain_session`/`draining`; `packages/webtransport/src/{index.ts,portable.ts,portable-native.ts}`; `crates/wasm/src/{capsule.rs,endpoint.rs}` | `packages/webtransport/test/parity-facade-lifecycle.test.ts` ("draining resolves on a peer drain, and the session stays usable") runs on **both** backends. WASM unit: `crates/wasm/src/endpoint_tests.rs::drain_capsule_notifies_the_peer_without_closing_the_session` |
 | `WT_APPLICATION_ERROR` remap (§4.4, QUIC stream codes only) | `implemented` | `implemented` | fork `wtransport/src/stream.rs` (`reset`/`stop` take a `u32` and map it); `crates/wasm/src/wt_error.rs` | Chromium round-trips the code on both backends: `tools/interop/tests/interop-expanded.pw.ts` and `tools/interop/tests-wasm/wasm-server.spec.ts` ("stream reset code round-trips … through the remap"). Both were verified to fail when the server shifts the code by one |
+| Close code/reason on `server.close()` | Code `3993`, reason `E_SERVER_CLOSING` — a stable, well-known pair alongside `3990` (idle) and `3992` (limit exceeded); see `docs/SPEC.md`, "Server shutdown close semantics" | Code `0`, reason `"endpoint closed"` — a plain application close. The peer observes only the code: the wasm client fills `CloseInfo.reason` from its own last-error detail, not from the received CONNECTION_CLOSE reason, so a shutdown arrives as `{ closeCode: 0 }` with no reason at all | `crates/native/src/{lib.rs,server.rs,server_napi.rs}` + `packages/webtransport/src/server-close.ts`; wasm: `packages/webtransport/src/backend-wasm.ts` (`wt_close_all(eid, 0, "endpoint closed")`) and `packages/webtransport/src/backend.ts` (`WasmTransportManager.close()` marking owned sessions `{ code: 0, reason: "endpoint closed" }`) | `packages/webtransport/test/liveness-close-contract.test.ts` (native, literal values pinned); `packages/webtransport/test/parity-error-close.test.ts` ("server shutdown close values are backend-specific and pinned") asserts the pair on whichever backend is selected |
 
 **`draining` is wire-driven on both backends, with the local-close fallback
 kept.** It resolves on a received `WT_DRAIN_SESSION` (and, on native, a received
 `GOAWAY` — the fork folds both into one signal), and *also* on the local
 `close()` path and on `closed`. Those fallbacks are deliberate: a peer that never
 drains must not leave consumers waiting forever.
+
+**The shutdown close pair is a live divergence, not an oversight.** Native has a
+server-owned session registry, so "the server is shutting this session down" is a
+state it can name; every native shutdown path therefore emits `3993` /
+`E_SERVER_CLOSING`. Wasm has no such distinction to make: `WasmTransportManager`
+is one endpoint manager shared by clients and servers, and its `close()` is the
+same call whether a `/wasm` server is shutting down or a client is releasing its
+own endpoint. Emitting a server-shutdown code from that path would put
+`E_SERVER_CLOSING` on the wire when a *client* closes, which is worse than the
+divergence. Aligning wasm needs a server-owned close path first, so the value is
+recorded here rather than changed. Native remains the authority for the code:
+`docs/SPEC.md` documents the pair, and the wasm value is pinned by the parity
+test above so it cannot drift silently either.
 
 **The native backend consumes the fork at rev `ac515b1`** (branch
 `feat/qpack-dynamic`, which stacks on `feat/track1-conformance`, itself a
