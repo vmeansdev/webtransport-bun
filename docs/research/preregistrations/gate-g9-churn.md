@@ -182,7 +182,7 @@ the derivation does not describe. **620 / 2 = 310 ms**, floored to a whole
 
 **Derivation B — independent convergence.** K26: the shipped instrument
 documents a p99 target of **300 ms**, authored before this effort and by a
-different hand. 310 and 300 agree to **3.2%**.
+different hand. 310 and 300 agree to **3.3%** (Amendment 1).
 
 **The registered bar is 300 ms** — the tighter of the two, so the gate is never
 more lenient than either source. That the two agree is a coincidence of
@@ -261,8 +261,10 @@ oversleep costs **3** arrivals of deficit on one shard rather than 24 globally.
 
 S = 8 is derived: it is the smallest power of two for which the per-shard
 interval at the gate rung exceeds the generator's mean observed schedule lag by
-a factor of ten or more (13.33 / 0.871 = 15.3; S = 16 would give 6.67 / 0.871 =
-7.7 and fail the test). **The day's floor arm re-checks it on the real p99**
+a factor of ten or more. Sharding *widens* the per-shard interval
+(`1000 · S / R`), so the binding direction is downward: S = 8 gives
+13.33 / 0.871 = **15.3** and clears it, and S = 4 gives 6.67 / 0.871 = **7.7**
+and does not (Amendment 2). **The day's floor arm re-checks it on the real p99**
 (§7 V-F): if `scheduleLagP99 > perShardIntervalMs / 10 = 1.333 ms`, V-F fires
 and the rung is INCOMPLETE.
 
@@ -605,6 +607,38 @@ Any change to this document after it is committed and before a dispatch is an
 moved and why. Ticket 30's precedent: mechanizing arithmetic exposes errors in
 prose, and the correction belongs on the record rather than in a silent edit.
 **After a dispatch, nothing in §1–§7 may change at all.**
+
+Both amendments below were raised by `tools/load/g9-plan.test.ts` failing
+against the prose, before any harness ran and long before any dispatch. **No
+threshold moved in either.**
+
+### Amendment 1 — the convergence figure in §1.4
+
+Original: *"310 and 300 agree to **3.2%**."*
+
+|310 − 300| / 300 = 3.33%, not 3.2%. Corrected to 3.3%. The figure is a
+disclosure about how close two independent derivations landed; it carries no
+clause, and the registered bar (300 ms, the tighter of the two) is untouched.
+
+### Amendment 2 — the shard derivation in §1.7 was argued in the wrong direction
+
+Original: *"S = 8 is derived: it is the smallest power of two for which the
+per-shard interval at the gate rung exceeds the generator's mean observed
+schedule lag by a factor of ten or more (13.33 / 0.871 = 15.3; S = 16 would
+give 6.67 / 0.871 = 7.7 and fail the test)."*
+
+The per-shard interval is `1000 · S / R`, so it **grows** with S. S = 16 would
+give 26.67 ms and clear the test more easily, not fail it; the 6.67 ms figure
+quoted against S = 16 is in fact **S = 4**'s. The conclusion — that S = 8 is
+the smallest power of two clearing the factor of ten — was and remains correct,
+and 8 stays the registered value; what was wrong was the falsifying case named
+beside it. Corrected to S = 4, and a unit test now pins both sides plus the
+one-sidedness of the bound, so the argument cannot be run backwards again.
+
+The downstream figures are unaffected and were independently correct: 13.33 ms
+per-shard interval, 1.333 ms V-F bound, 0.011% pacer residual, and 3 arrivals
+of deficit per shard against 24 globally at K11's 40.6 ms maximum — all four
+are now pinned by tests.
 
 ---
 
