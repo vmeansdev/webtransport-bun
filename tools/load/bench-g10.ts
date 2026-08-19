@@ -47,9 +47,14 @@ import {
 } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	cellDeadlineMs,
+	waitForChildWithDeadline,
+} from "./bench-child-deadline.ts";
+import {
 	type ArmClauses,
 	type ArmId,
 	armComparabilityFalsifier,
+	deadlineFalsifier,
 	denominatorFalsifier,
 	evaluateEmitterHonesty,
 	evaluateFleetDelivery,
@@ -760,6 +765,8 @@ async function main(): Promise<void> {
 	);
 
 	const rungs: unknown[] = [];
+	/** Rates whose subscriber fleet outlived its deadline and was killed. */
+	const breachedRates: number[] = [];
 	for (const rate of LADDER) {
 		rungs.push(await runRung(rate));
 		await drain();
@@ -795,6 +802,10 @@ async function main(): Promise<void> {
 		mirrorComposed: typeof mirrorEntry === "function",
 		preflightRequirements: preflightRequirements(GATE_RATE),
 		windowSeconds: WINDOW_SECONDS,
+		// A rung whose fleet had to be killed is a truncated window, and the
+		// killing itself quiesces the server — so the fact travels at the top of
+		// the artifact as well as inside the rung, where a reader cannot miss it.
+		deadlineBreachedRates: breachedRates,
 		rungs,
 	};
 	writeFileSync(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
@@ -847,7 +858,49 @@ async function main(): Promise<void> {
 		const sessionsActive = server.metricsSnapshot().sessionsActive;
 
 		if (client.smoke) await client.smoke.stop();
-		const report = await pumped;
+
+		// The unbounded wait this gate used to carry. `pumpSubscribers` drains the
+		// fleet's stdout and then awaits its exit, so a wedged subscriber wedged
+		// the conductor — G7's failure mode, and the one ticket 01 exists to make
+		// impossible. The deadline is the pre-registered
+		// drive + stagger + settle + margin, measured from the drive window's
+		// start; the fleet's own establishment is bounded separately by
+		// ESTABLISH_TIMEOUT_S, so the stagger term is zero here.
+		const rungDeadlineMs = cellDeadlineMs({
+			driveMs: WINDOW_SECONDS * 1000,
+			connectStaggerMs: 0,
+			settleMaxMs: SETTLE_SECONDS * 1000,
+		});
+		// A holder rather than a `let`: assigned inside a callback, a plain local
+		// reads back as `null` to the narrower and the report would quietly type
+		// itself out of existence.
+		const pumpedReport: { value: OffboxReport | null } = { value: null };
+		const wait = await waitForChildWithDeadline(
+			{
+				exited: pumped.then((r) => {
+					pumpedReport.value = r;
+					return 0;
+				}),
+				// Detached spawn, so this signals the whole process group: an ssh
+				// wrapper that outlives its child is the wedge shape this gate is
+				// most exposed to.
+				kill: (signal) =>
+					killChildren(typeof signal === "string" ? signal : "SIGKILL"),
+			},
+			{
+				deadlineMs: Math.max(rungDeadlineMs - (Date.now() - startedMs), 0),
+				sampleIntervalMs: 1000,
+				onBreach: (phase) =>
+					console.error(
+						`bench-g10: rung R=${rate} passed its ${(rungDeadlineMs / 1000).toFixed(0)} s deadline — ${phase}; this rung is INVALID`,
+					),
+			},
+		);
+		// A killed fleet's partial stdout is a truncated window, not a short rung:
+		// reporting its counters would put half a window's delivery beside the
+		// flag that says it is not a measurement.
+		const report = wait.deadlineBreached ? null : pumpedReport.value;
+		if (wait.deadlineBreached) breachedRates.push(rate);
 
 		return summarize(
 			rate,
@@ -857,6 +910,7 @@ async function main(): Promise<void> {
 			loopTicks,
 			kernelBefore,
 			kernelAfter,
+			wait.deadlineBreached,
 		);
 	}
 
@@ -1012,6 +1066,7 @@ async function main(): Promise<void> {
 		loopTicks: number,
 		kernelBefore: Record<string, number> | null,
 		kernelAfter: Record<string, number> | null,
+		deadlineBreached: boolean,
 	): unknown {
 		const loopLagP99Ms =
 			loopLag.count > 0 ? loopLag.percentile(0.99) / 1e6 : null;
@@ -1192,7 +1247,9 @@ async function main(): Promise<void> {
 					: null,
 			perArm,
 			offboxReport: report,
+			deadlineBreached,
 			falsifiers: {
+				"V-W": deadlineFalsifier(deadlineBreached),
 				"V-A": vA,
 				"V-L": vL,
 				"V-G": vG,
@@ -1222,8 +1279,19 @@ async function main(): Promise<void> {
 				FLEET,
 			),
 			// Second opinion only. §10 requires the gate agent to recompute every
-			// clause from the raw fields above; this is here to disagree with.
-			classifierVerdict: gateVerdict(armClauses),
+			// clause from the raw fields above; this is here to disagree with. A
+			// breached rung has no verdict to offer: killing the fleet stops every
+			// counter at once, so its clauses would compute over half a window and
+			// the liveness clause would read a server that quiesced because it was
+			// emptied.
+			classifierVerdict: deadlineBreached
+				? {
+						verdict: "no-verdict" as const,
+						arm: VERDICT_ARM,
+						failed: [],
+						reason: deadlineFalsifier(true).reason,
+					}
+				: gateVerdict(armClauses),
 		};
 	}
 

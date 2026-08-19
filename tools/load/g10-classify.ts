@@ -524,7 +524,8 @@ export type FalsifierId =
 	| "V-X"
 	| "V-G"
 	| "V-A"
-	| "V-L";
+	| "V-L"
+	| "V-W";
 
 /** The four that strip force from a named statement instead of killing the run. */
 export const SOFT_FALSIFIERS: ReadonlySet<FalsifierId> = new Set<FalsifierId>([
@@ -817,6 +818,28 @@ export function armComparabilityFalsifier(
  * because it strips force from a *disclosure*: C7 reads `passStallNs`, a
  * different instrument, and is untouched by this.
  */
+/**
+ * V-W. The subscriber fleet outlived the rung's pre-registered deadline and the
+ * conductor killed it (ticket 01's formula: drive + stagger + settle + margin).
+ *
+ * This is a hard falsifier for the reason it is easy to get wrong: killing the
+ * fleet quiesces the server instantly, so every settle-shaped check passes on a
+ * window that was cut short. A rung that fires V-W is not a slow rung, it is
+ * not a rung with a caveat, and it is never a number.
+ */
+export function deadlineFalsifier(breached: boolean): {
+	fires: boolean;
+	reason: string;
+} {
+	return breached
+		? {
+				fires: true,
+				reason:
+					"V-W: the subscriber fleet was killed at its deadline, so this rung's window is truncated and every counter under it is partial",
+			}
+		: { fires: false, reason: "V-W: the fleet exited inside its deadline" };
+}
+
 export function loopLagSamplerFalsifier(facts: {
 	ticksRecorded: number;
 	windowSeconds: number;

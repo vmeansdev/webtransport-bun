@@ -16,6 +16,7 @@ import {
 	excludedMessageFraction,
 	gateVerdict,
 	generatorFalsifier,
+	deadlineFalsifier,
 	invalidatesRun,
 	leverStatement,
 	loopLagSamplerFalsifier,
@@ -567,6 +568,13 @@ describe("§7 — which falsifiers kill the run", () => {
 		expect(invalidatesRun("V-SP")).toBe(false);
 		expect(invalidatesRun("V-X")).toBe(false);
 		expect(invalidatesRun("V-A")).toBe(false);
+	});
+
+	test("V-W kills the rung it fires on — a killed fleet is never a number", () => {
+		expect(invalidatesRun("V-W")).toBe(true);
+		expect(deadlineFalsifier(true).fires).toBe(true);
+		expect(deadlineFalsifier(true).reason).toContain("truncated");
+		expect(deadlineFalsifier(false).fires).toBe(false);
 	});
 });
 
