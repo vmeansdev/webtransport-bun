@@ -59,6 +59,21 @@ on:
         required: false
         default: "64"
         type: string
+      latency_send_sync:
+        description: "WEBTRANSPORT_DATAGRAM_SEND_SYNC for every latency arm; leave empty for the shipped default. Set to 0 for the promise-path positive control (prereg Amendment 6)"
+        required: false
+        default: ""
+        type: string
+      latency_watchdog_grace_sec:
+        description: "Seconds to wait after an arm writes its fragment before killing the driver (a driver still alive then is pinned)"
+        required: false
+        default: "900"
+        type: string
+      latency_watchdog_ceiling_sec:
+        description: "Seconds an arm may run without writing its fragment before it is killed as a harness fault"
+        required: false
+        default: "1200"
+        type: string
 jobs:
   bench:
     permissions:
@@ -135,6 +150,10 @@ jobs:
       # docs/research/preregistrations/latency.md.
       - name: Run latency axis
         if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_probe == 'true' }}
+        # Backstop only. The per-arm watchdog below is what actually bounds a
+        # pinned driver; this keeps a failure of the watchdog itself from
+        # holding the heavy runner for the full job timeout.
+        timeout-minutes: 75
         env:
           LATENCY_SESSIONS: ${{ github.event.inputs.sessions }}
           LATENCY_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -142,6 +161,9 @@ jobs:
           LATENCY_RATES: ${{ github.event.inputs.latency_rates }}
           LATENCY_TICK_HZ: ${{ github.event.inputs.latency_tick_hz }}
           LATENCY_ARMS: ${{ github.event.inputs.latency_arms }}
+          LATENCY_SEND_SYNC: ${{ github.event.inputs.latency_send_sync }}
+          WATCHDOG_GRACE_SEC: ${{ github.event.inputs.latency_watchdog_grace_sec }}
+          WATCHDOG_CEILING_SEC: ${{ github.event.inputs.latency_watchdog_ceiling_sec }}
         run: |
           set -euo pipefail
           OUTDIR="$GITHUB_WORKSPACE/.bench-evidence"
@@ -149,26 +171,100 @@ jobs:
           SHA="${{ github.event.inputs.candidate_commit }}"
           PORT=4433
           FRAGMENTS=""
+          SEND_SYNC="$(echo "${LATENCY_SEND_SYNC:-}" | tr -d '[:space:]')"
+          GRACE="$(echo "${WATCHDOG_GRACE_SEC:-}" | tr -d '[:space:]')"
+          CEILING="$(echo "${WATCHDOG_CEILING_SEC:-}" | tr -d '[:space:]')"
+          GRACE="${GRACE:-900}"
+          CEILING="${CEILING:-1200}"
+          echo "watchdog: grace=${GRACE}s after fragment write, ceiling=${CEILING}s before it"
+          if [ -n "$SEND_SYNC" ]; then
+            echo "arm env: WEBTRANSPORT_DATAGRAM_SEND_SYNC=$SEND_SYNC (prereg Amendment 6 control)"
+            SEND_SYNC_JSON="\"$SEND_SYNC\""
+          else
+            SEND_SYNC_JSON=null
+          fi
+          MISSING=""
           IFS=',' read -ra ARMS <<< "$LATENCY_ARMS"
           for ARM in "${ARMS[@]}"; do
             ARM="$(echo "$ARM" | tr -d '[:space:]')"
             [ -n "$ARM" ] || continue
             PORT=$((PORT + 1))
             OUT="$OUTDIR/bench-latency-$SHA-$ARM.json"
+            WATCH="$OUTDIR/bench-latency-$SHA-$ARM.watchdog.json"
+            rm -f "$OUT"
             echo "== latency arm $ARM on port $PORT =="
             case "$ARM" in
               batch0) ARM_ENV="WEBTRANSPORT_DATAGRAM_BATCH=0"; ARRIVAL=uniform ;;
               tick)   ARM_ENV="";                              ARRIVAL=tick ;;
               *)      ARM_ENV="";                              ARRIVAL=uniform ;;
             esac
+            if [ -n "$SEND_SYNC" ]; then
+              ARM_ENV="$ARM_ENV WEBTRANSPORT_DATAGRAM_SEND_SYNC=$SEND_SYNC"
+            fi
+            START="$(date +%s)"
+            # shellcheck disable=SC2086
             env $ARM_ENV \
               LATENCY_ARM="$ARM" \
               LATENCY_ARRIVAL="$ARRIVAL" \
               LATENCY_PORT="$PORT" \
               LATENCY_OUT="$OUT" \
-              bun tools/load/bench-latency.ts
-            FRAGMENTS="$FRAGMENTS $OUT"
+              bun tools/load/bench-latency.ts &
+            DRIVER=$!
+            # The driver has no post-write work — no I/O, no timers — so an exit
+            # follows its fragment write immediately. Still alive GRACE seconds
+            # after the write means the addon is holding the host event loop:
+            # that is the pin, and killing it is how the arm reports it.
+            WROTE_AT=""
+            KILLED=false
+            while kill -0 "$DRIVER" 2>/dev/null; do
+              NOW="$(date +%s)"
+              if [ -z "$WROTE_AT" ] && [ -s "$OUT" ]; then
+                WROTE_AT="$NOW"
+                echo "watchdog: arm $ARM wrote its fragment at +$((NOW - START))s; kill deadline +${GRACE}s"
+              fi
+              if [ -n "$WROTE_AT" ]; then DEADLINE=$((WROTE_AT + GRACE)); else DEADLINE=$((START + CEILING)); fi
+              if [ "$NOW" -ge "$DEADLINE" ]; then
+                echo "::warning::watchdog killing arm $ARM at +$((NOW - START))s (fragment written: $([ -n "$WROTE_AT" ] && echo yes || echo no))"
+                kill -KILL "$DRIVER" 2>/dev/null || true
+                pkill -KILL -P "$DRIVER" 2>/dev/null || true
+                pkill -KILL -f 'target/release/load-client' 2>/dev/null || true
+                KILLED=true
+                break
+              fi
+              sleep 5
+            done
+            CODE=0
+            wait "$DRIVER" || CODE=$?
+            END="$(date +%s)"
+            WROTE=false
+            SEC_TO_FRAGMENT=null
+            SEC_AFTER_FRAGMENT=null
+            # A driver that wrote and exited inside one poll interval never had
+            # its write observed; the fragment's mtime is the same instant.
+            if [ -z "$WROTE_AT" ] && [ -s "$OUT" ]; then
+              WROTE_AT="$(stat -c %Y "$OUT" 2>/dev/null || true)"
+            fi
+            if [ -s "$OUT" ]; then
+              WROTE=true
+              if [ -n "$WROTE_AT" ]; then
+                SEC_TO_FRAGMENT=$((WROTE_AT - START))
+                SEC_AFTER_FRAGMENT=$((END - WROTE_AT))
+              fi
+            fi
+            printf '{"arm":"%s","exitCode":%d,"killedByWatchdog":%s,"fragmentWritten":%s,"secondsToFragment":%s,"secondsAfterFragment":%s,"armSeconds":%d,"graceSec":%d,"ceilingSec":%d,"sendSyncEnv":%s}\n' \
+              "$ARM" "$CODE" "$KILLED" "$WROTE" "$SEC_TO_FRAGMENT" "$SEC_AFTER_FRAGMENT" \
+              "$((END - START))" "$GRACE" "$CEILING" "$SEND_SYNC_JSON" > "$WATCH"
+            echo "watchdog: arm $ARM exit=$CODE killed=$KILLED fragment=$WROTE elapsed=$((END - START))s"
+            if [ "$WROTE" = true ]; then
+              FRAGMENTS="$FRAGMENTS $OUT"
+            else
+              MISSING="$MISSING $ARM"
+            fi
           done
+          if [ -n "$MISSING" ]; then
+            echo "::error::latency arm(s) produced no fragment:$MISSING"
+            exit 1
+          fi
           # shellcheck disable=SC2086
           bun tools/load/latency-classify.ts \
             "$OUTDIR/bench-latency-$SHA-classified.json" $FRAGMENTS

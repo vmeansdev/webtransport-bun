@@ -153,7 +153,7 @@ async function main(): Promise<void> {
 
 	const clock = await createMonotonicClock();
 	console.log(
-		`bench-latency: arm=${ARM} arrival=${ARRIVAL} clock=${clock.source} residual=${clock.calibrationResidualNs.toFixed(0)}ns spread=${clock.calibrationSpreadNs.toFixed(0)}ns batchEnv=${process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? "(default)"}`,
+		`bench-latency: arm=${ARM} arrival=${ARRIVAL} clock=${clock.source} residual=${clock.calibrationResidualNs.toFixed(0)}ns spread=${clock.calibrationSpreadNs.toFixed(0)}ns batchEnv=${process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? "(default)"} sendSyncEnv=${process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC ?? "(default)"}`,
 	);
 
 	console.log("bench-latency: building load-client (release)...");
@@ -457,6 +457,7 @@ async function main(): Promise<void> {
 			tickHz: TICK_HZ,
 			echo: ECHO,
 			datagramBatchEnv: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
+			datagramSendSyncEnv: process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC ?? null,
 		},
 		steps,
 		liveness,
