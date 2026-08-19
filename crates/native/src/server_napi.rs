@@ -1,4 +1,5 @@
 //! NAPI bindings for ServerHandle. Risk-module coverage floors target `server.rs` logic.
+use napi::bindgen_prelude::Uint8Array;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::{Env, JsFunction, Result};
 use napi_derive::napi;
@@ -333,6 +334,46 @@ impl ServerHandle {
             return Err(napi::Error::from_reason(msg));
         }
         Ok(())
+    }
+
+    /// Send one payload to many of this server's sessions across one crossing.
+    ///
+    /// Synchronous and promise-free, because it is the fan-out of
+    /// `trySendDatagram` rather than of `sendDatagram`: one N-API promise costs
+    /// more than the whole fan-out below ~1,000 targets, a serial parking
+    /// fan-out would let one slow subscriber hold the rest, a concurrent one
+    /// would allocate N futures, and either would take a ThreadsafeFunction —
+    /// the host-loop reference the non-parking send exists to avoid — per
+    /// broadcast.
+    ///
+    /// Returns `{sent, failed, codes}` and never throws for a transport
+    /// condition. `failed` holds indices into `targets` and `codes` is parallel
+    /// to it, so a healthy broadcast to 10,000 subscribers allocates nothing to
+    /// report that nothing failed. A missing, closed or foreign-owned target is
+    /// a failure entry, never an exception: at this scale reaping is normal and
+    /// the failure list *is* the reap list.
+    ///
+    /// Targets past `DATAGRAM_MIRROR_MAX` are reported as failures rather than
+    /// attempted or dropped; the TypeScript wrapper throws `RangeError` before
+    /// the crossing, so only a raw-addon caller ever sees that code.
+    #[napi(js_name = "sendDatagramMirror")]
+    pub fn send_datagram_mirror(
+        &self,
+        targets: Vec<String>,
+        payload: Uint8Array,
+    ) -> crate::datagram_mirror::DatagramMirrorResult {
+        // Copied once, before the loop, and shared by reference with every
+        // target: N copies out of JS become one. The call is synchronous, so
+        // the caller cannot mutate its array before this returns — the copy
+        // makes that a contract rather than an accident of the current shape.
+        let payload = payload.as_ref().to_vec();
+        crate::session::send_datagram_mirror_for_owner(
+            self.server_id,
+            &targets,
+            &payload,
+            &self.metrics,
+        )
+        .into_napi()
     }
 
     #[napi]

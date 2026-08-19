@@ -90,6 +90,36 @@ type _AssertNoUpdateCertOnPortable = Assert<
 	Not<Extends<PortableServer, { updateCert(tls: unknown): Promise<void> }>>
 >;
 
+// `sendDatagramMirror()` is native-only for the same reason batched sending is:
+// its entire content is amortizing a Node-API crossing wasm does not have, and
+// wasm has no session registry to fan out through. See PARITY_MATRIX.md §3.
+type _AssertNoSendDatagramMirrorOnPortable = Assert<
+	Not<
+		Extends<
+			PortableServer,
+			{
+				sendDatagramMirror(
+					targets: readonly string[],
+					payload: Uint8Array,
+				): unknown;
+			}
+		>
+	>
+>;
+// ...and it is genuinely on the native root server, so the assertion above is a
+// statement about the portable surface rather than about a method nobody has.
+type _AssertSendDatagramMirrorOnNative = Assert<
+	Extends<
+		rootSurface.WebTransportServer,
+		{
+			sendDatagramMirror(
+				targets: readonly string[],
+				payload: Uint8Array,
+			): unknown;
+		}
+	>
+>;
+
 // --- the frozen export sets -----------------------------------------------
 
 const ROOT_EXPORTS = [
@@ -189,6 +219,17 @@ const METRICS_FIELDS = [
 
 /** Capabilities that must never leak onto the common session contract. */
 const BACKEND_ONLY_SESSION_MEMBERS = ["goAway", "unwrap", "getStats"];
+
+/**
+ * Native-only *server* members must be absent in fact, not merely absent from
+ * the type. Both adapters build an explicit object literal, so a leak here
+ * means a projection turned into a spread.
+ */
+function assertServerContract(server: PortableServer): void {
+	const bag = server as unknown as Record<string, unknown>;
+	expect(bag.sendDatagramMirror).toBeUndefined();
+	expect(bag.updateCert).toBeUndefined();
+}
 
 function assertSessionContract(session: PortableServerSession): void {
 	const bag = session as unknown as Record<string, unknown>;
@@ -385,6 +426,7 @@ describe("/portable runtime contract", () => {
 			expect(typeof server.address.host).toBe("string");
 			// Chain validation, not pinning: no hash to hand a client.
 			expect(server.certHashBase64).toBeUndefined();
+			assertServerContract(server);
 
 			const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 				tls: { insecureSkipVerify: true },
@@ -433,6 +475,7 @@ describe("/portable runtime contract", () => {
 				expect(server.backend).toBe("wasm");
 				// Clients pin the hash instead of chain-validating.
 				expect(typeof server.certHashBase64).toBe("string");
+				assertServerContract(server);
 
 				const { session: clientSession, manager } = await connectWasm(
 					wasm,
