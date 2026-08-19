@@ -926,6 +926,8 @@ export type GateG3Verdict = {
 		verdict: "PASS" | "INCOMPLETE";
 		blocks: number;
 		completeBlocks: number;
+		/** H1/H2's arm-level STOP — per-arm, so it has no block to sit in. */
+		armStop: RunVerdict["stop"];
 		stops: Array<{ block: number | null; stop: StopReason | null }>;
 	};
 	/** C2 — egressOneWay p99 under the frame gate, on the batch arm. */
@@ -974,7 +976,22 @@ export function gateVerdictG3(
 	const batch = gateSteps.filter((s) => s.emitter === "batch");
 	const blocks = new Set(batch.map((s) => s.block)).size;
 	const completeBlocks = batch.filter((s) => s.complete).length;
-	const c1Pass = blocks > 0 && completeBlocks === batch.length;
+
+	// §6 C1 says "complete (no STOP, H1–H4 included)". H3/H4 are per-step and
+	// already live in `s.complete`; H1/H2 are the arm's own loaded-headroom
+	// control and live in the arm's RunVerdict. Reading only the steps let an arm
+	// whose generator never proved it could source the load report five complete
+	// blocks — the exact laundering H1/H2 exist to stop.
+	const honest = (emitter: EgressEmitter) => {
+		const run = runs.find((r) => r.emitter === emitter);
+		const own = gateSteps.filter((s) => s.emitter === emitter);
+		return (
+			(run?.complete ?? false) && own.length > 0 && own.every((s) => s.complete)
+		);
+	};
+	const armStop = runs.find((r) => r.emitter === "batch")?.stop ?? null;
+	const c1Pass =
+		blocks > 0 && completeBlocks === batch.length && honest("batch");
 
 	const p99s = batch.filter((s) => s.complete).map((s) => s.oneWay.p99Ns / MS);
 	const stat = orderStatistic(p99s);
@@ -989,13 +1006,6 @@ export function gateVerdictG3(
 					? "PASS"
 					: "INCONCLUSIVE-AT-BAR";
 
-	const honest = (emitter: EgressEmitter) => {
-		const run = runs.find((r) => r.emitter === emitter);
-		const own = gateSteps.filter((s) => s.emitter === emitter);
-		return (
-			(run?.complete ?? false) && own.length > 0 && own.every((s) => s.complete)
-		);
-	};
 	const ceilings: Partial<Record<EgressEmitter, number>> = {};
 	const headroomRatios: Partial<Record<EgressEmitter, number | null>> = {};
 	for (const r of runs) {
@@ -1027,6 +1037,7 @@ export function gateVerdictG3(
 			verdict: c1Pass ? "PASS" : "INCOMPLETE",
 			blocks,
 			completeBlocks,
+			armStop,
 			stops: batch.map((s) => ({ block: s.block, stop: s.stop })),
 		},
 		c2: {
@@ -1172,7 +1183,7 @@ if (import.meta.main) {
 	if (result.gateG3) {
 		const g = result.gateG3;
 		console.log(
-			`egress-classify: G3 rung=${g.rungAggregatePerSec}/s ${g.profile} C1=${g.c1.verdict} (${g.c1.completeBlocks}/${g.c1.stops.length} batch arms complete, ${g.c1.blocks} blocks)`,
+			`egress-classify: G3 rung=${g.rungAggregatePerSec}/s ${g.profile} C1=${g.c1.verdict} (${g.c1.completeBlocks}/${g.c1.stops.length} batch arms complete, ${g.c1.blocks} blocks, armStop=${g.c1.armStop ?? "none"})`,
 		);
 		console.log(
 			`egress-classify: G3 C2=${g.c2.verdict} batch p99 median=${g.c2.medianP99Ms?.toFixed(3) ?? "n/a"}ms [${g.c2.lowP99Ms?.toFixed(3) ?? "n/a"}, ${g.c2.highP99Ms?.toFixed(3) ?? "n/a"}] coverage=${g.c2.coverage?.toFixed(4) ?? "n/a"} bar=${g.c2.barMs}ms`,
