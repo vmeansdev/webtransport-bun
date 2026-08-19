@@ -19,6 +19,10 @@ path = "src/smoke_client.rs"
 name = "gso-probe"
 path = "src/gso_probe.rs"
 
+[[bin]]
+name = "tunnel-client"
+path = "src/tunnel_client.rs"
+
 [dependencies]
 wtransport = { workspace = true }
 quinn-udp = "0.5"
