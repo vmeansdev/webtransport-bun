@@ -18,11 +18,19 @@
 //! Counters are snapshotted at each phase boundary and emitted as JSON, so the
 //! harness can attribute steady-state delivery without idle-phase contamination.
 
+// Ported verbatim from `probe/latency-01` so both axes share one instrument;
+// this binary only writes stamps (the server reads them from Bun), so the
+// decode half is unused here and stays rather than fork the file.
+#[allow(dead_code)]
+mod latency_probe;
+
+use latency_probe::{monotonic_ns, write_stamp, AtomicHistogram, STAMP_BYTES};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Semaphore};
+use wtransport::quinn;
 use wtransport::{ClientConfig, Endpoint};
 
 const DEFAULT_URL: &str = "https://127.0.0.1:4433";
@@ -68,6 +76,89 @@ struct Options {
     payload_bytes: usize,
     connect_timeout: Duration,
     json_out: Option<String>,
+    /// Spread each session's send schedule across one interval instead of
+    /// releasing every session on the same phase signal. Off reproduces the
+    /// session-scale ladder's original arrival process exactly; on is what
+    /// `docs/research/preregistrations/gate-g1.md` §2 registers for G1, because
+    /// a wall-clock-aligned fleet turns `sessions/interval` per second into one
+    /// `sessions`-packet impulse per interval and measures the runner's UDP
+    /// receive buffer rather than this server.
+    stagger_sends: bool,
+}
+
+/// Per-window QUIC tap, summed over live connections at the instant of the
+/// snapshot; the harness reports differences between snapshots.
+///
+/// `frame_tx_datagram` is G1 clause C4's tap 2: the gap between it and
+/// `datagrams_sent` is quinn's silent send-buffer eviction, which is the only
+/// way a datagram can vanish between this generator and the wire.
+#[derive(Clone, Copy, Default)]
+struct QuicTap {
+    connections: u64,
+    frame_tx_datagram: u64,
+    udp_tx_datagrams: u64,
+    sent_packets: u64,
+    lost_packets: u64,
+    congestion_events: u64,
+}
+
+impl QuicTap {
+    fn add(&mut self, s: &quinn::ConnectionStats) {
+        self.connections += 1;
+        self.frame_tx_datagram += s.frame_tx.datagram;
+        self.udp_tx_datagrams += s.udp_tx.datagrams;
+        self.sent_packets += s.path.sent_packets;
+        self.lost_packets += s.path.lost_packets;
+        self.congestion_events += s.path.congestion_events;
+    }
+
+    fn delta(&self, base: &QuicTap) -> QuicTap {
+        QuicTap {
+            // A connection count is a level, not a flow: report the later one.
+            connections: self.connections,
+            frame_tx_datagram: self
+                .frame_tx_datagram
+                .saturating_sub(base.frame_tx_datagram),
+            udp_tx_datagrams: self.udp_tx_datagrams.saturating_sub(base.udp_tx_datagrams),
+            sent_packets: self.sent_packets.saturating_sub(base.sent_packets),
+            lost_packets: self.lost_packets.saturating_sub(base.lost_packets),
+            congestion_events: self
+                .congestion_events
+                .saturating_sub(base.congestion_events),
+        }
+    }
+
+    fn to_json(self) -> String {
+        format!(
+            concat!(
+                "{{\"connections\":{},\"frameTxDatagram\":{},\"udpTxDatagrams\":{},",
+                "\"sentPackets\":{},\"lostPackets\":{},\"congestionEvents\":{}}}"
+            ),
+            self.connections,
+            self.frame_tx_datagram,
+            self.udp_tx_datagrams,
+            self.sent_packets,
+            self.lost_packets,
+            self.congestion_events,
+        )
+    }
+}
+
+/// Live QUIC connections, registered as each session finishes its handshake.
+/// `quinn::Connection` is an `Arc` handle, so one per session costs a pointer
+/// and keeps no extra transport state alive.
+type ConnRegistry = Arc<Mutex<Vec<quinn::Connection>>>;
+
+fn sample_quic(registry: &ConnRegistry) -> QuicTap {
+    let mut tap = QuicTap::default();
+    let conns = match registry.lock() {
+        Ok(c) => c,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for conn in conns.iter() {
+        tap.add(&conn.stats());
+    }
+    tap
 }
 
 #[derive(Default)]
@@ -185,19 +276,26 @@ fn spawn_rss_guard() {
 /// `steady / interval` ticks exactly, none of them within half an interval of
 /// either edge, and the offered rate label is the nominal rate rather than one
 /// tick short of it. Window length and per-session rate are unchanged.
-fn first_tick_offset(interval: Duration) -> Duration {
-    interval / 2
+///
+/// `phase_offset` adds this session's share of the staggered arrival process
+/// (gate-g1 pre-registration §6, amending the axis pre-registration's Amendment
+/// 2 §1): session *i* of *N* offsets by `i/N` of one interval on top of the half
+/// interval, so the same mean rate arrives smoothly instead of as one impulse.
+/// It is zero for every session when stagger is off, which is the original rule
+/// exactly.
+fn first_tick_offset(interval: Duration, phase_offset: f64) -> Duration {
+    interval / 2 + interval.mul_f64(phase_offset.clamp(0.0, 1.0))
 }
 
 /// Ticks whose deadline has passed, `elapsed` into a steady phase using the
-/// half-interval offset above. Shared by the per-session denominator and the
-/// nominal figure, so the two can never drift apart.
-fn ticks_due_after(elapsed: Duration, interval: Duration) -> u64 {
+/// offset above. Shared by the per-session denominator and the nominal figure,
+/// so the two can never drift apart.
+fn ticks_due_after(elapsed: Duration, interval: Duration, phase_offset: f64) -> u64 {
     let interval_ns = interval.as_nanos();
     if interval_ns == 0 {
         return 0;
     }
-    let first = first_tick_offset(interval);
+    let first = first_tick_offset(interval, phase_offset);
     if elapsed < first {
         return 0;
     }
@@ -209,7 +307,7 @@ fn ticks_due_after(elapsed: Duration, interval: Duration) -> u64 {
 /// and this figure is reported beside it so a reader can see the generator's
 /// sessions kept their own clocks.
 fn expected_ticks(steady: Duration, interval: Duration) -> u64 {
-    ticks_due_after(steady, interval)
+    ticks_due_after(steady, interval, 0.0)
 }
 
 fn open_fd_count() -> Option<u64> {
@@ -320,6 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload_bytes: DEFAULT_PAYLOAD_BYTES,
         connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
         json_out: None,
+        stagger_sends: false,
     };
 
     while let Some(arg) = args.next() {
@@ -366,7 +465,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--payload-bytes" => {
                 options.payload_bytes =
-                    parse_or_default("--payload-bytes", args.next(), DEFAULT_PAYLOAD_BYTES).max(8)
+                    parse_or_default("--payload-bytes", args.next(), DEFAULT_PAYLOAD_BYTES)
+                        // Every steady datagram carries the latency stamp, so a
+                        // payload too short to hold one is not a smaller
+                        // measurement, it is no measurement.
+                        .max(STAMP_BYTES)
             }
             "--connect-timeout-secs" => {
                 options.connect_timeout = Duration::from_secs(parse_or_default(
@@ -376,12 +479,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
             "--json-out" => options.json_out = args.next(),
+            "--stagger-sends" => options.stagger_sends = true,
             _ => {}
         }
     }
 
     println!(
-        "scale-client: url={} sessions={} endpoints={} connect_concurrency={} steady={}s idle={}s interval={}ms payload={}B",
+        "scale-client: url={} sessions={} endpoints={} connect_concurrency={} steady={}s idle={}s interval={}ms payload={}B stagger_sends={}",
         options.url,
         options.sessions,
         options.endpoints,
@@ -390,6 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.idle.as_secs(),
         options.datagram_interval.as_millis(),
         options.payload_bytes,
+        options.stagger_sends,
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -409,6 +514,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let latencies: Arc<Mutex<Vec<u64>>> =
         Arc::new(Mutex::new(Vec::with_capacity(options.sessions)));
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let registry: ConnRegistry = Arc::new(Mutex::new(Vec::with_capacity(options.sessions)));
+    let schedule_lag = Arc::new(AtomicHistogram::new());
     let (phase_tx, phase_rx) = watch::channel(PHASE_CONNECT);
 
     let cpu0 = self_cpu_ms();
@@ -420,10 +527,19 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         let permits = Arc::clone(&permits);
         let latencies = Arc::clone(&latencies);
         let errors = Arc::clone(&errors);
+        let registry = Arc::clone(&registry);
+        let schedule_lag = Arc::clone(&schedule_lag);
         let url = options.url.clone();
         let mut phase = phase_rx.clone();
         let interval = options.datagram_interval;
         let payload_bytes = options.payload_bytes;
+        // Deterministic, evenly spaced, and independent of connect order, so the
+        // staggered arm differs from the aligned one in exactly one thing.
+        let phase_offset = if options.stagger_sends {
+            i as f64 / options.sessions as f64
+        } else {
+            0.0
+        };
         handles.push(tokio::spawn(async move {
             let permit = match permits.acquire_owned().await {
                 Ok(p) => p,
@@ -452,8 +568,20 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
+            if let Ok(mut live) = registry.lock() {
+                live.push(conn.quic_connection().clone());
+            }
             counters.connect_done.fetch_add(1, Ordering::Relaxed);
-            hold_session(conn, &mut phase, interval, payload_bytes, counters.as_ref()).await;
+            hold_session(
+                conn,
+                &mut phase,
+                interval,
+                payload_bytes,
+                phase_offset,
+                schedule_lag.as_ref(),
+                counters.as_ref(),
+            )
+            .await;
         }));
     }
 
@@ -487,6 +615,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let after_connect = counters.snapshot();
+    let quic_after_connect = sample_quic(&registry);
     let _ = phase_tx.send(PHASE_STEADY);
     let steady_started = Instant::now();
     // Phase markers are line-buffered onto stdout so the harness can snapshot
@@ -503,6 +632,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let steady_wall = steady_started.elapsed();
     tokio::time::sleep(PHASE_SETTLE).await;
     let after_steady = counters.snapshot();
+    // Sampled inside the same settle grace as the counters, so the wire-tx tap
+    // and the enqueue counter describe the same window. The gate's C4a residual
+    // is a difference between them; a boundary skew between the two reads would
+    // show up as unattributed loss that never happened.
+    let quic_after_steady = sample_quic(&registry);
+    let lag_steady = schedule_lag.to_json();
     let rss_steady = self_rss_mb();
     let cpu_after_steady = self_cpu_ms();
     println!("scale-client: phase idle");
@@ -548,7 +683,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let json = format!(
         concat!(
             "{{",
-            "\"schema\":\"scale-client/2\",",
+            "\"schema\":\"scale-client/3\",",
+            "\"staggerSends\":{},",
             "\"sessionsRequested\":{},",
             "\"sessionsOk\":{},",
             "\"sessionsErr\":{},",
@@ -560,9 +696,12 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             "\"steady\":{{\"sent\":{},\"err\":{},\"received\":{},\"expectedSends\":{},\"expectedTicksPerSession\":{},\"wallSec\":{:.3}}},",
             "\"idle\":{{\"sent\":{},\"err\":{},\"received\":{}}},",
             "\"client\":{{\"rssMbSteady\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsIdle\":{},\"fdCount\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
+            "\"quicSteady\":{},",
+            "\"scheduleLagSteady\":{},",
             "\"connectErrorsSample\":[{}]",
             "}}"
         ),
+        options.stagger_sends,
         options.sessions,
         sessions_ok,
         sessions_err,
@@ -595,6 +734,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         json_u64(fds),
         options.endpoints,
         distinct_source_ips,
+        quic_after_steady.delta(&quic_after_connect).to_json(),
+        lag_steady,
         recorded_errors
             .iter()
             .map(|e| format!("\"{}\"", escape(e)))
@@ -623,14 +764,32 @@ fn account_steady(
     counters: &Counters,
     started_at: tokio::time::Instant,
     interval: Duration,
+    phase_offset: f64,
     accounted: &mut bool,
 ) {
     if *accounted {
         return;
     }
     *accounted = true;
-    let due = ticks_due_after(started_at.elapsed(), interval);
+    let due = ticks_due_after(started_at.elapsed(), interval, phase_offset);
     counters.steady_ticks_due.fetch_add(due, Ordering::Relaxed);
+}
+
+/// The scheduled deadline nearest `actual_ns`, for a schedule that started at
+/// `started_ns` and fires every `interval` after `offset`.
+///
+/// Derived from the instant rather than from a tick counter because
+/// `MissedTickBehavior::Skip` drops missed ticks silently: counting fires would
+/// make a generator that fell a whole interval behind report zero lag. Nearest
+/// deadline is what "how late was this send against its own schedule" means.
+fn nearest_deadline_ns(started_ns: u64, offset: Duration, interval: Duration, actual_ns: u64) -> u64 {
+    let interval_ns = interval.as_nanos() as u64;
+    let first = started_ns.saturating_add(offset.as_nanos() as u64);
+    if interval_ns == 0 || actual_ns <= first {
+        return first;
+    }
+    let k = ((actual_ns - first) as f64 / interval_ns as f64).round() as u64;
+    first.saturating_add(k.saturating_mul(interval_ns))
 }
 
 async fn hold_session(
@@ -638,6 +797,8 @@ async fn hold_session(
     phase: &mut watch::Receiver<u8>,
     interval: Duration,
     payload_bytes: usize,
+    phase_offset: f64,
+    schedule_lag: &AtomicHistogram,
     counters: &Counters,
 ) {
     // Wait for the steady signal so every session starts sending together;
@@ -656,19 +817,32 @@ async fn hold_session(
     // generator, so it must not run rich. Half rather than a whole interval so
     // no tick shares a timer slot with a phase boundary (see first_tick_offset).
     let steady_started_at = tokio::time::Instant::now();
-    let mut ticker =
-        tokio::time::interval_at(steady_started_at + first_tick_offset(interval), interval);
+    let steady_started_ns = monotonic_ns();
+    let offset = first_tick_offset(interval, phase_offset);
+    let mut ticker = tokio::time::interval_at(steady_started_at + offset, interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut steady_accounted = false;
 
     loop {
         let current = *phase.borrow();
         if current == PHASE_STOP {
-            account_steady(counters, steady_started_at, interval, &mut steady_accounted);
+            account_steady(
+                counters,
+                steady_started_at,
+                interval,
+                phase_offset,
+                &mut steady_accounted,
+            );
             break;
         }
         if current == PHASE_IDLE {
-            account_steady(counters, steady_started_at, interval, &mut steady_accounted);
+            account_steady(
+                counters,
+                steady_started_at,
+                interval,
+                phase_offset,
+                &mut steady_accounted,
+            );
             // Idle phase: no application sends. Stay alive so the server pays
             // whatever an idle session costs, and notice if it drops us.
             tokio::select! {
@@ -691,15 +865,29 @@ async fn hold_session(
         tokio::select! {
             changed = phase.changed() => {
                 if changed.is_err() {
-                    account_steady(counters, steady_started_at, interval, &mut steady_accounted);
+                    account_steady(
+                counters,
+                steady_started_at,
+                interval,
+                phase_offset,
+                &mut steady_accounted,
+            );
                     break;
                 }
             }
             _ = ticker.tick() => {
                 sequence = sequence.wrapping_add(1);
-                let header = format!("scale:{sequence}:");
-                let n = header.len().min(payload.len());
-                payload[..n].copy_from_slice(&header.as_bytes()[..n]);
+                // The stamp goes in immediately before the send, so the instant
+                // it carries is the actual send instant and nothing this
+                // generator does afterwards can be charged to the server's
+                // ingest latency. `intended` is the scheduled deadline nearest
+                // that instant; their difference is the schedule-lag floor the
+                // gate reports beside every ingest percentile.
+                let actual_ns = monotonic_ns();
+                let intended_ns =
+                    nearest_deadline_ns(steady_started_ns, offset, interval, actual_ns);
+                schedule_lag.record_signed(actual_ns as i64 - intended_ns as i64);
+                write_stamp(&mut payload, intended_ns, actual_ns, sequence);
                 match conn.send_datagram(&payload) {
                     Ok(()) => { counters.datagrams_sent.fetch_add(1, Ordering::Relaxed); }
                     Err(_) => { counters.datagrams_err.fetch_add(1, Ordering::Relaxed); }
@@ -712,7 +900,13 @@ async fn hold_session(
                         // A session lost mid-steady still offered whatever its
                         // schedule had made due up to the moment it died; not
                         // accounting for it would quietly forgive the shortfall.
-                        account_steady(counters, steady_started_at, interval, &mut steady_accounted);
+                        account_steady(
+                counters,
+                steady_started_at,
+                interval,
+                phase_offset,
+                &mut steady_accounted,
+            );
                         counters.sessions_lost.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -727,7 +921,8 @@ async fn hold_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape, expected_ticks, json_num, json_u64, parse_or_default, percentile, ticks_due_after,
+        escape, expected_ticks, first_tick_offset, json_num, json_u64, nearest_deadline_ns,
+        parse_or_default, percentile, ticks_due_after,
     };
     use std::time::Duration;
 
@@ -753,8 +948,58 @@ mod tests {
         // a snapshot taken slightly early or slightly late books the same count.
         for skew_ms in [-100i64, -1, 0, 1, 100] {
             let elapsed = Duration::from_millis((120_000 + skew_ms) as u64);
-            assert_eq!(ticks_due_after(elapsed, interval), 24, "skew {skew_ms}ms");
+            assert_eq!(
+                ticks_due_after(elapsed, interval, 0.0),
+                24,
+                "skew {skew_ms}ms"
+            );
         }
+    }
+
+    #[test]
+    fn stagger_spreads_first_ticks_over_one_interval_and_is_off_by_default() {
+        let interval = Duration::from_secs(5);
+        // Off: every session's first tick is the registered half interval, so
+        // the aligned arrival process is byte-for-byte the original rule.
+        assert_eq!(first_tick_offset(interval, 0.0), Duration::from_millis(2500));
+        // On: session i of N adds i/N of an interval, so N sessions present a
+        // smooth arrival instead of one N-packet impulse per interval.
+        assert_eq!(first_tick_offset(interval, 0.25), Duration::from_millis(3750));
+        assert_eq!(first_tick_offset(interval, 0.5), Duration::from_millis(5000));
+        // Fractions outside [0,1] cannot pull a tick before the window.
+        assert_eq!(first_tick_offset(interval, -1.0), Duration::from_millis(2500));
+        assert_eq!(first_tick_offset(interval, 9.0), Duration::from_millis(7500));
+    }
+
+    #[test]
+    fn staggered_sessions_are_charged_their_own_ticks() {
+        let interval = Duration::from_secs(5);
+        let window = Duration::from_secs(120);
+        // A session offset by nearly a whole interval loses the tick that no
+        // longer fits, and is charged for exactly that — the denominator is the
+        // session's own schedule, never the nominal one.
+        assert_eq!(ticks_due_after(window, interval, 0.0), 24);
+        assert_eq!(ticks_due_after(window, interval, 0.5), 24);
+        assert_eq!(ticks_due_after(window, interval, 0.9), 23);
+        // Nominal stays the un-staggered figure, reported beside the measured one.
+        assert_eq!(expected_ticks(window, interval), 24);
+    }
+
+    #[test]
+    fn schedule_lag_survives_a_skipped_tick() {
+        let interval = Duration::from_secs(5);
+        let offset = Duration::from_millis(2500);
+        let start = 1_000_000_000u64;
+        let deadline = |ns: u64| nearest_deadline_ns(start, offset, interval, ns);
+        // On time: the deadline is the tick's own.
+        assert_eq!(deadline(start + 2_500_000_000), start + 2_500_000_000);
+        // 3 ms late against the third deadline, not 5.003 s late against the
+        // second — a `Skip` ticker that dropped a tick must not be reported as
+        // an interval of lag it never had.
+        assert_eq!(deadline(start + 12_503_000_000), start + 12_500_000_000);
+        // Before the first deadline the schedule has not started; clamp there
+        // rather than book a negative lag as a shared-clock violation.
+        assert_eq!(deadline(start), start + 2_500_000_000);
     }
 
     #[test]
