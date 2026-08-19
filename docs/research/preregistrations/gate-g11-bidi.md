@@ -468,7 +468,11 @@ Written before the run so the stamp cannot widen it.
   ticket 23's fixes (K14), recorded from `git rev-parse` by the dispatching
   agent, never typed.
 - Staging base at writing: `2a4145d0556a35f8b4a0849e5953927b5e028b64`, verified
-  by `git merge-base probe/g11-bidi-01 rebind4-staging`.
+  by `git merge-base probe/g11-bidi-01 rebind4-staging`. **Superseded before
+  dispatch** — staging moved to
+  `9c475df1e255388abf4a07733164869f6377e0b7` (the M1 mirror-send merge) and the
+  branch was rebased onto it; see Amendment 5 for the old SHA quoted and the
+  drift diff over the four named source regions.
 - **If `rebind4-staging` has moved at dispatch time**: re-derive, amend this
   header under §10 with the old SHA quoted **before** dispatch, and diff the two
   staging SHAs for anything touching the bidi accept loop (`lib.rs` ~1058–1175),
@@ -716,6 +720,34 @@ The delay is entirely outside the drive window and outside every counter either
 generator reports; with it, five consecutive control smokes were clean where
 three of five had been dirty. C4's bar is unchanged, and this is the difference
 between it grading the product and it grading a shutdown ordering.
+
+### Amendment 5 — staging moved, and the drift is one module declaration (2026-08-19)
+
+Executed by the dispatching agent per §11's own rule, before any dispatch. **No
+threshold moves, no clause changes, no cell changes.**
+
+Original §11 line, quoted in full:
+
+> - Staging base at writing: `2a4145d0556a35f8b4a0849e5953927b5e028b64`, verified
+>   by `git merge-base probe/g11-bidi-01 rebind4-staging`.
+
+`rebind4-staging` moved to `9c475df1e255388abf4a07733164869f6377e0b7` — the
+merge of design/mirror-send-01 (M1 `sendDatagramMirror`). The probe branch was
+rebased onto it: pre-rebase head `8b74697ea99d5b66eeca29aeeba7a50c2c8fd855`,
+post-rebase head recorded in this amendment's commit. `2a4145d` (ticket 23's
+lever-hardening merge) remains an ancestor, so the K14 requirement still holds.
+
+Drift diff `2a4145d..9c475df` over the four regions §11 names — the bidi accept
+loop (`lib.rs` ~1058–1175), the stream budget (`client_stream.rs` 130–390), the
+write path (`client_stream.rs` ~1590–1630) and the deferred read paths
+(`client_stream.rs` 721–800, ~1190–1280) — plus `packages/webtransport/src/streams.ts`
+for the JS surface Amendment 4(c) reads: **only
+`crates/native/src/lib.rs` is touched, by the single line
+`pub mod datagram_mirror;`** — a module declaration in the module list, nowhere
+near the accept loop. `client_stream.rs` and `streams.ts` are byte-identical
+between the two SHAs. Everything else in the drift is the mirror feature's own
+files (`datagram_mirror.rs`, `datagram-mirror.ts`, session/registry mirror
+plumbing, bench and docs), none of which the bidi tunnel path reads.
 
 ## §12 — Run log
 
