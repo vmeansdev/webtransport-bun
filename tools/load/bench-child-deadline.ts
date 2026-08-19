@@ -35,6 +35,15 @@ export type DeadlineInputs = {
 	connectStaggerMs: number;
 	/** The settle barrier's maximum, in milliseconds. */
 	settleMaxMs: number;
+	/**
+	 * The child's own registered post-drive work, in milliseconds: its drain
+	 * window plus closing its whole fleet. Omitting a registered phase is how
+	 * the first G10 control run breached on a healthy rung — 10,000 sessions
+	 * take longer to close than the fixed margin. This is an enumerated phase,
+	 * not a tunable: it comes from the child's printed contract
+	 * ("window Ns + Ms drain") and a per-session close allowance.
+	 */
+	childTailMs?: number;
 	/** Defaults to the pre-registered margin; only tests pass anything else. */
 	marginMs?: number;
 };
@@ -51,7 +60,10 @@ export function cellDeadlineMs(inputs: DeadlineInputs): number {
 		if (!Number.isFinite(value) || value < 0)
 			throw new Error(`bench deadline: ${name} must be finite and >= 0`);
 	}
-	return driveMs + connectStaggerMs + settleMaxMs + margin;
+	const tail = inputs.childTailMs ?? 0;
+	if (!Number.isFinite(tail) || tail < 0)
+		throw new Error("bench deadline: childTailMs must be finite and >= 0");
+	return driveMs + connectStaggerMs + settleMaxMs + tail + margin;
 }
 
 /** The part of `Bun.Subprocess` a deadline needs, so tests can stand one in. */

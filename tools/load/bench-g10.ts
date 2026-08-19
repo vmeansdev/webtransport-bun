@@ -886,6 +886,10 @@ async function main(): Promise<void> {
 			driveMs: WINDOW_SECONDS * 1000,
 			connectStaggerMs: 0,
 			settleMaxMs: SETTLE_SECONDS * 1000,
+			// The client's printed contract is "window Ns + 10s drain", and then
+			// it closes its whole fleet — measured ≥6.5 ms/session at 10k on the
+			// cable, allowed 10 ms/session here as a bound, not a tuning.
+			childTailMs: 10_000 + FLEET * 10,
 		});
 		// A holder rather than a `let`: assigned inside a callback, a plain local
 		// reads back as `null` to the narrower and the report would quietly type
