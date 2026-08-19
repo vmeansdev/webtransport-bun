@@ -444,7 +444,22 @@ including aborted ones, per the effort spec's process rules.
 
 | dispatched | run id | candidate SHA | artifact hash | outcome |
 |---|---|---|---|---|
-| — | — | — | — | **no dispatch has been made** |
+| 2026-08-19 | `32213270203` | `e392c227d7215d8d71c7dd2dc46c8e3c80b0d605` | see below | **complete, valid, stamped** |
+
+Artifact `bench-egress-e392c227d7215d8d71c7dd2dc46c8e3c80b0d605`, SHA-256 per
+fragment:
+
+| fragment | sha256 |
+|---|---|
+| `…-headroom-serial.json` | `92661a8f2786151bf8df007909e4f9a03ef3423c55754fa0bcfe9bd9ed02c483` |
+| `…-headroom-pipelined.json` | `e601ac90d4b08432476c9900b31507b65ba690b50edcc14d47295f6bd633cc2f` |
+| `…-headroom-batch.json` | `3da27db96763298a6002d2eb35754148c0dccf9b09fe939dad459d807ad39ad5` |
+| `…-gate.json` | `9974413b725c38d21ee19d990be60dba39ec4c849dde648e0916c5f7d358dd61` |
+| `…-classified.json` (as produced in-run) | `6940f2b13f10261d03468369a40f6bb54a21994b9367fb8635c4c4b52b09f683` |
+| re-classified from the same four raw fragments after the §12a fix | `ca32edbad319dc638d3f53b04593bdb39321dfcc1428786fc551e22607ade6aa` |
+
+One dispatch, as registered. The four raw fragments are untouched and every
+number in §12 is derived from them.
 
 ## 11a. Local smoke (not a result)
 
@@ -466,7 +481,256 @@ C4's instrumentation obligation is met there and only there.
 
 ## 12. Verdict
 
-Written only after the run, from the classifier's own output, with every clause
-of §6 stated separately.
+Written after the run, from the classifier's own output, with every clause of §6
+stated separately. Run `32213270203`, candidate `e392c22`, one dispatch, valid.
 
-> *(empty — the gate has not run)*
+**Headline: G3 is INCOMPLETE, and the reason is the originator — the thing the
+gate was built to be honest about.** All three JS emitter arms failed their own
+loaded-server headroom control (§H1) at its lowest rung, so no arm cleared §H2
+and no arm may contribute a capacity or latency number at this rung. The batch
+arm's blocks were all step-complete and its tails were far under the bar; that
+is not a pass, and §6's "a clause whose inputs are missing or invalid is
+INCOMPLETE" is what it is for.
+
+### 12.0 The rung as realized
+
+Registered rung: 326/s/session → 32,600/s. Realized: **352/s/session →
+35,200/s**, because the schedule quantizes the per-session rate onto the profile
+grid. The run therefore ran **8.0 % above** the registered rung. Disclosed, not
+corrected: a rung above the registered one is the conservative direction for
+every latency clause and the harder direction for every honesty clause, and no
+threshold was moved to accommodate it. Every number below is at 35,200/s.
+
+### 12.1 §H1 — the per-arm headroom control, from the raw fragments
+
+Registered rule (§H1, verbatim): *"a rung passing iff the originator emitted
+≥ 0.95 of the plan's scheduled count across real and shadow together and kept
+`originationLag` p99 < 5 ms"*, multipliers `m ∈ {0.5, 1, 2, 4}`, **stop at first
+failure**, `generatorCeilingPerSec(arm)` = the combined offered rate of the
+highest passing rung.
+
+| arm | m | offered/s | emitted fraction | ≥ 0.95? | `originationLag` p99 | < 5 ms? | rung |
+|---|---|---|---|---|---|---|---|
+| `serial` | 0.5 | 52,793 | 0.95051 | yes | **30.671 ms** | no | **fail** |
+| `pipelined` | 0.5 | 52,729 | 0.96096 | yes | **31.195 ms** | no | **fail** |
+| `batch` | 0.5 | 52,794 | **1.00005** | yes | **8.520 ms** | no | **fail** |
+
+Every arm failed at `m = 0.5`; "stop at first failure" means no arm reached
+`m = 1`, and each fragment carries exactly one rung. **No rung passed for any
+arm, so `generatorCeilingPerSec = 0` for all three.** The zeros are the
+measurement, not a missing read.
+
+Note what `m = 0.5` is: 100 real + 50 shadow sessions × 352/s = 52,800/s, which
+is exactly `1.5 × 35,200` — the §H2 bar itself. The gate's honesty hinged
+entirely on this one rung, by construction.
+
+### 12.2 §H2 — the arm-level STOP
+
+`generatorCeilingPerSec(arm) < 1.5 × maxOfferedAggregatePerSec(arm)`:
+
+| arm | ceiling | max offered | ratio | §H2 |
+|---|---|---|---|---|
+| `serial` | 0/s | 35,200/s | 0.00 | **`generator-headroom`** |
+| `pipelined` | 0/s | 35,200/s | 0.00 | **`generator-headroom`** |
+| `batch` | 0/s | 35,200/s | 0.00 | **`generator-headroom`** |
+
+Per §H2 as registered: an arm that fails it *"contributes no latency number, no
+capacity number, and no side of any Δ."* That applies to all three.
+
+### 12.3 The four clauses
+
+**C1 — the rung is complete under arm (c): INCOMPLETE.** All five
+`frame-bursty`/`batch` blocks are step-complete (no H3/H4 STOP in any block; 100
+sessions connected, `sendEventsSkipped = 0`, `downDeliveryRatio = 1.000`,
+≈ 1,056,055 samples per block against the 10,000 floor). The clause is still
+INCOMPLETE because §6 C1 requires *"no STOP, **H1–H4 included**"* and the arm's
+own H2 STOP is `generator-headroom`. **Arm STOP: `generator-headroom`; per-block
+STOPs: none.**
+
+**C2 — egressOneWay p99 < 33.3 ms under arm (c): INCOMPLETE**, because C2 is
+registered as conditional on C1. The numbers are published rather than withheld,
+and they are **not a pass**:
+
+> `frame-bursty`/`batch` p99 by block: 3.572, 2.523, 2.916, 1.425, 1.425 ms →
+> **median 2.523 ms, order-statistic interval [1.425, 3.572] ms**, coverage
+> 93.75 %, bar 33.3 ms.
+
+The whole interval sits 9× under the bar. That is what the transport did while
+the JS originator could not prove it was sourcing the load honestly, and it is
+recorded as exactly that much — a tail measured behind an unmet honesty
+condition, never a licensed capacity.
+
+**C3 — the lever value, stated as (c) vs (b): INCOMPLETE. The lever's value at
+this rung is not established.**
+
+Registered §H5 does not apply: it fires when (b) is dishonest and (c) is honest
+(`CEILING-MOVED`), or the inverse (`CEILING-MOVED-AGAINST`). Here **both** sides
+are dishonest, and the registered name for that is INCOMPLETE. `ceilings =
+{serial: 0, pipelined: 0, batch: 0}`, `headroomRatios = {0, 0, 0}`, comparison
+`null`, `diagnosticVsSerial` `null` (arm (a) failed H2, so per §C3 it is not
+computed).
+
+Published for the record, and **not** the lever's value: the classifier's
+independent `emitterComparisons` block, which pairs within blocks without
+consulting H2, reads `frame-bursty` batch vs pipelined as **`lever-inconclusive`,
+median −1.229 ms, interval [−1.999, +0.459] ms, n = 5, 4 of 5 blocks
+`cpu-asymmetric`**. Even taken at face value that interval spans zero, so nothing
+would have been claimed from it either.
+
+**C4 — server-side UDP/GSO counters on the record: PASS.** GSO capability read
+present in every fragment header (`maxGsoSegments = 64`, `groSegments = 64`,
+"GSO ACTIVE, GRO ACTIVE"). `/proc/net/snmp` deltas present on **all 30 gate arms**
+(the clause evaluates the gate profile's 15). `SndbufErrors = 0` on all 15
+`frame-bursty` arms.
+
+Per §8 disclosure 3 — the syscall-shape evidence, reported as exactly that much
+and no more (app datagrams sent ÷ counted UDP `OutDatagrams`, median over 5
+blocks):
+
+| profile | serial | pipelined | batch |
+|---|---|---|---|
+| `frame-bursty` | 2.434 | 2.497 | **3.574** |
+| `keyframe-aligned` | 3.291 | 3.172 | **3.751** |
+
+The batched arm's egress cost ≈ 30 % fewer counted UDP sends per delivered
+datagram than either per-datagram arm on the gate profile. Per §8 disclosure 2
+this is **not** a claim that any send carried N GSO segments; the kernel exposes
+no per-send segment count and none is claimed. One `RcvbufErrors` exception:
+`keyframe-aligned`/`batch` shows 3–373 per arm; every `frame-bursty` arm is 0.
+
+### 12.4 §7 — alignment cost, all pairs disclosed, none bucketed
+
+Every one of the 14 available (profile-paired, within-arm, within-block)
+comparisons is **`cpu-asymmetric`** against the tolerances fixed in §7
+(server ≤ 10, host ≤ 20 percent-of-one-core): observed server gaps **50.8–75.9**
+and host gaps **90.4–132.6**. Per §7 each Δ is therefore **published with both
+CPU numbers and carries no bucket verdict**. Medians of the disclosed Δs:
+`serial` ≈ 2.96 ms, `pipelined` ≈ 1.97 ms, `batch` ≈ 13.73 ms. The 15th pair,
+`serial` block 0, does not exist: its `keyframe-aligned` step stopped on
+`offered-shortfall`.
+
+**No alignment cost is stated by this gate.** The spec's condition was "only with
+CPU symmetry between compared arms (or disclosed asymmetry + tolerance)"; this is
+the disclosure branch, and disclosure is not a measurement.
+
+### 12.5 The `keyframe-aligned` profile
+
+§6 binds the clauses to the `frame-bursty` rung only; `keyframe-aligned` enters
+this gate through §7 alone. Run through the same clause machinery for
+completeness: **C1 INCOMPLETE** (5/5 blocks step-complete on the batch arm, arm
+STOP `generator-headroom` — the same H2 failure, the ceiling is per-arm and not
+per-profile), **C2 INCOMPLETE** with median 16.646 ms, interval [13.238, 20.185]
+ms, **C3 INCOMPLETE**, **C4 PASS**. The `keyframe-aligned`/`serial` block 0 step
+also carries a step-level `offered-shortfall`.
+
+### 12.6 §H6 — prediction against outcome
+
+Registered before the run: **(a) expected to fail H2, (b) uncertain, (c) expected
+to pass.**
+
+| arm | predicted | outcome | |
+|---|---|---|---|
+| (a) `serial` | fail H2 | **failed H2** | **confirmed** |
+| (b) `pipelined` | uncertain | failed H2 | consistent — nothing was claimed |
+| (c) `batch` | pass | **failed H2** | **refuted** |
+
+Per §H6 the gate is not re-registered because the prediction was wrong, and it
+is not. The refutation is the gate's finding.
+
+The refutation has a shape worth stating precisely, because it is not "the batch
+API did nothing". At the headroom rung all three arms cleared the emitted-count
+half of §H1; **all three failed on the lag half alone**, and there the arms are
+not alike: `batch` held `originationLag` p99 at **8.520 ms** against `serial`'s
+30.671 ms and `pipelined`'s 31.195 ms — **3.6× lower**, and it was the only arm
+to emit its full scheduled count (1.00005 vs 0.951 / 0.961). It missed a 5 ms bar
+that the other two missed by 6×. That is a reading of the headroom control
+itself, which is where the ceilings come from; it is **not** a gate number, not a
+Δ, and not a substitute for C3, which stays INCOMPLETE.
+
+### 12.7 Disclosures carried on this stamp's face
+
+1. **R4 is OPEN, inherited from G2 and not closed here.** G2's server ingest p99
+   and this gate's `egressOneWay` p99 are **not established as comparable units**.
+   No ratio between them may be computed, they may not appear in one sentence as
+   if commensurable, and no "ingest is N× egress" claim follows from G2 and G3
+   together. The classifier prints `crossCheckR4: "open"` on every run.
+2. **Arm (a) rides staging's promise-free path (§1).** On the composed tree
+   `session.sendDatagram()` takes `trySendDatagram`; arm (a) is the shipped
+   default send path as of `3d03a98` but is **not** byte-identical to the emitter
+   the axis pre-registration was written against. No number here may be compared
+   against a pre-composition egress number.
+3. **The stamp-point convention loads arm (c) (§3.2).** `actual` is read at the
+   array push for (c) and at the send call for (a)/(b), so (c)'s measured
+   interval contains the remaining stamps, the array assembly and the whole
+   `sendDatagramBatch` crossing. Registered consequence, unchanged: a (c) win is a
+   floor on the real one. It is recorded here only to keep the convention on the
+   record — this gate states no (c)-vs-(b) win.
+4. **`/proc/net/snmp` is host-wide** and attributable only because subscribers ran
+   `--datagrams-per-sec 0`; **no per-send GSO segment count exists** and none is
+   claimed (§8).
+5. **Co-resident receiver, one rung, 100 sessions, 4 vCPU box.** Host CPU ran
+   175–257 % of 400 on the `frame-bursty` arms and 231–258 % during the headroom
+   control. No capacity, ladder, session-count or off-box claim is made (§10).
+
+### 12.8 What the gate licenses, and what it does not
+
+- It licenses **nothing about capacity** at 35,200/s frame-bursty. C1 is
+  INCOMPLETE.
+- It states **no value for T-send-batch**. C3 is INCOMPLETE; §H5's moved-ceiling
+  form does not apply because both sides failed.
+- It states **no alignment cost**. Every pair is disclosed-asymmetric.
+- It **does** put the instrumentation on the record (C4 PASS) and it **does**
+  establish, from the control rather than the gate, that at 52,800/s offered on
+  this rig the JS originator is the binding constraint under all three arms —
+  which is the axis's open question answered in the direction the ticket was
+  built to detect rather than laundered past.
+
+A miss on a valid run is final (§10). This run was valid.
+
+## 12a. Post-run finding against the classifier — the C1 defect
+
+Registered rule being applied: this document may not be edited to change a
+threshold after results exist; a post-run correction is a **finding against its
+author**, documented as such, never a threshold move. This is one.
+
+**The bug.** `gateVerdictG3` computed C1 as
+`blocks > 0 && completeBlocks === batch.length` — the batch arm's **per-step**
+completeness only. Per-step `complete` encodes H3 and H4; **H1 and H2 are
+arm-level** and live in the arm's `RunVerdict`, which the same function was
+already reading four lines later to decide C3. The in-run
+`…-classified.json` therefore printed the self-contradiction the orchestrator
+caught: **C1 = PASS and C2 = PASS on the batch arm, while C3 = INCOMPLETE
+because that same batch arm was not honest.** §6 C1's own words are "complete
+(no STOP, **H1–H4 included**)", so the pre-registered clause was under-read, not
+ambiguous.
+
+**Not the suspected bug.** The first hypothesis was that the classifier failed to
+parse the three `headroom-*.json` fragments and defaulted the ceilings to 0. It
+did not: the fragments each carry exactly one rung, `m = 0.5`, with
+`passes: false`, and `ceilingPerSec: 0` is written **in the raw fragment by the
+harness**. The hand derivation in §12.1 is taken from those raw fields and the
+§H1 rule quoted verbatim, and it reproduces `{serial: 0, pipelined: 0, batch: 0}`
+exactly. The zeros were always right; the C1/C2 passes were always wrong.
+
+**The fix.** C1 now requires the batch arm's `RunVerdict.complete` alongside its
+per-block completeness, and the clause reports `armStop` so the arm-level STOP
+has somewhere to be named (it belongs to no block). No threshold, rung, block
+count, tolerance or clause name changed. A regression test —
+*"C1: five step-complete blocks under a failed headroom arm are INCOMPLETE"* —
+pins the exact configuration this run produced.
+
+**Verification that the fix is a fix and not a second opinion.** The corrected
+classifier was re-run over the **same four untouched raw fragments** and its
+output matches the hand derivation of §12.1–12.3 clause for clause:
+`C1=INCOMPLETE (5/5 batch arms complete, 5 blocks, armStop=generator-headroom)`,
+`C2=INCOMPLETE median=2.523ms [1.425, 3.572]`, `C3=INCOMPLETE ceilings={0,0,0}`,
+`C4=PASS 15/15`. `bun test tools/load/egress-*.test.ts` → **136 pass / 0 fail**;
+`bun run typecheck` clean; Biome clean.
+
+**Direction of the error, stated plainly.** The defect made the gate read
+*better* than the evidence supports — a false C1/C2 PASS on the lever's own arm.
+It was caught by a reader cross-checking two clauses of one artifact against each
+other, not by the harness. The generalizable lesson: a clause that inherits
+another clause's honesty condition must **read that condition**, not re-derive a
+weaker proxy from the same inputs; every registered "H1–H4 included" needs a test
+that fails when only H3/H4 are consulted.

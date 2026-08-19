@@ -883,6 +883,30 @@ describe("gate G3 — the three-arm comparison", () => {
 		expect(g.crossCheckR4).toBe("open");
 	});
 
+	test("C1: five step-complete blocks under a failed headroom arm are INCOMPLETE", () => {
+		// The gate-g3 run's own defect: every batch block was step-complete while
+		// the batch arm's loaded-headroom control produced no passing rung. §6 C1
+		// says "no STOP, H1-H4 included", so H2's arm-level STOP decides the
+		// clause and C2 cannot be read behind it.
+		const steps = classifySteps(
+			[0, 1, 2, 3, 4].flatMap((b) => [
+				gateStep("batch", b, 2),
+				gateStep("pipelined", b, 4),
+			]),
+			0,
+		);
+		const g = gateVerdictG3(
+			steps,
+			[runFor("batch", false), runFor("pipelined", false)],
+			true,
+		);
+		expect(g.c1.completeBlocks).toBe(5);
+		expect(g.c1.verdict).toBe("INCOMPLETE");
+		expect(g.c1.armStop).toBe("generator-headroom");
+		expect(g.c2.verdict).toBe("INCOMPLETE");
+		expect(g.c3.verdict).toBe("INCOMPLETE");
+	});
+
 	test("C2: an interval straddling the bar is INCONCLUSIVE-AT-BAR, never a pass", () => {
 		const steps = classifySteps(
 			[10, 12, 20, 30, 40].map((ms, b) => gateStep("batch", b, ms)),
