@@ -50,6 +50,7 @@ import {
 	cellDeadlineMs,
 	waitForChildWithDeadline,
 } from "./bench-child-deadline.ts";
+import { finishRun, writeArtifactDurable } from "./bench-shutdown.ts";
 import {
 	type ArmClauses,
 	type ArmId,
@@ -808,10 +809,25 @@ async function main(): Promise<void> {
 		deadlineBreachedRates: breachedRates,
 		rungs,
 	};
-	writeFileSync(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
+	writeArtifactDurable(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
 	console.log(`bench-g10: wrote ${OUT_JSON}`);
-	await server.close();
-	killChildren();
+
+	// This is where the ~7 minutes went. `close()` ran with the subscriber fleet
+	// still alive — `killChildren()` came after it — so the native drain spent
+	// its whole grace period watching `sessionsActive` refuse to fall, then
+	// rejected with `E_BACKPRESSURE_TIMEOUT: ... asyncOpsPending=N`, which from
+	// here would have turned a finished run into a non-zero exit. And the drain's
+	// own comment says what a remainder means: those are `Env::spawn_future`
+	// promises it cannot abort, and they hold Bun's event loop open until they
+	// settle on their own — which, for an off-box subscriber killed with no ICMP
+	// and no idle timeout to reap its session, is never.
+	//
+	// So: children first, then a bounded close, then take the exit.
+	await finishRun({
+		killChildren: () => killChildren(),
+		closeServer: () => server.close(),
+		onNote: (note) => console.log(`bench-g10 shutdown: ${note}`),
+	});
 
 	/* ---------------------------------------------------------------------- */
 
