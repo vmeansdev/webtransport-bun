@@ -172,6 +172,26 @@ impl SessionHandle {
         })
     }
 
+    /// Send one datagram without creating an N-API promise.
+    ///
+    /// Every async N-API method is backed by a ThreadsafeFunction, and a live
+    /// TSFN is a reference on the *host* event loop — one per datagram on the
+    /// old send path, released by the host after the Rust future is already
+    /// gone. That release is outside anything this addon can observe: the
+    /// async-op counters, the task gauges and the session registry all read
+    /// clean while the loop stays referenced. The only reliable answer is not
+    /// to take the reference: quinn's send is synchronous, so a send with
+    /// budget needs no promise at all.
+    ///
+    /// Resolves `null` when the datagram was queued, `"E_WOULD_BLOCK"` when the
+    /// caller should retry on {@link SessionHandle::send_datagram} (the only
+    /// path allowed to wait), or an error code. Never throws.
+    #[napi(js_name = "trySendDatagram")]
+    pub fn try_send_datagram(&self, data: Buffer) -> Option<String> {
+        crate::session::try_send_datagram_for_session(&self.id, data.as_ref())
+            .map(|code| code.to_string())
+    }
+
     /// Spawn on the addon runtime without holding an exclusive napi borrow of
     /// `self` across `.await` (Bun rejects concurrent `async fn &self` calls).
     ///
