@@ -74,6 +74,28 @@ const CELL_INDEX = process.env.LATENCY_CELL_INDEX
 /** The conductor builds `load-client` once for the whole dispatch. */
 const SKIP_BUILD = process.env.LATENCY_SKIP_BUILD === "1";
 
+/**
+ * Off-box generation. When `LATENCY_OFFBOX_SSH` is set the load client runs on
+ * another machine and dials this server over the LAN, which is the whole point
+ * of the G2 conversion: the generator stops competing with the server for the
+ * same four vCPU.
+ *
+ * The price is that the two ends no longer share `CLOCK_MONOTONIC`, so every
+ * cross-host interval this harness normally reports becomes an arbitrary
+ * constant plus a latency. Rather than record those and rely on a reader not to
+ * quote them, off-box mode does not record them at all — see `OFFBOX` below and
+ * `docs/research/preregistrations/gate-g2-offbox-rtt.md` §6, whose classifier
+ * asserts the histograms are empty.
+ */
+const OFFBOX_SSH = (process.env.LATENCY_OFFBOX_SSH ?? "").trim();
+const OFFBOX = OFFBOX_SSH.length > 0;
+/** This server's address as the off-box generator sees it. LAN, never 100.x. */
+const OFFBOX_URL_HOST = (process.env.LATENCY_OFFBOX_URL_HOST ?? "").trim();
+/** load-client path on the generator; the conductor provisions it. */
+const OFFBOX_BIN = (
+	process.env.LATENCY_OFFBOX_BIN ?? "/tmp/load-client"
+).trim();
+
 const HAS_PROC = process.platform === "linux";
 
 function serverCpuMs(): number {
@@ -95,6 +117,87 @@ function readHostCpu(): CpuSnapshot | null {
 function hostCpuPct(prev: CpuSnapshot | null, next: CpuSnapshot | null) {
 	if (!prev || !next || next.total === prev.total) return null;
 	return ((next.busy - prev.busy) / (next.total - prev.total)) * 100;
+}
+
+/** Per-interface receive counters, keyed by interface name. */
+export type NetCounters = Record<
+	string,
+	{ rxBytes: number; rxPackets: number }
+>;
+
+function readNetCounters(): NetCounters | null {
+	if (!HAS_PROC) return null;
+	const out: NetCounters = {};
+	for (const line of readFileSync("/proc/net/dev", "utf8").split("\n")) {
+		const m = line.match(/^\s*([^:]+):\s*(\d+)\s+(\d+)/);
+		if (!m?.[1]) continue;
+		out[m[1].trim()] = {
+			rxBytes: Number(m[2]),
+			rxPackets: Number(m[3]),
+		};
+	}
+	return out;
+}
+
+function netDelta(
+	prev: NetCounters | null,
+	next: NetCounters | null,
+): NetCounters | null {
+	if (!prev || !next) return null;
+	const out: NetCounters = {};
+	for (const [iface, after] of Object.entries(next)) {
+		const before = prev[iface];
+		if (!before) continue;
+		out[iface] = {
+			rxBytes: after.rxBytes - before.rxBytes,
+			rxPackets: after.rxPackets - before.rxPackets,
+		};
+	}
+	return out;
+}
+
+/**
+ * Kernel UDP counters. `RcvbufErrors` is the counter T02 used to attribute the
+ * 10k session loss; here it separates a drop inside this host from one on the
+ * wire, which is the difference between a product miss and a rig disclosure.
+ */
+export type UdpCounters = {
+	inDatagrams: number;
+	inErrors: number;
+	rcvbufErrors: number;
+};
+
+function readUdpCounters(): UdpCounters | null {
+	if (!HAS_PROC) return null;
+	const lines = readFileSync("/proc/net/snmp", "utf8").split("\n");
+	for (let i = 0; i < lines.length; i += 1) {
+		const header = lines[i] ?? "";
+		if (!header.startsWith("Udp:")) continue;
+		const names = header.trim().split(/\s+/).slice(1);
+		const values = (lines[i + 1] ?? "").trim().split(/\s+/).slice(1);
+		const at = (name: string): number => {
+			const idx = names.indexOf(name);
+			return idx >= 0 ? Number(values[idx] ?? 0) : 0;
+		};
+		return {
+			inDatagrams: at("InDatagrams"),
+			inErrors: at("InErrors"),
+			rcvbufErrors: at("RcvbufErrors"),
+		};
+	}
+	return null;
+}
+
+function udpDelta(
+	prev: UdpCounters | null,
+	next: UdpCounters | null,
+): UdpCounters | null {
+	if (!prev || !next) return null;
+	return {
+		inDatagrams: next.inDatagrams - prev.inDatagrams,
+		inErrors: next.inErrors - prev.inErrors,
+		rcvbufErrors: next.rcvbufErrors - prev.rcvbufErrors,
+	};
 }
 
 export type ClientLatencyJson = {
@@ -159,6 +262,20 @@ export type LatencyStep = {
 	serverCpuPct: number;
 	sessionsOk: number;
 	sessionsErr: number;
+	/**
+	 * Where the generator ran, and the marks that prove it (registration §6).
+	 * Optional because fragments written before the off-box work exist and are
+	 * still read by `latency-classify.ts`; a fragment without it is not off-box.
+	 */
+	generator?: {
+		mode: "onbox" | "offbox";
+		ssh: string | null;
+		urlHost: string;
+	};
+	/** Per-interface receive deltas over the client-process window. */
+	netRxDelta?: NetCounters | null;
+	/** Server-side kernel UDP deltas over the same window. */
+	udpDelta?: UdpCounters | null;
 };
 
 function median(values: number[]): number | null {
@@ -174,6 +291,21 @@ async function main(): Promise<void> {
 		throw new Error(
 			`LATENCY_PAYLOAD_BYTES must be >= ${STAMP_BYTES} to carry a stamp`,
 		);
+	}
+
+	if (OFFBOX) {
+		// Refusals, not warnings: an off-box arm that quietly falls back to
+		// loopback produces a good-looking number and a false claim.
+		if (!OFFBOX_URL_HOST) {
+			throw new Error(
+				"LATENCY_OFFBOX_SSH is set but LATENCY_OFFBOX_URL_HOST is not",
+			);
+		}
+		if (!/^192\.168\.2\./.test(OFFBOX_URL_HOST)) {
+			throw new Error(
+				`LATENCY_OFFBOX_URL_HOST must be a 192.168.2.x LAN address, got ${OFFBOX_URL_HOST} — the data path is never Tailscale`,
+			);
+		}
 	}
 
 	const clock = await createMonotonicClock();
@@ -248,7 +380,11 @@ async function main(): Promise<void> {
 						serverUnstamped += 1;
 					} else {
 						serverStamped += 1;
-						ingest.record(arrivedNs - stamp.actualNs);
+						// Off-box the stamp's send instant is another machine's
+						// counter. There is no ingest interval to compute, so none
+						// is computed and the histogram ships empty — a number that
+						// does not exist cannot be quoted.
+						if (!OFFBOX) ingest.record(arrivedNs - stamp.actualNs);
 					}
 					if (!ECHO) continue;
 					// Stamp the send instant into the payload the client is about
@@ -256,7 +392,15 @@ async function main(): Promise<void> {
 					// the egress leg the client measures starts here and not
 					// somewhere earlier in this function.
 					const echoAtNs = clock.now();
-					if (writeEchoActual(datagram, echoAtNs)) {
+					// Turnaround is server-local at both ends and stays valid
+					// off-box. Writing the instant into the payload does not: the
+					// client would difference it against its own clock and produce
+					// two fictional legs. So off-box the instant is measured and
+					// not shipped, the client sees no echo instant, and its egress
+					// and upstream histograms stay empty by construction.
+					if (OFFBOX) {
+						turnaround.record(echoAtNs - arrivedNs);
+					} else if (writeEchoActual(datagram, echoAtNs)) {
 						turnaround.record(echoAtNs - arrivedNs);
 					} else {
 						echoStampFailures += 1;
@@ -274,7 +418,7 @@ async function main(): Promise<void> {
 	// createServer has no readiness promise; same 3s the other load tools use.
 	await Bun.sleep(3000);
 	console.log(
-		`bench-latency: server up port=${PORT} sessions=${SESSIONS} payload=${PAYLOAD_BYTES}B step=${STEP_SECONDS}s echo=${ECHO} ladder=[${RATES.join(",")}]/s/session`,
+		`bench-latency: server up port=${PORT} sessions=${SESSIONS} payload=${PAYLOAD_BYTES}B step=${STEP_SECONDS}s echo=${ECHO} generator=${OFFBOX ? `offbox(${OFFBOX_SSH} -> ${OFFBOX_URL_HOST})` : "onbox"} ladder=[${RATES.join(",")}]/s/session`,
 	);
 
 	const steps: LatencyStep[] = [];
@@ -292,12 +436,28 @@ async function main(): Promise<void> {
 		const echo0 = echoSent;
 		const echoErr0 = echoErr;
 		const cpuMs0 = serverCpuMs();
+		const net0 = readNetCounters();
+		const udp0 = readUdpCounters();
 		const startedAt = Date.now();
 
+		if (OFFBOX) {
+			// A straggler from an earlier cell would share the generator with this
+			// one and land in its schedule lag.
+			Bun.spawnSync([
+				"ssh",
+				"-o",
+				"BatchMode=yes",
+				OFFBOX_SSH,
+				"pkill",
+				"-x",
+				"load-client",
+			]);
+		}
+
 		const args = [
-			CLIENT_BIN,
+			OFFBOX ? OFFBOX_BIN : CLIENT_BIN,
 			"--url",
-			`https://127.0.0.1:${PORT}`,
+			`https://${OFFBOX ? OFFBOX_URL_HOST : "127.0.0.1"}:${PORT}`,
 			"--mode",
 			"load",
 			"--skip-probes",
@@ -324,7 +484,20 @@ async function main(): Promise<void> {
 			"--max-stream-errors",
 			"1000000000",
 		];
-		const child = Bun.spawn(args, {
+		// A dead ssh channel must not orphan a remote generator, so the remote
+		// process carries its own deadline: the step, the drain, and slack.
+		const argv = OFFBOX
+			? [
+					"ssh",
+					"-o",
+					"BatchMode=yes",
+					OFFBOX_SSH,
+					"timeout",
+					String(STEP_SECONDS + 30),
+					...args,
+				]
+			: args;
+		const child = Bun.spawn(argv, {
 			cwd: ROOT,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -352,6 +525,10 @@ async function main(): Promise<void> {
 		const elapsedSec = (Date.now() - startedAt) / 1000;
 		const cpuMsAtClientExit = serverCpuMs();
 		const rxAtClientExit = serverRx;
+		// Read the kernel taps at client exit, over the same window the rates
+		// use: the drain that follows is idle and would dilute them.
+		const netRxDelta = netDelta(net0, readNetCounters());
+		const udpRxDelta = udpDelta(udp0, readUdpCounters());
 
 		// Drain grace, spent before the step is snapshotted rather than after.
 		// Datagrams still in flight when the client process exits are this step's
@@ -457,6 +634,13 @@ async function main(): Promise<void> {
 				((cpuMsAtClientExit - cpuMs0) / Math.max(elapsedSec * 1000, 1)) * 100,
 			sessionsOk,
 			sessionsErr: num(/sessions ok=\d+ err=(\d+)/),
+			generator: {
+				mode: OFFBOX ? "offbox" : "onbox",
+				ssh: OFFBOX ? OFFBOX_SSH : null,
+				urlHost: OFFBOX ? OFFBOX_URL_HOST : "127.0.0.1",
+			},
+			netRxDelta,
+			udpDelta: udpRxDelta,
 		};
 		step.upDeliveryRatio =
 			step.clientSent > 0 ? step.serverRx / step.clientSent : null;
@@ -506,6 +690,14 @@ async function main(): Promise<void> {
 			tickHz: TICK_HZ,
 			echo: ECHO,
 			datagramBatchEnv: process.env.WEBTRANSPORT_DATAGRAM_BATCH ?? null,
+			generatorMode: OFFBOX ? "offbox" : "onbox",
+			offboxSsh: OFFBOX ? OFFBOX_SSH : null,
+			offboxUrlHost: OFFBOX ? OFFBOX_URL_HOST : null,
+			/**
+			 * False off-box: the two ends read different counters, so no
+			 * cross-host interval is recorded at all (registration §6).
+			 */
+			sharedClock: !OFFBOX,
 		},
 		steps,
 	};
