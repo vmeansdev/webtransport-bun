@@ -524,6 +524,28 @@ rests on a hand derivation from the raw fragments.
 | the schedule clock moved to a `Worker`, publishing into a `SharedArrayBuffer` ring; `schedulerLag` read wholly on that thread; both threads on `clock_gettime(CLOCK_MONOTONIC)` with an epoch guard; early wakes ranked at zero with the count kept as `schedulerEarlyWakes` (the driver's recording — `latency-histogram.ts` semantics untouched, other axes share it) | `d21ce1f` |
 | the falsifier rebuilt on a CPU-burning fake and run against both loops; the retained in-process loop is the negative control | `2a681c0` |
 | V1 computed in the classifier (`v1`, `runValid`), printed before any clause line | `4bb7a9b` |
+| one clock worker per process instead of one per drive; the ring consumer polls rather than parking on `Atomics.waitAsync` (which wedges Bun 1.3.14's timer queue and hung the falsifier at 0 % CPU); both loops bounded so a stuck clock names itself | `44ed09e` |
+
+**Local smoke, three arms, disclosed with its limits.** All three arms driven
+through the fixed driver against their own shadow sinks, 15/20/30 sessions at
+m = 0.5/1/2, 10 s per rung, on a shared developer laptop at load ~9, classified
+by the new V1: spreads **3.03× / 2.90× / 1.09×** — V1 `VIOLATED` there. Two
+things about that number, both stated rather than argued away:
+
+- the absolute lag fell about tenfold (0.24–1.23 ms against run
+  `32238304133`'s 1.4–17.6 ms), and
+- **the arm ordering is gone.** In the invalid run serial and pipelined were
+  2.3–3.9× batch at *every* multiplier and in *every* one of ten gate blocks. In
+  the smoke the highest arm is pipelined at m = 0.5, serial at m = 1 and batch at
+  m = 2 — unordered, which is what box noise looks like and what emitter
+  coupling cannot look like.
+
+This smoke is **not** evidence that the rerun will clear V1. It is a shared
+laptop with six other workloads on it, its rungs are 10 s rather than 20 s, and
+its p99 sits over a few thousand samples rather than a few hundred thousand.
+Whether the runner can give the clock thread a core is exactly the open question
+V1 exists to answer, and §9's last paragraph already says what a firing means
+there: an honest rig finding, not an instrument defect.
 
 Direction of the fault-2 fix, stated because it moves published numbers:
 clamping an early wake to zero **lowers** the reported lag percentiles and
