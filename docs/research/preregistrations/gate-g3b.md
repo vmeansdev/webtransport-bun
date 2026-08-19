@@ -493,6 +493,51 @@ d4a2385c0d3279fb750b1ab940a4d16df9fec9c0e86cd820a5ddbac76c775a1e  ...-headroom-s
 
 (prefix `bench-egress-7abd6411b3786a0c546c2d802dc1b0fa5013aca3` on every name)
 
+### Harness fault declared against Dispatch 1 — §10 rerun clause
+
+Logged here per §10 (*"a rerun requires a declared, logged harness/infra
+fault"*). **Nothing in §1–§8 is edited by this entry.** No threshold, clause,
+bound or prediction moved; V1 keeps its registered 2× bar and its registered
+consequence.
+
+**Fault 1 — the honesty instrument was measured on the emitter's own event
+loop.** §2.2's correction stopped the timing loop from `await`ing the emitter,
+but the loop's timer callbacks and the arm's work were still queued on one
+event loop, so a costlier arm delayed the read of `readyNs`. `handoffDelay`
+p99 of 1.4–4.8 µs on every arm and every rung rules the queue out as the
+carrier; the carrier is the event loop. `schedulerLag` was therefore
+arm-dependent by construction, which is what V1 detected.
+
+**Fault 2 — the percentile ranked the late subset only.** `schedulerLag`
+percentiles were computed over positive samples: `LatencyHistogram.record`
+counts a negative sample without bucketing it, and 47–84 % of `frame-bursty`
+wakes were early, with the early fraction itself arm-dependent (batch 84 %,
+serial/pipelined ~47 %). The three columns V1 compares were not the same order
+statistic.
+
+**Fault 3 — V1 was not computed anywhere.** It is a registered run-level
+condition and no field in `classified.json` carried it; the Dispatch 1 verdict
+rests on a hand derivation from the raw fragments.
+
+| fix | commit |
+|---|---|
+| the schedule clock moved to a `Worker`, publishing into a `SharedArrayBuffer` ring; `schedulerLag` read wholly on that thread; both threads on `clock_gettime(CLOCK_MONOTONIC)` with an epoch guard; early wakes ranked at zero with the count kept as `schedulerEarlyWakes` (the driver's recording — `latency-histogram.ts` semantics untouched, other axes share it) | `d21ce1f` |
+| the falsifier rebuilt on a CPU-burning fake and run against both loops; the retained in-process loop is the negative control | `2a681c0` |
+| V1 computed in the classifier (`v1`, `runValid`), printed before any clause line | `4bb7a9b` |
+
+Direction of the fault-2 fix, stated because it moves published numbers:
+clamping an early wake to zero **lowers** the reported lag percentiles and
+**enlarges** the rank's denominator. It cannot raise a lag number, so it cannot
+turn a lag failure into a pass by inflation; it can only make an already
+generous instrument more generous, and the `T/2` bound it is judged against is
+unchanged.
+
+What the fix does **not** do: it does not change the offered shape, the
+depth-one slot (§12 Amendment 1), the per-session emission concurrency, the
+arms, the rung, the block structure, the bound, H1–H6, C1–C4 or §7's
+predictions. The rerun is the same registration, on the same inputs as run
+`32238304133`, from a candidate carrying the three commits above.
+
 ---
 
 ## 10. What this registration may not do
