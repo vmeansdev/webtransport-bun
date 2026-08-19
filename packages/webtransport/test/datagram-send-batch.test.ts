@@ -235,6 +235,36 @@ describe("batched datagram send — chunking", () => {
 		expect(datagrams[296]).toBeDefined();
 	});
 
+	/**
+	 * SPEC: "One backpressure deadline for the whole call." Above the cap that
+	 * is only true if the crossings share a clock — each native call derives
+	 * its own deadline, so without this a 1024-element array bought four
+	 * `backpressureTimeoutMs` for the one call the caller made.
+	 */
+	it("carries the call's spent budget into every chunk after the first", async () => {
+		const seen: number[] = [];
+		const send = async (chunk: Uint8Array[], elapsedMs: number) => {
+			seen.push(elapsedMs);
+			// Burn real time so the reported budget has to move.
+			await new Promise((r) => setTimeout(r, 12));
+			return { sent: chunk.length };
+		};
+		const datagrams = Array.from({ length: 1000 }, () => payload(1, 8));
+		expect(await sendDatagramBatchChunked(send, datagrams)).toEqual({
+			sent: 1000,
+		});
+
+		expect(seen).toHaveLength(4);
+		// The first crossing has spent nothing; it gets the whole budget.
+		expect(seen[0]).toBe(0);
+		// Every later crossing reports strictly more, and it is real elapsed
+		// time — three sleeps of 12 ms have happened by the last one.
+		for (let i = 1; i < seen.length; i += 1) {
+			expect(seen[i]).toBeGreaterThan(seen[i - 1]);
+		}
+		expect(seen[3]).toBeGreaterThanOrEqual(30);
+	});
+
 	it("an empty array is a resolved zero, with no crossing at all", async () => {
 		const { chunks, send } = sender([]);
 		expect(await sendDatagramBatchChunked(send, [])).toEqual({ sent: 0 });

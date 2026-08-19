@@ -470,7 +470,13 @@ Contract points worth stating:
 - **Payloads are copied before the promise is returned.** A caller may reuse or
   overwrite its arrays immediately.
 - **One backpressure deadline for the whole call.** A caller who made one call
-  waits at most one `backpressureTimeoutMs`, not one per element.
+  waits at most one `backpressureTimeoutMs`, not one per element — and not one
+  per crossing either. An array longer than the 256-element native cap is split
+  into several calls (see "No length limit" below), and each crossing is told
+  how much of the budget the call has already spent, so the deadline is what
+  remains rather than a fresh one. A crossing that begins with the budget spent
+  still sends every element that does not have to wait: the byte reservation is
+  attempted before the deadline is consulted.
 - **The byte reservation is per element**, never `sum(len)` against
   `maxQueuedBytesPerSession`: a whole-batch reservation larger than the session
   budget would wait on a release that can never come.

@@ -224,12 +224,24 @@ impl SessionHandle {
     /// silently dropping the tail; the TypeScript wrapper chunks so no ordinary
     /// caller sees it.
     ///
+    /// `elapsedMs` is how long the caller-visible call has already run, so an
+    /// array the TypeScript layer had to split across several crossings still
+    /// shares one backpressure deadline. Omitted means zero.
+    ///
     /// Same no-hop contract as `send_datagram`.
     #[napi(ts_return_type = "Promise<DatagramBatchResult>")]
-    pub fn send_datagram_batch(&self, env: Env, data: Vec<Uint8Array>) -> Result<JsObject> {
+    pub fn send_datagram_batch(
+        &self,
+        env: Env,
+        data: Vec<Uint8Array>,
+        elapsed_ms: Option<u32>,
+    ) -> Result<JsObject> {
         let id = self.id.clone();
         let prepared = crate::datagram_batch::prepare_batch(&data);
-        env.spawn_future(async move { Ok(send_datagram_batch_for_session(&id, prepared).await) })
+        let elapsed = u64::from(elapsed_ms.unwrap_or(0));
+        env.spawn_future(async move {
+            Ok(send_datagram_batch_for_session(&id, prepared, elapsed).await)
+        })
     }
 
     /// Reads on the N-API runtime `spawn_future` already provides. Do NOT
