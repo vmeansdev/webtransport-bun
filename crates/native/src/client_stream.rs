@@ -463,6 +463,327 @@ impl Drop for StreamChunk {
 }
 
 // ---------------------------------------------------------------------------
+// Receive-side chunk batching
+// ---------------------------------------------------------------------------
+
+/// Upper bound on one batched crossing, whatever the caller asks for. Beyond
+/// this a larger budget buys nothing — the engine allocation per crossing grows
+/// with it — and one stream could pin an arbitrarily large payload.
+pub(crate) const STREAM_BATCH_MAX_BYTES: usize = 1024 * 1024;
+
+/// The byte budget for one batched crossing, reconciled against the per-stream
+/// receive window.
+///
+/// `max_stream` is `maxQueuedBytesPerStream`, the same limit `transport_memory`
+/// derives `stream_receive_window` from, so a budget above it can never be
+/// filled and only inflates the JS-side allocation. The floor is one byte, not
+/// zero: a batch that cannot fit anything would park forever on its first chunk
+/// (the datagram park-forever class, 5ad0245).
+fn resolve_batch_budget(requested: u32, budget: Option<&StreamBudget>) -> usize {
+    let window = budget
+        .map(|b| usize::try_from(b.max_stream).unwrap_or(usize::MAX))
+        .unwrap_or(STREAM_BATCH_MAX_BYTES);
+    let cap = STREAM_BATCH_MAX_BYTES.min(window).max(1);
+    (requested as usize).clamp(1, cap)
+}
+
+/// Poll a future exactly once, taking its output only if it is already ready.
+///
+/// This is the "take only what is already there" primitive for the deferred
+/// direct path, which has no queue of its own to `try_recv` from. Quinn
+/// documents `read_chunk` as cancel-safe, so a `Pending` poll consumes nothing
+/// and dropping the future loses no data. The noop waker it registers replaces
+/// quinn's blocked-reader entry for this stream, which is harmless: we hold the
+/// stream exclusively, and the next read registers a real waker before parking,
+/// re-reading the assembler from scratch.
+fn poll_once<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(value) => Some(value),
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// One receive-side crossing's worth of stream data, delivered to JavaScript as
+/// a single `Uint8Array`.
+///
+/// The chunks stay alive until `to_napi_value` has copied them into the engine's
+/// allocation, so every three-tier byte reservation behind them is released on
+/// JS consumption and never at coalesce time. The copy into that allocation is
+/// the only copy the bytes pay, which is what keeps coalescing compatible with
+/// the refcounted-payload flow.
+pub struct CoalescedChunks {
+    chunks: Vec<StreamChunk>,
+    len: usize,
+}
+
+impl CoalescedChunks {
+    fn new(chunks: Vec<StreamChunk>) -> Self {
+        let len = chunks.iter().map(|chunk| chunk.as_bytes().len()).sum();
+        Self { chunks, len }
+    }
+
+    fn copy_to(&self, dst: &mut [u8]) {
+        let mut at = 0;
+        for chunk in &self.chunks {
+            let bytes = chunk.as_bytes();
+            dst[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        }
+    }
+
+    /// The bytes as one owned allocation, for the external-handover arm. Taken
+    /// by reference so the chunks — and their reservations — outlive the
+    /// handover itself.
+    fn to_contiguous(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        for chunk in &self.chunks {
+            out.extend_from_slice(chunk.as_bytes());
+        }
+        out
+    }
+}
+
+impl napi::bindgen_prelude::TypeName for CoalescedChunks {
+    fn type_name() -> &'static str {
+        "Uint8Array"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl napi::bindgen_prelude::ToNapiValue for CoalescedChunks {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        use crate::payload_buffer::{
+            empty_payload_value, engine_owned_arraybuffer, engine_owned_buffer,
+            external_payload_to_napi_value, payload_delivery_mode, plan_delivery,
+            PayloadDeliveryPlan,
+        };
+        let len = val.len;
+        match plan_delivery(len, payload_delivery_mode()) {
+            PayloadDeliveryPlan::Empty => unsafe { empty_payload_value(env) },
+            PayloadDeliveryPlan::EngineOwnedArrayBuffer => unsafe {
+                engine_owned_arraybuffer(env, len, |dst| val.copy_to(dst))
+            },
+            PayloadDeliveryPlan::EngineOwnedBufferCopy => unsafe {
+                engine_owned_buffer(env, len, |dst| val.copy_to(dst))
+            },
+            PayloadDeliveryPlan::ExternalAccounted => unsafe {
+                external_payload_to_napi_value(env, val.to_contiguous(), len)
+            },
+        }
+    }
+}
+
+/// The pieces of a receive handle a bridged batch read needs. Both stream
+/// handles carry the same shape, so the batch lane is written once.
+struct BridgeReadCtx<'a> {
+    read_rx: &'a Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
+    read_error_slot: Option<&'a ReadErrorSlot>,
+    deferred_read_error_slot: &'a Mutex<Option<ReadErrorSlot>>,
+    read_abort: &'a Notify,
+    read_aborted: &'a AtomicBool,
+}
+
+/// Take everything already queued on a receive bridge, up to `max_bytes`.
+///
+/// Parks only for the first chunk — H7's rule: no timer, no fill wait, so a
+/// batch is exactly what had already arrived by the time the first chunk did.
+/// A closed channel is never consumed here: `try_recv` leaves the terminal
+/// state on the receiver, so the next read re-observes it as EOF or the stored
+/// error code. Bytes first, terminal event separate, never merged.
+async fn read_bridge_batch(
+    ctx: BridgeReadCtx<'_>,
+    max_bytes: usize,
+) -> Result<Option<CoalescedChunks>> {
+    let read_rx = ctx
+        .read_rx
+        .lock()
+        .map_err(|_| napi::Error::from_reason("E_INTERNAL: stream read lock poisoned"))?
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| wt_from_reason("E_STREAM_RESET"))?;
+    let mut rx = read_rx.lock().await;
+    let read_abort = ctx.read_abort.notified();
+    tokio::pin!(read_abort);
+    if ctx.read_aborted.load(Ordering::Acquire) {
+        return Err(wt_from_reason("E_STREAM_RESET"));
+    }
+    let first = tokio::select! {
+        value = rx.recv() => value,
+        _ = &mut read_abort => {
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+    };
+    let Some(first) = first else {
+        let deferred_slot = ctx
+            .deferred_read_error_slot
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(slot) = ctx.read_error_slot.or(deferred_slot.as_ref()) {
+            if let Ok(guard) = slot.lock() {
+                if let Some(code) = *guard {
+                    return Err(wt_from_static_code(code));
+                }
+            }
+        }
+        return Ok(None);
+    };
+
+    let mut total = first.as_bytes().len();
+    let mut chunks = vec![first];
+    while total < max_bytes {
+        let Ok(chunk) = rx.try_recv() else {
+            break;
+        };
+        total += chunk.as_bytes().len();
+        chunks.push(chunk);
+    }
+    Ok(Some(CoalescedChunks::new(chunks)))
+}
+
+/// The pieces of a receive handle a deferred-direct batch read needs.
+struct DirectReadCtx<'a> {
+    deferred_recv: &'a Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
+    budget: &'a Mutex<Option<StreamBudget>>,
+    deferred_budget: &'a Mutex<Option<DeferredStreamBudgetConfig>>,
+    read_abort: &'a Notify,
+    read_aborted: &'a AtomicBool,
+}
+
+/// The batched twin of `read_deferred_direct`: park for the first chunk exactly
+/// as the single-chunk lane does, then take whatever else quinn's assembler
+/// already holds without ever waiting for more.
+///
+/// Returns `Ok(None)` when the stream is not deferred (the caller falls back to
+/// the bridge), `Ok(Some(None))` at EOF, `Ok(Some(Some(batch)))` with data.
+async fn read_deferred_direct_batch(
+    ctx: DirectReadCtx<'_>,
+    requested_bytes: u32,
+) -> Result<Option<Option<CoalescedChunks>>> {
+    let pending = ctx
+        .deferred_recv
+        .lock()
+        .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
+        .take();
+    let Some((mut recv_stream, guard)) = pending else {
+        return Ok(None);
+    };
+    if ctx.read_aborted.load(Ordering::Acquire) {
+        recv_stream.stop(0);
+        drop(guard);
+        return Err(wt_from_reason("E_STREAM_RESET"));
+    }
+
+    let budget = installed_budget(ctx.budget, ctx.deferred_budget)?;
+    let max_bytes = resolve_batch_budget(requested_bytes, budget.as_ref());
+
+    let notified = ctx.read_abort.notified();
+    tokio::pin!(notified);
+    let _probe_direct = await_probe::enter(&await_probe::DIRECT_QUINN_READ);
+    let first_len = max_bytes.min(STREAM_READ_BUFFER_BYTES);
+    let result = tokio::select! {
+        value = recv_stream.quic_stream_mut().read_chunk(first_len, true) => value,
+        _ = &mut notified => {
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+    };
+    let read_result = match result {
+        Ok(value) => value,
+        Err(error) => {
+            drop(guard);
+            return Err(wt_from_static_code(quic_read_error_code(&error)));
+        }
+    };
+    let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
+        drop(guard);
+        return Ok(Some(None));
+    };
+    let n = chunk_bytes.len();
+    if let Some(ref b) = budget {
+        if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_STREAM_RESET"));
+        }
+        if !{
+            let _probe = await_probe::enter(&await_probe::DIRECT_BUDGET_WAIT);
+            b.reserve_or_wait(n as u64).await
+        } {
+            recv_stream.stop(0);
+            drop(guard);
+            return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
+        }
+    }
+    if ctx.read_aborted.load(Ordering::Acquire) {
+        if let Some(ref b) = budget {
+            b.release(n as u64);
+        }
+        recv_stream.stop(0);
+        drop(guard);
+        return Err(wt_from_reason("E_STREAM_RESET"));
+    }
+
+    let mut total = n;
+    let mut chunks = vec![StreamChunk::new_shared(
+        chunk_bytes,
+        budget.clone(),
+        n as u64,
+    )];
+    while total < max_bytes {
+        let want = (max_bytes - total).min(STREAM_READ_BUFFER_BYTES);
+        // Reserve before reading, never after: reserving afterwards would leave
+        // a chunk in hand with nowhere to account it, and parking on the budget
+        // mid-batch is exactly the wait this lever exists to remove. The excess
+        // over what the read actually yields is given straight back.
+        if let Some(ref b) = budget {
+            if !b.try_reserve(want as u64) {
+                break;
+            }
+        }
+        let polled = poll_once(recv_stream.quic_stream_mut().read_chunk(want, true));
+        // Pending means nothing more is queued. EOF and reset stop the batch
+        // without being consumed: quinn keeps both sticky, so the next read
+        // re-observes them as their own terminal event.
+        let Some(Ok(Some(chunk))) = polled else {
+            if let Some(ref b) = budget {
+                b.release(want as u64);
+            }
+            break;
+        };
+        let taken = chunk.bytes.len();
+        if let Some(ref b) = budget {
+            b.release((want - taken) as u64);
+        }
+        total += taken;
+        chunks.push(StreamChunk::new_shared(
+            chunk.bytes,
+            budget.clone(),
+            taken as u64,
+        ));
+    }
+
+    let batch = CoalescedChunks::new(chunks);
+    let mut deferred = ctx
+        .deferred_recv
+        .lock()
+        .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?;
+    if ctx.read_aborted.load(Ordering::Acquire) {
+        recv_stream.stop(0);
+        drop(guard);
+    } else {
+        *deferred = Some((recv_stream, guard));
+    }
+    Ok(Some(Some(batch)))
+}
+
+// ---------------------------------------------------------------------------
 // Bidi stream handle
 // ---------------------------------------------------------------------------
 
@@ -1036,6 +1357,59 @@ impl ClientBidiStreamHandle {
             Ok(None) => Either3::B(Null),
             Err(error) => Either3::C(error.reason.clone()),
         }
+    }
+
+    /// Read up to `max_bytes` of already-arrived stream data with one delivery
+    /// call. Same never-reject contract as `read`, and the same value shapes:
+    /// one `Uint8Array` for data, null for EOF, the error code string on
+    /// failure.
+    ///
+    /// Parks for the first chunk, then coalesces whatever is already queued —
+    /// no timer, no fill wait. Terminal events are never folded into a batch: a
+    /// batch that runs into EOF or a reset delivers its bytes and leaves the
+    /// terminal event for the next call.
+    #[napi]
+    pub async fn read_batch(
+        &self,
+        max_bytes: u32,
+    ) -> napi::bindgen_prelude::Either3<CoalescedChunks, napi::bindgen_prelude::Null, String> {
+        use napi::bindgen_prelude::{Either3, Null};
+        match self.read_batch_inner(max_bytes).await {
+            Ok(Some(batch)) => Either3::A(batch),
+            Ok(None) => Either3::B(Null),
+            Err(error) => Either3::C(error.reason.clone()),
+        }
+    }
+
+    async fn read_batch_inner(&self, max_bytes: u32) -> Result<Option<CoalescedChunks>> {
+        let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
+        if let Some(result) = read_deferred_direct_batch(
+            DirectReadCtx {
+                deferred_recv: &self.deferred_recv,
+                budget: &self.budget,
+                deferred_budget: &self.deferred_budget,
+                read_abort: &self.read_abort,
+                read_aborted: &self.read_aborted,
+            },
+            max_bytes,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+        self.ensure_deferred_read_bridge().await?;
+        let installed = installed_budget(&self.budget, &self.deferred_budget)?;
+        read_bridge_batch(
+            BridgeReadCtx {
+                read_rx: &self.read_rx,
+                read_error_slot: self.read_error_slot.as_ref(),
+                deferred_read_error_slot: &self.deferred_read_error_slot,
+                read_abort: &self.read_abort,
+                read_aborted: &self.read_aborted,
+            },
+            resolve_batch_budget(max_bytes, installed.as_ref()),
+        )
+        .await
     }
 
     pub(crate) async fn read_inner(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
@@ -1737,6 +2111,59 @@ impl ClientUniRecvHandle {
             Ok(None) => Either3::B(Null),
             Err(error) => Either3::C(error.reason.clone()),
         }
+    }
+
+    /// Read up to `max_bytes` of already-arrived stream data with one delivery
+    /// call. Same never-reject contract as `read`, and the same value shapes:
+    /// one `Uint8Array` for data, null for EOF, the error code string on
+    /// failure.
+    ///
+    /// Parks for the first chunk, then coalesces whatever is already queued —
+    /// no timer, no fill wait. Terminal events are never folded into a batch: a
+    /// batch that runs into EOF or a reset delivers its bytes and leaves the
+    /// terminal event for the next call.
+    #[napi]
+    pub async fn read_batch(
+        &self,
+        max_bytes: u32,
+    ) -> napi::bindgen_prelude::Either3<CoalescedChunks, napi::bindgen_prelude::Null, String> {
+        use napi::bindgen_prelude::{Either3, Null};
+        match self.read_batch_inner(max_bytes).await {
+            Ok(Some(batch)) => Either3::A(batch),
+            Ok(None) => Either3::B(Null),
+            Err(error) => Either3::C(error.reason.clone()),
+        }
+    }
+
+    async fn read_batch_inner(&self, max_bytes: u32) -> Result<Option<CoalescedChunks>> {
+        let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
+        if let Some(result) = read_deferred_direct_batch(
+            DirectReadCtx {
+                deferred_recv: &self.deferred_recv,
+                budget: &self.budget,
+                deferred_budget: &self.deferred_budget,
+                read_abort: &self.read_abort,
+                read_aborted: &self.read_aborted,
+            },
+            max_bytes,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+        self.ensure_deferred_read_bridge().await?;
+        let installed = installed_budget(&self.budget, &self.deferred_budget)?;
+        read_bridge_batch(
+            BridgeReadCtx {
+                read_rx: &self.read_rx,
+                read_error_slot: self.read_error_slot.as_ref(),
+                deferred_read_error_slot: &self.deferred_read_error_slot,
+                read_abort: &self.read_abort,
+                read_aborted: &self.read_aborted,
+            },
+            resolve_batch_budget(max_bytes, installed.as_ref()),
+        )
+        .await
     }
 
     pub(crate) async fn read_inner(&self) -> Result<Option<crate::payload_buffer::PayloadBuffer>> {
@@ -2505,6 +2932,110 @@ mod tests {
     fn stream_chunk_without_budget_is_noop() {
         let chunk = StreamChunk::new(vec![1u8; 10], None, 0);
         drop(chunk);
+    }
+
+    // The crossing budget is reconciled against the per-stream receive window:
+    // a request above it can never be filled, and the floor stays at one byte
+    // so a batch can never park on a budget that fits nothing.
+    #[test]
+    fn batch_budget_is_clamped_to_the_stream_window() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert_eq!(b.max_stream, 1 << 16);
+        assert_eq!(resolve_batch_budget(1 << 20, Some(&b)), 1 << 16);
+        assert_eq!(resolve_batch_budget(4096, Some(&b)), 4096);
+        assert_eq!(resolve_batch_budget(0, Some(&b)), 1);
+        // Without a budget the addon's own ceiling is the only bound.
+        assert_eq!(resolve_batch_budget(u32::MAX, None), STREAM_BATCH_MAX_BYTES);
+        assert_eq!(resolve_batch_budget(0, None), 1);
+    }
+
+    // The follow-up reads in a batch take only what is already there.
+    #[test]
+    fn poll_once_takes_a_ready_future_and_leaves_a_pending_one() {
+        assert_eq!(poll_once(std::future::ready(7u32)), Some(7));
+        assert_eq!(poll_once(std::future::pending::<u32>()), None);
+    }
+
+    // Coalescing must not reorder, pad, or drop bytes, and every chunk's
+    // reservation must survive until the payload has been materialized.
+    #[test]
+    fn coalesced_chunks_concatenate_in_order_and_hold_reservations() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(b.try_reserve(3));
+        assert!(b.try_reserve(2));
+        let batch = CoalescedChunks::new(vec![
+            StreamChunk::new(vec![1, 2, 3], Some(b.clone()), 3),
+            StreamChunk::new_shared(bytes::Bytes::from_static(&[4, 5]), Some(b.clone()), 2),
+        ]);
+        assert_eq!(batch.len, 5);
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 5);
+
+        let mut dst = vec![0u8; batch.len];
+        batch.copy_to(&mut dst);
+        assert_eq!(dst, vec![1, 2, 3, 4, 5]);
+        assert_eq!(batch.to_contiguous(), vec![1, 2, 3, 4, 5]);
+        // Still reserved: the bytes have not reached JavaScript yet.
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 5);
+
+        drop(batch);
+        assert_eq!(stream_queued.load(Ordering::Relaxed), 0);
+        assert_eq!(b.session_metrics.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    // Park for the first chunk, then take only what is queued — and never
+    // consume the channel's terminal state while doing it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_batch_coalesces_queued_chunks_and_leaves_eof_behind() {
+        let (tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+        for chunk in [vec![1u8; 100], vec![2u8; 100], vec![3u8; 100]] {
+            tx.send(StreamChunk::new(chunk, None, 0)).await.unwrap();
+        }
+        drop(tx);
+        let handle = ClientUniRecvHandle::new(read_rx, oneshot::channel::<u32>().0);
+
+        let first = handle
+            .read_batch_inner(4096)
+            .await
+            .expect("batch read")
+            .expect("data");
+        assert_eq!(first.len, 300);
+
+        // The closed channel was observed by try_recv but not consumed: EOF is
+        // still there to be delivered as its own event.
+        assert!(handle.read_batch_inner(4096).await.expect("eof").is_none());
+    }
+
+    // A budget smaller than what is queued splits the burst across crossings
+    // instead of overshooting it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_batch_stops_at_the_byte_budget() {
+        let (tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+        for _ in 0..4 {
+            tx.send(StreamChunk::new(vec![7u8; 100], None, 0))
+                .await
+                .unwrap();
+        }
+        let handle = ClientUniRecvHandle::new(read_rx, oneshot::channel::<u32>().0);
+
+        let first = handle
+            .read_batch_inner(150)
+            .await
+            .expect("batch read")
+            .expect("data");
+        assert_eq!(
+            first.len, 200,
+            "the chunk that crosses the budget completes"
+        );
+        let second = handle
+            .read_batch_inner(150)
+            .await
+            .expect("batch read")
+            .expect("data");
+        assert_eq!(second.len, 200);
+        drop(tx);
+        assert!(handle.read_batch_inner(150).await.expect("eof").is_none());
     }
 
     fn deferred_config() -> DeferredStreamBudgetConfig {

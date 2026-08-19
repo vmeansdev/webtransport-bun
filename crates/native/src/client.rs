@@ -1,5 +1,6 @@
 //! WebTransport client. Connects to a server and exposes session API.
 
+use napi::bindgen_prelude::Uint8Array;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, JsFunction, JsObject, Result};
 use napi_derive::napi;
@@ -202,11 +203,7 @@ fn try_reserve_client_queued_bytes(metrics: &ClientMetrics, budget_bytes: u64, n
 /// release exactly its own slots back to the forwarder and no more.
 pub(crate) const CLIENT_DATAGRAM_RECV_CAPACITY: usize = 256;
 
-/// Largest batch one client delivery call may carry. Matches the server cap:
-/// the N-API round-trip win is flat well before here, and a larger cap only
-/// widens the window in which dequeued payloads sit outside the byte
-/// reservation.
-const CLIENT_DATAGRAM_BATCH_MAX: u32 = 256;
+use crate::datagram_batch::DATAGRAM_BATCH_MAX;
 
 /// Queued-slot depth at or above which the forwarder copies instead of
 /// retaining the transport buffer. Retention pins the datagram's GRO parent
@@ -246,11 +243,61 @@ fn client_recv_payload(dgram: wtransport::datagram::Datagram, queue_depth: usize
 /// forwarder cannot charge. This is panic insurance, not the mechanism.
 const FORWARDER_EXIT_WAIT: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 
+/// The client half of the datagram send path, detached from the handle so a
+/// spawned future can own it. Resolved once per N-API call; a batch shares it
+/// across its elements, and `closed` stays live because it is the handle's own
+/// flag rather than a copy of it.
+struct ClientDatagramSendState {
+    tx: mpsc::Sender<Vec<u8>>,
+    closed: Arc<AtomicBool>,
+    client_metrics: Arc<ClientMetrics>,
+    datagram_budget_bytes: u64,
+    backpressure_timeout_ms: u64,
+    max_datagram_size: usize,
+}
+
+impl ClientDatagramSendState {
+    /// One datagram against an already-resolved state and deadline.
+    ///
+    /// The client fails fast on budget rather than parking on a governor — that
+    /// asymmetry with the server is pre-existing and deliberate, and the batch
+    /// path inherits each handle's per-datagram semantics element by element
+    /// rather than inventing a third behavior.
+    async fn send_one(&self, bytes: Vec<u8>, deadline: tokio::time::Instant) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
+        }
+        if bytes.len() > self.max_datagram_size {
+            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+        }
+        let sz = bytes.len() as u64;
+        if !try_reserve_client_queued_bytes(&self.client_metrics, self.datagram_budget_bytes, sz) {
+            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+        }
+        match tokio::time::timeout_at(deadline, self.tx.send(bytes)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_send_err)) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(sz, Ordering::Relaxed);
+                crate::report_channel_failure("client datagram enqueue");
+                Err(napi::Error::from_reason("E_SESSION_CLOSED"))
+            }
+            Err(_elapsed) => {
+                self.client_metrics
+                    .queued_bytes
+                    .fetch_sub(sz, Ordering::Relaxed);
+                Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))
+            }
+        }
+    }
+}
+
 /// Clamp a caller-supplied batch size into range. Out-of-range values are
 /// corrected silently: a rejected async N-API call leaks its self-reference
 /// under Bun, so user input must never become an `Err`.
 fn clamp_client_batch_max(max: u32) -> usize {
-    max.clamp(1, CLIENT_DATAGRAM_BATCH_MAX) as usize
+    max.clamp(1, DATAGRAM_BATCH_MAX) as usize
 }
 
 /// Store the sticky close flag and wake every parked datagram reader and the
@@ -894,38 +941,68 @@ impl ClientSessionHandle {
     }
 
     async fn send_datagram_inner(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
-        }
-        let Some(ref tx) = self.dgram_send_tx else {
+        let Some(state) = self.datagram_send_state() else {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
-        let bytes = data.to_vec();
-        if bytes.len() > self.max_datagram_size {
-            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(state.backpressure_timeout_ms);
+        state.send_one(data.to_vec(), deadline).await
+    }
+
+    /// Send up to 256 datagrams across one N-API crossing.
+    ///
+    /// Resolves `{sent, code?}` and never rejects: `sent = k` means elements
+    /// `0..k` went out in order, `code` is why element `k` failed, and elements
+    /// after `k` were not attempted. More than 256 elements resolves
+    /// `{sent: <=256, code: "E_BATCH_TOO_LARGE"}` rather than silently dropping
+    /// the tail.
+    ///
+    /// Unlike `send_datagram` this is a synchronous function returning a
+    /// promise, not an `async fn`: every payload must be copied out of the
+    /// caller's arrays *before* the future is spawned, so a caller may reuse
+    /// them the moment the call returns. The backpressure deadline is computed
+    /// once here and shared by all elements — one call, one call's worth of
+    /// patience — while the byte reservation stays strictly per element.
+    #[napi(ts_return_type = "Promise<DatagramBatchResult>")]
+    pub fn send_datagram_batch(&self, env: Env, data: Vec<Uint8Array>) -> Result<JsObject> {
+        let prepared = crate::datagram_batch::prepare_batch(&data);
+        let state = self.datagram_send_state();
+        env.spawn_future(async move {
+            let Some(state) = state else {
+                return Ok(crate::datagram_batch::DatagramBatchResult::new(
+                    0,
+                    Some("E_SESSION_CLOSED".to_string()),
+                ));
+            };
+            let deadline = tokio::time::Instant::now()
+                + tokio::time::Duration::from_millis(state.backpressure_timeout_ms);
+            Ok(crate::datagram_batch::send_prepared(prepared, |bytes| {
+                let state = &state;
+                async move {
+                    state
+                        .send_one(bytes, deadline)
+                        .await
+                        .map_err(|err| err.reason.clone())
+                }
+            })
+            .await)
+        })
+    }
+
+    /// Everything one datagram send needs from the handle, owned so a spawned
+    /// future can hold it. `None` once the session is closed or detached.
+    fn datagram_send_state(&self) -> Option<ClientDatagramSendState> {
+        if self.closed.load(Ordering::Relaxed) {
+            return None;
         }
-        let sz = bytes.len() as u64;
-        if !try_reserve_client_queued_bytes(&self.client_metrics, self.datagram_budget_bytes, sz) {
-            return Err(napi::Error::from_reason("E_QUEUE_FULL"));
-        }
-        let timeout = tokio::time::Duration::from_millis(self.backpressure_timeout_ms);
-        let result = tokio::time::timeout(timeout, tx.send(bytes)).await;
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_send_err)) => {
-                self.client_metrics
-                    .queued_bytes
-                    .fetch_sub(sz, Ordering::Relaxed);
-                crate::report_channel_failure("client datagram enqueue");
-                Err(napi::Error::from_reason("E_SESSION_CLOSED"))
-            }
-            Err(_elapsed) => {
-                self.client_metrics
-                    .queued_bytes
-                    .fetch_sub(sz, Ordering::Relaxed);
-                Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))
-            }
-        }
+        Some(ClientDatagramSendState {
+            tx: self.dgram_send_tx.clone()?,
+            closed: Arc::clone(&self.closed),
+            client_metrics: Arc::clone(&self.client_metrics),
+            datagram_budget_bytes: self.datagram_budget_bytes,
+            backpressure_timeout_ms: self.backpressure_timeout_ms,
+            max_datagram_size: self.max_datagram_size,
+        })
     }
 
     /// Read one datagram, or `null` on EOF or close.
@@ -2187,9 +2264,9 @@ mod tests {
         parse_congestion_control, parse_qpack_max_table_capacity, remove_registry_entry,
         run_client_datagram_forwarder, settle_client_receive_accounting_after_close,
         try_reserve_client_queued_bytes, ClientDatagramReadState, ClientMetrics,
-        ClientSessionHandle, CongestionControlMode, ForwarderDoneGuard, CLIENT_DATAGRAM_BATCH_MAX,
-        CLIENT_DATAGRAM_RECV_CAPACITY, CLIENT_HANDLE_REGISTRY, MAX_QPACK_TABLE_CAPACITY,
-        QPACK_DYNAMIC_PRESET_CAPACITY,
+        ClientSessionHandle, CongestionControlMode, ForwarderDoneGuard,
+        CLIENT_DATAGRAM_RECV_CAPACITY, CLIENT_HANDLE_REGISTRY, DATAGRAM_BATCH_MAX,
+        MAX_QPACK_TABLE_CAPACITY, QPACK_DYNAMIC_PRESET_CAPACITY,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -2565,8 +2642,8 @@ mod tests {
         assert_eq!(clamp_client_batch_max(0), 1);
         assert_eq!(clamp_client_batch_max(1), 1);
         assert_eq!(clamp_client_batch_max(64), 64);
-        assert_eq!(clamp_client_batch_max(CLIENT_DATAGRAM_BATCH_MAX), 256);
-        assert_eq!(clamp_client_batch_max(CLIENT_DATAGRAM_BATCH_MAX + 1), 256);
+        assert_eq!(clamp_client_batch_max(DATAGRAM_BATCH_MAX), 256);
+        assert_eq!(clamp_client_batch_max(DATAGRAM_BATCH_MAX + 1), 256);
         assert_eq!(clamp_client_batch_max(u32::MAX), 256);
     }
 

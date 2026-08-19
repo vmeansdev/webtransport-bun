@@ -130,24 +130,129 @@ pub(crate) fn session_metrics_snapshot_from(
     }
 }
 
-pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<()> {
+/// Error code the non-parking send returns when the byte budget cannot fit the
+/// payload right now. Not a failure: the caller is expected to fall back to the
+/// parking send, which is the only path allowed to wait.
+pub(crate) const WOULD_BLOCK: &str = "E_WOULD_BLOCK";
+
+/// Send one datagram without ever waiting.
+///
+/// This exists because of what an async N-API method costs on the host side:
+/// napi-rs backs every promise it hands JavaScript with a ThreadsafeFunction,
+/// and a live TSFN is a *reference on the host event loop*. The Rust future
+/// finishing is not the same event as that reference being released — the
+/// release is queued back to the JS thread — so a per-datagram promise puts one
+/// host-loop reference per datagram through a path the addon cannot see or
+/// count. A send that has budget needs none of that: quinn's `send_datagram` is
+/// synchronous, and the only asynchronous part of the old path was our own
+/// capacity wait.
+///
+/// Returns `None` when the datagram was queued, `Some(WOULD_BLOCK)` when the
+/// caller should fall back to the parking send, and `Some(code)` for a real
+/// failure. It never rejects and never blocks the JS thread.
+pub(crate) fn try_send_datagram_for_session(id: &str, bytes: &[u8]) -> Option<&'static str> {
     let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
         session_registry::get_datagram_send_state(id)
     else {
+        return Some("E_SESSION_CLOSED");
+    };
+    let sz = bytes.len();
+    if sz > limits.max_datagram_size {
+        return Some("E_QUEUE_FULL");
+    }
+    if lifecycle_closed.load(Ordering::Acquire) {
+        return Some("E_SESSION_CLOSED");
+    }
+    let sz_u64 = sz as u64;
+    if !metrics
+        .try_reserve_queued_bytes_with_session(
+            &sm.queued_bytes,
+            sz_u64,
+            limits.max_queued_bytes_global,
+            limits.max_queued_bytes_per_session,
+        )
+        .is_ok()
+    {
+        return Some(WOULD_BLOCK);
+    }
+    let start = std::time::Instant::now();
+    // Same order as the parking path: the reservation is released whatever the
+    // send does, so a failed send cannot strand budget.
+    let sent = conn.send_datagram(bytes).is_ok();
+    metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
+    if !sent {
+        return Some("E_SESSION_CLOSED");
+    }
+    metrics.datagram_enqueue_histogram.observe(start.elapsed());
+    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+    sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<()> {
+    let Some(state) = session_registry::get_datagram_send_state(id) else {
         return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
     };
+    // Counted here rather than at the binding: this function *is* the parking
+    // path, so the counter reads as "datagrams that needed an N-API promise",
+    // which is the exposure this server has to the host-loop reference class.
+    state.1.datagram_sends_async.fetch_add(1, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_millis(state.3.backpressure_timeout_ms);
+    send_datagram_on_state(&state, bytes, deadline).await
+}
+
+/// Send up to `DATAGRAM_BATCH_MAX` datagrams across one N-API crossing.
+///
+/// The session's send state and the backpressure deadline are both resolved
+/// once, at entry, and shared by every element: a caller who asked for one call
+/// gets one call's worth of patience, where per-element deadlines would let a
+/// 256-element batch park for 256 × `backpressure_timeout_ms`. Reservation
+/// stays strictly per element — reserving `sum(len)` against
+/// `max_queued_bytes_per_session` would be the park-forever class fixed by
+/// `5ad0245`, waiting on a release that can never come whenever a configured
+/// budget is smaller than the batch. At N=1 this is the same state lookup, the
+/// same deadline expression and the same reservation call as
+/// `send_datagram_for_session`, so batch-of-1 is that function.
+pub(crate) async fn send_datagram_batch_for_session(
+    id: &str,
+    prepared: crate::datagram_batch::PreparedBatch,
+) -> crate::datagram_batch::DatagramBatchResult {
+    let Some(state) = session_registry::get_datagram_send_state(id) else {
+        return crate::datagram_batch::DatagramBatchResult::new(
+            0,
+            Some("E_SESSION_CLOSED".to_string()),
+        );
+    };
+    let deadline = Instant::now() + Duration::from_millis(state.3.backpressure_timeout_ms);
+    crate::datagram_batch::send_prepared(prepared, |bytes| {
+        let state = &state;
+        async move {
+            send_datagram_on_state(state, &bytes, deadline)
+                .await
+                .map_err(|err| err.reason.clone())
+        }
+    })
+    .await
+}
+
+/// One datagram against an already-resolved session state and deadline.
+async fn send_datagram_on_state(
+    state: &session_registry::DatagramSendState,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    let (conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed) = state;
     let sz = bytes.len();
     if sz > limits.max_datagram_size {
         return Err(napi::Error::from_reason("E_QUEUE_FULL"));
     }
     let sz_u64 = sz as u64;
-    let deadline = Instant::now() + Duration::from_millis(limits.backpressure_timeout_ms);
     session_registry::reserve_datagram_capacity(
-        &metrics,
-        &sm,
-        &datagram_capacity_notify,
-        &lifecycle_closed,
-        &limits,
+        metrics,
+        sm,
+        datagram_capacity_notify,
+        lifecycle_closed,
+        limits,
         sz_u64,
         deadline,
     )
@@ -164,7 +269,7 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
     let result = conn
         .send_datagram(bytes)
         .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
-    metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
+    metrics.release_datagram_capacity(&sm.queued_bytes, datagram_capacity_notify, sz_u64);
     result?;
     metrics.datagram_enqueue_histogram.observe(start.elapsed());
     metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
@@ -172,12 +277,7 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-/// Largest batch one delivery call may carry.
-///
-/// The point of batching is amortizing the N-API round trip, and the win is
-/// already flat well before here; a larger cap only widens the window in which
-/// dequeued payloads are held outside the queue's byte reservation.
-const DATAGRAM_BATCH_MAX: u32 = 256;
+use crate::datagram_batch::DATAGRAM_BATCH_MAX;
 
 /// Clamp a caller-supplied batch size into range. Out-of-range values are
 /// corrected silently: a rejected async N-API call leaks its self-reference
@@ -280,16 +380,25 @@ pub(crate) async fn discard_datagram_for_session(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<bool>> {
-    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+    let Some((dgram_rx, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_datagram_read_state(id)
+    else {
         return Ok(None);
     };
     let mut rx = dgram_rx.lock().await;
     let next = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, rx.recv()).await {
-            Ok(slot) => slot,
-            Err(_) => return Ok(Some(false)),
-        },
-        None => rx.recv().await,
+        Some(limit) => {
+            match tokio::time::timeout(
+                limit,
+                recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify),
+            )
+            .await
+            {
+                Ok(slot) => slot,
+                Err(_) => return Ok(Some(false)),
+            }
+        }
+        None => recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify).await,
     };
     match next {
         Some(slot) => {
@@ -303,6 +412,12 @@ pub(crate) async fn discard_datagram_for_session(
 /// Consume queued datagrams until the session closes or the bounded deadline
 /// expires, without crossing the NAPI boundary once per payload.
 ///
+/// The wait is the same lifecycle-aware one the read path uses. Waiting on the
+/// channel alone would end only when every sender is dropped, so a deadline-free
+/// drain on a session that has already been closed would keep its N-API promise
+/// unsettled — and an unsettled promise keeps the host event loop referenced
+/// long after `server.close()` has resolved.
+///
 /// The load/evidence drain is a black-hole consumer: it needs delivery counts,
 /// not payload bytes. Keeping this loop on the native runtime avoids creating a
 /// Tokio task and JavaScript promise for every low-rate datagram while retaining
@@ -312,7 +427,9 @@ pub(crate) async fn discard_datagrams_for_session(
     id: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<u64>> {
-    let Some((_, dgram_rx, _, _, _, _, _)) = session_registry::get(id) else {
+    let Some((dgram_rx, lifecycle_closed, lifecycle_notify)) =
+        session_registry::get_datagram_read_state(id)
+    else {
         return Ok(None);
     };
     let mut rx = dgram_rx.lock().await;
@@ -320,11 +437,18 @@ pub(crate) async fn discard_datagrams_for_session(
     let mut discarded = 0u64;
     loop {
         let next = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(slot) => slot,
-                Err(_) => return Ok(Some(discarded)),
-            },
-            None => rx.recv().await,
+            Some(deadline) => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify),
+                )
+                .await
+                {
+                    Ok(slot) => slot,
+                    Err(_) => return Ok(Some(discarded)),
+                }
+            }
+            None => recv_datagram_slot(&mut rx, &lifecycle_closed, &lifecycle_notify).await,
         };
         match next {
             Some(slot) => {
@@ -1528,6 +1652,159 @@ mod tests {
         session_registry::remove(&id);
     }
 
+    /// The two properties that make a batched send safe rather than merely
+    /// fast: one deadline for the whole call, and a reservation per element.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_datagram_batch_shares_one_deadline_and_reserves_per_element() {
+        use crate::datagram_batch::PreparedBatch;
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 40).await;
+        let server_id = u64::MAX - 40;
+        let id = session.id.clone();
+        let metrics = Arc::clone(&session.metrics);
+
+        // A per-session budget an order of magnitude smaller than the batch's
+        // total bytes still drains completely, because each element reserves,
+        // sends and releases on its own. A `sum(len)` reservation here would
+        // wait on a release that can never come — the park-forever class.
+        let tight_id = format!("{id}-tight-budget");
+        let tight = Limits {
+            max_queued_bytes_per_session: 512,
+            backpressure_timeout_ms: 2_000,
+            ..Default::default()
+        };
+        let (.., tight_sm, _) = session_registry::insert(
+            tight_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            tight,
+            false,
+        );
+        let started = std::time::Instant::now();
+        let result = send_datagram_batch_for_session(
+            &tight_id,
+            PreparedBatch {
+                items: vec![vec![7u8; 100]; 256],
+                truncated: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            (result.sent, result.code.as_deref()),
+            (256, None),
+            "256 × 100 B drains through a 512 B session budget one element at a time"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "the batch must not have spent its backpressure deadline waiting"
+        );
+        assert_eq!(
+            tight_sm.datagrams_out.load(Ordering::Relaxed),
+            256,
+            "every element is counted exactly once"
+        );
+        assert_eq!(
+            tight_sm.queued_bytes.load(Ordering::Relaxed),
+            0,
+            "every element released its own reservation"
+        );
+
+        // A budget no element can ever fit makes every reservation time out.
+        // The whole call must cost one `backpressure_timeout_ms`, not one per
+        // element, and it reports the index it stopped at.
+        let starved_id = format!("{id}-starved");
+        let starved = Limits {
+            max_queued_bytes_per_session: 1,
+            backpressure_timeout_ms: 150,
+            ..Default::default()
+        };
+        session_registry::insert(
+            starved_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            starved,
+            false,
+        );
+        let started = std::time::Instant::now();
+        let result = send_datagram_batch_for_session(
+            &starved_id,
+            PreparedBatch {
+                items: vec![vec![7u8; 100]; 32],
+                truncated: None,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            (result.sent, result.code.as_deref()),
+            (0, Some("E_BACKPRESSURE_TIMEOUT")),
+            "element 0 could never be reserved, so nothing after it was attempted"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "32 elements shared one 150 ms deadline; per-element deadlines would \
+             have cost ~4.8 s, and this took {elapsed:?}"
+        );
+
+        // Oversize stops the batch at its own index, under today's code string.
+        let sized_id = format!("{id}-sized");
+        let sized = Limits {
+            max_datagram_size: 64,
+            ..Default::default()
+        };
+        session_registry::insert(
+            sized_id.clone(),
+            server_id,
+            session.conn.clone(),
+            Arc::clone(&metrics),
+            sized,
+            false,
+        );
+        let result = send_datagram_batch_for_session(
+            &sized_id,
+            PreparedBatch {
+                items: vec![vec![1u8; 8], vec![2u8; 8], vec![3u8; 4096], vec![4u8; 8]],
+                truncated: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            (result.sent, result.code.as_deref()),
+            (2, Some("E_QUEUE_FULL")),
+            "the oversize element is at index 2 == sent, and index 3 was not attempted"
+        );
+        let single = send_datagram_for_session(&sized_id, &vec![3u8; 4096])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            single.reason.as_str(),
+            result.code.as_deref().expect("batch code"),
+            "the batch may not invent a code the single-datagram path does not use"
+        );
+
+        // A missing session is an envelope, never a rejection.
+        let gone = send_datagram_batch_for_session(
+            "missing-batch",
+            PreparedBatch {
+                items: vec![vec![1u8; 8]],
+                truncated: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            (gone.sent, gone.code.as_deref()),
+            (0, Some("E_SESSION_CLOSED"))
+        );
+
+        session_registry::remove(&tight_id);
+        session_registry::remove(&starved_id);
+        session_registry::remove(&sized_id);
+        session_registry::remove(&id);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loopback_covers_datagram_stream_and_stats_paths() {
         use crate::client::insecure_loopback_client_config;
@@ -1591,6 +1868,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(queue_err.reason.contains("E_QUEUE_FULL"));
+
+        // The promise-free send: same outcomes, no N-API future, and it does
+        // not count against the parking-path exposure meter.
+        let async_sends_before = metrics
+            .datagram_sends_async
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            try_send_datagram_for_session(&id, b"sync-ping"),
+            None,
+            "a send with budget must be served without a promise"
+        );
+        assert_eq!(
+            try_send_datagram_for_session(&id, &oversized),
+            Some("E_QUEUE_FULL")
+        );
+        assert_eq!(
+            try_send_datagram_for_session("missing-loopback", b"x"),
+            Some("E_SESSION_CLOSED")
+        );
+        assert_eq!(
+            metrics
+                .datagram_sends_async
+                .load(std::sync::atomic::Ordering::Relaxed),
+            async_sends_before,
+            "the synchronous path must not count as a parking send"
+        );
 
         wait_session_stream_capacity(id.clone().into(), 200, "bidi")
             .await
@@ -1686,10 +1989,28 @@ mod tests {
         .unwrap_err();
         assert!(deadline_err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
 
+        // No budget: the synchronous send declines instead of waiting, and only
+        // the fallback pays for a promise — which is exactly what the counter
+        // is there to report.
+        assert_eq!(
+            try_send_datagram_for_session(&client_id, b"ab"),
+            Some(WOULD_BLOCK),
+            "a send with no budget must decline rather than block the JS thread"
+        );
+        let async_sends_before_fallback = metrics
+            .datagram_sends_async
+            .load(std::sync::atomic::Ordering::Relaxed);
         let timeout_err = send_datagram_for_session(&client_id, b"ab")
             .await
             .unwrap_err();
         assert!(timeout_err.reason.contains("E_BACKPRESSURE_TIMEOUT"));
+        assert_eq!(
+            metrics
+                .datagram_sends_async
+                .load(std::sync::atomic::Ordering::Relaxed),
+            async_sends_before_fallback + 1,
+            "the parking send must count itself"
+        );
 
         let slot = session_registry::DatagramSlot::new(
             b"queued".to_vec(),
@@ -1827,6 +2148,54 @@ mod tests {
             .expect("join")
             .expect("read");
         assert!(got.is_none(), "a closed session reads as EOF");
+
+        session_registry::close_session(&session.id, 0, "done");
+    }
+
+    /// The deadline-free discard drains are N-API futures like any other, so
+    /// they have to end on the session closing rather than on the last sender
+    /// being dropped. One that waits on the channel alone stays unsettled for
+    /// as long as the ingress task lives, and an unsettled N-API future keeps
+    /// the host event loop referenced after `server.close()` has resolved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_free_discards_wake_on_close_not_on_the_last_sender() {
+        use crate::limits::Limits;
+
+        let session = start_loopback_session(u64::MAX - 41).await;
+        for (suffix, drain) in [("single", false), ("bulk", true)] {
+            let id = format!("{}-discard-parked-{suffix}", session.id);
+            // Held for the whole test: only the lifecycle signal may end these.
+            let (_dgram_tx, _b, _u, _cb, _cu, _sm, _notify) = session_registry::insert(
+                id.clone(),
+                u64::MAX - 41,
+                session.conn.clone(),
+                Arc::clone(&session.metrics),
+                Limits::default(),
+                false,
+            );
+
+            let parked_id = id.clone();
+            let parked = tokio::spawn(async move {
+                if drain {
+                    discard_datagrams_for_session(&parked_id, None)
+                        .await
+                        .map(|count| count.is_none())
+                } else {
+                    discard_datagram_for_session(&parked_id, None)
+                        .await
+                        .map(|taken| taken.is_none())
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session_registry::remove(&id);
+
+            let ended_as_eof = tokio::time::timeout(Duration::from_secs(1), parked)
+                .await
+                .unwrap_or_else(|_| panic!("parked {suffix} discard must wake within 1s of close"))
+                .expect("join")
+                .expect("discard");
+            assert!(ended_as_eof, "a closed session drains as EOF ({suffix})");
+        }
 
         session_registry::close_session(&session.id, 0, "done");
     }
