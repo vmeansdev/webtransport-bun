@@ -241,7 +241,8 @@ describe("arm 2 clauses (§3)", () => {
 		ingested: 2_400,
 		forwarded: 96_000,
 		subscriberReceived: 96_000,
-		ingestToForwardP50Ns: 1_400_000,
+		pathP50Ns: 1_400_000,
+		serverForwardDwellP50Ns: 14_000,
 		frameGapFraction: 1,
 		datagramsPerTick: 1,
 		publisherStamped: 2_400,
@@ -266,7 +267,7 @@ describe("arm 2 clauses (§3)", () => {
 	test("V-I fires on the retracted run's own µs-scale ingest signature", () => {
 		// 9–31 µs of "ingest-to-forward" while the ladder beside it read
 		// milliseconds: a path that never contained a network.
-		const r = falsifierIngestReality(hotspot({ ingestToForwardP50Ns: 31_000 }));
+		const r = falsifierIngestReality(hotspot({ pathP50Ns: 31_000 }));
 		expect(r.fired).toBe(true);
 		expect(r.scope).toBe("run");
 		expect(r.reasons.join(" ")).toContain("lag-microsecond");
@@ -280,6 +281,15 @@ describe("arm 2 clauses (§3)", () => {
 
 	test("V-I passes a real cabled publisher", () => {
 		expect(falsifierIngestReality(hotspot()).fired).toBe(false);
+	});
+
+	test("V-I is not fed the server's own forward dwell", () => {
+		// The dwell is one process on one clock and is µs-scale on every valid
+		// run; feeding it to the µs-signature rule would fire the falsifier
+		// against reality. Amendment 2 is exactly this correction.
+		expect(
+			falsifierIngestReality(hotspot({ serverForwardDwellP50Ns: 9_000 })).fired,
+		).toBe(false);
 	});
 
 	test("H2 divides by ingested × N, not by what the server chose to forward", () => {

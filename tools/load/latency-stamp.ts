@@ -75,6 +75,12 @@ export const CLASS_ACTION = 1;
 export const CLASS_ACK = 2;
 export const CLASS_SNAPSHOT = 3;
 export const CLASS_RAID = 4;
+/**
+ * A raid subscriber's one-datagram hello. The server has no path or authority to
+ * key a role off, so a receive-only session has to say what it is once; the
+ * hello is not load and is excluded from every rate.
+ */
+export const CLASS_RAID_JOIN = 5;
 
 export type LatencyStamp = {
 	intendedNs: number;
