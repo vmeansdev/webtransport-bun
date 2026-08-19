@@ -128,7 +128,12 @@ echo "macgen: rustc=$(rustc --version | awk '{print $2}') argv=$*"
 # because macOS has no such command.
 "$BIN" "$@" &
 CHILD=$!
-( sleep "$DEADLINE"; kill -0 "$CHILD" 2>/dev/null && kill -9 "$CHILD" 2>/dev/null ) &
+# The watchdog holds NO channel file descriptors: `kill "$WATCHDOG"` below
+# kills the subshell but not an already-running `sleep`, and an orphaned sleep
+# that inherited stdout keeps the whole ssh channel open until the deadline
+# expires — every conductor "linger" and every healthy-rung deadline breach of
+# 2026-08-19/20 was this one inherited descriptor.
+( sleep "$DEADLINE"; kill -0 "$CHILD" 2>/dev/null && kill -9 "$CHILD" 2>/dev/null ) >/dev/null 2>&1 0</dev/null &
 WATCHDOG=$!
 
 wait "$CHILD"
