@@ -102,6 +102,7 @@ import {
 	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
+import { createServerCloseContract } from "./server-close.js";
 import type {
 	CloseInfo,
 	ErrorCode,
@@ -794,6 +795,13 @@ export type MetricsSnapshot = {
 	queuedBytesGlobal: number;
 	backpressureWaitCount: number;
 	backpressureTimeoutCount: number;
+	/**
+	 * Native only. Datagram sends that had to fall back to the parking N-API
+	 * call. Each one hands JavaScript a promise backed by a ThreadsafeFunction,
+	 * which is a reference on the host event loop, so this is the exposure
+	 * meter for that class — not a latency signal.
+	 */
+	datagramSendsAsync?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
@@ -806,6 +814,18 @@ export type MetricsSnapshot = {
 	nativeBidiHandlesLive?: number;
 	nativeUniSendHandlesLive?: number;
 	nativeUniRecvHandlesLive?: number;
+	/**
+	 * Native only. Unsettled N-API async operations this server still owns.
+	 * Non-zero after `close()` resolves means the addon is still holding the
+	 * host event loop open.
+	 */
+	nativeAsyncOpsPending?: number;
+	/** Native only. Sessions the QUIC idle timeout ended (peer went away). */
+	sessionsClosedByIdle?: number;
+	/** Native only. Sessions this server ended itself while shutting down. */
+	sessionsClosedByReap?: number;
+	/** Native only. Every other way a session ended (peer close, transport error). */
+	sessionsClosedOther?: number;
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
@@ -1116,6 +1136,11 @@ interface NativeSessionHandle {
 	peerPort: number;
 	close(code: number | null, reason: string | null): void;
 	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
+	/** Non-parking send. Returns null when queued, `E_WOULD_BLOCK` when the
+	 * caller must fall back to {@link sendDatagram}, or an error code. Optional
+	 * so an older override addon still works — it just keeps paying a promise
+	 * (and a host event-loop reference) per datagram. */
+	trySendDatagram?: (data: Buffer | Uint8Array) => string | null;
 	readDatagram(): Promise<Uint8Array | null>;
 	/** Batched datagram read. Resolves a non-empty array, or `null` at
 	 * EOF/close — it never rejects. Required, not optional-with-fallback: it is
@@ -1392,6 +1417,46 @@ function datagramBatchDiagnosticsSnapshot(): DatagramBatchDiagnostics {
 	};
 }
 
+/** What the native non-parking send returns when the byte budget is full. */
+const DATAGRAM_SEND_WOULD_BLOCK = "E_WOULD_BLOCK";
+
+/**
+ * Escape hatch back to a native promise per datagram
+ * (`WEBTRANSPORT_DATAGRAM_SEND_SYNC=0`), read once at module load like the
+ * other native-path knobs. It exists to make the host-loop reference class
+ * reproducible on demand: with the promise-free send off, an echo server under
+ * overload can again outlive its own `close()`.
+ */
+const datagramSyncSendEnabled =
+	process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC !== "0";
+
+/**
+ * Send without handing JavaScript a native promise.
+ *
+ * An async N-API call is not free on the host side: napi-rs backs every promise
+ * it returns with a ThreadsafeFunction, and a live TSFN is a reference on the
+ * event loop that the addon cannot see or count — the Rust future finishing and
+ * that reference being released are two different events. A datagram that has
+ * queue budget does not need any of it, so it takes the synchronous call and
+ * never creates the reference; only a send that must wait falls back.
+ *
+ * Returns true when the datagram is queued and the caller is done, false when
+ * the caller must fall back to the parking send. A real failure throws, exactly
+ * as the parking path's error envelope does.
+ */
+function sendDatagramWithoutPromise(
+	handle: Pick<NativeSessionHandle, "trySendDatagram">,
+	payload: Buffer | Uint8Array,
+): boolean {
+	if (!datagramSyncSendEnabled) return false;
+	const trySend = handle.trySendDatagram;
+	if (typeof trySend !== "function") return false;
+	const code = trySend.call(handle, payload);
+	if (code === DATAGRAM_SEND_WOULD_BLOCK) return false;
+	unwrapNativeVoid(code);
+	return true;
+}
+
 type DatagramSource = Pick<NativeSessionHandle, "readDatagram"> & {
 	readDatagramBatch?: (max: number) => Promise<Uint8Array[] | null>;
 };
@@ -1628,6 +1693,7 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+			if (sendDatagramWithoutPromise(this.#nativeHandle, buf)) return;
 			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err);
@@ -2051,30 +2117,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			await handle.setUnknownSniPolicy(policy);
 		},
 		tlsSnapshot: () => handle.tlsSnapshot(),
-		close: async () => {
-			await handle.close();
-			for (const [id, resolve] of closedResolvers) {
-				closedResolvers.delete(id);
-				resolve({ code: 0, reason: "server closed" });
-			}
-			if (activeOnSessionCallbacks > 0) {
-				// Clear the timeout timer if the drain wins the race, so it does
-				// not keep the event loop alive up to 5s after close() resolves.
-				let drainTimer: ReturnType<typeof setTimeout> | undefined;
-				try {
-					await Promise.race([
-						new Promise<void>((r) => {
-							onSessionDrainResolve = r;
-						}),
-						new Promise<void>((r) => {
-							drainTimer = setTimeout(r, 5000);
-						}),
-					]);
-				} finally {
-					if (drainTimer !== undefined) clearTimeout(drainTimer);
+		close: createServerCloseContract({
+			closeNative: () => handle.close(),
+			resolveOwnedSessions: (info) => {
+				for (const [id, resolve] of closedResolvers) {
+					closedResolvers.delete(id);
+					resolve(info);
 				}
-			}
-		},
+			},
+			pendingOnSessionCallbacks: () => activeOnSessionCallbacks,
+			awaitOnSessionDrain: () =>
+				new Promise<void>((resolve) => {
+					onSessionDrainResolve = resolve;
+				}),
+		}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
@@ -2177,6 +2233,7 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+			if (sendDatagramWithoutPromise(this.#nativeHandle, buf)) return;
 			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err, this.#strictW3CErrors);

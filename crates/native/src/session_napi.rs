@@ -3,6 +3,7 @@ use napi::bindgen_prelude::Buffer;
 use napi::{Env, JsObject, Result};
 use napi_derive::napi;
 
+use crate::async_ops::{AsyncOpGuard, AsyncOpKind};
 use crate::error::{
     from_reason as wt_from_reason, from_upstream_error as wt_from_upstream_error, WtResult,
 };
@@ -22,17 +23,40 @@ pub struct SessionHandle {
     id: std::sync::Arc<str>,
     peer_ip: String,
     peer_port: u32,
+    /// This session's owner counter block, resolved once at construction.
+    ops: std::sync::Arc<crate::async_ops::OwnerAsyncOps>,
 }
 
 #[napi]
 impl SessionHandle {
     #[napi(constructor)]
     pub fn new(id: String, peer_ip: String, peer_port: u32) -> Self {
+        let ops = match session_registry::owner_of(&id) {
+            Some(owner) => crate::async_ops::owner_ops(owner),
+            None => crate::async_ops::orphan_ops(),
+        };
         Self {
             id: id.into(),
             peer_ip,
             peer_port,
+            ops,
         }
+    }
+
+    /// Spawn an N-API future that counts itself against this session's owner
+    /// for as long as it is unsettled. Every async method on this handle goes
+    /// through here: an operation invisible to the counters is an operation
+    /// that can pin the event loop past `server.close()` with no evidence.
+    fn spawn_counted<T, F>(&self, env: Env, kind: AsyncOpKind, fut: F) -> Result<JsObject>
+    where
+        T: 'static + Send + napi::bindgen_prelude::ToNapiValue,
+        F: 'static + Send + std::future::Future<Output = Result<T>>,
+    {
+        let guard = AsyncOpGuard::new(&self.ops, kind);
+        env.spawn_future(async move {
+            let _guard = guard;
+            fut.await
+        })
     }
 
     #[napi(getter)]
@@ -127,16 +151,45 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn wait_draining(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Lifecycle, async move {
             let Some((conn, ..)) = session_registry::get(&id) else {
                 return Ok(());
             };
             RUNTIME
-                .spawn(async move { conn.draining().await })
+                .spawn(async move {
+                    // A peer that never drains and then goes away must not
+                    // leave this promise unsettled: an unsettled N-API promise
+                    // keeps the host event loop referenced for the life of the
+                    // process. The connection ending is an answer too.
+                    tokio::select! {
+                        _ = conn.draining() => {}
+                        _ = conn.closed() => {}
+                    }
+                })
                 .await
                 .map_err(wt_from_upstream_error)?;
             Ok(())
         })
+    }
+
+    /// Send one datagram without creating an N-API promise.
+    ///
+    /// Every async N-API method is backed by a ThreadsafeFunction, and a live
+    /// TSFN is a reference on the *host* event loop — one per datagram on the
+    /// old send path, released by the host after the Rust future is already
+    /// gone. That release is outside anything this addon can observe: the
+    /// async-op counters, the task gauges and the session registry all read
+    /// clean while the loop stays referenced. The only reliable answer is not
+    /// to take the reference: quinn's send is synchronous, so a send with
+    /// budget needs no promise at all.
+    ///
+    /// Resolves `null` when the datagram was queued, `"E_WOULD_BLOCK"` when the
+    /// caller should retry on {@link SessionHandle::send_datagram} (the only
+    /// path allowed to wait), or an error code. Never throws.
+    #[napi(js_name = "trySendDatagram")]
+    pub fn try_send_datagram(&self, data: Buffer) -> Option<String> {
+        crate::session::try_send_datagram_for_session(&self.id, data.as_ref())
+            .map(|code| code.to_string())
     }
 
     /// Spawn on the addon runtime without holding an exclusive napi borrow of
@@ -152,7 +205,9 @@ impl SessionHandle {
     pub fn send_datagram(&self, env: Env, data: Buffer) -> Result<JsObject> {
         let id = self.id.clone();
         let bytes = data.as_ref().to_vec();
-        env.spawn_future(async move { send_datagram_for_session(&id, &bytes).await })
+        self.spawn_counted(env, AsyncOpKind::Datagram, async move {
+            send_datagram_for_session(&id, &bytes).await
+        })
     }
 
     /// Reads on the N-API runtime `spawn_future` already provides. Do NOT
@@ -173,7 +228,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<Buffer | null>")]
     pub fn read_datagram(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Datagram, async move {
             Ok(read_datagram_for_session(&id)
                 .await?
                 .map(crate::payload_buffer::PayloadBuffer::from))
@@ -193,7 +248,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<Uint8Array[] | null>")]
     pub fn read_datagram_batch(&self, env: Env, max: u32) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Datagram, async move {
             Ok(read_datagram_batch_for_session(&id, max)
                 .await?
                 .map(|batch| {
@@ -218,7 +273,9 @@ impl SessionHandle {
     pub fn discard_datagram(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
         let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
-        env.spawn_future(async move { discard_datagram_for_session(&id, timeout).await })
+        self.spawn_counted(env, AsyncOpKind::Datagram, async move {
+            discard_datagram_for_session(&id, timeout).await
+        })
     }
 
     /// Consume queued datagrams until the session closes or the deadline
@@ -230,7 +287,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<number | null>")]
     pub fn discard_datagrams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Datagram, async move {
             RUNTIME
                 .spawn(async move {
                     let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
@@ -246,7 +303,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<number | null>")]
     pub fn discard_bidi_streams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move {
                     let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
@@ -262,7 +319,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<number | null>")]
     pub fn discard_uni_streams(&self, env: Env, timeout_ms: Option<u32>) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move {
                     let timeout = timeout_ms.map(|ms| std::time::Duration::from_millis(ms.into()));
@@ -291,7 +348,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientBidiStreamHandle>")]
     pub fn create_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { create_bidi_stream_for_session(&id).await })
                 .await
@@ -302,7 +359,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn wait_bidi_capacity(&self, env: Env, timeout_ms: u32) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { wait_session_stream_capacity(id, timeout_ms, "bidi").await })
                 .await
@@ -313,7 +370,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientBidiStreamHandle | null>")]
     pub fn accept_bidi_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { accept_bidi_stream_for_session(&id).await })
                 .await
@@ -325,7 +382,7 @@ impl SessionHandle {
     #[napi(js_name = "handleBidiProbe", ts_return_type = "Promise<boolean>")]
     pub fn handle_bidi_probe(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { handle_bidi_probe_for_session(&id).await })
                 .await
@@ -336,7 +393,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientUniSendHandle>")]
     pub fn create_uni_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { create_uni_stream_for_session(&id).await })
                 .await
@@ -347,7 +404,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn wait_uni_capacity(&self, env: Env, timeout_ms: u32) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { wait_session_stream_capacity(id, timeout_ms, "uni").await })
                 .await
@@ -358,7 +415,7 @@ impl SessionHandle {
     #[napi(ts_return_type = "Promise<ClientUniRecvHandle | null>")]
     pub fn accept_uni_stream(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { accept_uni_stream_for_session(&id).await })
                 .await
@@ -370,7 +427,7 @@ impl SessionHandle {
     #[napi(js_name = "handleUniProbe", ts_return_type = "Promise<number>")]
     pub fn handle_uni_probe(&self, env: Env) -> Result<JsObject> {
         let id = self.id.clone();
-        env.spawn_future(async move {
+        self.spawn_counted(env, AsyncOpKind::Stream, async move {
             RUNTIME
                 .spawn(async move { handle_uni_probe_for_session(&id).await })
                 .await

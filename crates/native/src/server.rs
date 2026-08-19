@@ -269,13 +269,25 @@ impl CloseDrainTiming {
     }
 }
 
+/// Whether nothing this server owns can still run.
+///
+/// `pending_async_ops` is the N-API half of the answer and the reason this
+/// predicate exists in this shape: tracked tokio tasks are abortable, but an
+/// unsettled `Env::spawn_future` promise is not — it keeps the host event loop
+/// referenced until it resolves. A close that ignored them could report a
+/// clean shutdown and still leave the process alive with no sockets open.
 pub(crate) fn server_runtime_is_idle(
     session_tasks: u64,
     stream_tasks: u64,
     sessions_active: u64,
     tracked_tasks: usize,
+    pending_async_ops: u64,
 ) -> bool {
-    session_tasks == 0 && stream_tasks == 0 && sessions_active == 0 && tracked_tasks == 0
+    session_tasks == 0
+        && stream_tasks == 0
+        && sessions_active == 0
+        && tracked_tasks == 0
+        && pending_async_ops == 0
 }
 
 pub(crate) async fn wait_for_server_drain(
@@ -292,7 +304,15 @@ pub(crate) async fn wait_for_server_drain(
         let accept_tasks = metrics.accept_tasks_active.load(Ordering::Relaxed);
         let sessions_active = metrics.sessions_active.load(Ordering::SeqCst);
         let tracked_tasks = crate::spawn_tracked::server_task_count(server_id);
-        if server_runtime_is_idle(session_tasks, stream_tasks, sessions_active, tracked_tasks) {
+        let pending_async_ops = crate::async_ops::owner_pending(server_id);
+        if server_runtime_is_idle(
+            session_tasks,
+            stream_tasks,
+            sessions_active,
+            tracked_tasks,
+            pending_async_ops,
+        ) {
+            crate::async_ops::forget_owner(server_id);
             return None;
         }
 
@@ -300,18 +320,28 @@ pub(crate) async fn wait_for_server_drain(
         if now >= phase_deadline {
             if !abort_attempted {
                 aborted_tasks = crate::spawn_tracked::abort_server_tasks(server_id);
-                crate::session_registry::close_all_for_owner(server_id, 0, b"server closing");
+                crate::session_registry::close_all_for_owner(
+                    server_id,
+                    crate::SERVER_CLOSING_CLOSE_CODE,
+                    crate::SERVER_CLOSING_CLOSE_REASON.as_bytes(),
+                );
                 abort_attempted = true;
                 phase_deadline = now + timing.abort_period;
             } else {
+                // Name what is still in flight. An `asyncOps` remainder here is
+                // the retained-reference signature: the process will stay alive
+                // until those promises settle, and this string is the only
+                // evidence of which lane held them.
                 return Some(format!(
-                    "E_BACKPRESSURE_TIMEOUT: server close abort timed out sessionsActive={} sessionTasksActive={} streamTasksActive={} acceptTasksActive={} trackedTasksActive={} abortedTasks={}",
+                    "E_BACKPRESSURE_TIMEOUT: server close abort timed out sessionsActive={} sessionTasksActive={} streamTasksActive={} acceptTasksActive={} trackedTasksActive={} abortedTasks={} asyncOpsPending={} asyncOps=[{}]",
                     sessions_active,
                     session_tasks,
                     stream_tasks,
                     accept_tasks,
                     tracked_tasks,
                     aborted_tasks,
+                    pending_async_ops,
+                    crate::async_ops::owner_breakdown(server_id),
                 ));
             }
         }
@@ -360,12 +390,15 @@ mod tests {
 
     #[test]
     fn server_runtime_is_idle_requires_all_gauges_clear() {
-        assert!(server_runtime_is_idle(0, 0, 0, 0));
-        assert!(!server_runtime_is_idle(1, 0, 0, 0));
-        assert!(!server_runtime_is_idle(0, 1, 0, 0));
-        assert!(!server_runtime_is_idle(0, 0, 1, 0));
-        assert!(!server_runtime_is_idle(0, 0, 0, 1));
-        assert!(!server_runtime_is_idle(1, 1, 1, 1));
+        assert!(server_runtime_is_idle(0, 0, 0, 0, 0));
+        assert!(!server_runtime_is_idle(1, 0, 0, 0, 0));
+        assert!(!server_runtime_is_idle(0, 1, 0, 0, 0));
+        assert!(!server_runtime_is_idle(0, 0, 1, 0, 0));
+        assert!(!server_runtime_is_idle(0, 0, 0, 1, 0));
+        // An unsettled N-API promise is the one gauge no abort can clear, so
+        // it has to keep the server out of idle on its own.
+        assert!(!server_runtime_is_idle(0, 0, 0, 0, 1));
+        assert!(!server_runtime_is_idle(1, 1, 1, 1, 1));
     }
 
     #[test]
