@@ -51,15 +51,15 @@ describe("C1 — spread, and the guards around it", () => {
 		messagesComplete: 600,
 	};
 
-	test("passes inside the bound and above the wire floor", () => {
+	test("passes inside the amended path-derived bound", () => {
 		const r = evaluateSpreadClause(base);
 		expect(r.status).toBe("pass");
-		expect(r.bound).toBe(50);
+		expect(r.bound).toBeCloseTo(119.915, 2);
 		expect(r.reason).toContain("21.28");
 	});
 
 	test("fails above the bound", () => {
-		expect(evaluateSpreadClause({ ...base, spreadP99Ms: 51 }).status).toBe(
+		expect(evaluateSpreadClause({ ...base, spreadP99Ms: 121 }).status).toBe(
 			"fail",
 		);
 	});
@@ -399,21 +399,36 @@ describe("§7 — the pre-check falsifiers", () => {
 		).toBe(true);
 	});
 
-	test("V-SP: a Mac whose own dispersion rivals the wire floor fires", () => {
+	test("V-SP: a sink slower than 1.2 × the impulse emission fires (Amendment 4)", () => {
 		expect(
-			spreadFloorFalsifier({ ...precheck, loopbackSpreadP99Ms: 12 }).fires,
+			spreadFloorFalsifier({
+				...precheck,
+				burstDrainP99Ms: 120,
+				burstEmitMaxMs: 95,
+				burstCompletenessMin: 0.8,
+			}).fires,
 		).toBe(true);
 	});
 
-	test("V-SP: inside 20% of the wire floor does not fire", () => {
-		expect(
-			spreadFloorFalsifier({ ...precheck, loopbackSpreadP99Ms: 1.4 }).fires,
-		).toBe(false);
+	test("V-SP: a sink at wire pace does not fire, completeness disclosed", () => {
+		const ok = spreadFloorFalsifier({
+			...precheck,
+			burstDrainP99Ms: 91.9,
+			burstEmitMaxMs: 95,
+			burstCompletenessMin: 0.617,
+		});
+		expect(ok.fires).toBe(false);
+		expect(ok.reason).toContain("disclosed");
 	});
 
-	test("V-SP: a missing floor arm fires", () => {
+	test("V-SP: a missing burst-probe artifact fires", () => {
 		expect(
-			spreadFloorFalsifier({ ...precheck, loopbackSpreadP99Ms: null }).fires,
+			spreadFloorFalsifier({
+				...precheck,
+				burstDrainP99Ms: null,
+				burstEmitMaxMs: null,
+				burstCompletenessMin: null,
+			}).fires,
 		).toBe(true);
 	});
 

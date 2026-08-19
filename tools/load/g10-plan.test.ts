@@ -29,6 +29,7 @@ import {
 	probeFloorLagCeilingMs,
 	probeIndices,
 	RATE_EXCLUDED,
+	PATH_CLEAN_PPS,
 	RATE_LADDER,
 	RTT_BOUND_MS,
 	rateFitsWire,
@@ -39,7 +40,7 @@ import {
 	spreadBoundMs,
 	spreadClauseApplies,
 	spreadCrossoverRate,
-	spreadFloorCeilingMs,
+	sinkDrainCeilingMs,
 	spreadHeadroom,
 	stallBudgetTargets,
 	TWO_POINT_FIVE_GIGABIT,
@@ -105,7 +106,7 @@ describe("§1.5 — the serialization floor", () => {
 
 describe("§1.4 — the ladder", () => {
 	test("the rungs and the gate rung are what the page registers", () => {
-		expect([...RATE_LADDER]).toEqual([1, 5, 20]);
+		expect([...RATE_LADDER]).toEqual([1, 5]);
 		expect(GATE_RATE).toBe(5);
 		expect(RATE_LADDER).toContain(GATE_RATE);
 	});
@@ -123,11 +124,13 @@ describe("§1.4 — the ladder", () => {
 		for (const rate of RATE_LADDER) expect(rateFitsWire(rate)).toBe(true);
 	});
 
-	test("R = 50 is excluded because it exceeds the wire", () => {
-		expect([...RATE_EXCLUDED]).toEqual([50]);
+	test("R = 50 exceeds the ideal wire; R = 20 exceeds the measured path (Amendment 4)", () => {
+		expect([...RATE_EXCLUDED]).toEqual([50, 20]);
 		expect(egressPps(50)).toBe(500_000);
 		expect(wireOccupancy(50) * 100).toBeCloseTo(106.4, 1);
 		expect(rateFitsWire(50)).toBe(false);
+		expect(egressPps(20)).toBe(200_000);
+		expect(egressPps(20) / PATH_CLEAN_PPS).toBeGreaterThan(1);
 	});
 
 	test("2.5 GbE would admit R = 50 — the page's only claim about it", () => {
@@ -140,11 +143,10 @@ describe("§1.4 — the ladder", () => {
 	});
 });
 
-describe("§1.6 — the spread bound", () => {
-	test("250/R, per rung", () => {
-		expect(spreadBoundMs(1)).toBe(250);
-		expect(spreadBoundMs(5)).toBe(50);
-		expect(spreadBoundMs(20)).toBe(12.5);
+describe("§1.6 — the spread bound (as amended — Amendment 4)", () => {
+	test("path serialization × 1.2, flat across rungs", () => {
+		expect(spreadBoundMs(1)).toBeCloseTo(119.915, 2);
+		expect(spreadBoundMs(5)).toBeCloseTo(119.915, 2);
 	});
 
 	test("the clause applies at R = 1 and R = 5 and not at R = 20", () => {
@@ -153,16 +155,15 @@ describe("§1.6 — the spread bound", () => {
 		expect(spreadClauseApplies(20)).toBe(false);
 	});
 
-	test("headroom figures the page prints", () => {
-		expect(spreadHeadroom(1)).toBeCloseTo(11.75, 2);
-		expect(spreadHeadroom(5)).toBeCloseTo(2.35, 2);
-		expect(spreadHeadroom(20)).toBeCloseTo(0.587, 2);
+	test("headroom is the sink margin over the path", () => {
+		expect(spreadHeadroom(1)).toBeCloseTo(1.2, 6);
+		expect(spreadHeadroom(5)).toBeCloseTo(1.2, 6);
 	});
 
-	test("the crossover is R < 11.75", () => {
-		expect(spreadCrossoverRate()).toBeCloseTo(11.75, 2);
-		expect(spreadClauseApplies(11)).toBe(true);
-		expect(spreadClauseApplies(12)).toBe(false);
+	test("the crossover is R < 8.34", () => {
+		expect(spreadCrossoverRate()).toBeCloseTo(8.34, 2);
+		expect(spreadClauseApplies(8)).toBe(true);
+		expect(spreadClauseApplies(9)).toBe(false);
 	});
 });
 
@@ -280,12 +281,12 @@ describe("§7 / §11a — the pre-check thresholds", () => {
 		expect(sinkPrecheckPps()).toBe(75_000);
 	});
 
-	test("V-SP's loopback ceiling is 4.26 ms", () => {
-		expect(spreadFloorCeilingMs()).toBeCloseTo(4.256, 3);
+	test("V-SP's sink-drain ceiling is 1.2 × the impulse emission time (Amendment 4)", () => {
+		expect(sinkDrainCeilingMs(95)).toBeCloseTo(114, 6);
 	});
 
-	test("V-F's probe lag ceiling is 2 ms", () => {
-		expect(probeFloorLagCeilingMs()).toBeCloseTo(2, 6);
+	test("V-F's probe lag ceiling is 5 ms (Amendment 3)", () => {
+		expect(probeFloorLagCeilingMs()).toBeCloseTo(5, 6);
 	});
 });
 

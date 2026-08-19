@@ -1006,6 +1006,83 @@ the generator's own baseline beside it, disclosed, never discarded. The object
 of §8 is the link; a bound read through a jitterier clock than the thing it
 bounds would refuse every wire regardless of the wire.
 
+**Amendment 3 (2026-08-19, before first dispatch — legal under §10; maintainer
+ruling).** §7's V-F row originally read: *"Mac floor-arm `scheduleLag` p99 >
+**2 ms** (10% of the 20 ms bound), or not taken the same day, or the wrong
+host"*. The ceiling is now **5 ms (25% of the bound)**; the same-day, same-host
+and max-disclosed requirements are unchanged. Why, with the evidence in
+run-order — every step an instrument fix, no threshold touched until this one:
+
+| run | change | scheduleLag p99 |
+|---|---|---|
+| loopback | binary predating the sleep-then-spin crossing | 4.809 ms |
+| loopback | spin crossing active (min lag 41 ns) | 4.923 ms |
+| cable #1 | server off-box, Mac idle — co-residency exonerated | 7.151 ms |
+| cable #2 | probe thread at `QOS_CLASS_USER_INTERACTIVE` | 3.756 ms |
+| cable #3 | spin window 4 → 10 ms | **3.117 ms** |
+
+Widening the spin window 2.5× moved the tail 0.64 ms: the residual is the macOS
+scheduler's own floor for an sshd-launched process, not the instrument. The
+2 ms figure was K11's aspiration; 3.1 ms is this generator's honest floor. The
+grounds for raising rather than refusing: `scheduleLag` never enters the RTT
+arithmetic — §6.3's RTT differences two *actual* instants — so lag perturbs
+only the sampling grid, and the grid held in every run above (0 skipped,
+offered ratio 1.0000, 2801/2801 sent). Artifacts:
+`g10-precheck-c-vf{-fixed,-cable,-cable2,-cable3}.json`.
+
+**Amendment 4 (2026-08-19, before first dispatch — legal under §10; maintainer
+ruling).** §1.5's premise — that the impulse serializes at 1 GbE line rate,
+21.28 ms for 10,000 × 200 B — was disproved by measurement before any
+dispatch, and every number derived from it moves together here.
+
+The evidence (`tools/offbox/burst-probe.ts`, runner NIC → Mac sink, both hosts
+quiet, 30 × 10,000 × 200 B): the sender needs **75–95 ms per impulse**
+(~110–130 k pps offered, socket backpressure 31–46 backoffs/burst) at a mere
+~230 Mbit of a 1 GbE wire — the ceiling is per-packet (the VM's NIC path), not
+bandwidth. The sink drained at wire pace (p50 67 ms / p99 92 ms ≈ the emission
+time). Raw completeness 0.62–0.96 per burst (0.804 overall) — a transportless
+probe's loss is the path's, disclosed, not bounded. The pre-flight's
+*delivered* clean ceiling on the same wire: `cleanPps` **100,071**
+(`g10-preflight-2026-08-19.json`), which this amendment pins as
+`PATH_CLEAN_PPS`.
+
+What moves, each quoting its original:
+
+1. **§1.6's spread bound.** Originally *"`0.25 × 1000/R` ms — the share of one
+   message period the emitter may occupy"*: 50 ms at R = 5. Now **the path's
+   own impulse serialization plus the original 20% sink margin**:
+   `10,000 / 100,071 × 1.2 ≈ 119.91 ms`, flat across rungs. The old bound at
+   the gate rate demanded an effective ≥200 k pps impulse from a ~120 k pps
+   path — unmeetable by physics regardless of the server, and a G10 miss is
+   final, so dispatching against it would have burned the gate on arithmetic
+   known false in advance.
+2. **§1.6's applicability rule.** Originally the bound had to clear the 21.28 ms
+   wire floor (crossover R < 11.75, R = 20 characterization-only). Now one
+   impulse must fit inside its own message period — `1000/R > 119.91 ms`,
+   crossover **R < 8.34**. R = 1 and R = 5 keep verdict force.
+3. **§1.4's ladder.** R = 20's sustained egress is 200,000 pps — 2× the
+   measured path's clean ceiling. The same §1.4 rule that excluded R = 50
+   against the ideal wire (*"a rung the wire cannot carry is not a gate
+   rung"*) excludes R = 20 against the real one. The ladder is now **[1, 5]**;
+   `RATE_EXCLUDED` records both, each with its arithmetic.
+4. **§7's V-SP.** Originally *"Mac **loopback** broadcast spread p99 at R = 5
+   exceeds **4.26 ms** (20% of the 21.28 ms wire floor)"*. That arm asked the
+   loopback to offer a line-rate impulse — no loopback can (measured drain
+   ~40–80 k pps; the 18:08 loopback arm read 261.88 ms, a number that measures
+   the local emitter, not the sink). V-SP is now the **burst probe**: same-day,
+   runner NIC → Mac, gate-shaped impulses; it fires if the sink's drain p99
+   exceeds **1.2 × the sender's max emission time**, or the artifact is
+   missing, stale or from the wrong host. Completeness is disclosed beside it,
+   never bounded. Today's evidence passes it: drain p99 91.91 ms ≤ 1.2 × ~95 ms.
+   The 18:08 loopback artifacts stay in the record as V-M/V-S evidence, which
+   they remain.
+
+The harness constants (`tools/load/g10-plan.ts`: `PATH_CLEAN_PPS`,
+`PATH_SINK_MARGIN`, `spreadBoundMs`, `spreadClauseApplies`, `RATE_LADDER`,
+`sinkDrainCeilingMs`, `PROBE_FLOOR_RTT_FRACTION`) move in the same commit as
+this text, so prose and numbers cannot drift apart (the G6 amendment-1
+lesson).
+
 Otherwise none: this document's first commit is its registration, and every
 threshold on this page was fixed in that commit. Two things are worth naming so a later
 reader does not mistake them for silent edits:

@@ -79,14 +79,16 @@ export function broadcastSerializationMs(
 /* §1.4 — the message-rate ladder                                             */
 /* -------------------------------------------------------------------------- */
 
-/** §1.4. The rungs that run, in order. */
-export const RATE_LADDER = [1, 5, 20] as const;
+/** §1.4 as amended (Amendment 4). The rungs that run, in order. */
+export const RATE_LADDER = [1, 5] as const;
 /**
- * §1.4. The rung the ticket offered and the arithmetic removed: 10,000 × 50 pps
- * is 1.064× a 1 GbE cable's ceiling at 200 B. Kept here so the exclusion is a
- * tested fact rather than a sentence.
+ * §1.4. Rungs the arithmetic removed, each a tested fact rather than a
+ * sentence: 10,000 × 50 pps is 1.064× a 1 GbE cable's ceiling at 200 B, and
+ * 10,000 × 20 pps is 2× the *measured* path's clean ceiling (Amendment 4 —
+ * `PATH_CLEAN_PPS`; the same §1.4 rule that removed 50 against the ideal wire
+ * removes 20 against the real one).
  */
-export const RATE_EXCLUDED = [50] as const;
+export const RATE_EXCLUDED = [50, 20] as const;
 /** §1.4. Retail market-data conflation cadence is 100–250 ms; 5 Hz is standard. */
 export const GATE_RATE = 5;
 
@@ -118,63 +120,85 @@ export function rateFitsWire(
 }
 
 /* -------------------------------------------------------------------------- */
-/* §1.6 — the spread bound                                                    */
+/* §1.5a — the measured impulse path (Amendment 4)                            */
 /* -------------------------------------------------------------------------- */
 
 /**
- * §1.6. The share of one message period the emitter may occupy. A server that
- * spends more than a quarter of every period fanning out has no period left for
- * ingest, the probe path, or the transport's own drain.
+ * Amendment 4. The delivered clean-pps ceiling of the real cable path, pinned
+ * from the registered pre-flight artifact (`g10-preflight-2026-08-19.json`,
+ * `ceiling.cleanPps` at 200 B under the 0.5% loss bound). §1.5's 1 GbE
+ * line-rate arithmetic survives above as the ideal wire; this is the path the
+ * impulse actually crosses — the burst probe measured a 10,000-packet impulse
+ * taking 75–95 ms end to end, not §1.5's 21.28 ms.
  */
-export const EMITTER_PERIOD_FRACTION = 0.25;
+export const PATH_CLEAN_PPS = 100_071;
 
-/** §1.6. `0.25 × 1000/R` ms. The ticket's rate-derived bound. */
-export function spreadBoundMs(rate: number): number {
-	return (EMITTER_PERIOD_FRACTION * 1000) / rate;
+/**
+ * Amendment 4. The sink's allowance on top of path serialization. The burst
+ * probe measured the Mac draining at wire pace (drain p99 ≈ the sender's own
+ * emission time), so the original V-SP intent — the sink adds at most 20% —
+ * carries over unchanged onto the measured path.
+ */
+export const PATH_SINK_MARGIN = 0.2;
+
+/** Amendment 4. What the measured path needs to move one impulse. */
+export function pathImpulseSerializationMs(subscribers = SUBSCRIBERS): number {
+	return (subscribers / PATH_CLEAN_PPS) * 1000;
+}
+
+/* -------------------------------------------------------------------------- */
+/* §1.6 — the spread bound (as amended — Amendment 4)                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * §1.6 as amended. The path's own impulse serialization plus the sink margin:
+ * `10,000/100,071 × 1.2 ≈ 119.91 ms`. The original `0.25 × 1000/R`
+ * emitter-period bound rested on §1.5's 21.28 ms line-rate premise, which the
+ * burst probe disproved; the rate no longer sets the bound, it decides
+ * applicability (below).
+ */
+export function spreadBoundMs(
+	_rate: number,
+	subscribers = SUBSCRIBERS,
+): number {
+	return pathImpulseSerializationMs(subscribers) * (1 + PATH_SINK_MARGIN);
 }
 
 /**
- * §1.6. Whether the spread clause is satisfiable at all at this rung: the bound
- * has to leave room above the wire's own serialization floor.
+ * §1.6 as amended. Whether the spread clause is satisfiable at all at this
+ * rung: one impulse must fit inside its own message period, or broadcasts
+ * overlap in the path and the spread measures queueing, not the fan-out.
  *
- * At 10,000 × 200 B on 1 GbE the crossover is R < 11.75, so R = 20 runs with its
- * spread published as a characterization carrying no verdict.
+ * At 10,000 subscribers on the measured path the crossover is R < 8.34.
  */
 export function spreadClauseApplies(
 	rate: number,
 	subscribers = SUBSCRIBERS,
-	payloadBytes = MESSAGE_PAYLOAD_BYTES,
-	linkBitsPerSec = GIGABIT,
+	_payloadBytes = MESSAGE_PAYLOAD_BYTES,
+	_linkBitsPerSec = GIGABIT,
 ): boolean {
-	return (
-		spreadBoundMs(rate) >
-		broadcastSerializationMs(subscribers, payloadBytes, linkBitsPerSec)
-	);
+	return 1000 / rate > spreadBoundMs(rate, subscribers);
 }
 
-/** §1.6. How much of the bound is left once the wire has taken its share. */
+/** §1.6 as amended. How much of the bound the sink margin leaves on top of the path. */
 export function spreadHeadroom(
 	rate: number,
 	subscribers = SUBSCRIBERS,
-	payloadBytes = MESSAGE_PAYLOAD_BYTES,
-	linkBitsPerSec = GIGABIT,
+	_payloadBytes = MESSAGE_PAYLOAD_BYTES,
+	_linkBitsPerSec = GIGABIT,
 ): number {
 	return (
-		spreadBoundMs(rate) /
-		broadcastSerializationMs(subscribers, payloadBytes, linkBitsPerSec)
+		spreadBoundMs(rate, subscribers) / pathImpulseSerializationMs(subscribers)
 	);
 }
 
 /** §1.6. The rate above which the wire floor swallows the bound. */
 export function spreadCrossoverRate(
 	subscribers = SUBSCRIBERS,
-	payloadBytes = MESSAGE_PAYLOAD_BYTES,
-	linkBitsPerSec = GIGABIT,
+	_payloadBytes = MESSAGE_PAYLOAD_BYTES,
+	_linkBitsPerSec = GIGABIT,
 ): number {
-	return (
-		(EMITTER_PERIOD_FRACTION * 1000) /
-		broadcastSerializationMs(subscribers, payloadBytes, linkBitsPerSec)
-	);
+	return 1000 / spreadBoundMs(0, subscribers);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -527,26 +551,34 @@ export const ARM_LAG_SPREAD_LIMIT = 2;
 export const SINK_HEADROOM_FACTOR = 1.5;
 /** V-S — delivery the sink must hold at that multiple. */
 export const SINK_DELIVERY_FLOOR = 0.995;
-/** V-SP — loopback spread floor, as a fraction of the wire serialization floor. */
-export const SPREAD_FLOOR_WIRE_FRACTION = 0.2;
-/** V-F — probe schedule-lag ceiling, as a fraction of the RTT bound. */
-export const PROBE_FLOOR_RTT_FRACTION = 0.1;
+/**
+ * V-F — probe schedule-lag ceiling, as a fraction of the RTT bound.
+ *
+ * 0.25, not 0.1 (Amendment 3): with the sleep-then-spin crossing, interactive
+ * thread QoS and a 10 ms spin window all in place, this generator's honest
+ * floor over the cable is p99 3.12 ms — the macOS scheduler's own tail for an
+ * sshd-launched process. scheduleLag never enters the RTT arithmetic (§6.3
+ * differences two *actual* instants); it only perturbs the sampling grid,
+ * which held (0 skipped, offered ratio 1.0) in every measured run. The max
+ * stays disclosed.
+ */
+export const PROBE_FLOOR_RTT_FRACTION = 0.25;
 
 /** V-S, in pps (§11a step 0b). */
 export function sinkPrecheckPps(rate = GATE_RATE): number {
 	return Math.round(SINK_HEADROOM_FACTOR * egressPps(rate));
 }
 
-/** V-SP, in ms (§7). */
-export function spreadFloorCeilingMs(
-	subscribers = SUBSCRIBERS,
-	payloadBytes = MESSAGE_PAYLOAD_BYTES,
-	linkBitsPerSec = GIGABIT,
-): number {
-	return (
-		SPREAD_FLOOR_WIRE_FRACTION *
-		broadcastSerializationMs(subscribers, payloadBytes, linkBitsPerSec)
-	);
+/**
+ * V-SP as amended (Amendment 4), in ms: the sink may take at most the same 20%
+ * margin on top of what the sender needed to emit the impulse. The original
+ * loopback-spread form (20% of §1.5's wire floor, 4.26 ms) asked the loopback
+ * to do something no loopback can — offer a line-rate impulse — so its number
+ * measured the local emitter, not the sink. The burst probe measures the sink
+ * against the real NIC's impulse, and this ceiling bounds it.
+ */
+export function sinkDrainCeilingMs(emitMaxMs: number): number {
+	return emitMaxMs * (1 + PATH_SINK_MARGIN);
 }
 
 /** V-F, in ms (§7). */

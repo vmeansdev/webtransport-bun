@@ -131,6 +131,7 @@ if (role === "recv") {
 	const socket = await udpSocket({ connect: { hostname: peer, port } });
 	const payload = new Uint8Array(payloadBytes);
 	const view = new DataView(payload.buffer);
+	const emits: number[] = [];
 	for (let b = 0; b < bursts; b += 1) {
 		const started = process.hrtime.bigint();
 		let blocked = 0;
@@ -152,14 +153,27 @@ if (role === "recv") {
 			}
 		}
 		const emitMs = Number(process.hrtime.bigint() - started) / 1e6;
+		emits.push(emitMs);
 		console.error(
 			`burst-probe send: burst ${b} emitted in ${emitMs.toFixed(2)} ms (${blocked} backoffs)`,
 		);
 		await new Promise((r) => setTimeout(r, gapMs));
 	}
 	socket.close();
+	const sorted = [...emits].sort((a, b) => a - b);
 	console.log(
-		JSON.stringify({ role: "send", peer, port, bursts, count, payloadBytes }),
+		JSON.stringify({
+			role: "send",
+			peer,
+			port,
+			bursts,
+			count,
+			payloadBytes,
+			emitMsP50: percentile(sorted, 0.5),
+			emitMsP99: percentile(sorted, 0.99),
+			emitMsMax: sorted.at(-1) ?? null,
+			perBurstEmitMs: emits,
+		}),
 	);
 } else {
 	console.error(

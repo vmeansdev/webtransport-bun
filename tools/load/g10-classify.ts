@@ -38,7 +38,7 @@ import {
 	sinkPrecheckPps,
 	spreadBoundMs,
 	spreadClauseApplies,
-	spreadFloorCeilingMs,
+	sinkDrainCeilingMs,
 	VERDICT_ARM,
 } from "./g10-plan";
 
@@ -141,9 +141,10 @@ export function evaluateSpreadClause(
 			observed: facts.spreadP99Ms,
 			bound,
 			reason:
-				`rate ${facts.rate}/s allows ${bound.toFixed(2)} ms but the wire ` +
-				`needs ${floor.toFixed(2)} ms to serialize ${facts.subscribers} ` +
-				"copies; published as a characterization (prereg §1.6)",
+				`rate ${facts.rate}/s gives a ${(1000 / facts.rate).toFixed(2)} ms ` +
+				`period but the path needs ${bound.toFixed(2)} ms to serialize ` +
+				`${facts.subscribers} copies with the sink margin; published as a ` +
+				"characterization (prereg §1.6, Amendment 4)",
 		};
 	}
 	if (completenessFalsifierFires(facts)) {
@@ -163,7 +164,7 @@ export function evaluateSpreadClause(
 			status: "no-verdict-force",
 			observed: facts.spreadP99Ms,
 			bound,
-			reason: "V-SP: the Mac's own loopback spread floor was not established",
+			reason: "V-SP: the Mac's sink drain floor was not established",
 		};
 	}
 	if (facts.spreadP99Ms === null) {
@@ -623,28 +624,46 @@ export function sinkFalsifier(
 }
 
 /**
- * V-SP. Without it the Mac's own receive-order dispersion is indistinguishable
- * from the server's fan-out, and the spread is this gate's headline metric.
+ * V-SP as amended (Amendment 4). Without it the Mac's own receive-order
+ * dispersion is indistinguishable from the server's fan-out, and the spread is
+ * this gate's headline metric. The measurement is the burst probe
+ * (`tools/offbox/burst-probe.ts`): the sender blasts the gate's impulse through
+ * the real NIC and reports how long emission took; the sink reports how long
+ * the drain took. A sink at wire pace attributes the day's spread to the
+ * server+path; completeness is disclosed beside it, never bounded — the raw
+ * probe has no transport, so its loss is the path's, not the sink's.
  */
 export function spreadFloorFalsifier(
-	facts: PrecheckFacts & { loopbackSpreadP99Ms: number | null },
-	subscribers = SUBSCRIBERS,
+	facts: PrecheckFacts & {
+		burstDrainP99Ms: number | null;
+		burstEmitMaxMs: number | null;
+		burstCompletenessMin: number | null;
+	},
 ): { fires: boolean; reason: string } {
 	const stale = sameDayOnExpectedHost(facts);
 	if (stale) return { fires: true, reason: `V-SP: ${stale}` };
-	const ceiling = spreadFloorCeilingMs(subscribers);
-	if (
-		facts.loopbackSpreadP99Ms === null ||
-		facts.loopbackSpreadP99Ms > ceiling
-	) {
+	if (facts.burstDrainP99Ms === null || facts.burstEmitMaxMs === null) {
+		return { fires: true, reason: "V-SP: no same-day burst-probe artifact" };
+	}
+	const ceiling = sinkDrainCeilingMs(facts.burstEmitMaxMs);
+	const completeness =
+		facts.burstCompletenessMin === null
+			? "undisclosed"
+			: facts.burstCompletenessMin.toFixed(3);
+	if (facts.burstDrainP99Ms > ceiling) {
 		return {
 			fires: true,
-			reason: `V-SP: loopback spread p99 ${facts.loopbackSpreadP99Ms ?? "absent"} ms vs ${ceiling.toFixed(2)} ms`,
+			reason:
+				`V-SP: sink drain p99 ${facts.burstDrainP99Ms.toFixed(2)} ms vs ` +
+				`${ceiling.toFixed(2)} ms (1.2 × emission max ${facts.burstEmitMaxMs.toFixed(2)} ms)`,
 		};
 	}
 	return {
 		fires: false,
-		reason: `V-SP: loopback spread p99 ${facts.loopbackSpreadP99Ms.toFixed(3)} ms`,
+		reason:
+			`V-SP: sink at wire pace — drain p99 ${facts.burstDrainP99Ms.toFixed(2)} ms ≤ ` +
+			`1.2 × emission max ${facts.burstEmitMaxMs.toFixed(2)} ms; ` +
+			`completeness min ${completeness}, disclosed`,
 	};
 }
 
