@@ -716,3 +716,37 @@ threshold, and the dispatch log above is still empty.
    scheduler's; a fan-out-only artifact has neither. The run still claims
    nothing — `complete` stays false — it just names the reason accurately
    instead of reporting a STOP that never ran.
+
+### Amendment 9 — server-side UDP/GSO socket counters (2026-08-19)
+
+Registered before the first dispatch of this axis (the dispatch log above is
+still empty) and before the harness commit that implements it. It is the
+residual of ticket 15 and the critic's "consider": every number this axis
+reports about the server's *send* path is a JS-side count of calls that
+returned, and nothing in the artifact says what the kernel did with them. On a
+fan-out step that blind spot is the whole forward direction.
+
+Registered addition, additive and diagnostic only:
+
+- Per ladder step, per fan-out step and per sink pre-check arm, `/proc/net/snmp`
+  `Udp:` counters are read immediately before and after **the same drive window
+  the step's rates already divide by**, and the delta is recorded as `udp`:
+  `inDatagrams`, `inErrors`, `rcvbufErrors`, `sndbufErrors`, `outDatagrams`.
+  These are host-wide counters on a single-host rig, which is a disclosure, not
+  a defect: on this box the publisher, the server and the subscribers are the
+  only UDP traffic of consequence, and the fan-out's forward direction dominates
+  `outDatagrams` by construction.
+- One derived number beside it, `gsoAmortization` = the datagrams the server
+  handed the socket during that window divided by the window's `outDatagrams`
+  delta — on a fan-out step, `forwarded / udp.outDatagrams`. A `UDP_SEGMENT`
+  send counts once at the UDP layer whatever the wire carries, so a ratio
+  materially above 1 is GSO doing its job and a ratio at 1 is a syscall per
+  datagram. `null` when the denominator is missing or non-positive.
+- The GSO/GRO *capability* of the host is separately established by the
+  workflow's existing `gso-probe` step and is not re-derived here.
+
+What this amendment explicitly does **not** do: it registers no threshold, no
+bucket and no STOP on any of these counters, and no gate reads them. No
+expectation for their values was registered before the run, and inventing one
+after seeing them is the thing this document exists to prevent. They are
+reported raw. On a non-Linux host every field is `null`.
