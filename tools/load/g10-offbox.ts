@@ -19,15 +19,12 @@
  * | no clone, dirty clone, unreachable candidate, failed build | 3 | remote-only |
  * | watchdog fired | 4 | `offboxDeadlineSeconds` sizes the deadline |
  *
- * **One refusal is not yet satisfiable, and this module states it rather than
- * papering over it.** The entry script hard-codes `load-client` as the binary it
- * builds and runs. G10's far end is `broadcast-client`, so the invocation below
- * carries `--bin broadcast-client`, which the script as it stands on
- * `prep/mac-generator-01` rejects as an unknown argument. Ticket 29 owes that
- * flag before this gate can dispatch off-box; the registration's §11b carries
- * the row. Emitting the flag is deliberate: an invocation that silently omitted
- * it would build and run the *wrong binary* on the Mac and produce a report the
- * conductor cannot parse, which is a far worse failure than a loud exit 3.
+ * The `--bin broadcast-client` flag this invocation carries was once the
+ * unsatisfiable refusal in that table: the entry script hard-coded
+ * `load-client`, and §11b carried the debt. The script now takes `--bin` as a
+ * closed set (`load-client|broadcast-client`, default `load-client`), and
+ * `mac-generator-entry.test.ts` runs this module's exact argv through the
+ * script's parser so the two cannot drift apart silently again.
  */
 
 /** Everything the Rust subscriber role needs, in the order it parses them. */

@@ -20,13 +20,14 @@
 #
 # Usage (from the runner, over ssh):
 #   ssh mac-gen tools/offbox/mac-generator-entry.sh \
-#       --candidate <sha> --deadline 120 -- --url https://10.99.0.1:4433 ...
+#       --candidate <sha> --deadline 120 [--bin broadcast-client] \
+#       -- --url https://10.99.0.1:4433 ...
 #
 # Contract: everything this prints on stdout that starts with `macgen:` is
-# provenance for the harness to fold into its artifact; everything else is
-# load-client's own stdout, verbatim and unreordered, so existing parsers keep
-# working. Exit status is load-client's, except 3 (provenance/build failure) and
-# 4 (watchdog fired).
+# provenance for the harness to fold into its artifact; everything else is the
+# selected binary's own stdout (`--bin`, default load-client), verbatim and
+# unreordered, so existing parsers keep working. Exit status is the binary's,
+# except 3 (provenance/build failure) and 4 (watchdog fired).
 
 set -uo pipefail
 
@@ -39,17 +40,27 @@ export PATH="${WT_MACGEN_PATH:-$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:
 CANDIDATE=""
 DEADLINE=300
 PLAN=0
+BIN_NAME="load-client"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --candidate) CANDIDATE="${2:-}"; shift 2 ;;
     --deadline)  DEADLINE="${2:-}"; shift 2 ;;
     --clone)     CLONE="${2:-}"; shift 2 ;;
+    --bin)       BIN_NAME="${2:-}"; shift 2 ;;
     --plan)      PLAN=1; shift ;;
     --) shift; break ;;
     *) echo "macgen: unknown argument $1" >&2; exit 3 ;;
   esac
 done
+
+# The generator is not one binary anymore: G10's far end is the subscriber
+# fleet, not the datagram source. The selector is a closed set — a typo must
+# refuse here, not cargo-build whatever string arrived.
+case "$BIN_NAME" in
+  load-client|broadcast-client) ;;
+  *) echo "macgen: --bin must be load-client or broadcast-client, got '$BIN_NAME'" >&2; exit 3 ;;
+esac
 
 if [ -z "$CANDIDATE" ]; then
   echo "macgen: --candidate <sha> is required" >&2
@@ -66,15 +77,15 @@ if [ "${#CANDIDATE}" -ne 40 ]; then
   exit 3
 fi
 
-BIN="$CLONE/target/release/load-client"
+BIN="$CLONE/target/release/$BIN_NAME"
 
 echo "macgen: host=$(hostname -s) arch=$(uname -m) os=$(uname -s)/$(uname -r)"
-echo "macgen: clone=$CLONE candidate=$CANDIDATE deadline=${DEADLINE}s"
+echo "macgen: clone=$CLONE candidate=$CANDIDATE bin=$BIN_NAME deadline=${DEADLINE}s"
 
 if [ "$PLAN" -eq 1 ]; then
   echo "macgen: plan git -C $CLONE fetch --quiet $REMOTE"
   echo "macgen: plan git -C $CLONE checkout --detach --quiet $CANDIDATE"
-  echo "macgen: plan cargo build --release -p reference --bin load-client"
+  echo "macgen: plan cargo build --release -p reference --bin $BIN_NAME"
   echo "macgen: plan $BIN $*"
   exit 0
 fi
@@ -107,7 +118,7 @@ if [ -n "$DIRTY" ]; then
   exit 3
 fi
 
-if ! ( cd "$CLONE" && cargo build --release -p reference --bin load-client >&2 ); then
+if ! ( cd "$CLONE" && cargo build --release -p reference --bin "$BIN_NAME" >&2 ); then
   echo "macgen: cargo build failed" >&2
   exit 3
 fi

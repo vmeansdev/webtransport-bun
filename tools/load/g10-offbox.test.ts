@@ -90,11 +90,12 @@ describe("the ssh invocation", () => {
 	});
 
 	/**
-	 * The one refusal the contract cannot yet satisfy. The script hard-codes
-	 * `load-client`; G10's far end is `broadcast-client`. Emitting the flag is
-	 * deliberate — omitting it would run the wrong binary on the Mac.
+	 * G10's far end is `broadcast-client`, not the datagram source, and the
+	 * entry script now takes `--bin` as a closed set. The end-to-end check that
+	 * the script's parser accepts this exact argv lives in
+	 * `tools/offbox/mac-generator-entry.test.ts`.
 	 */
-	test("names the binary it needs, which ticket 29 still owes a flag for", () => {
+	test("names the binary it needs, before the -- so the entry script owns it", () => {
 		const { args } = offboxInvocation({
 			ssh: "mac",
 			candidate: SHA,

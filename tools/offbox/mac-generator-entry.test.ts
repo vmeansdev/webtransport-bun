@@ -8,16 +8,19 @@
 
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { offboxInvocation } from "../load/g10-offbox";
 
 const ENTRY = join(import.meta.dir, "mac-generator-entry.sh");
 const SHA = "b4af780ad39012345678901234567890abcdef01";
 
 async function runEntry(
 	args: string[],
+	env?: Record<string, string>,
 ): Promise<{ code: number; out: string; err: string }> {
 	const child = Bun.spawn(["bash", ENTRY, ...args], {
 		stdout: "pipe",
 		stderr: "pipe",
+		env: { ...process.env, ...env },
 	});
 	const [out, err, code] = await Promise.all([
 		new Response(child.stdout).text(),
@@ -93,6 +96,77 @@ describe("mac-generator-entry.sh", () => {
 			"--clone",
 			"/nonexistent-clone",
 		]);
+		expect(code).toBe(3);
+		expect(err).toContain("no git clone");
+	});
+
+	test("--bin defaults to load-client so existing callers are unchanged", async () => {
+		const { code, out } = await runEntry(["--candidate", SHA, "--plan"]);
+		expect(code).toBe(0);
+		expect(out).toContain(
+			"plan cargo build --release -p reference --bin load-client",
+		);
+		expect(out).toContain("target/release/load-client");
+	});
+
+	test("--bin broadcast-client builds and runs the subscriber fleet, not the source", async () => {
+		const { code, out } = await runEntry([
+			"--candidate",
+			SHA,
+			"--bin",
+			"broadcast-client",
+			"--plan",
+		]);
+		expect(code).toBe(0);
+		expect(out).toContain(
+			"plan cargo build --release -p reference --bin broadcast-client",
+		);
+		expect(out).toContain("target/release/broadcast-client");
+		expect(out).not.toContain("target/release/load-client");
+	});
+
+	test("refuses a --bin outside the closed set rather than building it", async () => {
+		const { code, err } = await runEntry([
+			"--candidate",
+			SHA,
+			"--bin",
+			"latency-probe",
+			"--plan",
+		]);
+		expect(code).toBe(3);
+		expect(err).toContain("--bin must be load-client or broadcast-client");
+	});
+
+	test("the G10 conductor's exact ssh argv gets past the parser", async () => {
+		// End-to-end contract check for §11b: build the argv the conductor really
+		// emits, hand everything after the script path to the script, and require
+		// that no flag is refused. The clone check firing (exit 3, "no git clone")
+		// is the proof the parser accepted every flag — an unknown argument would
+		// have refused before the clone was ever consulted.
+		const invocation = offboxInvocation({
+			ssh: "mac-gen",
+			candidate: SHA,
+			deadlineSeconds: 120,
+			localBin: "",
+			subscriber: {
+				url: "https://10.99.0.1:4433",
+				sessions: 100,
+				probeCohort: 10,
+				probeHz: 20,
+				payloadBytes: 200,
+				rate: 30,
+				seconds: 60,
+			},
+		});
+		const scriptAt = invocation.args.indexOf(
+			"tools/offbox/mac-generator-entry.sh",
+		);
+		expect(scriptAt).toBeGreaterThan(-1);
+		const argv = invocation.args.slice(scriptAt + 1);
+		const { code, err } = await runEntry(argv, {
+			WT_MACGEN_CLONE: "/nonexistent-clone",
+		});
+		expect(err).not.toContain("unknown argument");
 		expect(code).toBe(3);
 		expect(err).toContain("no git clone");
 	});
