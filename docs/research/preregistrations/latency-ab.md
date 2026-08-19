@@ -358,4 +358,4 @@ that is not in this table did not happen.
 
 | # | run id | candidate SHA | outcome | artifact hash |
 |---|---|---|---|---|
-| — | — | — | not yet dispatched | — |
+| 1 | 32203374334 | `probe/latency-01` @ `0181666` (staging base `5ad0245`) | **complete run, dispatch incomplete by its own rule.** 86/86 arm-processes ran, none hit the 120 s guard. Floor `notQuiet` (ingest p99 1.32 ms ≥ 1.0 ms) → no adjusted figure; the gate is evaluated on raw p99, as registered. Rung A `measured`; rung B complete 10/10 in both arms but **honest 0/10 in both** (H4 in 20/20, H3 in 17/20) → B is not `measured`, so **G2 is not evaluated at 15,000/s** and is not interpolated. Rung C `measured` but honest 0/20. Rung D `generator-saturation` in 19/20. Cross-check reading **R4 — inconclusive** (the gate rung produced no ratio); clock valid (disagreement 0.0086 ms ≪ 0.2 ms). Classifier re-run independently from the fragments by the gate agent: output byte-identical apart from `classifiedAt`. | `sha256:6b71c709603a5f05f125b65ebe24fae0cfb995c0220914afe77a4a69d292aaf8` (`…-classified.json`) |
