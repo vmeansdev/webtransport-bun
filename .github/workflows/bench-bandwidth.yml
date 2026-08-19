@@ -35,7 +35,7 @@ on:
         default: "false"
         type: string
       mode:
-        description: "bandwidth (datagram ladder, default), stream (stream-throughput axis), or gate-g5 (gate G5; takes no tunable inputs — its config is pre-registered)"
+        description: "bandwidth (datagram ladder, default), stream (stream-throughput axis), gate-g5 (gate G5, unpaced), or gate-g5b (gate G5 paced; both gates take no tunable inputs — their config is pre-registered)"
         required: false
         default: "bandwidth"
         type: string
@@ -117,7 +117,7 @@ jobs:
       # from quinn's own counters, and capability-without-engagement is exactly
       # the silent-fallback case worth catching side by side.
       - name: GSO/GRO host probe
-        if: ${{ github.event.inputs.probe_only == 'true' || github.event.inputs.mode == 'stream' || github.event.inputs.mode == 'gate-g5' }}
+        if: ${{ github.event.inputs.probe_only == 'true' || github.event.inputs.mode == 'stream' || github.event.inputs.mode == 'gate-g5' || github.event.inputs.mode == 'gate-g5b' }}
         run: |
           echo "== kernel =="
           uname -a
@@ -164,7 +164,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'stream' && github.event.inputs.mode != 'gate-g5' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'stream' && github.event.inputs.mode != 'gate-g5' && github.event.inputs.mode != 'gate-g5b' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -235,6 +235,45 @@ jobs:
           # Every artifact hashed in the log, so the run log's sha256 column is
           # filled from the run rather than from a later local re-read.
           sha256sum "$EV"/bench-stream-g5-*.json
+      # Gate G5b — the paced gate. Pre-registration:
+      # docs/research/preregistrations/gate-g5b.md
+      #
+      # Gate G5's unpaced arm outran the rig and returned NO-VERDICT via the
+      # axis's host-saturation STOP. This arm holds the client at a registered
+      # 1.25 Gbps offer, so the question is whether the config sustains the bar
+      # rather than how fast it can go. Same no-tunable-inputs rule as gate-g5:
+      # the pace point, the cells and the batch budget live in the committed
+      # harness.
+      - name: Run gate G5b (paced)
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'gate-g5b' }}
+        env:
+          WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS: "1"
+          BENCH_STREAM_ARMS: P
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          EV="$GITHUB_WORKSPACE/.bench-evidence"
+          SHA="${{ github.event.inputs.candidate_commit }}"
+
+          echo "::group::G5b invocation 1 — knob OFF (P-control, P-window-ref, A6-shipped, A6-raised)"
+          BENCH_P_CELLS="P-control,P-window-ref,A6-shipped,A6-raised" \
+            BENCH_OUT="$EV/bench-stream-g5b-knoboff-$SHA.json" \
+            bun tools/load/bench-stream.ts
+          echo "::endgroup::"
+
+          echo "::group::G5b invocation 2 — knob ON at 65536 (P-batch)"
+          WEBTRANSPORT_STREAM_BATCH_BYTES=65536 \
+            BENCH_P_CELLS="P-batch" \
+            BENCH_OUT="$EV/bench-stream-g5b-knobon-$SHA.json" \
+            bun tools/load/bench-stream.ts
+          echo "::endgroup::"
+
+          GATE_G5B_OUT="$EV/bench-stream-g5b-verdict-$SHA.json" \
+            bun tools/load/gate-g5b-verdict.ts \
+              "$EV/bench-stream-g5b-knoboff-$SHA.json" \
+              "$EV/bench-stream-g5b-knobon-$SHA.json"
+
+          sha256sum "$EV"/bench-stream-g5b-*.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:

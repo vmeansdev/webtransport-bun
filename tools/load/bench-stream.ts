@@ -42,6 +42,14 @@ import {
 	summarizeServerSockets,
 } from "./gate-g5.ts";
 import {
+	isPacedShortfall,
+	PACE_NOTE,
+	PACE_TARGET_GBPS,
+	type PacedCellName,
+	type PacedRepeatFacts,
+	paceBucket,
+} from "./gate-g5b.ts";
+import {
 	assertWindowMathMirror,
 	DEFAULT_MAX_DATAGRAM_SIZE,
 	DEFAULT_MAX_SESSIONS,
@@ -148,6 +156,24 @@ const G_CELLS = (process.env.BENCH_G_CELLS ?? "")
 const G_RAISED_PER_STREAM = 16 * 1024 * 1024;
 const G_RAISED_PER_SESSION = 64 * 1024 * 1024;
 
+// --- Arm P: gate G5b (paced) ------------------------------------------------
+// docs/research/preregistrations/gate-g5b.md. Arm G's operating point with one
+// change: the client is paced to a fixed offered rate, so the gate asks whether
+// the config *sustains* the bar instead of how fast it can go. Everything else
+// is held so a P cell stays comparable to Arm G, A4 and A6.
+const P_SESSIONS = parseInt(process.env.BENCH_P_SESSIONS ?? "4", 10);
+const P_CONCURRENCY = parseInt(process.env.BENCH_P_CONCURRENCY ?? "4", 10);
+const P_STEP_SECONDS = parseInt(process.env.BENCH_P_STEP_SECONDS ?? "60", 10);
+const P_WRITE_BYTES = parseInt(process.env.BENCH_P_WRITE_BYTES ?? "262144", 10);
+const P_REPEATS = parseInt(process.env.BENCH_P_REPEATS ?? "2", 10);
+/** Which cells this invocation runs. The knob is a process property. */
+const P_CELLS = (process.env.BENCH_P_CELLS ?? "")
+	.split(",")
+	.map((v) => v.trim())
+	.filter((v) => v.length > 0) as PacedCellName[];
+/** Aggregate offered bytes/s at the registered 1.25 Gbps pace point. */
+const P_PACE_BYTES_PER_SEC = (PACE_TARGET_GBPS * 1e9) / 8;
+
 const PORT_A = 4433;
 const PORT_A_CONTROL = 4436;
 const PORT_B = 4437;
@@ -156,6 +182,8 @@ const PORT_C = 4438;
 const PORT_W_BASE = 4440;
 /** Arm G likewise: a fresh server per cell repeat, on its own port. */
 const PORT_G_BASE = 4460;
+/** Arm P likewise, clear of Arm G's range so the two never share a socket. */
+const PORT_P_BASE = 4480;
 
 // ---------------------------------------------------------------------------
 // Host / process instrumentation
@@ -780,6 +808,13 @@ const INCOMPLETE_BUCKETS = new Set([
 	// Gate G5's two additions (docs/research/preregistrations/gate-g5-bulk.md).
 	"crossing-instrument-disagreement",
 	"server-socket-drops-unmeasurable",
+	// Gate G5b (docs/research/preregistrations/gate-g5b.md). The pacer cannot
+	// write ahead of its virtual clock, so an overshoot means the step was not
+	// paced whatever its flag said; `pace-unmeasurable` is the same rule's
+	// missing-instrument case. `paced-shortfall` is NOT here: it is a
+	// disclosure, not an incompleteness.
+	"paced-overshoot",
+	"pace-unmeasurable",
 ]);
 
 /**
@@ -924,6 +959,39 @@ function classifyGate(step: StepObservation): string {
 	);
 }
 
+/** The client's own offered rate over the window every delivered figure uses. */
+function offeredGbps(step: StepObservation): number | null {
+	if (step.windowSec <= 0) return null;
+	return (step.client.streamBytesWritten * 8) / step.windowSec / 1e9;
+}
+
+/**
+ * Arm P. The axis's common rules, then Arm G's two integrity rules, then the
+ * pacing falsifier. `paced-shortfall` is deliberately NOT a bucket: it is a
+ * disclosure the verdict carries, because a reliable stream whose bytes arrived
+ * and drained delivered them whatever the offer was, and on the control cells
+ * the shortfall is the registered expectation rather than a defect.
+ */
+function classifyPaced(step: StepObservation, paceTargetGbps: number): string {
+	const common = commonBucket(step);
+	if (common) return common;
+	const integrity = gateIntegrityBucket({
+		crossing: {
+			packageMeanBytesPerCrossing: step.streamBatch
+				? step.streamBatch.meanBytesPerCrossing
+				: null,
+			harnessMeanBytesPerCrossing:
+				step.serverChunks > 0 ? step.serverBytes / step.serverChunks : null,
+		},
+		serverSocketsFound: step.serverSocket?.sockets ?? null,
+	});
+	if (integrity) return integrity;
+	return (
+		paceBucket({ paceTargetGbps, offeredGbps: offeredGbps(step) }) ??
+		"paced-cell"
+	);
+}
+
 /** GSO/GRO engagement, per the pre-registered 1.05 threshold. */
 function coalescingVerdict(
 	datagrams: number,
@@ -975,7 +1043,9 @@ type ClassifiedStep = StepObservation & {
 function classify(
 	step: StepObservation,
 	prev: StepObservation | null,
-	kind: "throughput" | "churn" | "window" | "gate",
+	kind: "throughput" | "churn" | "window" | "gate" | "paced",
+	/** Arm P only: the registered offer, 0 for its unpaced A6 cells. */
+	paceTargetGbps = 0,
 ): ClassifiedStep {
 	const bucket =
 		kind === "throughput"
@@ -984,7 +1054,9 @@ function classify(
 				? classifyChurn(step, prev)
 				: kind === "gate"
 					? classifyGate(step)
-					: classifyWindow(step, prev);
+					: kind === "paced"
+						? classifyPaced(step, paceTargetGbps)
+						: classifyWindow(step, prev);
 	const mbps = deliveredMbps(step);
 	// Bits actually delivered in this step, not a rate: cost-per-bit figures
 	// divide by it and so inherit no window choice at all.
@@ -1589,6 +1661,203 @@ async function runArmG(tls: {
 	return out;
 }
 
+// --- Arm P: gate G5b ---------------------------------------------------------
+
+type PacedCellSpec = {
+	cell: PacedCellName;
+	perStream: number;
+	perSession: number;
+	requiresBatchBytes: number;
+	/** Aggregate offered Gbps; 0 is unpaced. */
+	paceGbps: number;
+};
+
+const P_CELL_SPECS: Record<PacedCellName, PacedCellSpec> = {
+	"P-batch": {
+		cell: "P-batch",
+		perStream: DEFAULT_QUEUED_BYTES_PER_STREAM,
+		perSession: DEFAULT_QUEUED_BYTES_PER_SESSION,
+		requiresBatchBytes: GATE_BATCH_BYTES,
+		paceGbps: PACE_TARGET_GBPS,
+	},
+	"P-control": {
+		cell: "P-control",
+		perStream: DEFAULT_QUEUED_BYTES_PER_STREAM,
+		perSession: DEFAULT_QUEUED_BYTES_PER_SESSION,
+		requiresBatchBytes: 0,
+		paceGbps: PACE_TARGET_GBPS,
+	},
+	"P-window-ref": {
+		cell: "P-window-ref",
+		perStream: G_RAISED_PER_STREAM,
+		perSession: G_RAISED_PER_SESSION,
+		requiresBatchBytes: 0,
+		paceGbps: PACE_TARGET_GBPS,
+	},
+	// The A6 pair is unpaced on purpose: two cells held at one offer deliver the
+	// same rate, so their ratio would measure the pacer and not the window.
+	"A6-shipped": {
+		cell: "A6-shipped",
+		perStream: DEFAULT_QUEUED_BYTES_PER_STREAM,
+		perSession: DEFAULT_QUEUED_BYTES_PER_SESSION,
+		requiresBatchBytes: 0,
+		paceGbps: 0,
+	},
+	"A6-raised": {
+		cell: "A6-raised",
+		perStream: G_RAISED_PER_STREAM,
+		perSession: G_RAISED_PER_SESSION,
+		requiresBatchBytes: 0,
+		paceGbps: 0,
+	},
+};
+
+type PacedRepeatRecord = {
+	facts: PacedRepeatFacts;
+	step: ClassifiedStep;
+	math: WindowMath;
+};
+
+/**
+ * One invocation's share of Arm P: the cells named in BENCH_P_CELLS, each run
+ * BENCH_P_REPEATS times against a fresh server.
+ *
+ * Same knob-is-a-process-property constraint as Arm G, and the same refusal to
+ * produce a mislabelled arm: a cell whose registered knob disagrees with what
+ * this process resolved aborts the run.
+ */
+async function runArmP(tls: {
+	certPem: string;
+	keyPem: string;
+}): Promise<PacedRepeatRecord[]> {
+	assertWindowMathMirror();
+	const batchConfig = __TESTING__.streamBatchConfigForTests();
+	if (!batchConfig.diagnosticsEnabled) {
+		throw new Error(
+			"arm P requires WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1: the crossing clause is measured by that counter and the pre-registration turns it on for every invocation, controls included",
+		);
+	}
+	for (const name of P_CELLS) {
+		const spec = P_CELL_SPECS[name];
+		if (!spec) throw new Error(`arm P: unknown cell ${name}`);
+		if (spec.requiresBatchBytes !== batchConfig.batchBytes) {
+			throw new Error(
+				`arm P: cell ${name} requires WEBTRANSPORT_STREAM_BATCH_BYTES=${spec.requiresBatchBytes || "unset"} but this process resolved ${batchConfig.batchBytes}`,
+			);
+		}
+	}
+
+	const out: PacedRepeatRecord[] = [];
+	let portOffset = 0;
+	for (const name of P_CELLS) {
+		const spec = P_CELL_SPECS[name];
+		if (!spec) continue;
+		const math = windowMath(
+			spec.perStream,
+			spec.perSession,
+			P_SESSIONS,
+			DEFAULT_MAX_SESSIONS,
+			DEFAULT_MAX_DATAGRAM_SIZE,
+		);
+		// The load client takes a per-session target and divides it by the
+		// concurrency itself, so the aggregate offer is split once here.
+		const perSessionBytes =
+			spec.paceGbps > 0
+				? Math.floor(
+						(spec.paceGbps / PACE_TARGET_GBPS) *
+							(P_PACE_BYTES_PER_SEC / P_SESSIONS),
+					)
+				: 0;
+		for (let r = 1; r <= P_REPEATS; r++) {
+			const port = PORT_P_BASE + portOffset++;
+			const harness = await startServer(
+				{
+					port,
+					sessions: P_SESSIONS,
+					queuedBytesPerStream: spec.perStream,
+					queuedBytesPerSession: spec.perSession,
+				},
+				tls,
+			);
+			console.log(
+				`bench-stream: arm P ${name}-r${r} up on ${port} perStream=${(spec.perStream / 1024).toFixed(0)}KiB perSession=${(spec.perSession / 1024 / 1024).toFixed(1)}MiB batchBytes=${batchConfig.batchBytes} pace=${spec.paceGbps > 0 ? `${spec.paceGbps}Gbps (${perSessionBytes}B/s/session)` : "unpaced"} worstCase/session=${(math.perSessionWorstCaseBytes / 1024 / 1024).toFixed(1)}MiB`,
+			);
+			let step: StepObservation;
+			try {
+				step = await runStep(
+					"P",
+					`${name}-r${r}`,
+					harness,
+					P_SESSIONS,
+					P_STEP_SECONDS,
+					streamArgs({
+						port,
+						sessions: P_SESSIONS,
+						seconds: P_STEP_SECONDS,
+						workload: "bulk",
+						writeBytes: P_WRITE_BYTES,
+						concurrency: P_CONCURRENCY,
+						targetBytesPerSecPerSession: perSessionBytes,
+					}),
+					portOffset,
+					port,
+				);
+			} finally {
+				await harness.server.close();
+			}
+			const classified = classify(step, null, "paced", spec.paceGbps);
+			printStep(classified);
+			const offered = offeredGbps(step);
+			const shortfall = isPacedShortfall({
+				paceTargetGbps: spec.paceGbps,
+				offeredGbps: offered,
+			});
+			console.log(
+				`bench-stream: arm P ${name}-r${r} offered=${offered?.toFixed(3) ?? "n/a"}Gbps${shortfall ? "(SHORTFALL)" : ""} delivered=${(classified.deliveredMbps / 1000).toFixed(3)}Gbps crossing pkg=${step.streamBatch?.meanBytesPerCrossing.toFixed(0) ?? "n/a"}B harness=${classified.meanJsChunkBytes?.toFixed(0) ?? "n/a"}B maxBatch=${step.streamBatch?.maxBatchBytes ?? "n/a"}B crossings/s=${step.streamBatch?.crossingsPerSecond.toFixed(0) ?? "n/a"} serverSocketDrops=${step.serverSocket?.drops ?? "unmeasurable"} coResidentDrops=${step.serverSocket?.coResidentDrops ?? "n/a"}(${step.serverSocket?.coResidentDropVerdict ?? "n/a"})`,
+			);
+			out.push({
+				step: classified,
+				math,
+				facts: {
+					cell: name,
+					repeat: r,
+					bucket: classified.bucket,
+					incomplete: classified.incomplete,
+					paceTargetGbps: spec.paceGbps,
+					offeredGbps: offered,
+					deliveredMbps: classified.deliveredMbps,
+					packageMeanBytesPerCrossing:
+						step.streamBatch?.meanBytesPerCrossing ?? null,
+					harnessMeanBytesPerCrossing: classified.meanJsChunkBytes,
+					crossingsPerSecond: step.streamBatch?.crossingsPerSecond ?? null,
+					maxBatchBytes: step.streamBatch?.maxBatchBytes ?? null,
+					batchedCrossings: step.streamBatch?.batchedCrossings ?? null,
+					serverSocketDrops: step.serverSocket?.drops ?? null,
+					coResidentDrops: step.serverSocket?.coResidentDrops ?? null,
+					coResidentDropVerdict:
+						step.serverSocket?.coResidentDropVerdict ?? "UNGRADED",
+					serverSocketRxQueueBytesAtEnd:
+						step.serverSocket?.rxQueueBytesAtEnd ?? null,
+					queuedBytesPerStream: spec.perStream,
+					queuedBytesPerSession: spec.perSession,
+					// Arm P never sets streamReceiveWindow/receiveWindow/sendWindow:
+					// clause 3 is a statement about the shipped governors.
+					explicitWindowFieldsSet: false,
+					insideShippedPerSessionBudget: math.insideShippedPerSessionBudget,
+					batchBytesConfigured: batchConfig.batchBytes,
+					hostCpuPctMedian: classified.hostCpuPctMedian,
+					serverCpuPct: classified.serverCpuPct,
+					clientCpuPct: classified.clientCpuPct,
+					serverCpuMsPerGbit: classified.serverCpuMsPerGbit,
+					rssMbPeak: classified.rssMbMax,
+				},
+			});
+			await Bun.sleep(10_000);
+		}
+	}
+	return out;
+}
+
 /** Arm W's pre-registered verdict, over the facts the rules are allowed to see. */
 function evaluateArmW(rungs: WindowRung[]) {
 	return evaluateWindowSweep(
@@ -1748,6 +2017,7 @@ async function main(): Promise<void> {
 	const armC = ARMS.includes("C") ? await runArmC(creds) : [];
 	const armW = ARMS.includes("W") ? await runArmW(creds) : [];
 	const armG = ARMS.includes("G") ? await runArmG(creds) : [];
+	const armP = ARMS.includes("P") ? await runArmP(creds) : [];
 
 	const ladderA = armA.filter((s) => !s.label.startsWith("control-"));
 	const usableA = ladderA.filter((s) => !s.incomplete);
@@ -1792,6 +2062,7 @@ async function main(): Promise<void> {
 			committedMemory: WINDOW_MEMORY_NOTE,
 			crossingClause: CROSSING_CLAUSE_NOTE,
 			serverSocketDrops: SERVER_SOCKET_DROP_NOTE,
+			pacing: PACE_NOTE,
 			denominators:
 				"deliveredMbps / streamsPerSec / boundaryEventsPerSec divide by " +
 				"windowSec (the configured drive window). serverCpuPct and " +
@@ -1858,6 +2129,23 @@ async function main(): Promise<void> {
 				// What this process actually resolved, not what was asked for.
 				streamBatch: __TESTING__.streamBatchConfigForTests(),
 			},
+			p: {
+				preregistration: "docs/research/preregistrations/gate-g5b.md",
+				cells: P_CELLS,
+				repeats: P_REPEATS,
+				sessions: P_SESSIONS,
+				concurrency: P_CONCURRENCY,
+				stepSeconds: P_STEP_SECONDS,
+				writeBytes: P_WRITE_BYTES,
+				paceTargetGbps: PACE_TARGET_GBPS,
+				paceAggregateBytesPerSec: P_PACE_BYTES_PER_SEC,
+				pacePerSessionBytesPerSec: Math.floor(
+					P_PACE_BYTES_PER_SEC / P_SESSIONS,
+				),
+				raisedPerStream: G_RAISED_PER_STREAM,
+				raisedPerSession: G_RAISED_PER_SESSION,
+				streamBatch: __TESTING__.streamBatchConfigForTests(),
+			},
 		},
 		armA,
 		armB,
@@ -1867,6 +2155,13 @@ async function main(): Promise<void> {
 		// knob is a process property), so it is computed by tools/load/gate-g5-verdict.ts
 		// over every artifact, never by one invocation over its own half.
 		armG: armG.map((r) => ({
+			...r.facts,
+			step: r.step,
+			math: r.math,
+		})),
+		// Same shape, same reason: gate G5b's verdict spans invocations and is
+		// computed by tools/load/gate-g5b-verdict.ts over every artifact.
+		armP: armP.map((r) => ({
 			...r.facts,
 			step: r.step,
 			math: r.math,
