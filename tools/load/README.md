@@ -161,6 +161,34 @@ all before the run.
 In CI: `bench-bandwidth` with `latency_ab=true`. Locally, `LATENCY_AB_LIMIT=n`
 runs the first *n* cells as a smoke; local numbers are never results.
 
+### Off-box RTT dispatch (G2's conversion)
+
+The A/B could not evaluate G2's 15,000/s rung: a generator sharing four vCPU with
+the server failed the registered schedule-lag check in every cell. The fix is a
+rig change, not a knob — the generator moves to a sibling VM, and the gated
+quantity becomes one the move leaves intact.
+
+`latency-rtt-conduct.ts` runs 22 short cells over ssh; `bench-latency.ts` gains
+an off-box mode (`LATENCY_OFFBOX_SSH`, `LATENCY_OFFBOX_URL_HOST`) that dials the
+LAN address instead of loopback.
+
+- `latency-rtt-schedule.ts` — the 22 cells and their order, as a pure tested
+  function. Cell 0 is an off-box floor arm and doubles as the reachability
+  pre-flight: no sessions there aborts the dispatch.
+- `latency-rtt-classify.ts` — the verdict. Off-box integrity marks, the
+  censoring correction that stops loss from buying a better tail, kernel-drop
+  loss attribution, the loadgen's own floor, and the registered decision table.
+
+Two things the off-box mode does *not* do, on purpose: it records **no**
+cross-host interval (the two ends read different `CLOCK_MONOTONIC` counters, so
+ingest, egress and upstream-plus-turnaround ship empty and the classifier asserts
+they are), and it never subtracts a floor — the only correction defined moves the
+figure up.
+
+Pre-registered in `docs/research/preregistrations/gate-g2-offbox-rtt.md`.
+Power-on and host-RAM runbook: `docs/research/runbooks/2026-08-19-offbox-loadgen.md`.
+In CI: `bench-bandwidth` with `latency_rtt=true`.
+
 ## Production gates (10.2)
 
 The load harness enforces:
