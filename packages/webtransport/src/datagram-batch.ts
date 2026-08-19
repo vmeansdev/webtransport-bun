@@ -31,12 +31,21 @@ export type NativeDatagramBatchResult = {
  * caller's array, so the failing element is always at index `sent`, whichever
  * chunk it landed in, and nothing after it was attempted.
  *
+ * So does the one-deadline contract. `send` is handed the milliseconds this
+ * call has already spent, and native derives its deadline from what is left of
+ * `backpressureTimeoutMs` rather than starting a fresh one — otherwise a
+ * 1024-element array would silently buy `ceil(1024/256)` deadlines' worth of
+ * patience for a caller who made one call.
+ *
  * Deliberately not an `async function`: argument validation must throw at the
  * call site rather than reject a promise the caller may not be awaiting yet,
  * and neither check crosses N-API, so throwing costs nothing.
  */
 export function sendDatagramBatchChunked(
-	send: (chunk: Uint8Array[]) => Promise<NativeDatagramBatchResult>,
+	send: (
+		chunk: Uint8Array[],
+		elapsedMs: number,
+	) => Promise<NativeDatagramBatchResult>,
 	datagrams: readonly Uint8Array[],
 ): Promise<NativeDatagramBatchResult> {
 	if (!Array.isArray(datagrams)) {
@@ -54,16 +63,23 @@ export function sendDatagramBatchChunked(
 }
 
 async function sendChunks(
-	send: (chunk: Uint8Array[]) => Promise<NativeDatagramBatchResult>,
+	send: (
+		chunk: Uint8Array[],
+		elapsedMs: number,
+	) => Promise<NativeDatagramBatchResult>,
 	datagrams: readonly Uint8Array[],
 ): Promise<NativeDatagramBatchResult> {
 	let sent = 0;
+	// One clock for the whole caller-visible call. Monotonic, so a wall-clock
+	// step cannot hand a chunk more patience than the caller asked for.
+	const started = performance.now();
 	for (let start = 0; start < datagrams.length; start += DATAGRAM_BATCH_MAX) {
 		const chunk = datagrams.slice(
 			start,
 			start + DATAGRAM_BATCH_MAX,
 		) as Uint8Array[];
-		const result = await send(chunk);
+		const elapsed = start === 0 ? 0 : Math.max(0, performance.now() - started);
+		const result = await send(chunk, elapsed);
 		sent += result.sent;
 		// A short chunk without a code cannot happen — native reports why it
 		// stopped — but treating it as a stop keeps the prefix honest rather

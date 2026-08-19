@@ -224,12 +224,26 @@ impl SessionHandle {
     /// silently dropping the tail; the TypeScript wrapper chunks so no ordinary
     /// caller sees it.
     ///
-    /// Same no-hop contract as `send_datagram`.
+    /// `elapsedMs` is how long the caller-visible call has already run, so an
+    /// array the TypeScript layer had to split across several crossings still
+    /// shares one backpressure deadline. Omitted means zero.
+    ///
+    /// Same no-hop contract as `send_datagram`. Counted like every other async
+    /// method on this handle: a batched send that is still unsettled has to be
+    /// visible to `server.close()`, which is the whole point of the counters.
     #[napi(ts_return_type = "Promise<DatagramBatchResult>")]
-    pub fn send_datagram_batch(&self, env: Env, data: Vec<Uint8Array>) -> Result<JsObject> {
+    pub fn send_datagram_batch(
+        &self,
+        env: Env,
+        data: Vec<Uint8Array>,
+        elapsed_ms: Option<u32>,
+    ) -> Result<JsObject> {
         let id = self.id.clone();
         let prepared = crate::datagram_batch::prepare_batch(&data);
-        env.spawn_future(async move { Ok(send_datagram_batch_for_session(&id, prepared).await) })
+        let elapsed = u64::from(elapsed_ms.unwrap_or(0));
+        self.spawn_counted(env, AsyncOpKind::Datagram, async move {
+            Ok(send_datagram_batch_for_session(&id, prepared, elapsed).await)
+        })
     }
 
     /// Reads on the N-API runtime `spawn_future` already provides. Do NOT
@@ -465,5 +479,37 @@ impl SessionHandle {
             ))
         })
         .map_err(wt_from_reason)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `spawn_counted`'s own doc states the invariant this pins: "Every async
+    /// method on this handle goes through here: an operation invisible to the
+    /// counters is an operation that can pin the event loop past
+    /// `server.close()` with no evidence."
+    ///
+    /// `send_datagram_batch` was spawned raw, so the newest datagram send path
+    /// was the one path `server_runtime_is_idle` and `nativeAsyncOpsPending`
+    /// could not see. Counting the raw spawns from the source keeps the next
+    /// method that forgets from going invisible the same way.
+    #[test]
+    fn every_async_session_method_goes_through_spawn_counted() {
+        let source = include_str!("session_napi.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module is the tail of this file");
+        assert_eq!(
+            body.matches("env.spawn_future(").count(),
+            1,
+            "the only raw env.spawn_future may be the one inside spawn_counted; \
+             every async method must go through spawn_counted so an unsettled \
+             operation stays visible to the close contract"
+        );
+        assert!(
+            body.contains("Ok(send_datagram_batch_for_session(&id, prepared, elapsed).await)"),
+            "the batched datagram send must be spawned counted, like its peers"
+        );
     }
 }

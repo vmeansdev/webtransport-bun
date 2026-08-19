@@ -206,7 +206,18 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
 /// The session's send state and the backpressure deadline are both resolved
 /// once, at entry, and shared by every element: a caller who asked for one call
 /// gets one call's worth of patience, where per-element deadlines would let a
-/// 256-element batch park for 256 × `backpressure_timeout_ms`. Reservation
+/// 256-element batch park for 256 × `backpressure_timeout_ms`.
+///
+/// `elapsed_ms` extends that guarantee past the 256-element crossing cap. An
+/// array longer than the cap becomes several of these calls, and each one would
+/// otherwise start a fresh deadline — buying a 1024-element caller four
+/// deadlines for the one call it made. The chunker reports how long the call has
+/// already run and the deadline is what remains of the budget, so the patience
+/// belongs to the call rather than to the crossing. A budget already spent still
+/// sends everything that does not have to wait: `reserve_datagram_capacity`
+/// tries the reservation before it ever looks at the deadline.
+///
+/// Reservation
 /// stays strictly per element — reserving `sum(len)` against
 /// `max_queued_bytes_per_session` would be the park-forever class fixed by
 /// `5ad0245`, waiting on a release that can never come whenever a configured
@@ -216,6 +227,7 @@ pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<
 pub(crate) async fn send_datagram_batch_for_session(
     id: &str,
     prepared: crate::datagram_batch::PreparedBatch,
+    elapsed_ms: u64,
 ) -> crate::datagram_batch::DatagramBatchResult {
     let Some(state) = session_registry::get_datagram_send_state(id) else {
         return crate::datagram_batch::DatagramBatchResult::new(
@@ -223,7 +235,14 @@ pub(crate) async fn send_datagram_batch_for_session(
             Some("E_SESSION_CLOSED".to_string()),
         );
     };
-    let deadline = Instant::now() + Duration::from_millis(state.3.backpressure_timeout_ms);
+    // Every element of a batched send rides one N-API promise, so each one is
+    // exposed to the host-loop reference class the single-send path counts.
+    state
+        .1
+        .datagram_sends_async
+        .fetch_add(prepared.items.len() as u64, Ordering::Relaxed);
+    let deadline = Instant::now()
+        + Duration::from_millis(state.3.backpressure_timeout_ms.saturating_sub(elapsed_ms));
     crate::datagram_batch::send_prepared(prepared, |bytes| {
         let state = &state;
         async move {
@@ -1689,6 +1708,7 @@ mod tests {
                 items: vec![vec![7u8; 100]; 256],
                 truncated: None,
             },
+            0,
         )
         .await;
         assert_eq!(
@@ -1735,6 +1755,7 @@ mod tests {
                 items: vec![vec![7u8; 100]; 32],
                 truncated: None,
             },
+            0,
         )
         .await;
         let elapsed = started.elapsed();
@@ -1747,6 +1768,35 @@ mod tests {
             elapsed < Duration::from_millis(1_500),
             "32 elements shared one 150 ms deadline; per-element deadlines would \
              have cost ~4.8 s, and this took {elapsed:?}"
+        );
+
+        // The same guarantee across the 256-element crossing cap. An array
+        // longer than the cap becomes several of these calls, and each one used
+        // to start a fresh deadline — so a 1024-element caller who made one
+        // call bought four deadlines' worth of patience. The chunker reports
+        // what the call has already spent and the deadline is what is left of
+        // the budget, so a spent budget parks for nothing.
+        let started = std::time::Instant::now();
+        let later_chunk = send_datagram_batch_for_session(
+            &starved_id,
+            PreparedBatch {
+                items: vec![vec![7u8; 100]; 32],
+                truncated: None,
+            },
+            150,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            (later_chunk.sent, later_chunk.code.as_deref()),
+            (0, Some("E_BACKPRESSURE_TIMEOUT")),
+            "a chunk that starts with the call's budget already spent still \
+             reports where it stopped"
+        );
+        assert!(
+            elapsed < Duration::from_millis(75),
+            "the budget was already spent, so this crossing must not park for a \
+             second 150 ms deadline; it took {elapsed:?}"
         );
 
         // Oversize stops the batch at its own index, under today's code string.
@@ -1769,6 +1819,7 @@ mod tests {
                 items: vec![vec![1u8; 8], vec![2u8; 8], vec![3u8; 4096], vec![4u8; 8]],
                 truncated: None,
             },
+            0,
         )
         .await;
         assert_eq!(
@@ -1792,6 +1843,7 @@ mod tests {
                 items: vec![vec![1u8; 8]],
                 truncated: None,
             },
+            0,
         )
         .await;
         assert_eq!(

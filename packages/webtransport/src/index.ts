@@ -1223,6 +1223,9 @@ interface NativeSessionHandle {
 	 * than silently degrade. */
 	sendDatagramBatch: (
 		datagrams: Uint8Array[],
+		/** Milliseconds the caller-visible call has already spent, so a chunked
+		 * array shares one backpressure deadline instead of one per crossing. */
+		elapsedMs?: number,
 	) => Promise<NativeDatagramBatchResult>;
 	readDatagram(): Promise<Uint8Array | null>;
 	/** Batched datagram read. Resolves a non-empty array, or `null` at
@@ -1798,7 +1801,7 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		const handle = this.#nativeHandle;
 		return sendDatagramBatchChunked(
-			(chunk) => handle.sendDatagramBatch(chunk),
+			(chunk, elapsedMs) => handle.sendDatagramBatch(chunk, elapsedMs),
 			datagrams,
 		).then(({ sent, code }) =>
 			code === undefined
@@ -2354,7 +2357,7 @@ class NativeClientSession implements ClientSession {
 		const handle = this.#nativeHandle;
 		const strict = this.#strictW3CErrors;
 		return sendDatagramBatchChunked(
-			(chunk) => handle.sendDatagramBatch(chunk),
+			(chunk, elapsedMs) => handle.sendDatagramBatch(chunk, elapsedMs),
 			datagrams,
 		).then(({ sent, code }) =>
 			code === undefined

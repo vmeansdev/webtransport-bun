@@ -19,6 +19,7 @@ import {
 	SERVER_CLOSING_CLOSE_CODE,
 	SERVER_CLOSING_CLOSE_REASON,
 } from "../src/server-close.js";
+import type { CloseInfo } from "../src/types.js";
 import { generateCertForNames } from "./helpers/certs.js";
 
 const ROOT = new URL("../../..", import.meta.url).pathname;
@@ -242,6 +243,50 @@ describe("promise-free datagram send", () => {
 			cert.cleanup();
 		}
 	}, 30_000);
+
+	/**
+	 * The batched send takes the promise path by construction — it is a
+	 * `spawn_future`, not a synchronous quinn call — so it is exactly the
+	 * exposure `datagramSendsAsync` exists to report. It counted nothing,
+	 * leaving a batching server reading a flat zero while every one of its
+	 * datagrams held an N-API promise.
+	 */
+	it("counts batched sends on the exposure meter", async () => {
+		const cert = generateCertForNames(["localhost", "127.0.0.1"]);
+		expect(cert).not.toBeNull();
+		if (!cert) return;
+		let sent = 0;
+		const BATCH = 300;
+		const server = createServer({
+			port: 0,
+			host: "127.0.0.1",
+			tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+			onSession: (session) => {
+				void (async () => {
+					const batch = Array.from({ length: BATCH }, () => new Uint8Array(64));
+					const res = await session.sendDatagramBatch(batch);
+					sent = res.sent;
+				})().catch(() => {});
+			},
+		});
+		try {
+			const session = await connect(
+				`https://127.0.0.1:${server.address.port}/batch`,
+				{ tls: { insecureSkipVerify: true } },
+			);
+			const deadline = Date.now() + 10_000;
+			while (sent === 0 && Date.now() < deadline) await Bun.sleep(20);
+			expect(sent).toBeGreaterThan(0);
+			const snap = server.metricsSnapshot();
+			// One per element, matching how the single-send path counts, and
+			// the array was long enough to be split across crossings.
+			expect(snap.datagramSendsAsync ?? 0).toBeGreaterThanOrEqual(sent);
+			session.close();
+		} finally {
+			await server.close();
+			cert.cleanup();
+		}
+	}, 30_000);
 });
 
 describe("createServerCloseContract", () => {
@@ -306,5 +351,49 @@ describe("createServerCloseContract", () => {
 		await Promise.all([close(), close()]);
 		await close();
 		expect(nativeCloses).toBe(1);
+	});
+
+	/**
+	 * A failing native close used to be terminal in two ways at once: it
+	 * skipped `resolveOwnedSessions`, so every session's `closed` promise hung
+	 * forever, and the rejected promise was memoized, so `close()` could never
+	 * be retried. Adding `pending_async_ops` to the idle predicate made that
+	 * rejection reachable for any never-settling handle promise, which is a
+	 * strictly larger set of cases than before.
+	 */
+	it("resolves owned sessions and stays retryable when the native close fails", async () => {
+		let attempts = 0;
+		const resolved: CloseInfo[] = [];
+		const close = createServerCloseContract({
+			closeNative: async () => {
+				attempts += 1;
+				if (attempts === 1) throw new Error("still draining: 2 pending");
+			},
+			resolveOwnedSessions: (info) => {
+				resolved.push(info);
+			},
+			pendingOnSessionCallbacks: () => 0,
+			awaitOnSessionDrain: () => Promise.resolve(),
+		});
+
+		// The failure is reported, not swallowed.
+		await expect(close()).rejects.toThrow("still draining");
+		// ...but the app's sessions are not left waiting on a promise that can
+		// never settle: the endpoint has stopped accepting either way.
+		expect(resolved).toEqual([
+			{
+				code: SERVER_CLOSING_CLOSE_CODE,
+				reason: SERVER_CLOSING_CLOSE_REASON,
+			},
+		]);
+
+		// And the caller can try again — the rejection was not memoized.
+		await close();
+		expect(attempts).toBe(2);
+		expect(resolved).toHaveLength(2);
+
+		// A success is still memoized: retryable must not mean "re-runs forever".
+		await close();
+		expect(attempts).toBe(2);
 	});
 });

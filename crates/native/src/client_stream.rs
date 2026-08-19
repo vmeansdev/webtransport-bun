@@ -653,6 +653,69 @@ struct DirectReadCtx<'a> {
     deferred_budget: &'a Mutex<Option<DeferredStreamBudgetConfig>>,
     read_abort: &'a Notify,
     read_aborted: &'a AtomicBool,
+    deferred_terminal: &'a TerminalLatch,
+}
+
+/// Where the terminal event of a deferred-direct stream is remembered when a
+/// batch runs into it while it still has bytes to hand back.
+///
+/// The batch contract is bytes-then-terminal: a batch that meets EOF or a reset
+/// delivers the bytes it has and leaves the terminal event for the next call.
+/// For EOF that needs no bookkeeping — quinn latches `all_data_read` and every
+/// later read re-reports `Ok(None)`. A reset is *not* sticky the same way:
+/// `poll_read_generic` sets `all_data_read` alongside `reset` on the no-data
+/// reset branch and then short-circuits on `all_data_read` before it ever
+/// consults `reset`, so the second read of a reset stream reports a clean EOF.
+/// Reading the error is therefore consuming it, and the batch loop has to hold
+/// on to what it consumed.
+///
+/// Sticky by construction: the first terminal code wins and is never cleared,
+/// so every read after the batch that swallowed it reports the same event
+/// rather than a truncation dressed up as a clean end of stream.
+#[derive(Default)]
+struct TerminalLatch(Mutex<Option<&'static str>>);
+
+impl TerminalLatch {
+    /// Remember `code` unless something terminal is already remembered.
+    fn set(&self, code: &'static str) {
+        if let Ok(mut slot) = self.0.lock() {
+            slot.get_or_insert(code);
+        }
+    }
+
+    /// The remembered terminal code, if a batch consumed one.
+    fn get(&self) -> Option<&'static str> {
+        self.0.lock().ok().and_then(|slot| *slot)
+    }
+}
+
+/// What one poll of the batch loop's `read_chunk` means for the batch.
+enum BatchStep {
+    /// Bytes to add to the batch.
+    Take(bytes::Bytes),
+    /// Nothing more is available right now; end the batch, nothing consumed.
+    Stop,
+    /// A terminal event was consumed by this poll. End the batch, hand back the
+    /// bytes already collected, and remember the code for the next read.
+    Terminal(&'static str),
+}
+
+/// Classify a single `poll_once(read_chunk(..))` result.
+///
+/// `Pending` and EOF end the batch with nothing to remember. An `Err` is the
+/// case the lever originally dropped on the floor: polling it to completion
+/// consumes it, so it must be carried out of the loop rather than discarded.
+fn classify_batch_poll(
+    polled: Option<
+        std::result::Result<Option<wtransport::quinn::Chunk>, wtransport::quinn::ReadError>,
+    >,
+) -> BatchStep {
+    match polled {
+        None => BatchStep::Stop,
+        Some(Ok(None)) => BatchStep::Stop,
+        Some(Ok(Some(chunk))) => BatchStep::Take(chunk.bytes),
+        Some(Err(error)) => BatchStep::Terminal(quic_read_error_code(&error)),
+    }
 }
 
 /// The batched twin of `read_deferred_direct`: park for the first chunk exactly
@@ -665,6 +728,12 @@ async fn read_deferred_direct_batch(
     ctx: DirectReadCtx<'_>,
     requested_bytes: u32,
 ) -> Result<Option<Option<CoalescedChunks>>> {
+    // A terminal event an earlier batch consumed is reported here, before the
+    // stream is touched: quinn cannot re-report a reset, so this latch is the
+    // only remaining record of it.
+    if let Some(code) = ctx.deferred_terminal.get() {
+        return Err(wt_from_static_code(code));
+    }
     let pending = ctx
         .deferred_recv
         .lock()
@@ -748,22 +817,34 @@ async fn read_deferred_direct_batch(
             }
         }
         let polled = poll_once(recv_stream.quic_stream_mut().read_chunk(want, true));
-        // Pending means nothing more is queued. EOF and reset stop the batch
-        // without being consumed: quinn keeps both sticky, so the next read
-        // re-observes them as their own terminal event.
-        let Some(Ok(Some(chunk))) = polled else {
-            if let Some(ref b) = budget {
-                b.release(want as u64);
+        // Pending means nothing more is queued, and EOF genuinely is sticky in
+        // quinn — both end the batch with nothing to carry. A reset is not
+        // sticky, so polling it consumed it: latch it for the next read instead
+        // of dropping it, which would downgrade a reset to a clean EOF.
+        let step = classify_batch_poll(polled);
+        let chunk_bytes = match step {
+            BatchStep::Take(bytes) => bytes,
+            BatchStep::Stop => {
+                if let Some(ref b) = budget {
+                    b.release(want as u64);
+                }
+                break;
             }
-            break;
+            BatchStep::Terminal(code) => {
+                if let Some(ref b) = budget {
+                    b.release(want as u64);
+                }
+                ctx.deferred_terminal.set(code);
+                break;
+            }
         };
-        let taken = chunk.bytes.len();
+        let taken = chunk_bytes.len();
         if let Some(ref b) = budget {
             b.release((want - taken) as u64);
         }
         total += taken;
         chunks.push(StreamChunk::new_shared(
-            chunk.bytes,
+            chunk_bytes,
             budget.clone(),
             taken as u64,
         ));
@@ -926,6 +1007,9 @@ pub struct ClientBidiStreamHandle {
     write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
     lazy_send_stream: Mutex<Option<wtransport::SendStream>>,
     deferred_recv: Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
+    /// Terminal event a batch consumed while still holding bytes; see
+    /// [`TerminalLatch`].
+    deferred_terminal: TerminalLatch,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Mutex<Option<StreamBudget>>,
     deferred_budget: Mutex<Option<DeferredStreamBudgetConfig>>,
@@ -960,6 +1044,7 @@ impl ClientBidiStreamHandle {
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
             deferred_recv: Mutex::new(None),
+            deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(None),
@@ -996,6 +1081,7 @@ impl ClientBidiStreamHandle {
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
             deferred_recv: Mutex::new(None),
+            deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: Mutex::new(budget),
             deferred_budget: Mutex::new(None),
@@ -1022,6 +1108,7 @@ impl ClientBidiStreamHandle {
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
             deferred_recv: Mutex::new(None),
+            deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: Mutex::new(budget),
             deferred_budget: Mutex::new(None),
@@ -1051,6 +1138,7 @@ impl ClientBidiStreamHandle {
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
             deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(None),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(budget),
@@ -1104,6 +1192,11 @@ impl ClientBidiStreamHandle {
     async fn read_deferred_direct(
         &self,
     ) -> Result<Option<Option<crate::payload_buffer::PayloadBuffer>>> {
+        // A reset a batch already consumed is reported here too: mixing
+        // `read()` and `readBatch()` on one stream must not lose it.
+        if let Some(code) = self.deferred_terminal.get() {
+            return Err(wt_from_static_code(code));
+        }
         let pending = self
             .deferred_recv
             .lock()
@@ -1390,6 +1483,7 @@ impl ClientBidiStreamHandle {
                 deferred_budget: &self.deferred_budget,
                 read_abort: &self.read_abort,
                 read_aborted: &self.read_aborted,
+                deferred_terminal: &self.deferred_terminal,
             },
             max_bytes,
         )
@@ -1824,6 +1918,9 @@ pub struct ClientUniRecvHandle {
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     read_error_slot: Option<ReadErrorSlot>,
     deferred_recv: Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
+    /// Terminal event a batch consumed while still holding bytes; see
+    /// [`TerminalLatch`].
+    deferred_terminal: TerminalLatch,
     budget: Mutex<Option<StreamBudget>>,
     deferred_budget: Mutex<Option<DeferredStreamBudgetConfig>>,
     deferred_read_error_slot: Mutex<Option<ReadErrorSlot>>,
@@ -1842,6 +1939,7 @@ impl ClientUniRecvHandle {
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot: None,
             deferred_recv: Mutex::new(None),
+            deferred_terminal: TerminalLatch::default(),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(None),
             deferred_read_error_slot: Mutex::new(None),
@@ -1862,6 +1960,7 @@ impl ClientUniRecvHandle {
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot,
             deferred_recv: Mutex::new(None),
+            deferred_terminal: TerminalLatch::default(),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(None),
             deferred_read_error_slot: Mutex::new(None),
@@ -1884,6 +1983,7 @@ impl ClientUniRecvHandle {
             stop_tx: std::sync::Mutex::new(None),
             read_error_slot: None,
             deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            deferred_terminal: TerminalLatch::default(),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(budget),
             deferred_read_error_slot: Mutex::new(None),
@@ -1920,6 +2020,11 @@ impl ClientUniRecvHandle {
     async fn read_deferred_direct(
         &self,
     ) -> Result<Option<Option<crate::payload_buffer::PayloadBuffer>>> {
+        // A reset a batch already consumed is reported here too: mixing
+        // `read()` and `readBatch()` on one stream must not lose it.
+        if let Some(code) = self.deferred_terminal.get() {
+            return Err(wt_from_static_code(code));
+        }
         let pending = self
             .deferred_recv
             .lock()
@@ -2144,6 +2249,7 @@ impl ClientUniRecvHandle {
                 deferred_budget: &self.deferred_budget,
                 read_abort: &self.read_abort,
                 read_aborted: &self.read_aborted,
+                deferred_terminal: &self.deferred_terminal,
             },
             max_bytes,
         )
@@ -2955,6 +3061,46 @@ mod tests {
     fn poll_once_takes_a_ready_future_and_leaves_a_pending_one() {
         assert_eq!(poll_once(std::future::ready(7u32)), Some(7));
         assert_eq!(poll_once(std::future::pending::<u32>()), None);
+    }
+
+    // The batch loop originally matched only `Some(Ok(Some(chunk)))` and let
+    // every other shape fall into one `break`, which silently discarded a
+    // consumed `Err`. Each shape now has to say what it means on its own.
+    #[test]
+    fn a_batch_poll_that_consumed_an_error_reports_it_as_terminal() {
+        use wtransport::quinn::ReadError;
+
+        assert!(matches!(classify_batch_poll(None), BatchStep::Stop));
+        assert!(matches!(
+            classify_batch_poll(Some(Ok(None))),
+            BatchStep::Stop
+        ));
+
+        // The defect: a reset polled to completion is consumed, and quinn will
+        // never report it again, so dropping it here is the truncation.
+        let reset = ReadError::Reset(wtransport::quinn::VarInt::from_u32(42));
+        assert!(matches!(
+            classify_batch_poll(Some(Err(reset))),
+            BatchStep::Terminal("E_STREAM_RESET")
+        ));
+        assert!(matches!(
+            classify_batch_poll(Some(Err(ReadError::ClosedStream))),
+            BatchStep::Terminal("E_SESSION_CLOSED")
+        ));
+    }
+
+    // Sticky in the direction quinn is not: once a batch has consumed a
+    // terminal event, every later read must report it rather than a clean EOF.
+    #[test]
+    fn the_terminal_latch_keeps_the_first_code_forever() {
+        let latch = TerminalLatch::default();
+        assert_eq!(latch.get(), None);
+        latch.set("E_STREAM_RESET");
+        assert_eq!(latch.get(), Some("E_STREAM_RESET"));
+        // A later event cannot rewrite what the consumer is owed.
+        latch.set("E_SESSION_CLOSED");
+        assert_eq!(latch.get(), Some("E_STREAM_RESET"));
+        assert_eq!(latch.get(), Some("E_STREAM_RESET"));
     }
 
     // Coalescing must not reorder, pad, or drop bytes, and every chunk's
