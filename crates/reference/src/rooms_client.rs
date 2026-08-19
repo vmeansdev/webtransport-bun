@@ -118,6 +118,16 @@ struct Options {
     rooms: usize,
     /// Datagrams per second, per publisher.
     rate_per_sec: f64,
+    /// Frame ticks per second. A publisher emits `round(rate / tickHz)`
+    /// datagrams back to back on each tick, floored at one.
+    ///
+    /// This is not cosmetic. A video frame leaves an encoder as a burst of
+    /// packets, and it is that burst structure the per-room ingest-reality
+    /// falsifier looks for in the server's arrival times: `1 / perTick` of the
+    /// gaps are frame boundaries. A publisher that spread the same rate evenly
+    /// would make every gap a frame gap and fire V-I on every valid run — which
+    /// a local smoke of arm B did, before any dispatch.
+    tick_hz: f64,
     payload_bytes: usize,
     /// Seconds of steady drive. Connect and drain are outside it.
     duration_sec: f64,
@@ -142,6 +152,7 @@ impl Default for Options {
             subscribers_per_room: 10,
             rooms: 1,
             rate_per_sec: 50.0,
+            tick_hz: 50.0,
             payload_bytes: 128,
             duration_sec: 30.0,
             process_index: 0,
@@ -164,6 +175,18 @@ impl Default for Options {
 fn global_indices(base: usize, stride: usize, count: usize) -> Vec<usize> {
     let stride = stride.max(1);
     (0..count).map(|i| base + i * stride).collect()
+}
+
+/// Datagrams a publisher emits per frame tick: `round(rate / tickHz)`, floored
+/// at one — exactly what `datagramsPerTick` in `tools/load/egress-fanout.ts`
+/// computes, because the cadence falsifier's expected frame-gap fraction is
+/// `1 / perTick` and deriving it twice from different arithmetic is how a rule
+/// quietly stops matching the thing it tests.
+fn datagrams_per_tick(rate_per_sec: f64, tick_hz: f64) -> u64 {
+    if tick_hz <= 0.0 {
+        return 1;
+    }
+    ((rate_per_sec / tick_hz).round() as i64).max(1) as u64
 }
 
 /// Deterministic phase offset, in nanoseconds. `gate-g8-many-rooms.md` §1.6.
@@ -235,14 +258,14 @@ impl PublisherState {
         }
     }
 
-    fn to_json(&self, process_index: usize, rate_per_sec: f64) -> String {
+    fn to_json(&self, process_index: usize, rate_per_sec: f64, per_tick: u64) -> String {
         let drive_sec = self.drive_ns.load(Ordering::Relaxed) as f64 / 1e9;
         let sent = self.sent.load(Ordering::Relaxed);
         // The *effective* offered rate, quantisation-corrected: what this
         // publisher's own grid actually asked for over its own window. The spec
         // forbids labelling a rung with a nominal rate.
         let effective = if drive_sec > 0.0 {
-            (sent + self.ticks_skipped.load(Ordering::Relaxed)) as f64 / drive_sec
+            (sent + self.ticks_skipped.load(Ordering::Relaxed) * per_tick) as f64 / drive_sec
         } else {
             rate_per_sec
         };
@@ -454,6 +477,7 @@ fn parse_args() -> Options {
             }
             "--rooms" => o.rooms = parse_or_default("--rooms", args.next(), o.rooms).max(1),
             "--rate" => o.rate_per_sec = parse_or_default("--rate", args.next(), o.rate_per_sec),
+            "--tick-hz" => o.tick_hz = parse_or_default("--tick-hz", args.next(), o.tick_hz),
             "--payload-bytes" => {
                 o.payload_bytes = parse_or_default("--payload-bytes", args.next(), o.payload_bytes)
                     .max(STAMP_BYTES_V3)
@@ -496,11 +520,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     spawn_rss_guard();
 
     let indices = global_indices(options.index_base, options.index_stride, options.sessions);
-    let period_ns = if options.rate_per_sec > 0.0 {
-        (1e9 / options.rate_per_sec).round() as u64
+    // The grid is the *frame* grid, not the datagram grid.
+    let period_ns = if options.rate_per_sec > 0.0 && options.tick_hz > 0.0 {
+        (1e9 / options.tick_hz).round() as u64
     } else {
         0
     };
+    let per_tick = datagrams_per_tick(options.rate_per_sec, options.tick_hz);
 
     // One slot per room in the run, so a room this process happens not to serve
     // still reports a zero instead of being silently absent from the artifact.
@@ -550,7 +576,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         joins.push(tokio::spawn(async move {
             let _permit = gate.acquire().await;
             session_task(
-                endpoint, shared, options, global, room_id, publisher, sink, period_ns,
+                endpoint, shared, options, global, room_id, publisher, sink, period_ns, per_tick,
             )
             .await;
         }));
@@ -566,7 +592,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    emit_report(&options, &shared);
+    emit_report(&options, &shared, per_tick);
     // Explicit exit: a lingering endpoint task is how the egress driver used to
     // hang an arm forever (probe/egress-01, commit 1163a60).
     std::process::exit(0);
@@ -599,6 +625,7 @@ async fn session_task(
     publisher: Option<Arc<PublisherState>>,
     sink: Option<Arc<RoomSink>>,
     period_ns: u64,
+    per_tick: u64,
 ) {
     let connection = match tokio::time::timeout(JOIN_TIMEOUT, endpoint.connect(&options.url)).await
     {
@@ -646,6 +673,7 @@ async fn session_task(
             &options,
             global_index,
             period_ns,
+            per_tick,
             drive,
         )
         .await;
@@ -666,6 +694,7 @@ async fn publish_loop(
     options: &Options,
     global_index: usize,
     period_ns: u64,
+    per_tick: u64,
     drive: Duration,
 ) {
     if period_ns == 0 {
@@ -700,29 +729,35 @@ async fn publish_loop(
             continue;
         }
 
-        write_stamp_v3(
-            &mut payload,
-            intended_ns,
-            actual_ns,
-            sequence,
-            CLASS_ROOM_MEDIA,
-        );
-        match connection.send_datagram(&payload[..]) {
-            Ok(()) => {
-                state.sent.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                state.send_errors.fetch_add(1, Ordering::Relaxed);
-                if state.send_errors.load(Ordering::Relaxed) == 1 {
-                    eprintln!("rooms-client: send: {e}");
+        // One frame, `per_tick` datagrams, back to back — the burst a real
+        // encoder emits, and the structure the per-room cadence check reads.
+        for _ in 0..per_tick {
+            write_stamp_v3(
+                &mut payload,
+                intended_ns,
+                monotonic_ns(),
+                sequence,
+                CLASS_ROOM_MEDIA,
+            );
+            match connection.send_datagram(&payload[..]) {
+                Ok(()) => {
+                    state.sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    state.send_errors.fetch_add(1, Ordering::Relaxed);
+                    if state.send_errors.load(Ordering::Relaxed) == 1 {
+                        eprintln!("rooms-client: send: {e}");
+                    }
                 }
             }
+            sequence += 1;
         }
+        // One lag sample per *tick*: the quantity is how late the frame's grid
+        // slot was serviced, not how long the burst took to leave.
         state.send_events.fetch_add(1, Ordering::Relaxed);
         state
             .schedule_lag
             .record_signed(actual_ns as i64 - intended_ns as i64);
-        sequence += 1;
         n += 1;
     }
 
@@ -769,11 +804,11 @@ fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn emit_report(options: &Options, shared: &Shared) {
+fn emit_report(options: &Options, shared: &Shared, per_tick: u64) {
     let publishers = shared
         .publishers
         .iter()
-        .map(|p| p.to_json(options.process_index, options.rate_per_sec))
+        .map(|p| p.to_json(options.process_index, options.rate_per_sec, per_tick))
         .collect::<Vec<_>>()
         .join(",");
     let rooms = shared
@@ -798,13 +833,14 @@ fn emit_report(options: &Options, shared: &Shared) {
     let cpu = self_cpu_ms().unwrap_or(0.0);
     let rss = self_rss_mb().unwrap_or(0.0);
     let report = format!(
-        "{{\"role\":\"{}\",\"processIndex\":{},\"sessionsOpened\":{},\"sessionsFailed\":{},\"helloErrors\":{},\"durationSec\":{:.6},\"cpuMs\":{:.3},\"rssMb\":{:.2},\"publishers\":[{}],\"rooms\":[{}],\"errors\":[{}]}}",
+        "{{\"role\":\"{}\",\"processIndex\":{},\"sessionsOpened\":{},\"sessionsFailed\":{},\"helloErrors\":{},\"durationSec\":{:.6},\"datagramsPerTick\":{},\"cpuMs\":{:.3},\"rssMb\":{:.2},\"publishers\":[{}],\"rooms\":[{}],\"errors\":[{}]}}",
         options.role.label(),
         options.process_index,
         shared.sessions_opened.load(Ordering::Relaxed),
         shared.sessions_failed.load(Ordering::Relaxed),
         shared.hello_errors.load(Ordering::Relaxed),
         options.duration_sec,
+        per_tick,
         cpu,
         rss,
         publishers,

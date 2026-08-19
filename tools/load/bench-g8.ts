@@ -215,7 +215,9 @@ function resetConductor(
 	state.table = new RoomTable<SessionSink>();
 	state.roomStates = new Map();
 	state.nextHandle = 0;
-	state.framePeriodNs = (1000 / plan.ratePerSec) * 1e6;
+	// The *frame* period, not the datagram period: a gap at or above half a frame
+	// is a frame boundary, and at 11 datagrams to a frame the two differ by 11x.
+	state.framePeriodNs = plan.frameMs * 1e6;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -395,6 +397,11 @@ async function runRung(
 				String(plan.rooms),
 				"--rate",
 				String(plan.ratePerSec),
+				// The *frame* grid. A publisher emits `round(rate / tickHz)`
+				// datagrams per tick, which is what puts the frame structure V-I
+				// reads into the server's arrival times.
+				"--tick-hz",
+				String(1000 / plan.frameMs),
 				"--payload-bytes",
 				String(plan.payloadBytes),
 				"--duration-sec",

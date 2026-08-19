@@ -657,6 +657,42 @@ as such.
 
 ---
 
+## §9a — The publisher's per-frame burst, and the amendment that made it explicit
+
+**Amendment 1, made before any dispatch, on the strength of a local smoke and no
+G8 measurement.**
+
+§1.4 already described arm B's rate as "K4's quantised 11 datagrams/tick × 30 Hz
+form", but it never said in so many words that the *generator* has to emit that
+way, and the first harness did not: it ran a flat 330 Hz per-datagram grid.
+
+That is not a cosmetic difference. A video frame leaves an encoder as a burst of
+packets, and it is exactly that burst structure V-I looks for — the expected
+frame-gap fraction is `1 / perTick`, so at 11 datagrams to a frame 9.09% of the
+server's observed inter-arrival gaps should be frame boundaries. A publisher that
+spread the same rate evenly makes **every** gap a frame boundary, and a local
+smoke of arm B duly reported a frame-gap fraction of **0.99 against a band of
+[0.045, 0.182]** — V-I firing on a run where nothing was wrong. Registered as
+written and built as first built, arm B would have been INVALID on every dispatch
+for a reason that has nothing to do with the product.
+
+**Registered now, explicitly:** a publisher emits `round(rate ÷ tickHz)`
+datagrams back to back on each frame tick, floored at one — 1 per 20 ms tick for
+the voice arms, **11 per 33.3 ms tick** for arm B. The cumulative-deadline grid
+is the **frame** grid; the schedule-lag sample is one per *tick* (how late the
+frame's slot was serviced), not one per datagram. The server's frame-boundary
+threshold is half a **frame** period, which at 11 datagrams to a frame differs
+from half a datagram period by 11×.
+
+**No threshold moved.** The band, the floor and the provenance fraction are
+unchanged; what moved is the generator's shape, so the page's rule now reads the
+signature the page's arithmetic always described. After the fix the same smoke
+reported **0.0906 against an expected 0.0909**.
+
+This also puts arm B's controlled comparison with K5 on solid ground: G4's
+publisher was bursty per frame, and had G8's stayed flat, arm B would have
+differed from G4 in two variables rather than one.
+
 ## §10 — Amendment protocol
 
 Any change to this document after the first dispatch quotes the original text in
@@ -666,6 +702,38 @@ A rerun requires a declared, logged harness or infra fault (spec §Rerun policy)
 a miss on a valid run is final.
 
 ---
+
+## §10a — Dispatch plan
+
+One dispatch, on the heavy self-hosted runner, through the registered
+`bench-bandwidth` workflow (a new dispatch-only workflow is not registerable from
+a non-default branch, so G8 rides the existing one):
+
+    workflow: bench-bandwidth
+    ref:      probe/g8-many-rooms-01
+    inputs:   candidate_commit=<git rev-parse of the rebased probe head>
+              mode=g8-many-rooms
+              g8_arms=voice,video,mutual
+              g8_ladder_voice=10,50,100
+              g8_ladder_video=2,5,10
+              g8_ladder_mutual=2,5,10
+              g8_drive_seconds=60
+              g8_precheck_seconds=20
+
+Nine rungs, each preceded by its own standalone V-S pre-check, plus the routing
+microbench once before any arm. ≈ 20 min of runner wall clock at these windows.
+The workflow sets **populations, ladders and windows only** — no threshold is
+settable from the dispatch form.
+
+The artifact carries raw fields and no verdict. `bun tools/load/g8-report.ts
+<artifact>` recomputes every clause and falsifier off the runner and prints the
+verdict; the run also tees that output into the artifact bundle so the two can be
+compared.
+
+**Standing STOPs that apply without needing to be re-registered:** one CI run at
+a time on the heavy runner; the bench code must be in `candidate_commit`'s tree;
+candidate SHAs from `git rev-parse` / `git ls-remote` only; a miss on a valid run
+is final; a rerun requires a declared, logged harness or infra fault.
 
 ## §11 — Candidate composition and base
 
