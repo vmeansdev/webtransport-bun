@@ -711,6 +711,63 @@ exists. The change is enforced in `tools/load/g6-classify.ts`
 (`HotspotFacts.pathP50Ns` / `serverForwardDwellP50Ns`) and pinned by a unit test
 that asserts the dwell cannot fire the rule.
 
+## 11c. Dispatch plan — gated on the cable pre-flight artifact
+
+Nothing below runs until step 0 produces a green artifact. **No green same-day
+pre-flight at this gate's rates → no run.** That is the STOP, not a guideline.
+
+**Step 0 — cable day, on the Mac (human + ssh, ticket 29 §"What remains").**
+The runbook's ten steps, then:
+
+```
+bun tools/offbox/preflight.ts --peer <runner bench IP> --payload-bytes 1150 \
+    --out .bench-evidence/g6-preflight-<date>.json
+bun tools/offbox/preflight.ts --peer <runner bench IP> --payload-bytes 64 \
+    --out .bench-evidence/g6-preflight-up-<date>.json
+```
+
+Then, off-runner, evaluate **both** §8 requirements with
+`evaluatePreflight(artifact, requirement)` using
+`preflightRequirements()` from `tools/load/g6-plan.ts`. Record the negotiated
+link speed. **If R-down fails, stop and report; do not substitute a lower rung,
+a loopback path or the loadgen VM.**
+
+**Step 0b — the two same-day honesty arms on the Mac**, both required before
+the gate run and both evaluated by §7:
+
+* **floor arm (V-F)** — the realm role at a trivial rate, `--sessions 20`, on
+  the Mac, through the same `mac-generator-entry.sh` path the gate uses, checked
+  with `floorReportIsUsable(report, <mac host>)`. Report p99 **and** max.
+* **sink pre-check (V-S)** — Mac **loopback**, driving 1.5 × 77,500 ≈ 116,250
+  downstream pps into the subscriber shape. Loopback because the cable cannot
+  carry 1.5× the arm; the question is the sink's capability, not the wire's.
+
+**Step 1 — one dispatch**, `bench-bandwidth` workflow, ref `probe/g6-mmo-01`:
+
+| input | value |
+|---|---|
+| `candidate_commit` | the branch SHA from `git rev-parse`, never typed |
+| `mode` | `g6-mmo` |
+| `g6_arms` | `steady,hotspot,storm` |
+| `g6_ladder` | `500,2500,5000` |
+| `g6_steady_seconds` | `120` |
+| `g6_offbox_ssh` | the Mac's ssh destination — **empty is a wiring check, never a G6 result** |
+| `g6_server_address` | the runner's bench-subnet address |
+
+Expected runner wall clock ≈ 25 min: three steady rungs (~3.5 min each), the
+hotspot arm (~3.5 min), two storm arms (~5 min each), plus settle barriers.
+Inside the effort's remaining budget as one dispatch.
+
+**Step 2 — stamp.** Recompute every clause and every falsifier from the raw
+artifact with `g6-classify.ts`, never by reading a boolean out of it. Log the
+run in §12 whatever the outcome, including an abort. A miss is final.
+
+**What would make this run invalid before it starts,** in the order it is
+checked: no green same-day pre-flight (V-C) · a floor arm from the wrong day,
+the wrong host, or above 10 ms p99 (V-F) · no sink pre-check at 1.5× (V-S) ·
+`g6_offbox_ssh` empty, which is not a falsifier but is a disqualification: a
+co-resident generator is the confound the cable exists to remove.
+
 ## 12. Dispatch log
 
 Every dispatch of this gate, including aborted ones. A run that is not in this
