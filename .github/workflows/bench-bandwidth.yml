@@ -158,6 +158,10 @@ jobs:
           G10_WINDOW_SECONDS: ${{ github.event.inputs.g10_window_seconds }}
           G10_OFFBOX_SSH: ${{ github.event.inputs.g10_offbox_ssh }}
           G10_SERVER_ADDRESS: ${{ github.event.inputs.g10_server_address }}
+          # The Mac builds its own generator (ticket 29: a Linux runner cannot
+          # cross-build for macOS/arm64), so it needs the SHA to check out.
+          # `mac-generator-entry.sh` refuses a ref or an abbreviation.
+          G10_CANDIDATE: ${{ github.event.inputs.candidate_commit }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           # The fleet is 10,000 sessions; a low soft limit would look like a

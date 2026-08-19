@@ -19,7 +19,14 @@ path = "src/smoke_client.rs"
 name = "gso-probe"
 path = "src/gso_probe.rs"
 
+[[bin]]
+name = "broadcast-client"
+path = "src/broadcast_client.rs"
+
 [dependencies]
 wtransport = { workspace = true }
 quinn-udp = "0.5"
+# CLOCK_MONOTONIC by value. `Instant` is the same counter but hides it, and a
+# one-way measurement across two processes needs the value, not a duration.
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }

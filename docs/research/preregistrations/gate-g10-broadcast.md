@@ -6,11 +6,14 @@ before the Ethernet cable this gate depends on was characterized.
 **Ticket:** `.scratch/production-grade-scenarios/issues/35-gate-g10-broadcast.md`
 **Spec:** `.scratch/production-grade-scenarios/spec.md` rev 2 (§Process rules binding)
 **Branch:** `probe/g10-broadcast-01`
-**Base:** `rebind4-staging` @ `2a4145d0556a35f8b4a0849e5953927b5e028b64`
-(the `fix/lever-hardening-01` merge — the promise-free `trySendDatagram` fast
-path and the counted/one-deadline batch fixes are all in this tree). If
-`rebind4-staging` moves before dispatch, the candidate is **not** rebased
-silently: §11 says what happens instead.
+**Base:** `rebind4-staging` @ `9c475df1e255388abf4a07733164869f6377e0b7`
+(the `design/mirror-send-01` merge — M1's `sendDatagramMirror`, on top of the
+`fix/lever-hardening-01` merge that carries the promise-free send fast path and
+the counted/one-deadline batch fixes). **Amended from
+`2a4145d0556a35f8b4a0849e5953927b5e028b64`** under §11's own re-derivation rule;
+the rebase is recorded in §11.2. If `rebind4-staging` moves again before
+dispatch, the candidate is **not** rebased silently: §11 says what happens
+instead.
 
 **One-sentence statement of what this gate asks.** One small message, ten
 thousand subscribers, a moderate message rate: can this rig put every copy of a
@@ -814,6 +817,39 @@ The composition also decides C7's reach. Under Option C the stall instrument
 still runs and still produces A1's and A2's numbers — §1.11's obligation to
 *measure* the stall is not conditional on the mirror. Only P8 is.
 
+### 11.2 The composition that was taken — Option A, recorded
+
+**Option A.** `design/mirror-send-01` landed on `rebind4-staging` as
+`9c475df1e255388abf4a07733164869f6377e0b7` (the merge of `093e1cde565c`), and
+this branch was rebased onto it. No cherry-pick, no commit on a non-shipping
+branch, and nothing to disclose beyond the SHAs below.
+
+| | SHA |
+|---|---|
+| staging base **before** | `2a4145d0556a35f8b4a0849e5953927b5e028b64` |
+| staging base **after** (composed base) | `9c475df1e255388abf4a07733164869f6377e0b7` |
+| candidate **before** rebase | `574fbd9c09a876d41f6ce232a7a7b5dca3b65325` |
+| candidate **after** rebase | *from `git rev-parse` at dispatch; §12 records it* |
+
+The rebase replayed four commits with no conflicts and no content change. The
+pre-rebase head is named here so the tree that existed before composition stays
+reachable by SHA rather than only by reflog.
+
+**§11's own inspection requirement, discharged.** The diff between the two
+staging SHAs was read for anything touching the datagram send path, the batch
+path or the mirror entry point. It touches all three: `crates/native/session.rs`
+(+65/−14), `session_registry.rs`, the new `datagram_mirror.rs`, and
+`packages/webtransport/src/index.ts` (+61). That is K21 exactly — M1's commit
+refactors the single-datagram send path A1 and A2 themselves take — and it is
+the reason §11.1 forbids quoting an A2 number across compositions. Every arm in
+this run is measured on this one tree.
+
+**What A3 stops being.** Under Option A the mirror is present in every
+candidate, so `resolveArms` will never drop A3 on a real dispatch. The
+degradation path §2.3 registers is therefore exercised by a harness affordance
+(`G10_HIDE_MIRROR=1`, §11d) rather than by the composition, and remains the
+behaviour on a candidate that does not expose the entry point.
+
 ## 11a. Dispatch plan — gated on the cable pre-flight artifact
 
 Nothing below runs until step 0 produces a green artifact. **No green same-day
@@ -855,6 +891,11 @@ evaluated by §7:
 | `g10_offbox_ssh` | the Mac's ssh destination — **empty is a wiring check, never a G10 result** |
 | `g10_server_address` | the runner's bench-subnet address |
 
+`candidate_commit` is also what the workflow now passes to the Mac as
+`G10_CANDIDATE`: ticket 29's entry script checks that SHA out and builds the
+generator from it, and refuses a ref or an abbreviation (exit 3). The conductor
+makes the same refusal locally, before it spawns anything.
+
 Expected runner wall clock ≈ 15 min: three rungs × 120 s, plus a
 `sessionsActive → 0` drain barrier and a 15 s settle between rungs, plus the
 10,000-session establish ramp.
@@ -885,13 +926,44 @@ checking whether this gate may dispatch reads this table, not the commit log.
 | `.github/workflows/bench-bandwidth.yml` `mode: g10-broadcast` | the dispatch surface of §11a step 1 | built |
 | `tools/load/latency-stamp.ts` v4 (+ test) | §6.1's arm byte out of v3's reserved field — still 48 B — plus classes `BROADCAST`/`PROBE`/`PROBE_ECHO`, additively: v1–v3 decode exactly as before | built, validated off-runner |
 | `tools/load/latency-histogram.ts` | the shared log-linear histogram every percentile in this gate is computed by, unchanged from the gate that introduced it | vendored onto this branch |
-| `crates/reference/src/broadcast_client.rs` | the Rust subscriber role the Mac runs: 10,000 sessions, per-sequence receive stamps, the probe cohort's own loop, the spread histogram, the v4 stamp's reader | **NOT BUILT** |
-| `crates/reference/src/latency_probe.rs` v4 | the Rust half of the stamp — the arm byte on the subscriber's side | **NOT BUILT** |
+| `crates/reference/src/broadcast_client.rs` | the Rust subscriber role the Mac runs: 10,000 sessions, per-sequence receive stamps, the probe cohort's own loop, the spread histogram, the v4 stamp's reader | built, validated off-runner (§11d) — **exercised end to end** against the conductor over loopback |
+| `crates/reference/src/latency_probe.rs` v4 | the Rust half of the stamp — the arm byte on the subscriber's side, `ARM_NONE = 0` guarding a version-3 payload out of A1's samples | built, validated off-runner |
+| `tools/load/g10-offbox.ts` (+ test) | the ssh invocation, with every refusal `mac-generator-entry.sh` makes mirrored as a check performed *before* the spawn | built, validated off-runner |
 | `tools/offbox/preflight.ts` + `preflight-lib.ts` | ticket 29's cable pre-flight, which §8's STOP calls | **NOT ON THIS BRANCH** — it lives on `prep/mac-generator-01` and arrives with ticket 29's landing |
+| `tools/offbox/mac-generator-entry.sh` `--bin` | the entry script hard-codes `load-client`; G10's far end is `broadcast-client` | **NOT ON THIS BRANCH, AND NOT YET IN THE CONTRACT** — ticket 29 owes the flag. The conductor emits `--bin broadcast-client` and today's script rejects it as an unknown argument (exit 3), which is deliberate: omitting it would build and run the *wrong binary* on the Mac |
 
 **No part of this gate dispatches while any row above says NOT BUILT or NOT ON
-THIS BRANCH.** The two missing pieces are exactly the two a cable and a Mac
-validate, which is why they were left rather than written blind.
+THIS BRANCH.** Both remaining rows belong to ticket 29 and land with it: the
+pre-flight §8's STOP calls, and the one-flag extension the entry script needs to
+run a binary other than `load-client`.
+
+**Three defects the Rust half found in the conductor**, recorded because they
+were all invisible to a harness with no far end:
+
+1. **C4 read its sessions after the fleet had already gone.** `sessionsActive`
+   was sampled after `await pumped`, which resolves when the subscriber process
+   *exits*. The clause would have read ~0 and failed on every valid run. The
+   snapshot now happens immediately after the emitter stops, which is what "at
+   arm end" means.
+2. **V-N, V-K, V-D and V-G were computed over nothing that mattered.** The only
+   histogram the conductor fed them was its own stall histogram — the spread,
+   the RTT and the probe lag, all of which are computed on the Mac and all of
+   which this gate takes percentiles from, had no denominator check at all, and
+   V-G had no offered ratio to read. All four now read the far end's fragments.
+3. **Probe echoes taken while nothing was emitting were attributed to the last
+   arm.** The probe grid runs through the establish ramp and the drain grace, so
+   whichever arm was last collected a block of RTT and lag samples measured
+   under *no broadcast load* — and V-A compares that lag percentile across arms.
+   In an 18 s three-arm smoke it was 490 of 1,345 echoes, all on A3, whose
+   `probeEchoes` read 744 against A1's 310. The server now stamps `ARM_NONE`
+   whenever no arm is emitting, and the count of unattributed echoes is
+   disclosed rather than merely excluded.
+
+**C2b is divided on the runner, not on the Mac.** The subscriber role reports the
+*distribution* of per-subscriber receive counts and never a ratio, because it
+cannot know how many broadcasts it failed to receive; the emitter's own
+`broadcastsIssued` is the denominator. `messagesIssued` is absent from its report
+by design, so the conductor cannot accidentally use a self-flattering one.
 
 ## 11c. Amendment log
 
@@ -912,15 +984,38 @@ Run on the maintainer's macOS arm64 box, before the first dispatch:
 
 | command | outcome |
 |---|---|
-| `bun test tools/load/` | 221 pass, 0 fail |
+| `bun test tools/load/` | 232 pass, 0 fail |
+| `cargo test -p reference` | 43 pass, 0 fail |
+| `cargo clippy -p reference --all-targets` | clean |
 | `bun run typecheck` | clean |
 | `bunx biome check tools/load/g10-*.ts tools/load/bench-g10.ts tools/load/latency-stamp*.ts` | clean |
-| `G10_SMOKE=1 G10_SMOKE_FLEET=24 G10_RATE_LADDER=5 G10_ARMS=A1,A2,A3 G10_WINDOW_SECONDS=8 bun tools/load/bench-g10.ts` | conductor ran end to end: A3 resolved absent and the gate degraded to two arms with the registered warning; 40 broadcasts, 960 send attempts, the ledger closed; all eight clauses evaluated on both arms; both stall instruments recorded |
+
+The smoke was run in **three arms**, because after composition option A the
+mirror is always present and one invocation can no longer reach every path.
+All three used `G10_SMOKE=1 G10_SMOKE_FLEET=24 G10_RATE_LADDER=5
+G10_ARMS=A1,A2,A3 G10_BLOCK_MS=3000` so that six 3 s blocks fit inside the
+window and every arm actually emits — the earlier 8 s/10 s-block smoke gave
+every broadcast to A1 and reported the other arms as zero.
+
+| smoke | what it reaches | outcome |
+|---|---|---|
+| **1 — mirror present** | `G10_WINDOW_SECONDS=18` | three arms ran; A3 issued 30 broadcasts through `sendDatagramMirror`; `mirrorStall` measured 1.399 ms against the 0.002 ms mutex-free microbench floor — P8's ≥ 2× would have held at 677× on a laptop |
+| **2 — option C** | `G10_HIDE_MIRROR=1 G10_WINDOW_SECONDS=12` | `armsRun = ["A1","A2"]`, `armsDropped = ["A3"]`, the registered §2.3 warning in the artifact, the run continued, P3 and P8 scored `NOT-RUN` |
+| **3 — the Rust fleet** | `G10_SMOKE_RUST=1 G10_WINDOW_SECONDS=18` | `broadcast-client` at the far end over loopback: 24/24 sessions, 0 undecodable, 0 sequence overflow, 0 unattributed copies, `offeredRatio` 1.0, all three arms' spread/RTT/probe-lag histograms present with `negative` 0 and `count == recordedTotal`; V-N, V-K, V-D and V-G all computed and none fired; V-A and V-L fired, as a co-resident laptop should make them |
+
+**Two of those smokes exist only because of a harness affordance**, and both are
+named in the code: `G10_HIDE_MIRROR=1` simulates a candidate with no mirror
+entry point, and `G10_SMOKE_RUST=1` puts the real subscriber binary at the far
+end of a loopback smoke. Neither changes anything a run is scored against; the
+first makes option C testable now that composition A has made it unreachable,
+and the second is the only way the two halves of the v4 stamp meet before the
+cable does.
 
 **What the smoke proves.** That the conductor's wiring works: arm resolution,
 the interleave, the deadline-aimed emitter, the stamp, the probe echo path, the
-per-arm ledger, both stall instruments, the falsifiers and the artifact. Nothing
-else.
+per-arm ledger, both stall instruments, the falsifiers and the artifact — and
+now also that the Rust subscriber role speaks the same wire and produces the
+report shape the conductor parses. Nothing else.
 
 **What it does not prove, and this is the larger half.** No number it printed is
 a result — the fleet was 24 rather than 10,000, the subscribers were co-resident
@@ -929,8 +1024,10 @@ the runner. **Local macOS smoke output is never a result** (§10), and the
 artifact it writes carries that sentence in a field so a stray copy cannot be
 mistaken for one.
 
-**Two defects the smoke caught**, recorded because a passing smoke that found
-nothing would have been the less useful outcome:
+**Five defects the smoke caught**, recorded because a passing smoke that found
+nothing would have been the less useful outcome. The first two came from the
+conductor's own first run; the last three needed a real far end and are written
+up in §11b:
 
 1. Clauses **C2b and C6 were never evaluated** by the conductor. Every other
    clause was, so the artifact looked complete. A gate can only miss a clause it
@@ -940,6 +1037,14 @@ nothing would have been the less useful outcome:
    of its own poll granularity. C6 reads that lag and V-A compares it across
    arms; the instrument would have been reporting itself. Deadline-aimed
    re-arming brought it to 2–4 ms on an unquiesced laptop.
+3. **C4 sampled `sessionsActive` after the fleet had exited** — a clause that
+   would have failed on every valid run (§11b).
+4. **Four falsifiers read only the server's own histogram**, leaving the spread,
+   the RTT and the probe lag with no denominator check and V-G with no offered
+   ratio (§11b).
+5. **Probe echoes from the ramp and the drain were attributed to the last arm**,
+   handing it hundreds of samples measured under no broadcast load — the exact
+   percentile V-A compares across arms (§11b).
 
 ## 12. Dispatch log
 

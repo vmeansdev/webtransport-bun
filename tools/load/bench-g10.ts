@@ -50,6 +50,7 @@ import {
 	type ArmClauses,
 	type ArmId,
 	armComparabilityFalsifier,
+	denominatorFalsifier,
 	evaluateEmitterHonesty,
 	evaluateFleetDelivery,
 	evaluateLedger,
@@ -59,6 +60,7 @@ import {
 	evaluateSpreadClause,
 	evaluateStall,
 	gateVerdict,
+	generatorFalsifier,
 	leverStatement,
 	loopLagSamplerFalsifier,
 	negativeFalsifier,
@@ -76,9 +78,15 @@ import {
 	startLoopLagSampler,
 } from "./g10-emitter.ts";
 import {
+	offboxDeadlineSeconds,
+	offboxInvocation,
+	parseMacgenLine,
+} from "./g10-offbox.ts";
+import {
 	A2_CHUNK_TARGETS,
 	armShape,
 	DATAGRAM_MIRROR_MAX,
+	DELIVERY_FLOOR,
 	GATE_RATE,
 	JS_STALL_BUDGET_MS,
 	LOOP_LAG_SAMPLE_MS,
@@ -95,6 +103,7 @@ import {
 	ARM_A1,
 	ARM_A2,
 	ARM_A3,
+	ARM_NONE,
 	CLASS_BROADCAST,
 	CLASS_PROBE,
 	CLASS_PROBE_ECHO,
@@ -133,6 +142,12 @@ const SAMPLE_INTERVAL_MS = Number.parseInt(
 );
 const OFFBOX_SSH = process.env.G10_OFFBOX_SSH ?? "";
 const SERVER_ADDRESS = process.env.G10_SERVER_ADDRESS ?? "10.99.0.2";
+/**
+ * The candidate SHA the Mac checks out and builds. Required for an off-box run
+ * — `mac-generator-entry.sh` refuses without it — and unused when the fleet is
+ * co-resident, which is a wiring check rather than a run (§11a).
+ */
+const CANDIDATE = process.env.G10_CANDIDATE ?? "";
 const ESTABLISH_TIMEOUT_S = Number.parseInt(
 	process.env.G10_ESTABLISH_TIMEOUT_S ?? "300",
 	10,
@@ -150,6 +165,26 @@ const SMOKE = process.env.G10_SMOKE === "1";
 const FLEET = SMOKE
 	? Number.parseInt(process.env.G10_SMOKE_FLEET ?? "40", 10)
 	: SUBSCRIBERS;
+
+/**
+ * Smoke affordances, both of which exist to exercise a path the composition
+ * would otherwise hide, and neither of which changes anything a run is scored
+ * against.
+ *
+ * `G10_SMOKE_RUST=1` puts the real `broadcast-client` at the far end of a
+ * loopback smoke, at the smoke fleet size. Without it a laptop never runs the
+ * Rust subscriber role at all, and the wire contract between the two halves of
+ * the v4 stamp — and the report shape the conductor parses — would first be
+ * exercised on the cable, which is the worst place to find out they disagree.
+ *
+ * `G10_HIDE_MIRROR=1` makes the conductor behave as though the candidate does
+ * not expose `sendDatagramMirror`, which is composition option C (§11.1). With
+ * M1 landed on staging the mirror is now always present, so the degradation path
+ * — A3 dropped with a warning, `armsRun = ["A1","A2"]`, the run continuing —
+ * would otherwise be untestable end to end on this branch.
+ */
+const SMOKE_RUST = SMOKE && process.env.G10_SMOKE_RUST === "1";
+const HIDE_MIRROR = process.env.G10_HIDE_MIRROR === "1";
 
 const OUT_JSON = process.env.G10_OUT ?? join(ROOT, "tools/load/bench-g10.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
@@ -281,27 +316,113 @@ type Subscriber = {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * What `crates/reference/src/broadcast_client.rs` prints, and the one field it
+ * deliberately does not.
+ *
+ * `messagesIssued` is absent by design. The subscriber role cannot know it — a
+ * broadcast no subscriber received leaves no trace on the Mac — and reporting
+ * the sequences it happened to see would turn a total delivery failure into a
+ * completeness success. The emitter's own `broadcastsIssued` is the denominator,
+ * and the field stays optional so that it is used.
+ *
+ * `subscriberReceivedCounts` is the *distribution* of per-subscriber receive
+ * counts (`{"<received>": <subscribers>}`, every session present including the
+ * ones that got nothing). C2b is divided here rather than there, against the
+ * count the emitter issued, for the same reason.
+ */
+type OffboxArmReport = {
+	messagesIssued?: number;
+	messagesObserved?: number;
+	messagesComplete?: number;
+	received?: number;
+	spreadP99Ms?: number | null;
+	spreadHistogram?: HistogramFragment;
+	rttP99Ms?: number | null;
+	rttHistogram?: HistogramFragment;
+	probeEchoes?: number;
+	probeLagP99Ms?: number | null;
+	probeLagHistogram?: HistogramFragment;
+	offeredRatio?: number;
+	subscriberReceivedCounts?: Record<string, number>;
+	subscribersMeetingFloor?: number;
+	worstSubscriberRatio?: number;
+	negativeSamples?: number;
+};
+
+type HistogramFragment = {
+	count?: number;
+	recordedTotal?: number;
+	negative?: number;
+};
+
 type OffboxReport = {
 	sessions?: number;
+	sessionsFailed?: number;
+	sessionsLost?: number;
+	sessionsAliveAtEnd?: number;
+	undecodable?: number;
+	sequenceOverflow?: number;
+	unattributedReceived?: number;
+	probeSent?: number;
+	probeIntended?: number;
+	offeredRatio?: number | null;
 	/** Smoke path only. Never a rung, never a clause input beyond delivery. */
 	smokeDelivery?: { received: number; unstamped: number; subscribers: number };
-	perArm?: Record<
-		string,
-		{
-			messagesIssued?: number;
-			messagesComplete?: number;
-			received?: number;
-			spreadP99Ms?: number;
-			spreadHistogram?: unknown;
-			rttP99Ms?: number;
-			probeLagP99Ms?: number;
-			offeredRatio?: number;
-			subscribersMeetingFloor?: number;
-			worstSubscriberRatio?: number;
-			negativeSamples?: number;
-		}
-	>;
+	perArm?: Record<string, OffboxArmReport>;
 };
+
+/**
+ * C2b's two numbers, computed here from the Mac's distribution and the emitter's
+ * own issue count — never from a ratio the far end divided for us.
+ */
+function perSubscriberDelivery(
+	counts: Record<string, number> | undefined,
+	messagesIssued: number,
+	subscribers: number,
+): { subscribersMeetingFloor: number; worstSubscriberRatio: number | null } {
+	if (!counts || messagesIssued <= 0) {
+		return { subscribersMeetingFloor: 0, worstSubscriberRatio: null };
+	}
+	let meeting = 0;
+	let worst: number | null = null;
+	let reported = 0;
+	for (const [received, sessions] of Object.entries(counts)) {
+		const ratio = Number(received) / messagesIssued;
+		reported += sessions;
+		if (ratio >= DELIVERY_FLOOR) meeting += sessions;
+		if (worst === null || ratio < worst) worst = ratio;
+	}
+	// A subscriber missing from the distribution is a subscriber that cannot
+	// fail C2b, which is the defect the clause exists for. Absent sessions are
+	// counted as having received nothing.
+	if (reported < subscribers) worst = 0;
+	return { subscribersMeetingFloor: meeting, worstSubscriberRatio: worst };
+}
+
+/** A histogram fragment the far end wrote, in the shape the falsifiers read. */
+function offboxHistogramFacts(
+	name: string,
+	fragment: HistogramFragment | undefined,
+	deliveredOnPath: number,
+): {
+	name: string;
+	count: number;
+	recordedTotal: number;
+	negative: number;
+	deliveredOnPath: number;
+	unstamped: number;
+} | null {
+	if (!fragment) return null;
+	return {
+		name,
+		count: fragment.count ?? 0,
+		recordedTotal: fragment.recordedTotal ?? 0,
+		negative: fragment.negative ?? 0,
+		deliveredOnPath,
+		unstamped: 0,
+	};
+}
 
 type SpawnedClient = {
 	child: ChildProcess | null;
@@ -403,36 +524,22 @@ async function startSmokeFleet(port: number): Promise<SpawnedClient> {
  * wiring check that can never be a G10 result — the artifact carries the flag
  * and the workflow warns.
  */
-function spawnSubscribers(rate: number): SpawnedClient {
-	const args = [
-		"--url",
-		`https://${OFFBOX_SSH ? SERVER_ADDRESS : "127.0.0.1"}:${PORT}`,
-		"--sessions",
-		String(FLEET),
-		"--probe-cohort",
-		String(SMOKE ? Math.min(PROBE_COHORT, FLEET) : PROBE_COHORT),
-		"--probe-hz",
-		String(PROBE_HZ),
-		"--payload-bytes",
-		String(MESSAGE_PAYLOAD_BYTES),
-		"--rate",
-		String(rate),
-		"--seconds",
-		String(WINDOW_SECONDS),
-	];
-	const [cmd, cmdArgs] = OFFBOX_SSH
-		? ([
-				"ssh",
-				[
-					"-o",
-					"BatchMode=yes",
-					OFFBOX_SSH,
-					"tools/offbox/mac-generator-entry.sh",
-					"--",
-					...args,
-				],
-			] as const)
-		: ([CLIENT_BIN, args] as const);
+function spawnSubscribers(rate: number, port: number): SpawnedClient {
+	const { cmd, args: cmdArgs } = offboxInvocation({
+		ssh: OFFBOX_SSH,
+		candidate: CANDIDATE,
+		deadlineSeconds: offboxDeadlineSeconds(WINDOW_SECONDS, ESTABLISH_TIMEOUT_S),
+		localBin: CLIENT_BIN,
+		subscriber: {
+			url: `https://${OFFBOX_SSH ? SERVER_ADDRESS : "127.0.0.1"}:${OFFBOX_SSH ? PORT : port}`,
+			sessions: FLEET,
+			probeCohort: SMOKE ? Math.min(PROBE_COHORT, FLEET) : PROBE_COHORT,
+			probeHz: PROBE_HZ,
+			payloadBytes: MESSAGE_PAYLOAD_BYTES,
+			rate,
+			seconds: WINDOW_SECONDS,
+		},
+	});
 	const child = spawn(cmd, [...cmdArgs], {
 		cwd: ROOT,
 		stdio: ["ignore", "pipe", "pipe"],
@@ -445,6 +552,9 @@ function spawnSubscribers(rate: number): SpawnedClient {
 	});
 	return { child, exited };
 }
+
+/** Provenance the entry script prints: which tree the Mac's generator came from. */
+const macgen: Record<string, string> = {};
 
 async function pumpSubscribers(
 	client: SpawnedClient,
@@ -460,6 +570,7 @@ async function pumpSubscribers(
 		buffered = lines.pop() ?? "";
 		for (const line of lines) {
 			onLine(line);
+			Object.assign(macgen, parseMacgenLine(line) ?? {});
 			const match = line.match(/^broadcast-client: json (\{.*\})$/);
 			if (match?.[1]) report = JSON.parse(match[1]) as OffboxReport;
 		}
@@ -475,7 +586,7 @@ async function main(): Promise<void> {
 	if (LADDER.length === 0) throw new Error("G10_RATE_LADDER parsed empty");
 	if (REQUESTED_ARMS.length === 0) throw new Error("G10_ARMS parsed empty");
 
-	if (!SMOKE) {
+	if (!SMOKE || SMOKE_RUST) {
 		console.log("bench-g10: building broadcast-client (release)...");
 		try {
 			await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin broadcast-client --release`.quiet();
@@ -504,6 +615,19 @@ async function main(): Promise<void> {
 	const byId = new Map<string, Subscriber>();
 	let arms: ArmState[] = [];
 	let currentArm: ArmId = REQUESTED_ARMS[0] as ArmId;
+	/**
+	 * The arm byte the server stamps into a probe echo — and `ARM_NONE` whenever
+	 * no arm is emitting.
+	 *
+	 * It is deliberately not `ARM_BYTE[currentArm]`. Probes keep their grid
+	 * running through the establish ramp and the drain grace, and an echo taken
+	 * while nothing is broadcasting is an RTT measured under no load. Attributing
+	 * those to whichever arm happened to be last would hand that arm a block of
+	 * flattering samples — and V-A compares exactly that percentile across arms.
+	 * Unattributed echoes land in the subscriber role`s arm-0 slot, which no
+	 * per-arm percentile reads.
+	 */
+	let echoArmByte: number = ARM_NONE;
 	const armState = (): ArmState => {
 		const found = arms.find((a) => a.arm === currentArm);
 		if (!found) throw new Error(`no state for arm ${currentArm}`);
@@ -571,7 +695,7 @@ async function main(): Promise<void> {
 						holdNs: hold,
 						klass: CLASS_PROBE_ECHO,
 						sequence: stamp.sequence,
-						arm: ARM_BYTE[currentArm],
+						arm: echoArmByte,
 					});
 					if (!echoed) continue;
 					if (subscriber.send(datagram) === "ok") state.probeEchoes += 1;
@@ -585,17 +709,19 @@ async function main(): Promise<void> {
 			(SMOKE ? " — SMOKE RUN, never a result" : ""),
 	);
 
-	const mirrorEntry = (
-		server as unknown as {
-			sendDatagramMirror?: (
-				targets: string[],
-				payload: Uint8Array,
-			) => {
-				sent: number;
-				failures: readonly { index: number; error?: { code?: string } }[];
-			};
-		}
-	).sendDatagramMirror;
+	const mirrorEntry = HIDE_MIRROR
+		? undefined
+		: (
+				server as unknown as {
+					sendDatagramMirror?: (
+						targets: string[],
+						payload: Uint8Array,
+					) => {
+						sent: number;
+						failures: readonly { index: number; error?: { code?: string } }[];
+					};
+				}
+			).sendDatagramMirror;
 
 	const transport: EmitterTransport = {
 		trySend: (target, payload) => {
@@ -650,6 +776,10 @@ async function main(): Promise<void> {
 				? "co-resident subscribers: a wiring check, never a G10 result (prereg §11a)"
 				: null,
 		host: { platform: process.platform, cores: navigator.hardwareConcurrency },
+		candidate: CANDIDATE,
+		// Ticket 29's provenance: the Mac builds its own binary, so which tree the
+		// generator came from stops being obvious and has to be reported.
+		generator: macgen,
 		fleet: FLEET,
 		payloadBytes: MESSAGE_PAYLOAD_BYTES,
 		stampBytes: STAMP_BYTES_V4,
@@ -684,9 +814,10 @@ async function main(): Promise<void> {
 				`${rungShape.spreadClauseApplies ? "applies" : "N/A (§1.6)"}`,
 		);
 
-		const client = SMOKE
-			? await startSmokeFleet(server.address.port)
-			: spawnSubscribers(rate);
+		const client =
+			SMOKE && !SMOKE_RUST
+				? await startSmokeFleet(server.address.port)
+				: spawnSubscribers(rate, server.address.port);
 		const pumped = pumpSubscribers(client, (line) => {
 			if (line.trim()) console.log(`  [sub] ${line}`);
 		});
@@ -709,10 +840,14 @@ async function main(): Promise<void> {
 		sampler.stop();
 		const loopTicks = stopSampler();
 		const kernelAfter = readKernelUdp();
+		// C4 asks how many subscribers were still there **at arm end**, so the
+		// snapshot is taken here — before the fleet is asked to go away. Taken
+		// after the drain it would read zero on every valid run, which is a
+		// clause that always fails rather than a clause.
+		const sessionsActive = server.metricsSnapshot().sessionsActive;
 
 		if (client.smoke) await client.smoke.stop();
 		const report = await pumped;
-		const sessionsActive = server.metricsSnapshot().sessionsActive;
 
 		return summarize(
 			rate,
@@ -765,6 +900,7 @@ async function main(): Promise<void> {
 			const nowMs = Date.now();
 			const armId = armForElapsed(nowMs - startedMs, resolution.arms, BLOCK_MS);
 			currentArm = armId;
+			echoArmByte = ARM_BYTE[armId];
 			const state = armState();
 			if (inFlight) {
 				// The previous fan-out has not finished. Skipping is counted, never
@@ -823,6 +959,7 @@ async function main(): Promise<void> {
 		return {
 			stop: () => {
 				stopped = true;
+				echoArmByte = ARM_NONE;
 				if (timer !== null) clearTimeout(timer);
 			},
 		};
@@ -884,31 +1021,38 @@ async function main(): Promise<void> {
 		});
 		const perArm = resolution.arms.map((arm) => {
 			const state = arms.find((a) => a.arm === arm) as ArmState;
-			const offbox = report?.perArm?.[arm] ?? {};
+			const offbox: OffboxArmReport = report?.perArm?.[arm] ?? {};
 			const stallP99Ms =
 				state.stall.count > 0 ? state.stall.percentile(0.99) / 1e6 : null;
+			// The emitter's own count is the denominator: the far end cannot know
+			// how many broadcasts it never received.
+			const messagesIssued = offbox.messagesIssued ?? state.broadcastsIssued;
+			const perSubscriber = offbox.subscriberReceivedCounts
+				? perSubscriberDelivery(
+						offbox.subscriberReceivedCounts,
+						messagesIssued,
+						FLEET,
+					)
+				: {
+						subscribersMeetingFloor: offbox.subscribersMeetingFloor ?? 0,
+						worstSubscriberRatio: offbox.worstSubscriberRatio ?? null,
+					};
+			const delivery = {
+				received: offbox.received ?? 0,
+				messagesIssued,
+				subscribers: FLEET,
+				...perSubscriber,
+			};
 			const clauses = [
 				evaluateSpreadClause({
 					rate,
 					subscribers: FLEET,
 					spreadP99Ms: offbox.spreadP99Ms ?? null,
-					messagesIssued: offbox.messagesIssued ?? state.broadcastsIssued,
+					messagesIssued,
 					messagesComplete: offbox.messagesComplete ?? 0,
 				}),
-				evaluateFleetDelivery({
-					received: offbox.received ?? 0,
-					messagesIssued: offbox.messagesIssued ?? state.broadcastsIssued,
-					subscribers: FLEET,
-					subscribersMeetingFloor: offbox.subscribersMeetingFloor ?? 0,
-					worstSubscriberRatio: offbox.worstSubscriberRatio ?? null,
-				}),
-				evaluatePerSubscriberDelivery({
-					received: offbox.received ?? 0,
-					messagesIssued: offbox.messagesIssued ?? state.broadcastsIssued,
-					subscribers: FLEET,
-					subscribersMeetingFloor: offbox.subscribersMeetingFloor ?? 0,
-					worstSubscriberRatio: offbox.worstSubscriberRatio ?? null,
-				}),
+				evaluateFleetDelivery(delivery),
+				evaluatePerSubscriberDelivery(delivery),
 				evaluateRtt({
 					rttP99Ms: offbox.rttP99Ms ?? null,
 					holdP99Ms:
@@ -967,6 +1111,8 @@ async function main(): Promise<void> {
 						: null,
 				holdP99Ms:
 					state.hold.count > 0 ? state.hold.percentile(0.99) / 1e6 : null,
+				messagesIssued,
+				perSubscriber,
 				offbox,
 				clauses,
 			};
@@ -975,8 +1121,7 @@ async function main(): Promise<void> {
 		const vA = armComparabilityFalsifier(
 			perArm.map((a) => ({
 				arm: a.arm,
-				probeLagP99Ms:
-					(a.offbox as { probeLagP99Ms?: number }).probeLagP99Ms ?? null,
+				probeLagP99Ms: a.offbox.probeLagP99Ms ?? null,
 				emitterLagP99Ms: a.handoffLagP99Ms,
 			})),
 		);
@@ -984,14 +1129,47 @@ async function main(): Promise<void> {
 			arm: a.arm,
 			clauses: a.clauses,
 		}));
-		const hists = perArm.map((a) => ({
-			name: `${a.arm}.stall`,
-			count: a.stallHistogram.count,
-			recordedTotal: a.stallHistogram.recordedTotal,
-			negative: a.stallHistogram.negative,
-			deliveredOnPath: a.broadcastsIssued,
-			unstamped: 0,
-		}));
+		// V-N, V-K and V-D read *every* histogram this gate takes a percentile
+		// from, which includes the two the Mac computed. Reading only the
+		// server-side stall histogram would leave the spread — this gate's
+		// headline metric — with no denominator check at all.
+		const hists = [
+			...perArm.map((a) => ({
+				name: `${a.arm}.stall`,
+				count: a.stallHistogram.count,
+				recordedTotal: a.stallHistogram.recordedTotal,
+				negative: a.stallHistogram.negative,
+				deliveredOnPath: a.broadcastsIssued,
+				unstamped: 0,
+			})),
+			...perArm.flatMap((a) =>
+				[
+					offboxHistogramFacts(
+						`${a.arm}.spread`,
+						a.offbox.spreadHistogram,
+						a.offbox.messagesComplete ?? 0,
+					),
+					offboxHistogramFacts(
+						`${a.arm}.rtt`,
+						a.offbox.rttHistogram,
+						a.offbox.probeEchoes ?? 0,
+					),
+					offboxHistogramFacts(
+						`${a.arm}.probeLag`,
+						a.offbox.probeLagHistogram,
+						// A lag sample exists only for an echo this process matched to
+						// its own send, so unmatched echoes are the gap and are
+						// disclosed rather than folded in.
+						a.offbox.probeLagHistogram?.count ?? 0,
+					),
+				].filter((h) => h !== null),
+			),
+		];
+		// V-G. The Mac is a new generator host, and the probe grid is the only
+		// generator this gate has on it.
+		const vG = generatorFalsifier(
+			typeof report?.offeredRatio === "number" ? [report.offeredRatio] : [],
+		);
 
 		return {
 			rate,
@@ -1017,14 +1195,16 @@ async function main(): Promise<void> {
 			falsifiers: {
 				"V-A": vA,
 				"V-L": vL,
+				"V-G": vG,
 				"V-N": negativeFalsifier(hists),
 				"V-K": skewFalsifier(hists),
+				"V-D": denominatorFalsifier(hists),
 			},
+			histograms: hists,
 			lever: leverStatement(
 				perArm.map((a) => ({
 					arm: a.arm,
-					spreadP99Ms:
-						(a.offbox as { spreadP99Ms?: number }).spreadP99Ms ?? null,
+					spreadP99Ms: a.offbox.spreadP99Ms ?? null,
 				})),
 				vA.fires,
 			),
