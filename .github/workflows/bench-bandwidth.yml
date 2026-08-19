@@ -94,6 +94,31 @@ on:
         required: false
         default: "16500"
         type: string
+      egress_gate:
+        description: "Run gate G3 (three-arm interleaved comparison at one rung) instead of the egress ladder and fan-out"
+        required: false
+        default: "false"
+        type: string
+      egress_gate_emitters:
+        description: "Originator arms G3 puts in every block: serial,pipelined,batch"
+        required: false
+        default: "serial,pipelined,batch"
+        type: string
+      egress_gate_profiles:
+        description: "Burst profiles G3 puts in every block (the second one is the alignment comparison)"
+        required: false
+        default: "frame-bursty,keyframe-aligned"
+        type: string
+      egress_gate_blocks:
+        description: "Replicate blocks. Every block holds every arm once, in a rotated order."
+        required: false
+        default: "5"
+        type: string
+      egress_gate_rate:
+        description: "Per-session datagrams/s of G3's single rung (326 x 100 sessions = 32,600/s)"
+        required: false
+        default: "326"
+        type: string
 jobs:
   bench:
     permissions:
@@ -233,12 +258,49 @@ jobs:
           EGRESS_FANOUT_MODES: ${{ github.event.inputs.egress_fanout_modes }}
           EGRESS_FANOUT_AGGREGATE: ${{ github.event.inputs.egress_fanout_aggregate }}
           EGRESS_PROFILES: ${{ github.event.inputs.egress_profiles }}
+          EGRESS_GATE: ${{ github.event.inputs.egress_gate }}
+          EGRESS_GATE_EMITTERS: ${{ github.event.inputs.egress_gate_emitters }}
+          EGRESS_GATE_PROFILES: ${{ github.event.inputs.egress_gate_profiles }}
+          EGRESS_GATE_BLOCKS: ${{ github.event.inputs.egress_gate_blocks }}
+          EGRESS_GATE_RATE: ${{ github.event.inputs.egress_gate_rate }}
         run: |
           set -euo pipefail
           OUTDIR="$GITHUB_WORKSPACE/.bench-evidence"
           mkdir -p "$OUTDIR"
           SHA="${{ github.event.inputs.candidate_commit }}"
           PORT=4450
+          FRAGMENTS=""
+          # Gate G3: the headroom control runs once per originator arm, because a
+          # ceiling never crosses arms — an arm that cannot honestly source the
+          # rung contributes no number and lends none. Then one gate shape drives
+          # every (profile, emitter) cell, interleaved inside replicate blocks.
+          # Registered in docs/research/preregistrations/gate-g3.md.
+          if [ "$EGRESS_GATE" = "true" ]; then
+            IFS=',' read -ra ARMS <<< "$EGRESS_GATE_EMITTERS"
+            for ARM in "${ARMS[@]}"; do
+              ARM="$(echo "$ARM" | tr -d '[:space:]')"
+              [ -n "$ARM" ] || continue
+              PORT=$((PORT + 1))
+              GEN="$OUTDIR/bench-egress-$SHA-headroom-$ARM.json"
+              echo "== G3 generator-headroom control, arm $ARM (loaded server) =="
+              EGRESS_SHAPE=headroom EGRESS_EMITTER="$ARM" \
+                EGRESS_PROFILE=frame-bursty \
+                EGRESS_HEADROOM_RATE="$EGRESS_GATE_RATE" \
+                EGRESS_PORT="$PORT" EGRESS_OUT="$GEN" \
+                bun tools/load/bench-egress.ts
+              FRAGMENTS="$FRAGMENTS $GEN"
+            done
+            PORT=$((PORT + 1))
+            GATE="$OUTDIR/bench-egress-$SHA-gate.json"
+            echo "== G3 three-arm interleaved comparison at $EGRESS_GATE_RATE/s/session =="
+            EGRESS_SHAPE=gate EGRESS_PORT="$PORT" EGRESS_OUT="$GATE" \
+              bun tools/load/bench-egress.ts
+            FRAGMENTS="$FRAGMENTS $GATE"
+            # shellcheck disable=SC2086
+            bun tools/load/egress-classify.ts \
+              "$OUTDIR/bench-egress-$SHA-classified.json" $FRAGMENTS
+            exit 0
+          fi
           GEN="$OUTDIR/bench-egress-$SHA-headroom.json"
           echo "== egress generator-headroom control (loaded server) =="
           EGRESS_SHAPE=headroom EGRESS_PORT="$PORT" EGRESS_OUT="$GEN" \
