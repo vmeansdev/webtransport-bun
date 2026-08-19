@@ -36,6 +36,11 @@ import {
 	valueOrAfter,
 	waitForChildWithDeadline,
 } from "./bench-child-deadline.ts";
+import {
+	closeBounded,
+	finishRun,
+	writeArtifactDurable,
+} from "./bench-shutdown.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
 	type BulkRepeatFacts,
@@ -99,6 +104,14 @@ const CONNECT_STAGGER_MS = Number(process.env.G7_STAGGER_MS ?? 2);
 const SETTLE_POLL_MS = 250;
 const SETTLE_QUIET_POLLS = 4;
 const SETTLE_MAX_MS = 30_000;
+
+/**
+ * Cells whose server did not close cleanly. Not a falsifier: a cell's numbers
+ * are all taken before its teardown, so a stuck close cannot move one. It is
+ * recorded because a non-zero count is the retained-N-API-reference signature,
+ * and the reason this run needed an explicit exit rather than getting one.
+ */
+let serverCloseFailures = 0;
 
 let portCursor = BASE_PORT;
 const nextPort = () => portCursor++;
@@ -355,7 +368,19 @@ async function runStep(
 	const sinkSocket = sinkPort === null ? null : socketStatsForPort(sinkPort);
 	if (exitCode !== 0) console.error(stderr.slice(-2000));
 
-	await server.close?.();
+	// Bounded, and never thrown. A wedged sink is exactly the peer whose sessions
+	// the native drain cannot reap, so this is the cell where `close()` rejects
+	// with `E_BACKPRESSURE_TIMEOUT: ... asyncOpsPending=N` — one cell's teardown,
+	// not a reason to lose the cells behind it. The count travels in the artifact.
+	const close = await closeBounded(() => server.close?.() ?? Promise.resolve());
+	if (close.closeState !== "closed") {
+		serverCloseFailures += 1;
+		console.error(
+			`g7: server close ${close.closeState} after ${close.closeMs} ms${
+				close.closeError ? `: ${close.closeError}` : ""
+			}`,
+		);
+	}
 
 	return {
 		record,
@@ -863,13 +888,14 @@ async function main(): Promise<void> {
 				"writer, whose adapter adds one Buffer.from(chunk) copy per write. The " +
 				"two arms are not cost-comparable to each other and no clause compares them.",
 		},
+		serverCloseFailures,
 		verdict,
 		bulk: Object.fromEntries(bulkSummaries),
 		tokens: Object.fromEntries(tokenSummaries),
 		rawBulk: Object.fromEntries(bulk),
 		rawTokens: Object.fromEntries(tokens),
 	};
-	writeFileSync(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
+	writeArtifactDurable(OUT_JSON, `${JSON.stringify(artifact, null, 2)}\n`);
 
 	console.log(`\n${verdict.headline}`);
 	for (const clause of verdict.clauses)
@@ -879,3 +905,13 @@ async function main(): Promise<void> {
 }
 
 await main();
+
+// Every cell's server was already closed inside the step, and the artifact is
+// fsynced. What is left is the part the runtime cannot be asked to do: the
+// unsettled N-API promises of sessions whose sink was killed keep Bun's event
+// loop referenced with nothing running. The 117-minute wedge was the sink; this
+// is the tail that outlives it. The exit is taken rather than awaited.
+await finishRun({
+	closeServer: async () => {},
+	onNote: (note) => console.log(`g7 shutdown: ${note}`),
+});
