@@ -24,19 +24,32 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { $ } from "bun";
 import {
+	__TESTING__,
 	createServer,
 	releaseNativeMemory,
 } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	CROSSING_CLAUSE_NOTE,
+	coResidentDrops,
+	discloseCoResidentDrops,
+	GATE_BATCH_BYTES,
+	type GateCellName,
+	type GateRepeatFacts,
+	gateIntegrityBucket,
+	parseUdpSocketRows,
+	SERVER_SOCKET_DROP_NOTE,
+	summarizeServerSockets,
+} from "./gate-g5.ts";
+import {
 	assertWindowMathMirror,
 	DEFAULT_MAX_DATAGRAM_SIZE,
 	DEFAULT_MAX_SESSIONS,
+	DEFAULT_QUEUED_BYTES_PER_SESSION,
 	DEFAULT_QUEUED_BYTES_PER_STREAM,
 	evaluateWindowSweep,
 	WINDOW_MEMORY_NOTE,
 	type WindowMath,
-	type WindowRungRole,
 	windowMath,
 } from "./window-sweep.ts";
 
@@ -116,12 +129,33 @@ const W_QUIESCE_SECONDS = parseInt(
 	10,
 );
 
+// --- Arm G: gate G5 ---------------------------------------------------------
+// docs/research/preregistrations/gate-g5-bulk.md. Held at the W-rung / A4 / A6
+// operating point so a G cell is directly comparable to run 1 and to the A6
+// falsifier: the only variables are the server window and the batching knob.
+const G_SESSIONS = parseInt(process.env.BENCH_G_SESSIONS ?? "4", 10);
+const G_CONCURRENCY = parseInt(process.env.BENCH_G_CONCURRENCY ?? "4", 10);
+const G_STEP_SECONDS = parseInt(process.env.BENCH_G_STEP_SECONDS ?? "60", 10);
+const G_WRITE_BYTES = parseInt(process.env.BENCH_G_WRITE_BYTES ?? "262144", 10);
+const G_REPEATS = parseInt(process.env.BENCH_G_REPEATS ?? "2", 10);
+/** Which cells this invocation runs. The knob is a process property, so a
+ * knob-off cell and a knob-on cell cannot share one. */
+const G_CELLS = (process.env.BENCH_G_CELLS ?? "")
+	.split(",")
+	.map((v) => v.trim())
+	.filter((v) => v.length > 0) as GateCellName[];
+/** The raised-window control's config: A6's exact windows. */
+const G_RAISED_PER_STREAM = 16 * 1024 * 1024;
+const G_RAISED_PER_SESSION = 64 * 1024 * 1024;
+
 const PORT_A = 4433;
 const PORT_A_CONTROL = 4436;
 const PORT_B = 4437;
 const PORT_C = 4438;
 /** Arm W gives every rung its own port; each rung is a fresh server. */
 const PORT_W_BASE = 4440;
+/** Arm G likewise: a fresh server per cell repeat, on its own port. */
+const PORT_G_BASE = 4460;
 
 // ---------------------------------------------------------------------------
 // Host / process instrumentation
@@ -219,6 +253,32 @@ function udpDelta(
 		sndbufErrors: after.sndbufErrors - before.sndbufErrors,
 		outDatagrams: after.outDatagrams - before.outDatagrams,
 	};
+}
+
+/**
+ * Per-socket drop attribution for the gate's server-side rcvbuf clause.
+ *
+ * `/proc/net/snmp` `RcvbufErrors` is host-wide, so on this on-box rig it sums
+ * the server's drops and the co-resident client's. The clause says "on the
+ * server side", so the server's own sockets have to be found by their local
+ * port. Returns null when procfs is absent or no socket matches — never a zero,
+ * which is what `server-socket-drops-unmeasurable` exists to catch.
+ */
+function readServerSocketStats(
+	port: number,
+): { drops: number; rxQueueBytes: number; sockets: number } | null {
+	if (!HAS_PROC) return null;
+	const rows = [];
+	for (const path of ["/proc/net/udp", "/proc/net/udp6"]) {
+		try {
+			rows.push(...parseUdpSocketRows(readFileSync(path, "utf8"), port));
+		} catch {
+			// A missing udp6 on a v4-only kernel is not a failure; a missing udp is
+			// caught by the empty-rows check below.
+		}
+	}
+	if (rows.length === 0) return null;
+	return summarizeServerSockets(rows);
 }
 
 function median(values: number[]): number | null {
@@ -453,6 +513,38 @@ type StepObservation = {
 	limitExceededDelta: number;
 	requestedSessions: number;
 	exitCode: number;
+	/**
+	 * G5's crossing instrument (ticket 07's mandatory diagnostics), windowed to
+	 * this step: reset at step start, snapshotted after the settle. Null when
+	 * WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS is not 1.
+	 */
+	streamBatch: StreamBatchWindow | null;
+	/**
+	 * The server's own sockets, found by local port. Null means the clause could
+	 * not be checked for this step, which is not the same as zero drops.
+	 */
+	serverSocket: ServerSocketWindow | null;
+};
+
+type StreamBatchWindow = {
+	dataCrossings: number;
+	terminalCrossings: number;
+	batchedCrossings: number;
+	bytes: number;
+	meanBytesPerCrossing: number;
+	maxBatchBytes: number;
+	crossingsPerSecond: number;
+	elapsedMs: number;
+};
+
+type ServerSocketWindow = {
+	port: number;
+	sockets: number;
+	drops: number;
+	rxQueueBytesAtEnd: number;
+	coResidentDrops: number | null;
+	coResidentDropRatio: number | null;
+	coResidentDropVerdict: string;
 };
 
 /** Poll cadence and budget for the post-child drain settle. */
@@ -506,11 +598,18 @@ async function runStep(
 	stepSeconds: number,
 	args: string[],
 	csvIndex: number,
+	serverPort?: number,
 ): Promise<StepObservation> {
 	const c0 = { ...harness.counters };
 	const m0 = metricsOf(harness);
 	const cpuMs0 = serverCpuMs();
 	const udp0 = readUdpStats();
+	// G5's crossing instrument is a process-global counter, so the step window is
+	// opened here and closed after the settle — the same interval the byte
+	// counters cover.
+	__TESTING__.resetStreamBatchDiagnosticsForTests();
+	const sock0 =
+		serverPort !== undefined ? readServerSocketStats(serverPort) : null;
 	const startedAt = Date.now();
 
 	const child = Bun.spawn([CLIENT_BIN, ...args], {
@@ -571,6 +670,12 @@ async function runStep(
 	// then partly reflects when each client happened to die.
 	const settle = await settleCounters(harness);
 	const elapsedSec = (Date.now() - startedAt) / 1000;
+	const batchDiag = __TESTING__.streamBatchDiagnosticsSnapshotForTests();
+	const batchEnabled =
+		__TESTING__.streamBatchConfigForTests().diagnosticsEnabled;
+	const udpStep = udpDelta(udp0, readUdpStats());
+	const sock1 =
+		serverPort !== undefined ? readServerSocketStats(serverPort) : null;
 
 	const clientCpuMs =
 		clientTicks0 !== null && clientTicksLast !== null
@@ -605,11 +710,55 @@ async function runStep(
 		serverCpuMs: serverCpuMs() - cpuMs0,
 		clientCpuMs,
 		rssMbMax,
-		udp: udpDelta(udp0, readUdpStats()),
+		udp: udpStep,
 		rateLimitedDelta: m1.rateLimitedCount - m0.rateLimitedCount,
 		limitExceededDelta: m1.limitExceededCount - m0.limitExceededCount,
 		requestedSessions,
 		exitCode,
+		streamBatch: batchEnabled
+			? {
+					dataCrossings: batchDiag.dataCrossings,
+					terminalCrossings: batchDiag.terminalCrossings,
+					batchedCrossings: batchDiag.batchedCrossings,
+					bytes: batchDiag.bytes,
+					meanBytesPerCrossing: batchDiag.meanBytesPerCrossing,
+					maxBatchBytes: batchDiag.maxBatchBytes,
+					crossingsPerSecond: batchDiag.crossingsPerSecond,
+					elapsedMs: batchDiag.elapsedMs,
+				}
+			: null,
+		serverSocket: serverSocketWindow(serverPort, sock0, sock1, udpStep),
+	};
+}
+
+/**
+ * The server-side half of the drops clause, plus the co-resident disclosure.
+ *
+ * Both endpoints of the delta have to exist: a socket that appeared or vanished
+ * mid-step gives a difference that is not a drop count, and reporting it as one
+ * would be the silent zero this instrument exists to avoid.
+ */
+function serverSocketWindow(
+	port: number | undefined,
+	before: { drops: number; rxQueueBytes: number; sockets: number } | null,
+	after: { drops: number; rxQueueBytes: number; sockets: number } | null,
+	udp: UdpSnapshot | null,
+): ServerSocketWindow | null {
+	if (port === undefined || !before || !after) return null;
+	const drops = after.drops - before.drops;
+	const coResident = udp ? coResidentDrops(udp.rcvbufErrors, drops) : null;
+	const disclosure =
+		coResident !== null && udp
+			? discloseCoResidentDrops(coResident, udp.inDatagrams)
+			: null;
+	return {
+		port,
+		sockets: after.sockets,
+		drops,
+		rxQueueBytesAtEnd: after.rxQueueBytes,
+		coResidentDrops: coResident,
+		coResidentDropRatio: disclosure?.ratio ?? null,
+		coResidentDropVerdict: disclosure?.verdict ?? "UNGRADED",
 	};
 }
 
@@ -628,6 +777,9 @@ const INCOMPLETE_BUCKETS = new Set([
 	"host-saturated",
 	"generator-saturated",
 	"offer-shortfall",
+	// Gate G5's two additions (docs/research/preregistrations/gate-g5-bulk.md).
+	"crossing-instrument-disagreement",
+	"server-socket-drops-unmeasurable",
 ]);
 
 /**
@@ -748,6 +900,30 @@ function classifyWindow(
 	return "window-plateau";
 }
 
+/**
+ * Arm G. The axis's common rules first, then the two integrity rules gate G5
+ * pre-registered: a crossing clause adjudicated by an instrument its own
+ * cross-check contradicts is not a measurement, and a drops clause that could
+ * not be checked has not passed. No G cell is a rung of a ladder, so the shape
+ * rules never compare one cell against another.
+ */
+function classifyGate(step: StepObservation): string {
+	const common = commonBucket(step);
+	if (common) return common;
+	return (
+		gateIntegrityBucket({
+			crossing: {
+				packageMeanBytesPerCrossing: step.streamBatch
+					? step.streamBatch.meanBytesPerCrossing
+					: null,
+				harnessMeanBytesPerCrossing:
+					step.serverChunks > 0 ? step.serverBytes / step.serverChunks : null,
+			},
+			serverSocketsFound: step.serverSocket?.sockets ?? null,
+		}) ?? "gate-cell"
+	);
+}
+
 /** GSO/GRO engagement, per the pre-registered 1.05 threshold. */
 function coalescingVerdict(
 	datagrams: number,
@@ -799,14 +975,16 @@ type ClassifiedStep = StepObservation & {
 function classify(
 	step: StepObservation,
 	prev: StepObservation | null,
-	kind: "throughput" | "churn" | "window",
+	kind: "throughput" | "churn" | "window" | "gate",
 ): ClassifiedStep {
 	const bucket =
 		kind === "throughput"
 			? classifyThroughput(step, prev)
 			: kind === "churn"
 				? classifyChurn(step, prev)
-				: classifyWindow(step, prev);
+				: kind === "gate"
+					? classifyGate(step)
+					: classifyWindow(step, prev);
 	const mbps = deliveredMbps(step);
 	// Bits actually delivered in this step, not a rate: cost-per-bit figures
 	// divide by it and so inherit no window choice at all.
@@ -1245,6 +1423,172 @@ async function runArmW(tls: {
 	return out;
 }
 
+// --- Arm G: gate G5 ---------------------------------------------------------
+
+type GateCellSpec = {
+	cell: GateCellName;
+	perStream: number;
+	perSession: number;
+	/** What this invocation's knob must be for the cell to be legitimate. */
+	requiresBatchBytes: number;
+};
+
+const G_CELL_SPECS: Record<GateCellName, GateCellSpec> = {
+	"G-control": {
+		cell: "G-control",
+		perStream: DEFAULT_QUEUED_BYTES_PER_STREAM,
+		perSession: DEFAULT_QUEUED_BYTES_PER_SESSION,
+		requiresBatchBytes: 0,
+	},
+	"G-batch": {
+		cell: "G-batch",
+		perStream: DEFAULT_QUEUED_BYTES_PER_STREAM,
+		perSession: DEFAULT_QUEUED_BYTES_PER_SESSION,
+		requiresBatchBytes: GATE_BATCH_BYTES,
+	},
+	"G-window-ref": {
+		cell: "G-window-ref",
+		perStream: G_RAISED_PER_STREAM,
+		perSession: G_RAISED_PER_SESSION,
+		requiresBatchBytes: 0,
+	},
+	"G-window-batch": {
+		cell: "G-window-batch",
+		perStream: G_RAISED_PER_STREAM,
+		perSession: G_RAISED_PER_SESSION,
+		requiresBatchBytes: GATE_BATCH_BYTES,
+	},
+};
+
+type GateRepeatRecord = {
+	facts: GateRepeatFacts;
+	step: ClassifiedStep;
+	math: WindowMath;
+};
+
+/**
+ * One invocation's share of Arm G: the cells named in BENCH_G_CELLS, each run
+ * BENCH_G_REPEATS times against a fresh server.
+ *
+ * The batching knob is resolved once at module init by design, so an invocation
+ * can only host cells that agree with the knob it was started under. Running a
+ * cell under the wrong knob would produce a labelled arm that is not the arm,
+ * so the mismatch aborts the run instead of being reported.
+ */
+async function runArmG(tls: {
+	certPem: string;
+	keyPem: string;
+}): Promise<GateRepeatRecord[]> {
+	assertWindowMathMirror();
+	const batchConfig = __TESTING__.streamBatchConfigForTests();
+	if (!batchConfig.diagnosticsEnabled) {
+		throw new Error(
+			"arm G requires WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1: the crossing clause is measured by that counter and the pre-registration turns it on for every invocation, control included",
+		);
+	}
+	for (const name of G_CELLS) {
+		const spec = G_CELL_SPECS[name];
+		if (!spec) throw new Error(`arm G: unknown cell ${name}`);
+		if (spec.requiresBatchBytes !== batchConfig.batchBytes) {
+			throw new Error(
+				`arm G: cell ${name} requires WEBTRANSPORT_STREAM_BATCH_BYTES=${spec.requiresBatchBytes || "unset"} but this process resolved ${batchConfig.batchBytes}`,
+			);
+		}
+	}
+
+	const out: GateRepeatRecord[] = [];
+	let portOffset = 0;
+	for (const name of G_CELLS) {
+		const spec = G_CELL_SPECS[name];
+		if (!spec) continue;
+		const math = windowMath(
+			spec.perStream,
+			spec.perSession,
+			G_SESSIONS,
+			DEFAULT_MAX_SESSIONS,
+			DEFAULT_MAX_DATAGRAM_SIZE,
+		);
+		for (let r = 1; r <= G_REPEATS; r++) {
+			const port = PORT_G_BASE + portOffset++;
+			const harness = await startServer(
+				{
+					port,
+					sessions: G_SESSIONS,
+					queuedBytesPerStream: spec.perStream,
+					queuedBytesPerSession: spec.perSession,
+				},
+				tls,
+			);
+			console.log(
+				`bench-stream: arm G ${name}-r${r} up on ${port} perStream=${(spec.perStream / 1024).toFixed(0)}KiB perSession=${(spec.perSession / 1024 / 1024).toFixed(1)}MiB batchBytes=${batchConfig.batchBytes} worstCase/session=${(math.perSessionWorstCaseBytes / 1024 / 1024).toFixed(1)}MiB`,
+			);
+			let step: StepObservation;
+			try {
+				step = await runStep(
+					"G",
+					`${name}-r${r}`,
+					harness,
+					G_SESSIONS,
+					G_STEP_SECONDS,
+					streamArgs({
+						port,
+						sessions: G_SESSIONS,
+						seconds: G_STEP_SECONDS,
+						workload: "bulk",
+						writeBytes: G_WRITE_BYTES,
+						concurrency: G_CONCURRENCY,
+						targetBytesPerSecPerSession: 0,
+					}),
+					portOffset,
+					port,
+				);
+			} finally {
+				await harness.server.close();
+			}
+			const classified = classify(step, null, "gate");
+			printStep(classified);
+			console.log(
+				`bench-stream: arm G ${name}-r${r} delivered=${(classified.deliveredMbps / 1000).toFixed(3)}Gbps crossing pkg=${step.streamBatch?.meanBytesPerCrossing.toFixed(0) ?? "n/a"}B harness=${classified.meanJsChunkBytes?.toFixed(0) ?? "n/a"}B maxBatch=${step.streamBatch?.maxBatchBytes ?? "n/a"}B crossings/s=${step.streamBatch?.crossingsPerSecond.toFixed(0) ?? "n/a"} serverSocketDrops=${step.serverSocket?.drops ?? "unmeasurable"} coResidentDrops=${step.serverSocket?.coResidentDrops ?? "n/a"}(${step.serverSocket?.coResidentDropVerdict ?? "n/a"})`,
+			);
+			out.push({
+				step: classified,
+				math,
+				facts: {
+					cell: name,
+					repeat: r,
+					bucket: classified.bucket,
+					incomplete: classified.incomplete,
+					deliveredMbps: classified.deliveredMbps,
+					packageMeanBytesPerCrossing:
+						step.streamBatch?.meanBytesPerCrossing ?? null,
+					harnessMeanBytesPerCrossing: classified.meanJsChunkBytes,
+					crossingsPerSecond: step.streamBatch?.crossingsPerSecond ?? null,
+					maxBatchBytes: step.streamBatch?.maxBatchBytes ?? null,
+					batchedCrossings: step.streamBatch?.batchedCrossings ?? null,
+					serverSocketDrops: step.serverSocket?.drops ?? null,
+					coResidentDrops: step.serverSocket?.coResidentDrops ?? null,
+					coResidentDropVerdict:
+						step.serverSocket?.coResidentDropVerdict ?? "UNGRADED",
+					serverSocketRxQueueBytesAtEnd:
+						step.serverSocket?.rxQueueBytesAtEnd ?? null,
+					queuedBytesPerStream: spec.perStream,
+					queuedBytesPerSession: spec.perSession,
+					// Arm G never sets streamReceiveWindow/receiveWindow/sendWindow:
+					// clause 3 is a statement about the shipped governors, and an
+					// explicit window would make it a different config's claim.
+					explicitWindowFieldsSet: false,
+					insideShippedPerSessionBudget: math.insideShippedPerSessionBudget,
+					batchBytesConfigured: batchConfig.batchBytes,
+					serverCpuMsPerGbit: classified.serverCpuMsPerGbit,
+					rssMbPeak: classified.rssMbMax,
+				},
+			});
+			await Bun.sleep(10_000);
+		}
+	}
+	return out;
+}
+
 /** Arm W's pre-registered verdict, over the facts the rules are allowed to see. */
 function evaluateArmW(rungs: WindowRung[]) {
 	return evaluateWindowSweep(
@@ -1403,6 +1747,7 @@ async function main(): Promise<void> {
 	const armB = ARMS.includes("B") ? await runArmB(creds) : [];
 	const armC = ARMS.includes("C") ? await runArmC(creds) : [];
 	const armW = ARMS.includes("W") ? await runArmW(creds) : [];
+	const armG = ARMS.includes("G") ? await runArmG(creds) : [];
 
 	const ladderA = armA.filter((s) => !s.label.startsWith("control-"));
 	const usableA = ladderA.filter((s) => !s.incomplete);
@@ -1445,6 +1790,8 @@ async function main(): Promise<void> {
 		notes: {
 			snmpCounter: SNMP_DATAGRAM_COUNTER_NOTE,
 			committedMemory: WINDOW_MEMORY_NOTE,
+			crossingClause: CROSSING_CLAUSE_NOTE,
+			serverSocketDrops: SERVER_SOCKET_DROP_NOTE,
 			denominators:
 				"deliveredMbps / streamsPerSec / boundaryEventsPerSec divide by " +
 				"windowSec (the configured drive window). serverCpuPct and " +
@@ -1498,11 +1845,32 @@ async function main(): Promise<void> {
 				maxSessionsForMath: DEFAULT_MAX_SESSIONS,
 				maxDatagramSizeForMath: DEFAULT_MAX_DATAGRAM_SIZE,
 			},
+			g: {
+				preregistration: "docs/research/preregistrations/gate-g5-bulk.md",
+				cells: G_CELLS,
+				repeats: G_REPEATS,
+				sessions: G_SESSIONS,
+				concurrency: G_CONCURRENCY,
+				stepSeconds: G_STEP_SECONDS,
+				writeBytes: G_WRITE_BYTES,
+				raisedPerStream: G_RAISED_PER_STREAM,
+				raisedPerSession: G_RAISED_PER_SESSION,
+				// What this process actually resolved, not what was asked for.
+				streamBatch: __TESTING__.streamBatchConfigForTests(),
+			},
 		},
 		armA,
 		armB,
 		armC,
 		armW,
+		// Raw per-repeat facts. The gate verdict spans invocations (the batching
+		// knob is a process property), so it is computed by tools/load/gate-g5-verdict.ts
+		// over every artifact, never by one invocation over its own half.
+		armG: armG.map((r) => ({
+			...r.facts,
+			step: r.step,
+			math: r.math,
+		})),
 		verdicts: {
 			bulkCeilingMbps: bestA?.deliveredMbps ?? null,
 			bulkCeilingWriteSize: bestA?.label ?? null,

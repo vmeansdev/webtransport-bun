@@ -35,7 +35,7 @@ on:
         default: "false"
         type: string
       mode:
-        description: "bandwidth (datagram ladder, default) or stream (stream-throughput axis)"
+        description: "bandwidth (datagram ladder, default), stream (stream-throughput axis), or gate-g5 (gate G5; takes no tunable inputs — its config is pre-registered)"
         required: false
         default: "bandwidth"
         type: string
@@ -117,7 +117,7 @@ jobs:
       # from quinn's own counters, and capability-without-engagement is exactly
       # the silent-fallback case worth catching side by side.
       - name: GSO/GRO host probe
-        if: ${{ github.event.inputs.probe_only == 'true' || github.event.inputs.mode == 'stream' }}
+        if: ${{ github.event.inputs.probe_only == 'true' || github.event.inputs.mode == 'stream' || github.event.inputs.mode == 'gate-g5' }}
         run: |
           echo "== kernel =="
           uname -a
@@ -164,7 +164,7 @@ jobs:
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'stream' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'stream' && github.event.inputs.mode != 'gate-g5' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -193,6 +193,48 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-stream-${{ github.event.inputs.candidate_commit }}.json" \
             bun tools/load/bench-stream.ts
+      # Gate G5. Pre-registration: docs/research/preregistrations/gate-g5-bulk.md
+      #
+      # Deliberately takes no tunable dispatch inputs: the arms, the repeat count
+      # and the batch budget are fixed in the committed harness, so what ran is
+      # what was registered and not what a dispatch form said.
+      #
+      # WEBTRANSPORT_STREAM_BATCH_BYTES is read once at module init, so the
+      # knob-off cells and the knob-on cells cannot share a process. Two harness
+      # invocations, then a third pass that applies the verdict rules across both
+      # artifacts. One dispatch, one runner, one candidate.
+      - name: Run gate G5
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'gate-g5' }}
+        env:
+          WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS: "1"
+          BENCH_STREAM_ARMS: G
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          EV="$GITHUB_WORKSPACE/.bench-evidence"
+          SHA="${{ github.event.inputs.candidate_commit }}"
+
+          echo "::group::G5 invocation 1 — knob OFF (G-control, G-window-ref)"
+          BENCH_G_CELLS="G-control,G-window-ref" \
+            BENCH_OUT="$EV/bench-stream-g5-knoboff-$SHA.json" \
+            bun tools/load/bench-stream.ts
+          echo "::endgroup::"
+
+          echo "::group::G5 invocation 2 — knob ON at 65536 (G-batch, G-window-batch)"
+          WEBTRANSPORT_STREAM_BATCH_BYTES=65536 \
+            BENCH_G_CELLS="G-batch,G-window-batch" \
+            BENCH_OUT="$EV/bench-stream-g5-knobon-$SHA.json" \
+            bun tools/load/bench-stream.ts
+          echo "::endgroup::"
+
+          GATE_G5_OUT="$EV/bench-stream-g5-verdict-$SHA.json" \
+            bun tools/load/gate-g5-verdict.ts \
+              "$EV/bench-stream-g5-knoboff-$SHA.json" \
+              "$EV/bench-stream-g5-knobon-$SHA.json"
+
+          # Every artifact hashed in the log, so the run log's sha256 column is
+          # filled from the run rather than from a later local re-read.
+          sha256sum "$EV"/bench-stream-g5-*.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ always() && github.event.inputs.probe_only != 'true' }}
         with:
