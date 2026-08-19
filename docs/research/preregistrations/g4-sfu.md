@@ -159,7 +159,63 @@ Every dispatch of this gate, including aborted ones.
 
 | dispatched | run id | candidate SHA | artifact hash | outcome |
 |---|---|---|---|---|
-| — | — | — | — | **no dispatch has been made** |
+| 2026-08-19 04:31:31 UTC | `32216072119` | `869fa0d2c71612db3f33b74a3d15f1328f370abd` | `ca0ad203d1b158c149c2857401beabcafbca432df64a2fdfc8347de3f3d40038` | success — G4 **PASS** |
+
+Artifact hash above is sha256 of the eight fragments concatenated in filename
+order. Per-file sha256:
+
+| fragment | sha256 |
+|---|---|
+| `-classified.json` | `e46df811f8022bac45678e532d4d95891f9d40d6c07e6b876ade848232188ae4` |
+| `-fanout-constant-aggregate.json` | `f851a56041b57f866ce45b5e3020a5c3d8edcf5f9c1cea3b53cb92b3cfd546db` |
+| `-fanout-per-subscriber.json` | `3c3e817dd2360bf6b82166558f99fe339ef748f8cd89aef693dc21a6effba320` |
+| `-headroom.json` | `4ee8954e74ae5487218cd4c14f1b82ab31ce7bac84c6abb5fd6457aa80be62fe` |
+| `-ladder-constant.json` | `4181353bdce5e9c5e671174288e2e8b4da0bfb61838d327c805fbb480112794c` |
+| `-ladder-desktop-share.json` | `224d830dbe7c70ae7a26ccf939b9d3a7b9e2df2ddfb70a08520492f2321cc4d0` |
+| `-ladder-frame-bursty.json` | `4b9667c6f5bc304e767d701a3979b4d76ff03ecba188ccc3fa5460b743f59bdf` |
+| `-ladder-keyframe-aligned.json` | `7414f0ad16a38560e8677571bab053f7dbf29213f0c2ce9bc5c34cf8819cf469` |
+
+`head_sha` read back from the API is
+`869fa0d2c71612db3f33b74a3d15f1328f370abd` on `probe/egress-fanout-01`,
+conclusion `success` — the candidate this document registers.
+
+### Registered-dispatch deviation: the ladder ran
+
+The dispatch plan set `egress_profiles=" "` to suppress the four ladder arms.
+**It did not work, and four ladder fragments are in the artifact.** The
+mechanism is proven from the run log, not inferred: the job's environment block
+prints
+
+```
+EGRESS_PROFILES: constant,frame-bursty,keyframe-aligned,desktop-share
+```
+
+— GitHub substituted the input's **declared default** for a whitespace-only
+value before the workflow ever saw it, so the shell loop's `tr -d '[:space:]'`
++ `[ -n … ] || continue` guard (which would have skipped a blank correctly) was
+never reached with a blank. The four `ladder-*` fragments are **real, not empty
+shells**: 24 ladder steps carrying full histograms, six rungs a profile.
+
+Effect on this gate, disclosed either way:
+
+- **Sequencing, from the run log timestamps.** One job, one shell, strictly
+  sequential: headroom 04:34:39→04:36:48, ladder `constant` 04:36:48, ladder
+  `frame-bursty` 04:59:49, ladder `keyframe-aligned` 05:08:18, ladder
+  `desktop-share` 05:16:47, fan-out `per-subscriber` **05:25:41**, fan-out
+  `constant-aggregate` **05:34:36**. Each arm is its own server process on its
+  own port (4451…4456). **No ladder arm overlaps either fan-out sweep**, so the
+  fan-out arms' environment was not perturbed concurrently.
+- **Residual.** The fan-out arms began after ≈49 min of prior heavy load on the
+  same 4-vCPU runner, which the pre-registration did not anticipate. That
+  residual is covered by the gate's own falsifiers rather than argued away: each
+  N gets its own 20 s sink pre-check immediately before its step, all eight
+  passed at 1.5× the step's load, and every step's `ingestReality` cleared. A
+  rig degraded by the ladder would have surfaced there.
+- **Net.** More evidence than registered, not less: the run-level headroom rule
+  *was* evaluable (`complete=true`, `stop=null`, `headroomRatio` 1.80) instead
+  of the registered `headroom-not-evaluated`. G4's verdict is read off the
+  fan-out steps' own flags and numbers either way, exactly as pre-registered, so
+  the deviation changes no gate input. It is recorded, not used.
 
 ## What this gate may not do
 

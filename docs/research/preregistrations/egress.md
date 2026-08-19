@@ -307,7 +307,23 @@ hash — including aborted ones, per the effort spec's process rules.
 
 | dispatched | run id | candidate SHA | artifact hash | outcome |
 |---|---|---|---|---|
-| — | — | — | — | **no dispatch has been made** |
+| 2026-08-19 04:31:31 UTC | `32216072119` | `869fa0d2c71612db3f33b74a3d15f1328f370abd` | `ca0ad203d1b158c149c2857401beabcafbca432df64a2fdfc8347de3f3d40038` | success — gate G4 dispatch, **PASS**; ladder arms ran too (see below) |
+
+Artifact hash is sha256 of the eight fragments concatenated in filename order;
+per-file hashes are in `docs/research/preregistrations/g4-sfu.md`, which is the
+run log of record for this dispatch.
+
+This dispatch was aimed at the fan-out shape only. `egress_profiles=" "` failed
+to suppress the ladder — GitHub substituted the input's declared default for a
+whitespace-only value, proven from the job's own environment echo — so the run
+also carries the **full four-profile ladder** (24 steps, six rungs each) and the
+generator-headroom control. Those arms ran strictly before both fan-out sweeps
+in the same sequential job and are valid axis data in their own right; the
+run-level headroom rule evaluated `complete=true`, `stop=null`,
+`headroomRatio` 1.80 (ceiling 155,656/s, max delivered 83,822/s). Anyone
+reading this axis's ladder from run `32216072119` should note it was dispatched
+as G4's run, not as a ladder run, and that the fan-out arms followed ≈49 min of
+ladder load on the same runner.
 
 ## Amendments
 
