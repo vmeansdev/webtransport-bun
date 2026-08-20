@@ -120,6 +120,13 @@ import {
 	STAMP_BYTES_V4,
 	writeReflection,
 } from "./latency-stamp.ts";
+import {
+	assertOneProcessPerCell,
+	type PacerStatsRaw,
+	pacerEnvironment,
+	readPacerStats,
+	windowPacerStats,
+} from "./pacer-stats.ts";
 
 const ROOT = process.cwd();
 const CLIENT_BIN = `${ROOT}/target/release/broadcast-client`;
@@ -657,6 +664,13 @@ async function pumpSubscribers(
 async function main(): Promise<void> {
 	if (LADDER.length === 0) throw new Error("G10_RATE_LADDER parsed empty");
 	if (REQUESTED_ARMS.length === 0) throw new Error("G10_ARMS parsed empty");
+	// Before the cert, the build, and the fleet: a mis-shaped paced cell is
+	// worth minutes, and only if it stops here.
+	assertOneProcessPerCell({
+		pacerPps: process.env.WEBTRANSPORT_PACER_PPS,
+		ladder: LADDER,
+		arms: REQUESTED_ARMS,
+	});
 
 	if (!SMOKE || SMOKE_RUST) {
 		console.log("bench-g10: building broadcast-client (release)...");
@@ -869,6 +883,11 @@ async function main(): Promise<void> {
 		mirrorComposed: typeof mirrorEntry === "function",
 		preflightRequirements: preflightRequirements(GATE_RATE),
 		windowSeconds: WINDOW_SECONDS,
+		// As-read, not as-intended: `sweep2-c32-p75000-w60-r1.json` is what the
+		// operator meant to run, and a filename has never once refused to lie.
+		// `G10_COMPOSITION_SHAS` is free-form because the composition is three
+		// branches across two machines and no fixed schema survives that.
+		environment: pacerEnvironment(process.env),
 		// A rung whose fleet had to be killed is a truncated window, and the
 		// killing itself quiesces the server — so the fact travels at the top of
 		// the artifact as well as inside the rung, where a reader cannot miss it.
@@ -925,6 +944,11 @@ async function main(): Promise<void> {
 		);
 
 		const kernelBefore = readKernelUdp();
+		// The mark, taken as late as the drive window's own start: the pacer's
+		// counters run from process start, and everything before this line —
+		// the fleet establishing, the smoke path, a previous rung — belongs to
+		// neither this window nor this cell.
+		const pacerBefore = readPacerStats(server);
 		const startedMs = Date.now();
 		const emitter = startEmitter(rate, startedMs);
 		const sampler = sample(rate, startedMs);
@@ -933,6 +957,11 @@ async function main(): Promise<void> {
 		sampler.stop();
 		const loopTicks = stopSampler();
 		const kernelAfter = readKernelUdp();
+		// Read the instant the emitter stops, so the delta covers the drive
+		// window and nothing after it. Clumps still queued at this moment depart
+		// unattributed — `pendingTargets` in the report is how deep that tail
+		// was, and a non-trivial one is itself the finding.
+		const pacerAfter = readPacerStats(server);
 		// C4 asks how many subscribers were still there **at arm end**, so the
 		// snapshot is taken here — before the fleet is asked to go away. Taken
 		// after the drain it would read zero on every valid run, which is a
@@ -998,6 +1027,8 @@ async function main(): Promise<void> {
 			loopTicks,
 			kernelBefore,
 			kernelAfter,
+			pacerBefore,
+			pacerAfter,
 			wait.deadlineBreached,
 		);
 	}
@@ -1154,8 +1185,15 @@ async function main(): Promise<void> {
 		loopTicks: number,
 		kernelBefore: Record<string, number> | null,
 		kernelAfter: Record<string, number> | null,
+		pacerBefore: PacerStatsRaw | null,
+		pacerAfter: PacerStatsRaw | null,
 		deadlineBreached: boolean,
 	): unknown {
+		// Disclosure only: no clause above reads this, and the sweep's validity
+		// rule (windowed scheduleResets > 0, windowed lateClumps > 5% of clumps)
+		// is applied operator-side. Absent whenever the composition has no pacer
+		// API, so an older artifact reads exactly as it did before.
+		const pacerStats = windowPacerStats(pacerBefore, pacerAfter);
 		const loopLagP99Ms =
 			loopLag.count > 0 ? loopLag.percentile(0.99) / 1e6 : null;
 		const vL = loopLagSamplerFalsifier({
@@ -1338,6 +1376,7 @@ async function main(): Promise<void> {
 					: null,
 			perArm,
 			offboxReport: report,
+			...(pacerStats ? { pacerStats } : {}),
 			deadlineBreached,
 			falsifiers: {
 				"V-W": deadlineFalsifier(deadlineBreached),
