@@ -279,6 +279,7 @@ mod linux {
         let mut departures: HashMap<u32, u64> = HashMap::new();
         let mut errs = ErrCounts::default();
         let mut send_errors: u64 = 0;
+        let mut send_errno: HashMap<i32, u64> = HashMap::new();
 
         let clock_offset = realtime_minus_monotonic_ns();
         let base = now_ns() + lead_ns;
@@ -297,6 +298,8 @@ mod linux {
             let sent = unsafe { send_one(fd, &payload, txtime_on.then_some(txtime)) };
             if sent < 0 {
                 send_errors += 1;
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                *send_errno.entry(e).or_insert(0) += 1;
             } else {
                 submit_ns.push(now_ns());
                 scheduled_ns.push(txtime);
@@ -365,6 +368,16 @@ mod linux {
             send_errors,
             departures.len()
         ));
+        let mut errno_pairs: Vec<(i32, u64)> = send_errno.into_iter().collect();
+        errno_pairs.sort_unstable();
+        json.push_str(",\"send_errno\":{");
+        for (idx, (e, n)) in errno_pairs.iter().enumerate() {
+            if idx > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"{e}\":{n}"));
+        }
+        json.push('}');
         json.push_str(&format!(
             ",\"txtime_errors\":{{\"invalid_param\":{},\"missed\":{},\"other_txtime\":{},\"other_origin\":{}}}",
             errs.invalid_param, errs.missed, errs.other_txtime, errs.other_origin
