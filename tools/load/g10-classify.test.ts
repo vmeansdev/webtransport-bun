@@ -409,10 +409,11 @@ describe("§7 — the pre-check falsifiers", () => {
 		expect(
 			spreadFloorFalsifier({
 				...precheck,
-				burstDrainMaxMs: 120,
+				burstNormalizedDrainMaxMs: 121.2,
+				burstDrainMs: 120,
+				burstCompleteness: 0.99,
 				burstEmitNetMaxMs: 95,
 				burstEmitMaxMs: 95,
-				burstCompletenessMin: 0.99,
 			}).fires,
 		).toBe(true);
 	});
@@ -420,13 +421,14 @@ describe("§7 — the pre-check falsifiers", () => {
 	test("V-SP: a sink at wire pace on a near-complete burst does not fire", () => {
 		const ok = spreadFloorFalsifier({
 			...precheck,
-			burstDrainMaxMs: 100,
+			burstNormalizedDrainMaxMs: 102.04,
+			burstDrainMs: 100,
+			burstCompleteness: 0.98,
 			burstEmitNetMaxMs: 95,
 			burstEmitMaxMs: 140,
-			burstCompletenessMin: 0.98,
 		});
 		expect(ok.fires).toBe(false);
-		expect(ok.reason).toContain("completeness min 0.980");
+		expect(ok.reason).toContain("its completeness 0.980");
 		expect(ok.reason).toContain("gross 140.00 ms");
 	});
 
@@ -435,10 +437,11 @@ describe("§7 — the pre-check falsifiers", () => {
 		// 360 ms drain; the sender's own work was 95 ms, so the ceiling is 114.
 		const facts = {
 			...precheck,
-			burstDrainMaxMs: 200,
+			burstNormalizedDrainMaxMs: 202.02,
+			burstDrainMs: 200,
+			burstCompleteness: 0.99,
 			burstEmitNetMaxMs: 95,
 			burstEmitMaxMs: 300,
-			burstCompletenessMin: 0.99,
 		};
 		expect(spreadFloorFalsifier(facts).fires).toBe(true);
 		expect(
@@ -452,23 +455,25 @@ describe("§7 — the pre-check falsifiers", () => {
 		// window is 61.7% of a window. Normalized it is 148.95 ms, over ceiling.
 		const fired = spreadFloorFalsifier({
 			...precheck,
-			burstDrainMaxMs: 91.9,
+			burstNormalizedDrainMaxMs: 91.9 / 0.617,
+			burstDrainMs: 91.9,
+			burstCompleteness: 0.617,
 			burstEmitNetMaxMs: 95,
 			burstEmitMaxMs: 95,
-			burstCompletenessMin: 0.617,
 		});
 		expect(fired.fires).toBe(true);
 		expect(fired.reason).toContain("148.9");
 	});
 
-	test("V-SP: undisclosed completeness fires — an unnormalizable drain is not a cleared sink", () => {
+	test("V-SP: an unnormalizable drain fires — it is not a cleared sink", () => {
 		expect(
 			spreadFloorFalsifier({
 				...precheck,
-				burstDrainMaxMs: 91.9,
+				burstNormalizedDrainMaxMs: null,
+				burstDrainMs: null,
+				burstCompleteness: null,
 				burstEmitNetMaxMs: 95,
 				burstEmitMaxMs: 95,
-				burstCompletenessMin: null,
 			}).fires,
 		).toBe(true);
 	});
@@ -477,10 +482,11 @@ describe("§7 — the pre-check falsifiers", () => {
 		expect(
 			spreadFloorFalsifier({
 				...precheck,
-				burstDrainMaxMs: null,
+				burstNormalizedDrainMaxMs: null,
+				burstDrainMs: null,
+				burstCompleteness: null,
 				burstEmitNetMaxMs: null,
 				burstEmitMaxMs: null,
-				burstCompletenessMin: null,
 			}).fires,
 		).toBe(true);
 	});

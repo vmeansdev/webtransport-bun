@@ -17,15 +17,58 @@
 import type { PrecheckFacts } from "./g10-classify.ts";
 
 export type BurstFloorFacts = PrecheckFacts & {
-	burstDrainMaxMs: number | null;
+	/** The worst burst's drain, already divided by *that burst's* completeness. */
+	burstNormalizedDrainMaxMs: number | null;
+	/** Raw drain and completeness of the burst that produced it — disclosure. */
+	burstDrainMs: number | null;
+	burstCompleteness: number | null;
 	burstEmitNetMaxMs: number | null;
 	burstEmitMaxMs: number | null;
-	burstCompletenessMin: number | null;
 };
 
-/** A finite number, or `null`. `percentile()` of an empty sample is NaN. */
+/** A finite number, or `null`. A summary of an empty sample is NaN. */
 function finite(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * The burst with the worst completeness-normalized drain, per Amendment 5.
+ *
+ * Per burst, not summary-against-summary: the recv artifact's `drainMsMax` and
+ * `completenessMin` can come from two *different* bursts, and dividing one by
+ * the other would invent a burst that never happened. The rows carry both
+ * numbers for each burst, so the honest reading is the worst real one.
+ *
+ * A row whose completeness is zero or missing is not skipped — it is the
+ * strongest evidence the sink was not measured, and it returns `null`, which
+ * fires.
+ */
+function worstNormalizedBurst(recv: Record<string, unknown> | null): {
+	normalizedMs: number | null;
+	drainMs: number | null;
+	completeness: number | null;
+} {
+	const absent: {
+		normalizedMs: number | null;
+		drainMs: number | null;
+		completeness: number | null;
+	} = { normalizedMs: null, drainMs: null, completeness: null };
+	const rows = recv?.perBurst;
+	if (!Array.isArray(rows) || rows.length === 0) return absent;
+	let worst = absent;
+	for (const row of rows) {
+		const cell = (row ?? null) as Record<string, unknown> | null;
+		const drainMs = finite(cell?.drainMs);
+		const completeness = finite(cell?.completeness);
+		if (drainMs === null || completeness === null || !(completeness > 0)) {
+			return absent;
+		}
+		const normalizedMs = drainMs / completeness;
+		if (worst.normalizedMs === null || normalizedMs > worst.normalizedMs) {
+			worst = { normalizedMs, drainMs, completeness };
+		}
+	}
+	return worst;
 }
 
 function str(value: unknown): string | null {
@@ -49,18 +92,21 @@ export function burstFloorFacts(input: {
 }): BurstFloorFacts {
 	const recv = (input.recv ?? null) as Record<string, unknown> | null;
 	const send = (input.send ?? null) as Record<string, unknown> | null;
+	// Amendment 5: the drain is the worst burst normalized by its own
+	// completeness, and the emission is the sender's work net of its backoff
+	// sleeps. An artifact written before the amendment carries neither, so it
+	// reads as absent and fires — which is right: V-SP's rule is not computable
+	// from a pre-amendment probe.
+	const worst = worstNormalizedBurst(recv);
 	return {
 		artifactDate: recv ? str(recv.date) : null,
 		runDate: input.runDate,
 		host: recv ? str(recv.host) : null,
 		expectedHost: input.expectedHost,
-		// Amendment 5: the drain is the worst burst, and the emission the sender's
-		// own work net of its backoff sleeps. An artifact written before the
-		// amendment carries neither field, so it reads as null and fires — which
-		// is right: V-SP's ceiling is not computable from a pre-amendment probe.
-		burstDrainMaxMs: recv ? finite(recv.drainMsMax) : null,
+		burstNormalizedDrainMaxMs: worst.normalizedMs,
+		burstDrainMs: worst.drainMs,
+		burstCompleteness: worst.completeness,
 		burstEmitNetMaxMs: send ? finite(send.emitMsNetMax) : null,
 		burstEmitMaxMs: send ? finite(send.emitMsMax) : null,
-		burstCompletenessMin: recv ? finite(recv.completenessMin) : null,
 	};
 }

@@ -649,40 +649,48 @@ export function sinkFalsifier(
  *   that drops the tail of a burst produces a *shorter* `last − first` window,
  *   so loss used to make the sink look faster. Completeness is still never
  *   bounded — a raw UDP probe's loss is the path's, not the sink's — but a
- *   62%-complete burst no longer earns credit for a 62%-length drain.
+ *   62%-complete burst no longer earns credit for a 62%-length drain. The
+ *   normalization is per burst (`burstFloorFacts`), so the number here is a
+ *   burst that happened rather than a worst-of-each composite.
  */
 export function spreadFloorFalsifier(
 	facts: PrecheckFacts & {
-		burstDrainMaxMs: number | null;
+		burstNormalizedDrainMaxMs: number | null;
+		burstDrainMs: number | null;
+		burstCompleteness: number | null;
 		burstEmitNetMaxMs: number | null;
 		burstEmitMaxMs: number | null;
-		burstCompletenessMin: number | null;
 	},
 ): { fires: boolean; reason: string } {
 	const stale = sameDayOnExpectedHost(facts);
 	if (stale) return { fires: true, reason: `V-SP: ${stale}` };
-	if (facts.burstDrainMaxMs === null || facts.burstEmitNetMaxMs === null) {
-		return { fires: true, reason: "V-SP: no same-day burst-probe artifact" };
+	if (facts.burstEmitNetMaxMs === null) {
+		return {
+			fires: true,
+			reason: "V-SP: no same-day burst-probe send artifact",
+		};
 	}
 	if (
-		facts.burstCompletenessMin === null ||
-		!(facts.burstCompletenessMin > 0)
+		facts.burstNormalizedDrainMaxMs === null ||
+		facts.burstDrainMs === null ||
+		facts.burstCompleteness === null
 	) {
 		return {
 			fires: true,
 			reason:
-				"V-SP: burst completeness undisclosed or zero — the drain cannot be normalized",
+				"V-SP: no per-burst drain and completeness to normalize — " +
+				"an unnormalizable drain is not a cleared sink",
 		};
 	}
 	const ceiling = sinkDrainCeilingMs(facts.burstEmitNetMaxMs);
-	const normalized = facts.burstDrainMaxMs / facts.burstCompletenessMin;
 	const disclosure =
-		`drain max ${facts.burstDrainMaxMs.toFixed(2)} ms ÷ completeness min ` +
-		`${facts.burstCompletenessMin.toFixed(3)} = ${normalized.toFixed(2)} ms; ` +
-		`ceiling ${ceiling.toFixed(2)} ms (1.2 × net emission max ` +
+		`worst burst drain ${facts.burstDrainMs.toFixed(2)} ms ÷ its completeness ` +
+		`${facts.burstCompleteness.toFixed(3)} = ` +
+		`${facts.burstNormalizedDrainMaxMs.toFixed(2)} ms; ceiling ` +
+		`${ceiling.toFixed(2)} ms (1.2 × net emission max ` +
 		`${facts.burstEmitNetMaxMs.toFixed(2)} ms; gross ` +
 		`${facts.burstEmitMaxMs === null ? "undisclosed" : `${facts.burstEmitMaxMs.toFixed(2)} ms`})`;
-	if (normalized > ceiling) {
+	if (facts.burstNormalizedDrainMaxMs > ceiling) {
 		return {
 			fires: true,
 			reason: `V-SP: sink drain over ceiling — ${disclosure}`,

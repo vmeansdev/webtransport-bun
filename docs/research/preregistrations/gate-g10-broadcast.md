@@ -1103,12 +1103,15 @@ mechanical defects, one disposition, and one consequence for the record.
    is `last arrival − first arrival`, so a path that drops the tail of every
    burst produces a *shorter* window — heavier loss made the sink look faster,
    and `burstCompletenessMin` was formatted into the reason string and compared
-   against nothing. V-SP now compares `drainMax / completenessMin`. This keeps
-   Amendment 4's stance that the raw probe's loss is the path's and is **never
-   bounded** — no floor is registered on completeness — while stopping a
-   62%-complete burst from being credited with a 62%-length drain. An artifact
-   with no completeness figure fires: a drain that cannot be normalized is not a
-   cleared sink.
+   against nothing. V-SP now grades the **worst burst's drain divided by that
+   same burst's completeness** — per burst, from the artifact's `perBurst` rows,
+   not `drainMsMax / completenessMin`, because those two summaries can come from
+   two different bursts and dividing one by the other invents a burst that never
+   happened. This keeps Amendment 4's stance that the raw probe's loss is the
+   path's and is **never bounded** — no floor is registered on completeness —
+   while stopping a 62%-complete burst from being credited with a 62%-length
+   drain. Any burst missing either figure makes the whole reading absent, and
+   absent fires: a drain that cannot be normalized is not a cleared sink.
 3. **`drainMsP99` is retired in favour of `drainMsMax`.** At the registered
    `bursts = 30`, `ceil(0.99 × 30) − 1 = 29` — the field named p99 *was* the
    maximum, wearing a name that promised robustness the sample size cannot
