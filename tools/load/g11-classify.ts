@@ -147,6 +147,14 @@ export type TunnelCellFacts = {
 	 * cell — V-W is what refuses it (ticket 01's pre-registered formula).
 	 */
 	deadlineBreached: boolean;
+	/**
+	 * The generator's exit status, `null` if it was never reaped. It grades
+	 * nothing — a crashed generator under-offers and V-P already refuses the cell
+	 * — but V-P's reason string says "offered/target 0.31", which costs a
+	 * post-mortem the hour it takes to discover the process died. V-W carries it
+	 * so the artifact answers that question without a log dig.
+	 */
+	generatorExitCode: number | null;
 
 	maxQueuedBytesPerSession: number;
 	maxQueuedBytesGlobal: number;
@@ -287,9 +295,17 @@ export function falsifiersForTunnelCell(
 	results.push({
 		id: "V-W",
 		fired: facts.deadlineBreached,
-		detail: facts.deadlineBreached
-			? "deadline breached: the generator was killed mid-cell, so this window is truncated and every counter under it is partial"
-			: "generator exited inside its pre-registered deadline",
+		detail: `${
+			facts.deadlineBreached
+				? "deadline breached: the generator was killed mid-cell, so this window is truncated and every counter under it is partial"
+				: "generator exited inside its pre-registered deadline"
+		}; generator exit ${facts.generatorExitCode ?? "unreaped"}${
+			!facts.deadlineBreached &&
+			facts.generatorExitCode !== null &&
+			facts.generatorExitCode !== 0
+				? " (NON-ZERO — this cell's offer is a dead generator's, not a rig's; disclosure, V-P grades it)"
+				: ""
+		}`,
 	});
 
 	results.push({
@@ -467,9 +483,18 @@ export type TunnelRollUp = {
  * V-S is the one falsifier that produces INCOMPLETE rather than INVALID: a
  * saturated host did not measure the product wrongly, it measured a rig that
  * had nothing left to give, and a saturated rung is not a capacity number.
+ *
+ * `registeredRepeats` is required rather than defaulted: §5 grades the gate on
+ * `T-100` at **both repeats**, and a roll-up that stamped PASS on whatever
+ * arrived would read identically whether the second repeat ran or crashed after
+ * the first was banked. A shape that is not the registered one produces
+ * INCOMPLETE — never PASS, never MISS — because no verdict about the registered
+ * shape can be drawn from it. Any falsifier that fired is still named in the
+ * reason, so a short run cannot hide an invalid one behind its shortness.
  */
 export function rollUpTunnelGate(
 	gateCellRepeats: readonly TunnelCellFacts[],
+	registeredRepeats: number,
 ): TunnelRollUp {
 	const clauses: Record<string, ClauseResult[]> = {};
 	const falsifiers: Record<string, FalsifierResult[]> = {};
@@ -499,6 +524,18 @@ export function rollUpTunnelGate(
 			.filter((f) => f.fired && f.id !== "V-S" && f.id !== "V-S2")
 			.map((f) => `${key} ${f.id}: ${f.detail}`),
 	);
+
+	if (gateCellRepeats.length !== registeredRepeats) {
+		const fired = [...firedOther, ...firedSaturation];
+		return {
+			verdict: "INCOMPLETE",
+			reason:
+				`gate cell banked ${gateCellRepeats.length} repeat(s); §5 grades it on ` +
+				`${registeredRepeats}${fired.length > 0 ? ` — falsifiers also fired: ${fired.join(" | ")}` : ""}`,
+			clauses,
+			falsifiers,
+		};
+	}
 
 	if (firedOther.length > 0) {
 		return {

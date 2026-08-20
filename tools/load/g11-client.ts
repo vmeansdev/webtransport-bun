@@ -264,7 +264,11 @@ async function driveSession(args: Args, index: number, wallNs: () => bigint) {
 		sliceQuantum: 1,
 		now: () => performance.now(),
 		sleep: (ms) => Bun.sleep(ms),
-		allocChunk: (n) => Buffer.allocUnsafe(n),
+		// alloc, not allocUnsafe: the pacer allocates once per stream, so the
+		// memset is per-stream, and the Rust generator fills its frame body with
+		// b'x'. Shipping uninitialized pool bytes made the two ends
+		// byte-incomparable for the sake of an allocation nobody repeats.
+		allocChunk: (n) => Buffer.alloc(n),
 		fill: (chunk) => {
 			encodeFrame(chunk, {
 				totalLength: args.frameBytes,

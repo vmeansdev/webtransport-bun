@@ -64,6 +64,7 @@ function healthyCell(over: Partial<TunnelCellFacts> = {}): TunnelCellFacts {
 		streamResets: 0,
 		backpressureTimeouts: 0,
 		streamsClosedBothHalves: SESSIONS,
+		generatorExitCode: 0,
 		floor: {
 			runId: "run-1",
 			host: "bench-1",
@@ -125,15 +126,45 @@ describe("the healthy cell is healthy, or nothing else means anything", () => {
 	});
 
 	test("two healthy repeats roll up to PASS", () => {
-		const roll = rollUpTunnelGate([
-			healthyCell({ repeat: 1 }),
-			healthyCell({ repeat: 2 }),
-		]);
+		const roll = rollUpTunnelGate(
+			[healthyCell({ repeat: 1 }), healthyCell({ repeat: 2 })],
+			2,
+		);
 		expect(roll.verdict).toBe("PASS");
 	});
 
 	test("no repeats is INCOMPLETE, not PASS", () => {
-		expect(rollUpTunnelGate([]).verdict).toBe("INCOMPLETE");
+		expect(rollUpTunnelGate([], 2).verdict).toBe("INCOMPLETE");
+	});
+});
+
+describe("the registered repeat count is enforced, not assumed (§5)", () => {
+	test("one healthy repeat against a registered two is INCOMPLETE, not PASS", () => {
+		// The failure this pins: the second repeat crashed the conductor after the
+		// first was banked, and the artifact read identically to a two-repeat PASS.
+		const roll = rollUpTunnelGate([healthyCell({ repeat: 1 })], 2);
+		expect(roll.verdict).toBe("INCOMPLETE");
+		expect(roll.reason).toContain("banked 1 repeat(s)");
+		// The clauses are still recorded — the run is short, not unreadable.
+		expect(roll.clauses["T-100#1"]?.every((c) => c.pass)).toBe(true);
+	});
+
+	test("a short run does not hide a fired falsifier behind its shortness", () => {
+		const roll = rollUpTunnelGate([healthyCell({ settled: false })], 2);
+		expect(roll.verdict).toBe("INCOMPLETE");
+		expect(roll.reason).toContain("V-D");
+	});
+
+	test("more repeats than registered is also INCOMPLETE", () => {
+		const roll = rollUpTunnelGate(
+			[
+				healthyCell({ repeat: 1 }),
+				healthyCell({ repeat: 2 }),
+				healthyCell({ repeat: 3 }),
+			],
+			2,
+		);
+		expect(roll.verdict).toBe("INCOMPLETE");
 	});
 });
 
@@ -292,8 +323,23 @@ describe("each falsifier rejects the signature it exists for (§4)", () => {
 		const truncated = healthyCell({ deadlineBreached: true, settled: true });
 		expect(fired(truncated)).toContain("V-W");
 		expect(fired(truncated)).not.toContain("V-D");
-		expect(rollUpTunnelGate([truncated]).verdict).toBe("INVALID");
+		expect(rollUpTunnelGate([truncated], 1).verdict).toBe("INVALID");
 		expect(fired(healthyCell())).not.toContain("V-W");
+	});
+
+	test("V-W carries the generator's exit status so V-P is not the only witness", () => {
+		const crashed = healthyCell({ generatorExitCode: 101 });
+		// It grades nothing: V-P is what refuses the under-offer this produces.
+		expect(fired(crashed)).not.toContain("V-W");
+		const detail = falsifiersForTunnelCell(crashed).find(
+			(f) => f.id === "V-W",
+		)?.detail;
+		expect(detail).toContain("generator exit 101");
+		expect(detail).toContain("NON-ZERO");
+		const unreaped = falsifiersForTunnelCell(
+			healthyCell({ generatorExitCode: null }),
+		).find((f) => f.id === "V-W")?.detail;
+		expect(unreaped).toContain("generator exit unreaped");
 	});
 
 	test("V-B — a drop tap that was never read is not a zero", () => {
@@ -386,7 +432,7 @@ describe("roll-up ordering — G3b's lesson, stated as a test", () => {
 	test("a fired falsifier stamps INVALID over clauses that all computed PASS", () => {
 		const facts = healthyCell({ settled: false });
 		expect(failedClauses(facts)).toEqual([]);
-		const roll = rollUpTunnelGate([facts]);
+		const roll = rollUpTunnelGate([facts], 1);
 		expect(roll.verdict).toBe("INVALID");
 		expect(roll.reason).toContain("V-D");
 		// The clauses are still recorded, and they still say PASS. The verdict
@@ -395,21 +441,25 @@ describe("roll-up ordering — G3b's lesson, stated as a test", () => {
 	});
 
 	test("saturation is INCOMPLETE, not INVALID and not a miss", () => {
-		const roll = rollUpTunnelGate([healthyCell({ hostCpuMedianPctOfBox: 95 })]);
+		const roll = rollUpTunnelGate(
+			[healthyCell({ hostCpuMedianPctOfBox: 95 })],
+			1,
+		);
 		expect(roll.verdict).toBe("INCOMPLETE");
 	});
 
 	test("a real falsifier outranks a saturation STOP", () => {
-		const roll = rollUpTunnelGate([
-			healthyCell({ hostCpuMedianPctOfBox: 95, settled: false }),
-		]);
+		const roll = rollUpTunnelGate(
+			[healthyCell({ hostCpuMedianPctOfBox: 95, settled: false })],
+			1,
+		);
 		expect(roll.verdict).toBe("INVALID");
 	});
 
 	test("one bad repeat is enough to lose the gate", () => {
 		const bad = healthyCell({ repeat: 2 });
 		bad.oneWayP99Ms.down = 40;
-		expect(rollUpTunnelGate([healthyCell({ repeat: 1 }), bad]).verdict).toBe(
+		expect(rollUpTunnelGate([healthyCell({ repeat: 1 }), bad], 2).verdict).toBe(
 			"MISS",
 		);
 	});

@@ -749,6 +749,54 @@ between the two SHAs. Everything else in the drift is the mirror feature's own
 files (`datagram_mirror.rs`, `datagram-mirror.ts`, session/registry mirror
 plumbing, bench and docs), none of which the bidi tunnel path reads.
 
+### Amendment 6 — the repeat count §5 already required, now enforced by the classifier (2026-08-20)
+
+Filed after dispatch 1 and **before any further dispatch**, per §10. **No
+threshold moves, no clause changes, no cell changes.** It is recorded here
+rather than left as a harness detail because it changes which run shapes can
+carry a verdict, which is registered ground.
+
+(The number 6 was reserved by a draft amendment on CPU-derived falsifier bars.
+That draft concluded it should **not** be filed — the runner stayed at 4 vCPU —
+so the number was never consumed.)
+
+The registration text this concerns, quoted in full. §5's heading and opening
+sentence:
+
+> ## §5 — Gate clauses (all evaluated on cell `T-100`, both repeats)
+>
+> The gate is **PASS only if every clause passes on both repeats** and no
+> falsifier in §4 fired.
+
+and §2's Arm T row for the gate cell:
+
+> | **`T-100`** | **100** | **off (shipped default)** | **2** | **the gate cell**; every clause in §5 is about this cell |
+
+**Neither sentence changes.** What changes is that the classifier now reads
+them. `rollUpTunnelGate` took only the array of banked repeats and reported
+"every clause passed on N repeat(s)" as PASS for any non-empty N; nothing
+compared N to 2, and `G11_REPEATS` was not recorded in the artifact. A run
+dispatched with `G11_REPEATS=1`, or one whose second repeat died after the
+first was banked, produced a PASS artifact indistinguishable from the
+registered two-repeat one unless a reader counted `cells` keys by hand.
+
+The classifier now takes the registered repeat count as a **required**
+parameter — defaulting it would have left the same call site un-typechecked —
+and returns **INCOMPLETE** whenever the banked count is not the registered one.
+Any falsifier that fired is still named in that reason, so a short run cannot
+launder an invalid one behind its shortness, and the per-repeat clause and
+falsifier tables are still written to the artifact. `gateRepeats` is now
+stamped into `artifact.environment`.
+
+**Why this is strictly tightening.** The only transition it introduces is
+PASS/MISS → INCOMPLETE on a run whose shape is not the registered one. No cell
+that would have failed can now pass; no falsifier is weakened; no bar moves.
+A gate can only become harder to stamp.
+
+**It is retroactively inert.** Run 32291972328 banked `T-100#1` and `T-100#2` —
+both registered repeats — so the new rule would return the same verdict it
+recorded (INVALID via V-P). The §12 row below is unaffected.
+
 ## §12 — Run log
 
 *(empty — no dispatch has occurred)*

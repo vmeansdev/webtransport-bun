@@ -316,6 +316,13 @@ type ServerRecord = {
 	peakSessionQueuedBytes: number;
 	/** Arm X. */
 	acceptedExchangeStreams: number;
+	/**
+	 * Arm X's own completion count. Separate from `streamsFinBothHalves` because
+	 * that one is C4's, and C4 means "this end saw the peer's FIN" — which the
+	 * exchange responder never observes. Folding the two would put a number in
+	 * C4's detail string that C4 does not describe.
+	 */
+	completedExchangeStreams: number;
 	peakConcurrentBidiPerSession: number;
 };
 
@@ -337,12 +344,19 @@ function newRecord(): ServerRecord {
 		writeLatency: new G11Histogram(),
 		peakSessionQueuedBytes: 0,
 		acceptedExchangeStreams: 0,
+		completedExchangeStreams: 0,
 		peakConcurrentBidiPerSession: 0,
 	};
 }
 
 function recordTotal(r: ServerRecord): number {
-	return r.upFrames + r.downFrames + r.streamsFinBothHalves + r.streamErrors;
+	return (
+		r.upFrames +
+		r.downFrames +
+		r.streamsFinBothHalves +
+		r.completedExchangeStreams +
+		r.streamErrors
+	);
 }
 
 /**
@@ -447,7 +461,8 @@ function driveTunnelStream(
 			const arrival = wallNs();
 			record.readCrossings += 1;
 			record.upBytes += value.byteLength;
-			for (const frame of deframer.push(value)) {
+			const frames = deframer.push(value);
+			for (const frame of frames) {
 				record.upFrames += 1;
 				record.upLatency.recordNs(arrival - frame.sendWallNs);
 				record.perSessionUpBytes.set(
@@ -457,7 +472,12 @@ function driveTunnelStream(
 				);
 			}
 			if (withholdMs > 0) {
-				sinceWithhold += 1;
+				// Frames, not read() resolutions. One read after a withhold routinely
+				// carries dozens of frames, so counting crossings drains a batch many
+				// times the intended size and the backlog never sustains at the
+				// registered fraction — the client-opened end (g11-client.ts) has
+				// always counted frames, and the two ends have to mean the same thing.
+				sinceWithhold += frames.length;
 				if (sinceWithhold >= framesPerDrain) {
 					sinceWithhold = 0;
 					await Bun.sleep(withholdMs);
@@ -491,7 +511,10 @@ function driveTunnelStream(
 			sliceQuantum: 1,
 			now: () => performance.now(),
 			sleep: (ms) => Bun.sleep(ms),
-			allocChunk: (n) => Buffer.allocUnsafe(n),
+			// One memset per stream (the pacer allocates once), and it keeps this
+			// end byte-comparable with the Rust generator's `vec![b'x'; n]`
+			// instead of shipping whatever the pool last held.
+			allocChunk: (n) => Buffer.alloc(n),
 			fill: (chunk) => {
 				encodeFrame(chunk, {
 					totalLength: FRAME_BYTES,
@@ -562,10 +585,19 @@ function driveExchangeStream(
 				record.upLatency.recordNs(wallNs() - frame.sendWallNs);
 				if (request === null) request = frame.sequence;
 			}
-			if (request !== null) break;
 		}
+		// Read to EOF rather than breaking on the first frame. Breaking left the
+		// reader locked on an undrained stream for the rest of the cell — at
+		// X-1000 that is 60,000 held native handles, the tail this file's closing
+		// comment describes. Cancelling instead is NOT the fix: it puts
+		// STOP_SENDING on a request half the generator has already finished, and
+		// the generator then abandons the exchange — measured on a wiring smoke as
+		// 1 of 12 completed against 12 of 12, with E_STOP_SENDING and
+		// E_STREAM_RESET on this very path. The generator writes one request frame
+		// and finishes immediately, so the FIN rides with the request and this
+		// loop exits on the read after it.
 		const w = stream.writable.getWriter();
-		const chunk = Buffer.allocUnsafe(EXCHANGE_RESPONSE_BYTES);
+		const chunk = Buffer.alloc(EXCHANGE_RESPONSE_BYTES);
 		encodeFrame(chunk, {
 			totalLength: EXCHANGE_RESPONSE_BYTES,
 			frameClass: FrameClass.Response,
@@ -577,7 +609,7 @@ function driveExchangeStream(
 		record.downFrames += 1;
 		record.downBytes += EXCHANGE_RESPONSE_BYTES;
 		await w.close();
-		record.streamsFinBothHalves += 1;
+		record.completedExchangeStreams += 1;
 	})()
 		.catch((err) => {
 			noteWriteError(record, err, "exchange response");
@@ -1054,6 +1086,7 @@ function tunnelFacts(env: StepEnvelope): TunnelCellFacts {
 		limitExceededCount: env.limitExceededDelta,
 		settled: !env.settleTimedOut,
 		deadlineBreached: env.deadlineBreached,
+		generatorExitCode: env.exitCode ?? null,
 
 		maxQueuedBytesPerSession: DEFAULT_LIMITS.maxQueuedBytesPerSession,
 		maxQueuedBytesGlobal: DEFAULT_LIMITS.maxQueuedBytesGlobal,
@@ -1275,12 +1308,19 @@ async function main(): Promise<void> {
 		}
 	}
 
+	// "Suppresses the roll-up entirely" has to mean all three. A smoke X-1000 is
+	// a 2-session 4-second cell wearing the label of a 1,000-session one, and an
+	// `exchange: { verdict: "PASS" }` beside `wiringCheckOnly: true` is a verdict
+	// that has to be remembered to be ignored — which is the thing this mode
+	// exists not to produce.
 	const gateRepeats = SMOKE ? [] : (tunnelCells[GATE_CELL] ?? []);
-	const gate = rollUpTunnelGate(gateRepeats);
-	const exchangeGate = exchangeCells.find((c) => c.cell === "X-1000");
+	const gate = rollUpTunnelGate(gateRepeats, GATE_REPEATS);
+	const exchangeGate = SMOKE
+		? undefined
+		: exchangeCells.find((c) => c.cell === "X-1000");
 	const exchange = exchangeGate ? rollUpExchangeArm(exchangeGate) : null;
 	const coupling =
-		couplingCells.length > 0 ? readCouplingArm(couplingCells) : null;
+		!SMOKE && couplingCells.length > 0 ? readCouplingArm(couplingCells) : null;
 
 	const artifact = {
 		registration: "docs/research/preregistrations/gate-g11-bidi.md",
@@ -1304,6 +1344,10 @@ async function main(): Promise<void> {
 			exchangeStepSeconds: EXCHANGE_STEP_SECONDS,
 			couplingStepSeconds: COUPLING_STEP_SECONDS,
 			connectStaggerMs: CONNECT_STAGGER_MS,
+			// The repeat count the roll-up was held to. Without it in the artifact a
+			// reader has to count `cells` keys by hand to tell a two-repeat gate from
+			// a one-repeat one, and the two used to read identically.
+			gateRepeats: GATE_REPEATS,
 			shippedLimits: {
 				maxQueuedBytesPerStream: DEFAULT_LIMITS.maxQueuedBytesPerStream,
 				maxQueuedBytesPerSession: DEFAULT_LIMITS.maxQueuedBytesPerSession,

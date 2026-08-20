@@ -50,7 +50,7 @@ import { G11Histogram } from "./g11-histogram.ts";
  * livelocks. (A real timer's 1 ms floor hides this; a fake clock does not, which
  * is why the pacer is tested against one.)
  *
- * A nanosecond of tolerance is 1.5e-7 of the gate arm's 6.71 ms interval —
+ * A nanosecond of tolerance is 2.7e-7 of the gate arm's 3.739 ms interval —
  * seven orders below the 2% overshoot falsifier — so it cannot manufacture an
  * offer. It is a rounding guard, not a design tolerance.
  */

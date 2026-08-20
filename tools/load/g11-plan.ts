@@ -170,9 +170,11 @@ export function backlogTargetBytes(fraction: number): number {
 }
 
 /**
- * How long the server must withhold consumption to accumulate `targetBytes` of
- * unconsumed inbound reservation at the arm's inbound frame rate. Expressed as
- * a per-frame delay because that is the knob the harness actually has.
+ * How long the slow end must withhold consumption to accumulate `targetBytes` of
+ * unconsumed inbound reservation at the arm's inbound frame rate. This is the
+ * **total** accumulation time for the whole backlog, not a per-frame delay — at
+ * f = 0.95 it is 664 ms — and both call sites hold it once per drained batch of
+ * `targetBytes / FRAME_BYTES` frames. Do not divide it by the frame count.
  */
 export function consumptionDelayMsForBacklog(targetBytes: number): number {
 	const framesToHold = targetBytes / FRAME_BYTES;
