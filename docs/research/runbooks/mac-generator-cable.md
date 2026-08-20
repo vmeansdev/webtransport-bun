@@ -1,33 +1,34 @@
 # Cable day: this Mac as the off-box load generator
 
-**Status:** prepared 2026-08-19, link not yet connected. Everything marked
-`[verified]` was run on this Mac today; everything marked `[human]` needs the
-cable and a person; everything marked `[ssh]` can be automated once the link is
-up. Nothing in the "Verified now" section depends on the cable.
+**Status:** cable connected and verified 2026-08-19/20 against the bare-metal
+runner `gravvene-dev-home`. Everything marked `[verified]` was run for real;
+`[human]` needs a person at the hardware; `[ssh]` is automatable over the link.
 
 **Topology**
 
 ```
-  this Mac (arm64, 10 cores, 64 GB)          Windows host `home-windows`
+  this Mac (arm64, 10 cores, 64 GB)          gravvene-dev-home (bare metal)
   ┌──────────────────────────┐               ┌──────────────────────────────┐
-  │  load generator          │               │  Hyper-V                     │
-  │  10.99.0.1/24            │──── cable ────│  external vSwitch "bench"    │
-  │  (Wi-Fi keeps the        │               │      │                       │
-  │   default route)         │               │      └── runner VM           │
-  └──────────────────────────┘               │          10.99.0.2/24        │
-                                             │          (LAN 192.168.2.35   │
-                                             │           stays for CI/ssh)  │
+  │  load generator          │               │  Ubuntu, no hypervisor       │
+  │  10.99.0.1/24 (enN)      │──── cable ────│  eno1  10.99.0.2/24 static   │
+  │  (Wi-Fi keeps the        │               │                              │
+  │   default route)         │               │  wlp1s0 192.168.2.25 (DHCP)  │
+  └──────────────────────────┘               │  keeps the default route,    │
+                                             │  carries CI + ssh + WAN      │
+                                             │  tailscale0 100.87.169.29    │
                                              └──────────────────────────────┘
 ```
 
-The runner VM keeps its existing LAN NIC. The cable adds a *second* NIC used for
-nothing but bench traffic, so a mistake on the bench subnet cannot take the
+There is no Hyper-V, no vSwitch, and no VM anywhere in this path any more: the
+runner is the physical host. The cable is a direct NIC-to-NIC link on `eno1`,
+carrying bench traffic and nothing else. The box's Wi-Fi interface `wlp1s0`
+owns the default route, so a mistake on the bench subnet cannot take the
 self-hosted runner off GitHub mid-dispatch.
 
 Why this Mac rather than `v-ubuntu-loadgen`: 10 cores vs 3 vCPU, 64 GB vs a
 1280 MB static allocation that has already failed two power-ons for host-RAM
-slack, and no Hyper-V internal-switch hop on the generator side. The loadgen VM
-stays as the documented fallback; do not power it on for this path.
+slack. The loadgen VM belonged to the retired Hyper-V estate; do not resurrect
+it for this path.
 
 ---
 
@@ -82,70 +83,68 @@ generator co-residence", not "off-box raises the ceiling".
 
 ### 1. `[human]` Physical
 
-Plug the cable between this Mac's Ethernet adapter and the spare NIC on
-`home-windows`. If the Windows box has only one NIC, stop — the LAN NIC must not
-be repurposed or the runner leaves GitHub.
+Plug the cable between this Mac's Ethernet adapter and `eno1` on
+`gravvene-dev-home`. `eno1` is the box's only wired NIC and is dedicated to
+this link — the box reaches the LAN, GitHub, and ssh over Wi-Fi (`wlp1s0`), so
+taking `eno1` for the bench subnet cannot pull the runner off GitHub.
 
-### 2. `[human]` Windows: an external vSwitch on the new NIC
+### 2. `[ssh]` The box: give `eno1` its static address
 
-Hyper-V Manager → Virtual Switch Manager → New virtual network switch →
-External → select the **new** NIC → name it `bench`.
+Steps 2 and 3 replace what used to be three Hyper-V steps. There is no
+hypervisor, no virtual switch, and no VM: `eno1` is a physical NIC on the
+runner itself, so the address goes straight into netplan. Do this over the
+*Wi-Fi* path (`ssh home-ubuntu`, i.e. tailscale `100.87.169.29` or LAN
+`192.168.2.25`), never over the cable you are reconfiguring.
 
-**Leave "Allow management operating system to share this network adapter"
-UNCHECKED.** With it unchecked the Windows host takes no address on the bench
-link, the frames are switched straight to the VM, and Windows Firewall is not in
-the path at all — which removes a whole class of cable-day mystery. It also
-means you cannot ping the Windows host over the cable; that is intended.
-
-PowerShell equivalent (as Administrator):
-
-```powershell
-Get-NetAdapter                       # find the new NIC's Name
-New-VMSwitch -Name bench -NetAdapterName "<NIC name>" -AllowManagementOS $false
-```
-
-### 3. `[human]` Windows: give the runner VM a second NIC
-
-```powershell
-Add-VMNetworkAdapter -VMName "<runner VM name>" -SwitchName bench -Name bench
-```
-
-The VM can stay running; Hyper-V hot-adds NICs to Generation 2 VMs. Confirm the
-existing LAN adapter is untouched:
-
-```powershell
-Get-VMNetworkAdapter -VMName "<runner VM name>"   # expect two, LAN + bench
-```
-
-### 4. `[ssh]` Runner VM: address the new NIC
-
-Over the *existing* LAN ssh (`192.168.2.35`), never over the new link:
+`[verified]` — this is the live config, `/etc/netplan/60-bench-cable.yaml`:
 
 ```bash
-ip -br link                                  # the new NIC appears, no address
-sudo tee /etc/netplan/60-bench.yaml >/dev/null <<'EOF'
+sudo tee /etc/netplan/60-bench-cable.yaml >/dev/null <<'EOF'
 network:
   version: 2
   ethernets:
-    <new-iface>:
-      addresses: [10.99.0.2/24]
+    eno1:
       dhcp4: false
-      # No gateway and no nameservers: the LAN NIC keeps the default route, so
-      # a bench-subnet mistake cannot take the runner off GitHub.
+      dhcp6: false
+      addresses: [10.99.0.2/24]
+      # No gateway and no nameservers: wlp1s0 keeps the default route, so a
+      # bench-subnet mistake cannot take the runner off GitHub.
 EOF
+sudo chmod 600 /etc/netplan/60-bench-cable.yaml
 sudo netplan apply
-ip -br addr show <new-iface>                 # expect 10.99.0.2/24
-ip route | head                              # default route must still be the LAN one
 ```
 
-If `ufw` is active, allow the bench subnet only:
+Note `00-installer-config.yaml` pins `eno1` by MAC (`84:47:09:72:aa:3d`) with
+`set-name: eno1`, so the interface name is stable across reboots and the two
+files do not fight.
+
+### 3. `[ssh]` The box: confirm the split
 
 ```bash
-sudo ufw status
+ip -br addr show eno1        # expect: UP  10.99.0.2/24
+ip route get 8.8.8.8         # expect: via 192.168.2.254 dev wlp1s0  ← default stays Wi-Fi
+ip route get 10.99.0.1       # expect: dev eno1 src 10.99.0.2        ← cable only
+sudo ethtool eno1 | grep -E 'Speed|Duplex|Link detected'
+```
+
+`[verified]` 2026-08-20: `10.99.0.2/24` on `eno1`, default route via `wlp1s0`,
+and `Speed: 1000Mb/s / Duplex: Full / Link detected: yes` — the link is 1 GbE,
+which confirms the ~103k pps ceiling predicted above. Do not claim this path
+raises the bandwidth ceiling.
+
+### 4. `[ssh]` Firewall
+
+`ufw` is **inactive** on this box `[verified]`, so there is nothing to open and
+no rule to add. If someone enables it later, the bench subnet needs:
+
+```bash
 sudo ufw allow from 10.99.0.0/24 to any port 4400:4500 proto udp   # gate ports
 sudo ufw allow from 10.99.0.0/24 to any port 5201 proto tcp        # iperf3 control
 sudo ufw allow from 10.99.0.0/24 to any port 5201 proto udp        # iperf3 data
 ```
+
+Docker's bridges (`172.17/16`, `172.18/16`, `172.19/16`) and tailscale
+(`100.64/10`) were checked against `10.99.0.0/24` and do not collide.
 
 ### 5. `[human]` This Mac: address the interface
 
@@ -235,15 +234,25 @@ cd ~/wt-macgen && cargo build --release -p reference --bin load-client   # warms
 on each invocation and refuses a dirty clone, an abbreviated SHA, or a branch
 name. Keep the clone dedicated: it gets `git checkout --detach`ed under you.
 
-### 9. `[human]` Enable runner→Mac ssh (only if orchestration option B is taken)
+### 9. `[verified]` box→Mac ssh (only if orchestration option B is taken)
 
-System Settings → General → Sharing → **Remote Login: on**, "Allow access for"
-limited to your user. Then, from the runner over the LAN, install its key:
+Remote Login is on and the Mac's sshd answers on `10.99.0.1:22`. The box user
+is `hermes-admin`; the **Mac user is `vmeansdev`** — not `hermes-admin`, which
+is the mistake this step exists to prevent. Provisioned 2026-08-20: the box
+holds `~/.ssh/id_ed25519` (comment `gravvene-dev-home->mac`), its public half
+is in the Mac's `~vmeansdev/.ssh/authorized_keys`, and the Mac's host key is in
+the box's `known_hosts`.
 
 ```bash
-ssh-copy-id -i ~/.ssh/<runner key>.pub <mac-user>@10.99.0.1
-ssh <mac-user>@10.99.0.1 tools/offbox/mac-generator-entry.sh --candidate <sha> --plan
+# on the box; passwordless, non-interactive
+ssh -o BatchMode=yes vmeansdev@10.99.0.1 hostname      # → Nikitas-MacBook-Pro.local
+ssh vmeansdev@10.99.0.1 tools/offbox/mac-generator-entry.sh --candidate <sha> --plan
 ```
+
+Going the other way, the Mac's `known_hosts` entry for `10.99.0.2` must be the
+bare-metal box's key, `SHA256:KQYKRi4aNbXjiNmfbVsnwX/YJoy0q6gVCLx9eQG53s0`. The
+retired VM used to hold that address; if `ssh` warns about a changed key,
+`ssh-keygen -R 10.99.0.2` and re-verify the fingerprint above before accepting.
 
 Scope it to the cable subnet in the macOS application firewall, and remember to
 turn Remote Login back off when the gate campaign ends.
