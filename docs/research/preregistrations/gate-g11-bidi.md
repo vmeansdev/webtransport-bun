@@ -788,10 +788,18 @@ launder an invalid one behind its shortness, and the per-repeat clause and
 falsifier tables are still written to the artifact. `gateRepeats` is now
 stamped into `artifact.environment`.
 
-**Why this is strictly tightening.** The only transition it introduces is
-PASS/MISS → INCOMPLETE on a run whose shape is not the registered one. No cell
-that would have failed can now pass; no falsifier is weakened; no bar moves.
-A gate can only become harder to stamp.
+**Why this is strictly tightening.** Every transition it introduces lands on
+INCOMPLETE, and only on runs whose shape is not the registered one:
+PASS → INCOMPLETE, MISS → INCOMPLETE, and INVALID → INCOMPLETE. No cell that
+would have failed can now pass, no falsifier is weakened, and no bar moves —
+a gate can only become harder to stamp.
+
+The third transition is named rather than glossed: a short run that also fired
+a falsifier now reads INCOMPLETE where it would have read INVALID. That is not
+a downgrade of the finding — the fired falsifier is quoted verbatim in the
+INCOMPLETE reason, and neither verdict licenses a claim — but a reader who
+wants "the instrument was faulty" rather than "the run was short" must read the
+reason string, and both facts are in it.
 
 **It is retroactively inert.** Run 32291972328 banked `T-100#1` and `T-100#2` —
 both registered repeats — so the new rule would return the same verdict it
