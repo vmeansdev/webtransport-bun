@@ -204,10 +204,23 @@ mod linux {
         other_origin: u64,
     }
 
-    fn now_ns() -> u64 {
+    fn read_clock(id: libc::clockid_t) -> u64 {
         let mut ts: libc::timespec = unsafe { mem::zeroed() };
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        unsafe { libc::clock_gettime(id, &mut ts) };
         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    fn now_ns() -> u64 {
+        read_clock(libc::CLOCK_MONOTONIC)
+    }
+
+    /// Software TX timestamps come back on CLOCK_REALTIME; the txtime grid is
+    /// CLOCK_MONOTONIC. Without this offset the two are ~decades apart.
+    fn realtime_minus_monotonic_ns() -> i128 {
+        let a = read_clock(libc::CLOCK_MONOTONIC);
+        let rt = read_clock(libc::CLOCK_REALTIME);
+        let b = read_clock(libc::CLOCK_MONOTONIC);
+        i128::from(rt) - i128::from(a / 2 + b / 2)
     }
 
     fn sleep_ns(ns: u64) {
@@ -267,6 +280,7 @@ mod linux {
         let mut errs = ErrCounts::default();
         let mut send_errors: u64 = 0;
 
+        let clock_offset = realtime_minus_monotonic_ns();
         let base = now_ns() + lead_ns;
         let t0 = now_ns();
         for seq in 0..args.count {
@@ -301,8 +315,10 @@ mod linux {
             let mut ids: Vec<u32> = departures.keys().copied().collect();
             ids.sort_unstable();
             (
-                ids.iter().map(|id| departures[id]).collect::<Vec<u64>>(),
-                "SO_TIMESTAMPING/TX_SOFTWARE (post-qdisc, driver handoff)",
+                ids.iter()
+                    .map(|id| (i128::from(departures[id]) - clock_offset).max(0) as u64)
+                    .collect::<Vec<u64>>(),
+                "SO_TIMESTAMPING/TX_SOFTWARE (post-qdisc driver handoff, CLOCK_REALTIME rebased onto CLOCK_MONOTONIC)",
             )
         } else {
             (
@@ -338,8 +354,11 @@ mod linux {
             json_escape(clock)
         ));
         json.push_str(&format!(
-            ",\"target_gap_us\":{:.3},\"wall_ms\":{:.3},\"sent\":{},\"send_errors\":{}\
+            ",\"lead_ms\":{},\"realtime_minus_monotonic_ns\":{}\
+             ,\"target_gap_us\":{:.3},\"wall_ms\":{:.3},\"sent\":{},\"send_errors\":{}\
              ,\"departures_reported\":{}",
+            args.lead_ms,
+            clock_offset,
             target_gap_ns as f64 / 1000.0,
             wall_ns as f64 / 1e6,
             submit_ns.len(),
