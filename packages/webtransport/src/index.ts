@@ -564,6 +564,12 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
+	/**
+	 * Diagnostic, unstable, NOT public API (see egress_pacer.rs): windowed
+	 * pacer counters for bench tooling. Absent on addons without the pacer.
+	 */
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
 	/** Effective congestion-control mode applied to all server connections. */
 	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
@@ -1316,6 +1322,9 @@ type NativeConnectSessionHandle = {
 } & Partial<NativeSessionHandle>;
 interface NativeServerHandle {
 	port: number;
+	/** Diagnostic, unstable (egress pacer); may be absent on older addons. */
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
 	close(): Promise<void>;
 	updateCert(certPem: string, keyPem: string): Promise<void>;
 	updateTls(configJson: string): Promise<void>;
@@ -2248,6 +2257,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
+		// Diagnostic, unstable, deliberately underscore-prefixed (see
+		// egress_pacer.rs): the facade closes over the handle, so without these
+		// forwards the pacer's own counters are unreachable from bench code.
+		// Pure accessors — they cannot influence pacing or any measured path.
+		__pacerStatsSnapshot: () => handle.__pacerStatsSnapshot?.() ?? 0,
+		__pacerStatsJson: (token?: number) =>
+			handle.__pacerStatsJson?.(token) ?? "{}",
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);
