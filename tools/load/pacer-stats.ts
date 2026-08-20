@@ -16,10 +16,21 @@
  *    the drive window opens and the read taken as it closes is the only thing
  *    a per-cell rule may read; the raw cumulative pair travels beside it so a
  *    reader can check the subtraction.
- * 3. **Honest about what does not subtract.** `pps`/`clump`/`queueMs` are
- *    configuration, `pendingTargets` is a gauge, and `maxLatenessUs` is a
- *    since-process-start maximum — a difference of maxima is not a windowed
- *    maximum, so it is carried unsubtracted and labelled, never differenced.
+ * 3. **Honest about what does not subtract.** `pps`/`clump`/`queueMs`/
+ *    `maxPendingTargets` are configuration, `pendingTargets` is a gauge, and
+ *    `maxLatenessUsSinceProcessStart` is a since-process-start maximum — a
+ *    difference of maxima is not a windowed maximum, so it is carried
+ *    unsubtracted under its own name, never differenced.
+ *
+ * That third property was held by a list of literal field names, and the native
+ * side outgrew the list: `maxLatenessUs` became
+ * `maxLatenessUsSinceProcessStart`, so the maximum vanished from
+ * `sinceProcessStart` and reappeared inside `windowed` as `close - open` — a
+ * difference of maxima in the one object a per-cell rule is allowed to read.
+ * A rung whose worst lateness predated its window would have read as perfectly
+ * paced. Names are now matched by rule, not by literal: anything ending
+ * `SinceProcessStart` is carried, and nothing whose name says `max` is ever
+ * differenced.
  */
 
 /** Counters that accumulate and therefore subtract across a window. */
@@ -35,8 +46,38 @@ const COUNTER_FIELDS = [
 	"threadStartFailures",
 ] as const;
 
-/** Configuration echoed by the pacer; identical in both reads of a window. */
-const CONFIG_FIELDS = ["pps", "clump", "queueMs"] as const;
+/**
+ * Configuration echoed by the pacer; identical in both reads of a window.
+ *
+ * `maxPendingTargets` is the admission bound (`cfg.max_pending()`), not a
+ * counter and not a gauge — it is here so it travels as the constant it is
+ * rather than being differenced to a meaningless zero.
+ */
+const CONFIG_FIELDS = ["pps", "clump", "queueMs", "maxPendingTargets"] as const;
+
+/** Gauges: read at an instant, meaningless as a difference. */
+const GAUGE_FIELDS = ["pendingTargets"] as const;
+
+/**
+ * Since-process-start values, matched by suffix rather than by name.
+ *
+ * The native side has already renamed one of these once (`maxLatenessUs` →
+ * `maxLatenessUsSinceProcessStart`) and a hardcoded list did not survive it.
+ * The bare legacy name is still recognised so an older addon stays readable.
+ */
+function isSinceProcessStart(field: string): boolean {
+	return field.endsWith("SinceProcessStart") || field === "maxLatenessUs";
+}
+
+/**
+ * The backstop, and the one rule that does not depend on knowing the schema: a
+ * field whose name says `max` is a maximum, and the difference of two maxima is
+ * not the maximum over the window between them. Whatever the pacer adds next,
+ * it does not land in `windowed` by being unrecognised.
+ */
+function namesAMaximum(field: string): boolean {
+	return /max/i.test(field);
+}
 
 export type PacerStatsRaw = Record<string, number>;
 
@@ -49,14 +90,22 @@ export type PacerStatsReport = {
 	/** Configuration as the pacer reports it, when both reads agree. */
 	config: Record<string, number>;
 	/**
-	 * Since-process-start values that are not differences: `maxLatenessUs` is a
-	 * running maximum and `pendingTargets` a queue depth at the instant read.
+	 * Since-process-start values that are not differences, under the names the
+	 * pacer emits them under: `maxLatenessUsSinceProcessStart` is a running
+	 * maximum and `pendingTargets` a queue depth at the instant read.
 	 */
 	sinceProcessStart: Record<string, number>;
 	/** The raw reads, so the subtraction above can be checked. */
 	cumulative: { atWindowOpen: PacerStatsRaw; atWindowClose: PacerStatsRaw };
 	/** Set when the two reads disagree about pps/clump/queueMs. */
 	configChangedMidWindow?: Record<string, { open: number; close: number }>;
+	/**
+	 * Fields the pacer emitted that this file declined to difference because
+	 * their names say `max`, and that it also did not recognise as
+	 * since-process-start. Present so a schema addition shows up as a name in
+	 * the artifact rather than as a plausible-looking number inside `windowed`.
+	 */
+	refusedDifferencing?: string[];
 };
 
 /**
@@ -155,10 +204,17 @@ export function windowPacerStats(
 	}
 	// Fields the pacer grew that this file predates still travel: an unknown
 	// counter is more useful differenced than dropped, and dropping it silently
-	// is how the next schema addition goes unnoticed for a whole sweep.
+	// is how the next schema addition goes unnoticed for a whole sweep. But an
+	// unknown *maximum* differenced is worse than dropped — it reads as a
+	// windowed maximum and is not one — so those are named instead.
+	const refused: string[] = [];
 	for (const [field, close] of Object.entries(atWindowClose)) {
 		if (field in windowed) continue;
 		if (isKnownNonCounter(field)) continue;
+		if (namesAMaximum(field)) {
+			refused.push(field);
+			continue;
+		}
 		const open = atWindowOpen[field];
 		if (typeof open === "number") windowed[field] = close - open;
 	}
@@ -175,8 +231,15 @@ export function windowPacerStats(
 		}
 	}
 
+	// Carried under whatever name the pacer emitted, not translated into one this
+	// file prefers: a reader matching the artifact against `stats_json` has to
+	// find the same key.
 	const sinceProcessStart: Record<string, number> = {};
-	for (const field of ["maxLatenessUs", "pendingTargets"] as const) {
+	for (const [field, close] of Object.entries(atWindowClose)) {
+		if (!isSinceProcessStart(field)) continue;
+		if (typeof close === "number") sinceProcessStart[field] = close;
+	}
+	for (const field of GAUGE_FIELDS) {
 		const close = atWindowClose[field];
 		if (typeof close === "number") sinceProcessStart[field] = close;
 	}
@@ -188,14 +251,22 @@ export function windowPacerStats(
 		cumulative: { atWindowOpen, atWindowClose },
 	};
 	if (Object.keys(drift).length > 0) report.configChangedMidWindow = drift;
+	if (refused.length > 0) {
+		report.refusedDifferencing = refused;
+		console.warn(
+			`bench-g10: pacer stats carried ${refused.join(", ")} undifferenced — ` +
+				"the name says maximum and a difference of maxima is not a windowed " +
+				"maximum. Add it to this file's rules if that reading is wrong.",
+		);
+	}
 	return report;
 }
 
 function isKnownNonCounter(field: string): boolean {
 	return (
 		(CONFIG_FIELDS as readonly string[]).includes(field) ||
-		field === "maxLatenessUs" ||
-		field === "pendingTargets"
+		(GAUGE_FIELDS as readonly string[]).includes(field) ||
+		isSinceProcessStart(field)
 	);
 }
 
