@@ -13,6 +13,7 @@ import {
 	advertisedPerSessionBytes,
 	BACKLOG_FRACTIONS,
 	backlogTargetBytes,
+	backlogWitnessBytes,
 	bytesPerSecPerDirection,
 	consumptionDelayMsForBacklog,
 	EXCHANGE_GATE_RUNG,
@@ -137,6 +138,15 @@ describe("Arm D arithmetic", () => {
 	test("an out-of-range fraction is refused, not clamped", () => {
 		expect(() => backlogTargetBytes(1.5)).toThrow();
 		expect(() => backlogTargetBytes(-0.1)).toThrow();
+		expect(() => backlogWitnessBytes(1.5)).toThrow();
+	});
+
+	test("the witness bar is half the target the cell is registered at", () => {
+		expect(backlogWitnessBytes(0)).toBe(0);
+		expect(backlogWitnessBytes(0.95)).toBe(124_518);
+		for (const f of BACKLOG_FRACTIONS) {
+			expect(backlogWitnessBytes(f)).toBeLessThan(backlogTargetBytes(f) + 1);
+		}
 	});
 
 	test("the consumption delay to reach a backlog is derivable", () => {

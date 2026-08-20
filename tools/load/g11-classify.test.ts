@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
 	type CouplingCellFacts,
 	clausesForExchangeCell,
@@ -28,7 +29,10 @@ import {
 	type TunnelCellFacts,
 } from "./g11-classify.ts";
 import {
+	backlogTargetBytes,
+	backlogWitnessBytes,
 	FRAME_BYTES,
+	REGISTERED_GATE_REPEATS,
 	SHIPPED_QUEUED_BYTES_GLOBAL,
 	SHIPPED_QUEUED_BYTES_PER_SESSION,
 	TUNNEL_GATE_RUNG,
@@ -165,6 +169,56 @@ describe("the registered repeat count is enforced, not assumed (§5)", () => {
 			2,
 		);
 		expect(roll.verdict).toBe("INCOMPLETE");
+	});
+
+	test("the registered count is 2, off §2's Arm T row", () => {
+		expect(REGISTERED_GATE_REPEATS).toBe(2);
+	});
+
+	// The check above is only worth anything if the harness feeds it the
+	// *registration's* number. Fed the dispatch input on both sides it compares
+	// `G11_REPEATS` with itself and can never fail on a short dispatch — the
+	// exact hole this describe block was written to close, and one no test of
+	// `rollUpTunnelGate` alone can see, because every such test passes the count
+	// as a literal. So the wiring is asserted at the call site, in source.
+	describe("the harness passes the registration's count, not the dispatch's", () => {
+		const source = readFileSync(
+			new URL("./bench-g11.ts", import.meta.url),
+			"utf8",
+		);
+
+		test("the roll-up call site reads REGISTERED_GATE_REPEATS", () => {
+			expect(source).toContain(
+				"rollUpTunnelGate(gateRepeats, REGISTERED_GATE_REPEATS)",
+			);
+		});
+
+		test("no roll-up call site reads the driven count", () => {
+			const calls = source.match(/rollUpTunnelGate\([^)]*\)/g) ?? [];
+			expect(calls.length).toBe(1);
+			for (const call of calls) {
+				expect(call).not.toContain("DRIVEN_GATE_REPEATS");
+				expect(call).not.toContain("G11_REPEATS");
+			}
+		});
+
+		test("a dispatch short by one bank reads INCOMPLETE against it", () => {
+			// G11_REPEATS=1: one repeat driven, one banked, and the registered two
+			// is what it is graded against.
+			const roll = rollUpTunnelGate(
+				[healthyCell({ repeat: 1 })],
+				REGISTERED_GATE_REPEATS,
+			);
+			expect(roll.verdict).toBe("INCOMPLETE");
+			expect(roll.reason).toContain("banked 1 repeat(s)");
+		});
+
+		test("both counts are stamped, so a short run is visible in the artifact", () => {
+			expect(source).toContain("gateRepeatsDriven: DRIVEN_GATE_REPEATS");
+			expect(source).toContain(
+				"gateRepeatsRegistered: REGISTERED_GATE_REPEATS",
+			);
+		});
 	});
 });
 
@@ -585,7 +639,11 @@ function couplingCell(
 		downstreamWriteP99Ms: 0.4,
 		backpressureTimeouts: 0,
 		streamErrors: 0,
-		peakSessionQueuedBytes: 4096,
+		// A cell that reached the backlog it was registered at. Every reading
+		// below is about what such a backlog does, so the default fixture has to
+		// be one — a cell that never built its backlog is its own case, tested
+		// separately.
+		peakSessionQueuedBytes: backlogTargetBytes(fraction),
 		deadlineBreached: false,
 		...over,
 	};
@@ -646,6 +704,69 @@ describe("Arm D, per end — D-P1' against D-F1' (Amendment 2)", () => {
 		).toBe("INDETERMINATE");
 	});
 
+	test("a cell that never built its backlog reads nothing at all", () => {
+		// Run 32291972328's Arm D, reconstructed: flat write latency, no timeouts,
+		// and `peak queued 0 B` at a registered f = 0.95. Before this falsifier
+		// that pair read COUPLING-REFUTED — a claim about a per-stream budget
+		// under a backlog that the harness's own counter says never accumulated.
+		const reading = readCouplingEnd([
+			couplingCell("server-accepted", 0),
+			couplingCell("server-accepted", 0.95, {
+				downstreamWriteP99Ms: 0.64,
+				peakSessionQueuedBytes: 0,
+			}),
+		]);
+		expect(reading.reading).toBe("INDETERMINATE");
+		expect(reading.detail).toContain("peak queued 0 B");
+	});
+
+	test("the witness bar is half the registered target, not the whole of it", () => {
+		// A withholding reader's peak is sawtooth. Sampling it just above half a
+		// target is a shaped cell, not a missing backlog.
+		const justOver = backlogWitnessBytes(0.95) + 1;
+		expect(
+			readCouplingEnd([
+				couplingCell("server-accepted", 0),
+				couplingCell("server-accepted", 0.95, {
+					peakSessionQueuedBytes: justOver,
+				}),
+			]).reading,
+		).toBe("COUPLING-REFUTED");
+		expect(
+			readCouplingEnd([
+				couplingCell("server-accepted", 0),
+				couplingCell("server-accepted", 0.95, {
+					peakSessionQueuedBytes: justOver - 2,
+				}),
+			]).reading,
+		).toBe("INDETERMINATE");
+	});
+
+	test("an unwitnessed backlog is indeterminate even when a timeout fired", () => {
+		// A backpressure timeout beside a queue that never filled is a
+		// contradiction inside the instrument, not a coupling observation.
+		expect(
+			readCouplingEnd([
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, {
+					backpressureTimeouts: 4,
+					peakSessionQueuedBytes: 0,
+				}),
+			]).reading,
+		).toBe("INDETERMINATE");
+	});
+
+	test("the control cell is never held to a witness bar of its own", () => {
+		// f = 0, target 0: an unloaded control has no backlog to witness.
+		expect(backlogWitnessBytes(0)).toBe(0);
+		expect(
+			readCouplingEnd([
+				couplingCell("client-opened", 0, { peakSessionQueuedBytes: 0 }),
+				couplingCell("client-opened", 0.95, { downstreamWriteP99Ms: 3.2 }),
+			]).reading,
+		).toBe("COUPLING-OBSERVED");
+	});
+
 	test("a missing control cell is indeterminate, never a reading", () => {
 		expect(readCouplingEnd([couplingCell("client-opened", 0.95)]).reading).toBe(
 			"INDETERMINATE",
@@ -689,6 +810,21 @@ describe("Arm D, the pair reading — every outcome is named in advance", () => 
 			couplingCell("server-accepted", 0.95, { backpressureTimeouts: 1 }),
 		]);
 		expect(reading.verdictFreeReading).toBe("COUPLING-BOTH-ENDS");
+	});
+
+	test("an unwitnessed backlog on one end is not COUPLING-ABSENT for the pair", () => {
+		// The §12 shape: both ends quiet, one of them measured through a backlog
+		// that never accumulated. The pair used to read COUPLING-ABSENT — a
+		// verdict-free reading, but one that was cited as a K17 finding.
+		const reading = readCouplingArm([
+			...quietEnd("client-opened"),
+			couplingCell("server-accepted", 0),
+			couplingCell("server-accepted", 0.95, {
+				downstreamWriteP99Ms: 0.64,
+				peakSessionQueuedBytes: 0,
+			}),
+		]);
+		expect(reading.verdictFreeReading).toBe("INDETERMINATE");
 	});
 
 	test("one end missing its control makes the pair indeterminate", () => {

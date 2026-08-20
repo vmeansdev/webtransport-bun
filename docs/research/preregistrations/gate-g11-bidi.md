@@ -809,7 +809,7 @@ recorded (INVALID via V-P). The §12 row below is unaffected.
 
 | run id | candidate SHA | staging base | arms | artifact hash | outcome |
 |---|---|---|---|---|---|
-| 32291972328 | `00a44bf` | `9c475df` | T, X, J, D | knob-OFF `c0681846bbfa93e16c5a3deb6255dddac8931dc7c94e2626e58edd59357a1ed0` / knob-ON `b71edb2c69a8609589c3d2d7e6d99593d707c0cf32d93bb3ad8108b118bc488d` | **X PASS · D COUPLING-ABSENT · T INVALID (V-P) · gate OPEN** |
+| 32291972328 | `00a44bf` | `9c475df` | T, X, J, D | knob-OFF `c0681846bbfa93e16c5a3deb6255dddac8931dc7c94e2626e58edd59357a1ed0` / knob-ON `b71edb2c69a8609589c3d2d7e6d99593d707c0cf32d93bb3ad8108b118bc488d` | **X PASS · D RETRACTED (Amendment 9; was COUPLING-ABSENT) · T INVALID (V-P) · gate OPEN** |
 
 **Provenance of the two hashes, because they do not have the same standing.**
 The workflow's own `sha256sum "$EV"/bench-g11-*.json` line never executed — the
@@ -849,13 +849,19 @@ step's `always()` guard.
 - **Arm X — PASS, all clauses.** 250 / 500 / 1,000 sessions driven to 2,000
   exchanges/s; 47% host CPU at the top rung. The acceptance/churn claim §6
   attaches to Arm X is certified at the 1,000-session rung.
-- **Arm D — COUPLING-ABSENT**, its registered verdict-free reading. At
+- **Arm D — ~~COUPLING-ABSENT~~ RETRACTED, see Amendment 9.** As recorded on
+  2026-08-19: "COUPLING-ABSENT, its registered verdict-free reading. At
   f = 0.95 inbound backlog: write p99 **0.86 ms vs control 0.91 ms** on the
   client-opened handle, **0.64 ms vs 1.00 ms** on the server-accepted handle;
   **0 backpressure timeouts**; peak queued **0 B**. K17's shared-budget
-  cross-direction choke does not appear in the data plane on either path. Per
-  §2 Arm D this grades nothing on the gate either way; it routes to the K17
-  strike, not to a clause.
+  cross-direction choke does not appear in the data plane on either path." The
+  server-accepted half of that was measured through a harness defect that kept
+  the registered backlog from ever accumulating, and `peak queued 0 B` at
+  f = 0.95 is its signature rather than a null result. **It is withdrawn.** The
+  numbers stay on the page because they are what the run produced; the reading
+  drawn from them does not. Arm D grades nothing on the gate either way, so
+  nothing downstream of a clause moves — see Amendment 9 for the defect, the
+  falsifier that now catches its shape, and what a rerun owes.
 - **Arm T — INVALID via V-P**, on **both** T-100 repeats. Offered ÷ target on
   the server's downstream direction was **0.576** and **0.625** against V-P's
   registered bound **[0.98, 1.02]**. Upstream was full both repeats (2.25 GB).
@@ -913,8 +919,9 @@ on a 4-vCPU box, independently confirmed by the knob-ON T-100-batch cell
 reproducing 0.634.
 
 **Status after dispatch 1.** Per §4, "an INVALID gate cell makes the gate
-INVALID, not a miss." Arm X's PASS and Arm D's COUPLING-ABSENT stand as
-recorded at 4 vCPU. The gate is **OPEN, not final**: the T arm awaits either a
+INVALID, not a miss." Arm X's PASS stands as recorded at 4 vCPU. (As filed on
+2026-08-19 this sentence read "Arm X's PASS and Arm D's COUPLING-ABSENT stand
+as recorded at 4 vCPU"; Amendment 9 withdraws the Arm D half.) The gate is **OPEN, not final**: the T arm awaits either a
 cheaper server write path or a re-registered rung — a raise in runner vCPU has
 since been ruled out on this host (4 physical cores, all four already assigned
 to the runner; SMT siblings rejected on measurement-validity grounds). A §10
@@ -952,3 +959,122 @@ otherwise read as a run where the knob had no effect rather than one where it
 was never measured, so: **any dispatch that empties this input names the
 skipped disclosure cells in its own §12 entry.** The choice is the dispatcher's
 and it is logged; it is never a default.
+
+### Amendment 8 — Amendment 6 described an enforcement the code did not have (2026-08-20)
+
+Filed **before** any further dispatch, per §10. **No threshold moves, no clause
+changes, no cell definitions change.** It corrects Amendment 6's own text and
+the wiring behind it.
+
+Amendment 6 claimed, in these words (`§11b`, Amendment 6):
+
+> The classifier now takes the registered repeat count as a **required**
+> parameter — defaulting it would have left the same call site un-typechecked —
+> and returns **INCOMPLETE** whenever the banked count is not the registered
+> one.
+
+and
+
+> A run dispatched with `G11_REPEATS=1`, or one whose second repeat died after
+> the first was banked, produced a PASS artifact indistinguishable from the
+> registered two-repeat one …
+
+**The first half was true of the function and false of the run.** The parameter
+was required, but the harness fed it `GATE_REPEATS`, which is
+`Number(process.env.G11_REPEATS ?? 2)` — the dispatch input. Both sides of
+`gateCellRepeats.length !== registeredRepeats` therefore came off the same
+environment variable. The check could catch a repeat that *crashed* after its
+sibling was banked; it could not catch a run **dispatched short**, which is the
+first case Amendment 6 names. A dispatch with `g11_repeats=1` would have driven
+one repeat, banked one, compared 1 with 1, and stamped **PASS** — and
+`artifact.environment.gateRepeats` would have stamped `1` beside it, which is
+worse than the state before Amendment 6: a reader who previously had to count
+`cells` keys by hand now had a field that looked like it had counted them.
+
+Neither the tests nor the amendment could see this, for the same reason: every
+test passed the registered count as a literal, so all of them exercised the
+function and none of them exercised the wiring.
+
+**What changes.** The registered count becomes a constant in the registration
+module — `REGISTERED_GATE_REPEATS = 2` in `tools/load/g11-plan.ts`, sourced from
+§5's heading ("all evaluated on cell `T-100`, both repeats") and §2's Arm T row
+("| **`T-100`** | **100** | off | **2** | the gate cell |"). The roll-up is
+passed *that*. `G11_REPEATS` keeps its one job and is renamed at its own site to
+say so (`DRIVEN_GATE_REPEATS`): it decides how many repeats a run drives, never
+how many a PASS requires. A dispatch with `G11_REPEATS=1` now banks one against
+a registered two and reads **INCOMPLETE**.
+
+`artifact.environment.gateRepeats` is replaced by the pair
+`gateRepeatsDriven` / `gateRepeatsRegistered`, because only the pair is
+readable: one number alone cannot show a discrepancy.
+
+The wiring itself is now under test — the call site is asserted in source, so a
+future edit that reintroduces the dispatch input on the grading side fails
+`bun test tools/load/`. A test that can only see the function is what let this
+through once.
+
+**Neither §5 nor §2 changes**, and this remains strictly tightening in
+Amendment 6's sense: the only transitions it adds are onto INCOMPLETE, on runs
+whose shape is not the registered one. It is **retroactively inert** — run
+32291972328 was dispatched `g11_repeats=2` and banked both, so its recorded
+INVALID (via V-P) is unchanged.
+
+### Amendment 9 — Arm D had no witness that its backlog ever existed (2026-08-20)
+
+Filed **before** any further dispatch, per §10. **No threshold moves and no gate
+clause changes** — Arm D grades nothing (§2), so nothing here can move a
+verdict. It adds one structural falsifier to Arm D and **withdraws a recorded
+reading**, both of which are registered ground.
+
+**The defect.** The server-accepted end of Arm D withheld consumption by
+counting `read()` resolutions:
+
+> ```ts
+> sinceWithhold += 1;
+> ```
+
+One `read()` after a withhold routinely carries dozens of frames, so a drain
+sized in frames was satisfied by a fraction of the reads it was meant to take,
+and the reader drained batches many times the intended size. The registered
+backlog never sustained at its fraction. The client-opened end always counted
+frames, and `consumptionDelayMsForBacklog` is documented as a *total*
+accumulation time for the whole backlog — "do not divide it by the frame count"
+— so the two ends were withholding to different specifications. The harness fix
+(`sinceWithhold += frames.length`) landed in the same commit range as the §12
+entry that reports the run, and neither Amendment 6 nor Amendment 7 mentioned
+it; Amendment 7's "no cell definitions change" was true of Amendment 7 and not
+of the range it landed in. That omission is itself part of what this amendment
+corrects.
+
+**What is withdrawn.** The **server-accepted half** of run 32291972328's Arm D
+reading, and with it the pair reading COUPLING-ABSENT. §12's Arm D bullet and
+its status sentence are annotated in place, quoting what they said. The client
+figures (0.86 ms vs 0.91 ms) were measured through the frame-counting end and
+are not impeached by this defect, but a pair reading needs both ends, so the
+pair reading goes with the half.
+
+**The falsifier the arm should have shipped with.** `peak queued 0 B` at a
+registered f = 0.95 is not a null result about K17 — it is the signature of a
+backlog that was never built, and Arm D had no rule that could tell the two
+apart. It now does: a loaded cell whose peak queued bytes never reach
+**half its registered target** (`BACKLOG_WITNESS_FRACTION = 0.5`,
+`backlogWitnessBytes`) reads **INDETERMINATE**, and the pair with it. Half
+rather than the whole target because a withholding reader's peak is sawtooth and
+a full-target bar would fire on a correctly-shaped cell sampled mid-drain; the
+case being caught is not sampling noise but a backlog that never accumulated at
+all. INDETERMINATE rather than a new verdict name because Arm D grades nothing
+and INDETERMINATE is already its no-reading channel — it is the existing way of
+saying "this pair licenses no reading either way", which is exactly the state.
+
+**A limitation, stated rather than discovered later.** The counter this
+falsifier reads, `peakSessionQueuedBytes`, is the server's **outbound** session
+governor. It can only witness an inbound backlog if the budget really is
+shared — which is the very proposition K17 asserts and this arm exists to test.
+So on the present harness the falsifier makes a quiet end unreadable rather than
+refuting: with no coupling *and* no direct inbound counter, the arm reports
+INDETERMINATE, not COUPLING-ABSENT. That is the honest position — this harness
+cannot separate "the budget is not shared" from "the backlog never
+accumulated" — and it means **a rerun that only fixes the withhold counter still
+cannot produce COUPLING-ABSENT.** Producing that reading requires Arm D to carry
+a direct inbound-reservation counter, and adding one is a cell-definition change
+that will need its own amendment before it is dispatched.

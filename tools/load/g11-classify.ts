@@ -16,6 +16,7 @@
 
 import {
 	advertisedPerSessionBytes,
+	backlogWitnessBytes,
 	exchangeRttBoundMs,
 	FRAME_BYTES,
 	oneWayBoundMs,
@@ -811,6 +812,37 @@ export function readCouplingEnd(
 		return {
 			reading: "INDETERMINATE",
 			detail: "control cell reported no downstream write latency",
+		};
+	}
+	// The arm's own structural falsifier, and the one it should have shipped
+	// with. Every reading below compares a loaded cell against a control, and
+	// every one of them is a statement about what an inbound backlog of
+	// f x per-stream-budget does to the write half. If the cell's queued-bytes
+	// counter never came near that backlog, the flat curve it produced is a
+	// statement about a backlog that was never built — indistinguishable, on
+	// these numbers alone, from a genuine absence of coupling. Run 32291972328
+	// is the worked example: `peak queued 0 B` at a registered f = 0.95, read at
+	// the time as COUPLING-ABSENT, measured through a withhold counter that
+	// counted read() resolutions instead of frames and so drained batches many
+	// times the intended size.
+	//
+	// Known and deliberate: `peakSessionQueuedBytes` is the server's *outbound*
+	// session governor, so it can only witness the inbound backlog if the budget
+	// really is shared — which is the very thing K17 asserts and this arm exists
+	// to test. Until Arm D carries a direct inbound-reservation counter, that
+	// makes COUPLING-REFUTED on a quiet end unreachable, and the pair reading
+	// INDETERMINATE rather than COUPLING-ABSENT. That is the honest state: this
+	// harness has no witness that separates "the budget is not shared" from "the
+	// backlog never accumulated", and an arm with no such witness should say so
+	// rather than pick the more interesting of the two.
+	const witness = backlogWitnessBytes(top.backlogFraction);
+	if (witness > 0 && top.peakSessionQueuedBytes < witness) {
+		return {
+			reading: "INDETERMINATE",
+			detail:
+				`${top.cell} peak queued ${top.peakSessionQueuedBytes} B never reached ${witness} B, ` +
+				`half the f=${top.backlogFraction} backlog target; the registered backlog was not witnessed, ` +
+				"so neither a coupling nor a refutation can be read off this pair",
 		};
 	}
 	const spreadRatio = top.downstreamWriteP99Ms / control.downstreamWriteP99Ms;

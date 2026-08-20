@@ -35,6 +35,20 @@ export const TUNNEL_LADDER = [25, 50, 100] as const;
 export const TUNNEL_GATE_RUNG = 100;
 export const TUNNEL_EXPLORATORY_RUNG = 200;
 
+/**
+ * How many repeats of the gate cell §5 grades, straight off the §2 Arm T row
+ * (`| **T-100** | **100** | off | **2** | the gate cell |`) and §5's heading
+ * ("all evaluated on cell `T-100`, both repeats").
+ *
+ * It lives here, in the registration module, because it is registration text —
+ * not a dispatch input. `G11_REPEATS` decides how many repeats a run *drives*;
+ * this decides how many a PASS *requires*. Reading both sides of that
+ * comparison off the same environment variable would make the check
+ * unfailable-by-dispatch: a run asked for one repeat would bank one, compare it
+ * against one, and stamp PASS on a shape §5 does not grade.
+ */
+export const REGISTERED_GATE_REPEATS = 2;
+
 /** Arm X (acceptance path): the collab/RPC exchange. */
 export const EXCHANGE_REQUEST_BYTES = 120;
 export const EXCHANGE_RESPONSE_BYTES = 120;
@@ -167,6 +181,29 @@ export function backlogTargetBytes(fraction: number): number {
 		throw new Error(`g11: backlog fraction out of range: ${fraction}`);
 	}
 	return Math.floor(SHIPPED_QUEUED_BYTES_PER_STREAM * fraction);
+}
+
+/**
+ * How much of a loaded cell's registered backlog target has to show up in the
+ * cell's own queued-bytes counter before the cell is allowed to produce a
+ * reading at all.
+ *
+ * Half. A withholding reader's peak is sawtooth — it drains at the target and
+ * refills — so demanding the full target would fire on a correctly-shaped run
+ * that happened to be sampled mid-drain. Half is far above any sampling
+ * artefact and far below "the backlog was never built", which is the only case
+ * this is here to catch.
+ */
+export const BACKLOG_WITNESS_FRACTION = 0.5;
+
+/**
+ * The floor a loaded Arm D cell's peak queued bytes must clear for its numbers
+ * to mean anything. Below it, the cell did not run the shape it is labelled
+ * with, and a flat latency curve across it is a statement about a backlog that
+ * never accumulated rather than about the budget under test.
+ */
+export function backlogWitnessBytes(fraction: number): number {
+	return Math.floor(backlogTargetBytes(fraction) * BACKLOG_WITNESS_FRACTION);
 }
 
 /**

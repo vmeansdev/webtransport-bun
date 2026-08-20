@@ -83,6 +83,7 @@ import {
 	EXCHANGES_PER_SESSION_PER_SEC,
 	emitterOffsetMs,
 	FRAME_BYTES,
+	REGISTERED_GATE_REPEATS,
 	SHIPPED_MAX_STREAMS_PER_SESSION_BIDI,
 } from "./g11-plan.ts";
 import {
@@ -115,7 +116,13 @@ const EXCHANGE_STEP_SECONDS = Number(
 const COUPLING_STEP_SECONDS = Number(
 	process.env.G11_COUPLING_STEP_SECONDS ?? 30,
 );
-const GATE_REPEATS = Number(process.env.G11_REPEATS ?? 2);
+/**
+ * How many repeats of the gate cell this dispatch *drives*. Never how many the
+ * roll-up requires — that is `REGISTERED_GATE_REPEATS`, which is registration
+ * text and lives in `g11-plan.ts`. A dispatch that drives fewer banks fewer,
+ * and the roll-up reads INCOMPLETE against the registered count.
+ */
+const DRIVEN_GATE_REPEATS = Number(process.env.G11_REPEATS ?? 2);
 const BASE_PORT = Number(process.env.G11_BASE_PORT ?? 4520);
 /** Total connect ramp. Sessions spread evenly across it — K2, T02's mechanism. */
 const CONNECT_STAGGER_MS = Number(process.env.G11_STAGGER_MS ?? 2000);
@@ -199,7 +206,7 @@ const CELLS: CellSpec[] = [
 		sessions: 100,
 		knobBytes: 0,
 		stepSeconds: STEP_SECONDS,
-		repeats: GATE_REPEATS,
+		repeats: DRIVEN_GATE_REPEATS,
 	},
 	{
 		name: "T-100-batch",
@@ -1314,7 +1321,7 @@ async function main(): Promise<void> {
 	// that has to be remembered to be ignored — which is the thing this mode
 	// exists not to produce.
 	const gateRepeats = SMOKE ? [] : (tunnelCells[GATE_CELL] ?? []);
-	const gate = rollUpTunnelGate(gateRepeats, GATE_REPEATS);
+	const gate = rollUpTunnelGate(gateRepeats, REGISTERED_GATE_REPEATS);
 	const exchangeGate = SMOKE
 		? undefined
 		: exchangeCells.find((c) => c.cell === "X-1000");
@@ -1344,10 +1351,14 @@ async function main(): Promise<void> {
 			exchangeStepSeconds: EXCHANGE_STEP_SECONDS,
 			couplingStepSeconds: COUPLING_STEP_SECONDS,
 			connectStaggerMs: CONNECT_STAGGER_MS,
-			// The repeat count the roll-up was held to. Without it in the artifact a
-			// reader has to count `cells` keys by hand to tell a two-repeat gate from
-			// a one-repeat one, and the two used to read identically.
-			gateRepeats: GATE_REPEATS,
+			// Both numbers, because only the pair is readable. `Driven` is what this
+			// dispatch asked for; `Registered` is what §5 grades. Stamping one of
+			// them left a reader unable to tell a two-repeat gate from a one-repeat
+			// one without counting `cells` keys by hand, and stamping the dispatch
+			// input alone under the bare name `gateRepeats` was worse: it read as if
+			// the count had been checked against something.
+			gateRepeatsDriven: DRIVEN_GATE_REPEATS,
+			gateRepeatsRegistered: REGISTERED_GATE_REPEATS,
 			shippedLimits: {
 				maxQueuedBytesPerStream: DEFAULT_LIMITS.maxQueuedBytesPerStream,
 				maxQueuedBytesPerSession: DEFAULT_LIMITS.maxQueuedBytesPerSession,
