@@ -124,6 +124,16 @@ function coerceStats(raw: unknown): PacerStatsRaw | null {
 	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
 		if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
 	}
+	// The native JSON nests the actual counters under `cumulative` (and a
+	// token-relative `window`): flatten `cumulative`'s numerics to the top
+	// level, preferring them on collision — the first sweep cell shipped an
+	// empty `windowed` because this function saw only the config scalars.
+	const nested = (value as Record<string, unknown>).cumulative;
+	if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+		for (const [k, v] of Object.entries(nested as Record<string, unknown>)) {
+			if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+		}
+	}
 	return out;
 }
 
