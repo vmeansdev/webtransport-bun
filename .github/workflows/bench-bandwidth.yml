@@ -39,6 +39,11 @@ on:
         required: false
         default: ""
         type: string
+      g11_cells_knobon:
+        description: "g11-bidi mode: cell list for the knob-ON (verdict-free) invocation; empty string skips invocation 2 entirely. Emptying it omits the C9 disclosure cells and must be named in the run's §12 entry (Amendment 7)"
+        required: false
+        default: "T-100-batch,J-batch"
+        type: string
       g11_step_seconds:
         description: "g11-bidi mode: seconds of drive per Arm T / Arm J cell"
         required: false
@@ -340,16 +345,27 @@ jobs:
             bun tools/load/bench-g11.ts
           echo "::endgroup::"
 
-          echo "::group::G11 invocation 2 — knob ON at 65536 (T-100-batch, J-batch; verdict-free)"
-          WEBTRANSPORT_STREAM_BATCH_BYTES=65536 \
-            G11_RUN_ID="$RUN_ID" \
-            G11_CANDIDATE_SHA="$SHA" \
-            G11_CELLS="T-100-batch,J-batch" \
-            G11_SKIP_BUILD=1 \
-            G11_BASE_PORT=4620 \
-            G11_OUT="$EV/bench-g11-knobon-$SHA.json" \
-            bun tools/load/bench-g11.ts
-          echo "::endgroup::"
+          # Invocation 2 is the knob-ON disclosure run (C9 grades nothing). Its
+          # cell list used to be hardcoded, so a dispatch narrowed to the T
+          # ladder still ran J-batch — one of the shapes that hung in run
+          # 32291972328. The default is unchanged, so an unchanged dispatch
+          # behaves as before; emptying the input skips the invocation, which
+          # Amendment 7 requires the dispatcher to name in the §12 entry.
+          G11_CELLS_KNOBON="${{ github.event.inputs.g11_cells_knobon }}"
+          if [ -n "$G11_CELLS_KNOBON" ]; then
+            echo "::group::G11 invocation 2 — knob ON at 65536 ($G11_CELLS_KNOBON; verdict-free)"
+            WEBTRANSPORT_STREAM_BATCH_BYTES=65536 \
+              G11_RUN_ID="$RUN_ID" \
+              G11_CANDIDATE_SHA="$SHA" \
+              G11_CELLS="$G11_CELLS_KNOBON" \
+              G11_SKIP_BUILD=1 \
+              G11_BASE_PORT=4620 \
+              G11_OUT="$EV/bench-g11-knobon-$SHA.json" \
+              bun tools/load/bench-g11.ts
+            echo "::endgroup::"
+          else
+            echo "G11 invocation 2 skipped (g11_cells_knobon empty) — this run carries NO knob-ON disclosure cells"
+          fi
 
           sha256sum "$EV"/bench-g11-*.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

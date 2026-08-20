@@ -799,8 +799,148 @@ recorded (INVALID via V-P). The §12 row below is unaffected.
 
 ## §12 — Run log
 
-*(empty — no dispatch has occurred)*
-
 | run id | candidate SHA | staging base | arms | artifact hash | outcome |
 |---|---|---|---|---|---|
-| — | — | — | — | — | — |
+| 32291972328 | `00a44bf` | `9c475df` | T, X, J, D | knob-OFF `c0681846bbfa93e16c5a3deb6255dddac8931dc7c94e2626e58edd59357a1ed0` / knob-ON `b71edb2c69a8609589c3d2d7e6d99593d707c0cf32d93bb3ad8108b118bc488d` | **X PASS · D COUPLING-ABSENT · T INVALID (V-P) · gate OPEN** |
+
+**Provenance of the two hashes, because they do not have the same standing.**
+The workflow's own `sha256sum "$EV"/bench-g11-*.json` line never executed — the
+step tripped `set -euo pipefail` before reaching it — so neither hash was
+printed at run time. The **knob-OFF** hash was recomputed on 2026-08-20 from the
+run's uploaded artifact (`gh run download 32291972328`, artifact
+`bench-bandwidth-00a44bf077d8a2a39c7d193ef960d9867681fa3a`), which is the
+authoritative copy. The **knob-ON** artifact was never uploaded: invocation 2
+ran by hand on the runner (see the fault chain, item 5), so its JSON exists only
+as the runner's local file
+`/home/hermes-admin/bench-g11-knobon-00a44bf077d8a2a39c7d193ef960d9867681fa3a.json`,
+hashed there on 2026-08-20. It is an off-workflow file recovered from the box
+that produced it, not a run artifact, and it is recorded as such. Both files are
+copied to `.scratch/high-load-excellence/evidence/` under those hashes.
+
+### Dispatch 1 — run 32291972328, 2026-08-19
+
+**Inputs.** Workflow `bench-bandwidth`, `--ref probe/g11-bidi-01`,
+`mode=g11-bidi`, `candidate_commit=00a44bf`, every G11 input left at its
+registered default (`g11_arms=T,X,J,D`, `g11_cells=""`, `g11_step_seconds=60`,
+`g11_exchange_step_seconds=30`, `g11_coupling_step_seconds=30`,
+`g11_repeats=2`), `probe_only=false`. Runner `self-hosted / Linux / X64 /
+heavy`, 4 vCPU, generator co-resident per §1.2. Candidate `00a44bf` =
+`probe/g11-bidi-01` rebased onto staging `9c475df` with Amendment 5 (§11b);
+pre-rebase head `8b74697` parked at `keep/g11-prerebase-8b74697`.
+`WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1` set by the workflow, as the
+conductor's instrumentation guard requires.
+
+Dispatched ~20:20Z after a ~55 min queue behind G10; the G11 step started
+19:18:55Z. **The workflow concluded `failure`** — disclosed, not hidden: the
+lingering invocation-1 conductor was terminated by hand (below), which tripped
+`set -euo pipefail`. Both artifacts are complete and were uploaded by the
+step's `always()` guard.
+
+**Per-cell outcomes (knob-OFF artifact — classifier and raw fields agree).**
+
+- **Arm X — PASS, all clauses.** 250 / 500 / 1,000 sessions driven to 2,000
+  exchanges/s; 47% host CPU at the top rung. The acceptance/churn claim §6
+  attaches to Arm X is certified at the 1,000-session rung.
+- **Arm D — COUPLING-ABSENT**, its registered verdict-free reading. At
+  f = 0.95 inbound backlog: write p99 **0.86 ms vs control 0.91 ms** on the
+  client-opened handle, **0.64 ms vs 1.00 ms** on the server-accepted handle;
+  **0 backpressure timeouts**; peak queued **0 B**. K17's shared-budget
+  cross-direction choke does not appear in the data plane on either path. Per
+  §2 Arm D this grades nothing on the gate either way; it routes to the K17
+  strike, not to a clause.
+- **Arm T — INVALID via V-P**, on **both** T-100 repeats. Offered ÷ target on
+  the server's downstream direction was **0.576** and **0.625** against V-P's
+  registered bound **[0.98, 1.02]**. Upstream was full both repeats (2.25 GB).
+  T-25 and T-50 were fully clean in both directions. T-200 (registered
+  exploratory-only per §1.4/E3) delivered down 3%, upstream one-way p99 840 ms,
+  483 socket drops. Server process CPU pinned at **221–225% of one core**; host
+  **85–87%** of the 4-vCPU box — under V-S's 90% bar, so V-S did **not** fire;
+  V-P did. Everything the server wrote was delivered: this is a generator/rig
+  supply failure, not a delivery failure.
+- **Knob-ON disclosure cells (verdict-free, C9 grades nothing).** J-batch vs
+  J-control at 50 tunnels: JS data crossings **−28%** (802,446 → 576,900; max
+  batch 18,226 B) while server CPU moved only **−3%** (167.9% → 162.5% of one
+  core) and p99 was unchanged. T-100-batch reproduced the starvation exactly:
+  down-offer **0.634**. Reading, registered as disclosure only: **receive-side
+  chunk batching does not touch the write-side bottleneck**, which is E2's
+  prediction landing in a way E2 did not anticipate — the knob's value is a
+  function of per-stream rate, and the T arm's ceiling is a write path.
+
+**Declared harness/infra fault chain (this is the §10 declaration).**
+
+1. `bench-g11.ts` awaits `child.exited` with **no per-cell deadline**
+   (~line 818) — the same family as the G7 wedge. A cell that never exits
+   wedges the whole invocation.
+2. **Racy bidi teardown hang, product-side candidate.** Three D cells completed
+   their registered 30 s drive exactly and then never exited: **D-25-client**
+   (ran 33 m 54 s, killed), **D-75-client** (killed by watchdog at 160 s),
+   **D-95-server** (ran 1,210 s, killed). D-95-client and D-25/D-75-server
+   completed on their own, so the hang is racy, appears on both ends, and is
+   not monotone in f. Live capture at the hang: main thread in `ep_poll`,
+   10 workers in `futex_do_wait`, 1.1% CPU, counters frozen at their completion
+   values — a close handshake that never finishes when a slow reader was
+   present.
+3. **External kills** (all timestamped): SIGTERM D-25-client ~20:03 · watchdog
+   kill D-75-client 20:06:28 · SIGTERM D-95-server ~20:26 · SIGTERM the
+   invocation-1 conductor 20:45.
+4. **Conductor linger.** Invocation 1 wrote its JSON at 20:25:54 and then sat
+   **18 minutes with no children** before being terminated by hand at 20:45 —
+   the same family as G10's post-artifact linger. Working theory, recorded as a
+   theory: the in-process server still holds the killed clients' sessions and
+   there is no idle timeout, so shutdown never completes.
+5. **Manual knob-ON invocation.** Because the terminated conductor tripped
+   `set -euo pipefail`, invocation 2 did not run inside the workflow. It was run
+   by hand on the runner ~20:45–20:50 with the registered environment, and is
+   logged here as an **off-workflow invocation**. The conductor's own
+   instrumentation guard first **refused** the invocation because
+   `WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1` was absent — the guard is verified
+   working, and the refusal is recorded rather than quietly retried. (Nanny v1
+   died after one kill on a quoting bug; nanny v2 was file-based and needed no
+   further kills.)
+
+The fault chain touches the **D and J** cells directly (they are the shapes
+that hang) and the invocation as a whole (linger, kill, pipefail). It does
+**not** explain Arm T's V-P: T's offered-ratio shortfall is a CPU-supply fact
+on a 4-vCPU box, independently confirmed by the knob-ON T-100-batch cell
+reproducing 0.634.
+
+**Status after dispatch 1.** Per §4, "an INVALID gate cell makes the gate
+INVALID, not a miss." Arm X's PASS and Arm D's COUPLING-ABSENT stand as
+recorded at 4 vCPU. The gate is **OPEN, not final**: the T arm awaits either a
+cheaper server write path or a re-registered rung — a raise in runner vCPU has
+since been ruled out on this host (4 physical cores, all four already assigned
+to the runner; SMT siblings rejected on measurement-validity grounds). A §10
+rerun of the T cells is legal only once that fault is *addressed*, not merely
+declared.
+
+### Amendment 7 — the knob-ON invocation becomes opt-in (2026-08-20)
+
+Filed **before** any further dispatch, per §10. **No threshold moves, no clause
+changes, no cell definitions change.** It is recorded here because it changes
+which cells a default dispatch runs, and that is registered ground even when
+the cells in question grade nothing.
+
+`.github/workflows/bench-bandwidth.yml`'s second G11 invocation hardcoded its
+cell list:
+
+> ```
+>             G11_CELLS="T-100-batch,J-batch" \
+> ```
+
+`g11_cells` was wired into invocation 1 only, so a dispatch narrowed to
+`g11_cells=T-25,T-50,T-100` still ran **J-batch** — a 50-session cell in the
+same family as the three shapes that hung for 34 minutes, 160 seconds and
+20 minutes in run 32291972328 — and re-ran `T-100-batch`, already measured at a
+down-offer of 0.634. The invocation is now driven by a new `g11_cells_knobon`
+input whose **default is the same `T-100-batch,J-batch`**, so an unchanged
+dispatch behaves exactly as before; passing the input empty skips invocation 2.
+
+**The disclosed behaviour change.** Passing `g11_cells_knobon=""` produces an
+artifact set with **no knob-ON disclosure cells** — no J-batch/J-control
+comparison and no T-100-batch. §5 evaluates every gate clause on `T-100`, and
+C9 "grades nothing", so this omits disclosure and cannot weaken or strengthen
+any verdict. But an artifact set that is silently missing the C9 material would
+otherwise read as a run where the knob had no effect rather than one where it
+was never measured, so: **any dispatch that empties this input names the
+skipped disclosure cells in its own §12 entry.** The choice is the dispatcher's
+and it is logged; it is never a default.
