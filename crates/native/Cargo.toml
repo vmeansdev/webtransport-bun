@@ -33,5 +33,11 @@ x509-parser = "0.18.1"
 # after fully drained closes. mimalloc purges freed pages back to the OS.
 mimalloc = { version = "0.1", default-features = false }
 
+# Only the egress pacer's thread-priority knobs use this, and only on Linux:
+# `setpriority` is per-thread there, where on macOS the same call is
+# process-wide and would renice the whole runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 napi-build = "2"

@@ -127,6 +127,16 @@ does not hold a thread, and a soak does not accumulate them. Submission is a
 mutex + `VecDeque` push + condvar notify: the JS thread's per-call cost is one
 lock, one `Arc<Vec<u8>>` clone and one `Vec<String>` move, independent of `N`.
 
+The idle exit clears `thread_running` inside the same critical section that saw
+the queue empty, which is what keeps a respawn from racing a still-running
+thread — two schedules on one queue is two cursors, and two cursors is twice the
+configured rate. Every *other* way out of the thread (a panic in a send, a
+poisoned lock) is caught by an `ExitGuard` that clears the flag on unwind;
+without it a dead thread leaves the flag set, no submission ever respawns one,
+and the queue wedges with every subsequent target refused. `threadStarts` counts
+the spawns, so a window with more than one is visible in the artifact rather
+than inferred from a rate that quietly halved.
+
 Sleeping to a 427 µs cadence: `thread::sleep` to within 150 µs of the txtime,
 then `spin_loop` to it. Sleep granularity alone is ~50–100 µs on both platforms
 and would show up directly as inter-clump jitter; a bounded spin costs at most
@@ -134,12 +144,34 @@ and would show up directly as inter-clump jitter; a bounded spin costs at most
 
 ## Backpressure and memory
 
-The queue is bounded in *targets*, at `pps × queue_ms / 1000` (default 250 ms of
-scheduled work, floored at one clump). Targets past the bound are refused at
+The queue is bounded in *targets*, at `pps × queue_ms / 1000` (default 18 750
+targets at 75 k, floored at one clump). Targets past the bound are refused at
 admission with `E_WOULD_BLOCK` in the envelope, which is the code the caller
 already handles for a target with no budget. Unbounded queueing would trade
 packet loss for latency and RSS, silently, which is a worse failure than the one
 being fixed.
+
+**`queue_ms` is milliseconds at the *configured* rate, not a latency bound.** The
+conversion above uses `pps`, so a full queue is `queue_ms` of wall time only
+while the pacer achieves `pps`; at half the achieved rate the same 18 750 targets
+are 500 ms of work. Real queue latency is `pendingTargets ÷ achieved pps`, and
+the achieved rate is only readable from the windowed stats
+(`window.clumps × clump ÷ window seconds`) — which is why no paced number is
+interpretable without them.
+
+The bound cannot be turned into a real latency bound without timestamping each
+admission, which would put a clock read on the JS thread's per-target path to
+bound something the drain already bounds.
+
+What that means for reading a run: **zero `E_WOULD_BLOCK` from a paced mirror is
+evidence the queue stayed below its bound, so it also caps how long any target
+can have sat there.** A spread far above `queue_ms` with zero refusals is not a
+contradiction and not a leak in the bound — it says the delay is downstream of
+admission (the drain's own duration, the socket, the path, or the receiver). The
+arithmetic is pinned in
+`a_broadcast_that_is_never_refused_cannot_have_waited_the_bound_in_the_queue`:
+holding a target for ~2 s inside this queue requires a drain near 9.4 k pps,
+which at a 50 k/s offered rate refuses millions of targets.
 
 The bound is released **clump by clump** as the drain progresses, not when a job
 finishes. A 10 000-target job that has already sent 9 000 is 1 000 targets of
@@ -180,15 +212,62 @@ Read once, at first use, and never re-read. Default off.
 | --- | --- | --- |
 | `WEBTRANSPORT_PACER_PPS` | unset/`0` = **off** | Target packet rate for the schedule. |
 | `WEBTRANSPORT_PACER_CLUMP` | `32` | Datagrams per burst unit, clamped `1..=64`. |
-| `WEBTRANSPORT_PACER_QUEUE_MS` | `250` | Admission bound, in milliseconds of scheduled work. |
+| `WEBTRANSPORT_PACER_QUEUE_MS` | `250` | Admission bound, in milliseconds **at the configured rate**. |
+| `WEBTRANSPORT_PACER_NICE` | unset | Nice level for the pacer thread, clamped `-20..=19`. Linux only. |
+| `WEBTRANSPORT_PACER_SCHED` | unset | `rr:<prio>` for `SCHED_RR` at that priority, clamped `1..=99`. Linux only. |
 
 An unparseable or out-of-range value is clamped or treated as off — never an
 error. This matches every existing knob in the crate and matters more than usual
-here, because the knob is read on a path that must not throw.
+here, because the knob is read on a path that must not throw. The two priority
+knobs are the exception to "clamped": a value neither form can be read from sets
+`priority.knobMalformed` rather than falling back to unset, because a sweep cell
+that silently ran unprioritised would still be labelled a priority cell.
 
-`Server::pacerStatsJson()` returns the counters as a JSON string, `"{}"` when
-off. A string rather than a typed snapshot deliberately: the prototype commits to
-no schema.
+Both priority knobs are applied **at every pacer-thread spawn**, not once per
+process: the thread idle-exits after 5 s and respawns at the runtime's default
+priority. They are Linux-only by design — `setpriority(PRIO_PROCESS, 0, …)` is
+per-thread on Linux but process-wide on macOS, where honouring the knob would
+renice the whole runtime under a name that says "pacer thread". Off Linux the
+request is disclosed and `priority.achieved.policy` reads `"unsupported"`.
+
+`SCHED_RR` is asked for **before** the nice level, deliberately: an `RR` call
+denied for want of `CAP_SYS_NICE` still leaves the nice request to be attempted,
+so the cell degrades to a nice-level cell and discloses itself as one rather than
+running unprioritised. Note the corollary when both knobs are set and `RR`
+succeeds — nice only steers `SCHED_OTHER`, so the nice level is set but inert,
+and `priority.achieved` will truthfully report both.
+
+Both unset — the default — no syscall is made and the thread runs exactly as it
+did before the knobs existed.
+
+### Stats
+
+`Server.__pacerStatsSnapshot()` opens a window: it records every counter and
+returns a token (`0` when the pacer is off). `Server.__pacerStatsJson(token?)`
+returns the counters as a JSON string, `"{}"` when off. Both are named with the
+double underscore because they are diagnostic and unstable — the prototype
+commits to no schema, and a string rather than a typed snapshot is the same
+choice for the same reason.
+
+With a token the result carries `window` — the deltas over that window — beside
+the raw `cumulative` values; without one, `window` is `null`, so "no window" is
+distinguishable from "a window in which nothing happened". A token is not
+consumed by reading, and is released by eviction once 64 newer marks exist.
+
+Two lateness fields, deliberately not one:
+`cumulative.maxLatenessUsSinceProcessStart` is exactly what its name says and
+must not be read as a property of any window; `window.maxLatenessUsSinceSnapshot`
+is measured from the most recent `__pacerStatsSnapshot()` call — a maximum is not
+invertible, so unlike every other counter it cannot be derived from two
+cumulative reads and needs its own register.
+
+`priority.achieved` is read back from `sched_getscheduler`/`getpriority` after
+the calls, never inferred from them, so a `setpriority` that failed for want of
+`CAP_SYS_NICE` discloses the level the thread is really running at with an errno
+beside it. It is `null` until a pacer thread has started.
+
+The counters are **process-global**: the pacer is one schedule per process, not
+one per server, so a second `Server` in the same process reads the same numbers.
 
 ## What the prototype answers
 

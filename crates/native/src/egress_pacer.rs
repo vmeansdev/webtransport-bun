@@ -13,10 +13,12 @@
 //! Nothing here reimplements a send: the pacer thread calls the same
 //! `try_send_datagram_on_state` the inline loop does.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use serde_json::json;
 
 use crate::datagram_mirror::MirrorOutcome;
 use crate::session::WOULD_BLOCK;
@@ -68,6 +70,18 @@ pub(crate) struct PacerConfig {
 
 impl PacerConfig {
     /// Datagrams the queue may hold before admission starts refusing.
+    ///
+    /// The knob is named in milliseconds but the bound is a **target count**,
+    /// and the conversion uses the *configured* rate. So `queue_ms` is the time
+    /// a full queue represents only while the pacer achieves `pps`: at half the
+    /// achieved rate the same 18 750 targets are 500 ms of work, not 250. Read
+    /// `queue_ms` as "milliseconds at the configured rate", and read the real
+    /// queue latency off the windowed stats as `pendingTargets ÷ achieved pps`
+    /// (`window.clumps × clump ÷ window seconds`).
+    ///
+    /// The bound is not a latency guarantee and cannot become one without
+    /// timestamping admissions, which would put a clock read on the JS thread's
+    /// per-target path to bound something the drain already bounds.
     fn max_pending(&self) -> u64 {
         // At least one clump, whatever the arithmetic says: a bound that admits
         // nothing would turn the knob into a black hole.
@@ -114,6 +128,181 @@ pub(crate) fn config() -> Option<&'static PacerConfig> {
 
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse::<u64>().ok()
+}
+
+/// Scheduling priority the pacer thread should ask the kernel for.
+///
+/// Both knobs default to unset, which is today's behaviour: no syscall is made
+/// and the thread runs at whatever the runtime gave it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PriorityRequest {
+    /// `WEBTRANSPORT_PACER_NICE`, clamped to the portable `-20..=19`.
+    nice: Option<i32>,
+    /// `WEBTRANSPORT_PACER_SCHED=rr:<prio>`, clamped to `1..=99`.
+    rr_priority: Option<i32>,
+    /// A knob was set to something neither form could be read from. Disclosed
+    /// rather than defaulted, so a typo in a sweep cell is visible in the
+    /// artifact instead of quietly producing a nice-level run.
+    malformed: bool,
+}
+
+/// Read both priority knobs. Pure, so the parse rules are testable without the
+/// process-wide memoization `priority_request` adds.
+pub(crate) fn parse_priority(nice: Option<&str>, sched: Option<&str>) -> PriorityRequest {
+    let mut request = PriorityRequest::default();
+    if let Some(raw) = nice {
+        match raw.trim().parse::<i32>() {
+            Ok(value) => request.nice = Some(value.clamp(-20, 19)),
+            Err(_) => request.malformed = true,
+        }
+    }
+    if let Some(raw) = sched {
+        match raw.trim().to_ascii_lowercase().strip_prefix("rr:") {
+            Some(prio) => match prio.trim().parse::<i32>() {
+                Ok(value) => request.rr_priority = Some(value.clamp(1, 99)),
+                Err(_) => request.malformed = true,
+            },
+            None => request.malformed = true,
+        }
+    }
+    request
+}
+
+fn priority_request() -> &'static PriorityRequest {
+    static REQUEST: OnceLock<PriorityRequest> = OnceLock::new();
+    REQUEST.get_or_init(|| {
+        parse_priority(
+            std::env::var("WEBTRANSPORT_PACER_NICE").ok().as_deref(),
+            std::env::var("WEBTRANSPORT_PACER_SCHED").ok().as_deref(),
+        )
+    })
+}
+
+/// What the kernel says the pacer thread actually got, read back after the
+/// calls rather than inferred from them.
+///
+/// Every field here is an answer to `sched_getscheduler`/`getpriority`, so a
+/// `setpriority` that failed for want of `CAP_SYS_NICE` shows the level the
+/// thread is really running at and an errno beside it. A failed call is
+/// disclosed as the fallback it produced; it is never reported as the level
+/// that was asked for.
+#[derive(Debug, Clone, Copy, Default)]
+struct PriorityAchieved {
+    policy: &'static str,
+    rt_priority: i32,
+    nice: Option<i32>,
+    nice_errno: Option<i32>,
+    sched_errno: Option<i32>,
+    /// Value of `threadStarts` when this was recorded, so a reader can tell
+    /// which pacer thread the disclosure belongs to.
+    at_thread_start: u64,
+}
+
+fn priority_achieved() -> &'static Mutex<Option<PriorityAchieved>> {
+    static ACHIEVED: OnceLock<Mutex<Option<PriorityAchieved>>> = OnceLock::new();
+    ACHIEVED.get_or_init(|| Mutex::new(None))
+}
+
+fn priority_json() -> serde_json::Value {
+    let request = priority_request();
+    let achieved = priority_achieved()
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|a| {
+            json!({
+                "policy": a.policy,
+                "rtPriority": a.rt_priority,
+                "nice": a.nice,
+                "niceErrno": a.nice_errno,
+                "schedErrno": a.sched_errno,
+                "atThreadStart": a.at_thread_start,
+            })
+        });
+    json!({
+        "requestedNice": request.nice,
+        "requestedSchedRrPriority": request.rr_priority,
+        "knobMalformed": request.malformed,
+        // `null` until a pacer thread has run: nothing has been asked of the
+        // kernel yet, so there is nothing to disclose.
+        "achieved": achieved,
+    })
+}
+
+/// Ask for the requested priority on the calling thread, then read back what it
+/// got. Called at every pacer-thread spawn, because a respawned thread starts at
+/// the runtime's default again.
+#[cfg(target_os = "linux")]
+fn apply_priority(request: &PriorityRequest) -> PriorityAchieved {
+    fn errno() -> i32 {
+        // SAFETY: reading the thread-local errno slot through the libc accessor.
+        unsafe { *libc::__errno_location() }
+    }
+
+    let mut achieved = PriorityAchieved {
+        policy: "unknown",
+        at_thread_start: THREAD_STARTS.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    // SAFETY: every call below targets the calling thread (`0`) and reads or
+    // writes only scheduling attributes; `sched_param` is a plain POD the kernel
+    // fills in.
+    unsafe {
+        if let Some(prio) = request.rr_priority {
+            let param = libc::sched_param {
+                sched_priority: prio,
+            };
+            if libc::sched_setscheduler(0, libc::SCHED_RR, &param) != 0 {
+                achieved.sched_errno = Some(errno());
+            }
+        }
+        if let Some(nice) = request.nice {
+            // `PRIO_PROCESS` with `who == 0` is the *calling thread* on Linux:
+            // nice is a per-thread attribute there, which is the whole reason
+            // this knob is Linux-only.
+            *libc::__errno_location() = 0;
+            if libc::setpriority(libc::PRIO_PROCESS as u32, 0, nice) != 0 && errno() != 0 {
+                achieved.nice_errno = Some(errno());
+            }
+        }
+        achieved.policy = match libc::sched_getscheduler(0) {
+            libc::SCHED_OTHER => "other",
+            libc::SCHED_RR => "rr",
+            libc::SCHED_FIFO => "fifo",
+            libc::SCHED_BATCH => "batch",
+            libc::SCHED_IDLE => "idle",
+            _ => "unknown",
+        };
+        let mut param = libc::sched_param { sched_priority: 0 };
+        if libc::sched_getparam(0, &mut param) == 0 {
+            achieved.rt_priority = param.sched_priority;
+        }
+        // `-1` is a legal nice level, so errno is the only way to tell a real
+        // answer from a failure.
+        *libc::__errno_location() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS as u32, 0);
+        achieved.nice = if nice == -1 && errno() != 0 {
+            None
+        } else {
+            Some(nice)
+        };
+    }
+    achieved
+}
+
+/// Off Linux the knobs are read and disclosed but never applied.
+///
+/// `setpriority(PRIO_PROCESS, 0, …)` is process-wide on macOS rather than
+/// thread-scoped, so honouring `WEBTRANSPORT_PACER_NICE` there would renice the
+/// entire runtime under a name that says "pacer thread" — a measurement lie
+/// costlier than the missing lever. `SCHED_RR` has no portable equivalent.
+#[cfg(not(target_os = "linux"))]
+fn apply_priority(_request: &PriorityRequest) -> PriorityAchieved {
+    PriorityAchieved {
+        policy: "unsupported",
+        at_thread_start: THREAD_STARTS.load(Ordering::Relaxed),
+        ..Default::default()
+    }
 }
 
 /// The schedule, with no thread, no socket and no clock of its own.
@@ -209,41 +398,190 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 static CLUMPS: AtomicU64 = AtomicU64::new(0);
 static LATE_CLUMPS: AtomicU64 = AtomicU64::new(0);
 static LATE_NANOS_MAX: AtomicU64 = AtomicU64::new(0);
+/// Max lateness since the most recent `snapshot()`, which zeroes it.
+///
+/// A separate register rather than a derived number: a maximum is not
+/// invertible, so unlike every other counter here a windowed max cannot be
+/// computed as the difference of two cumulative reads.
+static LATE_NANOS_MAX_WINDOW: AtomicU64 = AtomicU64::new(0);
 static RESETS: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_FAILURES: AtomicU64 = AtomicU64::new(0);
 static THREAD_STARTS: AtomicU64 = AtomicU64::new(0);
 static THREAD_START_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// One consistent-enough read of every cumulative counter.
+///
+/// "Consistent enough" is the honest word: the loads are relaxed and unordered,
+/// so a snapshot taken while the pacer thread is mid-clump can show `clumps`
+/// incremented and `lateClumps` not yet. At a window's scale — thousands of
+/// clumps — that is one clump of slop, and the alternative is a lock on the
+/// send path to make a diagnostic exact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Counters {
+    submits: u64,
+    admitted: u64,
+    refused: u64,
+    clumps: u64,
+    late_clumps: u64,
+    resets: u64,
+    deferred_failures: u64,
+    thread_starts: u64,
+    thread_start_failures: u64,
+}
+
+impl Counters {
+    fn load() -> Self {
+        Self {
+            submits: SUBMITS.load(Ordering::Relaxed),
+            admitted: ADMITTED.load(Ordering::Relaxed),
+            refused: REFUSED.load(Ordering::Relaxed),
+            clumps: CLUMPS.load(Ordering::Relaxed),
+            late_clumps: LATE_CLUMPS.load(Ordering::Relaxed),
+            resets: RESETS.load(Ordering::Relaxed),
+            deferred_failures: DEFERRED_FAILURES.load(Ordering::Relaxed),
+            thread_starts: THREAD_STARTS.load(Ordering::Relaxed),
+            thread_start_failures: THREAD_START_FAILURES.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Counters advanced since `earlier`.
+    ///
+    /// Saturating: a counter that appears to have moved backwards — which the
+    /// unordered loads above make possible by one increment — reports zero
+    /// rather than eighteen quintillion.
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            submits: self.submits.saturating_sub(earlier.submits),
+            admitted: self.admitted.saturating_sub(earlier.admitted),
+            refused: self.refused.saturating_sub(earlier.refused),
+            clumps: self.clumps.saturating_sub(earlier.clumps),
+            late_clumps: self.late_clumps.saturating_sub(earlier.late_clumps),
+            resets: self.resets.saturating_sub(earlier.resets),
+            deferred_failures: self
+                .deferred_failures
+                .saturating_sub(earlier.deferred_failures),
+            thread_starts: self.thread_starts.saturating_sub(earlier.thread_starts),
+            thread_start_failures: self
+                .thread_start_failures
+                .saturating_sub(earlier.thread_start_failures),
+        }
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        json!({
+            "submits": self.submits,
+            "admittedTargets": self.admitted,
+            "refusedTargets": self.refused,
+            "clumps": self.clumps,
+            "lateClumps": self.late_clumps,
+            "scheduleResets": self.resets,
+            "deferredFailures": self.deferred_failures,
+            "threadStarts": self.thread_starts,
+            "threadStartFailures": self.thread_start_failures,
+        })
+    }
+}
+
+/// How many open snapshot marks are kept before the oldest is dropped.
+///
+/// A caller that takes marks and never reads them would otherwise grow this map
+/// without limit. The bench takes one per rung, so this is two orders of
+/// magnitude of headroom over the intended use.
+const MARKS_MAX: usize = 64;
+
+fn marks() -> &'static Mutex<BTreeMap<u32, Counters>> {
+    static MARKS: OnceLock<Mutex<BTreeMap<u32, Counters>>> = OnceLock::new();
+    MARKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+static NEXT_MARK: AtomicU32 = AtomicU32::new(1);
+
+/// Open a stats window: record every counter now, and return the token that
+/// reads the delta at window close. `0` means the pacer is off — there is
+/// nothing to window and no token was stored.
+///
+/// Reading a token does not consume it, so a caller may sample the same window
+/// repeatedly; the mark is released by eviction once `MARKS_MAX` newer marks
+/// exist.
+pub(crate) fn snapshot() -> u32 {
+    if config().is_none() {
+        return 0;
+    }
+    let counters = Counters::load();
+    // Zeroed here rather than at read: the window's max belongs to the window
+    // that just opened, and every clump after this point contributes to it.
+    LATE_NANOS_MAX_WINDOW.store(0, Ordering::Relaxed);
+    take_mark(counters)
+}
+
+/// Store one mark and name it. Split from `snapshot` only so the token and
+/// eviction rules are reachable from a test binary, where `config()` is
+/// permanently off and `snapshot` can only ever return `0`.
+fn take_mark(counters: Counters) -> u32 {
+    let mut token = NEXT_MARK.fetch_add(1, Ordering::Relaxed);
+    if token == 0 {
+        // Wrapped. `0` is the "no window" answer and must never name a real
+        // mark, so skip it rather than hand back an ambiguous token.
+        token = NEXT_MARK.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Ok(mut marks) = marks().lock() {
+        while marks.len() >= MARKS_MAX {
+            marks.pop_first();
+        }
+        marks.insert(token, counters);
+    }
+    token
+}
+
+fn read_mark(token: u32) -> Option<Counters> {
+    marks().lock().ok()?.get(&token).copied()
+}
 
 /// Counters as a JSON string. `"{}"` when the knob is off.
 ///
 /// A string rather than a typed snapshot on purpose: the prototype commits to no
 /// schema, and this is read by the microbench and the cable validation, not by
 /// user code.
-pub(crate) fn stats_json() -> String {
+///
+/// `since` is a token from [`snapshot`]. With one, `window` carries the deltas
+/// over that window beside the raw cumulative values; without one — or with a
+/// token already evicted — `window` is `null` and the caller can tell the
+/// difference between "no window" and "a window in which nothing happened".
+///
+/// `cumulative.maxLatenessUsSinceProcessStart` is exactly what its name says and
+/// must not be read as a property of any window. The windowed variant lives
+/// under `window.maxLatenessUsSinceSnapshot` and is measured from the most
+/// recent [`snapshot`] call, whichever token that was.
+pub(crate) fn stats_json(since: Option<u32>) -> String {
     let Some(cfg) = config() else {
         return "{}".to_string();
     };
     let pending = pacer().queue.lock().map(|q| q.pending_targets).unwrap_or(0);
-    format!(
-        "{{\"pps\":{},\"clump\":{},\"queueMs\":{},\"submits\":{},\"admittedTargets\":{},\
-\"refusedTargets\":{},\"clumps\":{},\"lateClumps\":{},\"maxLatenessUs\":{},\
-\"scheduleResets\":{},\"deferredFailures\":{},\"threadStarts\":{},\
-\"threadStartFailures\":{},\"pendingTargets\":{}}}",
-        cfg.pps,
-        cfg.clump,
-        cfg.queue_ms,
-        SUBMITS.load(Ordering::Relaxed),
-        ADMITTED.load(Ordering::Relaxed),
-        REFUSED.load(Ordering::Relaxed),
-        CLUMPS.load(Ordering::Relaxed),
-        LATE_CLUMPS.load(Ordering::Relaxed),
-        LATE_NANOS_MAX.load(Ordering::Relaxed) / 1_000,
-        RESETS.load(Ordering::Relaxed),
-        DEFERRED_FAILURES.load(Ordering::Relaxed),
-        THREAD_STARTS.load(Ordering::Relaxed),
-        THREAD_START_FAILURES.load(Ordering::Relaxed),
-        pending,
-    )
+    let now = Counters::load();
+    let window = since.and_then(|token| {
+        let earlier = read_mark(token)?;
+        let mut window = now.since(earlier).to_json();
+        window["token"] = json!(token);
+        window["maxLatenessUsSinceSnapshot"] =
+            json!(LATE_NANOS_MAX_WINDOW.load(Ordering::Relaxed) / 1_000);
+        Some(window)
+    });
+    let mut cumulative = now.to_json();
+    cumulative["maxLatenessUsSinceProcessStart"] =
+        json!(LATE_NANOS_MAX.load(Ordering::Relaxed) / 1_000);
+    json!({
+        "pps": cfg.pps,
+        "clump": cfg.clump,
+        "queueMs": cfg.queue_ms,
+        // The admission bound as the code actually holds it: a target count.
+        // See `max_pending` for why the millisecond knob is nominal.
+        "maxPendingTargets": cfg.max_pending(),
+        "pendingTargets": pending,
+        "priority": priority_json(),
+        "cumulative": cumulative,
+        "window": window,
+    })
+    .to_string()
 }
 
 /// How many of `wanted` targets the queue will take right now.
@@ -321,11 +659,47 @@ pub(crate) fn submit(
     })
 }
 
+/// Clears `thread_running` if the pacer thread leaves any way other than the
+/// idle exit — a panic in a send, or a poisoned lock.
+///
+/// Without it `thread_running` stays `true` for a thread that is gone, no
+/// submission ever respawns one, and the queue wedges permanently with every
+/// subsequent target refused. The idle exit clears the flag itself, under the
+/// lock and in the same critical section that observed the queue empty, and
+/// sets `clean` so this guard leaves it alone: clearing it a second time from
+/// outside that section is what would let a second pacer thread start while the
+/// first still holds a schedule, and two cursors is two paces.
+struct ExitGuard {
+    clean: bool,
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if self.clean {
+            return;
+        }
+        // A poisoned queue is exactly the case this exists for, so the poison is
+        // stepped over rather than propagated.
+        let mut queue = match pacer().queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        queue.thread_running = false;
+    }
+}
+
 /// The pacer thread: pop a job, split it into clumps, and give each clump one
 /// departure time.
 fn run(cfg: PacerConfig) {
     let pacer = pacer();
     let mut core = PacerCore::new(&cfg);
+    let mut guard = ExitGuard { clean: false };
+    // Every respawn starts at the runtime's default priority, so the request is
+    // re-applied here rather than once per process.
+    let achieved = apply_priority(priority_request());
+    if let Ok(mut slot) = priority_achieved().lock() {
+        *slot = Some(achieved);
+    }
     loop {
         let job = {
             let mut queue = match pacer.queue.lock() {
@@ -345,6 +719,7 @@ fn run(cfg: PacerConfig) {
                     // Exit rather than hold a thread for a server that has
                     // stopped broadcasting; the next submission respawns.
                     queue.thread_running = false;
+                    guard.clean = true;
                     break None;
                 }
             }
@@ -419,6 +794,7 @@ fn record_clump(txtime: Instant) {
     }
     let nanos = lateness.as_nanos().min(u64::MAX as u128) as u64;
     LATE_NANOS_MAX.fetch_max(nanos, Ordering::Relaxed);
+    LATE_NANOS_MAX_WINDOW.fetch_max(nanos, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -511,6 +887,113 @@ mod tests {
         assert_eq!(admit_count(99_999, 10, 18_750), 0);
     }
 
+    /// Replay of the admission rule against a drain that achieves `achieved_pps`.
+    ///
+    /// This is the submit side and the release side of the real code — the
+    /// `admit_count` bound, and the clump-by-clump release the drain performs —
+    /// with wall time replaced by a 1 ms step so a 60 s window is a test. It
+    /// exists to answer one question with arithmetic instead of a cable run:
+    /// what queue latencies are *reachable* at a given refusal count.
+    ///
+    /// Returns `(refused targets, worst time a target spent queued)`.
+    fn replay(
+        cfg: &PacerConfig,
+        achieved_pps: u64,
+        job: usize,
+        period_ms: u64,
+        seconds: u64,
+    ) -> (u64, Duration) {
+        let mut queued: VecDeque<(u64, u64)> = VecDeque::new(); // (admitted at ms, targets)
+        let mut pending = 0u64;
+        let mut refused = 0u64;
+        let mut worst_ms = 0u64;
+        for ms in 0..seconds * 1_000 {
+            if ms % period_ms == 0 {
+                let admitted = admit_count(pending, job, cfg.max_pending()) as u64;
+                refused += job as u64 - admitted;
+                if admitted > 0 {
+                    pending += admitted;
+                    queued.push_back((ms, admitted));
+                }
+            }
+            let mut budget = achieved_pps / 1_000;
+            while budget > 0 {
+                let Some((admitted_at, left)) = queued.front_mut() else {
+                    break;
+                };
+                let sent = budget.min(*left);
+                *left -= sent;
+                budget -= sent;
+                pending -= sent;
+                worst_ms = worst_ms.max(ms - *admitted_at);
+                if *left == 0 {
+                    queued.pop_front();
+                }
+            }
+        }
+        (refused, Duration::from_millis(worst_ms))
+    }
+
+    /// Ticket 18's contradiction, settled: the 250 ms bound is enforced, it is
+    /// enforced as a *target count*, and at last night's shape that count is
+    /// never approached — so zero refusals is what the bound predicts and the
+    /// 2 s spread cannot have been spent in this queue.
+    #[test]
+    fn a_broadcast_that_is_never_refused_cannot_have_waited_the_bound_in_the_queue() {
+        let cfg = PacerConfig {
+            pps: 75_000,
+            clump: 32,
+            queue_ms: QUEUE_MS_DEFAULT,
+        };
+        assert_eq!(cfg.max_pending(), 18_750);
+
+        // Last night's shape: 10 000 targets per broadcast at 5 Hz — 50 k
+        // targets/s offered against a 75 k schedule.
+        let (refused, worst) = replay(&cfg, cfg.pps, 10_000, 200, 60);
+        assert_eq!(refused, 0, "a drain above the offered rate refuses nothing");
+        assert!(
+            worst < Duration::from_millis(cfg.queue_ms),
+            "queue latency {worst:?} at the configured rate must stay under the bound"
+        );
+
+        // The queue can only hold a target for ~2 s if the drain runs at about
+        // `max_pending / 2 s` ≈ 9.4 k pps — and that drain refuses most of what
+        // it is offered, which is precisely what the measured run did not do.
+        let (refused_slow, worst_slow) = replay(&cfg, 9_400, 10_000, 200, 60);
+        assert!(
+            worst_slow >= Duration::from_millis(1_800),
+            "a 9.4 k drain should park targets for ~2 s, saw {worst_slow:?}"
+        );
+        assert!(
+            refused_slow > 2_000_000,
+            "reaching a 2 s queue means refusing millions of targets, saw {refused_slow}"
+        );
+    }
+
+    /// The other half of the answer: `queue_ms` is milliseconds *at the
+    /// configured rate*. Half the achieved rate is double the queue latency for
+    /// the same bound, which is why the windowed stats have to travel with any
+    /// paced number.
+    #[test]
+    fn the_queue_bound_is_a_target_count_and_only_nominally_a_duration() {
+        let cfg = PacerConfig {
+            pps: 75_000,
+            clump: 32,
+            queue_ms: QUEUE_MS_DEFAULT,
+        };
+        let bound = cfg.max_pending();
+        assert_eq!(
+            bound * 1_000 / cfg.pps,
+            cfg.queue_ms,
+            "nominal by construction"
+        );
+        assert_eq!(
+            bound * 1_000 / (cfg.pps / 2),
+            cfg.queue_ms * 2,
+            "the same bound is twice the wall time at half the achieved rate"
+        );
+    }
+
     #[test]
     fn the_admission_bound_is_at_least_one_clump() {
         let tiny = PacerConfig {
@@ -528,7 +1011,95 @@ mod tests {
         // environment means no pacer and no stats schema.
         assert!(std::env::var("WEBTRANSPORT_PACER_PPS").is_err());
         assert!(config().is_none());
-        assert_eq!(stats_json(), "{}");
+        assert_eq!(stats_json(None), "{}");
+        assert_eq!(stats_json(Some(1)), "{}");
+        // No token is handed out either: a caller that marks a window on a
+        // knob-off server must not be given something that looks like one.
+        assert_eq!(snapshot(), 0);
+    }
+
+    /// Both mark rules in one test: the global mark map is shared process-wide,
+    /// and splitting these would let the eviction half evict the delta half's
+    /// token under a parallel test runner.
+    #[test]
+    fn a_mark_reads_back_as_a_delta_and_the_oldest_marks_are_evicted() {
+        let open = Counters {
+            submits: 10,
+            clumps: 100,
+            late_clumps: 3,
+            ..Default::default()
+        };
+        let token = take_mark(open);
+        assert_ne!(token, 0, "a real mark never wears the no-window token");
+        assert_eq!(read_mark(token), Some(open));
+
+        let close = Counters {
+            submits: 14,
+            clumps: 400,
+            late_clumps: 3,
+            thread_starts: 2,
+            ..Default::default()
+        };
+        let window = close.since(open);
+        assert_eq!(window.submits, 4);
+        assert_eq!(window.clumps, 300);
+        assert_eq!(window.late_clumps, 0, "a counter that did not move is zero");
+        assert_eq!(window.thread_starts, 2);
+        // The unordered relaxed loads can show a counter going backwards by one
+        // increment; that must read as nothing happened, not as a wrap.
+        assert_eq!(open.since(close).submits, 0);
+
+        for _ in 0..MARKS_MAX {
+            take_mark(Counters::default());
+        }
+        assert_eq!(
+            read_mark(token),
+            None,
+            "a mark held past the cap is dropped rather than growing the map"
+        );
+    }
+
+    #[test]
+    fn the_priority_knobs_parse_clamped_and_disclose_a_typo_instead_of_defaulting() {
+        assert_eq!(parse_priority(None, None), PriorityRequest::default());
+
+        let nice = parse_priority(Some(" -10 "), None);
+        assert_eq!(nice.nice, Some(-10));
+        assert!(!nice.malformed);
+        assert_eq!(parse_priority(Some("-99"), None).nice, Some(-20));
+        assert_eq!(parse_priority(Some("99"), None).nice, Some(19));
+
+        let rr = parse_priority(None, Some("RR:50"));
+        assert_eq!(rr.rr_priority, Some(50));
+        assert!(!rr.malformed);
+        assert_eq!(parse_priority(None, Some("rr:0")).rr_priority, Some(1));
+        assert_eq!(parse_priority(None, Some("rr:400")).rr_priority, Some(99));
+
+        // A typo must never read as "no priority requested": a sweep cell that
+        // silently ran unprioritised would be labelled as a priority cell.
+        for typo in ["fifo:50", "rr", "50", ""] {
+            let bad = parse_priority(None, Some(typo));
+            assert!(bad.malformed, "{typo:?} should be disclosed as malformed");
+            assert_eq!(bad.rr_priority, None);
+        }
+        assert!(parse_priority(Some("high"), None).malformed);
+    }
+
+    #[test]
+    fn priority_is_disclosed_as_unrequested_and_unachieved_until_a_thread_runs() {
+        // Neither knob is set in the test environment, and no pacer thread can
+        // start with the pacer off — so this is the byte-identical default the
+        // lever must not disturb.
+        assert!(std::env::var("WEBTRANSPORT_PACER_NICE").is_err());
+        assert!(std::env::var("WEBTRANSPORT_PACER_SCHED").is_err());
+        let json = priority_json();
+        assert!(json["requestedNice"].is_null());
+        assert!(json["requestedSchedRrPriority"].is_null());
+        assert_eq!(json["knobMalformed"], serde_json::Value::Bool(false));
+        assert!(
+            json["achieved"].is_null(),
+            "achieved is read back from the kernel, so it stays null until there is a thread to read"
+        );
     }
 
     #[test]
@@ -648,7 +1219,7 @@ mod tests {
             mean,
             schedule_cost,
             cost_per_clump,
-            stats_json(),
+            stats_json(None),
         );
 
         // The schedule itself must be free relative to the cadence it drives.
