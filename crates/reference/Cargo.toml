@@ -23,6 +23,10 @@ path = "src/gso_probe.rs"
 name = "g7-sink"
 path = "src/g7_sink.rs"
 
+[[bin]]
+name = "g7-precheck-source"
+path = "src/g7_precheck_source.rs"
+
 [dependencies]
 wtransport = { workspace = true }
 quinn-udp = "0.5"
