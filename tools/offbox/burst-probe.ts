@@ -138,6 +138,11 @@ if (role === "recv") {
 		}));
 	const drains = rows.map((r) => r.drainMs).sort((a, b) => a - b);
 	const completeness = rows.map((r) => r.completeness).sort((a, b) => a - b);
+	// No `drainMsP99` (Amendment 5): at the registered `bursts = 30` the 0.99
+	// quantile lands on the last sample, so a field named p99 was the maximum
+	// wearing a name that promised robustness the sample cannot carry. V-SP
+	// rides `drainMsMax` — the same number at this sample size, and the
+	// conservative one at any larger size.
 	publish({
 		role: "recv",
 		date: localDate(),
@@ -148,7 +153,6 @@ if (role === "recv") {
 		burstsSeen: rows.length,
 		totalReceived: total,
 		drainMsP50: percentile(drains, 0.5),
-		drainMsP99: percentile(drains, 0.99),
 		drainMsMax: drains.at(-1) ?? null,
 		completenessMin: completeness[0] ?? null,
 		perBurst: rows,
@@ -160,9 +164,16 @@ if (role === "recv") {
 	const payload = new Uint8Array(payloadBytes);
 	const view = new DataView(payload.buffer);
 	const emits: number[] = [];
+	const netEmits: number[] = [];
+	const blockedCounts: number[] = [];
 	for (let b = 0; b < bursts; b += 1) {
 		const started = process.hrtime.bigint();
 		let blocked = 0;
+		// Wall time spent inside the backoff sleeps themselves. A `setTimeout(0)`
+		// costs a millisecond or more here, so on a bad burst these dominate
+		// `emitMs` — and V-SP judges the sink against the sender's emission, so
+		// leaving them in would let a struggling sender license a slow sink.
+		let blockedNs = 0n;
 		view.setUint32(0, b);
 		for (let s = 0; s < count; s += 1) {
 			if (pacePps > 0) {
@@ -187,18 +198,28 @@ if (role === "recv") {
 					if ((err as { code?: string }).code !== "EAGAIN") throw err;
 				}
 				blocked += 1;
+				const sleepFrom = process.hrtime.bigint();
 				await new Promise((r) => setTimeout(r, 0));
+				blockedNs += process.hrtime.bigint() - sleepFrom;
 			}
 		}
 		const emitMs = Number(process.hrtime.bigint() - started) / 1e6;
+		const netEmitMs = emitMs - Number(blockedNs) / 1e6;
 		emits.push(emitMs);
+		netEmits.push(netEmitMs);
+		blockedCounts.push(blocked);
 		console.error(
-			`burst-probe send: burst ${b} emitted in ${emitMs.toFixed(2)} ms (${blocked} backoffs)`,
+			`burst-probe send: burst ${b} emitted in ${emitMs.toFixed(2)} ms ` +
+				`(${netEmitMs.toFixed(2)} ms net of ${blocked} backoffs)`,
 		);
 		await new Promise((r) => setTimeout(r, gapMs));
 	}
 	socket.close();
 	const sorted = [...emits].sort((a, b) => a - b);
+	const sortedNet = [...netEmits].sort((a, b) => a - b);
+	// `emitMsNetMax` is what V-SP's ceiling rides (Amendment 5); `emitMsMax`
+	// stays as the disclosure of what the burst actually cost the sender, and
+	// `blocked` is now written down rather than only printed to stderr.
 	publish({
 		role: "send",
 		date: localDate(),
@@ -210,9 +231,14 @@ if (role === "recv") {
 		payloadBytes,
 		pacePps,
 		emitMsP50: percentile(sorted, 0.5),
-		emitMsP99: percentile(sorted, 0.99),
 		emitMsMax: sorted.at(-1) ?? null,
+		emitMsNetP50: percentile(sortedNet, 0.5),
+		emitMsNetMax: sortedNet.at(-1) ?? null,
+		blockedTotal: blockedCounts.reduce((a, b) => a + b, 0),
+		blockedMax: blockedCounts.length === 0 ? null : Math.max(...blockedCounts),
 		perBurstEmitMs: emits,
+		perBurstNetEmitMs: netEmits,
+		perBurstBlocked: blockedCounts,
 	});
 } else {
 	console.error(

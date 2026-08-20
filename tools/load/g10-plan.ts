@@ -155,12 +155,12 @@ export function pathImpulseSerializationMs(subscribers = SUBSCRIBERS): number {
  * `10,000/100,071 × 1.2 ≈ 119.91 ms`. The original `0.25 × 1000/R`
  * emitter-period bound rested on §1.5's 21.28 ms line-rate premise, which the
  * burst probe disproved; the rate no longer sets the bound, it decides
- * applicability (below).
+ * applicability (below). The rate parameter is gone rather than underscored:
+ * `spreadCrossoverRate` used to pass a literal `0` for it, which is meaningless
+ * as a rate and would become a division by zero the day anyone reintroduced a
+ * rate term.
  */
-export function spreadBoundMs(
-	_rate: number,
-	subscribers = SUBSCRIBERS,
-): number {
+export function spreadBoundMs(subscribers = SUBSCRIBERS): number {
 	return pathImpulseSerializationMs(subscribers) * (1 + PATH_SINK_MARGIN);
 }
 
@@ -177,19 +177,17 @@ export function spreadClauseApplies(
 	_payloadBytes = MESSAGE_PAYLOAD_BYTES,
 	_linkBitsPerSec = GIGABIT,
 ): boolean {
-	return 1000 / rate > spreadBoundMs(rate, subscribers);
+	return 1000 / rate > spreadBoundMs(subscribers);
 }
 
 /** §1.6 as amended. How much of the bound the sink margin leaves on top of the path. */
 export function spreadHeadroom(
-	rate: number,
+	_rate: number,
 	subscribers = SUBSCRIBERS,
 	_payloadBytes = MESSAGE_PAYLOAD_BYTES,
 	_linkBitsPerSec = GIGABIT,
 ): number {
-	return (
-		spreadBoundMs(rate, subscribers) / pathImpulseSerializationMs(subscribers)
-	);
+	return spreadBoundMs(subscribers) / pathImpulseSerializationMs(subscribers);
 }
 
 /** §1.6. The rate above which the wire floor swallows the bound. */
@@ -198,7 +196,7 @@ export function spreadCrossoverRate(
 	_payloadBytes = MESSAGE_PAYLOAD_BYTES,
 	_linkBitsPerSec = GIGABIT,
 ): number {
-	return 1000 / spreadBoundMs(0, subscribers);
+	return 1000 / spreadBoundMs(subscribers);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -299,7 +297,7 @@ export function armShape(
 			payloadBytes,
 			linkBitsPerSec,
 		),
-		spreadBoundMs: spreadBoundMs(rate),
+		spreadBoundMs: spreadBoundMs(),
 		spreadClauseApplies: spreadClauseApplies(
 			rate,
 			subscribers,
@@ -570,15 +568,20 @@ export function sinkPrecheckPps(rate = GATE_RATE): number {
 }
 
 /**
- * V-SP as amended (Amendment 4), in ms: the sink may take at most the same 20%
+ * V-SP as amended (Amendments 4 and 5), in ms: the sink may take at most the same 20%
  * margin on top of what the sender needed to emit the impulse. The original
  * loopback-spread form (20% of §1.5's wire floor, 4.26 ms) asked the loopback
  * to do something no loopback can — offer a line-rate impulse — so its number
  * measured the local emitter, not the sink. The burst probe measures the sink
  * against the real NIC's impulse, and this ceiling bounds it.
+ *
+ * Amendment 5: the argument is the sender's emission **net of its own backoff
+ * sleeps**. Gross emission folded the sender's `setTimeout(0)` waits into the
+ * sink's allowance, so a sender having a bad day raised the very bar the sink
+ * was judged against — the ceiling grew with the noise it exists to exclude.
  */
-export function sinkDrainCeilingMs(emitMaxMs: number): number {
-	return emitMaxMs * (1 + PATH_SINK_MARGIN);
+export function sinkDrainCeilingMs(netEmitMaxMs: number): number {
+	return netEmitMaxMs * (1 + PATH_SINK_MARGIN);
 }
 
 /** V-F, in ms (§7). */

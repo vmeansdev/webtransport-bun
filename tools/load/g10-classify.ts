@@ -137,7 +137,7 @@ export function evaluateSpreadClause(
 ): ClauseResult {
 	const payload = facts.payloadBytes ?? MESSAGE_PAYLOAD_BYTES;
 	const link = facts.linkBitsPerSec ?? GIGABIT;
-	const bound = spreadBoundMs(facts.rate);
+	const bound = spreadBoundMs(facts.subscribers);
 	const floor = broadcastSerializationMs(facts.subscribers, payload, link);
 
 	if (!spreadClauseApplies(facts.rate, facts.subscribers, payload, link)) {
@@ -637,41 +637,58 @@ export function sinkFalsifier(
  * (`tools/offbox/burst-probe.ts`): the sender blasts the gate's impulse through
  * the real NIC and reports how long emission took; the sink reports how long
  * the drain took. A sink at wire pace attributes the day's spread to the
- * server+path; completeness is disclosed beside it, never bounded — the raw
- * probe has no transport, so its loss is the path's, not the sink's.
+ * server+path.
+ *
+ * Amendment 5 moves two things and the reason string says both out loud:
+ *
+ * - **The ceiling is the sender's emission net of its own backoff sleeps.**
+ *   Gross emission includes every `setTimeout(0)` the sender spent waiting on a
+ *   full socket buffer, so the worse the sender's day the more drain the sink
+ *   was licensed. Net emission is the sender's actual work.
+ * - **The drain is normalized by completeness before it is compared.** A path
+ *   that drops the tail of a burst produces a *shorter* `last − first` window,
+ *   so loss used to make the sink look faster. Completeness is still never
+ *   bounded — a raw UDP probe's loss is the path's, not the sink's — but a
+ *   62%-complete burst no longer earns credit for a 62%-length drain.
  */
 export function spreadFloorFalsifier(
 	facts: PrecheckFacts & {
-		burstDrainP99Ms: number | null;
+		burstDrainMaxMs: number | null;
+		burstEmitNetMaxMs: number | null;
 		burstEmitMaxMs: number | null;
 		burstCompletenessMin: number | null;
 	},
 ): { fires: boolean; reason: string } {
 	const stale = sameDayOnExpectedHost(facts);
 	if (stale) return { fires: true, reason: `V-SP: ${stale}` };
-	if (facts.burstDrainP99Ms === null || facts.burstEmitMaxMs === null) {
+	if (facts.burstDrainMaxMs === null || facts.burstEmitNetMaxMs === null) {
 		return { fires: true, reason: "V-SP: no same-day burst-probe artifact" };
 	}
-	const ceiling = sinkDrainCeilingMs(facts.burstEmitMaxMs);
-	const completeness =
-		facts.burstCompletenessMin === null
-			? "undisclosed"
-			: facts.burstCompletenessMin.toFixed(3);
-	if (facts.burstDrainP99Ms > ceiling) {
+	if (
+		facts.burstCompletenessMin === null ||
+		!(facts.burstCompletenessMin > 0)
+	) {
 		return {
 			fires: true,
 			reason:
-				`V-SP: sink drain p99 ${facts.burstDrainP99Ms.toFixed(2)} ms vs ` +
-				`${ceiling.toFixed(2)} ms (1.2 × emission max ${facts.burstEmitMaxMs.toFixed(2)} ms)`,
+				"V-SP: burst completeness undisclosed or zero — the drain cannot be normalized",
 		};
 	}
-	return {
-		fires: false,
-		reason:
-			`V-SP: sink at wire pace — drain p99 ${facts.burstDrainP99Ms.toFixed(2)} ms ≤ ` +
-			`1.2 × emission max ${facts.burstEmitMaxMs.toFixed(2)} ms; ` +
-			`completeness min ${completeness}, disclosed`,
-	};
+	const ceiling = sinkDrainCeilingMs(facts.burstEmitNetMaxMs);
+	const normalized = facts.burstDrainMaxMs / facts.burstCompletenessMin;
+	const disclosure =
+		`drain max ${facts.burstDrainMaxMs.toFixed(2)} ms ÷ completeness min ` +
+		`${facts.burstCompletenessMin.toFixed(3)} = ${normalized.toFixed(2)} ms; ` +
+		`ceiling ${ceiling.toFixed(2)} ms (1.2 × net emission max ` +
+		`${facts.burstEmitNetMaxMs.toFixed(2)} ms; gross ` +
+		`${facts.burstEmitMaxMs === null ? "undisclosed" : `${facts.burstEmitMaxMs.toFixed(2)} ms`})`;
+	if (normalized > ceiling) {
+		return {
+			fires: true,
+			reason: `V-SP: sink drain over ceiling — ${disclosure}`,
+		};
+	}
+	return { fires: false, reason: `V-SP: sink at wire pace — ${disclosure}` };
 }
 
 /** V-F. K11: a 40.6 ms lag maximum on an idle Mac is larger than the whole bound. */

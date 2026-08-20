@@ -405,33 +405,80 @@ describe("§7 — the pre-check falsifiers", () => {
 		).toBe(true);
 	});
 
-	test("V-SP: a sink slower than 1.2 × the impulse emission fires (Amendment 4)", () => {
+	test("V-SP: a sink slower than 1.2 × the net impulse emission fires", () => {
 		expect(
 			spreadFloorFalsifier({
 				...precheck,
-				burstDrainP99Ms: 120,
+				burstDrainMaxMs: 120,
+				burstEmitNetMaxMs: 95,
 				burstEmitMaxMs: 95,
-				burstCompletenessMin: 0.8,
+				burstCompletenessMin: 0.99,
 			}).fires,
 		).toBe(true);
 	});
 
-	test("V-SP: a sink at wire pace does not fire, completeness disclosed", () => {
+	test("V-SP: a sink at wire pace on a near-complete burst does not fire", () => {
 		const ok = spreadFloorFalsifier({
 			...precheck,
-			burstDrainP99Ms: 91.9,
+			burstDrainMaxMs: 100,
+			burstEmitNetMaxMs: 95,
+			burstEmitMaxMs: 140,
+			burstCompletenessMin: 0.98,
+		});
+		expect(ok.fires).toBe(false);
+		expect(ok.reason).toContain("completeness min 0.980");
+		expect(ok.reason).toContain("gross 140.00 ms");
+	});
+
+	test("V-SP (Amendment 5): the sender's backoff sleeps no longer raise the ceiling", () => {
+		// Same sink, same burst. Gross emission 300 ms would have licensed a
+		// 360 ms drain; the sender's own work was 95 ms, so the ceiling is 114.
+		const facts = {
+			...precheck,
+			burstDrainMaxMs: 200,
+			burstEmitNetMaxMs: 95,
+			burstEmitMaxMs: 300,
+			burstCompletenessMin: 0.99,
+		};
+		expect(spreadFloorFalsifier(facts).fires).toBe(true);
+		expect(
+			spreadFloorFalsifier({ ...facts, burstEmitNetMaxMs: 300 }).fires,
+		).toBe(false);
+	});
+
+	test("V-SP (Amendment 5): a burst that mostly did not arrive cannot pass on its short drain", () => {
+		// The 2026-08-19 reading Amendment 4 recorded as passing: drain 91.9 ms
+		// against a 114 ms ceiling — but only 61.7% of the burst arrived, so the
+		// window is 61.7% of a window. Normalized it is 148.95 ms, over ceiling.
+		const fired = spreadFloorFalsifier({
+			...precheck,
+			burstDrainMaxMs: 91.9,
+			burstEmitNetMaxMs: 95,
 			burstEmitMaxMs: 95,
 			burstCompletenessMin: 0.617,
 		});
-		expect(ok.fires).toBe(false);
-		expect(ok.reason).toContain("disclosed");
+		expect(fired.fires).toBe(true);
+		expect(fired.reason).toContain("148.9");
+	});
+
+	test("V-SP: undisclosed completeness fires — an unnormalizable drain is not a cleared sink", () => {
+		expect(
+			spreadFloorFalsifier({
+				...precheck,
+				burstDrainMaxMs: 91.9,
+				burstEmitNetMaxMs: 95,
+				burstEmitMaxMs: 95,
+				burstCompletenessMin: null,
+			}).fires,
+		).toBe(true);
 	});
 
 	test("V-SP: a missing burst-probe artifact fires", () => {
 		expect(
 			spreadFloorFalsifier({
 				...precheck,
-				burstDrainP99Ms: null,
+				burstDrainMaxMs: null,
+				burstEmitNetMaxMs: null,
 				burstEmitMaxMs: null,
 				burstCompletenessMin: null,
 			}).fires,

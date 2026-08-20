@@ -32,10 +32,16 @@ const recvArtifact = {
 	role: "recv",
 	date: DAY,
 	host: MAC,
-	drainMsP99: 91.9,
-	completenessMin: 0.617,
+	drainMsMax: 100,
+	completenessMin: 0.98,
 };
-const sendArtifact = { role: "send", date: DAY, host: "runner", emitMsMax: 95 };
+const sendArtifact = {
+	role: "send",
+	date: DAY,
+	host: "runner",
+	emitMsMax: 140,
+	emitMsNetMax: 95,
+};
 
 describe("V-SP reaches C1, or the gate grades its headline clause blind", () => {
 	test("no burst artifact at all forces C1 to no-verdict", () => {
@@ -74,21 +80,29 @@ describe("V-SP reaches C1, or the gate grades its headline clause blind", () => 
 	});
 
 	test("a same-day sink slower than the emission still strips the verdict", () => {
-		const slow = { ...recvArtifact, drainMsP99: 120 };
+		const slow = { ...recvArtifact, drainMsMax: 120 };
 		expect(c1(slow, sendArtifact).clause.status).toBe("no-verdict-force");
+	});
+
+	test("a pre-Amendment-5 artifact cannot license the run", () => {
+		// The old field names. V-SP's ceiling is not computable from them, so the
+		// facts read as absent rather than as a reading — which is the rule.
+		const legacyRecv = { role: "recv", date: DAY, host: MAC, drainMsP99: 91.9 };
+		const legacySend = { role: "send", date: DAY, emitMsMax: 95 };
+		expect(c1(legacyRecv, legacySend).clause.status).toBe("no-verdict-force");
 	});
 });
 
 describe("burstFloorFacts refuses to invent a reading", () => {
 	test("NaN percentiles — an empty sample — read as absent, not as zero", () => {
 		const facts = burstFloorFacts({
-			recv: { date: DAY, host: MAC, drainMsP99: Number.NaN },
-			send: { emitMsMax: Number.NaN },
+			recv: { date: DAY, host: MAC, drainMsMax: Number.NaN },
+			send: { emitMsNetMax: Number.NaN },
 			runDate: DAY,
 			expectedHost: MAC,
 		});
-		expect(facts.burstDrainP99Ms).toBeNull();
-		expect(facts.burstEmitMaxMs).toBeNull();
+		expect(facts.burstDrainMaxMs).toBeNull();
+		expect(facts.burstEmitNetMaxMs).toBeNull();
 		expect(spreadFloorFalsifier(facts).fires).toBe(true);
 	});
 
@@ -99,7 +113,7 @@ describe("burstFloorFacts refuses to invent a reading", () => {
 			runDate: DAY,
 			expectedHost: MAC,
 		});
-		expect(facts.burstCompletenessMin).toBe(0.617);
-		expect(spreadFloorFalsifier(facts).reason).toContain("disclosed");
+		expect(facts.burstCompletenessMin).toBe(0.98);
+		expect(spreadFloorFalsifier(facts).reason).toContain("completeness min");
 	});
 });

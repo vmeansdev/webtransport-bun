@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 2,
+  "startedAt": "2026-08-19T16:01:10.895Z",
+  "generator": {
+    "hostname": "Nikitas-MacBook-Pro.local",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpus": 10,
+    "memoryBytes": 68719476736
+  },
+  "link": {
+    "localAddress": "",
+    "peerAddress": "10.99.0.2",
+    "subnet": "10.99.0.0/24",
+    "interfaceName": "en8",
+    "mtuBytes": 1500,
+    "mtuProbePayloadBytes": 1472
+  },
+  "guards": [
+    {
+      "name": "peer-on-cable-subnet",
+      "ok": true,
+      "detail": "10.99.0.2 in 10.99.0.0/24"
+    },
+    {
+      "name": "peer-routes-over-wire",
+      "ok": true,
+      "detail": "interface en8"
+    }
+  ],
+  "rtt": {
+    "samples": 600,
+    "transmitted": 600,
+    "received": 600,
+    "lossPct": 0,
+    "p50Ms": 0.985,
+    "p99Ms": 1.57,
+    "maxMs": 1.79
+  },
+  "rttVantage": "peer-toward-generator",
+  "rttGeneratorSide": {
+    "samples": 600,
+    "transmitted": 600,
+    "received": 600,
+    "lossPct": 0,
+    "p50Ms": 1.349,
+    "p99Ms": 5.446,
+    "maxMs": 6.921
+  },
+  "tcp": {
+    "bitsPerSec": 855537838.468497,
+    "retransmits": 0,
+    "seconds": 10.010976
+  },
+  "udpRungs": [
+    {
+      "offeredBitsPerSec": 10000000,
+      "payloadBytes": 200,
+      "sentPackets": 93789,
+      "receivedPackets": 93789,
+      "lostPackets": 0,
+      "lossPct": 0,
+      "jitterMs": 0.00874132245806296,
+      "seconds": 15.007321,
+      "deliveredPps": 6249.549803059454,
+      "offeredPps": 6249.549803059454
+    },
+    {
+      "offeredBitsPerSec": 40000000,
+      "payloadBytes": 200,
+      "sentPackets": 375043,
+      "receivedPackets": 375043,
+      "lostPackets": 0,
+      "lossPct": 0,
+      "jitterMs": 0.04079353092845624,
+      "seconds": 15.002684,
+      "deliveredPps": 24998.39362076812,
+      "offeredPps": 24998.39362076812
+    },
+    {
+      "offeredBitsPerSec": 80000000,
+      "payloadBytes": 200,
+      "sentPackets": 750005,
+      "receivedPackets": 750005,
+      "lostPackets": 0,
+      "lossPct": 0,
+      "jitterMs": 0.029348112545375327,
+      "seconds": 15.00144,
+      "deliveredPps": 49995.53376209217,
+      "offeredPps": 49995.53376209217
+    },
+    {
+      "offeredBitsPerSec": 120000000,
+      "payloadBytes": 200,
+      "sentPackets": 1125027,
+      "receivedPackets": 1125027,
+      "lostPackets": 0,
+      "lossPct": 0,
+      "jitterMs": 0.015729172793419368,
+      "seconds": 15.001597,
+      "deliveredPps": 74993.81565842623,
+      "offeredPps": 74993.81565842623
+    },
+    {
+      "offeredBitsPerSec": 250000000,
+      "payloadBytes": 200,
+      "sentPackets": 1509411,
+      "receivedPackets": 1502312,
+      "lostPackets": 7099,
+      "lossPct": 0.4703159046807,
+      "jitterMs": 0.011170396888086517,
+      "seconds": 15.012408,
+      "deliveredPps": 100071.35430904888,
+      "offeredPps": 100544.2298130986
+    },
+    {
+      "offeredBitsPerSec": 750000000,
+      "payloadBytes": 200,
+      "sentPackets": 1508792,
+      "receivedPackets": 1501645,
+      "lostPackets": 7147,
+      "lossPct": 0.4736902104465029,
+      "jitterMs": 0.023269875162874633,
+      "seconds": 15.008886,
+      "deliveredPps": 100050.39681159548,
+      "offeredPps": 100526.58138651996
+    }
+  ],
+  "ceiling": {
+    "cleanPps": 100071.35430904888,
+    "cleanOfferedPps": 100544.2298130986,
+    "peakDeliveredPps": 100071.35430904888,
+    "lossBoundPct": 0.5,
+    "cleanRungs": 6
+  },
+  "registeredProperties": {
+    "mtuBytes": 1500,
+    "idleRttP50Ms": 0.985,
+    "idleRttP99Ms": 1.57,
+    "cleanPpsCeiling": 100071.35430904888,
+    "lossBoundPct": 0.5,
+    "payloadBytes": 200
+  },
+  "notes": []
+}

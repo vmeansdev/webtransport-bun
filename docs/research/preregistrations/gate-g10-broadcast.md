@@ -1083,6 +1083,71 @@ The harness constants (`tools/load/g10-plan.ts`: `PATH_CLEAN_PPS`,
 this text, so prose and numbers cannot drift apart (the G6 amendment-1
 lesson).
 
+**Amendment 5 (2026-08-20, before first dispatch — legal under §10; every move
+here makes a falsifier stricter, none moves a clause threshold).** The C1
+adversarial review found that V-SP, as Amendment 4 wired it, could be cleared by
+a measurement that did not establish what V-SP exists to establish. Three
+mechanical defects, one disposition, and one consequence for the record.
+
+1. **The ceiling now rides emission net of the sender's backoff sleeps.**
+   Amendment 4 set `sinkDrainCeilingMs = 1.2 × emitMsMax`, where `emitMsMax` is
+   the sender's wall time for its worst burst — including every `setTimeout(0)`
+   it spent parked on a full socket buffer. A sender that took 300 backoffs
+   licensed a sink drain of `1.2 × (serialization + ~300 ms)`: the worse the
+   *sender's* day, the more the *sink* was allowed. `burst-probe.ts` now
+   accumulates the sleeps and reports `emitMsNetMax`, and the ceiling rides
+   that. Gross `emitMsMax` and the backoff counts (`blockedTotal`, `blockedMax`,
+   `perBurstBlocked` — previously printed only to stderr) stay in the artifact
+   as disclosure and appear in V-SP's reason string.
+2. **The drain is normalized by completeness before it is compared.** `drainMs`
+   is `last arrival − first arrival`, so a path that drops the tail of every
+   burst produces a *shorter* window — heavier loss made the sink look faster,
+   and `burstCompletenessMin` was formatted into the reason string and compared
+   against nothing. V-SP now compares `drainMax / completenessMin`. This keeps
+   Amendment 4's stance that the raw probe's loss is the path's and is **never
+   bounded** — no floor is registered on completeness — while stopping a
+   62%-complete burst from being credited with a 62%-length drain. An artifact
+   with no completeness figure fires: a drain that cannot be normalized is not a
+   cleared sink.
+3. **`drainMsP99` is retired in favour of `drainMsMax`.** At the registered
+   `bursts = 30`, `ceil(0.99 × 30) − 1 = 29` — the field named p99 *was* the
+   maximum, wearing a name that promised robustness the sample size cannot
+   deliver. No number moves at this sample size (the two were identically
+   equal); the max is also the conservative reading at any larger one. Same for
+   the send side's `emitMsP99`. The `bursts` count itself does **not** move.
+4. **Disposition, C1-8 (probe spin CPU).** `PROBE_SPIN_WINDOW` stays at 10 ms:
+   it was widened from 4 ms because the cable floor arm read `scheduleLag` p99
+   3.76 ms against a 4 ms window, and narrowing it again trades a V-SP concern
+   for a V-F failure. The instrument's cost on the Mac — the same host whose
+   receive-order dispersion is this gate's headline metric — is therefore
+   **disclosed and not bounded**: per-cell Mac CPU is sampled out-of-band by the
+   run wrapper (plan-day2 v3 delta 7) and carried in the artifact. **No ceiling
+   is registered on it**, because no baseline exists to set one from, and
+   inventing a threshold the day before a dispatch is exactly what §10 forbids.
+   This is a named residual limitation of the instrument, not a cleared finding.
+   The two stale comments in `crates/reference/src/broadcast_client.rs` that
+   priced the window at 16 ms and ≤3.2 core-seconds/s — numbers from the
+   pre-widening revision — now quote the constant.
+
+**The consequence, stated before the next run rather than after it:** the
+2026-08-19 burst artifact Amendment 4 recorded as passing (drain p99 91.91 ms,
+emission max ~95 ms, completeness min 0.617) **does not clear V-SP as amended**
+— normalized, its drain is 148.95 ms against a 114 ms ceiling. G10's next
+dispatch therefore requires a fresh same-day burst probe that clears the
+amended rule, and if the path cannot produce one, C1 carries no verdict force.
+That is the amendment working: the old rule would have licensed this gate's
+headline bound off a burst that mostly did not arrive.
+
+The harness moves in the same commit as this text (the G6 amendment-1 lesson):
+`tools/offbox/burst-probe.ts`, `tools/load/g10-burst-floor.ts`,
+`g10-classify.ts`'s `spreadFloorFalsifier`, and `g10-plan.ts`'s
+`sinkDrainCeilingMs`. Also in that commit, and changing no number:
+`PATH_CLEAN_PPS` — the hand-transcribed constant that sets this gate's entire
+headline bound — is now tied by test to the registered pre-flight artifact,
+committed at `docs/research/artifacts/g10-preflight-2026-08-19.json`
+(sha256 `0d59d02a8eb3d6f2b442422dd5b097f64e08073512915c63a969e40602631491`), so a
+transcription slip fails a test instead of surviving to a run.
+
 Otherwise none: this document's first commit is its registration, and every
 threshold on this page was fixed in that commit. Two things are worth naming so a later
 reader does not mistake them for silent edits:

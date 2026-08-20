@@ -17,7 +17,8 @@
 import type { PrecheckFacts } from "./g10-classify.ts";
 
 export type BurstFloorFacts = PrecheckFacts & {
-	burstDrainP99Ms: number | null;
+	burstDrainMaxMs: number | null;
+	burstEmitNetMaxMs: number | null;
 	burstEmitMaxMs: number | null;
 	burstCompletenessMin: number | null;
 };
@@ -53,7 +54,12 @@ export function burstFloorFacts(input: {
 		runDate: input.runDate,
 		host: recv ? str(recv.host) : null,
 		expectedHost: input.expectedHost,
-		burstDrainP99Ms: recv ? finite(recv.drainMsP99) : null,
+		// Amendment 5: the drain is the worst burst, and the emission the sender's
+		// own work net of its backoff sleeps. An artifact written before the
+		// amendment carries neither field, so it reads as null and fires — which
+		// is right: V-SP's ceiling is not computable from a pre-amendment probe.
+		burstDrainMaxMs: recv ? finite(recv.drainMsMax) : null,
+		burstEmitNetMaxMs: send ? finite(send.emitMsNetMax) : null,
 		burstEmitMaxMs: send ? finite(send.emitMsMax) : null,
 		burstCompletenessMin: recv ? finite(recv.completenessMin) : null,
 	};

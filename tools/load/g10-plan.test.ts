@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
 	A2_CHUNK_TARGETS,
 	armShape,
@@ -24,23 +25,23 @@ import {
 	maxMirrorSpreadGainMs,
 	mirrorCapAgreesWithProduct,
 	mirrorStallFloorMs,
+	PATH_CLEAN_PPS,
 	preflightMaxIdleRttP99Ms,
 	preflightRequirements,
 	probeFloorLagCeilingMs,
 	probeIndices,
 	RATE_EXCLUDED,
-	PATH_CLEAN_PPS,
 	RATE_LADDER,
 	RTT_BOUND_MS,
 	rateFitsWire,
 	recordBytes,
 	rttResidueMs,
 	SUBSCRIBERS,
+	sinkDrainCeilingMs,
 	sinkPrecheckPps,
 	spreadBoundMs,
 	spreadClauseApplies,
 	spreadCrossoverRate,
-	sinkDrainCeilingMs,
 	spreadHeadroom,
 	stallBudgetTargets,
 	TWO_POINT_FIVE_GIGABIT,
@@ -143,10 +144,29 @@ describe("§1.4 — the ladder", () => {
 	});
 });
 
+describe("§1.5a — the measured path constant is tied to its artifact", () => {
+	// PATH_CLEAN_PPS sets this gate's entire headline bound and reached the
+	// source by hand, from a file nothing read. A transcription slip in it was
+	// unfalsifiable; this test is the tie.
+	test("PATH_CLEAN_PPS is the registered pre-flight's clean ceiling", () => {
+		const artifact = JSON.parse(
+			readFileSync(
+				new URL(
+					"../../docs/research/artifacts/g10-preflight-2026-08-19.json",
+					import.meta.url,
+				),
+				"utf8",
+			),
+		) as { ceiling?: { cleanPps?: number; lossBoundPct?: number } };
+		expect(artifact.ceiling?.lossBoundPct).toBe(0.5);
+		expect(Math.round(artifact.ceiling?.cleanPps ?? 0)).toBe(PATH_CLEAN_PPS);
+	});
+});
+
 describe("§1.6 — the spread bound (as amended — Amendment 4)", () => {
 	test("path serialization × 1.2, flat across rungs", () => {
-		expect(spreadBoundMs(1)).toBeCloseTo(119.915, 2);
-		expect(spreadBoundMs(5)).toBeCloseTo(119.915, 2);
+		expect(spreadBoundMs()).toBeCloseTo(119.915, 2);
+		expect(spreadBoundMs(SUBSCRIBERS)).toBeCloseTo(119.915, 2);
 	});
 
 	test("the clause applies at R = 1 and R = 5 and not at R = 20", () => {

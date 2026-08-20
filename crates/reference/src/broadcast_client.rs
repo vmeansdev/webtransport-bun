@@ -716,10 +716,12 @@ fn sleep_until_precise(deadline: Instant) {
 /// The window is sized to the host's own wake tail, not to elegance: ~1% of
 /// thread wakes on the bench Mac arrive ≥9 ms late whatever primitive armed
 /// them, so a window under that keeps V-F's p99 exactly where the tail is.
-/// 16 ms of spinning per probe per period is the disclosed price of a p99 the
-/// scheduler cannot write; at the gate's 100 × 2 Hz cadence that is ≤3.2
-/// core-seconds per second on a 10-core generator, phased so at most a few
-/// spin at once.
+/// Up to `PROBE_SPIN_WINDOW` — 10 ms — of spinning per probe per period is the
+/// disclosed price of a p99 the scheduler cannot write; at the gate's
+/// 100 × 2 Hz cadence that is ~2 core-seconds per second on a 10-core
+/// generator, phased so at most a few spin at once. (This paragraph and
+/// `PROBE_SPIN_WINDOW`'s own comment quoted 16 ms and ≤3.2 core-seconds/s
+/// from the pre-widening revision; both now quote the constant.)
 async fn run_probe_session(
     index: usize,
     conn: wtransport::Connection,
