@@ -363,26 +363,54 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 
+    /// The reference the reusePort socket must match: exactly what the fork's
+    /// `BindAddressConfig::bind_socket` does for `Ipv6DualStackConfig::OsDefault`
+    /// (fork `config.rs:1307-1335`) — socket2, no `set_only_v6` either way, then
+    /// bind. The only thing our path adds is `SO_REUSEPORT`.
+    #[cfg(unix)]
+    fn os_default_dual_stack_reference(addr: std::net::SocketAddr) -> bool {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let domain = match addr {
+            std::net::SocketAddr::V4(_) => Domain::IPV4,
+            std::net::SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let socket =
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).expect("reference socket");
+        socket.bind(&addr.into()).expect("reference bind");
+        socket.only_v6().expect("reference only_v6")
+    }
+
     /// `with_bind_socket` skips the fork's own socket construction, so the
-    /// reusePort path has to land on the same dual-stack default the plain
-    /// `with_bind_address` path produces: IPV6_V6ONLY untouched.
+    /// reusePort path has to land on the same dual-stack setting the plain
+    /// `with_bind_address` path produces: IPV6_V6ONLY never touched by us.
+    ///
+    /// The reference is bound, not merely constructed, because IPV6_V6ONLY is
+    /// not a constant of the socket — Linux raises it at bind() time for a
+    /// *specific* v6 address (a socket bound to [::1] cannot carry v4 traffic)
+    /// while leaving it alone for the wildcard, and macOS does neither.
+    /// Comparing a bound socket against an unbound one measures that kernel
+    /// behavior rather than anything this code does. Both address shapes are
+    /// covered so the wildcard case, the one where the OS default actually
+    /// survives the bind, is exercised too.
     #[cfg(unix)]
     #[test]
     fn reuse_port_v6_bind_matches_the_os_default_dual_stack_setting() {
-        use socket2::{Domain, Protocol, Socket, Type};
+        use socket2::Socket;
 
-        let reference =
-            Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("reference socket");
-        let os_default = reference.only_v6().expect("reference only_v6");
+        for addr in ["[::1]:0", "[::]:0"] {
+            let addr: std::net::SocketAddr = addr.parse().expect("addr");
+            let expected = os_default_dual_stack_reference(addr);
 
-        let bound = super::bind_reuse_port_socket("[::1]:0".parse().expect("addr"))
-            .expect("v6 reusePort bind");
-        assert!(bound.local_addr().expect("bound addr").is_ipv6());
-        assert_eq!(
-            Socket::from(bound).only_v6().expect("only_v6"),
-            os_default,
-            "reusePort must not change IPV6_V6ONLY away from the OS default"
-        );
+            let bound = super::bind_reuse_port_socket(addr).expect("v6 reusePort bind");
+            assert!(bound.local_addr().expect("bound addr").is_ipv6());
+            assert_eq!(
+                Socket::from(bound).only_v6().expect("only_v6"),
+                expected,
+                "reusePort must not change IPV6_V6ONLY away from what the \
+                 fork's own OsDefault bind produces for {addr}"
+            );
+        }
     }
 
     #[cfg(unix)]
