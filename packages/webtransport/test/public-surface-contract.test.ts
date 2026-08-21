@@ -148,10 +148,23 @@ const ROOT_EXPORTS = [
 	"clientPoolMetricsSnapshot",
 	"connect",
 	"createServer",
+	// The QUIC-LB connection-ID decoders. Added deliberately, as an additive
+	// (semver-minor) widening of the native surface rather than a reshaping of
+	// it: they are the balancer's half of the `quicLb` server option, and a
+	// balancer cannot reach them anywhere else — the package's `exports` map is
+	// pinned to exactly three subpaths by the test below, so a module that is
+	// not re-exported from one of the three is unreachable for consumers.
+	"decodeQuicLbConfigRotation",
+	"decodeQuicLbServerId",
 	"exportTicketVault",
 	"importTicketVault",
 	"metricsToPrometheus",
 	"nativeToWebTransportLike",
+	// Ships with the two decoders above and for the same reason: a balancer
+	// reading a connection ID gets its LENGTH from configuration, never from
+	// the wire, so the decoders are only usable alongside the function that
+	// computes it. Additive (semver-minor) like they were.
+	"quicLbCidLength",
 	"releaseNativeMemory",
 	"toWebTransport",
 ];

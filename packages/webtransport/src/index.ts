@@ -46,6 +46,26 @@ export type { Resettable, StopSendable } from "./streams.js";
 // Re-export stream symbols and helpers
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 
+export type { QuicLbOptions } from "./quic-lb.js";
+// The QUIC-LB decoders are the balancer's half of the `quicLb` server option
+// and belong on the native surface with it. They are pure and load no addon, so
+// an eBPF loader or a routing test can import them on their own.
+// `quicLbCidLength` rides with them: the length is the one number a decoder
+// cannot read off the wire, so a caller of the two decoders needs it to know
+// how many octets a CID of this configuration should be before trusting what
+// it decoded.
+export {
+	decodeQuicLbConfigRotation,
+	decodeQuicLbServerId,
+	quicLbCidLength,
+} from "./quic-lb.js";
+
+import {
+	type QuicLbOptions,
+	quicLbOptionsError,
+	quicLbOptionsToJson,
+} from "./quic-lb.js";
+
 import {
 	BidiStream,
 	RecvStream,
@@ -550,6 +570,62 @@ export type ServerOptions = {
 	 * explicit `qpackMaxTableCapacity` takes precedence over this flag.
 	 */
 	enableDynamicQpack?: boolean;
+
+	/**
+	 * Set `SO_REUSEPORT` on the bind socket so several processes can listen on
+	 * the same port. Off by default. Native backend only (the WASM backend has
+	 * its own options type and no socket of its own), unix only — on a platform
+	 * without `SO_REUSEPORT` this throws `E_UNSUPPORTED_ARGUMENT` rather than
+	 * binding without it. Requires an explicit `port`; `port: 0` throws
+	 * `E_INVALID_ARGUMENT` because each instance would get its own ephemeral
+	 * port and share nothing.
+	 *
+	 * This is not a load-balancing answer on its own. Plain kernel steering
+	 * hashes the 4-tuple, so a client's NAT rebind re-hashes to a different
+	 * process and the session dies; and group membership changes re-hash the
+	 * whole group, so restarting one instance re-steers flows that belonged to
+	 * its siblings. Use it for eBPF-steered (`SK_REUSEPORT`) topologies, where
+	 * steering follows the connection ID, and for benchmarks. See
+	 * docs/OPERATIONS.md ("Multi-process binds (reusePort)").
+	 */
+	reusePort?: boolean;
+
+	/**
+	 * Issue QUIC-LB connection IDs carrying this instance's server ID in the
+	 * clear, so a CID-aware L4 or eBPF balancer can route by connection ID
+	 * instead of by 4-tuple — which is what makes steering survive a client's
+	 * NAT rebind. Absent (the default) leaves quinn's opaque 8-octet CIDs.
+	 * Native backend only; the WASM backend has its own options type and issues
+	 * no connection IDs of its own.
+	 *
+	 * The layout is the **keyless configuration** of
+	 * draft-ietf-quic-load-balancers-21 (§5.3): a first octet of 3
+	 * config-rotation bits plus 5 random bits, then `serverId`, then a
+	 * cryptographically random nonce of `nonceLen` octets. Both lengths are part
+	 * of the balancer's configuration and neither is encoded on the wire, which
+	 * is why {@link QuicLbOptions.nonceLen} has no default.
+	 *
+	 * Two costs to weigh, both stated in docs/OPERATIONS.md ("QUIC-LB connection
+	 * IDs (`quicLb`)"): the server ID is **cleartext**, so an observer can tell
+	 * which backend serves a connection and link its migrations (§5.3 says so in
+	 * those words); and the connection ID grows to `1 + serverId.length +
+	 * nonceLen` octets — 11 for a typical configuration, 6 at minimum — against
+	 * quinn's 8-octet default, on every short-header packet in both directions.
+	 *
+	 * Bounds, rejected here with `E_INVALID_ARGUMENT` before the addon is
+	 * touched: `serverId.length >= 1`, `nonceLen >= 4`, their sum `<= 19`, and
+	 * `configRotation` in 0–6 (7 is reserved for unroutable CIDs).
+	 *
+	 * @example
+	 * ```ts
+	 * createServer({
+	 *   port: 4433,
+	 *   quicLb: { serverId: new Uint8Array([0x00, 0x07]), nonceLen: 8 },
+	 *   tls, onSession,
+	 * });
+	 * ```
+	 */
+	quicLb?: QuicLbOptions;
 
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
@@ -2111,12 +2187,40 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	validateQpackOptions(opts);
 
+	if (opts.reusePort !== undefined && typeof opts.reusePort !== "boolean") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: reusePort must be a boolean",
+		);
+	}
+
+	if (opts.reusePort === true && opts.port === 0) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: reusePort requires an explicit port; port 0 asks the OS for a fresh ephemeral port per instance, so nothing shares a port",
+		);
+	}
+
+	if (opts.quicLb !== undefined && opts.quicLb !== null) {
+		const quicLbError = quicLbOptionsError(opts.quicLb);
+		if (quicLbError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${quicLbError}`,
+			);
+		}
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
 		congestionControl: opts.congestionControl ?? "default",
 		enable0Rtt: opts.enable0Rtt === true,
 		allowEarlySession: opts.allowEarlySession === true,
+		reusePort: opts.reusePort === true,
+		...(opts.quicLb === undefined || opts.quicLb === null
+			? {}
+			: { quicLb: quicLbOptionsToJson(opts.quicLb) }),
 		...(opts.qpackMaxTableCapacity === undefined
 			? {}
 			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
