@@ -32,7 +32,12 @@ import { join } from "node:path";
 import {
 	createServer,
 	DEFAULT_LIMITS,
+	type NativePacedEmitterOptions,
+	type NativePacedEmitterResult,
 } from "../../packages/webtransport/src/index.ts";
+// The bench/harness accessor is deliberately not on the package's frozen
+// public surface; harnesses import it from the module that declares it.
+import { WT_NATIVE_BIDI_HANDLE } from "../../packages/webtransport/src/streams.ts";
 import {
 	resetStreamBatchDiagnostics,
 	streamBatchConfig,
@@ -199,6 +204,27 @@ const CHILD_TAIL_PER_SESSION_MS = 40;
 const SMOKE = process.env.G11_SMOKE === "1";
 const SMOKE_SESSIONS = Number(process.env.G11_SMOKE_SESSIONS ?? 2);
 const SMOKE_SECONDS = Number(process.env.G11_SMOKE_SECONDS ?? 4);
+
+/**
+ * Who originates the T arm's downstream offer (issue 10's ruled fix).
+ *
+ * `js` (the default) is the pacer every registered cell has ever driven:
+ * `runPacedStream` on the conductor's thread, one awaited napi `write()` per
+ * frame — byte-identical behavior to every pre-knob run. `native` hands each
+ * T-arm stream's whole pacing loop to the addon (`runPacedEmitter`, one napi
+ * crossing per stream per step); the frames, the pacing policy, and the
+ * internal write path they land on are the same — only the loop's home moves.
+ * Applies to arm T only: D's writer stays beside its withholding reader, and
+ * J's rung is registered against the JS originator.
+ */
+const DOWN_ORIGINATOR_ENV = process.env.G11_DOWN_ORIGINATOR ?? "js";
+if (DOWN_ORIGINATOR_ENV !== "js" && DOWN_ORIGINATOR_ENV !== "native") {
+	console.error(
+		`g11: G11_DOWN_ORIGINATOR must be "js" or "native", got "${DOWN_ORIGINATOR_ENV}"`,
+	);
+	process.exit(1);
+}
+const NATIVE_DOWN = DOWN_ORIGINATOR_ENV === "native";
 
 const KNOB = streamBatchConfig();
 const CPU_CORES = cpus().length;
@@ -382,6 +408,21 @@ type ServerRecord = {
 	streamsFinBothHalves: number;
 	upLatency: G11Histogram;
 	writeLatency: G11Histogram;
+	/**
+	 * Native-emitter cells only (`G11_DOWN_ORIGINATOR=native`): the emitters'
+	 * own pacer lateness (actual − intended per write, the measurement
+	 * `runPacedStream` made on the JS path), merged across the cell's streams.
+	 * Empty on the JS path — the JS pacer's lateness was never recorded into
+	 * the cell record, and starting to do so here would change what existing
+	 * cells stamp.
+	 */
+	emitterLateness: G11Histogram;
+	/**
+	 * Streams whose native emitter was unavailable, errored, or stopped early.
+	 * All-or-nothing (the shard/deframe rule): any failure also counts a
+	 * stream error, so the cell cannot quietly grade on a partial offer.
+	 */
+	emitterFailures: number;
 	peakSessionQueuedBytes: number;
 	/**
 	 * Amendment 10's direct inbound-reservation counters, read off the
@@ -422,6 +463,8 @@ function newRecord(): ServerRecord {
 		streamsFinBothHalves: 0,
 		upLatency: new G11Histogram(),
 		writeLatency: new G11Histogram(),
+		emitterLateness: new G11Histogram(),
+		emitterFailures: 0,
 		peakSessionQueuedBytes: 0,
 		peakInboundStreamBytes: 0,
 		peakInboundSessionBytes: 0,
@@ -514,6 +557,14 @@ async function settleRecord(
 type AcceptedBidi = {
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
+	/** Bench/harness accessor the product attaches to accepted server bidi
+	 * streams; null once the stream is released. Optional so the conductor
+	 * degrades to a counted failure, not a crash, against an older addon. */
+	[WT_NATIVE_BIDI_HANDLE]?: () => {
+		runPacedEmitter?: (
+			opts: NativePacedEmitterOptions,
+		) => Promise<NativePacedEmitterResult>;
+	} | null;
 };
 
 type ServerSession = {
@@ -641,42 +692,88 @@ function driveTunnelStream(
 		// own is a harness fault, and a thrown offset would silence this stream's
 		// whole downstream instead of letting the ledger show the fault.
 		await Bun.sleep(emitterOffsetMs(index % cell.sessions, cell.sessions));
-		let sequence = 0;
-		const result = await runPacedStream({
-			write: async (chunk) => {
-				const startedAt = performance.now();
-				await w.write(chunk);
-				record.writeLatency.record(performance.now() - startedAt);
-			},
-			writeBytes: FRAME_BYTES,
-			bytesPerSec: bytesPerSecPerDirection(),
-			durationMs: cell.stepSeconds * 1000,
-			sliceQuantum: 1,
-			now: () => performance.now(),
-			sleep: (ms) => Bun.sleep(ms),
-			// One memset per stream (the pacer allocates once), and it keeps this
-			// end byte-comparable with the Rust generator's `vec![b'x'; n]`
-			// instead of shipping whatever the pool last held.
-			allocChunk: (n) => Buffer.alloc(n),
-			fill: (chunk) => {
-				encodeFrame(chunk, {
-					totalLength: FRAME_BYTES,
-					frameClass: FrameClass.TunnelDown,
+		if (NATIVE_DOWN && cell.arm === "T") {
+			// The native originator: the same frames on the same absolute-deadline
+			// pacing, but the loop lives in the addon and the per-frame napi
+			// crossing is gone. `settles`/`bytes` still mean "accepted into the
+			// native per-stream queue" — the emitter calls the same write path a
+			// settled JS write() crossed into — so offered-down stays comparable.
+			// The emitter stamps sendWallNs from CLOCK_REALTIME in Rust; the
+			// client's arrival stamp reads the same system clock, so V-N's
+			// negative-sample semantics carry unchanged.
+			// Call through the handle: a napi class method detached from its
+			// receiver rejects with InvalidArg.
+			const handle = stream[WT_NATIVE_BIDI_HANDLE]?.();
+			if (!handle?.runPacedEmitter) {
+				record.emitterFailures += 1;
+				noteWriteError(
+					record,
+					{ code: "E_EMITTER_UNAVAILABLE" },
+					"native paced emitter start",
+				);
+			} else {
+				const result = await handle.runPacedEmitter({
+					bytesPerSec: bytesPerSecPerDirection(),
+					frameBytes: FRAME_BYTES,
+					durationMs: cell.stepSeconds * 1000,
 					session: index,
-					sequence,
-					sendWallNs: wallNs(),
+					frameClass: FrameClass.TunnelDown,
 				});
-				sequence += 1;
-			},
-		});
-		record.downFrames += result.settles;
-		record.downBytes += result.bytes;
-		if (result.errors > 0) {
-			noteWriteError(
-				record,
-				{ code: result.firstError ?? "E_UNKNOWN" },
-				"paced write",
-			);
+				record.downFrames += result.settles;
+				record.downBytes += result.bytes;
+				// The emitter's settle histogram is the writeLatency measurement
+				// (write issue → acceptance) made where the write now happens; the
+				// merge's layout guard fails loudly if the Rust buckets ever drift
+				// from g11-histogram.ts's.
+				record.writeLatency.merge(result.settle);
+				record.emitterLateness.merge(result.lateness);
+				if (result.errors > 0 || !result.completedFullDuration) {
+					record.emitterFailures += 1;
+					noteWriteError(
+						record,
+						{ code: result.firstError ?? "E_EMITTER_EARLY_STOP" },
+						"native paced emitter",
+					);
+				}
+			}
+		} else {
+			let sequence = 0;
+			const result = await runPacedStream({
+				write: async (chunk) => {
+					const startedAt = performance.now();
+					await w.write(chunk);
+					record.writeLatency.record(performance.now() - startedAt);
+				},
+				writeBytes: FRAME_BYTES,
+				bytesPerSec: bytesPerSecPerDirection(),
+				durationMs: cell.stepSeconds * 1000,
+				sliceQuantum: 1,
+				now: () => performance.now(),
+				sleep: (ms) => Bun.sleep(ms),
+				// One memset per stream (the pacer allocates once), and it keeps this
+				// end byte-comparable with the Rust generator's `vec![b'x'; n]`
+				// instead of shipping whatever the pool last held.
+				allocChunk: (n) => Buffer.alloc(n),
+				fill: (chunk) => {
+					encodeFrame(chunk, {
+						totalLength: FRAME_BYTES,
+						frameClass: FrameClass.TunnelDown,
+						session: index,
+						sequence,
+						sendWallNs: wallNs(),
+					});
+					sequence += 1;
+				},
+			});
+			record.downFrames += result.settles;
+			record.downBytes += result.bytes;
+			if (result.errors > 0) {
+				noteWriteError(
+					record,
+					{ code: result.firstError ?? "E_UNKNOWN" },
+					"paced write",
+				);
+			}
 		}
 		try {
 			await w.close();
@@ -1617,6 +1714,17 @@ async function main(): Promise<void> {
 				count: env.deframeWorkers,
 				failed: env.deframeWorkersFailed,
 			};
+			// Who originated this cell's downstream offer (additive stamp,
+			// issue 10). "js-awaited" is the originator every pre-knob artifact
+			// drove; "native-paced" is the addon-resident emitter, T arm only.
+			entry.downOriginator =
+				cell.arm === "T" && NATIVE_DOWN ? "native-paced" : "js-awaited";
+			if (cell.arm === "T" && NATIVE_DOWN) {
+				entry.downEmitter = {
+					failures: env.record.emitterFailures,
+					latenessSnapshot: env.record.emitterLateness.snapshot(),
+				};
+			}
 			entry.hostLoad = {
 				start: env.hostLoadStart,
 				end: env.hostLoadEnd,
@@ -1676,6 +1784,10 @@ async function main(): Promise<void> {
 			// Arm T's deframe-worker knob, verbatim; per-cell counts ride on each
 			// cell as `deframeWorkers`.
 			deframeWorkersEnv: DEFRAME_WORKERS_ENV,
+			// Arm T's downstream-originator knob (issue 10): the env verbatim and
+			// the value that ran; per-cell provenance rides as `downOriginator`.
+			downOriginatorEnv: process.env.G11_DOWN_ORIGINATOR ?? null,
+			downOriginator: NATIVE_DOWN ? "native-paced" : "js-awaited",
 			// The deadline's child-tail terms travel with the artifact: a breach is
 			// only readable against the phases the deadline was built from.
 			childTailFixedMs: CHILD_TAIL_FIXED_MS,
