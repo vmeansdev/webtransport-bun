@@ -50,9 +50,14 @@ export type { QuicLbOptions } from "./quic-lb.js";
 // The QUIC-LB decoders are the balancer's half of the `quicLb` server option
 // and belong on the native surface with it. They are pure and load no addon, so
 // an eBPF loader or a routing test can import them on their own.
+// `quicLbCidLength` rides with them: the length is the one number a decoder
+// cannot read off the wire, so a caller of the two decoders needs it to know
+// how many octets a CID of this configuration should be before trusting what
+// it decoded.
 export {
 	decodeQuicLbConfigRotation,
 	decodeQuicLbServerId,
+	quicLbCidLength,
 } from "./quic-lb.js";
 
 import {

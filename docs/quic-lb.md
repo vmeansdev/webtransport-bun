@@ -66,10 +66,14 @@ moves, and the kernel delivers them to the same process.
 
 ### What one box still owes you
 
-- **The first flight is never CID-routable.** A client's Initial carries a
-  destination connection ID the *client* chose at random; the server has issued
-  nothing yet. Every CID-based scheme falls back to 4-tuple hashing for that
-  window, and a rebind inside it still breaks the connection. Short, not zero.
+- **The opening flight is never CID-routable.** The client's *first* Initial
+  carries a destination connection ID the *client* chose at random; the server
+  has issued nothing yet. Every CID-based scheme falls back to 4-tuple hashing
+  for that window, and a rebind inside it still breaks the connection. The
+  window is one client flight, not the whole handshake: RFC 9000 §7.2 makes the
+  client adopt the server's Source Connection ID as its destination as soon as
+  it sees the server's Initial or Retry, "including any 0-RTT packets", so later
+  Initials are routable and the eBPF example routes them. Short, not zero.
 - **Sockarray maintenance is the hard part.** A socket leaves
   `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY` when its process dies, and only the process
   owning a socket can insert one. A restarted instance must re-register at the
@@ -110,10 +114,15 @@ tests or tooling without loading the addon or opening a socket:
 import {
   decodeQuicLbServerId,
   decodeQuicLbConfigRotation,
+  quicLbCidLength,
 } from "@webtransport-bun/webtransport";
 ```
 
 `serverIdLen` is yours to supply from configuration; **it is never on the wire.**
+`quicLbCidLength(serverIdLen, nonceLen)` returns `1 + serverIdLen + nonceLen`,
+the wire length of every connection ID a given configuration issues — the number
+a balancer checks a connection ID against before believing anything it decoded
+out of it, and the one number the wire will never tell it.
 
 ### The fact that governs every layout decision
 
@@ -175,13 +184,27 @@ The same per-process randomness is why a `SO_REUSEPORT` group's cross-process
 stateless resets are invalid: sibling processes on one port cannot reset each
 other's connections either.
 
+**With `quicLb` configured, the mis-steer is resolved one step earlier, and the
+outcome is the same.** A QUIC-LB connection ID is minted by this server's own
+generator, so the wrong backend runs it through that generator's `validate()`
+before anything else: the CID does not parse as one of *its* connection IDs and
+the packet is dropped at `endpoint.rs:249-253` — it never reaches the code that
+would consider a stateless reset. So the two configurations reach the same
+observable place by different mechanisms: without `quicLb`, a reset is minted
+and the client discards it as unrecognised; with `quicLb`, no reset is minted at
+all. Either way the client hears nothing and the connection stalls to idle
+timeout. This is informational: it changes what you will see in a packet capture
+or a backend's counters, not what the application experiences.
+
 ## Not verified here
 
 - No NAT-rebind measurement exists in this project; the rebind argument is a
   reading of RFC 9000 and of quinn-proto's source.
 - Reuseport rehash-on-restart has not been measured on any target kernel.
-- The eBPF example compiles clean with `clang -target bpf` against Linux
-  7.0.0-30-generic headers (2026-08-21, the campaign box). It has never been
-  loaded, attached, verifier-checked, or run with traffic.
+- The eBPF example compiled clean with `clang -target bpf` against Linux
+  7.0.0-30-generic headers (2026-08-21, the campaign box) — **on the revision
+  before the review fixes it now carries**; the re-compile is owed and has not
+  been run. It has never been loaded, attached, verifier-checked, or run with
+  traffic.
 - No gate has run with `quicLb` enabled, so its byte overhead is arithmetic, not
   a measurement.
