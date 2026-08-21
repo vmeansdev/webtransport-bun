@@ -264,6 +264,12 @@ struct Shared {
     base_sent: AtomicU64,
     base_echoes: AtomicU64,
     base_sessions_lost: AtomicU64,
+    /// Base dials that failed and were retried (F-1: a refused connect is a
+    /// transient admission signal, not a loss).
+    base_connect_retries: AtomicU64,
+    /// Base sessions whose bounded retries all failed — never established,
+    /// which is V-B's statement, not C4's (stamp D-B).
+    base_sessions_never_established: AtomicU64,
     /* histograms — the graded window only, so a ramp sample can never
      * contaminate a percentile the gate reads */
     arrival_lag: AtomicHistogram,
@@ -293,6 +299,8 @@ impl Shared {
             base_sent: AtomicU64::new(0),
             base_echoes: AtomicU64::new(0),
             base_sessions_lost: AtomicU64::new(0),
+            base_connect_retries: AtomicU64::new(0),
+            base_sessions_never_established: AtomicU64::new(0),
             arrival_lag: AtomicHistogram::new(),
             connect_duration: AtomicHistogram::new(),
             exchange_rtt: AtomicHistogram::new(),
@@ -619,16 +627,38 @@ async fn run_base_session(
     endpoint: Arc<ClientEndpoint>,
     runs_for: Duration,
 ) {
-    let conn = match endpoint.connect(&options.url).await {
-        Ok(c) => c,
-        Err(e) => {
-            shared
-                .errors
-                .record(&shared.errors.connect, "base connect", e);
-            shared.base_sessions_lost.fetch_add(1, Ordering::Relaxed);
-            return;
+    // A refused connect is a transient admission signal, not a dead session:
+    // the server's handshake gate answers CONNECTION_REFUSED at its cap and a
+    // real long-lived client retries (G9-02 stamp, finding F-1 — the base
+    // fleet's size sits exactly on the shipped max_handshakes_in_flight, so a
+    // churn arrival overlapping the base ramp can bounce one dial). Retries
+    // are counted and reported; only exhausted retries book the session as
+    // never-established — a different statement from "established and lost"
+    // (stamp defect D-B), so it gets its own counter.
+    const BASE_CONNECT_ATTEMPTS: u32 = 5;
+    let mut conn = None;
+    for attempt in 1..=BASE_CONNECT_ATTEMPTS {
+        match endpoint.connect(&options.url).await {
+            Ok(c) => {
+                conn = Some(c);
+                break;
+            }
+            Err(e) => {
+                shared
+                    .errors
+                    .record(&shared.errors.connect, "base connect", e);
+                if attempt == BASE_CONNECT_ATTEMPTS {
+                    shared
+                        .base_sessions_never_established
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                shared.base_connect_retries.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+            }
         }
-    };
+    }
+    let conn = conn.expect("loop either set conn or returned");
 
     let offset = options
         .base_interval
@@ -723,6 +753,7 @@ fn report(
             "\"inFlightHighWater\":{},\"meanCycleSec\":{},",
             "\"requestBytesSent\":{},\"responseBytesRead\":{},",
             "\"baseSessions\":{},\"baseSent\":{},\"baseEchoes\":{},\"baseSessionsLost\":{},",
+            "\"baseConnectRetries\":{},\"baseSessionsNeverEstablished\":{},",
             "\"errors\":{{\"connect\":{},\"open\":{},\"write\":{},\"read\":{},\"close\":{},\"samples\":{}}},",
             "\"clientCpuSec\":{},\"clientRssMb\":{},\"cores\":{},",
             "\"histograms\":{{\"arrivalLag\":{},\"connectDuration\":{},",
@@ -750,6 +781,10 @@ fn report(
         shared.base_sent.load(Ordering::Relaxed),
         shared.base_echoes.load(Ordering::Relaxed),
         shared.base_sessions_lost.load(Ordering::Relaxed),
+        shared.base_connect_retries.load(Ordering::Relaxed),
+        shared
+            .base_sessions_never_established
+            .load(Ordering::Relaxed),
         shared.errors.connect.load(Ordering::Relaxed),
         shared.errors.open.load(Ordering::Relaxed),
         shared.errors.write.load(Ordering::Relaxed),

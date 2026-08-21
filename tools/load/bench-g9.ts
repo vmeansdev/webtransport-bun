@@ -508,10 +508,31 @@ async function runCell(cell: Cell, repeat: number) {
 	}
 	if (cell.churnRatePerSec > 0) {
 		// The churn tier's first arrival is what separates the base cohort from
-		// the churn cohort, server-side. It lands one ramp window from now.
-		setTimeout(() => {
-			state.churnStartMs = Date.now();
-		}, RAMP * 1000);
+		// the churn cohort, server-side. Two G9-02 stamp defects lived on this
+		// boundary and both are fixed here:
+		//
+		//  * D-A (cohort inflation): the old marker fired one ramp window after
+		//    spawn, but the churn clock issues arrivals at full rate from its
+		//    first second — everything it connected in that window was
+		//    misclassified as base (2,232–17,828 phantom cohort members in the
+		//    G9-02 artifact). The marker now lands at churn spawn, which every
+		//    churn accept necessarily follows.
+		//  * F-1 (admission collision): the base fleet's size sits exactly on
+		//    the shipped max_handshakes_in_flight, so churn dials overlapping
+		//    the base ramp bounced a base connect. The churn client now spawns
+		//    only after the server has accepted the full base population (or a
+		//    20 s cap expires — a base that cannot establish is V-B's finding,
+		//    and the cap keeps this wait from hiding it).
+		if (cell.baseSessions > 0) {
+			const establishedBy = Date.now() + 20_000;
+			while (
+				state.acceptSeries.length < cell.baseSessions &&
+				Date.now() < establishedBy
+			) {
+				await new Promise((r) => setTimeout(r, 100));
+			}
+		}
+		state.churnStartMs = Date.now();
 		runs.push(
 			runClient([
 				...shared,
@@ -543,6 +564,18 @@ async function runCell(cell: Cell, repeat: number) {
 		server as unknown as { metricsSnapshot: () => Record<string, unknown> },
 		prevCpu,
 	);
+	// Snapshot the cohort's alive flags AT the settle instant, while the base
+	// tier is still connected. The old code filtered `state.sessions` at
+	// fragment-assembly time — after `await baseRun`, when the base client had
+	// already torn down — so every fragment read aliveAtSettle=0 and
+	// lost=cohort against its own settle sample's 199–200 active sessions
+	// (G9-02 stamp defect D-A, the read-after-teardown class).
+	const baseCohortAliveAtSettleSnapshot = state.sessions.filter(
+		(s) => s.isBase && s.alive,
+	).length;
+	const baseCohortLostAtSettleSnapshot = state.sessions.filter(
+		(s) => s.isBase && !s.alive,
+	).length;
 	clearInterval(sampler);
 	const results = baseRun ? [...churnResults, await baseRun] : churnResults;
 
@@ -578,12 +611,12 @@ async function runCell(cell: Cell, repeat: number) {
 		acceptSeriesPerSecond: acceptSeriesPerSecond(state.acceptSeries),
 		churnStartMs: state.churnStartMs,
 		baseCohortSessions: state.sessions.filter((s) => s.isBase).length,
-		baseCohortLost: state.sessions.filter((s) => s.isBase && !s.alive).length,
+		baseCohortLost: baseCohortLostAtSettleSnapshot,
 		// C5 compares the registry to what the SERVER still holds, not to the
 		// configured base size: a generator that could not establish its
-		// population is a generator problem (V-B), never a leak.
-		baseCohortAliveAtSettle: state.sessions.filter((s) => s.isBase && s.alive)
-			.length,
+		// population is a generator problem (V-B), never a leak. Both cohort
+		// counts are the settle-instant snapshots — see D-A above.
+		baseCohortAliveAtSettle: baseCohortAliveAtSettleSnapshot,
 		configuredBaseSessions: cell.baseSessions,
 		serverBaseRx: state.baseRx,
 		serverBaseEchoErrors: state.baseEchoErrors,
