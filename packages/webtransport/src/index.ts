@@ -566,7 +566,9 @@ export interface WebTransportServer {
 	readonly address: { host: string; port: number };
 	/**
 	 * Diagnostic, unstable, NOT public API (see egress_pacer.rs): windowed
-	 * pacer counters for bench tooling. Absent on addons without the pacer.
+	 * pacer counters for bench tooling. **Absent** (not `"{}"`) on addons built
+	 * without the pacer accessors, so a caller can tell a stale addon from a
+	 * live addon whose pacer knob is simply off — the latter returns `"{}"`.
 	 */
 	__pacerStatsSnapshot?(): number;
 	__pacerStatsJson?(token?: number): string;
@@ -2050,6 +2052,36 @@ class NativeServerSession implements ServerSession {
 // ---------------------------------------------------------------------------
 
 /**
+ * Forward the pacer's diagnostic accessors, or forward nothing.
+ *
+ * The facade closes over the native handle, so without these the pacer's own
+ * counters are unreachable from bench code. Pure accessors — they cannot
+ * influence pacing or any measured path.
+ *
+ * The absence is the point. A current addon answers `"{}"` when the pacer knob
+ * is off, so a forward that substituted `"{}"` for a method the addon does not
+ * have would make a stale addon read as a deliberate unpaced run: a paced bench
+ * cell would then produce an artifact with no pacer stats and nothing saying
+ * why. Callers that need the pacer must check `typeof server.__pacerStatsJson
+ * === "function"` and refuse when it is not.
+ */
+function pacerStatsForwards(handle: {
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
+}): Pick<WebTransportServer, "__pacerStatsSnapshot" | "__pacerStatsJson"> {
+	const snapshot = handle.__pacerStatsSnapshot;
+	const json = handle.__pacerStatsJson;
+	return {
+		...(typeof snapshot === "function"
+			? { __pacerStatsSnapshot: () => snapshot.call(handle) }
+			: {}),
+		...(typeof json === "function"
+			? { __pacerStatsJson: (token?: number) => json.call(handle, token) }
+			: {}),
+	};
+}
+
+/**
  * Create an in-process WebTransport server.
  *
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
@@ -2257,13 +2289,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
-		// Diagnostic, unstable, deliberately underscore-prefixed (see
-		// egress_pacer.rs): the facade closes over the handle, so without these
-		// forwards the pacer's own counters are unreachable from bench code.
-		// Pure accessors — they cannot influence pacing or any measured path.
-		__pacerStatsSnapshot: () => handle.__pacerStatsSnapshot?.() ?? 0,
-		__pacerStatsJson: (token?: number) =>
-			handle.__pacerStatsJson?.(token) ?? "{}",
+		...pacerStatsForwards(handle),
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);
@@ -4392,6 +4418,7 @@ export const __TESTING__ = {
 	nativeStreamHandlesSnapshotForTests: () =>
 		native?.nativeStreamHandlesSnapshot?.(),
 	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
+	pacerStatsForwardsForTests: pacerStatsForwards,
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
 	parseDatagramBatchSizeForTests: parseDatagramBatchSize,
