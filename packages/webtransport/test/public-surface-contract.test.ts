@@ -160,6 +160,11 @@ const ROOT_EXPORTS = [
 	"importTicketVault",
 	"metricsToPrometheus",
 	"nativeToWebTransportLike",
+	// Ships with the two decoders above and for the same reason: a balancer
+	// reading a connection ID gets its LENGTH from configuration, never from
+	// the wire, so the decoders are only usable alongside the function that
+	// computes it. Additive (semver-minor) like they were.
+	"quicLbCidLength",
 	"releaseNativeMemory",
 	"toWebTransport",
 ];

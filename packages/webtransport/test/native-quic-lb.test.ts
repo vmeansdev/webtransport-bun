@@ -17,6 +17,7 @@ import {
 	createServer,
 	decodeQuicLbConfigRotation,
 	decodeQuicLbServerId,
+	quicLbCidLength,
 } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
@@ -227,5 +228,13 @@ describe("QUIC-LB connection-ID decoders", () => {
 		const id = decodeQuicLbServerId(cid, 2) as Uint8Array;
 		id[0] = 0xff;
 		expect(cid[1]).toBe(1);
+	});
+
+	it("agrees with the length of a connection ID built from the same layout", () => {
+		expect(quicLbCidLength(2, 8)).toBe(
+			buildCid(3, [0xab, 0xcd], [1, 2, 3, 4, 5, 6, 7, 8]).length,
+		);
+		expect(quicLbCidLength(1, 4)).toBe(6); // draft-21 §5.3 minimum
+		expect(quicLbCidLength(15, 4)).toBe(20); // and its maximum
 	});
 });
