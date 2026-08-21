@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: MIT
 //
 // ============================================================================
-// EXAMPLE — NOT COMPILED, NOT TESTED
+// EXAMPLE — COMPILES ONLY; NEVER LOADED, NEVER ATTACHED, NEVER TESTED
 // ============================================================================
 //
 // This file is a reference for operators writing their own SK_REUSEPORT
 // steering program. It is not built by this repository, not run by any test,
-// and not shipped in the npm package. No kernel has ever loaded it. Read it,
-// port it, verify it yourself.
+// and not shipped in the npm package. Read it, port it, verify it yourself.
 //
 // Written against Linux **7.0.0-30-generic** (the campaign's bare-metal box) as
 // the reference target, with libbpf/BTF-style map declarations and a CO-RE
-// build in mind. Nothing here was checked by that kernel's verifier; verifier
-// constraints on any kernel you target are yours to discover.
+// build in mind.
+//
+// Exactly one thing has been established about it: on 2026-08-21, on that box,
+// `clang -target bpf -O2 -g -c steer_by_cid.bpf.c` compiled it clean against
+// that kernel's headers with libbpf-dev installed — zero diagnostics, a
+// 15,984-byte object. That is a syntax and types result and nothing more.
+//
+// It has NEVER been submitted to a verifier, NEVER attached to a socket, and
+// NEVER carried a packet. Verifier acceptance and runtime behavior on any
+// kernel you target — including that one — remain entirely yours to establish.
 //
 // ----------------------------------------------------------------------------
 // THE CONFIGURATION MUST MATCH THE SERVER, BYTE FOR BYTE
