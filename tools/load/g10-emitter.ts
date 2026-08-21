@@ -39,6 +39,26 @@ export type MirrorEnvelope = {
 	failures: readonly MirrorFailure[];
 };
 
+/**
+ * `sendDatagramMirrorPaced`'s envelope, as the arm consumes it.
+ *
+ * `admitted` is a schedule acceptance, not a delivery — nothing about a target
+ * has been examined when the call returns. `refused` is admission backpressure
+ * (the schedule was already holding its bound) and is a different signal from
+ * the `E_QUEUE_FULL` reports that arrive later through {@link
+ * EmitterTransport.readMirrorReports}.
+ */
+export type MirrorAdmission = {
+	admitted: number;
+	refused: readonly MirrorFailure[];
+};
+
+/** One deferred per-target failure, drained out of band after the pass. */
+export type MirrorReportOutcome = {
+	/** `E_QUEUE_FULL` (no byte budget at its turn) or `E_SESSION_CLOSED`. */
+	code: string;
+};
+
 export interface EmitterTransport {
 	/**
 	 * A1 and A2's per-target send: the landed promise-free `trySendDatagram`
@@ -52,6 +72,27 @@ export interface EmitterTransport {
 	 * means composition option C, and the arm simply does not run.
 	 */
 	sendMirror?(targets: readonly string[], payload: Uint8Array): MirrorEnvelope;
+
+	/**
+	 * A3's one crossing in a **paced** cell.
+	 *
+	 * Present only when the composition ships `sendDatagramMirrorPaced` and the
+	 * pacer knob is on. When it is present A3 takes it and never the synchronous
+	 * entry: on the Candidate-C surface the pacer no longer lives inside
+	 * `sendDatagramMirror`, so a paced cell that fell back to the sync path would
+	 * produce an artifact with a `pacerStats` block full of zeroes and no way to
+	 * tell it from a control.
+	 */
+	sendMirrorPaced?(
+		targets: readonly string[],
+		payload: Uint8Array,
+	): MirrorAdmission;
+
+	/**
+	 * Drain the bounded reports ring. Failures only, oldest first; an empty
+	 * result means nothing is pending.
+	 */
+	readMirrorReports?(max?: number): readonly MirrorReportOutcome[];
 
 	/** The product's own `DATAGRAM_MIRROR_MAX`, when the entry point resolves. */
 	mirrorCap?: number;
@@ -91,7 +132,11 @@ export function resolveArms(
 	const dropped: ArmId[] = [];
 	const warnings: string[] = [];
 	for (const arm of requested) {
-		if (arm === "A3" && typeof transport.sendMirror !== "function") {
+		if (
+			arm === "A3" &&
+			typeof transport.sendMirror !== "function" &&
+			typeof transport.sendMirrorPaced !== "function"
+		) {
 			dropped.push(arm);
 			warnings.push(
 				"A3 requested but the candidate exposes no sendDatagramMirror; " +
@@ -138,6 +183,15 @@ export type BroadcastResult = {
 	stallNs: bigint;
 	/** Spans the arm took. 1 for A1 and A3; ceil(fleet/256) for A2. */
 	spans: number;
+	/**
+	 * Additive, paced-A3 only. Which mirror entry the arm took, and the
+	 * admission split it came back with. Absent on every other arm and on the
+	 * synchronous mirror, so an artifact from a control cell reads exactly as it
+	 * did before.
+	 */
+	pacedApi?: "sendDatagramMirrorPaced";
+	pacedAdmitted?: number;
+	pacedRefused?: number;
 };
 
 function emptyResult(arm: ArmId): BroadcastResult {
@@ -220,6 +274,19 @@ export async function broadcastA2(
  * retry would make A3 a different emitter from A1 and A2, and C5 would then be
  * comparing a persistent sender against two non-persistent ones.
  */
+function assertUnderCap(
+	targets: readonly string[],
+	transport: EmitterTransport,
+): void {
+	const cap = transport.mirrorCap ?? DATAGRAM_MIRROR_MAX;
+	if (targets.length > cap) {
+		throw new RangeError(
+			`A3 cannot mirror ${targets.length} targets past the ${cap} cap; a ` +
+				"chunked mirror is a different arm (prereg §2.3)",
+		);
+	}
+}
+
 export function broadcastA3(
 	targets: readonly string[],
 	payload: Uint8Array,
@@ -231,13 +298,7 @@ export function broadcastA3(
 			"A3 ran without a mirror entry point; resolveArms missed it",
 		);
 	}
-	const cap = transport.mirrorCap ?? DATAGRAM_MIRROR_MAX;
-	if (targets.length > cap) {
-		throw new RangeError(
-			`A3 cannot mirror ${targets.length} targets past the ${cap} cap; a ` +
-				"chunked mirror is a different arm (prereg §2.3)",
-		);
-	}
+	assertUnderCap(targets, transport);
 	const result = emptyResult("A3");
 	const started = transport.nowNs();
 	const envelope = sendMirror.call(transport, targets, payload);
@@ -252,6 +313,50 @@ export function broadcastA3(
 	return result;
 }
 
+/**
+ * A3 in a paced cell — one `sendDatagramMirrorPaced` call over the whole fleet.
+ *
+ * The same arm as {@link broadcastA3} in shape (one crossing, one span, no
+ * retry) and deliberately different in what it can claim. The paced envelope
+ * carries no delivery count, so `ok` here is **admission** — targets the
+ * schedule accepted — and `wouldBlock` is admission refusal. That is exactly
+ * what the old in-`sendDatagramMirror` pacer's `sent` meant, so the ledger
+ * fields keep the meaning the sweep's artifacts gave them.
+ *
+ * What the arm cannot see at the call — a target that had no byte budget when
+ * its turn came, or had gone away — arrives later through
+ * `readMirrorReports()`. The conductor drains that ring; folding it in here
+ * would put an out-of-band cost inside the span C7 reads.
+ */
+export function broadcastA3Paced(
+	targets: readonly string[],
+	payload: Uint8Array,
+	transport: EmitterTransport,
+): BroadcastResult {
+	const sendMirrorPaced = transport.sendMirrorPaced;
+	if (!sendMirrorPaced) {
+		throw new Error(
+			"A3 ran the paced path without a paced mirror entry point; resolveArms missed it",
+		);
+	}
+	assertUnderCap(targets, transport);
+	const result = emptyResult("A3");
+	const started = transport.nowNs();
+	const admission = sendMirrorPaced.call(transport, targets, payload);
+	result.stallNs = transport.nowNs() - started;
+	result.spans = 1;
+	result.attempts = targets.length;
+	result.ok = admission.admitted;
+	// Every admission refusal is `E_QUEUE_FULL` by construction: the schedule
+	// was holding its bound. It is backpressure, so it lands in `wouldBlock`
+	// beside A1's and A2's, never in `errors`.
+	result.wouldBlock = admission.refused.length;
+	result.pacedApi = "sendDatagramMirrorPaced";
+	result.pacedAdmitted = admission.admitted;
+	result.pacedRefused = admission.refused.length;
+	return result;
+}
+
 /** Dispatch by arm, so the conductor holds one call site and no branch. */
 export async function broadcast(
 	arm: ArmId,
@@ -260,8 +365,48 @@ export async function broadcast(
 	transport: EmitterTransport,
 ): Promise<BroadcastResult> {
 	if (arm === "A1") return broadcastA1(targets, payload, transport);
-	if (arm === "A3") return broadcastA3(targets, payload, transport);
+	if (arm === "A3") {
+		// A paced cell takes the paced entry whenever it exists. The conductor
+		// only installs `sendMirrorPaced` when the pacer knob is on, so this is
+		// the paced/control switch and there is no third state.
+		return typeof transport.sendMirrorPaced === "function"
+			? broadcastA3Paced(targets, payload, transport)
+			: broadcastA3(targets, payload, transport);
+	}
 	return broadcastA2(targets, payload, transport);
+}
+
+/** One drain of the reports ring, tallied by error identity. */
+export type MirrorReportTally = {
+	drained: number;
+	queueFull: number;
+	sessionClosed: number;
+	other: number;
+};
+
+export function emptyReportTally(): MirrorReportTally {
+	return { drained: 0, queueFull: 0, sessionClosed: 0, other: 0 };
+}
+
+/**
+ * Drain the paced reports ring into a running tally.
+ *
+ * Called by the conductor after each broadcast, outside the span C7 reads. A
+ * no-op when the transport has no ring, so a control cell pays nothing.
+ */
+export function drainMirrorReports(
+	transport: EmitterTransport,
+	into: MirrorReportTally,
+	max?: number,
+): void {
+	const read = transport.readMirrorReports;
+	if (!read) return;
+	for (const report of read.call(transport, max)) {
+		into.drained += 1;
+		if (report.code === "E_QUEUE_FULL") into.queueFull += 1;
+		else if (report.code === "E_SESSION_CLOSED") into.sessionClosed += 1;
+		else into.other += 1;
+	}
 }
 
 /* -------------------------------------------------------------------------- */

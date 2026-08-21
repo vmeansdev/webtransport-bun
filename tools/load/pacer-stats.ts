@@ -193,6 +193,49 @@ export function assertPacerReadable(
 	);
 }
 
+/**
+ * The paced-cell **API** guard, the sibling of {@link assertPacerReadable}.
+ *
+ * On the Candidate-C surface the pacer is no longer a knob inside
+ * `sendDatagramMirror`: the synchronous path stayed pure and the schedule got
+ * its own front door, `sendDatagramMirrorPaced`. A composition that predates
+ * that split will happily accept `WEBTRANSPORT_PACER_PPS`, expose readable
+ * stats, and then run every broadcast through the unpaced burst — producing a
+ * cell whose `pacerStats` block is present and all zeroes, which grades as a
+ * pacer that did nothing rather than as a harness that never asked it.
+ *
+ * So a paced cell that cannot reach the paced API refuses at start-up, loudly,
+ * before the fleet. Called only when A3 is in the resolved arms: A1 and A2 are
+ * per-target arms and have no mirror to pace.
+ */
+export function assertPacedMirrorApi(
+	server: unknown,
+	pacerPps: string | undefined,
+): void {
+	const paced = (pacerPps ?? "").trim();
+	if (paced === "") return;
+	const bag = server as Record<string, unknown> | null;
+	const send = bag?.sendDatagramMirrorPaced;
+	const read = bag?.readMirrorReports;
+	if (typeof send === "function" && typeof read === "function") return;
+	const missing = [
+		typeof send === "function" ? null : "sendDatagramMirrorPaced",
+		typeof read === "function" ? null : "readMirrorReports",
+	]
+		.filter((name): name is string => name !== null)
+		.join(" and ");
+	throw new Error(
+		`bench-g10: WEBTRANSPORT_PACER_PPS=${paced} is set and arm A3 is in the ` +
+			`run, but the composed server exposes no ${missing}. This composition ` +
+			"predates the paced mirror API, where the pacer sat inside " +
+			"`sendDatagramMirror` and the knob alone was enough. It no longer is: " +
+			"the synchronous path is unpaced by contract, so this cell would " +
+			"broadcast unpaced while carrying an all-zero `pacerStats` block. " +
+			"Compose against a tree that ships `sendDatagramMirrorPaced`, or unset " +
+			"the knob to run a control.",
+	);
+}
+
 function nested(server: unknown, key: string): unknown {
 	if (server === null || typeof server !== "object") return null;
 	return (server as Record<string, unknown>)[key] ?? null;

@@ -80,7 +80,10 @@ import {
 	type BroadcastResult,
 	blocksPerArm,
 	broadcast,
+	drainMirrorReports,
 	type EmitterTransport,
+	emptyReportTally,
+	type MirrorReportTally,
 	resolveArms,
 	type SendOutcome,
 	startLoopLagSampler,
@@ -122,6 +125,7 @@ import {
 } from "./latency-stamp.ts";
 import {
 	assertOneProcessPerCell,
+	assertPacedMirrorApi,
 	assertPacerReadable,
 	type PacerStatsRaw,
 	pacerEnvironment,
@@ -240,6 +244,16 @@ function parseFleetOverride(
  */
 const SMOKE_RUST = SMOKE && process.env.G10_SMOKE_RUST === "1";
 const HIDE_MIRROR = process.env.G10_HIDE_MIRROR === "1";
+
+/**
+ * Whether this cell is the `PACED` arm — the pacer knob being set is the whole
+ * definition, exactly as it was when the pacer lived inside
+ * `sendDatagramMirror`. What changed on the Candidate-C surface is which entry
+ * point honours it: the synchronous mirror is unpaced by contract now, so a
+ * paced cell must call `sendDatagramMirrorPaced` and drain
+ * `readMirrorReports()`.
+ */
+const PACED_CELL = (process.env.WEBTRANSPORT_PACER_PPS ?? "").trim() !== "";
 
 /**
  * V-SP's inputs: the same-day burst-probe artifacts, written by
@@ -378,6 +392,21 @@ type ArmState = {
 	sendEventsSkipped: number;
 	/** Rejections that arrived after the pass returned. Charged against sendOk. */
 	deferredErrors: number;
+	/**
+	 * Paced A3 only, additive. The paced mirror's deferred per-target failures,
+	 * drained out of band from `readMirrorReports()`.
+	 *
+	 * Kept out of `deferredErrors` deliberately. That counter is the per-session
+	 * `sendDatagram` promise rejection A1 and A2 produce, and `sendOk` is
+	 * reported net of it; the sweep's paced cells had no such charge, because
+	 * the in-`sendDatagramMirror` pacer's deferred failures were only ever
+	 * visible in `pacerStats.deferredFailures`. Folding these in would silently
+	 * redefine `sendOk` between the sweep and the gate, so they are reported
+	 * beside it instead and reconcile against `pacerStats.deferredFailures`.
+	 */
+	mirrorReports: MirrorReportTally;
+	/** Which mirror entry A3 took in this cell. Absent on A1/A2. */
+	pacedApi?: "sendDatagramMirrorPaced";
 	/** §6.6a — what C7 reads. */
 	stall: LatencyHistogram;
 	/** §C6 — deadline to the instant the pass *begins*, never across a send. */
@@ -398,6 +427,7 @@ function freshArm(arm: ArmId): ArmState {
 		sendErrors: 0,
 		sendEventsSkipped: 0,
 		deferredErrors: 0,
+		mirrorReports: emptyReportTally(),
 		stall: new LatencyHistogram(),
 		handoffLag: new LatencyHistogram(),
 		hold: new LatencyHistogram(),
@@ -852,6 +882,25 @@ async function main(): Promise<void> {
 				}
 			).sendDatagramMirror;
 
+	// The paced front door, taken only in a paced cell. `PACED_CELL` is the one
+	// switch: with the knob off the transport never grows the paced methods, A3
+	// runs the synchronous mirror, and the artifact is a control exactly as
+	// before.
+	const pacedApi = HIDE_MIRROR
+		? undefined
+		: (server as unknown as {
+				sendDatagramMirrorPaced?: (
+					targets: string[],
+					payload: Uint8Array,
+				) => {
+					admitted: number;
+					refused: readonly { index: number; error?: { code?: string } }[];
+				};
+				readMirrorReports?: (
+					max?: number,
+				) => readonly { error?: { code?: string } }[];
+			});
+
 	const transport: EmitterTransport = {
 		trySend: (target, payload) => {
 			const sub = byId.get(target);
@@ -874,12 +923,55 @@ async function main(): Promise<void> {
 		};
 		transport.mirrorCap = DATAGRAM_MIRROR_MAX;
 	}
+	if (PACED_CELL && REQUESTED_ARMS.includes("A3")) {
+		// Refuses before the fleet when the composition predates the paced API:
+		// an unpaced broadcast under an all-zero pacerStats block is the one
+		// failure mode nothing downstream can see.
+		assertPacedMirrorApi(server, process.env.WEBTRANSPORT_PACER_PPS);
+		const sendPaced = pacedApi?.sendDatagramMirrorPaced;
+		const readReports = pacedApi?.readMirrorReports;
+		if (sendPaced && readReports) {
+			transport.sendMirrorPaced = (targets, payload) => {
+				const admission = sendPaced.call(server, targets as string[], payload);
+				return {
+					admitted: admission.admitted,
+					refused: admission.refused.map((f) => ({
+						index: f.index,
+						code: f.error?.code ?? "E_INTERNAL",
+					})),
+				};
+			};
+			transport.readMirrorReports = (max) =>
+				readReports
+					.call(server, max)
+					.map((r) => ({ code: r.error?.code ?? "E_INTERNAL" }));
+			transport.mirrorCap = DATAGRAM_MIRROR_MAX;
+		}
+	}
 
 	const resolution = resolveArms(REQUESTED_ARMS, transport);
 	for (const warning of resolution.warnings)
 		console.warn(`bench-g10: ${warning}`);
 	if (resolution.arms.length === 0) {
 		throw new Error("bench-g10: every requested arm was dropped");
+	}
+	// The backstop the server-level guard cannot give: A3 resolved, the knob is
+	// on, and yet the conductor holds no paced entry — so `broadcast()` would
+	// take the synchronous mirror and the cell would blast unpaced under a
+	// `pacerStats` block that says nothing happened. Unreachable through a
+	// composition that ships the API; reachable through `G10_HIDE_MIRROR`, and
+	// worth refusing rather than trusting the wiring above to stay correct.
+	if (
+		PACED_CELL &&
+		resolution.arms.includes("A3") &&
+		typeof transport.sendMirrorPaced !== "function"
+	) {
+		throw new Error(
+			"bench-g10: this is a paced cell running A3, but the conductor wired " +
+				"no paced mirror entry. A3 would take the synchronous " +
+				"`sendDatagramMirror`, which is unpaced by contract on this " +
+				"surface, and the cell would be a control wearing a paced artifact.",
+		);
 	}
 
 	writeFileSync(
@@ -1163,6 +1255,10 @@ async function main(): Promise<void> {
 			state.sendWouldBlock += result.wouldBlock;
 			state.sendErrors += result.errors;
 			state.stall.record(Number(result.stallNs));
+			if (result.pacedApi) state.pacedApi = result.pacedApi;
+			// After the span C7 reads, never inside it: the drain is the caller's
+			// half of the paced contract and its cost is not the emitter's stall.
+			drainMirrorReports(transport, state.mirrorReports);
 		};
 
 		// Aimed at the deadline, re-armed from inside the tick — not a polling
@@ -1336,6 +1432,23 @@ async function main(): Promise<void> {
 				sendErrors: state.sendErrors,
 				sendEventsSkipped: state.sendEventsSkipped,
 				deferredErrors: state.deferredErrors,
+				// Additive, paced cells only. Absent on a control and on A1/A2, so
+				// an artifact from an unpaced cell reads exactly as it did before.
+				...(state.pacedApi ? { pacedApi: state.pacedApi } : {}),
+				...(state.mirrorReports.drained > 0 || state.pacedApi
+					? {
+							mirrorReports: {
+								drained: state.mirrorReports.drained,
+								queueFull: state.mirrorReports.queueFull,
+								sessionClosed: state.mirrorReports.sessionClosed,
+								other: state.mirrorReports.other,
+								// The ring's own overflow counter. `drained + dropped`
+								// must equal `pacerStats.windowed.deferredFailures`; a
+								// mismatch means the reporting path itself is lying.
+								dropped: server.metricsSnapshot().mirrorReportsDropped ?? null,
+							},
+						}
+					: {}),
 				probeEchoes: state.probeEchoes,
 				stallP99Ms,
 				stallHistogram: state.stall.toJson(),
