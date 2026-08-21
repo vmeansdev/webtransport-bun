@@ -27,6 +27,18 @@ export const WT_RESET: unique symbol = Symbol("WT_RESET");
  */
 export const WT_STOP_SENDING: unique symbol = Symbol("WT_STOP_SENDING");
 
+/**
+ * Bench/harness surface: returns the raw native bidi stream handle behind an
+ * accepted server stream, or null once the stream is released. Exists so load
+ * harnesses (G11's native paced emitter) can drive the native write path
+ * without a per-frame napi crossing; applications should never need it, and
+ * writes issued through the raw handle bypass the WHATWG writable's queue.
+ * @example `(stream as NativeHandleCarrier)[WT_NATIVE_BIDI_HANDLE]?.()`
+ */
+export const WT_NATIVE_BIDI_HANDLE: unique symbol = Symbol(
+	"WT_NATIVE_BIDI_HANDLE",
+);
+
 /** Stream that supports reset via WT_RESET. */
 export type Resettable = { [WT_RESET](code?: number): void };
 /** Stream that supports stopSending via WT_STOP_SENDING. */

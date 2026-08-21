@@ -44,6 +44,10 @@ import type { Duplex, Readable, Writable } from "node:stream";
 
 export type { Resettable, StopSendable } from "./streams.js";
 // Re-export stream symbols and helpers
+// (WT_NATIVE_BIDI_HANDLE is deliberately NOT re-exported: it is a
+// bench/harness surface, imported from ./streams.ts by the harness that
+// needs it, and keeping it off the root module keeps the frozen public
+// surface unchanged.)
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 
 import {
@@ -52,6 +56,7 @@ import {
 	type Resettable,
 	SendStream,
 	type StopSendable,
+	WT_NATIVE_BIDI_HANDLE,
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "./streams.js";
@@ -1238,6 +1243,36 @@ type NativeClientSessionEvent = {
 	code: number;
 	reason: string;
 };
+/** Histogram snapshot the native paced emitter returns; the shape matches
+ * the G11 harness's `LatencySnapshot` so the two merge without translation. */
+export type NativePacedEmitterSnapshot = {
+	negativeCount: number;
+	bucketUpperMs: number[];
+	bucketCounts: number[];
+	maxMs: number;
+};
+
+/** Result of `runPacedEmitter` — see `crates/native/src/paced_emitter.rs`. */
+export type NativePacedEmitterResult = {
+	writes: number;
+	settles: number;
+	bytes: number;
+	errors: number;
+	firstError?: string | null;
+	completedFullDuration: boolean;
+	lateness: NativePacedEmitterSnapshot;
+	settle: NativePacedEmitterSnapshot;
+};
+
+/** Options for `runPacedEmitter`. */
+export type NativePacedEmitterOptions = {
+	bytesPerSec: number;
+	frameBytes: number;
+	durationMs: number;
+	session: number;
+	frameClass: number;
+};
+
 type NativeBidiStreamHandle = {
 	readonly id: number;
 	// Never-reject sentinels: string results are error codes (see
@@ -1247,6 +1282,11 @@ type NativeBidiStreamHandle = {
 	 * addon without it degrades to `read` instead of throwing. */
 	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
 	write(chunk: Buffer | Uint8Array): Promise<string | null>;
+	/** Bench/harness surface: the native paced downstream emitter (G11).
+	 * Optional so an override addon without it degrades to the JS pacer. */
+	runPacedEmitter?: (
+		opts: NativePacedEmitterOptions,
+	) => Promise<NativePacedEmitterResult>;
 	finish(): Promise<string | null> | void;
 	finishWait?: () => Promise<string | null> | void;
 	reset?: (code?: number) => void;
@@ -3950,9 +3990,19 @@ function createServerIncomingBidiWebStreams(
 			return resource.getWritable();
 		},
 	} as WebTransportBidirectionalStream;
+	const withControls = attachServerBidiResourceControls(stream, resource);
+	// Bench/harness surface (see WT_NATIVE_BIDI_HANDLE in streams.ts): an
+	// accessor rather than the handle itself, so a harness holding the stream
+	// after release reads null instead of a disposed native reference.
+	(
+		withControls as unknown as Record<
+			typeof WT_NATIVE_BIDI_HANDLE,
+			() => NativeBidiStreamHandle | null
+		>
+	)[WT_NATIVE_BIDI_HANDLE] = () => resource.handle;
 	return {
 		resource,
-		stream: attachServerBidiResourceControls(stream, resource),
+		stream: withControls,
 	};
 }
 
