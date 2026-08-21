@@ -607,8 +607,10 @@ threads ~61%, tokio workers ~9%. One thread was running 100 upstream deframers
 (~26.8k frames/s, which stayed exact) alongside 100 downstream pacers needing
 ~26.4k awaited writes/s; the pacers got the residual, ≈0.40 — a ratio
 **invariant to generator topology** (single-process 0.411/0.405, sharded 2×50
-0.402) precisely because it is internal to one thread. H3 (drain cap) and H4
-(a structural constant) were refuted by the same data; the cliff is sharp —
+0.402) precisely because it is internal to one thread. H3 (drain cap) was
+refuted by that same empty-queue, exact-delivery data; H4 (a structural
+constant) fell to a different comparison — T-50 sustains 150 Mbps down against
+T-100's ~108–121, and no cap computes to 120 Mbps. The cliff is sharp —
 1.00 at 50 sessions, 0.36–0.40 at 100, **0.0068 at 200**.
 
 **The fix that failed, and what its failure proved.** T-PC2 moved deframing to
@@ -628,8 +630,9 @@ for the first time.
 ## 5. The verdict this arm actually delivers
 
 **The T arm's history is a harness finding, not a product finding.** Two of its
-three attribution layers blamed the product — once the rig's CPU, once the
-server's egress path — and both were wrong. What the graded run shows is a
+three attribution layers blamed something other than the harness — once the
+rig's CPU, once the server's egress path, and only the second of those was a
+charge against the product — and both were wrong. What the graded run shows is a
 server that offers its registered shape exactly in both directions, keeps its
 byte ledgers to the byte, drains without a single error or reset, and egresses
 at 4.25 ms p99 while ingesting the same load. The clause it misses is an
@@ -941,8 +944,10 @@ is a number this campaign paid for:
 **1. There is one JS thread, and it is the measured ceiling.** The write
 originator sources ~**63.3k writes/s at 1 KiB** and cannot reach an offered
 152,588 (`stamps/g7.md`, B-1k). The same thread, running 100 stream pacers,
-saturates at 93–95% of one core and sheds 60% of its offered downstream
-(ticket 10). Every application callback, every payload construction, every
+saturates at 93–95% of one core and shed 60% of its offered downstream until
+the pacing was moved off it (ticket 10; the T arm's supply wall is now closed
+by a native emitter, so this is a property of JS-side pacing, not a standing
+transport ceiling). Every application callback, every payload construction, every
 `await` on a send shares that thread with the transport's own JS-side work. A
 hot path cannot be scheduled behind an event loop that also runs the
 application.
@@ -1002,11 +1007,18 @@ only here.
 |---|---|---|
 | G1 GPS/telemetry | **PASS, coverage-narrowed** | 10k sessions, delivery 1.000, ingest p99 2.9 ms, ~128 KB/session. The pass covers **staggered** arrival only; synchronized fleets read 0.699 with kernel rcvbuf loss, disclosed and not covered. The re-registration's authorization was disputed on the record |
 | G2 FPS/MOBA | **INCOMPLETE-ON-THAT-RIG** | evidence chain weakened on review; its licensed 10k observation describes a tree that stopped being the shipped default two hours later |
-| G3 camera egress | **INCOMPLETE** | the "rig can't source 1.5×" conclusion was **struck** on re-read — `originationLag` is recorded across `await send` and absorbs product send latency |
+| G3 camera egress | **INCOMPLETE** | on re-read the "rig can't source 1.5×" conclusion was **refuted** by the run's own batch fragment, and the broader interpretation "the JS originator is the binding constraint under all arms" was **struck** — `originationLag` is recorded across `await send` and absorbs product send latency |
 | G4 video-call SFU | **PASS on its registered clauses** | N=50 p99 10.35 ms, delivery 1.000 — but the run-level "headroom 1.80" context was **struck**: the ceiling counted shadow-sink stubs that skip the native send |
 | G5 bulk/VOD | **NO-VERDICT** | with omitted disclosures restored: every cell except the control dropped on the server socket |
 | G10 broadcast | **MISS — final for that rig** | see A.3 |
 | G11 | X PASS · D coupling-absent · **T INVALID (V-P)** | see A.2 |
+
+The G1–G5 rows come from the gate ledger named above. **The G10 and G11 rows do
+not** — that document's own verdict table stops at G5, and those two gates were
+carried in the VM campaign's ticket scratch
+(`.scratch/production-grade-scenarios/issues/35-gate-g10-broadcast.md` and
+`36-gate-g11-bidi-proxy.md`), with the same gitignored-scratch disclosure this
+document applies to its own.
 
 Two findings in that document outranked its own gates, and both stand: the
 `WEBTRANSPORT_DATAGRAM_SEND_SYNC` default-ON landing was **not** a neutral
@@ -1020,13 +1032,15 @@ data — is the direct answer to that second finding.
 
 ## A.2 Correction 1 — G11's T arm, re-attributed twice
 
-The VM ledger recorded T as INVALID with the attribution *"rig CPU can't offer
-100 × 3 Mbps down; the batching knob doesn't help."* Bare metal corrected it in
+The VM ledger recorded T as INVALID with the attribution that the rig's CPU
+could not generate 100 × 3 Mbps of paced downstream, and that receive batching
+did not touch the write-side bottleneck. Bare metal corrected it in
 two further steps — first wrongly, to "the server's egress path", then
 correctly, to **the conductor's own JS thread** — and then closed it with a
 native paced emitter that took supply from 0.40 to 1.00003. The full three-layer
 history is in the T-arm chapter above. The point worth carrying: **two of the
-three attributions blamed the product, and both were wrong.**
+three attributions looked outside the harness — at the rig, then at the server
+— and both were wrong.**
 
 ## A.3 Correction 2 — the 160k ceiling, and G10's finality
 
@@ -1071,8 +1085,10 @@ this project owns.
 
 Not everything there was corrected. The H7 batched-delivery lever (1.96×) and
 the hop-removal work shipped and are in the tree the bare-metal gates measured;
-the zombie-session / no-idle-timeout product observation stands and is the
-reason the Deployment chapter can state the 60 s stall bound precisely; and the
+the zombie-session / no-idle-timeout product observation stands, and is the
+reason the Deployment chapter knows to bound the stall at all — though the 60 s
+figure itself is read from the shipped default in `crates/native/src/limits.rs`,
+not from that campaign; and the
 four-axes finding that the JS originator is the binding constraint on bursty
 egress was **reproduced independently on bare metal**, in G7's B-1k cell and in
 G11's T arm. That is the one VM-era conclusion this campaign confirmed rather
