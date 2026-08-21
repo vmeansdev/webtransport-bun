@@ -40,7 +40,7 @@ corroboration.
 | **G2 — FPS/MOBA tail latency** | **INCOMPLETE — `path-not-quiet`**: the off-box floor's own idle p99 is **8.101888 ms** against the registered 4.0 ms bar, so no gate statistic exists. An **instrument** finding, foreseen and pre-registered; the run is valid, the path is not evaluable | `stamps/g2.md` §9.6 |
 | **G3 — camera / bursty egress** | **PASS, with C3 = `CEILING-MOVED`**: egress one-way p99 **1.491 ms** (median of 5 blocks) against a 33.3 ms bar; GSO **and** GRO active at 64 segments, `sndbufErrors` 0 on all 30 steps. C3 states no lever value in milliseconds — for the third time across three registrations | `stamps/g3.md` §9.6, C2/C4 |
 | **G4 — SFU fan-out** | **PASS**: **16,509/s** forward egress inside a 30 Hz frame gate, p99 **10.879 ms**, delivery **1.0000**. Stated as a *rate* bound — "the 50 is incidental to that number, not causal" | `stamps/g4.md` §9.6 |
-| **G5 — bulk / VOD** | **PASS**, all six clauses: **1.1473 Gbps** delivered against a 1.25 Gbps paced offer with the batching knob **off** — which falsified the registered prediction that knob-off would fall short of 1.000 Gbps. The unpaced `A6` window probe is **force-stripped** and licenses nothing | `stamps/g5.md` §9.6, §6 P5 |
+| **G5 — bulk / VOD** | **PASS**, all six clauses, graded on the knob-**on** `P-batch` cell: **1.2505 Gbps** delivered against a 1.000 Gbps bar, sourcing 100.037% of its registered 1.25 Gbps offer. Separately — disclosed, not gating — the knob-**off** `P-control` cell delivered **1.1473 Gbps**, falsifying the registered prediction that knob-off would fall short of 1.000 Gbps. The unpaced `A6` window probe is **force-stripped** and licenses nothing | `stamps/g5.md` §9.6 clause 2, §6 P5 |
 | **G7 — stream egress** | **PASS, unnarrowed** (the C4-closure redispatch upgraded G7-01's "PASS — narrowed by C4 NOT-EVALUATED"): **1.2498 Gbps** at 16 streams × 64 KiB, byte- and stream-ledgers exact, and client receive-socket drops a *measured* **0** in all 14 cell-repeats | `stamps/g7-02.md`; run-1 record at `stamps/g7.md` |
 | **G8 — many-rooms fan-out** | **PASS, narrowed to one cell of nine**: **2** concurrent 10-subscriber video rooms at 330/s per publisher, p99 **3.740 ms**, forward delivery **0.99995**. Eight of nine cells INVALID; the voice and mutual arms produced no room count at all | `stamps/g8.md` §9.6 |
 | **G9 — sustained churn** | **NO-VERDICT (INVALID — declared harness/infra fault)**: every generator child exited **127**, no session was ever established, not one clause has an input. Explicitly **not a MISS**; one rerun is licensed and unspent | `stamps/g9.md` §9.6, §9.8 |
@@ -114,19 +114,26 @@ on this rig actually delivered, each with the whole box behind it:
 | Per-session memory, 1k → 10k sessions | **~126.5 KB/session**, linear (5k→10k slope within 0.48% of 1k→5k) | — | `g1.md` C3 |
 | Forward fan-out egress | **16,509/s** inside a 30 Hz frame gate, p99 **10.879 ms**, delivery 1.0000 | — | `g4.md` (stated as a **rate** bound, not a fan-out bound) |
 | Bursty / frame-shaped egress | egress one-way p99 **1.491 ms** median of 5 blocks, bar 33.3 ms | GSO **and** GRO active, 64 segments; `sndbufErrors` 0 on all 30 steps | `g3.md` C2/C4 |
-| Bulk / VOD paced throughput, shipped windows, batching knob **off** | **1.1473 Gbps** delivered against a 1.25 Gbps paced offer (`P-control`, median of 1149.6238 / 1144.9751 Mbps) | host CPU median 73.79 / 73.49% | `g5.md` §6 P5 — and note this *falsified* the registered prediction that the knob-off default would fall short of 1.000 Gbps, which the stamp calls the headline finding of the run |
-| Window-binding probe, **unpaced** — **INCOMPLETE, not a licensed result** | `A6-shipped` **1.1362 Gbps**, `A6-raised` **1.2049 Gbps**, ratio **1.0604** — read as `WINDOWS-NOT-BINDING`, **but the stamp force-strips it** | `A6-raised` is the only cell in the run with non-zero receive-socket drops: **1,564** and **1,797** on its two repeats (`A6-shipped` was `[0, 0]`, as was every other cell) | `g5.md` §"A6 at the chosen default — force stripped by §4.2" (both `A6-raised` repeats carry the sustained-throttle flag), drops from `g5.md` clause 6 |
+| Bulk / VOD paced throughput, batching knob **on** — the graded cell | **1.2505 Gbps** delivered against the 1.000 Gbps bar, at **100.037%** of the registered 1.25 Gbps offer; 42,599 B per crossing | host CPU median **34.31 / 34.37%** | `g5.md` clause 2 (throughput), clause 4 (crossing size), clause 1 (CPU) |
+| The same shape with the knob **off** (`P-control`) — **disclosed, not gating** | **1.1473 Gbps** (median of 1149.6238 / 1144.9751 Mbps), sourcing only **91.6–92.0%** of the offer — `paced-shortfall` fired on both repeats | host CPU median 73.79 / 73.49% | `g5.md` §6 P5 — and note this *falsified* the registered prediction that the knob-off default would fall short of 1.000 Gbps, which the stamp calls the headline finding of the run |
+| Window-binding probe, **unpaced** — **INCOMPLETE, not a licensed result** | `A6-shipped` **1.1362 Gbps**, `A6-raised` **1.2049 Gbps**, ratio **1.0604** — read as `WINDOWS-NOT-BINDING`, **but the stamp force-strips it** | `A6-raised` is the only cell in the run with non-zero **server** receive-socket drops: **1,564** and **1,797** on its two repeats (`A6-shipped` was `[0, 0]`, as was every other cell), corroborated exactly by kernel `udp.rcvbufErrors` | `g5.md` §"A6 at the chosen default — force stripped by §4.2" (both `A6-raised` repeats carry the sustained-throttle flag), drops from `g5.md` clause 6 |
 | Many-rooms fan-out | **2 concurrent 10-subscriber video rooms** at 330/s per publisher, p99 **3.740 ms**, forward delivery 0.99995 | co-resident generator + sink + VPN + Docker | `g8.md` — and note this licenses *two rooms*, nothing more; eight of nine cells were INVALID |
 
-**The two bulk rows are different cells and their numbers do not divide into
-each other.** 1.1473 Gbps is the *paced* `P-control` cell; the 1.0604 ratio is
-the *unpaced* `A6` pair. An earlier revision of this table put 1.1473 and 1.2049
-on one row under one ratio, which is a comparison between two different offer
-regimes — and the quotient of those two published numbers is 1.050, not the
-1.06 the row claimed. The ratio that means anything is `A6-raised / A6-shipped`
-= 1.2049 / 1.1362 = 1.0604, and it is force-stripped, so nothing may be
-concluded from it. **The only bulk throughput figure this document licenses is
-the 1.1473 Gbps paced one.**
+**The bulk rows are different cells and their numbers do not divide into each
+other.** 1.2505 Gbps is the knob-on `P-batch` cell the gate is graded on;
+1.1473 Gbps is the knob-off `P-control` cell, which the stamp's clause 1 marks
+*"disclosed, not gating"*; the 1.0604 ratio is the *unpaced* `A6` pair. An
+earlier revision of this table put 1.1473 and 1.2049 on one row under one
+ratio, which is a comparison between two different offer regimes — and the
+quotient of those two published numbers is 1.050, not the 1.06 the row claimed.
+The ratio that means anything is `A6-raised / A6-shipped` = 1.2049 / 1.1362 =
+1.0604, and it is force-stripped, so nothing may be concluded from it.
+
+**The bulk throughput figure this document licenses as a graded result is the
+1.2505 Gbps knob-on one.** The 1.1473 Gbps knob-off figure is licensed only as
+what the stamp makes it: a disclosure, and the falsification of P5. Neither
+number may be read as the other, and the knob-off cell did not source its full
+offer where the knob-on cell did.
 
 **Memory scales with sessions, not with instances.** At ~126.5 KB/session
 linear to 10,000 sessions, the instance count barely moves a memory budget.
