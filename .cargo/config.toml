@@ -1,5 +1,0 @@
-[build]
-target-dir = "/Users/vmeansdev/.cache/wtb-target"
-
-[target.aarch64-apple-darwin]
-runner = ["/Users/vmeansdev/.local/bin/wtb-sign-run"]
