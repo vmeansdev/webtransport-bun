@@ -182,7 +182,7 @@ balancer drop a session, and this document will not pretend otherwise.
 
 The mechanism matters, because the intuitive guess ("the client gets reset and
 reconnects quickly") is **wrong**, and wrong in the expensive direction. Traced
-against the source this tree locks (`Cargo.lock:892-893` → quinn-proto
+against the source this tree locks (`Cargo.lock:894-895` → quinn-proto
 **0.11.16**):
 
 1. **The wrong backend does try to reset.** A short-header packet whose
@@ -213,7 +213,7 @@ against the source this tree locks (`Cargo.lock:892-893` → quinn-proto
 connection quickly. It STALLS it.** The client keeps sending into a backend
 that will never answer; the connection dies only at idle timeout. On the server
 that is **60 s by default** (`crates/native/src/limits.rs:47`, always applied
-at `crates/native/src/lib.rs:744-746`, floored at 1000 ms by the parser at
+at `crates/native/src/lib.rs:761-763`, floored at 1000 ms by the parser at
 `limits.rs:101`, and negotiated down by whatever the peer advertises), with
 keep-alive pings **disabled by default** (`limits.rs:48`, `limits.rs:317-318`)
 — so nothing probes the dead path early. Server-side the stall is therefore
