@@ -10,13 +10,18 @@ use crate::rate_limit::RateLimits;
 use crate::server_metrics::ServerMetrics;
 use crate::{LogEvent, SessionEvent};
 
-/// Socket-level bind behavior for one server instance. The default reproduces
-/// the plain `with_bind_address` path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Endpoint-construction options for one server instance: everything decided
+/// once, at bind time, that the running server cannot change. The default
+/// reproduces the plain `with_bind_address` path with quinn's own CIDs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BindOptions {
     /// Set `SO_REUSEPORT` on the bind socket so sibling processes can share the
     /// port. Unix only; the caller rejects it elsewhere.
     pub reuse_port: bool,
+    /// Issue QUIC-LB connection IDs carrying this instance's server ID, so an
+    /// L4 balancer can route by CID instead of by 4-tuple. `None` leaves
+    /// quinn's default random 8-octet CIDs in place.
+    pub quic_lb: Option<crate::quic_lb::QuicLbConfig>,
 }
 
 /// Builds the server's UDP socket with `SO_REUSEPORT` set before `bind()`.
@@ -129,7 +134,7 @@ pub(crate) fn spawn_server_instance(
             enable_0rtt,
             allow_early_session,
             qpack_max_table_capacity,
-            bind,
+            bind.clone(),
             startup_tx,
         );
 
@@ -383,7 +388,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn two_server_instances_bind_the_same_port_with_reuse_port() {
-        let bind = BindOptions { reuse_port: true };
+        let bind = BindOptions {
+            reuse_port: true,
+            ..Default::default()
+        };
         let (first_tx, port) = spawn_server_instance(
             u64::MAX - 24,
             Arc::new(ServerMetrics::default()),
@@ -399,7 +407,7 @@ mod tests {
             false,
             false,
             0,
-            bind,
+            bind.clone(),
             1,
         )
         .expect("first reusePort server should start");
@@ -428,6 +436,145 @@ mod tests {
         assert_eq!(second_port, port);
     }
 
+    /// The generator only proves itself against a real handshake: quinn's
+    /// `new_cid` loops until it draws an unused CID, and `validate()` is
+    /// consulted on every packet whose destination CID the endpoint does not
+    /// already know. A deterministic nonce or an over-strict validate would
+    /// show up here as a hang or a failed connect, not as a unit-test failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_handshakes_against_an_endpoint_issuing_quic_lb_cids() {
+        use crate::quic_lb::QuicLbConfig;
+
+        let server_id = vec![0x51, 0x1b];
+        let bind = BindOptions {
+            reuse_port: false,
+            quic_lb: Some(QuicLbConfig::new(server_id.clone(), 8, 2).expect("valid config")),
+        };
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(4);
+        let (shutdown_tx, port) = spawn_server_instance(
+            u64::MAX - 28,
+            Arc::new(ServerMetrics::default()),
+            &Limits::default(),
+            &RateLimits::default(),
+            "127.0.0.1",
+            0,
+            &Some(session_tx),
+            &None,
+            build_default_dev_resolver().expect("dev resolver"),
+            crate::client::CongestionControlMode::Default,
+            false,
+            false,
+            false,
+            0,
+            bind,
+            3,
+        )
+        .expect("QUIC-LB server should start");
+        let _shutdown = ShutdownOnDrop(Some(shutdown_tx));
+
+        // Nothing in quinn's or wtransport's API hands back the CID the server
+        // issued, so the wire is read directly: a UDP relay between client and
+        // server keeps the first packet the server sends, whose long-header
+        // Source Connection ID is exactly the CID under test.
+        let (relay_port, first_server_packet) = spawn_capturing_relay(port).await;
+
+        let client_cfg = crate::client::insecure_loopback_client_config().expect("client cfg");
+        let endpoint = wtransport::Endpoint::client(client_cfg).expect("client endpoint");
+        let _conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.connect(format!("https://127.0.0.1:{relay_port}/")),
+        )
+        .await
+        .expect("handshake must not hang on CID generation")
+        .expect("connect");
+        let accepted = tokio::time::timeout(Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("accept timeout")
+            .expect("session event");
+        assert!(
+            matches!(accepted, crate::SessionEvent::Accepted(_)),
+            "the WebTransport session must establish over QUIC-LB CIDs"
+        );
+
+        let packet = first_server_packet
+            .lock()
+            .expect("relay capture")
+            .clone()
+            .expect("the server must have sent at least one packet");
+        let cid = long_header_source_cid(&packet).expect("server's first packet is a long header");
+        assert_eq!(
+            cid.len(),
+            11,
+            "1 first octet + 2 server-ID octets + 8 nonce octets, got {cid:02x?}"
+        );
+        assert_eq!(crate::quic_lb::decode_config_rotation(&cid), Some(2));
+        assert_eq!(
+            crate::quic_lb::decode_server_id(&cid, server_id.len()),
+            Some(server_id.as_slice()),
+            "a balancer must read this instance's server ID out of the CID"
+        );
+    }
+
+    /// Forwards UDP between one client and `server_port`, keeping a copy of the
+    /// first datagram the server sends. Returns the port clients should use and
+    /// the capture slot.
+    #[cfg(test)]
+    async fn spawn_capturing_relay(
+        server_port: u16,
+    ) -> (u16, Arc<std::sync::Mutex<Option<Vec<u8>>>>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("relay bind");
+        let relay_port = socket.local_addr().expect("relay addr").port();
+        let server_addr: std::net::SocketAddr = format!("127.0.0.1:{server_port}")
+            .parse()
+            .expect("server addr");
+        let captured = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let sink = Arc::clone(&captured);
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let mut client_addr: Option<std::net::SocketAddr> = None;
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                if from == server_addr {
+                    {
+                        let mut slot = sink.lock().expect("relay capture");
+                        if slot.is_none() {
+                            *slot = Some(buf[..n].to_vec());
+                        }
+                    }
+                    if let Some(client) = client_addr {
+                        let _ = socket.send_to(&buf[..n], client).await;
+                    }
+                } else {
+                    client_addr = Some(from);
+                    let _ = socket.send_to(&buf[..n], server_addr).await;
+                }
+            }
+        });
+
+        (relay_port, captured)
+    }
+
+    /// Reads the Source Connection ID out of a QUIC long-header packet
+    /// (RFC 9000 §17.2): header byte, 4-octet version, then each CID prefixed
+    /// by its own length octet.
+    #[cfg(test)]
+    fn long_header_source_cid(packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.first()? & 0x80 == 0 {
+            return None;
+        }
+        let dcid_len = *packet.get(5)? as usize;
+        let scid_len_at = 6 + dcid_len;
+        let scid_len = *packet.get(scid_len_at)? as usize;
+        packet
+            .get(scid_len_at + 1..scid_len_at + 1 + scid_len)
+            .map(<[u8]>::to_vec)
+    }
+
     #[cfg(unix)]
     #[test]
     fn second_instance_without_reuse_port_still_reports_addr_in_use() {
@@ -446,7 +593,10 @@ mod tests {
             false,
             false,
             0,
-            BindOptions { reuse_port: true },
+            BindOptions {
+                reuse_port: true,
+                ..Default::default()
+            },
             1,
         )
         .expect("reusePort server should start");

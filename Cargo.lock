@@ -727,6 +727,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "once_cell",
+ "quinn-proto",
  "rustls",
  "rustls-native-certs",
  "serde",

@@ -29,6 +29,11 @@ base64 = "0.22"
 # feature gates set_reuse_port; the version matches what wtransport already
 # locks so there is one socket2 in the tree.
 socket2 = { version = "0.6.5", features = ["all"] }
+# QUIC-LB connection IDs implement quinn's `ConnectionIdGenerator`, whose error
+# type `InvalidCid` quinn does not re-export. Pinned to the exact version quinn
+# 0.11 locks: a second quinn-proto in the tree would make the trait we implement
+# a different trait than `EndpointConfig::cid_generator` accepts.
+quinn-proto = { version = "=0.11.16", default-features = false }
 idna = "1"
 x509-parser = "0.18.1"
 # Global allocator for this dylib's Rust allocations. The macOS system malloc

@@ -93,6 +93,7 @@ pub mod metrics;
 pub mod native_memory;
 pub mod panic_guard;
 pub mod payload_buffer;
+pub mod quic_lb;
 pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
@@ -783,7 +784,18 @@ pub(crate) fn spawn_wtransport_server(
             // is no blocked-streams option to thread.
             let config_builder =
                 config_builder.qpack_max_table_capacity(qpack_max_table_capacity);
-            let config = config_builder.build();
+            let mut config = config_builder.build();
+            // QUIC-LB connection IDs (draft-ietf-quic-load-balancers-21, keyless
+            // configuration — see `quic_lb.rs`). The generator lives on the
+            // endpoint config, which the builder does not expose, so it goes on
+            // the built config through the fork's escape hatch before
+            // `Endpoint::server` consumes it. quinn wants a factory, not an
+            // instance, because it may build a generator per endpoint.
+            if let Some(quic_lb) = bind.quic_lb.clone() {
+                config
+                    .quic_endpoint_config_mut()
+                    .cid_generator(quic_lb::QuicLbCidGenerator::factory(quic_lb));
+            }
             let server = match Endpoint::server(config) {
                 Ok(s) => match s.local_addr() {
                     Ok(addr) => {
