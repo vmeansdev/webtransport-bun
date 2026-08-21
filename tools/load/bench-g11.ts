@@ -61,6 +61,7 @@ import {
 	type StreamEnd,
 	type TunnelCellFacts,
 } from "./g11-classify.ts";
+import { DeframePool, deframeWorkerPlan } from "./g11-deframe.ts";
 import {
 	createWallClockWithSource,
 	Deframer,
@@ -147,6 +148,21 @@ if (!Number.isInteger(SHARD_SESSIONS) || SHARD_SESSIONS < 1) {
 		`g11: G11_SHARD_SESSIONS must be a positive integer, got '${process.env.G11_SHARD_SESSIONS}'`,
 	);
 }
+
+/**
+ * Arm T's off-main-thread upstream deframing (issue 10's ruled fix). At T-100
+ * the conductor's one JS thread ran 100 pacers AND 100 deframers, pegged at
+ * 93–95% of a core, and offered 0.40 of the downstream target; the write side
+ * cannot leave the thread (env-bound N-API handles — see `g11-deframe.ts`'s
+ * header for the file:line evidence), so the deframe side does. `"auto"`
+ * keeps every cell at or below `G11_SHARD_SESSIONS` sessions byte-identical
+ * to the inline path (T-50 and below were already exact) and sizes workers as
+ * ceil(sessions / G11_SHARD_SESSIONS) above it; an explicit integer overrides.
+ * Scoped to arm T: arms D and J are at or below the threshold by
+ * registration, and arm D's withhold logic needs inline frame counts.
+ */
+const DEFRAME_WORKERS_ENV = process.env.G11_DEFRAME_WORKERS ?? "auto";
+deframeWorkerPlan(1, DEFRAME_WORKERS_ENV, 1); // Validate at startup, not mid-run.
 
 const SETTLE_POLL_MS = 250;
 const SETTLE_QUIET_POLLS = 4;
@@ -350,6 +366,13 @@ type ServerRecord = {
 	readCrossings: number;
 	upBytes: number;
 	upFrames: number;
+	/**
+	 * Frames the deframe workers have reported so far (live progress, folded
+	 * into `upFrames` at the pool's final merge and zeroed then). Exists so the
+	 * settle barrier still sees upstream activity while the deframe products
+	 * live off-thread.
+	 */
+	workerUpFrames: number;
 	perSessionUpBytes: Map<number, number>;
 	downBytes: number;
 	downFrames: number;
@@ -389,6 +412,7 @@ function newRecord(): ServerRecord {
 		readCrossings: 0,
 		upBytes: 0,
 		upFrames: 0,
+		workerUpFrames: 0,
 		perSessionUpBytes: new Map(),
 		downBytes: 0,
 		downFrames: 0,
@@ -454,6 +478,7 @@ function foldSessionCounters(
 function recordTotal(r: ServerRecord): number {
 	return (
 		r.upFrames +
+		r.workerUpFrames +
 		r.downFrames +
 		r.streamsFinBothHalves +
 		r.completedExchangeStreams +
@@ -544,6 +569,7 @@ function driveTunnelStream(
 	cell: CellSpec,
 	record: ServerRecord,
 	wallNs: () => bigint,
+	deframe: DeframePool | null,
 ): void {
 	const slowHere = cell.arm === "D" && cell.end === "server-accepted";
 	const targetBytes = backlogTargetBytes(cell.backlogFraction ?? 0);
@@ -556,7 +582,12 @@ function driveTunnelStream(
 	let sawEof = false;
 	const reader = (async () => {
 		const r = stream.readable.getReader();
-		const deframer = new Deframer();
+		// The off-thread path hands the chunk (with its main-thread arrival
+		// stamp) to the pool and keeps nothing else here; the inline path is the
+		// pre-worker code, byte for byte. Arm D's withhold logic needs inline
+		// frame counts, so the pool is only ever passed for arm T (withholdMs 0).
+		const streamKey = deframe ? deframe.openStream() : 0;
+		const deframer = deframe ? null : new Deframer();
 		let sinceWithhold = 0;
 		if (withholdMs > 0) await Bun.sleep(withholdMs);
 		for (;;) {
@@ -569,7 +600,11 @@ function driveTunnelStream(
 			const arrival = wallNs();
 			record.readCrossings += 1;
 			record.upBytes += value.byteLength;
-			const frames = deframer.push(value);
+			if (deframe) {
+				deframe.push(streamKey, arrival, value);
+				continue;
+			}
+			const frames = (deframer as Deframer).push(value);
 			for (const frame of frames) {
 				record.upFrames += 1;
 				record.upLatency.recordNs(arrival - frame.sendWallNs);
@@ -745,6 +780,9 @@ type StepEnvelope = {
 	exitCode: number | null;
 	/** How many generator processes drove this cell's client fleet. */
 	shardCount: number;
+	/** Arm T's off-thread upstream deframing: worker count, and whether it failed. */
+	deframeWorkers: number;
+	deframeWorkersFailed: boolean;
 	hostCpuMedianPct: number | null;
 	clientCpuPct: number | null;
 	serverCpuPct: number | null;
@@ -903,6 +941,23 @@ async function runStep(
 	const liveSessions = new Set<ServerSession>();
 	let sessionIndex = 0;
 
+	const deframeWorkerCount =
+		cell.arm === "T"
+			? deframeWorkerPlan(cell.sessions, DEFRAME_WORKERS_ENV, SHARD_SESSIONS)
+			: 0;
+	const deframePool =
+		deframeWorkerCount > 0
+			? new DeframePool(deframeWorkerCount, {
+					onProgress: (frames) => {
+						record.workerUpFrames += frames;
+					},
+					onFailure: (reason) =>
+						console.error(
+							`g11: ${cell.name}#${repeat} deframe worker failed: ${reason}`,
+						),
+				})
+			: null;
+
 	// §3, verbatim. maxStreamsPerSessionBidi stays at the shipped 200 because
 	// V-X2 is about that exact number; the governors stay shipped because the
 	// gate is about the shipped governors.
@@ -940,7 +995,15 @@ async function runStep(
 					record.streamsAccepted += 1;
 					if (cell.arm === "X")
 						driveExchangeStream(next.value, record, wallNs, live);
-					else driveTunnelStream(next.value, myIndex, cell, record, wallNs);
+					else
+						driveTunnelStream(
+							next.value,
+							myIndex,
+							cell,
+							record,
+							wallNs,
+							deframePool,
+						);
 				}
 			})().catch(() => {
 				// A session going away closes its accept loop; that is not an error
@@ -1016,7 +1079,7 @@ async function runStep(
 			foldSessionCounters(record, liveSessions);
 			appendFileSync(
 				OUT_CSV,
-				`${cell.name},${repeat},${Date.now()},${host?.toFixed(1) ?? ""},${record.upFrames},${record.downFrames},${record.peakSessionQueuedBytes}\n`,
+				`${cell.name},${repeat},${Date.now()},${host?.toFixed(1) ?? ""},${record.upFrames + record.workerUpFrames},${record.downFrames},${record.peakSessionQueuedBytes}\n`,
 			);
 		},
 		onBreach: (phase) =>
@@ -1043,6 +1106,36 @@ async function runStep(
 		: await Promise.all(shardStderr);
 	const childDriveSec = (Date.now() - startedAt) / 1000;
 	const settle = await settleRecord(record);
+
+	// The pool's final merge, after the settle barrier (its progress counter is
+	// what settle watched). All-or-nothing, the shard rule: a failed pool leaves
+	// the whole up-side deframe product absent — upFrames 0 against a non-zero
+	// upBytes, which no clause can read as a healthy cell — rather than a
+	// smaller population that grades.
+	let deframeWorkersFailed = false;
+	if (deframePool) {
+		const snap = await deframePool.finish();
+		deframePool.terminate();
+		if (snap === null) {
+			deframeWorkersFailed = true;
+			record.workerUpFrames = 0;
+			console.error(
+				`g11: ${cell.name}#${repeat} deframe pool failed (${deframePool.failure}) — the cell's upstream deframe products are dropped and the cell cannot grade`,
+			);
+		} else {
+			record.upFrames += snap.upFrames;
+			record.upLatency.merge(snap.latency);
+			for (const [session, bytes] of snap.perSessionUpBytes)
+				record.perSessionUpBytes.set(
+					session,
+					(record.perSessionUpBytes.get(session) ?? 0) + bytes,
+				);
+			// A worker-side deframe fault counts where the inline reader's catch
+			// counted it.
+			record.streamErrors += snap.deframeErrors;
+			record.workerUpFrames = 0;
+		}
+	}
 	const cpu1 = process.cpuUsage(cpu0);
 	const serverCpuPct =
 		childDriveSec > 0
@@ -1126,6 +1219,8 @@ async function runStep(
 		deadlineMs,
 		exitCode,
 		shardCount: shards.length,
+		deframeWorkers: deframeWorkerCount,
+		deframeWorkersFailed,
 		hostCpuMedianPct: median(hostSamples),
 		clientCpuPct: clientCpuSumPct,
 		serverCpuPct,
@@ -1515,6 +1610,13 @@ async function main(): Promise<void> {
 			// process's, and a reader comparing against a pre-shard run must be
 			// able to see which one they hold.
 			entry.generatorShards = env.shardCount;
+			// Arm T's off-thread deframing (additive stamp): how many workers took
+			// the upstream bookkeeping off the conductor's thread, and whether the
+			// pool failed. 0/false is the inline path every pre-worker run drove.
+			entry.deframeWorkers = {
+				count: env.deframeWorkers,
+				failed: env.deframeWorkersFailed,
+			};
 			entry.hostLoad = {
 				start: env.hostLoadStart,
 				end: env.hostLoadEnd,
@@ -1571,6 +1673,9 @@ async function main(): Promise<void> {
 			// Arm T's generator sharding: sessions per process; the per-cell
 			// process count is stamped on each cell as `generatorShards`.
 			shardSessionsPerProcess: SHARD_SESSIONS,
+			// Arm T's deframe-worker knob, verbatim; per-cell counts ride on each
+			// cell as `deframeWorkers`.
+			deframeWorkersEnv: DEFRAME_WORKERS_ENV,
 			// The deadline's child-tail terms travel with the artifact: a breach is
 			// only readable against the phases the deadline was built from.
 			childTailFixedMs: CHILD_TAIL_FIXED_MS,
