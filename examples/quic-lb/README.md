@@ -11,6 +11,12 @@ bare-metal box (Linux 7.0.0-30-generic, libbpf-dev installed),
 diagnostics, a 15,984-byte object. That establishes that it parses and
 type-checks against that kernel's headers, and nothing else.
 
+**That compile predates the current source.** It was run against the revision
+before the review fixes now in the file (the short-header fixed-bit test
+removed, Initial/0-RTT routed by DCID, `steer_stats` moved to a per-CPU array).
+The re-compile on the box is owed and has not been run; until it is, treat the
+clean-compile result as belonging to the earlier revision.
+
 **The program has never been submitted to a verifier, never attached to a
 socket, and never carried a packet.** Verifier acceptance and runtime behavior
 are yours to establish on the kernel you target. The loader below has never
@@ -48,6 +54,21 @@ Per packet:
    in a hash map to get a sockarray slot, and select that socket.
 4. Anything unparseable, unroutable, or unknown falls back (see below).
 
+Two header checks are deliberately *absent*, and both matter:
+
+- **The fixed bit is never tested.** RFC 9000 §17.3 requires bit `0x40` set on a
+  short header, but RFC 9287 (Greasing the QUIC Bit) lets an endpoint clear it
+  at random once its peer has offered the `grease_quic_bit` transport
+  parameter — and quinn turns that on by default (`grease_quic_bit: true`,
+  quinn-proto 0.11.16 `config/mod.rs:63`), which this repository does not
+  override. A program that demands the bit sends roughly half of a greasing
+  client's 1-RTT packets to the 4-tuple hash. What rejects foreign traffic
+  instead is the config-rotation codepoint plus the map lookup.
+- **Long-header packet type is not used to reject Initial or 0-RTT.** Only the
+  packet type `Retry` is dropped out (server-to-client). Everything else is
+  routed by its DCID, because most Initials carry a server-issued one — see the
+  fallback section.
+
 ## The configuration must match the server
 
 The single most important fact about the QUIC-LB wire format:
@@ -72,6 +93,12 @@ packet — which presents as a flaky network rather than as a misconfiguration.
 The `steer_stats` counters exist for exactly this: a fallback count that keeps
 climbing after handshakes settle means the layouts disagree or a slot is empty.
 
+`steer_stats` is a **per-CPU** array, so the increment on the packet path costs
+no atomic and no shared cache line — but the reader pays for that: `bpftool map
+dump` prints one value per CPU for each key and **the counter is their sum**.
+Whatever scrapes it must add the CPUs up; reading the first element reports one
+core's share and will look like the fallback rate is a fraction of what it is.
+
 This is the same layout the two pinned implementations carry in full, both
 against **draft-ietf-quic-load-balancers-21**:
 `crates/native/src/quic_lb.rs` and `packages/webtransport/src/quic-lb.ts`.
@@ -81,11 +108,24 @@ against **draft-ietf-quic-load-balancers-21**:
 Every early return is `SK_PASS` **without** selecting a socket, which leaves the
 kernel to apply its own 4-tuple hash. That covers:
 
-- **the first flight** — a client's Initial carries a destination CID the
-  *client* chose at random (RFC 9000 §7.2); the server has issued nothing yet,
-  so no CID-based scheme can route it. This window lasts until the client
-  adopts a server-issued connection ID. It is short, and it is not zero: a
-  rebind inside it still breaks the connection.
+- **the opening flight, and only that** — the client's *first* Initial carries a
+  destination CID the *client* invented (RFC 9000 §7.2); the server has issued
+  nothing yet, so no CID-based scheme can route it, and the random CID fails
+  the length, rotation, or map check and lands here. **The window closes as
+  soon as the client sees the server's Initial or Retry**: from that point
+  §7.2 requires it to use the server's Source Connection ID as the destination
+  "for subsequent packets, including any 0-RTT packets", so retransmitted
+  Initials, the Initial that acknowledges the server's flight, and post-Initial
+  0-RTT all carry our server ID and are steered normally. The unsteerable
+  window is therefore one client flight, not the whole handshake — short, and
+  not zero: a rebind inside it still breaks the connection.
+
+  One residual risk comes with routing Initials rather than excluding them: a
+  client-chosen random CID that is exactly `CID_LEN` octets, whose top three
+  bits happen to equal `CONFIG_ROTATION`, and whose next `SERVER_ID_LEN` octets
+  happen to hit in the map, gets steered. It is bounded — an opening Initial
+  belongs to no instance yet, so any member may answer it; the worst case is a
+  first flight split across two instances, which the client retransmits out of.
 - **Version Negotiation and Retry** — server-to-client packets that should
   never arrive on an ingress port, and carry nothing of ours to steer by.
 - **non-v1 versions** — a header shape this parser was not told how to read.
@@ -124,12 +164,23 @@ None of this has been measured on any kernel by this project.
 
 ## Requirements
 
-- Linux with `SK_REUSEPORT` and `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY` (4.19+ in
-  principle; **written against 7.0.0-30-generic** as the reference target and
-  verified against no kernel at all).
+- Linux **5.2 or newer**, with `SK_REUSEPORT` and
+  `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY`. Those two features landed in 4.19, but
+  this program declares its maps in libbpf's BTF style (`__uint`/`__type`),
+  which needs the BTF-defined map support added in 5.2 — on 4.19 the object
+  will not load without rewriting the map definitions in the old
+  `struct bpf_map_def` form. **Written against 7.0.0-30-generic** as the
+  reference target and verified against no kernel at all.
 - clang/LLVM 18+ for the BPF target, `bpftool`, and `libbpf` headers.
 - `CAP_BPF` + `CAP_NET_ADMIN` (or root) to load and attach.
-- Kernel BTF (`/sys/kernel/btf/vmlinux`) for a CO-RE build.
+
+**This is not a CO-RE build.** The program includes the kernel uapi headers
+directly — there is no generated `vmlinux.h`, no `BPF_CORE_READ`, and the
+`clang -target bpf -O2 -g -c` line in `attach.sh.example` has no BTF-relocation
+step. The object is bound to the ABI of the headers it was built against, so
+build it on (or against the headers of) the kernel that will load it. Porting
+it to CO-RE — `vmlinux.h`, `bpf_core_read.h`, and field reads through
+`BPF_CORE_READ` — is a reasonable upgrade path and has not been done here.
 
 ## The gap between this and a working deployment
 
