@@ -91,8 +91,10 @@ and this document does not publish one. What the data does support:
 
 **An instance is not a thread.** Under G11's bidirectional load the measured
 process — server **plus** the co-resident conductor — sat at **~317% of one
-core** (JS thread 93–95%, addon threads ~61%, tokio workers ~9%; ticket 10's
-per-thread sampler, `evidence/g11/g11-inv-t100.threads.tsv`). The conductor's
+core**, of which the single Bun JS thread was **93–95%** (ticket 10's
+per-thread sampler, `evidence/g11/g11-inv-t100.threads.tsv`; the ticket's
+companion figures, addon threads ~61% and tokio workers ~9%, are *per thread*
+and not a partition of the total — see the instrument chapter). The conductor's
 JS thread is known to be the *dominant* single consumer in that sample and it
 is harness code. The honest reading is therefore: **a loaded instance is a
 multi-thread process costing well over one core and probably under three**, and
@@ -785,10 +787,17 @@ deltas):
 
 | thread class | share of one core |
 |---|---|
-| **Bun JS thread** | **93–95%** |
-| addon threads | ~61% |
-| tokio workers | ~9% |
+| **Bun JS thread** (1 thread) | **93–95%** |
+| addon `wt-server` threads (2) | ~61% **each** |
+| tokio workers (8) | ~9% **each** |
 | **process total** | **~317%** |
+
+**The first three rows are per-thread readings and do not sum to the fourth** —
+ticket 10 states them as the ticket does, and the arithmetic only closes once
+each class is multiplied by its thread count (and the JIT and heap-helper
+threads, a few percent between them, are added). Recomputing the whole sampler
+window from the raw `.tsv` gives ~301% averaged across the drive, against the
+~317% the ticket reports at steady state.
 
 **The dominant single consumer in that sample is harness code**, and the
 campaign never separated the conductor's share from the server's in a
