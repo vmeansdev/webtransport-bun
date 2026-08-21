@@ -178,9 +178,48 @@ const ESTABLISH_TIMEOUT_S = Number.parseInt(
  * fleet size is wrong, the host is wrong, and there is no cable.
  */
 const SMOKE = process.env.G10_SMOKE === "1";
+
+/**
+ * Characterization mode: a fleet other than the registered 10,000.
+ *
+ * §1.1 fixes the subscriber count, so a run at another fleet size is not a G10
+ * cell and must never be readable as one. Day-2's 5,000-session cells were
+ * produced by editing the constant on a detached tree, which left artifacts
+ * that say `gate: "G10"` at a fleet the registration does not have and no
+ * mechanical way to tell them apart.
+ *
+ * So the override exists, but only behind `G10_SWEEP=1` — an explicit "this is
+ * characterization" — and it stamps `gate: "G10-characterization"` plus a
+ * disclaimer. That also keeps the campaign's no-edits-to-gate-trees rule
+ * (plan-run1 v3 C3) intact: a sweep changes environment, never code.
+ */
+const SWEEP = process.env.G10_SWEEP === "1";
+const FLEET_OVERRIDE = parseFleetOverride(process.env.G10_FLEET, SWEEP);
 const FLEET = SMOKE
 	? Number.parseInt(process.env.G10_SMOKE_FLEET ?? "40", 10)
-	: SUBSCRIBERS;
+	: (FLEET_OVERRIDE ?? SUBSCRIBERS);
+
+function parseFleetOverride(
+	raw: string | undefined,
+	sweep: boolean,
+): number | null {
+	const value = (raw ?? "").trim();
+	if (value === "") return null;
+	if (!sweep) {
+		throw new Error(
+			`bench-g10: G10_FLEET=${value} overrides the registered subscriber ` +
+				`count (${SUBSCRIBERS}, prereg §1.1), which makes this run a ` +
+				"characterization cell rather than a G10 cell. Set G10_SWEEP=1 to say " +
+				"so — the artifact is then stamped as characterization and cannot be " +
+				"mistaken for a gate result.",
+		);
+	}
+	const parsed = Number.parseInt(value, 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) {
+		throw new Error(`bench-g10: G10_FLEET=${value} is not a positive integer`);
+	}
+	return parsed;
+}
 
 /**
  * Smoke affordances, both of which exist to exercise a path the composition
@@ -858,15 +897,22 @@ async function main(): Promise<void> {
 	}
 
 	const artifact = {
-		gate: "G10",
+		gate: SWEEP ? "G10-characterization" : "G10",
 		registration: "docs/research/preregistrations/gate-g10-broadcast.md",
 		smoke: SMOKE,
+		sweep: SWEEP,
+		fleetOverride:
+			FLEET_OVERRIDE === null
+				? null
+				: { requested: FLEET_OVERRIDE, registered: SUBSCRIBERS },
 		offbox: OFFBOX_SSH !== "",
 		disclaimer: SMOKE
 			? "SMOKE RUN on the harness author's box: not a result, not a rung, not a verdict (prereg §10)"
-			: OFFBOX_SSH === ""
-				? "co-resident subscribers: a wiring check, never a G10 result (prereg §11a)"
-				: null,
+			: SWEEP
+				? `characterization cell at fleet ${FLEET} (registered fleet is ${SUBSCRIBERS}, prereg §1.1): not a G10 rung and not a G10 verdict`
+				: OFFBOX_SSH === ""
+					? "co-resident subscribers: a wiring check, never a G10 result (prereg §11a)"
+					: null,
 		host: { platform: process.platform, cores: navigator.hardwareConcurrency },
 		candidate: CANDIDATE,
 		// Ticket 29's provenance: the Mac builds its own binary, so which tree the
