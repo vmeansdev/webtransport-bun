@@ -121,7 +121,14 @@ type CellOptions = {
 	contaminate?: boolean;
 	noTaps?: boolean;
 	loopbackBytes?: number;
+	/** O5 — what the Mac reported about the tree it built its generator from. */
+	generatorHead?: string;
+	generatorDirty?: boolean;
+	generatorWatchdog?: boolean;
 };
+
+/** Stands in for the candidate SHA the dispatch is stamped against. */
+const FIXTURE_CANDIDATE = "0fbe9cb0000000000000000000000000000000ab";
 
 function fragment(options: CellOptions): RttFragment {
 	const placement = options.placement ?? "offbox";
@@ -180,8 +187,31 @@ function fragment(options: CellOptions): RttFragment {
 				sessionsOk: 100,
 				generator: {
 					mode: placement,
-					ssh: placement === "offbox" ? "hermes-admin@192.168.2.36" : null,
-					urlHost: placement === "offbox" ? "192.168.2.35" : "127.0.0.1",
+					ssh: placement === "offbox" ? "vmeansdev@10.99.0.1" : null,
+					urlHost: placement === "offbox" ? "10.99.0.2" : "127.0.0.1",
+					macgen:
+						placement === "offbox"
+							? {
+									bin: "load-client",
+									entry: "tools/offbox/mac-generator-entry.sh",
+									candidateAsked: FIXTURE_CANDIDATE,
+									deadlineSec: 113,
+									provenance: {
+										host: "Nikitas-MacBook-Pro",
+										arch: "arm64",
+										os: "Darwin/25.4.0",
+										candidate: FIXTURE_CANDIDATE,
+										head: options.generatorHead ?? FIXTURE_CANDIDATE,
+										dirty: options.generatorDirty ?? false,
+										binarySha256: "a".repeat(64),
+										rustc: "1.85.0",
+										buildSeconds: 41,
+										watchdogFired: options.generatorWatchdog ?? false,
+										exitCode: 0,
+									},
+									problems: [],
+								}
+							: null,
 				},
 				netRxDelta: options.noTaps
 					? null
@@ -297,6 +327,67 @@ describe("off-box integrity", () => {
 		const step = frag.steps?.[0];
 		if (step?.generator) step.generator.urlHost = "100.68.152.116";
 		expect(toCell(frag, opts)?.integrityFailures).toContain("O2");
+	});
+
+	test("the retired loadgen's own LAN address now fails O2", () => {
+		// 192.168.2.x was the VM era's *required* address family. On the cable it
+		// is the family Wi-Fi LAN, which is exactly what O2 exists to rule out.
+		const frag = fragment({ index: 3, rung: "G-off", replicate: 1 });
+		const step = frag.steps?.[0];
+		if (step?.generator) step.generator.urlHost = "192.168.2.35";
+		expect(toCell(frag, opts)?.integrityFailures).toContain("O2");
+	});
+
+	test("a generator that checked out a different tree fails O5", () => {
+		const frag = fragment({
+			index: 3,
+			rung: "G-off",
+			replicate: 1,
+			generatorHead: "b".repeat(40),
+		});
+		expect(toCell(frag, opts)?.integrityFailures).toContain("O5");
+	});
+
+	test("a generator built from a dirty clone fails O5", () => {
+		const frag = fragment({
+			index: 3,
+			rung: "G-off",
+			replicate: 1,
+			generatorDirty: true,
+		});
+		expect(toCell(frag, opts)?.integrityFailures).toContain("O5");
+	});
+
+	test("a watchdog kill fails O5 rather than reporting a short cell", () => {
+		const frag = fragment({
+			index: 3,
+			rung: "G-off",
+			replicate: 1,
+			generatorWatchdog: true,
+		});
+		expect(toCell(frag, opts)?.integrityFailures).toContain("O5");
+	});
+
+	test("an off-box cell with no macgen provenance at all fails O5", () => {
+		// A fragment from the retired scp-and-run path parses fine and says
+		// nothing about which tree generated its load.
+		const frag = fragment({ index: 3, rung: "G-off", replicate: 1 });
+		const step = frag.steps?.[0];
+		if (step?.generator) step.generator.macgen = null;
+		expect(toCell(frag, opts)?.integrityFailures).toContain("O5");
+	});
+
+	test("O5 does not apply to the on-box control arm", () => {
+		const cell = toCell(
+			fragment({
+				index: 4,
+				rung: "G-on",
+				replicate: 1,
+				placement: "onbox",
+			}),
+			opts,
+		);
+		expect(cell?.integrityFailures).not.toContain("O5");
 	});
 
 	test("missing kernel taps are a failure, not a pass", () => {

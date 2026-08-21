@@ -158,28 +158,34 @@ jobs:
       # quantity becomes a round trip measured on one clock in one process.
       # Cells, order, floor arms on the loadgen, off-box integrity marks,
       # censoring correction and the verdict algebra are pre-registered in
-      # docs/research/preregistrations/gate-g2-offbox-rtt.md. The conductor
-      # refuses rather than falling back to loopback.
+      # docs/research/preregistrations/gate-g2-offbox-rtt.md, with the bare-metal
+      # re-derivation in .scratch/bare-metal-campaign/registrations/g2-games.md.
+      # The conductor refuses rather than falling back to loopback.
       - name: Run off-box RTT dispatch
         if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.latency_rtt == 'true' }}
         env:
           LATENCY_RTT_SESSIONS: ${{ github.event.inputs.sessions }}
           LATENCY_RTT_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
-          # Fixed lab addresses, not dispatch inputs: a whitespace-only input is
+          # Fixed cable addresses, not dispatch inputs: a whitespace-only input is
           # silently replaced by GitHub with its declared default, and this pair
-          # decides whether the run is off-box at all. The conductor refuses on
-          # anything outside 192.168.2.0/24 regardless.
-          LATENCY_RTT_OFFBOX_SSH: hermes-admin@192.168.2.36
-          LATENCY_RTT_OFFBOX_URL_HOST: 192.168.2.35
+          # decides whether the run is off-box at all. The generator is the Mac at
+          # the far end of the direct cable; the conductor refuses anything
+          # outside 10.99.0.0/24, and names 192.168.2.x — the retired loadgen VM's
+          # address family, now the family Wi-Fi LAN — in its refusal.
+          LATENCY_RTT_OFFBOX_SSH: vmeansdev@10.99.0.1
+          LATENCY_RTT_OFFBOX_URL_HOST: 10.99.0.2
         run: |
           set -euo pipefail
           OUTDIR="$GITHUB_WORKSPACE/.bench-evidence"
           mkdir -p "$OUTDIR"
           SHA="${{ github.event.inputs.candidate_commit }}"
-          # Route disclosure: the data path must be the LAN interface, never
-          # tailscale0. Recorded in the log so the artifact can be read against it.
+          # Route disclosure: the data path must be eno1, never tailscale0 and
+          # never wlp1s0. Recorded in the log so the artifact can be read against it.
           ip route get "${LATENCY_RTT_OFFBOX_SSH##*@}" || true
+          # The Mac builds its own generator, so the candidate is passed
+          # explicitly rather than inferred from the checkout.
           LATENCY_RTT_OUT_DIR="$OUTDIR" LATENCY_RTT_TAG="$SHA" \
+            LATENCY_RTT_OFFBOX_CANDIDATE="$SHA" \
             bun tools/load/latency-rtt-conduct.ts
           bun tools/load/latency-rtt-classify.ts \
             "$OUTDIR/bench-latency-rtt-$SHA-classified.json" \

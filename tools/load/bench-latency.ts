@@ -29,6 +29,17 @@ import { join } from "node:path";
 import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
+import {
+	type GeneratorProvenance,
+	parseGeneratorReport,
+} from "../offbox/generator-report.ts";
+import {
+	assertCableHost,
+	assertCandidate,
+	G2_MACGEN_BIN,
+	MACGEN_ENTRY,
+	macgenInvocation,
+} from "./g2-offbox.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	LatencyHistogram,
@@ -76,25 +87,42 @@ const SKIP_BUILD = process.env.LATENCY_SKIP_BUILD === "1";
 
 /**
  * Off-box generation. When `LATENCY_OFFBOX_SSH` is set the load client runs on
- * another machine and dials this server over the LAN, which is the whole point
- * of the G2 conversion: the generator stops competing with the server for the
- * same four vCPU.
+ * the Mac at the far end of the cable and dials this server over it, which is
+ * the whole point of the G2 conversion: the generator stops competing with the
+ * server for the same cores.
  *
- * The price is that the two ends no longer share `CLOCK_MONOTONIC`, so every
- * cross-host interval this harness normally reports becomes an arbitrary
- * constant plus a latency. Rather than record those and rely on a reader not to
- * quote them, off-box mode does not record them at all — see `OFFBOX` below and
- * `docs/research/preregistrations/gate-g2-offbox-rtt.md` §6, whose classifier
- * asserts the histograms are empty.
+ * The generator is reached through `tools/offbox/mac-generator-entry.sh`, which
+ * builds `load-client` **on the Mac at the candidate SHA** and reports what it
+ * built. Nothing is copied to the generator and no remote binary path is named:
+ * the retired VM harness scp'd a Linux binary to `/tmp/load-client`, and a path
+ * like that survives its run — the next dispatch finds a stale binary from a
+ * tree no SHA describes and produces a fine-looking number from it. See
+ * `g2-offbox.ts`.
+ *
+ * The price of moving off-box is that the two ends no longer share
+ * `CLOCK_MONOTONIC`, so every cross-host interval this harness normally reports
+ * becomes an arbitrary constant plus a latency. Rather than record those and
+ * rely on a reader not to quote them, off-box mode does not record them at all —
+ * see `OFFBOX` below and the registration, whose classifier asserts the
+ * histograms are empty.
  */
 const OFFBOX_SSH = (process.env.LATENCY_OFFBOX_SSH ?? "").trim();
 const OFFBOX = OFFBOX_SSH.length > 0;
-/** This server's address as the off-box generator sees it. LAN, never 100.x. */
+/** This server's address as the generator sees it. The cable, 10.99.0.0/24. */
 const OFFBOX_URL_HOST = (process.env.LATENCY_OFFBOX_URL_HOST ?? "").trim();
-/** load-client path on the generator; the conductor provisions it. */
-const OFFBOX_BIN = (
-	process.env.LATENCY_OFFBOX_BIN ?? "/tmp/load-client"
-).trim();
+/** The tree the generator builds. 40 lowercase hex, from `git rev-parse`. */
+const OFFBOX_CANDIDATE = (process.env.LATENCY_OFFBOX_CANDIDATE ?? "").trim();
+/** Entry-script path on the Mac, relative to the ssh login's cwd. */
+const OFFBOX_ENTRY = (process.env.LATENCY_OFFBOX_ENTRY ?? MACGEN_ENTRY).trim();
+/**
+ * The remote watchdog, in seconds. macOS has no `timeout(1)`; the entry script
+ * carries the deadline and reports `exit=watchdog` so a deadline kill stays
+ * distinguishable from a load-client failure. The conductor registers the value.
+ */
+const OFFBOX_DEADLINE_SEC = parseInt(
+	process.env.LATENCY_OFFBOX_DEADLINE_SEC ?? "0",
+	10,
+);
 
 const HAS_PROC = process.platform === "linux";
 
@@ -271,6 +299,20 @@ export type LatencyStep = {
 		mode: "onbox" | "offbox";
 		ssh: string | null;
 		urlHost: string;
+		/**
+		 * What the Mac reported about the binary it built and ran. Absent on-box,
+		 * where the harness spawned the binary itself and already knows. Off-box
+		 * it is the only evidence that the generator was the candidate: the Mac
+		 * builds its own, so "which tree" is a claim that has to be carried.
+		 */
+		macgen?: {
+			bin: string;
+			entry: string;
+			candidateAsked: string;
+			deadlineSec: number;
+			provenance: GeneratorProvenance;
+			problems: string[];
+		} | null;
 	};
 	/** Per-interface receive deltas over the client-process window. */
 	netRxDelta?: NetCounters | null;
@@ -296,14 +338,15 @@ async function main(): Promise<void> {
 	if (OFFBOX) {
 		// Refusals, not warnings: an off-box arm that quietly falls back to
 		// loopback produces a good-looking number and a false claim.
-		if (!OFFBOX_URL_HOST) {
+		assertCableHost(OFFBOX_URL_HOST, "LATENCY_OFFBOX_URL_HOST");
+		// Mirrored from the entry script so a bad SHA is a sentence here rather
+		// than exit 3 inside an ssh channel.
+		assertCandidate(OFFBOX_CANDIDATE);
+		if (!Number.isFinite(OFFBOX_DEADLINE_SEC) || OFFBOX_DEADLINE_SEC <= 0) {
 			throw new Error(
-				"LATENCY_OFFBOX_SSH is set but LATENCY_OFFBOX_URL_HOST is not",
-			);
-		}
-		if (!/^192\.168\.2\./.test(OFFBOX_URL_HOST)) {
-			throw new Error(
-				`LATENCY_OFFBOX_URL_HOST must be a 192.168.2.x LAN address, got ${OFFBOX_URL_HOST} — the data path is never Tailscale`,
+				"LATENCY_OFFBOX_DEADLINE_SEC must be a positive number of seconds — " +
+					"macOS has no timeout(1), so the entry script's watchdog is the " +
+					"only deadline an off-box cell has",
 			);
 		}
 	}
@@ -418,7 +461,7 @@ async function main(): Promise<void> {
 	// createServer has no readiness promise; same 3s the other load tools use.
 	await Bun.sleep(3000);
 	console.log(
-		`bench-latency: server up port=${PORT} sessions=${SESSIONS} payload=${PAYLOAD_BYTES}B step=${STEP_SECONDS}s echo=${ECHO} generator=${OFFBOX ? `offbox(${OFFBOX_SSH} -> ${OFFBOX_URL_HOST})` : "onbox"} ladder=[${RATES.join(",")}]/s/session`,
+		`bench-latency: server up port=${PORT} sessions=${SESSIONS} payload=${PAYLOAD_BYTES}B step=${STEP_SECONDS}s echo=${ECHO} generator=${OFFBOX ? `macgen(${OFFBOX_SSH} bin=${G2_MACGEN_BIN} candidate=${OFFBOX_CANDIDATE.slice(0, 12)} -> ${OFFBOX_URL_HOST} deadline=${OFFBOX_DEADLINE_SEC}s)` : "onbox"} ladder=[${RATES.join(",")}]/s/session`,
 	);
 
 	const steps: LatencyStep[] = [];
@@ -454,8 +497,7 @@ async function main(): Promise<void> {
 			]);
 		}
 
-		const args = [
-			OFFBOX ? OFFBOX_BIN : CLIENT_BIN,
+		const clientArgs = [
 			"--url",
 			`https://${OFFBOX ? OFFBOX_URL_HOST : "127.0.0.1"}:${PORT}`,
 			"--mode",
@@ -485,18 +527,18 @@ async function main(): Promise<void> {
 			"1000000000",
 		];
 		// A dead ssh channel must not orphan a remote generator, so the remote
-		// process carries its own deadline: the step, the drain, and slack.
-		const argv = OFFBOX
-			? [
-					"ssh",
-					"-o",
-					"BatchMode=yes",
-					OFFBOX_SSH,
-					"timeout",
-					String(STEP_SECONDS + 30),
-					...args,
-				]
-			: args;
+		// process carries its own deadline — the entry script's watchdog, since
+		// macOS has no `timeout(1)` for the VM-era invocation to have used.
+		const invocation = macgenInvocation({
+			ssh: OFFBOX ? OFFBOX_SSH : "",
+			candidate: OFFBOX_CANDIDATE,
+			deadlineSeconds: OFFBOX_DEADLINE_SEC,
+			localBin: CLIENT_BIN,
+			clientArgs,
+			bin: G2_MACGEN_BIN,
+			entry: OFFBOX_ENTRY,
+		});
+		const argv = [invocation.cmd, ...invocation.args];
 		const child = Bun.spawn(argv, {
 			cwd: ROOT,
 			stdout: "pipe",
@@ -559,6 +601,16 @@ async function main(): Promise<void> {
 			return m?.[1] ? parseInt(m[1], 10) : 0;
 		};
 		const sessionsOk = num(/sessions ok=(\d+)/);
+		// Off-box, everything the on-box harness got for free — which binary,
+		// which tree, which host — arrives as text on a pipe or not at all.
+		const report = OFFBOX
+			? parseGeneratorReport(stdout, OFFBOX_CANDIDATE)
+			: null;
+		if (report && report.problems.length > 0) {
+			console.warn(
+				`bench-latency: step ${index + 1} generator problems: ${report.problems.join("; ")}`,
+			);
+		}
 		if (exitCode !== 0 && sessionsOk === 0) {
 			console.error(stderr.slice(-2000));
 			throw new Error(
@@ -638,6 +690,16 @@ async function main(): Promise<void> {
 				mode: OFFBOX ? "offbox" : "onbox",
 				ssh: OFFBOX ? OFFBOX_SSH : null,
 				urlHost: OFFBOX ? OFFBOX_URL_HOST : "127.0.0.1",
+				macgen: report
+					? {
+							bin: G2_MACGEN_BIN,
+							entry: OFFBOX_ENTRY,
+							candidateAsked: OFFBOX_CANDIDATE,
+							deadlineSec: OFFBOX_DEADLINE_SEC,
+							provenance: report.provenance,
+							problems: report.problems,
+						}
+					: null,
 			},
 			netRxDelta,
 			udpDelta: udpRxDelta,
@@ -693,6 +755,10 @@ async function main(): Promise<void> {
 			generatorMode: OFFBOX ? "offbox" : "onbox",
 			offboxSsh: OFFBOX ? OFFBOX_SSH : null,
 			offboxUrlHost: OFFBOX ? OFFBOX_URL_HOST : null,
+			offboxCandidate: OFFBOX ? OFFBOX_CANDIDATE : null,
+			offboxBin: OFFBOX ? G2_MACGEN_BIN : null,
+			offboxEntry: OFFBOX ? OFFBOX_ENTRY : null,
+			offboxDeadlineSec: OFFBOX ? OFFBOX_DEADLINE_SEC : null,
 			/**
 			 * False off-box: the two ends read different counters, so no
 			 * cross-host interval is recorded at all (registration §6).

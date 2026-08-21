@@ -23,6 +23,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { CABLE_HOST_RE } from "./g2-offbox.ts";
 import { medianInterval } from "./latency-ab-classify.ts";
 import { LatencyHistogram, quantizationNs } from "./latency-histogram.ts";
 import {
@@ -62,7 +63,7 @@ export const LAN_RX_MIN_SHARE = 0.5;
 export const LO_RX_MAX_SHARE = 0.1;
 
 export type HonestyFailure = "H1" | "H2" | "H3" | "H4" | "H5";
-export type IntegrityFailure = "O1" | "O2" | "O3" | "O4";
+export type IntegrityFailure = "O1" | "O2" | "O3" | "O4" | "O5";
 
 export type LossAttribution = "none" | "in-host" | "off-host";
 
@@ -129,7 +130,31 @@ export type RttFragment = {
 		hostCpuPctMedian: number | null;
 		serverCpuPct: number;
 		sessionsOk: number;
-		generator?: { mode: string; ssh: string | null; urlHost: string };
+		generator?: {
+			mode: string;
+			ssh: string | null;
+			urlHost: string;
+			macgen?: {
+				bin?: string;
+				entry?: string;
+				candidateAsked?: string;
+				deadlineSec?: number;
+				provenance?: {
+					host?: string | null;
+					arch?: string | null;
+					os?: string | null;
+					head?: string | null;
+					candidate?: string | null;
+					dirty?: boolean | null;
+					binarySha256?: string | null;
+					rustc?: string | null;
+					buildSeconds?: number | null;
+					watchdogFired?: boolean;
+					exitCode?: number | null;
+				};
+				problems?: string[];
+			} | null;
+		};
 		netRxDelta?: Record<string, { rxBytes: number; rxPackets: number }> | null;
 		udpDelta?: {
 			inDatagrams: number;
@@ -159,6 +184,35 @@ function summaryOf(json: HistogramJson) {
 	return LatencyHistogram.fromJson(json).summary();
 }
 
+/**
+ * O5 — did the Mac run the tree this gate is stamped against?
+ *
+ * Off-box the harness spawns nothing: it opens an ssh channel and reads text.
+ * The entry script reports the SHA it was asked for, the SHA it checked out,
+ * whether the clone was clean, the hash of the binary it built, and how the run
+ * ended. All five have to agree with the gate's candidate, and the run has to
+ * have ended by the client exiting rather than by the watchdog killing it —
+ * a watchdog kill is an infra fault, and the rerun policy reads it as one.
+ */
+export function generatorProvenanceClean(
+	step: NonNullable<RttFragment["steps"]>[number],
+): boolean {
+	const macgen = step.generator?.macgen;
+	if (!macgen) return false;
+	const p = macgen.provenance;
+	if (!p) return false;
+	const asked = macgen.candidateAsked ?? "";
+	if (!/^[0-9a-f]{40}$/.test(asked)) return false;
+	if (p.head !== asked) return false;
+	if (p.candidate !== asked) return false;
+	if (p.dirty !== false) return false;
+	if (!p.binarySha256) return false;
+	if (p.watchdogFired === true) return false;
+	if (p.exitCode !== 0) return false;
+	if ((macgen.problems?.length ?? 0) > 0) return false;
+	return true;
+}
+
 function integrityFailures(
 	step: NonNullable<RttFragment["steps"]>[number],
 	placement: "onbox" | "offbox",
@@ -168,9 +222,17 @@ function integrityFailures(
 	const generator = step.generator;
 	if (!generator || generator.mode !== placement) failures.push("O1");
 	if (placement === "offbox") {
-		if (!generator || !/^192\.168\.2\./.test(generator.urlHost)) {
+		// The cable, and only the cable. The VM-era mark required `192.168.2.x`;
+		// on this topology that address family is the family Wi-Fi LAN, which is
+		// exactly what an off-box mark exists to rule out.
+		if (!generator || !CABLE_HOST_RE.test(generator.urlHost)) {
 			failures.push("O2");
 		}
+		// O5 — the generator built its own binary, so "which tree ran" is a claim
+		// rather than a fact the harness observed. A cell that cannot show the Mac
+		// checked out the candidate from a clean clone and exited on its own is not
+		// evidence about the candidate.
+		if (!generatorProvenanceClean(step)) failures.push("O5");
 	}
 	const net = step.netRxDelta;
 	const expectedBytes = step.clientSent * payloadBytes;
