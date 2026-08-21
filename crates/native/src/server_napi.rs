@@ -173,9 +173,8 @@ impl ServerHandle {
             // QUIC-LB connection IDs: this instance's server ID in the clear so
             // an L4 balancer routes by CID rather than by 4-tuple. Absent leaves
             // quinn's default CIDs (docs/OPERATIONS.md).
-            let quic_lb = crate::quic_lb::parse_quic_lb_options(&server_opts).map_err(|msg| {
-                napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg))
-            })?;
+            let quic_lb = crate::quic_lb::parse_quic_lb_options(&server_opts)
+                .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
