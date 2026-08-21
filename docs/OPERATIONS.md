@@ -309,6 +309,53 @@ measure a stalled sender on a long path; do not widen speculatively.
 - Use systemd on Linux; ensure Restart=on-failure.
 - Collect logs centrally; scrape metrics via exposed endpoint (if you add one) or poll metricsSnapshot.
 
+## Multi-process binds (`reusePort`)
+
+`createServer({ reusePort: true })` sets `SO_REUSEPORT` on the bind socket so
+several server processes can listen on one port. It is **native-backend only**
+(the WASM backend has its own options type and owns no socket) and **unix
+only**: on a platform without `SO_REUSEPORT` the call throws
+`E_UNSUPPORTED_ARGUMENT` rather than binding without it. It also requires an
+explicit `port` — `port: 0` throws `E_INVALID_ARGUMENT`, since each instance
+would get its own ephemeral port and share nothing.
+
+**The flag alone is not a load-balancing answer.** Read these two before
+turning it on:
+
+- **4-tuple hashing breaks long-lived sessions.** Plain kernel steering picks a
+  group member by hashing the packet's source/destination address and port. A
+  QUIC connection survives a client address change by design (the connection ID
+  identifies it, not the 4-tuple), but the kernel does not read connection IDs
+  — after a NAT rebind or a client interface change the same connection hashes
+  to a *different* process, which does not recognize it. Every NAT rebind is a
+  session drop. The same argument applies to plain ECMP.
+- **Group membership changes re-hash the whole group.** Adding or removing a
+  socket changes the hash distribution for every flow, not just new ones.
+  Restarting one instance therefore re-steers surviving connections that belong
+  to its *siblings*, so a routine rolling restart drops sessions fleet-wide.
+
+What the flag is for:
+
+- **eBPF-steered topologies.** An `SK_REUSEPORT` program attached to the group
+  can pick the socket by reading the QUIC connection ID's server-ID bytes
+  instead of the 4-tuple, which is rebind-stable. That requires the server to
+  encode a server ID in the connection IDs it issues.
+- **Benchmarks and load-generation rigs**, where sessions are short and
+  distribution does not have to be stable.
+
+Neither the rebind failure nor the restart re-hash has been measured on this
+project's rigs; both are deductions from RFC 9000 §5.1/§9 and the kernel's
+documented reuseport behavior. Distribution across the group is the kernel's,
+not this library's: Linux hashes across members, BSD/macOS delivers to the last
+binder.
+
+The full argument, the supported deployment pattern, and the sizing figures
+live in
+[docs/research/2026-08-21-bare-metal-capacity.md](research/2026-08-21-bare-metal-capacity.md)
+— sections 3 ("Unsupported: 4-tuple-hash balancers in front of long-lived
+sessions") and 4 ("Four disclosures you must read before deploying any steered
+pattern").
+
 ---
 
 ## Runbook: Rollback to known-good release

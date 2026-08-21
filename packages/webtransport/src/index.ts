@@ -551,6 +551,25 @@ export type ServerOptions = {
 	 */
 	enableDynamicQpack?: boolean;
 
+	/**
+	 * Set `SO_REUSEPORT` on the bind socket so several processes can listen on
+	 * the same port. Off by default. Native backend only (the WASM backend has
+	 * its own options type and no socket of its own), unix only — on a platform
+	 * without `SO_REUSEPORT` this throws `E_UNSUPPORTED_ARGUMENT` rather than
+	 * binding without it. Requires an explicit `port`; `port: 0` throws
+	 * `E_INVALID_ARGUMENT` because each instance would get its own ephemeral
+	 * port and share nothing.
+	 *
+	 * This is not a load-balancing answer on its own. Plain kernel steering
+	 * hashes the 4-tuple, so a client's NAT rebind re-hashes to a different
+	 * process and the session dies; and group membership changes re-hash the
+	 * whole group, so restarting one instance re-steers flows that belonged to
+	 * its siblings. Use it for eBPF-steered (`SK_REUSEPORT`) topologies, where
+	 * steering follows the connection ID, and for benchmarks. See
+	 * docs/OPERATIONS.md ("Multi-process binds (reusePort)").
+	 */
+	reusePort?: boolean;
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -2111,12 +2130,27 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	validateQpackOptions(opts);
 
+	if (opts.reusePort !== undefined && typeof opts.reusePort !== "boolean") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: reusePort must be a boolean",
+		);
+	}
+
+	if (opts.reusePort === true && opts.port === 0) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: reusePort requires an explicit port; port 0 asks the OS for a fresh ephemeral port per instance, so nothing shares a port",
+		);
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
 		congestionControl: opts.congestionControl ?? "default",
 		enable0Rtt: opts.enable0Rtt === true,
 		allowEarlySession: opts.allowEarlySession === true,
+		reusePort: opts.reusePort === true,
 		...(opts.qpackMaxTableCapacity === undefined
 			? {}
 			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
