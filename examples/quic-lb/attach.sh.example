@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# ============================================================================
+# EXAMPLE — NOT RUN, NOT TESTED
+# ============================================================================
+#
+# A sketch of the loader steps for steer_by_cid.bpf.c, written against Linux
+# 7.0.0-30-generic with bpftool from that kernel's linux-tools package and
+# clang/LLVM 18+ for the BPF target. Nothing here has been executed. The
+# `.example` suffix is deliberate: read it, adapt it, and expect to fix it.
+#
+# What this does NOT do, and what makes the pattern hard:
+#
+#   * It does not keep the sockarray correct. A socket leaves the array when
+#     its process dies, and only the process that owns a socket can insert it.
+#     Re-registration after a restart is the operator's problem — see the
+#     README. This script only shows the first, easy load.
+#   * It does not populate slot_by_server_id from any authoritative source. The
+#     table below must agree with each instance's `quicLb.serverId` exactly.
+#
+set -euo pipefail
+
+BPF_OBJ=${BPF_OBJ:-steer_by_cid.bpf.o}
+PIN_DIR=${PIN_DIR:-/sys/fs/bpf/quic-lb}
+
+# --- 1. Build ---------------------------------------------------------------
+#
+# CO-RE build against the running kernel's BTF. -O2 is not optional: the
+# verifier rejects most unoptimised BPF C.
+
+build() {
+	clang -O2 -g -target bpf \
+		-D__TARGET_ARCH_x86 \
+		-c steer_by_cid.bpf.c -o "$BPF_OBJ"
+}
+
+# --- 2. Load and pin --------------------------------------------------------
+#
+# Pinning keeps the program and its maps alive independently of this shell, so
+# the server processes (below) can find the sockarray by path.
+
+load() {
+	mkdir -p "$PIN_DIR"
+	bpftool prog loadall "$BPF_OBJ" "$PIN_DIR" pinmaps "$PIN_DIR"
+	bpftool prog show pinned "$PIN_DIR/steer_by_cid"
+	bpftool map show pinned "$PIN_DIR/socks"
+}
+
+# --- 3. Populate the server-ID table ----------------------------------------
+#
+# One row per instance: the server ID bytes each instance is configured with,
+# and the sockarray slot its socket lives in. These must match the servers'
+# `quicLb.serverId` byte for byte; nothing detects a mismatch at runtime.
+#
+# Key layout is struct server_id_key: SERVER_ID_KEY_LEN (8) octets, the first
+# SERVER_ID_LEN (2) meaningful, the rest zero. Values are host-order u32 slots.
+
+declare -A SERVER_ID_SLOTS=(
+	["00 07"]=0
+	["00 08"]=1
+	["00 09"]=2
+)
+
+populate() {
+	local id slot
+	for id in "${!SERVER_ID_SLOTS[@]}"; do
+		slot=${SERVER_ID_SLOTS[$id]}
+		bpftool map update pinned "$PIN_DIR/slot_by_server_id" \
+			key hex $id 00 00 00 00 00 00 \
+			value hex "$(printf '%02x %02x %02x %02x' \
+				$((slot & 0xff)) $((slot >> 8 & 0xff)) \
+				$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))"
+	done
+	bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
+}
+
+# --- 4. Attach the program to the reuseport group ---------------------------
+#
+# THIS IS THE STEP A SHELL SCRIPT CANNOT DO.
+#
+# SK_REUSEPORT programs are attached with
+#
+#     setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF, &prog_fd, ...)
+#
+# on a socket that is already a member of the reuseport group, and each
+# instance inserts its own socket into the sockarray with
+#
+#     bpf_map_update_elem(sockarray_fd, &slot, &socket_fd, BPF_ANY)
+#
+# Both take a live file descriptor, so both must run inside a process that owns
+# the socket. webtransport-bun's `reusePort: true` builds and owns that socket
+# inside the native addon and does not expose its fd to JS, so today this step
+# needs either a small C/Go/Rust supervisor that creates the sockets and passes
+# them in, or a patched addon that performs the attach itself. Neither exists
+# in this repository. This is the honest gap between the example and a working
+# deployment.
+#
+# Attaching the program to only ONE member of the group is enough — the program
+# is a property of the group, not of the socket — but every member's socket
+# still has to be registered in the sockarray individually.
+
+attach_note() {
+	cat <<'EOF'
+attach: not scripted. See the comment above: SO_ATTACH_REUSEPORT_EBPF and the
+sockarray insert both require the socket fd, which lives inside the server
+process. Wire this into whatever supervises your instances.
+EOF
+}
+
+# --- 5. Observe -------------------------------------------------------------
+#
+# steer_stats index 0 counts steered packets, index 1 counts fallbacks. A
+# fallback count that keeps climbing after the handshakes settle means the
+# configuration does not match the servers' `quicLb` option, or a slot is empty.
+
+stats() {
+	bpftool map dump pinned "$PIN_DIR/steer_stats"
+}
+
+# --- 6. Tear down -----------------------------------------------------------
+
+unload() {
+	rm -rf "$PIN_DIR"
+}
+
+case "${1:-}" in
+build) build ;;
+load) load ;;
+populate) populate ;;
+attach) attach_note ;;
+stats) stats ;;
+unload) unload ;;
+*)
+	echo "usage: $0 {build|load|populate|attach|stats|unload}" >&2
+	exit 64
+	;;
+esac
