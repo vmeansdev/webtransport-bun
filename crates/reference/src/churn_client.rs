@@ -654,7 +654,14 @@ async fn run_base_session(
                     return;
                 }
                 shared.base_connect_retries.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                // Jittered backoff, per the documented client contract
+                // (OPERATIONS.md "Admission control"): a fleet retrying on a
+                // fixed timer re-arrives as the same synchronized wave it was
+                // refused for. ±50% from the monotonic clock's low bits — no
+                // rand dependency, and per-task nanos decorrelate the fleet.
+                let base_ms = 100 * attempt as u64;
+                let jitter_ms = base_ms / 2 + (monotonic_ns() % base_ms.max(1));
+                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
             }
         }
     }
