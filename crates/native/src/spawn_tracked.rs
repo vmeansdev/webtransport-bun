@@ -521,6 +521,7 @@ mod tests {
             false,
             false,
             0,
+            crate::server_spawn::BindOptions::default(),
             3,
         )
         .expect("server start");
