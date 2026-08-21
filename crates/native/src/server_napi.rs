@@ -170,6 +170,12 @@ impl ServerHandle {
                     crate::server_spawn::REUSE_PORT_UNSUPPORTED
                 )));
             }
+            // QUIC-LB connection IDs: this instance's server ID in the clear so
+            // an L4 balancer routes by CID rather than by 4-tuple. Absent leaves
+            // quinn's default CIDs (docs/OPERATIONS.md).
+            let quic_lb = crate::quic_lb::parse_quic_lb_options(&server_opts).map_err(|msg| {
+                napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg))
+            })?;
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -209,7 +215,10 @@ impl ServerHandle {
                 enable_0rtt,
                 allow_early_session,
                 qpack_max_table_capacity,
-                crate::server_spawn::BindOptions { reuse_port },
+                crate::server_spawn::BindOptions {
+                    reuse_port,
+                    quic_lb,
+                },
                 1,
             )
             .map_err(|msg| {
