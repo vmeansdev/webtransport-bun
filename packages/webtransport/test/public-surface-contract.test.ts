@@ -120,6 +120,41 @@ type _AssertSendDatagramMirrorOnNative = Assert<
 	>
 >;
 
+// The paced mirror and its report reader are additive members of the same
+// native-only family, and native-only for the same reason: both are about the
+// egress pacer's schedule and the session registry it fans out through, neither
+// of which wasm has. Added rather than substituted — `sendDatagramMirror` above
+// keeps its own assertions, because the paced API exists precisely so that one
+// does not change.
+type _AssertNoPacedMirrorOnPortable = Assert<
+	Not<
+		Extends<
+			PortableServer,
+			{
+				sendDatagramMirrorPaced(
+					targets: readonly string[],
+					payload: Uint8Array,
+				): unknown;
+			}
+		>
+	>
+>;
+type _AssertNoReadMirrorReportsOnPortable = Assert<
+	Not<Extends<PortableServer, { readMirrorReports(max?: number): unknown }>>
+>;
+type _AssertPacedMirrorOnNative = Assert<
+	Extends<
+		rootSurface.WebTransportServer,
+		{
+			sendDatagramMirrorPaced(
+				targets: readonly string[],
+				payload: Uint8Array,
+			): unknown;
+			readMirrorReports(max?: number): unknown;
+		}
+	>
+>;
+
 // --- the frozen export sets -----------------------------------------------
 
 const ROOT_EXPORTS = [
@@ -228,6 +263,8 @@ const BACKEND_ONLY_SESSION_MEMBERS = ["goAway", "unwrap", "getStats"];
 function assertServerContract(server: PortableServer): void {
 	const bag = server as unknown as Record<string, unknown>;
 	expect(bag.sendDatagramMirror).toBeUndefined();
+	expect(bag.sendDatagramMirrorPaced).toBeUndefined();
+	expect(bag.readMirrorReports).toBeUndefined();
 	expect(bag.updateCert).toBeUndefined();
 }
 

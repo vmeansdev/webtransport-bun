@@ -178,31 +178,40 @@ finishes. A 10 000-target job that has already sent 9 000 is 1 000 targets of
 outstanding work; charging the full job until it completed would make a 250 ms
 bound behave like a much smaller one at exactly the fan-out sizes this is for.
 
-## The envelope — the open API question
+## The envelope — settled
 
-This is the part deliberately left open for the brainstorm, and the reason the
-prototype is knob-gated and unmerged.
+This was left open for the brainstorm. It is now decided, and the decision is
+candidate 3 below, given a concrete shape: **the pacer is not a mode of
+`sendDatagramMirror`, it is a different method.**
 
-Knob off: `sent` means *queued to quinn*, and `failed` names every target that
-did not take the payload, synchronously.
+The problem, restated. `sendDatagramMirror`'s `sent` means *queued to quinn*,
+and `failed` names every target that did not take the payload, synchronously.
+A paced call returns before most sends happen, so the same field could only mean
+*admitted to the schedule* — a different quantity wearing a name the caller has
+already been taught to read as delivery. Seven of the fifteen mirror tests
+failed on the knob for exactly that reason, and one of the seven passed or
+failed depending on the configured rate.
 
-Knob on: the call returns before most sends happen, so `sent` can only mean
-*admitted to the schedule*. Per-target transport failures are discovered later,
-on the pacer thread, and go to counters rather than to the caller's envelope.
-The caller loses the reap list it gets today.
+So `submit` is no longer reachable from `send_datagram_mirror_for_owner`; the
+branch that used to steer it is deleted, and the mirror is byte-identical with
+the pacer compiled in. The schedule is reached through
+`send_datagram_mirror_paced_for_owner` / `sendDatagramMirrorPaced`, whose
+envelope is `{ admitted, refused }` and carries no delivery count at all.
+Per-target failures are drained out of band through `readMirrorReports(max)`
+from a fixed 4,096-entry ring — bounded by construction, oldest dropped,
+`mirrorReportsDropped` counting every drop, and `drained + dropped ==
+deferredFailures` available as a falsifier for the reporting path itself.
 
-Three candidate answers, none committed:
+The two rejected answers, for the record: fire-and-forget with counters only
+discards the reap list, which is the actionable half of the mirror design; a
+completion promise per broadcast reintroduces the ThreadsafeFunction — a host
+event-loop reference — that the promise-free path exists to avoid.
 
-1. Accept it, and document the paced mode as fire-and-forget with metrics.
-2. Make the mirror return a completion handle when paced (an API surface
-   commitment, and it reintroduces the ThreadsafeFunction the promise-free path
-   exists to avoid).
-3. Deliver late failures out-of-band — a batched reap callback per schedule
-   window, one crossing per window rather than per call.
-
-Ticket 07's per-workload profiles is the natural home for the choice: pacing is a
-profile parameter (broadcast profile: paced; realtime profile: unpaced, lowest
-latency), and so is the envelope contract that comes with it.
+Admission also became per-index (`admit_per_index`) rather than a
+`targets[..admitted]` slice, so the paced envelope is a set and not a prefix,
+matching design M4. Ticket 07's per-workload profiles remains the natural home
+for *choosing* pacing per workload; what is settled here is the contract that
+comes with it.
 
 ## Knobs
 

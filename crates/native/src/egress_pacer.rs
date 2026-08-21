@@ -425,6 +425,10 @@ pub(crate) struct Counters {
     late_clumps: u64,
     resets: u64,
     deferred_failures: u64,
+    /// Deferred failures whose identity the ring could not keep. Carried here so
+    /// `drained + reports_dropped == deferred_failures` can be checked over a
+    /// window as well as over the process.
+    reports_dropped: u64,
     thread_starts: u64,
     thread_start_failures: u64,
 }
@@ -439,6 +443,7 @@ impl Counters {
             late_clumps: LATE_CLUMPS.load(Ordering::Relaxed),
             resets: RESETS.load(Ordering::Relaxed),
             deferred_failures: DEFERRED_FAILURES.load(Ordering::Relaxed),
+            reports_dropped: REPORTS_DROPPED.load(Ordering::Relaxed),
             thread_starts: THREAD_STARTS.load(Ordering::Relaxed),
             thread_start_failures: THREAD_START_FAILURES.load(Ordering::Relaxed),
         }
@@ -460,6 +465,7 @@ impl Counters {
             deferred_failures: self
                 .deferred_failures
                 .saturating_sub(earlier.deferred_failures),
+            reports_dropped: self.reports_dropped.saturating_sub(earlier.reports_dropped),
             thread_starts: self.thread_starts.saturating_sub(earlier.thread_starts),
             thread_start_failures: self
                 .thread_start_failures
@@ -476,6 +482,7 @@ impl Counters {
             "lateClumps": self.late_clumps,
             "scheduleResets": self.resets,
             "deferredFailures": self.deferred_failures,
+            "mirrorReportsDropped": self.reports_dropped,
             "threadStarts": self.thread_starts,
             "threadStartFailures": self.thread_start_failures,
         })
@@ -577,6 +584,8 @@ pub(crate) fn stats_json(since: Option<u32>) -> String {
         // See `max_pending` for why the millisecond knob is nominal.
         "maxPendingTargets": cfg.max_pending(),
         "pendingTargets": pending,
+        // Reports waiting to be drained, all servers in this process together.
+        "pendingReports": reports().lock().map(|ring| ring.len()).unwrap_or(0),
         "priority": priority_json(),
         "cumulative": cumulative,
         "window": window,
@@ -594,12 +603,117 @@ pub(crate) fn admit_count(pending: u64, wanted: usize, max_pending: u64) -> usiz
     (wanted as u64).min(room) as usize
 }
 
+/// The same rule as [`admit_count`], answered **per index**.
+///
+/// The mirror envelope is a *set, not a prefix* — design M4,
+/// `tools/bench/mirror-send/mirror-send-design.md:203-214`: subscriber 4 being
+/// refused says nothing about subscriber 5, so every target carries its own
+/// decision and a refusal is reported at its own index. The earlier
+/// `targets[..admitted]` slice reintroduced exactly the prefix shape M4
+/// rejected: which targets travelled was decided by position, and the job held a
+/// range rather than a set.
+///
+/// The bound itself stays one number — there is one queue and one count of room
+/// in it — but the *decision* is per index, and [`submit`] gathers the job from
+/// the admitted indices and reports each refusal at its own. That is the whole
+/// difference from the `targets[..admitted]` slice, and it is the difference
+/// between a set and a prefix: a per-target rule added here (a duplicate
+/// suppressor, a per-session bound) changes only this map, and the envelope
+/// stays a set without anything downstream moving.
+pub(crate) fn admit_per_index(pending: u64, wanted: usize, max_pending: u64) -> Vec<bool> {
+    let room = admit_count(pending, wanted, max_pending);
+    (0..wanted).map(|index| index < room).collect()
+}
+
+/// Fixed capacity of the deferred-report ring.
+///
+/// Bounded by construction rather than by caller discipline: a caller that never
+/// polls `readMirrorReports` costs this constant, not a growth path. The ring is
+/// process-wide because the pacer is — one schedule per process — and each entry
+/// is scoped to the server that submitted the job, so a drain only ever sees its
+/// own targets.
+const MIRROR_REPORTS_CAP: usize = 4_096;
+
+/// One deferred per-target failure, waiting to be drained.
+struct Report {
+    owner_server_id: u64,
+    target: Arc<str>,
+    /// `crate::datagram_mirror::MirrorFailure` as its wire `u8`, so the paced
+    /// path and the synchronous path decode through the same table.
+    code: u8,
+}
+
+fn reports() -> &'static Mutex<VecDeque<Report>> {
+    static REPORTS: OnceLock<Mutex<VecDeque<Report>>> = OnceLock::new();
+    REPORTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MIRROR_REPORTS_CAP)))
+}
+
+static REPORTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one deferred failure: count it, and keep its identity if the ring has
+/// room.
+///
+/// `DEFERRED_FAILURES` and the ring move together on every path through here,
+/// including the ones that lose the entry, which is what makes
+/// `drained + mirrorReportsDropped == deferredFailures` a falsifier for the
+/// reporting path rather than a hope.
+fn record_report(owner_server_id: u64, target: &str, code: &'static str) {
+    DEFERRED_FAILURES.fetch_add(1, Ordering::Relaxed);
+    let failure = crate::datagram_mirror::MirrorFailure::from_code(code);
+    let Ok(mut ring) = reports().lock() else {
+        // A poisoned ring loses the entry; saying so keeps the identity above
+        // true instead of quietly breaking it.
+        REPORTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    while ring.len() >= MIRROR_REPORTS_CAP {
+        ring.pop_front();
+        REPORTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    ring.push_back(Report {
+        owner_server_id,
+        target: Arc::from(target),
+        code: failure as u8,
+    });
+}
+
+/// Take up to `max` of this server's pending reports, oldest first.
+///
+/// Entries belonging to another server in the process are stepped over and left
+/// where they are, so two servers sharing one pacer never drain each other's
+/// subscriber ids and neither can starve the other by not polling.
+pub(crate) fn drain_reports(owner_server_id: u64, max: usize) -> Vec<(String, u8)> {
+    let mut drained = Vec::new();
+    if max == 0 {
+        return drained;
+    }
+    let Ok(mut ring) = reports().lock() else {
+        return drained;
+    };
+    let mut index = 0;
+    while index < ring.len() && drained.len() < max {
+        if ring[index].owner_server_id == owner_server_id {
+            let report = ring.remove(index).expect("index is in range");
+            drained.push((report.target.to_string(), report.code));
+        } else {
+            index += 1;
+        }
+    }
+    drained
+}
+
+/// Reports lost to ring overflow since process start. Process-wide, like the
+/// ring itself.
+pub(crate) fn reports_dropped() -> u64 {
+    REPORTS_DROPPED.load(Ordering::Relaxed)
+}
+
 /// Hand a fan-out to the schedule instead of running it inline.
 ///
-/// Returns the same envelope shape the inline path does, but `sent` means
-/// *admitted to the schedule* — see the note's "open API question". Per-target
-/// transport failures happen later, on the pacer thread, and land in
-/// `deferredFailures`.
+/// The envelope's `sent` field means **admitted to the schedule** here, which is
+/// why nothing above this reports it under that name: the paced binding reads it
+/// as `admitted`. Per-target transport failures happen later, on the pacer
+/// thread, and land in the reports ring and in `deferredFailures`.
 pub(crate) fn submit(
     cfg: &PacerConfig,
     owner_server_id: u64,
@@ -610,19 +724,26 @@ pub(crate) fn submit(
     let in_cap = crate::datagram_mirror::split_at_cap(targets.len());
     let pacer = pacer();
 
-    let admitted = {
+    let (decisions, admitted) = {
         let mut queue = match pacer.queue.lock() {
             Ok(queue) => queue,
             // A poisoned pacer must not take the broadcast down: refuse
             // everything and let the caller fall back per target.
             Err(_) => return crate::datagram_mirror::fan_out(targets.len(), |_| Some(WOULD_BLOCK)),
         };
-        let admitted = admit_count(queue.pending_targets, in_cap, cfg.max_pending());
+        let decisions = admit_per_index(queue.pending_targets, in_cap, cfg.max_pending());
+        let accepted: Vec<String> = decisions
+            .iter()
+            .enumerate()
+            .filter(|(_, admit)| **admit)
+            .map(|(index, _)| targets[index].clone())
+            .collect();
+        let admitted = accepted.len();
         if admitted > 0 {
             queue.pending_targets += admitted as u64;
             queue.jobs.push_back(Job {
                 owner_server_id,
-                targets: targets[..admitted].to_vec(),
+                targets: accepted,
                 payload: Arc::new(payload.to_vec()),
             });
         }
@@ -644,14 +765,14 @@ pub(crate) fn submit(
                 }
             }
         }
-        admitted
+        (decisions, admitted)
     };
     pacer.wake.notify_one();
 
     ADMITTED.fetch_add(admitted as u64, Ordering::Relaxed);
     REFUSED.fetch_add((in_cap - admitted) as u64, Ordering::Relaxed);
     crate::datagram_mirror::fan_out(targets.len(), |index| {
-        if index < admitted {
+        if decisions[index] {
             None
         } else {
             Some(WOULD_BLOCK)
@@ -734,11 +855,12 @@ fn run(cfg: PacerConfig) {
                     id,
                     job.owner_server_id,
                 ) else {
-                    DEFERRED_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    record_report(job.owner_server_id, id, "E_SESSION_CLOSED");
                     return;
                 };
-                if crate::session::try_send_datagram_on_state(&state, &job.payload).is_some() {
-                    DEFERRED_FAILURES.fetch_add(1, Ordering::Relaxed);
+                if let Some(code) = crate::session::try_send_datagram_on_state(&state, &job.payload)
+                {
+                    record_report(job.owner_server_id, id, code);
                 }
             },
             // Released clump by clump, not job by job: the bound is "how much
@@ -877,6 +999,127 @@ mod tests {
             "a long stall must not owe the schedule a catch-up burst"
         );
         assert_eq!(RESETS.load(Ordering::Relaxed), before + 1);
+    }
+
+    /// The paced envelope is a set: every target carries its own decision, and a
+    /// refusal is reported at its own index rather than implied by a boundary
+    /// the caller has to reconstruct.
+    #[test]
+    fn admission_answers_per_index_and_agrees_with_the_count() {
+        let decisions = admit_per_index(0, 5, 3);
+        assert_eq!(decisions, vec![true, true, true, false, false]);
+        assert_eq!(
+            decisions.len(),
+            5,
+            "every offered target gets a decision, refused ones included"
+        );
+
+        // Refusal in the middle of a list is representable: the gather in
+        // `submit` reads this vector, not a range, so index 4 travelling while
+        // index 3 does not needs no new machinery.
+        let handmade = [true, true, true, false, true];
+        let admitted: Vec<usize> = handmade
+            .iter()
+            .enumerate()
+            .filter(|(_, admit)| **admit)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(admitted, vec![0, 1, 2, 4]);
+
+        for (pending, wanted, bound) in [(0u64, 10usize, 4u64), (15, 10, 18_750), (99_999, 10, 8)] {
+            let per_index = admit_per_index(pending, wanted, bound);
+            assert_eq!(
+                per_index.iter().filter(|admit| **admit).count(),
+                admit_count(pending, wanted, bound),
+                "one bound, two readings of it, which must never disagree"
+            );
+        }
+    }
+
+    /// The ring is the only thing standing between "a caller never polls" and
+    /// unbounded growth, so its bound, its FIFO order, its owner scoping, its
+    /// drop accounting and the identity that ties them together are pinned here
+    /// rather than inferred from a live run.
+    ///
+    /// One test rather than four: the ring, `DEFERRED_FAILURES` and
+    /// `REPORTS_DROPPED` are process-wide, so a sibling test recording reports
+    /// in parallel would break any delta the others read — the same reason the
+    /// mark-map rules share one test.
+    #[test]
+    fn the_reports_ring_is_fifo_owner_scoped_bounded_and_accounts_for_every_failure() {
+        let failures_before = DEFERRED_FAILURES.load(Ordering::Relaxed);
+        let dropped_at_start = reports_dropped();
+        // Owner ids unique to this test: the ring is process-wide and the test
+        // binary runs in parallel.
+        let owner = 0x5eed_0001;
+        let other = 0x5eed_0002;
+
+        record_report(owner, "a", "E_SESSION_CLOSED");
+        record_report(other, "not-mine", "E_SESSION_CLOSED");
+        record_report(owner, "b", WOULD_BLOCK);
+        record_report(owner, "c", "E_QUEUE_FULL");
+
+        // Every drain in this test adds to this, whichever owner it was for, so
+        // the closing identity counts what actually left the ring.
+        let mut drained = 0u64;
+        let mut take = |owner: u64, max: usize| {
+            let batch = drain_reports(owner, max);
+            drained += batch.len() as u64;
+            batch
+        };
+
+        let first = take(owner, 2);
+        assert_eq!(
+            first,
+            vec![
+                (
+                    "a".to_string(),
+                    crate::datagram_mirror::MirrorFailure::SessionClosed as u8
+                ),
+                (
+                    "b".to_string(),
+                    crate::datagram_mirror::MirrorFailure::WouldBlock as u8
+                ),
+            ],
+            "oldest first, another owner's entry stepped over rather than taken"
+        );
+        let rest = take(owner, 16);
+        assert_eq!(rest.len(), 1, "max is respected, the remainder stays");
+        assert_eq!(rest[0].0, "c");
+        assert!(
+            take(owner, 16).is_empty(),
+            "a drained ring is empty, and an empty drain is not an error"
+        );
+        assert_eq!(take(owner, 0).len(), 0, "max 0 takes nothing");
+
+        // The other owner's entry survived every drain above.
+        assert_eq!(take(other, 16).len(), 1);
+
+        // Overflow: one past capacity drops exactly one, oldest, and says so.
+        let dropped_before = reports_dropped();
+        for index in 0..MIRROR_REPORTS_CAP + 1 {
+            record_report(owner, &format!("t{index}"), "E_SESSION_CLOSED");
+        }
+        assert_eq!(
+            reports_dropped() - dropped_before,
+            1,
+            "the ring drops rather than grows, and counts what it dropped"
+        );
+        let survivors = take(owner, usize::MAX);
+        assert_eq!(survivors.len(), MIRROR_REPORTS_CAP);
+        assert_eq!(
+            survivors[0].0, "t1",
+            "the oldest entry is the one that goes"
+        );
+
+        // The identity every other number here rests on: a report is either
+        // drained or counted as dropped, never neither. The end-to-end version
+        // runs from TypeScript against a live pacer thread.
+        assert_eq!(
+            drained + (reports_dropped() - dropped_at_start),
+            DEFERRED_FAILURES.load(Ordering::Relaxed) - failures_before,
+            "a report that is neither drained nor counted as dropped is a reporting path that lies"
+        );
     }
 
     #[test]
