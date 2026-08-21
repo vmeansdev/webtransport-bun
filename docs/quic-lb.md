@@ -136,7 +136,8 @@ paid on the destination-CID field of **every short-header packet in both
 directions**, for the life of the connection.
 
 Against this rig's measured egress that is small but not free: G7's stream cell
-moved **1.2498 Gbps** at ≤79% host CPU, and at the ~1,400-byte datagrams that
+moved **1.2498 Gbps** (`g7.md` C2; the run's 79.1% host-CPU maximum belongs to
+cell B-1k, not to this one — `g7.md` C1), and at the ~1,400-byte datagrams that
 path carries, three extra header octets is roughly **0.2%** of the wire bytes;
 G3's egress cell ran with GSO and GRO active at 64 segments, so the extra bytes
 ride the same syscalls rather than costing new ones. **It has not been

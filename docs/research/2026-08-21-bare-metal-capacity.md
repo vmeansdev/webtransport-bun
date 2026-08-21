@@ -106,7 +106,7 @@ on this rig actually delivered, each with the whole box behind it:
 
 | Envelope | Measured | Host cost at that point | Stamp |
 |---|---|---|---|
-| Stream egress, 16 streams @ 64 KiB writes | **1.2498 Gbps**, byte- and stream-ledgers exact | host CPU ≤ 79% of the box | `g7.md` C2; reproduced 1.2498 in `g7-02.md` |
+| Stream egress, 16 streams @ 64 KiB writes | **1.2498 Gbps**, byte- and stream-ledgers exact | not recorded per cell; the run's maximum `hostCpuPctMedian` was **79.1%**, on cell **B-1k**, not on this one | `g7.md` C2 for the rate, `g7.md` C1 for the CPU maximum; reproduced 1.2498 in `g7-02.md` |
 | One-way p99 across **1,000** token sessions | **5.112 ms** raw (uncorrected) | same run | `g7.md` C7 (`g7-02.md`: 4.16 ms) |
 | Client receive-socket drops at that load | **0**, measured, all 14 cell-repeats | — | `g7-02.md` C4 |
 | Request/response exchange, **1,000 sessions** | **60,000/60,000** exchanges, RTT p99 **27.25 ms** | **25.6%** of the box | `g11.md` §2 (arm X) |
@@ -114,8 +114,19 @@ on this rig actually delivered, each with the whole box behind it:
 | Per-session memory, 1k → 10k sessions | **~126.5 KB/session**, linear (5k→10k slope within 0.48% of 1k→5k) | — | `g1.md` C3 |
 | Forward fan-out egress | **16,509/s** inside a 30 Hz frame gate, p99 **10.879 ms**, delivery 1.0000 | — | `g4.md` (stated as a **rate** bound, not a fan-out bound) |
 | Bursty / frame-shaped egress | egress one-way p99 **1.491 ms** median of 5 blocks, bar 33.3 ms | GSO **and** GRO active, 64 segments; `sndbufErrors` 0 on all 30 steps | `g3.md` C2/C4 |
-| Bulk / VOD paced throughput | **1.1473 Gbps** with shipped windows; **1.2049 Gbps** raised (windows not binding, ratio 1.06) | — | `g5.md` |
+| Bulk / VOD paced throughput, shipped windows, batching knob **off** | **1.1473 Gbps** delivered against a 1.25 Gbps paced offer (`P-control`, median of 1149.6238 / 1144.9751 Mbps) | host CPU median 73.79 / 73.49% | `g5.md` §6 P5 — and note this *falsified* the registered prediction that the knob-off default would fall short of 1.000 Gbps, which the stamp calls the headline finding of the run |
+| Window-binding probe, **unpaced** — **INCOMPLETE, not a licensed result** | `A6-shipped` **1.1362 Gbps**, `A6-raised` **1.2049 Gbps**, ratio **1.0604** — read as `WINDOWS-NOT-BINDING`, **but the stamp force-strips it** | `A6-raised` is the only cell in the run with non-zero receive-socket drops: **1,564** and **1,797** on its two repeats (`A6-shipped` was `[0, 0]`, as was every other cell) | `g5.md` §"A6 at the chosen default — force stripped by §4.2" (both `A6-raised` repeats carry the sustained-throttle flag), drops from `g5.md` clause 6 |
 | Many-rooms fan-out | **2 concurrent 10-subscriber video rooms** at 330/s per publisher, p99 **3.740 ms**, forward delivery 0.99995 | co-resident generator + sink + VPN + Docker | `g8.md` — and note this licenses *two rooms*, nothing more; eight of nine cells were INVALID |
+
+**The two bulk rows are different cells and their numbers do not divide into
+each other.** 1.1473 Gbps is the *paced* `P-control` cell; the 1.0604 ratio is
+the *unpaced* `A6` pair. An earlier revision of this table put 1.1473 and 1.2049
+on one row under one ratio, which is a comparison between two different offer
+regimes — and the quotient of those two published numbers is 1.050, not the
+1.06 the row claimed. The ratio that means anything is `A6-raised / A6-shipped`
+= 1.2049 / 1.1362 = 1.0604, and it is force-stripped, so nothing may be
+concluded from it. **The only bulk throughput figure this document licenses is
+the 1.1473 Gbps paced one.**
 
 **Memory scales with sessions, not with instances.** At ~126.5 KB/session
 linear to 10,000 sessions, the instance count barely moves a memory budget.
@@ -263,12 +274,19 @@ adopts a server-issued CID. A rebind occurring inside that window still breaks
 the connection. The window is short, and it is not zero.
 
 **(c) Keyless QUIC-LB CIDs publish your fleet topology in cleartext.** The
-keyless (key-optional) configuration of draft-ietf-quic-load-balancers puts the
-server ID into the connection ID unencrypted, where any on-path observer reads
-it. The draft warns about this in its own words (§5.3, on the key-optional
-configuration): without encryption the server mapping is exposed, and the
-routing bits are constant across every CID the connection ever uses, which is a
-linkability signal the QUIC CID design otherwise denies observers. A keyed
+keyless (key-optional) configuration of **draft-ietf-quic-load-balancers-21**
+— the revision both implementations are pinned to — puts the server ID into the
+connection ID unencrypted, where any on-path observer reads it. The draft warns
+about this in its own words, §5.3, quoted verbatim:
+
+> failure to define a key means that observers can determine the assigned
+> server of any connection, significantly increasing the linkability of QUIC
+> address migration.
+
+(The same sentence is quoted at `crates/native/src/quic_lb.rs:43-45`.) The
+routing bits are additionally constant across every CID the connection ever
+uses, which is a linkability signal the QUIC CID design otherwise denies
+observers. A keyed
 configuration is the remedy, is the same wire format, and is not implemented
 here. Deploying keyless is a deliberate topology disclosure.
 
