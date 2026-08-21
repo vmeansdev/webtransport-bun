@@ -4,14 +4,24 @@
  *
  * Phase 1 could not evaluate G2 because a generator sharing four vCPU with the
  * server could not honestly source 15,000 datagrams/s: every cell at that rung
- * failed the registered schedule-lag check. This dispatch moves the generator to
- * a sibling VM and gates a quantity that survives the move — the client's own
- * round trip, measured on one clock in one process.
+ * failed the registered schedule-lag check. That diagnosis stands; only the
+ * machine the generator moved to has changed. The sibling loadgen VM this
+ * conductor was first written against is retired, and the generator is now the
+ * Mac at the far end of the direct cable, reached through
+ * `tools/offbox/mac-generator-entry.sh`.
+ *
+ * The move costs this file its provisioning step and is better for it. A Linux
+ * runner cannot build a macOS/arm64 binary, so nothing is copied: the Mac
+ * fetches the candidate, checks it out, refuses a dirty clone, builds, and
+ * reports what it built. There is no `/tmp/load-client` to go stale between
+ * dispatches, and no arch-match check to pass by luck.
  *
  * Cells, order, floor arms, honesty conditions, integrity marks and the verdict
  * algebra are pre-registered in
+ * `.scratch/bare-metal-campaign/registrations/g2-games.md`, which carries the
+ * bare-metal re-derivation of every topology-dependent bound in the VM-era
  * `docs/research/preregistrations/gate-g2-offbox-rtt.md`. This file implements
- * that document; it does not get to reinterpret it. The order lives in
+ * those documents; it does not get to reinterpret them. The order lives in
  * `latency-rtt-schedule.ts` with its own tests, and
  * `latency-rtt-classify.ts` turns the fragments into a verdict — separately, so
  * that someone who does not trust whoever ran the dispatch can redo it from the
@@ -26,6 +36,13 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { $ } from "bun";
+import {
+	assertCableHost,
+	assertCandidate,
+	G2_MACGEN_BIN,
+	MACGEN_ENTRY,
+	macgenDeadlineSeconds,
+} from "./g2-offbox.ts";
 import { type RttCell, rttSchedule } from "./latency-rtt-schedule.ts";
 
 const ROOT = process.cwd();
@@ -46,9 +63,31 @@ const ARM_TIMEOUT_MS = parseInt(
 );
 const OFFBOX_SSH = (process.env.LATENCY_RTT_OFFBOX_SSH ?? "").trim();
 const OFFBOX_URL_HOST = (process.env.LATENCY_RTT_OFFBOX_URL_HOST ?? "").trim();
-const OFFBOX_BIN = (
-	process.env.LATENCY_RTT_OFFBOX_BIN ?? "/tmp/load-client"
+const OFFBOX_ENTRY = (
+	process.env.LATENCY_RTT_OFFBOX_ENTRY ?? MACGEN_ENTRY
 ).trim();
+/**
+ * The tree the Mac builds its generator from. Defaults to this checkout's HEAD,
+ * which is also what the manifest records as the candidate — the two must be the
+ * same tree or the run measures one program and is stamped against another.
+ */
+const OFFBOX_CANDIDATE = (
+	process.env.LATENCY_RTT_OFFBOX_CANDIDATE ?? ""
+).trim();
+/**
+ * The connect ramp the deadline has to cover on top of the drive window: 100
+ * sessions dialled over the cable, plus the client's own exit. Registered on the
+ * gate page; carried here as the default so the watchdog cannot be left unset.
+ */
+const CONNECT_RAMP_SECONDS = parseInt(
+	process.env.LATENCY_RTT_CONNECT_RAMP_SECONDS ?? "45",
+	10,
+);
+/** macOS has no `timeout(1)`; the entry script's watchdog is the only deadline. */
+const OFFBOX_DEADLINE_SEC = macgenDeadlineSeconds(
+	parseInt(DRIVE_SECONDS, 10),
+	CONNECT_RAMP_SECONDS,
+);
 /** Cells to run, for local smoke only. Never set on the runner. */
 const LIMIT = process.env.LATENCY_RTT_LIMIT
 	? parseInt(process.env.LATENCY_RTT_LIMIT, 10)
@@ -96,7 +135,7 @@ function fragmentPath(cell: RttCell): string {
 	);
 }
 
-async function runCell(cell: RttCell): Promise<CellOutcome> {
+async function runCell(cell: RttCell, candidate: string): Promise<CellOutcome> {
 	const out = fragmentPath(cell);
 	const offbox = cell.placement === "offbox";
 	const startedAt = Date.now();
@@ -122,7 +161,9 @@ async function runCell(cell: RttCell): Promise<CellOutcome> {
 			LATENCY_OUT: out,
 			LATENCY_OFFBOX_SSH: offbox ? OFFBOX_SSH : "",
 			LATENCY_OFFBOX_URL_HOST: offbox ? OFFBOX_URL_HOST : "",
-			LATENCY_OFFBOX_BIN: OFFBOX_BIN,
+			LATENCY_OFFBOX_CANDIDATE: offbox ? candidate : "",
+			LATENCY_OFFBOX_ENTRY: OFFBOX_ENTRY,
+			LATENCY_OFFBOX_DEADLINE_SEC: String(OFFBOX_DEADLINE_SEC),
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -187,16 +228,18 @@ async function main(): Promise<void> {
 
 	// §11.1-11.2 are checked before the build: a dispatch that is going to be
 	// refused should be refused in a second, not after a release compile.
+	// The candidate the Mac builds is this checkout's HEAD unless overridden, and
+	// the manifest records the same value: one tree measured, one tree stamped.
+	const candidate = OFFBOX_CANDIDATE || head;
 	if (needsOffbox) {
-		if (!OFFBOX_SSH || !OFFBOX_URL_HOST) {
-			refuse(
-				"LATENCY_RTT_OFFBOX_SSH and LATENCY_RTT_OFFBOX_URL_HOST are required for off-box cells",
-			);
+		if (!OFFBOX_SSH) {
+			refuse("LATENCY_RTT_OFFBOX_SSH is required for off-box cells");
 		}
-		if (!/^192\.168\.2\./.test(OFFBOX_URL_HOST)) {
-			refuse(
-				`LATENCY_RTT_OFFBOX_URL_HOST must be a 192.168.2.x LAN address, got ${OFFBOX_URL_HOST} — the data path is never Tailscale`,
-			);
+		try {
+			assertCableHost(OFFBOX_URL_HOST, "LATENCY_RTT_OFFBOX_URL_HOST");
+			assertCandidate(candidate);
+		} catch (err) {
+			refuse(String(err instanceof Error ? err.message : err));
 		}
 	}
 
@@ -208,10 +251,10 @@ async function main(): Promise<void> {
 		refuse(`load-client missing after build: ${CLIENT_BIN}`);
 	}
 
-	let provisioned = false;
 	let remoteArch: string | null = null;
+	let entrySha256: string | null = null;
+	let planOutput: string | null = null;
 	if (needsOffbox) {
-		// §11.3-11.5 — these need the binary that was just built.
 		const ping = sh([
 			"ssh",
 			"-o",
@@ -224,6 +267,9 @@ async function main(): Promise<void> {
 		if (ping.status !== 0) {
 			refuse(`ssh to ${OFFBOX_SSH} failed: ${ping.stderr.slice(0, 300)}`);
 		}
+		// Recorded, not gated. Nothing is copied to the generator any more, so a
+		// mismatched arch is no longer a way to fail — but a run should still say
+		// what machine produced its load.
 		remoteArch = shOut([
 			"ssh",
 			"-o",
@@ -232,38 +278,55 @@ async function main(): Promise<void> {
 			"uname",
 			"-m",
 		]);
-		const localArch = shOut(["uname", "-m"]);
-		if (!remoteArch || remoteArch !== localArch) {
+
+		// The entry script the run executes is the Mac's provisioned copy, not the
+		// candidate's file. That is the one piece of this harness a candidate SHA
+		// does not describe, so its hash is recorded here and the gate page pins
+		// the value it must equal.
+		entrySha256 =
+			shOut([
+				"ssh",
+				"-o",
+				"BatchMode=yes",
+				OFFBOX_SSH,
+				"shasum",
+				"-a",
+				"256",
+				OFFBOX_ENTRY,
+			]).split(/\s+/)[0] ?? null;
+		if (!entrySha256) {
 			refuse(
-				`generator arch ${remoteArch || "(unknown)"} does not match this host's ${localArch}; the release binary would not run`,
+				`no ${OFFBOX_ENTRY} on ${OFFBOX_SSH} — provision the generator entry ` +
+					"script first (docs/research/runbooks/mac-generator-cable.md §8)",
 			);
 		}
-		const copy = sh([
-			"scp",
-			"-q",
-			"-o",
-			"BatchMode=yes",
-			CLIENT_BIN,
-			`${OFFBOX_SSH}:${OFFBOX_BIN}`,
-		]);
-		if (copy.status !== 0) {
-			refuse(`scp of load-client failed: ${copy.stderr.slice(0, 300)}`);
-		}
-		const mark = sh([
+
+		// `--plan` resolves the candidate and prints the exact build and exec it
+		// would perform, without running anything. It is the cheapest possible
+		// proof that the clone exists, the SHA is reachable, and the `--bin`
+		// selector is inside the script's closed set: all three refuse with exit 3
+		// mid-dispatch otherwise, twenty-two cells deep.
+		const plan = Bun.spawnSync([
 			"ssh",
 			"-o",
 			"BatchMode=yes",
 			OFFBOX_SSH,
-			"chmod",
-			"+x",
-			OFFBOX_BIN,
+			OFFBOX_ENTRY,
+			"--bin",
+			G2_MACGEN_BIN,
+			"--candidate",
+			candidate,
+			"--plan",
 		]);
-		if (mark.status !== 0) {
-			refuse(`chmod +x on the generator failed: ${mark.stderr.slice(0, 300)}`);
+		planOutput = new TextDecoder().decode(plan.stdout).trim();
+		if (plan.exitCode !== 0) {
+			refuse(
+				`generator --plan refused (exit ${plan.exitCode}): ` +
+					`${new TextDecoder().decode(plan.stderr).trim().slice(0, 300)}`,
+			);
 		}
-		provisioned = true;
 		console.log(
-			`latency-rtt: offbox ssh=${OFFBOX_SSH} urlHost=${OFFBOX_URL_HOST} bin=${OFFBOX_BIN} arch=${remoteArch} provisioned=true`,
+			`latency-rtt: macgen ssh=${OFFBOX_SSH} urlHost=${OFFBOX_URL_HOST} bin=${G2_MACGEN_BIN} candidate=${candidate} deadline=${OFFBOX_DEADLINE_SEC}s arch=${remoteArch} entry=${OFFBOX_ENTRY} entrySha256=${entrySha256}`,
 		);
 	}
 
@@ -284,7 +347,7 @@ async function main(): Promise<void> {
 	for (const cell of cells) {
 		const label = `${cell.index + 1}/${cells.length} rung=${cell.rung} r=${cell.replicate} placement=${cell.placement} port=${cell.port}`;
 		console.log(`== latency-rtt cell ${label} ==`);
-		const outcome = await runCell(cell);
+		const outcome = await runCell(cell, candidate);
 		outcomes.push(outcome);
 		console.log(
 			`latency-rtt: cell ${label} exit=${outcome.exitCode}${outcome.timedOut ? " TIMED-OUT" : ""} wall=${outcome.wallSec.toFixed(1)}s sessionsOk=${outcome.sessionsOk ?? "n/a"} fragment=${outcome.fragment ? "yes" : "MISSING"}`,
@@ -311,14 +374,19 @@ async function main(): Promise<void> {
 				preregistration: "docs/research/preregistrations/gate-g2-offbox-rtt.md",
 				tag: TAG,
 				candidateSha: head,
+				generatorCandidateSha: candidate,
 				startedAt: new Date(startedAt).toISOString(),
 				wallSec: (Date.now() - startedAt) / 1000,
 				aborted,
 				offbox: {
 					ssh: OFFBOX_SSH || null,
 					urlHost: OFFBOX_URL_HOST || null,
-					bin: OFFBOX_BIN,
-					provisioned,
+					bin: G2_MACGEN_BIN,
+					entry: OFFBOX_ENTRY,
+					entrySha256,
+					deadlineSec: OFFBOX_DEADLINE_SEC,
+					connectRampSec: CONNECT_RAMP_SECONDS,
+					plan: planOutput,
 					remoteArch,
 					pathPing: pathPing || null,
 				},
