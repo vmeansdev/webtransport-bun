@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
 	assertOneProcessPerCell,
+	assertPacerReadable,
 	pacerEnvironment,
+	probePacerApi,
 	readPacerStats,
 	windowPacerStats,
 } from "./pacer-stats.ts";
@@ -277,6 +279,69 @@ describe("windowPacerStats on the shape the native side actually emits", () => {
 		expect(windowPacerStats(null, FULL)).toBeNull();
 		expect(windowPacerStats(FULL, null)).toBeNull();
 		expect(windowPacerStats(null, null)).toBeNull();
+	});
+});
+
+describe("probePacerApi", () => {
+	test("tells a stale addon apart from a knob that is simply off", () => {
+		expect(probePacerApi({}).kind).toBe("absent");
+		expect(probePacerApi({ __pacerStatsJson: () => "{}" }).kind).toBe(
+			"knob-off",
+		);
+		const live = probePacerApi({
+			__pacerStatsJson: () => JSON.stringify(nativeStats()),
+		});
+		expect(live.kind).toBe("live");
+		if (live.kind === "live") expect(live.stats.clumps).toBe(40);
+	});
+
+	test("an accessor that throws reads as absent, never as a live pacer", () => {
+		const probe = probePacerApi({
+			__pacerStatsJson: () => {
+				throw new Error("addon exploded");
+			},
+		});
+		expect(probe.kind).toBe("absent");
+	});
+});
+
+describe("assertPacerReadable", () => {
+	test("an unpaced cell needs no pacer and is not asked for one", () => {
+		expect(() => assertPacerReadable({}, undefined)).not.toThrow();
+		expect(() => assertPacerReadable({}, "  ")).not.toThrow();
+	});
+
+	test("refuses a paced cell whose addon has no accessor (H3)", () => {
+		expect(() => assertPacerReadable({}, "55000")).toThrow(
+			/no pacer stats accessor at all/,
+		);
+		// The message has to name the mis-shaped composition, because the artifact
+		// this would otherwise produce says nothing at all.
+		expect(() => assertPacerReadable({}, "55000")).toThrow(
+			/WEBTRANSPORT_PACER_PPS=55000/,
+		);
+	});
+
+	test("refuses a paced cell whose knob never reached the pacer", () => {
+		expect(() =>
+			assertPacerReadable({ __pacerStatsJson: () => "{}" }, "55000"),
+		).toThrow(/knob-off sentinel/);
+	});
+
+	test("admits a paced cell whose pacer reports on itself", () => {
+		expect(() =>
+			assertPacerReadable(
+				{ __pacerStatsJson: () => JSON.stringify(nativeStats()) },
+				"55000",
+			),
+		).not.toThrow();
+	});
+
+	test("looks through the same handle nestings readPacerStats does", () => {
+		const server = {
+			handle: { __pacerStatsJson: () => JSON.stringify(nativeStats()) },
+		};
+		expect(() => assertPacerReadable(server, "55000")).not.toThrow();
 	});
 });
 

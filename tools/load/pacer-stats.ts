@@ -117,6 +117,25 @@ export type PacerStatsReport = {
  * a missing one is not an error — it is a composition without a pacer.
  */
 export function readPacerStats(server: unknown): PacerStatsRaw | null {
+	const probed = probePacerApi(server);
+	return probed.kind === "live" ? probed.stats : null;
+}
+
+/**
+ * What the composition actually offers, as three distinguishable answers.
+ *
+ * `readPacerStats` collapses the first two into `null`, which is right for the
+ * windowing path — there is nothing to window either way — and wrong for the
+ * start-up check, where the difference is the whole finding. A stale addon has
+ * no accessor; a current addon with the knob off answers `"{}"`. Only the
+ * second is a deliberate unpaced control.
+ */
+export type PacerApiProbe =
+	| { kind: "absent" }
+	| { kind: "knob-off" }
+	| { kind: "live"; stats: PacerStatsRaw };
+
+export function probePacerApi(server: unknown): PacerApiProbe {
 	const names = ["__pacerStatsJson", "pacerStatsJson", "__pacerStatsSnapshot"];
 	// The facade `createServer()` returns is a plain object literal that closes
 	// over the native handle, so the accessor has to be forwarded onto it by the
@@ -127,13 +146,51 @@ export function readPacerStats(server: unknown): PacerStatsRaw | null {
 		callFirstAvailable(nested(server, "__nativeHandle"), names) ??
 		callFirstAvailable(nested(server, "__handle"), names) ??
 		callFirstAvailable(nested(server, "handle"), names);
-	if (raw === null) return null;
+	if (raw === null) return { kind: "absent" };
 	const parsed = coerceStats(raw);
 	// `"{}"` is what the pacer returns with the knob off: a live API reporting
 	// that nothing is paced, which is not the same as no API at all — but it
 	// carries no counters, so there is nothing to window.
-	if (parsed === null || Object.keys(parsed).length === 0) return null;
-	return parsed;
+	if (parsed === null || Object.keys(parsed).length === 0) {
+		return { kind: "knob-off" };
+	}
+	return { kind: "live", stats: parsed };
+}
+
+/**
+ * The paced-cell readability guard (review-d3a H3).
+ *
+ * `WEBTRANSPORT_PACER_PPS` set with no readable pacer produces an artifact with
+ * no `pacerStats` block at all — visually identical to a deliberate unpaced
+ * control, and ungradable with nothing saying so. The two ways to get there are
+ * a composition whose addon predates the accessors, and a knob that never
+ * reached the server. Both are mis-shaped cells, and both are worth exactly the
+ * seconds it takes to refuse here rather than the hour a sweep costs.
+ *
+ * Called after `createServer()` and before the fleet: this needs a server to
+ * ask, which `assertOneProcessPerCell` does not.
+ */
+export function assertPacerReadable(
+	server: unknown,
+	pacerPps: string | undefined,
+): void {
+	const paced = (pacerPps ?? "").trim();
+	if (paced === "") return;
+	const probe = probePacerApi(server);
+	if (probe.kind === "live") return;
+	const why =
+		probe.kind === "absent"
+			? "the server exposes no pacer stats accessor at all, which means the " +
+				"native addon in this composition predates `__pacerStatsJson` — it " +
+				"was not rebuilt, or a prebuilt one was picked up"
+			: "the pacer stats accessor answered the knob-off sentinel (`{}`), which " +
+				"means the knob never reached the pacer in this process";
+	throw new Error(
+		`bench-g10: WEBTRANSPORT_PACER_PPS=${paced} is set, but ${why}. A paced ` +
+			"cell with no readable pacer produces an artifact indistinguishable " +
+			"from an unpaced control and cannot be graded (review-d3a H3). Rebuild " +
+			"the addon from the pacer branch, or unset the knob to run a control.",
+	);
 }
 
 function nested(server: unknown, key: string): unknown {

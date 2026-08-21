@@ -122,6 +122,7 @@ import {
 } from "./latency-stamp.ts";
 import {
 	assertOneProcessPerCell,
+	assertPacerReadable,
 	type PacerStatsRaw,
 	pacerEnvironment,
 	readPacerStats,
@@ -789,6 +790,9 @@ async function main(): Promise<void> {
 			})();
 		},
 	});
+	// Before the fleet: a paced cell whose pacer cannot report on itself is a
+	// cell nobody can grade, and it looks exactly like a control in the artifact.
+	assertPacerReadable(server, process.env.WEBTRANSPORT_PACER_PPS);
 	console.log(
 		`bench-g10: listening on ${server.address.port}; fleet ${FLEET}, arms requested ` +
 			`${REQUESTED_ARMS.join(",")}, ladder ${LADDER.join(",")}` +
