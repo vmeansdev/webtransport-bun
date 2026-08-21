@@ -1,11 +1,15 @@
 # webtransport-bun on bare metal — capacity, latency, and deployment
 
-**Status: LIVING DRAFT (2026-08-21).** This is the bare-metal campaign's
-terminal document (campaign ticket 09). It is published incomplete on purpose:
-one chapter — **Deployment** — is finished and reviewed; the gate chapters are
-stubs that point at the stamps until the campaign closes them. Nothing here is
-a forecast. Every number carries the stamp it was recomputed in, and where a
-number does not exist, this document says so rather than estimating one.
+**Status: COMPLETE (2026-08-21).** This is the bare-metal campaign's terminal
+document (campaign ticket 09). Every gate has reached a final verdict and no
+chapter is a stub. Nothing here is a forecast. Every number carries the stamp
+it was recomputed in, and where a number does not exist, this document says so
+rather than estimating one.
+
+Three of those final verdicts are not passes — G2 is INCOMPLETE, G9 is a
+NO-VERDICT on a declared harness fault, and G11's T arm is a MISS. They are
+reported here with the same weight as the passes, because the campaign's bar
+was *"every gate reaches a final valid verdict"*, not *"every gate passes."*
 
 ## The rig every number below belongs to
 
@@ -22,41 +26,37 @@ topology change, never as a delta.
 
 ---
 
-## Chapter status
+## The verdict ledger
 
-| Chapter | State | Where the evidence lives |
+Every row is final. Campaign stamp paths are relative to
+`.scratch/bare-metal-campaign/` (gitignored campaign scratch on
+`rebind4-staging`); each stamp recomputes its clause values off-runner from raw
+artifact fields and records the shipped classifier's output only as
+corroboration.
+
+| Gate | Verdict, in one line | Stamp |
 |---|---|---|
-| **Deployment** | **Written** (below) | this document + `2026-08-21-load-balancing-architecture.md` |
-| Session scale (G1) | stub | `stamps/g1.md` — PASS |
-| Tail latency (G2) | stub | `stamps/g2.md` — INCOMPLETE (`path-not-quiet`; instrument finding) |
-| Bursty egress (G3) | stub | `stamps/g3.md` — PASS, C3 `CEILING-MOVED` |
-| Fan-out (G4) | stub | `stamps/g4.md` — PASS |
-| Bulk / VOD (G5) | stub | `stamps/g5.md` — PASS |
-| Stream egress (G7) | stub | `stamps/g7.md` (PASS, narrowed) → `stamps/g7-02.md` (PASS, unnarrowed) |
-| Many-rooms fan-out (G8) | stub | `stamps/g8.md` — PASS, narrowed to one cell of nine |
-| Churn (G9) | stub | `stamps/g9.md` — NO-VERDICT (declared harness fault; one rerun licensed) |
-| Bidirectional streams (G11) | stub | `stamps/g11.md` + its correction addendum — X PASS · D COUPLING-ABSENT · T INVALID |
+| **G1 — GPS session scale** | **PASS**, all five clauses: 10,000 sessions, ingest p99 **2.576 ms**, delivery **1.000000**, memory **~126.5 KB/session** linear | `stamps/g1.md` §9.6 |
+| **G2 — FPS/MOBA tail latency** | **INCOMPLETE — `path-not-quiet`**: the off-box floor's own idle p99 is **8.101888 ms** against the registered 4.0 ms bar, so no gate statistic exists. An **instrument** finding, foreseen and pre-registered; the run is valid, the path is not evaluable | `stamps/g2.md` §9.6 |
+| **G3 — camera / bursty egress** | **PASS, with C3 = `CEILING-MOVED`**: egress one-way p99 **1.491 ms** (median of 5 blocks) against a 33.3 ms bar; GSO **and** GRO active at 64 segments, `sndbufErrors` 0 on all 30 steps. C3 states no lever value in milliseconds — for the third time across three registrations | `stamps/g3.md` §9.6, C2/C4 |
+| **G4 — SFU fan-out** | **PASS**: **16,509/s** forward egress inside a 30 Hz frame gate, p99 **10.879 ms**, delivery **1.0000**. Stated as a *rate* bound — "the 50 is incidental to that number, not causal" | `stamps/g4.md` §9.6 |
+| **G5 — bulk / VOD** | **PASS**, all six clauses: **1.1473 Gbps** delivered against a 1.25 Gbps paced offer with the batching knob **off** — which falsified the registered prediction that knob-off would fall short of 1.000 Gbps. The unpaced `A6` window probe is **force-stripped** and licenses nothing | `stamps/g5.md` §9.6, §6 P5 |
+| **G7 — stream egress** | **PASS, unnarrowed** (the C4-closure redispatch upgraded G7-01's "PASS — narrowed by C4 NOT-EVALUATED"): **1.2498 Gbps** at 16 streams × 64 KiB, byte- and stream-ledgers exact, and client receive-socket drops a *measured* **0** in all 14 cell-repeats | `stamps/g7-02.md`; run-1 record at `stamps/g7.md` |
+| **G8 — many-rooms fan-out** | **PASS, narrowed to one cell of nine**: **2** concurrent 10-subscriber video rooms at 330/s per publisher, p99 **3.740 ms**, forward delivery **0.99995**. Eight of nine cells INVALID; the voice and mutual arms produced no room count at all | `stamps/g8.md` §9.6 |
+| **G9 — sustained churn** | **NO-VERDICT (INVALID — declared harness/infra fault)**: every generator child exited **127**, no session was ever established, not one clause has an input. Explicitly **not a MISS**; one rerun is licensed and unspent | `stamps/g9.md` §9.6, §9.8 |
+| **G11 arm X — exchange** | **PASS**: **60,000/60,000** exchanges at 1,000 sessions, RTT p99 **27.25 ms** raw against 50 ms, server-side accepts equal to attempted opens, host CPU median **25.6%** | `stamps/g11.md` §2 |
+| **G11 arm D — coupling** | **COUPLING-ABSENT** — a verdict-free reading: the registered choke did not appear, so the arm reports rather than grades | `stamps/g11.md` |
+| **G11 arm T — bidirectional throughput** | **MISS (C6-up only) — final valid verdict.** First graded T-100 in the gate's history: C1–C5, C7, C8 all PASS with supply exact at **1.00003** both directions; C6 up one-way p99 **348 / 328 ms** against 25 ms. Attributed to the conductor's read-side scheduling, pre-registered as such | `stamps/g11-t.md` |
+| **Paced broadcast (the G10 successor)** | **PASS — narrowed by C2 NO-VERDICT (V-SP)**: 5,000 sessions × 5 Hz, delivery **0.997859 / 0.997617 / 0.998633** with margin, RTT p50 **0.834 / 0.792 / 0.763 ms**, stall lever **−44.71 ms** median. The spread clause renders no verdict because its measuring instrument lost its licence that day | `stamps/paced-broadcast.md` |
+| **Deployment** | Not a gate — the operator-facing architecture chapter, written and reviewed | this document, below, + `2026-08-21-load-balancing-architecture.md` |
 
-### Placeholder — the broadcast pair
+**One gate is absent by design.** G6 (MMO) was registered
+(`registrations/g6-mmo.md`) and never dispatched on this rig. It has no
+verdict, no number, and no chapter here.
 
-*Chapter pending.* The paced-broadcast gate is not stamped. Nothing about
-broadcast envelopes should be quoted from this document until it is. The
-`sendDatagramMirror` path it certifies is merged
-(`crates/native/src/datagram_mirror.rs`) and is capped by a 1 ms JS-stall
-budget it measures against; that cap is a design statement, not a gate result.
-
-### Placeholder — the G11 T arm (bidirectional throughput)
-
-*Chapter pending.* T is **INVALID**, not missing: the V-P supply falsifier
-fired on both repeats. The correction addendum to `stamps/g11.md` and campaign
-ticket 10 locate the binding constraint on the **benchmark conductor's own JS
-thread** (93–95% of one core, running 100 downstream pacers and 100 upstream
-deframers in the same Bun process as the server under test), not on the
-product's egress path — the native queue peaked at 1,402 bytes and delivery was
-byte-exact. Offloading deframing to workers (T-PC2) recovered nothing, which
-locates the saturation in the write half. A compliant T arm re-registers at a
-witnessable shape or against a native paced emitter. Until then this document
-publishes **no bidirectional throughput envelope**.
+**G10 itself is not in this table.** Its VM-era MISS was ruled final for that
+rig, and the paced-broadcast gate supersedes its scenario on this one — the
+chapter below explains why that is a supersession rather than a re-run.
 
 ---
 
@@ -372,3 +372,673 @@ produced it:
 - **The conductor's share of the ~317% per-process CPU figure** is unmeasured
   (chapter 1). This is the single largest source of looseness in the sizing
   guidance.
+
+---
+
+# Paced broadcast — one payload to five thousand sessions
+
+**Verdict: PASS — narrowed by C2 NO-VERDICT (V-SP).**
+Stamp: `stamps/paced-broadcast.md`. Registration:
+`registrations/paced-broadcast.md`.
+
+This is the campaign's largest single-server claim, and the one whose narrowing
+matters most, so the narrowing is stated first and beside the number, not
+below it.
+
+## 1. What was measured
+
+A fleet of **5,000 sessions** over the cable, taking a **5 Hz** broadcast
+through the shipped `sendDatagramMirrorPaced` surface, at the pre-registered
+`c32 @ 30k` pacer configuration with round-robin ordering. Three **paired**
+blocks — control then paced, adjacent, by construction of the runner — run
+box-side under `/tmp/bench.lock` on 2026-08-21, ≈16:05–16:34Z, composition
+`val/pacer-03` @ `d779ad2f` (`stamps/paced-broadcast.md` §1).
+
+The surface under test is the merged mirror path
+(`crates/native/src/datagram_mirror.rs`), whose design is capped by a 1 ms
+JS-stall budget it measures against. That cap is a **design statement**; what
+follows is the gate result.
+
+## 2. The stamped numbers
+
+| clause | measured | verdict |
+|---|---|---|
+| **C1** delivery ≥ 0.995 | **0.997859 / 0.997617 / 0.998633**; 5,000/5,000 sessions, 0 failed, 0 lost, every cell | **PASS with margin** — min − 0.995 = 0.002617 exceeds the across-block range 0.001016, which is the §4.3 margin rule |
+| **C2** spread p99 ≤ 200.669 ms | 441.97 / 389.55 / 169.08 ms measured — **but unlicensed** | **NO-VERDICT (V-SP)** |
+| **C3′** paced RTT p50 ≤ 2.187 ms | **0.834 / 0.792 / 0.763 ms** — 2.6× under the bound, stable to 9% across blocks while the p99 tail swung 4.7× | **PASS** |
+| **C4** stall lever | paired δ **−44.71 / −45.83 / −43.22 ms** (paced 1.686–1.800 ms against control 45.02–47.51 ms); **median −44.71 ms**, ≈26× stall reduction | **READING CONFIRMED** |
+| **C5** control arm produced paired values | yes, all three blocks | **MET** |
+
+Sub-millisecond medians at 5,000 sessions and 5 Hz, through a merged product
+API, are the strongest latency figures this campaign produced at scale.
+
+**The control arm is the lever's justification, disclosed rather than graded.**
+The same offer, unpaced, delivered **0.9489 / 0.9434 / 0.9625** — the blast
+sheds **4–6%** of what the paced path delivers whole
+(`stamps/paced-broadcast.md` §2, C5).
+
+**−44.71 ms is the lever's third independent confirmation.** The paced sweep
+that preceded the gate measured −44.14 ms under a pairing that had drifted
+(deviation D-a); the corrected, F3-honoring pairing reproduces it.
+
+## 3. The narrowing: why the spread clause renders no verdict
+
+C2's bound was ratified at **J = 0** — "overlap itself the failure", the
+strictest form available (`registrations/paced-broadcast.md` §11). Grading it
+requires a sink that can certify sub-ceiling spreads, and on gate day the sink
+could not: the **V-SP** validity falsifier fired in **all six cells** — worst
+burst drain 88.49 ms ÷ completeness 0.714 = **123.94 ms** against the 106.76 ms
+ceiling the registration derived. INVALID dominates both PASS and MISS, so no
+verdict is rendered in either direction. The measured 441.97 / 389.55 /
+169.08 ms figures above are recorded, and they license nothing.
+
+The failure was **the Mac sink's**, and it was independently attributed the
+same day. On sweep day the same falsifier's input was 38.69 ms of drain; on
+gate day it was 88.49 ms, with burst `completenessMin` 0.357. That degradation
+is the same event the A-attribution verdict names
+(`registrations/a-attribution.md`, VERDICT 2026-08-21). Which instruments
+survived it is the useful part:
+
+> The delivery, median-RTT and stall instruments are box-side or
+> median-robust, and were **not** casualties. The spread instrument, which
+> reads the Mac's arrival timing, was.
+
+The same cross-reference disposes of the disclosure-only p99 row. Paced RTT p99
+read 389.5 / 286.8 / 83.0 ms and control 120.7 / 115.0 / 78.2 ms in cells whose
+medians are 0.76–0.83 ms. Per the A-attribution verdict, **cross-day absolute
+RTT-p99 numbers from this instrument are weather, not measurements** — a p50 of
+0.85 ms beside a p99 400× larger, with the box provably idle and cool, is
+measuring-process scheduling stall. No claim in this document rests on an
+off-box RTT p99.
+
+## 4. Falsifiers and integrity
+
+None of the gate's product-side falsifiers fired. Pacer integrity was clean:
+`lateClumps` **15 / 19 / 10** of ~46,944 clumps — **0.021–0.040%** against the
+ratified `f_LATE` of **5%** — with `refusedTargets`, `threadStartFailures` and
+`deferredFailures` all **0** in all three paced cells (F1). The broadcast
+identity closed exactly: 1,500,000 + 0 = 5,000 × 300, and 1,495,000 = 5,000 ×
+299 in the third block (F2). Thermal F5, at resolution 1, saw **zero** samples
+above the 125-sample quiet baseline's temperature maximum and a sub-2.1 GHz
+fraction of 2.7% against a 25% threshold.
+
+`scheduleResets` at 299/300 — roughly one per broadcast — is the benign
+identity the registration named in advance, and is disclosed as such.
+
+## 5. Ratification lineage
+
+Every judgement this gate needed from the maintainer was ratified before
+dispatch and is recorded on the registration: **J = 0**, **C3′/A_med = 0**
+(Amendment A-1, which re-derived C3 as a median clause on the ruling
+"re-derive"), **f_LATE = 5%**, **F5 resolution 1**, and precondition 6 closed
+on evidence. A-1 exists *because* of the A-attribution run: the maintainer
+refused to ratify an allowance `A` until the sweep's 4.9× paced-RTT repeat
+spread had an attributable cause, that measurement returned **H-mac**
+(measuring-end tail noise), and the clause was rebuilt around the median the
+verdict showed to be robust rather than around the tail it showed to be noise.
+
+## 6. Relation to G10
+
+**This gate supersedes G10's scenario; it is not a G10 re-run.** The
+G10-final ruling states it directly, and the registration quotes it verbatim
+(`registrations/paced-broadcast.md` §25-26):
+
+> *"A registration certifying a specific smaller shape would be a NEW gate if
+> ever needed, not a G10 re-run."*
+
+G10's own verdict — a MISS at 10,000 sessions on the VM rig — stands as final
+for that rig and is not reopened here (see the appendix). What this gate
+establishes is a **different, smaller, certified shape on new hardware**:
+5,000 sessions at 5 Hz, paced, at delivery ≥ 0.9976. G10's clauses are not
+graded by it and its 10,000-session fleet is not claimed.
+
+## 7. A recorded instrument defect
+
+The gate's §7 preflight **refused**, and the refusal was wrong: `preflight.ts`
+reported `10.99.0.1 routes over (unknown) — not the cable` while `ip route get
+10.99.0.1` on the box read `dev eno1 src 10.99.0.2` — the cable, exactly. The
+gate ran on the cable address and the Mac fleet connected 5,000/5,000. The
+consequence is disclosed rather than papered over: **no preflight artifact
+exists for this run and the §7 idle-RTT/loss table is undischarged.** The route
+detection defect in the preflight tool is recorded in the instrument chapter
+below.
+
+---
+
+# Bidirectional streams, arm T — the first graded T-100
+
+**Verdict: MISS (C6-up only) — final valid verdict. The supply wall is
+CLOSED.** Stamp: `stamps/g11-t.md`. Registration:
+`registrations/g11-t-redispatch.md`. Investigation: campaign ticket 10.
+
+## 1. Why this arm has a history
+
+Every prior attempt at T-100 died **INVALID on supply** — the V-P falsifier,
+which asks whether the harness actually offered the shape it registered. A gate
+that cannot be supplied grades nothing about the product. This run is the first
+time the arm was *gradable*, and the maintainer's pre-dispatch ruling was
+"dispatch, grade honestly", with the C6 outcome pre-registered as the likely
+one.
+
+## 2. The gate rung, graded
+
+T-100 — 100 sessions × 3 Mbps in **both** directions simultaneously, 60 s,
+two repeats, run **32480145202** on candidate `4a373765` (`stamps/g11-t.md`,
+"The gate rung, graded"):
+
+| clause | repeat 1 | repeat 2 |
+|---|---|---|
+| C1 up offered | **1.00003** PASS | **1.00003** PASS |
+| C2 down offered | **1.00003** PASS | **1.00003** PASS |
+| C3 byte ledgers | exact — 2,250,069,800 = 2,250,069,800 up, down exact | exact |
+| C4 drain | 0 errors / 0 resets / 0 backpressure timeouts / 100 of 100 closed | same |
+| C5 fairness | spread 1.0000 up, 1.0001 down, 100/100 | same |
+| **C6 up one-way p99 ≤ 25 ms** | **348 ms — MISS** | **328 ms — MISS** |
+| C7 down one-way p99 | **4.25 ms** PASS | **4.25 ms** PASS |
+| C8 memory governors | shipped values, worst case stated | PASS |
+
+**Down one-way p99 of 4.25 ms at T-100 — the server egressing 300 Mbps across
+100 sessions while ingesting the same — is the strongest downstream latency
+figure the T family has produced.**
+
+**The MISS's attribution, as pre-registered:** the 25 ms budget is exceeded by
+the **conductor's napi-bound read-side scheduling** at full-duplex saturation
+(host ~87.7%), not by the wire. Three facts locate it there — the identical
+machinery delivers 4.25 ms down in the same cells, T-25 and T-50 hold up-p99 at
+1.44 and 2.50 ms, and the X arm holds 27.25 ms RTT at 1,000 sessions. The MISS
+is final at this shape, on this rig, **with this harness as the application**. A
+leaner application may do better; the stamp claims only what was measured.
+
+## 3. The clean envelope, from the ladder
+
+The non-gate rungs grade nothing and are disclosed as ladder evidence
+(`stamps/g11-t.md`, "The ladder, disclosed"):
+
+| cell | up / down offered | up / down p99 (ms) | host CPU |
+|---|---|---|---|
+| T-25 | 1.000 / 1.000 | **1.44 / 0.57** | 26.5% |
+| T-50 | 1.000 / 1.000 | **2.50 / 0.97** | 51.5% |
+| T-100 (gate) | 1.000 / 1.000 | 348 / **4.25** | 87.8% |
+| T-200 | 0.62 / 1.000 | 1024 / 162 | 92.0% |
+
+> **The working bidirectional envelope on this rig: clean through 50 sessions ×
+> 3 Mbps in both directions with one-way p99 under 3 ms.** At 100 the box holds
+> throughput exactly but the conductor's up-read latency breaks the interaction
+> budget; at 200 the box itself saturates.
+
+## 4. The attribution correction, in three layers
+
+This arm's number was misattributed twice before it was attributed correctly.
+The history is recorded because each correction changed what the campaign
+believed the product could do.
+
+**Layer 1 — the VM-era claim: "the rig's CPU cannot offer 100 × 3 Mbps
+downstream."** Recorded in the VM ledger (`2026-08-19-production-grade-
+scenarios.md`, G11 T-cells INVALID under V-P). Wrong in its premise: the
+*client* never originates downstream at all.
+
+**Layer 2 — "the wall is inside the server's egress path."** This was campaign
+ticket 10's opening premise, and it rested on an artifact misreading: the
+`maxQueuedBytesPerSession` (2,097,152) and global (512 MiB) values in the
+artifact are **`DEFAULT_LIMITS` constants echoed verbatim**
+(`bench-g11.ts:1261-1262`), not measured queue depths. The actual measured
+queue peak, `peakSessionQueuedBytes`, was **1,402 bytes** across the entire 60 s
+T-100 investigation drive, and delivered equalled offered byte-for-byte
+(808,560,038 = 808,560,038). **Nothing queued; nothing was drain-bound.** The
+product server is exonerated: the native path drained everything JS handed it.
+
+**Layer 3 — the correct attribution: the conductor's single JS thread.**
+Confirmed by the per-thread sampler (`evidence/g11/g11-inv-t100.threads.tsv`):
+the Bun JS thread sat at **93–95% of one core** for the whole drive, addon
+threads ~61%, tokio workers ~9%. One thread was running 100 upstream deframers
+(~26.8k frames/s, which stayed exact) alongside 100 downstream pacers needing
+~26.4k awaited writes/s; the pacers got the residual, ≈0.40 — a ratio
+**invariant to generator topology** (single-process 0.411/0.405, sharded 2×50
+0.402) precisely because it is internal to one thread. H3 (drain cap) and H4
+(a structural constant) were refuted by the same data; the cliff is sharp —
+1.00 at 50 sessions, 0.36–0.40 at 100, **0.0068 at 200**.
+
+**The fix that failed, and what its failure proved.** T-PC2 moved deframing to
+worker threads (`probe/g11-bidi-04` @ `f1ec0c7`): shards 2, workers running and
+visibly spinning at 344% server CPU, up 1.00003 — and down **0.36649**, inside
+the baseline band. **No effect.** Removing ~26.8k frames/s of read-side work
+freed nothing the pacers could use, which locates the saturation in the **write
+half itself**: 100 per-stream pacers issuing ~26.4k awaited, env-bound napi
+`write()`s per second.
+
+**What closed the wall** was the third fix direction: a **native paced
+emitter** (`runPacedEmitter`, driving the product's own `write_bytes` path,
+with `downOriginator: "native-paced"` stamped in every cell and 0 emitter
+failures). Supply went from 0.40 to **1.00003**, and the arm became gradable
+for the first time.
+
+## 5. The verdict this arm actually delivers
+
+**The T arm's history is a harness finding, not a product finding.** Two of its
+three attribution layers blamed the product — once the rig's CPU, once the
+server's egress path — and both were wrong. What the graded run shows is a
+server that offers its registered shape exactly in both directions, keeps its
+byte ledgers to the byte, drains without a single error or reset, and egresses
+at 4.25 ms p99 while ingesting the same load. The clause it misses is an
+application-level latency budget measured through a harness whose read side is
+the thing that misses it.
+
+## 6. A recorded harness defect: V-K's stale constant
+
+The shipped classifier declared the run INVALID on **V-K**, and off-runner
+recomputation **un-fired** it, mechanically. V-K's `maxBatchBytes ≤ FRAME_BYTES`
+bound uses `FRAME_BYTES = 1400 + 2 = 1402` (`g11-plan.ts:24`), but the
+harness's actual tunnel frame is **1,420 B** — 1,400 payload plus a 20-byte
+header, the layout the emitter reproduces byte-exactly and the deframers parse.
+A single-frame crossing is therefore 1,420 B and the rule fires on **every
+knob-off T cell by construction**; it fired on G11-01 too, invisibly behind V-P
+at the time. The knob label does not lie: `batchedCrossings = 0` in every
+knob-off cell, and the knob-on cell shows `batchedCrossings ≈ dataCrossings` at
+max 65,536 B. Repeat 2's 1,422 B is read-side coalescing — one frame plus the
+next frame's 2-byte length prefix — not write batching.
+
+Per the campaign's §9.6 rule the classifier is not the verdict; its firing is
+recorded as **corroboration that disagrees**, with the cause disclosed. **Any
+future G11 branch should fix the constant**, and decide whether read-side
+coalescing belongs under a knob-off write-batching bound at all.
+
+---
+
+# The instrument — what this rig can witness, and what it cannot
+
+Nothing in this campaign was measured by a neutral observer. Every number above
+was produced by an instrument with its own ceilings, and several of the
+campaign's apparent product walls turned out to be those ceilings. This chapter
+states them, so that a reader can tell which of this document's silences are
+product limits and which are measurement limits.
+
+Sources: `registrations/instrument.md` (the F1 burst matrix, ticket 01 —
+**bound-free**: it carries properties, never thresholds), the A-attribution
+verdict (`registrations/a-attribution.md`), campaign ticket 10, and the gate
+stamps' own deviation sections.
+
+## 1. The sink wall — the Mac's RTL8153 ingress
+
+The campaign's off-box sink is a Mac receiving over a **USB RTL8153** Ethernet
+adapter, and it is the single most load-bearing instrument property in the
+campaign.
+
+**Smooth arrival** (`instrument.md` §6 P-5): **74,992 pps at 0.244% loss**, and
+**115,835 pps delivered at 2.652% loss**. Three independent routes — smooth
+iperf3, blast drain rate, and a second blast drain from an earlier day — land
+between **112k and 117k pps**, which the registration calls the strongest
+agreement in that document.
+
+**Burst-shaped arrival is a different wall entirely** (`instrument.md` §6 P-6,
+the registration's own "load-bearing property"). Holding the cable, the qdisc,
+the payload, and the *mean* rate fixed and varying only emission shape:
+
+| mean offered pps | smooth (iperf3) | burst-shaped (`burst-probe`) | ratio |
+|---|---|---|---|
+| ~75,000 | **0.244%** loss | **8.37%** loss | **34×** |
+| ~119,000 / ~124,000 | **2.652%** loss | **29.81%** loss | **11×** |
+
+The 75k row is the one that matters: that mean is **35% below** the sink's own
+smooth-arrival capability, its pacer was near-perfect (74,906–75,004 pps, a
+0.13% spread), and it still lost 8.37% uniformly across all fifteen bursts. A
+sink losing packets at 65% of its measured capability, evenly, is not
+rate-saturated — it is being handed packets faster than its instantaneous
+arrival window absorbs. The wall is **below the socket** (it survived a 6 MB
+recvspace test), consistent with a ring-and-USB-turnaround limit.
+
+**`fq` on the box's egress does not rescue burst-shaped traffic.** Post-`fq`
+blast lost 39.06% where pre-`fq` blast lost 42.62% under the same shape — a
+3.6-point difference is not a rescue. `fq` protects the sink only for traffic
+the qdisc can actually smooth; a userspace burst handing the kernel 10,000
+packets at once still arrives at the Mac as a burst.
+
+**This is the mechanism behind V-SP**, the falsifier that took the paced
+broadcast gate's spread verdict. A campaign whose sink sheds as a function of
+instantaneous arrival cannot certify arrival-spread bounds on a day when the
+sink is degraded — and it correctly declined to.
+
+**The 22%-at-140k figure inherited from the founding day-1/day-2 work needs
+qualification**, which `instrument.md` §8.8 supplies: "~100k pps clean" holds
+for *neither* shape as stated. Smooth arrival is clean at ~75k and already at
+2.1% by 118k; burst-shaped arrival is not clean at **any** rate the matrix
+tried, 75k included.
+
+## 2. The Mac as a measuring end — H-mac
+
+Off-box RTT in this campaign is measured by a prober on the Mac, and the
+A-attribution run (five repeats of the paced sweep's S1 cell, five instruments
+added that the sweep had lacked) established what that vantage can and cannot
+report:
+
+| repeat | RTT p50 | RTT p90 | RTT p99 |
+|---|---|---|---|
+| r1 | 0.86 ms | 52.3 | **423.1** |
+| r2 | 0.86 ms | 21.0 | 373.8 |
+| r3 | 0.83 ms | 21.0 | 371.7 |
+| r4 | 0.84 ms | 26.4 | 334.0 |
+| r5 | 0.83 ms | 33.8 | **309.9** |
+
+**The median is sub-millisecond and stable in every repeat; only the tail
+moves.** The box was provably clean throughout — Tctl ≤ 61.8 °C, loadavg1 ≤
+2.08, `performance` governor, pacer stall p99 1.76–1.89 ms — which killed the
+thermal and co-tenant hypotheses outright. The verdict:
+
+> **The sweep's 4.9× RTT-p99 repeat spread is measuring-end tail noise. The
+> same instrument produced 310–423 ms the same day with the box clean: a ~30×
+> cross-day swing that no box-side variable explains.** Cross-day absolute
+> RTT-p99 numbers from this instrument are weather, not measurements.
+
+Prober CPU medians (261–283%) matched sweep day, so the effect is **wakeup
+latency under host load**, not CPU starvation; the monotone decay across
+repeats tracks the Mac's independently-reported degraded state settling.
+
+**Two rules follow, and this document obeys both.** Off-box **medians** are
+robust and quotable. Off-box **RTT p99** is quotable only as a same-day,
+same-run *relative* comparison between paired arms — which is exactly the form
+the paced-broadcast C3′ clause was rebuilt into (Amendment A-1).
+
+**G2's INCOMPLETE is the same instrument seen from the other side.** Its
+off-box floor arm measured an idle p99 of **8.101888 ms** against a 4.0 ms bar
+— 81% of a 10 ms round-trip budget consumed by the vantage before the product
+is involved. The registration predicted this outcome in advance and called it a
+legitimate campaign result. **The Mac vantage cannot witness a single-digit-
+millisecond tail-latency claim**, and no such claim appears in this document.
+
+## 3. The cable and its preflight
+
+Cable: `box eno1 10.99.0.2 ↔ Mac en8 10.99.0.1`, MTU 1500, `fq` armed on
+`eno1`, Docker and Tailscale subnets verified non-colliding with `10.99.0.0/24`.
+
+The founding preflight (2026-08-20, `preflight-baremetal-2026-08-20.json`) came
+back **GREEN**: 600 ICMP samples at 0% loss, TCP **881,040,056 bit/s** with **0
+retransmits** over 10.006 s, jitter between 0.005 ms and 0.050 ms under UDP load
+in both directions, and a clean UDP ladder to 74,997 pps at 0% loss.
+
+**RTT depends on which end you ask, and the registration insists you say so.**
+Peer-toward-generator vantage: p50 **0.535 ms**, p99 **0.735 ms**, max 1.12 ms.
+Generator-side vantage: p50 0.672 ms, p99 **4.097 ms**, max 5.531 ms. Those two
+tails differ by 5.6×. *"A gate quoting 'the idle RTT' without naming its vantage
+has quoted nothing."*
+
+**Preflight route-parser defect, found 2026-08-21.** `preflight.ts` refused the
+paced-broadcast gate's preflight with `10.99.0.1 routes over (unknown) — not the
+cable`, while `ip route get 10.99.0.1` on the box read `dev eno1 src 10.99.0.2`
+— the cable. The tool's route detection fails to parse this kernel's output. The
+cost was real: that gate ran without a preflight artifact and its idle-RTT/loss
+table is undischarged. **Fix the parser before the next off-box gate.**
+
+## 4. The conductor's JS thread — the campaign's most expensive instrument
+property
+
+The benchmark conductor runs **in the same Bun process as the server under
+test**, and its work lands on the same single JS thread. Ticket 10's per-thread
+sampler measured the split during a T-100 drive
+(`evidence/g11/g11-inv-t100.threads.tsv`, 1 Hz over `/proc/<pid>/task/*/stat`
+deltas):
+
+| thread class | share of one core |
+|---|---|
+| **Bun JS thread** | **93–95%** |
+| addon threads | ~61% |
+| tokio workers | ~9% |
+| **process total** | **~317%** |
+
+**The dominant single consumer in that sample is harness code**, and the
+campaign never separated the conductor's share from the server's in a
+controlled way. That is the looseness the Deployment chapter's sizing section
+discloses, and it is the reason this document publishes no
+instances-per-core constant.
+
+## 5. Generator ceilings — what the harness can offer
+
+Three separate ceilings, all harness properties, each of which capped a gate:
+
+- **Bidirectional streams: ~50 sessions per conductor process.** Above that the
+  JS thread's write half saturates and offered supply collapses to ≈0.40
+  (§4 above, and the T-arm chapter). Closed for the T arm by the native paced
+  emitter; still true of any JS-side generator.
+- **JS write originator: ~63.3k writes/s at 1 KiB.** G7's B-1k cell is
+  originator-bound in both repeats and cannot reach its offered 152,588
+  writes/s. This one is a **product-relevant** finding as well as an instrument
+  one — it is the same JS thread an application's own write loop would use, and
+  the Deployment chapter treats it as the campaign's one genuine product wall.
+- **Box egress depends on which sender you ask.** iperf3's single-threaded UDP
+  client tops out at **118,992 pps / 190.39 Mbit/s** with a core pinned at
+  99.90%; the Bun `burst-probe` sender on the same box, same payload, same
+  qdisc, emits a p50 of **148,370 pps** and peaks at **196,010 pps** with zero
+  send-blocking — **1.6× more**, unexplained by the artifacts (plausibly
+  syscall batching, untested). Any statement about "what the box can send" must
+  name the sender.
+
+And one pacer fidelity property that bites whoever labels a cell by its knob:
+`burst-probe --pace-pps` is exact at 75k (−0.005%), **undershoots by 9.47% at
+100k**, and lands within 0.69% at 125k — non-monotone. *A cell labelled with a
+`--pace-pps` value is not thereby a cell at that rate*; read the achieved rate
+from the send artifact.
+
+## 6. Methods this campaign used, and would use again
+
+- **Off-runner recomputation as the verdict.** Every stamp recomputes its
+  clause values from raw artifact fields in a sandboxed process with no repo
+  code loaded, and treats the shipped classifier's output as *corroboration*.
+  It paid for itself twice: G11-T's V-K firing was un-fired on a stale
+  constant, and G7's classifier verdict (`INCOMPLETE`, 12 `V1-sink` firings)
+  disagreed with a run that was in fact valid.
+- **The 1 Hz host sidecar** (loadavg1, cpu0 frequency, Tctl, governor, docker
+  and tailscaled state — the F5-res-1 field set), started from a ≥120 s quiet
+  baseline before the first cell and running through the last. It is what let
+  the A-attribution run exonerate the box in one reading, and what lets the
+  gate stamps state "no throttle" as a measurement rather than an assumption.
+- **The per-thread CPU sampler** (`/proc/<pid>/task/*/stat` deltas at 1 Hz).
+  A whole-process CPU figure would have kept the T-arm wall misattributed
+  indefinitely; the per-thread split resolved it in one drive.
+- **Paired, adjacent arms.** Control-then-paced, adjacent by construction, is
+  what makes a claim survive an instrument having a bad day: both arms sample
+  the same weather.
+
+## 7. Instrument limits this campaign did not overcome
+
+- **Loss locus is inferred, not measured.** No kernel counters — no
+  `tc -s qdisc`, no NIC `rx_dropped`, no `netstat -su` — were captured at
+  either end of the burst matrix. The loss figures are real (those packets did
+  not reach the receiving application); the attribution to the Mac's RTL8153
+  ingress is a well-supported **inference**.
+- **One repetition per cell in the F1 matrix**, so there is **no dispersion
+  estimate** for any instrument property. The gates that needed variance
+  budgeted their own repeats.
+- **`burst-probe --role recv` on Linux is an open harness defect.** Both
+  Mac→box cells captured 1 of 15 and 4 of 15 bursts and are marked **advisory**;
+  they measure a role no gate uses. Box ingress truth comes from iperf3
+  instead: **114,989 pps at 0.355%**, and 74,994 pps at **exactly zero** loss
+  (0 of 600,003 packets).
+- **The `registration-common.md` §3 thermal-capture convention is not
+  genuinely implemented anywhere.** The F1 matrix captured to a side file, did
+  not record the governor or resident services, averaged frequency across 8
+  threads rather than per core, sampled only at cell endpoints, and skipped the
+  iperf3 ladders entirely — including the two cells that pinned a core at
+  99.90%. Later gates' sidecars fixed most of this; `run-matrix.sh`'s `therm()`
+  still needs the three missing fields, per-core frequencies, mid-cell
+  sampling, and a call from `iperf_ladder()`.
+- **GitHub caps a workflow at 25 inputs.** The G11-T redispatch hit it and had
+  to consolidate its knobs into a single `g11_generator` string
+  (`originator=native,deframe=0`). A dispatch surface that runs out of room is
+  a real constraint on how finely a gate can be parameterized, and it cost this
+  campaign one failed dispatch attempt (HTTP 422, no run id).
+
+---
+
+# HFT-adjacent positioning — what this product is and is not
+
+The campaign was asked, repeatedly, whether these envelopes qualify
+webtransport-bun for latency-sensitive financial workloads. The honest answer
+has two halves and they point in opposite directions.
+
+## Distribution: yes, at the stamped envelopes
+
+For **fan-out of the same or similar payloads to many long-lived subscribers**
+— market-data distribution to end-user clients, dashboards, mobile and browser
+consumers — this campaign measured real capability on a 4-core box:
+
+- **5,000 sessions at 5 Hz, paced broadcast: delivery 0.997859 / 0.997617 /
+  0.998633, RTT p50 0.834 / 0.792 / 0.763 ms** — narrowed by C2 rendering no
+  verdict on arrival spread (`stamps/paced-broadcast.md`, C1/C3′). Sub-
+  millisecond **medians** at that scale, through a shipped API.
+- **1.2498 Gbps of stream egress** at 16 streams × 64 KiB with exact byte and
+  stream ledgers and a *measured* zero receive-socket drops across 14
+  cell-repeats (`stamps/g7-02.md`, C2/C4).
+- **1,000 concurrent request/response sessions at RTT p99 27.25 ms**, 60,000 of
+  60,000 exchanges, at 25.6% of the box (`stamps/g11.md` §2).
+- **10,000 sessions** held with ingest p99 2.576 ms and delivery 1.000000, at
+  ~126.5 KB/session, linear (`stamps/g1.md` C1/C2/C3).
+- **Bursty, frame-shaped egress at one-way p99 1.491 ms** against a 33.3 ms
+  bar, with GSO and GRO active at 64 segments (`stamps/g3.md` C2/C4).
+
+Those are enough to build a distribution tier on, and the Deployment chapter
+says how to run more than one of them.
+
+## Hot path: no
+
+**webtransport-bun is not a tick-to-trade transport, and nothing in this
+campaign suggests it could become one.** The reasons are structural, and each
+is a number this campaign paid for:
+
+**1. There is one JS thread, and it is the measured ceiling.** The write
+originator sources ~**63.3k writes/s at 1 KiB** and cannot reach an offered
+152,588 (`stamps/g7.md`, B-1k). The same thread, running 100 stream pacers,
+saturates at 93–95% of one core and sheds 60% of its offered downstream
+(ticket 10). Every application callback, every payload construction, every
+`await` on a send shares that thread with the transport's own JS-side work. A
+hot path cannot be scheduled behind an event loop that also runs the
+application.
+
+**2. The runtime is garbage-collected, and the tails show it.** This document's
+tail figures live in the milliseconds and tens of milliseconds, not the
+microseconds: 27.25 ms exchange p99 at 1,000 sessions, 10.879 ms fan-out p99,
+4.25 ms one-way down p99 under full-duplex load. Those are good numbers for a
+distribution tier and they are three to four orders of magnitude away from what
+a hot path budgets.
+
+**3. This campaign's instrument cannot even witness a hot-path claim.** G2 —
+the one gate that set out to bound a single-digit-millisecond tail — returned
+INCOMPLETE because the measuring vantage's own idle p99 was 8.1 ms. Off-box
+RTT p99 from this rig is weather (the H-mac verdict). **Anyone claiming
+microsecond behaviour for this product would need an instrument this campaign
+does not own**, and this document declines to make a claim it could not have
+measured.
+
+**4. The measured latencies are application-level and harness-shaped.** The
+T-arm MISS is the clearest case: 348 ms up-p99 that belongs to the conductor's
+read-side scheduling, in the same cells where the down direction reads 4.25 ms.
+When latency is dominated by whichever JS thread is doing the reading, the
+transport's own contribution is not the number you are looking at.
+
+**The honest framing, then:** use it to *distribute* at the envelopes above,
+with N independent instances behind client-side assignment (Deployment,
+chapter 2). Do not put it between a signal and an order.
+
+---
+
+# Appendix — the VM-era ledger, and what bare metal corrected
+
+The campaign that preceded this one ran on a **4-vCPU Ubuntu VM on Hyper-V**
+(`hv_netvsc`, no hardware USO) hosted on an 8-logical-core Windows machine.
+Its documents are the historical record and were read for this appendix:
+
+- `docs/research/2026-08-19-production-grade-scenarios.md` — the gate ledger
+- `docs/research/2026-08-18-four-axes-measurement.md` — the four-axes campaign
+- `docs/research/2026-08-18-bandwidth-ceiling-attribution.md` — the ceiling
+
+**Where those three live, stated plainly:** they are **uncommitted** in the
+`rebind4-staging` working tree and are therefore *not* present in this branch's
+worktree. The links above will not resolve from a checkout of this branch until
+those documents are committed. They are cited as the sources this appendix was
+written from, with the same disclosure the campaign applies to its own
+gitignored scratch.
+
+**The standing rule of this document, restated: no VM-era number is carried
+forward as a bare-metal claim.** Where a gate has both, the bare-metal figure
+above is stated as a topology change, never as a delta, and the VM figure lives
+only here.
+
+## A.1 The VM ledger as it stood
+
+| gate | VM-era verdict | note carried from that document |
+|---|---|---|
+| G1 GPS/telemetry | **PASS, coverage-narrowed** | 10k sessions, delivery 1.000, ingest p99 2.9 ms, ~128 KB/session. The pass covers **staggered** arrival only; synchronized fleets read 0.699 with kernel rcvbuf loss, disclosed and not covered. The re-registration's authorization was disputed on the record |
+| G2 FPS/MOBA | **INCOMPLETE-ON-THAT-RIG** | evidence chain weakened on review; its licensed 10k observation describes a tree that stopped being the shipped default two hours later |
+| G3 camera egress | **INCOMPLETE** | the "rig can't source 1.5×" conclusion was **struck** on re-read — `originationLag` is recorded across `await send` and absorbs product send latency |
+| G4 video-call SFU | **PASS on its registered clauses** | N=50 p99 10.35 ms, delivery 1.000 — but the run-level "headroom 1.80" context was **struck**: the ceiling counted shadow-sink stubs that skip the native send |
+| G5 bulk/VOD | **NO-VERDICT** | with omitted disclosures restored: every cell except the control dropped on the server socket |
+| G10 broadcast | **MISS — final for that rig** | see A.3 |
+| G11 | X PASS · D coupling-absent · **T INVALID (V-P)** | see A.2 |
+
+Two findings in that document outranked its own gates, and both stand: the
+`WEBTRANSPORT_DATAGRAM_SEND_SYNC` default-ON landing was **not** a neutral
+change (G5 measured the shipped-default control moving +12.7% across it), and
+pre-registration hygiene had broken down at the edges — amendments asserting
+"no data existed" when runs had completed, dispatches missing from logs
+claiming exhaustiveness, and binding bars living in gitignored scratch with no
+version history. The bare-metal campaign's stamp discipline — off-runner
+recomputation, sidecars bracketing every dispatch, falsifiers registered before
+data — is the direct answer to that second finding.
+
+## A.2 Correction 1 — G11's T arm, re-attributed twice
+
+The VM ledger recorded T as INVALID with the attribution *"rig CPU can't offer
+100 × 3 Mbps down; the batching knob doesn't help."* Bare metal corrected it in
+two further steps — first wrongly, to "the server's egress path", then
+correctly, to **the conductor's own JS thread** — and then closed it with a
+native paced emitter that took supply from 0.40 to 1.00003. The full three-layer
+history is in the T-arm chapter above. The point worth carrying: **two of the
+three attributions blamed the product, and both were wrong.**
+
+## A.3 Correction 2 — the 160k ceiling, and G10's finality
+
+The VM-era bandwidth work chased a 160k datagrams/s offered shape and closed at
+a different number: **~103k/s delivered on-box with Cubic is that hardware's
+honest ceiling, and it is not a server-side limit**
+(`2026-08-18-bandwidth-ceiling-attribution.md`). It decomposed into three
+independently measured caps — sender co-residence capping the *offered* rate
+(~101k on-box against 151k from a sibling VM), client Cubic on loopback capping
+framing at ~105k/s, and the Hyper-V virtual switch's bursty invisible loss
+capping everything off-box (off-box Cubic framed 64k and delivered 62k; off-box
+**BBR framed 87.5k and delivered 42k** — BBR floods a dropping path that Cubic
+backs off from, which also reinterpreted the on-box BBR ingest collapse as
+overdriving rather than a GRO artifact).
+
+**Every remaining lever there was physical, not software in this repo** — which
+is precisely why this campaign moved to bare metal and a real cable.
+
+G10's VM-era MISS was then ruled **final for that rig** under the standing
+maintainer ruling that a hardware-scoped miss counts as a closed gate. The
+paced-broadcast chapter above supersedes its *scenario* at a smaller, certified
+shape on the new topology; it does not reopen or re-grade G10, and the
+G10-final ruling's own words govern: *"A registration certifying a specific
+smaller shape would be a NEW gate if ever needed, not a G10 re-run."*
+
+## A.4 Correction 3 — the "rebind" homonym
+
+An earlier revision of the load-balancing analysis claimed this project runs
+"rebind soaks" covering NAT rebinding. **That was a false weld of a homonym.**
+In this repository "rebind №4 / №5" names a *release-evidence* rebind —
+re-pointing a release candidate at regenerated evidence
+(`docs/RELEASE_1.0_STATUS.md`) — and has nothing to do with NAT. **No
+NAT-rebind test exists anywhere in the tree**: `soak-long.yml` contains none,
+and the only mention is a doc comment in `crates/native/src/client.rs`. The
+correction is carried in
+`docs/research/2026-08-21-load-balancing-architecture.md` §1 and is the reason
+this document's Deployment chapter states its 4-tuple argument as a **deduction
+from RFC 9000 §5.1/§9 and from quinn-proto's source**, not as a measurement
+this project owns.
+
+## A.5 What the VM era contributed that survives
+
+Not everything there was corrected. The H7 batched-delivery lever (1.96×) and
+the hop-removal work shipped and are in the tree the bare-metal gates measured;
+the zombie-session / no-idle-timeout product observation stands and is the
+reason the Deployment chapter can state the 60 s stall bound precisely; and the
+four-axes finding that the JS originator is the binding constraint on bursty
+egress was **reproduced independently on bare metal**, in G7's B-1k cell and in
+G11's T arm. That is the one VM-era conclusion this campaign confirmed rather
+than corrected — and, not coincidentally, it is the one product wall this
+document publishes.
