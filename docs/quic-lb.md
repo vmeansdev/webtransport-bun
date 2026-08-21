@@ -202,9 +202,9 @@ or a backend's counters, not what the application experiences.
   reading of RFC 9000 and of quinn-proto's source.
 - Reuseport rehash-on-restart has not been measured on any target kernel.
 - The eBPF example compiled clean with `clang -target bpf` against Linux
-  7.0.0-30-generic headers (2026-08-21, the campaign box) — **on the revision
-  before the review fixes it now carries**; the re-compile is owed and has not
-  been run. It has never been loaded, attached, verifier-checked, or run with
-  traffic.
+  7.0.0-30-generic headers (2026-08-21, the campaign box) — both the original
+  revision and the current post-review text (re-compiled the same day at tip
+  `f7c9058`, zero diagnostics). It has never been loaded, attached,
+  verifier-checked, or run with traffic.
 - No gate has run with `quicLb` enabled, so its byte overhead is arithmetic, not
   a measurement.

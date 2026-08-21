@@ -11,7 +11,7 @@ bare-metal box (Linux 7.0.0-30-generic, libbpf-dev installed),
 diagnostics, a 15,984-byte object. That establishes that it parses and
 type-checks against that kernel's headers, and nothing else.
 
-**That compile predates the current source.** It was run against the revision
+**Update, same day: the post-review source compiles too.** The current text (tip `f7c9058`, after the review fixes) was recompiled on the same box with the same command — clean, zero diagnostics. The pre-review note below is kept for provenance; it was run against the revision
 before the review fixes now in the file (the short-header fixed-bit test
 removed, Initial/0-RTT routed by DCID, `steer_stats` moved to a per-CPU array).
 The re-compile on the box is owed and has not been run; until it is, treat the
