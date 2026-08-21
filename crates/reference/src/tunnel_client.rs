@@ -279,6 +279,12 @@ struct Options {
     target_bytes_per_sec: u64,
     /// Exchange arm: exchanges per second per session.
     exchanges_per_sec: f64,
+    /// First global session index this process drives. A sharded fleet splits
+    /// its sessions across several processes, and the frame's `session` field
+    /// plus the per-session summary rows must stay globally distinct — two
+    /// shards both numbering from 0 would fold different sessions into one key
+    /// on the server's per-session ledger.
+    session_base: usize,
     run_id: String,
     host: String,
 }
@@ -311,6 +317,7 @@ fn parse_args() -> Options {
         frame_bytes: 1402,
         target_bytes_per_sec: 375_000,
         exchanges_per_sec: 2.0,
+        session_base: 0,
         run_id: "unset".to_string(),
         host: "unset".to_string(),
     };
@@ -346,6 +353,9 @@ fn parse_args() -> Options {
             "--exchanges-per-sec" => {
                 opts.exchanges_per_sec =
                     parse_or_default("--exchanges-per-sec", args.next(), 2.0f64)
+            }
+            "--session-base" => {
+                opts.session_base = parse_or_default("--session-base", args.next(), 0usize)
             }
             "--run-id" => opts.run_id = args.next().unwrap_or_else(|| "unset".to_string()),
             "--host" => opts.host = args.next().unwrap_or_else(|| "unset".to_string()),
@@ -470,10 +480,13 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(opts.sessions);
-    for index in 0..opts.sessions {
-        if !per_session_gap.is_zero() && index > 0 {
+    for local_index in 0..opts.sessions {
+        if !per_session_gap.is_zero() && local_index > 0 {
             tokio::time::sleep(per_session_gap).await;
         }
+        // The global index: what the frames stamp, what the per-session summary
+        // rows carry, and what the logs name. Local position only paces the ramp.
+        let index = opts.session_base + local_index;
         let url = opts.url.clone();
         let endpoint = Arc::clone(&endpoint);
         let shared = Arc::clone(&shared);

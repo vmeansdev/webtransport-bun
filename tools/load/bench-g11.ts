@@ -67,13 +67,15 @@ import {
 	encodeFrame,
 	FrameClass,
 } from "./g11-frame.ts";
-import {
-	emptySnapshot,
-	G11Histogram,
-	type LatencySnapshot,
-	percentileMs,
-} from "./g11-histogram.ts";
+import { emptySnapshot, G11Histogram, percentileMs } from "./g11-histogram.ts";
 import { runPacedStream } from "./g11-pacer.ts";
+import {
+	type ClientSummary,
+	compositeShardChild,
+	mergeClientSummaries,
+	shardPlan,
+	type ShardSlice,
+} from "./g11-shard.ts";
 import {
 	backlogTargetBytes,
 	bytesPerSecPerDirection,
@@ -130,6 +132,21 @@ const DRIVEN_GATE_REPEATS = Number(process.env.G11_REPEATS ?? 2);
 const BASE_PORT = Number(process.env.G11_BASE_PORT ?? 4520);
 /** Total connect ramp. Sessions spread evenly across it — K2, T02's mechanism. */
 const CONNECT_STAGGER_MS = Number(process.env.G11_STAGGER_MS ?? 2000);
+
+/**
+ * Arm T's sessions-per-generator-process ceiling. One tunnel-client process
+ * sourced T-50 exactly and missed T-100 at ~217% of one core while the host
+ * had headroom, so the fleet is split into ceil(sessions / this) processes
+ * with contiguous `--session-base` ranges. 50 is that measured ceiling, not a
+ * tuned figure; at or above the cell's session count the plan is one shard and
+ * the cell runs exactly as it did before sharding existed.
+ */
+const SHARD_SESSIONS = Number(process.env.G11_SHARD_SESSIONS ?? 50);
+if (!Number.isInteger(SHARD_SESSIONS) || SHARD_SESSIONS < 1) {
+	throw new Error(
+		`g11: G11_SHARD_SESSIONS must be a positive integer, got '${process.env.G11_SHARD_SESSIONS}'`,
+	);
+}
 
 const SETTLE_POLL_MS = 250;
 const SETTLE_QUIET_POLLS = 4;
@@ -714,45 +731,6 @@ function driveExchangeStream(
 // One cell repeat
 // ---------------------------------------------------------------------------
 
-type ClientSummary = {
-	runId: string;
-	host: string;
-	drivingSessions: number;
-	sessionsOk?: number;
-	sessionsErr?: number;
-	streamsErr?: number;
-	streamErrors?: number;
-	streamsClosedBothHalves: number;
-	framesWritten?: number;
-	bytesWritten: number;
-	framesRead?: number;
-	bytesRead: number;
-	exchangesAttempted?: number;
-	exchangesCompleted?: number;
-	streamsOpened?: number;
-	peakConcurrentBidiPerSession?: number;
-	perSession: {
-		index: number;
-		bytesWritten: number;
-		framesWritten: number;
-		bytesRead: number;
-		framesRead: number;
-	}[];
-	latency: LatencySnapshot;
-	schedulerLag: LatencySnapshot;
-	/** Rust generator only: write call → write settled. Disclosure, not a bar. */
-	writeSettle?: LatencySnapshot;
-	writeLatency?: LatencySnapshot;
-	writeLatencyP99Ms?: number;
-	backpressureTimeouts?: number;
-	peakSessionQueuedBytes?: number | null;
-	peakInboundStreamBytes?: number | null;
-	peakInboundSessionBytes?: number | null;
-	inboundReservedTotalBytes?: number | null;
-	inboundReserveTimeouts?: number | null;
-	crossings?: CrossingFacts & { meanBytesPerCrossing: number };
-};
-
 type StepEnvelope = {
 	cell: CellSpec;
 	repeat: number;
@@ -765,6 +743,8 @@ type StepEnvelope = {
 	deadlineMs: number;
 	/** `null` only when a killed child never reaped. */
 	exitCode: number | null;
+	/** How many generator processes drove this cell's client fleet. */
+	shardCount: number;
 	hostCpuMedianPct: number | null;
 	clientCpuPct: number | null;
 	serverCpuPct: number | null;
@@ -805,9 +785,20 @@ function parseSummary(stdout: string, prefix: string): ClientSummary | null {
 	}
 }
 
+/**
+ * Arm T's shard plan for this cell; every other arm is one process, exactly as
+ * before. Arm X sourced its registered rung single-process (X-1000 passed), so
+ * sharding is scoped to the arm whose offer was measured short.
+ */
+function shardsFor(cell: CellSpec): ShardSlice[] {
+	if (cell.arm !== "T") return [{ base: 0, sessions: cell.sessions }];
+	return shardPlan(cell.sessions, SHARD_SESSIONS);
+}
+
 function childCommand(
 	cell: CellSpec,
 	port: number,
+	shard: ShardSlice,
 ): { cmd: string[]; prefix: string } {
 	const url = `https://127.0.0.1:${port}`;
 	if (cell.arm === "T") {
@@ -820,7 +811,9 @@ function childCommand(
 				"--arm",
 				"tunnel",
 				"--sessions",
-				String(cell.sessions),
+				String(shard.sessions),
+				"--session-base",
+				String(shard.base),
 				"--duration-secs",
 				String(cell.stepSeconds),
 				"--connect-stagger-ms",
@@ -970,13 +963,33 @@ async function runStep(
 	const cpuMhzSamples: number[] = [];
 	const startedAt = Date.now();
 
-	const { cmd, prefix } = childCommand(cell, port);
-	const child = Bun.spawn(cmd, { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
-	const stdoutPromise = new Response(child.stdout).text();
-	const stderrPromise = new Response(child.stderr).text();
+	// One generator process per shard (arm T splits its fleet; every other arm
+	// is the single shard it always was). Shard spawns are offset by the fleet's
+	// global connect gap so the aggregate ramp stays one even stream across the
+	// same stagger window, rather than K sessions arriving on each gap tick.
+	const shards = shardsFor(cell);
+	const shardGapMs = CONNECT_STAGGER_MS / Math.max(cell.sessions - 1, 1);
+	const children: ReturnType<typeof Bun.spawn>[] = [];
+	const shardStdout: Promise<string>[] = [];
+	const shardStderr: Promise<string>[] = [];
+	let prefix = "";
+	for (let i = 0; i < shards.length; i += 1) {
+		if (i > 0 && shardGapMs > 0) await Bun.sleep(shardGapMs);
+		const command = childCommand(cell, port, shards[i] as ShardSlice);
+		prefix = command.prefix;
+		const child = Bun.spawn(command.cmd, {
+			cwd: ROOT,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		children.push(child);
+		shardStdout.push(new Response(child.stdout).text());
+		shardStderr.push(new Response(child.stderr).text());
+	}
+	const composite = compositeShardChild(children);
 
-	const clientTicks0 = readPidCpuTicks(child.pid);
-	let clientTicksLast = clientTicks0;
+	const clientTicks0 = children.map((c) => readPidCpuTicks(c.pid));
+	const clientTicksLast = [...clientTicks0];
 	const hostSamples: number[] = [];
 	let prevHost: CpuSnapshot | null = readHostCpu();
 	const deadlineMs = cellDeadlineMs({
@@ -986,7 +999,7 @@ async function runStep(
 		childTailMs:
 			CHILD_TAIL_FIXED_MS + cell.sessions * CHILD_TAIL_PER_SESSION_MS,
 	});
-	const wait = await waitForChildWithDeadline(child, {
+	const wait = await waitForChildWithDeadline(composite, {
 		deadlineMs,
 		sampleIntervalMs: SAMPLE_INTERVAL_MS,
 		onSample: () => {
@@ -994,8 +1007,10 @@ async function runStep(
 			const host = hostCpuPct(prevHost, nextHost);
 			prevHost = nextHost;
 			if (host !== null) hostSamples.push(host);
-			const ticks = readPidCpuTicks(child.pid);
-			if (ticks !== null) clientTicksLast = ticks;
+			for (let i = 0; i < children.length; i += 1) {
+				const ticks = readPidCpuTicks((children[i] as { pid: number }).pid);
+				if (ticks !== null) clientTicksLast[i] = ticks;
+			}
 			const mhz = readHostLoad().cpuMhzMean;
 			if (mhz !== null) cpuMhzSamples.push(mhz);
 			foldSessionCounters(record, liveSessions);
@@ -1016,12 +1031,16 @@ async function runStep(
 	foldSessionCounters(record, liveSessions);
 
 	const exitCode = wait.exitCode;
-	const [stdout, stderr] = wait.deadlineBreached
-		? await Promise.all([
-				valueOrAfter(stdoutPromise, DEADLINE_REAP_GRACE_MS, ""),
-				valueOrAfter(stderrPromise, DEADLINE_REAP_GRACE_MS, ""),
-			])
-		: [await stdoutPromise, await stderrPromise];
+	const stdouts = wait.deadlineBreached
+		? await Promise.all(
+				shardStdout.map((p) => valueOrAfter(p, DEADLINE_REAP_GRACE_MS, "")),
+			)
+		: await Promise.all(shardStdout);
+	const stderrs = wait.deadlineBreached
+		? await Promise.all(
+				shardStderr.map((p) => valueOrAfter(p, DEADLINE_REAP_GRACE_MS, "")),
+			)
+		: await Promise.all(shardStderr);
 	const childDriveSec = (Date.now() - startedAt) / 1000;
 	const settle = await settleRecord(record);
 	const cpu1 = process.cpuUsage(cpu0);
@@ -1041,13 +1060,45 @@ async function runStep(
 	>;
 	const serverCrossings = streamBatchDiagnosticsSnapshot();
 	const serverRssMb = process.memoryUsage().rss / (1024 * 1024);
-	if (exitCode !== 0) console.error(stderr.slice(-2000));
+	if (exitCode !== 0) {
+		for (let i = 0; i < stderrs.length; i += 1) {
+			const tail = (stderrs[i] ?? "").slice(-2000);
+			if (tail) console.error(`g11: shard ${i} stderr tail:\n${tail}`);
+		}
+	}
 	// The client summary of a killed child is a truncated window, not a short
 	// cell: parsing it would put half-measured numbers into the artifact beside
-	// the flag that says they are not measurements.
-	const clientSummary = wait.deadlineBreached
-		? null
-		: parseSummary(stdout, prefix);
+	// the flag that says they are not measurements. With shards the rule is
+	// all-or-nothing: one missing or unparseable shard summary makes the whole
+	// cell's client side absent — a partial fleet must never read as a fleet.
+	let clientSummary: ClientSummary | null = null;
+	if (!wait.deadlineBreached) {
+		const parsed = stdouts.map((out) => parseSummary(out, prefix));
+		if (parsed.every((s): s is ClientSummary => s !== null)) {
+			try {
+				clientSummary = mergeClientSummaries(parsed);
+			} catch (err) {
+				console.error(`g11: shard merge refused: ${err}`);
+			}
+		} else {
+			console.error(
+				`g11: ${parsed.filter((s) => s === null).length} of ${parsed.length} shard summaries missing — dropping the cell's client side`,
+			);
+		}
+	}
+	// The fleet's CPU is the sum of its processes'. One unmeasured shard makes
+	// the sum unmeasured (null → NaN in the facts), which V-S2 treats as
+	// un-evaluable rather than idle.
+	let clientCpuSumPct: number | null = 0;
+	for (let i = 0; i < children.length; i += 1) {
+		const pct = pidCpuPct(
+			clientTicks0[i] ?? null,
+			clientTicksLast[i] ?? null,
+			childDriveSec,
+		);
+		if (pct === null || clientCpuSumPct === null) clientCpuSumPct = null;
+		else clientCpuSumPct += pct;
+	}
 
 	// Bounded, and never thrown. A cell's close rejects with
 	// `E_BACKPRESSURE_TIMEOUT: ... asyncOpsPending=N` when the native drain
@@ -1074,8 +1125,9 @@ async function runStep(
 		deadlineBreached: wait.deadlineBreached,
 		deadlineMs,
 		exitCode,
+		shardCount: shards.length,
 		hostCpuMedianPct: median(hostSamples),
-		clientCpuPct: pidCpuPct(clientTicks0, clientTicksLast, childDriveSec),
+		clientCpuPct: clientCpuSumPct,
 		serverCpuPct,
 		serverRssMb,
 		serverSocketDrops: socket ? socket.drops : null,
@@ -1398,7 +1450,14 @@ async function main(): Promise<void> {
 
 	for (const cell of cells) {
 		for (let r = 1; r <= cell.repeats; r += 1) {
-			console.log(`g11: ${cell.name} repeat ${r}/${cell.repeats}`);
+			const plannedShards = shardsFor(cell);
+			console.log(
+				`g11: ${cell.name} repeat ${r}/${cell.repeats}${
+					plannedShards.length > 1
+						? ` (generator sharded ${plannedShards.length}×${plannedShards.map((s) => s.sessions).join("/")})`
+						: ""
+				}`,
+			);
 			const env = await runStep(cell, r, tls);
 			if (cell.arm === "X") {
 				const facts = exchangeFacts(env);
@@ -1451,6 +1510,11 @@ async function main(): Promise<void> {
 			// be the one that forgot — the flag is a property of the cell, not of
 			// the reading taken from it.
 			const entry = raw[`${cell.name}#${r}`] as Record<string, unknown>;
+			// How many generator processes drove this cell's client fleet. A
+			// sharded offer is a different generator topology than a single
+			// process's, and a reader comparing against a pre-shard run must be
+			// able to see which one they hold.
+			entry.generatorShards = env.shardCount;
 			entry.hostLoad = {
 				start: env.hostLoadStart,
 				end: env.hostLoadEnd,
@@ -1504,6 +1568,9 @@ async function main(): Promise<void> {
 			exchangeStepSeconds: EXCHANGE_STEP_SECONDS,
 			couplingStepSeconds: COUPLING_STEP_SECONDS,
 			connectStaggerMs: CONNECT_STAGGER_MS,
+			// Arm T's generator sharding: sessions per process; the per-cell
+			// process count is stamped on each cell as `generatorShards`.
+			shardSessionsPerProcess: SHARD_SESSIONS,
 			// The deadline's child-tail terms travel with the artifact: a breach is
 			// only readable against the phases the deadline was built from.
 			childTailFixedMs: CHILD_TAIL_FIXED_MS,
