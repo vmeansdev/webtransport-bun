@@ -722,6 +722,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "idna",
+ "libc",
  "mimalloc",
  "napi",
  "napi-build",

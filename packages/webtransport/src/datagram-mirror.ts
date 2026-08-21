@@ -112,20 +112,161 @@ export function decodeMirrorResult(
 	const failures: DatagramMirrorFailure[] = [];
 	for (let i = 0; i < native.failed.length; i += 1) {
 		const index = native.failed[i] as number;
-		const code = MIRROR_FAILURE_CODES[native.codes[i] as number];
 		const target = targets[index] ?? "";
 		failures.push({
 			target,
 			index,
-			error: new WebTransportError(
-				code ?? E_INTERNAL,
-				code
-					? `${code}: mirror send to ${target} failed`
-					: `E_INTERNAL: unknown mirror failure code ${native.codes[i]}`,
-			),
+			error: mirrorError(native.codes[i] as number, target, "mirror send to"),
 		});
 	}
 	return { sent: native.sent, failures };
+}
+
+/** What native returns from the paced call: refusals only, as parallel arrays. */
+export type NativeDatagramMirrorAdmission = {
+	/** False when the pacer knob is off and nothing was offered. */
+	paced: boolean;
+	admitted: number;
+	refused: Uint32Array;
+	codes: Uint8Array;
+};
+
+/**
+ * What {@link sendDatagramMirrorPacedChecked} hands the application.
+ *
+ * This envelope carries no delivery count, and that absence is the design: when
+ * a paced call returns, nothing has been resolved, owner-checked or
+ * budget-checked — the schedule has taken the targets and the pacer thread will
+ * attempt them later. `admitted` says how many it took, and nothing here can be
+ * mistaken for how many arrived. Delivery is `admitted` minus the failures that
+ * later arrive through `readMirrorReports()`.
+ */
+export type DatagramMirrorAdmission = {
+	/** Targets accepted onto the pacer's schedule. Not a delivery count. */
+	readonly admitted: number;
+	/**
+	 * Targets the schedule refused, in target order, always `E_QUEUE_FULL`:
+	 * the queue was already holding its bound of outstanding work.
+	 *
+	 * A set, not a prefix — each refusal names its own index, so a caller never
+	 * has to reconstruct which targets travelled from a boundary. Distinct from
+	 * the `E_QUEUE_FULL` *reports* that arrive later, which mean the opposite
+	 * end of the path: that target had no byte budget when its turn came.
+	 */
+	readonly refused: readonly DatagramMirrorFailure[];
+};
+
+/** One deferred per-target failure, as native holds it in the ring. */
+export type NativeMirrorReport = { target: string; code: number };
+
+/**
+ * One deferred failure from a paced broadcast.
+ *
+ * Failures only: a target that took the payload is never reported, so a healthy
+ * broadcast to 10,000 subscribers produces nothing here. `E_SESSION_CLOSED`
+ * entries are the reap list and `E_QUEUE_FULL` entries are the retry list,
+ * exactly as in the synchronous envelope.
+ */
+export type MirrorReport = {
+	/** The session id, as the caller wrote it in its target list. */
+	readonly target: string;
+	/** The same error identity every other send path produces. */
+	readonly error: WebTransportError;
+};
+
+const NO_REPORTS: readonly MirrorReport[] = Object.freeze([]);
+
+/** Shared decode for both envelopes: one native code, one error identity. */
+function mirrorError(
+	code: number,
+	target: string,
+	what: string,
+): WebTransportError {
+	const decoded = MIRROR_FAILURE_CODES[code];
+	return new WebTransportError(
+		decoded ?? E_INTERNAL,
+		decoded
+			? `${decoded}: ${what} ${target} failed`
+			: `E_INTERNAL: unknown mirror failure code ${code}`,
+	);
+}
+
+/** Turn native's parallel refusal arrays into the admission envelope. */
+export function decodeMirrorAdmission(
+	targets: readonly string[],
+	native: NativeDatagramMirrorAdmission,
+): DatagramMirrorAdmission {
+	if (native.refused.length === 0) {
+		return { admitted: native.admitted, refused: NO_FAILURES };
+	}
+	const refused: DatagramMirrorFailure[] = [];
+	for (let i = 0; i < native.refused.length; i += 1) {
+		const index = native.refused[i] as number;
+		const target = targets[index] ?? "";
+		refused.push({
+			target,
+			index,
+			error: mirrorError(
+				native.codes[i] as number,
+				target,
+				"paced mirror admission for",
+			),
+		});
+	}
+	return { admitted: native.admitted, refused };
+}
+
+/** Turn one drained native batch into reports an application can act on. */
+export function decodeMirrorReports(
+	native: readonly NativeMirrorReport[],
+): readonly MirrorReport[] {
+	if (native.length === 0) return NO_REPORTS;
+	return native.map((entry) => ({
+		target: entry.target,
+		error: mirrorError(entry.code, entry.target, "paced mirror send to"),
+	}));
+}
+
+/**
+ * Validate the caller's arguments and hand the fan-out to the pacer.
+ *
+ * The same argument checks as {@link sendDatagramMirrorChecked}, including the
+ * same 10,000 cap — but the cap means something different here and the message
+ * says so. On the synchronous path it is a JS-thread *stall* budget; a paced
+ * call's JS cost is one lock and one gather whatever N is, so here it is an
+ * argument-sanity bound. It is kept because a `RangeError` is cheaper to debug
+ * than a silent mass refusal, not because the stall derivation still applies.
+ */
+export function sendDatagramMirrorPacedChecked(
+	send: (
+		targets: string[],
+		payload: Uint8Array,
+	) => NativeDatagramMirrorAdmission,
+	targets: readonly string[],
+	payload: Uint8Array,
+): DatagramMirrorAdmission {
+	if (!Array.isArray(targets)) {
+		throw new TypeError(
+			"sendDatagramMirrorPaced expects an array of session ids",
+		);
+	}
+	if (!ArrayBuffer.isView(payload)) {
+		throw new TypeError("sendDatagramMirrorPaced expects a Uint8Array payload");
+	}
+	if (targets.length > DATAGRAM_MIRROR_MAX) {
+		throw new RangeError(
+			`sendDatagramMirrorPaced accepts at most ${DATAGRAM_MIRROR_MAX} targets; got ${targets.length}. The bound is argument sanity, not a stall budget — a paced call's cost on this thread does not grow with the list.`,
+		);
+	}
+	for (let i = 0; i < targets.length; i += 1) {
+		if (typeof targets[i] !== "string") {
+			throw new TypeError(
+				`sendDatagramMirrorPaced expects string session ids; element ${i} is not one`,
+			);
+		}
+	}
+	if (targets.length === 0) return { admitted: 0, refused: NO_FAILURES };
+	return decodeMirrorAdmission(targets, send(targets as string[], payload));
 }
 
 /**
