@@ -57,7 +57,8 @@ Three pieces, and each is inert without the others:
 3. **An `SK_REUSEPORT` eBPF program** attached to the group reads the server-ID
    bytes and selects the matching socket, instead of hashing.
    [`examples/quic-lb/steer_by_cid.bpf.c`](../examples/quic-lb/steer_by_cid.bpf.c)
-   is a reference for writing one — not compiled, not tested, not shipped.
+   is a reference for writing one — it compiles, but it has never been loaded,
+   attached, or tested, and it is not shipped.
 
 The result is rebind-safe **after the first flight**: once the client adopts a
 server-issued connection ID, its packets carry the server ID wherever the client
@@ -178,6 +179,8 @@ other's connections either.
 - No NAT-rebind measurement exists in this project; the rebind argument is a
   reading of RFC 9000 and of quinn-proto's source.
 - Reuseport rehash-on-restart has not been measured on any target kernel.
-- The eBPF example has never been compiled, loaded, or verifier-checked.
+- The eBPF example compiles clean with `clang -target bpf` against Linux
+  7.0.0-30-generic headers (2026-08-21, the campaign box). It has never been
+  loaded, attached, verifier-checked, or run with traffic.
 - No gate has run with `quicLb` enabled, so its byte overhead is arithmetic, not
   a measurement.

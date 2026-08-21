@@ -1,13 +1,23 @@
 # QUIC-LB CID steering — reference `SK_REUSEPORT` program
 
 **This is an example, not a shipped component.** Nothing in this directory is
-compiled, tested, loaded, or published. It is not part of the npm package, no
-CI job touches it, and no kernel in this project has ever run it. It exists so
-an operator building CID-aware steering has a correct starting point instead of
-a blank file.
+built by the repository, tested, loaded, or published. It is not part of the
+npm package and no CI job touches it. It exists so an operator building
+CID-aware steering has a correct starting point instead of a blank file.
 
-- [`steer_by_cid.bpf.c`](steer_by_cid.bpf.c) — the BPF program.
-- [`attach.sh.example`](attach.sh.example) — a loader sketch, equally untested.
+Exactly one claim is backed by a run: on 2026-08-21, on the campaign's
+bare-metal box (Linux 7.0.0-30-generic, libbpf-dev installed),
+`clang -target bpf -O2 -g -c steer_by_cid.bpf.c` compiled clean — zero
+diagnostics, a 15,984-byte object. That establishes that it parses and
+type-checks against that kernel's headers, and nothing else.
+
+**The program has never been submitted to a verifier, never attached to a
+socket, and never carried a packet.** Verifier acceptance and runtime behavior
+are yours to establish on the kernel you target. The loader below has never
+been run at all.
+
+- [`steer_by_cid.bpf.c`](steer_by_cid.bpf.c) — the BPF program; compiles, never loaded.
+- [`attach.sh.example`](attach.sh.example) — a loader sketch, never executed.
 
 For how this composes with the server options, read
 [`docs/quic-lb.md`](../../docs/quic-lb.md).
