@@ -118,6 +118,32 @@ Configure Prometheus alerts. Severity: **page** for Sev-2, **ticket** for Sev-3.
 
 Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400` for 400 MiB of 512 MiB).
 
+## Admission control: refusal is load-shaping, not rejection
+
+At `maxSessions` or `maxHandshakesInFlight`, the server answers a new dial
+with QUIC `CONNECTION_REFUSED` and increments `limitExceededCount`. This is a
+**transient admission signal from a healthy server** — "not right now", never
+"go away". The handshake cap in particular bounds *instantaneous concurrency*
+(how many handshakes are simultaneously incomplete), not arrival rate: a
+server clearing a handshake in ~10 ms sustains hundreds of establishments per
+second under a cap of 200, while a single synchronized wave deeper than the
+cap sees its overflow refused in the first instant, however idle the server
+was a moment earlier.
+
+**Clients must treat refusal as retryable**: retry with **jittered** backoff
+(e.g. 100–300 ms base, ±50% jitter, a handful of attempts), and treat only
+repeated exhaustion as an outage. The jitter is load-bearing — a fleet that
+retries on a fixed timer re-arrives as the same synchronized wave it was just
+refused for. The canonical scenario: a network blip drops 800 long-lived
+clients, all redial in the same second; with jittered retry the event is a
+sub-second hiccup, with single-shot dials it reads as a total outage — same
+server, same event.
+
+Operationally: a `limitExceededCount` burst that coincides with reconnect
+waves and drains within seconds is the admission gate doing its job; sustained
+growth under steady load is the signal to scale out or raise the cap toward
+what the host's handshake memory actually tolerates.
+
 ## Idle timeout behavior
 
 - `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.

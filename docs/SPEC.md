@@ -108,9 +108,15 @@ export type RateLimitOptions = {
 };
 
 export type LimitsOptions = {
-  /** Max concurrent sessions. At limit, next handshake is rejected. */
+  /** Max concurrent sessions. At limit, the next dial is answered with QUIC
+   * CONNECTION_REFUSED — a transient admission signal; clients retry with
+   * jittered backoff (see OPERATIONS.md "Admission control"). */
   maxSessions: number;
-  /** Max handshakes in progress. At limit, next is rejected (inclusive: limit is allowed). */
+  /** Max handshakes in progress (inclusive: limit is allowed). Bounds
+   * instantaneous concurrency, not arrival rate: sustained dial rates far
+   * above the cap establish fine when handshakes are fast; a synchronized
+   * wave deeper than the cap has its overflow answered CONNECTION_REFUSED —
+   * transient, retry with jittered backoff. */
   maxHandshakesInFlight: number;
   /** Max bidi streams per session. At limit, createBidirectionalStream rejects with E_LIMIT_EXCEEDED. */
   maxStreamsPerSessionBidi: number;
