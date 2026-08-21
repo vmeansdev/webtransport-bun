@@ -128,40 +128,43 @@ describe("§1.6 the ceilings and the ladder", () => {
 });
 
 describe("§1.7 arrival shards", () => {
-	test("the per-shard interval at the gate rung is 13.33 ms", () => {
-		expect(shardIntervalMs(600)).toBeCloseTo(13.333, 3);
+	test("the per-shard interval at the gate rung is 53.33 ms", () => {
+		expect(shardIntervalMs(600)).toBeCloseTo(53.333, 3);
 	});
 
-	test("S=8 is the smallest power of two clearing 10x the Mac's 871 us mean lag", () => {
-		const macMeanLagMs = 0.871;
-		expect(shardIntervalMs(600, ARRIVAL_SHARDS) / macMeanLagMs).toBeGreaterThan(
+	test("S=32 is the smallest power of two clearing 10x the Mac's measured 4.612 ms p99 lag", () => {
+		// The same-day floor arm (2026-08-21, gate cadence, ssh spawn path)
+		// measured the p99 the prereg said "must be measured on the day"; the
+		// original S=8 was selected against K11's 871 µs mean.
+		const macP99LagMs = 4.612;
+		expect(shardIntervalMs(600, ARRIVAL_SHARDS) / macP99LagMs).toBeGreaterThan(
 			10,
 		);
 		// Sharding *widens* the per-shard interval, so the binding direction is
-		// downward: the power of two below 8 is the one that must fail, and does.
-		// That is what makes 8 derived rather than chosen.
-		expect(shardIntervalMs(600, 4) / macMeanLagMs).toBeLessThan(10);
-		expect(ARRIVAL_SHARDS).toBe(8);
+		// downward: the power of two below 32 is the one that must fail, and
+		// does. That is what makes 32 derived rather than chosen.
+		expect(shardIntervalMs(600, 16) / macP99LagMs).toBeLessThan(10);
+		expect(ARRIVAL_SHARDS).toBe(32);
 	});
 
 	test("more shards only ever widen the interval, which is why the bound is one-sided", () => {
-		expect(shardIntervalMs(600, 16)).toBeGreaterThan(
+		expect(shardIntervalMs(600, 64)).toBeGreaterThan(
 			shardIntervalMs(600, ARRIVAL_SHARDS),
 		);
 	});
 
-	test("a 40.6 ms oversleep costs 3 arrivals on one shard, not 24 globally", () => {
+	test("a 40.6 ms oversleep costs 0 whole arrivals on one shard, not 24 globally", () => {
 		const macMaxLagSec = 0.0406;
-		expect(Math.floor((600 / ARRIVAL_SHARDS) * macMaxLagSec)).toBe(3);
+		expect(Math.floor((600 / ARRIVAL_SHARDS) * macMaxLagSec)).toBe(0);
 		expect(Math.floor(600 * macMaxLagSec)).toBe(24);
 	});
 
 	test("V-F's bound is one tenth of a shard interval", () => {
-		expect(scheduleLagBoundMs()).toBeCloseTo(1.3333, 3);
+		expect(scheduleLagBoundMs()).toBeCloseTo(5.3333, 3);
 	});
 
-	test("the pacer's residual over the graded window is 0.011%", () => {
-		expect(pacerResidualFraction() * 100).toBeCloseTo(0.0111, 4);
+	test("the pacer's residual over the graded window is 0.044%", () => {
+		expect(pacerResidualFraction() * 100).toBeCloseTo(0.0444, 4);
 	});
 
 	test("the residual is an order under C2's 1% band", () => {

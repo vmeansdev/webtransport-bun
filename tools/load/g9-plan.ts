@@ -64,8 +64,20 @@ export const BASE_PAYLOAD_BYTES = 200;
 export const EXCHANGE_REQUEST_BYTES = 256;
 export const EXCHANGE_RESPONSE_BYTES = 1024;
 
-/** Independent cumulative-deadline arrival clocks (§1.7). */
-export const ARRIVAL_SHARDS = 8;
+/**
+ * Independent cumulative-deadline arrival clocks (§1.7).
+ *
+ * 32, not the original 8: the same-day floor arm (2026-08-21, gate cadence,
+ * spawned over ssh exactly as the run spawns) measured the Mac's schedule-lag
+ * p99 at 4.612 ms — the original S=8 selection used K11's 871 µs *mean*, and
+ * the prereg itself said the p99 "must be measured on the day". Applying the
+ * page's own one-sided selection rule to the measured p99 instead of the
+ * mean: S is the smallest power of two whose gate-rung per-shard interval
+ * exceeds 10× the p99 — S=32 gives 53.33/4.612 = 11.6 and clears it, S=16
+ * gives 26.67/4.612 = 5.8 and does not. Maintainer-ruled pre-dispatch
+ * (pass-completion map, 2026-08-22); V-F's bound stays derived, not typed.
+ */
+export const ARRIVAL_SHARDS = 32;
 
 /**
  * Fraction of `max_sessions` held back from the churn tier so a rung is never

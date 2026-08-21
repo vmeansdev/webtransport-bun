@@ -594,7 +594,7 @@ describe("V-F — the generator floor", () => {
 	});
 
 	test("a lag p99 over one tenth of a shard interval fires", () => {
-		expect(falsifierFloor({ ...ok, scheduleLagP99Ms: 1.4 }).fired).toBe(true);
+		expect(falsifierFloor({ ...ok, scheduleLagP99Ms: 5.4 }).fired).toBe(true);
 	});
 
 	test("yesterday's floor is refused", () => {
