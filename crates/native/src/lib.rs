@@ -91,6 +91,7 @@ pub mod histogram;
 pub mod limits;
 pub mod metrics;
 pub mod native_memory;
+pub mod paced_emitter;
 pub mod panic_guard;
 pub mod payload_buffer;
 pub mod rate_limit;

@@ -8,6 +8,7 @@
 use crate::error::{
     from_reason as wt_from_reason, from_static_code as wt_from_static_code, WtResult,
 };
+use crate::paced_emitter::{EmitterHistogram, PacedEmitterOptions, PacedEmitterResult};
 use napi::Result;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
@@ -1711,6 +1712,119 @@ impl ClientBidiStreamHandle {
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         Ok(())
+    }
+
+    /// Bench/harness surface (G11's native paced emitter — see
+    /// `paced_emitter.rs` for why it exists). Runs one stream's downstream
+    /// pacing loop natively for `duration_ms`, so the conductor pays one napi
+    /// crossing per stream per step instead of one per frame. Every frame is
+    /// fed through `write_bytes` — the same budget reservation, `StreamChunk`,
+    /// and bridge channel a JS `write()` crosses into — so "bytes settled"
+    /// means exactly what a settled JS write meant, and the transport's serve
+    /// path is unchanged.
+    ///
+    /// The pacing policy mirrors `g11-pacer.ts` clause for clause: absolute
+    /// cumulative deadlines (`written / rate` from the step's start), a write
+    /// issued only once its deadline has passed (no overshoot by
+    /// construction), each write awaited before the next (a block is absorbed,
+    /// not repaid), one write per wake (`sliceQuantum` 1 — G11's frame
+    /// interval is 3.7x the timer tick, so the cap never binds).
+    ///
+    /// Never rejects (see read): failures come back inside the result
+    /// (`errors` / `firstError`), and an early stop reads as
+    /// `completedFullDuration: false`.
+    #[napi]
+    pub async fn run_paced_emitter(&self, opts: PacedEmitterOptions) -> PacedEmitterResult {
+        let mut lateness = EmitterHistogram::new();
+        let mut settle = EmitterHistogram::new();
+        let frame_bytes = opts.frame_bytes as usize;
+        if frame_bytes < crate::paced_emitter::FRAME_HEADER_BYTES
+            || opts.frame_bytes > u16::MAX as u32
+            || opts.bytes_per_sec.is_nan()
+            || opts.bytes_per_sec <= 0.0
+            || !opts.duration_ms.is_finite()
+            || opts.duration_ms < 0.0
+            || opts.frame_class > u8::MAX as u32
+        {
+            return PacedEmitterResult {
+                writes: 0.0,
+                settles: 0.0,
+                bytes: 0.0,
+                errors: 1.0,
+                first_error: Some("E_EMITTER_BAD_OPTIONS".to_string()),
+                completed_full_duration: false,
+                lateness: lateness.snapshot(),
+                settle: settle.snapshot(),
+            };
+        }
+        // Zeroed filler, like the JS pacer's `Buffer.alloc`; the header is
+        // patched in place and the frame cloned per write because
+        // `write_bytes` takes ownership (the same copy a JS write's
+        // `Buffer.to_vec()` pays).
+        let mut frame = vec![0u8; frame_bytes];
+        let mut writes: u64 = 0;
+        let mut settles: u64 = 0;
+        let mut bytes: u64 = 0;
+        let start = tokio::time::Instant::now();
+        let due_ms =
+            |issued: u64| ((issued as f64 * frame_bytes as f64) / opts.bytes_per_sec) * 1000.0;
+        loop {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            if elapsed >= opts.duration_ms {
+                break;
+            }
+            let due = due_ms(writes);
+            if due - elapsed <= crate::paced_emitter::DEADLINE_EPSILON_MS {
+                let intended = due;
+                crate::paced_emitter::encode_frame_header(
+                    &mut frame,
+                    opts.session,
+                    writes as u32,
+                    opts.frame_class as u8,
+                    crate::paced_emitter::wall_clock_ns(),
+                );
+                let actual = start.elapsed().as_secs_f64() * 1000.0;
+                lateness.record(actual - intended);
+                writes += 1;
+                match self.write_bytes(frame.clone()).await {
+                    Ok(()) => {
+                        settle.record(start.elapsed().as_secs_f64() * 1000.0 - actual);
+                        settles += 1;
+                        bytes += frame_bytes as u64;
+                    }
+                    Err(error) => {
+                        // A failing stream stops rather than hot-looping —
+                        // the JS pacer's early return, verbatim.
+                        return PacedEmitterResult {
+                            writes: writes as f64,
+                            settles: settles as f64,
+                            bytes: bytes as f64,
+                            errors: 1.0,
+                            first_error: Some(error.reason.clone()),
+                            completed_full_duration: false,
+                            lateness: lateness.snapshot(),
+                            settle: settle.snapshot(),
+                        };
+                    }
+                }
+            }
+            let wait = due_ms(writes) - start.elapsed().as_secs_f64() * 1000.0;
+            if wait > crate::paced_emitter::DEADLINE_EPSILON_MS {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(wait / 1000.0)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        PacedEmitterResult {
+            writes: writes as f64,
+            settles: settles as f64,
+            bytes: bytes as f64,
+            errors: 0.0,
+            first_error: None,
+            completed_full_duration: true,
+            lateness: lateness.snapshot(),
+            settle: settle.snapshot(),
+        }
     }
 
     #[napi]
