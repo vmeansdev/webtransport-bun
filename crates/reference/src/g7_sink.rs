@@ -169,10 +169,22 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // loopback rig `/proc/net/snmp` is host-wide and sums both processes, so
     // the receive-side clause can only be computed against the sink's own
     // socket, found by its local port.
-    match endpoint.local_addr() {
-        Ok(addr) => println!("g7-sink-local-port: {}", addr.port()),
-        Err(e) => eprintln!("g7-sink: local_addr unavailable: {e}"),
-    }
+    let local_port = match endpoint.local_addr() {
+        Ok(addr) => {
+            println!("g7-sink-local-port: {}", addr.port());
+            Some(addr.port())
+        }
+        Err(e) => {
+            eprintln!("g7-sink: local_addr unavailable: {e}");
+            None
+        }
+    };
+
+    // The conductor can only read /proc/net/udp while this socket exists, and
+    // it learns the port after this process exits — too late. So the sink
+    // samples its own row here and again before the summary; the delta is the
+    // cell's rcvbuf drop count. None (reported as null) is "unmeasured".
+    let rcvbuf_drops_start = local_port.and_then(socket_rx_drops);
 
     let started_ns = monotonic_ns();
     let mut handles = Vec::with_capacity(opts.sessions);
@@ -222,11 +234,69 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed_ns = monotonic_ns() - started_ns;
+    // Sampled before the endpoint drops so the /proc row still exists. Both
+    // samples present ⇒ a delta; either missing ⇒ null, with the reason on
+    // stderr so the artifact's null is disclosed, never a silent zero.
+    let rcvbuf_drops = match (rcvbuf_drops_start, local_port.and_then(socket_rx_drops)) {
+        (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+        _ => {
+            eprintln!(
+                "g7-sink: rcvbuf drops unmeasured ({})",
+                if cfg!(target_os = "linux") {
+                    "no /proc/net/udp row matched the sink's port"
+                } else {
+                    "per-socket drop counters need Linux /proc/net/udp"
+                }
+            );
+            None
+        }
+    };
     println!(
         "g7-sink-summary: {}",
-        summary_json(&opts, &counters, &one_way, elapsed_ns)
+        summary_json(&opts, &counters, &one_way, elapsed_ns, rcvbuf_drops)
     );
     Ok(())
+}
+
+/// Sum of the `drops` column over the /proc/net/udp{,6} rows bound to `port` —
+/// the kernel's per-socket rx-drop counter for the sink's own socket. `None`
+/// when no row parsed and matched, so an unmeasured count never reads as zero.
+#[cfg(target_os = "linux")]
+fn socket_rx_drops(port: u16) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for path in ["/proc/net/udp", "/proc/net/udp6"] {
+        // A missing udp6 on a v4-only kernel is not a failure; a missing udp
+        // just leaves `total` at None.
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 13 {
+                continue;
+            }
+            let local = fields[1];
+            let Some(colon) = local.rfind(':') else {
+                continue;
+            };
+            let Ok(row_port) = u16::from_str_radix(&local[colon + 1..], 16) else {
+                continue;
+            };
+            if row_port != port {
+                continue;
+            }
+            let Ok(drops) = fields[fields.len() - 1].parse::<u64>() else {
+                continue;
+            };
+            total = Some(total.unwrap_or(0) + drops);
+        }
+    }
+    total
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_rx_drops(_port: u16) -> Option<u64> {
+    None
 }
 
 /// Bulk: accept every unidirectional stream the server opens and read it to
@@ -391,6 +461,7 @@ fn summary_json(
     counters: &Counters,
     one_way: &AtomicHistogram,
     elapsed_ns: u64,
+    rcvbuf_drops: Option<u64>,
 ) -> String {
     let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
     format!(
@@ -402,7 +473,8 @@ fn summary_json(
             "\"bytesRead\":{},\"reads\":{},\"records\":{},",
             "\"stampsDecoded\":{},\"stampsUndecodable\":{},",
             "\"sequenceGaps\":{},\"outOfOrder\":{},\"coalescedReads\":{},",
-            "\"udpRxDatagrams\":{},\"udpRxBytes\":{},\"oneWay\":{}}}"
+            "\"udpRxDatagrams\":{},\"udpRxBytes\":{},",
+            "\"rcvbufDrops\":{},\"oneWay\":{}}}"
         ),
         match opts.mode {
             SinkMode::Bulk => "bulk",
@@ -427,6 +499,10 @@ fn summary_json(
         load(&counters.coalesced_reads),
         load(&counters.udp_rx_datagrams),
         load(&counters.udp_rx_bytes),
+        match rcvbuf_drops {
+            Some(n) => n.to_string(),
+            None => "null".to_string(),
+        },
         one_way.to_samples_json()
     )
 }

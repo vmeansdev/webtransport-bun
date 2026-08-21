@@ -198,6 +198,13 @@ type SinkSummary = {
 	coalescedReads: number;
 	udpRxDatagrams: number;
 	udpRxBytes: number;
+	/**
+	 * The sink's own /proc/net/udp{,6} `drops` column, sampled at bind and again
+	 * before this summary prints: a per-cell delta measured while the socket
+	 * still exists. Null on non-Linux or when no row matched (unmeasured, with
+	 * the reason on the sink's stderr). Older sink binaries omit the field.
+	 */
+	rcvbufDrops?: number | null;
 	oneWay: ReturnType<G7Histogram["snapshot"]>;
 };
 
@@ -366,6 +373,10 @@ async function runStep(
 	>;
 	const sinkPort = parseSinkPort(stdout);
 	const sinkSocket = sinkPort === null ? null : socketStatsForPort(sinkPort);
+	// A killed sink's summary is a truncated window, not a short cell: parsing
+	// it would put half-measured numbers into the artifact beside the flag that
+	// says they are not measurements.
+	const sink = wait.deadlineBreached ? null : parseSinkSummary(stdout);
 	if (exitCode !== 0) console.error(stderr.slice(-2000));
 
 	// Bounded, and never thrown. A wedged sink is exactly the peer whose sessions
@@ -384,10 +395,7 @@ async function runStep(
 
 	return {
 		record,
-		// A killed sink's summary is a truncated window, not a short cell:
-		// parsing it would put half-measured numbers into the artifact beside the
-		// flag that says they are not measurements.
-		sink: wait.deadlineBreached ? null : parseSinkSummary(stdout),
+		sink,
 		sinkPort,
 		childDriveSec,
 		settleSec: settle.settleSec,
@@ -399,9 +407,14 @@ async function runStep(
 		sinkCpuPctMedian: pidCpuPct(sinkTicks0, sinkTicksLast, childDriveSec),
 		serverCpuMs,
 		udp: udpDelta(udp0, udp1),
-		// The sink's socket is read after it exits, so the row is usually gone:
-		// null is "unmeasured", which the classifier refuses to grade as zero.
-		sinkSocketDrops: sinkSocket ? sinkSocket.drops : null,
+		// Preferred source: the sink samples its own /proc/net/udp row at bind
+		// and before its summary, so `rcvbufDrops` is a per-cell delta measured
+		// while the socket exists. The conductor-side read is the fallback for a
+		// summary that omitted the field; it runs after the sink exits, so the
+		// row is usually gone and the value stays null — "unmeasured", which the
+		// classifier refuses to grade as zero.
+		sinkSocketDrops:
+			sink?.rcvbufDrops ?? (sinkSocket ? sinkSocket.drops : null),
 		rateLimitedDelta:
 			(metricsAfter.rateLimitedCount ?? 0) -
 			(metricsBefore.rateLimitedCount ?? 0),
