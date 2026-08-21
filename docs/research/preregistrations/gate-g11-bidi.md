@@ -1286,6 +1286,21 @@ fault and is not touched here.
   first run of it failed one test — the public-surface parity contract — and
   that failure is the finding recorded above, not a flake.
 - `bun run typecheck` — clean. `biome check tools/load` — no new findings.
+- **Exact reserve/release pairing, tested against traffic rather than argued.**
+  A local wiring run of all eight D cells (K16: not a result, and no number
+  below is registered) put roughly 3 MB through a 262,144 B per-stream budget on
+  each end — the budget cycling about twelve times per stream — with
+  `inboundReserveTimeouts` **0 on every cell**. A release that returned fewer
+  bytes than its reserve took would have exhausted the budget inside one cell
+  and shown up as timeouts. The per-stream peak topped out at **exactly
+  262,144 B**, the shipped `maxQueuedBytesPerStream`, which is the other half of
+  the check: a double-count would have pushed the inbound counter above the tier
+  it shadows.
+- **A zero total means what it says.** A separate throwaway harness whose server
+  reader never actually consumed reported `inboundReservedTotalBytes: 0` beside
+  a client that had written to it. That is the INDETERMINATE branch firing on
+  exactly the case it exists for — a receive path that never ran — and it was
+  produced by accident, which is the best way to find out that a falsifier works.
 - No gate clause, no falsifier bar, and no cell rate, count or window changed.
 
 #### One unrelated harness fix, landed in the same range and named here
