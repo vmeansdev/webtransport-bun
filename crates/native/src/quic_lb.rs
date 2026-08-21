@@ -149,9 +149,7 @@ impl QuicLbConfig {
             return Err(QuicLbConfigError::ReservedConfigRotation);
         }
         if config_rotation > RESERVED_CONFIG_ROTATION {
-            return Err(QuicLbConfigError::ConfigRotationOutOfRange(
-                config_rotation,
-            ));
+            return Err(QuicLbConfigError::ConfigRotationOutOfRange(config_rotation));
         }
         Ok(Self {
             server_id,
@@ -197,7 +195,10 @@ pub fn decode_server_id(cid: &[u8], server_id_len: usize) -> Option<&[u8]> {
     if server_id_len == 0 {
         return None;
     }
-    cid.get(1..1 + server_id_len)
+    // Saturating, not `1 + len`: this is a public decoder and the length comes
+    // from a caller's configuration, so a nonsense length must return None the
+    // way the TypeScript twin does, not overflow the addition in a debug build.
+    cid.get(1..server_id_len.saturating_add(1))
 }
 
 /// Reads the config-rotation codepoint (§3.1) out of a connection ID.
@@ -492,6 +493,7 @@ mod tests {
         assert_eq!(decode_server_id(&[0x40, 9, 8], 3), None);
         assert_eq!(decode_server_id(&[], 1), None);
         assert_eq!(decode_server_id(bytes, 0), None);
+        assert_eq!(decode_server_id(bytes, usize::MAX), None);
         assert_eq!(decode_config_rotation(&[]), None);
     }
 
