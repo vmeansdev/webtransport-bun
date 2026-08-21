@@ -131,6 +131,9 @@ pub struct StreamBudget {
     pub server_metrics: Arc<crate::server_metrics::ServerMetrics>,
     pub session_metrics: Arc<crate::session_registry::SessionMetrics>,
     pub stream_queued: Arc<AtomicU64>,
+    /// The receive-side half of `stream_queued`, for this stream alone. See
+    /// `SessionMetrics::inbound_reserved_bytes` for why it is counted apart.
+    pub stream_inbound: Arc<AtomicU64>,
     pub max_global: u64,
     pub max_session: u64,
     pub max_stream: u64,
@@ -183,6 +186,7 @@ impl DeferredStreamBudgetConfig {
             server_metrics: self.server_metrics,
             session_metrics: self.session_metrics,
             stream_queued: Arc::new(AtomicU64::new(0)),
+            stream_inbound: Arc::new(AtomicU64::new(0)),
             max_global: self.max_global,
             max_session: self.max_session,
             max_stream: self.max_stream,
@@ -328,7 +332,7 @@ async fn reserve_for_recv(
 ) -> RecvReserveOutcome {
     let _probe = await_probe::enter(&await_probe::BRIDGE_BUDGET_WAIT);
     tokio::select! {
-        reserved = budget.reserve_or_wait(sz) => {
+        reserved = budget.reserve_or_wait_inbound(sz) => {
             if reserved {
                 RecvReserveOutcome::Reserved
             } else {
@@ -376,6 +380,61 @@ impl StreamBudget {
         true
     }
 
+    /// `try_reserve`, charged to the inbound counters as well.
+    pub fn try_reserve_inbound(&self, n: u64) -> bool {
+        let ok = self.try_reserve(n);
+        if ok {
+            self.note_inbound_reserved(n);
+        }
+        ok
+    }
+
+    /// `reserve_or_wait`, charged to the inbound counters as well. A refusal is
+    /// the backpressure deadline elapsing, which is the event D-P1 predicts, so
+    /// it is counted rather than inferred from an error string later.
+    pub async fn reserve_or_wait_inbound(&self, n: u64) -> bool {
+        if self.reserve_or_wait(n).await {
+            self.note_inbound_reserved(n);
+            true
+        } else {
+            self.session_metrics
+                .inbound_reserve_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// `release` for bytes reserved through the inbound path.
+    ///
+    /// Every reservation taken by `try_reserve_inbound` or
+    /// `reserve_or_wait_inbound` must come back through here, or the inbound
+    /// counter drifts upward forever while `queued_bytes` stays correct.
+    pub fn release_inbound(&self, n: u64) {
+        self.stream_inbound.fetch_sub(n, Ordering::Relaxed);
+        self.session_metrics
+            .inbound_reserved_bytes
+            .fetch_sub(n, Ordering::Relaxed);
+        self.release(n);
+    }
+
+    fn note_inbound_reserved(&self, n: u64) {
+        self.session_metrics
+            .inbound_reserved_total_bytes
+            .fetch_add(n, Ordering::Relaxed);
+        let stream_now = self.stream_inbound.fetch_add(n, Ordering::Relaxed) + n;
+        let session_now = self
+            .session_metrics
+            .inbound_reserved_bytes
+            .fetch_add(n, Ordering::Relaxed)
+            + n;
+        self.session_metrics
+            .inbound_reserved_peak_bytes
+            .fetch_max(session_now, Ordering::Relaxed);
+        self.session_metrics
+            .inbound_stream_peak_bytes
+            .fetch_max(stream_now, Ordering::Relaxed);
+    }
+
     pub fn release(&self, n: u64) {
         self.stream_queued.fetch_sub(n, Ordering::Relaxed);
         self.session_metrics
@@ -398,6 +457,11 @@ pub struct StreamChunk {
     data: StreamData,
     budget: Option<StreamBudget>,
     reserved: u64,
+    /// Whether the reservation was taken on the receive path. The chunk is the
+    /// only thing that still knows: `Drop` runs far from the reserving call,
+    /// and releasing an inbound reservation as outbound would leave the inbound
+    /// counter stuck high while `queued_bytes` settled correctly.
+    inbound: bool,
 }
 
 enum StreamData {
@@ -406,22 +470,36 @@ enum StreamData {
 }
 
 impl StreamChunk {
+    /// A chunk holding an outbound (write-path) reservation.
     pub fn new(data: Vec<u8>, budget: Option<StreamBudget>, reserved: u64) -> Self {
         Self {
             data: StreamData::Owned(data),
             budget,
             reserved,
+            inbound: false,
+        }
+    }
+
+    /// A chunk holding an inbound (receive-path) reservation: the read-ahead
+    /// bridges queue these, and the queue depth is the backlog Arm D measures.
+    pub fn new_inbound(data: Vec<u8>, budget: Option<StreamBudget>, reserved: u64) -> Self {
+        Self {
+            data: StreamData::Owned(data),
+            budget,
+            reserved,
+            inbound: true,
         }
     }
 
     /// A chunk over the transport's refcounted buffer. Only the synchronous
     /// deferred-read path uses this: the chunk is taken immediately, so the
-    /// parent recv buffer is never pinned in a queue.
+    /// parent recv buffer is never pinned in a queue. Always inbound.
     pub fn new_shared(data: bytes::Bytes, budget: Option<StreamBudget>, reserved: u64) -> Self {
         Self {
             data: StreamData::Shared(data),
             budget,
             reserved,
+            inbound: true,
         }
     }
 
@@ -456,7 +534,11 @@ impl Drop for StreamChunk {
     fn drop(&mut self) {
         if self.reserved > 0 {
             if let Some(ref b) = self.budget {
-                b.release(self.reserved);
+                if self.inbound {
+                    b.release_inbound(self.reserved);
+                } else {
+                    b.release(self.reserved);
+                }
             }
         }
     }
@@ -783,7 +865,7 @@ async fn read_deferred_direct_batch(
         }
         if !{
             let _probe = await_probe::enter(&await_probe::DIRECT_BUDGET_WAIT);
-            b.reserve_or_wait(n as u64).await
+            b.reserve_or_wait_inbound(n as u64).await
         } {
             recv_stream.stop(0);
             drop(guard);
@@ -792,7 +874,7 @@ async fn read_deferred_direct_batch(
     }
     if ctx.read_aborted.load(Ordering::Acquire) {
         if let Some(ref b) = budget {
-            b.release(n as u64);
+            b.release_inbound(n as u64);
         }
         recv_stream.stop(0);
         drop(guard);
@@ -812,7 +894,7 @@ async fn read_deferred_direct_batch(
         // mid-batch is exactly the wait this lever exists to remove. The excess
         // over what the read actually yields is given straight back.
         if let Some(ref b) = budget {
-            if !b.try_reserve(want as u64) {
+            if !b.try_reserve_inbound(want as u64) {
                 break;
             }
         }
@@ -826,13 +908,13 @@ async fn read_deferred_direct_batch(
             BatchStep::Take(bytes) => bytes,
             BatchStep::Stop => {
                 if let Some(ref b) = budget {
-                    b.release(want as u64);
+                    b.release_inbound(want as u64);
                 }
                 break;
             }
             BatchStep::Terminal(code) => {
                 if let Some(ref b) = budget {
-                    b.release(want as u64);
+                    b.release_inbound(want as u64);
                 }
                 ctx.deferred_terminal.set(code);
                 break;
@@ -840,7 +922,7 @@ async fn read_deferred_direct_batch(
         };
         let taken = chunk_bytes.len();
         if let Some(ref b) = budget {
-            b.release((want - taken) as u64);
+            b.release_inbound((want - taken) as u64);
         }
         total += taken;
         chunks.push(StreamChunk::new_shared(
@@ -1247,7 +1329,7 @@ impl ClientBidiStreamHandle {
             }
             if !{
                 let _probe = await_probe::enter(&await_probe::DIRECT_BUDGET_WAIT);
-                b.reserve_or_wait(n as u64).await
+                b.reserve_or_wait_inbound(n as u64).await
             } {
                 recv_stream.stop(0);
                 drop(guard);
@@ -1256,7 +1338,7 @@ impl ClientBidiStreamHandle {
         }
         if self.read_aborted.load(Ordering::Acquire) {
             if let Some(ref b) = budget {
-                b.release(n as u64);
+                b.release_inbound(n as u64);
             }
             recv_stream.stop(0);
             drop(guard);
@@ -2075,7 +2157,7 @@ impl ClientUniRecvHandle {
             }
             if !{
                 let _probe = await_probe::enter(&await_probe::DIRECT_BUDGET_WAIT);
-                b.reserve_or_wait(n as u64).await
+                b.reserve_or_wait_inbound(n as u64).await
             } {
                 recv_stream.stop(0);
                 drop(guard);
@@ -2084,7 +2166,7 @@ impl ClientUniRecvHandle {
         }
         if self.read_aborted.load(Ordering::Acquire) {
             if let Some(ref b) = budget {
-                b.release(n as u64);
+                b.release_inbound(n as u64);
             }
             recv_stream.stop(0);
             drop(guard);
@@ -2536,7 +2618,7 @@ fn spawn_recv_bridge_on_with_permit(
                                     }
                                 }
                             }
-                            let chunk = StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
+                            let chunk = StreamChunk::new_inbound(buf[..n].to_vec(), read_budget.clone(), sz);
                             // Bounded send: a full read channel with an abandoned
                             // reader must not park this bridge forever either. On
                             // the stop branch the chunk drops here, releasing its
@@ -2649,7 +2731,7 @@ pub fn spawn_bidi_bridge_on(
                                 }
                             }
                             let chunk =
-                                StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
+                                StreamChunk::new_inbound(buf[..n].to_vec(), read_budget.clone(), sz);
                             // Bounded send (chunk drops on the stop branch or send
                             // failure, releasing its reservation via Drop — no
                             // manual release needed).
@@ -2931,7 +3013,8 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                     }
                                 }
                             }
-                            let chunk = StreamChunk::new(buf[..n].to_vec(), budget.clone(), sz);
+                            let chunk =
+                                StreamChunk::new_inbound(buf[..n].to_vec(), budget.clone(), sz);
                             // Bounded send (chunk drops on the stop branch or send
                             // failure, releasing its reservation via Drop — no
                             // manual release needed).
@@ -2983,6 +3066,7 @@ mod tests {
             server_metrics: Arc::new(crate::server_metrics::ServerMetrics::default()),
             session_metrics: Arc::new(crate::session_registry::SessionMetrics::default()),
             stream_queued: Arc::clone(stream_queued),
+            stream_inbound: Arc::new(AtomicU64::new(0)),
             max_global: 1 << 20,
             max_session: 1 << 18,
             max_stream: 1 << 16,
@@ -3031,6 +3115,117 @@ mod tests {
             0
         );
         assert_eq!(stream_queued.load(Ordering::Relaxed), 0);
+    }
+
+    // The inbound counters follow the receive path only. An outbound chunk
+    // charges `queued_bytes` and leaves every `inbound_*` counter alone, which
+    // is the whole point of counting them apart.
+    #[test]
+    fn outbound_reservation_does_not_touch_the_inbound_counters() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(b.try_reserve(400));
+        let sm = &b.session_metrics;
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 400);
+        assert_eq!(sm.inbound_reserved_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.inbound_reserved_total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.inbound_reserved_peak_bytes.load(Ordering::Relaxed), 0);
+        drop(StreamChunk::new(vec![0u8; 400], Some(b.clone()), 400));
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.inbound_reserved_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    // A held inbound reservation shows up as backlog and settles back to zero
+    // when the chunk is consumed, while the peaks and the cumulative total keep
+    // the history the current value throws away.
+    #[test]
+    fn inbound_reservation_is_counted_held_and_released() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = budget(&stream_queued);
+        assert!(b.try_reserve_inbound(300));
+        assert!(b.try_reserve_inbound(500));
+        let sm = &b.session_metrics;
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(sm.inbound_reserved_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(sm.inbound_reserved_peak_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(sm.inbound_stream_peak_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(sm.inbound_reserved_total_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(b.stream_inbound.load(Ordering::Relaxed), 800);
+
+        drop(StreamChunk::new_inbound(
+            vec![0u8; 300],
+            Some(b.clone()),
+            300,
+        ));
+        drop(StreamChunk::new_shared(
+            bytes::Bytes::from_static(&[0u8; 500]),
+            Some(b.clone()),
+            500,
+        ));
+
+        assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(sm.inbound_reserved_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(b.stream_inbound.load(Ordering::Relaxed), 0);
+        // The history survives the drain: this pair is what tells a transient
+        // reserve-and-release path apart from one that never ran at all.
+        assert_eq!(sm.inbound_reserved_peak_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(sm.inbound_reserved_total_bytes.load(Ordering::Relaxed), 800);
+    }
+
+    // Two streams on one session: the session peak is their sum at its worst
+    // moment, the per-stream peak is the worst any one of them reached. Arm D's
+    // registered fraction is of `maxQueuedBytesPerStream`, so it reads the
+    // second number and would be wrong to read the first.
+    #[test]
+    fn session_peak_and_stream_peak_are_different_numbers() {
+        let sm = Arc::new(crate::session_registry::SessionMetrics::default());
+        let server = Arc::new(crate::server_metrics::ServerMetrics::default());
+        let make = || StreamBudget {
+            server_metrics: Arc::clone(&server),
+            session_metrics: Arc::clone(&sm),
+            stream_queued: Arc::new(AtomicU64::new(0)),
+            stream_inbound: Arc::new(AtomicU64::new(0)),
+            max_global: 1 << 20,
+            max_session: 1 << 18,
+            max_stream: 1 << 16,
+            capacity_notify: StreamBudget::new_notify(),
+            backpressure_timeout_ms: 1000,
+        };
+        let a = make();
+        let b = make();
+        assert!(a.try_reserve_inbound(1000));
+        assert!(b.try_reserve_inbound(600));
+
+        assert_eq!(sm.inbound_reserved_peak_bytes.load(Ordering::Relaxed), 1600);
+        assert_eq!(sm.inbound_stream_peak_bytes.load(Ordering::Relaxed), 1000);
+        assert_eq!(
+            sm.inbound_reserved_total_bytes.load(Ordering::Relaxed),
+            1600
+        );
+
+        a.release_inbound(1000);
+        b.release_inbound(600);
+        assert_eq!(sm.inbound_reserved_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    // The deadline that fires on a reader who never consumes is the event D-P1
+    // predicts, so it is counted where it happens rather than parsed out of an
+    // error string afterwards.
+    #[tokio::test]
+    async fn a_refused_inbound_reservation_counts_a_timeout() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let b = StreamBudget {
+            max_stream: 100,
+            backpressure_timeout_ms: 10,
+            ..budget(&stream_queued)
+        };
+        assert!(b.try_reserve_inbound(100));
+        assert!(!b.reserve_or_wait_inbound(100).await);
+        let sm = &b.session_metrics;
+        assert_eq!(sm.inbound_reserve_timeouts.load(Ordering::Relaxed), 1);
+        // The refusal reserves nothing, so it must not move the byte counters.
+        assert_eq!(sm.inbound_reserved_bytes.load(Ordering::Relaxed), 100);
+        assert_eq!(sm.inbound_reserved_total_bytes.load(Ordering::Relaxed), 100);
     }
 
     // No budget configured → no reservation, no release, no panic.

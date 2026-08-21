@@ -237,7 +237,11 @@ on only one of them.
 
 Measured per cell: downstream `write()` completion latency distribution, count of
 `E_BACKPRESSURE_TIMEOUT`, count of stream errors and resets, server
-`queued_bytes` per session, and delivered bytes both directions.
+`queued_bytes` per session, and delivered bytes both directions. **Extended by
+Amendment 10**, which adds, on the end holding the slow reader, the direct
+inbound-reservation counters `peakInboundStreamBytes` and
+`inboundReservedTotalBytes` (and `inboundReserveTimeouts` as disclosure) — the
+witness Amendment 9 proved this arm could not do without.
 
 **Registered prediction D-P1, from K17 (source, not a run):** because one
 `StreamBudget` is charged by both directions of a bidi handle, downstream write
@@ -1078,3 +1082,227 @@ accumulated" — and it means **a rerun that only fixes the withhold counter sti
 cannot produce COUPLING-ABSENT.** Producing that reading requires Arm D to carry
 a direct inbound-reservation counter, and adding one is a cell-definition change
 that will need its own amendment before it is dispatched.
+
+### Amendment 10 — Arm D gets the direct inbound-reservation counter Amendment 9 said it needed (2026-08-21)
+
+Filed **before** any further dispatch, per §10. **No gate clause changes and no
+threshold moves** — Arm D grades nothing (§2), so nothing here can move a
+verdict. It is a **cell-definition change** to Arm D and a new instrument, both
+authorised by the maintainer (campaign plan v2 item 3, v3-delta-3: *"G11 Arm D:
+maintainer RULED — counter + amendment authorized. Draft the cell-definition
+amendment quoting the measured grounds; implement the inbound-reservation
+counter; falsifier stays symmetric; Arm D reruns for its intended reading.
+Implementer is disqualified from dispatching G11."*).
+
+The implementing agent is disqualified from dispatching G11 and has dispatched
+nothing.
+
+#### The measured grounds
+
+Amendment 9 closed on exactly this, and it is quoted here in full because it is
+the ground this amendment stands on:
+
+> **A limitation, stated rather than discovered later.** The counter this
+> falsifier reads, `peakSessionQueuedBytes`, is the server's **outbound**
+> session governor. It can only witness an inbound backlog if the budget really
+> is shared — which is the very proposition K17 asserts and this arm exists to
+> test. So on the present harness the falsifier makes a quiet end unreadable
+> rather than refuting: with no coupling *and* no direct inbound counter, the
+> arm reports INDETERMINATE, not COUPLING-ABSENT. That is the honest position —
+> this harness cannot separate "the budget is not shared" from "the backlog
+> never accumulated" — and it means **a rerun that only fixes the withhold
+> counter still cannot produce COUPLING-ABSENT.** Producing that reading
+> requires Arm D to carry a direct inbound-reservation counter, and adding one
+> is a cell-definition change that will need its own amendment before it is
+> dispatched.
+
+and the run figures it was written against, from §12's Dispatch 1 Arm D bullet:
+
+> At f=0.95 inbound backlog: write p99 0.86 ms vs control 0.91 ms
+> (client-opened), 0.64 vs 1.0 ms (server-accepted); 0 backpressure timeouts;
+> **peak queued 0 B**.
+
+`peak queued 0 B` at a registered f = 0.95 is the whole grounds. On the old
+instrument that reading has two causes and no way to tell them apart: a budget
+that is not shared across directions, and a backlog that never accumulated.
+The counter below distinguishes them by construction.
+
+#### The counter
+
+Four atomics on the native per-session `SessionMetrics`
+(`crates/native/src/session_registry.rs`), charged **only** on the receive
+paths, plus a per-stream current value on `StreamBudget`
+(`crates/native/src/client_stream.rs`):
+
+| field | what it counts |
+|---|---|
+| `inbound_reserved_bytes` | bytes reserved by a receive path and not yet released, right now |
+| `inbound_reserved_total_bytes` | every byte ever reserved by a receive path, never decremented |
+| `inbound_reserved_peak_bytes` | high-water mark of the session's current value |
+| `inbound_stream_peak_bytes` | the largest current value any **single** stream on the session reached |
+| `StreamBudget::stream_inbound` | the same current value, per stream |
+
+They are maintained by `try_reserve_inbound` / `reserve_or_wait_inbound` /
+`release_inbound`, which wrap the existing three-tier reserve and release; a
+`StreamChunk` carries an `inbound` flag so its `Drop` — which runs far from the
+reserving call — releases through the matching path. Every receive site is
+converted: both deferred-direct read paths, the batched deferred-direct path
+(including the excess it hands straight back), and all three read-ahead bridges
+through `reserve_for_recv`. The write path is untouched and charges none of
+them, which is pinned by a unit test.
+
+`inbound_reserve_timeouts` counts receive-side reservations that gave up at
+`backpressureTimeoutMs`. It is **disclosure only** — no falsifier and no reading
+consults it — because D-P1′ is a prediction about the **write** half, and
+letting a read-side timeout flip the reading would break the symmetry §2
+requires.
+
+Exposure: `SessionMetricsSnapshot` gains `inboundReservedBytes`,
+`inboundReservedTotalBytes`, `inboundReservedPeakBytes`,
+`inboundStreamPeakBytes`, `inboundReserveTimeouts`, on **both** ends. The client
+handle previously had no reader for this at all —
+`tools/load/g11-client.ts` recorded that finding in place, and it is why the
+client end reported `peakSessionQueuedBytes: null`:
+
+> the bytes the read-ahead bridge holds against the shared per-handle budget
+> have **no JS reader on the client end at all**.
+
+The client handle now carries the `SessionMetrics` its own stream budgets are
+charged against, so the inbound counters are readable there. `queuedBytes` on
+the client end is still the datagram counter and is still reported `null` — that
+half of the finding stands, and Arm D never needed it.
+
+#### A parity finding the counter produced, and how it was resolved
+
+Adding the fields to the session snapshot broke
+`packages/webtransport/test/public-surface-contract.test.ts`, which pinned the
+**exact** key set of `metricsSnapshot()` for both backends. That is the contract
+doing its job: a native-only field on a shared surface is a parity divergence,
+and the wasm backend has no three-tier stream budget for these counters to
+describe.
+
+Resolved the way the codebase already resolves this for server metrics —
+`ServerMetricsSnapshot`'s own rule, quoted from `crates/native/src/metrics.rs`:
+
+> /// Present on native snapshots. Omit on WASM (do not zero).
+
+The five fields are **native-only and absent on wasm**, never zeroed: a zero
+would assert that no inbound reservation was held, on a backend that holds no
+such thing. The contract test now separates the parity fields from a named list
+of native-only ones, asserts the native snapshot carries exactly the union,
+asserts the wasm snapshot carries exactly the parity fields, and asserts the
+native-only fields are `undefined` on wasm **in fact**, not merely absent from
+the type. The key set stays closed in both directions, so an unnamed field is
+still a leak and still fails.
+
+The shared TypeScript `SessionMetricsSnapshot` declares the five as optional,
+documented native-only. No parity field changed, and no existing field changed
+type.
+
+#### The cell-definition change
+
+Arm D's per-cell measured quantities (§2, "Measured per cell") gain, **on the
+end that holds the slow reader**:
+
+- `peakInboundStreamBytes` — the per-stream high-water inbound reservation,
+- `inboundReservedTotalBytes` — the cumulative inbound reservation,
+- `inboundReserveTimeouts` — disclosure.
+
+Taken from the slow end and not the server unconditionally: the fast end's
+receive path is quiet by design, and reading it would report a working cell as a
+missing backlog. Because the peaks are native high-water marks, the harness does
+not have to catch the spike — one read per session at teardown carries the worst
+moment of the drive.
+
+#### The falsifier, still symmetric
+
+Amendment 9's structural falsifier is unchanged in bar and intent:
+`BACKLOG_WITNESS_FRACTION = 0.5` of the registered target. What changes is which
+counter it reads and what a miss below the bar means:
+
+| observation on the slow end | reading |
+|---|---|
+| peak inbound ≥ half the registered target | the backlog existed — read the latency curve against the control, exactly as before |
+| peak inbound below the bar, cumulative inbound **zero** | the receive path never reserved a byte: **INDETERMINATE**, nothing is readable |
+| peak inbound below the bar, cumulative inbound large, **server-accepted** end | **NO-STANDING-RESERVATION** |
+| peak inbound below the bar, cumulative inbound large, **client-opened** end | **INDETERMINATE** — this is the Amendment 9 defect signature |
+| no counter in the artifact (`null`) | the Amendment 9 rule, on `peakSessionQueuedBytes`, unchanged |
+
+`NO-STANDING-RESERVATION` is a new **per-end** reading, and it is a refutation on
+structural grounds: the deferred-direct path reserves and releases inside each
+read, so there is no standing reservation for the write half to contend with,
+however slow the reader is. Amendment 2 derived that path asymmetry from the
+source before any run; this counter is the first instrument that can witness it.
+
+The asymmetry in the last two rows is not a thumb on the scale — it is the same
+source reading, applied in the only direction it holds. A read-ahead bridge
+**does** hold its reservation until JS consumes, so a low peak on the
+client-opened end cannot be explained by transience and stays unreadable. If a
+run produces a low peak with a large total on the client-opened end, that is a
+harness defect to fix, not a mechanism to report.
+
+At the pair level, `NO-STANDING-RESERVATION` maps where `COUPLING-REFUTED` maps.
+So the reachable pair readings are unchanged in name and count, and
+`COUPLING-ABSENT` — which Amendment 9 proved unreachable — becomes reachable
+again, by a route that names its evidence.
+
+Both directions of refutation survive intact, which is what "symmetric" required:
+coupling observed on the **server-accepted** end still reads
+`PATH-ASYMMETRY-REFUTED` and still refutes this document's own K17 reading, and
+`NO-STANDING-RESERVATION` cannot be reached by an end that showed coupling —
+the witness check runs only on ends that stayed below the bar.
+
+#### What is withdrawn, and what is not
+
+Nothing further is withdrawn. Amendment 9's withdrawal of the server-accepted
+half of run 32291972328 and of the pair reading stands. That artifact predates
+this counter and is read through the fallback row above; it can never be
+re-scored under Amendment 10, because the numbers it would need were not taken.
+
+#### Rerun
+
+Arm D reruns for its intended reading, per §10 and the maintainer's ruling — a
+declared harness fault (Amendment 9's withhold counter) plus a declared
+instrument gap (this one). X and D-arm cells from Dispatch 1 stand as recorded
+where Amendment 9 left them; the T arm's INVALID is a separate, unaddressed rig
+fault and is not touched here.
+
+#### Validation
+
+- `cargo test --manifest-path crates/native/Cargo.toml` — 268 pass, 0 fail
+  (4 new tests: the write path charges no inbound counter; a held inbound
+  reservation is counted, peaked and released; session peak and per-stream peak
+  are different numbers; a refused inbound reservation counts a timeout and
+  moves no bytes).
+- `cargo clippy --workspace -- -D clippy::all` — clean. `cargo fmt --all --check`
+  — clean.
+- `bun test tools/load` — 291 pass, 0 fail (6 new classifier assertions: a rerun
+  with the counter can reach `COUPLING-ABSENT`; the structural reading is
+  refused on the read-ahead end; a receive path that never reserved a byte reads
+  nothing; and the two child-tail deadline cases below).
+- `bun run test` (the whole package suite) — **624 pass, 81 skip, 0 fail**. It
+  is quoted here because this amendment touches product code and a bench
+  amendment that only ran bench tests would be quoting the wrong suite. The
+  first run of it failed one test — the public-surface parity contract — and
+  that failure is the finding recorded above, not a flake.
+- `bun run typecheck` — clean. `biome check tools/load` — no new findings.
+- No gate clause, no falsifier bar, and no cell rate, count or window changed.
+
+#### One unrelated harness fix, landed in the same range and named here
+
+Campaign plan v2 item 6 ordered the per-cell deadline's `childTailMs` phase
+ported from G10 into `bench-g11.ts` before W3. It is ported: the deadline is now
+drive + stagger + settle + **child tail** + margin, with the child tail computed
+as a fixed 8,500 ms (the 3 s drain grace, 500 ms teardown quiesce and 5 s close
+bound both generators print — `tunnel_client.rs` `DRAIN_GRACE`/`CLOSE_QUIESCE`/
+`CLOSE_TIMEOUT`, and the same three phases in `g11-client.ts`) plus a per-session
+close allowance of 40 ms. Both terms are stamped into
+`artifact.environment.childTailFixedMs` / `childTailPerSessionMs`, because a
+breach is only readable against the phases the deadline was built from.
+
+The 40 ms/session allowance is **VM-era, inherited from G10** and carried as an
+upper allowance rather than a derivation; the campaign registration page
+re-derives it against this rig's own §12 wall clocks before it is relied on.
+`DEADLINE_MARGIN_MS` (60,000 ms) and `SETTLE_MAX_MS` (30,000 ms) are likewise
+VM-era and are re-derived on that page. No bound in this document reads any of
+them: a breached cell is INVALID, never a miss.

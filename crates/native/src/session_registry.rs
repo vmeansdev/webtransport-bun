@@ -22,6 +22,34 @@ pub struct SessionMetrics {
     pub streams_bidi_active: AtomicU64,
     pub streams_uni_active: AtomicU64,
     pub queued_bytes: AtomicU64,
+    /// The receive-side half of `queued_bytes`: bytes a stream's *inbound* path
+    /// has reserved on the three-tier budget and not yet released.
+    ///
+    /// `queued_bytes` is charged by both directions of every stream, so it can
+    /// never say which direction is holding it. That ambiguity is what made a
+    /// quiet `queued_bytes` unreadable in G11's Arm D — "the budget is not
+    /// shared across directions" and "no inbound backlog ever accumulated"
+    /// produce the same zero. The `inbound_*` counters are charged only on the
+    /// receive paths, so they separate the two.
+    pub inbound_reserved_bytes: AtomicU64,
+    /// Every byte ever reserved on the receive paths, never decremented.
+    ///
+    /// This is what makes a zero peak readable. The two receive paths differ:
+    /// a read-ahead bridge holds its reservation until JS consumes, while the
+    /// deferred-direct path reserves and releases inside one call. A peak of
+    /// zero beside a large total says "this path takes no standing inbound
+    /// reservation"; a peak of zero beside a zero total says "the inbound path
+    /// never ran". Without the total those are the same reading, which is the
+    /// ambiguity Amendment 9 could not resolve.
+    pub inbound_reserved_total_bytes: AtomicU64,
+    /// High-water mark of `inbound_reserved_bytes` over the session's life.
+    pub inbound_reserved_peak_bytes: AtomicU64,
+    /// The largest `inbound_reserved_bytes` any single stream on this session
+    /// reached. This is the figure comparable to `maxQueuedBytesPerStream`,
+    /// which is a per-stream governor; the session peak is not.
+    pub inbound_stream_peak_bytes: AtomicU64,
+    /// Receive-side reservations that gave up at the backpressure deadline.
+    pub inbound_reserve_timeouts: AtomicU64,
 }
 
 impl SessionMetrics {

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
 	cellDeadlineMs,
-	type DeadlineChild,
 	DEADLINE_MARGIN_MS,
+	type DeadlineChild,
 	valueOrAfter,
 	waitForChildWithDeadline,
 } from "./bench-child-deadline.ts";
@@ -51,7 +51,39 @@ describe("the pre-registered deadline formula", () => {
 		).toBe(152_000);
 	});
 
+	test("the child's own post-drive work is a phase, not slack", () => {
+		// G10's first control run breached on a healthy rung because closing a
+		// large fleet is work the fixed margin never covered.
+		expect(
+			cellDeadlineMs({
+				driveMs: 60_000,
+				connectStaggerMs: 2_000,
+				settleMaxMs: 30_000,
+				childTailMs: 8_500 + 100 * 40,
+			}),
+		).toBe(152_000 + 8_500 + 4_000);
+	});
+
+	test("omitting the child tail leaves every earlier deadline unchanged", () => {
+		expect(
+			cellDeadlineMs({
+				driveMs: 60_000,
+				connectStaggerMs: 2_000,
+				settleMaxMs: 30_000,
+				childTailMs: 0,
+			}),
+		).toBe(152_000);
+	});
+
 	test("a negative or non-finite input is a mistake, not a deadline", () => {
+		expect(() =>
+			cellDeadlineMs({
+				driveMs: 60_000,
+				connectStaggerMs: 0,
+				settleMaxMs: 0,
+				childTailMs: -1,
+			}),
+		).toThrow(/childTailMs/);
 		expect(() =>
 			cellDeadlineMs({
 				driveMs: Number.NaN,

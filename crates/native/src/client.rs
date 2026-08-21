@@ -886,6 +886,11 @@ pub struct ClientSessionHandle {
     stream_accept_uni_tx: Option<mpsc::Sender<AcceptUniReq>>,
     close_tx: Option<Arc<watch::Sender<(u32, String)>>>,
     client_metrics: Arc<ClientMetrics>,
+    /// The `SessionMetrics` this session's stream budgets are charged against.
+    /// `client_metrics` covers datagrams only, so without this the inbound
+    /// stream reservation on a client-opened handle has no reader — which is
+    /// exactly the half G11's Arm D could not witness.
+    stream_session_metrics: Arc<SessionMetrics>,
     closed: Arc<AtomicBool>,
     /// Fired once, on either close origin, right after the sticky `closed`
     /// store. Dedicated to datagram lifecycle: a shared capacity notify would
@@ -1163,11 +1168,19 @@ impl ClientSessionHandle {
 
     #[napi]
     pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::SessionMetricsSnapshot> {
+        let sm = &self.stream_session_metrics;
         Ok(crate::metrics::SessionMetricsSnapshot {
             datagrams_in: self.client_metrics.datagrams_in.load(Ordering::Relaxed) as f64,
             datagrams_out: self.client_metrics.datagrams_out.load(Ordering::Relaxed) as f64,
             streams_active: self.client_metrics.streams_active.load(Ordering::Relaxed) as u32,
             queued_bytes: self.client_metrics.queued_bytes.load(Ordering::Relaxed) as f64,
+            inbound_reserved_bytes: sm.inbound_reserved_bytes.load(Ordering::Relaxed) as f64,
+            inbound_reserved_total_bytes: sm.inbound_reserved_total_bytes.load(Ordering::Relaxed)
+                as f64,
+            inbound_reserved_peak_bytes: sm.inbound_reserved_peak_bytes.load(Ordering::Relaxed)
+                as f64,
+            inbound_stream_peak_bytes: sm.inbound_stream_peak_bytes.load(Ordering::Relaxed) as f64,
+            inbound_reserve_timeouts: sm.inbound_reserve_timeouts.load(Ordering::Relaxed) as f64,
         })
     }
 
@@ -1318,7 +1331,7 @@ impl ClientSessionHandle {
         let lifecycle_notify = Arc::new(Notify::new());
 
         let budget_metrics = Arc::new(ServerMetrics::default());
-        let session_metrics = Arc::new(SessionMetrics::default());
+        let session_metrics = Arc::new(crate::session_registry::SessionMetrics::default());
         let max_global = limits.max_queued_bytes_global;
         let max_session = limits.max_queued_bytes_per_session;
         let max_stream = limits.max_queued_bytes_per_stream;
@@ -1339,6 +1352,7 @@ impl ClientSessionHandle {
             stream_accept_uni_tx: Some(accept_uni_tx),
             close_tx: Some(Arc::new(close_tx)),
             client_metrics: Arc::clone(&cm),
+            stream_session_metrics: Arc::clone(&session_metrics),
             closed: Arc::clone(&closed_flag),
             datagram_lifecycle_notify: Arc::clone(&lifecycle_notify),
             conn: Some(conn.clone()),
@@ -1356,6 +1370,7 @@ impl ClientSessionHandle {
                 server_metrics: Arc::clone(&bm),
                 session_metrics: Arc::clone(&sm),
                 stream_queued: Arc::new(AtomicU64::new(0)),
+                stream_inbound: Arc::new(AtomicU64::new(0)),
                 max_global,
                 max_session,
                 max_stream,
@@ -2397,6 +2412,7 @@ mod tests {
                 stream_accept_uni_tx: Some(accept_uni_tx),
                 close_tx: Some(Arc::new(close_tx)),
                 client_metrics: Arc::clone(&metrics),
+                stream_session_metrics: Arc::new(crate::session_registry::SessionMetrics::default()),
                 closed: Arc::clone(&closed),
                 datagram_lifecycle_notify: Arc::clone(&lifecycle_notify),
                 conn: None,
@@ -2635,6 +2651,7 @@ mod tests {
             stream_accept_uni_tx: Some(accept_uni_tx),
             close_tx: Some(Arc::new(close_tx)),
             client_metrics: Arc::new(ClientMetrics::default()),
+            stream_session_metrics: Arc::new(crate::session_registry::SessionMetrics::default()),
             closed: Arc::clone(&closed_flag),
             datagram_lifecycle_notify: Arc::new(Notify::new()),
             conn: None,
@@ -2686,6 +2703,7 @@ mod tests {
                 stream_accept_uni_tx: Some(accept_uni_tx),
                 close_tx: Some(Arc::new(close_tx)),
                 client_metrics: Arc::new(ClientMetrics::default()),
+                stream_session_metrics: Arc::new(crate::session_registry::SessionMetrics::default()),
                 closed: Arc::new(AtomicBool::new(false)),
                 datagram_lifecycle_notify: Arc::new(Notify::new()),
                 conn: None,

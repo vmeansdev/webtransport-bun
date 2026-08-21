@@ -14,11 +14,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { connectWasm } from "../src/backend.js";
 import * as rootSurface from "../src/index.js";
-import * as portableSurface from "../src/portable.js";
 import type { PortableServer, PortableServerSession } from "../src/portable.js";
+import * as portableSurface from "../src/portable.js";
+import * as wasmSurface from "../src/wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import type { WasmServerSession } from "../src/wasm-server-session.js";
-import * as wasmSurface from "../src/wasm.js";
 import { withTimeout } from "./helpers/harness.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
@@ -210,11 +210,33 @@ const SESSION_CONTRACT: Record<string, "string" | "object" | "function"> = {
 	metricsSnapshot: "function",
 };
 
+/** Present on every backend, always a number. The parity surface proper. */
 const METRICS_FIELDS = [
 	"datagramsIn",
 	"datagramsOut",
 	"queuedBytes",
 	"streamsActive",
+];
+
+/**
+ * Native-only session metrics: the inbound-reservation counters.
+ *
+ * They follow `ServerMetricsSnapshot`'s established rule — "Present on native
+ * snapshots. Omit on WASM (do not zero)" — because the quantity they report is
+ * the native three-tier stream budget, which the wasm backend does not have.
+ * Reporting zero there would be a claim that no inbound reservation was held,
+ * on a backend that holds no such thing; absent is the honest shape.
+ *
+ * They are pinned here rather than left unlisted so that the key set stays
+ * closed: a field that is neither a parity field nor a named native-only one is
+ * a leak, and the assertion below still fails on it.
+ */
+const NATIVE_ONLY_METRICS_FIELDS = [
+	"inboundReserveTimeouts",
+	"inboundReservedBytes",
+	"inboundReservedPeakBytes",
+	"inboundReservedTotalBytes",
+	"inboundStreamPeakBytes",
 ];
 
 /** Capabilities that must never leak onto the common session contract. */
@@ -231,7 +253,10 @@ function assertServerContract(server: PortableServer): void {
 	expect(bag.updateCert).toBeUndefined();
 }
 
-function assertSessionContract(session: PortableServerSession): void {
+function assertSessionContract(
+	session: PortableServerSession,
+	backend: "native" | "wasm",
+): void {
 	const bag = session as unknown as Record<string, unknown>;
 	for (const [member, kind] of Object.entries(SESSION_CONTRACT)) {
 		expect(`${member} is ${typeof bag[member]}`).toBe(`${member} is ${kind}`);
@@ -244,12 +269,26 @@ function assertSessionContract(session: PortableServerSession): void {
 	expect(typeof session.peer.ip).toBe("string");
 	expect(typeof session.peer.port).toBe("number");
 
-	const metrics = session.metricsSnapshot();
-	expect(Object.keys(metrics).sort()).toEqual(METRICS_FIELDS);
-	for (const field of METRICS_FIELDS) {
-		expect(typeof (metrics as unknown as Record<string, unknown>)[field]).toBe(
-			"number",
-		);
+	const metrics = session.metricsSnapshot() as unknown as Record<
+		string,
+		unknown
+	>;
+	const expected = (
+		backend === "native"
+			? [...METRICS_FIELDS, ...NATIVE_ONLY_METRICS_FIELDS]
+			: METRICS_FIELDS
+	).sort();
+	expect(Object.keys(metrics).sort()).toEqual(expected);
+	for (const field of expected) {
+		expect(`${field} is ${typeof metrics[field]}`).toBe(`${field} is number`);
+	}
+	if (backend === "wasm") {
+		// Absent in fact, not merely absent from the type — and never zeroed.
+		for (const field of NATIVE_ONLY_METRICS_FIELDS) {
+			expect(`${field} is ${typeof metrics[field]}`).toBe(
+				`${field} is undefined`,
+			);
+		}
 	}
 
 	// Native-only members must be absent in fact, not merely absent from the
@@ -436,7 +475,7 @@ describe("/portable runtime contract", () => {
 				5000,
 				"portable native session",
 			);
-			assertSessionContract(session);
+			assertSessionContract(session, "native");
 			const writer = wt.datagrams.writable.getWriter();
 			const datagrams = await assertIncomingDatagramFlow(session, (payload) =>
 				writer.write(payload),
@@ -492,7 +531,7 @@ describe("/portable runtime contract", () => {
 					5000,
 					"portable wasm session",
 				);
-				assertSessionContract(session);
+				assertSessionContract(session, "wasm");
 				const datagrams = await assertIncomingDatagramFlow(session, (payload) =>
 					clientSession.sendDatagram(payload),
 				);

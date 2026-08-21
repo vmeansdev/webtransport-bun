@@ -644,6 +644,12 @@ function couplingCell(
 		// be one — a cell that never built its backlog is its own case, tested
 		// separately.
 		peakSessionQueuedBytes: backlogTargetBytes(fraction),
+		// Amendment 10's direct counter, mirroring the session queue unless the
+		// case is specifically about the two disagreeing. `null` is a
+		// pre-Amendment-10 artifact, read through the Amendment 9 fallback.
+		peakInboundStreamBytes: backlogTargetBytes(fraction),
+		inboundReservedTotalBytes: backlogTargetBytes(fraction),
+		inboundReserveTimeouts: 0,
 		deadlineBreached: false,
 		...over,
 	};
@@ -709,11 +715,14 @@ describe("Arm D, per end — D-P1' against D-F1' (Amendment 2)", () => {
 		// and `peak queued 0 B` at a registered f = 0.95. Before this falsifier
 		// that pair read COUPLING-REFUTED — a claim about a per-stream budget
 		// under a backlog that the harness's own counter says never accumulated.
+		// That artifact predates Amendment 10's counter, so it carries no direct
+		// reading and falls back to the session queue.
 		const reading = readCouplingEnd([
-			couplingCell("server-accepted", 0),
+			couplingCell("server-accepted", 0, { peakInboundStreamBytes: null }),
 			couplingCell("server-accepted", 0.95, {
 				downstreamWriteP99Ms: 0.64,
 				peakSessionQueuedBytes: 0,
+				peakInboundStreamBytes: null,
 			}),
 		]);
 		expect(reading.reading).toBe("INDETERMINATE");
@@ -726,17 +735,17 @@ describe("Arm D, per end — D-P1' against D-F1' (Amendment 2)", () => {
 		const justOver = backlogWitnessBytes(0.95) + 1;
 		expect(
 			readCouplingEnd([
-				couplingCell("server-accepted", 0),
-				couplingCell("server-accepted", 0.95, {
-					peakSessionQueuedBytes: justOver,
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, {
+					peakInboundStreamBytes: justOver,
 				}),
 			]).reading,
 		).toBe("COUPLING-REFUTED");
 		expect(
 			readCouplingEnd([
-				couplingCell("server-accepted", 0),
-				couplingCell("server-accepted", 0.95, {
-					peakSessionQueuedBytes: justOver - 2,
+				couplingCell("client-opened", 0),
+				couplingCell("client-opened", 0.95, {
+					peakInboundStreamBytes: justOver - 2,
 				}),
 			]).reading,
 		).toBe("INDETERMINATE");
@@ -751,6 +760,7 @@ describe("Arm D, per end — D-P1' against D-F1' (Amendment 2)", () => {
 				couplingCell("client-opened", 0.95, {
 					backpressureTimeouts: 4,
 					peakSessionQueuedBytes: 0,
+					peakInboundStreamBytes: 0,
 				}),
 			]).reading,
 		).toBe("INDETERMINATE");
@@ -815,16 +825,73 @@ describe("Arm D, the pair reading — every outcome is named in advance", () => 
 	test("an unwitnessed backlog on one end is not COUPLING-ABSENT for the pair", () => {
 		// The §12 shape: both ends quiet, one of them measured through a backlog
 		// that never accumulated. The pair used to read COUPLING-ABSENT — a
-		// verdict-free reading, but one that was cited as a K17 finding.
+		// verdict-free reading, but one that was cited as a K17 finding. The
+		// artifact predates the counter, so the fallback is all it has.
+		const reading = readCouplingArm([
+			...quietEnd("client-opened"),
+			couplingCell("server-accepted", 0, { peakInboundStreamBytes: null }),
+			couplingCell("server-accepted", 0.95, {
+				downstreamWriteP99Ms: 0.64,
+				peakSessionQueuedBytes: 0,
+				peakInboundStreamBytes: null,
+			}),
+		]);
+		expect(reading.verdictFreeReading).toBe("INDETERMINATE");
+	});
+
+	// Amendment 10: the same shape, run again on a harness that carries the
+	// counter. The server-accepted end reserved 6 MB inbound across the cell and
+	// never held more than 4 KB of it at once — the deferred-direct path
+	// releasing inside each read, exactly as Amendment 2 read off the source. A
+	// slow reader there has no standing reservation for the write half to
+	// contend with, so the quiet write curve is a fact about the mechanism
+	// rather than a fact about a backlog that never happened. This is the
+	// reading Amendment 9 said the arm could not reach without a direct
+	// counter.
+	test("a rerun with the counter can reach COUPLING-ABSENT", () => {
 		const reading = readCouplingArm([
 			...quietEnd("client-opened"),
 			couplingCell("server-accepted", 0),
 			couplingCell("server-accepted", 0.95, {
 				downstreamWriteP99Ms: 0.64,
 				peakSessionQueuedBytes: 0,
+				peakInboundStreamBytes: 4096,
+				inboundReservedTotalBytes: 6_291_456,
 			}),
 		]);
-		expect(reading.verdictFreeReading).toBe("INDETERMINATE");
+		expect(reading.perEnd["server-accepted"].reading).toBe(
+			"NO-STANDING-RESERVATION",
+		);
+		expect(reading.verdictFreeReading).toBe("COUPLING-ABSENT");
+	});
+
+	// The same low peak on the client-opened end is the Amendment 9 defect, not
+	// a mechanism reading: that end's bridge holds its reservation until JS
+	// consumes, so a backlog it withheld for should have shown up.
+	test("the structural reading is refused on the read-ahead end", () => {
+		const reading = readCouplingEnd([
+			couplingCell("client-opened", 0),
+			couplingCell("client-opened", 0.95, {
+				peakInboundStreamBytes: 4096,
+				inboundReservedTotalBytes: 6_291_456,
+			}),
+		]);
+		expect(reading.reading).toBe("INDETERMINATE");
+		expect(reading.detail).toContain("was not witnessed");
+	});
+
+	// A counter that reports zero total says the receive path never ran, which
+	// is neither a coupling nor a refutation on either end.
+	test("a receive path that never reserved a byte reads nothing", () => {
+		const reading = readCouplingEnd([
+			couplingCell("server-accepted", 0),
+			couplingCell("server-accepted", 0.95, {
+				peakInboundStreamBytes: 0,
+				inboundReservedTotalBytes: 0,
+			}),
+		]);
+		expect(reading.reading).toBe("INDETERMINATE");
+		expect(reading.detail).toContain("no inbound bytes at all");
 	});
 
 	test("one end missing its control makes the pair indeterminate", () => {

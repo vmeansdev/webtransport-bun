@@ -749,13 +749,38 @@ export type CouplingCellFacts = {
 	backpressureTimeouts: number;
 	streamErrors: number;
 	peakSessionQueuedBytes: number;
+	/**
+	 * Amendment 10's direct witness, from `SessionMetrics.inbound_*`: the
+	 * largest inbound reservation any one stream on the slow end held, the
+	 * bytes it ever reserved in total, and the receive-side reservations that
+	 * hit the backpressure deadline.
+	 *
+	 * `null` on an artifact written before the counter existed. Those artifacts
+	 * fall back to the Amendment 9 rule, which can only reach INDETERMINATE on a
+	 * quiet end — the fallback exists so old artifacts stay readable, never so a
+	 * new run can skip the witness.
+	 */
+	peakInboundStreamBytes: number | null;
+	inboundReservedTotalBytes: number | null;
+	inboundReserveTimeouts: number | null;
 	/** See `TunnelCellFacts.deadlineBreached`. Arm D drops such a cell. */
 	deadlineBreached: boolean;
 };
 
 export type CouplingReading = {
-	/** Never a gate verdict — Arm D grades nothing. */
-	reading: "COUPLING-OBSERVED" | "COUPLING-REFUTED" | "INDETERMINATE";
+	/**
+	 * Never a gate verdict — Arm D grades nothing.
+	 *
+	 * `NO-STANDING-RESERVATION` is Amendment 10's reading: the inbound path
+	 * demonstrably ran and demonstrably held no reservation while it did, so
+	 * K17's shared-budget choke cannot arise on it however slow the reader is.
+	 * It refutes coupling on structural grounds rather than on a flat curve.
+	 */
+	reading:
+		| "COUPLING-OBSERVED"
+		| "COUPLING-REFUTED"
+		| "NO-STANDING-RESERVATION"
+		| "INDETERMINATE";
 	detail: string;
 };
 
@@ -826,28 +851,60 @@ export function readCouplingEnd(
 	// counted read() resolutions instead of frames and so drained batches many
 	// times the intended size.
 	//
-	// Known and deliberate: `peakSessionQueuedBytes` is the server's *outbound*
-	// session governor, so it can only witness the inbound backlog if the budget
-	// really is shared — which is the very thing K17 asserts and this arm exists
-	// to test. Until Arm D carries a direct inbound-reservation counter, that
-	// makes COUPLING-REFUTED on a quiet end unreachable, and the pair reading
-	// INDETERMINATE rather than COUPLING-ABSENT. That is the honest state: this
-	// harness has no witness that separates "the budget is not shared" from "the
-	// backlog never accumulated", and an arm with no such witness should say so
-	// rather than pick the more interesting of the two.
+	// Amendment 9 could only get this far. `peakSessionQueuedBytes` is the
+	// server's *outbound* session governor, so it witnesses an inbound backlog
+	// only if the budget really is shared — the very thing K17 asserts and this
+	// arm exists to test — which left COUPLING-REFUTED unreachable on a quiet
+	// end and the pair INDETERMINATE rather than COUPLING-ABSENT.
+	//
+	// Amendment 10 supplies the missing witness: `inbound_*` on the native
+	// SessionMetrics, charged only on the receive paths. Three numbers, and the
+	// pair of them is what separates the readings a single peak could not:
+	//
+	//   peak >= half the target        the registered backlog existed; read the
+	//                                  latency curve against the control
+	//   peak low, total zero           the inbound path never reserved a byte —
+	//                                  nothing ran, nothing is readable
+	//   peak low, total large          the path reserved and released inside
+	//                                  each call, so it holds no standing
+	//                                  reservation to couple through
+	//
+	// The last row is read structurally on the server-accepted end only, where
+	// the deferred-direct path is documented (Amendment 2) to reserve
+	// transiently. On the client-opened end a read-ahead bridge holds its
+	// reservation until JS consumes, so a low peak there is a backlog that was
+	// never built — the Amendment 9 defect — and stays INDETERMINATE.
 	const witness = backlogWitnessBytes(top.backlogFraction);
-	if (witness > 0 && top.peakSessionQueuedBytes < witness) {
-		return {
-			reading: "INDETERMINATE",
+	const direct = top.peakInboundStreamBytes;
+	const observedBacklog = direct ?? top.peakSessionQueuedBytes;
+	if (witness > 0 && observedBacklog < witness) {
+		const where = direct === null ? "peak queued" : "peak inbound reserved";
+		const unwitnessed = {
+			reading: "INDETERMINATE" as const,
 			detail:
-				`${top.cell} peak queued ${top.peakSessionQueuedBytes} B never reached ${witness} B, ` +
+				`${top.cell} ${where} ${observedBacklog} B never reached ${witness} B, ` +
 				`half the f=${top.backlogFraction} backlog target; the registered backlog was not witnessed, ` +
 				"so neither a coupling nor a refutation can be read off this pair",
+		};
+		if (direct === null) return unwitnessed;
+		if (!top.inboundReservedTotalBytes) {
+			return {
+				reading: "INDETERMINATE",
+				detail: `${top.cell} reserved no inbound bytes at all (total 0 B): the receive path never ran on this end, so its quiet write curve says nothing about K17`,
+			};
+		}
+		if (top.end === "client-opened") return unwitnessed;
+		return {
+			reading: "NO-STANDING-RESERVATION",
+			detail:
+				`${top.cell} reserved ${top.inboundReservedTotalBytes} B inbound in total but never held more than ` +
+				`${direct} B at once (target ${witness} B): the deferred-direct path releases inside each read, so a slow ` +
+				"reader on this end holds no reservation for the write half to contend with",
 		};
 	}
 	const spreadRatio = top.downstreamWriteP99Ms / control.downstreamWriteP99Ms;
 	const timedOut = top.backpressureTimeouts > 0;
-	const detail = `control p99 ${control.downstreamWriteP99Ms} ms vs f=${top.backlogFraction} p99 ${top.downstreamWriteP99Ms} ms (${spreadRatio.toFixed(2)}x), backpressure timeouts at top ${top.backpressureTimeouts}, peak session queued ${top.peakSessionQueuedBytes} B`;
+	const detail = `control p99 ${control.downstreamWriteP99Ms} ms vs f=${top.backlogFraction} p99 ${top.downstreamWriteP99Ms} ms (${spreadRatio.toFixed(2)}x), backpressure timeouts at top ${top.backpressureTimeouts}, peak session queued ${top.peakSessionQueuedBytes} B, peak inbound reserved ${direct ?? "n/a"} B, inbound reserve timeouts ${top.inboundReserveTimeouts ?? "n/a"}`;
 	if (timedOut || spreadRatio >= COUPLING_REFUTED_SPREAD) {
 		return { reading: "COUPLING-OBSERVED", detail };
 	}
@@ -878,10 +935,17 @@ export function readCouplingArm(
 	if (client === "INDETERMINATE" || server === "INDETERMINATE") {
 		return { perEnd, verdictFreeReading: "INDETERMINATE", detail };
 	}
-	if (client === "COUPLING-OBSERVED" && server === "COUPLING-REFUTED") {
+	// Amendment 10: an end that held no standing inbound reservation refutes
+	// coupling on that end the way a flat latency curve does, and on firmer
+	// grounds — the mechanism has no reservation to work through, rather than
+	// having one that happened not to bite. The pair mapping treats the two
+	// alike, which is what finally makes COUPLING-ABSENT reachable.
+	const refuted = (r: CouplingReading["reading"]) =>
+		r === "COUPLING-REFUTED" || r === "NO-STANDING-RESERVATION";
+	if (client === "COUPLING-OBSERVED" && refuted(server)) {
 		return { perEnd, verdictFreeReading: "PATH-ASYMMETRY-HELD", detail };
 	}
-	if (client === "COUPLING-REFUTED" && server === "COUPLING-OBSERVED") {
+	if (refuted(client) && server === "COUPLING-OBSERVED") {
 		return { perEnd, verdictFreeReading: "PATH-ASYMMETRY-REFUTED", detail };
 	}
 	if (client === "COUPLING-OBSERVED" && server === "COUPLING-OBSERVED") {

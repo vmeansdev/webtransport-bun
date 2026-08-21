@@ -128,23 +128,59 @@ let sessionsOk = 0;
 let sessionsErr = 0;
 let streamsClosedBothHalves = 0;
 /**
- * The client end's session governor reading — **structurally unobservable**,
- * and reported as `null` rather than as a zero.
+ * The client end's session *governor* reading is still structurally
+ * unobservable, and still reported as `null` rather than as a zero.
  *
  * Found by smoking Arm D, and then confirmed in the tree: a client session's
  * stream budget is built over a `SessionMetrics` created fresh at
- * `client.rs:1321` and shared only with `make_budget` (`client.rs:1352`), while
- * `metricsSnapshot()` reads `ClientMetrics.queued_bytes` (`client.rs:1170`) —
- * a different counter, charged by the datagram budget. So the bytes the
- * read-ahead bridge holds against the shared per-handle budget have **no JS
- * reader on the client end at all**.
+ * `client.rs:1321` and shared only with `make_budget`, while `queuedBytes` on
+ * the snapshot reads `ClientMetrics.queued_bytes` — a different counter,
+ * charged by the datagram budget.
  *
- * This does not disarm Arm D: the arm's registered prediction is about write
- * latency and `E_BACKPRESSURE_TIMEOUT`, both of which are observable. It
- * removes one corroborating figure on one end, and saying so is the difference
- * between "the backlog was zero" and "the backlog could not be read".
+ * Amendment 10 closes the half of that gap Arm D actually needs. The handle now
+ * carries the same `SessionMetrics` its stream budgets are charged against, and
+ * the snapshot exposes the `inbound*` counters off it, so the bytes the
+ * read-ahead bridge holds against the shared per-handle budget do have a reader
+ * on this end. What is still missing is only the outbound governor, which Arm D
+ * never asked for.
  */
 const peakSessionQueuedBytes: number | null = null;
+/**
+ * Amendment 10's counters for this end, folded across the driving sessions.
+ *
+ * The peaks are native high-water marks, so reading them once per session at
+ * teardown carries the worst moment of the drive; the totals are cumulative and
+ * summed. A generator that saw no counter at all reports `null` — the classifier
+ * distinguishes "no instrument" from "no backlog", and a zero here would erase
+ * that distinction.
+ */
+let peakInboundStreamBytes: number | null = null;
+let peakInboundSessionBytes: number | null = null;
+let inboundReservedTotalBytes: number | null = null;
+let inboundReserveTimeouts: number | null = null;
+
+type InboundSnapshot = {
+	inboundStreamPeakBytes?: number;
+	inboundReservedPeakBytes?: number;
+	inboundReservedTotalBytes?: number;
+	inboundReserveTimeouts?: number;
+};
+
+function foldInboundCounters(snapshot: InboundSnapshot | undefined): void {
+	if (!snapshot || snapshot.inboundReservedTotalBytes === undefined) return;
+	peakInboundStreamBytes = Math.max(
+		peakInboundStreamBytes ?? 0,
+		snapshot.inboundStreamPeakBytes ?? 0,
+	);
+	peakInboundSessionBytes = Math.max(
+		peakInboundSessionBytes ?? 0,
+		snapshot.inboundReservedPeakBytes ?? 0,
+	);
+	inboundReservedTotalBytes =
+		(inboundReservedTotalBytes ?? 0) + snapshot.inboundReservedTotalBytes;
+	inboundReserveTimeouts =
+		(inboundReserveTimeouts ?? 0) + (snapshot.inboundReserveTimeouts ?? 0);
+}
 
 function errorCodeOf(err: unknown): string {
 	if (err && typeof err === "object" && "code" in err)
@@ -303,6 +339,13 @@ async function driveSession(args: Args, index: number, wallNs: () => bigint) {
 	// C4 would count as a stream error the run did not actually suffer. Found by
 	// smoking the arm; the delay sits entirely after the drive window and after
 	// every counter this driver reports.
+	// Read the counters before the session goes: they live on the native
+	// session, and a closed handle has none.
+	foldInboundCounters(
+		(
+			session as { metricsSnapshot?: () => InboundSnapshot }
+		).metricsSnapshot?.(),
+	);
 	await Bun.sleep(SESSION_CLOSE_QUIESCE_MS);
 	await session.close?.();
 }
@@ -354,6 +397,10 @@ async function main(): Promise<void> {
 		backpressureTimeouts,
 		streamsClosedBothHalves,
 		peakSessionQueuedBytes,
+		peakInboundStreamBytes,
+		peakInboundSessionBytes,
+		inboundReservedTotalBytes,
+		inboundReserveTimeouts,
 		bytesWritten: sum((t) => t.bytesWritten),
 		framesWritten: sum((t) => t.framesWritten),
 		bytesRead: sum((t) => t.bytesRead),

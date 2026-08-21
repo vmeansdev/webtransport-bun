@@ -119,6 +119,13 @@ pub(crate) fn session_metrics_snapshot_from(
             datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as f64,
             streams_active: sm.streams_active() as u32,
             queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as f64,
+            inbound_reserved_bytes: sm.inbound_reserved_bytes.load(Ordering::Relaxed) as f64,
+            inbound_reserved_total_bytes: sm.inbound_reserved_total_bytes.load(Ordering::Relaxed)
+                as f64,
+            inbound_reserved_peak_bytes: sm.inbound_reserved_peak_bytes.load(Ordering::Relaxed)
+                as f64,
+            inbound_stream_peak_bytes: sm.inbound_stream_peak_bytes.load(Ordering::Relaxed) as f64,
+            inbound_reserve_timeouts: sm.inbound_reserve_timeouts.load(Ordering::Relaxed) as f64,
         }
     } else {
         crate::metrics::SessionMetricsSnapshot {
@@ -126,6 +133,11 @@ pub(crate) fn session_metrics_snapshot_from(
             datagrams_out: 0.0,
             streams_active: 0,
             queued_bytes: 0.0,
+            inbound_reserved_bytes: 0.0,
+            inbound_reserved_total_bytes: 0.0,
+            inbound_reserved_peak_bytes: 0.0,
+            inbound_stream_peak_bytes: 0.0,
+            inbound_reserve_timeouts: 0.0,
         }
     }
 }

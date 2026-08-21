@@ -84,6 +84,135 @@ export function pidCpuPct(
 	return ((nextTicks - prevTicks) / CLOCK_TICKS_PER_SEC / windowSec) * 100;
 }
 
+/**
+ * Host load and thermal state, per the campaign common doc's §3 convention.
+ *
+ * The rig is a 35 W mobile APU, so a long cell can finish at a clock its first
+ * seconds never saw. Reporting a capacity number without saying what the silicon
+ * was doing underneath it is how "improvement everywhere" gets claimed on a
+ * throttled box. Every field is `null` when its source is absent — a missing
+ * sensor is never a zero, and never a cool reading.
+ */
+export type HostLoadSnapshot = {
+	loadavg1: number | null;
+	cpuMhzMean: number | null;
+	cpuMhzMax: number | null;
+	packageTempC: number | null;
+	governor: string | null;
+};
+
+function readFirstLine(path: string): string | null {
+	try {
+		return readFileSync(path, "utf8").trim();
+	} catch {
+		return null;
+	}
+}
+
+/** Mean and max of every core's current frequency, in MHz. */
+export function readCpuMhz(): { mean: number | null; max: number | null } {
+	if (!HAS_PROC) return { mean: null, max: null };
+	const khz: number[] = [];
+	for (let cpu = 0; ; cpu += 1) {
+		const raw = readFirstLine(
+			`/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_cur_freq`,
+		);
+		if (raw === null) break;
+		const value = Number(raw);
+		if (Number.isFinite(value)) khz.push(value);
+	}
+	if (khz.length === 0) {
+		// cpufreq is not always present; /proc/cpuinfo carries the same figure on
+		// the kernels that lack it.
+		const cpuinfo = readFirstLine("/proc/cpuinfo");
+		if (cpuinfo === null) return { mean: null, max: null };
+		for (const line of readFileSync("/proc/cpuinfo", "utf8").split("\n")) {
+			if (!line.startsWith("cpu MHz")) continue;
+			const value = Number(line.split(":")[1]?.trim());
+			if (Number.isFinite(value)) khz.push(value * 1000);
+		}
+	}
+	if (khz.length === 0) return { mean: null, max: null };
+	const mhz = khz.map((k) => k / 1000);
+	return {
+		mean: mhz.reduce((a, b) => a + b, 0) / mhz.length,
+		max: Math.max(...mhz),
+	};
+}
+
+/**
+ * Package temperature in °C. Prefers the AMD `k10temp` hwmon sensor, whose
+ * `temp1` is Tctl; falls back to the first `x86_pkg_temp` thermal zone, then to
+ * zone 0. Named rather than indexed because the zone numbering is not stable
+ * across boots, and reading the wrong zone would report a chipset sensor as the
+ * package.
+ */
+export function readPackageTempC(): number | null {
+	if (!HAS_PROC) return null;
+	for (let hwmon = 0; hwmon < 16; hwmon += 1) {
+		const name = readFirstLine(`/sys/class/hwmon/hwmon${hwmon}/name`);
+		if (name === null) continue;
+		if (name !== "k10temp" && name !== "coretemp") continue;
+		const milli = Number(
+			readFirstLine(`/sys/class/hwmon/hwmon${hwmon}/temp1_input`),
+		);
+		if (Number.isFinite(milli)) return milli / 1000;
+	}
+	for (let zone = 0; zone < 16; zone += 1) {
+		const type = readFirstLine(`/sys/class/thermal/thermal_zone${zone}/type`);
+		if (type === null) continue;
+		if (type !== "x86_pkg_temp" && type !== "k10temp") continue;
+		const milli = Number(
+			readFirstLine(`/sys/class/thermal/thermal_zone${zone}/temp`),
+		);
+		if (Number.isFinite(milli)) return milli / 1000;
+	}
+	return null;
+}
+
+export function readHostLoad(): HostLoadSnapshot {
+	const loadavgRaw = HAS_PROC ? readFirstLine("/proc/loadavg") : null;
+	const loadavg1 = Number(loadavgRaw?.split(/\s+/)[0]);
+	const mhz = readCpuMhz();
+	return {
+		loadavg1: Number.isFinite(loadavg1) ? loadavg1 : null,
+		cpuMhzMean: mhz.mean,
+		cpuMhzMax: mhz.max,
+		packageTempC: readPackageTempC(),
+		governor: HAS_PROC
+			? readFirstLine("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+			: null,
+	};
+}
+
+/**
+ * The registered base clock of the campaign rig's CPU (AMD Ryzen 5 3550H,
+ * 2.1 GHz base / 3.7 GHz boost). A cell whose median core clock sits below the
+ * *base* clock is not merely off boost — it is being held under the frequency
+ * the part is specified to sustain, which is what "sustained throttling" means.
+ * Registered on the G11 campaign page before the run; never tuned after one.
+ */
+export const RIG_BASE_CLOCK_MHZ = 2100;
+
+/**
+ * Whether a cell's clock samples show sustained throttling.
+ *
+ * The median, not the minimum: a single dip between two samples is scheduling,
+ * not thermal. Null when no clock was readable, and a null is carried as a null
+ * — an unmeasured clock is not a cool one.
+ */
+export function sustainedThrottle(
+	cpuMhzSamples: readonly number[],
+	baseClockMhz: number = RIG_BASE_CLOCK_MHZ,
+): boolean | null {
+	const usable = cpuMhzSamples.filter((v) => Number.isFinite(v));
+	if (usable.length === 0) return null;
+	const sorted = [...usable].sort((a, b) => a - b);
+	const median = sorted[Math.floor(sorted.length / 2)] ?? Number.NaN;
+	if (!Number.isFinite(median)) return null;
+	return median < baseClockMhz;
+}
+
 export type UdpSnapshot = {
 	inDatagrams: number;
 	inErrors: number;

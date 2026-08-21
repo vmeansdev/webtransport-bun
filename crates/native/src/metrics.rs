@@ -138,6 +138,18 @@ pub struct SessionMetricsSnapshot {
     pub datagrams_out: f64,
     pub streams_active: u32,
     pub queued_bytes: f64,
+    /// The receive-side half of `queued_bytes`, right now.
+    pub inbound_reserved_bytes: f64,
+    /// Every byte ever reserved on the receive paths. A zero peak beside a
+    /// non-zero total means the path reserves transiently, not that it idled.
+    pub inbound_reserved_total_bytes: f64,
+    /// High-water mark of `inbound_reserved_bytes`.
+    pub inbound_reserved_peak_bytes: f64,
+    /// Largest inbound reservation any single stream on the session reached —
+    /// the figure comparable to `maxQueuedBytesPerStream`.
+    pub inbound_stream_peak_bytes: f64,
+    /// Receive-side reservations that gave up at the backpressure deadline.
+    pub inbound_reserve_timeouts: f64,
 }
 
 /// Client pool metrics (debug/test). Present when allowPooling is used.

@@ -89,12 +89,16 @@ import {
 import {
 	type CpuSnapshot,
 	HAS_PROC,
+	type HostLoadSnapshot,
 	hostCpuPct,
 	pidCpuPct,
+	RIG_BASE_CLOCK_MHZ,
 	readHostCpu,
+	readHostLoad,
 	readPidCpuTicks,
 	readUdpStats,
 	socketStatsForPort,
+	sustainedThrottle,
 	udpDelta,
 } from "./g11-procfs.ts";
 
@@ -131,6 +135,24 @@ const SETTLE_POLL_MS = 250;
 const SETTLE_QUIET_POLLS = 4;
 const SETTLE_MAX_MS = 30_000;
 const DRAIN_GRACE_MS = 3000;
+
+/**
+ * The child's registered post-drive work, as a fixed part and a per-session
+ * part. Both generators print the same contract — a 3 s drain grace, a 500 ms
+ * teardown quiesce, and a 5 s bound on the QUIC close handshake
+ * (`tunnel_client.rs` DRAIN_GRACE/CLOSE_QUIESCE/CLOSE_TIMEOUT, and the same
+ * three phases in `g11-client.ts`) — and those phases run concurrently across a
+ * child's sessions, so they are a constant rather than a per-session cost.
+ *
+ * The per-session allowance is the part that is not: closing a fleet is serial
+ * work in the child. Omitting it is how G10's first control run breached a
+ * deadline on a healthy rung. The 40 ms figure is inherited from that run's
+ * wall clock on the VM rig and is an upper allowance, not a tuned one; the
+ * registration page re-derives it from this rig's own §12 timings before it is
+ * relied on for a verdict.
+ */
+const CHILD_TAIL_FIXED_MS = 8_500;
+const CHILD_TAIL_PER_SESSION_MS = 40;
 
 /**
  * The wiring-check mode. K16 is a permanent gotcha — a local macOS bench number
@@ -321,6 +343,16 @@ type ServerRecord = {
 	upLatency: G11Histogram;
 	writeLatency: G11Histogram;
 	peakSessionQueuedBytes: number;
+	/**
+	 * Amendment 10's direct inbound-reservation counters, read off the
+	 * native `SessionMetrics`. The peaks are native high-water marks, so a
+	 * sample taken at any time after the last read still carries the worst
+	 * moment of the cell — the harness never has to catch the spike.
+	 */
+	peakInboundStreamBytes: number;
+	peakInboundSessionBytes: number;
+	inboundReservedTotalBytes: number;
+	inboundReserveTimeouts: number;
 	/** Arm X. */
 	acceptedExchangeStreams: number;
 	/**
@@ -350,10 +382,56 @@ function newRecord(): ServerRecord {
 		upLatency: new G11Histogram(),
 		writeLatency: new G11Histogram(),
 		peakSessionQueuedBytes: 0,
+		peakInboundStreamBytes: 0,
+		peakInboundSessionBytes: 0,
+		inboundReservedTotalBytes: 0,
+		inboundReserveTimeouts: 0,
 		acceptedExchangeStreams: 0,
 		completedExchangeStreams: 0,
 		peakConcurrentBidiPerSession: 0,
 	};
+}
+
+/**
+ * Fold the live sessions' inbound-reservation counters into the cell record.
+ *
+ * The peaks are native high-water marks and are taken as maxima; the totals and
+ * timeouts are per-session cumulative sums, and the *maximum* sum across
+ * samples is kept rather than the latest, so a session that ends mid-cell
+ * cannot subtract the bytes it already reserved from the cell's total.
+ */
+function foldSessionCounters(
+	record: ServerRecord,
+	sessions: Iterable<ServerSession>,
+): void {
+	let total = 0;
+	let timeouts = 0;
+	for (const s of sessions) {
+		const m = s.metricsSnapshot?.();
+		if (!m) continue;
+		record.peakSessionQueuedBytes = Math.max(
+			record.peakSessionQueuedBytes,
+			m.queuedBytes ?? 0,
+		);
+		record.peakInboundStreamBytes = Math.max(
+			record.peakInboundStreamBytes,
+			m.inboundStreamPeakBytes ?? 0,
+		);
+		record.peakInboundSessionBytes = Math.max(
+			record.peakInboundSessionBytes,
+			m.inboundReservedPeakBytes ?? 0,
+		);
+		total += m.inboundReservedTotalBytes ?? 0;
+		timeouts += m.inboundReserveTimeouts ?? 0;
+	}
+	record.inboundReservedTotalBytes = Math.max(
+		record.inboundReservedTotalBytes,
+		total,
+	);
+	record.inboundReserveTimeouts = Math.max(
+		record.inboundReserveTimeouts,
+		timeouts,
+	);
 }
 
 function recordTotal(r: ServerRecord): number {
@@ -398,7 +476,13 @@ type AcceptedBidi = {
 
 type ServerSession = {
 	incomingBidirectionalStreams: ReadableStream<AcceptedBidi>;
-	metricsSnapshot?: () => { queuedBytes?: number };
+	metricsSnapshot?: () => {
+		queuedBytes?: number;
+		inboundStreamPeakBytes?: number;
+		inboundReservedPeakBytes?: number;
+		inboundReservedTotalBytes?: number;
+		inboundReserveTimeouts?: number;
+	};
 };
 
 function errorCodeOf(err: unknown): string {
@@ -662,6 +746,10 @@ type ClientSummary = {
 	writeLatencyP99Ms?: number;
 	backpressureTimeouts?: number;
 	peakSessionQueuedBytes?: number | null;
+	peakInboundStreamBytes?: number | null;
+	peakInboundSessionBytes?: number | null;
+	inboundReservedTotalBytes?: number | null;
+	inboundReserveTimeouts?: number | null;
 	crossings?: CrossingFacts & { meanBytesPerCrossing: number };
 };
 
@@ -682,6 +770,17 @@ type StepEnvelope = {
 	serverCpuPct: number | null;
 	serverRssMb: number;
 	serverSocketDrops: number | null;
+	/**
+	 * Host load and thermal state, per the campaign common doc's §3: taken at
+	 * the cell's start and end, with the clock sampled throughout. The
+	 * throttle flag is a *validity flag on this cell*, carried verbatim into
+	 * the stamp — the bar is the rig's base clock, registered on the campaign
+	 * page before the run.
+	 */
+	hostLoadStart: HostLoadSnapshot;
+	hostLoadEnd: HostLoadSnapshot;
+	cpuMhzMedian: number | null;
+	sustainedThrottle: boolean | null;
 	udp: ReturnType<typeof udpDelta>;
 	rateLimitedDelta: number;
 	limitExceededDelta: number;
@@ -867,6 +966,8 @@ async function runStep(
 	>;
 	const cpu0 = process.cpuUsage();
 	const udp0 = readUdpStats();
+	const hostLoadStart = readHostLoad();
+	const cpuMhzSamples: number[] = [];
 	const startedAt = Date.now();
 
 	const { cmd, prefix } = childCommand(cell, port);
@@ -882,6 +983,8 @@ async function runStep(
 		driveMs: cell.stepSeconds * 1000,
 		connectStaggerMs: CONNECT_STAGGER_MS,
 		settleMaxMs: SETTLE_MAX_MS,
+		childTailMs:
+			CHILD_TAIL_FIXED_MS + cell.sessions * CHILD_TAIL_PER_SESSION_MS,
 	});
 	const wait = await waitForChildWithDeadline(child, {
 		deadlineMs,
@@ -893,11 +996,9 @@ async function runStep(
 			if (host !== null) hostSamples.push(host);
 			const ticks = readPidCpuTicks(child.pid);
 			if (ticks !== null) clientTicksLast = ticks;
-			for (const s of liveSessions) {
-				const queued = s.metricsSnapshot?.().queuedBytes ?? 0;
-				if (queued > record.peakSessionQueuedBytes)
-					record.peakSessionQueuedBytes = queued;
-			}
+			const mhz = readHostLoad().cpuMhzMean;
+			if (mhz !== null) cpuMhzSamples.push(mhz);
+			foldSessionCounters(record, liveSessions);
 			appendFileSync(
 				OUT_CSV,
 				`${cell.name},${repeat},${Date.now()},${host?.toFixed(1) ?? ""},${record.upFrames},${record.downFrames},${record.peakSessionQueuedBytes}\n`,
@@ -908,6 +1009,11 @@ async function runStep(
 				`g11: ${cell.name}#${repeat} passed its ${(deadlineMs / 1000).toFixed(0)} s deadline — ${phase}; this cell is INVALID`,
 			),
 	});
+
+	// The child is gone but the server has not closed, so this is the last
+	// moment the sessions can be read — and the first at which every byte the
+	// cell ever reserved has been counted.
+	foldSessionCounters(record, liveSessions);
 
 	const exitCode = wait.exitCode;
 	const [stdout, stderr] = wait.deadlineBreached
@@ -928,6 +1034,7 @@ async function runStep(
 	// correctly refuses to treat as zero — but it would refuse a measurable cell.
 	const socket = socketStatsForPort(port);
 	const udp1 = readUdpStats();
+	const hostLoadEnd = readHostLoad();
 	const metricsAfter = server.metricsSnapshot() as unknown as Record<
 		string,
 		number
@@ -972,6 +1079,10 @@ async function runStep(
 		serverCpuPct,
 		serverRssMb,
 		serverSocketDrops: socket ? socket.drops : null,
+		hostLoadStart,
+		hostLoadEnd,
+		cpuMhzMedian: median(cpuMhzSamples),
+		sustainedThrottle: sustainedThrottle(cpuMhzSamples),
 		udp: udpDelta(udp0, udp1),
 		rateLimitedDelta:
 			(metricsAfter.rateLimitedCount ?? 0) -
@@ -1137,6 +1248,10 @@ function couplingFacts(env: StepEnvelope): CouplingCellFacts {
 		end === "client-opened"
 			? (client?.writeLatencyP99Ms ?? 0)
 			: percentileMs(record.writeLatency.snapshot(), 0.99);
+	// `null` on a client-opened cell whose generator predates the counter, which
+	// is what keeps the classifier's Amendment 9 fallback reachable instead of
+	// turning a missing instrument into a zero.
+	const slow = end === "client-opened" ? client : record;
 	return {
 		cell: cell.name,
 		end,
@@ -1146,11 +1261,18 @@ function couplingFacts(env: StepEnvelope): CouplingCellFacts {
 			record.backpressureTimeouts + (client?.backpressureTimeouts ?? 0),
 		streamErrors: record.streamErrors + (client?.streamErrors ?? 0),
 		// Always the server's session governor, on both ends, and the artifact
-		// says which end it belongs to. A client-opened cell's own budget has no
-		// JS reader in the tree (see `g11-client.ts`), so substituting a zero
+		// says which end it belongs to. A client-opened cell's own budget had no
+		// JS reader in the tree before Amendment 10, so substituting a zero
 		// there would report "no backlog" for a quantity that was never read —
 		// the all-cells-drop-disclosure lesson, applied to a byte counter.
 		peakSessionQueuedBytes: record.peakSessionQueuedBytes,
+		// Amendment 10's counters, taken from the end that holds the slow
+		// reader — the only end where an inbound backlog is registered to
+		// accumulate. Reading the fast end's counters would report a quiet
+		// receive path as a missing backlog.
+		peakInboundStreamBytes: slow?.peakInboundStreamBytes ?? null,
+		inboundReservedTotalBytes: slow?.inboundReservedTotalBytes ?? null,
+		inboundReserveTimeouts: slow?.inboundReserveTimeouts ?? null,
 		deadlineBreached: env.deadlineBreached,
 	};
 }
@@ -1295,6 +1417,24 @@ async function main(): Promise<void> {
 						client: env.client?.peakSessionQueuedBytes ?? null,
 						server: env.record.peakSessionQueuedBytes,
 					},
+					// Amendment 10's counters, both ends, for the same reason: the
+					// reading is about which end holds a standing reservation, and a
+					// reader handed only the slow end's figure cannot check that the
+					// fast end stayed quiet.
+					inboundReservationBothEnds: {
+						client: {
+							peakStreamBytes: env.client?.peakInboundStreamBytes ?? null,
+							peakSessionBytes: env.client?.peakInboundSessionBytes ?? null,
+							totalBytes: env.client?.inboundReservedTotalBytes ?? null,
+							reserveTimeouts: env.client?.inboundReserveTimeouts ?? null,
+						},
+						server: {
+							peakStreamBytes: env.record.peakInboundStreamBytes,
+							peakSessionBytes: env.record.peakInboundSessionBytes,
+							totalBytes: env.record.inboundReservedTotalBytes,
+							reserveTimeouts: env.record.inboundReserveTimeouts,
+						},
+					},
 					clientWriteLatency: env.client?.writeLatency ?? null,
 					serverWriteLatency: env.record.writeLatency.snapshot(),
 				};
@@ -1305,6 +1445,19 @@ async function main(): Promise<void> {
 				tunnelCells[cell.name] = bucket;
 				raw[`${cell.name}#${r}`] = facts;
 			}
+			// Common doc §3: every cell carries its own host-load and thermal
+			// block, and a sustained-throttle flag on the cell that carries it.
+			// Attached here rather than inside each arm's facts so that no arm can
+			// be the one that forgot — the flag is a property of the cell, not of
+			// the reading taken from it.
+			const entry = raw[`${cell.name}#${r}`] as Record<string, unknown>;
+			entry.hostLoad = {
+				start: env.hostLoadStart,
+				end: env.hostLoadEnd,
+				cpuMhzMedian: env.cpuMhzMedian,
+				baseClockMhz: RIG_BASE_CLOCK_MHZ,
+				sustainedThrottle: env.sustainedThrottle,
+			};
 			console.log(
 				`g11:   exit ${env.exitCode ?? "unreaped"}, settled ${!env.settleTimedOut}${
 					env.deadlineBreached
@@ -1351,6 +1504,10 @@ async function main(): Promise<void> {
 			exchangeStepSeconds: EXCHANGE_STEP_SECONDS,
 			couplingStepSeconds: COUPLING_STEP_SECONDS,
 			connectStaggerMs: CONNECT_STAGGER_MS,
+			// The deadline's child-tail terms travel with the artifact: a breach is
+			// only readable against the phases the deadline was built from.
+			childTailFixedMs: CHILD_TAIL_FIXED_MS,
+			childTailPerSessionMs: CHILD_TAIL_PER_SESSION_MS,
 			// Both numbers, because only the pair is readable. `Driven` is what this
 			// dispatch asked for; `Registered` is what §5 grades. Stamping one of
 			// them left a reader unable to tell a two-repeat gate from a one-repeat

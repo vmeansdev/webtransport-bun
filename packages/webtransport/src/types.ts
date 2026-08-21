@@ -175,4 +175,23 @@ export type SessionMetricsSnapshot = {
 	datagramsOut: number;
 	streamsActive: number;
 	queuedBytes: number;
+	/**
+	 * Native only. The receive-side half of `queuedBytes` right now, and the
+	 * history a current value throws away. `queuedBytes` is charged by both
+	 * directions of every stream, so it cannot say which direction holds it;
+	 * these can. A zero peak beside a non-zero total means the receive path
+	 * reserves transiently rather than that it never ran.
+	 */
+	inboundReservedBytes?: number;
+	/** Native only. Every byte ever reserved on the receive paths. */
+	inboundReservedTotalBytes?: number;
+	/** Native only. High-water mark of `inboundReservedBytes`. */
+	inboundReservedPeakBytes?: number;
+	/**
+	 * Native only. The largest inbound reservation any single stream on this
+	 * session reached — the figure comparable to `maxQueuedBytesPerStream`.
+	 */
+	inboundStreamPeakBytes?: number;
+	/** Native only. Receive-side reservations that hit the backpressure deadline. */
+	inboundReserveTimeouts?: number;
 };
