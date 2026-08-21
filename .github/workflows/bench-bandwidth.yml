@@ -221,6 +221,9 @@ jobs:
           G6_STEADY_SECONDS: ${{ github.event.inputs.g6_steady_seconds }}
           G6_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
           G6_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
+          # The Mac entrypoint checks out and builds exactly this SHA; without
+          # it every off-box generator spawn exits 3 before running (O-1).
+          G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           ulimit -n "$(ulimit -Hn)" || true
