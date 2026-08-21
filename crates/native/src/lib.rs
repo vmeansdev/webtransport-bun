@@ -683,6 +683,7 @@ pub(crate) fn spawn_wtransport_server(
     enable_0rtt: bool,
     allow_early_session: bool,
     qpack_max_table_capacity: u64,
+    bind: server_spawn::BindOptions,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -738,9 +739,23 @@ pub(crate) fn spawn_wtransport_server(
             memory_policy.apply_flow_control(&mut transport);
             memory_policy.apply_datagram_buffers(&mut transport);
             client::apply_congestion_controller(&mut transport, congestion_control);
-            let config_builder = ServerConfig::builder()
-            .with_bind_address(bind_addr)
-            .with_custom_tls_and_transport(tls_config, transport);
+            // reusePort takes over the socket build so SO_REUSEPORT can be set
+            // before bind(); with_bind_socket hands it to quinn untouched.
+            let bound = if bind.reuse_port {
+                match server_spawn::bind_reuse_port_socket(bind_addr) {
+                    Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                    Err(e) => {
+                        let msg = format!("failed to bind reusePort socket: {}", e);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                        report_startup(Err(msg));
+                        return;
+                    }
+                }
+            } else {
+                ServerConfig::builder().with_bind_address(bind_addr)
+            };
+            let config_builder =
+                bound.with_custom_tls_and_transport(tls_config, transport);
             let config_builder = match config_builder.max_idle_timeout(Some(
                 std::time::Duration::from_millis(limits.idle_timeout_ms),
             )) {

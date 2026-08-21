@@ -25,6 +25,10 @@ serde_json = "1"
 url = "2"
 sha2 = "0.10"
 base64 = "0.22"
+# SO_REUSEPORT on the server bind socket (the `reusePort` option). The "all"
+# feature gates set_reuse_port; the version matches what wtransport already
+# locks so there is one socket2 in the tree.
+socket2 = { version = "0.6.5", features = ["all"] }
 idna = "1"
 x509-parser = "0.18.1"
 # Global allocator for this dylib's Rust allocations. The macOS system malloc

@@ -157,10 +157,31 @@ impl ServerHandle {
             let qpack_max_table_capacity =
                 crate::client::parse_qpack_max_table_capacity(&server_opts)
                     .map_err(napi::Error::from_reason)?;
+            // SO_REUSEPORT on the bind socket. Kernel steering is 4-tuple
+            // hashed, so this is for eBPF-steered and bench topologies, not a
+            // general balancing answer (docs/OPERATIONS.md).
+            let reuse_port = server_opts
+                .get("reusePort")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if reuse_port && !crate::server_spawn::reuse_port_supported() {
+                return Err(napi::Error::from_reason(format!(
+                    "E_UNSUPPORTED_ARGUMENT: {}",
+                    crate::server_spawn::REUSE_PORT_UNSUPPORTED
+                )));
+            }
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
             let port_u16 = port.min(65535) as u16;
+            if reuse_port && port_u16 == 0 {
+                return Err(napi::Error::from_reason(
+                    "E_INVALID_ARGUMENT: reusePort requires an explicit port; \
+                     port 0 asks the OS for a fresh ephemeral port per instance, \
+                     so nothing shares a port"
+                        .to_string(),
+                ));
+            }
 
             let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tls_config = parse_tls_resolver_config(&tls_config_json)
@@ -188,6 +209,7 @@ impl ServerHandle {
                 enable_0rtt,
                 allow_early_session,
                 qpack_max_table_capacity,
+                crate::server_spawn::BindOptions { reuse_port },
                 1,
             )
             .map_err(|msg| {
