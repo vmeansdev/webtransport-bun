@@ -433,11 +433,14 @@ that preceded the gate measured −44.14 ms under a pairing that had drifted
 ## 3. The narrowing: why the spread clause renders no verdict
 
 C2's bound was ratified at **J = 0** — "overlap itself the failure", the
-strictest form available (`registrations/paced-broadcast.md` §11). Grading it
-requires a sink that can certify sub-ceiling spreads, and on gate day the sink
-could not: the **V-SP** validity falsifier fired in **all six cells** — worst
-burst drain 88.49 ms ÷ completeness 0.714 = **123.94 ms** against the 106.76 ms
-ceiling the registration derived. INVALID dominates both PASS and MISS, so no
+strictest form available (`registrations/paced-broadcast.md` §10, "Ratifications
+of 2026-08-21"). Grading it requires a sink that can certify sub-ceiling
+spreads, and on gate day the sink could not: the **V-SP** validity falsifier
+fired in **all six cells** — worst burst drain 88.49 ms ÷ completeness 0.714 =
+**123.94 ms** against a **106.76 ms** ceiling. That ceiling is computed per-run
+by the harness as 1.2 × the run's own 88.96 ms net emission maximum; what the
+registration derived is the V-SP *rule*, not this number. INVALID dominates
+both PASS and MISS, so no
 verdict is rendered in either direction. The measured 441.97 / 389.55 /
 169.08 ms figures above are recorded, and they license nothing.
 
@@ -490,7 +493,8 @@ verdict showed to be robust rather than around the tail it showed to be noise.
 
 **This gate supersedes G10's scenario; it is not a G10 re-run.** The
 G10-final ruling states it directly, and the registration quotes it verbatim
-(`registrations/paced-broadcast.md` §25-26):
+(`registrations/paced-broadcast.md`, preamble lines 25-26 — the page's numbered
+sections run §1–§12 and this quote sits above them):
 
 > *"A registration certifying a specific smaller shape would be a NEW gate if
 > ever needed, not a G10 re-run."*
@@ -674,9 +678,9 @@ campaign.
 
 **Smooth arrival** (`instrument.md` §6 P-5): **74,992 pps at 0.244% loss**, and
 **115,835 pps delivered at 2.652% loss**. Three independent routes — smooth
-iperf3, blast drain rate, and a second blast drain from an earlier day — land
-between **112k and 117k pps**, which the registration calls the strongest
-agreement in that document.
+iperf3, the matrix's own blast drain rate, and a second blast drain from
+earlier the same day — land between **112k and 117k pps**, which the
+registration calls the strongest agreement in that document.
 
 **Burst-shaped arrival is a different wall entirely** (`instrument.md` §6 P-6,
 the registration's own "load-bearing property"). Holding the cable, the qdisc,
@@ -692,8 +696,12 @@ smooth-arrival capability, its pacer was near-perfect (74,906–75,004 pps, a
 0.13% spread), and it still lost 8.37% uniformly across all fifteen bursts. A
 sink losing packets at 65% of its measured capability, evenly, is not
 rate-saturated — it is being handed packets faster than its instantaneous
-arrival window absorbs. The wall is **below the socket** (it survived a 6 MB
-recvspace test), consistent with a ring-and-USB-turnaround limit.
+arrival window absorbs. The wall is placed **below the socket**, consistent
+with a ring-and-USB-turnaround limit — but note that the 6 MB recvspace test
+behind that placement is **inherited from the founding day-1/day-2 work and was
+not reproduced here**: the F1 matrix varied recvspace in no cell, and
+`instrument.md` §9 lists that sensitivity under what the matrix cannot
+derive.
 
 **`fq` on the box's egress does not rescue burst-shaped traffic.** Post-`fq`
 blast lost 39.06% where pre-`fq` blast lost 42.62% under the same shape — a
@@ -706,11 +714,14 @@ broadcast gate's spread verdict. A campaign whose sink sheds as a function of
 instantaneous arrival cannot certify arrival-spread bounds on a day when the
 sink is degraded — and it correctly declined to.
 
-**The 22%-at-140k figure inherited from the founding day-1/day-2 work needs
-qualification**, which `instrument.md` §8.8 supplies: "~100k pps clean" holds
-for *neither* shape as stated. Smooth arrival is clean at ~75k and already at
-2.1% by 118k; burst-shaped arrival is not clean at **any** rate the matrix
-tried, 75k included.
+**The founding day-1/day-2 sink figures need qualification**, and
+`instrument.md` §8.8 supplies it. Of the three inherited numbers — "~100k pps
+clean, ~22% loss at 140k offered, buffer-insensitive at 6 MB recvspace" — **no
+artifact in the campaign's evidence carries any of them**. The one the matrix
+can speak to is "~100k pps clean", and it holds for *neither* shape as stated:
+smooth arrival is clean at ~75k and already at 2.1% by 118k; burst-shaped
+arrival is not clean at **any** rate the matrix tried, 75k included. The
+22%-at-140k figure is neither reproduced nor contradicted here.
 
 ## 2. The Mac as a measuring end — H-mac
 
@@ -732,10 +743,13 @@ moves.** The box was provably clean throughout — Tctl ≤ 61.8 °C, loadavg1 �
 2.08, `performance` governor, pacer stall p99 1.76–1.89 ms — which killed the
 thermal and co-tenant hypotheses outright. The verdict:
 
-> **The sweep's 4.9× RTT-p99 repeat spread is measuring-end tail noise. The
-> same instrument produced 310–423 ms the same day with the box clean: a ~30×
-> cross-day swing that no box-side variable explains.** Cross-day absolute
-> RTT-p99 numbers from this instrument are weather, not measurements.
+> **the sweep's 4.9× S1 RTT-p99 repeat spread (13.7–67.5 ms) is measuring-end
+> tail noise — the same mechanism at lower amplitude. Today the same instrument
+> produced 310–423 ms with the box clean: a ~30× cross-day swing that no
+> box-side variable explains.**
+>
+> […] Cross-day absolute RTT-p99 numbers from this instrument are weather, not
+> measurements, and no stamped claim should quote one without this verdict.
 
 Prober CPU medians (261–283%) matched sweep day, so the effect is **wakeup
 latency under host load**, not CPU starvation; the monotone decay across
@@ -747,10 +761,14 @@ same-run *relative* comparison between paired arms — which is exactly the form
 the paced-broadcast C3′ clause was rebuilt into (Amendment A-1).
 
 **G2's INCOMPLETE is the same instrument seen from the other side.** Its
-off-box floor arm measured an idle p99 of **8.101888 ms** against a 4.0 ms bar
-— 81% of a 10 ms round-trip budget consumed by the vantage before the product
-is involved. The registration predicted this outcome in advance and called it a
-legitimate campaign result. **The Mac vantage cannot witness a single-digit-
+off-box floor arms measured an idle p99 of **8.101888 ms** — the median of the
+three arms, all three of which are above the 4.0 ms bar — meaning 81% of a
+10 ms round-trip budget is consumed by the vantage before the product is
+involved. The registration predicted this outcome in advance and called it a
+legitimate campaign result, though the stamp records the prediction as a **HIT
+on the verdict and a MISS on the band**: it expected 3–6 ms, and 8.102 ms is
+35% above the top of that range and 2.03× the bar. **The Mac vantage cannot
+witness a single-digit-
 millisecond tail-latency claim**, and no such claim appears in this document.
 
 ## 3. The cable and its preflight
@@ -760,8 +778,10 @@ Cable: `box eno1 10.99.0.2 ↔ Mac en8 10.99.0.1`, MTU 1500, `fq` armed on
 
 The founding preflight (2026-08-20, `preflight-baremetal-2026-08-20.json`) came
 back **GREEN**: 600 ICMP samples at 0% loss, TCP **881,040,056 bit/s** with **0
-retransmits** over 10.006 s, jitter between 0.005 ms and 0.050 ms under UDP load
-in both directions, and a clean UDP ladder to 74,997 pps at 0% loss.
+retransmits** over 10.006 s, and a clean UDP ladder to 74,997 pps at 0% loss.
+(The jitter range of 0.005 ms to 0.050 ms under UDP load in both directions is
+from the SI-1/SI-2 iperf3 ladders, not from the preflight artifact, whose own
+ladder jitters run 0.0050–0.0165 ms.)
 
 **RTT depends on which end you ask, and the registration insists you say so.**
 Peer-toward-generator vantage: p50 **0.535 ms**, p99 **0.735 ms**, max 1.12 ms.
