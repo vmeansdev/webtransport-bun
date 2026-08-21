@@ -401,12 +401,14 @@ describe("assertOneProcessPerCell", () => {
 });
 
 describe("pacerEnvironment", () => {
-	test("stamps the three knobs as-read plus the composition SHAs", () => {
+	test("stamps every pacer knob as-read plus the composition SHAs", () => {
 		expect(
 			pacerEnvironment({
 				WEBTRANSPORT_PACER_PPS: "75000",
 				WEBTRANSPORT_PACER_CLUMP: "32",
 				WEBTRANSPORT_PACER_QUEUE_MS: "250",
+				WEBTRANSPORT_PACER_NICE: "-10",
+				WEBTRANSPORT_PACER_SCHED: "rr:10",
 				G10_COMPOSITION_SHAS: "g10=dcec476 pacer=0f885ef val=abc1234",
 				UNRELATED: "ignored",
 			}),
@@ -414,7 +416,23 @@ describe("pacerEnvironment", () => {
 			WEBTRANSPORT_PACER_PPS: "75000",
 			WEBTRANSPORT_PACER_CLUMP: "32",
 			WEBTRANSPORT_PACER_QUEUE_MS: "250",
+			WEBTRANSPORT_PACER_NICE: "-10",
+			WEBTRANSPORT_PACER_SCHED: "rr:10",
 			G10_COMPOSITION_SHAS: "g10=dcec476 pacer=0f885ef val=abc1234",
+		});
+	});
+
+	test("the priority knobs travel — they were two of day-2's four levers", () => {
+		// Day-2's winning cells raised delivery partly through nice/SCHED_RR and
+		// stamped neither, so their artifacts cannot say what they ran under.
+		expect(
+			pacerEnvironment({
+				WEBTRANSPORT_PACER_PPS: "30000",
+				WEBTRANSPORT_PACER_SCHED: "rr:10",
+			}),
+		).toMatchObject({
+			WEBTRANSPORT_PACER_NICE: null,
+			WEBTRANSPORT_PACER_SCHED: "rr:10",
 		});
 	});
 
@@ -423,6 +441,8 @@ describe("pacerEnvironment", () => {
 			WEBTRANSPORT_PACER_PPS: null,
 			WEBTRANSPORT_PACER_CLUMP: null,
 			WEBTRANSPORT_PACER_QUEUE_MS: null,
+			WEBTRANSPORT_PACER_NICE: null,
+			WEBTRANSPORT_PACER_SCHED: null,
 			G10_COMPOSITION_SHAS: null,
 		});
 	});

@@ -380,6 +380,13 @@ export function pacerEnvironment(
 		WEBTRANSPORT_PACER_PPS: read("WEBTRANSPORT_PACER_PPS"),
 		WEBTRANSPORT_PACER_CLUMP: read("WEBTRANSPORT_PACER_CLUMP"),
 		WEBTRANSPORT_PACER_QUEUE_MS: read("WEBTRANSPORT_PACER_QUEUE_MS"),
+		// Two of day-2's four compounding levers were the thread-priority knobs,
+		// and neither was stamped: the winning cells' artifacts cannot say
+		// whether they ran under SCHED_RR. Whether the request was *granted* is
+		// the pacer's own business (`priority.applied` in its stats); what
+		// belongs here is what the operator asked for.
+		WEBTRANSPORT_PACER_NICE: read("WEBTRANSPORT_PACER_NICE"),
+		WEBTRANSPORT_PACER_SCHED: read("WEBTRANSPORT_PACER_SCHED"),
 		G10_COMPOSITION_SHAS: read("G10_COMPOSITION_SHAS"),
 	};
 }
