@@ -86,6 +86,64 @@ pub struct DatagramMirrorResult {
     pub codes: Uint8Array,
 }
 
+/// Outcome of one **paced** mirror call: what the schedule accepted, and which
+/// targets it refused.
+///
+/// Deliberately not [`DatagramMirrorResult`], and deliberately carrying no
+/// delivery count of any name. Nothing has been delivered when this returns: no
+/// target has been resolved, no ownership checked, no byte budget consulted.
+/// `admitted` counts targets accepted onto the pacer's schedule and nothing
+/// more, and the per-target outcomes arrive later through `readMirrorReports`.
+///
+/// `refused` carries indices into the caller's target list and `codes` is
+/// parallel to it, exactly as the synchronous envelope's failure arrays are —
+/// same decode table, same set-not-prefix rule.
+#[napi(object)]
+pub struct DatagramMirrorAdmission {
+    /// Whether there was a schedule to be admitted to at all.
+    ///
+    /// `false` means the pacer knob is off; nothing was offered and the other
+    /// fields are empty. The wrapper turns it into an `E_UNSUPPORTED_ARGUMENT`
+    /// `WebTransportError`.
+    ///
+    /// A returned flag rather than a returned `Err`, because Bun does not raise
+    /// a synchronous N-API `Err` as a JavaScript exception: it hands the error
+    /// object back as the *return value*, so a `try`/`catch` around the call
+    /// never runs and the caller decodes an `Error` as if it were an envelope
+    /// (observed on Bun 1.3.14, `packages/webtransport/test/native-datagram-mirror-paced.test.ts`).
+    pub paced: bool,
+    pub admitted: u32,
+    pub refused: Uint32Array,
+    pub codes: Uint8Array,
+}
+
+impl DatagramMirrorAdmission {
+    /// The envelope for "there is no schedule": nothing offered, nothing
+    /// refused, and the flag that says so.
+    pub(crate) fn unpaced() -> Self {
+        Self {
+            paced: false,
+            admitted: 0,
+            refused: Uint32Array::new(Vec::new()),
+            codes: Uint8Array::new(Vec::new()),
+        }
+    }
+}
+
+/// One deferred per-target failure, drained from the reports ring.
+///
+/// Successes are never reported: a broadcast to 10,000 healthy subscribers
+/// produces nothing here, which is the same "cost proportional to what went
+/// wrong" property the synchronous envelope has.
+#[napi(object)]
+pub struct MirrorReportEntry {
+    /// The session id, as the caller wrote it in its target list.
+    pub target: String,
+    /// A [`MirrorFailure`] as its wire `u8`, decoded through the same
+    /// TypeScript table the synchronous envelope uses.
+    pub code: u8,
+}
+
 /// The same envelope in plain Rust, which is what the fan-out produces.
 ///
 /// Deliberately not the `#[napi(object)]` type: constructing a napi typed array
@@ -109,6 +167,21 @@ impl MirrorOutcome {
         DatagramMirrorResult {
             sent: self.sent as u32,
             failed: Uint32Array::new(self.failed),
+            codes: Uint8Array::new(self.codes),
+        }
+    }
+
+    /// Read the same outcome as an **admission**.
+    ///
+    /// The fan-out is shared with the synchronous path deliberately — one
+    /// implementation of "attempt every target, report the ones that said no" —
+    /// but on the paced path the successful count is not a send. It is renamed
+    /// here, once, at the boundary, so `sent` never reaches the paced surface.
+    pub(crate) fn into_admission_napi(self) -> DatagramMirrorAdmission {
+        DatagramMirrorAdmission {
+            paced: true,
+            admitted: self.sent as u32,
+            refused: Uint32Array::new(self.failed),
             codes: Uint8Array::new(self.codes),
         }
     }
