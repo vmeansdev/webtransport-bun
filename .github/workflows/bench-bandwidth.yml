@@ -64,6 +64,16 @@ on:
         required: false
         default: "2"
         type: string
+      g11_down_originator:
+        description: "g11-bidi mode: who originates the T arm's downstream offer — js (the registered per-frame JS pacer) or native (the addon's runPacedEmitter loop, arm T only; stamped per cell as downOriginator)"
+        required: false
+        default: "js"
+        type: string
+      g11_deframe_workers:
+        description: "g11-bidi mode: arm T upstream deframe workers — auto, or an explicit count (0 = inline on the conductor's thread)"
+        required: false
+        default: "auto"
+        type: string
       probe_only:
         description: "Run only the GSO/GRO host probe, skip the ladder"
         required: false
@@ -329,6 +339,11 @@ jobs:
           G11_EXCHANGE_STEP_SECONDS: ${{ github.event.inputs.g11_exchange_step_seconds }}
           G11_COUPLING_STEP_SECONDS: ${{ github.event.inputs.g11_coupling_step_seconds }}
           G11_REPEATS: ${{ github.event.inputs.g11_repeats }}
+          # Step-level env reaches BOTH invocations (knob-off and knob-on), so
+          # one dispatch's originator/deframe choice cannot silently differ
+          # between them.
+          G11_DOWN_ORIGINATOR: ${{ github.event.inputs.g11_down_originator }}
+          G11_DEFRAME_WORKERS: ${{ github.event.inputs.g11_deframe_workers }}
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"

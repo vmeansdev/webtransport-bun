@@ -166,7 +166,10 @@ if (!Number.isInteger(SHARD_SESSIONS) || SHARD_SESSIONS < 1) {
  * Scoped to arm T: arms D and J are at or below the threshold by
  * registration, and arm D's withhold logic needs inline frame counts.
  */
-const DEFRAME_WORKERS_ENV = process.env.G11_DEFRAME_WORKERS ?? "auto";
+// `||`, not `??`: a workflow dispatch that omits the input delivers an EMPTY
+// string, and `Number("") === 0` would silently read as "0 workers, inline"
+// instead of the default.
+const DEFRAME_WORKERS_ENV = process.env.G11_DEFRAME_WORKERS || "auto";
 deframeWorkerPlan(1, DEFRAME_WORKERS_ENV, 1); // Validate at startup, not mid-run.
 
 const SETTLE_POLL_MS = 250;
@@ -217,7 +220,9 @@ const SMOKE_SECONDS = Number(process.env.G11_SMOKE_SECONDS ?? 4);
  * Applies to arm T only: D's writer stays beside its withholding reader, and
  * J's rung is registered against the JS originator.
  */
-const DOWN_ORIGINATOR_ENV = process.env.G11_DOWN_ORIGINATOR ?? "js";
+// `||`, not `??`: an omitted workflow-dispatch input arrives as an empty
+// string, which must mean the default, not a validation failure.
+const DOWN_ORIGINATOR_ENV = process.env.G11_DOWN_ORIGINATOR || "js";
 if (DOWN_ORIGINATOR_ENV !== "js" && DOWN_ORIGINATOR_ENV !== "native") {
 	console.error(
 		`g11: G11_DOWN_ORIGINATOR must be "js" or "native", got "${DOWN_ORIGINATOR_ENV}"`,
