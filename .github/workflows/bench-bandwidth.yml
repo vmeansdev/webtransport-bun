@@ -64,15 +64,10 @@ on:
         required: false
         default: "2"
         type: string
-      g11_down_originator:
-        description: "g11-bidi mode: who originates the T arm's downstream offer — js (the registered per-frame JS pacer) or native (the addon's runPacedEmitter loop, arm T only; stamped per cell as downOriginator)"
+      g11_generator:
+        description: "g11-bidi mode: comma-separated generator overrides, e.g. 'originator=native,deframe=2'. originator: js (default, the registered per-frame JS pacer) or native (the addon's runPacedEmitter loop, arm T only; stamped per cell as downOriginator). deframe: auto (default) or an explicit arm-T deframe-worker count (0 = inline). Empty = all defaults; unknown keys fail the dispatch."
         required: false
-        default: "js"
-        type: string
-      g11_deframe_workers:
-        description: "g11-bidi mode: arm T upstream deframe workers — auto, or an explicit count (0 = inline on the conductor's thread)"
-        required: false
-        default: "auto"
+        default: ""
         type: string
       probe_only:
         description: "Run only the GSO/GRO host probe, skip the ladder"
@@ -339,13 +334,39 @@ jobs:
           G11_EXCHANGE_STEP_SECONDS: ${{ github.event.inputs.g11_exchange_step_seconds }}
           G11_COUPLING_STEP_SECONDS: ${{ github.event.inputs.g11_coupling_step_seconds }}
           G11_REPEATS: ${{ github.event.inputs.g11_repeats }}
-          # Step-level env reaches BOTH invocations (knob-off and knob-on), so
-          # one dispatch's originator/deframe choice cannot silently differ
-          # between them.
-          G11_DOWN_ORIGINATOR: ${{ github.event.inputs.g11_down_originator }}
-          G11_DEFRAME_WORKERS: ${{ github.event.inputs.g11_deframe_workers }}
+          G11_GENERATOR: ${{ github.event.inputs.g11_generator }}
         run: |
           set -euo pipefail
+
+          # One consolidated generator input (the workflow_dispatch 25-input
+          # cap is already at the wall). Parsed and EXPORTED here so both
+          # invocations — knob-off and knob-on — see the same choice; the
+          # conductor treats an empty value as the default (js / auto). An
+          # unknown key fails the dispatch rather than silently running the
+          # defaults a typo did not ask for.
+          G11_DOWN_ORIGINATOR=""
+          G11_DEFRAME_WORKERS=""
+          if [ -n "${G11_GENERATOR:-}" ]; then
+            IFS=',' read -ra GEN_PAIRS <<< "$G11_GENERATOR"
+            for pair in "${GEN_PAIRS[@]}"; do
+              key="${pair%%=*}"
+              value="${pair#*=}"
+              if [ "$key" = "$pair" ] || [ -z "$value" ]; then
+                echo "::error::g11_generator entry '$pair' is not key=value"
+                exit 1
+              fi
+              case "$key" in
+                originator) G11_DOWN_ORIGINATOR="$value" ;;
+                deframe) G11_DEFRAME_WORKERS="$value" ;;
+                *)
+                  echo "::error::g11_generator key '$key' unknown (allowed: originator, deframe)"
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+          export G11_DOWN_ORIGINATOR G11_DEFRAME_WORKERS
+          echo "g11 generator: originator='${G11_DOWN_ORIGINATOR:-js (default)}' deframe='${G11_DEFRAME_WORKERS:-auto (default)}'"
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           EV="$GITHUB_WORKSPACE/.bench-evidence"
           SHA="${{ github.event.inputs.candidate_commit }}"
