@@ -34,27 +34,27 @@ import {
 } from "./g11-plan.ts";
 
 describe("frame and rate constants (§1.3)", () => {
-	test("a frame is one inner packet plus its length prefix", () => {
-		expect(FRAME_BYTES).toBe(1402);
+	test("a frame is one inner packet plus the 20-byte g11-frame header", () => {
+		expect(FRAME_BYTES).toBe(1420);
 	});
 
 	test("3 Mbps is 375,000 B/s in one direction", () => {
 		expect(bytesPerSecPerDirection()).toBe(375_000);
 	});
 
-	test("one tunnel emits 267.5 frames/s per direction, 3.739 ms apart", () => {
+	test("one tunnel emits 264.1 frames/s per direction, 3.787 ms apart", () => {
 		const rung = tunnelRung(1);
-		expect(rung.framesPerSecPerTunnel).toBeCloseTo(267.475, 3);
-		expect(rung.frameIntervalMs).toBeCloseTo(3.7387, 4);
+		expect(rung.framesPerSecPerTunnel).toBeCloseTo(264.085, 3);
+		expect(rung.frameIntervalMs).toBeCloseTo(3.7867, 4);
 	});
 });
 
 describe("the session ladder reproduces §1.4 exactly", () => {
 	const expected = [
-		{ sessions: 25, mbps: 75, total: 150, frames: 6687, crossings: 13374 },
-		{ sessions: 50, mbps: 150, total: 300, frames: 13374, crossings: 26748 },
-		{ sessions: 100, mbps: 300, total: 600, frames: 26748, crossings: 53495 },
-		{ sessions: 200, mbps: 600, total: 1200, frames: 53495, crossings: 106990 },
+		{ sessions: 25, mbps: 75, total: 150, frames: 6602, crossings: 13204 },
+		{ sessions: 50, mbps: 150, total: 300, frames: 13204, crossings: 26408 },
+		{ sessions: 100, mbps: 300, total: 600, frames: 26408, crossings: 52817 },
+		{ sessions: 200, mbps: 600, total: 1200, frames: 52817, crossings: 105634 },
 	];
 
 	for (const row of expected) {
@@ -161,10 +161,10 @@ describe("Arm D arithmetic", () => {
 });
 
 describe("pacer and emitter properties the clauses lean on", () => {
-	test("the pacer's residual is ~800x smaller than the 5% fairness band", () => {
+	test("the pacer's residual is ~790x smaller than the 5% fairness band", () => {
 		const residual = pacerResidualFraction(60);
-		expect(residual).toBeCloseTo(0.0000623, 7);
-		expect(0.05 / residual).toBeGreaterThan(800);
+		expect(residual).toBeCloseTo(0.0000631, 7);
+		expect(0.05 / residual).toBeGreaterThan(790);
 	});
 
 	test("the downstream emitter spreads a tick across its sessions", () => {

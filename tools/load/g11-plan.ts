@@ -14,14 +14,23 @@
  * and only a module like this one found it.
  */
 
+import { FRAME_HEADER_BYTES as G11_FRAME_HEADER_BYTES } from "./g11-frame.ts";
+
 // --- Scenario constants (pre-registration §1.3, §1.5) -----------------------
 
 /** Full-MSS inner segment of a tunnelled TCP flow. */
 export const INNER_PACKET_BYTES = 1400;
-/** Length prefix a stream-framed tunnel puts in front of each inner packet. */
-export const FRAME_PREFIX_BYTES = 2;
-/** One inner packet is one write(), which is one N-API crossing (ledger K13). */
-export const FRAME_BYTES = INNER_PACKET_BYTES + FRAME_PREFIX_BYTES;
+/**
+ * One inner packet is one write(), which is one N-API crossing (ledger K13).
+ *
+ * The frame's overhead is the full 20-byte g11-frame.ts header (u16 length,
+ * version, class, session, sequence, u64 send stamp), not a bare 2-byte
+ * length prefix: the old `1400 + 2` constant disagreed with the frames both
+ * ends actually build, so V-K's `maxBatchBytes <= FRAME_BYTES` bound fired on
+ * every single-frame knob-off crossing by construction (G11-T stamp, V-K
+ * recomputation).
+ */
+export const FRAME_BYTES = INNER_PACKET_BYTES + G11_FRAME_HEADER_BYTES;
 
 /**
  * Per-direction per-tunnel rate: the effort's desktop-share constant applied to
