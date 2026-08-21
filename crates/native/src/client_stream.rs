@@ -1113,6 +1113,9 @@ pub struct ClientBidiStreamHandle {
     /// can outlive its transport use until JS finalization, so resource release
     /// and the live-handle diagnostic must be idempotent.
     released: AtomicBool,
+    /// Dual-stamp record ring for the G11 native frame sink (bench/harness
+    /// surface; None until `run_frame_sink` arms it). See `frame_sink.rs`.
+    frame_sink: Mutex<Option<Arc<crate::frame_sink::SinkShared>>>,
 }
 
 impl ClientBidiStreamHandle {
@@ -1138,6 +1141,7 @@ impl ClientBidiStreamHandle {
             read_aborted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            frame_sink: Mutex::new(None),
         }
     }
 
@@ -1175,6 +1179,7 @@ impl ClientBidiStreamHandle {
             read_aborted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            frame_sink: Mutex::new(None),
         }
     }
 
@@ -1202,6 +1207,7 @@ impl ClientBidiStreamHandle {
             read_aborted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            frame_sink: Mutex::new(None),
         }
     }
 
@@ -1232,6 +1238,7 @@ impl ClientBidiStreamHandle {
             read_aborted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            frame_sink: Mutex::new(None),
         }
     }
 
@@ -1824,6 +1831,145 @@ impl ClientBidiStreamHandle {
             completed_full_duration: true,
             lateness: lateness.snapshot(),
             settle: settle.snapshot(),
+        }
+    }
+
+    /// Bench/harness surface (G11's native frame sink — the paced emitter's
+    /// read-side twin; `frame_sink.rs` explains why it exists and what the
+    /// two stamps mean). Drains this stream's upstream natively until EOF,
+    /// error, or `deadline_ms`, whichever first: every chunk comes through
+    /// `read_inner` — the same bridge channel and terminal semantics a JS
+    /// `read()` crosses into — is deframed in place, and each frame records
+    /// its wire latency (sender send stamp → native arrival stamp, one
+    /// CLOCK_REALTIME domain) and queues a dual-stamp record for the JS
+    /// drain. Never rejects: failures come back inside the result.
+    #[napi]
+    pub async fn run_frame_sink(
+        &self,
+        opts: crate::frame_sink::FrameSinkOptions,
+    ) -> crate::frame_sink::FrameSinkResult {
+        let mut wire = EmitterHistogram::new();
+        let empty = |err: Option<String>| crate::frame_sink::FrameSinkResult {
+            reads: 0.0,
+            frames: 0.0,
+            bytes: 0.0,
+            errors: if err.is_some() { 1.0 } else { 0.0 },
+            first_error: err,
+            saw_eof: false,
+            deadline_hit: false,
+            wire_latency: EmitterHistogram::new().snapshot(),
+            dropped_records: 0.0,
+            pending_partial_bytes: 0.0,
+            sessions: Vec::new(),
+            session_bytes: Vec::new(),
+        };
+        if !opts.deadline_ms.is_finite() || opts.deadline_ms <= 0.0 {
+            return empty(Some("E_SINK_BAD_OPTIONS".to_string()));
+        }
+        let shared = Arc::new(crate::frame_sink::SinkShared::new(
+            opts.ring_capacity as usize,
+        ));
+        match self.frame_sink.lock() {
+            Ok(mut guard) => *guard = Some(shared.clone()),
+            Err(_) => return empty(Some("E_INTERNAL: frame sink lock poisoned".to_string())),
+        }
+        let mut deframer = crate::frame_sink::Deframer::new();
+        let mut parsed = Vec::new();
+        let mut per_session: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut reads: u64 = 0;
+        let mut frames: u64 = 0;
+        let mut bytes: u64 = 0;
+        let mut saw_eof = false;
+        let mut deadline_hit = false;
+        let mut first_error: Option<String> = None;
+        let start = tokio::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs_f64(opts.deadline_ms / 1000.0);
+        'sink: loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                deadline_hit = true;
+                break;
+            }
+            // The parent gate's defect ledger has a conductor hang on a slow
+            // reader with no per-cell deadline; the timeout refuses to
+            // reproduce it. quinn/mpsc reads are cancel-safe, and the one
+            // cancellation this can cost is the exit edge itself.
+            let read = tokio::time::timeout_at(deadline, self.read_inner()).await;
+            match read {
+                Err(_) => {
+                    deadline_hit = true;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    first_error = Some(error.reason.clone());
+                    break;
+                }
+                Ok(Ok(None)) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(Ok(Some(payload))) => {
+                    let arrival = crate::paced_emitter::wall_clock_ns();
+                    let chunk = payload.into_vec();
+                    reads += 1;
+                    bytes += chunk.len() as u64;
+                    parsed.clear();
+                    if let Err(fault) = deframer.push(&chunk, &mut parsed) {
+                        first_error = Some(fault);
+                        break 'sink;
+                    }
+                    for frame in &parsed {
+                        frames += 1;
+                        // i128: a skewed sender stamp above the arrival stamp
+                        // must record as a negative sample (V-N's population),
+                        // not wrap u64 into a 580-year latency.
+                        let delta_ns = arrival as i128 - frame.send_wall_ns as i128;
+                        wire.record(delta_ns as f64 / 1e6);
+                        *per_session.entry(frame.session).or_insert(0) += frame.total_length as u64;
+                        shared.push(crate::frame_sink::SinkRecord {
+                            session: frame.session,
+                            sequence: frame.sequence,
+                            send_wall_ns: frame.send_wall_ns,
+                            arrival_wall_ns: arrival,
+                            total_length: frame.total_length,
+                            class: frame.class,
+                        });
+                    }
+                }
+            }
+        }
+        let mut sessions: Vec<u32> = per_session.keys().copied().collect();
+        sessions.sort_unstable();
+        let session_bytes = sessions
+            .iter()
+            .map(|s| per_session[s] as f64)
+            .collect::<Vec<f64>>();
+        crate::frame_sink::FrameSinkResult {
+            reads: reads as f64,
+            frames: frames as f64,
+            bytes: bytes as f64,
+            errors: if first_error.is_some() { 1.0 } else { 0.0 },
+            first_error,
+            saw_eof,
+            deadline_hit,
+            wire_latency: wire.snapshot(),
+            dropped_records: shared.dropped() as f64,
+            pending_partial_bytes: deframer.pending_bytes() as f64,
+            sessions,
+            session_bytes,
+        }
+    }
+
+    /// Pop up to `max_records` dual-stamp records from the sink ring — 32 B
+    /// each, little-endian, layout documented in `frame_sink.rs`. The caller
+    /// stamps delivery on its own clock as it parses; an empty buffer means
+    /// the ring is empty (or the sink is not armed yet).
+    #[napi]
+    pub fn drain_frame_sink(&self, max_records: u32) -> napi::bindgen_prelude::Buffer {
+        let shared = self.frame_sink.lock().ok().and_then(|guard| guard.clone());
+        match shared {
+            Some(shared) => shared.drain(max_records as usize).into(),
+            None => Vec::new().into(),
         }
     }
 

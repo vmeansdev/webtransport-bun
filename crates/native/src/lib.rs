@@ -87,6 +87,7 @@ pub mod client_stream;
 pub mod datagram_batch;
 pub mod datagram_mirror;
 pub mod error;
+pub mod frame_sink;
 pub mod histogram;
 pub mod limits;
 pub mod metrics;

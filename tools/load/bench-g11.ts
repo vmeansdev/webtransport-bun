@@ -34,6 +34,7 @@ import {
 	DEFAULT_LIMITS,
 	type NativePacedEmitterOptions,
 	type NativePacedEmitterResult,
+	type NativePacedEmitterSnapshot,
 } from "../../packages/webtransport/src/index.ts";
 // The bench/harness accessor is deliberately not on the package's frozen
 // public surface; harnesses import it from the module that declares it.
@@ -231,6 +232,38 @@ if (DOWN_ORIGINATOR_ENV !== "js" && DOWN_ORIGINATOR_ENV !== "native") {
 }
 const NATIVE_DOWN = DOWN_ORIGINATOR_ENV === "native";
 
+/**
+ * Who consumes the T arm's upstream — issue 10's other half, and the reason
+ * the successor page (g11-t2) exists. "js" is the parent gate's read loop,
+ * byte for byte. "native" runs the addon frame sink (`runFrameSink`, the
+ * emitter's read-side twin): per-frame wire latency (sender send stamp →
+ * Rust arrival stamp) is recorded in the addon, and the conductor drains
+ * dual-stamp records whose JS-side delivery stamp *continues* the parent
+ * C6's app-level meaning beside the new wire figure — the two populations
+ * are never merged. Applies to arm T only, like the emitter.
+ */
+const UP_READER_ENV = process.env.G11_UP_READER || "js";
+if (UP_READER_ENV !== "js" && UP_READER_ENV !== "native") {
+	console.error(
+		`g11: G11_UP_READER must be "js" or "native", got "${UP_READER_ENV}"`,
+	);
+	process.exit(1);
+}
+const NATIVE_UP = UP_READER_ENV === "native";
+
+/** One drained frame-sink record (see native `frame_sink.rs`), little-endian. */
+const SINK_RECORD_BYTES = 32;
+/** Records per drain call; at gate rate one stream fills ~264/s. */
+const SINK_DRAIN_MAX = 4096;
+/** Idle sleep between empty drains, ms. */
+const SINK_DRAIN_IDLE_MS = 5;
+/**
+ * Grace past the step window before the sink's own deadline fires. The
+ * parent gate's defect ledger has a conductor hang on a slow reader with no
+ * per-cell deadline; the native sink always carries one.
+ */
+const SINK_DEADLINE_GRACE_MS = 30_000;
+
 const KNOB = streamBatchConfig();
 const CPU_CORES = cpus().length;
 
@@ -412,6 +445,20 @@ type ServerRecord = {
 	backpressureTimeouts: number;
 	streamsFinBothHalves: number;
 	upLatency: G11Histogram;
+	/**
+	 * Native-sink cells only (`G11_UP_READER=native`): per-frame wire latency
+	 * stamped at native arrival, before any napi crossing — the successor
+	 * clause C6-wire's population. Empty on the JS path. Never merged with
+	 * `upLatency`, which keeps the parent C6's app-level meaning.
+	 */
+	upWireLatency: G11Histogram;
+	/**
+	 * Streams whose native frame sink was unavailable, errored, or exited on
+	 * its own deadline instead of EOF. All-or-nothing, like the emitter.
+	 */
+	sinkFailures: number;
+	/** Dual-stamp records the sink ring refused (JS drain fell behind). */
+	sinkDroppedRecords: number;
 	writeLatency: G11Histogram;
 	/**
 	 * Native-emitter cells only (`G11_DOWN_ORIGINATOR=native`): the emitters'
@@ -467,6 +514,9 @@ function newRecord(): ServerRecord {
 		backpressureTimeouts: 0,
 		streamsFinBothHalves: 0,
 		upLatency: new G11Histogram(),
+		upWireLatency: new G11Histogram(),
+		sinkFailures: 0,
+		sinkDroppedRecords: 0,
 		writeLatency: new G11Histogram(),
 		emitterLateness: new G11Histogram(),
 		emitterFailures: 0,
@@ -569,7 +619,29 @@ type AcceptedBidi = {
 		runPacedEmitter?: (
 			opts: NativePacedEmitterOptions,
 		) => Promise<NativePacedEmitterResult>;
+		/** The emitter's read-side twin (see crates/native/src/frame_sink.rs). */
+		runFrameSink?: (opts: {
+			deadlineMs: number;
+			ringCapacity: number;
+		}) => Promise<NativeFrameSinkResult>;
+		drainFrameSink?: (maxRecords: number) => Uint8Array;
 	} | null;
+};
+
+/** Result of `runFrameSink` — see `crates/native/src/frame_sink.rs`. */
+type NativeFrameSinkResult = {
+	reads: number;
+	frames: number;
+	bytes: number;
+	errors: number;
+	firstError?: string | null;
+	sawEof: boolean;
+	deadlineHit: boolean;
+	wireLatency: NativePacedEmitterSnapshot;
+	droppedRecords: number;
+	pendingPartialBytes: number;
+	sessions: number[];
+	sessionBytes: number[];
 };
 
 type ServerSession = {
@@ -637,6 +709,82 @@ function driveTunnelStream(
 
 	let sawEof = false;
 	const reader = (async () => {
+		if (NATIVE_UP && cell.arm === "T") {
+			// The native frame sink (issue 10's read-side move). Arm T only:
+			// D's reader must withhold consumption inline, which is exactly
+			// the JS loop below.
+			// Call through the handle: a napi class method detached from its
+			// receiver rejects with InvalidArg (the emitter's lesson, carried).
+			const handle = stream[WT_NATIVE_BIDI_HANDLE]?.();
+			if (!handle?.runFrameSink || !handle.drainFrameSink) {
+				record.sinkFailures += 1;
+				record.streamErrors += 1;
+				console.error("g11: native frame sink unavailable on this handle");
+				return;
+			}
+			// bind() keeps the receiver, so the closures below stay narrow-safe
+			// without re-checking the optional methods on every call.
+			const runSink = handle.runFrameSink.bind(handle);
+			const drainRecords = handle.drainFrameSink.bind(handle);
+			let sinkDone = false;
+			const drain = (): number => {
+				const buf = drainRecords(SINK_DRAIN_MAX);
+				if (buf.byteLength === 0) return 0;
+				// One delivery stamp per drain batch: these records became
+				// visible to JS together, at this instant — the same "they
+				// did arrive together" honesty the chunk deframer applies.
+				const deliveredNs = wallNs();
+				const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+				const n = Math.floor(buf.byteLength / SINK_RECORD_BYTES);
+				for (let i = 0; i < n; i += 1) {
+					const base = i * SINK_RECORD_BYTES;
+					const sendWallNs = view.getBigUint64(base + 8, true);
+					record.upLatency.recordNs(deliveredNs - sendWallNs);
+				}
+				return n;
+			};
+			const drainLoop = (async () => {
+				while (!sinkDone) {
+					if (drain() === 0) await Bun.sleep(SINK_DRAIN_IDLE_MS);
+				}
+				// Final sweep: the sink stopped pushing before sinkDone was set,
+				// so one empty drain proves the ring is dry.
+				while (drain() > 0) {
+					/* keep sweeping */
+				}
+			})();
+			const result = await runSink({
+				deadlineMs: cell.stepSeconds * 1000 + SINK_DEADLINE_GRACE_MS,
+				ringCapacity: 0,
+			});
+			sinkDone = true;
+			await drainLoop;
+			record.readCrossings += result.reads;
+			record.upBytes += result.bytes;
+			record.upFrames += result.frames;
+			record.upWireLatency.merge(result.wireLatency);
+			record.sinkDroppedRecords += result.droppedRecords;
+			for (let i = 0; i < result.sessions.length; i += 1) {
+				const session = result.sessions[i] as number;
+				record.perSessionUpBytes.set(
+					session,
+					(record.perSessionUpBytes.get(session) ?? 0) +
+						(result.sessionBytes[i] as number),
+				);
+			}
+			sawEof = result.sawEof;
+			if (result.errors > 0 || result.deadlineHit) {
+				record.sinkFailures += 1;
+				record.streamErrors += 1;
+				console.error(
+					`g11: native frame sink stopped early: ${
+						result.firstError ??
+						(result.deadlineHit ? "E_SINK_DEADLINE" : "E_UNKNOWN")
+					}`,
+				);
+			}
+			return;
+		}
 		const r = stream.readable.getReader();
 		// The off-thread path hands the chunk (with its main-thread arrival
 		// stamp) to the pool and keeps nothing else here; the inline path is the
@@ -1730,6 +1878,22 @@ async function main(): Promise<void> {
 					latenessSnapshot: env.record.emitterLateness.snapshot(),
 				};
 			}
+			// Who consumed this cell's upstream (additive stamp, successor page
+			// g11-t2). "js-read" is the loop every parent artifact graded;
+			// "native-sink" adds the wire-latency population beside — never in
+			// place of — the app-level upLatency the drained records feed.
+			entry.upReader =
+				cell.arm === "T" && NATIVE_UP ? "native-sink" : "js-read";
+			if (cell.arm === "T" && NATIVE_UP) {
+				const wireSnapshot = env.record.upWireLatency.snapshot();
+				entry.upSink = {
+					failures: env.record.sinkFailures,
+					droppedRecords: env.record.sinkDroppedRecords,
+					wireLatencySnapshot: wireSnapshot,
+					wireOneWayP99Ms: percentileMs(wireSnapshot, 0.99),
+					wireNegativeSamples: wireSnapshot.negativeCount,
+				};
+			}
 			entry.hostLoad = {
 				start: env.hostLoadStart,
 				end: env.hostLoadEnd,
@@ -1793,6 +1957,8 @@ async function main(): Promise<void> {
 			// the value that ran; per-cell provenance rides as `downOriginator`.
 			downOriginatorEnv: process.env.G11_DOWN_ORIGINATOR ?? null,
 			downOriginator: NATIVE_DOWN ? "native-paced" : "js-awaited",
+			upReaderEnv: process.env.G11_UP_READER ?? null,
+			upReader: NATIVE_UP ? "native-sink" : "js-read",
 			// The deadline's child-tail terms travel with the artifact: a breach is
 			// only readable against the phases the deadline was built from.
 			childTailFixedMs: CHILD_TAIL_FIXED_MS,

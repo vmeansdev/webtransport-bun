@@ -346,6 +346,7 @@ jobs:
           # defaults a typo did not ask for.
           G11_DOWN_ORIGINATOR=""
           G11_DEFRAME_WORKERS=""
+          G11_UP_READER=""
           if [ -n "${G11_GENERATOR:-}" ]; then
             IFS=',' read -ra GEN_PAIRS <<< "$G11_GENERATOR"
             for pair in "${GEN_PAIRS[@]}"; do
@@ -358,15 +359,16 @@ jobs:
               case "$key" in
                 originator) G11_DOWN_ORIGINATOR="$value" ;;
                 deframe) G11_DEFRAME_WORKERS="$value" ;;
+                upreader) G11_UP_READER="$value" ;;
                 *)
-                  echo "::error::g11_generator key '$key' unknown (allowed: originator, deframe)"
+                  echo "::error::g11_generator key '$key' unknown (allowed: originator, deframe, upreader)"
                   exit 1
                   ;;
               esac
             done
           fi
-          export G11_DOWN_ORIGINATOR G11_DEFRAME_WORKERS
-          echo "g11 generator: originator='${G11_DOWN_ORIGINATOR:-js (default)}' deframe='${G11_DEFRAME_WORKERS:-auto (default)}'"
+          export G11_DOWN_ORIGINATOR G11_DEFRAME_WORKERS G11_UP_READER
+          echo "g11 generator: originator='${G11_DOWN_ORIGINATOR:-js (default)}' deframe='${G11_DEFRAME_WORKERS:-auto (default)}' upreader='${G11_UP_READER:-js (default)}'"
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           EV="$GITHUB_WORKSPACE/.bench-evidence"
           SHA="${{ github.event.inputs.candidate_commit }}"
