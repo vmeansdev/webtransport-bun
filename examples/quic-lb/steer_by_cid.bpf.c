@@ -21,7 +21,9 @@
 // that kernel's headers with libbpf-dev installed — zero diagnostics, a
 // 15,984-byte object. That is a syntax and types result and nothing more.
 //
-// ⚠️ THAT COMPILE PREDATES THE CURRENT TEXT. The 2026-08-21 object was built
+// UPDATE (same day): the CURRENT text — with every review fix below — was
+// recompiled clean on the same box, same command, at tip f7c9058. The
+// original 2026-08-21 object was built
 // from the revision before the review fixes below (short-header fixed-bit test
 // removed; Initial/0-RTT routed by DCID; `steer_stats` moved to a per-CPU
 // array). The re-compile on the box is OWED and has not been run — treat the
