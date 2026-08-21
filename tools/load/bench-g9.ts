@@ -627,11 +627,21 @@ async function runCell(cell: Cell, repeat: number) {
 	// read future, so the settle reading (taken with the base tier still up) is a
 	// disclosure and this one is the clause. Run 32209051975 stamped exactly this
 	// reading at zero.
+	// The per-socket drop tap dies with the socket: /proc/net/udp loses the
+	// port row the moment `server.close()` returns, so a post-close read is
+	// "could not look", not "saw no drops" — and V-K then fires on every cell
+	// (stamp D-6). Take the tap's terminal reading while the socket still
+	// exists and carry it into the post-close sample.
+	const terminalDrops = readServerSocketDrops();
 	await server.close();
-	const postClose = sampleLiveness(
-		server as unknown as { metricsSnapshot: () => Record<string, unknown> },
-		prevCpu,
-	).sample;
+	const postClose = {
+		...sampleLiveness(
+			server as unknown as { metricsSnapshot: () => Record<string, unknown> },
+			prevCpu,
+		).sample,
+		serverSocketDrops: terminalDrops,
+		socketDropsRead: terminalDrops !== null,
+	};
 	return { ...fragment, postCloseSample: postClose };
 }
 
