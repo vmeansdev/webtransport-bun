@@ -20,9 +20,15 @@ single-JS-thread originator wall the campaign has now hit in three independent
 shapes), so a relay tier built from the product halves fleet capacity and
 bottlenecks on exactly the thread the campaign keeps finding. Balancing is a
 **deployment pattern plus two small product hooks** (socket injection, CID
-server-ID encoding), not a product. Per 8-thread box, plan 2–4 instances sized
-by measurement (a loaded instance is a multi-thread process: JS thread + addon
-+ endpoint driver ≈ 3+ cores under bidirectional load), not 8.
+server-ID encoding), not a product. On instance count per box: one instance per
+hardware thread is refuted — a loaded instance is a multi-thread process (JS
+thread + addon + endpoint driver), so 8 on an 8-thread box oversubscribes it.
+What replaces that number is **an upper bound of unknown tightness**, not a
+recommendation: the ~317%-of-a-core figure this document cites was measured on
+a process that includes the harness *conductor*, whose share was never
+separated out and remains **unmeasured**. Size by measuring your own workload.
+See the capacity document's §1, "Sizing — an upper bound of unknown tightness",
+which is the authority here and declines to publish a per-box instance count.
 
 ---
 
@@ -49,8 +55,11 @@ decoupled from the address so the connection survives address changes
   hashes the 4-tuple re-routes the flow at the moment of rebind, and the new
   backend holds no state for those CIDs — the connection stalls until
   idle-timeout teardown (the server applies `max_idle_timeout` from limits,
-  `crates/native/src/lib.rs:745`). 4-tuple steering converts a survivable
-  rebind into a dropped session.
+  `crates/native/src/lib.rs:745`). 4-tuple steering therefore converts a
+  survivable rebind into a session that **stalls until the idle timeout expires
+  (60 s by default)** — not an immediate drop, and the difference is the whole
+  observable behaviour: the client sees a hang, not a close. The verified
+  mechanism is in the capacity document, §3.
 - **Migration and multipath** are the same failure amplified: the client
   *intends* to change path; only CID-aware routing follows it.
 - **Ownership of Retry, stateless reset, and 0-RTT.** Stateless resets are
@@ -85,11 +94,19 @@ rustls/quinn work; under G11's bidirectional load the single conductor+server
 process measured **~317% of one core** (JS 93–95%, addon threads ~61%, tokio
 ~9% — ticket 10's per-thread sampler). G7's egress run held host CPU at a
 run-wide median maximum of 79.1% of 8 threads (cell B-1k) with one server +
-sink + harness. **Plan 2–4 instances per
-8-thread box and size by measurement**; 8 would oversubscribe the box before
-the NIC is warm. Per-session memory is linear ≈140 KB/session to 5k sessions
-(four-axes measurement), so instance count barely moves the memory budget —
-sessions do.
+sink + harness. **What that licenses is an upper bound of unknown tightness,
+not a per-box instance count**: the ~317% figure was measured on a process that
+also runs the harness conductor, and **the conductor's share of it was never
+separated out** — it is unmeasured, and the JS thread it dominates is harness
+code. So the honest statement is that one instance under bidirectional load
+costs well over one core and probably under three, that one instance per
+hardware thread is refuted by the shape of that measurement, and that any
+number between those is yours to measure. The capacity document's §1, "Sizing —
+an upper bound of unknown tightness", is the authority and deliberately
+publishes no instance count. Per-session memory is linear at **126.4832
+KB/session** measured from 1k to 10k sessions on this bare-metal rig (`g1.md`
+C3; the 5k→10k slope is within 0.48% of the 1k→5k slope), so instance count
+barely moves the memory budget — sessions do.
 
 The options for N instances on one box:
 
@@ -247,11 +264,17 @@ The standard ladder, each rung usable with this codebase:
 ## 5. Recommendation — staged, priced, and bounded
 
 **Now (documentation only, no code):** publish the deployment pattern in the
-ticket-09 capacity document: N-instances-per-box sizing guidance (2–4 per 8
-threads, measured envelopes per instance), rung 1 = DNS/ports (§2c) as the
-supported pattern, with the explicit statement that 4-tuple-hash balancers
-(plain reuseport, plain ECMP) trade every NAT rebind for a session drop and
-are therefore unsupported for long-lived-session deployments.
+ticket-09 capacity document: sizing guidance stated as **an upper bound of
+unknown tightness** rather than an instance count — one instance per hardware
+thread is refuted, the per-instance cost is above one core and probably under
+three, and the conductor's share of the measurement that says so is
+**unmeasured** — plus the measured per-instance envelopes, rung 1 = DNS/ports
+(§2c) as the supported pattern, and the explicit statement that 4-tuple-hash
+balancers (plain reuseport, plain ECMP) stall a session at every NAT rebind
+until its idle timeout expires and are therefore unsupported for
+long-lived-session deployments. The capacity document's §1 is where that sizing
+language lives; it publishes no per-box number and this document must not
+either.
 
 **Next (two small product hooks, in lever order):**
 1. **Socket injection / `reusePort: true`** — native-crate option built on the
