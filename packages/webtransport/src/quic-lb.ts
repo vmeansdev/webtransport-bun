@@ -107,10 +107,7 @@ export function decodeQuicLbConfigRotation(cid: Uint8Array): number | null {
  * The wire length of every connection ID this configuration issues:
  * `1 + serverIdLen + nonceLen`, from 6 to 20 octets.
  */
-export function quicLbCidLength(
-	serverIdLen: number,
-	nonceLen: number,
-): number {
+export function quicLbCidLength(serverIdLen: number, nonceLen: number): number {
 	return 1 + serverIdLen + nonceLen;
 }
 
