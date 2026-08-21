@@ -83,8 +83,9 @@ thread. The addon runs its endpoint on a dedicated runtime
 (`server_spawn.rs:178`, `new_current_thread`) *plus* the Bun JS thread *plus*
 rustls/quinn work; under G11's bidirectional load the single conductor+server
 process measured **~317% of one core** (JS 93–95%, addon threads ~61%, tokio
-~9% — ticket 10's per-thread sampler). G7's egress run held host CPU at
-~75% of 8 threads with one server + sink + harness. **Plan 2–4 instances per
+~9% — ticket 10's per-thread sampler). G7's egress run held host CPU at a
+run-wide median maximum of 79.1% of 8 threads (cell B-1k) with one server +
+sink + harness. **Plan 2–4 instances per
 8-thread box and size by measurement**; 8 would oversubscribe the box before
 the NIC is warm. Per-session memory is linear ≈140 KB/session to 5k sessions
 (four-axes measurement), so instance count barely moves the memory budget —
