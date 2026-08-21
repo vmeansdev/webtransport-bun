@@ -75,6 +75,16 @@ pub struct ServerMetrics {
     /// which the mirror increments exactly as every other send path does, so a
     /// mirrored datagram is indistinguishable from a looped one there.
     pub datagram_mirror_targets: AtomicU64,
+    /// `sendDatagramMirrorPaced()` calls this server has served.
+    ///
+    /// Its own meter rather than a share of `datagram_mirror_calls`: the two
+    /// paths report different things — one delivery, one admission — and a
+    /// counter that summed them would name neither.
+    pub datagram_mirror_paced_calls: AtomicU64,
+    /// Targets those calls *offered to admission*, so
+    /// `offered - pacer.admittedTargets` is the pacer's `refusedTargets`.
+    /// Delivery stays per-session `datagrams_out`, as on every other send path.
+    pub datagram_mirror_paced_targets: AtomicU64,
     /// Wakes datagram senders competing for this server instance's global byte budget.
     pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
@@ -292,6 +302,13 @@ impl ServerMetrics {
             datagram_mirror_targets: Some(
                 self.datagram_mirror_targets.load(Ordering::Relaxed) as f64
             ),
+            datagram_mirror_paced_calls: Some(
+                self.datagram_mirror_paced_calls.load(Ordering::Relaxed) as f64,
+            ),
+            datagram_mirror_paced_targets: Some(
+                self.datagram_mirror_paced_targets.load(Ordering::Relaxed) as f64,
+            ),
+            mirror_reports_dropped: Some(crate::egress_pacer::reports_dropped() as f64),
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as f64,
             limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as f64,
             sessions_closed_by_idle: Some(

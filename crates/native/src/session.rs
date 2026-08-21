@@ -220,6 +220,13 @@ pub(crate) fn try_send_datagram_on_state(
 ///
 /// Targets are resolved **owner-scoped**: an id belonging to another server in
 /// this process reports `E_SESSION_CLOSED` and receives nothing.
+///
+/// The egress pacer is deliberately **not** reachable from here, whatever
+/// `WEBTRANSPORT_PACER_PPS` says. Pacing changes what the envelope's `sent`
+/// means — from "quinn took it" to "a schedule accepted it" — and that is the
+/// one word this contract sells. A caller that wants the schedule asks for it by
+/// name through `send_datagram_mirror_paced_for_owner`, whose envelope reports
+/// admission and never says `sent` at all.
 pub(crate) fn send_datagram_mirror_for_owner(
     owner_server_id: u64,
     targets: &[String],
@@ -244,6 +251,44 @@ pub(crate) fn send_datagram_mirror_for_owner(
         };
         try_send_datagram_on_state(&state, payload)
     })
+}
+
+/// Hand one payload and many targets to the egress pacer's schedule.
+///
+/// The sibling of [`send_datagram_mirror_for_owner`], and deliberately a
+/// different function rather than a knob inside it: this one returns
+/// **admission**, not delivery. Nothing about a target has been examined when it
+/// returns — not existence, not ownership, not byte budget — so the envelope
+/// counts targets accepted onto the schedule and the per-target outcomes are
+/// reported later, out of band, through the bounded reports ring
+/// (`egress_pacer::drain_reports`).
+///
+/// `None` means the pacer knob is off. The caller turns that into a typed error
+/// rather than silently running the inline loop: a caller that asked for the
+/// schedule by name and got the burst instead would have no way to tell.
+pub(crate) fn send_datagram_mirror_paced_for_owner(
+    owner_server_id: u64,
+    targets: &[String],
+    payload: &[u8],
+    metrics: &crate::server_metrics::ServerMetrics,
+) -> Option<crate::datagram_mirror::MirrorOutcome> {
+    let cfg = crate::egress_pacer::config()?;
+    metrics
+        .datagram_mirror_paced_calls
+        .fetch_add(1, Ordering::Relaxed);
+    // Targets *offered to admission*, so `offered - admitted` reconciles against
+    // the pacer's own `refusedTargets`. An over-cap tail is reported, never
+    // offered, so it is not counted here either.
+    metrics.datagram_mirror_paced_targets.fetch_add(
+        crate::datagram_mirror::split_at_cap(targets.len()) as u64,
+        Ordering::Relaxed,
+    );
+    Some(crate::egress_pacer::submit(
+        cfg,
+        owner_server_id,
+        targets,
+        payload,
+    ))
 }
 
 pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<()> {

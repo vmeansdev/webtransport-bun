@@ -587,6 +587,48 @@ Contract points worth stating:
   target, so a mirrored datagram is indistinguishable from a looped one in the
   per-session counters a delivery ratio reads.
 
+### The paced mirror
+
+`server.sendDatagramMirrorPaced(targets, payload)` is a **separate** method that
+hands the same fan-out to the native egress pacer's schedule. It exists so that
+the contract above can stay exactly what it says: `sendDatagramMirror` is not
+paced and never will be, whatever `WEBTRANSPORT_PACER_PPS` is set to. Pacing
+changes what a successful count *means* — from "quinn took it" to "a schedule
+accepted it" — and that is the one word the synchronous contract sells, so the
+paced envelope is a different object with a different vocabulary.
+
+- **The envelope is admission, not delivery.** `{ admitted, refused }`. When the
+  call returns, no target has been resolved, owner-checked or budget-checked.
+  `admitted` is targets the schedule took; `refused` names, per index, the ones
+  it would not, always `E_QUEUE_FULL` and always because the queue was already
+  holding its bound of outstanding work. A set, not a prefix, exactly as above.
+- **Per-target outcomes are drained out of band.**
+  `server.readMirrorReports(max?)` returns `{ target, error }` entries for
+  **failures only** — synchronous, promise-free, never throwing, `[]` when
+  nothing is pending. A caller counts deliveries as `admitted` minus the
+  failures it drains. `E_SESSION_CLOSED` reports are the reap list and
+  `E_QUEUE_FULL` reports are the retry list, the same two lists the synchronous
+  envelope hands back immediately.
+- **The ring is fixed at 4,096 entries** and drops oldest on overflow, counting
+  every drop in `metricsSnapshot().mirrorReportsDropped`. Bounded by
+  construction: a caller that never polls costs a constant. `drained +
+  mirrorReportsDropped` reconciles against the pacer's own `deferredFailures`,
+  which is the falsifier for the reporting path itself.
+- **Two backpressure signals, separately named.** `refused` at admission means
+  the schedule was full; an `E_QUEUE_FULL` *report* means that target had no
+  byte budget when its turn came. The synchronous API conflates them.
+- **The cap stays 10,000, with a different justification.** On the synchronous
+  path it is a JS-thread stall budget; a paced call's cost on that thread does
+  not grow with the list, so here it is an argument-sanity bound, kept because a
+  `RangeError` is cheaper to debug than a silent mass refusal.
+- **Metrics.** `datagramMirrorPacedCalls` and `datagramMirrorPacedTargets` move;
+  `datagramMirrorCalls`, `datagramMirrorTargets` and `datagramSendsAsync` do
+  not. No promise is created here either.
+- **With the pacer knob off** it throws a `WebTransportError` with code
+  `E_UNSUPPORTED_ARGUMENT` rather than quietly running the inline loop, with a
+  distinct message from the one an addon built without the pacer produces.
+  Native-only, like the synchronous mirror.
+
 ## Incoming datagram delivery
 
 `incomingDatagrams()` is the same public API on both native session classes and
