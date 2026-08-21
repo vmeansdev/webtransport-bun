@@ -89,9 +89,15 @@ import {
 	sendDatagramBatchChunked,
 } from "./datagram-batch.js";
 import {
+	type DatagramMirrorAdmission,
 	type DatagramMirrorResult,
+	decodeMirrorReports,
+	type MirrorReport,
+	type NativeDatagramMirrorAdmission,
 	type NativeDatagramMirrorResult,
+	type NativeMirrorReport,
 	sendDatagramMirrorChecked,
+	sendDatagramMirrorPacedChecked,
 } from "./datagram-mirror.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
@@ -564,6 +570,14 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
+	/**
+	 * Diagnostic, unstable, NOT public API (see egress_pacer.rs): windowed
+	 * pacer counters for bench tooling. **Absent** (not `"{}"`) on addons built
+	 * without the pacer accessors, so a caller can tell a stale addon from a
+	 * live addon whose pacer knob is simply off — the latter returns `"{}"`.
+	 */
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
 	/** Effective congestion-control mode applied to all server connections. */
 	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
@@ -607,13 +621,60 @@ export interface WebTransportServer {
 		targets: readonly string[],
 		payload: Uint8Array,
 	): DatagramMirrorResult;
+	/**
+	 * Hand one payload and many targets to the native egress pacer's schedule.
+	 *
+	 * The sibling of {@link sendDatagramMirror}, and a separate method rather
+	 * than a mode of it because the envelope means something else. `admitted`
+	 * counts targets the schedule accepted: nothing has been resolved,
+	 * owner-checked or budget-checked when this returns, so this envelope
+	 * carries no delivery count and deliberately offers nothing that could be
+	 * read as one — delivery is `admitted` minus the failures that later arrive
+	 * through {@link readMirrorReports}.
+	 *
+	 * Synchronous and promise-free, exactly as the mirror is. Throws `TypeError`
+	 * for a malformed argument and `RangeError` past 10,000 targets — the same
+	 * programming errors, checked before anything crosses — and never throws for
+	 * a transport condition.
+	 *
+	 * Throws a `WebTransportError` with code `E_UNSUPPORTED_ARGUMENT` when the
+	 * pacer is unavailable, with two distinguishable messages: the addon was
+	 * built without the pacer, or `WEBTRANSPORT_PACER_PPS` is unset. Native-only.
+	 */
+	sendDatagramMirrorPaced(
+		targets: readonly string[],
+		payload: Uint8Array,
+	): DatagramMirrorAdmission;
+	/**
+	 * Drain up to `max` deferred failures from paced broadcasts, oldest first.
+	 *
+	 * **Failures only.** Targets that took the payload are never reported, so a
+	 * healthy paced broadcast to 10,000 subscribers drains nothing; the caller
+	 * counts deliveries as `admitted` minus the failures it sees here.
+	 *
+	 * Synchronous, promise-free and never throwing — `[]` means nothing is
+	 * pending, including on an addon with no pacer at all. (Whether the pacer
+	 * exists is told by `sendDatagramMirrorPaced` throwing, and by
+	 * `mirrorReportsDropped` being present in `metricsSnapshot()`.)
+	 *
+	 * The backing ring is fixed at 4,096 entries and drops oldest on overflow,
+	 * counting every drop in `metricsSnapshot().mirrorReportsDropped`. So
+	 * polling too slowly loses reports *visibly*, and a caller that never polls
+	 * costs a constant rather than a growth path. `drained + mirrorReportsDropped`
+	 * reconciles against the pacer's own `deferredFailures`.
+	 *
+	 * Omitting `max` drains everything pending. Native-only.
+	 */
+	readMirrorReports(max?: number): readonly MirrorReport[];
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
 
 export type {
+	DatagramMirrorAdmission,
 	DatagramMirrorFailure,
 	DatagramMirrorResult,
+	MirrorReport,
 } from "./datagram-mirror.js";
 
 // ---------------------------------------------------------------------------
@@ -919,6 +980,22 @@ export type MetricsSnapshot = {
 	 * mirrored datagram is indistinguishable from a looped one there.
 	 */
 	datagramMirrorTargets?: number;
+	/**
+	 * Native only. `sendDatagramMirrorPaced()` calls served. Its own meter
+	 * rather than a share of {@link datagramMirrorCalls}: the two envelopes
+	 * report different things — delivery and admission — and a counter that
+	 * summed them would name neither.
+	 */
+	datagramMirrorPacedCalls?: number;
+	/** Native only. Targets those paced calls offered to the schedule. */
+	datagramMirrorPacedTargets?: number;
+	/**
+	 * Native only. Deferred mirror reports lost to ring overflow — the visible
+	 * cost of polling `readMirrorReports()` too slowly. Process-wide, like the
+	 * pacer's schedule, so a second server in this process reads the same
+	 * number. Absent entirely on an addon built without the pacer.
+	 */
+	mirrorReportsDropped?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
@@ -1316,6 +1393,9 @@ type NativeConnectSessionHandle = {
 } & Partial<NativeSessionHandle>;
 interface NativeServerHandle {
 	port: number;
+	/** Diagnostic, unstable (egress pacer); may be absent on older addons. */
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
 	close(): Promise<void>;
 	updateCert(certPem: string, keyPem: string): Promise<void>;
 	updateTls(configJson: string): Promise<void>;
@@ -1337,6 +1417,18 @@ interface NativeServerHandle {
 		targets: string[],
 		payload: Uint8Array,
 	): NativeDatagramMirrorResult;
+	/** Paced sibling of the above. Optional-with-fallback rather than required:
+	 * unlike `sendDatagramMirror` this one has a meaningful "not on this addon"
+	 * answer, and conflating it with "the knob is off" is the defect `5443704`
+	 * fixed for the stats accessors. The facade turns absence into its own
+	 * message. */
+	sendDatagramMirrorPaced?(
+		targets: string[],
+		payload: Uint8Array,
+	): NativeDatagramMirrorAdmission;
+	/** Drain-on-poll reader for deferred paced failures. Absent on addons
+	 * without the pacer, where the facade answers with an empty batch. */
+	readMirrorReports?(max?: number): NativeMirrorReport[];
 	metricsSnapshot(): MetricsSnapshot;
 }
 interface NativeAddon {
@@ -2041,6 +2133,36 @@ class NativeServerSession implements ServerSession {
 // ---------------------------------------------------------------------------
 
 /**
+ * Forward the pacer's diagnostic accessors, or forward nothing.
+ *
+ * The facade closes over the native handle, so without these the pacer's own
+ * counters are unreachable from bench code. Pure accessors — they cannot
+ * influence pacing or any measured path.
+ *
+ * The absence is the point. A current addon answers `"{}"` when the pacer knob
+ * is off, so a forward that substituted `"{}"` for a method the addon does not
+ * have would make a stale addon read as a deliberate unpaced run: a paced bench
+ * cell would then produce an artifact with no pacer stats and nothing saying
+ * why. Callers that need the pacer must check `typeof server.__pacerStatsJson
+ * === "function"` and refuse when it is not.
+ */
+function pacerStatsForwards(handle: {
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
+}): Pick<WebTransportServer, "__pacerStatsSnapshot" | "__pacerStatsJson"> {
+	const snapshot = handle.__pacerStatsSnapshot;
+	const json = handle.__pacerStatsJson;
+	return {
+		...(typeof snapshot === "function"
+			? { __pacerStatsSnapshot: () => snapshot.call(handle) }
+			: {}),
+		...(typeof json === "function"
+			? { __pacerStatsJson: (token?: number) => json.call(handle, token) }
+			: {}),
+	};
+}
+
+/**
  * Create an in-process WebTransport server.
  *
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
@@ -2248,6 +2370,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	return {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
+		...pacerStatsForwards(handle),
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);
@@ -2287,6 +2410,38 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				targets,
 				payload,
 			),
+		sendDatagramMirrorPaced: (targets, payload) =>
+			sendDatagramMirrorPacedChecked(
+				(ids, bytes) => {
+					const paced = handle.sendDatagramMirrorPaced;
+					if (typeof paced !== "function") {
+						// Distinct from the knob-off message native raises, for the
+						// reason 5443704 recorded: a composition whose addon predates
+						// the pacer must not read as a deliberately unpaced run.
+						throw new WebTransportError(
+							E_UNSUPPORTED_ARGUMENT,
+							"E_UNSUPPORTED_ARGUMENT: this addon was built without the egress pacer, so sendDatagramMirrorPaced has nothing to schedule onto",
+						);
+					}
+					const admission = paced.call(handle, ids, bytes);
+					if (!admission.paced) {
+						// The knob is off. Raised here rather than in native because
+						// Bun hands a synchronous N-API `Err` back as the return
+						// value instead of throwing it, so a native throw would be
+						// decoded as an envelope by the very caller it is meant to
+						// stop.
+						throw new WebTransportError(
+							E_UNSUPPORTED_ARGUMENT,
+							"E_UNSUPPORTED_ARGUMENT: sendDatagramMirrorPaced needs the egress pacer; set WEBTRANSPORT_PACER_PPS before creating the server",
+						);
+					}
+					return admission;
+				},
+				targets,
+				payload,
+			),
+		readMirrorReports: (max) =>
+			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
 		close: createServerCloseContract({
 			closeNative: () => handle.close(),
 			resolveOwnedSessions: (info) => {
@@ -4376,6 +4531,7 @@ export const __TESTING__ = {
 	nativeStreamHandlesSnapshotForTests: () =>
 		native?.nativeStreamHandlesSnapshot?.(),
 	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
+	pacerStatsForwardsForTests: pacerStatsForwards,
 	nativeErrorCodes: KNOWN_ERROR_CODES,
 	extractMessageErrorCodeForTests: extractMessageErrorCode,
 	parseDatagramBatchSizeForTests: parseDatagramBatchSize,

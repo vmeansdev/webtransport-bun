@@ -376,6 +376,98 @@ impl ServerHandle {
         .into_napi()
     }
 
+    /// Hand one payload and many targets to the egress pacer's schedule.
+    ///
+    /// The sibling of [`Self::send_datagram_mirror`], and a separate method
+    /// rather than a mode of it, because the envelope means something else.
+    /// `admitted` is targets accepted onto the schedule: nothing has been
+    /// resolved, owner-checked or budget-checked when this returns, and calling
+    /// that number `sent` is the lie this API exists to avoid. Per-target
+    /// outcomes are drained afterwards through [`Self::read_mirror_reports`].
+    ///
+    /// Synchronous and promise-free, exactly as the mirror is — the JS thread
+    /// pays one lock, one payload copy and one target gather, independent of the
+    /// schedule's depth. Never throws for a transport condition.
+    ///
+    /// `paced: false` says the pacer knob (`WEBTRANSPORT_PACER_PPS`) is off and
+    /// nothing was offered; the wrapper raises `E_UNSUPPORTED_ARGUMENT` for it.
+    /// That is a configuration error, not a transport condition: a caller that
+    /// asked for the schedule by name and silently got the inline burst instead
+    /// would have no way to tell.
+    #[napi(js_name = "sendDatagramMirrorPaced")]
+    pub fn send_datagram_mirror_paced(
+        &self,
+        targets: Vec<String>,
+        payload: Uint8Array,
+    ) -> crate::datagram_mirror::DatagramMirrorAdmission {
+        // One copy for the whole fan-out, as on the synchronous path — and here
+        // it is load-bearing rather than merely contractual: the job outlives
+        // the call, so the JS-owned buffer cannot be the one the pacer sends.
+        let payload = payload.as_ref().to_vec();
+        crate::session::send_datagram_mirror_paced_for_owner(
+            self.server_id,
+            &targets,
+            &payload,
+            &self.metrics,
+        )
+        .map(crate::datagram_mirror::MirrorOutcome::into_admission_napi)
+        .unwrap_or_else(crate::datagram_mirror::DatagramMirrorAdmission::unpaced)
+    }
+
+    /// Drain up to `max` of this server's deferred mirror reports, oldest first.
+    ///
+    /// Failures only. A paced broadcast reports nothing for the targets that
+    /// took the payload, so the delivered count is `admitted` minus the failures
+    /// that arrive here — the same "cost proportional to what went wrong" shape
+    /// the synchronous envelope has.
+    ///
+    /// Synchronous, promise-free and never throwing, in the drain-on-poll style
+    /// `readDatagramBatch` already uses. An empty result means nothing is
+    /// pending, including on an addon with no pacer at all; the pacer's presence
+    /// is told apart by whether `sendDatagramMirrorPaced` exists.
+    ///
+    /// The backing ring is fixed at 4,096 entries and drops oldest on overflow,
+    /// counting every drop in `mirrorReportsDropped`, so a caller that never
+    /// polls costs a constant rather than a growth path.
+    #[napi(js_name = "readMirrorReports")]
+    pub fn read_mirror_reports(
+        &self,
+        max: Option<u32>,
+    ) -> Vec<crate::datagram_mirror::MirrorReportEntry> {
+        let max = max.unwrap_or(u32::MAX) as usize;
+        crate::egress_pacer::drain_reports(self.server_id, max)
+            .into_iter()
+            .map(|(target, code)| crate::datagram_mirror::MirrorReportEntry { target, code })
+            .collect()
+    }
+
+    /// Open an egress-pacer stats window. Returns the token to pass to
+    /// [`Self::pacer_stats_json`] at window close, or `0` when the pacer knob is
+    /// off and there is nothing to window.
+    ///
+    /// Named with the double underscore for the same reason
+    /// `__pacerStatsJson` is: diagnostic, unstable, and outside the public API
+    /// this package commits to.
+    #[napi(js_name = "__pacerStatsSnapshot")]
+    pub fn pacer_stats_snapshot(&self) -> u32 {
+        crate::egress_pacer::snapshot()
+    }
+
+    /// Egress-pacer counters as a JSON string, `"{}"` when the pacer knob is
+    /// off. Prototype instrumentation for the microbench and the cable
+    /// validation (`crates/native/docs/egress-pacer.md`); deliberately untyped,
+    /// because the prototype commits to no schema.
+    ///
+    /// With a token from `__pacerStatsSnapshot()` the result carries a `window`
+    /// object of deltas over that window beside the raw `cumulative` values;
+    /// without one, `window` is `null`. Process-global by construction — the
+    /// pacer is one schedule per process, not one per server — so a second
+    /// `Server` in the same process reads the same counters.
+    #[napi(js_name = "__pacerStatsJson")]
+    pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
+        crate::egress_pacer::stats_json(since)
+    }
+
     #[napi]
     pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::ServerMetricsSnapshot> {
         panic_guard::catch_panic(|| {
