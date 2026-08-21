@@ -376,6 +376,33 @@ impl ServerHandle {
         .into_napi()
     }
 
+    /// Open an egress-pacer stats window. Returns the token to pass to
+    /// [`Self::pacer_stats_json`] at window close, or `0` when the pacer knob is
+    /// off and there is nothing to window.
+    ///
+    /// Named with the double underscore for the same reason
+    /// `__pacerStatsJson` is: diagnostic, unstable, and outside the public API
+    /// this package commits to.
+    #[napi(js_name = "__pacerStatsSnapshot")]
+    pub fn pacer_stats_snapshot(&self) -> u32 {
+        crate::egress_pacer::snapshot()
+    }
+
+    /// Egress-pacer counters as a JSON string, `"{}"` when the pacer knob is
+    /// off. Prototype instrumentation for the microbench and the cable
+    /// validation (`crates/native/docs/egress-pacer.md`); deliberately untyped,
+    /// because the prototype commits to no schema.
+    ///
+    /// With a token from `__pacerStatsSnapshot()` the result carries a `window`
+    /// object of deltas over that window beside the raw `cumulative` values;
+    /// without one, `window` is `null`. Process-global by construction — the
+    /// pacer is one schedule per process, not one per server — so a second
+    /// `Server` in the same process reads the same counters.
+    #[napi(js_name = "__pacerStatsJson")]
+    pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
+        crate::egress_pacer::stats_json(since)
+    }
+
     #[napi]
     pub fn metrics_snapshot(&self) -> WtResult<crate::metrics::ServerMetricsSnapshot> {
         panic_guard::catch_panic(|| {
