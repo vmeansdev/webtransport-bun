@@ -108,6 +108,19 @@ const CONNECT_TIMEOUT_SECONDS = parseInt(
  * co-resident run can never be a G6 result.
  */
 const OFFBOX_SSH = process.env.G6_OFFBOX_SSH ?? "";
+/**
+ * The candidate SHA the Mac entrypoint checks out and builds. Required for
+ * any off-box run: the entrypoint exits 3 without it, which is exactly the
+ * spawn fault O-1 documented — every generator dead before it ran.
+ */
+const CANDIDATE_SHA = process.env.G6_CANDIDATE_SHA ?? "";
+/**
+ * mmo_client.rs:152 sleeps a hardcoded 60 s after the storm window before its
+ * settle read. Named here because the entrypoint's watchdog deadline must
+ * cover it — O-2's arithmetic showed the old fixed 300 s deadline fired at
+ * least 31 s before a storm-arm generator could finish.
+ */
+const POST_STORM_SECONDS = 60;
 const OUT_JSON = process.env.G6_OUT ?? join(ROOT, "tools/load/bench-g6.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
 const HAS_PROC = process.platform === "linux";
@@ -802,72 +815,98 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	);
 
 	const stopEmitter = startEmitter(o.players, o.state(), o.clock);
-	const realm = spawnClient([
-		"--role",
-		"realm",
-		"--sessions",
-		String(o.sessions),
-		"--send-interval-ms",
-		String(Math.round(1000 / MOVE_HZ)),
-		"--action-every",
-		String(actionEveryNthTick()),
-		"--payload-bytes",
-		String(UPSTREAM_PAYLOAD_BYTES),
-		"--steady-secs",
-		String(STEADY_SECONDS),
-		"--idle-secs",
-		String(IDLE_SECONDS),
-		"--endpoints",
-		String(ENDPOINTS),
-		"--connect-concurrency",
-		String(CONNECT_CONCURRENCY),
-		"--connect-timeout-secs",
-		String(CONNECT_TIMEOUT_SECONDS),
-		...(o.stormCohort > 0
-			? [
-					"--storm-cohort",
-					String(o.stormCohort),
-					"--storm-window-secs",
-					String(stormWindowSec()),
-					"--storm-reconnect-delay-ms",
-					String(STORM_RECONNECT_DELAY_MS),
-					// Zero = no permit pool. The registered configuration, and the
-					// reason Little's law cannot be what the accept series measures.
-					"--storm-concurrency",
-					"0",
-				]
-			: []),
-	]);
+	// O-2's arithmetic, computed from the same constants the argv carries,
+	// with the macgen 1.5x allowance. The entrypoint's watchdog arms after its
+	// build, so this covers only the client's own phases.
+	const realmDeadlineSec = Math.ceil(
+		1.5 *
+			(CONNECT_TIMEOUT_SECONDS +
+				STEADY_SECONDS +
+				(o.stormCohort > 0
+					? Math.ceil(STORM_RECONNECT_DELAY_MS / 1000) +
+						stormWindowSec() +
+						POST_STORM_SECONDS
+					: 0) +
+				IDLE_SECONDS),
+	);
+	const sideDeadlineSec = Math.ceil(
+		1.5 * (CONNECT_TIMEOUT_SECONDS + STEADY_SECONDS + IDLE_SECONDS),
+	);
+	const realm = spawnClient(
+		[
+			"--role",
+			"realm",
+			"--sessions",
+			String(o.sessions),
+			"--send-interval-ms",
+			String(Math.round(1000 / MOVE_HZ)),
+			"--action-every",
+			String(actionEveryNthTick()),
+			"--payload-bytes",
+			String(UPSTREAM_PAYLOAD_BYTES),
+			"--steady-secs",
+			String(STEADY_SECONDS),
+			"--idle-secs",
+			String(IDLE_SECONDS),
+			"--endpoints",
+			String(ENDPOINTS),
+			"--connect-concurrency",
+			String(CONNECT_CONCURRENCY),
+			"--connect-timeout-secs",
+			String(CONNECT_TIMEOUT_SECONDS),
+			...(o.stormCohort > 0
+				? [
+						"--storm-cohort",
+						String(o.stormCohort),
+						"--storm-window-secs",
+						String(stormWindowSec()),
+						"--storm-reconnect-delay-ms",
+						String(STORM_RECONNECT_DELAY_MS),
+						// Zero = no permit pool. The registered configuration, and the
+						// reason Little's law cannot be what the accept series measures.
+						"--storm-concurrency",
+						"0",
+					]
+				: []),
+		],
+		realmDeadlineSec,
+	);
 
 	const extras: ReturnType<typeof spawnClient>[] = [];
 	if (o.hotspot) {
 		extras.push(
-			spawnClient([
-				"--role",
-				"raid-subscriber",
-				"--sessions",
-				String(RAID_MEMBERS),
-				"--steady-secs",
-				String(STEADY_SECONDS),
-				"--idle-secs",
-				String(IDLE_SECONDS),
-			]),
+			spawnClient(
+				[
+					"--role",
+					"raid-subscriber",
+					"--sessions",
+					String(RAID_MEMBERS),
+					"--steady-secs",
+					String(STEADY_SECONDS),
+					"--idle-secs",
+					String(IDLE_SECONDS),
+				],
+				sideDeadlineSec,
+			),
 		);
 		extras.push(
-			spawnClient([
-				"--role",
-				"publisher",
-				"--sessions",
-				"1",
-				"--send-interval-ms",
-				String(Math.round(1000 / RAID_PUBLISHER_HZ)),
-				"--payload-bytes",
-				String(UPSTREAM_PAYLOAD_BYTES),
-				"--steady-secs",
-				String(STEADY_SECONDS),
-				"--idle-secs",
-				String(IDLE_SECONDS),
-			]),
+			spawnClient(
+				[
+					"--role",
+					"publisher",
+					"--sessions",
+					"1",
+					"--send-interval-ms",
+					String(Math.round(1000 / RAID_PUBLISHER_HZ)),
+					"--payload-bytes",
+					String(UPSTREAM_PAYLOAD_BYTES),
+					"--steady-secs",
+					String(STEADY_SECONDS),
+					"--idle-secs",
+					String(IDLE_SECONDS),
+				],
+				sideDeadlineSec,
+			),
 		);
 	}
 
@@ -1164,7 +1203,7 @@ type SpawnedClient = {
 	exited: Promise<number>;
 };
 
-function spawnClient(args: string[]): SpawnedClient {
+function spawnClient(args: string[], deadlineSeconds: number): SpawnedClient {
 	const full = [
 		"--url",
 		`https://${OFFBOX_SSH ? serverAddressForOffbox() : "127.0.0.1"}:${PORT}`,
@@ -1172,7 +1211,15 @@ function spawnClient(args: string[]): SpawnedClient {
 	];
 	// Off-box the generator is the Mac, reached over ssh exactly as ticket 29's
 	// interface contract specifies; the entrypoint enforces the candidate SHA at
-	// the generator rather than trusting it.
+	// the generator rather than trusting it. The G6 variant of the entrypoint
+	// (a separate file — the sibling's hash is pinned by G2's PD-1) accepts
+	// `mmo-client` and takes the deadline from this conductor's own phase
+	// arithmetic instead of a fixed 300 s that O-2 showed kills the storm arm.
+	if (OFFBOX_SSH && CANDIDATE_SHA === "") {
+		throw new Error(
+			"bench-g6: G6_CANDIDATE_SHA is required for an off-box run — the entrypoint refuses to build without it",
+		);
+	}
 	const [cmd, cmdArgs] = OFFBOX_SSH
 		? ([
 				"ssh",
@@ -1180,7 +1227,13 @@ function spawnClient(args: string[]): SpawnedClient {
 					"-o",
 					"BatchMode=yes",
 					OFFBOX_SSH,
-					"tools/offbox/mac-generator-entry.sh",
+					"tools/offbox/mac-generator-entry-g6.sh",
+					"--candidate",
+					CANDIDATE_SHA,
+					"--bin",
+					"mmo-client",
+					"--deadline",
+					String(deadlineSeconds),
 					"--",
 					...full,
 				],
