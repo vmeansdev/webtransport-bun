@@ -9,13 +9,23 @@
 // and not shipped in the npm package. Read it, port it, verify it yourself.
 //
 // Written against Linux **7.0.0-30-generic** (the campaign's bare-metal box) as
-// the reference target, with libbpf/BTF-style map declarations and a CO-RE
-// build in mind.
+// the reference target. The maps are declared in libbpf's BTF style
+// (`__uint`/`__type`), which needs clang with BTF support and libbpf headers —
+// kernel >= 5.2, not 4.19. This is NOT a CO-RE build: it includes the kernel
+// uapi headers directly rather than a generated `vmlinux.h`, reads no field
+// through `BPF_CORE_READ`, and so is compiled against one kernel's ABI rather
+// than relocated onto whatever kernel loads it.
 //
 // Exactly one thing has been established about it: on 2026-08-21, on that box,
 // `clang -target bpf -O2 -g -c steer_by_cid.bpf.c` compiled it clean against
 // that kernel's headers with libbpf-dev installed — zero diagnostics, a
 // 15,984-byte object. That is a syntax and types result and nothing more.
+//
+// ⚠️ THAT COMPILE PREDATES THE CURRENT TEXT. The 2026-08-21 object was built
+// from the revision before the review fixes below (short-header fixed-bit test
+// removed; Initial/0-RTT routed by DCID; `steer_stats` moved to a per-CPU
+// array). The re-compile on the box is OWED and has not been run — treat the
+// clean-compile claim as applying to the earlier revision until it is redone.
 //
 // It has NEVER been submitted to a verifier, NEVER attached to a socket, and
 // NEVER carried a packet. Verifier acceptance and runtime behavior on any
@@ -106,9 +116,10 @@
 
 #define UDP_HDR_LEN 8
 
-// RFC 9000 §17.2 / §17.3: the header form bit and the fixed bit.
+// RFC 9000 §17.2 / §17.3: the header form bit. The fixed bit (0x40) is
+// deliberately NOT tested anywhere in this program — see the short-header
+// branch for why.
 #define QUIC_HEADER_FORM_LONG 0x80
-#define QUIC_FIXED_BIT 0x40
 
 // RFC 9000 §17.2, long header packet types for QUIC version 1.
 #define QUIC_LONG_TYPE_MASK 0x30
@@ -146,8 +157,19 @@ struct {
 
 // Counters, so an operator can see how often the fallback is taken. Index:
 // 0 = steered, 1 = fallback (any reason).
+//
+// PER-CPU, not a shared ARRAY. A global array would need an atomic
+// read-modify-write on every packet, putting one cache line under contention
+// from every core the NIC steers into — a measurable per-packet cost on the
+// hot path, paid purely for observability. A per-CPU array gives each core its
+// own copy, so the increment below is an ordinary non-atomic add.
+//
+// THE CONSEQUENCE IS THE READER'S: `bpftool map dump` returns one value per CPU
+// for each key, and the total is their sum. A reader that takes the first
+// element sees one core's share and under-reports. See the README and the
+// `stats` step in attach.sh.example.
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 2);
 	__type(key, __u32);
 	__type(value, __u64);
@@ -157,8 +179,10 @@ static __always_inline void bump(__u32 slot)
 {
 	__u64 *count = bpf_map_lookup_elem(&steer_stats, &slot);
 
+	// Per-CPU value: this CPU is the only writer, so a plain increment is
+	// correct and no atomic is needed.
 	if (count)
-		__sync_fetch_and_add(count, 1);
+		*count += 1;
 }
 
 // Every early return lands here.
@@ -237,35 +261,48 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 			return fallback();
 
 		switch (first_octet & QUIC_LONG_TYPE_MASK) {
-		case QUIC_LONG_TYPE_INITIAL:
-		case QUIC_LONG_TYPE_0RTT:
-			// FIRST FLIGHT. The client picks its own destination
-			// CID at random for the Initial (RFC 9000 §7.2); the
-			// server has issued nothing yet, so there is no server
-			// ID in this packet and no CID-based scheme can route
-			// it. Every such packet takes the kernel's 4-tuple
-			// hash. The window lasts until the client adopts a
-			// server-issued CID — short, but not zero, and a rebind
-			// inside it still breaks the connection.
-			//
-			// A consistent hash of the client-chosen DCID would
-			// keep a multi-packet first flight together on one
-			// instance; the kernel's 4-tuple hash already does that
-			// for a client that has not changed address, which is
-			// the same window. Left as the simpler policy.
-			return fallback();
 		case QUIC_LONG_TYPE_RETRY:
 			// Server-to-client (§17.2.5); nothing to steer.
 			return fallback();
+		case QUIC_LONG_TYPE_INITIAL:
+		case QUIC_LONG_TYPE_0RTT:
 		case QUIC_LONG_TYPE_HANDSHAKE:
 		default:
+			// Initial and 0-RTT fall through to the same DCID check
+			// as Handshake, deliberately. Only the client's *first*
+			// Initial carries a destination CID the client invented
+			// (RFC 9000 §7.2); from the moment it sees the server's
+			// Initial or Retry it uses the server's Source
+			// Connection ID as the DCID "for subsequent packets,
+			// including any 0-RTT packets" (§7.2). Retransmitted
+			// Initials, the Initial that acknowledges the server's
+			// flight, and post-Initial 0-RTT therefore all carry OUR
+			// server ID and are routable. Rejecting the whole packet
+			// type would push every one of them onto the 4-tuple
+			// hash and stretch the unsteerable window well past
+			// where it actually ends.
+			//
+			// The genuinely unroutable case — the client's opening
+			// Initial — is not special-cased because it does not
+			// need to be: its DCID is random, so it fails the
+			// CID_LEN check, the rotation check, or the map lookup,
+			// and lands in the same fallback by the ordinary path.
+			//
+			// Residual risk, stated: a client-chosen random CID that
+			// is exactly CID_LEN octets AND whose top three bits
+			// happen to equal CONFIG_ROTATION AND whose next
+			// SERVER_ID_LEN octets happen to hit in the map will be
+			// steered. The cost is bounded — an opening Initial is a
+			// connection no instance owns yet, so any member may
+			// answer it; the worst case is a multi-packet first
+			// flight split across two instances, which the client
+			// recovers from by retransmission.
 			break;
 		}
 
-		// A client Handshake packet carries the CID the server issued in
-		// its Initial, so it is routable — but only if it is the length
-		// this configuration issues. Anything else is another endpoint's
-		// connection ID.
+		// The DCID is routable only if it is the length this
+		// configuration issues. Anything else is another endpoint's
+		// connection ID (or a client-chosen one).
 		if (prefix[UDP_HDR_LEN + 5] != CID_LEN)
 			return fallback();
 
@@ -274,9 +311,29 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 		// RFC 9000 §17.3 short header: the destination CID starts at
 		// byte 1 and its length IS NOT ON THE WIRE. CID_LEN above is
 		// the only source of that number.
-		if (!(first_octet & QUIC_FIXED_BIT))
-			return fallback(); // not a QUIC v1 short header
-
+		//
+		// THE FIXED BIT IS NOT TESTED HERE, AND MUST NOT BE.
+		//
+		// RFC 9000 §17.3 calls bit 0x40 "fixed" and requires it set,
+		// but RFC 9287 (Greasing the QUIC Bit) lets an endpoint that
+		// received the `grease_quic_bit` transport parameter clear it
+		// at random, precisely so that middleboxes stop treating it as
+		// an invariant. quinn enables that by default —
+		// `grease_quic_bit: true` in quinn-proto 0.11.16
+		// `config/mod.rs:63` — and this repository never overrides it,
+		// so a greasing peer (Chrome among them) clears the bit on
+		// roughly half its 1-RTT packets. A program that requires the
+		// bit sends half of a steady-state connection's traffic to the
+		// 4-tuple hash, which is the exact failure this program exists
+		// to prevent, and it presents as a flaky network.
+		//
+		// Nothing is lost by dropping the test. A short header carries
+		// no version and no length field, so the fixed bit was never a
+		// reliable "is this QUIC" signal in the first place. What
+		// actually rejects foreign traffic here is the chain below: the
+		// config-rotation codepoint must be ours, and the decoded
+		// server ID must hit in `slot_by_server_id`. Anything else
+		// takes the fallback, which is a pass, not a drop.
 		cid_off = UDP_HDR_LEN + 1;
 	}
 
