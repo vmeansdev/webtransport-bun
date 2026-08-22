@@ -1,15 +1,18 @@
 # webtransport-bun on bare metal — capacity, latency, and deployment
 
-**Status: COMPLETE (2026-08-21).** This is the bare-metal campaign's terminal
-document (campaign ticket 09). Every gate has reached a final verdict and no
-chapter is a stub. Nothing here is a forecast. Every number carries the stamp
-it was recomputed in, and where a number does not exist, this document says so
-rather than estimating one.
+**Status: COMPLETE (2026-08-22).** This is the bare-metal campaign's terminal
+document (campaign ticket 09). Every gate has a terminally accounted disposition;
+that disposition may be a run verdict or an explicitly closed no-run state.
+Nothing here is a forecast. Every number carries the stamp it was recomputed
+in, and where a number does not exist, this document says so rather than
+estimating one.
 
-Three of those final verdicts are not passes — G2 is INCOMPLETE, G9 is a
-NO-VERDICT on a declared harness fault, and G11's T arm is a MISS. They are
-reported here with the same weight as the passes, because the campaign's bar
-was *"every gate reaches a final valid verdict"*, not *"every gate passes."*
+G9 is a final **PASS at 600 sessions/s**. The remaining terminal exceptions are
+G2's **hardware-scoped INCOMPLETE, FINAL**, G6's
+**registered-never-dispatched / NO-VERDICT, FINAL** disposition, and G11-T's
+dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
+the same weight as the passes: the campaign's bar was *"every gate reaches a
+terminally accounted disposition"*, not *"every gate passes."*
 
 ## The rig every number below belongs to
 
@@ -37,22 +40,35 @@ corroboration.
 | Gate | Verdict, in one line | Stamp |
 |---|---|---|
 | **G1 — GPS session scale** | **PASS**, all five clauses: 10,000 sessions, ingest p99 **2.576 ms**, delivery **1.000000**, memory **~126.5 KB/session** linear | `stamps/g1.md` §9.6 |
-| **G2 — FPS/MOBA tail latency** | **INCOMPLETE — `path-not-quiet`**: the off-box floor's own idle p99 is **8.101888 ms** against the registered 4.0 ms bar, so no gate statistic exists. An **instrument** finding, foreseen and pre-registered; the run is valid, the path is not evaluable | `stamps/g2.md` §9.6 |
+| **G2 — FPS/MOBA tail latency** | **hardware-scoped INCOMPLETE, FINAL** after the two licensed valid attempts: F-off raw RTT p99 medians **12.632064 ms** (attempt 1) and **9.289728 ms** (attempt 2), each above the fixed 4.0 ms `path-not-quiet` bar. No gate PASS/MISS statistic exists because the gate had no evaluable cells; no third attempt or lower bar is authorized | `stamps/g2.md` §9.10.3, §9.10.6 |
 | **G3 — camera / bursty egress** | **PASS, with C3 = `CEILING-MOVED`**: egress one-way p99 **1.491 ms** (median of 5 blocks) against a 33.3 ms bar; GSO **and** GRO active at 64 segments, `sndbufErrors` 0 on all 30 steps. C3 states no lever value in milliseconds — for the third time across three registrations | `stamps/g3.md` §9.6, C2/C4 |
 | **G4 — SFU fan-out** | **PASS**: **16,509/s** forward egress inside a 30 Hz frame gate, p99 **10.879 ms**, delivery **1.0000**. Stated as a *rate* bound — "the 50 is incidental to that number, not causal" | `stamps/g4.md` §9.6 |
 | **G5 — bulk / VOD** | **PASS**, all six clauses, graded on the knob-**on** `P-batch` cell: **1.2505 Gbps** delivered against a 1.000 Gbps bar, sourcing 100.037% of its registered 1.25 Gbps offer. Separately — disclosed, not gating — the knob-**off** `P-control` cell delivered **1.1473 Gbps**, falsifying the registered prediction that knob-off would fall short of 1.000 Gbps. The unpaced `A6` window probe is **force-stripped** and licenses nothing | `stamps/g5.md` §9.6 clause 2, §6 P5 |
 | **G7 — stream egress** | **PASS, unnarrowed** (the C4-closure redispatch upgraded G7-01's "PASS — narrowed by C4 NOT-EVALUATED"): **1.2498 Gbps** at 16 streams × 64 KiB, byte- and stream-ledgers exact, and client receive-socket drops a *measured* **0** in all 14 cell-repeats | `stamps/g7-02.md`; run-1 record at `stamps/g7.md` |
 | **G8 — many-rooms fan-out** | **PASS, narrowed to one cell of nine**: **2** concurrent 10-subscriber video rooms at 330/s per publisher, p99 **3.740 ms**, forward delivery **0.99995**. Eight of nine cells INVALID; the voice and mutual arms produced no room count at all | `stamps/g8.md` §9.6 |
-| **G9 — sustained churn** | **NO-VERDICT (INVALID — declared harness/infra fault)**: every generator child exited **127**, no session was ever established, not one clause has an input. Explicitly **not a MISS**; one rerun is licensed and unspent | `stamps/g9.md` §9.6, §9.8 |
+| **G9 — sustained churn** | **PASS at 600 sessions/s, FINAL** (`licensedRung(600)`): L-600 achieved **595.75 / 596.01 sessions/s** against the **594/s** bar, base RTT p99 **7.09 / 12.60 ms** against 40 ms, delivery **0.99952**, zero leaked sessions/handles, and LIM PASS | `stamps/g9-02.md` §2, §4, §7 |
 | **G11 arm X — exchange** | **PASS**: **60,000/60,000** exchanges at 1,000 sessions, RTT p99 **27.25 ms** raw against 50 ms, server-side accepts equal to attempted opens, host CPU median **25.6%** | `stamps/g11.md` §2 |
 | **G11 arm D — coupling** | **COUPLING-ABSENT** — a verdict-free reading: the registered choke did not appear, so the arm reports rather than grades | `stamps/g11.md` |
-| **G11 arm T — bidirectional throughput** | **MISS (C6-up only) — final valid verdict.** First graded T-100 in the gate's history: C1–C5, C7, C8 all PASS with supply exact at **1.00003** both directions; C6 up one-way p99 **348 / 328 ms** against 25 ms. Attributed to the conductor's read-side scheduling, pre-registered as such | `stamps/g11-t.md` |
+| **G11 arm T — bidirectional throughput** | **C6-app MISS (final) · C6-wire PASS**: native-wire p99 **17.25 / 12.25 ms** against 25 ms; the successor's native transport/read path holds the interaction budget, while the parent's JS application surface does not. The parent 348 / 328 ms app-level reading is attributed to deframe-loop/read-side scheduling, not transport; the successor drain sits only ~3–4 ms above wire | `stamps/g11-t2.md` §2, §6 |
 | **Paced broadcast (the G10 successor)** | **PASS — narrowed by C2 NO-VERDICT (V-SP)**: 5,000 sessions × 5 Hz, delivery **0.997859 / 0.997617 / 0.998633** with margin, RTT p50 **0.834 / 0.792 / 0.763 ms**, stall lever **−44.71 ms** median. The spread clause renders no verdict because its measuring instrument lost its licence that day | `stamps/paced-broadcast.md` |
 | **Deployment** | Not a gate — the operator-facing architecture chapter, written and reviewed | this document, below, + `2026-08-21-load-balancing-architecture.md` |
 
-**One gate is absent by design.** G6 (MMO) was registered
-(`registrations/g6-mmo.md`) and never dispatched on this rig. It has no
-verdict, no number, and no chapter here.
+**G6 terminal disposition (no run):** the canonical registration page
+(`registrations/g6-mmo-02-redispatch.md`) is closed as
+**`registered-never-dispatched / NO-VERDICT, FINAL`**. V-C was clear at RTT p99
+**4.745 ms**. V-S genuinely fired at **116,249.37496815059 < 116,250** (the
+delivery ratio was `1`, and `precheckOriginatorSaturated` was `false`). V-F was
+unusable because the registered candidate's parser rejected the actual
+`mmo-client/1` envelope. There is no dispatch, run identity, or G6 stamp;
+cleanup/lock/process proof is unretained and unproven. Parser repair
+`883059bb9940db9d22b3fa58ca199697ea1f68e1` was reviewed/pushed but is
+**UNCONSUMED**, not a G6 candidate or rerun authority. No rerun or dispatch is
+authorized without new explicit maintainer authority.
+
+G9's stamped F-1 finding concerns admission refusals under concurrent ramps;
+see [OPERATIONS.md §Admission control: refusal is load-shaping, not rejection](../OPERATIONS.md#admission-control-refusal-is-load-shaping-not-rejection)
+for the existing refusal/retry policy. This document does not duplicate that
+policy.
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
 rig, and the paced-broadcast gate supersedes its scenario on this one — the
@@ -520,9 +536,13 @@ below.
 
 # Bidirectional streams, arm T — the first graded T-100
 
-**Verdict: MISS (C6-up only) — final valid verdict. The supply wall is
-CLOSED.** Stamp: `stamps/g11-t.md`. Registration:
-`registrations/g11-t-redispatch.md`. Investigation: campaign ticket 10.
+**Terminal row: C6-app MISS (final) · C6-wire PASS (17.25 / 12.25 ms against
+25 ms).** The parent application-level reading remains final; the successor
+stamp adds the native-wire clause without collapsing the two readings. Parent
+registration: `registrations/g11-t-redispatch.md`; terminal successor
+registration: `registrations/g11-t2.md`. Terminal successor stamp
+`stamps/g11-t2.md` is bound to that successor registration. Parent stamp:
+`stamps/g11-t.md`. Investigation: campaign ticket 10.
 
 ## 1. Why this arm has a history
 
@@ -763,16 +783,15 @@ robust and quotable. Off-box **RTT p99** is quotable only as a same-day,
 same-run *relative* comparison between paired arms — which is exactly the form
 the paced-broadcast C3′ clause was rebuilt into (Amendment A-1).
 
-**G2's INCOMPLETE is the same instrument seen from the other side.** Its
-off-box floor arms measured an idle p99 of **8.101888 ms** — the median of the
-three arms, all three of which are above the 4.0 ms bar — meaning 81% of a
-10 ms round-trip budget is consumed by the vantage before the product is
-involved. The registration predicted this outcome in advance and called it a
-legitimate campaign result, though the stamp records the prediction as a **HIT
-on the verdict and a MISS on the band**: it expected 3–6 ms, and 8.102 ms is
-35% above the top of that range and 2.03× the bar. **The Mac vantage cannot
-witness a single-digit-
-millisecond tail-latency claim**, and no such claim appears in this document.
+**G2's final INCOMPLETE is the same instrument seen from the other side.** The
+historical first run's off-box floor arms measured an idle p99 of **8.101888
+ms**; the two licensed final attempts independently measured F-off medians of
+**12.632064 ms** and **9.289728 ms**, all above the fixed 4.0 ms bar. The
+registration predicted this outcome in advance and called it a legitimate
+campaign result. The final stamp records a hardware-scoped INCOMPLETE with no
+gate statistic, because the path was not quiet and no gate cells were
+evaluable. **The Mac vantage cannot witness a single-digit-millisecond
+tail-latency claim**, and no such claim appears in this document.
 
 ## 3. The cable and its preflight
 
