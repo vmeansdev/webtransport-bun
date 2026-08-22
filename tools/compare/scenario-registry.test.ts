@@ -5,11 +5,12 @@ import {
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_CONNECTION_SETUP,
 	CANONICAL_SCENARIO_REGISTRY,
-	SCENARIO_IDS,
 	createScenarioRegistry,
 	getScenarioCell,
 	listScenarioArms,
 	listScenarioCells,
+	SCENARIO_IDS,
+	type ScenarioRegistryOptions,
 	validateScenarioOverride,
 } from "./scenario-registry.ts";
 import type {
@@ -451,6 +452,151 @@ describe("frozen v1 comparison scenario registry", () => {
 		).toBe(true);
 	});
 
+	test("preserves one getter snapshot through validation and application", () => {
+		let cellIdReads = 0;
+		const getterOverride = Object.defineProperties(
+			{},
+			{
+				cellId: {
+					enumerable: true,
+					get: () => {
+						cellIdReads += 1;
+						return cellIdReads === 1
+							? "chat-fanout/subscribers-1000"
+							: "unknown/default";
+					},
+				},
+				changes: {
+					enumerable: true,
+					value: { durationSeconds: 31 },
+				},
+			},
+		);
+
+		const diagnostic = createScenarioRegistry([getterOverride] as never);
+		expect(cellIdReads).toBe(1);
+		expect(
+			getScenarioCell(diagnostic, "chat-fanout/subscribers-1000").parameters,
+		).toMatchObject({ durationSeconds: 31 });
+
+		let descriptorReads = 0;
+		const changingChanges = new Proxy(
+			{},
+			{
+				ownKeys: () => ["durationSeconds"],
+				getOwnPropertyDescriptor: () => {
+					descriptorReads += 1;
+					return {
+						configurable: true,
+						enumerable: true,
+						get: () => (descriptorReads === 1 ? 31 : 32),
+					};
+				},
+			},
+		);
+		const proxyDiagnostic = createScenarioRegistry([
+			{
+				cellId: "chat-fanout/subscribers-1000",
+				changes: changingChanges,
+			},
+		] as never);
+		expect(descriptorReads).toBe(1);
+		expect(
+			getScenarioCell(proxyDiagnostic, "chat-fanout/subscribers-1000")
+				.parameters,
+		).toMatchObject({ durationSeconds: 31 });
+	});
+
+	test("rejects empty, no-op, and cancelling diagnostic overrides", () => {
+		const cellId = "chat-fanout/subscribers-1000";
+		expect(() =>
+			createScenarioRegistry({ overrides: [{ cellId, changes: {} }] }),
+		).toThrow(/empty|no-op/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [{ cellId, changes: { durationSeconds: 30 } }],
+			}),
+		).toThrow(/no-op|canonical/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{ cellId, changes: { durationSeconds: 31 } },
+					{ cellId, changes: { durationSeconds: 30 } },
+				],
+			}),
+		).toThrow(/no-op|canonical|distinct hash/i);
+	});
+
+	test("keeps public registry factory overloads and ignores inherited options", () => {
+		const typedOptions: ScenarioRegistryOptions = { overrides: [] };
+		const typedOverrides: readonly ScenarioOverride[] = [];
+		expect(createScenarioRegistry()).toBe(CANONICAL_SCENARIO_REGISTRY);
+		expect(createScenarioRegistry(typedOptions)).toBe(
+			CANONICAL_SCENARIO_REGISTRY,
+		);
+		expect(createScenarioRegistry(typedOverrides)).toBe(
+			CANONICAL_SCENARIO_REGISTRY,
+		);
+
+		const originalOverrides = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"overrides",
+		);
+		const originalCellId = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"cellId",
+		);
+		const originalChanges = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"changes",
+		);
+		try {
+			Object.defineProperty(Object.prototype, "overrides", {
+				configurable: true,
+				value: [
+					{
+						cellId: "chat-fanout/subscribers-1000",
+						changes: { durationSeconds: 31 },
+					},
+				],
+			});
+			expect(createScenarioRegistry({})).toBe(CANONICAL_SCENARIO_REGISTRY);
+
+			Object.defineProperty(Object.prototype, "cellId", {
+				configurable: true,
+				value: "chat-fanout/subscribers-1000",
+			});
+			Object.defineProperty(Object.prototype, "changes", {
+				configurable: true,
+				value: { durationSeconds: 31 },
+			});
+			expect(() => validateScenarioOverride({})).toThrow(
+				/own.*cellId|own property/i,
+			);
+			expect(() =>
+				validateScenarioOverride({
+					cellId: "chat-fanout/subscribers-1000",
+				}),
+			).toThrow(/own.*changes|own property/i);
+		} finally {
+			if (originalOverrides) {
+				Object.defineProperty(Object.prototype, "overrides", originalOverrides);
+			} else {
+				Reflect.deleteProperty(Object.prototype, "overrides");
+			}
+			if (originalCellId) {
+				Object.defineProperty(Object.prototype, "cellId", originalCellId);
+			} else {
+				Reflect.deleteProperty(Object.prototype, "cellId");
+			}
+			if (originalChanges) {
+				Object.defineProperty(Object.prototype, "changes", originalChanges);
+			} else {
+				Reflect.deleteProperty(Object.prototype, "changes");
+			}
+		}
+	});
+
 	test("rejects invalid, unknown, and malformed scenario selections", () => {
 		expect(() =>
 			getScenarioCell(CANONICAL_SCENARIO_REGISTRY, "unknown"),
@@ -571,7 +717,7 @@ describe("frozen v1 comparison scenario registry", () => {
 				changes: { path: "physical" },
 			}),
 		).toThrow(/not present.*chat-fanout\/subscribers-1000/i);
-		expect(() => createScenarioRegistry(null)).toThrow(
+		expect(() => createScenarioRegistry(null as never)).toThrow(
 			/options.*object|array/i,
 		);
 		expect(() => createScenarioRegistry({ overrides: null } as never)).toThrow(

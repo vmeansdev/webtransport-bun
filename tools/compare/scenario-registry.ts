@@ -1,37 +1,36 @@
 import { canonicalJson, sha256Canonical } from "./canonical.ts";
-import {
-	SCENARIO_IDS as FROZEN_SCENARIO_IDS,
-	type AiTokenParameters,
-	type ArmKind,
-	type ArmTransport,
-	type BulkParameters,
-	type CapacityProfile,
-	type ChatParameters,
-	type ConnectionMemoryParameters,
-	type ConnectionSetup,
-	type CrdtParameters,
-	type DiagnosticParameterValue,
-	type DiagnosticScenarioParameters,
-	type GameParameters,
-	type HandshakeParameters,
-	type LinuxRole,
-	type MacRole,
-	type MacRoleSpec,
-	type ProcessCohort,
-	type ReconnectParameters,
-	type RolePlan,
-	type RunPolicy,
-	type ScenarioArm,
-	type ScenarioCell,
-	type ScenarioId,
-	type ScenarioOverride,
-	type ScenarioRegistry,
-	type RuntimeScenarioParameters,
-	type ShardingPlan,
-	type TailParameters,
-	type TickerParameters,
-	type TrafficDirection,
-	type WorkerShard,
+import type {
+	AiTokenParameters,
+	ArmKind,
+	ArmTransport,
+	BulkParameters,
+	CapacityProfile,
+	ChatParameters,
+	ConnectionMemoryParameters,
+	ConnectionSetup,
+	CrdtParameters,
+	DiagnosticParameterValue,
+	DiagnosticScenarioParameters,
+	GameParameters,
+	HandshakeParameters,
+	LinuxRole,
+	MacRole,
+	MacRoleSpec,
+	ProcessCohort,
+	ReconnectParameters,
+	RolePlan,
+	RunPolicy,
+	RuntimeScenarioParameters,
+	ScenarioArm,
+	ScenarioCell,
+	ScenarioOverride,
+	ScenarioRegistry,
+	ScenarioRegistryOptions,
+	ShardingPlan,
+	TailParameters,
+	TickerParameters,
+	TrafficDirection,
+	WorkerShard,
 } from "./types.ts";
 
 export {
@@ -41,6 +40,7 @@ export {
 	type ScenarioId,
 	type ScenarioOverride,
 	type ScenarioRegistry,
+	type ScenarioRegistryOptions,
 } from "./types.ts";
 
 export const CANONICAL_CAPACITY_PROFILE: CapacityProfile = Object.freeze({
@@ -631,6 +631,117 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return prototype === Object.prototype || prototype === null;
 }
 
+function readPropertyDescriptor(
+	owner: object,
+	descriptor: PropertyDescriptor,
+): unknown {
+	if ("value" in descriptor) return descriptor.value;
+	return typeof descriptor.get === "function"
+		? descriptor.get.call(owner)
+		: undefined;
+}
+
+function ownPropertyDescriptors(
+	value: object,
+): Record<string, PropertyDescriptor> {
+	return Object.getOwnPropertyDescriptors(value) as Record<
+		string,
+		PropertyDescriptor
+	>;
+}
+
+function getOwnPropertyDescriptor(
+	descriptors: Record<string, PropertyDescriptor>,
+	key: string,
+): PropertyDescriptor | undefined {
+	return Object.hasOwn(descriptors, key) ? descriptors[key] : undefined;
+}
+
+function normalizeScenarioOverride(rawOverride: unknown): ScenarioOverride {
+	if (!isPlainRecord(rawOverride)) {
+		throw new TypeError("scenario override must be an object");
+	}
+	const descriptors = ownPropertyDescriptors(rawOverride);
+	for (const key of Reflect.ownKeys(descriptors)) {
+		if (typeof key !== "string" || (key !== "cellId" && key !== "changes")) {
+			throw new TypeError(`unknown override property ${String(key)}`);
+		}
+	}
+	const cellIdDescriptor = getOwnPropertyDescriptor(descriptors, "cellId");
+	if (!cellIdDescriptor) {
+		throw new TypeError("scenario override must own a cellId property");
+	}
+	const rawCellId = readPropertyDescriptor(rawOverride, cellIdDescriptor);
+	if (typeof rawCellId !== "string" || rawCellId.length === 0) {
+		throw new TypeError("scenario override cellId must be a non-empty string");
+	}
+	const changesDescriptor = getOwnPropertyDescriptor(descriptors, "changes");
+	if (!changesDescriptor) {
+		throw new TypeError("scenario override must own a changes property");
+	}
+	const rawChanges = readPropertyDescriptor(rawOverride, changesDescriptor);
+	if (!isPlainRecord(rawChanges)) {
+		throw new TypeError("scenario override changes must be an object");
+	}
+	const changeDescriptors = ownPropertyDescriptors(rawChanges);
+	const changes: Record<string, unknown> = {};
+	for (const key of Reflect.ownKeys(changeDescriptors)) {
+		if (typeof key !== "string") {
+			throw new TypeError(`unknown override field ${String(key)}`);
+		}
+		const descriptor = getOwnPropertyDescriptor(changeDescriptors, key);
+		if (!descriptor) {
+			throw new TypeError(`missing override field descriptor ${key}`);
+		}
+		const value = readPropertyDescriptor(rawChanges, descriptor);
+		Object.defineProperty(changes, key, {
+			configurable: true,
+			enumerable: true,
+			value,
+			writable: true,
+		});
+	}
+	return { cellId: rawCellId, changes };
+}
+
+function normalizeOverrideArray(rawOverrides: unknown): ScenarioOverride[] {
+	if (!Array.isArray(rawOverrides)) {
+		throw new TypeError("scenario registry options.overrides must be an array");
+	}
+	const descriptors = ownPropertyDescriptors(rawOverrides);
+	const lengthDescriptor = getOwnPropertyDescriptor(descriptors, "length");
+	if (!lengthDescriptor) {
+		throw new TypeError(
+			"scenario registry overrides must expose an array length",
+		);
+	}
+	const length = readPropertyDescriptor(rawOverrides, lengthDescriptor);
+	if (
+		typeof length !== "number" ||
+		!Number.isSafeInteger(length) ||
+		length < 0
+	) {
+		throw new TypeError(
+			"scenario registry overrides length must be a safe integer",
+		);
+	}
+	const snapshots: ScenarioOverride[] = [];
+	for (let index = 0; index < length; index += 1) {
+		const descriptor = getOwnPropertyDescriptor(descriptors, String(index));
+		if (!descriptor) {
+			throw new TypeError(
+				`scenario registry overrides must own entry ${index}`,
+			);
+		}
+		snapshots.push(
+			normalizeScenarioOverride(
+				readPropertyDescriptor(rawOverrides, descriptor),
+			),
+		);
+	}
+	return snapshots;
+}
+
 function validateOverrideValue(field: string, value: unknown): void {
 	if (typeof value === "number" && !Number.isFinite(value)) {
 		throw new TypeError(`override field ${field} must be finite`);
@@ -698,22 +809,9 @@ function validateCellEnum(
 	}
 }
 
-export function validateScenarioOverride(
-	override: unknown,
-): asserts override is ScenarioOverride {
-	if (!isPlainRecord(override)) {
-		throw new TypeError("scenario override must be an object");
-	}
-	for (const key of Object.keys(override)) {
-		if (key !== "cellId" && key !== "changes") {
-			throw new TypeError(`unknown override property ${key}`);
-		}
-	}
-	if (typeof override.cellId !== "string" || override.cellId.length === 0) {
-		throw new TypeError("scenario override cellId must be a non-empty string");
-	}
-	if (!isPlainRecord(override.changes)) {
-		throw new TypeError("scenario override changes must be an object");
+function validateScenarioOverrideSnapshot(override: ScenarioOverride): void {
+	if (Object.keys(override.changes).length === 0) {
+		throw new TypeError("scenario override changes must not be empty");
 	}
 	const selectedCell = CANONICAL_CELLS.find(
 		(candidate) => candidate.cellId === override.cellId,
@@ -725,7 +823,7 @@ export function validateScenarioOverride(
 		if (!KNOWN_OVERRIDE_FIELDS.has(field)) {
 			throw new TypeError(`unknown override field ${field}`);
 		}
-		if (!Object.prototype.hasOwnProperty.call(selectedCell.parameters, field)) {
+		if (!Object.hasOwn(selectedCell.parameters, field)) {
 			throw new TypeError(
 				`override field ${field} is not present on selected scenario cell ${selectedCell.cellId}`,
 			);
@@ -738,6 +836,20 @@ export function validateScenarioOverride(
 			);
 		}
 	}
+}
+
+function normalizeAndValidateScenarioOverride(
+	rawOverride: unknown,
+): ScenarioOverride {
+	const snapshot = normalizeScenarioOverride(rawOverride);
+	validateScenarioOverrideSnapshot(snapshot);
+	return snapshot;
+}
+
+export function validateScenarioOverride(
+	override: unknown,
+): asserts override is ScenarioOverride {
+	normalizeAndValidateScenarioOverride(override);
 }
 
 function isDiagnosticParameterValue(
@@ -767,7 +879,7 @@ function overrideParameters(
 		parameters[field] = value;
 	}
 	for (const [field, value] of Object.entries(override.changes)) {
-		if (!Object.prototype.hasOwnProperty.call(parameters, field)) {
+		if (!Object.hasOwn(parameters, field)) {
 			throw new TypeError(
 				`unknown override field ${field} for ${cell.scenarioId} parameters`,
 			);
@@ -785,15 +897,31 @@ function overrideParameters(
 function applyOverride(
 	cell: ScenarioCell,
 	override: ScenarioOverride,
+	canonicalCell: ScenarioCell,
 ): ScenarioCell {
 	const parameters = overrideParameters(cell, override);
-	return buildCell(
+	const diagnosticCell = buildCell(
 		cell.cellId,
 		parameters,
 		cell.rolePlan,
 		cell.runPolicy,
 		false,
 	);
+	if (
+		canonicalJson(diagnosticCell.parameters) ===
+			canonicalJson(cell.parameters) ||
+		diagnosticCell.scenarioHash === cell.scenarioHash
+	) {
+		throw new RangeError(
+			`scenario override for ${cell.cellId} is a semantic no-op`,
+		);
+	}
+	if (diagnosticCell.scenarioHash === canonicalCell.scenarioHash) {
+		throw new RangeError(
+			`scenario override for ${cell.cellId} would restore the canonical scenario hash`,
+		);
+	}
+	return diagnosticCell;
 }
 
 function makeArm(
@@ -857,25 +985,35 @@ function buildRegistry(
 	});
 }
 
-function normalizeRegistryOptions(options: unknown): readonly unknown[] {
-	if (Array.isArray(options)) return options;
+function normalizeRegistryOptions(
+	options: unknown,
+): readonly ScenarioOverride[] {
+	if (Array.isArray(options)) return normalizeOverrideArray(options);
 	if (!isPlainRecord(options)) {
 		throw new TypeError(
 			"scenario registry options must be an object or override array",
 		);
 	}
-	for (const key of Object.keys(options)) {
+	const descriptors = ownPropertyDescriptors(options);
+	for (const key of Reflect.ownKeys(descriptors)) {
 		if (key !== "overrides") {
-			throw new TypeError(`unknown scenario registry option ${key}`);
+			throw new TypeError(`unknown scenario registry option ${String(key)}`);
 		}
 	}
-	if (options.overrides === undefined) return [];
-	if (!Array.isArray(options.overrides)) {
-		throw new TypeError("scenario registry options.overrides must be an array");
-	}
-	return options.overrides;
+	const overridesDescriptor = getOwnPropertyDescriptor(
+		descriptors,
+		"overrides",
+	);
+	if (!overridesDescriptor) return [];
+	const rawOverrides = readPropertyDescriptor(options, overridesDescriptor);
+	if (rawOverrides === undefined) return [];
+	return normalizeOverrideArray(rawOverrides);
 }
 
+export function createScenarioRegistry(): ScenarioRegistry;
+export function createScenarioRegistry(
+	options: ScenarioRegistryOptions | readonly ScenarioOverride[],
+): ScenarioRegistry;
 export function createScenarioRegistry(
 	options: unknown = {},
 ): ScenarioRegistry {
@@ -885,15 +1023,14 @@ export function createScenarioRegistry(
 	}
 	const byCellId = new Map(CANONICAL_CELLS.map((cell) => [cell.cellId, cell]));
 	const changed = new Map<string, ScenarioCell>();
-	for (const rawOverride of overrides) {
-		validateScenarioOverride(rawOverride);
-		const override = rawOverride;
+	for (const override of overrides) {
+		validateScenarioOverrideSnapshot(override);
 		const base = byCellId.get(override.cellId);
 		if (!base) {
 			throw new RangeError(`unknown scenario cell ${override.cellId}`);
 		}
 		const current = changed.get(override.cellId) ?? base;
-		changed.set(override.cellId, applyOverride(current, override));
+		changed.set(override.cellId, applyOverride(current, override, base));
 	}
 	const cells = CANONICAL_CELLS.map((cell) => changed.get(cell.cellId) ?? cell);
 	return buildRegistry(cells, false);
