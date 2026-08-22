@@ -108,6 +108,7 @@ export interface TailParameters {
 	readonly durationSeconds: 180;
 	readonly bulkChunkBytes: number;
 	readonly bulkRateMbps: 700;
+	readonly acknowledged: true;
 }
 
 export type ScenarioParameters =

@@ -477,6 +477,7 @@ function tailCell(): ScenarioCell {
 		durationSeconds: 180,
 		bulkChunkBytes: 65_536,
 		bulkRateMbps: 700,
+		acknowledged: true,
 	};
 	return buildCell(
 		"tail-under-cross-traffic/default",
@@ -634,6 +635,40 @@ function validateOverrideValue(field: string, value: unknown): void {
 	}
 }
 
+function validateCellEnum(
+	cell: ScenarioCell,
+	field: string,
+	value: unknown,
+): void {
+	let allowed: readonly string[] | undefined;
+	if (field === "path") {
+		if (cell.scenarioId === "handshake-matrix") {
+			allowed = ["physical", "delay40"];
+		} else if (cell.scenarioId === "bulk-one-way") {
+			allowed = ["physical", "delay40-loss1"];
+		}
+	} else if (field === "state") {
+		if (cell.scenarioId === "reconnect-storm") {
+			allowed = ["cold-full", "warm-after-prime"];
+		} else if (cell.scenarioId === "handshake-matrix") {
+			allowed = ["cold", "warm-after-prime"];
+		}
+	} else if (field === "snapshotSchedule") {
+		allowed = ["periodic-canonical"];
+	}
+	if (!allowed) return;
+	if (typeof value !== "string") {
+		throw new TypeError(
+			`override field ${field} must be a string (allowed: ${allowed.join("|")})`,
+		);
+	}
+	if (!allowed.includes(value)) {
+		throw new TypeError(
+			`override field ${field} must be one of ${allowed.join("|")}`,
+		);
+	}
+}
+
 export function validateScenarioOverride(override: ScenarioOverride): void {
 	if (!isPlainRecord(override)) {
 		throw new TypeError("scenario override must be an object");
@@ -649,11 +684,15 @@ export function validateScenarioOverride(override: ScenarioOverride): void {
 	if (!isPlainRecord(override.changes)) {
 		throw new TypeError("scenario override changes must be an object");
 	}
+	const selectedCell = CANONICAL_CELLS.find(
+		(candidate) => candidate.cellId === override.cellId,
+	);
 	for (const [field, value] of Object.entries(override.changes)) {
 		if (!KNOWN_OVERRIDE_FIELDS.has(field)) {
 			throw new TypeError(`unknown override field ${field}`);
 		}
 		validateOverrideValue(field, value);
+		if (selectedCell) validateCellEnum(selectedCell, field, value);
 	}
 }
 

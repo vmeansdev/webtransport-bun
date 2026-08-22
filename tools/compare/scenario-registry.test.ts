@@ -256,6 +256,7 @@ describe("frozen v1 comparison scenario registry", () => {
 			durationSeconds: 180,
 			bulkChunkBytes: 64 * 1024,
 			bulkRateMbps: 700,
+			acknowledged: true,
 		});
 	});
 
@@ -484,6 +485,79 @@ describe("frozen v1 comparison scenario registry", () => {
 		expect(() => canonicalJson({ value: Number.POSITIVE_INFINITY })).toThrow(
 			/finite/i,
 		);
+	});
+
+	test("rejects enum and type overrides outside the selected cell domain", () => {
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "bulk-one-way/physical",
+						changes: { path: "delay40" },
+					},
+				],
+			}),
+		).toThrow(/path.*physical.*delay40-loss1/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "handshake-matrix/physical-cold",
+						changes: { path: "delay40-loss1" },
+					},
+				],
+			}),
+		).toThrow(/path.*physical.*delay40/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "reconnect-storm/cold-full",
+						changes: { state: "cold" },
+					},
+				],
+			}),
+		).toThrow(/state.*cold-full.*warm-after-prime/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "handshake-matrix/physical-cold",
+						changes: { state: "cold-full" },
+					},
+				],
+			}),
+		).toThrow(/state.*cold.*warm-after-prime/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "crdt-sync/default",
+						changes: { snapshotSchedule: "periodic" },
+					},
+				],
+			}),
+		).toThrow(/snapshotSchedule.*periodic-canonical/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "bulk-one-way/physical",
+						changes: { path: 40 },
+					},
+				],
+			}),
+		).toThrow(/path.*string/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "crdt-sync/default",
+						changes: { snapshotSchedule: false },
+					},
+				],
+			}),
+		).toThrow(/snapshotSchedule.*periodic-canonical/i);
 	});
 
 	test("keeps canonical arm ordering and links each arm to its exact cell hash", () => {
