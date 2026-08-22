@@ -13,9 +13,14 @@
  * with the gate (`latency-histogram.ts` / `latency-ab-classify.ts`) and is
  * already tested there; duplicating it would create a second answer to the same
  * question. What is missing off-box is provenance and transport, so that is all
- * this does: the `scheduleLag` blob comes back untouched, ready for the existing
- * `LatencyHistogram.fromJson`.
+ * this does: the `scheduleLag` blob comes back untouched after being validated
+ * by the existing `LatencyHistogram.fromJson`, ready for the gate to read.
  */
+
+import {
+	LatencyHistogram,
+	type LatencyHistogramJson,
+} from "../load/latency-histogram.ts";
 
 /** Provenance lines `mac-generator-entry.sh` prints before the run. */
 export type GeneratorProvenance = {
@@ -37,15 +42,16 @@ export type GeneratorProvenance = {
 
 export type GeneratorReport = {
 	provenance: GeneratorProvenance;
-	/** `latency-json` verbatim, for the gate's own histogram decoder. */
+	/** Legacy `latency-json` or the retained MMO envelope, passed through verbatim. */
 	latencyJson: unknown | null;
 	sessionsOk: number | null;
 	sessionsErr: number | null;
 	datagramsSent: number | null;
 	datagramsErr: number | null;
 	datagramsReceived: number | null;
-	/** Window the generator actually offered load over, from `latency-json`. */
+	/** Window the generator actually offered load over, from the retained report. */
 	driveWindowSec: number | null;
+	/** Connected/driving sessions as the transcript explicitly reported them. */
 	sessionsDriving: number | null;
 	/** Everything that stopped this from being a usable generator observation. */
 	problems: string[];
@@ -58,6 +64,99 @@ function num(text: string, re: RegExp): number | null {
 
 function str(text: string, re: RegExp): string | null {
 	return text.match(re)?.[1] ?? null;
+}
+
+type JsonMap = Record<string, unknown>;
+
+type ParsedMmoReport = {
+	latencyJson: JsonMap;
+	sessionsOk: number;
+	sessionsErr: number;
+	datagramsSent: number;
+	datagramsErr: number;
+	datagramsReceived: number;
+	driveWindowSec: number;
+	sessionsDriving: number;
+};
+
+function jsonMap(value: unknown): JsonMap | null {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as JsonMap)
+		: null;
+}
+
+function jsonNumber(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function jsonFieldNumber(obj: JsonMap | null, key: string): number | null {
+	return obj ? jsonNumber(obj[key]) : null;
+}
+
+function scheduleLagCount(latencyJson: unknown): number | null {
+	return jsonFieldNumber(jsonMap(jsonMap(latencyJson)?.scheduleLag), "count");
+}
+
+function parseMmoClientEnvelope(json: unknown): ParsedMmoReport | string {
+	const root = jsonMap(json);
+	if (root?.schema !== "mmo-client/1") {
+		return "mmo-client json did not match schema mmo-client/1 floor shape";
+	}
+	if (root.role !== "realm") {
+		return "mmo-client floor report role must be realm";
+	}
+
+	const scheduleLag = jsonMap(root.scheduleLag);
+	const realm = jsonMap(root.realm);
+	const config = jsonMap(root.config);
+
+	const sessionsRequested = jsonFieldNumber(root, "sessionsRequested");
+	const sessionsOk = jsonFieldNumber(root, "sessionsOk");
+	const sessionsErr = jsonFieldNumber(root, "sessionsErr");
+	const datagramsSent = jsonFieldNumber(realm, "sent");
+	const datagramsErr = jsonFieldNumber(realm, "sendErr");
+	const driveWindowSec = jsonFieldNumber(config, "steadySec");
+	const scheduleLagVersion = jsonFieldNumber(scheduleLag, "version");
+	const scheduleLagCount = jsonFieldNumber(scheduleLag, "count");
+	const rxSnapshot = jsonFieldNumber(realm, "rxSnapshot");
+	const rxAck = jsonFieldNumber(realm, "rxAck");
+	const rxRaid = jsonFieldNumber(realm, "rxRaid");
+	const rxOther = jsonFieldNumber(realm, "rxOther");
+	const rxUnstamped = jsonFieldNumber(realm, "rxUnstamped");
+
+	if (
+		sessionsRequested === null ||
+		sessionsOk === null ||
+		sessionsErr === null ||
+		datagramsSent === null ||
+		datagramsErr === null ||
+		driveWindowSec === null ||
+		scheduleLagVersion === null ||
+		scheduleLagCount === null ||
+		rxSnapshot === null ||
+		rxAck === null ||
+		rxRaid === null ||
+		rxOther === null ||
+		rxUnstamped === null
+	) {
+		return "mmo-client json did not match schema mmo-client/1 floor shape";
+	}
+	try {
+		LatencyHistogram.fromJson(scheduleLag as LatencyHistogramJson);
+	} catch (err) {
+		return `mmo-client scheduleLag did not match LatencyHistogramJson: ${String(err)}`;
+	}
+
+	return {
+		latencyJson: root,
+		sessionsOk,
+		sessionsErr,
+		datagramsSent,
+		datagramsErr,
+		datagramsReceived: rxSnapshot + rxAck + rxRaid + rxOther + rxUnstamped,
+		driveWindowSec,
+		sessionsDriving: sessionsRequested === 0 ? 0 : sessionsOk,
+	};
 }
 
 /**
@@ -133,32 +232,85 @@ export function parseGeneratorReport(
 	}
 
 	let latencyJson: unknown | null = null;
+	let sessionsOk = num(stdout, /^load-client: sessions ok=(\d+)/m);
+	let sessionsErr = num(stdout, /^load-client: sessions ok=\d+ err=(\d+)/m);
+	let datagramsSent = num(stdout, /^load-client: datagrams sent=(\d+)/m);
+	let datagramsErr = num(stdout, /^load-client: datagrams sent=\d+ err=(\d+)/m);
+	let datagramsReceived = num(
+		stdout,
+		/^load-client: datagrams received=(\d+)/m,
+	);
+	let driveWindowSec: number | null = null;
+	let sessionsDriving: number | null = null;
+
 	const latencyLine = stdout.match(/^load-client: latency-json (\{.*\})\s*$/m);
-	if (latencyLine?.[1]) {
+	const mmoLine = stdout.match(/^mmo-client: json (\{.*\})\s*$/m);
+	if (latencyLine?.[1] && mmoLine?.[1]) {
+		problems.push(
+			"generator transcript is ambiguous — both load-client latency-json and mmo-client json were present",
+		);
+		try {
+			JSON.parse(latencyLine[1]);
+		} catch (err) {
+			problems.push(`latency-json did not parse: ${String(err)}`);
+		}
+		try {
+			const parsed = parseMmoClientEnvelope(JSON.parse(mmoLine[1]));
+			if (typeof parsed === "string") problems.push(parsed);
+		} catch (err) {
+			problems.push(`mmo-client json did not parse: ${String(err)}`);
+		}
+	} else if (latencyLine?.[1]) {
 		try {
 			latencyJson = JSON.parse(latencyLine[1]);
 		} catch (err) {
 			problems.push(`latency-json did not parse: ${String(err)}`);
 		}
 	} else {
-		problems.push("generator produced no latency-json — no floor and no RTT");
+		if (mmoLine?.[1]) {
+			try {
+				const parsed = parseMmoClientEnvelope(JSON.parse(mmoLine[1]));
+				if (typeof parsed === "string") {
+					problems.push(parsed);
+				} else {
+					latencyJson = parsed.latencyJson;
+					sessionsOk = parsed.sessionsOk;
+					sessionsErr = parsed.sessionsErr;
+					datagramsSent = parsed.datagramsSent;
+					datagramsErr = parsed.datagramsErr;
+					datagramsReceived = parsed.datagramsReceived;
+					driveWindowSec = parsed.driveWindowSec;
+					sessionsDriving = parsed.sessionsDriving;
+				}
+			} catch (err) {
+				problems.push(`mmo-client json did not parse: ${String(err)}`);
+			}
+		} else {
+			problems.push("generator produced no latency-json — no floor and no RTT");
+		}
 	}
 
 	const lj = latencyJson as {
 		driveWindowSec?: number;
 		sessionsDriving?: number;
 	} | null;
+	if (latencyJson !== null && driveWindowSec === null) {
+		driveWindowSec = lj?.driveWindowSec ?? null;
+	}
+	if (latencyJson !== null && sessionsDriving === null) {
+		sessionsDriving = lj?.sessionsDriving ?? null;
+	}
 
 	return {
 		provenance,
 		latencyJson,
-		sessionsOk: num(stdout, /^load-client: sessions ok=(\d+)/m),
-		sessionsErr: num(stdout, /^load-client: sessions ok=\d+ err=(\d+)/m),
-		datagramsSent: num(stdout, /^load-client: datagrams sent=(\d+)/m),
-		datagramsErr: num(stdout, /^load-client: datagrams sent=\d+ err=(\d+)/m),
-		datagramsReceived: num(stdout, /^load-client: datagrams received=(\d+)/m),
-		driveWindowSec: lj?.driveWindowSec ?? null,
-		sessionsDriving: lj?.sessionsDriving ?? null,
+		sessionsOk,
+		sessionsErr,
+		datagramsSent,
+		datagramsErr,
+		datagramsReceived,
+		driveWindowSec,
+		sessionsDriving,
 		problems,
 	};
 }
@@ -185,6 +337,12 @@ export function floorReportIsUsable(
 	}
 	if (report.latencyJson === null)
 		reasons.push("no scheduleLag to read a floor from");
+	const lagCount = scheduleLagCount(report.latencyJson);
+	if (report.latencyJson !== null && lagCount !== null && lagCount <= 0) {
+		reasons.push(
+			"no scheduleLag samples were recorded — connected sessions did not offer load",
+		);
+	}
 	if ((report.sessionsDriving ?? 0) === 0) {
 		reasons.push(
 			"no session offered load — a floor over zero sessions is not a floor",
