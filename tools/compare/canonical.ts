@@ -76,13 +76,35 @@ export function canonicalize(value: unknown): CanonicalValue {
 	return canonicalizeValue(value, new Set<object>());
 }
 
-/** Serialize JSON-compatible data without whitespace or runtime-dependent key order. */
-export function canonicalJson(value: unknown): string {
-	const encoded = JSON.stringify(canonicalize(value));
+function serializeCanonicalValue(value: CanonicalValue): string {
+	if (value === null) return "null";
+	if (Array.isArray(value)) {
+		return `[${value.map(serializeCanonicalValue).join(",")}]`;
+	}
+	if (typeof value === "object") {
+		const record = value as { readonly [key: string]: CanonicalValue };
+		const fields = Object.keys(record)
+			.sort()
+			.map((key) => {
+				const nested = record[key];
+				if (nested === undefined) {
+					throw new TypeError("canonical JSON cannot contain undefined values");
+				}
+				return `${JSON.stringify(key)}:${serializeCanonicalValue(nested)}`;
+			})
+			.join(",");
+		return `{${fields}}`;
+	}
+	const encoded = JSON.stringify(value);
 	if (encoded === undefined) {
 		throw new TypeError("canonical JSON serialization produced no value");
 	}
 	return encoded;
+}
+
+/** Serialize JSON-compatible data without whitespace or runtime-dependent key order. */
+export function canonicalJson(value: unknown): string {
+	return serializeCanonicalValue(canonicalize(value));
 }
 
 /** Hash the canonical JSON bytes using lowercase SHA-256 hex. */
