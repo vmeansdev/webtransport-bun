@@ -10,6 +10,8 @@ import {
 	type ConnectionMemoryParameters,
 	type ConnectionSetup,
 	type CrdtParameters,
+	type DiagnosticParameterValue,
+	type DiagnosticScenarioParameters,
 	type GameParameters,
 	type HandshakeParameters,
 	type LinuxRole,
@@ -23,9 +25,8 @@ import {
 	type ScenarioCell,
 	type ScenarioId,
 	type ScenarioOverride,
-	type ScenarioParameters,
 	type ScenarioRegistry,
-	type ScenarioRegistryOptions,
+	type RuntimeScenarioParameters,
 	type ShardingPlan,
 	type TailParameters,
 	type TickerParameters,
@@ -188,7 +189,7 @@ const SHORT_RUN_POLICY: RunPolicy = Object.freeze({
 	measuredRepetitions: 15,
 });
 
-function buildCell<T extends ScenarioParameters>(
+function buildCell<T extends RuntimeScenarioParameters>(
 	cellId: string,
 	parameters: T,
 	rolePlan: RolePlan,
@@ -567,43 +568,59 @@ const KNOWN_OVERRIDE_FIELDS = new Set([
 	"pauseDurationMs",
 	"path",
 	"bytes",
+	"measuredConnectionsPerWorker",
 	"controlMessageBytes",
 	"controlRatePerSecond",
 	"bulkChunkBytes",
 	"bulkRateMbps",
 ]);
 
-const POSITIVE_INTEGER_FIELDS = new Set([
+const INTEGER_FIELD_LIMITS: Readonly<Record<string, number>> = {
+	subscriberCount: 12_000,
+	publisherCount: 12_000,
+	messageBytes: 1_048_576,
+	messagesPerSecondPerPublisher: 1_000_000,
+	durationSeconds: 86_400,
+	ingressRatePerSecond: 1_000_000,
+	recordBytes: 1_048_576,
+	fanout: 12_000,
+	tickHz: 1_000,
+	tickBytes: 1_048_576,
+	receiverCount: 12_000,
+	delayMs: 60_000,
+	clientCount: 12_000,
+	reconnectCycles: 1_000,
+	concurrency: 12_000,
+	firstMessageBytes: 1_048_576,
+	liveConnections: 12_000,
+	holdSeconds: 86_400,
+	operationBytes: 1_048_576,
+	operationsPerSecond: 1_000_000,
+	chunkBytes: 1_048_576,
+	sessionCount: 12_000,
+	chunksPerSecondPerSession: 1_000_000,
+	pauseEverySeconds: 86_400,
+	pauseDurationMs: 60_000,
+	measuredConnectionsPerWorker: 8,
+	bytes: 1_073_741_824,
+	controlMessageBytes: 1_048_576,
+	controlRatePerSecond: 1_000,
+	bulkChunkBytes: 1_048_576,
+	bulkRateMbps: 10_000,
+};
+
+const STRUCTURAL_OVERRIDE_FIELDS = new Set([
 	"subscriberCount",
 	"publisherCount",
-	"messageBytes",
-	"messagesPerSecondPerPublisher",
-	"durationSeconds",
-	"ingressRatePerSecond",
-	"recordBytes",
 	"fanout",
-	"tickHz",
-	"tickBytes",
 	"receiverCount",
-	"delayMs",
 	"clientCount",
+	"sessionCount",
+	"liveConnections",
+	"state",
 	"reconnectCycles",
 	"concurrency",
-	"firstMessageBytes",
-	"liveConnections",
-	"holdSeconds",
-	"operationBytes",
-	"operationsPerSecond",
-	"chunkBytes",
-	"sessionCount",
-	"chunksPerSecondPerSession",
-	"pauseEverySeconds",
-	"pauseDurationMs",
-	"bytes",
-	"controlMessageBytes",
-	"controlRatePerSecond",
-	"bulkChunkBytes",
-	"bulkRateMbps",
+	"measuredConnectionsPerWorker",
 ]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -618,9 +635,21 @@ function validateOverrideValue(field: string, value: unknown): void {
 	if (typeof value === "number" && !Number.isFinite(value)) {
 		throw new TypeError(`override field ${field} must be finite`);
 	}
-	if (POSITIVE_INTEGER_FIELDS.has(field)) {
-		if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-			throw new TypeError(`override field ${field} must be a positive integer`);
+	const integerLimit = INTEGER_FIELD_LIMITS[field];
+	if (integerLimit !== undefined) {
+		if (
+			typeof value !== "number" ||
+			!Number.isSafeInteger(value) ||
+			value <= 0
+		) {
+			throw new TypeError(
+				`override field ${field} must be a positive integer (safe integer)`,
+			);
+		}
+		if (value > integerLimit) {
+			throw new RangeError(
+				`override field ${field} must be at most ${integerLimit}`,
+			);
 		}
 	}
 	if (field === "lossPercent") {
@@ -669,7 +698,9 @@ function validateCellEnum(
 	}
 }
 
-export function validateScenarioOverride(override: ScenarioOverride): void {
+export function validateScenarioOverride(
+	override: unknown,
+): asserts override is ScenarioOverride {
 	if (!isPlainRecord(override)) {
 		throw new TypeError("scenario override must be an object");
 	}
@@ -687,32 +718,68 @@ export function validateScenarioOverride(override: ScenarioOverride): void {
 	const selectedCell = CANONICAL_CELLS.find(
 		(candidate) => candidate.cellId === override.cellId,
 	);
+	if (!selectedCell) {
+		throw new RangeError(`unknown scenario cell ${override.cellId}`);
+	}
 	for (const [field, value] of Object.entries(override.changes)) {
 		if (!KNOWN_OVERRIDE_FIELDS.has(field)) {
 			throw new TypeError(`unknown override field ${field}`);
 		}
+		if (!Object.prototype.hasOwnProperty.call(selectedCell.parameters, field)) {
+			throw new TypeError(
+				`override field ${field} is not present on selected scenario cell ${selectedCell.cellId}`,
+			);
+		}
 		validateOverrideValue(field, value);
-		if (selectedCell) validateCellEnum(selectedCell, field, value);
+		validateCellEnum(selectedCell, field, value);
+		if (STRUCTURAL_OVERRIDE_FIELDS.has(field)) {
+			throw new TypeError(
+				`override field ${field} changes topology, cohort, or sharding metadata and is not diagnostic-overridable`,
+			);
+		}
 	}
+}
+
+function isDiagnosticParameterValue(
+	value: unknown,
+): value is DiagnosticParameterValue {
+	return (
+		typeof value === "string" ||
+		typeof value === "boolean" ||
+		(typeof value === "number" && Number.isFinite(value))
+	);
 }
 
 function overrideParameters(
 	cell: ScenarioCell,
 	override: ScenarioOverride,
-): ScenarioParameters {
-	const parameters = { ...cell.parameters } as Record<string, unknown>;
-	for (const [field, value] of Object.entries(override.changes)) {
-		if (!(field in parameters)) {
+): DiagnosticScenarioParameters {
+	const parameters: DiagnosticScenarioParameters = {
+		scenarioId: cell.scenarioId,
+	};
+	for (const [field, value] of Object.entries(cell.parameters)) {
+		if (field === "scenarioId") continue;
+		if (!isDiagnosticParameterValue(value)) {
 			throw new TypeError(
-				`unknown override field ${field} for ${cell.scenarioId} parameters`,
+				`scenario parameter ${field} must be a primitive value`,
 			);
 		}
 		parameters[field] = value;
 	}
-	if (parameters.scenarioId !== cell.scenarioId) {
-		throw new TypeError("scenario override cannot change scenarioId");
+	for (const [field, value] of Object.entries(override.changes)) {
+		if (!Object.prototype.hasOwnProperty.call(parameters, field)) {
+			throw new TypeError(
+				`unknown override field ${field} for ${cell.scenarioId} parameters`,
+			);
+		}
+		if (!isDiagnosticParameterValue(value)) {
+			throw new TypeError(
+				`scenario override field ${field} must be a primitive value`,
+			);
+		}
+		parameters[field] = value;
 	}
-	return parameters as unknown as ScenarioParameters;
+	return parameters;
 }
 
 function applyOverride(
@@ -790,21 +857,41 @@ function buildRegistry(
 	});
 }
 
+function normalizeRegistryOptions(options: unknown): readonly unknown[] {
+	if (Array.isArray(options)) return options;
+	if (!isPlainRecord(options)) {
+		throw new TypeError(
+			"scenario registry options must be an object or override array",
+		);
+	}
+	for (const key of Object.keys(options)) {
+		if (key !== "overrides") {
+			throw new TypeError(`unknown scenario registry option ${key}`);
+		}
+	}
+	if (options.overrides === undefined) return [];
+	if (!Array.isArray(options.overrides)) {
+		throw new TypeError("scenario registry options.overrides must be an array");
+	}
+	return options.overrides;
+}
+
 export function createScenarioRegistry(
-	options: ScenarioRegistryOptions | readonly ScenarioOverride[] = {},
+	options: unknown = {},
 ): ScenarioRegistry {
-	const overrides = Array.isArray(options)
-		? (options as readonly ScenarioOverride[])
-		: ((options as ScenarioRegistryOptions).overrides ?? []);
+	const overrides = normalizeRegistryOptions(options);
 	if (overrides.length === 0) {
 		return CANONICAL_SCENARIO_REGISTRY;
 	}
 	const byCellId = new Map(CANONICAL_CELLS.map((cell) => [cell.cellId, cell]));
 	const changed = new Map<string, ScenarioCell>();
-	for (const override of overrides) {
-		validateScenarioOverride(override);
+	for (const rawOverride of overrides) {
+		validateScenarioOverride(rawOverride);
+		const override = rawOverride;
 		const base = byCellId.get(override.cellId);
-		if (!base) throw new RangeError(`unknown scenario cell ${override.cellId}`);
+		if (!base) {
+			throw new RangeError(`unknown scenario cell ${override.cellId}`);
+		}
 		const current = changed.get(override.cellId) ?? base;
 		changed.set(override.cellId, applyOverride(current, override));
 	}

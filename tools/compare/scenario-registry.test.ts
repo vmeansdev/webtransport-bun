@@ -415,6 +415,9 @@ describe("frozen v1 comparison scenario registry", () => {
 		expect(canonicalJson({ z: 3, a: { y: 2, x: 1 }, m: [2, 1] })).toBe(
 			'{"a":{"x":1,"y":2},"m":[2,1],"z":3}',
 		);
+		expect(canonicalJson({ "2": "two", "10": "ten", a: "a" })).toBe(
+			'{"10":"ten","2":"two","a":"a"}',
+		);
 		expect(sha256Canonical({ b: 2, a: 1 })).toBe(
 			"43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777",
 		);
@@ -484,6 +487,101 @@ describe("frozen v1 comparison scenario registry", () => {
 		expect(() => canonicalJson({ value: undefined })).toThrow(/undefined/i);
 		expect(() => canonicalJson({ value: Number.POSITIVE_INFINITY })).toThrow(
 			/finite/i,
+		);
+	});
+
+	test("rejects overrides that would stale topology, sharding, or cohort metadata", () => {
+		const structuralOverrides: readonly [string, string, unknown][] = [
+			["chat-fanout/subscribers-1000", "subscriberCount", 999],
+			["chat-fanout/subscribers-1000", "publisherCount", 9],
+			["ticker-fanout/rate-10000", "fanout", 99],
+			["game-tick-loss/tick-20-loss-1-delay-20", "receiverCount", 99],
+			["reconnect-storm/cold-full", "clientCount", 99],
+			["ai-token-stream/chunk-32", "sessionCount", 99],
+			["connection-memory/live-1000", "liveConnections", 999],
+			["reconnect-storm/cold-full", "state", "warm-after-prime"],
+			["reconnect-storm/cold-full", "reconnectCycles", 9],
+			["reconnect-storm/cold-full", "concurrency", 99],
+			["handshake-matrix/physical-cold", "measuredConnectionsPerWorker", 2],
+		];
+		for (const [cellId, field, value] of structuralOverrides) {
+			expect(() =>
+				createScenarioRegistry({
+					overrides: [{ cellId, changes: { [field]: value } }],
+				}),
+			).toThrow(/topology|cohort|shard/i);
+		}
+	});
+
+	test("requires safe bounded integers for diagnostic numeric fields", () => {
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "chat-fanout/subscribers-1000",
+						changes: { durationSeconds: Number.MAX_SAFE_INTEGER },
+					},
+				],
+			}),
+		).toThrow(/safe integer|at most/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "chat-fanout/subscribers-1000",
+						changes: { durationSeconds: 86_401 },
+					},
+				],
+			}),
+		).toThrow(/at most/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "bulk-one-way/physical",
+						changes: { bytes: Number.MAX_SAFE_INTEGER },
+					},
+				],
+			}),
+		).toThrow(/safe integer|at most/i);
+		expect(() =>
+			createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "bulk-one-way/physical",
+						changes: { bytes: 1_073_741_825 },
+					},
+				],
+			}),
+		).toThrow(/at most/i);
+	});
+
+	test("freezes the exported scenario ID tuple at runtime", () => {
+		expect(Object.isFrozen(SCENARIO_IDS)).toBe(true);
+		expect(() => {
+			(SCENARIO_IDS as unknown as string[])[0] = "mutated";
+		}).toThrow();
+		expect(SCENARIO_IDS[0]).toBe("chat-fanout");
+	});
+
+	test("rejects direct missing-field validation and malformed registry options", () => {
+		expect(() =>
+			validateScenarioOverride({
+				cellId: "chat-fanout/subscribers-1000",
+				changes: { path: "physical" },
+			}),
+		).toThrow(/not present.*chat-fanout\/subscribers-1000/i);
+		expect(() => createScenarioRegistry(null)).toThrow(
+			/options.*object|array/i,
+		);
+		expect(() => createScenarioRegistry({ overrides: null } as never)).toThrow(
+			/overrides.*array/i,
+		);
+		expect(() =>
+			createScenarioRegistry({ overrides: "not-an-array" } as never),
+		).toThrow(/overrides.*array/i);
+		expect(() => createScenarioRegistry({ unexpected: [] } as never)).toThrow(
+			/unexpected|option/i,
 		);
 	});
 

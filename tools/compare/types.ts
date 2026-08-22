@@ -1,4 +1,4 @@
-export const SCENARIO_IDS = [
+export const SCENARIO_IDS = Object.freeze([
 	"chat-fanout",
 	"ticker-fanout",
 	"game-tick-loss",
@@ -9,7 +9,7 @@ export const SCENARIO_IDS = [
 	"handshake-matrix",
 	"bulk-one-way",
 	"tail-under-cross-traffic",
-] as const;
+] as const);
 
 export type ScenarioId = (typeof SCENARIO_IDS)[number];
 
@@ -123,6 +123,23 @@ export type ScenarioParameters =
 	| BulkParameters
 	| TailParameters;
 
+/** Primitive values permitted in a non-canonical diagnostic parameter set. */
+export type DiagnosticParameterValue = string | number | boolean;
+
+/**
+ * Runtime parameters produced by diagnostic overrides.  Canonical parameter
+ * interfaces retain their literal values; this shape makes widened override
+ * values explicit instead of hiding them behind an unsafe cast.
+ */
+export interface DiagnosticScenarioParameters {
+	scenarioId: ScenarioId;
+	[key: string]: DiagnosticParameterValue;
+}
+
+export type RuntimeScenarioParameters =
+	| ScenarioParameters
+	| DiagnosticScenarioParameters;
+
 export interface CapacityProfile {
 	readonly profileId: "capacity-v1";
 	readonly maxSessions: number;
@@ -235,7 +252,7 @@ export interface RolePlan {
 export interface ScenarioCell {
 	readonly cellId: string;
 	readonly scenarioId: ScenarioId;
-	readonly parameters: ScenarioParameters;
+	readonly parameters: RuntimeScenarioParameters;
 	readonly rolePlan: RolePlan;
 	readonly connectionSetup: ConnectionSetup;
 	readonly capacityProfileHash: string;
