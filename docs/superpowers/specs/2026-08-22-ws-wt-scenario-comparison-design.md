@@ -140,9 +140,9 @@ loopback address is allowed.
 ### Canonical capacity and admission profile
 
 The v1 registry embeds and hashes one explicit `capacityProfile`; no adapter
-may inherit its runtime defaults. The profile is applied through native WT
-server options and an equivalent WS admission/queue layer with the same
-algorithm, counters, and rejection semantics:
+may inherit its runtime defaults. The profile is submitted through public
+native WT server options and an equivalent WS admission/queue layer with the
+same algorithm, counters, and rejection semantics:
 
 | Field | Canonical value |
 | --- | ---: |
@@ -169,8 +169,14 @@ flight; lifecycle scenarios instead use their frozen 100-client barriers. The
 setup schedule is also part of the scenario hash. Capacity and rate-limit
 counters are emitted by both adapters. Hitting a frozen transport/admission
 limit is a valid numeric `MISS`, never an excuse to alter the profile or rerun
-one protocol with looser settings. A comparator rejects a missing or unequal
-profile, profile hash, applied-value echo, or admission-counter schema.
+one protocol with looser settings. Each adapter records the exact canonically
+serialized profile it submits and its SHA-256. Fake-backed adapter tests prove
+those exact values reach the public constructor/options seam, while the source
+archive and platform-binary hashes bind the implementation that performs the
+submission. WT's public metrics surface does not expose a runtime applied-config
+snapshot, so the evidence never claims one; limit/rate counters are behavioral
+corroboration only. A comparator rejects a missing or unequal registry profile,
+submitted-profile bytes/hash, or admission-counter schema.
 
 ### Clock contract
 
@@ -372,8 +378,10 @@ The merged comparison artifact includes:
 - full candidate SHA, clean-tree proof, source archive SHA-256, executable and
   toolchain identities;
 - scenario ID, canonical config, scenario hash, seed, repetition and arm order;
-- capacity-profile ID/hash, every requested/applied limit and rate, admission
-  counters, connection ramp, and Mac/Linux FD/port capacity proofs;
+- capacity-profile ID/hash, every requested limit/rate, exact normalized
+  submitted-profile bytes/hash, admission counters, connection ramp, and
+  Mac/Linux FD/port capacity proofs; no field is labeled a runtime-applied WT
+  echo;
 - distinct Mac/Linux host IDs, OS/arch/CPU/Bun, process roles;
 - route/interface/address/MTU and server-observed peer proof;
 - TLS/SNI/certificate fingerprint and compression mode;
@@ -412,22 +420,24 @@ Linux; only the public CA, leaf, and fingerprint return to Mac.
 SSH commands and stdout/stderr drains have deadlines. Cleanup targets only
 validated run-scoped PIDs/process groups. Broad `pkill` is forbidden.
 
-The live Linux preflight on 2026-08-22 found soft/hard `nofile` limits of
-1,024/524,288. Every Linux connection-scale role therefore raises only its own
-child-process soft limit to 65,536 before `exec` and records the effective
-value; it never mutates the host-wide hard limit or kernel settings. The Mac
-preflight on 2026-08-23 observed a shell soft/hard limit of
-1,048,575/unlimited, `kern.maxfilesperproc=245,760`, and the configured
-ephemeral range 49,152–65,535 (16,384 ports). Every Mac connection-scale child
-records its effective `RLIMIT_NOFILE`; the effective per-process/kernel ceiling
-must be at least 65,536. Before every 5,000- or 10,000-client arm, the controller
-records the range and all currently occupied ports for source `10.99.0.1`, and
-requires at least 12,500 conservative free ephemeral ports before the
-10,000-client arm (the maximum live set plus 25% headroom; proportionally at
-5,000). Failure of an FD or port gate makes the affected cell `BLOCKED`; the
-harness does not change persistent host limits, ranges, or aliases. The
-observed root qdisc on `eno1` is `fq`, which is the only accepted initial state
-for impaired cells.
+A planning-session diagnostic observed Linux soft/hard `nofile` limits of
+1,024/524,288, Mac shell soft/hard limits of 1,048,575/unlimited,
+`kern.maxfilesperproc=245,760`, a Mac ephemeral range of 49,152–65,535
+(16,384 ports), and Linux root qdisc `fq`. These values are feasibility notes,
+not promotable evidence and not prerequisites asserted from the plan: Task 12
+must recollect and bind all of them at the exact candidate HEAD before any
+network run. Every Linux connection-scale role raises only its own child soft
+limit to 65,536 before `exec` when the freshly observed hard cap permits it;
+it never mutates host-wide limits or kernel settings. Every Mac
+connection-scale child records its effective `RLIMIT_NOFILE`; the freshly
+observed effective per-process/kernel ceiling must be at least 65,536. Before
+every 5,000- or 10,000-client arm, the controller records the configured range
+and all currently occupied ports for source `10.99.0.1`, and requires at least
+12,500 conservative free ephemeral ports before the 10,000-client arm (the
+maximum live set plus 25% headroom; proportionally 6,250 at 5,000). Failure of
+an FD, port, or initial-`fq` gate makes the affected cell `BLOCKED`; the harness
+does not change persistent host limits, ranges, aliases, or the prerequisite
+record to force a pass.
 
 Netem is applied only to Linux `eno1`, after raw route proof and a non-measured
 probe. A remote supervisor holds `flock` on `/tmp/bench.lock`, owns the exact
