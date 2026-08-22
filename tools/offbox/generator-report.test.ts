@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { LatencyHistogram } from "../load/latency-histogram.ts";
 import {
 	floorReportIsUsable,
 	parseGeneratorReport,
@@ -37,6 +38,60 @@ function clientRun(): string[] {
 		})}`,
 		"load-client: PASS",
 	];
+}
+
+type MmoOverrides = {
+	role?: string;
+	sessionsRequested?: number;
+	sessionsOk?: number;
+	sessionsErr?: number;
+	realm?: Partial<{
+		sent: number;
+		sendErr: number;
+		rxSnapshot: number;
+		rxAck: number;
+		rxRaid: number;
+		rxOther: number;
+		rxUnstamped: number;
+	}>;
+	scheduleLagCount?: number;
+	scheduleLagJson?: unknown;
+	config?: Partial<{ steadySec: number }>;
+};
+
+function scheduleLagJson(count: number) {
+	const histogram = new LatencyHistogram();
+	for (let i = 0; i < count; i += 1) {
+		histogram.record(1_000_000 + (i % 5) * 100_000);
+	}
+	return histogram.toJson();
+}
+
+function mmoRun(overrides: MmoOverrides = {}): string[] {
+	const report = {
+		schema: "mmo-client/1",
+		role: overrides.role ?? "realm",
+		sessionsRequested: overrides.sessionsRequested ?? 20,
+		sessionsOk: overrides.sessionsOk ?? 18,
+		sessionsErr: overrides.sessionsErr ?? 2,
+		realm: {
+			sent: overrides.realm?.sent ?? 1440,
+			sendErr: overrides.realm?.sendErr ?? 3,
+			rxSnapshot: overrides.realm?.rxSnapshot ?? 1400,
+			rxAck: overrides.realm?.rxAck ?? 20,
+			rxRaid: overrides.realm?.rxRaid ?? 15,
+			rxOther: overrides.realm?.rxOther ?? 5,
+			rxUnstamped: overrides.realm?.rxUnstamped ?? 1,
+		},
+		scheduleLag:
+			overrides.scheduleLagJson ??
+			scheduleLagJson(overrides.scheduleLagCount ?? 1440),
+		config: {
+			steadySec: overrides.config?.steadySec ?? 12,
+		},
+	};
+
+	return [`mmo-client: json ${JSON.stringify(report)}`, "mmo-client: PASS"];
 }
 
 function transcript(extra: string[] = [], overrides = {}): string {
@@ -140,6 +195,99 @@ describe("provenance", () => {
 			"did not parse",
 		);
 	});
+
+	test("an mmo-client/1 envelope is accepted as the floor report source", () => {
+		const mmo = [...provenance(), ...mmoRun(), "macgen: exit=0"].join("\n");
+		const report = parseGeneratorReport(mmo, SHA);
+		const json = report.latencyJson as {
+			scheduleLag: { count: number; buckets: [number, number][] };
+		};
+		expect(report.problems).toEqual([]);
+		expect(report.sessionsOk).toBe(18);
+		expect(report.sessionsErr).toBe(2);
+		expect(report.datagramsSent).toBe(1440);
+		expect(report.datagramsErr).toBe(3);
+		expect(report.datagramsReceived).toBe(1441);
+		expect(report.driveWindowSec).toBe(12);
+		expect(report.sessionsDriving).toBe(18);
+		expect(json.scheduleLag.count).toBe(1440);
+		expect(json.scheduleLag.buckets.length).toBeGreaterThan(0);
+	});
+
+	test("an unrelated mmo-client json blob is rejected rather than treated as a floor", () => {
+		const wrongSchema = [
+			...provenance(),
+			`mmo-client: json ${JSON.stringify({
+				schema: "other-client/1",
+				scheduleLag: { version: 2, count: 1 },
+				sessionsRequested: 1,
+				sessionsOk: 1,
+				sessionsErr: 0,
+				realm: {
+					sent: 1,
+					sendErr: 0,
+					rxSnapshot: 0,
+					rxAck: 0,
+					rxRaid: 0,
+					rxOther: 0,
+					rxUnstamped: 0,
+				},
+				config: { steadySec: 1 },
+			})}`,
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(wrongSchema, SHA);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("mmo-client/1");
+	});
+
+	test("an mmo-client floor report must come from the realm role", () => {
+		const publisher = [
+			...provenance(),
+			...mmoRun({ role: "publisher" }),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(publisher, SHA);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("role must be realm");
+	});
+
+	test("any other non-realm mmo-client role is refused as a floor source", () => {
+		const subscriber = [
+			...provenance(),
+			...mmoRun({ role: "subscriber" }),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(subscriber, SHA);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("role must be realm");
+	});
+
+	test("a transcript with both legacy and mmo floor blobs fails closed as ambiguous", () => {
+		const mixed = [
+			...provenance(),
+			"load-client: latency-json {not json}",
+			...mmoRun(),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(mixed, SHA);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("ambiguous");
+		expect(report.problems.join(" ")).toContain("did not parse");
+	});
+
+	test("a truncated mmo scheduleLag histogram is rejected before downstream decoding", () => {
+		const truncated = [
+			...provenance(),
+			...mmoRun({ scheduleLagJson: { version: 2, count: 1440 } }),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(truncated, SHA);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("scheduleLag");
+		const verdict = floorReportIsUsable(report, "mac-studio");
+		expect(verdict.usable).toBe(false);
+	});
 });
 
 describe("the off-box floor", () => {
@@ -170,5 +318,23 @@ describe("the off-box floor", () => {
 		);
 		expect(verdict.usable).toBe(false);
 		expect(verdict.reasons.join(" ")).toContain("not a floor");
+	});
+
+	test("connected MMO sessions with zero scheduleLag samples did not offer load", () => {
+		const idleMmo = [
+			...provenance(),
+			...mmoRun({
+				sessionsRequested: 20,
+				sessionsOk: 18,
+				scheduleLagCount: 0,
+			}),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(idleMmo, SHA);
+		expect(report.sessionsDriving).toBe(18);
+		const verdict = floorReportIsUsable(report, "mac-studio");
+		expect(verdict.usable).toBe(false);
+		expect(verdict.reasons.join(" ")).toContain("scheduleLag");
+		expect(verdict.reasons.join(" ")).toContain("offer");
 	});
 });
