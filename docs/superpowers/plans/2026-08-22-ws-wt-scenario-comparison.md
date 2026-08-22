@@ -166,13 +166,15 @@ Such a change requires a fresh plan review and cannot be hidden in an adapter.
 - Generated evidence is untracked under
   `.release-evidence/transport-comparison/<candidate>/<campaign-id>/`.
 - Every connection-scale server/client role must prove an effective soft
-  `nofile` limit of at least 65,536. The 2026-08-22 Linux preflight observed
-  soft/hard limits 1,024/524,288, so the remote launcher raises only the child
-  soft limit before `exec`. The 2026-08-23 Mac preflight observed shell
-  soft/hard 1,048,575/unlimited, `kern.maxfilesperproc=245,760`, and ephemeral
-  ports 49,152–65,535. Mac child limits and port occupancy are recorded; a
-  10,000-client arm requires at least 12,500 free ports on source
-  `10.99.0.1` (5,000 requires 6,250). No persistent limit/range is changed.
+  `nofile` limit of at least 65,536. Planning-session diagnostics observed
+  Linux soft/hard 1,024/524,288, Mac shell soft/hard
+  1,048,575/unlimited, `kern.maxfilesperproc=245,760`, and Mac ephemeral ports
+  49,152–65,535. These are non-promotable feasibility notes; Task 12 must
+  recollect and bind them at the exact candidate. The Linux launcher raises
+  only its child soft limit before `exec` when the fresh hard limit permits it.
+  Mac child limits and port occupancy are recorded; a 10,000-client arm
+  requires at least 12,500 free ports on source `10.99.0.1` (5,000 requires
+  6,250). No persistent limit/range is changed.
 - The registry must contain exactly 35 primary workload cells, producing 35 WS
   primary arms and 35 WT primary arms, plus 12 explicitly labeled WS lossy-game
   overlay arms. Roles, directions, eight-worker Mac sharding for ordinary
@@ -289,7 +291,8 @@ non-canonical rows.
    control: source/digest/run mutation, artifact-byte mutation, loopback,
    missing Linux, same host, wrong interface/address, missing peer proof,
    scenario/payload/TLS/compression/impairment mismatch, missing or unequal
-   capacity-profile hash/applied values/admission counters, missing Mac FD/port
+   capacity-profile hash/normalized submitted values/admission counters,
+   missing Mac FD/port
    proof, smoke input, invalid units/samples/percentiles, and stale WT beside
    valid WS.
 2. Assert stable rejection reasons and that no delta/ranking is computed for an
@@ -341,8 +344,11 @@ non-canonical rows.
    session mapping, explicit datagram/reliable-message selection, both-side
    uni/bidi create/accept lifecycle, server-opened AI/bulk uni channels, Node
    stream backpressure, close/reset/timeout mapping, and 0-RTT truth-counter
-   propagation. Assert every canonical capacity/rate-limit value is passed
-   explicitly to the public native server and echoed into metrics/artifacts.
+   propagation. Assert every canonical capacity/rate-limit value is serialized
+   canonically and passed explicitly to the public native server options seam;
+   record those submitted bytes and their hash in artifacts. WT metrics expose
+   behavioral counters but no runtime applied-config echo, so do not fabricate
+   or label one.
 2. Run RED.
 3. Implement only with public root package APIs. Do not modify package/native
    product code. If a canonical workload cannot be expressed, stop this task
@@ -609,7 +615,8 @@ non-canonical rows.
 1. Assert that all 35 WS and all 35 WT primary arms were attempted inside their
    paired blocks, that all 12 WS overlays are present, and that source archive,
    scenario hash, certificate, topology, impairment, seed, capacity-profile
-   hash and applied values, admission-counter schema, Mac/Linux FD/port proof,
+   hash and exact normalized submitted values/hash, admission-counter schema,
+   Mac/Linux FD/port proof,
    roles/directions/shards, and block order match.
 2. Assert actual WT primitive/resumption state in each artifact. Do not infer
    it from configuration.
@@ -667,8 +674,9 @@ others' edits, and never rewrite the plan.
       critic `APPROVED`.
 - [ ] Durable goal created only after that approval.
 - [ ] Ten frozen scenario definitions and both adapters implemented.
-- [ ] Both adapters echo the identical hashed capacity/admission profile and
-      compatibility checks reject every profile or applied-limit mismatch.
+- [ ] Both adapters record the identical hashed capacity/admission profile and
+      exact normalized submission, and compatibility checks reject every
+      registry/submission mismatch without claiming a WT runtime applied echo.
 - [ ] No new dependency and no WebTransport product-code change.
 - [ ] All pure/unit/negative-control/static/typecheck gates pass.
 - [ ] All new network integration and campaign traffic used the Linux server
