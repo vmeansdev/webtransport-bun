@@ -832,6 +832,15 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	const sideDeadlineSec = Math.ceil(
 		1.5 * (CONNECT_TIMEOUT_SECONDS + STEADY_SECONDS + IDLE_SECONDS),
 	);
+	const cloneFor = new Map<string, string | null>();
+	// Pre-provision each concurrent role's clone BEFORE any spawn, so the three
+	// macgen invocations never share one worktree (index.lock race, run
+	// 32662000300 hotspot null-subscriber).
+	for (const role of o.hotspot
+		? ["realm", "raid-subscriber", "publisher"]
+		: ["realm"]) {
+		cloneFor.set(role, await macgenCloneFor(role));
+	}
 	const realm = spawnClient(
 		[
 			"--role",
@@ -870,6 +879,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 				: []),
 		],
 		realmDeadlineSec,
+		cloneFor.get("realm") ?? null,
 	);
 
 	const extras: ReturnType<typeof spawnClient>[] = [];
@@ -887,6 +897,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 					String(IDLE_SECONDS),
 				],
 				sideDeadlineSec,
+				cloneFor.get("raid-subscriber") ?? null,
 			),
 		);
 		extras.push(
@@ -906,6 +917,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 					String(IDLE_SECONDS),
 				],
 				sideDeadlineSec,
+				cloneFor.get("publisher") ?? null,
 			),
 		);
 	}
@@ -1203,7 +1215,11 @@ type SpawnedClient = {
 	exited: Promise<number>;
 };
 
-function spawnClient(args: string[], deadlineSeconds: number): SpawnedClient {
+function spawnClient(
+	args: string[],
+	deadlineSeconds: number,
+	cloneName: string | null = null,
+): SpawnedClient {
 	const full = [
 		"--url",
 		`https://${OFFBOX_SSH ? serverAddressForOffbox() : "127.0.0.1"}:${PORT}`,
@@ -1220,6 +1236,15 @@ function spawnClient(args: string[], deadlineSeconds: number): SpawnedClient {
 			"bench-g6: G6_CANDIDATE_SHA is required for an off-box run — the entrypoint refuses to build without it",
 		);
 	}
+	const cloneNameFor = cloneName;
+	const entrypointArgs =
+		cloneNameFor === null
+			? ["tools/offbox/mac-generator-entry-g6.sh"]
+			: [
+					"tools/offbox/mac-generator-entry-g6.sh",
+					"--clone",
+					`~/${cloneNameFor}`,
+				];
 	const [cmd, cmdArgs] = OFFBOX_SSH
 		? ([
 				"ssh",
@@ -1227,7 +1252,7 @@ function spawnClient(args: string[], deadlineSeconds: number): SpawnedClient {
 					"-o",
 					"BatchMode=yes",
 					OFFBOX_SSH,
-					"tools/offbox/mac-generator-entry-g6.sh",
+					...entrypointArgs,
 					"--candidate",
 					CANDIDATE_SHA,
 					"--bin",
@@ -1256,6 +1281,54 @@ function serverAddressForOffbox(): string {
 	// The bench subnet's server address. Registered by the cable runbook; never
 	// the LAN and never Tailscale.
 	return process.env.G6_SERVER_ADDRESS ?? "10.99.0.2";
+}
+
+/**
+ * Per-role Mac clone for the off-box generator.
+ *
+ * The hotspot arm spawns three `mac-generator-entry-g6.sh` invocations
+ * (realm, raid-subscriber, publisher) concurrently. Every invocation does
+ * `git fetch && git checkout --detach <sha> && git status` on one worktree
+ * before building; two concurrent checkouts on the same clone race on
+ * `index.lock` and one exits 128, silently producing no report — run
+ * 32662000300's hotspot arm recorded `subscriberClient: null` that way. Give
+ * each concurrent role its own clone, isolated by `--clone` (the entrypoint
+ * already accepts it); `git clone --local` on the Mac hardlinks objects and
+ * provisions in ~2 s. Absent a role, the default `~/wt-macgen` is used.
+ */
+const MACGEN_BASE_CLONE = "wt-macgen";
+const macgenCloneProvisioned = new Set<string>();
+
+async function macgenCloneFor(role: string | null): Promise<string | null> {
+	if (!OFFBOX_SSH) return null; // co-resident smoke: shared CLIENT_BIN.
+	if (role === null || role === "realm") return null; // default clone.
+	const clone = `wt-macgen-${role}`;
+	if (macgenCloneProvisioned.has(clone)) return clone;
+	// Provision on the Mac: clone from the base repo (local, hardlinked
+	// objects). Guard against the race where two arms both try to create it.
+	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if [ ! -d "$HOME/${MACGEN_BASE_CLONE}/.git" ]; then echo "macgen: no base clone at $HOME/${MACGEN_BASE_CLONE}" >&2; exit 3; fi; if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --local --quiet "$HOME/${MACGEN_BASE_CLONE}" "$CLONE" || echo "macgen: clone failed" >&2; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
+	const child = spawn("ssh", ["-o", "BatchMode=yes", OFFBOX_SSH, cloneCmd], {
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	// Bounded wait: provisioning must not hang the gate. 60 s is generous for a
+	// 2 s local clone on a box the gate will then hammer for 25 min.
+	const code = await new Promise<number>((res) => {
+		const t = setTimeout(() => {
+			child.kill("SIGKILL");
+			res(-1);
+		}, 60_000);
+		child.on("exit", (c) => {
+			clearTimeout(t);
+			res(c ?? -1);
+		});
+	});
+	if (code !== 0) {
+		throw new Error(
+			`bench-g6: failed to provision Mac generator clone ${clone} (exit ${code})`,
+		);
+	}
+	macgenCloneProvisioned.add(clone);
+	return clone;
 }
 
 async function pumpClient(
