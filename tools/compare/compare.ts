@@ -58,6 +58,18 @@ const MISSING_ARM_REJECTIONS: Readonly<Record<Transport, ArtifactRejection>> = {
 	},
 };
 
+function admissionCounterShape(
+	counters: RunArtifact["capacity"]["admissionCounters"],
+): unknown {
+	return {
+		schemaVersion: counters.schemaVersion,
+		handshakes: Object.keys(counters.handshakes).sort(),
+		sessions: Object.keys(counters.sessions).sort(),
+		streams: Object.keys(counters.streams).sort(),
+		datagrams: Object.keys(counters.datagrams).sort(),
+	};
+}
+
 function verifyArm(
 	input: ArtifactBytes | undefined,
 	expectedTransport: Transport,
@@ -357,13 +369,13 @@ function compatibilityRejections(
 			"$.capacity.submittedProfileHash",
 		);
 	if (
-		canonicalJson(ws.capacity.admissionCounters) !==
-		canonicalJson(wt.capacity.admissionCounters)
+		canonicalJson(admissionCounterShape(ws.capacity.admissionCounters)) !==
+		canonicalJson(admissionCounterShape(wt.capacity.admissionCounters))
 	)
 		addRejection(
 			rejections,
 			"CAPACITY_ADMISSION_COUNTER_INVALID",
-			"WS and WT admission-counter schema/counters differ",
+			"WS and WT admission-counter schema/shape differs",
 			"$.capacity.admissionCounters",
 		);
 	if (
@@ -392,6 +404,16 @@ function compatibilityRejections(
 			"METRICS_UNIT_INVALID",
 			"WS and WT metric unit/name differs",
 			"$.metrics",
+		);
+	if (
+		ws.metrics.metricKind !== wt.metrics.metricKind ||
+		canonicalJson(ws.metrics.clock) !== canonicalJson(wt.metrics.clock)
+	)
+		addRejection(
+			rejections,
+			"CLOCK_PROVENANCE_MISMATCH",
+			"WS and WT metric clock provenance differs",
+			"$.metrics.clock",
 		);
 	return rejections;
 }

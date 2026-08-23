@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -11,6 +13,10 @@ import {
 	verifyRunArtifact,
 	verifyRunArtifactObject,
 } from "./compare.ts";
+import {
+	CANONICAL_SCENARIO_REGISTRY,
+	getScenarioCell,
+} from "./scenario-registry.ts";
 
 const fixture = (name: string): Uint8Array =>
 	new Uint8Array(readFileSync(join(import.meta.dir, "fixtures", name)));
@@ -35,6 +41,80 @@ function mutatedBytes(
 
 function verifyCode(bytes: Uint8Array): ArtifactRejectionCode[] {
 	return verifyRunArtifact(bytes).rejections.map(({ code }) => code);
+}
+
+function bytesSha256(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function setMetricClock(
+	artifact: RunArtifact,
+	metricKind: string = "mac-local-end-to-end",
+	clock: Record<string, unknown> = {
+		domain: "mac-monotonic",
+		monotonic: true,
+		method: "process.monotonic",
+	},
+): void {
+	const metrics = artifact.metrics as unknown as Record<string, unknown>;
+	metrics.metricKind = metricKind;
+	metrics.clock = clock;
+}
+
+function canonicalCellArtifact(
+	baseBytes: Uint8Array,
+	cellId: string,
+): RunArtifact {
+	const artifact = fixtureObject(baseBytes);
+	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, cellId);
+	artifact.scenario.cellId = cell.cellId;
+	artifact.scenario.scenarioId = cell.scenarioId;
+	artifact.scenario.config = cell.parameters as unknown as Record<
+		string,
+		unknown
+	>;
+	artifact.scenario.scenarioHash = cell.scenarioHash;
+	artifact.scenario.direction = cell.rolePlan.direction;
+	artifact.scenario.repetition.total = cell.runPolicy.measuredRepetitions;
+	setMetricClock(artifact);
+	return artifact;
+}
+
+function bindDirectDigest(artifact: RunArtifact): void {
+	const withoutDigest = {
+		...(artifact as unknown as Record<string, unknown>),
+		artifactByteSha256: "0".repeat(64),
+	};
+	artifact.artifactByteSha256 = canonicalDigest(withoutDigest);
+}
+
+function bulkArtifactObject(baseBytes: Uint8Array): RunArtifact {
+	const artifact = canonicalCellArtifact(baseBytes, "bulk-one-way/physical");
+	setPayloadBytes(artifact, 65_536);
+	bindDirectDigest(artifact);
+	return artifact;
+}
+
+function setPayloadBytes(artifact: RunArtifact, length: number): void {
+	const payload = new Uint8Array(length);
+	for (let index = 0; index < payload.length; index += 1)
+		payload[index] = index & 0xff;
+	artifact.scenario.payload = {
+		encoding: "base64",
+		data: Buffer.from(payload).toString("base64"),
+		bytes: payload.byteLength,
+		sha256: bytesSha256(payload),
+	};
+}
+
+function scaleArtifactObject(
+	baseBytes: Uint8Array,
+	liveConnections: 1_000 | 5_000 | 10_000,
+): RunArtifact {
+	return canonicalCellArtifact(
+		baseBytes,
+		`connection-memory/live-${liveConnections}`,
+	);
 }
 
 function compareCode(
@@ -202,9 +282,23 @@ describe("fail-closed comparison evidence", () => {
 			"TOPOLOGY_OS_MISMATCH",
 		],
 		[
+			"wrong Linux OS",
+			(a) => {
+				a.topology.linux.os = "darwin" as never;
+			},
+			"TOPOLOGY_OS_MISMATCH",
+		],
+		[
 			"wrong interface",
 			(a) => {
 				a.topology.mac.interface = "lo0";
+			},
+			"TOPOLOGY_INTERFACE_MISMATCH",
+		],
+		[
+			"wrong Linux interface",
+			(a) => {
+				a.topology.linux.interface = "eth0";
 			},
 			"TOPOLOGY_INTERFACE_MISMATCH",
 		],
@@ -216,9 +310,23 @@ describe("fail-closed comparison evidence", () => {
 			"TOPOLOGY_ADDRESS_MISMATCH",
 		],
 		[
+			"wrong Linux address",
+			(a) => {
+				a.topology.linux.address = "10.99.0.9";
+			},
+			"TOPOLOGY_ADDRESS_MISMATCH",
+		],
+		[
 			"wrong route",
 			(a) => {
 				a.topology.mac.route.interface = "en0";
+			},
+			"TOPOLOGY_ROUTE_MISMATCH",
+		],
+		[
+			"wrong Linux route",
+			(a) => {
+				a.topology.linux.route.interface = "eth0";
 			},
 			"TOPOLOGY_ROUTE_MISMATCH",
 		],
@@ -236,6 +344,13 @@ describe("fail-closed comparison evidence", () => {
 					.serverObservedPeer;
 			},
 			"TOPOLOGY_PEER_MISSING",
+		],
+		[
+			"wrong peer",
+			(a) => {
+				a.topology.serverObservedPeer.address = "10.99.0.9";
+			},
+			"TOPOLOGY_PEER_MISMATCH",
 		],
 		[
 			"missing Linux sidecar",
@@ -302,7 +417,7 @@ describe("fail-closed comparison evidence", () => {
 			],
 			[
 				"direction",
-				(a) => (a.scenario.direction = "linux-to-mac"),
+				(a) => (a.scenario.direction = "mac-to-linux"),
 				"SCENARIO_DIRECTION_MISMATCH",
 			],
 		];
@@ -327,6 +442,11 @@ describe("fail-closed comparison evidence", () => {
 				"certificate",
 				(a) => (a.tls.certificateSha256 = "b".repeat(64)),
 				"TLS_CERTIFICATE_MISMATCH",
+			],
+			[
+				"CA",
+				(a) => (a.tls.caSha256 = "f".repeat(64)),
+				"TLS_CONFIGURATION_INVALID",
 			],
 			[
 				"compression",
@@ -374,6 +494,78 @@ describe("fail-closed comparison evidence", () => {
 		for (const [label, mutate, code] of cases) {
 			expect(compareCode(mutate), label).toContain(code);
 		}
+	});
+
+	test("binds impairment to the selected path and requires an initial fq state", () => {
+		const physical = canonicalCellArtifact(
+			wsBytes,
+			"handshake-matrix/physical-cold",
+		);
+		physical.impairment.requested = {
+			qdisc: "netem",
+			delayMs: 40,
+			lossPercent: 0,
+			direction: "linux-egress",
+		};
+		bindDirectDigest(physical);
+		expect(
+			verifyRunArtifactObject(physical).rejections.map(({ code }) => code),
+		).toContain("IMPAIRMENT_REQUESTED_INVALID");
+
+		const delay40 = canonicalCellArtifact(
+			wsBytes,
+			"handshake-matrix/delay40-cold",
+		);
+		delay40.impairment.requested = {
+			qdisc: "netem",
+			delayMs: 40,
+			lossPercent: 0,
+			direction: "linux-egress",
+		};
+		delay40.capacityProof.mac.ephemeralPorts.requiredFreePorts = 125;
+		bindDirectDigest(delay40);
+		expect(verifyRunArtifactObject(delay40).evidenceStatus).toBe("PASS");
+
+		const preExistingNetem = canonicalCellArtifact(
+			wsBytes,
+			"handshake-matrix/physical-cold",
+		);
+		preExistingNetem.impairment.observedBefore = {
+			qdisc: "netem",
+			delayMs: 40,
+			lossPercent: 0,
+		};
+		preExistingNetem.impairment.observedAfter = {
+			qdisc: "netem",
+			delayMs: 40,
+			lossPercent: 0,
+		};
+		preExistingNetem.impairment.restorationProof.observedBeforeSha256 =
+			canonicalDigest(preExistingNetem.impairment.observedBefore);
+		preExistingNetem.impairment.restorationProof.observedAfterSha256 =
+			canonicalDigest(preExistingNetem.impairment.observedAfter);
+		bindDirectDigest(preExistingNetem);
+		expect(
+			verifyRunArtifactObject(preExistingNetem).rejections.map(
+				({ code }) => code,
+			),
+		).toContain("IMPAIRMENT_OBSERVED_INVALID");
+
+		const game = canonicalCellArtifact(
+			wsBytes,
+			"game-tick-loss/tick-20-loss-1-delay-40",
+		);
+		setPayloadBytes(game, 64);
+		game.impairment.requested = {
+			qdisc: "netem",
+			delayMs: 100,
+			lossPercent: 1,
+			direction: "linux-egress",
+		};
+		bindDirectDigest(game);
+		expect(
+			verifyRunArtifactObject(game).rejections.map(({ code }) => code),
+		).toContain("IMPAIRMENT_REQUESTED_INVALID");
 	});
 
 	test("rejects capacity ID/hash/normalized bytes/hash/admission schema/counters/ramp drift", () => {
@@ -428,7 +620,22 @@ describe("fail-closed comparison evidence", () => {
 		}
 	});
 
-	test("requires Mac FD/ephemeral-port proof and effective child nofile for scale", () => {
+	test("compares admission-counter schema shape while retaining differing values", () => {
+		const wt = fixtureObject(wtBytes);
+		wt.capacity.admissionCounters.sessions.accepted = 9;
+		const result = compareRunArtifacts(wsBytes, sealRunArtifact(wt));
+		expect(result.evidenceStatus).toBe("PASS");
+		expect(result.delta).toEqual({
+			metric: "p50",
+			unit: "ms",
+			ws: 2,
+			wt: 1,
+			absolute: -1,
+			relative: -0.5,
+		});
+	});
+
+	test("requires capacity proof only for connection-scale cells", () => {
 		const cases: readonly [
 			string,
 			(a: RunArtifact) => void,
@@ -444,20 +651,54 @@ describe("fail-closed comparison evidence", () => {
 				(a) => (a.capacityProof.mac.ephemeralPorts.freePorts = 100),
 				"CAPACITY_EPHEMERAL_PORT_PROOF_INVALID",
 			],
-			[
-				"Mac child limit",
-				(a) => (a.capacityProof.mac.fd.effectiveChildLimit = 65_535),
-				"CAPACITY_EFFECTIVE_LIMIT_TOO_LOW",
-			],
-			[
-				"Linux child limit",
-				(a) => (a.capacityProof.linux.fd.effectiveChildLimit = 65_535),
-				"CAPACITY_EFFECTIVE_LIMIT_TOO_LOW",
-			],
 		];
 		for (const [label, mutate, code] of cases) {
 			expect(verifyCode(mutatedBytes(wsBytes, mutate)), label).toContain(code);
 		}
+
+		const nonScale = fixtureObject(wsBytes);
+		nonScale.capacityProof.mac.fd.effectiveChildLimit = 1_024;
+		nonScale.capacityProof.linux.fd.effectiveChildLimit = 1_024;
+		nonScale.capacityProof.mac.ephemeralPorts.requiredFreePorts = 1;
+		bindDirectDigest(nonScale);
+		expect(verifyRunArtifactObject(nonScale).evidenceStatus).toBe("PASS");
+		const zeroHeadroom = fixtureObject(wsBytes);
+		zeroHeadroom.capacityProof.mac.ephemeralPorts.requiredFreePorts = 0;
+		bindDirectDigest(zeroHeadroom);
+		expect(
+			verifyRunArtifactObject(zeroHeadroom).rejections.map(({ code }) => code),
+		).toContain("CAPACITY_EPHEMERAL_PORT_PROOF_INVALID");
+
+		for (const [liveConnections, requiredFreePorts] of [
+			[5_000, 6_250],
+			[10_000, 12_500],
+		] as const) {
+			const scale = scaleArtifactObject(wsBytes, liveConnections);
+			scale.capacityProof.mac.ephemeralPorts.requiredFreePorts =
+				requiredFreePorts;
+			bindDirectDigest(scale);
+			expect(verifyRunArtifactObject(scale).evidenceStatus).toBe("PASS");
+		}
+
+		const tampered = scaleArtifactObject(wsBytes, 10_000);
+		tampered.capacityProof.mac.ephemeralPorts.requiredFreePorts = 0;
+		bindDirectDigest(tampered);
+		expect(
+			verifyRunArtifactObject(tampered).rejections.map(({ code }) => code),
+		).toContain("CAPACITY_EPHEMERAL_PORT_PROOF_INVALID");
+
+		const lowMacFd = scaleArtifactObject(wsBytes, 10_000);
+		lowMacFd.capacityProof.mac.fd.effectiveChildLimit = 65_535;
+		bindDirectDigest(lowMacFd);
+		expect(
+			verifyRunArtifactObject(lowMacFd).rejections.map(({ code }) => code),
+		).toContain("CAPACITY_EFFECTIVE_LIMIT_TOO_LOW");
+		const lowLinuxFd = scaleArtifactObject(wsBytes, 10_000);
+		lowLinuxFd.capacityProof.linux.fd.effectiveChildLimit = 65_535;
+		bindDirectDigest(lowLinuxFd);
+		expect(
+			verifyRunArtifactObject(lowLinuxFd).rejections.map(({ code }) => code),
+		).toContain("CAPACITY_EFFECTIVE_LIMIT_TOO_LOW");
 	});
 
 	test("rejects invalid units, empty/nonfinite/sparse samples, and percentiles", () => {
@@ -509,6 +750,82 @@ describe("fail-closed comparison evidence", () => {
 				);
 			}
 		}
+	});
+
+	test("requires explicit metric clock provenance and binds metric kind", () => {
+		const local = fixtureObject(wsBytes);
+		setMetricClock(local);
+		bindDirectDigest(local);
+		expect(verifyRunArtifactObject(local).evidenceStatus).toBe("PASS");
+
+		const oneWayWithoutOffset = fixtureObject(wsBytes);
+		setMetricClock(oneWayWithoutOffset, "one-way", {
+			domain: "independent-offset",
+			monotonic: true,
+			method: "ptp-offset-sample",
+		});
+		bindDirectDigest(oneWayWithoutOffset);
+		expect(
+			verifyRunArtifactObject(oneWayWithoutOffset).rejections.map(
+				({ code }) => code,
+			),
+		).toContain("CLOCK_PROVENANCE_INVALID");
+
+		const oneWay = fixtureObject(wsBytes);
+		oneWay.metrics.name = "one-way-latency";
+		setMetricClock(oneWay, "one-way", {
+			domain: "independent-offset",
+			monotonic: true,
+			method: "ptp-offset-sample",
+			offsetMs: 0.25,
+			uncertaintyMs: 0.05,
+		});
+		bindDirectDigest(oneWay);
+		expect(verifyRunArtifactObject(oneWay).evidenceStatus).toBe("PASS");
+
+		const renamed = fixtureObject(wsBytes);
+		renamed.metrics.name = "one-way-latency";
+		setMetricClock(renamed);
+		bindDirectDigest(renamed);
+		expect(
+			verifyRunArtifactObject(renamed).rejections.map(({ code }) => code),
+		).toContain("CLOCK_PROVENANCE_INVALID");
+
+		const wt = fixtureObject(wtBytes);
+		setMetricClock(wt, "mac-local-end-to-end", {
+			domain: "mac-monotonic",
+			monotonic: true,
+			method: "different-monotonic-source",
+		});
+		const comparison = compareRunArtifacts(wsBytes, sealRunArtifact(wt));
+		expect(comparison.delta).toBe("not computed");
+		expect(comparison.rejections.map(({ code }) => code)).toContain(
+			"CLOCK_PROVENANCE_MISMATCH",
+		);
+	});
+
+	test("accepts an exact 64 KiB canonical bulk chunk and rejects an oversized chunk", () => {
+		expect(fixtureObject(wsBytes).scenario.cellId).toBe(
+			"bulk-one-way/physical",
+		);
+		const bulk = bulkArtifactObject(wsBytes);
+		expect(verifyRunArtifactObject(bulk).evidenceStatus).toBe("PASS");
+
+		const oversized = bulkArtifactObject(wsBytes);
+		setPayloadBytes(oversized, 65_537);
+		bindDirectDigest(oversized);
+		expect(
+			verifyRunArtifactObject(oversized).rejections.map(({ code }) => code),
+		).toContain("SCENARIO_PAYLOAD_MISMATCH");
+
+		const beyondSupportedCap = bulkArtifactObject(wsBytes);
+		setPayloadBytes(beyondSupportedCap, 1_048_577);
+		bindDirectDigest(beyondSupportedCap);
+		expect(
+			verifyRunArtifactObject(beyondSupportedCap).rejections.map(
+				({ code }) => code,
+			),
+		).toContain("SCENARIO_PAYLOAD_INVALID");
 	});
 
 	test("keeps evidence status, scenario verdict, and promotability separate but rejects contradictions", () => {
