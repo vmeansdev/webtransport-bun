@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { ByteBoundedQueue } from "./bounded-queue.ts";
-import { OpenLoopPacer } from "./pacer.ts";
+import { ByteBoundedQueue, DEFAULT_MAX_QUEUE_ITEMS } from "./bounded-queue.ts";
+import { ManualClock, OpenLoopPacer } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
 	DEFAULT_MAX_WIRE_PAYLOAD_BYTES,
 	decodeWireMessage,
 	encodeWireMessage,
 	isWireMessageExpired,
+	MAX_WIRE_PAYLOAD_BYTES,
+	MAX_WIRE_TOTAL_BYTES,
 	WIRE_MAGIC,
 	WIRE_VERSION,
 	WireFormatError,
@@ -51,6 +53,21 @@ describe("shared comparison driver core", () => {
 			}),
 		).toThrow(WireFormatError);
 		expect(decodeWireMessage(encodeWireMessage(message))).toEqual(message);
+	});
+
+	test("requires own finite nowMs when rejecting expired envelopes", () => {
+		const encoded = encodeWireMessage(message);
+		expect(() => decodeWireMessage(encoded, { rejectExpired: true })).toThrow(
+			/nowMs/i,
+		);
+		expect(() =>
+			decodeWireMessage(encoded, { nowMs: Number.NaN, rejectExpired: true }),
+		).toThrow(/nowMs/i);
+		const inherited = Object.create({ nowMs: 1_000 }) as {
+			rejectExpired: true;
+		};
+		inherited.rejectExpired = true;
+		expect(() => decodeWireMessage(encoded, inherited)).toThrow(/own/i);
 	});
 
 	test("rejects truncated input before reading the fixed header", () => {
@@ -130,6 +147,41 @@ describe("shared comparison driver core", () => {
 		expect(() => decodeWireMessage(malformedId)).toThrow(WireFormatError);
 	});
 
+	test("rejects unpaired UTF-16 surrogates and round-trips valid pairs", () => {
+		const unicodeMessage = {
+			...message,
+			runId: "run-🚀",
+			sessionId: "session-🧪",
+		};
+		expect(decodeWireMessage(encodeWireMessage(unicodeMessage))).toEqual(
+			unicodeMessage,
+		);
+		expect(() =>
+			encodeWireMessage({ ...message, runId: "bad-\ud800" }),
+		).toThrow(/surrogate/i);
+		expect(() =>
+			encodeWireMessage({ ...message, sessionId: "bad-\udfff" }),
+		).toThrow(/surrogate/i);
+	});
+
+	test("enforces uint32 payload and compatible total wire limits", () => {
+		expect(MAX_WIRE_PAYLOAD_BYTES).toBe(0xffff_ffff);
+		expect(MAX_WIRE_TOTAL_BYTES).toBeGreaterThan(MAX_WIRE_PAYLOAD_BYTES);
+		expect(() =>
+			encodeWireMessage(message, {
+				maxPayloadBytes: MAX_WIRE_PAYLOAD_BYTES + 1,
+			}),
+		).toThrow(/uint32/i);
+		expect(() =>
+			decodeWireMessage(encodeWireMessage(message), {
+				maxPayloadBytes: MAX_WIRE_PAYLOAD_BYTES + 1,
+			}),
+		).toThrow(/uint32/i);
+		expect(() =>
+			encodeWireMessage(message, { maxWireBytes: MAX_WIRE_TOTAL_BYTES + 1 }),
+		).toThrow(/wire|maximum|uint/i);
+	});
+
 	test("enforces byte capacity and exposes high/low watermark transitions", () => {
 		const queue = new ByteBoundedQueue<Uint8Array>({
 			maxBytes: 10,
@@ -146,6 +198,32 @@ describe("shared comparison driver core", () => {
 		expect(queue.bytes).toBe(8);
 		expect(queue.shift()?.byteLength).toBe(5);
 		expect(queue.belowLowWaterMark).toBe(true);
+	});
+
+	test("bounds item metadata separately from bytes and rejects zero-byte entries", () => {
+		expect(Number.isSafeInteger(DEFAULT_MAX_QUEUE_ITEMS)).toBe(true);
+		expect(DEFAULT_MAX_QUEUE_ITEMS).toBeGreaterThan(0);
+		const queue = new ByteBoundedQueue<Uint8Array>({
+			maxBytes: 100,
+			maxItems: 2,
+		});
+		expect(queue.tryPush(new Uint8Array([1]))).toBe(true);
+		expect(queue.tryPush(new Uint8Array([2]))).toBe(true);
+		expect(queue.tryPush(new Uint8Array([3]))).toBe(false);
+		expect(() => queue.tryPush(new Uint8Array(0))).toThrow(/zero|positive/i);
+		expect(
+			() => new ByteBoundedQueue<Uint8Array>({ maxBytes: 10, maxItems: 0 }),
+		).toThrow(/maxItems/i);
+	});
+
+	test("rejects resizable ArrayBuffer backing and untrusted byteLength objects", () => {
+		const resizable = new ArrayBuffer(8, { maxByteLength: 16 });
+		const queue = new ByteBoundedQueue<unknown>({ maxBytes: 32 });
+		expect(() => queue.tryPush(resizable)).toThrow(/resizable/i);
+		expect(() => queue.tryPush(new Uint8Array(resizable))).toThrow(
+			/resizable/i,
+		);
+		expect(() => queue.tryPush({ byteLength: 1 })).toThrow(/sizeOf/i);
 	});
 
 	test("closes deterministically, drains existing items, and rejects later pushes", async () => {
@@ -169,6 +247,45 @@ describe("shared comparison driver core", () => {
 		drainable.close();
 		expect(drainable.shift()).toBe(7);
 		expect(drainable.shift()).toBeUndefined();
+	});
+
+	test("aborted item waits are removed and waiter capacity is reusable", async () => {
+		const queue = new ByteBoundedQueue<number>({
+			maxBytes: 16,
+			maxItems: 4,
+			sizeOf: () => 1,
+			maxWaiters: 1,
+		});
+		const controller = new AbortController();
+		const pending = queue.waitForItem({ signal: controller.signal });
+		expect(queue.pendingItemWaiters).toBe(1);
+		controller.abort("cancelled");
+		await pending.catch((reason) => expect(reason).toBe("cancelled"));
+		expect(queue.pendingItemWaiters).toBe(0);
+		const reusable = queue.waitForItem();
+		expect(queue.pendingItemWaiters).toBe(1);
+		queue.close("done");
+		expect(await reusable).toEqual({ done: true, reason: "done" });
+		expect(queue.pendingItemWaiters).toBe(0);
+	});
+
+	test("aborted watermark waits are removed and do not consume the total cap", async () => {
+		const queue = new ByteBoundedQueue<Uint8Array>({
+			maxBytes: 10,
+			highWaterMark: 5,
+			lowWaterMark: 1,
+			maxWaiters: 1,
+		});
+		queue.tryPush(new Uint8Array([1, 2, 3, 4, 5]));
+		const controller = new AbortController();
+		const pending = queue.waitForLowWaterMark({ signal: controller.signal });
+		expect(queue.pendingWatermarkWaiters).toBe(1);
+		controller.abort("cancelled");
+		await pending.catch((reason) => expect(reason).toBe("cancelled"));
+		expect(queue.pendingWatermarkWaiters).toBe(0);
+		const reusable = queue.waitForLowWaterMark();
+		queue.shift();
+		expect(await reusable).toBe("low");
 	});
 
 	test("pacing is open-loop from one epoch and does not drift or catch up implicitly", () => {
@@ -226,6 +343,31 @@ describe("shared comparison driver core", () => {
 		expect(pacer.catchUp).toBe("skip");
 	});
 
+	test("rejects nonrepresentable rates, epochs, derived slots, and clock overflow", () => {
+		expect(
+			() => new OpenLoopPacer({ ratePerSecond: Number.MIN_VALUE }),
+		).toThrow(/interval|rate/i);
+		expect(() => new OpenLoopPacer({ ratePerSecond: 1e20 })).toThrow(
+			/interval|rate/i,
+		);
+		expect(() =>
+			new OpenLoopPacer({
+				ratePerSecond: 1,
+				now: () => Number.MAX_VALUE,
+			}).nextSlot(),
+		).toThrow(/epoch|safe|representable/i);
+		const pacer = new OpenLoopPacer({
+			ratePerSecond: 1,
+			now: () => Number.MAX_SAFE_INTEGER - 1_000,
+			catchUp: "none",
+		});
+		pacer.nextSlot();
+		pacer.nextSlot();
+		expect(() => pacer.nextSlot()).toThrow(/slot|safe|representable/i);
+		const clock = new ManualClock(Number.MAX_SAFE_INTEGER - 1);
+		expect(() => clock.advance(2)).toThrow(/overflow|safe/i);
+	});
+
 	test("reset starts a new warmup epoch and sequence", () => {
 		let nowMs = 10;
 		const pacer = new OpenLoopPacer({ ratePerSecond: 2, now: () => nowMs });
@@ -281,6 +423,7 @@ describe("shared comparison driver core", () => {
 			expect(() => studentTCritical95(sampleCount)).toThrow(/sample count/i);
 		}
 		expect(sampleSummary([7]).ci95Low).toBe(7);
+		expect(studentTCritical95(1e15)).toBeCloseTo(1.959964, 5);
 	});
 
 	test("keeps extreme finite summaries finite or rejects unrepresentable results", () => {

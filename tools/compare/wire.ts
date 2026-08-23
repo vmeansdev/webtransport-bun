@@ -9,6 +9,10 @@
 export const WIRE_MAGIC = 0x5754;
 export const WIRE_VERSION = 1;
 export const WIRE_FIXED_HEADER_BYTES = 38;
+export const MAX_WIRE_HEADER_BYTES = 0xffff;
+export const MAX_WIRE_PAYLOAD_BYTES = 0xffff_ffff;
+export const MAX_WIRE_TOTAL_BYTES =
+	MAX_WIRE_HEADER_BYTES + MAX_WIRE_PAYLOAD_BYTES;
 export const DEFAULT_MAX_WIRE_PAYLOAD_BYTES = 1024 * 1024;
 export const DEFAULT_MAX_WIRE_BYTES =
 	WIRE_FIXED_HEADER_BYTES + 2 * 65_535 + DEFAULT_MAX_WIRE_PAYLOAD_BYTES;
@@ -60,6 +64,31 @@ function validateLimit(name: string, value: number): number {
 	return value;
 }
 
+function validatePayloadLimit(name: string, value: number): number {
+	const limit = validateLimit(name, value);
+	if (limit > MAX_WIRE_PAYLOAD_BYTES) {
+		fail("invalid-input", `${name} must fit in a uint32 payload length`);
+	}
+	return limit;
+}
+
+function assertWellFormedUtf16(value: string, label: string): void {
+	for (let index = 0; index < value.length; index += 1) {
+		const code = value.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1);
+			if (!(next >= 0xdc00 && next <= 0xdfff)) {
+				fail("invalid-input", `${label} contains an unpaired surrogate`);
+			}
+			index += 1;
+			continue;
+		}
+		if (code >= 0xdc00 && code <= 0xdfff) {
+			fail("invalid-input", `${label} contains an unpaired surrogate`);
+		}
+	}
+}
+
 function validateMessage(
 	message: WireMessage,
 	options: WireCodecOptions,
@@ -79,6 +108,8 @@ function validateMessage(
 	if (typeof message.sessionId !== "string" || message.sessionId.length === 0) {
 		fail("invalid-input", "sessionId must be a non-empty string");
 	}
+	assertWellFormedUtf16(message.runId, "runId");
+	assertWellFormedUtf16(message.sessionId, "sessionId");
 	const runId = textEncoder.encode(message.runId);
 	const sessionId = textEncoder.encode(message.sessionId);
 	if (runId.byteLength > 65_535 || sessionId.byteLength > 65_535) {
@@ -92,7 +123,7 @@ function validateMessage(
 	const payload = message.payload;
 	const maxPayloadBytes =
 		options.maxPayloadBytes ?? DEFAULT_MAX_WIRE_PAYLOAD_BYTES;
-	validateLimit("maxPayloadBytes", maxPayloadBytes);
+	validatePayloadLimit("maxPayloadBytes", maxPayloadBytes);
 	if (payload.byteLength > maxPayloadBytes) {
 		fail(
 			"oversized",
@@ -105,6 +136,15 @@ function validateMessage(
 function validateWireLimit(options: WireCodecOptions): number {
 	const maxWireBytes = options.maxWireBytes ?? DEFAULT_MAX_WIRE_BYTES;
 	validateLimit("maxWireBytes", maxWireBytes);
+	if (maxWireBytes < WIRE_FIXED_HEADER_BYTES + 2) {
+		fail(
+			"invalid-input",
+			`maxWireBytes must fit the fixed header and both identity fields`,
+		);
+	}
+	if (maxWireBytes > MAX_WIRE_TOTAL_BYTES) {
+		fail("invalid-input", "maxWireBytes exceeds the compatible wire limit");
+	}
 	return maxWireBytes;
 }
 
@@ -120,13 +160,14 @@ export function encodeWireMessage(
 	const headerBytes =
 		WIRE_FIXED_HEADER_BYTES + runId.byteLength + sessionId.byteLength;
 	const totalBytes = headerBytes + payload.byteLength;
-	if (totalBytes > validateWireLimit(options)) {
+	const maxWireBytes = validateWireLimit(options);
+	if (totalBytes > maxWireBytes) {
 		fail(
 			"oversized",
-			`wire message is ${totalBytes} bytes; maximum is ${options.maxWireBytes}`,
+			`wire message is ${totalBytes} bytes; maximum is ${maxWireBytes}`,
 		);
 	}
-	if (headerBytes > 65_535) {
+	if (headerBytes > MAX_WIRE_HEADER_BYTES) {
 		fail("oversized", "wire header exceeds its 16-bit length field");
 	}
 
@@ -235,7 +276,7 @@ export function decodeWireMessage(
 	const payloadBytes = view.getUint32(34, false);
 	const maxPayloadBytes =
 		options.maxPayloadBytes ?? DEFAULT_MAX_WIRE_PAYLOAD_BYTES;
-	validateLimit("maxPayloadBytes", maxPayloadBytes);
+	validatePayloadLimit("maxPayloadBytes", maxPayloadBytes);
 	if (payloadBytes > maxPayloadBytes) {
 		fail(
 			"oversized",
@@ -269,14 +310,21 @@ export function decodeWireMessage(
 		expiresAtMs,
 		payload,
 	};
+	const rejectingExpired = options.rejectExpired === true;
+	if (rejectingExpired) {
+		if (
+			!Object.hasOwn(options, "nowMs") ||
+			typeof options.nowMs !== "number" ||
+			!Number.isFinite(options.nowMs)
+		) {
+			fail("invalid-input", "rejectExpired requires an own finite nowMs");
+		}
+	}
 	if (options.nowMs !== undefined) {
-		if (!Number.isFinite(options.nowMs)) {
+		if (typeof options.nowMs !== "number" || !Number.isFinite(options.nowMs)) {
 			fail("invalid-input", "nowMs must be finite");
 		}
-		if (
-			(options.rejectExpired ?? false) &&
-			isWireMessageExpired(message, options.nowMs)
-		) {
+		if (rejectingExpired && isWireMessageExpired(message, options.nowMs)) {
 			fail("expired", "wire envelope expired before it was decoded");
 		}
 	}
