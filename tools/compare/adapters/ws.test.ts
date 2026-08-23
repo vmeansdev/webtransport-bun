@@ -167,7 +167,19 @@ function message(sequence = 7): WireMessage {
 	};
 }
 
-function deadline(now = 0, timeoutMs = 100): number {
+const TEST_CLIENT_TLS = Object.freeze({
+	ca: "CA",
+	serverName: "wt-compare.local",
+	rejectUnauthorized: true,
+});
+
+const TEST_SERVER_TLS = Object.freeze({
+	cert: "cert",
+	key: "key",
+	serverName: "wt-compare.local",
+});
+
+function deadline(now = Date.now(), timeoutMs = 100): number {
 	return now + timeoutMs;
 }
 
@@ -181,6 +193,26 @@ function boundedRead(
 	return read.call(channel, deadlineMs) as Promise<Uint8Array | null>;
 }
 
+type BoundedResult<T> =
+	| { readonly kind: "resolved"; readonly value: T }
+	| { readonly kind: "rejected"; readonly reason: unknown }
+	| { readonly kind: "timeout" };
+
+async function observeBounded<T>(
+	promise: Promise<T>,
+	timeoutMs = 50,
+): Promise<BoundedResult<T>> {
+	return Promise.race([
+		promise.then(
+			(value) => ({ kind: "resolved" as const, value }),
+			(reason) => ({ kind: "rejected" as const, reason }),
+		),
+		new Promise<BoundedResult<T>>((resolve) => {
+			setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+		}),
+	]);
+}
+
 function makeAdapter(
 	socket: FakeClientSocket,
 	clock: { nowMs: () => number; sleep: (ms: number) => Promise<void> } = {
@@ -192,6 +224,9 @@ function makeAdapter(
 		clock,
 		clientFactory: (_url, _options) => {
 			socket.open();
+			queueMicrotask(() =>
+				socket.receive(encodeWebSocketFrame({ kind: "hello-ack" })),
+			);
 			return socket;
 		},
 	});
@@ -248,6 +283,7 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		const session = await adapter.connect({
 			url: "wss://compare",
 			role: "publisher",
+			tls: TEST_CLIENT_TLS,
 			clientHighWaterMark: 4,
 			clientLowWaterMark: 1,
 			deadlineMs: deadline(0, 50),
@@ -267,6 +303,7 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		const blockedSession = await blocked.connect({
 			url: "wss://compare",
 			role: "publisher",
+			tls: TEST_CLIENT_TLS,
 			clientHighWaterMark: 4,
 			clientLowWaterMark: 1,
 			deadlineMs: 50,
@@ -287,7 +324,11 @@ describe("Bun-native WebSocket comparison adapter", () => {
 			},
 			clock: { nowMs: () => 0, sleep: async () => {} },
 		});
-		const server = await adapter.startServer({ port: 4433, role: "publisher" });
+		const server = await adapter.startServer({
+			port: 4433,
+			role: "publisher",
+			tls: TEST_SERVER_TLS,
+		});
 		const socket = runtime?.open();
 		if (!socket) throw new Error("fake socket was not opened");
 		runtime?.receive(socket, encodeHandshakeFrame("publisher"));
@@ -330,7 +371,11 @@ describe("Bun-native WebSocket comparison adapter", () => {
 			maxReceiveQueueBytes: 80,
 			clock: { nowMs: () => 0, sleep: async () => {} },
 		});
-		const server = await adapter.startServer({ port: 4433, role: "publisher" });
+		const server = await adapter.startServer({
+			port: 4433,
+			role: "publisher",
+			tls: TEST_SERVER_TLS,
+		});
 		const socket = runtime?.open();
 		if (!socket) throw new Error("fake socket was not opened");
 		runtime?.receive(socket, encodeHandshakeFrame("publisher"));
@@ -365,6 +410,7 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		const server = await adapter.startServer({
 			port: 4433,
 			role: "subscriber",
+			tls: TEST_SERVER_TLS,
 		});
 		const wrong = runtime?.open();
 		if (!wrong) throw new Error("wrong fake socket was not opened");
@@ -389,7 +435,8 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		const session = await adapter.connect({
 			url: "wss://compare",
 			role: "publisher",
-			deadlineMs: 100,
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: deadline(),
 		});
 		const uni = await session.openUni(100);
 		const bidi = await session.openBidi(100);
@@ -426,18 +473,21 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		const session = await adapter.connect({
 			url: "wss://compare",
 			role: "subscriber",
+			tls: TEST_CLIENT_TLS,
 			deadlineMs: 100,
 		});
-		socket.receive(encodeWebSocketFrame({ kind: "open-uni", channelId: 9 }));
+		socket.receive(encodeWebSocketFrame({ kind: "open-uni", channelId: 10 }));
 		const uni = await session.acceptUni(100);
 		socket.receive(
 			encodeWebSocketFrame({
 				kind: "channel-data",
-				channelId: 9,
+				channelId: 10,
 				payload: Uint8Array.from([8, 7]),
 			}),
 		);
-		socket.receive(encodeWebSocketFrame({ kind: "channel-end", channelId: 9 }));
+		socket.receive(
+			encodeWebSocketFrame({ kind: "channel-end", channelId: 10 }),
+		);
 		expect(await boundedRead(uni, 100)).toEqual(Uint8Array.from([8, 7]));
 		expect(await boundedRead(uni, 100)).toBeNull();
 		const uniWriter = uni as unknown as {
@@ -447,13 +497,13 @@ describe("Bun-native WebSocket comparison adapter", () => {
 			uniWriter.write(Uint8Array.from([1]), 100),
 		).rejects.toMatchObject({ code: "E_SESSION_CLOSED" });
 
-		socket.receive(encodeWebSocketFrame({ kind: "open-bidi", channelId: 10 }));
+		socket.receive(encodeWebSocketFrame({ kind: "open-bidi", channelId: 12 }));
 		const bidi = await session.acceptBidi(100);
 		await bidi.write(Uint8Array.from([4]), 100);
 		socket.receive(
 			encodeWebSocketFrame({
 				kind: "channel-data",
-				channelId: 10,
+				channelId: 12,
 				payload: Uint8Array.from([5]),
 			}),
 		);
@@ -470,7 +520,7 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		});
 		await adapter.startServer({
 			port: 4433,
-			tls: { cert: "cert", key: "key" },
+			tls: TEST_SERVER_TLS,
 		});
 		const options = runtime?.options;
 		if (!options) throw new Error("server options were not captured");
@@ -489,7 +539,7 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		expect(adapter.submittedCapacityProfile.hash).toBe(
 			CANONICAL_SCENARIO_REGISTRY.capacityProfileHash,
 		);
-		expect(options.tls).toEqual({ cert: "cert", key: "key" });
+		expect(options.tls).toEqual(TEST_SERVER_TLS);
 	});
 
 	test("rejects insecure custom-CA client configuration", async () => {
@@ -526,6 +576,9 @@ describe("Bun-native WebSocket comparison adapter", () => {
 			clientFactory: () => {
 				const socket = new FakeClientSocket();
 				socket.open();
+				queueMicrotask(() =>
+					socket.receive(encodeWebSocketFrame({ kind: "hello-ack" })),
+				);
 				sockets.push(socket);
 				return socket;
 			},
@@ -533,6 +586,7 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		const first = await adapter.connect({
 			url: "wss://compare",
 			role: "publisher",
+			tls: TEST_CLIENT_TLS,
 			deadlineMs: 100,
 		});
 		await expect(
@@ -562,5 +616,438 @@ describe("Bun-native WebSocket comparison adapter", () => {
 		});
 		await first.close(100);
 		expect(sockets).toHaveLength(1);
+	});
+
+	test("bounds drain waiters and enforces global queued bytes", async () => {
+		let runtime: FakeServerRuntime | undefined;
+		const profile = {
+			...CANONICAL_CAPACITY_PROFILE,
+			maxQueuedBytesGlobal: 80,
+			maxQueuedBytesPerSession: 80,
+			maxQueuedBytesPerStream: 80,
+		};
+		const adapter = new WebSocketAdapter({
+			capacityProfile: profile,
+			receiveWaiterLimit: 1,
+			serverFactory: (options) => {
+				runtime = new FakeServerRuntime(options);
+				return runtime;
+			},
+			clock: {
+				nowMs: () => 0,
+				sleep: async () => new Promise<void>(() => {}),
+			},
+		});
+		const server = await adapter.startServer({
+			port: 4433,
+			role: "publisher",
+			tls: TEST_SERVER_TLS,
+		});
+		const blockedSocket = runtime?.open();
+		if (!blockedSocket) throw new Error("blocked fake socket was not opened");
+		runtime?.receive(blockedSocket, encodeHandshakeFrame("publisher"));
+		const blockedSession = await server.acceptSession(100);
+		blockedSocket.statuses.push(-1);
+		await blockedSession.sendMessage("reliable-message", message(1), 100);
+		const pendingDrain = blockedSession.sendMessage(
+			"reliable-message",
+			message(2),
+			100,
+		);
+		const drainResult = await observeBounded(pendingDrain);
+		runtime?.drain(blockedSocket);
+		const afterDrain = await observeBounded(pendingDrain);
+
+		const firstSocket = runtime?.open();
+		const secondSocket = runtime?.open();
+		if (!firstSocket || !secondSocket)
+			throw new Error("global-queue fake sockets were not opened");
+		runtime?.receive(firstSocket, encodeHandshakeFrame("publisher"));
+		runtime?.receive(secondSocket, encodeHandshakeFrame("publisher"));
+		const firstSession = await server.acceptSession(100);
+		const secondSession = await server.acceptSession(100);
+		const encoded = encodeWebSocketFrame({
+			kind: "message",
+			payload: encodeWireMessage(message(), { nowMs: 0 }),
+		});
+		runtime?.receive(firstSocket, encoded);
+		runtime?.receive(secondSocket, encoded);
+
+		expect({
+			drainResult,
+			afterDrain,
+			first: firstSession.snapshot(),
+			second: secondSession.snapshot(),
+		}).toMatchObject({
+			drainResult: {
+				kind: "rejected",
+				reason: { code: "E_QUEUE_FULL" },
+			},
+			afterDrain: {
+				kind: "rejected",
+				reason: { code: "E_QUEUE_FULL" },
+			},
+			first: { receiveQueueItems: 1, dropped: 0 },
+			second: { receiveQueueItems: 0, dropped: 1 },
+		});
+	});
+
+	test("waits for the server handshake acknowledgement and times out without one", async () => {
+		const socket = new FakeClientSocket();
+		let now = 0;
+		const adapter = new WebSocketAdapter({
+			clock: {
+				nowMs: () => now,
+				sleep: async (milliseconds) => {
+					now += milliseconds;
+				},
+			},
+			clientFactory: () => {
+				socket.open();
+				return socket;
+			},
+		});
+		const result = await observeBounded(
+			adapter.connect({
+				url: "wss://compare",
+				role: "publisher",
+				tls: TEST_CLIENT_TLS,
+				deadlineMs: 50,
+			}),
+		);
+		if (result.kind === "resolved") await result.value.close(100);
+		expect(result).toMatchObject({
+			kind: "rejected",
+			reason: { code: "E_HANDSHAKE_TIMEOUT" },
+		});
+	});
+
+	test("bounds server stop and rejects a pre-open close", async () => {
+		const adapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				const runtime = new FakeServerRuntime(options);
+				runtime.stop = () => new Promise<void>(() => {});
+				return runtime;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const server = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "cert", key: "key", serverName: "wt-compare.local" },
+		});
+		const stopResult = await observeBounded(server.stop(1));
+
+		class PreOpenCloseSocket extends FakeClientSocket {
+			override addEventListener(type: string, listener: EventListener): void {
+				super.addEventListener(type, listener);
+				if (type === "open" && this.readyState === 0)
+					this.close(1006, "closed before open");
+			}
+		}
+		const preOpen = new PreOpenCloseSocket();
+		let now = 0;
+		const preOpenAdapter = new WebSocketAdapter({
+			clock: {
+				nowMs: () => now,
+				sleep: async (milliseconds) => {
+					now += milliseconds;
+				},
+			},
+			clientFactory: () => preOpen,
+		});
+		const openResult = await observeBounded(
+			preOpenAdapter.connect({
+				url: "wss://compare",
+				role: "publisher",
+				tls: TEST_CLIENT_TLS,
+				deadlineMs: 50,
+			}),
+		);
+		expect(stopResult.kind).toBe("rejected");
+		expect(openResult.kind).toBe("rejected");
+		if (stopResult.kind === "rejected")
+			expect((stopResult.reason as WebSocketTransportError).code).toBe(
+				"E_BACKPRESSURE_TIMEOUT",
+			);
+		if (openResult.kind === "rejected")
+			expect((openResult.reason as WebSocketTransportError).code).toBe(
+				"E_SESSION_CLOSED",
+			);
+	});
+
+	test("allocates collision-free channel IDs for both endpoint roles", async () => {
+		const clientSocket = new FakeClientSocket();
+		const client = makeAdapter(clientSocket, {
+			nowMs: () => 0,
+			sleep: async () => {},
+		});
+		const clientSession = await client.connect({
+			url: "wss://compare",
+			role: "publisher",
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: 100,
+		});
+		const clientChannel = await clientSession.openBidi(100);
+
+		let runtime: FakeServerRuntime | undefined;
+		const serverAdapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				runtime = new FakeServerRuntime(options);
+				return runtime;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const server = await serverAdapter.startServer({
+			port: 4433,
+			role: "publisher",
+			tls: TEST_SERVER_TLS,
+		});
+		const socket = runtime?.open();
+		if (!socket) throw new Error("server fake socket was not opened");
+		runtime?.receive(socket, encodeHandshakeFrame("publisher"));
+		const serverSession = await server.acceptSession(100);
+		const serverChannel = await serverSession.openUni(100);
+
+		expect(clientChannel.channelId % 2).not.toBe(serverChannel.channelId % 2);
+		expect(clientChannel.channelId).not.toBe(serverChannel.channelId);
+	});
+
+	test("keeps bidi send and receive halves independent after either end closes", async () => {
+		const localSocket = new FakeClientSocket();
+		const local = makeAdapter(localSocket, {
+			nowMs: () => 0,
+			sleep: async () => {},
+		});
+		const localSession = await local.connect({
+			url: "wss://compare",
+			role: "publisher",
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: 100,
+		});
+		const localChannel = await localSession.openBidi(100);
+		await localChannel.end(100);
+		localSocket.receive(
+			encodeWebSocketFrame({
+				kind: "channel-data",
+				channelId: localChannel.channelId,
+				payload: Uint8Array.from([3]),
+			}),
+		);
+		const localRead = await observeBounded(boundedRead(localChannel, 100));
+
+		const remoteSocket = new FakeClientSocket();
+		const remote = makeAdapter(remoteSocket, {
+			nowMs: () => 0,
+			sleep: async () => {},
+		});
+		const remoteSession = await remote.connect({
+			url: "wss://compare",
+			role: "subscriber",
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: 100,
+		});
+		remoteSocket.receive(
+			encodeWebSocketFrame({ kind: "open-bidi", channelId: 12 }),
+		);
+		const remoteChannel = await remoteSession.acceptBidi(100);
+		remoteSocket.receive(
+			encodeWebSocketFrame({ kind: "channel-end", channelId: 12 }),
+		);
+		const remoteWrite = await observeBounded(
+			remoteChannel.write(Uint8Array.from([4]), 100),
+		);
+
+		expect(localRead).toMatchObject({
+			kind: "resolved",
+			value: Uint8Array.from([3]),
+		});
+		expect(remoteWrite).toMatchObject({ kind: "resolved" });
+	});
+
+	test("rolls back a channel when server send status zero refuses its open frame", async () => {
+		let runtime: FakeServerRuntime | undefined;
+		const adapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				runtime = new FakeServerRuntime(options);
+				return runtime;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const server = await adapter.startServer({
+			port: 4433,
+			role: "publisher",
+			tls: TEST_SERVER_TLS,
+		});
+		const socket = runtime?.open();
+		if (!socket) throw new Error("server fake socket was not opened");
+		runtime?.receive(socket, encodeHandshakeFrame("publisher"));
+		const session = await server.acceptSession(100);
+		socket.statuses.push(0);
+		const result = await observeBounded(session.openUni(100));
+
+		expect(result).toMatchObject({
+			kind: "rejected",
+			reason: { code: "E_QUEUE_FULL" },
+		});
+		expect(session.snapshot()).toMatchObject({
+			streamsOpened: 0,
+			streamsClosed: 1,
+		});
+	});
+
+	test("retains lifetime metrics and counts rejected sends as attempted", async () => {
+		const profile = { ...CANONICAL_CAPACITY_PROFILE, maxDatagramSize: 2 };
+		const socket = new FakeClientSocket();
+		const adapter = new WebSocketAdapter({
+			capacityProfile: profile,
+			clock: { nowMs: () => 0, sleep: async () => {} },
+			clientFactory: () => {
+				socket.open();
+				queueMicrotask(() =>
+					socket.receive(encodeWebSocketFrame({ kind: "hello-ack" })),
+				);
+				return socket;
+			},
+		});
+		const session = await adapter.connect({
+			url: "wss://compare",
+			role: "publisher",
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: 100,
+		});
+		await expect(
+			session.sendMessage("datagram", message(), 100),
+		).rejects.toMatchObject({
+			code: "E_LIMIT_EXCEEDED",
+		});
+		expect(session.snapshot()).toMatchObject({
+			sessionsOpened: 1,
+			sessionsClosed: 0,
+			attempted: 1,
+			refused: 1,
+		});
+		await session.close(100);
+		expect(session.snapshot()).toMatchObject({
+			sessionsOpened: 1,
+			sessionsClosed: 1,
+			active: false,
+		});
+	});
+
+	test("waits through the full high-to-low watermark hysteresis", async () => {
+		const socket = new FakeClientSocket();
+		socket.bufferedAmount = 10;
+		let now = 0;
+		let sleeps = 0;
+		const adapter = makeAdapter(socket, {
+			nowMs: () => now,
+			sleep: async (milliseconds) => {
+				now += milliseconds;
+				sleeps += 1;
+				socket.bufferedAmount = sleeps === 1 ? 7 : 4;
+			},
+		});
+		const session = await adapter.connect({
+			url: "wss://compare",
+			role: "publisher",
+			tls: TEST_CLIENT_TLS,
+			clientHighWaterMark: 10,
+			clientLowWaterMark: 5,
+			deadlineMs: 100,
+		});
+		await session.sendText("hysteresis", 100);
+		expect(sleeps).toBe(2);
+	});
+
+	test("requires strict custom-CA and SNI TLS on both client and server", async () => {
+		const clientAdapter = new WebSocketAdapter({
+			clock: { nowMs: () => 0, sleep: async () => {} },
+			clientFactory: () => {
+				const socket = new FakeClientSocket();
+				socket.open();
+				return socket;
+			},
+		});
+		const missingCa = await observeBounded(
+			clientAdapter.connect({
+				url: "wss://compare",
+				role: "publisher",
+				tls: { serverName: "wt-compare.local", rejectUnauthorized: true },
+				deadlineMs: 100,
+			}),
+		);
+		const missingSni = await observeBounded(
+			clientAdapter.connect({
+				url: "wss://compare",
+				role: "publisher",
+				tls: { ca: "CA", rejectUnauthorized: true },
+				deadlineMs: 100,
+			}),
+		);
+
+		let runtime: FakeServerRuntime | undefined;
+		const serverAdapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				runtime = new FakeServerRuntime(options);
+				return runtime;
+			},
+		});
+		const missingServerSni = await observeBounded(
+			serverAdapter.startServer({
+				port: 4433,
+				tls: { cert: "cert", key: "key" },
+			}),
+		);
+
+		expect([missingCa, missingSni, missingServerSni]).toMatchObject([
+			{ kind: "rejected", reason: { code: "E_TLS" } },
+			{ kind: "rejected", reason: { code: "E_TLS" } },
+			{ kind: "rejected", reason: { code: "E_TLS" } },
+		]);
+	});
+
+	test("uses one active submitted capacity profile and rejects divergent starts", async () => {
+		const makeServerAdapter = () =>
+			new WebSocketAdapter({
+				serverFactory: (options) => new FakeServerRuntime(options),
+			});
+		const adapter = makeServerAdapter();
+		const first = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "cert", key: "key", serverName: "wt-compare.local" },
+		});
+		const second = await observeBounded(
+			adapter.startServer({
+				port: 4434,
+				tls: { cert: "cert", key: "key", serverName: "wt-compare.local" },
+			}),
+		);
+		const divergent = await observeBounded(
+			makeServerAdapter().startServer({
+				port: 4433,
+				tls: { cert: "cert", key: "key", serverName: "wt-compare.local" },
+				capacityProfile: {
+					...CANONICAL_CAPACITY_PROFILE,
+					maxSessions: CANONICAL_CAPACITY_PROFILE.maxSessions - 1,
+				},
+			}),
+		);
+
+		expect({
+			submitted: adapter.submittedCapacityProfile.profile,
+			second,
+			divergent,
+		}).toMatchObject({
+			submitted: CANONICAL_CAPACITY_PROFILE,
+			second: {
+				kind: "rejected",
+				reason: { code: "E_LIMIT_EXCEEDED" },
+			},
+			divergent: {
+				kind: "rejected",
+				reason: { code: "E_LIMIT_EXCEEDED" },
+			},
+		});
+		await first.stop(100);
 	});
 });
