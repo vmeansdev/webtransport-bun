@@ -11,6 +11,11 @@ export const MAX_PAYLOAD_BASE64_LENGTH =
 export const MAX_ARTIFACT_KEYS = 256;
 export const MAX_ARTIFACT_DEPTH = 32;
 export const MAX_ARTIFACT_SAMPLES = 100_000;
+export const MAX_ARTIFACT_NODES = 200_000;
+export const MAX_ARTIFACT_EDGES = 400_000;
+export const MAX_ARTIFACT_KEY_BYTES = 256 * 1024;
+export const MAX_ARTIFACT_STRING_BYTES = 4 * 1024 * 1024;
+export const MAX_REPORTED_REJECTIONS = 128;
 export const MIN_EFFECTIVE_CHILD_NOFILE = 65_536;
 export const EXPECTED_MAC_ADDRESS = "10.99.0.1";
 export const EXPECTED_LINUX_ADDRESS = "10.99.0.2";
@@ -23,6 +28,7 @@ export const EXPECTED_SMOKE_INPUT = "https://10.99.0.2:4433";
 export type EvidenceStatus = "PASS" | "FAIL" | "BLOCKED";
 export type ScenarioVerdict = "PASS" | "MISS" | "NO_VERDICT";
 export type Transport = "ws" | "wt";
+export type ArtifactKind = "measured" | "test-fixture";
 export type MetricUnit =
 	| "ms"
 	| "bytes"
@@ -38,6 +44,108 @@ export type MetricClockDomain =
 	| "mac-monotonic"
 	| "linux-monotonic"
 	| "independent-offset";
+export type MetricDirection = "higher" | "lower";
+
+export interface MetricContract {
+	readonly id: string;
+	readonly name: string;
+	readonly unit: MetricUnit;
+	readonly metricKind: MetricKind;
+	readonly direction: MetricDirection;
+	readonly minimum: number;
+	readonly maximum?: number;
+}
+
+/**
+ * Task 3 owns the primary metric vocabulary.  Keeping this table local to the
+ * verifier prevents a producer from renaming a metric while retaining the
+ * wrong clock or ranking semantics.
+ */
+export const PRIMARY_METRIC_CONTRACTS: Readonly<
+	Record<string, MetricContract>
+> = Object.freeze({
+	"chat-fanout": {
+		id: "chat-fanout.primary.v1",
+		name: "delivered-messages-per-second",
+		unit: "count",
+		metricKind: "mac-local-end-to-end",
+		direction: "higher",
+		minimum: 0,
+	},
+	"ticker-fanout": {
+		id: "ticker-fanout.primary.v1",
+		name: "delivered-updates-per-second",
+		unit: "count",
+		metricKind: "linux-local-service",
+		direction: "higher",
+		minimum: 0,
+	},
+	"game-tick-loss": {
+		id: "game-tick-loss.primary.v1",
+		name: "delivery-percent",
+		unit: "percent",
+		metricKind: "mac-local-end-to-end",
+		direction: "higher",
+		minimum: 0,
+		maximum: 100,
+	},
+	"reconnect-storm": {
+		id: "reconnect-storm.primary.v1",
+		name: "recovery-time-ms",
+		unit: "ms",
+		metricKind: "mac-local-end-to-end",
+		direction: "lower",
+		minimum: 0,
+	},
+	"handshake-matrix": {
+		id: "handshake-matrix.primary.v1",
+		name: "first-message-latency-ms",
+		unit: "ms",
+		metricKind: "mac-local-end-to-end",
+		direction: "lower",
+		minimum: 0,
+	},
+	"connection-memory": {
+		id: "connection-memory.primary.v1",
+		name: "rss-bytes-per-connection",
+		unit: "bytes",
+		metricKind: "mac-local-end-to-end",
+		direction: "lower",
+		minimum: 0,
+	},
+	"crdt-sync": {
+		id: "crdt-sync.primary.v1",
+		name: "applied-unique-ops-per-second",
+		unit: "count",
+		metricKind: "mac-local-end-to-end",
+		direction: "higher",
+		minimum: 0,
+	},
+	"ai-token-stream": {
+		id: "ai-token-stream.primary.v1",
+		name: "inter-token-latency-ms",
+		unit: "ms",
+		metricKind: "mac-local-end-to-end",
+		direction: "lower",
+		minimum: 0,
+	},
+	"bulk-one-way": {
+		id: "bulk-one-way.primary.v1",
+		name: "application-throughput-mbps",
+		unit: "Mbps",
+		metricKind: "mac-local-end-to-end",
+		direction: "higher",
+		minimum: 0,
+	},
+	"tail-under-cross-traffic": {
+		id: "tail-under-cross-traffic.primary.v1",
+		name: "control-latency-ms",
+		unit: "ms",
+		metricKind: "mac-local-end-to-end",
+		direction: "lower",
+		minimum: 0,
+	},
+});
 
 export type ArtifactRejectionCode =
 	| "ARTIFACT_BYTES_INVALID"
@@ -49,6 +157,13 @@ export type ArtifactRejectionCode =
 	| "SCHEMA_UNKNOWN_FIELD"
 	| "SCHEMA_OWN_FIELD_REQUIRED"
 	| "SCHEMA_INVALID_FIELD"
+	| "SCHEMA_RESOURCE_LIMIT"
+	| "REJECTIONS_CAPPED"
+	| "TRUST_CONTEXT_MISSING"
+	| "TRUST_CONTEXT_INVALID"
+	| "TRUST_ANCHOR_MISMATCH"
+	| "ARTIFACT_KIND_INVALID"
+	| "ARTIFACT_FIXTURE_NOT_PROMOTABLE"
 	| "SOURCE_UNBOUND"
 	| "SOURCE_SHA_INVALID"
 	| "SOURCE_SHA_MISMATCH"
@@ -118,8 +233,14 @@ export type ArtifactRejectionCode =
 	| "METRICS_SAMPLE_INVALID"
 	| "METRICS_SAMPLES_SPARSE"
 	| "METRICS_PERCENTILES_INVALID"
+	| "METRICS_CONTRACT_INVALID"
+	| "METRICS_ARITHMETIC_INVALID"
 	| "CLOCK_PROVENANCE_INVALID"
 	| "CLOCK_PROVENANCE_MISMATCH"
+	| "EVIDENCE_RUNTIME_INVALID"
+	| "EVIDENCE_PROCESS_PROOF_INVALID"
+	| "EVIDENCE_LEDGER_INVALID"
+	| "EVIDENCE_TELEMETRY_INVALID"
 	| "STATUS_CONTRADICTION"
 	| "COMPARISON_INCOMPATIBLE"
 	| "SCENARIO_BINDING_MISMATCH"
@@ -316,6 +437,61 @@ export interface MetricsEvidence {
 	};
 }
 
+export interface RuntimeEvidence {
+	mac: { cpu: string; bun: string; identity: string };
+	linux: { cpu: string; bun: string; identity: string };
+}
+
+export interface ProcessProofEvidence {
+	rolePlanHash: string;
+	macRoles: ReadonlyArray<{
+		role: string;
+		count: number;
+		processModel: string;
+	}>;
+	linuxRole: string;
+	sharding: {
+		role: string;
+		workerCount: number;
+		strategy: string;
+		shards: ReadonlyArray<{
+			workerIndex: number;
+			clientIds: ReadonlyArray<number>;
+		}>;
+	};
+	processCohort: {
+		kind: string;
+		processes: number;
+		primeBeforeMeasurement: boolean;
+		measuredCycles: number;
+	};
+}
+
+export interface TransportLedgerEvidence {
+	attempted: number;
+	queued: number;
+	serverObserved: number;
+	acknowledged: number;
+	delivered: number;
+	expired: number;
+	dropped: number;
+	histogram: {
+		unit: MetricUnit;
+		boundaries: number[];
+		counts: number[];
+	};
+}
+
+export interface HostTelemetryEvidence {
+	cpuPercent: number;
+	rssBytes: number;
+}
+
+export interface TelemetryEvidence {
+	mac: HostTelemetryEvidence;
+	linux: HostTelemetryEvidence;
+}
+
 export interface RawSidecarDigests {
 	client: string;
 	server: string;
@@ -327,6 +503,7 @@ export interface RawSidecarDigests {
 export interface RunArtifact {
 	schemaVersion: "v1";
 	artifactByteSha256: string;
+	artifactKind: ArtifactKind;
 	comparisonId: string;
 	runId: string;
 	transport: Transport;
@@ -343,8 +520,26 @@ export interface RunArtifact {
 	capacity: CapacityEvidence;
 	capacityProof: CapacityProof;
 	metrics: MetricsEvidence;
+	metricContractId: string;
+	metricContractHash: string;
+	runtime: RuntimeEvidence;
+	processProof: ProcessProofEvidence;
+	ledger: TransportLedgerEvidence;
+	telemetry: TelemetryEvidence;
 	rawSidecarDigests: RawSidecarDigests;
 	rawSidecarBindingSha256: string;
+}
+
+export interface ArtifactTrustContext {
+	readonly comparisonId: string;
+	readonly runId: string;
+	readonly transport: Transport;
+	readonly sourceSha: string;
+	readonly archiveSha256: string;
+	readonly executableSha256: string;
+	readonly toolchain: { readonly identity: string; readonly sha256: string };
+	readonly rawSidecarDigests: RawSidecarDigests;
+	readonly artifactByteSha256?: string;
 }
 
 export interface ArtifactVerification {
@@ -352,9 +547,34 @@ export interface ArtifactVerification {
 	readonly rejections: readonly ArtifactRejection[];
 	readonly artifact?: RunArtifact;
 	readonly artifactByteSha256?: string;
+	readonly artifactKind?: ArtifactKind;
 }
 
 export type ArtifactBytes = ArrayBufferView | ArrayBuffer | string;
+
+export function metricContractForScenario(
+	scenarioId: unknown,
+): MetricContract | undefined {
+	return typeof scenarioId === "string"
+		? PRIMARY_METRIC_CONTRACTS[scenarioId]
+		: undefined;
+}
+
+export function metricContractHash(contract: MetricContract): string {
+	return sha256Canonical(contract);
+}
+
+export function balancedArmOrder(
+	seed: number,
+	repetitionIndex: number,
+): readonly [Transport, Transport, Transport, Transport] {
+	const parity =
+		Number.parseInt(
+			sha256Bytes(textEncoder.encode(`${seed}:${repetitionIndex}`))[0] ?? "0",
+			16,
+		) & 1;
+	return parity === 0 ? ["ws", "wt", "wt", "ws"] : ["wt", "ws", "ws", "wt"];
+}
 
 const HEX_40 = /^[0-9a-f]{40}$/;
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -441,39 +661,82 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return prototype === objectPrototype || prototype === null;
 }
 
-/**
- * Snapshot an untrusted object exactly once per own property.  Verification
- * never keeps a reference to a caller-owned object, so getters and prototype
- * mutation cannot create a time-of-check/time-of-use gap.
- */
-export function snapshotEvidenceValue(
+interface SnapshotContext {
+	readonly seen: WeakSet<object>;
+	nodes: number;
+	edges: number;
+	keyBytes: number;
+	stringBytes: number;
+	outputBytes: number;
+}
+
+function newSnapshotContext(): SnapshotContext {
+	return {
+		seen: new WeakSet<object>(),
+		nodes: 0,
+		edges: 0,
+		keyBytes: 0,
+		stringBytes: 0,
+		outputBytes: 0,
+	};
+}
+
+function snapshotStringLimit(path: string): number {
+	return path === "$.scenario.payload.data"
+		? MAX_PAYLOAD_BASE64_LENGTH
+		: MAX_ARTIFACT_STRING_LENGTH;
+}
+
+function snapshotValue(
 	value: unknown,
-	path = "$",
-	depth = 0,
+	path: string,
+	depth: number,
+	context: SnapshotContext,
 ): unknown {
 	if (depth > MAX_ARTIFACT_DEPTH)
 		invalid(`${path} exceeds maximum nesting depth`);
-	if (value === null) return null;
+	if (value === null) {
+		context.outputBytes += 4;
+		return null;
+	}
 	if (typeof value === "string") {
-		const maximumLength =
-			path === "$.scenario.payload.data"
-				? MAX_PAYLOAD_BASE64_LENGTH
-				: MAX_ARTIFACT_STRING_LENGTH;
-		if (value.length > maximumLength) invalid(`${path} string is too long`);
+		const maximumLength = snapshotStringLimit(path);
+		const stringBytes = textEncoder.encode(value).byteLength;
+		if (value.length > maximumLength || stringBytes > MAX_ARTIFACT_STRING_BYTES)
+			invalid(`${path} string is too long`);
+		context.stringBytes += stringBytes;
+		context.outputBytes += stringBytes + 2;
+		if (context.stringBytes > MAX_ARTIFACT_STRING_BYTES)
+			invalid(`${path} exceeds the string byte budget`);
 		return value;
 	}
-	if (typeof value === "boolean") return value;
+	if (typeof value === "boolean") {
+		context.outputBytes += value ? 4 : 5;
+		return value;
+	}
 	if (typeof value === "number") {
 		if (!Number.isFinite(value)) invalid(`${path} must be finite`);
+		context.outputBytes += 24;
 		return value;
 	}
 	if (typeof value !== "object") invalid(`${path} has unsupported type`);
+	if (context.seen.has(value))
+		invalid(`${path} contains a cycle or repeated shared reference`);
+	context.seen.add(value);
+	context.nodes += 1;
+	if (context.nodes > MAX_ARTIFACT_NODES)
+		invalid(`${path} exceeds the node budget`);
 
 	if (Array.isArray(value)) {
-		const descriptors = Object.getOwnPropertyDescriptors(value) as Record<
-			string,
-			PropertyDescriptor
-		>;
+		let descriptors: Record<string, PropertyDescriptor>;
+		try {
+			descriptors = Object.getOwnPropertyDescriptors(value) as Record<
+				string,
+				PropertyDescriptor
+			>;
+		} catch {
+			invalid(`${path} cannot be snapshotted`);
+		}
 		const lengthDescriptor = descriptors.length;
 		if (!lengthDescriptor) invalid(`${path} array length must be own`);
 		const rawLength = ownDescriptorValue(value, lengthDescriptor);
@@ -482,10 +745,12 @@ export function snapshotEvidenceValue(
 			!Number.isSafeInteger(rawLength) ||
 			rawLength < 0 ||
 			rawLength > MAX_ARTIFACT_SAMPLES
-		) {
+		)
 			invalid(`${path} array length is invalid`);
-		}
 		const length = rawLength as number;
+		context.edges += length;
+		if (context.edges > MAX_ARTIFACT_EDGES)
+			invalid(`${path} exceeds the edge budget`);
 		for (const key of Reflect.ownKeys(descriptors)) {
 			if (key === "length") continue;
 			if (typeof key !== "string" || !/^\d+$/.test(key))
@@ -496,19 +761,20 @@ export function snapshotEvidenceValue(
 				index < 0 ||
 				index >= length ||
 				String(index) !== key
-			) {
+			)
 				invalid(`${path} has an invalid array index`);
-			}
 		}
 		const output: unknown[] = [];
+		context.outputBytes += 2;
 		for (let index = 0; index < length; index += 1) {
 			const descriptor = descriptors[String(index)];
 			if (!descriptor) invalid(`${path} is sparse at index ${index}`);
 			output.push(
-				snapshotEvidenceValue(
+				snapshotValue(
 					ownDescriptorValue(value, descriptor),
 					`${path}[${index}]`,
 					depth + 1,
+					context,
 				),
 			);
 		}
@@ -516,28 +782,70 @@ export function snapshotEvidenceValue(
 	}
 
 	if (!isPlainObject(value)) invalid(`${path} must be a plain object`);
-	const descriptors = Object.getOwnPropertyDescriptors(value);
+	let descriptors: Record<string, PropertyDescriptor>;
+	try {
+		descriptors = Object.getOwnPropertyDescriptors(value);
+	} catch {
+		invalid(`${path} cannot be snapshotted`);
+	}
 	const keys = Reflect.ownKeys(descriptors);
 	if (keys.length > MAX_ARTIFACT_KEYS) invalid(`${path} has too many fields`);
 	const output: Record<string, unknown> = Object.create(null) as Record<
 		string,
 		unknown
 	>;
+	context.outputBytes += 2;
 	for (const key of keys) {
 		if (typeof key !== "string") invalid(`${path} has a symbol field`);
+		const keyBytes = textEncoder.encode(key).byteLength;
+		if (
+			key.length > MAX_ARTIFACT_STRING_LENGTH ||
+			keyBytes > MAX_ARTIFACT_STRING_LENGTH
+		)
+			invalid(`${path}.${key} key is too long`);
+		context.keyBytes += keyBytes;
+		context.outputBytes += keyBytes + 4;
+		if (context.keyBytes > MAX_ARTIFACT_KEY_BYTES)
+			invalid(`${path} exceeds the key byte budget`);
 		const descriptor = descriptors[key];
 		if (!descriptor) invalid(`${path}.${key} descriptor is missing`);
 		const propertyValue = ownDescriptorValue(value, descriptor);
-		// JSON has no undefined value.  Treat an explicitly undefined field as
+		// JSON has no undefined value. Treat an explicitly undefined field as
 		// absent so the schema layer can emit the stable missing-own-field code.
 		if (propertyValue === undefined) continue;
-		output[key] = snapshotEvidenceValue(
+		context.edges += 1;
+		if (context.edges > MAX_ARTIFACT_EDGES)
+			invalid(`${path} exceeds the edge budget`);
+		output[key] = snapshotValue(
 			propertyValue,
 			`${path}.${key}`,
 			depth + 1,
+			context,
 		);
 	}
 	return output;
+}
+
+/** Snapshot an untrusted value through one shared, bounded traversal. */
+export function snapshotEvidenceValue(
+	value: unknown,
+	path = "$",
+	depth = 0,
+): unknown {
+	const context = newSnapshotContext();
+	const snapshot = snapshotValue(value, path, depth, context);
+	try {
+		if (
+			textEncoder.encode(canonicalJson(snapshot)).byteLength >
+			MAX_ARTIFACT_BYTES
+		)
+			invalid("snapshot canonical output exceeds the artifact byte budget");
+	} catch {
+		invalid("snapshot canonical output is invalid");
+	}
+	if (context.outputBytes > MAX_ARTIFACT_BYTES)
+		invalid("snapshot output exceeds the artifact byte budget");
+	return snapshot;
 }
 
 function bytesFromInput(input: ArtifactBytes): Uint8Array {
@@ -756,7 +1064,13 @@ function findTopLevelStringValue(
 				after = skipWhitespace(text, after + 1);
 				if (key === field) {
 					count += 1;
-					if (text[after] === '"' && located === undefined) {
+					// The self-digest field is intentionally stricter than ordinary
+					// JSON: only an unescaped literal key and value are maskable.
+					if (
+						keyText === `"${field}"` &&
+						text[after] === '"' &&
+						located === undefined
+					) {
 						const valueStart = after + 1;
 						let valueIndex = valueStart;
 						let valueEscaped = false;
@@ -773,11 +1087,13 @@ function findTopLevelStringValue(
 								continue;
 							}
 							if (current === '"') {
-								const value: unknown = JSON.parse(
-									text.slice(after, valueIndex + 1),
-								);
-								if (typeof value === "string")
-									located = { start: valueStart, end: valueIndex, value };
+								const value = text.slice(valueStart, valueIndex);
+								if (value.length === 64 && HEX_64.test(value))
+									located = {
+										start: valueStart,
+										end: valueIndex,
+										value,
+									};
 								break;
 							}
 							valueIndex += 1;
@@ -884,13 +1200,36 @@ export function addRejection(
 	reason: string,
 	path?: string,
 ): void {
-	if (
-		rejections.some(
-			(rejection) => rejection.code === code && rejection.path === path,
-		)
-	)
+	const state = rejectionStates.get(rejections) ?? {
+		keys: new Set<string>(),
+		capped: false,
+	};
+	if (!rejectionStates.has(rejections)) {
+		for (const rejection of rejections)
+			state.keys.add(`${rejection.code}\u0000${rejection.path ?? ""}`);
+		rejectionStates.set(rejections, state);
+	}
+	const key = `${code}\u0000${path ?? ""}`;
+	if (state.keys.has(key)) return;
+	if (rejections.length >= MAX_REPORTED_REJECTIONS) {
+		if (!state.capped) {
+			state.capped = true;
+			state.keys.add("REJECTIONS_CAPPED\u0000$");
+			rejections.push({
+				code: "REJECTIONS_CAPPED",
+				reason: "additional evidence rejections were capped",
+				path: "$",
+			});
+		}
 		return;
+	}
+	state.keys.add(key);
 	rejections.push(
 		path === undefined ? { code, reason } : { code, reason, path },
 	);
 }
+
+const rejectionStates = new WeakMap<
+	ArtifactRejection[],
+	{ readonly keys: Set<string>; capped: boolean }
+>();

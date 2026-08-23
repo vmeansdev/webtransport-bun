@@ -5,10 +5,12 @@ import {
 	type ArtifactBytes,
 	type ArtifactRejection,
 	type ArtifactRejectionCode,
+	type ArtifactTrustContext,
 	type ArtifactVerification,
 	addRejection,
 	artifactByteSha256,
 	artifactInputBytes,
+	balancedArmOrder,
 	EVIDENCE_SCHEMA_VERSION,
 	EXPECTED_LINUX_ADDRESS,
 	EXPECTED_LINUX_INTERFACE,
@@ -27,6 +29,8 @@ import {
 	MAX_PAYLOAD_BASE64_LENGTH,
 	MAX_SUPPORTED_PAYLOAD_BYTES,
 	MIN_EFFECTIVE_CHILD_NOFILE,
+	metricContractForScenario,
+	metricContractHash,
 	type RunArtifact,
 	snapshotEvidenceValue,
 } from "./evidence.ts";
@@ -69,6 +73,7 @@ const EXPECTED_SOURCE_KEYS = [
 const EXPECTED_TOP_LEVEL_KEYS = [
 	"schemaVersion",
 	"artifactByteSha256",
+	"artifactKind",
 	"comparisonId",
 	"runId",
 	"transport",
@@ -85,6 +90,12 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"capacity",
 	"capacityProof",
 	"metrics",
+	"metricContractId",
+	"metricContractHash",
+	"runtime",
+	"processProof",
+	"ledger",
+	"telemetry",
 	"rawSidecarDigests",
 	"rawSidecarBindingSha256",
 ] as const;
@@ -115,6 +126,103 @@ function field(
 	key: string,
 ): unknown {
 	return value && Object.hasOwn(value, key) ? value[key] : undefined;
+}
+
+function verifyTrustContext(
+	value: unknown,
+	artifact: Record<string, unknown>,
+	rejections: ArtifactRejection[],
+): void {
+	let context: Record<string, unknown> | undefined;
+	if (value !== undefined) {
+		try {
+			context = record(snapshotEvidenceValue(value));
+		} catch {
+			addRejection(
+				rejections,
+				"TRUST_CONTEXT_INVALID",
+				"verification context cannot be safely snapshotted",
+				"$.verificationContext",
+			);
+			return;
+		}
+	}
+	if (!context) {
+		addRejection(
+			rejections,
+			"TRUST_CONTEXT_MISSING",
+			"external source/run/comparison trust anchors are required",
+			"$.verificationContext",
+		);
+		return;
+	}
+	const transport = field(artifact, "transport");
+	const expected = [
+		"comparisonId",
+		"runId",
+		"transport",
+		"sourceSha",
+		"archiveSha256",
+		"executableSha256",
+		"toolchain",
+		"rawSidecarDigests",
+	];
+	requireKeys(context, expected, "$.verificationContext", rejections);
+	const checks: readonly [string, unknown, unknown][] = [
+		[
+			"comparisonId",
+			field(context, "comparisonId"),
+			field(artifact, "comparisonId"),
+		],
+		["runId", field(context, "runId"), field(artifact, "runId")],
+		["transport", field(context, "transport"), transport],
+		[
+			"sourceSha",
+			field(context, "sourceSha"),
+			field(record(field(artifact, "source")), "sourceSha"),
+		],
+		[
+			"archiveSha256",
+			field(context, "archiveSha256"),
+			field(record(field(artifact, "source")), "archiveSha256"),
+		],
+		[
+			"executableSha256",
+			field(context, "executableSha256"),
+			field(record(field(artifact, "source")), "executableSha256"),
+		],
+		[
+			"toolchain",
+			field(context, "toolchain"),
+			field(record(field(artifact, "source")), "toolchain"),
+		],
+		[
+			"rawSidecarDigests",
+			field(context, "rawSidecarDigests"),
+			field(artifact, "rawSidecarDigests"),
+		],
+	];
+	for (const [name, expectedValue, actualValue] of checks) {
+		if (!compareCanonical(expectedValue, actualValue))
+			addRejection(
+				rejections,
+				"TRUST_ANCHOR_MISMATCH",
+				`verification context ${name} does not match the artifact`,
+				`$.verificationContext.${name}`,
+			);
+	}
+	const expectedArtifactDigest = field(context, "artifactByteSha256");
+	if (
+		expectedArtifactDigest !== undefined &&
+		(!isSha256(expectedArtifactDigest) ||
+			expectedArtifactDigest !== field(artifact, "artifactByteSha256"))
+	)
+		addRejection(
+			rejections,
+			"TRUST_ANCHOR_MISMATCH",
+			"verification context artifact digest does not match",
+			"$.verificationContext.artifactByteSha256",
+		);
 }
 
 function requireKeys(
@@ -323,6 +431,14 @@ function verifyIdentity(
 			"SCHEMA_INVALID_FIELD",
 			"armKind must be primary",
 			"$.armKind",
+		);
+	const artifactKind = field(artifact, "artifactKind");
+	if (artifactKind !== "measured" && artifactKind !== "test-fixture")
+		addRejection(
+			rejections,
+			"ARTIFACT_KIND_INVALID",
+			"artifactKind must be measured or test-fixture",
+			"$.artifactKind",
 		);
 }
 
@@ -819,12 +935,18 @@ function verifyScenario(
 			);
 	}
 	const armOrder = field(scenario, "armOrder");
+	const seed = field(scenario, "seed");
+	const repetitionIndex = field(record(field(scenario, "repetition")), "index");
+	const expectedArmOrder =
+		typeof seed === "number" && typeof repetitionIndex === "number"
+			? balancedArmOrder(seed, repetitionIndex)
+			: undefined;
 	if (
 		!Array.isArray(armOrder) ||
 		armOrder.length !== 4 ||
 		!armOrder.every((arm) => arm === "ws" || arm === "wt") ||
-		(armOrder.join(",") !== "ws,wt,wt,ws" &&
-			armOrder.join(",") !== "wt,ws,ws,wt")
+		!expectedArmOrder ||
+		armOrder.join(",") !== expectedArmOrder.join(",")
 	)
 		addRejection(
 			rejections,
@@ -1338,13 +1460,37 @@ function verifyAdmissionCounters(
 			typeof attempted === "number" &&
 			typeof accepted === "number" &&
 			typeof rejected === "number" &&
-			accepted + rejected > attempted
+			accepted + rejected !== attempted
 		)
 			addRejection(
 				rejections,
 				"CAPACITY_ADMISSION_COUNTER_INVALID",
-				`${section}.accepted plus rejected cannot exceed attempted`,
+				`${section}.accepted plus rejected must equal attempted`,
 				`$.capacity.admissionCounters.${section}`,
+			);
+		const rateLimited = field(item, "rateLimited");
+		if (
+			typeof rateLimited === "number" &&
+			typeof rejected === "number" &&
+			rateLimited > rejected
+		)
+			addRejection(
+				rejections,
+				"CAPACITY_ADMISSION_COUNTER_INVALID",
+				`${section}.rateLimited cannot exceed rejected`,
+				`$.capacity.admissionCounters.${section}.rateLimited`,
+			);
+		if (
+			section === "sessions" &&
+			typeof field(item, "activePeak") === "number" &&
+			typeof accepted === "number" &&
+			(field(item, "activePeak") as number) > accepted
+		)
+			addRejection(
+				rejections,
+				"CAPACITY_ADMISSION_COUNTER_INVALID",
+				"sessions.activePeak cannot exceed sessions.accepted",
+				"$.capacity.admissionCounters.sessions.activePeak",
 			);
 	}
 }
@@ -1494,6 +1640,7 @@ function verifyCapacityProof(
 			typeof free === "number" &&
 			typeof required === "number" &&
 			(start < 1 ||
+				end > 65_535 ||
 				end <= start ||
 				free < 0 ||
 				required <= 0 ||
@@ -1522,7 +1669,11 @@ function verifyCapacityProof(
 	}
 }
 
-function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
+function verifyMetrics(
+	value: unknown,
+	rejections: ArtifactRejection[],
+	scenarioId?: unknown,
+): void {
 	const metrics = record(value);
 	requireKeys(
 		metrics,
@@ -1535,6 +1686,26 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 	stringField(metricName, "$.metrics.name", rejections, {
 		nonEmpty: true,
 	});
+	const contract = metricContractForScenario(scenarioId);
+	if (!contract) {
+		addRejection(
+			rejections,
+			"METRICS_CONTRACT_INVALID",
+			"scenario has no primary metric contract",
+			"$.metrics",
+		);
+	} else if (
+		metricName !== contract.name ||
+		field(metrics, "unit") !== contract.unit ||
+		field(metrics, "metricKind") !== contract.metricKind
+	) {
+		addRejection(
+			rejections,
+			"METRICS_CONTRACT_INVALID",
+			"metric name, unit, and clock kind must match the primary contract",
+			"$.metrics",
+		);
+	}
 	const metricKind = field(metrics, "metricKind");
 	const clock = record(field(metrics, "clock"));
 	if (!EXPECTED_METRIC_KINDS.includes(metricKind as never))
@@ -1640,7 +1811,9 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 			"$.metrics.unit",
 		);
 	const samples = field(metrics, "samples");
+	let samplesValid = true;
 	if (!Array.isArray(samples)) {
+		samplesValid = false;
 		addRejection(
 			rejections,
 			"METRICS_SAMPLE_INVALID",
@@ -1648,6 +1821,7 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 			"$.metrics.samples",
 		);
 	} else if (samples.length === 0) {
+		samplesValid = false;
 		addRejection(
 			rejections,
 			"METRICS_SAMPLES_EMPTY",
@@ -1655,6 +1829,7 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 			"$.metrics.samples",
 		);
 	} else if (samples.length > MAX_ARTIFACT_SAMPLES) {
+		samplesValid = false;
 		addRejection(
 			rejections,
 			"METRICS_SAMPLE_INVALID",
@@ -1664,6 +1839,7 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 	} else {
 		for (let index = 0; index < samples.length; index += 1) {
 			if (!Object.hasOwn(samples, index)) {
+				samplesValid = false;
 				addRejection(
 					rejections,
 					"METRICS_SAMPLES_SPARSE",
@@ -1679,13 +1855,28 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 					rejections,
 				) ||
 				(samples[index] as number) < 0
-			)
+			) {
+				samplesValid = false;
 				addRejection(
 					rejections,
 					"METRICS_SAMPLE_INVALID",
 					"metrics.samples must contain finite non-negative numbers",
 					`$.metrics.samples[${index}]`,
 				);
+			} else if (
+				contract &&
+				((samples[index] as number) < contract.minimum ||
+					(contract.maximum !== undefined &&
+						(samples[index] as number) > contract.maximum))
+			) {
+				samplesValid = false;
+				addRejection(
+					rejections,
+					"METRICS_CONTRACT_INVALID",
+					"metric sample is outside the primary contract bounds",
+					`$.metrics.samples[${index}]`,
+				);
+			}
 		}
 	}
 	const percentiles = record(field(metrics, "percentiles"));
@@ -1695,16 +1886,24 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 		"$.metrics.percentiles",
 		rejections,
 	);
+	if (!percentiles || !Array.isArray(samples) || !samplesValid) return;
 	if (
-		!percentiles ||
-		!Array.isArray(samples) ||
-		samples.length === 0 ||
-		samples.some(
-			(sample) =>
-				typeof sample !== "number" || !Number.isFinite(sample) || sample < 0,
-		)
+		contract &&
+		["p50", "p95", "p99"].some((key) => {
+			const candidate = field(percentiles, key);
+			return (
+				typeof candidate !== "number" ||
+				candidate < contract.minimum ||
+				(contract.maximum !== undefined && candidate > contract.maximum)
+			);
+		})
 	)
-		return;
+		addRejection(
+			rejections,
+			"METRICS_CONTRACT_INVALID",
+			"metric percentile is outside the primary contract bounds",
+			"$.metrics.percentiles",
+		);
 	if (
 		!percentiles ||
 		!finiteNumber(
@@ -1765,6 +1964,295 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 		);
 }
 
+function verifyMetricContract(
+	artifact: Record<string, unknown>,
+	scenarioCell: ReturnType<typeof getScenarioCell> | undefined,
+	rejections: ArtifactRejection[],
+): void {
+	const contract = metricContractForScenario(scenarioCell?.scenarioId);
+	const id = field(artifact, "metricContractId");
+	const hash = field(artifact, "metricContractHash");
+	if (
+		!contract ||
+		typeof id !== "string" ||
+		id !== contract.id ||
+		!isSha256(hash) ||
+		hash !== metricContractHash(contract)
+	)
+		addRejection(
+			rejections,
+			"METRICS_CONTRACT_INVALID",
+			"metric contract identity/hash does not match the canonical scenario",
+			"$.metricContractHash",
+		);
+}
+
+function verifyRuntime(value: unknown, rejections: ArtifactRejection[]): void {
+	const runtime = record(value);
+	requireKeys(runtime, ["mac", "linux"], "$.runtime", rejections);
+	for (const host of ["mac", "linux"] as const) {
+		const item = record(field(runtime, host));
+		requireKeys(
+			item,
+			["cpu", "bun", "identity"],
+			`$.runtime.${host}`,
+			rejections,
+		);
+		if (!item) continue;
+		for (const key of ["cpu", "bun", "identity"] as const) {
+			if (
+				!stringField(field(item, key), `$.runtime.${host}.${key}`, rejections, {
+					nonEmpty: true,
+				})
+			)
+				addRejection(
+					rejections,
+					"EVIDENCE_RUNTIME_INVALID",
+					"runtime identity fields must be non-empty strings",
+					`$.runtime.${host}.${key}`,
+				);
+		}
+	}
+}
+
+function verifyProcessProof(
+	value: unknown,
+	scenarioCell: ReturnType<typeof getScenarioCell> | undefined,
+	rejections: ArtifactRejection[],
+): void {
+	const proof = record(value);
+	requireKeys(
+		proof,
+		["rolePlanHash", "macRoles", "linuxRole", "sharding", "processCohort"],
+		"$.processProof",
+		rejections,
+	);
+	if (!proof || !scenarioCell) return;
+	const rolePlan = scenarioCell.rolePlan;
+	if (
+		!isSha256(field(proof, "rolePlanHash")) ||
+		field(proof, "rolePlanHash") !== sha256Canonical(rolePlan)
+	)
+		addRejection(
+			rejections,
+			"EVIDENCE_PROCESS_PROOF_INVALID",
+			"process proof is not bound to the canonical role plan",
+			"$.processProof.rolePlanHash",
+		);
+	if (!compareCanonical(field(proof, "macRoles"), rolePlan.macRoles))
+		addRejection(
+			rejections,
+			"EVIDENCE_PROCESS_PROOF_INVALID",
+			"Mac process roles do not match the canonical role plan",
+			"$.processProof.macRoles",
+		);
+	if (field(proof, "linuxRole") !== rolePlan.linuxRole)
+		addRejection(
+			rejections,
+			"EVIDENCE_PROCESS_PROOF_INVALID",
+			"Linux process role does not match the canonical role plan",
+			"$.processProof.linuxRole",
+		);
+	const sharding = record(field(proof, "sharding"));
+	requireKeys(
+		sharding,
+		["role", "workerCount", "strategy", "shards"],
+		"$.processProof.sharding",
+		rejections,
+	);
+	if (sharding && !compareCanonical(sharding, rolePlan.sharding))
+		addRejection(
+			rejections,
+			"EVIDENCE_PROCESS_PROOF_INVALID",
+			"sharding proof does not match the canonical role plan",
+			"$.processProof.sharding",
+		);
+	const cohort = record(field(proof, "processCohort"));
+	requireKeys(
+		cohort,
+		["kind", "processes", "primeBeforeMeasurement", "measuredCycles"],
+		"$.processProof.processCohort",
+		rejections,
+	);
+	if (cohort && !compareCanonical(cohort, rolePlan.processCohort))
+		addRejection(
+			rejections,
+			"EVIDENCE_PROCESS_PROOF_INVALID",
+			"process cohort proof does not match the canonical role plan",
+			"$.processProof.processCohort",
+		);
+}
+
+function verifyLedger(
+	value: unknown,
+	metricUnit: unknown,
+	rejections: ArtifactRejection[],
+): void {
+	const ledger = record(value);
+	const keys = [
+		"attempted",
+		"queued",
+		"serverObserved",
+		"acknowledged",
+		"delivered",
+		"expired",
+		"dropped",
+		"histogram",
+	] as const;
+	requireKeys(ledger, keys, "$.ledger", rejections);
+	if (!ledger) return;
+	for (const key of keys.slice(0, -1))
+		safeNonNegative(field(ledger, key), `$.ledger.${key}`, rejections);
+	const ordered = [
+		"queued",
+		"serverObserved",
+		"acknowledged",
+		"delivered",
+	] as const;
+	for (let index = 0; index < ordered.length; index += 1) {
+		const currentKey = ordered[index];
+		const previousKey = index === 0 ? "attempted" : ordered[index - 1];
+		if (!currentKey || !previousKey) continue;
+		const current = field(ledger, currentKey);
+		const previous = field(ledger, previousKey);
+		if (
+			typeof current === "number" &&
+			typeof previous === "number" &&
+			current > previous
+		)
+			addRejection(
+				rejections,
+				"EVIDENCE_LEDGER_INVALID",
+				`ledger.${ordered[index]} cannot exceed its preceding stage`,
+				`$.ledger.${ordered[index]}`,
+			);
+	}
+	for (const key of ["expired", "dropped"] as const) {
+		const candidate = field(ledger, key);
+		const attempted = field(ledger, "attempted");
+		if (
+			typeof candidate === "number" &&
+			typeof attempted === "number" &&
+			candidate > attempted
+		)
+			addRejection(
+				rejections,
+				"EVIDENCE_LEDGER_INVALID",
+				`ledger.${key} cannot exceed attempted`,
+				`$.ledger.${key}`,
+			);
+	}
+	const histogram = record(field(ledger, "histogram"));
+	requireKeys(
+		histogram,
+		["unit", "boundaries", "counts"],
+		"$.ledger.histogram",
+		rejections,
+	);
+	if (!histogram) return;
+	if (field(histogram, "unit") !== metricUnit)
+		addRejection(
+			rejections,
+			"EVIDENCE_LEDGER_INVALID",
+			"histogram unit must match the primary metric unit",
+			"$.ledger.histogram.unit",
+		);
+	const boundaries = field(histogram, "boundaries");
+	const counts = field(histogram, "counts");
+	if (
+		!Array.isArray(boundaries) ||
+		!Array.isArray(counts) ||
+		boundaries.length === 0 ||
+		boundaries.length !== counts.length
+	)
+		addRejection(
+			rejections,
+			"EVIDENCE_LEDGER_INVALID",
+			"histogram boundaries and counts must be equal non-empty arrays",
+			"$.ledger.histogram",
+		);
+	if (Array.isArray(boundaries) && Array.isArray(counts)) {
+		let previous = -Infinity;
+		let total = 0;
+		for (let index = 0; index < boundaries.length; index += 1) {
+			const boundary = boundaries[index];
+			const count = counts[index];
+			if (
+				!finiteNumber(
+					boundary,
+					`$.ledger.histogram.boundaries[${index}]`,
+					rejections,
+				) ||
+				!safeNonNegative(
+					count,
+					`$.ledger.histogram.counts[${index}]`,
+					rejections,
+				) ||
+				(boundary as number) < previous
+			)
+				addRejection(
+					rejections,
+					"EVIDENCE_LEDGER_INVALID",
+					"histogram buckets must be finite, ordered, and counted",
+					"$.ledger.histogram",
+				);
+			previous = typeof boundary === "number" ? boundary : previous;
+			if (typeof count === "number") total += count;
+		}
+		const attempted = field(ledger, "attempted");
+		if (typeof attempted === "number" && total > attempted)
+			addRejection(
+				rejections,
+				"EVIDENCE_LEDGER_INVALID",
+				"histogram count cannot exceed attempted",
+				"$.ledger.histogram.counts",
+			);
+	}
+}
+
+function verifyTelemetry(
+	value: unknown,
+	rejections: ArtifactRejection[],
+): void {
+	const telemetry = record(value);
+	requireKeys(telemetry, ["mac", "linux"], "$.telemetry", rejections);
+	for (const host of ["mac", "linux"] as const) {
+		const item = record(field(telemetry, host));
+		requireKeys(
+			item,
+			["cpuPercent", "rssBytes"],
+			`$.telemetry.${host}`,
+			rejections,
+		);
+		if (!item) continue;
+		const cpu = field(item, "cpuPercent");
+		if (
+			!finiteNumber(cpu, `$.telemetry.${host}.cpuPercent`, rejections) ||
+			(cpu as number) < 0 ||
+			(cpu as number) > 100 * 1024
+		)
+			addRejection(
+				rejections,
+				"EVIDENCE_TELEMETRY_INVALID",
+				"CPU telemetry must be a finite non-negative percentage",
+				`$.telemetry.${host}.cpuPercent`,
+			);
+		if (
+			!safeNonNegative(
+				field(item, "rssBytes"),
+				`$.telemetry.${host}.rssBytes`,
+				rejections,
+			)
+		)
+			addRejection(
+				rejections,
+				"EVIDENCE_TELEMETRY_INVALID",
+				"RSS telemetry must be a non-negative safe integer",
+				`$.telemetry.${host}.rssBytes`,
+			);
+	}
+}
+
 function verifyRawSidecars(
 	artifact: Record<string, unknown>,
 	rejections: ArtifactRejection[],
@@ -1793,13 +2281,44 @@ function verifyRawSidecars(
 			"rawSidecarBindingSha256 must be SHA-256",
 			"$.rawSidecarBindingSha256",
 		);
-	} else if (sidecars && binding !== sha256Canonical(sidecars)) {
-		addRejection(
-			rejections,
-			"RAW_SIDECAR_DIGEST_MISMATCH",
-			"raw sidecar digests do not match their binding",
-			"$.rawSidecarBindingSha256",
+	} else if (sidecars) {
+		const sourceBindingSha256 = field(
+			record(field(artifact, "source")),
+			"bindingSha256",
 		);
+		const scenarioHash = field(
+			record(field(artifact, "scenario")),
+			"scenarioHash",
+		);
+		const metricContractHashValue = field(artifact, "metricContractHash");
+		const bindingInputs = [
+			field(artifact, "comparisonId"),
+			field(artifact, "runId"),
+			field(artifact, "transport"),
+			sourceBindingSha256,
+			scenarioHash,
+			metricContractHashValue,
+		];
+		if (
+			bindingInputs.every((item) => item !== undefined) &&
+			binding !==
+				sha256Canonical({
+					comparisonId: field(artifact, "comparisonId"),
+					runId: field(artifact, "runId"),
+					transport: field(artifact, "transport"),
+					sourceBindingSha256,
+					scenarioHash,
+					metricContractHash: metricContractHashValue,
+					rawSidecarDigests: sidecars,
+				})
+		) {
+			addRejection(
+				rejections,
+				"RAW_SIDECAR_DIGEST_MISMATCH",
+				"raw sidecar digests do not match their binding",
+				"$.rawSidecarBindingSha256",
+			);
+		}
 	}
 }
 
@@ -1810,6 +2329,7 @@ function verifyStatus(
 	const status = field(artifact, "evidenceStatus");
 	const verdict = field(artifact, "scenarioVerdict");
 	const promotable = field(artifact, "promotable");
+	const artifactKind = field(artifact, "artifactKind");
 	if (status !== "PASS" && status !== "FAIL" && status !== "BLOCKED")
 		addRejection(
 			rejections,
@@ -1838,7 +2358,12 @@ function verifyStatus(
 			"PASS evidence must have a PASS or MISS scenario verdict",
 			"$",
 		);
-	if (status === "PASS" && verdict === "PASS" && promotable !== true)
+	if (
+		status === "PASS" &&
+		verdict === "PASS" &&
+		promotable !== true &&
+		artifactKind !== "test-fixture"
+	)
 		addRejection(
 			rejections,
 			"STATUS_CONTRADICTION",
@@ -1850,6 +2375,13 @@ function verifyStatus(
 			rejections,
 			"STATUS_CONTRADICTION",
 			"a measured MISS is not promotable",
+			"$.promotable",
+		);
+	if (artifactKind === "test-fixture" && promotable !== false)
+		addRejection(
+			rejections,
+			"ARTIFACT_FIXTURE_NOT_PROMOTABLE",
+			"test fixtures must never be promotable",
 			"$.promotable",
 		);
 	if (
@@ -1868,10 +2400,12 @@ function verifySnapshot(
 	snapshot: unknown,
 	rejections: ArtifactRejection[],
 	expectedDigest?: string,
+	verificationContext?: ArtifactTrustContext,
 ): ArtifactVerification {
 	if (!verifyTopLevelShape(snapshot, rejections))
 		return { evidenceStatus: "FAIL", rejections };
 	const artifact = snapshot as unknown as Record<string, unknown>;
+	verifyTrustContext(verificationContext, artifact, rejections);
 	verifyIdentity(artifact, rejections);
 	verifySource(field(artifact, "source"), rejections);
 	verifyTopology(field(artifact, "topology"), rejections);
@@ -1889,7 +2423,20 @@ function verifySnapshot(
 		rejections,
 		scenarioCell,
 	);
-	verifyMetrics(field(artifact, "metrics"), rejections);
+	verifyMetrics(
+		field(artifact, "metrics"),
+		rejections,
+		scenarioCell?.scenarioId,
+	);
+	verifyMetricContract(artifact, scenarioCell, rejections);
+	verifyRuntime(field(artifact, "runtime"), rejections);
+	verifyProcessProof(field(artifact, "processProof"), scenarioCell, rejections);
+	verifyLedger(
+		field(artifact, "ledger"),
+		field(record(field(artifact, "metrics")), "unit"),
+		rejections,
+	);
+	verifyTelemetry(field(artifact, "telemetry"), rejections);
 	verifyRawSidecars(artifact, rejections);
 	verifyStatus(artifact, rejections);
 	const actualDigest = field(artifact, "artifactByteSha256");
@@ -1928,14 +2475,24 @@ function verifySnapshot(
 		// BLOCKED/FAIL declaration remains a typed status, never an implicit
 		// measurement that the comparator could accidentally rank.
 		artifact:
-			rejections.length === 0 && status === "PASS"
+			rejections.length === 0 &&
+			status === "PASS" &&
+			field(artifact, "artifactKind") === "measured"
 				? (snapshot as RunArtifact)
 				: undefined,
 		artifactByteSha256: isSha256(actualDigest) ? actualDigest : undefined,
+		artifactKind:
+			field(artifact, "artifactKind") === "measured" ||
+			field(artifact, "artifactKind") === "test-fixture"
+				? (field(artifact, "artifactKind") as "measured" | "test-fixture")
+				: undefined,
 	};
 }
 
-export function verifyRunArtifact(input: ArtifactBytes): ArtifactVerification {
+export function verifyRunArtifact(
+	input: ArtifactBytes,
+	verificationContext?: ArtifactTrustContext,
+): ArtifactVerification {
 	let bytes: Uint8Array;
 	try {
 		bytes = artifactInputBytes(input);
@@ -2018,7 +2575,9 @@ export function verifyRunArtifact(input: ArtifactBytes): ArtifactVerification {
 			? "SCENARIO_PAYLOAD_INVALID"
 			: /\.metrics\.clock/.test(message)
 				? "CLOCK_PROVENANCE_INVALID"
-				: "SCHEMA_INVALID_FIELD";
+				: /resource|too long|budget|node|edge/i.test(message)
+					? "SCHEMA_RESOURCE_LIMIT"
+					: "SCHEMA_INVALID_FIELD";
 		return {
 			evidenceStatus: "FAIL",
 			rejections: [
@@ -2043,7 +2602,12 @@ export function verifyRunArtifact(input: ArtifactBytes): ArtifactVerification {
 			"$.artifactByteSha256",
 		);
 	}
-	const result = verifySnapshot(snapshot, rejections, digest);
+	const result = verifySnapshot(
+		snapshot,
+		rejections,
+		digest,
+		verificationContext,
+	);
 	if (result.rejections.length === 0 && digest !== result.artifactByteSha256) {
 		return {
 			...result,
@@ -2060,7 +2624,10 @@ export function verifyRunArtifact(input: ArtifactBytes): ArtifactVerification {
 	return result;
 }
 
-export function verifyRunArtifactObject(input: unknown): ArtifactVerification {
+export function verifyRunArtifactObject(
+	input: unknown,
+	verificationContext?: ArtifactTrustContext,
+): ArtifactVerification {
 	let snapshot: unknown;
 	try {
 		snapshot = snapshotEvidenceValue(input);
@@ -2081,14 +2648,14 @@ export function verifyRunArtifactObject(input: unknown): ArtifactVerification {
 						? "CLOCK_PROVENANCE_INVALID"
 						: /\.metrics\.percentiles/.test(message)
 							? "METRICS_PERCENTILES_INVALID"
-							: typeof input === "object" &&
-									input !== null &&
-									!Object.hasOwn(input, "source")
-								? "SCHEMA_OWN_FIELD_REQUIRED"
-								: "SCHEMA_ROOT_INVALID";
+							: /resource|cycle|shared|cannot be snapshotted|too long|budget/i.test(
+										message,
+									)
+								? "SCHEMA_RESOURCE_LIMIT"
+								: "SCHEMA_RESOURCE_LIMIT";
 		return { evidenceStatus: "FAIL", rejections: [{ code, reason: message }] };
 	}
-	return verifySnapshot(snapshot, []);
+	return verifySnapshot(snapshot, [], undefined, verificationContext);
 }
 
 export { artifactByteSha256 };

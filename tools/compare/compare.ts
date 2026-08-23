@@ -3,9 +3,11 @@ import {
 	type ArtifactBytes,
 	type ArtifactRejection,
 	type ArtifactRejectionCode,
+	type ArtifactTrustContext,
 	addRejection,
 	artifactByteSha256,
 	type EvidenceStatus,
+	metricContractForScenario,
 	type RunArtifact,
 	type ScenarioVerdict,
 	sealRunArtifact,
@@ -26,12 +28,17 @@ export interface ArmComparisonResult {
 }
 
 export interface ComparisonDelta {
-	readonly metric: "p50";
+	readonly metric: string;
 	readonly unit: string;
 	readonly ws: number;
 	readonly wt: number;
 	readonly absolute: number;
-	readonly relative: number;
+	readonly relative: number | null;
+}
+
+export interface CompareOptions {
+	readonly ws?: ArtifactTrustContext;
+	readonly wt?: ArtifactTrustContext;
 }
 
 export type ComputedDelta = ComparisonDelta | "not computed";
@@ -70,9 +77,20 @@ function admissionCounterShape(
 	};
 }
 
+function ledgerShape(ledger: RunArtifact["ledger"]): unknown {
+	return {
+		histogram: {
+			unit: ledger.histogram.unit,
+			boundaries: ledger.histogram.boundaries.length,
+			counts: ledger.histogram.counts.length,
+		},
+	};
+}
+
 function verifyArm(
 	input: ArtifactBytes | undefined,
 	expectedTransport: Transport,
+	verificationContext?: ArtifactTrustContext,
 ): ArmComparisonResult {
 	if (input === undefined) {
 		return {
@@ -81,8 +99,15 @@ function verifyArm(
 			rejections: [MISSING_ARM_REJECTIONS[expectedTransport]],
 		};
 	}
-	const verification = verifyRunArtifact(input);
+	const verification = verifyRunArtifact(input, verificationContext);
 	const rejections = [...verification.rejections];
+	if (verification.artifactKind === "test-fixture")
+		addRejection(
+			rejections,
+			"ARTIFACT_FIXTURE_NOT_PROMOTABLE",
+			"test-fixture artifacts are visible evidence but cannot be compared",
+			"$.artifactKind",
+		);
 	if (
 		verification.artifact &&
 		verification.artifact.transport !== expectedTransport
@@ -178,6 +203,13 @@ function compatibilityRejections(
 			"SOURCE_UNBOUND",
 			"WS and WT source binding differs",
 			"$.source",
+		);
+	if (ws.artifactKind !== "measured" || wt.artifactKind !== "measured")
+		addRejection(
+			rejections,
+			"ARTIFACT_FIXTURE_NOT_PROMOTABLE",
+			"only measured artifacts can participate in a comparison",
+			"$.artifactKind",
 		);
 	if (
 		ws.scenario.cellId !== wt.scenario.cellId ||
@@ -415,15 +447,70 @@ function compatibilityRejections(
 			"WS and WT metric clock provenance differs",
 			"$.metrics.clock",
 		);
+	if (
+		ws.metricContractId !== wt.metricContractId ||
+		ws.metricContractHash !== wt.metricContractHash
+	)
+		addRejection(
+			rejections,
+			"METRICS_CONTRACT_INVALID",
+			"WS and WT primary metric contracts differ",
+			"$.metricContractHash",
+		);
+	if (
+		canonicalJson({ mac: ws.runtime.mac.bun, linux: ws.runtime.linux.bun }) !==
+			canonicalJson({ mac: wt.runtime.mac.bun, linux: wt.runtime.linux.bun }) ||
+		canonicalJson({
+			mac: ws.runtime.mac.identity,
+			linux: ws.runtime.linux.identity,
+		}) !==
+			canonicalJson({
+				mac: wt.runtime.mac.identity,
+				linux: wt.runtime.linux.identity,
+			})
+	)
+		addRejection(
+			rejections,
+			"EVIDENCE_RUNTIME_INVALID",
+			"WS and WT runtime identity differs",
+			"$.runtime",
+		);
+	if (canonicalJson(ws.processProof) !== canonicalJson(wt.processProof))
+		addRejection(
+			rejections,
+			"EVIDENCE_PROCESS_PROOF_INVALID",
+			"WS and WT process-role/cohort/shard proof differs",
+			"$.processProof",
+		);
+	if (
+		canonicalJson(ledgerShape(ws.ledger)) !==
+		canonicalJson(ledgerShape(wt.ledger))
+	)
+		addRejection(
+			rejections,
+			"EVIDENCE_LEDGER_INVALID",
+			"WS and WT ledger histogram schema differs",
+			"$.ledger.histogram",
+		);
+	if (
+		canonicalJson(ws.rawSidecarDigests) !== canonicalJson(wt.rawSidecarDigests)
+	)
+		addRejection(
+			rejections,
+			"RAW_SIDECAR_DIGEST_MISMATCH",
+			"WS and WT raw sidecar digests differ",
+			"$.rawSidecarDigests",
+		);
 	return rejections;
 }
 
 export function compareRunArtifacts(
 	wsInput: ArtifactBytes | undefined,
 	wtInput: ArtifactBytes | undefined,
+	options: CompareOptions = {},
 ): ComparisonResult {
-	const ws = verifyArm(wsInput, "ws");
-	const wt = verifyArm(wtInput, "wt");
+	const ws = verifyArm(wsInput, "ws", options.ws);
+	const wt = verifyArm(wtInput, "wt", options.wt);
 	const rejections: ArtifactRejection[] = [...ws.rejections];
 	for (const rejection of wt.rejections) rejections.push(rejection);
 	if (!ws.artifact || !wt.artifact) {
@@ -467,9 +554,30 @@ export function compareRunArtifacts(
 	const wsValue = ws.artifact.metrics.percentiles.p50;
 	const wtValue = wt.artifact.metrics.percentiles.p50;
 	const absolute = wtValue - wsValue;
-	const relative = wsValue === 0 ? 0 : absolute / wsValue;
+	const relative = wsValue === 0 ? null : absolute / wsValue;
+	const contract = metricContractForScenario(ws.artifact.scenario.scenarioId);
+	if (
+		contract === undefined ||
+		!Number.isFinite(absolute) ||
+		(relative !== null && !Number.isFinite(relative))
+	) {
+		const arithmeticRejection: ArtifactRejection = {
+			code: "METRICS_ARITHMETIC_INVALID",
+			reason: "metric delta arithmetic is not finite or lacks a contract",
+			path: "$.metrics.percentiles.p50",
+		};
+		return {
+			evidenceStatus: "BLOCKED",
+			scenarioVerdict: "NO_VERDICT",
+			ws,
+			wt,
+			delta: "not computed",
+			ranking: "not computed",
+			rejections: [...rejections, arithmeticRejection],
+		};
+	}
 	const delta: ComparisonDelta = {
-		metric: "p50",
+		metric: contract.name,
 		unit: ws.artifact.metrics.unit,
 		ws: wsValue,
 		wt: wtValue,
@@ -486,7 +594,16 @@ export function compareRunArtifacts(
 		ws,
 		wt,
 		delta,
-		ranking: wsValue === wtValue ? "tie" : wsValue < wtValue ? "ws" : "wt",
+		ranking:
+			wsValue === wtValue
+				? "tie"
+				: contract.direction === "higher"
+					? wsValue > wtValue
+						? "ws"
+						: "wt"
+					: wsValue < wtValue
+						? "ws"
+						: "wt",
 		rejections: [],
 	};
 }
