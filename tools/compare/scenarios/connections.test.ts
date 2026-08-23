@@ -16,15 +16,15 @@
 
 import { describe, expect, it } from "bun:test";
 import {
-	createReconnectLedger,
-	runReconnectStormPure,
-	createHandshakeLedger,
-	runHandshakeMatrixPure,
-	createConnectionMemoryLedger,
-	runConnectionMemoryPure,
-	type ReconnectScenarioConfig,
-	type HandshakeScenarioConfig,
 	type ConnectionMemoryConfig,
+	createConnectionMemoryLedger,
+	createHandshakeLedger,
+	createReconnectLedger,
+	type HandshakeScenarioConfig,
+	type ReconnectScenarioConfig,
+	runConnectionMemoryPure,
+	runHandshakeMatrixPure,
+	runReconnectStormPure,
 } from "./connections.ts";
 
 describe("Task 8: Reconnect storm scenario", () => {

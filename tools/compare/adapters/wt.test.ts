@@ -14,9 +14,9 @@
  *  - one submitted profile per adapter instance; divergent starts rejected
  */
 import { describe, expect, it } from "bun:test";
-import { Readable, Writable, Duplex } from "node:stream";
-import { CANONICAL_CAPACITY_PROFILE } from "../scenario-registry.ts";
+import { Duplex, Readable, Writable } from "node:stream";
 import { canonicalJson, sha256Canonical } from "../canonical.ts";
+import { CANONICAL_CAPACITY_PROFILE } from "../scenario-registry.ts";
 import type {
 	BidiChannel,
 	ReceiveChannel,
@@ -29,10 +29,10 @@ import type {
 } from "./transport.ts";
 import {
 	createWebTransportAdapter,
-	type WtServerFactory,
-	type WtClientFactory,
-	type FakeWtServerSession,
 	type FakeWtClientSession,
+	type FakeWtServerSession,
+	type WtClientFactory,
+	type WtServerFactory,
 } from "./wt.ts";
 
 // ---------------------------------------------------------------------------
@@ -268,8 +268,8 @@ function makeFactories(
 
 	const server: WtServerFactory = (options) => {
 		capturedOptions.push(options as Record<string, unknown>);
-		let sessionQueue: FakeWtServerSession[] = [serverSession];
-		let sessionQueueResolve: ((s: FakeWtServerSession) => void) | null = null;
+		const sessionQueue: FakeWtServerSession[] = [serverSession];
+		const sessionQueueResolve: ((s: FakeWtServerSession) => void) | null = null;
 		return {
 			address: { host: "10.99.0.2", port: options.port ?? 4433 },
 			congestionControl: "default",

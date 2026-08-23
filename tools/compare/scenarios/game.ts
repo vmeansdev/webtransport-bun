@@ -9,7 +9,7 @@
  * - Tracks latest-state age (receiveTime - sendTime), stale, expired, and unique delivered counts.
  */
 
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 export interface GameLedgerOptions {
 	readonly runId: string;

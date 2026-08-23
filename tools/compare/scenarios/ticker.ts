@@ -9,7 +9,7 @@
  *   Overload is a measured outcome (drops/backpressure), never silently downscaled.
  */
 
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 export interface TickerLedgerOptions {
 	readonly runId: string;

@@ -15,22 +15,16 @@
 
 import { describe, expect, it } from "bun:test";
 import {
-	createChatLedger,
-	runChatFanoutPure,
 	type ChatScenarioConfig,
 	type ChatScenarioResult,
+	createChatLedger,
+	runChatFanoutPure,
 } from "./fanout.ts";
 import {
-	createTickerLedger,
-	runTickerFanoutPure,
-	type TickerScenarioConfig,
-	type TickerScenarioResult,
-} from "./ticker.ts";
-import {
 	createGameLedger,
-	runGameTickLossPure,
 	type GameScenarioConfig,
 	type GameScenarioResult,
+	runGameTickLossPure,
 } from "./game.ts";
 import {
 	createTailLedger,
@@ -38,6 +32,12 @@ import {
 	type TailScenarioConfig,
 	type TailScenarioResult,
 } from "./tail.ts";
+import {
+	createTickerLedger,
+	runTickerFanoutPure,
+	type TickerScenarioConfig,
+	type TickerScenarioResult,
+} from "./ticker.ts";
 
 describe("Task 7: Chat fanout scenario", () => {
 	it("initializes and records offered vs delivered in per-receiver ledgers", () => {

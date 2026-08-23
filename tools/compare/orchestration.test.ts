@@ -25,29 +25,29 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-	parseMacRoute,
-	parseLinuxRoute,
-	validateTopology,
-	type MacRoute,
-	type LinuxRoute,
-	type TopologyProof,
-} from "./topology.ts";
-import { validateTlsFingerprint, type TlsIdentity } from "./tls.ts";
-import {
-	validateFdLimits,
-	validatePortHeadroom,
-	parseRlimit,
 	type FdCapacity,
 	type PortCapacity,
+	parseRlimit,
+	validateFdLimits,
+	validatePortHeadroom,
 } from "./host-sidecar.ts";
 import {
-	parseQdisc,
-	isExpectedFq,
 	buildNetemInstallArgs,
-	type QdiscState,
+	isExpectedFq,
 	type NetemProfile,
+	parseQdisc,
+	type QdiscState,
 } from "./netem.ts";
-import { validatePidRecord, type PidRecord } from "./remote.ts";
+import { type PidRecord, validatePidRecord } from "./remote.ts";
+import { type TlsIdentity, validateTlsFingerprint } from "./tls.ts";
+import {
+	type LinuxRoute,
+	type MacRoute,
+	parseLinuxRoute,
+	parseMacRoute,
+	type TopologyProof,
+	validateTopology,
+} from "./topology.ts";
 
 const FIXTURES_DIR = join(import.meta.dir, "fixtures");
 

@@ -1120,7 +1120,7 @@ export async function productionWtAdapterOptions(): Promise<WtAdapterOptions> {
 	// Use relative path to the workspace package to satisfy TypeScript module resolution.
 	// At runtime this resolves to the compiled package entry point.
 	// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-	// @ts-ignore — dynamic workspace import; types resolved at runtime via package.json exports
+	// @ts-expect-error — dynamic workspace import; types resolved at runtime via package.json exports
 	const pkg = (await import("../../../packages/webtransport/src/index.ts")) as {
 		createServer: (opts: Record<string, unknown>) => unknown;
 		connect: (url: string, opts: unknown) => Promise<FakeWtClientSession>;

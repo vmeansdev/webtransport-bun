@@ -9,7 +9,7 @@
  * - Per-receiver ledgers track delivery, duplicates, reordering, and publish-to-receive latency.
  */
 
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 import type { WireMessage } from "../wire.ts";
 
 export interface ChatLedgerOptions {

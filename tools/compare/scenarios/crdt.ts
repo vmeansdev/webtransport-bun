@@ -10,7 +10,7 @@
 
 import { createHash } from "node:crypto";
 import { canonicalJson, sha256Canonical } from "../canonical.ts";
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 export interface CrdtOp {
 	readonly actorId: number;

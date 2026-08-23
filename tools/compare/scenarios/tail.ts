@@ -10,7 +10,7 @@
  * - Metrics: control latency p50/p95/p99, <= 4ms classifier count/percent, bulk achieved Mbps.
  */
 
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 export interface TailLedgerOptions {
 	readonly runId: string;

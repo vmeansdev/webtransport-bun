@@ -14,24 +14,24 @@
 
 import { describe, expect, it } from "bun:test";
 import {
-	encodeCrdtOp,
-	decodeCrdtOp,
-	createCrdtStore,
-	createCrdtLedger,
-	runCrdtSyncPure,
-	type CrdtScenarioConfig,
-} from "./crdt.ts";
-import {
+	type AiTokenScenarioConfig,
 	createAiTokenLedger,
 	runAiTokenStreamPure,
-	type AiTokenScenarioConfig,
 } from "./ai-token.ts";
 import {
-	createBulkLedger,
-	runBulkOneWayPure,
-	generateBulkPayload,
 	type BulkScenarioConfig,
+	createBulkLedger,
+	generateBulkPayload,
+	runBulkOneWayPure,
 } from "./bulk.ts";
+import {
+	type CrdtScenarioConfig,
+	createCrdtLedger,
+	createCrdtStore,
+	decodeCrdtOp,
+	encodeCrdtOp,
+	runCrdtSyncPure,
+} from "./crdt.ts";
 
 describe("Task 9: CRDT sync scenario (Yjs-style synthetic KV)", () => {
 	it("encodes and decodes deterministic 96-byte CRDT operations", () => {
