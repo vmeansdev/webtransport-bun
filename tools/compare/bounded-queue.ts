@@ -581,6 +581,7 @@ export class ByteBoundedQueue<T> {
 	tryPush(value: T): boolean {
 		if (this.didClose) return false;
 		const bytes = this.itemBytes(value);
+		if (this.didClose) return false;
 		if (
 			bytes > this.maxBytes ||
 			this.queuedBytes + bytes > this.maxBytes ||
