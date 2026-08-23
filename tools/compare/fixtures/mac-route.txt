@@ -1,0 +1,8 @@
+Mac-generated IP route for direct cable path (darwin-arm64):
+route to: 10.99.0.2
+destination: 10.99.0.2
+fgt: lo0
+interface: en8
+flags: <UP,HOST,DONE,WASCLONED,IFSCOPE>
+recvpipe  sendpipe  ssthresh  rtt,msec    mtu        weight    expire
+      0         0         0         0      1500         1         0
