@@ -782,6 +782,57 @@ describe("fail-closed comparison evidence", () => {
 		});
 	});
 
+	test("blocks runtime CPU identity drift without producing a delta or ranking", () => {
+		const wt = fixtureObject(wtBytes);
+		wt.artifactKind = "measured";
+		wt.promotable = true;
+		wt.runtime.mac.cpu = "Apple arm64 efficiency cores";
+		const wtMeasured = sealRunArtifact(wt);
+		const wsMeasured = measuredBytes(wsBytes);
+		const result = compareRunArtifacts(wsMeasured, wtMeasured, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(wtMeasured),
+		});
+
+		expect(result.evidenceStatus).toBe("BLOCKED");
+		expect(result.delta).toBe("not computed");
+		expect(result.ranking).toBe("not computed");
+		expect(result.rejections.map(({ code }) => code)).toContain(
+			"EVIDENCE_RUNTIME_INVALID",
+		);
+	});
+
+	test("requires exact histogram bucket boundaries while allowing measured counts to differ", () => {
+		const wsMeasured = measuredBytes(wsBytes);
+		const differentCounts = fixtureObject(wtBytes);
+		differentCounts.artifactKind = "measured";
+		differentCounts.promotable = true;
+		differentCounts.ledger.histogram.counts = [0, 1, 0];
+		const differentCountsBytes = sealRunArtifact(differentCounts);
+		const compatible = compareRunArtifacts(wsMeasured, differentCountsBytes, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(differentCountsBytes),
+		});
+		expect(compatible.evidenceStatus).toBe("PASS");
+		expect(compatible.delta).not.toBe("not computed");
+
+		const differentBoundary = fixtureObject(wtBytes);
+		differentBoundary.artifactKind = "measured";
+		differentBoundary.promotable = true;
+		differentBoundary.ledger.histogram.boundaries[1] = 3;
+		const differentBoundaryBytes = sealRunArtifact(differentBoundary);
+		const blocked = compareRunArtifacts(wsMeasured, differentBoundaryBytes, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(differentBoundaryBytes),
+		});
+		expect(blocked.evidenceStatus).toBe("BLOCKED");
+		expect(blocked.delta).toBe("not computed");
+		expect(blocked.ranking).toBe("not computed");
+		expect(blocked.rejections.map(({ code }) => code)).toContain(
+			"EVIDENCE_LEDGER_INVALID",
+		);
+	});
+
 	test("requires capacity proof only for connection-scale cells", () => {
 		const cases: readonly [
 			string,
