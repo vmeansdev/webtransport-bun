@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { ByteBoundedQueue, DEFAULT_MAX_QUEUE_ITEMS } from "./bounded-queue.ts";
+import {
+	ByteBoundedQueue,
+	DEFAULT_MAX_QUEUE_ITEMS,
+	type QueueWaitOptions,
+} from "./bounded-queue.ts";
 import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
@@ -335,12 +339,65 @@ describe("shared comparison driver core", () => {
 			sizeOf: () => 1,
 		});
 		expect(() => queue.waitForItem({ aborted: false } as never)).toThrow(
-			/signal|AbortSignal/i,
+			/signal|AbortSignal|unknown/i,
 		);
 		expect(() =>
 			queue.waitForItem({ signal: { aborted: false } } as never),
 		).toThrow(/signal|AbortSignal/i);
 		expect(queue.pendingWaiters).toBe(0);
+	});
+
+	test("accepts empty wait options and rejects inherited signal pollution", async () => {
+		const queue = new ByteBoundedQueue<number>({
+			maxBytes: 8,
+			maxWaiters: 2,
+			sizeOf: () => 1,
+		});
+		queue.tryPush(1);
+		expect(await queue.waitForItem({})).toEqual({ done: false, value: 1 });
+		queue.tryPush(2);
+		const nullPrototypeOptions = Object.create(null) as { signal?: undefined };
+		expect(await queue.waitForItem(nullPrototypeOptions)).toEqual({
+			done: false,
+			value: 2,
+		});
+
+		const inheritedController = new AbortController();
+		const inheritedOptions = Object.create({
+			signal: inheritedController.signal,
+		}) as QueueWaitOptions;
+		expect(() => queue.waitForItem(inheritedOptions)).toThrow(/plain|option/i);
+		expect(queue.pendingItemWaiters).toBe(0);
+		inheritedController.abort("must be rejected");
+
+		const watermarkQueue = new ByteBoundedQueue<Uint8Array>({
+			maxBytes: 4,
+			highWaterMark: 1,
+			lowWaterMark: 0,
+		});
+		watermarkQueue.tryPush(new Uint8Array([1]));
+		const watermarkWait = watermarkQueue.waitForLowWaterMark({});
+		watermarkQueue.shift();
+		expect(await watermarkWait).toBe("low");
+		watermarkQueue.tryPush(new Uint8Array([2]));
+		const nullPrototypeWatermark = watermarkQueue.waitForLowWaterMark(
+			Object.create(null),
+		);
+		watermarkQueue.shift();
+		expect(await nullPrototypeWatermark).toBe("low");
+		const inheritedWatermark = Object.create({
+			signal: new AbortController().signal,
+		});
+		expect(() =>
+			watermarkQueue.waitForLowWaterMark(inheritedWatermark),
+		).toThrow(/plain|option/i);
+
+		expect(() => queue.waitForItem({ unknown: true } as never)).toThrow(
+			/unknown|unsupported/i,
+		);
+		expect(() =>
+			watermarkQueue.waitForLowWaterMark({ signal: {} } as never),
+		).toThrow(/AbortSignal/i);
 	});
 
 	test("closes deterministically, drains existing items, and rejects later pushes", async () => {
@@ -479,6 +536,22 @@ describe("shared comparison driver core", () => {
 		await expect(pacer.waitNext(10)).rejects.toBeInstanceOf(PacerDeadlineError);
 		expect(receivedSignal).toBeInstanceOf(AbortSignal);
 		expect(receivedSignal?.aborted).toBe(true);
+	});
+
+	test("rejects a finite deadline remainder above the native timer maximum before sleeping", async () => {
+		let sleepCalls = 0;
+		const pacer = new OpenLoopPacer({
+			ratePerSecond: 1,
+			now: () => 0,
+			sleep: async () => {
+				sleepCalls += 1;
+			},
+		});
+		pacer.nextSlot();
+		await expect(pacer.waitNext(3_000_000_000)).rejects.toThrow(
+			/timer|deadline|maximum/i,
+		);
+		expect(sleepCalls).toBe(0);
 	});
 
 	test("freezes skip as the safe default open-loop policy", () => {

@@ -253,9 +253,20 @@ function normalizeSignal(options: QueueWaitArgument): AbortSignal | undefined {
 	if (prototype !== Object.prototype && prototype !== null) {
 		throw new TypeError("queue wait options must be a plain object");
 	}
+	let ownKeys: (string | symbol)[];
+	try {
+		ownKeys = Reflect.ownKeys(options);
+	} catch {
+		throw new TypeError("queue wait options could not be inspected");
+	}
+	for (const key of ownKeys) {
+		if (key !== "signal") {
+			throw new TypeError("queue wait options contain an unknown property");
+		}
+	}
 	const descriptor = Object.getOwnPropertyDescriptor(options, "signal");
 	if (!descriptor) {
-		throw new TypeError("queue wait options must own a signal property");
+		return undefined;
 	}
 	let signal: unknown;
 	try {
