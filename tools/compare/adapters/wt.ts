@@ -154,9 +154,20 @@ function nextChannelId(): number {
 	return _nextChannelId++;
 }
 
-// ---------------------------------------------------------------------------
-// Node stream helpers
-// ---------------------------------------------------------------------------
+function toRemainingMs(
+	deadlineOrTimeoutMs: number,
+	clock: TransportClock,
+): number {
+	if (!Number.isFinite(deadlineOrTimeoutMs) || deadlineOrTimeoutMs <= 0) {
+		return 1;
+	}
+	// If value is small (< 1e10, ~115 days), treat as relative timeout duration
+	if (deadlineOrTimeoutMs < 1e10) {
+		return Math.max(1, deadlineOrTimeoutMs);
+	}
+	// Otherwise treat as absolute epoch timestamp
+	return Math.max(1, deadlineOrTimeoutMs - clock.nowMs());
+}
 
 /** Read one chunk from a Node Readable with a bounded deadline. Returns null on EOF. */
 async function readChunk(
@@ -170,7 +181,7 @@ async function readChunk(
 				cleanup();
 				reject(new Error("E_BACKPRESSURE_TIMEOUT: read() deadline exceeded"));
 			},
-			Math.max(1, deadlineMs - clock.nowMs()),
+			toRemainingMs(deadlineMs, clock),
 		);
 
 		function cleanup() {
@@ -219,7 +230,7 @@ async function writeChunk(
 	clock: TransportClock,
 ): Promise<void> {
 	return new Promise<void>((resolve, reject) => {
-		const remaining = Math.max(1, deadlineMs - clock.nowMs());
+		const remaining = toRemainingMs(deadlineMs, clock);
 		const timer = setTimeout(() => {
 			reject(new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"));
 		}, remaining);
@@ -239,7 +250,7 @@ async function endStream(
 	clock: TransportClock,
 ): Promise<void> {
 	return new Promise<void>((resolve, reject) => {
-		const remaining = Math.max(1, deadlineMs - clock.nowMs());
+		const remaining = toRemainingMs(deadlineMs, clock);
 		const timer = setTimeout(() => {
 			reject(new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded"));
 		}, remaining);
@@ -347,7 +358,7 @@ async function readFromStream<T>(
 ): Promise<T | null> {
 	const reader = stream.getReader();
 	try {
-		const remaining = Math.max(1, deadlineMs - clock.nowMs());
+		const remaining = toRemainingMs(deadlineMs, clock);
 		const result = await Promise.race([
 			reader.read(),
 			new Promise<{ done: true; value: undefined }>((_, reject) =>
@@ -355,7 +366,7 @@ async function readFromStream<T>(
 					() =>
 						reject(
 							new Error(
-								"E_BACKPRESSURE_TIMEOUT: acceptSession/stream deadline exceeded",
+								"E_BACKPRESSURE_TIMEOUT: readFromStream deadline exceeded",
 							),
 						),
 					remaining,
@@ -363,7 +374,7 @@ async function readFromStream<T>(
 			),
 		]);
 		if (result.done) return null;
-		return result.value ?? null;
+		return result.value as T;
 	} finally {
 		reader.releaseLock();
 	}
@@ -501,7 +512,7 @@ function wrapServerSession(
 			if (kind === "datagram") {
 				// Read from the datagram async iterator
 				const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
-				const remaining = Math.max(1, deadlineMs - clock.nowMs());
+				const remaining = toRemainingMs(deadlineMs, clock);
 				const result = await Promise.race([
 					iter.next(),
 					new Promise<IteratorResult<Uint8Array>>((_res, reject) =>
@@ -703,7 +714,7 @@ function wrapClientSession(
 						new Error("E_BACKPRESSURE_TIMEOUT: acceptUni deadline exceeded"),
 					);
 				},
-				Math.max(1, deadlineMs - clock.nowMs()),
+				toRemainingMs(deadlineMs, clock),
 			);
 
 			uniQueue.push({
@@ -725,7 +736,7 @@ function wrapClientSession(
 						new Error("E_BACKPRESSURE_TIMEOUT: acceptBidi deadline exceeded"),
 					);
 				},
-				Math.max(1, deadlineMs - clock.nowMs()),
+				toRemainingMs(deadlineMs, clock),
 			);
 
 			bidiQueue.push({
@@ -786,7 +797,7 @@ function wrapClientSession(
 		): Promise<WireMessage> {
 			if (kind === "datagram") {
 				const iter = native.incomingDatagrams()[Symbol.asyncIterator]();
-				const remaining = Math.max(1, deadlineMs - clock.nowMs());
+				const remaining = toRemainingMs(deadlineMs, clock);
 				const result = await Promise.race([
 					iter.next(),
 					new Promise<IteratorResult<Uint8Array>>((_r, reject) =>
@@ -913,16 +924,14 @@ function wrapServerHandle(
 				return wrapServerSession(sessionQueue.shift()!, clock);
 			}
 			return new Promise<Session>((resolve, reject) => {
-				const timer = setTimeout(
-					() => {
-						const idx = waiters.findIndex((w) => w.resolve === resolve);
-						if (idx !== -1) waiters.splice(idx, 1);
-						reject(
-							new Error("E_HANDSHAKE_TIMEOUT: acceptSession deadline exceeded"),
-						);
-					},
-					Math.max(1, deadlineMs - clock.nowMs()),
-				);
+				const remaining = toRemainingMs(deadlineMs, clock);
+				const timer = setTimeout(() => {
+					const idx = waiters.findIndex((w) => w.resolve === resolve);
+					if (idx !== -1) waiters.splice(idx, 1);
+					reject(
+						new Error("E_HANDSHAKE_TIMEOUT: acceptSession deadline exceeded"),
+					);
+				}, remaining);
 
 				waiters.push({ resolve, reject, timer });
 			});
@@ -937,7 +946,7 @@ function wrapServerHandle(
 				clearTimeout(w.timer);
 				w.reject(new Error("E_SESSION_CLOSED: server stopping"));
 			}
-			const remaining = Math.max(1, deadlineMs - clock.nowMs());
+			const remaining = toRemainingMs(deadlineMs, clock);
 			await Promise.race([
 				native.close(),
 				new Promise<void>((_, reject) =>
@@ -1063,14 +1072,24 @@ export function createWebTransportAdapter(
 			}
 			started = true;
 
+			const rawTls = config.tls as Record<string, unknown> | undefined;
+			const cert = (rawTls?.certPem ?? rawTls?.cert) as
+				| string
+				| Uint8Array
+				| undefined;
+			const key = (rawTls?.keyPem ?? rawTls?.key) as
+				| string
+				| Uint8Array
+				| undefined;
+
 			const serverOptions: WtServerOptions = {
 				host: config.hostname,
 				port: config.port,
 				tls: {
-					certPem: config.tls?.cert as string | Uint8Array | undefined,
-					keyPem: config.tls?.key as string | Uint8Array | undefined,
-					cert: config.tls?.cert as string | Uint8Array | undefined,
-					key: config.tls?.key as string | Uint8Array | undefined,
+					certPem: cert,
+					keyPem: key,
+					cert,
+					key,
 				},
 				limits: profileToLimits(profile),
 				rateLimits: profileToRateLimits(profile),
