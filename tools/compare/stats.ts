@@ -37,7 +37,13 @@ export function percentile(samples: readonly number[], p: number): number {
 	const upperIndex = Math.ceil(rank);
 	const lower = values[lowerIndex] as number;
 	const upper = values[upperIndex] as number;
-	return lower + (upper - lower) * (rank - lowerIndex);
+	const fraction = rank - lowerIndex;
+	const result =
+		lower === upper ? lower : lower * (1 - fraction) + upper * fraction;
+	if (!Number.isFinite(result)) {
+		throw new RangeError("percentile result is non-finite");
+	}
+	return result;
 }
 
 /** Quantile spelling for callers that naturally use a [0, 1] probability. */
@@ -161,7 +167,9 @@ function studentsTCdf(value: number, degreesOfFreedom: number): number {
 
 /** Two-sided 95% Student-t critical value for a sample count. */
 export function studentTCritical95(sampleCount: number): number {
-	if (!Number.isSafeInteger(sampleCount) || sampleCount <= 1) return 0;
+	if (!Number.isSafeInteger(sampleCount) || sampleCount < 2) {
+		throw new RangeError("sample count must be a safe integer of at least 2");
+	}
 	const degreesOfFreedom = sampleCount - 1;
 	if (degreesOfFreedom < STUDENT_T_95_TWO_SIDED.length) {
 		return STUDENT_T_95_TWO_SIDED[degreesOfFreedom] ?? 0;
@@ -181,32 +189,66 @@ export function studentTCritical95(sampleCount: number): number {
 export function sampleSummary(input: readonly number[]): SampleSummary {
 	const samples = finiteSamples(input);
 	const count = samples.length;
-	const mean = samples.reduce((sum, value) => sum + value, 0) / count;
-	const variance =
-		count > 1
-			? samples.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+	const scale = samples.reduce(
+		(current, value) => Math.max(current, Math.abs(value)),
+		0,
+	);
+	const normalizedMean =
+		scale === 0
+			? 0
+			: samples.reduce((sum, value) => sum + value / scale, 0) / count;
+	const mean = scale * normalizedMean;
+	const normalizedVariance =
+		count > 1 && scale > 0
+			? samples.reduce(
+					(sum, value) => sum + (value / scale - normalizedMean) ** 2,
+					0,
+				) /
 				(count - 1)
 			: 0;
-	const stddev = Math.sqrt(variance);
+	const stddev = scale * Math.sqrt(normalizedVariance);
 	const standardError = count > 1 ? stddev / Math.sqrt(count) : 0;
-	const tCritical95 = studentTCritical95(count);
+	const tCritical95 = count > 1 ? studentTCritical95(count) : 0;
 	const marginOfError95 = tCritical95 * standardError;
-	return {
+	const p50 = percentile(samples, 50);
+	const p95 = percentile(samples, 95);
+	const p99 = percentile(samples, 99);
+	const min = samples.reduce((current, value) => Math.min(current, value));
+	const max = samples.reduce((current, value) => Math.max(current, value));
+	const result: SampleSummary = {
 		samples,
 		count,
 		mean,
-		min: Math.min(...samples),
-		max: Math.max(...samples),
+		min,
+		max,
 		stddev,
 		standardError,
 		tCritical95,
 		marginOfError95,
 		ci95Low: mean - marginOfError95,
 		ci95High: mean + marginOfError95,
-		p50: percentile(samples, 50),
-		p95: percentile(samples, 95),
-		p99: percentile(samples, 99),
+		p50,
+		p95,
+		p99,
 	};
+	const numericResults = [
+		result.mean,
+		result.min,
+		result.max,
+		result.stddev,
+		result.standardError,
+		result.tCritical95,
+		result.marginOfError95,
+		result.ci95Low,
+		result.ci95High,
+		result.p50,
+		result.p95,
+		result.p99,
+	];
+	if (numericResults.some((value) => !Number.isFinite(value))) {
+		throw new RangeError("sample summary result is non-finite or overflowed");
+	}
+	return result;
 }
 
 export const summarizeSamples = sampleSummary;

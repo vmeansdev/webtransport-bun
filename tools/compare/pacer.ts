@@ -11,6 +11,8 @@ export interface OpenLoopPacerOptions {
 	readonly catchUp?: "none" | "skip";
 }
 
+export const DEFAULT_OPEN_LOOP_CATCH_UP = "skip" as const;
+
 export interface PacingSlot {
 	readonly sequence: number;
 	readonly scheduledAtMs: number;
@@ -34,9 +36,11 @@ function finiteNow(value: number): number {
 }
 
 /**
- * An open-loop scheduler.  Slot timestamps are always derived from one epoch
+ * An open-loop scheduler. Slot timestamps are always derived from one epoch
  * and a sequence number, so time spent handling an event cannot accumulate as
- * drift.  The default `none` policy never silently catches up or skips slots.
+ * drift. The default `skip` policy drops overdue slots instead of repaying
+ * schedule debt as a burst; `none` is available only when every logical slot
+ * must be represented explicitly.
  */
 export class OpenLoopPacer {
 	readonly ratePerSecond: number;
@@ -55,7 +59,7 @@ export class OpenLoopPacer {
 		// Skipping overdue slots is the safe default: a delayed event loop must
 		// never repay a schedule debt as a burst.  Tests and diagnostics can opt
 		// into `none` when they need every logical slot represented.
-		this.catchUp = options.catchUp ?? "skip";
+		this.catchUp = options.catchUp ?? DEFAULT_OPEN_LOOP_CATCH_UP;
 		this.clock = {
 			now: options.now ?? (() => Date.now()),
 			sleep: options.sleep,
