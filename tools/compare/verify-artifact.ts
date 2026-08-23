@@ -1363,18 +1363,38 @@ function verifyCapacityProof(
 	requireKeys(linux, ["fd"], "$.capacityProof.linux", rejections);
 	const macFd = record(field(mac, "fd"));
 	const linuxFd = record(field(linux, "fd"));
+	const selectedRole = cell?.rolePlan.macRoles.find(
+		({ role }) => role === cell.rolePlan.sharding.role,
+	);
 	const parameters = cell?.parameters as Record<string, unknown> | undefined;
-	const liveConnections =
-		cell?.scenarioId === "connection-memory"
-			? parameters?.liveConnections
-			: cell?.scenarioId === "handshake-matrix" ||
-					cell?.scenarioId === "reconnect-storm"
-				? (parameters?.clientCount ?? parameters?.concurrency)
-				: undefined;
+	const canonicalCardinality =
+		selectedRole &&
+		Number.isSafeInteger(selectedRole.count) &&
+		selectedRole.count > 0
+			? selectedRole.count
+			: [
+					"liveConnections",
+					"subscriberCount",
+					"receiverCount",
+					"clientCount",
+					"sessionCount",
+					"concurrency",
+				]
+					.map((key) => parameters?.[key])
+					.find(
+						(value): value is number =>
+							typeof value === "number" &&
+							Number.isSafeInteger(value) &&
+							value > 0,
+					);
 	const isConnectionScale =
-		typeof liveConnections === "number" && liveConnections > 0;
+		canonicalCardinality !== undefined &&
+		(selectedRole?.processModel === "cohort" ||
+			(selectedRole?.processModel === "sharded" &&
+				canonicalCardinality >= 1_000) ||
+			(selectedRole === undefined && canonicalCardinality >= 1_000));
 	const expectedFreePorts = isConnectionScale
-		? Math.ceil(liveConnections * 1.25)
+		? Math.ceil(canonicalCardinality * 1.25)
 		: undefined;
 	for (const [fd, path] of [
 		[macFd, "$.capacityProof.mac.fd"],
@@ -1491,12 +1511,12 @@ function verifyCapacityProof(
 			isConnectionScale &&
 			typeof required === "number" &&
 			expectedFreePorts !== undefined &&
-			required !== expectedFreePorts
+			required < expectedFreePorts
 		)
 			addRejection(
 				rejections,
 				"CAPACITY_EPHEMERAL_PORT_PROOF_INVALID",
-				`requiredFreePorts must equal ceil(liveConnections * 1.25) = ${expectedFreePorts}`,
+				`requiredFreePorts must be at least ceil(connection cardinality * 1.25) = ${expectedFreePorts}`,
 				"$.capacityProof.mac.ephemeralPorts.requiredFreePorts",
 			);
 	}

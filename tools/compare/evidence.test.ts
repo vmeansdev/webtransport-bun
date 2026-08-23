@@ -117,6 +117,28 @@ function scaleArtifactObject(
 	);
 }
 
+function roleScaleArtifactObject(
+	baseBytes: Uint8Array,
+	cellId: string,
+): RunArtifact {
+	const artifact = canonicalCellArtifact(baseBytes, cellId);
+	const cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, cellId);
+	const parameters = cell.parameters as Record<string, unknown>;
+	const payloadBytes = [
+		"messageBytes",
+		"recordBytes",
+		"tickBytes",
+		"firstMessageBytes",
+		"operationBytes",
+		"chunkBytes",
+		"controlMessageBytes",
+	]
+		.map((key) => parameters[key])
+		.find((value) => typeof value === "number");
+	if (typeof payloadBytes === "number") setPayloadBytes(artifact, payloadBytes);
+	return artifact;
+}
+
 function compareCode(
 	mutator: (artifact: RunArtifact) => void,
 	rebindSource = false,
@@ -662,6 +684,15 @@ describe("fail-closed comparison evidence", () => {
 		nonScale.capacityProof.mac.ephemeralPorts.requiredFreePorts = 1;
 		bindDirectDigest(nonScale);
 		expect(verifyRunArtifactObject(nonScale).evidenceStatus).toBe("PASS");
+		const ordinaryTicker = roleScaleArtifactObject(
+			wsBytes,
+			"ticker-fanout/rate-10000",
+		);
+		ordinaryTicker.capacityProof.mac.fd.effectiveChildLimit = 1_024;
+		ordinaryTicker.capacityProof.linux.fd.effectiveChildLimit = 1_024;
+		ordinaryTicker.capacityProof.mac.ephemeralPorts.requiredFreePorts = 1;
+		bindDirectDigest(ordinaryTicker);
+		expect(verifyRunArtifactObject(ordinaryTicker).evidenceStatus).toBe("PASS");
 		const zeroHeadroom = fixtureObject(wsBytes);
 		zeroHeadroom.capacityProof.mac.ephemeralPorts.requiredFreePorts = 0;
 		bindDirectDigest(zeroHeadroom);
@@ -699,6 +730,55 @@ describe("fail-closed comparison evidence", () => {
 		expect(
 			verifyRunArtifactObject(lowLinuxFd).rejections.map(({ code }) => code),
 		).toContain("CAPACITY_EFFECTIVE_LIMIT_TOO_LOW");
+	});
+
+	test("derives connection-scale proof from canonical role cardinality", () => {
+		for (const [subscriberCount, requiredFreePorts] of [
+			[5_000, 6_250],
+			[10_000, 12_500],
+		] as const) {
+			const cellId = `chat-fanout/subscribers-${subscriberCount}`;
+			const valid = roleScaleArtifactObject(wsBytes, cellId);
+			valid.capacityProof.mac.ephemeralPorts.requiredFreePorts =
+				requiredFreePorts;
+			bindDirectDigest(valid);
+			expect(verifyRunArtifactObject(valid).evidenceStatus).toBe("PASS");
+
+			const lowMacLimit = roleScaleArtifactObject(wsBytes, cellId);
+			lowMacLimit.capacityProof.mac.ephemeralPorts.requiredFreePorts =
+				requiredFreePorts;
+			lowMacLimit.capacityProof.mac.fd.effectiveChildLimit = 65_535;
+			bindDirectDigest(lowMacLimit);
+			expect(
+				verifyRunArtifactObject(lowMacLimit).rejections.map(({ code }) => code),
+			).toContain("CAPACITY_EFFECTIVE_LIMIT_TOO_LOW");
+
+			const lowLinuxLimit = roleScaleArtifactObject(wsBytes, cellId);
+			lowLinuxLimit.capacityProof.mac.ephemeralPorts.requiredFreePorts =
+				requiredFreePorts;
+			lowLinuxLimit.capacityProof.linux.fd.effectiveChildLimit = 65_535;
+			bindDirectDigest(lowLinuxLimit);
+			expect(
+				verifyRunArtifactObject(lowLinuxLimit).rejections.map(
+					({ code }) => code,
+				),
+			).toContain("CAPACITY_EFFECTIVE_LIMIT_TOO_LOW");
+
+			const lowPorts = roleScaleArtifactObject(wsBytes, cellId);
+			lowPorts.capacityProof.mac.ephemeralPorts.requiredFreePorts = 1;
+			bindDirectDigest(lowPorts);
+			expect(
+				verifyRunArtifactObject(lowPorts).rejections.map(({ code }) => code),
+			).toContain("CAPACITY_EPHEMERAL_PORT_PROOF_INVALID");
+		}
+
+		const reconnect = roleScaleArtifactObject(
+			wsBytes,
+			"reconnect-storm/cold-full",
+		);
+		reconnect.capacityProof.mac.ephemeralPorts.requiredFreePorts = 125;
+		bindDirectDigest(reconnect);
+		expect(verifyRunArtifactObject(reconnect).evidenceStatus).toBe("PASS");
 	});
 
 	test("rejects invalid units, empty/nonfinite/sparse samples, and percentiles", () => {
