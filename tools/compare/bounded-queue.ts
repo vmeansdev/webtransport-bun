@@ -77,7 +77,7 @@ const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(
 	"byteLength",
 )?.get as IntrinsicGetter<number> | undefined;
 const arrayBufferIsView = ArrayBuffer.isView;
-const dataViewConstructor = DataView;
+const objectHasOwn = Object.hasOwn;
 
 const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(
 	AbortSignal.prototype,
@@ -139,6 +139,16 @@ function fixedBacking(buffer: unknown): number {
 	return byteLength;
 }
 
+function isArrayBufferValue(value: unknown): boolean {
+	if (!arrayBufferByteLengthGetter) return false;
+	try {
+		arrayBufferByteLengthGetter.call(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function viewBytes(value: unknown):
 	| {
 			readonly buffer: ArrayBuffer;
@@ -147,7 +157,16 @@ function viewBytes(value: unknown):
 	  }
 	| undefined {
 	if (!arrayBufferIsView(value)) return undefined;
-	const isDataView = value instanceof dataViewConstructor;
+	let isDataView = false;
+	let byteLength: number | undefined;
+	if (dataViewByteLengthGetter) {
+		try {
+			byteLength = dataViewByteLengthGetter.call(value);
+			isDataView = true;
+		} catch {
+			// The DataView brand check failed; try the captured TypedArray getter.
+		}
+	}
 	const buffer = callIntrinsic(
 		isDataView ? dataViewBufferGetter : typedArrayBufferGetter,
 		value,
@@ -158,8 +177,8 @@ function viewBytes(value: unknown):
 		value,
 		"ArrayBuffer view",
 	);
-	const byteLength = callIntrinsic(
-		isDataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter,
+	byteLength ??= callIntrinsic(
+		typedArrayByteLengthGetter,
 		value,
 		"ArrayBuffer view",
 	);
@@ -177,7 +196,7 @@ function viewBytes(value: unknown):
 }
 
 function validateBinaryBacking(value: unknown): void {
-	if (value instanceof ArrayBuffer) {
+	if (isArrayBufferValue(value)) {
 		fixedBacking(value);
 		return;
 	}
@@ -188,7 +207,7 @@ function defaultSizeOf(value: unknown): number {
 	if (typeof value === "string") {
 		return new TextEncoder().encode(value).byteLength;
 	}
-	if (value instanceof ArrayBuffer) return fixedBacking(value);
+	if (isArrayBufferValue(value)) return fixedBacking(value);
 	const view = viewBytes(value);
 	if (view) return view.byteLength;
 	throw new TypeError(
@@ -275,8 +294,13 @@ function normalizeSignal(options: QueueWaitArgument): AbortSignal | undefined {
 	}
 	let signal: unknown;
 	try {
-		signal =
-			"value" in descriptor ? descriptor.value : descriptor.get?.call(options);
+		if (objectHasOwn(descriptor, "value")) signal = descriptor.value;
+		else if (objectHasOwn(descriptor, "get")) {
+			const getter = descriptor.get;
+			signal = typeof getter === "function" ? getter.call(options) : undefined;
+		} else {
+			signal = undefined;
+		}
 	} catch {
 		throw new TypeError("queue wait signal could not be read");
 	}
@@ -318,6 +342,102 @@ function validateWatermark(
 	return value;
 }
 
+type DescriptorMap = Record<PropertyKey, PropertyDescriptor>;
+
+type QueueOptionsSnapshot = {
+	readonly maxBytes: unknown;
+	readonly maxItems: unknown;
+	readonly maxItemCount: unknown;
+	readonly maxWaiters: unknown;
+	readonly maxItemWaiters: unknown;
+	readonly maxWatermarkWaiters: unknown;
+	readonly highWaterMark: unknown;
+	readonly lowWaterMark: unknown;
+	readonly sizeOf: unknown;
+};
+
+function ownOptionDescriptors(options: unknown, label: string): DescriptorMap {
+	if (!options || typeof options !== "object") {
+		throw new TypeError(`${label} must be an object`);
+	}
+	try {
+		return Object.assign(
+			Object.create(null) as DescriptorMap,
+			Object.getOwnPropertyDescriptors(options),
+		);
+	} catch {
+		throw new TypeError(`${label} properties could not be inspected`);
+	}
+}
+
+function rejectUnknownQueueOptions(
+	descriptors: DescriptorMap,
+	allowed: ReadonlySet<string>,
+): void {
+	for (const key of Reflect.ownKeys(descriptors)) {
+		if (typeof key !== "string" || !allowed.has(key)) {
+			throw new TypeError("queue options contain an unknown own property");
+		}
+	}
+}
+
+function readQueueOption(
+	descriptors: DescriptorMap,
+	options: object,
+	name: string,
+): unknown {
+	if (!objectHasOwn(descriptors, name)) return undefined;
+	const descriptor = descriptors[name];
+	if (!descriptor) return undefined;
+	try {
+		if (objectHasOwn(descriptor, "value")) return descriptor.value;
+		if (!objectHasOwn(descriptor, "get")) return undefined;
+		const getter = descriptor.get;
+		return typeof getter === "function" ? getter.call(options) : undefined;
+	} catch {
+		throw new TypeError(`queue option ${name} could not be read`);
+	}
+}
+
+function snapshotQueueOptions<T>(
+	options: ByteBoundedQueueOptions<T>,
+): QueueOptionsSnapshot {
+	const descriptors = ownOptionDescriptors(options, "queue options");
+	rejectUnknownQueueOptions(
+		descriptors,
+		new Set([
+			"maxBytes",
+			"maxItems",
+			"maxItemCount",
+			"maxWaiters",
+			"maxItemWaiters",
+			"maxWatermarkWaiters",
+			"highWaterMark",
+			"lowWaterMark",
+			"sizeOf",
+		]),
+	);
+	if (!objectHasOwn(descriptors, "maxBytes")) {
+		throw new TypeError("queue options must own maxBytes");
+	}
+	const owner = options as unknown as object;
+	return {
+		maxBytes: readQueueOption(descriptors, owner, "maxBytes"),
+		maxItems: readQueueOption(descriptors, owner, "maxItems"),
+		maxItemCount: readQueueOption(descriptors, owner, "maxItemCount"),
+		maxWaiters: readQueueOption(descriptors, owner, "maxWaiters"),
+		maxItemWaiters: readQueueOption(descriptors, owner, "maxItemWaiters"),
+		maxWatermarkWaiters: readQueueOption(
+			descriptors,
+			owner,
+			"maxWatermarkWaiters",
+		),
+		highWaterMark: readQueueOption(descriptors, owner, "highWaterMark"),
+		lowWaterMark: readQueueOption(descriptors, owner, "lowWaterMark"),
+		sizeOf: readQueueOption(descriptors, owner, "sizeOf"),
+	};
+}
+
 interface QueueEntry<T> {
 	readonly value: T;
 	readonly bytes: number;
@@ -342,52 +462,66 @@ export class ByteBoundedQueue<T> {
 	private reason: unknown;
 
 	constructor(options: ByteBoundedQueueOptions<T>) {
-		if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes <= 0) {
+		const snapshot = snapshotQueueOptions(options);
+		if (
+			!Number.isSafeInteger(snapshot.maxBytes) ||
+			(snapshot.maxBytes as number) <= 0
+		) {
 			throw new RangeError("maxBytes must be a positive safe integer");
 		}
-		this.maxBytes = options.maxBytes;
+		this.maxBytes = snapshot.maxBytes as number;
 		if (
-			options.maxItems !== undefined &&
-			options.maxItemCount !== undefined &&
-			options.maxItems !== options.maxItemCount
+			snapshot.maxItems !== undefined &&
+			snapshot.maxItemCount !== undefined &&
+			snapshot.maxItems !== snapshot.maxItemCount
 		) {
 			throw new RangeError("maxItems and maxItemCount must agree");
 		}
 		this.maxItems = validateCap(
 			"maxItems",
-			options.maxItems ?? options.maxItemCount,
+			(snapshot.maxItems as number | undefined) ??
+				(snapshot.maxItemCount as number | undefined),
 			DEFAULT_MAX_QUEUE_ITEMS,
 		);
 		this.maxItemCount = this.maxItems;
 		this.maxWaiters = validateCap(
 			"maxWaiters",
-			options.maxWaiters,
+			snapshot.maxWaiters as number | undefined,
 			DEFAULT_MAX_QUEUE_WAITERS,
 		);
 		this.maxItemWaiters = validateCap(
 			"maxItemWaiters",
-			options.maxItemWaiters,
+			snapshot.maxItemWaiters as number | undefined,
 			this.maxWaiters,
 		);
 		this.maxWatermarkWaiters = validateCap(
 			"maxWatermarkWaiters",
-			options.maxWatermarkWaiters,
+			snapshot.maxWatermarkWaiters as number | undefined,
 			this.maxWaiters,
 		);
 		this.highWaterMark = validateWatermark(
 			"highWaterMark",
-			options.highWaterMark ?? options.maxBytes,
-			options.maxBytes,
+			(snapshot.highWaterMark as number | undefined) ?? this.maxBytes,
+			this.maxBytes,
 		);
 		this.lowWaterMark = validateWatermark(
 			"lowWaterMark",
-			options.lowWaterMark ?? Math.floor(this.highWaterMark / 2),
-			options.maxBytes,
+			(snapshot.lowWaterMark as number | undefined) ??
+				Math.floor(this.highWaterMark / 2),
+			this.maxBytes,
 		);
 		if (this.lowWaterMark > this.highWaterMark) {
 			throw new RangeError("lowWaterMark must not exceed highWaterMark");
 		}
-		this.sizeOf = options.sizeOf ?? ((value: T) => defaultSizeOf(value));
+		if (
+			snapshot.sizeOf !== undefined &&
+			typeof snapshot.sizeOf !== "function"
+		) {
+			throw new TypeError("sizeOf must be a function");
+		}
+		this.sizeOf =
+			(snapshot.sizeOf as ((value: T) => number) | undefined) ??
+			((value: T) => defaultSizeOf(value));
 	}
 
 	get bytes(): number {
