@@ -362,10 +362,47 @@ describe("shared comparison driver core", () => {
 			catchUp: "none",
 		});
 		pacer.nextSlot();
-		pacer.nextSlot();
 		expect(() => pacer.nextSlot()).toThrow(/slot|safe|representable/i);
 		const clock = new ManualClock(Number.MAX_SAFE_INTEGER - 1);
 		expect(() => clock.advance(2)).toThrow(/overflow|safe/i);
+	});
+
+	test("rejects intervals that collapse at the selected epoch", () => {
+		const epochMs = 1_000_000_000;
+		const pacer = new OpenLoopPacer({
+			ratePerSecond: 1e12,
+			now: () => epochMs,
+			catchUp: "none",
+		});
+		expect(() => pacer.start()).toThrow(/monotonic|precision|representable/i);
+
+		const resettable = new OpenLoopPacer({
+			ratePerSecond: 1e12,
+			now: () => 0,
+			catchUp: "none",
+		});
+		resettable.nextSlot();
+		expect(() => resettable.reset(epochMs)).toThrow(
+			/monotonic|precision|representable/i,
+		);
+	});
+
+	test("rejects sequence slots that collapse after a large offset", () => {
+		const pacer = new OpenLoopPacer({
+			ratePerSecond: 100_000,
+			now: () => 0,
+			catchUp: "none",
+		});
+		expect(() => pacer.dueAt(Number.MAX_SAFE_INTEGER - 1)).toThrow(
+			/increasing|monotonic|precision|representable/i,
+		);
+	});
+
+	test("rejects an unsafe manual-clock duration before adding it", () => {
+		const clock = new ManualClock(-1);
+		expect(() => clock.advance(Number.MAX_SAFE_INTEGER + 1)).toThrow(
+			/duration|safe|representable/i,
+		);
 	});
 
 	test("reset starts a new warmup epoch and sequence", () => {

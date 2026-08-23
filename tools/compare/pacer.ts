@@ -49,6 +49,20 @@ function finiteSafeDuration(value: number, label: string): number {
 	return value;
 }
 
+function validateEpoch(epochMs: number, intervalMs: number): number {
+	const nextEpochMs = epochMs + intervalMs;
+	if (
+		!Number.isFinite(nextEpochMs) ||
+		Math.abs(nextEpochMs) > MAX_SAFE_TIME_MS ||
+		nextEpochMs <= epochMs
+	) {
+		throw new RangeError(
+			"epoch and interval must produce strictly increasing, safely representable slots",
+		);
+	}
+	return epochMs;
+}
+
 /**
  * An open-loop scheduler. Slot timestamps are always derived from one epoch
  * and a sequence number, so time spent handling an event cannot accumulate as
@@ -102,12 +116,14 @@ export class OpenLoopPacer {
 	}
 
 	start(atMs = this.clock.now()): number {
-		if (this.epochMs === undefined) this.epochMs = finiteNow(atMs);
+		if (this.epochMs === undefined) {
+			this.epochMs = validateEpoch(finiteNow(atMs), this.intervalMs);
+		}
 		return this.epochMs;
 	}
 
 	reset(atMs = this.clock.now()): void {
-		this.epochMs = finiteNow(atMs);
+		this.epochMs = validateEpoch(finiteNow(atMs), this.intervalMs);
 		this.nextSequence = 0;
 	}
 
@@ -116,16 +132,39 @@ export class OpenLoopPacer {
 	}
 
 	dueAt(sequence: number): number {
-		if (!Number.isSafeInteger(sequence) || sequence < 0) {
+		if (
+			!Number.isSafeInteger(sequence) ||
+			sequence < 0 ||
+			sequence >= Number.MAX_SAFE_INTEGER
+		) {
 			throw new RangeError("sequence must be a non-negative safe integer");
 		}
+		const epochMs = this.start();
+		const nextSequence = sequence + 1;
 		const offsetMs = sequence * this.intervalMs;
-		if (!Number.isFinite(offsetMs) || Math.abs(offsetMs) > MAX_SAFE_TIME_MS) {
+		const nextOffsetMs = nextSequence * this.intervalMs;
+		if (
+			!Number.isFinite(offsetMs) ||
+			Math.abs(offsetMs) > MAX_SAFE_TIME_MS ||
+			!Number.isFinite(nextOffsetMs) ||
+			Math.abs(nextOffsetMs) > MAX_SAFE_TIME_MS
+		) {
 			throw new RangeError("slot offset is not safely representable");
 		}
-		const dueMs = this.start() + offsetMs;
-		if (!Number.isFinite(dueMs) || Math.abs(dueMs) > MAX_SAFE_TIME_MS) {
+		const dueMs = epochMs + offsetMs;
+		const nextDueMs = epochMs + nextOffsetMs;
+		if (
+			!Number.isFinite(dueMs) ||
+			Math.abs(dueMs) > MAX_SAFE_TIME_MS ||
+			!Number.isFinite(nextDueMs) ||
+			Math.abs(nextDueMs) > MAX_SAFE_TIME_MS
+		) {
 			throw new RangeError("slot timestamp is not safely representable");
+		}
+		if (nextDueMs <= dueMs) {
+			throw new RangeError(
+				"adjacent slot timestamps must be strictly increasing",
+			);
 		}
 		return dueMs;
 	}
@@ -216,14 +255,15 @@ export class ManualClock implements PacerClock {
 	now = (): number => this.currentMs;
 
 	advance(milliseconds: number): void {
-		if (!Number.isFinite(milliseconds) || milliseconds < 0) {
-			throw new RangeError(
-				"advance duration must be a non-negative finite number",
-			);
-		}
-		const nextMs = this.currentMs + milliseconds;
+		const durationMs = finiteSafeDuration(milliseconds, "advance duration");
+		const nextMs = this.currentMs + durationMs;
 		if (!Number.isFinite(nextMs) || Math.abs(nextMs) > MAX_SAFE_TIME_MS) {
 			throw new RangeError("clock advance would overflow safe time");
+		}
+		if (durationMs > 0 && nextMs <= this.currentMs) {
+			throw new RangeError(
+				"clock advance is not safely representable at the current epoch",
+			);
 		}
 		this.currentMs = nextMs;
 	}
