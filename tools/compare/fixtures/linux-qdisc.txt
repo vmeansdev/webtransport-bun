@@ -1,0 +1,1 @@
+qdisc fq 1: dev eno1 root refcnt 2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023 quantum 3028b initial_quantum 15140b low_rate_threshold 550Kbit refill_delay 40.0ms timer_slack 10us horizon 10s horizon_drop
