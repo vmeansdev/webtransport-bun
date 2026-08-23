@@ -13,6 +13,13 @@ export interface OpenLoopPacerOptions {
 
 export const DEFAULT_OPEN_LOOP_CATCH_UP = "skip" as const;
 
+/**
+ * JavaScript can represent larger finite numbers, but not as exact millisecond
+ * coordinates.  Keep epochs, slot timestamps, and durations in the safe
+ * integer range so a schedule cannot silently collapse or overflow.
+ */
+const MAX_SAFE_TIME_MS = Number.MAX_SAFE_INTEGER;
+
 export interface PacingSlot {
 	readonly sequence: number;
 	readonly scheduledAtMs: number;
@@ -30,8 +37,15 @@ export class PacerDeadlineError extends Error {
 }
 
 function finiteNow(value: number): number {
-	if (!Number.isFinite(value))
-		throw new RangeError("clock.now() must be finite");
+	if (!Number.isFinite(value) || Math.abs(value) > MAX_SAFE_TIME_MS)
+		throw new RangeError("clock.now() must be finite and safely representable");
+	return value;
+}
+
+function finiteSafeDuration(value: number, label: string): number {
+	if (!Number.isFinite(value) || value < 0 || value > MAX_SAFE_TIME_MS) {
+		throw new RangeError(`${label} must be finite and safely representable`);
+	}
 	return value;
 }
 
@@ -56,6 +70,15 @@ export class OpenLoopPacer {
 		}
 		this.ratePerSecond = options.ratePerSecond;
 		this.intervalMs = 1_000 / options.ratePerSecond;
+		if (
+			!Number.isFinite(this.intervalMs) ||
+			this.intervalMs < Number.EPSILON ||
+			this.intervalMs > MAX_SAFE_TIME_MS
+		) {
+			throw new RangeError(
+				"ratePerSecond produces an interval that is not safely representable",
+			);
+		}
 		// Skipping overdue slots is the safe default: a delayed event loop must
 		// never repay a schedule debt as a burst.  Tests and diagnostics can opt
 		// into `none` when they need every logical slot represented.
@@ -96,7 +119,15 @@ export class OpenLoopPacer {
 		if (!Number.isSafeInteger(sequence) || sequence < 0) {
 			throw new RangeError("sequence must be a non-negative safe integer");
 		}
-		return this.start() + sequence * this.intervalMs;
+		const offsetMs = sequence * this.intervalMs;
+		if (!Number.isFinite(offsetMs) || Math.abs(offsetMs) > MAX_SAFE_TIME_MS) {
+			throw new RangeError("slot offset is not safely representable");
+		}
+		const dueMs = this.start() + offsetMs;
+		if (!Number.isFinite(dueMs) || Math.abs(dueMs) > MAX_SAFE_TIME_MS) {
+			throw new RangeError("slot timestamp is not safely representable");
+		}
+		return dueMs;
 	}
 
 	nextSlot(atMs = this.clock.now()): PacingSlot {
@@ -108,14 +139,24 @@ export class OpenLoopPacer {
 			const firstCurrentSlot = Math.floor(
 				(emittedAtMs - epochMs) / this.intervalMs,
 			);
+			if (!Number.isSafeInteger(firstCurrentSlot) || firstCurrentSlot < 0) {
+				throw new RangeError(
+					"derived slot sequence is not safely representable",
+				);
+			}
 			if (firstCurrentSlot > sequence) {
 				skippedSlots = firstCurrentSlot - sequence;
 				sequence = firstCurrentSlot;
 				this.nextSequence = sequence;
 			}
 		}
-		const scheduledAtMs = epochMs + sequence * this.intervalMs;
+		const scheduledAtMs = this.dueAt(sequence);
+		if (sequence >= Number.MAX_SAFE_INTEGER) {
+			throw new RangeError("next slot sequence is not safely representable");
+		}
 		this.nextSequence = sequence + 1;
+		const deltaMs = scheduledAtMs - emittedAtMs;
+		finiteSafeDuration(Math.abs(deltaMs), "slot delta");
 		return {
 			sequence,
 			scheduledAtMs,
@@ -134,12 +175,17 @@ export class OpenLoopPacer {
 		) {
 			throw new RangeError("deadlineMs must be finite or positive infinity");
 		}
+		if (Number.isFinite(deadlineMs)) finiteNow(deadlineMs);
 		const now = finiteNow(this.clock.now());
 		const due = this.dueAt(this.nextSequence);
 		if (due > now) {
 			const remaining = deadlineMs - now;
 			if (remaining <= 0) throw new PacerDeadlineError();
+			if (Number.isFinite(remaining)) {
+				finiteSafeDuration(remaining, "deadline remainder");
+			}
 			const delay = due - now;
+			finiteSafeDuration(delay, "slot delay");
 			if (!this.clock.sleep) {
 				throw new PacerDeadlineError(
 					"pacer requires a sleep function before the deadline",
@@ -153,8 +199,9 @@ export class OpenLoopPacer {
 				);
 			}
 		}
-		if (this.clock.now() > deadlineMs) throw new PacerDeadlineError();
-		return this.nextSlot(this.clock.now());
+		const emittedAtMs = finiteNow(this.clock.now());
+		if (emittedAtMs > deadlineMs) throw new PacerDeadlineError();
+		return this.nextSlot(emittedAtMs);
 	}
 }
 
@@ -174,7 +221,11 @@ export class ManualClock implements PacerClock {
 				"advance duration must be a non-negative finite number",
 			);
 		}
-		this.currentMs += milliseconds;
+		const nextMs = this.currentMs + milliseconds;
+		if (!Number.isFinite(nextMs) || Math.abs(nextMs) > MAX_SAFE_TIME_MS) {
+			throw new RangeError("clock advance would overflow safe time");
+		}
+		this.currentMs = nextMs;
 	}
 
 	sleep = async (milliseconds: number): Promise<void> => {

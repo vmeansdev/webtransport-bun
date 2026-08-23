@@ -174,6 +174,28 @@ export function studentTCritical95(sampleCount: number): number {
 	if (degreesOfFreedom < STUDENT_T_95_TWO_SIDED.length) {
 		return STUDENT_T_95_TWO_SIDED[degreesOfFreedom] ?? 0;
 	}
+	// The incomplete-beta evaluation is useful for ordinary sample sizes but
+	// loses precision when the degrees of freedom approach the safe-integer
+	// ceiling.  Use the standard Student-t -> normal expansion in that range;
+	// its correction terms remain finite and preserve the six-decimal output
+	// contract without pretending that a huge count has exact distribution
+	// arithmetic available in JavaScript.
+	if (degreesOfFreedom >= 1_000_000) {
+		const z = 1.959963984540054;
+		const inverseDf = 1 / degreesOfFreedom;
+		const inverseDfSquared = inverseDf * inverseDf;
+		const inverseDfCubed = inverseDfSquared * inverseDf;
+		const approximation =
+			z +
+			((z ** 3 + z) / 4) * inverseDf +
+			((5 * z ** 5 + 16 * z ** 3 + 3 * z) / 96) * inverseDfSquared +
+			((3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / 384) *
+				inverseDfCubed;
+		if (!Number.isFinite(approximation)) {
+			throw new RangeError("Student-t critical value is non-finite");
+		}
+		return Number(approximation.toFixed(6));
+	}
 	const target = 0.975;
 	let low = 0;
 	let high = 2;
