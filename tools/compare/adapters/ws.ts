@@ -300,6 +300,118 @@ function deadlineError(
 	return new WebSocketTransportError(code, message);
 }
 
+function cloneCapacityProfile(profile: CapacityProfile): CapacityProfile {
+	return {
+		profileId: profile.profileId,
+		maxSessions: profile.maxSessions,
+		maxHandshakesInFlight: profile.maxHandshakesInFlight,
+		maxStreamsPerSessionBidi: profile.maxStreamsPerSessionBidi,
+		maxStreamsPerSessionUni: profile.maxStreamsPerSessionUni,
+		maxStreamsGlobal: profile.maxStreamsGlobal,
+		maxDatagramSize: profile.maxDatagramSize,
+		maxQueuedBytesGlobal: profile.maxQueuedBytesGlobal,
+		maxQueuedBytesPerSession: profile.maxQueuedBytesPerSession,
+		maxQueuedBytesPerStream: profile.maxQueuedBytesPerStream,
+		backpressureTimeoutMs: profile.backpressureTimeoutMs,
+		handshakeTimeoutMs: profile.handshakeTimeoutMs,
+		idleTimeoutMs: profile.idleTimeoutMs,
+		handshakesPerSec: profile.handshakesPerSec,
+		handshakesBurst: profile.handshakesBurst,
+		handshakesBurstPerPrefix: profile.handshakesBurstPerPrefix,
+		streamsPerSec: profile.streamsPerSec,
+		streamsBurst: profile.streamsBurst,
+		datagramsPerSec: profile.datagramsPerSec,
+		datagramsBurst: profile.datagramsBurst,
+	};
+}
+
+function freezeCapacityProfile(profile: CapacityProfile): CapacityProfile {
+	return Object.freeze(profile);
+}
+
+class ByteReservation {
+	private released = false;
+
+	constructor(
+		private readonly ledger: ByteReservationLedger,
+		readonly sessionKey: string,
+		readonly streamKey: string | undefined,
+		readonly bytes: number,
+	) {}
+
+	release(): void {
+		if (this.released) return;
+		this.released = true;
+		this.ledger.release(this);
+	}
+}
+
+class ByteReservationLedger {
+	private globalBytes = 0;
+	private readonly sessionBytesMap = new Map<string, number>();
+	private readonly streamBytesMap = new Map<string, number>();
+
+	constructor(private readonly profile: CapacityProfile) {}
+
+	reserve(
+		bytes: number,
+		sessionKey: string,
+		streamKey?: string,
+	): ByteReservation {
+		if (!Number.isSafeInteger(bytes) || bytes <= 0)
+			throw new RangeError("reservation bytes must be a positive safe integer");
+		const sessionBytes = this.sessionBytesMap.get(sessionKey) ?? 0;
+		const streamBytes = streamKey
+			? (this.streamBytesMap.get(streamKey) ?? 0)
+			: 0;
+		if (
+			this.globalBytes + bytes > this.profile.maxQueuedBytesGlobal ||
+			sessionBytes + bytes > this.profile.maxQueuedBytesPerSession ||
+			(streamKey !== undefined &&
+				streamBytes + bytes > this.profile.maxQueuedBytesPerStream)
+		) {
+			throw new WebSocketTransportError(
+				"E_QUEUE_FULL",
+				"WebSocket queued-byte budget exhausted",
+			);
+		}
+		this.globalBytes += bytes;
+		this.sessionBytesMap.set(sessionKey, sessionBytes + bytes);
+		if (streamKey !== undefined)
+			this.streamBytesMap.set(streamKey, streamBytes + bytes);
+		return new ByteReservation(this, sessionKey, streamKey, bytes);
+	}
+
+	release(reservation: ByteReservation): void {
+		this.globalBytes = Math.max(0, this.globalBytes - reservation.bytes);
+		this.decrement(
+			this.sessionBytesMap,
+			reservation.sessionKey,
+			reservation.bytes,
+		);
+		if (reservation.streamKey !== undefined)
+			this.decrement(
+				this.streamBytesMap,
+				reservation.streamKey,
+				reservation.bytes,
+			);
+	}
+
+	sessionBytes(sessionKey: string): number {
+		return this.sessionBytesMap.get(sessionKey) ?? 0;
+	}
+
+	private decrement(
+		map: Map<string, number>,
+		key: string,
+		bytes: number,
+	): void {
+		const remaining = Math.max(0, (map.get(key) ?? 0) - bytes);
+		if (remaining === 0) map.delete(key);
+		else map.set(key, remaining);
+	}
+}
+
 async function waitForQueue<T>(
 	queue: ByteBoundedQueue<T>,
 	clock: TransportClock,
@@ -319,10 +431,15 @@ async function waitForQueue<T>(
 	const read = queue.waitForItem({ signal: controller.signal });
 	let timer: Promise<never> | undefined;
 	if (remaining !== Number.POSITIVE_INFINITY) {
-		timer = clock.sleep(remaining).then(() => {
+		timer = (async () => {
+			// Let synchronous socket handlers finish enqueueing before an injected
+			// zero-cost clock can win the race.
+			await Promise.resolve();
+			await Promise.resolve();
+			await clock.sleep(remaining);
 			controller.abort(deadlineError(code, message));
 			throw deadlineError(code, message);
-		});
+		})();
 	}
 	try {
 		const result = timer ? await Promise.race([read, timer]) : await read;
@@ -336,10 +453,16 @@ async function waitForQueue<T>(
 	}
 }
 
+type DrainWaiter = {
+	readonly resolve: () => void;
+	readonly reject: (reason: unknown) => void;
+};
+
 async function waitForDrain(
-	waiters: Array<() => void>,
+	waiters: DrainWaiter[],
 	clock: TransportClock,
 	deadlineMs: number,
+	maxWaiters: number,
 ): Promise<void> {
 	if (deadlineMs === Number.POSITIVE_INFINITY) {
 		throw deadlineError(
@@ -354,13 +477,23 @@ async function waitForDrain(
 			"server drain deadline expired",
 		);
 	if (remaining === Number.POSITIVE_INFINITY) {
-		await new Promise<void>((resolve) => waiters.push(resolve));
-		return;
+		throw deadlineError(
+			"E_BACKPRESSURE_TIMEOUT",
+			"a finite deadline is required for WebSocket drain waits",
+		);
 	}
-	let resolver!: () => void;
-	const ready = new Promise<void>((resolve) => {
-		resolver = resolve;
-		waiters.push(resolve);
+	if (waiters.length >= maxWaiters)
+		throw deadlineError(
+			"E_QUEUE_FULL",
+			"WebSocket drain waiter limit exceeded",
+		);
+	let waiter!: DrainWaiter;
+	const ready = new Promise<void>((resolve, reject) => {
+		waiter = {
+			resolve,
+			reject,
+		};
+		waiters.push(waiter);
 	});
 	const timeout = clock.sleep(remaining).then(() => {
 		throw deadlineError(
@@ -371,9 +504,28 @@ async function waitForDrain(
 	try {
 		await Promise.race([ready, timeout]);
 	} finally {
-		const index = waiters.indexOf(resolver);
+		const index = waiters.indexOf(waiter);
 		if (index >= 0) waiters.splice(index, 1);
 	}
+}
+
+async function runWithDeadline<T>(
+	operation: Promise<T> | T,
+	clock: TransportClock,
+	timeoutMs: number,
+	error: WebSocketTransportError,
+): Promise<T> {
+	if (timeoutMs === Number.POSITIVE_INFINITY)
+		throw new WebSocketTransportError(
+			error.code,
+			`${error.message}; an explicit finite deadline is required`,
+		);
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 0)
+		throw new RangeError("timeoutMs must be a non-negative finite time");
+	const timeout = clock.sleep(timeoutMs).then(() => {
+		throw error;
+	});
+	return Promise.race([Promise.resolve(operation), timeout]);
 }
 
 function socketData(event: unknown): unknown {
@@ -504,6 +656,12 @@ class AdmissionController {
 		}
 	}
 
+	/** Record a handshake that arrived after the server stopped. */
+	rejectHandshakeAttempt(): void {
+		this.counters.handshakesAttempted += 1;
+		this.counters.handshakesRejected += 1;
+	}
+
 	closeSession(): void {
 		this.counters.sessionsActive = Math.max(
 			0,
@@ -533,6 +691,15 @@ class AdmissionController {
 		return true;
 	}
 
+	rejectStreamAttempt(): void {
+		this.counters.streamOpenAttempts += 1;
+		this.counters.streamOpenRejected += 1;
+	}
+
+	rejectAcceptedStream(): void {
+		this.counters.streamOpenRejected += 1;
+	}
+
 	closeStream(): void {
 		this.streamsActive = Math.max(0, this.streamsActive - 1);
 	}
@@ -554,14 +721,24 @@ class AdmissionController {
 		return true;
 	}
 
+	rejectDatagram(): void {
+		this.counters.datagramAttempts += 1;
+		this.counters.datagramRejected += 1;
+	}
+
 	snapshot(): AdmissionCounters {
 		return { ...this.counters };
 	}
 }
 
-type QueuedFrame = { readonly frame: WebSocketFrame; readonly bytes: number };
+type QueuedFrame = {
+	readonly frame: WebSocketFrame;
+	readonly bytes: number;
+	readonly reservation: ByteReservation;
+};
 
 class WsSession implements Session {
+	private readonly handshakeWaiters = new Set<DrainWaiter>();
 	private _role: string;
 	private active = true;
 	private didCloseSocket = false;
@@ -571,15 +748,20 @@ class WsSession implements Session {
 	private readonly bidiAcceptQueue: ByteBoundedQueue<WsChannel>;
 	private readonly channels = new Map<number, WsChannel>();
 	private nextChannelId = 1;
-	private readonly drainWaiters: Array<() => void> = [];
+	private readonly drainWaiters: DrainWaiter[] = [];
+	private readonly blockedSendReservations = new Set<ByteReservation>();
 	private serverBlocked = false;
 	private handshakeComplete = false;
+	private handshakeTerminal = false;
+	private handshakeAdmissionSettled = false;
 	private admissionAccepted = false;
+	private acceptReservation: ByteReservation | undefined;
 	private readonly sourceKey: string;
 	private readonly clientHighWaterMark: number;
 	private readonly clientLowWaterMark: number;
 	private readonly clientWatermarkPollMs: number;
 	private readonly onHandshakeRole?: (session: WsSession) => boolean;
+	private readonly onHandshakeAccepted?: (session: WsSession) => boolean;
 	private readonly openUniCount = { value: 0 };
 	private readonly openBidiCount = { value: 0 };
 
@@ -592,14 +774,23 @@ class WsSession implements Session {
 		private readonly admission: AdmissionController,
 		maxReceiveQueueBytes: number,
 		maxReceiveQueueItems: number,
-		receiveWaiterLimit: number,
+		private readonly receiveWaiterLimit: number,
 		private readonly onClosed?: (session: WsSession) => void,
 		clientHighWaterMark?: number,
 		clientLowWaterMark?: number,
 		clientWatermarkPollMs = 10,
 		onHandshakeRole?: (session: WsSession) => boolean,
+		onHandshakeAccepted?: (session: WsSession) => boolean,
+		private readonly ledger: ByteReservationLedger = new ByteReservationLedger(
+			profile,
+		),
+		private readonly sessionKey = "session",
+		channelParity: 1 | 2 = isServer ? 2 : 1,
 	) {
 		this._role = initialRole;
+		this.nextChannelId = channelParity;
+		if (isServer || socket.readyState === 1)
+			this.handshakeState = "socket-open";
 		if (!isServer) this.metrics.sessionsOpened = 1;
 		this.clientHighWaterMark =
 			clientHighWaterMark ?? profile.maxQueuedBytesPerSession;
@@ -607,6 +798,7 @@ class WsSession implements Session {
 			clientLowWaterMark ?? Math.floor(this.clientHighWaterMark / 2);
 		this.clientWatermarkPollMs = clientWatermarkPollMs;
 		this.onHandshakeRole = onHandshakeRole;
+		this.onHandshakeAccepted = onHandshakeAccepted;
 		this.sourceKey = isServer
 			? ((socket as ServerWebSocketLike).remoteAddress ?? "unknown")
 			: "local";
@@ -630,6 +822,13 @@ class WsSession implements Session {
 		});
 	}
 
+	private handshakeState:
+		| "connecting"
+		| "socket-open"
+		| "hello-sent"
+		| "established"
+		| "failed" = "connecting";
+
 	get role(): string {
 		return this._role;
 	}
@@ -638,19 +837,113 @@ class WsSession implements Session {
 		if (role) this._role = role;
 	}
 
+	markSocketOpen(): void {
+		if (this.handshakeState === "connecting")
+			this.handshakeState = "socket-open";
+	}
+
+	markHandshakeSent(): void {
+		if (!this.handshakeTerminal) this.handshakeState = "hello-sent";
+	}
+
+	isActive(): boolean {
+		return this.active;
+	}
+
+	setAcceptReservation(reservation: ByteReservation): void {
+		this.acceptReservation?.release();
+		this.acceptReservation = reservation;
+	}
+
+	releaseAcceptReservation(): void {
+		this.acceptReservation?.release();
+		this.acceptReservation = undefined;
+	}
+
+	private settleHandshakeAdmission(accepted: boolean): void {
+		if (this.handshakeAdmissionSettled) return;
+		this.handshakeAdmissionSettled = true;
+		this.admissionAccepted = accepted;
+		this.admission.finishHandshake(accepted);
+	}
+
 	markHandshakeComplete(): void {
-		if (this.handshakeComplete) return;
+		if (this.handshakeTerminal) return;
+		this.handshakeTerminal = true;
+		this.handshakeState = "established";
 		this.handshakeComplete = true;
-		this.admissionAccepted = true;
-		this.admission.finishHandshake(true);
+		this.settleHandshakeAdmission(true);
+		for (const waiter of this.handshakeWaiters) waiter.resolve();
+		this.handshakeWaiters.clear();
 	}
 
 	rejectHandshake(reason: unknown): void {
-		if (this.handshakeComplete) return;
-		this.handshakeComplete = true;
-		this.admissionAccepted = false;
-		this.admission.finishHandshake(false);
+		if (this.handshakeTerminal) return;
+		this.handshakeTerminal = true;
+		this.handshakeState = "failed";
+		this.settleHandshakeAdmission(false);
+		for (const waiter of this.handshakeWaiters) waiter.reject(reason);
+		this.handshakeWaiters.clear();
 		this.closeInternal(reason, true);
+	}
+
+	async waitForHandshake(deadlineMs: number): Promise<void> {
+		if (this.handshakeComplete) return;
+		if (!this.active)
+			throw new WebSocketTransportError(
+				"E_SESSION_CLOSED",
+				"WebSocket session closed before handshake",
+			);
+		const remaining = remainingMs(this.clock, deadlineMs);
+		if (remaining === Number.POSITIVE_INFINITY || remaining <= 0) {
+			const error = deadlineError(
+				"E_HANDSHAKE_TIMEOUT",
+				remaining === Number.POSITIVE_INFINITY
+					? "WebSocket handshake acknowledgement requires a finite deadline"
+					: "WebSocket handshake acknowledgement deadline expired",
+			);
+			this.rejectHandshake(error);
+			throw error;
+		}
+		let waiter!: DrainWaiter;
+		const ready = new Promise<void>((resolve, reject) => {
+			waiter = { resolve, reject };
+			this.handshakeWaiters.add(waiter);
+		});
+		const timeout = (async () => {
+			await Promise.resolve();
+			if (this.handshakeComplete) return new Promise<never>(() => {});
+			await this.clock.sleep(remaining);
+			const error = deadlineError(
+				"E_HANDSHAKE_TIMEOUT",
+				"WebSocket handshake acknowledgement deadline expired",
+			);
+			this.rejectHandshake(error);
+			throw error;
+		})();
+		try {
+			await Promise.race([ready, timeout]);
+		} finally {
+			this.handshakeWaiters.delete(waiter);
+		}
+	}
+
+	startServerHandshakeTimer(): void {
+		if (!this.isServer || this.handshakeComplete) return;
+		void (async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+			await this.clock.sleep(this.profile.handshakeTimeoutMs);
+			if (!this.handshakeComplete && this.active)
+				this.rejectHandshake(
+					deadlineError(
+						"E_HANDSHAKE_TIMEOUT",
+						"WebSocket server handshake deadline expired",
+					),
+				);
+		})().catch((error) => {
+			if (!this.handshakeComplete && this.active) this.rejectHandshake(error);
+		});
 	}
 
 	private assertActive(): void {
@@ -664,8 +957,20 @@ class WsSession implements Session {
 	private updateQueuePeak(): void {
 		this.metrics.queueBytesPeak = Math.max(
 			this.metrics.queueBytesPeak,
-			this.incoming.bytes,
+			this.ledger.sessionBytes(this.sessionKey),
 		);
+	}
+
+	reserve(bytes: number, channelId?: number): ByteReservation {
+		const reservation = this.ledger.reserve(
+			bytes,
+			this.sessionKey,
+			channelId === undefined
+				? undefined
+				: `${this.sessionKey}:stream:${channelId}`,
+		);
+		this.updateQueuePeak();
+		return reservation;
 	}
 
 	private async waitClientWatermark(deadlineMs: number): Promise<void> {
@@ -676,7 +981,15 @@ class WsSession implements Session {
 			highWaterMark,
 			Math.max(0, this.clientLowWaterMark),
 		);
-		while (socket.bufferedAmount >= highWaterMark) {
+		if (highWaterMark <= 0 || socket.bufferedAmount < highWaterMark) return;
+		if (deadlineMs === Number.POSITIVE_INFINITY) {
+			this.metrics.timedOut += 1;
+			throw deadlineError(
+				"E_BACKPRESSURE_TIMEOUT",
+				"client bufferedAmount requires a finite deadline",
+			);
+		}
+		while (socket.bufferedAmount > lowWaterMark) {
 			const remaining = remainingMs(this.clock, deadlineMs);
 			if (remaining <= 0) {
 				this.metrics.timedOut += 1;
@@ -691,14 +1004,18 @@ class WsSession implements Session {
 					"WebSocket client closed",
 				);
 			await this.clock.sleep(Math.min(this.clientWatermarkPollMs, remaining));
-			if (socket.bufferedAmount <= lowWaterMark) return;
 		}
 	}
 
 	private async waitServerDrain(deadlineMs: number): Promise<void> {
 		if (!this.serverBlocked) return;
 		try {
-			await waitForDrain(this.drainWaiters, this.clock, deadlineMs);
+			await waitForDrain(
+				this.drainWaiters,
+				this.clock,
+				deadlineMs,
+				this.receiveWaiterLimit,
+			);
 		} catch (error) {
 			this.metrics.timedOut += 1;
 			throw error;
@@ -711,11 +1028,25 @@ class WsSession implements Session {
 		deadlineMs: number,
 		channelId?: number,
 		countAttempt = true,
+		attemptAlreadyCounted = false,
 	): Promise<SendObservation> {
 		this.assertActive();
-		if (countAttempt) this.metrics.attempted += 1;
-		if (!this.isServer) await this.waitClientWatermark(deadlineMs);
-		else await this.waitServerDrain(deadlineMs);
+		if (countAttempt && !attemptAlreadyCounted) this.metrics.attempted += 1;
+		let reservation: ByteReservation;
+		try {
+			reservation = this.reserve(encoded.byteLength, channelId);
+		} catch (error) {
+			if (countAttempt) this.metrics.refused += 1;
+			throw error;
+		}
+		try {
+			if (!this.isServer) await this.waitClientWatermark(deadlineMs);
+			else await this.waitServerDrain(deadlineMs);
+		} catch (error) {
+			reservation.release();
+			if (countAttempt) this.metrics.refused += 1;
+			throw error;
+		}
 		let status: number;
 		try {
 			status = this.isServer
@@ -725,6 +1056,7 @@ class WsSession implements Session {
 					) as unknown as number);
 			if (!this.isServer) status = encoded.byteLength;
 		} catch (error) {
+			reservation.release();
 			this.closeInternal(error, false);
 			throw new WebSocketTransportError(
 				"E_SESSION_CLOSED",
@@ -745,6 +1077,9 @@ class WsSession implements Session {
 		if (this.isServer && status === -1) {
 			// Bun has already queued this exact message. Never call send again for it.
 			this.serverBlocked = true;
+			this.blockedSendReservations.add(reservation);
+		} else {
+			reservation.release();
 		}
 		if (this.isServer && status > 0) this.serverBlocked = false;
 		return {
@@ -760,16 +1095,86 @@ class WsSession implements Session {
 		};
 	}
 
+	/**
+	 * Send the server's handshake ACK synchronously. Bun's server send is
+	 * synchronous, and keeping this control transition synchronous prevents an
+	 * accept waiter from racing the handshake completion microtask.
+	 */
+	private sendHandshakeAck(): number {
+		if (!this.isServer)
+			throw new WebSocketTransportError(
+				"E_INTERNAL",
+				"only a server session can send a WebSocket handshake ACK",
+			);
+		const encoded = encodeWebSocketFrame({ kind: "hello-ack" });
+		const reservation = this.reserve(encoded.byteLength);
+		let status: number;
+		try {
+			status = (this.socket as ServerWebSocketLike).send(encoded, false);
+		} catch (error) {
+			reservation.release();
+			throw new WebSocketTransportError(
+				"E_SESSION_CLOSED",
+				"WebSocket handshake acknowledgement failed",
+				{ cause: error },
+			);
+		}
+		if (status === 0) {
+			reservation.release();
+			throw new WebSocketTransportError(
+				"E_QUEUE_FULL",
+				"WebSocket handshake acknowledgement was refused",
+			);
+		}
+		if (status === -1) {
+			this.serverBlocked = true;
+			this.blockedSendReservations.add(reservation);
+		} else {
+			reservation.release();
+			this.serverBlocked = false;
+		}
+		return status;
+	}
+
 	private openStreamAdmission(kind: "uni" | "bidi"): boolean {
 		const count = kind === "uni" ? this.openUniCount : this.openBidiCount;
 		const limit =
 			kind === "uni"
 				? this.profile.maxStreamsPerSessionUni
 				: this.profile.maxStreamsPerSessionBidi;
-		if (count.value >= limit || !this.admission.openStream(this.sourceKey))
+		if (count.value >= limit) {
+			this.admission.rejectStreamAttempt();
 			return false;
+		}
+		if (!this.admission.openStream(this.sourceKey)) return false;
 		count.value += 1;
 		return true;
+	}
+
+	private allocateChannelId(): number {
+		const channelId = this.nextChannelId;
+		if (
+			!Number.isSafeInteger(channelId) ||
+			channelId <= 0 ||
+			channelId > 0xffff_ffff
+		)
+			throw new WebSocketTransportError(
+				"E_LIMIT_EXCEEDED",
+				"WebSocket channel ID namespace exhausted",
+			);
+		this.nextChannelId += 2;
+		return channelId;
+	}
+
+	private acceptsRemoteChannelId(channelId: number): boolean {
+		const expectedParity = this.isServer ? 1 : 0;
+		return (
+			Number.isSafeInteger(channelId) &&
+			channelId > 0 &&
+			channelId <= 0xffff_ffff &&
+			channelId % 2 === expectedParity &&
+			!this.channels.has(channelId)
+		);
 	}
 
 	releaseStream(kind: "uni" | "bidi"): void {
@@ -785,10 +1190,13 @@ class WsSession implements Session {
 		message: WireMessage,
 		deadlineMs: number,
 	): Promise<SendObservation> {
+		this.assertActive();
+		this.metrics.attempted += 1;
 		if (
 			kind === "datagram" &&
 			message.payload.byteLength > this.profile.maxDatagramSize
 		) {
+			this.admission.rejectDatagram();
 			this.metrics.refused += 1;
 			throw new WebSocketTransportError(
 				"E_LIMIT_EXCEEDED",
@@ -810,14 +1218,31 @@ class WsSession implements Session {
 			encodeWebSocketFrame({ kind: "message", payload, deliveryKind: kind }),
 			kind,
 			deadlineMs,
+			undefined,
+			true,
+			true,
 		);
 	}
 
 	async sendText(text: string, deadlineMs: number): Promise<SendObservation> {
 		this.assertActive();
 		this.metrics.attempted += 1;
-		if (!this.isServer) await this.waitClientWatermark(deadlineMs);
-		else await this.waitServerDrain(deadlineMs);
+		const bytes = new TextEncoder().encode(text);
+		let reservation: ByteReservation;
+		try {
+			reservation = this.reserve(bytes.byteLength);
+		} catch (error) {
+			this.metrics.refused += 1;
+			throw error;
+		}
+		try {
+			if (!this.isServer) await this.waitClientWatermark(deadlineMs);
+			else await this.waitServerDrain(deadlineMs);
+		} catch (error) {
+			reservation.release();
+			this.metrics.refused += 1;
+			throw error;
+		}
 		let status: number;
 		try {
 			if (this.isServer) {
@@ -827,6 +1252,7 @@ class WsSession implements Session {
 				status = text.length;
 			}
 		} catch (error) {
+			reservation.release();
 			this.closeInternal(error, false);
 			throw new WebSocketTransportError(
 				"E_SESSION_CLOSED",
@@ -837,10 +1263,13 @@ class WsSession implements Session {
 		const accepted = !this.isServer || status === -1 || status > 0;
 		if (accepted) this.metrics.queued += 1;
 		if (this.isServer && status === 0) this.metrics.refused += 1;
-		if (this.isServer && status === -1) this.serverBlocked = true;
+		if (this.isServer && status === -1) {
+			this.serverBlocked = true;
+			this.blockedSendReservations.add(reservation);
+		} else reservation.release();
 		return {
 			status,
-			bytes: new TextEncoder().encode(text).byteLength,
+			bytes: bytes.byteLength,
 			deliveryKind: "reliable-message",
 			attempted: true,
 			queued: accepted,
@@ -862,6 +1291,7 @@ class WsSession implements Session {
 				"E_HANDSHAKE_TIMEOUT",
 				"message receive deadline expired",
 			);
+			entry.reservation.release();
 			if (entry.frame.kind !== "message") continue;
 			if (entry.frame.deliveryKind && entry.frame.deliveryKind !== kind)
 				continue;
@@ -888,6 +1318,7 @@ class WsSession implements Session {
 		_options?: { readonly sourceKey?: string },
 	): Promise<SendChannel> {
 		this.assertActive();
+		const channelId = this.allocateChannelId();
 		if (!this.openStreamAdmission("uni"))
 			throw new WebSocketTransportError(
 				"E_LIMIT_EXCEEDED",
@@ -895,7 +1326,7 @@ class WsSession implements Session {
 			);
 		const channel = new WsChannel(
 			this,
-			this.nextChannelId++,
+			channelId,
 			true,
 			false,
 			"uni",
@@ -903,13 +1334,24 @@ class WsSession implements Session {
 			this.clock,
 		);
 		this.channels.set(channel.channelId, channel);
-		this.metrics.streamsOpened += 1;
-		await this.sendControl(
-			{ kind: "open-uni", channelId: channel.channelId },
-			"reliable-message",
-			deadlineMs,
-		);
-		return channel;
+		try {
+			const observation = await this.sendControl(
+				{ kind: "open-uni", channelId: channel.channelId },
+				"reliable-message",
+				deadlineMs,
+			);
+			if (observation.status === 0)
+				throw new WebSocketTransportError(
+					"E_QUEUE_FULL",
+					"WebSocket uni channel open was refused",
+				);
+			this.metrics.streamsOpened += 1;
+			return channel;
+		} catch (error) {
+			this.channels.delete(channel.channelId);
+			channel.closeLocal(error);
+			throw error;
+		}
 	}
 
 	async acceptUni(deadlineMs: number): Promise<ReceiveChannel> {
@@ -920,6 +1362,7 @@ class WsSession implements Session {
 			"E_HANDSHAKE_TIMEOUT",
 			"uni stream accept deadline expired",
 		);
+		channel.releaseAcceptReservation();
 		return channel;
 	}
 
@@ -928,6 +1371,7 @@ class WsSession implements Session {
 		_options?: { readonly sourceKey?: string },
 	): Promise<BidiChannel> {
 		this.assertActive();
+		const channelId = this.allocateChannelId();
 		if (!this.openStreamAdmission("bidi"))
 			throw new WebSocketTransportError(
 				"E_LIMIT_EXCEEDED",
@@ -935,7 +1379,7 @@ class WsSession implements Session {
 			);
 		const channel = new WsChannel(
 			this,
-			this.nextChannelId++,
+			channelId,
 			true,
 			true,
 			"bidi",
@@ -943,13 +1387,24 @@ class WsSession implements Session {
 			this.clock,
 		);
 		this.channels.set(channel.channelId, channel);
-		this.metrics.streamsOpened += 1;
-		await this.sendControl(
-			{ kind: "open-bidi", channelId: channel.channelId },
-			"reliable-message",
-			deadlineMs,
-		);
-		return channel;
+		try {
+			const observation = await this.sendControl(
+				{ kind: "open-bidi", channelId: channel.channelId },
+				"reliable-message",
+				deadlineMs,
+			);
+			if (observation.status === 0)
+				throw new WebSocketTransportError(
+					"E_QUEUE_FULL",
+					"WebSocket bidi channel open was refused",
+				);
+			this.metrics.streamsOpened += 1;
+			return channel;
+		} catch (error) {
+			this.channels.delete(channel.channelId);
+			channel.closeLocal(error);
+			throw error;
+		}
 	}
 
 	async acceptBidi(deadlineMs: number): Promise<BidiChannel> {
@@ -960,6 +1415,7 @@ class WsSession implements Session {
 			"E_HANDSHAKE_TIMEOUT",
 			"bidi stream accept deadline expired",
 		);
+		channel.releaseAcceptReservation();
 		return channel;
 	}
 
@@ -1022,15 +1478,33 @@ class WsSession implements Session {
 		this.bidiAcceptQueue.close(reason);
 	}
 
+	private releaseIncomingReservations(): void {
+		for (const entry of this.incoming.drain()) entry.reservation.release();
+	}
+
+	private rejectDrainWaiters(reason: unknown): void {
+		for (const waiter of this.drainWaiters.splice(0)) waiter.reject(reason);
+	}
+
 	private closeInternal(reason: unknown, closeSocket: boolean): void {
 		if (!this.active) return;
 		this.active = false;
+		if (!this.handshakeTerminal) {
+			this.handshakeTerminal = true;
+			this.handshakeState = "failed";
+			for (const waiter of this.handshakeWaiters) waiter.reject(reason);
+			this.handshakeWaiters.clear();
+		}
+		this.settleHandshakeAdmission(false);
+		this.rejectDrainWaiters(reason);
+		this.releaseAcceptReservation();
+		for (const reservation of this.blockedSendReservations)
+			reservation.release();
+		this.blockedSendReservations.clear();
+		this.releaseIncomingReservations();
 		this.incoming.close(reason);
 		this.closeChannels(reason);
-		if (!this.handshakeComplete) {
-			this.handshakeComplete = true;
-			this.admission.finishHandshake(false);
-		} else if (this.admissionAccepted) {
+		if (this.handshakeComplete && this.admissionAccepted) {
 			this.admission.closeSession();
 		}
 		if (closeSocket && !this.didCloseSocket) {
@@ -1060,7 +1534,10 @@ class WsSession implements Session {
 
 	onDrain(): void {
 		this.serverBlocked = false;
-		for (const resolve of this.drainWaiters.splice(0)) resolve();
+		for (const waiter of this.drainWaiters.splice(0)) waiter.resolve();
+		for (const reservation of this.blockedSendReservations)
+			reservation.release();
+		this.blockedSendReservations.clear();
 	}
 
 	onSocketError(error: unknown): void {
@@ -1098,26 +1575,93 @@ class WsSession implements Session {
 			return;
 		}
 		if (frame.kind === "hello") {
+			if (
+				!this.isServer ||
+				this.handshakeTerminal ||
+				this.handshakeState !== "socket-open"
+			) {
+				this.metrics.dropped += 1;
+				return;
+			}
+			if (frame.payload.byteLength === 0 || frame.payload.byteLength > 255) {
+				this.rejectHandshake(
+					new WebSocketTransportError(
+						"E_LIMIT_EXCEEDED",
+						"WebSocket role handshake is invalid",
+					),
+				);
+				return;
+			}
 			const role = new TextDecoder().decode(frame.payload);
 			this.setRole(role);
-			if (this.onHandshakeRole && !this.onHandshakeRole(this)) return;
-			this.markHandshakeComplete();
-			if (this.isServer) {
-				void this.sendControl(
-					{ kind: "hello-ack" },
-					"reliable-message",
-					this.clock.nowMs() + this.profile.backpressureTimeoutMs,
-					false,
+			let handshakeReservation: ByteReservation;
+			try {
+				handshakeReservation = this.reserve(
+					DEFAULT_FRAME_BYTES + frame.payload.byteLength,
 				);
+			} catch (error) {
+				this.rejectHandshake(error);
+				return;
+			}
+			try {
+				if (this.onHandshakeRole && !this.onHandshakeRole(this))
+					throw new WebSocketTransportError(
+						"E_LIMIT_EXCEEDED",
+						"WebSocket role rejected",
+					);
+				this.sendHandshakeAck();
+				if (this.onHandshakeAccepted && !this.onHandshakeAccepted(this))
+					throw new WebSocketTransportError(
+						"E_QUEUE_FULL",
+						"WebSocket session accept queue is full",
+					);
+				this.markHandshakeComplete();
+			} catch (error) {
+				this.rejectHandshake(error);
+			} finally {
+				handshakeReservation.release();
 			}
 			return;
 		}
-		if (frame.kind === "hello-ack") return;
+		if (frame.kind === "hello-ack") {
+			if (
+				!this.isServer &&
+				this.handshakeState === "hello-sent" &&
+				frame.channelId === 0 &&
+				frame.payload.byteLength === 0 &&
+				frame.deliveryKind === undefined
+			) {
+				try {
+					const reservation = this.reserve(
+						DEFAULT_FRAME_BYTES + frame.payload.byteLength,
+					);
+					reservation.release();
+					this.markHandshakeComplete();
+				} catch {
+					this.metrics.dropped += 1;
+				}
+			} else this.metrics.dropped += 1;
+			return;
+		}
 		this.metrics.serverObserved += 1;
 		if (frame.kind === "open-uni" || frame.kind === "open-bidi") {
 			const streamKind = frame.kind === "open-uni" ? "uni" : "bidi";
+			if (!this.acceptsRemoteChannelId(frame.channelId)) {
+				this.metrics.dropped += 1;
+				return;
+			}
 			if (!this.openStreamAdmission(streamKind)) {
 				this.metrics.dropped += 1;
+				return;
+			}
+			let acceptReservation: ByteReservation;
+			try {
+				acceptReservation = this.reserve(
+					DEFAULT_FRAME_BYTES + frame.payload.byteLength,
+				);
+			} catch {
+				this.metrics.dropped += 1;
+				this.releaseStream(streamKind);
 				return;
 			}
 			const channel = new WsChannel(
@@ -1129,6 +1673,7 @@ class WsSession implements Session {
 				this.profile,
 				this.clock,
 			);
+			channel.setAcceptReservation(acceptReservation);
 			this.channels.set(frame.channelId, channel);
 			const accepted =
 				frame.kind === "open-uni"
@@ -1137,7 +1682,12 @@ class WsSession implements Session {
 			if (!accepted) {
 				this.metrics.dropped += 1;
 				this.channels.delete(frame.channelId);
-				this.releaseStream(streamKind);
+				channel.closeLocal(
+					new WebSocketTransportError(
+						"E_QUEUE_FULL",
+						"WebSocket channel accept queue is full",
+					),
+				);
 			} else this.metrics.streamsAccepted += 1;
 			return;
 		}
@@ -1160,8 +1710,16 @@ class WsSession implements Session {
 				return;
 			}
 			const bytes = frame.payload.byteLength + DEFAULT_FRAME_BYTES;
-			const entry = { frame, bytes };
+			let reservation: ByteReservation;
+			try {
+				reservation = this.reserve(bytes);
+			} catch {
+				this.metrics.dropped += 1;
+				return;
+			}
+			const entry = { frame, bytes, reservation };
 			if (!this.incoming.tryPush(entry)) {
+				reservation.release();
 				this.metrics.dropped += 1;
 				return;
 			}
@@ -1183,7 +1741,7 @@ class WsSession implements Session {
 			...this.metrics,
 			...admission,
 			active: this.active,
-			queueBytes: this.incoming.bytes,
+			queueBytes: this.ledger.sessionBytes(this.sessionKey),
 			receiveQueueItems: this.incoming.length,
 			receiveQueueBytes: this.incoming.bytes,
 			role: this.role,
@@ -1191,11 +1749,18 @@ class WsSession implements Session {
 	}
 }
 
+type QueuedChannelData = {
+	readonly bytes: Uint8Array;
+	readonly reservation: ByteReservation;
+};
+
 class WsChannel implements SendChannel, ReceiveChannel {
-	private ended = false;
+	private sendEnded: boolean;
+	private receiveEnded: boolean;
 	private locallyClosed = false;
 	private streamReleased = false;
-	private readonly incoming: ByteBoundedQueue<Uint8Array>;
+	private acceptReservation: ByteReservation | undefined;
+	private readonly incoming: ByteBoundedQueue<QueuedChannelData>;
 
 	constructor(
 		private readonly session: WsSession,
@@ -1206,16 +1771,27 @@ class WsChannel implements SendChannel, ReceiveChannel {
 		profile: CapacityProfile,
 		private readonly clock: TransportClock,
 	) {
-		this.incoming = new ByteBoundedQueue<Uint8Array>({
+		this.sendEnded = !sendAllowed;
+		this.receiveEnded = !receiveAllowed;
+		this.incoming = new ByteBoundedQueue<QueuedChannelData>({
 			maxBytes: profile.maxQueuedBytesPerStream,
 			maxItems: profile.maxStreamsGlobal,
 			maxWaiters: 1_024,
-			sizeOf: (bytes) => Math.max(1, bytes.byteLength),
+			sizeOf: (entry) => Math.max(1, entry.bytes.byteLength),
 		});
 	}
 
+	setAcceptReservation(reservation: ByteReservation): void {
+		this.acceptReservation = reservation;
+	}
+
+	releaseAcceptReservation(): void {
+		this.acceptReservation?.release();
+		this.acceptReservation = undefined;
+	}
+
 	async write(bytes: Uint8Array, deadlineMs: number): Promise<SendObservation> {
-		if (!this.sendAllowed || this.ended || this.locallyClosed)
+		if (!this.sendAllowed || this.sendEnded || this.locallyClosed)
 			throw new WebSocketTransportError(
 				"E_SESSION_CLOSED",
 				"channel is not writable",
@@ -1228,8 +1804,8 @@ class WsChannel implements SendChannel, ReceiveChannel {
 	}
 
 	async end(deadlineMs: number): Promise<void> {
-		if (this.ended || this.locallyClosed) return;
-		this.ended = true;
+		if (this.sendEnded || this.locallyClosed) return;
+		this.sendEnded = true;
 		try {
 			await this.session.endChannel(this.channelId, deadlineMs);
 		} finally {
@@ -1243,7 +1819,7 @@ class WsChannel implements SendChannel, ReceiveChannel {
 				"E_SESSION_CLOSED",
 				"channel is not readable",
 			);
-		if (this.ended && this.incoming.length === 0) return null;
+		if (this.receiveEnded && this.incoming.length === 0) return null;
 		try {
 			const result = await waitForQueue(
 				this.incoming,
@@ -1252,10 +1828,11 @@ class WsChannel implements SendChannel, ReceiveChannel {
 				"E_HANDSHAKE_TIMEOUT",
 				"channel read deadline expired",
 			);
-			return result;
+			result.reservation.release();
+			return result.bytes;
 		} catch (error) {
 			if (
-				this.ended &&
+				this.receiveEnded &&
 				error instanceof WebSocketTransportError &&
 				error.code === "E_SESSION_CLOSED"
 			)
@@ -1270,6 +1847,9 @@ class WsChannel implements SendChannel, ReceiveChannel {
 		try {
 			await this.session.cancelChannel(this.channelId, deadlineMs);
 		} finally {
+			this.receiveEnded = true;
+			this.sendEnded = true;
+			this.releaseQueuedData();
 			this.incoming.close(
 				new WebSocketTransportError("E_SESSION_CLOSED", "channel cancelled"),
 			);
@@ -1278,25 +1858,38 @@ class WsChannel implements SendChannel, ReceiveChannel {
 	}
 
 	onData(bytes: Uint8Array): boolean {
-		if (
-			!this.receiveAllowed ||
-			this.locallyClosed ||
-			this.ended ||
-			!this.incoming.tryPush(bytes.slice())
-		) {
+		if (!this.receiveAllowed || this.locallyClosed || this.receiveEnded) {
+			return false;
+		}
+		let reservation: ByteReservation;
+		try {
+			reservation = this.session.reserve(
+				DEFAULT_FRAME_BYTES + bytes.byteLength,
+				this.channelId,
+			);
+		} catch {
+			return false;
+		}
+		if (!this.incoming.tryPush({ bytes: bytes.slice(), reservation })) {
+			reservation.release();
 			return false;
 		}
 		return true;
 	}
 
 	onEnd(): void {
-		this.ended = true;
+		this.receiveEnded = true;
+		this.releaseAcceptReservation();
 		this.incoming.close();
 		this.sessionChannelClosed();
 	}
 
 	closeRemote(): void {
 		this.locallyClosed = true;
+		this.sendEnded = true;
+		this.receiveEnded = true;
+		this.releaseQueuedData();
+		this.releaseAcceptReservation();
 		this.incoming.close(
 			new WebSocketTransportError(
 				"E_SESSION_CLOSED",
@@ -1308,8 +1901,16 @@ class WsChannel implements SendChannel, ReceiveChannel {
 
 	closeLocal(reason?: unknown): void {
 		this.locallyClosed = true;
+		this.sendEnded = true;
+		this.receiveEnded = true;
+		this.releaseQueuedData();
+		this.releaseAcceptReservation();
 		this.incoming.close(reason);
 		this.sessionChannelClosed();
+	}
+
+	private releaseQueuedData(): void {
+		for (const entry of this.incoming.drain()) entry.reservation.release();
 	}
 
 	private sessionChannelClosed(): void {
@@ -1322,9 +1923,12 @@ class WsChannel implements SendChannel, ReceiveChannel {
 class WsServerHandle implements ServerHandle {
 	private readonly pending: ByteBoundedQueue<WsSession>;
 	private readonly sessions = new Set<WsSession>();
+	private readonly activeSessions = new Set<WsSession>();
 	private readonly socketSessions = new WeakMap<object, WsSession>();
 	private stopped = false;
+	private stopPromise: Promise<void> | undefined;
 	private readonly metrics = emptyMetrics();
+	private nextSessionId = 0;
 
 	constructor(
 		private readonly runtime: WebSocketServerRuntime,
@@ -1335,6 +1939,8 @@ class WsServerHandle implements ServerHandle {
 		private readonly maxReceiveQueueBytes: number,
 		private readonly maxReceiveQueueItems: number,
 		private readonly receiveWaiterLimit: number,
+		private readonly ledger: ByteReservationLedger,
+		private readonly onStopped?: () => void,
 	) {
 		this.pending = new ByteBoundedQueue<WsSession>({
 			maxBytes: Math.max(1, profile.maxSessions),
@@ -1346,6 +1952,11 @@ class WsServerHandle implements ServerHandle {
 
 	addSocket(socket: ServerWebSocketLike): void {
 		const source = socket.remoteAddress ?? "unknown";
+		if (this.stopped) {
+			this.admission.rejectHandshakeAttempt();
+			socket.close(1013, "server closing");
+			return;
+		}
 		if (!this.admission.beginHandshake(source)) {
 			socket.close(1013, "capacity or rate limit");
 			return;
@@ -1365,15 +1976,19 @@ class WsServerHandle implements ServerHandle {
 			this.maxReceiveQueueItems,
 			this.receiveWaiterLimit,
 			(closed) => {
-				this.sessions.delete(closed);
-				this.metrics.sessionsClosed += 1;
+				this.activeSessions.delete(closed);
 			},
 			undefined,
 			undefined,
 			10,
 			(closed) => this.acceptIfRole(closed),
+			(closed) => this.enqueueAcceptedSession(closed),
+			this.ledger,
+			`server-${++this.nextSessionId}`,
+			2,
 		);
 		this.sessions.add(session);
+		this.activeSessions.add(session);
 		this.socketSessions.set(socket as object, session);
 		this.metrics.sessionsOpened += 1;
 		// The real Bun server dispatches through the handler below. Fakes may
@@ -1388,52 +2003,51 @@ class WsServerHandle implements ServerHandle {
 		socket.addEventListener?.("close", (event) =>
 			session.onSocketClose(socketCloseCode(event), socketCloseReason(event)),
 		);
+		session.startServerHandshakeTimer();
 	}
 
 	private acceptIfRole(session: WsSession): boolean {
-		if (this.expectedRole && session.role !== this.expectedRole) {
-			session.rejectHandshake(
-				new WebSocketTransportError(
-					"E_LIMIT_EXCEEDED",
-					"WebSocket role rejected",
-				),
-			);
+		return !this.expectedRole || session.role === this.expectedRole;
+	}
+
+	private enqueueAcceptedSession(session: WsSession): boolean {
+		let reservation: ByteReservation;
+		try {
+			reservation = session.reserve(DEFAULT_FRAME_BYTES);
+		} catch {
 			return false;
 		}
-		if (!this.pending.tryPush(session)) {
-			session.rejectHandshake(
-				new WebSocketTransportError(
-					"E_QUEUE_FULL",
-					"session accept queue full",
-				),
-			);
-			return false;
-		}
-		return true;
+		session.setAcceptReservation(reservation);
+		const pushed = this.pending.tryPush(session);
+		if (pushed) return true;
+		session.releaseAcceptReservation();
+		return false;
 	}
 
 	sessionFor(socket: ServerWebSocketLike): WsSession | undefined {
 		return this.socketSessions.get(socket as object);
 	}
 
-	acceptSession(deadlineMs: number): Promise<Session> {
+	async acceptSession(deadlineMs: number): Promise<Session> {
 		if (this.stopped)
-			return Promise.reject(
-				new WebSocketTransportError(
-					"E_SESSION_CLOSED",
-					"WebSocket server stopped",
-				),
+			throw new WebSocketTransportError(
+				"E_SESSION_CLOSED",
+				"WebSocket server stopped",
 			);
-		return waitForQueue(
+		const session = await waitForQueue(
 			this.pending,
 			this.clock,
 			deadlineMs,
 			"E_HANDSHAKE_TIMEOUT",
 			"session accept deadline expired",
 		);
+		session.releaseAcceptReservation();
+		if (!session.isActive()) return this.acceptSession(deadlineMs);
+		return session;
 	}
 
-	async stop(_deadlineMs: number): Promise<void> {
+	async stop(deadlineMs: number): Promise<void> {
+		if (this.stopPromise) return this.stopPromise;
 		if (this.stopped) return;
 		this.stopped = true;
 		this.pending.close(
@@ -1442,23 +2056,50 @@ class WsServerHandle implements ServerHandle {
 				"WebSocket server stopped",
 			),
 		);
-		for (const session of this.sessions)
-			await session.close(Number.POSITIVE_INFINITY);
-		await this.runtime.stop(true);
+		for (const session of this.pending.drain())
+			session.releaseAcceptReservation();
+		const operation = (async () => {
+			for (const session of this.activeSessions)
+				await session.close(Number.POSITIVE_INFINITY);
+			await this.runtime.stop(true);
+		})();
+		this.stopPromise = runWithDeadline(
+			operation,
+			this.clock,
+			deadlineMs,
+			deadlineError(
+				"E_BACKPRESSURE_TIMEOUT",
+				"WebSocket server stop deadline expired",
+			),
+		).then(
+			() => {
+				this.onStopped?.();
+			},
+			(error) => {
+				throw error;
+			},
+		);
+		return this.stopPromise;
 	}
 
 	snapshot(): TransportMetrics {
 		const aggregate = copyMetrics(this.metrics);
-		for (const session of this.sessions)
-			mergeMetrics(aggregate, session.snapshot() as unknown as MutableMetrics);
+		let queueBytes = 0;
+		let receiveQueueBytes = 0;
+		for (const session of this.sessions) {
+			const snapshot = session.snapshot();
+			mergeMetrics(aggregate, snapshot as unknown as MutableMetrics);
+			queueBytes += snapshot.queueBytes;
+			receiveQueueBytes += snapshot.receiveQueueBytes;
+		}
 		const admission = this.admission.snapshot();
 		return {
 			...aggregate,
 			...admission,
 			active: !this.stopped,
-			queueBytes: this.pending.bytes,
+			queueBytes,
 			receiveQueueItems: this.pending.length,
-			receiveQueueBytes: this.pending.bytes,
+			receiveQueueBytes,
 		};
 	}
 }
@@ -1500,17 +2141,44 @@ function defaultServerFactory(
 	return bun.serve(options);
 }
 
-function mergeClientTls(
-	tls: ClientTlsOptions | undefined,
-): ClientTlsOptions | undefined {
-	if (!tls) return undefined;
-	if (tls.rejectUnauthorized !== true) {
+function hasTlsMaterial(value: unknown): boolean {
+	if (typeof value === "string") return value.trim().length > 0;
+	if (value instanceof ArrayBuffer) return value.byteLength > 0;
+	if (ArrayBuffer.isView(value)) return value.byteLength > 0;
+	if (Array.isArray(value))
+		return value.length > 0 && value.every((item) => hasTlsMaterial(item));
+	return false;
+}
+
+function mergeClientTls(tls: ClientTlsOptions | undefined): ClientTlsOptions {
+	if (
+		!tls ||
+		tls.rejectUnauthorized !== true ||
+		typeof tls.serverName !== "string" ||
+		tls.serverName.trim().length === 0 ||
+		!hasTlsMaterial(tls.ca)
+	) {
 		throw new WebSocketTransportError(
 			"E_TLS",
-			"WebSocket comparison requires rejectUnauthorized: true",
+			"WebSocket comparison requires custom CA, SNI, and rejectUnauthorized",
 		);
 	}
 	return { ...tls, rejectUnauthorized: true };
+}
+
+function validateServerTls(tls: ServerConfig["tls"]): void {
+	if (
+		!tls ||
+		!hasTlsMaterial(tls.cert) ||
+		!hasTlsMaterial(tls.key) ||
+		typeof tls.serverName !== "string" ||
+		tls.serverName.trim().length === 0
+	) {
+		throw new WebSocketTransportError(
+			"E_TLS",
+			"WebSocket comparison requires server certificate, key, and SNI",
+		);
+	}
 }
 
 export class WebSocketAdapter implements TransportAdapter {
@@ -1525,9 +2193,16 @@ export class WebSocketAdapter implements TransportAdapter {
 	private readonly receiveWaiterLimit: number;
 	private readonly clientWatermarkPollMs: number;
 	private readonly clientAdmission: AdmissionController;
+	private readonly ledger: ByteReservationLedger;
+	private nextClientSessionId = 0;
+	private activeServer: WsServerHandle | undefined;
 
 	constructor(options: WebSocketAdapterOptions = {}) {
-		this.profile = options.capacityProfile ?? CANONICAL_CAPACITY_PROFILE;
+		this.profile = freezeCapacityProfile(
+			cloneCapacityProfile(
+				options.capacityProfile ?? CANONICAL_CAPACITY_PROFILE,
+			),
+		);
 		this.clock = options.clock ?? systemTransportClock;
 		this.clientFactory = options.clientFactory ?? defaultClientFactory;
 		this.serverFactory = options.serverFactory ?? defaultServerFactory;
@@ -1537,6 +2212,7 @@ export class WebSocketAdapter implements TransportAdapter {
 		this.receiveWaiterLimit = options.receiveWaiterLimit ?? 1_024;
 		this.clientWatermarkPollMs = options.clientWatermarkPollMs ?? 10;
 		this.clientAdmission = new AdmissionController(this.profile, this.clock);
+		this.ledger = new ByteReservationLedger(this.profile);
 		this.submittedCapacityProfile = Object.freeze({
 			profile: this.profile,
 			bytes: canonicalJson(this.profile),
@@ -1559,6 +2235,11 @@ export class WebSocketAdapter implements TransportAdapter {
 			);
 		let tls: ClientTlsOptions | undefined;
 		try {
+			if (!/^wss:\/\//iu.test(config.url))
+				throw new WebSocketTransportError(
+					"E_TLS",
+					"WebSocket comparison requires a wss:// URL",
+				);
 			tls = mergeClientTls(config.tls);
 		} catch (error) {
 			admission.finishHandshake(false);
@@ -1595,6 +2276,11 @@ export class WebSocketAdapter implements TransportAdapter {
 			config.clientHighWaterMark,
 			config.clientLowWaterMark,
 			config.clientWatermarkPollMs ?? this.clientWatermarkPollMs,
+			undefined,
+			undefined,
+			this.ledger,
+			`client-${++this.nextClientSessionId}`,
+			1,
 		);
 		socket.binaryType = "arraybuffer";
 		socket.addEventListener("message", (event) =>
@@ -1622,17 +2308,29 @@ export class WebSocketAdapter implements TransportAdapter {
 			}
 			let openListener: EventListener | undefined;
 			let openErrorListener: EventListener | undefined;
+			let openCloseListener: EventListener | undefined;
 			try {
 				const opened = new Promise<void>((resolve, reject) => {
-					openListener = (() => resolve()) as unknown as EventListener;
+					openListener = (() => {
+						session.markSocketOpen();
+						resolve();
+					}) as unknown as EventListener;
 					openErrorListener = ((event: unknown) =>
 						reject(
 							new WebSocketTransportError("E_TLS", "WebSocket open failed", {
 								cause: socketData(event),
 							}),
 						)) as unknown as EventListener;
-					socket.addEventListener("open", openListener);
+					openCloseListener = (() =>
+						reject(
+							new WebSocketTransportError(
+								"E_SESSION_CLOSED",
+								"WebSocket closed before open",
+							),
+						)) as unknown as EventListener;
+					socket.addEventListener("close", openCloseListener);
 					socket.addEventListener("error", openErrorListener);
+					socket.addEventListener("open", openListener);
 				});
 				const timeout = this.clock.sleep(remaining).then(() => {
 					throw deadlineError(
@@ -1648,36 +2346,76 @@ export class WebSocketAdapter implements TransportAdapter {
 				if (openListener) socket.removeEventListener("open", openListener);
 				if (openErrorListener)
 					socket.removeEventListener("error", openErrorListener);
+				if (openCloseListener)
+					socket.removeEventListener("close", openCloseListener);
 			}
 		}
+		session.markSocketOpen();
 		// The role handshake is control metadata, not application admission or
-		// delivery. It is deliberately excluded from the scenario ledger.
+		// delivery, but its short-lived bytes still obey the queue budget.
+		const hello = encodeHandshakeFrame(config.role);
+		let handshakeReservation: ByteReservation | undefined;
 		try {
-			socket.send(encodeHandshakeFrame(config.role));
+			handshakeReservation = session.reserve(hello.byteLength);
+			socket.send(hello);
 		} catch (error) {
-			session.onSocketError(error);
-			throw new WebSocketTransportError(
-				"E_SESSION_CLOSED",
-				"WebSocket role handshake failed",
-				{ cause: error },
-			);
+			handshakeReservation?.release();
+			const handshakeError =
+				error instanceof WebSocketTransportError
+					? error
+					: new WebSocketTransportError(
+							"E_SESSION_CLOSED",
+							"WebSocket role handshake failed",
+							{ cause: error },
+						);
+			session.rejectHandshake(handshakeError);
+			throw handshakeError;
 		}
-		session.markHandshakeComplete();
+		handshakeReservation.release();
+		session.markHandshakeSent();
+		await session.waitForHandshake(config.deadlineMs);
 		return session;
 	}
 
 	async startServer(config: ServerConfig): Promise<ServerHandle> {
-		const profile = config.capacityProfile ?? this.profile;
+		if (this.activeServer)
+			throw new WebSocketTransportError(
+				"E_LIMIT_EXCEEDED",
+				"only one active WebSocket comparison server is permitted",
+			);
+		const profile = config.capacityProfile
+			? freezeCapacityProfile(cloneCapacityProfile(config.capacityProfile))
+			: this.profile;
+		if (canonicalJson(profile) !== this.submittedCapacityProfile.bytes)
+			throw new WebSocketTransportError(
+				"E_LIMIT_EXCEEDED",
+				"server capacity profile differs from the submitted canonical profile",
+			);
+		validateServerTls(config.tls);
 		const clock = this.clock;
 		const admission = new AdmissionController(profile, clock);
-		let handle: WsServerHandle;
+		let handle: WsServerHandle | undefined;
+		const pendingSockets: ServerWebSocketLike[] = [];
+		type PendingServerEvent =
+			| { readonly kind: "message"; readonly value: unknown }
+			| { readonly kind: "drain" }
+			| {
+					readonly kind: "close";
+					readonly code: number;
+					readonly reason: string;
+			  }
+			| { readonly kind: "error"; readonly error: unknown };
+		const pendingEvents = new Map<object, PendingServerEvent[]>();
 		const handler: WebSocketHandler = {
 			maxPayloadLength: profile.maxQueuedBytesPerStream,
 			backpressureLimit: profile.maxQueuedBytesPerSession,
 			closeOnBackpressureLimit: false,
 			idleTimeout: Math.ceil(profile.idleTimeoutMs / 1000),
 			perMessageDeflate: false,
-			open: (socket) => handle.addSocket(socket),
+			open: (socket) => {
+				if (handle) handle.addSocket(socket);
+				else pendingSockets.push(socket);
+			},
 			message: (socket, value) => handleSession(socket, value),
 			drain: (socket) => handleDrain(socket),
 			close: (socket, code, reason) => handleClose(socket, code, reason),
@@ -1716,24 +2454,52 @@ export class WebSocketAdapter implements TransportAdapter {
 			this.maxReceiveQueueBytes,
 			this.maxReceiveQueueItems,
 			this.receiveWaiterLimit,
+			this.ledger,
+			() => {
+				if (this.activeServer === handle) this.activeServer = undefined;
+			},
 		);
+		this.activeServer = handle;
+		for (const socket of pendingSockets.splice(0)) handle.addSocket(socket);
+		for (const [socket, events] of pendingEvents) {
+			for (const event of events)
+				dispatchServerEvent(socket as ServerWebSocketLike, event);
+			pendingEvents.delete(socket);
+		}
 		return handle;
 
 		function handleSession(socket: ServerWebSocketLike, value: unknown): void {
-			handle?.sessionFor(socket)?.onSocketMessage(value);
+			dispatchServerEvent(socket, { kind: "message", value });
 		}
 		function handleDrain(socket: ServerWebSocketLike): void {
-			handle?.sessionFor(socket)?.onDrain();
+			dispatchServerEvent(socket, { kind: "drain" });
 		}
 		function handleClose(
 			socket: ServerWebSocketLike,
 			code: number,
 			reason: string,
 		): void {
-			handle?.sessionFor(socket)?.onSocketClose(code, reason);
+			dispatchServerEvent(socket, { kind: "close", code, reason });
 		}
 		function handleError(socket: ServerWebSocketLike, error: unknown): void {
-			handle?.sessionFor(socket)?.onSocketError(error);
+			dispatchServerEvent(socket, { kind: "error", error });
+		}
+		function dispatchServerEvent(
+			socket: ServerWebSocketLike,
+			event: PendingServerEvent,
+		): void {
+			const session = handle?.sessionFor(socket);
+			if (!session) {
+				const events = pendingEvents.get(socket as object) ?? [];
+				events.push(event);
+				pendingEvents.set(socket as object, events);
+				return;
+			}
+			if (event.kind === "message") session.onSocketMessage(event.value);
+			else if (event.kind === "drain") session.onDrain();
+			else if (event.kind === "close")
+				session.onSocketClose(event.code, event.reason);
+			else session.onSocketError(event.error);
 		}
 	}
 }
