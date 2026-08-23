@@ -1240,11 +1240,7 @@ function spawnClient(
 	const entrypointArgs =
 		cloneNameFor === null
 			? ["tools/offbox/mac-generator-entry-g6.sh"]
-			: [
-					"tools/offbox/mac-generator-entry-g6.sh",
-					"--clone",
-					`~/${cloneNameFor}`,
-				];
+			: ["tools/offbox/mac-generator-entry-g6.sh", "--clone", cloneNameFor];
 	const [cmd, cmdArgs] = OFFBOX_SSH
 		? ([
 				"ssh",
@@ -1304,6 +1300,12 @@ async function macgenCloneFor(role: string | null): Promise<string | null> {
 	if (role === null || role === "realm") return null; // default clone.
 	const clone = `wt-macgen-${role}`;
 	if (macgenCloneProvisioned.has(clone)) return clone;
+	// Absolute path on the Mac: a literal `~/…` passed through `--clone` is
+	// never tilde-expanded by the entrypoint (bash expands tilde in
+	// assignments, not in `CLONE="${2:-}"`), so the clone would fail its
+	// `.git` existence check exactly as a provisioning miss would.
+	const macHome = await macHomeOf(OFFBOX_SSH);
+	const absClone = `${macHome}/${clone}`;
 	// Provision on the Mac: clone from the base repo (local, hardlinked
 	// objects). Guard against the race where two arms both try to create it.
 	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if [ ! -d "$HOME/${MACGEN_BASE_CLONE}/.git" ]; then echo "macgen: no base clone at $HOME/${MACGEN_BASE_CLONE}" >&2; exit 3; fi; if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --local --quiet "$HOME/${MACGEN_BASE_CLONE}" "$CLONE" || echo "macgen: clone failed" >&2; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
@@ -1328,7 +1330,42 @@ async function macgenCloneFor(role: string | null): Promise<string | null> {
 		);
 	}
 	macgenCloneProvisioned.add(clone);
-	return clone;
+	return absClone;
+}
+
+const macHomeCache = new Map<string, string>();
+async function macHomeOf(sshDest: string): Promise<string> {
+	const cached = macHomeCache.get(sshDest);
+	if (cached) return cached;
+	const child = spawn(
+		"ssh",
+		["-o", "BatchMode=yes", sshDest, 'printf %s "$HOME"'],
+		{
+			stdio: ["ignore", "pipe", "pipe"],
+		},
+	);
+	let out = "";
+	child.stdout.on("data", (d) => {
+		out += d;
+	});
+	const code = await new Promise<number>((res) => {
+		const t = setTimeout(() => {
+			child.kill("SIGKILL");
+			res(-1);
+		}, 30_000);
+		child.on("exit", (c) => {
+			clearTimeout(t);
+			res(c ?? -1);
+		});
+	});
+	if (code !== 0 || !out.trim()) {
+		throw new Error(
+			`bench-g6: cannot resolve Mac home of ${sshDest} (exit ${code})`,
+		);
+	}
+	const home = out.trim();
+	macHomeCache.set(sshDest, home);
+	return home;
 }
 
 async function pumpClient(
