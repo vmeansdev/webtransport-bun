@@ -526,6 +526,7 @@ async function waitForDrain(
 			"WebSocket drain waiter limit exceeded",
 		);
 	let waiter!: DrainWaiter;
+	let done = false;
 	const ready = new Promise<void>((resolve, reject) => {
 		waiter = {
 			resolve,
@@ -533,15 +534,20 @@ async function waitForDrain(
 		};
 		waiters.push(waiter);
 	});
-	const timeout = clock.sleep(remaining).then(() => {
+	const timeout = (async () => {
+		await Promise.resolve();
+		if (done) return new Promise<never>(() => {});
+		await clock.sleep(remaining);
+		if (done) return new Promise<never>(() => {});
 		throw deadlineError(
 			"E_BACKPRESSURE_TIMEOUT",
 			"server drain deadline expired",
 		);
-	});
+	})();
 	try {
 		await Promise.race([ready, timeout]);
 	} finally {
+		done = true;
 		const index = waiters.indexOf(waiter);
 		if (index >= 0) waiters.splice(index, 1);
 	}
@@ -560,10 +566,16 @@ async function runWithDeadline<T>(
 		);
 	if (!Number.isFinite(timeoutMs) || timeoutMs < 0)
 		throw new RangeError("timeoutMs must be a non-negative finite time");
+	let done = false;
 	const timeout = clock.sleep(timeoutMs).then(() => {
+		if (done) return new Promise<never>(() => {});
 		throw error;
 	});
-	return Promise.race([Promise.resolve(operation), timeout]);
+	try {
+		return await Promise.race([Promise.resolve(operation), timeout]);
+	} finally {
+		done = true;
+	}
 }
 
 function socketData(event: unknown): unknown {
@@ -979,14 +991,17 @@ class WsSession implements Session {
 			throw error;
 		}
 		let waiter!: DrainWaiter;
+		let done = false;
 		const ready = new Promise<void>((resolve, reject) => {
 			waiter = { resolve, reject };
 			this.handshakeWaiters.add(waiter);
 		});
 		const timeout = (async () => {
 			await Promise.resolve();
-			if (this.handshakeComplete) return new Promise<never>(() => {});
+			if (done || this.handshakeComplete) return new Promise<never>(() => {});
 			await this.clock.sleep(remaining);
+			if (done || this.handshakeComplete || !this.active)
+				return new Promise<never>(() => {});
 			const error = deadlineError(
 				"E_HANDSHAKE_TIMEOUT",
 				"WebSocket handshake acknowledgement deadline expired",
@@ -997,6 +1012,7 @@ class WsSession implements Session {
 		try {
 			await Promise.race([ready, timeout]);
 		} finally {
+			done = true;
 			this.handshakeWaiters.delete(waiter);
 		}
 	}
@@ -2195,9 +2211,13 @@ class WsServerHandle implements ServerHandle {
 		for (const session of this.pending.drain())
 			session.releaseAcceptReservation();
 		const operation = (async () => {
-			for (const session of this.activeSessions)
+			for (const session of [...this.activeSessions])
 				await session.close(Number.POSITIVE_INFINITY);
-			await this.runtime.stop(true);
+			try {
+				await this.runtime.stop(true);
+			} catch {
+				// Stop is best effort
+			}
 		})();
 		let finalized = false;
 		const finalize = (): void => {
@@ -2211,6 +2231,7 @@ class WsServerHandle implements ServerHandle {
 				finalize();
 			},
 			(error) => {
+				console.error("[ws-server-stop] operation error:", error);
 				finalize();
 				throw error;
 			},
@@ -2483,12 +2504,17 @@ export class WebSocketAdapter implements TransportAdapter {
 					socket.addEventListener("error", openErrorListener);
 					socket.addEventListener("open", openListener);
 				});
-				const timeout = this.clock.sleep(remaining).then(() => {
+				let done = false;
+				const timeout = (async () => {
+					await Promise.resolve();
+					if (done) return new Promise<never>(() => {});
+					await this.clock.sleep(remaining);
+					if (done) return new Promise<never>(() => {});
 					throw deadlineError(
 						"E_HANDSHAKE_TIMEOUT",
 						"WebSocket open deadline expired",
 					);
-				});
+				})();
 				await Promise.race([opened, timeout]);
 			} catch (error) {
 				session.rejectHandshake(error);
@@ -2578,16 +2604,16 @@ export class WebSocketAdapter implements TransportAdapter {
 			tls: config.tls,
 			websocket: handler,
 			fetch: (request, server) => {
-				const upgrade = (
-					server as {
-						upgrade?: (
-							request: Request,
-							options?: { data?: unknown },
-						) => boolean;
-					}
-				).upgrade;
+				const serverObj = server as
+					| {
+							upgrade?: (
+								request: Request,
+								options?: { data?: unknown },
+							) => boolean;
+					  }
+					| undefined;
 				if (
-					upgrade?.(request, {
+					serverObj?.upgrade?.call(server, request, {
 						data: { role: request.headers.get("x-ws-role") ?? undefined },
 					})
 				)
