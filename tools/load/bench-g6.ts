@@ -1308,7 +1308,11 @@ async function macgenCloneFor(role: string | null): Promise<string | null> {
 	const absClone = `${macHome}/${clone}`;
 	// Provision on the Mac: clone from the base repo (local, hardlinked
 	// objects). Guard against the race where two arms both try to create it.
-	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if [ ! -d "$HOME/${MACGEN_BASE_CLONE}/.git" ]; then echo "macgen: no base clone at $HOME/${MACGEN_BASE_CLONE}" >&2; exit 3; fi; if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --local --quiet "$HOME/${MACGEN_BASE_CLONE}" "$CLONE" || echo "macgen: clone failed" >&2; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
+	// The refspec is widened to `+refs/*` so probe-branch candidates that the
+	// base only carries as remote-tracking refs stay reachable from the
+	// subclone — a plain `git clone --local` mirrors heads only, and the G6
+	// candidate lives on `probe/g6-mmo-03` (remote-tracking in the base).
+	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if [ ! -d "$HOME/${MACGEN_BASE_CLONE}/.git" ]; then echo "macgen: no base clone at $HOME/${MACGEN_BASE_CLONE}" >&2; exit 3; fi; if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --local --quiet "$HOME/${MACGEN_BASE_CLONE}" "$CLONE" && git -C "$CLONE" config remote.origin.fetch '+refs/*:refs/remotes/origin/*' || echo "macgen: clone failed" >&2; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
 	const child = spawn("ssh", ["-o", "BatchMode=yes", OFFBOX_SSH, cloneCmd], {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
