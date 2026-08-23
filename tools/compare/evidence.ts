@@ -5,6 +5,9 @@ import { canonicalJson, sha256Canonical } from "./canonical.ts";
 export const EVIDENCE_SCHEMA_VERSION = "v1" as const;
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const MAX_ARTIFACT_STRING_LENGTH = 4096;
+export const MAX_SUPPORTED_PAYLOAD_BYTES = 1_048_576;
+export const MAX_PAYLOAD_BASE64_LENGTH =
+	4 * Math.ceil(MAX_SUPPORTED_PAYLOAD_BYTES / 3);
 export const MAX_ARTIFACT_KEYS = 256;
 export const MAX_ARTIFACT_DEPTH = 32;
 export const MAX_ARTIFACT_SAMPLES = 100_000;
@@ -27,6 +30,14 @@ export type MetricUnit =
 	| "count"
 	| "ratio"
 	| "percent";
+export type MetricKind =
+	| "mac-local-end-to-end"
+	| "linux-local-service"
+	| "one-way";
+export type MetricClockDomain =
+	| "mac-monotonic"
+	| "linux-monotonic"
+	| "independent-offset";
 
 export type ArtifactRejectionCode =
 	| "ARTIFACT_BYTES_INVALID"
@@ -107,6 +118,8 @@ export type ArtifactRejectionCode =
 	| "METRICS_SAMPLE_INVALID"
 	| "METRICS_SAMPLES_SPARSE"
 	| "METRICS_PERCENTILES_INVALID"
+	| "CLOCK_PROVENANCE_INVALID"
+	| "CLOCK_PROVENANCE_MISMATCH"
 	| "STATUS_CONTRADICTION"
 	| "COMPARISON_INCOMPATIBLE"
 	| "SCENARIO_BINDING_MISMATCH"
@@ -287,6 +300,14 @@ export interface CapacityProof {
 export interface MetricsEvidence {
 	name: string;
 	unit: MetricUnit;
+	metricKind: MetricKind;
+	clock: {
+		domain: MetricClockDomain;
+		monotonic: boolean;
+		method: string;
+		offsetMs?: number;
+		uncertaintyMs?: number;
+	};
 	samples: number[];
 	percentiles: {
 		p50: number;
@@ -434,8 +455,11 @@ export function snapshotEvidenceValue(
 		invalid(`${path} exceeds maximum nesting depth`);
 	if (value === null) return null;
 	if (typeof value === "string") {
-		if (value.length > MAX_ARTIFACT_STRING_LENGTH)
-			invalid(`${path} string is too long`);
+		const maximumLength =
+			path === "$.scenario.payload.data"
+				? MAX_PAYLOAD_BASE64_LENGTH
+				: MAX_ARTIFACT_STRING_LENGTH;
+		if (value.length > maximumLength) invalid(`${path} string is too long`);
 		return value;
 	}
 	if (typeof value === "boolean") return value;
@@ -843,10 +867,13 @@ export function isSha1(value: unknown): value is string {
 	return typeof value === "string" && HEX_40.test(value);
 }
 
-export function isBase64(value: unknown): value is string {
+export function isBase64(
+	value: unknown,
+	maximumLength = MAX_ARTIFACT_STRING_LENGTH,
+): value is string {
 	return (
 		typeof value === "string" &&
-		value.length <= MAX_ARTIFACT_STRING_LENGTH &&
+		value.length <= maximumLength &&
 		BASE64.test(value)
 	);
 }

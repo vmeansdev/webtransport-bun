@@ -24,6 +24,8 @@ import {
 	isSha256,
 	MAX_ARTIFACT_BYTES,
 	MAX_ARTIFACT_SAMPLES,
+	MAX_PAYLOAD_BASE64_LENGTH,
+	MAX_SUPPORTED_PAYLOAD_BYTES,
 	MIN_EFFECTIVE_CHILD_NOFILE,
 	type RunArtifact,
 	snapshotEvidenceValue,
@@ -86,6 +88,21 @@ const EXPECTED_TOP_LEVEL_KEYS = [
 	"rawSidecarDigests",
 	"rawSidecarBindingSha256",
 ] as const;
+const EXPECTED_METRIC_KINDS = [
+	"mac-local-end-to-end",
+	"linux-local-service",
+	"one-way",
+] as const;
+const EXPECTED_CLOCK_DOMAINS = [
+	"mac-monotonic",
+	"linux-monotonic",
+	"independent-offset",
+] as const;
+const INITIAL_IMPAIRMENT = Object.freeze({
+	qdisc: "fq" as const,
+	delayMs: 0,
+	lossPercent: 0,
+});
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -704,7 +721,7 @@ function verifyScenario(
 	value: unknown,
 	transport: unknown,
 	rejections: ArtifactRejection[],
-): void {
+): ReturnType<typeof getScenarioCell> | undefined {
 	const scenario = record(value);
 	const path = "$.scenario";
 	requireKeys(
@@ -724,7 +741,7 @@ function verifyScenario(
 		path,
 		rejections,
 	);
-	if (!scenario) return;
+	if (!scenario) return undefined;
 	if (field(scenario, "canonical") !== true)
 		addRejection(
 			rejections,
@@ -734,7 +751,7 @@ function verifyScenario(
 		);
 	const cellId = field(scenario, "cellId");
 	if (!stringField(cellId, `${path}.cellId`, rejections, { nonEmpty: true }))
-		return;
+		return undefined;
 	let cell: ReturnType<typeof getScenarioCell>;
 	try {
 		cell = getScenarioCell(CANONICAL_SCENARIO_REGISTRY, cellId);
@@ -745,7 +762,7 @@ function verifyScenario(
 			`unknown canonical scenario cell ${cellId}`,
 			`${path}.cellId`,
 		);
-		return;
+		return undefined;
 	}
 	if (field(scenario, "scenarioId") !== cell.scenarioId)
 		addRejection(
@@ -873,6 +890,7 @@ function verifyScenario(
 			"transport must be ws or wt",
 			"$.transport",
 		);
+	return cell;
 }
 
 function expectedPayloadBytes(
@@ -894,8 +912,9 @@ function expectedPayloadBytes(
 }
 
 function decodeCanonicalBase64(value: unknown): Uint8Array | undefined {
-	if (!isBase64(value)) return undefined;
+	if (!isBase64(value, MAX_PAYLOAD_BASE64_LENGTH)) return undefined;
 	const decoded = new Uint8Array(Buffer.from(value, "base64"));
+	if (decoded.byteLength > MAX_SUPPORTED_PAYLOAD_BYTES) return undefined;
 	return Buffer.from(decoded).toString("base64") === value
 		? decoded
 		: undefined;
@@ -963,9 +982,28 @@ function verifyTls(value: unknown, rejections: ArtifactRejection[]): void {
 		);
 }
 
+function expectedRequestedImpairment(
+	cell: ReturnType<typeof getScenarioCell> | undefined,
+): { qdisc: "fq" | "netem"; delayMs: number; lossPercent: number } {
+	const parameters = cell?.parameters as Record<string, unknown> | undefined;
+	if (cell?.scenarioId === "game-tick-loss") {
+		return {
+			qdisc: "netem",
+			delayMs: parameters?.delayMs as number,
+			lossPercent: parameters?.lossPercent as number,
+		};
+	}
+	if (parameters?.path === "delay40")
+		return { qdisc: "netem", delayMs: 40, lossPercent: 0 };
+	if (parameters?.path === "delay40-loss1")
+		return { qdisc: "netem", delayMs: 40, lossPercent: 1 };
+	return INITIAL_IMPAIRMENT;
+}
+
 function verifyImpairment(
 	value: unknown,
 	rejections: ArtifactRejection[],
+	cell?: ReturnType<typeof getScenarioCell>,
 ): void {
 	const impairment = record(value) as Record<string, unknown> | undefined;
 	requireKeys(
@@ -1045,6 +1083,33 @@ function verifyImpairment(
 			"impairment direction must be linux-egress",
 			"$.impairment.requested.direction",
 		);
+	const expectedRequested = expectedRequestedImpairment(cell);
+	if (
+		!requested ||
+		field(requested, "qdisc") !== expectedRequested.qdisc ||
+		field(requested, "delayMs") !== expectedRequested.delayMs ||
+		field(requested, "lossPercent") !== expectedRequested.lossPercent
+	)
+		addRejection(
+			rejections,
+			"IMPAIRMENT_REQUESTED_INVALID",
+			"requested impairment does not match the canonical scenario path",
+			"$.impairment.requested",
+		);
+	if (!before || !compareCanonical(before, INITIAL_IMPAIRMENT))
+		addRejection(
+			rejections,
+			"IMPAIRMENT_OBSERVED_INVALID",
+			"pre-run impairment must be the initial fq state",
+			"$.impairment.observedBefore",
+		);
+	if (!after || !compareCanonical(after, INITIAL_IMPAIRMENT))
+		addRejection(
+			rejections,
+			"IMPAIRMENT_RESTORATION_INVALID",
+			"post-run impairment must be restored to the initial fq state",
+			"$.impairment.observedAfter",
+		);
 	const proof = record(field(impairment, "restorationProof"));
 	if (!proof)
 		addRejection(
@@ -1109,6 +1174,17 @@ function verifyImpairment(
 				"IMPAIRMENT_RESTORATION_INVALID",
 				"post-run qdisc proof hash does not match",
 				"$.impairment.restorationProof.observedAfterSha256",
+			);
+		const initialHash = sha256Canonical(INITIAL_IMPAIRMENT);
+		if (
+			field(proof, "observedBeforeSha256") !== initialHash ||
+			field(proof, "observedAfterSha256") !== initialHash
+		)
+			addRejection(
+				rejections,
+				"IMPAIRMENT_RESTORATION_INVALID",
+				"restoration proof must bind the initial fq state",
+				"$.impairment.restorationProof",
 			);
 	}
 }
@@ -1257,12 +1333,26 @@ function verifyAdmissionCounters(
 				`${section}.accepted cannot exceed attempted`,
 				`$.capacity.admissionCounters.${section}`,
 			);
+		const rejected = field(item, "rejected");
+		if (
+			typeof attempted === "number" &&
+			typeof accepted === "number" &&
+			typeof rejected === "number" &&
+			accepted + rejected > attempted
+		)
+			addRejection(
+				rejections,
+				"CAPACITY_ADMISSION_COUNTER_INVALID",
+				`${section}.accepted plus rejected cannot exceed attempted`,
+				`$.capacity.admissionCounters.${section}`,
+			);
 	}
 }
 
 function verifyCapacityProof(
 	value: unknown,
 	rejections: ArtifactRejection[],
+	cell?: ReturnType<typeof getScenarioCell>,
 ): void {
 	const proof = record(value);
 	requireKeys(proof, ["mac", "linux"], "$.capacityProof", rejections);
@@ -1273,6 +1363,19 @@ function verifyCapacityProof(
 	requireKeys(linux, ["fd"], "$.capacityProof.linux", rejections);
 	const macFd = record(field(mac, "fd"));
 	const linuxFd = record(field(linux, "fd"));
+	const parameters = cell?.parameters as Record<string, unknown> | undefined;
+	const liveConnections =
+		cell?.scenarioId === "connection-memory"
+			? parameters?.liveConnections
+			: cell?.scenarioId === "handshake-matrix" ||
+					cell?.scenarioId === "reconnect-storm"
+				? (parameters?.clientCount ?? parameters?.concurrency)
+				: undefined;
+	const isConnectionScale =
+		typeof liveConnections === "number" && liveConnections > 0;
+	const expectedFreePorts = isConnectionScale
+		? Math.ceil(liveConnections * 1.25)
+		: undefined;
 	for (const [fd, path] of [
 		[macFd, "$.capacityProof.mac.fd"],
 		[linuxFd, "$.capacityProof.linux.fd"],
@@ -1329,7 +1432,11 @@ function verifyCapacityProof(
 				`${path}.effectiveChildLimit must not exceed hardLimit`,
 				`${path}.effectiveChildLimit`,
 			);
-		if (typeof effective === "number" && effective < MIN_EFFECTIVE_CHILD_NOFILE)
+		if (
+			isConnectionScale &&
+			typeof effective === "number" &&
+			effective < MIN_EFFECTIVE_CHILD_NOFILE
+		)
 			addRejection(
 				rejections,
 				"CAPACITY_EFFECTIVE_LIMIT_TOO_LOW",
@@ -1369,7 +1476,7 @@ function verifyCapacityProof(
 			(start < 1 ||
 				end <= start ||
 				free < 0 ||
-				required < 0 ||
+				required <= 0 ||
 				end - start + 1 < required ||
 				free < required ||
 				free > end - start + 1)
@@ -1380,6 +1487,18 @@ function verifyCapacityProof(
 				"ephemeral-port proof lacks the required free-port headroom",
 				"$.capacityProof.mac.ephemeralPorts",
 			);
+		if (
+			isConnectionScale &&
+			typeof required === "number" &&
+			expectedFreePorts !== undefined &&
+			required !== expectedFreePorts
+		)
+			addRejection(
+				rejections,
+				"CAPACITY_EPHEMERAL_PORT_PROOF_INVALID",
+				`requiredFreePorts must equal ceil(liveConnections * 1.25) = ${expectedFreePorts}`,
+				"$.capacityProof.mac.ephemeralPorts.requiredFreePorts",
+			);
 	}
 }
 
@@ -1387,14 +1506,107 @@ function verifyMetrics(value: unknown, rejections: ArtifactRejection[]): void {
 	const metrics = record(value);
 	requireKeys(
 		metrics,
-		["name", "unit", "samples", "percentiles"],
+		["name", "unit", "metricKind", "clock", "samples", "percentiles"],
 		"$.metrics",
 		rejections,
 	);
 	if (!metrics) return;
-	stringField(field(metrics, "name"), "$.metrics.name", rejections, {
+	const metricName = field(metrics, "name");
+	stringField(metricName, "$.metrics.name", rejections, {
 		nonEmpty: true,
 	});
+	const metricKind = field(metrics, "metricKind");
+	const clock = record(field(metrics, "clock"));
+	if (!EXPECTED_METRIC_KINDS.includes(metricKind as never))
+		addRejection(
+			rejections,
+			"CLOCK_PROVENANCE_INVALID",
+			"metrics.metricKind is not supported",
+			"$.metrics.metricKind",
+		);
+	const requiredClockKeys =
+		metricKind === "one-way"
+			? ["domain", "monotonic", "method", "offsetMs", "uncertaintyMs"]
+			: ["domain", "monotonic", "method"];
+	requireKeys(clock, requiredClockKeys, "$.metrics.clock", rejections);
+	if (clock) {
+		const domain = field(clock, "domain");
+		if (!EXPECTED_CLOCK_DOMAINS.includes(domain as never))
+			addRejection(
+				rejections,
+				"CLOCK_PROVENANCE_INVALID",
+				"clock domain is not supported",
+				"$.metrics.clock.domain",
+			);
+		if (field(clock, "monotonic") !== true)
+			addRejection(
+				rejections,
+				"CLOCK_PROVENANCE_INVALID",
+				"clock evidence must be monotonic",
+				"$.metrics.clock.monotonic",
+			);
+		if (
+			!stringField(
+				field(clock, "method"),
+				"$.metrics.clock.method",
+				rejections,
+				{ nonEmpty: true },
+			)
+		)
+			addRejection(
+				rejections,
+				"CLOCK_PROVENANCE_INVALID",
+				"clock method is required",
+				"$.metrics.clock.method",
+			);
+		const expectedDomain =
+			metricKind === "mac-local-end-to-end"
+				? "mac-monotonic"
+				: metricKind === "linux-local-service"
+					? "linux-monotonic"
+					: "independent-offset";
+		if (domain !== expectedDomain)
+			addRejection(
+				rejections,
+				"CLOCK_PROVENANCE_INVALID",
+				`metric kind ${String(metricKind)} requires ${expectedDomain} clock evidence`,
+				"$.metrics.clock.domain",
+			);
+		const oneWayName =
+			typeof metricName === "string" &&
+			/one[- ]?way|cross[- ]?host/i.test(metricName);
+		if (
+			(oneWayName && metricKind !== "one-way") ||
+			(!oneWayName && metricKind === "one-way")
+		)
+			addRejection(
+				rejections,
+				"CLOCK_PROVENANCE_INVALID",
+				"metric name and metric kind must agree on one-way semantics",
+				"$.metrics",
+			);
+		if (metricKind === "one-way") {
+			if (
+				!finiteNumber(
+					field(clock, "offsetMs"),
+					"$.metrics.clock.offsetMs",
+					rejections,
+				) ||
+				!finiteNumber(
+					field(clock, "uncertaintyMs"),
+					"$.metrics.clock.uncertaintyMs",
+					rejections,
+				) ||
+				(field(clock, "uncertaintyMs") as number) < 0
+			)
+				addRejection(
+					rejections,
+					"CLOCK_PROVENANCE_INVALID",
+					"one-way metrics require finite offset and non-negative uncertainty",
+					"$.metrics.clock",
+				);
+		}
+	}
 	const unit = field(metrics, "unit");
 	if (
 		!["ms", "bytes", "Mbps", "count", "ratio", "percent"].includes(
@@ -1644,15 +1856,19 @@ function verifySnapshot(
 	verifySource(field(artifact, "source"), rejections);
 	verifyTopology(field(artifact, "topology"), rejections);
 	verifySmoke(field(artifact, "smoke"), rejections);
-	verifyScenario(
+	const scenarioCell = verifyScenario(
 		field(artifact, "scenario"),
 		field(artifact, "transport"),
 		rejections,
 	);
 	verifyTls(field(artifact, "tls"), rejections);
-	verifyImpairment(field(artifact, "impairment"), rejections);
+	verifyImpairment(field(artifact, "impairment"), rejections, scenarioCell);
 	verifyCapacity(field(artifact, "capacity"), rejections);
-	verifyCapacityProof(field(artifact, "capacityProof"), rejections);
+	verifyCapacityProof(
+		field(artifact, "capacityProof"),
+		rejections,
+		scenarioCell,
+	);
 	verifyMetrics(field(artifact, "metrics"), rejections);
 	verifyRawSidecars(artifact, rejections);
 	verifyStatus(artifact, rejections);
@@ -1772,15 +1988,23 @@ export function verifyRunArtifact(input: ArtifactBytes): ArtifactVerification {
 	try {
 		snapshot = snapshotEvidenceValue(parsed);
 	} catch (error) {
+		const message =
+			error instanceof Error
+				? error.message
+				: "artifact schema cannot be snapshotted";
+		const code: ArtifactRejectionCode = /\.scenario\.payload\.data/.test(
+			message,
+		)
+			? "SCENARIO_PAYLOAD_INVALID"
+			: /\.metrics\.clock/.test(message)
+				? "CLOCK_PROVENANCE_INVALID"
+				: "SCHEMA_INVALID_FIELD";
 		return {
 			evidenceStatus: "FAIL",
 			rejections: [
 				{
-					code: "SCHEMA_INVALID_FIELD",
-					reason:
-						error instanceof Error
-							? error.message
-							: "artifact schema cannot be snapshotted",
+					code,
+					reason: message,
 				},
 			],
 		};
@@ -1831,13 +2055,17 @@ export function verifyRunArtifactObject(input: unknown): ArtifactVerification {
 				? /sparse/i.test(message)
 					? "METRICS_SAMPLES_SPARSE"
 					: "METRICS_SAMPLE_INVALID"
-				: /\.metrics\.percentiles/.test(message)
-					? "METRICS_PERCENTILES_INVALID"
-					: typeof input === "object" &&
-							input !== null &&
-							!Object.hasOwn(input, "source")
-						? "SCHEMA_OWN_FIELD_REQUIRED"
-						: "SCHEMA_ROOT_INVALID";
+				: /\.scenario\.payload\.data/.test(message)
+					? "SCENARIO_PAYLOAD_INVALID"
+					: /\.metrics\.clock/.test(message)
+						? "CLOCK_PROVENANCE_INVALID"
+						: /\.metrics\.percentiles/.test(message)
+							? "METRICS_PERCENTILES_INVALID"
+							: typeof input === "object" &&
+									input !== null &&
+									!Object.hasOwn(input, "source")
+								? "SCHEMA_OWN_FIELD_REQUIRED"
+								: "SCHEMA_ROOT_INVALID";
 		return { evidenceStatus: "FAIL", rejections: [{ code, reason: message }] };
 	}
 	return verifySnapshot(snapshot, []);
