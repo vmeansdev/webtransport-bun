@@ -1292,7 +1292,6 @@ function serverAddressForOffbox(): string {
  * already accepts it); `git clone --local` on the Mac hardlinks objects and
  * provisions in ~2 s. Absent a role, the default `~/wt-macgen` is used.
  */
-const MACGEN_BASE_CLONE = "wt-macgen";
 const macgenCloneProvisioned = new Set<string>();
 
 async function macgenCloneFor(role: string | null): Promise<string | null> {
@@ -1306,13 +1305,14 @@ async function macgenCloneFor(role: string | null): Promise<string | null> {
 	// `.git` existence check exactly as a provisioning miss would.
 	const macHome = await macHomeOf(OFFBOX_SSH);
 	const absClone = `${macHome}/${clone}`;
-	// Provision on the Mac: clone from the base repo (local, hardlinked
-	// objects). Guard against the race where two arms both try to create it.
-	// The refspec is widened to `+refs/*` so probe-branch candidates that the
-	// base only carries as remote-tracking refs stay reachable from the
-	// subclone — a plain `git clone --local` mirrors heads only, and the G6
-	// candidate lives on `probe/g6-mmo-03` (remote-tracking in the base).
-	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if [ ! -d "$HOME/${MACGEN_BASE_CLONE}/.git" ]; then echo "macgen: no base clone at $HOME/${MACGEN_BASE_CLONE}" >&2; exit 3; fi; if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --local --quiet "$HOME/${MACGEN_BASE_CLONE}" "$CLONE" && git -C "$CLONE" config remote.origin.fetch '+refs/*:refs/remotes/origin/*' || echo "macgen: clone failed" >&2; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
+	// Provision on the Mac: clone the probe branch straight from GitHub origin.
+	// A clone-from-base lane has a state race: the subclone fetches the base as
+	// its origin, and the base is only brought to the new commit by the realm's
+	// own macgen fetch — so a subscriber that fetches before the realm lands
+	// sees the old commit and dies with "unable to read tree (candidate)".
+	// Each role cloning from GitHub directly removes that coupling; the
+	// entrypoint's own `git fetch origin` then reconciles any later commits.
+	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --quiet --branch probe/g6-mmo-03 "https://github.com/vmeansdev/webtransport-bun.git" "$CLONE" 2>&1 || true; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
 	const child = spawn("ssh", ["-o", "BatchMode=yes", OFFBOX_SSH, cloneCmd], {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
