@@ -462,6 +462,54 @@ describe("§7 falsifiers", () => {
 		);
 	});
 
+	test("V-S boundary is exact: one packet below the floor fires, equality clears", () => {
+		const base = {
+			armDownstreamPps: 77_500,
+			precheckDeliveryRatio: 0.999,
+			precheckOriginatorSaturated: false,
+		};
+		// The evaluator floor is exact: one packet below 1.5 × 77,500 fires.
+		const justBelow = falsifierSink({
+			...base,
+			precheckDeliveryRatio: 1,
+			precheckOfferedPps: 116_249.999,
+		});
+		expect(justBelow.fired).toBe(true);
+		expect(justBelow.reasons.join(" ")).toContain("needs 116250");
+		// Equality clears the floor; there is no tolerance or rounding band.
+		const exactlyAtFloor = falsifierSink({
+			...base,
+			precheckDeliveryRatio: 1,
+			precheckOfferedPps: 116_250,
+		});
+		expect(exactlyAtFloor).toMatchObject({
+			id: "V-S",
+			fired: false,
+			reasons: [],
+			scope: "run",
+		});
+		// Delivery boundary: 0.994999 fires, 0.995 clears, at full offer.
+		const lossy = falsifierSink({
+			...base,
+			precheckDeliveryRatio: 0.994_999,
+			precheckOfferedPps: 120_000,
+		});
+		expect(lossy.fired).toBe(true);
+		const atDeliveryFloor = falsifierSink({
+			...base,
+			precheckDeliveryRatio: 0.995,
+			precheckOfferedPps: 120_000,
+		});
+		expect(atDeliveryFloor.fired).toBe(false);
+	});
+
+	test("V-S evaluator constants stay frozen at their registered values", async () => {
+		const g6plan = await import("./g6-plan.ts");
+		expect(g6plan.DELIVERY_FLOOR).toBe(0.995);
+		expect(g6plan.SINK_HEADROOM_FACTOR).toBe(1.5);
+		expect(g6plan.SINK_DELIVERY_FLOOR).toBe(0.995);
+	});
+
 	test("V-G fires on a generator that could not source a rung", () => {
 		expect(
 			falsifierGenerator({
