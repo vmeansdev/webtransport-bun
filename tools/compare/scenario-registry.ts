@@ -1,8 +1,6 @@
 import { canonicalJson, sha256Canonical } from "./canonical.ts";
 import type {
 	AiTokenParameters,
-	ArmKind,
-	ArmTransport,
 	BulkParameters,
 	CapacityProfile,
 	ChatParameters,
@@ -14,8 +12,11 @@ import type {
 	GameParameters,
 	HandshakeParameters,
 	LinuxRole,
+	LossyScenarioArm,
 	MacRole,
 	MacRoleSpec,
+	PrimaryScenarioArm,
+	PrimaryTransport,
 	ProcessCohort,
 	ReconnectParameters,
 	RolePlan,
@@ -617,6 +618,7 @@ const STRUCTURAL_OVERRIDE_FIELDS = new Set([
 	"clientCount",
 	"sessionCount",
 	"liveConnections",
+	"pooling",
 	"state",
 	"reconnectCycles",
 	"concurrency",
@@ -635,10 +637,10 @@ function readPropertyDescriptor(
 	owner: object,
 	descriptor: PropertyDescriptor,
 ): unknown {
-	if ("value" in descriptor) return descriptor.value;
-	return typeof descriptor.get === "function"
-		? descriptor.get.call(owner)
-		: undefined;
+	if (Object.hasOwn(descriptor, "value")) return descriptor.value;
+	if (!Object.hasOwn(descriptor, "get")) return undefined;
+	const getter = descriptor.get;
+	return typeof getter === "function" ? getter.call(owner) : undefined;
 }
 
 function ownPropertyDescriptors(
@@ -866,9 +868,19 @@ function overrideParameters(
 	cell: ScenarioCell,
 	override: ScenarioOverride,
 ): DiagnosticScenarioParameters {
-	const parameters: DiagnosticScenarioParameters = {
-		scenarioId: cell.scenarioId,
+	const parameters: DiagnosticScenarioParameters = Object.create(null);
+	const defineParameter = (
+		field: string,
+		value: DiagnosticParameterValue,
+	): void => {
+		Object.defineProperty(parameters, field, {
+			configurable: true,
+			enumerable: true,
+			value,
+			writable: true,
+		});
 	};
+	defineParameter("scenarioId", cell.scenarioId);
 	for (const [field, value] of Object.entries(cell.parameters)) {
 		if (field === "scenarioId") continue;
 		if (!isDiagnosticParameterValue(value)) {
@@ -876,7 +888,7 @@ function overrideParameters(
 				`scenario parameter ${field} must be a primitive value`,
 			);
 		}
-		parameters[field] = value;
+		defineParameter(field, value);
 	}
 	for (const [field, value] of Object.entries(override.changes)) {
 		if (!Object.hasOwn(parameters, field)) {
@@ -889,7 +901,7 @@ function overrideParameters(
 				`scenario override field ${field} must be a primitive value`,
 			);
 		}
-		parameters[field] = value;
+		defineParameter(field, value);
 	}
 	return parameters;
 }
@@ -926,40 +938,55 @@ function applyOverride(
 
 function makeArm(
 	cell: ScenarioCell,
-	transport: ArmTransport,
-	armKind: ArmKind,
+	transport: PrimaryTransport,
+): PrimaryScenarioArm;
+function makeArm(
+	cell: ScenarioCell,
+	transport: "ws-lossy-overlay",
+	overlayOf: string,
+): LossyScenarioArm;
+function makeArm(
+	cell: ScenarioCell,
+	transport: PrimaryTransport | "ws-lossy-overlay",
 	overlayOf?: string,
 ): ScenarioArm {
-	const overlay = armKind === "ws-lossy-overlay";
-	return deepFreeze({
-		armId: `${cell.cellId}/${transport}`,
+	const armId = `${cell.cellId}/${transport}`;
+	const base = {
+		armId,
 		cellId: cell.cellId,
 		scenarioId: cell.scenarioId,
-		transport,
-		armKind,
-		label: overlay ? "ws-lossy-game-overlay" : `${transport}-primary`,
-		...(overlayOf === undefined ? {} : { overlayOf }),
 		canonical: cell.canonical,
 		scenarioHash: cell.scenarioHash,
 		capacityProfileHash: cell.capacityProfileHash,
 		connectionSetup: cell.connectionSetup,
+	};
+	if (transport === "ws-lossy-overlay") {
+		if (overlayOf === undefined) {
+			throw new Error(`overlay arm ${armId} requires an overlayOf cell`);
+		}
+		return deepFreeze({
+			...base,
+			transport,
+			armKind: "ws-lossy-overlay" as const,
+			label: "ws-lossy-game-overlay",
+			overlayOf,
+		});
+	}
+	return deepFreeze({
+		...base,
+		transport,
+		armKind: "primary" as const,
+		label: `${transport}-primary`,
 	});
 }
 
 function buildArms(cells: readonly ScenarioCell[]): ScenarioArm[] {
 	const arms: ScenarioArm[] = [];
 	for (const cell of cells) {
-		arms.push(makeArm(cell, "ws", "primary"));
-		arms.push(makeArm(cell, "wt", "primary"));
+		arms.push(makeArm(cell, "ws"));
+		arms.push(makeArm(cell, "wt"));
 		if (cell.scenarioId === "game-tick-loss") {
-			arms.push(
-				makeArm(
-					cell,
-					"ws-lossy-overlay",
-					"ws-lossy-overlay",
-					`${cell.cellId}/ws`,
-				),
-			);
+			arms.push(makeArm(cell, "ws-lossy-overlay", `${cell.cellId}/ws`));
 		}
 	}
 	return arms;
@@ -1012,7 +1039,7 @@ function normalizeRegistryOptions(
 
 export function createScenarioRegistry(): ScenarioRegistry;
 export function createScenarioRegistry(
-	options: ScenarioRegistryOptions | readonly ScenarioOverride[],
+	options: ScenarioRegistryOptions | readonly ScenarioOverride[] | undefined,
 ): ScenarioRegistry;
 export function createScenarioRegistry(
 	options: unknown = {},
