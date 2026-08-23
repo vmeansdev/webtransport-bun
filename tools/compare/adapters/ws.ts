@@ -287,11 +287,15 @@ function finiteDeadline(deadlineMs: number): void {
 }
 
 function normalizeAbsoluteDeadline(
+	clock: TransportClock,
 	deadlineMs: number,
 	message: string,
 ): number {
 	if (!Number.isFinite(deadlineMs) || deadlineMs < 0)
 		throw deadlineError("E_HANDSHAKE_TIMEOUT", message);
+	if (deadlineMs < 1e10) {
+		return clock.nowMs() + deadlineMs;
+	}
 	return deadlineMs;
 }
 
@@ -308,6 +312,7 @@ function effectiveHandshakeDeadline(
 	handshakeTimeoutMs: number,
 ): number {
 	const callerDeadline = normalizeAbsoluteDeadline(
+		clock,
 		deadlineMs,
 		"WebSocket handshake requires a finite deadline",
 	);
@@ -463,7 +468,8 @@ async function waitForQueue<T>(
 			"a finite deadline is required for WebSocket queue waits",
 		);
 	}
-	const remaining = remainingMs(clock, deadlineMs);
+	const absDeadline = normalizeAbsoluteDeadline(clock, deadlineMs, message);
+	const remaining = remainingMs(clock, absDeadline);
 	if (remaining <= 0) throw deadlineError(code, message);
 	const controller = new AbortController();
 	const read = queue.waitForItem({ signal: controller.signal });
@@ -508,7 +514,12 @@ async function waitForDrain(
 			"a finite deadline is required for WebSocket drain waits",
 		);
 	}
-	const remaining = remainingMs(clock, deadlineMs);
+	const absDeadline = normalizeAbsoluteDeadline(
+		clock,
+		deadlineMs,
+		"a finite deadline is required for WebSocket drain waits",
+	);
+	const remaining = remainingMs(clock, absDeadline);
 	if (remaining <= 0)
 		throw deadlineError(
 			"E_BACKPRESSURE_TIMEOUT",

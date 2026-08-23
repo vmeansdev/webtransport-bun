@@ -169,12 +169,35 @@ function toRemainingMs(
 	return Math.max(1, deadlineOrTimeoutMs - clock.nowMs());
 }
 
-/** Read one chunk from a Node Readable with a bounded deadline. Returns null on EOF. */
+/** Read one chunk from a Node Readable or Web ReadableStream with a bounded deadline. Returns null on EOF. */
 async function readChunk(
-	readable: Readable,
+	readable: any,
 	deadlineMs: number,
 	clock: TransportClock,
 ): Promise<Uint8Array | null> {
+	if (readable && typeof readable.getReader === "function") {
+		const reader = readable.getReader();
+		const remaining = toRemainingMs(deadlineMs, clock);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeoutPromise = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(new Error("E_BACKPRESSURE_TIMEOUT: read() deadline exceeded")),
+				remaining,
+			);
+		});
+		try {
+			const readPromise = reader
+				.read()
+				.then((res: { value?: Uint8Array; done: boolean }) => {
+					return res.done ? null : (res.value ?? null);
+				});
+			return await Promise.race([readPromise, timeoutPromise]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+			reader.releaseLock();
+		}
+	}
 	return new Promise<Uint8Array | null>((resolve, reject) => {
 		const timer = setTimeout(
 			() => {
@@ -186,9 +209,9 @@ async function readChunk(
 
 		function cleanup() {
 			clearTimeout(timer);
-			readable.off("data", onData);
-			readable.off("end", onEnd);
-			readable.off("error", onError);
+			readable.off?.("data", onData);
+			readable.off?.("end", onEnd);
+			readable.off?.("error", onError);
 		}
 
 		function onData(chunk: Buffer | Uint8Array) {
@@ -205,12 +228,16 @@ async function readChunk(
 			reject(err);
 		}
 
-		readable.once("data", onData);
-		readable.once("end", onEnd);
-		readable.once("error", onError);
+		readable.once?.("data", onData);
+		readable.once?.("end", onEnd);
+		readable.once?.("error", onError);
 
 		// Nudge the stream if it hasn't started flowing
-		if (readable.readable && !readable.readableFlowing) {
+		if (
+			readable.readable &&
+			!readable.readableFlowing &&
+			typeof readable.read === "function"
+		) {
 			const chunk = readable.read();
 			if (chunk !== null) {
 				cleanup();
@@ -222,20 +249,40 @@ async function readChunk(
 	});
 }
 
-/** Write bytes to a Node Writable with a bounded deadline. */
+/** Write bytes to a Node Writable or Web WritableStream with a bounded deadline. */
 async function writeChunk(
-	writable: Writable,
+	writable: any,
 	data: Uint8Array,
 	deadlineMs: number,
 	clock: TransportClock,
 ): Promise<void> {
+	const remaining = toRemainingMs(deadlineMs, clock);
+	if (writable && typeof writable.getWriter === "function") {
+		const writer = writable.getWriter();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeoutPromise = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(
+						new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"),
+					),
+				remaining,
+			);
+		});
+		try {
+			await Promise.race([writer.write(data), timeoutPromise]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+			writer.releaseLock();
+		}
+		return;
+	}
 	return new Promise<void>((resolve, reject) => {
-		const remaining = toRemainingMs(deadlineMs, clock);
 		const timer = setTimeout(() => {
 			reject(new Error("E_BACKPRESSURE_TIMEOUT: write() deadline exceeded"));
 		}, remaining);
 
-		writable.write(data, (err) => {
+		writable.write(data, (err: unknown) => {
 			clearTimeout(timer);
 			if (err) reject(err);
 			else resolve();
@@ -243,14 +290,32 @@ async function writeChunk(
 	});
 }
 
-/** End a Node Writable with a bounded deadline. */
+/** End a Node Writable or Web WritableStream with a bounded deadline. */
 async function endStream(
-	writable: Writable,
+	writable: any,
 	deadlineMs: number,
 	clock: TransportClock,
 ): Promise<void> {
+	const remaining = toRemainingMs(deadlineMs, clock);
+	if (writable && typeof writable.getWriter === "function") {
+		const writer = writable.getWriter();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeoutPromise = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded")),
+				remaining,
+			);
+		});
+		try {
+			await Promise.race([writer.close(), timeoutPromise]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+			writer.releaseLock();
+		}
+		return;
+	}
 	return new Promise<void>((resolve, reject) => {
-		const remaining = toRemainingMs(deadlineMs, clock);
 		const timer = setTimeout(() => {
 			reject(new Error("E_BACKPRESSURE_TIMEOUT: end() deadline exceeded"));
 		}, remaining);
@@ -1042,7 +1107,7 @@ export interface WtAdapterOptions {
 }
 
 export function createWebTransportAdapter(
-	opts: WtAdapterOptions,
+	opts: WtAdapterOptions = {},
 ): TransportAdapter {
 	const clock = opts.clock ?? systemTransportClock;
 	const profile = CANONICAL_CAPACITY_PROFILE;
@@ -1056,6 +1121,18 @@ export function createWebTransportAdapter(
 	});
 
 	let started = false;
+
+	let prodOpts: WtAdapterOptions | undefined;
+	async function getFactories(): Promise<WtAdapterOptions> {
+		if (opts.serverFactory && opts.clientFactory)
+			return opts as WtAdapterOptions;
+		if (!prodOpts) prodOpts = await productionWtAdapterOptions();
+		return {
+			serverFactory: opts.serverFactory ?? prodOpts.serverFactory,
+			clientFactory: opts.clientFactory ?? prodOpts.clientFactory,
+			clock,
+		};
+	}
 
 	const adapter: TransportAdapter = {
 		kind: "wt",
@@ -1071,6 +1148,7 @@ export function createWebTransportAdapter(
 				);
 			}
 			started = true;
+			const factories = await getFactories();
 
 			const rawTls = config.tls as Record<string, unknown> | undefined;
 			const cert = (rawTls?.certPem ?? rawTls?.cert) as
@@ -1096,12 +1174,13 @@ export function createWebTransportAdapter(
 			};
 
 			const sessionQueue: FakeWtServerSession[] = [];
-			const handle = opts.serverFactory(serverOptions);
+			const handle = factories.serverFactory(serverOptions);
 
 			return wrapServerHandle(handle, sessionQueue, clock, () => {});
 		},
 
 		async connect(config: ClientConfig): Promise<Session> {
+			const factories = await getFactories();
 			const clientOptions: Record<string, unknown> = {
 				limits: profileToLimits(profile),
 			};
@@ -1117,7 +1196,7 @@ export function createWebTransportAdapter(
 				clientOptions["enable0Rtt"] = true;
 			}
 
-			const native = await opts.clientFactory(config.url, clientOptions);
+			const native = await factories.clientFactory(config.url, clientOptions);
 			await native.ready;
 			return wrapClientSession(native, clock);
 		},
