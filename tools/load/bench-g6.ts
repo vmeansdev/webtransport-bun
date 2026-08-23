@@ -976,7 +976,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 
 	const [realmRaw, extraReports] = await Promise.all([
 		pumpClient(realm, onLine),
-		Promise.all(extras.map((c) => pumpClient(c, () => {}))),
+		Promise.all(extras.map((c, i) => pumpClient(c, () => {}, `extra-${i}`))),
 		sampleWhile(
 			() => realm.exited,
 			o,
@@ -1375,16 +1375,19 @@ async function macHomeOf(sshDest: string): Promise<string> {
 async function pumpClient(
 	client: SpawnedClient,
 	onLine: (line: string) => void,
+	extraLabel?: string,
 ): Promise<unknown | null> {
 	let report: unknown | null = null;
 	const decoder = new TextDecoder();
 	let buffered = "";
+	const debugExtras = process.env.G6_DEBUG_EXTRAS === "1";
 	for await (const chunk of client.child.stdout ?? []) {
 		buffered += decoder.decode(chunk as Uint8Array, { stream: true });
 		const lines = buffered.split("\n");
 		buffered = lines.pop() ?? "";
 		for (const line of lines) {
 			onLine(line);
+			if (debugExtras && extraLabel) console.error(`${extraLabel}| ${line}`);
 			const match = line.match(/^mmo-client: json (\{.*\})$/);
 			if (match?.[1]) report = JSON.parse(match[1]);
 		}
