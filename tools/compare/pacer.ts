@@ -19,12 +19,32 @@ export interface OpenLoopPacerOptions {
 
 export const DEFAULT_OPEN_LOOP_CATCH_UP = "skip" as const;
 
+const capturedPerformanceNow =
+	typeof globalThis.performance?.now === "function"
+		? globalThis.performance.now.bind(globalThis.performance)
+		: undefined;
+const capturedDateNow = Date.now.bind(Date);
+let defaultClockLastMs = Number.NEGATIVE_INFINITY;
+
+function defaultMonotonicNow(): number {
+	const raw = capturedPerformanceNow?.() ?? capturedDateNow();
+	if (!Number.isFinite(raw)) {
+		throw new RangeError("default clock must be finite");
+	}
+	const monotonic = Math.max(raw, defaultClockLastMs);
+	defaultClockLastMs = monotonic;
+	return monotonic;
+}
+
 type PacerOptionsSnapshot = {
 	readonly ratePerSecond: unknown;
 	readonly now: unknown;
 	readonly sleep: unknown;
 	readonly catchUp: unknown;
 };
+
+type DescriptorMap = Record<PropertyKey, PropertyDescriptor>;
+const objectHasOwn = Object.hasOwn;
 
 /**
  * JavaScript can represent larger finite numbers, but not as exact millisecond
@@ -83,19 +103,35 @@ function snapshotPacerOptions(
 	if (!options || typeof options !== "object") {
 		throw new TypeError("pacer options must be an object");
 	}
-	const descriptors = Object.getOwnPropertyDescriptors(options);
+	let descriptors: DescriptorMap;
+	try {
+		descriptors = Object.assign(
+			Object.create(null) as DescriptorMap,
+			Object.getOwnPropertyDescriptors(options),
+		);
+	} catch {
+		throw new TypeError("pacer options properties could not be inspected");
+	}
+	const allowed = new Set(["ratePerSecond", "now", "sleep", "catchUp"]);
+	for (const key of Reflect.ownKeys(descriptors)) {
+		if (typeof key !== "string" || !allowed.has(key)) {
+			throw new TypeError("pacer options contain an unknown own property");
+		}
+	}
 	const read = (name: string): unknown => {
+		if (!objectHasOwn(descriptors, name)) return undefined;
 		const descriptor = descriptors[name];
 		if (!descriptor) return undefined;
 		try {
-			return "value" in descriptor
-				? descriptor.value
-				: descriptor.get?.call(options);
+			if (objectHasOwn(descriptor, "value")) return descriptor.value;
+			if (!objectHasOwn(descriptor, "get")) return undefined;
+			const getter = descriptor.get;
+			return typeof getter === "function" ? getter.call(options) : undefined;
 		} catch {
 			throw new TypeError(`pacer option ${name} could not be read`);
 		}
 	};
-	if (!descriptors.ratePerSecond) {
+	if (!objectHasOwn(descriptors, "ratePerSecond")) {
 		throw new TypeError("pacer options must own ratePerSecond");
 	}
 	return {
@@ -120,6 +156,7 @@ export class OpenLoopPacer {
 	private readonly clock: PacerClock;
 	private epochMs: number | undefined;
 	private nextSequence = 0;
+	private lastObservedMs: number | undefined;
 
 	constructor(options: OpenLoopPacerOptions) {
 		const snapshot = snapshotPacerOptions(options);
@@ -159,11 +196,20 @@ export class OpenLoopPacer {
 			throw new TypeError("sleep must be a function");
 		}
 		this.clock = {
-			now: (snapshot.now as (() => number) | undefined) ?? (() => Date.now()),
+			now: (snapshot.now as (() => number) | undefined) ?? defaultMonotonicNow,
 			sleep: snapshot.sleep as
 				| ((milliseconds: number, signal?: AbortSignal) => Promise<void>)
 				| undefined,
 		};
+	}
+
+	private observeNow(value: number): number {
+		const observed = finiteNow(value);
+		if (this.lastObservedMs !== undefined && observed < this.lastObservedMs) {
+			throw new RangeError("clock moved backward during pacing");
+		}
+		this.lastObservedMs = observed;
+		return observed;
 	}
 
 	get started(): boolean {
@@ -178,15 +224,17 @@ export class OpenLoopPacer {
 		return this.nextSequence;
 	}
 
-	start(atMs = this.clock.now()): number {
+	start(atMs?: number): number {
+		const observed = this.observeNow(atMs ?? this.clock.now());
 		if (this.epochMs === undefined) {
-			this.epochMs = validateEpoch(finiteNow(atMs), this.intervalMs);
+			this.epochMs = validateEpoch(observed, this.intervalMs);
 		}
 		return this.epochMs;
 	}
 
-	reset(atMs = this.clock.now()): void {
-		this.epochMs = validateEpoch(finiteNow(atMs), this.intervalMs);
+	reset(atMs?: number): void {
+		const observed = this.observeNow(atMs ?? this.clock.now());
+		this.epochMs = validateEpoch(observed, this.intervalMs);
 		this.nextSequence = 0;
 	}
 
@@ -233,7 +281,7 @@ export class OpenLoopPacer {
 	}
 
 	nextSlot(atMs = this.clock.now()): PacingSlot {
-		const emittedAtMs = finiteNow(atMs);
+		const emittedAtMs = this.observeNow(atMs);
 		const epochMs = this.start(emittedAtMs);
 		let sequence = this.nextSequence;
 		let skippedSlots = 0;
@@ -278,7 +326,7 @@ export class OpenLoopPacer {
 			throw new RangeError("deadlineMs must be finite or positive infinity");
 		}
 		if (Number.isFinite(deadlineMs)) finiteNow(deadlineMs);
-		const now = finiteNow(this.clock.now());
+		const now = this.observeNow(this.clock.now());
 		const due = this.dueAt(this.nextSequence);
 		if (due > now) {
 			const remaining = deadlineMs - now;
@@ -327,14 +375,14 @@ export class OpenLoopPacer {
 			} else {
 				await this.clock.sleep(sleepDelay);
 			}
-			const afterSleep = finiteNow(this.clock.now());
+			const afterSleep = this.observeNow(this.clock.now());
 			if (afterSleep < due) {
 				throw new PacerDeadlineError(
 					"pacer sleep returned before the scheduled slot",
 				);
 			}
 		}
-		const emittedAtMs = finiteNow(this.clock.now());
+		const emittedAtMs = this.observeNow(this.clock.now());
 		if (emittedAtMs > deadlineMs) throw new PacerDeadlineError();
 		return this.nextSlot(emittedAtMs);
 	}

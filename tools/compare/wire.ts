@@ -59,8 +59,12 @@ const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(
 	"byteLength",
 )?.get as IntrinsicGetter<number> | undefined;
 const arrayBufferIsView = ArrayBuffer.isView;
-const dataViewConstructor = DataView;
+const typedArrayTagGetter = Object.getOwnPropertyDescriptor(
+	typedArrayPrototype,
+	Symbol.toStringTag,
+)?.get as IntrinsicGetter<string | undefined> | undefined;
 const uint8ArraySet = Uint8Array.prototype.set;
+const objectHasOwn = Object.hasOwn;
 
 export interface WireMessage {
 	readonly runId: string;
@@ -138,6 +142,16 @@ function fixedBackingBytes(buffer: unknown): number {
 	return byteLength;
 }
 
+function isArrayBufferValue(value: unknown): boolean {
+	if (!arrayBufferByteLengthGetter) return false;
+	try {
+		arrayBufferByteLengthGetter.call(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function intrinsicViewBytes(value: unknown): {
 	readonly buffer: ArrayBuffer;
 	readonly byteOffset: number;
@@ -146,7 +160,16 @@ function intrinsicViewBytes(value: unknown): {
 	if (!arrayBufferIsView(value)) {
 		fail("invalid-input", "input must be an ArrayBuffer or ArrayBufferView");
 	}
-	const isDataView = value instanceof dataViewConstructor;
+	let isDataView = false;
+	let byteLength: number | undefined;
+	if (dataViewByteLengthGetter) {
+		try {
+			byteLength = dataViewByteLengthGetter.call(value);
+			isDataView = true;
+		} catch {
+			// The DataView brand check failed; try the captured TypedArray getter.
+		}
+	}
 	const buffer = callIntrinsic(
 		isDataView ? dataViewBufferGetter : typedArrayBufferGetter,
 		value,
@@ -157,8 +180,8 @@ function intrinsicViewBytes(value: unknown): {
 		value,
 		"ArrayBuffer view",
 	);
-	const byteLength = callIntrinsic(
-		isDataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter,
+	byteLength ??= callIntrinsic(
+		typedArrayByteLengthGetter,
 		value,
 		"ArrayBuffer view",
 	);
@@ -175,14 +198,33 @@ function intrinsicViewBytes(value: unknown): {
 	return { buffer, byteOffset, byteLength };
 }
 
-function snapshotViewBytes(value: unknown, label: string): Uint8Array {
-	const view = intrinsicViewBytes(value);
+function isUint8ArrayValue(value: unknown): boolean {
+	if (!arrayBufferIsView(value) || !typedArrayTagGetter) return false;
+	try {
+		return typedArrayTagGetter.call(value) === "Uint8Array";
+	} catch {
+		return false;
+	}
+}
+
+type BinarySpan = {
+	readonly buffer: ArrayBuffer;
+	readonly byteOffset: number;
+	readonly byteLength: number;
+};
+
+function snapshotViewBytes(
+	value: unknown,
+	label: string,
+	knownView?: BinarySpan,
+): Uint8Array {
+	if (!isUint8ArrayValue(value) && label === "payload") {
+		fail("invalid-input", "payload must be a Uint8Array");
+	}
+	const view = knownView ?? intrinsicViewBytes(value);
 	const source = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 	const snapshot = new Uint8Array(view.byteLength);
 	uint8ArraySet.call(snapshot, source);
-	if (!(value instanceof Uint8Array) && label === "payload") {
-		fail("invalid-input", "payload must be a Uint8Array");
-	}
 	return snapshot;
 }
 
@@ -234,32 +276,50 @@ type WireCodecSnapshot = {
 	readonly rejectExpired: unknown;
 };
 
-function ownDescriptors(
-	value: unknown,
-	label: string,
-): Record<string, PropertyDescriptor> {
+type DescriptorMap = Record<PropertyKey, PropertyDescriptor>;
+
+function ownDescriptors(value: unknown, label: string): DescriptorMap {
 	if (!value || typeof value !== "object") {
 		fail("invalid-input", `${label} must be an object`);
 	}
 	try {
-		return Object.getOwnPropertyDescriptors(value);
+		return Object.assign(
+			Object.create(null) as DescriptorMap,
+			Object.getOwnPropertyDescriptors(value),
+		);
 	} catch {
 		fail("invalid-input", `${label} properties could not be inspected`);
 	}
 }
 
+function rejectUnknownOwnKeys(
+	descriptors: DescriptorMap,
+	allowed: ReadonlySet<string>,
+	label: string,
+): void {
+	for (const key of Reflect.ownKeys(descriptors)) {
+		if (typeof key !== "string" || !allowed.has(key)) {
+			fail("invalid-input", `${label} contains an unknown own property`);
+		}
+	}
+}
+
 function readOwnDescriptor(
-	descriptors: Record<string, PropertyDescriptor>,
+	descriptors: DescriptorMap,
 	owner: object,
 	name: string,
 	label: string,
 ): unknown {
+	if (!objectHasOwn(descriptors, name)) {
+		fail("invalid-input", `${label}.${name} must be own`);
+	}
 	const descriptor = descriptors[name];
 	if (!descriptor) fail("invalid-input", `${label}.${name} must be own`);
 	try {
-		return "value" in descriptor
-			? descriptor.value
-			: descriptor.get?.call(owner);
+		if (objectHasOwn(descriptor, "value")) return descriptor.value;
+		if (!objectHasOwn(descriptor, "get")) return undefined;
+		const getter = descriptor.get;
+		return typeof getter === "function" ? getter.call(owner) : undefined;
 	} catch {
 		fail("invalid-input", `${label}.${name} could not be read`);
 	}
@@ -267,6 +327,11 @@ function readOwnDescriptor(
 
 function snapshotMessage(message: WireMessage): WireMessageSnapshot {
 	const descriptors = ownDescriptors(message, "message");
+	rejectUnknownOwnKeys(
+		descriptors,
+		new Set(["runId", "sessionId", "sequence", "expiresAtMs", "payload"]),
+		"message",
+	);
 	const owner = message as unknown as object;
 	const runId = readOwnDescriptor(descriptors, owner, "runId", "message");
 	const sessionId = readOwnDescriptor(
@@ -294,13 +359,24 @@ function snapshotMessage(message: WireMessage): WireMessageSnapshot {
 
 function snapshotCodecOptions(options: WireCodecOptions): WireCodecSnapshot {
 	const descriptors = ownDescriptors(options, "codec options");
+	rejectUnknownOwnKeys(
+		descriptors,
+		new Set(["maxPayloadBytes", "maxWireBytes", "nowMs", "rejectExpired"]),
+		"codec options",
+	);
 	const owner = options as unknown as object;
-	const maxPayloadDescriptor = descriptors.maxPayloadBytes;
-	const maxWireDescriptor = descriptors.maxWireBytes;
-	const nowDescriptor = descriptors.nowMs;
-	const rejectDescriptor = descriptors.rejectExpired;
+	const hasMaxPayload = objectHasOwn(descriptors, "maxPayloadBytes");
+	const hasMaxWire = objectHasOwn(descriptors, "maxWireBytes");
+	const hasNowMs = objectHasOwn(descriptors, "nowMs");
+	const hasRejectExpired = objectHasOwn(descriptors, "rejectExpired");
+	const rejectExpired = hasRejectExpired
+		? readOwnDescriptor(descriptors, owner, "rejectExpired", "codec options")
+		: undefined;
+	if (hasRejectExpired && typeof rejectExpired !== "boolean") {
+		fail("invalid-input", "codec options.rejectExpired must be boolean");
+	}
 	return {
-		maxPayloadBytes: maxPayloadDescriptor
+		maxPayloadBytes: hasMaxPayload
 			? readOwnDescriptor(
 					descriptors,
 					owner,
@@ -308,16 +384,14 @@ function snapshotCodecOptions(options: WireCodecOptions): WireCodecSnapshot {
 					"codec options",
 				)
 			: undefined,
-		maxWireBytes: maxWireDescriptor
+		maxWireBytes: hasMaxWire
 			? readOwnDescriptor(descriptors, owner, "maxWireBytes", "codec options")
 			: undefined,
-		nowMs: nowDescriptor
+		nowMs: hasNowMs
 			? readOwnDescriptor(descriptors, owner, "nowMs", "codec options")
 			: undefined,
-		hasNowMs: nowDescriptor !== undefined,
-		rejectExpired: rejectDescriptor
-			? readOwnDescriptor(descriptors, owner, "rejectExpired", "codec options")
-			: undefined,
+		hasNowMs,
+		rejectExpired,
 	};
 }
 
@@ -329,7 +403,8 @@ function validateMessage(
 	sessionId: Uint8Array;
 	sequence: number;
 	expiresAtMs: number;
-	payload: Uint8Array;
+	payloadValue: Uint8Array;
+	payloadView: BinarySpan;
 } {
 	if (typeof message.runId !== "string" || message.runId.length === 0) {
 		fail("invalid-input", "runId must be a non-empty string");
@@ -346,21 +421,28 @@ function validateMessage(
 	}
 	const sequence = validateLimit("sequence", message.sequence);
 	const expiresAtMs = validateLimit("expiresAtMs", message.expiresAtMs);
-	if (!(message.payload instanceof Uint8Array)) {
+	if (!isUint8ArrayValue(message.payload)) {
 		fail("invalid-input", "payload must be a Uint8Array");
 	}
-	const payload = snapshotViewBytes(message.payload, "payload");
+	const payloadView = intrinsicViewBytes(message.payload);
 	const maxPayloadBytes =
 		(options.maxPayloadBytes as number | undefined) ??
 		DEFAULT_MAX_WIRE_PAYLOAD_BYTES;
 	validatePayloadLimit("maxPayloadBytes", maxPayloadBytes);
-	if (payload.byteLength > maxPayloadBytes) {
+	if (payloadView.byteLength > maxPayloadBytes) {
 		fail(
 			"oversized",
-			`payload is ${payload.byteLength} bytes; maximum is ${maxPayloadBytes}`,
+			`payload is ${payloadView.byteLength} bytes; maximum is ${maxPayloadBytes}`,
 		);
 	}
-	return { runId, sessionId, sequence, expiresAtMs, payload };
+	return {
+		runId,
+		sessionId,
+		sequence,
+		expiresAtMs,
+		payloadValue: message.payload,
+		payloadView,
+	};
 }
 
 function validateWireLimit(options: WireCodecSnapshot): number {
@@ -386,13 +468,11 @@ export function encodeWireMessage(
 ): Uint8Array {
 	const codecOptions = snapshotCodecOptions(options);
 	const messageSnapshot = snapshotMessage(message);
-	const { runId, sessionId, sequence, expiresAtMs, payload } = validateMessage(
-		messageSnapshot,
-		codecOptions,
-	);
+	const { runId, sessionId, sequence, expiresAtMs, payloadValue, payloadView } =
+		validateMessage(messageSnapshot, codecOptions);
 	const headerBytes =
 		WIRE_FIXED_HEADER_BYTES + runId.byteLength + sessionId.byteLength;
-	const totalBytes = headerBytes + payload.byteLength;
+	const totalBytes = headerBytes + payloadView.byteLength;
 	const maxWireBytes = validateWireLimit(codecOptions);
 	if (totalBytes > maxWireBytes) {
 		fail(
@@ -403,6 +483,7 @@ export function encodeWireMessage(
 	if (headerBytes > MAX_WIRE_HEADER_BYTES) {
 		fail("oversized", "wire header exceeds its 16-bit length field");
 	}
+	const payload = snapshotViewBytes(payloadValue, "payload", payloadView);
 
 	const encoded = new Uint8Array(totalBytes);
 	const view = new DataView(
@@ -426,26 +507,23 @@ export function encodeWireMessage(
 	return encoded;
 }
 
-function inputBytes(input: ArrayBuffer | ArrayBufferView): Uint8Array {
-	if (input instanceof ArrayBuffer) {
-		const byteLength = fixedBackingBytes(input);
-		const source = new Uint8Array(input, 0, byteLength);
-		const snapshot = new Uint8Array(byteLength);
-		uint8ArraySet.call(snapshot, source);
-		return snapshot;
+function inputBytes(input: ArrayBuffer | ArrayBufferView): BinarySpan {
+	if (isArrayBufferValue(input)) {
+		return {
+			buffer: input as ArrayBuffer,
+			byteOffset: 0,
+			byteLength: fixedBackingBytes(input),
+		};
 	}
-	if (arrayBufferIsView(input)) {
-		const view = intrinsicViewBytes(input);
-		const source = new Uint8Array(
-			view.buffer,
-			view.byteOffset,
-			view.byteLength,
-		);
-		const snapshot = new Uint8Array(view.byteLength);
-		uint8ArraySet.call(snapshot, source);
-		return snapshot;
-	}
+	if (arrayBufferIsView(input)) return intrinsicViewBytes(input);
 	fail("invalid-input", "input must be an ArrayBuffer or ArrayBufferView");
+}
+
+function snapshotInputBytes(span: BinarySpan): Uint8Array {
+	const source = new Uint8Array(span.buffer, span.byteOffset, span.byteLength);
+	const snapshot = new Uint8Array(span.byteLength);
+	uint8ArraySet.call(snapshot, source);
+	return snapshot;
 }
 
 function decodeUtf8(bytes: Uint8Array, label: string): string {
@@ -469,30 +547,34 @@ export function decodeWireMessage(
 	options: WireCodecOptions = {},
 ): WireMessage {
 	const codecOptions = snapshotCodecOptions(options);
-	const bytes = inputBytes(input);
-	if (bytes.byteLength < WIRE_FIXED_HEADER_BYTES) {
+	const sourceSpan = inputBytes(input);
+	if (sourceSpan.byteLength < WIRE_FIXED_HEADER_BYTES) {
 		fail("truncated", "wire envelope is shorter than its fixed header");
 	}
 	const maxWireBytes = validateWireLimit(codecOptions);
-	if (bytes.byteLength > maxWireBytes) {
+	if (sourceSpan.byteLength > maxWireBytes) {
 		fail(
 			"oversized",
-			`wire envelope is ${bytes.byteLength} bytes; maximum is ${maxWireBytes}`,
+			`wire envelope is ${sourceSpan.byteLength} bytes; maximum is ${maxWireBytes}`,
 		);
 	}
-	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	if (view.getUint16(0, false) !== WIRE_MAGIC) {
+	const sourceView = new DataView(
+		sourceSpan.buffer,
+		sourceSpan.byteOffset,
+		sourceSpan.byteLength,
+	);
+	if (sourceView.getUint16(0, false) !== WIRE_MAGIC) {
 		fail("malformed", "wire envelope has an invalid magic value");
 	}
-	if (view.getUint8(2) !== WIRE_VERSION) {
+	if (sourceView.getUint8(2) !== WIRE_VERSION) {
 		fail("malformed", "wire envelope has an unsupported version");
 	}
-	if (view.getUint8(3) !== 0) {
+	if (sourceView.getUint8(3) !== 0) {
 		fail("malformed", "wire envelope has unsupported flags");
 	}
-	const headerBytes = view.getUint16(4, false);
-	const runIdBytes = view.getUint16(6, false);
-	const sessionIdBytes = view.getUint16(8, false);
+	const headerBytes = sourceView.getUint16(4, false);
+	const runIdBytes = sourceView.getUint16(6, false);
+	const sessionIdBytes = sourceView.getUint16(8, false);
 	if (runIdBytes === 0) {
 		fail("malformed", "runId length must be non-zero");
 	}
@@ -507,19 +589,22 @@ export function decodeWireMessage(
 	if (headerBytes !== expectedHeaderBytes) {
 		fail("malformed", "wire header length does not match identity lengths");
 	}
-	if (headerBytes > bytes.byteLength) {
+	if (headerBytes > sourceSpan.byteLength) {
 		fail("truncated", "wire envelope ends inside its identity fields");
 	}
 
-	const sequence = decodeSafeInteger(view.getBigUint64(10, false), "sequence");
+	const sequence = decodeSafeInteger(
+		sourceView.getBigUint64(10, false),
+		"sequence",
+	);
 	const expiresAtMs = decodeSafeInteger(
-		view.getBigUint64(18, false),
+		sourceView.getBigUint64(18, false),
 		"expiresAtMs",
 	);
-	if (view.getBigUint64(26, false) !== 0n) {
+	if (sourceView.getBigUint64(26, false) !== 0n) {
 		fail("malformed", "wire envelope has non-zero reserved timestamp bytes");
 	}
-	const payloadBytes = view.getUint32(34, false);
+	const payloadBytes = sourceView.getUint32(34, false);
 	const maxPayloadBytes =
 		(codecOptions.maxPayloadBytes as number | undefined) ??
 		DEFAULT_MAX_WIRE_PAYLOAD_BYTES;
@@ -531,12 +616,13 @@ export function decodeWireMessage(
 		);
 	}
 	const expectedTotalBytes = headerBytes + payloadBytes;
-	if (expectedTotalBytes > bytes.byteLength) {
+	if (expectedTotalBytes > sourceSpan.byteLength) {
 		fail("truncated", "wire envelope ends inside its payload");
 	}
-	if (expectedTotalBytes !== bytes.byteLength) {
+	if (expectedTotalBytes !== sourceSpan.byteLength) {
 		fail("malformed", "wire envelope contains trailing bytes");
 	}
+	const bytes = snapshotInputBytes(sourceSpan);
 	const runId = decodeUtf8(
 		bytes.subarray(
 			WIRE_FIXED_HEADER_BYTES,
