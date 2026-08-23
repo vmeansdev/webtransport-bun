@@ -37,25 +37,243 @@ type PendingWatermarkWaiter = {
 	readonly onAbort?: () => void;
 };
 
-type ResizableArrayBuffer = ArrayBuffer & {
-	readonly resizable?: boolean;
-	readonly maxByteLength?: number;
-};
+type IntrinsicGetter<T> = (this: unknown) => T;
+
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(
+	ArrayBuffer.prototype,
+	"byteLength",
+)?.get as IntrinsicGetter<number> | undefined;
+const arrayBufferResizableGetter = Object.getOwnPropertyDescriptor(
+	ArrayBuffer.prototype,
+	"resizable",
+)?.get as IntrinsicGetter<boolean> | undefined;
+const arrayBufferMaxByteLengthGetter = Object.getOwnPropertyDescriptor(
+	ArrayBuffer.prototype,
+	"maxByteLength",
+)?.get as IntrinsicGetter<number> | undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(
+	typedArrayPrototype,
+	"buffer",
+)?.get as IntrinsicGetter<ArrayBuffer> | undefined;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(
+	typedArrayPrototype,
+	"byteOffset",
+)?.get as IntrinsicGetter<number> | undefined;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(
+	typedArrayPrototype,
+	"byteLength",
+)?.get as IntrinsicGetter<number> | undefined;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(
+	DataView.prototype,
+	"buffer",
+)?.get as IntrinsicGetter<ArrayBuffer> | undefined;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(
+	DataView.prototype,
+	"byteOffset",
+)?.get as IntrinsicGetter<number> | undefined;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(
+	DataView.prototype,
+	"byteLength",
+)?.get as IntrinsicGetter<number> | undefined;
+const arrayBufferIsView = ArrayBuffer.isView;
+const dataViewConstructor = DataView;
+
+const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(
+	AbortSignal.prototype,
+	"aborted",
+)?.get as IntrinsicGetter<boolean> | undefined;
+const abortSignalReasonGetter = Object.getOwnPropertyDescriptor(
+	AbortSignal.prototype,
+	"reason",
+)?.get as IntrinsicGetter<unknown> | undefined;
+type EventListenerIntrinsic = (
+	this: AbortSignal,
+	type: string,
+	listener: () => void,
+	options?: unknown,
+) => void;
+const addEventListenerIntrinsic = Object.getOwnPropertyDescriptor(
+	EventTarget.prototype,
+	"addEventListener",
+)?.value as EventListenerIntrinsic | undefined;
+const removeEventListenerIntrinsic = Object.getOwnPropertyDescriptor(
+	EventTarget.prototype,
+	"removeEventListener",
+)?.value as EventListenerIntrinsic | undefined;
+
+function callIntrinsic<T>(
+	getter: IntrinsicGetter<T> | undefined,
+	receiver: unknown,
+	label: string,
+): T {
+	if (!getter) throw new TypeError(`${label} intrinsic is unavailable`);
+	try {
+		return getter.call(receiver);
+	} catch {
+		throw new TypeError(`${label} is not a supported binary value`);
+	}
+}
+
+function fixedBacking(buffer: unknown): number {
+	const byteLength = callIntrinsic(
+		arrayBufferByteLengthGetter,
+		buffer,
+		"ArrayBuffer backing",
+	);
+	const resizable = arrayBufferResizableGetter
+		? callIntrinsic(arrayBufferResizableGetter, buffer, "ArrayBuffer backing")
+		: false;
+	const maxByteLength = arrayBufferMaxByteLengthGetter
+		? callIntrinsic(
+				arrayBufferMaxByteLengthGetter,
+				buffer,
+				"ArrayBuffer backing",
+			)
+		: byteLength;
+	if (resizable || maxByteLength !== byteLength) {
+		throw new TypeError(
+			"queue item cannot use a resizable ArrayBuffer backing",
+		);
+	}
+	return byteLength;
+}
+
+function viewBytes(value: unknown):
+	| {
+			readonly buffer: ArrayBuffer;
+			readonly byteOffset: number;
+			readonly byteLength: number;
+	  }
+	| undefined {
+	if (!arrayBufferIsView(value)) return undefined;
+	const isDataView = value instanceof dataViewConstructor;
+	const buffer = callIntrinsic(
+		isDataView ? dataViewBufferGetter : typedArrayBufferGetter,
+		value,
+		"ArrayBuffer view",
+	);
+	const byteOffset = callIntrinsic(
+		isDataView ? dataViewByteOffsetGetter : typedArrayByteOffsetGetter,
+		value,
+		"ArrayBuffer view",
+	);
+	const byteLength = callIntrinsic(
+		isDataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter,
+		value,
+		"ArrayBuffer view",
+	);
+	const backingLength = fixedBacking(buffer);
+	if (
+		!Number.isSafeInteger(byteOffset) ||
+		!Number.isSafeInteger(byteLength) ||
+		byteOffset < 0 ||
+		byteLength < 0 ||
+		byteOffset + byteLength > backingLength
+	) {
+		throw new TypeError("ArrayBuffer view has an invalid byte range");
+	}
+	return { buffer, byteOffset, byteLength };
+}
+
+function validateBinaryBacking(value: unknown): void {
+	if (value instanceof ArrayBuffer) {
+		fixedBacking(value);
+		return;
+	}
+	if (arrayBufferIsView(value)) viewBytes(value);
+}
+
+function defaultSizeOf(value: unknown): number {
+	if (typeof value === "string") {
+		return new TextEncoder().encode(value).byteLength;
+	}
+	if (value instanceof ArrayBuffer) return fixedBacking(value);
+	const view = viewBytes(value);
+	if (view) return view.byteLength;
+	throw new TypeError(
+		"queue item requires sizeOf for non-binary and non-string values",
+	);
+}
+
+function isActualAbortSignal(value: unknown): value is AbortSignal {
+	if (!value || typeof value !== "object") return false;
+	if (!abortSignalAbortedGetter || !abortSignalReasonGetter) return false;
+	if (!addEventListenerIntrinsic || !removeEventListenerIntrinsic) return false;
+	try {
+		const aborted = abortSignalAbortedGetter.call(value);
+		abortSignalReasonGetter.call(value);
+		return typeof aborted === "boolean";
+	} catch {
+		return false;
+	}
+}
+
+function signalAborted(signal: AbortSignal): boolean {
+	return callIntrinsic(abortSignalAbortedGetter, signal, "AbortSignal");
+}
+
+function signalReason(signal: AbortSignal): unknown {
+	return callIntrinsic(abortSignalReasonGetter, signal, "AbortSignal");
+}
+
+function addAbortListener(signal: AbortSignal, listener: () => void): void {
+	if (!addEventListenerIntrinsic) {
+		throw new TypeError("AbortSignal listener support is unavailable");
+	}
+	addEventListenerIntrinsic.call(signal, "abort", listener, { once: true });
+}
+
+function removeAbortListener(
+	signal: AbortSignal | undefined,
+	listener: (() => void) | undefined,
+): void {
+	if (!signal || !listener || !removeEventListenerIntrinsic) return;
+	try {
+		removeEventListenerIntrinsic.call(signal, "abort", listener);
+	} catch {
+		// Listener cleanup must not reject a resolved or closed waiter.
+	}
+}
 
 function normalizeSignal(options: QueueWaitArgument): AbortSignal | undefined {
-	if (!options) return undefined;
-	if (
-		typeof options === "object" &&
-		"aborted" in options &&
-		typeof options.aborted === "boolean"
-	) {
-		return options as AbortSignal;
+	if (options === undefined) return undefined;
+	if (isActualAbortSignal(options)) return options;
+	if (!options || typeof options !== "object") {
+		throw new TypeError(
+			"queue wait argument must be an AbortSignal or { signal }",
+		);
 	}
-	return (options as QueueWaitOptions).signal;
+	let prototype: object | null;
+	try {
+		prototype = Object.getPrototypeOf(options);
+	} catch {
+		throw new TypeError("queue wait options must be a plain object");
+	}
+	if (prototype !== Object.prototype && prototype !== null) {
+		throw new TypeError("queue wait options must be a plain object");
+	}
+	const descriptor = Object.getOwnPropertyDescriptor(options, "signal");
+	if (!descriptor) {
+		throw new TypeError("queue wait options must own a signal property");
+	}
+	let signal: unknown;
+	try {
+		signal =
+			"value" in descriptor ? descriptor.value : descriptor.get?.call(options);
+	} catch {
+		throw new TypeError("queue wait signal could not be read");
+	}
+	if (signal === undefined) return undefined;
+	if (!isActualAbortSignal(signal)) {
+		throw new TypeError("queue wait signal must be an AbortSignal");
+	}
+	return signal;
 }
 
 function abortReason(signal: AbortSignal): unknown {
-	if (signal.reason !== undefined) return signal.reason;
+	const reason = signalReason(signal);
+	if (reason !== undefined) return reason;
 	const error = new Error("queue wait aborted");
 	error.name = "AbortError";
 	return error;
@@ -82,39 +300,6 @@ function validateWatermark(
 		throw new RangeError(`${name} must be an integer between 0 and maxBytes`);
 	}
 	return value;
-}
-
-function fixedBacking(buffer: ArrayBuffer): void {
-	const candidate = buffer as ResizableArrayBuffer;
-	if (
-		candidate.resizable === true ||
-		(candidate.maxByteLength !== undefined &&
-			candidate.maxByteLength !== buffer.byteLength)
-	) {
-		throw new TypeError(
-			"queue item cannot use a resizable ArrayBuffer backing",
-		);
-	}
-}
-
-function defaultSizeOf(value: unknown): number {
-	if (typeof value === "string") {
-		return new TextEncoder().encode(value).byteLength;
-	}
-	if (value instanceof ArrayBuffer) {
-		fixedBacking(value);
-		return value.byteLength;
-	}
-	if (ArrayBuffer.isView(value)) {
-		if (!(value.buffer instanceof ArrayBuffer)) {
-			throw new TypeError("queue item requires a fixed ArrayBuffer backing");
-		}
-		fixedBacking(value.buffer);
-		return value.byteLength;
-	}
-	throw new TypeError(
-		"queue item requires sizeOf for non-binary and non-string values",
-	);
 }
 
 interface QueueEntry<T> {
@@ -234,6 +419,7 @@ export class ByteBoundedQueue<T> {
 	}
 
 	private itemBytes(value: T): number {
+		validateBinaryBacking(value);
 		const bytes = this.sizeOf(value);
 		if (!Number.isSafeInteger(bytes) || bytes <= 0) {
 			throw new RangeError("queue item size must be a positive safe integer");
@@ -254,7 +440,7 @@ export class ByteBoundedQueue<T> {
 		}
 		const reader = this.pendingReaders.shift();
 		if (reader) {
-			reader.signal?.removeEventListener("abort", reader.onAbort as () => void);
+			removeAbortListener(reader.signal, reader.onAbort);
 			reader.resolve({ done: false, value });
 			return true;
 		}
@@ -293,7 +479,7 @@ export class ByteBoundedQueue<T> {
 		const index = this.pendingReaders.indexOf(reader);
 		if (index < 0) return false;
 		this.pendingReaders.splice(index, 1);
-		reader.signal?.removeEventListener("abort", reader.onAbort as () => void);
+		removeAbortListener(reader.signal, reader.onAbort);
 		return true;
 	}
 
@@ -301,14 +487,15 @@ export class ByteBoundedQueue<T> {
 		const index = this.watermarkWaiters.indexOf(waiter);
 		if (index < 0) return false;
 		this.watermarkWaiters.splice(index, 1);
-		waiter.signal?.removeEventListener("abort", waiter.onAbort as () => void);
+		removeAbortListener(waiter.signal, waiter.onAbort);
 		return true;
 	}
 
 	/** Wait for an item or deterministic close. */
 	waitForItem(options?: QueueWaitArgument): Promise<QueueReadResult<T>> {
 		const signal = normalizeSignal(options);
-		if (signal?.aborted) return Promise.reject(abortReason(signal));
+		if (signal && signalAborted(signal))
+			return Promise.reject(abortReason(signal));
 		if (this.entries.length > 0) {
 			const value = this.shift() as T;
 			return Promise.resolve({ done: false, value });
@@ -329,15 +516,22 @@ export class ByteBoundedQueue<T> {
 			};
 			reader = { resolve, reject, signal, onAbort };
 			this.pendingReaders.push(reader);
-			signal?.addEventListener("abort", onAbort, { once: true });
-			if (signal?.aborted) onAbort();
+			try {
+				if (signal) addAbortListener(signal, onAbort);
+			} catch (error) {
+				this.removeReader(reader);
+				reject(error);
+				return;
+			}
+			if (signal && signalAborted(signal)) onAbort();
 		});
 	}
 
 	/** Wait until queued bytes are at or below the low watermark. */
 	waitForLowWaterMark(options?: QueueWaitArgument): Promise<"low" | "closed"> {
 		const signal = normalizeSignal(options);
-		if (signal?.aborted) return Promise.reject(abortReason(signal));
+		if (signal && signalAborted(signal))
+			return Promise.reject(abortReason(signal));
 		if (this.belowLowWaterMark) return Promise.resolve("low");
 		if (this.didClose) return Promise.resolve("closed");
 		if (
@@ -354,8 +548,14 @@ export class ByteBoundedQueue<T> {
 			};
 			waiter = { resolve, reject, signal, onAbort };
 			this.watermarkWaiters.push(waiter);
-			signal?.addEventListener("abort", onAbort, { once: true });
-			if (signal?.aborted) onAbort();
+			try {
+				if (signal) addAbortListener(signal, onAbort);
+			} catch (error) {
+				this.removeWatermarkWaiter(waiter);
+				reject(error);
+				return;
+			}
+			if (signal && signalAborted(signal)) onAbort();
 		});
 	}
 
@@ -368,7 +568,7 @@ export class ByteBoundedQueue<T> {
 	private resolveWatermarkWaiters(): void {
 		if (!this.belowLowWaterMark) return;
 		for (const waiter of this.watermarkWaiters.splice(0)) {
-			waiter.signal?.removeEventListener("abort", waiter.onAbort as () => void);
+			removeAbortListener(waiter.signal, waiter.onAbort);
 			waiter.resolve("low");
 		}
 	}
@@ -379,11 +579,11 @@ export class ByteBoundedQueue<T> {
 		this.didClose = true;
 		this.reason = reason;
 		for (const reader of this.pendingReaders.splice(0)) {
-			reader.signal?.removeEventListener("abort", reader.onAbort as () => void);
+			removeAbortListener(reader.signal, reader.onAbort);
 			reader.resolve({ done: true, reason });
 		}
 		for (const waiter of this.watermarkWaiters.splice(0)) {
-			waiter.signal?.removeEventListener("abort", waiter.onAbort as () => void);
+			removeAbortListener(waiter.signal, waiter.onAbort);
 			waiter.resolve("closed");
 		}
 		return true;

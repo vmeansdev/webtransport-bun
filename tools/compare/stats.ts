@@ -16,12 +16,37 @@ export interface SampleSummary {
 }
 
 function finiteSamples(samples: readonly number[]): number[] {
-	if (samples.length === 0)
-		throw new RangeError("cannot summarize empty samples");
-	if (samples.some((sample) => !Number.isFinite(sample))) {
-		throw new RangeError("samples must contain only finite numbers");
+	if (
+		!samples ||
+		(typeof samples !== "object" && typeof samples !== "function")
+	) {
+		throw new RangeError("samples must be a finite array-like collection");
 	}
-	return [...samples];
+	const lengthValue = (samples as { readonly length?: unknown }).length;
+	if (
+		typeof lengthValue !== "number" ||
+		!Number.isSafeInteger(lengthValue) ||
+		lengthValue < 0
+	) {
+		throw new RangeError("samples must have a finite safe length");
+	}
+	if (lengthValue === 0) throw new RangeError("cannot summarize empty samples");
+
+	const source = samples as unknown as object;
+	const snapshot: number[] = [];
+	for (let index = 0; index < lengthValue; index += 1) {
+		if (!Object.hasOwn(source, index)) {
+			throw new RangeError(
+				"samples must contain only finite numbers and must not contain sparse holes",
+			);
+		}
+		const sample = (samples as readonly unknown[])[index];
+		if (typeof sample !== "number" || !Number.isFinite(sample)) {
+			throw new RangeError("samples must contain only finite numbers");
+		}
+		snapshot.push(sample);
+	}
+	return snapshot;
 }
 
 /** Linear-interpolated percentile over a sorted copy; p is in [0, 100]. */

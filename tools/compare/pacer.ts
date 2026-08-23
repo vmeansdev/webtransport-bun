@@ -1,17 +1,30 @@
 export interface PacerClock {
 	readonly now: () => number;
-	readonly sleep?: (milliseconds: number) => Promise<void>;
+	readonly sleep?: (
+		milliseconds: number,
+		signal?: AbortSignal,
+	) => Promise<void>;
 }
 
 export interface OpenLoopPacerOptions {
 	readonly ratePerSecond: number;
 	readonly now?: () => number;
-	readonly sleep?: (milliseconds: number) => Promise<void>;
+	readonly sleep?: (
+		milliseconds: number,
+		signal?: AbortSignal,
+	) => Promise<void>;
 	/** `none` emits every slot; `skip` explicitly drops slots missed while late. */
 	readonly catchUp?: "none" | "skip";
 }
 
 export const DEFAULT_OPEN_LOOP_CATCH_UP = "skip" as const;
+
+type PacerOptionsSnapshot = {
+	readonly ratePerSecond: unknown;
+	readonly now: unknown;
+	readonly sleep: unknown;
+	readonly catchUp: unknown;
+};
 
 /**
  * JavaScript can represent larger finite numbers, but not as exact millisecond
@@ -63,6 +76,35 @@ function validateEpoch(epochMs: number, intervalMs: number): number {
 	return epochMs;
 }
 
+function snapshotPacerOptions(
+	options: OpenLoopPacerOptions,
+): PacerOptionsSnapshot {
+	if (!options || typeof options !== "object") {
+		throw new TypeError("pacer options must be an object");
+	}
+	const descriptors = Object.getOwnPropertyDescriptors(options);
+	const read = (name: string): unknown => {
+		const descriptor = descriptors[name];
+		if (!descriptor) return undefined;
+		try {
+			return "value" in descriptor
+				? descriptor.value
+				: descriptor.get?.call(options);
+		} catch {
+			throw new TypeError(`pacer option ${name} could not be read`);
+		}
+	};
+	if (!descriptors.ratePerSecond) {
+		throw new TypeError("pacer options must own ratePerSecond");
+	}
+	return {
+		ratePerSecond: read("ratePerSecond"),
+		now: read("now"),
+		sleep: read("sleep"),
+		catchUp: read("catchUp"),
+	};
+}
+
 /**
  * An open-loop scheduler. Slot timestamps are always derived from one epoch
  * and a sequence number, so time spent handling an event cannot accumulate as
@@ -79,11 +121,16 @@ export class OpenLoopPacer {
 	private nextSequence = 0;
 
 	constructor(options: OpenLoopPacerOptions) {
-		if (!Number.isFinite(options.ratePerSecond) || options.ratePerSecond <= 0) {
+		const snapshot = snapshotPacerOptions(options);
+		if (
+			typeof snapshot.ratePerSecond !== "number" ||
+			!Number.isFinite(snapshot.ratePerSecond) ||
+			snapshot.ratePerSecond <= 0
+		) {
 			throw new RangeError("ratePerSecond must be a positive finite number");
 		}
-		this.ratePerSecond = options.ratePerSecond;
-		this.intervalMs = 1_000 / options.ratePerSecond;
+		this.ratePerSecond = snapshot.ratePerSecond;
+		this.intervalMs = 1_000 / snapshot.ratePerSecond;
 		if (
 			!Number.isFinite(this.intervalMs) ||
 			this.intervalMs < Number.EPSILON ||
@@ -93,13 +140,28 @@ export class OpenLoopPacer {
 				"ratePerSecond produces an interval that is not safely representable",
 			);
 		}
+		const catchUp =
+			snapshot.catchUp === undefined
+				? DEFAULT_OPEN_LOOP_CATCH_UP
+				: snapshot.catchUp;
+		if (catchUp !== "none" && catchUp !== "skip") {
+			throw new RangeError("catchUp must be exactly `none` or `skip`");
+		}
 		// Skipping overdue slots is the safe default: a delayed event loop must
 		// never repay a schedule debt as a burst.  Tests and diagnostics can opt
 		// into `none` when they need every logical slot represented.
-		this.catchUp = options.catchUp ?? DEFAULT_OPEN_LOOP_CATCH_UP;
+		this.catchUp = catchUp;
+		if (snapshot.now !== undefined && typeof snapshot.now !== "function") {
+			throw new TypeError("now must be a function");
+		}
+		if (snapshot.sleep !== undefined && typeof snapshot.sleep !== "function") {
+			throw new TypeError("sleep must be a function");
+		}
 		this.clock = {
-			now: options.now ?? (() => Date.now()),
-			sleep: options.sleep,
+			now: (snapshot.now as (() => number) | undefined) ?? (() => Date.now()),
+			sleep: snapshot.sleep as
+				| ((milliseconds: number, signal?: AbortSignal) => Promise<void>)
+				| undefined,
 		};
 	}
 
@@ -230,7 +292,35 @@ export class OpenLoopPacer {
 					"pacer requires a sleep function before the deadline",
 				);
 			}
-			await this.clock.sleep(Math.min(delay, remaining));
+			const sleepDelay = Math.min(delay, remaining);
+			if (Number.isFinite(remaining)) {
+				const sleepController = new AbortController();
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				let didTimeout = false;
+				let rejectDeadline!: (error: unknown) => void;
+				const deadline = new Promise<never>((_, reject) => {
+					rejectDeadline = reject;
+					timer = setTimeout(
+						() => {
+							didTimeout = true;
+							const error = new PacerDeadlineError();
+							sleepController.abort(error);
+							rejectDeadline(error);
+						},
+						Math.max(0, remaining),
+					);
+				});
+				try {
+					const sleeping = this.clock.sleep(sleepDelay, sleepController.signal);
+					await Promise.race([sleeping, deadline]);
+					if (didTimeout) throw new PacerDeadlineError();
+				} finally {
+					if (timer !== undefined) clearTimeout(timer);
+					if (!didTimeout) sleepController.abort();
+				}
+			} else {
+				await this.clock.sleep(sleepDelay);
+			}
 			const afterSleep = finiteNow(this.clock.now());
 			if (afterSleep < due) {
 				throw new PacerDeadlineError(
