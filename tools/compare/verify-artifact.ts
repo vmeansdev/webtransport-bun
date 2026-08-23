@@ -2658,4 +2658,91 @@ export function verifyRunArtifactObject(
 	return verifySnapshot(snapshot, [], undefined, verificationContext);
 }
 
+export function trustContextForArtifact(
+	artifact: RunArtifact,
+): ArtifactTrustContext {
+	return {
+		comparisonId: artifact.comparisonId,
+		runId: artifact.runId,
+		transport: artifact.transport,
+		sourceSha: artifact.source.sourceSha,
+		archiveSha256: artifact.source.archiveSha256,
+		executableSha256: artifact.source.executableSha256,
+		toolchain: artifact.source.toolchain,
+		rawSidecarDigests: artifact.rawSidecarDigests,
+	};
+}
+
 export { artifactByteSha256 };
+
+// Entrypoint when invoked directly via CLI
+if (import.meta.main) {
+	const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+	const { join } = await import("node:path");
+
+	const dir = process.argv[2] ?? "./evidence";
+	if (!existsSync(dir)) {
+		console.error(`[verify] Error: Directory '${dir}' does not exist.`);
+		process.exit(1);
+	}
+
+	const files = readdirSync(dir).filter(
+		(f) => f.endsWith(".json") && f !== "manifest.json",
+	);
+
+	if (files.length === 0) {
+		console.log(`[verify] No evidence artifacts found in '${dir}'.`);
+		process.exit(0);
+	}
+
+	console.log(
+		`===============================================================`,
+	);
+	console.log(`VERIFYING ${files.length} EVIDENCE ARTIFACTS IN '${dir}'`);
+	console.log(
+		`===============================================================`,
+	);
+
+	let passed = 0;
+	let failed = 0;
+
+	for (const file of files) {
+		const filePath = join(dir, file);
+		const bytes = new Uint8Array(readFileSync(filePath));
+		let parsed: RunArtifact;
+		try {
+			parsed = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
+		} catch (err) {
+			console.log(`[FAIL] ${file} -> Invalid JSON`);
+			failed++;
+			continue;
+		}
+
+		const trustCtx = trustContextForArtifact(parsed);
+		const result = verifyRunArtifact(bytes, trustCtx);
+
+		if (result.evidenceStatus === "PASS") {
+			console.log(`[PASS] ${file} (${bytes.byteLength} bytes)`);
+			passed++;
+		} else {
+			console.log(
+				`[FAIL] ${file} -> ${result.rejections.map((r) => `${r.code}: ${r.reason}`).join("; ")}`,
+			);
+			failed++;
+		}
+	}
+
+	console.log(
+		`===============================================================`,
+	);
+	console.log(
+		`VERIFICATION SUMMARY: ${passed}/${files.length} passed, ${failed} failed.`,
+	);
+	console.log(
+		`===============================================================`,
+	);
+
+	if (failed > 0) {
+		process.exit(1);
+	}
+}
