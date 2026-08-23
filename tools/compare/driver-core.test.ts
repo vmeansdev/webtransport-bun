@@ -400,6 +400,35 @@ describe("shared comparison driver core", () => {
 		).toThrow(/AbortSignal/i);
 	});
 
+	test("rejects an inherited Object.prototype signal without retaining waiters", () => {
+		const queue = new ByteBoundedQueue<number>({
+			maxBytes: 8,
+			sizeOf: () => 1,
+		});
+		const controller = new AbortController();
+		const previous = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"signal",
+		);
+		try {
+			Object.defineProperty(Object.prototype, "signal", {
+				configurable: true,
+				enumerable: false,
+				writable: true,
+				value: controller.signal,
+			});
+			expect(() => queue.waitForItem({})).toThrow(/inherited|polluted|signal/i);
+			expect(queue.pendingWaiters).toBe(0);
+			expect(() => queue.waitForLowWaterMark({})).toThrow(
+				/inherited|polluted|signal/i,
+			);
+			expect(queue.pendingWaiters).toBe(0);
+		} finally {
+			if (previous) Object.defineProperty(Object.prototype, "signal", previous);
+			else Reflect.deleteProperty(Object.prototype, "signal");
+		}
+	});
+
 	test("closes deterministically, drains existing items, and rejects later pushes", async () => {
 		const queue = new ByteBoundedQueue<number>({
 			maxBytes: 16,

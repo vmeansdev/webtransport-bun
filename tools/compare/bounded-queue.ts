@@ -266,6 +266,11 @@ function normalizeSignal(options: QueueWaitArgument): AbortSignal | undefined {
 	}
 	const descriptor = Object.getOwnPropertyDescriptor(options, "signal");
 	if (!descriptor) {
+		if ("signal" in options) {
+			throw new TypeError(
+				"queue wait options contain an inherited signal property",
+			);
+		}
 		return undefined;
 	}
 	let signal: unknown;
