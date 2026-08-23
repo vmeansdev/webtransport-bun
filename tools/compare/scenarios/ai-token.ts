@@ -8,7 +8,7 @@
  * - Tracks inter-token gap p50/p95/p99, schedule misses, queue peaks, and delivered bytes.
  */
 
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 export interface AiTokenLedgerOptions {
 	readonly runId: string;

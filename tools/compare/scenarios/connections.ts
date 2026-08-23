@@ -5,7 +5,7 @@
  * 3. connection-memory (1k / 5k / 10k concurrent idle connections, RSS / socket delta)
  */
 
-import { sampleSummary, type SampleSummary } from "../stats.ts";
+import { type SampleSummary, sampleSummary } from "../stats.ts";
 
 // ---------------------------------------------------------------------------
 // Reconnect Storm

@@ -11,14 +11,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { parseServerArgs } from "./server.ts";
 import { parseClientArgs } from "./client.ts";
-import { parseCampaignArgs } from "./run-campaign.ts";
 import {
-	renderMarkdownReport,
-	escapeMarkdown,
 	type ComparisonSummary,
+	escapeMarkdown,
+	renderMarkdownReport,
 } from "./render-report.ts";
+import { parseCampaignArgs } from "./run-campaign.ts";
+import { parseServerArgs } from "./server.ts";
 
 describe("Task 10: Server CLI argument parsing", () => {
 	it("parses valid server arguments", () => {
