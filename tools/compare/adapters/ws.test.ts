@@ -4,6 +4,7 @@ import {
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_SCENARIO_REGISTRY,
 } from "../scenario-registry.ts";
+import type { CapacityProfile } from "../types.ts";
 import { encodeWireMessage, type WireMessage } from "../wire.ts";
 import type { ReceiveChannel } from "./transport.ts";
 import {
@@ -230,6 +231,32 @@ function makeAdapter(
 			return socket;
 		},
 	});
+}
+
+async function openServerFixture(
+	adapter: WebSocketAdapter,
+	holder: { current?: FakeServerRuntime },
+	capacityProfile?: CapacityProfile,
+): Promise<{
+	readonly server: Awaited<ReturnType<WebSocketAdapter["startServer"]>>;
+	readonly socket: FakeServerSocket;
+	readonly session: Awaited<
+		ReturnType<
+			Awaited<ReturnType<WebSocketAdapter["startServer"]>>["acceptSession"]
+		>
+	>;
+}> {
+	const server = await adapter.startServer({
+		port: 4433,
+		role: "publisher",
+		tls: TEST_SERVER_TLS,
+		...(capacityProfile ? { capacityProfile } : {}),
+	});
+	const socket = holder.current?.open();
+	if (!socket) throw new Error("fake socket was not opened");
+	holder.current?.receive(socket, encodeHandshakeFrame("publisher"));
+	const session = await server.acceptSession(100);
+	return { server, socket, session };
 }
 
 describe("Bun-native WebSocket comparison adapter", () => {
@@ -1049,5 +1076,344 @@ describe("Bun-native WebSocket comparison adapter", () => {
 			},
 		});
 		await first.stop(100);
+	});
+});
+
+describe("Task4 reviewer regression probes (RED)", () => {
+	test("accepts a 1200-byte application datagram despite envelope overhead", async () => {
+		const holder: { current?: FakeServerRuntime } = {};
+		const adapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				holder.current = new FakeServerRuntime(options);
+				return holder.current;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const { session, socket } = await openServerFixture(adapter, holder);
+		const datagram = { ...message(11), payload: new Uint8Array(1_200) };
+		holder.current?.receive(
+			socket,
+			encodeWebSocketFrame({
+				kind: "message",
+				deliveryKind: "datagram",
+				payload: encodeWireMessage(datagram, { nowMs: 0 }),
+			}),
+		);
+
+		expect(session.snapshot()).toMatchObject({
+			serverObserved: 1,
+			dropped: 0,
+			receiveQueueItems: 1,
+		});
+		await session.close(100);
+	});
+
+	test("bounds invalid client open deadlines and settles handshake admission", async () => {
+		const outcomes: Array<{
+			readonly label: string;
+			readonly firstKind: BoundedResult<unknown>["kind"];
+			readonly secondKind: BoundedResult<unknown>["kind"];
+			readonly secondInFlight?: number;
+		}> = [];
+		for (const deadlineMs of [Number.POSITIVE_INFINITY, Number.NaN, -1]) {
+			let factoryCalls = 0;
+			const adapter = new WebSocketAdapter({
+				capacityProfile: {
+					...CANONICAL_CAPACITY_PROFILE,
+					maxHandshakesInFlight: 1,
+				},
+				clock: { nowMs: () => 0, sleep: async () => {} },
+				clientFactory: () => {
+					factoryCalls += 1;
+					const socket = new FakeClientSocket();
+					socket.open();
+					if (factoryCalls === 1)
+						queueMicrotask(() =>
+							socket.receive(encodeWebSocketFrame({ kind: "hello-ack" })),
+						);
+					return socket;
+				},
+			});
+			const first = await observeBounded(
+				adapter.connect({
+					url: "wss://compare",
+					role: "publisher",
+					tls: TEST_CLIENT_TLS,
+					deadlineMs,
+				}),
+			);
+			const second = await observeBounded(
+				adapter.connect({
+					url: "wss://compare",
+					role: "publisher",
+					tls: TEST_CLIENT_TLS,
+					deadlineMs: 100,
+				}),
+			);
+			let secondInFlight: number | undefined;
+			if (second.kind === "resolved") {
+				secondInFlight = second.value.snapshot().handshakesInFlight;
+				await second.value.close(100);
+			}
+			outcomes.push({
+				label: String(deadlineMs),
+				firstKind: first.kind,
+				secondKind: second.kind,
+				secondInFlight,
+			});
+		}
+
+		expect(outcomes).toEqual([
+			{
+				label: "Infinity",
+				firstKind: "rejected",
+				secondKind: "resolved",
+				secondInFlight: 0,
+			},
+			{
+				label: "NaN",
+				firstKind: "rejected",
+				secondKind: "resolved",
+				secondInFlight: 0,
+			},
+			{
+				label: "-1",
+				firstKind: "rejected",
+				secondKind: "resolved",
+				secondInFlight: 0,
+			},
+		]);
+	});
+
+	test("conserves accepted and rejected counters for failed stream opens", async () => {
+		const statusHolder: { current?: FakeServerRuntime } = {};
+		const statusAdapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				statusHolder.current = new FakeServerRuntime(options);
+				return statusHolder.current;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const status = await openServerFixture(statusAdapter, statusHolder);
+		status.socket.statuses.push(0);
+		await expect(status.session.openUni(100)).rejects.toMatchObject({
+			code: "E_QUEUE_FULL",
+		});
+		const statusMetrics = status.session.snapshot();
+		await status.session.close(100);
+
+		const reservationProfile = {
+			...CANONICAL_CAPACITY_PROFILE,
+			maxQueuedBytesPerStream: 12,
+		};
+		const reservationHolder: { current?: FakeServerRuntime } = {};
+		const reservationAdapter = new WebSocketAdapter({
+			capacityProfile: reservationProfile,
+			serverFactory: (options) => {
+				reservationHolder.current = new FakeServerRuntime(options);
+				return reservationHolder.current;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const reservation = await openServerFixture(
+			reservationAdapter,
+			reservationHolder,
+			reservationProfile,
+		);
+		await expect(reservation.session.openUni(100)).rejects.toMatchObject({
+			code: "E_QUEUE_FULL",
+		});
+		const reservationMetrics = reservation.session.snapshot();
+		await reservation.session.close(100);
+
+		const queueHolder: { current?: FakeServerRuntime } = {};
+		const queueAdapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				queueHolder.current = new FakeServerRuntime(options);
+				return queueHolder.current;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const queue = await openServerFixture(queueAdapter, queueHolder);
+		const acceptQueue = Reflect.get(queue.session, "uniAcceptQueue") as {
+			close: (reason?: unknown) => void;
+		};
+		acceptQueue.close(new WebSocketTransportError("E_QUEUE_FULL", "full"));
+		queueHolder.current?.receive(
+			queue.socket,
+			encodeWebSocketFrame({ kind: "open-uni", channelId: 1 }),
+		);
+		const queueMetrics = queue.session.snapshot();
+		await queue.session.close(100);
+
+		expect([statusMetrics, reservationMetrics, queueMetrics]).toMatchObject([
+			{
+				streamOpenAttempts: 1,
+				streamOpenAccepted: 0,
+				streamOpenRejected: 1,
+			},
+			{
+				streamOpenAttempts: 1,
+				streamOpenAccepted: 0,
+				streamOpenRejected: 1,
+			},
+			{
+				streamOpenAttempts: 1,
+				streamOpenAccepted: 0,
+				streamOpenRejected: 1,
+			},
+		]);
+	});
+
+	test("holds bidi capacity until both halves terminate", async () => {
+		const socket = new FakeClientSocket();
+		const adapter = new WebSocketAdapter({
+			capacityProfile: {
+				...CANONICAL_CAPACITY_PROFILE,
+				maxStreamsPerSessionBidi: 1,
+			},
+			clientFactory: () => {
+				socket.open();
+				queueMicrotask(() =>
+					socket.receive(encodeWebSocketFrame({ kind: "hello-ack" })),
+				);
+				return socket;
+			},
+		});
+		const session = await adapter.connect({
+			url: "wss://compare",
+			role: "publisher",
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: deadline(),
+		});
+		const channel = await session.openBidi(deadline());
+		await channel.end(deadline());
+
+		await expect(session.openBidi(deadline())).rejects.toMatchObject({
+			code: "E_LIMIT_EXCEEDED",
+		});
+		await session.close(100);
+	});
+
+	test("ignores late frames after session close without mutating metrics or admission", async () => {
+		const socket = new FakeClientSocket();
+		const adapter = makeAdapter(socket);
+		const session = await adapter.connect({
+			url: "wss://compare",
+			role: "publisher",
+			tls: TEST_CLIENT_TLS,
+			deadlineMs: deadline(),
+		});
+		await session.close(100);
+		const before = session.snapshot();
+		socket.receive(
+			encodeWebSocketFrame({
+				kind: "message",
+				deliveryKind: "datagram",
+				payload: encodeWireMessage(message(12), { nowMs: 0 }),
+			}),
+		);
+		socket.receive(encodeWebSocketFrame({ kind: "open-uni", channelId: 2 }));
+
+		expect(session.snapshot()).toEqual(before);
+	});
+
+	test("evicts closed session objects while conserving lifetime metrics", async () => {
+		const holder: { current?: FakeServerRuntime } = {};
+		const adapter = new WebSocketAdapter({
+			serverFactory: (options) => {
+				holder.current = new FakeServerRuntime(options);
+				return holder.current;
+			},
+			clock: { nowMs: () => 0, sleep: async () => {} },
+		});
+		const { server, session } = await openServerFixture(adapter, holder);
+		await session.close(100);
+		const sessions = Reflect.get(server, "sessions") as Set<unknown>;
+
+		expect(sessions.has(session)).toBe(false);
+		expect(server.snapshot()).toMatchObject({ sessionsClosed: 1 });
+	});
+
+	test("uses an absolute stop deadline and clears activeServer after timeout", async () => {
+		let now = 100;
+		const sleeps: number[] = [];
+		let starts = 0;
+		const adapter = new WebSocketAdapter({
+			clock: {
+				nowMs: () => now,
+				sleep: async (milliseconds) => {
+					sleeps.push(milliseconds);
+					now += milliseconds;
+				},
+			},
+			serverFactory: (options) => {
+				const runtime = new FakeServerRuntime(options);
+				starts += 1;
+				if (starts === 1) runtime.stop = () => new Promise<void>(() => {});
+				return runtime;
+			},
+		});
+		const server = await adapter.startServer({
+			port: 4433,
+			tls: TEST_SERVER_TLS,
+		});
+		const stopped = await observeBounded(server.stop(110));
+		const restarted = await observeBounded(
+			adapter.startServer({
+				port: 4434,
+				tls: TEST_SERVER_TLS,
+			}),
+		);
+		if (restarted.kind === "resolved") await restarted.value.stop(now + 100);
+
+		expect(Reflect.get(adapter, "activeServer")).toBeUndefined();
+		expect({ stopped, sleeps, restarted }).toMatchObject({
+			stopped: {
+				kind: "rejected",
+				reason: { code: "E_BACKPRESSURE_TIMEOUT" },
+			},
+			sleeps: [10],
+			restarted: {
+				kind: "rejected",
+				reason: { code: "E_LIMIT_EXCEEDED" },
+			},
+		});
+	});
+
+	test("applies canonical handshakeTimeoutMs to the client handshake deadline", async () => {
+		let now = 0;
+		const sleeps: number[] = [];
+		const adapter = new WebSocketAdapter({
+			capacityProfile: {
+				...CANONICAL_CAPACITY_PROFILE,
+				handshakeTimeoutMs: 5,
+			},
+			clock: {
+				nowMs: () => now,
+				sleep: async (milliseconds) => {
+					sleeps.push(milliseconds);
+					now += milliseconds;
+				},
+			},
+			clientFactory: () => {
+				const socket = new FakeClientSocket();
+				socket.open();
+				return socket;
+			},
+		});
+		const result = await observeBounded(
+			adapter.connect({
+				url: "wss://compare",
+				role: "publisher",
+				tls: TEST_CLIENT_TLS,
+				deadlineMs: 1_000,
+			}),
+		);
+
+		expect({ result, sleeps }).toMatchObject({
+			result: { kind: "rejected", reason: { code: "E_HANDSHAKE_TIMEOUT" } },
+			sleeps: [5],
+		});
 	});
 });

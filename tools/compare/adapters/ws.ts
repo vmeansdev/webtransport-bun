@@ -286,11 +286,49 @@ function finiteDeadline(deadlineMs: number): void {
 	}
 }
 
+function normalizeAbsoluteDeadline(
+	deadlineMs: number,
+	message: string,
+): number {
+	if (!Number.isFinite(deadlineMs) || deadlineMs < 0)
+		throw deadlineError("E_HANDSHAKE_TIMEOUT", message);
+	return deadlineMs;
+}
+
 function remainingMs(clock: TransportClock, deadlineMs: number): number {
 	finiteDeadline(deadlineMs);
 	return deadlineMs === Number.POSITIVE_INFINITY
 		? Number.POSITIVE_INFINITY
 		: Math.max(0, deadlineMs - clock.nowMs());
+}
+
+function effectiveHandshakeDeadline(
+	clock: TransportClock,
+	deadlineMs: number,
+	handshakeTimeoutMs: number,
+): number {
+	const callerDeadline = normalizeAbsoluteDeadline(
+		deadlineMs,
+		"WebSocket handshake requires a finite deadline",
+	);
+	const handshakeDeadline = clock.nowMs() + handshakeTimeoutMs;
+	if (!Number.isFinite(handshakeDeadline))
+		throw deadlineError(
+			"E_HANDSHAKE_TIMEOUT",
+			"WebSocket handshake deadline is not representable",
+		);
+	return Math.min(callerDeadline, handshakeDeadline);
+}
+
+function remainingUntilAbsoluteDeadline(
+	clock: TransportClock,
+	deadlineMs: number,
+	code: WebSocketTransportErrorCode,
+	message: string,
+): number {
+	if (!Number.isFinite(deadlineMs) || deadlineMs < 0)
+		throw deadlineError(code, message);
+	return Math.max(0, deadlineMs - clock.nowMs());
 }
 
 function deadlineError(
@@ -583,6 +621,24 @@ class TokenBucket {
 	}
 }
 
+class StreamAdmissionLease {
+	private settled = false;
+
+	constructor(private readonly admission: AdmissionController) {}
+
+	commit(): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.admission.commitStream();
+	}
+
+	rollback(): void {
+		if (this.settled) return;
+		this.settled = true;
+		this.admission.rollbackStream();
+	}
+}
+
 class AdmissionController {
 	private readonly counters = {
 		sessionsActive: 0,
@@ -602,6 +658,7 @@ class AdmissionController {
 	private readonly streamBuckets = new Map<string, TokenBucket>();
 	private readonly datagramBuckets = new Map<string, TokenBucket>();
 	private streamsActive = 0;
+	private streamsReserved = 0;
 
 	constructor(
 		private readonly profile: CapacityProfile,
@@ -669,7 +726,7 @@ class AdmissionController {
 		);
 	}
 
-	openStream(source: string): boolean {
+	beginStream(source: string): StreamAdmissionLease | undefined {
 		this.counters.streamOpenAttempts += 1;
 		const bucket = this.bucket(
 			this.streamBuckets,
@@ -679,16 +736,27 @@ class AdmissionController {
 		);
 		const tokenAvailable = bucket.consume();
 		if (
-			this.streamsActive >= this.profile.maxStreamsGlobal ||
+			this.streamsActive + this.streamsReserved >=
+				this.profile.maxStreamsGlobal ||
 			!tokenAvailable
 		) {
 			this.counters.streamOpenRejected += 1;
 			if (!tokenAvailable) this.counters.tokenBucketRejected += 1;
-			return false;
+			return undefined;
 		}
+		this.streamsReserved += 1;
+		return new StreamAdmissionLease(this);
+	}
+
+	commitStream(): void {
+		this.streamsReserved = Math.max(0, this.streamsReserved - 1);
 		this.streamsActive += 1;
 		this.counters.streamOpenAccepted += 1;
-		return true;
+	}
+
+	rollbackStream(): void {
+		this.streamsReserved = Math.max(0, this.streamsReserved - 1);
+		this.counters.streamOpenRejected += 1;
 	}
 
 	rejectStreamAttempt(): void {
@@ -735,6 +803,11 @@ type QueuedFrame = {
 	readonly frame: WebSocketFrame;
 	readonly bytes: number;
 	readonly reservation: ByteReservation;
+};
+
+type SessionStreamAdmissionLease = {
+	commit(): void;
+	rollback(): void;
 };
 
 class WsSession implements Session {
@@ -1136,7 +1209,9 @@ class WsSession implements Session {
 		return status;
 	}
 
-	private openStreamAdmission(kind: "uni" | "bidi"): boolean {
+	private openStreamAdmission(
+		kind: "uni" | "bidi",
+	): SessionStreamAdmissionLease | undefined {
 		const count = kind === "uni" ? this.openUniCount : this.openBidiCount;
 		const limit =
 			kind === "uni"
@@ -1144,11 +1219,25 @@ class WsSession implements Session {
 				: this.profile.maxStreamsPerSessionBidi;
 		if (count.value >= limit) {
 			this.admission.rejectStreamAttempt();
-			return false;
+			return undefined;
 		}
-		if (!this.admission.openStream(this.sourceKey)) return false;
+		const admissionLease = this.admission.beginStream(this.sourceKey);
+		if (!admissionLease) return undefined;
 		count.value += 1;
-		return true;
+		let settled = false;
+		return {
+			commit: () => {
+				if (settled) return;
+				settled = true;
+				admissionLease.commit();
+			},
+			rollback: () => {
+				if (settled) return;
+				settled = true;
+				count.value = Math.max(0, count.value - 1);
+				admissionLease.rollback();
+			},
+		};
 	}
 
 	private allocateChannelId(): number {
@@ -1319,7 +1408,8 @@ class WsSession implements Session {
 	): Promise<SendChannel> {
 		this.assertActive();
 		const channelId = this.allocateChannelId();
-		if (!this.openStreamAdmission("uni"))
+		const lease = this.openStreamAdmission("uni");
+		if (!lease)
 			throw new WebSocketTransportError(
 				"E_LIMIT_EXCEEDED",
 				"uni stream admission limit exceeded",
@@ -1345,11 +1435,14 @@ class WsSession implements Session {
 					"E_QUEUE_FULL",
 					"WebSocket uni channel open was refused",
 				);
+			lease.commit();
 			this.metrics.streamsOpened += 1;
 			return channel;
 		} catch (error) {
 			this.channels.delete(channel.channelId);
-			channel.closeLocal(error);
+			lease.rollback();
+			this.metrics.streamsClosed += 1;
+			channel.closeBeforeCommit(error);
 			throw error;
 		}
 	}
@@ -1372,7 +1465,8 @@ class WsSession implements Session {
 	): Promise<BidiChannel> {
 		this.assertActive();
 		const channelId = this.allocateChannelId();
-		if (!this.openStreamAdmission("bidi"))
+		const lease = this.openStreamAdmission("bidi");
+		if (!lease)
 			throw new WebSocketTransportError(
 				"E_LIMIT_EXCEEDED",
 				"bidi stream admission limit exceeded",
@@ -1398,11 +1492,14 @@ class WsSession implements Session {
 					"E_QUEUE_FULL",
 					"WebSocket bidi channel open was refused",
 				);
+			lease.commit();
 			this.metrics.streamsOpened += 1;
 			return channel;
 		} catch (error) {
 			this.channels.delete(channel.channelId);
-			channel.closeLocal(error);
+			lease.rollback();
+			this.metrics.streamsClosed += 1;
+			channel.closeBeforeCommit(error);
 			throw error;
 		}
 	}
@@ -1558,6 +1655,7 @@ class WsSession implements Session {
 	}
 
 	onSocketMessage(value: unknown): void {
+		if (!this.active) return;
 		const payload = asSocketPayload(value);
 		if (typeof payload === "string") {
 			this.metrics.serverObserved += 1;
@@ -1647,10 +1745,12 @@ class WsSession implements Session {
 		if (frame.kind === "open-uni" || frame.kind === "open-bidi") {
 			const streamKind = frame.kind === "open-uni" ? "uni" : "bidi";
 			if (!this.acceptsRemoteChannelId(frame.channelId)) {
+				this.admission.rejectStreamAttempt();
 				this.metrics.dropped += 1;
 				return;
 			}
-			if (!this.openStreamAdmission(streamKind)) {
+			const lease = this.openStreamAdmission(streamKind);
+			if (!lease) {
 				this.metrics.dropped += 1;
 				return;
 			}
@@ -1661,7 +1761,7 @@ class WsSession implements Session {
 				);
 			} catch {
 				this.metrics.dropped += 1;
-				this.releaseStream(streamKind);
+				lease.rollback();
 				return;
 			}
 			const channel = new WsChannel(
@@ -1682,13 +1782,17 @@ class WsSession implements Session {
 			if (!accepted) {
 				this.metrics.dropped += 1;
 				this.channels.delete(frame.channelId);
-				channel.closeLocal(
+				lease.rollback();
+				channel.closeBeforeCommit(
 					new WebSocketTransportError(
 						"E_QUEUE_FULL",
 						"WebSocket channel accept queue is full",
 					),
 				);
-			} else this.metrics.streamsAccepted += 1;
+			} else {
+				lease.commit();
+				this.metrics.streamsAccepted += 1;
+			}
 			return;
 		}
 		if (frame.kind === "ack") {
@@ -1701,13 +1805,19 @@ class WsSession implements Session {
 			return;
 		}
 		if (frame.kind === "message") {
-			if (
-				frame.deliveryKind === "datagram" &&
-				frame.payload.byteLength >
-					this.profile.maxDatagramSize + DEFAULT_FRAME_BYTES
-			) {
-				this.metrics.dropped += 1;
-				return;
+			if (frame.deliveryKind === "datagram") {
+				try {
+					const decoded = decodeWireMessage(frame.payload, {
+						nowMs: this.clock.nowMs(),
+						rejectExpired: false,
+					});
+					if (decoded.payload.byteLength > this.profile.maxDatagramSize) {
+						this.metrics.dropped += 1;
+						return;
+					}
+				} catch {
+					// Preserve malformed-message accounting for receiveMessage().
+				}
 			}
 			const bytes = frame.payload.byteLength + DEFAULT_FRAME_BYTES;
 			let reservation: ByteReservation;
@@ -1899,6 +2009,15 @@ class WsChannel implements SendChannel, ReceiveChannel {
 		this.sessionChannelClosed();
 	}
 
+	closeBeforeCommit(reason?: unknown): void {
+		this.locallyClosed = true;
+		this.sendEnded = true;
+		this.receiveEnded = true;
+		this.releaseQueuedData();
+		this.releaseAcceptReservation();
+		this.incoming.close(reason);
+	}
+
 	closeLocal(reason?: unknown): void {
 		this.locallyClosed = true;
 		this.sendEnded = true;
@@ -1915,6 +2034,7 @@ class WsChannel implements SendChannel, ReceiveChannel {
 
 	private sessionChannelClosed(): void {
 		if (this.streamReleased) return;
+		if (!this.sendEnded || !this.receiveEnded) return;
 		this.streamReleased = true;
 		this.session.releaseStream(this.streamKind);
 	}
@@ -1926,6 +2046,7 @@ class WsServerHandle implements ServerHandle {
 	private readonly activeSessions = new Set<WsSession>();
 	private readonly socketSessions = new WeakMap<object, WsSession>();
 	private stopped = false;
+	private stopState: "running" | "stopping" | "stopped" = "running";
 	private stopPromise: Promise<void> | undefined;
 	private readonly metrics = emptyMetrics();
 	private nextSessionId = 0;
@@ -1941,6 +2062,7 @@ class WsServerHandle implements ServerHandle {
 		private readonly receiveWaiterLimit: number,
 		private readonly ledger: ByteReservationLedger,
 		private readonly onStopped?: () => void,
+		private readonly onStopping?: () => void,
 	) {
 		this.pending = new ByteBoundedQueue<WsSession>({
 			maxBytes: Math.max(1, profile.maxSessions),
@@ -1977,6 +2099,12 @@ class WsServerHandle implements ServerHandle {
 			this.receiveWaiterLimit,
 			(closed) => {
 				this.activeSessions.delete(closed);
+				this.sessions.delete(closed);
+				this.socketSessions.delete(socket as object);
+				mergeMetrics(
+					this.metrics,
+					closed.snapshot() as unknown as MutableMetrics,
+				);
 			},
 			undefined,
 			undefined,
@@ -2048,8 +2176,16 @@ class WsServerHandle implements ServerHandle {
 
 	async stop(deadlineMs: number): Promise<void> {
 		if (this.stopPromise) return this.stopPromise;
-		if (this.stopped) return;
+		if (this.stopState === "stopped") return;
+		const remaining = remainingUntilAbsoluteDeadline(
+			this.clock,
+			deadlineMs,
+			"E_BACKPRESSURE_TIMEOUT",
+			"WebSocket server stop requires a finite absolute deadline",
+		);
+		this.stopState = "stopping";
 		this.stopped = true;
+		this.onStopping?.();
 		this.pending.close(
 			new WebSocketTransportError(
 				"E_SESSION_CLOSED",
@@ -2063,21 +2199,30 @@ class WsServerHandle implements ServerHandle {
 				await session.close(Number.POSITIVE_INFINITY);
 			await this.runtime.stop(true);
 		})();
+		let finalized = false;
+		const finalize = (): void => {
+			if (finalized) return;
+			finalized = true;
+			this.stopState = "stopped";
+			this.onStopped?.();
+		};
+		const underlying = operation.then(
+			() => {
+				finalize();
+			},
+			(error) => {
+				finalize();
+				throw error;
+			},
+		);
 		this.stopPromise = runWithDeadline(
-			operation,
+			underlying,
 			this.clock,
-			deadlineMs,
+			remaining,
 			deadlineError(
 				"E_BACKPRESSURE_TIMEOUT",
 				"WebSocket server stop deadline expired",
 			),
-		).then(
-			() => {
-				this.onStopped?.();
-			},
-			(error) => {
-				throw error;
-			},
 		);
 		return this.stopPromise;
 	}
@@ -2196,6 +2341,7 @@ export class WebSocketAdapter implements TransportAdapter {
 	private readonly ledger: ByteReservationLedger;
 	private nextClientSessionId = 0;
 	private activeServer: WsServerHandle | undefined;
+	private stoppingServer: WsServerHandle | undefined;
 
 	constructor(options: WebSocketAdapterOptions = {}) {
 		this.profile = freezeCapacityProfile(
@@ -2227,6 +2373,11 @@ export class WebSocketAdapter implements TransportAdapter {
 	private _lastClientOptions: ClientWebSocketOptions | undefined;
 
 	async connect(config: ClientConfig): Promise<Session> {
+		const handshakeDeadline = effectiveHandshakeDeadline(
+			this.clock,
+			config.deadlineMs,
+			this.profile.handshakeTimeoutMs,
+		);
 		const admission = this.clientAdmission;
 		if (!admission.beginHandshake(config.sourceKey ?? "local"))
 			throw new WebSocketTransportError(
@@ -2293,7 +2444,7 @@ export class WebSocketAdapter implements TransportAdapter {
 			session.onSocketClose(socketCloseCode(event), socketCloseReason(event)),
 		);
 		if (socket.readyState !== 1) {
-			const remaining = remainingMs(this.clock, config.deadlineMs);
+			const remaining = remainingMs(this.clock, handshakeDeadline);
 			if (remaining <= 0) {
 				session.rejectHandshake(
 					new WebSocketTransportError(
@@ -2373,12 +2524,12 @@ export class WebSocketAdapter implements TransportAdapter {
 		}
 		handshakeReservation.release();
 		session.markHandshakeSent();
-		await session.waitForHandshake(config.deadlineMs);
+		await session.waitForHandshake(handshakeDeadline);
 		return session;
 	}
 
 	async startServer(config: ServerConfig): Promise<ServerHandle> {
-		if (this.activeServer)
+		if (this.activeServer || this.stoppingServer)
 			throw new WebSocketTransportError(
 				"E_LIMIT_EXCEEDED",
 				"only one active WebSocket comparison server is permitted",
@@ -2457,6 +2608,11 @@ export class WebSocketAdapter implements TransportAdapter {
 			this.ledger,
 			() => {
 				if (this.activeServer === handle) this.activeServer = undefined;
+				if (this.stoppingServer === handle) this.stoppingServer = undefined;
+			},
+			() => {
+				if (this.activeServer === handle) this.activeServer = undefined;
+				this.stoppingServer = handle;
 			},
 		);
 		this.activeServer = handle;
@@ -2490,9 +2646,11 @@ export class WebSocketAdapter implements TransportAdapter {
 		): void {
 			const session = handle?.sessionFor(socket);
 			if (!session) {
-				const events = pendingEvents.get(socket as object) ?? [];
-				events.push(event);
-				pendingEvents.set(socket as object, events);
+				if (!handle) {
+					const events = pendingEvents.get(socket as object) ?? [];
+					events.push(event);
+					pendingEvents.set(socket as object, events);
+				}
 				return;
 			}
 			if (event.kind === "message") session.onSocketMessage(event.value);
