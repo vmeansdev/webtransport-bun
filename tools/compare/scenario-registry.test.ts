@@ -428,6 +428,27 @@ describe("frozen v1 comparison scenario registry", () => {
 		}
 	});
 
+	test("rejects sparse arrays even when Array.prototype supplies a hole", () => {
+		const originalIndex = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+		try {
+			Object.defineProperty(Array.prototype, "0", {
+				configurable: true,
+				enumerable: false,
+				value: "polluted",
+				writable: true,
+			});
+			const sparse: unknown[] = [];
+			sparse.length = 1;
+			expect(() => canonicalJson(sparse)).toThrow(/sparse/i);
+		} finally {
+			if (originalIndex) {
+				Object.defineProperty(Array.prototype, "0", originalIndex);
+			} else {
+				Reflect.deleteProperty(Array.prototype, "0");
+			}
+		}
+	});
+
 	test("marks diagnostic overrides non-canonical and hashes the changed cell", () => {
 		const override: ScenarioOverride = {
 			cellId: "chat-fanout/subscribers-1000",
@@ -450,6 +471,53 @@ describe("frozen v1 comparison scenario registry", () => {
 					return !canonical && scenarioHash === diagnosticCell.scenarioHash;
 				}),
 		).toBe(true);
+	});
+
+	test("keeps diagnostic parameters complete under inherited setters", () => {
+		const originalDuration = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"durationSeconds",
+		);
+		let setterCalls = 0;
+		try {
+			Object.defineProperty(Object.prototype, "durationSeconds", {
+				configurable: true,
+				set: () => {
+					setterCalls += 1;
+				},
+			});
+			const diagnostic = createScenarioRegistry({
+				overrides: [
+					{
+						cellId: "chat-fanout/subscribers-1000",
+						changes: { durationSeconds: 31 },
+					},
+				],
+			});
+			const parameters = getScenarioCell(
+				diagnostic,
+				"chat-fanout/subscribers-1000",
+			).parameters;
+			expect(Object.getPrototypeOf(parameters)).toBeNull();
+			expect(Object.keys(parameters)).toEqual(
+				Object.keys(cell("chat-fanout/subscribers-1000").parameters),
+			);
+			expect(Object.hasOwn(parameters, "durationSeconds")).toBe(true);
+			expect(
+				Object.getOwnPropertyDescriptor(parameters, "durationSeconds")?.value,
+			).toBe(31);
+			expect(setterCalls).toBe(0);
+		} finally {
+			if (originalDuration) {
+				Object.defineProperty(
+					Object.prototype,
+					"durationSeconds",
+					originalDuration,
+				);
+			} else {
+				Reflect.deleteProperty(Object.prototype, "durationSeconds");
+			}
+		}
 	});
 
 	test("preserves one getter snapshot through validation and application", () => {
@@ -507,6 +575,90 @@ describe("frozen v1 comparison scenario registry", () => {
 		).toMatchObject({ durationSeconds: 31 });
 	});
 
+	test("ignores inherited descriptor value and get pollution", () => {
+		const originalValue = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"value",
+		);
+		const originalGet = Object.getOwnPropertyDescriptor(
+			Object.prototype,
+			"get",
+		);
+		const originalDescriptors = Object.getOwnPropertyDescriptor(
+			Object,
+			"getOwnPropertyDescriptors",
+		);
+		try {
+			Object.defineProperty(Object.prototype, "value", {
+				configurable: true,
+				value: "unknown/default",
+				writable: true,
+			});
+			const getterOverride = Object.defineProperties(
+				{},
+				{
+					cellId: {
+						configurable: true,
+						enumerable: true,
+						get: () => "chat-fanout/subscribers-1000",
+					},
+					changes: {
+						configurable: true,
+						enumerable: true,
+						value: { durationSeconds: 31 },
+					},
+				},
+			);
+			expect(() => validateScenarioOverride(getterOverride)).not.toThrow();
+
+			Reflect.deleteProperty(Object.prototype, "value");
+			Object.defineProperty(Object.prototype, "get", {
+				configurable: true,
+				value: () => ({ durationSeconds: 31 }),
+				writable: true,
+			});
+			const descriptorPollutedOverride = {
+				cellId: "chat-fanout/subscribers-1000",
+				changes: { durationSeconds: 31 },
+			};
+			const originalGetOwnPropertyDescriptors =
+				Object.getOwnPropertyDescriptors;
+			Object.getOwnPropertyDescriptors = ((value: object) => {
+				const descriptors = originalGetOwnPropertyDescriptors(value);
+				if (value !== descriptorPollutedOverride) return descriptors;
+				const pollutedDescriptor = Object.create(
+					Object.prototype,
+				) as PropertyDescriptor;
+				pollutedDescriptor.configurable = true;
+				pollutedDescriptor.enumerable = true;
+				return { ...descriptors, changes: pollutedDescriptor };
+			}) as typeof Object.getOwnPropertyDescriptors;
+			expect(() =>
+				validateScenarioOverride(descriptorPollutedOverride),
+			).toThrow(/changes.*object|own property/i);
+		} finally {
+			if (originalValue) {
+				Object.defineProperty(Object.prototype, "value", originalValue);
+			} else {
+				Reflect.deleteProperty(Object.prototype, "value");
+			}
+			if (originalGet) {
+				Object.defineProperty(Object.prototype, "get", originalGet);
+			} else {
+				Reflect.deleteProperty(Object.prototype, "get");
+			}
+			if (originalDescriptors) {
+				Object.defineProperty(
+					Object,
+					"getOwnPropertyDescriptors",
+					originalDescriptors,
+				);
+			} else {
+				Reflect.deleteProperty(Object, "getOwnPropertyDescriptors");
+			}
+		}
+	});
+
 	test("rejects empty, no-op, and cancelling diagnostic overrides", () => {
 		const cellId = "chat-fanout/subscribers-1000";
 		expect(() =>
@@ -531,6 +683,7 @@ describe("frozen v1 comparison scenario registry", () => {
 		const typedOptions: ScenarioRegistryOptions = { overrides: [] };
 		const typedOverrides: readonly ScenarioOverride[] = [];
 		expect(createScenarioRegistry()).toBe(CANONICAL_SCENARIO_REGISTRY);
+		expect(createScenarioRegistry(undefined)).toBe(CANONICAL_SCENARIO_REGISTRY);
 		expect(createScenarioRegistry(typedOptions)).toBe(
 			CANONICAL_SCENARIO_REGISTRY,
 		);
@@ -645,6 +798,7 @@ describe("frozen v1 comparison scenario registry", () => {
 			["reconnect-storm/cold-full", "clientCount", 99],
 			["ai-token-stream/chunk-32", "sessionCount", 99],
 			["connection-memory/live-1000", "liveConnections", 999],
+			["connection-memory/live-1000", "pooling", true],
 			["reconnect-storm/cold-full", "state", "warm-after-prime"],
 			["reconnect-storm/cold-full", "reconnectCycles", 9],
 			["reconnect-storm/cold-full", "concurrency", 99],
@@ -822,5 +976,50 @@ describe("frozen v1 comparison scenario registry", () => {
 			"chat-fanout/subscribers-1000/ws",
 			"chat-fanout/subscribers-1000/wt",
 		]);
+	});
+
+	test("enforces discriminated arm kinds at compile time and runtime", () => {
+		const arms = listScenarioArms(CANONICAL_SCENARIO_REGISTRY);
+		for (const arm of arms) {
+			if (arm.armKind === "primary") {
+				expect(["ws", "wt"]).toContain(arm.transport);
+				expect(Object.hasOwn(arm, "overlayOf")).toBe(false);
+				expect(arm.overlayOf).toBeUndefined();
+			} else {
+				expect(arm.transport).toBe("ws-lossy-overlay");
+				expect(Object.hasOwn(arm, "overlayOf")).toBe(true);
+				expect(arm.overlayOf).toMatch(/\/ws$/);
+			}
+		}
+
+		const armBase = {
+			armId: "chat-fanout/subscribers-1000/ws",
+			cellId: "chat-fanout/subscribers-1000",
+			scenarioId: "chat-fanout",
+			canonical: true,
+			scenarioHash: "a".repeat(64),
+			capacityProfileHash: "b".repeat(64),
+			connectionSetup: {
+				connectionRampPerSecond: 500,
+				maxConnectsInFlight: 200,
+			},
+		} as const;
+		// @ts-expect-error primary arms cannot carry overlayOf
+		const invalidPrimaryArm: ScenarioArm = {
+			...armBase,
+			transport: "ws",
+			armKind: "primary",
+			label: "ws-primary",
+			overlayOf: "chat-fanout/subscribers-1000/ws",
+		};
+		// @ts-expect-error lossy overlay arms require overlayOf
+		const invalidOverlayArm: ScenarioArm = {
+			...armBase,
+			transport: "ws-lossy-overlay",
+			armKind: "ws-lossy-overlay",
+			label: "ws-lossy-game-overlay",
+		};
+		void invalidPrimaryArm;
+		void invalidOverlayArm;
 	});
 });

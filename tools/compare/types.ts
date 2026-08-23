@@ -265,19 +265,30 @@ export type PrimaryTransport = "ws" | "wt";
 export type ArmTransport = PrimaryTransport | "ws-lossy-overlay";
 export type ArmKind = "primary" | "ws-lossy-overlay";
 
-export interface ScenarioArm {
+interface ScenarioArmBase {
 	readonly armId: string;
 	readonly cellId: string;
 	readonly scenarioId: ScenarioId;
-	readonly transport: ArmTransport;
-	readonly armKind: ArmKind;
 	readonly label: string;
-	readonly overlayOf?: string;
 	readonly canonical: boolean;
 	readonly scenarioHash: string;
 	readonly capacityProfileHash: string;
 	readonly connectionSetup: ConnectionSetup;
 }
+
+export interface PrimaryScenarioArm extends ScenarioArmBase {
+	readonly transport: PrimaryTransport;
+	readonly armKind: "primary";
+	readonly overlayOf?: never;
+}
+
+export interface LossyScenarioArm extends ScenarioArmBase {
+	readonly transport: "ws-lossy-overlay";
+	readonly armKind: "ws-lossy-overlay";
+	readonly overlayOf: string;
+}
+
+export type ScenarioArm = PrimaryScenarioArm | LossyScenarioArm;
 
 export interface ScenarioRegistry {
 	readonly schemaVersion: "v1";

@@ -43,7 +43,7 @@ function canonicalizeValue(
 		if (Array.isArray(value)) {
 			const result: CanonicalValue[] = [];
 			for (let index = 0; index < value.length; index += 1) {
-				if (!(index in value)) {
+				if (!Object.hasOwn(value, index)) {
 					throw new TypeError("canonical JSON cannot contain sparse arrays");
 				}
 				result.push(canonicalizeValue(value[index], ancestors));
