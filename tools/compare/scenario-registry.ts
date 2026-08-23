@@ -727,7 +727,32 @@ function normalizeOverrideArray(rawOverrides: unknown): ScenarioOverride[] {
 			"scenario registry overrides length must be a safe integer",
 		);
 	}
+	if (length > CANONICAL_CELLS.length) {
+		throw new RangeError(
+			`scenario registry overrides length must be at most ${CANONICAL_CELLS.length}`,
+		);
+	}
+	for (const key of Reflect.ownKeys(descriptors)) {
+		if (key === "length") continue;
+		if (typeof key !== "string") {
+			throw new TypeError(
+				`scenario registry overrides has unexpected own property ${String(key)}`,
+			);
+		}
+		const index = Number(key);
+		if (
+			!Number.isSafeInteger(index) ||
+			index < 0 ||
+			index >= length ||
+			String(index) !== key
+		) {
+			throw new TypeError(
+				`scenario registry overrides has unexpected own property ${key}`,
+			);
+		}
+	}
 	const snapshots: ScenarioOverride[] = [];
+	const cellIds = new Set<string>();
 	for (let index = 0; index < length; index += 1) {
 		const descriptor = getOwnPropertyDescriptor(descriptors, String(index));
 		if (!descriptor) {
@@ -735,11 +760,16 @@ function normalizeOverrideArray(rawOverrides: unknown): ScenarioOverride[] {
 				`scenario registry overrides must own entry ${index}`,
 			);
 		}
-		snapshots.push(
-			normalizeScenarioOverride(
-				readPropertyDescriptor(rawOverrides, descriptor),
-			),
+		const snapshot = normalizeScenarioOverride(
+			readPropertyDescriptor(rawOverrides, descriptor),
 		);
+		if (cellIds.has(snapshot.cellId)) {
+			throw new RangeError(
+				`scenario registry overrides contain duplicate cellId ${snapshot.cellId}`,
+			);
+		}
+		cellIds.add(snapshot.cellId);
+		snapshots.push(snapshot);
 	}
 	return snapshots;
 }
@@ -848,10 +878,8 @@ function normalizeAndValidateScenarioOverride(
 	return snapshot;
 }
 
-export function validateScenarioOverride(
-	override: unknown,
-): asserts override is ScenarioOverride {
-	normalizeAndValidateScenarioOverride(override);
+export function validateScenarioOverride(override: unknown): ScenarioOverride {
+	return normalizeAndValidateScenarioOverride(override);
 }
 
 function isDiagnosticParameterValue(
