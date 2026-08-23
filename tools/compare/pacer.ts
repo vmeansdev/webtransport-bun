@@ -341,6 +341,9 @@ export class OpenLoopPacer {
 			}
 			const delay = due - now;
 			finiteSafeDuration(delay, "slot delay");
+			if (delay > MAX_NATIVE_TIMER_MS) {
+				throw new RangeError("slot delay exceeds the native timer maximum");
+			}
 			if (!this.clock.sleep) {
 				throw new PacerDeadlineError(
 					"pacer requires a sleep function before the deadline",
