@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ByteBoundedQueue, DEFAULT_MAX_QUEUE_ITEMS } from "./bounded-queue.ts";
-import { ManualClock, OpenLoopPacer } from "./pacer.ts";
+import { ManualClock, OpenLoopPacer, PacerDeadlineError } from "./pacer.ts";
 import { percentile, sampleSummary, studentTCritical95 } from "./stats.ts";
 import {
 	DEFAULT_MAX_WIRE_PAYLOAD_BYTES,
@@ -53,6 +53,86 @@ describe("shared comparison driver core", () => {
 			}),
 		).toThrow(WireFormatError);
 		expect(decodeWireMessage(encodeWireMessage(message))).toEqual(message);
+	});
+
+	test("requires own wire fields and snapshots message and codec getters once", () => {
+		const reads = new Map<string, number>();
+		const read = (name: string, value: unknown) => {
+			reads.set(name, (reads.get(name) ?? 0) + 1);
+			return value;
+		};
+		const snapshotMessage = {} as Record<string, unknown>;
+		Object.defineProperties(snapshotMessage, {
+			runId: { enumerable: true, get: () => read("runId", message.runId) },
+			sessionId: {
+				enumerable: true,
+				get: () => read("sessionId", message.sessionId),
+			},
+			sequence: {
+				enumerable: true,
+				get: () => read("sequence", message.sequence),
+			},
+			expiresAtMs: {
+				enumerable: true,
+				get: () => read("expiresAtMs", message.expiresAtMs),
+			},
+			payload: {
+				enumerable: true,
+				get: () => read("payload", message.payload),
+			},
+		});
+
+		const encoded = encodeWireMessage(
+			snapshotMessage as unknown as typeof message,
+		);
+		expect(decodeWireMessage(encoded)).toEqual(message);
+		for (const name of [
+			"runId",
+			"sessionId",
+			"sequence",
+			"expiresAtMs",
+			"payload",
+		]) {
+			expect(reads.get(name)).toBe(1);
+		}
+
+		const inherited = Object.create(message) as typeof message;
+		expect(() => encodeWireMessage(inherited)).toThrow(/own/i);
+
+		let nowReads = 0;
+		const options = {
+			rejectExpired: true,
+			get nowMs() {
+				nowReads += 1;
+				return message.expiresAtMs;
+			},
+		};
+		expect(() => decodeWireMessage(encoded, options)).toThrow(/expired/i);
+		expect(nowReads).toBe(1);
+	});
+
+	test("snapshots payload and input bytes through intrinsic view accessors", () => {
+		const payload = new Uint8Array([7, 8, 9]);
+		Object.defineProperties(payload, {
+			buffer: { configurable: true, value: new ArrayBuffer(1) },
+			byteOffset: { configurable: true, value: 0 },
+			byteLength: { configurable: true, value: 1 },
+		});
+		const encoded = encodeWireMessage({ ...message, payload });
+		expect(decodeWireMessage(encoded).payload).toEqual(
+			new Uint8Array([7, 8, 9]),
+		);
+
+		const input = new Uint8Array(encoded);
+		Object.defineProperties(input, {
+			buffer: { configurable: true, value: new ArrayBuffer(1) },
+			byteOffset: { configurable: true, value: 0 },
+			byteLength: { configurable: true, value: 1 },
+		});
+		expect(decodeWireMessage(input)).toEqual({
+			...message,
+			payload: new Uint8Array([7, 8, 9]),
+		});
 	});
 
 	test("requires own finite nowMs when rejecting expired envelopes", () => {
@@ -226,6 +306,43 @@ describe("shared comparison driver core", () => {
 		expect(() => queue.tryPush({ byteLength: 1 })).toThrow(/sizeOf/i);
 	});
 
+	test("uses intrinsic binary sizes and validates fixed backing before custom sizing", () => {
+		const fixed = new ArrayBuffer(8);
+		Object.defineProperty(fixed, "byteLength", {
+			configurable: true,
+			value: 1,
+		});
+		const fixedQueue = new ByteBoundedQueue<ArrayBuffer>({ maxBytes: 8 });
+		expect(fixedQueue.tryPush(fixed)).toBe(true);
+		expect(fixedQueue.bytes).toBe(8);
+
+		const resizable = new ArrayBuffer(8, { maxByteLength: 16 });
+		Object.defineProperties(resizable, {
+			resizable: { configurable: true, value: false },
+			maxByteLength: { configurable: true, value: 8 },
+		});
+		const customQueue = new ByteBoundedQueue<ArrayBuffer>({
+			maxBytes: 8,
+			sizeOf: () => 1,
+		});
+		expect(() => customQueue.tryPush(resizable)).toThrow(/resizable/i);
+	});
+
+	test("rejects malformed queue wait arguments before consuming waiter capacity", () => {
+		const queue = new ByteBoundedQueue<number>({
+			maxBytes: 8,
+			maxWaiters: 1,
+			sizeOf: () => 1,
+		});
+		expect(() => queue.waitForItem({ aborted: false } as never)).toThrow(
+			/signal|AbortSignal/i,
+		);
+		expect(() =>
+			queue.waitForItem({ signal: { aborted: false } } as never),
+		).toThrow(/signal|AbortSignal/i);
+		expect(queue.pendingWaiters).toBe(0);
+	});
+
 	test("closes deterministically, drains existing items, and rejects later pushes", async () => {
 		const queue = new ByteBoundedQueue<number>({
 			maxBytes: 16,
@@ -338,6 +455,32 @@ describe("shared comparison driver core", () => {
 		});
 	});
 
+	test("validates catch-up policy at runtime and bounds a hung sleeper by deadline", async () => {
+		for (const catchUp of ["repay", null, 0] as unknown[]) {
+			expect(
+				() =>
+					new OpenLoopPacer({
+						ratePerSecond: 10,
+						catchUp: catchUp as never,
+					}),
+			).toThrow(/catchUp/i);
+		}
+
+		let receivedSignal: AbortSignal | undefined;
+		const pacer = new OpenLoopPacer({
+			ratePerSecond: 1,
+			now: () => 0,
+			sleep: ((_: number, signal?: AbortSignal) => {
+				receivedSignal = signal;
+				return new Promise<void>(() => {});
+			}) as (milliseconds: number) => Promise<void>,
+		});
+		pacer.nextSlot();
+		await expect(pacer.waitNext(10)).rejects.toBeInstanceOf(PacerDeadlineError);
+		expect(receivedSignal).toBeInstanceOf(AbortSignal);
+		expect(receivedSignal?.aborted).toBe(true);
+	});
+
 	test("freezes skip as the safe default open-loop policy", () => {
 		const pacer = new OpenLoopPacer({ ratePerSecond: 10, now: () => 0 });
 		expect(pacer.catchUp).toBe("skip");
@@ -430,6 +573,39 @@ describe("shared comparison driver core", () => {
 		expect(values).toEqual([9, 1, 4, 2, 8, 3, 7, 5, 6]);
 		expect(() => percentile([], 50)).toThrow(/empty/i);
 		expect(() => percentile([1, Number.NaN], 50)).toThrow(/finite/i);
+		expect(() => percentile(new Array(2), 50)).toThrow(/finite|number/i);
+
+		const source = [1, 3];
+		let firstRead = true;
+		const mutating = new Proxy(source, {
+			get(target, property, receiver) {
+				if (property === "0") {
+					const value = firstRead ? 1 : 100;
+					firstRead = false;
+					return value;
+				}
+				return Reflect.get(target, property, receiver);
+			},
+		}) as unknown as readonly number[];
+		expect(percentile(mutating, 50)).toBe(2);
+	});
+
+	test("requires an own finite expiry timestamp", () => {
+		const inherited = Object.create({
+			expiresAtMs: message.expiresAtMs,
+		}) as typeof message;
+		expect(() => isWireMessageExpired(inherited, 2_000)).toThrow(
+			/own|expires/i,
+		);
+		expect(() =>
+			isWireMessageExpired({ ...message, expiresAtMs: Number.NaN }, 0),
+		).toThrow(/expires/i);
+		expect(() =>
+			isWireMessageExpired(
+				{ ...message, expiresAtMs: Number.POSITIVE_INFINITY },
+				0,
+			),
+		).toThrow(/expires/i);
 	});
 
 	test("summarizes finite samples with a Student-t 95% confidence interval", () => {
