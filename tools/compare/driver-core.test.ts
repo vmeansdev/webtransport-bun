@@ -675,6 +675,29 @@ describe("shared comparison driver core", () => {
 		expect(drainable.shift()).toBeUndefined();
 	});
 
+	test("re-checks close after reentrant sizeOf before reader delivery or enqueue", async () => {
+		let queue!: ByteBoundedQueue<number>;
+		queue = new ByteBoundedQueue<number>({
+			maxBytes: 8,
+			sizeOf: () => {
+				queue.close("sizeOf closed");
+				return 1;
+			},
+		});
+		const pending = queue.waitForItem();
+
+		expect(queue.tryPush(7)).toBe(false);
+		expect(queue.closed).toBe(true);
+		expect(queue.bytes).toBe(0);
+		expect(queue.length).toBe(0);
+		expect(queue.drain()).toEqual([]);
+		expect(await pending).toEqual({ done: true, reason: "sizeOf closed" });
+		expect(await queue.waitForItem()).toEqual({
+			done: true,
+			reason: "sizeOf closed",
+		});
+	});
+
 	test("aborted item waits are removed and waiter capacity is reusable", async () => {
 		const queue = new ByteBoundedQueue<number>({
 			maxBytes: 16,
