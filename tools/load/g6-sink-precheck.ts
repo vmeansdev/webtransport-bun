@@ -181,12 +181,40 @@ function run(
 	});
 }
 
+/** Poll until the one-shot server is actually listening (or give up). */
+function waitListening(port: number, ms = 5_000): Promise<boolean> {
+	return new Promise((resolve) => {
+		const start = Date.now();
+		const tick = () => {
+			// lsof, not nc: a connection probe would consume the `-1` one-shot
+			// server's single client and kill it before the real client dials.
+			const probe = spawn(
+				"/usr/sbin/lsof",
+				["-nP", `-iTCP:${String(port)}`, "-sTCP:LISTEN"],
+				{ stdio: ["ignore", "ignore", "ignore"] },
+			);
+			probe.on("exit", (code) => {
+				if (code === 0) return resolve(true);
+				if (Date.now() - start > ms) return resolve(false);
+				setTimeout(tick, 100);
+			});
+		};
+		tick();
+	});
+}
+
 async function main(): Promise<number> {
-	// Server first (one-shot), then the client, then read the server's end.sum.
-	const server = await run(IPERF, ["-s", "-p", String(PORT), "-1"]);
-	if (server.code !== 0) {
+	// Server in the background: the `-1` one-shot exits only after one client
+	// disconnects, so it must be running while the client dials — starting it
+	// and awaiting exit before the client is a deadlock.
+	const server = spawn(IPERF, ["-s", "-p", String(PORT), "-1"], {
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	const listening = await waitListening(PORT);
+	if (!listening) {
+		server.kill("SIGKILL");
 		console.error(
-			`g6-sink-precheck: iperf3 server failed (exit ${server.code}):\n${server.out}`,
+			`g6-sink-precheck: iperf3 server never came up on port ${PORT}`,
 		);
 		return 1;
 	}
@@ -206,6 +234,13 @@ async function main(): Promise<number> {
 		"--get-server-output",
 		"-J",
 	]);
+	// The one-shot server exits when the client disconnects; reap it.
+	await new Promise<void>((resolve) => {
+		if (server.exitCode !== null) return resolve();
+		server.on("exit", () => resolve());
+		setTimeout(() => resolve(), 3_000);
+	});
+
 	if (client.code !== 0) {
 		console.error(
 			`g6-sink-precheck: iperf3 client failed (exit ${client.code}):\n${client.out}`,
