@@ -32,6 +32,7 @@ type PacerOptionsSnapshot = {
  * integer range so a schedule cannot silently collapse or overflow.
  */
 const MAX_SAFE_TIME_MS = Number.MAX_SAFE_INTEGER;
+const MAX_NATIVE_TIMER_MS = 2_147_483_647;
 
 export interface PacingSlot {
 	readonly sequence: number;
@@ -284,6 +285,11 @@ export class OpenLoopPacer {
 			if (remaining <= 0) throw new PacerDeadlineError();
 			if (Number.isFinite(remaining)) {
 				finiteSafeDuration(remaining, "deadline remainder");
+				if (remaining > MAX_NATIVE_TIMER_MS) {
+					throw new RangeError(
+						"deadline remainder exceeds the native timer maximum",
+					);
+				}
 			}
 			const delay = due - now;
 			finiteSafeDuration(delay, "slot delay");
