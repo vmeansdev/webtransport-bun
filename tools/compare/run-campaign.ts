@@ -479,7 +479,7 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 		const balancedOrder = balancedArmOrder(42, 1);
 
 		for (const transport of transportsToRun) {
-			const runId = `run-${cell.cellId.replace(/[\/:]/g, "-")}-${transport}`;
+			const runId = `run-${cell.cellId.replace(/[\/:]/g, "-")}`;
 			process.stdout.write(
 				`  -> [${transport.toUpperCase()}] running ${runId}... `,
 			);

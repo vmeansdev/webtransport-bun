@@ -14,11 +14,13 @@ import {
 	type Transport,
 } from "./evidence.ts";
 import {
+	trustContextForArtifact,
 	verifyRunArtifact,
 	verifyRunArtifactObject,
 } from "./verify-artifact.ts";
 
 export * from "./evidence.ts";
+export { trustContextForArtifact };
 
 export interface ArmComparisonResult {
 	readonly visible: boolean;
