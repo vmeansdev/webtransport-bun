@@ -7,6 +7,8 @@ import {
 	decodeWireMessage,
 	encodeWireMessage,
 	isWireMessageExpired,
+	WIRE_MAGIC,
+	WIRE_VERSION,
 	WireFormatError,
 } from "./wire.ts";
 
@@ -51,15 +53,55 @@ describe("shared comparison driver core", () => {
 		expect(decodeWireMessage(encodeWireMessage(message))).toEqual(message);
 	});
 
+	test("rejects truncated input before reading the fixed header", () => {
+		expect(() => decodeWireMessage(new Uint8Array([0x57]))).toThrow(
+			WireFormatError,
+		);
+	});
+
 	test.each([
-		["truncated header", new Uint8Array([0x57])],
-		["wrong magic", new Uint8Array([0x00, 0x00, 1, 0, 0, 38, 0, 0, 0, 0])],
+		[
+			"wrong magic",
+			(view: DataView) => view.setUint16(0, WIRE_MAGIC ^ 1, false),
+		],
 		[
 			"unsupported version",
-			new Uint8Array([0x57, 0x54, 99, 0, 0, 38, 0, 0, 0, 0]),
+			(view: DataView) => view.setUint8(2, WIRE_VERSION + 1),
 		],
-	] as const)("rejects %s input", (_label, bytes) => {
-		expect(() => decodeWireMessage(bytes)).toThrow(WireFormatError);
+	] as const)("rejects a full-length fixture with %s", (_label, mutate) => {
+		const encoded = encodeWireMessage(message);
+		mutate(
+			new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength),
+		);
+		let thrown: unknown;
+		try {
+			decodeWireMessage(encoded);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(WireFormatError);
+		expect((thrown as WireFormatError).code).toBe("malformed");
+	});
+
+	test.each([
+		["runId", 6],
+		["sessionId", 8],
+	] as const)("rejects a zero %s length symmetrically with the encoder", (_label, offset) => {
+		const encoded = encodeWireMessage(message);
+		const view = new DataView(
+			encoded.buffer,
+			encoded.byteOffset,
+			encoded.byteLength,
+		);
+		view.setUint16(offset, 0, false);
+		let thrown: unknown;
+		try {
+			decodeWireMessage(encoded);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(WireFormatError);
+		expect((thrown as WireFormatError).message).toContain(`${_label} length`);
 	});
 
 	test("rejects payloads over the configured and default caps", () => {
@@ -164,6 +206,7 @@ describe("shared comparison driver core", () => {
 			ratePerSecond: 10,
 			now: () => nowMs,
 		});
+		expect(pacer.catchUp).toBe("skip");
 		pacer.nextSlot();
 		nowMs = 1_250;
 		expect(pacer.nextSlot()).toMatchObject({
@@ -176,6 +219,11 @@ describe("shared comparison driver core", () => {
 			skippedSlots: 0,
 			delayMs: 50,
 		});
+	});
+
+	test("freezes skip as the safe default open-loop policy", () => {
+		const pacer = new OpenLoopPacer({ ratePerSecond: 10, now: () => 0 });
+		expect(pacer.catchUp).toBe("skip");
 	});
 
 	test("reset starts a new warmup epoch and sequence", () => {
@@ -218,6 +266,38 @@ describe("shared comparison driver core", () => {
 		expect(() => sampleSummary([])).toThrow(/empty/i);
 		expect(() => sampleSummary([1, Number.POSITIVE_INFINITY])).toThrow(
 			/finite/i,
+		);
+	});
+
+	test("fails closed for invalid Student-t sample counts", () => {
+		for (const sampleCount of [
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			-1,
+			0,
+			1,
+			1.5,
+		]) {
+			expect(() => studentTCritical95(sampleCount)).toThrow(/sample count/i);
+		}
+		expect(sampleSummary([7]).ci95Low).toBe(7);
+	});
+
+	test("keeps extreme finite summaries finite or rejects unrepresentable results", () => {
+		const repeatedMaximum = sampleSummary([Number.MAX_VALUE, Number.MAX_VALUE]);
+		for (const value of [
+			repeatedMaximum.mean,
+			repeatedMaximum.stddev,
+			repeatedMaximum.ci95Low,
+			repeatedMaximum.ci95High,
+			repeatedMaximum.p50,
+			repeatedMaximum.p95,
+			repeatedMaximum.p99,
+		]) {
+			expect(Number.isFinite(value)).toBe(true);
+		}
+		expect(() => sampleSummary([Number.MAX_VALUE, -Number.MAX_VALUE])).toThrow(
+			/finite|overflow/i,
 		);
 	});
 });

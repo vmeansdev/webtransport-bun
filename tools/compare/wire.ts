@@ -206,6 +206,12 @@ export function decodeWireMessage(
 	const headerBytes = view.getUint16(4, false);
 	const runIdBytes = view.getUint16(6, false);
 	const sessionIdBytes = view.getUint16(8, false);
+	if (runIdBytes === 0) {
+		fail("malformed", "runId length must be non-zero");
+	}
+	if (sessionIdBytes === 0) {
+		fail("malformed", "sessionId length must be non-zero");
+	}
 	if (headerBytes < WIRE_FIXED_HEADER_BYTES) {
 		fail("malformed", "wire header length is smaller than the fixed header");
 	}
