@@ -61,7 +61,7 @@ export function escapeMarkdown(text: string): string {
 export function renderMarkdownReport(summary: ComparisonSummary): string {
 	const lines: string[] = [];
 
-	lines.push("# WebTransport vs WebSocket Canonical Comparison Results");
+	lines.push("# WebTransport vs WebSocket Comparison Report");
 	lines.push("");
 	lines.push(
 		`> **Environment**: Mac (darwin-arm64, \`10.99.0.1/en8\`) ↔ Linux (linux-x86_64, \`10.99.0.2/eno1\`) direct 1 Gbps Ethernet cable.`,
@@ -99,40 +99,45 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 
 	lines.push("---");
 	lines.push("");
-	lines.push("## Master Results Matrix");
+	lines.push("## Summary Table");
 	lines.push("");
 	lines.push(
-		"| Scenario Cell | Primary Metric | Unit | Direction | WS Baseline | WebTransport | Delta (%) | Advantage |",
+		"| Scenario | Status | Primary Metric | WS | WT | Delta (%) | Winner | Notes |",
 	);
-	lines.push("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |");
+	lines.push("| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :--- |");
 
 	for (const comp of summary.comparisons) {
-		const cellName = `\`${escapeMarkdown(comp.cellId)}\``;
-		const metricName = escapeMarkdown(comp.primaryMetricName ?? "metric");
-		const unit = comp.metricUnit ?? "";
-		const direction = comp.metricDirection === "lower" ? "↓ lower" : "↑ higher";
-		const ws =
-			comp.wsValue !== undefined
-				? comp.wsValue.toLocaleString("en-US", { maximumFractionDigits: 2 })
-				: "-";
-		const wt =
-			comp.wtValue !== undefined
-				? comp.wtValue.toLocaleString("en-US", { maximumFractionDigits: 2 })
-				: "-";
-		const delta =
-			comp.deltaPercent !== undefined
-				? `${comp.deltaPercent > 0 ? "+" : ""}${comp.deltaPercent.toFixed(2)}%`
-				: "-";
-		const winner =
-			comp.winner === "wt"
-				? "**WebTransport**"
-				: comp.winner === "ws"
-					? "**WebSocket**"
-					: "*Tie*";
+		const scenario = escapeMarkdown(comp.cellId ?? comp.scenarioId);
+		const status = comp.status;
 
-		lines.push(
-			`| ${cellName} | ${metricName} | \`${unit}\` | ${direction} | ${ws} | ${wt} | ${delta} | ${winner} |`,
-		);
+		if (status === "COMPATIBLE") {
+			const metric = escapeMarkdown(
+				`${comp.primaryMetricName ?? "metric"} (${comp.metricUnit ?? ""})`,
+			);
+			const ws =
+				comp.wsValue !== undefined
+					? comp.wsValue.toLocaleString("en-US", { maximumFractionDigits: 2 })
+					: "-";
+			const wt =
+				comp.wtValue !== undefined
+					? comp.wtValue.toLocaleString("en-US", { maximumFractionDigits: 2 })
+					: "-";
+			const delta =
+				comp.deltaPercent !== undefined
+					? `${comp.deltaPercent > 0 ? "+" : ""}${comp.deltaPercent.toFixed(2)}%`
+					: "-";
+			const winner = comp.winner ? comp.winner.toUpperCase() : "-";
+			const notes = "-";
+
+			lines.push(
+				`| \`${scenario}\` | **${status}** | ${metric} | ${ws} | ${wt} | ${delta} | ${winner} | ${notes} |`,
+			);
+		} else {
+			const reason = escapeMarkdown(comp.rejectionReason ?? "Incompatible");
+			lines.push(
+				`| \`${scenario}\` | *${status}* | - | - | - | - | - | ${reason} |`,
+			);
+		}
 	}
 
 	lines.push("");

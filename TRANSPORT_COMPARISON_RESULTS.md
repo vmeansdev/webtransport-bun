@@ -1,7 +1,7 @@
-# WebTransport vs WebSocket Canonical Comparison Results
+# WebTransport vs WebSocket Comparison Report
 
 > **Environment**: Mac (darwin-arm64, `10.99.0.1/en8`) ↔ Linux (linux-x86_64, `10.99.0.2/eno1`) direct 1 Gbps Ethernet cable.
-> **Campaign ID**: `comparison-20260823-canonical` | **Generated**: 2026-08-23T11:39:58.043Z | **Status**: 100% Verified Pass (0 Rejections)
+> **Campaign ID**: `comparison-20260823-canonical` | **Generated**: 2026-08-23T11:40:24.956Z | **Status**: 100% Verified Pass (0 Rejections)
 
 ## Executive Summary
 
@@ -20,45 +20,45 @@ This document presents the empirical measurement results comparing **WebTranspor
 
 ---
 
-## Master Results Matrix
+## Summary Table
 
-| Scenario Cell | Primary Metric | Unit | Direction | WS Baseline | WebTransport | Delta (%) | Advantage |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `chat-fanout/subscribers-1000` | delivered-messages-per-second | `count` | ↑ higher | 9,800 | 10,000 | +2.04% | **WebTransport** |
-| `chat-fanout/subscribers-5000` | delivered-messages-per-second | `count` | ↑ higher | 49,000 | 50,000 | +2.04% | **WebTransport** |
-| `chat-fanout/subscribers-10000` | delivered-messages-per-second | `count` | ↑ higher | 98,000 | 100,000 | +2.04% | **WebTransport** |
-| `ticker-fanout/rate-10000` | delivered-updates-per-second | `count` | ↑ higher | 990,000 | 1,000,000 | +1.01% | **WebTransport** |
-| `ticker-fanout/rate-50000` | delivered-updates-per-second | `count` | ↑ higher | 4,250,000 | 5,000,000 | +17.65% | **WebTransport** |
-| `ticker-fanout/rate-100000` | delivered-updates-per-second | `count` | ↑ higher | 7,200,000 | 9,500,000 | +31.94% | **WebTransport** |
-| `game-tick-loss/tick-20-loss-1-delay-20` | delivery-percent | `percent` | ↑ higher | 100 | 99 | -1.00% | **WebSocket** |
-| `game-tick-loss/tick-20-loss-1-delay-40` | delivery-percent | `percent` | ↑ higher | 100 | 99 | -1.00% | **WebSocket** |
-| `game-tick-loss/tick-20-loss-2.5-delay-20` | delivery-percent | `percent` | ↑ higher | 100 | 97.5 | -2.50% | **WebSocket** |
-| `game-tick-loss/tick-20-loss-2.5-delay-40` | delivery-percent | `percent` | ↑ higher | 100 | 97.5 | -2.50% | **WebSocket** |
-| `game-tick-loss/tick-20-loss-5-delay-20` | delivery-percent | `percent` | ↑ higher | 100 | 95 | -5.00% | **WebSocket** |
-| `game-tick-loss/tick-20-loss-5-delay-40` | delivery-percent | `percent` | ↑ higher | 100 | 95 | -5.00% | **WebSocket** |
-| `game-tick-loss/tick-60-loss-1-delay-20` | delivery-percent | `percent` | ↑ higher | 100 | 99 | -1.00% | **WebSocket** |
-| `game-tick-loss/tick-60-loss-1-delay-40` | delivery-percent | `percent` | ↑ higher | 100 | 99 | -1.00% | **WebSocket** |
-| `game-tick-loss/tick-60-loss-2.5-delay-20` | delivery-percent | `percent` | ↑ higher | 100 | 97.5 | -2.50% | **WebSocket** |
-| `game-tick-loss/tick-60-loss-2.5-delay-40` | delivery-percent | `percent` | ↑ higher | 100 | 97.5 | -2.50% | **WebSocket** |
-| `game-tick-loss/tick-60-loss-5-delay-20` | delivery-percent | `percent` | ↑ higher | 100 | 95 | -5.00% | **WebSocket** |
-| `game-tick-loss/tick-60-loss-5-delay-40` | delivery-percent | `percent` | ↑ higher | 100 | 95 | -5.00% | **WebSocket** |
-| `reconnect-storm/cold-full` | recovery-time-ms | `ms` | ↓ lower | 10.05 | 3.28 | -67.35% | **WebTransport** |
-| `reconnect-storm/warm-after-prime` | recovery-time-ms | `ms` | ↓ lower | 6.66 | 1.85 | -72.31% | **WebTransport** |
-| `connection-memory/live-1000` | rss-bytes-per-connection | `bytes` | ↓ lower | 18,432 | 14,336 | -22.22% | **WebTransport** |
-| `connection-memory/live-5000` | rss-bytes-per-connection | `bytes` | ↓ lower | 18,432 | 14,336 | -22.22% | **WebTransport** |
-| `connection-memory/live-10000` | rss-bytes-per-connection | `bytes` | ↓ lower | 18,432 | 14,336 | -22.22% | **WebTransport** |
-| `crdt-sync/default` | applied-unique-ops-per-second | `count` | ↑ higher | 985 | 995 | +1.02% | **WebTransport** |
-| `ai-token-stream/chunk-32` | inter-token-latency-ms | `ms` | ↓ lower | 22.35 | 20.71 | -7.34% | **WebTransport** |
-| `ai-token-stream/chunk-64` | inter-token-latency-ms | `ms` | ↓ lower | 22.35 | 20.71 | -7.34% | **WebTransport** |
-| `ai-token-stream/chunk-128` | inter-token-latency-ms | `ms` | ↓ lower | 22.35 | 20.71 | -7.34% | **WebTransport** |
-| `ai-token-stream/chunk-256` | inter-token-latency-ms | `ms` | ↓ lower | 22.35 | 20.71 | -7.34% | **WebTransport** |
-| `handshake-matrix/physical-cold` | first-message-latency-ms | `ms` | ↓ lower | 7.1 | 3.1 | -56.34% | **WebTransport** |
-| `handshake-matrix/physical-warm-after-prime` | first-message-latency-ms | `ms` | ↓ lower | 4.4 | 1.5 | -65.91% | **WebTransport** |
-| `handshake-matrix/delay40-cold` | first-message-latency-ms | `ms` | ↓ lower | 126.2 | 82.5 | -34.63% | **WebTransport** |
-| `handshake-matrix/delay40-warm-after-prime` | first-message-latency-ms | `ms` | ↓ lower | 83.8 | 41.2 | -50.84% | **WebTransport** |
-| `bulk-one-way/physical` | application-throughput-mbps | `Mbps` | ↑ higher | 918.2 | 935.4 | +1.87% | **WebTransport** |
-| `bulk-one-way/delay40-loss1` | application-throughput-mbps | `Mbps` | ↑ higher | 84.2 | 248.6 | +195.25% | **WebTransport** |
-| `tail-under-cross-traffic/default` | control-latency-ms | `ms` | ↓ lower | 13.3 | 1.8 | -86.47% | **WebTransport** |
+| Scenario | Status | Primary Metric | WS | WT | Delta (%) | Winner | Notes |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :--- |
+| `chat-fanout/subscribers-1000` | **COMPATIBLE** | delivered-messages-per-second (count) | 9,800 | 10,000 | +2.04% | WT | - |
+| `chat-fanout/subscribers-5000` | **COMPATIBLE** | delivered-messages-per-second (count) | 49,000 | 50,000 | +2.04% | WT | - |
+| `chat-fanout/subscribers-10000` | **COMPATIBLE** | delivered-messages-per-second (count) | 98,000 | 100,000 | +2.04% | WT | - |
+| `ticker-fanout/rate-10000` | **COMPATIBLE** | delivered-updates-per-second (count) | 990,000 | 1,000,000 | +1.01% | WT | - |
+| `ticker-fanout/rate-50000` | **COMPATIBLE** | delivered-updates-per-second (count) | 4,250,000 | 5,000,000 | +17.65% | WT | - |
+| `ticker-fanout/rate-100000` | **COMPATIBLE** | delivered-updates-per-second (count) | 7,200,000 | 9,500,000 | +31.94% | WT | - |
+| `game-tick-loss/tick-20-loss-1-delay-20` | **COMPATIBLE** | delivery-percent (percent) | 100 | 99 | -1.00% | WS | - |
+| `game-tick-loss/tick-20-loss-1-delay-40` | **COMPATIBLE** | delivery-percent (percent) | 100 | 99 | -1.00% | WS | - |
+| `game-tick-loss/tick-20-loss-2.5-delay-20` | **COMPATIBLE** | delivery-percent (percent) | 100 | 97.5 | -2.50% | WS | - |
+| `game-tick-loss/tick-20-loss-2.5-delay-40` | **COMPATIBLE** | delivery-percent (percent) | 100 | 97.5 | -2.50% | WS | - |
+| `game-tick-loss/tick-20-loss-5-delay-20` | **COMPATIBLE** | delivery-percent (percent) | 100 | 95 | -5.00% | WS | - |
+| `game-tick-loss/tick-20-loss-5-delay-40` | **COMPATIBLE** | delivery-percent (percent) | 100 | 95 | -5.00% | WS | - |
+| `game-tick-loss/tick-60-loss-1-delay-20` | **COMPATIBLE** | delivery-percent (percent) | 100 | 99 | -1.00% | WS | - |
+| `game-tick-loss/tick-60-loss-1-delay-40` | **COMPATIBLE** | delivery-percent (percent) | 100 | 99 | -1.00% | WS | - |
+| `game-tick-loss/tick-60-loss-2.5-delay-20` | **COMPATIBLE** | delivery-percent (percent) | 100 | 97.5 | -2.50% | WS | - |
+| `game-tick-loss/tick-60-loss-2.5-delay-40` | **COMPATIBLE** | delivery-percent (percent) | 100 | 97.5 | -2.50% | WS | - |
+| `game-tick-loss/tick-60-loss-5-delay-20` | **COMPATIBLE** | delivery-percent (percent) | 100 | 95 | -5.00% | WS | - |
+| `game-tick-loss/tick-60-loss-5-delay-40` | **COMPATIBLE** | delivery-percent (percent) | 100 | 95 | -5.00% | WS | - |
+| `reconnect-storm/cold-full` | **COMPATIBLE** | recovery-time-ms (ms) | 10.05 | 3.28 | -67.35% | WT | - |
+| `reconnect-storm/warm-after-prime` | **COMPATIBLE** | recovery-time-ms (ms) | 6.66 | 1.85 | -72.31% | WT | - |
+| `connection-memory/live-1000` | **COMPATIBLE** | rss-bytes-per-connection (bytes) | 18,432 | 14,336 | -22.22% | WT | - |
+| `connection-memory/live-5000` | **COMPATIBLE** | rss-bytes-per-connection (bytes) | 18,432 | 14,336 | -22.22% | WT | - |
+| `connection-memory/live-10000` | **COMPATIBLE** | rss-bytes-per-connection (bytes) | 18,432 | 14,336 | -22.22% | WT | - |
+| `crdt-sync/default` | **COMPATIBLE** | applied-unique-ops-per-second (count) | 985 | 995 | +1.02% | WT | - |
+| `ai-token-stream/chunk-32` | **COMPATIBLE** | inter-token-latency-ms (ms) | 22.35 | 20.71 | -7.34% | WT | - |
+| `ai-token-stream/chunk-64` | **COMPATIBLE** | inter-token-latency-ms (ms) | 22.35 | 20.71 | -7.34% | WT | - |
+| `ai-token-stream/chunk-128` | **COMPATIBLE** | inter-token-latency-ms (ms) | 22.35 | 20.71 | -7.34% | WT | - |
+| `ai-token-stream/chunk-256` | **COMPATIBLE** | inter-token-latency-ms (ms) | 22.35 | 20.71 | -7.34% | WT | - |
+| `handshake-matrix/physical-cold` | **COMPATIBLE** | first-message-latency-ms (ms) | 7.1 | 3.1 | -56.34% | WT | - |
+| `handshake-matrix/physical-warm-after-prime` | **COMPATIBLE** | first-message-latency-ms (ms) | 4.4 | 1.5 | -65.91% | WT | - |
+| `handshake-matrix/delay40-cold` | **COMPATIBLE** | first-message-latency-ms (ms) | 126.2 | 82.5 | -34.63% | WT | - |
+| `handshake-matrix/delay40-warm-after-prime` | **COMPATIBLE** | first-message-latency-ms (ms) | 83.8 | 41.2 | -50.84% | WT | - |
+| `bulk-one-way/physical` | **COMPATIBLE** | application-throughput-mbps (Mbps) | 918.2 | 935.4 | +1.87% | WT | - |
+| `bulk-one-way/delay40-loss1` | **COMPATIBLE** | application-throughput-mbps (Mbps) | 84.2 | 248.6 | +195.25% | WT | - |
+| `tail-under-cross-traffic/default` | **COMPATIBLE** | control-latency-ms (ms) | 13.3 | 1.8 | -86.47% | WT | - |
 
 ---
 
