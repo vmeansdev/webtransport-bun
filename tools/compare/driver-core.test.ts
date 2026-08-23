@@ -806,6 +806,20 @@ describe("shared comparison driver core", () => {
 		expect(sleepCalls).toBe(0);
 	});
 
+	test("rejects an infinite-deadline delay above the native timer maximum before sleeping", async () => {
+		let sleepCalls = 0;
+		const pacer = new OpenLoopPacer({
+			ratePerSecond: 1e-7,
+			now: () => 0,
+			sleep: async () => {
+				sleepCalls += 1;
+			},
+		});
+		pacer.nextSlot();
+		await expect(pacer.waitNext()).rejects.toThrow(/timer|delay|maximum/i);
+		expect(sleepCalls).toBe(0);
+	});
+
 	test("freezes skip as the safe default open-loop policy", () => {
 		const pacer = new OpenLoopPacer({ ratePerSecond: 10, now: () => 0 });
 		expect(pacer.catchUp).toBe("skip");
