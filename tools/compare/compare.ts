@@ -81,7 +81,7 @@ function ledgerShape(ledger: RunArtifact["ledger"]): unknown {
 	return {
 		histogram: {
 			unit: ledger.histogram.unit,
-			boundaries: ledger.histogram.boundaries.length,
+			boundaries: ledger.histogram.boundaries,
 			counts: ledger.histogram.counts.length,
 		},
 	};
@@ -458,16 +458,30 @@ function compatibilityRejections(
 			"$.metricContractHash",
 		);
 	if (
-		canonicalJson({ mac: ws.runtime.mac.bun, linux: ws.runtime.linux.bun }) !==
-			canonicalJson({ mac: wt.runtime.mac.bun, linux: wt.runtime.linux.bun }) ||
 		canonicalJson({
-			mac: ws.runtime.mac.identity,
-			linux: ws.runtime.linux.identity,
+			mac: {
+				cpu: ws.runtime.mac.cpu,
+				bun: ws.runtime.mac.bun,
+				identity: ws.runtime.mac.identity,
+			},
+			linux: {
+				cpu: ws.runtime.linux.cpu,
+				bun: ws.runtime.linux.bun,
+				identity: ws.runtime.linux.identity,
+			},
 		}) !==
-			canonicalJson({
-				mac: wt.runtime.mac.identity,
-				linux: wt.runtime.linux.identity,
-			})
+		canonicalJson({
+			mac: {
+				cpu: wt.runtime.mac.cpu,
+				bun: wt.runtime.mac.bun,
+				identity: wt.runtime.mac.identity,
+			},
+			linux: {
+				cpu: wt.runtime.linux.cpu,
+				bun: wt.runtime.linux.bun,
+				identity: wt.runtime.linux.identity,
+			},
+		})
 	)
 		addRejection(
 			rejections,
@@ -489,7 +503,7 @@ function compatibilityRejections(
 		addRejection(
 			rejections,
 			"EVIDENCE_LEDGER_INVALID",
-			"WS and WT ledger histogram schema differs",
+			"WS and WT ledger histogram bucket boundaries or schema differs",
 			"$.ledger.histogram",
 		);
 	if (
