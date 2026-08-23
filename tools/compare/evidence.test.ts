@@ -6,12 +6,20 @@ import { join } from "node:path";
 
 import {
 	type ArtifactRejectionCode,
+	type ArtifactTrustContext,
+	addRejection,
+	balancedArmOrder,
 	canonicalDigest,
 	compareRunArtifacts,
+	metricContractForScenario,
+	metricContractHash,
+	PRIMARY_METRIC_CONTRACTS,
+	type RawSidecarDigests,
 	type RunArtifact,
 	sealRunArtifact,
+	snapshotEvidenceValue,
+	verifyRunArtifactObject as verifyRawRunArtifactObject,
 	verifyRunArtifact,
-	verifyRunArtifactObject,
 } from "./compare.ts";
 import {
 	CANONICAL_SCENARIO_REGISTRY,
@@ -25,9 +33,52 @@ const wsBytes = fixture("valid-ws-run.json");
 const wtBytes = fixture("valid-wt-run.json");
 
 function fixtureObject(bytes: Uint8Array): RunArtifact {
-	const artifact = verifyRunArtifact(bytes).artifact;
-	if (!artifact) throw new Error("fixture must be a valid run artifact");
-	return artifact;
+	return JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
+}
+
+function trustContextForArtifact(artifact: RunArtifact): ArtifactTrustContext {
+	return {
+		comparisonId: artifact.comparisonId,
+		runId: artifact.runId,
+		transport: artifact.transport,
+		sourceSha: artifact.source.sourceSha,
+		archiveSha256: artifact.source.archiveSha256,
+		executableSha256: artifact.source.executableSha256,
+		toolchain: artifact.source.toolchain,
+		rawSidecarDigests: artifact.rawSidecarDigests,
+	};
+}
+
+function trustContext(bytes: Uint8Array): ArtifactTrustContext {
+	return trustContextForArtifact(fixtureObject(bytes));
+}
+
+function verifyObject(artifact: RunArtifact) {
+	return verifyRawRunArtifactObject(
+		artifact,
+		trustContextForArtifact(artifact),
+	);
+}
+
+function verifyRunArtifactObject(input: unknown) {
+	try {
+		if (input && typeof input === "object" && "source" in input)
+			return verifyRawRunArtifactObject(
+				input,
+				trustContextForArtifact(input as RunArtifact),
+			);
+	} catch {
+		// The production verifier owns hostile-root handling; retry without
+		// touching the root so the test exercises that path.
+	}
+	return verifyRawRunArtifactObject(input);
+}
+
+function measuredBytes(bytes: Uint8Array): Uint8Array {
+	const artifact = fixtureObject(bytes);
+	artifact.artifactKind = "measured";
+	artifact.promotable = true;
+	return sealRunArtifact(artifact);
 }
 
 function mutatedBytes(
@@ -35,7 +86,12 @@ function mutatedBytes(
 	mutate: (artifact: RunArtifact) => void,
 ): Uint8Array {
 	const artifact = fixtureObject(bytes);
+	artifact.artifactKind = "measured";
+	artifact.promotable = true;
+	const originalSidecars = canonicalDigest(artifact.rawSidecarDigests);
 	mutate(artifact);
+	if (canonicalDigest(artifact.rawSidecarDigests) === originalSidecars)
+		bindRawSidecar(artifact);
 	return sealRunArtifact(artifact);
 }
 
@@ -50,15 +106,21 @@ function bytesSha256(bytes: Uint8Array): string {
 function setMetricClock(
 	artifact: RunArtifact,
 	metricKind: string = "mac-local-end-to-end",
-	clock: Record<string, unknown> = {
-		domain: "mac-monotonic",
-		monotonic: true,
-		method: "process.monotonic",
-	},
+	clock?: Record<string, unknown>,
 ): void {
 	const metrics = artifact.metrics as unknown as Record<string, unknown>;
 	metrics.metricKind = metricKind;
-	metrics.clock = clock;
+	metrics.clock = clock ?? {
+		domain:
+			metricKind === "linux-local-service"
+				? "linux-monotonic"
+				: metricKind === "one-way"
+					? "independent-offset"
+					: "mac-monotonic",
+		monotonic: true,
+		method: "process.monotonic",
+		...(metricKind === "one-way" ? { offsetMs: 0, uncertaintyMs: 0.25 } : {}),
+	};
 }
 
 function canonicalCellArtifact(
@@ -76,7 +138,34 @@ function canonicalCellArtifact(
 	artifact.scenario.scenarioHash = cell.scenarioHash;
 	artifact.scenario.direction = cell.rolePlan.direction;
 	artifact.scenario.repetition.total = cell.runPolicy.measuredRepetitions;
-	setMetricClock(artifact);
+	artifact.artifactKind = "measured";
+	artifact.promotable = true;
+	const contract = metricContractForScenario(cell.scenarioId);
+	if (contract) {
+		artifact.metrics.name = contract.name;
+		artifact.metrics.unit = contract.unit;
+		artifact.metrics.metricKind = contract.metricKind;
+		artifact.metricContractId = contract.id;
+		artifact.metricContractHash = metricContractHash(contract);
+		artifact.ledger.histogram.unit = contract.unit;
+	}
+	artifact.processProof = {
+		rolePlanHash: canonicalDigest(cell.rolePlan),
+		macRoles: cell.rolePlan.macRoles,
+		linuxRole: cell.rolePlan.linuxRole,
+		sharding: cell.rolePlan.sharding,
+		processCohort: cell.rolePlan.processCohort,
+	};
+	artifact.rawSidecarBindingSha256 = canonicalDigest({
+		comparisonId: artifact.comparisonId,
+		runId: artifact.runId,
+		transport: artifact.transport,
+		sourceBindingSha256: artifact.source.bindingSha256,
+		scenarioHash: artifact.scenario.scenarioHash,
+		metricContractHash: artifact.metricContractHash,
+		rawSidecarDigests: artifact.rawSidecarDigests,
+	});
+	setMetricClock(artifact, contract?.metricKind ?? "mac-local-end-to-end");
 	return artifact;
 }
 
@@ -86,6 +175,18 @@ function bindDirectDigest(artifact: RunArtifact): void {
 		artifactByteSha256: "0".repeat(64),
 	};
 	artifact.artifactByteSha256 = canonicalDigest(withoutDigest);
+}
+
+function bindRawSidecar(artifact: RunArtifact): void {
+	artifact.rawSidecarBindingSha256 = canonicalDigest({
+		comparisonId: artifact.comparisonId,
+		runId: artifact.runId,
+		transport: artifact.transport,
+		sourceBindingSha256: artifact.source.bindingSha256,
+		scenarioHash: artifact.scenario.scenarioHash,
+		metricContractHash: artifact.metricContractHash,
+		rawSidecarDigests: artifact.rawSidecarDigests,
+	});
 }
 
 function bulkArtifactObject(baseBytes: Uint8Array): RunArtifact {
@@ -144,6 +245,9 @@ function compareCode(
 	rebindSource = false,
 ): ArtifactRejectionCode[] {
 	const changed = fixtureObject(wtBytes);
+	changed.artifactKind = "measured";
+	changed.promotable = true;
+	const originalSidecars = canonicalDigest(changed.rawSidecarDigests);
 	mutator(changed);
 	if (rebindSource) {
 		changed.source.bindingSha256 = canonicalDigest({
@@ -154,32 +258,44 @@ function compareCode(
 			cleanTree: changed.source.cleanTree,
 		});
 	}
-	return compareRunArtifacts(wsBytes, sealRunArtifact(changed)).rejections.map(
-		({ code }) => code,
-	);
+	if (canonicalDigest(changed.rawSidecarDigests) === originalSidecars)
+		bindRawSidecar(changed);
+	const changedBytes = sealRunArtifact(changed);
+	const result = compareRunArtifacts(measuredBytes(wsBytes), changedBytes, {
+		ws: trustContext(measuredBytes(wsBytes)),
+		wt: trustContext(changedBytes),
+	});
+	return result.rejections.map(({ code }) => code);
 }
 
 describe("fail-closed comparison evidence", () => {
 	test("accepts compatible WS and WT artifacts and computes a delta", () => {
-		const result = compareRunArtifacts(wsBytes, wtBytes);
+		const ws = measuredBytes(wsBytes);
+		const wt = measuredBytes(wtBytes);
+		const result = compareRunArtifacts(ws, wt, {
+			ws: trustContext(ws),
+			wt: trustContext(wt),
+		});
 
 		expect(result.evidenceStatus).toBe("PASS");
 		expect(result.scenarioVerdict).toBe("PASS");
 		expect(result.ws.visible).toBe(true);
 		expect(result.wt.visible).toBe(true);
 		expect(result.delta).toEqual({
-			metric: "p50",
-			unit: "ms",
+			metric: "application-throughput-mbps",
+			unit: "Mbps",
 			ws: 2,
 			wt: 1,
 			absolute: -1,
 			relative: -0.5,
 		});
-		expect(result.ranking).toBe("wt");
+		expect(result.ranking).toBe("ws");
 	});
 
 	test("binds the exact supplied artifact bytes with a non-self-referential digest", () => {
-		expect(verifyRunArtifact(wsBytes).evidenceStatus).toBe("PASS");
+		expect(
+			verifyRunArtifact(wsBytes, trustContext(wsBytes)).evidenceStatus,
+		).toBe("PASS");
 		const changed = new Uint8Array(wsBytes);
 		const marker = new TextEncoder().encode('"p50":2');
 		const markerIndex = findBytes(changed, marker);
@@ -644,12 +760,21 @@ describe("fail-closed comparison evidence", () => {
 
 	test("compares admission-counter schema shape while retaining differing values", () => {
 		const wt = fixtureObject(wtBytes);
+		wt.artifactKind = "measured";
+		wt.promotable = true;
 		wt.capacity.admissionCounters.sessions.accepted = 9;
-		const result = compareRunArtifacts(wsBytes, sealRunArtifact(wt));
+		wt.capacity.admissionCounters.sessions.rejected = 1;
+		wt.capacity.admissionCounters.sessions.activePeak = 9;
+		const wtMeasured = sealRunArtifact(wt);
+		const wsMeasured = measuredBytes(wsBytes);
+		const result = compareRunArtifacts(wsMeasured, wtMeasured, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(wtMeasured),
+		});
 		expect(result.evidenceStatus).toBe("PASS");
 		expect(result.delta).toEqual({
-			metric: "p50",
-			unit: "ms",
+			metric: "application-throughput-mbps",
+			unit: "Mbps",
 			ws: 2,
 			wt: 1,
 			absolute: -1,
@@ -861,7 +986,9 @@ describe("fail-closed comparison evidence", () => {
 			uncertaintyMs: 0.05,
 		});
 		bindDirectDigest(oneWay);
-		expect(verifyRunArtifactObject(oneWay).evidenceStatus).toBe("PASS");
+		expect(
+			verifyRunArtifactObject(oneWay).rejections.map(({ code }) => code),
+		).toContain("METRICS_CONTRACT_INVALID");
 
 		const renamed = fixtureObject(wsBytes);
 		renamed.metrics.name = "one-way-latency";
@@ -869,15 +996,22 @@ describe("fail-closed comparison evidence", () => {
 		bindDirectDigest(renamed);
 		expect(
 			verifyRunArtifactObject(renamed).rejections.map(({ code }) => code),
-		).toContain("CLOCK_PROVENANCE_INVALID");
+		).toContain("METRICS_CONTRACT_INVALID");
 
 		const wt = fixtureObject(wtBytes);
+		wt.artifactKind = "measured";
+		wt.promotable = true;
 		setMetricClock(wt, "mac-local-end-to-end", {
 			domain: "mac-monotonic",
 			monotonic: true,
 			method: "different-monotonic-source",
 		});
-		const comparison = compareRunArtifacts(wsBytes, sealRunArtifact(wt));
+		const wsMeasured = measuredBytes(wsBytes);
+		const wtMeasured = sealRunArtifact(wt);
+		const comparison = compareRunArtifacts(wsMeasured, wtMeasured, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(wtMeasured),
+		});
 		expect(comparison.delta).toBe("not computed");
 		expect(comparison.rejections.map(({ code }) => code)).toContain(
 			"CLOCK_PROVENANCE_MISMATCH",
@@ -947,7 +1081,11 @@ describe("fail-closed comparison evidence", () => {
 			artifact.scenarioVerdict = "NO_VERDICT";
 			artifact.promotable = false;
 		});
-		const result = compareRunArtifacts(blockedWs, wtBytes);
+		const wtMeasured = measuredBytes(wtBytes);
+		const result = compareRunArtifacts(blockedWs, wtMeasured, {
+			ws: trustContext(blockedWs),
+			wt: trustContext(wtMeasured),
+		});
 		expect(result.ws.visible).toBe(false);
 		expect(result.ws.evidenceStatus).toBe("BLOCKED");
 		expect(result.delta).toBe("not computed");
@@ -955,7 +1093,10 @@ describe("fail-closed comparison evidence", () => {
 	});
 
 	test("retains a valid WS arm when WT is missing with a typed blocker and no delta", () => {
-		const result = compareRunArtifacts(wsBytes, undefined);
+		const wsMeasured = measuredBytes(wsBytes);
+		const result = compareRunArtifacts(wsMeasured, undefined, {
+			ws: trustContext(wsMeasured),
+		});
 
 		expect(result.evidenceStatus).toBe("BLOCKED");
 		expect(result.ws.visible).toBe(true);
@@ -978,7 +1119,11 @@ describe("fail-closed comparison evidence", () => {
 		const stale = mutatedBytes(wtBytes, (artifact) => {
 			artifact.runId = "stale-run";
 		});
-		const result = compareRunArtifacts(wsBytes, stale);
+		const wsMeasured = measuredBytes(wsBytes);
+		const result = compareRunArtifacts(wsMeasured, stale, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(stale),
+		});
 
 		expect(result.ws.visible).toBe(true);
 		expect(result.wt.visible).toBe(false);
@@ -993,8 +1138,18 @@ describe("fail-closed comparison evidence", () => {
 	test("does not compute a delta when either PASS arm has a mismatched compatibility binding", () => {
 		const changed = mutatedBytes(wtBytes, (artifact) => {
 			artifact.scenario.seed += 1;
+			artifact.scenario.armOrder = [
+				...balancedArmOrder(
+					artifact.scenario.seed,
+					artifact.scenario.repetition.index,
+				),
+			];
 		});
-		const result = compareRunArtifacts(wsBytes, changed);
+		const wsMeasured = measuredBytes(wsBytes);
+		const result = compareRunArtifacts(wsMeasured, changed, {
+			ws: trustContext(wsMeasured),
+			wt: trustContext(changed),
+		});
 
 		expect(result.evidenceStatus).toBe("BLOCKED");
 		expect(result.delta).toBe("not computed");
@@ -1011,12 +1166,15 @@ describe("fail-closed comparison evidence", () => {
 		Object.setPrototypeOf(object, { source });
 		expect(
 			verifyRunArtifactObject(object).rejections.map(({ code }) => code),
-		).toContain("SCHEMA_OWN_FIELD_REQUIRED");
+		).toContain("SCHEMA_RESOURCE_LIMIT");
 
 		const getterObject = fixtureObject(wsBytes) as unknown as Record<
 			string,
 			unknown
 		>;
+		const getterContext = trustContextForArtifact(
+			getterObject as unknown as RunArtifact,
+		);
 		const originalSource = getterObject.source;
 		let reads = 0;
 		Object.defineProperty(getterObject, "source", {
@@ -1026,8 +1184,371 @@ describe("fail-closed comparison evidence", () => {
 				return originalSource;
 			},
 		});
-		expect(verifyRunArtifactObject(getterObject).evidenceStatus).toBe("PASS");
+		expect(
+			verifyRawRunArtifactObject(getterObject, getterContext).evidenceStatus,
+		).toBe("PASS");
 		expect(reads).toBe(1);
+	});
+
+	test("requires literal raw self-digest key and value spans", () => {
+		const text = new TextDecoder().decode(wsBytes);
+		const escapedKey = text.replace(
+			'"artifactByteSha256":',
+			'"artifactByteSha\\u0032\\u0035\\u0036":',
+		);
+		expect(verifyCode(new TextEncoder().encode(escapedKey))).toContain(
+			"ARTIFACT_BYTE_DIGEST_INVALID",
+		);
+
+		const valueMatch = text.match(/("artifactByteSha256":")([0-9a-f]{64})(")/);
+		expect(valueMatch).not.toBeNull();
+		if (!valueMatch) return;
+		const first = valueMatch[2]?.[0];
+		if (!first) return;
+		const escapedValue = text.replace(
+			valueMatch[0],
+			`${valueMatch[1]}\\u${first.codePointAt(0)?.toString(16).padStart(4, "0")}${valueMatch[2]?.slice(1)}${valueMatch[3]}`,
+		);
+		expect(verifyCode(new TextEncoder().encode(escapedValue))).toContain(
+			"ARTIFACT_BYTE_DIGEST_INVALID",
+		);
+
+		const collision = text.replace(
+			valueMatch[0],
+			`${valueMatch[0]},"artifactByteSha\\u0032\\u0035\\u0036":"${valueMatch[2]}"`,
+		);
+		expect(verifyCode(new TextEncoder().encode(collision))).toContain(
+			"ARTIFACT_BYTE_DIGEST_INVALID",
+		);
+	});
+
+	test("never re-reads a hostile root after snapshot failure", () => {
+		const revoked = Proxy.revocable(
+			JSON.parse(new TextDecoder().decode(wsBytes)) as object,
+			{},
+		);
+		revoked.revoke();
+		const revokedResult = verifyRunArtifactObject(revoked.proxy);
+		expect(revokedResult.rejections.length).toBeGreaterThan(0);
+		expect(revokedResult.rejections.map(({ code }) => code)).toContain(
+			"SCHEMA_RESOURCE_LIMIT",
+		);
+
+		const throwing = new Proxy(
+			{},
+			{
+				ownKeys: () => {
+					throw new Error("revoked");
+				},
+			},
+		);
+		const throwingResult = verifyRunArtifactObject(throwing);
+		expect(throwingResult.rejections.map(({ code }) => code)).toContain(
+			"SCHEMA_RESOURCE_LIMIT",
+		);
+	});
+
+	test("rejects cycles, shared references, and resource-budget overflow", () => {
+		const shared = { value: 1 };
+		const sharedRoot = { first: shared, second: shared };
+		expect(() => snapshotEvidenceValue(sharedRoot)).toThrow();
+
+		const cycle: Record<string, unknown> = {};
+		cycle.self = cycle;
+		expect(() => snapshotEvidenceValue(cycle)).toThrow();
+
+		const hugeKey = { ["x".repeat(100_000)]: true };
+		expect(() => snapshotEvidenceValue(hugeKey)).toThrow();
+	});
+
+	test("deduplicates and caps rejection reporting", () => {
+		const rejections: Array<{
+			code: ArtifactRejectionCode;
+			reason: string;
+			path: string;
+		}> = [];
+		for (let index = 0; index < 100_000; index += 1) {
+			addRejection(
+				rejections,
+				"SCHEMA_INVALID_FIELD",
+				"same reason",
+				`$.samples[${index}]`,
+			);
+		}
+		expect(rejections.length).toBeLessThan(100_000);
+		expect(rejections.map(({ code }) => code)).toContain("REJECTIONS_CAPPED");
+	});
+
+	test("requires external trust anchors instead of self-consistency alone", () => {
+		const verifyWithContext = verifyRunArtifact as unknown as (
+			input: Uint8Array,
+			context?: Record<string, unknown>,
+		) => ReturnType<typeof verifyRunArtifact>;
+		const raw = JSON.parse(new TextDecoder().decode(wsBytes)) as Record<
+			string,
+			unknown
+		>;
+		const rawSource = raw.source as Record<string, unknown>;
+		const rawToolchain = rawSource.toolchain as Record<string, unknown>;
+		const rawSidecarDigests = raw.rawSidecarDigests as RawSidecarDigests;
+		const context = {
+			comparisonId: raw.comparisonId as string,
+			runId: raw.runId as string,
+			transport: raw.transport as "ws" | "wt",
+			sourceSha: rawSource.sourceSha as string,
+			archiveSha256: rawSource.archiveSha256 as string,
+			executableSha256: rawSource.executableSha256 as string,
+			toolchain: {
+				identity: rawToolchain.identity as string,
+				sha256: rawToolchain.sha256 as string,
+			},
+			rawSidecarDigests,
+		};
+		expect(
+			verifyWithContext(wsBytes).rejections.map(({ code }) => code),
+		).toContain("TRUST_CONTEXT_MISSING");
+		expect(verifyWithContext(wsBytes, context).evidenceStatus).toBe("PASS");
+		expect(
+			verifyWithContext(wsBytes, {
+				...context,
+				sourceSha: "b".repeat(40),
+			}).rejections.map(({ code }) => code),
+		).toContain("TRUST_ANCHOR_MISMATCH");
+	});
+
+	test("keeps test fixtures visible but never promotable or comparable", () => {
+		const verified = verifyRunArtifact(wsBytes, trustContext(wsBytes));
+		expect(verified.evidenceStatus).toBe("PASS");
+		expect(verified.artifact).toBeUndefined();
+		const result = compareRunArtifacts(wsBytes, wtBytes, {
+			ws: trustContext(wsBytes),
+			wt: trustContext(wtBytes),
+		});
+		expect(result.evidenceStatus).toBe("BLOCKED");
+		expect(result.delta).toBe("not computed");
+		expect(result.ranking).toBe("not computed");
+		expect(result.rejections.map(({ code }) => code)).toContain(
+			"ARTIFACT_FIXTURE_NOT_PROMOTABLE",
+		);
+	});
+
+	test("defines an exact contract for every canonical scenario", () => {
+		const expected: Record<string, [string, string, string, string]> = {
+			"chat-fanout": [
+				"delivered-messages-per-second",
+				"count",
+				"mac-local-end-to-end",
+				"higher",
+			],
+			"ticker-fanout": [
+				"delivered-updates-per-second",
+				"count",
+				"linux-local-service",
+				"higher",
+			],
+			"game-tick-loss": [
+				"delivery-percent",
+				"percent",
+				"mac-local-end-to-end",
+				"higher",
+			],
+			"reconnect-storm": [
+				"recovery-time-ms",
+				"ms",
+				"mac-local-end-to-end",
+				"lower",
+			],
+			"handshake-matrix": [
+				"first-message-latency-ms",
+				"ms",
+				"mac-local-end-to-end",
+				"lower",
+			],
+			"connection-memory": [
+				"rss-bytes-per-connection",
+				"bytes",
+				"mac-local-end-to-end",
+				"lower",
+			],
+			"crdt-sync": [
+				"applied-unique-ops-per-second",
+				"count",
+				"mac-local-end-to-end",
+				"higher",
+			],
+			"ai-token-stream": [
+				"inter-token-latency-ms",
+				"ms",
+				"mac-local-end-to-end",
+				"lower",
+			],
+			"bulk-one-way": [
+				"application-throughput-mbps",
+				"Mbps",
+				"mac-local-end-to-end",
+				"higher",
+			],
+			"tail-under-cross-traffic": [
+				"control-latency-ms",
+				"ms",
+				"mac-local-end-to-end",
+				"lower",
+			],
+		};
+		expect(Object.keys(PRIMARY_METRIC_CONTRACTS).sort()).toEqual(
+			Object.keys(expected).sort(),
+		);
+		for (const [
+			scenarioId,
+			[name, unit, metricKind, direction],
+		] of Object.entries(expected)) {
+			const contract = PRIMARY_METRIC_CONTRACTS[scenarioId];
+			if (!contract) throw new Error(`missing contract ${scenarioId}`);
+			expect(contract).toMatchObject({
+				name,
+				unit,
+				metricKind,
+				direction,
+			});
+			expect(metricContractHash(contract)).toMatch(/^[0-9a-f]{64}$/);
+		}
+	});
+
+	test("uses contract direction and explicit undefined relative baseline", () => {
+		const zero = fixtureObject(wsBytes);
+		zero.artifactKind = "measured";
+		zero.promotable = true;
+		zero.metrics.samples = [0, 0, 0, 0];
+		zero.metrics.percentiles = { p50: 0, p95: 0, p99: 0 };
+		bindRawSidecar(zero);
+		const ws = sealRunArtifact(zero);
+		const wt = measuredBytes(wtBytes);
+		const result = compareRunArtifacts(ws, wt, {
+			ws: trustContext(ws),
+			wt: trustContext(wt),
+		});
+		expect(result.evidenceStatus).toBe("PASS");
+		if (result.delta === "not computed") throw new Error("delta missing");
+		expect(result.delta.relative).toBeNull();
+		expect(result.ranking).toBe("wt");
+
+		const lowerWs = roleScaleArtifactObject(
+			wsBytes,
+			"reconnect-storm/cold-full",
+		);
+		lowerWs.metrics.samples = [1, 2, 2, 3];
+		lowerWs.metrics.percentiles = { p50: 2, p95: 2.85, p99: 2.97 };
+		bindRawSidecar(lowerWs);
+		const lowerWt = roleScaleArtifactObject(
+			wtBytes,
+			"reconnect-storm/cold-full",
+		);
+		lowerWt.metrics.samples = [2, 3, 3, 4];
+		lowerWt.metrics.percentiles = { p50: 3, p95: 3.85, p99: 3.97 };
+		bindRawSidecar(lowerWt);
+		const lowerWsBytes = sealRunArtifact(lowerWs);
+		const lowerWtBytes = sealRunArtifact(lowerWt);
+		const lower = compareRunArtifacts(lowerWsBytes, lowerWtBytes, {
+			ws: trustContext(lowerWsBytes),
+			wt: trustContext(lowerWtBytes),
+		});
+		expect(lower.evidenceStatus).toBe("PASS");
+		expect(lower.ranking).toBe("ws");
+	});
+
+	test("validates counters, runtime dimensions, ledger, and telemetry invariants", () => {
+		const cases: readonly [
+			string,
+			(artifact: RunArtifact) => void,
+			ArtifactRejectionCode,
+		][] = [
+			[
+				"counter arithmetic",
+				(a) => (a.capacity.admissionCounters.sessions.accepted = 9),
+				"CAPACITY_ADMISSION_COUNTER_INVALID",
+			],
+			[
+				"rate limit bound",
+				(a) => (a.capacity.admissionCounters.handshakes.rateLimited = 1),
+				"CAPACITY_ADMISSION_COUNTER_INVALID",
+			],
+			[
+				"active peak bound",
+				(a) => (a.capacity.admissionCounters.sessions.activePeak = 11),
+				"CAPACITY_ADMISSION_COUNTER_INVALID",
+			],
+			[
+				"runtime identity",
+				(a) => (a.runtime.mac.bun = ""),
+				"EVIDENCE_RUNTIME_INVALID",
+			],
+			[
+				"role proof hash",
+				(a) => (a.processProof.rolePlanHash = "b".repeat(64)),
+				"EVIDENCE_PROCESS_PROOF_INVALID",
+			],
+			[
+				"ledger ordering",
+				(a) => (a.ledger.delivered = 2),
+				"EVIDENCE_LEDGER_INVALID",
+			],
+			[
+				"telemetry RSS",
+				(a) => (a.telemetry.mac.rssBytes = -1),
+				"EVIDENCE_TELEMETRY_INVALID",
+			],
+		];
+		for (const [label, mutate, code] of cases) {
+			const artifact = fixtureObject(wsBytes);
+			artifact.artifactKind = "measured";
+			artifact.promotable = true;
+			mutate(artifact);
+			bindRawSidecar(artifact);
+			bindDirectDigest(artifact);
+			expect(
+				verifyObject(artifact).rejections.map(({ code: actual }) => actual),
+				label,
+			).toContain(code);
+		}
+	});
+
+	test("binds arm order to adjacent seed choices and enforces port bounds", () => {
+		const wrong = fixtureObject(wsBytes);
+		wrong.artifactKind = "measured";
+		wrong.promotable = true;
+		wrong.scenario.seed += 1;
+		bindRawSidecar(wrong);
+		bindDirectDigest(wrong);
+		expect(verifyObject(wrong).rejections.map(({ code }) => code)).toContain(
+			"SCENARIO_ARM_ORDER_INVALID",
+		);
+
+		const right = fixtureObject(wsBytes);
+		right.artifactKind = "measured";
+		right.promotable = true;
+		right.scenario.seed += 1;
+		right.scenario.armOrder = [
+			...balancedArmOrder(right.scenario.seed, right.scenario.repetition.index),
+		];
+		bindRawSidecar(right);
+		bindDirectDigest(right);
+		expect(verifyObject(right).evidenceStatus).toBe("PASS");
+
+		for (const [start, end] of [
+			[0, 65_535],
+			[1, 65_536],
+		] as const) {
+			const invalid = fixtureObject(wsBytes);
+			invalid.artifactKind = "measured";
+			invalid.promotable = true;
+			invalid.capacityProof.mac.ephemeralPorts.rangeStart = start;
+			invalid.capacityProof.mac.ephemeralPorts.rangeEnd = end;
+			bindRawSidecar(invalid);
+			bindDirectDigest(invalid);
+			expect(
+				verifyObject(invalid).rejections.map(({ code }) => code),
+			).toContain("CAPACITY_EPHEMERAL_PORT_PROOF_INVALID");
+		}
 	});
 });
 
