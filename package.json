@@ -48,6 +48,12 @@
 		"bench:h7-floor": "bun tools/bench/datagram-delivery-floor.ts",
 		"bench:h7-e2e-probe": "bun tools/bench/datagram-batch-e2e-probe.ts",
 		"bench:regress": "bun tools/bench/bench-regress.ts",
+		"compare:server": "bun tools/compare/server.ts",
+		"compare:client": "bun tools/compare/client.ts",
+		"compare:run": "bun tools/compare/run-campaign.ts",
+		"compare:verify": "bun tools/compare/verify-artifact.ts",
+		"compare:report": "bun tools/compare/render-report.ts",
+		"test:compare": "bun test tools/compare/",
 		"fuzz:release-smoke": "bun tools/fuzz/release-smoke.ts",
 		"release:npm": "node -e \"console.error('Direct npm publishing is disabled. Use the GitHub Actions publish workflow from a successful release run.'); process.exit(1)\""
 	},
