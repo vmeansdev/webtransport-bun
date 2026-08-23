@@ -575,6 +575,43 @@ describe("frozen v1 comparison scenario registry", () => {
 		).toMatchObject({ durationSeconds: 31 });
 	});
 
+	test("returns a detached validated snapshot from accessor-backed overrides", () => {
+		let cellIdReads = 0;
+		const rawChanges = { durationSeconds: 31 };
+		const rawOverride = Object.defineProperties(
+			{},
+			{
+				cellId: {
+					configurable: true,
+					enumerable: true,
+					get: () => {
+						cellIdReads += 1;
+						return cellIdReads === 1
+							? "chat-fanout/subscribers-1000"
+							: "unknown/default";
+					},
+				},
+				changes: {
+					configurable: true,
+					enumerable: true,
+					get: () => rawChanges,
+				},
+			},
+		);
+
+		const validated = validateScenarioOverride(rawOverride);
+		const typedCellId: string = validated.cellId;
+		rawChanges.durationSeconds = 32;
+		expect(typedCellId).toBe("chat-fanout/subscribers-1000");
+		expect(validated).not.toBe(rawOverride);
+		expect(validated.changes).not.toBe(rawChanges);
+		expect(validated).toEqual({
+			cellId: "chat-fanout/subscribers-1000",
+			changes: { durationSeconds: 31 },
+		});
+		expect(cellIdReads).toBe(1);
+	});
+
 	test("ignores inherited descriptor value and get pollution", () => {
 		const originalValue = Object.getOwnPropertyDescriptor(
 			Object.prototype,
@@ -676,7 +713,7 @@ describe("frozen v1 comparison scenario registry", () => {
 					{ cellId, changes: { durationSeconds: 30 } },
 				],
 			}),
-		).toThrow(/no-op|canonical|distinct hash/i);
+		).toThrow(/no-op|canonical|distinct hash|duplicate.*cell/i);
 	});
 
 	test("keeps public registry factory overloads and ignores inherited options", () => {
@@ -883,6 +920,44 @@ describe("frozen v1 comparison scenario registry", () => {
 		expect(() => createScenarioRegistry({ unexpected: [] } as never)).toThrow(
 			/unexpected|option/i,
 		);
+	});
+
+	test("rejects polluted, oversized, and duplicate override arrays", () => {
+		const baseOverride: ScenarioOverride = {
+			cellId: "chat-fanout/subscribers-1000",
+			changes: { durationSeconds: 31 },
+		};
+		const extraString = [baseOverride];
+		Object.defineProperty(extraString, "unexpected", {
+			configurable: true,
+			enumerable: false,
+			value: true,
+		});
+		expect(() => createScenarioRegistry(extraString)).toThrow(
+			/unexpected.*property|override array/i,
+		);
+
+		const extraSymbol = Symbol("unexpected");
+		const symbolArray = [baseOverride];
+		Object.defineProperty(symbolArray, extraSymbol, {
+			configurable: true,
+			enumerable: false,
+			value: true,
+		});
+		expect(() => createScenarioRegistry(symbolArray)).toThrow(
+			/unexpected.*property|override array/i,
+		);
+
+		const oversized = Array.from({ length: 36 }, () => baseOverride);
+		expect(() => createScenarioRegistry(oversized)).toThrow(
+			/at most|maximum|35/i,
+		);
+
+		const duplicate = [
+			baseOverride,
+			{ cellId: baseOverride.cellId, changes: { durationSeconds: 32 } },
+		];
+		expect(() => createScenarioRegistry(duplicate)).toThrow(/duplicate.*cell/i);
 	});
 
 	test("rejects enum and type overrides outside the selected cell domain", () => {
