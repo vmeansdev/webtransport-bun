@@ -45,6 +45,8 @@ use wtransport::quinn;
 use wtransport::{ClientConfig, Endpoint};
 
 const DEFAULT_URL: &str = "https://127.0.0.1:4433";
+const G6_CLOSEOUT_SPEC_ID: &str = "g6-mmo-closeout/1";
+const G6_CLOSEOUT_SPEC_PATH: &str = "docs/research/preregistrations/gate-g6-mmo-closeout.md";
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 const MAX_IDLE: Duration = Duration::from_secs(60);
 const MAX_RECORDED_ERRORS: usize = 5;
@@ -114,6 +116,7 @@ struct Options {
     payload_bytes: usize,
     connect_timeout: Duration,
     json_out: Option<String>,
+    pre_registration_sha256: Option<String>,
     /// Session *i* of *N* phase-offsets by `i/N` of one interval. On for the
     /// steady realm (G1's registered process, T02's reason); the storm's
     /// alignment is a separate, deliberate thing and lives in the storm phase.
@@ -145,6 +148,7 @@ impl Options {
             payload_bytes: 64,
             connect_timeout: Duration::from_secs(300),
             json_out: None,
+            pre_registration_sha256: None,
             stagger_sends: true,
             storm_cohort: 0,
             storm_reconnect_delay: Duration::from_millis(1000),
@@ -184,23 +188,67 @@ fn ticks_due_after(elapsed: Duration, interval: Duration, phase_offset: f64) -> 
     u64::try_from((elapsed - first).as_nanos() / interval_ns + 1).unwrap_or(u64::MAX)
 }
 
-/// The scheduled deadline nearest `actual_ns`. Derived from the instant rather
-/// than a tick counter because `MissedTickBehavior::Skip` drops missed ticks
-/// silently: counting fires would report a generator a whole interval behind as
-/// having zero lag.
-fn nearest_deadline_ns(
-    started_ns: u64,
-    offset: Duration,
-    interval: Duration,
-    actual_ns: u64,
-) -> u64 {
-    let interval_ns = interval.as_nanos() as u64;
-    let first = started_ns.saturating_add(offset.as_nanos() as u64);
-    if interval_ns == 0 || actual_ns <= first {
-        return first;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TickObservation {
+    intended_ns: u64,
+    lag_ns: u64,
+    skipped_ticks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScheduleAccounting {
+    due: u64,
+    fired: u64,
+    skipped: u64,
+}
+
+impl ScheduleAccounting {
+    fn reconciled(self) -> bool {
+        self.due == self.fired.saturating_add(self.skipped)
     }
-    let k = ((actual_ns - first) as f64 / interval_ns as f64).round() as u64;
-    first.saturating_add(k.saturating_mul(interval_ns))
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Convert a resolved Tokio tick into a monotonic intended timestamp and an
+/// explicit count of skipped periods. With `MissedTickBehavior::Skip`, Tokio
+/// already tells us which deadline fired; all that remains is to measure how
+/// late that particular deadline was observed.
+fn observe_tick(
+    scheduled: tokio::time::Instant,
+    observed: tokio::time::Instant,
+    actual_ns: u64,
+    interval: Duration,
+) -> TickObservation {
+    let lag = observed.saturating_duration_since(scheduled);
+    let lag_ns = saturating_u128_to_u64(lag.as_nanos());
+    let skipped_ticks = if interval.is_zero() {
+        0
+    } else {
+        saturating_u128_to_u64(lag.as_nanos() / interval.as_nanos())
+    };
+    TickObservation {
+        intended_ns: actual_ns.saturating_sub(lag_ns),
+        lag_ns,
+        skipped_ticks,
+    }
+}
+
+#[cfg(test)]
+fn schedule_accounting(
+    elapsed: Duration,
+    interval: Duration,
+    phase_offset: f64,
+    fired: u64,
+    skipped: u64,
+) -> ScheduleAccounting {
+    ScheduleAccounting {
+        due: ticks_due_after(elapsed, interval, phase_offset),
+        fired,
+        skipped,
+    }
 }
 
 /// Class this tick carries. Every `action_every`-th movement tick is an action,
@@ -273,6 +321,13 @@ fn json_num(v: Option<f64>) -> String {
 fn json_u64(v: Option<u64>) -> String {
     match v {
         Some(n) => n.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn json_string(v: Option<&str>) -> String {
+    match v {
+        Some(value) => format!("\"{}\"", escape(value)),
         None => "null".to_string(),
     }
 }
@@ -414,6 +469,9 @@ fn sample_quic(registry: &ConnRegistry) -> QuicTap {
 struct Shared {
     realm: Counters,
     survivors: Counters,
+    schedule_ticks_due: AtomicU64,
+    schedule_ticks_fired: AtomicU64,
+    schedule_ticks_skipped: AtomicU64,
     sessions: SessionCounters,
     /// Round trip on the ack class, all sessions, steady phase.
     rtt_steady: AtomicHistogram,
@@ -436,6 +494,9 @@ impl Shared {
         Shared {
             realm: Counters::default(),
             survivors: Counters::default(),
+            schedule_ticks_due: AtomicU64::new(0),
+            schedule_ticks_fired: AtomicU64::new(0),
+            schedule_ticks_skipped: AtomicU64::new(0),
             sessions: SessionCounters::default(),
             rtt_steady: AtomicHistogram::new(),
             rtt_storm_survivors: AtomicHistogram::new(),
@@ -602,6 +663,7 @@ fn parse_args() -> Options {
                 ))
             }
             "--json-out" => o.json_out = args.next(),
+            "--preregistration-sha256" => o.pre_registration_sha256 = args.next(),
             "--no-stagger" => o.stagger_sends = false,
             "--storm-cohort" => {
                 o.storm_cohort = parse_or_default("--storm-cohort", args.next(), o.storm_cohort)
@@ -637,8 +699,27 @@ fn parse_args() -> Options {
     o
 }
 
+fn validate_pre_registration_sha256(
+    value: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(sha) = value else {
+        return Err(
+            "mmo-client: --preregistration-sha256 is required for mmo-client/2 reports".into(),
+        );
+    };
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "mmo-client: --preregistration-sha256 must be 64 hex chars, got '{sha}'"
+        )
+        .into());
+    }
+    Ok(sha.to_string())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_args();
+    let pre_registration_sha256 =
+        validate_pre_registration_sha256(options.pre_registration_sha256.as_deref())?;
     println!(
         "mmo-client: role={} url={} sessions={} endpoints={} interval={}ms actionEvery={} payload={}B steady={}s storm={}@{}s window={}s concurrency={} stagger={}",
         options.role.as_str(),
@@ -658,10 +739,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(options))
+    rt.block_on(run(options, pre_registration_sha256))
 }
 
-async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    options: Options,
+    pre_registration_sha256: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     spawn_rss_guard();
     let EndpointPool {
         endpoints,
@@ -816,11 +900,21 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         (Some(a), Some(b)) => Some(b - a),
         _ => None,
     };
+    let schedule_due = shared.schedule_ticks_due.load(Ordering::Relaxed);
+    let schedule_fired = shared.schedule_ticks_fired.load(Ordering::Relaxed);
+    let schedule_skipped = shared.schedule_ticks_skipped.load(Ordering::Relaxed);
+    let schedule_accounting = ScheduleAccounting {
+        due: schedule_due,
+        fired: schedule_fired,
+        skipped: schedule_skipped,
+    };
+    let schedule_reconciled = schedule_accounting.reconciled();
 
     let json = format!(
         concat!(
             "{{",
-            "\"schema\":\"mmo-client/1\",",
+            "\"schema\":\"mmo-client/2\",",
+            "\"preRegistration\":{{\"id\":\"{}\",\"path\":\"{}\",\"sha256\":{}}},",
             "\"role\":\"{}\",",
             "\"staggerSends\":{},",
             "\"sessionsRequested\":{},",
@@ -837,6 +931,10 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             "\"reconnectErr\":{},",
             "\"acceptMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
             "\"reconnectMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
+            "\"scheduleTicksDue\":{},",
+            "\"scheduleTicksFired\":{},",
+            "\"scheduleTicksSkipped\":{},",
+            "\"scheduleTicksReconciled\":{},",
             "\"realm\":{},",
             "\"survivors\":{},",
             "\"rttSteady\":{},",
@@ -844,12 +942,16 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             "\"oneWay\":{},",
             "\"serverHold\":{},",
             "\"scheduleLag\":{},",
+            "\"lifetime\":{{\"realm\":{},\"survivors\":{},\"rttSteady\":{},\"rttStormSurvivors\":{},\"oneWay\":{},\"serverHold\":{},\"scheduleLag\":{}}},",
             "\"quicDrive\":{},",
             "\"client\":{{\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
             "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{}}},",
             "\"connectErrorsSample\":[{}]",
             "}}"
         ),
+        G6_CLOSEOUT_SPEC_ID,
+        G6_CLOSEOUT_SPEC_PATH,
+        json_string(Some(pre_registration_sha256.as_str())),
         options.role.as_str(),
         options.stagger_sends,
         options.sessions,
@@ -879,6 +981,17 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         json_u64(percentile(&reconnects, 0.90)),
         json_u64(percentile(&reconnects, 0.99)),
         json_u64(reconnects.last().copied()),
+        schedule_due,
+        schedule_fired,
+        schedule_skipped,
+        schedule_reconciled,
+        shared.realm.to_json(),
+        shared.survivors.to_json(),
+        shared.rtt_steady.to_json(),
+        shared.rtt_storm_survivors.to_json(),
+        shared.one_way.to_json(),
+        shared.server_hold.to_json(),
+        shared.schedule_lag.to_json(),
         shared.realm.to_json(),
         shared.survivors.to_json(),
         shared.rtt_steady.to_json(),
@@ -925,20 +1038,47 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
 /// reached — a shortfall against it is a generator that failed to source the
 /// load and nothing else.
 fn account_ticks(
-    counters: &Counters,
+    shared: &Shared,
+    track_schedule: bool,
     started_at: tokio::time::Instant,
     interval: Duration,
     phase_offset: f64,
     accounted: &mut bool,
 ) {
+    if !track_schedule {
+        return;
+    }
     if *accounted {
         return;
     }
     *accounted = true;
-    counters.ticks_due.fetch_add(
-        ticks_due_after(started_at.elapsed(), interval, phase_offset),
-        Ordering::Relaxed,
+    let due = ticks_due_after(started_at.elapsed(), interval, phase_offset);
+    shared.realm.ticks_due.fetch_add(due, Ordering::Relaxed);
+    shared.schedule_ticks_due.fetch_add(due, Ordering::Relaxed);
+}
+
+fn record_reconnect_failure(
+    shared: &Shared,
+    track_schedule: bool,
+    started_at: tokio::time::Instant,
+    interval: Duration,
+    phase_offset: f64,
+    accounted: &mut bool,
+    error: String,
+) {
+    account_ticks(
+        shared,
+        track_schedule,
+        started_at,
+        interval,
+        phase_offset,
+        accounted,
     );
+    shared
+        .sessions
+        .reconnect_err
+        .fetch_add(1, Ordering::Relaxed);
+    shared.record_error(error);
 }
 
 /// Fold one received datagram into the right counters and the right histogram.
@@ -1023,6 +1163,7 @@ async fn hold_session(
 
     let severed = is_severed(index, options.storm_cohort);
     let receive_only = options.role == Role::RaidSubscriber;
+    let track_schedule = !receive_only;
     let mut conn = conn;
     let mut payload = vec![b'x'; options.payload_bytes];
     let mut sequence: u64 = 0;
@@ -1040,7 +1181,6 @@ async fn hold_session(
     }
 
     let started_at = tokio::time::Instant::now();
-    let started_ns = monotonic_ns();
     let offset = first_tick_offset(options.send_interval, phase_offset);
     let mut ticker = tokio::time::interval_at(started_at + offset, options.send_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1050,7 +1190,8 @@ async fn hold_session(
         let current = *phase.borrow();
         if current == PHASE_STOP {
             account_ticks(
-                &shared.realm,
+                shared,
+                track_schedule,
                 started_at,
                 options.send_interval,
                 phase_offset,
@@ -1084,11 +1225,15 @@ async fn hold_session(
                     conn = fresh;
                 }
                 Err(e) => {
-                    shared
-                        .sessions
-                        .reconnect_err
-                        .fetch_add(1, Ordering::Relaxed);
-                    shared.record_error(e.to_string());
+                    record_reconnect_failure(
+                        shared,
+                        track_schedule,
+                        started_at,
+                        options.send_interval,
+                        phase_offset,
+                        &mut accounted,
+                        e.to_string(),
+                    );
                     return;
                 }
             }
@@ -1097,7 +1242,8 @@ async fn hold_session(
 
         if current == PHASE_IDLE {
             account_ticks(
-                &shared.realm,
+                shared,
+                track_schedule,
                 started_at,
                 options.send_interval,
                 phase_offset,
@@ -1148,30 +1294,44 @@ async fn hold_session(
             changed = phase.changed() => {
                 if changed.is_err() {
                     account_ticks(
-                        &shared.realm, started_at, options.send_interval,
-                        phase_offset, &mut accounted,
+                        shared,
+                        track_schedule,
+                        started_at,
+                        options.send_interval,
+                        phase_offset,
+                        &mut accounted,
                     );
                     break;
                 }
             }
-            _ = ticker.tick() => {
+            scheduled = ticker.tick() => {
                 sequence = sequence.wrapping_add(1);
                 // The stamp goes in immediately before the send, so the instant
                 // it carries is the actual send instant and nothing this
                 // generator does afterwards is charged to the server.
+                let observed = tokio::time::Instant::now();
                 let actual_ns = monotonic_ns();
-                let intended_ns = nearest_deadline_ns(
-                    started_ns, offset, options.send_interval, actual_ns,
-                );
+                let observation =
+                    observe_tick(scheduled, observed, actual_ns, options.send_interval);
+                shared.schedule_ticks_fired.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .schedule_ticks_skipped
+                    .fetch_add(observation.skipped_ticks, Ordering::Relaxed);
                 shared
                     .schedule_lag
-                    .record_signed(actual_ns as i64 - intended_ns as i64);
+                    .record(observation.lag_ns);
                 let class = if options.role == Role::Publisher {
                     CLASS_RAID
                 } else {
                     class_for_tick(sequence, options.action_every)
                 };
-                write_stamp_v3(&mut payload, intended_ns, actual_ns, sequence, class);
+                write_stamp_v3(
+                    &mut payload,
+                    observation.intended_ns,
+                    actual_ns,
+                    sequence,
+                    class,
+                );
                 match conn.send_datagram(&payload) {
                     Ok(()) => {
                         shared.realm.sent.fetch_add(1, Ordering::Relaxed);
@@ -1200,8 +1360,12 @@ async fn hold_session(
                         // the storm phase is expected to see this and is not
                         // counted as lost.
                         account_ticks(
-                            &shared.realm, started_at, options.send_interval,
-                            phase_offset, &mut accounted,
+                            shared,
+                            track_schedule,
+                            started_at,
+                            options.send_interval,
+                            phase_offset,
+                            &mut accounted,
                         );
                         if !(severed && current == PHASE_STORM) {
                             shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
@@ -1279,17 +1443,180 @@ mod tests {
     }
 
     #[test]
-    fn schedule_lag_survives_a_skipped_tick() {
+    fn observe_tick_reports_nonnegative_lag_without_future_deadlines() {
         let interval = Duration::from_millis(250);
-        let offset = Duration::from_millis(125);
-        let start = 1_000_000_000u64;
-        let deadline = |ns: u64| nearest_deadline_ns(start, offset, interval, ns);
-        assert_eq!(deadline(start + 125_000_000), start + 125_000_000);
-        // 3 ms late against the third deadline, not 253 ms late against the
-        // second — a `Skip` ticker that dropped a tick must not be reported as
-        // an interval of lag it never had.
-        assert_eq!(deadline(start + 628_000_000), start + 625_000_000);
-        assert_eq!(deadline(start), start + 125_000_000);
+        let scheduled = tokio::time::Instant::now();
+
+        let exact = observe_tick(scheduled, scheduled, 1_000_000_000, interval);
+        assert_eq!(
+            exact,
+            TickObservation {
+                intended_ns: 1_000_000_000,
+                lag_ns: 0,
+                skipped_ticks: 0,
+            }
+        );
+
+        let late_3ms = observe_tick(
+            scheduled,
+            scheduled + Duration::from_millis(3),
+            1_003_000_000,
+            interval,
+        );
+        assert_eq!(late_3ms.lag_ns, 3_000_000);
+        assert_eq!(late_3ms.intended_ns, 1_000_000_000);
+        assert_eq!(late_3ms.skipped_ticks, 0);
+
+        let half_plus = observe_tick(
+            scheduled,
+            scheduled + Duration::from_millis(126),
+            2_126_000_000,
+            interval,
+        );
+        assert_eq!(half_plus.lag_ns, 126_000_000);
+        assert_eq!(half_plus.intended_ns, 2_000_000_000);
+        assert_eq!(half_plus.skipped_ticks, 0);
+
+        let two_exact = observe_tick(
+            scheduled,
+            scheduled + Duration::from_millis(500),
+            3_500_000_000,
+            interval,
+        );
+        assert_eq!(two_exact.lag_ns, 500_000_000);
+        assert_eq!(two_exact.intended_ns, 3_000_000_000);
+        assert_eq!(two_exact.skipped_ticks, 2);
+
+        let two_plus = observe_tick(
+            scheduled,
+            scheduled + Duration::from_millis(503),
+            4_503_000_000,
+            interval,
+        );
+        assert_eq!(two_plus.lag_ns, 503_000_000);
+        assert_eq!(two_plus.intended_ns, 4_000_000_000);
+        assert_eq!(two_plus.skipped_ticks, 2);
+
+        let saturated = observe_tick(
+            scheduled,
+            scheduled + Duration::from_secs(1),
+            400_000_000,
+            interval,
+        );
+        assert_eq!(saturated.lag_ns, 1_000_000_000);
+        assert_eq!(saturated.intended_ns, 0);
+        assert_eq!(saturated.skipped_ticks, 4);
+    }
+
+    #[test]
+    fn schedule_accounting_respects_phase_offset_and_reconciles() {
+        let interval = Duration::from_millis(250);
+        let aligned = schedule_accounting(Duration::from_millis(600), interval, 0.0, 2, 0);
+        assert_eq!(
+            aligned,
+            ScheduleAccounting {
+                due: 2,
+                fired: 2,
+                skipped: 0,
+            }
+        );
+        assert!(aligned.reconciled());
+
+        let offset = schedule_accounting(Duration::from_millis(600), interval, 1.0, 1, 0);
+        assert_eq!(
+            offset,
+            ScheduleAccounting {
+                due: 1,
+                fired: 1,
+                skipped: 0,
+            }
+        );
+        assert!(offset.reconciled());
+
+        let skipped = schedule_accounting(Duration::from_millis(875), interval, 1.0, 2, 1);
+        assert_eq!(
+            skipped,
+            ScheduleAccounting {
+                due: 3,
+                fired: 2,
+                skipped: 1,
+            }
+        );
+        assert!(skipped.reconciled());
+    }
+
+    #[test]
+    fn reconnect_failure_books_schedule_before_returning() {
+        let shared = Shared::new(1);
+        shared.schedule_ticks_fired.store(3, Ordering::Relaxed);
+        shared.schedule_ticks_skipped.store(1, Ordering::Relaxed);
+        let mut accounted = false;
+        let started_at = tokio::time::Instant::now() - Duration::from_millis(3600);
+        let interval = Duration::from_secs(1);
+
+        record_reconnect_failure(
+            &shared,
+            true,
+            started_at,
+            interval,
+            0.0,
+            &mut accounted,
+            "storm reconnect failed".to_string(),
+        );
+
+        assert!(accounted);
+        assert_eq!(shared.sessions.reconnect_err.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared.errors.lock().unwrap().as_slice(),
+            ["storm reconnect failed"]
+        );
+        let accounting = ScheduleAccounting {
+            due: shared.schedule_ticks_due.load(Ordering::Relaxed),
+            fired: shared.schedule_ticks_fired.load(Ordering::Relaxed),
+            skipped: shared.schedule_ticks_skipped.load(Ordering::Relaxed),
+        };
+        assert_eq!(
+            accounting,
+            ScheduleAccounting {
+                due: 4,
+                fired: 3,
+                skipped: 1,
+            }
+        );
+        assert!(accounting.reconciled());
+    }
+
+    #[test]
+    fn preregistration_sha256_is_required() {
+        let err = validate_pre_registration_sha256(None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mmo-client: --preregistration-sha256 is required for mmo-client/2 reports"
+        );
+    }
+
+    #[test]
+    fn preregistration_sha256_rejects_malformed_values() {
+        for raw in [
+            "",
+            "abc",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+        ] {
+            let err = validate_pre_registration_sha256(Some(raw)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("mmo-client: --preregistration-sha256 must be 64 hex chars, got '{raw}'")
+            );
+        }
+    }
+
+    #[test]
+    fn preregistration_sha256_accepts_valid_and_is_json_safe() {
+        let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let parsed = validate_pre_registration_sha256(Some(sha)).unwrap();
+        assert_eq!(parsed, sha);
+        assert_eq!(json_string(Some(parsed.as_str())), format!("\"{sha}\""));
     }
 
     /// The classification the round trip depends on, exercised without a
