@@ -1147,6 +1147,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 
 	const boundary = (): BoundarySnapshot => ({
 		rxTotal: o.state().rxTotal,
+		rxSurvivors: o.state().rxSurvivors,
 		rxByClass: {
 			snapshot: o.state().rxByClass.get(CLASS_SNAPSHOT) ?? 0,
 			ack: o.state().rxByClass.get(CLASS_ACK) ?? 0,
@@ -1378,6 +1379,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 			steady: {
 				serverUpstream: {
 					rxTotal: steadyWindow.rxTotal,
+					rxSurvivors: steadyWindow.rxSurvivors,
 					rxByClass: steadyWindow.rxByClass,
 				},
 				emitter: steadyWindow.emitter,
@@ -1389,6 +1391,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 			steadyDrain: {
 				serverUpstream: {
 					rxTotal: steadyDrainWindow.rxTotal,
+					rxSurvivors: steadyDrainWindow.rxSurvivors,
 					rxByClass: steadyDrainWindow.rxByClass,
 				},
 				emitter: steadyDrainWindow.emitter,
@@ -1402,6 +1405,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 				? {
 						serverUpstream: {
 							rxTotal: stormWindow.rxTotal,
+							rxSurvivors: stormWindow.rxSurvivors,
 							rxByClass: stormWindow.rxByClass,
 						},
 						emitter: stormWindow.emitter,
@@ -1415,6 +1419,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 			lifetime: {
 				serverUpstream: {
 					rxTotal: lifetimeWindow.rxTotal,
+					rxSurvivors: lifetimeWindow.rxSurvivors,
 					rxByClass: lifetimeWindow.rxByClass,
 				},
 				emitter: lifetimeWindow.emitter,

@@ -24,6 +24,7 @@ import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "./g6-plan.ts";
 function boundary(over: Partial<BoundarySnapshot> = {}): BoundarySnapshot {
 	return {
 		rxTotal: 10,
+		rxSurvivors: 4,
 		rxByClass: {
 			snapshot: 6,
 			ack: 2,
@@ -75,6 +76,7 @@ function measurementWindow(
 		rxOther: 0,
 		rxUnstamped: 0,
 		ackUnreflected: 0,
+		sessionsLost: 0,
 		scheduleLag: { count: 100, negative: 0, p99Ns: 5_000_000 },
 		rtt: { count: 8, negative: 0, p99Ns: 40_000_000 },
 		oneWay: { count: 4, negative: 0, p99Ns: 12_000_000 },
@@ -231,6 +233,7 @@ describe("boundary windows", () => {
 			boundary(),
 			boundary({
 				rxTotal: 25,
+				rxSurvivors: 12,
 				rxByClass: {
 					snapshot: 15,
 					ack: 5,
@@ -266,6 +269,7 @@ describe("boundary windows", () => {
 		);
 
 		expect(delta.rxTotal).toBe(15);
+		expect(delta.rxSurvivors).toBe(8);
 		expect(delta.rxByClass).toEqual({
 			snapshot: 9,
 			ack: 3,
@@ -286,6 +290,7 @@ describe("boundary windows", () => {
 		expect(windows.steadyDrain.emitter.snapshotDue).toBe(20);
 		expect(windows.steadyDrain.emitter.ackIssued).toBe(6);
 		expect(windows.storm?.rxTotal).toBe(20);
+		expect(windows.storm?.rxSurvivors).toBe(0);
 	});
 });
 

@@ -43,6 +43,8 @@ export type MetricsSnapshotLike = {
 
 export type BoundarySnapshot = {
 	rxTotal: number;
+	/** Upstream received from sessions outside the registered severed cohort. */
+	rxSurvivors: number;
 	rxByClass: RxByClassSnapshot;
 	emitter: EmitterSnapshot;
 	cpuMs: number;
@@ -64,6 +66,7 @@ export type ClientMeasurementWindow = {
 	rxOther: number;
 	rxUnstamped: number;
 	ackUnreflected: number;
+	sessionsLost: number;
 	scheduleLag: unknown;
 	rtt: unknown;
 	oneWay: unknown;
@@ -205,6 +208,7 @@ export function deltaBoundarySnapshot(
 ): BoundarySnapshot {
 	return {
 		rxTotal: to.rxTotal - from.rxTotal,
+		rxSurvivors: to.rxSurvivors - from.rxSurvivors,
 		rxByClass: {
 			snapshot: to.rxByClass.snapshot - from.rxByClass.snapshot,
 			ack: to.rxByClass.ack - from.rxByClass.ack,
