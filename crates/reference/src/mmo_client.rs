@@ -418,6 +418,8 @@ struct Counters {
     /// Acks whose reflected token was zero — a server that forgot to reflect.
     /// Counted rather than recorded as a round trip measured from the epoch.
     ack_unreflected: AtomicU64,
+    /// Unexpected session losses attributable to this measurement population.
+    sessions_lost: AtomicU64,
 }
 
 impl Counters {
@@ -436,7 +438,7 @@ impl Counters {
                 "\"scheduleTicksDue\":{},\"scheduleTicksFired\":{},",
                 "\"scheduleTicksSkipped\":{},\"scheduleTicksReconciled\":{},",
                 "\"rxSnapshot\":{},\"rxAck\":{},\"rxRaid\":{},\"rxOther\":{},",
-                "\"rxUnstamped\":{},\"ackUnreflected\":{}"
+                "\"rxUnstamped\":{},\"ackUnreflected\":{},\"sessionsLost\":{}"
             ),
             self.sent.load(Ordering::Relaxed),
             self.send_err.load(Ordering::Relaxed),
@@ -450,6 +452,7 @@ impl Counters {
             self.rx_other.load(Ordering::Relaxed),
             self.rx_unstamped.load(Ordering::Relaxed),
             self.ack_unreflected.load(Ordering::Relaxed),
+            self.sessions_lost.load(Ordering::Relaxed),
         )
     }
 }
@@ -481,6 +484,10 @@ impl WindowStats {
         self.counters
             .ack_unreflected
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_session_loss(&self) {
+        self.counters.sessions_lost.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_send(&self, ok: bool) {
@@ -1526,6 +1533,27 @@ fn record_reconnect_failure(
     shared.record_error(error);
 }
 
+/// Count an unexpected loss in every applicable population. The deliberate
+/// disconnect of a severed storm session is not a loss; every other receive
+/// failure is, and a survivor failure must remain visible in S-C1 without
+/// borrowing a whole-realm counter.
+fn record_session_loss(phase: u8, severed: bool, shared: &Shared) {
+    if severed && phase == PHASE_STORM {
+        return;
+    }
+    shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
+    shared.lifetime.record_session_loss();
+    if phase_records_steady_drain(phase) {
+        shared.steady_drain.record_session_loss();
+        if phase == PHASE_STEADY {
+            shared.steady.record_session_loss();
+        }
+    }
+    if phase_records_storm_survivors(phase, severed) {
+        shared.storm_survivors.record_session_loss();
+    }
+}
+
 /// Fold one received datagram into the right counters and the right histogram.
 ///
 /// Split out of the session loop so the classification — which class was this,
@@ -1710,7 +1738,7 @@ async fn hold_session(
                             d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
                         ),
                         Err(_) => {
-                            shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
+                            record_session_loss(*phase.borrow(), severed, shared);
                             return;
                         }
                     }
@@ -1730,7 +1758,7 @@ async fn hold_session(
                             d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
                         ),
                         Err(_) => {
-                            shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
+                            record_session_loss(*phase.borrow(), severed, shared);
                             return;
                         }
                     }
@@ -1828,9 +1856,7 @@ async fn hold_session(
                             phase_offset,
                             severed,
                         );
-                        if !(severed && current == PHASE_STORM) {
-                            shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
-                        }
+                        record_session_loss(current, severed, shared);
                         return;
                     }
                 }
@@ -2231,6 +2257,37 @@ mod tests {
         record_arrival(&buf, sent_ns + 1_000_000, false, PHASE_STEADY, &shared);
         assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":1"));
         assert!(shared.steady_drain.rtt.to_json().contains("\"count\":1"));
+    }
+
+    #[test]
+    fn survivor_loss_accounting_excludes_expected_severed_disconnects() {
+        let shared = Shared::new(2);
+
+        record_session_loss(PHASE_STORM, true, &shared);
+        assert_eq!(shared.sessions.lost.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared
+                .storm_survivors
+                .counters
+                .sessions_lost
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        record_session_loss(PHASE_STORM, false, &shared);
+        assert_eq!(shared.sessions.lost.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared
+                .storm_survivors
+                .counters
+                .sessions_lost
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(shared
+            .storm_survivors
+            .to_json()
+            .contains("\"sessionsLost\":1"));
     }
 
     #[test]
