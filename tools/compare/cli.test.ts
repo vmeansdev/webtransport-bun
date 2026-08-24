@@ -11,6 +11,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { resolve } from "node:path";
 import { parseClientArgs } from "./client.ts";
 import {
 	type ComparisonSummary,
@@ -121,19 +122,37 @@ describe("Task 10: Campaign CLI argument parsing", () => {
 			"chat-fanout,ticker-fanout",
 			"--transports",
 			"both",
+			"--candidate",
+			"candidate-1",
+			"--campaign-id",
+			"campaign-1",
 			"--output-dir",
-			"./results",
+			"./.release-evidence/transport-comparison/candidate-1/campaign-1",
 		]);
 
 		expect(args.scenarios).toEqual(["chat-fanout", "ticker-fanout"]);
 		expect(args.transports).toBe("both");
-		expect(args.outputDir).toBe("./results");
+		expect(args.candidate).toBe("candidate-1");
+		expect(args.campaignId).toBe("campaign-1");
+		expect(args.outputDir).toBe(
+			resolve(
+				process.cwd(),
+				".release-evidence/transport-comparison/candidate-1/campaign-1",
+			),
+		);
 	});
 
 	it("defaults to all scenarios and both transports", () => {
 		const args = parseCampaignArgs([]);
 		expect(args.scenarios.length).toBeGreaterThan(5);
 		expect(args.transports).toBe("both");
+		expect(args.outputDir).toContain(
+			".release-evidence/transport-comparison/unbound-candidate/campaign-unbound",
+		);
+	});
+
+	it("rejects legacy evidence output", () => {
+		expect(() => parseCampaignArgs(["--output-dir", "./evidence"])).toThrow();
 	});
 });
 
@@ -152,6 +171,7 @@ describe("Task 10: Report rendering", () => {
 			rejectedCells: 1,
 			comparisons: [
 				{
+					cellId: "chat-fanout/subscribers-1000",
 					scenarioId: "chat-fanout",
 					status: "COMPATIBLE",
 					primaryMetricName: "delivered-messages-per-second",
@@ -163,6 +183,7 @@ describe("Task 10: Report rendering", () => {
 					winner: "wt",
 				},
 				{
+					cellId: "reconnect-storm/cold-full",
 					scenarioId: "reconnect-storm",
 					status: "INCOMPATIBLE",
 					rejectionReason: "missing WT run evidence",
