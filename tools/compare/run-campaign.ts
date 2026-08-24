@@ -1,9 +1,9 @@
 /**
  * Task 14: Canonical 35-Cell Campaign Orchestrator.
  *
- * Runs the full 35-cell comparison matrix and 12 WS lossy overlays in
- * balanced interleaved block order (WS, WT, WT, WS) across the physical
- * 10.99.0.1 (Mac en8) ↔ 10.99.0.2 (Linux eno1) direct Ethernet link.
+ * R0 keeps this official campaign entrypoint quarantined until R1 supplies a
+ * validated staged trust boundary. The pure artifact builder and verifier
+ * remain available to tests without publishing campaign output.
  *
  * Usage:
  *   bun tools/compare/run-campaign.ts [--scenarios all|<id,...>] [--transports both|ws|wt] [--output-dir .release-evidence/transport-comparison/<candidate>/<campaign-id>]
@@ -24,6 +24,7 @@ import {
 	type Transport,
 } from "./evidence.ts";
 import {
+	assertOfficialComparisonIoAvailable,
 	checkPromotionQuarantine,
 	resolveOfficialComparisonOutputDir,
 	resolveOfficialComparisonOutputFile,
@@ -466,6 +467,7 @@ function measureCellArm(
  * Execute the comparison campaign.
  */
 export async function runCampaign(args: CampaignArgs): Promise<void> {
+	assertOfficialComparisonIoAvailable();
 	const campaignId = args.campaignId;
 	const outputDir = resolveOfficialComparisonOutputDir({
 		candidate: args.candidate,

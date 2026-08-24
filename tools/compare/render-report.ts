@@ -1,10 +1,10 @@
 /**
  * Render a comparison report from externally trusted, verified artifacts.
  *
- * Reports are generated next to the campaign artifacts under
- * `.release-evidence/transport-comparison/<candidate>/<campaign-id>/`.
- * Historical `./evidence` output and checked-in numeric reports are not a
- * source of comparison truth.
+ * R0 keeps official report generation quarantined until R1 supplies a
+ * validated staged trust boundary for campaign filesystem I/O. Historical
+ * `./evidence` output and checked-in numeric reports are not a source of
+ * comparison truth.
  */
 
 import { existsSync, readdirSync } from "node:fs";
@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
 import { metricContractForScenario, type RunArtifact } from "./evidence.ts";
 import {
+	assertOfficialComparisonIoAvailable,
 	checkPromotionQuarantine,
 	readOfficialComparisonFile,
 	resolveOfficialComparisonOutputDir,
@@ -128,6 +129,7 @@ export function generateReport(
 	evidenceDir?: string,
 	outputFile?: string,
 ): void {
+	assertOfficialComparisonIoAvailable();
 	const { candidate, campaignId } = campaignIdentity();
 	const officialDir = resolveOfficialComparisonOutputDir({
 		candidate,

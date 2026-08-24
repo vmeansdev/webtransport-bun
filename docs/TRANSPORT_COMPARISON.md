@@ -59,6 +59,12 @@ the Linux role on the required `10.99.0.2/eno1` host and the Mac role on the
 required `10.99.0.1/en8` host. Historical, synthetic, and pure-test outputs
 are not measured comparison evidence and cannot populate a numeric result.
 
+R0 additionally keeps official artifact/report filesystem I/O quarantined. The
+campaign, verifier, and report entrypoints fail closed with the typed
+`OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` error until R1 supplies a validated,
+staged external trust boundary. Pure byte/object parsing and verification stay
+available for fixtures and tests; they do not publish or promote evidence.
+
 ## Tooling Commands
 
 The official output directory is
@@ -79,23 +85,24 @@ OUTPUT_DIR=".release-evidence/transport-comparison/$CANDIDATE/$CAMPAIGN_ID"
   ```bash
   bun run test:compare
   ```
-- **Launch Linux Server Role**:
+- **Run Pure Evidence Verification Tests**:
+  ```bash
+  bun test tools/compare/evidence.test.ts
+  ```
+- **Deferred Physical Roles (R1 only)**:
   ```bash
   bun run compare:server --transport <ws|wt> --scenario <id> --port 4433 --bind 10.99.0.2
-  ```
-- **Launch Mac Client Role**:
-  ```bash
   bun run compare:client --transport <ws|wt> --scenario <id> --server-url https://10.99.0.2:4433
   ```
-- **Execute Full Campaign**:
+- **Deferred Official Campaign (R1 only)**:
   ```bash
   bun run compare:run --scenarios all --transports both --candidate "$CANDIDATE" --campaign-id "$CAMPAIGN_ID" --output-dir "$OUTPUT_DIR"
   ```
-- **Verify Run Artifacts**:
+- **Deferred Official Verification (R1 only)**:
   ```bash
   bun run compare:verify "$OUTPUT_DIR"
   ```
-- **Render Comparison Report**:
+- **Deferred Official Report (R1 only)**:
   ```bash
   bun run compare:report "$OUTPUT_DIR"
   ```
@@ -105,6 +112,7 @@ OUTPUT_DIR=".release-evidence/transport-comparison/$CANDIDATE/$CAMPAIGN_ID"
 - Every run produces a JSON artifact with schema version `v1` and a SHA-256 byte digest.
 - An opaque external trust marker alone never promotes an artifact; evidence remains quarantined until the R1 external validation contract is implemented.
 - An artifact `comparisonId` must match the campaign directory identity; mismatches are rejected before comparison.
-- Artifact and report leaves reject symbolic links, and report publication uses a same-directory atomic write.
+- Official artifact/report reads and publication fail closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`; R0 intentionally makes no portable openat/renameat safety claim.
+- R1 must provide the validated staged boundary before any official filesystem read or report publication is enabled.
 - If any parameter, capacity hash, route proof, or certificate fingerprint diverges between arms, the comparator marks the cell `INCOMPATIBLE` and suppresses ranking.
 - Overload is an open-loop measured outcome; rate downshifting is strictly prohibited.
