@@ -35,6 +35,7 @@ import {
 	snapshotEvidenceValue,
 } from "./evidence.ts";
 import {
+	assertOfficialComparisonIoAvailable,
 	checkPromotionQuarantine,
 	readOfficialComparisonFile,
 	resolveOfficialComparisonOutputDir,
@@ -2683,6 +2684,12 @@ export { artifactByteSha256 };
 
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
+	try {
+		assertOfficialComparisonIoAvailable();
+	} catch (error: unknown) {
+		console.error(`[verify] Error: ${(error as Error).message}`);
+		process.exit(1);
+	}
 	const { readdirSync, existsSync } = await import("node:fs");
 	const { join } = await import("node:path");
 

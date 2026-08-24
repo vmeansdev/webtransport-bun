@@ -1,25 +1,5 @@
-import {
-	closeSync,
-	constants,
-	existsSync,
-	fstatSync,
-	fsyncSync,
-	lstatSync,
-	openSync,
-	readFileSync,
-	realpathSync,
-	renameSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import {
-	basename as hostBasename,
-	dirname as hostDirname,
-	join as hostJoin,
-	resolve as hostResolve,
-	posix as posixPath,
-	win32 as win32Path,
-} from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { posix as posixPath, win32 as win32Path } from "node:path";
 
 /** The only repository location where comparison output may be generated. */
 export const OFFICIAL_COMPARISON_OUTPUT_ROOT =
@@ -64,6 +44,7 @@ export type OutputPolicyRejectionCode =
 	| "OUTPUT_PATH_SYMLINK"
 	| "OUTPUT_FILE_INVALID"
 	| "OUTPUT_SEGMENT_INVALID"
+	| "OUTPUT_TRUST_BOUNDARY_UNAVAILABLE"
 	| "EXTERNAL_TRUST_BOUND_MISSING"
 	| "EXTERNAL_TRUST_BOUND_UNVALIDATED"
 	| "COMPARISON_ID_MISSING"
@@ -131,10 +112,6 @@ function record(value: unknown): Record<string, unknown> | undefined {
 function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
-
-const NO_FOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
-
-let temporaryWriteSequence = 0;
 
 function pathSegments(value: string): string[] {
 	return value.split(/[\\/]+/u).filter((segment) => segment.length > 0);
@@ -249,151 +226,39 @@ function assertNoSymlinkComponents(
 		);
 }
 
-function assertSafeOutputLeaf(pathname: string): void {
-	try {
-		const stat = lstatSync(pathname);
-		if (stat.isSymbolicLink())
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_PATH_SYMLINK",
-				"comparison output file must not be a symbolic link",
-			);
-		if (!stat.isFile())
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_FILE_INVALID",
-				"comparison output file must be a regular file",
-			);
-	} catch (error: unknown) {
-		if (error instanceof ComparisonOutputPolicyError) throw error;
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-}
-
-function assertSafeOutputParent(pathname: string): void {
-	const parent = hostDirname(pathname);
-	try {
-		const stat = lstatSync(parent);
-		if (stat.isSymbolicLink() || !stat.isDirectory())
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_PATH_SYMLINK",
-				"comparison output parent must be a real directory",
-			);
-		const lexicalParent = hostResolve(parent);
-		if (realpathSync(parent) !== lexicalParent)
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_PATH_SYMLINK",
-				"comparison output parent resolves through a symbolic link",
-			);
-	} catch (error: unknown) {
-		if (error instanceof ComparisonOutputPolicyError) throw error;
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		throw new ComparisonOutputPolicyError(
-			"OUTPUT_FILE_INVALID",
-			"comparison output parent directory does not exist",
-		);
-	}
-}
-
 /**
- * Read a campaign leaf without following a symbolic link between validation
- * and open.  The no-follow flag is available on the supported Unix hosts;
- * lstat remains the fallback on runtimes that do not expose it.
+ * R0 cannot bind official filesystem I/O to a validated external campaign
+ * lock.  Keep this boundary explicit and typed until R1 owns a staged
+ * trust-boundary implementation; pure bytes/object verification remains
+ * available through the evidence verifier.
  */
+function throwOfficialComparisonIoUnavailable(): never {
+	throw new ComparisonOutputPolicyError(
+		"OUTPUT_TRUST_BOUNDARY_UNAVAILABLE",
+		"official comparison filesystem I/O is unavailable until R1 supplies a validated staged trust boundary",
+	);
+}
+
+export function assertOfficialComparisonIoAvailable(): void {
+	throwOfficialComparisonIoUnavailable();
+}
+
+/** Official artifact reads remain quarantined until R1 supplies staged trust. */
 export function readOfficialComparisonFile(pathname: string): Uint8Array {
-	assertSafeOutputLeaf(pathname);
-	let descriptor: number | undefined;
-	try {
-		descriptor = openSync(pathname, constants.O_RDONLY | NO_FOLLOW_FLAG);
-		if (realpathSync(pathname) !== hostResolve(pathname))
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_PATH_SYMLINK",
-				"comparison input became a symbolic link before it was read",
-			);
-		if (!fstatSync(descriptor).isFile())
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_FILE_INVALID",
-				"comparison input must be a regular file",
-			);
-		return new Uint8Array(readFileSync(descriptor));
-	} catch (error: unknown) {
-		if (error instanceof ComparisonOutputPolicyError) throw error;
-		if ((error as NodeJS.ErrnoException).code === "ELOOP")
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_PATH_SYMLINK",
-				"comparison input became a symbolic link before it was opened",
-			);
-		throw error;
-	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-	}
+	void pathname;
+	assertOfficialComparisonIoAvailable();
+	return throwOfficialComparisonIoUnavailable();
 }
 
-/**
- * Publish a campaign leaf through a same-directory temporary file and atomic
- * rename.  The destination is rechecked before publication and temporary
- * files are always removed on failure.
- */
+/** Official artifact publication remains quarantined until R1 supplies staged trust. */
 export function writeOfficialComparisonFile(
 	pathname: string,
 	contents: Uint8Array | string,
 ): void {
-	assertSafeOutputParent(pathname);
-	assertSafeOutputLeaf(pathname);
-
-	const parent = hostDirname(pathname);
-	const leaf = hostBasename(pathname);
-	let temporaryPath: string | undefined;
-	let descriptor: number | undefined;
-	try {
-		for (let attempt = 0; attempt < 16; attempt++) {
-			const sequence = temporaryWriteSequence++;
-			const candidate = hostJoin(
-				parent,
-				`.${leaf}.tmp-${process.pid}-${sequence}`,
-			);
-			try {
-				descriptor = openSync(
-					candidate,
-					constants.O_WRONLY |
-						constants.O_CREAT |
-						constants.O_EXCL |
-						NO_FOLLOW_FLAG,
-					0o600,
-				);
-				temporaryPath = candidate;
-				if (realpathSync(candidate) !== hostResolve(candidate))
-					throw new ComparisonOutputPolicyError(
-						"OUTPUT_PATH_SYMLINK",
-						"comparison temporary file escaped its campaign directory",
-					);
-				break;
-			} catch (error: unknown) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			}
-		}
-		if (descriptor === undefined || temporaryPath === undefined)
-			throw new ComparisonOutputPolicyError(
-				"OUTPUT_FILE_INVALID",
-				"could not allocate a unique comparison output temporary file",
-			);
-		writeFileSync(descriptor, contents);
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-
-		// A destination symlink that appeared after the first check is rejected
-		// before rename; rename itself never follows the destination leaf.
-		assertSafeOutputParent(pathname);
-		assertSafeOutputLeaf(pathname);
-		renameSync(temporaryPath, pathname);
-		temporaryPath = undefined;
-	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-		if (temporaryPath !== undefined) {
-			try {
-				unlinkSync(temporaryPath);
-			} catch {}
-		}
-	}
+	void pathname;
+	void contents;
+	assertOfficialComparisonIoAvailable();
+	throwOfficialComparisonIoUnavailable();
 }
 
 /** Resolve a report file whose parent is the already-validated campaign dir. */

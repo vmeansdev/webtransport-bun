@@ -4,8 +4,11 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,12 +16,15 @@ import { join, resolve } from "node:path";
 
 import {
 	ALL_F_SENTINEL_SHA256,
+	ComparisonOutputPolicyError,
 	checkPromotionQuarantine,
 	EMPTY_SHA256,
 	LEGACY_SYNTHETIC_COMPARISON_ID,
 	LEGACY_SYNTHETIC_SOURCE_SHA,
+	readOfficialComparisonFile,
 	resolveOfficialComparisonOutputDir,
 	resolveOfficialComparisonOutputFile,
+	writeOfficialComparisonFile,
 } from "./output-policy.ts";
 import { generateReport } from "./render-report.ts";
 
@@ -46,6 +52,74 @@ function validEvidence() {
 			cleanup: "8".repeat(64),
 		},
 	};
+}
+
+type SwappedParent = "candidate" | "campaign";
+
+function prepareSwappedParent(
+	cwd: string,
+	parent: SwappedParent,
+): {
+	officialDir: string;
+	outputFile: string;
+	outsideDir: string;
+	outsideFile: string;
+	restore: () => void;
+} {
+	const canonicalCwd = realpathSync(cwd);
+	const officialDir = resolve(
+		canonicalCwd,
+		OFFICIAL_ROOT,
+		"candidate-1",
+		"campaign-1",
+	);
+	mkdirSync(officialDir, { recursive: true });
+	const outputFile = resolveOfficialComparisonOutputFile({
+		cwd: canonicalCwd,
+		candidate: "candidate-1",
+		campaignId: "campaign-1",
+		outputDir: officialDir,
+		outputFile: join(officialDir, "artifact.json"),
+	} as never);
+	const outsideRoot = mkdtempSync(join(tmpdir(), "wt-output-race-outside-"));
+	const outsideDir = outsideRoot;
+	const outsideFile =
+		parent === "candidate"
+			? join(outsideRoot, "campaign-1", "artifact.json")
+			: join(outsideRoot, "artifact.json");
+	mkdirSync(resolve(outsideFile, ".."), { recursive: true });
+	const parentPath =
+		parent === "candidate" ? resolve(officialDir, "..") : officialDir;
+	const backupPath = `${parentPath}.real`;
+	renameSync(parentPath, backupPath);
+	symlinkSync(outsideDir, parentPath, "dir");
+
+	return {
+		officialDir,
+		outputFile,
+		outsideDir,
+		outsideFile,
+		restore: () => {
+			try {
+				unlinkSync(parentPath);
+			} catch {}
+			renameSync(backupPath, parentPath);
+			rmSync(outsideRoot, { recursive: true, force: true });
+		},
+	};
+}
+
+function expectTrustBoundaryUnavailable(operation: () => unknown): void {
+	let error: unknown;
+	try {
+		operation();
+	} catch (caught) {
+		error = caught;
+	}
+	expect(error).toBeInstanceOf(ComparisonOutputPolicyError);
+	expect((error as ComparisonOutputPolicyError).code).toBe(
+		"OUTPUT_TRUST_BOUNDARY_UNAVAILABLE",
+	);
 }
 
 describe("comparison output path quarantine", () => {
@@ -259,20 +333,13 @@ describe("promotion quarantine", () => {
 });
 
 describe("comparison publication containment", () => {
-	test("refuses to read a symlinked artifact leaf", () => {
-		const cwd = mkdtempSync(join(tmpdir(), "wt-report-artifact-"));
-		const outside = mkdtempSync(join(tmpdir(), "wt-report-artifact-outside-"));
-		const previousCwd = process.cwd();
-		const previousCandidate = process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
-		const previousCampaign = process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
-		const previousTrust =
-			process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
+	test.each([
+		"candidate",
+		"campaign",
+	] as const)("rejects an intermediate %s parent swap before an official read", (parent) => {
+		const cwd = mkdtempSync(join(tmpdir(), "wt-read-parent-race-"));
+		let swapped: ReturnType<typeof prepareSwappedParent> | undefined;
 		try {
-			process.chdir(cwd);
-			process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = "candidate-1";
-			process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = "campaign-1";
-			process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND =
-				"trust-bound-1";
 			const officialDir = resolve(
 				cwd,
 				OFFICIAL_ROOT,
@@ -280,71 +347,48 @@ describe("comparison publication containment", () => {
 				"campaign-1",
 			);
 			mkdirSync(officialDir, { recursive: true });
-			const outsideArtifact = join(outside, "artifact.json");
-			writeFileSync(outsideArtifact, JSON.stringify(validEvidence()));
-			symlinkSync(
-				outsideArtifact,
-				join(officialDir, "chat-fanout_subscribers-1000-ws.json"),
-			);
+			const insideFile = join(officialDir, "artifact.json");
+			writeFileSync(insideFile, "inside");
+			swapped = prepareSwappedParent(cwd, parent);
+			writeFileSync(swapped.outsideFile, "outside");
 
-			expect(() => generateReport()).toThrow(/symbolic link|symlink|artifact/i);
+			expectTrustBoundaryUnavailable(() =>
+				readOfficialComparisonFile(swapped?.outputFile ?? insideFile),
+			);
 		} finally {
-			process.chdir(previousCwd);
-			if (previousCandidate === undefined)
-				delete process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
-			else process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = previousCandidate;
-			if (previousCampaign === undefined)
-				delete process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
-			else process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = previousCampaign;
-			if (previousTrust === undefined)
-				delete process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
-			else
-				process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND =
-					previousTrust;
+			swapped?.restore();
 			rmSync(cwd, { recursive: true, force: true });
-			rmSync(outside, { recursive: true, force: true });
 		}
 	});
 
-	test("fails closed when the report leaf is swapped after validation", () => {
-		const cwd = mkdtempSync(join(tmpdir(), "wt-report-race-"));
-		const outside = mkdtempSync(join(tmpdir(), "wt-report-race-outside-"));
+	test.each([
+		"candidate",
+		"campaign",
+	] as const)("rejects an intermediate %s parent swap before official publication", (parent) => {
+		const cwd = mkdtempSync(join(tmpdir(), "wt-write-parent-race-"));
+		let swapped: ReturnType<typeof prepareSwappedParent> | undefined;
+		try {
+			swapped = prepareSwappedParent(cwd, parent);
+			expectTrustBoundaryUnavailable(() =>
+				writeOfficialComparisonFile(swapped?.outputFile ?? "", "report"),
+			);
+			expect(existsSync(swapped.outsideFile)).toBe(false);
+		} finally {
+			swapped?.restore();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses official report generation until R1 trust is staged", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "wt-report-artifact-"));
 		const previousCwd = process.cwd();
 		const previousCandidate = process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
 		const previousCampaign = process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
-		const trustKey = "WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND";
-		const previousTrustDescriptor = Object.getOwnPropertyDescriptor(
-			process.env,
-			trustKey,
-		);
 		try {
 			process.chdir(cwd);
 			process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = "candidate-1";
 			process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = "campaign-1";
-			const officialDir = resolve(
-				cwd,
-				OFFICIAL_ROOT,
-				"candidate-1",
-				"campaign-1",
-			);
-			mkdirSync(officialDir, { recursive: true });
-			const resolvedCwd = process.cwd();
-			const reportPath = resolveOfficialComparisonOutputFile({
-				cwd: resolvedCwd,
-				candidate: "candidate-1",
-				campaignId: "campaign-1",
-			});
-			const escapedReport = join(outside, "escaped-report.md");
-			Object.defineProperty(process.env, trustKey, {
-				configurable: true,
-				get() {
-					symlinkSync(escapedReport, reportPath);
-					return "trust-bound-1";
-				},
-			});
-
-			expect(() => generateReport()).toThrow(/symbolic link|symlink|output/i);
-			expect(existsSync(escapedReport)).toBe(false);
+			expectTrustBoundaryUnavailable(() => generateReport());
 		} finally {
 			process.chdir(previousCwd);
 			if (previousCandidate === undefined)
@@ -353,11 +397,29 @@ describe("comparison publication containment", () => {
 			if (previousCampaign === undefined)
 				delete process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
 			else process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = previousCampaign;
-			if (previousTrustDescriptor)
-				Object.defineProperty(process.env, trustKey, previousTrustDescriptor);
-			else delete process.env[trustKey];
 			rmSync(cwd, { recursive: true, force: true });
-			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses official report publication until R1 trust is staged", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "wt-report-race-"));
+		const previousCwd = process.cwd();
+		const previousCandidate = process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
+		const previousCampaign = process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
+		try {
+			process.chdir(cwd);
+			process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = "candidate-1";
+			process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = "campaign-1";
+			expectTrustBoundaryUnavailable(() => generateReport());
+		} finally {
+			process.chdir(previousCwd);
+			if (previousCandidate === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
+			else process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = previousCandidate;
+			if (previousCampaign === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
+			else process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = previousCampaign;
+			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 });
