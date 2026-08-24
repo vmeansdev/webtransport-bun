@@ -35,16 +35,18 @@ import {
 	snapshotEvidenceValue,
 } from "./evidence.ts";
 import {
+	checkPromotionQuarantine,
+	readOfficialComparisonFile,
+	resolveOfficialComparisonOutputDir,
+	resolveOfficialComparisonOutputFile,
+} from "./output-policy.ts";
+import {
 	CANONICAL_CAPACITY_PROFILE,
 	CANONICAL_CONNECTION_SETUP,
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 } from "./scenario-registry.ts";
 import { sampleSummary } from "./stats.ts";
-import {
-	checkPromotionQuarantine,
-	resolveOfficialComparisonOutputDir,
-} from "./output-policy.ts";
 
 const EXPECTED_ADMISSION_KEYS = [
 	"schemaVersion",
@@ -2681,7 +2683,7 @@ export { artifactByteSha256 };
 
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
-	const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+	const { readdirSync, existsSync } = await import("node:fs");
 	const { join } = await import("node:path");
 
 	const candidate =
@@ -2719,8 +2721,13 @@ if (import.meta.main) {
 	let failed = 0;
 
 	for (const file of files) {
-		const filePath = join(dir, file);
-		const bytes = new Uint8Array(readFileSync(filePath));
+		const filePath = resolveOfficialComparisonOutputFile({
+			candidate,
+			campaignId,
+			outputDir: dir,
+			outputFile: join(dir, file),
+		});
+		const bytes = readOfficialComparisonFile(filePath);
 		let parsed: RunArtifact;
 		try {
 			parsed = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
@@ -2736,6 +2743,7 @@ if (import.meta.main) {
 			artifact: parsed,
 			externalTrustBound:
 				process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND,
+			expectedComparisonId: campaignId,
 		});
 
 		if (result.evidenceStatus === "PASS" && quarantine.promotable) {

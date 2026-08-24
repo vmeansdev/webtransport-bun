@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	rmSync,
 	symlinkSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,7 +18,9 @@ import {
 	LEGACY_SYNTHETIC_COMPARISON_ID,
 	LEGACY_SYNTHETIC_SOURCE_SHA,
 	resolveOfficialComparisonOutputDir,
+	resolveOfficialComparisonOutputFile,
 } from "./output-policy.ts";
+import { generateReport } from "./render-report.ts";
 
 const OFFICIAL_ROOT = ".release-evidence/transport-comparison";
 
@@ -133,6 +137,27 @@ describe("comparison output path quarantine", () => {
 		expect(resolved).toBe(expected);
 	});
 
+	test.each([
+		"NUL",
+		"NUL.txt",
+		"CON",
+		"CON.txt",
+		"comparison-report.md::$DATA",
+	])("rejects a Win32-reserved or ADS report leaf %s", (leaf) => {
+		const officialDir =
+			"C:\\repo\\.release-evidence\\transport-comparison\\candidate-1\\campaign-1";
+		expect(() =>
+			resolveOfficialComparisonOutputFile({
+				cwd: "C:\\repo",
+				candidate: "candidate-1",
+				campaignId: "campaign-1",
+				outputDir: officialDir,
+				outputFile: `${officialDir}\\${leaf}`,
+				platform: "win32",
+			} as never),
+		).toThrow();
+	});
+
 	test("rejects an existing symlink component instead of following it", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "wt-output-policy-"));
 		try {
@@ -213,13 +238,127 @@ describe("promotion quarantine", () => {
 		expect(result.promotable).toBe(false);
 	});
 
-	test("allows only measured evidence with a non-empty external trust bound", () => {
+	test("does not treat an arbitrary non-empty trust marker as validated", () => {
 		const result = checkPromotionQuarantine({
 			artifact: validEvidence(),
 			externalTrustBound: "trust-bound-1",
 		});
 
-		expect(result).toEqual({ promotable: true, reasons: [] });
+		expect(result.promotable).toBe(false);
+	});
+
+	test("rejects an artifact whose comparison ID is from another campaign", () => {
+		const result = checkPromotionQuarantine({
+			artifact: { ...validEvidence(), comparisonId: "campaign-2" },
+			externalTrustBound: "trust-bound-1",
+			expectedComparisonId: "campaign-1",
+		} as never);
+
+		expect(result.promotable).toBe(false);
+	});
+});
+
+describe("comparison publication containment", () => {
+	test("refuses to read a symlinked artifact leaf", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "wt-report-artifact-"));
+		const outside = mkdtempSync(join(tmpdir(), "wt-report-artifact-outside-"));
+		const previousCwd = process.cwd();
+		const previousCandidate = process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
+		const previousCampaign = process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
+		const previousTrust =
+			process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
+		try {
+			process.chdir(cwd);
+			process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = "candidate-1";
+			process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = "campaign-1";
+			process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND =
+				"trust-bound-1";
+			const officialDir = resolve(
+				cwd,
+				OFFICIAL_ROOT,
+				"candidate-1",
+				"campaign-1",
+			);
+			mkdirSync(officialDir, { recursive: true });
+			const outsideArtifact = join(outside, "artifact.json");
+			writeFileSync(outsideArtifact, JSON.stringify(validEvidence()));
+			symlinkSync(
+				outsideArtifact,
+				join(officialDir, "chat-fanout_subscribers-1000-ws.json"),
+			);
+
+			expect(() => generateReport()).toThrow(/symbolic link|symlink|artifact/i);
+		} finally {
+			process.chdir(previousCwd);
+			if (previousCandidate === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
+			else process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = previousCandidate;
+			if (previousCampaign === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
+			else process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = previousCampaign;
+			if (previousTrust === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
+			else
+				process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND =
+					previousTrust;
+			rmSync(cwd, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed when the report leaf is swapped after validation", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "wt-report-race-"));
+		const outside = mkdtempSync(join(tmpdir(), "wt-report-race-outside-"));
+		const previousCwd = process.cwd();
+		const previousCandidate = process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
+		const previousCampaign = process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
+		const trustKey = "WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND";
+		const previousTrustDescriptor = Object.getOwnPropertyDescriptor(
+			process.env,
+			trustKey,
+		);
+		try {
+			process.chdir(cwd);
+			process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = "candidate-1";
+			process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = "campaign-1";
+			const officialDir = resolve(
+				cwd,
+				OFFICIAL_ROOT,
+				"candidate-1",
+				"campaign-1",
+			);
+			mkdirSync(officialDir, { recursive: true });
+			const resolvedCwd = process.cwd();
+			const reportPath = resolveOfficialComparisonOutputFile({
+				cwd: resolvedCwd,
+				candidate: "candidate-1",
+				campaignId: "campaign-1",
+			});
+			const escapedReport = join(outside, "escaped-report.md");
+			Object.defineProperty(process.env, trustKey, {
+				configurable: true,
+				get() {
+					symlinkSync(escapedReport, reportPath);
+					return "trust-bound-1";
+				},
+			});
+
+			expect(() => generateReport()).toThrow(/symbolic link|symlink|output/i);
+			expect(existsSync(escapedReport)).toBe(false);
+		} finally {
+			process.chdir(previousCwd);
+			if (previousCandidate === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_CANDIDATE;
+			else process.env.WEBTRANSPORT_COMPARISON_CANDIDATE = previousCandidate;
+			if (previousCampaign === undefined)
+				delete process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN;
+			else process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN = previousCampaign;
+			if (previousTrustDescriptor)
+				Object.defineProperty(process.env, trustKey, previousTrustDescriptor);
+			else delete process.env[trustKey];
+			rmSync(cwd, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
 	});
 });
 

@@ -103,5 +103,8 @@ OUTPUT_DIR=".release-evidence/transport-comparison/$CANDIDATE/$CAMPAIGN_ID"
 ## Evidence & Verification Contract
 
 - Every run produces a JSON artifact with schema version `v1` and a SHA-256 byte digest.
+- An opaque external trust marker alone never promotes an artifact; evidence remains quarantined until the R1 external validation contract is implemented.
+- An artifact `comparisonId` must match the campaign directory identity; mismatches are rejected before comparison.
+- Artifact and report leaves reject symbolic links, and report publication uses a same-directory atomic write.
 - If any parameter, capacity hash, route proof, or certificate fingerprint diverges between arms, the comparator marks the cell `INCOMPATIBLE` and suppresses ranking.
 - Overload is an open-loop measured outcome; rate downshifting is strictly prohibited.
