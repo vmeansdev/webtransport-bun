@@ -6,7 +6,7 @@
  * 10.99.0.1 (Mac en8) ↔ 10.99.0.2 (Linux eno1) direct Ethernet link.
  *
  * Usage:
- *   bun tools/compare/run-campaign.ts [--scenarios all|<id,...>] [--transports both|ws|wt] [--output-dir ./evidence]
+ *   bun tools/compare/run-campaign.ts [--scenarios all|<id,...>] [--transports both|ws|wt] [--output-dir .release-evidence/transport-comparison/<candidate>/<campaign-id>]
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -15,6 +15,10 @@ import {
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
+import {
+	checkPromotionQuarantine,
+	resolveOfficialComparisonOutputDir,
+} from "./output-policy.ts";
 import { canonicalDigest, canonicalJson } from "./canonical.ts";
 import {
 	type AdmissionCounters,
@@ -35,13 +39,22 @@ export interface CampaignArgs {
 	readonly scenarios: readonly ScenarioId[];
 	readonly transports: "ws" | "wt" | "both";
 	readonly outputDir: string;
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly externalTrustBound?: string;
 	readonly help?: boolean;
 }
 
 export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
 	let scenarios: ScenarioId[] = [...SCENARIO_IDS];
 	let transports: "ws" | "wt" | "both" = "both";
-	let outputDir = "./evidence";
+	let outputDir: string | undefined;
+	let candidate =
+		process.env.WEBTRANSPORT_COMPARISON_CANDIDATE ?? "unbound-candidate";
+	let campaignId =
+		process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN ?? "campaign-unbound";
+	const externalTrustBound =
+		process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
 	let help = false;
 
 	for (let i = 0; i < argv.length; i++) {
@@ -72,6 +85,12 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
 		} else if (arg === "--output-dir") {
 			outputDir = argv[++i] ?? "";
 			if (!outputDir) throw new Error("Missing value for --output-dir");
+		} else if (arg === "--candidate") {
+			candidate = argv[++i] ?? "";
+			if (!candidate) throw new Error("Missing value for --candidate");
+		} else if (arg === "--campaign-id") {
+			campaignId = argv[++i] ?? "";
+			if (!campaignId) throw new Error("Missing value for --campaign-id");
 		} else {
 			throw new Error(`Unknown argument: ${arg}`);
 		}
@@ -80,7 +99,14 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
 	return {
 		scenarios,
 		transports,
-		outputDir,
+		candidate,
+		campaignId,
+		externalTrustBound,
+		outputDir: resolveOfficialComparisonOutputDir({
+			candidate,
+			campaignId,
+			outputDir,
+		}),
 		help,
 	};
 }
@@ -95,7 +121,9 @@ Usage:
 Options:
   --scenarios <list|all>   Comma-separated scenario IDs or 'all' (default: all)
   --transports <ws|wt|both> Transports to evaluate (default: both)
-  --output-dir <dir>       Directory to write evidence artifacts (default: ./evidence)
+  --candidate <id>         Candidate identity used in the official output path
+  --campaign-id <id>       Campaign identity used in the official output path
+  --output-dir <dir>       Official output directory (default: .release-evidence/transport-comparison/<candidate>/<campaign-id>)
   --help, -h               Show this help message
 `);
 }
@@ -436,8 +464,12 @@ function measureCellArm(
  * Execute the comparison campaign.
  */
 export async function runCampaign(args: CampaignArgs): Promise<void> {
-	const campaignId = `comparison-20260823-canonical`;
-	const outputDir = args.outputDir;
+	const campaignId = args.campaignId;
+	const outputDir = resolveOfficialComparisonOutputDir({
+		candidate: args.candidate,
+		campaignId,
+		outputDir: args.outputDir,
+	});
 
 	if (!existsSync(outputDir)) {
 		mkdirSync(outputDir, { recursive: true });
@@ -515,16 +547,24 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 			const verification = verifyRunArtifact(sealed, trustCtx);
 
 			totalRuns++;
-			if (verification.evidenceStatus === "PASS") {
+			const quarantine = checkPromotionQuarantine({
+				artifact,
+				externalTrustBound: args.externalTrustBound,
+			});
+			if (verification.evidenceStatus === "PASS" && quarantine.promotable) {
 				passRuns++;
 				const filename = `${cell.cellId.replace(/[\/:]/g, "_")}-${transport}.json`;
 				const filepath = join(outputDir, filename);
 				writeFileSync(filepath, sealed);
 				generatedArtifacts.push(filename);
 				console.log(`PASS (sealed ${sealed.byteLength} bytes -> ${filename})`);
-			} else {
+			} else if (verification.evidenceStatus !== "PASS") {
 				console.log(
 					`FAIL: ${verification.rejections.map((r) => r.code).join(", ")}`,
+				);
+			} else {
+				console.log(
+					`QUARANTINED: ${quarantine.reasons.map((r) => r.code).join(", ")}`,
 				);
 			}
 
@@ -564,7 +604,14 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				const overlayVerif = verifyRunArtifact(sealedOverlay, overlayTrustCtx);
 
 				totalRuns++;
-				if (overlayVerif.evidenceStatus === "PASS") {
+				const overlayQuarantine = checkPromotionQuarantine({
+					artifact: overlayArtifact,
+					externalTrustBound: args.externalTrustBound,
+				});
+				if (
+					overlayVerif.evidenceStatus === "PASS" &&
+					overlayQuarantine.promotable
+				) {
 					passRuns++;
 					const filename = `${cell.cellId.replace(/[\/:]/g, "_")}-ws-lossy-overlay.json`;
 					const filepath = join(outputDir, filename);
@@ -573,9 +620,13 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 					console.log(
 						`PASS (sealed ${sealedOverlay.byteLength} bytes -> ${filename})`,
 					);
-				} else {
+				} else if (overlayVerif.evidenceStatus !== "PASS") {
 					console.log(
 						`FAIL: ${overlayVerif.rejections.map((r) => r.code).join(", ")}`,
+					);
+				} else {
+					console.log(
+						`QUARANTINED: ${overlayQuarantine.reasons.map((r) => r.code).join(", ")}`,
 					);
 				}
 			}

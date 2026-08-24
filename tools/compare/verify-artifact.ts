@@ -41,6 +41,10 @@ import {
 	getScenarioCell,
 } from "./scenario-registry.ts";
 import { sampleSummary } from "./stats.ts";
+import {
+	checkPromotionQuarantine,
+	resolveOfficialComparisonOutputDir,
+} from "./output-policy.ts";
 
 const EXPECTED_ADMISSION_KEYS = [
 	"schemaVersion",
@@ -2680,7 +2684,15 @@ if (import.meta.main) {
 	const { readdirSync, readFileSync, existsSync } = await import("node:fs");
 	const { join } = await import("node:path");
 
-	const dir = process.argv[2] ?? "./evidence";
+	const candidate =
+		process.env.WEBTRANSPORT_COMPARISON_CANDIDATE ?? "unbound-candidate";
+	const campaignId =
+		process.env.WEBTRANSPORT_COMPARISON_CAMPAIGN ?? "campaign-unbound";
+	const dir = resolveOfficialComparisonOutputDir({
+		candidate,
+		campaignId,
+		outputDir: process.argv[2],
+	});
 	if (!existsSync(dir)) {
 		console.error(`[verify] Error: Directory '${dir}' does not exist.`);
 		process.exit(1);
@@ -2720,13 +2732,21 @@ if (import.meta.main) {
 
 		const trustCtx = trustContextForArtifact(parsed);
 		const result = verifyRunArtifact(bytes, trustCtx);
+		const quarantine = checkPromotionQuarantine({
+			artifact: parsed,
+			externalTrustBound:
+				process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND,
+		});
 
-		if (result.evidenceStatus === "PASS") {
+		if (result.evidenceStatus === "PASS" && quarantine.promotable) {
 			console.log(`[PASS] ${file} (${bytes.byteLength} bytes)`);
 			passed++;
 		} else {
 			console.log(
-				`[FAIL] ${file} -> ${result.rejections.map((r) => `${r.code}: ${r.reason}`).join("; ")}`,
+				`[${result.evidenceStatus === "PASS" ? "QUARANTINED" : "FAIL"}] ${file} -> ${[
+					...result.rejections.map((r) => `${r.code}: ${r.reason}`),
+					...quarantine.reasons.map((r) => `${r.code}: ${r.reason}`),
+				].join("; ")}`,
 			);
 			failed++;
 		}
