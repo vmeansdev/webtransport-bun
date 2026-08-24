@@ -279,8 +279,9 @@ The comparative benchmark harness evaluates Bun-native WebSocket against native 
 - **Mac Controller**: darwin-arm64, `10.99.0.1/en8`
 - **Linux Server**: linux-x86_64, `10.99.0.2/eno1`
 - **Tooling**: `tools/compare/`
-  - `bun run compare:run`: executes the multi-scenario campaign across transports.
-  - `bun run compare:verify`: validates individual run artifacts against the fail-closed evidence contract.
-  - `bun run compare:report`: renders markdown comparison reports with delta calculations and rankings.
+  - **Official comparison filesystem I/O is R1-deferred: compare:run, compare:verify, and compare:report are non-operational until validated staging supplies a trusted boundary.**
+  - `bun run compare:run`: intended future multi-scenario campaign entrypoint; currently fails closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`.
+  - `bun run compare:verify`: intended future artifact-verification entrypoint; currently fails closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`.
+  - `bun run compare:report`: intended future markdown-report entrypoint; currently fails closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`.
   - `bun run test:compare`: runs pure-driver and fake-backed test suite.
 - **Fail-closed guarantees**: Loopback, mismatched routes, invalid MTU, unequal capacity profiles, or corrupted digests immediately reject and suppress delta computation.

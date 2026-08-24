@@ -439,5 +439,16 @@ describe("authoritative comparison documentation", () => {
 		);
 		expect(docs).toContain("--candidate <candidate>");
 		expect(docs).toContain("--campaign-id <campaign-id>");
+
+		const testPlan = readFileSync(
+			resolve(import.meta.dir, "../../docs/TESTPLAN.md"),
+			"utf8",
+		);
+		expect(testPlan).toContain(
+			"Official comparison filesystem I/O is R1-deferred: compare:run, compare:verify, and compare:report are non-operational until validated staging supplies a trusted boundary.",
+		);
+		for (const command of ["compare:run", "compare:verify", "compare:report"]) {
+			expect(testPlan).not.toContain(`\`bun run ${command}\`: executes`);
+		}
 	});
 });
