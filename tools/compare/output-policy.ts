@@ -1,5 +1,25 @@
-import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { posix as posixPath, win32 as win32Path } from "node:path";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fstatSync,
+	fsyncSync,
+	lstatSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import {
+	basename as hostBasename,
+	dirname as hostDirname,
+	join as hostJoin,
+	resolve as hostResolve,
+	posix as posixPath,
+	win32 as win32Path,
+} from "node:path";
 
 /** The only repository location where comparison output may be generated. */
 export const OFFICIAL_COMPARISON_OUTPUT_ROOT =
@@ -21,6 +41,7 @@ export const ALL_F_SENTINEL_SHA256 = "f".repeat(64);
 export type ComparisonPathPlatform = "posix" | "win32";
 
 interface PathSemantics {
+	readonly basename: (path: string) => string;
 	readonly dirname: (path: string) => string;
 	readonly isAbsolute: (path: string) => boolean;
 	readonly join: (...paths: string[]) => string;
@@ -41,8 +62,12 @@ export type OutputPolicyRejectionCode =
 	| "OUTPUT_PATH_TRAVERSAL"
 	| "OUTPUT_PATH_OUTSIDE_ROOT"
 	| "OUTPUT_PATH_SYMLINK"
+	| "OUTPUT_FILE_INVALID"
 	| "OUTPUT_SEGMENT_INVALID"
 	| "EXTERNAL_TRUST_BOUND_MISSING"
+	| "EXTERNAL_TRUST_BOUND_UNVALIDATED"
+	| "COMPARISON_ID_MISSING"
+	| "COMPARISON_ID_MISMATCH"
 	| "ARTIFACT_NOT_MEASURED"
 	| "ARTIFACT_NOT_PROMOTABLE"
 	| "LEGACY_SYNTHETIC_COMPARISON"
@@ -72,10 +97,12 @@ export interface ComparisonOutputFileInput extends ComparisonOutputPathInput {
 
 export interface PromotionQuarantineInput {
 	readonly artifact: unknown;
+	/** The campaign identity bound to the containing official output directory. */
+	readonly expectedComparisonId?: unknown;
 	/**
-	 * An opaque marker supplied by the external run/lock authority.  This
-	 * policy deliberately does not define its schema; the evidence contract
-	 * owns that concern.
+	 * An opaque marker supplied by the external run/lock authority.  R0 does
+	 * not define or validate its schema, so every supplied marker remains
+	 * quarantined until the R1 evidence contract owns that validation.
 	 */
 	readonly externalTrustBound?: unknown;
 }
@@ -104,6 +131,10 @@ function record(value: unknown): Record<string, unknown> | undefined {
 function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
+
+const NO_FOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
+
+let temporaryWriteSequence = 0;
 
 function pathSegments(value: string): string[] {
 	return value.split(/[\\/]+/u).filter((segment) => segment.length > 0);
@@ -218,6 +249,153 @@ function assertNoSymlinkComponents(
 		);
 }
 
+function assertSafeOutputLeaf(pathname: string): void {
+	try {
+		const stat = lstatSync(pathname);
+		if (stat.isSymbolicLink())
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_PATH_SYMLINK",
+				"comparison output file must not be a symbolic link",
+			);
+		if (!stat.isFile())
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_FILE_INVALID",
+				"comparison output file must be a regular file",
+			);
+	} catch (error: unknown) {
+		if (error instanceof ComparisonOutputPolicyError) throw error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
+function assertSafeOutputParent(pathname: string): void {
+	const parent = hostDirname(pathname);
+	try {
+		const stat = lstatSync(parent);
+		if (stat.isSymbolicLink() || !stat.isDirectory())
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_PATH_SYMLINK",
+				"comparison output parent must be a real directory",
+			);
+		const lexicalParent = hostResolve(parent);
+		if (realpathSync(parent) !== lexicalParent)
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_PATH_SYMLINK",
+				"comparison output parent resolves through a symbolic link",
+			);
+	} catch (error: unknown) {
+		if (error instanceof ComparisonOutputPolicyError) throw error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		throw new ComparisonOutputPolicyError(
+			"OUTPUT_FILE_INVALID",
+			"comparison output parent directory does not exist",
+		);
+	}
+}
+
+/**
+ * Read a campaign leaf without following a symbolic link between validation
+ * and open.  The no-follow flag is available on the supported Unix hosts;
+ * lstat remains the fallback on runtimes that do not expose it.
+ */
+export function readOfficialComparisonFile(pathname: string): Uint8Array {
+	assertSafeOutputLeaf(pathname);
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(pathname, constants.O_RDONLY | NO_FOLLOW_FLAG);
+		if (realpathSync(pathname) !== hostResolve(pathname))
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_PATH_SYMLINK",
+				"comparison input became a symbolic link before it was read",
+			);
+		if (!fstatSync(descriptor).isFile())
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_FILE_INVALID",
+				"comparison input must be a regular file",
+			);
+		return new Uint8Array(readFileSync(descriptor));
+	} catch (error: unknown) {
+		if (error instanceof ComparisonOutputPolicyError) throw error;
+		if ((error as NodeJS.ErrnoException).code === "ELOOP")
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_PATH_SYMLINK",
+				"comparison input became a symbolic link before it was opened",
+			);
+		throw error;
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+	}
+}
+
+/**
+ * Publish a campaign leaf through a same-directory temporary file and atomic
+ * rename.  The destination is rechecked before publication and temporary
+ * files are always removed on failure.
+ */
+export function writeOfficialComparisonFile(
+	pathname: string,
+	contents: Uint8Array | string,
+): void {
+	assertSafeOutputParent(pathname);
+	assertSafeOutputLeaf(pathname);
+
+	const parent = hostDirname(pathname);
+	const leaf = hostBasename(pathname);
+	let temporaryPath: string | undefined;
+	let descriptor: number | undefined;
+	try {
+		for (let attempt = 0; attempt < 16; attempt++) {
+			const sequence = temporaryWriteSequence++;
+			const candidate = hostJoin(
+				parent,
+				`.${leaf}.tmp-${process.pid}-${sequence}`,
+			);
+			try {
+				descriptor = openSync(
+					candidate,
+					constants.O_WRONLY |
+						constants.O_CREAT |
+						constants.O_EXCL |
+						NO_FOLLOW_FLAG,
+					0o600,
+				);
+				temporaryPath = candidate;
+				if (realpathSync(candidate) !== hostResolve(candidate))
+					throw new ComparisonOutputPolicyError(
+						"OUTPUT_PATH_SYMLINK",
+						"comparison temporary file escaped its campaign directory",
+					);
+				break;
+			} catch (error: unknown) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+		}
+		if (descriptor === undefined || temporaryPath === undefined)
+			throw new ComparisonOutputPolicyError(
+				"OUTPUT_FILE_INVALID",
+				"could not allocate a unique comparison output temporary file",
+			);
+		writeFileSync(descriptor, contents);
+		fsyncSync(descriptor);
+		closeSync(descriptor);
+		descriptor = undefined;
+
+		// A destination symlink that appeared after the first check is rejected
+		// before rename; rename itself never follows the destination leaf.
+		assertSafeOutputParent(pathname);
+		assertSafeOutputLeaf(pathname);
+		renameSync(temporaryPath, pathname);
+		temporaryPath = undefined;
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+		if (temporaryPath !== undefined) {
+			try {
+				unlinkSync(temporaryPath);
+			} catch {}
+		}
+	}
+}
+
 /** Resolve a report file whose parent is the already-validated campaign dir. */
 export function resolveOfficialComparisonOutputFile(
 	input: ComparisonOutputFileInput,
@@ -244,6 +422,11 @@ export function resolveOfficialComparisonOutputFile(
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_OUTSIDE_ROOT",
 			"comparison report must be written directly inside the official campaign directory",
+		);
+	if (!validPathSegment(paths.basename(resolvedFile)))
+		throw new ComparisonOutputPolicyError(
+			"OUTPUT_SEGMENT_INVALID",
+			"comparison output leaf contains reserved, alternate-stream, or unsafe syntax",
 		);
 	if (
 		platform === HOST_PATH_PLATFORM &&
@@ -342,6 +525,27 @@ export function checkPromotionQuarantine(
 			"EXTERNAL_TRUST_BOUND_MISSING",
 			"externalTrustBound is required before evidence can be promoted",
 			"$.externalTrustBound",
+		);
+	else
+		addReason(
+			reasons,
+			"EXTERNAL_TRUST_BOUND_UNVALIDATED",
+			"externalTrustBound is opaque until the external run/lock schema validates it",
+			"$.externalTrustBound",
+		);
+	if (!isNonEmptyString(input.expectedComparisonId))
+		addReason(
+			reasons,
+			"COMPARISON_ID_MISSING",
+			"expectedComparisonId is required at the promotion boundary",
+			"$.expectedComparisonId",
+		);
+	else if (artifact?.comparisonId !== input.expectedComparisonId)
+		addReason(
+			reasons,
+			"COMPARISON_ID_MISMATCH",
+			"artifact comparisonId does not match the containing campaign",
+			"$.comparisonId",
 		);
 	if (artifact?.artifactKind !== "measured")
 		addReason(

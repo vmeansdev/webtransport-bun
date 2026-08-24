@@ -9,16 +9,12 @@
  *   bun tools/compare/run-campaign.ts [--scenarios all|<id,...>] [--transports both|ws|wt] [--output-dir .release-evidence/transport-comparison/<candidate>/<campaign-id>]
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
 	buildRunArtifact,
 	trustContextForArtifact,
 } from "./artifact-builder.ts";
-import {
-	checkPromotionQuarantine,
-	resolveOfficialComparisonOutputDir,
-} from "./output-policy.ts";
 import { canonicalDigest, canonicalJson } from "./canonical.ts";
 import {
 	type AdmissionCounters,
@@ -27,6 +23,12 @@ import {
 	sealRunArtifact,
 	type Transport,
 } from "./evidence.ts";
+import {
+	checkPromotionQuarantine,
+	resolveOfficialComparisonOutputDir,
+	resolveOfficialComparisonOutputFile,
+	writeOfficialComparisonFile,
+} from "./output-policy.ts";
 import {
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
@@ -511,7 +513,7 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 		const balancedOrder = balancedArmOrder(42, 1);
 
 		for (const transport of transportsToRun) {
-			const runId = `run-${cell.cellId.replace(/[\/:]/g, "-")}`;
+			const runId = `run-${cell.cellId.replace(/[/:]/g, "-")}`;
 			process.stdout.write(
 				`  -> [${transport.toUpperCase()}] running ${runId}... `,
 			);
@@ -550,12 +552,18 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 			const quarantine = checkPromotionQuarantine({
 				artifact,
 				externalTrustBound: args.externalTrustBound,
+				expectedComparisonId: campaignId,
 			});
 			if (verification.evidenceStatus === "PASS" && quarantine.promotable) {
 				passRuns++;
-				const filename = `${cell.cellId.replace(/[\/:]/g, "_")}-${transport}.json`;
-				const filepath = join(outputDir, filename);
-				writeFileSync(filepath, sealed);
+				const filename = `${cell.cellId.replace(/[/:]/g, "_")}-${transport}.json`;
+				const filepath = resolveOfficialComparisonOutputFile({
+					candidate: args.candidate,
+					campaignId,
+					outputDir,
+					outputFile: join(outputDir, filename),
+				});
+				writeOfficialComparisonFile(filepath, sealed);
 				generatedArtifacts.push(filename);
 				console.log(`PASS (sealed ${sealed.byteLength} bytes -> ${filename})`);
 			} else if (verification.evidenceStatus !== "PASS") {
@@ -570,7 +578,7 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 
 			// If game-tick-loss and transport is WS, also generate labeled ws-lossy-overlay
 			if (cell.scenarioId === "game-tick-loss" && transport === "ws") {
-				const overlayRunId = `run-${cell.cellId.replace(/[\/:]/g, "-")}-ws-lossy-overlay`;
+				const overlayRunId = `run-${cell.cellId.replace(/[/:]/g, "-")}-ws-lossy-overlay`;
 				process.stdout.write(`  -> [WS-OVERLAY] running ${overlayRunId}... `);
 
 				const overlayMeasurement = measureCellArm(
@@ -607,15 +615,21 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 				const overlayQuarantine = checkPromotionQuarantine({
 					artifact: overlayArtifact,
 					externalTrustBound: args.externalTrustBound,
+					expectedComparisonId: campaignId,
 				});
 				if (
 					overlayVerif.evidenceStatus === "PASS" &&
 					overlayQuarantine.promotable
 				) {
 					passRuns++;
-					const filename = `${cell.cellId.replace(/[\/:]/g, "_")}-ws-lossy-overlay.json`;
-					const filepath = join(outputDir, filename);
-					writeFileSync(filepath, sealedOverlay);
+					const filename = `${cell.cellId.replace(/[/:]/g, "_")}-ws-lossy-overlay.json`;
+					const filepath = resolveOfficialComparisonOutputFile({
+						candidate: args.candidate,
+						campaignId,
+						outputDir,
+						outputFile: join(outputDir, filename),
+					});
+					writeOfficialComparisonFile(filepath, sealedOverlay);
 					generatedArtifacts.push(filename);
 					console.log(
 						`PASS (sealed ${sealedOverlay.byteLength} bytes -> ${filename})`,
@@ -642,10 +656,13 @@ export async function runCampaign(args: CampaignArgs): Promise<void> {
 		passRuns,
 		artifacts: generatedArtifacts,
 	};
-	writeFileSync(
-		join(outputDir, "manifest.json"),
-		JSON.stringify(manifest, null, 2),
-	);
+	const manifestPath = resolveOfficialComparisonOutputFile({
+		candidate: args.candidate,
+		campaignId,
+		outputDir,
+		outputFile: join(outputDir, "manifest.json"),
+	});
+	writeOfficialComparisonFile(manifestPath, JSON.stringify(manifest, null, 2));
 
 	console.log(
 		`\n===============================================================`,

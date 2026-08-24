@@ -7,15 +7,17 @@
  * source of comparison truth.
  */
 
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
 import { metricContractForScenario, type RunArtifact } from "./evidence.ts";
 import {
 	checkPromotionQuarantine,
+	readOfficialComparisonFile,
 	resolveOfficialComparisonOutputDir,
 	resolveOfficialComparisonOutputFile,
+	writeOfficialComparisonFile,
 } from "./output-policy.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 
@@ -148,11 +150,18 @@ export function generateReport(
 		process.env.WEBTRANSPORT_COMPARISON_EXTERNAL_TRUST_BOUND;
 	const artifactMap = new Map<string, RunArtifact>();
 	for (const file of files) {
-		const bytes = new Uint8Array(readFileSync(join(officialDir, file)));
+		const artifactPath = resolveOfficialComparisonOutputFile({
+			candidate,
+			campaignId,
+			outputDir: officialDir,
+			outputFile: join(officialDir, file),
+		});
+		const bytes = readOfficialComparisonFile(artifactPath);
 		const artifact = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
 		const quarantine = checkPromotionQuarantine({
 			artifact,
 			externalTrustBound,
+			expectedComparisonId: campaignId,
 		});
 		if (quarantine.promotable) artifactMap.set(file, artifact);
 	}
@@ -181,8 +190,20 @@ export function generateReport(
 			continue;
 		}
 
-		const wsBytes = new Uint8Array(readFileSync(join(officialDir, wsFile)));
-		const wtBytes = new Uint8Array(readFileSync(join(officialDir, wtFile)));
+		const wsPath = resolveOfficialComparisonOutputFile({
+			candidate,
+			campaignId,
+			outputDir: officialDir,
+			outputFile: join(officialDir, wsFile),
+		});
+		const wtPath = resolveOfficialComparisonOutputFile({
+			candidate,
+			campaignId,
+			outputDir: officialDir,
+			outputFile: join(officialDir, wtFile),
+		});
+		const wsBytes = readOfficialComparisonFile(wsPath);
+		const wtBytes = readOfficialComparisonFile(wtPath);
 		const result = compareRunArtifacts(wsBytes, wtBytes, {
 			ws: trustContextForArtifact(wsArtifact),
 			wt: trustContextForArtifact(wtArtifact),
@@ -240,7 +261,7 @@ export function generateReport(
 		comparisons,
 	};
 	const markdown = renderMarkdownReport(summary);
-	writeFileSync(reportPath, markdown, "utf8");
+	writeOfficialComparisonFile(reportPath, markdown);
 	console.log(
 		`[report] Generated Markdown report at '${reportPath}' (${markdown.length} bytes, ${summary.comparableCells}/${summary.totalCells} cells comparable).`,
 	);
