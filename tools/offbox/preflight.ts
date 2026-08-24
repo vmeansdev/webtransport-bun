@@ -36,6 +36,7 @@
 import { mkdirSync } from "node:fs";
 import { arch, cpus, hostname, platform, totalmem } from "node:os";
 import { dirname } from "node:path";
+import { canonicalGeneratorIdentity } from "./host-identity.ts";
 import {
 	chooseRttBaseline,
 	DEFAULT_CABLE_SUBNET,
@@ -423,7 +424,7 @@ async function main(): Promise<void> {
 		schemaVersion: PREFLIGHT_SCHEMA_VERSION,
 		startedAt,
 		generator: {
-			hostname: hostname(),
+			hostname: canonicalGeneratorIdentity(hostname()),
 			platform: platform(),
 			arch: arch(),
 			cpus: cpus().length,

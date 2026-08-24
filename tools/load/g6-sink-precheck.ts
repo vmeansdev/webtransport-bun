@@ -39,6 +39,7 @@ import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 
+import { canonicalGeneratorIdentity } from "../offbox/host-identity.ts";
 import {
 	armShape,
 	gateRung,
@@ -285,7 +286,7 @@ async function main(): Promise<number> {
 		jitterMs: sum.jitter_ms ?? null,
 		seconds,
 		rawEndSum: endSum,
-		host: hostname(),
+		host: canonicalGeneratorIdentity(hostname()),
 		dateIso: new Date().toISOString(),
 	});
 
