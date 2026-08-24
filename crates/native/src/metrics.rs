@@ -99,7 +99,9 @@ pub struct QuicConnectionStats {
     /// UDP payload bytes sent/received on the connection (wire bytes).
     pub bytes_sent: f64,
     pub bytes_received: f64,
-    /// QUIC packets sent/received/lost.
+    /// QUIC packets sent/lost. `packets_received` is the legacy receive field:
+    /// the pinned quinn release exposes received UDP datagrams, not a separate
+    /// received QUIC-packet total, so it aliases `udp_datagrams_received`.
     pub packets_sent: f64,
     pub packets_received: f64,
     pub packets_lost: f64,

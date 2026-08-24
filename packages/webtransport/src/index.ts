@@ -2487,7 +2487,14 @@ class NativeClientSession implements ClientSession {
 	}
 }
 
-/** Wire-level QUIC connection stats reported by the native layer. */
+/**
+ * Wire-level QUIC connection stats reported by the native layer.
+ *
+ * @internal Unstable diagnostic surface for source-bound evidence. It is not
+ * part of the supported W3C or Node client contract. `packetsReceived` is a
+ * legacy alias of `udpDatagramsReceived` because the pinned Quinn version does
+ * not expose a distinct received QUIC-packet total.
+ */
 export interface QuicConnectionStats {
 	rttMs: number;
 	bytesSent: number;
