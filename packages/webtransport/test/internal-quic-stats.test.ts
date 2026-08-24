@@ -4,6 +4,7 @@ import {
 	type QuicConnectionStats,
 	type ServerSession,
 } from "../src/index.js";
+import { __TESTING__ } from "../src/internal.js";
 import { readWithTimeout, withTimeout } from "./helpers/harness.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 
@@ -12,6 +13,24 @@ type InternalStatsSession = ServerSession & {
 };
 
 describe("internal QUIC transport counters", () => {
+	test("returns null when an older native handle has no stats hook", () => {
+		for (const makeSession of [
+			__TESTING__.createNativeServerSessionForTests,
+			__TESTING__.createNativeClientSessionForTests,
+		]) {
+			const absent = makeSession({
+				close: () => {},
+			}) as unknown as InternalStatsSession;
+			expect(absent._connectionStats?.()).toBeNull();
+
+			const unavailable = makeSession({
+				close: () => {},
+				connectionStats: () => null,
+			}) as unknown as InternalStatsSession;
+			expect(unavailable._connectionStats?.()).toBeNull();
+		}
+	});
+
 	test("reports raw DATAGRAM-frame and UDP-datagram stages without extending public getStats", async () => {
 		const port = nextPort(24800, 400);
 		let resolveSession!: (session: ServerSession) => void;
