@@ -52,9 +52,30 @@ Both transports use identical submitted capacity and admission control settings:
 9. **`bulk-one-way`**: Exactly 100 MiB transfer in 64 KiB chunks over one connection / stream; baseline vs delay40-loss1%.
 10. **`tail-under-cross-traffic`**: 1 Hz control ping-ack during concurrent 700 Mbps bulk transfer; tests head-of-line stream isolation.
 
+## Current Evidence Status
+
+Real comparison measurements remain absent until a fresh campaign has run with
+the Linux role on the required `10.99.0.2/eno1` host and the Mac role on the
+required `10.99.0.1/en8` host. Historical, synthetic, and pure-test outputs
+are not measured comparison evidence and cannot populate a numeric result.
+
 ## Tooling Commands
 
-- **Run Pure/Fake Test Suite**:
+The official output directory is
+`.release-evidence/transport-comparison/<candidate>/<campaign-id>/`. It is
+ignored by Git and must be selected by explicit candidate and campaign
+identities. The campaign CLI accepts `--candidate <candidate>` and
+`--campaign-id <campaign-id>` for those path segments:
+
+```bash
+CANDIDATE="<candidate>"
+CAMPAIGN_ID="<campaign-id>"
+export WEBTRANSPORT_COMPARISON_CANDIDATE="$CANDIDATE"
+export WEBTRANSPORT_COMPARISON_CAMPAIGN="$CAMPAIGN_ID"
+OUTPUT_DIR=".release-evidence/transport-comparison/$CANDIDATE/$CAMPAIGN_ID"
+```
+
+- **Run Pure Policy/CLI Test Suite**:
   ```bash
   bun run test:compare
   ```
@@ -68,15 +89,15 @@ Both transports use identical submitted capacity and admission control settings:
   ```
 - **Execute Full Campaign**:
   ```bash
-  bun run compare:run --scenarios all --transports both --output-dir ./evidence
+  bun run compare:run --scenarios all --transports both --candidate "$CANDIDATE" --campaign-id "$CAMPAIGN_ID" --output-dir "$OUTPUT_DIR"
   ```
 - **Verify Run Artifacts**:
   ```bash
-  bun run compare:verify --artifact ./evidence/run-1.json
+  bun run compare:verify "$OUTPUT_DIR"
   ```
 - **Render Comparison Report**:
   ```bash
-  bun run compare:report --input-dir ./evidence --output ./report.md
+  bun run compare:report "$OUTPUT_DIR"
   ```
 
 ## Evidence & Verification Contract
