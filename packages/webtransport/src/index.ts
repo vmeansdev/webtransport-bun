@@ -1979,6 +1979,14 @@ class NativeServerSession implements ServerSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
+	_connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2487,6 +2495,14 @@ export interface QuicConnectionStats {
 	packetsSent: number;
 	packetsReceived: number;
 	packetsLost: number;
+	/** @internal Application DATAGRAM frames emitted/consumed by QUIC. */
+	datagramFramesSent?: number | null;
+	/** @internal Application DATAGRAM frames emitted/consumed by QUIC. */
+	datagramFramesReceived?: number | null;
+	/** @internal UDP datagrams emitted/consumed by QUIC. */
+	udpDatagramsSent?: number | null;
+	/** @internal UDP datagrams emitted/consumed by QUIC. */
+	udpDatagramsReceived?: number | null;
 	maxDatagramSize?: number | null;
 }
 

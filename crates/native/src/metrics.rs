@@ -103,12 +103,22 @@ pub struct QuicConnectionStats {
     pub packets_sent: f64,
     pub packets_received: f64,
     pub packets_lost: f64,
+    /// Application DATAGRAM frames emitted/consumed by QUIC.
+    pub datagram_frames_sent: f64,
+    pub datagram_frames_received: f64,
+    /// UDP datagrams emitted/consumed by QUIC. These remain distinct from
+    /// application DATAGRAM frames because one UDP datagram can carry other
+    /// frame classes and transport batching can change their relationship.
+    pub udp_datagrams_sent: f64,
+    pub udp_datagrams_received: f64,
     /// Current max datagram payload size for this path (None until known).
     pub max_datagram_size: Option<u32>,
 }
 
-pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStats {
-    let stats = conn.quic_connection().stats();
+fn quic_stats_from_snapshot(
+    stats: &wtransport::quinn::ConnectionStats,
+    max_datagram_size: Option<usize>,
+) -> QuicConnectionStats {
     QuicConnectionStats {
         rtt_ms: stats.path.rtt.as_secs_f64() * 1000.0,
         bytes_sent: stats.udp_tx.bytes as f64,
@@ -116,8 +126,17 @@ pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStat
         packets_sent: stats.path.sent_packets as f64,
         packets_received: stats.udp_rx.datagrams as f64,
         packets_lost: stats.path.lost_packets as f64,
-        max_datagram_size: conn.max_datagram_size().map(|n| n as u32),
+        datagram_frames_sent: stats.frame_tx.datagram as f64,
+        datagram_frames_received: stats.frame_rx.datagram as f64,
+        udp_datagrams_sent: stats.udp_tx.datagrams as f64,
+        udp_datagrams_received: stats.udp_rx.datagrams as f64,
+        max_datagram_size: max_datagram_size.map(|n| n as u32),
     }
+}
+
+pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStats {
+    let stats = conn.quic_connection().stats();
+    quic_stats_from_snapshot(&stats, conn.max_datagram_size())
 }
 
 #[napi(object)]
@@ -141,4 +160,36 @@ pub struct ClientPoolMetricsSnapshot {
     pub misses: u32,
     pub evict_idle: u32,
     pub evict_broken: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quic_stats_from_snapshot;
+
+    #[test]
+    fn quic_stats_snapshot_maps_raw_datagram_stages_exactly() {
+        let mut raw = wtransport::quinn::ConnectionStats::default();
+        raw.path.rtt = std::time::Duration::from_micros(2_500);
+        raw.frame_tx.datagram = 17;
+        raw.frame_rx.datagram = 19;
+        raw.udp_tx.datagrams = 23;
+        raw.udp_rx.datagrams = 29;
+        raw.udp_tx.bytes = 31;
+        raw.udp_rx.bytes = 37;
+        raw.path.sent_packets = 41;
+        raw.path.lost_packets = 43;
+
+        let mapped = quic_stats_from_snapshot(&raw, Some(1_200));
+
+        assert_eq!(mapped.datagram_frames_sent, 17.0);
+        assert_eq!(mapped.datagram_frames_received, 19.0);
+        assert_eq!(mapped.udp_datagrams_sent, 23.0);
+        assert_eq!(mapped.udp_datagrams_received, 29.0);
+        assert_eq!(mapped.bytes_sent, 31.0);
+        assert_eq!(mapped.bytes_received, 37.0);
+        assert_eq!(mapped.packets_sent, 41.0);
+        assert_eq!(mapped.packets_lost, 43.0);
+        assert_eq!(mapped.max_datagram_size, Some(1_200));
+        assert_eq!(mapped.rtt_ms, 2.5);
+    }
 }
