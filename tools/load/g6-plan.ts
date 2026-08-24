@@ -19,6 +19,11 @@
  * pre-registration states in prose.
  */
 
+/** Successor authority that freezes G6 closeout grading inputs and rules. */
+export const G6_CLOSEOUT_SPEC_ID = "g6-mmo-closeout/1";
+export const G6_CLOSEOUT_SPEC_PATH =
+	"docs/research/preregistrations/gate-g6-mmo-closeout.md";
+
 /* -------------------------------------------------------------------------- */
 /* Scenario constants — the MMO, not the rig                                  */
 /* -------------------------------------------------------------------------- */
