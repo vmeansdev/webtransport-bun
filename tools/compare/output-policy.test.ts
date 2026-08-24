@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -89,11 +95,42 @@ describe("comparison output path quarantine", () => {
 	])("rejects unsafe candidate/campaign pair %j", (candidate, campaignId) => {
 		expect(() =>
 			resolveOfficialComparisonOutputDir({
-				cwd: "/tmp/ws-wt-policy",
+				cwd: "/private/tmp/ws-wt-policy",
 				candidate,
 				campaignId,
 			} as never),
 		).toThrow();
+	});
+
+	test.each([
+		["candidate:1", "campaign-1"],
+		["candidate-1", "campaign:1"],
+		["CON", "campaign-1"],
+		["candidate-1", "NUL.txt"],
+		["candidate.", "campaign-1"],
+		["candidate-1", "campaign-1 "],
+	])("rejects cross-platform identity syntax %j", (candidate, campaignId) => {
+		expect(() =>
+			resolveOfficialComparisonOutputDir({
+				cwd: "/private/tmp/ws-wt-policy",
+				candidate,
+				campaignId,
+			} as never),
+		).toThrow();
+	});
+
+	test("accepts a valid Windows official path with injected win32 handling", () => {
+		const expected =
+			"C:\\repo\\.release-evidence\\transport-comparison\\candidate-1\\campaign-1";
+		const resolved = resolveOfficialComparisonOutputDir({
+			cwd: "C:\\repo",
+			candidate: "candidate-1",
+			campaignId: "campaign-1",
+			outputDir: expected,
+			platform: "win32",
+		} as never);
+
+		expect(resolved).toBe(expected);
 	});
 
 	test("rejects an existing symlink component instead of following it", () => {
@@ -183,5 +220,23 @@ describe("promotion quarantine", () => {
 		});
 
 		expect(result).toEqual({ promotable: true, reasons: [] });
+	});
+});
+
+describe("authoritative comparison documentation", () => {
+	test("documents only the official candidate/campaign output layout", () => {
+		const docs = readFileSync(
+			resolve(import.meta.dir, "../../docs/TRANSPORT_COMPARISON.md"),
+			"utf8",
+		);
+
+		expect(docs).not.toContain("./evidence");
+		expect(docs).not.toContain("--artifact");
+		expect(docs).not.toContain("--input-dir");
+		expect(docs).toContain(
+			".release-evidence/transport-comparison/<candidate>/<campaign-id>",
+		);
+		expect(docs).toContain("--candidate <candidate>");
+		expect(docs).toContain("--campaign-id <campaign-id>");
 	});
 });

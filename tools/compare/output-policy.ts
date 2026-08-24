@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { posix as posixPath, win32 as win32Path } from "node:path";
 
 /** The only repository location where comparison output may be generated. */
 export const OFFICIAL_COMPARISON_OUTPUT_ROOT =
@@ -17,6 +17,23 @@ export const EMPTY_SHA256 =
 
 /** Sentinel used by the pre-quarantine producer for uncollected sidecars. */
 export const ALL_F_SENTINEL_SHA256 = "f".repeat(64);
+
+export type ComparisonPathPlatform = "posix" | "win32";
+
+interface PathSemantics {
+	readonly dirname: (path: string) => string;
+	readonly isAbsolute: (path: string) => boolean;
+	readonly join: (...paths: string[]) => string;
+	readonly relative: (from: string, to: string) => string;
+	readonly resolve: (...paths: string[]) => string;
+}
+
+const HOST_PATH_PLATFORM: ComparisonPathPlatform =
+	process.platform === "win32" ? "win32" : "posix";
+
+function pathSemantics(platform: ComparisonPathPlatform): PathSemantics {
+	return platform === "win32" ? win32Path : posixPath;
+}
 
 export type OutputPolicyRejectionCode =
 	| "OUTPUT_PATH_MISSING"
@@ -45,6 +62,8 @@ export interface ComparisonOutputPathInput {
 	readonly candidate: string;
 	readonly campaignId: string;
 	readonly outputDir?: string;
+	/** Override path spelling for lexical tests; defaults to the host platform. */
+	readonly platform?: ComparisonPathPlatform;
 }
 
 export interface ComparisonOutputFileInput extends ComparisonOutputPathInput {
@@ -90,6 +109,13 @@ function pathSegments(value: string): string[] {
 	return value.split(/[\\/]+/u).filter((segment) => segment.length > 0);
 }
 
+function isPathOutsideRoot(value: string, paths: PathSemantics): boolean {
+	return (
+		paths.isAbsolute(value) ||
+		pathSegments(value).some((segment) => segment === "..")
+	);
+}
+
 function rejectUnsafePathAlias(value: string): boolean {
 	const segments = pathSegments(value);
 	for (const [index, segment] of segments.entries()) {
@@ -102,16 +128,22 @@ function rejectUnsafePathAlias(value: string): boolean {
 }
 
 function validPathSegment(value: unknown): value is string {
-	return (
-		isNonEmptyString(value) &&
-		value !== "." &&
-		value !== ".." &&
-		!/[\\/]/u.test(value) &&
-		Array.from(value).every((character) => {
-			const codePoint = character.codePointAt(0) ?? 0;
-			return codePoint >= 0x20 && codePoint !== 0x7f;
-		})
-	);
+	if (
+		!isNonEmptyString(value) ||
+		value !== value.trim() ||
+		value === "." ||
+		value === ".." ||
+		/[\\/:]/u.test(value) ||
+		/[. ]$/u.test(value) ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value) ||
+		/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/iu.test(value)
+	)
+		return false;
+
+	return Array.from(value).every((character) => {
+		const codePoint = character.codePointAt(0) ?? 0;
+		return codePoint >= 0x20 && codePoint !== 0x7f;
+	});
 }
 
 /**
@@ -119,21 +151,34 @@ function validPathSegment(value: unknown): value is string {
  * directories.  The caller uses this only as a second, read-only containment
  * check after rejecting explicit symlink components.
  */
-function realPathWithMissingSuffix(pathname: string): string {
+function realPathWithMissingSuffix(
+	pathname: string,
+	paths: PathSemantics,
+): string {
 	let existing = pathname;
 	const missing: string[] = [];
 	while (!existsSync(existing)) {
-		const parent = dirname(existing);
-		if (parent === existing) return resolve(pathname);
-		missing.unshift(existing.slice(parent.length + 1));
+		const parent = paths.dirname(existing);
+		if (parent === existing) return paths.resolve(pathname);
+		const suffix = paths.relative(parent, existing);
+		if (suffix) missing.unshift(suffix);
 		existing = parent;
 	}
-	return resolve(realpathSync(existing), ...missing);
+	return paths.resolve(realpathSync(existing), ...missing);
 }
 
-function assertNoSymlinkComponents(cwd: string, target: string): void {
-	const lexicalCwd = resolve(cwd);
-	const realCwd = realPathWithMissingSuffix(lexicalCwd);
+function assertNoSymlinkComponents(
+	cwd: string,
+	target: string,
+	paths: PathSemantics,
+	platform: ComparisonPathPlatform,
+): void {
+	// A lexical win32 test on a non-Windows host must not ask the host filesystem
+	// to resolve a drive path. Real-host invocations retain the symlink checks.
+	if (platform !== HOST_PATH_PLATFORM) return;
+
+	const lexicalCwd = paths.resolve(cwd);
+	const realCwd = realPathWithMissingSuffix(lexicalCwd, paths);
 	if (realCwd !== lexicalCwd)
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_SYMLINK",
@@ -147,8 +192,8 @@ function assertNoSymlinkComponents(cwd: string, target: string): void {
 			"comparison output cwd must not be a symbolic link",
 		);
 
-	const suffix = relative(current, target);
-	if (suffix.startsWith("..") || isAbsolute(suffix))
+	const suffix = paths.relative(current, target);
+	if (isPathOutsideRoot(suffix, paths))
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_OUTSIDE_ROOT",
 			"comparison output path escaped its working directory",
@@ -156,7 +201,7 @@ function assertNoSymlinkComponents(cwd: string, target: string): void {
 
 	for (const segment of suffix.split(/[\\/]+/u)) {
 		if (!segment) continue;
-		current = join(current, segment);
+		current = paths.join(current, segment);
 		if (existsSync(current) && lstatSync(current).isSymbolicLink())
 			throw new ComparisonOutputPolicyError(
 				"OUTPUT_PATH_SYMLINK",
@@ -164,8 +209,9 @@ function assertNoSymlinkComponents(cwd: string, target: string): void {
 			);
 	}
 
-	const realTarget = realPathWithMissingSuffix(target);
-	if (realTarget !== realCwd && !realTarget.startsWith(`${realCwd}/`))
+	const realTarget = realPathWithMissingSuffix(target, paths);
+	const realSuffix = paths.relative(realCwd, realTarget);
+	if (isPathOutsideRoot(realSuffix, paths))
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_SYMLINK",
 			"comparison output path does not remain inside its real working directory",
@@ -176,6 +222,8 @@ function assertNoSymlinkComponents(cwd: string, target: string): void {
 export function resolveOfficialComparisonOutputFile(
 	input: ComparisonOutputFileInput,
 ): string {
+	const platform = input.platform ?? HOST_PATH_PLATFORM;
+	const paths = pathSemantics(platform);
 	const outputDir = resolveOfficialComparisonOutputDir(input);
 	const outputFile = input.outputFile;
 	if (outputFile !== undefined && !isNonEmptyString(outputFile))
@@ -188,16 +236,20 @@ export function resolveOfficialComparisonOutputFile(
 			"OUTPUT_PATH_TRAVERSAL",
 			"comparison report path contains traversal or alias segments",
 		);
-	const resolvedFile = resolve(
+	const resolvedFile = paths.resolve(
 		input.cwd ?? process.cwd(),
-		outputFile ?? join(outputDir, "comparison-report.md"),
+		outputFile ?? paths.join(outputDir, "comparison-report.md"),
 	);
-	if (dirname(resolvedFile) !== outputDir)
+	if (paths.dirname(resolvedFile) !== outputDir)
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_OUTSIDE_ROOT",
 			"comparison report must be written directly inside the official campaign directory",
 		);
-	if (existsSync(resolvedFile) && lstatSync(resolvedFile).isSymbolicLink())
+	if (
+		platform === HOST_PATH_PLATFORM &&
+		existsSync(resolvedFile) &&
+		lstatSync(resolvedFile).isSymbolicLink()
+	)
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_SYMLINK",
 			"comparison report path must not be a symbolic link",
@@ -214,14 +266,16 @@ export function resolveOfficialComparisonOutputFile(
 export function resolveOfficialComparisonOutputDir(
 	input: ComparisonOutputPathInput,
 ): string {
-	const cwd = resolve(input.cwd ?? process.cwd());
+	const platform = input.platform ?? HOST_PATH_PLATFORM;
+	const paths = pathSemantics(platform);
+	const cwd = paths.resolve(input.cwd ?? process.cwd());
 	if (!validPathSegment(input.candidate) || !validPathSegment(input.campaignId))
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_SEGMENT_INVALID",
 			"candidate and campaignId must be non-empty path segments",
 		);
 
-	const expected = resolve(
+	const expected = paths.resolve(
 		cwd,
 		OFFICIAL_COMPARISON_OUTPUT_ROOT,
 		input.candidate,
@@ -239,8 +293,9 @@ export function resolveOfficialComparisonOutputDir(
 			"comparison output path contains traversal or alias segments",
 		);
 
-	const supplied = outputDir === undefined ? expected : resolve(cwd, outputDir);
-	if (supplied === resolve(cwd, "evidence") || supplied.endsWith("/evidence"))
+	const supplied =
+		outputDir === undefined ? expected : paths.resolve(cwd, outputDir);
+	if (supplied === paths.resolve(cwd, "evidence"))
 		throw new ComparisonOutputPolicyError(
 			"OUTPUT_PATH_LEGACY",
 			"legacy ./evidence output is quarantined",
@@ -251,7 +306,7 @@ export function resolveOfficialComparisonOutputDir(
 			`comparison output must resolve exactly inside ${OFFICIAL_COMPARISON_OUTPUT_ROOT}/${input.candidate}/${input.campaignId}`,
 		);
 
-	assertNoSymlinkComponents(cwd, expected);
+	assertNoSymlinkComponents(cwd, expected, paths, platform);
 	return expected;
 }
 
