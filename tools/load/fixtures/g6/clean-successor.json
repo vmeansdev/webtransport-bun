@@ -1,0 +1,36 @@
+{
+	"schema": "g6-evaluator-fixture/1",
+	"name": "clean-six-arm-successor",
+	"expected": {
+		"valid": true,
+		"gate": "PASS",
+		"steadyRungs": 3,
+		"clauseIds": [
+			"steady-500/C1",
+			"steady-500/C2",
+			"steady-500/C3",
+			"steady-500/C4",
+			"steady-500/C5",
+			"steady-500/C6",
+			"steady-2500/C1",
+			"steady-2500/C2",
+			"steady-2500/C3",
+			"steady-2500/C4",
+			"steady-2500/C5",
+			"steady-2500/C6",
+			"steady-5000/C1",
+			"steady-5000/C2",
+			"steady-5000/C3",
+			"steady-5000/C4",
+			"steady-5000/C5",
+			"steady-5000/C6",
+			"hotspot-5000/H1",
+			"hotspot-5000/H2",
+			"hotspot-5000/H3",
+			"storm-1000/S-C1",
+			"storm-1000/S-C2",
+			"storm-5000/S-C1",
+			"storm-5000/S-C2"
+		]
+	}
+}
