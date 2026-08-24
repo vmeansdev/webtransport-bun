@@ -36,10 +36,13 @@ use latency_probe::{
     monotonic_ns, read_stamp, write_stamp_v3, AtomicHistogram, CLASS_ACK, CLASS_ACTION, CLASS_MOVE,
     CLASS_RAID, CLASS_RAID_JOIN, CLASS_SNAPSHOT, STAMP_BYTES_V3,
 };
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
 use wtransport::quinn;
 use wtransport::{ClientConfig, Endpoint};
@@ -47,10 +50,12 @@ use wtransport::{ClientConfig, Endpoint};
 const DEFAULT_URL: &str = "https://127.0.0.1:4433";
 const G6_CLOSEOUT_SPEC_ID: &str = "g6-mmo-closeout/1";
 const G6_CLOSEOUT_SPEC_PATH: &str = "docs/research/preregistrations/gate-g6-mmo-closeout.md";
+const DEFAULT_DRAIN_MS: u64 = 1000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 const MAX_IDLE: Duration = Duration::from_secs(60);
 const MAX_RECORDED_ERRORS: usize = 5;
 const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_PHASE_BARRIER_TIMEOUT_MS: u64 = 60_000;
 /// Grace for every session task to observe a phase change before counters are
 /// snapshotted at that boundary. Carried from `scale_client`, same reason: a
 /// session whose `select!` picked its ticker over the phase change would send a
@@ -69,10 +74,25 @@ const SEVER_CLOSE_CODE: u32 = 0;
 
 const PHASE_CONNECT: u8 = 0;
 const PHASE_STEADY: u8 = 1;
-const PHASE_STORM: u8 = 2;
-const PHASE_POST: u8 = 3;
-const PHASE_IDLE: u8 = 4;
-const PHASE_STOP: u8 = 5;
+const PHASE_DRAIN: u8 = 2;
+const PHASE_STORM: u8 = 3;
+const PHASE_POST: u8 = 4;
+const PHASE_IDLE: u8 = 5;
+const PHASE_STOP: u8 = 6;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendWindowKind {
+    Steady,
+    Storm,
+    Post,
+}
+
+#[derive(Debug)]
+struct ActiveSendWindow {
+    kind: SendWindowKind,
+    started_at: tokio::time::Instant,
+    ticker: tokio::time::Interval,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
@@ -108,6 +128,7 @@ struct Options {
     endpoints: usize,
     connect_concurrency: usize,
     steady: Duration,
+    drain: Duration,
     idle: Duration,
     /// Upstream movement interval. 250 ms = the registered 4 pps (§1.2).
     send_interval: Duration,
@@ -117,6 +138,11 @@ struct Options {
     connect_timeout: Duration,
     json_out: Option<String>,
     pre_registration_sha256: Option<String>,
+    started_at: Option<String>,
+    phase_barrier_id: Option<String>,
+    phase_barrier_dir: Option<String>,
+    phase_barrier_parties: usize,
+    phase_barrier_timeout: Duration,
     /// Session *i* of *N* phase-offsets by `i/N` of one interval. On for the
     /// steady realm (G1's registered process, T02's reason); the storm's
     /// alignment is a separate, deliberate thing and lives in the storm phase.
@@ -142,6 +168,7 @@ impl Options {
             endpoints: 1,
             connect_concurrency: 500,
             steady: Duration::from_secs(120),
+            drain: Duration::from_millis(DEFAULT_DRAIN_MS),
             idle: Duration::from_secs(30),
             send_interval: Duration::from_millis(250),
             action_every: 8,
@@ -149,6 +176,11 @@ impl Options {
             connect_timeout: Duration::from_secs(300),
             json_out: None,
             pre_registration_sha256: None,
+            started_at: None,
+            phase_barrier_id: None,
+            phase_barrier_dir: None,
+            phase_barrier_parties: 0,
+            phase_barrier_timeout: Duration::from_millis(DEFAULT_PHASE_BARRIER_TIMEOUT_MS),
             stagger_sends: true,
             storm_cohort: 0,
             storm_reconnect_delay: Duration::from_millis(1000),
@@ -196,12 +228,14 @@ struct TickObservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct ScheduleAccounting {
     due: u64,
     fired: u64,
     skipped: u64,
 }
 
+#[cfg(test)]
 impl ScheduleAccounting {
     fn reconciled(self) -> bool {
         self.due == self.fired.saturating_add(self.skipped)
@@ -260,6 +294,23 @@ fn class_for_tick(sequence: u64, action_every: u64) -> u8 {
     } else {
         CLASS_MOVE
     }
+}
+
+fn send_window_kind(phase: u8) -> Option<SendWindowKind> {
+    match phase {
+        PHASE_STEADY => Some(SendWindowKind::Steady),
+        PHASE_STORM => Some(SendWindowKind::Storm),
+        PHASE_POST => Some(SendWindowKind::Post),
+        _ => None,
+    }
+}
+
+fn phase_records_steady_drain(phase: u8) -> bool {
+    matches!(phase, PHASE_STEADY | PHASE_DRAIN)
+}
+
+fn phase_records_storm_survivors(phase: u8, severed: bool) -> bool {
+    !severed && phase == PHASE_STORM
 }
 
 /// Whether session `index` is in the severed cohort. The cohort is the *first*
@@ -357,6 +408,8 @@ struct Counters {
     sent: AtomicU64,
     send_err: AtomicU64,
     ticks_due: AtomicU64,
+    ticks_fired: AtomicU64,
+    ticks_skipped: AtomicU64,
     rx_snapshot: AtomicU64,
     rx_ack: AtomicU64,
     rx_raid: AtomicU64,
@@ -368,22 +421,104 @@ struct Counters {
 }
 
 impl Counters {
-    fn to_json(&self) -> String {
+    fn ticks_reconciled(&self) -> bool {
+        self.ticks_due.load(Ordering::Relaxed)
+            == self
+                .ticks_fired
+                .load(Ordering::Relaxed)
+                .saturating_add(self.ticks_skipped.load(Ordering::Relaxed))
+    }
+
+    fn to_json_fields(&self) -> String {
         format!(
             concat!(
-                "{{\"sent\":{},\"sendErr\":{},\"ticksDue\":{},",
+                "\"sent\":{},\"sendErr\":{},",
+                "\"scheduleTicksDue\":{},\"scheduleTicksFired\":{},",
+                "\"scheduleTicksSkipped\":{},\"scheduleTicksReconciled\":{},",
                 "\"rxSnapshot\":{},\"rxAck\":{},\"rxRaid\":{},\"rxOther\":{},",
-                "\"rxUnstamped\":{},\"ackUnreflected\":{}}}"
+                "\"rxUnstamped\":{},\"ackUnreflected\":{}"
             ),
             self.sent.load(Ordering::Relaxed),
             self.send_err.load(Ordering::Relaxed),
             self.ticks_due.load(Ordering::Relaxed),
+            self.ticks_fired.load(Ordering::Relaxed),
+            self.ticks_skipped.load(Ordering::Relaxed),
+            self.ticks_reconciled(),
             self.rx_snapshot.load(Ordering::Relaxed),
             self.rx_ack.load(Ordering::Relaxed),
             self.rx_raid.load(Ordering::Relaxed),
             self.rx_other.load(Ordering::Relaxed),
             self.rx_unstamped.load(Ordering::Relaxed),
             self.ack_unreflected.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Default)]
+struct WindowStats {
+    counters: Counters,
+    rtt: AtomicHistogram,
+    one_way: AtomicHistogram,
+    server_hold: AtomicHistogram,
+    schedule_lag: AtomicHistogram,
+}
+
+impl WindowStats {
+    fn record_class(&self, class: u8) {
+        match class {
+            CLASS_SNAPSHOT => self.counters.rx_snapshot.fetch_add(1, Ordering::Relaxed),
+            CLASS_ACK => self.counters.rx_ack.fetch_add(1, Ordering::Relaxed),
+            CLASS_RAID => self.counters.rx_raid.fetch_add(1, Ordering::Relaxed),
+            _ => self.counters.rx_other.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn record_unstamped(&self) {
+        self.counters.rx_unstamped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_ack_unreflected(&self) {
+        self.counters
+            .ack_unreflected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_send(&self, ok: bool) {
+        if ok {
+            self.counters.sent.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters.send_err.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_tick(&self, observation: TickObservation) {
+        self.counters.ticks_fired.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .ticks_skipped
+            .fetch_add(observation.skipped_ticks, Ordering::Relaxed);
+        self.schedule_lag.record(observation.lag_ns);
+    }
+
+    fn record_due(&self, due: u64) {
+        self.counters.ticks_due.fetch_add(due, Ordering::Relaxed);
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "{},",
+                "\"scheduleLag\":{},",
+                "\"rtt\":{},",
+                "\"oneWay\":{},",
+                "\"serverHold\":{}",
+                "}}"
+            ),
+            self.counters.to_json_fields(),
+            self.schedule_lag.to_json(),
+            self.rtt.to_json(),
+            self.one_way.to_json(),
+            self.server_hold.to_json(),
         )
     }
 }
@@ -467,22 +602,11 @@ fn sample_quic(registry: &ConnRegistry) -> QuicTap {
 
 /// Everything a session task shares with the run.
 struct Shared {
-    realm: Counters,
-    survivors: Counters,
-    schedule_ticks_due: AtomicU64,
-    schedule_ticks_fired: AtomicU64,
-    schedule_ticks_skipped: AtomicU64,
+    steady: WindowStats,
+    steady_drain: WindowStats,
+    storm_survivors: WindowStats,
+    lifetime: WindowStats,
     sessions: SessionCounters,
-    /// Round trip on the ack class, all sessions, steady phase.
-    rtt_steady: AtomicHistogram,
-    /// Round trip on the ack class, survivors only, storm window (§5.3).
-    rtt_storm_survivors: AtomicHistogram,
-    /// One-way publisher→subscriber, raid subscribers only (§3).
-    one_way: AtomicHistogram,
-    /// Server dwell as the server reported it, for disclosure beside C3 (§6.3).
-    server_hold: AtomicHistogram,
-    /// This generator's own lag against its own schedule (§6.4).
-    schedule_lag: AtomicHistogram,
     registry: ConnRegistry,
     errors: Mutex<Vec<String>>,
     latencies: Mutex<Vec<u64>>,
@@ -492,17 +616,11 @@ struct Shared {
 impl Shared {
     fn new(capacity: usize) -> Shared {
         Shared {
-            realm: Counters::default(),
-            survivors: Counters::default(),
-            schedule_ticks_due: AtomicU64::new(0),
-            schedule_ticks_fired: AtomicU64::new(0),
-            schedule_ticks_skipped: AtomicU64::new(0),
+            steady: WindowStats::default(),
+            steady_drain: WindowStats::default(),
+            storm_survivors: WindowStats::default(),
+            lifetime: WindowStats::default(),
             sessions: SessionCounters::default(),
-            rtt_steady: AtomicHistogram::new(),
-            rtt_storm_survivors: AtomicHistogram::new(),
-            one_way: AtomicHistogram::new(),
-            server_hold: AtomicHistogram::new(),
-            schedule_lag: AtomicHistogram::new(),
             registry: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
             errors: Mutex::new(Vec::new()),
             latencies: Mutex::new(Vec::with_capacity(capacity)),
@@ -628,6 +746,13 @@ fn parse_args() -> Options {
                     o.steady.as_secs(),
                 ))
             }
+            "--drain-ms" => {
+                o.drain = Duration::from_millis(parse_or_default(
+                    "--drain-ms",
+                    args.next(),
+                    o.drain.as_millis() as u64,
+                ))
+            }
             "--idle-secs" => {
                 o.idle = Duration::from_secs(parse_or_default(
                     "--idle-secs",
@@ -664,6 +789,23 @@ fn parse_args() -> Options {
             }
             "--json-out" => o.json_out = args.next(),
             "--preregistration-sha256" => o.pre_registration_sha256 = args.next(),
+            "--started-at" => o.started_at = args.next(),
+            "--phase-barrier-id" => o.phase_barrier_id = args.next(),
+            "--phase-barrier-dir" => o.phase_barrier_dir = args.next(),
+            "--phase-barrier-parties" => {
+                o.phase_barrier_parties = parse_or_default(
+                    "--phase-barrier-parties",
+                    args.next(),
+                    o.phase_barrier_parties,
+                )
+            }
+            "--phase-barrier-timeout-ms" => {
+                o.phase_barrier_timeout = Duration::from_millis(parse_or_default(
+                    "--phase-barrier-timeout-ms",
+                    args.next(),
+                    o.phase_barrier_timeout.as_millis() as u64,
+                ))
+            }
             "--no-stagger" => o.stagger_sends = false,
             "--storm-cohort" => {
                 o.storm_cohort = parse_or_default("--storm-cohort", args.next(), o.storm_cohort)
@@ -716,12 +858,272 @@ fn validate_pre_registration_sha256(
     Ok(sha.to_string())
 }
 
+fn validate_started_at(value: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(started_at) = value else {
+        return Err("mmo-client: --started-at is required for mmo-client/2 reports".into());
+    };
+    let bytes = started_at.as_bytes();
+    let is_digits = |slice: &[u8]| slice.iter().all(u8::is_ascii_digit);
+    let parse_u32 =
+        |slice: &[u8]| -> Option<u32> { std::str::from_utf8(slice).ok()?.parse::<u32>().ok() };
+    let is_leap_year = |year: u32| {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    };
+    let fractional = if bytes.len() == 20 {
+        &[][..]
+    } else if bytes.len() > 21 && bytes[19] == b'.' {
+        &bytes[20..bytes.len() - 1]
+    } else {
+        &[0u8][..]
+    };
+    let year = bytes.get(0..4).and_then(parse_u32);
+    let month = bytes.get(5..7).and_then(parse_u32);
+    let day = bytes.get(8..10).and_then(parse_u32);
+    let hour = bytes.get(11..13).and_then(parse_u32);
+    let minute = bytes.get(14..16).and_then(parse_u32);
+    let second = bytes.get(17..19).and_then(parse_u32);
+    let max_day = match month {
+        Some(1 | 3 | 5 | 7 | 8 | 10 | 12) => Some(31),
+        Some(4 | 6 | 9 | 11) => Some(30),
+        Some(2) => Some(if year.is_some_and(is_leap_year) {
+            29
+        } else {
+            28
+        }),
+        _ => None,
+    };
+    let valid = bytes.len() >= 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && is_digits(&bytes[0..4])
+        && is_digits(&bytes[5..7])
+        && is_digits(&bytes[8..10])
+        && is_digits(&bytes[11..13])
+        && is_digits(&bytes[14..16])
+        && is_digits(&bytes[17..19])
+        && matches!(bytes.last(), Some(b'Z'))
+        && (bytes.len() == 20 || (!fractional.is_empty() && is_digits(fractional)))
+        && month.is_some_and(|value| (1..=12).contains(&value))
+        && day
+            .zip(max_day)
+            .is_some_and(|(value, limit)| (1..=limit).contains(&value))
+        && hour.is_some_and(|value| value <= 23)
+        && minute.is_some_and(|value| value <= 59)
+        && second.is_some_and(|value| value <= 59);
+    if !valid {
+        return Err(format!(
+            "mmo-client: --started-at must be an RFC3339 UTC timestamp, got '{started_at}'"
+        )
+        .into());
+    }
+    Ok(started_at.to_string())
+}
+
+#[derive(Clone, Debug)]
+struct PhaseBarrierProof {
+    id: String,
+    role: String,
+    parties: usize,
+    ready_unix_ms: u64,
+    ready_monotonic_ns: u64,
+    release_unix_ms: u64,
+    release_monotonic_ns: u64,
+    steady_enter_unix_ms: u64,
+    steady_enter_monotonic_ns: u64,
+}
+
+impl PhaseBarrierProof {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"id\":\"{}\",",
+                "\"role\":\"{}\",",
+                "\"parties\":{},",
+                "\"readyUnixMs\":{},",
+                "\"readyMonotonicNs\":{},",
+                "\"releaseUnixMs\":{},",
+                "\"releaseMonotonicNs\":{},",
+                "\"steadyEnterUnixMs\":{},",
+                "\"steadyEnterMonotonicNs\":{}",
+                "}}"
+            ),
+            escape(&self.id),
+            escape(&self.role),
+            self.parties,
+            self.ready_unix_ms,
+            self.ready_monotonic_ns,
+            self.release_unix_ms,
+            self.release_monotonic_ns,
+            self.steady_enter_unix_ms,
+            self.steady_enter_monotonic_ns
+        )
+    }
+}
+
+fn unix_now_ms() -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX))
+}
+
+fn validate_phase_barrier_component(
+    label: &str,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(
+            format!("mmo-client: --{label} must use only [A-Za-z0-9._-], got '{value}'").into(),
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_phase_barrier(
+    options: &Options,
+) -> Result<Option<PhaseBarrierProof>, Box<dyn std::error::Error>> {
+    let Some(id) = options.phase_barrier_id.as_deref() else {
+        if options.phase_barrier_dir.is_some() || options.phase_barrier_parties > 0 {
+            return Err(
+                "mmo-client: --phase-barrier-id is required when phase barrier options are set"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+    let Some(dir) = options.phase_barrier_dir.as_deref() else {
+        return Err(
+            "mmo-client: --phase-barrier-dir is required when --phase-barrier-id is set".into(),
+        );
+    };
+    if options.phase_barrier_parties == 0 {
+        return Err(
+            "mmo-client: --phase-barrier-parties must be at least 1 when --phase-barrier-id is set"
+                .into(),
+        );
+    }
+    validate_phase_barrier_component("phase-barrier-id", id)?;
+    validate_phase_barrier_component("role", options.role.as_str())?;
+    fs::create_dir_all(dir)?;
+    let dir_path = Path::new(dir);
+    let ready_path = dir_path.join(format!("{id}.{}.ready", options.role.as_str()));
+    let release_path = dir_path.join(format!("{id}.release"));
+    let ready_unix_ms = unix_now_ms()?;
+    let ready_monotonic_ns = monotonic_ns();
+    fs::write(
+        &ready_path,
+        format!(
+            concat!(
+                "role={}\n",
+                "parties={}\n",
+                "readyUnixMs={}\n",
+                "readyMonotonicNs={}\n"
+            ),
+            options.role.as_str(),
+            options.phase_barrier_parties,
+            ready_unix_ms,
+            ready_monotonic_ns,
+        ),
+    )?;
+    let deadline = Instant::now() + options.phase_barrier_timeout;
+    let prefix = format!("{id}.");
+    let suffix = ".ready";
+    let mut release_unix_ms: Option<u64> = None;
+    let mut release_monotonic_ns: Option<u64> = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "mmo-client: phase barrier timed out waiting for {}/{}, role={}",
+                fs::read_dir(dir_path)?
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(suffix))
+                    })
+                    .count(),
+                options.phase_barrier_parties,
+                options.role.as_str()
+            )
+            .into());
+        }
+        let ready_count = fs::read_dir(dir_path)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(suffix))
+            })
+            .count();
+        if ready_count >= options.phase_barrier_parties {
+            let release_value = unix_now_ms()?;
+            let release_monotonic_value = monotonic_ns();
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&release_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "releaseUnixMs={release_value}")?;
+                    writeln!(file, "releaseMonotonicNs={release_monotonic_value}")?;
+                    release_unix_ms = Some(release_value);
+                    release_monotonic_ns = Some(release_monotonic_value);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let mut buf = String::new();
+                    fs::File::open(&release_path)?.read_to_string(&mut buf)?;
+                    for line in buf.lines() {
+                        if let Some(value) = line.strip_prefix("releaseUnixMs=") {
+                            release_unix_ms = value.parse::<u64>().ok();
+                        } else if let Some(value) = line.strip_prefix("releaseMonotonicNs=") {
+                            release_monotonic_ns = value.parse::<u64>().ok();
+                        }
+                    }
+                    if release_unix_ms.is_some() && release_monotonic_ns.is_some() {
+                        break;
+                    }
+                }
+                Err(err) => return Err(Box::new(err)),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let release_unix_ms = release_unix_ms
+        .ok_or("mmo-client: phase barrier release file existed but was unreadable")?;
+    let release_monotonic_ns = release_monotonic_ns
+        .ok_or("mmo-client: phase barrier release file omitted releaseMonotonicNs")?;
+    Ok(Some(PhaseBarrierProof {
+        id: id.to_string(),
+        role: options.role.as_str().to_string(),
+        parties: options.phase_barrier_parties,
+        ready_unix_ms,
+        ready_monotonic_ns,
+        release_unix_ms,
+        release_monotonic_ns,
+        steady_enter_unix_ms: 0,
+        steady_enter_monotonic_ns: 0,
+    }))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_args();
     let pre_registration_sha256 =
         validate_pre_registration_sha256(options.pre_registration_sha256.as_deref())?;
+    let started_at_iso = validate_started_at(options.started_at.as_deref())?;
     println!(
-        "mmo-client: role={} url={} sessions={} endpoints={} interval={}ms actionEvery={} payload={}B steady={}s storm={}@{}s window={}s concurrency={} stagger={}",
+        "mmo-client: role={} url={} sessions={} endpoints={} interval={}ms actionEvery={} payload={}B steady={}s drain={}ms storm={}@{}s window={}s concurrency={} stagger={}",
         options.role.as_str(),
         options.url,
         options.sessions,
@@ -730,6 +1132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.action_every,
         options.payload_bytes,
         options.steady.as_secs(),
+        options.drain.as_millis(),
         options.storm_cohort,
         options.steady.as_secs(),
         options.storm_window.as_secs(),
@@ -739,12 +1142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(options, pre_registration_sha256))
+    rt.block_on(run(options, pre_registration_sha256, started_at_iso))
 }
 
 async fn run(
     options: Options,
     pre_registration_sha256: String,
+    started_at_iso: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     spawn_rss_guard();
     let EndpointPool {
@@ -844,11 +1248,19 @@ async fn run(
     );
 
     let quic_after_connect = sample_quic(&shared.registry);
+    let mut phase_barrier = wait_for_phase_barrier(&options).await?;
+    if let Some(proof) = phase_barrier.as_mut() {
+        proof.steady_enter_unix_ms = unix_now_ms()?;
+        proof.steady_enter_monotonic_ns = monotonic_ns();
+    }
     let _ = phase_tx.send(PHASE_STEADY);
     // Phase markers are line-buffered onto stdout so the harness snapshots
     // server-side counters at exactly the boundaries this process uses.
     println!("mmo-client: phase steady");
     tokio::time::sleep(options.steady).await;
+    let _ = phase_tx.send(PHASE_DRAIN);
+    println!("mmo-client: phase drain");
+    tokio::time::sleep(options.drain).await;
 
     let storm_ran = options.storm_cohort > 0;
     if storm_ran {
@@ -861,11 +1273,11 @@ async fn run(
     }
 
     let _ = phase_tx.send(PHASE_IDLE);
+    println!("mmo-client: phase idle");
     tokio::time::sleep(PHASE_SETTLE).await;
     let quic_after_drive = sample_quic(&shared.registry);
     let cpu_after_drive = self_cpu_ms();
     let rss_drive = self_rss_mb();
-    println!("mmo-client: phase idle");
     tokio::time::sleep(options.idle.saturating_sub(PHASE_SETTLE)).await;
     let cpu_after_idle = self_cpu_ms();
     let rss_idle = self_rss_mb();
@@ -900,20 +1312,18 @@ async fn run(
         (Some(a), Some(b)) => Some(b - a),
         _ => None,
     };
-    let schedule_due = shared.schedule_ticks_due.load(Ordering::Relaxed);
-    let schedule_fired = shared.schedule_ticks_fired.load(Ordering::Relaxed);
-    let schedule_skipped = shared.schedule_ticks_skipped.load(Ordering::Relaxed);
-    let schedule_accounting = ScheduleAccounting {
-        due: schedule_due,
-        fired: schedule_fired,
-        skipped: schedule_skipped,
+    let reconnect_total_ms: u64 = reconnects.iter().copied().sum();
+    let reconnect_mean_ms = if reconnects.is_empty() {
+        None
+    } else {
+        Some(reconnect_total_ms as f64 / reconnects.len() as f64)
     };
-    let schedule_reconciled = schedule_accounting.reconciled();
 
     let json = format!(
         concat!(
             "{{",
             "\"schema\":\"mmo-client/2\",",
+            "\"startedAt\":\"{}\",",
             "\"preRegistration\":{{\"id\":\"{}\",\"path\":\"{}\",\"sha256\":{}}},",
             "\"role\":\"{}\",",
             "\"staggerSends\":{},",
@@ -924,31 +1334,18 @@ async fn run(
             "\"connectWallSec\":{:.3},",
             "\"connectTimedOut\":{},",
             "\"connectConcurrency\":{},",
-            "\"stormConcurrency\":{},",
-            "\"stormCohort\":{},",
-            "\"stormRan\":{},",
-            "\"reconnectOk\":{},",
-            "\"reconnectErr\":{},",
             "\"acceptMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
-            "\"reconnectMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}},",
-            "\"scheduleTicksDue\":{},",
-            "\"scheduleTicksFired\":{},",
-            "\"scheduleTicksSkipped\":{},",
-            "\"scheduleTicksReconciled\":{},",
-            "\"realm\":{},",
-            "\"survivors\":{},",
-            "\"rttSteady\":{},",
-            "\"rttStormSurvivors\":{},",
-            "\"oneWay\":{},",
-            "\"serverHold\":{},",
-            "\"scheduleLag\":{},",
-            "\"lifetime\":{{\"realm\":{},\"survivors\":{},\"rttSteady\":{},\"rttStormSurvivors\":{},\"oneWay\":{},\"serverHold\":{},\"scheduleLag\":{}}},",
+            "\"storm\":{{\"concurrency\":{},\"cohort\":{},\"ran\":{},\"windowSec\":{},\"reconnectOk\":{},\"reconnectErr\":{},\"reconnectTotalMs\":{},\"reconnectMeanMs\":{},\"reconnectMs\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"max\":{}}}}},",
+            "\"phaseBarrier\":{},",
+            "\"windows\":{{\"steady\":{},\"steadyDrain\":{},\"stormSurvivors\":{}}},",
+            "\"lifetime\":{},",
             "\"quicDrive\":{},",
             "\"client\":{{\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
-            "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{}}},",
+            "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{}}},",
             "\"connectErrorsSample\":[{}]",
             "}}"
         ),
+        started_at_iso,
         G6_CLOSEOUT_SPEC_ID,
         G6_CLOSEOUT_SPEC_PATH,
         json_string(Some(pre_registration_sha256.as_str())),
@@ -961,9 +1358,10 @@ async fn run(
         connect_wall.as_secs_f64(),
         connect_timed_out,
         options.connect_concurrency,
-        // Emitted as null when there was no pool, because "no permit pool" and
-        // "a pool of some size" are the two states the Little's-law falsifier
-        // distinguishes, and a zero would read as the second.
+        json_u64(percentile(&accepts, 0.50)),
+        json_u64(percentile(&accepts, 0.90)),
+        json_u64(percentile(&accepts, 0.99)),
+        json_u64(accepts.last().copied()),
         if options.storm_concurrency == 0 {
             "null".to_string()
         } else {
@@ -971,34 +1369,23 @@ async fn run(
         },
         options.storm_cohort,
         storm_ran,
+        options.storm_window.as_secs(),
         shared.sessions.reconnect_ok.load(Ordering::Relaxed),
         shared.sessions.reconnect_err.load(Ordering::Relaxed),
-        json_u64(percentile(&accepts, 0.50)),
-        json_u64(percentile(&accepts, 0.90)),
-        json_u64(percentile(&accepts, 0.99)),
-        json_u64(accepts.last().copied()),
+        reconnect_total_ms,
+        json_num(reconnect_mean_ms),
         json_u64(percentile(&reconnects, 0.50)),
         json_u64(percentile(&reconnects, 0.90)),
         json_u64(percentile(&reconnects, 0.99)),
         json_u64(reconnects.last().copied()),
-        schedule_due,
-        schedule_fired,
-        schedule_skipped,
-        schedule_reconciled,
-        shared.realm.to_json(),
-        shared.survivors.to_json(),
-        shared.rtt_steady.to_json(),
-        shared.rtt_storm_survivors.to_json(),
-        shared.one_way.to_json(),
-        shared.server_hold.to_json(),
-        shared.schedule_lag.to_json(),
-        shared.realm.to_json(),
-        shared.survivors.to_json(),
-        shared.rtt_steady.to_json(),
-        shared.rtt_storm_survivors.to_json(),
-        shared.one_way.to_json(),
-        shared.server_hold.to_json(),
-        shared.schedule_lag.to_json(),
+        phase_barrier
+            .as_ref()
+            .map(PhaseBarrierProof::to_json)
+            .unwrap_or_else(|| "null".to_string()),
+        shared.steady.to_json(),
+        shared.steady_drain.to_json(),
+        shared.storm_survivors.to_json(),
+        shared.lifetime.to_json(),
         quic_after_drive.delta(&quic_after_connect).to_json(),
         json_num(rss_drive),
         json_num(rss_idle),
@@ -1011,6 +1398,7 @@ async fn run(
         options.action_every,
         options.payload_bytes,
         options.steady.as_secs(),
+        options.drain.as_millis(),
         options.storm_window.as_secs(),
         options.post_storm.as_secs(),
         options.idle.as_secs(),
@@ -1037,42 +1425,99 @@ async fn run(
 /// entered late or died early is charged for exactly the ticks its own schedule
 /// reached — a shortfall against it is a generator that failed to source the
 /// load and nothing else.
-fn account_ticks(
+fn account_window_ticks(
     shared: &Shared,
     track_schedule: bool,
+    kind: SendWindowKind,
     started_at: tokio::time::Instant,
     interval: Duration,
     phase_offset: f64,
-    accounted: &mut bool,
+    severed: bool,
 ) {
     if !track_schedule {
         return;
     }
-    if *accounted {
+    let due = ticks_due_after(started_at.elapsed(), interval, phase_offset);
+    shared.lifetime.record_due(due);
+    match kind {
+        SendWindowKind::Steady => shared.steady.record_due(due),
+        SendWindowKind::Storm if !severed => shared.storm_survivors.record_due(due),
+        SendWindowKind::Post | SendWindowKind::Storm => {}
+    }
+}
+
+#[cfg(test)]
+fn window_schedule_accounting(
+    elapsed: Duration,
+    interval: Duration,
+    phase_offset: f64,
+    fired: u64,
+    skipped: u64,
+) -> ScheduleAccounting {
+    schedule_accounting(elapsed, interval, phase_offset, fired, skipped)
+}
+
+fn open_send_window(
+    kind: SendWindowKind,
+    interval: Duration,
+    phase_offset: f64,
+) -> ActiveSendWindow {
+    let started_at = tokio::time::Instant::now();
+    let offset = first_tick_offset(interval, phase_offset);
+    let mut ticker = tokio::time::interval_at(started_at + offset, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ActiveSendWindow {
+        kind,
+        started_at,
+        ticker,
+    }
+}
+
+fn sync_send_window(
+    shared: &Shared,
+    track_schedule: bool,
+    active: &mut Option<ActiveSendWindow>,
+    desired: Option<SendWindowKind>,
+    interval: Duration,
+    phase_offset: f64,
+    severed: bool,
+) {
+    if active.as_ref().map(|window| window.kind) == desired {
         return;
     }
-    *accounted = true;
-    let due = ticks_due_after(started_at.elapsed(), interval, phase_offset);
-    shared.realm.ticks_due.fetch_add(due, Ordering::Relaxed);
-    shared.schedule_ticks_due.fetch_add(due, Ordering::Relaxed);
+    if let Some(window) = active.take() {
+        account_window_ticks(
+            shared,
+            track_schedule,
+            window.kind,
+            window.started_at,
+            interval,
+            phase_offset,
+            severed,
+        );
+    }
+    if let Some(kind) = desired {
+        *active = Some(open_send_window(kind, interval, phase_offset));
+    }
 }
 
 fn record_reconnect_failure(
     shared: &Shared,
     track_schedule: bool,
-    started_at: tokio::time::Instant,
+    active_window: &mut Option<ActiveSendWindow>,
     interval: Duration,
     phase_offset: f64,
-    accounted: &mut bool,
+    severed: bool,
     error: String,
 ) {
-    account_ticks(
+    sync_send_window(
         shared,
         track_schedule,
-        started_at,
+        active_window,
+        None,
         interval,
         phase_offset,
-        accounted,
+        severed,
     );
     shared
         .sessions
@@ -1087,31 +1532,23 @@ fn record_reconnect_failure(
 /// does the ack carry a usable token, whose clock is the token on — is one
 /// place, and so the "record a round trip measured from zero" mistake has to be
 /// made deliberately rather than by omission.
-fn record_arrival(
-    payload: &[u8],
-    now_ns: u64,
-    severed: bool,
-    phase: u8,
-    shared: &Shared,
-    realm: &Counters,
-    survivors: &Counters,
-) {
-    let count_in = |c: &Counters, class: u8| match class {
-        CLASS_SNAPSHOT => c.rx_snapshot.fetch_add(1, Ordering::Relaxed),
-        CLASS_ACK => c.rx_ack.fetch_add(1, Ordering::Relaxed),
-        CLASS_RAID => c.rx_raid.fetch_add(1, Ordering::Relaxed),
-        _ => c.rx_other.fetch_add(1, Ordering::Relaxed),
-    };
+fn record_arrival(payload: &[u8], now_ns: u64, severed: bool, phase: u8, shared: &Shared) {
     let Some(stamp) = read_stamp(payload) else {
-        realm.rx_unstamped.fetch_add(1, Ordering::Relaxed);
-        if !severed && phase == PHASE_STORM {
-            survivors.rx_unstamped.fetch_add(1, Ordering::Relaxed);
+        shared.lifetime.record_unstamped();
+        if phase_records_steady_drain(phase) {
+            shared.steady_drain.record_unstamped();
+        }
+        if phase_records_storm_survivors(phase, severed) {
+            shared.storm_survivors.record_unstamped();
         }
         return;
     };
-    count_in(realm, stamp.class);
-    if !severed && phase == PHASE_STORM {
-        count_in(survivors, stamp.class);
+    shared.lifetime.record_class(stamp.class);
+    if phase_records_steady_drain(phase) {
+        shared.steady_drain.record_class(stamp.class);
+    }
+    if phase_records_storm_survivors(phase, severed) {
+        shared.storm_survivors.record_class(stamp.class);
     }
 
     if stamp.class == CLASS_RAID {
@@ -1119,8 +1556,21 @@ fn record_arrival(
         // is a client-clock instant here and the one-way is honest. It is the
         // only one-way this gate can make; the client↔server legs are RTT-only.
         shared
+            .lifetime
             .one_way
             .record_signed(now_ns as i64 - stamp.actual_ns as i64);
+        if phase_records_steady_drain(phase) {
+            shared
+                .steady_drain
+                .one_way
+                .record_signed(now_ns as i64 - stamp.actual_ns as i64);
+        }
+        if phase_records_storm_survivors(phase, severed) {
+            shared
+                .storm_survivors
+                .one_way
+                .record_signed(now_ns as i64 - stamp.actual_ns as i64);
+        }
         return;
     }
 
@@ -1130,17 +1580,31 @@ fn record_arrival(
     if stamp.echo_actual_ns == 0 {
         // The server did not reflect. Counted, never recorded: a round trip
         // measured from the epoch is not a small number, it is a wrong one.
-        realm.ack_unreflected.fetch_add(1, Ordering::Relaxed);
+        shared.lifetime.record_ack_unreflected();
+        if phase_records_steady_drain(phase) {
+            shared.steady_drain.record_ack_unreflected();
+        }
+        if phase_records_storm_survivors(phase, severed) {
+            shared.storm_survivors.record_ack_unreflected();
+        }
         return;
     }
     let rtt = now_ns as i64 - stamp.echo_actual_ns as i64;
     if stamp.hold_ns > 0 {
-        shared.server_hold.record(stamp.hold_ns);
+        shared.lifetime.server_hold.record(stamp.hold_ns);
+        if phase_records_steady_drain(phase) {
+            shared.steady_drain.server_hold.record(stamp.hold_ns);
+        }
+        if phase_records_storm_survivors(phase, severed) {
+            shared.storm_survivors.server_hold.record(stamp.hold_ns);
+        }
     }
-    match phase {
-        PHASE_STEADY => shared.rtt_steady.record_signed(rtt),
-        PHASE_STORM if !severed => shared.rtt_storm_survivors.record_signed(rtt),
-        _ => {}
+    shared.lifetime.rtt.record_signed(rtt);
+    if phase_records_steady_drain(phase) {
+        shared.steady_drain.rtt.record_signed(rtt);
+    }
+    if phase_records_storm_survivors(phase, severed) {
+        shared.storm_survivors.rtt.record_signed(rtt);
     }
 }
 
@@ -1155,19 +1619,13 @@ async fn hold_session(
     phase_offset: f64,
     shared: &Shared,
 ) {
-    while *phase.borrow() == PHASE_CONNECT {
-        if phase.changed().await.is_err() {
-            return;
-        }
-    }
-
-    let severed = is_severed(index, options.storm_cohort);
     let receive_only = options.role == Role::RaidSubscriber;
     let track_schedule = !receive_only;
     let mut conn = conn;
     let mut payload = vec![b'x'; options.payload_bytes];
     let mut sequence: u64 = 0;
     let mut severed_yet = false;
+    let mut active_send_window: Option<ActiveSendWindow> = None;
 
     // The server has no path or authority to key a role off, so a receive-only
     // session says what it is exactly once. One datagram per subscriber, sent
@@ -1175,28 +1633,29 @@ async fn hold_session(
     if receive_only {
         let now = monotonic_ns();
         write_stamp_v3(&mut payload, now, now, 0, CLASS_RAID_JOIN);
-        if conn.send_datagram(&payload).is_err() {
-            shared.realm.send_err.fetch_add(1, Ordering::Relaxed);
-        }
+        let _ = conn.send_datagram(&payload);
     }
 
-    let started_at = tokio::time::Instant::now();
-    let offset = first_tick_offset(options.send_interval, phase_offset);
-    let mut ticker = tokio::time::interval_at(started_at + offset, options.send_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut accounted = false;
+    while *phase.borrow() == PHASE_CONNECT {
+        if phase.changed().await.is_err() {
+            return;
+        }
+    }
+    let severed = is_severed(index, options.storm_cohort);
 
     loop {
         let current = *phase.borrow();
+        sync_send_window(
+            shared,
+            track_schedule,
+            &mut active_send_window,
+            send_window_kind(current),
+            options.send_interval,
+            phase_offset,
+            severed,
+        );
+
         if current == PHASE_STOP {
-            account_ticks(
-                shared,
-                track_schedule,
-                started_at,
-                options.send_interval,
-                phase_offset,
-                &mut accounted,
-            );
             break;
         }
 
@@ -1228,10 +1687,10 @@ async fn hold_session(
                     record_reconnect_failure(
                         shared,
                         track_schedule,
-                        started_at,
+                        &mut active_send_window,
                         options.send_interval,
                         phase_offset,
-                        &mut accounted,
+                        severed,
                         e.to_string(),
                     );
                     return;
@@ -1240,15 +1699,7 @@ async fn hold_session(
             continue;
         }
 
-        if current == PHASE_IDLE {
-            account_ticks(
-                shared,
-                track_schedule,
-                started_at,
-                options.send_interval,
-                phase_offset,
-                &mut accounted,
-            );
+        if current == PHASE_DRAIN || current == PHASE_IDLE {
             tokio::select! {
                 changed = phase.changed() => {
                     if changed.is_err() { break; }
@@ -1256,8 +1707,7 @@ async fn hold_session(
                 received = conn.receive_datagram() => {
                     match received {
                         Ok(d) => record_arrival(
-                            d.as_ref(), monotonic_ns(), severed, current,
-                            shared, &shared.realm, &shared.survivors,
+                            d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
                         ),
                         Err(_) => {
                             shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
@@ -1277,8 +1727,7 @@ async fn hold_session(
                 received = conn.receive_datagram() => {
                     match received {
                         Ok(d) => record_arrival(
-                            d.as_ref(), monotonic_ns(), severed, current,
-                            shared, &shared.realm, &shared.survivors,
+                            d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
                         ),
                         Err(_) => {
                             shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
@@ -1293,18 +1742,34 @@ async fn hold_session(
         tokio::select! {
             changed = phase.changed() => {
                 if changed.is_err() {
-                    account_ticks(
+                    sync_send_window(
                         shared,
                         track_schedule,
-                        started_at,
+                        &mut active_send_window,
+                        None,
                         options.send_interval,
                         phase_offset,
-                        &mut accounted,
+                        severed,
                     );
                     break;
                 }
             }
-            scheduled = ticker.tick() => {
+            scheduled = active_send_window.as_mut().expect("send window active").ticker.tick() => {
+                let phase_now = *phase.borrow();
+                let desired_window = send_window_kind(phase_now);
+                let active_kind = active_send_window.as_ref().map(|window| window.kind);
+                if desired_window != active_kind {
+                    sync_send_window(
+                        shared,
+                        track_schedule,
+                        &mut active_send_window,
+                        desired_window,
+                        options.send_interval,
+                        phase_offset,
+                        severed,
+                    );
+                    continue;
+                }
                 sequence = sequence.wrapping_add(1);
                 // The stamp goes in immediately before the send, so the instant
                 // it carries is the actual send instant and nothing this
@@ -1313,13 +1778,16 @@ async fn hold_session(
                 let actual_ns = monotonic_ns();
                 let observation =
                     observe_tick(scheduled, observed, actual_ns, options.send_interval);
-                shared.schedule_ticks_fired.fetch_add(1, Ordering::Relaxed);
-                shared
-                    .schedule_ticks_skipped
-                    .fetch_add(observation.skipped_ticks, Ordering::Relaxed);
-                shared
-                    .schedule_lag
-                    .record(observation.lag_ns);
+                let active_kind = active_send_window
+                    .as_ref()
+                    .expect("send window active after resync")
+                    .kind;
+                shared.lifetime.record_tick(observation);
+                match active_kind {
+                    SendWindowKind::Steady => shared.steady.record_tick(observation),
+                    SendWindowKind::Storm if !severed => shared.storm_survivors.record_tick(observation),
+                    SendWindowKind::Storm | SendWindowKind::Post => {}
+                }
                 let class = if options.role == Role::Publisher {
                     CLASS_RAID
                 } else {
@@ -1332,26 +1800,18 @@ async fn hold_session(
                     sequence,
                     class,
                 );
-                match conn.send_datagram(&payload) {
-                    Ok(()) => {
-                        shared.realm.sent.fetch_add(1, Ordering::Relaxed);
-                        if !severed && current == PHASE_STORM {
-                            shared.survivors.sent.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Err(_) => {
-                        shared.realm.send_err.fetch_add(1, Ordering::Relaxed);
-                        if !severed && current == PHASE_STORM {
-                            shared.survivors.send_err.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
+                let sent_ok = conn.send_datagram(&payload).is_ok();
+                shared.lifetime.record_send(sent_ok);
+                match active_kind {
+                    SendWindowKind::Steady => shared.steady.record_send(sent_ok),
+                    SendWindowKind::Storm if !severed => shared.storm_survivors.record_send(sent_ok),
+                    SendWindowKind::Storm | SendWindowKind::Post => {}
+                };
             }
             received = conn.receive_datagram() => {
                 match received {
                     Ok(d) => record_arrival(
-                        d.as_ref(), monotonic_ns(), severed, current,
-                        shared, &shared.realm, &shared.survivors,
+                        d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
                     ),
                     Err(_) => {
                         // A session lost mid-drive still offered whatever its
@@ -1359,13 +1819,14 @@ async fn hold_session(
                         // quietly forgive the shortfall. A severed session in
                         // the storm phase is expected to see this and is not
                         // counted as lost.
-                        account_ticks(
+                        sync_send_window(
                             shared,
                             track_schedule,
-                            started_at,
+                            &mut active_send_window,
+                            None,
                             options.send_interval,
                             phase_offset,
-                            &mut accounted,
+                            severed,
                         );
                         if !(severed && current == PHASE_STORM) {
                             shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
@@ -1547,43 +2008,64 @@ mod tests {
 
     #[test]
     fn reconnect_failure_books_schedule_before_returning() {
-        let shared = Shared::new(1);
-        shared.schedule_ticks_fired.store(3, Ordering::Relaxed);
-        shared.schedule_ticks_skipped.store(1, Ordering::Relaxed);
-        let mut accounted = false;
-        let started_at = tokio::time::Instant::now() - Duration::from_millis(3600);
-        let interval = Duration::from_secs(1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let shared = Shared::new(1);
+            shared
+                .lifetime
+                .counters
+                .ticks_fired
+                .store(3, Ordering::Relaxed);
+            shared
+                .lifetime
+                .counters
+                .ticks_skipped
+                .store(1, Ordering::Relaxed);
+            let mut active_window = Some(ActiveSendWindow {
+                kind: SendWindowKind::Storm,
+                started_at: tokio::time::Instant::now() - Duration::from_millis(3600),
+                ticker: tokio::time::interval(Duration::from_secs(1)),
+            });
+            let interval = Duration::from_secs(1);
 
-        record_reconnect_failure(
-            &shared,
-            true,
-            started_at,
-            interval,
-            0.0,
-            &mut accounted,
-            "storm reconnect failed".to_string(),
-        );
+            record_reconnect_failure(
+                &shared,
+                true,
+                &mut active_window,
+                interval,
+                0.0,
+                false,
+                "storm reconnect failed".to_string(),
+            );
 
-        assert!(accounted);
-        assert_eq!(shared.sessions.reconnect_err.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            shared.errors.lock().unwrap().as_slice(),
-            ["storm reconnect failed"]
-        );
-        let accounting = ScheduleAccounting {
-            due: shared.schedule_ticks_due.load(Ordering::Relaxed),
-            fired: shared.schedule_ticks_fired.load(Ordering::Relaxed),
-            skipped: shared.schedule_ticks_skipped.load(Ordering::Relaxed),
-        };
-        assert_eq!(
-            accounting,
-            ScheduleAccounting {
-                due: 4,
-                fired: 3,
-                skipped: 1,
-            }
-        );
-        assert!(accounting.reconciled());
+            assert!(active_window.is_none());
+            assert_eq!(shared.sessions.reconnect_err.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                shared.errors.lock().unwrap().as_slice(),
+                ["storm reconnect failed"]
+            );
+            let accounting = ScheduleAccounting {
+                due: shared.lifetime.counters.ticks_due.load(Ordering::Relaxed),
+                fired: shared.lifetime.counters.ticks_fired.load(Ordering::Relaxed),
+                skipped: shared
+                    .lifetime
+                    .counters
+                    .ticks_skipped
+                    .load(Ordering::Relaxed),
+            };
+            assert_eq!(
+                accounting,
+                ScheduleAccounting {
+                    due: 4,
+                    fired: 3,
+                    skipped: 1,
+                }
+            );
+            assert!(accounting.reconciled());
+        });
     }
 
     #[test]
@@ -1619,55 +2101,96 @@ mod tests {
         assert_eq!(json_string(Some(parsed.as_str())), format!("\"{sha}\""));
     }
 
+    #[test]
+    fn started_at_is_required() {
+        let err = validate_started_at(None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "mmo-client: --started-at is required for mmo-client/2 reports"
+        );
+    }
+
+    #[test]
+    fn started_at_rejects_malformed_values() {
+        for raw in [
+            "",
+            "2026-08-24",
+            "2026-08-24T08:00:00",
+            "2026-08-24 08:00:00Z",
+            "2026-08-24T08:00Z",
+            "2026-08-24T08:00:00+00:00",
+            "2026-99-24T08:00:00Z",
+            "2026-02-30T08:00:00Z",
+            "2025-02-29T08:00:00Z",
+            "2026-08-24T24:00:00Z",
+            "2026-08-24T08:60:00Z",
+            "2026-08-24T08:00:60Z",
+            "not-a-date",
+        ] {
+            let err = validate_started_at(Some(raw)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("mmo-client: --started-at must be an RFC3339 UTC timestamp, got '{raw}'")
+            );
+        }
+    }
+
+    #[test]
+    fn started_at_accepts_valid_and_is_json_safe() {
+        for raw in ["2026-08-24T08:00:00Z", "2026-08-24T08:00:00.123Z"] {
+            let parsed = validate_started_at(Some(raw)).unwrap();
+            assert_eq!(parsed, raw);
+            assert_eq!(json_string(Some(parsed.as_str())), format!("\"{raw}\""));
+        }
+    }
+
     /// The classification the round trip depends on, exercised without a
     /// network: an ack the server forgot to reflect must be *counted*, never
     /// recorded as a round trip measured from the epoch.
     #[test]
     fn an_unreflected_ack_is_counted_and_not_measured() {
         let shared = Shared::new(1);
-        let realm = Counters::default();
-        let survivors = Counters::default();
         let mut buf = [0u8; STAMP_BYTES_V3];
         write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
-        record_arrival(
-            &buf,
-            monotonic_ns(),
-            false,
-            PHASE_STEADY,
-            &shared,
-            &realm,
-            &survivors,
+        record_arrival(&buf, monotonic_ns(), false, PHASE_STEADY, &shared);
+        assert_eq!(shared.lifetime.counters.rx_ack.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared
+                .lifetime
+                .counters
+                .ack_unreflected
+                .load(Ordering::Relaxed),
+            1
         );
-        assert_eq!(realm.rx_ack.load(Ordering::Relaxed), 1);
-        assert_eq!(realm.ack_unreflected.load(Ordering::Relaxed), 1);
-        assert!(shared.rtt_steady.to_json().contains("\"count\":0"));
+        assert!(shared.steady_drain.rtt.to_json().contains("\"count\":0"));
     }
 
     #[test]
     fn a_reflected_ack_produces_exactly_one_round_trip_sample() {
         let shared = Shared::new(1);
-        let realm = Counters::default();
-        let survivors = Counters::default();
         let sent_ns = monotonic_ns();
         let mut buf = [0u8; STAMP_BYTES_V3];
         write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
         // The server's half: reflect the client's instant and report its dwell.
         buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
         buf[36..44].copy_from_slice(&3_000_000u64.to_le_bytes());
-        record_arrival(
-            &buf,
-            sent_ns + 12_000_000,
-            false,
-            PHASE_STEADY,
-            &shared,
-            &realm,
-            &survivors,
-        );
-        let json = shared.rtt_steady.to_json();
+        record_arrival(&buf, sent_ns + 12_000_000, false, PHASE_STEADY, &shared);
+        let json = shared.steady_drain.rtt.to_json();
         assert!(json.contains("\"count\":1"), "{json}");
         assert!(json.contains("\"negative\":0"), "{json}");
-        assert!(shared.server_hold.to_json().contains("\"count\":1"));
-        assert_eq!(realm.ack_unreflected.load(Ordering::Relaxed), 0);
+        assert!(shared
+            .steady_drain
+            .server_hold
+            .to_json()
+            .contains("\"count\":1"));
+        assert_eq!(
+            shared
+                .lifetime
+                .counters
+                .ack_unreflected
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     /// §5.3: the survivor clause is computed over the survivor cohort alone.
@@ -1676,50 +2199,38 @@ mod tests {
     #[test]
     fn survivor_accounting_excludes_the_severed_cohort() {
         let shared = Shared::new(1);
-        let realm = Counters::default();
-        let survivors = Counters::default();
         let sent_ns = monotonic_ns();
         let mut buf = [0u8; STAMP_BYTES_V3];
         write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
         buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
 
-        record_arrival(
-            &buf,
-            sent_ns + 1_000_000,
-            true,
-            PHASE_STORM,
-            &shared,
-            &realm,
-            &survivors,
+        record_arrival(&buf, sent_ns + 1_000_000, true, PHASE_STORM, &shared);
+        assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":0"));
+        assert_eq!(
+            shared
+                .storm_survivors
+                .counters
+                .rx_ack
+                .load(Ordering::Relaxed),
+            0
         );
-        assert!(shared.rtt_storm_survivors.to_json().contains("\"count\":0"));
-        assert_eq!(survivors.rx_ack.load(Ordering::Relaxed), 0);
 
-        record_arrival(
-            &buf,
-            sent_ns + 1_000_000,
-            false,
-            PHASE_STORM,
-            &shared,
-            &realm,
-            &survivors,
+        record_arrival(&buf, sent_ns + 1_000_000, false, PHASE_STORM, &shared);
+        assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":1"));
+        assert_eq!(
+            shared
+                .storm_survivors
+                .counters
+                .rx_ack
+                .load(Ordering::Relaxed),
+            1
         );
-        assert!(shared.rtt_storm_survivors.to_json().contains("\"count\":1"));
-        assert_eq!(survivors.rx_ack.load(Ordering::Relaxed), 1);
 
         // Outside the storm window a survivor's ack belongs to the steady
         // histogram, not the survivor one.
-        record_arrival(
-            &buf,
-            sent_ns + 1_000_000,
-            false,
-            PHASE_STEADY,
-            &shared,
-            &realm,
-            &survivors,
-        );
-        assert!(shared.rtt_storm_survivors.to_json().contains("\"count\":1"));
-        assert!(shared.rtt_steady.to_json().contains("\"count\":1"));
+        record_arrival(&buf, sent_ns + 1_000_000, false, PHASE_STEADY, &shared);
+        assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":1"));
+        assert!(shared.steady_drain.rtt.to_json().contains("\"count\":1"));
     }
 
     #[test]
@@ -1727,39 +2238,90 @@ mod tests {
         // Snapshots are interpolated client-side; the gate's latency clause is
         // on the ack class alone, and mixing them would measure tick wait.
         let shared = Shared::new(1);
-        let realm = Counters::default();
-        let survivors = Counters::default();
         let mut buf = [0u8; STAMP_BYTES_V3];
         write_stamp_v3(&mut buf, 0, monotonic_ns(), 1, CLASS_SNAPSHOT);
-        record_arrival(
-            &buf,
-            monotonic_ns(),
-            false,
-            PHASE_STEADY,
-            &shared,
-            &realm,
-            &survivors,
+        record_arrival(&buf, monotonic_ns(), false, PHASE_STEADY, &shared);
+        assert_eq!(
+            shared.lifetime.counters.rx_snapshot.load(Ordering::Relaxed),
+            1
         );
-        assert_eq!(realm.rx_snapshot.load(Ordering::Relaxed), 1);
-        assert!(shared.rtt_steady.to_json().contains("\"count\":0"));
+        assert!(shared.steady_drain.rtt.to_json().contains("\"count\":0"));
+    }
+
+    #[test]
+    fn drain_phase_keeps_receive_accounting_in_steady_drain_window() {
+        let shared = Shared::new(1);
+        let sent_ns = monotonic_ns();
+        let mut buf = [0u8; STAMP_BYTES_V3];
+        write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
+        buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
+        buf[36..44].copy_from_slice(&2_000_000u64.to_le_bytes());
+
+        record_arrival(&buf, sent_ns + 9_000_000, false, PHASE_DRAIN, &shared);
+
+        assert_eq!(
+            shared.steady_drain.counters.rx_ack.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            shared
+                .steady_drain
+                .counters
+                .ack_unreflected
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(shared.steady_drain.rtt.to_json().contains("\"count\":1"));
+        assert!(shared.steady.rtt.to_json().contains("\"count\":0"));
+        assert_eq!(
+            shared
+                .storm_survivors
+                .counters
+                .rx_ack
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn schedule_windows_reanchor_after_drain() {
+        let interval = Duration::from_millis(250);
+        let steady = window_schedule_accounting(Duration::from_millis(600), interval, 0.0, 2, 0);
+        let storm = window_schedule_accounting(Duration::from_millis(375), interval, 0.0, 1, 1);
+
+        assert_eq!(
+            steady,
+            ScheduleAccounting {
+                due: 2,
+                fired: 2,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            storm,
+            ScheduleAccounting {
+                due: 2,
+                fired: 1,
+                skipped: 1,
+            }
+        );
+        assert!(steady.reconciled());
+        assert!(storm.reconciled());
     }
 
     #[test]
     fn a_foreign_payload_is_counted_as_unstamped() {
         let shared = Shared::new(1);
-        let realm = Counters::default();
-        let survivors = Counters::default();
-        record_arrival(
-            &[0u8; 64],
-            monotonic_ns(),
-            false,
-            PHASE_STEADY,
-            &shared,
-            &realm,
-            &survivors,
+        record_arrival(&[0u8; 64], monotonic_ns(), false, PHASE_STEADY, &shared);
+        assert_eq!(
+            shared
+                .lifetime
+                .counters
+                .rx_unstamped
+                .load(Ordering::Relaxed),
+            1
         );
-        assert_eq!(realm.rx_unstamped.load(Ordering::Relaxed), 1);
-        assert_eq!(realm.rx_other.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.lifetime.counters.rx_other.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1785,5 +2347,136 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.50), Some(6));
         assert_eq!(percentile(&sorted, 0.99), Some(10));
         assert_eq!(percentile(&[], 0.5), None);
+    }
+
+    fn phase_barrier_options(
+        role: Role,
+        dir: Option<&str>,
+        id: &str,
+        parties: usize,
+        timeout_ms: u64,
+    ) -> Options {
+        let mut options = Options::defaults();
+        options.role = role;
+        options.phase_barrier_id = Some(id.to_string());
+        options.phase_barrier_dir = dir.map(str::to_string);
+        options.phase_barrier_parties = parties;
+        options.phase_barrier_timeout = Duration::from_millis(timeout_ms);
+        options
+    }
+
+    fn unique_phase_barrier_dir(label: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "g6-phase-barrier-{label}-{}-{}",
+            std::process::id(),
+            monotonic_ns()
+        ));
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn phase_barrier_synchronizes_three_roles_with_shared_release() {
+        let dir = unique_phase_barrier_dir("success");
+        let id = format!("barrier-{}", monotonic_ns());
+        let roles = [Role::Realm, Role::Publisher, Role::RaidSubscriber];
+        let mut workers = Vec::new();
+        for role in roles {
+            let options = phase_barrier_options(role, Some(&dir), &id, 3, 1_000);
+            workers.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(wait_for_phase_barrier(&options))
+                    .unwrap()
+                    .unwrap()
+            }));
+        }
+        let proofs = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(proofs.len(), 3);
+        let first = &proofs[0];
+        assert!(first.ready_monotonic_ns > 0);
+        assert!(first.release_monotonic_ns > 0);
+        assert_eq!(first.steady_enter_unix_ms, 0);
+        assert_eq!(first.steady_enter_monotonic_ns, 0);
+        let mut seen_roles = proofs
+            .iter()
+            .map(|proof| proof.role.as_str())
+            .collect::<Vec<_>>();
+        seen_roles.sort_unstable();
+        assert_eq!(seen_roles, vec!["publisher", "raid-subscriber", "realm"]);
+        for proof in &proofs {
+            assert_eq!(proof.id, id);
+            assert_eq!(proof.parties, 3);
+            assert_eq!(proof.release_unix_ms, first.release_unix_ms);
+            assert_eq!(proof.release_monotonic_ns, first.release_monotonic_ns);
+            assert!(proof.ready_unix_ms <= proof.release_unix_ms);
+            assert!(proof.ready_monotonic_ns <= proof.release_monotonic_ns);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_barrier_times_out_when_parties_never_arrive() {
+        let dir = unique_phase_barrier_dir("timeout");
+        let options = phase_barrier_options(
+            Role::Realm,
+            Some(&dir),
+            &format!("timeout-{}", monotonic_ns()),
+            2,
+            50,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(wait_for_phase_barrier(&options))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_barrier_rejects_missing_dir_configuration() {
+        let options = phase_barrier_options(
+            Role::Realm,
+            None,
+            &format!("missing-dir-{}", monotonic_ns()),
+            3,
+            50,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(wait_for_phase_barrier(&options))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phase-barrier-dir is required"), "{err}");
+    }
+
+    #[test]
+    fn phase_barrier_json_includes_monotonic_fields() {
+        let json = PhaseBarrierProof {
+            id: "barrier".to_string(),
+            role: "realm".to_string(),
+            parties: 3,
+            ready_unix_ms: 100,
+            ready_monotonic_ns: 200,
+            release_unix_ms: 300,
+            release_monotonic_ns: 400,
+            steady_enter_unix_ms: 500,
+            steady_enter_monotonic_ns: 600,
+        }
+        .to_json();
+        assert!(json.contains("\"readyMonotonicNs\":200"), "{json}");
+        assert!(json.contains("\"releaseMonotonicNs\":400"), "{json}");
+        assert!(json.contains("\"steadyEnterMonotonicNs\":600"), "{json}");
     }
 }

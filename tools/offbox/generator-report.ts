@@ -21,6 +21,7 @@ import {
 	LatencyHistogram,
 	type LatencyHistogramJson,
 } from "../load/latency-histogram.ts";
+import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "../load/g6-plan.ts";
 
 /** Provenance lines `mac-generator-entry.sh` prints before the run. */
 export type GeneratorProvenance = {
@@ -44,6 +45,10 @@ export type GeneratorReport = {
 	provenance: GeneratorProvenance;
 	/** Legacy `latency-json` or the retained MMO envelope, passed through verbatim. */
 	latencyJson: unknown | null;
+	schema: string | null;
+	startedAt: string | null;
+	preRegistration: { id: string; path: string; sha256: string } | null;
+	historicalOnly: boolean;
 	sessionsOk: number | null;
 	sessionsErr: number | null;
 	datagramsSent: number | null;
@@ -70,6 +75,10 @@ type JsonMap = Record<string, unknown>;
 
 type ParsedMmoReport = {
 	latencyJson: JsonMap;
+	schema: string;
+	startedAt: string | null;
+	preRegistration: { id: string; path: string; sha256: string } | null;
+	historicalOnly: boolean;
 	sessionsOk: number;
 	sessionsErr: number;
 	datagramsSent: number;
@@ -94,52 +103,156 @@ function jsonFieldNumber(obj: JsonMap | null, key: string): number | null {
 }
 
 function scheduleLagCount(latencyJson: unknown): number | null {
-	return jsonFieldNumber(jsonMap(jsonMap(latencyJson)?.scheduleLag), "count");
+	const root = jsonMap(latencyJson);
+	const schema = root?.schema;
+	if (schema === "mmo-client/2") {
+		return jsonFieldNumber(
+			jsonMap(jsonMap(jsonMap(root?.windows)?.steady)?.scheduleLag),
+			"count",
+		);
+	}
+	return jsonFieldNumber(jsonMap(jsonMap(root)?.scheduleLag), "count");
 }
 
-function parseMmoClientEnvelope(json: unknown): ParsedMmoReport | string {
+function parseMmoClientEnvelope(
+	json: unknown,
+	expectedPreRegistrationSha256?: string,
+): ParsedMmoReport | string {
 	const root = jsonMap(json);
-	if (root?.schema !== "mmo-client/1") {
-		return "mmo-client json did not match schema mmo-client/1 floor shape";
+	if (root?.schema === "mmo-client/1") {
+		if (root.role !== "realm") {
+			return "mmo-client floor report role must be realm";
+		}
+
+		const scheduleLag = jsonMap(root.scheduleLag);
+		const realm = jsonMap(root.realm);
+		const config = jsonMap(root.config);
+
+		const sessionsRequested = jsonFieldNumber(root, "sessionsRequested");
+		const sessionsOk = jsonFieldNumber(root, "sessionsOk");
+		const sessionsErr = jsonFieldNumber(root, "sessionsErr");
+		const datagramsSent = jsonFieldNumber(realm, "sent");
+		const datagramsErr = jsonFieldNumber(realm, "sendErr");
+		const driveWindowSec = jsonFieldNumber(config, "steadySec");
+		const scheduleLagVersion = jsonFieldNumber(scheduleLag, "version");
+		const scheduleLagSamples = jsonFieldNumber(scheduleLag, "count");
+		const rxSnapshot = jsonFieldNumber(realm, "rxSnapshot");
+		const rxAck = jsonFieldNumber(realm, "rxAck");
+		const rxRaid = jsonFieldNumber(realm, "rxRaid");
+		const rxOther = jsonFieldNumber(realm, "rxOther");
+		const rxUnstamped = jsonFieldNumber(realm, "rxUnstamped");
+
+		if (
+			sessionsRequested === null ||
+			sessionsOk === null ||
+			sessionsErr === null ||
+			datagramsSent === null ||
+			datagramsErr === null ||
+			driveWindowSec === null ||
+			scheduleLagVersion === null ||
+			scheduleLagSamples === null ||
+			rxSnapshot === null ||
+			rxAck === null ||
+			rxRaid === null ||
+			rxOther === null ||
+			rxUnstamped === null
+		) {
+			return "mmo-client json did not match schema mmo-client/1 floor shape";
+		}
+		try {
+			LatencyHistogram.fromJson(scheduleLag as LatencyHistogramJson);
+		} catch (err) {
+			return `mmo-client scheduleLag did not match LatencyHistogramJson: ${String(err)}`;
+		}
+
+		return {
+			latencyJson: root,
+			schema: "mmo-client/1",
+			startedAt: null,
+			preRegistration: null,
+			historicalOnly: true,
+			sessionsOk,
+			sessionsErr,
+			datagramsSent,
+			datagramsErr,
+			datagramsReceived: rxSnapshot + rxAck + rxRaid + rxOther + rxUnstamped,
+			driveWindowSec,
+			sessionsDriving: sessionsRequested === 0 ? 0 : sessionsOk,
+		};
+	}
+	if (root?.schema !== "mmo-client/2") {
+		return "mmo-client json did not match schema mmo-client/1 or mmo-client/2 floor shape";
 	}
 	if (root.role !== "realm") {
 		return "mmo-client floor report role must be realm";
 	}
-
-	const scheduleLag = jsonMap(root.scheduleLag);
-	const realm = jsonMap(root.realm);
+	const startedAt =
+		typeof root.startedAt === "string" && root.startedAt.length > 0
+			? root.startedAt
+			: null;
+	const preRegistration = jsonMap(root.preRegistration);
+	const windows = jsonMap(root.windows);
+	const steady = jsonMap(windows?.steady);
+	const steadyDrain = jsonMap(windows?.steadyDrain);
+	const scheduleLag = jsonMap(steady?.scheduleLag);
 	const config = jsonMap(root.config);
 
 	const sessionsRequested = jsonFieldNumber(root, "sessionsRequested");
 	const sessionsOk = jsonFieldNumber(root, "sessionsOk");
 	const sessionsErr = jsonFieldNumber(root, "sessionsErr");
-	const datagramsSent = jsonFieldNumber(realm, "sent");
-	const datagramsErr = jsonFieldNumber(realm, "sendErr");
+	const datagramsSent = jsonFieldNumber(steady, "sent");
+	const datagramsErr = jsonFieldNumber(steady, "sendErr");
 	const driveWindowSec = jsonFieldNumber(config, "steadySec");
-	const scheduleLagVersion = jsonFieldNumber(scheduleLag, "version");
-	const scheduleLagCount = jsonFieldNumber(scheduleLag, "count");
-	const rxSnapshot = jsonFieldNumber(realm, "rxSnapshot");
-	const rxAck = jsonFieldNumber(realm, "rxAck");
-	const rxRaid = jsonFieldNumber(realm, "rxRaid");
-	const rxOther = jsonFieldNumber(realm, "rxOther");
-	const rxUnstamped = jsonFieldNumber(realm, "rxUnstamped");
+	const scheduleLagFired = jsonFieldNumber(steady, "scheduleTicksFired");
+	const scheduleLagReconciled = steady?.scheduleTicksReconciled;
+	const scheduleLagSamples = jsonFieldNumber(scheduleLag, "count");
+	const rxSnapshot = jsonFieldNumber(steadyDrain, "rxSnapshot");
+	const rxAck = jsonFieldNumber(steadyDrain, "rxAck");
+	const rxRaid = jsonFieldNumber(steadyDrain, "rxRaid");
+	const rxOther = jsonFieldNumber(steadyDrain, "rxOther");
+	const rxUnstamped = jsonFieldNumber(steadyDrain, "rxUnstamped");
 
 	if (
+		startedAt === null ||
+		typeof preRegistration?.id !== "string" ||
+		typeof preRegistration?.path !== "string" ||
+		typeof preRegistration?.sha256 !== "string" ||
 		sessionsRequested === null ||
 		sessionsOk === null ||
 		sessionsErr === null ||
 		datagramsSent === null ||
 		datagramsErr === null ||
 		driveWindowSec === null ||
-		scheduleLagVersion === null ||
-		scheduleLagCount === null ||
+		scheduleLagFired === null ||
+		scheduleLagSamples === null ||
 		rxSnapshot === null ||
 		rxAck === null ||
 		rxRaid === null ||
 		rxOther === null ||
 		rxUnstamped === null
 	) {
-		return "mmo-client json did not match schema mmo-client/1 floor shape";
+		return "mmo-client json did not match schema mmo-client/2 floor shape";
+	}
+	if (preRegistration.id !== G6_CLOSEOUT_SPEC_ID) {
+		return `mmo-client preregistration id must be ${G6_CLOSEOUT_SPEC_ID}`;
+	}
+	if (preRegistration.path !== G6_CLOSEOUT_SPEC_PATH) {
+		return `mmo-client preregistration path must be ${G6_CLOSEOUT_SPEC_PATH}`;
+	}
+	if (!/^[0-9a-f]{64}$/i.test(preRegistration.sha256)) {
+		return "mmo-client preregistration sha256 must be 64 hex chars";
+	}
+	if (
+		expectedPreRegistrationSha256 &&
+		preRegistration.sha256 !== expectedPreRegistrationSha256
+	) {
+		return `mmo-client preregistration sha256 ${preRegistration.sha256} did not match expected ${expectedPreRegistrationSha256}`;
+	}
+	if (scheduleLagReconciled !== true) {
+		return "mmo-client steady window scheduleTicksReconciled must be true";
+	}
+	if (scheduleLagSamples !== scheduleLagFired) {
+		return "mmo-client steady window scheduleLag count did not match scheduleTicksFired";
 	}
 	try {
 		LatencyHistogram.fromJson(scheduleLag as LatencyHistogramJson);
@@ -149,6 +262,14 @@ function parseMmoClientEnvelope(json: unknown): ParsedMmoReport | string {
 
 	return {
 		latencyJson: root,
+		schema: "mmo-client/2",
+		startedAt,
+		preRegistration: {
+			id: preRegistration.id,
+			path: preRegistration.path,
+			sha256: preRegistration.sha256,
+		},
+		historicalOnly: false,
 		sessionsOk,
 		sessionsErr,
 		datagramsSent,
@@ -169,6 +290,7 @@ function parseMmoClientEnvelope(json: unknown): ParsedMmoReport | string {
 export function parseGeneratorReport(
 	stdout: string,
 	expectedCandidate?: string,
+	expectedPreRegistrationSha256?: string,
 ): GeneratorReport {
 	const problems: string[] = [];
 
@@ -232,6 +354,10 @@ export function parseGeneratorReport(
 	}
 
 	let latencyJson: unknown | null = null;
+	let schema: string | null = null;
+	let startedAt: string | null = null;
+	let preRegistration: GeneratorReport["preRegistration"] = null;
+	let historicalOnly = false;
 	let sessionsOk = num(stdout, /^load-client: sessions ok=(\d+)/m);
 	let sessionsErr = num(stdout, /^load-client: sessions ok=\d+ err=(\d+)/m);
 	let datagramsSent = num(stdout, /^load-client: datagrams sent=(\d+)/m);
@@ -255,7 +381,10 @@ export function parseGeneratorReport(
 			problems.push(`latency-json did not parse: ${String(err)}`);
 		}
 		try {
-			const parsed = parseMmoClientEnvelope(JSON.parse(mmoLine[1]));
+			const parsed = parseMmoClientEnvelope(
+				JSON.parse(mmoLine[1]),
+				expectedPreRegistrationSha256,
+			);
 			if (typeof parsed === "string") problems.push(parsed);
 		} catch (err) {
 			problems.push(`mmo-client json did not parse: ${String(err)}`);
@@ -269,11 +398,18 @@ export function parseGeneratorReport(
 	} else {
 		if (mmoLine?.[1]) {
 			try {
-				const parsed = parseMmoClientEnvelope(JSON.parse(mmoLine[1]));
+				const parsed = parseMmoClientEnvelope(
+					JSON.parse(mmoLine[1]),
+					expectedPreRegistrationSha256,
+				);
 				if (typeof parsed === "string") {
 					problems.push(parsed);
 				} else {
 					latencyJson = parsed.latencyJson;
+					schema = parsed.schema;
+					startedAt = parsed.startedAt;
+					preRegistration = parsed.preRegistration;
+					historicalOnly = parsed.historicalOnly;
 					sessionsOk = parsed.sessionsOk;
 					sessionsErr = parsed.sessionsErr;
 					datagramsSent = parsed.datagramsSent;
@@ -304,6 +440,10 @@ export function parseGeneratorReport(
 	return {
 		provenance,
 		latencyJson,
+		schema,
+		startedAt,
+		preRegistration,
+		historicalOnly,
 		sessionsOk,
 		sessionsErr,
 		datagramsSent,
@@ -325,6 +465,7 @@ export function parseGeneratorReport(
 export function floorReportIsUsable(
 	report: GeneratorReport,
 	expectedGeneratorHost: string,
+	expectedPreRegistrationSha256?: string,
 ): { usable: boolean; reasons: string[] } {
 	const reasons = [...report.problems];
 	if (
@@ -337,6 +478,22 @@ export function floorReportIsUsable(
 	}
 	if (report.latencyJson === null)
 		reasons.push("no scheduleLag to read a floor from");
+	if (report.historicalOnly) {
+		reasons.push(
+			"historical mmo-client/1 floor reports are readable but not successor-valid",
+		);
+	}
+	if (expectedPreRegistrationSha256 !== undefined) {
+		if (report.preRegistration === null) {
+			reasons.push("no preregistration identity on floor report");
+		} else if (
+			report.preRegistration.sha256 !== expectedPreRegistrationSha256
+		) {
+			reasons.push(
+				`floor preregistration sha256 ${report.preRegistration.sha256} did not match expected ${expectedPreRegistrationSha256}`,
+			);
+		}
+	}
 	const lagCount = scheduleLagCount(report.latencyJson);
 	if (report.latencyJson !== null && lagCount !== null && lagCount <= 0) {
 		reasons.push(
