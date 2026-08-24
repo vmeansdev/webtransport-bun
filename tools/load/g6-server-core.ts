@@ -139,6 +139,32 @@ export type G6ServerCoreIntervalScheduler = {
 	clearInterval: (handle: unknown) => void;
 };
 
+export type G6ServerCoreInstrumentationSwitches = {
+	recordClauseLatencyHistograms: boolean;
+	retainPerDatagramDiagnosticSamples: boolean;
+	emitVerboseProgressLogs: boolean;
+	materializeHumanReadableRows: boolean;
+};
+
+export type G6ServerCoreInstrumentation = {
+	switches?: Partial<G6ServerCoreInstrumentationSwitches>;
+	emitVerboseProgress?: (message: string) => void;
+	materializeHumanReadableRow?: (row: string) => void;
+};
+
+export type G6ServerCoreDueAccounting = {
+	plannedSessions: number;
+	steadyWindowSec: number;
+};
+
+const DEFAULT_G6_SERVER_CORE_INSTRUMENTATION_SWITCHES: Readonly<G6ServerCoreInstrumentationSwitches> =
+	Object.freeze({
+		recordClauseLatencyHistograms: true,
+		retainPerDatagramDiagnosticSamples: true,
+		emitVerboseProgressLogs: true,
+		materializeHumanReadableRows: true,
+	});
+
 export function createG6ServerCore(options: {
 	plan?: G6ServerCorePlan;
 	clock: { now: () => number };
@@ -146,6 +172,8 @@ export function createG6ServerCore(options: {
 	phaseState: { current: EmitterPhase };
 	state: () => ServerState;
 	severAtMs: () => number | null;
+	instrumentation?: G6ServerCoreInstrumentation;
+	dueAccounting?: G6ServerCoreDueAccounting;
 }): {
 	plan: G6ServerCorePlan;
 	players: Player[];
@@ -159,6 +187,62 @@ export function createG6ServerCore(options: {
 	const plan = options.plan ?? REGISTERED_G6_SERVER_CORE_PLAN;
 	const players: Player[] = [];
 	const raidMembers: Player[] = [];
+	const switches = {
+		...DEFAULT_G6_SERVER_CORE_INSTRUMENTATION_SWITCHES,
+		...(options.instrumentation?.switches ?? {}),
+	};
+	const emitVerboseProgress = (message: string): void => {
+		if (!switches.emitVerboseProgressLogs) return;
+		options.instrumentation?.emitVerboseProgress?.(message);
+	};
+	const materializeHumanReadableRow = (row: string): void => {
+		if (!switches.materializeHumanReadableRows) return;
+		options.instrumentation?.materializeHumanReadableRow?.(row);
+	};
+	const recordHistogram = (
+		histogram: LatencyHistogram,
+		value: number,
+	): void => {
+		if (!switches.recordClauseLatencyHistograms) return;
+		histogram.record(value);
+	};
+	const retainDiagnosticSample = (samples: number[], value: number): void => {
+		if (!switches.retainPerDatagramDiagnosticSamples) return;
+		samples.push(value);
+	};
+	const immutableSessionsInSlice = (sliceIndex: number): number => {
+		const plannedSessions = Math.max(
+			0,
+			options.dueAccounting?.plannedSessions ?? 0,
+		);
+		const { from, to } = emitterSliceBounds(
+			plannedSessions,
+			plan.slicesPerTick,
+			sliceIndex,
+		);
+		return Math.max(0, to - from);
+	};
+	const totalSteadySlices =
+		options.dueAccounting === undefined
+			? null
+			: Math.max(
+					0,
+					Math.round(
+						options.dueAccounting.steadyWindowSec * plan.emitterSliceHz,
+					),
+				);
+	const bookImmutableDueSlices = (
+		state: ServerState,
+		bookedSlicesRef: { value: number },
+		targetSliceCount: number,
+	): void => {
+		while (bookedSlicesRef.value < targetSliceCount) {
+			state.emitter.snapshotDue +=
+				immutableSessionsInSlice(bookedSlicesRef.value) *
+				plan.snapshotDatagrams;
+			bookedSlicesRef.value += 1;
+		}
+	};
 
 	const onSession = (session: G6ServerCoreSession): void => {
 		const acceptedAtMs = options.nowMs();
@@ -218,12 +302,12 @@ export function createG6ServerCore(options: {
 					}
 					if (lastPublisherArrivalNs !== null) {
 						const gapNs = entryNs - lastPublisherArrivalNs;
-						state.publisherGaps.push(gapNs);
+						retainDiagnosticSample(state.publisherGaps, gapNs);
 						if (
 							options.phaseState.current === "steady" ||
 							options.phaseState.current === "drain"
 						) {
-							state.publisherGapsSteadyDrain.push(gapNs);
+							retainDiagnosticSample(state.publisherGapsSteadyDrain, gapNs);
 						}
 					}
 					lastPublisherArrivalNs = entryNs;
@@ -234,6 +318,9 @@ export function createG6ServerCore(options: {
 						raidMembers,
 						options.clock,
 						options.phaseState,
+						recordHistogram,
+						emitVerboseProgress,
+						materializeHumanReadableRow,
 					);
 					continue;
 				}
@@ -254,15 +341,21 @@ export function createG6ServerCore(options: {
 						state.emitter.sendEventsSkipped += 1;
 						continue;
 					}
-					state.hold.record(sendNs - entryNs);
+					recordHistogram(state.hold, sendNs - entryNs);
 					if (
 						options.phaseState.current === "steady" ||
 						options.phaseState.current === "drain"
 					) {
-						state.holdSteadyDrain.record(sendNs - entryNs);
+						recordHistogram(state.holdSteadyDrain, sendNs - entryNs);
 					} else if (options.phaseState.current === "storm") {
-						state.holdStorm.record(sendNs - entryNs);
+						recordHistogram(state.holdStorm, sendNs - entryNs);
 					}
+					emitVerboseProgress(
+						`ack phase=${options.phaseState.current} seq=${stamp.sequence} holdNs=${sendNs - entryNs}`,
+					);
+					materializeHumanReadableRow(
+						`${options.phaseState.current} ack seq=${stamp.sequence} holdNs=${sendNs - entryNs}`,
+					);
 					try {
 						player.sendOne(ack);
 						state.emitter.ackIssued += 1;
@@ -287,26 +380,59 @@ export function createG6ServerCore(options: {
 		let sequence = 0;
 		let stopped = false;
 		let window: EmitterWindowState | null = null;
+		const bookedSlicesRef = { value: 0 };
+		const emittedSlicesRef = { value: 0 };
 		const sliceNs = plan.sliceMs * 1e6;
 		const timer = scheduler.setInterval(() => {
 			if (stopped) return;
+			const phaseName = phase();
+			if (
+				phaseName !== "steady" &&
+				window?.kind === "steady" &&
+				totalSteadySlices !== null
+			) {
+				bookImmutableDueSlices(
+					options.state(),
+					bookedSlicesRef,
+					totalSteadySlices,
+				);
+			}
+			const previousKind = window?.kind ?? null;
 			const planned = nextEmitterWindowState(
 				window,
-				phase(),
+				phaseName,
 				options.clock.now(),
 				sliceNs,
 			);
 			window = planned.window;
+			if (
+				previousKind !== planned.window?.kind &&
+				planned.window?.kind === "steady"
+			) {
+				bookedSlicesRef.value = 0;
+				emittedSlicesRef.value = 0;
+			}
 			if (!planned.emit) return;
 			const { deadlineNs, sliceIndex } = planned.emit;
 			const handoffNs = options.clock.now();
 			const state = options.state();
+			if (
+				totalSteadySlices !== null &&
+				planned.emit.kind === "steady" &&
+				window !== null
+			) {
+				const dueSlicesByNow = Math.min(
+					totalSteadySlices,
+					Math.floor(Math.max(0, handoffNs - window.startedNs) / sliceNs) + 1,
+				);
+				bookImmutableDueSlices(state, bookedSlicesRef, dueSlicesByNow);
+			}
 			const lagNs = Math.max(0, handoffNs - deadlineNs);
-			state.emitterLag.record(lagNs);
+			recordHistogram(state.emitterLag, lagNs);
 			if (planned.emit.kind === "steady") {
-				state.emitterLagSteady.record(lagNs);
+				recordHistogram(state.emitterLagSteady, lagNs);
 			} else if (planned.emit.kind === "storm") {
-				state.emitterLagStorm.record(lagNs);
+				recordHistogram(state.emitterLagStorm, lagNs);
 			}
 			const target = players.filter(
 				(player) => player.alive && player.kind === "player",
@@ -317,6 +443,21 @@ export function createG6ServerCore(options: {
 				sliceIndex,
 			);
 			const chunk = target.slice(from, to);
+			emitVerboseProgress(
+				`emitter kind=${planned.emit.kind} slice=${sliceIndex} players=${chunk.length} lagNs=${lagNs}`,
+			);
+			materializeHumanReadableRow(
+				`${planned.emit.kind} snapshot slice=${sliceIndex} players=${chunk.length} lagNs=${lagNs}`,
+			);
+			const emitSliceIndex = emittedSlicesRef.value;
+			if (
+				totalSteadySlices !== null &&
+				planned.emit.kind === "steady" &&
+				emitSliceIndex >= totalSteadySlices
+			) {
+				return;
+			}
+			emittedSlicesRef.value += 1;
 			for (const player of chunk) {
 				sequence += 1;
 				const batch: Uint8Array[] = [];
@@ -332,7 +473,9 @@ export function createG6ServerCore(options: {
 					});
 					batch.push(datagram);
 				}
-				state.emitter.snapshotDue += plan.snapshotDatagrams;
+				if (totalSteadySlices === null) {
+					state.emitter.snapshotDue += plan.snapshotDatagrams;
+				}
 				player
 					.send(batch)
 					.then((result) => {
@@ -369,6 +512,9 @@ function forwardToRaid(
 	raidMembers: Player[],
 	clock: { now: () => number },
 	phaseState: { current: EmitterPhase },
+	recordHistogram: (histogram: LatencyHistogram, value: number) => void,
+	emitVerboseProgress: (message: string) => void,
+	materializeHumanReadableRow: (row: string) => void,
 ): void {
 	let first = true;
 	for (const member of raidMembers) {
@@ -380,10 +526,16 @@ function forwardToRaid(
 			state.emitter.raidForwarded += 1;
 			if (first) {
 				const dwellNs = clock.now() - entryNs;
-				state.ingestToForward.record(dwellNs);
+				recordHistogram(state.ingestToForward, dwellNs);
 				if (phaseState.current === "steady" || phaseState.current === "drain") {
-					state.ingestToForwardSteadyDrain.record(dwellNs);
+					recordHistogram(state.ingestToForwardSteadyDrain, dwellNs);
 				}
+				emitVerboseProgress(
+					`raid phase=${phaseState.current} dwellNs=${dwellNs} bytes=${datagram.byteLength}`,
+				);
+				materializeHumanReadableRow(
+					`${phaseState.current} raid dwellNs=${dwellNs} bytes=${datagram.byteLength}`,
+				);
 				first = false;
 			}
 		} catch {

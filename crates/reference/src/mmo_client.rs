@@ -30,11 +30,17 @@
 // implementation. This binary writes v3 upstream and reads v3 downstream, so
 // unlike `scale_client` it uses both halves.
 #[allow(dead_code)]
+mod g6_protocol;
+#[allow(dead_code)]
 mod latency_probe;
 
+use g6_protocol::{
+    action_every_nth_tick, class_for_tick, first_tick_offset, observe_tick, ticks_due_after,
+    TickObservation, UPSTREAM_PAYLOAD_BYTES,
+};
 use latency_probe::{
-    monotonic_ns, read_stamp, write_stamp_v3, AtomicHistogram, CLASS_ACK, CLASS_ACTION, CLASS_MOVE,
-    CLASS_RAID, CLASS_RAID_JOIN, CLASS_SNAPSHOT, STAMP_BYTES_V3,
+    monotonic_ns, read_stamp, write_stamp_v3, AtomicHistogram, CLASS_ACK, CLASS_RAID,
+    CLASS_RAID_JOIN, CLASS_SNAPSHOT, STAMP_BYTES_V3,
 };
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -171,8 +177,8 @@ impl Options {
             drain: Duration::from_millis(DEFAULT_DRAIN_MS),
             idle: Duration::from_secs(30),
             send_interval: Duration::from_millis(250),
-            action_every: 8,
-            payload_bytes: 64,
+            action_every: action_every_nth_tick(),
+            payload_bytes: UPSTREAM_PAYLOAD_BYTES,
             connect_timeout: Duration::from_secs(300),
             json_out: None,
             pre_registration_sha256: None,
@@ -195,38 +201,6 @@ impl Options {
 /* Pure helpers — everything a unit test can reach without a network           */
 /* -------------------------------------------------------------------------- */
 
-/// Offset of a session's first tick: half an interval, plus its share of the
-/// staggered arrival process.
-///
-/// Half rather than a whole interval so no tick shares a timer slot with a phase
-/// boundary — the window then holds `steady / interval` ticks exactly and the
-/// offered-rate label is the nominal rate rather than one tick short of it.
-/// Ported from `scale_client` deliberately: two generators that disagree about
-/// their own denominator cannot be compared.
-fn first_tick_offset(interval: Duration, phase_offset: f64) -> Duration {
-    interval / 2 + interval.mul_f64(phase_offset.clamp(0.0, 1.0))
-}
-
-/// Ticks whose deadline has passed, `elapsed` into a phase using that offset.
-fn ticks_due_after(elapsed: Duration, interval: Duration, phase_offset: f64) -> u64 {
-    let interval_ns = interval.as_nanos();
-    if interval_ns == 0 {
-        return 0;
-    }
-    let first = first_tick_offset(interval, phase_offset);
-    if elapsed < first {
-        return 0;
-    }
-    u64::try_from((elapsed - first).as_nanos() / interval_ns + 1).unwrap_or(u64::MAX)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TickObservation {
-    intended_ns: u64,
-    lag_ns: u64,
-    skipped_ticks: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(test)]
 struct ScheduleAccounting {
@@ -242,34 +216,6 @@ impl ScheduleAccounting {
     }
 }
 
-fn saturating_u128_to_u64(value: u128) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-/// Convert a resolved Tokio tick into a monotonic intended timestamp and an
-/// explicit count of skipped periods. With `MissedTickBehavior::Skip`, Tokio
-/// already tells us which deadline fired; all that remains is to measure how
-/// late that particular deadline was observed.
-fn observe_tick(
-    scheduled: tokio::time::Instant,
-    observed: tokio::time::Instant,
-    actual_ns: u64,
-    interval: Duration,
-) -> TickObservation {
-    let lag = observed.saturating_duration_since(scheduled);
-    let lag_ns = saturating_u128_to_u64(lag.as_nanos());
-    let skipped_ticks = if interval.is_zero() {
-        0
-    } else {
-        saturating_u128_to_u64(lag.as_nanos() / interval.as_nanos())
-    };
-    TickObservation {
-        intended_ns: actual_ns.saturating_sub(lag_ns),
-        lag_ns,
-        skipped_ticks,
-    }
-}
-
 #[cfg(test)]
 fn schedule_accounting(
     elapsed: Duration,
@@ -282,17 +228,6 @@ fn schedule_accounting(
         due: ticks_due_after(elapsed, interval, phase_offset),
         fired,
         skipped,
-    }
-}
-
-/// Class this tick carries. Every `action_every`-th movement tick is an action,
-/// so the action rate falls out of one schedule instead of a second timer — one
-/// schedule, one schedule-lag figure.
-fn class_for_tick(sequence: u64, action_every: u64) -> u8 {
-    if action_every > 0 && sequence.is_multiple_of(action_every) {
-        CLASS_ACTION
-    } else {
-        CLASS_MOVE
     }
 }
 
@@ -338,20 +273,33 @@ where
     }
 }
 
+fn rusage_self() -> Option<libc::rusage> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    Some(unsafe { usage.assume_init() })
+}
+
 fn self_rss_mb() -> Option<f64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb / 1024.0)
+    let usage = rusage_self()?;
+    let raw = usage.ru_maxrss as f64;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        Some(raw / 1024.0 / 1024.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        Some(raw / 1024.0)
+    }
 }
 
 fn self_cpu_ms() -> Option<f64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let close = stat.rfind(')')?;
-    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-    let utime: f64 = fields.get(11)?.parse().ok()?;
-    let stime: f64 = fields.get(12)?.parse().ok()?;
-    Some((utime + stime) * 1000.0 / 100.0)
+    let usage = rusage_self()?;
+    let user_ms = usage.ru_utime.tv_sec as f64 * 1000.0 + usage.ru_utime.tv_usec as f64 / 1000.0;
+    let system_ms = usage.ru_stime.tv_sec as f64 * 1000.0 + usage.ru_stime.tv_usec as f64 / 1000.0;
+    Some(user_ms + system_ms)
 }
 
 fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
@@ -1255,6 +1203,9 @@ async fn run(
     );
 
     let quic_after_connect = sample_quic(&shared.registry);
+    let quic_before_steady = sample_quic(&shared.registry);
+    let cpu_before_steady = self_cpu_ms();
+    let rss_before_steady = self_rss_mb();
     let mut phase_barrier = wait_for_phase_barrier(&options).await?;
     if let Some(proof) = phase_barrier.as_mut() {
         proof.steady_enter_unix_ms = unix_now_ms()?;
@@ -1265,6 +1216,9 @@ async fn run(
     // server-side counters at exactly the boundaries this process uses.
     println!("mmo-client: phase steady");
     tokio::time::sleep(options.steady).await;
+    let quic_after_steady = sample_quic(&shared.registry);
+    let cpu_after_steady = self_cpu_ms();
+    let rss_after_steady = self_rss_mb();
     let _ = phase_tx.send(PHASE_DRAIN);
     println!("mmo-client: phase drain");
     tokio::time::sleep(options.drain).await;
@@ -1346,8 +1300,9 @@ async fn run(
             "\"phaseBarrier\":{},",
             "\"windows\":{{\"steady\":{},\"steadyDrain\":{},\"stormSurvivors\":{}}},",
             "\"lifetime\":{},",
+            "\"quicSteady\":{},",
             "\"quicDrive\":{},",
-            "\"client\":{{\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
+            "\"client\":{{\"rssMbSteady\":{},\"rssMbDrive\":{},\"rssMbIdle\":{},\"cpuMsConnect\":{},\"cpuMsSteady\":{},\"cpuMsDrive\":{},\"cpuMsIdle\":{},\"endpoints\":{},\"distinctSourceIps\":{}}},",
             "\"config\":{{\"sendIntervalMs\":{},\"actionEvery\":{},\"payloadBytes\":{},\"steadySec\":{},\"drainMs\":{},\"stormWindowSec\":{},\"postStormSec\":{},\"idleSec\":{}}},",
             "\"connectErrorsSample\":[{}]",
             "}}"
@@ -1393,10 +1348,13 @@ async fn run(
         shared.steady_drain.to_json(),
         shared.storm_survivors.to_json(),
         shared.lifetime.to_json(),
+        quic_after_steady.delta(&quic_before_steady).to_json(),
         quic_after_drive.delta(&quic_after_connect).to_json(),
+        json_num(rss_after_steady.or(rss_before_steady)),
         json_num(rss_drive),
         json_num(rss_idle),
         json_num(window_ms(cpu0, cpu_after_connect)),
+        json_num(window_ms(cpu_before_steady, cpu_after_steady)),
         json_num(window_ms(cpu_after_connect, cpu_after_drive)),
         json_num(window_ms(cpu_after_drive, cpu_after_idle)),
         options.endpoints,
@@ -1870,6 +1828,7 @@ async fn hold_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::latency_probe::{CLASS_ACTION, CLASS_MOVE};
 
     #[test]
     fn ticks_due_is_stable_across_the_window_edge() {
@@ -1918,6 +1877,18 @@ mod tests {
         assert_eq!(class_for_tick(9, 8), CLASS_MOVE);
         // Zero disables actions rather than making every tick one.
         assert_eq!(class_for_tick(8, 0), CLASS_MOVE);
+    }
+
+    #[test]
+    fn shared_protocol_cadence_matches_the_client_schedule() {
+        assert_eq!(g6_protocol::action_every_nth_tick(), 8);
+        let shared_actions = (1..=800u64)
+            .filter(|s| {
+                g6_protocol::class_for_tick(*s, g6_protocol::action_every_nth_tick())
+                    == CLASS_ACTION
+            })
+            .count();
+        assert_eq!(shared_actions, 100);
     }
 
     #[test]
