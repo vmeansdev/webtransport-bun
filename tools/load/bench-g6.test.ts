@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildBenchArtifact,
 	clientWindow,
+	clientProcessFailureReasons,
 	chooseClientProvenance,
 	compareWindowDelivery,
 	type BoundaryMarks,
@@ -13,6 +14,7 @@ import {
 	nextEmitterWindowState,
 	readPhaseMarker,
 	requireClientReportIdentity,
+	indexClientBundlesByLaunchRole,
 	summarizePhaseBarrier,
 	validateSourceBinding,
 	windowReceiveTotal,
@@ -610,6 +612,45 @@ describe("bench artifact", () => {
 });
 
 describe("client provenance selection", () => {
+	test("preserves launch-owned side-role failures before either client emits JSON", () => {
+		const byRole = indexClientBundlesByLaunchRole(
+			["raid-subscriber", "publisher"] as const,
+			[
+				{
+					report: null,
+					provenanceLines: [],
+					stderrLines: ["subscriber checkout failed"],
+					exitCode: 128,
+				},
+				{
+					report: null,
+					provenanceLines: [],
+					stderrLines: ["publisher build failed"],
+					exitCode: 17,
+				},
+			],
+		);
+
+		const subscriber = byRole.get("raid-subscriber");
+		const publisher = byRole.get("publisher");
+		expect(subscriber?.exitCode).toBe(128);
+		expect(subscriber?.stderrLines).toEqual(["subscriber checkout failed"]);
+		expect(publisher?.exitCode).toBe(17);
+		expect(publisher?.stderrLines).toEqual(["publisher build failed"]);
+		expect(
+			clientProcessFailureReasons("raid-subscriber", subscriber, true),
+		).toEqual([
+			"raid-subscriber client produced no JSON report",
+			"raid-subscriber client exited 128; stderr=subscriber checkout failed",
+			"raid-subscriber client produced no off-box provenance lines",
+		]);
+		expect(clientProcessFailureReasons("publisher", publisher, true)).toEqual([
+			"publisher client produced no JSON report",
+			"publisher client exited 17; stderr=publisher build failed",
+			"publisher client produced no off-box provenance lines",
+		]);
+	});
+
 	test("uses provided provenance when present", () => {
 		expect(
 			chooseClientProvenance({

@@ -48,12 +48,14 @@ import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/
 import {
 	buildBenchArtifact,
 	clientWindow,
+	clientProcessFailureReasons,
 	chooseClientProvenance,
 	compareWindowDelivery,
 	deriveBoundaryWindows,
 	emitterSliceBounds,
 	HOTSPOT_PHASE_BARRIER_PARTIES,
 	HOTSPOT_PHASE_BARRIER_STEADY_SKEW_MS,
+	indexClientBundlesByLaunchRole,
 	nextEmitterWindowState,
 	deltaBoundarySnapshot,
 	readPhaseMarker,
@@ -1087,6 +1089,9 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	);
 
 	const extras: ReturnType<typeof spawnClient>[] = [];
+	const extraRoles = o.hotspot
+		? (["raid-subscriber", "publisher"] as const)
+		: ([] as const);
 	if (o.hotspot) {
 		extras.push(
 			spawnClient(
@@ -1227,19 +1232,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	// The subscriber's and publisher's reports are evidence, not noise: the
 	// one-way percentile the hotspot clause reads lives in the *subscriber's*
 	// histogram, and the smoke that first ran this arm discarded them.
-	const byRole = new Map<
-		string,
-		{
-			report: Record<string, unknown> | null;
-			provenanceLines: string[];
-			stderrLines: string[];
-			exitCode: number;
-		}
-	>();
-	for (const r of extraReports) {
-		const role = r.report?.role;
-		if (typeof role === "string") byRole.set(role, r);
-	}
+	const byRole = indexClientBundlesByLaunchRole(extraRoles, extraReports);
 	const subscriberBundle = byRole.get("raid-subscriber") ?? null;
 	const publisherBundle = byRole.get("publisher") ?? null;
 	const subscriberReport = subscriberBundle?.report
@@ -1256,46 +1249,22 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 				preregistrationSha256: EXPECTED_PREREGISTRATION_SHA256,
 			})
 		: null;
-	if (!realmReport) degraded.push("realm client produced no JSON report");
-	if (realmRaw.exitCode !== 0) {
+	degraded.push(
+		...clientProcessFailureReasons("realm", realmRaw, OFFBOX_SSH !== ""),
+	);
+	if (o.hotspot) {
 		degraded.push(
-			`realm client exited ${realmRaw.exitCode}${stderrSuffix(realmRaw.stderrLines)}`,
+			...clientProcessFailureReasons(
+				"raid-subscriber",
+				subscriberBundle,
+				OFFBOX_SSH !== "",
+			),
+			...clientProcessFailureReasons(
+				"publisher",
+				publisherBundle,
+				OFFBOX_SSH !== "",
+			),
 		);
-	}
-	if (OFFBOX_SSH && realmRaw.provenanceLines.length === 0) {
-		degraded.push("realm client produced no off-box provenance lines");
-	}
-	if (o.hotspot && !subscriberReport) {
-		degraded.push("raid-subscriber client produced no JSON report");
-	}
-	if (subscriberBundle && subscriberBundle.exitCode !== 0) {
-		degraded.push(
-			`raid-subscriber client exited ${subscriberBundle.exitCode}${stderrSuffix(subscriberBundle.stderrLines)}`,
-		);
-	}
-	if (
-		o.hotspot &&
-		OFFBOX_SSH &&
-		(subscriberBundle?.provenanceLines.length ?? 0) === 0
-	) {
-		degraded.push(
-			"raid-subscriber client produced no off-box provenance lines",
-		);
-	}
-	if (o.hotspot && !publisherReport) {
-		degraded.push("publisher client produced no JSON report");
-	}
-	if (publisherBundle && publisherBundle.exitCode !== 0) {
-		degraded.push(
-			`publisher client exited ${publisherBundle.exitCode}${stderrSuffix(publisherBundle.stderrLines)}`,
-		);
-	}
-	if (
-		o.hotspot &&
-		OFFBOX_SSH &&
-		(publisherBundle?.provenanceLines.length ?? 0) === 0
-	) {
-		degraded.push("publisher client produced no off-box provenance lines");
 	}
 	// A missing phase marker means the client died before printing it. The
 	// windows can still be closed at the child's exit so the arm reports
@@ -1863,11 +1832,6 @@ async function pumpClient(
 	const exitCode = await client.exited;
 	activeChildren.delete(client.child);
 	return { report, provenanceLines, stderrLines, exitCode };
-}
-
-function stderrSuffix(lines: string[]): string {
-	if (lines.length === 0) return "";
-	return `; stderr=${lines.join(" | ")}`;
 }
 
 async function sampleWhile(

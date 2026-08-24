@@ -112,6 +112,50 @@ export type ClientReportV2 = {
 	[key: string]: unknown;
 };
 
+export type ClientProcessEvidence = {
+	report: Record<string, unknown> | null;
+	provenanceLines: string[];
+	stderrLines: string[];
+	exitCode: number;
+};
+
+/**
+ * Bind side-process evidence to the role the conductor launched, never to a
+ * role read from the process's optional JSON report. A process that dies before
+ * JSON still has authoritative exit and stderr evidence.
+ */
+export function indexClientBundlesByLaunchRole<R extends string>(
+	roles: readonly R[],
+	bundles: readonly ClientProcessEvidence[],
+): Map<R, ClientProcessEvidence> {
+	if (roles.length !== bundles.length) {
+		throw new Error(
+			`bench-g6: launched ${roles.length} side role(s) but collected ${bundles.length} bundle(s)`,
+		);
+	}
+	return new Map(roles.map((role, index) => [role, bundles[index]!]));
+}
+
+export function clientProcessFailureReasons(
+	role: string,
+	bundle: ClientProcessEvidence | null | undefined,
+	requireOffboxProvenance: boolean,
+): string[] {
+	const reasons: string[] = [];
+	if (!bundle?.report) reasons.push(`${role} client produced no JSON report`);
+	if (bundle && bundle.exitCode !== 0) {
+		const stderr =
+			bundle.stderrLines.length > 0
+				? `; stderr=${bundle.stderrLines.join(" | ")}`
+				: "";
+		reasons.push(`${role} client exited ${bundle.exitCode}${stderr}`);
+	}
+	if (requireOffboxProvenance && (bundle?.provenanceLines.length ?? 0) === 0) {
+		reasons.push(`${role} client produced no off-box provenance lines`);
+	}
+	return reasons;
+}
+
 export type PhaseBarrierEvidence = {
 	id: string;
 	parties: number;
