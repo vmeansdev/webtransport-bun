@@ -21,6 +21,7 @@ import {
 	clauseC6,
 	clauseH1,
 	clauseH2,
+	clauseH3,
 	clauseSC1,
 	clauseSC2,
 	falsifierCablePreflight,
@@ -46,6 +47,7 @@ function histogram(over: Partial<HistogramFacts> = {}): HistogramFacts {
 	return {
 		name: "rtt",
 		count: 300_000,
+		declaredCount: 300_000,
 		recordedTotal: 300_000,
 		negative: 0,
 		p99Ns: ms(12),
@@ -105,6 +107,22 @@ describe("histogram validity — the two defects G3b had to dig out of raw bucke
 		expect(v.reasons.join(" ")).toContain("V-K");
 	});
 
+	test("the raw bucket sum must equal the producer-declared count", () => {
+		const v = histogramValidity(
+			histogram({ count: 299_999, declaredCount: 300_000 }),
+		);
+		expect(v.valid).toBe(false);
+		expect(v.reasons.join(" ")).toContain("raw bucket total");
+	});
+
+	test("recordedTotal below the raw bucket sum is impossible", () => {
+		const v = histogramValidity(
+			histogram({ count: 300_000, recordedTotal: 299_999 }),
+		);
+		expect(v.valid).toBe(false);
+		expect(v.reasons.join(" ")).toContain("below bucketed count");
+	});
+
 	test("a skew inside the tolerance is not a failure", () => {
 		expect(
 			histogramValidity(histogram({ count: 300_000, recordedTotal: 300_200 }))
@@ -122,12 +140,18 @@ describe("histogram validity — the two defects G3b had to dig out of raw bucke
 		expect(v.reasons.join(" ")).toContain("V-D");
 	});
 
-	test("unstamped datagrams are subtracted from the expectation, not ignored", () => {
-		expect(
-			histogramValidity(
-				histogram({ count: 299_990, recordedTotal: 299_990, unstamped: 10 }),
-			).valid,
-		).toBe(true);
+	test("an unstamped receive invalidates the latency population", () => {
+		const v = histogramValidity(
+			histogram({
+				count: 299_990,
+				declaredCount: 299_990,
+				recordedTotal: 299_990,
+				unstamped: 10,
+			}),
+		);
+		expect(v.valid).toBe(false);
+		expect(v.reasons.join(" ")).toContain("10 unstamped");
+		expect(v.reasons.join(" ")).toContain("299990 samples against 300000");
 	});
 });
 
@@ -301,6 +325,22 @@ describe("arm 2 clauses (§3)", () => {
 		expect(r.verdict).toBe("MISS");
 		expect(r.observed.expected).toBe(96_000);
 	});
+
+	test("H3 requires the concurrent realm to retain both C1 and C3", () => {
+		expect(clauseH3(steadyArm()).verdict).toBe("PASS");
+
+		const deliveryMiss = clauseH3(steadyArm({ serverRxUpstream: 2_000_000 }));
+		expect(deliveryMiss.verdict).toBe("MISS");
+		expect(deliveryMiss.reasons.join(" ")).toContain("H3/C1");
+
+		const latencyMiss = clauseH3(
+			steadyArm({
+				rtt: histogram({ p99Ns: ms(51), expectedSamples: 300_000 }),
+			}),
+		);
+		expect(latencyMiss.verdict).toBe("MISS");
+		expect(latencyMiss.reasons.join(" ")).toContain("H3/C3");
+	});
 });
 
 describe("arm 3 clauses (§5)", () => {
@@ -344,8 +384,23 @@ describe("arm 3 clauses (§5)", () => {
 
 	test("S-C1 does not apply when the whole realm was severed", () => {
 		const r = clauseSC1(storm({ cohort: 5000, survivors: null }));
-		expect(r.verdict).toBe("INCOMPLETE");
+		expect(r.verdict).toBe("N/A");
 		expect(r.reasons.join(" ")).toContain("whole realm was severed");
+		expect(
+			rollUp(
+				[
+					r,
+					clauseSC2(
+						storm({
+							cohort: 5000,
+							survivors: null,
+							reAcceptedInWindow: 5000,
+						}),
+					),
+				],
+				[],
+			).gate,
+		).toBe("PASS");
 	});
 
 	test("S-C2 fails a cohort that did not all come back inside the window", () => {

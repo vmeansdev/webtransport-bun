@@ -38,7 +38,7 @@ import {
 	STAGE_RESIDUAL_FRACTION,
 } from "./g6-plan.ts";
 
-export type Verdict = "PASS" | "MISS" | "INCOMPLETE";
+export type Verdict = "PASS" | "MISS" | "INCOMPLETE" | "N/A";
 
 export type ClauseResult = {
 	id: string;
@@ -72,6 +72,8 @@ export type HistogramFacts = {
 	name: string;
 	/** Samples the emitted buckets actually contain. */
 	count: number;
+	/** Producer-declared bucket count, checked independently of the raw sum. */
+	declaredCount: number;
 	/** The producer's running counter. A gap means the snapshot raced recording. */
 	recordedTotal: number;
 	/** Samples that came out negative. On a single clock this must be zero. */
@@ -99,10 +101,11 @@ export type HistogramFacts = {
  * was taken while it was still recording. A percentile reader handed a rank its
  * buckets cannot reach walks off the end and reports the maximum.
  *
- * V-D: the sample count has to equal what the run's counters say was delivered
- * on that path, less the unstamped. G1 checked this ("sample count equals
- * steadySent exactly at every rung") and it is the cheapest defence against a
- * percentile computed over a survivorship subset.
+ * V-D: the sample count has to equal the path-specific stamped-sample
+ * denominator. Any unstamped receive makes that population unclassifiable; it
+ * may not be subtracted from a different class's denominator. G1 checked this
+ * ("sample count equals steadySent exactly at every rung") and it is the
+ * cheapest defence against a percentile computed over a survivorship subset.
  */
 export function histogramValidity(h: HistogramFacts): {
 	valid: boolean;
@@ -114,17 +117,30 @@ export function histogramValidity(h: HistogramFacts): {
 			`V-N ${h.name}: ${h.negative} negative sample(s) on a single-clock measurement`,
 		);
 	}
+	if (h.count !== h.declaredCount) {
+		reasons.push(
+			`V-K ${h.name}: raw bucket total ${h.count} differs from declared count ${h.declaredCount}`,
+		);
+	}
 	const skew = h.recordedTotal - h.count;
-	if (skew > HISTOGRAM_SKEW_FRACTION * Math.max(h.count, 1)) {
+	if (skew < 0) {
+		reasons.push(
+			`V-K ${h.name}: recordedTotal ${h.recordedTotal} is below bucketed count ${h.count}`,
+		);
+	} else if (skew > HISTOGRAM_SKEW_FRACTION * Math.max(h.count, 1)) {
 		reasons.push(
 			`V-K ${h.name}: recordedTotal ${h.recordedTotal} exceeds bucketed count ${h.count} by ${skew} (> ${HISTOGRAM_SKEW_FRACTION * 100}%)`,
 		);
 	}
+	if (h.unstamped > 0) {
+		reasons.push(
+			`V-D ${h.name}: ${h.unstamped} unstamped receive(s) make the latency population unclassifiable`,
+		);
+	}
 	if (h.expectedSamples !== null) {
-		const expected = h.expectedSamples - h.unstamped;
-		if (h.count !== expected) {
+		if (h.count !== h.expectedSamples) {
 			reasons.push(
-				`V-D ${h.name}: ${h.count} samples against ${expected} delivered-and-stamped (${h.expectedSamples} delivered, ${h.unstamped} unstamped)`,
+				`V-D ${h.name}: ${h.count} samples against ${h.expectedSamples} expected stamped samples`,
 			);
 		}
 	}
@@ -432,6 +448,28 @@ export function clauseH2(f: HotspotFacts): ClauseResult {
 	);
 }
 
+/** H3 keeps the concurrent steady realm's delivery and RTT obligations intact. */
+export function clauseH3(f: SteadyArmFacts): ClauseResult {
+	const c1 = clauseC1(f);
+	const c3 = clauseC3(f);
+	const reasons = [
+		...c1.reasons.map((reason) => `H3/${reason}`),
+		...c3.reasons.map((reason) => `H3/${reason}`),
+	];
+	const incomplete = c1.verdict === "INCOMPLETE" || c3.verdict === "INCOMPLETE";
+	return pass(
+		"H3",
+		{
+			upstreamRatio: c1.observed.ratio ?? null,
+			upstreamFloor: c1.observed.floor ?? null,
+			rttP99Ms: c3.observed.p99Ms ?? null,
+			rttBudgetMs: c3.observed.budgetMs ?? null,
+		},
+		reasons,
+		incomplete,
+	);
+}
+
 /**
  * H4 / V-I. Ticket 14's ingest-reality falsifier, reused rather than
  * reimplemented: the retracted fan-out run reported a 9–31 µs ingest-to-forward
@@ -487,7 +525,7 @@ export function clauseSC1(f: StormFacts): ClauseResult {
 		// not apply. Not a pass, not a miss — it is out of scope by construction.
 		return {
 			id: "S-C1",
-			verdict: "INCOMPLETE",
+			verdict: "N/A",
 			reasons: ["S-C1 does not apply: the whole realm was severed"],
 			observed: { cohort: f.cohort, realmSessions: f.realmSessions },
 		};
@@ -741,7 +779,7 @@ export type RunVerdict = {
 	invalidReasons: string[];
 	/** Falsifiers that only strip verdict force from the characterization. */
 	characterizationOnlyReasons: string[];
-	gate: Verdict | "INVALID";
+	gate: Exclude<Verdict, "N/A"> | "INVALID";
 	clauses: ClauseResult[];
 };
 
