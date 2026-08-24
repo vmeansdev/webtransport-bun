@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { LatencyHistogram } from "../load/latency-histogram.ts";
+import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "../load/g6-plan.ts";
 import {
 	floorReportIsUsable,
 	parseGeneratorReport,
@@ -21,7 +22,6 @@ function provenance(overrides: Partial<Record<string, string>> = {}): string[] {
 	];
 }
 
-/** A trimmed but structurally real load-client run, as it arrives over ssh. */
 function clientRun(): string[] {
 	return [
 		"load-client: arrival=uniform tick_hz=64 latency_stamp=true",
@@ -41,11 +41,18 @@ function clientRun(): string[] {
 }
 
 type MmoOverrides = {
+	schema?: "mmo-client/1" | "mmo-client/2";
 	role?: string;
+	startedAt?: string;
+	preRegistration?: Partial<{
+		id: string;
+		path: string;
+		sha256: string;
+	}>;
 	sessionsRequested?: number;
 	sessionsOk?: number;
 	sessionsErr?: number;
-	realm?: Partial<{
+	window?: Partial<{
 		sent: number;
 		sendErr: number;
 		rxSnapshot: number;
@@ -55,6 +62,7 @@ type MmoOverrides = {
 		rxUnstamped: number;
 	}>;
 	scheduleLagCount?: number;
+	scheduleLagReconciled?: boolean;
 	scheduleLagJson?: unknown;
 	config?: Partial<{ steadySec: number }>;
 };
@@ -68,30 +76,79 @@ function scheduleLagJson(count: number) {
 }
 
 function mmoRun(overrides: MmoOverrides = {}): string[] {
-	const report = {
-		schema: "mmo-client/1",
-		role: overrides.role ?? "realm",
-		sessionsRequested: overrides.sessionsRequested ?? 20,
-		sessionsOk: overrides.sessionsOk ?? 18,
-		sessionsErr: overrides.sessionsErr ?? 2,
-		realm: {
-			sent: overrides.realm?.sent ?? 1440,
-			sendErr: overrides.realm?.sendErr ?? 3,
-			rxSnapshot: overrides.realm?.rxSnapshot ?? 1400,
-			rxAck: overrides.realm?.rxAck ?? 20,
-			rxRaid: overrides.realm?.rxRaid ?? 15,
-			rxOther: overrides.realm?.rxOther ?? 5,
-			rxUnstamped: overrides.realm?.rxUnstamped ?? 1,
-		},
-		scheduleLag:
-			overrides.scheduleLagJson ??
-			scheduleLagJson(overrides.scheduleLagCount ?? 1440),
-		config: {
-			steadySec: overrides.config?.steadySec ?? 12,
-		},
-	};
+	const schema = overrides.schema ?? "mmo-client/1";
+	const sent = overrides.window?.sent ?? 1440;
+	const sendErr = overrides.window?.sendErr ?? 3;
+	const rxSnapshot = overrides.window?.rxSnapshot ?? 1400;
+	const rxAck = overrides.window?.rxAck ?? 20;
+	const rxRaid = overrides.window?.rxRaid ?? 15;
+	const rxOther = overrides.window?.rxOther ?? 5;
+	const rxUnstamped = overrides.window?.rxUnstamped ?? 1;
+	const scheduleLag =
+		overrides.scheduleLagJson ??
+		scheduleLagJson(overrides.scheduleLagCount ?? sent);
 
-	return [`mmo-client: json ${JSON.stringify(report)}`, "mmo-client: PASS"];
+	if (schema === "mmo-client/2") {
+		return [
+			`mmo-client: json ${JSON.stringify({
+				schema,
+				role: overrides.role ?? "realm",
+				startedAt: overrides.startedAt ?? "2026-08-24T08:00:00Z",
+				preRegistration: {
+					id: overrides.preRegistration?.id ?? G6_CLOSEOUT_SPEC_ID,
+					path: overrides.preRegistration?.path ?? G6_CLOSEOUT_SPEC_PATH,
+					sha256: overrides.preRegistration?.sha256 ?? HASH,
+				},
+				sessionsRequested: overrides.sessionsRequested ?? 20,
+				sessionsOk: overrides.sessionsOk ?? 18,
+				sessionsErr: overrides.sessionsErr ?? 2,
+				windows: {
+					steady: {
+						sent,
+						sendErr,
+						scheduleTicksFired: sent,
+						scheduleTicksReconciled: overrides.scheduleLagReconciled ?? true,
+						scheduleLag,
+					},
+					steadyDrain: {
+						rxSnapshot,
+						rxAck,
+						rxRaid,
+						rxOther,
+						rxUnstamped,
+					},
+				},
+				config: {
+					steadySec: overrides.config?.steadySec ?? 12,
+				},
+			})}`,
+			"mmo-client: PASS",
+		];
+	}
+
+	return [
+		`mmo-client: json ${JSON.stringify({
+			schema,
+			role: overrides.role ?? "realm",
+			sessionsRequested: overrides.sessionsRequested ?? 20,
+			sessionsOk: overrides.sessionsOk ?? 18,
+			sessionsErr: overrides.sessionsErr ?? 2,
+			realm: {
+				sent,
+				sendErr,
+				rxSnapshot,
+				rxAck,
+				rxRaid,
+				rxOther,
+				rxUnstamped,
+			},
+			scheduleLag,
+			config: {
+				steadySec: overrides.config?.steadySec ?? 12,
+			},
+		})}`,
+		"mmo-client: PASS",
+	];
 }
 
 function transcript(extra: string[] = [], overrides = {}): string {
@@ -170,7 +227,6 @@ describe("provenance", () => {
 	test("stdout with no macgen header means the entrypoint never ran", () => {
 		const report = parseGeneratorReport(clientRun().join("\n"), SHA);
 		expect(report.problems.join(" ")).toContain("did not run");
-		// The client half still parses: a local run is readable by the same code.
 		expect(report.sessionsOk).toBe(100);
 	});
 
@@ -196,13 +252,14 @@ describe("provenance", () => {
 		);
 	});
 
-	test("an mmo-client/1 envelope is accepted as the floor report source", () => {
+	test("an mmo-client/1 envelope stays readable but is marked historical-only", () => {
 		const mmo = [...provenance(), ...mmoRun(), "macgen: exit=0"].join("\n");
 		const report = parseGeneratorReport(mmo, SHA);
 		const json = report.latencyJson as {
 			scheduleLag: { count: number; buckets: [number, number][] };
 		};
-		expect(report.problems).toEqual([]);
+		expect(report.schema).toBe("mmo-client/1");
+		expect(report.historicalOnly).toBe(true);
 		expect(report.sessionsOk).toBe(18);
 		expect(report.sessionsErr).toBe(2);
 		expect(report.datagramsSent).toBe(1440);
@@ -212,6 +269,44 @@ describe("provenance", () => {
 		expect(report.sessionsDriving).toBe(18);
 		expect(json.scheduleLag.count).toBe(1440);
 		expect(json.scheduleLag.buckets.length).toBeGreaterThan(0);
+		const verdict = floorReportIsUsable(report, "mac-studio");
+		expect(verdict.usable).toBe(false);
+		expect(verdict.reasons.join(" ")).toContain("historical");
+	});
+
+	test("an mmo-client/2 envelope is accepted with prereg identity and startedAt", () => {
+		const startedAt = "2026-08-24T08:12:13Z";
+		const mmo = [
+			...provenance(),
+			...mmoRun({
+				schema: "mmo-client/2",
+				startedAt,
+			}),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(mmo, SHA, HASH);
+		const json = report.latencyJson as {
+			windows: { steady: { scheduleLag: { count: number } } };
+		};
+		expect(report.problems).toEqual([]);
+		expect(report.schema).toBe("mmo-client/2");
+		expect(report.historicalOnly).toBe(false);
+		expect(report.startedAt).toBe(startedAt);
+		expect(report.preRegistration).toEqual({
+			id: G6_CLOSEOUT_SPEC_ID,
+			path: G6_CLOSEOUT_SPEC_PATH,
+			sha256: HASH,
+		});
+		expect(report.datagramsSent).toBe(1440);
+		expect(report.datagramsErr).toBe(3);
+		expect(report.datagramsReceived).toBe(1441);
+		expect(report.driveWindowSec).toBe(12);
+		expect(report.sessionsDriving).toBe(18);
+		expect(json.windows.steady.scheduleLag.count).toBe(1440);
+		expect(floorReportIsUsable(report, "mac-studio", HASH)).toEqual({
+			usable: true,
+			reasons: [],
+		});
 	});
 
 	test("an unrelated mmo-client json blob is rejected rather than treated as a floor", () => {
@@ -244,10 +339,10 @@ describe("provenance", () => {
 	test("an mmo-client floor report must come from the realm role", () => {
 		const publisher = [
 			...provenance(),
-			...mmoRun({ role: "publisher" }),
+			...mmoRun({ schema: "mmo-client/2", role: "publisher" }),
 			"macgen: exit=0",
 		].join("\n");
-		const report = parseGeneratorReport(publisher, SHA);
+		const report = parseGeneratorReport(publisher, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("role must be realm");
 	});
@@ -255,10 +350,10 @@ describe("provenance", () => {
 	test("any other non-realm mmo-client role is refused as a floor source", () => {
 		const subscriber = [
 			...provenance(),
-			...mmoRun({ role: "subscriber" }),
+			...mmoRun({ schema: "mmo-client/2", role: "subscriber" }),
 			"macgen: exit=0",
 		].join("\n");
-		const report = parseGeneratorReport(subscriber, SHA);
+		const report = parseGeneratorReport(subscriber, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("role must be realm");
 	});
@@ -267,10 +362,10 @@ describe("provenance", () => {
 		const mixed = [
 			...provenance(),
 			"load-client: latency-json {not json}",
-			...mmoRun(),
+			...mmoRun({ schema: "mmo-client/2" }),
 			"macgen: exit=0",
 		].join("\n");
-		const report = parseGeneratorReport(mixed, SHA);
+		const report = parseGeneratorReport(mixed, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("ambiguous");
 		expect(report.problems.join(" ")).toContain("did not parse");
@@ -279,14 +374,61 @@ describe("provenance", () => {
 	test("a truncated mmo scheduleLag histogram is rejected before downstream decoding", () => {
 		const truncated = [
 			...provenance(),
-			...mmoRun({ scheduleLagJson: { version: 2, count: 1440 } }),
+			...mmoRun({
+				schema: "mmo-client/2",
+				scheduleLagJson: { version: 2, count: 1440 },
+			}),
 			"macgen: exit=0",
 		].join("\n");
-		const report = parseGeneratorReport(truncated, SHA);
+		const report = parseGeneratorReport(truncated, SHA, HASH);
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("scheduleLag");
-		const verdict = floorReportIsUsable(report, "mac-studio");
+		const verdict = floorReportIsUsable(report, "mac-studio", HASH);
 		expect(verdict.usable).toBe(false);
+	});
+
+	test("an mmo-client/2 preregistration sha mismatch is rejected", () => {
+		const mismatch = [
+			...provenance(),
+			...mmoRun({
+				schema: "mmo-client/2",
+				preRegistration: { sha256: "b".repeat(64) },
+			}),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(mismatch, SHA, HASH);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("preregistration sha256");
+		expect(report.problems.join(" ")).toContain(HASH);
+	});
+
+	test("an mmo-client/2 report with scheduleLag count not matching steady fired is rejected", () => {
+		const mismatch = [
+			...provenance(),
+			...mmoRun({
+				schema: "mmo-client/2",
+				scheduleLagCount: 1439,
+			}),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(mismatch, SHA, HASH);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("scheduleLag count");
+		expect(report.problems.join(" ")).toContain("scheduleTicksFired");
+	});
+
+	test("an mmo-client/2 report with unreconciled steady ticks is rejected", () => {
+		const mismatch = [
+			...provenance(),
+			...mmoRun({
+				schema: "mmo-client/2",
+				scheduleLagReconciled: false,
+			}),
+			"macgen: exit=0",
+		].join("\n");
+		const report = parseGeneratorReport(mismatch, SHA, HASH);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("scheduleTicksReconciled");
 	});
 });
 
@@ -320,21 +462,19 @@ describe("the off-box floor", () => {
 		expect(verdict.reasons.join(" ")).toContain("not a floor");
 	});
 
-	test("connected MMO sessions with zero scheduleLag samples did not offer load", () => {
+	test("a v2 floor with zero scheduleLag samples but nonzero steady fired is rejected before floor use", () => {
 		const idleMmo = [
 			...provenance(),
 			...mmoRun({
+				schema: "mmo-client/2",
 				sessionsRequested: 20,
 				sessionsOk: 18,
 				scheduleLagCount: 0,
 			}),
 			"macgen: exit=0",
 		].join("\n");
-		const report = parseGeneratorReport(idleMmo, SHA);
-		expect(report.sessionsDriving).toBe(18);
-		const verdict = floorReportIsUsable(report, "mac-studio");
-		expect(verdict.usable).toBe(false);
-		expect(verdict.reasons.join(" ")).toContain("scheduleLag");
-		expect(verdict.reasons.join(" ")).toContain("offer");
+		const report = parseGeneratorReport(idleMmo, SHA, HASH);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("scheduleLag count");
 	});
 });

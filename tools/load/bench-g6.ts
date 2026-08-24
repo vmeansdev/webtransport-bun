@@ -33,21 +33,44 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
 	readFileSync,
 	renameSync,
 	writeFileSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	buildBenchArtifact,
+	clientWindow,
+	chooseClientProvenance,
+	compareWindowDelivery,
+	deriveBoundaryWindows,
+	emitterSliceBounds,
+	HOTSPOT_PHASE_BARRIER_PARTIES,
+	HOTSPOT_PHASE_BARRIER_STEADY_SKEW_MS,
+	nextEmitterWindowState,
+	deltaBoundarySnapshot,
+	readPhaseMarker,
+	requireClientReportIdentity,
+	summarizePhaseBarrier,
+	type BoundarySnapshot,
+	type ClientReportV2,
+	type EmitterPhase,
+	type EmitterWindowState,
+	validateSourceBinding,
+} from "./g6-artifact.ts";
+import {
 	ACTION_HZ,
 	actionEveryNthTick,
 	armShape,
 	EMITTER_SLICE_HZ,
+	G6_CLOSEOUT_SPEC_PATH,
 	MOVE_HZ,
 	preflightRequirements,
 	RAID_MEMBERS,
@@ -102,6 +125,8 @@ const CONNECT_TIMEOUT_SECONDS = parseInt(
 	process.env.G6_CONNECT_TIMEOUT_SECONDS ?? "300",
 	10,
 );
+const EXPECTED_PREREGISTRATION_SHA256 =
+	process.env.G6_PREREGISTRATION_SHA256 ?? "";
 /**
  * The generator host. Empty means co-resident, which for this gate is a **local
  * smoke only** — the registration requires the Mac over the cable, and a
@@ -124,6 +149,9 @@ const POST_STORM_SECONDS = 60;
 const OUT_JSON = process.env.G6_OUT ?? join(ROOT, "tools/load/bench-g6.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
 const HAS_PROC = process.platform === "linux";
+const SERVER_HOSTNAME = hostname();
+const HOTSPOT_PHASE_BARRIER_DIR =
+	process.env.G6_PHASE_BARRIER_DIR ?? "/tmp/webtransport-g6-phase-barriers";
 
 const SNAPSHOT_DATAGRAMS = snapshotDatagrams();
 const SLICE_MS = 1000 / EMITTER_SLICE_HZ;
@@ -268,6 +296,70 @@ function diffKernelUdp(
 	return out;
 }
 
+function sha256Hex(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+function sha256FileHex(path: string): string {
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function readTrackedPreregistrationSha256(): string {
+	return sha256Hex(readFileSync(join(ROOT, G6_CLOSEOUT_SPEC_PATH), "utf8"));
+}
+
+function requirePreregistrationSha256(): string {
+	if (!EXPECTED_PREREGISTRATION_SHA256) {
+		throw new Error(
+			"bench-g6: G6_PREREGISTRATION_SHA256 is required for bench-g6/2",
+		);
+	}
+	if (!/^[0-9a-f]{64}$/i.test(EXPECTED_PREREGISTRATION_SHA256)) {
+		throw new Error(
+			`bench-g6: G6_PREREGISTRATION_SHA256 must be 64 hex chars, got '${EXPECTED_PREREGISTRATION_SHA256}'`,
+		);
+	}
+	const actual = readTrackedPreregistrationSha256();
+	if (actual !== EXPECTED_PREREGISTRATION_SHA256) {
+		throw new Error(
+			`bench-g6: preregistration sha256 mismatch for ${G6_CLOSEOUT_SPEC_PATH}: expected ${EXPECTED_PREREGISTRATION_SHA256}, got ${actual}`,
+		);
+	}
+	return actual;
+}
+
+async function resolveCandidateSource(): Promise<{
+	candidateSha: string;
+	dirty: false;
+}> {
+	const checkedOutSha = (
+		await $`cd ${ROOT} && git rev-parse HEAD`.text()
+	).trim();
+	const statusPorcelain = await $`cd ${ROOT} && git status --porcelain`.text();
+	return validateSourceBinding({
+		checkedOutSha,
+		expectedCandidateSha: CANDIDATE_SHA || null,
+		statusPorcelain,
+	});
+}
+
+function localClientProvenanceLines(candidateSha: string): string[] {
+	return [
+		`localgen: host=${SERVER_HOSTNAME} candidate=${candidateSha} head=${candidateSha} dirty=no`,
+		`localgen: binary=${CLIENT_BIN} sha256=${sha256FileHex(CLIENT_BIN)}`,
+	];
+}
+
+function localClientProvenance(
+	candidateSha: string,
+	exitCode: number,
+): string[] {
+	return [
+		...localClientProvenanceLines(candidateSha),
+		`localgen: exit=${exitCode}`,
+	];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Child process lifetime                                                      */
 /* -------------------------------------------------------------------------- */
@@ -339,14 +431,22 @@ type ServerState = {
 	emitter: EmitterCounters;
 	/** Publisher→first-forward lag, the ingest-reality falsifier's input. */
 	ingestToForward: LatencyHistogram;
+	ingestToForwardSteadyDrain: LatencyHistogram;
 	/** Server-observed inter-arrival gaps on the publisher session. */
 	publisherGaps: number[];
+	publisherGapsSteadyDrain: number[];
 	publisherStamped: number;
+	publisherStampedSteadyDrain: number;
 	publisherArrivals: number;
+	publisherArrivalsSteadyDrain: number;
 	/** Emitter slice lag at the scheduler handoff — never across `await send`. */
 	emitterLag: LatencyHistogram;
+	emitterLagSteady: LatencyHistogram;
+	emitterLagStorm: LatencyHistogram;
 	/** Server dwell on the ack path, the disclosure beside C3. */
 	hold: LatencyHistogram;
+	holdSteadyDrain: LatencyHistogram;
+	holdStorm: LatencyHistogram;
 };
 
 function freshState(): ServerState {
@@ -367,25 +467,29 @@ function freshState(): ServerState {
 			batchPartialCompletions: 0,
 		},
 		ingestToForward: new LatencyHistogram(),
+		ingestToForwardSteadyDrain: new LatencyHistogram(),
 		publisherGaps: [],
+		publisherGapsSteadyDrain: [],
 		publisherStamped: 0,
+		publisherStampedSteadyDrain: 0,
 		publisherArrivals: 0,
+		publisherArrivalsSteadyDrain: 0,
 		emitterLag: new LatencyHistogram(),
+		emitterLagSteady: new LatencyHistogram(),
+		emitterLagStorm: new LatencyHistogram(),
 		hold: new LatencyHistogram(),
+		holdSteadyDrain: new LatencyHistogram(),
+		holdStorm: new LatencyHistogram(),
 	};
 }
 
 async function main(): Promise<void> {
 	if (LADDER.length === 0) throw new Error("G6_LADDER parsed empty");
+	const preregistrationSha256 = requirePreregistrationSha256();
+	const candidateSource = await resolveCandidateSource();
+	const campaignStartedAt = new Date().toISOString();
 	console.log("bench-g6: building mmo-client (release)...");
-	try {
-		await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin mmo-client --release`.quiet();
-	} catch (err) {
-		if (!(await Bun.file(CLIENT_BIN).exists())) throw err;
-		console.warn(
-			"bench-g6: cargo build failed; using existing mmo-client binary",
-		);
-	}
+	await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin mmo-client --release`.quiet();
 
 	const tls = generateLocalhostCert();
 	if (!tls) throw new Error("failed to generate localhost cert");
@@ -393,6 +497,7 @@ async function main(): Promise<void> {
 	// FFI read, not the `Bun.nanoseconds()` fast path: the gate's evidence chain
 	// must not carry the fast path's same-counter assumption.
 	const clock = await createMonotonicClock(false);
+	const phaseState: { current: EmitterPhase } = { current: "idle" };
 	let state = freshState();
 	const players: Player[] = [];
 	const raidMembers: Player[] = [];
@@ -476,11 +581,32 @@ async function main(): Promise<void> {
 						player.kind = "publisher";
 						state.publisherArrivals += 1;
 						state.publisherStamped += 1;
+						if (
+							phaseState.current === "steady" ||
+							phaseState.current === "drain"
+						) {
+							state.publisherArrivalsSteadyDrain += 1;
+							state.publisherStampedSteadyDrain += 1;
+						}
 						if (lastPublisherArrivalNs !== null) {
-							state.publisherGaps.push(entryNs - lastPublisherArrivalNs);
+							const gapNs = entryNs - lastPublisherArrivalNs;
+							state.publisherGaps.push(gapNs);
+							if (
+								phaseState.current === "steady" ||
+								phaseState.current === "drain"
+							) {
+								state.publisherGapsSteadyDrain.push(gapNs);
+							}
 						}
 						lastPublisherArrivalNs = entryNs;
-						forwardToRaid(datagram, entryNs, state, raidMembers, clock);
+						forwardToRaid(
+							datagram,
+							entryNs,
+							state,
+							raidMembers,
+							clock,
+							phaseState,
+						);
 						continue;
 					}
 
@@ -504,6 +630,14 @@ async function main(): Promise<void> {
 							continue;
 						}
 						state.hold.record(sendNs - entryNs);
+						if (
+							phaseState.current === "steady" ||
+							phaseState.current === "drain"
+						) {
+							state.holdSteadyDrain.record(sendNs - entryNs);
+						} else if (phaseState.current === "storm") {
+							state.holdStorm.record(sendNs - entryNs);
+						}
 						try {
 							player.sendOne(ack);
 							state.emitter.ackIssued += 1;
@@ -526,22 +660,23 @@ async function main(): Promise<void> {
 	);
 
 	const arms: unknown[] = [];
-	const startedAt = new Date().toISOString();
 	let aborted: string | null = null;
 
 	const buildResult = () => ({
-		version: 1,
-		schema: "bench-g6/1",
-		startedAt,
+		startedAt: campaignStartedAt,
 		writtenAt: new Date().toISOString(),
 		complete: aborted === null && arms.length > 0,
-		preRegistration: "docs/research/preregistrations/gate-g6-mmo.md",
 		host: {
+			identity: SERVER_HOSTNAME,
 			platform: process.platform,
 			cpus: navigator?.hardwareConcurrency ?? null,
 			bunVersion: Bun.version,
 			/** Empty means the generator was co-resident: a smoke, never a G6 result. */
 			offboxSsh: OFFBOX_SSH || null,
+		},
+		source: {
+			...candidateSource,
+			coResident: OFFBOX_SSH === "",
 		},
 		config: {
 			ladder: LADDER,
@@ -557,6 +692,7 @@ async function main(): Promise<void> {
 			raidMembers: RAID_MEMBERS,
 			raidPublisherHz: RAID_PUBLISHER_HZ,
 			steadySeconds: STEADY_SECONDS,
+			drainGraceMs: DRAIN_GRACE_MS,
 			idleSeconds: IDLE_SECONDS,
 			stormWindowSec: stormWindowSec(),
 			stormCohorts: stormCohorts(Math.max(...LADDER)),
@@ -572,7 +708,17 @@ async function main(): Promise<void> {
 
 	const flush = () => {
 		const tmp = `${OUT_JSON}.partial`;
-		writeFileSync(tmp, `${JSON.stringify(buildResult(), null, 2)}\n`);
+		writeFileSync(
+			tmp,
+			`${JSON.stringify(
+				buildBenchArtifact({
+					...buildResult(),
+					preregistrationSha256,
+				}),
+				null,
+				2,
+			)}\n`,
+		);
 		renameSync(tmp, OUT_JSON);
 	};
 
@@ -583,6 +729,8 @@ async function main(): Promise<void> {
 				await runArm({
 					name: `steady-${sessions}`,
 					sessions,
+					startedAt: new Date().toISOString(),
+					candidateSha: candidateSource.candidateSha,
 					server,
 					state: () => state,
 					resetState: () => {
@@ -591,11 +739,13 @@ async function main(): Promise<void> {
 					players,
 					raidMembers,
 					clock,
+					phaseState,
 					hotspot: false,
 					stormCohort: 0,
 					setSeverAt: (v) => {
 						severAtMs = v;
 					},
+					phaseBarrierId: null,
 				}),
 			);
 			flush();
@@ -607,6 +757,8 @@ async function main(): Promise<void> {
 				await runArm({
 					name: `hotspot-${Math.max(...LADDER)}`,
 					sessions: Math.max(...LADDER),
+					startedAt: new Date().toISOString(),
+					candidateSha: candidateSource.candidateSha,
 					server,
 					state: () => state,
 					resetState: () => {
@@ -615,11 +767,13 @@ async function main(): Promise<void> {
 					players,
 					raidMembers,
 					clock,
+					phaseState,
 					hotspot: true,
 					stormCohort: 0,
 					setSeverAt: (v) => {
 						severAtMs = v;
 					},
+					phaseBarrierId: randomUUID(),
 				}),
 			);
 			flush();
@@ -632,6 +786,8 @@ async function main(): Promise<void> {
 					await runArm({
 						name: `storm-${cohort}`,
 						sessions: Math.max(...LADDER),
+						startedAt: new Date().toISOString(),
+						candidateSha: candidateSource.candidateSha,
 						server,
 						state: () => state,
 						resetState: () => {
@@ -640,11 +796,13 @@ async function main(): Promise<void> {
 						players,
 						raidMembers,
 						clock,
+						phaseState,
 						hotspot: false,
 						stormCohort: cohort,
 						setSeverAt: (v) => {
 							severAtMs = v;
 						},
+						phaseBarrierId: null,
 					}),
 				);
 				flush();
@@ -669,6 +827,7 @@ function forwardToRaid(
 	state: ServerState,
 	raidMembers: Player[],
 	clock: { now: () => number },
+	phaseState: { current: EmitterPhase },
 ): void {
 	let first = true;
 	for (const member of raidMembers) {
@@ -690,7 +849,11 @@ function forwardToRaid(
 				// one clock and off-box is two hosts — un-differenceable. The
 				// off-box replacement is the subscriber's own one-way, which
 				// spans the whole path on one clock (Amendment 2).
-				state.ingestToForward.record(clock.now() - entryNs);
+				const dwellNs = clock.now() - entryNs;
+				state.ingestToForward.record(dwellNs);
+				if (phaseState.current === "steady" || phaseState.current === "drain") {
+					state.ingestToForwardSteadyDrain.record(dwellNs);
+				}
 				first = false;
 			}
 		} catch {
@@ -713,23 +876,40 @@ function startEmitter(
 	players: Player[],
 	state: ServerState,
 	clock: { now: () => number },
+	phase: () => EmitterPhase,
 ): () => void {
 	const body = new Uint8Array(SNAPSHOT_PAYLOAD_BYTES);
 	body.fill(0x77);
-	let slice = 0;
 	let sequence = 0;
 	let stopped = false;
-	const startedNs = clock.now();
+	let window: EmitterWindowState | null = null;
+	const sliceNs = SLICE_MS * 1e6;
 	const timer = setInterval(() => {
 		if (stopped) return;
-		const deadlineNs = startedNs + slice * SLICE_MS * 1e6;
+		const planned = nextEmitterWindowState(
+			window,
+			phase(),
+			clock.now(),
+			sliceNs,
+		);
+		window = planned.window;
+		if (!planned.emit) return;
+		const { deadlineNs, sliceIndex } = planned.emit;
 		const handoffNs = clock.now();
-		state.emitterLag.record(Math.max(0, handoffNs - deadlineNs));
+		const lagNs = Math.max(0, handoffNs - deadlineNs);
+		state.emitterLag.record(lagNs);
+		if (planned.emit.kind === "steady") {
+			state.emitterLagSteady.record(lagNs);
+		} else if (planned.emit.kind === "storm") {
+			state.emitterLagStorm.record(lagNs);
+		}
 		const target = players.filter((p) => p.alive && p.kind === "player");
-		const perSlice = Math.ceil(target.length / SLICES_PER_TICK);
-		const from = (slice % SLICES_PER_TICK) * perSlice;
-		const chunk = target.slice(from, from + perSlice);
-		slice += 1;
+		const { from, to } = emitterSliceBounds(
+			target.length,
+			SLICES_PER_TICK,
+			sliceIndex,
+		);
+		const chunk = target.slice(from, to);
 		for (const player of chunk) {
 			sequence += 1;
 			const batch: Uint8Array[] = [];
@@ -773,35 +953,30 @@ function startEmitter(
 type ArmOptions = {
 	name: string;
 	sessions: number;
+	startedAt: string;
+	candidateSha: string;
 	server: ReturnType<typeof createServer>;
 	state: () => ServerState;
 	resetState: () => void;
 	players: Player[];
 	raidMembers: Player[];
 	clock: { now: () => number; source: string };
+	phaseState: { current: EmitterPhase };
 	hotspot: boolean;
 	stormCohort: number;
 	setSeverAt: (v: number | null) => void;
+	phaseBarrierId: string | null;
 };
 
 type Marks = {
-	start: Boundary | null;
-	steadyStart: Boundary | null;
-	steadyMark: Boundary | null;
-	steadyEnd: Boundary | null;
-	stormStart: Boundary | null;
-	stormEnd: Boundary | null;
-	idleEnd: Boundary | null;
-};
-
-type Boundary = {
-	rx: number;
-	snapshotIssued: number;
-	ackIssued: number;
-	cpuMs: number;
-	wallMs: number;
-	kernel: KernelUdp | null;
-	metrics: ReturnType<ReturnType<typeof createServer>["metricsSnapshot"]>;
+	start: BoundarySnapshot | null;
+	steadyStart: BoundarySnapshot | null;
+	drainStart: BoundarySnapshot | null;
+	drainEnd: BoundarySnapshot | null;
+	stormStart: BoundarySnapshot | null;
+	stormEnd: BoundarySnapshot | null;
+	idleStart: BoundarySnapshot | null;
+	idleEnd: BoundarySnapshot | null;
 };
 
 async function runArm(o: ArmOptions): Promise<unknown> {
@@ -809,12 +984,14 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	o.raidMembers.length = 0;
 	o.resetState();
 	o.setSeverAt(null);
+	o.phaseState.current = "connect";
 	const shape = armShape(o.sessions);
 	console.log(
 		`bench-g6: arm ${o.name} sessions=${o.sessions} up=${shape.upstreamAggregatePps}/s down=${shape.downstreamAggregatePps}/s storm=${o.stormCohort}`,
 	);
 
-	const stopEmitter = startEmitter(o.players, o.state(), o.clock);
+	let phase: EmitterPhase = "connect";
+	const stopEmitter = startEmitter(o.players, o.state(), o.clock, () => phase);
 	// O-2's arithmetic, computed from the same constants the argv carries,
 	// with the macgen 1.5x allowance. The entrypoint's watchdog arms after its
 	// build, so this covers only the client's own phases.
@@ -822,6 +999,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 		1.5 *
 			(CONNECT_TIMEOUT_SECONDS +
 				STEADY_SECONDS +
+				Math.ceil(DRAIN_GRACE_MS / 1000) +
 				(o.stormCohort > 0
 					? Math.ceil(STORM_RECONNECT_DELAY_MS / 1000) +
 						stormWindowSec() +
@@ -830,8 +1008,27 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 				IDLE_SECONDS),
 	);
 	const sideDeadlineSec = Math.ceil(
-		1.5 * (CONNECT_TIMEOUT_SECONDS + STEADY_SECONDS + IDLE_SECONDS),
+		1.5 *
+			(CONNECT_TIMEOUT_SECONDS +
+				STEADY_SECONDS +
+				Math.ceil(DRAIN_GRACE_MS / 1000) +
+				IDLE_SECONDS),
 	);
+	const phaseBarrierArgs = o.hotspot
+		? [
+				"--phase-barrier-id",
+				o.phaseBarrierId ??
+					(() => {
+						throw new Error("bench-g6: hotspot arm missing phase barrier id");
+					})(),
+				"--phase-barrier-dir",
+				HOTSPOT_PHASE_BARRIER_DIR,
+				"--phase-barrier-parties",
+				String(HOTSPOT_PHASE_BARRIER_PARTIES),
+				"--phase-barrier-timeout-ms",
+				"60000",
+			]
+		: [];
 	const cloneFor = new Map<string, string | null>();
 	// Pre-provision each concurrent role's clone BEFORE any spawn, so the three
 	// macgen invocations never share one worktree (index.lock race, run
@@ -855,6 +1052,8 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 			String(UPSTREAM_PAYLOAD_BYTES),
 			"--steady-secs",
 			String(STEADY_SECONDS),
+			"--drain-ms",
+			String(DRAIN_GRACE_MS),
 			"--idle-secs",
 			String(IDLE_SECONDS),
 			"--endpoints",
@@ -863,6 +1062,11 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 			String(CONNECT_CONCURRENCY),
 			"--connect-timeout-secs",
 			String(CONNECT_TIMEOUT_SECONDS),
+			"--preregistration-sha256",
+			EXPECTED_PREREGISTRATION_SHA256,
+			"--started-at",
+			o.startedAt,
+			...phaseBarrierArgs,
 			...(o.stormCohort > 0
 				? [
 						"--storm-cohort",
@@ -893,8 +1097,15 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 					String(RAID_MEMBERS),
 					"--steady-secs",
 					String(STEADY_SECONDS),
+					"--drain-ms",
+					String(DRAIN_GRACE_MS),
 					"--idle-secs",
 					String(IDLE_SECONDS),
+					"--preregistration-sha256",
+					EXPECTED_PREREGISTRATION_SHA256,
+					"--started-at",
+					o.startedAt,
+					...phaseBarrierArgs,
 				],
 				sideDeadlineSec,
 				cloneFor.get("raid-subscriber") ?? null,
@@ -913,8 +1124,15 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 					String(UPSTREAM_PAYLOAD_BYTES),
 					"--steady-secs",
 					String(STEADY_SECONDS),
+					"--drain-ms",
+					String(DRAIN_GRACE_MS),
 					"--idle-secs",
 					String(IDLE_SECONDS),
+					"--preregistration-sha256",
+					EXPECTED_PREREGISTRATION_SHA256,
+					"--started-at",
+					o.startedAt,
+					...phaseBarrierArgs,
 				],
 				sideDeadlineSec,
 				cloneFor.get("publisher") ?? null,
@@ -922,10 +1140,18 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 		);
 	}
 
-	const boundary = (): Boundary => ({
-		rx: o.state().rxTotal,
-		snapshotIssued: o.state().emitter.snapshotIssued,
-		ackIssued: o.state().emitter.ackIssued,
+	const boundary = (): BoundarySnapshot => ({
+		rxTotal: o.state().rxTotal,
+		rxByClass: {
+			snapshot: o.state().rxByClass.get(CLASS_SNAPSHOT) ?? 0,
+			ack: o.state().rxByClass.get(CLASS_ACK) ?? 0,
+			raid: o.state().rxByClass.get(CLASS_RAID) ?? 0,
+			raidJoin: o.state().rxByClass.get(CLASS_RAID_JOIN) ?? 0,
+			unstamped: o.state().rxUnstamped,
+		},
+		emitter: {
+			...o.state().emitter,
+		},
 		cpuMs: serverCpuMs(),
 		wallMs: Date.now(),
 		kernel: readKernelUdp(),
@@ -935,42 +1161,46 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	const marks: Marks = {
 		start: boundary(),
 		steadyStart: null,
-		steadyMark: null,
-		steadyEnd: null,
+		drainStart: null,
+		drainEnd: null,
 		stormStart: null,
 		stormEnd: null,
+		idleStart: null,
 		idleEnd: null,
 	};
-	let phase = "connect";
 	const hostSteady: number[] = [];
 	const degraded: string[] = [];
 
 	const onLine = (line: string) => {
-		if (line.includes("phase steady")) {
+		const marker = readPhaseMarker(line);
+		if (!marker) return;
+		if (marker.kind === "steady") {
 			marks.steadyStart = boundary();
 			phase = "steady";
-		} else if (line.includes("phase storm")) {
-			marks.steadyMark = boundary();
-			phase = "storm";
-			marks.stormStart = boundary();
-			// The sever instant, on the server's clock. Everything accepted
-			// before it is a survivor; everything after it is the cohort
-			// returning. This is the only place that distinction exists without
-			// trusting the client's account of who it severed.
-			o.setSeverAt(Date.now());
-		} else if (line.includes("phase post-storm")) {
-			marks.stormEnd = boundary();
-			phase = "post";
-		} else if (line.includes("phase idle")) {
-			marks.steadyMark ??= boundary();
+			o.phaseState.current = "steady";
+		} else if (marker.kind === "drain") {
+			marks.drainStart = boundary();
 			phase = "drain";
-			setTimeout(() => {
-				marks.steadyEnd = boundary();
-				phase = "idle";
-			}, DRAIN_GRACE_MS);
-		} else if (line.includes("phase stop")) {
+			o.phaseState.current = "drain";
+		} else if (marker.kind === "storm") {
+			marks.drainEnd ??= boundary();
+			marks.stormStart = boundary();
+			phase = "storm";
+			o.phaseState.current = "storm";
+			o.setSeverAt(marks.stormStart.wallMs);
+		} else if (marker.kind === "post-storm") {
+			marks.stormEnd = boundary();
+			phase = "post-storm";
+			o.phaseState.current = "post-storm";
+		} else if (marker.kind === "idle") {
+			marks.drainEnd ??= boundary();
+			marks.idleStart = boundary();
+			phase = "idle";
+			o.phaseState.current = "idle";
+		} else if (marker.kind === "stop") {
 			marks.idleEnd = boundary();
 			phase = "stop";
+			o.phaseState.current = "stop";
 		}
 	};
 
@@ -987,20 +1217,86 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	]);
 	stopEmitter();
 
-	const realmReport = realmRaw as Record<string, unknown> | null;
+	const realmReport = realmRaw.report
+		? requireClientReportIdentity(realmRaw.report, {
+				role: "realm",
+				startedAt: o.startedAt,
+				preregistrationSha256: EXPECTED_PREREGISTRATION_SHA256,
+			})
+		: null;
 	// The subscriber's and publisher's reports are evidence, not noise: the
 	// one-way percentile the hotspot clause reads lives in the *subscriber's*
 	// histogram, and the smoke that first ran this arm discarded them.
-	const byRole = new Map<string, Record<string, unknown>>();
+	const byRole = new Map<
+		string,
+		{
+			report: Record<string, unknown> | null;
+			provenanceLines: string[];
+			stderrLines: string[];
+			exitCode: number;
+		}
+	>();
 	for (const r of extraReports) {
-		const rec = r as Record<string, unknown> | null;
-		const role = rec?.role;
-		if (typeof role === "string")
-			byRole.set(role, rec as Record<string, unknown>);
+		const role = r.report?.role;
+		if (typeof role === "string") byRole.set(role, r);
 	}
-	const subscriberReport = byRole.get("raid-subscriber") ?? null;
-	const publisherReport = byRole.get("publisher") ?? null;
+	const subscriberBundle = byRole.get("raid-subscriber") ?? null;
+	const publisherBundle = byRole.get("publisher") ?? null;
+	const subscriberReport = subscriberBundle?.report
+		? requireClientReportIdentity(subscriberBundle.report, {
+				role: "raid-subscriber",
+				startedAt: o.startedAt,
+				preregistrationSha256: EXPECTED_PREREGISTRATION_SHA256,
+			})
+		: null;
+	const publisherReport = publisherBundle?.report
+		? requireClientReportIdentity(publisherBundle.report, {
+				role: "publisher",
+				startedAt: o.startedAt,
+				preregistrationSha256: EXPECTED_PREREGISTRATION_SHA256,
+			})
+		: null;
 	if (!realmReport) degraded.push("realm client produced no JSON report");
+	if (realmRaw.exitCode !== 0) {
+		degraded.push(
+			`realm client exited ${realmRaw.exitCode}${stderrSuffix(realmRaw.stderrLines)}`,
+		);
+	}
+	if (OFFBOX_SSH && realmRaw.provenanceLines.length === 0) {
+		degraded.push("realm client produced no off-box provenance lines");
+	}
+	if (o.hotspot && !subscriberReport) {
+		degraded.push("raid-subscriber client produced no JSON report");
+	}
+	if (subscriberBundle && subscriberBundle.exitCode !== 0) {
+		degraded.push(
+			`raid-subscriber client exited ${subscriberBundle.exitCode}${stderrSuffix(subscriberBundle.stderrLines)}`,
+		);
+	}
+	if (
+		o.hotspot &&
+		OFFBOX_SSH &&
+		(subscriberBundle?.provenanceLines.length ?? 0) === 0
+	) {
+		degraded.push(
+			"raid-subscriber client produced no off-box provenance lines",
+		);
+	}
+	if (o.hotspot && !publisherReport) {
+		degraded.push("publisher client produced no JSON report");
+	}
+	if (publisherBundle && publisherBundle.exitCode !== 0) {
+		degraded.push(
+			`publisher client exited ${publisherBundle.exitCode}${stderrSuffix(publisherBundle.stderrLines)}`,
+		);
+	}
+	if (
+		o.hotspot &&
+		OFFBOX_SSH &&
+		(publisherBundle?.provenanceLines.length ?? 0) === 0
+	) {
+		degraded.push("publisher client produced no off-box provenance lines");
+	}
 	// A missing phase marker means the client died before printing it. The
 	// windows can still be closed at the child's exit so the arm reports
 	// something, but a synthesized boundary silently stretches the window over
@@ -1008,8 +1304,9 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	// and a degraded arm can never be read as a clean one.
 	for (const key of [
 		"steadyStart",
-		"steadyMark",
-		"steadyEnd",
+		"drainStart",
+		"drainEnd",
+		"idleStart",
 		"idleEnd",
 	] as const) {
 		if (!marks[key]) {
@@ -1017,34 +1314,90 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 			marks[key] = boundary();
 		}
 	}
-
-	const between = (
-		from: Boundary | null,
-		to: Boundary | null,
-		pick: (b: Boundary) => number,
-	) => (from && to ? pick(to) - pick(from) : 0);
+	if (o.stormCohort > 0) {
+		for (const key of ["stormStart", "stormEnd"] as const) {
+			if (!marks[key]) {
+				degraded.push(`${key} marker never arrived: boundary synthesized`);
+				marks[key] = boundary();
+			}
+		}
+	}
 	const metricBetween = (
-		from: Boundary | null,
-		to: Boundary | null,
+		from: BoundarySnapshot | null,
+		to: BoundarySnapshot | null,
 		key: string,
 	) =>
 		from && to
-			? ((to.metrics as unknown as Record<string, number>)[key] ?? 0) -
-				((from.metrics as unknown as Record<string, number>)[key] ?? 0)
+			? ((to.metrics as Record<string, number>)[key] ?? 0) -
+				((from.metrics as Record<string, number>)[key] ?? 0)
 			: null;
-	const kernelDelta = diffKernelUdp(
-		marks.steadyStart?.kernel ?? null,
-		marks.steadyEnd?.kernel ?? null,
-	);
-	const kernelValue = (key: string): number | null => {
-		const v = kernelDelta?.[key];
-		return v === undefined ? null : v;
-	};
 
 	const state = o.state();
-	const classCount = (k: number) => state.rxByClass.get(k) ?? 0;
 	const acceptSeries = state.acceptSeries;
 	const severAt = marks.stormStart?.wallMs ?? null;
+	const {
+		steady: steadyWindow,
+		steadyDrain: steadyDrainWindow,
+		lifetime: lifetimeWindow,
+		storm: stormWindow,
+	} = deriveBoundaryWindows({
+		start: marks.start!,
+		steadyStart: marks.steadyStart!,
+		drainStart: marks.drainStart!,
+		drainEnd: marks.drainEnd!,
+		idleStart: marks.idleStart!,
+		stormStart: marks.stormStart,
+		stormEnd: marks.stormEnd,
+	});
+	const steadyClient = clientWindow(realmReport, "steady");
+	const steadyDrainClient = clientWindow(realmReport, "steadyDrain");
+	const stormSurvivorsClient = clientWindow(realmReport, "stormSurvivors");
+	const subscriberSteadyDrain = clientWindow(subscriberReport, "steadyDrain");
+	const publisherSteady = clientWindow(publisherReport, "steady");
+	const steadyDrainDelivery = steadyDrainClient
+		? compareWindowDelivery(
+				steadyDrainWindow.emitter.snapshotIssued +
+					steadyDrainWindow.emitter.ackIssued,
+				steadyDrainClient,
+			)
+		: null;
+	const stormSurvivorDelivery =
+		stormWindow && stormSurvivorsClient
+			? compareWindowDelivery(
+					stormWindow.emitter.snapshotIssued + stormWindow.emitter.ackIssued,
+					stormSurvivorsClient,
+				)
+			: null;
+	if (steadyDrainDelivery?.status === "unparseable") {
+		degraded.push(
+			"realm steadyDrain window contained unstamped receives and is invalidating",
+		);
+	}
+	if (steadyDrainDelivery?.status === "unreflected") {
+		degraded.push(
+			"realm steadyDrain window contained unreflected acks and is degraded",
+		);
+	}
+	if (stormSurvivorDelivery?.status === "unparseable") {
+		degraded.push(
+			"realm stormSurvivors window contained unstamped receives and is invalidating",
+		);
+	}
+	const hotspotPhaseBarrier =
+		o.hotspot && realmReport && subscriberReport && publisherReport
+			? summarizePhaseBarrier(
+					[realmReport, subscriberReport, publisherReport],
+					HOTSPOT_PHASE_BARRIER_PARTIES,
+				)
+			: null;
+	if (
+		hotspotPhaseBarrier &&
+		hotspotPhaseBarrier.steadyEnterSkewMs > HOTSPOT_PHASE_BARRIER_STEADY_SKEW_MS
+	) {
+		throw new Error(
+			`bench-g6: hotspot phase barrier steady-enter skew ${hotspotPhaseBarrier.steadyEnterSkewMs.toFixed(3)}ms exceeded ${HOTSPOT_PHASE_BARRIER_STEADY_SKEW_MS}ms`,
+		);
+	}
 
 	return {
 		arm: o.name,
@@ -1052,50 +1405,81 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 		shape,
 		degraded,
 		clockSource: o.clock.source,
-		client: realmReport,
-		subscriberClient: subscriberReport,
-		publisherClient: publisherReport,
-		serverUpstream: {
-			rxTotal: between(marks.steadyStart, marks.steadyEnd, (b) => b.rx),
-			rxUnstamped: state.rxUnstamped,
-			rxMove: classCount(0),
-			rxAction: classCount(CLASS_ACTION),
-			rxRaid: classCount(CLASS_RAID),
-			rxRaidJoin: classCount(CLASS_RAID_JOIN),
-			rxSurvivors: state.rxSurvivors,
-		},
-		emitter: {
-			...state.emitter,
-			lag: state.emitterLag.toJson(),
-			// Reported beside the round trip, and never subtracted from it.
-			hold: state.hold.toJson(),
+		windows: {
+			steady: {
+				serverUpstream: {
+					rxTotal: steadyWindow.rxTotal,
+					rxByClass: steadyWindow.rxByClass,
+				},
+				emitter: steadyWindow.emitter,
+				diagnostics: {
+					emitterLag: state.emitterLagSteady.toJson(),
+				},
+				client: steadyClient,
+			},
+			steadyDrain: {
+				serverUpstream: {
+					rxTotal: steadyDrainWindow.rxTotal,
+					rxByClass: steadyDrainWindow.rxByClass,
+				},
+				emitter: steadyDrainWindow.emitter,
+				diagnostics: {
+					serverHold: state.holdSteadyDrain.toJson(),
+					ingestToForward: state.ingestToForwardSteadyDrain.toJson(),
+				},
+				client: steadyDrainClient,
+			},
+			storm: stormWindow
+				? {
+						serverUpstream: {
+							rxTotal: stormWindow.rxTotal,
+							rxByClass: stormWindow.rxByClass,
+						},
+						emitter: stormWindow.emitter,
+						diagnostics: {
+							emitterLag: state.emitterLagStorm.toJson(),
+							serverHold: state.holdStorm.toJson(),
+						},
+						client: stormSurvivorsClient,
+					}
+				: null,
+			lifetime: {
+				serverUpstream: {
+					rxTotal: lifetimeWindow.rxTotal,
+					rxByClass: lifetimeWindow.rxByClass,
+				},
+				emitter: lifetimeWindow.emitter,
+				diagnostics: {
+					emitterLag: state.emitterLag.toJson(),
+					serverHold: state.hold.toJson(),
+					ingestToForward: state.ingestToForward.toJson(),
+				},
+				client: realmReport?.lifetime ?? null,
+			},
 		},
 		hotspot: o.hotspot
 			? {
 					subscribers: o.raidMembers.length,
-					ingested: state.publisherArrivals,
-					publisherStamped: state.publisherStamped,
+					ingested: state.publisherArrivalsSteadyDrain,
+					publisherStamped: state.publisherStampedSteadyDrain,
 					forwarded: state.emitter.raidForwarded,
-					subscriberReceived:
-						(subscriberReport?.realm as Record<string, number> | undefined)
-							?.rxRaid ?? 0,
-					publisherSent:
-						(publisherReport?.realm as Record<string, number> | undefined)
-							?.sent ?? 0,
+					subscriberReceived: subscriberSteadyDrain?.rxRaid ?? 0,
+					publisherSent: publisherSteady?.sent ?? 0,
 					/** The clause's percentile, on the subscriber's own clock. */
-					oneWay: (subscriberReport?.oneWay as unknown) ?? null,
+					oneWay: subscriberSteadyDrain?.oneWay ?? null,
 					/** Server-internal dwell. Disclosure only — see the comment
 					 * at the recording site and Amendment 2. */
-					serverForwardDwell: state.ingestToForward.toJson(),
+					serverForwardDwell: state.ingestToForwardSteadyDrain.toJson(),
 					// A gap at or above half a publisher period is a frame
 					// boundary; the falsifier's band is computed from the
 					// publisher's own per-tick count.
 					frameGapFraction: frameGapFraction(
-						state.publisherGaps,
+						state.publisherGapsSteadyDrain,
 						1e9 / RAID_PUBLISHER_HZ,
 					),
 				}
 			: null,
+		phaseBarrier: hotspotPhaseBarrier,
 		storm:
 			o.stormCohort > 0
 				? {
@@ -1135,48 +1519,87 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 							marks.stormEnd,
 							"sessionsClosedOther",
 						),
-						kernelStorm: diffKernelUdp(
-							marks.stormStart?.kernel ?? null,
-							marks.stormEnd?.kernel ?? null,
-						),
+						kernelStorm: stormWindow?.kernel ?? null,
 					}
 				: null,
-		stageLedger: {
-			clientEnqueued:
-				(realmReport?.realm as Record<string, number> | undefined)?.sent ?? 0,
-			clientWireTx:
-				(realmReport?.quicDrive as Record<string, number> | undefined)
-					?.frameTxDatagram ?? null,
-			kernelDropsSocket: kernelValue("serverSocketDrops"),
-			kernelRcvbufErrors: kernelValue("RcvbufErrors"),
-			serverObserved: metricBetween(
-				marks.steadyStart,
-				marks.steadyEnd,
-				"datagramsIn",
-			),
-			jsDelivered: between(marks.steadyStart, marks.steadyEnd, (b) => b.rx),
-			nativeDropped: metricBetween(
-				marks.steadyStart,
-				marks.steadyEnd,
-				"datagramsDropped",
-			),
-			nativeSkippedQueueFull: metricBetween(
-				marks.steadyStart,
-				marks.steadyEnd,
-				"datagramsSkippedQueueFull",
-			),
+		stageWindows: {
+			steady: {
+				clientEnqueued: steadyClient?.sent ?? 0,
+				clientWireTx:
+					(realmReport?.quicDrive as Record<string, number> | undefined)
+						?.frameTxDatagram ?? null,
+				kernelDropsSocket: steadyWindow.kernel?.serverSocketDrops ?? null,
+				kernelRcvbufErrors: steadyWindow.kernel?.RcvbufErrors ?? null,
+				serverObserved: steadyWindow.metrics.datagramsIn ?? null,
+				jsDelivered: steadyWindow.rxTotal,
+				nativeDropped: steadyWindow.metrics.datagramsDropped ?? null,
+				nativeSkippedQueueFull:
+					steadyWindow.metrics.datagramsSkippedQueueFull ?? null,
+			},
+			steadyDrain: {
+				clientReceived: steadyDrainDelivery?.clientReceived ?? null,
+				serverIssued:
+					steadyDrainWindow.emitter.snapshotIssued +
+					steadyDrainWindow.emitter.ackIssued,
+				kernelDropsSocket: steadyDrainWindow.kernel?.serverSocketDrops ?? null,
+				kernelRcvbufErrors: steadyDrainWindow.kernel?.RcvbufErrors ?? null,
+				serverObserved: steadyDrainWindow.metrics.datagramsIn ?? null,
+				jsDelivered: steadyDrainWindow.rxTotal,
+				nativeDropped: steadyDrainWindow.metrics.datagramsDropped ?? null,
+				nativeSkippedQueueFull:
+					steadyDrainWindow.metrics.datagramsSkippedQueueFull ?? null,
+			},
 		},
-		kernelSteady: kernelDelta,
-		serverCpuPctSteady:
-			marks.steadyStart &&
-			marks.steadyMark &&
-			marks.steadyMark.wallMs > marks.steadyStart.wallMs
-				? ((marks.steadyMark.cpuMs - marks.steadyStart.cpuMs) /
-						(marks.steadyMark.wallMs - marks.steadyStart.wallMs)) *
-					100
-				: null,
-		hostCpuPctMedianSteady: median(hostSteady),
-		sessionsActiveMax: marks.steadyMark?.metrics.sessionsActive ?? null,
+		cpuWindows: {
+			steady: {
+				serverPct:
+					steadyWindow.wallMs > 0
+						? (steadyWindow.cpuMs / steadyWindow.wallMs) * 100
+						: null,
+				hostPctMedian: median(hostSteady),
+				sessionsActiveMax: marks.drainStart?.metrics.sessionsActive ?? null,
+			},
+			steadyDrain: {
+				serverPct:
+					steadyDrainWindow.wallMs > 0
+						? (steadyDrainWindow.cpuMs / steadyDrainWindow.wallMs) * 100
+						: null,
+				sessionsActiveEnd: marks.drainEnd?.metrics.sessionsActive ?? null,
+			},
+		},
+		rawReports: {
+			realm: realmReport,
+			realmProvenance: chooseClientProvenance({
+				provenanceLines: realmRaw.provenanceLines,
+				offbox: OFFBOX_SSH !== "",
+				exitCode: realmRaw.exitCode,
+				localFallback: localClientProvenance(o.candidateSha, realmRaw.exitCode),
+			}),
+			realmStderr: realmRaw.stderrLines,
+			realmExitCode: realmRaw.exitCode,
+			subscriber: subscriberReport,
+			subscriberProvenance: chooseClientProvenance({
+				provenanceLines: subscriberBundle?.provenanceLines,
+				offbox: OFFBOX_SSH !== "",
+				exitCode: subscriberBundle?.exitCode ?? null,
+				localFallback: subscriberBundle
+					? localClientProvenance(o.candidateSha, subscriberBundle.exitCode)
+					: [],
+			}),
+			subscriberStderr: subscriberBundle?.stderrLines ?? [],
+			subscriberExitCode: subscriberBundle?.exitCode ?? null,
+			publisher: publisherReport,
+			publisherProvenance: chooseClientProvenance({
+				provenanceLines: publisherBundle?.provenanceLines,
+				offbox: OFFBOX_SSH !== "",
+				exitCode: publisherBundle?.exitCode ?? null,
+				localFallback: publisherBundle
+					? localClientProvenance(o.candidateSha, publisherBundle.exitCode)
+					: [],
+			}),
+			publisherStderr: publisherBundle?.stderrLines ?? [],
+			publisherExitCode: publisherBundle?.exitCode ?? null,
+		},
 	};
 }
 
@@ -1214,6 +1637,15 @@ type SpawnedClient = {
 	child: ChildProcess;
 	exited: Promise<number>;
 };
+
+type PumpedClient = {
+	report: Record<string, unknown> | null;
+	provenanceLines: string[];
+	stderrLines: string[];
+	exitCode: number;
+};
+
+const MAX_CLIENT_STDERR_LINES = 40;
 
 function spawnClient(
 	args: string[],
@@ -1376,25 +1808,66 @@ async function pumpClient(
 	client: SpawnedClient,
 	onLine: (line: string) => void,
 	extraLabel?: string,
-): Promise<unknown | null> {
-	let report: unknown | null = null;
-	const decoder = new TextDecoder();
-	let buffered = "";
+): Promise<PumpedClient> {
+	let report: Record<string, unknown> | null = null;
+	const provenanceLines: string[] = [];
+	const stderrLines: string[] = [];
+	const stdoutDecoder = new TextDecoder();
+	const stderrDecoder = new TextDecoder();
+	let bufferedStdout = "";
+	let bufferedStderr = "";
 	const debugExtras = process.env.G6_DEBUG_EXTRAS === "1";
-	for await (const chunk of client.child.stdout ?? []) {
-		buffered += decoder.decode(chunk as Uint8Array, { stream: true });
-		const lines = buffered.split("\n");
-		buffered = lines.pop() ?? "";
-		for (const line of lines) {
-			onLine(line);
-			if (debugExtras && extraLabel) console.error(`${extraLabel}| ${line}`);
-			const match = line.match(/^mmo-client: json (\{.*\})$/);
-			if (match?.[1]) report = JSON.parse(match[1]);
+	const rememberStderr = (line: string) => {
+		if (stderrLines.length < MAX_CLIENT_STDERR_LINES) stderrLines.push(line);
+	};
+	const drainStdout = (async () => {
+		for await (const chunk of client.child.stdout ?? []) {
+			bufferedStdout += stdoutDecoder.decode(chunk as Uint8Array, {
+				stream: true,
+			});
+			const lines = bufferedStdout.split("\n");
+			bufferedStdout = lines.pop() ?? "";
+			for (const line of lines) {
+				onLine(line);
+				if (debugExtras && extraLabel) console.error(`${extraLabel}| ${line}`);
+				if (line.startsWith("macgen: ")) provenanceLines.push(line);
+				const match = line.match(/^mmo-client: json (\{.*\})$/);
+				if (match?.[1])
+					report = JSON.parse(match[1]) as Record<string, unknown>;
+			}
 		}
-	}
-	await client.exited;
+		if (bufferedStdout.length > 0) {
+			onLine(bufferedStdout);
+			if (debugExtras && extraLabel) {
+				console.error(`${extraLabel}| ${bufferedStdout}`);
+			}
+			if (bufferedStdout.startsWith("macgen: ")) {
+				provenanceLines.push(bufferedStdout);
+			}
+			const match = bufferedStdout.match(/^mmo-client: json (\{.*\})$/);
+			if (match?.[1]) report = JSON.parse(match[1]) as Record<string, unknown>;
+		}
+	})();
+	const drainStderr = (async () => {
+		for await (const chunk of client.child.stderr ?? []) {
+			bufferedStderr += stderrDecoder.decode(chunk as Uint8Array, {
+				stream: true,
+			});
+			const lines = bufferedStderr.split("\n");
+			bufferedStderr = lines.pop() ?? "";
+			for (const line of lines) rememberStderr(line);
+		}
+		if (bufferedStderr.length > 0) rememberStderr(bufferedStderr);
+	})();
+	await Promise.all([drainStdout, drainStderr]);
+	const exitCode = await client.exited;
 	activeChildren.delete(client.child);
-	return report;
+	return { report, provenanceLines, stderrLines, exitCode };
+}
+
+function stderrSuffix(lines: string[]): string {
+	if (lines.length === 0) return "";
+	return `; stderr=${lines.join(" | ")}`;
 }
 
 async function sampleWhile(
