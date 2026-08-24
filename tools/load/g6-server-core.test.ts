@@ -14,6 +14,7 @@ import {
 	REGISTERED_G6_SERVER_CORE_PLAN,
 	createG6ServerCore,
 	freshG6ServerState,
+	type G6ServerCoreDueAccounting,
 } from "./g6-server-core.ts";
 
 type FakeSession = {
@@ -95,6 +96,7 @@ function makeCore(
 		nowMs: number[];
 		phase: EmitterPhase;
 		severAtMs: number | null;
+		dueAccounting: G6ServerCoreDueAccounting;
 	}> = {},
 ) {
 	const phaseState = { current: over.phase ?? ("steady" as EmitterPhase) };
@@ -111,6 +113,7 @@ function makeCore(
 		phaseState,
 		state: () => stateRef.value,
 		severAtMs: () => severRef.value,
+		dueAccounting: over.dueAccounting,
 	});
 	return { core, phaseState, stateRef, severRef };
 }
@@ -358,5 +361,169 @@ describe("g6 server core", () => {
 
 		expect(oldState.emitter.sendErrors).toBe(1);
 		expect(newState.emitter.sendErrors).toBe(0);
+	});
+
+	test("operationally gates only the four declared diagnostic switches", async () => {
+		const runLane = async (switches: {
+			recordClauseLatencyHistograms: boolean;
+			retainPerDatagramDiagnosticSamples: boolean;
+			emitVerboseProgressLogs: boolean;
+			materializeHumanReadableRows: boolean;
+		}) => {
+			const phaseState = { current: "steady" as EmitterPhase };
+			const stateRef = { value: freshG6ServerState() };
+			const nowNs = [
+				400, 450, 500, 550, 600, 625, 1_000, 1_000, 1_020_000_000,
+				1_020_000_000,
+			];
+			const nowMs = [1, 2, 3, 4];
+			const verboseLogs: string[] = [];
+			const humanReadableRows: string[] = [];
+			const core = createG6ServerCore({
+				plan: REGISTERED_G6_SERVER_CORE_PLAN,
+				clock: {
+					now: () => nowNs.shift() ?? 0,
+				},
+				nowMs: () => nowMs.shift() ?? 0,
+				phaseState,
+				state: () => stateRef.value,
+				severAtMs: () => null,
+				instrumentation: {
+					switches,
+					emitVerboseProgress: (message) => {
+						verboseLogs.push(message);
+					},
+					materializeHumanReadableRow: (row) => {
+						humanReadableRows.push(row);
+					},
+				},
+			});
+
+			const player = queueSession();
+			const raid = queueSession([
+				stampedDatagram(CLASS_RAID_JOIN, { sequence: 1 }),
+			]);
+			const publisher = queueSession([
+				stampedDatagram(CLASS_RAID, { actualNs: 470, sequence: 2 }),
+				stampedDatagram(CLASS_RAID, { actualNs: 520, sequence: 3 }),
+			]);
+			const action = queueSession([
+				stampedDatagram(CLASS_ACTION, {
+					intendedNs: 40,
+					actualNs: 590,
+					sequence: 7,
+				}),
+			]);
+
+			core.onSession(player.session);
+			core.onSession(raid.session);
+			core.onSession(publisher.session);
+			core.onSession(action.session);
+			await flushAsyncWork();
+
+			const scheduled: Array<() => void> = [];
+			core.startEmitter(() => "steady", {
+				setInterval: (tick) => {
+					scheduled.push(tick);
+					return scheduled.length;
+				},
+				clearInterval: () => {},
+			});
+			scheduled[0]?.();
+			await flushAsyncWork();
+
+			return {
+				state: stateRef.value,
+				player,
+				raid,
+				action,
+				verboseLogs,
+				humanReadableRows,
+			};
+		};
+
+		const full = await runLane({
+			recordClauseLatencyHistograms: true,
+			retainPerDatagramDiagnosticSamples: true,
+			emitVerboseProgressLogs: true,
+			materializeHumanReadableRows: true,
+		});
+		const minimal = await runLane({
+			recordClauseLatencyHistograms: false,
+			retainPerDatagramDiagnosticSamples: false,
+			emitVerboseProgressLogs: false,
+			materializeHumanReadableRows: false,
+		});
+
+		expect(full.state.emitter).toEqual(minimal.state.emitter);
+		expect(full.state.rxTotal).toBe(minimal.state.rxTotal);
+		expect([...full.state.rxByClass.entries()]).toEqual([
+			...minimal.state.rxByClass.entries(),
+		]);
+		expect(full.player.sentBatches.map((batch) => batch.length)).toEqual(
+			minimal.player.sentBatches.map((batch) => batch.length),
+		);
+		expect(full.raid.sentOne).toHaveLength(minimal.raid.sentOne.length);
+		expect(full.action.sentOne).toHaveLength(minimal.action.sentOne.length);
+
+		expect(full.state.hold.summary().count).toBe(1);
+		expect(full.state.holdSteadyDrain.summary().count).toBe(1);
+		expect(full.state.ingestToForward.summary().count).toBe(2);
+		expect(full.state.ingestToForwardSteadyDrain.summary().count).toBe(2);
+		expect(full.state.emitterLag.summary().count).toBe(1);
+		expect(full.state.emitterLagSteady.summary().count).toBe(1);
+		expect(full.state.publisherGaps).toHaveLength(1);
+		expect(full.state.publisherGapsSteadyDrain).toHaveLength(1);
+		expect(full.verboseLogs.length).toBeGreaterThan(0);
+		expect(full.humanReadableRows.length).toBeGreaterThan(0);
+
+		expect(minimal.state.hold.summary().count).toBe(0);
+		expect(minimal.state.holdSteadyDrain.summary().count).toBe(0);
+		expect(minimal.state.ingestToForward.summary().count).toBe(0);
+		expect(minimal.state.ingestToForwardSteadyDrain.summary().count).toBe(0);
+		expect(minimal.state.emitterLag.summary().count).toBe(0);
+		expect(minimal.state.emitterLagSteady.summary().count).toBe(0);
+		expect(minimal.state.publisherGaps).toHaveLength(0);
+		expect(minimal.state.publisherGapsSteadyDrain).toHaveLength(0);
+		expect(minimal.verboseLogs).toHaveLength(0);
+		expect(minimal.humanReadableRows).toHaveLength(0);
+	});
+
+	test("counts all immutable steady slices as due even when callback lag skips 14 timer firings", async () => {
+		const nowNs: number[] = [];
+		for (let index = 0; index < 236; index += 1) {
+			const observedNs = Math.round(index * 21_280_000);
+			nowNs.push(observedNs, observedNs);
+		}
+		const { core, stateRef } = makeCore({
+			nowNs,
+			nowMs: Array.from({ length: 20 }, (_, index) => index + 1),
+			dueAccounting: {
+				plannedSessions: 20,
+				steadyWindowSec: 5,
+			},
+		});
+		const sessions = Array.from({ length: 20 }, () => queueSession());
+		for (const harness of sessions) {
+			core.onSession(harness.session);
+		}
+		await flushAsyncWork();
+
+		const scheduled: Array<() => void> = [];
+		core.startEmitter(() => "steady", {
+			setInterval: (tick) => {
+				scheduled.push(tick);
+				return scheduled.length;
+			},
+			clearInterval: () => {},
+		});
+
+		for (let index = 0; index < 236; index += 1) {
+			scheduled[0]?.();
+		}
+		await flushAsyncWork();
+
+		expect(stateRef.value.emitter.snapshotDue).toBe(1500);
+		expect(stateRef.value.emitter.snapshotIssued).toBe(1416);
 	});
 });

@@ -23,6 +23,10 @@ path = "src/gso_probe.rs"
 name = "mmo-client"
 path = "src/mmo_client.rs"
 
+[[bin]]
+name = "g6-server"
+path = "src/g6_server.rs"
+
 [dependencies]
 wtransport = { workspace = true }
 quinn-udp = "0.5"

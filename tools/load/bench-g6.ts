@@ -64,6 +64,7 @@ import {
 	type EmitterPhase,
 	validateSourceBinding,
 } from "./g6-artifact.ts";
+import { g6MacgenCloneCommand } from "./g6-offbox.ts";
 import {
 	ACTION_HZ,
 	actionEveryNthTick,
@@ -1386,7 +1387,7 @@ async function macgenCloneFor(role: string | null): Promise<string | null> {
 	// sees the old commit and dies with "unable to read tree (candidate)".
 	// Each role cloning from GitHub directly removes that coupling; the
 	// entrypoint's own `git fetch origin` then reconciles any later commits.
-	const cloneCmd = `"$HOME/.bun/bin/bun" --version >/dev/null 2>&1 || true; CLONE=$HOME/${clone}; if [ ! -d "$CLONE/.git" ]; then if mkdir "$CLONE.lock" 2>/dev/null; then if [ ! -d "$CLONE/.git" ]; then git clone --quiet --branch probe/g6-mmo-03 "https://github.com/vmeansdev/webtransport-bun.git" "$CLONE" 2>&1 || true; fi; rmdir "$CLONE.lock" 2>/dev/null || true; fi; fi; [ -d "$CLONE/.git" ] || { echo "macgen: $CLONE not provisioned" >&2; exit 3; }`;
+	const cloneCmd = g6MacgenCloneCommand({ cloneName: clone });
 	const child = spawn("ssh", ["-o", "BatchMode=yes", OFFBOX_SSH, cloneCmd], {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
