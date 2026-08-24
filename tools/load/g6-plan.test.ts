@@ -9,11 +9,15 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import {
 	AOI_ENTITIES,
 	actionEveryNthTick,
 	armShape,
 	DELIVERY_FLOOR,
+	G6_CLOSEOUT_SPEC_ID,
+	G6_CLOSEOUT_SPEC_PATH,
 	downstreamWireOccupancy,
 	floorLagCeilingMs,
 	GIGABIT,
@@ -31,6 +35,8 @@ import {
 	wireBytes,
 	wirePpsCeiling,
 } from "./g6-plan.ts";
+
+const repoRoot = resolve(import.meta.dir, "..", "..");
 
 describe("latency budget (§1.6)", () => {
 	test("the interaction budget leaves 50 ms for the round trip", () => {
@@ -177,5 +183,15 @@ describe("storm shape (§1.8, §5.4)", () => {
 	test("the storm window is twice the shipped idle timeout, not a run figure", () => {
 		expect(stormWindowSec()).toBe(120);
 		expect(STORM_RECONNECT_DELAY_MS).toBe(1000);
+	});
+});
+
+describe("closeout authority", () => {
+	test("pins the successor preregistration identity and tracked path", () => {
+		expect(G6_CLOSEOUT_SPEC_ID).toBe("g6-mmo-closeout/1");
+		expect(G6_CLOSEOUT_SPEC_PATH).toBe(
+			"docs/research/preregistrations/gate-g6-mmo-closeout.md",
+		);
+		expect(existsSync(resolve(repoRoot, G6_CLOSEOUT_SPEC_PATH))).toBe(true);
 	});
 });
