@@ -23,6 +23,7 @@ import {
 	clauseH2,
 	clauseSC1,
 	clauseSC2,
+	falsifierCablePreflight,
 	falsifierFloor,
 	falsifierGenerator,
 	falsifierHistograms,
@@ -37,6 +38,7 @@ import {
 	type StormFacts,
 	steadyArmClauses,
 } from "./g6-classify.ts";
+import type { PreflightVerdict } from "../offbox/preflight-lib.ts";
 
 const ms = (v: number) => v * 1e6;
 
@@ -359,6 +361,43 @@ describe("arm 3 clauses (§5)", () => {
 });
 
 describe("§7 falsifiers", () => {
+	test("V-C fires when either registered cable pre-flight fails", () => {
+		const failed: PreflightVerdict = {
+			valid: false,
+			reasons: [
+				"link carries 74900 pps under 0.1% loss; gate offers 75000 pps",
+			],
+			observed: {
+				cleanPpsCeiling: 74_900,
+				headroomRatio: 0.998_7,
+				mtuBytes: 1500,
+				idleRttP99Ms: 1.2,
+				preflightDate: "2026-08-24",
+			},
+		};
+		const passed: PreflightVerdict = {
+			valid: true,
+			reasons: [],
+			observed: {
+				cleanPpsCeiling: 20_100,
+				headroomRatio: 1.005,
+				mtuBytes: 1500,
+				idleRttP99Ms: 1.2,
+				preflightDate: "2026-08-24",
+			},
+		};
+		const verdict = falsifierCablePreflight({
+			results: [
+				{ name: "R-down", verdict: failed },
+				{ name: "R-up", verdict: passed },
+			],
+		});
+		expect(verdict.fired).toBe(true);
+		expect(verdict.reasons).toEqual([
+			"V-C R-down: link carries 74900 pps under 0.1% loss; gate offers 75000 pps",
+		]);
+	});
+
 	test("V-L fires on the exact retracted signature", () => {
 		// The four-axes retraction: acceptsPerSec × mean accept latency ≈ 500 =
 		// the client's own connect semaphore, at every rung.

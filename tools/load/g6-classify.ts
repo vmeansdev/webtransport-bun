@@ -22,6 +22,7 @@
  */
 
 import { ingestRealityVerdict } from "./egress-fanout.ts";
+import type { PreflightVerdict } from "../offbox/preflight-lib.ts";
 import {
 	DELIVERY_FLOOR,
 	EMITTED_FRACTION_FLOOR,
@@ -700,6 +701,17 @@ export function falsifierGenerator(input: {
 		}
 	}
 	return { id: "V-G", fired: reasons.length > 0, reasons, scope: "run" };
+}
+
+export function falsifierCablePreflight(input: {
+	results: { name: "R-down" | "R-up"; verdict: PreflightVerdict }[];
+}): FalsifierResult {
+	const reasons = input.results.flatMap(({ name, verdict }) =>
+		verdict.valid
+			? []
+			: verdict.reasons.map((reason) => `V-C ${name}: ${reason}`),
+	);
+	return { id: "V-C", fired: reasons.length > 0, reasons, scope: "run" };
 }
 
 /**
