@@ -103,6 +103,8 @@ interface CampaignAuthorityV1 {
     linuxStagedArchiveReceiptSha256: string;
     macLaunchProvenanceSha256: string;
     linuxLaunchProvenanceSha256: string;
+    macRuntimeFactsSha256: string;
+    linuxRuntimeFactsSha256: string;
     archiveSha256: string;
     macStagedArchiveSha256: string;
     linuxStagedArchiveSha256: string;
@@ -131,6 +133,7 @@ interface CampaignAuthorityV1 {
     { hostId: string; kind: "mac-campaign"; identity: MacosDirectoryIdentityV1 },
     { hostId: string; kind: "mac-staging"; identity: MacosDirectoryIdentityV1 },
     { hostId: string; kind: "linux-staging"; identity: LinuxDirectoryIdentityV1 },
+    { hostId: string; kind: "mac-exec-parent"; identity: MacosDirectoryIdentityV1 },
   ];
 }
 
@@ -236,6 +239,8 @@ interface ExpectedCampaignInputsV1 {
   linuxStagedArchiveReceiptSha256: string;
   macLaunchProvenanceSha256: string;
   linuxLaunchProvenanceSha256: string;
+  macRuntimeFactsSha256: string;
+  linuxRuntimeFactsSha256: string;
   sshHostReceiptSha256: string;
   macStagedArchiveSha256: string;
   linuxStagedArchiveSha256: string;
@@ -254,6 +259,7 @@ interface ExpectedCampaignInputsV1 {
   macCampaignParentIdentity: MacosDirectoryIdentityV1;
   macStagingIdentity: MacosDirectoryIdentityV1;
   linuxStagingIdentity: LinuxDirectoryIdentityV1;
+  macExecParentIdentity: MacosDirectoryIdentityV1;
 }
 
 interface OfficialFileIdentityV1 {
@@ -302,9 +308,204 @@ interface HostLaunchProvenanceV1 {
   stagedArchiveReceiptSha256: string;
   files: readonly LaunchFileProvenanceV1[]; // sorted kind, role, components
   canonicalFileSetSha256: string;
+  residentSupervisorLaunch: ProcessLaunchReceiptV1;
+  bunRoleLaunchContract: BunRoleLaunchContractV1;
+  initialDescriptorMap: readonly DescriptorBindingV1[];
   supervisorInstanceNonceSha256: string;
   observedAt: string;
 }
+
+interface DescriptorBindingV1 {
+  logicalName: string;
+  fd: number;
+  access: "read" | "write" | "read-write";
+  kind: "regular" | "executable" | "directory" | "pipe" | "seqpacket" | "observation-file";
+  closeOnExec: boolean;
+  inheritedByChild: boolean;
+  identitySha256: string;
+}
+
+interface ProcessLaunchReceiptV1 {
+  executableSha256: string;
+  executableIdentity: OfficialFileIdentityV1;
+  argv: readonly string[];
+  environment: readonly string[]; // sorted exact KEY=value entries
+  descriptorMapSha256: string;
+  startupNonceSha256: string;
+  startupDigestSha256: string;
+  launchedAt: string;
+}
+
+interface BunRoleLaunchContractV1 {
+  argvTemplate: readonly [
+    "bun",
+    "--no-install",
+    "--no-env-file",
+    "/dev/fd/{roleFd}",
+  ];
+  environmentTemplate: readonly [
+    "LC_ALL=C",
+    "WT_COMPARISON_PROTOCOL_IN_FD={protocolInFd}",
+    "WT_COMPARISON_PROTOCOL_OUT_FD={protocolOutFd}",
+    "WT_COMPARISON_STARTUP_NONCE_FD={startupNonceFd}",
+    "WT_COMPARISON_STRICT_ADDON_FD={addonFd}",
+  ];
+  inheritedLogicalDescriptors: readonly [
+    "roleFd",
+    "addonFd",
+    "protocolInFd",
+    "protocolOutFd",
+    "startupNonceFd",
+  ];
+  cwd: "sealed-exec-root";
+  pathLookup: false;
+  shell: false;
+  addonSpecifierTemplate: "/dev/fd/{addonFd}";
+  addonLoadAttemptCount: 1;
+  addonFallbackAttemptCount: 0;
+}
+
+interface BunRoleLaunchReceiptV1 {
+  schema: "bun-role-launch-receipt/v1";
+  hostId: string;
+  runId: string;
+  executionIndex: number;
+  logicalRole: string;
+  processOrdinal: number;
+  bunSha256: string;
+  roleEntrypointSha256: string;
+  addonSha256: string;
+  argv: readonly string[];
+  environment: readonly string[];
+  descriptorMap: readonly DescriptorBindingV1[];
+  sealedExecutionIdentity: MacosDirectoryIdentityV1 | null;
+  launchPrimitive: "linux-execveat-empty-path" | "macos-sealed-relative-posix-spawn";
+  startupNonceSha256: string;
+  startupDigestSha256: string;
+  addonRequestedSpecifier: string;
+  addonLoadAttemptCount: 1;
+  addonLoadedSha256: string;
+  addonFallbackCandidates: readonly [];
+  socketBeforeStartupHandshake: false;
+  launchedAt: string;
+}
+
+interface HostRuntimeFactsV1 {
+  schema: "host-runtime-facts/v1";
+  hostId: string;
+  platform: "darwin-arm64" | "linux-x86_64";
+  hostnameSha256: string;
+  os: {
+    system: "Darwin" | "Linux";
+    release: string;
+    versionSha256: string;
+    architecture: "arm64" | "x86_64";
+  };
+  cpu: {
+    modelSha256: string;
+    logicalCpuCount: number;
+    availableLogicalCpuCount: number;
+    minimumAvailableLogicalCpuCount: 8;
+    frequencyGovernorSha256: string;
+  };
+  toolchain: {
+    bunVersion: "1.3.14";
+    bunExecutableSha256: string;
+    bunVersionOutputSha256: string;
+    rustcVersion: string;
+    rustcExecutableSha256: string;
+    rustcVersionOutputSha256: string;
+    cargoVersion: string;
+    cargoExecutableSha256: string;
+    cargoVersionOutputSha256: string;
+    opensslVersion: string;
+    opensslExecutableSha256: string;
+    opensslVersionOutputSha256: string;
+  };
+  limits: {
+    nofileSoft: string;
+    nofileHard: string;
+    effectiveChildNofile: string;
+    minimumEffectiveChildNofile: "65536";
+    ephemeralPortFirst: number;
+    ephemeralPortLast: number;
+    occupiedSourcePortsSha256: string;
+    freeSourcePortCount: number;
+    requiredFreeSourcePortCount: number;
+  };
+  measurementEndpoint: {
+    interface: "en8" | "eno1";
+    interfaceIndex: number;
+    address: "10.99.0.1" | "10.99.0.2";
+    peerAddress: "10.99.0.2" | "10.99.0.1";
+    mtu: 1500;
+    wsTcpPort: 4433;
+    wtUdpPort: 4433;
+    wsPortFreeAtInspection: true;
+    wtPortFreeAtInspection: true;
+    listeningSocketInventorySha256: string;
+  };
+  descriptorMapSha256: string;
+  commandReceiptsSha256: string;
+  observedAt: string;
+}
+
+interface BunRoleLaunchReceiptSetV1 {
+  schema: "bun-role-launch-receipt-set/v1";
+  candidate: string;
+  campaignId: string;
+  authoritySha256: string;
+  lockSha256: string;
+  capabilitySha256: string;
+  expectedProcessCount: number;
+  receipts: readonly BunRoleLaunchReceiptV1[];
+  orderedReceiptSetSha256: string;
+}
+
+The expected process count and ordered `(executionIndex, logicalRole,
+processOrdinal)` tuples are recomputed from the frozen role plan for all 588
+executions. A missing, extra, reordered, path-launched, differently
+environmented, pre-handshake-socket, second addon attempt, or fallback addon
+candidate invalidates the complete campaign. `argv` and `environment` contain
+the actual decimal descriptor numbers; substituting those numbers into the
+single frozen logical template must reproduce the exact arrays, and the
+descriptor map must account for every substituted number and every inherited
+descriptor with no extras.
+
+`HostRuntimeFactsV1` is supervisor-owned evidence, not a role report. Before a
+host submission, the supervisor collects OS release/architecture, CPU model and
+available logical-CPU count, exact Bun/Rust/Cargo/OpenSSL version outputs,
+soft/hard/effective child `nofile`, ephemeral-port range, occupied-source-port
+inventory, interface index/address/MTU, and TCP/UDP port-4433 occupancy through
+the sealed `SupervisorObservationSyscalls` and approved command-runner seams.
+Mac values must describe `10.99.0.1/en8`; Linux values must describe
+`10.99.0.2/eno1`. TCP 4433 and UDP 4433 must both be free before every server
+launch, are used sequentially rather than concurrently, and must be absent
+again in the post-run cleanup receipt. A child-supplied `uname`, CPU count,
+toolchain string, descriptor map, FD limit, port count, route, socket list, or
+launch receipt is never authoritative.
+
+The toolchain command set is exact and shell-free: Bun `--version`, Rustc
+`--version --verbose`, Cargo `--version --verbose`, and OpenSSL `version -a`,
+each through its approved descriptor and `["LC_ALL=C"]`. OS identity comes
+from `uname(2)`. Mac CPU/availability/ephemeral-range facts come from the fixed
+`sysctlbyname` keys `machdep.cpu.brand_string`, `hw.logicalcpu`,
+`hw.logicalcpu_max`, `net.inet.ip.portrange.first`, and
+`net.inet.ip.portrange.last`; its governor value is canonical
+`not-applicable-darwin`. Linux CPU model, governor, and ephemeral range are
+read exactly once from the three pre-opened observation descriptors, while
+available CPUs come from `sched_getaffinity`; no `/proc` or `/sys` pathname is
+opened by the supervisor. Every source has a fixed byte bound and raw digest.
+
+Each final reviewer receives the two canonical runtime-facts records and their
+raw approved-command receipts separately from the host submissions, computes
+their expected digests independently, and records only those expected digests
+in `ExpectedCampaignInputsV1`. An opaque `roleFactsSha256`, toolchain string, or
+host-submission echo cannot replace the strict records. At campaign end,
+`BunRoleLaunchReceiptSetV1` and the ordered per-run cleanup/network receipts
+must prove the exact actual argv, sorted environment, descriptor substitutions,
+addon attempt, process/port ownership, and port release for every process
+declared by the frozen role plan.
 
 interface ExactApprovalRecordV1 {
   schema: "exact-approval/v1";
@@ -334,7 +535,7 @@ interface CampaignReservationV1 {
 }
 ```
 
-All three roots are created or opened and pinned by trusted Mac/Linux
+All four authority roots are created or opened and pinned by trusted Mac/Linux
 supervisors before authority serialization. They must be owned by the
 supervisor UID, be real directories on the expected local filesystem, and be
 neither group- nor world-writable. Created descendants use mode `0700`.
@@ -403,9 +604,10 @@ Second, a trusted operator launches `inspect-host` once on Mac and once on
 Linux. Each launch receives pre-opened read-only descriptors for the exact
 source receipt, source archive, platform staged archive, Bun executable,
 supervisor executable, canonical role-entrypoint manifest, native addon, and
-observation tools. It also receives the pinned staging-parent directory and a
-256-bit operator nonce. The supervisor hashes those descriptor bytes, opens
-the role bundles and addon relative to the pinned staging directory, and emits
+observation tools. It also receives the already opened exact staging-root
+directory descriptor and a 256-bit operator nonce. The supervisor hashes those
+descriptor bytes, adopts that root without descendant lookup, opens only the
+archive-declared role bundles and addon relative to it, and emits
 one canonical `host-submission/v1` containing its full staged-archive receipt
 and launch provenance. The supervisor verifies the staged archive member
 inventory against the pinned staging tree without enumeration beyond the
@@ -429,78 +631,140 @@ requires every observed digest to equal all three approval records. The
 controller copies no unapproved digest into authority. This removes the former
 self-hash/self-authorization path.
 
-The complete descriptor-only modes are frozen below. Repeated, missing,
-unknown, pathname-valued, environment-derived, or access-mode-incompatible
-inputs are rejected.
+The resident descriptor-only protocol is frozen below. `inspect-host`,
+`prepare-controller`, `serve-host`, `run-campaign`, `verify-campaign`, and
+`render-report` are states of already launched supervisors, not independent
+CLIs. Exactly one Mac supervisor and one Linux supervisor OS process are
+launched for an ordinary official campaign. Repeated, missing, unknown,
+pathname-valued, environment-derived, or access-mode-incompatible inputs are
+rejected.
 
 ```text
-inspect-host (both hosts)
-  --platform <darwin-arm64|linux-x86_64>
-  --source-receipt-fd <read-only regular-file/pipe fd>
-  --red-approval-bundle-fd <read-only regular-file/pipe fd>
-  --source-archive-fd <read-only regular-file fd>
-  --staged-archive-fd <read-only regular-file fd>
-  --bun-fd <read-only regular executable fd>
-  --self-fd <read-only regular executable fd>
-  --role-manifest-fd <read-only regular-file fd>
-  --addon-fd <read-only regular-file fd>
-  --route-tool-fd <read-only regular executable fd>       # route on Mac; ip on Linux
-  --interface-tool-fd <read-only regular executable fd>   # ifconfig on Mac; tc on Linux
-  --staging-parent-fd <read-only directory fd>
-  --submission-nonce-fd <read-only 32-byte pipe fd>
-  --host-submission-out-fd <write-only pipe fd>
-
-prepare-controller (Mac only)
+resident-mac (one launch; initial state inspect-host)
+  --platform darwin-arm64
   --candidate <40-hex>
   --campaign-id <strict component>
   --source-receipt-fd <read-only regular-file/pipe fd>
   --red-approval-bundle-fd <read-only regular-file/pipe fd>
   --source-archive-fd <read-only regular-file fd>
-  --mac-staged-archive-fd <read-only regular-file fd>
-  --mac-bun-fd <read-only regular executable fd>
+  --staged-archive-fd <read-only regular-file fd>
+  --staging-root-fd <read-only directory fd>
+  --bun-fd <read-only regular executable fd>
   --self-fd <read-only regular executable fd>
-  --mac-role-manifest-fd <read-only regular-file fd>
-  --mac-addon-fd <read-only regular-file fd>
-  --mac-route-tool-fd <read-only regular executable fd>
-  --mac-ifconfig-tool-fd <read-only regular executable fd>
-  --architect-approval-fd <read-only pipe fd>
-  --critic-approval-fd <read-only pipe fd>
-  --verifier-approval-fd <read-only pipe fd>
-  --mac-submission-fd <read-only pipe fd>
-  --linux-submission-fd <read-only pipe fd>
-  --ssh-receipt-fd <read-only pipe fd>
-  --mac-staging-parent-fd <read-only directory fd>
-  --mac-campaign-parent-fd <read-only directory fd>
+  --role-manifest-fd <read-only regular-file fd>
+  --addon-fd <read-only regular-file fd>
+  --route-tool-fd <read-only regular executable fd>
+  --interface-tool-fd <read-only regular executable fd>
+  --rustc-fd <read-only regular executable fd>
+  --cargo-fd <read-only regular executable fd>
+  --openssl-fd <read-only regular executable fd>
+  --exec-parent-fd <read-only APFS directory fd>
+  --submission-nonce-fd <read-only 32-byte pipe fd>
+  --phase-control-fd <AF_UNIX SOCK_SEQPACKET fd>
+  --host-submission-out-fd <write-only pipe fd>
   --authority-out-fd <write-only pipe fd>
-  --authority-digest-out-fd <write-only pipe fd>
+  --authority-digest-out-fd <write-only 32-byte pipe fd>
 
-serve-host (Linux only, one SSH session per campaign)
-  --authority-fd <read-only pipe fd>
-  --authority-digest-fd <read-only 32-byte pipe fd>
+resident-linux (one pinned SSH session; initial state inspect-host)
+  --platform linux-x86_64
   --source-receipt-fd <read-only regular-file/pipe fd>
+  --red-approval-bundle-fd <read-only regular-file/pipe fd>
   --source-archive-fd <read-only regular-file fd>
-  --linux-staged-archive-fd <read-only regular-file fd>
-  --linux-bun-fd <read-only regular executable fd>
+  --staged-archive-fd <read-only regular-file fd>
+  --staging-root-fd <read-only directory fd>
+  --bun-fd <read-only regular executable fd>
   --self-fd <read-only regular executable fd>
-  --linux-role-manifest-fd <read-only regular-file fd>
-  --linux-addon-fd <read-only regular-file fd>
-  --linux-ip-tool-fd <read-only regular executable fd>
-  --linux-tc-tool-fd <read-only regular executable fd>
-  --linux-staging-parent-fd <read-only directory fd>
+  --role-manifest-fd <read-only regular-file fd>
+  --addon-fd <read-only regular-file fd>
+  --ip-tool-fd <read-only regular executable fd>
+  --tc-tool-fd <read-only regular executable fd>
+  --rustc-fd <read-only regular executable fd>
+  --cargo-fd <read-only regular executable fd>
+  --openssl-fd <read-only regular executable fd>
+  --cpu-info-fd <read-only bounded /proc/cpuinfo observation fd>
+  --governor-fd <read-only bounded sysfs governor observation fd>
+  --ephemeral-range-fd <read-only bounded proc-sys observation fd>
+  --submission-nonce-fd <read-only 32-byte pipe fd>
   --ssh-challenge-fd <read-only 32-byte pipe fd>
   --control-in-fd <read-only pipe fd>
   --control-out-fd <write-only pipe fd>
+  --host-submission-out-fd <write-only pipe fd>
 ```
 
-These names describe protocol phases, not path-based relaunches. Each
-`inspect-host` supervisor remains resident after emitting its submission and
-retains the exact staging, launch-file, tool, and self descriptors. The Mac
-instance transitions in-process to `prepare-controller` when the three
-approval pipes arrive; the Linux instance remains in the same pinned-host-key
-SSH session and transitions in-process to `serve-host` when authority arrives.
-No process exits and later reopens an approved staging directory. A lost
-resident process, descriptor, SSH session, or nonce invalidates both host
-submissions and requires fresh staging approvals.
+The exact staging root is supplied and adopted by descriptor; a
+staging-parent descriptor, descendant name, lookup, extraction path, or
+directory enumeration cannot substitute for it. The staged archive inventory
+must match only archive-declared components beneath that root, and the fixed
+reserved leaves `campaign-lock.json` and `staged-capability.json` must be absent
+when the host submission is emitted.
+
+After both submissions exist, the operator sends one canonical
+`prepare-controller/v1` message on the Mac `SOCK_SEQPACKET` control socket and
+transfers with one `SCM_RIGHTS` ancillary message exactly seven descriptors:
+the architect, critic, and verifier approvals; the independently retained
+Linux submission; the SSH receipt; the Mac campaign-parent directory; and the
+known-hosts record used by the pinned SSH session. The Mac supervisor already
+retains its own exact submission bytes. Message truncation, multiple ancillary
+messages, a duplicate/missing/extra descriptor, wrong access mode, or an
+identity that differs from `ExpectedCampaignInputsV1` invalidates staging.
+Ordinary pipes are never claimed to transfer descriptors.
+
+Linux receives no late local descriptor. Its transition to `serve-host` uses
+only bounded canonical authority, authority-digest, lock, capability, and
+phase-command frames on the already established SSH control stream. Both
+resident processes retain all staged files, tools, launch inputs, root
+handles, instance nonces, and control endpoints through campaign, verification,
+and report publication. A lost process, descriptor, phase-control socket, SSH
+session, challenge, or nonce invalidates both submissions and all later
+outputs; no state may re-exec, reopen, or reacquire an approved root by
+pathname.
+
+The resident-supervisor actual argv is the platform list above in that exact
+option order with each logical descriptor replaced by its decimal FD; the
+environment array is exactly `["LC_ALL=C"]`. `ProcessLaunchReceiptV1` records
+the expanded argv, environment, complete initial descriptor map, executable
+identity/digest, startup nonce, and startup digest. No PATH, cwd-derived value,
+loader variable, inherited ambient variable, additional descriptor, or option
+is permitted. The Mac bootstrap uses the sealed relative launch rule below;
+Linux uses `execveat(..., AT_EMPTY_PATH)`. Reviewers bind both canonical launch
+receipts independently before authority can be created.
+
+Two recovery-only Mac modes make the operator-only verify/report operations
+complete without granting pathname authority. The similarly named package
+scripts remain fixture-only as frozen below. These modes are separate
+supervisor launches and are
+admitted only from operator-preopened descriptors:
+
+```text
+verify-existing
+  --authority-fd <read-only canonical authority fd>
+  --authority-digest-fd <read-only 32-byte fd>
+  --campaign-root-fd <read-only directory fd>
+  --staging-root-fd <read-only directory fd>
+  --self-fd <read-only regular executable fd>
+  --bun-fd <read-only regular executable fd>
+  --role-manifest-fd <read-only regular-file fd>
+  --addon-fd <read-only regular-file fd>
+  --exec-parent-fd <read-only APFS directory fd>
+
+report-existing
+  <the same nine descriptors as verify-existing>
+```
+
+Each mode first validates the independent authority bytes/digest, approved
+executable digests, exact campaign/staging/exec-parent identities, fixed lock
+and capability, reservation, and resident-produced manifest. `verify-existing`
+then streams and validates the complete 3,599-descriptor set before exclusively
+creating `verifier-result.json`. `report-existing` reruns the same verifier
+logic, requires byte-identical `verifier-result.json`, streams the 490 measured
+artifacts, and exclusively creates `report.md` then `report.json`. No resume
+mode accepts candidate/campaign/path arguments, enumerates a directory, uses an
+environment locator, contacts Linux, or executes scenario traffic. If the
+operator-owned authority copy or any required descriptor is unavailable,
+`verify-existing`/`report-existing` return
+`OUTPUT_TRUST_BOUNDARY_UNAVAILABLE` before artifact access. The ordinary
+resident campaign performs both phases in-process; recovery mode is not a way
+to repair or promote an incomplete campaign.
 
 `fcntl(F_GETFL)` must prove input/output access modes; `fstat` must prove
 anonymous pipes or regular files as declared. Directory descriptors must be
@@ -517,27 +781,45 @@ supplies that descriptor as `--self-fd`; Linux Bun roles use the same
 descriptor-execution rule. A pathname `execve`, shell, or hash-then-path launch
 is forbidden.
 
-macOS exposes no accepted executable-descriptor primitive for this plan. Its
-reviewed equivalent is therefore narrower: the trusted operator/supervisor
-creates a private APFS execution directory, installs one hard-link-count-one
-regular executable by exclusive create, syncs it and the directory, changes
-both to non-writable mode `0500`, pins and records their descriptor/volume
-identities, and launches the fixed relative component only with
-`posix_spawn_file_actions_addfchdir_np` (or its non-`_np` successor). It
-rechecks the open executable and parent identities immediately before the one
-`posix_spawn` call and requires a startup nonce/digest handshake before the
-child may load an addon or open a socket. The directory contains one entry,
-cannot be adopted/reused, and is never writable while launch is possible.
-Absence of this API or any identity/mode/link-count drift is
-`OUTPUT_EXEC_HANDLE_UNAVAILABLE`/`OUTPUT_EXEC_REPLACED`; ordinary
-`posix_spawn(path)`, PATH search, and a writable staging-relative launch are
-forbidden. This protects the stated buggy-child/race threat model; a malicious
-same-UID process remains explicitly outside it.
+macOS exposes no accepted executable-descriptor primitive for this plan. The
+trusted operator bootstraps the resident Mac supervisor with the same sealed
+copy ceremony that the resident supervisor later uses for Bun and every
+observation tool. For each executable launch, the responsible trusted process:
+
+1. exclusively creates one fresh private directory below the approved pinned
+   `mac-exec-parent` APFS descriptor;
+2. streams the exact approved executable descriptor bytes into one fixed leaf
+   by exclusive create while recomputing the independently expected digest;
+3. requires owner UID match and link count one, syncs leaf and parent, changes
+   both leaf and directory to `0500`, and proves no other directory entry ever
+   existed through the native creation-token ledger;
+4. reopens and rehashes the leaf relative to the retained directory descriptor,
+   rechecks file/directory/volume identities immediately before launch, and
+   launches only that fixed relative leaf after
+   `posix_spawn_file_actions_addfchdir_np` (or its non-`_np` successor); and
+5. requires the child startup nonce/digest handshake before addon load, socket
+   creation, observation output, or protocol output.
+
+Each sealed execution directory is single-launch and single-executable; it is
+never adopted from staging, writable while launch is possible, or reused. Bun,
+`route`, and `ifconfig` each receive distinct sealed directories. The
+supervisor-bootstrap receipt and every later child/tool receipt bind the
+approved source descriptor, sealed identities, exact argv/environment, startup
+nonce, and digest. Absence of the API, inability to seal, extra entry, or any
+digest/identity/mode/link-count drift is
+`OUTPUT_EXEC_HANDLE_UNAVAILABLE`/`OUTPUT_EXEC_REPLACED`. Ordinary
+`posix_spawn(path)`, PATH search, shell launch, hash-then-path launch, and a
+writable staging-relative launch are forbidden. The macOS path never claims or
+uses `fexecve`. This protects the stated buggy-child/race threat model; a
+malicious same-UID process remains explicitly outside it.
 
 The supervisor checks its inherited executable identity and digest against the
 final approvals before accepting any other input. It launches Bun with the
-platform rule above and exact argv
-`["bun","--no-install","--no-env-file","/dev/fd/<role-fd>"]`.
+platform rule above and the exact actual argv obtained by substituting the
+recorded `roleFd` into
+`["bun","--no-install","--no-env-file","/dev/fd/{roleFd}"]` and the exact
+sorted environment obtained from `BunRoleLaunchContractV1`; there are no other
+arguments or environment entries.
 The role descriptor and addon descriptor are opened once relative to the
 pinned staging handle, hashed, kept open across launch, and supplied as the
 only non-close-on-exec content descriptors. The supervisor sets the sole
@@ -583,8 +865,40 @@ Authority/bootstrap descriptors exist only at the supervisor boundary:
 - a child cannot substitute roots, optional identities, expected digests, or
   bytes read from its own artifact.
 
+Staged trust metadata publication is an exact post-authority activation
+protocol, not an implicit path lookup:
+
+1. The Mac resident fixes canonical authority bytes and its digest once; those
+   bytes never change in response to a later receipt.
+2. It derives canonical `campaign-lock.json` from that authority and canonical
+   `staged-capability.json` from authority plus lock, then exclusively creates
+   both fixed leaves through its retained Mac staging-root handle in that
+   order, syncing each leaf and the root.
+3. It sends the exact lock and capability frames to the resident Linux
+   supervisor. Linux validates both before writing, exclusively creates the
+   same two fixed leaves through its retained Linux staging-root handle in the
+   same order, syncs each leaf and the root, and returns canonical
+   `staged-metadata-receipt/v1` bytes.
+4. Mac rereads/hashes its two leaves through its retained handle, constructs
+   its own receipt, and requires both receipts to bind the same authority,
+   lock, capability, host submission, staging identity, file identities,
+   sizes, and supervisor instance nonce.
+5. Only then may either supervisor enter `run-campaign`. A partial create,
+   existing leaf, digest mismatch, lost SSH session, or missing sync is a typed
+   activation failure; no scenario socket opens. The receipts are downstream
+   observations, never inputs to authority, lock, or capability, so the digest
+   graph remains acyclic. The ordered receipt pair is bound into the observed
+   attestation and is mandatory for standalone verification.
+
+No trusted process later locates a staging root. Every fixed metadata read is
+relative to the already adopted root descriptor. The staged archive inventory
+and receipt explicitly exclude the two reserved metadata leaves; their absence
+at host inspection and exclusive post-authority creation are both verified.
+
 The only official campaign output root is the pinned Mac campaign directory.
-The Linux supervisor adopts a read-only staging descriptor and emits bounded,
+The Linux supervisor retains its read-only-open directory descriptor (usable
+only as the `*at` anchor for supervisor-controlled reads and exclusive creates)
+and emits bounded,
 length-prefixed observed records/sidecars over the SSH control stream; the Mac
 controller validates their declared lengths/digests and creates the official
 copies through its campaign handle. Linux scenario roles never write an
@@ -593,8 +907,9 @@ cable; SSH carries control/evidence bytes, not workload traffic.
 
 Each child may report runtime/addon diagnostics, but those values are never
 launch authority. Launch identity comes only from the supervisor-held Bun,
-role, and addon descriptors and the supervisor-owned `fexecve`/descriptor-load
-receipt. A child-supplied path, cwd, digest, environment override, or identity
+role, and addon descriptors and the supervisor-owned platform launch plus
+descriptor-load receipt. A child-supplied path, cwd, digest, environment
+override, or identity
 cannot repair a mismatch and is non-promotable.
 
 If the platform/runtime cannot inherit and validate these descriptors, the
@@ -674,9 +989,12 @@ both with `armKind:"primary"`. Each `overlay:yes` row also has exactly
 discriminant.
 
 Global schedule order is table order. Within a cell, warmup precedes measured.
-For a phase with first transport `S`, other transport `O`, and `r`
-repetitions, every complete repetition pair `k,k+1` expands as
-`S@k,O@k,O@(k+1),S@(k+1)`; the final odd repetition expands as `S@r,O@r`.
+`repetitionIndex` is zero-based independently within each `(cell, phase,
+transport)` arm: a phase with count `r` has exactly the indexes `0...r-1` for
+each primary transport. For a phase with first transport `S`, other transport
+`O`, and `r` repetitions, every complete pair starting at the even index
+`k = 2*j` expands as `S@k,O@k,O@(k+1),S@(k+1)`. When `r` is odd, the sole tail
+uses index `r-1` and expands as `S@(r-1),O@(r-1)`.
 Immediately after each WS primary in an overlay cell, append the matching WS
 overlay with the same phase and repetition. Nothing may appear between that WS
 primary and overlay. `executionIndex` is then assigned monotonically `0...587`.
@@ -783,6 +1101,7 @@ interface HostSubmissionV1 {
   hostId: string;
   platform: "darwin-arm64" | "linux-x86_64";
   stagingIdentity: PosixDirectoryIdentity;
+  execParentIdentity: MacosDirectoryIdentityV1 | null;
   sourceArchiveReceiptSha256: Sha256;
   redApprovalBundleSha256: Sha256;
   sourceArchiveSha256: Sha256;
@@ -790,6 +1109,8 @@ interface HostSubmissionV1 {
   stagedArchiveReceiptSha256: Sha256;
   launchProvenance: HostLaunchProvenanceV1;
   launchProvenanceSha256: Sha256;
+  runtimeFacts: HostRuntimeFactsV1;
+  runtimeFactsSha256: Sha256;
   stagedArchiveSha256: Sha256;
   bunSha256: Sha256;
   supervisorSha256: Sha256;
@@ -798,6 +1119,7 @@ interface HostSubmissionV1 {
   routeToolSha256: Sha256;
   interfaceToolSha256: Sha256;
   submissionNonceSha256: Sha256;
+  reservedStagingMetadataComponentsAbsent: true;
   observedAt: string;
 }
 
@@ -851,6 +1173,25 @@ interface StagedCapabilityV1 {
   fixtureOnly: false;
 }
 
+interface StagedMetadataReceiptV1 {
+  schema: "staged-metadata-receipt/v1";
+  hostId: string;
+  platform: "darwin-arm64" | "linux-x86_64";
+  authoritySha256: Sha256;
+  lockSha256: Sha256;
+  lockSize: number;
+  lockIdentity: OfficialFileIdentityV1;
+  capabilitySha256: Sha256;
+  capabilitySize: number;
+  capabilityIdentity: OfficialFileIdentityV1;
+  hostSubmissionSha256: Sha256;
+  stagingIdentity: PosixDirectoryIdentity;
+  supervisorSha256: Sha256;
+  supervisorInstanceNonceSha256: Sha256;
+  leafAndParentSyncComplete: true;
+  activatedAt: string;
+}
+
 interface EvidenceDescriptorV1 {
   schema: "evidence-descriptor/v1";
   kind:
@@ -898,6 +1239,7 @@ interface ObservedAttestationV1 {
     linuxAddonSha256: Sha256;
   };
   sshHostReceiptSha256: Sha256;
+  stagedMetadataReceiptSetSha256: Sha256;
   supervisorObservationSetSha256: Sha256;
   macRouteFactsSha256: Sha256;
   linuxRouteFactsSha256: Sha256;
@@ -905,6 +1247,9 @@ interface ObservedAttestationV1 {
   qdiscFactsSha256: Sha256;
   tlsFactsSha256: Sha256;
   roleFactsSha256: Sha256;
+  bunRoleLaunchReceiptSetSha256: Sha256;
+  macRuntimeFactsSha256: Sha256;
+  linuxRuntimeFactsSha256: Sha256;
   wtFactsSha256: Sha256;
   telemetryFactsSha256: Sha256;
   cleanupFactsSha256: Sha256;
@@ -967,7 +1312,7 @@ type SupervisorRunNetworkReceiptV1 =
   | (SupervisorRunReceiptBaseV1 & {
       schema: "supervisor-run-network-receipt/v1";
       status: "OBSERVED";
-      serverPort: number;
+      serverPort: 4433;
       protocol: "tcp" | "udp";
       peerObservation: "inet-diag" | "af-packet";
       serverPgid: number;
@@ -1052,6 +1397,8 @@ type SupervisorCleanupReceiptV1 =
       status: "CLEAN";
       allOwnedChildrenReaped: true;
       noOwnedSocketsRemain: true;
+      tcp4433ListenerAbsent: true;
+      udp4433ListenerAbsent: true;
       qdiscRestored: true;
       completedAt: string;
     })
@@ -1060,6 +1407,8 @@ type SupervisorCleanupReceiptV1 =
       failureCodes: readonly string[];
       allOwnedChildrenReaped: boolean;
       noOwnedSocketsRemain: boolean;
+      tcp4433ListenerAbsent: boolean;
+      udp4433ListenerAbsent: boolean;
       qdiscRestored: boolean;
       failedAt: string;
     });
@@ -1131,6 +1480,8 @@ Exact bootstrap and publication order:
    `campaign-lock.json`, hash
    and validate it against authority; then read exactly
    `staged-capability.json`, hash and validate it against authority+lock.
+   Require the ordered Mac/Linux staged-metadata receipts from the activation
+   protocol to match those exact bytes and retained root/file identities.
 3. Execute roles. Each untrusted framed record is parsed, bound to all three
    parent hashes, and written exclusively by the supervisor. Write the observed
    attestation after every cleanup/restoration fact is complete.
@@ -1142,8 +1493,9 @@ Exact bootstrap and publication order:
    `verifier-result.json` exclusively; that file is not a manifest descriptor.
 6. The report process first reads and validates fixed
    `verifier-result.json`, then exactly the 490 already validated measured
-   artifacts in schedule order: 430 primary followed in-place by 60 visible
-   overlays; warmups are excluded. Only the 430 primary artifacts may feed 35
+   artifacts in exact measured-schedule order: 430 primary plus 60 visible
+   overlays interleaved immediately after their paired WS entries; warmups are
+   excluded. Only the 430 primary artifacts may feed 35
    WS/WT delta rows. It
    writes `report.md`, followed by `report.json` containing the Markdown digest;
    neither report file is a manifest descriptor.
@@ -1160,9 +1512,11 @@ application metrics and a non-authoritative cross-check; it cannot provide a
 route, interface, MTU, qdisc, packet, server-peer, process, cleanup, tool, or
 SSH-host receipt, nor raw bytes later relabeled as one.
 
-The Mac supervisor executes, by `fexecve` of the approved tool descriptors and
-with an empty environment except `LC_ALL=C`, exactly `/sbin/route -n get
-10.99.0.2` and `/sbin/ifconfig en8`. It also performs its own
+The Mac supervisor copies and executes the approved `route` and `ifconfig`
+descriptor bytes only through the sealed relative `posix_spawn` ceremony above,
+with exact argv respectively `["route","-n","get","10.99.0.2"]` and
+`["ifconfig","en8"]` and an environment containing exactly `LC_ALL=C`. The
+macOS path never uses `fexecve`. It also performs its own
 `if_nametoindex("en8")`, `SIOCGIFMTU`, and UDP `connect(10.99.0.2)` plus
 `getsockname` route probe. All sources must independently resolve to
 `10.99.0.1`, interface `en8`, the same positive MTU, and the approved Mac host
@@ -1219,10 +1573,10 @@ overlay entries alike.
 
 ## Supervisor filesystem and IPC contract
 
-`comparison-supervisor` keeps opaque Rust `OfficialDirectory` and
-`CreatedFileToken` values in its own process. No NAPI export, TypeScript object,
-scenario child, verifier child, or report child can acquire them. Its internal
-API is:
+`comparison-supervisor` keeps opaque Rust `OfficialDirectory`,
+`OfficialReadStream`, `OfficialWriteStream`, and `CreatedFileToken` values in
+its own process. No NAPI export, TypeScript object, scenario child, verifier
+child, or report child can acquire them. Its internal API is:
 
 ```rust
 fn adopt_staging(fd: RawFd, expected: PosixDirectoryIdentity)
@@ -1232,18 +1586,23 @@ fn create_campaign_exclusive(
   candidate: &str,
   campaign_id: &str,
 ) -> Result<(OfficialDirectory, PosixDirectoryIdentity, CampaignReservation)>;
-fn read_file(dir: &OfficialDirectory, components: &[Component], max: u64)
-  -> Result<Vec<u8>>;
+fn open_read_stream(dir: &OfficialDirectory, components: &[Component], max: u64)
+  -> Result<OfficialReadStream>;
+fn read_chunk(stream: &mut OfficialReadStream, out: &mut [u8])
+  -> Result<usize>;
+fn finish_read(stream: OfficialReadStream) -> Result<FileDigest>;
 fn hash_file(dir: &OfficialDirectory, components: &[Component], max: u64)
   -> Result<FileDigest>;
 fn ensure_directory(dir: &OfficialDirectory, components: &[Component])
   -> Result<()>;
-fn create_file_exclusive(
+fn create_file_stream_exclusive(
   dir: &OfficialDirectory,
   components: &[Component],
-  bytes: &[u8],
   max: u64,
-) -> Result<CreatedFileToken>;
+) -> Result<(OfficialWriteStream, CreatedFileToken)>;
+fn write_chunk(stream: &mut OfficialWriteStream, bytes: &[u8]) -> Result<()>;
+fn finish_file(stream: OfficialWriteStream, token: CreatedFileToken)
+  -> Result<CreatedFileToken>;
 fn abort_created_file(dir: &OfficialDirectory, token: CreatedFileToken)
   -> Result<()>;
 fn sync(dir: &OfficialDirectory) -> Result<()>;
@@ -1262,11 +1621,15 @@ Contract rules:
 - There is no root pathname or optional identity input after bootstrap. The
   supervisor duplicates and owns inherited descriptors, rejects non-directory
   roots, and matches required OS identities before reading a child.
-- `read_file` fails before allocating beyond its required positive bound and
-  detects growth. `hash_file` streams raw files without exposing bytes to JS.
-- `create_file_exclusive` is create-new only, mode `0600`, never replaces a
-  destination, and returns an opaque token bound to supervisor instance,
-  campaign reservation, parent identity, leaf identity, and operation.
+- `open_read_stream` rejects a non-positive/excessive bound before allocation,
+  snapshots the admitted size, detects growth/truncation, and never exposes a
+  whole-file buffer. `hash_file` uses the same stream without exposing bytes to
+  JS.
+- `create_file_stream_exclusive` is create-new only, mode `0600`, never
+  replaces a destination, and returns a writer plus opaque token bound to
+  supervisor instance, campaign reservation, parent identity, leaf identity,
+  byte bound, and operation. `finish_file` succeeds only after exact EOF,
+  cumulative-size validation, digest completion, leaf sync, and parent sync.
 - `abort_created_file` accepts only that token and may remove only the still
   matching uncommitted leaf. There is no component-based deletion surface.
 - `sync` durably synchronizes created files and pinned parents before success.
@@ -1276,6 +1639,29 @@ Contract rules:
   buffering.
 - There is no `readdir`, glob, rename, replace, arbitrary-open, or pathname
   escape. The supervisor reads the manifest, then exactly its components.
+
+The live payload-memory ceiling is **2,097,152 bytes per process per
+direction**, including codec buffers and in-flight filesystem chunks. A
+supervisor or official child uses at most one reusable 1 MiB chunk plus bounded
+parser/digest state in a direction; it must not retain the preceding chunk when
+requesting the next. Authority, approval, submission, receipt, reservation,
+lock, capability, descriptor, command, error, and report-envelope records must
+each fit in one bounded metadata frame. Every admitted class that may exceed 2
+MiB—including an artifact, raw file, snapshot, attestation, manifest, verifier
+result, or report Markdown—remains streaming end-to-end. It may not become one
+Rust `Vec<u8>`, JS `Uint8Array`, JS string, or whole parsed object.
+
+Canonical JSON validation for large records is incremental and native. The
+manifest validator emits one already validated descriptor declaration at a
+time; verifier/report children receive a bounded stream of declarations and
+payload chunks, never the full manifest. Large child output is streamed
+directly into an uncommitted native exclusive writer while hashing and parsing;
+only `finish_file` can publish it. Raw sidecar bytes are hashed/copied by the
+supervisors and never enter a JS heap. Short read/write, `EINTR`, zero progress,
+declared-size exhaustion, overrun, `ENOSPC`, parser failure, child failure, or
+digest mismatch aborts the matching native token and drains/kills the child
+before another frame. No temporary final-name file is ever treated as
+committed.
 
 Children communicate only over inherited stdin/stdout pipes using this binary
 frame, with stderr reserved for bounded logs:
@@ -1313,7 +1699,7 @@ There is no caller-selected bound and no counter reset within an operation.
 | --- | ---: |
 | canonical frame header | 65,536 |
 | one streamed payload chunk | 1,048,576 |
-| approval, RED approval record, host submission, SSH receipt, descriptor, run command, error | 65,536 each |
+| approval, RED approval record, host submission, host runtime facts, SSH receipt, staged metadata receipt, descriptor, run command, launch receipt, error | 65,536 each |
 | source receipt, RED approval bundle, authority | 262,144 each |
 | reservation | 65,536 |
 | staged capability | 1,048,576 |
@@ -1345,9 +1731,10 @@ The exact aggregate limits and successful counts are:
 | verifier input/output | exactly authority + lock + capability + manifest + 3,599 descriptor payloads = 3,603 inputs; exactly 1 output | 68,719,476,736 input; 16,777,216 output |
 | report input/output | exactly authority + lock + capability + manifest + verifier result + 490 measured artifacts = 495 inputs; exactly 2 outputs | 8,589,934,592 input; 34,603,008 output |
 
-Bootstrap pipes separately permit exactly one source receipt, one RED approval
-bundle, three final approvals, two host submissions, one SSH receipt, one
-authority, and one authority digest. Header/digest reads have a five-second
+Bootstrap/control channels separately permit exactly one source receipt, one
+RED approval bundle, three final approvals, two host submissions, two host
+runtime-facts records, one SSH receipt, one authority, one authority digest,
+one lock, one capability, and exactly two staged-metadata receipts. Header/digest reads have a five-second
 idle deadline; payload streaming has a 30-second inter-chunk idle deadline;
 each role also has its registry-declared overall deadline. Count, byte, or
 deadline exhaustion kills/drains the owned PGID and publishes no frame.
@@ -1440,7 +1827,7 @@ A separate sealed `SupervisorObservationSyscalls` seam covers
 `if_nametoindex`, `SIOCGIFMTU`, UDP connect/getsockname, AF_PACKET bind/filter/
 timestamp/drop counters, NETLINK_SOCK_DIAG, process-group/socket ownership,
 qdisc cleanup guards, and PGID kill/wait. A sealed `SupervisorCommandRunner`
-accepts only the four pre-opened approved tool descriptors and the exact argv/
+accepts only the host-mode-declared pre-opened approved tool descriptors and the exact argv/
 environment enumerated above; it records bounded stdout/stderr, exit, timing,
 and tool identity. Scripted tests reject an unexpected tool, argv, environment,
 PATH/shell lookup, child-supplied observation, missing packet receipt, or
@@ -1592,11 +1979,32 @@ Entrypoint owner, after the boundary and validators are green:
 - modify `packages/webtransport/src/index.ts` and its focused loader tests so a
   supervisor-set comparison addon FD causes exactly one `/dev/fd/<n>` load
   attempt and disables all fallback candidate searches
-- modify `package.json` comparison scripts to enter through the supervisor
+- modify `package.json` so `compare:run`, `compare:verify`, and
+  `compare:report` remain explicitly fixture-only and reject official
+  capabilities; remove any `compare:campaign` spelling
 - create `tools/compare/r1-entrypoint-red.test.ts`
 - create `tools/compare/r1-physical-path-red.test.ts`
 - create `tools/compare/check-official-io.ts`
 - create `tools/compare/official-io-allowlist.json`
+
+The four and only four official Bun child roots are concrete file entrypoints:
+
+| Logical child | Exact source root | Required conversion |
+| --- | --- | --- |
+| `campaign-child` | `tools/compare/run-campaign.ts` | framed campaign transform only |
+| `artifact-child` | `tools/compare/artifact-builder.ts` | convert the current library module into the framed artifact CLI root while retaining pure helpers behind that root |
+| `verifier-child` | `tools/compare/verify-artifact.ts` | framed verifier transform only |
+| `report-child` | `tools/compare/render-report.ts` | framed report transform only |
+
+The role-entrypoint manifest maps exactly those four logical names to their
+four independently Bun-bundled, import-closed ESM files and byte digests. The
+supervisor never launches the TypeScript source path itself. The allowlist
+checker roots its transitive analysis at exactly those four source files, and
+runtime spies launch each corresponding bundle through its role descriptor.
+`artifact-builder.ts` is therefore no longer merely an in-process library on
+the official path; direct imports may reach only separately exported pure
+helpers and can never invoke its CLI protocol. No fifth official child,
+implicit `import.meta.main`, generated wrapper, or package-script root exists.
 
 Documentation/CI owner, after behavior is verified:
 
@@ -1704,6 +2112,20 @@ self-referential diff hash is stored inside the allowlist.
 
 ## Execution sequence
 
+The architect and critic are boundary reviewers only. This amendment receives
+one architect verdict and one critic verdict before any R1 development begins;
+revisions required to turn a rejected draft into that approved artifact remain
+part of the same pre-development gate. After approval, Tasks A through E and
+the parent R2 through R8 execution proceed without intermediate architect or
+critic calls. Ordinary TDD runs, implementer self-checks, focused spec tests,
+and verification are execution evidence rather than architecture gates. The
+architect is called once more and the critic once more only after Tasks A-E,
+the parent implementation work, and both-host source-bound staging are complete
+but before any official campaign traffic. Their post-development verdicts
+cover the complete implementation and exact staged inputs and are the campaign
+staging approvals consumed by authority. No architect or critic is called
+again during diagnostics, the 82-arm campaign, verification, or reporting.
+
 ### Task A — Complete and approve the R1 RED contract
 
 1. Move stable literal fixtures into `r1-fixtures.ts` and split the existing
@@ -1774,9 +2196,14 @@ self-referential diff hash is stored inside the allowlist.
 
 ### Task B — Implement the native boundary
 
-1. Add the named Rust tests first for component validation, descriptor/handle
-   lifetime, leaf type, byte bound, exclusive publication, sync, cleanup, and
-   parent-swap behavior.
+1. Treat the Task-A-approved `crates/native/tests/secure_fs.rs` and five RED
+   TypeScript suites as immutable inputs. Implement production code against
+   those exact tests; Task B does not add, delete, rename, or edit any file in
+   the RED approval bundle. Additional non-contract regression coverage, if
+   genuinely needed, goes in separately named GREEN test files outside that
+   bundle. Any change to an approved RED file or its failure inventory stops
+   implementation immediately and requires a new focused RED run plus fresh
+   spec-reviewer/verifier RED approval records before production edits resume.
 2. Implement the POSIX handle-relative core, sealed `SecureFsSyscalls` seam,
    exclusive campaign reservation, bounded supervisor frame codec, and
    `comparison-supervisor` binary. Do not add a NAPI filesystem surface.
@@ -1805,10 +2232,32 @@ self-referential diff hash is stored inside the allowlist.
 
 ### Task D — Integrate official entrypoints
 
-1. Make package scripts invoke `comparison-supervisor`, which in turn launches
-   campaign, verifier, report, and artifact-builder children with validated
-   input frames. Children receive no filesystem descriptors/paths. Remove
-   unbound defaults and trust-marker environment paths.
+1. Preserve `compare:run` as the single canonical package command name and
+   remove every `compare:campaign` spelling; update package metadata, docs, and
+   tests together. `compare:run`, `compare:verify`, and `compare:report` are
+   explicitly non-authoritative developer/fixture conveniences: they require
+   `fixtureOnly:true`, cannot accept an official capability, and can never
+   create or promote official output. The authoritative path is operator-only:
+   the trusted operator launches the already approved
+   `comparison-supervisor resident-mac`, `verify-existing`, or
+   `report-existing` binary mode directly with the exact pre-opened descriptor
+   argv frozen above. A package script, Bun process, shell, PATH lookup,
+   candidate child, or path argument cannot bootstrap official descriptor
+   authority. The supervisor launches the four exact Bun child roots below
+   with validated input frames; children receive no filesystem
+   descriptors/paths. Remove unbound defaults and trust-marker environment
+   paths.
+
+   The final package script values are exact:
+   `"compare:run":"bun tools/compare/run-campaign.ts --fixture-only"`,
+   `"compare:verify":"bun tools/compare/verify-artifact.ts --fixture-only"`,
+   and
+   `"compare:report":"bun tools/compare/render-report.ts --fixture-only"`.
+   Their parsers reject an official authority/capability, root/path locator, or
+   missing fixture marker before filesystem or network I/O. Documentation and
+   tests label them fixture-only. Official operator instructions show the
+   native binary plus descriptor argv and never present a package script as an
+   official launch command.
 2. Remove directory discovery and path-based official I/O. The validated
    manifest is the complete read set; supervisor-owned Rust handles are the
    only official write path.
@@ -1819,7 +2268,8 @@ self-referential diff hash is stored inside the allowlist.
    without contradiction. A valid MISS may retain numbers; blocked, failed,
    incompatible, warmup, and overlay records cannot enter primary deltas.
 5. Run real supervisor->child CLI integration against temporary directories
-   and inherited pipes with no sockets. Prove the main package-script path,
+   and inherited pipes with no sockets. Prove the native operator-only
+   descriptor path and separately prove each package script remains fixture-only,
    frame timeouts/replays/trailing bytes/child crash, PGID cleanup, and every
    exit mapping—not only exported parsers.
 6. Run the static and runtime no-bypass gates and the synthetic/default
