@@ -52,11 +52,9 @@ import {
 	chooseClientProvenance,
 	compareWindowDelivery,
 	deriveBoundaryWindows,
-	emitterSliceBounds,
 	HOTSPOT_PHASE_BARRIER_PARTIES,
 	HOTSPOT_PHASE_BARRIER_STEADY_SKEW_MS,
 	indexClientBundlesByLaunchRole,
-	nextEmitterWindowState,
 	deltaBoundarySnapshot,
 	readPhaseMarker,
 	requireClientReportIdentity,
@@ -64,14 +62,12 @@ import {
 	type BoundarySnapshot,
 	type ClientReportV2,
 	type EmitterPhase,
-	type EmitterWindowState,
 	validateSourceBinding,
 } from "./g6-artifact.ts";
 import {
 	ACTION_HZ,
 	actionEveryNthTick,
 	armShape,
-	EMITTER_SLICE_HZ,
 	G6_CLOSEOUT_SPEC_PATH,
 	MOVE_HZ,
 	preflightRequirements,
@@ -81,23 +77,23 @@ import {
 	SNAPSHOT_HZ,
 	SNAPSHOT_PAYLOAD_BYTES,
 	STORM_RECONNECT_DELAY_MS,
-	snapshotDatagrams,
 	stormCohorts,
 	stormWindowSec,
 	UPSTREAM_PAYLOAD_BYTES,
 } from "./g6-plan.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
-import { LatencyHistogram } from "./latency-histogram.ts";
+import {
+	REGISTERED_G6_SERVER_CORE_PLAN,
+	createG6ServerCore,
+	freshG6ServerState,
+	type Player,
+	type ServerState,
+} from "./g6-server-core.ts";
 import {
 	CLASS_ACK,
-	CLASS_ACTION,
 	CLASS_RAID,
 	CLASS_RAID_JOIN,
 	CLASS_SNAPSHOT,
-	decodeStamp,
-	encodeStamp,
-	STAMP_BYTES_V3,
-	writeReflection,
 } from "./latency-stamp.ts";
 
 const ROOT = process.cwd();
@@ -155,9 +151,7 @@ const SERVER_HOSTNAME = hostname();
 const HOTSPOT_PHASE_BARRIER_DIR =
 	process.env.G6_PHASE_BARRIER_DIR ?? "/tmp/webtransport-g6-phase-barriers";
 
-const SNAPSHOT_DATAGRAMS = snapshotDatagrams();
-const SLICE_MS = 1000 / EMITTER_SLICE_HZ;
-const SLICES_PER_TICK = Math.max(1, Math.round(EMITTER_SLICE_HZ / SNAPSHOT_HZ));
+const SERVER_CORE_PLAN = REGISTERED_G6_SERVER_CORE_PLAN;
 
 /* -------------------------------------------------------------------------- */
 /* Host taps — same readers the session-scale ladder uses, same reasons        */
@@ -393,98 +387,6 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 	});
 }
 
-/* -------------------------------------------------------------------------- */
-/* The realm server                                                            */
-/* -------------------------------------------------------------------------- */
-
-type SessionKind = "player" | "publisher" | "raid";
-
-type Player = {
-	send: (datagrams: readonly Uint8Array[]) => Promise<{
-		sent: number;
-		error?: unknown;
-	}>;
-	sendOne: (d: Uint8Array) => unknown;
-	/** Server-clock instant this session became established. */
-	acceptedAtMs: number;
-	kind: SessionKind;
-	alive: boolean;
-};
-
-type EmitterCounters = {
-	snapshotIssued: number;
-	snapshotDue: number;
-	ackIssued: number;
-	ackDue: number;
-	raidForwarded: number;
-	sendErrors: number;
-	sendEventsSkipped: number;
-	batchPartialCompletions: number;
-};
-
-type ServerState = {
-	rxByClass: Map<number, number>;
-	rxTotal: number;
-	rxUnstamped: number;
-	/** Upstream arrivals on sessions established before the sever instant. */
-	rxSurvivors: number;
-	/** Server-clock accept completions, one entry per established session. */
-	acceptSeries: number[];
-	emitter: EmitterCounters;
-	/** Publisher→first-forward lag, the ingest-reality falsifier's input. */
-	ingestToForward: LatencyHistogram;
-	ingestToForwardSteadyDrain: LatencyHistogram;
-	/** Server-observed inter-arrival gaps on the publisher session. */
-	publisherGaps: number[];
-	publisherGapsSteadyDrain: number[];
-	publisherStamped: number;
-	publisherStampedSteadyDrain: number;
-	publisherArrivals: number;
-	publisherArrivalsSteadyDrain: number;
-	/** Emitter slice lag at the scheduler handoff — never across `await send`. */
-	emitterLag: LatencyHistogram;
-	emitterLagSteady: LatencyHistogram;
-	emitterLagStorm: LatencyHistogram;
-	/** Server dwell on the ack path, the disclosure beside C3. */
-	hold: LatencyHistogram;
-	holdSteadyDrain: LatencyHistogram;
-	holdStorm: LatencyHistogram;
-};
-
-function freshState(): ServerState {
-	return {
-		rxByClass: new Map(),
-		rxTotal: 0,
-		rxUnstamped: 0,
-		rxSurvivors: 0,
-		acceptSeries: [],
-		emitter: {
-			snapshotIssued: 0,
-			snapshotDue: 0,
-			ackIssued: 0,
-			ackDue: 0,
-			raidForwarded: 0,
-			sendErrors: 0,
-			sendEventsSkipped: 0,
-			batchPartialCompletions: 0,
-		},
-		ingestToForward: new LatencyHistogram(),
-		ingestToForwardSteadyDrain: new LatencyHistogram(),
-		publisherGaps: [],
-		publisherGapsSteadyDrain: [],
-		publisherStamped: 0,
-		publisherStampedSteadyDrain: 0,
-		publisherArrivals: 0,
-		publisherArrivalsSteadyDrain: 0,
-		emitterLag: new LatencyHistogram(),
-		emitterLagSteady: new LatencyHistogram(),
-		emitterLagStorm: new LatencyHistogram(),
-		hold: new LatencyHistogram(),
-		holdSteadyDrain: new LatencyHistogram(),
-		holdStorm: new LatencyHistogram(),
-	};
-}
-
 async function main(): Promise<void> {
 	if (LADDER.length === 0) throw new Error("G6_LADDER parsed empty");
 	const preregistrationSha256 = requirePreregistrationSha256();
@@ -500,15 +402,22 @@ async function main(): Promise<void> {
 	// must not carry the fast path's same-counter assumption.
 	const clock = await createMonotonicClock(false);
 	const phaseState: { current: EmitterPhase } = { current: "idle" };
-	let state = freshState();
-	const players: Player[] = [];
-	const raidMembers: Player[] = [];
+	let state = freshG6ServerState();
 	/**
 	 * Server-clock instant the storm severed its cohort. Sessions accepted
 	 * before it are the survivors; sessions accepted after it are the cohort
 	 * coming back. Null outside the storm arm.
 	 */
 	let severAtMs: number | null = null;
+	const serverCore = createG6ServerCore({
+		plan: SERVER_CORE_PLAN,
+		clock,
+		nowMs: () => Date.now(),
+		phaseState,
+		state: () => state,
+		severAtMs: () => severAtMs,
+	});
+	const { players, raidMembers } = serverCore;
 
 	const topSessions = Math.max(...LADDER) + RAID_MEMBERS + 1;
 	const shape = armShape(Math.max(...LADDER));
@@ -521,7 +430,7 @@ async function main(): Promise<void> {
 			// The storm severs and reconnects a whole realm; a 60 s idle timeout
 			// would reap sessions mid-arm on a busy host.
 			idleTimeoutMs: 300_000,
-			maxDatagramSize: SNAPSHOT_PAYLOAD_BYTES + 64,
+			maxDatagramSize: SERVER_CORE_PLAN.snapshotPayloadBytes + 64,
 		},
 		rateLimits: {
 			// Every limiter is set above the arm on purpose: a run that trips one
@@ -534,126 +443,11 @@ async function main(): Promise<void> {
 			datagramsPerSec: Math.max(shape.upstreamAggregatePps * 8, 200_000),
 			datagramsBurst: Math.max(shape.upstreamAggregatePps * 16, 400_000),
 		},
-		onSession: (session) => {
-			const acceptedAtMs = Date.now();
-			state.acceptSeries.push(acceptedAtMs);
-			const player: Player = {
-				send: (datagrams) => session.sendDatagramBatch(datagrams),
-				sendOne: (d) => session.sendDatagram(d),
-				acceptedAtMs,
-				kind: "player",
-				alive: true,
-			};
-			players.push(player);
-			session.closed.then(
-				() => {
-					player.alive = false;
-				},
-				() => {
-					player.alive = false;
-				},
-			);
-			void (async () => {
-				let lastPublisherArrivalNs: number | null = null;
-				for await (const datagram of session.incomingDatagrams()) {
-					// First statement of the handler body: this instant is where
-					// the server's own dwell starts.
-					const entryNs = clock.now();
-					state.rxTotal += 1;
-					const stamp = decodeStamp(datagram);
-					if (stamp === null) {
-						state.rxUnstamped += 1;
-						continue;
-					}
-					state.rxByClass.set(
-						stamp.klass,
-						(state.rxByClass.get(stamp.klass) ?? 0) + 1,
-					);
-					if (severAtMs !== null && player.acceptedAtMs < severAtMs) {
-						state.rxSurvivors += 1;
-					}
-
-					if (stamp.klass === CLASS_RAID_JOIN) {
-						player.kind = "raid";
-						if (!raidMembers.includes(player)) raidMembers.push(player);
-						continue;
-					}
-
-					if (stamp.klass === CLASS_RAID) {
-						player.kind = "publisher";
-						state.publisherArrivals += 1;
-						state.publisherStamped += 1;
-						if (
-							phaseState.current === "steady" ||
-							phaseState.current === "drain"
-						) {
-							state.publisherArrivalsSteadyDrain += 1;
-							state.publisherStampedSteadyDrain += 1;
-						}
-						if (lastPublisherArrivalNs !== null) {
-							const gapNs = entryNs - lastPublisherArrivalNs;
-							state.publisherGaps.push(gapNs);
-							if (
-								phaseState.current === "steady" ||
-								phaseState.current === "drain"
-							) {
-								state.publisherGapsSteadyDrain.push(gapNs);
-							}
-						}
-						lastPublisherArrivalNs = entryNs;
-						forwardToRaid(
-							datagram,
-							entryNs,
-							state,
-							raidMembers,
-							clock,
-							phaseState,
-						);
-						continue;
-					}
-
-					if (stamp.klass === CLASS_ACTION) {
-						// Issued on receipt, not on the world tick: holding the
-						// confirm for the next snapshot would cost up to a full
-						// tick of quantization and the budget does not have it.
-						state.emitter.ackDue += 1;
-						const ack = new Uint8Array(STAMP_BYTES_V3);
-						ack.set(datagram.subarray(0, STAMP_BYTES_V3));
-						const sendNs = clock.now();
-						const ok = writeReflection(ack, {
-							echoActualNs: stamp.actualNs,
-							serverSendNs: sendNs,
-							holdNs: sendNs - entryNs,
-							klass: CLASS_ACK,
-							sequence: stamp.sequence,
-						});
-						if (!ok) {
-							state.emitter.sendEventsSkipped += 1;
-							continue;
-						}
-						state.hold.record(sendNs - entryNs);
-						if (
-							phaseState.current === "steady" ||
-							phaseState.current === "drain"
-						) {
-							state.holdSteadyDrain.record(sendNs - entryNs);
-						} else if (phaseState.current === "storm") {
-							state.holdStorm.record(sendNs - entryNs);
-						}
-						try {
-							player.sendOne(ack);
-							state.emitter.ackIssued += 1;
-						} catch {
-							state.emitter.sendErrors += 1;
-						}
-					}
-				}
-			})().catch(() => {});
-		},
+		onSession: serverCore.onSession,
 	});
 	await Bun.sleep(3000);
 	console.log(
-		`bench-g6: server up on ${PORT}; ladder=[${LADDER.join(",")}] arms=[${ARMS.join(",")}] snapshot=${SNAPSHOT_DATAGRAMS}x${SNAPSHOT_PAYLOAD_BYTES}B@${SNAPSHOT_HZ}Hz slices=${SLICES_PER_TICK}`,
+		`bench-g6: server up on ${PORT}; ladder=[${LADDER.join(",")}] arms=[${ARMS.join(",")}] snapshot=${SERVER_CORE_PLAN.snapshotDatagrams}x${SERVER_CORE_PLAN.snapshotPayloadBytes}B@${SERVER_CORE_PLAN.snapshotHz}Hz slices=${SERVER_CORE_PLAN.slicesPerTick}`,
 	);
 
 	writeFileSync(
@@ -688,9 +482,9 @@ async function main(): Promise<void> {
 			actionEvery: actionEveryNthTick(),
 			upstreamPayloadBytes: UPSTREAM_PAYLOAD_BYTES,
 			snapshotHz: SNAPSHOT_HZ,
-			snapshotDatagrams: SNAPSHOT_DATAGRAMS,
-			snapshotPayloadBytes: SNAPSHOT_PAYLOAD_BYTES,
-			emitterSliceHz: EMITTER_SLICE_HZ,
+			snapshotDatagrams: SERVER_CORE_PLAN.snapshotDatagrams,
+			snapshotPayloadBytes: SERVER_CORE_PLAN.snapshotPayloadBytes,
+			emitterSliceHz: SERVER_CORE_PLAN.emitterSliceHz,
 			raidMembers: RAID_MEMBERS,
 			raidPublisherHz: RAID_PUBLISHER_HZ,
 			steadySeconds: STEADY_SECONDS,
@@ -736,8 +530,9 @@ async function main(): Promise<void> {
 					server,
 					state: () => state,
 					resetState: () => {
-						state = freshState();
+						state = freshG6ServerState();
 					},
+					startEmitter: serverCore.startEmitter,
 					players,
 					raidMembers,
 					clock,
@@ -764,8 +559,9 @@ async function main(): Promise<void> {
 					server,
 					state: () => state,
 					resetState: () => {
-						state = freshState();
+						state = freshG6ServerState();
 					},
+					startEmitter: serverCore.startEmitter,
 					players,
 					raidMembers,
 					clock,
@@ -793,8 +589,9 @@ async function main(): Promise<void> {
 						server,
 						state: () => state,
 						resetState: () => {
-							state = freshState();
+							state = freshG6ServerState();
 						},
+						startEmitter: serverCore.startEmitter,
 						players,
 						raidMembers,
 						clock,
@@ -822,136 +619,6 @@ async function main(): Promise<void> {
 	console.log(`bench-g6: wrote ${OUT_JSON}`);
 }
 
-/** Forward one publisher datagram to every raid member (§3). */
-function forwardToRaid(
-	datagram: Uint8Array,
-	entryNs: number,
-	state: ServerState,
-	raidMembers: Player[],
-	clock: { now: () => number },
-	phaseState: { current: EmitterPhase },
-): void {
-	let first = true;
-	for (const member of raidMembers) {
-		if (!member.alive) continue;
-		// Copied per member: the payload leaves this loop and the caller's
-		// buffer is not ours to keep.
-		const out = new Uint8Array(datagram.byteLength);
-		out.set(datagram);
-		try {
-			member.sendOne(out);
-			state.emitter.raidForwarded += 1;
-			if (first) {
-				// Server-internal dwell: arrival → first forward issued, both on
-				// the *server's* clock. Reported as a disclosure and expected to
-				// be µs-scale, because it is entirely inside one process.
-				//
-				// It is NOT the ingest-reality falsifier's input. Ticket 14's
-				// rule reads "publisher-send → first forward", which on-box was
-				// one clock and off-box is two hosts — un-differenceable. The
-				// off-box replacement is the subscriber's own one-way, which
-				// spans the whole path on one clock (Amendment 2).
-				const dwellNs = clock.now() - entryNs;
-				state.ingestToForward.record(dwellNs);
-				if (phaseState.current === "steady" || phaseState.current === "drain") {
-					state.ingestToForwardSteadyDrain.record(dwellNs);
-				}
-				first = false;
-			}
-		} catch {
-			state.emitter.sendErrors += 1;
-		}
-	}
-}
-
-/**
- * The snapshot emitter: one `sendDatagramBatch` per session per world tick,
- * spread across a 20 ms slice grid.
- *
- * Its lag is measured at the **scheduler handoff** — the interval between the
- * slice's scheduled deadline and the instant the batch is handed to the send
- * path — and never across `await send(...)`. Measuring across the await was
- * G3's defect 1: the metric absorbed the product's own send latency and then
- * the product was judged by it.
- */
-function startEmitter(
-	players: Player[],
-	state: ServerState,
-	clock: { now: () => number },
-	phase: () => EmitterPhase,
-): () => void {
-	const body = new Uint8Array(SNAPSHOT_PAYLOAD_BYTES);
-	body.fill(0x77);
-	let sequence = 0;
-	let stopped = false;
-	let window: EmitterWindowState | null = null;
-	const sliceNs = SLICE_MS * 1e6;
-	const timer = setInterval(() => {
-		if (stopped) return;
-		const planned = nextEmitterWindowState(
-			window,
-			phase(),
-			clock.now(),
-			sliceNs,
-		);
-		window = planned.window;
-		if (!planned.emit) return;
-		const { deadlineNs, sliceIndex } = planned.emit;
-		const handoffNs = clock.now();
-		const lagNs = Math.max(0, handoffNs - deadlineNs);
-		state.emitterLag.record(lagNs);
-		if (planned.emit.kind === "steady") {
-			state.emitterLagSteady.record(lagNs);
-		} else if (planned.emit.kind === "storm") {
-			state.emitterLagStorm.record(lagNs);
-		}
-		const target = players.filter((p) => p.alive && p.kind === "player");
-		const { from, to } = emitterSliceBounds(
-			target.length,
-			SLICES_PER_TICK,
-			sliceIndex,
-		);
-		const chunk = target.slice(from, to);
-		for (const player of chunk) {
-			sequence += 1;
-			const batch: Uint8Array[] = [];
-			for (let k = 0; k < SNAPSHOT_DATAGRAMS; k += 1) {
-				const d = new Uint8Array(SNAPSHOT_PAYLOAD_BYTES);
-				d.set(body);
-				encodeStamp(d, {
-					version: 3,
-					intendedNs: deadlineNs,
-					actualNs: handoffNs,
-					sequence: sequence * SNAPSHOT_DATAGRAMS + k,
-					klass: CLASS_SNAPSHOT,
-				});
-				batch.push(d);
-			}
-			state.emitter.snapshotDue += SNAPSHOT_DATAGRAMS;
-			// Fire-and-account: the batch envelope is `{sent, code}` and a
-			// partial completion is a real outcome, counted rather than
-			// forgiven. Awaiting here would serialize the slice and turn the
-			// emitter into the thing being measured.
-			player
-				.send(batch)
-				.then((res) => {
-					state.emitter.snapshotIssued += res.sent;
-					if (res.sent < batch.length) {
-						state.emitter.batchPartialCompletions += 1;
-					}
-				})
-				.catch(() => {
-					state.emitter.sendErrors += 1;
-				});
-		}
-	}, SLICE_MS);
-	timer.unref?.();
-	return () => {
-		stopped = true;
-		clearInterval(timer);
-	};
-}
-
 type ArmOptions = {
 	name: string;
 	sessions: number;
@@ -960,6 +627,7 @@ type ArmOptions = {
 	server: ReturnType<typeof createServer>;
 	state: () => ServerState;
 	resetState: () => void;
+	startEmitter: ReturnType<typeof createG6ServerCore>["startEmitter"];
 	players: Player[];
 	raidMembers: Player[];
 	clock: { now: () => number; source: string };
@@ -993,7 +661,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	);
 
 	let phase: EmitterPhase = "connect";
-	const stopEmitter = startEmitter(o.players, o.state(), o.clock, () => phase);
+	const stopEmitter = o.startEmitter(() => phase);
 	// O-2's arithmetic, computed from the same constants the argv carries,
 	// with the macgen 1.5x allowance. The entrypoint's watchdog arms after its
 	// build, so this covers only the client's own phases.
