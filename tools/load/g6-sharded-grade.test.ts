@@ -36,6 +36,7 @@ function scanFixture(over: {
 	killShard?: number;
 	stretchShardWallMs?: number;
 	issuedSteadyOnly?: number;
+	sendErrors?: number;
 }): RungScan {
 	const report = {
 		schema: "mmo-client/2",
@@ -100,7 +101,7 @@ function scanFixture(over: {
 				rxTotal: over.rx,
 				emitter: {
 					snapshotIssued: over.issuedSteadyOnly ?? over.issued,
-					sendErrors: 0,
+					sendErrors: over.sendErrors ?? 0,
 				},
 			},
 			steadyDrain: {
@@ -213,12 +214,34 @@ describe("g6-sharded-grade", () => {
 
 		const lostTrickle = gradeRung(
 			5000,
-			scanFixture({ ...base, sessionsLost: 20 }),
+			scanFixture({ ...base, sessionsLost: 20, sendErrors: 55 }),
 			CANDIDATE,
 		);
 		expect(lostTrickle.valid).toBe(true);
 		expect(lostTrickle.gate).toBe("MISS");
 		expect(lostTrickle.clauses.S5_sessionsLost?.pass).toBe(false);
+	});
+
+	test("send errors beyond the lost-session explanation refuse; explained ones grade", () => {
+		const base = cleanOver(5000);
+		const unexplained = gradeRung(
+			5000,
+			scanFixture({ ...base, sendErrors: 4 }),
+			CANDIDATE,
+		);
+		expect(unexplained.valid).toBe(false);
+		expect(
+			unexplained.invalidReasons.some((reason) =>
+				reason.includes("unexplained error mass"),
+			),
+		).toBe(true);
+
+		const explained = gradeRung(
+			5000,
+			scanFixture({ ...base, sessionsLost: 2, sendErrors: 6 }),
+			CANDIDATE,
+		);
+		expect(explained.valid).toBe(true);
 	});
 
 	test("steeredTotal sums per-cpu steered and refuses unusable dumps", () => {
