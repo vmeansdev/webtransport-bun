@@ -28,7 +28,11 @@ fi
 rm -rf "$PIN_DIR"
 mkdir -p "$PIN_DIR"
 
-clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -c "$SRC" -o "$BPF_OBJ"
+# -target bpf drops the host's multiarch include path, so asm/types.h (a
+# x86_64-linux-gnu-only header) vanishes; put it back explicitly.
+MULTIARCH=$(gcc -print-multiarch 2>/dev/null || echo x86_64-linux-gnu)
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+	-I"/usr/include/$MULTIARCH" -c "$SRC" -o "$BPF_OBJ"
 bpftool prog loadall "$BPF_OBJ" "$PIN_DIR" pinmaps "$PIN_DIR"
 bpftool prog show pinned "$PIN_DIR/steer_by_cid"
 bpftool map show pinned "$PIN_DIR/socks"
