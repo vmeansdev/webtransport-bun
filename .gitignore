@@ -73,5 +73,12 @@ packages/webtransport/wasm-dist/
 # Generated release evidence artifacts
 .release-evidence/
 
+# Generated benchmark/gate evidence artifacts. The bench-bandwidth workflow
+# writes the G6 evidence bundle and the legacy ladder outputs here under the
+# workspace, and the G6 off-box measurement asserts a pristine candidate tree
+# (git status --untracked-files=all), so these outputs must never register as
+# untracked changes.
+.bench-evidence/
+
 # Local planning/tracker scratch files — never committed
 /.scratch/
