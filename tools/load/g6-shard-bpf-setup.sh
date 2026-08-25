@@ -39,11 +39,13 @@ bpftool map show pinned "$PIN_DIR/socks"
 
 for ((i = 1; i <= INSTANCES; i++)); do
 	slot=$((i - 1))
+	# shellcheck disable=SC2046 — bpftool wants one argv token per byte, so
+	# the substitution must word-split (the .example quotes it and fails).
 	bpftool map update pinned "$PIN_DIR/slot_by_server_id" \
 		key hex 00 "$(printf '%02x' "$i")" 00 00 00 00 00 00 \
-		value hex "$(printf '%02x %02x %02x %02x' \
+		value hex $(printf '%02x %02x %02x %02x' \
 			$((slot & 0xff)) $((slot >> 8 & 0xff)) \
-			$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))"
+			$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))
 done
 bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
 echo "g6-shard-bpf-setup: OK pin_dir=$PIN_DIR instances=$INSTANCES"
