@@ -8,6 +8,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { canonicalGeneratorIdentity } from "../offbox/host-identity.ts";
 import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "./g6-plan.ts";
 
 export const G6_BUNDLE_SCHEMA = "g6-evidence-bundle/1" as const;
@@ -168,6 +169,20 @@ const ATTRIBUTION_REQUIRED_ROLES: G6BundleFileRole[] = [
 	"comparison",
 	"profiles",
 ];
+const FULL_G6_EXTERNAL_ROLES: G6BundleFileRole[] = [
+	"preflight-down",
+	"preflight-up",
+	"floor",
+	"sink",
+];
+const CLASSIFIED_INPUT_ROLES = [
+	["artifactJson", "g6-json"],
+	["artifactCsv", "g6-csv"],
+	["preflightDown", "preflight-down"],
+	["preflightUp", "preflight-up"],
+	["floor", "floor"],
+	["sink", "sink"],
+] as const satisfies ReadonlyArray<readonly [string, G6BundleFileRole]>;
 
 export function createG6EvidenceDirectory(path: string): void {
 	if (existsSync(path)) {
@@ -361,6 +376,54 @@ function validateIdentityCopy(
 	}
 }
 
+function validateHostIdentity(
+	bundleDir: string,
+	metadata: G6BundleMetadata,
+): { runnerHost: string; generatorHost: string; identity: string } {
+	const entry = requireExactlyOneRole(metadata.files, "host-identity");
+	const host = parseJsonFile(bundleDir, entry);
+	if (host.schema !== "g6-host-identity/1") {
+		throw new Error("g6-manifest: unsupported host identity schema");
+	}
+	const runnerHost = requireString(host.runnerHost, `${entry.path}.runnerHost`);
+	const generatorHost = requireString(
+		host.generatorHost,
+		`${entry.path}.generatorHost`,
+	);
+	const identity = requireString(host.identity, `${entry.path}.identity`);
+	for (const [label, value] of [
+		["runner", runnerHost],
+		["generator", generatorHost],
+	] as const) {
+		try {
+			if (canonicalGeneratorIdentity(value) !== value) {
+				throw new Error("not canonical");
+			}
+		} catch {
+			throw new Error(`g6-manifest: ${label} host identity is not canonical`);
+		}
+	}
+	const expectedIdentity = `runner=${runnerHost};generator=${generatorHost}`;
+	if (identity !== expectedIdentity) {
+		throw new Error("g6-manifest: host pair identity is not canonical");
+	}
+	const registration = readFileSync(
+		join(
+			bundleDir,
+			requireExactlyOneRole(metadata.files, "registration-copy").path,
+		),
+		"utf8",
+	);
+	for (const value of [runnerHost, generatorHost, identity]) {
+		if (!registration.includes(value)) {
+			throw new Error(
+				`g6-manifest: registration copy does not bind host value ${value}`,
+			);
+		}
+	}
+	return { runnerHost, generatorHost, identity };
+}
+
 function validatePreRegistrationObject(
 	value: unknown,
 	metadata: G6BundleMetadata,
@@ -386,9 +449,99 @@ function validateCandidateValue(
 	}
 }
 
+function validateSourceExternalInputs(
+	bundleDir: string,
+	metadata: G6BundleMetadata,
+	source: JsonObject,
+	label: string,
+): void {
+	const declared = requireObject(
+		source.externalInputs,
+		`${label}.externalInputs`,
+	);
+	const retained =
+		metadata.kind === "full-g6"
+			? FULL_G6_EXTERNAL_ROLES.map((role) =>
+					requireExactlyOneRole(metadata.files, role),
+				)
+			: [];
+	const retainedPaths = retained
+		.map((entry) => entry.path)
+		.sort((a, b) => a.localeCompare(b, "en"));
+	const declaredPaths = Object.keys(declared).sort((a, b) =>
+		a.localeCompare(b, "en"),
+	);
+	if (JSON.stringify(declaredPaths) !== JSON.stringify(retainedPaths)) {
+		throw new Error(
+			"g6-manifest: source identity external input membership mismatch",
+		);
+	}
+	for (const entry of retained) {
+		const expected = requireString(
+			declared[entry.path],
+			`${label}.externalInputs.${entry.path}`,
+		);
+		if (
+			!HASH_RE.test(expected) ||
+			sha256File(join(bundleDir, entry.path)) !== expected
+		) {
+			throw new Error(
+				`g6-manifest: external input hash mismatch for ${entry.path}`,
+			);
+		}
+	}
+}
+
+function validateClassifiedInputBinding(
+	bundleDir: string,
+	metadata: G6BundleMetadata,
+	classified: JsonObject,
+	entry: G6BundleFile,
+	hostIdentity: { generatorHost: string },
+): void {
+	const source = requireObject(classified.source, `${entry.path}.source`);
+	if (source.graderSha !== metadata.identity.candidateSha) {
+		throw new Error(
+			"g6-manifest: classified grader SHA does not match candidate",
+		);
+	}
+	if (source.generatorHost !== hostIdentity.generatorHost) {
+		throw new Error("g6-manifest: classified generator host mismatch");
+	}
+	const declared = requireObject(
+		classified.inputSha256,
+		`${entry.path}.inputSha256`,
+	);
+	const expectedKeys = CLASSIFIED_INPUT_ROLES.map(([key]) => key).sort((a, b) =>
+		a.localeCompare(b, "en"),
+	);
+	const declaredKeys = Object.keys(declared).sort((a, b) =>
+		a.localeCompare(b, "en"),
+	);
+	if (JSON.stringify(declaredKeys) !== JSON.stringify(expectedKeys)) {
+		throw new Error(
+			"g6-manifest: classified grading input membership mismatch",
+		);
+	}
+	for (const [key, role] of CLASSIFIED_INPUT_ROLES) {
+		const expected = requireString(
+			declared[key],
+			`${entry.path}.inputSha256.${key}`,
+		);
+		const retained = requireExactlyOneRole(metadata.files, role);
+		if (
+			!HASH_RE.test(expected) ||
+			sha256File(join(bundleDir, retained.path)) !== expected
+		) {
+			throw new Error(`g6-manifest: classified input hash mismatch for ${key}`);
+		}
+	}
+}
+
 function validateJsonIdentities(
 	bundleDir: string,
 	metadata: G6BundleMetadata,
+	hostIdentity: { generatorHost: string },
 ): void {
 	for (const entry of metadata.files) {
 		if (
@@ -399,7 +552,6 @@ function validateJsonIdentities(
 				"realm-report",
 				"subscriber-report",
 				"publisher-report",
-				"floor",
 				"classified",
 				"attribution-aggregate",
 				"attribution-leg",
@@ -420,7 +572,27 @@ function validateJsonIdentities(
 			continue;
 		}
 		if (entry.role === "source-identity") {
+			if (value.schema !== "g6-source-identity/1") {
+				throw new Error("g6-manifest: unsupported source identity schema");
+			}
 			validateCandidateValue(value.candidateSha, metadata, entry.path);
+			const treeSha = requireString(value.treeSha, `${entry.path}.treeSha`);
+			if (!CANDIDATE_RE.test(treeSha) || value.dirty !== false) {
+				throw new Error("g6-manifest: source identity must bind a clean tree");
+			}
+			const registration = readFileSync(
+				join(
+					bundleDir,
+					requireExactlyOneRole(metadata.files, "registration-copy").path,
+				),
+				"utf8",
+			);
+			if (!registration.includes(treeSha)) {
+				throw new Error(
+					"g6-manifest: source tree is not bound by registration",
+				);
+			}
+			validateSourceExternalInputs(bundleDir, metadata, value, entry.path);
 			continue;
 		}
 		if (
@@ -432,8 +604,7 @@ function validateJsonIdentities(
 			entry.role === "attribution-raw-server" ||
 			entry.role === "realm-report" ||
 			entry.role === "subscriber-report" ||
-			entry.role === "publisher-report" ||
-			entry.role === "floor"
+			entry.role === "publisher-report"
 		) {
 			validatePreRegistrationObject(
 				value.preRegistration,
@@ -444,6 +615,15 @@ function validateJsonIdentities(
 		if (entry.role === "g6-json" || entry.role === "classified") {
 			const source = requireObject(value.source, `${entry.path}.source`);
 			validateCandidateValue(source.candidateSha, metadata, entry.path);
+		}
+		if (entry.role === "classified") {
+			validateClassifiedInputBinding(
+				bundleDir,
+				metadata,
+				value,
+				entry,
+				hostIdentity,
+			);
 		}
 		if (
 			entry.role === "attribution-aggregate" ||
@@ -470,6 +650,28 @@ function validateJsonIdentities(
 				`${entry.path}.identityLeg`,
 			);
 		}
+	}
+}
+
+function validateFloorIdentity(
+	bundleDir: string,
+	metadata: G6BundleMetadata,
+): void {
+	const entries = entriesForRole(metadata.files, "floor");
+	for (const entry of entries) {
+		const transcript = readFileSync(join(bundleDir, entry.path), "utf8");
+		const line = transcript.match(/^mmo-client: json (\{.*\})\s*$/m)?.[1];
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line ?? transcript);
+		} catch {
+			throw new Error(`g6-manifest: invalid floor transcript ${entry.path}`);
+		}
+		const report = requireObject(parsed, `${entry.path}.mmo-client`);
+		if (report.schema !== "mmo-client/2") {
+			throw new Error(`g6-manifest: ${entry.path} floor is not mmo-client/2`);
+		}
+		validatePreRegistrationObject(report.preRegistration, metadata, entry.path);
 	}
 }
 
@@ -540,6 +742,7 @@ function validateCompleteResult(
 	bundleDir: string,
 	metadata: G6BundleMetadata,
 ): void {
+	const hostIdentity = validateHostIdentity(bundleDir, metadata);
 	if (metadata.kind === "full-g6") {
 		const artifact = parseJsonFile(
 			bundleDir,
@@ -549,6 +752,10 @@ function validateCompleteResult(
 			throw new Error(
 				"g6-manifest: complete full-G6 bundle needs complete bench-g6/2",
 			);
+		}
+		const artifactHost = requireObject(artifact.host, "bench-g6.host");
+		if (artifactHost.identity !== hostIdentity.runnerHost) {
+			throw new Error("g6-manifest: full-G6 runner host identity mismatch");
 		}
 		const classified = parseJsonFile(
 			bundleDir,
@@ -563,6 +770,13 @@ function validateCompleteResult(
 			throw new Error(
 				"g6-manifest: complete full-G6 bundle needs a valid PASS or MISS classification",
 			);
+		}
+		const classifiedSource = requireObject(
+			classified.source,
+			"classified.source",
+		);
+		if (classifiedSource.generatorHost !== hostIdentity.generatorHost) {
+			throw new Error("g6-manifest: classified generator host mismatch");
 		}
 		return;
 	}
@@ -611,6 +825,11 @@ function validateCompleteResult(
 			leg,
 		);
 		const legArtifact = parseJsonFile(bundleDir, legEntry);
+		if (legArtifact.hostIdentity !== hostIdentity.identity) {
+			throw new Error(
+				`g6-manifest: attribution leg ${leg} host identity mismatch`,
+			);
+		}
 		const rawProcessReports = requireObject(
 			legArtifact.rawProcessReports,
 			`${legEntry.path}.rawProcessReports`,
@@ -622,6 +841,14 @@ function validateCompleteResult(
 			throw new Error(
 				`g6-manifest: attribution leg ${leg} raw process references do not match retained reports`,
 			);
+		}
+		for (const rawEntry of [clientEntry, serverEntry]) {
+			const raw = parseJsonFile(bundleDir, rawEntry);
+			if (raw.hostIdentity !== hostIdentity.identity) {
+				throw new Error(
+					`g6-manifest: attribution leg ${leg} raw host identity mismatch`,
+				);
+			}
 		}
 	}
 }
@@ -662,6 +889,7 @@ function validateBundleContract(
 		"preregistration",
 		metadata,
 	);
+	const hostIdentity = validateHostIdentity(bundleDir, metadata);
 	validateIdentityCopy(
 		bundleDir,
 		requireExactlyOneRole(metadata.files, "registration-copy"),
@@ -669,14 +897,11 @@ function validateBundleContract(
 		"registration",
 		metadata,
 	);
-	validateJsonIdentities(bundleDir, metadata);
-	const profilesEntries = entriesForRole(metadata.files, "profiles");
-	if (profilesEntries.length > 1) {
-		throw new Error("g6-manifest: profiles role may appear at most once");
-	}
-	if (profilesEntries.length === 1) {
-		validateProfiles(bundleDir, metadata.files);
-	}
+	validateJsonIdentities(bundleDir, metadata, hostIdentity);
+	validateFloorIdentity(bundleDir, metadata);
+	requireExactlyOneRole(metadata.files, "profiles");
+	requireExactlyOneRole(metadata.files, "comparison");
+	validateProfiles(bundleDir, metadata.files);
 	if (metadata.status !== "COMPLETE") {
 		if (metadata.stampable) {
 			throw new Error(
