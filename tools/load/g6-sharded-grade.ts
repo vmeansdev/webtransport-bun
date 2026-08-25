@@ -3,15 +3,15 @@
  * pre-registered clauses over g6-sharded-scan/1 artifacts, one rung per file.
  *
  * The producer is tools/load/g6-sharded-scan.ts (the sharded conductor), not
- * bench-g6 — this grader is the frozen half that turns its characterization
- * schema into a registered verdict. Thresholds live HERE, in tracked code,
- * pre-committed by the preregistration's hash of this file's constants; a
- * failed rung is diagnosed, never re-thresholded.
+ * bench-g6 — this grader is the frozen half that turns its schema into a
+ * registered verdict. Thresholds live HERE, in tracked code, pre-committed by
+ * the preregistration's hash of this file's constants; a failed rung is
+ * diagnosed, never re-thresholded.
  *
  * Usage:
  *   bun tools/load/g6-sharded-grade.ts \
- *     --expect-candidate <sha> --expect-shards 16 \
- *     --steer-stats <bpftool-json> \
+ *     --expect-candidate <sha> \
+ *     --steer-stats <bpftool -j map dump of steer_stats> \
  *     --rung <sessions>=<scan.json> [--rung ...] \
  *     [--out verdict.json]
  *
@@ -26,7 +26,11 @@ import { LatencyHistogram } from "./latency-histogram.ts";
 export const G6_SHARDED_CLAUSES = Object.freeze({
 	/** S1: server-ingested upstream / client-sent upstream, steady window. */
 	ingestFloor: 0.995,
-	/** S2: client-received snapshots (steady+drain) / server-issued (steady). */
+	/** S2: client-received snapshots (steady+drain) / server-issued. The
+	 * issued figure is the steady+drain emitter counter: emission stops at the
+	 * steady edge, so the drain tail holds only late-resolved bookings of
+	 * steady-window sends (the .then-at-the-edge undercount the critic proved
+	 * against the steady-only counter). */
 	deliveryFloor: 0.995,
 	/** S3: server-issued snapshots / registered demand (sessions×15×120). */
 	dutyFloor: 0.99,
@@ -40,9 +44,55 @@ export const G6_SHARDED_CLAUSES = Object.freeze({
 export const G6_SHARDED_VALIDITY = Object.freeze({
 	steadySeconds: 120,
 	requiredShards: 16,
+	requiredEndpoints: 128,
 	pacedEmitter: false,
 	sessionsErrMax: 0,
+	/** Per-shard steady wall-clock tolerance: event-loop-clocked marks stretch
+	 * under load; a stretched window inflates S1 (0.083 %/100 ms). */
+	steadyWallMsTolerance: 250,
+	/** Run-scoped steering floor: steered short-header packets must cover this
+	 * fraction of the summed steady upstream — a `> 0` bound would validate a
+	 * 99.9 %-kernel-hash run with one steered packet of residue. */
+	steeredFloorFractionOfUpstream: 0.9,
 });
+
+type ShardEntry = {
+	serverId: number;
+	sessionsAtSteady: number | null;
+	windows: {
+		steady: BoundaryLike;
+		steadyDrain: BoundaryLike;
+	} | null;
+};
+
+type BoundaryLike = {
+	rxTotal: number;
+	wallMs: number;
+	emitter: { snapshotIssued: number; sendErrors: number };
+};
+
+export type RungScan = {
+	candidateSha: string;
+	config: {
+		shards: number;
+		sessions: number;
+		paced: boolean;
+		steadySeconds: number;
+		endpoints: number;
+	};
+	clientExit: number;
+	shards: ShardEntry[];
+	aggregate: {
+		steady: {
+			rxTotal: number;
+			emitter: { snapshotIssued: number; sendErrors: number };
+		};
+		steadyDrain: {
+			emitter: { snapshotIssued: number };
+		};
+	};
+	clientStdout: string;
+};
 
 type RungVerdict = {
 	rung: number;
@@ -50,6 +100,7 @@ type RungVerdict = {
 	invalidReasons: string[];
 	clauses: Record<string, { value: number; bound: number; pass: boolean }>;
 	gate: "PASS" | "MISS" | null;
+	steadySent: number;
 };
 
 function arg(name: string): string | null {
@@ -83,23 +134,7 @@ function p99Ms(histJson: unknown): number | null {
 
 export function gradeRung(
 	rungSessions: number,
-	scan: {
-		candidateSha: string;
-		config: {
-			shards: number;
-			sessions: number;
-			paced: boolean;
-			steadySeconds: number;
-		};
-		clientExit: number;
-		aggregate: {
-			steady: {
-				rxTotal: number;
-				emitter: { snapshotIssued: number; sendErrors: number };
-			};
-		};
-		clientStdout: string;
-	},
+	scan: RungScan,
 	expectCandidate: string,
 ): RungVerdict {
 	const invalid: string[] = [];
@@ -110,6 +145,10 @@ export function gradeRung(
 		);
 	if (scan.config.shards !== v.requiredShards)
 		invalid.push(`shards ${scan.config.shards} != ${v.requiredShards}`);
+	if (scan.config.endpoints !== v.requiredEndpoints)
+		invalid.push(
+			`endpoints ${scan.config.endpoints} != ${v.requiredEndpoints}`,
+		);
 	if (scan.config.sessions !== rungSessions)
 		invalid.push(`sessions ${scan.config.sessions} != rung ${rungSessions}`);
 	if (scan.config.paced !== v.pacedEmitter)
@@ -118,8 +157,43 @@ export function gradeRung(
 		invalid.push(`steadySeconds ${scan.config.steadySeconds} != 120`);
 	if (scan.clientExit !== 0) invalid.push(`clientExit ${scan.clientExit}`);
 
+	// Shard survival + window completeness: a shard that died mid-steady must
+	// refuse, never silently deflate the aggregate into an honest-looking MISS.
+	if (scan.shards.length !== v.requiredShards) {
+		invalid.push(`shard entries ${scan.shards.length} != ${v.requiredShards}`);
+	} else {
+		const ids = new Set(scan.shards.map((s) => s.serverId));
+		if (ids.size !== v.requiredShards)
+			invalid.push("duplicate shard serverIds");
+		const steadySessions = scan.shards.reduce(
+			(sum, s) => sum + (s.sessionsAtSteady ?? 0),
+			0,
+		);
+		if (steadySessions !== rungSessions)
+			invalid.push(
+				`sessions at steady ${steadySessions} != rung ${rungSessions}`,
+			);
+		for (const shard of scan.shards) {
+			if (shard.windows === null) {
+				invalid.push(`shard ${shard.serverId} has no boundary windows`);
+				continue;
+			}
+			const wall = shard.windows.steady.wallMs;
+			const target = v.steadySeconds * 1000;
+			if (Math.abs(wall - target) > v.steadyWallMsTolerance)
+				invalid.push(
+					`shard ${shard.serverId} steady wall ${wall}ms outside ${target}±${v.steadyWallMsTolerance}`,
+				);
+		}
+	}
+	if (scan.aggregate.steady.emitter.sendErrors !== 0)
+		invalid.push(
+			`emitter sendErrors ${scan.aggregate.steady.emitter.sendErrors} != 0`,
+		);
+
 	let clauses: RungVerdict["clauses"] = {};
 	let gate: RungVerdict["gate"] = null;
+	let steadySent = 0;
 	try {
 		const report = clientReport(scan) as {
 			sessionsOk: number;
@@ -137,15 +211,18 @@ export function gradeRung(
 		const c = G6_SHARDED_CLAUSES;
 		const demand =
 			rungSessions * SNAPSHOT_HZ * snapshotDatagrams() * v.steadySeconds;
-		const sent = report.windows.steady.sent;
-		const issued = scan.aggregate.steady.emitter.snapshotIssued;
+		steadySent = report.windows.steady.sent;
+		// The steady+drain emitter counter: emission stops at the steady edge,
+		// so this is the complete booking of steady-window sends (D1).
+		const issued = scan.aggregate.steadyDrain.emitter.snapshotIssued;
+		if (issued <= 0) invalid.push("no snapshots issued");
 		const ackP99 = p99Ms(report.windows.steadyDrain.rtt);
 		if (ackP99 === null) invalid.push("ack RTT histogram is empty");
 		clauses = {
 			S1_ingest: {
-				value: scan.aggregate.steady.rxTotal / sent,
+				value: scan.aggregate.steady.rxTotal / steadySent,
 				bound: c.ingestFloor,
-				pass: scan.aggregate.steady.rxTotal / sent >= c.ingestFloor,
+				pass: scan.aggregate.steady.rxTotal / steadySent >= c.ingestFloor,
 			},
 			S2_delivery: {
 				value: report.windows.steadyDrain.rxSnapshot / issued,
@@ -178,19 +255,31 @@ export function gradeRung(
 	if (valid) {
 		gate = Object.values(clauses).every((cl) => cl.pass) ? "PASS" : "MISS";
 	}
-	return { rung: rungSessions, valid, invalidReasons: invalid, clauses, gate };
+	return {
+		rung: rungSessions,
+		valid,
+		invalidReasons: invalid,
+		clauses,
+		gate,
+		steadySent,
+	};
 }
 
-function steerStatsEngaged(path: string): boolean {
-	const dump = JSON.parse(readFileSync(path, "utf8")) as Array<{
-		key: number;
-		values: Array<{ value: number }>;
-	}>;
-	const steered = dump
-		.filter((row) => row.key === 0)
-		.flatMap((row) => row.values)
-		.reduce((sum, v) => sum + v.value, 0);
-	return steered > 0;
+/** Total steered short-header packets from a `bpftool -j` percpu dump, or a
+ * refusal reason string when the dump is unusable. */
+export function steeredTotal(text: string): number | string {
+	try {
+		const dump = JSON.parse(text) as Array<{
+			key: number;
+			values: Array<{ value: number }>;
+		}>;
+		return dump
+			.filter((row) => row.key === 0)
+			.flatMap((row) => row.values)
+			.reduce((sum, entry) => sum + entry.value, 0);
+	} catch (error) {
+		return `steer_stats dump unusable: ${String(error)}`;
+	}
 }
 
 async function main(): Promise<void> {
@@ -209,18 +298,28 @@ async function main(): Promise<void> {
 		const scan = JSON.parse(readFileSync(spec.slice(eq + 1), "utf8"));
 		verdicts.push(gradeRung(rung, scan, expectCandidate));
 	}
-	const steering = steerStatsEngaged(steerStatsPath);
-	if (!steering) {
+	const steered = steeredTotal(readFileSync(steerStatsPath, "utf8"));
+	const upstreamSum = verdicts.reduce((sum, v) => sum + v.steadySent, 0);
+	const steeredFloor =
+		G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream * upstreamSum;
+	const steeringReason =
+		typeof steered === "string"
+			? steered
+			: steered < steeredFloor
+				? `steered ${steered} below floor ${Math.round(steeredFloor)} (0.9 × upstream ${upstreamSum})`
+				: null;
+	if (steeringReason !== null) {
 		for (const verdict of verdicts) {
 			verdict.valid = false;
-			verdict.invalidReasons.push("steer_stats shows zero steered packets");
+			verdict.invalidReasons.push(steeringReason);
 			verdict.gate = null;
 		}
 	}
 	const result = {
 		schema: "g6-sharded-grade/1",
 		expectCandidate,
-		steeringEngaged: steering,
+		steered,
+		steeredFloor: Math.round(steeredFloor),
 		clauses: G6_SHARDED_CLAUSES,
 		validity: G6_SHARDED_VALIDITY,
 		rungs: verdicts,

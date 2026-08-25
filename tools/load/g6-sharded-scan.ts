@@ -4,9 +4,10 @@
  * mmo-client realm fleet drives the registered steady shape at them, and the
  * conductor aggregates per-shard boundary windows.
  *
- * Characterization only — not a registered producer. The per-shard emitter
- * and the client contract are the gate's own; what is new here is only the
- * process split and the summation.
+ * Producer for gate g6-sharded/1 (and for informal characterization runs).
+ * The per-shard emitter and the client contract are the gate's own; what is
+ * new here is only the process split and the summation. The registered half
+ * is tools/load/g6-sharded-grade.ts, which grades this file's schema.
  *
  * Env: SCAN_SHARDS (2), SCAN_SESSIONS (5000), SCAN_OUT (g6-sharded-scan.json),
  *      SCAN_PIN_DIR (/sys/fs/bpf/quic-lb), G6_OFFBOX_SSH, G6_CANDIDATE_SHA,
