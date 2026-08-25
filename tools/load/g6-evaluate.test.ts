@@ -648,6 +648,55 @@ describe("g6-classified/2 evaluator", () => {
 		);
 	});
 
+	test("counted mid-steady session losses keep the run valid within the derived due band", () => {
+		const input = request();
+		const steady = (input.artifact as Json).arms[0].rawReports.realm.windows
+			.steady;
+		// Two sessions died mid-steady: their forfeited due is bounded by two
+		// full windows (2 × (4 × 120 + 1) = 962 ticks); 400 is well inside.
+		const forfeit = 400;
+		steady.scheduleTicksDue -= forfeit;
+		steady.scheduleTicksFired -= forfeit;
+		steady.sent -= forfeit;
+		steady.sessionsLost = 2;
+		steady.scheduleLag = histogram(1_000_000, steady.scheduleTicksFired);
+
+		const result = evaluateG6(input);
+		expect(
+			result.invalidReasons.filter((reason) => reason.includes("schedule due")),
+		).toEqual([]);
+		expect(result.final.valid).toBe(true);
+	});
+
+	test("a due shortfall beyond the counted losses is refused", () => {
+		const input = request();
+		const steady = (input.artifact as Json).arms[0].rawReports.realm.windows
+			.steady;
+		// The same shortfall with zero counted losses has no derivation: the
+		// generator under-drove without a matching loss ledger.
+		const forfeit = 400;
+		steady.scheduleTicksDue -= forfeit;
+		steady.scheduleTicksFired -= forfeit;
+		steady.sent -= forfeit;
+		steady.scheduleLag = histogram(1_000_000, steady.scheduleTicksFired);
+
+		const result = evaluateG6(input);
+		expect(result.final.gate).toBe("INVALID");
+		expect(result.invalidReasons.join(" ")).toContain("counted losses");
+	});
+
+	test("a due count above the registered demand is refused", () => {
+		const input = request();
+		const steady = (input.artifact as Json).arms[0].rawReports.realm.windows
+			.steady;
+		steady.scheduleTicksDue += 1;
+		steady.scheduleTicksUnpresented = 1;
+
+		const result = evaluateG6(input);
+		expect(result.final.gate).toBe("INVALID");
+		expect(result.invalidReasons.join(" ")).toContain("exceeds registered");
+	});
+
 	test("uses the subscriber raw one-way histogram, never the clean artifact summary", () => {
 		const input = request();
 		const hotspot = (input.artifact as Json).arms[3];
