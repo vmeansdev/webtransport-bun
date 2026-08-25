@@ -409,15 +409,22 @@ describe("G6 bundle producer", () => {
 		expect(inputNames.length).toBeLessThanOrEqual(25);
 		expect(inputNames).toContain("      g6_source_bound:");
 
-		// The blob is decoded by the tracked fail-closed validator, and its
-		// values reach GITHUB_ENV only after the last identity refusal.
+		// The blob is decoded by the tracked fail-closed validator to a temp
+		// file. Its output is NEVER eval'd — a validated value can carry no
+		// code — and reaches GITHUB_ENV via cat only after the last refusal.
 		const validatorCall = workflow.indexOf("bun tools/load/g6-source-bound.ts");
-		const evalParsed = workflow.indexOf('eval "$PARSED"');
-		const exportParsed = workflow.indexOf(
-			`printf '%s\\n' "$PARSED" >> "$GITHUB_ENV"`,
-		);
 		expect(validatorCall).toBeGreaterThan(0);
-		expect(evalParsed).toBeGreaterThan(validatorCall);
+		// eval of the validator output was the injection sink; it must be gone.
+		expect(workflow).not.toContain('eval "$PARSED"');
+		expect(workflow).not.toMatch(/\n\s*eval\s+["'$]/);
+		// The one field an in-step refusal needs is read with grep, not eval.
+		const grepHost = workflow.indexOf(
+			`grep '^G6_EXPECTED_RUNNER_HOST=' "$PARSED_FILE"`,
+		);
+		expect(grepHost).toBeGreaterThan(validatorCall);
+		const exportParsed = workflow.indexOf(
+			`cat "$PARSED_FILE" >> "$GITHUB_ENV"`,
+		);
 		expect(exportParsed).toBeGreaterThan(
 			workflow.indexOf("Runner host $ACTUAL_RUNNER_HOST differs"),
 		);
