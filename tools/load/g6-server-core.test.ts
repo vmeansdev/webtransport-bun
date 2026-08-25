@@ -15,6 +15,7 @@ import {
 	createG6ServerCore,
 	freshG6ServerState,
 	type G6ServerCoreDueAccounting,
+	type G6ServerCorePacedMirror,
 } from "./g6-server-core.ts";
 
 type FakeSession = {
@@ -97,6 +98,7 @@ function makeCore(
 		phase: EmitterPhase;
 		severAtMs: number | null;
 		dueAccounting: G6ServerCoreDueAccounting;
+		pacedMirror: G6ServerCorePacedMirror | null;
 	}> = {},
 ) {
 	const phaseState = { current: over.phase ?? ("steady" as EmitterPhase) };
@@ -114,6 +116,7 @@ function makeCore(
 		state: () => stateRef.value,
 		severAtMs: () => severRef.value,
 		dueAccounting: over.dueAccounting,
+		pacedMirror: () => over.pacedMirror ?? null,
 	});
 	return { core, phaseState, stateRef, severRef };
 }
@@ -220,6 +223,61 @@ describe("g6 server core", () => {
 				});
 			}
 		}
+	});
+
+	test("routes snapshot fan-out through the paced mirror when one is injected", async () => {
+		const calls: Array<{ targets: readonly string[]; bytes: number }> = [];
+		let failuresToReport: Array<{ target: string; error: unknown }> = [];
+		const paced: G6ServerCorePacedMirror = {
+			send: (targets, payload) => {
+				calls.push({ targets: [...targets], bytes: payload.byteLength });
+				return { admitted: targets.length };
+			},
+			readReports: () => {
+				const out = failuresToReport;
+				failuresToReport = [];
+				return out;
+			},
+		};
+		const { core, stateRef } = makeCore({ pacedMirror: paced });
+		const sessions = [queueSession(), queueSession(), queueSession()];
+		for (const [index, harness] of sessions.entries()) {
+			core.onSession({ ...harness.session, id: `session-${index}` });
+		}
+		await flushAsyncWork();
+
+		const scheduled: Array<{ delay: number; tick: () => void }> = [];
+		const stop = core.startEmitter(() => "steady", {
+			setInterval: (tick, delay) => {
+				scheduled.push({ delay, tick });
+				return scheduled.length;
+			},
+			clearInterval: () => {},
+		});
+
+		scheduled[0]?.tick();
+		await flushAsyncWork();
+		failuresToReport = [{ target: "session-1", error: "E_SESSION_CLOSED" }];
+		scheduled[0]?.tick();
+		await flushAsyncWork();
+		scheduled[0]?.tick();
+		await flushAsyncWork();
+		stop();
+
+		// Three paced admissions per slice (one per snapshot datagram); the
+		// per-player batch path must stay untouched.
+		expect(calls).toHaveLength(9);
+		for (const call of calls) {
+			expect(call.targets).toHaveLength(1);
+			expect(call.bytes).toBe(1150);
+		}
+		for (const harness of sessions) {
+			expect(harness.sentBatches).toHaveLength(0);
+		}
+		expect(stateRef.value.emitter.snapshotDue).toBe(9);
+		// 9 admitted minus the one deferred failure drained on the second slice.
+		expect(stateRef.value.emitter.snapshotIssued).toBe(8);
+		expect(stateRef.value.emitter.sendErrors).toBe(1);
 	});
 
 	test("discovers raid roles from session traffic and forwards publisher datagrams to raid members", async () => {

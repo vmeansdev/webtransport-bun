@@ -26,6 +26,7 @@ import {
 export type SessionKind = "player" | "publisher" | "raid";
 
 export type Player = {
+	id?: string;
 	send: (datagrams: readonly Uint8Array[]) => Promise<{
 		sent: number;
 		error?: unknown;
@@ -125,6 +126,8 @@ export const REGISTERED_G6_SERVER_CORE_PLAN: G6ServerCorePlan = Object.freeze({
 });
 
 export type G6ServerCoreSession = {
+	/** Present on real native sessions; the paced-mirror emitter needs it. */
+	id?: string;
 	sendDatagramBatch: (datagrams: readonly Uint8Array[]) => Promise<{
 		sent: number;
 		error?: unknown;
@@ -132,6 +135,19 @@ export type G6ServerCoreSession = {
 	sendDatagram: (datagram: Uint8Array) => unknown;
 	incomingDatagrams: () => AsyncIterable<Uint8Array>;
 	closed: Promise<unknown>;
+};
+
+/**
+ * Server-level paced fan-out, injected the same way sessions are. `send`
+ * returns an admission (targets the pacer's schedule accepted), never a
+ * delivery count; deferred failures arrive later through `readReports`.
+ */
+export type G6ServerCorePacedMirror = {
+	send: (
+		targets: readonly string[],
+		payload: Uint8Array,
+	) => { admitted: number };
+	readReports: (max?: number) => readonly { target: string; error: unknown }[];
 };
 
 export type G6ServerCoreIntervalScheduler = {
@@ -175,6 +191,13 @@ export function createG6ServerCore(options: {
 	severAtMs: () => number | null;
 	instrumentation?: G6ServerCoreInstrumentation;
 	dueAccounting?: G6ServerCoreDueAccounting;
+	/**
+	 * Late-bound getter (the server exists only after the core does). Non-null
+	 * switches the snapshot fan-out from per-player `sendDatagramBatch` to the
+	 * native egress pacer; acks and raid forwards stay on their per-session
+	 * paths either way.
+	 */
+	pacedMirror?: () => G6ServerCorePacedMirror | null;
 }): {
 	plan: G6ServerCorePlan;
 	players: Player[];
@@ -250,6 +273,7 @@ export function createG6ServerCore(options: {
 		const acceptedAtMs = options.nowMs();
 		options.state().acceptSeries.push(acceptedAtMs);
 		const player: Player = {
+			id: session.id,
 			send: (datagrams) => session.sendDatagramBatch(datagrams),
 			sendOne: (datagram) => session.sendDatagram(datagram),
 			acceptedAtMs,
@@ -460,6 +484,49 @@ export function createG6ServerCore(options: {
 				return;
 			}
 			emittedSlicesRef.value += 1;
+			const paced = options.pacedMirror?.() ?? null;
+			if (paced !== null) {
+				// One admission call per snapshot datagram instead of one batch
+				// promise per player: the pacer's own thread does the sends, so
+				// the slice handoff costs 3 synchronous crossings regardless of
+				// population. The stamp's sequence is shared across the chunk —
+				// per-session it is still strictly increasing, which is all the
+				// client reads from it.
+				sequence += 1;
+				const targets: string[] = [];
+				for (const player of chunk) {
+					if (player.id !== undefined) targets.push(player.id);
+				}
+				for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
+					const datagram = new Uint8Array(plan.snapshotPayloadBytes);
+					datagram.set(body);
+					encodeStamp(datagram, {
+						version: 3,
+						intendedNs: deadlineNs,
+						actualNs: handoffNs,
+						sequence: sequence * plan.snapshotDatagrams + index,
+						klass: CLASS_SNAPSHOT,
+					});
+					if (totalSteadySlices === null) {
+						state.emitter.snapshotDue += targets.length;
+					}
+					try {
+						const { admitted } = paced.send(targets, datagram);
+						state.emitter.snapshotIssued += admitted;
+					} catch {
+						state.emitter.sendErrors += 1;
+					}
+				}
+				// Deferred failures are the paced analog of a rejected batch:
+				// admitted-but-never-sent. Subtract so snapshotIssued keeps
+				// meaning "handed to the wire".
+				const failures = paced.readReports();
+				if (failures.length > 0) {
+					state.emitter.snapshotIssued -= failures.length;
+					state.emitter.sendErrors += failures.length;
+				}
+				return;
+			}
 			for (const player of chunk) {
 				sequence += 1;
 				const batch: Uint8Array[] = [];
