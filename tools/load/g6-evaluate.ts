@@ -41,6 +41,7 @@ import {
 } from "./g6-classify.ts";
 import {
 	armShape,
+	exactStaggeredWindowDue,
 	G6_CLOSEOUT_SPEC_ID,
 	G6_CLOSEOUT_SPEC_PATH,
 	gateRung,
@@ -407,6 +408,7 @@ function parseClientWindow(
 	const due = counter("scheduleTicksDue");
 	const fired = counter("scheduleTicksFired");
 	const skipped = counter("scheduleTicksSkipped");
+	const unpresented = counter("scheduleTicksUnpresented");
 	const rxSnapshot = counter("rxSnapshot");
 	const rxAck = counter("rxAck");
 	const rxRaid = counter("rxRaid");
@@ -419,9 +421,12 @@ function parseClientWindow(
 		if (window.scheduleTicksReconciled !== true) {
 			reasons.push(`V-A ${path}: scheduleTicksReconciled must be true`);
 		}
-		if (due !== fired + skipped) {
+		// Recomputed from the raw counters, never trusted from the artifact's
+		// boolean: every due tick is fired, skipped, or measured as
+		// never-presented at the window-close boundary.
+		if (due !== fired + skipped + unpresented) {
 			reasons.push(
-				`V-A ${path}: schedule due ${due} != fired ${fired} + skipped ${skipped}`,
+				`V-A ${path}: schedule due ${due} != fired ${fired} + skipped ${skipped} + unpresented ${unpresented}`,
 			);
 		}
 		if (sent + sendErr !== fired) {
@@ -686,7 +691,16 @@ function buildSteadyFacts(
 		request.expectedCandidate,
 		reasons,
 	);
-	const expectedUpstream = sessions * MOVE_HZ * G6_STEADY_SECONDS;
+	// The registered demand is the exact staggered schedule's total — the same
+	// arithmetic the client runs — not the naive sessions × hz × seconds
+	// product, which overcounts sessions whose stagger offset trims one tick.
+	const expectedUpstream = exactStaggeredWindowDue({
+		durationSec: G6_STEADY_SECONDS,
+		intervalSec: 1 / MOVE_HZ,
+		totalSessions: sessions,
+		startIndex: 0,
+		count: sessions,
+	});
 	const steady = parseClientWindow(
 		realm,
 		"steady",
@@ -992,7 +1006,13 @@ function evaluateFloor(
 		"floor report.config.drainMs",
 		floorReasons,
 	);
-	const expectedDue = sessionsRequested * MOVE_HZ * steadySec;
+	const expectedDue = exactStaggeredWindowDue({
+		durationSec: steadySec,
+		intervalSec: 1 / MOVE_HZ,
+		totalSessions: sessionsRequested,
+		startIndex: 0,
+		count: sessionsRequested,
+	});
 	const floorWindow = parseClientWindow(
 		root,
 		"steady",
@@ -1483,7 +1503,13 @@ export function evaluateG6(request: G6EvaluationRequest): G6ClassifiedV2 {
 		request.expectedCandidate,
 		validityReasons,
 	);
-	const expectedPublisherDue = RAID_PUBLISHER_HZ * G6_STEADY_SECONDS;
+	const expectedPublisherDue = exactStaggeredWindowDue({
+		durationSec: G6_STEADY_SECONDS,
+		intervalSec: 1 / RAID_PUBLISHER_HZ,
+		totalSessions: 1,
+		startIndex: 0,
+		count: 1,
+	});
 	const publisherWindow = parseClientWindow(
 		publisher,
 		"steady",
@@ -1670,7 +1696,16 @@ export function evaluateG6(request: G6EvaluationRequest): G6ClassifiedV2 {
 					schedule: true,
 					rtt: true,
 					oneWay: false,
-					expectedDue: survivorCount * MOVE_HZ * G6_STORM_WINDOW_SECONDS,
+					// Survivors keep the stagger offsets of their original fleet
+					// indices — everything past the severed cohort — so their
+					// exact demand is that slice of the full fleet's schedule.
+					expectedDue: exactStaggeredWindowDue({
+						durationSec: G6_STORM_WINDOW_SECONDS,
+						intervalSec: 1 / MOVE_HZ,
+						totalSessions: gateRung(),
+						startIndex: cohort,
+						count: survivorCount,
+					}),
 				},
 				validityReasons,
 				allHistograms,

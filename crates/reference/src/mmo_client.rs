@@ -96,8 +96,19 @@ enum SendWindowKind {
 #[derive(Debug)]
 struct ActiveSendWindow {
     kind: SendWindowKind,
+    /// The driver's flip instant for this phase, shared by every session, so
+    /// the window's schedule is the registered one rather than one that
+    /// starts whenever this session happened to wake.
     started_at: tokio::time::Instant,
     ticker: tokio::time::Interval,
+    /// Ticks this session has fired or skipped inside this window — its own
+    /// local ledger, matched against the window's due count at close so the
+    /// never-presented boundary remainder is measured, not inferred.
+    processed: u64,
+    /// The registered schedule's total demand for this window: ticks due over
+    /// the registered phase duration. Sends stop here — the registered window
+    /// is the offer, and a late-observed drain flip must not stretch it.
+    capacity: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,12 +218,17 @@ struct ScheduleAccounting {
     due: u64,
     fired: u64,
     skipped: u64,
+    unpresented: u64,
 }
 
 #[cfg(test)]
 impl ScheduleAccounting {
     fn reconciled(self) -> bool {
-        self.due == self.fired.saturating_add(self.skipped)
+        self.due
+            == self
+                .fired
+                .saturating_add(self.skipped)
+                .saturating_add(self.unpresented)
     }
 }
 
@@ -223,11 +239,16 @@ fn schedule_accounting(
     phase_offset: f64,
     fired: u64,
     skipped: u64,
+    processed: u64,
+    capacity: Option<u64>,
 ) -> ScheduleAccounting {
+    let wall_due = ticks_due_after(elapsed, interval, phase_offset);
+    let due = capacity.map_or(wall_due, |cap| wall_due.min(cap));
     ScheduleAccounting {
-        due: ticks_due_after(elapsed, interval, phase_offset),
+        due,
         fired,
         skipped,
+        unpresented: due.saturating_sub(processed),
     }
 }
 
@@ -358,6 +379,11 @@ struct Counters {
     ticks_due: AtomicU64,
     ticks_fired: AtomicU64,
     ticks_skipped: AtomicU64,
+    /// Ticks the registered schedule made due inside the window that the
+    /// session's ticker never presented before the window closed. Measured per
+    /// session at close from its own schedule position — a fourth counter,
+    /// never inferred from the other three after the fact.
+    ticks_unpresented: AtomicU64,
     rx_snapshot: AtomicU64,
     rx_ack: AtomicU64,
     rx_raid: AtomicU64,
@@ -377,6 +403,7 @@ impl Counters {
                 .ticks_fired
                 .load(Ordering::Relaxed)
                 .saturating_add(self.ticks_skipped.load(Ordering::Relaxed))
+                .saturating_add(self.ticks_unpresented.load(Ordering::Relaxed))
     }
 
     fn to_json_fields(&self) -> String {
@@ -384,7 +411,8 @@ impl Counters {
             concat!(
                 "\"sent\":{},\"sendErr\":{},",
                 "\"scheduleTicksDue\":{},\"scheduleTicksFired\":{},",
-                "\"scheduleTicksSkipped\":{},\"scheduleTicksReconciled\":{},",
+                "\"scheduleTicksSkipped\":{},\"scheduleTicksUnpresented\":{},",
+                "\"scheduleTicksReconciled\":{},",
                 "\"rxSnapshot\":{},\"rxAck\":{},\"rxRaid\":{},\"rxOther\":{},",
                 "\"rxUnstamped\":{},\"ackUnreflected\":{},\"sessionsLost\":{}"
             ),
@@ -393,6 +421,7 @@ impl Counters {
             self.ticks_due.load(Ordering::Relaxed),
             self.ticks_fired.load(Ordering::Relaxed),
             self.ticks_skipped.load(Ordering::Relaxed),
+            self.ticks_unpresented.load(Ordering::Relaxed),
             self.ticks_reconciled(),
             self.rx_snapshot.load(Ordering::Relaxed),
             self.rx_ack.load(Ordering::Relaxed),
@@ -456,6 +485,12 @@ impl WindowStats {
 
     fn record_due(&self, due: u64) {
         self.counters.ticks_due.fetch_add(due, Ordering::Relaxed);
+    }
+
+    fn record_unpresented(&self, unpresented: u64) {
+        self.counters
+            .ticks_unpresented
+            .fetch_add(unpresented, Ordering::Relaxed);
     }
 
     fn to_json(&self) -> String {
@@ -1121,7 +1156,11 @@ async fn run(
     } else {
         options.storm_concurrency
     }));
-    let (phase_tx, phase_rx) = watch::channel(PHASE_CONNECT);
+    // The channel carries the flip instant beside the phase so every session
+    // opens its send window on the driver's clock, not on its own wake-up
+    // time: a late wake shows up as honest first-tick lag and skipped ticks
+    // instead of silently shrinking the session's offered denominator.
+    let (phase_tx, phase_rx) = watch::channel((PHASE_CONNECT, tokio::time::Instant::now()));
 
     let cpu0 = self_cpu_ms();
     let connect_started = Instant::now();
@@ -1211,7 +1250,7 @@ async fn run(
         proof.steady_enter_unix_ms = unix_now_ms()?;
         proof.steady_enter_monotonic_ns = monotonic_ns();
     }
-    let _ = phase_tx.send(PHASE_STEADY);
+    let _ = phase_tx.send((PHASE_STEADY, tokio::time::Instant::now()));
     // Phase markers are line-buffered onto stdout so the harness snapshots
     // server-side counters at exactly the boundaries this process uses.
     println!("mmo-client: phase steady");
@@ -1219,21 +1258,21 @@ async fn run(
     let quic_after_steady = sample_quic(&shared.registry);
     let cpu_after_steady = self_cpu_ms();
     let rss_after_steady = self_rss_mb();
-    let _ = phase_tx.send(PHASE_DRAIN);
+    let _ = phase_tx.send((PHASE_DRAIN, tokio::time::Instant::now()));
     println!("mmo-client: phase drain");
     tokio::time::sleep(options.drain).await;
 
     let storm_ran = options.storm_cohort > 0;
     if storm_ran {
-        let _ = phase_tx.send(PHASE_STORM);
+        let _ = phase_tx.send((PHASE_STORM, tokio::time::Instant::now()));
         println!("mmo-client: phase storm cohort={}", options.storm_cohort);
         tokio::time::sleep(options.storm_window).await;
-        let _ = phase_tx.send(PHASE_POST);
+        let _ = phase_tx.send((PHASE_POST, tokio::time::Instant::now()));
         println!("mmo-client: phase post-storm");
         tokio::time::sleep(options.post_storm).await;
     }
 
-    let _ = phase_tx.send(PHASE_IDLE);
+    let _ = phase_tx.send((PHASE_IDLE, tokio::time::Instant::now()));
     println!("mmo-client: phase idle");
     tokio::time::sleep(PHASE_SETTLE).await;
     let quic_after_drive = sample_quic(&shared.registry);
@@ -1243,7 +1282,7 @@ async fn run(
     let cpu_after_idle = self_cpu_ms();
     let rss_idle = self_rss_mb();
 
-    let _ = phase_tx.send(PHASE_STOP);
+    let _ = phase_tx.send((PHASE_STOP, tokio::time::Instant::now()));
     println!("mmo-client: phase stop");
     let join_deadline = Instant::now() + JOIN_TIMEOUT;
     while Instant::now() < join_deadline && handles.iter().any(|h| !h.is_finished()) {
@@ -1385,11 +1424,25 @@ async fn run(
 /* Session task                                                                */
 /* -------------------------------------------------------------------------- */
 
-/// Book this session's share of the offered denominator, once, at the instant it
-/// stops sending. Measured from this session's own clock, so a session that
-/// entered late or died early is charged for exactly the ticks its own schedule
-/// reached — a shortfall against it is a generator that failed to source the
-/// load and nothing else.
+/// The registered duration of a send window: what the workload contract says
+/// this phase offers, and therefore the cap on its due count. A drain flip the
+/// session observes late must not stretch the offer, and a session that died
+/// early is charged only for the ticks its schedule actually reached.
+fn registered_window_duration(kind: SendWindowKind, options: &Options) -> Duration {
+    match kind {
+        SendWindowKind::Steady => options.steady,
+        SendWindowKind::Storm => options.storm_window,
+        SendWindowKind::Post => options.post_storm,
+    }
+}
+
+/// Book this session's share of the offered denominator, once, at the instant
+/// it stops sending. The due count is the registered schedule's demand — the
+/// wall-clock due capped at the window's registered capacity — and the ticks
+/// that demand covers but the ticker never presented before close are booked
+/// to the separate unpresented counter, measured here against the session's
+/// own processed ledger rather than inferred later from the global counters.
+#[allow(clippy::too_many_arguments)]
 fn account_window_ticks(
     shared: &Shared,
     track_schedule: bool,
@@ -1398,15 +1451,26 @@ fn account_window_ticks(
     interval: Duration,
     phase_offset: f64,
     severed: bool,
+    processed: u64,
+    capacity: Option<u64>,
 ) {
     if !track_schedule {
         return;
     }
-    let due = ticks_due_after(started_at.elapsed(), interval, phase_offset);
+    let wall_due = ticks_due_after(started_at.elapsed(), interval, phase_offset);
+    let due = capacity.map_or(wall_due, |cap| wall_due.min(cap));
+    let unpresented = due.saturating_sub(processed);
     shared.lifetime.record_due(due);
+    shared.lifetime.record_unpresented(unpresented);
     match kind {
-        SendWindowKind::Steady => shared.steady.record_due(due),
-        SendWindowKind::Storm if !severed => shared.storm_survivors.record_due(due),
+        SendWindowKind::Steady => {
+            shared.steady.record_due(due);
+            shared.steady.record_unpresented(unpresented);
+        }
+        SendWindowKind::Storm if !severed => {
+            shared.storm_survivors.record_due(due);
+            shared.storm_survivors.record_unpresented(unpresented);
+        }
         SendWindowKind::Post | SendWindowKind::Storm => {}
     }
 }
@@ -1418,34 +1482,59 @@ fn window_schedule_accounting(
     phase_offset: f64,
     fired: u64,
     skipped: u64,
+    processed: u64,
+    capacity: Option<u64>,
 ) -> ScheduleAccounting {
-    schedule_accounting(elapsed, interval, phase_offset, fired, skipped)
+    schedule_accounting(
+        elapsed,
+        interval,
+        phase_offset,
+        fired,
+        skipped,
+        processed,
+        capacity,
+    )
 }
 
 fn open_send_window(
     kind: SendWindowKind,
-    interval: Duration,
+    options: &Options,
     phase_offset: f64,
+    opened_at: tokio::time::Instant,
 ) -> ActiveSendWindow {
-    let started_at = tokio::time::Instant::now();
+    let interval = options.send_interval;
+    // The window starts at the driver's flip instant, shared by every
+    // session. A session that wakes late gets its missed ticks presented
+    // immediately by the Skip ticker — honest lag and skips — instead of a
+    // silently shorter window.
+    let started_at = opened_at;
     let offset = first_tick_offset(interval, phase_offset);
     let mut ticker = tokio::time::interval_at(started_at + offset, interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let capacity = Some(ticks_due_after(
+        registered_window_duration(kind, options),
+        interval,
+        phase_offset,
+    ));
     ActiveSendWindow {
         kind,
         started_at,
         ticker,
+        processed: 0,
+        capacity,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_send_window(
     shared: &Shared,
     track_schedule: bool,
     active: &mut Option<ActiveSendWindow>,
     desired: Option<SendWindowKind>,
-    interval: Duration,
+    options: &Options,
     phase_offset: f64,
     severed: bool,
+    opened_at: tokio::time::Instant,
 ) {
     if active.as_ref().map(|window| window.kind) == desired {
         return;
@@ -1456,21 +1545,24 @@ fn sync_send_window(
             track_schedule,
             window.kind,
             window.started_at,
-            interval,
+            options.send_interval,
             phase_offset,
             severed,
+            window.processed,
+            window.capacity,
         );
     }
     if let Some(kind) = desired {
-        *active = Some(open_send_window(kind, interval, phase_offset));
+        *active = Some(open_send_window(kind, options, phase_offset, opened_at));
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_reconnect_failure(
     shared: &Shared,
     track_schedule: bool,
     active_window: &mut Option<ActiveSendWindow>,
-    interval: Duration,
+    options: &Options,
     phase_offset: f64,
     severed: bool,
     error: String,
@@ -1480,9 +1572,10 @@ fn record_reconnect_failure(
         track_schedule,
         active_window,
         None,
-        interval,
+        options,
         phase_offset,
         severed,
+        tokio::time::Instant::now(),
     );
     shared
         .sessions
@@ -1600,7 +1693,7 @@ async fn hold_session(
     conn: wtransport::Connection,
     endpoint: Arc<ClientEndpoint>,
     storm_permits: Arc<Semaphore>,
-    phase: &mut watch::Receiver<u8>,
+    phase: &mut watch::Receiver<(u8, tokio::time::Instant)>,
     options: &Options,
     phase_offset: f64,
     shared: &Shared,
@@ -1622,23 +1715,35 @@ async fn hold_session(
         let _ = conn.send_datagram(&payload);
     }
 
-    while *phase.borrow() == PHASE_CONNECT {
+    while phase.borrow().0 == PHASE_CONNECT {
         if phase.changed().await.is_err() {
             return;
         }
     }
     let severed = is_severed(index, options.storm_cohort);
+    // A send window whose registered capacity has been fully offered stays
+    // closed until the phase moves on; this remembers which kind is spent so
+    // the loop does not reopen it against the same phase.
+    let mut spent_window: Option<SendWindowKind> = None;
 
     loop {
-        let current = *phase.borrow();
+        let (current, current_flip) = *phase.borrow();
+        if spent_window.is_some() && send_window_kind(current) != spent_window {
+            spent_window = None;
+        }
+        let desired = match send_window_kind(current) {
+            kind if kind == spent_window => None,
+            kind => kind,
+        };
         sync_send_window(
             shared,
             track_schedule,
             &mut active_send_window,
-            send_window_kind(current),
-            options.send_interval,
+            desired,
+            options,
             phase_offset,
             severed,
+            current_flip,
         );
 
         if current == PHASE_STOP {
@@ -1674,7 +1779,7 @@ async fn hold_session(
                         shared,
                         track_schedule,
                         &mut active_send_window,
-                        options.send_interval,
+                        options,
                         phase_offset,
                         severed,
                         e.to_string(),
@@ -1685,7 +1790,10 @@ async fn hold_session(
             continue;
         }
 
-        if current == PHASE_DRAIN || current == PHASE_IDLE {
+        // No live send window to poll: receive-only roles, the drain and idle
+        // phases, and a window that already offered its registered capacity
+        // all wait here for the next phase flip while keeping receives hot.
+        if receive_only || active_send_window.is_none() {
             tokio::select! {
                 changed = phase.changed() => {
                     if changed.is_err() { break; }
@@ -1693,30 +1801,10 @@ async fn hold_session(
                 received = conn.receive_datagram() => {
                     match received {
                         Ok(d) => record_arrival(
-                            d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
+                            d.as_ref(), monotonic_ns(), severed, phase.borrow().0, shared,
                         ),
                         Err(_) => {
-                            record_session_loss(*phase.borrow(), severed, shared);
-                            return;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        if receive_only {
-            tokio::select! {
-                changed = phase.changed() => {
-                    if changed.is_err() { break; }
-                }
-                received = conn.receive_datagram() => {
-                    match received {
-                        Ok(d) => record_arrival(
-                            d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
-                        ),
-                        Err(_) => {
-                            record_session_loss(*phase.borrow(), severed, shared);
+                            record_session_loss(phase.borrow().0, severed, shared);
                             return;
                         }
                     }
@@ -1733,15 +1821,16 @@ async fn hold_session(
                         track_schedule,
                         &mut active_send_window,
                         None,
-                        options.send_interval,
+                        options,
                         phase_offset,
                         severed,
+                        tokio::time::Instant::now(),
                     );
                     break;
                 }
             }
             scheduled = active_send_window.as_mut().expect("send window active").ticker.tick() => {
-                let phase_now = *phase.borrow();
+                let (phase_now, flip_now) = *phase.borrow();
                 let desired_window = send_window_kind(phase_now);
                 let active_kind = active_send_window.as_ref().map(|window| window.kind);
                 if desired_window != active_kind {
@@ -1750,9 +1839,30 @@ async fn hold_session(
                         track_schedule,
                         &mut active_send_window,
                         desired_window,
-                        options.send_interval,
+                        options,
                         phase_offset,
                         severed,
+                        flip_now,
+                    );
+                    continue;
+                }
+                // The registered window has offered everything it is due:
+                // close it and go quiet until the phase moves on.
+                let spent = {
+                    let window = active_send_window.as_ref().expect("send window active");
+                    window.capacity.is_some_and(|cap| window.processed >= cap)
+                };
+                if spent {
+                    spent_window = active_kind;
+                    sync_send_window(
+                        shared,
+                        track_schedule,
+                        &mut active_send_window,
+                        None,
+                        options,
+                        phase_offset,
+                        severed,
+                        flip_now,
                     );
                     continue;
                 }
@@ -1762,12 +1872,26 @@ async fn hold_session(
                 // generator does afterwards is charged to the server.
                 let observed = tokio::time::Instant::now();
                 let actual_ns = monotonic_ns();
-                let observation =
+                let mut observation =
                     observe_tick(scheduled, observed, actual_ns, options.send_interval);
-                let active_kind = active_send_window
-                    .as_ref()
-                    .expect("send window active after resync")
-                    .kind;
+                let active_kind = {
+                    let window = active_send_window
+                        .as_mut()
+                        .expect("send window active after resync");
+                    // The skip count stays inside the window's registered
+                    // capacity: ticks past the registered end belong to no
+                    // window and must not inflate this one's ledger.
+                    if let Some(cap) = window.capacity {
+                        let remaining = cap.saturating_sub(window.processed);
+                        observation.skipped_ticks =
+                            observation.skipped_ticks.min(remaining.saturating_sub(1));
+                    }
+                    window.processed = window
+                        .processed
+                        .saturating_add(1)
+                        .saturating_add(observation.skipped_ticks);
+                    window.kind
+                };
                 shared.lifetime.record_tick(observation);
                 match active_kind {
                     SendWindowKind::Steady => shared.steady.record_tick(observation),
@@ -1797,7 +1921,7 @@ async fn hold_session(
             received = conn.receive_datagram() => {
                 match received {
                     Ok(d) => record_arrival(
-                        d.as_ref(), monotonic_ns(), severed, *phase.borrow(), shared,
+                        d.as_ref(), monotonic_ns(), severed, phase.borrow().0, shared,
                     ),
                     Err(_) => {
                         // A session lost mid-drive still offered whatever its
@@ -1810,9 +1934,10 @@ async fn hold_session(
                             track_schedule,
                             &mut active_send_window,
                             None,
-                            options.send_interval,
+                            options,
                             phase_offset,
                             severed,
+                            tokio::time::Instant::now(),
                         );
                         record_session_loss(current, severed, shared);
                         return;
@@ -1969,38 +2094,117 @@ mod tests {
     #[test]
     fn schedule_accounting_respects_phase_offset_and_reconciles() {
         let interval = Duration::from_millis(250);
-        let aligned = schedule_accounting(Duration::from_millis(600), interval, 0.0, 2, 0);
+        let aligned = schedule_accounting(Duration::from_millis(600), interval, 0.0, 2, 0, 2, None);
         assert_eq!(
             aligned,
             ScheduleAccounting {
                 due: 2,
                 fired: 2,
                 skipped: 0,
+                unpresented: 0,
             }
         );
         assert!(aligned.reconciled());
 
-        let offset = schedule_accounting(Duration::from_millis(600), interval, 1.0, 1, 0);
+        let offset = schedule_accounting(Duration::from_millis(600), interval, 1.0, 1, 0, 1, None);
         assert_eq!(
             offset,
             ScheduleAccounting {
                 due: 1,
                 fired: 1,
                 skipped: 0,
+                unpresented: 0,
             }
         );
         assert!(offset.reconciled());
 
-        let skipped = schedule_accounting(Duration::from_millis(875), interval, 1.0, 2, 1);
+        let skipped = schedule_accounting(Duration::from_millis(875), interval, 1.0, 2, 1, 3, None);
         assert_eq!(
             skipped,
             ScheduleAccounting {
                 due: 3,
                 fired: 2,
                 skipped: 1,
+                unpresented: 0,
             }
         );
         assert!(skipped.reconciled());
+    }
+
+    #[test]
+    fn schedule_accounting_measures_the_window_close_boundary_as_unpresented() {
+        let interval = Duration::from_millis(250);
+        // The wall clock made three ticks due but the session's loop only
+        // processed two before the window closed: the remainder is measured
+        // as unpresented and the ledger still reconciles exactly.
+        let boundary =
+            schedule_accounting(Duration::from_millis(800), interval, 0.0, 2, 0, 2, None);
+        assert_eq!(
+            boundary,
+            ScheduleAccounting {
+                due: 3,
+                fired: 2,
+                skipped: 0,
+                unpresented: 1,
+            }
+        );
+        assert!(boundary.reconciled());
+    }
+
+    #[test]
+    fn schedule_accounting_caps_due_at_the_registered_capacity() {
+        let interval = Duration::from_millis(250);
+        // The drain flip was observed late — the wall clock says 4 ticks —
+        // but the registered window only demanded 3; the offer is the
+        // registered demand, not the stretched wall clock.
+        let capped = schedule_accounting(
+            Duration::from_millis(1_100),
+            interval,
+            0.0,
+            3,
+            0,
+            3,
+            Some(3),
+        );
+        assert_eq!(
+            capped,
+            ScheduleAccounting {
+                due: 3,
+                fired: 3,
+                skipped: 0,
+                unpresented: 0,
+            }
+        );
+        assert!(capped.reconciled());
+
+        // A session that died early is charged only for what its schedule
+        // reached, still under the cap.
+        let early =
+            schedule_accounting(Duration::from_millis(600), interval, 0.0, 1, 0, 1, Some(3));
+        assert_eq!(early.due, 2);
+        assert_eq!(early.unpresented, 1);
+        assert!(early.reconciled());
+    }
+
+    #[test]
+    fn schedule_accounting_refuses_to_reconcile_an_overfired_ledger() {
+        let interval = Duration::from_millis(250);
+        // More ticks processed than the registered demand allows: the
+        // unpresented remainder saturates at zero rather than going negative,
+        // and the ledger must NOT reconcile — that imbalance is a real
+        // accounting defect, not a boundary artifact.
+        let overfired = schedule_accounting(
+            Duration::from_millis(1_100),
+            interval,
+            0.0,
+            5,
+            0,
+            5,
+            Some(3),
+        );
+        assert_eq!(overfired.due, 3);
+        assert_eq!(overfired.unpresented, 0);
+        assert!(!overfired.reconciled());
     }
 
     #[test]
@@ -2025,14 +2229,19 @@ mod tests {
                 kind: SendWindowKind::Storm,
                 started_at: tokio::time::Instant::now() - Duration::from_millis(3600),
                 ticker: tokio::time::interval(Duration::from_secs(1)),
+                processed: 4,
+                capacity: None,
             });
-            let interval = Duration::from_secs(1);
+            let options = Options {
+                send_interval: Duration::from_secs(1),
+                ..Options::defaults()
+            };
 
             record_reconnect_failure(
                 &shared,
                 true,
                 &mut active_window,
-                interval,
+                &options,
                 0.0,
                 false,
                 "storm reconnect failed".to_string(),
@@ -2052,6 +2261,11 @@ mod tests {
                     .counters
                     .ticks_skipped
                     .load(Ordering::Relaxed),
+                unpresented: shared
+                    .lifetime
+                    .counters
+                    .ticks_unpresented
+                    .load(Ordering::Relaxed),
             };
             assert_eq!(
                 accounting,
@@ -2059,6 +2273,7 @@ mod tests {
                     due: 4,
                     fired: 3,
                     skipped: 1,
+                    unpresented: 0,
                 }
             );
             assert!(accounting.reconciled());
@@ -2314,8 +2529,10 @@ mod tests {
     #[test]
     fn schedule_windows_reanchor_after_drain() {
         let interval = Duration::from_millis(250);
-        let steady = window_schedule_accounting(Duration::from_millis(600), interval, 0.0, 2, 0);
-        let storm = window_schedule_accounting(Duration::from_millis(375), interval, 0.0, 1, 1);
+        let steady =
+            window_schedule_accounting(Duration::from_millis(600), interval, 0.0, 2, 0, 2, None);
+        let storm =
+            window_schedule_accounting(Duration::from_millis(375), interval, 0.0, 1, 1, 2, None);
 
         assert_eq!(
             steady,
@@ -2323,6 +2540,7 @@ mod tests {
                 due: 2,
                 fired: 2,
                 skipped: 0,
+                unpresented: 0,
             }
         );
         assert_eq!(
@@ -2331,6 +2549,7 @@ mod tests {
                 due: 2,
                 fired: 1,
                 skipped: 1,
+                unpresented: 0,
             }
         );
         assert!(steady.reconciled());

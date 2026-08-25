@@ -71,6 +71,7 @@ function measurementWindow(
 		scheduleTicksDue: 101,
 		scheduleTicksFired: 100,
 		scheduleTicksSkipped: 1,
+		scheduleTicksUnpresented: 0,
 		scheduleTicksReconciled: true,
 		rxSnapshot: 80,
 		rxAck: 9,

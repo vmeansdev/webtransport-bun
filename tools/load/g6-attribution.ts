@@ -1,6 +1,8 @@
 import {
 	actionEveryNthTick,
 	armShape,
+	exactStaggeredWindowDue,
+	exactTicksDueAfter,
 	G6_CLOSEOUT_SPEC_ID,
 	G6_CLOSEOUT_SPEC_PATH,
 	MOVE_HZ,
@@ -189,31 +191,19 @@ type ValidationResult = {
 	reasons: string[];
 };
 
-function exactTicksDueAfter(
-	durationSec: number,
-	intervalSec: number,
-	phaseOffset: number,
-): number {
-	if (!(durationSec > 0) || !(intervalSec > 0)) return 0;
-	const clampedPhase = Math.min(1, Math.max(0, phaseOffset));
-	const firstTickSec = intervalSec / 2 + intervalSec * clampedPhase;
-	if (durationSec < firstTickSec) return 0;
-	const epsilon = intervalSec * 1e-9;
-	return Math.floor((durationSec - firstTickSec + epsilon) / intervalSec) + 1;
-}
-
 function exactMoveDue(
 	sessions: number,
 	durationSec: number,
 	movePps: number,
 ): number {
 	if (sessions <= 0 || movePps <= 0) return 0;
-	const intervalSec = 1 / movePps;
-	let total = 0;
-	for (let index = 0; index < sessions; index += 1) {
-		total += exactTicksDueAfter(durationSec, intervalSec, index / sessions);
-	}
-	return total;
+	return exactStaggeredWindowDue({
+		durationSec,
+		intervalSec: 1 / movePps,
+		totalSessions: sessions,
+		startIndex: 0,
+		count: sessions,
+	});
 }
 
 function exactAckDue(

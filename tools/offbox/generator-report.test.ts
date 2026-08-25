@@ -106,7 +106,10 @@ function mmoRun(overrides: MmoOverrides = {}): string[] {
 					steady: {
 						sent,
 						sendErr,
+						scheduleTicksDue: sent + sendErr,
 						scheduleTicksFired: sent,
+						scheduleTicksSkipped: sendErr,
+						scheduleTicksUnpresented: 0,
 						scheduleTicksReconciled: overrides.scheduleLagReconciled ?? true,
 						scheduleLag,
 					},
@@ -430,7 +433,56 @@ describe("provenance", () => {
 		expect(report.latencyJson).toBeNull();
 		expect(report.problems.join(" ")).toContain("scheduleTicksReconciled");
 	});
+
+	test("a v2 ledger that does not balance is rejected even when the boolean claims reconciliation", () => {
+		const tampered = tamperSteadyWindow(
+			[
+				...provenance(),
+				...mmoRun({ schema: "mmo-client/2" }),
+				"macgen: exit=0",
+			],
+			(steady) => {
+				steady.scheduleTicksDue = (steady.scheduleTicksDue as number) + 1;
+				steady.scheduleTicksReconciled = true;
+			},
+		);
+		const report = parseGeneratorReport(tampered, SHA, HASH);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain(
+			"schedule ledger did not reconcile from raw counters",
+		);
+	});
+
+	test("an mmo-client/2 report without the unpresented counter is rejected", () => {
+		const missing = tamperSteadyWindow(
+			[
+				...provenance(),
+				...mmoRun({ schema: "mmo-client/2" }),
+				"macgen: exit=0",
+			],
+			(steady) => {
+				delete steady.scheduleTicksUnpresented;
+			},
+		);
+		const report = parseGeneratorReport(missing, SHA, HASH);
+		expect(report.latencyJson).toBeNull();
+		expect(report.problems.join(" ")).toContain("mmo-client/2 floor shape");
+	});
 });
+
+function tamperSteadyWindow(
+	lines: string[],
+	mutate: (steady: Record<string, unknown>) => void,
+): string {
+	return lines
+		.map((line) => {
+			if (!line.startsWith("mmo-client: json ")) return line;
+			const value = JSON.parse(line.slice("mmo-client: json ".length));
+			mutate(value.windows.steady);
+			return `mmo-client: json ${JSON.stringify(value)}`;
+		})
+		.join("\n");
+}
 
 describe("the off-box floor", () => {
 	test("a floor from the generator host is usable", () => {

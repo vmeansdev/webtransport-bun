@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { evaluateG6, type G6EvaluationRequest } from "./g6-evaluate.ts";
+import { exactStaggeredWindowDue } from "./g6-plan.ts";
 import {
 	armShape,
 	G6_CLOSEOUT_SPEC_ID,
@@ -52,6 +53,7 @@ function emptyWindow(): Json {
 		scheduleTicksDue: 0,
 		scheduleTicksFired: 0,
 		scheduleTicksSkipped: 0,
+		scheduleTicksUnpresented: 0,
 		scheduleTicksReconciled: true,
 		rxSnapshot: 0,
 		rxAck: 0,
@@ -223,7 +225,13 @@ function rawReports(realm: Json): Json {
 }
 
 function steadyArm(sessions: number): Json {
-	const upstream = sessions * 4 * STEADY_SECONDS;
+	const upstream = exactStaggeredWindowDue({
+		durationSec: STEADY_SECONDS,
+		intervalSec: 0.25,
+		totalSessions: sessions,
+		startIndex: 0,
+		count: sessions,
+	});
 	const snapshots = sessions * 15 * STEADY_SECONDS;
 	const acks = sessions * 0.5 * STEADY_SECONDS;
 	const steady = sendWindow(upstream);
@@ -354,7 +362,13 @@ function hotspotArm(): Json {
 function stormArm(cohort: number): Json {
 	const arm = steadyArm(5000);
 	const survivors = 5000 - cohort;
-	const survivorSent = survivors * 4 * 120;
+	const survivorSent = exactStaggeredWindowDue({
+		durationSec: 120,
+		intervalSec: 0.25,
+		totalSessions: 5000,
+		startIndex: cohort,
+		count: survivors,
+	});
 	const survivorAcks = survivors * 0.5 * 120;
 	const survivorSnapshots = survivors * 15 * 120;
 	const survivorWindow = {
@@ -527,7 +541,13 @@ function floorTranscript(
 	} = {},
 ): string {
 	const sessions = input.sessions ?? 20;
-	const fired = sessions * 4 * 5;
+	const fired = exactStaggeredWindowDue({
+		durationSec: 5,
+		intervalSec: 0.25,
+		totalSessions: sessions,
+		startIndex: 0,
+		count: sessions,
+	});
 	const floor = report({
 		sessions,
 		steadySeconds: 5,

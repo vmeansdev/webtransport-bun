@@ -341,3 +341,54 @@ export const SINK_DELIVERY_FLOOR = 0.995;
 export const HISTOGRAM_SKEW_FRACTION = 0.001;
 /** Little's-law band around the client's permit pool (§7 V-L). */
 export const LITTLE_BAND = 0.2;
+
+/**
+ * The exact tick count a session's registered schedule makes due over a
+ * window. This is the same arithmetic the Rust client uses — first tick at
+ * half an interval plus the session's stagger fraction, then one tick per
+ * interval — so an evaluator comparing a client's due counter against this
+ * value is comparing two computations of one registered schedule, not a
+ * measurement against an approximation. The epsilon absorbs float error on
+ * offsets that land exactly on a tick boundary.
+ */
+export function exactTicksDueAfter(
+	durationSec: number,
+	intervalSec: number,
+	phaseOffset: number,
+): number {
+	if (!(durationSec > 0) || !(intervalSec > 0)) return 0;
+	const clampedPhase = Math.min(1, Math.max(0, phaseOffset));
+	const firstTickSec = intervalSec / 2 + intervalSec * clampedPhase;
+	if (durationSec < firstTickSec) return 0;
+	const epsilon = intervalSec * 1e-9;
+	return Math.floor((durationSec - firstTickSec + epsilon) / intervalSec) + 1;
+}
+
+/**
+ * The exact total due for a staggered population slice: sessions
+ * `startIndex..startIndex + count` of a `totalSessions`-strong fleet, each
+ * offset by `index / totalSessions` of an interval exactly as the client
+ * staggers them. The realm arms use the whole fleet, the storm-survivor
+ * window uses the indices past the severed cohort, and a single-session role
+ * is the slice of one.
+ */
+export function exactStaggeredWindowDue(options: {
+	durationSec: number;
+	intervalSec: number;
+	totalSessions: number;
+	startIndex: number;
+	count: number;
+}): number {
+	const { durationSec, intervalSec, totalSessions, startIndex, count } =
+		options;
+	if (totalSessions <= 0 || count <= 0) return 0;
+	let total = 0;
+	for (let offset = 0; offset < count; offset += 1) {
+		total += exactTicksDueAfter(
+			durationSec,
+			intervalSec,
+			(startIndex + offset) / totalSessions,
+		);
+	}
+	return total;
+}
