@@ -46,10 +46,33 @@ say.
    deploy time.
 3. **Codec-test alignment.** Three expectations in the imported
    `latency-instrumentation.test.ts` updated to the v3 stamp decode shape
-   (fields the current shared codec returns; no threshold involved).
+   (fields the current shared codec returns; no threshold involved), plus
+   `g2-offbox.test.ts` gaining the subnet-declaration cases of delta 1.
+4. **Instrument restoration.** The intervening G6 refactor had stripped
+   `load-client`'s latency mode (`--latency-stamp`/`--arrival`/`--tick-hz`
+   and its probe), and the binary swallows unknown flags silently — the
+   critic's review caught that the pinned instrument could not measure.
+   `crates/reference/src/load_client.rs` is restored byte-for-byte from
+   `a1e18fd9`; the shared `latency_probe.rs` gains only per-bin
+   `#[allow(dead_code)]` on its v3-only items.
+5. **Reproducible host falsifier.** The classifier's O2 no longer imports
+   the home-cable constant: the conductor records the declared prefix in
+   each cell's generator fragment (`dataSubnetPrefix`), and O2 grades
+   `urlHost` against the *artifact's* recorded prefix — historical
+   artifacts without the field grade under `10.99.0` unchanged, and the
+   family-LAN refusal is unconditional either way. The independent re-grade
+   must assert the recorded prefix equals the registered `10.110.0` and
+   that every off-box `urlHost` is inside it.
+6. **Entry-twin binding.** At grade time, the manifest's `entrySha256` must
+   equal the sha256 of `tools/offbox/linux-generator-entry-g2.sh` as read
+   from the candidate tree (`git show <candidate>:…`) — a deploy-time pin
+   alone would let a doctored twin pin itself. The dispatch environment
+   sets `LATENCY_RTT_OFFBOX_ENTRY` explicitly; the conductor's manifest
+   `preregistration` field is inherited-stale (it names the home gate's
+   page) and runs under this dispatch are governed by this document.
 
 Everything else in the imported suite is unchanged from `a1e18fd9`; the
-port commit is the candidate below.
+candidate below carries all six deltas.
 
 ## 4. Identities
 

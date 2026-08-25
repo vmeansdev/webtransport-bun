@@ -48,13 +48,20 @@ const OFFSET_CLASS: usize = 44;
 /// version-2 stamp, which carries no class byte, decodes as the unremarkable
 /// case rather than as something a G6 rule keys off.
 pub const CLASS_MOVE: u8 = 0;
+// The v3 vocabulary below is per-bin dead code: every binary includes this
+// module via `mod`, and the version-2 bins (load-client) never touch it.
+#[allow(dead_code)]
 pub const CLASS_ACTION: u8 = 1;
+#[allow(dead_code)]
 pub const CLASS_ACK: u8 = 2;
+#[allow(dead_code)]
 pub const CLASS_SNAPSHOT: u8 = 3;
+#[allow(dead_code)]
 pub const CLASS_RAID: u8 = 4;
 /// A raid subscriber's one-datagram hello: the server has no path to key a role
 /// off, so a receive-only session says what it is once. Not load, and excluded
 /// from every rate.
+#[allow(dead_code)]
 pub const CLASS_RAID_JOIN: u8 = 5;
 
 /// Write the 36-byte header in place. The caller owns the padding beyond it.
@@ -75,6 +82,7 @@ pub fn write_stamp(buf: &mut [u8], intended_ns: u64, actual_ns: u64, sequence: u
 ///
 /// `echo_actual` and `hold_ns` belong to the server and are left zero; `class`
 /// is what tells a movement tick from an action the server must acknowledge.
+#[allow(dead_code)]
 pub fn write_stamp_v3(buf: &mut [u8], intended_ns: u64, actual_ns: u64, sequence: u64, class: u8) {
     debug_assert!(buf.len() >= STAMP_BYTES_V3);
     buf[0..2].copy_from_slice(&STAMP_MAGIC.to_le_bytes());
