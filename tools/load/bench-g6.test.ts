@@ -1,20 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import {
-	buildBenchArtifact,
-	clientWindow,
-	clientProcessFailureReasons,
-	chooseClientProvenance,
-	compareWindowDelivery,
 	type BoundaryMarks,
 	type BoundarySnapshot,
-	type ClientReportV2,
+	buildBenchArtifact,
+	buildRetainedG6ClientRoleEvidence,
 	type ClientMeasurementWindow,
+	type ClientReportV2,
+	chooseClientProvenance,
+	clientProcessFailureReasons,
+	clientWindow,
+	compareWindowDelivery,
 	deltaBoundarySnapshot,
 	deriveBoundaryWindows,
+	indexClientBundlesByLaunchRole,
 	nextEmitterWindowState,
 	readPhaseMarker,
+	renderRetainedG6ClientRoleLog,
 	requireClientReportIdentity,
-	indexClientBundlesByLaunchRole,
 	summarizePhaseBarrier,
 	validateSourceBinding,
 	windowReceiveTotal,
@@ -617,6 +619,58 @@ describe("bench artifact", () => {
 });
 
 describe("client provenance selection", () => {
+	test("retains every arm's raw role report and process log in one sidecar", () => {
+		const preRegistration = {
+			id: G6_CLOSEOUT_SPEC_ID,
+			path: G6_CLOSEOUT_SPEC_PATH,
+			sha256:
+				"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		};
+		const evidence = buildRetainedG6ClientRoleEvidence(
+			{
+				preRegistration,
+				source: { candidateSha: "1".repeat(40) },
+				arms: [
+					{
+						arm: "steady-500",
+						sessions: 500,
+						rawReports: {
+							realm: { schema: "mmo-client/2", role: "realm" },
+							realmProvenance: ["macgen: host=mac-generator"],
+							realmStdout: ["mmo-client: phase steady"],
+							realmStderr: ["diagnostic"],
+							realmExitCode: 0,
+							realmOutputTruncated: false,
+						},
+					},
+				],
+			},
+			"realm",
+		);
+
+		expect(evidence).toMatchObject({
+			schema: "g6-client-role-evidence/1",
+			role: "realm",
+			preRegistration,
+			records: [
+				{
+					arm: "steady-500",
+					report: { schema: "mmo-client/2", role: "realm" },
+					stdoutLines: ["mmo-client: phase steady"],
+					stderrLines: ["diagnostic"],
+					exitCode: 0,
+					outputTruncated: false,
+				},
+			],
+		});
+		expect(renderRetainedG6ClientRoleLog(evidence)).toContain(
+			"stdout: mmo-client: phase steady",
+		);
+		expect(renderRetainedG6ClientRoleLog(evidence)).toContain(
+			"stderr: diagnostic",
+		);
+	});
+
 	test("preserves launch-owned side-role failures before either client emits JSON", () => {
 		const byRole = indexClientBundlesByLaunchRole(
 			["raid-subscriber", "publisher"] as const,

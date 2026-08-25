@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -11,39 +11,44 @@ import {
 import { cpus, hostname, tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import { createServer } from "../../packages/webtransport/src/index.ts";
-import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
+import { generateCertForNames } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
+	type GeneratorReport,
+	parseGeneratorReport,
+} from "../offbox/generator-report.ts";
+import { canonicalGeneratorIdentity } from "../offbox/host-identity.ts";
+import {
+	type ClientReportV2,
 	clientWindow,
+	type EmitterPhase,
 	readPhaseMarker,
 	requireClientReportIdentity,
-	type ClientReportV2,
-	type EmitterPhase,
 } from "./g6-artifact.ts";
 import {
-	G6_ATTRIBUTION_SCHEMA,
-	buildLaneContract,
-	buildBalancedLaneOrder,
-	buildSharedAttributionPlan,
-	buildSharedAttributionServerSettings,
-	evaluateAttributionOutcome,
-	defaultPreRegistration,
-	validateAttributionIdentity,
-	type AttributionServerSettings,
-	type AttributionRequiredMeasurements,
 	type AttributionIdentityLeg,
 	type AttributionLane,
+	type AttributionRequiredMeasurements,
+	type AttributionServerSettings,
+	buildBalancedLaneOrder,
+	buildLaneContract,
+	buildSharedAttributionPlan,
+	buildSharedAttributionServerSettings,
+	defaultPreRegistration,
+	evaluateAttributionOutcome,
+	G6_ATTRIBUTION_SCHEMA,
 	type LaneContract,
 	type SharedAttributionPlan,
+	validateAttributionIdentity,
 } from "./g6-attribution.ts";
+import { G6_CLOSEOUT_SPEC_PATH } from "./g6-plan.ts";
 import {
-	REGISTERED_G6_SERVER_CORE_PLAN,
 	createG6ServerCore,
 	freshG6ServerState,
 	type G6ServerCoreInstrumentationSwitches,
 	type G6ServerCoreSession,
+	REGISTERED_G6_SERVER_CORE_PLAN,
 	type ServerState,
 } from "./g6-server-core.ts";
-import { G6_CLOSEOUT_SPEC_PATH } from "./g6-plan.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 
 type InternalSession = G6ServerCoreSession & {
@@ -71,6 +76,18 @@ type ProcessSnapshot = {
 	};
 };
 
+const MAX_ATTRIBUTION_OUTPUT_LINES = 100_000;
+
+export function retainAttributionOutputLine(
+	lines: string[],
+	line: string,
+	maxLines = MAX_ATTRIBUTION_OUTPUT_LINES,
+): boolean {
+	if (lines.length >= maxLines) return false;
+	lines.push(line);
+	return true;
+}
+
 export type AttributionTlsBundle = {
 	certPem: string;
 	keyPem: string;
@@ -84,9 +101,189 @@ export type ClientRunResult = {
 	phaseMarkers: string[];
 	stdoutLines: string[];
 	stderrLines: string[];
+	outputTruncated: boolean;
 	exitCode: number;
 	jsonPath: string;
+	clientBinarySha256: string;
+	generatorHost: string;
 };
+
+export type AttributionClientExecution =
+	| { kind: "local" }
+	| {
+			kind: "offbox";
+			sshDestination: string;
+			serverAddress: string;
+			candidateSha: string;
+			expectedBinarySha256: string | null;
+			expectedGeneratorHost: string;
+	  };
+
+export type AttributionClientInvocation = {
+	command: string;
+	args: string[];
+};
+
+export type ValidatedOffboxGeneratorProvenance = {
+	generatorHost: string;
+	binarySha256: string;
+};
+
+export type AttributionTerminalStatus = "INVALID" | "ABORTED";
+
+export type AttributionFailureEvidence = {
+	terminalStatus: AttributionTerminalStatus;
+	stage: string;
+	message: string;
+	exitCode: number | null;
+	stdoutLines: string[];
+	stderrLines: string[];
+	outputTruncated: boolean;
+};
+
+export class AttributionExecutionError extends Error {
+	readonly evidence: AttributionFailureEvidence;
+
+	constructor(evidence: AttributionFailureEvidence) {
+		super(evidence.message);
+		this.name = "AttributionExecutionError";
+		this.evidence = evidence;
+	}
+}
+
+export function combineAttributionCleanupFailure(
+	primary: unknown | null,
+	cleanup: unknown,
+	stage: string,
+): AttributionExecutionError {
+	const cleanupMessage =
+		cleanup instanceof Error ? cleanup.message : String(cleanup);
+	if (primary instanceof AttributionExecutionError) {
+		const stderrLines = [...primary.evidence.stderrLines];
+		const cleanupRetained = retainAttributionOutputLine(
+			stderrLines,
+			`${stage}: ${cleanupMessage}`,
+		);
+		return new AttributionExecutionError({
+			...primary.evidence,
+			message: `${primary.evidence.message}; ${stage}: ${cleanupMessage}`,
+			stderrLines,
+			outputTruncated: primary.evidence.outputTruncated || !cleanupRetained,
+		});
+	}
+	const primaryMessage =
+		primary === null
+			? null
+			: primary instanceof Error
+				? primary.message
+				: String(primary);
+	return new AttributionExecutionError({
+		terminalStatus: primary === null ? "ABORTED" : "INVALID",
+		stage,
+		message: [primaryMessage, cleanupMessage].filter(Boolean).join("; "),
+		exitCode: null,
+		stdoutLines: [],
+		stderrLines: [`${stage}: ${cleanupMessage}`],
+		outputTruncated: false,
+	});
+}
+
+export function classifyAttributionClientExit(
+	exitCode: number,
+): AttributionTerminalStatus {
+	return exitCode === -1 || exitCode === 4 || exitCode === 255
+		? "ABORTED"
+		: "INVALID";
+}
+
+type AttributionFailureLeg = {
+	schema: "g6-attribution-leg/1";
+	lane: AttributionLane;
+	orderIndex: number;
+	preRegistration: ReturnType<typeof defaultPreRegistration>;
+	hostIdentity: string;
+	candidateSha: string;
+	identityLeg: { candidateSha: string };
+	rawProcessReports: { client: string; server: string };
+	failure: AttributionFailureEvidence;
+};
+
+type AttributionFailureProcess = {
+	schema: "g6-attribution-process/1";
+	process: "client" | "server";
+	lane: AttributionLane;
+	orderIndex: number;
+	preRegistration: ReturnType<typeof defaultPreRegistration>;
+	candidateSha: string;
+	hostIdentity: string;
+	binarySha256: string | null;
+	failure: AttributionFailureEvidence;
+	stdoutLines: string[];
+	stderrLines: string[];
+	outputTruncated: boolean;
+};
+
+export function buildAttributionFailureArtifacts(options: {
+	lane: AttributionLane;
+	orderIndex: number;
+	preRegistrationSha256: string;
+	candidateSha: string;
+	hostIdentity: string;
+	clientBinarySha256: string | null;
+	serverBinarySha256: string | null;
+	failure: AttributionFailureEvidence;
+}): {
+	legPath: string;
+	clientPath: string;
+	serverPath: string;
+	leg: AttributionFailureLeg;
+	client: AttributionFailureProcess;
+	server: AttributionFailureProcess;
+} {
+	const prefix = `${String(options.orderIndex).padStart(2, "0")}-${options.lane}`;
+	const legPath = `legs/${prefix}.json`;
+	const { client: clientPath, server: serverPath } =
+		attributionRawProcessReportNames(options.orderIndex, options.lane);
+	const preRegistration = defaultPreRegistration(options.preRegistrationSha256);
+	const process = (
+		kind: "client" | "server",
+		binarySha256: string | null,
+	): AttributionFailureProcess => ({
+		schema: "g6-attribution-process/1",
+		process: kind,
+		lane: options.lane,
+		orderIndex: options.orderIndex,
+		preRegistration,
+		candidateSha: options.candidateSha,
+		hostIdentity: options.hostIdentity,
+		binarySha256,
+		failure: options.failure,
+		outputTruncated: options.failure.outputTruncated,
+		stdoutLines: kind === "client" ? options.failure.stdoutLines : [],
+		stderrLines:
+			kind === "client"
+				? options.failure.stderrLines
+				: [options.failure.message],
+	});
+	return {
+		legPath,
+		clientPath,
+		serverPath,
+		leg: {
+			schema: "g6-attribution-leg/1",
+			lane: options.lane,
+			orderIndex: options.orderIndex,
+			preRegistration,
+			hostIdentity: options.hostIdentity,
+			candidateSha: options.candidateSha,
+			identityLeg: { candidateSha: options.candidateSha },
+			rawProcessReports: { client: clientPath, server: serverPath },
+			failure: options.failure,
+		},
+		client: process("client", options.clientBinarySha256),
+		server: process("server", options.serverBinarySha256),
+	};
+}
 
 export type AttributionLegManifest = {
 	schema: "g6-attribution-leg/1";
@@ -105,7 +302,12 @@ export type AttributionLegManifest = {
 	phaseMarkers: string[];
 	stdoutLines: string[];
 	stderrLines: string[];
+	outputTruncated: boolean;
 	rawServer: Record<string, unknown>;
+	rawProcessReports: {
+		client: string;
+		server: string;
+	};
 	identityLeg: AttributionIdentityLeg;
 };
 
@@ -121,11 +323,155 @@ export type LegExecutionOptions = {
 	candidateSha: string;
 	clientBinary: string;
 	clientBinarySha256: string;
+	clientExecution: AttributionClientExecution;
 	rustServerBinary: string;
 	rustServerBinarySha256: string;
 	tls: AttributionTlsBundle;
 	preRegistrationSha256: string;
 };
+
+export function attributionHostIdentity(
+	runnerHost: string,
+	generatorHost: string,
+): string {
+	return `runner=${canonicalGeneratorIdentity(runnerHost)};generator=${canonicalGeneratorIdentity(generatorHost)}`;
+}
+
+export function buildAttributionClientInvocation(options: {
+	clientBinary: string;
+	clientArgs: string[];
+	jsonPath: string;
+	deadlineSeconds: number;
+	execution: AttributionClientExecution;
+}): AttributionClientInvocation {
+	if (options.execution.kind === "local") {
+		return {
+			command: options.clientBinary,
+			args: [...options.clientArgs, "--json-out", options.jsonPath],
+		};
+	}
+	if (!/^[0-9a-f]{40}$/.test(options.execution.candidateSha)) {
+		throw new Error(
+			"g6-attribution: off-box candidate must be exact lowercase 40-hex",
+		);
+	}
+	if (
+		options.execution.sshDestination.length === 0 ||
+		options.execution.serverAddress.length === 0
+	) {
+		throw new Error(
+			"g6-attribution: off-box ssh destination and server address are required",
+		);
+	}
+	return {
+		command: "ssh",
+		args: [
+			"-o",
+			"BatchMode=yes",
+			options.execution.sshDestination,
+			"tools/offbox/mac-generator-entry-g6.sh",
+			"--candidate",
+			options.execution.candidateSha,
+			"--bin",
+			"mmo-client",
+			"--deadline",
+			String(options.deadlineSeconds),
+			"--",
+			...options.clientArgs,
+		],
+	};
+}
+
+export function validateOffboxGeneratorProvenance(
+	report: Pick<GeneratorReport, "provenance" | "problems">,
+	expectedCandidateSha: string,
+	expectedBinarySha256: string | null,
+	expectedGeneratorHost: string,
+): ValidatedOffboxGeneratorProvenance {
+	if (report.problems.length > 0) {
+		throw new Error(
+			`g6-attribution: off-box generator invalid: ${report.problems.join("; ")}`,
+		);
+	}
+	const provenance = report.provenance;
+	if (
+		provenance.candidate !== expectedCandidateSha ||
+		provenance.head !== expectedCandidateSha ||
+		provenance.dirty !== false ||
+		provenance.exitCode !== 0 ||
+		provenance.watchdogFired
+	) {
+		throw new Error(
+			"g6-attribution: off-box generator source/exit provenance mismatch",
+		);
+	}
+	if (!provenance.host || !provenance.binarySha256) {
+		throw new Error(
+			"g6-attribution: off-box generator omitted host or binary sha256",
+		);
+	}
+	const generatorHost = canonicalGeneratorIdentity(provenance.host);
+	if (generatorHost !== expectedGeneratorHost) {
+		throw new Error(
+			`g6-attribution: generator host ${generatorHost} did not match ${expectedGeneratorHost}`,
+		);
+	}
+	if (
+		expectedBinarySha256 !== null &&
+		provenance.binarySha256 !== expectedBinarySha256
+	) {
+		throw new Error(
+			`g6-attribution: off-box generator binary sha256 ${provenance.binarySha256} did not match ${expectedBinarySha256}`,
+		);
+	}
+	return {
+		generatorHost,
+		binarySha256: provenance.binarySha256,
+	};
+}
+
+export function attributionRawProcessReportNames(
+	orderIndex: number,
+	lane: AttributionLane,
+): { client: string; server: string } {
+	const prefix = `${String(orderIndex).padStart(2, "0")}-${lane}`;
+	return {
+		client: `raw/${prefix}-client.json`,
+		server: `raw/${prefix}-server.json`,
+	};
+}
+
+export function renderAttributionRawProcessReport(
+	manifest: AttributionLegManifest,
+	processKind: "client" | "server",
+): string {
+	return `${JSON.stringify(
+		{
+			schema: "g6-attribution-process/1",
+			process: processKind,
+			lane: manifest.lane,
+			orderIndex: manifest.orderIndex,
+			preRegistration: manifest.preRegistration,
+			candidateSha: manifest.candidateSha,
+			hostIdentity: manifest.hostIdentity,
+			binarySha256:
+				processKind === "client"
+					? manifest.clientBinarySha256
+					: manifest.serverBinarySha256,
+			report:
+				processKind === "client" ? manifest.clientReport : manifest.rawServer,
+			...(processKind === "client"
+				? {
+						stdoutLines: manifest.stdoutLines,
+						stderrLines: manifest.stderrLines,
+						outputTruncated: manifest.outputTruncated,
+					}
+				: {}),
+		},
+		null,
+		2,
+	)}\n`;
+}
 
 export type AggregateResult = {
 	schema: "g6-attribution/1";
@@ -133,7 +479,7 @@ export type AggregateResult = {
 	preRegistration: ReturnType<typeof defaultPreRegistration>;
 	plan: SharedAttributionPlan;
 	candidateSha: string;
-	clientBinarySha256: string;
+	clientBinarySha256: string | null;
 	rustServerBinarySha256: string;
 	legOrder: AttributionLane[];
 	legs: string[];
@@ -155,7 +501,9 @@ export type AggregateResult = {
 	};
 	identity: ReturnType<typeof validateAttributionIdentity>;
 	outcome: ReturnType<typeof evaluateAttributionOutcome>;
-	profiles: { available: false; reason: string };
+	profiles: { available: false; reason: string; files: [] };
+	terminalStatus?: AttributionTerminalStatus;
+	failure?: AttributionFailureEvidence;
 };
 
 export type IdleBand = {
@@ -181,13 +529,13 @@ export type MatrixProvenance = {
 type MatrixProvenanceDeps = {
 	candidateSha: () => string;
 	assertCleanTree: () => void;
-	buildReferenceBinaries: () => void | MatrixBuildProvenance;
+	buildReferenceBinaries: () => undefined | MatrixBuildProvenance;
 	fileExists: (path: string) => boolean;
 	hashFile: (path: string) => string;
 };
 
 export async function withAttributionRunContext<T>(
-	options: { outDir: string },
+	options: { outDir: string; serverNames?: string[] },
 	run: (context: {
 		outDir: string;
 		tls: AttributionTlsBundle;
@@ -198,10 +546,24 @@ export async function withAttributionRunContext<T>(
 	try {
 		return await run({
 			outDir: options.outDir,
-			tls: buildTlsBundle(tlsDir),
+			tls: buildTlsBundle(
+				tlsDir,
+				options.serverNames ?? ["localhost", "127.0.0.1"],
+			),
 		});
 	} finally {
 		rmSync(tlsDir, { recursive: true, force: true });
+	}
+}
+
+export async function withAttributionLegScratchDirectory<T>(
+	run: (scratchDir: string) => Promise<T> | T,
+): Promise<T> {
+	const scratchDir = mkdtempSync(join(tmpdir(), "g6-attribution-leg-"));
+	try {
+		return await run(scratchDir);
+	} finally {
+		rmSync(scratchDir, { recursive: true, force: true });
 	}
 }
 
@@ -554,16 +916,23 @@ export async function runClientLeg(options: {
 	idleSec: number;
 	drainMs: number;
 	clientBinary: string;
+	clientBinarySha256: string;
+	candidateSha: string;
+	execution: AttributionClientExecution;
 	jsonPath: string;
 	startedAt: string;
 	preRegistrationSha256: string;
 	onPhaseMarker: (phase: string) => void;
 }): Promise<ClientRunResult> {
-	const args = [
+	const serverAddress =
+		options.execution.kind === "offbox"
+			? options.execution.serverAddress
+			: "127.0.0.1";
+	const clientArgs = [
 		"--role",
 		"realm",
 		"--url",
-		`https://127.0.0.1:${options.port}`,
+		`https://${serverAddress}:${options.port}`,
 		"--sessions",
 		String(options.sessions),
 		"--send-interval-ms",
@@ -584,16 +953,26 @@ export async function runClientLeg(options: {
 		options.preRegistrationSha256,
 		"--started-at",
 		options.startedAt,
-		"--json-out",
-		options.jsonPath,
 	];
-	const child = spawn(options.clientBinary, args, {
+	const deadlineSeconds = Math.ceil(
+		1.5 * (60 + options.durationSec + options.idleSec + options.drainMs / 1000),
+	);
+	const invocation = buildAttributionClientInvocation({
+		clientBinary: options.clientBinary,
+		clientArgs,
+		jsonPath: options.jsonPath,
+		deadlineSeconds,
+		execution: options.execution,
+	});
+	const child = spawn(invocation.command, invocation.args, {
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	const stdoutLines: string[] = [];
 	const stderrLines: string[] = [];
 	const phaseMarkers: string[] = [];
 	let reportFromStdout: Record<string, unknown> | null = null;
+	let spawnError: string | null = null;
+	let outputTruncated = false;
 	const stdoutDecoder = new TextDecoder();
 	const stderrDecoder = new TextDecoder();
 	let stdoutBuffered = "";
@@ -606,7 +985,9 @@ export async function runClientLeg(options: {
 			const lines = stdoutBuffered.split("\n");
 			stdoutBuffered = lines.pop() ?? "";
 			for (const line of lines) {
-				stdoutLines.push(line);
+				if (!retainAttributionOutputLine(stdoutLines, line)) {
+					outputTruncated = true;
+				}
 				const marker = readPhaseMarker(line);
 				if (marker) {
 					phaseMarkers.push(marker.kind);
@@ -616,7 +997,9 @@ export async function runClientLeg(options: {
 			}
 		}
 		if (stdoutBuffered.length > 0) {
-			stdoutLines.push(stdoutBuffered);
+			if (!retainAttributionOutputLine(stdoutLines, stdoutBuffered)) {
+				outputTruncated = true;
+			}
 			const marker = readPhaseMarker(stdoutBuffered);
 			if (marker) {
 				phaseMarkers.push(marker.kind);
@@ -632,36 +1015,161 @@ export async function runClientLeg(options: {
 			});
 			const lines = stderrBuffered.split("\n");
 			stderrBuffered = lines.pop() ?? "";
-			for (const line of lines) stderrLines.push(line);
+			for (const line of lines) {
+				if (!retainAttributionOutputLine(stderrLines, line)) {
+					outputTruncated = true;
+				}
+			}
 		}
-		if (stderrBuffered.length > 0) stderrLines.push(stderrBuffered);
+		if (
+			stderrBuffered.length > 0 &&
+			!retainAttributionOutputLine(stderrLines, stderrBuffered)
+		) {
+			outputTruncated = true;
+		}
 	})();
-	const exitCode = await new Promise<number>((resolve) => {
-		child.on("exit", (code, signal) => resolve(code ?? (signal ? 128 : -1)));
-		child.on("error", () => resolve(-1));
-	});
-	await Promise.all([readStdout, readStderr]);
-	const reportJson =
-		existsSync(options.jsonPath) &&
-		readFileSync(options.jsonPath, "utf8").trim().length > 0
-			? (JSON.parse(readFileSync(options.jsonPath, "utf8")) as Record<
-					string,
-					unknown
-				>)
-			: reportFromStdout;
-	const report = requireClientReportIdentity(reportJson, {
-		role: "realm",
-		startedAt: options.startedAt,
-		preregistrationSha256: options.preRegistrationSha256,
-	});
-	return {
-		report,
-		phaseMarkers,
-		stdoutLines,
-		stderrLines,
-		exitCode,
-		jsonPath: options.jsonPath,
-	};
+	let conductorWatchdogFired = false;
+	const conductorDeadlineSeconds =
+		deadlineSeconds + (options.execution.kind === "offbox" ? 180 : 0);
+	const alreadyExited =
+		child.exitCode ?? (child.signalCode !== null ? 128 : null);
+	const waitForExit = () =>
+		new Promise<number>((resolve) => {
+			child.on("exit", (code, signal) => resolve(code ?? (signal ? 128 : -1)));
+			child.on("error", (error) => {
+				spawnError = String(error);
+				resolve(-1);
+			});
+		});
+	let exitCode: number;
+	if (alreadyExited !== null) {
+		exitCode = alreadyExited;
+	} else {
+		try {
+			exitCode = await closeWithin(
+				"client process exit",
+				waitForExit,
+				conductorDeadlineSeconds * 1000,
+			);
+		} catch {
+			conductorWatchdogFired = true;
+			try {
+				exitCode = await terminateChildWithin(child, {
+					termTimeoutMs: 5_000,
+					killTimeoutMs: 5_000,
+				});
+			} catch (error) {
+				exitCode = 128;
+				spawnError = `client reap failed: ${error instanceof Error ? error.message : String(error)}`;
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+			}
+		}
+	}
+	try {
+		await closeWithin(
+			"client output drain",
+			() => Promise.all([readStdout, readStderr]),
+			5_000,
+		);
+	} catch (error) {
+		outputTruncated = true;
+		spawnError ??= `client output drain failed: ${error instanceof Error ? error.message : String(error)}`;
+		child.stdout?.destroy();
+		child.stderr?.destroy();
+	}
+	if (exitCode !== 0) {
+		if (spawnError && !retainAttributionOutputLine(stderrLines, spawnError)) {
+			outputTruncated = true;
+		}
+		const stage = conductorWatchdogFired
+			? "client-conductor-watchdog"
+			: exitCode === 3
+				? "client-source-provision"
+				: exitCode === 4
+					? "client-watchdog"
+					: exitCode === -1 || exitCode === 255
+						? "client-transport"
+						: "client-process";
+		throw new AttributionExecutionError({
+			terminalStatus: conductorWatchdogFired
+				? "ABORTED"
+				: classifyAttributionClientExit(exitCode),
+			stage,
+			message: `g6-attribution: client process exited ${exitCode}: ${stderrLines.join(" | ")}`,
+			exitCode,
+			stdoutLines,
+			stderrLines,
+			outputTruncated,
+		});
+	}
+	if (outputTruncated) {
+		throw new AttributionExecutionError({
+			terminalStatus: "INVALID",
+			stage: "client-output-retention",
+			message: "g6-attribution: client process output exceeded retention bound",
+			exitCode,
+			stdoutLines,
+			stderrLines,
+			outputTruncated: true,
+		});
+	}
+	try {
+		let reportJson: Record<string, unknown> | null;
+		let clientBinarySha256 = options.clientBinarySha256;
+		let generatorHost = canonicalGeneratorIdentity(hostname());
+		if (options.execution.kind === "offbox") {
+			const parsed = parseGeneratorReport(
+				stdoutLines.join("\n"),
+				options.candidateSha,
+				options.preRegistrationSha256,
+			);
+			const provenance = validateOffboxGeneratorProvenance(
+				parsed,
+				options.candidateSha,
+				options.execution.expectedBinarySha256,
+				options.execution.expectedGeneratorHost,
+			);
+			reportJson = parsed.latencyJson as Record<string, unknown> | null;
+			clientBinarySha256 = provenance.binarySha256;
+			generatorHost = provenance.generatorHost;
+		} else {
+			reportJson =
+				existsSync(options.jsonPath) &&
+				readFileSync(options.jsonPath, "utf8").trim().length > 0
+					? (JSON.parse(readFileSync(options.jsonPath, "utf8")) as Record<
+							string,
+							unknown
+						>)
+					: reportFromStdout;
+		}
+		const report = requireClientReportIdentity(reportJson, {
+			role: "realm",
+			startedAt: options.startedAt,
+			preregistrationSha256: options.preRegistrationSha256,
+		});
+		return {
+			report,
+			phaseMarkers,
+			stdoutLines,
+			stderrLines,
+			outputTruncated,
+			exitCode,
+			jsonPath: options.jsonPath,
+			clientBinarySha256,
+			generatorHost,
+		};
+	} catch (error) {
+		throw new AttributionExecutionError({
+			terminalStatus: "INVALID",
+			stage: "client-report-identity",
+			message: `g6-attribution: client report/provenance invalid: ${error instanceof Error ? error.message : String(error)}`,
+			exitCode,
+			stdoutLines,
+			stderrLines,
+			outputTruncated,
+		});
+	}
 }
 
 export async function startJsLaneServer(options: {
@@ -1134,16 +1642,20 @@ export async function runAttributionLeg(
 			"--summary-json",
 			summaryJson,
 		]);
-		let client: ClientRunResult | null = null;
 		let serverExitCode: number | null = null;
+		let primaryError: unknown | null = null;
+		let result: AttributionLegManifest | null = null;
 		try {
-			client = await runClientLeg({
+			const client = await runClientLeg({
 				port: options.port,
 				sessions: options.sessions,
 				durationSec: options.durationSec,
 				idleSec: options.idleSec,
 				drainMs: options.drainMs,
 				clientBinary: options.clientBinary,
+				clientBinarySha256: options.clientBinarySha256,
+				candidateSha: options.candidateSha,
+				execution: options.clientExecution,
 				jsonPath: clientJson,
 				startedAt: options.startedAt,
 				preRegistrationSha256: options.preRegistrationSha256,
@@ -1155,6 +1667,11 @@ export async function runAttributionLeg(
 				() => waitForRustServerExit(child),
 				10_000,
 			);
+			if (serverExitCode !== 0) {
+				throw new Error(
+					`g6-attribution: direct-rust server exited ${serverExitCode}`,
+				);
+			}
 			const summary = JSON.parse(readFileSync(summaryJson, "utf8")) as Record<
 				string,
 				unknown
@@ -1165,9 +1682,9 @@ export async function runAttributionLeg(
 				plan,
 				preRegistrationSha256: options.preRegistrationSha256,
 				candidateSha: options.candidateSha,
-				clientBinarySha256: options.clientBinarySha256,
+				clientBinarySha256: client.clientBinarySha256,
 				tlsCertSha256: options.tls.certSha256,
-				hostIdentity: hostname(),
+				hostIdentity: attributionHostIdentity(hostname(), client.generatorHost),
 				clientReport: client.report,
 				phaseMarkers: client.phaseMarkers,
 				rawServer: {
@@ -1181,16 +1698,16 @@ export async function runAttributionLeg(
 					},
 				},
 			});
-			return {
+			result = {
 				schema: "g6-attribution-leg/1",
 				lane: options.lane,
 				orderIndex: options.orderIndex,
 				preRegistration: defaultPreRegistration(options.preRegistrationSha256),
 				contract: buildLaneContract(options.lane),
 				plan,
-				hostIdentity: hostname(),
+				hostIdentity: attributionHostIdentity(hostname(), client.generatorHost),
 				candidateSha: options.candidateSha,
-				clientBinarySha256: options.clientBinarySha256,
+				clientBinarySha256: client.clientBinarySha256,
 				serverBinarySha256: options.rustServerBinarySha256,
 				tlsCertSha256: options.tls.certSha256,
 				serverSettings,
@@ -1201,18 +1718,49 @@ export async function runAttributionLeg(
 					`g6-server exit=${serverExitCode}`,
 					...client.stderrLines,
 				],
+				outputTruncated: client.outputTruncated,
 				rawServer: summary,
+				rawProcessReports: attributionRawProcessReportNames(
+					options.orderIndex,
+					options.lane,
+				),
 				identityLeg,
 			};
-		} finally {
+		} catch (error) {
+			primaryError = error;
+		}
+		let cleanupError: unknown | null = null;
+		try {
 			setPhase("stop");
-			if (serverExitCode === null) {
+		} catch (error) {
+			cleanupError = error;
+		}
+		if (serverExitCode === null) {
+			try {
 				await terminateChildWithin(child, {
 					termTimeoutMs: 5_000,
 					killTimeoutMs: 5_000,
 				});
+			} catch (error) {
+				cleanupError = cleanupError
+					? new Error(
+							`${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}; ${error instanceof Error ? error.message : String(error)}`,
+						)
+					: error;
 			}
 		}
+		if (cleanupError !== null) {
+			throw combineAttributionCleanupFailure(
+				primaryError,
+				cleanupError,
+				"direct-rust-server-cleanup",
+			);
+		}
+		if (primaryError !== null) throw primaryError;
+		if (result === null) {
+			throw new Error("g6-attribution: direct-rust leg produced no result");
+		}
+		return result;
 	}
 
 	const jsServer = await startJsLaneServer({
@@ -1223,6 +1771,8 @@ export async function runAttributionLeg(
 		durationSec: options.durationSec,
 		serverSettings,
 	});
+	let primaryError: unknown | null = null;
+	let result: AttributionLegManifest | null = null;
 	try {
 		const client = await runClientLeg({
 			port: options.port,
@@ -1231,6 +1781,9 @@ export async function runAttributionLeg(
 			idleSec: options.idleSec,
 			drainMs: options.drainMs,
 			clientBinary: options.clientBinary,
+			clientBinarySha256: options.clientBinarySha256,
+			candidateSha: options.candidateSha,
+			execution: options.clientExecution,
 			jsonPath: clientJson,
 			startedAt: options.startedAt,
 			preRegistrationSha256: options.preRegistrationSha256,
@@ -1247,23 +1800,23 @@ export async function runAttributionLeg(
 			plan,
 			preRegistrationSha256: options.preRegistrationSha256,
 			candidateSha: options.candidateSha,
-			clientBinarySha256: options.clientBinarySha256,
+			clientBinarySha256: client.clientBinarySha256,
 			tlsCertSha256: options.tls.certSha256,
-			hostIdentity: hostname(),
+			hostIdentity: attributionHostIdentity(hostname(), client.generatorHost),
 			clientReport: client.report,
 			phaseMarkers: client.phaseMarkers,
 			rawServer,
 		});
-		return {
+		result = {
 			schema: "g6-attribution-leg/1",
 			lane: options.lane,
 			orderIndex: options.orderIndex,
 			preRegistration: defaultPreRegistration(options.preRegistrationSha256),
 			contract: jsServer.contract,
 			plan,
-			hostIdentity: hostname(),
+			hostIdentity: attributionHostIdentity(hostname(), client.generatorHost),
 			candidateSha: options.candidateSha,
-			clientBinarySha256: options.clientBinarySha256,
+			clientBinarySha256: client.clientBinarySha256,
 			serverBinarySha256: null,
 			tlsCertSha256: options.tls.certSha256,
 			serverSettings,
@@ -1271,12 +1824,31 @@ export async function runAttributionLeg(
 			phaseMarkers: client.phaseMarkers,
 			stdoutLines: client.stdoutLines,
 			stderrLines: client.stderrLines,
+			outputTruncated: client.outputTruncated,
 			rawServer,
+			rawProcessReports: attributionRawProcessReportNames(
+				options.orderIndex,
+				options.lane,
+			),
 			identityLeg,
 		};
-	} finally {
-		await closeWithin("js-server close", () => jsServer.close(), 5_000);
+	} catch (error) {
+		primaryError = error;
 	}
+	try {
+		await closeWithin("js-server close", () => jsServer.close(), 5_000);
+	} catch (cleanupError) {
+		throw combineAttributionCleanupFailure(
+			primaryError,
+			cleanupError,
+			"js-server-cleanup",
+		);
+	}
+	if (primaryError !== null) throw primaryError;
+	if (result === null) {
+		throw new Error("g6-attribution: JS leg produced no result");
+	}
+	return result;
 }
 
 export function writeManifest(
@@ -1386,8 +1958,11 @@ function sha256Text(input: string): string {
 	return createHash("sha256").update(input).digest("hex");
 }
 
-function buildTlsBundle(baseDir: string): AttributionTlsBundle {
-	const generated = generateLocalhostCert();
+function buildTlsBundle(
+	baseDir: string,
+	serverNames: string[],
+): AttributionTlsBundle {
+	const generated = generateCertForNames(serverNames);
 	if (!generated) {
 		throw new Error(
 			"g6-attribution: failed to generate localhost TLS material",
@@ -1478,12 +2053,28 @@ export async function runAttributionMatrixCli(): Promise<AggregateResult> {
 	const outDir =
 		process.env.G6_ATTR_OUT_DIR ??
 		mkdtempSync(join(tmpdir(), "g6-attribution-"));
-	const clientBinary =
-		process.env.G6_ATTR_CLIENT_BIN ??
-		join(process.cwd(), "target/release/mmo-client");
-	const rustServerBinary =
-		process.env.G6_ATTR_RUST_SERVER_BIN ??
-		join(process.cwd(), "target/release/g6-server");
+	const offboxSsh = process.env.G6_ATTR_OFFBOX_SSH ?? "";
+	const serverAddress = process.env.G6_ATTR_SERVER_ADDRESS ?? "";
+	const expectedGeneratorHost =
+		process.env.G6_ATTR_EXPECTED_GENERATOR_HOST ?? "";
+	if ((offboxSsh === "") !== (serverAddress === "")) {
+		throw new Error(
+			"g6-attribution: G6_ATTR_OFFBOX_SSH and G6_ATTR_SERVER_ADDRESS must be set together",
+		);
+	}
+	if (offboxSsh !== "" && expectedGeneratorHost === "") {
+		throw new Error(
+			"g6-attribution: G6_ATTR_EXPECTED_GENERATOR_HOST is required off-box",
+		);
+	}
+	if (
+		expectedGeneratorHost !== "" &&
+		canonicalGeneratorIdentity(expectedGeneratorHost) !== expectedGeneratorHost
+	) {
+		throw new Error(
+			"g6-attribution: expected generator host must be canonical",
+		);
+	}
 	const preRegistrationSha256 = preregistrationSha256();
 	const order = buildBalancedLaneOrder().flat();
 	const sampleWindowMs = 100;
@@ -1504,8 +2095,19 @@ export async function runAttributionMatrixCli(): Promise<AggregateResult> {
 			buildDir,
 		});
 		return await withAttributionRunContext(
-			{ outDir },
+			{
+				outDir,
+				serverNames: [
+					"localhost",
+					"127.0.0.1",
+					...(serverAddress === "" ? [] : [serverAddress]),
+				],
+			},
 			async ({ outDir, tls }) => {
+				const legsDir = join(outDir, "legs");
+				const rawDir = join(outDir, "raw");
+				ensureDir(legsDir);
+				ensureDir(rawDir);
 				const manifests: string[] = [];
 				const settlements: AggregateResult["settlement"]["afterLegs"] = [];
 				const executedLegs: Array<{
@@ -1513,35 +2115,105 @@ export async function runAttributionMatrixCli(): Promise<AggregateResult> {
 					orderIndex: number;
 					identityLeg: AttributionIdentityLeg;
 				}> = [];
+				let terminalFailure: AttributionFailureEvidence | null = null;
+				let clientBinaryAnchor =
+					offboxSsh === "" ? provenance.clientBinarySha256 : null;
 				for (const [index, lane] of order.entries()) {
-					const legOutDir = join(
-						outDir,
-						`leg-${String(index).padStart(2, "0")}-${lane}`,
-					);
-					ensureDir(legOutDir);
-					const manifest = await runAttributionLeg({
-						lane,
-						orderIndex: index,
-						port: basePort + index,
-						sessions,
-						durationSec,
-						idleSec,
-						drainMs,
-						outDir: legOutDir,
-						candidateSha: provenance.candidateSha,
-						clientBinary: clientBuildBinary,
-						clientBinarySha256: provenance.clientBinarySha256,
-						rustServerBinary: rustBuildBinary,
-						rustServerBinarySha256: provenance.rustServerBinarySha256,
-						tls,
-						startedAt: invokedAt,
-						preRegistrationSha256,
-					});
+					let manifest: AttributionLegManifest;
+					try {
+						manifest = await withAttributionLegScratchDirectory(
+							async (legOutDir) =>
+								await runAttributionLeg({
+									lane,
+									orderIndex: index,
+									port: basePort + index,
+									sessions,
+									durationSec,
+									idleSec,
+									drainMs,
+									outDir: legOutDir,
+									candidateSha: provenance.candidateSha,
+									clientBinary: clientBuildBinary,
+									clientBinarySha256: provenance.clientBinarySha256,
+									clientExecution:
+										offboxSsh === ""
+											? { kind: "local" }
+											: {
+													kind: "offbox",
+													sshDestination: offboxSsh,
+													serverAddress,
+													candidateSha: provenance.candidateSha,
+													expectedBinarySha256: clientBinaryAnchor,
+													expectedGeneratorHost,
+												},
+									rustServerBinary: rustBuildBinary,
+									rustServerBinarySha256: provenance.rustServerBinarySha256,
+									tls,
+									startedAt: invokedAt,
+									preRegistrationSha256,
+								}),
+						);
+					} catch (error) {
+						terminalFailure =
+							error instanceof AttributionExecutionError
+								? error.evidence
+								: {
+										terminalStatus: "INVALID",
+										stage: "leg-execution",
+										message:
+											error instanceof Error ? error.message : String(error),
+										exitCode: null,
+										stdoutLines: [],
+										stderrLines: [],
+										outputTruncated: false,
+									};
+						const failure = buildAttributionFailureArtifacts({
+							lane,
+							orderIndex: index,
+							preRegistrationSha256,
+							candidateSha: provenance.candidateSha,
+							hostIdentity: attributionHostIdentity(
+								hostname(),
+								offboxSsh === ""
+									? canonicalGeneratorIdentity(hostname())
+									: expectedGeneratorHost,
+							),
+							clientBinarySha256: clientBinaryAnchor,
+							serverBinarySha256:
+								lane === "direct-rust"
+									? provenance.rustServerBinarySha256
+									: null,
+							failure: terminalFailure,
+						});
+						writeFileSync(
+							join(outDir, failure.legPath),
+							`${JSON.stringify(failure.leg, null, 2)}\n`,
+						);
+						writeFileSync(
+							join(outDir, failure.clientPath),
+							`${JSON.stringify(failure.client, null, 2)}\n`,
+						);
+						writeFileSync(
+							join(outDir, failure.serverPath),
+							`${JSON.stringify(failure.server, null, 2)}\n`,
+						);
+						manifests.push(failure.legPath);
+						break;
+					}
+					clientBinaryAnchor ??= manifest.clientBinarySha256;
 					const manifestPath = join(
-						outDir,
+						legsDir,
 						`${String(index).padStart(2, "0")}-${lane}.json`,
 					);
 					writeManifest(manifestPath, manifest);
+					writeFileSync(
+						join(outDir, manifest.rawProcessReports.client),
+						renderAttributionRawProcessReport(manifest, "client"),
+					);
+					writeFileSync(
+						join(outDir, manifest.rawProcessReports.server),
+						renderAttributionRawProcessReport(manifest, "server"),
+					);
 					const evidenceName = portableEvidenceName(outDir, manifestPath);
 					manifests.push(evidenceName);
 					executedLegs.push({
@@ -1549,18 +2221,33 @@ export async function runAttributionMatrixCli(): Promise<AggregateResult> {
 						orderIndex: index,
 						identityLeg: manifest.identityLeg,
 					});
-					const settleSamples = await settleToIdleBand({
-						idleBand,
-						deadlineMs: settlementDeadlineMs,
-						sampleIntervalMs,
-						readHostCpu: () => readHostCpuSample(sampleWindowMs),
-					});
-					settlements.push({ leg: evidenceName, samples: settleSamples });
+					try {
+						const settleSamples = await settleToIdleBand({
+							idleBand,
+							deadlineMs: settlementDeadlineMs,
+							sampleIntervalMs,
+							readHostCpu: () => readHostCpuSample(sampleWindowMs),
+						});
+						settlements.push({ leg: evidenceName, samples: settleSamples });
+					} catch (error) {
+						terminalFailure = {
+							terminalStatus: "INVALID",
+							stage: "host-idle-settlement",
+							message: error instanceof Error ? error.message : String(error),
+							exitCode: null,
+							stdoutLines: [],
+							stderrLines: [],
+							outputTruncated: false,
+						};
+						break;
+					}
 				}
 				const plan = buildSharedAttributionPlan(sessions, durationSec);
-				const identity = validateAttributionIdentity(
-					executedLegs.map((leg) => leg.identityLeg),
-				);
+				const identity = terminalFailure
+					? { valid: false, reasons: [terminalFailure.message] }
+					: validateAttributionIdentity(
+							executedLegs.map((leg) => leg.identityLeg),
+						);
 				const outcome = evaluateAttributionOutcome({
 					identity,
 					legs: executedLegs.map((leg) => leg.identityLeg),
@@ -1572,7 +2259,7 @@ export async function runAttributionMatrixCli(): Promise<AggregateResult> {
 					preRegistration: defaultPreRegistration(preRegistrationSha256),
 					plan,
 					candidateSha: provenance.candidateSha,
-					clientBinarySha256: provenance.clientBinarySha256,
+					clientBinarySha256: clientBinaryAnchor,
 					rustServerBinarySha256: provenance.rustServerBinarySha256,
 					legOrder: order,
 					legs: manifests,
@@ -1595,7 +2282,14 @@ export async function runAttributionMatrixCli(): Promise<AggregateResult> {
 						available: false,
 						reason:
 							"profiling was not collected by the same-workload attribution matrix",
+						files: [],
 					},
+					...(terminalFailure
+						? {
+								terminalStatus: terminalFailure.terminalStatus,
+								failure: terminalFailure,
+							}
+						: {}),
 				};
 				const rendered = renderAggregateArtifacts(aggregate, executedLegs);
 				writeFileSync(join(outDir, "aggregate.json"), rendered.aggregateJson);
