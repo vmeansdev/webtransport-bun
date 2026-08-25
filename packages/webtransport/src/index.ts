@@ -633,6 +633,35 @@ export type ServerOptions = {
 	 */
 	quicLb?: QuicLbOptions;
 
+	/**
+	 * Wire this instance's bind socket into a CID-steered `SO_REUSEPORT` group:
+	 * insert the socket at `key` in a pinned BPF `REUSEPORT_SOCKARRAY`
+	 * (`sockArrayPinPath`), and — when `attachProgPinPath` is set — attach the
+	 * pinned `sk_reuseport` steering program to the group (exactly one instance
+	 * per group passes it; the program lives on the group afterwards and covers
+	 * later joiners). By convention `key` equals this instance's numeric QUIC-LB
+	 * server id, matching what the steering program's `slot_by_server_id` map
+	 * resolves. See examples/quic-lb for the program and the load recipe.
+	 *
+	 * Requires `reusePort: true` (there is no group to steer otherwise) and
+	 * `quicLb` (without QUIC-LB CIDs every packet takes the hash fallback while
+	 * the group looks steered) — both rejected with `E_INVALID_ARGUMENT`.
+	 * Linux only (`E_UNSUPPORTED_ARGUMENT` elsewhere); typically needs
+	 * `CAP_BPF` to open the pins. Fail-closed: any steering failure fails
+	 * `createServer` rather than silently degrading to 4-tuple hashing. The
+	 * kernel drops the sockarray entry when the socket closes; a fast
+	 * close-and-rebind can transiently see the slot still occupied, which is
+	 * retryable exactly like `AddrInUse`.
+	 */
+	reusePortSteering?: {
+		/** Absolute bpffs path of the pinned `REUSEPORT_SOCKARRAY`. */
+		sockArrayPinPath: string;
+		/** This instance's slot in the sockarray (its QUIC-LB server id). */
+		key: number;
+		/** Absolute bpffs path of the pinned `sk_reuseport` program to attach. */
+		attachProgPinPath?: string;
+	};
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -2341,6 +2370,52 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
+	if (opts.reusePortSteering !== undefined && opts.reusePortSteering !== null) {
+		const steering = opts.reusePortSteering;
+		const steeringError = (() => {
+			if (typeof steering !== "object") {
+				return "reusePortSteering must be an object";
+			}
+			if (
+				typeof steering.sockArrayPinPath !== "string" ||
+				!steering.sockArrayPinPath.startsWith("/")
+			) {
+				return "reusePortSteering.sockArrayPinPath must be an absolute bpffs path";
+			}
+			if (
+				!Number.isInteger(steering.key) ||
+				steering.key < 0 ||
+				steering.key > 0xffffffff
+			) {
+				return "reusePortSteering.key must be a non-negative 32-bit integer";
+			}
+			if (
+				steering.attachProgPinPath !== undefined &&
+				(typeof steering.attachProgPinPath !== "string" ||
+					!steering.attachProgPinPath.startsWith("/"))
+			) {
+				return "reusePortSteering.attachProgPinPath must be an absolute bpffs path";
+			}
+			if (opts.reusePort !== true) {
+				return "reusePortSteering requires reusePort: true";
+			}
+			if (opts.quicLb === undefined || opts.quicLb === null) {
+				return (
+					"reusePortSteering requires quicLb — without QUIC-LB CIDs every " +
+					"packet falls back to the kernel hash and the steering program " +
+					"steers nothing"
+				);
+			}
+			return null;
+		})();
+		if (steeringError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${steeringError}`,
+			);
+		}
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
@@ -2351,6 +2426,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		...(opts.quicLb === undefined || opts.quicLb === null
 			? {}
 			: { quicLb: quicLbOptionsToJson(opts.quicLb) }),
+		...(opts.reusePortSteering === undefined || opts.reusePortSteering === null
+			? {}
+			: { reusePortSteering: opts.reusePortSteering }),
 		...(opts.qpackMaxTableCapacity === undefined
 			? {}
 			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),

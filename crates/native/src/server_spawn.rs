@@ -22,6 +22,11 @@ pub(crate) struct BindOptions {
     /// L4 balancer can route by CID instead of by 4-tuple. `None` leaves
     /// quinn's default random 8-octet CIDs in place.
     pub quic_lb: Option<crate::quic_lb::QuicLbConfig>,
+    /// Wire the bound socket into a pinned BPF reuseport sockarray (and
+    /// optionally attach the pinned steering program) so the kernel routes by
+    /// QUIC-LB CID instead of 4-tuple hash. Requires `reuse_port` and
+    /// `quic_lb`; Linux only. Fail-closed at bind.
+    pub steering: Option<crate::reuseport_steering::ReusePortSteering>,
 }
 
 /// Builds the server's UDP socket with `SO_REUSEPORT` set before `bind()`.
@@ -477,6 +482,7 @@ mod tests {
         let bind = BindOptions {
             reuse_port: false,
             quic_lb: Some(QuicLbConfig::new(server_id.clone(), 8, 2).expect("valid config")),
+            steering: None,
         };
         let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(4);
         let (shutdown_tx, port) = spawn_server_instance(

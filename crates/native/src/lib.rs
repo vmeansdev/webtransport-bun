@@ -96,6 +96,7 @@ pub mod panic_guard;
 pub mod payload_buffer;
 pub mod quic_lb;
 pub mod rate_limit;
+pub mod reuseport_steering;
 pub mod server;
 pub mod server_metrics;
 pub mod server_napi;
@@ -743,9 +744,22 @@ pub(crate) fn spawn_wtransport_server(
             client::apply_congestion_controller(&mut transport, congestion_control);
             // reusePort takes over the socket build so SO_REUSEPORT can be set
             // before bind(); with_bind_socket hands it to quinn untouched.
+            // Steering wiring happens in the gap between bind and handoff —
+            // the only moment the fd is visible to us — and any failure aborts
+            // startup: a steering misconfiguration must never degrade to
+            // silent 4-tuple hashing.
             let bound = if bind.reuse_port {
                 match server_spawn::bind_reuse_port_socket(bind_addr) {
-                    Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                    Ok(socket) => {
+                        if let Some(steering) = &bind.steering {
+                            if let Err(msg) = reuseport_steering::install(&socket, steering) {
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                        ServerConfig::builder().with_bind_socket(socket)
+                    }
                     Err(e) => {
                         let msg = format!("failed to bind reusePort socket: {}", e);
                         emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);

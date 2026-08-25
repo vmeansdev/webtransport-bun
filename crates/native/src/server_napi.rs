@@ -175,6 +175,34 @@ impl ServerHandle {
             // quinn's default CIDs (docs/OPERATIONS.md).
             let quic_lb = crate::quic_lb::parse_quic_lb_options(&server_opts)
                 .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
+            // CID steering for the reuseport group. Steering without reusePort
+            // has no group to steer, and steering without quicLb is 100%
+            // hash-fallback while looking configured — both are refused rather
+            // than half-honored.
+            let steering = crate::reuseport_steering::parse_steering_options(&server_opts)
+                .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
+            if steering.is_some() {
+                if !crate::reuseport_steering::steering_supported() {
+                    return Err(napi::Error::from_reason(format!(
+                        "E_UNSUPPORTED_ARGUMENT: {}",
+                        crate::reuseport_steering::STEERING_UNSUPPORTED
+                    )));
+                }
+                if !reuse_port {
+                    return Err(napi::Error::from_reason(
+                        "E_INVALID_ARGUMENT: reusePortSteering requires reusePort: true"
+                            .to_string(),
+                    ));
+                }
+                if quic_lb.is_none() {
+                    return Err(napi::Error::from_reason(
+                        "E_INVALID_ARGUMENT: reusePortSteering requires quicLb — \
+                         without QUIC-LB CIDs every packet falls back to the \
+                         kernel hash and the steering program steers nothing"
+                            .to_string(),
+                    ));
+                }
+            }
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -217,6 +245,7 @@ impl ServerHandle {
                 crate::server_spawn::BindOptions {
                     reuse_port,
                     quic_lb,
+                    steering,
                 },
                 1,
             )
