@@ -1432,9 +1432,15 @@ export function evaluateG6(request: G6EvaluationRequest): G6ClassifiedV2 {
 				`V-A ${name} degraded evidence: ${arm.degraded.join(" | ")}`,
 			);
 		}
+		// "ffi" is the producer's label for the forced per-read
+		// clock_gettime(CLOCK_MONOTONIC) syscall: bench-g6 builds its clock
+		// with createMonotonicClock(false), whose only possible source is
+		// "ffi" (latency-clock.ts). The previous expected literal was a string
+		// the producer never emits, so the check was unsatisfiable against
+		// any real artifact — masked by fixtures that echoed the evaluator.
 		requireExact(
 			arm.clockSource,
-			"clock_gettime(CLOCK_MONOTONIC)",
+			"ffi",
 			`${name}.clockSource`,
 			validityReasons,
 		);

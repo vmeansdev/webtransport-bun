@@ -243,7 +243,7 @@ function steadyArm(sessions: number): Json {
 		sessions,
 		shape: armShape(sessions),
 		degraded: [],
-		clockSource: "clock_gettime(CLOCK_MONOTONIC)",
+		clockSource: "ffi",
 		windows: {
 			steady: {
 				serverUpstream: { rxTotal: upstream, rxSurvivors: 0 },
