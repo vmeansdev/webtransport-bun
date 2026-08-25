@@ -97,10 +97,13 @@ async function main(): Promise<void> {
 	const shards: Shard[] = [];
 	const readyPromises: Promise<void>[] = [];
 
+	// Root needs no sudo — and must not use it: Ubuntu 26.04's sudo ignores
+	// -E ("preserving the entire environment is not supported"), which
+	// silently strips WEBTRANSPORT_PACER_PPS from the shards and turns every
+	// paced admission into a throw.
+	const asRoot = process.getuid?.() === 0;
 	for (let i = 1; i <= SHARDS; i += 1) {
 		const args = [
-			"-E",
-			process.execPath,
 			"tools/load/g6-shard-server.ts",
 			"--port",
 			String(PORT),
@@ -120,10 +123,15 @@ async function main(): Promise<void> {
 		// One attach per group is enough; the attach lives on the reuseport
 		// group, so the first shard carries it.
 		if (i === 1) args.push("--attach-prog-pin", `${PIN_DIR}/steer_by_cid`);
-		const child = spawn("sudo", args, {
-			cwd: process.cwd(),
-			stdio: ["pipe", "pipe", "pipe"],
-		});
+		const child = asRoot
+			? spawn(process.execPath, args, {
+					cwd: process.cwd(),
+					stdio: ["pipe", "pipe", "pipe"],
+				})
+			: spawn("sudo", ["-E", process.execPath, ...args], {
+					cwd: process.cwd(),
+					stdio: ["pipe", "pipe", "pipe"],
+				});
 		const shard: Shard = {
 			serverId: i,
 			child,
