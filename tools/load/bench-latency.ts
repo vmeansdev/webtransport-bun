@@ -39,6 +39,7 @@ import {
 	G2_MACGEN_BIN,
 	MACGEN_ENTRY,
 	macgenInvocation,
+	dataSubnetPrefix,
 } from "./g2-offbox.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
@@ -299,6 +300,8 @@ export type LatencyStep = {
 		mode: "onbox" | "offbox";
 		ssh: string | null;
 		urlHost: string;
+		/** Declared data-path /24 prefix, recorded for the classifier's O2. */
+		dataSubnetPrefix: string;
 		/**
 		 * What the Mac reported about the binary it built and ran. Absent on-box,
 		 * where the harness spawned the binary itself and already knows. Off-box
@@ -690,6 +693,10 @@ async function main(): Promise<void> {
 				mode: OFFBOX ? "offbox" : "onbox",
 				ssh: OFFBOX ? OFFBOX_SSH : null,
 				urlHost: OFFBOX ? OFFBOX_URL_HOST : "127.0.0.1",
+				// The declared data-path /24, recorded so the classifier's host
+				// falsifier grades against the artifact rather than the
+				// classify-time environment (reproducible re-grades).
+				dataSubnetPrefix: dataSubnetPrefix(),
 				macgen: report
 					? {
 							bin: G2_MACGEN_BIN,

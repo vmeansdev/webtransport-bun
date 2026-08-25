@@ -23,7 +23,8 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { CABLE_HOST_RE } from "./g2-offbox.ts";
+// (The home-cable regex used to be imported here; the falsifier now
+// builds it from the prefix the run itself recorded.)
 import { medianInterval } from "./latency-ab-classify.ts";
 import { LatencyHistogram, quantizationNs } from "./latency-histogram.ts";
 import {
@@ -134,6 +135,8 @@ export type RttFragment = {
 			mode: string;
 			ssh: string | null;
 			urlHost: string;
+			/** Declared data-path /24 prefix; absent on historical artifacts. */
+			dataSubnetPrefix?: string;
 			macgen?: {
 				bin?: string;
 				entry?: string;
@@ -222,10 +225,19 @@ function integrityFailures(
 	const generator = step.generator;
 	if (!generator || generator.mode !== placement) failures.push("O1");
 	if (placement === "offbox") {
-		// The cable, and only the cable. The VM-era mark required `192.168.2.x`;
-		// on this topology that address family is the family Wi-Fi LAN, which is
-		// exactly what an off-box mark exists to rule out.
-		if (!generator || !CABLE_HOST_RE.test(generator.urlHost)) {
+		// The registered wire, and only the registered wire. The prefix comes
+		// from the artifact (recorded at run time), never from the classify-time
+		// environment — a historical artifact without the field grades under the
+		// home cable's 10.99.0. The family-LAN refusal is unconditional: the
+		// VM-era mark required `192.168.2.x`, and that address family is exactly
+		// what an off-box mark exists to rule out.
+		const prefix = generator?.dataSubnetPrefix ?? "10.99.0";
+		const hostRe = new RegExp(`^${prefix.replaceAll(".", "\\.")}\\.\\d{1,3}$`);
+		if (
+			!generator ||
+			/^192\.168\.2\./.test(generator.urlHost) ||
+			!hostRe.test(generator.urlHost)
+		) {
 			failures.push("O2");
 		}
 		// O5 — the generator built its own binary, so "which tree ran" is a claim
