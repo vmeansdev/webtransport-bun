@@ -401,6 +401,12 @@ async function main(): Promise<void> {
 	 * coming back. Null outside the storm arm.
 	 */
 	let severAtMs: number | null = null;
+	// The registered demand booking: one core serves every rung, so the
+	// planned population follows the current arm. With this configured the
+	// emitter's snapshotDue is booked immutably from the registered plan and
+	// the evaluator's exact snapshot-due identity is deterministic rather than
+	// an attempt count that drifts under load.
+	let plannedArmSessions = 0;
 	const serverCore = createG6ServerCore({
 		plan: SERVER_CORE_PLAN,
 		clock,
@@ -408,6 +414,10 @@ async function main(): Promise<void> {
 		phaseState,
 		state: () => state,
 		severAtMs: () => severAtMs,
+		dueAccounting: {
+			plannedSessions: () => plannedArmSessions,
+			steadyWindowSec: STEADY_SECONDS,
+		},
 	});
 	const { players, raidMembers } = serverCore;
 
@@ -541,6 +551,9 @@ async function main(): Promise<void> {
 					setSeverAt: (v) => {
 						severAtMs = v;
 					},
+					setPlannedSessions: (v) => {
+						plannedArmSessions = v;
+					},
 					phaseBarrierId: null,
 				}),
 			);
@@ -569,6 +582,9 @@ async function main(): Promise<void> {
 					stormCohort: 0,
 					setSeverAt: (v) => {
 						severAtMs = v;
+					},
+					setPlannedSessions: (v) => {
+						plannedArmSessions = v;
 					},
 					phaseBarrierId: randomUUID(),
 				}),
@@ -599,6 +615,9 @@ async function main(): Promise<void> {
 						stormCohort: cohort,
 						setSeverAt: (v) => {
 							severAtMs = v;
+						},
+						setPlannedSessions: (v) => {
+							plannedArmSessions = v;
 						},
 						phaseBarrierId: null,
 					}),
@@ -634,6 +653,8 @@ type ArmOptions = {
 	hotspot: boolean;
 	stormCohort: number;
 	setSeverAt: (v: number | null) => void;
+	/** Points the shared emitter's registered-demand booking at this arm. */
+	setPlannedSessions: (v: number) => void;
 	phaseBarrierId: string | null;
 };
 
@@ -653,6 +674,7 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	o.raidMembers.length = 0;
 	o.resetState();
 	o.setSeverAt(null);
+	o.setPlannedSessions(o.sessions);
 	o.phaseState.current = "connect";
 	const shape = armShape(o.sessions);
 	console.log(

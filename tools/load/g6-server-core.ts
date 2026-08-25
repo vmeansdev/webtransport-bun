@@ -153,7 +153,8 @@ export type G6ServerCoreInstrumentation = {
 };
 
 export type G6ServerCoreDueAccounting = {
-	plannedSessions: number;
+	/** Fixed count, or a getter when one core serves arms of different sizes. */
+	plannedSessions: number | (() => number);
 	steadyWindowSec: number;
 };
 
@@ -211,9 +212,10 @@ export function createG6ServerCore(options: {
 		samples.push(value);
 	};
 	const immutableSessionsInSlice = (sliceIndex: number): number => {
+		const planned = options.dueAccounting?.plannedSessions ?? 0;
 		const plannedSessions = Math.max(
 			0,
-			options.dueAccounting?.plannedSessions ?? 0,
+			typeof planned === "function" ? planned() : planned,
 		);
 		const { from, to } = emitterSliceBounds(
 			plannedSessions,
