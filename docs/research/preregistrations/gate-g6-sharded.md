@@ -66,10 +66,18 @@ refuse, never deflate the aggregate into an honest-looking MISS); **window
 integrity** — any shard's steady window wall-clock outside 120 s ± 250 ms
 (event-loop-clocked marks stretch under load and would inflate S1).
 
-Run-scoped: the post-run `steer_stats` dump must show steered short-header
-packets ≥ **0.9 ×** the summed steady upstream across all rungs. A merely
-non-zero bound would validate a 99.9 %-kernel-hash run on residue; the
-fallback counter cannot serve, since it legitimately holds every Initial.
+Steering: a cumulative `steer_stats` dump is taken **after each rung**, and
+each rung's steered-packet **delta** must be ≥ **0.9 ×** that rung's steady
+upstream. A merely non-zero bound would validate a 99.9 %-kernel-hash run on
+residue; a run-summed bound would let steering die before the frontier rung
+undetected (transport ACKs make steered ≈ 2.75× app upstream, so two clean
+rungs out-mass the third's demand); the fallback counter cannot serve, since
+it legitimately holds every Initial. An unusable dump refuses every rung.
+
+Emitter send errors are bounded, not zeroed: errors ≤ **3 ×** the client's
+steady lost-session count grade (they are the registered signature of sends
+racing a tolerated mid-steady death); anything beyond is unexplained error
+mass and refuses. A hard zero would contradict S5's registered trickle.
 
 ## 5. Producer, grader, and independence
 
@@ -94,15 +102,24 @@ tools with `--subnet` set to the VPC:
   home-rig generator failed exactly here): simultaneous 750 Mbit/s @ 1150 B
   down + 12 Mbit/s @ 64 B up for 20 s, 0.5 % loss ceiling each direction
 - Sink precheck on the generator: ≥ 116,250 pps offered, delivery ≥ 0.995
+- **Steering-floor calibration** — the 0.9 floor assumes one `steer_stats`
+  bump per arriving packet, which UDP GRO may deflate (reuseport selection
+  can run once per GRO aggregate). Before dispatch: one short informal
+  16-shard scan on this rig, dump `steer_stats`, and confirm
+  steered / client steady upstream clears **0.9 with at least 2× margin**
+  (i.e. ratio ≥ 1.8). If it does not, the dispatch is blocked — the floor
+  constant is re-derived from the calibration and re-reviewed *before* any
+  licensed run; it is never adjusted after one. The maps are re-pinned per
+  §7 after calibration, so its counts never feed the licensed floors.
 
 ## 7. Run rules
 
 One licensed dispatch of the three-rung ladder. The BPF maps are freshly
 re-pinned (`tools/load/g6-shard-bpf-setup.sh 16`) immediately before
 dispatch, which zeroes `steer_stats` — qualification residue never feeds the
-steering floor. The dump is taken with exactly
-`bpftool map dump pinned /sys/fs/bpf/quic-lb/steer_stats -j` after the last
-rung; an unusable dump is a refusal, not an error.
+steering floor. A dump is taken with exactly
+`bpftool map dump pinned /sys/fs/bpf/quic-lb/steer_stats -j` **after each
+rung**, in rung order; an unusable dump is a refusal, not an error.
 
 Infrastructure refusals (droplet provisioning, BPF pin setup, connect-phase
 stall before steady) retain their artifacts and license a redispatch the

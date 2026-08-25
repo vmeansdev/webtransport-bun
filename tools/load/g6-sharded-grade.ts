@@ -11,7 +11,7 @@
  * Usage:
  *   bun tools/load/g6-sharded-grade.ts \
  *     --expect-candidate <sha> \
- *     --steer-stats <bpftool -j map dump of steer_stats> \
+ *     --steer-stats <post-rung bpftool -j dump> [--steer-stats ...] \
  *     --rung <sessions>=<scan.json> [--rung ...] \
  *     [--out verdict.json]
  *
@@ -50,10 +50,18 @@ export const G6_SHARDED_VALIDITY = Object.freeze({
 	/** Per-shard steady wall-clock tolerance: event-loop-clocked marks stretch
 	 * under load; a stretched window inflates S1 (0.083 %/100 ms). */
 	steadyWallMsTolerance: 250,
-	/** Run-scoped steering floor: steered short-header packets must cover this
-	 * fraction of the summed steady upstream — a `> 0` bound would validate a
-	 * 99.9 %-kernel-hash run with one steered packet of residue. */
+	/** Per-rung steering floor: this rung's steered-packet DELTA must cover
+	 * this fraction of the rung's steady upstream — a `> 0` bound would
+	 * validate a 99.9 %-kernel-hash run on residue, and a run-summed bound
+	 * would let steering die before the frontier rung undetected (transport
+	 * ACKs make steered ≈ 2.75× app upstream, so two clean rungs out-mass the
+	 * third's whole demand). */
 	steeredFloorFractionOfUpstream: 0.9,
+	/** Send errors are explained only by mid-steady session deaths racing the
+	 * alive flag (a batch to a dying session rejects). Error mass beyond this
+	 * multiple of the client's lost-session count is unexplained and refuses —
+	 * a hard zero would contradict S5's registered lost-session trickle. */
+	sendErrorsPerLostSession: 3,
 });
 
 type ShardEntry = {
@@ -186,11 +194,6 @@ export function gradeRung(
 				);
 		}
 	}
-	if (scan.aggregate.steady.emitter.sendErrors !== 0)
-		invalid.push(
-			`emitter sendErrors ${scan.aggregate.steady.emitter.sendErrors} != 0`,
-		);
-
 	let clauses: RungVerdict["clauses"] = {};
 	let gate: RungVerdict["gate"] = null;
 	let steadySent = 0;
@@ -207,6 +210,12 @@ export function gradeRung(
 			invalid.push(`sessionsOk ${report.sessionsOk} != ${rungSessions}`);
 		if (report.sessionsErr > v.sessionsErrMax)
 			invalid.push(`sessionsErr ${report.sessionsErr} > ${v.sessionsErrMax}`);
+		const sendErrorCap =
+			v.sendErrorsPerLostSession * report.windows.steady.sessionsLost;
+		if (scan.aggregate.steady.emitter.sendErrors > sendErrorCap)
+			invalid.push(
+				`emitter sendErrors ${scan.aggregate.steady.emitter.sendErrors} exceed ${sendErrorCap} (${v.sendErrorsPerLostSession} × ${report.windows.steady.sessionsLost} lost sessions) — unexplained error mass`,
+			);
 
 		const c = G6_SHARDED_CLAUSES;
 		const demand =
@@ -284,9 +293,12 @@ export function steeredTotal(text: string): number | string {
 
 async function main(): Promise<void> {
 	const expectCandidate = arg("expect-candidate");
-	const steerStatsPath = arg("steer-stats");
 	const rungSpecs = args("rung");
-	if (!expectCandidate || !steerStatsPath || rungSpecs.length === 0) {
+	if (
+		!expectCandidate ||
+		args("steer-stats").length === 0 ||
+		rungSpecs.length === 0
+	) {
 		throw new Error(
 			"g6-sharded-grade: --expect-candidate, --steer-stats and at least one --rung <sessions>=<scan.json> are required",
 		);
@@ -298,28 +310,51 @@ async function main(): Promise<void> {
 		const scan = JSON.parse(readFileSync(spec.slice(eq + 1), "utf8"));
 		verdicts.push(gradeRung(rung, scan, expectCandidate));
 	}
-	const steered = steeredTotal(readFileSync(steerStatsPath, "utf8"));
-	const upstreamSum = verdicts.reduce((sum, v) => sum + v.steadySent, 0);
-	const steeredFloor =
-		G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream * upstreamSum;
-	const steeringReason =
-		typeof steered === "string"
-			? steered
-			: steered < steeredFloor
-				? `steered ${steered} below floor ${Math.round(steeredFloor)} (0.9 × upstream ${upstreamSum})`
-				: null;
-	if (steeringReason !== null) {
+	// One cumulative steer_stats dump per rung, in rung order (the maps start
+	// zeroed by the registered pre-dispatch re-pin). Per-rung DELTAS carry the
+	// floor: a run-summed bound would let steering die before the frontier
+	// rung undetected. An unusable dump refuses every rung — its own delta and
+	// its successor's are both uncomputable.
+	const steerPaths = args("steer-stats");
+	const steeredCumulative: Array<number | string> = steerPaths.map((path) =>
+		steeredTotal(readFileSync(path, "utf8")),
+	);
+	const dumpProblem =
+		steerPaths.length !== verdicts.length
+			? `steer-stats dumps ${steerPaths.length} != rungs ${verdicts.length}`
+			: (steeredCumulative.find((entry) => typeof entry === "string") as
+					| string
+					| undefined);
+	const steeredDeltas: number[] = [];
+	if (dumpProblem !== undefined) {
 		for (const verdict of verdicts) {
 			verdict.valid = false;
-			verdict.invalidReasons.push(steeringReason);
+			verdict.invalidReasons.push(dumpProblem);
 			verdict.gate = null;
+		}
+	} else {
+		let previous = 0;
+		for (const [index, verdict] of verdicts.entries()) {
+			const cumulative = steeredCumulative[index] as number;
+			const delta = cumulative - previous;
+			previous = cumulative;
+			steeredDeltas.push(delta);
+			const floor =
+				G6_SHARDED_VALIDITY.steeredFloorFractionOfUpstream * verdict.steadySent;
+			if (delta < floor) {
+				verdict.valid = false;
+				verdict.invalidReasons.push(
+					`rung steered delta ${delta} below floor ${Math.round(floor)} (0.9 × steady upstream ${verdict.steadySent})`,
+				);
+				verdict.gate = null;
+			}
 		}
 	}
 	const result = {
 		schema: "g6-sharded-grade/1",
 		expectCandidate,
-		steered,
-		steeredFloor: Math.round(steeredFloor),
+		steeredCumulative,
+		steeredDeltas,
 		clauses: G6_SHARDED_CLAUSES,
 		validity: G6_SHARDED_VALIDITY,
 		rungs: verdicts,
