@@ -6,10 +6,11 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	watch,
 	writeFileSync,
 } from "node:fs";
 import { cpus, hostname, tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateCertForNames } from "../../packages/webtransport/test/helpers/certs.ts";
 import {
@@ -1332,6 +1333,139 @@ export async function waitForRustServerExit(
 	});
 }
 
+type RustServerReadyDependencies = {
+	fileExists: (path: string) => boolean;
+	readText: (path: string) => string;
+	watchReadyPath: (path: string, onChange: () => void) => () => void;
+	setTimer: (
+		onTimeout: () => void,
+		milliseconds: number,
+	) => ReturnType<typeof setTimeout>;
+	clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
+export async function waitForRustServerReady(options: {
+	child: Pick<ChildProcess, "exitCode" | "signalCode" | "on" | "off">;
+	readyPath: string;
+	expectedPort: number;
+	timeoutMs: number;
+	deps?: RustServerReadyDependencies;
+}): Promise<void> {
+	const deps: RustServerReadyDependencies = options.deps ?? {
+		fileExists: existsSync,
+		readText: (path: string) => readFileSync(path, "utf8"),
+		watchReadyPath: (path, onChange) => {
+			const watcher = watch(dirname(path), onChange);
+			return () => watcher.close();
+		},
+		setTimer: (onTimeout, milliseconds) => setTimeout(onTimeout, milliseconds),
+		clearTimer: clearTimeout,
+	};
+	const checkReadyMarker = (): boolean => {
+		if (
+			typeof options.child.exitCode === "number" ||
+			options.child.signalCode !== null
+		) {
+			throw new Error(
+				`g6-attribution: direct-rust server exited before readiness marker (exit=${options.child.exitCode ?? "signal"})`,
+			);
+		}
+		if (!deps.fileExists(options.readyPath)) return false;
+		let marker: unknown;
+		try {
+			marker = JSON.parse(deps.readText(options.readyPath));
+		} catch (error) {
+			throw new Error(
+				`g6-attribution: invalid direct-rust readiness marker: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		if (
+			typeof marker !== "object" ||
+			marker === null ||
+			(marker as { schema?: unknown }).schema !== "g6-rust-server-ready/1"
+		) {
+			throw new Error(
+				"g6-attribution: direct-rust readiness marker schema is invalid",
+			);
+		}
+		if ((marker as { port?: unknown }).port !== options.expectedPort) {
+			throw new Error(
+				`g6-attribution: direct-rust readiness marker port did not match ${options.expectedPort}`,
+			);
+		}
+		return true;
+	};
+	if (checkReadyMarker()) return;
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		let stopWatching: (() => void) | null = null;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const cleanup = () => {
+			if (timer !== null) deps.clearTimer(timer);
+			if (stopWatching !== null) stopWatching();
+			options.child.off("exit", onExit);
+			options.child.off("error", onError);
+		};
+		const finish = (error?: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			if (error) reject(error);
+			else resolve();
+		};
+		const check = () => {
+			try {
+				if (checkReadyMarker()) finish();
+			} catch (error) {
+				finish(error instanceof Error ? error : new Error(String(error)));
+			}
+		};
+		function onExit(code: number | null, signal: NodeJS.Signals | null) {
+			finish(
+				new Error(
+					`g6-attribution: direct-rust server exited before readiness marker (exit=${code ?? signal ?? "unknown"})`,
+				),
+			);
+		}
+		function onError(error: Error) {
+			finish(
+				new Error(
+					`g6-attribution: direct-rust server failed before readiness marker: ${error.message}`,
+				),
+			);
+		}
+		function onDeadline() {
+			try {
+				if (checkReadyMarker()) {
+					finish();
+					return;
+				}
+				finish(
+					new Error(
+						`g6-attribution: direct-rust readiness marker timed out after ${options.timeoutMs}ms`,
+					),
+				);
+			} catch (error) {
+				finish(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
+		try {
+			stopWatching = deps.watchReadyPath(options.readyPath, check);
+			options.child.on("exit", onExit);
+			options.child.on("error", onError);
+			timer = deps.setTimer(onDeadline, options.timeoutMs);
+			check();
+		} catch (error) {
+			finish(error instanceof Error ? error : new Error(String(error)));
+		}
+	});
+	if (!deps.fileExists(options.readyPath)) {
+		throw new Error(
+			"g6-attribution: direct-rust readiness marker disappeared after observation",
+		);
+	}
+}
+
 export async function closeWithin<T>(
 	label: string,
 	run: () => Promise<T>,
@@ -1590,6 +1724,10 @@ export async function runAttributionLeg(
 			options.outDir,
 			`${String(options.orderIndex).padStart(2, "0")}-${options.lane}-server.json`,
 		);
+		const readyPath = join(
+			options.outDir,
+			`${String(options.orderIndex).padStart(2, "0")}-${options.lane}-ready.json`,
+		);
 		const child = spawn(options.rustServerBinary, [
 			"--port",
 			String(options.port),
@@ -1641,11 +1779,19 @@ export async function runAttributionLeg(
 			phaseFile,
 			"--summary-json",
 			summaryJson,
+			"--ready-path",
+			readyPath,
 		]);
 		let serverExitCode: number | null = null;
 		let primaryError: unknown | null = null;
 		let result: AttributionLegManifest | null = null;
 		try {
+			await waitForRustServerReady({
+				child,
+				readyPath,
+				expectedPort: options.port,
+				timeoutMs: 5_000,
+			});
 			const client = await runClientLeg({
 				port: options.port,
 				sessions: options.sessions,
