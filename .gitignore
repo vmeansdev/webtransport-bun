@@ -82,3 +82,6 @@ packages/webtransport/wasm-dist/
 
 # Local planning/tracker scratch files — never committed
 /.scratch/
+
+# Dev-machine-local cargo overrides (shared target dir, signing runner) — never commit
+.cargo/

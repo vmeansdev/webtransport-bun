@@ -118,6 +118,32 @@ Configure Prometheus alerts. Severity: **page** for Sev-2, **ticket** for Sev-3.
 
 Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400` for 400 MiB of 512 MiB).
 
+## Admission control: refusal is load-shaping, not rejection
+
+At `maxSessions` or `maxHandshakesInFlight`, the server answers a new dial
+with QUIC `CONNECTION_REFUSED` and increments `limitExceededCount`. This is a
+**transient admission signal from a healthy server** — "not right now", never
+"go away". The handshake cap in particular bounds *instantaneous concurrency*
+(how many handshakes are simultaneously incomplete), not arrival rate: a
+server clearing a handshake in ~10 ms sustains hundreds of establishments per
+second under a cap of 200, while a single synchronized wave deeper than the
+cap sees its overflow refused in the first instant, however idle the server
+was a moment earlier.
+
+**Clients must treat refusal as retryable**: retry with **jittered** backoff
+(e.g. 100–300 ms base, ±50% jitter, a handful of attempts), and treat only
+repeated exhaustion as an outage. The jitter is load-bearing — a fleet that
+retries on a fixed timer re-arrives as the same synchronized wave it was just
+refused for. The canonical scenario: a network blip drops 800 long-lived
+clients, all redial in the same second; with jittered retry the event is a
+sub-second hiccup, with single-shot dials it reads as a total outage — same
+server, same event.
+
+Operationally: a `limitExceededCount` burst that coincides with reconnect
+waves and drains within seconds is the admission gate doing its job; sustained
+growth under steady load is the signal to scale out or raise the cap toward
+what the host's handshake memory actually tolerates.
+
 ## Idle timeout behavior
 
 - `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.
@@ -308,6 +334,173 @@ measure a stalled sender on a long path; do not widen speculatively.
 - Run the runtime process as a dedicated service user.
 - Use systemd on Linux; ensure Restart=on-failure.
 - Collect logs centrally; scrape metrics via exposed endpoint (if you add one) or poll metricsSnapshot.
+
+## Multi-process binds (`reusePort`)
+
+`createServer({ reusePort: true })` sets `SO_REUSEPORT` on the bind socket so
+several server processes can listen on one port. It is **native-backend only**
+(the WASM backend has its own options type and owns no socket) and **unix
+only**: on a platform without `SO_REUSEPORT` the call throws
+`E_UNSUPPORTED_ARGUMENT` rather than binding without it. It also requires an
+explicit `port` — `port: 0` throws `E_INVALID_ARGUMENT`, since each instance
+would get its own ephemeral port and share nothing.
+
+**The flag alone is not a load-balancing answer.** Read these two before
+turning it on:
+
+- **4-tuple hashing breaks long-lived sessions.** Plain kernel steering picks a
+  group member by hashing the packet's source/destination address and port. A
+  QUIC connection survives a client address change by design (the connection ID
+  identifies it, not the 4-tuple), but the kernel does not read connection IDs
+  — after a NAT rebind or a client interface change the same connection hashes
+  to a *different* process, which does not recognize it. The connection does not
+  close: it **stalls until the idle timeout expires (60 s by default,
+  `crates/native/src/limits.rs:47`)**, so what the application sees is a hang
+  followed by a timeout, not a clean drop. See §3 of
+  `docs/research/2026-08-21-bare-metal-capacity.md` for the verified mechanism.
+  The same argument applies to plain ECMP.
+- **Group membership changes re-hash the whole group.** Adding or removing a
+  socket changes the hash distribution for every flow, not just new ones.
+  Restarting one instance therefore re-steers surviving connections that belong
+  to its *siblings*, so a routine rolling restart drops sessions fleet-wide.
+
+What the flag is for:
+
+- **eBPF-steered topologies.** An `SK_REUSEPORT` program attached to the group
+  can pick the socket by reading the QUIC connection ID's server-ID bytes
+  instead of the 4-tuple, which is rebind-stable. That requires the server to
+  encode a server ID in the connection IDs it issues.
+- **Benchmarks and load-generation rigs**, where sessions are short and
+  distribution does not have to be stable.
+
+Neither the rebind failure nor the restart re-hash has been measured on this
+project's rigs; both are deductions from RFC 9000 §5.1/§9 and the kernel's
+documented reuseport behavior. Distribution across the group is the kernel's,
+not this library's: Linux hashes across members, BSD/macOS delivers to the last
+binder.
+
+The full argument, the supported deployment pattern, and the sizing figures
+live in
+[docs/research/2026-08-21-bare-metal-capacity.md](research/2026-08-21-bare-metal-capacity.md)
+— sections 3 ("Unsupported: 4-tuple-hash balancers in front of long-lived
+sessions") and 4 ("Four disclosures you must read before deploying any steered
+pattern").
+
+## QUIC-LB connection IDs (`quicLb`)
+
+`reusePort` gives you a group of processes on one port; `quicLb` gives the
+thing steering that group something rebind-stable to steer *by*. With
+
+```ts
+createServer({
+  port: 4433,
+  quicLb: { serverId: new Uint8Array([0x00, 0x07]), nonceLen: 8 },
+  tls, onSession,
+});
+```
+
+every connection ID this instance issues carries `00 07` in the clear, so an
+`SK_REUSEPORT` eBPF program or an external L4 balancer can read the backend out
+of the packet header instead of hashing the 4-tuple. That is what makes the
+steering survive a client's NAT rebind: the connection ID is the connection's
+own name and travels with it, while the 4-tuple does not.
+
+**Native backend only** — the WASM backend has its own options type and issues
+no connection IDs of its own. Absent, the option changes nothing: quinn's
+opaque 8-octet connection IDs are the default.
+
+### The layout
+
+Written against **draft-ietf-quic-load-balancers-21**, the **keyless**
+configuration of §5.3:
+
+```text
+first octet   3 config-rotation bits + 5 random bits    §3.1, §3.3
+server ID     serverId.length octets, >= 1              §5.3
+nonce         nonceLen octets, >= 4, random per CID     §5.4
+```
+
+`serverId.length + nonceLen` must be 19 or less, because QUIC v1 caps
+connection IDs at 20 octets and the first one is spent on the first octet. The
+keyed configuration is the same format with the plaintext block encrypted; it
+is a later option, not a different scheme.
+
+### `nonceLen` is required on purpose
+
+Nothing in the connection ID encodes the nonce length or the server-ID length —
+a balancer learns both from its own configuration. A default here would let the
+server write one layout while the balancer decodes another, and the symptom
+would be traffic landing on arbitrary backends, which reads as a flaky network
+rather than as a misconfiguration. So `nonceLen` has no default and an absent
+one throws `E_INVALID_ARGUMENT`. Every other bound is checked the same way, in
+JS, before the addon is touched.
+
+`configRotation` (0–6, default 0) labels which configuration generation issued
+a connection ID, so a fleet can roll to new parameters while connections issued
+under the old ones stay routable. `7` (0b111) is reserved for unroutable
+connection IDs (§3.2) and is rejected.
+
+### Cost 1: the topology is in cleartext
+
+The draft states the tradeoff in its own words (§5.3): "failure to define a key
+means that observers can determine the assigned server of any connection,
+significantly increasing the linkability of QUIC address migration." Anyone on
+the path can tell which backend serves a connection, count your fleet, and link
+a connection across a migration that QUIC otherwise makes unlinkable. That is
+the price of keyless routing; the keyed configuration is what buys it back, and
+it is not built.
+
+### Cost 2: bytes on every packet
+
+A QUIC-LB connection ID is `1 + serverId.length + nonceLen` octets — **11** for
+the example above, **6** at minimum, up to 20 — against quinn's **8**-octet
+default. Once the client adopts a server-issued connection ID, that difference
+is paid on the destination-CID field of **every short-header packet** in both
+directions, for the life of the connection.
+
+Put against this rig's measured egress, that is small but not free. G7's stream
+cell moved **1.2498 Gbps** with byte-exact ledgers (the run's 79.1% host-CPU
+maximum was measured on a *different* cell, B-1k — see the
+[capacity doc](research/2026-08-21-bare-metal-capacity.md), §"Host-level
+envelopes"); at the ~1,400-byte datagrams that path carries, three extra header
+octets is roughly **0.2%** of the wire bytes, and G3's egress cell ran with GSO
+and GRO active at 64 segments, so the added bytes ride the same syscalls rather
+than costing new ones. It has **not been measured** — no gate has run with
+`quicLb` on. Size a minimal `nonceLen` (4) and a minimal `serverId` if your
+fleet is small and the bytes matter; note that a short nonce shrinks the
+unlinkability budget §5.4 asks you to keep.
+
+### Reading connection IDs on the balancer side
+
+The package exports the decoders, pure and addon-free, so an eBPF loader or a
+routing test can read a connection ID without opening a socket:
+
+```ts
+import {
+  decodeQuicLbServerId,
+  decodeQuicLbConfigRotation,
+} from "@webtransport-bun/webtransport";
+
+const serverId = decodeQuicLbServerId(cid, 2); // null if the CID is too short
+const rotation = decodeQuicLbConfigRotation(cid); // 7 means unroutable (§3.2)
+```
+
+`serverIdLen` is yours to supply from configuration; it is never on the wire.
+
+### What it does not do
+
+The first flight is still unrouted by connection ID: the client picks its own
+random destination CID for the Initial, so routing falls back to the 4-tuple
+until the server's CID is adopted, and a rebind inside that window still breaks
+the connection. See disclosure (b) in the capacity document. Rotation, Retry,
+version negotiation, and the unroutable codepoint are all the balancer's
+problem, not this option's.
+
+A worked configuration — how `reusePort` + `quicLb` + an eBPF steering program
+compose on one box, and how `quicLb` composes with an external L4 balancer
+across machines — is in [quic-lb.md](quic-lb.md), with a reference
+`SK_REUSEPORT` program (an example, not a shipped component) in
+[examples/quic-lb/](../examples/quic-lb/README.md).
 
 ---
 

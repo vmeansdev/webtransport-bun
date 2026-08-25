@@ -111,6 +111,71 @@ type _AssertNoUpdateCertOnPortable = Assert<
 	Not<Extends<PortableServer, { updateCert(tls: unknown): Promise<void> }>>
 >;
 
+// `sendDatagramMirror()` is native-only for the same reason batched sending is:
+// its entire content is amortizing a Node-API crossing wasm does not have, and
+// wasm has no session registry to fan out through. See PARITY_MATRIX.md §3.
+type _AssertNoSendDatagramMirrorOnPortable = Assert<
+	Not<
+		Extends<
+			PortableServer,
+			{
+				sendDatagramMirror(
+					targets: readonly string[],
+					payload: Uint8Array,
+				): unknown;
+			}
+		>
+	>
+>;
+// ...and it is genuinely on the native root server, so the assertion above is a
+// statement about the portable surface rather than about a method nobody has.
+type _AssertSendDatagramMirrorOnNative = Assert<
+	Extends<
+		rootSurface.WebTransportServer,
+		{
+			sendDatagramMirror(
+				targets: readonly string[],
+				payload: Uint8Array,
+			): unknown;
+		}
+	>
+>;
+
+// The paced mirror and its report reader are additive members of the same
+// native-only family, and native-only for the same reason: both are about the
+// egress pacer's schedule and the session registry it fans out through, neither
+// of which wasm has. Added rather than substituted — `sendDatagramMirror` above
+// keeps its own assertions, because the paced API exists precisely so that one
+// does not change.
+type _AssertNoPacedMirrorOnPortable = Assert<
+	Not<
+		Extends<
+			PortableServer,
+			{
+				sendDatagramMirrorPaced(
+					targets: readonly string[],
+					payload: Uint8Array,
+				): unknown;
+			}
+		>
+	>
+>;
+type _AssertNoReadMirrorReportsOnPortable = Assert<
+	Not<Extends<PortableServer, { readMirrorReports(max?: number): unknown }>>
+>;
+type _AssertPacedMirrorOnNative = Assert<
+	Extends<
+		rootSurface.WebTransportServer,
+		{
+			sendDatagramMirrorPaced(
+				targets: readonly string[],
+				payload: Uint8Array,
+			): unknown;
+			readMirrorReports(max?: number): unknown;
+		}
+	>
+>;
+
 // --- the frozen export sets -----------------------------------------------
 
 const ROOT_EXPORTS = [
@@ -139,10 +204,23 @@ const ROOT_EXPORTS = [
 	"clientPoolMetricsSnapshot",
 	"connect",
 	"createServer",
+	// The QUIC-LB connection-ID decoders. Added deliberately, as an additive
+	// (semver-minor) widening of the native surface rather than a reshaping of
+	// it: they are the balancer's half of the `quicLb` server option, and a
+	// balancer cannot reach them anywhere else — the package's `exports` map is
+	// pinned to exactly three subpaths by the test below, so a module that is
+	// not re-exported from one of the three is unreachable for consumers.
+	"decodeQuicLbConfigRotation",
+	"decodeQuicLbServerId",
 	"exportTicketVault",
 	"importTicketVault",
 	"metricsToPrometheus",
 	"nativeToWebTransportLike",
+	// Ships with the two decoders above and for the same reason: a balancer
+	// reading a connection ID gets its LENGTH from configuration, never from
+	// the wire, so the decoders are only usable alongside the function that
+	// computes it. Additive (semver-minor) like they were.
+	"quicLbCidLength",
 	"releaseNativeMemory",
 	"toWebTransport",
 ];
@@ -210,6 +288,19 @@ const METRICS_FIELDS = [
 
 /** Capabilities that must never leak onto the common session contract. */
 const BACKEND_ONLY_SESSION_MEMBERS = ["goAway", "unwrap", "getStats"];
+
+/**
+ * Native-only *server* members must be absent in fact, not merely absent from
+ * the type. Both adapters build an explicit object literal, so a leak here
+ * means a projection turned into a spread.
+ */
+function assertServerContract(server: PortableServer): void {
+	const bag = server as unknown as Record<string, unknown>;
+	expect(bag.sendDatagramMirror).toBeUndefined();
+	expect(bag.sendDatagramMirrorPaced).toBeUndefined();
+	expect(bag.readMirrorReports).toBeUndefined();
+	expect(bag.updateCert).toBeUndefined();
+}
 
 function assertSessionContract(session: PortableServerSession): void {
 	const bag = session as unknown as Record<string, unknown>;
@@ -406,6 +497,7 @@ describe("/portable runtime contract", () => {
 			expect(typeof server.address.host).toBe("string");
 			// Chain validation, not pinning: no hash to hand a client.
 			expect(server.certHashBase64).toBeUndefined();
+			assertServerContract(server);
 
 			const wt = await openWTWithRetry(`https://127.0.0.1:${port}`, {
 				tls: { insecureSkipVerify: true },
@@ -454,6 +546,7 @@ describe("/portable runtime contract", () => {
 				expect(server.backend).toBe("wasm");
 				// Clients pin the hash instead of chain-validating.
 				expect(typeof server.certHashBase64).toBe("string");
+				assertServerContract(server);
 
 				const { session: clientSession, manager } = await connectWasm(
 					wasm,

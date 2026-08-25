@@ -147,6 +147,10 @@ export type MetricsSnapshot = {
 	queuedBytesGlobal: number;
 	backpressureWaitCount: number;
 	backpressureTimeoutCount: number;
+	/** Native only. `sendDatagramMirror()` calls served. */
+	datagramMirrorCalls?: number;
+	/** Native only. Targets those mirror calls attempted. */
+	datagramMirrorTargets?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;

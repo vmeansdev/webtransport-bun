@@ -1,4 +1,5 @@
 //! NAPI bindings for ServerHandle. Risk-module coverage floors target `server.rs` logic.
+use napi::bindgen_prelude::Uint8Array;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::{Env, JsFunction, Result};
 use napi_derive::napi;
@@ -156,10 +157,36 @@ impl ServerHandle {
             let qpack_max_table_capacity =
                 crate::client::parse_qpack_max_table_capacity(&server_opts)
                     .map_err(napi::Error::from_reason)?;
+            // SO_REUSEPORT on the bind socket. Kernel steering is 4-tuple
+            // hashed, so this is for eBPF-steered and bench topologies, not a
+            // general balancing answer (docs/OPERATIONS.md).
+            let reuse_port = server_opts
+                .get("reusePort")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if reuse_port && !crate::server_spawn::reuse_port_supported() {
+                return Err(napi::Error::from_reason(format!(
+                    "E_UNSUPPORTED_ARGUMENT: {}",
+                    crate::server_spawn::REUSE_PORT_UNSUPPORTED
+                )));
+            }
+            // QUIC-LB connection IDs: this instance's server ID in the clear so
+            // an L4 balancer routes by CID rather than by 4-tuple. Absent leaves
+            // quinn's default CIDs (docs/OPERATIONS.md).
+            let quic_lb = crate::quic_lb::parse_quic_lb_options(&server_opts)
+                .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
             let port_u16 = port.min(65535) as u16;
+            if reuse_port && port_u16 == 0 {
+                return Err(napi::Error::from_reason(
+                    "E_INVALID_ARGUMENT: reusePort requires an explicit port; \
+                     port 0 asks the OS for a fresh ephemeral port per instance, \
+                     so nothing shares a port"
+                        .to_string(),
+                ));
+            }
 
             let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tls_config = parse_tls_resolver_config(&tls_config_json)
@@ -187,6 +214,10 @@ impl ServerHandle {
                 enable_0rtt,
                 allow_early_session,
                 qpack_max_table_capacity,
+                crate::server_spawn::BindOptions {
+                    reuse_port,
+                    quic_lb,
+                },
                 1,
             )
             .map_err(|msg| {
@@ -333,6 +364,138 @@ impl ServerHandle {
             return Err(napi::Error::from_reason(msg));
         }
         Ok(())
+    }
+
+    /// Send one payload to many of this server's sessions across one crossing.
+    ///
+    /// Synchronous and promise-free, because it is the fan-out of
+    /// `trySendDatagram` rather than of `sendDatagram`: one N-API promise costs
+    /// more than the whole fan-out below ~1,000 targets, a serial parking
+    /// fan-out would let one slow subscriber hold the rest, a concurrent one
+    /// would allocate N futures, and either would take a ThreadsafeFunction —
+    /// the host-loop reference the non-parking send exists to avoid — per
+    /// broadcast.
+    ///
+    /// Returns `{sent, failed, codes}` and never throws for a transport
+    /// condition. `failed` holds indices into `targets` and `codes` is parallel
+    /// to it, so a healthy broadcast to 10,000 subscribers allocates nothing to
+    /// report that nothing failed. A missing, closed or foreign-owned target is
+    /// a failure entry, never an exception: at this scale reaping is normal and
+    /// the failure list *is* the reap list.
+    ///
+    /// Targets past `DATAGRAM_MIRROR_MAX` are reported as failures rather than
+    /// attempted or dropped; the TypeScript wrapper throws `RangeError` before
+    /// the crossing, so only a raw-addon caller ever sees that code.
+    #[napi(js_name = "sendDatagramMirror")]
+    pub fn send_datagram_mirror(
+        &self,
+        targets: Vec<String>,
+        payload: Uint8Array,
+    ) -> crate::datagram_mirror::DatagramMirrorResult {
+        // Copied once, before the loop, and shared by reference with every
+        // target: N copies out of JS become one. The call is synchronous, so
+        // the caller cannot mutate its array before this returns — the copy
+        // makes that a contract rather than an accident of the current shape.
+        let payload = payload.as_ref().to_vec();
+        crate::session::send_datagram_mirror_for_owner(
+            self.server_id,
+            &targets,
+            &payload,
+            &self.metrics,
+        )
+        .into_napi()
+    }
+
+    /// Hand one payload and many targets to the egress pacer's schedule.
+    ///
+    /// The sibling of [`Self::send_datagram_mirror`], and a separate method
+    /// rather than a mode of it, because the envelope means something else.
+    /// `admitted` is targets accepted onto the schedule: nothing has been
+    /// resolved, owner-checked or budget-checked when this returns, and calling
+    /// that number `sent` is the lie this API exists to avoid. Per-target
+    /// outcomes are drained afterwards through [`Self::read_mirror_reports`].
+    ///
+    /// Synchronous and promise-free, exactly as the mirror is — the JS thread
+    /// pays one lock, one payload copy and one target gather, independent of the
+    /// schedule's depth. Never throws for a transport condition.
+    ///
+    /// `paced: false` says the pacer knob (`WEBTRANSPORT_PACER_PPS`) is off and
+    /// nothing was offered; the wrapper raises `E_UNSUPPORTED_ARGUMENT` for it.
+    /// That is a configuration error, not a transport condition: a caller that
+    /// asked for the schedule by name and silently got the inline burst instead
+    /// would have no way to tell.
+    #[napi(js_name = "sendDatagramMirrorPaced")]
+    pub fn send_datagram_mirror_paced(
+        &self,
+        targets: Vec<String>,
+        payload: Uint8Array,
+    ) -> crate::datagram_mirror::DatagramMirrorAdmission {
+        // One copy for the whole fan-out, as on the synchronous path — and here
+        // it is load-bearing rather than merely contractual: the job outlives
+        // the call, so the JS-owned buffer cannot be the one the pacer sends.
+        let payload = payload.as_ref().to_vec();
+        crate::session::send_datagram_mirror_paced_for_owner(
+            self.server_id,
+            &targets,
+            &payload,
+            &self.metrics,
+        )
+        .map(crate::datagram_mirror::MirrorOutcome::into_admission_napi)
+        .unwrap_or_else(crate::datagram_mirror::DatagramMirrorAdmission::unpaced)
+    }
+
+    /// Drain up to `max` of this server's deferred mirror reports, oldest first.
+    ///
+    /// Failures only. A paced broadcast reports nothing for the targets that
+    /// took the payload, so the delivered count is `admitted` minus the failures
+    /// that arrive here — the same "cost proportional to what went wrong" shape
+    /// the synchronous envelope has.
+    ///
+    /// Synchronous, promise-free and never throwing, in the drain-on-poll style
+    /// `readDatagramBatch` already uses. An empty result means nothing is
+    /// pending, including on an addon with no pacer at all; the pacer's presence
+    /// is told apart by whether `sendDatagramMirrorPaced` exists.
+    ///
+    /// The backing ring is fixed at 4,096 entries and drops oldest on overflow,
+    /// counting every drop in `mirrorReportsDropped`, so a caller that never
+    /// polls costs a constant rather than a growth path.
+    #[napi(js_name = "readMirrorReports")]
+    pub fn read_mirror_reports(
+        &self,
+        max: Option<u32>,
+    ) -> Vec<crate::datagram_mirror::MirrorReportEntry> {
+        let max = max.unwrap_or(u32::MAX) as usize;
+        crate::egress_pacer::drain_reports(self.server_id, max)
+            .into_iter()
+            .map(|(target, code)| crate::datagram_mirror::MirrorReportEntry { target, code })
+            .collect()
+    }
+
+    /// Open an egress-pacer stats window. Returns the token to pass to
+    /// [`Self::pacer_stats_json`] at window close, or `0` when the pacer knob is
+    /// off and there is nothing to window.
+    ///
+    /// Named with the double underscore for the same reason
+    /// `__pacerStatsJson` is: diagnostic, unstable, and outside the public API
+    /// this package commits to.
+    #[napi(js_name = "__pacerStatsSnapshot")]
+    pub fn pacer_stats_snapshot(&self) -> u32 {
+        crate::egress_pacer::snapshot()
+    }
+
+    /// Egress-pacer counters as a JSON string, `"{}"` when the pacer knob is
+    /// off. Prototype instrumentation for the microbench and the cable
+    /// validation (`crates/native/docs/egress-pacer.md`); deliberately untyped,
+    /// because the prototype commits to no schema.
+    ///
+    /// With a token from `__pacerStatsSnapshot()` the result carries a `window`
+    /// object of deltas over that window beside the raw `cumulative` values;
+    /// without one, `window` is `null`. Process-global by construction — the
+    /// pacer is one schedule per process, not one per server — so a second
+    /// `Server` in the same process reads the same counters.
+    #[napi(js_name = "__pacerStatsJson")]
+    pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
+        crate::egress_pacer::stats_json(since)
     }
 
     #[napi]

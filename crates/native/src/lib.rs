@@ -85,6 +85,8 @@ pub mod client;
 pub mod client_pool;
 pub mod client_stream;
 pub mod datagram_batch;
+pub mod datagram_mirror;
+pub mod egress_pacer;
 pub mod error;
 pub mod histogram;
 pub mod limits;
@@ -92,6 +94,7 @@ pub mod metrics;
 pub mod native_memory;
 pub mod panic_guard;
 pub mod payload_buffer;
+pub mod quic_lb;
 pub mod rate_limit;
 pub mod server;
 pub mod server_metrics;
@@ -682,6 +685,7 @@ pub(crate) fn spawn_wtransport_server(
     enable_0rtt: bool,
     allow_early_session: bool,
     qpack_max_table_capacity: u64,
+    bind: server_spawn::BindOptions,
     startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -737,9 +741,23 @@ pub(crate) fn spawn_wtransport_server(
             memory_policy.apply_flow_control(&mut transport);
             memory_policy.apply_datagram_buffers(&mut transport);
             client::apply_congestion_controller(&mut transport, congestion_control);
-            let config_builder = ServerConfig::builder()
-            .with_bind_address(bind_addr)
-            .with_custom_tls_and_transport(tls_config, transport);
+            // reusePort takes over the socket build so SO_REUSEPORT can be set
+            // before bind(); with_bind_socket hands it to quinn untouched.
+            let bound = if bind.reuse_port {
+                match server_spawn::bind_reuse_port_socket(bind_addr) {
+                    Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                    Err(e) => {
+                        let msg = format!("failed to bind reusePort socket: {}", e);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                        report_startup(Err(msg));
+                        return;
+                    }
+                }
+            } else {
+                ServerConfig::builder().with_bind_address(bind_addr)
+            };
+            let config_builder =
+                bound.with_custom_tls_and_transport(tls_config, transport);
             let config_builder = match config_builder.max_idle_timeout(Some(
                 std::time::Duration::from_millis(limits.idle_timeout_ms),
             )) {
@@ -767,7 +785,18 @@ pub(crate) fn spawn_wtransport_server(
             // is no blocked-streams option to thread.
             let config_builder =
                 config_builder.qpack_max_table_capacity(qpack_max_table_capacity);
-            let config = config_builder.build();
+            let mut config = config_builder.build();
+            // QUIC-LB connection IDs (draft-ietf-quic-load-balancers-21, keyless
+            // configuration — see `quic_lb.rs`). The generator lives on the
+            // endpoint config, which the builder does not expose, so it goes on
+            // the built config through the fork's escape hatch before
+            // `Endpoint::server` consumes it. quinn wants a factory, not an
+            // instance, because it may build a generator per endpoint.
+            if let Some(quic_lb) = bind.quic_lb.clone() {
+                config
+                    .quic_endpoint_config_mut()
+                    .cid_generator(quic_lb::QuicLbCidGenerator::factory(quic_lb));
+            }
             let server = match Endpoint::server(config) {
                 Ok(s) => match s.local_addr() {
                     Ok(addr) => {
