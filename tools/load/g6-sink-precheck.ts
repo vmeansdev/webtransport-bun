@@ -163,7 +163,10 @@ const OUT = args.get("out") ?? "g6-sink-precheck.json";
 const SECONDS = Number(args.get("seconds") ?? 30);
 const PORT = Number(args.get("port") ?? 45211);
 
-const IPERF = "/opt/homebrew/bin/iperf3";
+// Resolve from PATH; the Homebrew literal only as the Mac fallback. A missing
+// binary must fail loudly, not hang — a spawn ENOENT inside this tool once
+// stalled a billed rig for half an hour.
+const IPERF = Bun.which("iperf3") ?? "/opt/homebrew/bin/iperf3";
 
 function run(
 	cmd: string,
