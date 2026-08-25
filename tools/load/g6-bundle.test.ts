@@ -336,6 +336,62 @@ describe("G6 bundle producer", () => {
 		expect(workflow).not.toContain(".tmp-g6-tls");
 	});
 
+	test("workflow measurement is fail-closed behind configure and prepare while refusal retention stays predicated on the bundle directory alone", () => {
+		const workflow = readFileSync(
+			join(import.meta.dir, "../../.github/workflows/bench-bandwidth.yml"),
+			"utf8",
+		);
+		const count = (needle: string) => workflow.split(needle).length - 1;
+
+		// Configure must refuse before it exports anything the always()
+		// steps predicate on. A configure failure after the export would let
+		// measurement start against an unvalidated identity.
+		const bundleExport = workflow.indexOf("G6_BUNDLE_DIR=$BUNDLE_DIR");
+		expect(bundleExport).toBeGreaterThan(
+			workflow.indexOf("differs from registered candidate"),
+		);
+		expect(bundleExport).toBeGreaterThan(
+			workflow.indexOf("Tracked candidate tree is dirty"),
+		);
+		expect(bundleExport).toBeGreaterThan(
+			workflow.indexOf("Runner host $ACTUAL_RUNNER_HOST differs"),
+		);
+		expect(workflow.indexOf("G6_CONFIGURE_OK=true")).toBeGreaterThan(
+			bundleExport,
+		);
+
+		// Prepare stamps its success flag only after the producer exits zero.
+		expect(workflow.indexOf("G6_PREPARE_OK=true")).toBeGreaterThan(
+			workflow.indexOf("g6-bundle.ts prepare"),
+		);
+		expect(count("G6_CONFIGURE_OK=true")).toBe(1);
+		expect(count("G6_PREPARE_OK=true")).toBe(1);
+
+		// Both measurement steps and the evaluator require configure AND
+		// prepare success; finalize, verify, and upload keep running on the
+		// bundle directory alone so refusals are retained.
+		const failClosed =
+			"env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != ''";
+		expect(count(failClosed)).toBe(3);
+		expect(
+			count(
+				"(github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != ''",
+			),
+		).toBe(3);
+
+		// The bench-g6/2 producer refuses to start without the registered
+		// preregistration hash; the full-G6 step must pass it through.
+		const mmoStep = workflow.indexOf("- name: Run G6 MMO realm gate");
+		const attributionStep = workflow.indexOf(
+			"- name: Run G6 attribution matrix",
+		);
+		const preregEnv = workflow.indexOf(
+			"G6_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}",
+		);
+		expect(preregEnv).toBeGreaterThan(mmoStep);
+		expect(preregEnv).toBeLessThan(attributionStep);
+	});
+
 	test("prepares a new authority-bound directory and finalizes a complete attribution bundle", () => {
 		const { bundleDir, authority } = fixture();
 		prepareG6EvidenceBundle({

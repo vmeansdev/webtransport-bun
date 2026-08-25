@@ -261,17 +261,9 @@ jobs:
           EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
           EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
-          BUNDLE_DIR="$GITHUB_WORKSPACE/.bench-evidence/g6-${MODE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          TREE_SHA="$(git rev-parse 'HEAD^{tree}')"
-          echo "G6_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
-          echo "G6_TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
-          echo "G6_RUN_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_EVALUATOR_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_FINALIZE_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_VERIFY_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_BUNDLE_STATUS=not-run" >> "$GITHUB_ENV"
-          echo "G6_UPLOAD_FAILED=unknown" >> "$GITHUB_ENV"
+          # Every identity check runs before anything is exported to
+          # GITHUB_ENV. Later always() steps predicate on these exports, so a
+          # refused configuration must leave them unset.
           for value in "$OFFBOX_SSH" "$REGISTRATION_PATH" "$REGISTRATION_SHA256" "$PREREGISTRATION_SHA256" "$EXPECTED_RUNNER_HOST" "$EXPECTED_GENERATOR_HOST"; do
             if [ -z "$value" ]; then
               echo "::error::All source-bound G6 registration, host, and off-box inputs are required"
@@ -292,6 +284,18 @@ jobs:
             echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $EXPECTED_RUNNER_HOST"
             exit 2
           fi
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          BUNDLE_DIR="$GITHUB_WORKSPACE/.bench-evidence/g6-${MODE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TREE_SHA="$(git rev-parse 'HEAD^{tree}')"
+          echo "G6_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
+          echo "G6_TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
+          echo "G6_RUN_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_EVALUATOR_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_FINALIZE_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_VERIFY_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_BUNDLE_STATUS=not-run" >> "$GITHUB_ENV"
+          echo "G6_UPLOAD_FAILED=unknown" >> "$GITHUB_ENV"
+          echo "G6_CONFIGURE_OK=true" >> "$GITHUB_ENV"
       - name: Prepare successor evidence bundle
         if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
         env:
@@ -338,6 +342,7 @@ jobs:
           else
             bun tools/load/g6-bundle.ts prepare "${COMMON[@]}"
           fi
+          echo "G6_PREPARE_OK=true" >> "$GITHUB_ENV"
       - name: Run bandwidth ladder
         if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'bandwidth' }}
         env:
@@ -379,7 +384,7 @@ jobs:
       # Registration: docs/research/preregistrations/gate-g6-mmo.md.
       - name: Run G6 MMO realm gate
         id: run_g6_mmo
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_BUNDLE_DIR != '' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
         continue-on-error: true
         env:
           G6_ARMS: ${{ github.event.inputs.g6_arms }}
@@ -390,6 +395,9 @@ jobs:
           # The Mac entrypoint checks out and builds exactly this SHA; without
           # it every off-box generator spawn exits 3 before running (O-1).
           G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
+          # The bench-g6/2 producer refuses to run unless the tracked
+          # preregistration hashes to exactly this value.
+          G6_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
         run: |
           set +e
           ulimit -n "$(ulimit -Hn)" || true
@@ -401,7 +409,7 @@ jobs:
           exit "$STATUS"
       - name: Run G6 attribution matrix
         id: run_g6_attribution
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-attribution' && env.G6_BUNDLE_DIR != '' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-attribution' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
         continue-on-error: true
         env:
           G6_ATTR_OUT_DIR: ${{ env.G6_BUNDLE_DIR }}
@@ -416,7 +424,7 @@ jobs:
           exit "$STATUS"
       - name: Evaluate G6 MMO realm gate
         id: evaluate_g6_mmo
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_BUNDLE_DIR != '' }}
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
         continue-on-error: true
         env:
           EXPECTED_CANDIDATE: ${{ github.event.inputs.candidate_commit }}
