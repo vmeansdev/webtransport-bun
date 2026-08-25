@@ -23,6 +23,7 @@ import {
 const roots: string[] = [];
 const CANDIDATE = "1".repeat(40);
 const OTHER_CANDIDATE = "2".repeat(40);
+const TREE = "3".repeat(40);
 const PREREGISTRATION_ID = "g6-mmo-closeout/1";
 const PREREGISTRATION_PATH =
 	"docs/research/preregistrations/gate-g6-mmo-closeout.md";
@@ -36,7 +37,7 @@ afterEach(() => {
 	}
 });
 
-function sha256(value: string): string {
+function sha256(value: string | Uint8Array): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
@@ -103,8 +104,12 @@ function identityCopies(candidateSha = CANDIDATE): {
 		`Registration id: ${REGISTRATION_ID}`,
 		`Registration path: ${REGISTRATION_PATH}`,
 		`Candidate SHA: ${candidateSha}`,
+		`Tree SHA: ${TREE}`,
 		`Tracked preregistration id/path: ${preRegistration.id}, ${preRegistration.path}`,
 		`Tracked preregistration SHA-256: ${preRegistration.sha256}`,
+		"Runner host: runner-a",
+		"Generator host: mac-generator",
+		"Host identity: runner=runner-a;generator=mac-generator",
 		"",
 	].join("\n");
 	return {
@@ -144,14 +149,25 @@ function requiredIdentityFiles(
 		files,
 		"host-identity.json",
 		"host-identity",
-		json({ schema: "g6-host-identity/1", hostname: "runner-a" }),
+		json({
+			schema: "g6-host-identity/1",
+			runnerHost: "runner-a",
+			generatorHost: "mac-generator",
+			identity: "runner=runner-a;generator=mac-generator",
+		}),
 	);
 	writePayload(
 		bundleDir,
 		files,
 		"source-identity.json",
 		"source-identity",
-		json({ schema: "g6-source-identity/1", candidateSha }),
+		json({
+			schema: "g6-source-identity/1",
+			candidateSha,
+			treeSha: TREE,
+			dirty: false,
+			externalInputs: {},
+		}),
 	);
 	return copies;
 }
@@ -173,6 +189,7 @@ function makeFullFixture(
 			schema: "bench-g6/2",
 			preRegistration,
 			source: { candidateSha: CANDIDATE },
+			host: { identity: "runner-a" },
 			complete: status === "COMPLETE",
 		}),
 	);
@@ -209,9 +226,34 @@ function makeFullFixture(
 	writePayload(
 		bundleDir,
 		files,
-		"inputs/floor.json",
+		"inputs/floor.log",
 		"floor",
-		json({ schema: "mmo-client/2", preRegistration, role: "realm" }),
+		`macgen: host=mac-generator\nmmo-client: json ${JSON.stringify({
+			schema: "mmo-client/2",
+			preRegistration,
+			role: "realm",
+		})}\n`,
+	);
+	const externalInputPaths = [
+		"inputs/preflight-down.json",
+		"inputs/preflight-up.json",
+		"inputs/floor.log",
+		"inputs/sink.json",
+	];
+	writeFileSync(
+		join(bundleDir, "source-identity.json"),
+		json({
+			schema: "g6-source-identity/1",
+			candidateSha: CANDIDATE,
+			treeSha: TREE,
+			dirty: false,
+			externalInputs: Object.fromEntries(
+				externalInputPaths.map((path) => [
+					path,
+					sha256(readFileSync(join(bundleDir, path))),
+				]),
+			),
+		}),
 	);
 	writePayload(
 		bundleDir,
@@ -221,7 +263,23 @@ function makeFullFixture(
 		json({
 			schema: "g6-classified/2",
 			preRegistration,
-			source: { candidateSha: CANDIDATE },
+			inputSha256: {
+				artifactJson: sha256(readFileSync(join(bundleDir, "bench-g6.json"))),
+				artifactCsv: sha256(readFileSync(join(bundleDir, "bench-g6.csv"))),
+				preflightDown: sha256(
+					readFileSync(join(bundleDir, "inputs/preflight-down.json")),
+				),
+				preflightUp: sha256(
+					readFileSync(join(bundleDir, "inputs/preflight-up.json")),
+				),
+				floor: sha256(readFileSync(join(bundleDir, "inputs/floor.log"))),
+				sink: sha256(readFileSync(join(bundleDir, "inputs/sink.json"))),
+			},
+			source: {
+				candidateSha: CANDIDATE,
+				graderSha: CANDIDATE,
+				generatorHost: "mac-generator",
+			},
 			final: { valid: status === "COMPLETE", gate: "MISS" },
 		}),
 	);
@@ -309,6 +367,7 @@ function makeAttributionFixture(): Fixture {
 				candidateSha: CANDIDATE,
 				preRegistration,
 				identityLeg: { candidateSha: CANDIDATE },
+				hostIdentity: "runner=runner-a;generator=mac-generator",
 				rawProcessReports: {
 					client: `raw/${legName}-client.json`,
 					server: `raw/${legName}-server.json`,
@@ -328,6 +387,7 @@ function makeAttributionFixture(): Fixture {
 					schema: `g6-attribution-${process}/1`,
 					preRegistration,
 					candidateSha: CANDIDATE,
+					hostIdentity: "runner=runner-a;generator=mac-generator",
 				}),
 				{ leg },
 			);
@@ -447,6 +507,100 @@ describe("G6 evidence manifest", () => {
 		);
 	});
 
+	test("binds registered runner and generator hosts across complete evidence", () => {
+		const full = makeFullFixture();
+		const classifiedPath = join(full.bundleDir, "classified.json");
+		const classified = JSON.parse(readFileSync(classifiedPath, "utf8")) as {
+			source: { generatorHost: string };
+		};
+		classified.source.generatorHost = "other-generator";
+		writeFileSync(classifiedPath, json(classified));
+		expect(() => writeG6Manifest(full.options)).toThrow(
+			/classified generator host mismatch/i,
+		);
+
+		const attribution = makeAttributionFixture();
+		const legPath = join(attribution.bundleDir, "legs/00.json");
+		const leg = JSON.parse(readFileSync(legPath, "utf8")) as {
+			hostIdentity: string;
+		};
+		leg.hostIdentity = "runner=runner-a;generator=other-generator";
+		writeFileSync(legPath, json(leg));
+		expect(() => writeG6Manifest(attribution.options)).toThrow(
+			/leg 0 host identity mismatch/i,
+		);
+
+		const registration = makeFullFixture();
+		const registrationPath = join(registration.bundleDir, "registration.md");
+		const withoutHostPair = readFileSync(registrationPath, "utf8").replace(
+			"Host identity: runner=runner-a;generator=mac-generator\n",
+			"",
+		);
+		writeFileSync(registrationPath, withoutHostPair);
+		registration.options.registration = {
+			...registration.options.registration,
+			sha256: sha256(withoutHostPair),
+		};
+		expect(() => writeG6Manifest(registration.options)).toThrow(
+			/registration copy does not bind host value runner=runner-a;generator=mac-generator/i,
+		);
+	});
+
+	test("binds the tracked evaluator and every classified grading input", () => {
+		const wrongGrader = makeFullFixture();
+		const wrongGraderPath = join(wrongGrader.bundleDir, "classified.json");
+		const wrongGraderJson = JSON.parse(
+			readFileSync(wrongGraderPath, "utf8"),
+		) as { source: { graderSha: string } };
+		wrongGraderJson.source.graderSha = OTHER_CANDIDATE;
+		writeFileSync(wrongGraderPath, json(wrongGraderJson));
+		expect(() => writeG6Manifest(wrongGrader.options)).toThrow(
+			/classified grader SHA does not match candidate/i,
+		);
+
+		const wrongInput = makeFullFixture();
+		const wrongInputPath = join(wrongInput.bundleDir, "classified.json");
+		const wrongInputJson = JSON.parse(readFileSync(wrongInputPath, "utf8")) as {
+			inputSha256: { preflightDown: string };
+		};
+		wrongInputJson.inputSha256.preflightDown = "f".repeat(64);
+		writeFileSync(wrongInputPath, json(wrongInputJson));
+		expect(() => writeG6Manifest(wrongInput.options)).toThrow(
+			/classified input hash mismatch for preflightDown/i,
+		);
+	});
+
+	test("binds the clean source tree to the source-bound registration", () => {
+		const fixture = makeFullFixture();
+		const sourcePath = join(fixture.bundleDir, "source-identity.json");
+		writeFileSync(
+			sourcePath,
+			json({
+				schema: "g6-source-identity/1",
+				candidateSha: CANDIDATE,
+				treeSha: "4".repeat(40),
+				dirty: false,
+			}),
+		);
+		expect(() => writeG6Manifest(fixture.options)).toThrow(
+			/source tree is not bound by registration/i,
+		);
+
+		const dirty = makeFullFixture();
+		writeFileSync(
+			join(dirty.bundleDir, "source-identity.json"),
+			json({
+				schema: "g6-source-identity/1",
+				candidateSha: CANDIDATE,
+				treeSha: TREE,
+				dirty: true,
+			}),
+		);
+		expect(() => writeG6Manifest(dirty.options)).toThrow(
+			/source identity must bind a clean tree/i,
+		);
+	});
+
 	test("allows integrity-verifiable partial refusals but never marks them stampable", () => {
 		for (const status of ["INVALID", "ABORTED"] as const) {
 			const fixture = makeFullFixture(status);
@@ -471,6 +625,12 @@ describe("G6 evidence manifest", () => {
 						"registration-copy",
 						"host-identity",
 						"source-identity",
+						"preflight-down",
+						"preflight-up",
+						"floor",
+						"sink",
+						"profiles",
+						"comparison",
 						"partial-json",
 					].includes(entry.role)
 				) {
@@ -513,6 +673,8 @@ describe("G6 evidence manifest", () => {
 						"registration-copy",
 						"host-identity",
 						"source-identity",
+						"profiles",
+						"comparison",
 						"partial-json",
 					].includes(entry.role)
 				) {
@@ -546,6 +708,11 @@ describe("G6 evidence manifest", () => {
 						"registration-copy",
 						"host-identity",
 						"source-identity",
+						...(kind === "full-g6"
+							? ["preflight-down", "preflight-up", "floor", "sink"]
+							: []),
+						"profiles",
+						"comparison",
 					].includes(entry.role)
 				) {
 					fixture.files.splice(fixture.files.indexOf(entry), 1);
