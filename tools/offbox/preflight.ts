@@ -161,17 +161,22 @@ type Step = { what: string; argv: string[]; expect: string };
  * runbook's expected outputs are printed from the same list the run uses.
  */
 function steps(opts: Options): Step[] {
+	// The generator is historically the Mac; a Linux generator (rented rig)
+	// speaks iproute2 and spells don't-fragment differently.
+	const linux = process.platform === "linux";
 	const list: Step[] = [
 		{
 			what: "route",
-			argv: ["route", "-n", "get", opts.peer],
+			argv: linux
+				? ["ip", "route", "get", opts.peer]
+				: ["route", "-n", "get", opts.peer],
 			expect: `interface: the cable's interface (enX / bridgeX), never utunN — a utun means Tailscale answered`,
 		},
 		{
 			what: "mtu",
 			argv: [
 				"ping",
-				"-D",
+				...(linux ? ["-M", "do"] : ["-D"]),
 				"-c",
 				"3",
 				"-s",
@@ -357,8 +362,14 @@ async function main(): Promise<void> {
 			? (routeOut.stdout.match(/^\s*local:\s*(\S+)/m)?.[1] ?? "")
 			: "";
 		if (!localAddress && interfaceName) {
-			const res = await run(["ipconfig", "getifaddr", interfaceName]);
-			localAddress = res.stdout.trim();
+			const res =
+				process.platform === "linux"
+					? await run(["ip", "-o", "-4", "addr", "show", "dev", interfaceName])
+					: await run(["ipconfig", "getifaddr", interfaceName]);
+			localAddress =
+				process.platform === "linux"
+					? (res.stdout.match(/inet (\S+?)\//)?.[1] ?? "")
+					: res.stdout.trim();
 		}
 		if (!localAddress) {
 			notes.push(
