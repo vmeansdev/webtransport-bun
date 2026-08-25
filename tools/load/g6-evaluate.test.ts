@@ -618,6 +618,7 @@ describe("g6-classified/2 evaluator", () => {
 		expect(result.source).toEqual({
 			candidateSha: CANDIDATE,
 			graderSha: GRADER_SHA,
+			generatorHost: GENERATOR_HOST,
 		});
 		expect(result.publication.steadyRungs).toHaveLength(
 			fixture.expected.steadyRungs,

@@ -36,32 +36,34 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
+	mkdirSync,
 	readFileSync,
 	renameSync,
 	writeFileSync,
 } from "node:fs";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { $ } from "bun";
 import { createServer } from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
+import { canonicalGeneratorIdentity } from "../offbox/host-identity.ts";
 import {
+	type BoundarySnapshot,
 	buildBenchArtifact,
-	clientWindow,
-	clientProcessFailureReasons,
+	buildRetainedG6ClientRoleEvidence,
 	chooseClientProvenance,
+	clientProcessFailureReasons,
+	clientWindow,
 	compareWindowDelivery,
 	deriveBoundaryWindows,
+	type EmitterPhase,
 	HOTSPOT_PHASE_BARRIER_PARTIES,
 	HOTSPOT_PHASE_BARRIER_STEADY_SKEW_MS,
 	indexClientBundlesByLaunchRole,
-	deltaBoundarySnapshot,
 	readPhaseMarker,
+	renderRetainedG6ClientRoleLog,
 	requireClientReportIdentity,
 	summarizePhaseBarrier,
-	type BoundarySnapshot,
-	type ClientReportV2,
-	type EmitterPhase,
 	validateSourceBinding,
 } from "./g6-artifact.ts";
 import { g6MacgenCloneCommand } from "./g6-offbox.ts";
@@ -76,20 +78,19 @@ import {
 	RAID_PUBLISHER_HZ,
 	REALM_LADDER,
 	SNAPSHOT_HZ,
-	SNAPSHOT_PAYLOAD_BYTES,
 	STORM_RECONNECT_DELAY_MS,
 	stormCohorts,
 	stormWindowSec,
 	UPSTREAM_PAYLOAD_BYTES,
 } from "./g6-plan.ts";
-import { createMonotonicClock } from "./latency-clock.ts";
 import {
-	REGISTERED_G6_SERVER_CORE_PLAN,
 	createG6ServerCore,
 	freshG6ServerState,
 	type Player,
+	REGISTERED_G6_SERVER_CORE_PLAN,
 	type ServerState,
 } from "./g6-server-core.ts";
+import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	CLASS_ACK,
 	CLASS_RAID,
@@ -148,7 +149,7 @@ const POST_STORM_SECONDS = 60;
 const OUT_JSON = process.env.G6_OUT ?? join(ROOT, "tools/load/bench-g6.json");
 const OUT_CSV = OUT_JSON.replace(/\.json$/, ".csv");
 const HAS_PROC = process.platform === "linux";
-const SERVER_HOSTNAME = hostname();
+const SERVER_HOSTNAME = canonicalGeneratorIdentity(hostname());
 const HOTSPOT_PHASE_BARRIER_DIR =
 	process.env.G6_PHASE_BARRIER_DIR ?? "/tmp/webtransport-g6-phase-barriers";
 
@@ -277,20 +278,6 @@ function readKernelUdp(): KernelUdp | null {
 	} catch {
 		return null;
 	}
-}
-
-function diffKernelUdp(
-	a: KernelUdp | null,
-	b: KernelUdp | null,
-): KernelUdp | null {
-	if (!a || !b) return null;
-	const out: KernelUdp = {};
-	for (const k of Object.keys(b)) {
-		const from = a[k];
-		const to = b[k];
-		if (from !== undefined && to !== undefined) out[k] = to - from;
-	}
-	return out;
 }
 
 function sha256Hex(text: string): string {
@@ -504,19 +491,26 @@ async function main(): Promise<void> {
 	});
 
 	const flush = () => {
+		const artifact = buildBenchArtifact({
+			...buildResult(),
+			preregistrationSha256,
+		});
 		const tmp = `${OUT_JSON}.partial`;
-		writeFileSync(
-			tmp,
-			`${JSON.stringify(
-				buildBenchArtifact({
-					...buildResult(),
-					preregistrationSha256,
-				}),
-				null,
-				2,
-			)}\n`,
-		);
+		writeFileSync(tmp, `${JSON.stringify(artifact, null, 2)}\n`);
 		renameSync(tmp, OUT_JSON);
+		const rawDir = join(dirname(OUT_JSON), "raw");
+		mkdirSync(rawDir, { recursive: true });
+		for (const role of ["realm", "subscriber", "publisher"] as const) {
+			const evidence = buildRetainedG6ClientRoleEvidence(artifact, role);
+			writeFileSync(
+				join(rawDir, `${role}-report.json`),
+				`${JSON.stringify(evidence, null, 2)}\n`,
+			);
+			writeFileSync(
+				join(rawDir, `${role}.log`),
+				renderRetainedG6ClientRoleLog(evidence),
+			);
+		}
 	};
 
 	try {
@@ -974,17 +968,24 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 	const state = o.state();
 	const acceptSeries = state.acceptSeries;
 	const severAt = marks.stormStart?.wallMs ?? null;
+	const requiredMark = (
+		key: "start" | "steadyStart" | "drainStart" | "drainEnd" | "idleStart",
+	): BoundarySnapshot => {
+		const mark = marks[key];
+		if (!mark) throw new Error(`bench-g6: required ${key} boundary is missing`);
+		return mark;
+	};
 	const {
 		steady: steadyWindow,
 		steadyDrain: steadyDrainWindow,
 		lifetime: lifetimeWindow,
 		storm: stormWindow,
 	} = deriveBoundaryWindows({
-		start: marks.start!,
-		steadyStart: marks.steadyStart!,
-		drainStart: marks.drainStart!,
-		drainEnd: marks.drainEnd!,
-		idleStart: marks.idleStart!,
+		start: requiredMark("start"),
+		steadyStart: requiredMark("steadyStart"),
+		drainStart: requiredMark("drainStart"),
+		drainEnd: requiredMark("drainEnd"),
+		idleStart: requiredMark("idleStart"),
 		stormStart: marks.stormStart,
 		stormEnd: marks.stormEnd,
 	});
@@ -1219,7 +1220,9 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 				localFallback: localClientProvenance(o.candidateSha, realmRaw.exitCode),
 			}),
 			realmStderr: realmRaw.stderrLines,
+			realmStdout: realmRaw.stdoutLines,
 			realmExitCode: realmRaw.exitCode,
+			realmOutputTruncated: realmRaw.outputTruncated,
 			subscriber: subscriberReport,
 			subscriberProvenance: chooseClientProvenance({
 				provenanceLines: subscriberBundle?.provenanceLines,
@@ -1230,7 +1233,9 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 					: [],
 			}),
 			subscriberStderr: subscriberBundle?.stderrLines ?? [],
+			subscriberStdout: subscriberBundle?.stdoutLines ?? [],
 			subscriberExitCode: subscriberBundle?.exitCode ?? null,
+			subscriberOutputTruncated: subscriberBundle?.outputTruncated ?? false,
 			publisher: publisherReport,
 			publisherProvenance: chooseClientProvenance({
 				provenanceLines: publisherBundle?.provenanceLines,
@@ -1241,7 +1246,9 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 					: [],
 			}),
 			publisherStderr: publisherBundle?.stderrLines ?? [],
+			publisherStdout: publisherBundle?.stdoutLines ?? [],
 			publisherExitCode: publisherBundle?.exitCode ?? null,
+			publisherOutputTruncated: publisherBundle?.outputTruncated ?? false,
 		},
 	};
 }
@@ -1284,11 +1291,13 @@ type SpawnedClient = {
 type PumpedClient = {
 	report: Record<string, unknown> | null;
 	provenanceLines: string[];
+	stdoutLines: string[];
 	stderrLines: string[];
 	exitCode: number;
+	outputTruncated: boolean;
 };
 
-const MAX_CLIENT_STDERR_LINES = 40;
+const MAX_RETAINED_CLIENT_OUTPUT_LINES = 100_000;
 
 function spawnClient(
 	args: string[],
@@ -1454,14 +1463,20 @@ async function pumpClient(
 ): Promise<PumpedClient> {
 	let report: Record<string, unknown> | null = null;
 	const provenanceLines: string[] = [];
+	const stdoutLines: string[] = [];
 	const stderrLines: string[] = [];
 	const stdoutDecoder = new TextDecoder();
 	const stderrDecoder = new TextDecoder();
 	let bufferedStdout = "";
 	let bufferedStderr = "";
+	let outputTruncated = false;
 	const debugExtras = process.env.G6_DEBUG_EXTRAS === "1";
-	const rememberStderr = (line: string) => {
-		if (stderrLines.length < MAX_CLIENT_STDERR_LINES) stderrLines.push(line);
+	const remember = (lines: string[], line: string) => {
+		if (lines.length < MAX_RETAINED_CLIENT_OUTPUT_LINES) {
+			lines.push(line);
+		} else {
+			outputTruncated = true;
+		}
 	};
 	const drainStdout = (async () => {
 		for await (const chunk of client.child.stdout ?? []) {
@@ -1471,6 +1486,7 @@ async function pumpClient(
 			const lines = bufferedStdout.split("\n");
 			bufferedStdout = lines.pop() ?? "";
 			for (const line of lines) {
+				remember(stdoutLines, line);
 				onLine(line);
 				if (debugExtras && extraLabel) console.error(`${extraLabel}| ${line}`);
 				if (line.startsWith("macgen: ")) provenanceLines.push(line);
@@ -1480,6 +1496,7 @@ async function pumpClient(
 			}
 		}
 		if (bufferedStdout.length > 0) {
+			remember(stdoutLines, bufferedStdout);
 			onLine(bufferedStdout);
 			if (debugExtras && extraLabel) {
 				console.error(`${extraLabel}| ${bufferedStdout}`);
@@ -1498,14 +1515,21 @@ async function pumpClient(
 			});
 			const lines = bufferedStderr.split("\n");
 			bufferedStderr = lines.pop() ?? "";
-			for (const line of lines) rememberStderr(line);
+			for (const line of lines) remember(stderrLines, line);
 		}
-		if (bufferedStderr.length > 0) rememberStderr(bufferedStderr);
+		if (bufferedStderr.length > 0) remember(stderrLines, bufferedStderr);
 	})();
 	await Promise.all([drainStdout, drainStderr]);
 	const exitCode = await client.exited;
 	activeChildren.delete(client.child);
-	return { report, provenanceLines, stderrLines, exitCode };
+	return {
+		report,
+		provenanceLines,
+		stdoutLines,
+		stderrLines,
+		exitCode,
+		outputTruncated,
+	};
 }
 
 async function sampleWhile(

@@ -118,8 +118,10 @@ export type ClientReportV2 = {
 export type ClientProcessEvidence = {
 	report: Record<string, unknown> | null;
 	provenanceLines: string[];
+	stdoutLines?: string[];
 	stderrLines: string[];
 	exitCode: number;
+	outputTruncated?: boolean;
 };
 
 /**
@@ -136,7 +138,15 @@ export function indexClientBundlesByLaunchRole<R extends string>(
 			`bench-g6: launched ${roles.length} side role(s) but collected ${bundles.length} bundle(s)`,
 		);
 	}
-	return new Map(roles.map((role, index) => [role, bundles[index]!]));
+	return new Map(
+		roles.map((role, index) => {
+			const bundle = bundles[index];
+			if (!bundle) {
+				throw new Error(`bench-g6: missing collected bundle for ${role}`);
+			}
+			return [role, bundle];
+		}),
+	);
 }
 
 export function clientProcessFailureReasons(
@@ -155,6 +165,9 @@ export function clientProcessFailureReasons(
 	}
 	if (requireOffboxProvenance && (bundle?.provenanceLines.length ?? 0) === 0) {
 		reasons.push(`${role} client produced no off-box provenance lines`);
+	}
+	if (bundle?.outputTruncated) {
+		reasons.push(`${role} client output exceeded the retained evidence bound`);
 	}
 	return reasons;
 }
@@ -602,6 +615,99 @@ export function buildBenchArtifact<
 		},
 		...rest,
 	};
+}
+
+export type G6RetainedClientRole = "realm" | "subscriber" | "publisher";
+
+const RETAINED_CLIENT_ROLE_KEYS = {
+	realm: {
+		report: "realm",
+		provenance: "realmProvenance",
+		stdout: "realmStdout",
+		stderr: "realmStderr",
+		exitCode: "realmExitCode",
+		outputTruncated: "realmOutputTruncated",
+	},
+	subscriber: {
+		report: "subscriber",
+		provenance: "subscriberProvenance",
+		stdout: "subscriberStdout",
+		stderr: "subscriberStderr",
+		exitCode: "subscriberExitCode",
+		outputTruncated: "subscriberOutputTruncated",
+	},
+	publisher: {
+		report: "publisher",
+		provenance: "publisherProvenance",
+		stdout: "publisherStdout",
+		stderr: "publisherStderr",
+		exitCode: "publisherExitCode",
+		outputTruncated: "publisherOutputTruncated",
+	},
+} as const;
+
+function stringArray(value: unknown): string[] {
+	return Array.isArray(value)
+		? value.filter((item): item is string => typeof item === "string")
+		: [];
+}
+
+export function buildRetainedG6ClientRoleEvidence(
+	artifact: unknown,
+	role: G6RetainedClientRole,
+): Record<string, unknown> {
+	const root = asObject(artifact);
+	if (!root) throw new Error("bench-g6: retained evidence needs an artifact");
+	const preRegistration = asObject(root.preRegistration);
+	if (!preRegistration) {
+		throw new Error(
+			"bench-g6: retained evidence needs preregistration identity",
+		);
+	}
+	const keys = RETAINED_CLIENT_ROLE_KEYS[role];
+	const arms = Array.isArray(root.arms) ? root.arms : [];
+	return {
+		schema: "g6-client-role-evidence/1",
+		role,
+		preRegistration,
+		source: root.source ?? null,
+		records: arms.map((value) => {
+			const arm = asObject(value);
+			const raw = asObject(arm?.rawReports);
+			return {
+				arm: typeof arm?.arm === "string" ? arm.arm : null,
+				sessions: typeof arm?.sessions === "number" ? arm.sessions : null,
+				report: raw?.[keys.report] ?? null,
+				provenanceLines: stringArray(raw?.[keys.provenance]),
+				stdoutLines: stringArray(raw?.[keys.stdout]),
+				stderrLines: stringArray(raw?.[keys.stderr]),
+				exitCode:
+					typeof raw?.[keys.exitCode] === "number" ? raw[keys.exitCode] : null,
+				outputTruncated: raw?.[keys.outputTruncated] === true,
+			};
+		}),
+	};
+}
+
+export function renderRetainedG6ClientRoleLog(
+	evidence: Record<string, unknown>,
+): string {
+	const records = Array.isArray(evidence.records) ? evidence.records : [];
+	const lines: string[] = [];
+	for (const value of records) {
+		const record = asObject(value);
+		if (!record) continue;
+		lines.push(
+			`=== arm=${String(record.arm)} sessions=${String(record.sessions)} exit=${String(record.exitCode)} truncated=${String(record.outputTruncated === true)} ===`,
+		);
+		for (const line of stringArray(record.stdoutLines)) {
+			lines.push(`stdout: ${line}`);
+		}
+		for (const line of stringArray(record.stderrLines)) {
+			lines.push(`stderr: ${line}`);
+		}
+	}
+	return `${lines.join("\n")}\n`;
 }
 
 export function chooseClientProvenance(input: {

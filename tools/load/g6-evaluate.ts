@@ -91,7 +91,11 @@ export type G6ClassifiedV2 = {
 	schema: "g6-classified/2";
 	preRegistration: { id: string; path: string; sha256: string };
 	inputSha256: G6EvaluationRequest["inputSha256"];
-	source: { candidateSha: string; graderSha: string };
+	source: {
+		candidateSha: string;
+		graderSha: string;
+		generatorHost: string;
+	};
 	normalizedFacts: Record<string, unknown>;
 	publication: {
 		steadyRungs: Record<string, unknown>[];
@@ -1877,6 +1881,7 @@ export function evaluateG6(request: G6EvaluationRequest): G6ClassifiedV2 {
 		source: {
 			candidateSha: request.expectedCandidate,
 			graderSha: request.graderSha,
+			generatorHost: request.expectedGeneratorHost,
 		},
 		normalizedFacts: {
 			preflight: { down: preflightDown.observed, up: preflightUp.observed },

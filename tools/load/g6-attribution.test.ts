@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import type { ClientReportV2 } from "./g6-artifact.ts";
 import {
+	type AttributionIdentityLeg,
 	buildBalancedLaneOrder,
 	buildLaneContract,
 	buildSharedAttributionPlan,
@@ -12,24 +14,32 @@ import {
 	evaluateAttributionOutcome,
 	validateAttributionIdentity,
 	validateMinimalJsAddonContract,
-	type AttributionIdentityLeg,
 } from "./g6-attribution.ts";
-import type { ClientReportV2 } from "./g6-artifact.ts";
 import {
-	buildIdentityLeg,
-	closeWithin,
-	deriveIdleBand,
 	type AggregateResult,
+	AttributionExecutionError,
 	type AttributionLegManifest,
-	renderManifestJson,
-	renderAggregateArtifacts,
+	attributionHostIdentity,
+	buildAttributionClientInvocation,
+	buildAttributionFailureArtifacts,
+	buildIdentityLeg,
+	classifyAttributionClientExit,
+	closeWithin,
+	combineAttributionCleanupFailure,
+	deriveIdleBand,
 	portableEvidenceName,
+	renderAggregateArtifacts,
+	renderAttributionRawProcessReport,
+	renderManifestJson,
 	resolveMatrixProvenance,
+	retainAttributionOutputLine,
 	settleToIdleBand,
 	terminateChildWithin,
-	withFreshBuildDirectory,
-	withAttributionRunContext,
+	validateOffboxGeneratorProvenance,
 	waitForRustServerExit,
+	withAttributionLegScratchDirectory,
+	withAttributionRunContext,
+	withFreshBuildDirectory,
 } from "./g6-attribution-server.ts";
 
 const PREREG_SHA =
@@ -365,6 +375,44 @@ describe("shared attribution plan", () => {
 		rmSync(base, { recursive: true, force: true });
 	});
 
+	test("generates a certificate that covers the off-box server address", async () => {
+		const base = mkdtempSync(join(tmpdir(), "g6-attribution-san-test-"));
+		const outDir = join(base, "new-output");
+
+		await withAttributionRunContext(
+			{ outDir, serverNames: ["localhost", "127.0.0.1", "10.99.0.2"] },
+			async ({ tls }) => {
+				const certificate = execFileSync(
+					"openssl",
+					["x509", "-in", tls.certPath, "-noout", "-text"],
+					{ encoding: "utf8" },
+				);
+				expect(certificate).toContain("IP Address:10.99.0.2");
+			},
+		);
+
+		rmSync(base, { recursive: true, force: true });
+	});
+
+	test("removes each transient leg directory after success and failure", async () => {
+		let successful = "";
+		await withAttributionLegScratchDirectory(async (scratchDir) => {
+			successful = scratchDir;
+			await Bun.write(join(scratchDir, "transient.json"), "{}\n");
+			expect(existsSync(scratchDir)).toBe(true);
+		});
+		expect(existsSync(successful)).toBe(false);
+
+		let failed = "";
+		await expect(
+			withAttributionLegScratchDirectory(async (scratchDir) => {
+				failed = scratchDir;
+				throw new Error("leg failed");
+			}),
+		).rejects.toThrow("leg failed");
+		expect(existsSync(failed)).toBe(false);
+	});
+
 	test("stores only portable relative evidence names in the aggregate", () => {
 		const root = "/private/tmp/g6-attribution";
 		const legPath = join(root, "00-full-js.json");
@@ -375,6 +423,168 @@ describe("shared attribution plan", () => {
 		expect(() =>
 			portableEvidenceName(root, "/private/tmp/elsewhere.json"),
 		).toThrow("g6-attribution: evidence path escaped the output directory");
+	});
+
+	test("runs every authoritative off-box client through the Mac Rust entrypoint", () => {
+		const invocation = buildAttributionClientInvocation({
+			clientBinary: "/runner/target/release/mmo-client",
+			clientArgs: ["--role", "realm", "--url", "https://10.99.0.2:4433"],
+			jsonPath: "/runner/evidence/client.json",
+			deadlineSeconds: 240,
+			execution: {
+				kind: "offbox",
+				sshDestination: "vmeansdev@10.99.0.1",
+				serverAddress: "10.99.0.2",
+				candidateSha: CANDIDATE_SHA,
+				expectedBinarySha256: CLIENT_SHA,
+				expectedGeneratorHost: "mac-generator",
+			},
+		});
+
+		expect(invocation.command).toBe("ssh");
+		expect(invocation.args).toEqual([
+			"-o",
+			"BatchMode=yes",
+			"vmeansdev@10.99.0.1",
+			"tools/offbox/mac-generator-entry-g6.sh",
+			"--candidate",
+			CANDIDATE_SHA,
+			"--bin",
+			"mmo-client",
+			"--deadline",
+			"240",
+			"--",
+			"--role",
+			"realm",
+			"--url",
+			"https://10.99.0.2:4433",
+		]);
+		expect(invocation.args).not.toContain("--json-out");
+	});
+
+	test("binds the runner and Mac host pair and rejects remote provenance drift", () => {
+		const report = {
+			provenance: {
+				host: "mac-generator.example",
+				arch: "arm64",
+				os: "Darwin/25.6.0",
+				candidate: CANDIDATE_SHA,
+				head: CANDIDATE_SHA,
+				dirty: false,
+				binarySha256: CLIENT_SHA,
+				rustc: "1.95.0",
+				buildSeconds: 2,
+				watchdogFired: false,
+				exitCode: 0,
+			},
+			problems: [],
+		};
+		const provenance = validateOffboxGeneratorProvenance(
+			report,
+			CANDIDATE_SHA,
+			CLIENT_SHA,
+			"mac-generator",
+		);
+
+		expect(provenance.generatorHost).toBe("mac-generator");
+		expect(provenance.binarySha256).toBe(CLIENT_SHA);
+		expect(
+			attributionHostIdentity("runner-a.example", provenance.generatorHost),
+		).toBe("runner=runner-a;generator=mac-generator");
+		expect(() =>
+			validateOffboxGeneratorProvenance(
+				{
+					...report,
+					provenance: {
+						...report.provenance,
+						binarySha256: "a".repeat(64),
+					},
+				},
+				CANDIDATE_SHA,
+				CLIENT_SHA,
+				"mac-generator",
+			),
+		).toThrow(/binary sha256/i);
+		expect(() =>
+			validateOffboxGeneratorProvenance(
+				report,
+				CANDIDATE_SHA,
+				CLIENT_SHA,
+				"different-mac",
+			),
+		).toThrow(/generator host/i);
+	});
+
+	test("classifies failed clients and retains source-bound partial process evidence", () => {
+		const bounded: string[] = [];
+		expect(retainAttributionOutputLine(bounded, "a", 2)).toBe(true);
+		expect(retainAttributionOutputLine(bounded, "b", 2)).toBe(true);
+		expect(retainAttributionOutputLine(bounded, "c", 2)).toBe(false);
+		expect(bounded).toEqual(["a", "b"]);
+
+		const primary = new AttributionExecutionError({
+			terminalStatus: "INVALID",
+			stage: "client-report-identity",
+			message: "client evidence failed",
+			exitCode: 3,
+			stdoutLines: ["retained-client-proof"],
+			stderrLines: ["client stderr"],
+			outputTruncated: false,
+		});
+		const combined = combineAttributionCleanupFailure(
+			primary,
+			new Error("reap timed out"),
+			"server-cleanup",
+		);
+		expect(combined.evidence.terminalStatus).toBe("INVALID");
+		expect(combined.evidence.stage).toBe("client-report-identity");
+		expect(combined.evidence.stdoutLines).toEqual(["retained-client-proof"]);
+		expect(combined.evidence.stderrLines).toEqual([
+			"client stderr",
+			"server-cleanup: reap timed out",
+		]);
+		expect(combined.message).toContain("client evidence failed");
+		expect(combined.message).toContain("reap timed out");
+
+		expect(classifyAttributionClientExit(-1)).toBe("ABORTED");
+		expect(classifyAttributionClientExit(4)).toBe("ABORTED");
+		expect(classifyAttributionClientExit(255)).toBe("ABORTED");
+		expect(classifyAttributionClientExit(3)).toBe("INVALID");
+		expect(classifyAttributionClientExit(1)).toBe("INVALID");
+
+		const failure = buildAttributionFailureArtifacts({
+			lane: "full-js",
+			orderIndex: 0,
+			preRegistrationSha256: PREREG_SHA,
+			candidateSha: CANDIDATE_SHA,
+			hostIdentity: "runner=runner-a;generator=mac-generator",
+			clientBinarySha256: null,
+			serverBinarySha256: null,
+			failure: {
+				terminalStatus: "INVALID",
+				stage: "client-source-provision",
+				message: "candidate checkout failed",
+				exitCode: 3,
+				stdoutLines: ["macgen: host=mac-generator"],
+				stderrLines: ["candidate is not reachable"],
+				outputTruncated: false,
+			},
+		});
+
+		expect(failure.leg.rawProcessReports).toEqual({
+			client: failure.clientPath,
+			server: failure.serverPath,
+		});
+		expect(failure.client).toMatchObject({
+			candidateSha: CANDIDATE_SHA,
+			hostIdentity: "runner=runner-a;generator=mac-generator",
+			stdoutLines: ["macgen: host=mac-generator"],
+			stderrLines: ["candidate is not reachable"],
+		});
+		expect(failure.server).toMatchObject({
+			candidateSha: CANDIDATE_SHA,
+			failure: { terminalStatus: "INVALID" },
+		});
 	});
 
 	test("creates and then removes a fresh controlled build directory", async () => {
@@ -425,7 +635,11 @@ describe("shared attribution plan", () => {
 			},
 			identity: { valid: true, reasons: [] },
 			outcome: { valid: true, reasons: [], cpuAttributionAllowed: true },
-			profiles: { available: false as const, reason: "not collected" },
+			profiles: {
+				available: false as const,
+				reason: "not collected",
+				files: [] as [],
+			},
 		};
 		const executedLegs = [
 			{ lane: "full-js" as const, orderIndex: 0, identityLeg: leg },
@@ -475,7 +689,11 @@ describe("shared attribution plan", () => {
 			},
 			identity: { valid: true, reasons: [] },
 			outcome: { valid: true, reasons: [], cpuAttributionAllowed: true },
-			profiles: { available: false as const, reason: "not collected" },
+			profiles: {
+				available: false as const,
+				reason: "not collected",
+				files: [] as [],
+			},
 		};
 		const executedLegs = [
 			{ lane: "full-js" as const, orderIndex: 0, identityLeg: leg },
@@ -521,11 +739,34 @@ describe("shared attribution plan", () => {
 			phaseMarkers: leg.phaseMarkers,
 			stdoutLines: [],
 			stderrLines: [],
+			outputTruncated: false,
 			rawServer: {},
+			rawProcessReports: {
+				client: "raw/00-full-js-client.json",
+				server: "raw/00-full-js-server.json",
+			},
 			identityLeg: leg,
 		};
 
 		expect(renderManifestJson(manifest)).toBe(renderManifestJson(manifest));
+		const clientRaw = JSON.parse(
+			renderAttributionRawProcessReport(manifest, "client"),
+		) as Record<string, unknown>;
+		const serverRaw = JSON.parse(
+			renderAttributionRawProcessReport(manifest, "server"),
+		) as Record<string, unknown>;
+		expect(clientRaw).toMatchObject({
+			schema: "g6-attribution-process/1",
+			process: "client",
+			candidateSha: CANDIDATE_SHA,
+			preRegistration: leg.preRegistration,
+		});
+		expect(serverRaw).toMatchObject({
+			schema: "g6-attribution-process/1",
+			process: "server",
+			candidateSha: CANDIDATE_SHA,
+			preRegistration: leg.preRegistration,
+		});
 	});
 
 	test("truthful explicit timestamps can differ without changing evaluator semantics", () => {
