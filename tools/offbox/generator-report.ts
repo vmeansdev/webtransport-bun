@@ -203,7 +203,13 @@ function parseMmoClientEnvelope(
 	const datagramsSent = jsonFieldNumber(steady, "sent");
 	const datagramsErr = jsonFieldNumber(steady, "sendErr");
 	const driveWindowSec = jsonFieldNumber(config, "steadySec");
+	const scheduleLagDue = jsonFieldNumber(steady, "scheduleTicksDue");
 	const scheduleLagFired = jsonFieldNumber(steady, "scheduleTicksFired");
+	const scheduleLagSkipped = jsonFieldNumber(steady, "scheduleTicksSkipped");
+	const scheduleLagUnpresented = jsonFieldNumber(
+		steady,
+		"scheduleTicksUnpresented",
+	);
 	const scheduleLagReconciled = steady?.scheduleTicksReconciled;
 	const scheduleLagSamples = jsonFieldNumber(scheduleLag, "count");
 	const rxSnapshot = jsonFieldNumber(steadyDrain, "rxSnapshot");
@@ -223,7 +229,10 @@ function parseMmoClientEnvelope(
 		datagramsSent === null ||
 		datagramsErr === null ||
 		driveWindowSec === null ||
+		scheduleLagDue === null ||
 		scheduleLagFired === null ||
+		scheduleLagSkipped === null ||
+		scheduleLagUnpresented === null ||
 		scheduleLagSamples === null ||
 		rxSnapshot === null ||
 		rxAck === null ||
@@ -250,6 +259,15 @@ function parseMmoClientEnvelope(
 	}
 	if (scheduleLagReconciled !== true) {
 		return "mmo-client steady window scheduleTicksReconciled must be true";
+	}
+	// Recomputed from the raw counters, never trusted from the boolean: every
+	// due tick is fired, skipped, or measured as never-presented at the
+	// window-close boundary.
+	if (
+		scheduleLagDue !==
+		scheduleLagFired + scheduleLagSkipped + scheduleLagUnpresented
+	) {
+		return "mmo-client steady window schedule ledger did not reconcile from raw counters";
 	}
 	if (scheduleLagSamples !== scheduleLagFired) {
 		return "mmo-client steady window scheduleLag count did not match scheduleTicksFired";

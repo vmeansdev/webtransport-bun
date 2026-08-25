@@ -16,6 +16,8 @@ import {
 	actionEveryNthTick,
 	armShape,
 	DELIVERY_FLOOR,
+	exactStaggeredWindowDue,
+	exactTicksDueAfter,
 	G6_CLOSEOUT_SPEC_ID,
 	G6_CLOSEOUT_SPEC_PATH,
 	downstreamWireOccupancy,
@@ -193,5 +195,60 @@ describe("closeout authority", () => {
 			"docs/research/preregistrations/gate-g6-mmo-closeout.md",
 		);
 		expect(existsSync(resolve(repoRoot, G6_CLOSEOUT_SPEC_PATH))).toBe(true);
+	});
+});
+
+describe("exact staggered window due", () => {
+	test("matches the client's measured due for the empirically observed shapes", () => {
+		// Floor c6 on 2026-08-25 measured scheduleTicksDue = 4791 for the
+		// 20-session, 60-second, 4 Hz floor arm — the naive 20 × 4 × 60 = 4800
+		// product overcounts sessions whose stagger offset trims one tick.
+		expect(
+			exactStaggeredWindowDue({
+				durationSec: 60,
+				intervalSec: 0.25,
+				totalSessions: 20,
+				startIndex: 0,
+				count: 20,
+			}),
+		).toBe(4791);
+		expect(
+			exactStaggeredWindowDue({
+				durationSec: 120,
+				intervalSec: 0.25,
+				totalSessions: 5000,
+				startIndex: 0,
+				count: 5000,
+			}),
+		).toBe(2_397_501);
+	});
+
+	test("a population slice keeps the offsets of its original fleet indices", () => {
+		const whole = exactStaggeredWindowDue({
+			durationSec: 120,
+			intervalSec: 0.25,
+			totalSessions: 5000,
+			startIndex: 0,
+			count: 5000,
+		});
+		const cohort = exactStaggeredWindowDue({
+			durationSec: 120,
+			intervalSec: 0.25,
+			totalSessions: 5000,
+			startIndex: 0,
+			count: 1000,
+		});
+		const survivors = exactStaggeredWindowDue({
+			durationSec: 120,
+			intervalSec: 0.25,
+			totalSessions: 5000,
+			startIndex: 1000,
+			count: 4000,
+		});
+		expect(cohort + survivors).toBe(whole);
+	});
+
+	test("a single session at offset zero equals the naive product", () => {
+		expect(exactTicksDueAfter(120, 1 / 20, 0)).toBe(120 * 20);
 	});
 });

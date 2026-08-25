@@ -59,6 +59,10 @@ export type ClientMeasurementWindow = {
 	scheduleTicksDue: number;
 	scheduleTicksFired: number;
 	scheduleTicksSkipped: number;
+	/** Ticks due inside the window that the session's ticker never presented
+	 * before close — the measured window-close boundary, a fourth counter
+	 * beside due/fired/skipped rather than a value inferred from them. */
+	scheduleTicksUnpresented: number;
 	scheduleTicksReconciled: boolean;
 	rxSnapshot: number;
 	rxAck: number;
