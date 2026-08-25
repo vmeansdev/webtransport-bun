@@ -38,9 +38,13 @@ Per rung:
 - **S1 ingest** — server-ingested upstream / client-sent upstream (steady
   window) ≥ **0.995**
 - **S2 delivery** — client-received snapshots (steady+drain) / server-issued
-  (steady) ≥ **0.995**
-- **S3 duty** — server-issued snapshots / registered demand
-  (sessions × 15 × 120) ≥ **0.99**
+  ≥ **0.995**. The issued figure is the **steady+drain** emitter counter:
+  emission stops at the steady edge, so the drain tail contains only
+  late-resolved bookings of steady-window sends — the steady-only counter
+  systematically undercounts at the hot edge (async result booking) and
+  would inflate this clause.
+- **S3 duty** — server-issued snapshots (same steady+drain counter) /
+  registered demand (sessions × 15 × 120) ≥ **0.99**
 - **S4 ack RTT** — client ack RTT p99 (steady+drain) ≤ **25 ms**
 - **S5 session survival** — sessions lost during steady ≤ **0.1 %** of the
   rung
@@ -50,13 +54,22 @@ Both are terminal verdicts for that rung under this registration.
 
 ## 4. Validity (refusals, not misses; `G6_SHARDED_VALIDITY`)
 
-A rung produces no verdict if any of: candidate SHA mismatch; shard count ≠
-16; paced emitter enabled (the registered emitter is the per-player batch
-path with persistent buffers); steady window ≠ 120 s; conductor or client
-exit nonzero; any connect error (`sessionsErr > 0`); empty ack-RTT
-histogram; or — run-scoped — the post-run `steer_stats` dump shows zero
-steered packets (kernel-hash fallback masquerading as CID steering would be
-invisible in every other counter).
+A rung produces no verdict if any of: candidate SHA mismatch; configured
+shard count ≠ 16; client endpoints ≠ 128; paced emitter enabled (the
+registered emitter is the per-player batch path with persistent buffers);
+steady window ≠ 120 s; conductor or client exit nonzero; any connect error
+(`sessionsErr > 0`); emitter send errors ≠ 0; zero snapshots issued; empty
+ack-RTT histogram; **shard survival** — fewer than 16 shard entries with
+complete boundary windows, duplicate server ids, or per-shard
+sessions-at-steady not summing to the rung (a shard dying mid-steady must
+refuse, never deflate the aggregate into an honest-looking MISS); **window
+integrity** — any shard's steady window wall-clock outside 120 s ± 250 ms
+(event-loop-clocked marks stretch under load and would inflate S1).
+
+Run-scoped: the post-run `steer_stats` dump must show steered short-header
+packets ≥ **0.9 ×** the summed steady upstream across all rungs. A merely
+non-zero bound would validate a 99.9 %-kernel-hash run on residue; the
+fallback counter cannot serve, since it legitimately holds every Initial.
 
 ## 5. Producer, grader, and independence
 
@@ -84,9 +97,21 @@ tools with `--subnet` set to the VPC:
 
 ## 7. Run rules
 
-One licensed dispatch of the three-rung ladder. Infrastructure refusals
-(droplet provisioning, BPF pin setup, connect-phase stall before steady)
-retain their artifacts and license a redispatch the same day; a rung that
-reaches its steady window is graded from that attempt, whatever it shows.
-Rungs are graded independently: an invalid rung does not invalidate its
-siblings (except the run-scoped steering falsifier, which invalidates all).
+One licensed dispatch of the three-rung ladder. The BPF maps are freshly
+re-pinned (`tools/load/g6-shard-bpf-setup.sh 16`) immediately before
+dispatch, which zeroes `steer_stats` — qualification residue never feeds the
+steering floor. The dump is taken with exactly
+`bpftool map dump pinned /sys/fs/bpf/quic-lb/steer_stats -j` after the last
+rung; an unusable dump is a refusal, not an error.
+
+Infrastructure refusals (droplet provisioning, BPF pin setup, connect-phase
+stall before steady) retain their artifacts and license a redispatch the
+same day. A rung that reaches its steady window is graded from that attempt
+— except that a **validity refusal** (any §4 item other than the run-scoped
+steering floor) also licenses one same-day redispatch of that rung: a flaky
+connect error must cost a retry, not leave the rung permanently
+verdict-less. Caveat, accepted at registration: if frontier-rung overload
+ever migrates into the connect phase, that rung can only refuse, never
+produce its registered acceptable MISS — a refusal there is itself a
+finding. Rungs are graded independently: an invalid rung does not
+invalidate its siblings (except the steering floor, which invalidates all).
