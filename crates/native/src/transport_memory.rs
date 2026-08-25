@@ -140,10 +140,12 @@ mod tests {
 
     #[test]
     fn malformed_relational_limits_stay_nonzero() {
-        let mut limits = Limits::default();
-        limits.max_datagram_size = 0;
-        limits.max_queued_bytes_per_session = 0;
-        limits.max_queued_bytes_per_stream = 0;
+        let limits = Limits {
+            max_datagram_size: 0,
+            max_queued_bytes_per_session: 0,
+            max_queued_bytes_per_stream: 0,
+            ..Limits::default()
+        };
 
         let policy = TransportMemoryPolicy::from_limits(&limits);
 
@@ -155,10 +157,12 @@ mod tests {
 
     #[test]
     fn payload_floor_wins_when_datagram_exceeds_stream_budgets() {
-        let mut limits = Limits::default();
-        limits.max_datagram_size = 4096;
-        limits.max_queued_bytes_per_session = 1;
-        limits.max_queued_bytes_per_stream = 1;
+        let limits = Limits {
+            max_datagram_size: 4096,
+            max_queued_bytes_per_session: 1,
+            max_queued_bytes_per_stream: 1,
+            ..Limits::default()
+        };
 
         let policy = TransportMemoryPolicy::from_limits(&limits);
 
@@ -170,9 +174,11 @@ mod tests {
 
     #[test]
     fn saturates_windows_at_quic_varint_limit() {
-        let mut limits = Limits::default();
-        limits.max_queued_bytes_per_session = u64::MAX;
-        limits.max_queued_bytes_per_stream = u64::MAX;
+        let limits = Limits {
+            max_queued_bytes_per_session: u64::MAX,
+            max_queued_bytes_per_stream: u64::MAX,
+            ..Limits::default()
+        };
 
         let policy = TransportMemoryPolicy::from_limits(&limits);
 
@@ -191,8 +197,10 @@ mod tests {
 
     #[test]
     fn clamps_datagram_buffers_to_the_configured_payload_floor() {
-        let mut limits = Limits::default();
-        limits.max_datagram_size = 1200;
+        let limits = Limits {
+            max_datagram_size: 1200,
+            ..Limits::default()
+        };
         let policy =
             TransportMemoryPolicy::from_limits(&limits).with_datagram_buffers(&limits, 64, 32);
 
