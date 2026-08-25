@@ -275,17 +275,30 @@ export function gradeRung(
 }
 
 /** Total steered short-header packets from a `bpftool -j` percpu dump, or a
- * refusal reason string when the dump is unusable. */
+ * refusal reason string when the dump is unusable.
+ *
+ * bpftool emits two shapes for the same map: numeric keys/values when the
+ * map's BTF association survived pinning, and little-endian hex byte arrays
+ * (`["0x59","0x48",...]`) when it did not — the registered rig produces the
+ * latter. Both decode here; anything else refuses. */
 export function steeredTotal(text: string): number | string {
+	const littleEndian = (bytes: string[]): number =>
+		bytes.reduce((sum, byte, index) => {
+			const parsed = Number.parseInt(byte, 16);
+			if (Number.isNaN(parsed)) throw new Error(`bad byte ${byte}`);
+			return sum + parsed * 256 ** index;
+		}, 0);
+	const decode = (value: number | string[]): number =>
+		Array.isArray(value) ? littleEndian(value) : value;
 	try {
 		const dump = JSON.parse(text) as Array<{
-			key: number;
-			values: Array<{ value: number }>;
+			key: number | string[];
+			values: Array<{ value: number | string[] }>;
 		}>;
 		return dump
-			.filter((row) => row.key === 0)
+			.filter((row) => decode(row.key) === 0)
 			.flatMap((row) => row.values)
-			.reduce((sum, entry) => sum + entry.value, 0);
+			.reduce((sum, entry) => sum + decode(entry.value), 0);
 	} catch (error) {
 		return `steer_stats dump unusable: ${String(error)}`;
 	}
