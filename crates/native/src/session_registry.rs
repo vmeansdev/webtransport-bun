@@ -861,7 +861,9 @@ mod tests {
     // reserved budget; a laxer value silently reopens the accounting hole.
     #[test]
     fn zero_copy_threshold_bounds_backing_overhead_to_two_x() {
-        assert!(TRANSPORT_ZERO_COPY_MIN_PAYLOAD * 2 >= TRANSPORT_DATAGRAM_BACKING_ESTIMATE);
+        const {
+            assert!(TRANSPORT_ZERO_COPY_MIN_PAYLOAD * 2 >= TRANSPORT_DATAGRAM_BACKING_ESTIMATE);
+        }
     }
 
     // `into_transport_slot` cannot be exercised directly (`Datagram` has no
@@ -1140,7 +1142,7 @@ mod tests {
 
         metrics.release_datagram_capacity(&sm.queued_bytes, &session_notify, SESSION_MAX);
 
-        let _ = timeout(Duration::from_millis(100), second_send)
+        timeout(Duration::from_millis(100), second_send)
             .await
             .expect("the first outbound send's direct release must wake the second")
             .expect("second send task must not panic")

@@ -197,11 +197,12 @@ mod tests {
     use crate::server_metrics::ServerMetrics;
     use std::future::pending;
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Mutex;
 
     /// Env-var stall/verbose seams are process-global; serialize those tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn wait_for(predicate: impl Fn() -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -222,8 +223,8 @@ mod tests {
         TEST_STALL_STREAM_EXIT_ONCE.store(false, Ordering::SeqCst);
     }
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().expect("env lock")
+    async fn lock_env() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().await
     }
 
     fn clear_stall_env() {
@@ -252,7 +253,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn server_scoped_tasks_are_counted_under_owner_id() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         let metrics = Arc::new(ServerMetrics::default());
         spawn_tracked(
@@ -275,7 +276,7 @@ mod tests {
     /// and made "all sessions drained" unobservable.
     #[tokio::test(flavor = "current_thread")]
     async fn accept_tasks_are_counted_apart_from_session_tasks() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         let metrics = Arc::new(ServerMetrics::default());
         spawn_tracked(
@@ -312,7 +313,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn aborts_are_isolated_per_server_id() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         let metrics_a = Arc::new(ServerMetrics::default());
         let metrics_b = Arc::new(ServerMetrics::default());
@@ -344,7 +345,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stream_and_session_tasks_complete_and_decrement_gauges() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         let metrics = Arc::new(ServerMetrics::default());
         spawn_tracked(
@@ -368,7 +369,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn panic_scopes_are_contained() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         std::env::remove_var("WEBTRANSPORT_VERBOSE_PANICS");
         let metrics = Arc::new(ServerMetrics::default());
@@ -400,7 +401,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn panic_verbose_env_path_is_contained() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         let metrics = Arc::new(ServerMetrics::default());
         std::env::set_var("WEBTRANSPORT_VERBOSE_PANICS", "1");
@@ -418,7 +419,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stall_exit_second_claim_returns_immediately() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         reset_stall_flags();
         let metrics = Arc::new(ServerMetrics::default());
         std::env::remove_var("WEBTRANSPORT_TEST_STALL_TRACKED_SESSION_EXIT");
@@ -455,7 +456,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stall_session_exit_enters_sleep_then_abort() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         reset_stall_flags();
         std::env::remove_var("WEBTRANSPORT_TEST_STALL_TRACKED_STREAM_EXIT");
         let metrics = Arc::new(ServerMetrics::default());
@@ -494,7 +495,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn panic_conn_scope_closes_connection() {
-        let _guard = lock_env();
+        let _guard = lock_env().await;
         clear_stall_env();
         use crate::client::insecure_loopback_client_config;
         use crate::limits::Limits;
