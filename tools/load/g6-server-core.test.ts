@@ -430,10 +430,10 @@ describe("g6 server core", () => {
 		}) => {
 			const phaseState = { current: "steady" as EmitterPhase };
 			const stateRef = { value: freshG6ServerState() };
-			const nowNs = [
-				400, 450, 500, 550, 600, 625, 1_000, 1_000, 1_020_000_000,
-				1_020_000_000,
-			];
+			// The tick's window-start and handoff stamps stay within one slice of
+			// each other: a synthetic jump here would (correctly) trigger the
+			// emitter's timer catch-up and double the lag recordings this test pins.
+			const nowNs = [400, 450, 500, 550, 600, 625, 1_000, 1_000, 1_000, 1_000];
 			const nowMs = [1, 2, 3, 4];
 			const verboseLogs: string[] = [];
 			const humanReadableRows: string[] = [];
@@ -582,7 +582,10 @@ describe("g6 server core", () => {
 		await flushAsyncWork();
 
 		expect(stateRef.value.emitter.snapshotDue).toBe(1500);
-		expect(stateRef.value.emitter.snapshotIssued).toBe(1416);
+		// Before timer catch-up this read 1416: the 14 skipped firings were lost
+		// demand (gate g6-sharded-01's S3 MISS, duty 0.949-0.988). Late slices
+		// are now emitted in bounded catch-up passes, so issued meets due.
+		expect(stateRef.value.emitter.snapshotIssued).toBe(1500);
 	});
 
 	test("a plannedSessions getter books the population it reads at booking time", async () => {

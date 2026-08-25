@@ -412,8 +412,17 @@ export function createG6ServerCore(options: {
 		const bookedSlicesRef = { value: 0 };
 		const emittedSlicesRef = { value: 0 };
 		const sliceNs = plan.sliceMs * 1e6;
-		const timer = scheduler.setInterval(() => {
-			if (stopped) return;
+		/**
+		 * One slice of emission. Returns true when the emitter is still behind
+		 * schedule after this slice — the caller then runs another slice in the
+		 * same timer fire. This is the timer catch-up that g6-sharded-01's S3
+		 * MISS measured the absence of: missed setInterval ticks used to be
+		 * lost demand (duty 0.988→0.949 as load grew); now they are emitted
+		 * late, bounded per fire, with their true lag on the histogram.
+		 * Behindness is judged from the slice's own handoff stamp — no extra
+		 * clock reads.
+		 */
+		const runSlice = (): boolean => {
 			const phaseName = phase();
 			if (
 				phaseName !== "steady" &&
@@ -441,9 +450,12 @@ export function createG6ServerCore(options: {
 				bookedSlicesRef.value = 0;
 				emittedSlicesRef.value = 0;
 			}
-			if (!planned.emit) return;
+			if (!planned.emit) return false;
 			const { deadlineNs, sliceIndex } = planned.emit;
 			const handoffNs = options.clock.now();
+			const behindAfter = (): boolean =>
+				window !== null &&
+				handoffNs >= window.startedNs + window.sliceIndex * sliceNs;
 			const state = options.state();
 			if (
 				totalSteadySlices !== null &&
@@ -484,7 +496,7 @@ export function createG6ServerCore(options: {
 				planned.emit.kind === "steady" &&
 				emitSliceIndex >= totalSteadySlices
 			) {
-				return;
+				return false;
 			}
 			emittedSlicesRef.value += 1;
 			const paced = options.pacedMirror?.() ?? null;
@@ -539,7 +551,7 @@ export function createG6ServerCore(options: {
 					state.emitter.snapshotIssued -= failures.length;
 					state.emitter.sendErrors += failures.length;
 				}
-				return;
+				return behindAfter();
 			}
 			for (const player of chunk) {
 				sequence += 1;
@@ -580,6 +592,16 @@ export function createG6ServerCore(options: {
 					.catch(() => {
 						state.emitter.sendErrors += 1;
 					});
+			}
+			return behindAfter();
+		};
+		const timer = scheduler.setInterval(() => {
+			if (stopped) return;
+			// Catch-up, bounded to one full snapshot tick per fire: a late timer
+			// emits its backlog instead of losing it, and anything beyond the cap
+			// rolls to the next fire.
+			for (let pass = 0; pass < plan.slicesPerTick; pass += 1) {
+				if (!runSlice()) break;
 			}
 		}, plan.sliceMs);
 		(timer as { unref?: () => void }).unref?.();
