@@ -193,7 +193,7 @@ function waitListening(port: number, ms = 5_000): Promise<boolean> {
 			// lsof, not nc: a connection probe would consume the `-1` one-shot
 			// server's single client and kill it before the real client dials.
 			const probe = spawn(
-				"/usr/sbin/lsof",
+				Bun.which("lsof") ?? "/usr/sbin/lsof",
 				["-nP", `-iTCP:${String(port)}`, "-sTCP:LISTEN"],
 				{ stdio: ["ignore", "ignore", "ignore"] },
 			);
