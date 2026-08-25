@@ -9,9 +9,12 @@
  * fail-closed rules live in tracked, tested code rather than in YAML.
  *
  * Reads `G6_SOURCE_BOUND` (the JSON) and `G6_MODE`, and prints one
- * `G6_<NAME>=<value>` line per field on stdout — nothing else — so the
- * workflow can `eval` the output and append the same lines to `GITHUB_ENV`.
- * Any defect refuses with exit 2 before a single line is printed.
+ * `G6_<NAME>=<value>` line per field on stdout — nothing else. The workflow
+ * writes that output to a temp file and later `cat`s it into `GITHUB_ENV`; it
+ * never `eval`s it. Every value is held to a strict allowlist charset with no
+ * shell metacharacters, so a line can carry no code even if a downstream
+ * consumer were to mishandle it. Any defect refuses with exit 2 before a
+ * single line is printed.
  *
  * Mode rules: `g6-mmo` requires the full twelve; `g6-attribution` requires
  * the registration and host fields and refuses quartet fields outright — an
@@ -19,6 +22,10 @@
  */
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
+// Allowlists, not denylists: only these characters may appear, so no shell
+// metacharacter (; | & $ ` ( ) < > quotes, backslash, space) can ride through.
+const HOST_RE = /^[A-Za-z0-9._-]+$/;
+const PATH_RE = /^\/[A-Za-z0-9._/-]+$/;
 
 type FieldRule = {
 	key: string;
@@ -85,18 +92,20 @@ export function parseSourceBound(
 		if (typeof field !== "string" || field === "") {
 			throw new Error(`source-bound: '${rule.key}' is required`);
 		}
-		if (/\s/.test(field)) {
-			throw new Error(
-				`source-bound: '${rule.key}' must not contain whitespace`,
-			);
-		}
 		if (rule.kind === "sha256" && !SHA256_RE.test(field)) {
 			throw new Error(
 				`source-bound: '${rule.key}' must be lowercase 64-hex, got '${field}'`,
 			);
 		}
-		if (rule.kind === "path" && !field.startsWith("/")) {
-			throw new Error(`source-bound: '${rule.key}' must be an absolute path`);
+		if (rule.kind === "host" && !HOST_RE.test(field)) {
+			throw new Error(
+				`source-bound: '${rule.key}' must match ${HOST_RE} (no shell metacharacters), got '${field}'`,
+			);
+		}
+		if (rule.kind === "path" && !PATH_RE.test(field)) {
+			throw new Error(
+				`source-bound: '${rule.key}' must be an absolute path matching ${PATH_RE} (no shell metacharacters), got '${field}'`,
+			);
 		}
 		lines.push(`${rule.env}=${field}`);
 	}

@@ -216,11 +216,17 @@ jobs:
               exit 2
             fi
           done
-          if ! PARSED="$(G6_SOURCE_BOUND="$SOURCE_BOUND" G6_MODE="$MODE" bun tools/load/g6-source-bound.ts)"; then
+          # The validator emits only allowlisted KEY=value lines (no shell
+          # metacharacters) to a temp file. We never eval its output — a value
+          # can carry no code. The one field an in-step refusal needs (the
+          # expected runner host) is read back with grep, not eval, and the
+          # whole file is appended to GITHUB_ENV only after the last refusal.
+          PARSED_FILE="$RUNNER_TEMP/g6-source-bound-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.env"
+          if ! G6_SOURCE_BOUND="$SOURCE_BOUND" G6_MODE="$MODE" bun tools/load/g6-source-bound.ts > "$PARSED_FILE"; then
             echo "::error::source-bound input rejected"
             exit 2
           fi
-          eval "$PARSED"
+          EXPECTED_RUNNER_HOST="$(grep '^G6_EXPECTED_RUNNER_HOST=' "$PARSED_FILE" | cut -d= -f2-)"
           ACTUAL_HEAD="$(git rev-parse HEAD)"
           if [ "$ACTUAL_HEAD" != "$CANDIDATE_SHA" ]; then
             echo "::error::Checked-out HEAD $ACTUAL_HEAD differs from registered candidate $CANDIDATE_SHA"
@@ -231,14 +237,14 @@ jobs:
             exit 2
           fi
           ACTUAL_RUNNER_HOST="$(hostname -s)"
-          if [ "$ACTUAL_RUNNER_HOST" != "$G6_EXPECTED_RUNNER_HOST" ]; then
-            echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $G6_EXPECTED_RUNNER_HOST"
+          if [ "$ACTUAL_RUNNER_HOST" != "$EXPECTED_RUNNER_HOST" ]; then
+            echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $EXPECTED_RUNNER_HOST"
             exit 2
           fi
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BUNDLE_DIR="$GITHUB_WORKSPACE/.bench-evidence/g6-${MODE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           TREE_SHA="$(git rev-parse 'HEAD^{tree}')"
-          printf '%s\n' "$PARSED" >> "$GITHUB_ENV"
+          cat "$PARSED_FILE" >> "$GITHUB_ENV"
           echo "G6_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
           echo "G6_TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
           echo "G6_RUN_EXIT=not-run" >> "$GITHUB_ENV"

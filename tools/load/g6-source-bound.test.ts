@@ -75,7 +75,7 @@ describe("g6-source-bound", () => {
 		);
 	});
 
-	test("refuses unknown fields, malformed hashes, relative paths, and whitespace", () => {
+	test("refuses unknown fields, malformed hashes, and relative paths", () => {
 		expect(() =>
 			parseSourceBound(
 				JSON.stringify({ ...REGISTRATION, extra: "x" }),
@@ -94,15 +94,46 @@ describe("g6-source-bound", () => {
 				"g6-attribution",
 			),
 		).toThrow("absolute path");
-		expect(() =>
-			parseSourceBound(
-				JSON.stringify({
-					...REGISTRATION,
-					registrationPath: "/home/run ner/reg.md",
-				}),
-				"g6-attribution",
-			),
-		).toThrow("whitespace");
+	});
+
+	// The workflow captures this tool's stdout and appends it to GITHUB_ENV.
+	// A value carrying a shell metacharacter or whitespace must be refused
+	// before any line is emitted — otherwise a crafted host/path could inject
+	// shell state or forge an env stamp. (Regression for the eval-sink defect.)
+	test("refuses shell metacharacters and whitespace in hosts and paths", () => {
+		const hostAttacks = [
+			"host;touch /tmp/x",
+			"host`id`",
+			"host$(id)",
+			"host|cat",
+			"host&whoami",
+			"host with space",
+			"host\ttab",
+			"host>redirect",
+			'host"quote',
+		];
+		for (const expectedGeneratorHost of hostAttacks) {
+			expect(() =>
+				parseSourceBound(
+					JSON.stringify({ ...REGISTRATION, expectedGeneratorHost }),
+					"g6-attribution",
+				),
+			).toThrow("no shell metacharacters");
+		}
+		const pathAttacks = [
+			"/home/runner;rm -rf x",
+			"/home/runner/$(id)",
+			"/home/run ner/reg.md",
+			"/home/runner/`id`",
+		];
+		for (const registrationPath of pathAttacks) {
+			expect(() =>
+				parseSourceBound(
+					JSON.stringify({ ...REGISTRATION, registrationPath }),
+					"g6-attribution",
+				),
+			).toThrow("no shell metacharacters");
+		}
 	});
 
 	test("refuses non-JSON, non-object JSON, and unsupported modes", () => {
