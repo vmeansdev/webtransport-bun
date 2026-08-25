@@ -394,6 +394,17 @@ function parseClientWindow(
 		rtt: boolean;
 		oneWay: boolean;
 		expectedDue?: number;
+		/**
+		 * When set, a session lost mid-window forfeits at most this many due
+		 * ticks, so the registered demand is checked as the exact band
+		 * `expectedDue − sessionsLost × cap ≤ due ≤ expectedDue` instead of a
+		 * strict equality. Connect health is enforced separately (sessionsOk
+		 * must equal the registered population, sessionsErr must be zero), so
+		 * every session enters the window and every shortfall is attributable
+		 * to a counted loss. Windows whose population must survive intact —
+		 * the floor and the publisher — omit this and stay exact.
+		 */
+		expectedDueLossCapTicks?: number;
 	},
 	reasons: string[],
 	allHistograms: HistogramFacts[],
@@ -434,10 +445,28 @@ function parseClientWindow(
 				`V-A ${path}: sent ${sent} + sendErr ${sendErr} != fired ${fired}`,
 			);
 		}
-		if (options.expectedDue !== undefined && due !== options.expectedDue) {
-			reasons.push(
-				`V-A ${path}: schedule due ${due}, expected registered ${options.expectedDue}`,
-			);
+		if (options.expectedDue !== undefined) {
+			if (options.expectedDueLossCapTicks === undefined) {
+				if (due !== options.expectedDue) {
+					reasons.push(
+						`V-A ${path}: schedule due ${due}, expected registered ${options.expectedDue}`,
+					);
+				}
+			} else {
+				// The capacity cap makes over-booking impossible for a healthy
+				// client, and each counted loss forfeits at most one window.
+				const lossFloor =
+					options.expectedDue - sessionsLost * options.expectedDueLossCapTicks;
+				if (due > options.expectedDue) {
+					reasons.push(
+						`V-A ${path}: schedule due ${due} exceeds registered ${options.expectedDue}`,
+					);
+				} else if (due < lossFloor) {
+					reasons.push(
+						`V-A ${path}: schedule due ${due} below ${lossFloor} (registered ${options.expectedDue} less ${sessionsLost} counted losses at ${options.expectedDueLossCapTicks} ticks each)`,
+					);
+				}
+			}
 		}
 	}
 	if (ackUnreflected > rxAck) {
@@ -710,6 +739,9 @@ function buildSteadyFacts(
 			rtt: false,
 			oneWay: false,
 			expectedDue: expectedUpstream,
+			// A session lost mid-steady forfeits at most one full window of
+			// due, boundary tick included.
+			expectedDueLossCapTicks: MOVE_HZ * G6_STEADY_SECONDS + 1,
 		},
 		reasons,
 		allHistograms,
@@ -1706,6 +1738,9 @@ export function evaluateG6(request: G6EvaluationRequest): G6ClassifiedV2 {
 						startIndex: cohort,
 						count: survivorCount,
 					}),
+					// A survivor lost mid-storm is a counted, clause-visible
+					// event (S-C1); it forfeits at most one storm window of due.
+					expectedDueLossCapTicks: MOVE_HZ * G6_STORM_WINDOW_SECONDS + 1,
 				},
 				validityReasons,
 				allHistograms,
