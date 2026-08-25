@@ -240,7 +240,7 @@ function writeCompleteFullOutputs(
 }
 
 describe("G6 bundle producer", () => {
-	test.skip("workflow keeps every benchmark mode disjoint and verifies successor bundles before upload (requires explicit remote/upload authorization)", () => {
+	test("workflow keeps every benchmark mode disjoint and finalizes, verifies, uploads, then enforces successor bundles", () => {
 		const workflow = readFileSync(
 			join(import.meta.dir, "../../.github/workflows/bench-bandwidth.yml"),
 			"utf8",
@@ -257,23 +257,83 @@ describe("G6 bundle producer", () => {
 		]) {
 			expect(workflow).toContain(`github.event.inputs.mode == '${mode}'`);
 		}
+		expect(workflow).toContain(
+			"bandwidth|session-scale|g6-mmo|g6-attribution) ;;",
+		);
+		expect(workflow).toContain("timeout-minutes: 180");
 		const prepare = workflow.indexOf(
 			"- name: Prepare successor evidence bundle",
 		);
+		const g6Mmo = workflow.indexOf("- name: Run G6 MMO realm gate");
 		const attribution = workflow.indexOf("- name: Run G6 attribution matrix");
+		const evaluate = workflow.indexOf("- name: Evaluate G6 MMO realm gate");
 		const finalize = workflow.indexOf(
 			"- name: Finalize successor evidence bundle",
 		);
 		const verify = workflow.indexOf("- name: Verify successor evidence bundle");
-		const upload = workflow.indexOf("uses: actions/upload-artifact@");
+		const g6Upload = workflow.indexOf(
+			"- name: Upload successor evidence bundle",
+		);
+		const enforce = workflow.indexOf(
+			"- name: Enforce successor evidence bundle",
+		);
+		const legacyUpload = workflow.indexOf(
+			"- name: Upload legacy benchmark artifacts",
+		);
 		expect(prepare).toBeGreaterThan(0);
+		expect(g6Mmo).toBeGreaterThan(prepare);
 		expect(attribution).toBeGreaterThan(prepare);
+		expect(evaluate).toBeGreaterThan(g6Mmo);
+		expect(finalize).toBeGreaterThan(evaluate);
 		expect(finalize).toBeGreaterThan(attribution);
 		expect(verify).toBeGreaterThan(finalize);
-		expect(upload).toBeGreaterThan(verify);
+		expect(g6Upload).toBeGreaterThan(verify);
+		expect(enforce).toBeGreaterThan(g6Upload);
+		expect(legacyUpload).toBeGreaterThan(0);
+		expect(g6Upload).toBeGreaterThan(legacyUpload);
 		expect(workflow).toContain(
-			"if: $" + "{{ always() && steps.verify_g6_bundle.outcome == 'success' }}",
+			"if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'bandwidth' || github.event.inputs.mode == 'session-scale') }}",
 		);
+		expect(workflow).toContain(
+			"if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}",
+		);
+		expect(workflow).toContain("retention-days: 90");
+		expect(workflow).toContain("include-hidden-files: true");
+		expect(workflow).toContain("path: ${{ env.G6_BUNDLE_DIR }}");
+		expect(workflow).toContain("if-no-files-found: error");
+		expect(workflow).not.toContain(
+			"steps.verify_g6_bundle.outcome == 'success'",
+		);
+		expect(workflow).toContain("G6_ATTR_OUT_DIR: ${{ env.G6_BUNDLE_DIR }}");
+		expect(workflow).toContain(
+			"G6_ATTR_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}",
+		);
+		expect(workflow).toContain(
+			"G6_ATTR_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}",
+		);
+		expect(workflow).toContain(
+			"G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}",
+		);
+		expect(workflow).toContain('G6_OUT="$G6_BUNDLE_DIR/bench-g6.json"');
+		expect(workflow).toContain("bun tools/load/g6-attribution-server.ts");
+		expect(workflow).toContain("bun tools/load/bench-g6.ts");
+		expect(workflow).toContain("bun tools/load/g6-evaluate.ts");
+		expect(workflow).toContain("bun tools/load/g6-bundle.ts");
+		expect(workflow).toContain("finalize");
+		expect(workflow).toContain("bun tools/load/g6-manifest.ts verify");
+		expect(workflow).toContain("G6_FINALIZE_EXIT=");
+		expect(workflow).toContain("G6_VERIFY_EXIT=");
+		expect(workflow).toContain("G6_UPLOAD_FAILED=");
+		expect(workflow).toContain("G6_BUNDLE_STATUS=");
+		expect(workflow).toContain("G6_EVALUATOR_EXIT=");
+		expect(workflow).toContain("G6_RUN_EXIT=");
+		expect(workflow).toContain("steps.finalize_g6_bundle.outcome");
+		expect(workflow).toContain("steps.verify_g6_bundle.outcome");
+		expect(workflow).toContain("steps.upload_g6_bundle.outcome");
+		expect(workflow).toContain("COMPLETE");
+		expect(workflow).not.toContain("bench-g6-*");
+		expect(workflow).not.toContain("key.pem");
+		expect(workflow).not.toContain(".tmp-g6-tls");
 	});
 
 	test("prepares a new authority-bound directory and finalizes a complete attribution bundle", () => {
