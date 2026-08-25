@@ -8,7 +8,7 @@ use g6_protocol::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -240,6 +240,7 @@ struct Options {
     server_settings: ServerSettings,
     phase_path: Option<PathBuf>,
     summary_json: Option<PathBuf>,
+    ready_path: Option<PathBuf>,
 }
 
 impl Options {
@@ -261,6 +262,7 @@ impl Options {
         let mut drain_ms = DEFAULT_DRAIN_MS;
         let mut phase_path = None;
         let mut summary_json = None;
+        let mut ready_path = None;
         let mut max_sessions = None;
         let mut max_handshakes_in_flight = None;
         let mut max_streams_per_session_bidi = None;
@@ -373,6 +375,9 @@ impl Options {
                         "--summary-json",
                     )?));
                 }
+                "--ready-path" => {
+                    ready_path = Some(PathBuf::from(parse_string_arg(&mut args, "--ready-path")?));
+                }
                 _ => {}
             }
         }
@@ -423,8 +428,38 @@ impl Options {
             },
             phase_path,
             summary_json,
+            ready_path,
         })
     }
+}
+
+fn ready_marker_temp_path(path: &Path) -> PathBuf {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(format!(".tmp.{}", std::process::id()));
+    PathBuf::from(temp)
+}
+
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_ready_marker(path: &Path) -> std::io::Result<()> {
+    remove_file_if_present(path)?;
+    remove_file_if_present(&ready_marker_temp_path(path))
+}
+
+fn publish_ready_marker(path: &Path, port: u16) -> std::io::Result<()> {
+    let temp = ready_marker_temp_path(path);
+    remove_file_if_present(&temp)?;
+    std::fs::write(
+        &temp,
+        format!("{{\"schema\":\"g6-rust-server-ready/1\",\"port\":{port}}}\n"),
+    )?;
+    std::fs::rename(temp, path)
 }
 
 fn parse_string_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -1184,6 +1219,9 @@ async fn emitter_loop(shared: Arc<SharedState>, phase_path: Option<PathBuf>, opt
 }
 
 async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = options.ready_path.as_deref() {
+        clear_ready_marker(path)?;
+    }
     let plan = G6ServerCorePlan::registered();
     let identity = Identity::load_pemfiles(&options.cert_pem, &options.key_pem).await?;
     let transport = apply_transport_settings(options.server_settings)?;
@@ -1253,6 +1291,9 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
+    if let Some(path) = options.ready_path.as_deref() {
+        publish_ready_marker(path, options.port)?;
+    }
 
     let total_wait = Duration::from_secs(options.duration_secs + options.idle_secs)
         + Duration::from_millis(options.drain_ms);
@@ -1412,6 +1453,8 @@ mod tests {
             "cert.pem".to_string(),
             "--key-pem".to_string(),
             "key.pem".to_string(),
+            "--ready-path".to_string(),
+            "ready.json".to_string(),
             "--max-sessions".to_string(),
             "128".to_string(),
             "--max-handshakes-in-flight".to_string(),
@@ -1481,6 +1524,30 @@ mod tests {
         assert_eq!(options.server_settings.rate_limits.streams_burst, 94);
         assert_eq!(options.server_settings.rate_limits.datagrams_per_sec, 95);
         assert_eq!(options.server_settings.rate_limits.datagrams_burst, 96);
+        assert_eq!(options.ready_path, Some(PathBuf::from("ready.json")));
+    }
+
+    #[test]
+    fn publishes_atomic_source_owned_readiness_marker() {
+        let marker = std::env::temp_dir().join(format!(
+            "g6-server-ready-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let temp = ready_marker_temp_path(&marker);
+
+        publish_ready_marker(&marker, 4_433).expect("publish marker");
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            "{\"schema\":\"g6-rust-server-ready/1\",\"port\":4433}\n"
+        );
+        assert!(!temp.exists());
+        clear_ready_marker(&marker).expect("clear marker");
+        assert!(!marker.exists());
     }
 
     #[test]

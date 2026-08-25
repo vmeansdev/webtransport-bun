@@ -37,6 +37,7 @@ import {
 	terminateChildWithin,
 	validateOffboxGeneratorProvenance,
 	waitForRustServerExit,
+	waitForRustServerReady,
 	withAttributionLegScratchDirectory,
 	withAttributionRunContext,
 	withFreshBuildDirectory,
@@ -182,6 +183,166 @@ describe("shared attribution plan", () => {
 		]);
 
 		expect(result).toBe(0);
+	});
+
+	test("waits for a source-owned direct-rust readiness marker before launch", async () => {
+		class ReadyChild extends EventEmitter {
+			exitCode: number | null = null;
+			signalCode: NodeJS.Signals | null = null;
+		}
+		const child = new ReadyChild() as unknown as ChildProcess;
+		let marker: string | null = null;
+		let notifyChange = () => {};
+		let watcherClosed = false;
+		let timerCleared = false;
+		const ready = waitForRustServerReady({
+			child,
+			readyPath: "/tmp/ready.json",
+			expectedPort: 4433,
+			timeoutMs: 20,
+			deps: {
+				fileExists: () => marker !== null,
+				readText: () => marker ?? "",
+				watchReadyPath: (_path, onChange) => {
+					notifyChange = onChange;
+					return () => {
+						watcherClosed = true;
+					};
+				},
+				setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+				clearTimer: () => {
+					timerCleared = true;
+				},
+			},
+		});
+		marker = JSON.stringify({
+			schema: "g6-rust-server-ready/1",
+			port: 4433,
+		});
+		notifyChange();
+		await expect(ready).resolves.toBeUndefined();
+		expect(watcherClosed).toBe(true);
+		expect(timerCleared).toBe(true);
+	});
+
+	test("fails closed for every direct-rust readiness refusal", async () => {
+		const aliveChild = new EventEmitter() as EventEmitter & {
+			exitCode: number | null;
+			signalCode: NodeJS.Signals | null;
+		};
+		aliveChild.exitCode = null;
+		aliveChild.signalCode = null;
+		const exitedChild = new EventEmitter() as EventEmitter & {
+			exitCode: number | null;
+			signalCode: NodeJS.Signals | null;
+		};
+		exitedChild.exitCode = 7;
+		exitedChild.signalCode = null;
+
+		await expect(
+			waitForRustServerReady({
+				child: exitedChild as unknown as ChildProcess,
+				readyPath: "/tmp/ready.json",
+				expectedPort: 4433,
+				timeoutMs: 20,
+			}),
+		).rejects.toThrow(/exited before readiness marker.*7/i);
+
+		await expect(
+			waitForRustServerReady({
+				child: aliveChild as unknown as ChildProcess,
+				readyPath: "/tmp/ready.json",
+				expectedPort: 4433,
+				timeoutMs: 20,
+				deps: {
+					fileExists: () => true,
+					readText: () =>
+						JSON.stringify({
+							schema: "g6-rust-server-ready/0",
+							port: 4433,
+						}),
+					watchReadyPath: () => () => {},
+					setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+					clearTimer: () => {},
+				},
+			}),
+		).rejects.toThrow(/readiness marker schema is invalid/i);
+
+		await expect(
+			waitForRustServerReady({
+				child: aliveChild as unknown as ChildProcess,
+				readyPath: "/tmp/ready.json",
+				expectedPort: 4433,
+				timeoutMs: 20,
+				deps: {
+					fileExists: () => true,
+					readText: () =>
+						JSON.stringify({
+							schema: "g6-rust-server-ready/1",
+							port: 4434,
+						}),
+					watchReadyPath: () => () => {},
+					setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+					clearTimer: () => {},
+				},
+			}),
+		).rejects.toThrow(/readiness marker.*port/i);
+
+		let fireTimeout = () => {};
+		await expect(
+			waitForRustServerReady({
+				child: aliveChild as unknown as ChildProcess,
+				readyPath: "/tmp/ready.json",
+				expectedPort: 4433,
+				timeoutMs: 20,
+				deps: {
+					fileExists: () => false,
+					readText: () => "",
+					watchReadyPath: () => () => {},
+					setTimer: (onTimeout) => {
+						fireTimeout = onTimeout;
+						queueMicrotask(fireTimeout);
+						return 1 as unknown as ReturnType<typeof setTimeout>;
+					},
+					clearTimer: () => {},
+				},
+			}),
+		).rejects.toThrow(/readiness marker timed out after 20ms/i);
+	});
+
+	test("accepts a valid readiness marker when its watch event is coalesced", async () => {
+		const child = new EventEmitter() as EventEmitter & {
+			exitCode: number | null;
+			signalCode: NodeJS.Signals | null;
+		};
+		child.exitCode = null;
+		child.signalCode = null;
+		let marker: string | null = null;
+		let fireDeadline = () => {};
+		const ready = waitForRustServerReady({
+			child: child as unknown as ChildProcess,
+			readyPath: "/tmp/ready.json",
+			expectedPort: 4433,
+			timeoutMs: 20,
+			deps: {
+				fileExists: () => marker !== null,
+				readText: () => marker ?? "",
+				watchReadyPath: () => () => {},
+				setTimer: (onTimeout) => {
+					fireDeadline = onTimeout;
+					return 1 as unknown as ReturnType<typeof setTimeout>;
+				},
+				clearTimer: () => {},
+			},
+		});
+
+		marker = JSON.stringify({
+			schema: "g6-rust-server-ready/1",
+			port: 4433,
+		});
+		fireDeadline();
+
+		await expect(ready).resolves.toBeUndefined();
 	});
 
 	test("terminates a hung child with bounded escalation and reaps the exit", async () => {
