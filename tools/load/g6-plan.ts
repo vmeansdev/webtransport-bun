@@ -392,3 +392,14 @@ export function exactStaggeredWindowDue(options: {
 	}
 	return total;
 }
+
+/**
+ * Client endpoints for the registered gate workload: the sessions are spread
+ * across this many client UDP sockets. The bench-g6 conductor has always run
+ * the gate's client this way; a single-socket client at the 5,000-session
+ * rung collapses on its own egress path (datagram frames accepted but never
+ * transmitted, connections starved into server idle-closes), which measures
+ * the socket, not the server. Any conductor claiming the gate's workload
+ * identity must spawn the client with exactly this value.
+ */
+export const GATE_CLIENT_ENDPOINTS = 64;

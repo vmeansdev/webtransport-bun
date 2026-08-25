@@ -72,6 +72,7 @@ import {
 	actionEveryNthTick,
 	armShape,
 	G6_CLOSEOUT_SPEC_PATH,
+	GATE_CLIENT_ENDPOINTS,
 	MOVE_HZ,
 	preflightRequirements,
 	RAID_MEMBERS,
@@ -116,7 +117,10 @@ const IDLE_SECONDS = parseInt(process.env.G6_IDLE_SECONDS ?? "30", 10);
 const SETTLE_SECONDS = parseInt(process.env.G6_SETTLE_SECONDS ?? "15", 10);
 const DRAIN_GRACE_MS = parseInt(process.env.G6_DRAIN_GRACE_MS ?? "1000", 10);
 const SAMPLE_INTERVAL_MS = parseInt(process.env.G6_SAMPLE_MS ?? "2000", 10);
-const ENDPOINTS = parseInt(process.env.G6_ENDPOINTS ?? "64", 10);
+const ENDPOINTS = parseInt(
+	process.env.G6_ENDPOINTS ?? String(GATE_CLIENT_ENDPOINTS),
+	10,
+);
 const CONNECT_CONCURRENCY = parseInt(
 	process.env.G6_CONNECT_CONCURRENCY ?? "500",
 	10,

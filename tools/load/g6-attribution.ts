@@ -3,6 +3,7 @@ import {
 	armShape,
 	exactStaggeredWindowDue,
 	exactTicksDueAfter,
+	GATE_CLIENT_ENDPOINTS,
 	G6_CLOSEOUT_SPEC_ID,
 	G6_CLOSEOUT_SPEC_PATH,
 	MOVE_HZ,
@@ -140,6 +141,7 @@ export type AttributionIdentityLeg = {
 	rateLimitedDelta: number;
 	limitExceededDelta: number;
 	clientScheduleTicksDue: number;
+	clientEndpoints: number;
 	serverSnapshotDue: number;
 	serverAckDue: number;
 	comparableStageMismatchPct: number;
@@ -624,6 +626,11 @@ export function validateAttributionIdentity(
 		}
 		if (!nearlyEqual(leg.clientScheduleTicksDue, leg.expectedMoveDue)) {
 			reasons.push(`${leg.lane} client schedule due did not match armShape`);
+		}
+		if (leg.clientEndpoints !== GATE_CLIENT_ENDPOINTS) {
+			reasons.push(
+				`${leg.lane} client ran ${leg.clientEndpoints} endpoints, the gate's registered client uses ${GATE_CLIENT_ENDPOINTS}`,
+			);
 		}
 		if (!nearlyEqual(leg.serverSnapshotDue, leg.expectedSnapshotDue)) {
 			reasons.push(`${leg.lane} snapshot due did not match armShape`);

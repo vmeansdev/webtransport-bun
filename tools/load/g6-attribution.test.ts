@@ -1,3 +1,4 @@
+import { GATE_CLIENT_ENDPOINTS } from "./g6-plan.ts";
 import { describe, expect, test } from "bun:test";
 import { type ChildProcess, execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -89,6 +90,7 @@ function makeLeg(
 		rateLimitedDelta: 0,
 		limitExceededDelta: 0,
 		clientScheduleTicksDue: plan.expectedMoveDue,
+		clientEndpoints: GATE_CLIENT_ENDPOINTS,
 		serverSnapshotDue: plan.expectedSnapshotDue,
 		serverAckDue: plan.expectedAckDue,
 		comparableStageMismatchPct: 0.0005,
@@ -584,6 +586,18 @@ describe("shared attribution plan", () => {
 		expect(() =>
 			portableEvidenceName(root, "/private/tmp/elsewhere.json"),
 		).toThrow("g6-attribution: evidence path escaped the output directory");
+	});
+
+	test("a client that did not run the gate's registered endpoint spread is refused", () => {
+		// A single-socket client at the 5,000-session rung collapses on its
+		// own egress path and measures the socket, not the server; the leg
+		// must prove it ran the gate's registered endpoint count.
+		const singleSocket = makeLeg({ clientEndpoints: 1 });
+		const verdict = validateAttributionIdentity([singleSocket]);
+		expect(verdict.valid).toBe(false);
+		expect(verdict.reasons).toContain(
+			`full-js client ran 1 endpoints, the gate's registered client uses ${GATE_CLIENT_ENDPOINTS}`,
+		);
 	});
 
 	test("runs every authoritative off-box client through the Mac Rust entrypoint", () => {
