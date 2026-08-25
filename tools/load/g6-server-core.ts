@@ -35,6 +35,8 @@ export type Player = {
 	acceptedAtMs: number;
 	kind: SessionKind;
 	alive: boolean;
+	/** Emitter-owned reusable snapshot buffers; body filled once, restamped per tick. */
+	snapshotBatch?: Uint8Array[];
 };
 
 export type EmitterCounters = {
@@ -405,6 +407,7 @@ export function createG6ServerCore(options: {
 		body.fill(plan.snapshotFillByte);
 		let sequence = 0;
 		let stopped = false;
+		let pacedTemplates: Uint8Array[] | null = null;
 		let window: EmitterWindowState | null = null;
 		const bookedSlicesRef = { value: 0 };
 		const emittedSlicesRef = { value: 0 };
@@ -497,9 +500,20 @@ export function createG6ServerCore(options: {
 				for (const player of chunk) {
 					if (player.id !== undefined) targets.push(player.id);
 				}
+				// Both native send paths copy the payload synchronously inside the
+				// call (prepare_batch / the mirror's one-copy-for-the-fan-out), so
+				// these buffers are reusable the moment the call returns. The body
+				// never changes; only the stamp is rewritten per slice.
+				if (pacedTemplates === null) {
+					pacedTemplates = [];
+					for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
+						const datagram = new Uint8Array(plan.snapshotPayloadBytes);
+						datagram.set(body);
+						pacedTemplates.push(datagram);
+					}
+				}
 				for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
-					const datagram = new Uint8Array(plan.snapshotPayloadBytes);
-					datagram.set(body);
+					const datagram = pacedTemplates[index] as Uint8Array;
 					encodeStamp(datagram, {
 						version: 3,
 						intendedNs: deadlineNs,
@@ -529,18 +543,28 @@ export function createG6ServerCore(options: {
 			}
 			for (const player of chunk) {
 				sequence += 1;
-				const batch: Uint8Array[] = [];
+				// Persistent per-player buffers: the 1150-byte body is static, so
+				// after the first fill only the 40-byte stamp is rewritten.
+				// sendDatagramBatch copies synchronously (prepare_batch), which is
+				// what licenses handing the same buffers back every tick.
+				let batch = player.snapshotBatch;
+				if (batch === undefined) {
+					batch = [];
+					for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
+						const datagram = new Uint8Array(plan.snapshotPayloadBytes);
+						datagram.set(body);
+						batch.push(datagram);
+					}
+					player.snapshotBatch = batch;
+				}
 				for (let index = 0; index < plan.snapshotDatagrams; index += 1) {
-					const datagram = new Uint8Array(plan.snapshotPayloadBytes);
-					datagram.set(body);
-					encodeStamp(datagram, {
+					encodeStamp(batch[index] as Uint8Array, {
 						version: 3,
 						intendedNs: deadlineNs,
 						actualNs: handoffNs,
 						sequence: sequence * plan.snapshotDatagrams + index,
 						klass: CLASS_SNAPSHOT,
 					});
-					batch.push(datagram);
 				}
 				if (totalSteadySlices === null) {
 					state.emitter.snapshotDue += plan.snapshotDatagrams;
