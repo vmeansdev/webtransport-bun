@@ -103,7 +103,11 @@ export function guardPeerAddress(
  * interface is measuring the wrong wire; the caller turns that into a refusal.
  */
 export function parseRouteInterface(routeGetOutput: string): string | null {
-	const match = routeGetOutput.match(/^\s*interface:\s*(\S+)\s*$/m);
+	// macOS `route -n get` prints an `interface:` line; Linux `ip route get`
+	// prints ` dev <name> ` inline.
+	const match =
+		routeGetOutput.match(/^\s*interface:\s*(\S+)\s*$/m) ??
+		routeGetOutput.match(/\bdev (\S+)/);
 	return match?.[1] ?? null;
 }
 
