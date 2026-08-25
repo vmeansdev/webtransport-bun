@@ -317,6 +317,45 @@ benefit on a real path: over a WAN, where BDP routinely exceeds 256 KiB, the
 default window — not the CPU — is what caps a single stream. Widen when you
 measure a stalled sender on a long path; do not widen speculatively.
 
+## Sizing the JS read side (stream tail latency)
+
+Everything a stream delivers to JavaScript is surfaced by **one event loop**,
+and app-observed tail latency is a queueing function of that thread's
+utilization — it degrades *nonlinearly* as the loop approaches saturation. The
+mechanism was measured end-to-end (2026-08-25, T-100 shape: 100 bidi streams,
+3 Mbps each direction, ~26.4k frames/s aggregate): with loop headroom the
+app-level p99 is **2.5 ms**; starving the same workload's CPU produced 5.2 ms
+at ~82 % and 11.5 ms at ~95 % utilization; and a host that held the loop at
+93–95 % of a slower core with unthrottled senders measured **348 ms** — a
+~140× tail inflation with near-identical throughput. Wire-level delivery was
+17 ms p99 throughout: the frames arrive; a saturated loop just doesn't run
+your callback.
+
+The rules that follow from the measurements, in order of leverage:
+
+1. **Keep the reader loop below ~80 % of a core.** On the reference hardware
+   (dedicated Intel vCPU), 100 tunnels of the shape above cost 0.9–1.15
+   cores of loop time — plan roughly **70 such streams per JS process** and
+   shard processes beyond that (`reusePort` + `quicLb` +
+   `reusePortSteering` is the supported multi-process shape). Watch the
+   loop's own utilization, not host CPU: the host can be 90 % idle while the
+   one loop that matters is critical.
+2. **Drain latency-critical streams natively.** A native-side sink that
+   timestamps and drains off the event loop held a flat 3–4 ms overhead at
+   every utilization the JS path degraded under. This exists today as
+   harness instrumentation (the g11 frame sink), not a public API — treat
+   "read latency-critical data on a saturated JS loop" as unsupported until
+   it is productized.
+3. **Worker threads help the processing, not the delivery.** Offloading
+   parse/deframe work to workers reduces loop load, but the read callback
+   itself still lands on the one loop — workers alone cannot fix a saturated
+   reader.
+4. **`WEBTRANSPORT_STREAM_BATCH_BYTES` is damping, not prevention.** Batching
+   coalesces only what has accumulated: a keeping-up reader measured 1.07
+   frames per crossing (no benefit — 11.0 vs 11.5 ms p99 at 95 %
+   utilization, identical CPU). It softens a backlog once you are already
+   behind; it does not keep you out of the critical region.
+
 ## Known limitations and compatibility
 
 - Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
@@ -369,7 +408,12 @@ What the flag is for:
 - **eBPF-steered topologies.** An `SK_REUSEPORT` program attached to the group
   can pick the socket by reading the QUIC connection ID's server-ID bytes
   instead of the 4-tuple, which is rebind-stable. That requires the server to
-  encode a server ID in the connection IDs it issues.
+  encode a server ID in the connection IDs it issues (`quicLb`), and the
+  per-process socket registration + program attach are handled by the
+  `reusePortSteering` server option — see `docs/quic-lb.md` for the full
+  bring-up. Steering engagement is only observable from the program's own
+  stats map (a silent fallback to the kernel hash is invisible in every other
+  counter), so dump it after rollout.
 - **Benchmarks and load-generation rigs**, where sessions are short and
   distribution does not have to be stable.
 
