@@ -109,63 +109,12 @@ on:
         required: false
         default: ""
         type: string
-      g6_registration_path:
-        description: "g6 modes: absolute path of the source-bound registration staged on the runner"
-        required: false
-        default: ""
-        type: string
-      g6_registration_sha256:
-        description: "g6 modes: exact SHA-256 of the staged source-bound registration"
-        required: false
-        default: ""
-        type: string
-      g6_expected_runner_host:
-        description: "g6 modes: canonical short hostname of the registered Linux runner"
-        required: false
-        default: "gravvene-dev-home"
-        type: string
-      g6_expected_generator_host:
-        description: "g6 modes: canonical short hostname of the registered Mac generator"
-        required: false
-        default: "Nikitas-MacBook-Pro"
-        type: string
-      g6_preflight_down_path:
-        description: "g6-mmo: absolute runner path of the same-day R-down JSON"
-        required: false
-        default: ""
-        type: string
-      g6_preflight_down_sha256:
-        description: "g6-mmo: exact SHA-256 of the same-day R-down JSON"
-        required: false
-        default: ""
-        type: string
-      g6_preflight_up_path:
-        description: "g6-mmo: absolute runner path of the same-day R-up JSON"
-        required: false
-        default: ""
-        type: string
-      g6_preflight_up_sha256:
-        description: "g6-mmo: exact SHA-256 of the same-day R-up JSON"
-        required: false
-        default: ""
-        type: string
-      g6_floor_path:
-        description: "g6-mmo: absolute runner path of the same-day Mac floor transcript"
-        required: false
-        default: ""
-        type: string
-      g6_floor_sha256:
-        description: "g6-mmo: exact SHA-256 of the same-day Mac floor transcript"
-        required: false
-        default: ""
-        type: string
-      g6_sink_path:
-        description: "g6-mmo: absolute runner path of the same-day sink JSON"
-        required: false
-        default: ""
-        type: string
-      g6_sink_sha256:
-        description: "g6-mmo: exact SHA-256 of the same-day sink JSON"
+      # GitHub refuses to parse a workflow with more than 25 dispatch inputs,
+      # so the twelve source-bound values ride in one JSON blob. It is decoded
+      # and fail-closed-validated by tools/load/g6-source-bound.ts before the
+      # configure step exports anything.
+      g6_source_bound:
+        description: "g6 modes: JSON with registrationPath/registrationSha256/expectedRunnerHost/expectedGeneratorHost, plus for g6-mmo the same-day preflightDown/preflightUp/floor/sink Path+Sha256 pairs (absolute runner paths)"
         required: false
         default: ""
         type: string
@@ -255,21 +204,23 @@ jobs:
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           MODE: ${{ github.event.inputs.mode }}
           OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
-          REGISTRATION_PATH: ${{ github.event.inputs.g6_registration_path }}
-          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
           PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-          EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
-          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+          SOURCE_BOUND: ${{ github.event.inputs.g6_source_bound }}
         run: |
           # Every identity check runs before anything is exported to
           # GITHUB_ENV. Later always() steps predicate on these exports, so a
           # refused configuration must leave them unset.
-          for value in "$OFFBOX_SSH" "$REGISTRATION_PATH" "$REGISTRATION_SHA256" "$PREREGISTRATION_SHA256" "$EXPECTED_RUNNER_HOST" "$EXPECTED_GENERATOR_HOST"; do
+          for value in "$OFFBOX_SSH" "$PREREGISTRATION_SHA256" "$SOURCE_BOUND"; do
             if [ -z "$value" ]; then
-              echo "::error::All source-bound G6 registration, host, and off-box inputs are required"
+              echo "::error::The off-box, preregistration, and source-bound inputs are all required"
               exit 2
             fi
           done
+          if ! PARSED="$(G6_SOURCE_BOUND="$SOURCE_BOUND" G6_MODE="$MODE" bun tools/load/g6-source-bound.ts)"; then
+            echo "::error::source-bound input rejected"
+            exit 2
+          fi
+          eval "$PARSED"
           ACTUAL_HEAD="$(git rev-parse HEAD)"
           if [ "$ACTUAL_HEAD" != "$CANDIDATE_SHA" ]; then
             echo "::error::Checked-out HEAD $ACTUAL_HEAD differs from registered candidate $CANDIDATE_SHA"
@@ -280,13 +231,14 @@ jobs:
             exit 2
           fi
           ACTUAL_RUNNER_HOST="$(hostname -s)"
-          if [ "$ACTUAL_RUNNER_HOST" != "$EXPECTED_RUNNER_HOST" ]; then
-            echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $EXPECTED_RUNNER_HOST"
+          if [ "$ACTUAL_RUNNER_HOST" != "$G6_EXPECTED_RUNNER_HOST" ]; then
+            echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $G6_EXPECTED_RUNNER_HOST"
             exit 2
           fi
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           BUNDLE_DIR="$GITHUB_WORKSPACE/.bench-evidence/g6-${MODE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           TREE_SHA="$(git rev-parse 'HEAD^{tree}')"
+          printf '%s\n' "$PARSED" >> "$GITHUB_ENV"
           echo "G6_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
           echo "G6_TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
           echo "G6_RUN_EXIT=not-run" >> "$GITHUB_ENV"
@@ -302,18 +254,6 @@ jobs:
           MODE: ${{ github.event.inputs.mode }}
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-          REGISTRATION_PATH: ${{ github.event.inputs.g6_registration_path }}
-          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
-          EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
-          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
-          PREFLIGHT_DOWN_PATH: ${{ github.event.inputs.g6_preflight_down_path }}
-          PREFLIGHT_DOWN_SHA256: ${{ github.event.inputs.g6_preflight_down_sha256 }}
-          PREFLIGHT_UP_PATH: ${{ github.event.inputs.g6_preflight_up_path }}
-          PREFLIGHT_UP_SHA256: ${{ github.event.inputs.g6_preflight_up_sha256 }}
-          FLOOR_PATH: ${{ github.event.inputs.g6_floor_path }}
-          FLOOR_SHA256: ${{ github.event.inputs.g6_floor_sha256 }}
-          SINK_PATH: ${{ github.event.inputs.g6_sink_path }}
-          SINK_SHA256: ${{ github.event.inputs.g6_sink_sha256 }}
         run: |
           KIND="attribution"
           if [ "$MODE" = "g6-mmo" ]; then KIND="full-g6"; fi
@@ -324,21 +264,21 @@ jobs:
             --tree-sha "$G6_TREE_SHA"
             --preregistration "$GITHUB_WORKSPACE/docs/research/preregistrations/gate-g6-mmo-closeout.md"
             --expected-preregistration-sha256 "$PREREGISTRATION_SHA256"
-            --registration "$REGISTRATION_PATH"
-            --expected-registration-sha256 "$REGISTRATION_SHA256"
-            --expected-runner-host "$EXPECTED_RUNNER_HOST"
-            --expected-generator-host "$EXPECTED_GENERATOR_HOST"
+            --registration "$G6_REGISTRATION_PATH"
+            --expected-registration-sha256 "$G6_REGISTRATION_SHA256"
+            --expected-runner-host "$G6_EXPECTED_RUNNER_HOST"
+            --expected-generator-host "$G6_EXPECTED_GENERATOR_HOST"
           )
           if [ "$MODE" = "g6-mmo" ]; then
             bun tools/load/g6-bundle.ts prepare "${COMMON[@]}" \
-              --preflight-down "$PREFLIGHT_DOWN_PATH" \
-              --expected-preflight-down-sha256 "$PREFLIGHT_DOWN_SHA256" \
-              --preflight-up "$PREFLIGHT_UP_PATH" \
-              --expected-preflight-up-sha256 "$PREFLIGHT_UP_SHA256" \
-              --floor "$FLOOR_PATH" \
-              --expected-floor-sha256 "$FLOOR_SHA256" \
-              --sink "$SINK_PATH" \
-              --expected-sink-sha256 "$SINK_SHA256"
+              --preflight-down "$G6_PREFLIGHT_DOWN_PATH" \
+              --expected-preflight-down-sha256 "$G6_PREFLIGHT_DOWN_SHA256" \
+              --preflight-up "$G6_PREFLIGHT_UP_PATH" \
+              --expected-preflight-up-sha256 "$G6_PREFLIGHT_UP_SHA256" \
+              --floor "$G6_FLOOR_PATH" \
+              --expected-floor-sha256 "$G6_FLOOR_SHA256" \
+              --sink "$G6_SINK_PATH" \
+              --expected-sink-sha256 "$G6_SINK_SHA256"
           else
             bun tools/load/g6-bundle.ts prepare "${COMMON[@]}"
           fi
@@ -415,7 +355,7 @@ jobs:
           G6_ATTR_OUT_DIR: ${{ env.G6_BUNDLE_DIR }}
           G6_ATTR_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
           G6_ATTR_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
-          G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+          G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ env.G6_EXPECTED_GENERATOR_HOST }}
         run: |
           set +e
           bun tools/load/g6-attribution-server.ts
@@ -428,7 +368,7 @@ jobs:
         continue-on-error: true
         env:
           EXPECTED_CANDIDATE: ${{ github.event.inputs.candidate_commit }}
-          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+          EXPECTED_GENERATOR_HOST: ${{ env.G6_EXPECTED_GENERATOR_HOST }}
           EXPECTED_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
         run: |
           set +e
@@ -464,10 +404,6 @@ jobs:
           MODE: ${{ github.event.inputs.mode }}
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-          REGISTRATION_PATH: ${{ github.event.inputs.g6_registration_path }}
-          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
-          EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
-          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
         run: |
           set +e
           KIND="attribution"
@@ -489,10 +425,10 @@ jobs:
             --tree-sha "$G6_TREE_SHA"
             --preregistration "$GITHUB_WORKSPACE/docs/research/preregistrations/gate-g6-mmo-closeout.md"
             --expected-preregistration-sha256 "$PREREGISTRATION_SHA256"
-            --registration "$REGISTRATION_PATH"
-            --expected-registration-sha256 "$REGISTRATION_SHA256"
-            --expected-runner-host "$EXPECTED_RUNNER_HOST"
-            --expected-generator-host "$EXPECTED_GENERATOR_HOST"
+            --registration "$G6_REGISTRATION_PATH"
+            --expected-registration-sha256 "$G6_REGISTRATION_SHA256"
+            --expected-runner-host "$G6_EXPECTED_RUNNER_HOST"
+            --expected-generator-host "$G6_EXPECTED_GENERATOR_HOST"
           )
           if [ -n "$REASON" ]; then
             ARGS+=(--reason "$REASON")
@@ -512,7 +448,6 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
           PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
         run: |
           set +e
           VERIFY_OUT="$RUNNER_TEMP/g6-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
@@ -520,7 +455,7 @@ jobs:
             --dir "$G6_BUNDLE_DIR" \
             --expected-candidate "$CANDIDATE_SHA" \
             --expected-preregistration-sha256 "$PREREGISTRATION_SHA256" \
-            --expected-registration-sha256 "$REGISTRATION_SHA256" \
+            --expected-registration-sha256 "$G6_REGISTRATION_SHA256" \
             > "$VERIFY_OUT"
           STATUS="$?"
           echo "G6_VERIFY_EXIT=$STATUS" >> "$GITHUB_ENV"

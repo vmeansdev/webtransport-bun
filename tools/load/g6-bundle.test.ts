@@ -312,7 +312,7 @@ describe("G6 bundle producer", () => {
 			"G6_ATTR_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}",
 		);
 		expect(workflow).toContain(
-			"G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}",
+			"G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ env.G6_EXPECTED_GENERATOR_HOST }}",
 		);
 		expect(workflow).toContain('G6_OUT="$G6_BUNDLE_DIR/bench-g6.json"');
 		expect(workflow).toContain("bun tools/load/g6-attribution-server.ts");
@@ -390,6 +390,58 @@ describe("G6 bundle producer", () => {
 		);
 		expect(preregEnv).toBeGreaterThan(mmoStep);
 		expect(preregEnv).toBeLessThan(attributionStep);
+	});
+
+	test("workflow stays dispatchable and decodes the source-bound blob before anything is exported", () => {
+		const workflow = readFileSync(
+			join(import.meta.dir, "../../.github/workflows/bench-bandwidth.yml"),
+			"utf8",
+		);
+
+		// GitHub refuses to parse a workflow with more than 25 dispatch
+		// inputs; the 33-input version 422'd on every dispatch attempt.
+		const inputsBlock = workflow.slice(
+			workflow.indexOf("    inputs:"),
+			workflow.indexOf("jobs:"),
+		);
+		const inputNames = inputsBlock.match(/^ {6}[a-z0-9_]+:$/gm) ?? [];
+		expect(inputNames.length).toBeGreaterThan(0);
+		expect(inputNames.length).toBeLessThanOrEqual(25);
+		expect(inputNames).toContain("      g6_source_bound:");
+
+		// The blob is decoded by the tracked fail-closed validator, and its
+		// values reach GITHUB_ENV only after the last identity refusal.
+		const validatorCall = workflow.indexOf("bun tools/load/g6-source-bound.ts");
+		const evalParsed = workflow.indexOf('eval "$PARSED"');
+		const exportParsed = workflow.indexOf(
+			`printf '%s\\n' "$PARSED" >> "$GITHUB_ENV"`,
+		);
+		expect(validatorCall).toBeGreaterThan(0);
+		expect(evalParsed).toBeGreaterThan(validatorCall);
+		expect(exportParsed).toBeGreaterThan(
+			workflow.indexOf("Runner host $ACTUAL_RUNNER_HOST differs"),
+		);
+		expect(workflow.indexOf("G6_CONFIGURE_OK=true")).toBeGreaterThan(
+			exportParsed,
+		);
+
+		// Nothing may still read the deleted per-field inputs.
+		for (const removed of [
+			"g6_registration_path",
+			"g6_registration_sha256",
+			"g6_expected_runner_host",
+			"g6_expected_generator_host",
+			"g6_preflight_down_path",
+			"g6_preflight_down_sha256",
+			"g6_preflight_up_path",
+			"g6_preflight_up_sha256",
+			"g6_floor_path",
+			"g6_floor_sha256",
+			"g6_sink_path",
+			"g6_sink_sha256",
+		]) {
+			expect(workflow).not.toContain(removed);
+		}
 	});
 
 	test("prepares a new authority-bound directory and finalizes a complete attribution bundle", () => {
