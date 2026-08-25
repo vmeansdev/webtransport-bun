@@ -1,1 +1,7 @@
 # Bun configuration for webtransport-bun
+
+[test]
+pathIgnorePatterns = [
+	"tools/interop/tests-wasm/wasm-server.spec.ts",
+	"tools/interop/tests/fault-matrix.spec.ts",
+]
