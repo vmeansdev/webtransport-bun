@@ -760,14 +760,23 @@ function buildSteadyFacts(
 	const expectedAck =
 		((sessions * armShape(sessions).ackAggregatePps) / sessions) *
 		G6_STEADY_SECONDS;
+	// Snapshot due is booked immutably from the registered plan (the gate's
+	// server core runs with dueAccounting configured), so exact equality with
+	// the registered product is deterministic and stays a validity identity.
 	if (server.emitter.snapshotDue !== expectedSnapshot) {
 		reasons.push(
 			`V-A ${scope}: snapshot due ${server.emitter.snapshotDue}, expected ${expectedSnapshot}`,
 		);
 	}
-	if (server.emitter.ackDue !== expectedAck) {
+	// Ack due is receipt-driven — the server owes an ack only for an action
+	// datagram it actually ingested — so under overload it legitimately falls
+	// below the registered plan: the shortfall is the ingest the delivery
+	// clauses grade, and issuance honesty against the receipts is C6's job.
+	// More acks due than the registered plan is impossible for a conforming
+	// run and stays a validity refusal.
+	if (server.emitter.ackDue > expectedAck) {
 		reasons.push(
-			`V-A ${scope}: ack due ${server.emitter.ackDue}, expected ${expectedAck}`,
+			`V-A ${scope}: ack due ${server.emitter.ackDue} exceeds registered ${expectedAck}`,
 		);
 	}
 	const stageWindows = objectAt(arm, "stageWindows", path, reasons);

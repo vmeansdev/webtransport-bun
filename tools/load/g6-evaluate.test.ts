@@ -697,6 +697,64 @@ describe("g6-classified/2 evaluator", () => {
 		expect(result.invalidReasons.join(" ")).toContain("exceeds registered");
 	});
 
+	test("a receipt-bound ack shortfall is not a validity refusal, but an excess is", () => {
+		const short = request();
+		for (const window of ["steady", "steadyDrain", "lifetime"]) {
+			const emitter = (short.artifact as Json).arms[0].windows[window].emitter;
+			// The server only ingested a bit over half the planned actions;
+			// its ack ledger stays honest against what it actually received.
+			emitter.ackDue = Math.round(emitter.ackDue * 0.55);
+			emitter.ackIssued = emitter.ackDue;
+		}
+		const shortResult = evaluateG6(short);
+		expect(
+			shortResult.invalidReasons.filter((reason) => reason.includes("ack due")),
+		).toEqual([]);
+		expect(shortResult.final.valid).toBe(true);
+
+		const excess = request();
+		const emitter = (excess.artifact as Json).arms[0].windows.steadyDrain
+			.emitter;
+		emitter.ackDue += 1;
+		const excessResult = evaluateG6(excess);
+		expect(excessResult.final.gate).toBe("INVALID");
+		expect(excessResult.invalidReasons.join(" ")).toContain("ack due");
+	});
+
+	test("the measured 5000-rung saturation profile grades as a valid MISS, never INVALID", () => {
+		// The license-protecting property, encoded from attribution run
+		// 32840857971's measured shape: offered ~0.999, server ingest ~54%,
+		// snapshots issued ~88%, acks receipt-bound at ~55%, and a few dozen
+		// counted mid-steady session losses. The gate must grade this as its
+		// registered overload outcome — clauses MISS — with validity intact.
+		const input = request();
+		const arm = (input.artifact as Json).arms[2]; // steady-5000
+		const steady = arm.rawReports.realm.windows.steady;
+		const forfeit = 400;
+		steady.scheduleTicksDue -= forfeit;
+		steady.scheduleTicksFired -= forfeit;
+		steady.sent -= forfeit;
+		steady.sessionsLost = 24;
+		steady.scheduleLag = histogram(1_000_000, steady.scheduleTicksFired);
+		const ingested = Math.round(steady.sent * 0.54);
+		for (const window of ["steady", "steadyDrain", "lifetime"]) {
+			arm.windows[window].serverUpstream.rxTotal = ingested;
+			const emitter = arm.windows[window].emitter;
+			emitter.ackDue = Math.round(emitter.ackDue * 0.55);
+			emitter.ackIssued = emitter.ackDue;
+			emitter.snapshotIssued = Math.round(emitter.snapshotDue * 0.88);
+		}
+		arm.stageWindows.steady.clientEnqueued = steady.sent;
+		arm.stageWindows.steady.clientWireTx = steady.sent;
+		arm.stageWindows.steady.serverObserved = ingested;
+		arm.stageWindows.steady.jsDelivered = ingested;
+
+		const result = evaluateG6(input);
+		expect(result.invalidReasons).toEqual([]);
+		expect(result.final.valid).toBe(true);
+		expect(result.final.gate).toBe("MISS");
+	});
+
 	test("uses the subscriber raw one-way histogram, never the clean artifact summary", () => {
 		const input = request();
 		const hotspot = (input.artifact as Json).arms[3];

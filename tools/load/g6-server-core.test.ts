@@ -526,4 +526,45 @@ describe("g6 server core", () => {
 		expect(stateRef.value.emitter.snapshotDue).toBe(1500);
 		expect(stateRef.value.emitter.snapshotIssued).toBe(1416);
 	});
+
+	test("a plannedSessions getter books the population it reads at booking time", async () => {
+		const nowNs: number[] = [];
+		for (let index = 0; index < 300; index += 1) {
+			const observedNs = Math.round(index * 21_280_000);
+			nowNs.push(observedNs, observedNs);
+		}
+		// One shared core serving arms of different sizes: the booking must
+		// follow the getter's current value, not a construction-time snapshot.
+		let planned = 0;
+		const { core, stateRef } = makeCore({
+			nowNs,
+			nowMs: Array.from({ length: 20 }, (_, index) => index + 1),
+			dueAccounting: {
+				plannedSessions: () => planned,
+				steadyWindowSec: 5,
+			},
+		});
+		planned = 20;
+		const sessions = Array.from({ length: 20 }, () => queueSession());
+		for (const harness of sessions) {
+			core.onSession(harness.session);
+		}
+		await flushAsyncWork();
+
+		const scheduled: Array<() => void> = [];
+		core.startEmitter(() => "steady", {
+			setInterval: (tick) => {
+				scheduled.push(tick);
+				return scheduled.length;
+			},
+			clearInterval: () => {},
+		});
+
+		for (let index = 0; index < 236; index += 1) {
+			scheduled[0]?.();
+		}
+		await flushAsyncWork();
+
+		expect(stateRef.value.emitter.snapshotDue).toBe(1500);
+	});
 });
