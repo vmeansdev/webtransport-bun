@@ -81,10 +81,21 @@ moves, and the kernel delivers them to the same process.
   (4-tuple hashing). What the CID steer buys is *confinement*: on a plain
   reuseport group, changing membership rehashes the whole group and one restart
   re-steers the siblings' surviving flows too. The example's README covers this.
-- **The attach step is not wired up here.** `SO_ATTACH_REUSEPORT_EBPF` and the
-  sockarray insert both need the socket's file descriptor, which lives inside
-  the native addon. Closing that gap needs a supervisor that owns the sockets or
-  an addon that attaches for you; neither exists in this repository.
+- **The attach step is wired up: `reusePortSteering`.** The fd gap this bullet
+  used to describe is closed — the server option
+  `reusePortSteering: { sockArrayPinPath, key, attachProgPinPath? }` makes each
+  instance insert its own socket into the pinned
+  `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY` at startup (`BPF_NOEXIST`, so a
+  misconfigured sibling cannot evict you) and, on whichever instance passes
+  `attachProgPinPath`, attach the pinned `sk_reuseport` program to the group.
+  It is fail-closed: a missing pin, a bad path, or missing `CAP_BPF` aborts
+  `createServer` rather than silently running on the kernel hash. Requires
+  `reusePort: true` and `quicLb` (there is nothing to steer by otherwise).
+  Loading and pinning the program stay with the operator (`bpftool prog
+  loadall … pinmaps …`); the per-process fd work is the addon's. This path is
+  load-proven: a 16-instance group under a registered gate sustained
+  20,000 sessions with per-rung steering deltas at 2.4× the audited floor
+  (gate `g6-sharded/1`, 2026-08-25).
 - **Sizing first.** Instances-per-box comes from the capacity document, whose
   sizing chapter is an upper bound of unknown tightness — read it before
   choosing N.
