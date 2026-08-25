@@ -87,6 +87,7 @@ import {
 import {
 	createG6ServerCore,
 	freshG6ServerState,
+	type G6ServerCorePacedMirror,
 	type Player,
 	REGISTERED_G6_SERVER_CORE_PLAN,
 	type ServerState,
@@ -407,6 +408,10 @@ async function main(): Promise<void> {
 	// the evaluator's exact snapshot-due identity is deterministic rather than
 	// an attempt count that drifts under load.
 	let plannedArmSessions = 0;
+	// EXPERIMENT KNOB (informal, not a registered configuration): G6_PACED_EMITTER=1
+	// routes snapshot fan-out through the native egress pacer instead of
+	// per-player sendDatagramBatch. Requires WEBTRANSPORT_PACER_PPS to be set.
+	let pacedMirror: G6ServerCorePacedMirror | null = null;
 	const serverCore = createG6ServerCore({
 		plan: SERVER_CORE_PLAN,
 		clock,
@@ -418,6 +423,7 @@ async function main(): Promise<void> {
 			plannedSessions: () => plannedArmSessions,
 			steadyWindowSec: STEADY_SECONDS,
 		},
+		pacedMirror: () => pacedMirror,
 	});
 	const { players, raidMembers } = serverCore;
 
@@ -447,9 +453,19 @@ async function main(): Promise<void> {
 		},
 		onSession: serverCore.onSession,
 	});
+	if (process.env.G6_PACED_EMITTER === "1") {
+		// Fails fast (E_UNSUPPORTED_ARGUMENT) on first slice if the pacer is
+		// absent or WEBTRANSPORT_PACER_PPS is unset — deliberate: an experiment
+		// run that silently fell back to the batch path would measure nothing.
+		pacedMirror = {
+			send: (targets, payload) =>
+				server.sendDatagramMirrorPaced(targets, payload),
+			readReports: (max) => server.readMirrorReports(max),
+		};
+	}
 	await Bun.sleep(3000);
 	console.log(
-		`bench-g6: server up on ${PORT}; ladder=[${LADDER.join(",")}] arms=[${ARMS.join(",")}] snapshot=${SERVER_CORE_PLAN.snapshotDatagrams}x${SERVER_CORE_PLAN.snapshotPayloadBytes}B@${SERVER_CORE_PLAN.snapshotHz}Hz slices=${SERVER_CORE_PLAN.slicesPerTick}`,
+		`bench-g6: server up on ${PORT}; ladder=[${LADDER.join(",")}] arms=[${ARMS.join(",")}] snapshot=${SERVER_CORE_PLAN.snapshotDatagrams}x${SERVER_CORE_PLAN.snapshotPayloadBytes}B@${SERVER_CORE_PLAN.snapshotHz}Hz slices=${SERVER_CORE_PLAN.slicesPerTick} emitter=${pacedMirror !== null ? "paced" : "batch"}`,
 	);
 
 	writeFileSync(
