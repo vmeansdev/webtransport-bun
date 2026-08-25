@@ -62,8 +62,8 @@ async function main(): Promise<void> {
 	const topSessions = parseInt(requireArg("top-sessions"), 10);
 	const paced = arg("paced") === "1";
 
-	if (!Number.isInteger(serverId) || serverId < 1 || serverId > 8) {
-		throw new Error("g6-shard-server: --server-id must be 1..8");
+	if (!Number.isInteger(serverId) || serverId < 1 || serverId > 16) {
+		throw new Error("g6-shard-server: --server-id must be 1..16");
 	}
 
 	const clock = await createMonotonicClock(false);
