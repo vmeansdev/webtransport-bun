@@ -35,7 +35,7 @@ on:
         default: "false"
         type: string
       mode:
-        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | g6-mmo (MMO realm gate)"
+        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | g6-mmo (MMO realm gate) | g6-attribution (same-workload attribution)"
         required: false
         default: "bandwidth"
         type: string
@@ -100,16 +100,81 @@ on:
         default: ""
         type: string
       g6_server_address:
-        description: "g6-mmo: the server's address on the bench subnet, as the off-box generator dials it"
+        description: "g6 modes: the server's address on the bench subnet, as the off-box generator dials it"
         required: false
         default: "10.99.0.2"
+        type: string
+      g6_preregistration_sha256:
+        description: "g6 modes: exact SHA-256 of the tracked successor preregistration"
+        required: false
+        default: ""
+        type: string
+      g6_registration_path:
+        description: "g6 modes: absolute path of the source-bound registration staged on the runner"
+        required: false
+        default: ""
+        type: string
+      g6_registration_sha256:
+        description: "g6 modes: exact SHA-256 of the staged source-bound registration"
+        required: false
+        default: ""
+        type: string
+      g6_expected_runner_host:
+        description: "g6 modes: canonical short hostname of the registered Linux runner"
+        required: false
+        default: "gravvene-dev-home"
+        type: string
+      g6_expected_generator_host:
+        description: "g6 modes: canonical short hostname of the registered Mac generator"
+        required: false
+        default: "Nikitas-MacBook-Pro"
+        type: string
+      g6_preflight_down_path:
+        description: "g6-mmo: absolute runner path of the same-day R-down JSON"
+        required: false
+        default: ""
+        type: string
+      g6_preflight_down_sha256:
+        description: "g6-mmo: exact SHA-256 of the same-day R-down JSON"
+        required: false
+        default: ""
+        type: string
+      g6_preflight_up_path:
+        description: "g6-mmo: absolute runner path of the same-day R-up JSON"
+        required: false
+        default: ""
+        type: string
+      g6_preflight_up_sha256:
+        description: "g6-mmo: exact SHA-256 of the same-day R-up JSON"
+        required: false
+        default: ""
+        type: string
+      g6_floor_path:
+        description: "g6-mmo: absolute runner path of the same-day Mac floor transcript"
+        required: false
+        default: ""
+        type: string
+      g6_floor_sha256:
+        description: "g6-mmo: exact SHA-256 of the same-day Mac floor transcript"
+        required: false
+        default: ""
+        type: string
+      g6_sink_path:
+        description: "g6-mmo: absolute runner path of the same-day sink JSON"
+        required: false
+        default: ""
+        type: string
+      g6_sink_sha256:
+        description: "g6-mmo: exact SHA-256 of the same-day sink JSON"
+        required: false
+        default: ""
         type: string
 jobs:
   bench:
     permissions:
       contents: read
     runs-on: ["self-hosted", "Linux", "X64", "heavy"]
-    timeout-minutes: 120
+    timeout-minutes: 180
     concurrency:
       group: bench-bandwidth
       cancel-in-progress: false
@@ -174,8 +239,107 @@ jobs:
           CPUS="$(nproc 2>/dev/null || echo 1)"
           MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
           echo "Runner: cpu=$CPUS mem=$((MEM_KB / 1024))MB"
+      - name: Validate benchmark mode
+        if: ${{ github.event.inputs.probe_only != 'true' }}
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          case "$MODE" in
+            bandwidth|session-scale|g6-mmo|g6-attribution) ;;
+            *) echo "::error::Unsupported benchmark mode: $MODE"; exit 2 ;;
+          esac
+      - name: Configure successor evidence bundle
+        id: configure_g6_bundle
+        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
+        env:
+          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
+          MODE: ${{ github.event.inputs.mode }}
+          OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
+          REGISTRATION_PATH: ${{ github.event.inputs.g6_registration_path }}
+          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
+          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
+          EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
+          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          BUNDLE_DIR="$GITHUB_WORKSPACE/.bench-evidence/g6-${MODE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TREE_SHA="$(git rev-parse 'HEAD^{tree}')"
+          echo "G6_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
+          echo "G6_TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
+          echo "G6_RUN_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_EVALUATOR_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_FINALIZE_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_VERIFY_EXIT=not-run" >> "$GITHUB_ENV"
+          echo "G6_BUNDLE_STATUS=not-run" >> "$GITHUB_ENV"
+          echo "G6_UPLOAD_FAILED=unknown" >> "$GITHUB_ENV"
+          for value in "$OFFBOX_SSH" "$REGISTRATION_PATH" "$REGISTRATION_SHA256" "$PREREGISTRATION_SHA256" "$EXPECTED_RUNNER_HOST" "$EXPECTED_GENERATOR_HOST"; do
+            if [ -z "$value" ]; then
+              echo "::error::All source-bound G6 registration, host, and off-box inputs are required"
+              exit 2
+            fi
+          done
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_HEAD" != "$CANDIDATE_SHA" ]; then
+            echo "::error::Checked-out HEAD $ACTUAL_HEAD differs from registered candidate $CANDIDATE_SHA"
+            exit 2
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "::error::Tracked candidate tree is dirty"
+            exit 2
+          fi
+          ACTUAL_RUNNER_HOST="$(hostname -s)"
+          if [ "$ACTUAL_RUNNER_HOST" != "$EXPECTED_RUNNER_HOST" ]; then
+            echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $EXPECTED_RUNNER_HOST"
+            exit 2
+          fi
+      - name: Prepare successor evidence bundle
+        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
+          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
+          REGISTRATION_PATH: ${{ github.event.inputs.g6_registration_path }}
+          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
+          EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
+          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+          PREFLIGHT_DOWN_PATH: ${{ github.event.inputs.g6_preflight_down_path }}
+          PREFLIGHT_DOWN_SHA256: ${{ github.event.inputs.g6_preflight_down_sha256 }}
+          PREFLIGHT_UP_PATH: ${{ github.event.inputs.g6_preflight_up_path }}
+          PREFLIGHT_UP_SHA256: ${{ github.event.inputs.g6_preflight_up_sha256 }}
+          FLOOR_PATH: ${{ github.event.inputs.g6_floor_path }}
+          FLOOR_SHA256: ${{ github.event.inputs.g6_floor_sha256 }}
+          SINK_PATH: ${{ github.event.inputs.g6_sink_path }}
+          SINK_SHA256: ${{ github.event.inputs.g6_sink_sha256 }}
+        run: |
+          KIND="attribution"
+          if [ "$MODE" = "g6-mmo" ]; then KIND="full-g6"; fi
+          COMMON=(
+            --kind "$KIND"
+            --dir "$G6_BUNDLE_DIR"
+            --candidate "$CANDIDATE_SHA"
+            --tree-sha "$G6_TREE_SHA"
+            --preregistration "$GITHUB_WORKSPACE/docs/research/preregistrations/gate-g6-mmo-closeout.md"
+            --expected-preregistration-sha256 "$PREREGISTRATION_SHA256"
+            --registration "$REGISTRATION_PATH"
+            --expected-registration-sha256 "$REGISTRATION_SHA256"
+            --expected-runner-host "$EXPECTED_RUNNER_HOST"
+            --expected-generator-host "$EXPECTED_GENERATOR_HOST"
+          )
+          if [ "$MODE" = "g6-mmo" ]; then
+            bun tools/load/g6-bundle.ts prepare "${COMMON[@]}" \
+              --preflight-down "$PREFLIGHT_DOWN_PATH" \
+              --expected-preflight-down-sha256 "$PREFLIGHT_DOWN_SHA256" \
+              --preflight-up "$PREFLIGHT_UP_PATH" \
+              --expected-preflight-up-sha256 "$PREFLIGHT_UP_SHA256" \
+              --floor "$FLOOR_PATH" \
+              --expected-floor-sha256 "$FLOOR_SHA256" \
+              --sink "$SINK_PATH" \
+              --expected-sink-sha256 "$SINK_SHA256"
+          else
+            bun tools/load/g6-bundle.ts prepare "${COMMON[@]}"
+          fi
       - name: Run bandwidth ladder
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode != 'session-scale' }}
+        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'bandwidth' }}
         env:
           BENCH_SESSIONS: ${{ github.event.inputs.sessions }}
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
@@ -214,7 +378,9 @@ jobs:
       # workflow carries populations and windows and no thresholds at all.
       # Registration: docs/research/preregistrations/gate-g6-mmo.md.
       - name: Run G6 MMO realm gate
-        if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' }}
+        id: run_g6_mmo
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_BUNDLE_DIR != '' }}
+        continue-on-error: true
         env:
           G6_ARMS: ${{ github.event.inputs.g6_arms }}
           G6_LADDER: ${{ github.event.inputs.g6_ladder }}
@@ -225,22 +391,182 @@ jobs:
           # it every off-box generator spawn exits 3 before running (O-1).
           G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
+          set +e
           ulimit -n "$(ulimit -Hn)" || true
           echo "fd soft limit: $(ulimit -n)"
-          if [ -z "${G6_OFFBOX_SSH}" ]; then
-            echo "::warning::G6 ran with a CO-RESIDENT generator. The registration requires the Mac over the cable; this run is a wiring check and can never be a G6 result."
-          fi
-          G6_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-g6-${{ github.event.inputs.candidate_commit }}.json" \
+          G6_OUT="$G6_BUNDLE_DIR/bench-g6.json" \
             bun tools/load/bench-g6.ts
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: ${{ always() && github.event.inputs.probe_only != 'true' }}
+          STATUS="$?"
+          echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
+          exit "$STATUS"
+      - name: Run G6 attribution matrix
+        id: run_g6_attribution
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-attribution' && env.G6_BUNDLE_DIR != '' }}
+        continue-on-error: true
+        env:
+          G6_ATTR_OUT_DIR: ${{ env.G6_BUNDLE_DIR }}
+          G6_ATTR_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
+          G6_ATTR_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
+          G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+        run: |
+          set +e
+          bun tools/load/g6-attribution-server.ts
+          STATUS="$?"
+          echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
+          exit "$STATUS"
+      - name: Evaluate G6 MMO realm gate
+        id: evaluate_g6_mmo
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_BUNDLE_DIR != '' }}
+        continue-on-error: true
+        env:
+          EXPECTED_CANDIDATE: ${{ github.event.inputs.candidate_commit }}
+          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+          EXPECTED_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
+        run: |
+          set +e
+          bun tools/load/g6-evaluate.ts \
+            --artifact "$G6_BUNDLE_DIR/bench-g6.json" \
+            --preflight-down "$G6_BUNDLE_DIR/inputs/preflight-down.json" \
+            --preflight-up "$G6_BUNDLE_DIR/inputs/preflight-up.json" \
+            --floor "$G6_BUNDLE_DIR/inputs/floor.log" \
+            --sink "$G6_BUNDLE_DIR/inputs/sink.json" \
+            --expected-candidate "$EXPECTED_CANDIDATE" \
+            --expected-generator-host "$EXPECTED_GENERATOR_HOST" \
+            --expected-preregistration-sha256 "$EXPECTED_PREREGISTRATION_SHA256" \
+            --out "$G6_BUNDLE_DIR/classified.json"
+          STATUS="$?"
+          echo "G6_EVALUATOR_EXIT=$STATUS" >> "$GITHUB_ENV"
+          exit "$STATUS"
+      - name: Upload legacy benchmark artifacts
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'bandwidth' || github.event.inputs.mode == 'session-scale') }}
         with:
           name: bench-bandwidth-${{ github.event.inputs.candidate_commit }}
           path: |
             .bench-evidence/bench-bandwidth-*
             .bench-evidence/bench-session-scale-*
-            .bench-evidence/bench-g6-*
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Finalize successor evidence bundle
+        id: finalize_g6_bundle
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != '' }}
+        continue-on-error: true
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
+          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
+          REGISTRATION_PATH: ${{ github.event.inputs.g6_registration_path }}
+          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
+          EXPECTED_RUNNER_HOST: ${{ github.event.inputs.g6_expected_runner_host }}
+          EXPECTED_GENERATOR_HOST: ${{ github.event.inputs.g6_expected_generator_host }}
+        run: |
+          set +e
+          KIND="attribution"
+          if [ "$MODE" = "g6-mmo" ]; then KIND="full-g6"; fi
+          REASON=""
+          if [ "$G6_RUN_EXIT" != "0" ] && [ "$G6_RUN_EXIT" != "not-run" ]; then
+            REASON="measurement exit $G6_RUN_EXIT"
+          fi
+          if [ "$MODE" = "g6-mmo" ] && [ "$G6_EVALUATOR_EXIT" != "0" ] && [ "$G6_EVALUATOR_EXIT" != "not-run" ]; then
+            if [ -n "$REASON" ]; then REASON="$REASON; "; fi
+            REASON="${REASON}evaluator exit $G6_EVALUATOR_EXIT"
+          fi
+          FINALIZE_OUT="$RUNNER_TEMP/g6-finalize-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          ARGS=(
+            finalize
+            --kind "$KIND"
+            --dir "$G6_BUNDLE_DIR"
+            --candidate "$CANDIDATE_SHA"
+            --tree-sha "$G6_TREE_SHA"
+            --preregistration "$GITHUB_WORKSPACE/docs/research/preregistrations/gate-g6-mmo-closeout.md"
+            --expected-preregistration-sha256 "$PREREGISTRATION_SHA256"
+            --registration "$REGISTRATION_PATH"
+            --expected-registration-sha256 "$REGISTRATION_SHA256"
+            --expected-runner-host "$EXPECTED_RUNNER_HOST"
+            --expected-generator-host "$EXPECTED_GENERATOR_HOST"
+          )
+          if [ -n "$REASON" ]; then
+            ARGS+=(--reason "$REASON")
+          fi
+          bun tools/load/g6-bundle.ts "${ARGS[@]}" > "$FINALIZE_OUT"
+          STATUS="$?"
+          echo "G6_FINALIZE_EXIT=$STATUS" >> "$GITHUB_ENV"
+          if [ "$STATUS" = "0" ]; then
+            FINAL_STATUS="$(bun -e 'const path = process.argv[1]; const value = JSON.parse(await Bun.file(path).text()); process.stdout.write(String(value.status ?? ""));' "$FINALIZE_OUT")"
+            echo "G6_BUNDLE_STATUS=$FINAL_STATUS" >> "$GITHUB_ENV"
+          fi
+          exit "$STATUS"
+      - name: Verify successor evidence bundle
+        id: verify_g6_bundle
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != '' }}
+        continue-on-error: true
+        env:
+          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
+          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
+          REGISTRATION_SHA256: ${{ github.event.inputs.g6_registration_sha256 }}
+        run: |
+          set +e
+          VERIFY_OUT="$RUNNER_TEMP/g6-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          bun tools/load/g6-manifest.ts verify \
+            --dir "$G6_BUNDLE_DIR" \
+            --expected-candidate "$CANDIDATE_SHA" \
+            --expected-preregistration-sha256 "$PREREGISTRATION_SHA256" \
+            --expected-registration-sha256 "$REGISTRATION_SHA256" \
+            > "$VERIFY_OUT"
+          STATUS="$?"
+          echo "G6_VERIFY_EXIT=$STATUS" >> "$GITHUB_ENV"
+          if [ "$STATUS" = "0" ]; then
+            VERIFY_STATUS="$(bun -e 'const path = process.argv[1]; const value = JSON.parse(await Bun.file(path).text()); process.stdout.write(String(value.status ?? ""));' "$VERIFY_OUT")"
+            echo "G6_BUNDLE_STATUS=$VERIFY_STATUS" >> "$GITHUB_ENV"
+          fi
+          exit "$STATUS"
+      - name: Upload successor evidence bundle
+        id: upload_g6_bundle
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: g6-evidence-${{ github.event.inputs.mode }}-${{ github.event.inputs.candidate_commit }}
+          path: ${{ env.G6_BUNDLE_DIR }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+      - name: Record successor evidence upload outcome
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
+        run: |
+          if [ "${{ steps.upload_g6_bundle.outcome }}" = "success" ]; then
+            echo "G6_UPLOAD_FAILED=false" >> "$GITHUB_ENV"
+          else
+            echo "G6_UPLOAD_FAILED=true" >> "$GITHUB_ENV"
+          fi
+      - name: Enforce successor evidence bundle
+        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
+        run: |
+          FAIL=0
+          if [ "$G6_RUN_EXIT" != "0" ]; then
+            echo "::error::G6 measurement failed with exit $G6_RUN_EXIT"
+            FAIL=1
+          fi
+          if [ "${{ github.event.inputs.mode }}" = "g6-mmo" ] && [ "$G6_EVALUATOR_EXIT" != "0" ]; then
+            echo "::error::G6 evaluator failed with exit $G6_EVALUATOR_EXIT"
+            FAIL=1
+          fi
+          if [ "${{ steps.finalize_g6_bundle.outcome }}" != "success" ] || [ "$G6_FINALIZE_EXIT" != "0" ]; then
+            echo "::error::G6 finalization failed with exit $G6_FINALIZE_EXIT"
+            FAIL=1
+          fi
+          if [ "${{ steps.verify_g6_bundle.outcome }}" != "success" ] || [ "$G6_VERIFY_EXIT" != "0" ]; then
+            echo "::error::G6 verification failed with exit $G6_VERIFY_EXIT"
+            FAIL=1
+          fi
+          if [ "${{ steps.upload_g6_bundle.outcome }}" != "success" ] || [ "$G6_UPLOAD_FAILED" = "true" ]; then
+            echo "::error::G6 bundle upload failed"
+            FAIL=1
+          fi
+          if [ "$G6_BUNDLE_STATUS" != "COMPLETE" ]; then
+            echo "::error::G6 verified status was $G6_BUNDLE_STATUS, expected COMPLETE"
+            FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
