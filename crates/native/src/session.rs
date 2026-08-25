@@ -151,11 +151,24 @@ pub(crate) const WOULD_BLOCK: &str = "E_WOULD_BLOCK";
 /// caller should fall back to the parking send, and `Some(code)` for a real
 /// failure. It never rejects and never blocks the JS thread.
 pub(crate) fn try_send_datagram_for_session(id: &str, bytes: &[u8]) -> Option<&'static str> {
-    let Some((conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed)) =
-        session_registry::get_datagram_send_state(id)
-    else {
+    let Some(state) = session_registry::get_datagram_send_state(id) else {
         return Some("E_SESSION_CLOSED");
     };
+    try_send_datagram_on_state(&state, bytes)
+}
+
+/// The whole non-parking send, against an already-resolved session state.
+///
+/// Split out so the mirror send (`send_datagram_mirror_for_owner`) and the
+/// single-datagram binding run the *same* code rather than two implementations
+/// tested into agreement: budget check, reservation, quinn call, release and
+/// both counters are here once. A one-target mirror is therefore
+/// `trySendDatagram` by construction, which is what M-T1 pins.
+pub(crate) fn try_send_datagram_on_state(
+    state: &session_registry::DatagramSendState,
+    bytes: &[u8],
+) -> Option<&'static str> {
+    let (conn, metrics, sm, limits, datagram_capacity_notify, lifecycle_closed) = state;
     let sz = bytes.len();
     if sz > limits.max_datagram_size {
         return Some("E_QUEUE_FULL");
@@ -179,7 +192,7 @@ pub(crate) fn try_send_datagram_for_session(id: &str, bytes: &[u8]) -> Option<&'
     // Same order as the parking path: the reservation is released whatever the
     // send does, so a failed send cannot strand budget.
     let sent = conn.send_datagram(bytes).is_ok();
-    metrics.release_datagram_capacity(&sm.queued_bytes, &datagram_capacity_notify, sz_u64);
+    metrics.release_datagram_capacity(&sm.queued_bytes, datagram_capacity_notify, sz_u64);
     if !sent {
         return Some("E_SESSION_CLOSED");
     }
@@ -187,6 +200,95 @@ pub(crate) fn try_send_datagram_for_session(id: &str, bytes: &[u8]) -> Option<&'
     metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
     sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
     None
+}
+
+/// Send one payload to many sessions across one N-API crossing.
+///
+/// The whole call is this loop. Nothing awaits, so there is no deadline to
+/// divide and no way for one slow subscriber to hold the other 9,999: a target
+/// with no byte budget right now yields `E_WOULD_BLOCK` in the envelope and the
+/// caller retries just that one on the parking send. The peak reservation
+/// across the call is **one payload** — reserving `N × len` would be nonsense
+/// against a per-session budget and a self-inflicted failure against the global
+/// one, which is the park-forever class `5ad0245` fixed.
+///
+/// `payload` is copied out of JS-owned memory once, before the loop, and shared
+/// by reference with every target. `wtransport`'s `send_datagram` borrows and
+/// re-frames behind each session's own quarter-stream-id varint, so v1 still
+/// pays one framing copy per target; removing that is a separately-landable
+/// refinement owed a byte-equality falsifier (design M7).
+///
+/// Targets are resolved **owner-scoped**: an id belonging to another server in
+/// this process reports `E_SESSION_CLOSED` and receives nothing.
+///
+/// The egress pacer is deliberately **not** reachable from here, whatever
+/// `WEBTRANSPORT_PACER_PPS` says. Pacing changes what the envelope's `sent`
+/// means — from "quinn took it" to "a schedule accepted it" — and that is the
+/// one word this contract sells. A caller that wants the schedule asks for it by
+/// name through `send_datagram_mirror_paced_for_owner`, whose envelope reports
+/// admission and never says `sent` at all.
+pub(crate) fn send_datagram_mirror_for_owner(
+    owner_server_id: u64,
+    targets: &[String],
+    payload: &[u8],
+    metrics: &crate::server_metrics::ServerMetrics,
+) -> crate::datagram_mirror::MirrorOutcome {
+    metrics
+        .datagram_mirror_calls
+        .fetch_add(1, Ordering::Relaxed);
+    // Targets *attempted*, so `attempted - delivered` reads against per-session
+    // `datagrams_out`. An over-cap tail is reported, never attempted, so it is
+    // not counted here either.
+    metrics.datagram_mirror_targets.fetch_add(
+        crate::datagram_mirror::split_at_cap(targets.len()) as u64,
+        Ordering::Relaxed,
+    );
+    crate::datagram_mirror::fan_out(targets.len(), |index| {
+        let Some(state) =
+            session_registry::get_datagram_send_state_for_owner(&targets[index], owner_server_id)
+        else {
+            return Some("E_SESSION_CLOSED");
+        };
+        try_send_datagram_on_state(&state, payload)
+    })
+}
+
+/// Hand one payload and many targets to the egress pacer's schedule.
+///
+/// The sibling of [`send_datagram_mirror_for_owner`], and deliberately a
+/// different function rather than a knob inside it: this one returns
+/// **admission**, not delivery. Nothing about a target has been examined when it
+/// returns — not existence, not ownership, not byte budget — so the envelope
+/// counts targets accepted onto the schedule and the per-target outcomes are
+/// reported later, out of band, through the bounded reports ring
+/// (`egress_pacer::drain_reports`).
+///
+/// `None` means the pacer knob is off. The caller turns that into a typed error
+/// rather than silently running the inline loop: a caller that asked for the
+/// schedule by name and got the burst instead would have no way to tell.
+pub(crate) fn send_datagram_mirror_paced_for_owner(
+    owner_server_id: u64,
+    targets: &[String],
+    payload: &[u8],
+    metrics: &crate::server_metrics::ServerMetrics,
+) -> Option<crate::datagram_mirror::MirrorOutcome> {
+    let cfg = crate::egress_pacer::config()?;
+    metrics
+        .datagram_mirror_paced_calls
+        .fetch_add(1, Ordering::Relaxed);
+    // Targets *offered to admission*, so `offered - admitted` reconciles against
+    // the pacer's own `refusedTargets`. An over-cap tail is reported, never
+    // offered, so it is not counted here either.
+    metrics.datagram_mirror_paced_targets.fetch_add(
+        crate::datagram_mirror::split_at_cap(targets.len()) as u64,
+        Ordering::Relaxed,
+    );
+    Some(crate::egress_pacer::submit(
+        cfg,
+        owner_server_id,
+        targets,
+        payload,
+    ))
 }
 
 pub(crate) async fn send_datagram_for_session(id: &str, bytes: &[u8]) -> Result<()> {
@@ -1468,6 +1570,7 @@ mod tests {
             false,
             false,
             0,
+            crate::server_spawn::BindOptions::default(),
             3,
         )
         .expect("server start");
@@ -1887,6 +1990,7 @@ mod tests {
             false,
             false,
             0,
+            crate::server_spawn::BindOptions::default(),
             3,
         )
         .expect("server start");

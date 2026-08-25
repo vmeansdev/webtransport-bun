@@ -25,6 +25,15 @@ serde_json = "1"
 url = "2"
 sha2 = "0.10"
 base64 = "0.22"
+# SO_REUSEPORT on the server bind socket (the `reusePort` option). The "all"
+# feature gates set_reuse_port; the version matches what wtransport already
+# locks so there is one socket2 in the tree.
+socket2 = { version = "0.6.5", features = ["all"] }
+# QUIC-LB connection IDs implement quinn's `ConnectionIdGenerator`, whose error
+# type `InvalidCid` quinn does not re-export. Pinned to the exact version quinn
+# 0.11 locks: a second quinn-proto in the tree would make the trait we implement
+# a different trait than `EndpointConfig::cid_generator` accepts.
+quinn-proto = { version = "=0.11.16", default-features = false }
 idna = "1"
 x509-parser = "0.18.1"
 # Global allocator for this dylib's Rust allocations. The macOS system malloc
@@ -32,6 +41,12 @@ x509-parser = "0.18.1"
 # is a measured no-op on macOS 26), which left load-proportional RSS resident
 # after fully drained closes. mimalloc purges freed pages back to the OS.
 mimalloc = { version = "0.1", default-features = false }
+
+# Only the egress pacer's thread-priority knobs use this, and only on Linux:
+# `setpriority` is per-thread there, where on macOS the same call is
+# process-wide and would renice the whole runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 napi-build = "2"

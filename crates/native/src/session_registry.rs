@@ -540,16 +540,36 @@ pub type DatagramSendState = (
 );
 
 pub fn get_datagram_send_state(session_id: &str) -> Option<DatagramSendState> {
-    REGISTRY.get(session_id).map(|entry| {
-        (
-            entry.conn.clone(),
-            Arc::clone(&entry.metrics),
-            Arc::clone(&entry.session_metrics),
-            entry.limits.clone(),
-            Arc::clone(&entry.datagram_capacity_notify),
-            Arc::clone(&entry.datagram_lifecycle_closed),
-        )
-    })
+    REGISTRY.get(session_id).map(send_state_of)
+}
+
+/// Same lookup, but only for a session this server owns.
+///
+/// The mirror send resolves a caller-supplied list of ids, so an id belonging
+/// to another server in the same process — the `__TESTING__` suites and the
+/// client pool both create more than one — must not become a send. A foreign
+/// id is `None`, which the caller reports as `E_SESSION_CLOSED`: from this
+/// server's point of view a session it does not own and a session that is gone
+/// are the same thing.
+pub fn get_datagram_send_state_for_owner(
+    session_id: &str,
+    owner_server_id: u64,
+) -> Option<DatagramSendState> {
+    REGISTRY
+        .get(session_id)
+        .filter(|entry| entry.owner_server_id == owner_server_id)
+        .map(send_state_of)
+}
+
+fn send_state_of(entry: dashmap::mapref::one::Ref<'_, String, SessionState>) -> DatagramSendState {
+    (
+        entry.conn.clone(),
+        Arc::clone(&entry.metrics),
+        Arc::clone(&entry.session_metrics),
+        entry.limits.clone(),
+        Arc::clone(&entry.datagram_capacity_notify),
+        Arc::clone(&entry.datagram_lifecycle_closed),
+    )
 }
 
 pub fn get_limits(session_id: &str) -> Option<crate::limits::Limits> {

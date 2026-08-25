@@ -108,9 +108,15 @@ export type RateLimitOptions = {
 };
 
 export type LimitsOptions = {
-  /** Max concurrent sessions. At limit, next handshake is rejected. */
+  /** Max concurrent sessions. At limit, the next dial is answered with QUIC
+   * CONNECTION_REFUSED — a transient admission signal; clients retry with
+   * jittered backoff (see OPERATIONS.md "Admission control"). */
   maxSessions: number;
-  /** Max handshakes in progress. At limit, next is rejected (inclusive: limit is allowed). */
+  /** Max handshakes in progress (inclusive: limit is allowed). Bounds
+   * instantaneous concurrency, not arrival rate: sustained dial rates far
+   * above the cap establish fine when handshakes are fast; a synchronized
+   * wave deeper than the cap has its overflow answered CONNECTION_REFUSED —
+   * transient, retry with jittered backoff. */
   maxHandshakesInFlight: number;
   /** Max bidi streams per session. At limit, createBidirectionalStream rejects with E_LIMIT_EXCEEDED. */
   maxStreamsPerSessionBidi: number;
@@ -193,6 +199,22 @@ export interface WebTransportServer {
   setUnknownSniPolicy(policy: "reject" | "default"): Promise<void>;
   /** Inspect active SNI names and policy without exposing key material. */
   tlsSnapshot(): { sniServerNames: string[]; unknownSniPolicy: "reject" | "default" };
+  /**
+   * Send one payload to many of this server's sessions across one Node-API
+   * crossing. Synchronous and non-parking; native-only.
+   * See "One payload to many sessions".
+   */
+  sendDatagramMirror(
+    targets: readonly string[],
+    payload: Uint8Array,
+  ): {
+    sent: number;
+    failures: readonly {
+      target: string;
+      index: number;
+      error: WebTransportError;
+    }[];
+  };
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -348,6 +370,8 @@ export type MetricsSnapshot = {
   queuedBytesGlobal: number;
   backpressureWaitCount: number;
   backpressureTimeoutCount: number;
+  datagramMirrorCalls?: number;
+  datagramMirrorTargets?: number;
 
   rateLimitedCount: number;
   limitExceededCount: number;
@@ -496,6 +520,120 @@ between two sink invocations — so a batching sink measures a mean batch size o
 either a timer-based fill or resolving `write()` before delivery. Applications
 that need batched sending must hold the native session handle; the W3C path
 costs roughly one crossing per datagram and that asymmetry is deliberate.
+
+## One payload to many sessions
+
+`server.sendDatagramMirror(targets, payload)` sends the same payload to many of
+that server's sessions across a single Node-API crossing. It is **native-only**,
+for a stronger reason than batched sending: the crossing it amortizes does not
+exist on wasm, and the wasm backend has no session registry to fan out through.
+
+It is the fan-out of `trySendDatagram`, **not** of `sendDatagram`: the call is
+synchronous, hands JavaScript no promise, and never waits. A promise costs more
+than the whole fan-out below roughly a thousand targets; a serial parking
+fan-out would let one slow subscriber hold every other; a concurrent one would
+allocate a future per target — the allocation the API exists to avoid.
+
+The envelope is a **set, not a prefix**:
+
+```ts
+const { sent, failures } = server.sendDatagramMirror(targets, payload);
+// Every target was attempted, independently and in list order.
+// sent + failures.length === targets.length, always.
+```
+
+A target list has no ordering obligation — subscriber 4 being gone says nothing
+about subscriber 5 — so a dead target never stops the broadcast. This is the
+sharpest difference from `sendDatagramBatch`, whose prefix envelope is correct
+only because element `k+1` of one session's batch genuinely cannot precede
+element `k`.
+
+`failures` is the actionable half, and it names the failing **session id** as
+well as its index:
+
+- `E_SESSION_CLOSED` — unknown, reaped, or owned by another server in this
+  process. At ten thousand subscribers reaping is normal, so this list *is* the
+  reap list.
+- `E_QUEUE_FULL` — the payload is longer than `maxDatagramSize`, or the target
+  had no queued-byte budget at this instant. The mirror never waits, so this is
+  where backpressure lands; the remedy is `session.sendDatagram()` on just those
+  targets, which is the only path allowed to park.
+
+Contract points worth stating:
+
+- **The payload is copied once, before the fan-out**, and shared by reference
+  with every target: `N` copies out of JavaScript become one. A caller may
+  overwrite its array the moment the call returns.
+- **The peak byte reservation is one payload**, never `N × len`. Reserving a
+  whole fan-out against a per-session budget is meaningless (they are different
+  sessions) and against the global budget it would fail broadcasts every
+  individual send would have made.
+- **No deadline, because nothing waits.** The call performs `N`
+  reserve/try-send/release triples and returns.
+- **Targets are owner-scoped.** An id belonging to another server in the same
+  process is reported `E_SESSION_CLOSED` and receives nothing.
+- **Duplicate targets are delivered to twice.** The parameter is a list, not a
+  set; deduplicating would cost a hash set per call to second-guess a caller who
+  may have meant it.
+- **At most 10,000 targets per call**, a JavaScript-thread stall budget
+  expressed in targets. Over-cap throws `RangeError` synchronously, before
+  anything is sent — safe precisely because the call is synchronous, so there is
+  no promise to reject. The JavaScript layer deliberately does **not** chunk:
+  splitting a target list across two calls is observably identical to one call
+  over the union (no deadline to divide, no ordering across targets), so the
+  caller owns the decision of when to yield the loop. That is exactly the
+  property `sendDatagramBatch` lacks, which is why *it* chunks.
+- **It throws only for programming errors**: `TypeError` for a non-array target
+  list, a non-string element or a non-`Uint8Array` payload, and `RangeError`
+  over the cap. Never for a transport condition.
+- **Metrics.** `datagramMirrorCalls` and `datagramMirrorTargets` count the
+  calls and the targets they attempted. `datagramSendsAsync` deliberately does
+  **not** move: the mirror creates no promise, and that counter's meaning is
+  host-loop exposure. Per-session `datagramsOut` increments once per delivered
+  target, so a mirrored datagram is indistinguishable from a looped one in the
+  per-session counters a delivery ratio reads.
+
+### The paced mirror
+
+`server.sendDatagramMirrorPaced(targets, payload)` is a **separate** method that
+hands the same fan-out to the native egress pacer's schedule. It exists so that
+the contract above can stay exactly what it says: `sendDatagramMirror` is not
+paced and never will be, whatever `WEBTRANSPORT_PACER_PPS` is set to. Pacing
+changes what a successful count *means* — from "quinn took it" to "a schedule
+accepted it" — and that is the one word the synchronous contract sells, so the
+paced envelope is a different object with a different vocabulary.
+
+- **The envelope is admission, not delivery.** `{ admitted, refused }`. When the
+  call returns, no target has been resolved, owner-checked or budget-checked.
+  `admitted` is targets the schedule took; `refused` names, per index, the ones
+  it would not, always `E_QUEUE_FULL` and always because the queue was already
+  holding its bound of outstanding work. A set, not a prefix, exactly as above.
+- **Per-target outcomes are drained out of band.**
+  `server.readMirrorReports(max?)` returns `{ target, error }` entries for
+  **failures only** — synchronous, promise-free, never throwing, `[]` when
+  nothing is pending. A caller counts deliveries as `admitted` minus the
+  failures it drains. `E_SESSION_CLOSED` reports are the reap list and
+  `E_QUEUE_FULL` reports are the retry list, the same two lists the synchronous
+  envelope hands back immediately.
+- **The ring is fixed at 4,096 entries** and drops oldest on overflow, counting
+  every drop in `metricsSnapshot().mirrorReportsDropped`. Bounded by
+  construction: a caller that never polls costs a constant. `drained +
+  mirrorReportsDropped` reconciles against the pacer's own `deferredFailures`,
+  which is the falsifier for the reporting path itself.
+- **Two backpressure signals, separately named.** `refused` at admission means
+  the schedule was full; an `E_QUEUE_FULL` *report* means that target had no
+  byte budget when its turn came. The synchronous API conflates them.
+- **The cap stays 10,000, with a different justification.** On the synchronous
+  path it is a JS-thread stall budget; a paced call's cost on that thread does
+  not grow with the list, so here it is an argument-sanity bound, kept because a
+  `RangeError` is cheaper to debug than a silent mass refusal.
+- **Metrics.** `datagramMirrorPacedCalls` and `datagramMirrorPacedTargets` move;
+  `datagramMirrorCalls`, `datagramMirrorTargets` and `datagramSendsAsync` do
+  not. No promise is created here either.
+- **With the pacer knob off** it throws a `WebTransportError` with code
+  `E_UNSUPPORTED_ARGUMENT` rather than quietly running the inline loop, with a
+  distinct message from the one an addon built without the pacer produces.
+  Native-only, like the synchronous mirror.
 
 ## Incoming datagram delivery
 

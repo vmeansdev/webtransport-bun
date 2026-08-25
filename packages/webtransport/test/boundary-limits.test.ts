@@ -79,6 +79,68 @@ describe("limit boundaries (P0.4)", () => {
 		}
 	}, 15000);
 
+	it("maxHandshakesInFlight: a refused burst fully establishes under jittered retry — refusal is load-shaping, not rejection", async () => {
+		// The documented client contract (OPERATIONS.md "Admission control"):
+		// CONNECTION_REFUSED from this server is a transient admission signal.
+		// A synchronized wave deeper than the cap must fully establish once
+		// every dial retries with jittered backoff — the same event that reads
+		// as an outage to single-shot clients (the test above) is a sub-second
+		// hiccup to retrying ones. Measured here so the semantics cannot drift
+		// silently: refusals MUST occur AND every client MUST get in.
+		const port = nextPort(25480, 3000);
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { maxHandshakesInFlight: 2, maxSessions: 100 },
+			onSession: () => {},
+		});
+
+		const dialWithJitteredRetry = async (): Promise<
+			Awaited<ReturnType<typeof connect>>
+		> => {
+			const attempts = 8;
+			let lastErr: unknown;
+			for (let attempt = 1; attempt <= attempts; attempt += 1) {
+				try {
+					return await connect(`https://127.0.0.1:${port}`, {
+						tls: { insecureSkipVerify: true },
+						limits: { handshakeTimeoutMs: 1500 },
+					});
+				} catch (err) {
+					lastErr = err;
+					// Jitter is load-bearing: a fixed timer re-arrives as the
+					// same synchronized wave the server just refused.
+					const base = 100 * attempt;
+					await Bun.sleep(base * (0.5 + Math.random()));
+				}
+			}
+			throw lastErr;
+		};
+
+		try {
+			const burst = 24;
+			const started = performance.now();
+			const sessions = await Promise.all(
+				Array.from({ length: burst }, () => dialWithJitteredRetry()),
+			);
+			const elapsedMs = performance.now() - started;
+
+			// Every client established — zero terminal failures.
+			expect(sessions.length).toBe(burst);
+			// The wave really was refused at the boundary (the retry path was
+			// exercised, not bypassed by a lucky drain).
+			const m = server.metricsSnapshot();
+			expect(m.limitExceededCount).toBeGreaterThanOrEqual(1);
+			// "Hiccup, not outage": the whole burst clears well inside the
+			// retry schedule's own worst case.
+			expect(elapsedMs).toBeLessThan(10_000);
+
+			for (const s of sessions) s.close();
+		} finally {
+			await server.close();
+		}
+	}, 20000);
+
 	it("maxSessions: exactly limit sessions accepted, limit+1 rejected", async () => {
 		const port = nextPort(25480, 3000);
 		const limit = 2;
