@@ -107,10 +107,14 @@ tools with `--subnet` set to the VPC:
   can run once per GRO aggregate). Before dispatch: one short informal
   16-shard scan on this rig, dump `steer_stats`, and confirm
   steered / client steady upstream clears **0.9 with at least 2× margin**
-  (i.e. ratio ≥ 1.8). If it does not, the dispatch is blocked — the floor
-  constant is re-derived from the calibration and re-reviewed *before* any
-  licensed run; it is never adjusted after one. The maps are re-pinned per
-  §7 after calibration, so its counts never feed the licensed floors.
+  (i.e. ratio ≥ 1.8). The calibration scan runs at the frontier-rung shape
+  (16 shards × 20000 sessions) and its packet rate is retained beside the
+  ratio — GRO aggregation scales with rate, so a light calibration would
+  validate a floor the frontier rung could still deflate. If the margin is
+  not cleared, the dispatch is blocked — the floor constant is re-derived
+  from the calibration and re-reviewed *before* any licensed run; it is
+  never adjusted after one. The maps are re-pinned per §7 after
+  calibration, so its counts never feed the licensed floors.
 
 ## 7. Run rules
 
@@ -124,11 +128,14 @@ rung**, in rung order; an unusable dump is a refusal, not an error.
 Infrastructure refusals (droplet provisioning, BPF pin setup, connect-phase
 stall before steady) retain their artifacts and license a redispatch the
 same day. A rung that reaches its steady window is graded from that attempt
-— except that a **validity refusal** (any §4 item other than the run-scoped
-steering floor) also licenses one same-day redispatch of that rung: a flaky
+— except that a **validity refusal** (any §4 item other than a per-rung
+steering-delta refusal, which is deliberately excluded: a genuine steering
+failure at load is a finding, and §6's calibration bounds the false-refusal
+risk) also licenses one same-day redispatch of that rung: a flaky
 connect error must cost a retry, not leave the rung permanently
 verdict-less. Caveat, accepted at registration: if frontier-rung overload
 ever migrates into the connect phase, that rung can only refuse, never
 produce its registered acceptable MISS — a refusal there is itself a
 finding. Rungs are graded independently: an invalid rung does not
-invalidate its siblings (except the steering floor, which invalidates all).
+invalidate its siblings (except an unusable or miscounted steer-stats dump,
+which refuses all).
