@@ -45,7 +45,7 @@ const STEADY_SECONDS = 120;
 const IDLE_SECONDS = 30;
 const DRAIN_GRACE_MS = 1000;
 const CONNECT_TIMEOUT_SECONDS = 300;
-const ENDPOINTS = 64;
+const ENDPOINTS = parseInt(process.env.SCAN_ENDPOINTS ?? "64", 10);
 const CONNECT_CONCURRENCY = 500;
 
 if (!OFFBOX_SSH || !CANDIDATE_SHA || !PREREG_SHA) {
@@ -53,8 +53,10 @@ if (!OFFBOX_SSH || !CANDIDATE_SHA || !PREREG_SHA) {
 		"g6-sharded-scan: G6_OFFBOX_SSH, G6_CANDIDATE_SHA and G6_PREREGISTRATION_SHA256 are required",
 	);
 }
-if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 8) {
-	throw new Error("g6-sharded-scan: SCAN_SHARDS must be 1..8");
+// 16 needs the BPF program rebuilt with -DMAX_INSTANCES=16 (the pinned
+// sockarray's size is compile-time); the setup script handles that.
+if (!Number.isInteger(SHARDS) || SHARDS < 1 || SHARDS > 16) {
+	throw new Error("g6-sharded-scan: SCAN_SHARDS must be 1..16");
 }
 
 type Shard = {

@@ -97,8 +97,12 @@
 
 #define CID_LEN (1 + SERVER_ID_LEN + NONCE_LEN)
 
-// Slots in the sockarray. One per instance sharing the port.
+// Slots in the sockarray. One per instance sharing the port. Overridable at
+// build time (-DMAX_INSTANCES=N) for boxes with more cores than the default
+// assumes.
+#ifndef MAX_INSTANCES
 #define MAX_INSTANCES 8
+#endif
 
 // Fixed-width map key so the hash key has no uninitialised padding. Only the
 // first SERVER_ID_LEN octets are ever meaningful; the rest stay zero.
