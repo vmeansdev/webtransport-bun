@@ -143,6 +143,10 @@ struct Options {
     url: String,
     sessions: usize,
     endpoints: usize,
+    /// Skip the 127.0.x.1 per-endpoint source-IP aliases (a co-resident
+    /// trick): an off-box Linux generator binds them successfully and then
+    /// routes nothing, where macOS fails the bind and falls back anyway.
+    bind_default: bool,
     connect_concurrency: usize,
     steady: Duration,
     drain: Duration,
@@ -183,6 +187,7 @@ impl Options {
             url: DEFAULT_URL.to_string(),
             sessions: 100,
             endpoints: 1,
+            bind_default: false,
             connect_concurrency: 500,
             steady: Duration::from_secs(120),
             drain: Duration::from_millis(DEFAULT_DRAIN_MS),
@@ -638,12 +643,15 @@ struct EndpointPool {
     distinct_source_ips: usize,
 }
 
-fn build_endpoints(count: usize) -> Result<EndpointPool, Box<dyn std::error::Error>> {
+fn build_endpoints(
+    count: usize,
+    bind_default: bool,
+) -> Result<EndpointPool, Box<dyn std::error::Error>> {
     let mut endpoints = Vec::with_capacity(count);
     let mut distinct_source_ips = 0usize;
     for k in 0..count {
         let mut endpoint = None;
-        if count > 1 {
+        if count > 1 && !bind_default {
             let octet = u8::try_from(1 + (k % 250)).unwrap_or(1);
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, octet, 1)), 0);
             let config = ClientConfig::builder()
@@ -724,6 +732,7 @@ fn parse_args() -> Options {
                 o.endpoints =
                     parse_or_default("--endpoints", args.next(), o.endpoints).clamp(1, 250)
             }
+            "--bind-default" => o.bind_default = true,
             "--connect-concurrency" => {
                 o.connect_concurrency =
                     parse_or_default("--connect-concurrency", args.next(), o.connect_concurrency)
@@ -1144,7 +1153,7 @@ async fn run(
     let EndpointPool {
         endpoints,
         distinct_source_ips,
-    } = build_endpoints(options.endpoints)?;
+    } = build_endpoints(options.endpoints, options.bind_default)?;
     let shared = Arc::new(Shared::new(options.sessions));
     let permits = Arc::new(Semaphore::new(options.connect_concurrency));
     // Zero means no pool. `Semaphore::new(usize::MAX >> 3)` is tokio's own
