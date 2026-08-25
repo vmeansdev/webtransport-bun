@@ -258,4 +258,62 @@ describe("g6-sharded-grade", () => {
 		expect(steeredTotal(dump)).toBe(1000);
 		expect(typeof steeredTotal("not json")).toBe("string");
 	});
+
+	test("steeredTotal decodes the BTF-less hex byte-array dump shape", () => {
+		// The registered rig's actual format: little-endian hex byte arrays
+		// (0x134859 = 1,263,705 on cpu 1, zero elsewhere).
+		const dump = JSON.stringify([
+			{
+				key: ["0x00", "0x00", "0x00", "0x00"],
+				values: [
+					{
+						cpu: 0,
+						value: [
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+						],
+					},
+					{
+						cpu: 1,
+						value: [
+							"0x59",
+							"0x48",
+							"0x13",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+						],
+					},
+				],
+			},
+			{
+				key: ["0x01", "0x00", "0x00", "0x00"],
+				values: [
+					{
+						cpu: 1,
+						value: [
+							"0x05",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+							"0x00",
+						],
+					},
+				],
+			},
+		]);
+		expect(steeredTotal(dump)).toBe(0x134859);
+		expect(typeof steeredTotal('[{"key":[true],"values":[]}]')).toBe("string");
+	});
 });
