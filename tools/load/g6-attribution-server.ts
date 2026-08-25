@@ -41,7 +41,7 @@ import {
 	type SharedAttributionPlan,
 	validateAttributionIdentity,
 } from "./g6-attribution.ts";
-import { G6_CLOSEOUT_SPEC_PATH } from "./g6-plan.ts";
+import { G6_CLOSEOUT_SPEC_PATH, GATE_CLIENT_ENDPOINTS } from "./g6-plan.ts";
 import {
 	createG6ServerCore,
 	freshG6ServerState,
@@ -936,6 +936,11 @@ export async function runClientLeg(options: {
 		`https://${serverAddress}:${options.port}`,
 		"--sessions",
 		String(options.sessions),
+		// The gate's registered client spreads its sessions across this many
+		// endpoints; a single-socket spawn at 5,000 sessions measures its own
+		// egress collapse, not the server (see GATE_CLIENT_ENDPOINTS).
+		"--endpoints",
+		String(GATE_CLIENT_ENDPOINTS),
 		"--send-interval-ms",
 		"250",
 		"--action-every",
@@ -1674,6 +1679,13 @@ export function buildIdentityLeg(input: {
 			(metrics as Record<string, unknown>).limitExceededCount ?? 0,
 		),
 		clientScheduleTicksDue: steady?.scheduleTicksDue ?? 0,
+		clientEndpoints: Number(
+			(
+				(input.clientReport as Record<string, unknown>).client as
+					| Record<string, unknown>
+					| undefined
+			)?.endpoints ?? 0,
+		),
 		serverSnapshotDue: Number(
 			(emitter as Record<string, unknown>).snapshotDue ?? 0,
 		),
