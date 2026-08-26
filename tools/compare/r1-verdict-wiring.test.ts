@@ -19,7 +19,7 @@ function artifactInput(
 		repetitionIndex: 1,
 		totalRepetitions: 5,
 		samples: [10, 12, 14],
-		percentiles: { p50: 12, p95: 13.8, p99: 13.96 },
+		percentiles: { p1: 10.04, p50: 12, p95: 13.8, p99: 13.96 },
 		ledger: {
 			attempted: 3,
 			queued: 3,

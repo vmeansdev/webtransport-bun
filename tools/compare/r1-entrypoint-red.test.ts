@@ -621,19 +621,25 @@ describe("R1 RED: amendment official entrypoint contracts", () => {
 			seed: 20260824,
 			repetitionIndex: 1,
 			totalRepetitions: 5,
-			samples: [10, 12, 14],
+			samples: [...Array(500).fill(10), ...Array(500).fill(14)],
 			percentiles: {
+				// rank 0.01 x 999 = 9.99, and values[9] === values[10] === 10,
+				// so this is exact with no interpolation.
+				p1: 10,
+				// rank 499.5 interpolates values[499]=10 and values[500]=14.
 				p50: 12,
-				p95: 13.799999999999999,
-				p99: 13.959999999999999,
+				p95: 14,
+				p99: 14,
 			},
+			// Not all-equal, so `LEDGER_FUNNEL_DEGENERATE` can be switched on
+			// later without editing a frozen byte here.
 			ledger: {
-				attempted: 3,
-				queued: 3,
-				serverObserved: 3,
-				acknowledged: 3,
-				delivered: 3,
-				dropped: 0,
+				attempted: 1000,
+				queued: 1000,
+				serverObserved: 998,
+				acknowledged: 997,
+				delivered: 996,
+				dropped: 4,
 			},
 		});
 		const sealedArtifact = sealRunArtifact(artifact);

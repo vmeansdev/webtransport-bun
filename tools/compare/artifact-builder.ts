@@ -71,6 +71,7 @@ export interface BuildArtifactInput {
 	readonly totalRepetitions?: number;
 	readonly samples: readonly number[];
 	readonly percentiles: {
+		readonly p1: number;
 		readonly p50: number;
 		readonly p95: number;
 		readonly p99: number;
@@ -354,6 +355,7 @@ export function buildRunArtifact(input: BuildArtifactInput): RunArtifact {
 		},
 		samples: validSamples,
 		percentiles: {
+			p1: input.percentiles.p1,
 			p50: input.percentiles.p50,
 			p95: input.percentiles.p95,
 			p99: input.percentiles.p99,

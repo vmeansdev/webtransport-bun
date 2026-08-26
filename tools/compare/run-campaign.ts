@@ -320,7 +320,7 @@ and all three digests. There are no environment fallbacks.
 /** What one measured arm produced. */
 export interface ArmMeasurement {
 	readonly samples: number[];
-	readonly percentiles: { p50: number; p95: number; p99: number };
+	readonly percentiles: { p1: number; p50: number; p95: number; p99: number };
 	readonly ledger: {
 		readonly attempted: number;
 		readonly queued: number;
@@ -596,6 +596,7 @@ function measureCellArm(
 		streamsAttempted = 2;
 	}
 
+	const p1 = percentile(samples, 1);
 	const p50 = percentile(samples, 50);
 	const p95 = percentile(samples, 95);
 	const p99 = percentile(samples, 99);
@@ -630,7 +631,7 @@ function measureCellArm(
 
 	return {
 		samples,
-		percentiles: { p50, p95, p99 },
+		percentiles: { p1, p50, p95, p99 },
 		ledger: {
 			attempted,
 			queued,

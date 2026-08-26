@@ -218,6 +218,24 @@ function scaleArtifactObject(
 	);
 }
 
+/**
+ * The latency contracts carry a `minSamples` floor, so a four-sample fixture
+ * is below it.  This is the same construction the frozen fixtures use: two
+ * equal runs of 500, whose percentiles are exact.
+ */
+function setFlooredSamples(artifact: RunArtifact, low: number, high: number) {
+	artifact.metrics.samples = [
+		...Array(500).fill(low),
+		...Array(500).fill(high),
+	];
+	artifact.metrics.percentiles = {
+		p1: low,
+		p50: (low + high) / 2,
+		p95: high,
+		p99: high,
+	};
+}
+
 function roleScaleArtifactObject(
 	baseBytes: Uint8Array,
 	cellId: string,
@@ -661,6 +679,7 @@ describe("fail-closed comparison evidence", () => {
 			direction: "linux-egress",
 		};
 		delay40.capacityProof.mac.ephemeralPorts.requiredFreePorts = 125;
+		setFlooredSamples(delay40, 1, 3);
 		bindDirectDigest(delay40);
 		expect(verifyRunArtifactObject(delay40).evidenceStatus).toBe("PASS");
 
@@ -953,6 +972,7 @@ describe("fail-closed comparison evidence", () => {
 			"reconnect-storm/cold-full",
 		);
 		reconnect.capacityProof.mac.ephemeralPorts.requiredFreePorts = 125;
+		setFlooredSamples(reconnect, 1, 3);
 		bindDirectDigest(reconnect);
 		expect(verifyRunArtifactObject(reconnect).evidenceStatus).toBe("PASS");
 	});
@@ -1394,7 +1414,8 @@ describe("fail-closed comparison evidence", () => {
 			"ticker-fanout": [
 				"delivered-updates-per-second",
 				"count",
-				"linux-local-service",
+				// R8-y: both stamps are taken on the Mac.
+				"mac-local-end-to-end",
 				"higher",
 			],
 			"game-tick-loss": [
@@ -1470,7 +1491,7 @@ describe("fail-closed comparison evidence", () => {
 		zero.artifactKind = "measured";
 		zero.promotable = true;
 		zero.metrics.samples = [0, 0, 0, 0];
-		zero.metrics.percentiles = { p50: 0, p95: 0, p99: 0 };
+		zero.metrics.percentiles = { p1: 0, p50: 0, p95: 0, p99: 0 };
 		bindRawSidecar(zero);
 		const ws = sealRunArtifact(zero);
 		const wt = measuredBytes(wtBytes);
@@ -1487,15 +1508,13 @@ describe("fail-closed comparison evidence", () => {
 			wsBytes,
 			"reconnect-storm/cold-full",
 		);
-		lowerWs.metrics.samples = [1, 2, 2, 3];
-		lowerWs.metrics.percentiles = { p50: 2, p95: 2.85, p99: 2.97 };
+		setFlooredSamples(lowerWs, 1, 3);
 		bindRawSidecar(lowerWs);
 		const lowerWt = roleScaleArtifactObject(
 			wtBytes,
 			"reconnect-storm/cold-full",
 		);
-		lowerWt.metrics.samples = [2, 3, 3, 4];
-		lowerWt.metrics.percentiles = { p50: 3, p95: 3.85, p99: 3.97 };
+		setFlooredSamples(lowerWt, 2, 4);
 		bindRawSidecar(lowerWt);
 		const lowerWsBytes = sealRunArtifact(lowerWs);
 		const lowerWtBytes = sealRunArtifact(lowerWt);

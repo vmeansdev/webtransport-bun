@@ -1083,7 +1083,7 @@ describe("R1 flow hardening: the campaign's per-arm artifact is derived", () => 
 		const attempted = 1000;
 		return {
 			samples: [...samples],
-			percentiles: { p50: 99, p95: 99, p99: 99 },
+			percentiles: { p1: 99, p50: 99, p95: 99, p99: 99 },
 			ledger: {
 				attempted,
 				queued: attempted,
