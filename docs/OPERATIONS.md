@@ -317,6 +317,55 @@ benefit on a real path: over a WAN, where BDP routinely exceeds 256 KiB, the
 default window — not the CPU — is what caps a single stream. Widen when you
 measure a stalled sender on a long path; do not widen speculatively.
 
+## Sizing the JS read side (stream tail latency)
+
+Everything a stream delivers to JavaScript is surfaced by **one event loop**,
+and app-observed tail latency is a queueing function of that thread's
+utilization — it degrades *nonlinearly* as the loop approaches saturation. The
+mechanism was measured end-to-end (2026-08-25, T-100 shape: 100 bidi streams,
+3 Mbps each direction, ~26.4k frames/s aggregate): with loop headroom the
+app-level p99 is **2.5 ms**; starving the same workload's CPU produced 5.2 ms
+at ~82 % and 11.5 ms at ~95 % utilization; and a host that held the loop at
+93–95 % of a slower core with unthrottled senders measured **348 ms** — a
+~140× tail inflation with near-identical throughput. Wire-level delivery was
+17 ms p99 throughout: the frames arrive; a saturated loop just doesn't run
+your callback.
+
+The rules that follow from the measurements, in order of leverage:
+
+1. **Keep the reader loop below ~80 % of a core.** On the reference hardware
+   (dedicated Intel vCPU), 100 tunnels of the shape above cost 0.9–1.15
+   cores of loop time — plan roughly **70 such streams per JS process** and
+   shard processes beyond that (`reusePort` + `quicLb` +
+   `reusePortSteering` is the supported multi-process shape). Watch the
+   loop's own utilization, not host CPU: the host can be 90 % idle while the
+   one loop that matters is critical.
+2. **Drain latency-critical streams with a native sink
+   (`openReadSink`).** A native task timestamps stream data into a
+   SharedArrayBuffer ring that a `SinkReader` in a Worker consumes with zero
+   event-loop crossings on the hot path (`docs/RFC_STREAM_SINK.md`). The
+   productized path reproduces the harness result: at 90 % loop saturation
+   the facade read path measured p50 5.2 ms / p99 9.5 ms while the sink held
+   p50 0.7 ms / p99 2.3 ms — flat against its unsaturated numbers
+   (`tools/load/bench-sink.ts`; local macOS run, the authoritative gate is
+   the Linux dedicated runner). Open the sink before consuming the stream's
+   readable, post `handle.buffer`/`handle.descriptor` to your Worker, and
+   size `ringBytes` for your burst tolerance — `overflow: 'block'` (default)
+   throttles the sender losslessly via QUIC flow control when the ring
+   fills; `'drop-newest'` never blocks the wire and discloses counted gaps.
+   The wasm backend exposes the same API as shape parity only: its producer
+   runs on the main loop, so it cannot isolate latency from saturation.
+3. **Worker threads help the processing, not the delivery.** Offloading
+   parse/deframe work to workers reduces loop load, but the read callback
+   itself still lands on the one loop — workers alone cannot fix a saturated
+   reader. (The sink in rule 2 is the exception by construction: delivery
+   itself moves off the loop.)
+4. **`WEBTRANSPORT_STREAM_BATCH_BYTES` is damping, not prevention.** Batching
+   coalesces only what has accumulated: a keeping-up reader measured 1.07
+   frames per crossing (no benefit — 11.0 vs 11.5 ms p99 at 95 %
+   utilization, identical CPU). It softens a backlog once you are already
+   behind; it does not keep you out of the critical region.
+
 ## Known limitations and compatibility
 
 - Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits

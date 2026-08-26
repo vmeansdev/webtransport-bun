@@ -17,7 +17,34 @@ use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use wtransport::error::{StreamReadError, StreamWriteError};
 
+use crate::read_ownership::{ReadOwnership, ReadOwnershipState};
+use crate::stream_sink::{
+    clock_now_ns, resolve_sink_options, run_sink_task, try_acquire_sink_slot, Deframer,
+    NativeStreamSinkOptions, SinkClock, SinkCounters, SinkRing, SinkSource, SinkStop,
+    SinkTaskConfig, StreamSinkOpenInfo, StreamSinkStatsSnapshot,
+};
 use crate::RUNTIME;
+use napi::{Env, JsTypedArray, TypedArrayType};
+
+/// Which tokio runtime a handle's lazily-created bridges spawn on. Eagerly
+/// bridged handles never consult this; deferred handles must land their
+/// late-spawned read/write bridges on the same runtime that drives their
+/// connection (server sessions on `RUNTIME`, client connections on
+/// `CLIENT_RUNTIME`).
+#[derive(Clone, Copy)]
+pub enum BridgeRuntime {
+    Server,
+    Client,
+}
+
+impl BridgeRuntime {
+    fn get(self) -> &'static tokio::runtime::Runtime {
+        match self {
+            Self::Server => &RUNTIME,
+            Self::Client => &crate::CLIENT_RUNTIME,
+        }
+    }
+}
 
 /// Deliver a control command (Finish/Reset) without loss: try_send fast path,
 /// falling back to an async send when the write channel is momentarily full.
@@ -648,12 +675,16 @@ async fn read_bridge_batch(
 
 /// The pieces of a receive handle a deferred-direct batch read needs.
 struct DirectReadCtx<'a> {
+    ownership: &'a ReadOwnership,
     deferred_recv: &'a Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
     budget: &'a Mutex<Option<StreamBudget>>,
     deferred_budget: &'a Mutex<Option<DeferredStreamBudgetConfig>>,
     read_abort: &'a Notify,
     read_aborted: &'a AtomicBool,
     deferred_terminal: &'a TerminalLatch,
+    /// Bytes handed to JS by deferred-direct reads; the base a later native
+    /// sink resumes its `streamByteOffset` from (RFC_STREAM_SINK §6).
+    direct_bytes_consumed: &'a AtomicU64,
 }
 
 /// Where the terminal event of a deferred-direct stream is remembered when a
@@ -734,17 +765,28 @@ async fn read_deferred_direct_batch(
     if let Some(code) = ctx.deferred_terminal.get() {
         return Err(wt_from_static_code(code));
     }
+    // The ownership gate replaces "was the deferred slot occupied" as the
+    // direct-read admission check: only a `Deferred` readable half may be
+    // read directly, and claiming it is atomic, so a concurrent sink open or
+    // second reader observes `DirectReadActive` instead of an ambiguous
+    // empty slot.
+    if !ctx.ownership.begin_direct_read() {
+        return Ok(None);
+    }
     let pending = ctx
         .deferred_recv
         .lock()
         .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
         .take();
     let Some((mut recv_stream, guard)) = pending else {
+        // Teardown emptied the slot between the claim and the take.
+        ctx.ownership.direct_read_lost();
         return Ok(None);
     };
     if ctx.read_aborted.load(Ordering::Acquire) {
         recv_stream.stop(0);
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
         return Err(wt_from_reason("E_STREAM_RESET"));
     }
 
@@ -760,6 +802,7 @@ async fn read_deferred_direct_batch(
         _ = &mut notified => {
             recv_stream.stop(0);
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
     };
@@ -767,11 +810,13 @@ async fn read_deferred_direct_batch(
         Ok(value) => value,
         Err(error) => {
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_static_code(quic_read_error_code(&error)));
         }
     };
     let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
         return Ok(Some(None));
     };
     let n = chunk_bytes.len();
@@ -779,6 +824,7 @@ async fn read_deferred_direct_batch(
         if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
             recv_stream.stop(0);
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         if !{
@@ -787,6 +833,7 @@ async fn read_deferred_direct_batch(
         } {
             recv_stream.stop(0);
             drop(guard);
+            ctx.ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
         }
     }
@@ -796,6 +843,7 @@ async fn read_deferred_direct_batch(
         }
         recv_stream.stop(0);
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
         return Err(wt_from_reason("E_STREAM_RESET"));
     }
 
@@ -851,6 +899,8 @@ async fn read_deferred_direct_batch(
     }
 
     let batch = CoalescedChunks::new(chunks);
+    ctx.direct_bytes_consumed
+        .fetch_add(total as u64, Ordering::Relaxed);
     let mut deferred = ctx
         .deferred_recv
         .lock()
@@ -858,10 +908,232 @@ async fn read_deferred_direct_batch(
     if ctx.read_aborted.load(Ordering::Acquire) {
         recv_stream.stop(0);
         drop(guard);
+        ctx.ownership.end_direct_read_consumed();
     } else {
         *deferred = Some((recv_stream, guard));
+        ctx.ownership.end_direct_read_keep();
     }
     Ok(Some(Some(batch)))
+}
+
+// ---------------------------------------------------------------------------
+// Native stream sink surface (RFC_STREAM_SINK phase 3)
+// ---------------------------------------------------------------------------
+
+/// Per-handle record of an opened sink. The task owns the transport stream
+/// and the ring writer; this is the main thread's view of it. The SAB
+/// reference is the lifetime anchor for the ring memory: it is released only
+/// on the JS thread, only after the task's exit was observed
+/// (`sink_release_buffer`), so a native writer never outlives its buffer.
+pub(crate) struct ActiveSink {
+    stop: Arc<SinkStop>,
+    exited: Arc<SinkStop>,
+    counters: Arc<SinkCounters>,
+    buffer_ref: Mutex<Option<napi::Ref<()>>>,
+}
+
+/// The pieces of a receive handle a sink open needs; both handle shapes
+/// carry them, so the open path is written once (DirectReadCtx precedent).
+struct SinkOpenCtx<'a> {
+    ownership: &'a ReadOwnership,
+    deferred_recv: &'a Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
+    deferred_terminal: &'a TerminalLatch,
+    direct_bytes_consumed: &'a AtomicU64,
+    sink: &'a Mutex<Option<Arc<ActiveSink>>>,
+    runtime: BridgeRuntime,
+}
+
+fn sink_of(slot: &Mutex<Option<Arc<ActiveSink>>>) -> Option<Arc<ActiveSink>> {
+    slot.lock().ok().and_then(|guard| guard.clone())
+}
+
+fn fire_sink_stop(slot: &Mutex<Option<Arc<ActiveSink>>>) {
+    if let Some(sink) = sink_of(slot) {
+        sink.stop.fire();
+    }
+}
+
+/// Open a native read sink on a deferred readable half. Sync and
+/// reject-free: every failure comes back as its code string, and a failure
+/// after the ownership claim rolls the stream back into the deferred slot.
+fn open_read_sink_common(
+    env: Env,
+    sab: JsTypedArray,
+    options: NativeStreamSinkOptions,
+    ctx: SinkOpenCtx<'_>,
+) -> napi::bindgen_prelude::Either<StreamSinkOpenInfo, String> {
+    use napi::bindgen_prelude::Either;
+    if sink_of(ctx.sink).is_some() {
+        return Either::B("E_SINK_ALREADY_OPEN".to_string());
+    }
+    // A latched terminal means reads already consumed the stream's end; a
+    // sink must not open past it (the latch is invisible to the ring).
+    if ctx.deferred_terminal.get().is_some() {
+        return Either::B("E_SINK_READ_ACTIVE".to_string());
+    }
+    let resolved = match resolve_sink_options(&options) {
+        Ok(resolved) => resolved,
+        Err(code) => return Either::B(code),
+    };
+    let framing = match resolved.framing.clone().map(Deframer::new).transpose() {
+        Ok(framing) => framing,
+        Err(code) => return Either::B(code),
+    };
+    let Some(slot) = try_acquire_sink_slot() else {
+        return Either::B("E_SINK_LIMIT".to_string());
+    };
+    if let Err(state) = ctx.ownership.try_claim_sink() {
+        return Either::B(
+            match state {
+                ReadOwnershipState::DirectReadActive | ReadOwnershipState::Bridged => {
+                    "E_SINK_READ_ACTIVE"
+                }
+                ReadOwnershipState::Sink => "E_SINK_ALREADY_OPEN",
+                _ => "E_STREAM_RESET",
+            }
+            .to_string(),
+        );
+    }
+    let pending = match ctx.deferred_recv.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => {
+            ctx.ownership.release_sink_claim();
+            return Either::B("E_INTERNAL: deferred stream lock poisoned".to_string());
+        }
+    };
+    let Some((recv_stream, stream_guard)) = pending else {
+        // Teardown emptied the slot between the claim and the take.
+        ctx.ownership.mark_consumed();
+        return Either::B("E_STREAM_RESET".to_string());
+    };
+    // Failure past this point puts the stream back before releasing the
+    // claim, preserving the Deferred => slot-occupied invariant.
+    let rollback = |recv_stream: wtransport::RecvStream, stream_guard: StreamGuard| {
+        if let Ok(mut guard) = ctx.deferred_recv.lock() {
+            *guard = Some((recv_stream, stream_guard));
+        }
+        ctx.ownership.release_sink_claim();
+    };
+    let mut sab_ref = match env.create_reference(&sab) {
+        Ok(sab_ref) => sab_ref,
+        Err(_) => {
+            rollback(recv_stream, stream_guard);
+            return Either::B("E_SINK_INTERNAL: buffer reference failed".to_string());
+        }
+    };
+    let value = match sab.into_value() {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = sab_ref.unref(env);
+            rollback(recv_stream, stream_guard);
+            return Either::B("E_SINK_BAD_BUFFER: not a typed array".to_string());
+        }
+    };
+    if value.typedarray_type != TypedArrayType::Uint8 || value.byte_offset != 0 {
+        let _ = sab_ref.unref(env);
+        rollback(recv_stream, stream_guard);
+        return Either::B(
+            "E_SINK_BAD_BUFFER: expected a Uint8Array view from offset 0".to_string(),
+        );
+    }
+    let bytes: &[u8] = value.as_ref();
+    let ring = match unsafe {
+        SinkRing::init(
+            bytes.as_ptr() as *mut u8,
+            bytes.len(),
+            resolved.data_capacity,
+            resolved.flags,
+            resolved.mode,
+        )
+    } {
+        Ok(ring) => ring,
+        Err(code) => {
+            let _ = sab_ref.unref(env);
+            rollback(recv_stream, stream_guard);
+            return Either::B(code);
+        }
+    };
+    let counters = Arc::new(SinkCounters::default());
+    let stop = Arc::new(SinkStop::new());
+    let exited = Arc::new(SinkStop::new());
+    let config = SinkTaskConfig {
+        clock: resolved.clock,
+        framing,
+        backpressure_timeout: resolved.backpressure_timeout,
+        idle_timeout: resolved.idle_timeout,
+        base_offset: ctx.direct_bytes_consumed.load(Ordering::Relaxed),
+    };
+    ctx.runtime.get().spawn(run_sink_task(
+        SinkSource::Quic(recv_stream),
+        ring,
+        config,
+        Arc::clone(&counters),
+        Arc::clone(&stop),
+        Arc::clone(&exited),
+        (stream_guard, slot),
+    ));
+    let active = Arc::new(ActiveSink {
+        stop,
+        exited,
+        counters,
+        buffer_ref: Mutex::new(Some(sab_ref)),
+    });
+    if let Ok(mut guard) = ctx.sink.lock() {
+        *guard = Some(active);
+    }
+    Either::A(StreamSinkOpenInfo {
+        data_capacity: resolved.data_capacity,
+        flags: resolved.flags,
+        monotonic_anchor_us: clock_now_ns(SinkClock::Monotonic) as f64 / 1000.0,
+        wall_anchor_us: clock_now_ns(SinkClock::Wall) as f64 / 1000.0,
+    })
+}
+
+/// Await the sink task's exit, bounded. Never rejects; false = still
+/// running at the deadline.
+async fn wait_sink_exit(sink: Arc<ActiveSink>, timeout_ms: f64) -> bool {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0.0) as u64);
+    loop {
+        if sink.exited.fired() {
+            return true;
+        }
+        let notified = sink.exited.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if sink.exited.fired() {
+            return true;
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(deadline) => return sink.exited.fired(),
+        }
+    }
+}
+
+fn sink_release_buffer_common(env: Env, slot: &Mutex<Option<Arc<ActiveSink>>>) -> bool {
+    let Some(sink) = sink_of(slot) else {
+        return true;
+    };
+    if !sink.exited.fired() {
+        return false;
+    }
+    if let Ok(mut guard) = sink.buffer_ref.lock() {
+        if let Some(mut sab_ref) = guard.take() {
+            let _ = sab_ref.unref(env);
+        }
+    }
+    true
+}
+
+fn sink_stats_common(slot: &Mutex<Option<Arc<ActiveSink>>>) -> Option<StreamSinkStatsSnapshot> {
+    sink_of(slot).map(|sink| StreamSinkStatsSnapshot {
+        bytes_in: sink.counters.bytes_in.load(Ordering::Relaxed) as f64,
+        records: sink.counters.records.load(Ordering::Relaxed) as f64,
+        pending_partial_bytes: sink.counters.pending_partial_bytes.load(Ordering::Relaxed) as f64,
+        task_state: sink.counters.task_state.load(Ordering::Acquire),
+        exited: sink.exited.fired(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -872,13 +1144,6 @@ async fn read_deferred_direct_batch(
 type WriteErrorSlot = Arc<Mutex<Option<&'static str>>>;
 /// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
 type ReadErrorSlot = Arc<Mutex<Option<&'static str>>>;
-type BidiBridgeParts = (
-    mpsc::Receiver<StreamChunk>,
-    mpsc::Sender<StreamCmd>,
-    oneshot::Sender<u32>,
-    Option<WriteErrorSlot>,
-    Option<ReadErrorSlot>,
-);
 type ReadBridgeParts = (
     mpsc::Receiver<StreamChunk>,
     oneshot::Sender<u32>,
@@ -1003,6 +1268,15 @@ async fn acquire_deferred_read_bridge_permit(
 /// do not retain a task, channel, or scratch buffer for their whole lifetime.
 #[napi]
 pub struct ClientBidiStreamHandle {
+    /// Authoritative state of the readable half; the deferred/bridge slots
+    /// below are storage, this gate decides which path a read takes.
+    read_ownership: ReadOwnership,
+    /// Runtime for lazily-spawned read/write bridges (see [`BridgeRuntime`]).
+    bridge_runtime: BridgeRuntime,
+    /// Bytes delivered to JS by deferred-direct reads (sink offset base).
+    direct_bytes_consumed: AtomicU64,
+    /// Opened native sink, if any (RFC_STREAM_SINK).
+    sink: Mutex<Option<Arc<ActiveSink>>>,
     read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
     lazy_send_stream: Mutex<Option<wtransport::SendStream>>,
@@ -1040,6 +1314,10 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
@@ -1077,6 +1355,10 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
@@ -1086,33 +1368,6 @@ impl ClientBidiStreamHandle {
             budget: Mutex::new(budget),
             deferred_budget: Mutex::new(None),
             write_error_slot: Mutex::new(write_error_slot),
-            read_error_slot,
-            deferred_read_error_slot: Mutex::new(None),
-            read_abort: Notify::new(),
-            read_aborted: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-        }
-    }
-
-    pub fn new_lazy_with_budget_and_slot(
-        read_rx: mpsc::Receiver<StreamChunk>,
-        send_stream: wtransport::SendStream,
-        stop_tx: oneshot::Sender<u32>,
-        budget: Option<StreamBudget>,
-        read_error_slot: Option<ReadErrorSlot>,
-    ) -> Self {
-        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
-        Self {
-            read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
-            write_tx: Mutex::new(None),
-            lazy_send_stream: Mutex::new(Some(send_stream)),
-            deferred_recv: Mutex::new(None),
-            deferred_terminal: TerminalLatch::default(),
-            stop_tx: std::sync::Mutex::new(Some(stop_tx)),
-            budget: Mutex::new(budget),
-            deferred_budget: Mutex::new(None),
-            write_error_slot: Mutex::new(None),
             read_error_slot,
             deferred_read_error_slot: Mutex::new(None),
             read_abort: Notify::new(),
@@ -1134,6 +1389,10 @@ impl ClientBidiStreamHandle {
     ) -> Self {
         LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(None),
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
@@ -1152,12 +1411,40 @@ impl ClientBidiStreamHandle {
         }
     }
 
-    pub fn new_client_stream(
-        read_rx: mpsc::Receiver<StreamChunk>,
-        write_tx: mpsc::Sender<StreamCmd>,
-        stop_tx: oneshot::Sender<u32>,
+    /// Construct a deferred bidi stream whose budget is already materialized
+    /// (client-opened/-accepted and server-created streams size their budget
+    /// at open time), pinning lazily-spawned bridges to the given runtime.
+    /// Same laziness as `new_deferred`: no task, channel, or scratch buffer
+    /// exists until JS first reads or writes.
+    pub fn new_deferred_with_budget(
+        recv_stream: wtransport::RecvStream,
+        send_stream: wtransport::SendStream,
+        guard: StreamGuard,
+        budget: StreamBudget,
+        runtime: BridgeRuntime,
     ) -> Self {
-        Self::new(read_rx, write_tx, stop_tx)
+        LIVE_BIDI_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: runtime,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
+            read_rx: Mutex::new(None),
+            write_tx: Mutex::new(None),
+            lazy_send_stream: Mutex::new(Some(send_stream)),
+            deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            deferred_terminal: TerminalLatch::default(),
+            stop_tx: std::sync::Mutex::new(None),
+            budget: Mutex::new(Some(budget)),
+            deferred_budget: Mutex::new(None),
+            write_error_slot: Mutex::new(None),
+            read_error_slot: None,
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
     }
 
     /// Consume a deferred server receive stream to EOF without creating a
@@ -1197,17 +1484,24 @@ impl ClientBidiStreamHandle {
         if let Some(code) = self.deferred_terminal.get() {
             return Err(wt_from_static_code(code));
         }
+        // Ownership gate: see `read_deferred_direct_batch` — only a
+        // `Deferred` readable half may be read directly.
+        if !self.read_ownership.begin_direct_read() {
+            return Ok(None);
+        }
         let pending = self
             .deferred_recv
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
             .take();
         let Some((mut recv_stream, guard)) = pending else {
+            self.read_ownership.direct_read_lost();
             return Ok(None);
         };
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
 
@@ -1223,6 +1517,7 @@ impl ClientBidiStreamHandle {
             _ = &mut notified => {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
         };
@@ -1230,11 +1525,13 @@ impl ClientBidiStreamHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_static_code(quic_read_error_code(&error)));
             }
         };
         let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Ok(Some(None));
         };
         let n = chunk_bytes.len();
@@ -1243,6 +1540,7 @@ impl ClientBidiStreamHandle {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
             if !{
@@ -1251,6 +1549,7 @@ impl ClientBidiStreamHandle {
             } {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
@@ -1260,10 +1559,13 @@ impl ClientBidiStreamHandle {
             }
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         let chunk = StreamChunk::new_shared(chunk_bytes, budget, n as u64);
         let value = chunk.take_bytes().into();
+        self.direct_bytes_consumed
+            .fetch_add(n as u64, Ordering::Relaxed);
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -1271,8 +1573,10 @@ impl ClientBidiStreamHandle {
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
         } else {
             *deferred = Some((recv_stream, guard));
+            self.read_ownership.end_direct_read_keep();
         }
         Ok(Some(Some(value)))
     }
@@ -1305,7 +1609,12 @@ impl ClientBidiStreamHandle {
             }
         };
         let (write_tx, write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
-        spawn_bidi_write_bridge_on(&RUNTIME, send_stream, write_rx, write_error_slot);
+        spawn_bidi_write_bridge_on(
+            self.bridge_runtime.get(),
+            send_stream,
+            write_rx,
+            write_error_slot,
+        );
         *tx_guard = Some(write_tx.clone());
         Ok(write_tx)
     }
@@ -1361,14 +1670,14 @@ impl ClientBidiStreamHandle {
             drop(permit);
             return Ok(());
         };
-        let budget = self
-            .deferred_budget
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
-            .take()
-            .map(DeferredStreamBudgetConfig::materialize);
+        // `installed_budget`, not a bare `deferred_budget.take()`: handles
+        // with an already-materialized budget (client streams, server-created
+        // streams) would otherwise hand the bridge an unbudgeted read loop,
+        // and materializing through `installed_budget` keeps the handle's
+        // copy so a later write shares the same counters.
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         let (read_rx, stop_tx, read_error_slot) = spawn_recv_bridge_on_with_permit(
-            &RUNTIME,
+            self.bridge_runtime.get(),
             recv_stream,
             Some(guard),
             budget,
@@ -1386,10 +1695,13 @@ impl ClientBidiStreamHandle {
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred error lock poisoned"))?
             .replace(read_error_slot.expect("receive bridge always has an error slot"));
+        self.read_ownership.mark_bridged();
         Ok(())
     }
 
     fn dispose_resources(&self) {
+        self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.finished.store(true, Ordering::Release);
         self.abort_read();
         if let Ok(mut stop) = self.stop_tx.lock() {
@@ -1478,18 +1790,27 @@ impl ClientBidiStreamHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = read_deferred_direct_batch(
             DirectReadCtx {
+                ownership: &self.read_ownership,
                 deferred_recv: &self.deferred_recv,
                 budget: &self.budget,
                 deferred_budget: &self.deferred_budget,
                 read_abort: &self.read_abort,
                 read_aborted: &self.read_aborted,
                 deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
             },
             max_bytes,
         )
         .await?
         {
             return Ok(result);
+        }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
         }
         self.ensure_deferred_read_bridge().await?;
         let installed = installed_budget(&self.budget, &self.deferred_budget)?;
@@ -1510,6 +1831,13 @@ impl ClientBidiStreamHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
+        }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
         }
         self.ensure_deferred_read_bridge().await?;
         let read_rx = self
@@ -1631,6 +1959,65 @@ impl ClientBidiStreamHandle {
         Ok(())
     }
 
+    /// Open a native read sink on this stream's readable half
+    /// (RFC_STREAM_SINK). Sync and reject-free: failures resolve as their
+    /// code string. On success the sink task owns the readable half
+    /// permanently; `read()`/`readBatch()` resolve `E_SINK_ACTIVE`.
+    #[napi]
+    pub fn open_read_sink(
+        &self,
+        env: Env,
+        sab: JsTypedArray,
+        options: NativeStreamSinkOptions,
+    ) -> napi::bindgen_prelude::Either<StreamSinkOpenInfo, String> {
+        open_read_sink_common(
+            env,
+            sab,
+            options,
+            SinkOpenCtx {
+                ownership: &self.read_ownership,
+                deferred_recv: &self.deferred_recv,
+                deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
+                sink: &self.sink,
+                runtime: self.bridge_runtime,
+            },
+        )
+    }
+
+    /// Signal the sink task to stop. Returns false when no sink is open.
+    #[napi]
+    pub fn sink_close_begin(&self) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => {
+                sink.stop.fire();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Await the sink task's exit (never rejects; false = deadline hit).
+    #[napi]
+    pub async fn sink_wait_exit(&self, timeout_ms: f64) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => wait_sink_exit(sink, timeout_ms).await,
+            None => true,
+        }
+    }
+
+    /// Release the SharedArrayBuffer reference after the task exited.
+    /// Returns false (and holds the reference) while the task still runs.
+    #[napi]
+    pub fn sink_release_buffer(&self, env: Env) -> bool {
+        sink_release_buffer_common(env, &self.sink)
+    }
+
+    #[napi]
+    pub fn sink_stats(&self) -> Option<StreamSinkStatsSnapshot> {
+        sink_stats_common(&self.sink)
+    }
+
     #[napi]
     pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
@@ -1657,6 +2044,8 @@ impl ClientBidiStreamHandle {
 
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
+        self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.abort_read();
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
@@ -1914,6 +2303,14 @@ impl ClientUniSendHandle {
 
 #[napi]
 pub struct ClientUniRecvHandle {
+    /// Authoritative state of the readable half; see [`ReadOwnership`].
+    read_ownership: ReadOwnership,
+    /// Runtime for the lazily-spawned read bridge (see [`BridgeRuntime`]).
+    bridge_runtime: BridgeRuntime,
+    /// Bytes delivered to JS by deferred-direct reads (sink offset base).
+    direct_bytes_consumed: AtomicU64,
+    /// Opened native sink, if any (RFC_STREAM_SINK).
+    sink: Mutex<Option<Arc<ActiveSink>>>,
     read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     read_error_slot: Option<ReadErrorSlot>,
@@ -1935,6 +2332,10 @@ impl ClientUniRecvHandle {
     pub fn new(read_rx: mpsc::Receiver<StreamChunk>, stop_tx: oneshot::Sender<u32>) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot: None,
@@ -1956,6 +2357,10 @@ impl ClientUniRecvHandle {
     ) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::bridged(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot,
@@ -1979,6 +2384,10 @@ impl ClientUniRecvHandle {
     ) -> Self {
         LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
         Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: BridgeRuntime::Server,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(None),
             read_error_slot: None,
@@ -1986,6 +2395,35 @@ impl ClientUniRecvHandle {
             deferred_terminal: TerminalLatch::default(),
             budget: Mutex::new(None),
             deferred_budget: Mutex::new(budget),
+            deferred_read_error_slot: Mutex::new(None),
+            read_abort: Notify::new(),
+            read_aborted: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct a deferred incoming uni stream whose budget is already
+    /// materialized (client-accepted streams size their budget at accept
+    /// time), pinning the lazily-spawned read bridge to the given runtime.
+    pub fn new_deferred_with_budget(
+        recv_stream: wtransport::RecvStream,
+        guard: StreamGuard,
+        budget: StreamBudget,
+        runtime: BridgeRuntime,
+    ) -> Self {
+        LIVE_UNI_RECV_HANDLES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            read_ownership: ReadOwnership::deferred(),
+            bridge_runtime: runtime,
+            direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
+            read_rx: Mutex::new(None),
+            stop_tx: std::sync::Mutex::new(None),
+            read_error_slot: None,
+            deferred_recv: Mutex::new(Some((recv_stream, guard))),
+            deferred_terminal: TerminalLatch::default(),
+            budget: Mutex::new(Some(budget)),
+            deferred_budget: Mutex::new(None),
             deferred_read_error_slot: Mutex::new(None),
             read_abort: Notify::new(),
             read_aborted: AtomicBool::new(false),
@@ -2025,17 +2463,24 @@ impl ClientUniRecvHandle {
         if let Some(code) = self.deferred_terminal.get() {
             return Err(wt_from_static_code(code));
         }
+        // Ownership gate: see `read_deferred_direct_batch` — only a
+        // `Deferred` readable half may be read directly.
+        if !self.read_ownership.begin_direct_read() {
+            return Ok(None);
+        }
         let pending = self
             .deferred_recv
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred stream lock poisoned"))?
             .take();
         let Some((mut recv_stream, guard)) = pending else {
+            self.read_ownership.direct_read_lost();
             return Ok(None);
         };
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
 
@@ -2051,6 +2496,7 @@ impl ClientUniRecvHandle {
             _ = &mut notified => {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
         };
@@ -2058,11 +2504,13 @@ impl ClientUniRecvHandle {
             Ok(value) => value,
             Err(error) => {
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_static_code(quic_read_error_code(&error)));
             }
         };
         let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Ok(Some(None));
         };
         let n = chunk_bytes.len();
@@ -2071,6 +2519,7 @@ impl ClientUniRecvHandle {
             if should_reset_on_oversized_chunk(n as u64, &Some(b.clone())) {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_STREAM_RESET"));
             }
             if !{
@@ -2079,6 +2528,7 @@ impl ClientUniRecvHandle {
             } {
                 recv_stream.stop(0);
                 drop(guard);
+                self.read_ownership.end_direct_read_consumed();
                 return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
             }
         }
@@ -2088,10 +2538,13 @@ impl ClientUniRecvHandle {
             }
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
             return Err(wt_from_reason("E_STREAM_RESET"));
         }
         let chunk = StreamChunk::new_shared(chunk_bytes, budget, n as u64);
         let value = chunk.take_bytes().into();
+        self.direct_bytes_consumed
+            .fetch_add(n as u64, Ordering::Relaxed);
         let mut deferred = self
             .deferred_recv
             .lock()
@@ -2099,13 +2552,17 @@ impl ClientUniRecvHandle {
         if self.read_aborted.load(Ordering::Acquire) {
             recv_stream.stop(0);
             drop(guard);
+            self.read_ownership.end_direct_read_consumed();
         } else {
             *deferred = Some((recv_stream, guard));
+            self.read_ownership.end_direct_read_keep();
         }
         Ok(Some(Some(value)))
     }
 
     fn dispose_resources(&self) {
+        self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.read_aborted.store(true, Ordering::Release);
         self.read_abort.notify_waiters();
         if let Ok(mut stop) = self.stop_tx.lock() {
@@ -2148,14 +2605,10 @@ impl ClientUniRecvHandle {
             drop(permit);
             return Ok(());
         };
-        let budget = self
-            .deferred_budget
-            .lock()
-            .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred budget lock poisoned"))?
-            .take()
-            .map(DeferredStreamBudgetConfig::materialize);
+        // `installed_budget`, not a bare take: see the bidi twin above.
+        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
         let (read_rx, stop_tx, read_error_slot) = spawn_uni_recv_bridge_on_with_permit(
-            &RUNTIME,
+            self.bridge_runtime.get(),
             recv_stream,
             Some(guard),
             budget,
@@ -2173,6 +2626,7 @@ impl ClientUniRecvHandle {
             .lock()
             .map_err(|_| napi::Error::from_reason("E_INTERNAL: deferred error lock poisoned"))?
             .replace(read_error_slot.expect("receive bridge always has an error slot"));
+        self.read_ownership.mark_bridged();
         Ok(())
     }
 
@@ -2244,18 +2698,27 @@ impl ClientUniRecvHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = read_deferred_direct_batch(
             DirectReadCtx {
+                ownership: &self.read_ownership,
                 deferred_recv: &self.deferred_recv,
                 budget: &self.budget,
                 deferred_budget: &self.deferred_budget,
                 read_abort: &self.read_abort,
                 read_aborted: &self.read_aborted,
                 deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
             },
             max_bytes,
         )
         .await?
         {
             return Ok(result);
+        }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
         }
         self.ensure_deferred_read_bridge().await?;
         let installed = installed_budget(&self.budget, &self.deferred_budget)?;
@@ -2276,6 +2739,13 @@ impl ClientUniRecvHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
+        }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
         }
         self.ensure_deferred_read_bridge().await?;
         let read_rx = self
@@ -2323,8 +2793,63 @@ impl ClientUniRecvHandle {
         Ok(result)
     }
 
+    /// Open a native read sink on this stream (RFC_STREAM_SINK); see the
+    /// bidi handle's twin for the contract.
+    #[napi]
+    pub fn open_read_sink(
+        &self,
+        env: Env,
+        sab: JsTypedArray,
+        options: NativeStreamSinkOptions,
+    ) -> napi::bindgen_prelude::Either<StreamSinkOpenInfo, String> {
+        open_read_sink_common(
+            env,
+            sab,
+            options,
+            SinkOpenCtx {
+                ownership: &self.read_ownership,
+                deferred_recv: &self.deferred_recv,
+                deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
+                sink: &self.sink,
+                runtime: self.bridge_runtime,
+            },
+        )
+    }
+
+    #[napi]
+    pub fn sink_close_begin(&self) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => {
+                sink.stop.fire();
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[napi]
+    pub async fn sink_wait_exit(&self, timeout_ms: f64) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => wait_sink_exit(sink, timeout_ms).await,
+            None => true,
+        }
+    }
+
+    #[napi]
+    pub fn sink_release_buffer(&self, env: Env) -> bool {
+        sink_release_buffer_common(env, &self.sink)
+    }
+
+    #[napi]
+    pub fn sink_stats(&self) -> Option<StreamSinkStatsSnapshot> {
+        sink_stats_common(&self.sink)
+    }
+
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
+        self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.read_aborted.store(true, Ordering::Release);
         self.read_abort.notify_waiters();
         if let Ok(mut guard) = self.stop_tx.lock() {
@@ -2356,18 +2881,6 @@ impl ClientUniRecvHandle {
 // ---------------------------------------------------------------------------
 // Bridge spawn functions
 // ---------------------------------------------------------------------------
-
-/// Spawn bridge tasks for a bidi stream on the server runtime.
-/// Returns (read_rx, write_tx, stop_tx, write_error_slot) where write_error_slot
-/// is set to E_STOP_SENDING or E_STREAM_RESET when write fails.
-pub fn spawn_bidi_bridge(
-    send_stream: wtransport::SendStream,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> BidiBridgeParts {
-    spawn_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
-}
 
 async fn finish_send_stream(
     send_stream: &mut wtransport::SendStream,
@@ -2434,48 +2947,6 @@ fn spawn_bidi_write_bridge_on(
             }
         }
     });
-}
-
-pub fn spawn_lazy_bidi_bridge(
-    send_stream: wtransport::SendStream,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    wtransport::SendStream,
-    Option<ReadErrorSlot>,
-) {
-    spawn_lazy_bidi_bridge_on(&RUNTIME, send_stream, recv_stream, guard, budget)
-}
-
-pub fn spawn_lazy_bidi_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    send_stream: wtransport::SendStream,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    wtransport::SendStream,
-    Option<ReadErrorSlot>,
-) {
-    let (read_rx, stop_tx, read_error_slot) = spawn_recv_bridge_on(rt, recv_stream, guard, budget);
-    (read_rx, stop_tx, send_stream, read_error_slot)
-}
-
-/// Spawn only the receive half of a stream bridge. Accepted server streams use
-/// this from a deferred handle so an application that never calls `read()`
-/// does not allocate a Tokio task, channel, or scratch buffer for every stream.
-fn spawn_recv_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> ReadBridgeParts {
-    spawn_recv_bridge_on_with_permit(rt, recv_stream, guard, budget, None)
 }
 
 fn spawn_recv_bridge_on_with_permit(
@@ -2579,182 +3050,6 @@ fn spawn_recv_bridge_on_with_permit(
     (read_rx, stop_tx, Some(read_error_slot))
 }
 
-/// Spawn bridge on a specific runtime (use CLIENT_RUNTIME for client streams).
-pub fn spawn_bidi_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    mut send_stream: wtransport::SendStream,
-    mut recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> BidiBridgeParts {
-    let (read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
-    let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
-    let (stop_tx, stop_rx) = oneshot::channel::<u32>();
-    let write_error_slot: WriteErrorSlot = Arc::new(Mutex::new(None));
-    let read_error_slot: ReadErrorSlot = Arc::new(Mutex::new(None));
-
-    let read_budget = budget.clone();
-    let read_error_slot_clone = Arc::clone(&read_error_slot);
-    rt.spawn(async move {
-        let _guard = guard;
-        let mut buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
-        let mut stop_rx = stop_rx;
-        loop {
-            let _probe_select = await_probe::enter(&await_probe::BRIDGE_SELECT);
-            tokio::select! {
-                res = recv_stream.read(&mut buf) => {
-                    match res {
-                        Ok(Some(n)) => {
-                            let sz = n as u64;
-                            if let Some(ref b) = read_budget {
-                                // A chunk larger than the per-stream budget can
-                                // NEVER be reserved: parking would wedge the
-                                // stream forever. Stop it so the reader unblocks
-                                // with an error instead of hanging.
-                                if should_reset_on_oversized_chunk(sz, &read_budget) {
-                                    recv_stream.stop(0);
-                                    if let Ok(mut g) = read_error_slot_clone.lock() {
-                                        if g.is_none() {
-                                            *g = Some("E_STREAM_RESET");
-                                        }
-                                    }
-                                    break;
-                                }
-                                // Bounded backpressure park (see uni recv bridge and
-                                // reserve_for_recv): wait for capacity while QUIC
-                                // flow control pushes back on the sender, but give
-                                // up after backpressure_timeout_ms — an abandoned
-                                // reader frees no capacity and an unbounded park
-                                // pinned the handle and bridge for the process
-                                // lifetime.
-                                match reserve_for_recv(b, sz, &mut stop_rx).await {
-                                    RecvReserveOutcome::Reserved => {}
-                                    RecvReserveOutcome::TimedOut => {
-                                        recv_stream.stop(0);
-                                        if let Ok(mut g) = read_error_slot_clone.lock() {
-                                            if g.is_none() {
-                                                *g = Some(
-                                                    "E_BACKPRESSURE_TIMEOUT",
-                                                );
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    RecvReserveOutcome::Stopped(code) => {
-                                        if let Some(c) = code {
-                                            recv_stream.stop(c);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            let chunk =
-                                StreamChunk::new(buf[..n].to_vec(), read_budget.clone(), sz);
-                            // Bounded send (chunk drops on the stop branch or send
-                            // failure, releasing its reservation via Drop — no
-                            // manual release needed).
-                            let _probe_send = await_probe::enter(&await_probe::BRIDGE_SEND);
-                            tokio::select! {
-                                sent = read_tx.send(chunk) => {
-                                    if sent.is_err() {
-                                        break;
-                                    }
-                                }
-                                code = &mut stop_rx => {
-                                    if let Ok(c) = code {
-                                        recv_stream.stop(c);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            if let Ok(mut guard) = read_error_slot_clone.lock() {
-                                if guard.is_none() {
-                                    *guard = Some(read_error_code(&e));
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                code = &mut stop_rx => {
-                    if let Ok(c) = code {
-                        recv_stream.stop(c);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-
-    // `budget` is dropped here: each StreamCmd::Data now carries its own
-    // reservation via StreamChunk, releasing on write completion or teardown.
-    drop(budget);
-    let write_error_slot_clone = Arc::clone(&write_error_slot);
-    rt.spawn(async move {
-        while let Some(cmd) = write_rx.recv().await {
-            match cmd {
-                StreamCmd::Data(chunk) => {
-                    // The chunk holds the byte reservation until it drops at the
-                    // end of this arm (after the write completes or fails).
-                    match send_stream.write_all(chunk.as_bytes()).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            let code = match &e {
-                                StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                                _ => "E_STREAM_RESET",
-                            };
-                            if let Ok(mut guard) = write_error_slot_clone.lock() {
-                                if guard.is_none() {
-                                    *guard = Some(code);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                StreamCmd::Finish => {
-                    if let Err(code) = finish_send_stream(&mut send_stream).await {
-                        if let Ok(mut guard) = write_error_slot_clone.lock() {
-                            if guard.is_none() {
-                                *guard = Some(code);
-                            }
-                        }
-                    }
-                    break;
-                }
-                StreamCmd::FinishWithAck(done_tx) => {
-                    let mut ret: std::result::Result<(), String> = Ok(());
-                    if let Err(code) = finish_send_stream(&mut send_stream).await {
-                        if let Ok(mut guard) = write_error_slot_clone.lock() {
-                            if guard.is_none() {
-                                *guard = Some(code);
-                            }
-                        }
-                        ret = Err(code.to_string());
-                    }
-                    let _ = done_tx.send(ret);
-                    break;
-                }
-                StreamCmd::Reset(code) => {
-                    let _ = send_stream.reset(code);
-                    break;
-                }
-            }
-        }
-    });
-
-    (
-        read_rx,
-        write_tx,
-        stop_tx,
-        Some(write_error_slot),
-        Some(read_error_slot),
-    )
-}
-
 /// Spawn bridge for an outgoing uni stream.
 /// Returns (write_tx, write_error_slot) where write_error_slot is set on write failure.
 pub fn spawn_uni_send_bridge(
@@ -2832,32 +3127,6 @@ pub fn spawn_uni_send_bridge_on(
     });
 
     (write_tx, Some(write_error_slot))
-}
-
-/// Spawn bridge for an incoming uni stream.
-pub fn spawn_uni_recv_bridge(
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    Option<ReadErrorSlot>,
-) {
-    spawn_uni_recv_bridge_on(&RUNTIME, recv_stream, guard, budget)
-}
-
-pub fn spawn_uni_recv_bridge_on(
-    rt: &tokio::runtime::Runtime,
-    recv_stream: wtransport::RecvStream,
-    guard: Option<StreamGuard>,
-    budget: Option<StreamBudget>,
-) -> (
-    mpsc::Receiver<StreamChunk>,
-    oneshot::Sender<u32>,
-    Option<ReadErrorSlot>,
-) {
-    spawn_uni_recv_bridge_on_with_permit(rt, recv_stream, guard, budget, None)
 }
 
 fn spawn_uni_recv_bridge_on_with_permit(

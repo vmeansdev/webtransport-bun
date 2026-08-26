@@ -76,6 +76,56 @@ import {
 	WT_STOP_SENDING,
 } from "./streams.js";
 
+// Native stream sink (RFC_STREAM_SINK): latency-critical reads drained off
+// the JS event loop into a SharedArrayBuffer ring. Native backend only; the
+// worker-side SinkReader is also importable without native code via the
+// "@webtransport-bun/webtransport/sink-reader" subpath.
+export type {
+	StreamSinkHandle,
+	StreamSinkOptions,
+	StreamSinkStats,
+} from "./sink.js";
+export type {
+	SinkTaskStateName,
+	StreamSinkDescriptor,
+	StreamSinkFraming,
+} from "./sink-layout.js";
+export { SinkReader } from "./sink-reader.js";
+export type { SinkRecord, SinkRecordType } from "./sink-reader.js";
+import {
+	openReadSinkOnNativeHandle,
+	type SinkCapableNativeHandle,
+	type StreamSinkHandle as StreamSinkHandleType,
+	type StreamSinkOptions as StreamSinkOptionsType,
+} from "./sink.js";
+
+/**
+ * Open a native read sink on a native-backend stream (RFC_STREAM_SINK):
+ * accepts the Node facade classes (BidiStream / RecvStream) and the W3C
+ * incoming-stream wrappers a server session yields, all of which carry an
+ * `openReadSink` method with the same contract.
+ */
+export function openReadSink(
+	stream:
+		| BidiStream
+		| RecvStream
+		| { openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType },
+	opts?: StreamSinkOptionsType,
+): StreamSinkHandleType {
+	if (
+		typeof (stream as { openReadSink?: unknown }).openReadSink === "function"
+	) {
+		return (
+			stream as {
+				openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType;
+			}
+		).openReadSink(opts);
+	}
+	throw new Error(
+		"E_SINK_BAD_OPTIONS: openReadSink requires a native readable stream",
+	);
+}
+
 export type {
 	WebTransportErrorOptions,
 	WebTransportErrorSource,
@@ -4018,6 +4068,8 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 	disposed = false;
 	readableDone = false;
 	writableDone = false;
+	/** True once the W3C readable pulled — a sink cannot open after that. */
+	didRead = false;
 	private writableStream: WritableStream<Uint8Array> | null = null;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
 
@@ -4082,6 +4134,7 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			controller.close();
 			return;
 		}
+		this.didRead = true;
 		try {
 			const chunk = unwrapNativeValue(await readStreamChunk(current));
 			if (this.disposed || this.handle !== current) return;
@@ -4098,6 +4151,17 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			this.release(true);
 			controller.error(toWebTransportError(err));
 		}
+	}
+
+	/** See BidiStream.openReadSink — same contract on the W3C wrapper. */
+	openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType {
+		const current = this.handle;
+		if (!current || this.disposed) throw new Error("E_STREAM_RESET");
+		if (this.didRead) throw new Error("E_SINK_READ_ACTIVE");
+		return openReadSinkOnNativeHandle(
+			current as unknown as SinkCapableNativeHandle,
+			opts,
+		);
 	}
 
 	cancel(reason: unknown): void {
@@ -4206,12 +4270,20 @@ function attachServerBidiResourceControls(
 	const withControls = stream as WebTransportBidirectionalStream;
 	withControls[WT_RESET] = (code?: number) => resource.reset(code);
 	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	(
+		withControls as unknown as {
+			openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType;
+		}
+	).openReadSink = (opts?: StreamSinkOptionsType) =>
+		(resource as ServerIncomingBidiResource).openReadSink(opts);
 	return withControls;
 }
 
 class ServerIncomingUniResource implements ServerIncomingStreamResource {
 	handle: NativeRecvStreamHandle | null;
 	disposed = false;
+	/** True once the W3C readable pulled — a sink cannot open after that. */
+	didRead = false;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
 
 	constructor(
@@ -4266,6 +4338,7 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 			controller.close();
 			return;
 		}
+		this.didRead = true;
 		try {
 			const chunk = unwrapNativeValue(await readStreamChunk(current));
 			if (this.disposed || this.handle !== current) return;
@@ -4285,6 +4358,17 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 	cancel(reason: unknown): void {
 		this.release(true, extractStreamErrorCode(reason));
 	}
+
+	/** See RecvStream.openReadSink — same contract on the W3C wrapper. */
+	openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType {
+		const current = this.handle;
+		if (!current || this.disposed) throw new Error("E_STREAM_RESET");
+		if (this.didRead) throw new Error("E_SINK_READ_ACTIVE");
+		return openReadSinkOnNativeHandle(
+			current as unknown as SinkCapableNativeHandle,
+			opts,
+		);
+	}
 }
 
 function createServerIncomingUniWebReadable(
@@ -4300,6 +4384,12 @@ function createServerIncomingUniWebReadable(
 	});
 	const withControls = readable as WebTransportReceiveStream;
 	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	(
+		withControls as unknown as {
+			openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType;
+		}
+	).openReadSink = (opts?: StreamSinkOptionsType) =>
+		resource.openReadSink(opts);
 	return { resource, readable: withControls };
 }
 
