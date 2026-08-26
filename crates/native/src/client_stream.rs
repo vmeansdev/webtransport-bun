@@ -17,8 +17,14 @@ use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use wtransport::error::{StreamReadError, StreamWriteError};
 
-use crate::read_ownership::ReadOwnership;
+use crate::read_ownership::{ReadOwnership, ReadOwnershipState};
+use crate::stream_sink::{
+    clock_now_ns, resolve_sink_options, run_sink_task, try_acquire_sink_slot, Deframer,
+    NativeStreamSinkOptions, SinkClock, SinkCounters, SinkRing, SinkSource, SinkStop,
+    SinkTaskConfig, StreamSinkOpenInfo, StreamSinkStatsSnapshot,
+};
 use crate::RUNTIME;
+use napi::{Env, JsTypedArray, TypedArrayType};
 
 /// Which tokio runtime a handle's lazily-created bridges spawn on. Eagerly
 /// bridged handles never consult this; deferred handles must land their
@@ -911,6 +917,226 @@ async fn read_deferred_direct_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Native stream sink surface (RFC_STREAM_SINK phase 3)
+// ---------------------------------------------------------------------------
+
+/// Per-handle record of an opened sink. The task owns the transport stream
+/// and the ring writer; this is the main thread's view of it. The SAB
+/// reference is the lifetime anchor for the ring memory: it is released only
+/// on the JS thread, only after the task's exit was observed
+/// (`sink_release_buffer`), so a native writer never outlives its buffer.
+pub(crate) struct ActiveSink {
+    stop: Arc<SinkStop>,
+    exited: Arc<SinkStop>,
+    counters: Arc<SinkCounters>,
+    buffer_ref: Mutex<Option<napi::Ref<()>>>,
+}
+
+/// The pieces of a receive handle a sink open needs; both handle shapes
+/// carry them, so the open path is written once (DirectReadCtx precedent).
+struct SinkOpenCtx<'a> {
+    ownership: &'a ReadOwnership,
+    deferred_recv: &'a Mutex<Option<(wtransport::RecvStream, StreamGuard)>>,
+    deferred_terminal: &'a TerminalLatch,
+    direct_bytes_consumed: &'a AtomicU64,
+    sink: &'a Mutex<Option<Arc<ActiveSink>>>,
+    runtime: BridgeRuntime,
+}
+
+fn sink_of(slot: &Mutex<Option<Arc<ActiveSink>>>) -> Option<Arc<ActiveSink>> {
+    slot.lock().ok().and_then(|guard| guard.clone())
+}
+
+fn fire_sink_stop(slot: &Mutex<Option<Arc<ActiveSink>>>) {
+    if let Some(sink) = sink_of(slot) {
+        sink.stop.fire();
+    }
+}
+
+/// Open a native read sink on a deferred readable half. Sync and
+/// reject-free: every failure comes back as its code string, and a failure
+/// after the ownership claim rolls the stream back into the deferred slot.
+fn open_read_sink_common(
+    env: Env,
+    sab: JsTypedArray,
+    options: NativeStreamSinkOptions,
+    ctx: SinkOpenCtx<'_>,
+) -> napi::bindgen_prelude::Either<StreamSinkOpenInfo, String> {
+    use napi::bindgen_prelude::Either;
+    if sink_of(ctx.sink).is_some() {
+        return Either::B("E_SINK_ALREADY_OPEN".to_string());
+    }
+    // A latched terminal means reads already consumed the stream's end; a
+    // sink must not open past it (the latch is invisible to the ring).
+    if ctx.deferred_terminal.get().is_some() {
+        return Either::B("E_SINK_READ_ACTIVE".to_string());
+    }
+    let resolved = match resolve_sink_options(&options) {
+        Ok(resolved) => resolved,
+        Err(code) => return Either::B(code),
+    };
+    let framing = match resolved.framing.clone().map(Deframer::new).transpose() {
+        Ok(framing) => framing,
+        Err(code) => return Either::B(code),
+    };
+    let Some(slot) = try_acquire_sink_slot() else {
+        return Either::B("E_SINK_LIMIT".to_string());
+    };
+    if let Err(state) = ctx.ownership.try_claim_sink() {
+        return Either::B(
+            match state {
+                ReadOwnershipState::DirectReadActive | ReadOwnershipState::Bridged => {
+                    "E_SINK_READ_ACTIVE"
+                }
+                ReadOwnershipState::Sink => "E_SINK_ALREADY_OPEN",
+                _ => "E_STREAM_RESET",
+            }
+            .to_string(),
+        );
+    }
+    let pending = match ctx.deferred_recv.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => {
+            ctx.ownership.release_sink_claim();
+            return Either::B("E_INTERNAL: deferred stream lock poisoned".to_string());
+        }
+    };
+    let Some((recv_stream, stream_guard)) = pending else {
+        // Teardown emptied the slot between the claim and the take.
+        ctx.ownership.mark_consumed();
+        return Either::B("E_STREAM_RESET".to_string());
+    };
+    // Failure past this point puts the stream back before releasing the
+    // claim, preserving the Deferred => slot-occupied invariant.
+    let rollback = |recv_stream: wtransport::RecvStream, stream_guard: StreamGuard| {
+        if let Ok(mut guard) = ctx.deferred_recv.lock() {
+            *guard = Some((recv_stream, stream_guard));
+        }
+        ctx.ownership.release_sink_claim();
+    };
+    let mut sab_ref = match env.create_reference(&sab) {
+        Ok(sab_ref) => sab_ref,
+        Err(_) => {
+            rollback(recv_stream, stream_guard);
+            return Either::B("E_SINK_INTERNAL: buffer reference failed".to_string());
+        }
+    };
+    let value = match sab.into_value() {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = sab_ref.unref(env);
+            rollback(recv_stream, stream_guard);
+            return Either::B("E_SINK_BAD_BUFFER: not a typed array".to_string());
+        }
+    };
+    if value.typedarray_type != TypedArrayType::Uint8 || value.byte_offset != 0 {
+        let _ = sab_ref.unref(env);
+        rollback(recv_stream, stream_guard);
+        return Either::B(
+            "E_SINK_BAD_BUFFER: expected a Uint8Array view from offset 0".to_string(),
+        );
+    }
+    let bytes: &[u8] = value.as_ref();
+    let ring = match unsafe {
+        SinkRing::init(
+            bytes.as_ptr() as *mut u8,
+            bytes.len(),
+            resolved.data_capacity,
+            resolved.flags,
+            resolved.mode,
+        )
+    } {
+        Ok(ring) => ring,
+        Err(code) => {
+            let _ = sab_ref.unref(env);
+            rollback(recv_stream, stream_guard);
+            return Either::B(code);
+        }
+    };
+    let counters = Arc::new(SinkCounters::default());
+    let stop = Arc::new(SinkStop::new());
+    let exited = Arc::new(SinkStop::new());
+    let config = SinkTaskConfig {
+        clock: resolved.clock,
+        framing,
+        backpressure_timeout: resolved.backpressure_timeout,
+        idle_timeout: resolved.idle_timeout,
+        base_offset: ctx.direct_bytes_consumed.load(Ordering::Relaxed),
+    };
+    ctx.runtime.get().spawn(run_sink_task(
+        SinkSource::Quic(recv_stream),
+        ring,
+        config,
+        Arc::clone(&counters),
+        Arc::clone(&stop),
+        Arc::clone(&exited),
+        (stream_guard, slot),
+    ));
+    let active = Arc::new(ActiveSink {
+        stop,
+        exited,
+        counters,
+        buffer_ref: Mutex::new(Some(sab_ref)),
+    });
+    if let Ok(mut guard) = ctx.sink.lock() {
+        *guard = Some(active);
+    }
+    Either::A(StreamSinkOpenInfo {
+        data_capacity: resolved.data_capacity,
+        flags: resolved.flags,
+        monotonic_anchor_us: clock_now_ns(SinkClock::Monotonic) as f64 / 1000.0,
+        wall_anchor_us: clock_now_ns(SinkClock::Wall) as f64 / 1000.0,
+    })
+}
+
+/// Await the sink task's exit, bounded. Never rejects; false = still
+/// running at the deadline.
+async fn wait_sink_exit(sink: Arc<ActiveSink>, timeout_ms: f64) -> bool {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0.0) as u64);
+    loop {
+        if sink.exited.fired() {
+            return true;
+        }
+        let notified = sink.exited.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if sink.exited.fired() {
+            return true;
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(deadline) => return sink.exited.fired(),
+        }
+    }
+}
+
+fn sink_release_buffer_common(env: Env, slot: &Mutex<Option<Arc<ActiveSink>>>) -> bool {
+    let Some(sink) = sink_of(slot) else {
+        return true;
+    };
+    if !sink.exited.fired() {
+        return false;
+    }
+    if let Ok(mut guard) = sink.buffer_ref.lock() {
+        if let Some(mut sab_ref) = guard.take() {
+            let _ = sab_ref.unref(env);
+        }
+    }
+    true
+}
+
+fn sink_stats_common(slot: &Mutex<Option<Arc<ActiveSink>>>) -> Option<StreamSinkStatsSnapshot> {
+    sink_of(slot).map(|sink| StreamSinkStatsSnapshot {
+        bytes_in: sink.counters.bytes_in.load(Ordering::Relaxed) as f64,
+        records: sink.counters.records.load(Ordering::Relaxed) as f64,
+        pending_partial_bytes: sink.counters.pending_partial_bytes.load(Ordering::Relaxed) as f64,
+        task_state: sink.counters.task_state.load(Ordering::Acquire),
+        exited: sink.exited.fired(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Bidi stream handle
 // ---------------------------------------------------------------------------
 
@@ -1049,6 +1275,8 @@ pub struct ClientBidiStreamHandle {
     bridge_runtime: BridgeRuntime,
     /// Bytes delivered to JS by deferred-direct reads (sink offset base).
     direct_bytes_consumed: AtomicU64,
+    /// Opened native sink, if any (RFC_STREAM_SINK).
+    sink: Mutex<Option<Arc<ActiveSink>>>,
     read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     write_tx: Mutex<Option<mpsc::Sender<StreamCmd>>>,
     lazy_send_stream: Mutex<Option<wtransport::SendStream>>,
@@ -1089,6 +1317,7 @@ impl ClientBidiStreamHandle {
             read_ownership: ReadOwnership::bridged(),
             bridge_runtime: BridgeRuntime::Server,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
@@ -1129,6 +1358,7 @@ impl ClientBidiStreamHandle {
             read_ownership: ReadOwnership::bridged(),
             bridge_runtime: BridgeRuntime::Server,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             write_tx: Mutex::new(Some(write_tx)),
             lazy_send_stream: Mutex::new(None),
@@ -1162,6 +1392,7 @@ impl ClientBidiStreamHandle {
             read_ownership: ReadOwnership::deferred(),
             bridge_runtime: BridgeRuntime::Server,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(None),
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
@@ -1197,6 +1428,7 @@ impl ClientBidiStreamHandle {
             read_ownership: ReadOwnership::deferred(),
             bridge_runtime: runtime,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(None),
             write_tx: Mutex::new(None),
             lazy_send_stream: Mutex::new(Some(send_stream)),
@@ -1469,6 +1701,7 @@ impl ClientBidiStreamHandle {
 
     fn dispose_resources(&self) {
         self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.finished.store(true, Ordering::Release);
         self.abort_read();
         if let Ok(mut stop) = self.stop_tx.lock() {
@@ -1572,6 +1805,13 @@ impl ClientBidiStreamHandle {
         {
             return Ok(result);
         }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
+        }
         self.ensure_deferred_read_bridge().await?;
         let installed = installed_budget(&self.budget, &self.deferred_budget)?;
         read_bridge_batch(
@@ -1591,6 +1831,13 @@ impl ClientBidiStreamHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
+        }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
         }
         self.ensure_deferred_read_bridge().await?;
         let read_rx = self
@@ -1712,6 +1959,65 @@ impl ClientBidiStreamHandle {
         Ok(())
     }
 
+    /// Open a native read sink on this stream's readable half
+    /// (RFC_STREAM_SINK). Sync and reject-free: failures resolve as their
+    /// code string. On success the sink task owns the readable half
+    /// permanently; `read()`/`readBatch()` resolve `E_SINK_ACTIVE`.
+    #[napi]
+    pub fn open_read_sink(
+        &self,
+        env: Env,
+        sab: JsTypedArray,
+        options: NativeStreamSinkOptions,
+    ) -> napi::bindgen_prelude::Either<StreamSinkOpenInfo, String> {
+        open_read_sink_common(
+            env,
+            sab,
+            options,
+            SinkOpenCtx {
+                ownership: &self.read_ownership,
+                deferred_recv: &self.deferred_recv,
+                deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
+                sink: &self.sink,
+                runtime: self.bridge_runtime,
+            },
+        )
+    }
+
+    /// Signal the sink task to stop. Returns false when no sink is open.
+    #[napi]
+    pub fn sink_close_begin(&self) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => {
+                sink.stop.fire();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Await the sink task's exit (never rejects; false = deadline hit).
+    #[napi]
+    pub async fn sink_wait_exit(&self, timeout_ms: f64) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => wait_sink_exit(sink, timeout_ms).await,
+            None => true,
+        }
+    }
+
+    /// Release the SharedArrayBuffer reference after the task exited.
+    /// Returns false (and holds the reference) while the task still runs.
+    #[napi]
+    pub fn sink_release_buffer(&self, env: Env) -> bool {
+        sink_release_buffer_common(env, &self.sink)
+    }
+
+    #[napi]
+    pub fn sink_stats(&self) -> Option<StreamSinkStatsSnapshot> {
+        sink_stats_common(&self.sink)
+    }
+
     #[napi]
     pub fn reset(&self, code: u32) -> WtResult<()> {
         self.finished.store(true, Ordering::Release);
@@ -1739,6 +2045,7 @@ impl ClientBidiStreamHandle {
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
         self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.abort_read();
         if let Ok(mut guard) = self.stop_tx.lock() {
             if let Some(tx) = guard.take() {
@@ -2002,6 +2309,8 @@ pub struct ClientUniRecvHandle {
     bridge_runtime: BridgeRuntime,
     /// Bytes delivered to JS by deferred-direct reads (sink offset base).
     direct_bytes_consumed: AtomicU64,
+    /// Opened native sink, if any (RFC_STREAM_SINK).
+    sink: Mutex<Option<Arc<ActiveSink>>>,
     read_rx: Mutex<Option<Arc<TokioMutex<mpsc::Receiver<StreamChunk>>>>>,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     read_error_slot: Option<ReadErrorSlot>,
@@ -2026,6 +2335,7 @@ impl ClientUniRecvHandle {
             read_ownership: ReadOwnership::bridged(),
             bridge_runtime: BridgeRuntime::Server,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot: None,
@@ -2050,6 +2360,7 @@ impl ClientUniRecvHandle {
             read_ownership: ReadOwnership::bridged(),
             bridge_runtime: BridgeRuntime::Server,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(Some(Arc::new(TokioMutex::new(read_rx)))),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             read_error_slot,
@@ -2076,6 +2387,7 @@ impl ClientUniRecvHandle {
             read_ownership: ReadOwnership::deferred(),
             bridge_runtime: BridgeRuntime::Server,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(None),
             read_error_slot: None,
@@ -2104,6 +2416,7 @@ impl ClientUniRecvHandle {
             read_ownership: ReadOwnership::deferred(),
             bridge_runtime: runtime,
             direct_bytes_consumed: AtomicU64::new(0),
+            sink: Mutex::new(None),
             read_rx: Mutex::new(None),
             stop_tx: std::sync::Mutex::new(None),
             read_error_slot: None,
@@ -2249,6 +2562,7 @@ impl ClientUniRecvHandle {
 
     fn dispose_resources(&self) {
         self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.read_aborted.store(true, Ordering::Release);
         self.read_abort.notify_waiters();
         if let Ok(mut stop) = self.stop_tx.lock() {
@@ -2399,6 +2713,13 @@ impl ClientUniRecvHandle {
         {
             return Ok(result);
         }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
+        }
         self.ensure_deferred_read_bridge().await?;
         let installed = installed_budget(&self.budget, &self.deferred_budget)?;
         read_bridge_batch(
@@ -2418,6 +2739,13 @@ impl ClientUniRecvHandle {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = self.read_deferred_direct().await? {
             return Ok(result);
+        }
+        // A sink owns the readable half permanently; surface that as its
+        // own code instead of the bridge path's E_STREAM_RESET. Raw
+        // napi::Error, not wt_from_reason: sink codes are outside the WtCode
+        // table and the read methods resolve the reason string verbatim.
+        if self.read_ownership.state() == ReadOwnershipState::Sink {
+            return Err(napi::Error::from_reason("E_SINK_ACTIVE"));
         }
         self.ensure_deferred_read_bridge().await?;
         let read_rx = self
@@ -2465,9 +2793,63 @@ impl ClientUniRecvHandle {
         Ok(result)
     }
 
+    /// Open a native read sink on this stream (RFC_STREAM_SINK); see the
+    /// bidi handle's twin for the contract.
+    #[napi]
+    pub fn open_read_sink(
+        &self,
+        env: Env,
+        sab: JsTypedArray,
+        options: NativeStreamSinkOptions,
+    ) -> napi::bindgen_prelude::Either<StreamSinkOpenInfo, String> {
+        open_read_sink_common(
+            env,
+            sab,
+            options,
+            SinkOpenCtx {
+                ownership: &self.read_ownership,
+                deferred_recv: &self.deferred_recv,
+                deferred_terminal: &self.deferred_terminal,
+                direct_bytes_consumed: &self.direct_bytes_consumed,
+                sink: &self.sink,
+                runtime: self.bridge_runtime,
+            },
+        )
+    }
+
+    #[napi]
+    pub fn sink_close_begin(&self) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => {
+                sink.stop.fire();
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[napi]
+    pub async fn sink_wait_exit(&self, timeout_ms: f64) -> bool {
+        match sink_of(&self.sink) {
+            Some(sink) => wait_sink_exit(sink, timeout_ms).await,
+            None => true,
+        }
+    }
+
+    #[napi]
+    pub fn sink_release_buffer(&self, env: Env) -> bool {
+        sink_release_buffer_common(env, &self.sink)
+    }
+
+    #[napi]
+    pub fn sink_stats(&self) -> Option<StreamSinkStatsSnapshot> {
+        sink_stats_common(&self.sink)
+    }
+
     #[napi]
     pub fn stop_sending(&self, code: u32) -> WtResult<()> {
         self.read_ownership.mark_consumed();
+        fire_sink_stop(&self.sink);
         self.read_aborted.store(true, Ordering::Release);
         self.read_abort.notify_waiters();
         if let Ok(mut guard) = self.stop_tx.lock() {

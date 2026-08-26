@@ -108,8 +108,7 @@ pub mod session;
 pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) mod stream_sink;
+pub mod stream_sink;
 pub mod transport_memory;
 pub mod zero_rtt;
 
