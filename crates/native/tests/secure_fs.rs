@@ -1541,7 +1541,7 @@ mod posix_red {
         assert_eq!(error.code(), expected);
     }
 
-    fn linux_identity() -> DirectoryIdentity {
+    pub(super) fn linux_identity() -> DirectoryIdentity {
         #[cfg(target_os = "linux")]
         {
             DirectoryIdentity::Linux(super::secure_fs::LinuxDirectoryIdentity {
@@ -1578,7 +1578,7 @@ mod posix_red {
         }
     }
 
-    fn root_file_identity() -> FileIdentity {
+    pub(super) fn root_file_identity() -> FileIdentity {
         #[cfg(target_os = "linux")]
         let (device, mount_id) = ("8:1".to_string(), Some("55".to_string()));
         #[cfg(target_os = "macos")]
@@ -2762,7 +2762,7 @@ mod posix_red {
             ),
             ScriptedCall::ok(
                 Syscall::Fstat { fd: CHILD_FD },
-                Reply::FileIdentity(root_stat().with_inode("9010")),
+                Reply::FileIdentity(super::linux_red::root_stat().with_inode("9010")),
             ),
             ScriptedCall::ok(Syscall::FcntlGetFd { fd: CHILD_FD }, Reply::CloseOnExec),
             ScriptedCall::ok(
@@ -2798,8 +2798,8 @@ mod posix_red {
         // handle. Linux may retain ordinary staging primitives, but a caller
         // asking for the campaign reservation receives the platform gate before
         // any reservation bytes, campaign identity, or partial file exist.
-        let expected = identity();
-        let mut calls = root_prefix(&expected);
+        let expected = super::linux_red::identity();
+        let mut calls = super::linux_red::root_prefix(&expected);
         calls.push(ScriptedCall::ok(
             Syscall::Close { fd: PINNED_ROOT_FD },
             Reply::Unit,
@@ -3522,6 +3522,12 @@ mod linux_red {
     const PROTOCOL_OUT_FD: i32 = 206;
     const STARTUP_NONCE_FD: i32 = 207;
     const STAGED_EXEC_FD: i32 = 204;
+    // Linux launches the sealed executable in place via execveat(EXEC_FD, "")
+    // ("linux-execveat-empty-path"): the descriptor whose bytes the ceremony
+    // hashes is the exec descriptor itself, so the source descriptor aliases
+    // EXEC_FD. There is no macOS-style copy from a separate source fd (208)
+    // into a staged exec fd (204) on this platform.
+    const SOURCE_EXEC_FD: i32 = EXEC_FD;
     const EXECUTABLE_BYTES: &[u8] = b"#!/usr/bin/env bun\n";
     const EXECUTABLE_SHA256: &str =
         "1af9f724d86a6268aa72c8a187248c1d06937501784da400b5a3199270bc3c41";
@@ -3697,7 +3703,7 @@ mod linux_red {
         assert_eq!(error.code(), expected);
     }
 
-    fn identity() -> DirectoryIdentity {
+    pub(super) fn identity() -> DirectoryIdentity {
         DirectoryIdentity::Linux(super::secure_fs::LinuxDirectoryIdentity {
             device_major: "8".into(),
             device_minor: "1".into(),
@@ -3713,7 +3719,7 @@ mod linux_red {
         })
     }
 
-    fn root_stat() -> FileIdentity {
+    pub(super) fn root_stat() -> FileIdentity {
         FileIdentity {
             kind: FileKind::Directory,
             device: "8:1".into(),
@@ -4339,7 +4345,7 @@ mod linux_red {
         }
     }
 
-    fn root_prefix(expected: &DirectoryIdentity) -> Vec<ScriptedCall> {
+    pub(super) fn root_prefix(expected: &DirectoryIdentity) -> Vec<ScriptedCall> {
         vec![
             ScriptedCall::ok(
                 Syscall::Dup {
@@ -4444,7 +4450,7 @@ mod linux_red {
                     dirfd: PINNED_ROOT_FD,
                     component: "nested".into(),
                 },
-                Reply::FileIdentity(nested_stat),
+                Reply::FileIdentity(nested_stat.clone()),
             ),
             ScriptedCall::ok(
                 Syscall::Openat2 {
@@ -4485,7 +4491,7 @@ mod linux_red {
                     dirfd: PARENT_FD,
                     component: "deep".into(),
                 },
-                Reply::FileIdentity(deep_stat),
+                Reply::FileIdentity(deep_stat.clone()),
             ),
             ScriptedCall::ok(
                 Syscall::Openat2 {
@@ -6180,25 +6186,25 @@ mod linux_red {
             FileIdentity {
                 kind: FileKind::Regular,
                 size: 0,
-                ..root_file_identity()
+                ..super::posix_red::root_file_identity()
             },
             FileIdentity {
                 owner_uid: 502,
                 size: 0,
-                ..root_file_identity()
+                ..super::posix_red::root_file_identity()
             },
             FileIdentity {
                 hard_link_count: "2".into(),
                 size: 0,
-                ..root_file_identity()
+                ..super::posix_red::root_file_identity()
             },
             FileIdentity {
                 mode: 0o770,
                 size: 0,
-                ..root_file_identity()
+                ..super::posix_red::root_file_identity()
             },
         ] {
-            let identity = linux_identity();
+            let identity = super::posix_red::linux_identity();
             let calls = vec![
                 ScriptedCall::ok(
                     Syscall::Dup {
