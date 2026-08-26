@@ -4,7 +4,13 @@ version = "0.3.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+# rlib added for R1: the comparison-supervisor binary and the secure_fs
+# integration test target link the library crate; the addon remains a cdylib.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "comparison-supervisor"
+path = "src/bin/comparison-supervisor.rs"
 
 [features]
 default = []
@@ -42,10 +48,10 @@ x509-parser = "0.18.1"
 # after fully drained closes. mimalloc purges freed pages back to the OS.
 mimalloc = { version = "0.1", default-features = false }
 
-# Only the egress pacer's thread-priority knobs use this, and only on Linux:
-# `setpriority` is per-thread there, where on macOS the same call is
-# process-wide and would renice the whole runtime.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The egress pacer's thread-priority knobs use this on Linux (`setpriority`
+# is per-thread there), and the R1 secure filesystem boundary uses it for its
+# handle-relative syscalls on both macOS and Linux.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [build-dependencies]

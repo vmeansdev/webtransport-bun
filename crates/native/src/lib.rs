@@ -97,6 +97,9 @@ pub mod payload_buffer;
 pub mod quic_lb;
 pub mod rate_limit;
 pub(crate) mod read_ownership;
+// R1 secure comparison filesystem boundary: Rust-public only so the
+// comparison-supervisor binary can link it; no #[napi] symbols.
+pub mod secure_fs;
 // Ring core for the native stream sink; the napi surface arrives in
 // RFC_STREAM_SINK phase 3, so the module is test-only until then.
 pub mod server;
