@@ -30,6 +30,7 @@ import {
 	MAX_SUPPORTED_PAYLOAD_BYTES,
 	MIN_EFFECTIVE_CHILD_NOFILE,
 	classifyVerdictTuple,
+	ComparisonCliError,
 	comparisonErrorCode,
 	metricContractForScenario,
 	metricContractHash,
@@ -2706,6 +2707,26 @@ export function parseVerifyArgs(argv: readonly string[]): StagedTrustArgs {
 	return parseStagedTrustArgv("verify", argv);
 }
 
+/**
+ * The evidence directory to read, refusing typed when there is nothing there.
+ *
+ * The root used to print `Directory '<resolved official path>' does not exist`
+ * straight to stderr, which put an absolute official path into CI logs on a
+ * plain operator typo — the one thing every other refusal on these roots is
+ * careful not to do. The existence check is injected so the refusal is
+ * reachable from a test: the root itself fails closed on the quarantined trust
+ * boundary long before it gets here.
+ */
+export function requireExistingEvidenceDir(
+	dir: string,
+	exists: (path: string) => boolean,
+): string {
+	if (!exists(dir)) {
+		throw new ComparisonCliError("verify", "VERIFY_EVIDENCE_DIR_MISSING");
+	}
+	return dir;
+}
+
 // Entrypoint when invoked directly via CLI
 if (import.meta.main) {
 	// The package script runs this root with --fixture-only. That flag used to be
@@ -2742,8 +2763,10 @@ if (import.meta.main) {
 		campaignId,
 		outputDir: parsedArgs.positionals[0],
 	});
-	if (!existsSync(dir)) {
-		console.error(`[verify] Error: Directory '${dir}' does not exist.`);
+	try {
+		requireExistingEvidenceDir(dir, existsSync);
+	} catch (error: unknown) {
+		console.error(`[verify] Error: ${comparisonErrorCode(error)}`);
 		process.exit(1);
 	}
 

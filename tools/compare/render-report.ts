@@ -174,8 +174,11 @@ export function generateReport(identity?: ReportIdentity): void {
 		outputFile,
 	});
 
+	// A typed code, not a message quoting the resolved official path: an
+	// in-process caller that prints `error.message` would otherwise publish that
+	// path, and only the root's catch was collapsing it.
 	if (!existsSync(officialDir))
-		throw new Error(`Evidence directory '${officialDir}' does not exist.`);
+		throw new ComparisonCliError("report", "REPORT_EVIDENCE_DIR_MISSING");
 
 	const files = readdirSync(officialDir).filter(
 		(file) => file.endsWith(".json") && file !== "manifest.json",
